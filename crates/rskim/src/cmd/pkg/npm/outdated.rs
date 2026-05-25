@@ -121,11 +121,7 @@ fn try_parse_outdated_regex(text: &str) -> Option<PkgResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::load_fixture as _load_fixture;
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("pkg", name)
-    }
+    use crate::cmd::test_support::load_fixture;
 
     // ========================================================================
     // npm outdated: JSON
@@ -133,7 +129,7 @@ mod tests {
 
     #[test]
     fn test_outdated_json_parse() {
-        let input = load_fixture("npm_outdated.json");
+        let input = load_fixture("pkg", "npm_outdated.json");
         let result = try_parse_outdated_json(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -157,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_outdated_json_produces_full() {
-        let input = load_fixture("npm_outdated.json");
+        let input = load_fixture("pkg", "npm_outdated.json");
         let output = CommandOutput {
             stdout: input,
             stderr: String::new(),

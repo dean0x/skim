@@ -30,8 +30,8 @@ use std::process::ExitCode;
 pub(super) use super::combine_stdout_stderr;
 pub(super) use super::inject_format_json;
 pub(super) use super::log_result_to_infra;
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "docker",
@@ -58,9 +58,7 @@ pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Resu
         ("ps", _) | ("container", "ls") => {
             run_tool(CONFIG, args, ctx, ps::prepare_args, ps::parse_impl)
         }
-        ("images", _) => {
-            run_tool(CONFIG, args, ctx, images::prepare_args, images::parse_impl)
-        }
+        ("images", _) => run_tool(CONFIG, args, ctx, images::prepare_args, images::parse_impl),
         ("inspect", _) => run_tool(
             CONFIG,
             args,

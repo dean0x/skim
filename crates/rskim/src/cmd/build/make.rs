@@ -235,15 +235,7 @@ fn try_tier2_noise_strip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture as _load_fixture, make_output_full};
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("build", name)
-    }
-
-    fn make_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> CommandOutput {
-        make_output_full(stdout, stderr, exit_code)
-    }
+    use crate::cmd::test_support::{load_fixture, make_output_full};
 
     // ========================================================================
     // Tier 1: GCC/Clang diagnostics, make failures, linker errors, noops
@@ -252,8 +244,8 @@ mod tests {
     #[test]
     fn test_tier1_errors() {
         // Compiler errors come through combined stderr (compiler + make)
-        let fixture = load_fixture("make_errors.txt");
-        let output = make_output("", &fixture, Some(1));
+        let fixture = load_fixture("build", "make_errors.txt");
+        let output = make_output_full("", &fixture, Some(1));
         let result = parse_make(&output);
         assert!(
             result.is_full(),
@@ -269,8 +261,8 @@ mod tests {
 
     #[test]
     fn test_tier1_warnings_only() {
-        let fixture = load_fixture("make_warnings_only.txt");
-        let output = make_output(&fixture, "", Some(0));
+        let fixture = load_fixture("build", "make_warnings_only.txt");
+        let output = make_output_full(&fixture, "", Some(0));
         let result = parse_make(&output);
         assert!(
             result.is_full(),
@@ -286,8 +278,8 @@ mod tests {
 
     #[test]
     fn test_tier1_nothing_to_do() {
-        let fixture = load_fixture("make_nothing.txt");
-        let output = make_output("", &fixture, Some(0));
+        let fixture = load_fixture("build", "make_nothing.txt");
+        let output = make_output_full("", &fixture, Some(0));
         let result = parse_make(&output);
         assert!(
             result.is_full(),
@@ -303,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_tier1_up_to_date() {
-        let output = make_output("", "make: 'app' is up to date.", Some(0));
+        let output = make_output_full("", "make: 'app' is up to date.", Some(0));
         let result = parse_make(&output);
         assert!(
             result.is_full(),
@@ -317,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_tier1_make_failure_line() {
-        let output = make_output("", "make: *** [Makefile:10: all] Error 1", Some(2));
+        let output = make_output_full("", "make: *** [Makefile:10: all] Error 1", Some(2));
         let result = parse_make(&output);
         assert!(
             result.is_full(),
@@ -332,7 +324,7 @@ mod tests {
 
     #[test]
     fn test_tier1_makefile_syntax_error() {
-        let output = make_output("", "Makefile:5: *** missing separator.  Stop.", Some(2));
+        let output = make_output_full("", "Makefile:5: *** missing separator.  Stop.", Some(2));
         let result = parse_make(&output);
         assert!(
             result.is_full(),
@@ -347,7 +339,7 @@ mod tests {
 
     #[test]
     fn test_tier1_fatal_error() {
-        let output = make_output(
+        let output = make_output_full(
             "",
             "foo.c:1:10: fatal error: bar.h: No such file or directory",
             Some(1),
@@ -366,7 +358,7 @@ mod tests {
 
     #[test]
     fn test_tier1_linker_error_gnu() {
-        let output = make_output("", "main.o: undefined reference to 'foo'", Some(1));
+        let output = make_output_full("", "main.o: undefined reference to 'foo'", Some(1));
         let result = parse_make(&output);
         assert!(
             result.is_full(),
@@ -380,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_tier1_linker_error_macos() {
-        let output = make_output(
+        let output = make_output_full(
             "",
             "ld: symbol(s) not found for architecture arm64",
             Some(1),
@@ -400,7 +392,7 @@ mod tests {
     fn test_tier1_note_not_counted() {
         let input =
             "main.c:10:5: error: undeclared identifier\nmain.c:10:5: note: did you mean 'x'?\n";
-        let output = make_output("", input, Some(1));
+        let output = make_output_full("", input, Some(1));
         let result = parse_make(&output);
         assert!(
             result.is_full(),
@@ -423,8 +415,8 @@ mod tests {
 
     #[test]
     fn test_tier2_noise_strip_recursive() {
-        let fixture = load_fixture("make_recursive.txt");
-        let output = make_output(&fixture, "", Some(0));
+        let fixture = load_fixture("build", "make_recursive.txt");
+        let output = make_output_full(&fixture, "", Some(0));
         let result = parse_make(&output);
         assert!(
             result.is_degraded(),
@@ -438,8 +430,8 @@ mod tests {
 
     #[test]
     fn test_tier2_noise_strip_success() {
-        let fixture = load_fixture("make_success.txt");
-        let output = make_output(&fixture, "", Some(0));
+        let fixture = load_fixture("build", "make_success.txt");
+        let output = make_output_full(&fixture, "", Some(0));
         let result = parse_make(&output);
         assert!(
             result.is_degraded(),
@@ -454,7 +446,7 @@ mod tests {
 
     #[test]
     fn test_tier3_passthrough() {
-        let output = make_output("some random unrecognized output\n", "", Some(1));
+        let output = make_output_full("some random unrecognized output\n", "", Some(1));
         let result = parse_make(&output);
         assert!(
             result.is_passthrough(),
@@ -469,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_empty_output_is_success() {
-        let output = make_output("", "", Some(0));
+        let output = make_output_full("", "", Some(0));
         let result = parse_make(&output);
         assert!(
             result.is_full(),
@@ -487,7 +479,7 @@ mod tests {
     fn test_signal_killed_make_is_failure() {
         // exit_code: None means the process was killed by a signal (e.g. SIGKILL).
         // Empty output + None exit code must be treated as failure, not success.
-        let output = make_output("", "", None);
+        let output = make_output_full("", "", None);
         let result = parse_make(&output);
         assert!(
             result.is_full(),
@@ -504,7 +496,7 @@ mod tests {
         // A trailing noop line must not discard previously-accumulated diagnostics.
         // Regression test for the noop-early-return bug (make.rs:176).
         let input = "main.c:1:1: error: use of undeclared identifier 'x'\nmake: Nothing to be done for 'all'\n";
-        let output = make_output("", input, Some(1));
+        let output = make_output_full("", input, Some(1));
         let result = parse_make(&output);
         assert!(
             result.is_full(),
@@ -520,7 +512,7 @@ mod tests {
     #[test]
     fn test_tier1_recursive_noop() {
         // MAKE_NOOP_RE handles make[N]: prefix; verify it fires on recursive make.
-        let output = make_output("", "make[1]: Nothing to be done for 'target'\n", Some(0));
+        let output = make_output_full("", "make[1]: Nothing to be done for 'target'\n", Some(0));
         let result = parse_make(&output);
         assert!(
             result.is_full(),

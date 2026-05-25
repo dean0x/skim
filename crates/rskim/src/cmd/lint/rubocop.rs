@@ -17,8 +17,8 @@ use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
 use super::{combine_stdout_stderr, group_issues};
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "rubocop",
@@ -191,10 +191,6 @@ mod tests {
     use super::*;
     use crate::cmd::test_support::make_output_full;
 
-    fn make_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> CommandOutput {
-        make_output_full(stdout, stderr, exit_code)
-    }
-
     const RUBOCOP_PASS_JSON: &str = r#"{"metadata":{"rubocop_version":"1.65.0","ruby_engine":"ruby","ruby_version":"3.3.0","ruby_patchlevel":"0","ruby_platform":"arm64-darwin23"},"files":[{"path":"app/models/user.rb","offenses":[]}],"summary":{"offense_count":0,"target_file_count":1,"inspected_file_count":1}}"#;
 
     const RUBOCOP_FAIL_JSON: &str = r#"{"metadata":{"rubocop_version":"1.65.0","ruby_engine":"ruby","ruby_version":"3.3.0","ruby_patchlevel":"0","ruby_platform":"arm64-darwin23"},"files":[{"path":"app/models/user.rb","offenses":[{"severity":"convention","message":"Use single-quoted strings when you don't need string interpolation or special symbols.","cop_name":"Style/StringLiterals","correctable":true,"location":{"start_line":5,"start_column":10,"last_line":5,"last_column":20,"length":11,"line":5,"column":10}},{"severity":"error","message":"Useless assignment to variable - `foo`.","cop_name":"Lint/UselessAssignment","correctable":false,"location":{"start_line":12,"start_column":5,"last_line":12,"last_column":7,"length":3,"line":12,"column":5}}]}],"summary":{"offense_count":2,"target_file_count":1,"inspected_file_count":1}}"#;
@@ -234,7 +230,7 @@ mod tests {
 
     #[test]
     fn test_rubocop_tier3_passthrough() {
-        let output = make_output(
+        let output = make_output_full(
             "completely unparseable output\nno json no regex",
             "",
             Some(1),
@@ -249,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_json_produces_full() {
-        let output = make_output(RUBOCOP_FAIL_JSON, "", Some(1));
+        let output = make_output_full(RUBOCOP_FAIL_JSON, "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_full(),
@@ -260,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_text_produces_degraded() {
-        let output = make_output(RUBOCOP_TEXT, "", Some(1));
+        let output = make_output_full(RUBOCOP_TEXT, "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_degraded(),

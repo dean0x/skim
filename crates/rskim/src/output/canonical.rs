@@ -1931,9 +1931,7 @@ mod tests {
     #[test]
     fn test_truncate_display_rows_caps_at_max_db_rows() {
         // Build MAX_DB_ROWS + 10 rows; only MAX_DB_ROWS should survive.
-        let rows: Vec<Vec<String>> = (0..MAX_DB_ROWS + 10)
-            .map(|i| vec![i.to_string()])
-            .collect();
+        let rows: Vec<Vec<String>> = (0..MAX_DB_ROWS + 10).map(|i| vec![i.to_string()]).collect();
         let display = DbResult::truncate_display_rows(&rows);
         assert_eq!(display.len(), MAX_DB_ROWS);
     }

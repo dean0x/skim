@@ -22,8 +22,8 @@ use crate::output::ParseResult;
 use crate::output::canonical::DbResult;
 use crate::runner::CommandOutput;
 
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "psql",

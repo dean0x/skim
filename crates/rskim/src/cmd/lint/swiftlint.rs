@@ -17,8 +17,8 @@ use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
 use super::{combine_stdout_stderr, group_issues};
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "swiftlint",
@@ -161,10 +161,6 @@ mod tests {
     use super::*;
     use crate::cmd::test_support::make_output_full;
 
-    fn make_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> CommandOutput {
-        make_output_full(stdout, stderr, exit_code)
-    }
-
     const SWIFTLINT_PASS_JSON: &str = r#"[]"#;
 
     const SWIFTLINT_FAIL_JSON: &str = r#"[{"character":null,"file":"/Users/dev/MyApp/Sources/ContentView.swift","line":10,"reason":"Line should be 120 characters or less; currently it is 125 characters","rule_id":"line_length","severity":"Warning","type":"warning"},{"character":5,"file":"/Users/dev/MyApp/Sources/ContentView.swift","line":20,"reason":"Function body should span 40 lines or less; currently spans 50 lines","rule_id":"function_body_length","severity":"Error","type":"error"}]"#;
@@ -205,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_swiftlint_tier3_passthrough() {
-        let output = make_output("completely unparseable output", "", Some(1));
+        let output = make_output_full("completely unparseable output", "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -216,7 +212,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_json_produces_full() {
-        let output = make_output(SWIFTLINT_FAIL_JSON, "", Some(1));
+        let output = make_output_full(SWIFTLINT_FAIL_JSON, "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_full(),
@@ -227,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_text_produces_degraded() {
-        let output = make_output(SWIFTLINT_TEXT, "", Some(1));
+        let output = make_output_full(SWIFTLINT_TEXT, "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_degraded(),

@@ -24,8 +24,8 @@ use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
 use super::combine_stdout_stderr;
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "curl",
@@ -679,21 +679,13 @@ fn try_parse_regex(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture as _load_fixture, make_output_full};
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("infra", name)
-    }
-
-    fn make_output(stdout: &str, stderr: &str, exit_code: i32) -> CommandOutput {
-        make_output_full(stdout, stderr, Some(exit_code))
-    }
+    use crate::cmd::test_support::{load_fixture, make_output_full};
 
     // ---- Pre-existing tests (must remain passing) ----
 
     #[test]
     fn test_tier1_curl_json_response() {
-        let input = load_fixture("curl_json_response.txt");
+        let input = load_fixture("infra", "curl_json_response.txt");
         let result = try_parse_json(&input, Some("200 OK"));
         assert!(result.is_some(), "Expected Tier 1 JSON parse to succeed");
         let result = result.unwrap();
@@ -708,7 +700,7 @@ mod tests {
 
     #[test]
     fn test_tier2_curl_regex() {
-        let input = load_fixture("curl_verbose.txt");
+        let input = load_fixture("infra", "curl_verbose.txt");
         let result = try_parse_regex(&input);
         assert!(result.is_some(), "Expected Tier 2 parse to succeed");
         let result = result.unwrap();
@@ -717,8 +709,8 @@ mod tests {
 
     #[test]
     fn test_parse_impl_produces_full() {
-        let input = load_fixture("curl_json_response.txt");
-        let output = make_output(&input, "", 0);
+        let input = load_fixture("infra", "curl_json_response.txt");
+        let output = make_output_full(&input, "", Some(0));
         let result = parse_impl(&output);
         assert!(
             result.is_full(),
@@ -729,7 +721,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_garbage_produces_passthrough() {
-        let output = make_output("", "", 7);
+        let output = make_output_full("", "", Some(7));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -803,10 +795,10 @@ mod tests {
 
     #[test]
     fn test_parse_impl_text_produces_degraded() {
-        let output = make_output(
+        let output = make_output_full(
             "",
             "* Connected to api.example.com\n> GET / HTTP/1.1\n< HTTP/1.1 200 OK\n<\n",
-            0,
+            Some(0),
         );
         let result = parse_impl(&output);
         assert!(
@@ -885,7 +877,7 @@ mod tests {
 
     #[test]
     fn test_header_extraction_i_mode() {
-        let input = load_fixture("curl_headers_body.txt");
+        let input = load_fixture("infra", "curl_headers_body.txt");
         let result = try_split_header_body(&input);
         assert!(result.is_some(), "Expected header/body split to succeed");
         let (items, body) = result.unwrap();
@@ -953,7 +945,7 @@ mod tests {
 
     #[test]
     fn test_header_extraction_set_cookie_count() {
-        let input = load_fixture("curl_headers_body.txt");
+        let input = load_fixture("infra", "curl_headers_body.txt");
         let (items, _) = try_split_header_body(&input).unwrap();
         let cookie = items.iter().find(|i| i.label == "Set-Cookie");
         assert!(cookie.is_some(), "Set-Cookie should be counted");
@@ -966,7 +958,7 @@ mod tests {
 
     #[test]
     fn test_redirect_chain_takes_last() {
-        let input = load_fixture("curl_redirect_chain.txt");
+        let input = load_fixture("infra", "curl_redirect_chain.txt");
         let result = try_split_header_body(&input);
         assert!(result.is_some(), "Redirect chain should parse");
         let (items, body) = result.unwrap();
@@ -1031,7 +1023,7 @@ mod tests {
 
     #[test]
     fn test_tier1_curl_error_4xx_json() {
-        let input = load_fixture("curl_error_4xx.txt");
+        let input = load_fixture("infra", "curl_error_4xx.txt");
         // Parse with 404 status
         let result = try_parse_json(&input, Some("404"));
         assert!(result.is_some(), "Should parse 4xx JSON response");
@@ -1046,7 +1038,7 @@ mod tests {
 
     #[test]
     fn test_tier1_curl_error_5xx_json() {
-        let input = load_fixture("curl_error_5xx.txt");
+        let input = load_fixture("infra", "curl_error_5xx.txt");
         let result = try_parse_json(&input, Some("500"));
         assert!(result.is_some(), "Should parse 5xx JSON response");
         let result = result.unwrap();
@@ -1089,7 +1081,7 @@ mod tests {
 
     #[test]
     fn test_writeout_extraction() {
-        let input = load_fixture("curl_writeout.txt");
+        let input = load_fixture("infra", "curl_writeout.txt");
         let result = try_extract_writeout(&input);
         assert!(result.is_some(), "Should detect write-out status code");
         let (item, body) = result.unwrap();
@@ -1105,7 +1097,7 @@ mod tests {
 
     #[test]
     fn test_verbose_response_headers() {
-        let stderr = load_fixture("curl_verbose_headers.txt");
+        let stderr = load_fixture("infra", "curl_verbose_headers.txt");
         let (status, items) = extract_verbose_metadata(&stderr);
         assert!(
             status.is_some(),
@@ -1131,7 +1123,7 @@ mod tests {
 
     #[test]
     fn test_tier1_curl_json_array() {
-        let input = load_fixture("curl_json_array.txt");
+        let input = load_fixture("infra", "curl_json_array.txt");
         let result = try_parse_json(&input, None);
         assert!(result.is_some(), "Should parse JSON array response");
         let result = result.unwrap();
@@ -1148,8 +1140,8 @@ mod tests {
 
     #[test]
     fn test_html_body_falls_to_tier2() {
-        let input = load_fixture("curl_html_response.txt");
-        let output = make_output(&input, "", 0);
+        let input = load_fixture("infra", "curl_html_response.txt");
+        let output = make_output_full(&input, "", Some(0));
         let result = parse_impl(&output);
         // HTML is not valid JSON, so Tier 1 fails.
         // try_parse_regex would find no HTTP status lines either, so falls to passthrough.

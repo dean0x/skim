@@ -334,11 +334,7 @@ fn try_parse_list_regex(text: &str) -> Option<PkgResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::load_fixture as _load_fixture;
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("pkg", name)
-    }
+    use crate::cmd::test_support::load_fixture;
 
     // ========================================================================
     // pip install: Regex
@@ -346,7 +342,7 @@ mod tests {
 
     #[test]
     fn test_install_regex_parse() {
-        let input = load_fixture("pip_install.txt");
+        let input = load_fixture("pkg", "pip_install.txt");
         let result = try_parse_install_regex(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -372,7 +368,7 @@ mod tests {
 
     #[test]
     fn test_check_clean() {
-        let input = load_fixture("pip_check_clean.txt");
+        let input = load_fixture("pkg", "pip_check_clean.txt");
         let result = try_parse_check_regex(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -382,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_check_issues() {
-        let input = load_fixture("pip_check_issues.txt");
+        let input = load_fixture("pkg", "pip_check_issues.txt");
         let result = try_parse_check_regex(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -397,7 +393,7 @@ mod tests {
 
     #[test]
     fn test_list_json_parse() {
-        let input = load_fixture("pip_outdated.json");
+        let input = load_fixture("pkg", "pip_outdated.json");
         let result = try_parse_list_json(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -421,7 +417,7 @@ mod tests {
 
     #[test]
     fn test_install_produces_full() {
-        let input = load_fixture("pip_install.txt");
+        let input = load_fixture("pkg", "pip_install.txt");
         let output = CommandOutput {
             stdout: input,
             stderr: String::new(),
@@ -438,7 +434,7 @@ mod tests {
 
     #[test]
     fn test_check_produces_full() {
-        let input = load_fixture("pip_check_clean.txt");
+        let input = load_fixture("pkg", "pip_check_clean.txt");
         let output = CommandOutput {
             stdout: input,
             stderr: String::new(),

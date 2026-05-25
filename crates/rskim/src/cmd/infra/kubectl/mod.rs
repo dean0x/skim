@@ -20,8 +20,8 @@ use std::process::ExitCode;
 /// Re-exports for sub-module use.
 pub(super) use super::combine_stdout_stderr;
 pub(super) use super::log_result_to_infra;
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "kubectl",

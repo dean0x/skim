@@ -23,8 +23,8 @@ use crate::output::ParseResult;
 use crate::output::canonical::DbResult;
 use crate::runner::CommandOutput;
 
-use crate::cmd::{ToolRunConfig, run_tool, user_has_flag};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool, user_has_flag};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "sqlite3",

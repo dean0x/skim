@@ -18,8 +18,8 @@ use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
 use super::combine_stdout_stderr;
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "wget",
@@ -202,15 +202,11 @@ fn try_parse_regex(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::load_fixture as _load_fixture;
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("infra", name)
-    }
+    use crate::cmd::test_support::load_fixture;
 
     #[test]
     fn test_tier1_wget_download() {
-        let input = load_fixture("wget_download.txt");
+        let input = load_fixture("infra", "wget_download.txt");
         let result = try_parse_structured(&input);
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
@@ -220,7 +216,7 @@ mod tests {
 
     #[test]
     fn test_tier1_wget_error() {
-        let input = load_fixture("wget_error.txt");
+        let input = load_fixture("infra", "wget_error.txt");
         let result = try_parse_structured(&input);
         assert!(
             result.is_some(),
@@ -251,7 +247,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_produces_full() {
-        let input = load_fixture("wget_download.txt");
+        let input = load_fixture("infra", "wget_download.txt");
         let output = CommandOutput {
             stdout: String::new(),
             stderr: input,

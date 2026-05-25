@@ -13,8 +13,8 @@ use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
 use super::{MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "ps",
@@ -106,11 +106,7 @@ fn try_parse_ps(stdout: &str) -> Option<FileResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture as _load_fixture, make_output_full};
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("file", name)
-    }
+    use crate::cmd::test_support::{load_fixture, make_output_full};
 
     fn make_large_ps() -> String {
         let mut lines = vec![
@@ -124,13 +120,9 @@ mod tests {
         lines.join("\n")
     }
 
-    fn make_output(stdout: &str, exit_code: i32) -> CommandOutput {
-        make_output_full(stdout, "", Some(exit_code))
-    }
-
     #[test]
     fn test_tier1_ps_small() {
-        let input = load_fixture("ps_small.txt");
+        let input = load_fixture("file", "ps_small.txt");
         let result = try_parse_ps(&input);
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
@@ -158,7 +150,7 @@ mod tests {
 
     #[test]
     fn test_tier1_ps_preserves_header() {
-        let input = load_fixture("ps_small.txt");
+        let input = load_fixture("file", "ps_small.txt");
         let result = try_parse_ps(&input).unwrap();
         // First entry should be the header line with PID
         assert!(
@@ -170,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_tier1_ps_minimal() {
-        let input = load_fixture("ps_minimal.txt");
+        let input = load_fixture("file", "ps_minimal.txt");
         let result = try_parse_ps(&input);
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
@@ -180,7 +172,7 @@ mod tests {
 
     #[test]
     fn test_tier3_empty_passthrough() {
-        let output = make_output("", 1);
+        let output = make_output_full("", "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),

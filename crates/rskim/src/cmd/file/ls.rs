@@ -23,8 +23,8 @@ use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
 use super::{MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 /// Maximum byte length of JSON input accepted for Tier 1 tree JSON parsing.
 ///
@@ -362,15 +362,11 @@ fn count_tree_depth(line: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture as _load_fixture, make_output};
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("file", name)
-    }
+    use crate::cmd::test_support::{load_fixture, make_output};
 
     #[test]
     fn test_tier1_ls_la() {
-        let input = load_fixture("ls_la.txt");
+        let input = load_fixture("file", "ls_la.txt");
         let result = try_parse_ls_long(&input);
         assert!(result.is_some(), "Expected Tier 1 ls -la parse to succeed");
         let result = result.unwrap();
@@ -382,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_tier2_ls_basic() {
-        let input = load_fixture("ls_basic.txt");
+        let input = load_fixture("file", "ls_basic.txt");
         let result = try_parse_ls_plain(&input);
         assert!(
             result.is_some(),
@@ -394,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_parse_ls_impl_long_form_is_full() {
-        let input = load_fixture("ls_la.txt");
+        let input = load_fixture("file", "ls_la.txt");
         let output = make_output(&input);
         let result = parse_ls(&output);
         assert!(
@@ -406,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_parse_ls_impl_plain_is_degraded() {
-        let input = load_fixture("ls_basic.txt");
+        let input = load_fixture("file", "ls_basic.txt");
         let output = make_output(&input);
         let result = parse_ls(&output);
         // Plain ls doesn't match long form, falls to Tier 2
@@ -419,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_tier2_tree_basic() {
-        let input = load_fixture("tree_basic.txt");
+        let input = load_fixture("file", "tree_basic.txt");
         let result = try_parse_tree_text(&input);
         assert!(result.is_some(), "Expected Tier 2 tree parse to succeed");
         let result = result.unwrap();
@@ -428,7 +424,7 @@ mod tests {
 
     #[test]
     fn test_parse_tree_impl_produces_result() {
-        let input = load_fixture("tree_basic.txt");
+        let input = load_fixture("file", "tree_basic.txt");
         let output = make_output(&input);
         let result = parse_tree(&output);
         assert!(
@@ -444,7 +440,7 @@ mod tests {
     /// established in v2.3.0 (CHANGELOG consistency review HIGH-2).
     #[test]
     fn test_parse_tree_degradation_marker_uses_tree_prefix() {
-        let input = load_fixture("tree_basic.txt");
+        let input = load_fixture("file", "tree_basic.txt");
         let output = make_output(&input);
         let result = parse_tree(&output);
         if let ParseResult::Degraded(_, markers) = result {

@@ -62,8 +62,8 @@ use crate::output::canonical::InfraResult;
 use crate::runner::CommandOutput;
 
 use super::combine_stdout_stderr;
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "gh",
@@ -242,14 +242,11 @@ fn try_parse_view_json_auto(obj: &serde_json::Value) -> Option<InfraResult> {
 
 /// Re-export shared test helpers for gh submodule tests.
 ///
-/// Delegates to `crate::cmd::test_support` which provides canonical
-/// `make_output` and `load_fixture` implementations used across the
-/// entire `cmd` subtree.
+/// Provides `make_output` (single-arg) and `load_fixture` (single-arg with
+/// "infra" subdir pre-applied) from `crate::cmd::test_support`.
 #[cfg(test)]
 pub(super) mod test_helpers {
-    pub(super) fn make_output(stdout: &str) -> crate::runner::CommandOutput {
-        crate::cmd::test_support::make_output(stdout)
-    }
+    pub(super) use crate::cmd::test_support::make_output;
 
     pub(super) fn load_fixture(name: &str) -> String {
         crate::cmd::test_support::load_fixture("infra", name)

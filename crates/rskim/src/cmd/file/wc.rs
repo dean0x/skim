@@ -16,8 +16,8 @@ use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
 use super::{MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "wc",
@@ -160,19 +160,11 @@ fn try_parse_wc(stdout: &str) -> Option<FileResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture as _load_fixture, make_output_full};
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("file", name)
-    }
-
-    fn make_output(stdout: &str, exit_code: i32) -> CommandOutput {
-        make_output_full(stdout, "", Some(exit_code))
-    }
+    use crate::cmd::test_support::{load_fixture, make_output_full};
 
     #[test]
     fn test_tier1_wc_full_mode() {
-        let input = load_fixture("wc_small.txt");
+        let input = load_fixture("file", "wc_small.txt");
         let result = try_parse_wc(&input);
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
@@ -184,7 +176,7 @@ mod tests {
 
     #[test]
     fn test_tier1_wc_lines_only() {
-        let input = load_fixture("wc_lines_only.txt");
+        let input = load_fixture("file", "wc_lines_only.txt");
         let result = try_parse_wc(&input);
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
@@ -208,7 +200,7 @@ mod tests {
 
     #[test]
     fn test_tier1_wc_total_as_footer() {
-        let input = load_fixture("wc_small.txt");
+        let input = load_fixture("file", "wc_small.txt");
         let result = try_parse_wc(&input).unwrap();
         let footer = result.footer.as_ref().expect("total should become footer");
         assert!(
@@ -224,7 +216,7 @@ mod tests {
 
     #[test]
     fn test_tier3_empty_on_error() {
-        let output = make_output("", 1);
+        let output = make_output_full("", "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -235,8 +227,8 @@ mod tests {
 
     #[test]
     fn test_parse_impl_produces_full() {
-        let input = load_fixture("wc_small.txt");
-        let output = make_output(&input, 0);
+        let input = load_fixture("file", "wc_small.txt");
+        let output = make_output_full(&input, "", Some(0));
         let result = parse_impl(&output);
         assert!(
             result.is_full(),
@@ -247,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_display_format() {
-        let input = load_fixture("wc_small.txt");
+        let input = load_fixture("file", "wc_small.txt");
         let result = try_parse_wc(&input).unwrap();
         let rendered = format!("{result}");
         assert!(

@@ -17,8 +17,8 @@ use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
 use super::combine_stdout_stderr;
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "aws",
@@ -249,15 +249,11 @@ fn try_parse_regex(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::load_fixture as _load_fixture;
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("infra", name)
-    }
+    use crate::cmd::test_support::load_fixture;
 
     #[test]
     fn test_tier1_aws_s3_ls() {
-        let input = load_fixture("aws_s3_ls.json");
+        let input = load_fixture("infra", "aws_s3_ls.json");
         let result = try_parse_json(&input);
         assert!(result.is_some(), "Expected Tier 1 JSON parse to succeed");
         let result = result.unwrap();
@@ -267,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_tier1_aws_ec2_describe() {
-        let input = load_fixture("aws_ec2_describe.json");
+        let input = load_fixture("infra", "aws_ec2_describe.json");
         let result = try_parse_json(&input);
         assert!(result.is_some(), "Expected Tier 1 JSON parse to succeed");
     }
@@ -281,7 +277,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_produces_full() {
-        let input = load_fixture("aws_s3_ls.json");
+        let input = load_fixture("infra", "aws_s3_ls.json");
         let output = CommandOutput {
             stdout: input,
             stderr: String::new(),

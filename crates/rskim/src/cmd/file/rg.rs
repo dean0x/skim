@@ -16,8 +16,8 @@ use super::{
     MAX_FILES_SHOWN, MAX_INPUT_LINES, MAX_MATCHES_PER_FILE, build_file_result,
     try_parse_file_line_content,
 };
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "rg",
@@ -164,15 +164,11 @@ fn try_parse_regex(text: &str) -> Option<FileResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture as _load_fixture, make_output};
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("file", name)
-    }
+    use crate::cmd::test_support::{load_fixture, make_output};
 
     #[test]
     fn test_tier1_rg_json() {
-        let input = load_fixture("rg_json.jsonl");
+        let input = load_fixture("file", "rg_json.jsonl");
         let result = try_parse_json(&input);
         assert!(
             result.is_some(),
@@ -184,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_tier2_rg_text() {
-        let input = load_fixture("rg_text.txt");
+        let input = load_fixture("file", "rg_text.txt");
         let result = try_parse_regex(&input);
         assert!(result.is_some(), "Expected Tier 2 regex parse to succeed");
         let result = result.unwrap();
@@ -193,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_json_is_full() {
-        let input = load_fixture("rg_json.jsonl");
+        let input = load_fixture("file", "rg_json.jsonl");
         let output = make_output(&input);
         let result = parse_impl(&output);
         assert!(
@@ -205,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_text_is_degraded() {
-        let input = load_fixture("rg_text.txt");
+        let input = load_fixture("file", "rg_text.txt");
         let output = make_output(&input);
         let result = parse_impl(&output);
         assert!(

@@ -86,4 +86,3 @@ fn print_help() {
     println!("  skim mysql -e \"SELECT * FROM orders LIMIT 10\"");
     println!("  skim sqlite3 app.db \"SELECT * FROM logs LIMIT 20\"");
 }
-

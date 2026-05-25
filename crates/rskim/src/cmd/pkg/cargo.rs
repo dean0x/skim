@@ -277,11 +277,7 @@ fn extract_field<'a>(block: &'a str, prefix: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::load_fixture as _load_fixture;
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("pkg", name)
-    }
+    use crate::cmd::test_support::load_fixture;
 
     // ========================================================================
     // cargo audit: JSON
@@ -289,7 +285,7 @@ mod tests {
 
     #[test]
     fn test_audit_json_parse() {
-        let input = load_fixture("cargo_audit.json");
+        let input = load_fixture("pkg", "cargo_audit.json");
         let result = try_parse_audit_json(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -304,7 +300,7 @@ mod tests {
 
     #[test]
     fn test_audit_json_clean() {
-        let input = load_fixture("cargo_audit_clean.json");
+        let input = load_fixture("pkg", "cargo_audit_clean.json");
         let result = try_parse_audit_json(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -406,7 +402,7 @@ Version: 0.3.1
 
     #[test]
     fn test_audit_json_produces_full() {
-        let input = load_fixture("cargo_audit.json");
+        let input = load_fixture("pkg", "cargo_audit.json");
         let output = CommandOutput {
             stdout: input,
             stderr: String::new(),

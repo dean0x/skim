@@ -121,11 +121,7 @@ fn try_parse_ls_regex(text: &str) -> Option<PkgResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::load_fixture as _load_fixture;
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("pkg", name)
-    }
+    use crate::cmd::test_support::load_fixture;
 
     // ========================================================================
     // npm ls: JSON
@@ -133,7 +129,7 @@ mod tests {
 
     #[test]
     fn test_ls_json_parse() {
-        let input = load_fixture("npm_ls.json");
+        let input = load_fixture("pkg", "npm_ls.json");
         let result = try_parse_ls_json(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -150,7 +146,7 @@ mod tests {
 
     #[test]
     fn test_ls_json_produces_full() {
-        let input = load_fixture("npm_ls.json");
+        let input = load_fixture("pkg", "npm_ls.json");
         let output = CommandOutput {
             stdout: input,
             stderr: String::new(),

@@ -656,13 +656,11 @@ mod tests {
         LogFlags::default()
     }
 
-    fn load_fixture(name: &str) -> String {
-        crate::cmd::test_support::load_fixture("log", name)
-    }
+    use crate::cmd::test_support::load_fixture;
 
     #[test]
     fn test_tier1_json_structured() {
-        let input = load_fixture("json_structured.jsonl");
+        let input = load_fixture("log", "json_structured.jsonl");
         let flags = make_flags();
         let result = try_parse_json_logs(&input, &flags);
         assert!(result.is_some(), "Expected Tier 1 JSON parse to succeed");
@@ -672,7 +670,7 @@ mod tests {
 
     #[test]
     fn test_tier2_plaintext_mixed() {
-        let input = load_fixture("plaintext_mixed.txt");
+        let input = load_fixture("log", "plaintext_mixed.txt");
         let flags = make_flags();
         let result = try_parse_regex_logs(&input, &flags);
         assert!(result.is_some(), "Expected Tier 2 regex parse to succeed");
@@ -682,7 +680,7 @@ mod tests {
 
     #[test]
     fn test_debug_hidden_by_default() {
-        let input = load_fixture("debug_heavy.txt");
+        let input = load_fixture("log", "debug_heavy.txt");
         let flags = make_flags(); // keep_debug = false
         let result = try_parse_regex_logs(&input, &flags).unwrap();
         assert!(result.debug_hidden > 0, "Expected DEBUG lines to be hidden");
@@ -690,7 +688,7 @@ mod tests {
 
     #[test]
     fn test_debug_kept_with_keep_debug() {
-        let input = load_fixture("debug_heavy.txt");
+        let input = load_fixture("log", "debug_heavy.txt");
         let flags = LogFlags {
             keep_debug: true,
             ..Default::default()
@@ -704,7 +702,7 @@ mod tests {
 
     #[test]
     fn test_dedup_reduces_entries() {
-        let input = load_fixture("duplicate_heavy.txt");
+        let input = load_fixture("log", "duplicate_heavy.txt");
         let flags = make_flags();
         let result = try_parse_regex_logs(&input, &flags).unwrap();
         assert!(
@@ -748,7 +746,7 @@ mod tests {
 
     #[test]
     fn test_compress_log_json_produces_full() {
-        let input = load_fixture("json_structured.jsonl");
+        let input = load_fixture("log", "json_structured.jsonl");
         let flags = make_flags();
         let result = compress_log(&input, &flags);
         assert!(
@@ -760,7 +758,7 @@ mod tests {
 
     #[test]
     fn test_compress_log_plaintext_produces_degraded() {
-        let input = load_fixture("plaintext_mixed.txt");
+        let input = load_fixture("log", "plaintext_mixed.txt");
         let flags = make_flags();
         let result = compress_log(&input, &flags);
         assert!(
@@ -850,7 +848,7 @@ mod tests {
     /// AD-LOG-10: ERROR and WARN entries with the same text must NOT merge.
     #[test]
     fn test_log_dedup_preserves_level() {
-        let input = load_fixture("dedup_error_warn.txt");
+        let input = load_fixture("log", "dedup_error_warn.txt");
         let flags = make_flags();
         let result = try_parse_regex_logs(&input, &flags).unwrap();
         // ERROR+ERROR dedup'd to 1 ERROR(×2), WARN+WARN dedup'd to 1 WARN(×2),
@@ -882,7 +880,7 @@ mod tests {
     /// AD-LOG-10: 5-frame Java trace → last 3 kept, 2 elided.
     #[test]
     fn test_log_stack_elision_keeps_last_3() {
-        let input = load_fixture("stack_trace_java.txt");
+        let input = load_fixture("log", "stack_trace_java.txt");
         let flags = make_flags();
         let result = try_parse_regex_logs(&input, &flags).unwrap();
         let error_entry = result
@@ -912,7 +910,7 @@ mod tests {
     /// AD-LOG-10: elided count renders in the footer when non-zero.
     #[test]
     fn test_log_stack_elision_footer() {
-        let input = load_fixture("stack_trace_java.txt");
+        let input = load_fixture("log", "stack_trace_java.txt");
         let flags = make_flags();
         let result = try_parse_regex_logs(&input, &flags).unwrap();
         // 5 frames total, 3 kept → 2 elided.
@@ -927,7 +925,7 @@ mod tests {
     /// AD-LOG-10: Python `File "..."` stack traces are recognised.
     #[test]
     fn test_log_python_traceback_recognised() {
-        let input = load_fixture("stack_trace_python.txt");
+        let input = load_fixture("log", "stack_trace_python.txt");
         let flags = make_flags();
         let result = try_parse_regex_logs(&input, &flags).unwrap();
         let error_entry = result

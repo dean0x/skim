@@ -451,13 +451,10 @@ fn try_parse_regex(output: &str) -> Option<TestResult> {
 mod tests {
     use super::*;
 
-    fn fixture_path(name: &str) -> String {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        format!("{manifest_dir}/tests/fixtures/go_test/{name}")
-    }
-
     fn read_fixture(name: &str) -> String {
-        std::fs::read_to_string(fixture_path(name))
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = format!("{manifest_dir}/tests/fixtures/go_test/{name}");
+        std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("Failed to read fixture {name}: {e}"))
     }
 

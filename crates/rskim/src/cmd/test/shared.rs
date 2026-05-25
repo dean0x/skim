@@ -570,6 +570,7 @@ pub(super) fn extract_json_object(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::test_support::make_output_full;
 
     // ========================================================================
     // resolve_exit_code tests
@@ -646,16 +647,12 @@ mod tests {
     // test_pytest_passthrough_*) which pipe stdin via `write_stdin`.
     // ========================================================================
 
-    fn make_output(stdout: &str, stderr: &str, code: Option<i32>) -> CommandOutput {
-        crate::cmd::test_support::make_output_full(stdout, stderr, code)
-    }
-
     #[test]
     fn test_run_passthrough_spawn_exit_zero_returns_success() {
         let code = run_passthrough(
             &[],
             |a| a.to_vec(),
-            |_| Ok(make_output("ok output\n", "", Some(0))),
+            |_| Ok(make_output_full("ok output\n", "", Some(0))),
         )
         .expect("run_passthrough should not error");
         assert_eq!(code, ExitCode::SUCCESS);
@@ -666,7 +663,7 @@ mod tests {
         let code = run_passthrough(
             &[],
             |a| a.to_vec(),
-            |_| Ok(make_output("fail output\n", "", Some(2))),
+            |_| Ok(make_output_full("fail output\n", "", Some(2))),
         )
         .expect("run_passthrough should not error");
         // exit code 2 → ExitCode::from(2)
@@ -677,7 +674,7 @@ mod tests {
     fn test_run_passthrough_spawn_exit_none_returns_failure() {
         // When the command is killed by a signal, exit_code is None.
         // run_passthrough falls back to exit code 1 (FAILURE).
-        let code = run_passthrough(&[], |a| a.to_vec(), |_| Ok(make_output("", "", None)))
+        let code = run_passthrough(&[], |a| a.to_vec(), |_| Ok(make_output_full("", "", None)))
             .expect("run_passthrough should not error");
         assert_eq!(code, ExitCode::FAILURE);
     }
@@ -696,7 +693,7 @@ mod tests {
             },
             |arg_refs| {
                 received_args = arg_refs.iter().map(|s| s.to_string()).collect();
-                Ok(make_output("", "", Some(0)))
+                Ok(make_output_full("", "", Some(0)))
             },
         )
         .expect("run_passthrough should not error");
@@ -943,7 +940,7 @@ mod tests {
             |a| a.to_vec(),
             |arg_refs| {
                 received_args = arg_refs.iter().map(|s| s.to_string()).collect();
-                Ok(make_output("", "", Some(0)))
+                Ok(make_output_full("", "", Some(0)))
             },
         )
         .expect("run_passthrough should not error");
@@ -984,7 +981,7 @@ mod tests {
             },
             |arg_refs| {
                 received_args = arg_refs.iter().map(|s| s.to_string()).collect();
-                Ok(make_output("", "", Some(0)))
+                Ok(make_output_full("", "", Some(0)))
             },
         )
         .expect("run_passthrough should not error");
@@ -1032,7 +1029,7 @@ mod tests {
         let code = run_passthrough(
             &[],
             |a| a.to_vec(),
-            |_| Ok(make_output("partial output\n", "", None)),
+            |_| Ok(make_output_full("partial output\n", "", None)),
         )
         .expect("run_passthrough should not error");
         assert_eq!(
@@ -1051,7 +1048,7 @@ mod tests {
         let code = run_passthrough(
             &[],
             |a| a.to_vec(),
-            |_| Ok(make_output("error: could not compile\n", "", Some(2))),
+            |_| Ok(make_output_full("error: could not compile\n", "", Some(2))),
         )
         .expect("run_passthrough should not error");
         assert_eq!(

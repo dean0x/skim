@@ -151,11 +151,7 @@ fn try_parse_install_regex(text: &str) -> Option<PkgResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::load_fixture as _load_fixture;
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("pkg", name)
-    }
+    use crate::cmd::test_support::load_fixture;
 
     // ========================================================================
     // npm install: JSON
@@ -163,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_install_json_parse() {
-        let input = load_fixture("npm_install.json");
+        let input = load_fixture("pkg", "npm_install.json");
         let result = try_parse_install_json(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -180,7 +176,7 @@ mod tests {
 
     #[test]
     fn test_install_regex_parse() {
-        let input = load_fixture("npm_install_text.txt");
+        let input = load_fixture("pkg", "npm_install_text.txt");
         let result = try_parse_install_regex(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -196,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_install_json_produces_full() {
-        let input = load_fixture("npm_install.json");
+        let input = load_fixture("pkg", "npm_install.json");
         let output = CommandOutput {
             stdout: input,
             stderr: String::new(),
@@ -213,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_install_text_produces_degraded() {
-        let input = load_fixture("npm_install_text.txt");
+        let input = load_fixture("pkg", "npm_install_text.txt");
         let output = CommandOutput {
             stdout: input,
             stderr: String::new(),

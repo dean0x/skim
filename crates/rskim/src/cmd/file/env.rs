@@ -27,8 +27,8 @@ use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
 use super::{MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 /// CONFIG uses "printenv" as the binary name; `skim env` routes here via dispatch.
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
@@ -195,19 +195,11 @@ fn redact_url_credentials(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture as _load_fixture, make_output_full};
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("file", name)
-    }
-
-    fn make_output(stdout: &str, exit_code: i32) -> CommandOutput {
-        make_output_full(stdout, "", Some(exit_code))
-    }
+    use crate::cmd::test_support::{load_fixture, make_output_full};
 
     #[test]
     fn test_tier1_env_basic() {
-        let input = load_fixture("env_basic.txt");
+        let input = load_fixture("file", "env_basic.txt");
         let result = try_parse_env(&input);
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
@@ -304,7 +296,7 @@ mod tests {
 
     #[test]
     fn test_redacts_url_credentials() {
-        let input = load_fixture("env_url_creds.txt");
+        let input = load_fixture("file", "env_url_creds.txt");
         let result = try_parse_env(&input).unwrap();
 
         // DATABASE_URL is an exact key match → fully redacted
@@ -426,7 +418,7 @@ mod tests {
 
     #[test]
     fn test_tier3_empty_passthrough() {
-        let output = make_output("", 1);
+        let output = make_output_full("", "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -437,8 +429,8 @@ mod tests {
 
     #[test]
     fn test_parse_impl_produces_full() {
-        let input = load_fixture("env_basic.txt");
-        let output = make_output(&input, 0);
+        let input = load_fixture("file", "env_basic.txt");
+        let output = make_output_full(&input, "", Some(0));
         let result = parse_impl(&output);
         assert!(
             result.is_full(),

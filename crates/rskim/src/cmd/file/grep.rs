@@ -12,8 +12,8 @@ use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
 use super::try_parse_file_line_content;
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "grep",
@@ -65,15 +65,11 @@ fn try_parse_regex(text: &str) -> Option<FileResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture as _load_fixture, make_output};
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("file", name)
-    }
+    use crate::cmd::test_support::{load_fixture, make_output};
 
     #[test]
     fn test_tier1_grep_basic() {
-        let input = load_fixture("grep_basic.txt");
+        let input = load_fixture("file", "grep_basic.txt");
         let result = try_parse_regex(&input);
         assert!(result.is_some(), "Expected Tier 1 grep parse to succeed");
         let result = result.unwrap();
@@ -82,7 +78,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_produces_full() {
-        let input = load_fixture("grep_basic.txt");
+        let input = load_fixture("file", "grep_basic.txt");
         let output = make_output(&input);
         let result = parse_impl(&output);
         assert!(

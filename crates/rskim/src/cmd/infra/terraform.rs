@@ -20,8 +20,8 @@ use crate::output::ParseResult;
 use crate::output::canonical::{InfraItem, InfraResult};
 
 use super::{combine_stdout_stderr, passthrough_parse};
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "terraform",
@@ -219,15 +219,11 @@ fn try_parse_text(text: &str, subcmd: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture as _load_fixture, make_output};
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("infra", name)
-    }
+    use crate::cmd::test_support::{load_fixture, make_output};
 
     #[test]
     fn test_tier1_plan_ndjson_full_result() {
-        let fixture = load_fixture("terraform_plan_ndjson.json");
+        let fixture = load_fixture("infra", "terraform_plan_ndjson.json");
         let output = make_output(&fixture);
         let result = parse_plan(&output);
         assert!(
@@ -243,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_tier1_apply_ndjson_full_result() {
-        let fixture = load_fixture("terraform_apply_ndjson.json");
+        let fixture = load_fixture("infra", "terraform_apply_ndjson.json");
         let output = make_output(&fixture);
         let result = parse_apply(&output);
         assert!(
@@ -257,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_tier2_plan_text_degraded() {
-        let fixture = load_fixture("terraform_plan_text.txt");
+        let fixture = load_fixture("infra", "terraform_plan_text.txt");
         let output = make_output(&fixture);
         let result = parse_plan(&output);
         assert!(
@@ -273,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_tier2_no_changes_edge_case() {
-        let fixture = load_fixture("terraform_plan_no_changes.txt");
+        let fixture = load_fixture("infra", "terraform_plan_no_changes.txt");
         let output = make_output(&fixture);
         let result = parse_plan(&output);
         assert!(matches!(result, ParseResult::Degraded(_, _)));

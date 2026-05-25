@@ -522,11 +522,7 @@ fn try_parse_regex(text: &str) -> Option<TestResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::load_fixture as _load_fixture;
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("test", name)
-    }
+    use crate::cmd::test_support::load_fixture;
 
     // ========================================================================
     // Tier 1: JSON parsing
@@ -534,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_tier1_all_pass() {
-        let input = load_fixture("cargo_pass.json");
+        let input = load_fixture("test", "cargo_pass.json");
         let result = try_parse_json(&input);
         assert!(result.is_some(), "Expected Tier 1 JSON parse to succeed");
         let result = result.unwrap();
@@ -544,7 +540,7 @@ mod tests {
 
     #[test]
     fn test_tier1_with_failures() {
-        let input = load_fixture("cargo_fail.json");
+        let input = load_fixture("test", "cargo_fail.json");
         let result = try_parse_json(&input);
         assert!(result.is_some(), "Expected Tier 1 JSON parse to succeed");
         let result = result.unwrap();
@@ -569,7 +565,7 @@ mod tests {
 
     #[test]
     fn test_tier1_nextest_pass() {
-        let input = load_fixture("cargo_nextest_pass.txt");
+        let input = load_fixture("test", "cargo_nextest_pass.txt");
         let result = try_parse_nextest(&input);
         assert!(result.is_some(), "Expected Tier 1 nextest parse to succeed");
         let result = result.unwrap();
@@ -579,7 +575,7 @@ mod tests {
 
     #[test]
     fn test_tier1_nextest_dedup() {
-        let input = load_fixture("cargo_nextest_fail.txt");
+        let input = load_fixture("test", "cargo_nextest_fail.txt");
         let result = try_parse_nextest(&input);
         assert!(result.is_some(), "Expected Tier 1 nextest parse to succeed");
         let result = result.unwrap();
@@ -630,7 +626,7 @@ mod tests {
 
     #[test]
     fn test_parse_json_produces_full() {
-        let input = load_fixture("cargo_pass.json");
+        let input = load_fixture("test", "cargo_pass.json");
         let output = CommandOutput {
             stdout: input,
             stderr: String::new(),
@@ -733,7 +729,7 @@ mod tests {
 
     #[test]
     fn test_tier2_regex_scrapes_failing_test_names() {
-        let input = load_fixture("cargo_regex_fail.txt");
+        let input = load_fixture("test", "cargo_regex_fail.txt");
         let result = try_parse_regex(&input);
         assert!(
             result.is_some(),
@@ -756,7 +752,7 @@ mod tests {
     #[test]
     fn test_tier2_regression_tier1_json_still_populates_entries() {
         // Tier-1 JSON path must still populate entries (regression guard).
-        let input = load_fixture("cargo_fail.json");
+        let input = load_fixture("test", "cargo_fail.json");
         let result = try_parse_json(&input);
         assert!(result.is_some(), "Tier-1 JSON parse must succeed");
         let result = result.unwrap();

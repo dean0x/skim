@@ -30,8 +30,8 @@ use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
 use super::combine_stdout_stderr;
-use crate::cmd::{ToolRunConfig, run_tool};
 use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
 // ============================================================================
 // Tool configs
@@ -567,11 +567,7 @@ fn try_parse_nslookup_regex(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture as _load_fixture, make_output};
-
-    fn load_fixture(name: &str) -> String {
-        _load_fixture("infra", name)
-    }
+    use crate::cmd::test_support::{load_fixture, make_output};
 
     // ========================================================================
     // dig: Tier 1
@@ -579,7 +575,7 @@ mod tests {
 
     #[test]
     fn test_dig_tier1_a_record() {
-        let input = load_fixture("dig_a_record.txt");
+        let input = load_fixture("infra", "dig_a_record.txt");
         let result = try_parse_dig_structured(&input);
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
@@ -596,7 +592,7 @@ mod tests {
 
     #[test]
     fn test_dig_tier1_mx_record() {
-        let input = load_fixture("dig_mx_record.txt");
+        let input = load_fixture("infra", "dig_mx_record.txt");
         let result = try_parse_dig_structured(&input);
         assert!(result.is_some(), "Expected Tier 1 parse for MX");
         let result = result.unwrap();
@@ -608,7 +604,7 @@ mod tests {
 
     #[test]
     fn test_dig_tier1_nxdomain() {
-        let input = load_fixture("dig_nxdomain.txt");
+        let input = load_fixture("infra", "dig_nxdomain.txt");
         let result = try_parse_dig_structured(&input);
         assert!(result.is_some(), "Expected Tier 1 parse for NXDOMAIN");
         let result = result.unwrap();
@@ -628,7 +624,7 @@ mod tests {
 
     #[test]
     fn test_dig_tier1_multi_answer() {
-        let input = load_fixture("dig_multi_answer.txt");
+        let input = load_fixture("infra", "dig_multi_answer.txt");
         let result = try_parse_dig_structured(&input);
         assert!(result.is_some(), "Expected Tier 1 parse for multi-answer");
         let result = result.unwrap();
@@ -649,7 +645,7 @@ mod tests {
 
     #[test]
     fn test_dig_tier1_query_time_in_summary() {
-        let input = load_fixture("dig_a_record.txt");
+        let input = load_fixture("infra", "dig_a_record.txt");
         let result = try_parse_dig_structured(&input).unwrap();
         // Should include ms timing
         assert!(
@@ -662,7 +658,7 @@ mod tests {
     #[test]
     fn test_dig_tier1_aaaa_record() {
         // AC-DIG-10: AAAA/IPv6 records must be extracted as Tier 1 Full
-        let input = load_fixture("dig_aaaa_record.txt");
+        let input = load_fixture("infra", "dig_aaaa_record.txt");
         let result = try_parse_dig_structured(&input);
         assert!(result.is_some(), "Expected Tier 1 parse for AAAA record");
         let result = result.unwrap();
@@ -710,7 +706,7 @@ mod tests {
 
     #[test]
     fn test_dig_parse_impl_produces_full_for_a_record() {
-        let input = load_fixture("dig_a_record.txt");
+        let input = load_fixture("infra", "dig_a_record.txt");
         let output = make_output(&input);
         let result = parse_dig_impl(&output);
         assert!(
@@ -723,7 +719,7 @@ mod tests {
     #[test]
     fn test_dig_parse_impl_passthrough_for_short_output() {
         // dig +short output has no HEADER or ANSWER SECTION markers
-        let input = load_fixture("dig_short.txt");
+        let input = load_fixture("infra", "dig_short.txt");
         let output = make_output(&input);
         let result = parse_dig_impl(&output);
         assert!(
@@ -762,7 +758,7 @@ mod tests {
 
     #[test]
     fn test_nslookup_tier1_a_record() {
-        let input = load_fixture("nslookup_a_record.txt");
+        let input = load_fixture("infra", "nslookup_a_record.txt");
         let result = try_parse_nslookup_structured(&input);
         assert!(result.is_some(), "Expected Tier 1 parse for A record");
         let result = result.unwrap();
@@ -775,7 +771,7 @@ mod tests {
 
     #[test]
     fn test_nslookup_tier1_mx_record() {
-        let input = load_fixture("nslookup_mx_record.txt");
+        let input = load_fixture("infra", "nslookup_mx_record.txt");
         let result = try_parse_nslookup_structured(&input);
         assert!(result.is_some(), "Expected Tier 1 parse for MX record");
         let result = result.unwrap();
@@ -787,7 +783,7 @@ mod tests {
 
     #[test]
     fn test_nslookup_tier1_nxdomain() {
-        let input = load_fixture("nslookup_nxdomain.txt");
+        let input = load_fixture("infra", "nslookup_nxdomain.txt");
         let result = try_parse_nslookup_structured(&input);
         assert!(result.is_some(), "Expected Tier 1 parse for NXDOMAIN");
         let result = result.unwrap();
@@ -809,7 +805,7 @@ mod tests {
     #[test]
     fn test_nslookup_tier1_nxdomain_compression() {
         // AC-NSL-10: NXDOMAIN compressed output must be strictly smaller than raw input.
-        let input = load_fixture("nslookup_nxdomain.txt");
+        let input = load_fixture("infra", "nslookup_nxdomain.txt");
         let output = make_output(&input);
         let result = parse_nslookup_impl(&output);
         assert!(
@@ -838,7 +834,7 @@ mod tests {
     #[test]
     fn test_nslookup_tier1_mx_domain_extracted() {
         // AC-NSL-MX: MX queries must show the queried domain, not "unknown".
-        let input = load_fixture("nslookup_mx_record.txt");
+        let input = load_fixture("infra", "nslookup_mx_record.txt");
         let result = try_parse_nslookup_structured(&input);
         assert!(result.is_some(), "Expected Tier 1 parse for MX");
         let result = result.unwrap();
@@ -857,7 +853,7 @@ mod tests {
 
     #[test]
     fn test_nslookup_tier1_server_in_summary() {
-        let input = load_fixture("nslookup_a_record.txt");
+        let input = load_fixture("infra", "nslookup_a_record.txt");
         let result = try_parse_nslookup_structured(&input).unwrap();
         assert!(
             result.as_ref().contains("via"),
@@ -1005,7 +1001,7 @@ mod tests {
 
     #[test]
     fn test_nslookup_parse_impl_produces_full() {
-        let input = load_fixture("nslookup_a_record.txt");
+        let input = load_fixture("infra", "nslookup_a_record.txt");
         let output = make_output(&input);
         let result = parse_nslookup_impl(&output);
         assert!(
