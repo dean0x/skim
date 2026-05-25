@@ -309,7 +309,8 @@ mod tests {
  => [3/3] RUN pip install -r requirements.txt\n\
 WARNING: Running pip as the 'root' user can result in broken permissions\n\
 WARNING: pip is configured with locations that require TLS/SSL\n";
-        let result = try_parse_build(input).expect("expected Some for BuildKit output with warnings");
+        let result =
+            try_parse_build(input).expect("expected Some for BuildKit output with warnings");
         let display = result.to_string();
         assert!(
             display.contains("Running pip as the 'root' user"),
