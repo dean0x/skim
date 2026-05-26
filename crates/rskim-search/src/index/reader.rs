@@ -378,7 +378,15 @@ impl SearchLayer for NgramIndexReader {
             )?;
         }
 
-        let mut scored: Vec<(u32, f64)> = doc_scores.into_iter().collect();
+        // Apply file_filter allowlist: discard any scored doc not in the set.
+        let mut scored: Vec<(u32, f64)> = if let Some(ref filter) = query.file_filter {
+            doc_scores
+                .into_iter()
+                .filter(|(doc_id, _)| filter.contains(&FileId(*doc_id)))
+                .collect()
+        } else {
+            doc_scores.into_iter().collect()
+        };
         // Sort descending by score; tie-break ascending by FileId for determinism.
         // FileId tie-breaking already guarantees a total order so stable sort is not needed.
         scored.sort_unstable_by(|a, b| {

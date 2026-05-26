@@ -176,6 +176,7 @@ fn test_format_text_output_includes_path_and_score() {
         }),
         stale: false,
         match_positions: vec![],
+        temporal: None,
     };
 
     let output = QueryOutput {
@@ -215,6 +216,7 @@ fn test_format_text_output_includes_stale_marker() {
         }),
         stale: true,
         match_positions: vec![],
+        temporal: None,
     };
 
     let output = QueryOutput {
@@ -312,6 +314,7 @@ fn test_resolved_result_line_range_some_serializes_start_end() {
         snippet: None,
         stale: false,
         match_positions: vec![],
+        temporal: None,
     };
 
     let value = serde_json::to_value(&result).expect("ResolvedResult must serialize");
@@ -336,6 +339,7 @@ fn test_resolved_result_line_range_none_serializes_null() {
         snippet: None,
         stale: false,
         match_positions: vec![],
+        temporal: None,
     };
 
     let value = serde_json::to_value(&result).expect("ResolvedResult must serialize");
@@ -367,4 +371,180 @@ fn test_format_json_output_is_valid_json() {
     let parsed: serde_json::Value = serde_json::from_str(s).expect("must be valid JSON");
     assert_eq!(parsed["query"], "test");
     assert_eq!(parsed["total"], 0);
+}
+
+// ============================================================================
+// Temporal annotation in text output (Step 11)
+// ============================================================================
+
+/// format_text_output includes "hotspot: X.XXX" when temporal annotation present.
+#[test]
+fn test_format_text_output_includes_temporal_hotspot() {
+    use crate::cmd::search::types::{ResolvedResult, TemporalAnnotation};
+
+    let result = ResolvedResult {
+        path: "src/hot.rs".to_string(),
+        score: 5.0,
+        field: "function_signature".to_string(),
+        line_number: Some(1),
+        line_range: Some(1..2),
+        snippet: None,
+        stale: false,
+        match_positions: vec![],
+        temporal: Some(TemporalAnnotation {
+            hotspot_score: Some(0.95),
+            ..Default::default()
+        }),
+    };
+
+    let output = QueryOutput {
+        query: "hot".to_string(),
+        total: 1,
+        results: vec![result],
+        duration_ms: 1,
+        index_stats: None,
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_text_output(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+    assert!(
+        s.contains("hotspot:"),
+        "temporal hotspot annotation must appear, got: {s:?}"
+    );
+    assert!(
+        s.contains("0.950"),
+        "hotspot score must be formatted to 3dp, got: {s:?}"
+    );
+}
+
+/// format_text_output shows "risk: X.XXX" when risk annotation present.
+#[test]
+fn test_format_text_output_includes_temporal_risk() {
+    use crate::cmd::search::types::{ResolvedResult, TemporalAnnotation};
+
+    let result = ResolvedResult {
+        path: "src/risky.rs".to_string(),
+        score: 3.0,
+        field: "function_signature".to_string(),
+        line_number: None,
+        line_range: None,
+        snippet: None,
+        stale: false,
+        match_positions: vec![],
+        temporal: Some(TemporalAnnotation {
+            risk_score: Some(0.80),
+            ..Default::default()
+        }),
+    };
+
+    let output = QueryOutput {
+        query: "risky".to_string(),
+        total: 1,
+        results: vec![result],
+        duration_ms: 1,
+        index_stats: None,
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_text_output(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+    assert!(
+        s.contains("risk:"),
+        "risk annotation must appear, got: {s:?}"
+    );
+    assert!(
+        s.contains("0.800"),
+        "risk score must be formatted to 3dp, got: {s:?}"
+    );
+}
+
+/// format_text_output omits temporal section when annotation is None.
+#[test]
+fn test_format_text_output_omits_temporal_when_none() {
+    use crate::cmd::search::types::ResolvedResult;
+
+    let result = ResolvedResult {
+        path: "src/plain.rs".to_string(),
+        score: 2.0,
+        field: "function_signature".to_string(),
+        line_number: None,
+        line_range: None,
+        snippet: None,
+        stale: false,
+        match_positions: vec![],
+        temporal: None,
+    };
+
+    let output = QueryOutput {
+        query: "plain".to_string(),
+        total: 1,
+        results: vec![result],
+        duration_ms: 1,
+        index_stats: None,
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_text_output(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+    assert!(
+        !s.contains("hotspot:"),
+        "no hotspot annotation when temporal is None, got: {s:?}"
+    );
+    assert!(
+        !s.contains("risk:"),
+        "no risk annotation when temporal is None, got: {s:?}"
+    );
+}
+
+/// format_json_output includes temporal annotations inside each result object.
+#[test]
+fn test_format_json_output_includes_temporal_annotations() {
+    use crate::cmd::search::types::{ResolvedResult, TemporalAnnotation};
+
+    let result = ResolvedResult {
+        path: "src/hot.rs".to_string(),
+        score: 5.0,
+        field: "function_signature".to_string(),
+        line_number: None,
+        line_range: None,
+        snippet: None,
+        stale: false,
+        match_positions: vec![],
+        temporal: Some(TemporalAnnotation {
+            hotspot_score: Some(0.95),
+            risk_score: Some(0.70),
+            ..Default::default()
+        }),
+    };
+
+    let output = QueryOutput {
+        query: "hot".to_string(),
+        total: 1,
+        results: vec![result],
+        duration_ms: 1,
+        index_stats: None,
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_json_output(&output, &mut buf).unwrap();
+    let bytes = buf.into_inner().unwrap();
+    let s = std::str::from_utf8(&bytes).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(s).expect("must be valid JSON");
+
+    let temporal = &parsed["results"][0]["temporal"];
+    assert!(
+        !temporal.is_null(),
+        "temporal field must be present in JSON when Some"
+    );
+    let hs = temporal["hotspot_score"].as_f64().unwrap();
+    assert!(
+        (hs - 0.95).abs() < 1e-6,
+        "hotspot_score must be ~0.95, got {hs}"
+    );
+    let rs = temporal["risk_score"].as_f64().unwrap();
+    assert!(
+        (rs - 0.70).abs() < 1e-6,
+        "risk_score must be ~0.70, got {rs}"
+    );
 }

@@ -19,6 +19,7 @@ mod manifest;
 mod query;
 mod snippet;
 mod staleness;
+mod temporal;
 mod types;
 mod walk;
 
@@ -73,8 +74,20 @@ pub(crate) fn run(
             flags.limit,
             flags.json,
             &flags.root_override,
+            flags.temporal_sort,
+            flags.blast_radius.as_deref(),
             analytics,
         ),
+        // Empty query with temporal flags → standalone temporal dispatch.
+        SearchAction::Query(_) if flags.temporal_sort.is_some() || flags.blast_radius.is_some() => {
+            run_temporal_standalone(
+                flags.limit,
+                flags.json,
+                &flags.root_override,
+                flags.temporal_sort,
+                flags.blast_radius.as_deref(),
+            )
+        }
         SearchAction::Query(_) => {
             // Empty query (no positional args and no action flag) → help.
             print_help();
@@ -110,6 +123,10 @@ struct Flags {
     json: bool,
     limit: usize,
     root_override: Option<PathBuf>,
+    /// Sort mode for temporal queries — mutually exclusive.
+    temporal_sort: Option<types::TemporalSort>,
+    /// Raw path for blast-radius pre-filtering. Normalized later in run_query.
+    blast_radius: Option<String>,
 }
 
 /// Parse and validate a `--limit` value string.
@@ -141,6 +158,8 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut limit: usize = 20;
     let mut root_override: Option<PathBuf> = None;
     let mut query_parts: Vec<String> = Vec::new();
+    let mut temporal_sort: Option<types::TemporalSort> = None;
+    let mut blast_radius: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -166,6 +185,34 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                 })?;
                 root_override = Some(PathBuf::from(val));
             }
+            "--hot" => {
+                if let Some(existing) = temporal_sort {
+                    anyhow::bail!("--hot and {} are mutually exclusive", existing.flag_name());
+                }
+                temporal_sort = Some(types::TemporalSort::Hot);
+            }
+            "--cold" => {
+                if let Some(existing) = temporal_sort {
+                    anyhow::bail!("--cold and {} are mutually exclusive", existing.flag_name());
+                }
+                temporal_sort = Some(types::TemporalSort::Cold);
+            }
+            "--risky" => {
+                if let Some(existing) = temporal_sort {
+                    anyhow::bail!(
+                        "--risky and {} are mutually exclusive",
+                        existing.flag_name()
+                    );
+                }
+                temporal_sort = Some(types::TemporalSort::Risky);
+            }
+            "--blast-radius" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--blast-radius requires a file path"))?;
+                blast_radius = Some(val.clone());
+            }
             s if s.starts_with("--limit=") => {
                 let raw = s.trim_start_matches("--limit=");
                 limit = parse_limit_value(raw)?;
@@ -173,10 +220,14 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
             s if s.starts_with("--root=") => {
                 root_override = Some(PathBuf::from(s.trim_start_matches("--root=")));
             }
+            s if s.starts_with("--blast-radius=") => {
+                blast_radius = Some(s.trim_start_matches("--blast-radius=").to_string());
+            }
             s if s.starts_with("--") => {
                 anyhow::bail!(
                     "unrecognised flag {:?}. Valid flags: --build, --rebuild, --update, \
-                     --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --root",
+                     --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --root, \
+                     --hot, --cold, --risky, --blast-radius",
                     s
                 );
             }
@@ -193,6 +244,8 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
         json,
         limit,
         root_override,
+        temporal_sort,
+        blast_radius,
     })
 }
 
@@ -341,6 +394,8 @@ fn run_query(
     limit: usize,
     json: bool,
     root_override: &Option<PathBuf>,
+    temporal_sort: Option<types::TemporalSort>,
+    blast_radius: Option<&str>,
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
     let (root, cache_dir) = resolve_root_and_cache(root_override)?;
@@ -350,17 +405,95 @@ fn run_query(
         text: text.to_string(),
         limit,
         json,
-        root,
-        cache_dir,
+        root: root.clone(),
+        cache_dir: cache_dir.clone(),
     };
 
-    let output = query::execute_query(&config, analytics)?;
+    let mut output = query::execute_query(&config, analytics)?;
+
+    // Apply temporal enrichment if requested.
+    if temporal_sort.is_some() || blast_radius.is_some() {
+        let temporal_db_path = cache_dir.join("temporal.db");
+        if let Some(db) = temporal::open_temporal_db(&temporal_db_path) {
+            // Blast-radius pre-filter: resolve co-change partners and restrict results.
+            if let Some(raw_path) = blast_radius {
+                match temporal::normalize_blast_radius_path(raw_path, &root) {
+                    Ok(normalized) => {
+                        let partners = db.cochanges_for_file(&normalized)?;
+                        if partners.is_empty() {
+                            eprintln!("skim search: no co-change data for {raw_path:?}");
+                        }
+                        // Filter results to only those that are co-change partners.
+                        let partner_paths: std::collections::HashSet<String> = partners
+                            .iter()
+                            .map(|p| {
+                                if p.file_a == normalized {
+                                    p.file_b.clone()
+                                } else {
+                                    p.file_a.clone()
+                                }
+                            })
+                            .collect();
+                        output.results.retain(|r| partner_paths.contains(&r.path));
+                        output.total = output.results.len();
+                    }
+                    Err(e) => {
+                        eprintln!("skim search: --blast-radius: {e}");
+                    }
+                }
+            }
+            // Apply temporal sort/annotation.
+            if let Some(sort) = temporal_sort {
+                temporal::apply_temporal_enrichment(&mut output.results, sort, &db)?;
+                output.total = output.results.len();
+            }
+        } else {
+            eprintln!("skim search: no temporal data — run 'skim heatmap' to populate");
+        }
+    }
 
     let mut stdout = BufWriter::new(std::io::stdout());
     if json {
         query::format_json_output(&output, &mut stdout)?;
     } else {
         query::format_text_output(&output, &mut stdout)?;
+    }
+    stdout.flush()?;
+
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_temporal_standalone(
+    limit: usize,
+    json: bool,
+    root_override: &Option<PathBuf>,
+    temporal_sort: Option<types::TemporalSort>,
+    blast_radius: Option<&str>,
+) -> anyhow::Result<ExitCode> {
+    let (root, cache_dir) = resolve_root_and_cache(root_override)?;
+    let temporal_db_path = cache_dir.join("temporal.db");
+
+    let Some(db) = temporal::open_temporal_db(&temporal_db_path) else {
+        if json {
+            println!("{{\"error\": \"no temporal data — run 'skim heatmap' to populate\"}}");
+        } else {
+            eprintln!("skim search: no temporal data — run 'skim heatmap' to populate");
+        }
+        return Ok(ExitCode::FAILURE);
+    };
+
+    // Check staleness.
+    if let Some(warning) = temporal::check_temporal_staleness(&db, &root) {
+        eprintln!("{warning}");
+    }
+
+    let output = temporal::query_standalone(temporal_sort, blast_radius, limit, &db, &root)?;
+
+    let mut stdout = BufWriter::new(std::io::stdout());
+    if json {
+        temporal::format_temporal_json(&output, &mut stdout)?;
+    } else {
+        temporal::format_temporal_text(&output, &mut stdout)?;
     }
     stdout.flush()?;
 
@@ -394,15 +527,30 @@ Options:
   --root PATH      Override project root (default: walk up to .git)
   -h, --help       Print this help message
 
+Temporal query options (require 'skim heatmap' data):
+  --hot                        Sort/list by hotspot score descending
+  --cold                       Sort/list by hotspot score ascending
+  --risky                      Sort/list by bug-fix density descending
+  --blast-radius FILE          Restrict to co-change partners of FILE
+
+Temporal flag composition:
+  --hot and --cold/--risky are mutually exclusive (pick one sort mode).
+  --blast-radius is composable with any sort mode and with text queries.
+
 Examples:
-  skim search \"authenticate\"          Search for 'authenticate'
-  skim search --limit 5 \"parse_url\"   Return at most 5 results
-  skim search --json \"UserService\"    JSON output
-  skim search --build                 Build the search index
-  skim search --rebuild               Rebuild from scratch
-  skim search --update                Refresh stale index
-  skim search --stats                 Show index statistics
-  skim search --install-hooks         Auto-refresh on git commit/merge"
+  skim search \"authenticate\"                Search for 'authenticate'
+  skim search --limit 5 \"parse_url\"         Return at most 5 results
+  skim search --json \"UserService\"          JSON output
+  skim search --build                       Build the search index
+  skim search --rebuild                     Rebuild from scratch
+  skim search --update                      Refresh stale index
+  skim search --stats                       Show index statistics
+  skim search --install-hooks               Auto-refresh on git commit/merge
+  skim search --hot                         Top hotspot files (standalone)
+  skim search --risky                       Top risky files (standalone)
+  skim search --blast-radius src/auth.rs    Co-change partners of auth.rs
+  skim search \"auth\" --hot                  Text results sorted by hotspot
+  skim search \"auth\" --blast-radius src/auth.rs  Text within co-change partners"
     );
 }
 

@@ -50,9 +50,9 @@ fn wal_mode_enabled() {
 }
 
 #[test]
-fn schema_version_is_1() {
+fn schema_version_is_2() {
     let (_dir, db) = temp_db();
-    assert_eq!(db.schema_version().unwrap(), 1);
+    assert_eq!(db.schema_version().unwrap(), 2);
 }
 
 #[test]
@@ -352,4 +352,320 @@ fn sync_rejects_over_capacity() {
         .collect();
     let err = db.sync(&big, &[], &[], "head").unwrap_err();
     assert!(matches!(err, SearchError::CapacityExceeded(_)));
+}
+
+// ============================================================================
+// Group 7: Per-file lookup methods (Step 1)
+// ============================================================================
+
+#[test]
+fn hotspot_for_file_returns_none_when_empty() {
+    let (_dir, db) = temp_db();
+    assert_eq!(db.hotspot_for_file("src/main.rs").unwrap(), None);
+}
+
+#[test]
+fn hotspot_for_file_returns_row_when_present() {
+    let (_dir, db) = temp_db();
+    let row = HotspotRow {
+        file_path: "src/auth.rs".to_string(),
+        score: 0.85,
+        changes_30d: 10,
+        changes_90d: 25,
+    };
+    db.store_hotspots(&[row.clone()]).unwrap();
+    let found = db.hotspot_for_file("src/auth.rs").unwrap().unwrap();
+    assert_eq!(found, row);
+}
+
+#[test]
+fn hotspot_for_file_returns_none_for_unknown_path() {
+    let (_dir, db) = temp_db();
+    db.store_hotspots(&[HotspotRow {
+        file_path: "src/auth.rs".to_string(),
+        score: 0.5,
+        changes_30d: 1,
+        changes_90d: 2,
+    }])
+    .unwrap();
+    assert_eq!(db.hotspot_for_file("src/other.rs").unwrap(), None);
+}
+
+#[test]
+fn risk_for_file_returns_none_when_empty() {
+    let (_dir, db) = temp_db();
+    assert_eq!(db.risk_for_file("src/main.rs").unwrap(), None);
+}
+
+#[test]
+fn risk_for_file_returns_row_when_present() {
+    let (_dir, db) = temp_db();
+    let row = RiskRow {
+        file_path: "src/engine.rs".to_string(),
+        risk_score: 0.72,
+        total_commits: 30,
+        fix_commits: 8,
+        fix_density: 0.267,
+    };
+    db.store_risks(&[row.clone()]).unwrap();
+    let found = db.risk_for_file("src/engine.rs").unwrap().unwrap();
+    assert_eq!(found, row);
+}
+
+#[test]
+fn cochanges_for_file_returns_empty_when_no_pairs() {
+    let (_dir, db) = temp_db();
+    assert!(db.cochanges_for_file("src/auth.rs").unwrap().is_empty());
+}
+
+#[test]
+fn cochanges_for_file_returns_both_directions() {
+    let (_dir, db) = temp_db();
+    // Canonical ordering: file_a < file_b lexically.
+    // "src/a.rs" < "src/b.rs" so file_a = "src/a.rs", file_b = "src/b.rs".
+    let row = CochangeRow {
+        file_a: "src/a.rs".to_string(),
+        file_b: "src/b.rs".to_string(),
+        count: 5,
+        jaccard: 0.6,
+    };
+    db.store_cochanges(&[row.clone()]).unwrap();
+
+    // Query for file_a should find it
+    let from_a = db.cochanges_for_file("src/a.rs").unwrap();
+    assert_eq!(from_a.len(), 1);
+    assert_eq!(from_a[0], row);
+
+    // Query for file_b should also find it
+    let from_b = db.cochanges_for_file("src/b.rs").unwrap();
+    assert_eq!(from_b.len(), 1);
+    assert_eq!(from_b[0], row);
+}
+
+#[test]
+fn cochanges_for_file_returns_multiple_sorted_by_jaccard() {
+    let (_dir, db) = temp_db();
+    let rows = vec![
+        CochangeRow {
+            file_a: "src/a.rs".to_string(),
+            file_b: "src/c.rs".to_string(),
+            count: 3,
+            jaccard: 0.3,
+        },
+        CochangeRow {
+            file_a: "src/a.rs".to_string(),
+            file_b: "src/b.rs".to_string(),
+            count: 7,
+            jaccard: 0.8,
+        },
+    ];
+    db.store_cochanges(&rows).unwrap();
+    let results = db.cochanges_for_file("src/a.rs").unwrap();
+    assert_eq!(results.len(), 2);
+    // Should be sorted descending by jaccard
+    assert!(
+        results[0].jaccard >= results[1].jaccard,
+        "results should be sorted by jaccard desc"
+    );
+    assert!((results[0].jaccard - 0.8).abs() < f64::EPSILON);
+}
+
+#[test]
+fn cochanges_for_file_respects_canonical_ordering() {
+    let (_dir, db) = temp_db();
+    // Only "src/auth.rs" is involved; "src/middleware.rs" > "src/auth.rs" lexically
+    // so auth.rs is stored as file_a.
+    let row = CochangeRow {
+        file_a: "src/auth.rs".to_string(),
+        file_b: "src/middleware.rs".to_string(),
+        count: 12,
+        jaccard: 0.72,
+    };
+    db.store_cochanges(&[row.clone()]).unwrap();
+    // Both directions should find the same row
+    let via_a = db.cochanges_for_file("src/auth.rs").unwrap();
+    let via_b = db.cochanges_for_file("src/middleware.rs").unwrap();
+    assert_eq!(via_a, vec![row.clone()]);
+    assert_eq!(via_b, vec![row]);
+}
+
+// ============================================================================
+// Group 8: Top-N query methods (Step 2)
+// ============================================================================
+
+#[test]
+fn top_hotspots_sorted_descending() {
+    let (_dir, db) = temp_db();
+    db.store_hotspots(&[
+        HotspotRow {
+            file_path: "b.rs".to_string(),
+            score: 0.5,
+            changes_30d: 2,
+            changes_90d: 5,
+        },
+        HotspotRow {
+            file_path: "a.rs".to_string(),
+            score: 0.9,
+            changes_30d: 8,
+            changes_90d: 20,
+        },
+        HotspotRow {
+            file_path: "c.rs".to_string(),
+            score: 0.3,
+            changes_30d: 1,
+            changes_90d: 3,
+        },
+    ])
+    .unwrap();
+    let results = db.top_hotspots(10).unwrap();
+    assert_eq!(results.len(), 3);
+    // Scores should be in descending order
+    for i in 0..results.len() - 1 {
+        assert!(results[i].score >= results[i + 1].score);
+    }
+    assert!((results[0].score - 0.9).abs() < f64::EPSILON);
+}
+
+#[test]
+fn top_hotspots_respects_limit() {
+    let (_dir, db) = temp_db();
+    db.store_hotspots(&[
+        HotspotRow {
+            file_path: "a.rs".to_string(),
+            score: 0.9,
+            changes_30d: 1,
+            changes_90d: 2,
+        },
+        HotspotRow {
+            file_path: "b.rs".to_string(),
+            score: 0.7,
+            changes_30d: 1,
+            changes_90d: 2,
+        },
+        HotspotRow {
+            file_path: "c.rs".to_string(),
+            score: 0.5,
+            changes_30d: 1,
+            changes_90d: 2,
+        },
+    ])
+    .unwrap();
+    let results = db.top_hotspots(2).unwrap();
+    assert_eq!(results.len(), 2, "limit should cap at 2 rows");
+    assert!((results[0].score - 0.9).abs() < f64::EPSILON);
+}
+
+#[test]
+fn top_hotspots_empty_table_returns_empty() {
+    let (_dir, db) = temp_db();
+    assert!(db.top_hotspots(10).unwrap().is_empty());
+}
+
+#[test]
+fn top_risks_sorted_descending() {
+    let (_dir, db) = temp_db();
+    db.store_risks(&[
+        RiskRow {
+            file_path: "a.rs".to_string(),
+            risk_score: 0.3,
+            total_commits: 10,
+            fix_commits: 1,
+            fix_density: 0.1,
+        },
+        RiskRow {
+            file_path: "b.rs".to_string(),
+            risk_score: 0.8,
+            total_commits: 20,
+            fix_commits: 6,
+            fix_density: 0.3,
+        },
+    ])
+    .unwrap();
+    let results = db.top_risks(10).unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results[0].risk_score >= results[1].risk_score);
+    assert!((results[0].risk_score - 0.8).abs() < f64::EPSILON);
+}
+
+#[test]
+fn top_coldspots_sorted_ascending() {
+    let (_dir, db) = temp_db();
+    db.store_hotspots(&[
+        HotspotRow {
+            file_path: "hot.rs".to_string(),
+            score: 0.95,
+            changes_30d: 20,
+            changes_90d: 50,
+        },
+        HotspotRow {
+            file_path: "cold.rs".to_string(),
+            score: 0.05,
+            changes_30d: 0,
+            changes_90d: 1,
+        },
+        HotspotRow {
+            file_path: "medium.rs".to_string(),
+            score: 0.5,
+            changes_30d: 5,
+            changes_90d: 12,
+        },
+    ])
+    .unwrap();
+    let results = db.top_coldspots(10).unwrap();
+    assert_eq!(results.len(), 3);
+    // Ascending: coldest first
+    for i in 0..results.len() - 1 {
+        assert!(results[i].score <= results[i + 1].score);
+    }
+    assert!((results[0].score - 0.05).abs() < f64::EPSILON);
+}
+
+#[test]
+fn top_risks_empty_returns_empty() {
+    let (_dir, db) = temp_db();
+    assert!(db.top_risks(10).unwrap().is_empty());
+}
+
+// ============================================================================
+// Group 9: Schema v2 migration (Step 3)
+// ============================================================================
+
+#[test]
+fn v1_database_migrates_to_v2_on_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("migrate.db");
+
+    // Create a v1 database manually.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "BEGIN;
+            CREATE TABLE IF NOT EXISTS hotspot (
+                file_path TEXT PRIMARY KEY, score REAL NOT NULL,
+                changes_30d INTEGER NOT NULL, changes_90d INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS risk (
+                file_path TEXT PRIMARY KEY, risk_score REAL NOT NULL,
+                total_commits INTEGER NOT NULL, fix_commits INTEGER NOT NULL,
+                fix_density REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cochange (
+                file_a TEXT NOT NULL, file_b TEXT NOT NULL,
+                count INTEGER NOT NULL, jaccard REAL NOT NULL,
+                PRIMARY KEY (file_a, file_b)
+            );
+            CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            PRAGMA user_version = 1;
+            COMMIT;",
+        )
+        .unwrap();
+    }
+
+    // Reopen via TemporalDb — should migrate to v2.
+    let db = TemporalDb::open(&path).unwrap();
+    assert_eq!(
+        db.schema_version().unwrap(),
+        2,
+        "v1 database should be migrated to v2 on reopen"
+    );
 }

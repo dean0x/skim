@@ -10,6 +10,54 @@ use rskim_search::SearchField;
 use serde::Serialize;
 
 // ============================================================================
+// Temporal query types (Issue #189)
+// ============================================================================
+
+/// Sort mode for temporal queries. Mutually exclusive with each other.
+///
+/// When combined with a text query, the sort is applied to the text results.
+/// When used standalone (no query text), produces a ranked list from temporal DB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TemporalSort {
+    /// Sort by hotspot score descending (most active files first).
+    Hot,
+    /// Sort by hotspot score ascending (least active files first).
+    Cold,
+    /// Sort by fix_density descending (most bug-prone files first).
+    Risky,
+}
+
+impl TemporalSort {
+    /// Human-readable flag name for use in error messages.
+    pub(super) fn flag_name(self) -> &'static str {
+        match self {
+            Self::Hot => "--hot",
+            Self::Cold => "--cold",
+            Self::Risky => "--risky",
+        }
+    }
+}
+
+/// Temporal annotation attached to a resolved search result.
+///
+/// Fields are `None` when the file is not present in the temporal database.
+#[derive(Debug, Clone, Serialize, Default)]
+pub(super) struct TemporalAnnotation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hotspot_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix_density: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cochange_jaccard: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes_30d: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes_90d: Option<u32>,
+}
+
+// ============================================================================
 // Snippet types
 // ============================================================================
 
@@ -76,6 +124,9 @@ pub(super) struct ResolvedResult {
     /// Byte-position ranges within the file content where query terms appear.
     #[serde(skip)]
     pub match_positions: Vec<Range<usize>>,
+    /// Optional temporal data for this file, populated when temporal flags are active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporal: Option<TemporalAnnotation>,
 }
 
 /// Output produced by a query execution run.
