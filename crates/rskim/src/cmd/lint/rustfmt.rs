@@ -347,7 +347,11 @@ mod tests {
     fn test_parse_impl_text_produces_degraded() {
         // Tier 2 input: unified diff headers (`--- <path>`) that pass Tier 2
         // but NOT Tier 1 (`Diff in <path> at line <N>:`).
-        let output = make_output_full("--- src/main.rs\n+++ src/main.rs\n-old line\n+new line\n", "", Some(1));
+        let output = make_output_full(
+            "--- src/main.rs\n+++ src/main.rs\n-old line\n+new line\n",
+            "",
+            Some(1),
+        );
         let result = parse_check_impl(&output);
         assert!(
             result.is_degraded(),
@@ -432,7 +436,11 @@ mod tests {
     /// AD-LINT-20: non-zero exit = syntax error → passthrough.
     #[test]
     fn test_rustfmt_format_error_is_passthrough() {
-        let output = make_output_full("", "error[E0001]: unexpected token `}` in format string\n --> src/main.rs:5:1", Some(1));
+        let output = make_output_full(
+            "",
+            "error[E0001]: unexpected token `}` in format string\n --> src/main.rs:5:1",
+            Some(1),
+        );
         let result = parse_format_impl(&output);
         assert!(
             result.is_passthrough(),

@@ -361,7 +361,11 @@ mod tests {
 
     #[test]
     fn test_parse_impl_garbage_produces_passthrough() {
-        let output = make_output_full("unexpected output from prettier\nno warn lines at all", "", Some(1));
+        let output = make_output_full(
+            "unexpected output from prettier\nno warn lines at all",
+            "",
+            Some(1),
+        );
         let result = parse_check_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -374,7 +378,11 @@ mod tests {
     fn test_parse_impl_text_produces_degraded() {
         // Tier 2 input: matches the `<path> needs formatting` regex but NOT the
         // `[warn]` Tier 1 format.
-        let output = make_output_full("src/main.ts needs formatting\nsrc/utils/helper.js needs formatting\n", "", Some(1));
+        let output = make_output_full(
+            "src/main.ts needs formatting\nsrc/utils/helper.js needs formatting\n",
+            "",
+            Some(1),
+        );
         let result = parse_check_impl(&output);
         assert!(
             result.is_degraded(),
