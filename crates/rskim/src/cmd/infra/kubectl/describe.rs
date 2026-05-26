@@ -55,6 +55,28 @@ pub(crate) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     ParseResult::Passthrough(combined.into_owned())
 }
 
+/// Parse `kubectl describe` text output.
+///
+/// ## State machine for section skipping
+///
+/// `kubectl describe` output is structured as a flat stream of indented
+/// key-value lines, grouped into labelled sections.  Some sections
+/// (Annotations, Managed Fields) are verbose metadata that adds noise
+/// without value for AI context windows.
+///
+/// The parser tracks a single boolean flag `in_skip_section` that acts as a
+/// two-state machine:
+///
+/// - **`false` (normal)**: Process lines as key-value pairs.  When the current
+///   line matches a `SKIP_SECTIONS` header (e.g. `Annotations:`), transition
+///   to **`true`** and drop the header line.
+///
+/// - **`true` (skipping)**: Discard every line.  When a non-indented line
+///   appears (i.e. a new top-level section header or a blank separator),
+///   transition back to **`false`** and re-process that line.
+///
+/// Indentation is the boundary signal: section body lines always start with
+/// at least one space or tab, while new section headers start at column 0.
 fn try_parse_describe(text: &str) -> Option<InfraResult> {
     let mut items: Vec<InfraItem> = Vec::new();
     let mut in_skip_section = false;
@@ -145,28 +167,11 @@ fn try_parse_describe(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::CommandOutput;
-
-    fn make_output(stdout: &str) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
-    }
-
-    fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/infra");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
+    use crate::cmd::test_support::{load_fixture, make_output};
 
     #[test]
     fn test_tier2_describe_degraded() {
-        let fixture = load_fixture("kubectl_describe_pod.txt");
+        let fixture = load_fixture("infra", "kubectl_describe_pod.txt");
         let output = make_output(&fixture);
         let result = parse_impl(&output);
         assert!(
@@ -177,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_describe_extracts_name_and_namespace() {
-        let fixture = load_fixture("kubectl_describe_pod.txt");
+        let fixture = load_fixture("infra", "kubectl_describe_pod.txt");
         let output = make_output(&fixture);
         if let ParseResult::Degraded(r, _) = parse_impl(&output) {
             let display = r.to_string();
@@ -191,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_describe_strips_annotations_section() {
-        let fixture = load_fixture("kubectl_describe_pod.txt");
+        let fixture = load_fixture("infra", "kubectl_describe_pod.txt");
         let output = make_output(&fixture);
         if let ParseResult::Degraded(r, _) = parse_impl(&output) {
             let display = r.to_string();

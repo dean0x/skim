@@ -23,12 +23,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
-use super::{LinterConfig, combine_stdout_stderr, group_issues};
+use super::{combine_stdout_stderr, group_issues};
+use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
-const CONFIG: LinterConfig<'static> = LinterConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "ruff",
     env_overrides: &[("NO_COLOR", "1")],
     install_hint: "Install ruff: pip install ruff",
+    family: "lint",
+    skip_ansi_strip: false,
+    command_type: CommandType::Lint,
 };
 
 // Static regex patterns compiled once via LazyLock.
@@ -81,7 +86,7 @@ fn run_check(
         .skip(if starts_with_check { 1 } else { 0 })
         .cloned()
         .collect();
-    super::run_linter(
+    run_tool(
         CONFIG,
         &remaining,
         ctx,
@@ -134,7 +139,7 @@ fn run_format(
     // file args remain (e.g., `cat output.txt | skim ruff format`).
     // `prepare_format_args` re-injects "format" for binary execution.
     let remaining: Vec<String> = args.iter().skip(1).cloned().collect();
-    super::run_linter(
+    run_tool(
         CONFIG,
         &remaining,
         ctx,
@@ -146,7 +151,7 @@ fn run_format(
 /// Re-inject the `format` subcommand stripped by `run_format`.
 ///
 /// When `ruff format` is executed as a binary, `format` must be the first
-/// argument. We strip it before `run_linter` to allow stdin detection, then
+/// argument. We strip it before `run_tool` to allow stdin detection, then
 /// restore it here.
 fn prepare_format_args(cmd_args: &mut Vec<String>) {
     if cmd_args.first().is_none_or(|a| a != "format") {
@@ -361,6 +366,7 @@ mod tests {
     use super::*;
 
     use crate::cmd::lint::load_lint_fixture as load_fixture;
+    use crate::cmd::test_support::{make_output, make_output_full};
 
     // -------------------------------------------------------------------------
     // Check mode (existing tests, unchanged)
@@ -398,12 +404,7 @@ mod tests {
     #[test]
     fn test_parse_impl_json_produces_full() {
         let input = load_fixture("ruff_fail.json");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_check_impl(&output);
         assert!(result.is_full());
     }
@@ -411,12 +412,7 @@ mod tests {
     #[test]
     fn test_parse_impl_text_produces_degraded() {
         let input = load_fixture("ruff_text.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_check_impl(&output);
         assert!(
             result.is_degraded(),
@@ -427,12 +423,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_garbage_produces_passthrough() {
-        let output = CommandOutput {
-            stdout: "random garbage".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("random garbage", "", Some(1));
         let result = parse_check_impl(&output);
         assert!(result.is_passthrough());
     }
@@ -482,12 +473,7 @@ mod tests {
     /// AD-LINT-20: empty output on exit 0 = no files reformatted.
     #[test]
     fn test_ruff_format_empty_output_is_pass() {
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("");
         let result = parse_format_impl(&output);
         assert!(
             result.is_full(),
@@ -522,12 +508,7 @@ mod tests {
     #[test]
     fn test_parse_format_impl_fail_fixture_is_full() {
         let input = load_fixture("ruff_format_check_fail.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_format_impl(&output);
         assert!(
             result.is_full(),
@@ -540,12 +521,7 @@ mod tests {
     #[test]
     fn test_parse_format_impl_pass_fixture_is_full() {
         let input = load_fixture("ruff_format_pass.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output(&input);
         let result = parse_format_impl(&output);
         assert!(
             result.is_full(),

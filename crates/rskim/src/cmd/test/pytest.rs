@@ -500,18 +500,7 @@ fn emit_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Load a fixture file from the test fixtures directory.
-    fn load_fixture(name: &str) -> String {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("fixtures")
-            .join("cmd")
-            .join("test")
-            .join(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture {}: {e}", path.display()))
-    }
+    use crate::cmd::test_support::load_fixture;
 
     // ========================================================================
     // Tier 1 tests
@@ -519,7 +508,7 @@ mod tests {
 
     #[test]
     fn test_tier1_all_pass() {
-        let input = load_fixture("pytest_pass.txt");
+        let input = load_fixture("test", "pytest_pass.txt");
         let result = parse(&input);
 
         assert!(
@@ -537,7 +526,7 @@ mod tests {
 
     #[test]
     fn test_tier1_with_failures() {
-        let input = load_fixture("pytest_fail.txt");
+        let input = load_fixture("test", "pytest_fail.txt");
         let result = parse(&input);
 
         assert!(
@@ -566,7 +555,7 @@ mod tests {
 
     #[test]
     fn test_tier1_mixed() {
-        let input = load_fixture("pytest_mixed.txt");
+        let input = load_fixture("test", "pytest_mixed.txt");
         let result = parse(&input);
 
         assert!(
@@ -752,7 +741,7 @@ mod tests {
 
     #[test]
     fn test_tier1_all_failures() {
-        let input = load_fixture("pytest_all_fail.txt");
+        let input = load_fixture("test", "pytest_all_fail.txt");
         let result = parse(&input);
 
         assert!(
@@ -789,7 +778,7 @@ mod tests {
 
     #[test]
     fn test_tier1_extracts_duration() {
-        let input = load_fixture("pytest_pass.txt");
+        let input = load_fixture("test", "pytest_pass.txt");
         let result = parse(&input);
 
         if let ParseResult::Full(tr) = &result {

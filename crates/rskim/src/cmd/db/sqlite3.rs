@@ -23,13 +23,16 @@ use crate::output::ParseResult;
 use crate::output::canonical::DbResult;
 use crate::runner::CommandOutput;
 
-use super::{DbToolConfig, run_db_tool};
-use crate::cmd::user_has_flag;
+use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool, user_has_flag};
 
-const CONFIG: DbToolConfig<'static> = DbToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "sqlite3",
     env_overrides: &[],
     install_hint: "Install SQLite: https://www.sqlite.org/download.html",
+    family: "db",
+    skip_ansi_strip: true,
+    command_type: CommandType::Db,
 };
 
 /// Flags that indicate the user has already set an output format.
@@ -53,7 +56,7 @@ pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    run_db_tool(CONFIG, args, ctx, prepare_sqlite3_args, parse_impl)
+    run_tool(CONFIG, args, ctx, prepare_sqlite3_args, parse_impl)
 }
 
 /// Inject `-header -separator '|'` when the user hasn't specified a format flag.
@@ -192,16 +195,7 @@ fn try_parse_regex_fallback(text: &str) -> Option<DbResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::CommandOutput;
-
-    fn make_output(stdout: &str) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
-    }
+    use crate::cmd::test_support::make_output;
 
     #[test]
     fn test_tier1_sqlite3_pipe_separated() {

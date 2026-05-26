@@ -23,12 +23,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
-use super::{LinterConfig, combine_stdout_stderr, group_issues};
+use super::{combine_stdout_stderr, group_issues};
+use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
-const CONFIG: LinterConfig<'static> = LinterConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "prettier",
     env_overrides: &[("NO_COLOR", "1")],
     install_hint: "Install prettier via npm: npm install -g prettier",
+    family: "lint",
+    skip_ansi_strip: false,
+    command_type: CommandType::Lint,
 };
 
 /// AD-LINT-21 (2026-04-15) — Path-aware regex patterns: `.+\S` captures full path including
@@ -78,7 +83,7 @@ fn run_check(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(CONFIG, args, ctx, prepare_check_args, parse_check_impl)
+    run_tool(CONFIG, args, ctx, prepare_check_args, parse_check_impl)
 }
 
 /// Inject `--check` if not already present.
@@ -127,7 +132,7 @@ fn run_format(
         .filter(|a| a.as_str() != "--write" && a.as_str() != "-w")
         .cloned()
         .collect();
-    super::run_linter(
+    run_tool(
         CONFIG,
         &remaining,
         ctx,
@@ -298,6 +303,7 @@ mod tests {
     use super::*;
 
     use crate::cmd::lint::load_lint_fixture as load_fixture;
+    use crate::cmd::test_support::{make_output, make_output_full};
 
     // -------------------------------------------------------------------------
     // Check mode tests (existing, unchanged)
@@ -305,12 +311,7 @@ mod tests {
 
     #[test]
     fn test_tier1_prettier_pass() {
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("");
         let result = parse_check_impl(&output);
         assert!(
             result.is_full(),
@@ -349,12 +350,7 @@ mod tests {
     #[test]
     fn test_parse_impl_produces_full() {
         let input = load_fixture("prettier_check_fail.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_check_impl(&output);
         assert!(
             result.is_full(),
@@ -365,12 +361,11 @@ mod tests {
 
     #[test]
     fn test_parse_impl_garbage_produces_passthrough() {
-        let output = CommandOutput {
-            stdout: "unexpected output from prettier\nno warn lines at all".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(
+            "unexpected output from prettier\nno warn lines at all",
+            "",
+            Some(1),
+        );
         let result = parse_check_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -383,13 +378,11 @@ mod tests {
     fn test_parse_impl_text_produces_degraded() {
         // Tier 2 input: matches the `<path> needs formatting` regex but NOT the
         // `[warn]` Tier 1 format.
-        let output = CommandOutput {
-            stdout: "src/main.ts needs formatting\nsrc/utils/helper.js needs formatting\n"
-                .to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(
+            "src/main.ts needs formatting\nsrc/utils/helper.js needs formatting\n",
+            "",
+            Some(1),
+        );
         let result = parse_check_impl(&output);
         assert!(
             result.is_degraded(),
@@ -487,12 +480,7 @@ mod tests {
     /// AD-LINT-20: empty stdout on exit 0 = nothing reformatted.
     #[test]
     fn test_prettier_format_empty_is_pass() {
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("");
         let result = parse_format_impl(&output);
         assert!(
             result.is_full(),
@@ -508,12 +496,7 @@ mod tests {
     #[test]
     fn test_parse_format_impl_fixture_is_full() {
         let input = load_fixture("prettier_write_output.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output(&input);
         let result = parse_format_impl(&output);
         assert!(
             result.is_full(),

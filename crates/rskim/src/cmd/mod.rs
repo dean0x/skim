@@ -412,8 +412,8 @@ pub(crate) struct ParsedCommandConfig<'a> {
     /// `strip_ansi_escapes` treats ASCII control codes — including `\t` (0x09) —
     /// as part of escape sequences and drops them. DB tools emit tab-separated
     /// (TSV) output; stripping would remove tab separators and cause all DB
-    /// parsers to fall through to Passthrough. Set `true` in `run_db_tool`,
-    /// `false` for all other families.
+    /// parsers to fall through to Passthrough. DB tools set `true`;
+    /// all other families set `false`.
     pub skip_ansi_strip: bool,
     /// Recording context constructed once by the family dispatcher.
     /// `run_parsed_command_with_mode` annotates `parse_tier` via
@@ -501,7 +501,7 @@ where
 /// stdin when no user args are provided AND stdin is piped).
 pub(crate) fn run_parsed_command_with_mode<T>(
     config: ParsedCommandConfig<'_>,
-    parse: impl FnOnce(&CommandOutput, &[String]) -> ParseResult<T>,
+    parse: impl FnOnce(&CommandOutput) -> ParseResult<T>,
 ) -> anyhow::Result<ExitCode>
 where
     T: AsRef<str> + serde::Serialize,
@@ -552,7 +552,7 @@ where
         }
     };
 
-    let result = parse(&output, args);
+    let result = parse(&output);
     let _ = result.emit_markers(&mut io::stderr().lock());
     let code = output.exit_code.unwrap_or(1);
 
@@ -1120,6 +1120,172 @@ pub(crate) fn sanitize_for_display(input: &str) -> String {
             }
         })
         .collect()
+}
+
+// ============================================================================
+// Generic tool runner
+// ============================================================================
+
+/// Cross-cutting configuration for a single-tool execution.
+///
+/// Unifies `DbToolConfig`, `InfraToolConfig`, `FileToolConfig`, and
+/// `LinterConfig` into one struct.  The two new fields (`family`,
+/// `skip_ansi_strip`) are the only differences between the four original
+/// family-specific configs; all other fields are structurally identical.
+///
+/// ## Relationship to `ParsedCommandConfig`
+///
+/// `ToolRunConfig` is the caller-facing API; `ParsedCommandConfig` is the
+/// internal config consumed by `run_parsed_command_with_mode`.  `run_tool`
+/// bridges the two, translating caller fields plus `family`/`skip_ansi_strip`
+/// into the full `ParsedCommandConfig`.
+///
+/// The split is intentional: `ToolRunConfig` carries only static, caller-supplied
+/// fields.  `ParsedCommandConfig` additionally requires runtime-computed fields
+/// (`use_stdin`, `show_stats`, `output_format`, `rec`) derived from `RunContext`
+/// and the actual argument list — values unavailable at `ToolRunConfig`
+/// construction time.  `Into<ParsedCommandConfig>` would therefore be unsound
+/// without also accepting `&[String]` and `&RunContext`, which defeats the
+/// purpose of a simple `Into` bridge.  `run_tool` IS the bridge.
+pub(crate) struct ToolRunConfig<'a> {
+    /// Binary name of the tool (e.g., "psql", "eslint").
+    pub program: &'a str,
+    /// Environment variable overrides for the child process.
+    pub env_overrides: &'a [(&'a str, &'a str)],
+    /// Hint printed when the tool binary is not found.
+    pub install_hint: &'a str,
+    /// Family name for analytics labels (e.g. `"db"`, `"infra"`, `"lint"`).
+    pub family: &'a str,
+    /// When `true`, skip ANSI escape stripping on the raw command output.
+    ///
+    /// Set `true` for DB tools (TSV output) and DNS tools (tab field separators).
+    /// See `ParsedCommandConfig::skip_ansi_strip` for full rationale.
+    pub skip_ansi_strip: bool,
+    /// Analytics command type for recording.
+    pub command_type: crate::analytics::CommandType,
+}
+
+/// Execute a tool, parse its output, and emit the result.
+///
+/// Single generic implementation that replaces `run_db_tool`, `run_infra_tool`,
+/// `run_file_tool`, and `run_linter`.  Each family-specific runner had an
+/// identical body; the only differences were `family`, `skip_ansi_strip`, and
+/// `command_type`, which are now carried in `ToolRunConfig`.
+///
+/// ## Constraints
+///
+/// `build::run_parsed_command` is intentionally **not** replaced: it has a
+/// different call shape (no `ctx: &RunContext`, different analytics path).
+/// `run_pkg_subcommand` is also excluded: it has a different signature.
+pub(crate) fn run_tool<T>(
+    config: ToolRunConfig<'_>,
+    args: &[String],
+    ctx: &RunContext,
+    prepare_args: impl FnOnce(&mut Vec<String>),
+    parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<T>,
+) -> anyhow::Result<std::process::ExitCode>
+where
+    T: AsRef<str> + serde::Serialize,
+{
+    let mut cmd_args = args.to_vec();
+    prepare_args(&mut cmd_args);
+    let use_stdin = should_read_stdin(args);
+    run_parsed_command_with_mode(
+        ParsedCommandConfig {
+            program: config.program,
+            args: &cmd_args,
+            env_overrides: config.env_overrides,
+            install_hint: config.install_hint,
+            use_stdin,
+            show_stats: ctx.show_stats,
+            output_format: ctx.output_format(),
+            family: config.family,
+            skip_ansi_strip: config.skip_ansi_strip,
+            rec: crate::analytics::RecordingContext {
+                enabled: ctx.analytics_enabled,
+                command_type: config.command_type,
+                parse_tier: None,
+                session_id: ctx.session_id.as_deref(),
+            },
+        },
+        |output| parse_fn(output),
+    )
+}
+
+// ============================================================================
+// Shared test helpers
+// ============================================================================
+
+/// Shared test helpers for subcommand parser unit tests.
+///
+/// Centralises `make_output`, `make_output_full`, and `load_fixture` so that
+/// the ~34 local `make_output` definitions and ~41 local `load_fixture`
+/// definitions across the `cmd` subtree are replaced by a single canonical
+/// source. This eliminates drift between test helpers and ensures all tests
+/// construct `CommandOutput` values consistently (e.g., `Duration::ZERO`
+/// rather than arbitrary millisecond values).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::runner::CommandOutput;
+    use std::time::Duration;
+
+    /// Build a `CommandOutput` from stdout only.
+    ///
+    /// Sets `stderr` to empty, `exit_code` to `Some(0)`, and
+    /// `duration` to `Duration::ZERO`. Use this for the common
+    /// successful-output case.
+    pub(crate) fn make_output(stdout: &str) -> CommandOutput {
+        CommandOutput {
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: Duration::ZERO,
+        }
+    }
+
+    /// Build a `CommandOutput` with explicit stdout, stderr, and exit code.
+    ///
+    /// Use when the test needs to exercise non-zero exits, stderr content,
+    /// or absent exit codes (`None`).
+    pub(crate) fn make_output_full(
+        stdout: &str,
+        stderr: &str,
+        exit_code: Option<i32>,
+    ) -> CommandOutput {
+        CommandOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            exit_code,
+            duration: Duration::ZERO,
+        }
+    }
+
+    /// Build a `CommandOutput` where all output is on stderr and exit code is 0.
+    ///
+    /// Use for tools that write to stderr by default (e.g. `wget`, `curl`).
+    /// Equivalent to `make_output_full("", stderr, Some(0))` but clarifies
+    /// the intent at the call site.
+    pub(crate) fn make_output_stderr(stderr: &str) -> CommandOutput {
+        CommandOutput {
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+            exit_code: Some(0),
+            duration: Duration::ZERO,
+        }
+    }
+
+    /// Load a test fixture from `tests/fixtures/cmd/{subdir}/{name}`.
+    ///
+    /// Panics with a clear message if the fixture file cannot be read,
+    /// so test failures surface the missing-file path immediately.
+    pub(crate) fn load_fixture(subdir: &str, name: &str) -> String {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests/fixtures/cmd");
+        path.push(subdir);
+        path.push(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
+    }
 }
 
 // ============================================================================

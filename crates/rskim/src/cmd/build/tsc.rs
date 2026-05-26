@@ -164,26 +164,7 @@ fn try_tier2_combined(combined: &str) -> Option<ParseResult<BuildResult>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use std::time::Duration;
-
-    fn fixtures_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cmd/build")
-    }
-
-    fn load_fixture(name: &str) -> String {
-        std::fs::read_to_string(fixtures_dir().join(name))
-            .unwrap_or_else(|e| panic!("Failed to load fixture {name}: {e}"))
-    }
-
-    fn make_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-            exit_code,
-            duration: Duration::from_millis(100),
-        }
-    }
+    use crate::cmd::test_support::{load_fixture, make_output_full};
 
     // ========================================================================
     // Tier 1: Regex on stderr
@@ -191,8 +172,8 @@ mod tests {
 
     #[test]
     fn test_tier1_tsc_errors() {
-        let stderr = load_fixture("tsc_errors.txt");
-        let output = make_output("", &stderr, Some(2));
+        let stderr = load_fixture("build", "tsc_errors.txt");
+        let output = make_output_full("", &stderr, Some(2));
         let result = parse_tsc(&output);
 
         assert!(
@@ -209,7 +190,7 @@ mod tests {
     #[test]
     fn test_tier1_tsc_success() {
         // Empty stdout+stderr means successful compilation
-        let output = make_output("", "", Some(0));
+        let output = make_output_full("", "", Some(0));
         let result = parse_tsc(&output);
 
         assert!(
@@ -227,7 +208,7 @@ mod tests {
     fn test_signal_killed_tsc_is_failure() {
         // exit_code: None means the process was killed by a signal (e.g. SIGKILL).
         // Empty output + None exit code must be treated as failure, not success.
-        let output = make_output("", "", None);
+        let output = make_output_full("", "", None);
         let result = parse_tsc(&output);
 
         assert!(
@@ -245,8 +226,8 @@ mod tests {
 
     #[test]
     fn test_tsc_group_by_file() {
-        let stderr = load_fixture("tsc_errors.txt");
-        let output = make_output("", &stderr, Some(2));
+        let stderr = load_fixture("build", "tsc_errors.txt");
+        let output = make_output_full("", &stderr, Some(2));
         let result = parse_tsc(&output);
 
         if let ParseResult::Full(build_result) = &result {
@@ -285,7 +266,7 @@ mod tests {
     fn test_tier2_tsc_errors_on_stdout() {
         // tsc output on stdout instead of stderr (unusual but possible)
         let tsc_output = "src/main.ts(5,1): error TS2304: Cannot find name 'x'.\n";
-        let output = make_output(tsc_output, "", Some(2));
+        let output = make_output_full(tsc_output, "", Some(2));
         let result = parse_tsc(&output);
 
         assert!(
@@ -306,7 +287,7 @@ mod tests {
     #[test]
     fn test_tier3_passthrough() {
         // Non-tsc output that doesn't match any pattern
-        let output = make_output("", "some random error text\n", Some(1));
+        let output = make_output_full("", "some random error text\n", Some(1));
         let result = parse_tsc(&output);
 
         assert!(

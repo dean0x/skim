@@ -114,7 +114,7 @@ where
             skip_ansi_strip: false,
             rec,
         },
-        |output, _args| parse_fn(output),
+        |output| parse_fn(output),
     )
 }
 

@@ -61,13 +61,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::InfraResult;
 use crate::runner::CommandOutput;
 
-use super::{InfraToolConfig, combine_stdout_stderr, run_infra_tool};
+use super::combine_stdout_stderr;
+use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
-const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "gh",
     env_overrides: &[],
     install_hint: "Install gh: https://cli.github.com/",
+    family: "infra",
     skip_ansi_strip: false,
+    command_type: CommandType::Infra,
 };
 
 // ============================================================================
@@ -83,28 +87,28 @@ pub(crate) fn run(
     let action = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
     match (subcmd, action) {
-        ("issue", "view") => run_infra_tool(
+        ("issue", "view") => run_tool(
             CONFIG,
             args,
             ctx,
             issue_view::prepare_args,
             issue_view::parse_impl,
         ),
-        ("pr", "view") => run_infra_tool(
+        ("pr", "view") => run_tool(
             CONFIG,
             args,
             ctx,
             pr_view::prepare_args,
             pr_view::parse_impl,
         ),
-        ("pr", "checks") => run_infra_tool(
+        ("pr", "checks") => run_tool(
             CONFIG,
             args,
             ctx,
             pr_checks::prepare_args,
             pr_checks::parse_impl,
         ),
-        ("run", "view") => run_infra_tool(
+        ("run", "view") => run_tool(
             CONFIG,
             args,
             ctx,
@@ -112,12 +116,12 @@ pub(crate) fn run(
             run_view::parse_impl,
         ),
         ("run", "watch") => {
-            // Streaming handler — does not use run_infra_tool.
+            // Streaming handler — does not use run_tool.
             // Passes remaining args (after "run watch") to run_watch.
             let watch_args = if args.len() > 2 { &args[2..] } else { &[] };
             run_watch::run_watch(watch_args, ctx)
         }
-        ("release", "view") => run_infra_tool(
+        ("release", "view") => run_tool(
             CONFIG,
             args,
             ctx,
@@ -125,16 +129,16 @@ pub(crate) fn run(
             release_view::parse_impl,
         ),
         ("api", _) => {
-            // Strip the leading "api" token so run_infra_tool sees the
+            // Strip the leading "api" token so run_tool sees the
             // remaining args only.  This lets use_stdin detection fire when
             // the user pipes `gh api ... | skim gh api` with no
             // endpoint arg — args[1..] is empty → stdin is read.
             // api::prepare_args re-inserts "api" before the spawn so the
             // child process still receives `gh api [endpoint...]`.
             let api_args = if args.is_empty() { &[][..] } else { &args[1..] };
-            run_infra_tool(CONFIG, api_args, ctx, api::prepare_args, api::parse_impl)
+            run_tool(CONFIG, api_args, ctx, api::prepare_args, api::parse_impl)
         }
-        _ => run_infra_tool(
+        _ => run_tool(
             CONFIG,
             args,
             ctx,
@@ -236,26 +240,14 @@ fn try_parse_view_json_auto(obj: &serde_json::Value) -> Option<InfraResult> {
 // Shared test helpers
 // ============================================================================
 
+/// Shared fixture loader for gh submodule tests.
+///
+/// Delegates to `test_support::load_fixture` with the `"infra"` subdir
+/// pre-applied. Sub-modules import it as
+/// `use super::super::load_gh_fixture as load_fixture`.
 #[cfg(test)]
-pub(super) mod test_helpers {
-    use crate::runner::CommandOutput;
-
-    pub(super) fn make_output(stdout: &str) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
-    }
-
-    pub(super) fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/infra");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
+pub(super) fn load_gh_fixture(name: &str) -> String {
+    crate::cmd::test_support::load_fixture("infra", name)
 }
 
 // ============================================================================
@@ -264,8 +256,9 @@ pub(super) mod test_helpers {
 
 #[cfg(test)]
 mod tests {
-    use super::test_helpers::{load_fixture, make_output};
+    use super::load_gh_fixture as load_fixture;
     use super::*;
+    use crate::cmd::test_support::{make_output, make_output_full};
 
     // --- truncate_body ---
 
@@ -434,13 +427,11 @@ mod tests {
 
     #[test]
     fn test_404_error_passthrough() {
-        let input = "Not Found (HTTP 404)";
-        let output = CommandOutput {
-            stdout: input.to_string(),
-            stderr: "gh: 404 - Not Found\nhttps://github.com".to_string(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(
+            "Not Found (HTTP 404)",
+            "gh: 404 - Not Found\nhttps://github.com",
+            Some(1),
+        );
         let result = parse_impl_with_auto_detect(&output);
         assert!(
             result.is_passthrough(),
@@ -451,13 +442,11 @@ mod tests {
 
     #[test]
     fn test_auth_error_passthrough() {
-        let input = "";
-        let output = CommandOutput {
-            stdout: input.to_string(),
-            stderr: "To get started with GitHub CLI, please run:  gh auth login".to_string(),
-            exit_code: Some(4),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(
+            "",
+            "To get started with GitHub CLI, please run:  gh auth login",
+            Some(4),
+        );
         let result = parse_impl_with_auto_detect(&output);
         assert!(
             result.is_passthrough(),

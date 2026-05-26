@@ -22,12 +22,16 @@ use crate::output::ParseResult;
 use crate::output::canonical::DbResult;
 use crate::runner::CommandOutput;
 
-use super::{DbToolConfig, run_db_tool};
+use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
-const CONFIG: DbToolConfig<'static> = DbToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "psql",
     env_overrides: &[("PAGER", "cat"), ("PGPAGER", "cat")],
     install_hint: "Install PostgreSQL: https://www.postgresql.org/download/",
+    family: "db",
+    skip_ansi_strip: true,
+    command_type: CommandType::Db,
 };
 
 /// Matches the psql row-count footer: `(N rows)` or `(1 row)`.
@@ -45,7 +49,7 @@ pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    run_db_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
 }
 
 /// Three-tier parse function for psql output.
@@ -84,6 +88,14 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<DbResult> {
 ///  val  | val  | val
 /// (N rows)
 /// ```
+///
+/// ## Eager collection pattern
+///
+/// The input is eagerly collected into a `Vec<&str>` so that the parser can use
+/// random-access indexing (`lines[sep_idx - 1]`, slice ranges, `rposition`) to
+/// locate the header, separator, data rows, and footer in a single pass.  A
+/// streaming iterator would require multiple passes or complex lookahead; the
+/// bounded allocation is negligible for the query result sizes skim handles.
 fn try_parse_tabular(text: &str) -> Option<DbResult> {
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
@@ -185,16 +197,7 @@ fn try_parse_regex_fallback(text: &str) -> Option<DbResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::CommandOutput;
-
-    fn make_output(stdout: &str) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
-    }
+    use crate::cmd::test_support::make_output;
 
     #[test]
     fn test_tier1_psql_tabular() {
@@ -316,7 +319,7 @@ mod tests {
         // psql prepare_args must not modify args (no injection)
         let original = vec!["-c".to_string(), "SELECT 1".to_string()];
         let args = original.clone();
-        // Invoke run_db_tool's prepare_args closure (it's |_| {})
+        // Invoke run_tool's prepare_args closure (it's |_| {})
         // We test by calling parse directly and checking no side effects on args
         let _ = parse_impl(&make_output("SELECT 1\n"));
         assert_eq!(args, original, "prepare_args must be a no-op for psql");

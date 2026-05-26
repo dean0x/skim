@@ -1,0 +1,31 @@
+<!-- TL;DR: 3 pitfalls. Key: PF-001, PF-002, PF-003 -->
+# Known Pitfalls
+
+Area-specific gotchas, fragile areas, and past bugs.
+
+## PF-001: Post-release verification checklist omitting Homebrew tap check
+
+- **Area**: post-release verification checklist (release process documentation in CLAUDE.md)
+- **Issue**: after completing a release the assistant declared 'All done' without proactively checking whether the Homebrew tap PR was merged and the formula updated — the user had to ask explicitly
+- **Impact**: User had to prompt for the brew tap check after the assistant declared the release complete — a broken or lagging Homebrew tap would go unnoticed if the agent treats the checklist as done
+- **Resolution**: Always include `brew update && brew info dean0x/tap/skim` as the fourth post-release verification step. Full checklist per CLAUDE.md: (1) `cargo install rskim` — shows new version, (2) `npx rskim --version` — shows new version, (3) GitHub Release page — 7 binary assets attached, (4) `brew update && brew info dean0x/tap/skim` — formula updated.
+- **Status**: Active
+- **Source**: self-learning:obs_qt2m8p
+
+## PF-002: Classifying review findings as pre-existing or deferred to skip resolution
+
+- **Area**: review resolution system (Resolver agent, resolution summary output)
+- **Issue**: The assistant grouped unresolved review findings into 'pre-existing', 'deferred', 'tech debt', and 'suggestions' categories and declared resolution complete — implicitly treating these as skippable without explicit user sign-off. The user rejected this framing in two distinct sessions, each time asking to have the skipped items explained and fixed
+- **Impact**: Silently closing pre-existing or tech-debt findings accumulates hidden debt and triggers a correction turn where the user must ask for re-explanation and re-planning
+- **Resolution**: Never present pre-existing, deferred, or tech-debt findings as closed without explicit user sign-off. Surface all findings with explanations and let the user decide. User's explicit policy: 'I am not one to notice an issue and skip it, even if it is preexisting' and 'I really hate tech debt. my approach is if you see something do something.'
+- **Status**: Active
+- **Source**: self-learning:obs_nk8w2v
+
+## PF-003: Attributing command failures to external tools without verifying skim's rewrite hook intercepted the command
+
+- **Area**: rewrite hook rule matching for git commands
+- **Issue**: assistant attributed two git command failures (zsh parenthesis glob expansion in commit message, git branch -d squash-merge ancestry check) to non-skim causes without ruling out whether skim's rewrite hook intercepted those commands
+- **Impact**: genuine skim involvement is dismissed prematurely, causing the user to challenge with 'Are you one hundred percent sure?' — mirrors prior npx instance where zero output was attributed to external npx hanging rather than skim's vitest rewrite
+- **Resolution**: before attributing any command failure to an external tool in a project where skim is installed, verify (1) whether skim's rewrite hook matched that command and (2) whether the rewrite itself could have caused the failure mode. Never declare 'not related to skim' without checking the engine.rs rule table for the failing command pattern.
+- **Status**: Active
+- **Source**: self-learning:obs_yw3m6d

@@ -21,10 +21,8 @@ pub(crate) mod swiftlint;
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
-use super::{ParsedCommandConfig, extract_show_stats, run_parsed_command_with_mode};
-use crate::output::ParseResult;
+use super::extract_show_stats;
 use crate::output::canonical::{LintGroup, LintIssue, LintResult, LintSeverity};
-use crate::runner::CommandOutput;
 
 /// Known linters that the lint handler can dispatch to.
 const KNOWN_LINTERS: &[&str] = &[
@@ -128,67 +126,6 @@ fn print_help() {
     println!("  eslint . 2>&1 | skim eslint  Pipe eslint output");
 }
 
-// ============================================================================
-// Shared linter execution helper
-// ============================================================================
-
-/// Static configuration for a linter binary.
-///
-/// Each linter module exposes a `CONFIG` constant with this type.
-pub(crate) struct LinterConfig<'a> {
-    /// Binary name of the linter (e.g., "eslint", "ruff").
-    pub program: &'a str,
-    /// Environment variable overrides for the child process.
-    pub env_overrides: &'a [(&'a str, &'a str)],
-    /// Hint printed when the linter binary is not found.
-    pub install_hint: &'a str,
-}
-
-/// Execute a linter, parse its output, and emit the result.
-///
-/// This is the single implementation shared by all lint parsers, handling both
-/// text and JSON output modes. It eliminates per-linter `run()` boilerplate by
-/// delegating to [`super::run_parsed_command_with_mode`].
-///
-/// - `config`: static linter metadata (program name, env vars, install hint)
-/// - `args`: raw user args (before prepare_args)
-/// - `ctx`: cross-cutting flags (show_stats, json_output, analytics_enabled)
-/// - `prepare_args`: closure to inject linter-specific flags (e.g., `--format json`)
-/// - `parse_fn`: linter-specific three-tier parse function
-pub(crate) fn run_linter(
-    config: LinterConfig<'_>,
-    args: &[String],
-    ctx: &super::RunContext,
-    prepare_args: impl FnOnce(&mut Vec<String>),
-    parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<LintResult>,
-) -> anyhow::Result<ExitCode> {
-    let mut cmd_args = args.to_vec();
-    prepare_args(&mut cmd_args);
-
-    let use_stdin = super::should_read_stdin(args);
-
-    run_parsed_command_with_mode(
-        ParsedCommandConfig {
-            program: config.program,
-            args: &cmd_args,
-            env_overrides: config.env_overrides,
-            install_hint: config.install_hint,
-            use_stdin,
-            show_stats: ctx.show_stats,
-            output_format: ctx.output_format(),
-            family: "lint",
-            skip_ansi_strip: false,
-            rec: crate::analytics::RecordingContext {
-                enabled: ctx.analytics_enabled,
-                command_type: crate::analytics::CommandType::Lint,
-                parse_tier: None,
-                session_id: ctx.session_id.as_deref(),
-            },
-        },
-        |output, _args| parse_fn(output),
-    )
-}
-
 /// Re-export the shared `combine_output` under the name callers expect.
 pub(crate) use super::combine_output as combine_stdout_stderr;
 
@@ -230,13 +167,12 @@ pub(crate) fn group_issues(tool: &str, issues: Vec<LintIssue>) -> LintResult {
 // ============================================================================
 
 /// Shared fixture loader for lint parser unit tests.
+///
+/// Delegates to `test_support::load_fixture` with the `"lint"` subdir
+/// pre-applied, consistent with the pattern used by `gh::test_helpers`.
 #[cfg(test)]
 pub(crate) fn load_lint_fixture(name: &str) -> String {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/cmd/lint")
-        .join(name);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
+    crate::cmd::test_support::load_fixture("lint", name)
 }
 
 // ============================================================================
@@ -248,6 +184,7 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
+    use crate::cmd::test_support::{make_output, make_output_full};
     use crate::output::canonical::{LintIssue, LintSeverity};
 
     #[test]
@@ -286,12 +223,7 @@ mod tests {
 
     #[test]
     fn test_combine_stdout_stderr_empty_stderr() {
-        let output = CommandOutput {
-            stdout: "hello world".to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("hello world");
         let combined = combine_stdout_stderr(&output);
         assert_eq!(&*combined, "hello world");
         // When stderr is empty, should borrow (Cow::Borrowed)
@@ -300,12 +232,7 @@ mod tests {
 
     #[test]
     fn test_combine_stdout_stderr_with_stderr() {
-        let output = CommandOutput {
-            stdout: "out".to_string(),
-            stderr: "err".to_string(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("out", "err", Some(1));
         let combined = combine_stdout_stderr(&output);
         assert_eq!(&*combined, "out\nerr");
         // When stderr is non-empty, should own (Cow::Owned)
@@ -314,12 +241,7 @@ mod tests {
 
     #[test]
     fn test_combine_stdout_stderr_both_empty() {
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("");
         let combined = combine_stdout_stderr(&output);
         assert_eq!(&*combined, "");
         assert!(matches!(combined, Cow::Borrowed(_)));

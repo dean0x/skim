@@ -18,10 +18,8 @@ use std::process::ExitCode;
 
 use std::collections::BTreeMap;
 
-use super::{ParsedCommandConfig, extract_show_stats, run_parsed_command_with_mode};
-use crate::output::ParseResult;
+use super::extract_show_stats;
 use crate::output::canonical::FileResult;
-use crate::runner::CommandOutput;
 
 /// Known file tools that the file handler can dispatch to.
 const KNOWN_TOOLS: &[&str] = &[
@@ -107,57 +105,6 @@ fn print_help() {
     println!("  skim tree src/                 Directory tree");
     println!("  skim grep -rn 'TODO' src/      Grep recursively");
     println!("  skim rg 'fn main' src/         Ripgrep search");
-}
-
-// ============================================================================
-// Shared file tool execution helper
-// ============================================================================
-
-/// Static configuration for a file tool binary.
-pub(crate) struct FileToolConfig<'a> {
-    /// Binary name of the tool (e.g., "find", "rg").
-    pub program: &'a str,
-    /// Environment variable overrides for the child process.
-    pub env_overrides: &'a [(&'a str, &'a str)],
-    /// Hint printed when the tool binary is not found.
-    pub install_hint: &'a str,
-}
-
-/// Execute a file tool, parse its output, and emit the result.
-///
-/// Shared implementation for all file parsers, mirroring `run_infra_tool`.
-pub(crate) fn run_file_tool(
-    config: FileToolConfig<'_>,
-    args: &[String],
-    ctx: &super::RunContext,
-    prepare_args: impl FnOnce(&mut Vec<String>),
-    parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<FileResult>,
-) -> anyhow::Result<ExitCode> {
-    let mut cmd_args = args.to_vec();
-    prepare_args(&mut cmd_args);
-
-    let use_stdin = super::should_read_stdin(args);
-
-    run_parsed_command_with_mode(
-        ParsedCommandConfig {
-            program: config.program,
-            args: &cmd_args,
-            env_overrides: config.env_overrides,
-            install_hint: config.install_hint,
-            use_stdin,
-            show_stats: ctx.show_stats,
-            output_format: ctx.output_format(),
-            family: "file",
-            skip_ansi_strip: false,
-            rec: crate::analytics::RecordingContext {
-                enabled: ctx.analytics_enabled,
-                command_type: crate::analytics::CommandType::FileOps,
-                parse_tier: None,
-                session_id: ctx.session_id.as_deref(),
-            },
-        },
-        |output, _args| parse_fn(output),
-    )
 }
 
 // ============================================================================

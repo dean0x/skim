@@ -291,8 +291,9 @@ fn build_checks_result(checks: Vec<ParsedCheck>) -> Option<InfraResult> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::{load_fixture, make_output};
+    use super::super::load_gh_fixture as load_fixture;
     use super::*;
+    use crate::cmd::test_support::make_output;
 
     #[test]
     fn test_tier1_tab_text() {

@@ -241,18 +241,7 @@ fn try_parse_audit_regex(text: &str) -> Option<PkgResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn fixture_path(name: &str) -> std::path::PathBuf {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/pkg");
-        path.push(name);
-        path
-    }
-
-    fn load_fixture(name: &str) -> String {
-        std::fs::read_to_string(fixture_path(name))
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
+    use crate::cmd::test_support::load_fixture;
 
     // ========================================================================
     // npm audit: JSON
@@ -260,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_audit_json_parse() {
-        let input = load_fixture("npm_audit.json");
+        let input = load_fixture("pkg", "npm_audit.json");
         let result = try_parse_audit_json(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -280,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_audit_json_clean() {
-        let input = load_fixture("npm_audit_clean.json");
+        let input = load_fixture("pkg", "npm_audit_clean.json");
         let result = try_parse_audit_json(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -319,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_npm_audit_extracts_ghsa_from_url() {
-        let input = load_fixture("npm_audit_with_via_id.json");
+        let input = load_fixture("pkg", "npm_audit_with_via_id.json");
         let result = try_parse_audit_json(&input).expect("must parse");
         let display = format!("{result}");
         assert!(
@@ -330,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_npm_audit_fallback_to_source_number() {
-        let input = load_fixture("npm_audit_with_via_id.json");
+        let input = load_fixture("pkg", "npm_audit_with_via_id.json");
         let result = try_parse_audit_json(&input).expect("must parse");
         let display = format!("{result}");
         // minimist entry has no URL, only a numeric source → NPM-{source}

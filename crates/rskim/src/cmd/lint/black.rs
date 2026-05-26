@@ -22,12 +22,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
-use super::{LinterConfig, combine_stdout_stderr, group_issues};
+use super::{combine_stdout_stderr, group_issues};
+use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
-const CONFIG: LinterConfig<'static> = LinterConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "black",
     env_overrides: &[("NO_COLOR", "1")],
     install_hint: "Install black: pip install black",
+    family: "lint",
+    skip_ansi_strip: false,
+    command_type: CommandType::Lint,
 };
 
 /// AD-LINT-21 (2026-04-15) — `.+` captures paths with spaces.
@@ -66,7 +71,7 @@ fn run_check(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(CONFIG, args, ctx, prepare_check_args, parse_check_impl)
+    run_tool(CONFIG, args, ctx, prepare_check_args, parse_check_impl)
 }
 
 /// Inject `--check` if no mode flag is present.
@@ -103,7 +108,7 @@ fn run_format(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(CONFIG, args, ctx, prepare_format_args, parse_format_impl)
+    run_tool(CONFIG, args, ctx, prepare_format_args, parse_format_impl)
 }
 
 /// Pass args through unchanged for format mode.
@@ -271,6 +276,7 @@ mod tests {
     use super::*;
 
     use crate::cmd::lint::load_lint_fixture as load_fixture;
+    use crate::cmd::test_support::{make_output, make_output_full};
 
     #[test]
     fn test_tier1_check_fail() {
@@ -321,12 +327,7 @@ mod tests {
     #[test]
     fn test_parse_check_impl_full() {
         let input = load_fixture("black_check_fail.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_check_impl(&output);
         assert!(
             result.is_full(),
@@ -338,12 +339,7 @@ mod tests {
     #[test]
     fn test_parse_check_impl_pass() {
         let input = load_fixture("black_check_pass.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output(&input);
         let result = parse_check_impl(&output);
         assert!(
             result.is_full(),
@@ -358,12 +354,7 @@ mod tests {
     #[test]
     fn test_parse_check_impl_degraded() {
         // Input that only has `would reformat` without "All done!" context
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: "would reformat src/main.py\n".to_string(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("", "would reformat src/main.py\n", Some(1));
         let result = parse_check_impl(&output);
         // Should succeed as Full (regex pattern matches just fine via Tier 1)
         assert!(
@@ -375,12 +366,7 @@ mod tests {
 
     #[test]
     fn test_parse_check_impl_passthrough_garbage() {
-        let output = CommandOutput {
-            stdout: "random garbage not black output".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("random garbage not black output", "", Some(1));
         let result = parse_check_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -391,12 +377,7 @@ mod tests {
     #[test]
     fn test_parse_format_impl_full() {
         let input = load_fixture("black_format_output.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output(&input);
         let result = parse_format_impl(&output);
         assert!(
             result.is_full(),
