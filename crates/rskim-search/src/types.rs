@@ -558,6 +558,7 @@ pub trait FieldClassifier: Send + Sync {
 // ============================================================================
 
 /// Errors that can occur during search index construction or querying.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum SearchError {
     /// Propagated error from the rskim-core library

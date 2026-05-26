@@ -3,8 +3,6 @@
 //! Uses `tempfile::TempDir` for isolation so every test gets a fresh database.
 //! Performance and persistence tests live in `storage_perf_tests.rs`.
 
-#![allow(clippy::unwrap_used)]
-
 use tempfile::TempDir;
 
 use super::{
