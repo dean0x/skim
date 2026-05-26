@@ -817,7 +817,7 @@ impl DbResult {
             if i > 0 {
                 let _ = write!(output, " | ");
             }
-            let w = widths[i];
+            let w = widths.get(i).copied().unwrap_or(0);
             let _ = write!(output, "{col:<w$}");
         }
     }
@@ -837,9 +837,11 @@ impl DbResult {
         for (i, &w) in widths.iter().enumerate() {
             if i > 0 {
                 let _ = write!(output, "+");
-                let _ = write!(output, "{}", "-".repeat(w + PADDING));
+                // Use fill/width format to avoid a temporary String allocation per column.
+                let dashes = w + PADDING;
+                let _ = write!(output, "{:-<dashes$}", "");
             } else {
-                let _ = write!(output, "{}", "-".repeat(w));
+                let _ = write!(output, "{:-<w$}", "");
             }
         }
     }
