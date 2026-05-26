@@ -191,7 +191,7 @@ mod tests {
     use super::*;
 
     use crate::cmd::lint::load_lint_fixture as load_fixture;
-    use crate::cmd::test_support::{make_output_full};
+    use crate::cmd::test_support::make_output_full;
 
     #[test]
     fn test_tier1_eslint_pass() {
