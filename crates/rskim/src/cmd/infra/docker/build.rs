@@ -109,8 +109,6 @@ const MAX_WARNINGS: usize = 50;
 /// # Panics (debug only)
 /// Panics in debug builds if `line` contains leading or trailing whitespace —
 /// callers must trim before passing.
-///
-/// The caller is responsible for trimming whitespace before passing `line`.
 fn classify_line<'a>(line: &'a str) -> LineClassification<'a> {
     debug_assert!(
         line == line.trim(),

@@ -24,13 +24,11 @@ pub(super) fn run_ls(
         show_stats,
         rec,
         |cmd_args| {
-            if json_output {
-                if !user_has_flag(cmd_args, &["--json"]) {
-                    cmd_args.push("--json".to_string());
-                }
-                if !user_has_flag(cmd_args, &["--depth"]) {
-                    cmd_args.push("--depth=0".to_string());
-                }
+            if json_output && !user_has_flag(cmd_args, &["--json"]) {
+                cmd_args.push("--json".to_string());
+            }
+            if json_output && !user_has_flag(cmd_args, &["--depth"]) {
+                cmd_args.push("--depth=0".to_string());
             }
         },
         parse_ls,

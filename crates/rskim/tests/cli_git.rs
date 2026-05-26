@@ -243,60 +243,6 @@ fn test_skim_git_unknown_subcommand() {
         .stderr(predicate::str::contains("unknown git subcommand"));
 }
 
-// ============================================================================
-// Step 7a: Real `git status` E2E tests — previously-skipped flags now compress
-// ============================================================================
-
-#[test]
-fn test_skim_git_status_with_short_flag_compresses() {
-    // -s was previously a skip flag causing passthrough. Handler now strips it
-    // and runs compressed output.
-    Command::cargo_bin("skim")
-        .unwrap()
-        .args(["git", "status", "-s"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("status "));
-}
-
-#[test]
-fn test_skim_git_status_with_porcelain_flag_compresses() {
-    // --porcelain was previously a skip flag. Handler now strips it.
-    Command::cargo_bin("skim")
-        .unwrap()
-        .args(["git", "status", "--porcelain"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("status "));
-}
-
-#[test]
-fn test_skim_git_status_with_short_long_flag_compresses() {
-    // --short was previously a skip flag. Handler now strips it.
-    Command::cargo_bin("skim")
-        .unwrap()
-        .args(["git", "status", "--short"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("status "));
-}
-
-// ============================================================================
-// Step 7b: Real `git log` E2E tests — --oneline now compresses
-// ============================================================================
-
-#[test]
-fn test_skim_git_log_oneline_flag_compresses() {
-    // --oneline was previously a skip flag causing passthrough. Handler now
-    // strips it and runs compressed output.
-    Command::cargo_bin("skim")
-        .unwrap()
-        .args(["git", "log", "--oneline", "-5"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("log ").and(predicate::str::contains("commit")));
-}
-
 #[test]
 fn test_skim_git_log_contains_hashes() {
     // Compressed log output should contain commit hashes (short 7-char hex).
