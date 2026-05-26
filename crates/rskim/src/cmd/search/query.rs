@@ -64,6 +64,21 @@ pub(super) fn execute_query(
     let mut sq = SearchQuery::new(config.text.clone());
     sq.limit = Some(config.limit);
 
+    // When blast-radius paths are provided, convert them to FileId allowlist
+    // so the search engine filters BEFORE applying the limit. This ensures
+    // the limit applies to the filtered set rather than discarding matches
+    // that fall outside the top-N unfiltered results.
+    if let Some(ref allowed_paths) = config.blast_radius_paths {
+        let sorted = manifest.sorted_paths();
+        let mut file_ids = std::collections::HashSet::new();
+        for (idx, path) in sorted.iter().enumerate() {
+            if allowed_paths.contains(*path) {
+                file_ids.insert(rskim_search::FileId(idx as u32));
+            }
+        }
+        sq.file_filter = Some(file_ids);
+    }
+
     // Execute the search.
     let raw_results = engine.search(&sq)?;
 

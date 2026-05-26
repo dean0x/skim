@@ -136,6 +136,18 @@ fn read_git_head(root: &Path) -> Option<String> {
 }
 
 // ============================================================================
+// Private helpers
+// ============================================================================
+
+/// Given a co-change row, return the path of the file that is NOT `target`.
+///
+/// Co-change pairs are stored with the lexically smaller path in `file_a`. This
+/// helper resolves both directions so callers don't need to repeat the pattern.
+fn cochange_partner<'a>(row: &'a rskim_search::CochangeRow, target: &str) -> &'a str {
+    if row.file_a == target { &row.file_b } else { &row.file_a }
+}
+
+// ============================================================================
 // Standalone temporal query
 // ============================================================================
 
@@ -181,34 +193,24 @@ pub(super) fn query_standalone(
         if let Some(sort_mode) = sort {
             match sort_mode {
                 TemporalSort::Hot | TemporalSort::Cold => {
-                    // Load hotspots to get scores for the partners.
                     let hotspots = db.load_hotspots()?;
                     let hotspot_map: std::collections::HashMap<&str, f64> = hotspots
                         .iter()
                         .map(|h| (h.file_path.as_str(), h.score))
                         .collect();
                     partners.sort_by(|a, b| {
-                        let partner_a = if a.file_a == normalized {
-                            &a.file_b
-                        } else {
-                            &a.file_a
-                        };
-                        let partner_b = if b.file_a == normalized {
-                            &b.file_b
-                        } else {
-                            &b.file_a
-                        };
-                        let score_a = hotspot_map.get(partner_a.as_str()).copied().unwrap_or(0.0);
-                        let score_b = hotspot_map.get(partner_b.as_str()).copied().unwrap_or(0.0);
-                        if sort_mode == TemporalSort::Cold {
-                            score_a
-                                .partial_cmp(&score_b)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        } else {
-                            score_b
-                                .partial_cmp(&score_a)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        }
+                        let score_a = hotspot_map
+                            .get(cochange_partner(a, &normalized))
+                            .copied()
+                            .unwrap_or(0.0);
+                        let score_b = hotspot_map
+                            .get(cochange_partner(b, &normalized))
+                            .copied()
+                            .unwrap_or(0.0);
+                        let cmp = score_a
+                            .partial_cmp(&score_b)
+                            .unwrap_or(std::cmp::Ordering::Equal);
+                        if sort_mode == TemporalSort::Cold { cmp } else { cmp.reverse() }
                     });
                 }
                 TemporalSort::Risky => {
@@ -218,18 +220,14 @@ pub(super) fn query_standalone(
                         .map(|r| (r.file_path.as_str(), r.risk_score))
                         .collect();
                     partners.sort_by(|a, b| {
-                        let partner_a = if a.file_a == normalized {
-                            &a.file_b
-                        } else {
-                            &a.file_a
-                        };
-                        let partner_b = if b.file_a == normalized {
-                            &b.file_b
-                        } else {
-                            &b.file_a
-                        };
-                        let risk_a = risk_map.get(partner_a.as_str()).copied().unwrap_or(0.0);
-                        let risk_b = risk_map.get(partner_b.as_str()).copied().unwrap_or(0.0);
+                        let risk_a = risk_map
+                            .get(cochange_partner(a, &normalized))
+                            .copied()
+                            .unwrap_or(0.0);
+                        let risk_b = risk_map
+                            .get(cochange_partner(b, &normalized))
+                            .copied()
+                            .unwrap_or(0.0);
                         risk_b
                             .partial_cmp(&risk_a)
                             .unwrap_or(std::cmp::Ordering::Equal)
@@ -272,28 +270,22 @@ pub(super) fn format_temporal_text(
     w: &mut impl Write,
 ) -> anyhow::Result<()> {
     match output {
-        TemporalQueryOutput::Hotspots(rows) => {
+        TemporalQueryOutput::Hotspots(rows) | TemporalQueryOutput::Coldspots(rows) => {
+            let (empty_msg, header_msg) = match output {
+                TemporalQueryOutput::Hotspots(_) => (
+                    "No hotspot data available.",
+                    format!("Hotspots (top {}, 90-day decay):\n", rows.len()),
+                ),
+                _ => (
+                    "No coldspot data available.",
+                    format!("Coldspots (top {}, least active):\n", rows.len()),
+                ),
+            };
             if rows.is_empty() {
-                writeln!(w, "No hotspot data available.")?;
+                writeln!(w, "{empty_msg}")?;
                 return Ok(());
             }
-            writeln!(w, "Hotspots (top {}, 90-day decay):\n", rows.len())?;
-            writeln!(w, "  Score  30d  90d  Path")?;
-            writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
-            for r in rows {
-                writeln!(
-                    w,
-                    "  {:.3}   {:>4} {:>4}  {}",
-                    r.score, r.changes_30d, r.changes_90d, r.file_path
-                )?;
-            }
-        }
-        TemporalQueryOutput::Coldspots(rows) => {
-            if rows.is_empty() {
-                writeln!(w, "No coldspot data available.")?;
-                return Ok(());
-            }
-            writeln!(w, "Coldspots (top {}, least active):\n", rows.len())?;
+            writeln!(w, "{header_msg}")?;
             writeln!(w, "  Score  30d  90d  Path")?;
             writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
             for r in rows {
@@ -341,11 +333,7 @@ pub(super) fn format_temporal_text(
             writeln!(w, "  Jaccard  Count  Path")?;
             writeln!(w, "  ───────  ─────  ────────────────────────────────")?;
             for p in partners {
-                let partner = if p.file_a == *target {
-                    &p.file_b
-                } else {
-                    &p.file_a
-                };
+                let partner = cochange_partner(p, target);
                 writeln!(w, "  {:.3}    {:>5}  {}", p.jaccard, p.count, partner)?;
             }
         }
@@ -359,7 +347,11 @@ pub(super) fn format_temporal_json(
     w: &mut impl Write,
 ) -> anyhow::Result<()> {
     let json = match output {
-        TemporalQueryOutput::Hotspots(rows) => {
+        TemporalQueryOutput::Hotspots(rows) | TemporalQueryOutput::Coldspots(rows) => {
+            let mode = match output {
+                TemporalQueryOutput::Hotspots(_) => "hot",
+                _ => "cold",
+            };
             let results: Vec<serde_json::Value> = rows
                 .iter()
                 .map(|r| {
@@ -372,25 +364,7 @@ pub(super) fn format_temporal_json(
                 })
                 .collect();
             serde_json::json!({
-                "mode": "hot",
-                "limit": rows.len(),
-                "results": results,
-            })
-        }
-        TemporalQueryOutput::Coldspots(rows) => {
-            let results: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "path": r.file_path,
-                        "hotspot_score": r.score,
-                        "changes_30d": r.changes_30d,
-                        "changes_90d": r.changes_90d,
-                    })
-                })
-                .collect();
-            serde_json::json!({
-                "mode": "cold",
+                "mode": mode,
                 "limit": rows.len(),
                 "results": results,
             })
@@ -418,13 +392,8 @@ pub(super) fn format_temporal_json(
             let results: Vec<serde_json::Value> = partners
                 .iter()
                 .map(|p| {
-                    let partner = if p.file_a == *target {
-                        &p.file_b
-                    } else {
-                        &p.file_a
-                    };
                     serde_json::json!({
-                        "path": partner,
+                        "path": cochange_partner(p, target),
                         "jaccard": p.jaccard,
                         "count": p.count,
                     })
@@ -485,43 +454,17 @@ pub(super) fn apply_temporal_enrichment(
                 }
             }
 
-            if sort == TemporalSort::Hot {
-                // Sort descending: annotated files first (by score desc), then unannotated by path.
-                results.sort_by(|a, b| {
-                    let score_a = a
-                        .temporal
-                        .as_ref()
-                        .and_then(|t| t.hotspot_score)
-                        .unwrap_or(-1.0);
-                    let score_b = b
-                        .temporal
-                        .as_ref()
-                        .and_then(|t| t.hotspot_score)
-                        .unwrap_or(-1.0);
-                    score_b
-                        .partial_cmp(&score_a)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.path.cmp(&b.path))
-                });
-            } else {
-                // Cold: ascending, unannotated files first (score -1.0 sorts before 0.0).
-                results.sort_by(|a, b| {
-                    let score_a = a
-                        .temporal
-                        .as_ref()
-                        .and_then(|t| t.hotspot_score)
-                        .unwrap_or(-1.0);
-                    let score_b = b
-                        .temporal
-                        .as_ref()
-                        .and_then(|t| t.hotspot_score)
-                        .unwrap_or(-1.0);
-                    score_a
-                        .partial_cmp(&score_b)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.path.cmp(&b.path))
-                });
-            }
+            // Hot: descending (annotated first). Cold: ascending (unannotated first via -1.0).
+            let hotspot_score = |r: &ResolvedResult| {
+                r.temporal.as_ref().and_then(|t| t.hotspot_score).unwrap_or(-1.0)
+            };
+            results.sort_by(|a, b| {
+                let cmp = hotspot_score(a)
+                    .partial_cmp(&hotspot_score(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.path.cmp(&b.path));
+                if sort == TemporalSort::Hot { cmp.reverse() } else { cmp }
+            });
         }
         TemporalSort::Risky => {
             let risks = match db.load_risks() {

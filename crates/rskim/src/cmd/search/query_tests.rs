@@ -49,6 +49,7 @@ fn make_config(root: &std::path::Path, cache_dir: &std::path::Path, text: &str) 
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
     }
 }
 

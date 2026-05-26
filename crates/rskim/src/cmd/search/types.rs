@@ -97,6 +97,13 @@ pub(super) struct QueryConfig {
     pub root: PathBuf,
     /// Cache directory containing the index files.
     pub cache_dir: PathBuf,
+    /// Optional set of allowed file paths (blast-radius pre-filter).
+    ///
+    /// When `Some`, only files whose repo-relative path is in this set are
+    /// scored. The filter is applied inside the search engine (before LIMIT)
+    /// so that the limit applies to the filtered result set rather than being
+    /// wasted on files that would be discarded.
+    pub blast_radius_paths: Option<std::collections::HashSet<String>>,
 }
 
 /// A search result with the file path resolved and snippet extracted.

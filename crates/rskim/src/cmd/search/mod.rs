@@ -185,26 +185,20 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                 })?;
                 root_override = Some(PathBuf::from(val));
             }
-            "--hot" => {
-                if let Some(existing) = temporal_sort {
-                    anyhow::bail!("--hot and {} are mutually exclusive", existing.flag_name());
-                }
-                temporal_sort = Some(types::TemporalSort::Hot);
-            }
-            "--cold" => {
-                if let Some(existing) = temporal_sort {
-                    anyhow::bail!("--cold and {} are mutually exclusive", existing.flag_name());
-                }
-                temporal_sort = Some(types::TemporalSort::Cold);
-            }
-            "--risky" => {
+            "--hot" | "--cold" | "--risky" => {
+                let new_sort = match args[i].as_str() {
+                    "--hot" => types::TemporalSort::Hot,
+                    "--cold" => types::TemporalSort::Cold,
+                    _ => types::TemporalSort::Risky,
+                };
                 if let Some(existing) = temporal_sort {
                     anyhow::bail!(
-                        "--risky and {} are mutually exclusive",
+                        "{} and {} are mutually exclusive",
+                        new_sort.flag_name(),
                         existing.flag_name()
                     );
                 }
-                temporal_sort = Some(types::TemporalSort::Risky);
+                temporal_sort = Some(new_sort);
             }
             "--blast-radius" => {
                 i += 1;
@@ -401,55 +395,60 @@ fn run_query(
     let (root, cache_dir) = resolve_root_and_cache(root_override)?;
     std::fs::create_dir_all(&cache_dir)?;
 
+    // Resolve blast-radius partner paths BEFORE querying so the file_filter
+    // is applied inside the search engine (before LIMIT). This ensures the
+    // limit applies to the filtered set rather than silently discarding
+    // co-change partners that ranked beyond the top-N unfiltered results.
+    let mut blast_radius_paths: Option<std::collections::HashSet<String>> = None;
+    let temporal_db_path = cache_dir.join("temporal.db");
+    let temporal_db = if temporal_sort.is_some() || blast_radius.is_some() {
+        temporal::open_temporal_db(&temporal_db_path)
+    } else {
+        None
+    };
+
+    if let (Some(raw_path), Some(db)) = (blast_radius, &temporal_db) {
+        match temporal::normalize_blast_radius_path(raw_path, &root) {
+            Ok(normalized) => {
+                let partners = db.cochanges_for_file(&normalized)?;
+                if partners.is_empty() {
+                    eprintln!("skim search: no co-change data for {raw_path:?}");
+                }
+                let paths: std::collections::HashSet<String> = partners
+                    .iter()
+                    .map(|p| {
+                        if p.file_a == normalized {
+                            p.file_b.clone()
+                        } else {
+                            p.file_a.clone()
+                        }
+                    })
+                    .collect();
+                blast_radius_paths = Some(paths);
+            }
+            Err(e) => {
+                eprintln!("skim search: --blast-radius: {e}");
+            }
+        }
+    } else if temporal_db.is_none() && (temporal_sort.is_some() || blast_radius.is_some()) {
+        eprintln!("skim search: no temporal data — run 'skim heatmap' to populate");
+    }
+
     let config = types::QueryConfig {
         text: text.to_string(),
         limit,
         json,
         root: root.clone(),
         cache_dir: cache_dir.clone(),
+        blast_radius_paths,
     };
 
     let mut output = query::execute_query(&config, analytics)?;
 
-    // Apply temporal enrichment if requested.
-    if temporal_sort.is_some() || blast_radius.is_some() {
-        let temporal_db_path = cache_dir.join("temporal.db");
-        if let Some(db) = temporal::open_temporal_db(&temporal_db_path) {
-            // Blast-radius pre-filter: resolve co-change partners and restrict results.
-            if let Some(raw_path) = blast_radius {
-                match temporal::normalize_blast_radius_path(raw_path, &root) {
-                    Ok(normalized) => {
-                        let partners = db.cochanges_for_file(&normalized)?;
-                        if partners.is_empty() {
-                            eprintln!("skim search: no co-change data for {raw_path:?}");
-                        }
-                        // Filter results to only those that are co-change partners.
-                        let partner_paths: std::collections::HashSet<String> = partners
-                            .iter()
-                            .map(|p| {
-                                if p.file_a == normalized {
-                                    p.file_b.clone()
-                                } else {
-                                    p.file_a.clone()
-                                }
-                            })
-                            .collect();
-                        output.results.retain(|r| partner_paths.contains(&r.path));
-                        output.total = output.results.len();
-                    }
-                    Err(e) => {
-                        eprintln!("skim search: --blast-radius: {e}");
-                    }
-                }
-            }
-            // Apply temporal sort/annotation.
-            if let Some(sort) = temporal_sort {
-                temporal::apply_temporal_enrichment(&mut output.results, sort, &db)?;
-                output.total = output.results.len();
-            }
-        } else {
-            eprintln!("skim search: no temporal data — run 'skim heatmap' to populate");
-        }
+    // Apply temporal sort/annotation to the results.
+    if let (Some(sort), Some(db)) = (temporal_sort, &temporal_db) {
+        temporal::apply_temporal_enrichment(&mut output.results, sort, db)?;
+        output.total = output.results.len();
     }
 
     let mut stdout = BufWriter::new(std::io::stdout());
