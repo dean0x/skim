@@ -114,7 +114,12 @@ fn try_parse_build(text: &str) -> Option<InfraResult> {
 
         // Legacy format
         if let Some(caps) = RE_BUILD_STEP_LEGACY.captures(trimmed) {
-            fmt = Some(BuildFormat::Legacy);
+            // First-writer-wins: only set format if not yet detected.
+            // Prevents a mixed Legacy+BuildKit log from silently flipping to
+            // whichever format matched last.
+            if fmt.is_none() {
+                fmt = Some(BuildFormat::Legacy);
+            }
             let step_num = &caps[1];
             let total = &caps[2];
             let cmd = &caps[3];
@@ -124,7 +129,10 @@ fn try_parse_build(text: &str) -> Option<InfraResult> {
 
         // BuildKit format — match lines like `=> [1/6] FROM ...`
         if let Some(caps) = RE_BUILD_STEP_BUILDKIT.captures(trimmed) {
-            fmt = Some(BuildFormat::BuildKit);
+            // First-writer-wins: only set format if not yet detected.
+            if fmt.is_none() {
+                fmt = Some(BuildFormat::BuildKit);
+            }
             let stage = &caps[1];
             let cmd = &caps[2];
             // Skip internal/metadata steps
@@ -334,6 +342,50 @@ ERROR: failed to solve: failed to read dockerfile: open Dockerfile: no such file
         assert!(
             display.contains("failed to solve"),
             "expected error text in output, got: {display}"
+        );
+    }
+
+    /// Mixed Legacy+BuildKit output must use first-writer-wins for BuildFormat.
+    ///
+    /// If `Step N/M` lines appear before `=> [stage]` lines the format must be
+    /// locked to `Legacy` — not silently overwritten by the later BuildKit match.
+    /// Conversely, if BuildKit appears first the format stays `BuildKit`.
+    #[test]
+    fn test_mixed_output_first_writer_wins_legacy_first() {
+        // Legacy lines appear first — format must stay Legacy.
+        let input = "Step 1/2 : FROM python:3.11\n\
+                     Step 2/2 : RUN pip install flask\n\
+                     => [1/2] FROM docker.io/library/python:3.11\n\
+                     Successfully built abc123456def\n";
+        let result = try_parse_build(input).expect("expected Some for mixed output");
+        let display = result.to_string();
+        assert!(
+            display.contains("legacy"),
+            "expected format label 'legacy' when Legacy lines appear first, got: {display}"
+        );
+        assert!(
+            !display.contains("BuildKit"),
+            "BuildKit label must not appear when Legacy was detected first, got: {display}"
+        );
+    }
+
+    /// Mirror of the above: BuildKit first must not be overwritten by a later
+    /// Legacy line.
+    #[test]
+    fn test_mixed_output_first_writer_wins_buildkit_first() {
+        // BuildKit lines appear first — format must stay BuildKit.
+        let input = " => [1/2] FROM docker.io/library/python:3.11\n\
+                     Step 1/1 : RUN pip install flask\n\
+                     Successfully built abc123456def\n";
+        let result = try_parse_build(input).expect("expected Some for mixed output");
+        let display = result.to_string();
+        assert!(
+            display.contains("BuildKit"),
+            "expected format label 'BuildKit' when BuildKit lines appear first, got: {display}"
+        );
+        assert!(
+            !display.contains("legacy"),
+            "legacy label must not appear when BuildKit was detected first, got: {display}"
         );
     }
 
