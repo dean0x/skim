@@ -104,9 +104,9 @@ impl TemporalDb {
                 rows.len()
             )));
         }
-        // SAFETY: `TemporalDb` is not `Send`/`Sync` and holds a single
-        // connection. Callers cannot share it across threads, so no nested
-        // transaction can be active when this method is called.
+        // SAFETY: `TemporalDb` is `Send` but not `Sync` — it can be moved to
+        // another thread but cannot be shared. Since `&self` methods cannot be
+        // called concurrently, no nested transaction can be active.
         let tx = self.conn.unchecked_transaction().map_err(db_err)?;
         insert_hotspots_in_tx(&tx, rows)?;
         tx.commit().map_err(db_err)
@@ -183,7 +183,10 @@ impl TemporalDb {
     pub fn load_hotspots(&self) -> Result<Vec<HotspotRow>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT file_path, score, changes_30d, changes_90d FROM hotspot")
+            .prepare(
+                "SELECT file_path, score, changes_30d, changes_90d FROM hotspot
+                 LIMIT 500001",
+            )
             .map_err(db_err)?;
         let rows = stmt
             .query_map([], |row| {
@@ -197,6 +200,11 @@ impl TemporalDb {
             .map_err(db_err)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(db_err)?;
+        if rows.len() > MAX_ROWS_PER_TABLE {
+            return Err(SearchError::CapacityExceeded(format!(
+                "load_hotspots: table contains more than {MAX_ROWS_PER_TABLE} rows"
+            )));
+        }
         Ok(rows)
     }
 
@@ -211,7 +219,8 @@ impl TemporalDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT file_path, risk_score, total_commits, fix_commits, fix_density FROM risk",
+                "SELECT file_path, risk_score, total_commits, fix_commits, fix_density FROM risk
+                 LIMIT 500001",
             )
             .map_err(db_err)?;
         let rows = stmt
@@ -227,6 +236,11 @@ impl TemporalDb {
             .map_err(db_err)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(db_err)?;
+        if rows.len() > MAX_ROWS_PER_TABLE {
+            return Err(SearchError::CapacityExceeded(format!(
+                "load_risks: table contains more than {MAX_ROWS_PER_TABLE} rows"
+            )));
+        }
         Ok(rows)
     }
 
@@ -240,7 +254,10 @@ impl TemporalDb {
     pub fn load_cochanges(&self) -> Result<Vec<CochangeRow>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT file_a, file_b, count, jaccard FROM cochange")
+            .prepare(
+                "SELECT file_a, file_b, count, jaccard FROM cochange
+                 LIMIT 500001",
+            )
             .map_err(db_err)?;
         let rows = stmt
             .query_map([], |row| {
@@ -254,6 +271,11 @@ impl TemporalDb {
             .map_err(db_err)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(db_err)?;
+        if rows.len() > MAX_ROWS_PER_TABLE {
+            return Err(SearchError::CapacityExceeded(format!(
+                "load_cochanges: table contains more than {MAX_ROWS_PER_TABLE} rows"
+            )));
+        }
         Ok(rows)
     }
 
@@ -320,9 +342,9 @@ impl TemporalDb {
             }
         }
 
-        // SAFETY: `TemporalDb` is not `Send`/`Sync` and holds a single
-        // connection. Callers cannot share it across threads, so no nested
-        // transaction can be active when this method is called.
+        // SAFETY: `TemporalDb` is `Send` but not `Sync` — it can be moved to
+        // another thread but cannot be shared. Since `&self` methods cannot be
+        // called concurrently, no nested transaction can be active.
         let tx = self.conn.unchecked_transaction().map_err(db_err)?;
 
         insert_hotspots_in_tx(&tx, hotspots)?;

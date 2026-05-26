@@ -30,8 +30,8 @@ fn make_hotspot(n: usize) -> HotspotRow {
     HotspotRow {
         file_path: format!("src/file_{n}.rs"),
         score: n as f64 / 10_000.0,
-        changes_30d: i64::try_from(n % 100).unwrap(),
-        changes_90d: i64::try_from(n % 200).unwrap(),
+        changes_30d: (n % 100) as u32,
+        changes_90d: (n % 200) as u32,
     }
 }
 
@@ -39,8 +39,8 @@ fn make_risk(n: usize) -> RiskRow {
     RiskRow {
         file_path: format!("src/file_{n}.rs"),
         risk_score: n as f64 / 10_000.0,
-        total_commits: i64::try_from(n + 1).unwrap(),
-        fix_commits: i64::try_from(n % 5).unwrap(),
+        total_commits: (n + 1) as u32,
+        fix_commits: (n % 5) as u32,
         fix_density: (n % 5) as f64 / (n + 1) as f64,
     }
 }
@@ -49,7 +49,7 @@ fn make_cochange(n: usize) -> CochangeRow {
     CochangeRow {
         file_a: format!("src/file_{n}.rs"),
         file_b: format!("src/file_{}.rs", n + 1),
-        count: i64::try_from(n + 1).unwrap(),
+        count: (n + 1) as u32,
         jaccard: n as f64 / 10_000.0,
     }
 }
