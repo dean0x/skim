@@ -10,8 +10,8 @@ use rusqlite::params;
 
 use crate::types::{Result, SearchError};
 
-use super::{META_GIT_HEAD, META_LAST_UPDATED, TemporalDb, db_err};
 use super::storage_types::{CochangeRow, HotspotRow, RiskRow};
+use super::{META_GIT_HEAD, META_LAST_UPDATED, TemporalDb, db_err};
 
 /// Maximum rows accepted per table in a single store or sync call.
 ///
@@ -23,10 +23,7 @@ const MAX_ROWS_PER_TABLE: usize = 500_000;
 // Private insert helpers — accept an open Transaction
 // ============================================================================
 
-fn insert_hotspots_in_tx(
-    tx: &rusqlite::Transaction<'_>,
-    rows: &[HotspotRow],
-) -> Result<()> {
+fn insert_hotspots_in_tx(tx: &rusqlite::Transaction<'_>, rows: &[HotspotRow]) -> Result<()> {
     tx.execute("DELETE FROM hotspot", []).map_err(db_err)?;
     let mut stmt = tx
         .prepare_cached(
@@ -35,16 +32,18 @@ fn insert_hotspots_in_tx(
         )
         .map_err(db_err)?;
     for row in rows {
-        stmt.execute(params![row.file_path, row.score, row.changes_30d, row.changes_90d])
-            .map_err(db_err)?;
+        stmt.execute(params![
+            row.file_path,
+            row.score,
+            row.changes_30d,
+            row.changes_90d
+        ])
+        .map_err(db_err)?;
     }
     Ok(())
 }
 
-fn insert_risks_in_tx(
-    tx: &rusqlite::Transaction<'_>,
-    rows: &[RiskRow],
-) -> Result<()> {
+fn insert_risks_in_tx(tx: &rusqlite::Transaction<'_>, rows: &[RiskRow]) -> Result<()> {
     tx.execute("DELETE FROM risk", []).map_err(db_err)?;
     let mut stmt = tx
         .prepare_cached(
@@ -65,10 +64,7 @@ fn insert_risks_in_tx(
     Ok(())
 }
 
-fn insert_cochanges_in_tx(
-    tx: &rusqlite::Transaction<'_>,
-    rows: &[CochangeRow],
-) -> Result<()> {
+fn insert_cochanges_in_tx(tx: &rusqlite::Transaction<'_>, rows: &[CochangeRow]) -> Result<()> {
     tx.execute("DELETE FROM cochange", []).map_err(db_err)?;
     let mut stmt = tx
         .prepare_cached(
@@ -294,11 +290,11 @@ impl TemporalDb {
     /// Returns [`SearchError::Database`] on any SQLite failure other than
     /// `QueryReturnedNoRows`.
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        match self
-            .conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |row| {
-                row.get(0)
-            }) {
+        match self.conn.query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        ) {
             Ok(v) => Ok(Some(v)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(db_err(e)),

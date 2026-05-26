@@ -33,12 +33,12 @@ pub use ngram::{
     BORDER_MULTIPLIER, Ngram, extract_ngrams, extract_ngrams_with_weights, extract_query_ngrams,
     extract_query_ngrams_with_weights,
 };
+pub use temporal::storage::{
+    CochangeRow, HotspotRow, META_GIT_HEAD, META_LAST_UPDATED, RiskRow, TemporalDb,
+};
 pub use temporal::{
     DEFAULT_HALF_LIFE_DAYS, GixSource, compute_file_risk_scores, compute_file_temporal_stats,
     decay_weight, is_fix_commit,
-};
-pub use temporal::storage::{
-    CochangeRow, HotspotRow, META_GIT_HEAD, META_LAST_UPDATED, RiskRow, TemporalDb,
 };
 pub use types::{
     CochangeStats, CommitInfo, FieldClassifier, FileChangeInfo, FileId, FileRiskScores,

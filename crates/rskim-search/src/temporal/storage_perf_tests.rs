@@ -10,8 +10,8 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use super::{
-    storage_types::{CochangeRow, HotspotRow, RiskRow},
     META_GIT_HEAD, META_LAST_UPDATED, TemporalDb,
+    storage_types::{CochangeRow, HotspotRow, RiskRow},
 };
 use crate::types::SearchError;
 
@@ -203,7 +203,10 @@ fn sync_sets_meta_keys() {
     );
     // Timestamp should be a plausible Unix epoch (> year 2020 = 1577836800).
     let ts: u64 = updated.unwrap().parse().unwrap();
-    assert!(ts > 1_577_836_800, "timestamp should be after 2020, got {ts}");
+    assert!(
+        ts > 1_577_836_800,
+        "timestamp should be after 2020, got {ts}"
+    );
 }
 
 // ============================================================================
@@ -334,4 +337,3 @@ fn database_error_display() {
     let display = err.to_string();
     assert_eq!(display, "Database error: something went wrong");
 }
-

@@ -6,8 +6,8 @@
 use tempfile::TempDir;
 
 use super::{
-    storage_types::{CochangeRow, HotspotRow, RiskRow},
     TemporalDb,
+    storage_types::{CochangeRow, HotspotRow, RiskRow},
 };
 use crate::types::SearchError;
 
