@@ -1252,6 +1252,20 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Build a `CommandOutput` where all output is on stderr and exit code is 0.
+    ///
+    /// Use for tools that write to stderr by default (e.g. `wget`, `curl`).
+    /// Equivalent to `make_output_full("", stderr, Some(0))` but clarifies
+    /// the intent at the call site.
+    pub(crate) fn make_output_stderr(stderr: &str) -> CommandOutput {
+        CommandOutput {
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+            exit_code: Some(0),
+            duration: Duration::ZERO,
+        }
+    }
+
     /// Load a test fixture from `tests/fixtures/cmd/{subdir}/{name}`.
     ///
     /// Panics with a clear message if the fixture file cannot be read,

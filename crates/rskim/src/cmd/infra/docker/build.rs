@@ -74,6 +74,57 @@ impl BuildFormat {
     }
 }
 
+// ============================================================================
+// Line classification
+// ============================================================================
+
+/// Classification of a single line from `docker build` output.
+///
+/// Returned by [`classify_line`] so that [`try_parse_build`] can dispatch on
+/// a flat `match` rather than a chain of nested `if let` blocks.
+enum LineClassification<'a> {
+    /// Legacy `Step N/M : COMMAND` — carries `(step_num, total, cmd)`.
+    LegacyStep(&'a str, &'a str, &'a str),
+    /// BuildKit `=> [stage N/M] COMMAND` — carries `(stage, cmd)`.
+    BuildKitStep(&'a str, &'a str),
+    /// Legacy `Successfully built <id>` — carries the raw image-id slice.
+    LegacyImage(&'a str),
+    /// BuildKit `writing image sha256:<id>` — carries the raw sha256 slice.
+    BuildKitImage(&'a str),
+    /// `WARNING:` / `ERROR:` line — carries the message text.
+    Warning(&'a str),
+    /// Unrecognised line — no action needed.
+    Other,
+}
+
+/// Classify a single trimmed build-output line into a [`LineClassification`].
+///
+/// The caller is responsible for trimming whitespace before passing `line`.
+fn classify_line<'a>(line: &'a str) -> LineClassification<'a> {
+    if let Some(caps) = RE_BUILD_STEP_LEGACY.captures(line) {
+        // SAFETY: groups 1–3 are always present when the regex matches.
+        let step_num = caps.get(1).unwrap().as_str();
+        let total = caps.get(2).unwrap().as_str();
+        let cmd = caps.get(3).unwrap().as_str();
+        return LineClassification::LegacyStep(step_num, total, cmd);
+    }
+    if let Some(caps) = RE_BUILD_STEP_BUILDKIT.captures(line) {
+        let stage = caps.get(1).unwrap().as_str();
+        let cmd = caps.get(2).unwrap().as_str();
+        return LineClassification::BuildKitStep(stage, cmd);
+    }
+    if let Some(caps) = RE_BUILD_SUCCESS_LEGACY.captures(line) {
+        return LineClassification::LegacyImage(caps.get(1).unwrap().as_str());
+    }
+    if let Some(caps) = RE_BUILD_SUCCESS_BUILDKIT.captures(line) {
+        return LineClassification::BuildKitImage(caps.get(1).unwrap().as_str());
+    }
+    if let Some(caps) = RE_BUILD_WARN_ERROR.captures(line) {
+        return LineClassification::Warning(caps.get(1).unwrap().as_str());
+    }
+    LineClassification::Other
+}
+
 /// No-op: `docker build` does not support `--format json`.
 ///
 /// # Safety invariant
@@ -112,54 +163,53 @@ fn try_parse_build(text: &str) -> Option<InfraResult> {
     for line in text.lines() {
         let trimmed = line.trim();
 
-        // Legacy format
-        if let Some(caps) = RE_BUILD_STEP_LEGACY.captures(trimmed) {
-            // First-writer-wins: only set format if not yet detected.
-            // Prevents a mixed Legacy+BuildKit log from silently flipping to
-            // whichever format matched last.
-            if fmt.is_none() {
-                fmt = Some(BuildFormat::Legacy);
+        match classify_line(trimmed) {
+            LineClassification::LegacyStep(step_num, total, cmd) => {
+                // First-writer-wins: only lock format on the first recognised line.
+                // Prevents a mixed Legacy+BuildKit log from silently flipping to
+                // whichever format matched last.
+                if fmt.is_none() {
+                    fmt = Some(BuildFormat::Legacy);
+                } else if crate::debug::is_debug_enabled()
+                    && fmt != Some(BuildFormat::Legacy)
+                {
+                    eprintln!(
+                        "[skim:debug] docker build: Legacy step skipped — format already locked to {:?}",
+                        fmt
+                    );
+                }
+                steps.push(format!("Step {step_num}/{total}: {cmd}"));
             }
-            let step_num = &caps[1];
-            let total = &caps[2];
-            let cmd = &caps[3];
-            steps.push(format!("Step {step_num}/{total}: {cmd}"));
-            continue;
-        }
-
-        // BuildKit format — match lines like `=> [1/6] FROM ...`
-        if let Some(caps) = RE_BUILD_STEP_BUILDKIT.captures(trimmed) {
-            // First-writer-wins: only set format if not yet detected.
-            if fmt.is_none() {
-                fmt = Some(BuildFormat::BuildKit);
+            LineClassification::BuildKitStep(stage, cmd) => {
+                // First-writer-wins: only lock format on the first recognised line.
+                if fmt.is_none() {
+                    fmt = Some(BuildFormat::BuildKit);
+                } else if crate::debug::is_debug_enabled()
+                    && fmt != Some(BuildFormat::BuildKit)
+                {
+                    eprintln!(
+                        "[skim:debug] docker build: BuildKit step skipped — format already locked to {:?}",
+                        fmt
+                    );
+                }
+                // Skip internal/metadata steps
+                if !stage.contains("internal")
+                    && !stage.contains("load")
+                    && !stage.contains("exporting")
+                {
+                    steps.push(format!("[{stage}] {cmd}"));
+                }
             }
-            let stage = &caps[1];
-            let cmd = &caps[2];
-            // Skip internal/metadata steps
-            if !stage.contains("internal")
-                && !stage.contains("load")
-                && !stage.contains("exporting")
-            {
-                steps.push(format!("[{stage}] {cmd}"));
+            LineClassification::LegacyImage(id) => {
+                final_image = Some(id.chars().take(12).collect());
             }
-            continue;
-        }
-
-        // Image ID (legacy)
-        if let Some(caps) = RE_BUILD_SUCCESS_LEGACY.captures(trimmed) {
-            final_image = Some(caps[1].chars().take(12).collect());
-            continue;
-        }
-
-        // Image ID (BuildKit)
-        if let Some(caps) = RE_BUILD_SUCCESS_BUILDKIT.captures(trimmed) {
-            final_image = Some(caps[1].chars().take(19).collect()); // sha256:12chars
-            continue;
-        }
-
-        // Warnings/errors
-        if let Some(caps) = RE_BUILD_WARN_ERROR.captures(trimmed) {
-            warnings.push(caps[1].to_string());
+            LineClassification::BuildKitImage(id) => {
+                final_image = Some(id.chars().take(19).collect()); // sha256:12chars
+            }
+            LineClassification::Warning(msg) => {
+                warnings.push(msg.to_string());
+            }
+            LineClassification::Other => {}
         }
     }
 
@@ -403,6 +453,29 @@ ERROR: failed to solve: failed to read dockerfile: open Dockerfile: no such file
         assert!(
             result.is_none(),
             "expected None for all-filtered BuildKit output, got {result:?}"
+        );
+    }
+
+    /// Debug mode must not break first-writer-wins correctness on mixed output.
+    ///
+    /// When `SKIM_DEBUG` is enabled, skipped-format lines emit a `[skim:debug]`
+    /// warning via `eprintln!` but the parse result itself must still honour the
+    /// first-detected format.
+    #[test]
+    fn test_mixed_output_first_writer_wins_correct_with_debug_enabled() {
+        let _guard = crate::debug::DebugTestGuard::acquire();
+        crate::debug::force_enable_debug();
+
+        // Legacy first — format must stay Legacy even when debug mode is on.
+        let input = "Step 1/2 : FROM python:3.11\n\
+                     Step 2/2 : RUN pip install flask\n\
+                     => [1/2] FROM docker.io/library/python:3.11\n\
+                     Successfully built abc123456def\n";
+        let result = try_parse_build(input).expect("expected Some for mixed output with debug on");
+        let display = result.to_string();
+        assert!(
+            display.contains("legacy"),
+            "format must be 'legacy' when Legacy lines appear first, even with debug enabled, got: {display}"
         );
     }
 }

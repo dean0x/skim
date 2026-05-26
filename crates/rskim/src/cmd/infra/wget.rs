@@ -202,7 +202,7 @@ fn try_parse_regex(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture, make_output_full};
+    use crate::cmd::test_support::{load_fixture, make_output_full, make_output_stderr};
 
     #[test]
     fn test_tier1_wget_download() {
@@ -247,8 +247,9 @@ mod tests {
 
     #[test]
     fn test_parse_impl_produces_full() {
+        // wget writes to stderr by default; use make_output_stderr to clarify intent.
         let input = load_fixture("infra", "wget_download.txt");
-        let output = make_output_full("", &input, Some(0));
+        let output = make_output_stderr(&input);
         let result = parse_impl(&output);
         assert!(
             result.is_full(),
@@ -259,6 +260,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_garbage_produces_passthrough() {
+        // Non-zero exit, stderr only — use make_output_full for explicit exit code.
         let output = make_output_full("", "no output at all", Some(1));
         let result = parse_impl(&output);
         assert!(
@@ -273,7 +275,8 @@ mod tests {
         // Tier 2 input: wget progress output containing an HTTP status code with
         // HTTP context (matches RE_WGET_ANY_STATUS) but does NOT contain
         // "HTTP request" or "ERROR" (which would trigger Tier 1).
-        let output = make_output_full("", "HTTP response 200\n", Some(0));
+        // wget writes to stderr; use make_output_stderr to clarify intent.
+        let output = make_output_stderr("HTTP response 200\n");
         let result = parse_impl(&output);
         assert!(
             result.is_degraded(),
