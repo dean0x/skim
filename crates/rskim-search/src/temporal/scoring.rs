@@ -194,11 +194,7 @@ pub fn compute_file_risk_scores(
 fn dedup_changed_files(files: &[crate::types::FileChangeInfo], buf: &mut HashSet<String>) {
     buf.clear();
     for file in files {
-        let path_cow = file.path_str();
-        let path_ref: &str = &path_cow;
-        if !buf.contains(path_ref) {
-            buf.insert(path_cow.into_owned());
-        }
+        buf.insert(file.path_str().into_owned());
     }
 }
 

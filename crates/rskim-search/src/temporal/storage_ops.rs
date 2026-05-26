@@ -184,6 +184,8 @@ impl TemporalDb {
         let mut stmt = self
             .conn
             .prepare(
+                // LIMIT is MAX_ROWS_PER_TABLE + 1 so the post-query check below
+                // can distinguish "exactly at limit" from "over limit".
                 "SELECT file_path, score, changes_30d, changes_90d FROM hotspot
                  LIMIT 500001",
             )
@@ -219,6 +221,8 @@ impl TemporalDb {
         let mut stmt = self
             .conn
             .prepare(
+                // LIMIT is MAX_ROWS_PER_TABLE + 1 so the post-query check can
+                // distinguish "exactly at limit" from "over limit".
                 "SELECT file_path, risk_score, total_commits, fix_commits, fix_density FROM risk
                  LIMIT 500001",
             )
@@ -255,6 +259,8 @@ impl TemporalDb {
         let mut stmt = self
             .conn
             .prepare(
+                // LIMIT is MAX_ROWS_PER_TABLE + 1 so the post-query check can
+                // distinguish "exactly at limit" from "over limit".
                 "SELECT file_a, file_b, count, jaccard FROM cochange
                  LIMIT 500001",
             )

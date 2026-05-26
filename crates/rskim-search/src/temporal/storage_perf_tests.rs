@@ -26,6 +26,19 @@ fn temp_db() -> (TempDir, TemporalDb) {
     (dir, db)
 }
 
+/// Returns the appropriate timing ceiling in milliseconds.
+///
+/// Debug builds run without optimizations and CI runners can be under load,
+/// so `debug_ms` provides headroom there while `release_ms` holds the tight
+/// acceptance ceiling.
+fn threshold_ms(debug_ms: u128, release_ms: u128) -> u128 {
+    if cfg!(debug_assertions) {
+        debug_ms
+    } else {
+        release_ms
+    }
+}
+
 fn make_hotspot(n: usize) -> HotspotRow {
     HotspotRow {
         file_path: format!("src/file_{n}.rs"),
@@ -203,9 +216,7 @@ fn load_10k_hotspots_under_100ms() {
     let rows: Vec<HotspotRow> = (0..10_000).map(make_hotspot).collect();
     db.store_hotspots(&rows).unwrap();
 
-    // Debug builds run without optimisations and CI runners may be under load,
-    // so give 5× headroom in debug mode while keeping the tight release ceiling.
-    let threshold_ms: u128 = if cfg!(debug_assertions) { 500 } else { 100 };
+    let ceiling = threshold_ms(500, 100);
 
     let start = Instant::now();
     let loaded = db.load_hotspots().unwrap();
@@ -213,10 +224,10 @@ fn load_10k_hotspots_under_100ms() {
 
     assert_eq!(loaded.len(), 10_000);
     assert!(
-        elapsed.as_millis() < threshold_ms,
+        elapsed.as_millis() < ceiling,
         "load_hotspots 10k rows took {}ms, expected <{}ms",
         elapsed.as_millis(),
-        threshold_ms,
+        ceiling,
     );
 }
 
@@ -226,7 +237,7 @@ fn load_10k_risks_under_100ms() {
     let rows: Vec<RiskRow> = (0..10_000).map(make_risk).collect();
     db.store_risks(&rows).unwrap();
 
-    let threshold_ms: u128 = if cfg!(debug_assertions) { 500 } else { 100 };
+    let ceiling = threshold_ms(500, 100);
 
     let start = Instant::now();
     let loaded = db.load_risks().unwrap();
@@ -234,10 +245,10 @@ fn load_10k_risks_under_100ms() {
 
     assert_eq!(loaded.len(), 10_000);
     assert!(
-        elapsed.as_millis() < threshold_ms,
+        elapsed.as_millis() < ceiling,
         "load_risks 10k rows took {}ms, expected <{}ms",
         elapsed.as_millis(),
-        threshold_ms,
+        ceiling,
     );
 }
 
@@ -247,7 +258,7 @@ fn load_10k_cochanges_under_100ms() {
     let rows: Vec<CochangeRow> = (0..10_000).map(make_cochange).collect();
     db.store_cochanges(&rows).unwrap();
 
-    let threshold_ms: u128 = if cfg!(debug_assertions) { 500 } else { 100 };
+    let ceiling = threshold_ms(500, 100);
 
     let start = Instant::now();
     let loaded = db.load_cochanges().unwrap();
@@ -255,10 +266,10 @@ fn load_10k_cochanges_under_100ms() {
 
     assert_eq!(loaded.len(), 10_000);
     assert!(
-        elapsed.as_millis() < threshold_ms,
+        elapsed.as_millis() < ceiling,
         "load_cochanges 10k rows took {}ms, expected <{}ms",
         elapsed.as_millis(),
-        threshold_ms,
+        ceiling,
     );
 }
 
@@ -267,17 +278,17 @@ fn store_10k_hotspots_under_200ms() {
     let (_dir, db) = temp_db();
     let rows: Vec<HotspotRow> = (0..10_000).map(make_hotspot).collect();
 
-    let threshold_ms: u128 = if cfg!(debug_assertions) { 1_000 } else { 200 };
+    let ceiling = threshold_ms(1_000, 200);
 
     let start = Instant::now();
     db.store_hotspots(&rows).unwrap();
     let elapsed = start.elapsed();
 
     assert!(
-        elapsed.as_millis() < threshold_ms,
+        elapsed.as_millis() < ceiling,
         "store_hotspots 10k rows took {}ms, expected <{}ms",
         elapsed.as_millis(),
-        threshold_ms,
+        ceiling,
     );
 }
 
@@ -288,17 +299,17 @@ fn sync_10k_each_under_500ms() {
     let risks: Vec<RiskRow> = (0..10_000).map(make_risk).collect();
     let cochanges: Vec<CochangeRow> = (0..10_000).map(make_cochange).collect();
 
-    let threshold_ms: u128 = if cfg!(debug_assertions) { 2_500 } else { 500 };
+    let ceiling = threshold_ms(2_500, 500);
 
     let start = Instant::now();
     db.sync(&hotspots, &risks, &cochanges, "perf_head").unwrap();
     let elapsed = start.elapsed();
 
     assert!(
-        elapsed.as_millis() < threshold_ms,
+        elapsed.as_millis() < ceiling,
         "sync 10k×3 rows took {}ms, expected <{}ms",
         elapsed.as_millis(),
-        threshold_ms,
+        ceiling,
     );
 }
 
