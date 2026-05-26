@@ -247,12 +247,7 @@ pub fn compute_file_temporal_stats(
         }
 
         for path in &seen_in_commit {
-            let entry = accum.entry(path.clone()).or_insert(FileTemporalStats {
-                changes_30d: 0,
-                changes_90d: 0,
-                total_commits: 0,
-                fix_commits: 0,
-            });
+            let entry = accum.entry(path.clone()).or_default();
             entry.total_commits += 1;
             if is_fix {
                 entry.fix_commits += 1;

@@ -278,7 +278,7 @@ pub struct FileRiskScores {
 /// Computed by [`crate::temporal::compute_file_temporal_stats`] from a slice of
 /// [`CommitInfo`] values. Unlike [`FileRiskScores`], these are raw counts (not
 /// decay-weighted), suitable for persistence and incremental refresh.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileTemporalStats {
     /// Number of commits touching this file within the last 30 days.
     pub changes_30d: u32,

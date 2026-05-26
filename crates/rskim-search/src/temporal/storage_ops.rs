@@ -29,18 +29,17 @@ impl TemporalDb {
     pub fn store_hotspots(&self, rows: &[HotspotRow]) -> Result<()> {
         let tx = self.conn.unchecked_transaction().map_err(db_err)?;
         tx.execute("DELETE FROM hotspot", []).map_err(db_err)?;
-        {
-            let mut stmt = tx
-                .prepare_cached(
-                    "INSERT INTO hotspot (file_path, score, changes_30d, changes_90d)
-                     VALUES (?1, ?2, ?3, ?4)",
-                )
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT INTO hotspot (file_path, score, changes_30d, changes_90d)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .map_err(db_err)?;
+        for row in rows {
+            stmt.execute(params![row.file_path, row.score, row.changes_30d, row.changes_90d])
                 .map_err(db_err)?;
-            for row in rows {
-                stmt.execute(params![row.file_path, row.score, row.changes_30d, row.changes_90d])
-                    .map_err(db_err)?;
-            }
         }
+        drop(stmt);
         tx.commit().map_err(db_err)
     }
 
@@ -54,24 +53,23 @@ impl TemporalDb {
     pub fn store_risks(&self, rows: &[RiskRow]) -> Result<()> {
         let tx = self.conn.unchecked_transaction().map_err(db_err)?;
         tx.execute("DELETE FROM risk", []).map_err(db_err)?;
-        {
-            let mut stmt = tx
-                .prepare_cached(
-                    "INSERT INTO risk (file_path, risk_score, total_commits, fix_commits, fix_density)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                )
-                .map_err(db_err)?;
-            for row in rows {
-                stmt.execute(params![
-                    row.file_path,
-                    row.risk_score,
-                    row.total_commits,
-                    row.fix_commits,
-                    row.fix_density
-                ])
-                .map_err(db_err)?;
-            }
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT INTO risk (file_path, risk_score, total_commits, fix_commits, fix_density)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(db_err)?;
+        for row in rows {
+            stmt.execute(params![
+                row.file_path,
+                row.risk_score,
+                row.total_commits,
+                row.fix_commits,
+                row.fix_density
+            ])
+            .map_err(db_err)?;
         }
+        drop(stmt);
         tx.commit().map_err(db_err)
     }
 
@@ -85,18 +83,17 @@ impl TemporalDb {
     pub fn store_cochanges(&self, rows: &[CochangeRow]) -> Result<()> {
         let tx = self.conn.unchecked_transaction().map_err(db_err)?;
         tx.execute("DELETE FROM cochange", []).map_err(db_err)?;
-        {
-            let mut stmt = tx
-                .prepare_cached(
-                    "INSERT INTO cochange (file_a, file_b, count, jaccard)
-                     VALUES (?1, ?2, ?3, ?4)",
-                )
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT INTO cochange (file_a, file_b, count, jaccard)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .map_err(db_err)?;
+        for row in rows {
+            stmt.execute(params![row.file_a, row.file_b, row.count, row.jaccard])
                 .map_err(db_err)?;
-            for row in rows {
-                stmt.execute(params![row.file_a, row.file_b, row.count, row.jaccard])
-                    .map_err(db_err)?;
-            }
         }
+        drop(stmt);
         tx.commit().map_err(db_err)
     }
 
@@ -111,8 +108,8 @@ impl TemporalDb {
                 "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
                 params![key, value],
             )
-            .map_err(db_err)?;
-        Ok(())
+            .map(|_| ())
+            .map_err(db_err)
     }
 
     // ========================================================================
@@ -261,75 +258,68 @@ impl TemporalDb {
 
         // ---- hotspot ----
         tx.execute("DELETE FROM hotspot", []).map_err(db_err)?;
-        {
-            let mut stmt = tx
-                .prepare_cached(
-                    "INSERT INTO hotspot (file_path, score, changes_30d, changes_90d)
-                     VALUES (?1, ?2, ?3, ?4)",
-                )
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT INTO hotspot (file_path, score, changes_30d, changes_90d)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .map_err(db_err)?;
+        for row in hotspots {
+            stmt.execute(params![row.file_path, row.score, row.changes_30d, row.changes_90d])
                 .map_err(db_err)?;
-            for row in hotspots {
-                stmt.execute(params![row.file_path, row.score, row.changes_30d, row.changes_90d])
-                    .map_err(db_err)?;
-            }
         }
+        drop(stmt);
 
         // ---- risk ----
         tx.execute("DELETE FROM risk", []).map_err(db_err)?;
-        {
-            let mut stmt = tx
-                .prepare_cached(
-                    "INSERT INTO risk (file_path, risk_score, total_commits, fix_commits, fix_density)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                )
-                .map_err(db_err)?;
-            for row in risks {
-                stmt.execute(params![
-                    row.file_path,
-                    row.risk_score,
-                    row.total_commits,
-                    row.fix_commits,
-                    row.fix_density
-                ])
-                .map_err(db_err)?;
-            }
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT INTO risk (file_path, risk_score, total_commits, fix_commits, fix_density)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(db_err)?;
+        for row in risks {
+            stmt.execute(params![
+                row.file_path,
+                row.risk_score,
+                row.total_commits,
+                row.fix_commits,
+                row.fix_density
+            ])
+            .map_err(db_err)?;
         }
+        drop(stmt);
 
         // ---- cochange ----
         tx.execute("DELETE FROM cochange", []).map_err(db_err)?;
-        {
-            let mut stmt = tx
-                .prepare_cached(
-                    "INSERT INTO cochange (file_a, file_b, count, jaccard)
-                     VALUES (?1, ?2, ?3, ?4)",
-                )
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT INTO cochange (file_a, file_b, count, jaccard)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .map_err(db_err)?;
+        for row in cochanges {
+            stmt.execute(params![row.file_a, row.file_b, row.count, row.jaccard])
                 .map_err(db_err)?;
-            for row in cochanges {
-                stmt.execute(params![row.file_a, row.file_b, row.count, row.jaccard])
-                    .map_err(db_err)?;
-            }
         }
+        drop(stmt);
 
         // ---- meta ----
-        {
-            let now_secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-                .as_secs();
-            let timestamp_str = now_secs.to_string();
-
-            let mut meta_stmt = tx
-                .prepare_cached(
-                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-                )
-                .map_err(db_err)?;
-            meta_stmt
-                .execute(params![META_GIT_HEAD, git_head])
-                .map_err(db_err)?;
-            meta_stmt
-                .execute(params![META_LAST_UPDATED, timestamp_str])
-                .map_err(db_err)?;
-        }
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs()
+            .to_string();
+        let mut meta_stmt = tx
+            .prepare_cached("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)")
+            .map_err(db_err)?;
+        meta_stmt
+            .execute(params![META_GIT_HEAD, git_head])
+            .map_err(db_err)?;
+        meta_stmt
+            .execute(params![META_LAST_UPDATED, now_secs])
+            .map_err(db_err)?;
+        drop(meta_stmt);
 
         tx.commit().map_err(db_err)
     }
