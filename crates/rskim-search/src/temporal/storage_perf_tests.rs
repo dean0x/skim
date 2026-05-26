@@ -113,6 +113,69 @@ fn sync_writes_all_tables_atomically() {
 }
 
 #[test]
+fn sync_replaces_on_second_call() {
+    let (_dir, db) = temp_db();
+    let h1 = vec![HotspotRow {
+        file_path: "a.rs".into(),
+        score: 0.5,
+        changes_30d: 1,
+        changes_90d: 2,
+    }];
+    let r1 = vec![RiskRow {
+        file_path: "a.rs".into(),
+        risk_score: 0.3,
+        total_commits: 5,
+        fix_commits: 1,
+        fix_density: 0.2,
+    }];
+    let c1 = vec![CochangeRow {
+        file_a: "a.rs".into(),
+        file_b: "b.rs".into(),
+        count: 2,
+        jaccard: 0.4,
+    }];
+    db.sync(&h1, &r1, &c1, "sha1").unwrap();
+
+    let h2 = vec![HotspotRow {
+        file_path: "x.rs".into(),
+        score: 0.9,
+        changes_30d: 3,
+        changes_90d: 6,
+    }];
+    let r2 = vec![RiskRow {
+        file_path: "x.rs".into(),
+        risk_score: 0.8,
+        total_commits: 20,
+        fix_commits: 4,
+        fix_density: 0.2,
+    }];
+    let c2 = vec![CochangeRow {
+        file_a: "x.rs".into(),
+        file_b: "y.rs".into(),
+        count: 5,
+        jaccard: 0.7,
+    }];
+    db.sync(&h2, &r2, &c2, "sha2").unwrap();
+
+    let loaded_h = db.load_hotspots().unwrap();
+    assert_eq!(loaded_h.len(), 1);
+    assert_eq!(loaded_h[0].file_path, "x.rs");
+
+    let loaded_r = db.load_risks().unwrap();
+    assert_eq!(loaded_r.len(), 1);
+    assert_eq!(loaded_r[0].file_path, "x.rs");
+
+    let loaded_c = db.load_cochanges().unwrap();
+    assert_eq!(loaded_c.len(), 1);
+    assert_eq!(loaded_c[0].file_a, "x.rs");
+
+    assert_eq!(
+        db.get_meta(META_GIT_HEAD).unwrap(),
+        Some("sha2".to_string())
+    );
+}
+
+#[test]
 fn sync_sets_meta_keys() {
     let (_dir, db) = temp_db();
     db.sync(&[], &[], &[], "deadbeef").unwrap();

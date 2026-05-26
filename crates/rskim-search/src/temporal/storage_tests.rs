@@ -9,6 +9,7 @@ use super::{
     storage_types::{CochangeRow, HotspotRow, RiskRow},
     TemporalDb,
 };
+use crate::types::SearchError;
 
 // ============================================================================
 // Helper utilities
@@ -317,4 +318,38 @@ fn set_meta_overwrites() {
     db.set_meta("k", "first").unwrap();
     db.set_meta("k", "second").unwrap();
     assert_eq!(db.get_meta("k").unwrap(), Some("second".to_string()));
+}
+
+// ============================================================================
+// Group 6: Capacity rejection
+// ============================================================================
+
+#[test]
+fn store_hotspots_rejects_over_capacity() {
+    let (_dir, db) = temp_db();
+    let rows: Vec<HotspotRow> = (0..500_001)
+        .map(|n| HotspotRow {
+            file_path: format!("{n}"),
+            score: 0.0,
+            changes_30d: 0,
+            changes_90d: 0,
+        })
+        .collect();
+    let err = db.store_hotspots(&rows).unwrap_err();
+    assert!(matches!(err, SearchError::CapacityExceeded(_)));
+}
+
+#[test]
+fn sync_rejects_over_capacity() {
+    let (_dir, db) = temp_db();
+    let big: Vec<HotspotRow> = (0..500_001)
+        .map(|n| HotspotRow {
+            file_path: format!("{n}"),
+            score: 0.0,
+            changes_30d: 0,
+            changes_90d: 0,
+        })
+        .collect();
+    let err = db.sync(&big, &[], &[], "head").unwrap_err();
+    assert!(matches!(err, SearchError::CapacityExceeded(_)));
 }
