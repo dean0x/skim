@@ -121,7 +121,7 @@ fn try_parse_ls_regex(text: &str) -> Option<PkgResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::load_fixture;
+    use crate::cmd::test_support::{load_fixture, make_output, make_output_full};
 
     // ========================================================================
     // npm ls: JSON
@@ -147,12 +147,7 @@ mod tests {
     #[test]
     fn test_ls_json_produces_full() {
         let input = load_fixture("pkg", "npm_ls.json");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output(&input);
         let result = parse_ls(&output);
         assert!(
             result.is_full(),
@@ -163,12 +158,7 @@ mod tests {
 
     #[test]
     fn test_ls_garbage_produces_passthrough() {
-        let output = CommandOutput {
-            stdout: "completely unparseable output".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("completely unparseable output", "", Some(1));
         let result = parse_ls(&output);
         assert!(
             result.is_passthrough(),
