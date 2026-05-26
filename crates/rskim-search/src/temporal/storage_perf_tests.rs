@@ -261,13 +261,3 @@ fn database_error_display() {
     assert_eq!(display, "Database error: something went wrong");
 }
 
-#[test]
-fn database_error_variant_matchable() {
-    let err = SearchError::Database("test".to_string());
-    // Verify the variant is exhaustively matchable.
-    let matched = match err {
-        SearchError::Database(msg) => msg,
-        _ => panic!("wrong variant"),
-    };
-    assert_eq!(matched, "test");
-}

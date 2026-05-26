@@ -180,7 +180,6 @@ impl TemporalDb {
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
-    #[must_use]
     pub fn load_hotspots(&self) -> Result<Vec<HotspotRow>> {
         let mut stmt = self
             .conn
@@ -208,7 +207,6 @@ impl TemporalDb {
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
-    #[must_use]
     pub fn load_risks(&self) -> Result<Vec<RiskRow>> {
         let mut stmt = self
             .conn
@@ -239,7 +237,6 @@ impl TemporalDb {
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
-    #[must_use]
     pub fn load_cochanges(&self) -> Result<Vec<CochangeRow>> {
         let mut stmt = self
             .conn
@@ -268,7 +265,6 @@ impl TemporalDb {
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure other than
     /// `QueryReturnedNoRows`.
-    #[must_use]
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         match self
             .conn
