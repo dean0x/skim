@@ -1977,11 +1977,9 @@ mod tests {
         let columns = vec!["id".to_string(), "name".to_string()];
         let widths = vec![2, 5];
         DbResult::render_header(&mut output, &columns, &widths);
-        // Should start with newline + space, columns separated by " | "
-        assert!(output.starts_with("\n "));
-        assert!(output.contains("id"));
-        assert!(output.contains(" | "));
-        assert!(output.contains("name"));
+        // Exact contract: "\n " prefix, columns left-padded to their widths, separated by " | ".
+        // "id" already fills width 2; "name" gets 1 trailing space to fill width 5.
+        assert_eq!(output, "\n id | name ");
     }
 
     #[test]
@@ -1989,10 +1987,9 @@ mod tests {
         let mut output = String::new();
         let widths = vec![3, 4];
         DbResult::render_separator(&mut output, &widths);
-        // First column: 3 dashes, second column: + then 6 chars (2 padding + 4 width)
-        assert!(output.starts_with("\n "));
-        assert!(output.contains("---"));
-        assert!(output.contains('+'));
+        // Exact contract: "\n " prefix, first column = 3 dashes, subsequent columns =
+        // "+" followed by (width + 2) dashes to cover the " | " separator spacing.
+        assert_eq!(output, "\n ---+------");
     }
 
     #[test]
@@ -2004,10 +2001,10 @@ mod tests {
         ];
         let widths = vec![2, 5];
         DbResult::render_data_rows(&mut output, &display_rows, &widths);
-        assert!(output.contains("Alice"));
-        assert!(output.contains("Bob"));
-        // Two rows means two leading "\n " sequences
-        assert_eq!(output.matches("\n ").count(), 2);
+        // Exact contract: each row prefixed by "\n ", cells left-padded to their widths,
+        // separated by " | ". "1" pads to "1 ", "Alice" fills width 5 exactly.
+        // "2" pads to "2 ", "Bob" pads to "Bob  ".
+        assert_eq!(output, "\n 1  | Alice\n 2  | Bob  ");
     }
 
     #[test]
