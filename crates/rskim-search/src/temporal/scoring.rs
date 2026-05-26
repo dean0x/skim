@@ -240,23 +240,33 @@ pub fn compute_file_temporal_stats(
         let in_90d = elapsed_days <= 90.0;
 
         // Collect unique file paths for this commit.
+        // Borrow-first: check seen_in_commit with &str before calling into_owned(),
+        // so duplicate paths within a commit do not allocate a new String.
         seen_in_commit.clear();
         for file in &commit.changed_files {
-            let path = file.path_str().into_owned();
-            seen_in_commit.insert(path);
+            let path_cow = file.path_str();
+            let path_ref: &str = &path_cow;
+            if !seen_in_commit.contains(path_ref) {
+                seen_in_commit.insert(path_cow.into_owned());
+            }
         }
 
         for path in &seen_in_commit {
-            let entry = accum.entry(path.clone()).or_default();
-            entry.total_commits += 1;
+            // Borrow-first: probe accum with &str before allocating for new entries.
+            let entry = if let Some(v) = accum.get_mut(path.as_str()) {
+                v
+            } else {
+                accum.entry(path.clone()).or_default()
+            };
+            entry.total_commits = entry.total_commits.saturating_add(1);
             if is_fix {
-                entry.fix_commits += 1;
+                entry.fix_commits = entry.fix_commits.saturating_add(1);
             }
             if in_30d {
-                entry.changes_30d += 1;
+                entry.changes_30d = entry.changes_30d.saturating_add(1);
             }
             if in_90d {
-                entry.changes_90d += 1;
+                entry.changes_90d = entry.changes_90d.saturating_add(1);
             }
         }
     }
