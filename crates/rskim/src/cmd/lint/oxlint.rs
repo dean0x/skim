@@ -196,6 +196,7 @@ mod tests {
     use super::*;
 
     use crate::cmd::lint::load_lint_fixture as load_fixture;
+    use crate::cmd::test_support::make_output_full;
 
     /// oxlint_fail.json: generated from oxlint v0.3.0 on 2026-04-15.
     /// Contains 3 messages: 1 error (no-unused-vars) + 1 warning (eqeqeq) in app.ts,
@@ -241,12 +242,7 @@ mod tests {
     #[test]
     fn test_parse_impl_json_produces_full() {
         let input = load_fixture("oxlint_fail.json");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_full(),
@@ -258,12 +254,7 @@ mod tests {
     #[test]
     fn test_parse_impl_text_produces_degraded() {
         let input = load_fixture("oxlint_text.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_degraded(),
@@ -274,12 +265,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_garbage_passthrough() {
-        let output = CommandOutput {
-            stdout: "random garbage not oxlint output".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("random garbage not oxlint output", "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),

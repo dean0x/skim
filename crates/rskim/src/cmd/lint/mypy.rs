@@ -187,6 +187,7 @@ mod tests {
     use super::*;
 
     use crate::cmd::lint::load_lint_fixture as load_fixture;
+    use crate::cmd::test_support::make_output_full;
 
     #[test]
     fn test_tier1_mypy_fail() {
@@ -210,12 +211,7 @@ mod tests {
     #[test]
     fn test_parse_impl_json_produces_full() {
         let input = load_fixture("mypy_fail.json");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_impl(&output);
         assert!(result.is_full());
     }
@@ -223,12 +219,7 @@ mod tests {
     #[test]
     fn test_parse_impl_text_produces_degraded() {
         let input = load_fixture("mypy_text.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_degraded(),
@@ -239,12 +230,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_garbage_produces_passthrough() {
-        let output = CommandOutput {
-            stdout: "random garbage".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("random garbage", "", Some(1));
         let result = parse_impl(&output);
         assert!(result.is_passthrough());
     }

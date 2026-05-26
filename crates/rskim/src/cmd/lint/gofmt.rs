@@ -159,6 +159,7 @@ mod tests {
     use super::*;
 
     use crate::cmd::lint::load_lint_fixture as load_fixture;
+    use crate::cmd::test_support::{make_output, make_output_full};
 
     #[test]
     fn test_tier1_list_fail() {
@@ -176,12 +177,7 @@ mod tests {
 
     #[test]
     fn test_tier1_empty_output_pass() {
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("");
         let result = parse_impl(&output);
         assert!(result.is_full(), "Expected Full for empty output");
         if let ParseResult::Full(r) = result {
@@ -202,12 +198,7 @@ mod tests {
     #[test]
     fn test_parse_impl_list_produces_full() {
         let input = load_fixture("gofmt_list_fail.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_full(),
@@ -219,12 +210,7 @@ mod tests {
     #[test]
     fn test_parse_impl_diff_produces_degraded() {
         let input = load_fixture("gofmt_diff_fail.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_degraded(),
@@ -235,12 +221,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_garbage_passthrough() {
-        let output = CommandOutput {
-            stdout: "random garbage not gofmt output".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("random garbage not gofmt output", "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),

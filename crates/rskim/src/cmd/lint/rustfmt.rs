@@ -248,6 +248,7 @@ mod tests {
     use super::*;
 
     use crate::cmd::lint::load_lint_fixture as load_fixture;
+    use crate::cmd::test_support::{make_output, make_output_full};
 
     // -------------------------------------------------------------------------
     // Check mode tests (existing, unchanged)
@@ -255,12 +256,7 @@ mod tests {
 
     #[test]
     fn test_tier1_rustfmt_pass() {
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("");
         let result = parse_check_impl(&output);
         assert!(
             result.is_full(),
@@ -327,12 +323,7 @@ mod tests {
     #[test]
     fn test_parse_impl_produces_full() {
         let input = load_fixture("rustfmt_check_fail.txt");
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: input,
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("", &input, Some(1));
         let result = parse_check_impl(&output);
         assert!(
             result.is_full(),
@@ -343,12 +334,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_garbage_produces_passthrough() {
-        let output = CommandOutput {
-            stdout: "unexpected output\nno diff headers here".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("unexpected output\nno diff headers here", "", Some(1));
         let result = parse_check_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -361,12 +347,7 @@ mod tests {
     fn test_parse_impl_text_produces_degraded() {
         // Tier 2 input: unified diff headers (`--- <path>`) that pass Tier 2
         // but NOT Tier 1 (`Diff in <path> at line <N>:`).
-        let output = CommandOutput {
-            stdout: "--- src/main.rs\n+++ src/main.rs\n-old line\n+new line\n".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("--- src/main.rs\n+++ src/main.rs\n-old line\n+new line\n", "", Some(1));
         let result = parse_check_impl(&output);
         assert!(
             result.is_degraded(),
@@ -430,12 +411,7 @@ mod tests {
     /// AD-LINT-20: empty output on exit 0 = successful format run.
     #[test]
     fn test_rustfmt_format_empty_output_is_pass() {
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("");
         let result = parse_format_impl(&output);
         assert!(
             result.is_full(),
@@ -456,13 +432,7 @@ mod tests {
     /// AD-LINT-20: non-zero exit = syntax error → passthrough.
     #[test]
     fn test_rustfmt_format_error_is_passthrough() {
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: "error[E0001]: unexpected token `}` in format string\n --> src/main.rs:5:1"
-                .to_string(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("", "error[E0001]: unexpected token `}` in format string\n --> src/main.rs:5:1", Some(1));
         let result = parse_format_impl(&output);
         assert!(
             result.is_passthrough(),

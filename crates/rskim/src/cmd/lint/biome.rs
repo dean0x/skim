@@ -340,6 +340,7 @@ mod tests {
     use super::*;
 
     use crate::cmd::lint::load_lint_fixture as load_fixture;
+    use crate::cmd::test_support::{make_output, make_output_full};
 
     /// biome_check_fail.json: generated from biome v1.7.0 on 2026-04-15.
     #[test]
@@ -406,12 +407,7 @@ mod tests {
     #[test]
     fn test_parse_check_impl_json_produces_full() {
         let input = load_fixture("biome_check_fail.json");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_check_impl(&output);
         assert!(
             result.is_full(),
@@ -423,12 +419,7 @@ mod tests {
     #[test]
     fn test_parse_check_impl_text_produces_degraded() {
         let input = load_fixture("biome_check_text.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_check_impl(&output);
         assert!(
             result.is_degraded(),
@@ -439,12 +430,7 @@ mod tests {
 
     #[test]
     fn test_parse_check_impl_garbage_passthrough() {
-        let output = CommandOutput {
-            stdout: "random garbage not biome output".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("random garbage not biome output", "", Some(1));
         let result = parse_check_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -466,12 +452,7 @@ mod tests {
 
     #[test]
     fn test_parse_format_impl_empty_exit0() {
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("");
         let result = parse_format_impl(&output);
         assert!(result.is_full(), "Expected Full for empty exit 0");
         if let ParseResult::Full(r) = result {
