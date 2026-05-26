@@ -97,10 +97,25 @@ enum LineClassification<'a> {
     Other,
 }
 
+/// Maximum number of warning/error items collected from a single build log.
+///
+/// Docker builds with many `pip`/`npm`/`apt` warnings can emit hundreds of
+/// `WARNING:` lines. Capping at 50 matches the convention used by other infra
+/// parsers (aws, curl) and prevents unbounded memory growth.
+const MAX_WARNINGS: usize = 50;
+
 /// Classify a single trimmed build-output line into a [`LineClassification`].
+///
+/// # Panics (debug only)
+/// Panics in debug builds if `line` contains leading or trailing whitespace —
+/// callers must trim before passing.
 ///
 /// The caller is responsible for trimming whitespace before passing `line`.
 fn classify_line<'a>(line: &'a str) -> LineClassification<'a> {
+    debug_assert!(
+        line == line.trim(),
+        "classify_line requires a pre-trimmed input, got: {line:?}"
+    );
     if let Some(caps) = RE_BUILD_STEP_LEGACY.captures(line) {
         // SAFETY: groups 1–3 are always present when the regex matches.
         let step_num = caps.get(1).unwrap().as_str();
@@ -170,11 +185,14 @@ fn try_parse_build(text: &str) -> Option<InfraResult> {
                 // whichever format matched last.
                 if fmt.is_none() {
                     fmt = Some(BuildFormat::Legacy);
-                } else if crate::debug::is_debug_enabled() && fmt != Some(BuildFormat::Legacy) {
-                    eprintln!(
-                        "[skim:debug] docker build: Legacy step skipped — format already locked to {:?}",
-                        fmt
-                    );
+                } else if fmt != Some(BuildFormat::Legacy) {
+                    if crate::debug::is_debug_enabled() {
+                        eprintln!(
+                            "[skim:debug] docker build: Legacy step dropped — format locked to {:?}",
+                            fmt
+                        );
+                    }
+                    continue;
                 }
                 steps.push(format!("Step {step_num}/{total}: {cmd}"));
             }
@@ -182,11 +200,14 @@ fn try_parse_build(text: &str) -> Option<InfraResult> {
                 // First-writer-wins: only lock format on the first recognised line.
                 if fmt.is_none() {
                     fmt = Some(BuildFormat::BuildKit);
-                } else if crate::debug::is_debug_enabled() && fmt != Some(BuildFormat::BuildKit) {
-                    eprintln!(
-                        "[skim:debug] docker build: BuildKit step skipped — format already locked to {:?}",
-                        fmt
-                    );
+                } else if fmt != Some(BuildFormat::BuildKit) {
+                    if crate::debug::is_debug_enabled() {
+                        eprintln!(
+                            "[skim:debug] docker build: BuildKit step dropped — format locked to {:?}",
+                            fmt
+                        );
+                    }
+                    continue;
                 }
                 // Skip internal/metadata steps
                 if !stage.contains("internal")
@@ -203,7 +224,9 @@ fn try_parse_build(text: &str) -> Option<InfraResult> {
                 final_image = Some(id.chars().take(19).collect()); // sha256:12chars
             }
             LineClassification::Warning(msg) => {
-                warnings.push(msg.to_string());
+                if warnings.len() < MAX_WARNINGS {
+                    warnings.push(msg.to_string());
+                }
             }
             LineClassification::Other => {}
         }
@@ -472,6 +495,73 @@ ERROR: failed to solve: failed to read dockerfile: open Dockerfile: no such file
         assert!(
             display.contains("legacy"),
             "format must be 'legacy' when Legacy lines appear first, even with debug enabled, got: {display}"
+        );
+    }
+
+    /// Wrong-format steps must not appear in output when format is locked (Legacy first).
+    ///
+    /// The debug warning says "skipped" — the step must actually be skipped. This
+    /// test asserts that a BuildKit step encountered after format is locked to Legacy
+    /// does NOT appear in the result items.
+    #[test]
+    fn test_mixed_output_wrong_format_steps_not_collected_legacy_first() {
+        // Legacy first. The BuildKit line "[1/2] FROM python:3.11" must be skipped.
+        let input = "Step 1/2 : FROM python:3.11\n\
+                     Step 2/2 : RUN pip install flask\n\
+                     => [1/2] FROM docker.io/library/python:3.11\n\
+                     Successfully built abc123456def\n";
+        let result = try_parse_build(input).expect("expected Some for mixed output");
+        let display = result.to_string();
+        // The BuildKit step text "[1/2] FROM docker.io/library/python:3.11" must not
+        // appear as a step item — only the two Legacy steps should be collected.
+        assert!(
+            !display.contains("[1/2] FROM docker.io"),
+            "BuildKit step text must not appear in output when format is locked to Legacy, got: {display}"
+        );
+        // Exactly 2 steps collected (the two Legacy steps).
+        assert!(
+            display.contains("2 steps"),
+            "expected exactly 2 steps (Legacy only), got: {display}"
+        );
+    }
+
+    /// Wrong-format steps must not appear in output when format is locked (BuildKit first).
+    ///
+    /// A Legacy step encountered after format is locked to BuildKit must not be
+    /// collected — the step count must reflect only BuildKit steps.
+    #[test]
+    fn test_mixed_output_wrong_format_steps_not_collected_buildkit_first() {
+        // BuildKit first. The Legacy step "Step 1/1 : RUN pip install flask" must be skipped.
+        let input = " => [1/2] FROM docker.io/library/python:3.11\n\
+                     Step 1/1 : RUN pip install flask\n\
+                     Successfully built abc123456def\n";
+        let result = try_parse_build(input).expect("expected Some for mixed output");
+        let display = result.to_string();
+        // The Legacy step text "RUN pip install flask" must not appear as a step item.
+        assert!(
+            !display.contains("Step 1/1"),
+            "Legacy step text must not appear in output when format is locked to BuildKit, got: {display}"
+        );
+    }
+
+    /// Warnings are capped at MAX_WARNINGS to prevent unbounded growth on verbose builds.
+    #[test]
+    fn test_warnings_capped_at_max_warnings() {
+        // Build a BuildKit input with MAX_WARNINGS + 10 warning lines.
+        let mut input = String::from(" => [1/1] FROM docker.io/library/python:3.11\n");
+        for i in 0..MAX_WARNINGS + 10 {
+            input.push_str(&format!("WARNING: warning number {i}\n"));
+        }
+        let result = try_parse_build(&input).expect("expected Some");
+        // Count warning items in the result.
+        let warning_count = result
+            .to_string()
+            .lines()
+            .filter(|l| l.contains("warning"))
+            .count();
+        assert!(
+            warning_count <= MAX_WARNINGS,
+            "warnings must be capped at MAX_WARNINGS ({MAX_WARNINGS}), got {warning_count}"
         );
     }
 }
