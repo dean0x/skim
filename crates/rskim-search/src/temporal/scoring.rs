@@ -17,6 +17,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::types::{CommitInfo, FileRiskScores, FileTemporalStats};
 
+/// Seconds in one day, used to convert Unix-timestamp differences to fractional days.
+const SECS_PER_DAY: f64 = 86_400.0;
+
 /// Default e-folding time (in days) used when callers do not supply a custom value.
 ///
 /// **Naming note:** `half_life_days` follows the heatmap module convention and
@@ -126,7 +129,7 @@ pub fn compute_file_risk_scores(
         let ts = commit.timestamp.max(0) as u64;
 
         let elapsed = if now_epoch >= ts {
-            (now_epoch - ts) as f64 / 86_400.0
+            (now_epoch - ts) as f64 / SECS_PER_DAY
         } else {
             // Future commit: treat as elapsed = 0.
             0.0
@@ -183,6 +186,22 @@ pub fn compute_file_risk_scores(
         .collect()
 }
 
+/// Populate `buf` with the deduplicated set of file paths touched by `files`.
+///
+/// `buf` is cleared before insertion. Each path appears at most once regardless
+/// of how many times the same file is listed in `files`. The caller reuses the
+/// buffer across commits to avoid repeated allocation.
+fn dedup_changed_files(files: &[crate::types::FileChangeInfo], buf: &mut HashSet<String>) {
+    buf.clear();
+    for file in files {
+        let path_cow = file.path_str();
+        let path_ref: &str = &path_cow;
+        if !buf.contains(path_ref) {
+            buf.insert(path_cow.into_owned());
+        }
+    }
+}
+
 /// Compute raw per-file commit counts within 30-day and 90-day windows.
 ///
 /// # Parameters
@@ -230,7 +249,7 @@ pub fn compute_file_temporal_stats(
         // Clamp negative timestamps to 0 before converting to u64.
         let ts = commit.timestamp.max(0) as u64;
         let elapsed_days: f64 = if now_epoch >= ts {
-            (now_epoch - ts) as f64 / 86_400.0
+            (now_epoch - ts) as f64 / SECS_PER_DAY
         } else {
             // Future commit: treat as elapsed = 0 (within both windows).
             0.0
@@ -239,17 +258,8 @@ pub fn compute_file_temporal_stats(
         let in_30d = elapsed_days <= 30.0;
         let in_90d = elapsed_days <= 90.0;
 
-        // Collect unique file paths for this commit.
-        // Borrow-first: check seen_in_commit with &str before calling into_owned(),
-        // so duplicate paths within a commit do not allocate a new String.
-        seen_in_commit.clear();
-        for file in &commit.changed_files {
-            let path_cow = file.path_str();
-            let path_ref: &str = &path_cow;
-            if !seen_in_commit.contains(path_ref) {
-                seen_in_commit.insert(path_cow.into_owned());
-            }
-        }
+        // Collect unique file paths for this commit into the reused buffer.
+        dedup_changed_files(&commit.changed_files, &mut seen_in_commit);
 
         for path in &seen_in_commit {
             // Borrow-first: probe accum with &str before allocating for new entries.
