@@ -170,9 +170,7 @@ fn try_parse_build(text: &str) -> Option<InfraResult> {
                 // whichever format matched last.
                 if fmt.is_none() {
                     fmt = Some(BuildFormat::Legacy);
-                } else if crate::debug::is_debug_enabled()
-                    && fmt != Some(BuildFormat::Legacy)
-                {
+                } else if crate::debug::is_debug_enabled() && fmt != Some(BuildFormat::Legacy) {
                     eprintln!(
                         "[skim:debug] docker build: Legacy step skipped — format already locked to {:?}",
                         fmt
@@ -184,9 +182,7 @@ fn try_parse_build(text: &str) -> Option<InfraResult> {
                 // First-writer-wins: only lock format on the first recognised line.
                 if fmt.is_none() {
                     fmt = Some(BuildFormat::BuildKit);
-                } else if crate::debug::is_debug_enabled()
-                    && fmt != Some(BuildFormat::BuildKit)
-                {
+                } else if crate::debug::is_debug_enabled() && fmt != Some(BuildFormat::BuildKit) {
                     eprintln!(
                         "[skim:debug] docker build: BuildKit step skipped — format already locked to {:?}",
                         fmt

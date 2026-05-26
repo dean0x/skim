@@ -251,7 +251,11 @@ mod tests {
 
     #[test]
     fn test_parse_impl_garbage_produces_passthrough() {
-        let output = make_output_full("completely unparseable output\nno json, no regex match", "", Some(1));
+        let output = make_output_full(
+            "completely unparseable output\nno json, no regex match",
+            "",
+            Some(1),
+        );
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
