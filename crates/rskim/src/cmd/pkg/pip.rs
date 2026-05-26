@@ -334,7 +334,7 @@ fn try_parse_list_regex(text: &str) -> Option<PkgResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::load_fixture;
+    use crate::cmd::test_support::{load_fixture, make_output, make_output_full};
 
     // ========================================================================
     // pip install: Regex
@@ -418,12 +418,7 @@ mod tests {
     #[test]
     fn test_install_produces_full() {
         let input = load_fixture("pkg", "pip_install.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output(&input);
         let result = parse_install(&output);
         assert!(
             result.is_full(),
@@ -435,12 +430,7 @@ mod tests {
     #[test]
     fn test_check_produces_full() {
         let input = load_fixture("pkg", "pip_check_clean.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output(&input);
         let result = parse_check(&output);
         assert!(
             result.is_full(),
@@ -451,12 +441,7 @@ mod tests {
 
     #[test]
     fn test_garbage_produces_passthrough() {
-        let output = CommandOutput {
-            stdout: "completely unparseable output".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("completely unparseable output", "", Some(1));
         let result = parse_install(&output);
         assert!(
             result.is_passthrough(),

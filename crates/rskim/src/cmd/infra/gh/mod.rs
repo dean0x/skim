@@ -246,7 +246,7 @@ fn try_parse_view_json_auto(obj: &serde_json::Value) -> Option<InfraResult> {
 /// "infra" subdir pre-applied) from `crate::cmd::test_support`.
 #[cfg(test)]
 pub(super) mod test_helpers {
-    pub(super) use crate::cmd::test_support::make_output;
+    pub(super) use crate::cmd::test_support::{make_output, make_output_full};
 
     pub(super) fn load_fixture(name: &str) -> String {
         crate::cmd::test_support::load_fixture("infra", name)
@@ -259,7 +259,7 @@ pub(super) mod test_helpers {
 
 #[cfg(test)]
 mod tests {
-    use super::test_helpers::{load_fixture, make_output};
+    use super::test_helpers::{load_fixture, make_output, make_output_full};
     use super::*;
 
     // --- truncate_body ---
@@ -429,13 +429,11 @@ mod tests {
 
     #[test]
     fn test_404_error_passthrough() {
-        let input = "Not Found (HTTP 404)";
-        let output = CommandOutput {
-            stdout: input.to_string(),
-            stderr: "gh: 404 - Not Found\nhttps://github.com".to_string(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(
+            "Not Found (HTTP 404)",
+            "gh: 404 - Not Found\nhttps://github.com",
+            Some(1),
+        );
         let result = parse_impl_with_auto_detect(&output);
         assert!(
             result.is_passthrough(),
@@ -446,13 +444,11 @@ mod tests {
 
     #[test]
     fn test_auth_error_passthrough() {
-        let input = "";
-        let output = CommandOutput {
-            stdout: input.to_string(),
-            stderr: "To get started with GitHub CLI, please run:  gh auth login".to_string(),
-            exit_code: Some(4),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(
+            "",
+            "To get started with GitHub CLI, please run:  gh auth login",
+            Some(4),
+        );
         let result = parse_impl_with_auto_detect(&output);
         assert!(
             result.is_passthrough(),

@@ -256,7 +256,7 @@ fn parse_bordered_row(line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::*;
+    use crate::cmd::test_support::{make_output};
 
     #[test]
     fn test_tier1_mysql_tsv() {

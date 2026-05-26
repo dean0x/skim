@@ -98,7 +98,7 @@ fn try_parse_json_array(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::*;
+    use crate::cmd::test_support::{load_fixture, make_output};
 
     fn json_fixture() -> String {
         load_fixture("infra", "docker_inspect.json")

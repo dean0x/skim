@@ -249,7 +249,7 @@ fn try_parse_regex(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::load_fixture;
+    use crate::cmd::test_support::{load_fixture, make_output, make_output_full};
 
     #[test]
     fn test_tier1_aws_s3_ls() {
@@ -278,12 +278,7 @@ mod tests {
     #[test]
     fn test_parse_impl_produces_full() {
         let input = load_fixture("infra", "aws_s3_ls.json");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output(&input);
         let result = parse_impl(&output);
         assert!(
             result.is_full(),
@@ -294,12 +289,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_garbage_produces_passthrough() {
-        let output = CommandOutput {
-            stdout: "An error occurred: Access Denied".to_string(),
-            stderr: String::new(),
-            exit_code: Some(255),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("An error occurred: Access Denied", "", Some(255));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -312,14 +302,9 @@ mod tests {
     fn test_parse_impl_text_produces_degraded() {
         // Tier 2 input: AWS table-formatted output (not JSON) that matches the
         // `| value |` pipe-delimited table regex.
-        let output = CommandOutput {
-            stdout:
-                "| i-0abc123def  | t3.micro  | running |\n| i-0def456ghi  | t3.small  | stopped |\n"
-                    .to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output(
+            "| i-0abc123def  | t3.micro  | running |\n| i-0def456ghi  | t3.small  | stopped |\n",
+        );
         let result = parse_impl(&output);
         assert!(
             result.is_degraded(),

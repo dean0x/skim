@@ -159,7 +159,7 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::make_output_full;
+    use crate::cmd::test_support::{make_output_full};
 
     const SWIFTLINT_PASS_JSON: &str = r#"[]"#;
 

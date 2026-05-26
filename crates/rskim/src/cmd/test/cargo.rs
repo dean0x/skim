@@ -522,7 +522,7 @@ fn try_parse_regex(text: &str) -> Option<TestResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::load_fixture;
+    use crate::cmd::test_support::{load_fixture, make_output, make_output_full};
 
     // ========================================================================
     // Tier 1: JSON parsing
@@ -627,12 +627,7 @@ mod tests {
     #[test]
     fn test_parse_json_produces_full() {
         let input = load_fixture("test", "cargo_pass.json");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output(&input);
         let result = parse_impl(&output, false);
         assert!(
             result.is_full(),
@@ -643,12 +638,7 @@ mod tests {
 
     #[test]
     fn test_parse_plain_text_produces_degraded() {
-        let output = CommandOutput {
-            stdout: "test result: ok. 5 passed; 0 failed; 0 ignored".to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("test result: ok. 5 passed; 0 failed; 0 ignored");
         let result = parse_impl(&output, false);
         assert!(
             result.is_degraded(),
@@ -659,12 +649,8 @@ mod tests {
 
     #[test]
     fn test_parse_garbage_produces_passthrough() {
-        let output = CommandOutput {
-            stdout: "completely unparseable output\nno json, no regex match".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output =
+            make_output_full("completely unparseable output\nno json, no regex match", "", Some(1));
         let result = parse_impl(&output, false);
         assert!(
             result.is_passthrough(),

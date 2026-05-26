@@ -202,7 +202,7 @@ fn try_parse_regex(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::load_fixture;
+    use crate::cmd::test_support::{load_fixture, make_output_full};
 
     #[test]
     fn test_tier1_wget_download() {
@@ -248,12 +248,7 @@ mod tests {
     #[test]
     fn test_parse_impl_produces_full() {
         let input = load_fixture("infra", "wget_download.txt");
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: input,
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("", &input, Some(0));
         let result = parse_impl(&output);
         assert!(
             result.is_full(),
@@ -264,12 +259,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_garbage_produces_passthrough() {
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: "no output at all".to_string(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("", "no output at all", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -283,12 +273,7 @@ mod tests {
         // Tier 2 input: wget progress output containing an HTTP status code with
         // HTTP context (matches RE_WGET_ANY_STATUS) but does NOT contain
         // "HTTP request" or "ERROR" (which would trigger Tier 1).
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: "HTTP response 200\n".to_string(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("", "HTTP response 200\n", Some(0));
         let result = parse_impl(&output);
         assert!(
             result.is_degraded(),
