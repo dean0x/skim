@@ -41,8 +41,19 @@ pub(super) fn normalize_blast_radius_path(
 ) -> anyhow::Result<String> {
     let p = std::path::Path::new(raw);
 
-    // Resolve to an absolute path.
+    // Resolve to an absolute path, trying existence in order:
+    // 1. project-root-relative (most common for `--blast-radius src/foo.rs`)
+    // 2. CWD-relative (user is in a subdirectory of the repo)
+    // 3. Neither exists → bail with a clear "not found" error.
+    //
+    // The existence check happens before canonicalization so that missing files
+    // produce "blast-radius file not found: <path>" instead of the confusing
+    // "outside the project root" message that canonicalize() fallback would yield.
     let abs = if p.is_absolute() {
+        // Absolute paths: check existence directly before proceeding.
+        if !p.exists() {
+            anyhow::bail!("blast-radius file not found: {}", raw);
+        }
         p.to_path_buf()
     } else {
         // Prefer project-root-relative resolution so that `src/foo.rs` works
@@ -52,7 +63,18 @@ pub(super) fn normalize_blast_radius_path(
             root_relative
         } else {
             // Fallback: CWD-relative (e.g. user is in a subdirectory).
-            std::env::current_dir()?.join(p)
+            // If current_dir() fails (deleted temp dir in tests, unusual in
+            // production), treat it as "not found" rather than propagating a
+            // confusing OS error.
+            let cwd_relative = std::env::current_dir()
+                .ok()
+                .map(|cwd| cwd.join(p))
+                .filter(|candidate| candidate.exists());
+
+            match cwd_relative {
+                Some(path) => path,
+                None => anyhow::bail!("blast-radius file not found: {}", raw),
+            }
         }
     };
 
@@ -144,7 +166,11 @@ fn read_git_head(root: &Path) -> Option<String> {
 /// Co-change pairs are stored with the lexically smaller path in `file_a`. This
 /// helper resolves both directions so callers don't need to repeat the pattern.
 fn cochange_partner<'a>(row: &'a rskim_search::CochangeRow, target: &str) -> &'a str {
-    if row.file_a == target { &row.file_b } else { &row.file_a }
+    if row.file_a == target {
+        &row.file_b
+    } else {
+        &row.file_a
+    }
 }
 
 // ============================================================================
@@ -210,7 +236,11 @@ pub(super) fn query_standalone(
                         let cmp = score_a
                             .partial_cmp(&score_b)
                             .unwrap_or(std::cmp::Ordering::Equal);
-                        if sort_mode == TemporalSort::Cold { cmp } else { cmp.reverse() }
+                        if sort_mode == TemporalSort::Cold {
+                            cmp
+                        } else {
+                            cmp.reverse()
+                        }
                     });
                 }
                 TemporalSort::Risky => {
@@ -456,14 +486,21 @@ pub(super) fn apply_temporal_enrichment(
 
             // Hot: descending (annotated first). Cold: ascending (unannotated first via -1.0).
             let hotspot_score = |r: &ResolvedResult| {
-                r.temporal.as_ref().and_then(|t| t.hotspot_score).unwrap_or(-1.0)
+                r.temporal
+                    .as_ref()
+                    .and_then(|t| t.hotspot_score)
+                    .unwrap_or(-1.0)
             };
             results.sort_by(|a, b| {
                 let cmp = hotspot_score(a)
                     .partial_cmp(&hotspot_score(b))
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.path.cmp(&b.path));
-                if sort == TemporalSort::Hot { cmp.reverse() } else { cmp }
+                if sort == TemporalSort::Hot {
+                    cmp.reverse()
+                } else {
+                    cmp
+                }
             });
         }
         TemporalSort::Risky => {

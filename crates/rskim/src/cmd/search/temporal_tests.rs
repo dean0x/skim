@@ -82,6 +82,43 @@ fn normalize_path_outside_repo_errors() {
     assert!(result.is_err(), "path outside repo should return error");
 }
 
+// F14: nonexistent path must produce a clear "blast-radius file not found" error,
+// not the confusing "outside the project root" message that canonicalize would yield.
+#[test]
+fn normalize_nonexistent_relative_path_gives_not_found_error() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+
+    // Do NOT create the file — test the nonexistent path case.
+    let result = normalize_blast_radius_path("src/does_not_exist.rs", &root);
+    assert!(result.is_err(), "nonexistent path should return error");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("blast-radius file not found"),
+        "error should say 'blast-radius file not found', got: {msg}"
+    );
+    assert!(
+        !msg.contains("outside the project root"),
+        "error should NOT say 'outside the project root' for nonexistent files, got: {msg}"
+    );
+}
+
+#[test]
+fn normalize_nonexistent_absolute_path_gives_not_found_error() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    // Absolute path inside the repo but the file doesn't exist.
+    let missing = root.join("src").join("ghost.rs");
+
+    let result = normalize_blast_radius_path(missing.to_str().unwrap(), &root);
+    assert!(result.is_err(), "nonexistent absolute path should return error");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("blast-radius file not found"),
+        "error should say 'blast-radius file not found', got: {msg}"
+    );
+}
+
 #[test]
 fn normalize_dot_slash_stripped() {
     let dir = TempDir::new().unwrap();

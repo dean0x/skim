@@ -474,11 +474,11 @@ fn run_temporal_standalone(
 
     let Some(db) = temporal::open_temporal_db(&temporal_db_path) else {
         if json {
-            println!("{{\"error\": \"no temporal data — run 'skim heatmap' to populate\"}}");
+            println!("{{\"warning\": \"no temporal data — run 'skim heatmap' to populate\"}}");
         } else {
             eprintln!("skim search: no temporal data — run 'skim heatmap' to populate");
         }
-        return Ok(ExitCode::FAILURE);
+        return Ok(ExitCode::SUCCESS);
     };
 
     // Check staleness.
@@ -808,5 +808,35 @@ mod tests {
     fn test_parse_flags_limit_one_is_valid() {
         let flags = parse_flags(&["--limit".to_string(), "1".to_string()]).unwrap();
         assert_eq!(flags.limit, 1);
+    }
+
+    // ============================================================================
+    // F12: Missing temporal.db must produce exit 0 (graceful degradation), not
+    //      exit 1. AC says: "Missing temporal.db → warning on stderr, exit 0".
+    // ============================================================================
+
+    /// Standalone temporal mode (e.g. `skim search --hot`) with no temporal.db must
+    /// return `ExitCode::SUCCESS` (not FAILURE). The missing DB is a graceful-
+    /// degradation case, not an error.
+    #[test]
+    fn test_standalone_temporal_no_db_returns_exit_0() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        // No temporal.db exists in the temp dir's cache — standalone path should
+        // degrade gracefully with exit 0.
+        let result = run(
+            &[
+                "--hot".to_string(),
+                "--root".to_string(),
+                root,
+            ],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "missing temporal.db must be a warning (exit 0), not an error (exit 1)"
+        );
     }
 }
