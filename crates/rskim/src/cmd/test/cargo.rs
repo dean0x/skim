@@ -80,7 +80,7 @@ pub(crate) fn run(
             skip_ansi_strip: false,
             rec,
         },
-        move |output, _args| parse_impl(output, is_nextest),
+        move |output| parse_impl(output, is_nextest),
     )
 }
 

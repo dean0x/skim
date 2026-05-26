@@ -243,14 +243,11 @@ fn try_parse_view_json_auto(obj: &serde_json::Value) -> Option<InfraResult> {
 /// Shared fixture loader for gh submodule tests.
 ///
 /// Delegates to `test_support::load_fixture` with the `"infra"` subdir
-/// pre-applied, consistent with the pattern used by `lint::load_lint_fixture`.
-/// Sub-modules import `make_output` / `make_output_full` directly from
-/// `crate::cmd::test_support` — no re-export wrapper needed.
+/// pre-applied, matching the pattern used by `lint::load_gh_fixture`.
+/// Sub-modules import it as `use super::super::load_gh_fixture as load_fixture`.
 #[cfg(test)]
-pub(super) mod test_helpers {
-    pub(super) fn load_fixture(name: &str) -> String {
-        crate::cmd::test_support::load_fixture("infra", name)
-    }
+pub(super) fn load_gh_fixture(name: &str) -> String {
+    crate::cmd::test_support::load_fixture("infra", name)
 }
 
 // ============================================================================
@@ -259,7 +256,7 @@ pub(super) mod test_helpers {
 
 #[cfg(test)]
 mod tests {
-    use super::test_helpers::load_fixture;
+    use super::load_gh_fixture as load_fixture;
     use super::*;
     use crate::cmd::test_support::{make_output, make_output_full};
 

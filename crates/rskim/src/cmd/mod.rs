@@ -501,7 +501,7 @@ where
 /// stdin when no user args are provided AND stdin is piped).
 pub(crate) fn run_parsed_command_with_mode<T>(
     config: ParsedCommandConfig<'_>,
-    parse: impl FnOnce(&CommandOutput, &[String]) -> ParseResult<T>,
+    parse: impl FnOnce(&CommandOutput) -> ParseResult<T>,
 ) -> anyhow::Result<ExitCode>
 where
     T: AsRef<str> + serde::Serialize,
@@ -552,7 +552,7 @@ where
         }
     };
 
-    let result = parse(&output, args);
+    let result = parse(&output);
     let _ = result.emit_markers(&mut io::stderr().lock());
     let code = output.exit_code.unwrap_or(1);
 
@@ -1139,6 +1139,14 @@ pub(crate) fn sanitize_for_display(input: &str) -> String {
 /// internal config consumed by `run_parsed_command_with_mode`.  `run_tool`
 /// bridges the two, translating caller fields plus `family`/`skip_ansi_strip`
 /// into the full `ParsedCommandConfig`.
+///
+/// The split is intentional: `ToolRunConfig` carries only static, caller-supplied
+/// fields.  `ParsedCommandConfig` additionally requires runtime-computed fields
+/// (`use_stdin`, `show_stats`, `output_format`, `rec`) derived from `RunContext`
+/// and the actual argument list — values unavailable at `ToolRunConfig`
+/// construction time.  `Into<ParsedCommandConfig>` would therefore be unsound
+/// without also accepting `&[String]` and `&RunContext`, which defeats the
+/// purpose of a simple `Into` bridge.  `run_tool` IS the bridge.
 pub(crate) struct ToolRunConfig<'a> {
     /// Binary name of the tool (e.g., "psql", "eslint").
     pub program: &'a str,
@@ -1200,7 +1208,7 @@ where
                 session_id: ctx.session_id.as_deref(),
             },
         },
-        |output, _args| parse_fn(output),
+        |output| parse_fn(output),
     )
 }
 
