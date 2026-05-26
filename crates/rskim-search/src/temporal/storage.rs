@@ -49,7 +49,7 @@ const CURRENT_VERSION: i64 = 1;
 // Meta key constants
 // ============================================================================
 
-/// Key storing the ISO-8601 UTC timestamp of the last successful [`TemporalDb::sync`].
+/// Key storing the Unix epoch timestamp (seconds) of the last successful [`TemporalDb::sync`].
 pub const META_LAST_UPDATED: &str = "last_updated";
 
 /// Key storing the git HEAD SHA at the time of the last [`TemporalDb::sync`].
@@ -62,7 +62,8 @@ pub const META_GIT_HEAD: &str = "git_head";
 /// Convert a rusqlite error into [`SearchError::Database`].
 ///
 /// Private to this module — rusqlite types must not leak into the public API.
-pub(super) fn db_err(e: rusqlite::Error) -> SearchError {
+#[inline]
+pub(super) fn db_err(e: impl std::fmt::Display) -> SearchError {
     SearchError::Database(e.to_string())
 }
 
@@ -177,14 +178,18 @@ impl TemporalDb {
             if let Ok(meta) = std::fs::metadata(db_path) {
                 let mut perms = meta.permissions();
                 perms.set_mode(0o600);
-                let _ = std::fs::set_permissions(db_path, perms);
+                if let Err(e) = std::fs::set_permissions(db_path, perms) {
+                    eprintln!(
+                        "[skim-search] warning: could not restrict database permissions to 0o600: {e}"
+                    );
+                }
             }
         }
 
         conn.busy_timeout(Duration::from_millis(5_000))
             .map_err(db_err)?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL;")
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
             .map_err(db_err)?;
 
         run_migrations(&conn)?;

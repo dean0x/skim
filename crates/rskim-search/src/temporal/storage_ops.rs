@@ -8,10 +8,80 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::params;
 
-use crate::types::Result;
+use crate::types::{Result, SearchError};
 
 use super::{META_GIT_HEAD, META_LAST_UPDATED, TemporalDb, db_err};
 use super::storage_types::{CochangeRow, HotspotRow, RiskRow};
+
+/// Maximum rows accepted per table in a single store or sync call.
+///
+/// Prevents unbounded memory pressure and runaway INSERT loops on unexpectedly
+/// large datasets. Matches the co-change module's `MAX_ROWS_PER_TABLE` limit.
+const MAX_ROWS_PER_TABLE: usize = 500_000;
+
+// ============================================================================
+// Private insert helpers — accept an open Transaction
+// ============================================================================
+
+fn insert_hotspots_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    rows: &[HotspotRow],
+) -> Result<()> {
+    tx.execute("DELETE FROM hotspot", []).map_err(db_err)?;
+    let mut stmt = tx
+        .prepare_cached(
+            "INSERT INTO hotspot (file_path, score, changes_30d, changes_90d)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .map_err(db_err)?;
+    for row in rows {
+        stmt.execute(params![row.file_path, row.score, row.changes_30d, row.changes_90d])
+            .map_err(db_err)?;
+    }
+    Ok(())
+}
+
+fn insert_risks_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    rows: &[RiskRow],
+) -> Result<()> {
+    tx.execute("DELETE FROM risk", []).map_err(db_err)?;
+    let mut stmt = tx
+        .prepare_cached(
+            "INSERT INTO risk (file_path, risk_score, total_commits, fix_commits, fix_density)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .map_err(db_err)?;
+    for row in rows {
+        stmt.execute(params![
+            row.file_path,
+            row.risk_score,
+            row.total_commits,
+            row.fix_commits,
+            row.fix_density
+        ])
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
+
+fn insert_cochanges_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    rows: &[CochangeRow],
+) -> Result<()> {
+    tx.execute("DELETE FROM cochange", []).map_err(db_err)?;
+    let mut stmt = tx
+        .prepare_cached(
+            "INSERT INTO cochange (file_a, file_b, count, jaccard)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .map_err(db_err)?;
+    for row in rows {
+        stmt.execute(params![row.file_a, row.file_b, row.count, row.jaccard])
+            .map_err(db_err)?;
+    }
+    Ok(())
+}
 
 impl TemporalDb {
     // ========================================================================
@@ -26,20 +96,19 @@ impl TemporalDb {
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
+    /// Returns [`SearchError::CapacityExceeded`] if `rows.len() > 500_000`.
     pub fn store_hotspots(&self, rows: &[HotspotRow]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
-        tx.execute("DELETE FROM hotspot", []).map_err(db_err)?;
-        let mut stmt = tx
-            .prepare_cached(
-                "INSERT INTO hotspot (file_path, score, changes_30d, changes_90d)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )
-            .map_err(db_err)?;
-        for row in rows {
-            stmt.execute(params![row.file_path, row.score, row.changes_30d, row.changes_90d])
-                .map_err(db_err)?;
+        if rows.len() > MAX_ROWS_PER_TABLE {
+            return Err(SearchError::CapacityExceeded(format!(
+                "store_hotspots: {} rows exceeds limit of {MAX_ROWS_PER_TABLE}",
+                rows.len()
+            )));
         }
-        drop(stmt);
+        // SAFETY: `TemporalDb` is not `Send`/`Sync` and holds a single
+        // connection. Callers cannot share it across threads, so no nested
+        // transaction can be active when this method is called.
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        insert_hotspots_in_tx(&tx, rows)?;
         tx.commit().map_err(db_err)
     }
 
@@ -50,26 +119,17 @@ impl TemporalDb {
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
+    /// Returns [`SearchError::CapacityExceeded`] if `rows.len() > 500_000`.
     pub fn store_risks(&self, rows: &[RiskRow]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
-        tx.execute("DELETE FROM risk", []).map_err(db_err)?;
-        let mut stmt = tx
-            .prepare_cached(
-                "INSERT INTO risk (file_path, risk_score, total_commits, fix_commits, fix_density)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )
-            .map_err(db_err)?;
-        for row in rows {
-            stmt.execute(params![
-                row.file_path,
-                row.risk_score,
-                row.total_commits,
-                row.fix_commits,
-                row.fix_density
-            ])
-            .map_err(db_err)?;
+        if rows.len() > MAX_ROWS_PER_TABLE {
+            return Err(SearchError::CapacityExceeded(format!(
+                "store_risks: {} rows exceeds limit of {MAX_ROWS_PER_TABLE}",
+                rows.len()
+            )));
         }
-        drop(stmt);
+        // SAFETY: See store_hotspots.
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        insert_risks_in_tx(&tx, rows)?;
         tx.commit().map_err(db_err)
     }
 
@@ -80,20 +140,17 @@ impl TemporalDb {
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
+    /// Returns [`SearchError::CapacityExceeded`] if `rows.len() > 500_000`.
     pub fn store_cochanges(&self, rows: &[CochangeRow]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
-        tx.execute("DELETE FROM cochange", []).map_err(db_err)?;
-        let mut stmt = tx
-            .prepare_cached(
-                "INSERT INTO cochange (file_a, file_b, count, jaccard)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )
-            .map_err(db_err)?;
-        for row in rows {
-            stmt.execute(params![row.file_a, row.file_b, row.count, row.jaccard])
-                .map_err(db_err)?;
+        if rows.len() > MAX_ROWS_PER_TABLE {
+            return Err(SearchError::CapacityExceeded(format!(
+                "store_cochanges: {} rows exceeds limit of {MAX_ROWS_PER_TABLE}",
+                rows.len()
+            )));
         }
-        drop(stmt);
+        // SAFETY: See store_hotspots.
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        insert_cochanges_in_tx(&tx, rows)?;
         tx.commit().map_err(db_err)
     }
 
@@ -123,7 +180,7 @@ impl TemporalDb {
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
-    #[must_use = "load_hotspots returns a Result; use or propagate the rows"]
+    #[must_use]
     pub fn load_hotspots(&self) -> Result<Vec<HotspotRow>> {
         let mut stmt = self
             .conn
@@ -151,7 +208,7 @@ impl TemporalDb {
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
-    #[must_use = "load_risks returns a Result; use or propagate the rows"]
+    #[must_use]
     pub fn load_risks(&self) -> Result<Vec<RiskRow>> {
         let mut stmt = self
             .conn
@@ -182,7 +239,7 @@ impl TemporalDb {
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
-    #[must_use = "load_cochanges returns a Result; use or propagate the rows"]
+    #[must_use]
     pub fn load_cochanges(&self) -> Result<Vec<CochangeRow>> {
         let mut stmt = self
             .conn
@@ -211,7 +268,7 @@ impl TemporalDb {
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure other than
     /// `QueryReturnedNoRows`.
-    #[must_use = "get_meta returns a Result; check the value or propagate the error"]
+    #[must_use]
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         match self
             .conn
@@ -247,6 +304,7 @@ impl TemporalDb {
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure. On error the
     /// transaction is rolled back and the database is left unchanged.
+    /// Returns [`SearchError::CapacityExceeded`] if any slice exceeds 500_000 rows.
     pub fn sync(
         &self,
         hotspots: &[HotspotRow],
@@ -254,55 +312,26 @@ impl TemporalDb {
         cochanges: &[CochangeRow],
         git_head: &str,
     ) -> Result<()> {
+        for (name, len) in [
+            ("hotspots", hotspots.len()),
+            ("risks", risks.len()),
+            ("cochanges", cochanges.len()),
+        ] {
+            if len > MAX_ROWS_PER_TABLE {
+                return Err(SearchError::CapacityExceeded(format!(
+                    "sync: {name} has {len} rows, exceeds limit of {MAX_ROWS_PER_TABLE}"
+                )));
+            }
+        }
+
+        // SAFETY: `TemporalDb` is not `Send`/`Sync` and holds a single
+        // connection. Callers cannot share it across threads, so no nested
+        // transaction can be active when this method is called.
         let tx = self.conn.unchecked_transaction().map_err(db_err)?;
 
-        // ---- hotspot ----
-        tx.execute("DELETE FROM hotspot", []).map_err(db_err)?;
-        let mut stmt = tx
-            .prepare_cached(
-                "INSERT INTO hotspot (file_path, score, changes_30d, changes_90d)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )
-            .map_err(db_err)?;
-        for row in hotspots {
-            stmt.execute(params![row.file_path, row.score, row.changes_30d, row.changes_90d])
-                .map_err(db_err)?;
-        }
-        drop(stmt);
-
-        // ---- risk ----
-        tx.execute("DELETE FROM risk", []).map_err(db_err)?;
-        let mut stmt = tx
-            .prepare_cached(
-                "INSERT INTO risk (file_path, risk_score, total_commits, fix_commits, fix_density)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )
-            .map_err(db_err)?;
-        for row in risks {
-            stmt.execute(params![
-                row.file_path,
-                row.risk_score,
-                row.total_commits,
-                row.fix_commits,
-                row.fix_density
-            ])
-            .map_err(db_err)?;
-        }
-        drop(stmt);
-
-        // ---- cochange ----
-        tx.execute("DELETE FROM cochange", []).map_err(db_err)?;
-        let mut stmt = tx
-            .prepare_cached(
-                "INSERT INTO cochange (file_a, file_b, count, jaccard)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )
-            .map_err(db_err)?;
-        for row in cochanges {
-            stmt.execute(params![row.file_a, row.file_b, row.count, row.jaccard])
-                .map_err(db_err)?;
-        }
-        drop(stmt);
+        insert_hotspots_in_tx(&tx, hotspots)?;
+        insert_risks_in_tx(&tx, risks)?;
+        insert_cochanges_in_tx(&tx, cochanges)?;
 
         // ---- meta ----
         let now_secs = SystemTime::now()
