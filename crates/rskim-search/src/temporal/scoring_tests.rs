@@ -1,4 +1,5 @@
-//! Tests for [`decay_weight`] and [`compute_file_risk_scores`].
+//! Tests for [`decay_weight`], [`compute_file_risk_scores`], and
+//! [`compute_file_temporal_stats`].
 //!
 //! Written test-first (RED phase) following the TDD cycle.
 //! Groups match the plan: decay_weight unit tests, basic cases,
@@ -6,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use crate::temporal::{DEFAULT_HALF_LIFE_DAYS, compute_file_risk_scores, decay_weight};
+use crate::temporal::{compute_file_risk_scores, compute_file_temporal_stats, decay_weight};
 use crate::types::{CommitInfo, FileChangeInfo};
 
 // ============================================================================
@@ -622,4 +623,179 @@ fn half_life_parameter_varies() {
         ratio_short < ratio_long,
         "short={ratio_short}, long={ratio_long}"
     );
+}
+
+// ============================================================================
+// Group: compute_file_temporal_stats
+// ============================================================================
+
+/// Empty commit slice → empty HashMap.
+#[test]
+fn temporal_stats_empty_commits() {
+    let stats = compute_file_temporal_stats(&[], NOW);
+    assert!(stats.is_empty());
+}
+
+/// Single commit today, non-fix, 1 file → {30d:1, 90d:1, total:1, fix:0}.
+#[test]
+fn temporal_stats_single_commit_today() {
+    let commits = vec![make_commit(NOW, "feat: add feature", &["a.rs"])];
+    let stats = compute_file_temporal_stats(&commits, NOW);
+    let s = &stats["a.rs"];
+    assert_eq!(s.changes_30d, 1);
+    assert_eq!(s.changes_90d, 1);
+    assert_eq!(s.total_commits, 1);
+    assert_eq!(s.fix_commits, 0);
+}
+
+/// Single fix commit → fix_commits = 1.
+#[test]
+fn temporal_stats_fix_commit() {
+    let commits = vec![make_commit(NOW, "fix: crash on startup", &["b.rs"])];
+    let stats = compute_file_temporal_stats(&commits, NOW);
+    let s = &stats["b.rs"];
+    assert_eq!(s.fix_commits, 1);
+    assert_eq!(s.total_commits, 1);
+}
+
+/// Commit at 45 days ago → in 90d window but not 30d window.
+#[test]
+fn temporal_stats_commit_at_45_days() {
+    let commits = vec![make_commit(NOW - 45 * DAY, "feat: old", &["c.rs"])];
+    let stats = compute_file_temporal_stats(&commits, NOW);
+    let s = &stats["c.rs"];
+    assert_eq!(s.changes_30d, 0);
+    assert_eq!(s.changes_90d, 1);
+    assert_eq!(s.total_commits, 1);
+}
+
+/// Commit at 100 days ago → outside both windows, but counted in total.
+#[test]
+fn temporal_stats_commit_at_100_days() {
+    let commits = vec![make_commit(NOW - 100 * DAY, "feat: ancient", &["d.rs"])];
+    let stats = compute_file_temporal_stats(&commits, NOW);
+    let s = &stats["d.rs"];
+    assert_eq!(s.changes_30d, 0);
+    assert_eq!(s.changes_90d, 0);
+    assert_eq!(s.total_commits, 1);
+}
+
+/// Commit at exactly 30.0 days → included in changes_30d (boundary inclusive).
+#[test]
+fn temporal_stats_boundary_30_days() {
+    let commits = vec![make_commit(NOW - 30 * DAY, "feat: boundary", &["e.rs"])];
+    let stats = compute_file_temporal_stats(&commits, NOW);
+    let s = &stats["e.rs"];
+    assert_eq!(
+        s.changes_30d, 1,
+        "commit at exactly 30 days must be included in 30d window"
+    );
+    assert_eq!(s.changes_90d, 1);
+}
+
+/// Commit at exactly 90.0 days → included in changes_90d (boundary inclusive).
+#[test]
+fn temporal_stats_boundary_90_days() {
+    let commits = vec![make_commit(NOW - 90 * DAY, "feat: boundary90", &["f.rs"])];
+    let stats = compute_file_temporal_stats(&commits, NOW);
+    let s = &stats["f.rs"];
+    assert_eq!(s.changes_30d, 0);
+    assert_eq!(
+        s.changes_90d, 1,
+        "commit at exactly 90 days must be included in 90d window"
+    );
+    assert_eq!(s.total_commits, 1);
+}
+
+/// Future-dated commit (timestamp > now_epoch) → elapsed = 0, counted in both windows.
+#[test]
+fn temporal_stats_future_commit() {
+    let future_ts = NOW + 10 * DAY;
+    let commits = vec![make_commit(future_ts, "feat: future", &["g.rs"])];
+    let stats = compute_file_temporal_stats(&commits, NOW);
+    let s = &stats["g.rs"];
+    assert_eq!(s.changes_30d, 1);
+    assert_eq!(s.changes_90d, 1);
+    assert_eq!(s.total_commits, 1);
+}
+
+/// Commit touches files a.rs and b.rs → both files get independent entries.
+#[test]
+fn temporal_stats_multiple_files() {
+    let commits = vec![make_commit(NOW, "feat: multi", &["a.rs", "b.rs"])];
+    let stats = compute_file_temporal_stats(&commits, NOW);
+    assert!(stats.contains_key("a.rs"));
+    assert!(stats.contains_key("b.rs"));
+    let a = &stats["a.rs"];
+    let b = &stats["b.rs"];
+    assert_eq!(a.total_commits, 1);
+    assert_eq!(b.total_commits, 1);
+}
+
+/// Commit lists a.rs twice in changed_files → deduplicated, total_commits = 1.
+#[test]
+fn temporal_stats_dedup_within_commit() {
+    // Build the commit manually with a duplicate file path.
+    let commit = CommitInfo {
+        hash: "0".repeat(40),
+        timestamp: i64::try_from(NOW).expect("timestamp overflow"),
+        author: "test".to_string(),
+        message: "feat: dup".to_string(),
+        changed_files: vec![
+            FileChangeInfo {
+                path: std::path::PathBuf::from("a.rs"),
+                additions: 1,
+                deletions: 0,
+            },
+            FileChangeInfo {
+                path: std::path::PathBuf::from("a.rs"),
+                additions: 2,
+                deletions: 0,
+            },
+        ],
+    };
+    let stats = compute_file_temporal_stats(&[commit], NOW);
+    let s = &stats["a.rs"];
+    assert_eq!(
+        s.total_commits, 1,
+        "duplicate file in single commit must be counted once"
+    );
+    assert_eq!(s.changes_30d, 1);
+}
+
+/// Three separate commits all touch the same file → total_commits = 3.
+#[test]
+fn temporal_stats_multiple_commits_same_file() {
+    let commits = vec![
+        make_commit(NOW, "feat: first", &["lib.rs"]),
+        make_commit(NOW - 10 * DAY, "feat: second", &["lib.rs"]),
+        make_commit(NOW - 20 * DAY, "feat: third", &["lib.rs"]),
+    ];
+    let stats = compute_file_temporal_stats(&commits, NOW);
+    let s = &stats["lib.rs"];
+    assert_eq!(s.total_commits, 3);
+    assert_eq!(s.changes_30d, 3);
+    assert_eq!(s.changes_90d, 3);
+}
+
+/// Negative timestamp → clamped to 0, very large elapsed → outside both windows.
+#[test]
+fn temporal_stats_negative_timestamp() {
+    let commit = CommitInfo {
+        hash: "1".repeat(40),
+        timestamp: -1_000_000,
+        author: "test".to_string(),
+        message: "feat: ancient".to_string(),
+        changed_files: vec![FileChangeInfo {
+            path: std::path::PathBuf::from("old.rs"),
+            additions: 1,
+            deletions: 0,
+        }],
+    };
+    let stats = compute_file_temporal_stats(&[commit], NOW);
+    let s = &stats["old.rs"];
+    // Clamped to 0 → ts = 0, elapsed = NOW/86400 days (≫ 90 days).
+    assert_eq!(s.changes_30d, 0, "negative timestamp should be outside 30d");
+    assert_eq!(s.changes_90d, 0, "negative timestamp should be outside 90d");
+    assert_eq!(s.total_commits, 1, "should still be counted in total");
 }

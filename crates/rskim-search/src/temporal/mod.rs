@@ -12,9 +12,12 @@
 
 mod git_parser;
 mod scoring;
+pub mod storage;
 
 pub use git_parser::GixSource;
-pub use scoring::{DEFAULT_HALF_LIFE_DAYS, compute_file_risk_scores, decay_weight};
+pub use scoring::{
+    DEFAULT_HALF_LIFE_DAYS, compute_file_risk_scores, compute_file_temporal_stats, decay_weight,
+};
 
 use regex::Regex;
 

@@ -23,6 +23,7 @@ crc32fast = { workspace = true }
 tempfile = { workspace = true }
 gix = { workspace = true }
 regex = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

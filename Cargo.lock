@@ -2382,6 +2382,7 @@ dependencies = [
  "memmap2",
  "regex",
  "rskim-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

@@ -22,7 +22,7 @@
     },
     "cochange": {
       "name": "Co-Change Matrix",
-      "description": "Binary co-change matrix with Jaccard similarity, SKCC format, mmap reader",
+      "description": "Binary co-change matrix with Jaccard similarity, SKCC format for mmap point queries, plus SQLite CochangeRow for bulk-loading. Dual persistence model serving different access patterns.",
       "directories": [
         "crates/rskim-search/src/cochange/"
       ],
@@ -32,14 +32,17 @@
         "crates/rskim-search/src/cochange/format.rs",
         "crates/rskim-search/src/cochange/reader.rs",
         "crates/rskim-search/src/types.rs",
-        "crates/rskim-search/src/lib.rs"
+        "crates/rskim-search/src/lib.rs",
+        "crates/rskim-search/src/temporal/storage.rs",
+        "crates/rskim-search/src/temporal/storage_types.rs",
+        "crates/rskim-search/src/temporal/storage_ops.rs"
       ],
-      "lastUpdated": "2026-05-24T09:00:37.079Z",
+      "lastUpdated": "2026-05-25T21:45:03.285Z",
       "createdBy": "implement"
     },
     "temporal-scoring": {
       "name": "Temporal Risk Scoring",
-      "description": "Per-file hotspot and bug-fix density with exponential decay. Use when adding temporal ranking signals, modifying decay parameters, or debugging risk score computation.",
+      "description": "Per-file hotspot and bug-fix density with exponential decay, plus SQLite persistence layer (TemporalDb) for fast bulk-loading of temporal signals. Use when adding temporal ranking signals, modifying decay parameters, working with storage schema, or debugging risk score computation.",
       "directories": [
         "crates/rskim-search/src/temporal/"
       ],
@@ -48,10 +51,13 @@
         "crates/rskim-search/src/temporal/scoring_tests.rs",
         "crates/rskim-search/src/temporal/mod.rs",
         "crates/rskim-search/src/temporal/git_parser.rs",
+        "crates/rskim-search/src/temporal/storage.rs",
+        "crates/rskim-search/src/temporal/storage_ops.rs",
+        "crates/rskim-search/src/temporal/storage_types.rs",
         "crates/rskim-search/src/types.rs",
         "crates/rskim-search/src/lib.rs"
       ],
-      "lastUpdated": "2026-05-25T10:11:00.693Z",
+      "lastUpdated": "2026-05-25T21:44:49.314Z",
       "createdBy": "implement"
     }
   }

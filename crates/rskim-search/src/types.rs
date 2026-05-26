@@ -273,6 +273,23 @@ pub struct FileRiskScores {
     pub fix_density: f64,
 }
 
+/// Per-file raw commit counts within two time windows.
+///
+/// Computed by [`crate::temporal::compute_file_temporal_stats`] from a slice of
+/// [`CommitInfo`] values. Unlike [`FileRiskScores`], these are raw counts (not
+/// decay-weighted), suitable for persistence and incremental refresh.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileTemporalStats {
+    /// Number of commits touching this file within the last 30 days.
+    pub changes_30d: u32,
+    /// Number of commits touching this file within the last 90 days.
+    pub changes_90d: u32,
+    /// Total number of commits touching this file in the input slice.
+    pub total_commits: u32,
+    /// Number of commits classified as fix commits by [`crate::is_fix_commit`].
+    pub fix_commits: u32,
+}
+
 /// Summary metadata about a parsed history result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemporalMetadata {
@@ -541,6 +558,7 @@ pub trait FieldClassifier: Send + Sync {
 // ============================================================================
 
 /// Errors that can occur during search index construction or querying.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum SearchError {
     /// Propagated error from the rskim-core library
@@ -581,6 +599,13 @@ pub enum SearchError {
     /// exceeds a pre-configured capacity bound.
     #[error("Capacity exceeded: {0}")]
     CapacityExceeded(String),
+
+    /// SQLite database error from the temporal persistence layer.
+    ///
+    /// All rusqlite errors are converted to strings at the storage boundary so
+    /// no rusqlite types leak into this enum.
+    #[error("Database error: {0}")]
+    Database(String),
 }
 
 /// Result type alias for all rskim-search operations.
