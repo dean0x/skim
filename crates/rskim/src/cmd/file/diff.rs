@@ -22,17 +22,22 @@ use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{FileToolConfig, MAX_DISPLAY_ENTRIES, run_file_tool};
+use super::MAX_DISPLAY_ENTRIES;
+use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
-const CONFIG: FileToolConfig<'static> = FileToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "diff",
     env_overrides: &[],
     install_hint: "diff is typically pre-installed on Unix systems",
+    family: "file",
+    skip_ansi_strip: false,
+    command_type: CommandType::FileOps,
 };
 
 /// Run `skim diff [args...]`.
 pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
-    run_file_tool(CONFIG, args, ctx, prepare_args, parse_impl)
+    run_tool(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Inject `-u` (unified diff) if not already present.
@@ -226,24 +231,7 @@ fn build_file_result(file_stats: Vec<FileStat>) -> Option<FileResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/file");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
-
-    fn make_output(stdout: &str, exit_code: i32) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(exit_code),
-            duration: Duration::ZERO,
-        }
-    }
+    use crate::cmd::test_support::{load_fixture, make_output_full};
 
     // ---- prepare_args tests ----
 
@@ -279,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_tier1_unified_single_file() {
-        let input = load_fixture("diff_unified.txt");
+        let input = load_fixture("file", "diff_unified.txt");
         let result = try_parse_standalone_unified(&input);
         assert!(result.is_some(), "Expected parse to succeed");
         let result = result.unwrap();
@@ -293,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_tier1_unified_multi_file() {
-        let input = load_fixture("diff_multi_file.txt");
+        let input = load_fixture("file", "diff_multi_file.txt");
         let result = try_parse_standalone_unified(&input);
         assert!(result.is_some(), "Expected parse to succeed");
         let result = result.unwrap();
@@ -302,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_tier1_counts_insertions_deletions() {
-        let input = load_fixture("diff_unified.txt");
+        let input = load_fixture("file", "diff_unified.txt");
         let result = try_parse_standalone_unified(&input).unwrap();
         let entry = &result.entries[0];
         // The fixture has 3 insertions (+use std::fs, +println skim, +println Version)
@@ -319,8 +307,8 @@ mod tests {
 
     #[test]
     fn test_exit_code_1_is_success() {
-        let input = load_fixture("diff_unified.txt");
-        let output = make_output(&input, 1);
+        let input = load_fixture("file", "diff_unified.txt");
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_full(),
@@ -331,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_exit_code_2_is_error() {
-        let output = make_output("diff: file not found", 2);
+        let output = make_output_full("diff: file not found", "", Some(2));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -343,7 +331,7 @@ mod tests {
     #[test]
     fn test_tier3_empty_passthrough() {
         // Non-zero exit, empty output (not exit 0 which means identical)
-        let output = make_output("", 2);
+        let output = make_output_full("", "", Some(2));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -355,7 +343,7 @@ mod tests {
     #[test]
     fn test_identical_files() {
         // Exit code 0, empty stdout: files are identical
-        let output = make_output("", 0);
+        let output = make_output_full("", "", Some(0));
         let result = parse_impl(&output);
         assert!(
             result.is_full(),

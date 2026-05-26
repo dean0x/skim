@@ -28,12 +28,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
-use super::{LinterConfig, combine_stdout_stderr, group_issues};
+use super::{combine_stdout_stderr, group_issues};
+use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
-const CONFIG: LinterConfig<'static> = LinterConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "biome",
     env_overrides: &[("NO_COLOR", "1")],
     install_hint: "Install biome: npm install -g @biomejs/biome",
+    family: "lint",
+    skip_ansi_strip: false,
+    command_type: CommandType::Lint,
 };
 
 /// AD-LINT-21 (2026-04-15) — `.+` captures paths with spaces.
@@ -86,7 +91,7 @@ fn run_check(
         .skip(if has_subcommand { 1 } else { 0 })
         .cloned()
         .collect();
-    super::run_linter(
+    run_tool(
         CONFIG,
         &remaining,
         ctx,
@@ -134,7 +139,7 @@ fn run_format(
     // file args remain (e.g., `cat output.txt | skim biome format`).
     // `prepare_format_args` re-injects "format" for binary execution.
     let remaining: Vec<String> = args.iter().skip(1).cloned().collect();
-    super::run_linter(
+    run_tool(
         CONFIG,
         &remaining,
         ctx,
@@ -146,7 +151,7 @@ fn run_format(
 /// Re-inject the `format` subcommand stripped by `run_format`.
 ///
 /// When `biome format` is executed as a binary, `format` must be the first
-/// argument. We strip it before `run_linter` to allow stdin detection, then
+/// argument. We strip it before `run_tool` to allow stdin detection, then
 /// restore it here.
 fn prepare_format_args(cmd_args: &mut Vec<String>) {
     if cmd_args.first().is_none_or(|a| a != "format") {
@@ -335,6 +340,7 @@ mod tests {
     use super::*;
 
     use crate::cmd::lint::load_lint_fixture as load_fixture;
+    use crate::cmd::test_support::{make_output, make_output_full};
 
     /// biome_check_fail.json: generated from biome v1.7.0 on 2026-04-15.
     #[test]
@@ -401,12 +407,7 @@ mod tests {
     #[test]
     fn test_parse_check_impl_json_produces_full() {
         let input = load_fixture("biome_check_fail.json");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_check_impl(&output);
         assert!(
             result.is_full(),
@@ -418,12 +419,7 @@ mod tests {
     #[test]
     fn test_parse_check_impl_text_produces_degraded() {
         let input = load_fixture("biome_check_text.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full(&input, "", Some(1));
         let result = parse_check_impl(&output);
         assert!(
             result.is_degraded(),
@@ -434,12 +430,7 @@ mod tests {
 
     #[test]
     fn test_parse_check_impl_garbage_passthrough() {
-        let output = CommandOutput {
-            stdout: "random garbage not biome output".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("random garbage not biome output", "", Some(1));
         let result = parse_check_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -461,12 +452,7 @@ mod tests {
 
     #[test]
     fn test_parse_format_impl_empty_exit0() {
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("");
         let result = parse_format_impl(&output);
         assert!(result.is_full(), "Expected Full for empty exit 0");
         if let ParseResult::Full(r) = result {

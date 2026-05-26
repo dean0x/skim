@@ -16,13 +16,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
-use super::{InfraToolConfig, combine_stdout_stderr, run_infra_tool};
+use super::combine_stdout_stderr;
+use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
-const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "aws",
     env_overrides: &[],
     install_hint: "Install AWS CLI: https://aws.amazon.com/cli/",
+    family: "infra",
     skip_ansi_strip: false,
+    command_type: CommandType::Infra,
 };
 
 /// Keys stripped from AWS JSON responses (metadata, not useful data).
@@ -45,7 +49,7 @@ pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    run_infra_tool(CONFIG, args, ctx, prepare_args, parse_impl)
+    run_tool(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Inject `--output json` if not already present and subcommand supports it.
@@ -245,18 +249,11 @@ fn try_parse_regex(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/infra");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
+    use crate::cmd::test_support::{load_fixture, make_output, make_output_full};
 
     #[test]
     fn test_tier1_aws_s3_ls() {
-        let input = load_fixture("aws_s3_ls.json");
+        let input = load_fixture("infra", "aws_s3_ls.json");
         let result = try_parse_json(&input);
         assert!(result.is_some(), "Expected Tier 1 JSON parse to succeed");
         let result = result.unwrap();
@@ -266,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_tier1_aws_ec2_describe() {
-        let input = load_fixture("aws_ec2_describe.json");
+        let input = load_fixture("infra", "aws_ec2_describe.json");
         let result = try_parse_json(&input);
         assert!(result.is_some(), "Expected Tier 1 JSON parse to succeed");
     }
@@ -280,13 +277,8 @@ mod tests {
 
     #[test]
     fn test_parse_impl_produces_full() {
-        let input = load_fixture("aws_s3_ls.json");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let input = load_fixture("infra", "aws_s3_ls.json");
+        let output = make_output(&input);
         let result = parse_impl(&output);
         assert!(
             result.is_full(),
@@ -297,12 +289,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_garbage_produces_passthrough() {
-        let output = CommandOutput {
-            stdout: "An error occurred: Access Denied".to_string(),
-            stderr: String::new(),
-            exit_code: Some(255),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("An error occurred: Access Denied", "", Some(255));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -315,14 +302,9 @@ mod tests {
     fn test_parse_impl_text_produces_degraded() {
         // Tier 2 input: AWS table-formatted output (not JSON) that matches the
         // `| value |` pipe-delimited table regex.
-        let output = CommandOutput {
-            stdout:
-                "| i-0abc123def  | t3.micro  | running |\n| i-0def456ghi  | t3.small  | stopped |\n"
-                    .to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output(
+            "| i-0abc123def  | t3.micro  | running |\n| i-0def456ghi  | t3.small  | stopped |\n",
+        );
         let result = parse_impl(&output);
         assert!(
             result.is_degraded(),

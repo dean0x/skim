@@ -16,12 +16,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
-use super::{LinterConfig, combine_stdout_stderr, group_issues};
+use super::{combine_stdout_stderr, group_issues};
+use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
-const CONFIG: LinterConfig<'static> = LinterConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "swiftlint",
     env_overrides: &[],
     install_hint: "Install SwiftLint: brew install swiftlint",
+    family: "lint",
+    skip_ansi_strip: false,
+    command_type: CommandType::Lint,
 };
 
 /// `file.swift:line:col: warning: message (rule_id)`
@@ -34,7 +39,7 @@ pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(CONFIG, args, ctx, prepare_args, parse_impl)
+    run_tool(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Inject `--reporter json` unless the user already specified a reporter or fix flags.
@@ -154,17 +159,7 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::CommandOutput;
-    use std::time::Duration;
-
-    fn make_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-            exit_code,
-            duration: Duration::ZERO,
-        }
-    }
+    use crate::cmd::test_support::make_output_full;
 
     const SWIFTLINT_PASS_JSON: &str = r#"[]"#;
 
@@ -206,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_swiftlint_tier3_passthrough() {
-        let output = make_output("completely unparseable output", "", Some(1));
+        let output = make_output_full("completely unparseable output", "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -217,7 +212,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_json_produces_full() {
-        let output = make_output(SWIFTLINT_FAIL_JSON, "", Some(1));
+        let output = make_output_full(SWIFTLINT_FAIL_JSON, "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_full(),
@@ -228,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_text_produces_degraded() {
-        let output = make_output(SWIFTLINT_TEXT, "", Some(1));
+        let output = make_output_full(SWIFTLINT_TEXT, "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_degraded(),

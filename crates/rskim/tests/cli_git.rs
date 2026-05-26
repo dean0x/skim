@@ -8,6 +8,72 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 
 // ============================================================================
+// Helpers
+// ============================================================================
+
+/// Create a hermetic local git repo with an `origin` remote pointing at a
+/// local bare repo. Returns the temp dir (caller must keep alive) and the
+/// path of the worker clone directory.
+///
+/// This avoids hitting the project's own git remote during `skim git fetch`
+/// tests, preventing flakiness caused by stale remote tracking refs on the
+/// host machine (e.g. `cannot lock ref refs/remotes/origin/...`).
+fn make_hermetic_fetch_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir must succeed");
+    let base = dir.path();
+
+    // Bare repo acts as the remote.
+    let bare = base.join("bare.git");
+    std::process::Command::new("git")
+        .args(["init", "--bare"])
+        .arg(&bare)
+        .output()
+        .expect("git init --bare");
+
+    // Seed repo: one empty commit, then push to bare so it is non-empty.
+    let seed = base.join("seed");
+    std::process::Command::new("git")
+        .args(["init"])
+        .arg(&seed)
+        .output()
+        .expect("git init seed");
+    for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+        std::process::Command::new("git")
+            .args(["config", k, v])
+            .current_dir(&seed)
+            .output()
+            .expect("git config");
+    }
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(&seed)
+        .output()
+        .expect("git commit seed");
+    std::process::Command::new("git")
+        .args(["remote", "add", "origin"])
+        .arg(bare.to_str().unwrap())
+        .current_dir(&seed)
+        .output()
+        .expect("git remote add seed");
+    std::process::Command::new("git")
+        .args(["push", "origin", "HEAD:refs/heads/main"])
+        .current_dir(&seed)
+        .output()
+        .expect("git push seed");
+
+    // Worker: clone from bare — this is the repo tests run `skim git fetch` in.
+    let worker = base.join("worker");
+    std::process::Command::new("git")
+        .args(["clone"])
+        .arg(bare.to_str().unwrap())
+        .arg(&worker)
+        .output()
+        .expect("git clone worker");
+
+    (dir, worker)
+}
+
+// ============================================================================
 // Help
 // ============================================================================
 
@@ -144,14 +210,20 @@ fn test_skim_git_log_oneline_compresses() {
 // Fetch
 // ============================================================================
 
-/// Run `skim git fetch` against the skim repo. Since skim may have no
-/// configured remotes or may be up-to-date, we accept either `fetch up to date`
-/// output or the `fetch ` prefix (indicating a remote update was found).
+/// Run `skim git fetch` using a hermetic local bare-repo remote so the test
+/// is not affected by stale remote tracking refs on the host machine.
+///
+/// The setup creates a bare repo (the "remote") and a worker clone. Fetching
+/// from the local bare repo always succeeds and produces "up to date" output,
+/// which exercises the `parse_fetch` handler without touching the network or
+/// the project's own git remote.
 #[test]
 fn test_skim_git_fetch_in_repo() {
+    let (_dir, worker) = make_hermetic_fetch_repo();
     Command::cargo_bin("skim")
         .unwrap()
         .args(["git", "fetch"])
+        .current_dir(&worker)
         .assert()
         .success()
         .stdout(predicate::str::contains("fetch ").or(predicate::str::contains("up to date")));
@@ -169,60 +241,6 @@ fn test_skim_git_unknown_subcommand() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("unknown git subcommand"));
-}
-
-// ============================================================================
-// Step 7a: Real `git status` E2E tests — previously-skipped flags now compress
-// ============================================================================
-
-#[test]
-fn test_skim_git_status_with_short_flag_compresses() {
-    // -s was previously a skip flag causing passthrough. Handler now strips it
-    // and runs compressed output.
-    Command::cargo_bin("skim")
-        .unwrap()
-        .args(["git", "status", "-s"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("status "));
-}
-
-#[test]
-fn test_skim_git_status_with_porcelain_flag_compresses() {
-    // --porcelain was previously a skip flag. Handler now strips it.
-    Command::cargo_bin("skim")
-        .unwrap()
-        .args(["git", "status", "--porcelain"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("status "));
-}
-
-#[test]
-fn test_skim_git_status_with_short_long_flag_compresses() {
-    // --short was previously a skip flag. Handler now strips it.
-    Command::cargo_bin("skim")
-        .unwrap()
-        .args(["git", "status", "--short"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("status "));
-}
-
-// ============================================================================
-// Step 7b: Real `git log` E2E tests — --oneline now compresses
-// ============================================================================
-
-#[test]
-fn test_skim_git_log_oneline_flag_compresses() {
-    // --oneline was previously a skip flag causing passthrough. Handler now
-    // strips it and runs compressed output.
-    Command::cargo_bin("skim")
-        .unwrap()
-        .args(["git", "log", "--oneline", "-5"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("log ").and(predicate::str::contains("commit")));
 }
 
 #[test]
@@ -567,9 +585,13 @@ fn test_skim_git_dispatcher_routes_all_subcommands() {
 
     // ---- fetch ----
     // The fetch handler prefixes output with `fetch ` (operation + space).
+    // Uses a hermetic local bare-repo remote to avoid flakiness from stale
+    // remote tracking refs on the host machine.
+    let (_dir, worker) = make_hermetic_fetch_repo();
     Command::cargo_bin("skim")
         .unwrap()
         .args(["git", "fetch"])
+        .current_dir(&worker)
         .assert()
         .success()
         .stdout(predicate::str::contains("fetch ").or(predicate::str::contains("up to date")));

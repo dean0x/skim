@@ -12,17 +12,22 @@ use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{FileToolConfig, MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES, run_file_tool};
+use super::{MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
+use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
-const CONFIG: FileToolConfig<'static> = FileToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "df",
     env_overrides: &[],
     install_hint: "df is typically pre-installed on Unix systems",
+    family: "file",
+    skip_ansi_strip: false,
+    command_type: CommandType::FileOps,
 };
 
 /// Run `skim df [args...]`.
 pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
-    run_file_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
 }
 
 /// Three-tier parse function for df output.
@@ -100,28 +105,11 @@ fn try_parse_df(stdout: &str) -> Option<FileResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/file");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
-
-    fn make_output(stdout: &str, exit_code: i32) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(exit_code),
-            duration: Duration::ZERO,
-        }
-    }
+    use crate::cmd::test_support::{load_fixture, make_output_full};
 
     #[test]
     fn test_tier1_df_basic() {
-        let input = load_fixture("df_basic.txt");
+        let input = load_fixture("file", "df_basic.txt");
         let result = try_parse_df(&input);
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
@@ -130,7 +118,7 @@ mod tests {
 
     #[test]
     fn test_tier1_df_human() {
-        let input = load_fixture("df_human.txt");
+        let input = load_fixture("file", "df_human.txt");
         let result = try_parse_df(&input);
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
@@ -139,7 +127,7 @@ mod tests {
 
     #[test]
     fn test_tier1_df_preserves_header() {
-        let input = load_fixture("df_basic.txt");
+        let input = load_fixture("file", "df_basic.txt");
         let result = try_parse_df(&input).unwrap();
         // First entry should be the header line
         assert!(
@@ -151,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_tier3_empty_passthrough() {
-        let output = make_output("", 1);
+        let output = make_output_full("", "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -194,8 +182,8 @@ mod tests {
 
     #[test]
     fn test_parse_impl_produces_full() {
-        let input = load_fixture("df_basic.txt");
-        let output = make_output(&input, 0);
+        let input = load_fixture("file", "df_basic.txt");
+        let output = make_output_full(&input, "", Some(0));
         let result = parse_impl(&output);
         assert!(
             result.is_full(),

@@ -11,12 +11,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{FileToolConfig, run_file_tool, try_parse_file_line_content};
+use super::try_parse_file_line_content;
+use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
-const CONFIG: FileToolConfig<'static> = FileToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "grep",
     env_overrides: &[],
     install_hint: "grep is typically pre-installed. For better compression, install ripgrep: https://github.com/BurntSushi/ripgrep",
+    family: "file",
+    skip_ansi_strip: false,
+    command_type: CommandType::FileOps,
 };
 
 /// Run `skim grep [args...]`.
@@ -25,7 +30,7 @@ pub(crate) fn run(
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     // No flag injection for grep -- flags are too varied
-    run_file_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
 }
 
 /// Two-tier parse function: Tier 1 regex -> Passthrough.
@@ -60,28 +65,11 @@ fn try_parse_regex(text: &str) -> Option<FileResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/file");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
-
-    fn make_output(stdout: &str) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: Duration::ZERO,
-        }
-    }
+    use crate::cmd::test_support::{load_fixture, make_output};
 
     #[test]
     fn test_tier1_grep_basic() {
-        let input = load_fixture("grep_basic.txt");
+        let input = load_fixture("file", "grep_basic.txt");
         let result = try_parse_regex(&input);
         assert!(result.is_some(), "Expected Tier 1 grep parse to succeed");
         let result = result.unwrap();
@@ -90,7 +78,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_produces_full() {
-        let input = load_fixture("grep_basic.txt");
+        let input = load_fixture("file", "grep_basic.txt");
         let output = make_output(&input);
         let result = parse_impl(&output);
         assert!(

@@ -350,19 +350,12 @@ fn try_parse_regex(raw: &str) -> Option<TestResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn fixture_path(name: &str) -> PathBuf {
-        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests");
-        path.push("fixtures");
-        path.push("vitest");
-        path.push(name);
-        path
-    }
 
     fn read_fixture(name: &str) -> String {
-        std::fs::read_to_string(fixture_path(name))
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests/fixtures/vitest");
+        path.push(name);
+        std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("Failed to read fixture {name}: {e}"))
     }
 

@@ -243,21 +243,12 @@ fn try_tier2_noise_strip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    fn make_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-            exit_code,
-            duration: Duration::from_millis(100),
-        }
-    }
+    use crate::cmd::test_support::make_output_full;
 
     #[test]
     fn test_gradle_tier1_success() {
         let input = "> Task :compileJava\n> Task :processResources UP-TO-DATE\n> Task :classes\nBUILD SUCCESSFUL in 2.345 secs\n2 actionable tasks: 1 executed, 1 up-to-date\n";
-        let output = make_output(input, "", Some(0));
+        let output = make_output_full(input, "", Some(0));
         let result = parse_gradle(&output);
         assert!(
             result.is_full(),
@@ -273,7 +264,7 @@ mod tests {
     #[test]
     fn test_gradle_tier1_failure() {
         let input = "> Task :compileJava FAILED\n\nFAILURE: Build failed with an exception.\n\nBUILD FAILED\n";
-        let output = make_output(input, "", Some(1));
+        let output = make_output_full(input, "", Some(1));
         let result = parse_gradle(&output);
         assert!(
             result.is_full(),
@@ -289,7 +280,7 @@ mod tests {
     #[test]
     fn test_gradle_tier1_java_errors() {
         let input = "src/main/java/com/example/App.java:10: error: cannot find symbol\nsymbol: variable foo\nBUILD FAILED\n";
-        let output = make_output(input, "", Some(1));
+        let output = make_output_full(input, "", Some(1));
         let result = parse_gradle(&output);
         assert!(
             result.is_full(),
@@ -304,7 +295,7 @@ mod tests {
     #[test]
     fn test_gradle_tier2_noise_strip() {
         let input = "Starting a Gradle Daemon (subsequent builds will be faster)\n> Configure project :app\nTask :build UP-TO-DATE\nDownload https://example.com/artifact.jar\n";
-        let output = make_output(input, "", Some(0));
+        let output = make_output_full(input, "", Some(0));
         let result = parse_gradle(&output);
         assert!(
             result.is_degraded(),
@@ -315,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_gradle_tier3_passthrough() {
-        let output = make_output("some random unrecognized output\n", "", Some(1));
+        let output = make_output_full("some random unrecognized output\n", "", Some(1));
         let result = parse_gradle(&output);
         assert!(
             result.is_passthrough(),
@@ -326,7 +317,7 @@ mod tests {
 
     #[test]
     fn test_empty_output_is_success() {
-        let output = make_output("", "", Some(0));
+        let output = make_output_full("", "", Some(0));
         let result = parse_gradle(&output);
         assert!(
             result.is_full(),
@@ -362,7 +353,7 @@ mod tests {
     fn test_gradle_tier1_success_with_duration() {
         // Verify that a 1-minute build is parsed as 62000ms, not 1000ms
         let input = "> Task :compileJava\nBUILD SUCCESSFUL in 1 min 2 secs\n";
-        let output = make_output(input, "", Some(0));
+        let output = make_output_full(input, "", Some(0));
         let result = parse_gradle(&output);
         if let ParseResult::Full(br) = &result {
             assert_eq!(

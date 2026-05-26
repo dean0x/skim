@@ -204,16 +204,7 @@ fn try_tier2_noise_strip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    fn make_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-            exit_code,
-            duration: Duration::from_millis(100),
-        }
-    }
+    use crate::cmd::test_support::make_output_full;
 
     const MAVEN_SUCCESS: &str = "[INFO] Scanning for projects...\n[INFO] Building MyApp 1.0.0\n[INFO] BUILD SUCCESS\n[INFO] ------------------------------------------------------------------------\n[INFO] Total time:  2.345 s\n[INFO] Finished at: 2026-01-01T00:00:00Z\n";
 
@@ -223,7 +214,7 @@ mod tests {
 
     #[test]
     fn test_maven_tier1_success() {
-        let output = make_output(MAVEN_SUCCESS, "", Some(0));
+        let output = make_output_full(MAVEN_SUCCESS, "", Some(0));
         let result = parse_maven(&output);
         assert!(
             result.is_full(),
@@ -238,7 +229,7 @@ mod tests {
 
     #[test]
     fn test_maven_tier1_failure() {
-        let output = make_output(MAVEN_FAILURE, "", Some(1));
+        let output = make_output_full(MAVEN_FAILURE, "", Some(1));
         let result = parse_maven(&output);
         assert!(
             result.is_full(),
@@ -253,7 +244,7 @@ mod tests {
 
     #[test]
     fn test_maven_tier2_noise_strip() {
-        let output = make_output(MAVEN_NOISY, "", Some(0));
+        let output = make_output_full(MAVEN_NOISY, "", Some(0));
         let result = parse_maven(&output);
         assert!(
             result.is_degraded(),
@@ -264,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_maven_tier3_passthrough() {
-        let output = make_output("random unrecognized output\n", "", Some(1));
+        let output = make_output_full("random unrecognized output\n", "", Some(1));
         let result = parse_maven(&output);
         assert!(
             result.is_passthrough(),
@@ -275,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_maven_empty_success() {
-        let output = make_output("", "", Some(0));
+        let output = make_output_full("", "", Some(0));
         let result = parse_maven(&output);
         assert!(
             result.is_full(),

@@ -19,13 +19,17 @@ use serde_json::Value;
 use crate::output::ParseResult;
 use crate::output::canonical::{InfraItem, InfraResult};
 
-use super::{InfraToolConfig, combine_stdout_stderr, passthrough_parse, run_infra_tool};
+use super::{combine_stdout_stderr, passthrough_parse};
+use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
-const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "terraform",
     env_overrides: &[],
     install_hint: "Install Terraform: https://developer.hashicorp.com/terraform/downloads",
+    family: "infra",
     skip_ansi_strip: false,
+    command_type: CommandType::Infra,
 };
 
 /// Matches the plan summary line in text output.
@@ -52,9 +56,9 @@ pub(crate) fn run(
     let subcmd = args.first().map(|s| s.as_str()).unwrap_or("");
 
     match subcmd {
-        "plan" => run_infra_tool(CONFIG, args, ctx, prepare_args, parse_plan),
-        "apply" => run_infra_tool(CONFIG, args, ctx, prepare_args, parse_apply),
-        _ => run_infra_tool(CONFIG, args, ctx, prepare_args, passthrough_parse),
+        "plan" => run_tool(CONFIG, args, ctx, prepare_args, parse_plan),
+        "apply" => run_tool(CONFIG, args, ctx, prepare_args, parse_apply),
+        _ => run_tool(CONFIG, args, ctx, prepare_args, passthrough_parse),
     }
 }
 
@@ -215,28 +219,11 @@ fn try_parse_text(text: &str, subcmd: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::CommandOutput;
-
-    fn make_output(stdout: &str) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
-    }
-
-    fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/infra");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
+    use crate::cmd::test_support::{load_fixture, make_output};
 
     #[test]
     fn test_tier1_plan_ndjson_full_result() {
-        let fixture = load_fixture("terraform_plan_ndjson.json");
+        let fixture = load_fixture("infra", "terraform_plan_ndjson.json");
         let output = make_output(&fixture);
         let result = parse_plan(&output);
         assert!(
@@ -252,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_tier1_apply_ndjson_full_result() {
-        let fixture = load_fixture("terraform_apply_ndjson.json");
+        let fixture = load_fixture("infra", "terraform_apply_ndjson.json");
         let output = make_output(&fixture);
         let result = parse_apply(&output);
         assert!(
@@ -266,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_tier2_plan_text_degraded() {
-        let fixture = load_fixture("terraform_plan_text.txt");
+        let fixture = load_fixture("infra", "terraform_plan_text.txt");
         let output = make_output(&fixture);
         let result = parse_plan(&output);
         assert!(
@@ -282,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_tier2_no_changes_edge_case() {
-        let fixture = load_fixture("terraform_plan_no_changes.txt");
+        let fixture = load_fixture("infra", "terraform_plan_no_changes.txt");
         let output = make_output(&fixture);
         let result = parse_plan(&output);
         assert!(matches!(result, ParseResult::Degraded(_, _)));

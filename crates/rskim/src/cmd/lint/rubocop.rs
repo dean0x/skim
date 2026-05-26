@@ -16,12 +16,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
-use super::{LinterConfig, combine_stdout_stderr, group_issues};
+use super::{combine_stdout_stderr, group_issues};
+use crate::analytics::CommandType;
+use crate::cmd::{ToolRunConfig, run_tool};
 
-const CONFIG: LinterConfig<'static> = LinterConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "rubocop",
     env_overrides: &[("NO_COLOR", "1")],
     install_hint: "Install RuboCop: gem install rubocop",
+    family: "lint",
+    skip_ansi_strip: false,
+    command_type: CommandType::Lint,
 };
 
 /// `file:line:col: S: CopName: message`
@@ -34,7 +39,7 @@ pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(CONFIG, args, ctx, prepare_args, parse_impl)
+    run_tool(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Inject `--format json` unless the user already specified a format or
@@ -184,17 +189,7 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::CommandOutput;
-    use std::time::Duration;
-
-    fn make_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-            exit_code,
-            duration: Duration::ZERO,
-        }
-    }
+    use crate::cmd::test_support::make_output_full;
 
     const RUBOCOP_PASS_JSON: &str = r#"{"metadata":{"rubocop_version":"1.65.0","ruby_engine":"ruby","ruby_version":"3.3.0","ruby_patchlevel":"0","ruby_platform":"arm64-darwin23"},"files":[{"path":"app/models/user.rb","offenses":[]}],"summary":{"offense_count":0,"target_file_count":1,"inspected_file_count":1}}"#;
 
@@ -235,7 +230,7 @@ mod tests {
 
     #[test]
     fn test_rubocop_tier3_passthrough() {
-        let output = make_output(
+        let output = make_output_full(
             "completely unparseable output\nno json no regex",
             "",
             Some(1),
@@ -250,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_json_produces_full() {
-        let output = make_output(RUBOCOP_FAIL_JSON, "", Some(1));
+        let output = make_output_full(RUBOCOP_FAIL_JSON, "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_full(),
@@ -261,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_text_produces_degraded() {
-        let output = make_output(RUBOCOP_TEXT, "", Some(1));
+        let output = make_output_full(RUBOCOP_TEXT, "", Some(1));
         let result = parse_impl(&output);
         assert!(
             result.is_degraded(),

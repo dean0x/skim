@@ -334,18 +334,7 @@ fn try_parse_list_regex(text: &str) -> Option<PkgResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn fixture_path(name: &str) -> std::path::PathBuf {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/pkg");
-        path.push(name);
-        path
-    }
-
-    fn load_fixture(name: &str) -> String {
-        std::fs::read_to_string(fixture_path(name))
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
+    use crate::cmd::test_support::{load_fixture, make_output, make_output_full};
 
     // ========================================================================
     // pip install: Regex
@@ -353,7 +342,7 @@ mod tests {
 
     #[test]
     fn test_install_regex_parse() {
-        let input = load_fixture("pip_install.txt");
+        let input = load_fixture("pkg", "pip_install.txt");
         let result = try_parse_install_regex(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -379,7 +368,7 @@ mod tests {
 
     #[test]
     fn test_check_clean() {
-        let input = load_fixture("pip_check_clean.txt");
+        let input = load_fixture("pkg", "pip_check_clean.txt");
         let result = try_parse_check_regex(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -389,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_check_issues() {
-        let input = load_fixture("pip_check_issues.txt");
+        let input = load_fixture("pkg", "pip_check_issues.txt");
         let result = try_parse_check_regex(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -404,7 +393,7 @@ mod tests {
 
     #[test]
     fn test_list_json_parse() {
-        let input = load_fixture("pip_outdated.json");
+        let input = load_fixture("pkg", "pip_outdated.json");
         let result = try_parse_list_json(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -428,13 +417,8 @@ mod tests {
 
     #[test]
     fn test_install_produces_full() {
-        let input = load_fixture("pip_install.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let input = load_fixture("pkg", "pip_install.txt");
+        let output = make_output(&input);
         let result = parse_install(&output);
         assert!(
             result.is_full(),
@@ -445,13 +429,8 @@ mod tests {
 
     #[test]
     fn test_check_produces_full() {
-        let input = load_fixture("pip_check_clean.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let input = load_fixture("pkg", "pip_check_clean.txt");
+        let output = make_output(&input);
         let result = parse_check(&output);
         assert!(
             result.is_full(),
@@ -462,12 +441,7 @@ mod tests {
 
     #[test]
     fn test_garbage_produces_passthrough() {
-        let output = CommandOutput {
-            stdout: "completely unparseable output".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("completely unparseable output", "", Some(1));
         let result = parse_install(&output);
         assert!(
             result.is_passthrough(),

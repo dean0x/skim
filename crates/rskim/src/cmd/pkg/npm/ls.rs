@@ -24,13 +24,11 @@ pub(super) fn run_ls(
         show_stats,
         rec,
         |cmd_args| {
-            if json_output {
-                if !user_has_flag(cmd_args, &["--json"]) {
-                    cmd_args.push("--json".to_string());
-                }
-                if !user_has_flag(cmd_args, &["--depth"]) {
-                    cmd_args.push("--depth=0".to_string());
-                }
+            if json_output && !user_has_flag(cmd_args, &["--json"]) {
+                cmd_args.push("--json".to_string());
+            }
+            if json_output && !user_has_flag(cmd_args, &["--depth"]) {
+                cmd_args.push("--depth=0".to_string());
             }
         },
         parse_ls,
@@ -121,18 +119,7 @@ fn try_parse_ls_regex(text: &str) -> Option<PkgResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn fixture_path(name: &str) -> std::path::PathBuf {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/pkg");
-        path.push(name);
-        path
-    }
-
-    fn load_fixture(name: &str) -> String {
-        std::fs::read_to_string(fixture_path(name))
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
+    use crate::cmd::test_support::{load_fixture, make_output, make_output_full};
 
     // ========================================================================
     // npm ls: JSON
@@ -140,7 +127,7 @@ mod tests {
 
     #[test]
     fn test_ls_json_parse() {
-        let input = load_fixture("npm_ls.json");
+        let input = load_fixture("pkg", "npm_ls.json");
         let result = try_parse_ls_json(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -157,13 +144,8 @@ mod tests {
 
     #[test]
     fn test_ls_json_produces_full() {
-        let input = load_fixture("npm_ls.json");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let input = load_fixture("pkg", "npm_ls.json");
+        let output = make_output(&input);
         let result = parse_ls(&output);
         assert!(
             result.is_full(),
@@ -174,12 +156,7 @@ mod tests {
 
     #[test]
     fn test_ls_garbage_produces_passthrough() {
-        let output = CommandOutput {
-            stdout: "completely unparseable output".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("completely unparseable output", "", Some(1));
         let result = parse_ls(&output);
         assert!(
             result.is_passthrough(),

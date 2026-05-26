@@ -14,7 +14,7 @@ pub(crate) mod wget;
 
 use std::process::ExitCode;
 
-use super::{ParsedCommandConfig, extract_show_stats, run_parsed_command_with_mode};
+use super::extract_show_stats;
 use crate::output::ParseResult;
 use crate::output::canonical::InfraResult;
 use crate::runner::CommandOutput;
@@ -149,67 +149,6 @@ fn print_help() {
     println!("  skim aws s3 ls               List S3 buckets");
     println!("  skim curl https://api.example.com/data  Make HTTP request");
     println!("  skim wget https://example.com/file.txt  Download a file");
-}
-
-// ============================================================================
-// Shared infra tool execution helper
-// ============================================================================
-
-/// Static configuration for an infra tool binary.
-pub(crate) struct InfraToolConfig<'a> {
-    /// Binary name of the tool (e.g., "gh", "aws").
-    pub program: &'a str,
-    /// Environment variable overrides for the child process.
-    pub env_overrides: &'a [(&'a str, &'a str)],
-    /// Hint printed when the tool binary is not found.
-    pub install_hint: &'a str,
-    /// When `true`, skip ANSI escape stripping on the raw command output.
-    ///
-    /// `strip_ansi_escapes` treats ASCII control codes — including `\t` (0x09) —
-    /// as part of escape sequences and drops them. DNS tools (dig, nslookup) use
-    /// TABs as field separators in their structured output; stripping would remove
-    /// those separators and cause record-line regex to fail, falling through to
-    /// Passthrough. Set `true` for dig and nslookup.
-    pub skip_ansi_strip: bool,
-}
-
-/// Execute an infra tool, parse its output, and emit the result.
-///
-/// This is the single implementation shared by all infra parsers, handling both
-/// text and JSON output modes. It eliminates per-tool `run()` boilerplate by
-/// delegating to [`super::run_parsed_command_with_mode`].
-pub(crate) fn run_infra_tool(
-    config: InfraToolConfig<'_>,
-    args: &[String],
-    ctx: &super::RunContext,
-    prepare_args: impl FnOnce(&mut Vec<String>),
-    parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<InfraResult>,
-) -> anyhow::Result<ExitCode> {
-    let mut cmd_args = args.to_vec();
-    prepare_args(&mut cmd_args);
-
-    let use_stdin = super::should_read_stdin(args);
-
-    run_parsed_command_with_mode(
-        ParsedCommandConfig {
-            program: config.program,
-            args: &cmd_args,
-            env_overrides: config.env_overrides,
-            install_hint: config.install_hint,
-            use_stdin,
-            show_stats: ctx.show_stats,
-            output_format: ctx.output_format(),
-            family: "infra",
-            skip_ansi_strip: config.skip_ansi_strip,
-            rec: crate::analytics::RecordingContext {
-                enabled: ctx.analytics_enabled,
-                command_type: crate::analytics::CommandType::Infra,
-                parse_tier: None,
-                session_id: ctx.session_id.as_deref(),
-            },
-        },
-        |output, _args| parse_fn(output),
-    )
 }
 
 /// Build an analytics label for streaming infra commands.

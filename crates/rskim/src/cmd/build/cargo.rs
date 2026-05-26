@@ -271,26 +271,7 @@ fn try_tier2_regex(stderr: &str) -> Option<ParseResult<BuildResult>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use std::time::Duration;
-
-    fn fixtures_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cmd/build")
-    }
-
-    fn load_fixture(name: &str) -> String {
-        std::fs::read_to_string(fixtures_dir().join(name))
-            .unwrap_or_else(|e| panic!("Failed to load fixture {name}: {e}"))
-    }
-
-    fn make_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-            exit_code,
-            duration: Duration::from_millis(100),
-        }
-    }
+    use crate::cmd::test_support::{load_fixture, make_output_full};
 
     // ========================================================================
     // Tier 1: JSON parsing
@@ -298,8 +279,8 @@ mod tests {
 
     #[test]
     fn test_tier1_build_success() {
-        let stdout = load_fixture("cargo_build_ok.json");
-        let output = make_output(&stdout, "", Some(0));
+        let stdout = load_fixture("build", "cargo_build_ok.json");
+        let output = make_output_full(&stdout, "", Some(0));
         let result = parse(&output);
 
         assert!(
@@ -315,8 +296,8 @@ mod tests {
 
     #[test]
     fn test_tier1_build_failure() {
-        let stdout = load_fixture("cargo_build_fail.json");
-        let output = make_output(&stdout, "", Some(101));
+        let stdout = load_fixture("build", "cargo_build_fail.json");
+        let output = make_output_full(&stdout, "", Some(101));
         let result = parse(&output);
 
         assert!(
@@ -332,8 +313,8 @@ mod tests {
 
     #[test]
     fn test_tier1_clippy_warnings() {
-        let stdout = load_fixture("clippy_warnings.json");
-        let output = make_output(&stdout, "", Some(0));
+        let stdout = load_fixture("build", "clippy_warnings.json");
+        let output = make_output_full(&stdout, "", Some(0));
         let result = parse(&output);
 
         assert!(
@@ -349,8 +330,8 @@ mod tests {
 
     #[test]
     fn test_tier1_clippy_warning_codes_grouped() {
-        let stdout = load_fixture("clippy_warnings.json");
-        let output = make_output(&stdout, "", Some(0));
+        let stdout = load_fixture("build", "clippy_warnings.json");
+        let output = make_output_full(&stdout, "", Some(0));
         let result = parse(&output);
 
         if let ParseResult::Full(build_result) = &result {
@@ -396,7 +377,7 @@ mod tests {
         //
         // Simulate: cargo outputs human text to stderr (no JSON on stdout).
         let stderr = "error[E0308]: mismatched types\n  --> src/main.rs:10:5\n";
-        let output = make_output("", stderr, Some(101));
+        let output = make_output_full("", stderr, Some(101));
 
         // Verify flag detection prevents injection
         let user_args = vec!["build".to_string(), "--message-format=short".to_string()];
@@ -425,7 +406,7 @@ mod tests {
     #[test]
     fn test_tier2_regex_errors() {
         let stderr = "error[E0308]: mismatched types\n  --> src/main.rs:10:5\nerror[E0425]: cannot find value\n";
-        let output = make_output("", stderr, Some(101));
+        let output = make_output_full("", stderr, Some(101));
         let result = parse(&output);
 
         assert!(
@@ -448,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_tier3_passthrough() {
-        let output = make_output("some random output", "", Some(0));
+        let output = make_output_full("some random output", "", Some(0));
         let result = parse(&output);
 
         assert!(

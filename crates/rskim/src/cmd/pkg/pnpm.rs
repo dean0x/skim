@@ -328,18 +328,7 @@ fn try_parse_outdated_json(stdout: &str) -> Option<PkgResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn fixture_path(name: &str) -> std::path::PathBuf {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/pkg");
-        path.push(name);
-        path
-    }
-
-    fn load_fixture(name: &str) -> String {
-        std::fs::read_to_string(fixture_path(name))
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
+    use crate::cmd::test_support::{load_fixture, make_output, make_output_full};
 
     // ========================================================================
     // pnpm install: Regex
@@ -347,7 +336,7 @@ mod tests {
 
     #[test]
     fn test_install_regex_parse() {
-        let input = load_fixture("pnpm_install.txt");
+        let input = load_fixture("pkg", "pnpm_install.txt");
         let result = try_parse_install_regex(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -363,7 +352,7 @@ mod tests {
 
     #[test]
     fn test_audit_json_parse() {
-        let input = load_fixture("pnpm_audit.json");
+        let input = load_fixture("pkg", "pnpm_audit.json");
         let result = try_parse_audit_json(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -380,7 +369,7 @@ mod tests {
 
     #[test]
     fn test_outdated_json_parse() {
-        let input = load_fixture("pnpm_outdated.json");
+        let input = load_fixture("pkg", "pnpm_outdated.json");
         let result = try_parse_outdated_json(&input);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -403,13 +392,8 @@ mod tests {
 
     #[test]
     fn test_install_produces_full() {
-        let input = load_fixture("pnpm_install.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let input = load_fixture("pkg", "pnpm_install.txt");
+        let output = make_output(&input);
         let result = parse_install(&output);
         assert!(
             result.is_full(),
@@ -420,12 +404,7 @@ mod tests {
 
     #[test]
     fn test_garbage_produces_passthrough() {
-        let output = CommandOutput {
-            stdout: "completely unparseable output".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("completely unparseable output", "", Some(1));
         let result = parse_install(&output);
         assert!(
             result.is_passthrough(),
@@ -440,7 +419,7 @@ mod tests {
 
     #[test]
     fn test_pnpm_audit_uses_key_as_id() {
-        let input = load_fixture("pnpm_audit_ghsa_key.json");
+        let input = load_fixture("pkg", "pnpm_audit_ghsa_key.json");
         let result = try_parse_audit_json(&input).expect("must parse");
         let display = format!("{result}");
         // The GHSA-1234-abcd-xyz0 key must appear in the detail string.
