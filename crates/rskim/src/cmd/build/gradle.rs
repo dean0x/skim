@@ -243,7 +243,7 @@ fn try_tier2_noise_strip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{make_output_full};
+    use crate::cmd::test_support::make_output_full;
 
     #[test]
     fn test_gradle_tier1_success() {

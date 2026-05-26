@@ -121,7 +121,7 @@ fn try_parse_outdated_regex(text: &str) -> Option<PkgResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture};
+    use crate::cmd::test_support::load_fixture;
 
     // ========================================================================
     // npm outdated: JSON

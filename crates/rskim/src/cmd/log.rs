@@ -656,7 +656,7 @@ mod tests {
         LogFlags::default()
     }
 
-    use crate::cmd::test_support::{load_fixture};
+    use crate::cmd::test_support::load_fixture;
 
     #[test]
     fn test_tier1_json_structured() {

@@ -184,8 +184,8 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
+    use crate::cmd::test_support::{make_output, make_output_full};
     use crate::output::canonical::{LintIssue, LintSeverity};
-    use crate::runner::CommandOutput;
 
     #[test]
     fn test_group_issues_info_severity_not_counted() {
@@ -223,12 +223,7 @@ mod tests {
 
     #[test]
     fn test_combine_stdout_stderr_empty_stderr() {
-        let output = CommandOutput {
-            stdout: "hello world".to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("hello world");
         let combined = combine_stdout_stderr(&output);
         assert_eq!(&*combined, "hello world");
         // When stderr is empty, should borrow (Cow::Borrowed)
@@ -237,12 +232,7 @@ mod tests {
 
     #[test]
     fn test_combine_stdout_stderr_with_stderr() {
-        let output = CommandOutput {
-            stdout: "out".to_string(),
-            stderr: "err".to_string(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output_full("out", "err", Some(1));
         let combined = combine_stdout_stderr(&output);
         assert_eq!(&*combined, "out\nerr");
         // When stderr is non-empty, should own (Cow::Owned)
@@ -251,12 +241,7 @@ mod tests {
 
     #[test]
     fn test_combine_stdout_stderr_both_empty() {
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("");
         let combined = combine_stdout_stderr(&output);
         assert_eq!(&*combined, "");
         assert!(matches!(combined, Cow::Borrowed(_)));
