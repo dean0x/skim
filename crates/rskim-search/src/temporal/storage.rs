@@ -61,7 +61,7 @@ pub const META_GIT_HEAD: &str = "git_head";
 
 /// Convert a rusqlite error into [`SearchError::Database`].
 ///
-/// Private to this module — rusqlite types must not leak into the public API.
+/// Visible to the storage sub-modules — not part of the public API.
 #[inline]
 pub(super) fn db_err(e: impl std::fmt::Display) -> SearchError {
     SearchError::Database(e.to_string())
@@ -95,7 +95,9 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
     if version < 1 {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS hotspot (
+            "BEGIN;
+
+            CREATE TABLE IF NOT EXISTS hotspot (
                 file_path  TEXT    PRIMARY KEY,
                 score      REAL    NOT NULL,
                 changes_30d INTEGER NOT NULL,
@@ -123,7 +125,9 @@ fn run_migrations(conn: &Connection) -> Result<()> {
                 value TEXT NOT NULL
             );
 
-            PRAGMA user_version = 1;",
+            PRAGMA user_version = 1;
+
+            COMMIT;",
         )
         .map_err(db_err)?;
     }
@@ -189,7 +193,15 @@ impl TemporalDb {
         conn.busy_timeout(Duration::from_millis(5_000))
             .map_err(db_err)?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .map_err(db_err)?;
+        if journal_mode.to_lowercase() != "wal" {
+            return Err(SearchError::Database(format!(
+                "failed to enable WAL mode; journal_mode is '{journal_mode}'"
+            )));
+        }
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")
             .map_err(db_err)?;
 
         run_migrations(&conn)?;
