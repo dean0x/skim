@@ -811,6 +811,14 @@ fn standalone_risky_empty_db_text_format() {
 // The stored HEAD differs from the current repo HEAD.
 // ============================================================================
 
+// NOTE: This test requires the `git` binary and a writable filesystem to
+// initialize a temporary repo and create a commit. In environments where git
+// is unavailable or identity config is missing (some CI sandboxes), the test
+// performs an early return with an eprintln! skip message rather than failing.
+// This is intentional: the behaviour under test is git-dependent and cannot be
+// meaningfully exercised without a real git binary. The skip is observable via
+// the eprintln! output in verbose test runs (`cargo test -- --nocapture`).
+// If running in CI, ensure `git` is on PATH and a default identity is set.
 #[test]
 fn staleness_warns_when_stored_head_differs_from_current() {
     // Set up a minimal git repo so git rev-parse HEAD returns a real value.

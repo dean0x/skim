@@ -412,15 +412,19 @@ fn run_remove_hooks(root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode>
 
 /// Resolve blast-radius partner paths from the temporal database.
 ///
-/// Normalizes the raw path, looks up co-change partners, and returns the full
-/// set of paths to restrict the search to (partners + the target file itself).
+/// Returns co-change partners **plus the target file itself**, so text queries
+/// like `skim search auth --blast-radius src/auth.rs` surface matches within
+/// `src/auth.rs` in addition to its co-change partners.
 ///
 /// Returns `None` when no blast-radius was requested, or when the temporal DB
-/// is unavailable (emits a warning in that case).
+/// is unavailable.  When `json` is true the warning is emitted as a JSON
+/// object to stdout (consistent with the JSON degradation path in
+/// `run_temporal_standalone`); otherwise it goes to stderr.
 fn resolve_blast_radius_filter(
     blast_radius: Option<&str>,
     temporal_db: &Option<rskim_search::TemporalDb>,
     root: &std::path::Path,
+    json: bool,
 ) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
     let raw_path = match blast_radius {
         Some(p) => p,
@@ -430,7 +434,13 @@ fn resolve_blast_radius_filter(
     let db = match temporal_db {
         Some(db) => db,
         None => {
-            eprintln!("skim search: no temporal data — run 'skim heatmap' to populate");
+            const MSG: &str = "no temporal data — run 'skim heatmap' to populate";
+            if json {
+                let w = WarningJson { warning: MSG };
+                println!("{}", serde_json::to_string(&w)?);
+            } else {
+                eprintln!("skim search: {MSG}");
+            }
             return Ok(None);
         }
     };
@@ -478,7 +488,7 @@ fn run_query(
     // limit applies to the filtered set rather than silently discarding
     // co-change partners that ranked beyond the top-N unfiltered results.
     let blast_radius_paths =
-        resolve_blast_radius_filter(flags.blast_radius.as_deref(), &temporal_db, &root)?;
+        resolve_blast_radius_filter(flags.blast_radius.as_deref(), &temporal_db, &root, flags.json)?;
 
     let config = types::QueryConfig {
         text: text.to_string(),
@@ -516,6 +526,12 @@ struct WarningJson<'a> {
     warning: &'a str,
 }
 
+/// Execute a standalone temporal query (no text search term provided).
+///
+/// Opens the temporal DB from the resolved cache directory, checks for
+/// staleness, dispatches the query (hotspot, cold, risky, or blast-radius),
+/// and writes the result as JSON or plain text to stdout. Degrades gracefully
+/// when the temporal DB is absent — prints a warning and returns exit 0.
 fn run_temporal_standalone(
     limit: usize,
     json: bool,
@@ -865,6 +881,30 @@ mod tests {
     fn test_parse_flags_limit_one_is_valid() {
         let flags = parse_flags(&["--limit".to_string(), "1".to_string()]).unwrap();
         assert_eq!(flags.limit, 1);
+    }
+
+    // ============================================================================
+    // resolve_blast_radius_filter — None DB degradation path
+    // ============================================================================
+
+    /// When blast_radius is Some but temporal_db is None (user hasn't run
+    /// `skim heatmap` yet), the function must return Ok(None) without panicking.
+    /// A stderr warning is expected but the caller handles the degradation.
+    #[test]
+    fn test_resolve_blast_radius_filter_no_db_returns_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let result = resolve_blast_radius_filter(Some("src/auth.rs"), &None, root);
+        assert!(
+            result.is_ok(),
+            "must not error when temporal_db is None, got: {:?}",
+            result.unwrap_err()
+        );
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "must return None (graceful degradation) when temporal_db is None"
+        );
     }
 
     // ============================================================================
