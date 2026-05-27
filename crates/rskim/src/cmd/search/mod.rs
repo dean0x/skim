@@ -69,15 +69,7 @@ pub(crate) fn run(
         SearchAction::Stats => run_stats(flags.json, &flags.root_override),
         SearchAction::InstallHooks => run_install_hooks(&flags.root_override),
         SearchAction::RemoveHooks => run_remove_hooks(&flags.root_override),
-        SearchAction::Query(ref text) if !text.is_empty() => run_query(
-            text,
-            flags.limit,
-            flags.json,
-            &flags.root_override,
-            flags.temporal_sort,
-            flags.blast_radius.as_deref(),
-            analytics,
-        ),
+        SearchAction::Query(ref text) if !text.is_empty() => run_query(text, &flags, analytics),
         // Empty query with temporal flags → standalone temporal dispatch.
         SearchAction::Query(_) if flags.temporal_sort.is_some() || flags.blast_radius.is_some() => {
             run_temporal_standalone(
@@ -143,6 +135,51 @@ fn parse_limit_value(raw: &str) -> anyhow::Result<usize> {
     Ok(parsed)
 }
 
+/// Parse a temporal flag arm (`--hot`, `--cold`, `--risky`, `--blast-radius`).
+///
+/// Returns `Ok(true)` when the flag consumed an extra token (i.e. the space-
+/// separated `--blast-radius <path>` form), `Ok(false)` for single-token arms,
+/// and `Err` on validation failure.
+///
+/// The caller is responsible for advancing `i` by one additional position when
+/// this function returns `Ok(true)`.
+fn parse_temporal_flag(
+    arg: &str,
+    next_arg: Option<&String>,
+    temporal_sort: &mut Option<types::TemporalSort>,
+    blast_radius: &mut Option<String>,
+) -> anyhow::Result<bool> {
+    match arg {
+        "--hot" | "--cold" | "--risky" => {
+            let new_sort = match arg {
+                "--hot" => types::TemporalSort::Hot,
+                "--cold" => types::TemporalSort::Cold,
+                _ => types::TemporalSort::Risky,
+            };
+            if let Some(existing) = *temporal_sort {
+                anyhow::bail!(
+                    "{} and {} are mutually exclusive",
+                    new_sort.flag_name(),
+                    existing.flag_name()
+                );
+            }
+            *temporal_sort = Some(new_sort);
+            Ok(false)
+        }
+        "--blast-radius" => {
+            let val = next_arg
+                .ok_or_else(|| anyhow::anyhow!("--blast-radius requires a file path"))?;
+            *blast_radius = Some(val.clone());
+            Ok(true)
+        }
+        s if s.starts_with("--blast-radius=") => {
+            *blast_radius = Some(s.trim_start_matches("--blast-radius=").to_string());
+            Ok(false)
+        }
+        _ => unreachable!("parse_temporal_flag called with non-temporal arg: {arg}"),
+    }
+}
+
 /// Parse the flags from `args`.
 ///
 /// # Errors
@@ -185,28 +222,6 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                 })?;
                 root_override = Some(PathBuf::from(val));
             }
-            "--hot" | "--cold" | "--risky" => {
-                let new_sort = match args[i].as_str() {
-                    "--hot" => types::TemporalSort::Hot,
-                    "--cold" => types::TemporalSort::Cold,
-                    _ => types::TemporalSort::Risky,
-                };
-                if let Some(existing) = temporal_sort {
-                    anyhow::bail!(
-                        "{} and {} are mutually exclusive",
-                        new_sort.flag_name(),
-                        existing.flag_name()
-                    );
-                }
-                temporal_sort = Some(new_sort);
-            }
-            "--blast-radius" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--blast-radius requires a file path"))?;
-                blast_radius = Some(val.clone());
-            }
             s if s.starts_with("--limit=") => {
                 let raw = s.trim_start_matches("--limit=");
                 limit = parse_limit_value(raw)?;
@@ -214,8 +229,14 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
             s if s.starts_with("--root=") => {
                 root_override = Some(PathBuf::from(s.trim_start_matches("--root=")));
             }
-            s if s.starts_with("--blast-radius=") => {
-                blast_radius = Some(s.trim_start_matches("--blast-radius=").to_string());
+            s if matches!(s, "--hot" | "--cold" | "--risky" | "--blast-radius")
+                || s.starts_with("--blast-radius=") =>
+            {
+                let consumed_next =
+                    parse_temporal_flag(s, args.get(i + 1), &mut temporal_sort, &mut blast_radius)?;
+                if consumed_next {
+                    i += 1;
+                }
             }
             s if s.starts_with("--") => {
                 anyhow::bail!(
@@ -383,74 +404,88 @@ fn run_remove_hooks(root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode>
 // Query execution
 // ============================================================================
 
+/// Resolve blast-radius partner paths from the temporal database.
+///
+/// Normalizes the raw path, looks up co-change partners, and returns the full
+/// set of paths to restrict the search to (partners + the target file itself).
+///
+/// Returns `None` when no blast-radius was requested, or when the temporal DB
+/// is unavailable (emits a warning in that case).
+fn resolve_blast_radius_filter(
+    blast_radius: Option<&str>,
+    temporal_db: &Option<rskim_search::TemporalDb>,
+    root: &std::path::Path,
+) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
+    let raw_path = match blast_radius {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    let db = match temporal_db {
+        Some(db) => db,
+        None => {
+            eprintln!("skim search: no temporal data — run 'skim heatmap' to populate");
+            return Ok(None);
+        }
+    };
+
+    let normalized = temporal::normalize_blast_radius_path(raw_path, root)?;
+    let partners = db.cochanges_for_file(&normalized)?;
+    if partners.is_empty() {
+        eprintln!("skim search: no co-change data for {raw_path:?}");
+    }
+
+    // Include the target file itself so text queries like
+    // `skim search auth --blast-radius src/auth.rs` surface matches
+    // within src/auth.rs in addition to its co-change partners.
+    let mut paths = temporal::cochange_partner_paths(&partners, &normalized);
+    paths.insert(normalized);
+    Ok(Some(paths))
+}
+
 fn run_query(
     text: &str,
-    limit: usize,
-    json: bool,
-    root_override: &Option<PathBuf>,
-    temporal_sort: Option<types::TemporalSort>,
-    blast_radius: Option<&str>,
+    flags: &Flags,
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    let (root, cache_dir) = resolve_root_and_cache(root_override)?;
+    let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
     std::fs::create_dir_all(&cache_dir)?;
+
+    // Open the temporal DB once. Used for both blast-radius filtering (before
+    // the query, so LIMIT applies to the filtered set) and temporal enrichment
+    // (after the query, to annotate/sort results).
+    let temporal_db = if flags.temporal_sort.is_some() || flags.blast_radius.is_some() {
+        temporal::open_temporal_db(&cache_dir.join("temporal.db"))
+    } else {
+        None
+    };
 
     // Resolve blast-radius partner paths BEFORE querying so the file_filter
     // is applied inside the search engine (before LIMIT). This ensures the
     // limit applies to the filtered set rather than silently discarding
     // co-change partners that ranked beyond the top-N unfiltered results.
-    let mut blast_radius_paths: Option<std::collections::HashSet<String>> = None;
-    let temporal_db_path = cache_dir.join("temporal.db");
-    let temporal_db = if temporal_sort.is_some() || blast_radius.is_some() {
-        temporal::open_temporal_db(&temporal_db_path)
-    } else {
-        None
-    };
-
-    if let (Some(raw_path), Some(db)) = (blast_radius, &temporal_db) {
-        let normalized = temporal::normalize_blast_radius_path(raw_path, &root)?;
-        let partners = db.cochanges_for_file(&normalized)?;
-        if partners.is_empty() {
-            eprintln!("skim search: no co-change data for {raw_path:?}");
-        }
-        let mut paths: std::collections::HashSet<String> = partners
-            .iter()
-            .map(|p| {
-                if p.file_a == normalized {
-                    p.file_b.clone()
-                } else {
-                    p.file_a.clone()
-                }
-            })
-            .collect();
-        // Include the target file itself so text queries like
-        // `skim search auth --blast-radius src/auth.rs` surface matches
-        // within src/auth.rs in addition to its co-change partners.
-        paths.insert(normalized);
-        blast_radius_paths = Some(paths);
-    } else if temporal_db.is_none() && (temporal_sort.is_some() || blast_radius.is_some()) {
-        eprintln!("skim search: no temporal data — run 'skim heatmap' to populate");
-    }
+    let blast_radius_paths =
+        resolve_blast_radius_filter(flags.blast_radius.as_deref(), &temporal_db, &root)?;
 
     let config = types::QueryConfig {
         text: text.to_string(),
-        limit,
-        json,
-        root: root.clone(),
-        cache_dir: cache_dir.clone(),
+        limit: flags.limit,
+        json: flags.json,
+        root,
+        cache_dir,
         blast_radius_paths,
     };
 
     let mut output = query::execute_query(&config, analytics)?;
 
     // Apply temporal sort/annotation to the results.
-    if let (Some(sort), Some(db)) = (temporal_sort, &temporal_db) {
+    if let (Some(sort), Some(db)) = (flags.temporal_sort, &temporal_db) {
         temporal::apply_temporal_enrichment(&mut output.results, sort, db)?;
         output.total = output.results.len();
     }
 
     let mut stdout = BufWriter::new(std::io::stdout());
-    if json {
+    if flags.json {
         query::format_json_output(&output, &mut stdout)?;
     } else {
         query::format_text_output(&output, &mut stdout)?;
@@ -823,11 +858,7 @@ mod tests {
         // No temporal.db exists in the temp dir's cache — standalone path should
         // degrade gracefully with exit 0.
         let result = run(
-            &[
-                "--hot".to_string(),
-                "--root".to_string(),
-                root,
-            ],
+            &["--hot".to_string(), "--root".to_string(), root],
             &TEST_ANALYTICS,
         )
         .unwrap();

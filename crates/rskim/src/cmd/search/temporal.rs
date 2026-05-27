@@ -173,6 +173,20 @@ fn cochange_partner<'a>(row: &'a rskim_search::CochangeRow, target: &str) -> &'a
     }
 }
 
+/// Extract the set of partner paths from a slice of co-change rows.
+///
+/// Uses `cochange_partner` to resolve both `file_a`/`file_b` directions. The
+/// `target` file itself is NOT included — callers add it separately when needed.
+pub(super) fn cochange_partner_paths(
+    partners: &[rskim_search::CochangeRow],
+    target: &str,
+) -> std::collections::HashSet<String> {
+    partners
+        .iter()
+        .map(|p| cochange_partner(p, target).to_string())
+        .collect()
+}
+
 // ============================================================================
 // Standalone temporal query
 // ============================================================================
@@ -231,9 +245,7 @@ pub(super) fn query_standalone(
         Some(TemporalSort::Hot) | None => {
             Ok(TemporalQueryOutput::Hotspots(db.top_hotspots(limit)?))
         }
-        Some(TemporalSort::Cold) => {
-            Ok(TemporalQueryOutput::Coldspots(db.top_coldspots(limit)?))
-        }
+        Some(TemporalSort::Cold) => Ok(TemporalQueryOutput::Coldspots(db.top_coldspots(limit)?)),
         Some(TemporalSort::Risky) => Ok(TemporalQueryOutput::Risks(db.top_risks(limit)?)),
     }
 }
@@ -252,9 +264,9 @@ fn resort_partners_by_temporal(
     normalized: &str,
     db: &TemporalDb,
 ) -> anyhow::Result<()> {
-    match sort_mode {
+    let (scores, descending): (Vec<(usize, f64)>, bool) = match sort_mode {
         TemporalSort::Hot | TemporalSort::Cold => {
-            let mut scored: Vec<(usize, f64)> = partners
+            let scores = partners
                 .iter()
                 .enumerate()
                 .map(|(i, row)| {
@@ -266,20 +278,10 @@ fn resort_partners_by_temporal(
                     Ok((i, score))
                 })
                 .collect::<anyhow::Result<_>>()?;
-
-            if sort_mode == TemporalSort::Cold {
-                scored
-                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            } else {
-                scored
-                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            }
-            let reordered: Vec<_> =
-                scored.into_iter().map(|(i, _)| partners[i].clone()).collect();
-            *partners = reordered;
+            (scores, sort_mode == TemporalSort::Hot)
         }
         TemporalSort::Risky => {
-            let mut scored: Vec<(usize, f64)> = partners
+            let scores = partners
                 .iter()
                 .enumerate()
                 .map(|(i, row)| {
@@ -291,13 +293,21 @@ fn resort_partners_by_temporal(
                     Ok((i, score))
                 })
                 .collect::<anyhow::Result<_>>()?;
-
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let reordered: Vec<_> =
-                scored.into_iter().map(|(i, _)| partners[i].clone()).collect();
-            *partners = reordered;
+            (scores, true)
         }
+    };
+
+    let mut scored = scores;
+    if descending {
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    } else {
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     }
+    let reordered: Vec<_> = scored
+        .into_iter()
+        .map(|(i, _)| partners[i].clone())
+        .collect();
+    *partners = reordered;
     Ok(())
 }
 
@@ -311,22 +321,28 @@ pub(super) fn format_temporal_text(
     w: &mut impl Write,
 ) -> anyhow::Result<()> {
     match output {
-        TemporalQueryOutput::Hotspots(rows) | TemporalQueryOutput::Coldspots(rows) => {
-            let (empty_msg, header_msg) = match output {
-                TemporalQueryOutput::Hotspots(_) => (
-                    "No hotspot data available.",
-                    format!("Hotspots (top {}, 90-day decay):\n", rows.len()),
-                ),
-                _ => (
-                    "No coldspot data available.",
-                    format!("Coldspots (top {}, least active):\n", rows.len()),
-                ),
-            };
+        TemporalQueryOutput::Hotspots(rows) => {
             if rows.is_empty() {
-                writeln!(w, "{empty_msg}")?;
+                writeln!(w, "No hotspot data available.")?;
                 return Ok(());
             }
-            writeln!(w, "{header_msg}")?;
+            writeln!(w, "Hotspots (top {}, 90-day decay):\n", rows.len())?;
+            writeln!(w, "  Score  30d  90d  Path")?;
+            writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
+            for r in rows {
+                writeln!(
+                    w,
+                    "  {:.3}   {:>4} {:>4}  {}",
+                    r.score, r.changes_30d, r.changes_90d, r.file_path
+                )?;
+            }
+        }
+        TemporalQueryOutput::Coldspots(rows) => {
+            if rows.is_empty() {
+                writeln!(w, "No coldspot data available.")?;
+                return Ok(());
+            }
+            writeln!(w, "Coldspots (top {}, least active):\n", rows.len())?;
             writeln!(w, "  Score  30d  90d  Path")?;
             writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
             for r in rows {
@@ -389,9 +405,10 @@ pub(super) fn format_temporal_json(
 ) -> anyhow::Result<()> {
     let json = match output {
         TemporalQueryOutput::Hotspots(rows) | TemporalQueryOutput::Coldspots(rows) => {
-            let mode = match output {
-                TemporalQueryOutput::Hotspots(_) => "hot",
-                _ => "cold",
+            let mode = if matches!(output, TemporalQueryOutput::Hotspots(_)) {
+                "hot"
+            } else {
+                "cold"
             };
             let results: Vec<serde_json::Value> = rows
                 .iter()

@@ -112,7 +112,10 @@ fn normalize_nonexistent_absolute_path_gives_not_found_error() {
     let missing = root.join("src").join("ghost.rs");
 
     let result = normalize_blast_radius_path(missing.to_str().unwrap(), &root);
-    assert!(result.is_err(), "nonexistent absolute path should return error");
+    assert!(
+        result.is_err(),
+        "nonexistent absolute path should return error"
+    );
     let msg = result.unwrap_err().to_string();
     assert!(
         msg.contains("blast-radius file not found"),
@@ -409,7 +412,10 @@ fn standalone_hot_json_valid() {
     assert_eq!(v["mode"], "hot");
     assert!(v["results"].is_array());
     assert_eq!(v["total"], 1, "JSON output should use 'total', not 'limit'");
-    assert!(v["limit"].is_null(), "JSON output must not contain a 'limit' field");
+    assert!(
+        v["limit"].is_null(),
+        "JSON output must not contain a 'limit' field"
+    );
 }
 
 #[test]
@@ -824,7 +830,13 @@ fn staleness_warns_when_stored_head_differs_from_current() {
 
     // Configure git identity for the commit.
     let _ = std::process::Command::new("git")
-        .args(["-C", root.to_str().unwrap(), "config", "user.email", "test@test.com"])
+        .args([
+            "-C",
+            root.to_str().unwrap(),
+            "config",
+            "user.email",
+            "test@test.com",
+        ])
         .output();
     let _ = std::process::Command::new("git")
         .args(["-C", root.to_str().unwrap(), "config", "user.name", "Test"])
@@ -846,8 +858,11 @@ fn staleness_warns_when_stored_head_differs_from_current() {
     // Open a fresh temporal DB and store a deliberately wrong HEAD.
     let db_path = root.join("temporal.db");
     let db = TemporalDb::open(&db_path).unwrap();
-    db.set_meta(rskim_search::META_GIT_HEAD, "0000000000000000000000000000000000000000")
-        .unwrap();
+    db.set_meta(
+        rskim_search::META_GIT_HEAD,
+        "0000000000000000000000000000000000000000",
+    )
+    .unwrap();
 
     // The staleness check must detect the mismatch and return a warning.
     let warning = check_temporal_staleness(&db, &root);
@@ -997,12 +1012,18 @@ fn standalone_blast_radius_json_valid() {
     let v: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
 
     assert_eq!(v["mode"], "blast_radius", "mode must be 'blast_radius'");
-    assert_eq!(v["target"], "src/auth.rs", "target must match the input path");
+    assert_eq!(
+        v["target"], "src/auth.rs",
+        "target must match the input path"
+    );
     assert!(v["results"].is_array(), "results must be an array");
     assert_eq!(v["total"], 1, "total must match number of partners");
 
     let first = &v["results"][0];
-    assert_eq!(first["path"], "src/middleware.rs", "partner path must be correct");
+    assert_eq!(
+        first["path"], "src/middleware.rs",
+        "partner path must be correct"
+    );
     assert!(first["jaccard"].is_number(), "jaccard must be a number");
     assert!(first["count"].is_number(), "count must be a number");
 }
