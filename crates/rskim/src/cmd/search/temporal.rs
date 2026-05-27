@@ -144,23 +144,61 @@ pub(super) fn check_temporal_staleness(db: &TemporalDb, project_root: &Path) -> 
 
 /// Read the current git HEAD SHA from the project root.
 ///
-/// Spawns `git rev-parse HEAD` as a child process. This call assumes a local
-/// git repository where `rev-parse HEAD` completes near-instantly (typical
-/// sub-10ms on local disk). It is NOT safe to use on network-mounted repos or
-/// corrupted `.git` directories where the subprocess may hang indefinitely.
-/// Callers that need hang protection should wrap this in a timeout.
+/// Spawns `git rev-parse HEAD` with a 5-second timeout. Returns `None` on
+/// timeout, spawn failure, non-zero exit, or non-git directory.
+///
+/// The timeout prevents indefinite hangs on network-mounted repos or
+/// corrupted `.git` directories. The staleness check is advisory, so
+/// timing out is safe — the caller degrades gracefully.
 fn read_git_head(root: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    let child = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
         .arg("rev-parse")
         .arg("HEAD")
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
+
+    let child_id = child.id();
+    let (tx, rx) = mpsc::channel::<Option<String>>();
+
+    std::thread::spawn(move || {
+        let result = child.wait_with_output().ok().and_then(|out| {
+            if out.status.success() {
+                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                None
+            }
+        });
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(TIMEOUT) {
+        Ok(result) => result,
+        Err(_timeout) => {
+            // Kill the subprocess so it doesn't linger after we give up.
+            #[cfg(unix)]
+            {
+                // SAFETY: kill(2) is always safe to call with a valid pid.
+                unsafe {
+                    libc::kill(child_id as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &child_id.to_string()])
+                    .status();
+            }
+            None
+        }
     }
 }
 
@@ -283,30 +321,27 @@ fn resort_partners_by_temporal(
     // Compute scores eagerly into a parallel Vec — one entry per partner.
     // Scores are keyed by position so we can sort an index Vec without
     // touching `partners` until the final permutation step.
-    let scores: Vec<f64> = match sort_mode {
-        TemporalSort::Hot | TemporalSort::Cold => partners
-            .iter()
-            .map(|row| {
+    //
+    // The score-fetching logic is identical across arms except for the DB
+    // method called; extract a closure to avoid repeating the map structure.
+    let fetch_score: Box<dyn Fn(&rskim_search::CochangeRow) -> anyhow::Result<f64>> =
+        match sort_mode {
+            TemporalSort::Hot | TemporalSort::Cold => Box::new(|row| {
                 let partner = cochange_partner(row, normalized);
-                let score = db
-                    .hotspot_for_file(partner)?
-                    .map(|h| h.score)
-                    .unwrap_or(0.0);
-                Ok(score)
-            })
-            .collect::<anyhow::Result<_>>()?,
-        TemporalSort::Risky => partners
-            .iter()
-            .map(|row| {
+                Ok(db.hotspot_for_file(partner)?.map(|h| h.score).unwrap_or(0.0))
+            }),
+            TemporalSort::Risky => Box::new(|row| {
                 let partner = cochange_partner(row, normalized);
-                let score = db
+                Ok(db
                     .risk_for_file(partner)?
                     .map(|r| r.risk_score)
-                    .unwrap_or(0.0);
-                Ok(score)
-            })
-            .collect::<anyhow::Result<_>>()?,
-    };
+                    .unwrap_or(0.0))
+            }),
+        };
+    let scores: Vec<f64> = partners
+        .iter()
+        .map(fetch_score.as_ref())
+        .collect::<anyhow::Result<_>>()?;
 
     // Sort an index Vec by score, then apply the permutation to `partners`.
     let mut indices: Vec<usize> = (0..partners.len()).collect();
@@ -342,20 +377,21 @@ pub(super) fn format_temporal_text(
     match output {
         TemporalQueryOutput::Hotspots(rows) | TemporalQueryOutput::Coldspots(rows) => {
             let is_hot = matches!(output, TemporalQueryOutput::Hotspots(_));
+            let empty_msg = if is_hot {
+                "No hotspot data available."
+            } else {
+                "No coldspot data available."
+            };
+            let header_msg = if is_hot {
+                format!("Hotspots (top {}, 90-day decay):\n", rows.len())
+            } else {
+                format!("Coldspots (top {}, least active):\n", rows.len())
+            };
             if rows.is_empty() {
-                let empty_msg = if is_hot {
-                    "No hotspot data available."
-                } else {
-                    "No coldspot data available."
-                };
                 writeln!(w, "{empty_msg}")?;
                 return Ok(());
             }
-            if is_hot {
-                writeln!(w, "Hotspots (top {}, 90-day decay):\n", rows.len())?;
-            } else {
-                writeln!(w, "Coldspots (top {}, least active):\n", rows.len())?;
-            }
+            write!(w, "{header_msg}")?;
             writeln!(w, "  Score  30d  90d  Path")?;
             writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
             for r in rows {
