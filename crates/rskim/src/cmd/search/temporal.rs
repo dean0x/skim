@@ -80,7 +80,14 @@ pub(super) fn normalize_blast_radius_path(
     };
 
     // Canonicalize — resolves `..` and symlinks.
-    let canonical = abs.canonicalize().unwrap_or_else(|_| abs.clone());
+    // Fallback to the raw path if canonicalize fails (e.g. race: file deleted
+    // between the existence check above and this call).
+    let canonical = abs.canonicalize().unwrap_or_else(|e| {
+        if crate::debug::is_debug_enabled() {
+            eprintln!("skim search: canonicalize failed for {:?}: {e} — using raw path", abs);
+        }
+        abs.clone()
+    });
 
     // Canonicalize the project root too for fair comparison.
     let canonical_root = project_root
@@ -640,6 +647,10 @@ pub(super) fn apply_temporal_enrichment(
 
 /// Annotate results with hotspot data using per-file lookups.
 ///
+/// Performs one DB query per result (O(N)). The default `--limit` of 20 keeps
+/// this negligible. At `--limit 1000` this becomes 1000 queries — acceptable
+/// for an interactive CLI but not for batch workloads.
+///
 /// On lookup failure, emits a warning and leaves that result unannotated.
 fn annotate_hotspots(results: &mut [ResolvedResult], db: &TemporalDb) {
     for result in results.iter_mut() {
@@ -661,6 +672,9 @@ fn annotate_hotspots(results: &mut [ResolvedResult], db: &TemporalDb) {
 }
 
 /// Annotate results with risk data using per-file lookups.
+///
+/// Performs one DB query per result (O(N)). See [`annotate_hotspots`] for the
+/// complexity note.
 ///
 /// On lookup failure, emits a warning and leaves that result unannotated.
 fn annotate_risks(results: &mut [ResolvedResult], db: &TemporalDb) {

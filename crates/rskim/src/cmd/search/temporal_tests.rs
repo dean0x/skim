@@ -168,6 +168,59 @@ fn staleness_returns_none_when_current() {
 }
 
 // ============================================================================
+// cochange_partner_paths — direct unit tests
+// ============================================================================
+
+/// When `target` matches `file_a`, the partner set contains `file_b`.
+#[test]
+fn cochange_partner_paths_target_is_file_a() {
+    use rskim_search::CochangeRow;
+    let rows = vec![CochangeRow {
+        file_a: "src/auth.rs".to_string(),
+        file_b: "src/middleware.rs".to_string(),
+        count: 5,
+        jaccard: 0.75,
+    }];
+    let partners = super::cochange_partner_paths(&rows, "src/auth.rs");
+    assert!(
+        partners.contains("src/middleware.rs"),
+        "partner must be file_b when target is file_a"
+    );
+    assert!(
+        !partners.contains("src/auth.rs"),
+        "target itself must not appear in partner set"
+    );
+}
+
+/// When `target` matches `file_b`, the partner set contains `file_a`.
+#[test]
+fn cochange_partner_paths_target_is_file_b() {
+    use rskim_search::CochangeRow;
+    let rows = vec![CochangeRow {
+        file_a: "src/auth.rs".to_string(),
+        file_b: "src/middleware.rs".to_string(),
+        count: 5,
+        jaccard: 0.75,
+    }];
+    let partners = super::cochange_partner_paths(&rows, "src/middleware.rs");
+    assert!(
+        partners.contains("src/auth.rs"),
+        "partner must be file_a when target is file_b"
+    );
+    assert!(
+        !partners.contains("src/middleware.rs"),
+        "target itself must not appear in partner set"
+    );
+}
+
+/// Empty input produces an empty partner set.
+#[test]
+fn cochange_partner_paths_empty_input() {
+    let partners = super::cochange_partner_paths(&[], "src/anything.rs");
+    assert!(partners.is_empty(), "empty input must produce empty partner set");
+}
+
+// ============================================================================
 // Step 9: Standalone temporal dispatch
 // ============================================================================
 
