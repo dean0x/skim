@@ -143,6 +143,12 @@ pub(super) fn check_temporal_staleness(db: &TemporalDb, project_root: &Path) -> 
 }
 
 /// Read the current git HEAD SHA from the project root.
+///
+/// Spawns `git rev-parse HEAD` as a child process. This call assumes a local
+/// git repository where `rev-parse HEAD` completes near-instantly (typical
+/// sub-10ms on local disk). It is NOT safe to use on network-mounted repos or
+/// corrupted `.git` directories where the subprocess may hang indefinitely.
+/// Callers that need hang protection should wrap this in a timeout.
 fn read_git_head(root: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .arg("-C")

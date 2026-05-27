@@ -824,7 +824,7 @@ fn staleness_warns_when_stored_head_differs_from_current() {
         .arg("init")
         .output();
     if init.map(|o| !o.status.success()).unwrap_or(true) {
-        // git not available or init failed — skip.
+        eprintln!("SKIP staleness_warns_when_stored_head_differs_from_current: git init failed or git not available");
         return;
     }
 
@@ -851,7 +851,7 @@ fn staleness_warns_when_stored_head_differs_from_current() {
         .args(["-C", root.to_str().unwrap(), "commit", "-m", "init"])
         .output();
     if commit_result.map(|o| !o.status.success()).unwrap_or(true) {
-        // Commit failed (CI environment) — skip gracefully.
+        eprintln!("SKIP staleness_warns_when_stored_head_differs_from_current: git commit failed (CI environment without git identity?)");
         return;
     }
 
@@ -1026,4 +1026,104 @@ fn standalone_blast_radius_json_valid() {
     );
     assert!(first["jaccard"].is_number(), "jaccard must be a number");
     assert!(first["count"].is_number(), "count must be a number");
+}
+
+// ============================================================================
+// Issue temporal_tests:cold_json — format_temporal_json cold path
+// ============================================================================
+
+#[test]
+fn standalone_cold_json_valid() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let (_db_dir, db) = temp_db();
+
+    db.store_hotspots(&[HotspotRow {
+        file_path: "src/cold.rs".to_string(),
+        score: 0.03,
+        changes_30d: 0,
+        changes_90d: 1,
+    }])
+    .unwrap();
+
+    let output = query_standalone(Some(TemporalSort::Cold), None, 10, &db, &root).unwrap();
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_json(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
+
+    assert_eq!(v["mode"], "cold", "mode discriminant must be 'cold'");
+    assert!(v["results"].is_array(), "results must be an array");
+    assert_eq!(v["total"], 1, "total must match number of rows");
+    assert!(
+        v["limit"].is_null(),
+        "JSON output must not contain a 'limit' field"
+    );
+}
+
+// ============================================================================
+// Issue temporal_tests:empty_hotspot — format_temporal_text hot empty branch
+// ============================================================================
+
+#[test]
+fn standalone_hot_empty_db_text_format() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let (_db_dir, db) = temp_db();
+
+    // Empty hotspots table — no store_hotspots call.
+    let output = query_standalone(Some(TemporalSort::Hot), None, 10, &db, &root).unwrap();
+    match &output {
+        TemporalQueryOutput::Hotspots(rows) => assert!(rows.is_empty()),
+        other => panic!("expected Hotspots, got {other:?}"),
+    }
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_text(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+    assert!(
+        s.contains("No hotspot data available"),
+        "empty hot table must print no-data message, got: {s:?}"
+    );
+    // Must NOT print the column headers when there is no data.
+    assert!(
+        !s.contains("Score"),
+        "column headers must not appear for empty hot output, got: {s:?}"
+    );
+}
+
+// ============================================================================
+// Issue temporal_tests:empty_cochange — format_temporal_text Cochanges empty branch
+// ============================================================================
+
+#[test]
+fn standalone_blast_radius_empty_db_text_format() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+
+    // Create the target file so path normalization succeeds.
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/auth.rs"), "").unwrap();
+
+    let (_db_dir, db) = temp_db();
+    // No store_cochanges call — empty co-change table.
+
+    let output = query_standalone(None, Some("src/auth.rs"), 10, &db, &root).unwrap();
+    match &output {
+        TemporalQueryOutput::Cochanges { partners, .. } => assert!(partners.is_empty()),
+        other => panic!("expected Cochanges, got {other:?}"),
+    }
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_text(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+    assert!(
+        s.contains("No co-change data"),
+        "empty co-change result must print no-data message, got: {s:?}"
+    );
+    // Must NOT print the column headers when there is no data.
+    assert!(
+        !s.contains("Jaccard"),
+        "column headers must not appear for empty co-change output, got: {s:?}"
+    );
 }
