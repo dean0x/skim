@@ -477,10 +477,10 @@ fn run_query(
     };
 
     // Warn when temporal data is stale (same check as run_temporal_standalone).
-    if let Some(ref db) = temporal_db {
-        if let Some(warning) = temporal::check_temporal_staleness(db, &root) {
-            eprintln!("{warning}");
-        }
+    if let Some(ref db) = temporal_db
+        && let Some(warning) = temporal::check_temporal_staleness(db, &root)
+    {
+        eprintln!("{warning}");
     }
 
     // Resolve blast-radius partner paths BEFORE querying so the file_filter
@@ -518,9 +518,6 @@ fn run_query(
 }
 
 /// Typed JSON envelope for a warning-only response (no temporal data available).
-///
-/// Uses `#[derive(Serialize)]` to stay consistent with the typed-struct pattern
-/// throughout this module rather than hand-formatting JSON strings.
 #[derive(Serialize)]
 struct WarningJson<'a> {
     warning: &'a str,

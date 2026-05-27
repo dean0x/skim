@@ -328,26 +328,19 @@ fn resort_partners_by_temporal(
     // Compute scores eagerly into a parallel Vec — one entry per partner.
     // Scores are keyed by position so we can sort an index Vec without
     // touching `partners` until the final permutation step.
-    //
-    // The score-fetching logic is identical across arms except for the DB
-    // method called; extract a closure to avoid repeating the map structure.
-    let fetch_score: Box<dyn Fn(&rskim_search::CochangeRow) -> anyhow::Result<f64>> =
-        match sort_mode {
-            TemporalSort::Hot | TemporalSort::Cold => Box::new(|row| {
-                let partner = cochange_partner(row, normalized);
-                Ok(db.hotspot_for_file(partner)?.map(|h| h.score).unwrap_or(0.0))
-            }),
-            TemporalSort::Risky => Box::new(|row| {
-                let partner = cochange_partner(row, normalized);
-                Ok(db
-                    .risk_for_file(partner)?
-                    .map(|r| r.risk_score)
-                    .unwrap_or(0.0))
-            }),
-        };
     let scores: Vec<f64> = partners
         .iter()
-        .map(fetch_score.as_ref())
+        .map(|row| -> anyhow::Result<f64> {
+            let partner = cochange_partner(row, normalized);
+            match sort_mode {
+                TemporalSort::Hot | TemporalSort::Cold => {
+                    Ok(db.hotspot_for_file(partner)?.map(|h| h.score).unwrap_or(0.0))
+                }
+                TemporalSort::Risky => {
+                    Ok(db.risk_for_file(partner)?.map(|r| r.risk_score).unwrap_or(0.0))
+                }
+            }
+        })
         .collect::<anyhow::Result<_>>()?;
 
     // Sort an index Vec by score, then apply the permutation to `partners`.
@@ -367,8 +360,7 @@ fn resort_partners_by_temporal(
     }
 
     // Apply permutation: collect in sorted order, then replace `partners`.
-    let temp: Vec<_> = indices.into_iter().map(|i| partners[i].clone()).collect();
-    *partners = temp;
+    *partners = indices.into_iter().map(|i| partners[i].clone()).collect();
     Ok(())
 }
 
@@ -624,19 +616,12 @@ pub(super) fn apply_temporal_enrichment(
         }
         TemporalSort::Risky => {
             annotate_risks(results, db);
+            let risk_score = |r: &ResolvedResult| {
+                r.temporal.as_ref().and_then(|t| t.risk_score).unwrap_or(-1.0)
+            };
             results.sort_by(|a, b| {
-                let risk_a = a
-                    .temporal
-                    .as_ref()
-                    .and_then(|t| t.risk_score)
-                    .unwrap_or(-1.0);
-                let risk_b = b
-                    .temporal
-                    .as_ref()
-                    .and_then(|t| t.risk_score)
-                    .unwrap_or(-1.0);
-                risk_b
-                    .partial_cmp(&risk_a)
+                risk_score(b)
+                    .partial_cmp(&risk_score(a))
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.path.cmp(&b.path))
             });

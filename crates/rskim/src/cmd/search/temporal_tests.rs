@@ -1,6 +1,7 @@
 //! Tests for the temporal search helpers.
 
 use std::io::BufWriter;
+use std::process::ExitCode;
 
 use rskim_search::{CochangeRow, HotspotRow, META_GIT_HEAD, RiskRow, TemporalDb};
 use tempfile::TempDir;
@@ -10,6 +11,12 @@ use super::{
     format_temporal_text, normalize_blast_radius_path, open_temporal_db, query_standalone,
 };
 use crate::cmd::search::types::{ResolvedResult, TemporalSort};
+
+const TEST_ANALYTICS: crate::analytics::AnalyticsConfig = crate::analytics::AnalyticsConfig {
+    enabled: false,
+    input_cost_per_mtok: None,
+    session_id: None,
+};
 
 // ============================================================================
 // Helpers
@@ -174,7 +181,6 @@ fn staleness_returns_none_when_current() {
 /// When `target` matches `file_a`, the partner set contains `file_b`.
 #[test]
 fn cochange_partner_paths_target_is_file_a() {
-    use rskim_search::CochangeRow;
     let rows = vec![CochangeRow {
         file_a: "src/auth.rs".to_string(),
         file_b: "src/middleware.rs".to_string(),
@@ -195,7 +201,6 @@ fn cochange_partner_paths_target_is_file_a() {
 /// When `target` matches `file_b`, the partner set contains `file_a`.
 #[test]
 fn cochange_partner_paths_target_is_file_b() {
-    use rskim_search::CochangeRow;
     let rows = vec![CochangeRow {
         file_a: "src/auth.rs".to_string(),
         file_b: "src/middleware.rs".to_string(),
@@ -789,12 +794,6 @@ fn parse_standalone_blast_radius() {
 
 #[test]
 fn parse_help_includes_temporal_flags() {
-    use std::process::ExitCode;
-    const TEST_ANALYTICS: crate::analytics::AnalyticsConfig = crate::analytics::AnalyticsConfig {
-        enabled: false,
-        input_cost_per_mtok: None,
-        session_id: None,
-    };
     // Verify it runs without error.
     let result = super::super::run(&["--help".to_string()], &TEST_ANALYTICS).unwrap();
     assert_eq!(result, ExitCode::SUCCESS);
