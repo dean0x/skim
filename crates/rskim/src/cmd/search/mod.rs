@@ -27,6 +27,8 @@ use std::io::{BufWriter, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use serde::Serialize;
+
 // ============================================================================
 // Public entry point
 // ============================================================================
@@ -173,7 +175,11 @@ fn parse_temporal_flag(
             Ok(true)
         }
         s if s.starts_with("--blast-radius=") => {
-            *blast_radius = Some(s.trim_start_matches("--blast-radius=").to_string());
+            let val = s.trim_start_matches("--blast-radius=");
+            if val.is_empty() {
+                anyhow::bail!("--blast-radius requires a file path");
+            }
+            *blast_radius = Some(val.to_string());
             Ok(false)
         }
         _ => unreachable!("parse_temporal_flag called with non-temporal arg: {arg}"),
@@ -460,6 +466,13 @@ fn run_query(
         None
     };
 
+    // Warn when temporal data is stale (same check as run_temporal_standalone).
+    if let Some(ref db) = temporal_db {
+        if let Some(warning) = temporal::check_temporal_staleness(db, &root) {
+            eprintln!("{warning}");
+        }
+    }
+
     // Resolve blast-radius partner paths BEFORE querying so the file_filter
     // is applied inside the search engine (before LIMIT). This ensures the
     // limit applies to the filtered set rather than silently discarding
@@ -481,7 +494,6 @@ fn run_query(
     // Apply temporal sort/annotation to the results.
     if let (Some(sort), Some(db)) = (flags.temporal_sort, &temporal_db) {
         temporal::apply_temporal_enrichment(&mut output.results, sort, db)?;
-        output.total = output.results.len();
     }
 
     let mut stdout = BufWriter::new(std::io::stdout());
@@ -493,6 +505,15 @@ fn run_query(
     stdout.flush()?;
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Typed JSON envelope for a warning-only response (no temporal data available).
+///
+/// Uses `#[derive(Serialize)]` to stay consistent with the typed-struct pattern
+/// throughout this module rather than hand-formatting JSON strings.
+#[derive(Serialize)]
+struct WarningJson<'a> {
+    warning: &'a str,
 }
 
 fn run_temporal_standalone(
@@ -507,7 +528,10 @@ fn run_temporal_standalone(
 
     let Some(db) = temporal::open_temporal_db(&temporal_db_path) else {
         if json {
-            println!("{{\"warning\": \"no temporal data — run 'skim heatmap' to populate\"}}");
+            let msg = WarningJson {
+                warning: "no temporal data — run 'skim heatmap' to populate",
+            };
+            println!("{}", serde_json::to_string(&msg)?);
         } else {
             eprintln!("skim search: no temporal data — run 'skim heatmap' to populate");
         }
