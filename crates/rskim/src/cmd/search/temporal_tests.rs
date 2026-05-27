@@ -2,7 +2,7 @@
 
 use std::io::BufWriter;
 
-use rskim_search::{CochangeRow, HotspotRow, RiskRow, TemporalDb};
+use rskim_search::{CochangeRow, HotspotRow, META_GIT_HEAD, RiskRow, TemporalDb};
 use tempfile::TempDir;
 
 use super::{
@@ -52,7 +52,8 @@ fn normalize_relative_path() {
     std::fs::write(&file, "").unwrap();
 
     // Normalize from the root.
-    std::env::set_current_dir(&root).unwrap();
+    // Note: no set_current_dir here — root-relative resolution takes priority
+    // over CWD fallback, so this test is not sensitive to the process CWD.
     let result = normalize_blast_radius_path("src/auth.rs", &root).unwrap();
     assert_eq!(result, "src/auth.rs");
 }
@@ -128,7 +129,7 @@ fn normalize_dot_slash_stripped() {
     let file = sub.join("mod.rs");
     std::fs::write(&file, "").unwrap();
 
-    std::env::set_current_dir(&root).unwrap();
+    // No set_current_dir — root-relative resolution does not require CWD mutation.
     let result = normalize_blast_radius_path("lib/mod.rs", &root).unwrap();
     // Should not start with "./"
     assert!(
@@ -738,4 +739,270 @@ fn parse_help_includes_temporal_flags() {
     // Verify it runs without error.
     let result = super::super::run(&["--help".to_string()], &TEST_ANALYTICS).unwrap();
     assert_eq!(result, ExitCode::SUCCESS);
+}
+
+// ============================================================================
+// Issue: standalone --cold and --risky on empty tables (format_temporal_text
+// empty-table branches) — previously untested.
+// ============================================================================
+
+#[test]
+fn standalone_cold_empty_db_text_format() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let (_db_dir, db) = temp_db();
+
+    // Empty hotspots table — no store_hotspots call.
+    let output = query_standalone(Some(TemporalSort::Cold), None, 10, &db, &root).unwrap();
+    match &output {
+        TemporalQueryOutput::Coldspots(rows) => assert!(rows.is_empty()),
+        other => panic!("expected Coldspots, got {other:?}"),
+    }
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_text(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+    assert!(
+        s.contains("No coldspot data available"),
+        "empty cold table must print no-data message, got: {s:?}"
+    );
+    // Must NOT print the column headers when there is no data.
+    assert!(
+        !s.contains("Score"),
+        "column headers must not appear for empty cold output, got: {s:?}"
+    );
+}
+
+#[test]
+fn standalone_risky_empty_db_text_format() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let (_db_dir, db) = temp_db();
+
+    // Empty risks table — no store_risks call.
+    let output = query_standalone(Some(TemporalSort::Risky), None, 10, &db, &root).unwrap();
+    match &output {
+        TemporalQueryOutput::Risks(rows) => assert!(rows.is_empty()),
+        other => panic!("expected Risks, got {other:?}"),
+    }
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_text(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+    assert!(
+        s.contains("No risk data available"),
+        "empty risk table must print no-data message, got: {s:?}"
+    );
+    // Must NOT print the column headers when there is no data.
+    assert!(
+        !s.contains("Risk"),
+        "column headers must not appear for empty risk output, got: {s:?}"
+    );
+}
+
+// ============================================================================
+// Issue: check_temporal_staleness stale-HEAD path — previously untested.
+// The stored HEAD differs from the current repo HEAD.
+// ============================================================================
+
+#[test]
+fn staleness_warns_when_stored_head_differs_from_current() {
+    // Set up a minimal git repo so git rev-parse HEAD returns a real value.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+
+    // Init git repo.
+    let init = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .arg("init")
+        .output();
+    if init.map(|o| !o.status.success()).unwrap_or(true) {
+        // git not available or init failed — skip.
+        return;
+    }
+
+    // Configure git identity for the commit.
+    let _ = std::process::Command::new("git")
+        .args(["-C", root.to_str().unwrap(), "config", "user.email", "test@test.com"])
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["-C", root.to_str().unwrap(), "config", "user.name", "Test"])
+        .output();
+
+    // Create an initial commit so HEAD is a real SHA.
+    std::fs::write(root.join("README.md"), "test").unwrap();
+    let _ = std::process::Command::new("git")
+        .args(["-C", root.to_str().unwrap(), "add", "."])
+        .output();
+    let commit_result = std::process::Command::new("git")
+        .args(["-C", root.to_str().unwrap(), "commit", "-m", "init"])
+        .output();
+    if commit_result.map(|o| !o.status.success()).unwrap_or(true) {
+        // Commit failed (CI environment) — skip gracefully.
+        return;
+    }
+
+    // Open a fresh temporal DB and store a deliberately wrong HEAD.
+    let db_path = root.join("temporal.db");
+    let db = TemporalDb::open(&db_path).unwrap();
+    db.set_meta(rskim_search::META_GIT_HEAD, "0000000000000000000000000000000000000000")
+        .unwrap();
+
+    // The staleness check must detect the mismatch and return a warning.
+    let warning = check_temporal_staleness(&db, &root);
+    assert!(
+        warning.is_some(),
+        "staleness check must return Some(warning) when stored HEAD differs from current HEAD"
+    );
+    let msg = warning.unwrap();
+    assert!(
+        msg.contains("stale"),
+        "warning message must contain 'stale', got: {msg:?}"
+    );
+    assert!(
+        msg.contains("0000000"),
+        "warning must include stored HEAD prefix, got: {msg:?}"
+    );
+}
+
+// ============================================================================
+// Issue: temporal_annotation_tag "both hotspot+risk" case — previously untested.
+// ============================================================================
+
+/// format_text_output renders both hotspot and risk tags when both annotations
+/// are present. This exercises the "both" branch of temporal_annotation_tag.
+#[test]
+fn format_text_output_includes_both_hotspot_and_risk_tags() {
+    use crate::cmd::search::types::{QueryOutput, ResolvedResult, TemporalAnnotation};
+
+    let result = ResolvedResult {
+        path: "src/both.rs".to_string(),
+        score: 8.0,
+        field: "function_signature".to_string(),
+        line_number: None,
+        line_range: None,
+        snippet: None,
+        stale: false,
+        match_positions: vec![],
+        temporal: Some(TemporalAnnotation {
+            hotspot_score: Some(0.95),
+            risk_score: Some(0.80),
+            ..Default::default()
+        }),
+    };
+
+    let output = QueryOutput {
+        query: "both".to_string(),
+        total: 1,
+        results: vec![result],
+        duration_ms: 1,
+        index_stats: None,
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    super::super::query::format_text_output(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    assert!(
+        s.contains("hotspot:"),
+        "output must contain 'hotspot:' tag when hotspot annotation present, got: {s:?}"
+    );
+    assert!(
+        s.contains("0.950"),
+        "hotspot score must be formatted to 3dp, got: {s:?}"
+    );
+    assert!(
+        s.contains("risk:"),
+        "output must contain 'risk:' tag when risk annotation present, got: {s:?}"
+    );
+    assert!(
+        s.contains("0.800"),
+        "risk score must be formatted to 3dp, got: {s:?}"
+    );
+}
+
+// ============================================================================
+// Issue: format_temporal_json for Risks and Cochanges variants — previously
+// untested. Only Hotspots JSON shape was validated.
+// ============================================================================
+
+#[test]
+fn standalone_risky_json_valid() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let (_db_dir, db) = temp_db();
+
+    db.store_risks(&[RiskRow {
+        file_path: "src/buggy.rs".to_string(),
+        risk_score: 0.85,
+        total_commits: 20,
+        fix_commits: 10,
+        fix_density: 0.5,
+    }])
+    .unwrap();
+
+    let output = query_standalone(Some(TemporalSort::Risky), None, 10, &db, &root).unwrap();
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_json(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
+
+    assert_eq!(v["mode"], "risky", "mode must be 'risky'");
+    assert!(v["results"].is_array(), "results must be an array");
+    assert_eq!(v["total"], 1, "total must match number of rows");
+
+    let first = &v["results"][0];
+    assert_eq!(first["path"], "src/buggy.rs");
+    assert!(
+        first["risk_score"].is_number(),
+        "risk_score must be a number"
+    );
+    assert!(
+        first["fix_density"].is_number(),
+        "fix_density must be a number"
+    );
+    assert!(
+        first["fix_commits"].is_number(),
+        "fix_commits must be a number"
+    );
+    assert!(
+        first["total_commits"].is_number(),
+        "total_commits must be a number"
+    );
+}
+
+#[test]
+fn standalone_blast_radius_json_valid() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+
+    // Create the target file so path normalization succeeds.
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/auth.rs"), "").unwrap();
+
+    let (_db_dir, db) = temp_db();
+    db.store_cochanges(&[rskim_search::CochangeRow {
+        file_a: "src/auth.rs".to_string(),
+        file_b: "src/middleware.rs".to_string(),
+        count: 7,
+        jaccard: 0.65,
+    }])
+    .unwrap();
+
+    let output = query_standalone(None, Some("src/auth.rs"), 10, &db, &root).unwrap();
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_json(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
+
+    assert_eq!(v["mode"], "blast_radius", "mode must be 'blast_radius'");
+    assert_eq!(v["target"], "src/auth.rs", "target must match the input path");
+    assert!(v["results"].is_array(), "results must be an array");
+    assert_eq!(v["total"], 1, "total must match number of partners");
+
+    let first = &v["results"][0];
+    assert_eq!(first["path"], "src/middleware.rs", "partner path must be correct");
+    assert!(first["jaccard"].is_number(), "jaccard must be a number");
+    assert!(first["count"].is_number(), "count must be a number");
 }
