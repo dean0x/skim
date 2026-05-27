@@ -281,8 +281,8 @@ fn resort_partners_by_temporal(
     db: &TemporalDb,
 ) -> anyhow::Result<()> {
     // Compute scores eagerly into a parallel Vec — one entry per partner.
-    // This avoids the clone-and-permute pattern; we sort the score Vec
-    // then apply a single allocation-free permutation via swap-based sort.
+    // Scores are keyed by position so we can sort an index Vec without
+    // touching `partners` until the final permutation step.
     let scores: Vec<f64> = match sort_mode {
         TemporalSort::Hot | TemporalSort::Cold => partners
             .iter()
@@ -308,31 +308,24 @@ fn resort_partners_by_temporal(
             .collect::<anyhow::Result<_>>()?,
     };
 
-    // Build an index Vec and sort it by score, then permute `partners` in place.
+    // Sort an index Vec by score, then apply the permutation to `partners`.
     let mut indices: Vec<usize> = (0..partners.len()).collect();
-    let descending = sort_mode != TemporalSort::Cold;
-    if descending {
-        indices.sort_by(|&a, &b| {
-            scores[b]
-                .partial_cmp(&scores[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    } else {
+    if sort_mode == TemporalSort::Cold {
         indices.sort_by(|&a, &b| {
             scores[a]
                 .partial_cmp(&scores[b])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+    } else {
+        indices.sort_by(|&a, &b| {
+            scores[b]
+                .partial_cmp(&scores[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
-    // Apply permutation using a single auxiliary Vec — one allocation instead
-    // of one clone per element.
-    let mut temp = Vec::with_capacity(partners.len());
-    for i in indices {
-        // Safety: `indices` is a permutation of 0..partners.len(), so each
-        // index is valid. We drain into `temp` via swap to avoid clone.
-        temp.push(partners[i].clone());
-    }
+    // Apply permutation: collect in sorted order, then replace `partners`.
+    let temp: Vec<_> = indices.into_iter().map(|i| partners[i].clone()).collect();
     *partners = temp;
     Ok(())
 }
@@ -348,16 +341,21 @@ pub(super) fn format_temporal_text(
 ) -> anyhow::Result<()> {
     match output {
         TemporalQueryOutput::Hotspots(rows) | TemporalQueryOutput::Coldspots(rows) => {
-            let (empty_msg, header) = if matches!(output, TemporalQueryOutput::Hotspots(_)) {
-                ("No hotspot data available.", format!("Hotspots (top {}, 90-day decay):\n", rows.len()))
-            } else {
-                ("No coldspot data available.", format!("Coldspots (top {}, least active):\n", rows.len()))
-            };
+            let is_hot = matches!(output, TemporalQueryOutput::Hotspots(_));
             if rows.is_empty() {
+                let empty_msg = if is_hot {
+                    "No hotspot data available."
+                } else {
+                    "No coldspot data available."
+                };
                 writeln!(w, "{empty_msg}")?;
                 return Ok(());
             }
-            writeln!(w, "{header}")?;
+            if is_hot {
+                writeln!(w, "Hotspots (top {}, 90-day decay):\n", rows.len())?;
+            } else {
+                writeln!(w, "Coldspots (top {}, least active):\n", rows.len())?;
+            }
             writeln!(w, "  Score  30d  90d  Path")?;
             writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
             for r in rows {

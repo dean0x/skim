@@ -359,10 +359,10 @@ impl SearchLayer for NgramIndexReader {
                 if p.doc_id >= self.header.file_count {
                     continue; // out-of-range doc_ids are never valid
                 }
-                if let Some(ref filter) = query.file_filter {
-                    if !filter.contains(&FileId(p.doc_id)) {
-                        continue; // not in the blast-radius allowlist — skip early
-                    }
+                if let Some(ref filter) = query.file_filter
+                    && !filter.contains(&FileId(p.doc_id))
+                {
+                    continue; // not in the blast-radius allowlist — skip early
                 }
                 let field_idx = p.field_id as usize;
                 if field_idx < FIELD_COUNT {
