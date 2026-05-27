@@ -348,12 +348,21 @@ impl SearchLayer for NgramIndexReader {
             let idf = f64::from(idf_for_key(ngram.key()));
 
             // First sub-pass: accumulate per-field TF counts and candidate positions,
-            // skipping doc_ids that are out of range (never valid).
+            // skipping doc_ids that are out of range (never valid) or outside the
+            // file_filter allowlist.  Checking file_filter here avoids accumulating
+            // TF and positions for documents that will be discarded anyway — critical
+            // for blast-radius queries where the allowlist is a tiny fraction of the
+            // full index.
             tf_per_doc.clear();
             pos_per_doc.clear();
             for p in &postings {
                 if p.doc_id >= self.header.file_count {
                     continue; // out-of-range doc_ids are never valid
+                }
+                if let Some(ref filter) = query.file_filter {
+                    if !filter.contains(&FileId(p.doc_id)) {
+                        continue; // not in the blast-radius allowlist — skip early
+                    }
                 }
                 let field_idx = p.field_id as usize;
                 if field_idx < FIELD_COUNT {

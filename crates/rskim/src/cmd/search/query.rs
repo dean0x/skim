@@ -64,12 +64,15 @@ pub(super) fn execute_query(
     let mut sq = SearchQuery::new(config.text.clone());
     sq.limit = Some(config.limit);
 
+    // Hoist sorted_paths() so it is computed once and reused for both the
+    // file_filter construction and the path-resolution step below.
+    let sorted = manifest.sorted_paths();
+
     // When blast-radius paths are provided, convert them to FileId allowlist
     // so the search engine filters BEFORE applying the limit. This ensures
     // the limit applies to the filtered set rather than discarding matches
     // that fall outside the top-N unfiltered results.
     if let Some(ref allowed_paths) = config.blast_radius_paths {
-        let sorted = manifest.sorted_paths();
         let mut file_ids = std::collections::HashSet::new();
         for (idx, path) in sorted.iter().enumerate() {
             if allowed_paths.contains(*path) {
@@ -81,9 +84,6 @@ pub(super) fn execute_query(
 
     // Execute the search.
     let raw_results = engine.search(&sq)?;
-
-    // Use the manifest returned by auto_refresh_if_stale (already loaded).
-    let sorted = manifest.sorted_paths();
 
     // Resolve and enrich results.
     let results = resolve_paths_and_snippets(&raw_results, &sorted, root, &manifest);
