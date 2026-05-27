@@ -73,6 +73,16 @@ fn insert_cochanges_in_tx(tx: &rusqlite::Transaction<'_>, rows: &[CochangeRow]) 
         )
         .map_err(db_err)?;
     for row in rows {
+        // Canonical ordering invariant: file_a < file_b must always hold.
+        // The UNION ALL query in cochanges_for_file relies on this to avoid
+        // returning duplicate rows (a row cannot satisfy both arms if the
+        // ordering is strict).
+        debug_assert!(
+            row.file_a < row.file_b,
+            "cochange row violates file_a < file_b invariant: {:?} >= {:?}",
+            row.file_a,
+            row.file_b
+        );
         stmt.execute(params![row.file_a, row.file_b, row.count, row.jaccard])
             .map_err(db_err)?;
     }
@@ -159,7 +169,7 @@ impl TemporalDb {
     pub fn cochanges_for_file(&self, path: &str) -> Result<Vec<CochangeRow>> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT file_a, file_b, count, jaccard FROM cochange WHERE file_a = ?1 \
                  UNION ALL \
                  SELECT file_a, file_b, count, jaccard FROM cochange WHERE file_b = ?1 \
@@ -199,7 +209,7 @@ impl TemporalDb {
         let limit = limit.min(MAX_ROWS_PER_TABLE);
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT file_path, score, changes_30d, changes_90d FROM hotspot \
                  ORDER BY score DESC LIMIT ?1",
             )
@@ -233,7 +243,7 @@ impl TemporalDb {
         let limit = limit.min(MAX_ROWS_PER_TABLE);
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT file_path, risk_score, total_commits, fix_commits, fix_density \
                  FROM risk ORDER BY risk_score DESC LIMIT ?1",
             )
@@ -268,7 +278,7 @@ impl TemporalDb {
         let limit = limit.min(MAX_ROWS_PER_TABLE);
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT file_path, score, changes_30d, changes_90d FROM hotspot \
                  ORDER BY score ASC LIMIT ?1",
             )

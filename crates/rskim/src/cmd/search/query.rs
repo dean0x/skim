@@ -79,6 +79,14 @@ pub(super) fn execute_query(
                 file_ids.insert(rskim_search::FileId(idx as u32));
             }
         }
+        if file_ids.is_empty() {
+            eprintln!(
+                "skim search: blast-radius filter matched 0 indexed files \
+                 (allowed {} paths, index has {} files)",
+                allowed_paths.len(),
+                sorted.len()
+            );
+        }
         sq.file_filter = Some(file_ids);
     }
 

@@ -387,7 +387,12 @@ impl SearchLayer for NgramIndexReader {
             )?;
         }
 
-        // Apply file_filter allowlist: discard any scored doc not in the set.
+        // Defense-in-depth: apply file_filter allowlist a second time before
+        // collecting scores.  The first sub-pass (above) already skips posting
+        // accumulation for non-allowlisted docs, so in practice this filter is a
+        // no-op.  It is kept here to guard against future refactors that change
+        // the first-pass filtering logic — any doc that somehow escaped the early
+        // guard is still excluded from the final result set.
         let mut scored: Vec<(u32, f64)> = if let Some(ref filter) = query.file_filter {
             doc_scores
                 .into_iter()
