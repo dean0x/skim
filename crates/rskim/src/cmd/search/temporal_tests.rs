@@ -1011,7 +1011,7 @@ fn standalone_blast_radius_json_valid() {
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     let v: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
 
-    assert_eq!(v["mode"], "blast_radius", "mode must be 'blast_radius'");
+    assert_eq!(v["mode"], "blast-radius", "mode must be 'blast-radius'");
     assert_eq!(
         v["target"], "src/auth.rs",
         "target must match the input path"

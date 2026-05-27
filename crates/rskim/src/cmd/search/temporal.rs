@@ -12,6 +12,7 @@ use std::io::Write;
 use std::path::Path;
 
 use rskim_search::{HotspotRow, RiskRow, TemporalDb};
+use serde::Serialize;
 
 use super::types::{ResolvedResult, TemporalAnnotation, TemporalSort};
 
@@ -230,6 +231,12 @@ pub(super) fn query_standalone(
         let mut partners = db.cochanges_for_file(&normalized)?;
 
         if let Some(sort_mode) = sort {
+            // Pre-truncate before the re-sort to bound per-file DB lookups.
+            // The cochange query already returns results sorted by Jaccard DESC,
+            // so the highest co-change partners are at the front. Window is
+            // limit*5 clamped to at least 100 so small limits don't over-prune.
+            let resort_window = (limit.saturating_mul(5)).max(100);
+            partners.truncate(resort_window);
             resort_partners_by_temporal(&mut partners, sort_mode, &normalized, db)?;
         }
 
@@ -252,6 +259,9 @@ pub(super) fn query_standalone(
 
 /// Re-sort blast-radius partners by temporal score using per-file lookups.
 ///
+/// Callers MUST pre-truncate `partners` to a reasonable window before calling
+/// this function to bound the number of per-file DB queries.
+///
 /// Uses `hotspot_for_file` / `risk_for_file` for each partner individually,
 /// avoiding bulk table loads. Absent entries sort last (score 0.0).
 ///
@@ -264,50 +274,60 @@ fn resort_partners_by_temporal(
     normalized: &str,
     db: &TemporalDb,
 ) -> anyhow::Result<()> {
-    let (scores, descending): (Vec<(usize, f64)>, bool) = match sort_mode {
-        TemporalSort::Hot | TemporalSort::Cold => {
-            let scores = partners
-                .iter()
-                .enumerate()
-                .map(|(i, row)| {
-                    let partner = cochange_partner(row, normalized);
-                    let score = db
-                        .hotspot_for_file(partner)?
-                        .map(|h| h.score)
-                        .unwrap_or(0.0);
-                    Ok((i, score))
-                })
-                .collect::<anyhow::Result<_>>()?;
-            (scores, sort_mode == TemporalSort::Hot)
-        }
-        TemporalSort::Risky => {
-            let scores = partners
-                .iter()
-                .enumerate()
-                .map(|(i, row)| {
-                    let partner = cochange_partner(row, normalized);
-                    let score = db
-                        .risk_for_file(partner)?
-                        .map(|r| r.risk_score)
-                        .unwrap_or(0.0);
-                    Ok((i, score))
-                })
-                .collect::<anyhow::Result<_>>()?;
-            (scores, true)
-        }
+    // Compute scores eagerly into a parallel Vec — one entry per partner.
+    // This avoids the clone-and-permute pattern; we sort the score Vec
+    // then apply a single allocation-free permutation via swap-based sort.
+    let scores: Vec<f64> = match sort_mode {
+        TemporalSort::Hot | TemporalSort::Cold => partners
+            .iter()
+            .map(|row| {
+                let partner = cochange_partner(row, normalized);
+                let score = db
+                    .hotspot_for_file(partner)?
+                    .map(|h| h.score)
+                    .unwrap_or(0.0);
+                Ok(score)
+            })
+            .collect::<anyhow::Result<_>>()?,
+        TemporalSort::Risky => partners
+            .iter()
+            .map(|row| {
+                let partner = cochange_partner(row, normalized);
+                let score = db
+                    .risk_for_file(partner)?
+                    .map(|r| r.risk_score)
+                    .unwrap_or(0.0);
+                Ok(score)
+            })
+            .collect::<anyhow::Result<_>>()?,
     };
 
-    let mut scored = scores;
+    // Build an index Vec and sort it by score, then permute `partners` in place.
+    let mut indices: Vec<usize> = (0..partners.len()).collect();
+    let descending = sort_mode != TemporalSort::Cold;
     if descending {
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        indices.sort_by(|&a, &b| {
+            scores[b]
+                .partial_cmp(&scores[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     } else {
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        indices.sort_by(|&a, &b| {
+            scores[a]
+                .partial_cmp(&scores[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
-    let reordered: Vec<_> = scored
-        .into_iter()
-        .map(|(i, _)| partners[i].clone())
-        .collect();
-    *partners = reordered;
+
+    // Apply permutation using a single auxiliary Vec — one allocation instead
+    // of one clone per element.
+    let mut temp = Vec::with_capacity(partners.len());
+    for i in indices {
+        // Safety: `indices` is a permutation of 0..partners.len(), so each
+        // index is valid. We drain into `temp` via swap to avoid clone.
+        temp.push(partners[i].clone());
+    }
+    *partners = temp;
     Ok(())
 }
 
@@ -321,28 +341,17 @@ pub(super) fn format_temporal_text(
     w: &mut impl Write,
 ) -> anyhow::Result<()> {
     match output {
-        TemporalQueryOutput::Hotspots(rows) => {
+        TemporalQueryOutput::Hotspots(rows) | TemporalQueryOutput::Coldspots(rows) => {
+            let (empty_msg, header) = if matches!(output, TemporalQueryOutput::Hotspots(_)) {
+                ("No hotspot data available.", format!("Hotspots (top {}, 90-day decay):\n", rows.len()))
+            } else {
+                ("No coldspot data available.", format!("Coldspots (top {}, least active):\n", rows.len()))
+            };
             if rows.is_empty() {
-                writeln!(w, "No hotspot data available.")?;
+                writeln!(w, "{empty_msg}")?;
                 return Ok(());
             }
-            writeln!(w, "Hotspots (top {}, 90-day decay):\n", rows.len())?;
-            writeln!(w, "  Score  30d  90d  Path")?;
-            writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
-            for r in rows {
-                writeln!(
-                    w,
-                    "  {:.3}   {:>4} {:>4}  {}",
-                    r.score, r.changes_30d, r.changes_90d, r.file_path
-                )?;
-            }
-        }
-        TemporalQueryOutput::Coldspots(rows) => {
-            if rows.is_empty() {
-                writeln!(w, "No coldspot data available.")?;
-                return Ok(());
-            }
-            writeln!(w, "Coldspots (top {}, least active):\n", rows.len())?;
+            writeln!(w, "{header}")?;
             writeln!(w, "  Score  30d  90d  Path")?;
             writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
             for r in rows {
@@ -398,74 +407,127 @@ pub(super) fn format_temporal_text(
     Ok(())
 }
 
+// ============================================================================
+// JSON serialization types
+// ============================================================================
+
+/// A single hotspot/coldspot entry in standalone JSON output.
+#[derive(Serialize)]
+struct HotspotJsonRow<'a> {
+    path: &'a str,
+    hotspot_score: f64,
+    changes_30d: u32,
+    changes_90d: u32,
+}
+
+/// A single risk entry in standalone JSON output.
+#[derive(Serialize)]
+struct RiskJsonRow<'a> {
+    path: &'a str,
+    risk_score: f64,
+    fix_density: f64,
+    fix_commits: u32,
+    total_commits: u32,
+}
+
+/// A single co-change partner entry in standalone JSON output.
+#[derive(Serialize)]
+struct CochangeJsonRow<'a> {
+    path: &'a str,
+    jaccard: f64,
+    count: u32,
+}
+
+/// Top-level envelope for hotspot/coldspot standalone JSON.
+#[derive(Serialize)]
+struct HotColdJson<'a> {
+    mode: &'a str,
+    total: usize,
+    results: Vec<HotspotJsonRow<'a>>,
+}
+
+/// Top-level envelope for risk standalone JSON.
+#[derive(Serialize)]
+struct RiskyJson<'a> {
+    mode: &'a str,
+    total: usize,
+    results: Vec<RiskJsonRow<'a>>,
+}
+
+/// Top-level envelope for blast-radius standalone JSON.
+#[derive(Serialize)]
+struct BlastRadiusJson<'a> {
+    mode: &'a str,
+    target: &'a str,
+    total: usize,
+    results: Vec<CochangeJsonRow<'a>>,
+}
+
 /// Format a standalone temporal query result as JSON.
+///
+/// Uses `#[derive(Serialize)]` typed structs so field names are defined in one
+/// place, preventing the hand-built `serde_json::json!()` approach from drifting
+/// independently.
 pub(super) fn format_temporal_json(
     output: &TemporalQueryOutput,
     w: &mut impl Write,
 ) -> anyhow::Result<()> {
-    let json = match output {
+    match output {
         TemporalQueryOutput::Hotspots(rows) | TemporalQueryOutput::Coldspots(rows) => {
             let mode = if matches!(output, TemporalQueryOutput::Hotspots(_)) {
                 "hot"
             } else {
                 "cold"
             };
-            let results: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "path": r.file_path,
-                        "hotspot_score": r.score,
-                        "changes_30d": r.changes_30d,
-                        "changes_90d": r.changes_90d,
+            let envelope = HotColdJson {
+                mode,
+                total: rows.len(),
+                results: rows
+                    .iter()
+                    .map(|r| HotspotJsonRow {
+                        path: &r.file_path,
+                        hotspot_score: r.score,
+                        changes_30d: r.changes_30d,
+                        changes_90d: r.changes_90d,
                     })
-                })
-                .collect();
-            serde_json::json!({
-                "mode": mode,
-                "total": rows.len(),
-                "results": results,
-            })
+                    .collect(),
+            };
+            writeln!(w, "{}", serde_json::to_string_pretty(&envelope)?)?;
         }
         TemporalQueryOutput::Risks(rows) => {
-            let results: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "path": r.file_path,
-                        "risk_score": r.risk_score,
-                        "fix_density": r.fix_density,
-                        "fix_commits": r.fix_commits,
-                        "total_commits": r.total_commits,
+            let envelope = RiskyJson {
+                mode: "risky",
+                total: rows.len(),
+                results: rows
+                    .iter()
+                    .map(|r| RiskJsonRow {
+                        path: &r.file_path,
+                        risk_score: r.risk_score,
+                        fix_density: r.fix_density,
+                        fix_commits: r.fix_commits,
+                        total_commits: r.total_commits,
                     })
-                })
-                .collect();
-            serde_json::json!({
-                "mode": "risky",
-                "total": rows.len(),
-                "results": results,
-            })
+                    .collect(),
+            };
+            writeln!(w, "{}", serde_json::to_string_pretty(&envelope)?)?;
         }
         TemporalQueryOutput::Cochanges { target, partners } => {
-            let results: Vec<serde_json::Value> = partners
-                .iter()
-                .map(|p| {
-                    serde_json::json!({
-                        "path": cochange_partner(p, target),
-                        "jaccard": p.jaccard,
-                        "count": p.count,
+            let envelope = BlastRadiusJson {
+                mode: "blast-radius",
+                target,
+                total: partners.len(),
+                results: partners
+                    .iter()
+                    .map(|p| CochangeJsonRow {
+                        path: cochange_partner(p, target),
+                        jaccard: p.jaccard,
+                        count: p.count,
                     })
-                })
-                .collect();
-            serde_json::json!({
-                "mode": "blast_radius",
-                "target": target,
-                "total": partners.len(),
-                "results": results,
-            })
+                    .collect(),
+            };
+            writeln!(w, "{}", serde_json::to_string_pretty(&envelope)?)?;
         }
-    };
-    writeln!(w, "{}", serde_json::to_string_pretty(&json)?)?;
+    }
     Ok(())
 }
 
