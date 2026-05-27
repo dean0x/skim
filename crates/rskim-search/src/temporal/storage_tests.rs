@@ -667,7 +667,125 @@ fn top_risks_empty_returns_empty() {
 }
 
 // ============================================================================
-// Group 9: Schema v2 migration (Step 3)
+// Group 9: Regression — UNION ALL indexed cochange query (storage_ops:156)
+// ============================================================================
+
+/// Regression: cochanges_for_file must find rows where the queried file
+/// appears in file_b (not just file_a). The UNION ALL rewrite enables SQLite
+/// to hit the secondary index on file_b instead of scanning with OR.
+#[test]
+fn cochanges_for_file_union_all_hits_file_b_index() {
+    let (_dir, db) = temp_db();
+    // "src/z.rs" > "src/a.rs" lexically, so canonical storage is
+    // file_a = "src/a.rs", file_b = "src/z.rs".
+    // Querying by the file_b value ("src/z.rs") must still return the row.
+    let row = CochangeRow {
+        file_a: "src/a.rs".to_string(),
+        file_b: "src/z.rs".to_string(),
+        count: 9,
+        jaccard: 0.77,
+    };
+    db.store_cochanges(&[row.clone()]).unwrap();
+
+    let results = db.cochanges_for_file("src/z.rs").unwrap();
+    assert_eq!(results.len(), 1, "file_b lookup must return the row");
+    assert_eq!(results[0], row);
+}
+
+/// Regression: a file that appears in both arms of the UNION ALL (once as
+/// file_a and once as file_b across different rows) must not produce duplicate
+/// results because the canonical ordering guarantee means no single row can
+/// satisfy both `file_a = ?1` AND `file_b = ?1` simultaneously.
+#[test]
+fn cochanges_for_file_no_duplicates_across_union_arms() {
+    let (_dir, db) = temp_db();
+    // "src/hub.rs" appears as file_a in one row and file_b in another.
+    // "src/aaa.rs" < "src/hub.rs" < "src/zzz.rs" lexically.
+    let rows = vec![
+        CochangeRow {
+            file_a: "src/aaa.rs".to_string(),
+            file_b: "src/hub.rs".to_string(),
+            count: 3,
+            jaccard: 0.4,
+        },
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/zzz.rs".to_string(),
+            count: 7,
+            jaccard: 0.8,
+        },
+    ];
+    db.store_cochanges(&rows).unwrap();
+
+    let results = db.cochanges_for_file("src/hub.rs").unwrap();
+    assert_eq!(
+        results.len(),
+        2,
+        "hub.rs appears in both arms; must return exactly 2 distinct rows"
+    );
+    // Results should still be sorted by jaccard DESC.
+    assert!(
+        results[0].jaccard >= results[1].jaccard,
+        "results must be sorted by jaccard DESC"
+    );
+}
+
+// ============================================================================
+// Group 10: Regression — top-N limit overflow (storage_ops:187)
+// ============================================================================
+
+/// Regression: top_hotspots must not produce an i64 overflow when limit is
+/// usize::MAX. The clamp to MAX_ROWS_PER_TABLE must happen before the cast.
+#[test]
+fn top_hotspots_usize_max_does_not_overflow() {
+    let (_dir, db) = temp_db();
+    db.store_hotspots(&[HotspotRow {
+        file_path: "x.rs".to_string(),
+        score: 0.5,
+        changes_30d: 1,
+        changes_90d: 2,
+    }])
+    .unwrap();
+    // usize::MAX would wrap to a large negative i64 without the clamp.
+    let results = db.top_hotspots(usize::MAX).unwrap();
+    assert_eq!(results.len(), 1, "usize::MAX limit must be clamped safely");
+}
+
+/// Regression: top_risks must not produce an i64 overflow when limit is
+/// usize::MAX.
+#[test]
+fn top_risks_usize_max_does_not_overflow() {
+    let (_dir, db) = temp_db();
+    db.store_risks(&[RiskRow {
+        file_path: "x.rs".to_string(),
+        risk_score: 0.5,
+        total_commits: 10,
+        fix_commits: 1,
+        fix_density: 0.1,
+    }])
+    .unwrap();
+    let results = db.top_risks(usize::MAX).unwrap();
+    assert_eq!(results.len(), 1, "usize::MAX limit must be clamped safely");
+}
+
+/// Regression: top_coldspots must not produce an i64 overflow when limit is
+/// usize::MAX.
+#[test]
+fn top_coldspots_usize_max_does_not_overflow() {
+    let (_dir, db) = temp_db();
+    db.store_hotspots(&[HotspotRow {
+        file_path: "cold.rs".to_string(),
+        score: 0.1,
+        changes_30d: 0,
+        changes_90d: 1,
+    }])
+    .unwrap();
+    let results = db.top_coldspots(usize::MAX).unwrap();
+    assert_eq!(results.len(), 1, "usize::MAX limit must be clamped safely");
+}
+
+// ============================================================================
+// Group 11: Schema v2 migration (Step 3)
 // ============================================================================
 
 #[test]

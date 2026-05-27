@@ -146,6 +146,13 @@ impl TemporalDb {
     /// (lexically smaller path in `file_a`) is transparent to callers.
     /// Results are sorted by Jaccard similarity descending.
     ///
+    /// Uses `UNION ALL` of two indexed queries instead of `OR` to allow SQLite
+    /// to use both the primary key index on `file_a` and the secondary index on
+    /// `file_b`. With `OR`, SQLite degrades to a partial or full table scan at
+    /// large row counts. `UNION ALL` (not `UNION`) is safe because the canonical
+    /// ordering guarantee (`file_a < file_b`) makes self-pairs impossible, so no
+    /// row can satisfy both arms simultaneously.
+    ///
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
@@ -153,8 +160,9 @@ impl TemporalDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT file_a, file_b, count, jaccard FROM cochange \
-                 WHERE file_a = ?1 OR file_b = ?1 \
+                "SELECT file_a, file_b, count, jaccard FROM cochange WHERE file_a = ?1 \
+                 UNION ALL \
+                 SELECT file_a, file_b, count, jaccard FROM cochange WHERE file_b = ?1 \
                  ORDER BY jaccard DESC LIMIT 10000",
             )
             .map_err(db_err)?;
@@ -168,7 +176,7 @@ impl TemporalDb {
                 })
             })
             .map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_err)?;
         Ok(rows)
     }
@@ -179,12 +187,16 @@ impl TemporalDb {
 
     /// Return the top `limit` hotspot rows ordered by score descending.
     ///
+    /// `limit` is silently clamped to [`MAX_ROWS_PER_TABLE`] to prevent
+    /// `usize::MAX as i64` integer overflow when binding to SQLite.
+    ///
     /// Returns an empty `Vec` when the table is empty.
     ///
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
     pub fn top_hotspots(&self, limit: usize) -> Result<Vec<HotspotRow>> {
+        let limit = limit.min(MAX_ROWS_PER_TABLE);
         let mut stmt = self
             .conn
             .prepare(
@@ -202,12 +214,15 @@ impl TemporalDb {
                 })
             })
             .map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_err)?;
         Ok(rows)
     }
 
     /// Return the top `limit` risk rows ordered by risk_score descending.
+    ///
+    /// `limit` is silently clamped to [`MAX_ROWS_PER_TABLE`] to prevent
+    /// `usize::MAX as i64` integer overflow when binding to SQLite.
     ///
     /// Returns an empty `Vec` when the table is empty.
     ///
@@ -215,6 +230,7 @@ impl TemporalDb {
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
     pub fn top_risks(&self, limit: usize) -> Result<Vec<RiskRow>> {
+        let limit = limit.min(MAX_ROWS_PER_TABLE);
         let mut stmt = self
             .conn
             .prepare(
@@ -233,12 +249,15 @@ impl TemporalDb {
                 })
             })
             .map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_err)?;
         Ok(rows)
     }
 
     /// Return the bottom `limit` hotspot rows ordered by score ascending (coldspots).
+    ///
+    /// `limit` is silently clamped to [`MAX_ROWS_PER_TABLE`] to prevent
+    /// `usize::MAX as i64` integer overflow when binding to SQLite.
     ///
     /// Returns an empty `Vec` when the table is empty.
     ///
@@ -246,6 +265,7 @@ impl TemporalDb {
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
     pub fn top_coldspots(&self, limit: usize) -> Result<Vec<HotspotRow>> {
+        let limit = limit.min(MAX_ROWS_PER_TABLE);
         let mut stmt = self
             .conn
             .prepare(
@@ -263,7 +283,7 @@ impl TemporalDb {
                 })
             })
             .map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_err)?;
         Ok(rows)
     }
@@ -384,7 +404,7 @@ impl TemporalDb {
                 })
             })
             .map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_err)?;
         if rows.len() > MAX_ROWS_PER_TABLE {
             return Err(SearchError::CapacityExceeded(format!(
@@ -422,7 +442,7 @@ impl TemporalDb {
                 })
             })
             .map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_err)?;
         if rows.len() > MAX_ROWS_PER_TABLE {
             return Err(SearchError::CapacityExceeded(format!(
@@ -459,7 +479,7 @@ impl TemporalDb {
                 })
             })
             .map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_err)?;
         if rows.len() > MAX_ROWS_PER_TABLE {
             return Err(SearchError::CapacityExceeded(format!(
