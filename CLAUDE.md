@@ -77,6 +77,8 @@ analytics/          ← Token savings persistence (SQLite)
 
 **ANALYTICS NOTE**: The `analytics/` module persists token savings to `~/.cache/skim/analytics.db` (SQLite with WAL mode). Recording is fire-and-forget via background threads. The `AnalyticsStore` trait enables MockStore-based testing of the stats dashboard without a real database. `--clear-cache` does NOT touch `analytics.db`.
 
+**TEMPORAL SEARCH NOTE**: The `rskim-search` crate stores hotspot, risk, and co-change data in `<project-root>/.skim/search.db` (SQLite, WAL mode). Schema migrations are forward-only via `PRAGMA user_version` — each version gate runs only when the stored version is below the target. Databases created by a future version return an error rather than silently corrupting data. Current schema: v1 (hotspot, risk, cochange tables), v2 (performance indexes for top-N and per-file lookup queries).
+
 ## Implementation Phases
 
 ### Phase 1 (Weeks 1-4): Proof of Concept
@@ -162,6 +164,7 @@ cargo fmt -- --check           # Format check
 
 **Analysis:**
 - `heatmap` — Git history risk/coupling analysis: churn, co-change coupling, stability scores, author concentration, fix-after-touch, module encapsulation (`--json`, `--since`, `--last`, `--window`, `--path`, `--top`, `--insights`)
+- `search` — n-gram code search over the project index. Build/update index with `skim search index` (`--force`, `--root`, `--max-files`). Query with `skim search <query>` (`--limit`, `--root`, `--json`, `--stats`, `--install-hooks`, `--remove-hooks`, `--build`, `--rebuild`, `--update`). Temporal sort/filter flags: `--hot` (sort by hotspot score), `--cold` (invert hotspot sort), `--risky` (sort by fix-risk score), `--blast-radius FILE` (pre-filter to co-change peers of FILE).
 
 **Multi-category dispatchers:**
 - `cargo` — Rust toolchain compression: test, build, clippy, audit, nextest
