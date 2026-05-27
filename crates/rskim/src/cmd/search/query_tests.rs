@@ -49,6 +49,7 @@ fn make_config(root: &std::path::Path, cache_dir: &std::path::Path, text: &str) 
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
     }
 }
 
@@ -176,6 +177,7 @@ fn test_format_text_output_includes_path_and_score() {
         }),
         stale: false,
         match_positions: vec![],
+        temporal: None,
     };
 
     let output = QueryOutput {
@@ -215,6 +217,7 @@ fn test_format_text_output_includes_stale_marker() {
         }),
         stale: true,
         match_positions: vec![],
+        temporal: None,
     };
 
     let output = QueryOutput {
@@ -312,6 +315,7 @@ fn test_resolved_result_line_range_some_serializes_start_end() {
         snippet: None,
         stale: false,
         match_positions: vec![],
+        temporal: None,
     };
 
     let value = serde_json::to_value(&result).expect("ResolvedResult must serialize");
@@ -336,6 +340,7 @@ fn test_resolved_result_line_range_none_serializes_null() {
         snippet: None,
         stale: false,
         match_positions: vec![],
+        temporal: None,
     };
 
     let value = serde_json::to_value(&result).expect("ResolvedResult must serialize");
@@ -343,6 +348,86 @@ fn test_resolved_result_line_range_none_serializes_null() {
         value["line_range"].is_null(),
         "line_range must be null when None, got: {:?}",
         value["line_range"]
+    );
+}
+
+// ============================================================================
+// blast_radius_paths filter
+// ============================================================================
+
+/// When blast_radius_paths is set, execute_query must restrict results to
+/// the allowed paths. The target file itself is included in the set (Issue fix:
+/// previously only co-change *partners* were included, excluding the target).
+#[test]
+fn test_execute_query_blast_radius_includes_only_allowed_paths() {
+    use std::collections::HashSet;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    // Allow only src/auth.rs in the blast-radius set.
+    let mut allowed: HashSet<String> = HashSet::new();
+    allowed.insert("src/auth.rs".to_string());
+
+    let config = QueryConfig {
+        text: "authenticate".to_string(),
+        limit: 20,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // All results must be from the allowed set.
+    for r in &output.results {
+        assert_eq!(
+            r.path, "src/auth.rs",
+            "blast-radius filter must restrict results to allowed paths, got: {}",
+            r.path
+        );
+    }
+}
+
+/// When blast_radius_paths contains the target file, a query that matches
+/// the target returns results for that file.
+/// Regression for: combined mode was excluding the target file itself.
+#[test]
+fn test_execute_query_blast_radius_target_file_is_included() {
+    use std::collections::HashSet;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    // Build an allowlist that includes src/auth.rs (the "target") plus a
+    // partner that has no matching content for "authenticate".
+    let mut allowed: HashSet<String> = HashSet::new();
+    allowed.insert("src/auth.rs".to_string()); // target
+    allowed.insert("src/does_not_exist.rs".to_string()); // partner (not indexed)
+
+    let config = QueryConfig {
+        text: "authenticate".to_string(),
+        limit: 20,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // src/auth.rs contains "authenticate" and is in the allowed set — it must appear.
+    let has_auth = output.results.iter().any(|r| r.path == "src/auth.rs");
+    assert!(
+        has_auth,
+        "target file (src/auth.rs) must be in blast-radius results when it matches the query"
     );
 }
 
@@ -367,4 +452,180 @@ fn test_format_json_output_is_valid_json() {
     let parsed: serde_json::Value = serde_json::from_str(s).expect("must be valid JSON");
     assert_eq!(parsed["query"], "test");
     assert_eq!(parsed["total"], 0);
+}
+
+// ============================================================================
+// Temporal annotation in text output (Step 11)
+// ============================================================================
+
+/// format_text_output includes "hotspot: X.XXX" when temporal annotation present.
+#[test]
+fn test_format_text_output_includes_temporal_hotspot() {
+    use crate::cmd::search::types::{ResolvedResult, TemporalAnnotation};
+
+    let result = ResolvedResult {
+        path: "src/hot.rs".to_string(),
+        score: 5.0,
+        field: "function_signature".to_string(),
+        line_number: Some(1),
+        line_range: Some(1..2),
+        snippet: None,
+        stale: false,
+        match_positions: vec![],
+        temporal: Some(TemporalAnnotation {
+            hotspot_score: Some(0.95),
+            ..Default::default()
+        }),
+    };
+
+    let output = QueryOutput {
+        query: "hot".to_string(),
+        total: 1,
+        results: vec![result],
+        duration_ms: 1,
+        index_stats: None,
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_text_output(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+    assert!(
+        s.contains("hotspot:"),
+        "temporal hotspot annotation must appear, got: {s:?}"
+    );
+    assert!(
+        s.contains("0.950"),
+        "hotspot score must be formatted to 3dp, got: {s:?}"
+    );
+}
+
+/// format_text_output shows "risk: X.XXX" when risk annotation present.
+#[test]
+fn test_format_text_output_includes_temporal_risk() {
+    use crate::cmd::search::types::{ResolvedResult, TemporalAnnotation};
+
+    let result = ResolvedResult {
+        path: "src/risky.rs".to_string(),
+        score: 3.0,
+        field: "function_signature".to_string(),
+        line_number: None,
+        line_range: None,
+        snippet: None,
+        stale: false,
+        match_positions: vec![],
+        temporal: Some(TemporalAnnotation {
+            risk_score: Some(0.80),
+            ..Default::default()
+        }),
+    };
+
+    let output = QueryOutput {
+        query: "risky".to_string(),
+        total: 1,
+        results: vec![result],
+        duration_ms: 1,
+        index_stats: None,
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_text_output(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+    assert!(
+        s.contains("risk:"),
+        "risk annotation must appear, got: {s:?}"
+    );
+    assert!(
+        s.contains("0.800"),
+        "risk score must be formatted to 3dp, got: {s:?}"
+    );
+}
+
+/// format_text_output omits temporal section when annotation is None.
+#[test]
+fn test_format_text_output_omits_temporal_when_none() {
+    use crate::cmd::search::types::ResolvedResult;
+
+    let result = ResolvedResult {
+        path: "src/plain.rs".to_string(),
+        score: 2.0,
+        field: "function_signature".to_string(),
+        line_number: None,
+        line_range: None,
+        snippet: None,
+        stale: false,
+        match_positions: vec![],
+        temporal: None,
+    };
+
+    let output = QueryOutput {
+        query: "plain".to_string(),
+        total: 1,
+        results: vec![result],
+        duration_ms: 1,
+        index_stats: None,
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_text_output(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+    assert!(
+        !s.contains("hotspot:"),
+        "no hotspot annotation when temporal is None, got: {s:?}"
+    );
+    assert!(
+        !s.contains("risk:"),
+        "no risk annotation when temporal is None, got: {s:?}"
+    );
+}
+
+/// format_json_output includes temporal annotations inside each result object.
+#[test]
+fn test_format_json_output_includes_temporal_annotations() {
+    use crate::cmd::search::types::{ResolvedResult, TemporalAnnotation};
+
+    let result = ResolvedResult {
+        path: "src/hot.rs".to_string(),
+        score: 5.0,
+        field: "function_signature".to_string(),
+        line_number: None,
+        line_range: None,
+        snippet: None,
+        stale: false,
+        match_positions: vec![],
+        temporal: Some(TemporalAnnotation {
+            hotspot_score: Some(0.95),
+            risk_score: Some(0.70),
+            ..Default::default()
+        }),
+    };
+
+    let output = QueryOutput {
+        query: "hot".to_string(),
+        total: 1,
+        results: vec![result],
+        duration_ms: 1,
+        index_stats: None,
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_json_output(&output, &mut buf).unwrap();
+    let bytes = buf.into_inner().unwrap();
+    let s = std::str::from_utf8(&bytes).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(s).expect("must be valid JSON");
+
+    let temporal = &parsed["results"][0]["temporal"];
+    assert!(
+        !temporal.is_null(),
+        "temporal field must be present in JSON when Some"
+    );
+    let hs = temporal["hotspot_score"].as_f64().unwrap();
+    assert!(
+        (hs - 0.95).abs() < 1e-6,
+        "hotspot_score must be ~0.95, got {hs}"
+    );
+    let rs = temporal["risk_score"].as_f64().unwrap();
+    assert!(
+        (rs - 0.70).abs() < 1e-6,
+        "risk_score must be ~0.70, got {rs}"
+    );
 }

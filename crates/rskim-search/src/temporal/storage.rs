@@ -43,7 +43,7 @@ use crate::types::{Result, SearchError};
 // ============================================================================
 
 /// Current schema version. Must be bumped whenever the DDL changes.
-const CURRENT_VERSION: i64 = 1;
+const CURRENT_VERSION: i64 = 2;
 
 // ============================================================================
 // Meta key constants
@@ -126,6 +126,23 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             );
 
             PRAGMA user_version = 1;
+
+            COMMIT;",
+        )
+        .map_err(db_err)?;
+    }
+
+    if version < 2 {
+        // Performance indexes for the top-N and per-file lookup queries added in v2.
+        // `idx_cochange_file_a` is NOT needed — PK (file_a, file_b) already covers file_a.
+        conn.execute_batch(
+            "BEGIN;
+
+            CREATE INDEX IF NOT EXISTS idx_hotspot_score ON hotspot(score);
+            CREATE INDEX IF NOT EXISTS idx_risk_score ON risk(risk_score);
+            CREATE INDEX IF NOT EXISTS idx_cochange_file_b ON cochange(file_b);
+
+            PRAGMA user_version = 2;
 
             COMMIT;",
         )

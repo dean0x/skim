@@ -359,6 +359,13 @@ pub struct SearchQuery {
     /// the reader's default is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bm25f_config: Option<crate::lexical::BM25FConfig>,
+
+    /// Optional file ID allowlist. When `Some`, only files in this set are scored.
+    ///
+    /// Used by blast-radius pre-filtering to restrict search to co-change partners.
+    /// Not serialized — applied at query construction time in the CLI layer.
+    #[serde(skip)]
+    pub file_filter: Option<std::collections::HashSet<FileId>>,
 }
 
 impl SearchQuery {
@@ -373,6 +380,7 @@ impl SearchQuery {
             limit: None,
             offset: None,
             bm25f_config: None,
+            file_filter: None,
         }
     }
 }
@@ -722,6 +730,7 @@ mod tests {
             limit: Some(10),
             offset: Some(5),
             bm25f_config: None,
+            file_filter: None,
         };
         assert_eq!(q.text, "find_me");
         assert_eq!(q.lang, Some(rskim_core::Language::Rust));
@@ -1103,6 +1112,29 @@ mod tests {
         assert!(
             q.bm25f_config.is_none(),
             "new() should initialise bm25f_config to None"
+        );
+    }
+
+    /// SearchQuery::new() should initialise file_filter to None.
+    #[test]
+    fn test_search_query_new_file_filter_none() {
+        let q = SearchQuery::new("hello");
+        assert!(
+            q.file_filter.is_none(),
+            "new() should initialise file_filter to None"
+        );
+    }
+
+    /// file_filter serialises as skipped (not included in JSON output).
+    #[test]
+    fn test_search_query_file_filter_skipped_in_serde() {
+        let mut q = SearchQuery::new("test");
+        q.file_filter = Some(std::collections::HashSet::from([FileId(1), FileId(2)]));
+        let json = serde_json::to_string(&q).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v.get("file_filter").is_none(),
+            "file_filter must be skipped during serialization"
         );
     }
 

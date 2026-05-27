@@ -19,12 +19,15 @@ mod manifest;
 mod query;
 mod snippet;
 mod staleness;
+mod temporal;
 mod types;
 mod walk;
 
 use std::io::{BufWriter, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+use serde::Serialize;
 
 // ============================================================================
 // Public entry point
@@ -68,13 +71,17 @@ pub(crate) fn run(
         SearchAction::Stats => run_stats(flags.json, &flags.root_override),
         SearchAction::InstallHooks => run_install_hooks(&flags.root_override),
         SearchAction::RemoveHooks => run_remove_hooks(&flags.root_override),
-        SearchAction::Query(ref text) if !text.is_empty() => run_query(
-            text,
-            flags.limit,
-            flags.json,
-            &flags.root_override,
-            analytics,
-        ),
+        SearchAction::Query(ref text) if !text.is_empty() => run_query(text, &flags, analytics),
+        // Empty query with temporal flags → standalone temporal dispatch.
+        SearchAction::Query(_) if flags.temporal_sort.is_some() || flags.blast_radius.is_some() => {
+            run_temporal_standalone(
+                flags.limit,
+                flags.json,
+                &flags.root_override,
+                flags.temporal_sort,
+                flags.blast_radius.as_deref(),
+            )
+        }
         SearchAction::Query(_) => {
             // Empty query (no positional args and no action flag) → help.
             print_help();
@@ -110,6 +117,10 @@ struct Flags {
     json: bool,
     limit: usize,
     root_override: Option<PathBuf>,
+    /// Sort mode for temporal queries — mutually exclusive.
+    temporal_sort: Option<types::TemporalSort>,
+    /// Raw path for blast-radius pre-filtering. Normalized later in run_query.
+    blast_radius: Option<String>,
 }
 
 /// Parse and validate a `--limit` value string.
@@ -124,6 +135,55 @@ fn parse_limit_value(raw: &str) -> anyhow::Result<usize> {
         anyhow::bail!("--limit must be >= 1 (got 0)");
     }
     Ok(parsed)
+}
+
+/// Parse a temporal flag arm (`--hot`, `--cold`, `--risky`, `--blast-radius`).
+///
+/// Returns `Ok(true)` when the flag consumed an extra token (i.e. the space-
+/// separated `--blast-radius <path>` form), `Ok(false)` for single-token arms,
+/// and `Err` on validation failure.
+///
+/// The caller is responsible for advancing `i` by one additional position when
+/// this function returns `Ok(true)`.
+fn parse_temporal_flag(
+    arg: &str,
+    next_arg: Option<&String>,
+    temporal_sort: &mut Option<types::TemporalSort>,
+    blast_radius: &mut Option<String>,
+) -> anyhow::Result<bool> {
+    match arg {
+        "--hot" | "--cold" | "--risky" => {
+            let new_sort = match arg {
+                "--hot" => types::TemporalSort::Hot,
+                "--cold" => types::TemporalSort::Cold,
+                _ => types::TemporalSort::Risky,
+            };
+            if let Some(existing) = *temporal_sort {
+                anyhow::bail!(
+                    "{} and {} are mutually exclusive",
+                    new_sort.flag_name(),
+                    existing.flag_name()
+                );
+            }
+            *temporal_sort = Some(new_sort);
+            Ok(false)
+        }
+        "--blast-radius" => {
+            let val =
+                next_arg.ok_or_else(|| anyhow::anyhow!("--blast-radius requires a file path"))?;
+            *blast_radius = Some(val.clone());
+            Ok(true)
+        }
+        s if s.starts_with("--blast-radius=") => {
+            let val = s.trim_start_matches("--blast-radius=");
+            if val.is_empty() {
+                anyhow::bail!("--blast-radius requires a file path");
+            }
+            *blast_radius = Some(val.to_string());
+            Ok(false)
+        }
+        _ => unreachable!("parse_temporal_flag called with non-temporal arg: {arg}"),
+    }
 }
 
 /// Parse the flags from `args`.
@@ -141,6 +201,8 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut limit: usize = 20;
     let mut root_override: Option<PathBuf> = None;
     let mut query_parts: Vec<String> = Vec::new();
+    let mut temporal_sort: Option<types::TemporalSort> = None;
+    let mut blast_radius: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -173,10 +235,20 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
             s if s.starts_with("--root=") => {
                 root_override = Some(PathBuf::from(s.trim_start_matches("--root=")));
             }
+            s if matches!(s, "--hot" | "--cold" | "--risky" | "--blast-radius")
+                || s.starts_with("--blast-radius=") =>
+            {
+                let consumed_next =
+                    parse_temporal_flag(s, args.get(i + 1), &mut temporal_sort, &mut blast_radius)?;
+                if consumed_next {
+                    i += 1;
+                }
+            }
             s if s.starts_with("--") => {
                 anyhow::bail!(
                     "unrecognised flag {:?}. Valid flags: --build, --rebuild, --update, \
-                     --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --root",
+                     --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --root, \
+                     --hot, --cold, --risky, --blast-radius",
                     s
                 );
             }
@@ -193,6 +265,8 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
         json,
         limit,
         root_override,
+        temporal_sort,
+        blast_radius,
     })
 }
 
@@ -336,31 +410,163 @@ fn run_remove_hooks(root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode>
 // Query execution
 // ============================================================================
 
+/// Resolve blast-radius partner paths from the temporal database.
+///
+/// Returns co-change partners **plus the target file itself**, so text queries
+/// like `skim search auth --blast-radius src/auth.rs` surface matches within
+/// `src/auth.rs` in addition to its co-change partners.
+///
+/// Returns `None` when no blast-radius was requested, or when the temporal DB
+/// is unavailable.  When `json` is true the warning is emitted as a JSON
+/// object to stdout (consistent with the JSON degradation path in
+/// `run_temporal_standalone`); otherwise it goes to stderr.
+fn resolve_blast_radius_filter(
+    blast_radius: Option<&str>,
+    temporal_db: &Option<rskim_search::TemporalDb>,
+    root: &std::path::Path,
+    json: bool,
+) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
+    let raw_path = match blast_radius {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    let db = match temporal_db {
+        Some(db) => db,
+        None => {
+            const MSG: &str = "no temporal data — run 'skim heatmap' to populate";
+            if json {
+                let w = WarningJson { warning: MSG };
+                println!("{}", serde_json::to_string(&w)?);
+            } else {
+                eprintln!("skim search: {MSG}");
+            }
+            return Ok(None);
+        }
+    };
+
+    let normalized = temporal::normalize_blast_radius_path(raw_path, root)?;
+    let partners = db.cochanges_for_file(&normalized)?;
+    if partners.is_empty() {
+        eprintln!("skim search: no co-change data for {raw_path:?}");
+    }
+
+    // Include the target file itself so text queries like
+    // `skim search auth --blast-radius src/auth.rs` surface matches
+    // within src/auth.rs in addition to its co-change partners.
+    let mut paths = temporal::cochange_partner_paths(&partners, &normalized);
+    paths.insert(normalized);
+    Ok(Some(paths))
+}
+
 fn run_query(
     text: &str,
-    limit: usize,
-    json: bool,
-    root_override: &Option<PathBuf>,
+    flags: &Flags,
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    let (root, cache_dir) = resolve_root_and_cache(root_override)?;
+    let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
     std::fs::create_dir_all(&cache_dir)?;
+
+    // Open the temporal DB once. Used for both blast-radius filtering (before
+    // the query, so LIMIT applies to the filtered set) and temporal enrichment
+    // (after the query, to annotate/sort results).
+    let temporal_db = if flags.temporal_sort.is_some() || flags.blast_radius.is_some() {
+        temporal::open_temporal_db(&cache_dir.join("temporal.db"))
+    } else {
+        None
+    };
+
+    // Warn when temporal data is stale (same check as run_temporal_standalone).
+    if let Some(ref db) = temporal_db
+        && let Some(warning) = temporal::check_temporal_staleness(db, &root)
+    {
+        eprintln!("{warning}");
+    }
+
+    // Resolve blast-radius partner paths BEFORE querying so the file_filter
+    // is applied inside the search engine (before LIMIT). This ensures the
+    // limit applies to the filtered set rather than silently discarding
+    // co-change partners that ranked beyond the top-N unfiltered results.
+    let blast_radius_paths = resolve_blast_radius_filter(
+        flags.blast_radius.as_deref(),
+        &temporal_db,
+        &root,
+        flags.json,
+    )?;
 
     let config = types::QueryConfig {
         text: text.to_string(),
-        limit,
-        json,
+        limit: flags.limit,
+        json: flags.json,
         root,
         cache_dir,
+        blast_radius_paths,
     };
 
-    let output = query::execute_query(&config, analytics)?;
+    let mut output = query::execute_query(&config, analytics)?;
+
+    // Apply temporal sort/annotation to the results.
+    if let (Some(sort), Some(db)) = (flags.temporal_sort, &temporal_db) {
+        temporal::apply_temporal_enrichment(&mut output.results, sort, db)?;
+    }
 
     let mut stdout = BufWriter::new(std::io::stdout());
-    if json {
+    if flags.json {
         query::format_json_output(&output, &mut stdout)?;
     } else {
         query::format_text_output(&output, &mut stdout)?;
+    }
+    stdout.flush()?;
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Typed JSON envelope for a warning-only response (no temporal data available).
+#[derive(Serialize)]
+struct WarningJson<'a> {
+    warning: &'a str,
+}
+
+/// Execute a standalone temporal query (no text search term provided).
+///
+/// Opens the temporal DB from the resolved cache directory, checks for
+/// staleness, dispatches the query (hotspot, cold, risky, or blast-radius),
+/// and writes the result as JSON or plain text to stdout. Degrades gracefully
+/// when the temporal DB is absent — prints a warning and returns exit 0.
+fn run_temporal_standalone(
+    limit: usize,
+    json: bool,
+    root_override: &Option<PathBuf>,
+    temporal_sort: Option<types::TemporalSort>,
+    blast_radius: Option<&str>,
+) -> anyhow::Result<ExitCode> {
+    let (root, cache_dir) = resolve_root_and_cache(root_override)?;
+    let temporal_db_path = cache_dir.join("temporal.db");
+
+    let Some(db) = temporal::open_temporal_db(&temporal_db_path) else {
+        if json {
+            let msg = WarningJson {
+                warning: "no temporal data — run 'skim heatmap' to populate",
+            };
+            println!("{}", serde_json::to_string(&msg)?);
+        } else {
+            eprintln!("skim search: no temporal data — run 'skim heatmap' to populate");
+        }
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    // Check staleness.
+    if let Some(warning) = temporal::check_temporal_staleness(&db, &root) {
+        eprintln!("{warning}");
+    }
+
+    let output = temporal::query_standalone(temporal_sort, blast_radius, limit, &db, &root)?;
+
+    let mut stdout = BufWriter::new(std::io::stdout());
+    if json {
+        temporal::format_temporal_json(&output, &mut stdout)?;
+    } else {
+        temporal::format_temporal_text(&output, &mut stdout)?;
     }
     stdout.flush()?;
 
@@ -394,15 +600,30 @@ Options:
   --root PATH      Override project root (default: walk up to .git)
   -h, --help       Print this help message
 
+Temporal query options (require 'skim heatmap' data):
+  --hot                        Sort/list by hotspot score descending
+  --cold                       Sort/list by hotspot score ascending
+  --risky                      Sort/list by bug-fix density descending
+  --blast-radius FILE          Restrict to co-change partners of FILE
+
+Temporal flag composition:
+  --hot and --cold/--risky are mutually exclusive (pick one sort mode).
+  --blast-radius is composable with any sort mode and with text queries.
+
 Examples:
-  skim search \"authenticate\"          Search for 'authenticate'
-  skim search --limit 5 \"parse_url\"   Return at most 5 results
-  skim search --json \"UserService\"    JSON output
-  skim search --build                 Build the search index
-  skim search --rebuild               Rebuild from scratch
-  skim search --update                Refresh stale index
-  skim search --stats                 Show index statistics
-  skim search --install-hooks         Auto-refresh on git commit/merge"
+  skim search \"authenticate\"                Search for 'authenticate'
+  skim search --limit 5 \"parse_url\"         Return at most 5 results
+  skim search --json \"UserService\"          JSON output
+  skim search --build                       Build the search index
+  skim search --rebuild                     Rebuild from scratch
+  skim search --update                      Refresh stale index
+  skim search --stats                       Show index statistics
+  skim search --install-hooks               Auto-refresh on git commit/merge
+  skim search --hot                         Top hotspot files (standalone)
+  skim search --risky                       Top risky files (standalone)
+  skim search --blast-radius src/auth.rs    Co-change partners of auth.rs
+  skim search \"auth\" --hot                  Text results sorted by hotspot
+  skim search \"auth\" --blast-radius src/auth.rs  Text within co-change partners"
     );
 }
 
@@ -661,5 +882,55 @@ mod tests {
     fn test_parse_flags_limit_one_is_valid() {
         let flags = parse_flags(&["--limit".to_string(), "1".to_string()]).unwrap();
         assert_eq!(flags.limit, 1);
+    }
+
+    // ============================================================================
+    // resolve_blast_radius_filter — None DB degradation path
+    // ============================================================================
+
+    /// When blast_radius is Some but temporal_db is None (user hasn't run
+    /// `skim heatmap` yet), the function must return Ok(None) without panicking.
+    /// A stderr warning is expected but the caller handles the degradation.
+    #[test]
+    fn test_resolve_blast_radius_filter_no_db_returns_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let result = resolve_blast_radius_filter(Some("src/auth.rs"), &None, root, false);
+        assert!(
+            result.is_ok(),
+            "must not error when temporal_db is None, got: {:?}",
+            result.unwrap_err()
+        );
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "must return None (graceful degradation) when temporal_db is None"
+        );
+    }
+
+    // ============================================================================
+    // F12: Missing temporal.db must produce exit 0 (graceful degradation), not
+    //      exit 1. AC says: "Missing temporal.db → warning on stderr, exit 0".
+    // ============================================================================
+
+    /// Standalone temporal mode (e.g. `skim search --hot`) with no temporal.db must
+    /// return `ExitCode::SUCCESS` (not FAILURE). The missing DB is a graceful-
+    /// degradation case, not an error.
+    #[test]
+    fn test_standalone_temporal_no_db_returns_exit_0() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        // No temporal.db exists in the temp dir's cache — standalone path should
+        // degrade gracefully with exit 0.
+        let result = run(
+            &["--hot".to_string(), "--root".to_string(), root],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "missing temporal.db must be a warning (exit 0), not an error (exit 1)"
+        );
     }
 }

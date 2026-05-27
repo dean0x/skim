@@ -618,6 +618,32 @@ fn test_search_result_field_populated_from_dominant_field() {
 }
 
 // -----------------------------------------------------------------------
+// file_filter edge cases
+// -----------------------------------------------------------------------
+
+/// An empty HashSet passed as `file_filter` must return no results, because no
+/// document can satisfy an allowlist with zero members.  This exercises the
+/// `Some(empty_set)` path in the first sub-pass filter and the defense-in-depth
+/// filter, both of which must agree that every doc is excluded.
+#[test]
+fn test_file_filter_empty_set_returns_no_results() {
+    let (_dir, layer) = build_index_with(&[
+        (FileId(0), "fn main() {}", rskim_core::Language::Rust),
+        (FileId(1), "def main(): pass", rskim_core::Language::Python),
+    ]);
+
+    let mut query = SearchQuery::new("main");
+    query.file_filter = Some(std::collections::HashSet::new());
+
+    let results = layer.search(&query).unwrap();
+    assert!(
+        results.is_empty(),
+        "Some(empty_set) file_filter must return no results, got {} results",
+        results.len()
+    );
+}
+
+// -----------------------------------------------------------------------
 // BM25FConfig validation at trust boundaries
 // -----------------------------------------------------------------------
 

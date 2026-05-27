@@ -60,8 +60,8 @@ fn make_risk(n: usize) -> RiskRow {
 
 fn make_cochange(n: usize) -> CochangeRow {
     CochangeRow {
-        file_a: format!("src/file_{n}.rs"),
-        file_b: format!("src/file_{}.rs", n + 1),
+        file_a: format!("src/file_{n:05}.rs"),
+        file_b: format!("src/file_{:05}.rs", n + 1),
         count: (n + 1) as u32,
         jaccard: n as f64 / 10_000.0,
     }

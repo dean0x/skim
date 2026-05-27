@@ -73,6 +73,16 @@ fn insert_cochanges_in_tx(tx: &rusqlite::Transaction<'_>, rows: &[CochangeRow]) 
         )
         .map_err(db_err)?;
     for row in rows {
+        // Canonical ordering invariant: file_a < file_b must always hold.
+        // The UNION ALL query in cochanges_for_file relies on this to avoid
+        // returning duplicate rows (a row cannot satisfy both arms if the
+        // ordering is strict).
+        debug_assert!(
+            row.file_a < row.file_b,
+            "cochange row violates file_a < file_b invariant: {:?} >= {:?}",
+            row.file_a,
+            row.file_b
+        );
         stmt.execute(params![row.file_a, row.file_b, row.count, row.jaccard])
             .map_err(db_err)?;
     }
@@ -80,6 +90,214 @@ fn insert_cochanges_in_tx(tx: &rusqlite::Transaction<'_>, rows: &[CochangeRow]) 
 }
 
 impl TemporalDb {
+    // ========================================================================
+    // Per-file lookup methods
+    // ========================================================================
+
+    /// Look up a single file's hotspot data.
+    ///
+    /// Returns `Ok(None)` when the file has no hotspot entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::Database`] on any SQLite failure other than
+    /// `QueryReturnedNoRows`.
+    pub fn hotspot_for_file(&self, path: &str) -> Result<Option<HotspotRow>> {
+        match self.conn.query_row(
+            "SELECT file_path, score, changes_30d, changes_90d FROM hotspot WHERE file_path = ?1",
+            rusqlite::params![path],
+            |row| {
+                Ok(HotspotRow {
+                    file_path: row.get(0)?,
+                    score: row.get(1)?,
+                    changes_30d: row.get(2)?,
+                    changes_90d: row.get(3)?,
+                })
+            },
+        ) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    /// Look up a single file's risk data.
+    ///
+    /// Returns `Ok(None)` when the file has no risk entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::Database`] on any SQLite failure other than
+    /// `QueryReturnedNoRows`.
+    pub fn risk_for_file(&self, path: &str) -> Result<Option<RiskRow>> {
+        match self.conn.query_row(
+            "SELECT file_path, risk_score, total_commits, fix_commits, fix_density \
+             FROM risk WHERE file_path = ?1",
+            rusqlite::params![path],
+            |row| {
+                Ok(RiskRow {
+                    file_path: row.get(0)?,
+                    risk_score: row.get(1)?,
+                    total_commits: row.get(2)?,
+                    fix_commits: row.get(3)?,
+                    fix_density: row.get(4)?,
+                })
+            },
+        ) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    /// Find all co-change partners for a file (bidirectional).
+    ///
+    /// Searches both `file_a` and `file_b` columns so the canonical ordering
+    /// (lexically smaller path in `file_a`) is transparent to callers.
+    /// Results are sorted by Jaccard similarity descending.
+    ///
+    /// Uses `UNION ALL` of two indexed queries instead of `OR` to allow SQLite
+    /// to use both the primary key index on `file_a` and the secondary index on
+    /// `file_b`. With `OR`, SQLite degrades to a partial or full table scan at
+    /// large row counts. `UNION ALL` (not `UNION`) is safe because the canonical
+    /// ordering guarantee (`file_a < file_b`) makes self-pairs impossible, so no
+    /// row can satisfy both arms simultaneously.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::Database`] on any SQLite failure.
+    pub fn cochanges_for_file(&self, path: &str) -> Result<Vec<CochangeRow>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT file_a, file_b, count, jaccard FROM cochange WHERE file_a = ?1 \
+                 UNION ALL \
+                 SELECT file_a, file_b, count, jaccard FROM cochange WHERE file_b = ?1 \
+                 ORDER BY jaccard DESC LIMIT 10000",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![path], |row| {
+                Ok(CochangeRow {
+                    file_a: row.get(0)?,
+                    file_b: row.get(1)?,
+                    count: row.get(2)?,
+                    jaccard: row.get(3)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    // ========================================================================
+    // Top-N query methods
+    // ========================================================================
+
+    /// Return the top `limit` hotspot rows ordered by score descending.
+    ///
+    /// `limit` is silently clamped to [`MAX_ROWS_PER_TABLE`] to prevent
+    /// `usize::MAX as i64` integer overflow when binding to SQLite.
+    ///
+    /// Returns an empty `Vec` when the table is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::Database`] on any SQLite failure.
+    pub fn top_hotspots(&self, limit: usize) -> Result<Vec<HotspotRow>> {
+        let limit = limit.min(MAX_ROWS_PER_TABLE);
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT file_path, score, changes_30d, changes_90d FROM hotspot \
+                 ORDER BY score DESC LIMIT ?1",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit as i64], |row| {
+                Ok(HotspotRow {
+                    file_path: row.get(0)?,
+                    score: row.get(1)?,
+                    changes_30d: row.get(2)?,
+                    changes_90d: row.get(3)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// Return the top `limit` risk rows ordered by risk_score descending.
+    ///
+    /// `limit` is silently clamped to [`MAX_ROWS_PER_TABLE`] to prevent
+    /// `usize::MAX as i64` integer overflow when binding to SQLite.
+    ///
+    /// Returns an empty `Vec` when the table is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::Database`] on any SQLite failure.
+    pub fn top_risks(&self, limit: usize) -> Result<Vec<RiskRow>> {
+        let limit = limit.min(MAX_ROWS_PER_TABLE);
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT file_path, risk_score, total_commits, fix_commits, fix_density \
+                 FROM risk ORDER BY risk_score DESC LIMIT ?1",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit as i64], |row| {
+                Ok(RiskRow {
+                    file_path: row.get(0)?,
+                    risk_score: row.get(1)?,
+                    total_commits: row.get(2)?,
+                    fix_commits: row.get(3)?,
+                    fix_density: row.get(4)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// Return the bottom `limit` hotspot rows ordered by score ascending (coldspots).
+    ///
+    /// `limit` is silently clamped to [`MAX_ROWS_PER_TABLE`] to prevent
+    /// `usize::MAX as i64` integer overflow when binding to SQLite.
+    ///
+    /// Returns an empty `Vec` when the table is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::Database`] on any SQLite failure.
+    pub fn top_coldspots(&self, limit: usize) -> Result<Vec<HotspotRow>> {
+        let limit = limit.min(MAX_ROWS_PER_TABLE);
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT file_path, score, changes_30d, changes_90d FROM hotspot \
+                 ORDER BY score ASC LIMIT ?1",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit as i64], |row| {
+                Ok(HotspotRow {
+                    file_path: row.get(0)?,
+                    score: row.get(1)?,
+                    changes_30d: row.get(2)?,
+                    changes_90d: row.get(3)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
     // ========================================================================
     // Individual store methods
     // ========================================================================
@@ -196,7 +414,7 @@ impl TemporalDb {
                 })
             })
             .map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_err)?;
         if rows.len() > MAX_ROWS_PER_TABLE {
             return Err(SearchError::CapacityExceeded(format!(
@@ -234,7 +452,7 @@ impl TemporalDb {
                 })
             })
             .map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_err)?;
         if rows.len() > MAX_ROWS_PER_TABLE {
             return Err(SearchError::CapacityExceeded(format!(
@@ -271,7 +489,7 @@ impl TemporalDb {
                 })
             })
             .map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_err)?;
         if rows.len() > MAX_ROWS_PER_TABLE {
             return Err(SearchError::CapacityExceeded(format!(

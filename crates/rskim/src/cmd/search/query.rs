@@ -64,11 +64,34 @@ pub(super) fn execute_query(
     let mut sq = SearchQuery::new(config.text.clone());
     sq.limit = Some(config.limit);
 
+    // Hoist sorted_paths() so it is computed once and reused for both the
+    // file_filter construction and the path-resolution step below.
+    let sorted = manifest.sorted_paths();
+
+    // When blast-radius paths are provided, convert them to FileId allowlist
+    // so the search engine filters BEFORE applying the limit. This ensures
+    // the limit applies to the filtered set rather than discarding matches
+    // that fall outside the top-N unfiltered results.
+    if let Some(ref allowed_paths) = config.blast_radius_paths {
+        let mut file_ids = std::collections::HashSet::new();
+        for (idx, path) in sorted.iter().enumerate() {
+            if allowed_paths.contains(*path) {
+                file_ids.insert(rskim_search::FileId(idx as u32));
+            }
+        }
+        if file_ids.is_empty() {
+            eprintln!(
+                "skim search: blast-radius filter matched 0 indexed files \
+                 (allowed {} paths, index has {} files)",
+                allowed_paths.len(),
+                sorted.len()
+            );
+        }
+        sq.file_filter = Some(file_ids);
+    }
+
     // Execute the search.
     let raw_results = engine.search(&sq)?;
-
-    // Use the manifest returned by auto_refresh_if_stale (already loaded).
-    let sorted = manifest.sorted_paths();
 
     // Resolve and enrich results.
     let results = resolve_paths_and_snippets(&raw_results, &sorted, root, &manifest);
@@ -119,6 +142,7 @@ fn resolve_paths_and_snippets(
                 snippet,
                 stale,
                 match_positions: r.match_positions.clone(),
+                temporal: None,
             })
         })
         .collect()
@@ -128,11 +152,35 @@ fn resolve_paths_and_snippets(
 // Output formatters
 // ============================================================================
 
+/// Build an optional temporal annotation suffix for a single result line.
+///
+/// Examples:
+/// - hotspot only  → `"  hotspot: 0.950"`
+/// - risk only     → `"  risk: 0.800"`
+/// - both          → `"  hotspot: 0.950  risk: 0.800"`
+/// - neither       → `""`
+fn temporal_annotation_tag(temporal: Option<&super::types::TemporalAnnotation>) -> String {
+    let Some(t) = temporal else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(hs) = t.hotspot_score {
+        parts.push(format!("hotspot: {hs:.3}"));
+    }
+    if let Some(rs) = t.risk_score {
+        parts.push(format!("risk: {rs:.3}"));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("  {}", parts.join("  "))
+}
+
 /// Format query results as human-readable text to `w`.
 ///
 /// Format per result:
 /// ```text
-/// src/auth/middleware.rs:42  [function_signature]  score: 12.34
+/// src/auth/middleware.rs:42  [function_signature]  score: 12.34  hotspot: 0.950
 ///   41│ /// Validates JWT token
 ///   42│ pub fn authenticate(req: &Request) -> Result<Claims> {
 ///   43│     let header = req.header("Authorization")
@@ -149,10 +197,14 @@ pub(super) fn format_text_output(
     for r in &output.results {
         let line_info = r.line_number.map(|ln| format!(":{ln}")).unwrap_or_default();
         let stale_tag = if r.stale { "  [stale]" } else { "" };
+
+        // Compose optional temporal annotation suffix: "  hotspot: 0.95  risk: 0.80"
+        let temporal_tag = temporal_annotation_tag(r.temporal.as_ref());
+
         writeln!(
             w,
-            "{}{}  [{}]  score: {:.2}{}",
-            r.path, line_info, r.field, r.score, stale_tag
+            "{}{}  [{}]  score: {:.2}{}{}",
+            r.path, line_info, r.field, r.score, stale_tag, temporal_tag
         )?;
 
         if let Some(ctx) = &r.snippet {
