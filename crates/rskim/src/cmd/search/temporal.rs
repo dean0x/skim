@@ -84,7 +84,10 @@ pub(super) fn normalize_blast_radius_path(
     // between the existence check above and this call).
     let canonical = abs.canonicalize().unwrap_or_else(|e| {
         if crate::debug::is_debug_enabled() {
-            eprintln!("skim search: canonicalize failed for {:?}: {e} — using raw path", abs);
+            eprintln!(
+                "skim search: canonicalize failed for {:?}: {e} — using raw path",
+                abs
+            );
         }
         abs.clone()
     });
@@ -333,12 +336,14 @@ fn resort_partners_by_temporal(
         .map(|row| -> anyhow::Result<f64> {
             let partner = cochange_partner(row, normalized);
             match sort_mode {
-                TemporalSort::Hot | TemporalSort::Cold => {
-                    Ok(db.hotspot_for_file(partner)?.map(|h| h.score).unwrap_or(0.0))
-                }
-                TemporalSort::Risky => {
-                    Ok(db.risk_for_file(partner)?.map(|r| r.risk_score).unwrap_or(0.0))
-                }
+                TemporalSort::Hot | TemporalSort::Cold => Ok(db
+                    .hotspot_for_file(partner)?
+                    .map(|h| h.score)
+                    .unwrap_or(0.0)),
+                TemporalSort::Risky => Ok(db
+                    .risk_for_file(partner)?
+                    .map(|r| r.risk_score)
+                    .unwrap_or(0.0)),
             }
         })
         .collect::<anyhow::Result<_>>()?;
@@ -617,7 +622,10 @@ pub(super) fn apply_temporal_enrichment(
         TemporalSort::Risky => {
             annotate_risks(results, db);
             let risk_score = |r: &ResolvedResult| {
-                r.temporal.as_ref().and_then(|t| t.risk_score).unwrap_or(-1.0)
+                r.temporal
+                    .as_ref()
+                    .and_then(|t| t.risk_score)
+                    .unwrap_or(-1.0)
             };
             results.sort_by(|a, b| {
                 risk_score(b)

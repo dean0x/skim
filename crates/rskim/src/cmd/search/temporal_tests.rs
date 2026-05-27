@@ -222,7 +222,10 @@ fn cochange_partner_paths_target_is_file_b() {
 #[test]
 fn cochange_partner_paths_empty_input() {
     let partners = super::cochange_partner_paths(&[], "src/anything.rs");
-    assert!(partners.is_empty(), "empty input must produce empty partner set");
+    assert!(
+        partners.is_empty(),
+        "empty input must produce empty partner set"
+    );
 }
 
 // ============================================================================
@@ -884,7 +887,9 @@ fn staleness_warns_when_stored_head_differs_from_current() {
         .arg("init")
         .output();
     if init.map(|o| !o.status.success()).unwrap_or(true) {
-        eprintln!("SKIP staleness_warns_when_stored_head_differs_from_current: git init failed or git not available");
+        eprintln!(
+            "SKIP staleness_warns_when_stored_head_differs_from_current: git init failed or git not available"
+        );
         return;
     }
 
@@ -911,7 +916,9 @@ fn staleness_warns_when_stored_head_differs_from_current() {
         .args(["-C", root.to_str().unwrap(), "commit", "-m", "init"])
         .output();
     if commit_result.map(|o| !o.status.success()).unwrap_or(true) {
-        eprintln!("SKIP staleness_warns_when_stored_head_differs_from_current: git commit failed (CI environment without git identity?)");
+        eprintln!(
+            "SKIP staleness_warns_when_stored_head_differs_from_current: git commit failed (CI environment without git identity?)"
+        );
         return;
     }
 

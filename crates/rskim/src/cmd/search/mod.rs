@@ -169,8 +169,8 @@ fn parse_temporal_flag(
             Ok(false)
         }
         "--blast-radius" => {
-            let val = next_arg
-                .ok_or_else(|| anyhow::anyhow!("--blast-radius requires a file path"))?;
+            let val =
+                next_arg.ok_or_else(|| anyhow::anyhow!("--blast-radius requires a file path"))?;
             *blast_radius = Some(val.clone());
             Ok(true)
         }
@@ -487,8 +487,12 @@ fn run_query(
     // is applied inside the search engine (before LIMIT). This ensures the
     // limit applies to the filtered set rather than silently discarding
     // co-change partners that ranked beyond the top-N unfiltered results.
-    let blast_radius_paths =
-        resolve_blast_radius_filter(flags.blast_radius.as_deref(), &temporal_db, &root, flags.json)?;
+    let blast_radius_paths = resolve_blast_radius_filter(
+        flags.blast_radius.as_deref(),
+        &temporal_db,
+        &root,
+        flags.json,
+    )?;
 
     let config = types::QueryConfig {
         text: text.to_string(),
