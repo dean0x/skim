@@ -133,8 +133,8 @@ pub(super) fn check_temporal_staleness(db: &TemporalDb, project_root: &Path) -> 
         Some(format!(
             "skim search: temporal data is stale (stored: {}, current: {}). \
              Run 'skim heatmap' to refresh.",
-            &stored_head[..stored_head.len().min(7)],
-            &current_head[..current_head.len().min(7)],
+            stored_head.get(..7).unwrap_or(&stored_head),
+            current_head.get(..7).unwrap_or(&current_head),
         ))
     } else {
         None
@@ -215,55 +215,8 @@ pub(super) fn query_standalone(
         let normalized = normalize_blast_radius_path(raw_path, project_root)?;
         let mut partners = db.cochanges_for_file(&normalized)?;
 
-        // Re-sort by temporal metric when a sort mode is specified.
         if let Some(sort_mode) = sort {
-            match sort_mode {
-                TemporalSort::Hot | TemporalSort::Cold => {
-                    let hotspots = db.load_hotspots()?;
-                    let hotspot_map: std::collections::HashMap<&str, f64> = hotspots
-                        .iter()
-                        .map(|h| (h.file_path.as_str(), h.score))
-                        .collect();
-                    partners.sort_by(|a, b| {
-                        let score_a = hotspot_map
-                            .get(cochange_partner(a, &normalized))
-                            .copied()
-                            .unwrap_or(0.0);
-                        let score_b = hotspot_map
-                            .get(cochange_partner(b, &normalized))
-                            .copied()
-                            .unwrap_or(0.0);
-                        let cmp = score_a
-                            .partial_cmp(&score_b)
-                            .unwrap_or(std::cmp::Ordering::Equal);
-                        if sort_mode == TemporalSort::Cold {
-                            cmp
-                        } else {
-                            cmp.reverse()
-                        }
-                    });
-                }
-                TemporalSort::Risky => {
-                    let risks = db.load_risks()?;
-                    let risk_map: std::collections::HashMap<&str, f64> = risks
-                        .iter()
-                        .map(|r| (r.file_path.as_str(), r.risk_score))
-                        .collect();
-                    partners.sort_by(|a, b| {
-                        let risk_a = risk_map
-                            .get(cochange_partner(a, &normalized))
-                            .copied()
-                            .unwrap_or(0.0);
-                        let risk_b = risk_map
-                            .get(cochange_partner(b, &normalized))
-                            .copied()
-                            .unwrap_or(0.0);
-                        risk_b
-                            .partial_cmp(&risk_a)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                }
-            }
+            resort_partners_by_temporal(&mut partners, sort_mode, &normalized, db)?;
         }
 
         partners.truncate(limit);
@@ -276,18 +229,76 @@ pub(super) fn query_standalone(
     // No blast-radius — pure temporal sort.
     match sort {
         Some(TemporalSort::Hot) | None => {
-            let rows = db.top_hotspots(limit)?;
-            Ok(TemporalQueryOutput::Hotspots(rows))
+            Ok(TemporalQueryOutput::Hotspots(db.top_hotspots(limit)?))
         }
         Some(TemporalSort::Cold) => {
-            let rows = db.top_coldspots(limit)?;
-            Ok(TemporalQueryOutput::Coldspots(rows))
+            Ok(TemporalQueryOutput::Coldspots(db.top_coldspots(limit)?))
         }
-        Some(TemporalSort::Risky) => {
-            let rows = db.top_risks(limit)?;
-            Ok(TemporalQueryOutput::Risks(rows))
+        Some(TemporalSort::Risky) => Ok(TemporalQueryOutput::Risks(db.top_risks(limit)?)),
+    }
+}
+
+/// Re-sort blast-radius partners by temporal score using per-file lookups.
+///
+/// Uses `hotspot_for_file` / `risk_for_file` for each partner individually,
+/// avoiding bulk table loads. Absent entries sort last (score 0.0).
+///
+/// # Errors
+///
+/// Returns an error if any per-file DB query fails.
+fn resort_partners_by_temporal(
+    partners: &mut Vec<rskim_search::CochangeRow>,
+    sort_mode: TemporalSort,
+    normalized: &str,
+    db: &TemporalDb,
+) -> anyhow::Result<()> {
+    match sort_mode {
+        TemporalSort::Hot | TemporalSort::Cold => {
+            let mut scored: Vec<(usize, f64)> = partners
+                .iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    let partner = cochange_partner(row, normalized);
+                    let score = db
+                        .hotspot_for_file(partner)?
+                        .map(|h| h.score)
+                        .unwrap_or(0.0);
+                    Ok((i, score))
+                })
+                .collect::<anyhow::Result<_>>()?;
+
+            if sort_mode == TemporalSort::Cold {
+                scored
+                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            } else {
+                scored
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            let reordered: Vec<_> =
+                scored.into_iter().map(|(i, _)| partners[i].clone()).collect();
+            *partners = reordered;
+        }
+        TemporalSort::Risky => {
+            let mut scored: Vec<(usize, f64)> = partners
+                .iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    let partner = cochange_partner(row, normalized);
+                    let score = db
+                        .risk_for_file(partner)?
+                        .map(|r| r.risk_score)
+                        .unwrap_or(0.0);
+                    Ok((i, score))
+                })
+                .collect::<anyhow::Result<_>>()?;
+
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let reordered: Vec<_> =
+                scored.into_iter().map(|(i, _)| partners[i].clone()).collect();
+            *partners = reordered;
         }
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -395,7 +406,7 @@ pub(super) fn format_temporal_json(
                 .collect();
             serde_json::json!({
                 "mode": mode,
-                "limit": rows.len(),
+                "total": rows.len(),
                 "results": results,
             })
         }
@@ -414,7 +425,7 @@ pub(super) fn format_temporal_json(
                 .collect();
             serde_json::json!({
                 "mode": "risky",
-                "limit": rows.len(),
+                "total": rows.len(),
                 "results": results,
             })
         }
@@ -432,7 +443,7 @@ pub(super) fn format_temporal_json(
             serde_json::json!({
                 "mode": "blast_radius",
                 "target": target,
-                "limit": partners.len(),
+                "total": partners.len(),
                 "results": results,
             })
         }
@@ -454,8 +465,11 @@ pub(super) fn format_temporal_json(
 /// - For `Risky`: annotate with risk scores, sort descending. Files absent
 ///   sort last.
 ///
-/// Graceful degradation: if the DB query fails, log a debug warning and
-/// return without modifying the results.
+/// Uses per-file lookups (`hotspot_for_file` / `risk_for_file`) to avoid
+/// bulk table loads when annotating a small result set.
+///
+/// Graceful degradation: if a per-file DB query fails, the result is left
+/// unannotated and a warning is emitted; other results are still annotated.
 pub(super) fn apply_temporal_enrichment(
     results: &mut [ResolvedResult],
     sort: TemporalSort,
@@ -463,28 +477,7 @@ pub(super) fn apply_temporal_enrichment(
 ) -> anyhow::Result<()> {
     match sort {
         TemporalSort::Hot | TemporalSort::Cold => {
-            let hotspots = match db.load_hotspots() {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("skim search: temporal enrichment warning: {e}");
-                    return Ok(());
-                }
-            };
-            let hotspot_map: std::collections::HashMap<&str, &HotspotRow> =
-                hotspots.iter().map(|h| (h.file_path.as_str(), h)).collect();
-
-            for result in results.iter_mut() {
-                if let Some(row) = hotspot_map.get(result.path.as_str()) {
-                    result.temporal = Some(TemporalAnnotation {
-                        hotspot_score: Some(row.score),
-                        changes_30d: Some(row.changes_30d),
-                        changes_90d: Some(row.changes_90d),
-                        ..Default::default()
-                    });
-                }
-            }
-
-            // Hot: descending (annotated first). Cold: ascending (unannotated first via -1.0).
+            annotate_hotspots(results, db);
             let hotspot_score = |r: &ResolvedResult| {
                 r.temporal
                     .as_ref()
@@ -504,27 +497,7 @@ pub(super) fn apply_temporal_enrichment(
             });
         }
         TemporalSort::Risky => {
-            let risks = match db.load_risks() {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("skim search: temporal enrichment warning: {e}");
-                    return Ok(());
-                }
-            };
-            let risk_map: std::collections::HashMap<&str, &RiskRow> =
-                risks.iter().map(|r| (r.file_path.as_str(), r)).collect();
-
-            for result in results.iter_mut() {
-                if let Some(row) = risk_map.get(result.path.as_str()) {
-                    result.temporal = Some(TemporalAnnotation {
-                        risk_score: Some(row.risk_score),
-                        fix_density: Some(row.fix_density),
-                        ..Default::default()
-                    });
-                }
-            }
-
-            // Sort descending: annotated files first (by risk_score desc), then unannotated by path.
+            annotate_risks(results, db);
             results.sort_by(|a, b| {
                 let risk_a = a
                     .temporal
@@ -544,6 +517,49 @@ pub(super) fn apply_temporal_enrichment(
         }
     }
     Ok(())
+}
+
+/// Annotate results with hotspot data using per-file lookups.
+///
+/// On lookup failure, emits a warning and leaves that result unannotated.
+fn annotate_hotspots(results: &mut [ResolvedResult], db: &TemporalDb) {
+    for result in results.iter_mut() {
+        match db.hotspot_for_file(&result.path) {
+            Ok(Some(row)) => {
+                result.temporal = Some(TemporalAnnotation {
+                    hotspot_score: Some(row.score),
+                    changes_30d: Some(row.changes_30d),
+                    changes_90d: Some(row.changes_90d),
+                    ..Default::default()
+                });
+            }
+            Ok(None) => {} // File not in temporal DB — leave unannotated.
+            Err(e) => {
+                eprintln!("skim search: temporal enrichment warning: {e}");
+            }
+        }
+    }
+}
+
+/// Annotate results with risk data using per-file lookups.
+///
+/// On lookup failure, emits a warning and leaves that result unannotated.
+fn annotate_risks(results: &mut [ResolvedResult], db: &TemporalDb) {
+    for result in results.iter_mut() {
+        match db.risk_for_file(&result.path) {
+            Ok(Some(row)) => {
+                result.temporal = Some(TemporalAnnotation {
+                    risk_score: Some(row.risk_score),
+                    fix_density: Some(row.fix_density),
+                    ..Default::default()
+                });
+            }
+            Ok(None) => {} // File not in temporal DB — leave unannotated.
+            Err(e) => {
+                eprintln!("skim search: temporal enrichment warning: {e}");
+            }
+        }
+    }
 }
 
 // ============================================================================

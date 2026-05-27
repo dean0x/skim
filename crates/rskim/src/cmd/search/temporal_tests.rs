@@ -407,6 +407,8 @@ fn standalone_hot_json_valid() {
     let v: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
     assert_eq!(v["mode"], "hot");
     assert!(v["results"].is_array());
+    assert_eq!(v["total"], 1, "JSON output should use 'total', not 'limit'");
+    assert!(v["limit"].is_null(), "JSON output must not contain a 'limit' field");
 }
 
 #[test]
