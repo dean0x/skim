@@ -894,7 +894,7 @@ mod tests {
     fn test_resolve_blast_radius_filter_no_db_returns_none() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        let result = resolve_blast_radius_filter(Some("src/auth.rs"), &None, root);
+        let result = resolve_blast_radius_filter(Some("src/auth.rs"), &None, root, false);
         assert!(
             result.is_ok(),
             "must not error when temporal_db is None, got: {:?}",
