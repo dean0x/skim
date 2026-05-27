@@ -155,7 +155,7 @@ impl TemporalDb {
             .prepare(
                 "SELECT file_a, file_b, count, jaccard FROM cochange \
                  WHERE file_a = ?1 OR file_b = ?1 \
-                 ORDER BY jaccard DESC",
+                 ORDER BY jaccard DESC LIMIT 10000",
             )
             .map_err(db_err)?;
         let rows = stmt

@@ -489,6 +489,46 @@ fn cochanges_for_file_respects_canonical_ordering() {
     assert_eq!(via_b, vec![row]);
 }
 
+/// Regression: cochanges_for_file must return results ordered by jaccard DESC.
+/// With many rows the LIMIT 10000 keeps memory bounded while preserving the
+/// highest-jaccard partners at the front of the result.
+#[test]
+fn cochanges_for_file_returns_highest_jaccard_first_with_many_rows() {
+    let (_dir, db) = temp_db();
+
+    // Insert 20 co-change rows for "src/hub.rs" with varying jaccard values.
+    // The pair with jaccard=1.00 should always appear first regardless of
+    // insertion order.
+    let rows: Vec<CochangeRow> = (0..20_u32)
+        .map(|i| CochangeRow {
+            // "src/hub.rs" < "src/partner_NN.rs" lexically so file_a = hub.
+            file_a: "src/hub.rs".to_string(),
+            file_b: format!("src/partner_{i:02}.rs"),
+            count: i + 1,
+            jaccard: (i as f64 + 1.0) / 20.0, // 0.05 .. 1.00
+        })
+        .collect();
+    db.store_cochanges(&rows).unwrap();
+
+    let results = db.cochanges_for_file("src/hub.rs").unwrap();
+    assert_eq!(results.len(), 20, "all 20 rows should be returned");
+    // Verify the result is sorted descending by jaccard.
+    for window in results.windows(2) {
+        assert!(
+            window[0].jaccard >= window[1].jaccard,
+            "results must be sorted by jaccard DESC: {} < {}",
+            window[0].jaccard,
+            window[1].jaccard
+        );
+    }
+    // The first result should be the highest-jaccard pair.
+    assert!(
+        (results[0].jaccard - 1.0).abs() < f64::EPSILON,
+        "highest jaccard partner must be first, got {}",
+        results[0].jaccard
+    );
+}
+
 // ============================================================================
 // Group 8: Top-N query methods (Step 2)
 // ============================================================================

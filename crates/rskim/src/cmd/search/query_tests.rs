@@ -352,6 +352,86 @@ fn test_resolved_result_line_range_none_serializes_null() {
 }
 
 // ============================================================================
+// blast_radius_paths filter
+// ============================================================================
+
+/// When blast_radius_paths is set, execute_query must restrict results to
+/// the allowed paths. The target file itself is included in the set (Issue fix:
+/// previously only co-change *partners* were included, excluding the target).
+#[test]
+fn test_execute_query_blast_radius_includes_only_allowed_paths() {
+    use std::collections::HashSet;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    // Allow only src/auth.rs in the blast-radius set.
+    let mut allowed: HashSet<String> = HashSet::new();
+    allowed.insert("src/auth.rs".to_string());
+
+    let config = QueryConfig {
+        text: "authenticate".to_string(),
+        limit: 20,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // All results must be from the allowed set.
+    for r in &output.results {
+        assert_eq!(
+            r.path, "src/auth.rs",
+            "blast-radius filter must restrict results to allowed paths, got: {}",
+            r.path
+        );
+    }
+}
+
+/// When blast_radius_paths contains the target file, a query that matches
+/// the target returns results for that file.
+/// Regression for: combined mode was excluding the target file itself.
+#[test]
+fn test_execute_query_blast_radius_target_file_is_included() {
+    use std::collections::HashSet;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    // Build an allowlist that includes src/auth.rs (the "target") plus a
+    // partner that has no matching content for "authenticate".
+    let mut allowed: HashSet<String> = HashSet::new();
+    allowed.insert("src/auth.rs".to_string()); // target
+    allowed.insert("src/does_not_exist.rs".to_string()); // partner (not indexed)
+
+    let config = QueryConfig {
+        text: "authenticate".to_string(),
+        limit: 20,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // src/auth.rs contains "authenticate" and is in the allowed set — it must appear.
+    let has_auth = output.results.iter().any(|r| r.path == "src/auth.rs");
+    assert!(
+        has_auth,
+        "target file (src/auth.rs) must be in blast-radius results when it matches the query"
+    );
+}
+
+// ============================================================================
 // format_json_output
 // ============================================================================
 

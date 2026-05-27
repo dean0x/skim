@@ -408,28 +408,26 @@ fn run_query(
     };
 
     if let (Some(raw_path), Some(db)) = (blast_radius, &temporal_db) {
-        match temporal::normalize_blast_radius_path(raw_path, &root) {
-            Ok(normalized) => {
-                let partners = db.cochanges_for_file(&normalized)?;
-                if partners.is_empty() {
-                    eprintln!("skim search: no co-change data for {raw_path:?}");
-                }
-                let paths: std::collections::HashSet<String> = partners
-                    .iter()
-                    .map(|p| {
-                        if p.file_a == normalized {
-                            p.file_b.clone()
-                        } else {
-                            p.file_a.clone()
-                        }
-                    })
-                    .collect();
-                blast_radius_paths = Some(paths);
-            }
-            Err(e) => {
-                eprintln!("skim search: --blast-radius: {e}");
-            }
+        let normalized = temporal::normalize_blast_radius_path(raw_path, &root)?;
+        let partners = db.cochanges_for_file(&normalized)?;
+        if partners.is_empty() {
+            eprintln!("skim search: no co-change data for {raw_path:?}");
         }
+        let mut paths: std::collections::HashSet<String> = partners
+            .iter()
+            .map(|p| {
+                if p.file_a == normalized {
+                    p.file_b.clone()
+                } else {
+                    p.file_a.clone()
+                }
+            })
+            .collect();
+        // Include the target file itself so text queries like
+        // `skim search auth --blast-radius src/auth.rs` surface matches
+        // within src/auth.rs in addition to its co-change partners.
+        paths.insert(normalized);
+        blast_radius_paths = Some(paths);
     } else if temporal_db.is_none() && (temporal_sort.is_some() || blast_radius.is_some()) {
         eprintln!("skim search: no temporal data — run 'skim heatmap' to populate");
     }
