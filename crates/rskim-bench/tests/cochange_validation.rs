@@ -203,7 +203,7 @@ fn temporal_split_no_leakage() {
         })
         .collect();
 
-    let split = temporal_split(&commits, 0.8);
+    let split = temporal_split(commits, 0.8);
 
     // Collect hashes to verify no overlap.
     let train_hashes: std::collections::HashSet<&str> =
@@ -374,7 +374,7 @@ fn full_pipeline_synthetic_repo() {
     }
 
     // Temporal split: use 0.98 so the last commit (our A+B+C test) is in test.
-    let split = temporal_split(&history.commits, 0.98);
+    let split = temporal_split(history.commits, 0.98);
 
     if split.test.is_empty() {
         eprintln!("SKIPPED: test split is empty");

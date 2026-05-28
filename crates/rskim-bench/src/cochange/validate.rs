@@ -400,7 +400,8 @@ pub fn validate_repo(
     }
 
     // 5. Temporal split (input is newest-first from GixSource).
-    let split = temporal_split(&all_commits, train_fraction);
+    // Pass ownership to avoid cloning the full commit list.
+    let split = temporal_split(all_commits, train_fraction);
 
     // 6. Build path_map from training commits.
     let path_map = build_path_map(&split.train);
@@ -624,7 +625,7 @@ fn capture_head_sha(repo_path: &Path) -> anyhow::Result<String> {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let mut child = std::process::Command::new("git")
+    let child = std::process::Command::new("git")
         .arg("-c")
         .arg("credential.helper=")
         .arg("-C")
