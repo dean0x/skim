@@ -763,56 +763,25 @@ fn error_result(entry: &RepoEntry, repo_name: &str, error: String) -> RepoCochan
 const GIT_SHA_TIMEOUT_SECS: u64 = 30;
 
 fn capture_head_sha(repo_path: &Path) -> anyhow::Result<String> {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    let child = std::process::Command::new("git")
-        .arg("-c")
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-c")
         .arg("credential.helper=")
         .arg("-C")
         .arg(repo_path)
         .args(["rev-parse", "HEAD"])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("git rev-parse spawn: {e}"))?;
+        .stderr(std::process::Stdio::null());
 
-    let child_id = child.id();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = child.wait_with_output();
-        let _ = tx.send(result);
-    });
+    let output = rskim_research::clone::git_output_with_timeout(
+        cmd,
+        "git rev-parse HEAD",
+        GIT_SHA_TIMEOUT_SECS,
+    )?;
 
-    match rx.recv_timeout(Duration::from_secs(GIT_SHA_TIMEOUT_SECS)) {
-        Ok(Ok(output)) => {
-            if !output.status.success() {
-                anyhow::bail!("git rev-parse HEAD failed");
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-        }
-        Ok(Err(e)) => Err(anyhow::anyhow!("git rev-parse wait error: {e}")),
-        Err(_timeout) => {
-            #[cfg(unix)]
-            {
-                // SAFETY: kill(2) is safe to call. Race note: the background
-                // thread may have already reaped this pid, and the pid could
-                // theoretically be recycled by the OS before we signal it.
-                // This is acceptable for a benchmark tool; a production daemon
-                // would use pidfd_open(2) on Linux 5.3+ to avoid the race.
-                unsafe {
-                    libc::kill(child_id as libc::pid_t, libc::SIGKILL);
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/F", "/PID", &child_id.to_string()])
-                    .status();
-            }
-            anyhow::bail!("git rev-parse HEAD timed out after {GIT_SHA_TIMEOUT_SECS}s");
-        }
+    if !output.status.success() {
+        anyhow::bail!("git rev-parse HEAD failed");
     }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 // ============================================================================
