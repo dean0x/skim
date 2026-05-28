@@ -130,7 +130,11 @@ fn deny_list_filters_lockfiles() {
         },
     ];
     filter_denied(&mut files);
-    assert_eq!(files.len(), 1, "only src/auth.rs should survive deny-list filtering");
+    assert_eq!(
+        files.len(),
+        1,
+        "only src/auth.rs should survive deny-list filtering"
+    );
     assert_eq!(files[0].path, PathBuf::from("src/auth.rs"));
 }
 
@@ -165,7 +169,10 @@ fn quality_gate_rejects_small_repo() {
     let result = check_quality_gates(&commits);
     assert!(result.is_err(), "small repo should fail quality gate");
     let err = result.unwrap_err();
-    assert!(err.contains("multi-file commits"), "error should mention commit count: {err}");
+    assert!(
+        err.contains("multi-file commits"),
+        "error should mention commit count: {err}"
+    );
 }
 
 #[test]
@@ -211,7 +218,12 @@ fn temporal_split_no_leakage() {
 
     // Training commits must be chronologically older than test commits.
     let max_train_ts = split.train.iter().map(|c| c.timestamp).max().unwrap_or(0);
-    let min_test_ts = split.test.iter().map(|c| c.timestamp).min().unwrap_or(i64::MAX);
+    let min_test_ts = split
+        .test
+        .iter()
+        .map(|c| c.timestamp)
+        .min()
+        .unwrap_or(i64::MAX);
     assert!(
         max_train_ts <= min_test_ts,
         "training set must contain only older commits: max_train={max_train_ts} > min_test={min_test_ts}"
@@ -226,11 +238,13 @@ fn temporal_split_no_leakage() {
 fn json_output_valid() {
     let result = sample_validation_result();
     let json = to_json(&result).expect("to_json should not fail");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&json).expect("JSON output must be valid");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("JSON output must be valid");
 
     // Verify required top-level fields.
-    assert!(parsed.get("repos").is_some(), "JSON must contain 'repos' key");
+    assert!(
+        parsed.get("repos").is_some(),
+        "JSON must contain 'repos' key"
+    );
     assert!(
         parsed.get("aggregate_metrics").is_some(),
         "JSON must contain 'aggregate_metrics' key"
@@ -263,8 +277,14 @@ fn markdown_output_non_empty() {
         md.contains("Threshold") && md.contains("|"),
         "markdown must contain a threshold table"
     );
-    assert!(md.contains("Per-Repo"), "markdown must have per-repo section");
-    assert!(md.contains("Methodology"), "markdown must have methodology section");
+    assert!(
+        md.contains("Per-Repo"),
+        "markdown must have per-repo section"
+    );
+    assert!(
+        md.contains("Methodology"),
+        "markdown must have methodology section"
+    );
 }
 
 // ============================================================================
@@ -334,8 +354,8 @@ fn full_pipeline_synthetic_repo() {
     assert!(ok, "test commit should succeed");
 
     // Parse history, build split, evaluate.
-    use rskim_search::temporal::GixSource;
     use rskim_search::TemporalSource;
+    use rskim_search::temporal::GixSource;
 
     let history = match GixSource.parse_history(dir.path(), 0) {
         Ok(h) => h,
@@ -366,8 +386,8 @@ fn full_pipeline_synthetic_repo() {
     // Build matrix.
     let index_dir = tempfile::tempdir().expect("tempdir");
     use rskim_search::cochange::CochangeMatrixBuilder;
-    let builder = CochangeMatrixBuilder::new(index_dir.path().to_path_buf())
-        .expect("builder creation");
+    let builder =
+        CochangeMatrixBuilder::new(index_dir.path().to_path_buf()).expect("builder creation");
     let history_for_builder = rskim_search::HistoryResult {
         commits: split.train.clone(),
         metadata: rskim_search::TemporalMetadata {
@@ -388,9 +408,8 @@ fn full_pipeline_synthetic_repo() {
 
     use rskim_bench::cochange::validate::evaluate_at_thresholds;
     let thresholds = vec![0.01, 0.1, 0.3];
-    let (metrics, _unmapped) =
-        evaluate_at_thresholds(&reader, &split.test, &path_map, &thresholds)
-            .expect("evaluate_at_thresholds");
+    let (metrics, _unmapped) = evaluate_at_thresholds(&reader, &split.test, &path_map, &thresholds)
+        .expect("evaluate_at_thresholds");
 
     // At a low threshold (0.01), the strong A-B coupling should yield recall > 0.
     // (We can't guarantee exact values because the commit timestamp manipulation
@@ -470,7 +489,10 @@ fn aggregate_metrics_skips_failed_repos() {
     assert_eq!(agg.len(), 1);
     // Aggregate should only include the passing repo.
     let m = &agg[0];
-    assert!((m.macro_precision - 0.5).abs() < 1e-9, "aggregate should match passing repo");
+    assert!(
+        (m.macro_precision - 0.5).abs() < 1e-9,
+        "aggregate should match passing repo"
+    );
     assert!((m.macro_recall - 0.6).abs() < 1e-9);
 }
 

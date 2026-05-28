@@ -175,7 +175,12 @@ mod tests {
 
         // After reversing, training commits should have the lowest timestamps.
         let max_train_ts = split.train.iter().map(|c| c.timestamp).max().unwrap_or(0);
-        let min_test_ts = split.test.iter().map(|c| c.timestamp).min().unwrap_or(i64::MAX);
+        let min_test_ts = split
+            .test
+            .iter()
+            .map(|c| c.timestamp)
+            .min()
+            .unwrap_or(i64::MAX);
         assert!(
             max_train_ts <= min_test_ts,
             "training set must be chronologically older: max_train={max_train_ts}, min_test={min_test_ts}"
@@ -206,7 +211,10 @@ mod tests {
         let commits = vec![make_commit(1000, 0)];
         let split = temporal_split(&commits, 0.8);
         assert_eq!(split.train.len(), 1, "single commit must go to training");
-        assert!(split.test.is_empty(), "test must be empty for single commit");
+        assert!(
+            split.test.is_empty(),
+            "test must be empty for single commit"
+        );
         assert_eq!(split.split_timestamp, 0);
     }
 

@@ -213,7 +213,12 @@ fn chrono_now() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let years = 1970 + (secs / 86400) / 365;
-    format!("{years}-XX-XXT{:02}:{:02}:{:02}Z", (secs % 86400) / 3600, (secs % 3600) / 60, secs % 60)
+    format!(
+        "{years}-XX-XXT{:02}:{:02}:{:02}Z",
+        (secs % 86400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
 }
 
 fn build_manifests(repos: &[RepoCochangeResult]) -> Vec<RepoManifest> {
@@ -256,11 +261,7 @@ fn deny_list_pattern_names() -> Vec<String> {
     ]
 }
 
-fn save_to_devflow(
-    timestamp: &str,
-    format: &OutputFormat,
-    content: &str,
-) -> anyhow::Result<()> {
+fn save_to_devflow(timestamp: &str, format: &OutputFormat, content: &str) -> anyhow::Result<()> {
     let docs_dir = Path::new(".devflow/docs");
     std::fs::create_dir_all(docs_dir)?;
     let safe_ts = timestamp.replace([':', '/'], "-");

@@ -294,9 +294,7 @@ pub fn load_fixture_files(dir: &Path) -> anyhow::Result<Vec<SourceFile>> {
 /// - The `git clone` subprocess fails or times out.
 pub fn clone_with_history(url: &str, dest: &Path) -> anyhow::Result<()> {
     if !url.starts_with("https://") {
-        anyhow::bail!(
-            "clone_with_history: url must start with 'https://', got: {url}"
-        );
+        anyhow::bail!("clone_with_history: url must start with 'https://', got: {url}");
     }
 
     // Skip if already cloned (idempotent).

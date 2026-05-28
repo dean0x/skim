@@ -219,7 +219,10 @@ mod tests {
 
         let json = serde_json::to_string(&result).unwrap();
         let restored: RepoCochangeResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.quality_gate_reason.as_deref(), Some("too few commits"));
+        assert_eq!(
+            restored.quality_gate_reason.as_deref(),
+            Some("too few commits")
+        );
         assert_eq!(restored.error.as_deref(), Some("clone failed"));
     }
 
@@ -247,6 +250,9 @@ mod tests {
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let restored: RepoManifest = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.train_cutoff_timestamp, manifest.train_cutoff_timestamp);
+        assert_eq!(
+            restored.train_cutoff_timestamp,
+            manifest.train_cutoff_timestamp
+        );
     }
 }

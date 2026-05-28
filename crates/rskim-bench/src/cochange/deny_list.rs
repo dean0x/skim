@@ -69,15 +69,12 @@ pub fn is_denied(path: &str) -> bool {
 
     // 2. Any directory component on the deny-list.
     //    Split on '/' and check every component except the last (filename).
-    let components: Vec<&str> = normalised.split('/').collect();
-    let dir_components = if components.len() > 1 {
-        &components[..components.len() - 1]
-    } else {
-        &[][..]
-    };
-    for component in dir_components {
-        let trimmed = component.trim_end_matches('/');
-        if DENIED_DIRS.contains(&trimmed) {
+    let mut components = normalised.split('/').peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break; // last segment is the filename, already checked above
+        }
+        if DENIED_DIRS.contains(&component) {
             return true;
         }
     }

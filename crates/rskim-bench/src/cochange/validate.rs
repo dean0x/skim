@@ -240,8 +240,11 @@ pub fn evaluate_at_thresholds(
                 }
 
                 // Build actual set: all other known IDs in this commit.
-                let actual: HashSet<FileId> =
-                    known_ids.iter().copied().filter(|&id| id != query_id).collect();
+                let actual: HashSet<FileId> = known_ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| id != query_id)
+                    .collect();
 
                 let p = compute_precision(&predicted, &actual);
                 let r = compute_recall(&predicted, &actual);
@@ -451,18 +454,23 @@ pub fn validate_repo(
     };
 
     // 9. Evaluate at all thresholds.
-    let (metrics, unmapped) = match evaluate_at_thresholds(&reader, &split.test, &path_map, thresholds) {
-        Ok(r) => r,
-        Err(e) => {
-            return Ok(error_result(
-                entry,
-                &repo_name,
-                format!("evaluation failed: {e:#}"),
-            ));
-        }
-    };
+    let (metrics, unmapped) =
+        match evaluate_at_thresholds(&reader, &split.test, &path_map, thresholds) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(error_result(
+                    entry,
+                    &repo_name,
+                    format!("evaluation failed: {e:#}"),
+                ));
+            }
+        };
 
-    let multi_file_test = split.test.iter().filter(|c| c.changed_files.len() >= 2).count();
+    let multi_file_test = split
+        .test
+        .iter()
+        .filter(|c| c.changed_files.len() >= 2)
+        .count();
     let single_file_test = split.test.len() - multi_file_test;
 
     Ok(RepoCochangeResult {
@@ -533,7 +541,11 @@ pub fn aggregate_metrics(
             let mut total_queries = 0usize;
 
             for repo in &passing {
-                if let Some(m) = repo.metrics_by_threshold.get(ti).filter(|m| (m.threshold - threshold).abs() < 1e-9) {
+                if let Some(m) = repo
+                    .metrics_by_threshold
+                    .get(ti)
+                    .filter(|m| (m.threshold - threshold).abs() < 1e-9)
+                {
                     mp_sum += m.macro_precision;
                     mr_sum += m.macro_recall;
                     mip_sum += m.micro_precision;

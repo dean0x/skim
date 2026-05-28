@@ -88,10 +88,14 @@ pub fn to_markdown(result: &CochangeValidationResult) -> String {
 
     // --- 4. Methodology ---
     md.push_str("## Methodology\n\n");
-    md.push_str("- **Train/test split:** 80/20 (chronological, oldest commits train, newest test)\n");
+    md.push_str(
+        "- **Train/test split:** 80/20 (chronological, oldest commits train, newest test)\n",
+    );
     md.push_str("- **Quality gates:** ≥50 multi-file commits, ≥6 months history span\n");
     md.push_str("- **Precision:** |predicted ∩ actual| / |predicted| per query\n");
-    md.push_str("- **Recall:** |predicted ∩ actual| / |actual| per query (unmapped files excluded)\n");
+    md.push_str(
+        "- **Recall:** |predicted ∩ actual| / |actual| per query (unmapped files excluded)\n",
+    );
     md.push_str("- **Macro average:** per-commit, then averaged across commits\n");
     md.push_str("- **Micro average:** accumulated over all individual queries\n");
     md.push_str("- **Deny-list patterns applied:**\n");
@@ -130,9 +134,11 @@ pub fn to_markdown(result: &CochangeValidationResult) -> String {
 // ============================================================================
 
 fn best_by_macro_f1(metrics: &[ThresholdMetrics]) -> Option<&ThresholdMetrics> {
-    metrics
-        .iter()
-        .max_by(|a, b| a.macro_f1.partial_cmp(&b.macro_f1).unwrap_or(std::cmp::Ordering::Equal))
+    metrics.iter().max_by(|a, b| {
+        a.macro_f1
+            .partial_cmp(&b.macro_f1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
 }
 
 fn threshold_row(m: &ThresholdMetrics) -> String {
@@ -198,12 +204,8 @@ fn repo_section(repo: &RepoCochangeResult) -> String {
         return md;
     }
 
-    md.push_str(
-        "| Threshold | Macro P | Macro R | Macro F1 | Micro P | Micro R | Micro F1 |\n",
-    );
-    md.push_str(
-        "|-----------|---------|---------|----------|---------|---------|----------|\n",
-    );
+    md.push_str("| Threshold | Macro P | Macro R | Macro F1 | Micro P | Micro R | Micro F1 |\n");
+    md.push_str("|-----------|---------|---------|----------|---------|---------|----------|\n");
     for m in &repo.metrics_by_threshold {
         md.push_str(&format!(
             "| {:.2} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} |\n",
@@ -360,7 +362,10 @@ mod tests {
         let result = sample_result();
         let md = to_markdown(&result);
         assert!(md.contains("repo"), "should include repo name");
-        assert!(md.contains("Per-Repo Results"), "should have per-repo section");
+        assert!(
+            md.contains("Per-Repo Results"),
+            "should have per-repo section"
+        );
     }
 
     #[test]
@@ -391,7 +396,10 @@ mod tests {
     fn markdown_shows_best_threshold() {
         let result = sample_result();
         let md = to_markdown(&result);
-        assert!(md.contains("Best threshold"), "should highlight best threshold");
+        assert!(
+            md.contains("Best threshold"),
+            "should highlight best threshold"
+        );
     }
 
     #[test]
