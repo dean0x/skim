@@ -14,6 +14,7 @@ use rskim_bench::cochange::{
     deny_list::filter_denied,
     report::{to_json, to_markdown},
     temporal_split::temporal_split,
+    test_utils::make_commit,
     types::{CochangeValidationResult, RunMetadata, ThresholdMetrics},
     validate::{
         aggregate_metrics, build_path_map, check_quality_gates, compute_f1, compute_precision,
@@ -86,23 +87,6 @@ fn git_commit_files(dir: &Path, files: &[(&str, &str)], message: &str) -> bool {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
-}
-
-fn make_commit(id: usize, timestamp: i64, paths: &[&str]) -> CommitInfo {
-    CommitInfo {
-        hash: format!("{id:040x}"),
-        timestamp,
-        author: "test".to_string(),
-        message: format!("commit {id}"),
-        changed_files: paths
-            .iter()
-            .map(|p| FileChangeInfo {
-                path: PathBuf::from(p),
-                additions: 1,
-                deletions: 0,
-            })
-            .collect(),
-    }
 }
 
 // ============================================================================
@@ -358,29 +342,23 @@ fn full_pipeline_synthetic_repo() {
     use rskim_search::TemporalSource;
     use rskim_search::temporal::GixSource;
 
-    let history = match GixSource.parse_history(dir.path(), 0) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIPPED: parse_history failed: {e}");
-            return;
-        }
-    };
+    let history = GixSource
+        .parse_history(dir.path(), 0)
+        .expect("parse_history should succeed on a freshly-initialised synthetic repo");
 
-    if history.commits.len() < 51 {
-        eprintln!(
-            "SKIPPED: only {} commits in synthetic repo (need ≥51)",
-            history.commits.len()
-        );
-        return;
-    }
+    assert!(
+        history.commits.len() >= 51,
+        "synthetic repo must have ≥51 commits; got {}",
+        history.commits.len()
+    );
 
     // Temporal split: use 0.98 so the last commit (our A+B+C test) is in test.
     let split = temporal_split(history.commits, 0.98);
 
-    if split.test.is_empty() {
-        eprintln!("SKIPPED: test split is empty");
-        return;
-    }
+    assert!(
+        !split.test.is_empty(),
+        "test split must be non-empty with a 0.98 train fraction and ≥51 commits"
+    );
 
     let path_map = build_path_map(&split.train);
 
@@ -396,13 +374,9 @@ fn full_pipeline_synthetic_repo() {
             commit_count: split.train.len(),
         },
     };
-    let _stats = match builder.build(&history_for_builder, &path_map) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("SKIPPED: matrix build failed: {e}");
-            return;
-        }
-    };
+    let _stats = builder
+        .build(&history_for_builder, &path_map)
+        .expect("matrix build should succeed on a well-formed synthetic repo");
 
     use rskim_search::cochange::CochangeMatrixReader;
     let reader = CochangeMatrixReader::open(index_dir.path()).expect("reader open");
@@ -412,9 +386,6 @@ fn full_pipeline_synthetic_repo() {
     let (metrics, _unmapped) = evaluate_at_thresholds(&reader, &split.test, &path_map, &thresholds)
         .expect("evaluate_at_thresholds");
 
-    // At a low threshold (0.01), the strong A-B coupling should yield recall > 0.
-    // (We can't guarantee exact values because the commit timestamp manipulation
-    //  may not work perfectly in all CI environments, but recall must be ≥0.)
     assert_eq!(metrics.len(), 3, "should have metrics for each threshold");
     for m in &metrics {
         assert!(
@@ -428,6 +399,18 @@ fn full_pipeline_synthetic_repo() {
             m.threshold
         );
     }
+
+    // At the lowest threshold (0.01), the 44 A+B co-change commits in training
+    // must produce a detectable signal. A regression that produces all-zero
+    // metrics (e.g., broken matrix writes, empty path_map, wrong split direction)
+    // would cause this assertion to fail.
+    let lowest = metrics.iter().find(|m| (m.threshold - 0.01).abs() < 1e-9)
+        .expect("metrics must contain threshold 0.01");
+    assert!(
+        lowest.macro_recall > 0.0,
+        "co-change model must detect A-B coupling at threshold 0.01; got recall={}",
+        lowest.macro_recall
+    );
 }
 
 // ============================================================================
@@ -438,9 +421,9 @@ fn full_pipeline_synthetic_repo() {
 fn aggregate_metrics_skips_failed_repos() {
     use rskim_bench::cochange::types::RepoCochangeResult;
 
-    let passing = RepoCochangeResult {
-        repo_url: "https://github.com/example/passing".to_string(),
-        repo_name: "passing".to_string(),
+    let passing_a = RepoCochangeResult {
+        repo_url: "https://github.com/example/passing-a".to_string(),
+        repo_name: "passing-a".to_string(),
         head_sha: "a".repeat(40),
         train_commits: 80,
         test_commits: 20,
@@ -455,12 +438,44 @@ fn aggregate_metrics_skips_failed_repos() {
             threshold: 0.1,
             macro_precision: 0.5,
             macro_recall: 0.6,
-            macro_f1: 0.545,
+            macro_f1: compute_f1(0.5, 0.6),
             micro_precision: 0.55,
             micro_recall: 0.65,
-            micro_f1: 0.595,
+            micro_f1: compute_f1(0.55, 0.65),
             commit_count: 15,
             query_count: 45,
+        }],
+        quality_gate_passed: true,
+        quality_gate_reason: None,
+        error: None,
+    };
+
+    // A second passing repo with different metric values ensures that
+    // aggregate_metrics divides by N rather than returning raw sums.
+    // (0.5 + 0.7) / 2 = 0.6  and  (0.6 + 0.8) / 2 = 0.7
+    let passing_b = RepoCochangeResult {
+        repo_url: "https://github.com/example/passing-b".to_string(),
+        repo_name: "passing-b".to_string(),
+        head_sha: "b".repeat(40),
+        train_commits: 100,
+        test_commits: 25,
+        multi_file_test_commits: 20,
+        single_file_test_commits: 5,
+        unmapped_files_in_test: 0,
+        file_count: 120,
+        pair_count: 400,
+        commits_skipped_too_large: 0,
+        split_timestamp: 1_700_100_000,
+        metrics_by_threshold: vec![ThresholdMetrics {
+            threshold: 0.1,
+            macro_precision: 0.7,
+            macro_recall: 0.8,
+            macro_f1: compute_f1(0.7, 0.8),
+            micro_precision: 0.72,
+            micro_recall: 0.82,
+            micro_f1: compute_f1(0.72, 0.82),
+            commit_count: 20,
+            query_count: 60,
         }],
         quality_gate_passed: true,
         quality_gate_reason: None,
@@ -486,15 +501,29 @@ fn aggregate_metrics_skips_failed_repos() {
         error: None,
     };
 
-    let agg = aggregate_metrics(&[passing, failing], &[0.1]);
+    let agg = aggregate_metrics(&[passing_a, passing_b, failing], &[0.1]);
     assert_eq!(agg.len(), 1);
-    // Aggregate should only include the passing repo.
     let m = &agg[0];
+
+    // Average of the two passing repos: (0.5 + 0.7) / 2 = 0.6
     assert!(
-        (m.macro_precision - 0.5).abs() < 1e-9,
-        "aggregate should match passing repo"
+        (m.macro_precision - 0.6).abs() < 1e-9,
+        "aggregate macro_precision should be (0.5+0.7)/2=0.6, got {}",
+        m.macro_precision
     );
-    assert!((m.macro_recall - 0.6).abs() < 1e-9);
+    // Average of the two passing repos: (0.6 + 0.8) / 2 = 0.7
+    assert!(
+        (m.macro_recall - 0.7).abs() < 1e-9,
+        "aggregate macro_recall should be (0.6+0.8)/2=0.7, got {}",
+        m.macro_recall
+    );
+
+    // Verify the failing repo was excluded: if it were included the averages
+    // would be (0.5+0.7+0.0)/3 ≈ 0.4 and (0.6+0.8+0.0)/3 ≈ 0.467.
+    assert!(
+        m.macro_precision > 0.55,
+        "failing repo must not lower the aggregate precision below 0.55"
+    );
 }
 
 // ============================================================================

@@ -707,26 +707,10 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use rskim_search::{CommitInfo, FileChangeInfo, FileId};
+    use rskim_search::FileId;
 
     use super::*;
-
-    fn make_commit(id: usize, timestamp: i64, paths: &[&str]) -> CommitInfo {
-        CommitInfo {
-            hash: format!("{id:040x}"),
-            timestamp,
-            author: "test".to_string(),
-            message: format!("commit {id}"),
-            changed_files: paths
-                .iter()
-                .map(|p| FileChangeInfo {
-                    path: PathBuf::from(p),
-                    additions: 1,
-                    deletions: 0,
-                })
-                .collect(),
-        }
-    }
+    use crate::cochange::test_utils::make_commit;
 
     // --- Precision / Recall / F1 ---
 

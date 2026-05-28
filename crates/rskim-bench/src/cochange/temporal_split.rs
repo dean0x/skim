@@ -114,34 +114,8 @@ pub fn temporal_split(mut commits: Vec<CommitInfo>, train_fraction: f64) -> Temp
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::path::PathBuf;
-
-    use rskim_search::{CommitInfo, FileChangeInfo};
-
     use super::*;
-
-    /// Build a `CommitInfo` with a given timestamp (newest-first ordering).
-    fn make_commit(timestamp: i64, id: usize) -> CommitInfo {
-        CommitInfo {
-            hash: format!("{id:040x}"),
-            timestamp,
-            author: "test".to_string(),
-            message: format!("commit {id}"),
-            changed_files: vec![FileChangeInfo {
-                path: PathBuf::from(format!("file_{id}.rs")),
-                additions: 1,
-                deletions: 0,
-            }],
-        }
-    }
-
-    /// Build a slice of commits in newest-first order (as GixSource returns).
-    fn make_commits_newest_first(count: usize) -> Vec<CommitInfo> {
-        // timestamps: count, count-1, ..., 1 (newest first)
-        (0..count)
-            .map(|i| make_commit((count - i) as i64, i))
-            .collect()
-    }
+    use crate::cochange::test_utils::{make_commit, make_commits_newest_first};
 
     // --- 80/20 split ---
 
@@ -209,7 +183,7 @@ mod tests {
 
     #[test]
     fn single_commit_goes_to_training() {
-        let commits = vec![make_commit(1000, 0)];
+        let commits = vec![make_commit(0, 1000, &["file_0.rs"])];
         let split = temporal_split(commits, 0.8);
         assert_eq!(split.train.len(), 1, "single commit must go to training");
         assert!(
@@ -233,7 +207,7 @@ mod tests {
     #[test]
     fn same_timestamp_fallback_splits_by_index() {
         let same_ts_commits: Vec<CommitInfo> = (0..10)
-            .map(|i| make_commit(42, i)) // all same timestamp
+            .map(|i| make_commit(i, 42, &[&format!("file_{i}.rs")])) // all same timestamp
             .collect();
         let split = temporal_split(same_ts_commits, 0.8);
         // Should still split at floor(10 * 0.8) = 8.
@@ -256,6 +230,26 @@ mod tests {
         assert!(
             train_hashes.is_disjoint(&test_hashes),
             "no commit should appear in both train and test"
+        );
+    }
+
+    // --- NaN fraction fallback ---
+
+    #[test]
+    fn nan_fraction_falls_back_to_0_8() {
+        // NaN is non-finite and must fall back to the 0.8 default.
+        // floor(10 * 0.8) = 8 → 8 training commits, 2 test commits.
+        let commits = make_commits_newest_first(10);
+        let split = temporal_split(commits, f64::NAN);
+        assert_eq!(
+            split.train.len(),
+            8,
+            "NaN train_fraction must fall back to 0.8 → 8 training commits"
+        );
+        assert_eq!(
+            split.test.len(),
+            2,
+            "NaN train_fraction must fall back to 0.8 → 2 test commits"
         );
     }
 
