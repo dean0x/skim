@@ -25,6 +25,7 @@ use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
 
 use rskim_bench::cochange::{
+    deny_list,
     report,
     types::{CochangeValidationResult, RepoCochangeResult, RepoManifest, RunMetadata},
     validate::{aggregate_metrics, validate_repo},
@@ -43,6 +44,15 @@ enum OutputFormat {
     Markdown,
     /// Machine-readable JSON.
     Json,
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutputFormat::Markdown => write!(f, "markdown"),
+            OutputFormat::Json => write!(f, "json"),
+        }
+    }
 }
 
 /// Co-change blast-radius prediction accuracy benchmark.
@@ -132,8 +142,8 @@ fn main() -> anyhow::Result<()> {
     // Build manifests for reproducibility.
     let repo_manifests = build_manifests(&repo_results);
 
-    // Deny-list patterns for the report.
-    let deny_list_patterns = deny_list_pattern_names();
+    // Deny-list patterns for the report (single source of truth: deny_list::pattern_names).
+    let deny_list_patterns = deny_list::pattern_names();
 
     let result = CochangeValidationResult {
         repos: repo_results,
@@ -204,21 +214,38 @@ fn parse_thresholds(input: &str) -> anyhow::Result<Vec<f64>> {
     Ok(thresholds)
 }
 
+/// Return the current UTC time as an ISO-8601 string (`YYYY-MM-DDTHH:MM:SSZ`).
+///
+/// Implemented with only `std::time` to avoid adding a `chrono`/`time`
+/// dependency to this benchmark binary.  The Gregorian calendar arithmetic
+/// accounts for leap years.  Falls back to `"unknown"` if the system clock
+/// is before the Unix epoch (should never happen in practice).
 fn chrono_now() -> String {
-    // Use std time to avoid a chrono/time dependency.
-    // Format as YYYY-XX-XXT HH:MM:SSZ (approximate — year + time of day for human readability).
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let years = 1970 + (secs / 86400) / 365;
-    format!(
-        "{years}-XX-XXT{:02}:{:02}:{:02}Z",
-        (secs % 86400) / 3600,
-        (secs % 3600) / 60,
-        secs % 60
-    )
+    let secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => return "unknown".to_string(),
+    };
+
+    // --- time of day ---
+    let hour = (secs % 86400) / 3600;
+    let minute = (secs % 3600) / 60;
+    let second = secs % 60;
+
+    // --- Gregorian calendar: days since epoch → year/month/day ---
+    // Algorithm: "civil_from_days" (Howard Hinnant, https://howardhinnant.github.io/date_algorithms.html)
+    let z = (secs / 86400) as i64 + 719_468; // shift to 0000-03-01 epoch
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // year of era [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month in [0, 11] (March=0)
+    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 fn build_manifests(repos: &[RepoCochangeResult]) -> Vec<RepoManifest> {
@@ -235,31 +262,6 @@ fn build_manifests(repos: &[RepoCochangeResult]) -> Vec<RepoManifest> {
         .collect()
 }
 
-fn deny_list_pattern_names() -> Vec<String> {
-    vec![
-        "Cargo.lock".to_string(),
-        "package-lock.json".to_string(),
-        "yarn.lock".to_string(),
-        "go.sum".to_string(),
-        "poetry.lock".to_string(),
-        "pnpm-lock.yaml".to_string(),
-        "Pipfile.lock".to_string(),
-        "Gemfile.lock".to_string(),
-        "composer.lock".to_string(),
-        "flake.lock".to_string(),
-        "vendor/".to_string(),
-        "node_modules/".to_string(),
-        "dist/".to_string(),
-        "build/".to_string(),
-        "target/".to_string(),
-        "__pycache__/".to_string(),
-        ".tox/".to_string(),
-        "*.min.js".to_string(),
-        "*.min.css".to_string(),
-        "*.pb.go".to_string(),
-        "*.generated.go".to_string(),
-    ]
-}
 
 fn save_to_devflow(timestamp: &str, format: &OutputFormat, content: &str) -> anyhow::Result<()> {
     let docs_dir = Path::new(".devflow/docs");
@@ -276,11 +278,81 @@ fn save_to_devflow(timestamp: &str, format: &OutputFormat, content: &str) -> any
     Ok(())
 }
 
-impl std::fmt::Display for OutputFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OutputFormat::Markdown => write!(f, "markdown"),
-            OutputFormat::Json => write!(f, "json"),
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    // --- parse_thresholds ---
+
+    #[test]
+    fn parse_thresholds_rejects_zero() {
+        assert!(parse_thresholds("0.0").is_err());
+    }
+
+    #[test]
+    fn parse_thresholds_accepts_one() {
+        let result = parse_thresholds("1.0").unwrap();
+        assert_eq!(result, vec![1.0]);
+    }
+
+    #[test]
+    fn parse_thresholds_rejects_above_one() {
+        assert!(parse_thresholds("1.1").is_err());
+    }
+
+    #[test]
+    fn parse_thresholds_rejects_empty_input() {
+        assert!(parse_thresholds("").is_err());
+        assert!(parse_thresholds("  ").is_err());
+    }
+
+    #[test]
+    fn parse_thresholds_deduplicates() {
+        let result = parse_thresholds("0.1,0.1,0.2").unwrap();
+        assert_eq!(result, vec![0.1, 0.2]);
+    }
+
+    #[test]
+    fn parse_thresholds_rejects_nan() {
+        assert!(parse_thresholds("NaN").is_err());
+    }
+
+    #[test]
+    fn parse_thresholds_sorts_ascending() {
+        let result = parse_thresholds("0.5,0.1,0.3").unwrap();
+        assert_eq!(result, vec![0.1, 0.3, 0.5]);
+    }
+
+    #[test]
+    fn parse_thresholds_trims_whitespace() {
+        let result = parse_thresholds(" 0.1 , 0.2 ").unwrap();
+        assert_eq!(result, vec![0.1, 0.2]);
+    }
+
+    // --- chrono_now ---
+
+    #[test]
+    fn chrono_now_produces_iso8601_format() {
+        let ts = chrono_now();
+        // Must match YYYY-MM-DDTHH:MM:SSZ  (20 chars)
+        assert_eq!(ts.len(), 20, "unexpected length: {ts}");
+        assert!(ts.ends_with('Z'), "missing Z suffix: {ts}");
+        assert_eq!(&ts[4..5], "-", "missing year-month separator: {ts}");
+        assert_eq!(&ts[7..8], "-", "missing month-day separator: {ts}");
+        assert_eq!(&ts[10..11], "T", "missing T: {ts}");
+        assert_eq!(&ts[13..14], ":", "missing hour-minute separator: {ts}");
+        assert_eq!(&ts[16..17], ":", "missing minute-second separator: {ts}");
+        // All numeric positions must be digits.
+        for i in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+            assert!(
+                ts.as_bytes()[i].is_ascii_digit(),
+                "position {i} is not a digit in {ts}"
+            );
         }
     }
 }

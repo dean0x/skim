@@ -89,6 +89,24 @@ pub fn is_denied(path: &str) -> bool {
     false
 }
 
+/// Return the human-readable names of all deny-list patterns.
+///
+/// Combines filenames, directory prefixes (with trailing `/`), and extension
+/// suffixes (with leading `*.`) into a single sorted list suitable for
+/// reporting. This is the single source of truth — callers must not maintain
+/// a parallel copy.
+#[must_use]
+pub fn pattern_names() -> Vec<String> {
+    let mut names: Vec<String> = DENIED_FILENAMES
+        .iter()
+        .map(|s| s.to_string())
+        .chain(DENIED_DIRS.iter().map(|s| format!("{s}/")))
+        .chain(DENIED_EXTENSIONS.iter().map(|s| format!("*.{s}")))
+        .collect();
+    names.sort();
+    names
+}
+
 /// Remove all denied files from `files` in-place.
 ///
 /// Uses [`Vec::retain`] so the operation is O(n) and avoids a temporary
