@@ -88,11 +88,7 @@ pub fn to_markdown(result: &CochangeValidationResult) -> String {
 
     // --- 4. Methodology ---
     md.push_str("## Methodology\n\n");
-    md.push_str(&format!(
-        "- **Train/test split:** {:.0}/{:.0} (chronological, oldest commits train, newest test)\n",
-        80.0_f64,
-        20.0_f64,
-    ));
+    md.push_str("- **Train/test split:** 80/20 (chronological, oldest commits train, newest test)\n");
     md.push_str("- **Quality gates:** ≥50 multi-file commits, ≥6 months history span\n");
     md.push_str("- **Precision:** |predicted ∩ actual| / |predicted| per query\n");
     md.push_str("- **Recall:** |predicted ∩ actual| / |actual| per query (unmapped files excluded)\n");
@@ -266,6 +262,7 @@ mod tests {
                     file_count: 100,
                     pair_count: 300,
                     commits_skipped_too_large: 1,
+                    split_timestamp: 1_700_000_000,
                     metrics_by_threshold: vec![sample_threshold(0.1), sample_threshold(0.2)],
                     quality_gate_passed: true,
                     quality_gate_reason: None,
@@ -283,6 +280,7 @@ mod tests {
                     file_count: 0,
                     pair_count: 0,
                     commits_skipped_too_large: 0,
+                    split_timestamp: 0,
                     metrics_by_threshold: vec![],
                     quality_gate_passed: false,
                     quality_gate_reason: Some("too few commits".to_string()),

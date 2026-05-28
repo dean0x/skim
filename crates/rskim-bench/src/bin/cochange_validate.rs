@@ -26,7 +26,7 @@ use rayon::prelude::*;
 
 use rskim_bench::cochange::{
     report,
-    types::{CochangeValidationResult, RunMetadata},
+    types::{CochangeValidationResult, RepoCochangeResult, RepoManifest, RunMetadata},
     validate::{aggregate_metrics, validate_repo},
 };
 use rskim_research::config::load_corpus_config;
@@ -184,8 +184,13 @@ fn parse_thresholds(input: &str) -> anyhow::Result<Vec<f64>> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| {
-            s.parse::<f64>()
-                .with_context(|| format!("invalid threshold: {s:?}"))
+            let v = s
+                .parse::<f64>()
+                .with_context(|| format!("invalid threshold: {s:?}"))?;
+            if v <= 0.0 || v > 1.0 || v.is_nan() {
+                anyhow::bail!("threshold {s:?} is out of range (0.0, 1.0]");
+            }
+            Ok(v)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -201,28 +206,24 @@ fn parse_thresholds(input: &str) -> anyhow::Result<Vec<f64>> {
 
 fn chrono_now() -> String {
     // Use std time to avoid a chrono/time dependency.
+    // Format as YYYY-XX-XXT HH:MM:SSZ (approximate — year + time of day for human readability).
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Format as YYYY-MM-DDTHH:MM:SSZ (approximate — for human readability).
-    let s = secs;
-    let days = s / 86400;
-    let years = 1970 + days / 365;
-    format!("{years}-XX-XXT{:02}:{:02}:{:02}Z", (s % 86400) / 3600, (s % 3600) / 60, s % 60)
+    let years = 1970 + (secs / 86400) / 365;
+    format!("{years}-XX-XXT{:02}:{:02}:{:02}Z", (secs % 86400) / 3600, (secs % 3600) / 60, secs % 60)
 }
 
-fn build_manifests(
-    repos: &[rskim_bench::cochange::types::RepoCochangeResult],
-) -> Vec<rskim_bench::cochange::types::RepoManifest> {
+fn build_manifests(repos: &[RepoCochangeResult]) -> Vec<RepoManifest> {
     repos
         .iter()
         .filter(|r| r.quality_gate_passed && r.error.is_none())
-        .map(|r| rskim_bench::cochange::types::RepoManifest {
+        .map(|r| RepoManifest {
             repo_url: r.repo_url.clone(),
             head_sha: r.head_sha.clone(),
-            train_cutoff_timestamp: 0, // populated in future with split metadata
+            train_cutoff_timestamp: r.split_timestamp,
             train_commit_count: r.train_commits,
             test_commit_count: r.test_commits,
         })

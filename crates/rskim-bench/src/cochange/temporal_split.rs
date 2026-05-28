@@ -66,8 +66,22 @@ pub fn temporal_split(commits: &[CommitInfo], train_fraction: f64) -> TemporalSp
         };
     }
 
-    // Clamp fraction to avoid empty splits.
-    let fraction = train_fraction.clamp(0.01, 0.99);
+    // Single commit: always goes to training. There is nothing to test against.
+    if commits.len() == 1 {
+        return TemporalSplit {
+            train: commits.to_vec(),
+            test: vec![],
+            split_timestamp: 0,
+        };
+    }
+
+    // Clamp fraction to avoid empty splits. Guard against NaN by treating
+    // non-finite values as the default 0.8.
+    let fraction = if train_fraction.is_finite() {
+        train_fraction.clamp(0.01, 0.99)
+    } else {
+        0.8
+    };
 
     // Reverse to chronological order (oldest first).
     // GixSource returns newest-first; we need oldest-first for the split.
@@ -75,8 +89,8 @@ pub fn temporal_split(commits: &[CommitInfo], train_fraction: f64) -> TemporalSp
     chronological.reverse();
 
     let split_index = ((chronological.len() as f64) * fraction).floor() as usize;
-    // Ensure at least 1 training commit when there are ≥2 commits.
-    let split_index = split_index.max(1).min(chronological.len().saturating_sub(1));
+    // Ensure at least 1 training commit and at least 1 test commit.
+    let split_index = split_index.max(1).min(chronological.len() - 1);
 
     let split_timestamp = chronological
         .get(split_index)
@@ -191,11 +205,9 @@ mod tests {
     fn single_commit_goes_to_training() {
         let commits = vec![make_commit(1000, 0)];
         let split = temporal_split(&commits, 0.8);
-        // With 1 commit, split_index=1, so train has 1 and test has 0.
-        // But clamping to max(1).min(0) = 0 when len-1 = 0 means test is empty.
-        assert_eq!(split.train.len() + split.test.len(), 1);
-        // At least 1 in training.
-        assert!(!split.train.is_empty() || !split.test.is_empty());
+        assert_eq!(split.train.len(), 1, "single commit must go to training");
+        assert!(split.test.is_empty(), "test must be empty for single commit");
+        assert_eq!(split.split_timestamp, 0);
     }
 
     #[test]

@@ -67,6 +67,9 @@ pub struct RepoCochangeResult {
     pub pair_count: usize,
     /// Commits skipped because they touched too many files (bulk refactors).
     pub commits_skipped_too_large: usize,
+    /// Unix timestamp at the train/test split boundary (first test commit's
+    /// timestamp, or 0 if no temporal split was performed).
+    pub split_timestamp: i64,
     /// Per-threshold precision/recall results.
     pub metrics_by_threshold: Vec<ThresholdMetrics>,
     /// Whether this repo passed the quality gates.
@@ -158,6 +161,7 @@ mod tests {
             file_count: 150,
             pair_count: 500,
             commits_skipped_too_large: 2,
+            split_timestamp: 1_700_000_000,
             metrics_by_threshold: vec![sample_threshold_metrics()],
             quality_gate_passed: true,
             quality_gate_reason: None,

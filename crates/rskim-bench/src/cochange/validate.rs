@@ -128,8 +128,9 @@ pub fn check_quality_gates(commits: &[CommitInfo]) -> Result<(), String> {
 
     // Check history span.
     if commits.len() >= 2 {
-        let max_ts = commits.iter().map(|c| c.timestamp).max().unwrap_or(0);
-        let min_ts = commits.iter().map(|c| c.timestamp).min().unwrap_or(0);
+        let (min_ts, max_ts) = commits.iter().fold((i64::MAX, i64::MIN), |(lo, hi), c| {
+            (lo.min(c.timestamp), hi.max(c.timestamp))
+        });
         let span = max_ts - min_ts;
         if span < MIN_HISTORY_SECONDS {
             return Err(format!(
@@ -374,6 +375,7 @@ pub fn validate_repo(
             file_count: 0,
             pair_count: 0,
             commits_skipped_too_large: 0,
+            split_timestamp: 0,
             metrics_by_threshold: vec![],
             quality_gate_passed: false,
             quality_gate_reason: Some(reason),
@@ -475,6 +477,7 @@ pub fn validate_repo(
         file_count: stats.file_count as usize,
         pair_count: stats.pair_count as usize,
         commits_skipped_too_large: stats.commits_skipped_too_large as usize,
+        split_timestamp: split.split_timestamp,
         metrics_by_threshold: metrics,
         quality_gate_passed: true,
         quality_gate_reason: None,
@@ -592,6 +595,7 @@ fn error_result(entry: &RepoEntry, repo_name: &str, error: String) -> RepoCochan
         file_count: 0,
         pair_count: 0,
         commits_skipped_too_large: 0,
+        split_timestamp: 0,
         metrics_by_threshold: vec![],
         quality_gate_passed: false,
         quality_gate_reason: None,
@@ -601,7 +605,7 @@ fn error_result(entry: &RepoEntry, repo_name: &str, error: String) -> RepoCochan
 
 fn capture_head_sha(repo_path: &Path) -> anyhow::Result<String> {
     let output = std::process::Command::new("git")
-        .args(["-C"])
+        .arg("-C")
         .arg(repo_path)
         .args(["rev-parse", "HEAD"])
         .output()

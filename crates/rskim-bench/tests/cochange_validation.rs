@@ -430,6 +430,7 @@ fn aggregate_metrics_skips_failed_repos() {
         file_count: 100,
         pair_count: 300,
         commits_skipped_too_large: 0,
+        split_timestamp: 1_700_000_000,
         metrics_by_threshold: vec![ThresholdMetrics {
             threshold: 0.1,
             macro_precision: 0.5,
@@ -458,6 +459,7 @@ fn aggregate_metrics_skips_failed_repos() {
         file_count: 0,
         pair_count: 0,
         commits_skipped_too_large: 0,
+        split_timestamp: 0,
         metrics_by_threshold: vec![],
         quality_gate_passed: false,
         quality_gate_reason: Some("too few commits".to_string()),
@@ -545,6 +547,7 @@ fn sample_validation_result() -> CochangeValidationResult {
             file_count: 100,
             pair_count: 300,
             commits_skipped_too_large: 0,
+            split_timestamp: 1_700_000_000,
             metrics_by_threshold: vec![sample_threshold_metrics()],
             quality_gate_passed: true,
             quality_gate_reason: None,
