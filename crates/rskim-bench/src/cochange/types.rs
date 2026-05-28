@@ -42,7 +42,7 @@ pub struct ThresholdMetrics {
 // ============================================================================
 
 /// Validation result for a single repository.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoCochangeResult {
     /// Full repository URL.
     pub repo_url: String,

@@ -48,7 +48,7 @@ impl FileSource for GitCloneSource {
     }
 }
 
-fn extract_repo_name(url: &str) -> anyhow::Result<String> {
+pub fn extract_repo_name(url: &str) -> anyhow::Result<String> {
     let name = url
         .rsplit('/')
         .next()
@@ -71,7 +71,7 @@ const GIT_SUBPROCESS_TIMEOUT_SECS: u64 = 300;
 /// `GIT_SUBPROCESS_TIMEOUT_SECS`.  Returns `Ok(true)` on success, `Ok(false)`
 /// on non-zero exit, and `Err` if the process could not be spawned or the
 /// timeout expired.
-fn git_run_with_timeout(mut cmd: std::process::Command, label: &str) -> anyhow::Result<bool> {
+pub fn git_run_with_timeout(mut cmd: std::process::Command, label: &str) -> anyhow::Result<bool> {
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -310,7 +310,9 @@ pub fn clone_with_history(url: &str, dest: &Path) -> anyhow::Result<()> {
     ];
 
     let mut cmd = std::process::Command::new("git");
-    cmd.args(security_args).args(["clone", url]).arg(dest);
+    cmd.args(security_args)
+        .args(["clone", "--single-branch", url])
+        .arg(dest);
 
     let ok = git_run_with_timeout(cmd, "git clone (full history)")
         .with_context(|| format!("cloning {url} with full history"))?;

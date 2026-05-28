@@ -20,7 +20,7 @@
 //! O(n) for the `file_b` prefix scan) to keep evaluation O(F² log P) where F
 //! is the number of mapped files and P is the pair count.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rskim_search::cochange::{CochangeMatrixBuilder, CochangeMatrixReader};
@@ -47,18 +47,19 @@ const MIN_HISTORY_SECONDS: i64 = 6 * 30 * 24 * 60 * 60; // approximately 6 month
 /// Paths are collected from all changed files across every commit, sorted
 /// alphabetically, and assigned IDs `0, 1, 2, …`.  Sorting ensures the
 /// mapping is deterministic regardless of commit traversal order.
+///
+/// Uses a [`BTreeSet`] to deduplicate while maintaining sort order, avoiding
+/// the clone-all-then-dedup pattern that discards most duplicates.
 #[must_use]
 pub fn build_path_map(commits: &[CommitInfo]) -> HashMap<PathBuf, FileId> {
-    let mut paths: Vec<PathBuf> = commits
+    let unique_paths: BTreeSet<&PathBuf> = commits
         .iter()
-        .flat_map(|c| c.changed_files.iter().map(|f| f.path.clone()))
+        .flat_map(|c| c.changed_files.iter().map(|f| &f.path))
         .collect();
-    paths.sort_unstable();
-    paths.dedup();
-    paths
+    unique_paths
         .into_iter()
         .enumerate()
-        .map(|(i, p)| (p, FileId(i as u32)))
+        .map(|(i, p)| (p.clone(), FileId(i as u32)))
         .collect()
 }
 
@@ -209,50 +210,70 @@ pub fn evaluate_at_thresholds(
             continue;
         }
 
-        // The "actual" co-change set for this commit is all *other* known files
-        // (everything that changed together with the query file in this commit).
-        // We build it for each query as the commit set minus the query itself.
+        // Pre-compute jaccard scores and actual sets once, then sweep thresholds.
+        // Jaccard values are threshold-independent: computing them once and sweeping
+        // thresholds reduces total work by a factor of T (number of thresholds).
+
+        // jaccard_cache[q_idx] = Vec of (candidate_id, jaccard) pairs where j > 0.
+        // Only positive values are retained so the threshold sweep is cheap.
+        let mut jaccard_cache: Vec<Vec<(FileId, f64)>> = Vec::with_capacity(known_ids.len());
+        for &query_id in &known_ids {
+            let mut pairs: Vec<(FileId, f64)> = Vec::new();
+            for &candidate_id in &all_file_ids {
+                if candidate_id == query_id {
+                    continue; // skip self-pair
+                }
+                match reader.jaccard(query_id, candidate_id) {
+                    Ok(j) if j > 0.0 => {
+                        pairs.push((candidate_id, j));
+                    }
+                    Ok(_) => {}
+                    Err(SearchError::IndexCorrupted(msg)) => {
+                        return Err(anyhow::anyhow!("matrix corrupted: {msg}"));
+                    }
+                    Err(e) => return Err(anyhow::anyhow!("jaccard error: {e}")),
+                }
+            }
+            jaccard_cache.push(pairs);
+        }
+
+        // Pre-compute the "actual" co-change set for each query in this commit:
+        // all other known file IDs changed in the same commit.
+        let actual_sets: Vec<HashSet<FileId>> = known_ids
+            .iter()
+            .map(|&query_id| {
+                known_ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| id != query_id)
+                    .collect()
+            })
+            .collect();
+
+        // Sweep thresholds over the cached jaccard values.
+        let query_count = known_ids.len();
         for ti in 0..n_thresholds {
             let threshold = thresholds[ti];
 
             let mut commit_precision_sum = 0.0f64;
             let mut commit_recall_sum = 0.0f64;
-            let query_count = known_ids.len();
 
-            for &query_id in &known_ids {
-                // Build predicted set: files with jaccard >= threshold.
-                let mut predicted: HashSet<FileId> = HashSet::new();
-                for &candidate_id in &all_file_ids {
-                    if candidate_id == query_id {
-                        continue; // skip self-pair
-                    }
-                    // jaccard(a, a) == 0.0 by design; threshold is applied here.
-                    match reader.jaccard(query_id, candidate_id) {
-                        Ok(j) if j > 0.0 && j >= threshold => {
-                            predicted.insert(candidate_id);
-                        }
-                        Ok(_) => {}
-                        Err(SearchError::IndexCorrupted(msg)) => {
-                            return Err(anyhow::anyhow!("matrix corrupted: {msg}"));
-                        }
-                        Err(e) => return Err(anyhow::anyhow!("jaccard error: {e}")),
-                    }
-                }
-
-                // Build actual set: all other known IDs in this commit.
-                let actual: HashSet<FileId> = known_ids
+            for (q_idx, _query_id) in known_ids.iter().enumerate() {
+                // Apply threshold filter to cached jaccard values.
+                let predicted: HashSet<FileId> = jaccard_cache[q_idx]
                     .iter()
-                    .copied()
-                    .filter(|&id| id != query_id)
+                    .filter(|&&(_, j)| j >= threshold)
+                    .map(|&(cid, _)| cid)
                     .collect();
 
-                let p = compute_precision(&predicted, &actual);
-                let r = compute_recall(&predicted, &actual);
+                let actual = &actual_sets[q_idx];
+                let p = compute_precision(&predicted, actual);
+                let r = compute_recall(&predicted, actual);
                 commit_precision_sum += p;
                 commit_recall_sum += r;
 
                 // Micro accumulation.
-                let tp = predicted.intersection(&actual).count();
+                let tp = predicted.intersection(actual).count();
                 micro_tp[ti] += tp;
                 micro_predicted[ti] += predicted.len();
                 micro_actual[ti] += actual.len();
@@ -324,13 +345,16 @@ pub fn validate_repo(
     thresholds: &[f64],
     train_fraction: f64,
 ) -> anyhow::Result<RepoCochangeResult> {
-    let repo_name = entry
-        .url
-        .rsplit('/')
-        .next()
-        .unwrap_or("unknown")
-        .trim_end_matches(".git")
-        .to_string();
+    let repo_name = match rskim_research::clone::extract_repo_name(&entry.url) {
+        Ok(name) => name,
+        Err(e) => {
+            return Ok(error_result(
+                entry,
+                "unknown",
+                format!("invalid repo URL (path traversal guard): {e:#}"),
+            ))
+        }
+    };
 
     let dest = corpus_dir.join(&repo_name);
 
@@ -370,19 +394,8 @@ pub fn validate_repo(
             repo_url: entry.url.clone(),
             repo_name,
             head_sha,
-            train_commits: 0,
-            test_commits: 0,
-            multi_file_test_commits: 0,
-            single_file_test_commits: 0,
-            unmapped_files_in_test: 0,
-            file_count: 0,
-            pair_count: 0,
-            commits_skipped_too_large: 0,
-            split_timestamp: 0,
-            metrics_by_threshold: vec![],
-            quality_gate_passed: false,
             quality_gate_reason: Some(reason),
-            error: None,
+            ..Default::default()
         });
     }
 
@@ -599,33 +612,61 @@ fn error_result(entry: &RepoEntry, repo_name: &str, error: String) -> RepoCochan
         repo_url: entry.url.clone(),
         repo_name: repo_name.to_string(),
         head_sha: "unknown".to_string(),
-        train_commits: 0,
-        test_commits: 0,
-        multi_file_test_commits: 0,
-        single_file_test_commits: 0,
-        unmapped_files_in_test: 0,
-        file_count: 0,
-        pair_count: 0,
-        commits_skipped_too_large: 0,
-        split_timestamp: 0,
-        metrics_by_threshold: vec![],
-        quality_gate_passed: false,
-        quality_gate_reason: None,
         error: Some(error),
+        ..Default::default()
     }
 }
 
+/// Timeout for `git rev-parse HEAD` (seconds).
+const GIT_SHA_TIMEOUT_SECS: u64 = 30;
+
 fn capture_head_sha(repo_path: &Path) -> anyhow::Result<String> {
-    let output = std::process::Command::new("git")
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let mut child = std::process::Command::new("git")
+        .arg("-c")
+        .arg("credential.helper=")
         .arg("-C")
         .arg(repo_path)
         .args(["rev-parse", "HEAD"])
-        .output()
-        .map_err(|e| anyhow::anyhow!("git rev-parse: {e}"))?;
-    if !output.status.success() {
-        anyhow::bail!("git rev-parse HEAD failed");
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("git rev-parse spawn: {e}"))?;
+
+    let child_id = child.id();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = child.wait_with_output();
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(Duration::from_secs(GIT_SHA_TIMEOUT_SECS)) {
+        Ok(Ok(output)) => {
+            if !output.status.success() {
+                anyhow::bail!("git rev-parse HEAD failed");
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+        Ok(Err(e)) => Err(anyhow::anyhow!("git rev-parse wait error: {e}")),
+        Err(_timeout) => {
+            #[cfg(unix)]
+            {
+                // SAFETY: kill(2) is always safe to call with a valid pid.
+                unsafe {
+                    libc::kill(child_id as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &child_id.to_string()])
+                    .status();
+            }
+            anyhow::bail!("git rev-parse HEAD timed out after {GIT_SHA_TIMEOUT_SECS}s");
+        }
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 // ============================================================================
