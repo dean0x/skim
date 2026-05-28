@@ -38,6 +38,15 @@ const MIN_MULTI_FILE_COMMITS: usize = 50;
 /// Minimum repository age in seconds to pass the quality gate.
 const MIN_HISTORY_SECONDS: i64 = 6 * 30 * 24 * 60 * 60; // approximately 6 months
 
+/// Maximum number of distinct files evaluated per threshold sweep.
+///
+/// Each query-candidate pair requires one `jaccard` call, so evaluation cost
+/// is O(F² × T) where F is the file count and T is the threshold count.  A
+/// 20 000-file repo with 10 thresholds requires ~4 billion jaccard calls,
+/// which is prohibitively slow.  Repos exceeding this limit are rejected
+/// before evaluation begins.
+const MAX_FILES_FOR_EVALUATION: usize = 20_000;
+
 // ============================================================================
 // Path map construction
 // ============================================================================
@@ -56,6 +65,11 @@ pub fn build_path_map(commits: &[CommitInfo]) -> HashMap<PathBuf, FileId> {
         .iter()
         .flat_map(|c| c.changed_files.iter().map(|f| &f.path))
         .collect();
+    assert!(
+        unique_paths.len() <= u32::MAX as usize,
+        "too many unique paths ({}) for FileId(u32)",
+        unique_paths.len()
+    );
     unique_paths
         .into_iter()
         .enumerate()
@@ -111,10 +125,10 @@ pub fn compute_f1(precision: f64, recall: f64) -> f64 {
 ///
 /// # Errors
 ///
-/// Returns a human-readable error string (not an `anyhow::Error`) when the
-/// quality gate fails so it can be stored directly in
-/// [`RepoCochangeResult::quality_gate_reason`].
-pub fn check_quality_gates(commits: &[CommitInfo]) -> Result<(), String> {
+/// Returns an [`anyhow::Error`] with a human-readable message when the quality
+/// gate fails.  At the call site, convert to a `String` via `.to_string()` and
+/// store in [`RepoCochangeResult::quality_gate_reason`].
+pub fn check_quality_gates(commits: &[CommitInfo]) -> anyhow::Result<()> {
     // Count multi-file commits (≥2 files after deny-list filtering).
     let multi_file_count = commits
         .iter()
@@ -122,9 +136,9 @@ pub fn check_quality_gates(commits: &[CommitInfo]) -> Result<(), String> {
         .count();
 
     if multi_file_count < MIN_MULTI_FILE_COMMITS {
-        return Err(format!(
+        anyhow::bail!(
             "only {multi_file_count} multi-file commits (need ≥{MIN_MULTI_FILE_COMMITS})"
-        ));
+        );
     }
 
     // Check history span.
@@ -134,9 +148,9 @@ pub fn check_quality_gates(commits: &[CommitInfo]) -> Result<(), String> {
         });
         let span = max_ts - min_ts;
         if span < MIN_HISTORY_SECONDS {
-            return Err(format!(
+            anyhow::bail!(
                 "history span {span}s is less than required {MIN_HISTORY_SECONDS}s (≈6 months)"
-            ));
+            );
         }
     }
 
@@ -175,6 +189,15 @@ pub fn evaluate_at_thresholds(
         ids.sort_unstable();
         ids
     };
+
+    // Guard against O(F²) explosion for very large repositories.
+    if all_file_ids.len() > MAX_FILES_FOR_EVALUATION {
+        anyhow::bail!(
+            "file count {} exceeds evaluation limit {} — skip this repo or raise MAX_FILES_FOR_EVALUATION",
+            all_file_ids.len(),
+            MAX_FILES_FOR_EVALUATION
+        );
+    }
 
     let mut unmapped_files_total = 0usize;
 
@@ -336,9 +359,9 @@ pub fn evaluate_at_thresholds(
 
 /// Validate co-change predictions for a single repository.
 ///
-/// This is the top-level orchestrator that ties together cloning, history
-/// parsing, filtering, quality gating, splitting, matrix building, and
-/// evaluation.
+/// This is the top-level orchestrator: it converts errors from the two
+/// sub-phases (clone/parse and build/evaluate) into soft failure fields on
+/// [`RepoCochangeResult`] so a single broken repo does not abort the whole run.
 pub fn validate_repo(
     entry: &RepoEntry,
     corpus_dir: &Path,
@@ -358,43 +381,19 @@ pub fn validate_repo(
 
     let dest = corpus_dir.join(&repo_name);
 
-    // 1. Clone with full history (idempotent if already present).
-    if let Err(e) = rskim_research::clone::clone_with_history(&entry.url, &dest) {
-        return Ok(error_result(
-            entry,
-            &repo_name,
-            format!("clone failed: {e:#}"),
-        ));
-    }
-
-    // Capture HEAD SHA for the manifest.
-    let head_sha = capture_head_sha(&dest).unwrap_or_else(|_| "unknown".to_string());
-
-    // 2. Parse full history (lookback_days = 0 = all history).
-    let history: HistoryResult = match GixSource.parse_history(&dest, 0) {
-        Ok(h) => h,
-        Err(e) => {
-            return Ok(error_result(
-                entry,
-                &repo_name,
-                format!("parse_history failed: {e:#}"),
-            ));
-        }
+    // Phase 1: clone, parse history, and apply deny-list filter.
+    let (head_sha, all_commits) = match clone_and_parse(&entry.url, &dest) {
+        Ok(r) => r,
+        Err(e) => return Ok(error_result(entry, &repo_name, format!("{e:#}"))),
     };
 
-    // 3. Apply deny-list filter in-place to every commit.
-    let mut all_commits = history.commits;
-    for commit in &mut all_commits {
-        filter_denied(&mut commit.changed_files);
-    }
-
     // 4. Quality gate on full commit list.
-    if let Err(reason) = check_quality_gates(&all_commits) {
+    if let Err(e) = check_quality_gates(&all_commits) {
         return Ok(RepoCochangeResult {
             repo_url: entry.url.clone(),
             repo_name,
             head_sha,
-            quality_gate_reason: Some(reason),
+            quality_gate_reason: Some(e.to_string()),
             ..Default::default()
         });
     }
@@ -403,82 +402,11 @@ pub fn validate_repo(
     // Pass ownership to avoid cloning the full commit list.
     let split = temporal_split(all_commits, train_fraction);
 
-    // 6. Build path_map from training commits.
-    let path_map = build_path_map(&split.train);
-
-    // 7. Build co-change matrix in a tempdir.
-    let index_dir = match tempfile::tempdir() {
-        Ok(d) => d,
-        Err(e) => {
-            return Ok(error_result(
-                entry,
-                &repo_name,
-                format!("tempdir failed: {e:#}"),
-            ));
-        }
-    };
-
-    let builder = match CochangeMatrixBuilder::new(index_dir.path().to_path_buf()) {
-        Ok(b) => b,
-        Err(e) => {
-            return Ok(error_result(
-                entry,
-                &repo_name,
-                format!("builder creation failed: {e:#}"),
-            ));
-        }
-    };
-
-    let history_for_builder = rskim_search::HistoryResult {
-        commits: split.train.clone(),
-        metadata: rskim_search::TemporalMetadata {
-            is_shallow: false,
-            commit_count: split.train.len(),
-        },
-    };
-
-    let stats = match builder.build(&history_for_builder, &path_map) {
-        Ok(s) => s,
-        Err(SearchError::CapacityExceeded(msg)) => {
-            return Ok(error_result(
-                entry,
-                &repo_name,
-                format!("capacity exceeded: {msg}"),
-            ));
-        }
-        Err(e) => {
-            return Ok(error_result(
-                entry,
-                &repo_name,
-                format!("matrix build failed: {e:#}"),
-            ));
-        }
-    };
-
-    // 8. Open reader.
-    let reader = match CochangeMatrixReader::open(index_dir.path()) {
+    // Phase 2: build co-change matrix and evaluate at all thresholds.
+    let eval = match build_and_evaluate(&split.train, &split.test, thresholds) {
         Ok(r) => r,
-        Err(e) => {
-            return Ok(error_result(
-                entry,
-                &repo_name,
-                format!("reader open failed: {e:#}"),
-            ));
-        }
+        Err(e) => return Ok(error_result(entry, &repo_name, format!("{e:#}"))),
     };
-
-    // 9. Evaluate at all thresholds.
-    let (metrics, unmapped) =
-        match evaluate_at_thresholds(&reader, &split.test, &path_map, thresholds) {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(error_result(
-                    entry,
-                    &repo_name,
-                    format!("evaluation failed: {e:#}"),
-                ));
-            }
-        };
 
     let multi_file_test = split
         .test
@@ -495,12 +423,12 @@ pub fn validate_repo(
         test_commits: split.test.len(),
         multi_file_test_commits: multi_file_test,
         single_file_test_commits: single_file_test,
-        unmapped_files_in_test: unmapped,
-        file_count: stats.file_count as usize,
-        pair_count: stats.pair_count as usize,
-        commits_skipped_too_large: stats.commits_skipped_too_large as usize,
+        unmapped_files_in_test: eval.unmapped,
+        file_count: eval.file_count,
+        pair_count: eval.pair_count,
+        commits_skipped_too_large: eval.commits_skipped_too_large,
         split_timestamp: split.split_timestamp,
-        metrics_by_threshold: metrics,
+        metrics_by_threshold: eval.metrics,
         quality_gate_passed: true,
         quality_gate_reason: None,
         error: None,
@@ -515,6 +443,20 @@ pub fn validate_repo(
 ///
 /// Only repos with `quality_gate_passed == true` and `error == None` are
 /// included in the aggregate.
+///
+/// # Averaging semantics
+///
+/// The returned [`ThresholdMetrics`] fields have the following meanings at the
+/// **aggregate** level:
+///
+/// - `macro_precision` / `macro_recall` — macro-average of per-repo macro
+///   precision/recall.
+/// - `micro_precision` / `micro_recall` — macro-average of per-repo micro
+///   precision/recall.  Note: this is *not* a true cross-repo micro-average
+///   (which would require summing raw TP/predicted/actual counts across repos).
+///   The field names are inherited from [`ThresholdMetrics`] for schema
+///   compatibility; at this aggregate level they represent the average of each
+///   repo's true-micro value.
 #[must_use]
 pub fn aggregate_metrics(
     repos: &[RepoCochangeResult],
@@ -607,6 +549,91 @@ pub fn aggregate_metrics(
 // ============================================================================
 // Private helpers
 // ============================================================================
+
+/// Return type for [`build_and_evaluate`].
+struct EvalResult {
+    metrics: Vec<ThresholdMetrics>,
+    unmapped: usize,
+    file_count: usize,
+    pair_count: usize,
+    commits_skipped_too_large: usize,
+}
+
+/// Phase 1: clone, parse full history, apply deny-list filter.
+///
+/// Returns `(head_sha, filtered_commits)` on success.
+fn clone_and_parse(url: &str, dest: &Path) -> anyhow::Result<(String, Vec<CommitInfo>)> {
+    // 1. Clone with full history (idempotent if already present).
+    rskim_research::clone::clone_with_history(url, dest)
+        .map_err(|e| anyhow::anyhow!("clone failed: {e:#}"))?;
+
+    // Capture HEAD SHA for the manifest.
+    let head_sha = capture_head_sha(dest).unwrap_or_else(|_| "unknown".to_string());
+
+    // 2. Parse full history (lookback_days = 0 = all history).
+    let history: HistoryResult = GixSource
+        .parse_history(dest, 0)
+        .map_err(|e| anyhow::anyhow!("parse_history failed: {e:#}"))?;
+
+    // 3. Apply deny-list filter in-place to every commit.
+    let mut all_commits = history.commits;
+    for commit in &mut all_commits {
+        filter_denied(&mut commit.changed_files);
+    }
+
+    Ok((head_sha, all_commits))
+}
+
+/// Phase 2: build co-change matrix and evaluate at all thresholds.
+///
+/// Accepts the train and test splits as slices so the caller retains ownership
+/// for counting commits and computing statistics in the result.
+fn build_and_evaluate(
+    train: &[CommitInfo],
+    test: &[CommitInfo],
+    thresholds: &[f64],
+) -> anyhow::Result<EvalResult> {
+    // 6. Build path_map from training commits.
+    let path_map = build_path_map(train);
+
+    // 7. Build co-change matrix in a tempdir.
+    let index_dir =
+        tempfile::tempdir().map_err(|e| anyhow::anyhow!("tempdir failed: {e:#}"))?;
+
+    let builder = CochangeMatrixBuilder::new(index_dir.path().to_path_buf())
+        .map_err(|e| anyhow::anyhow!("builder creation failed: {e:#}"))?;
+
+    let history_for_builder = rskim_search::HistoryResult {
+        commits: train.to_vec(),
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: false,
+            commit_count: train.len(),
+        },
+    };
+
+    let stats = builder
+        .build(&history_for_builder, &path_map)
+        .map_err(|e| match e {
+            SearchError::CapacityExceeded(msg) => anyhow::anyhow!("capacity exceeded: {msg}"),
+            other => anyhow::anyhow!("matrix build failed: {other:#}"),
+        })?;
+
+    // 8. Open reader.
+    let reader = CochangeMatrixReader::open(index_dir.path())
+        .map_err(|e| anyhow::anyhow!("reader open failed: {e:#}"))?;
+
+    // 9. Evaluate at all thresholds.
+    let (metrics, unmapped) = evaluate_at_thresholds(&reader, test, &path_map, thresholds)
+        .map_err(|e| anyhow::anyhow!("evaluation failed: {e:#}"))?;
+
+    Ok(EvalResult {
+        metrics,
+        unmapped,
+        file_count: stats.file_count as usize,
+        pair_count: stats.pair_count as usize,
+        commits_skipped_too_large: stats.commits_skipped_too_large as usize,
+    })
+}
 
 fn error_result(entry: &RepoEntry, repo_name: &str, error: String) -> RepoCochangeResult {
     RepoCochangeResult {
@@ -794,7 +821,7 @@ mod tests {
             .collect();
         let result = check_quality_gates(&commits);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("multi-file commits"));
+        assert!(result.unwrap_err().to_string().contains("multi-file commits"));
     }
 
     #[test]
@@ -805,6 +832,6 @@ mod tests {
             .collect();
         let result = check_quality_gates(&commits);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("span"));
+        assert!(result.unwrap_err().to_string().contains("span"));
     }
 }

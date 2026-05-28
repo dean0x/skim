@@ -169,9 +169,10 @@ fn quality_gate_rejects_small_repo() {
     let result = check_quality_gates(&commits);
     assert!(result.is_err(), "small repo should fail quality gate");
     let err = result.unwrap_err();
+    let msg = err.to_string();
     assert!(
-        err.contains("multi-file commits"),
-        "error should mention commit count: {err}"
+        msg.contains("multi-file commits"),
+        "error should mention commit count: {msg}"
     );
 }
 
