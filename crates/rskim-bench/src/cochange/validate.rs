@@ -59,22 +59,27 @@ const MAX_FILES_FOR_EVALUATION: usize = 20_000;
 ///
 /// Uses a [`BTreeSet`] to deduplicate while maintaining sort order, avoiding
 /// the clone-all-then-dedup pattern that discards most duplicates.
-#[must_use]
-pub fn build_path_map(commits: &[CommitInfo]) -> HashMap<PathBuf, FileId> {
+///
+/// # Errors
+///
+/// Returns an error if the number of unique paths exceeds [`u32::MAX`], which
+/// would overflow the [`FileId`] counter.
+pub fn build_path_map(commits: &[CommitInfo]) -> anyhow::Result<HashMap<PathBuf, FileId>> {
     let unique_paths: BTreeSet<&PathBuf> = commits
         .iter()
         .flat_map(|c| c.changed_files.iter().map(|f| &f.path))
         .collect();
-    assert!(
-        unique_paths.len() <= u32::MAX as usize,
-        "too many unique paths ({}) for FileId(u32)",
-        unique_paths.len()
-    );
-    unique_paths
+    if unique_paths.len() > u32::MAX as usize {
+        anyhow::bail!(
+            "too many unique paths ({}) for FileId(u32)",
+            unique_paths.len()
+        );
+    }
+    Ok(unique_paths
         .into_iter()
         .enumerate()
         .map(|(i, p)| (p.clone(), FileId(i as u32)))
-        .collect()
+        .collect())
 }
 
 // ============================================================================
@@ -403,7 +408,9 @@ pub fn validate_repo(
     let split = temporal_split(all_commits, train_fraction);
 
     // Phase 2: build co-change matrix and evaluate at all thresholds.
-    let eval = match build_and_evaluate(&split.train, &split.test, thresholds) {
+    // Capture lengths before moving ownership of split.train into build_and_evaluate.
+    let train_commits = split.train.len();
+    let eval = match build_and_evaluate(split.train, &split.test, thresholds) {
         Ok(r) => r,
         Err(e) => return Ok(error_result(entry, &repo_name, format!("{e:#}"))),
     };
@@ -419,7 +426,7 @@ pub fn validate_repo(
         repo_url: entry.url.clone(),
         repo_name,
         head_sha,
-        train_commits: split.train.len(),
+        train_commits,
         test_commits: split.test.len(),
         multi_file_test_commits: multi_file_test,
         single_file_test_commits: single_file_test,
@@ -581,15 +588,16 @@ fn clone_and_parse(url: &str, dest: &Path) -> anyhow::Result<(String, Vec<Commit
 
 /// Phase 2: build co-change matrix and evaluate at all thresholds.
 ///
-/// Accepts the train and test splits as slices so the caller retains ownership
-/// for counting commits and computing statistics in the result.
+/// Takes `train` by value to avoid cloning potentially large `Vec<CommitInfo>`.
+/// The caller must capture `split.train.len()` before moving ownership here.
 fn build_and_evaluate(
-    train: &[CommitInfo],
+    train: Vec<CommitInfo>,
     test: &[CommitInfo],
     thresholds: &[f64],
 ) -> anyhow::Result<EvalResult> {
     // 6. Build path_map from training commits.
-    let path_map = build_path_map(train);
+    let path_map = build_path_map(&train)
+        .map_err(|e| anyhow::anyhow!("path map construction failed: {e:#}"))?;
 
     // 7. Build co-change matrix in a tempdir.
     let index_dir =
@@ -598,11 +606,12 @@ fn build_and_evaluate(
     let builder = CochangeMatrixBuilder::new(index_dir.path().to_path_buf())
         .map_err(|e| anyhow::anyhow!("builder creation failed: {e:#}"))?;
 
+    let commit_count = train.len();
     let history_for_builder = rskim_search::HistoryResult {
-        commits: train.to_vec(),
+        commits: train,
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
-            commit_count: train.len(),
+            commit_count,
         },
     };
 
@@ -676,7 +685,11 @@ fn capture_head_sha(repo_path: &Path) -> anyhow::Result<String> {
         Err(_timeout) => {
             #[cfg(unix)]
             {
-                // SAFETY: kill(2) is always safe to call with a valid pid.
+                // SAFETY: kill(2) is safe to call. Race note: the background
+                // thread may have already reaped this pid, and the pid could
+                // theoretically be recycled by the OS before we signal it.
+                // This is acceptable for a benchmark tool; a production daemon
+                // would use pidfd_open(2) on Linux 5.3+ to avoid the race.
                 unsafe {
                     libc::kill(child_id as libc::pid_t, libc::SIGKILL);
                 }
@@ -764,15 +777,15 @@ mod tests {
             make_commit(0, 100, &["z.rs", "a.rs"]),
             make_commit(1, 200, &["m.rs", "a.rs"]),
         ];
-        let map1 = build_path_map(&commits);
-        let map2 = build_path_map(&commits);
+        let map1 = build_path_map(&commits).expect("build_path_map 1");
+        let map2 = build_path_map(&commits).expect("build_path_map 2");
         assert_eq!(map1, map2, "path_map must be deterministic");
     }
 
     #[test]
     fn path_map_sorted_alphabetically() {
         let commits = vec![make_commit(0, 100, &["z.rs", "a.rs", "m.rs"])];
-        let map = build_path_map(&commits);
+        let map = build_path_map(&commits).expect("build_path_map");
         // a.rs → 0, m.rs → 1, z.rs → 2
         assert_eq!(*map.get(&PathBuf::from("a.rs")).unwrap(), FileId(0));
         assert_eq!(*map.get(&PathBuf::from("m.rs")).unwrap(), FileId(1));

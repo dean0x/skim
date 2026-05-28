@@ -360,7 +360,7 @@ fn full_pipeline_synthetic_repo() {
         "test split must be non-empty with a 0.98 train fraction and ≥51 commits"
     );
 
-    let path_map = build_path_map(&split.train);
+    let path_map = build_path_map(&split.train).expect("build_path_map");
 
     // Build matrix.
     let index_dir = tempfile::tempdir().expect("tempdir");
@@ -537,7 +537,7 @@ fn build_path_map_deduplicates() {
         make_commit(0, 100, &["shared.rs", "a.rs"]),
         make_commit(1, 200, &["shared.rs", "b.rs"]),
     ];
-    let map = build_path_map(&commits);
+    let map = build_path_map(&commits).expect("build_path_map");
     // 3 unique paths: a.rs, b.rs, shared.rs.
     assert_eq!(map.len(), 3, "path map should deduplicate across commits");
     // shared.rs should have a valid FileId.
