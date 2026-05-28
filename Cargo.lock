@@ -2315,6 +2315,7 @@ dependencies = [
  "clap",
  "libc",
  "rayon",
+ "rskim-bench",
  "rskim-core",
  "rskim-research",
  "rskim-search",

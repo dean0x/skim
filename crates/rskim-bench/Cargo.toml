@@ -39,6 +39,15 @@ tempfile = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[features]
+## Expose `cochange::test_utils` helpers to integration tests and external test
+## harnesses.  Not included in production builds by default.
+test-utils = []
+
+[dev-dependencies]
+# Enable test-utils so integration tests in tests/ can import cochange::test_utils.
+rskim-bench = { path = ".", features = ["test-utils"] }
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

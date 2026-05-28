@@ -36,10 +36,21 @@ pub fn to_json(result: &CochangeValidationResult) -> anyhow::Result<String> {
 #[must_use]
 pub fn to_markdown(result: &CochangeValidationResult) -> String {
     let mut md = String::new();
-
     md.push_str("# Co-change Validation Report\n\n");
+    md.push_str(&summary_section(result));
+    md.push_str(&threshold_sweep_section(result));
+    md.push_str(&per_repo_section(result));
+    md.push_str(&methodology_section(result));
+    md.push_str(&reproducibility_section(result));
+    md
+}
 
-    // --- 1. Summary ---
+// ============================================================================
+// Private helpers
+// ============================================================================
+
+fn summary_section(result: &CochangeValidationResult) -> String {
+    let mut md = String::new();
     md.push_str("## Summary\n\n");
     if let Some(best) = best_by_macro_f1(&result.aggregate_metrics) {
         md.push_str(&format!(
@@ -62,8 +73,11 @@ pub fn to_markdown(result: &CochangeValidationResult) -> String {
         "- **Run timestamp:** {}\n\n",
         result.run_metadata.timestamp
     ));
+    md
+}
 
-    // --- 2. Threshold sweep table ---
+fn threshold_sweep_section(result: &CochangeValidationResult) -> String {
+    let mut md = String::new();
     md.push_str("## Threshold Sweep (Aggregate)\n\n");
     if result.aggregate_metrics.is_empty() {
         md.push_str("(no aggregate metrics)\n\n");
@@ -79,14 +93,20 @@ pub fn to_markdown(result: &CochangeValidationResult) -> String {
         }
         md.push('\n');
     }
+    md
+}
 
-    // --- 3. Per-repo breakdown ---
+fn per_repo_section(result: &CochangeValidationResult) -> String {
+    let mut md = String::new();
     md.push_str("## Per-Repo Results\n\n");
     for repo in &result.repos {
         md.push_str(&repo_section(repo));
     }
+    md
+}
 
-    // --- 4. Methodology ---
+fn methodology_section(result: &CochangeValidationResult) -> String {
+    let mut md = String::new();
     md.push_str("## Methodology\n\n");
     md.push_str(
         "- **Train/test split:** 80/20 (chronological, oldest commits train, newest test)\n",
@@ -103,8 +123,11 @@ pub fn to_markdown(result: &CochangeValidationResult) -> String {
         md.push_str(&format!("  - `{pattern}`\n"));
     }
     md.push('\n');
+    md
+}
 
-    // --- 5. Reproducibility manifest ---
+fn reproducibility_section(result: &CochangeValidationResult) -> String {
+    let mut md = String::new();
     md.push_str("## Reproducibility Manifest\n\n");
     md.push_str(&format!(
         "- **Corpus config:** `{}`\n\n",
@@ -125,13 +148,8 @@ pub fn to_markdown(result: &CochangeValidationResult) -> String {
         ));
     }
     md.push('\n');
-
     md
 }
-
-// ============================================================================
-// Private helpers
-// ============================================================================
 
 fn best_by_macro_f1(metrics: &[ThresholdMetrics]) -> Option<&ThresholdMetrics> {
     metrics.iter().max_by(|a, b| {

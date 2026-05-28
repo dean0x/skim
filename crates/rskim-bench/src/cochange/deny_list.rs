@@ -54,13 +54,23 @@ const DENIED_EXTENSIONS: &[&str] = &["min.js", "min.css", "pb.go", "generated.go
 /// 1. File name matches a [`DENIED_FILENAMES`] entry (exact match).
 /// 2. Any path component matches a [`DENIED_DIRS`] entry.
 /// 3. File name ends with a [`DENIED_EXTENSIONS`] suffix.
+///
+/// On Unix platforms where backslashes never appear in paths, the
+/// normalisation step is skipped entirely to avoid a heap allocation.
 #[must_use]
 pub fn is_denied(path: &str) -> bool {
     // Normalise to forward slashes so Windows paths also work.
-    let normalised = path.replace('\\', "/");
+    // Only allocate when the path actually contains backslashes.
+    let normalised_buf;
+    let normalised: &str = if path.contains('\\') {
+        normalised_buf = path.replace('\\', "/");
+        &normalised_buf
+    } else {
+        path
+    };
 
     // Extract the file name (last segment after the final `/`).
-    let filename = normalised.rsplit('/').next().unwrap_or(&normalised);
+    let filename = normalised.rsplit('/').next().unwrap_or(normalised);
 
     // 1. Exact filename match.
     if DENIED_FILENAMES.contains(&filename) {

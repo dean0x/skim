@@ -24,14 +24,18 @@ pub mod validate;
 
 /// Shared helpers used by unit and integration tests in the `cochange` module.
 ///
-/// Always compiled (not gated by `#[cfg(test)]`) so that integration tests in
-/// `tests/` — which compile against the library as a separate crate — can
-/// import from here.  The module is deliberately not re-exported from the crate
-/// root so callers must opt-in explicitly.
+/// Compiled only when the `test-utils` feature is enabled or when building
+/// under `#[cfg(test)]`.  Integration tests in `tests/` enable this via:
+///
+/// ```toml
+/// # Cargo.toml [dev-dependencies]
+/// rskim-bench = { path = "..", features = ["test-utils"] }
+/// ```
 ///
 /// Both the per-module unit tests (`validate.rs`, `temporal_split.rs`) and the
 /// integration tests (`tests/cochange_validation.rs`) import from here to
 /// avoid duplicating the `make_commit` helper with slightly differing signatures.
+#[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils {
     use std::path::PathBuf;
 
