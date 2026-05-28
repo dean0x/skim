@@ -274,6 +274,56 @@ pub fn load_fixture_files(dir: &Path) -> anyhow::Result<Vec<SourceFile>> {
     walk_and_load(dir)
 }
 
+/// Clone a repository with full history (no `--depth 1`) for co-change analysis.
+///
+/// Unlike [`GitCloneSource`] which shallow-clones to a pinned commit, this
+/// function always performs a full clone and stays at HEAD.  Full history is
+/// required by [`rskim_search::temporal::GixSource`] to compute co-change
+/// signal across the entire commit log.
+///
+/// # Idempotency
+///
+/// If `dest` already exists the function returns `Ok(())` immediately without
+/// re-cloning, matching the behaviour of [`clone_repo`].
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - `url` fails the HTTPS prefix check (to guard against shell-injection via
+///   `git://` or `file://` schemes).
+/// - The `git clone` subprocess fails or times out.
+pub fn clone_with_history(url: &str, dest: &Path) -> anyhow::Result<()> {
+    if !url.starts_with("https://") {
+        anyhow::bail!(
+            "clone_with_history: url must start with 'https://', got: {url}"
+        );
+    }
+
+    // Skip if already cloned (idempotent).
+    if dest.exists() {
+        return Ok(());
+    }
+
+    let security_args = [
+        "-c",
+        "credential.helper=",
+        "-c",
+        "transfer.fsckObjects=true",
+    ];
+
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(security_args).args(["clone", url]).arg(dest);
+
+    let ok = git_run_with_timeout(cmd, "git clone (full history)")
+        .with_context(|| format!("cloning {url} with full history"))?;
+
+    if !ok {
+        anyhow::bail!("git clone failed for {url}");
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -289,6 +339,7 @@ mod tests {
             url: "https://github.com/example/repo".to_string(),
             commit: "4649aa9700619f94cf9c66876e9549d83420e16c".to_string(),
             language: "Rust".to_string(),
+            deep_clone: false,
         }
     }
 

@@ -19,6 +19,12 @@ pub struct RepoEntry {
     pub url: String,
     pub commit: String,
     pub language: String,
+    /// When `true`, clone the full repository history (no `--depth 1`).
+    ///
+    /// Required for co-change analysis which needs complete git history.
+    /// Defaults to `false` for backward compatibility.
+    #[serde(default)]
+    pub deep_clone: bool,
 }
 
 /// The set of language strings accepted in corpus.toml.

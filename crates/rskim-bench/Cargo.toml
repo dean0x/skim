@@ -12,6 +12,10 @@ publish = false
 name = "rskim-bench"
 path = "src/main.rs"
 
+[[bin]]
+name = "cochange-validate"
+path = "src/bin/cochange_validate.rs"
+
 [lib]
 name = "rskim_bench"
 path = "src/lib.rs"
