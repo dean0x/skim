@@ -281,7 +281,7 @@ pub fn evaluate_at_thresholds(
             let mut commit_precision_sum = 0.0f64;
             let mut commit_recall_sum = 0.0f64;
 
-            for (q_idx, _query_id) in known_ids.iter().enumerate() {
+            for q_idx in 0..known_ids.len() {
                 // Apply threshold filter to cached jaccard values.
                 let predicted: HashSet<FileId> = jaccard_cache[q_idx]
                     .iter()
@@ -468,20 +468,7 @@ pub fn aggregate_metrics(
         .collect();
 
     if passing.is_empty() {
-        return thresholds
-            .iter()
-            .map(|&t| ThresholdMetrics {
-                threshold: t,
-                macro_precision: 0.0,
-                macro_recall: 0.0,
-                macro_f1: 0.0,
-                micro_precision: 0.0,
-                micro_recall: 0.0,
-                micro_f1: 0.0,
-                commit_count: 0,
-                query_count: 0,
-            })
-            .collect();
+        return thresholds.iter().map(|&t| zero_metrics(t)).collect();
     }
 
     thresholds
@@ -513,17 +500,7 @@ pub fn aggregate_metrics(
             }
 
             if count == 0 {
-                return ThresholdMetrics {
-                    threshold,
-                    macro_precision: 0.0,
-                    macro_recall: 0.0,
-                    macro_f1: 0.0,
-                    micro_precision: 0.0,
-                    micro_recall: 0.0,
-                    micro_f1: 0.0,
-                    commit_count: 0,
-                    query_count: 0,
-                };
+                return zero_metrics(threshold);
             }
 
             let macro_p = mp_sum / count as f64;
@@ -549,6 +526,24 @@ pub fn aggregate_metrics(
 // ============================================================================
 // Private helpers
 // ============================================================================
+
+/// Build a [`ThresholdMetrics`] with all-zero values for a given threshold.
+///
+/// Used as the fallback when no repos pass quality gates or no repos contribute
+/// data at a particular threshold.
+fn zero_metrics(threshold: f64) -> ThresholdMetrics {
+    ThresholdMetrics {
+        threshold,
+        macro_precision: 0.0,
+        macro_recall: 0.0,
+        macro_f1: 0.0,
+        micro_precision: 0.0,
+        micro_recall: 0.0,
+        micro_f1: 0.0,
+        commit_count: 0,
+        query_count: 0,
+    }
+}
 
 /// Return type for [`build_and_evaluate`].
 struct EvalResult {

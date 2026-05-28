@@ -262,7 +262,6 @@ fn build_manifests(repos: &[RepoCochangeResult]) -> Vec<RepoManifest> {
         .collect()
 }
 
-
 fn save_to_devflow(timestamp: &str, format: &OutputFormat, content: &str) -> anyhow::Result<()> {
     let docs_dir = Path::new(".devflow/docs");
     std::fs::create_dir_all(docs_dir)?;
