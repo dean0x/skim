@@ -11,7 +11,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 use rskim_bench::cochange::{
-    deny_list::{filter_denied, is_denied},
+    deny_list::filter_denied,
     report::{to_json, to_markdown},
     temporal_split::temporal_split,
     types::{CochangeValidationResult, RunMetadata, ThresholdMetrics},
