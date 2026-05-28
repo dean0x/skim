@@ -222,27 +222,61 @@ fn parse_thresholds(input: &str) -> anyhow::Result<Vec<f64>> {
 /// is before the Unix epoch (should never happen in practice).
 fn chrono_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Named constants from Howard Hinnant's "civil_from_days" algorithm.
+    // Reference: https://howardhinnant.github.io/date_algorithms.html
+    //
+    // CIVIL_EPOCH_OFFSET: days from Unix epoch (1970-01-01) to the civil epoch
+    //   (0000-03-01) used by the algorithm, which simplifies leap-year arithmetic.
+    const CIVIL_EPOCH_OFFSET: i64 = 719_468;
+    // DAYS_PER_ERA: days in a 400-year Gregorian era (365*400 + 97 leap days).
+    const DAYS_PER_ERA: i64 = 146_097;
+    // DAYS_PER_ERA_MINUS_ONE: used to adjust negative day values into the correct era.
+    const DAYS_PER_ERA_MINUS_ONE: i64 = 146_096;
+    // YEARS_PER_ERA: the era length in years.
+    const YEARS_PER_ERA: i64 = 400;
+    // DAYS_PER_4_YEARS: days in a 4-year cycle (includes one leap year).
+    const DAYS_PER_4_YEARS: i64 = 1460;
+    // DAYS_PER_100_YEARS: days in a 100-year century (no leap on century unless /400).
+    const DAYS_PER_100_YEARS: i64 = 36524;
+    // DAYS_PER_YEAR: days in a common (non-leap) year.
+    const DAYS_PER_YEAR: i64 = 365;
+    // MONTH_PERIOD_NUMERATOR / MONTH_PERIOD_DENOMINATOR: encode the irregular
+    //   day-counts of months as a linear approximation.  mp = (5*doy+2)/153.
+    const MONTH_LINEAR_SCALE: i64 = 5;
+    const MONTH_LINEAR_OFFSET: i64 = 2;
+    const MONTH_LINEAR_DENOM: i64 = 153;
+    // MARCH_OFFSET: months in the civil epoch run March=0..February=11; adding 3
+    //   converts to January=1..December=12 for the first 10 months.
+    const MARCH_OFFSET: i64 = 3;
+    // YEAR_WRAP_THRESHOLD: months >= 10 (Nov, Dec in March-origin numbering)
+    //   belong to the next calendar year.
+    const YEAR_WRAP_THRESHOLD: i64 = 10;
+    const YEAR_WRAP_SUBTRACT: i64 = 9;
+
     let secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_secs(),
         Err(_) => return "unknown".to_string(),
     };
 
     // --- time of day ---
-    let hour = (secs % 86400) / 3600;
-    let minute = (secs % 3600) / 60;
-    let second = secs % 60;
+    const SECS_PER_DAY: u64 = 86400;
+    const SECS_PER_HOUR: u64 = 3600;
+    const SECS_PER_MINUTE: u64 = 60;
+    let hour = (secs % SECS_PER_DAY) / SECS_PER_HOUR;
+    let minute = (secs % SECS_PER_HOUR) / SECS_PER_MINUTE;
+    let second = secs % SECS_PER_MINUTE;
 
-    // --- Gregorian calendar: days since epoch → year/month/day ---
-    // Algorithm: "civil_from_days" (Howard Hinnant, https://howardhinnant.github.io/date_algorithms.html)
-    let z = (secs / 86400) as i64 + 719_468; // shift to 0000-03-01 epoch
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // day of era [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // year of era [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
-    let mp = (5 * doy + 2) / 153; // month in [0, 11] (March=0)
-    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
+    // --- Gregorian calendar: days since Unix epoch → year/month/day ---
+    let z = (secs / SECS_PER_DAY) as i64 + CIVIL_EPOCH_OFFSET;
+    let era = if z >= 0 { z } else { z - DAYS_PER_ERA_MINUS_ONE } / DAYS_PER_ERA;
+    let doe = z - era * DAYS_PER_ERA; // day of era [0, 146096]
+    let yoe = (doe - doe / DAYS_PER_4_YEARS + doe / DAYS_PER_100_YEARS - doe / DAYS_PER_ERA_MINUS_ONE) / DAYS_PER_YEAR; // year of era [0, 399]
+    let y = yoe + era * YEARS_PER_ERA;
+    let doy = doe - (DAYS_PER_YEAR * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (MONTH_LINEAR_SCALE * doy + MONTH_LINEAR_OFFSET) / MONTH_LINEAR_DENOM; // month in [0, 11] (March=0)
+    let d = doy - (MONTH_LINEAR_DENOM * mp + MONTH_LINEAR_OFFSET) / MONTH_LINEAR_SCALE + 1; // day [1, 31]
+    let m = if mp < YEAR_WRAP_THRESHOLD { mp + MARCH_OFFSET } else { mp - YEAR_WRAP_SUBTRACT }; // month [1, 12]
     let y = if m <= 2 { y + 1 } else { y };
 
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")

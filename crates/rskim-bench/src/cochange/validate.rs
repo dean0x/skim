@@ -791,7 +791,7 @@ fn capture_head_sha(repo_path: &Path) -> anyhow::Result<String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
     use rskim_search::FileId;
@@ -869,6 +869,125 @@ mod tests {
         assert_eq!(*map.get(&PathBuf::from("a.rs")).unwrap(), FileId(0));
         assert_eq!(*map.get(&PathBuf::from("m.rs")).unwrap(), FileId(1));
         assert_eq!(*map.get(&PathBuf::from("z.rs")).unwrap(), FileId(2));
+    }
+
+    // --- evaluate_at_thresholds: empty / unmappable commit path ---
+
+    #[test]
+    fn evaluate_at_thresholds_zero_metrics_when_all_commits_unmappable() {
+        // Build a reader from an empty history (no training commits → empty matrix).
+        // Test commits contain only files absent from path_map, so known_ids.len() < 2
+        // for every commit.  evaluate_at_thresholds must return zero metrics without
+        // panicking or returning an error.
+        use rskim_search::cochange::{CochangeMatrixBuilder, CochangeMatrixReader};
+        use rskim_search::{HistoryResult, TemporalMetadata};
+
+        let index_dir = tempfile::tempdir().expect("tempdir");
+        let builder =
+            CochangeMatrixBuilder::new(index_dir.path().to_path_buf()).expect("builder");
+        let empty_history = HistoryResult {
+            commits: vec![],
+            metadata: TemporalMetadata {
+                is_shallow: false,
+                commit_count: 0,
+            },
+        };
+        let empty_path_map = HashMap::new();
+        builder
+            .build(&empty_history, &empty_path_map)
+            .expect("build empty matrix");
+        let reader = CochangeMatrixReader::open(index_dir.path()).expect("reader open");
+
+        // Test commits: one single-file commit (skipped: known_ids.len() < 2)
+        // and one commit whose only file is not in path_map (skipped: unmapped).
+        let test_commits = vec![
+            make_commit(0, 100, &["unmapped_a.rs"]),
+            make_commit(1, 200, &["unmapped_b.rs"]),
+        ];
+        let thresholds = vec![0.1, 0.3];
+
+        let (metrics, unmapped) =
+            evaluate_at_thresholds(&reader, &test_commits, &empty_path_map, &thresholds)
+                .expect("evaluate_at_thresholds must not error on all-unmapped commits");
+
+        assert_eq!(
+            metrics.len(),
+            thresholds.len(),
+            "must return one ThresholdMetrics per threshold"
+        );
+        assert_eq!(
+            unmapped, 2,
+            "both files are unmapped; expected unmapped_files_total=2, got {unmapped}"
+        );
+        for m in &metrics {
+            assert_eq!(
+                m.macro_precision, 0.0,
+                "macro_precision must be 0.0 when no commits contribute; threshold={}",
+                m.threshold
+            );
+            assert_eq!(
+                m.macro_recall, 0.0,
+                "macro_recall must be 0.0 when no commits contribute; threshold={}",
+                m.threshold
+            );
+            assert_eq!(
+                m.commit_count, 0,
+                "commit_count must be 0 when all commits are skipped; threshold={}",
+                m.threshold
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_at_thresholds_zero_metrics_for_single_file_commits() {
+        // Single-file commits (after path mapping) have known_ids.len() < 2 and
+        // must be skipped for macro averaging, producing zero metrics.
+        use rskim_search::cochange::{CochangeMatrixBuilder, CochangeMatrixReader};
+        use rskim_search::{HistoryResult, TemporalMetadata};
+
+        let index_dir = tempfile::tempdir().expect("tempdir");
+
+        // Build a path_map with two files so the matrix is non-empty, but
+        // test commits will only touch one file each.
+        let train_commits = vec![make_commit(0, 100, &["a.rs", "b.rs"])];
+        let path_map = build_path_map(&train_commits).expect("build_path_map");
+
+        let builder =
+            CochangeMatrixBuilder::new(index_dir.path().to_path_buf()).expect("builder");
+        let history = HistoryResult {
+            commits: train_commits,
+            metadata: TemporalMetadata {
+                is_shallow: false,
+                commit_count: 1,
+            },
+        };
+        builder.build(&history, &path_map).expect("build matrix");
+        let reader = CochangeMatrixReader::open(index_dir.path()).expect("reader open");
+
+        // Each test commit touches only one mapped file → known_ids.len() == 1 → skipped.
+        let test_commits = vec![
+            make_commit(1, 200, &["a.rs"]),
+            make_commit(2, 300, &["b.rs"]),
+        ];
+        let thresholds = vec![0.1];
+
+        let (metrics, _unmapped) =
+            evaluate_at_thresholds(&reader, &test_commits, &path_map, &thresholds)
+                .expect("evaluate_at_thresholds must succeed on single-file test commits");
+
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(
+            metrics[0].commit_count, 0,
+            "single-file commits must not contribute to macro averaging"
+        );
+        assert_eq!(
+            metrics[0].macro_precision, 0.0,
+            "macro_precision must be 0.0 when all test commits are single-file"
+        );
+        assert_eq!(
+            metrics[0].macro_recall, 0.0,
+            "macro_recall must be 0.0 when all test commits are single-file"
+        );
     }
 
     // --- Quality gates ---

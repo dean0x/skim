@@ -168,6 +168,11 @@ fn quality_gate_rejects_short_history() {
         .collect();
     let result = check_quality_gates(&commits);
     assert!(result.is_err(), "short history should fail quality gate");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("span") || msg.contains("history"),
+        "error should mention history span: {msg}"
+    );
 }
 
 // ============================================================================
@@ -278,13 +283,16 @@ fn markdown_output_non_empty() {
 
 #[test]
 fn full_pipeline_synthetic_repo() {
-    if !git_available() {
-        eprintln!("SKIPPED: git not available");
-        return;
-    }
+    assert!(
+        git_available(),
+        "PRECONDITION: git must be available for this integration test. \
+         Mark the test with #[ignore] if git is not expected in this environment."
+    );
     let Some(dir) = init_git_repo() else {
-        eprintln!("SKIPPED: could not init git repo");
-        return;
+        panic!(
+            "PRECONDITION: could not initialise a temporary git repository. \
+             Ensure git is installed and the file-system allows temporary directories."
+        );
     };
 
     // Build a synthetic git repo with known co-change patterns.
@@ -523,6 +531,92 @@ fn aggregate_metrics_skips_failed_repos() {
     assert!(
         m.macro_precision > 0.55,
         "failing repo must not lower the aggregate precision below 0.55"
+    );
+}
+
+// ============================================================================
+// aggregate_metrics_skips_errored_passing_repos
+// ============================================================================
+
+#[test]
+fn aggregate_metrics_skips_errored_passing_repos() {
+    // Covers the branch where quality_gate_passed=true but error=Some(...).
+    // Such repos must be excluded from aggregation even though the gate passed.
+    use rskim_bench::cochange::types::RepoCochangeResult;
+
+    let clean = RepoCochangeResult {
+        repo_url: "https://github.com/example/clean".to_string(),
+        repo_name: "clean".to_string(),
+        head_sha: "a".repeat(40),
+        train_commits: 80,
+        test_commits: 20,
+        multi_file_test_commits: 15,
+        single_file_test_commits: 5,
+        unmapped_files_in_test: 0,
+        file_count: 100,
+        pair_count: 300,
+        commits_skipped_too_large: 0,
+        split_timestamp: 1_700_000_000,
+        metrics_by_threshold: vec![ThresholdMetrics {
+            threshold: 0.1,
+            macro_precision: 0.8,
+            macro_recall: 0.8,
+            macro_f1: compute_f1(0.8, 0.8),
+            micro_precision: 0.8,
+            micro_recall: 0.8,
+            micro_f1: compute_f1(0.8, 0.8),
+            commit_count: 15,
+            query_count: 45,
+        }],
+        quality_gate_passed: true,
+        quality_gate_reason: None,
+        error: None,
+    };
+
+    // gate passed but an error occurred during evaluation — must be excluded.
+    let errored_but_passing_gate = RepoCochangeResult {
+        repo_url: "https://github.com/example/errored".to_string(),
+        repo_name: "errored".to_string(),
+        head_sha: "b".repeat(40),
+        train_commits: 100,
+        test_commits: 25,
+        multi_file_test_commits: 20,
+        single_file_test_commits: 5,
+        unmapped_files_in_test: 0,
+        file_count: 120,
+        pair_count: 400,
+        commits_skipped_too_large: 0,
+        split_timestamp: 1_700_100_000,
+        metrics_by_threshold: vec![ThresholdMetrics {
+            threshold: 0.1,
+            macro_precision: 0.0, // would drag aggregate down if included
+            macro_recall: 0.0,
+            macro_f1: 0.0,
+            micro_precision: 0.0,
+            micro_recall: 0.0,
+            micro_f1: 0.0,
+            commit_count: 0,
+            query_count: 0,
+        }],
+        quality_gate_passed: true, // gate passed…
+        quality_gate_reason: None,
+        error: Some("evaluation failed: matrix corrupted".to_string()), // …but error present
+    };
+
+    let agg = aggregate_metrics(&[clean, errored_but_passing_gate], &[0.1]);
+    assert_eq!(agg.len(), 1);
+    let m = &agg[0];
+
+    // Only the clean repo should contribute: precision = 0.8.
+    assert!(
+        (m.macro_precision - 0.8).abs() < 1e-9,
+        "errored repo must not lower aggregate precision; got {}",
+        m.macro_precision
+    );
+    assert!(
+        (m.macro_recall - 0.8).abs() < 1e-9,
+        "errored repo must not lower aggregate recall; got {}",
+        m.macro_recall
     );
 }
 
