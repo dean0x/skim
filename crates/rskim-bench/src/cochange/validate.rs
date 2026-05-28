@@ -47,6 +47,21 @@ const MIN_HISTORY_SECONDS: i64 = 6 * 30 * 24 * 60 * 60; // approximately 6 month
 /// before evaluation begins.
 const MAX_FILES_FOR_EVALUATION: usize = 20_000;
 
+/// Maximum number of test commits processed by [`evaluate_at_thresholds`].
+///
+/// A repo with 100k test commits × 100 mapped files × 20k candidates would
+/// require 200 billion jaccard calls.  Exceeding this limit aborts evaluation
+/// with an error so the benchmark run does not stall indefinitely.
+const MAX_TEST_COMMITS: usize = 50_000;
+
+/// Maximum number of files in a single test commit included in evaluation.
+///
+/// A commit touching 1 000 mapped files would produce 1 000 × 20 000 = 20M
+/// jaccard calls and roughly 320 MB of cached tuples for that commit alone.
+/// Commits exceeding this limit are skipped silently; the commit still
+/// contributes its unmapped-file count but is excluded from metric averaging.
+const MAX_FILES_PER_COMMIT: usize = 500;
+
 // ============================================================================
 // Path map construction
 // ============================================================================
@@ -204,6 +219,15 @@ pub fn evaluate_at_thresholds(
         );
     }
 
+    // Guard against O(commits × F²) wall-time explosion.
+    if test_commits.len() > MAX_TEST_COMMITS {
+        anyhow::bail!(
+            "test commit count {} exceeds limit {} — raise MAX_TEST_COMMITS or reduce test set",
+            test_commits.len(),
+            MAX_TEST_COMMITS
+        );
+    }
+
     let mut unmapped_files_total = 0usize;
 
     // Per-threshold accumulators for macro (commit-level) averages.
@@ -218,6 +242,9 @@ pub fn evaluate_at_thresholds(
     let mut micro_predicted = vec![0usize; n_thresholds]; // predicted set sizes
     let mut micro_actual = vec![0usize; n_thresholds]; // actual set sizes
     let mut micro_query_count = vec![0usize; n_thresholds];
+
+    // Scratch set reused across all threshold iterations to avoid Q×T per-commit allocations.
+    let mut predicted_scratch: HashSet<FileId> = HashSet::new();
 
     for commit in test_commits {
         // Resolve all file IDs for this commit. Track unmapped files.
@@ -238,83 +265,38 @@ pub fn evaluate_at_thresholds(
             continue;
         }
 
+        // Skip bulk-refactor commits to avoid ~320 MB of jaccard cache per commit.
+        if known_ids.len() > MAX_FILES_PER_COMMIT {
+            continue;
+        }
+
         // Pre-compute jaccard scores and actual sets once, then sweep thresholds.
         // Jaccard values are threshold-independent: computing them once and sweeping
         // thresholds reduces total work by a factor of T (number of thresholds).
 
         // jaccard_cache[q_idx] = Vec of (candidate_id, jaccard) pairs where j > 0.
         // Only positive values are retained so the threshold sweep is cheap.
-        let mut jaccard_cache: Vec<Vec<(FileId, f64)>> = Vec::with_capacity(known_ids.len());
-        for &query_id in &known_ids {
-            let mut pairs: Vec<(FileId, f64)> = Vec::new();
-            for &candidate_id in &all_file_ids {
-                if candidate_id == query_id {
-                    continue; // skip self-pair
-                }
-                match reader.jaccard(query_id, candidate_id) {
-                    Ok(j) if j > 0.0 => {
-                        pairs.push((candidate_id, j));
-                    }
-                    Ok(_) => {}
-                    Err(SearchError::IndexCorrupted(msg)) => {
-                        return Err(anyhow::anyhow!("matrix corrupted: {msg}"));
-                    }
-                    Err(e) => return Err(anyhow::anyhow!("jaccard error: {e}")),
-                }
-            }
-            jaccard_cache.push(pairs);
-        }
+        let jaccard_cache = compute_jaccard_cache(&known_ids, &all_file_ids, reader)?;
 
         // Pre-compute the "actual" co-change set for each query in this commit:
         // all other known file IDs changed in the same commit.
-        let actual_sets: Vec<HashSet<FileId>> = known_ids
-            .iter()
-            .map(|&query_id| {
-                known_ids
-                    .iter()
-                    .copied()
-                    .filter(|&id| id != query_id)
-                    .collect()
-            })
-            .collect();
+        let actual_sets = compute_actual_sets(&known_ids);
 
         // Sweep thresholds over the cached jaccard values.
-        let query_count = known_ids.len();
-        for ti in 0..n_thresholds {
-            let threshold = thresholds[ti];
-
-            let mut commit_precision_sum = 0.0f64;
-            let mut commit_recall_sum = 0.0f64;
-
-            for q_idx in 0..known_ids.len() {
-                // Apply threshold filter to cached jaccard values.
-                let predicted: HashSet<FileId> = jaccard_cache[q_idx]
-                    .iter()
-                    .filter(|&&(_, j)| j >= threshold)
-                    .map(|&(cid, _)| cid)
-                    .collect();
-
-                let actual = &actual_sets[q_idx];
-                let p = compute_precision(&predicted, actual);
-                let r = compute_recall(&predicted, actual);
-                commit_precision_sum += p;
-                commit_recall_sum += r;
-
-                // Micro accumulation.
-                let tp = predicted.intersection(actual).count();
-                micro_tp[ti] += tp;
-                micro_predicted[ti] += predicted.len();
-                micro_actual[ti] += actual.len();
-                micro_query_count[ti] += 1;
-            }
-
-            // Macro: average over queries within this commit, then accumulate.
-            let commit_avg_precision = commit_precision_sum / query_count as f64;
-            let commit_avg_recall = commit_recall_sum / query_count as f64;
-            macro_precision_sum[ti] += commit_avg_precision;
-            macro_recall_sum[ti] += commit_avg_recall;
-            macro_commit_count[ti] += 1;
-        }
+        sweep_thresholds(
+            &jaccard_cache,
+            &actual_sets,
+            &known_ids,
+            thresholds,
+            &mut predicted_scratch,
+            &mut macro_precision_sum,
+            &mut macro_recall_sum,
+            &mut macro_commit_count,
+            &mut micro_tp,
+            &mut micro_predicted,
+            &mut micro_actual,
+            &mut micro_query_count,
+        );
     }
 
     // Assemble ThresholdMetrics for each threshold.
@@ -637,6 +619,134 @@ fn build_and_evaluate(
         pair_count: stats.pair_count as usize,
         commits_skipped_too_large: stats.commits_skipped_too_large as usize,
     })
+}
+
+// ============================================================================
+// evaluate_at_thresholds helpers (decomposed from the original 175-line body)
+// ============================================================================
+
+/// Build the per-query jaccard cache for a single commit.
+///
+/// For each `query_id` in `known_ids`, scans all `all_file_ids` and retains
+/// `(candidate_id, jaccard)` pairs where `jaccard > 0.0`.  Self-pairs are
+/// skipped.  Returns a `Vec` aligned with `known_ids`.
+///
+/// Extracting this helper eliminates the 6-level nesting that existed inside
+/// the original `evaluate_at_thresholds` commit loop.
+///
+/// # Errors
+///
+/// Propagates [`SearchError::IndexCorrupted`] and unexpected jaccard errors.
+fn compute_jaccard_cache(
+    known_ids: &[FileId],
+    all_file_ids: &[FileId],
+    reader: &CochangeMatrixReader,
+) -> anyhow::Result<Vec<Vec<(FileId, f64)>>> {
+    let mut cache: Vec<Vec<(FileId, f64)>> = Vec::with_capacity(known_ids.len());
+    for &query_id in known_ids {
+        let pairs = build_jaccard_pairs(query_id, all_file_ids, reader)?;
+        cache.push(pairs);
+    }
+    Ok(cache)
+}
+
+/// Compute positive jaccard pairs for a single query file against all candidates.
+///
+/// Returns `(candidate_id, jaccard)` for every candidate where `jaccard > 0.0`.
+/// Self-pairs (where `candidate_id == query_id`) are excluded.
+fn build_jaccard_pairs(
+    query_id: FileId,
+    all_file_ids: &[FileId],
+    reader: &CochangeMatrixReader,
+) -> anyhow::Result<Vec<(FileId, f64)>> {
+    let mut pairs: Vec<(FileId, f64)> = Vec::new();
+    for &candidate_id in all_file_ids {
+        if candidate_id == query_id {
+            continue; // skip self-pair
+        }
+        match reader.jaccard(query_id, candidate_id) {
+            Ok(j) if j > 0.0 => pairs.push((candidate_id, j)),
+            Ok(_) => {}
+            Err(SearchError::IndexCorrupted(msg)) => {
+                return Err(anyhow::anyhow!("matrix corrupted: {msg}"));
+            }
+            Err(e) => return Err(anyhow::anyhow!("jaccard error: {e}")),
+        }
+    }
+    Ok(pairs)
+}
+
+/// Pre-compute the "actual" co-change set for each query in a commit.
+///
+/// For each query, the actual set is every other mapped file in the same
+/// commit.  Aligned with `known_ids`.
+fn compute_actual_sets(known_ids: &[FileId]) -> Vec<HashSet<FileId>> {
+    known_ids
+        .iter()
+        .map(|&query_id| {
+            known_ids
+                .iter()
+                .copied()
+                .filter(|&id| id != query_id)
+                .collect()
+        })
+        .collect()
+}
+
+/// Sweep all thresholds over pre-computed jaccard and actual sets for one commit.
+///
+/// Updates all accumulator slices in-place.  The `predicted_scratch` set is
+/// cleared and reused for every (threshold, query) pair to avoid Q×T HashSet
+/// allocations per commit.
+#[allow(clippy::too_many_arguments)]
+fn sweep_thresholds(
+    jaccard_cache: &[Vec<(FileId, f64)>],
+    actual_sets: &[HashSet<FileId>],
+    known_ids: &[FileId],
+    thresholds: &[f64],
+    predicted_scratch: &mut HashSet<FileId>,
+    macro_precision_sum: &mut [f64],
+    macro_recall_sum: &mut [f64],
+    macro_commit_count: &mut [usize],
+    micro_tp: &mut [usize],
+    micro_predicted: &mut [usize],
+    micro_actual: &mut [usize],
+    micro_query_count: &mut [usize],
+) {
+    let query_count = known_ids.len();
+    for (ti, &threshold) in thresholds.iter().enumerate() {
+        let mut commit_precision_sum = 0.0f64;
+        let mut commit_recall_sum = 0.0f64;
+
+        for q_idx in 0..query_count {
+            // Reuse scratch set: clear then extend with threshold-filtered candidates.
+            predicted_scratch.clear();
+            predicted_scratch.extend(
+                jaccard_cache[q_idx]
+                    .iter()
+                    .filter(|&&(_, j)| j >= threshold)
+                    .map(|&(cid, _)| cid),
+            );
+
+            let actual = &actual_sets[q_idx];
+            let p = compute_precision(predicted_scratch, actual);
+            let r = compute_recall(predicted_scratch, actual);
+            commit_precision_sum += p;
+            commit_recall_sum += r;
+
+            // Micro accumulation.
+            let tp = predicted_scratch.intersection(actual).count();
+            micro_tp[ti] += tp;
+            micro_predicted[ti] += predicted_scratch.len();
+            micro_actual[ti] += actual.len();
+            micro_query_count[ti] += 1;
+        }
+
+        // Macro: average over queries within this commit, then accumulate.
+        macro_precision_sum[ti] += commit_precision_sum / query_count as f64;
+        macro_recall_sum[ti] += commit_recall_sum / query_count as f64;
+        macro_commit_count[ti] += 1;
+    }
 }
 
 fn error_result(entry: &RepoEntry, repo_name: &str, error: String) -> RepoCochangeResult {
