@@ -78,14 +78,12 @@ pub fn is_denied(path: &str) -> bool {
     }
 
     // 2. Any directory component on the deny-list.
-    //    Split on '/' and check every component except the last (filename).
-    let mut components = normalised.split('/').peekable();
-    while let Some(component) = components.next() {
-        if components.peek().is_none() {
-            break; // last segment is the filename, already checked above
-        }
-        if DENIED_DIRS.contains(&component) {
-            return true;
+    //    Everything before the final '/' is a directory component.
+    if let Some(dir_prefix) = normalised.rsplit_once('/').map(|(prefix, _)| prefix) {
+        for component in dir_prefix.split('/') {
+            if DENIED_DIRS.contains(&component) {
+                return true;
+            }
         }
     }
 
@@ -135,7 +133,7 @@ pub fn filter_denied(files: &mut Vec<FileChangeInfo>) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
 
@@ -313,8 +311,8 @@ mod tests {
         ];
         filter_denied(&mut files);
         assert_eq!(files.len(), 2);
-        assert!(files.iter().any(|f| f.path == PathBuf::from("src/main.rs")));
-        assert!(files.iter().any(|f| f.path == PathBuf::from("src/lib.rs")));
+        assert!(files.iter().any(|f| f.path == Path::new("src/main.rs")));
+        assert!(files.iter().any(|f| f.path == Path::new("src/lib.rs")));
     }
 
     #[test]
