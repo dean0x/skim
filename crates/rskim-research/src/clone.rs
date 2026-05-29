@@ -67,29 +67,43 @@ pub fn extract_repo_name(url: &str) -> anyhow::Result<String> {
 /// Timeout for any single `git` subprocess (seconds).
 const GIT_SUBPROCESS_TIMEOUT_SECS: u64 = 300;
 
-/// Spawn a `git` command and wait for it to finish, killing it if it exceeds
-/// `GIT_SUBPROCESS_TIMEOUT_SECS`.  Returns `Ok(true)` on success, `Ok(false)`
-/// on non-zero exit, and `Err` if the process could not be spawned or the
-/// timeout expired.
-pub fn git_run_with_timeout(mut cmd: std::process::Command, label: &str) -> anyhow::Result<bool> {
+/// Spawn a child process, hand it to a wait closure on a background thread,
+/// and enforce a hard deadline.  Returns `Err` if spawning fails, the wait
+/// closure returns an error, or the deadline expires.
+///
+/// The wait strategy is parameterised so callers can use either `Child::wait`
+/// (discard output) or `Child::wait_with_output` (capture stdout/stderr)
+/// without duplicating the spawn/channel/kill/join boilerplate.
+///
+/// # Platform notes
+///
+/// On timeout the child is killed via SIGKILL (Unix) or `taskkill /F` (Windows)
+/// using the pid captured before the child is moved onto the background thread.
+/// The background thread is then joined; because the process has already been
+/// killed this join completes immediately.
+fn run_with_timeout<F, T>(
+    child: std::process::Child,
+    label: &str,
+    timeout_secs: u64,
+    wait_fn: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce(std::process::Child) -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let mut child = cmd.spawn().with_context(|| format!("spawning {label}"))?;
-
-    // Move blocking `wait()` onto a background thread so the main thread can
-    // enforce the deadline without using any unstable API.
-    let (tx, rx) = mpsc::channel();
-    // Move the child into the background thread for blocking wait.  Capture the
-    // pid first so we can send SIGKILL on timeout without needing the Child handle.
+    // Capture the pid before moving `child` onto the background thread so we
+    // can send SIGKILL without needing the `Child` handle back from the thread.
     let child_id = child.id();
+    let (tx, rx) = mpsc::channel();
     let handle = std::thread::spawn(move || {
-        let result = child.wait();
-        let _ = tx.send(result);
+        let _ = tx.send(wait_fn(child));
     });
 
-    match rx.recv_timeout(Duration::from_secs(GIT_SUBPROCESS_TIMEOUT_SECS)) {
-        Ok(Ok(status)) => Ok(status.success()),
+    match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+        Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => Err(anyhow::anyhow!("{label} wait error: {e}")),
         Err(_timeout) => {
             // Kill the process using its pid via a platform-appropriate signal.
@@ -114,9 +128,20 @@ pub fn git_run_with_timeout(mut cmd: std::process::Command, label: &str) -> anyh
             // this does not block indefinitely.  Joining prevents the thread
             // from becoming permanently detached after SIGKILL.
             let _ = handle.join();
-            anyhow::bail!("{label} timed out after {GIT_SUBPROCESS_TIMEOUT_SECS}s");
+            anyhow::bail!("{label} timed out after {timeout_secs}s");
         }
     }
+}
+
+/// Spawn a `git` command and wait for it to finish, killing it if it exceeds
+/// `GIT_SUBPROCESS_TIMEOUT_SECS`.  Returns `Ok(true)` on success, `Ok(false)`
+/// on non-zero exit, and `Err` if the process could not be spawned or the
+/// timeout expired.
+pub fn git_run_with_timeout(mut cmd: std::process::Command, label: &str) -> anyhow::Result<bool> {
+    let child = cmd.spawn().with_context(|| format!("spawning {label}"))?;
+    run_with_timeout(child, label, GIT_SUBPROCESS_TIMEOUT_SECS, |mut c| {
+        c.wait().map(|s| s.success())
+    })
 }
 
 /// Spawn a `git` command and wait for its output, killing it if it exceeds
@@ -130,42 +155,8 @@ pub fn git_output_with_timeout(
     label: &str,
     timeout_secs: u64,
 ) -> anyhow::Result<std::process::Output> {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("spawning {label}"))?;
-
-    let child_id = child.id();
-    let (tx, rx) = mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        let result = child.wait_with_output();
-        let _ = tx.send(result);
-    });
-
-    match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err(anyhow::anyhow!("{label} wait error: {e}")),
-        Err(_timeout) => {
-            #[cfg(unix)]
-            {
-                // SAFETY: kill(2) is always safe to call with a valid pid.
-                unsafe {
-                    libc::kill(child_id as libc::pid_t, libc::SIGKILL);
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/F", "/PID", &child_id.to_string()])
-                    .status();
-            }
-            // Join after kill: the process exits quickly, so this won't block.
-            let _ = handle.join();
-            anyhow::bail!("{label} timed out after {timeout_secs}s");
-        }
-    }
+    let child = cmd.spawn().with_context(|| format!("spawning {label}"))?;
+    run_with_timeout(child, label, timeout_secs, |c| c.wait_with_output())
 }
 
 fn clone_repo(url: &str, commit: &str, dest: &Path) -> anyhow::Result<()> {
