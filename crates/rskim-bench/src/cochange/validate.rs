@@ -229,22 +229,7 @@ pub fn evaluate_at_thresholds(
     }
 
     let mut unmapped_files_total = 0usize;
-
-    // Per-threshold accumulators for macro (commit-level) averages.
-    // Index aligns with `thresholds`.
-    let n_thresholds = thresholds.len();
-    let mut macro_precision_sum = vec![0.0f64; n_thresholds];
-    let mut macro_recall_sum = vec![0.0f64; n_thresholds];
-    let mut macro_commit_count = vec![0usize; n_thresholds];
-
-    // Per-threshold accumulators for micro (query-level) averages.
-    let mut micro_tp = vec![0usize; n_thresholds]; // true positives
-    let mut micro_predicted = vec![0usize; n_thresholds]; // predicted set sizes
-    let mut micro_actual = vec![0usize; n_thresholds]; // actual set sizes
-    let mut micro_query_count = vec![0usize; n_thresholds];
-
-    // Scratch set reused across all threshold iterations to avoid Q×T per-commit allocations.
-    let mut predicted_scratch: HashSet<FileId> = HashSet::new();
+    let mut accumulators = EvalAccumulators::new(thresholds.len());
 
     for commit in test_commits {
         // Resolve all file IDs for this commit. Track unmapped files.
@@ -283,60 +268,10 @@ pub fn evaluate_at_thresholds(
         let actual_sets = compute_actual_sets(&known_ids);
 
         // Sweep thresholds over the cached jaccard values.
-        sweep_thresholds(
-            &jaccard_cache,
-            &actual_sets,
-            &known_ids,
-            thresholds,
-            &mut predicted_scratch,
-            &mut macro_precision_sum,
-            &mut macro_recall_sum,
-            &mut macro_commit_count,
-            &mut micro_tp,
-            &mut micro_predicted,
-            &mut micro_actual,
-            &mut micro_query_count,
-        );
+        sweep_thresholds(&jaccard_cache, &actual_sets, &known_ids, thresholds, &mut accumulators);
     }
 
-    // Assemble ThresholdMetrics for each threshold.
-    let metrics: Vec<ThresholdMetrics> = (0..n_thresholds)
-        .map(|ti| {
-            let commit_count = macro_commit_count[ti];
-            let (macro_p, macro_r) = if commit_count > 0 {
-                (
-                    macro_precision_sum[ti] / commit_count as f64,
-                    macro_recall_sum[ti] / commit_count as f64,
-                )
-            } else {
-                (0.0, 0.0)
-            };
-
-            let micro_p = if micro_predicted[ti] > 0 {
-                micro_tp[ti] as f64 / micro_predicted[ti] as f64
-            } else {
-                0.0
-            };
-            let micro_r = if micro_actual[ti] > 0 {
-                micro_tp[ti] as f64 / micro_actual[ti] as f64
-            } else {
-                0.0
-            };
-
-            ThresholdMetrics {
-                threshold: thresholds[ti],
-                macro_precision: macro_p,
-                macro_recall: macro_r,
-                macro_f1: compute_f1(macro_p, macro_r),
-                micro_precision: micro_p,
-                micro_recall: micro_r,
-                micro_f1: compute_f1(micro_p, micro_r),
-                commit_count,
-                query_count: micro_query_count[ti],
-            }
-        })
-        .collect();
-
+    let metrics = accumulators.finalize(thresholds);
     Ok((metrics, unmapped_files_total))
 }
 
@@ -622,6 +557,131 @@ fn build_and_evaluate(
 }
 
 // ============================================================================
+// EvalAccumulators — cohesive accumulator state for sweep_thresholds
+// ============================================================================
+
+/// Per-threshold accumulator state for one evaluation run.
+///
+/// Bundles the 7 parallel index-aligned arrays that were previously passed as
+/// separate mutable slice parameters to `sweep_thresholds`.  Each index `ti`
+/// corresponds to one Jaccard threshold.
+///
+/// Also owns the `predicted_scratch` [`HashSet`] reused across (threshold,
+/// query) iterations to avoid `Q × T` allocations per commit.
+struct EvalAccumulators {
+    /// Sum of per-commit macro-precision values, one entry per threshold.
+    macro_precision_sum: Vec<f64>,
+    /// Sum of per-commit macro-recall values, one entry per threshold.
+    macro_recall_sum: Vec<f64>,
+    /// Number of commits contributing to macro averages, one entry per threshold.
+    macro_commit_count: Vec<usize>,
+    /// Micro true-positive count, one entry per threshold.
+    micro_tp: Vec<usize>,
+    /// Micro predicted-set size sum, one entry per threshold.
+    micro_predicted: Vec<usize>,
+    /// Micro actual-set size sum, one entry per threshold.
+    micro_actual: Vec<usize>,
+    /// Number of query-file observations, one entry per threshold.
+    micro_query_count: Vec<usize>,
+    /// Scratch set cleared and reused each (threshold, query) iteration.
+    predicted_scratch: HashSet<FileId>,
+}
+
+impl EvalAccumulators {
+    /// Allocate zero-initialised accumulators for `n_thresholds` thresholds.
+    fn new(n_thresholds: usize) -> Self {
+        Self {
+            macro_precision_sum: vec![0.0f64; n_thresholds],
+            macro_recall_sum: vec![0.0f64; n_thresholds],
+            macro_commit_count: vec![0usize; n_thresholds],
+            micro_tp: vec![0usize; n_thresholds],
+            micro_predicted: vec![0usize; n_thresholds],
+            micro_actual: vec![0usize; n_thresholds],
+            micro_query_count: vec![0usize; n_thresholds],
+            predicted_scratch: HashSet::new(),
+        }
+    }
+
+    /// Accumulate one (threshold-index, predicted, actual) observation.
+    ///
+    /// Computes the intersection count once and derives macro precision/recall
+    /// and micro TP from that single count, eliminating the three independent
+    /// intersection iterations that existed when these were separate slice params.
+    fn accumulate(
+        &mut self,
+        ti: usize,
+        predicted: &HashSet<FileId>,
+        actual: &HashSet<FileId>,
+    ) -> (f64, f64) {
+        // Compute intersection once; derive all dependent quantities from it.
+        let intersection = predicted.intersection(actual).count();
+        let precision = if predicted.is_empty() {
+            0.0
+        } else {
+            intersection as f64 / predicted.len() as f64
+        };
+        let recall = if actual.is_empty() {
+            0.0
+        } else {
+            intersection as f64 / actual.len() as f64
+        };
+
+        // Micro accumulation uses the same intersection count.
+        self.micro_tp[ti] += intersection;
+        self.micro_predicted[ti] += predicted.len();
+        self.micro_actual[ti] += actual.len();
+        self.micro_query_count[ti] += 1;
+
+        (precision, recall)
+    }
+
+    /// Assemble the final [`ThresholdMetrics`] vector from accumulated state.
+    ///
+    /// Extracts the metrics-assembly phase that previously lived inline at the
+    /// end of `evaluate_at_thresholds` (lines ~302-339 prior to this refactor).
+    fn finalize(self, thresholds: &[f64]) -> Vec<ThresholdMetrics> {
+        thresholds
+            .iter()
+            .enumerate()
+            .map(|(ti, &threshold)| {
+                let commit_count = self.macro_commit_count[ti];
+                let (macro_p, macro_r) = if commit_count > 0 {
+                    (
+                        self.macro_precision_sum[ti] / commit_count as f64,
+                        self.macro_recall_sum[ti] / commit_count as f64,
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+
+                let micro_p = if self.micro_predicted[ti] > 0 {
+                    self.micro_tp[ti] as f64 / self.micro_predicted[ti] as f64
+                } else {
+                    0.0
+                };
+                let micro_r = if self.micro_actual[ti] > 0 {
+                    self.micro_tp[ti] as f64 / self.micro_actual[ti] as f64
+                } else {
+                    0.0
+                };
+
+                ThresholdMetrics {
+                    threshold,
+                    macro_precision: macro_p,
+                    macro_recall: macro_r,
+                    macro_f1: compute_f1(macro_p, macro_r),
+                    micro_precision: micro_p,
+                    micro_recall: micro_r,
+                    micro_f1: compute_f1(micro_p, micro_r),
+                    commit_count,
+                    query_count: self.micro_query_count[ti],
+                }
+            })
+            .collect()
+    }
+}
+
+// ============================================================================
 // evaluate_at_thresholds helpers (decomposed from the original 175-line body)
 // ============================================================================
 
@@ -642,12 +702,10 @@ fn compute_jaccard_cache(
     all_file_ids: &[FileId],
     reader: &CochangeMatrixReader,
 ) -> anyhow::Result<Vec<Vec<(FileId, f64)>>> {
-    let mut cache: Vec<Vec<(FileId, f64)>> = Vec::with_capacity(known_ids.len());
-    for &query_id in known_ids {
-        let pairs = build_jaccard_pairs(query_id, all_file_ids, reader)?;
-        cache.push(pairs);
-    }
-    Ok(cache)
+    known_ids
+        .iter()
+        .map(|&query_id| build_jaccard_pairs(query_id, all_file_ids, reader))
+        .collect()
 }
 
 /// Compute positive jaccard pairs for a single query file against all candidates.
@@ -695,23 +753,15 @@ fn compute_actual_sets(known_ids: &[FileId]) -> Vec<HashSet<FileId>> {
 
 /// Sweep all thresholds over pre-computed jaccard and actual sets for one commit.
 ///
-/// Updates all accumulator slices in-place.  The `predicted_scratch` set is
-/// cleared and reused for every (threshold, query) pair to avoid Q×T HashSet
-/// allocations per commit.
-#[allow(clippy::too_many_arguments)]
+/// Updates `accumulators` in-place.  The `predicted_scratch` set inside
+/// `accumulators` is cleared and reused for every (threshold, query) pair to
+/// avoid Q×T HashSet allocations per commit.
 fn sweep_thresholds(
     jaccard_cache: &[Vec<(FileId, f64)>],
     actual_sets: &[HashSet<FileId>],
     known_ids: &[FileId],
     thresholds: &[f64],
-    predicted_scratch: &mut HashSet<FileId>,
-    macro_precision_sum: &mut [f64],
-    macro_recall_sum: &mut [f64],
-    macro_commit_count: &mut [usize],
-    micro_tp: &mut [usize],
-    micro_predicted: &mut [usize],
-    micro_actual: &mut [usize],
-    micro_query_count: &mut [usize],
+    accumulators: &mut EvalAccumulators,
 ) {
     let query_count = known_ids.len();
     for (ti, &threshold) in thresholds.iter().enumerate() {
@@ -720,32 +770,29 @@ fn sweep_thresholds(
 
         for q_idx in 0..query_count {
             // Reuse scratch set: clear then extend with threshold-filtered candidates.
-            predicted_scratch.clear();
-            predicted_scratch.extend(
+            accumulators.predicted_scratch.clear();
+            accumulators.predicted_scratch.extend(
                 jaccard_cache[q_idx]
                     .iter()
                     .filter(|&&(_, j)| j >= threshold)
                     .map(|&(cid, _)| cid),
             );
 
+            // accumulate() computes the intersection once and derives precision,
+            // recall, and micro-TP from that single count (fixes redundant intersection).
             let actual = &actual_sets[q_idx];
-            let p = compute_precision(predicted_scratch, actual);
-            let r = compute_recall(predicted_scratch, actual);
+            let scratch = std::mem::take(&mut accumulators.predicted_scratch);
+            let (p, r) = accumulators.accumulate(ti, &scratch, actual);
+            accumulators.predicted_scratch = scratch;
+
             commit_precision_sum += p;
             commit_recall_sum += r;
-
-            // Micro accumulation.
-            let tp = predicted_scratch.intersection(actual).count();
-            micro_tp[ti] += tp;
-            micro_predicted[ti] += predicted_scratch.len();
-            micro_actual[ti] += actual.len();
-            micro_query_count[ti] += 1;
         }
 
         // Macro: average over queries within this commit, then accumulate.
-        macro_precision_sum[ti] += commit_precision_sum / query_count as f64;
-        macro_recall_sum[ti] += commit_recall_sum / query_count as f64;
-        macro_commit_count[ti] += 1;
+        accumulators.macro_precision_sum[ti] += commit_precision_sum / query_count as f64;
+        accumulators.macro_recall_sum[ti] += commit_recall_sum / query_count as f64;
+        accumulators.macro_commit_count[ti] += 1;
     }
 }
 
