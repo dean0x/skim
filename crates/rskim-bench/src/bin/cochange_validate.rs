@@ -214,18 +214,15 @@ fn parse_thresholds(input: &str) -> anyhow::Result<Vec<f64>> {
     Ok(thresholds)
 }
 
-/// Return the current UTC time as an ISO-8601 string (`YYYY-MM-DDTHH:MM:SSZ`).
+/// Convert a count of days since the Unix epoch (1970-01-01) to a proleptic
+/// Gregorian `(year, month, day)` triple.
 ///
-/// Implemented with only `std::time` to avoid adding a `chrono`/`time`
-/// dependency to this benchmark binary.  The Gregorian calendar arithmetic
-/// accounts for leap years.  Falls back to `"unknown"` if the system clock
-/// is before the Unix epoch (should never happen in practice).
-fn chrono_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Named constants from Howard Hinnant's "civil_from_days" algorithm.
-    // Reference: https://howardhinnant.github.io/date_algorithms.html
-    //
+/// Uses Howard Hinnant's `civil_from_days` algorithm.
+/// Reference: <https://howardhinnant.github.io/date_algorithms.html>
+///
+/// Negative values (dates before 1970-01-01) are handled correctly by the
+/// era-shift arithmetic and are exercised in tests.
+fn epoch_days_to_ymd(days: i64) -> (i64, i64, i64) {
     // CIVIL_EPOCH_OFFSET: days from Unix epoch (1970-01-01) to the civil epoch
     //   (0000-03-01) used by the algorithm, which simplifies leap-year arithmetic.
     const CIVIL_EPOCH_OFFSET: i64 = 719_468;
@@ -241,8 +238,8 @@ fn chrono_now() -> String {
     const DAYS_PER_100_YEARS: i64 = 36524;
     // DAYS_PER_YEAR: days in a common (non-leap) year.
     const DAYS_PER_YEAR: i64 = 365;
-    // MONTH_PERIOD_NUMERATOR / MONTH_PERIOD_DENOMINATOR: encode the irregular
-    //   day-counts of months as a linear approximation.  mp = (5*doy+2)/153.
+    // MONTH_LINEAR_SCALE / MONTH_LINEAR_OFFSET / MONTH_LINEAR_DENOM: encode the
+    //   irregular day-counts of months as a linear approximation.  mp = (5*doy+2)/153.
     const MONTH_LINEAR_SCALE: i64 = 5;
     const MONTH_LINEAR_OFFSET: i64 = 2;
     const MONTH_LINEAR_DENOM: i64 = 153;
@@ -254,12 +251,40 @@ fn chrono_now() -> String {
     const YEAR_WRAP_THRESHOLD: i64 = 10;
     const YEAR_WRAP_SUBTRACT: i64 = 9;
 
+    let z = days + CIVIL_EPOCH_OFFSET;
+    let era = if z >= 0 { z } else { z - DAYS_PER_ERA_MINUS_ONE } / DAYS_PER_ERA;
+    let doe = z - era * DAYS_PER_ERA; // day of era [0, 146096]
+    let yoe = (doe - doe / DAYS_PER_4_YEARS + doe / DAYS_PER_100_YEARS
+        - doe / DAYS_PER_ERA_MINUS_ONE)
+        / DAYS_PER_YEAR; // year of era [0, 399]
+    let y = yoe + era * YEARS_PER_ERA;
+    let doy = doe - (DAYS_PER_YEAR * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (MONTH_LINEAR_SCALE * doy + MONTH_LINEAR_OFFSET) / MONTH_LINEAR_DENOM; // month in [0, 11] (March=0)
+    let d = doy - (MONTH_LINEAR_DENOM * mp + MONTH_LINEAR_OFFSET) / MONTH_LINEAR_SCALE + 1; // day [1, 31]
+    let m = if mp < YEAR_WRAP_THRESHOLD {
+        mp + MARCH_OFFSET
+    } else {
+        mp - YEAR_WRAP_SUBTRACT
+    }; // month [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+
+    (y, m, d)
+}
+
+/// Return the current UTC time as an ISO-8601 string (`YYYY-MM-DDTHH:MM:SSZ`).
+///
+/// Implemented with only `std::time` to avoid adding a `chrono`/`time`
+/// dependency to this benchmark binary.  The Gregorian calendar arithmetic
+/// accounts for leap years.  Falls back to `"unknown"` if the system clock
+/// is before the Unix epoch (should never happen in practice).
+fn chrono_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     let secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_secs(),
         Err(_) => return "unknown".to_string(),
     };
 
-    // --- time of day ---
     const SECS_PER_DAY: u64 = 86400;
     const SECS_PER_HOUR: u64 = 3600;
     const SECS_PER_MINUTE: u64 = 60;
@@ -267,17 +292,7 @@ fn chrono_now() -> String {
     let minute = (secs % SECS_PER_HOUR) / SECS_PER_MINUTE;
     let second = secs % SECS_PER_MINUTE;
 
-    // --- Gregorian calendar: days since Unix epoch → year/month/day ---
-    let z = (secs / SECS_PER_DAY) as i64 + CIVIL_EPOCH_OFFSET;
-    let era = if z >= 0 { z } else { z - DAYS_PER_ERA_MINUS_ONE } / DAYS_PER_ERA;
-    let doe = z - era * DAYS_PER_ERA; // day of era [0, 146096]
-    let yoe = (doe - doe / DAYS_PER_4_YEARS + doe / DAYS_PER_100_YEARS - doe / DAYS_PER_ERA_MINUS_ONE) / DAYS_PER_YEAR; // year of era [0, 399]
-    let y = yoe + era * YEARS_PER_ERA;
-    let doy = doe - (DAYS_PER_YEAR * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
-    let mp = (MONTH_LINEAR_SCALE * doy + MONTH_LINEAR_OFFSET) / MONTH_LINEAR_DENOM; // month in [0, 11] (March=0)
-    let d = doy - (MONTH_LINEAR_DENOM * mp + MONTH_LINEAR_OFFSET) / MONTH_LINEAR_SCALE + 1; // day [1, 31]
-    let m = if mp < YEAR_WRAP_THRESHOLD { mp + MARCH_OFFSET } else { mp - YEAR_WRAP_SUBTRACT }; // month [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
+    let (y, m, d) = epoch_days_to_ymd((secs / SECS_PER_DAY) as i64);
 
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
@@ -365,6 +380,60 @@ mod tests {
     fn parse_thresholds_trims_whitespace() {
         let result = parse_thresholds(" 0.1 , 0.2 ").unwrap();
         assert_eq!(result, vec![0.1, 0.2]);
+    }
+
+    // --- epoch_days_to_ymd ---
+
+    #[test]
+    fn epoch_days_to_ymd_unix_epoch() {
+        // Day 0 is 1970-01-01.
+        assert_eq!(epoch_days_to_ymd(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn epoch_days_to_ymd_known_date_2000_01_01() {
+        // 2000-01-01 is 10957 days after 1970-01-01.
+        // (30 years: 7 leap years in 1972,76,80,84,88,92,96 → 30*365+7 = 10957)
+        assert_eq!(epoch_days_to_ymd(10_957), (2000, 1, 1));
+    }
+
+    #[test]
+    fn epoch_days_to_ymd_leap_year_feb29_2000() {
+        // 2000-02-29 exists (400-year divisible leap year).
+        // 2000-01-01 = day 10957; +31 (Jan) +28 (Feb 1-28) = +59 → day 11016 = 2000-02-29.
+        assert_eq!(epoch_days_to_ymd(11_016), (2000, 2, 29));
+    }
+
+    #[test]
+    fn epoch_days_to_ymd_leap_year_feb29_2004() {
+        // 2004 is a regular 4-year leap year.
+        // 2004-01-01 = 10957 + 4*365 + 1 (leap day in 2000) = 10957 + 1461 = 12418.
+        // +31 (Jan) +28 (Feb 1-28) = 12418 + 59 = 12477 = 2004-02-29.
+        assert_eq!(epoch_days_to_ymd(12_477), (2004, 2, 29));
+    }
+
+    #[test]
+    fn epoch_days_to_ymd_century_year_no_leap_1900() {
+        // 1900 is a century year (divisible by 100 but not 400): not a leap year.
+        // 1970-01-01 is epoch day 0.  1900-01-01 is 70 years earlier:
+        //   17 leap years (1904,1908,...,1968) + 53 common years
+        //   = 17*366 + 53*365 = 6222 + 19345 = 25567 days → 1900-01-01 = day -25567.
+        // 1900-02-28: +31 (Jan) +27 (Feb 1–27) = +58 → day -25509.
+        assert_eq!(epoch_days_to_ymd(-25_509), (1900, 2, 28));
+        // The day after must be 1900-03-01, not 1900-02-29.
+        assert_eq!(epoch_days_to_ymd(-25_508), (1900, 3, 1));
+    }
+
+    #[test]
+    fn epoch_days_to_ymd_end_of_year_2023() {
+        // 2023-12-31: 19722 days after epoch (verified against known reference).
+        assert_eq!(epoch_days_to_ymd(19_722), (2023, 12, 31));
+    }
+
+    #[test]
+    fn epoch_days_to_ymd_beginning_of_year_2024() {
+        // 2024-01-01 immediately follows 2023-12-31.
+        assert_eq!(epoch_days_to_ymd(19_723), (2024, 1, 1));
     }
 
     // --- chrono_now ---
