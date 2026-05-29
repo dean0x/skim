@@ -62,6 +62,14 @@ const MAX_TEST_COMMITS: usize = 50_000;
 /// contributes its unmapped-file count but is excluded from metric averaging.
 const MAX_FILES_PER_COMMIT: usize = 500;
 
+/// Maximum number of commits loaded by [`parse_history`] before evaluation.
+///
+/// `parse_history` with `lookback_days = 0` loads the entire repo history with
+/// no upper bound, which can OOM on unexpectedly large repos.  If the parsed
+/// commit count exceeds this limit, the repo is rejected before the build/
+/// evaluate phase.
+const MAX_COMMITS_FOR_PARSE: usize = 500_000;
+
 // ============================================================================
 // Path map construction
 // ============================================================================
@@ -231,9 +239,24 @@ pub fn evaluate_at_thresholds(
     let mut unmapped_files_total = 0usize;
     let mut accumulators = EvalAccumulators::new(thresholds.len());
 
+    // Pre-allocate scratch buffers reused across commits to avoid per-commit
+    // heap allocations in the hot evaluation loop.
+    //
+    // jaccard_scratch: outer Vec pre-sized to MAX_FILES_PER_COMMIT so it is
+    // never reallocated; inner Vecs are cleared and refilled each commit,
+    // matching the predicted_scratch pattern in EvalAccumulators.
+    let mut jaccard_scratch: Vec<Vec<(FileId, f64)>> =
+        Vec::with_capacity(MAX_FILES_PER_COMMIT);
+    // all_known_scratch: single HashSet of mapped file IDs for this commit,
+    // replacing the Q per-query actual HashSets (fixes O(Q²) allocation).
+    let mut all_known_scratch: HashSet<FileId> =
+        HashSet::with_capacity(MAX_FILES_PER_COMMIT);
+    // known_ids_scratch: reused across commits to avoid per-commit allocation.
+    let mut known_ids: Vec<FileId> = Vec::with_capacity(MAX_FILES_PER_COMMIT);
+
     for commit in test_commits {
         // Resolve all file IDs for this commit. Track unmapped files.
-        let mut known_ids: Vec<FileId> = Vec::new();
+        known_ids.clear();
         let mut unmapped = 0usize;
         for fc in &commit.changed_files {
             match path_map.get(&fc.path) {
@@ -255,20 +278,28 @@ pub fn evaluate_at_thresholds(
             continue;
         }
 
-        // Pre-compute jaccard scores and actual sets once, then sweep thresholds.
+        // Pre-compute jaccard scores once, then sweep thresholds.
         // Jaccard values are threshold-independent: computing them once and sweeping
         // thresholds reduces total work by a factor of T (number of thresholds).
 
-        // jaccard_cache[q_idx] = Vec of (candidate_id, jaccard) pairs where j > 0.
-        // Only positive values are retained so the threshold sweep is cheap.
-        let jaccard_cache = compute_jaccard_cache(&known_ids, &all_file_ids, reader)?;
+        // Reuse jaccard_scratch: truncate to known_ids length (extending with empty
+        // inner Vecs if needed), then clear and refill each inner Vec.
+        // jaccard_scratch[q_idx] = Vec of (candidate_id, jaccard) pairs where j > 0.
+        fill_jaccard_scratch(&known_ids, &all_file_ids, reader, &mut jaccard_scratch)?;
 
-        // Pre-compute the "actual" co-change set for each query in this commit:
-        // all other known file IDs changed in the same commit.
-        let actual_sets = compute_actual_sets(&known_ids);
+        // Build a single HashSet of all mapped file IDs in this commit.
+        // Used in sweep_thresholds to replace Q per-query actual HashSets.
+        all_known_scratch.clear();
+        all_known_scratch.extend(known_ids.iter().copied());
 
         // Sweep thresholds over the cached jaccard values.
-        sweep_thresholds(&jaccard_cache, &actual_sets, &known_ids, thresholds, &mut accumulators);
+        sweep_thresholds(
+            &jaccard_scratch,
+            &all_known_scratch,
+            &known_ids,
+            thresholds,
+            &mut accumulators,
+        );
     }
 
     let metrics = accumulators.finalize(thresholds);
@@ -496,6 +527,16 @@ fn clone_and_parse(url: &str, dest: &Path) -> anyhow::Result<(String, Vec<Commit
 
     // 3. Apply deny-list filter in-place to every commit.
     let mut all_commits = history.commits;
+
+    // Guard against OOM on unexpectedly large repos.
+    if all_commits.len() > MAX_COMMITS_FOR_PARSE {
+        anyhow::bail!(
+            "parsed commit count {} exceeds MAX_COMMITS_FOR_PARSE ({}) — repo too large",
+            all_commits.len(),
+            MAX_COMMITS_FOR_PARSE
+        );
+    }
+
     for commit in &mut all_commits {
         filter_denied(&mut commit.changed_files);
     }
@@ -602,11 +643,57 @@ impl EvalAccumulators {
         }
     }
 
+    /// Accumulate one observation with the "actual" set expressed as
+    /// `all_known` minus `query_id`.
+    ///
+    /// This avoids materializing a per-query actual [`HashSet`]: the
+    /// intersection count is computed by iterating `predicted` and checking
+    /// membership in `all_known`, excluding the query itself.
+    ///
+    /// `actual_size` must equal `all_known.len() - 1` (the caller pre-computes
+    /// this once per commit since it is identical for every query).
+    fn accumulate_excluding(
+        &mut self,
+        ti: usize,
+        predicted: &HashSet<FileId>,
+        all_known: &HashSet<FileId>,
+        query_id: FileId,
+        actual_size: usize,
+    ) -> (f64, f64) {
+        // Count |predicted ∩ actual| where actual = all_known \ {query_id}.
+        let intersection = predicted
+            .iter()
+            .filter(|&&id| id != query_id && all_known.contains(&id))
+            .count();
+
+        let precision = if predicted.is_empty() {
+            0.0
+        } else {
+            intersection as f64 / predicted.len() as f64
+        };
+        let recall = if actual_size == 0 {
+            0.0
+        } else {
+            intersection as f64 / actual_size as f64
+        };
+
+        // Micro accumulation.
+        self.micro_tp[ti] += intersection;
+        self.micro_predicted[ti] += predicted.len();
+        self.micro_actual[ti] += actual_size;
+        self.micro_query_count[ti] += 1;
+
+        (precision, recall)
+    }
+
     /// Accumulate one (threshold-index, predicted, actual) observation.
     ///
     /// Computes the intersection count once and derives macro precision/recall
     /// and micro TP from that single count, eliminating the three independent
     /// intersection iterations that existed when these were separate slice params.
+    ///
+    /// Used by tests; production code uses [`accumulate_excluding`].
+    #[cfg(test)]
     fn accumulate(
         &mut self,
         ti: usize,
@@ -685,45 +772,59 @@ impl EvalAccumulators {
 // evaluate_at_thresholds helpers (decomposed from the original 175-line body)
 // ============================================================================
 
-/// Build the per-query jaccard cache for a single commit.
+/// Fill `scratch` in-place with per-query jaccard pairs for a single commit.
 ///
 /// For each `query_id` in `known_ids`, scans all `all_file_ids` and retains
 /// `(candidate_id, jaccard)` pairs where `jaccard > 0.0`.  Self-pairs are
-/// skipped.  Returns a `Vec` aligned with `known_ids`.
+/// skipped.  `scratch` is aligned with `known_ids` after the call: it is
+/// truncated or extended as needed, and each inner Vec is cleared before
+/// being refilled.
 ///
-/// Extracting this helper eliminates the 6-level nesting that existed inside
-/// the original `evaluate_at_thresholds` commit loop.
+/// Reusing the outer and inner Vecs across commits eliminates the per-commit
+/// heap allocation that `compute_jaccard_cache` (the previous allocation-
+/// returning form) incurred on every call.
 ///
 /// # Errors
 ///
 /// Propagates [`SearchError::IndexCorrupted`] and unexpected jaccard errors.
-fn compute_jaccard_cache(
+fn fill_jaccard_scratch(
     known_ids: &[FileId],
     all_file_ids: &[FileId],
     reader: &CochangeMatrixReader,
-) -> anyhow::Result<Vec<Vec<(FileId, f64)>>> {
-    known_ids
-        .iter()
-        .map(|&query_id| build_jaccard_pairs(query_id, all_file_ids, reader))
-        .collect()
+    scratch: &mut Vec<Vec<(FileId, f64)>>,
+) -> anyhow::Result<()> {
+    let q = known_ids.len();
+    // Grow the outer vec if this commit has more queries than any previous one.
+    while scratch.len() < q {
+        scratch.push(Vec::new());
+    }
+    // Shrink the outer vec to exactly q entries (does not free inner memory).
+    scratch.truncate(q);
+
+    for (q_idx, &query_id) in known_ids.iter().enumerate() {
+        scratch[q_idx].clear();
+        build_jaccard_pairs_into(query_id, all_file_ids, reader, &mut scratch[q_idx])?;
+    }
+    Ok(())
 }
 
-/// Compute positive jaccard pairs for a single query file against all candidates.
+/// Fill `out` with positive jaccard pairs for a single query file against all candidates.
 ///
-/// Returns `(candidate_id, jaccard)` for every candidate where `jaccard > 0.0`.
+/// Appends `(candidate_id, jaccard)` for every candidate where `jaccard > 0.0`.
 /// Self-pairs (where `candidate_id == query_id`) are excluded.
-fn build_jaccard_pairs(
+/// Callers must clear `out` before calling if reuse is intended.
+fn build_jaccard_pairs_into(
     query_id: FileId,
     all_file_ids: &[FileId],
     reader: &CochangeMatrixReader,
-) -> anyhow::Result<Vec<(FileId, f64)>> {
-    let mut pairs: Vec<(FileId, f64)> = Vec::new();
+    out: &mut Vec<(FileId, f64)>,
+) -> anyhow::Result<()> {
     for &candidate_id in all_file_ids {
         if candidate_id == query_id {
             continue; // skip self-pair
         }
         match reader.jaccard(query_id, candidate_id) {
-            Ok(j) if j > 0.0 => pairs.push((candidate_id, j)),
+            Ok(j) if j > 0.0 => out.push((candidate_id, j)),
             Ok(_) => {}
             Err(SearchError::IndexCorrupted(msg)) => {
                 return Err(anyhow::anyhow!("matrix corrupted: {msg}"));
@@ -731,44 +832,41 @@ fn build_jaccard_pairs(
             Err(e) => return Err(anyhow::anyhow!("jaccard error: {e}")),
         }
     }
-    Ok(pairs)
+    Ok(())
 }
 
-/// Pre-compute the "actual" co-change set for each query in a commit.
-///
-/// For each query, the actual set is every other mapped file in the same
-/// commit.  Aligned with `known_ids`.
-fn compute_actual_sets(known_ids: &[FileId]) -> Vec<HashSet<FileId>> {
-    known_ids
-        .iter()
-        .map(|&query_id| {
-            known_ids
-                .iter()
-                .copied()
-                .filter(|&id| id != query_id)
-                .collect()
-        })
-        .collect()
-}
+// compute_actual_sets removed: replaced by a single all_known HashSet per commit.
+// The per-query "actual" set is all_known minus query_id, handled inline in
+// sweep_thresholds via accumulate_excluding.  This eliminates the O(Q²) allocation
+// that Q per-query HashSets incurred (Q = known_ids.len(), up to 500).
 
-/// Sweep all thresholds over pre-computed jaccard and actual sets for one commit.
+/// Sweep all thresholds over pre-computed jaccard pairs for one commit.
 ///
 /// Updates `accumulators` in-place.  The `predicted_scratch` set inside
 /// `accumulators` is cleared and reused for every (threshold, query) pair to
 /// avoid Q×T HashSet allocations per commit.
+///
+/// `all_known` is the set of all mapped file IDs in this commit.  For each
+/// query the "actual" co-change set is `all_known` minus the query itself,
+/// so no per-query actual HashSet is materialized (fixes the O(Q²) allocation).
 fn sweep_thresholds(
     jaccard_cache: &[Vec<(FileId, f64)>],
-    actual_sets: &[HashSet<FileId>],
+    all_known: &HashSet<FileId>,
     known_ids: &[FileId],
     thresholds: &[f64],
     accumulators: &mut EvalAccumulators,
 ) {
     let query_count = known_ids.len();
+    // actual_size is the same for every query in this commit.
+    let actual_size = query_count.saturating_sub(1);
+
     for (ti, &threshold) in thresholds.iter().enumerate() {
         let mut commit_precision_sum = 0.0f64;
         let mut commit_recall_sum = 0.0f64;
 
         for q_idx in 0..query_count {
+            let query_id = known_ids[q_idx];
+
             // Reuse scratch set: clear then extend with threshold-filtered candidates.
             accumulators.predicted_scratch.clear();
             accumulators.predicted_scratch.extend(
@@ -778,11 +876,10 @@ fn sweep_thresholds(
                     .map(|&(cid, _)| cid),
             );
 
-            // accumulate() computes the intersection once and derives precision,
-            // recall, and micro-TP from that single count (fixes redundant intersection).
-            let actual = &actual_sets[q_idx];
+            // Compute intersection inline: count predicted elements that are in
+            // all_known AND are not the query itself (the "actual" set).
             let scratch = std::mem::take(&mut accumulators.predicted_scratch);
-            let (p, r) = accumulators.accumulate(ti, &scratch, actual);
+            let (p, r) = accumulators.accumulate_excluding(ti, &scratch, all_known, query_id, actual_size);
             accumulators.predicted_scratch = scratch;
 
             commit_precision_sum += p;
