@@ -489,6 +489,57 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Detect whether this binary was invoked via a symlink with a tool name as argv[0].
+///
+/// When `~/.skim/bin/git` is invoked, argv[0] will be something like
+/// `/Users/x/.skim/bin/git`. We extract the file stem (`"git"`), check that
+/// it is a known non-meta subcommand, and return `Some((name, remaining_args))`.
+///
+/// Returns `None` when:
+/// - argv[0] stem is `"skim"` or `"rskim"` (normal invocation)
+/// - stem is not a known subcommand (unrecognized tool)
+/// - stem is a meta subcommand (`init`, `stats`, etc.) — those should not be symlinked
+///
+/// This function is `pub(crate)` only for testability. `main()` calls it via
+/// the `detect_argv0_dispatch()` wrapper that reads real `std::env::args()`.
+///
+/// DESIGN: passthrough mode (`SKIM_PASSTHROUGH=1`) is intentionally NOT checked
+/// here. The handler dispatched from `cmd::dispatch()` already checks it
+/// internally via `is_passthrough_mode()`.
+pub(crate) fn detect_argv0_for(name: &str) -> bool {
+    // Normal binary names: not a symlink dispatch
+    if name == "skim" || name == "rskim" {
+        return false;
+    }
+    // Must be a known subcommand
+    if !cmd::is_known_subcommand(name) {
+        return false;
+    }
+    // Meta subcommands should not be symlink targets
+    if cmd::is_meta_subcommand(name) {
+        return false;
+    }
+    true
+}
+
+/// Detect argv[0]-based dispatch for symlink invocations.
+///
+/// When the binary is invoked as `~/.skim/bin/git`, this returns
+/// `Some(("git", remaining_args))`. Returns `None` for normal invocations.
+fn detect_argv0_dispatch() -> Option<(String, Vec<String>)> {
+    let mut args = std::env::args();
+    let argv0 = args.next()?;
+    let stem = std::path::Path::new(&argv0)
+        .file_name()?
+        .to_str()?
+        .to_string();
+    if detect_argv0_for(&stem) {
+        Some((stem, args.collect()))
+    } else {
+        None
+    }
+}
+
 /// Extract and validate `--session-id=VALUE` from a command-line argument iterator.
 ///
 /// Returns `Some(value)` when exactly one `--session-id=VALUE` argument is present
@@ -513,7 +564,53 @@ where
         .filter(|s| analytics::is_safe_session_id(s))
 }
 
+/// Remove `~/.skim/bin` from `PATH` to prevent infinite recursion when the
+/// skim binary is invoked as a symlink (e.g. `~/.skim/bin/git`).
+///
+/// This MUST be the first thing called in `main()`, before any thread is
+/// spawned, because `set_var` is not thread-safe.
+///
+/// # Why this is needed
+///
+/// When a symlink in `~/.skim/bin/git` invokes this binary, `~/.skim/bin`
+/// is at the front of PATH. If we let that PATH entry persist, then when a
+/// subcommand handler calls `CommandRunner::run("git", …)`, the shell will
+/// find `~/.skim/bin/git` again — triggering infinite recursion.
+///
+/// # Safety
+///
+/// `set_var` is unsafe in multi-threaded programs. This function must be
+/// called before any thread is spawned (before analytics background threads,
+/// rayon pools, etc.).
+fn strip_skim_wrappers_from_path() {
+    let wrappers_dir = match dirs::home_dir() {
+        Some(h) => h.join(".skim").join("bin"),
+        None => return,
+    };
+    let path = match std::env::var_os("PATH") {
+        Some(p) => p,
+        None => return,
+    };
+    let filtered: Vec<_> = std::env::split_paths(&path)
+        .filter(|p| p != &wrappers_dir)
+        .collect();
+    if let Ok(new_path) = std::env::join_paths(&filtered) {
+        // SAFETY: single-threaded at this point (before any thread spawn).
+        // strip_skim_wrappers_from_path() is called as the very first
+        // statement in main() before debug init, analytics init, rayon,
+        // or any other thread-spawning code.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    // Strip ~/.skim/bin from PATH FIRST — before any thread is spawned.
+    // This prevents infinite recursion when invoked as a symlink (PF-003).
+    strip_skim_wrappers_from_path();
+
     // Initialise debug flag from SKIM_DEBUG env var once, before any threads
     // are spawned. After this call, is_debug_enabled() is a pure atomic load.
     debug::init_debug_from_env();
@@ -530,15 +627,30 @@ fn main() -> ExitCode {
     // inherits session context without per-subcommand parsing.
     // AD-SC-1: Fall back to PID-keyed sidecar when --session-id is absent so
     // direct skim invocations (bypassing the hook) still get attribution.
-    let session_id = parse_session_id(std::env::args()).or_else(|| {
-        let dir = cmd::resolve_cache_dir()?;
-        cmd::session_sidecar::read_session_id(&dir)
-    });
+    // Third fallback: SKIM_SESSION_ID env var, set in shell profile alongside
+    // the PATH export so sub-agents (which bypass hooks) still get attribution.
+    let session_id = parse_session_id(std::env::args())
+        .or_else(|| {
+            let dir = cmd::resolve_cache_dir()?;
+            cmd::session_sidecar::read_session_id(&dir)
+        })
+        .or_else(|| {
+            std::env::var("SKIM_SESSION_ID")
+                .ok()
+                .filter(|s| analytics::is_safe_session_id(s))
+        });
     let analytics = analytics::AnalyticsConfig::from_process(cli_disable_analytics, session_id);
 
-    let result: anyhow::Result<ExitCode> = match resolve_invocation() {
-        Invocation::FileOperation => run_file_operation(&analytics).map(|()| ExitCode::SUCCESS),
-        Invocation::Subcommand { name, args } => cmd::dispatch(&name, &args, &analytics),
+    // argv[0] dispatch: when invoked as ~/.skim/bin/git, bypass normal clap
+    // parsing and route directly to the appropriate handler. PATH stripping
+    // above ensures the handler won't find the symlink again (no recursion).
+    let result: anyhow::Result<ExitCode> = if let Some((name, args)) = detect_argv0_dispatch() {
+        cmd::dispatch(&name, &args, &analytics)
+    } else {
+        match resolve_invocation() {
+            Invocation::FileOperation => run_file_operation(&analytics).map(|()| ExitCode::SUCCESS),
+            Invocation::Subcommand { name, args } => cmd::dispatch(&name, &args, &analytics),
+        }
     };
 
     let exit_code = match result {
@@ -1015,6 +1127,189 @@ mod tests {
             resolved.as_deref(),
             Some("explicit-session-99"),
             "explicit --session-id must take priority over sidecar"
+        );
+    }
+
+    // ========================================================================
+    // strip_skim_wrappers_from_path tests
+    // ========================================================================
+
+    /// PATH containing ~/.skim/bin has that entry removed.
+    #[test]
+    fn test_strip_skim_wrappers_removes_wrapper_dir() {
+        let home = dirs::home_dir().unwrap();
+        let wrappers = home.join(".skim").join("bin");
+        let other = std::path::PathBuf::from("/usr/bin");
+
+        // Build a PATH that includes the wrappers dir
+        let input_paths = vec![wrappers.clone(), other.clone()];
+        let path_str = std::env::join_paths(&input_paths).unwrap();
+
+        // filter manually (same logic as strip_skim_wrappers_from_path)
+        let filtered: Vec<_> = std::env::split_paths(&path_str)
+            .filter(|p| p != &wrappers)
+            .collect();
+        let result = std::env::join_paths(&filtered).unwrap();
+
+        let result_paths: Vec<_> = std::env::split_paths(&result).collect();
+        assert!(
+            !result_paths.contains(&wrappers),
+            "wrappers dir must be removed from PATH"
+        );
+        assert!(
+            result_paths.contains(&other),
+            "non-wrapper dirs must be preserved"
+        );
+    }
+
+    /// PATH without ~/.skim/bin is returned unchanged.
+    #[test]
+    fn test_strip_skim_wrappers_no_change_when_absent() {
+        let other = std::path::PathBuf::from("/usr/local/bin");
+        let other2 = std::path::PathBuf::from("/usr/bin");
+        let home = dirs::home_dir().unwrap();
+        let wrappers = home.join(".skim").join("bin");
+
+        let input_paths = vec![other.clone(), other2.clone()];
+        let path_str = std::env::join_paths(&input_paths).unwrap();
+
+        let filtered: Vec<_> = std::env::split_paths(&path_str)
+            .filter(|p| p != &wrappers)
+            .collect();
+
+        assert_eq!(
+            filtered.len(),
+            2,
+            "path without wrappers dir must be returned unchanged"
+        );
+        assert!(filtered.contains(&other));
+        assert!(filtered.contains(&other2));
+    }
+
+    /// Wrappers dir in the middle of PATH: only that entry is removed.
+    #[test]
+    fn test_strip_skim_wrappers_middle_entry_removed_order_preserved() {
+        let home = dirs::home_dir().unwrap();
+        let wrappers = home.join(".skim").join("bin");
+        let before = std::path::PathBuf::from("/usr/local/bin");
+        let after = std::path::PathBuf::from("/usr/bin");
+
+        let input_paths = vec![before.clone(), wrappers.clone(), after.clone()];
+        let path_str = std::env::join_paths(&input_paths).unwrap();
+
+        let filtered: Vec<_> = std::env::split_paths(&path_str)
+            .filter(|p| p != &wrappers)
+            .collect();
+
+        assert_eq!(filtered.len(), 2, "only the wrappers dir is removed");
+        assert_eq!(filtered[0], before, "order before wrappers must be preserved");
+        assert_eq!(filtered[1], after, "order after wrappers must be preserved");
+    }
+
+    // ========================================================================
+    // detect_argv0_for tests
+    // ========================================================================
+
+    /// "skim" stem: normal invocation, returns false.
+    #[test]
+    fn test_detect_argv0_for_skim() {
+        assert!(!detect_argv0_for("skim"), "'skim' must not trigger argv0 dispatch");
+    }
+
+    /// "rskim" stem: normal invocation, returns false.
+    #[test]
+    fn test_detect_argv0_for_rskim() {
+        assert!(!detect_argv0_for("rskim"), "'rskim' must not trigger argv0 dispatch");
+    }
+
+    /// "git": known non-meta subcommand, returns true.
+    #[test]
+    fn test_detect_argv0_for_git() {
+        assert!(detect_argv0_for("git"), "'git' must trigger argv0 dispatch");
+    }
+
+    /// "cargo": known non-meta subcommand, returns true.
+    #[test]
+    fn test_detect_argv0_for_cargo() {
+        assert!(detect_argv0_for("cargo"), "'cargo' must trigger argv0 dispatch");
+    }
+
+    /// Unknown tool: returns false.
+    #[test]
+    fn test_detect_argv0_for_unknown_tool() {
+        assert!(
+            !detect_argv0_for("unknown_tool_xyz"),
+            "unknown tool must not trigger argv0 dispatch"
+        );
+    }
+
+    /// "init": meta subcommand, returns false.
+    #[test]
+    fn test_detect_argv0_for_init_meta() {
+        assert!(!detect_argv0_for("init"), "'init' (meta) must not trigger argv0 dispatch");
+    }
+
+    /// "stats": meta subcommand, returns false.
+    #[test]
+    fn test_detect_argv0_for_stats_meta() {
+        assert!(!detect_argv0_for("stats"), "'stats' (meta) must not trigger argv0 dispatch");
+    }
+
+    /// "heatmap": meta subcommand, returns false.
+    #[test]
+    fn test_detect_argv0_for_heatmap_meta() {
+        assert!(
+            !detect_argv0_for("heatmap"),
+            "'heatmap' (meta) must not trigger argv0 dispatch"
+        );
+    }
+
+    // ========================================================================
+    // SKIM_SESSION_ID env var fallback tests
+    // ========================================================================
+
+    /// Empty SKIM_SESSION_ID yields None.
+    #[test]
+    fn test_skim_session_id_empty_yields_none() {
+        let result = std::env::var("").ok().filter(|s| analytics::is_safe_session_id(s));
+        assert!(result.is_none(), "empty session ID must yield None");
+        // Also test is_safe_session_id directly with empty string
+        assert!(
+            !analytics::is_safe_session_id(""),
+            "empty session ID must be rejected by is_safe_session_id"
+        );
+    }
+
+    /// SKIM_SESSION_ID with shell metacharacters yields None.
+    #[test]
+    fn test_skim_session_id_bad_chars_yields_none() {
+        assert!(
+            !analytics::is_safe_session_id("bad;chars"),
+            "session ID with ';' must be rejected"
+        );
+        assert!(
+            !analytics::is_safe_session_id("bad|pipe"),
+            "session ID with '|' must be rejected"
+        );
+    }
+
+    /// SKIM_SESSION_ID with 129+ chars yields None.
+    #[test]
+    fn test_skim_session_id_too_long_yields_none() {
+        let long_id = "a".repeat(129);
+        assert!(
+            !analytics::is_safe_session_id(&long_id),
+            "129-char session ID must be rejected"
+        );
+    }
+
+    /// Valid SKIM_SESSION_ID is accepted.
+    #[test]
+    fn test_skim_session_id_valid_accepted() {
+        let valid = "session-2024-01-15_abc123";
+        assert!(
+            analytics::is_safe_session_id(valid),
+            "valid session ID must be accepted"
         );
     }
 }

@@ -248,6 +248,56 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "wc",
 ];
 
+/// Meta/management subcommands that belong to skim itself.
+///
+/// These should NOT be wrapper targets in `~/.skim/bin/` because:
+/// 1. They manage skim, not external tools — wrapping them would create confusing
+///    recursive behaviour (e.g. `~/.skim/bin/init` would invoke `skim init`).
+/// 2. A sub-agent invoking `init` is almost certainly invoking skim's own init,
+///    not a tool named "init" — the wrapper would intercept incorrectly.
+///
+/// Everything in KNOWN_SUBCOMMANDS that is NOT in META_SUBCOMMANDS is a valid
+/// wrapper target (i.e. it wraps an external tool of the same name).
+///
+/// SYNC NOTE: if you add a new meta subcommand to KNOWN_SUBCOMMANDS, add it
+/// here too. The `test_meta_subcommands_are_in_known_subcommands` sync-guard
+/// test will catch any entries that are in META but not in KNOWN.
+pub(crate) const META_SUBCOMMANDS: &[&str] = &[
+    "agents",
+    "completions",
+    "discover",
+    "heatmap",
+    "init",
+    "learn",
+    "log",
+    "rewrite",
+    "search",
+    "stats",
+];
+
+/// Check whether `name` is a registered meta/management subcommand.
+///
+/// Meta subcommands are skim's own management commands and are NOT valid
+/// wrapper targets (see [`META_SUBCOMMANDS`]).
+pub(crate) fn is_meta_subcommand(name: &str) -> bool {
+    META_SUBCOMMANDS.contains(&name)
+}
+
+/// Return the list of subcommand names that are valid wrapper targets.
+///
+/// These are all [`KNOWN_SUBCOMMANDS`] that are NOT in [`META_SUBCOMMANDS`].
+/// Each name corresponds to an external tool that skim can compress output for.
+///
+/// Used by the wrapper installer to determine which symlinks to create in
+/// `~/.skim/bin/`.
+pub(crate) fn wrapper_targets() -> Vec<&'static str> {
+    KNOWN_SUBCOMMANDS
+        .iter()
+        .filter(|&&name| !is_meta_subcommand(name))
+        .copied()
+        .collect()
+}
+
 /// Check whether `name` is a registered subcommand.
 pub(crate) fn is_known_subcommand(name: &str) -> bool {
     KNOWN_SUBCOMMANDS.contains(&name)
@@ -1846,5 +1896,76 @@ mod tests {
             !result.contains("[REDACTED]"),
             "no redaction should occur for port: {result}"
         );
+    }
+
+    // ========================================================================
+    // META_SUBCOMMANDS sync-guard tests
+    // ========================================================================
+
+    /// Every entry in META_SUBCOMMANDS must also exist in KNOWN_SUBCOMMANDS.
+    ///
+    /// If this fails, a subcommand was added to META but not to KNOWN,
+    /// or vice versa (wrong way around).
+    #[test]
+    fn test_meta_subcommands_are_in_known_subcommands() {
+        for &meta in META_SUBCOMMANDS {
+            assert!(
+                KNOWN_SUBCOMMANDS.contains(&meta),
+                "META_SUBCOMMANDS entry '{meta}' is not in KNOWN_SUBCOMMANDS — \
+                 every meta subcommand must also be registered in KNOWN_SUBCOMMANDS"
+            );
+        }
+    }
+
+    /// wrapper_targets() must not contain any meta subcommands.
+    #[test]
+    fn test_wrapper_targets_contains_no_meta_subcommands() {
+        let targets = wrapper_targets();
+        for &meta in META_SUBCOMMANDS {
+            assert!(
+                !targets.contains(&meta),
+                "wrapper_targets() returned meta subcommand '{meta}' — \
+                 meta subcommands must not be wrapper targets"
+            );
+        }
+    }
+
+    /// wrapper_targets() length must equal KNOWN minus META.
+    #[test]
+    fn test_wrapper_targets_count_equals_known_minus_meta() {
+        let targets = wrapper_targets();
+        let expected_len = KNOWN_SUBCOMMANDS.len() - META_SUBCOMMANDS.len();
+        assert_eq!(
+            targets.len(),
+            expected_len,
+            "wrapper_targets() has {} entries but expected {} \
+             (KNOWN={} minus META={})",
+            targets.len(),
+            expected_len,
+            KNOWN_SUBCOMMANDS.len(),
+            META_SUBCOMMANDS.len()
+        );
+    }
+
+    /// is_meta_subcommand() returns true for every meta subcommand.
+    #[test]
+    fn test_is_meta_subcommand_for_all_meta() {
+        for &meta in META_SUBCOMMANDS {
+            assert!(
+                is_meta_subcommand(meta),
+                "is_meta_subcommand('{meta}') returned false — must return true"
+            );
+        }
+    }
+
+    /// is_meta_subcommand() returns false for known tool wrappers.
+    #[test]
+    fn test_is_meta_subcommand_false_for_tool_wrappers() {
+        for &name in &["git", "cargo", "npm", "grep", "find"] {
+            assert!(
+                !is_meta_subcommand(name),
+                "is_meta_subcommand('{name}') returned true — tool wrappers must return false"
+            );
+        }
     }
 }

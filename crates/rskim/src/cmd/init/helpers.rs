@@ -311,14 +311,26 @@ pub(super) fn print_help() {
     println!("  --uninstall         Remove hook and clean up");
     println!("  --no-guidance       Skip injecting guidance into agent instruction file");
     println!("  --force             Force uninstall even if hook script was modified");
+    println!("  --wrappers          Install PATH wrappers in ~/.skim/bin/ (skip prompt)");
+    println!("  --no-wrappers       Skip PATH wrapper installation (skip prompt)");
     println!("  --help, -h          Print help information");
+    println!();
+    println!("Shell Wrappers:");
+    println!("  PATH wrappers in ~/.skim/bin/ intercept tool calls from sub-agents that");
+    println!("  bypass PreToolUse hooks. Each symlink (e.g. ~/.skim/bin/git) points to");
+    println!("  the skim binary; skim detects the tool name from argv[0] and compresses");
+    println!("  the output. Add to ~/.zshrc or ~/.bashrc to enable:");
+    println!("    export PATH=\"$HOME/.skim/bin:$PATH\"");
+    println!("    export SKIM_SESSION_ID=\"<your-session-id>\"  # optional, for analytics");
     println!();
     println!("Examples:");
     println!("  skim init                          Install for Claude Code (recommended)");
     println!("  skim init --agent cursor           Install for Cursor");
     println!("  skim init --agent gemini           Install for Gemini CLI");
     println!("  skim init --project                Install project-level hook");
-    println!("  skim init --uninstall              Remove skim hook");
+    println!("  skim init --wrappers               Install with PATH wrappers");
+    println!("  skim init --no-wrappers            Install without PATH wrappers");
+    println!("  skim init --uninstall              Remove skim hook and wrappers");
     println!("  skim init --uninstall --yes        Uninstall without confirmation");
     println!("  skim init --dry-run                Preview actions without writing");
 }

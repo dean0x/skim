@@ -202,6 +202,27 @@ fn run_uninstall_for_agent(
     let env = InstructionEnv::from_process();
     super::install::remove_guidance(agent, global, &env)?;
 
+    // Uninstall shell wrappers (global scope only).
+    // Non-fatal: wrapper removal failure must not abort hook uninstall.
+    if !flags.project {
+        match super::wrappers::uninstall_wrappers(flags.dry_run) {
+            Ok(result) if result.removed > 0 => {
+                println!(
+                    "  {} Removed {} wrapper symlink(s) from ~/.skim/bin/",
+                    check_mark(true),
+                    result.removed
+                );
+                if result.dir_removed {
+                    println!("  {} Removed empty ~/.skim/bin/ directory", check_mark(true));
+                }
+            }
+            Ok(_) => {} // No wrappers to remove — silently skip
+            Err(e) => {
+                eprintln!("  Note: could not remove wrappers: {e}");
+            }
+        }
+    }
+
     println!();
     println!("  skim hook has been uninstalled.");
     println!();

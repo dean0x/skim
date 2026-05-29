@@ -206,6 +206,35 @@ cargo fmt -- --check           # Format check
 **Passthrough:**
 - `SKIM_PASSTHROUGH` — Set to `1`/`true`/`yes` to bypass all skim compression (hook, test, build). Useful for debugging when compressed output hides errors.
 
+**Shell interception (wrappers):**
+- `SKIM_SESSION_ID` — Session ID for analytics attribution when using PATH wrappers. Set alongside `PATH` export in your shell profile so sub-agents inherit it.
+
+### Shell Interception (PATH Wrappers)
+
+Sub-agents that spawn their own shell bypass PreToolUse hooks. PATH wrappers close this gap by intercepting commands at the OS level.
+
+**How it works:**
+1. `skim init --wrappers` creates symlinks `~/.skim/bin/<tool>` → skim binary for each supported tool
+2. User adds `export PATH="$HOME/.skim/bin:$PATH"` to their shell profile
+3. When any process invokes `git`, `npm`, etc., the shell resolves the symlink
+4. The skim binary detects `argv[0] == "git"` and dispatches through the existing git handler
+5. The binary strips `~/.skim/bin` from PATH as its first action — preventing infinite recursion
+
+**Recursion prevention (PF-003):**
+- `strip_skim_wrappers_from_path()` is called as the very first statement in `main()` before any thread is spawned
+- When a handler runs `CommandRunner::run("git", …)`, the shell finds `/usr/bin/git` (not the symlink)
+- `SKIM_PASSTHROUGH=1` always works as an escape hatch — the handler checks it internally
+
+**Session attribution:**
+- Add `export SKIM_SESSION_ID="<id>"` to shell profile alongside the PATH export
+- This gives sub-agents a consistent session identity for analytics grouping
+- Priority order: `--session-id` flag > sidecar > `SKIM_SESSION_ID` env > None
+
+**Safety invariant (PF-003):**
+- `install_wrappers` NEVER overwrites non-symlink files (regular files, directories, etc.)
+- Non-symlink paths are skipped with a warning
+- `uninstall_wrappers` ONLY removes symlinks whose target path contains `"skim"` or `"rskim"`
+
 ### Benchmarking
 ```bash
 cargo bench                    # Criterion benchmarks

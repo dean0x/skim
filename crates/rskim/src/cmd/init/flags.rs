@@ -22,6 +22,12 @@ pub(super) struct InitFlags {
     /// Defaults to `None` when `--agent` is not supplied.
     /// Resolved to a concrete `AgentKind` by `resolve_agent()` before use.
     pub(super) agent: Option<AgentKind>,
+    /// Whether to install/uninstall shell wrappers in `~/.skim/bin/`.
+    ///
+    /// `Some(true)` — `--wrappers` flag: install wrappers.
+    /// `Some(false)` — `--no-wrappers` flag: skip wrappers.
+    /// `None` — neither flag: prompt interactively (or default to false in non-TTY).
+    pub(super) wrappers: Option<bool>,
 }
 
 /// Resolve a single explicit agent from flags, or `None` for auto-detect mode.
@@ -172,6 +178,7 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
     let mut force = false;
     let mut no_guidance = false;
     let mut agent: Option<AgentKind> = None;
+    let mut wrappers: Option<bool> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -183,6 +190,24 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
             "--uninstall" => uninstall = true,
             "--force" => force = true,
             "--no-guidance" => no_guidance = true,
+            "--wrappers" => {
+                if wrappers == Some(false) {
+                    anyhow::bail!(
+                        "--wrappers and --no-wrappers are mutually exclusive\n\
+                         Use one or the other, not both."
+                    );
+                }
+                wrappers = Some(true);
+            }
+            "--no-wrappers" => {
+                if wrappers == Some(true) {
+                    anyhow::bail!(
+                        "--wrappers and --no-wrappers are mutually exclusive\n\
+                         Use one or the other, not both."
+                    );
+                }
+                wrappers = Some(false);
+            }
             "--agent" => {
                 i += 1;
                 if i >= args.len() {
@@ -225,6 +250,7 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
         force,
         no_guidance,
         agent,
+        wrappers,
     })
 }
 
@@ -330,6 +356,7 @@ mod tests {
             force: false,
             no_guidance: false,
             agent: Some(AgentKind::Cursor),
+            wrappers: None,
         };
         assert_eq!(resolve_single_agent(&flags), Some(AgentKind::Cursor));
     }
@@ -344,6 +371,7 @@ mod tests {
             force: false,
             no_guidance: false,
             agent: None,
+            wrappers: None,
         };
         assert_eq!(resolve_single_agent(&flags), None);
     }
@@ -432,6 +460,7 @@ mod tests {
             force: false,
             no_guidance: false,
             agent: Some(AgentKind::Cursor),
+            wrappers: None,
         };
         // env is unused when agent is explicit; default env is fine
         assert_eq!(
@@ -453,6 +482,7 @@ mod tests {
             force: false,
             no_guidance: false,
             agent: None,
+            wrappers: None,
         };
         let env = DetectionEnv {
             home_dir: Some(std::path::PathBuf::from(
@@ -464,6 +494,38 @@ mod tests {
             resolve_agent(&flags, &env),
             AgentKind::ClaudeCode,
             "should fall back to ClaudeCode when no agent config dirs exist"
+        );
+    }
+
+    // ---- --wrappers / --no-wrappers ----
+
+    #[test]
+    fn test_parse_flags_wrappers_true() {
+        let flags = parse_flags(&["--wrappers".to_string()]).unwrap();
+        assert_eq!(flags.wrappers, Some(true), "--wrappers must set Some(true)");
+    }
+
+    #[test]
+    fn test_parse_flags_no_wrappers_false() {
+        let flags = parse_flags(&["--no-wrappers".to_string()]).unwrap();
+        assert_eq!(flags.wrappers, Some(false), "--no-wrappers must set Some(false)");
+    }
+
+    #[test]
+    fn test_parse_flags_wrappers_absent_is_none() {
+        let flags = parse_flags(&["--yes".to_string()]).unwrap();
+        assert_eq!(flags.wrappers, None, "absent --wrappers flag must yield None");
+    }
+
+    #[test]
+    fn test_parse_flags_wrappers_and_no_wrappers_conflict() {
+        let result =
+            parse_flags(&["--wrappers".to_string(), "--no-wrappers".to_string()]);
+        assert!(result.is_err(), "--wrappers and --no-wrappers must conflict");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "error must mention mutual exclusion: {err}"
         );
     }
 }

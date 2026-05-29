@@ -221,10 +221,20 @@ fn run_install_single(
 
     if flags.dry_run {
         print_dry_run_actions(&state, flags.no_guidance, global, &env)?;
+        // Also show dry-run for wrappers if they would be installed.
+        if !flags.project {
+            maybe_install_wrappers(flags.wrappers, flags.dry_run)?;
+        }
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
     execute_install(&state, flags.no_guidance, global, &env)?;
+
+    // Install shell wrappers (global scope only — wrappers are per-user, not per-project).
+    if !flags.project {
+        maybe_install_wrappers(flags.wrappers, flags.dry_run)?;
+    }
+
     print_completion_message(agent.display_name());
 
     Ok(std::process::ExitCode::SUCCESS)
@@ -329,6 +339,72 @@ fn execute_install(
             eprintln!("  Search index build started (PID {})", child.id());
             drop(child); // Detach: do not wait for the background process.
         }
+    }
+
+    Ok(())
+}
+
+/// Install or prompt for shell wrapper installation in `~/.skim/bin/`.
+///
+/// - `Some(true)`: install unconditionally.
+/// - `Some(false)`: skip.
+/// - `None`: prompt interactively on TTY; default to false on non-TTY.
+///
+/// Wrapper installation is global-only; callers should not call this for
+/// `--project` scope installs.
+fn maybe_install_wrappers(wrappers: Option<bool>, dry_run: bool) -> anyhow::Result<()> {
+    use super::helpers::confirm_proceed;
+    use std::io::IsTerminal;
+
+    let should_install = match wrappers {
+        Some(v) => v,
+        None => {
+            if !std::io::stdin().is_terminal() {
+                // Non-interactive: default to false, do not prompt.
+                return Ok(());
+            }
+            println!();
+            println!("  Shell wrappers in ~/.skim/bin/ let sub-agents bypass hooks.");
+            println!("  Install PATH wrappers? (requires adding ~/.skim/bin to PATH)");
+            confirm_proceed()?
+        }
+    };
+
+    if !should_install {
+        return Ok(());
+    }
+
+    let skim_binary = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("cannot determine skim binary path: {e}"))?;
+
+    let result = super::wrappers::install_wrappers(&skim_binary, dry_run)?;
+
+    if dry_run {
+        println!(
+            "  [dry-run] Wrappers: would create {}, update {}, skip {} (correct), \
+             skip {} (non-symlink)",
+            result.created, result.updated, result.skipped_correct, result.skipped_non_symlink
+        );
+    } else {
+        println!(
+            "  {} Wrappers: created {}, updated {}, skipped {} (already correct)",
+            super::helpers::check_mark(true),
+            result.created,
+            result.updated,
+            result.skipped_correct,
+        );
+        if result.skipped_non_symlink > 0 {
+            println!(
+                "  Warning: {} path(s) skipped — existing non-symlink files were not overwritten",
+                result.skipped_non_symlink
+            );
+        }
+        println!();
+        println!("  To enable wrappers, add to ~/.zshrc or ~/.bashrc:");
+        println!("    export PATH=\"$HOME/.skim/bin:$PATH\"");
+        println!();
+        println!("  Set SKIM_SESSION_ID in your shell profile for analytics attribution:");
+        println!("    export SKIM_SESSION_ID=\"<your-session-id>\"");
     }
 
     Ok(())
