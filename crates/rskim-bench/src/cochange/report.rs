@@ -416,4 +416,24 @@ mod tests {
         let md = to_markdown(&result);
         assert!(md.contains("no aggregate metrics"));
     }
+
+    #[test]
+    fn markdown_repo_error_shows_error_message() {
+        let mut result = sample_result();
+        result.repos.push(RepoCochangeResult {
+            repo_name: "errored-repo".to_string(),
+            error: Some("clone failed: connection refused".to_string()),
+            ..Default::default()
+        });
+        let md = to_markdown(&result);
+        assert!(md.contains("errored-repo"), "should include errored repo name");
+        assert!(
+            md.contains("clone failed: connection refused"),
+            "should render error message"
+        );
+        assert!(
+            md.contains("**Error:**"),
+            "should use bold Error: prefix from repo_section"
+        );
+    }
 }
