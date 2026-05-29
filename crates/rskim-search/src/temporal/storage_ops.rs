@@ -19,6 +19,15 @@ use super::{META_GIT_HEAD, META_LAST_UPDATED, TemporalDb, db_err};
 /// large datasets. Matches the co-change module's `MAX_ROWS_PER_TABLE` limit.
 const MAX_ROWS_PER_TABLE: usize = 500_000;
 
+/// Minimum Jaccard similarity for co-change query results.
+///
+/// Empirically determined via the co-change validation benchmark (#191):
+/// threshold 0.10 yields the best macro F1 (0.28) across 6 OSS repos,
+/// nearly doubling precision vs. unfiltered (10.9% → 21.5%) while retaining
+/// 41% recall. Pairs below this threshold are noise — they co-occurred in
+/// commits but the coupling signal is too weak to be predictive.
+const MIN_JACCARD_THRESHOLD: f64 = 0.10;
+
 // ============================================================================
 // Private insert helpers — accept an open Transaction
 // ============================================================================
@@ -170,14 +179,16 @@ impl TemporalDb {
         let mut stmt = self
             .conn
             .prepare_cached(
-                "SELECT file_a, file_b, count, jaccard FROM cochange WHERE file_a = ?1 \
+                "SELECT file_a, file_b, count, jaccard FROM cochange \
+                 WHERE file_a = ?1 AND jaccard >= ?2 \
                  UNION ALL \
-                 SELECT file_a, file_b, count, jaccard FROM cochange WHERE file_b = ?1 \
+                 SELECT file_a, file_b, count, jaccard FROM cochange \
+                 WHERE file_b = ?1 AND jaccard >= ?2 \
                  ORDER BY jaccard DESC LIMIT 10000",
             )
             .map_err(db_err)?;
         let rows = stmt
-            .query_map(rusqlite::params![path], |row| {
+            .query_map(rusqlite::params![path, MIN_JACCARD_THRESHOLD], |row| {
                 Ok(CochangeRow {
                     file_a: row.get(0)?,
                     file_b: row.get(1)?,
