@@ -213,7 +213,10 @@ fn run_uninstall_for_agent(
                     result.removed
                 );
                 if result.dir_removed {
-                    println!("  {} Removed empty ~/.skim/bin/ directory", check_mark(true));
+                    println!(
+                        "  {} Removed empty ~/.skim/bin/ directory",
+                        check_mark(true)
+                    );
                 }
             }
             Ok(_) => {} // No wrappers to remove — silently skip

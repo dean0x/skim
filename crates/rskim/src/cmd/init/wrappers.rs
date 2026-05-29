@@ -100,10 +100,7 @@ pub(crate) fn wrapper_targets() -> Vec<&'static str> {
 /// When `dry_run` is `true`, no filesystem changes are made. The function
 /// prints `[dry-run] Would create/update …` lines and returns a result
 /// with the counts of what *would* have changed.
-pub(crate) fn install_wrappers(
-    skim_binary: &Path,
-    dry_run: bool,
-) -> anyhow::Result<InstallResult> {
+pub(crate) fn install_wrappers(skim_binary: &Path, dry_run: bool) -> anyhow::Result<InstallResult> {
     let dir = wrappers_dir()?;
     let targets = wrapper_targets();
     let mut result = InstallResult::default();
@@ -115,9 +112,8 @@ pub(crate) fn install_wrappers(
                 dir.display()
             );
         } else {
-            std::fs::create_dir_all(&dir).map_err(|e| {
-                anyhow::anyhow!("Failed to create {}: {}", dir.display(), e)
-            })?;
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", dir.display(), e))?;
         }
     }
 
@@ -227,8 +223,8 @@ pub(crate) fn uninstall_wrappers(dry_run: bool) -> anyhow::Result<UninstallResul
         return Ok(result);
     }
 
-    let entries = std::fs::read_dir(&dir)
-        .map_err(|e| anyhow::anyhow!("read {}: {}", dir.display(), e))?;
+    let entries =
+        std::fs::read_dir(&dir).map_err(|e| anyhow::anyhow!("read {}: {}", dir.display(), e))?;
 
     for entry in entries {
         let entry = entry.map_err(|e| anyhow::anyhow!("read dir entry: {e}"))?;
@@ -268,41 +264,15 @@ pub(crate) fn uninstall_wrappers(dry_run: bool) -> anyhow::Result<UninstallResul
     }
 
     // Remove the directory if it is now empty.
-    if !dry_run {
-        if let Ok(mut remaining) = std::fs::read_dir(&dir) {
-            if remaining.next().is_none() {
-                let _ = std::fs::remove_dir(&dir);
-                result.dir_removed = true;
-            }
-        }
+    if !dry_run
+        && let Ok(mut remaining) = std::fs::read_dir(&dir)
+        && remaining.next().is_none()
+    {
+        let _ = std::fs::remove_dir(&dir);
+        result.dir_removed = true;
     }
 
     Ok(result)
-}
-
-// ============================================================================
-// Status check
-// ============================================================================
-
-/// Return `true` if `~/.skim/bin` exists and contains at least one symlink.
-pub(crate) fn wrappers_installed() -> bool {
-    let Ok(dir) = wrappers_dir() else {
-        return false;
-    };
-    if !dir.exists() {
-        return false;
-    }
-    std::fs::read_dir(&dir)
-        .ok()
-        .map(|mut entries| {
-            entries.any(|e| {
-                e.ok()
-                    .and_then(|entry| std::fs::symlink_metadata(entry.path()).ok())
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
 }
 
 // ============================================================================
@@ -341,7 +311,11 @@ mod tests {
             created += 1;
         }
 
-        assert_eq!(created, targets.len(), "all wrapper targets must be created");
+        assert_eq!(
+            created,
+            targets.len(),
+            "all wrapper targets must be created"
+        );
     }
 
     #[cfg(unix)]
@@ -387,7 +361,10 @@ mod tests {
         let mut result = InstallResult::default();
         install_one_symlink(&link, &fake_skim, "git", false, &mut result).unwrap();
 
-        assert_eq!(result.skipped_correct, 1, "already-correct symlink must be skipped");
+        assert_eq!(
+            result.skipped_correct, 1,
+            "already-correct symlink must be skipped"
+        );
         assert_eq!(result.created, 0);
         assert_eq!(result.updated, 0);
     }
@@ -411,7 +388,10 @@ mod tests {
         let mut result = InstallResult::default();
         install_one_symlink(&link, &new_skim, "git", false, &mut result).unwrap();
 
-        assert_eq!(result.updated, 1, "symlink with different target must be updated");
+        assert_eq!(
+            result.updated, 1,
+            "symlink with different target must be updated"
+        );
         assert_eq!(std::fs::read_link(&link).unwrap(), new_skim);
     }
 

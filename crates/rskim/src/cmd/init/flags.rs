@@ -508,20 +508,29 @@ mod tests {
     #[test]
     fn test_parse_flags_no_wrappers_false() {
         let flags = parse_flags(&["--no-wrappers".to_string()]).unwrap();
-        assert_eq!(flags.wrappers, Some(false), "--no-wrappers must set Some(false)");
+        assert_eq!(
+            flags.wrappers,
+            Some(false),
+            "--no-wrappers must set Some(false)"
+        );
     }
 
     #[test]
     fn test_parse_flags_wrappers_absent_is_none() {
         let flags = parse_flags(&["--yes".to_string()]).unwrap();
-        assert_eq!(flags.wrappers, None, "absent --wrappers flag must yield None");
+        assert_eq!(
+            flags.wrappers, None,
+            "absent --wrappers flag must yield None"
+        );
     }
 
     #[test]
     fn test_parse_flags_wrappers_and_no_wrappers_conflict() {
-        let result =
-            parse_flags(&["--wrappers".to_string(), "--no-wrappers".to_string()]);
-        assert!(result.is_err(), "--wrappers and --no-wrappers must conflict");
+        let result = parse_flags(&["--wrappers".to_string(), "--no-wrappers".to_string()]);
+        assert!(
+            result.is_err(),
+            "--wrappers and --no-wrappers must conflict"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("mutually exclusive"),

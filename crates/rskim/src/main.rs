@@ -1202,7 +1202,10 @@ mod tests {
             .collect();
 
         assert_eq!(filtered.len(), 2, "only the wrappers dir is removed");
-        assert_eq!(filtered[0], before, "order before wrappers must be preserved");
+        assert_eq!(
+            filtered[0], before,
+            "order before wrappers must be preserved"
+        );
         assert_eq!(filtered[1], after, "order after wrappers must be preserved");
     }
 
@@ -1213,13 +1216,19 @@ mod tests {
     /// "skim" stem: normal invocation, returns false.
     #[test]
     fn test_detect_argv0_for_skim() {
-        assert!(!detect_argv0_for("skim"), "'skim' must not trigger argv0 dispatch");
+        assert!(
+            !detect_argv0_for("skim"),
+            "'skim' must not trigger argv0 dispatch"
+        );
     }
 
     /// "rskim" stem: normal invocation, returns false.
     #[test]
     fn test_detect_argv0_for_rskim() {
-        assert!(!detect_argv0_for("rskim"), "'rskim' must not trigger argv0 dispatch");
+        assert!(
+            !detect_argv0_for("rskim"),
+            "'rskim' must not trigger argv0 dispatch"
+        );
     }
 
     /// "git": known non-meta subcommand, returns true.
@@ -1231,7 +1240,10 @@ mod tests {
     /// "cargo": known non-meta subcommand, returns true.
     #[test]
     fn test_detect_argv0_for_cargo() {
-        assert!(detect_argv0_for("cargo"), "'cargo' must trigger argv0 dispatch");
+        assert!(
+            detect_argv0_for("cargo"),
+            "'cargo' must trigger argv0 dispatch"
+        );
     }
 
     /// Unknown tool: returns false.
@@ -1246,13 +1258,19 @@ mod tests {
     /// "init": meta subcommand, returns false.
     #[test]
     fn test_detect_argv0_for_init_meta() {
-        assert!(!detect_argv0_for("init"), "'init' (meta) must not trigger argv0 dispatch");
+        assert!(
+            !detect_argv0_for("init"),
+            "'init' (meta) must not trigger argv0 dispatch"
+        );
     }
 
     /// "stats": meta subcommand, returns false.
     #[test]
     fn test_detect_argv0_for_stats_meta() {
-        assert!(!detect_argv0_for("stats"), "'stats' (meta) must not trigger argv0 dispatch");
+        assert!(
+            !detect_argv0_for("stats"),
+            "'stats' (meta) must not trigger argv0 dispatch"
+        );
     }
 
     /// "heatmap": meta subcommand, returns false.
@@ -1271,7 +1289,9 @@ mod tests {
     /// Empty SKIM_SESSION_ID yields None.
     #[test]
     fn test_skim_session_id_empty_yields_none() {
-        let result = std::env::var("").ok().filter(|s| analytics::is_safe_session_id(s));
+        let result = std::env::var("")
+            .ok()
+            .filter(|s| analytics::is_safe_session_id(s));
         assert!(result.is_none(), "empty session ID must yield None");
         // Also test is_safe_session_id directly with empty string
         assert!(
