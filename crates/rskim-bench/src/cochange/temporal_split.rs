@@ -91,10 +91,7 @@ pub fn temporal_split(mut commits: Vec<CommitInfo>, train_fraction: f64) -> Temp
     // Ensure at least 1 training commit and at least 1 test commit.
     let split_index = split_index.max(1).min(commits.len() - 1);
 
-    let split_timestamp = commits
-        .get(split_index)
-        .map(|c| c.timestamp)
-        .unwrap_or(0);
+    let split_timestamp = commits.get(split_index).map(|c| c.timestamp).unwrap_or(0);
 
     // Zero-copy split: split_off leaves [0, split_index) in `commits` (train)
     // and returns [split_index, len) as the test vec.

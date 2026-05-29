@@ -426,7 +426,10 @@ mod tests {
             ..Default::default()
         });
         let md = to_markdown(&result);
-        assert!(md.contains("errored-repo"), "should include errored repo name");
+        assert!(
+            md.contains("errored-repo"),
+            "should include errored repo name"
+        );
         assert!(
             md.contains("clone failed: connection refused"),
             "should render error message"

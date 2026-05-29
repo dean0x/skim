@@ -25,8 +25,7 @@ use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
 
 use rskim_bench::cochange::{
-    deny_list,
-    report,
+    deny_list, report,
     types::{CochangeValidationResult, RepoCochangeResult, RepoManifest, RunMetadata},
     validate::{aggregate_metrics, validate_repo},
 };
@@ -252,7 +251,11 @@ fn epoch_days_to_ymd(days: i64) -> (i64, i64, i64) {
     const YEAR_WRAP_SUBTRACT: i64 = 9;
 
     let z = days + CIVIL_EPOCH_OFFSET;
-    let era = if z >= 0 { z } else { z - DAYS_PER_ERA_MINUS_ONE } / DAYS_PER_ERA;
+    let era = if z >= 0 {
+        z
+    } else {
+        z - DAYS_PER_ERA_MINUS_ONE
+    } / DAYS_PER_ERA;
     let doe = z - era * DAYS_PER_ERA; // day of era [0, 146096]
     let yoe = (doe - doe / DAYS_PER_4_YEARS + doe / DAYS_PER_100_YEARS
         - doe / DAYS_PER_ERA_MINUS_ONE)

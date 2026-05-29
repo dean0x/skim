@@ -412,7 +412,9 @@ fn full_pipeline_synthetic_repo() {
     // must produce a detectable signal. A regression that produces all-zero
     // metrics (e.g., broken matrix writes, empty path_map, wrong split direction)
     // would cause this assertion to fail.
-    let lowest = metrics.iter().find(|m| (m.threshold - 0.01).abs() < 1e-9)
+    let lowest = metrics
+        .iter()
+        .find(|m| (m.threshold - 0.01).abs() < 1e-9)
         .expect("metrics must contain threshold 0.01");
     assert!(
         lowest.macro_recall > 0.0,

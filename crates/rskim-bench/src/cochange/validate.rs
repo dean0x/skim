@@ -244,12 +244,10 @@ pub fn evaluate_at_thresholds(
     //
     // jaccard_scratch: outer Vec pre-sized to MAX_FILES_PER_COMMIT so it is
     // never reallocated; inner Vecs are cleared and refilled each commit.
-    let mut jaccard_scratch: Vec<Vec<(FileId, f64)>> =
-        Vec::with_capacity(MAX_FILES_PER_COMMIT);
+    let mut jaccard_scratch: Vec<Vec<(FileId, f64)>> = Vec::with_capacity(MAX_FILES_PER_COMMIT);
     // all_known_scratch: single HashSet of mapped file IDs for this commit,
     // replacing the Q per-query actual HashSets (fixes O(Q²) allocation).
-    let mut all_known_scratch: HashSet<FileId> =
-        HashSet::with_capacity(MAX_FILES_PER_COMMIT);
+    let mut all_known_scratch: HashSet<FileId> = HashSet::with_capacity(MAX_FILES_PER_COMMIT);
     // known_ids: reused across commits to avoid per-commit allocation.
     let mut known_ids: Vec<FileId> = Vec::with_capacity(MAX_FILES_PER_COMMIT);
     // predicted_scratch: reused across (threshold, query) pairs to avoid Q×T
@@ -331,7 +329,7 @@ pub fn validate_repo(
                 entry,
                 "unknown",
                 format!("invalid repo URL (path traversal guard): {e:#}"),
-            ))
+            ));
         }
     };
 
@@ -561,8 +559,7 @@ fn build_and_evaluate(
         .map_err(|e| anyhow::anyhow!("path map construction failed: {e:#}"))?;
 
     // 7. Build co-change matrix in a tempdir.
-    let index_dir =
-        tempfile::tempdir().map_err(|e| anyhow::anyhow!("tempdir failed: {e:#}"))?;
+    let index_dir = tempfile::tempdir().map_err(|e| anyhow::anyhow!("tempdir failed: {e:#}"))?;
 
     let builder = CochangeMatrixBuilder::new(index_dir.path().to_path_buf())
         .map_err(|e| anyhow::anyhow!("builder creation failed: {e:#}"))?;
@@ -985,8 +982,7 @@ mod tests {
         use rskim_search::{HistoryResult, TemporalMetadata};
 
         let index_dir = tempfile::tempdir().expect("tempdir");
-        let builder =
-            CochangeMatrixBuilder::new(index_dir.path().to_path_buf()).expect("builder");
+        let builder = CochangeMatrixBuilder::new(index_dir.path().to_path_buf()).expect("builder");
         let empty_history = HistoryResult {
             commits: vec![],
             metadata: TemporalMetadata {
@@ -1054,8 +1050,7 @@ mod tests {
         let train_commits = vec![make_commit(0, 100, &["a.rs", "b.rs"])];
         let path_map = build_path_map(&train_commits).expect("build_path_map");
 
-        let builder =
-            CochangeMatrixBuilder::new(index_dir.path().to_path_buf()).expect("builder");
+        let builder = CochangeMatrixBuilder::new(index_dir.path().to_path_buf()).expect("builder");
         let history = HistoryResult {
             commits: train_commits,
             metadata: TemporalMetadata {
@@ -1113,7 +1108,12 @@ mod tests {
             .collect();
         let result = check_quality_gates(&commits);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("multi-file commits"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("multi-file commits")
+        );
     }
 
     #[test]
