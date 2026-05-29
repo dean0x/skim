@@ -926,6 +926,7 @@ mod tests {
         "--session",
         "--agent",
         "--format",
+        "--blast-radius",
     ];
 
     /// Ensure every value-consuming flag (non-boolean, non-positional) in `Args`
