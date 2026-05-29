@@ -243,16 +243,18 @@ pub fn evaluate_at_thresholds(
     // heap allocations in the hot evaluation loop.
     //
     // jaccard_scratch: outer Vec pre-sized to MAX_FILES_PER_COMMIT so it is
-    // never reallocated; inner Vecs are cleared and refilled each commit,
-    // matching the predicted_scratch pattern in EvalAccumulators.
+    // never reallocated; inner Vecs are cleared and refilled each commit.
     let mut jaccard_scratch: Vec<Vec<(FileId, f64)>> =
         Vec::with_capacity(MAX_FILES_PER_COMMIT);
     // all_known_scratch: single HashSet of mapped file IDs for this commit,
     // replacing the Q per-query actual HashSets (fixes O(Q²) allocation).
     let mut all_known_scratch: HashSet<FileId> =
         HashSet::with_capacity(MAX_FILES_PER_COMMIT);
-    // known_ids_scratch: reused across commits to avoid per-commit allocation.
+    // known_ids: reused across commits to avoid per-commit allocation.
     let mut known_ids: Vec<FileId> = Vec::with_capacity(MAX_FILES_PER_COMMIT);
+    // predicted_scratch: reused across (threshold, query) pairs to avoid Q×T
+    // HashSet allocations per commit.
+    let mut predicted_scratch: HashSet<FileId> = HashSet::with_capacity(MAX_FILES_PER_COMMIT);
 
     for commit in test_commits {
         // Resolve all file IDs for this commit. Track unmapped files.
@@ -299,6 +301,7 @@ pub fn evaluate_at_thresholds(
             &known_ids,
             thresholds,
             &mut accumulators,
+            &mut predicted_scratch,
         );
     }
 
@@ -606,9 +609,6 @@ fn build_and_evaluate(
 /// Bundles the 7 parallel index-aligned arrays that were previously passed as
 /// separate mutable slice parameters to `sweep_thresholds`.  Each index `ti`
 /// corresponds to one Jaccard threshold.
-///
-/// Also owns the `predicted_scratch` [`HashSet`] reused across (threshold,
-/// query) iterations to avoid `Q × T` allocations per commit.
 struct EvalAccumulators {
     /// Sum of per-commit macro-precision values, one entry per threshold.
     macro_precision_sum: Vec<f64>,
@@ -624,8 +624,6 @@ struct EvalAccumulators {
     micro_actual: Vec<usize>,
     /// Number of query-file observations, one entry per threshold.
     micro_query_count: Vec<usize>,
-    /// Scratch set cleared and reused each (threshold, query) iteration.
-    predicted_scratch: HashSet<FileId>,
 }
 
 impl EvalAccumulators {
@@ -639,7 +637,6 @@ impl EvalAccumulators {
             micro_predicted: vec![0usize; n_thresholds],
             micro_actual: vec![0usize; n_thresholds],
             micro_query_count: vec![0usize; n_thresholds],
-            predicted_scratch: HashSet::new(),
         }
     }
 
@@ -681,42 +678,6 @@ impl EvalAccumulators {
         self.micro_tp[ti] += intersection;
         self.micro_predicted[ti] += predicted.len();
         self.micro_actual[ti] += actual_size;
-        self.micro_query_count[ti] += 1;
-
-        (precision, recall)
-    }
-
-    /// Accumulate one (threshold-index, predicted, actual) observation.
-    ///
-    /// Computes the intersection count once and derives macro precision/recall
-    /// and micro TP from that single count, eliminating the three independent
-    /// intersection iterations that existed when these were separate slice params.
-    ///
-    /// Used by tests; production code uses [`accumulate_excluding`].
-    #[cfg(test)]
-    fn accumulate(
-        &mut self,
-        ti: usize,
-        predicted: &HashSet<FileId>,
-        actual: &HashSet<FileId>,
-    ) -> (f64, f64) {
-        // Compute intersection once; derive all dependent quantities from it.
-        let intersection = predicted.intersection(actual).count();
-        let precision = if predicted.is_empty() {
-            0.0
-        } else {
-            intersection as f64 / predicted.len() as f64
-        };
-        let recall = if actual.is_empty() {
-            0.0
-        } else {
-            intersection as f64 / actual.len() as f64
-        };
-
-        // Micro accumulation uses the same intersection count.
-        self.micro_tp[ti] += intersection;
-        self.micro_predicted[ti] += predicted.len();
-        self.micro_actual[ti] += actual.len();
         self.micro_query_count[ti] += 1;
 
         (precision, recall)
@@ -835,16 +796,11 @@ fn build_jaccard_pairs_into(
     Ok(())
 }
 
-// compute_actual_sets removed: replaced by a single all_known HashSet per commit.
-// The per-query "actual" set is all_known minus query_id, handled inline in
-// sweep_thresholds via accumulate_excluding.  This eliminates the O(Q²) allocation
-// that Q per-query HashSets incurred (Q = known_ids.len(), up to 500).
-
 /// Sweep all thresholds over pre-computed jaccard pairs for one commit.
 ///
-/// Updates `accumulators` in-place.  The `predicted_scratch` set inside
-/// `accumulators` is cleared and reused for every (threshold, query) pair to
-/// avoid Q×T HashSet allocations per commit.
+/// Updates `accumulators` in-place.  `predicted_scratch` is a caller-owned
+/// [`HashSet`] that is cleared and reused for every (threshold, query) pair
+/// to avoid Q×T allocations per commit.
 ///
 /// `all_known` is the set of all mapped file IDs in this commit.  For each
 /// query the "actual" co-change set is `all_known` minus the query itself,
@@ -855,6 +811,7 @@ fn sweep_thresholds(
     known_ids: &[FileId],
     thresholds: &[f64],
     accumulators: &mut EvalAccumulators,
+    predicted_scratch: &mut HashSet<FileId>,
 ) {
     let query_count = known_ids.len();
     // actual_size is the same for every query in this commit.
@@ -868,20 +825,21 @@ fn sweep_thresholds(
             let query_id = known_ids[q_idx];
 
             // Reuse scratch set: clear then extend with threshold-filtered candidates.
-            accumulators.predicted_scratch.clear();
-            accumulators.predicted_scratch.extend(
+            predicted_scratch.clear();
+            predicted_scratch.extend(
                 jaccard_cache[q_idx]
                     .iter()
                     .filter(|&&(_, j)| j >= threshold)
                     .map(|&(cid, _)| cid),
             );
 
-            // Compute intersection inline: count predicted elements that are in
-            // all_known AND are not the query itself (the "actual" set).
-            let scratch = std::mem::take(&mut accumulators.predicted_scratch);
-            let (p, r) = accumulators.accumulate_excluding(ti, &scratch, all_known, query_id, actual_size);
-            accumulators.predicted_scratch = scratch;
-
+            let (p, r) = accumulators.accumulate_excluding(
+                ti,
+                predicted_scratch,
+                all_known,
+                query_id,
+                actual_size,
+            );
             commit_precision_sum += p;
             commit_recall_sum += r;
         }
