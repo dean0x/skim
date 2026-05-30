@@ -82,8 +82,21 @@ pub(super) fn wrapper_targets() -> &'static [&'static str] {
 
 /// Install wrapper symlinks in `~/.skim/bin/`.
 ///
+/// Delegates to [`install_wrappers_in`] with the canonical wrappers directory
+/// from [`wrappers_dir()`]. This is the public API used by `skim init --wrappers`.
+pub(super) fn install_wrappers(skim_binary: &Path, dry_run: bool) -> anyhow::Result<InstallResult> {
+    let dir = wrappers_dir()?;
+    install_wrappers_in(&dir, skim_binary, dry_run)
+}
+
+/// Install wrapper symlinks in `dir`.
+///
+/// Accepts an explicit directory so that callers (including tests) can pass a
+/// temporary directory instead of always writing to `~/.skim/bin/`. The public
+/// API [`install_wrappers`] delegates here after resolving the canonical path.
+///
 /// For each tool name returned by [`wrapper_targets()`], creates a symlink
-/// `~/.skim/bin/<tool>` → `skim_binary`.
+/// `<dir>/<tool>` → `skim_binary`.
 ///
 /// ## Idempotence
 ///
@@ -100,8 +113,11 @@ pub(super) fn wrapper_targets() -> &'static [&'static str] {
 /// When `dry_run` is `true`, no filesystem changes are made. The function
 /// prints `[dry-run] Would create/update …` lines and returns a result
 /// with the counts of what *would* have changed.
-pub(super) fn install_wrappers(skim_binary: &Path, dry_run: bool) -> anyhow::Result<InstallResult> {
-    let dir = wrappers_dir()?;
+pub(super) fn install_wrappers_in(
+    dir: &Path,
+    skim_binary: &Path,
+    dry_run: bool,
+) -> anyhow::Result<InstallResult> {
     let targets = wrapper_targets();
     let mut result = InstallResult::default();
 
@@ -112,7 +128,7 @@ pub(super) fn install_wrappers(skim_binary: &Path, dry_run: bool) -> anyhow::Res
                 dir.display()
             );
         } else {
-            std::fs::create_dir_all(&dir)
+            std::fs::create_dir_all(dir)
                 .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", dir.display(), e))?;
         }
     }
@@ -248,18 +264,31 @@ fn install_one_symlink(
 
 /// Remove skim-pointing symlinks from `~/.skim/bin/`.
 ///
-/// Only removes symlinks whose target path contains `"skim"` or `"rskim"`.
-/// Preserves all other files (regular files, other symlinks, directories).
-/// If the directory is empty after cleanup, it is removed.
+/// Delegates to [`uninstall_wrappers_in`] with the canonical wrappers directory
+/// from [`wrappers_dir()`]. This is the public API used by `skim init --uninstall`.
+pub(super) fn uninstall_wrappers(dry_run: bool) -> anyhow::Result<UninstallResult> {
+    let dir = wrappers_dir()?;
+    uninstall_wrappers_in(&dir, dry_run)
+}
+
+/// Remove skim-pointing symlinks from `dir`.
+///
+/// Accepts an explicit directory so that callers (including tests) can pass a
+/// temporary directory instead of always operating on `~/.skim/bin/`. The
+/// public API [`uninstall_wrappers`] delegates here after resolving the
+/// canonical path.
+///
+/// Only removes symlinks whose target filename stem is exactly `"skim"` or
+/// `"rskim"`. Preserves all other files (regular files, other symlinks,
+/// directories). If the directory is empty after cleanup, it is removed.
 ///
 /// When `dry_run` is `true`, no filesystem changes are made.
-pub(super) fn uninstall_wrappers(dry_run: bool) -> anyhow::Result<UninstallResult> {
+pub(super) fn uninstall_wrappers_in(dir: &Path, dry_run: bool) -> anyhow::Result<UninstallResult> {
     // Circuit breaker: ~/.skim/bin/ is managed entirely by skim and should
     // never contain more entries than the maximum number of wrapper targets.
     // A much larger count indicates a corrupted or adversarial directory.
     const MAX_ENTRIES: usize = 256;
 
-    let dir = wrappers_dir()?;
     let mut result = UninstallResult::default();
 
     if !dir.exists() {
@@ -267,7 +296,7 @@ pub(super) fn uninstall_wrappers(dry_run: bool) -> anyhow::Result<UninstallResul
     }
 
     let entries =
-        std::fs::read_dir(&dir).map_err(|e| anyhow::anyhow!("read {}: {}", dir.display(), e))?;
+        std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("read {}: {}", dir.display(), e))?;
 
     let mut count = 0usize;
     for entry in entries {
@@ -323,10 +352,10 @@ pub(super) fn uninstall_wrappers(dry_run: bool) -> anyhow::Result<UninstallResul
 
     // Remove the directory if it is now empty.
     if !dry_run
-        && let Ok(mut remaining) = std::fs::read_dir(&dir)
+        && let Ok(mut remaining) = std::fs::read_dir(dir)
         && remaining.next().is_none()
     {
-        let _ = std::fs::remove_dir(&dir);
+        let _ = std::fs::remove_dir(dir);
         result.dir_removed = true;
     }
 
@@ -353,27 +382,59 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let fake_skim = tmp.path().join("skim");
         std::fs::write(&fake_skim, "#!/bin/sh\nexec true").unwrap();
+        // install_wrappers_in creates the directory itself — don't pre-create it.
         let install_dir = tmp.path().join(".skim").join("bin");
-        std::fs::create_dir_all(&install_dir).unwrap();
 
-        // Install using our wrappers dir (override by writing symlinks manually for targets)
+        let result = install_wrappers_in(&install_dir, &fake_skim, false).unwrap();
+
+        // Every wrapper target must be created.
         let targets = wrapper_targets();
-        let mut created = 0usize;
+        assert_eq!(
+            result.created,
+            targets.len(),
+            "install_wrappers_in must create a symlink for each wrapper target"
+        );
+        assert_eq!(result.skipped_correct, 0);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.skipped_non_symlink, 0);
 
+        // Each symlink must exist and point to the skim binary.
         for &tool in targets {
             let link = install_dir.join(tool);
-            std::os::unix::fs::symlink(&fake_skim, &link).unwrap();
-            // verify
             assert!(link.is_symlink(), "symlink for {tool} must exist");
-            assert_eq!(std::fs::read_link(&link).unwrap(), fake_skim);
-            created += 1;
+            assert_eq!(
+                std::fs::read_link(&link).unwrap(),
+                fake_skim,
+                "symlink for {tool} must point to skim binary"
+            );
         }
+    }
 
+    /// Calling install_wrappers_in twice is idempotent: the second call skips
+    /// every already-correct symlink and creates nothing new.
+    #[cfg(unix)]
+    #[test]
+    fn test_install_wrappers_in_idempotent() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let fake_skim = tmp.path().join("skim");
+        std::fs::write(&fake_skim, "").unwrap();
+        let install_dir = tmp.path().join("bin");
+
+        // First install.
+        let r1 = install_wrappers_in(&install_dir, &fake_skim, false).unwrap();
+        assert!(r1.created > 0, "first install must create symlinks");
+
+        // Second install — all symlinks are already correct.
+        let r2 = install_wrappers_in(&install_dir, &fake_skim, false).unwrap();
         assert_eq!(
-            created,
-            targets.len(),
-            "all wrapper targets must be created"
+            r2.skipped_correct,
+            wrapper_targets().len(),
+            "second install must skip all already-correct symlinks"
         );
+        assert_eq!(r2.created, 0, "second install must create nothing new");
+        assert_eq!(r2.updated, 0, "second install must update nothing");
     }
 
     #[cfg(unix)]
@@ -481,10 +542,8 @@ mod tests {
     fn test_uninstall_removes_only_skim_symlinks() {
         use tempfile::TempDir;
 
-        // The skim binary target must have an exact filename stem of "skim" or
-        // "rskim" — `uninstall_wrappers` uses stem matching, not substring
-        // matching, to avoid removing symlinks pointing to binaries like
-        // `/usr/local/bin/someskimmer`.
+        // uninstall_wrappers_in uses exact stem matching ("skim" / "rskim"), not
+        // substring matching, so symlinks to binaries like `someskimmer` are safe.
         let tmp = TempDir::new().unwrap();
         let bin_dir = tmp.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
@@ -500,32 +559,44 @@ mod tests {
         std::os::unix::fs::symlink(&fake_skim, &skim_link).unwrap();
         std::os::unix::fs::symlink(&other_tool, &other_link).unwrap();
 
-        // Verify the exact-stem matching logic used by uninstall_wrappers.
-        let entries: Vec<_> = std::fs::read_dir(&bin_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
+        // Call the real function with the temp directory.
+        let result = uninstall_wrappers_in(&bin_dir, false).unwrap();
 
-        let mut removed = 0usize;
-        let mut preserved = 0usize;
+        assert_eq!(result.removed, 1, "only the skim-pointing symlink must be removed");
+        assert_eq!(result.preserved, 1, "non-skim symlink must be preserved");
 
-        for entry in &entries {
-            let path = entry.path();
-            let meta = std::fs::symlink_metadata(&path).unwrap();
-            if !meta.file_type().is_symlink() {
-                continue; // real files
-            }
-            let target = std::fs::read_link(&path).unwrap();
-            let stem = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if stem == "skim" || stem == "rskim" {
-                removed += 1;
-            } else {
-                preserved += 1;
-            }
-        }
+        // The skim-pointing symlink must be gone.
+        assert!(
+            !skim_link.exists() && !skim_link.is_symlink(),
+            "skim symlink must have been removed"
+        );
+        // The non-skim symlink must still be there.
+        assert!(
+            other_link.is_symlink(),
+            "non-skim symlink must be preserved"
+        );
+    }
 
-        assert_eq!(removed, 1, "only the skim-pointing symlink must be removed");
-        assert_eq!(preserved, 1, "non-skim symlink must be preserved");
+    /// uninstall_wrappers_in removes the directory when it becomes empty.
+    #[cfg(unix)]
+    #[test]
+    fn test_uninstall_removes_empty_dir() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let fake_skim = tmp.path().join("skim");
+        std::fs::write(&fake_skim, "").unwrap();
+        let link = bin_dir.join("git");
+        std::os::unix::fs::symlink(&fake_skim, &link).unwrap();
+
+        let result = uninstall_wrappers_in(&bin_dir, false).unwrap();
+
+        assert_eq!(result.removed, 1);
+        assert!(result.dir_removed, "empty directory must be removed");
+        assert!(!bin_dir.exists(), "bin_dir must no longer exist");
     }
 
     #[cfg(unix)]

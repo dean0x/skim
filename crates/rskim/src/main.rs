@@ -522,6 +522,26 @@ pub(crate) fn detect_argv0_for(name: &str) -> bool {
     true
 }
 
+/// Extract the file stem from an `argv[0]` string.
+///
+/// Returns the last path component (without extension) of `argv0` as a
+/// `String`, or `None` if the path has no file name component or contains
+/// non-UTF-8 bytes.
+///
+/// Examples:
+/// - `"/Users/x/.skim/bin/git"` → `Some("git")`
+/// - `"skim"` → `Some("skim")`
+/// - `"rskim"` → `Some("rskim")`
+///
+/// Extracted as a pure function so it can be unit-tested independently of
+/// `std::env::args()`.
+fn extract_argv0_stem(argv0: &str) -> Option<String> {
+    std::path::Path::new(argv0)
+        .file_name()?
+        .to_str()
+        .map(str::to_string)
+}
+
 /// Detect argv[0]-based dispatch for symlink invocations.
 ///
 /// When the binary is invoked as `~/.skim/bin/git`, this returns
@@ -529,10 +549,7 @@ pub(crate) fn detect_argv0_for(name: &str) -> bool {
 fn detect_argv0_dispatch() -> Option<(String, Vec<String>)> {
     let mut args = std::env::args();
     let argv0 = args.next()?;
-    let stem = std::path::Path::new(&argv0)
-        .file_name()?
-        .to_str()?
-        .to_string();
+    let stem = extract_argv0_stem(&argv0)?;
     if detect_argv0_for(&stem) {
         Some((stem, args.collect()))
     } else {
@@ -564,6 +581,37 @@ where
         .filter(|s| analytics::is_safe_session_id(s))
 }
 
+/// Pure PATH filter: removes all entries that match `~/.skim/bin` from `path`.
+///
+/// Returns `Some(filtered)` when at least one entry was removed, `None` when
+/// the wrappers directory cannot be determined or the path is unchanged.
+///
+/// Extracted as a pure function (no `set_var`) so it can be unit-tested
+/// directly without touching the process environment.
+fn filter_wrappers_from_path(path: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    let wrappers_dir = cmd::skim_wrappers_dir()?;
+    // Normalize once so that trailing slashes, `..` segments, and symlinked
+    // parent paths do not defeat the equality check (PF-003).
+    let wrappers_dir_canonical: std::path::PathBuf = wrappers_dir.components().collect();
+
+    let all: Vec<_> = std::env::split_paths(path).collect();
+    let filtered: Vec<_> = all
+        .iter()
+        .filter(|p| {
+            let normalized: std::path::PathBuf = p.components().collect();
+            normalized != wrappers_dir_canonical
+        })
+        .cloned()
+        .collect();
+
+    if filtered.len() == all.len() {
+        // Nothing was removed; caller can skip the set_var.
+        return None;
+    }
+
+    std::env::join_paths(&filtered).ok()
+}
+
 /// Remove `~/.skim/bin` from `PATH` to prevent infinite recursion when the
 /// skim binary is invoked as a symlink (e.g. `~/.skim/bin/git`).
 ///
@@ -583,25 +631,11 @@ where
 /// called before any thread is spawned (before analytics background threads,
 /// rayon pools, etc.).
 fn strip_skim_wrappers_from_path() {
-    let wrappers_dir = match cmd::skim_wrappers_dir() {
-        Some(d) => d,
-        None => return,
-    };
-    // Normalize wrappers_dir once so that trailing slashes, `..` segments, and
-    // symlinked parent paths do not defeat the equality check (PF-003).
-    let wrappers_dir_canonical: std::path::PathBuf =
-        wrappers_dir.components().collect();
     let path = match std::env::var_os("PATH") {
         Some(p) => p,
         None => return,
     };
-    let filtered: Vec<_> = std::env::split_paths(&path)
-        .filter(|p| {
-            let normalized: std::path::PathBuf = p.components().collect();
-            normalized != wrappers_dir_canonical
-        })
-        .collect();
-    if let Ok(new_path) = std::env::join_paths(&filtered) {
+    if let Some(new_path) = filter_wrappers_from_path(&path) {
         // SAFETY: single-threaded at this point (before any thread spawn).
         // strip_skim_wrappers_from_path() is called as the very first
         // statement in main() before debug init, analytics init, rayon,
@@ -1138,7 +1172,7 @@ mod tests {
     }
 
     // ========================================================================
-    // strip_skim_wrappers_from_path tests
+    // filter_wrappers_from_path tests (pure function, no set_var)
     // ========================================================================
 
     /// PATH containing ~/.skim/bin has that entry removed.
@@ -1148,15 +1182,12 @@ mod tests {
         let wrappers = home.join(".skim").join("bin");
         let other = std::path::PathBuf::from("/usr/bin");
 
-        // Build a PATH that includes the wrappers dir
         let input_paths = vec![wrappers.clone(), other.clone()];
         let path_str = std::env::join_paths(&input_paths).unwrap();
 
-        // filter manually (same logic as strip_skim_wrappers_from_path)
-        let filtered: Vec<_> = std::env::split_paths(&path_str)
-            .filter(|p| p != &wrappers)
-            .collect();
-        let result = std::env::join_paths(&filtered).unwrap();
+        // Call the real extracted function — no manual replication.
+        let result = filter_wrappers_from_path(&path_str)
+            .expect("wrappers dir present — filter must return Some");
 
         let result_paths: Vec<_> = std::env::split_paths(&result).collect();
         assert!(
@@ -1169,31 +1200,24 @@ mod tests {
         );
     }
 
-    /// PATH without ~/.skim/bin is returned unchanged.
+    /// PATH without ~/.skim/bin returns None (no change needed).
     #[test]
     fn test_strip_skim_wrappers_no_change_when_absent() {
         let other = std::path::PathBuf::from("/usr/local/bin");
         let other2 = std::path::PathBuf::from("/usr/bin");
-        let home = dirs::home_dir().unwrap();
-        let wrappers = home.join(".skim").join("bin");
 
         let input_paths = vec![other.clone(), other2.clone()];
         let path_str = std::env::join_paths(&input_paths).unwrap();
 
-        let filtered: Vec<_> = std::env::split_paths(&path_str)
-            .filter(|p| p != &wrappers)
-            .collect();
-
-        assert_eq!(
-            filtered.len(),
-            2,
-            "path without wrappers dir must be returned unchanged"
+        // filter_wrappers_from_path returns None when nothing was removed.
+        let result = filter_wrappers_from_path(&path_str);
+        assert!(
+            result.is_none(),
+            "path without wrappers dir must return None (no change)"
         );
-        assert!(filtered.contains(&other));
-        assert!(filtered.contains(&other2));
     }
 
-    /// Wrappers dir in the middle of PATH: only that entry is removed.
+    /// Wrappers dir in the middle of PATH: only that entry is removed, order preserved.
     #[test]
     fn test_strip_skim_wrappers_middle_entry_removed_order_preserved() {
         let home = dirs::home_dir().unwrap();
@@ -1204,9 +1228,9 @@ mod tests {
         let input_paths = vec![before.clone(), wrappers.clone(), after.clone()];
         let path_str = std::env::join_paths(&input_paths).unwrap();
 
-        let filtered: Vec<_> = std::env::split_paths(&path_str)
-            .filter(|p| p != &wrappers)
-            .collect();
+        let result = filter_wrappers_from_path(&path_str)
+            .expect("wrappers dir present — filter must return Some");
+        let filtered: Vec<_> = std::env::split_paths(&result).collect();
 
         assert_eq!(filtered.len(), 2, "only the wrappers dir is removed");
         assert_eq!(
@@ -1214,6 +1238,82 @@ mod tests {
             "order before wrappers must be preserved"
         );
         assert_eq!(filtered[1], after, "order after wrappers must be preserved");
+    }
+
+    /// Duplicate ~/.skim/bin entries in PATH: both are removed.
+    #[test]
+    fn test_strip_skim_wrappers_removes_duplicate_entries() {
+        let home = dirs::home_dir().unwrap();
+        let wrappers = home.join(".skim").join("bin");
+        let other = std::path::PathBuf::from("/usr/bin");
+
+        // PATH=~/.skim/bin:/usr/bin:~/.skim/bin — duplicates must both be removed.
+        let input_paths = vec![wrappers.clone(), other.clone(), wrappers.clone()];
+        let path_str = std::env::join_paths(&input_paths).unwrap();
+
+        let result = filter_wrappers_from_path(&path_str)
+            .expect("wrappers dir present — filter must return Some");
+        let filtered: Vec<_> = std::env::split_paths(&result).collect();
+
+        assert_eq!(filtered.len(), 1, "both duplicate wrappers entries must be removed");
+        assert_eq!(filtered[0], other, "only /usr/bin must remain");
+    }
+
+    // ========================================================================
+    // extract_argv0_stem tests
+    // ========================================================================
+
+    /// Full absolute path: stem is the last component.
+    #[test]
+    fn test_extract_argv0_stem_full_path() {
+        assert_eq!(
+            extract_argv0_stem("/Users/x/.skim/bin/git").as_deref(),
+            Some("git"),
+            "full path must yield the filename stem"
+        );
+    }
+
+    /// Bare binary name: stem is the name itself.
+    #[test]
+    fn test_extract_argv0_stem_bare_name() {
+        assert_eq!(
+            extract_argv0_stem("skim").as_deref(),
+            Some("skim"),
+        );
+        assert_eq!(
+            extract_argv0_stem("rskim").as_deref(),
+            Some("rskim"),
+        );
+    }
+
+    /// Deep nested path resolves correctly.
+    #[test]
+    fn test_extract_argv0_stem_nested_path() {
+        assert_eq!(
+            extract_argv0_stem("/home/runner/.skim/bin/npm").as_deref(),
+            Some("npm"),
+        );
+    }
+
+    /// Relative path is handled correctly.
+    #[test]
+    fn test_extract_argv0_stem_relative_path() {
+        assert_eq!(
+            extract_argv0_stem(".skim/bin/grep").as_deref(),
+            Some("grep"),
+        );
+    }
+
+    /// Empty string yields None (no file name component).
+    #[test]
+    fn test_extract_argv0_stem_empty_string() {
+        // An empty string has no file name component.
+        let result = extract_argv0_stem("");
+        // Path::new("").file_name() returns None on all platforms.
+        assert!(
+            result.is_none(),
+            "empty argv0 must yield None"
+        );
     }
 
     // ========================================================================
