@@ -482,6 +482,7 @@ mod tests {
             ("SELECT 1", Language::Sql),
             ("fun k() {}", Language::Kotlin),
             ("func l() {}", Language::Swift),
+            ("# Hello\n\nSome text", Language::Markdown),
         ];
 
         for (source, lang) in test_cases {

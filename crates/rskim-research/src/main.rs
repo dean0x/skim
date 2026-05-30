@@ -428,8 +428,7 @@ fn cmd_ast_run(
 
     for (lang, df_map) in &raw_trigram_df_maps {
         let rekeyed = ast_types::rekey_trigram_df_map(df_map, &remap);
-        let weights =
-            ast_idf::compute_ast_trigram_weights(&rekeyed, total_docs, threshold, &vocab);
+        let weights = ast_idf::compute_ast_trigram_weights(&rekeyed, total_docs, threshold, &vocab);
         eprintln!(
             "  {lang}: {} trigrams (threshold={threshold})",
             weights.len()
