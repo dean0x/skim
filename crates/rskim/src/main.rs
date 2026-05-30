@@ -594,8 +594,8 @@ fn filter_wrappers_from_path(path: &std::ffi::OsStr) -> Option<std::ffi::OsStrin
     // parent paths do not defeat the equality check (PF-003).
     let wrappers_dir_canonical: std::path::PathBuf = wrappers_dir.components().collect();
 
-    let all: Vec<_> = std::env::split_paths(path).collect();
-    let filtered: Vec<_> = all
+    let entries: Vec<_> = std::env::split_paths(path).collect();
+    let filtered: Vec<_> = entries
         .iter()
         .filter(|p| {
             let normalized: std::path::PathBuf = p.components().collect();
@@ -604,7 +604,7 @@ fn filter_wrappers_from_path(path: &std::ffi::OsStr) -> Option<std::ffi::OsStrin
         .cloned()
         .collect();
 
-    if filtered.len() == all.len() {
+    if filtered.len() == entries.len() {
         // Nothing was removed; caller can skip the set_var.
         return None;
     }
@@ -1393,14 +1393,9 @@ mod tests {
     // SKIM_SESSION_ID env var fallback tests
     // ========================================================================
 
-    /// Empty SKIM_SESSION_ID yields None.
+    /// Empty string is rejected by is_safe_session_id.
     #[test]
     fn test_skim_session_id_empty_yields_none() {
-        let result = std::env::var("")
-            .ok()
-            .filter(|s| analytics::is_safe_session_id(s));
-        assert!(result.is_none(), "empty session ID must yield None");
-        // Also test is_safe_session_id directly with empty string
         assert!(
             !analytics::is_safe_session_id(""),
             "empty session ID must be rejected by is_safe_session_id"

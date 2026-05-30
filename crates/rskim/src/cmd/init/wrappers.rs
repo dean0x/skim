@@ -439,32 +439,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_install_all_symlinks_point_to_correct_target() {
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let fake_skim = tmp.path().join("skim");
-        std::fs::write(&fake_skim, "#!/bin/sh").unwrap();
-        let install_dir = tmp.path().join("bin");
-        std::fs::create_dir_all(&install_dir).unwrap();
-
-        for &tool in wrapper_targets() {
-            let link = install_dir.join(tool);
-            std::os::unix::fs::symlink(&fake_skim, &link).unwrap();
-        }
-
-        for &tool in wrapper_targets() {
-            let link = install_dir.join(tool);
-            let target = std::fs::read_link(&link).unwrap();
-            assert_eq!(
-                target, fake_skim,
-                "symlink for {tool} must point to skim binary"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn test_install_idempotent_correct_symlink_skipped() {
         use tempfile::TempDir;
 
@@ -617,12 +591,11 @@ mod tests {
         let link = bin_dir.join("git");
         std::os::unix::fs::symlink(&look_alike, &link).unwrap();
 
-        let target = std::fs::read_link(&link).unwrap();
-        let stem = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        assert!(
-            stem != "skim" && stem != "rskim",
-            "someskimmer must NOT be classified as a skim binary (stem = {stem:?})"
-        );
+        let result = uninstall_wrappers_in(&bin_dir, false).unwrap();
+
+        assert_eq!(result.removed, 0, "someskimmer-pointing symlink must be preserved");
+        assert_eq!(result.preserved, 1, "non-skim symlink must be preserved");
+        assert!(link.is_symlink(), "the symlink must still exist");
     }
 
     #[cfg(unix)]
