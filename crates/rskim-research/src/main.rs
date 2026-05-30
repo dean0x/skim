@@ -8,8 +8,14 @@
 //! - `run`: clone corpus repos, extract bigrams, compute IDF, write JSON
 //! - `codegen`: read JSON weight table, generate weights.rs for rskim-search
 //! - `validate`: read JSON weight table, run border-weight validation report
+//! - `ast-run`: clone corpus repos, extract AST n-grams, compute IDF, write JSON
+//! - `ast-codegen`: read ast_weights.json, generate ast_weights.rs for rskim-search
+//! - `ast-validate`: read ast_weights.json, run AST validation report
 
-use rskim_research::{clone, codegen, config, extract, idf, types, validate};
+use rskim_research::{
+    ast_codegen, ast_extract, ast_idf, ast_types, ast_validate, clone, codegen, config, extract,
+    idf, types, validate,
+};
 
 use std::path::PathBuf;
 
@@ -67,6 +73,47 @@ enum Commands {
         #[arg(long)]
         json_path: Option<PathBuf>,
     },
+
+    /// Clone corpus repos, extract AST bigrams/trigrams, compute IDF weights, and write JSON.
+    AstRun {
+        /// Directory to clone repos into (defaults to a temporary directory).
+        #[arg(long)]
+        corpus_dir: Option<PathBuf>,
+
+        /// Minimum IDF threshold — bigrams/trigrams below this are excluded.
+        #[arg(long, default_value = "1.5")]
+        threshold: f32,
+
+        /// Path to ast-corpus.toml configuration file.
+        #[arg(long, default_value = "ast-corpus.toml")]
+        corpus_config: PathBuf,
+
+        /// Output path for ast_weights.json.
+        #[arg(long)]
+        output: Option<PathBuf>,
+
+        /// Collect AST trigrams in addition to bigrams.
+        #[arg(long, default_value = "true")]
+        trigrams: bool,
+    },
+
+    /// Read ast_weights.json and generate ast_weights.rs for rskim-search.
+    AstCodegen {
+        /// Path to ast_weights.json (defaults to crates/rskim-search/data/ast_weights.json).
+        #[arg(long)]
+        json_path: Option<PathBuf>,
+
+        /// Override workspace root detection (auto-detected if omitted).
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
+    },
+
+    /// Read ast_weights.json and run AST validation report.
+    AstValidate {
+        /// Path to ast_weights.json (defaults to crates/rskim-search/data/ast_weights.json).
+        #[arg(long)]
+        json_path: Option<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -86,6 +133,21 @@ fn main() -> anyhow::Result<()> {
         } => cmd_codegen(json_path, workspace_root),
 
         Commands::Validate { json_path } => cmd_validate(json_path),
+
+        Commands::AstRun {
+            corpus_dir,
+            threshold,
+            corpus_config,
+            output,
+            trigrams,
+        } => cmd_ast_run(corpus_dir, threshold, &corpus_config, output, trigrams),
+
+        Commands::AstCodegen {
+            json_path,
+            workspace_root,
+        } => cmd_ast_codegen(json_path, workspace_root),
+
+        Commands::AstValidate { json_path } => cmd_ast_validate(json_path),
     }
 }
 
@@ -293,6 +355,194 @@ fn cmd_validate(json_path: Option<PathBuf>) -> anyhow::Result<()> {
         "Improvement:                {:.2}%",
         validation.improvement_pct
     );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AST subcommand handlers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmd_ast_run(
+    corpus_dir: Option<PathBuf>,
+    threshold: f32,
+    corpus_config: &std::path::Path,
+    output: Option<PathBuf>,
+    collect_trigrams: bool,
+) -> anyhow::Result<()> {
+    let ast_config = config::load_ast_corpus_config(corpus_config)
+        .with_context(|| format!("loading AST corpus config from {}", corpus_config.display()))?;
+
+    let (corpus_dir_path, _temp_dir_guard) = resolve_corpus_dir(corpus_dir)?;
+
+    eprintln!(
+        "Cloning {} repos into {} ...",
+        ast_config.repos.len(),
+        corpus_dir_path.display()
+    );
+
+    let all_files = fetch_all_ast_files(&ast_config, &corpus_dir_path)?;
+
+    eprintln!(
+        "Loaded {} source files. Extracting AST n-grams...",
+        all_files.len()
+    );
+
+    let mut vocab = ast_types::NodeKindVocabulary::new();
+
+    let (bigram_df_maps, trigram_df_maps, corpus_stats) =
+        ast_extract::extract_ast_ngrams_from_corpus(&all_files, &mut vocab, collect_trigrams);
+
+    vocab.stabilize();
+
+    eprintln!(
+        "Vocabulary: {} node kinds. Computing IDF weights...",
+        vocab.len()
+    );
+
+    let mut bigram_weights_map: std::collections::HashMap<String, Vec<ast_types::AstBigramWeight>> =
+        std::collections::HashMap::new();
+    let mut trigram_weights_map: std::collections::HashMap<
+        String,
+        Vec<ast_types::AstTrigramWeight>,
+    > = std::collections::HashMap::new();
+
+    let total_docs = corpus_stats.total_files;
+
+    for (lang, df_map) in &bigram_df_maps {
+        let weights = ast_idf::compute_ast_bigram_weights(df_map, total_docs, threshold, &vocab);
+        eprintln!(
+            "  {lang}: {} bigrams (threshold={threshold})",
+            weights.len()
+        );
+        bigram_weights_map.insert(lang.clone(), weights);
+    }
+
+    for (lang, df_map) in &trigram_df_maps {
+        let weights = ast_idf::compute_ast_trigram_weights(df_map, total_docs, threshold, &vocab);
+        eprintln!(
+            "  {lang}: {} trigrams (threshold={threshold})",
+            weights.len()
+        );
+        trigram_weights_map.insert(lang.clone(), weights);
+    }
+
+    let table = ast_types::AstWeightTable {
+        version: 1,
+        generated_at: chrono_now(),
+        vocabulary: vocab.kinds().into_iter().map(str::to_string).collect(),
+        corpus_stats,
+        bigram_weights: bigram_weights_map,
+        trigram_weights: trigram_weights_map,
+    };
+
+    write_ast_weight_table(&table, output)?;
+
+    Ok(())
+}
+
+/// Clone/fetch all source files for the AST corpus using the AST extension walker.
+fn fetch_all_ast_files(
+    config: &config::CorpusConfig,
+    corpus_dir: &std::path::Path,
+) -> anyhow::Result<Vec<types::SourceFile>> {
+    use rayon::prelude::*;
+
+    let source = clone::AstGitCloneSource {
+        corpus_dir: corpus_dir.to_path_buf(),
+    };
+
+    let progress = ProgressBar::new(config.repos.len() as u64);
+    if let Ok(style) =
+        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40}] {pos}/{len} {msg}")
+    {
+        progress.set_style(style);
+    }
+
+    let all_files: Vec<types::SourceFile> = config
+        .repos
+        .par_iter()
+        .flat_map(|repo| {
+            progress.set_message(repo.url.clone());
+            let result = source.fetch_files(repo);
+            progress.inc(1);
+            match result {
+                Ok(files) => files,
+                Err(e) => {
+                    eprintln!("Warning: failed to fetch {}: {e:#}", repo.url);
+                    vec![]
+                }
+            }
+        })
+        .collect();
+
+    progress.finish_with_message("done");
+    Ok(all_files)
+}
+
+/// Serialize the AST weight table to JSON and write to output path.
+fn write_ast_weight_table(
+    table: &ast_types::AstWeightTable,
+    output: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let output_path = output.unwrap_or_else(|| {
+        ast_codegen::default_ast_weights_json_path()
+            .unwrap_or_else(|_| PathBuf::from("ast_weights.json"))
+    });
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating output directory {}", parent.display()))?;
+    }
+
+    let json = serde_json::to_string_pretty(table).context("serializing AST weight table")?;
+    std::fs::write(&output_path, json)
+        .with_context(|| format!("writing {}", output_path.display()))?;
+
+    eprintln!("Written: {}", output_path.display());
+    Ok(())
+}
+
+fn cmd_ast_codegen(
+    json_path: Option<PathBuf>,
+    workspace_root: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let workspace_root = match workspace_root {
+        Some(p) => p,
+        None => codegen::find_workspace_root().context("auto-detecting workspace root")?,
+    };
+
+    let json_path = json_path
+        .unwrap_or_else(|| workspace_root.join("crates/rskim-search/data/ast_weights.json"));
+
+    let output_path = workspace_root.join("crates/rskim-search/src/ast_weights.rs");
+
+    eprintln!(
+        "Reading {} -> generating {}",
+        json_path.display(),
+        output_path.display()
+    );
+
+    ast_codegen::generate_ast_weights_rs(&json_path, &output_path)?;
+
+    eprintln!("Generated: {}", output_path.display());
+    Ok(())
+}
+
+fn cmd_ast_validate(json_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let json_path = json_path.unwrap_or_else(|| {
+        ast_codegen::default_ast_weights_json_path()
+            .unwrap_or_else(|_| PathBuf::from("ast_weights.json"))
+    });
+
+    let raw = std::fs::read_to_string(&json_path)
+        .with_context(|| format!("reading {}", json_path.display()))?;
+
+    let table: ast_types::AstWeightTable =
+        serde_json::from_str(&raw).context("parsing ast_weights.json")?;
+
+    let report = ast_validate::run_ast_validation(&table);
+    ast_validate::print_ast_validation_report(&report);
 
     Ok(())
 }

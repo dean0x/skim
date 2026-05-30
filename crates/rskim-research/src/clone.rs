@@ -17,11 +17,40 @@ const MAX_FILE_SIZE: u64 = 100 * 1024;
 /// Number of bytes to inspect for null bytes (binary detection).
 const BINARY_PROBE_BYTES: usize = 8192;
 
-/// File extensions explicitly excluded (data formats, not code).
+/// File extensions explicitly excluded for the lexical bigram corpus (data formats, not code).
+///
+/// This list is only applied when using the default `TARGET_EXTENSIONS`.
+/// When an explicit extension list is passed to `walk_and_load`, no extensions
+/// are excluded beyond what the caller provides.
 const EXCLUDED_EXTENSIONS: &[&str] = &["json", "yaml", "yml", "toml", "md", "markdown"];
 
-/// Target language file extensions accepted by the corpus.
+/// Target language file extensions accepted by the lexical bigram corpus.
 const TARGET_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "py", "go", "java"];
+
+/// Target file extensions for the AST n-gram corpus (all 14 tree-sitter languages).
+pub const AST_TARGET_EXTENSIONS: &[&str] = &[
+    "rs",    // Rust
+    "ts",    // TypeScript
+    "tsx",   // TypeScript (JSX)
+    "js",    // JavaScript
+    "jsx",   // JavaScript (JSX)
+    "py",    // Python
+    "go",    // Go
+    "java",  // Java
+    "c",     // C
+    "h",     // C headers
+    "cpp",   // C++
+    "cc",    // C++
+    "cxx",   // C++
+    "hpp",   // C++ headers
+    "cs",    // C#
+    "rb",    // Ruby
+    "sql",   // SQL
+    "kt",    // Kotlin
+    "kts",   // Kotlin script
+    "swift", // Swift
+    "md",    // Markdown
+];
 
 /// Abstraction over file loading — enables testing without network access.
 pub trait FileSource: Send + Sync {
@@ -44,7 +73,27 @@ impl FileSource for GitCloneSource {
                 .with_context(|| format!("cloning {}", repo.url))?;
         }
 
-        walk_and_load(&dest)
+        walk_and_load(&dest, None)
+    }
+}
+
+/// An AST-aware file source that clones repos and walks with AST extensions.
+pub struct AstGitCloneSource {
+    pub corpus_dir: std::path::PathBuf,
+}
+
+impl FileSource for AstGitCloneSource {
+    fn fetch_files(&self, repo: &RepoEntry) -> anyhow::Result<Vec<SourceFile>> {
+        let repo_name = extract_repo_name(&repo.url)?;
+        let dest = self.corpus_dir.join(&repo_name);
+
+        // Clone if not already present.
+        if !dest.exists() {
+            clone_repo(&repo.url, &repo.commit, &dest)
+                .with_context(|| format!("cloning {}", repo.url))?;
+        }
+
+        walk_and_load_ast(&dest)
     }
 }
 
@@ -229,7 +278,13 @@ fn clone_repo(url: &str, commit: &str, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn walk_and_load(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
+/// Walk `root` and load all source files matching the given extension list.
+///
+/// If `extensions` is `None`, the default lexical corpus extensions
+/// (`TARGET_EXTENSIONS`) are used and `EXCLUDED_EXTENSIONS` is applied.
+/// If `extensions` is `Some(list)`, only those extensions are accepted and
+/// the exclusion list is NOT applied — the caller controls what is included.
+pub fn walk_and_load(root: &Path, extensions: Option<&[&str]>) -> anyhow::Result<Vec<SourceFile>> {
     let mut files = Vec::new();
 
     let walker = ignore::WalkBuilder::new(root)
@@ -249,14 +304,22 @@ fn walk_and_load(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
             .unwrap_or("")
             .to_lowercase();
 
-        // Skip excluded extensions.
-        if EXCLUDED_EXTENSIONS.contains(&ext.as_str()) {
-            continue;
-        }
-
-        // Skip non-target extensions.
-        if !TARGET_EXTENSIONS.contains(&ext.as_str()) {
-            continue;
+        match extensions {
+            None => {
+                // Default lexical mode: apply exclusion list then target list.
+                if EXCLUDED_EXTENSIONS.contains(&ext.as_str()) {
+                    continue;
+                }
+                if !TARGET_EXTENSIONS.contains(&ext.as_str()) {
+                    continue;
+                }
+            }
+            Some(allowed) => {
+                // Explicit extension list: no exclusion, only allow listed exts.
+                if !allowed.contains(&ext.as_str()) {
+                    continue;
+                }
+            }
         }
 
         // Skip files that are too large.
@@ -302,6 +365,14 @@ fn walk_and_load(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
     Ok(files)
 }
 
+/// Walk `root` and load source files for all 14 tree-sitter languages.
+///
+/// Uses `AST_TARGET_EXTENSIONS` as the extension filter. No exclusion list
+/// is applied — the caller decides which extensions to accept.
+pub fn walk_and_load_ast(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
+    walk_and_load(root, Some(AST_TARGET_EXTENSIONS))
+}
+
 /// Test file source that reads from a fixture directory.
 pub struct FixtureSource {
     pub fixture_dir: PathBuf,
@@ -309,13 +380,13 @@ pub struct FixtureSource {
 
 impl FileSource for FixtureSource {
     fn fetch_files(&self, _repo: &RepoEntry) -> anyhow::Result<Vec<SourceFile>> {
-        walk_and_load(&self.fixture_dir)
+        walk_and_load(&self.fixture_dir, None)
     }
 }
 
 /// Load all source files from a directory (public helper for the codegen step).
 pub fn load_fixture_files(dir: &Path) -> anyhow::Result<Vec<SourceFile>> {
-    walk_and_load(dir)
+    walk_and_load(dir, None)
 }
 
 /// Clone a repository with full history (no `--depth 1`) for co-change analysis.
