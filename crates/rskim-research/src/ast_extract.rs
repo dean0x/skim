@@ -36,6 +36,7 @@ pub type BigramDfMap = HashMap<String, HashMap<AstBigram, u32>>;
 pub type TrigramDfMap = HashMap<String, HashMap<AstTrigram, u32>>;
 
 /// Per-file result from AST n-gram extraction.
+#[derive(Default)]
 pub struct AstFileResult {
     /// Unique bigrams (parent→child node-kind pairs) found in this file.
     pub bigrams: HashSet<AstBigram>,
@@ -45,17 +46,6 @@ pub struct AstFileResult {
     pub error_node_count: u32,
     /// Total number of AST nodes visited.
     pub node_count: u32,
-}
-
-impl AstFileResult {
-    fn empty() -> Self {
-        Self {
-            bigrams: HashSet::new(),
-            trigrams: HashSet::new(),
-            error_node_count: 0,
-            node_count: 0,
-        }
-    }
 }
 
 /// Extract AST bigrams and (optionally) trigrams from a single source file.
@@ -81,27 +71,26 @@ pub fn extract_ast_ngrams_from_file(
             "Warning: skipping file larger than {} KiB for AST extraction",
             MAX_FILE_SIZE / 1024
         );
-        return Ok(AstFileResult::empty());
+        return Ok(AstFileResult::default());
     }
 
     // Parser::new returns Err for non-tree-sitter languages (JSON, YAML, TOML, Markdown).
     // We treat these as "no AST available" and return an empty result.
     let mut parser = match Parser::new(language) {
         Ok(p) => p,
-        Err(_) => return Ok(AstFileResult::empty()),
+        Err(_) => return Ok(AstFileResult::default()),
     };
 
     let tree = match parser.parse(source) {
         Ok(t) => t,
-        Err(_) => return Ok(AstFileResult::empty()),
+        Err(_) => return Ok(AstFileResult::default()),
     };
 
-    let mut result = AstFileResult::empty();
+    let mut result = AstFileResult::default();
     let mut cursor = tree.walk();
 
     walk_tree(
         &mut cursor,
-        source.as_bytes(),
         vocab,
         &mut result.bigrams,
         &mut result.trigrams,
@@ -125,7 +114,6 @@ pub fn extract_ast_ngrams_from_file(
 #[allow(clippy::too_many_arguments)]
 fn walk_tree(
     cursor: &mut tree_sitter::TreeCursor,
-    _source: &[u8],
     vocab: &mut NodeKindVocabulary,
     bigrams: &mut HashSet<AstBigram>,
     trigrams: &mut HashSet<AstTrigram>,
@@ -182,7 +170,6 @@ fn walk_tree(
         loop {
             walk_tree(
                 cursor,
-                _source,
                 vocab,
                 bigrams,
                 trigrams,
@@ -257,7 +244,6 @@ pub fn extract_ast_ngrams_from_corpus(
         let mut lang_file_count: u32 = 0;
         let mut lang_error_nodes: u32 = 0;
         let mut lang_total_nodes: u32 = 0;
-        let mut lang_deduped: u32 = 0;
 
         for file in lang_files.iter() {
             progress.set_message(lang_name.clone());
@@ -265,7 +251,6 @@ pub fn extract_ast_ngrams_from_corpus(
 
             let hash = content_hash(&file.content);
             if !seen_hashes.insert(hash) {
-                lang_deduped += 1;
                 total_deduplicated += 1;
                 continue;
             }
@@ -299,8 +284,6 @@ pub fn extract_ast_ngrams_from_corpus(
                 *trigram_df.entry(trigram).or_default() += 1;
             }
         }
-
-        let _ = lang_deduped; // tracked in total_deduplicated
 
         language_stats.push(AstLanguageStats {
             language: lang_name,

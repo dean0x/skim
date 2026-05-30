@@ -146,14 +146,14 @@ fn write_vocabulary(buf: &mut Vec<u8>, vocabulary: &[String]) -> anyhow::Result<
 /// Produce a stable Rust identifier fragment from a language name.
 ///
 /// Examples: `"Rust"` → `"RUST"`, `"TypeScript"` → `"TYPESCRIPT"`,
-/// `"C++"` → `"CPP"`, `"C#"` → `"CSHARP"`.
+/// `"Cpp"` → `"CPP"`, `"CSharp"` → `"CSHARP"`, `"C"` → `"C"`.
+///
+/// Special characters (`+`, `#`, `-`, space) are replaced with `_` and
+/// consecutive underscores are collapsed.
 fn lang_to_ident(lang: &str) -> String {
     lang.chars()
         .map(|c| match c {
-            '+' => '_',
-            '#' => '_',
-            '-' => '_',
-            ' ' => '_',
+            '+' | '#' | '-' | ' ' => '_',
             _ => c.to_ascii_uppercase(),
         })
         .collect::<String>()
@@ -437,12 +437,14 @@ mod tests {
     }
 
     #[test]
-    fn lang_to_ident_handles_special_chars() {
+    fn lang_to_ident_handles_language_names() {
+        // Language strings match ast-corpus.toml values (not raw C++/C#).
         assert_eq!(lang_to_ident("Rust"), "RUST");
         assert_eq!(lang_to_ident("TypeScript"), "TYPESCRIPT");
-        assert_eq!(lang_to_ident("C++"), "C_");
-        assert_eq!(lang_to_ident("C#"), "C_");
+        assert_eq!(lang_to_ident("Cpp"), "CPP");
+        assert_eq!(lang_to_ident("CSharp"), "CSHARP");
         assert_eq!(lang_to_ident("C"), "C");
+        assert_eq!(lang_to_ident("JavaScript"), "JAVASCRIPT");
     }
 
     #[test]

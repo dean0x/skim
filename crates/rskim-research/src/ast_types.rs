@@ -60,6 +60,70 @@ pub fn decode_ast_trigram(trigram: AstTrigram) -> (NodeKindId, NodeKindId, NodeK
 }
 
 // ─────────────────────────────────────────────────────────
+// Re-keying after stabilize
+// ─────────────────────────────────────────────────────────
+
+/// Re-encode a bigram key using an old-to-new ID remap table.
+///
+/// Decodes the bigram into its (parent, child) IDs, remaps each through
+/// `remap[old_id]`, and re-encodes the result.
+///
+/// Returns `None` if either ID is out of bounds for the remap table.
+#[must_use]
+pub fn remap_bigram(bigram: AstBigram, remap: &[NodeKindId]) -> Option<AstBigram> {
+    let (parent, child) = decode_ast_bigram(bigram);
+    let new_parent = *remap.get(usize::from(parent))?;
+    let new_child = *remap.get(usize::from(child))?;
+    Some(encode_ast_bigram(new_parent, new_child))
+}
+
+/// Re-encode a trigram key using an old-to-new ID remap table.
+///
+/// Returns `None` if any ID is out of bounds for the remap table.
+#[must_use]
+pub fn remap_trigram(trigram: AstTrigram, remap: &[NodeKindId]) -> Option<AstTrigram> {
+    let (gp, parent, child) = decode_ast_trigram(trigram);
+    let new_gp = *remap.get(usize::from(gp))?;
+    let new_parent = *remap.get(usize::from(parent))?;
+    let new_child = *remap.get(usize::from(child))?;
+    Some(encode_ast_trigram(new_gp, new_parent, new_child))
+}
+
+/// Re-key an entire bigram document-frequency map using the remap table.
+///
+/// Entries whose IDs fall outside the remap table are silently dropped.
+#[must_use]
+pub fn rekey_bigram_df_map(
+    df_map: &HashMap<AstBigram, u32>,
+    remap: &[NodeKindId],
+) -> HashMap<AstBigram, u32> {
+    let mut new_map = HashMap::with_capacity(df_map.len());
+    for (&bigram, &count) in df_map {
+        if let Some(new_key) = remap_bigram(bigram, remap) {
+            *new_map.entry(new_key).or_default() += count;
+        }
+    }
+    new_map
+}
+
+/// Re-key an entire trigram document-frequency map using the remap table.
+///
+/// Entries whose IDs fall outside the remap table are silently dropped.
+#[must_use]
+pub fn rekey_trigram_df_map(
+    df_map: &HashMap<AstTrigram, u32>,
+    remap: &[NodeKindId],
+) -> HashMap<AstTrigram, u32> {
+    let mut new_map = HashMap::with_capacity(df_map.len());
+    for (&trigram, &count) in df_map {
+        if let Some(new_key) = remap_trigram(trigram, remap) {
+            *new_map.entry(new_key).or_default() += count;
+        }
+    }
+    new_map
+}
+
+// ─────────────────────────────────────────────────────────
 // Vocabulary
 // ─────────────────────────────────────────────────────────
 
@@ -88,9 +152,13 @@ impl NodeKindVocabulary {
         if let Some(&id) = self.kind_to_id.get(kind) {
             return id;
         }
-        // Safety: vocabulary must not exceed u16::MAX entries.
         // In practice tree-sitter grammars have O(100) node kinds per language,
-        // so this limit is never approached in normal usage.
+        // so the u16 limit is never approached in normal usage.
+        debug_assert!(
+            self.id_to_kind.len() < usize::from(NodeKindId::MAX),
+            "NodeKindVocabulary overflow: {} kinds exceeds u16::MAX",
+            self.id_to_kind.len()
+        );
         let id = self.id_to_kind.len() as NodeKindId;
         self.kind_to_id.insert(kind.to_string(), id);
         self.id_to_kind.push(kind.to_string());
@@ -130,18 +198,36 @@ impl NodeKindVocabulary {
     /// same IDs regardless of insertion order, making generated weight tables
     /// reproducible across corpus passes.
     ///
+    /// Returns a mapping from old IDs to new IDs so that callers can re-key
+    /// any bigram/trigram maps that were built with pre-stabilize IDs.
+    /// The returned vector is indexed by old ID; `remap[old_id] = new_id`.
+    ///
     /// **Important:** Any bigram/trigram keys computed *before* calling `stabilize`
-    /// are invalidated. Always stabilize the vocabulary *before* encoding final keys.
-    pub fn stabilize(&mut self) {
-        let mut kinds: Vec<String> = self.id_to_kind.drain(..).collect();
-        kinds.sort_unstable();
+    /// must be re-encoded using the returned remap table.
+    pub fn stabilize(&mut self) -> Vec<NodeKindId> {
+        // Build remap: for each old ID, record which kind it pointed to,
+        // then after sorting, look up the new ID for that kind.
+        let old_kinds: Vec<String> = self.id_to_kind.drain(..).collect();
+
+        let mut sorted_kinds = old_kinds.clone();
+        sorted_kinds.sort_unstable();
 
         self.kind_to_id.clear();
-        self.id_to_kind = kinds;
+        self.id_to_kind = sorted_kinds;
 
         for (new_id, kind) in self.id_to_kind.iter().enumerate() {
             self.kind_to_id.insert(kind.clone(), new_id as NodeKindId);
         }
+
+        // Build remap[old_id] = new_id.
+        old_kinds
+            .iter()
+            .map(|kind| {
+                // After stabilize, every kind that existed before must still exist.
+                // The indexing is safe because stabilize only reorders, never removes.
+                self.kind_to_id[kind]
+            })
+            .collect()
     }
 
     /// Returns all registered kind strings in sorted (alphabetical) order.
@@ -378,5 +464,68 @@ mod tests {
             restored.bigram_weights["Rust"][0].idf,
             table.bigram_weights["Rust"][0].idf
         );
+    }
+
+    // ── stabilize remap ──────────────────────────────────
+
+    #[test]
+    fn stabilize_returns_correct_remap() {
+        let mut vocab = NodeKindVocabulary::new();
+        // Insert in reverse alphabetical order: z=0, m=1, a=2
+        vocab.get_or_insert("z_kind");
+        vocab.get_or_insert("m_kind");
+        vocab.get_or_insert("a_kind");
+
+        let remap = vocab.stabilize();
+
+        // After stabilize: a_kind=0, m_kind=1, z_kind=2
+        // Old IDs: z_kind was 0, m_kind was 1, a_kind was 2
+        // remap[0] = new id of z_kind = 2
+        // remap[1] = new id of m_kind = 1
+        // remap[2] = new id of a_kind = 0
+        assert_eq!(remap, vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn remap_bigram_correctness() {
+        let mut vocab = NodeKindVocabulary::new();
+        vocab.get_or_insert("z_kind"); // old ID 0
+        vocab.get_or_insert("a_kind"); // old ID 1
+
+        // Bigram encoded with old IDs: parent=0 (z_kind), child=1 (a_kind)
+        let old_bigram = encode_ast_bigram(0, 1);
+
+        let remap = vocab.stabilize();
+        // After stabilize: a_kind=0, z_kind=1
+        // remap[0] = 1 (z_kind old:0 -> new:1)
+        // remap[1] = 0 (a_kind old:1 -> new:0)
+
+        let new_bigram = remap_bigram(old_bigram, &remap).unwrap();
+        let (new_parent, new_child) = decode_ast_bigram(new_bigram);
+
+        // parent was z_kind (new ID 1), child was a_kind (new ID 0)
+        assert_eq!(new_parent, 1);
+        assert_eq!(new_child, 0);
+        assert_eq!(vocab.resolve(new_parent), Some("z_kind"));
+        assert_eq!(vocab.resolve(new_child), Some("a_kind"));
+    }
+
+    #[test]
+    fn rekey_bigram_df_map_preserves_counts() {
+        let mut vocab = NodeKindVocabulary::new();
+        vocab.get_or_insert("z_kind"); // old ID 0
+        vocab.get_or_insert("a_kind"); // old ID 1
+
+        let old_bigram = encode_ast_bigram(0, 1);
+        let mut df_map = HashMap::new();
+        df_map.insert(old_bigram, 42u32);
+
+        let remap = vocab.stabilize();
+        let rekeyed = rekey_bigram_df_map(&df_map, &remap);
+
+        // The count should be preserved under the new key.
+        assert_eq!(rekeyed.len(), 1);
+        let new_bigram = remap_bigram(old_bigram, &remap).unwrap();
+        assert_eq!(rekeyed[&new_bigram], 42);
     }
 }

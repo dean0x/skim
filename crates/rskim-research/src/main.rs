@@ -17,6 +17,7 @@ use rskim_research::{
     idf, types, validate,
 };
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -225,16 +226,12 @@ fn resolve_corpus_dir(
     Ok((path, guard))
 }
 
-/// Clone/fetch all source files from each configured repo in parallel.
-fn fetch_all_files(
+/// Clone/fetch all source files from each configured repo in parallel using `source`.
+fn fetch_files_parallel(
     config: &config::CorpusConfig,
-    corpus_dir: &std::path::Path,
+    source: &impl FileSource,
 ) -> anyhow::Result<Vec<types::SourceFile>> {
     use rayon::prelude::*;
-
-    let source = clone::GitCloneSource {
-        corpus_dir: corpus_dir.to_path_buf(),
-    };
 
     let progress = ProgressBar::new(config.repos.len() as u64);
     if let Ok(style) =
@@ -262,6 +259,17 @@ fn fetch_all_files(
 
     progress.finish_with_message("done");
     Ok(all_files)
+}
+
+/// Clone/fetch all source files from each configured repo in parallel.
+fn fetch_all_files(
+    config: &config::CorpusConfig,
+    corpus_dir: &std::path::Path,
+) -> anyhow::Result<Vec<types::SourceFile>> {
+    let source = clone::GitCloneSource {
+        corpus_dir: corpus_dir.to_path_buf(),
+    };
+    fetch_files_parallel(config, &source)
 }
 
 /// Print validation summary to stderr.
@@ -390,27 +398,27 @@ fn cmd_ast_run(
 
     let mut vocab = ast_types::NodeKindVocabulary::new();
 
-    let (bigram_df_maps, trigram_df_maps, corpus_stats) =
+    let (raw_bigram_df_maps, raw_trigram_df_maps, corpus_stats) =
         ast_extract::extract_ast_ngrams_from_corpus(&all_files, &mut vocab, collect_trigrams);
 
-    vocab.stabilize();
+    // Stabilize the vocabulary (sort alphabetically, reassign IDs) and get the
+    // old→new ID remap table. All bigram/trigram keys in the DF maps were encoded
+    // with pre-stabilize IDs and must be re-keyed before IDF computation.
+    let remap = vocab.stabilize();
 
     eprintln!(
-        "Vocabulary: {} node kinds. Computing IDF weights...",
+        "Vocabulary: {} node kinds. Re-keying and computing IDF weights...",
         vocab.len()
     );
 
-    let mut bigram_weights_map: std::collections::HashMap<String, Vec<ast_types::AstBigramWeight>> =
-        std::collections::HashMap::new();
-    let mut trigram_weights_map: std::collections::HashMap<
-        String,
-        Vec<ast_types::AstTrigramWeight>,
-    > = std::collections::HashMap::new();
+    let mut bigram_weights_map: HashMap<String, Vec<ast_types::AstBigramWeight>> = HashMap::new();
+    let mut trigram_weights_map: HashMap<String, Vec<ast_types::AstTrigramWeight>> = HashMap::new();
 
     let total_docs = corpus_stats.total_files;
 
-    for (lang, df_map) in &bigram_df_maps {
-        let weights = ast_idf::compute_ast_bigram_weights(df_map, total_docs, threshold, &vocab);
+    for (lang, df_map) in &raw_bigram_df_maps {
+        let rekeyed = ast_types::rekey_bigram_df_map(df_map, &remap);
+        let weights = ast_idf::compute_ast_bigram_weights(&rekeyed, total_docs, threshold, &vocab);
         eprintln!(
             "  {lang}: {} bigrams (threshold={threshold})",
             weights.len()
@@ -418,8 +426,10 @@ fn cmd_ast_run(
         bigram_weights_map.insert(lang.clone(), weights);
     }
 
-    for (lang, df_map) in &trigram_df_maps {
-        let weights = ast_idf::compute_ast_trigram_weights(df_map, total_docs, threshold, &vocab);
+    for (lang, df_map) in &raw_trigram_df_maps {
+        let rekeyed = ast_types::rekey_trigram_df_map(df_map, &remap);
+        let weights =
+            ast_idf::compute_ast_trigram_weights(&rekeyed, total_docs, threshold, &vocab);
         eprintln!(
             "  {lang}: {} trigrams (threshold={threshold})",
             weights.len()
@@ -446,38 +456,10 @@ fn fetch_all_ast_files(
     config: &config::CorpusConfig,
     corpus_dir: &std::path::Path,
 ) -> anyhow::Result<Vec<types::SourceFile>> {
-    use rayon::prelude::*;
-
     let source = clone::AstGitCloneSource {
         corpus_dir: corpus_dir.to_path_buf(),
     };
-
-    let progress = ProgressBar::new(config.repos.len() as u64);
-    if let Ok(style) =
-        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40}] {pos}/{len} {msg}")
-    {
-        progress.set_style(style);
-    }
-
-    let all_files: Vec<types::SourceFile> = config
-        .repos
-        .par_iter()
-        .flat_map(|repo| {
-            progress.set_message(repo.url.clone());
-            let result = source.fetch_files(repo);
-            progress.inc(1);
-            match result {
-                Ok(files) => files,
-                Err(e) => {
-                    eprintln!("Warning: failed to fetch {}: {e:#}", repo.url);
-                    vec![]
-                }
-            }
-        })
-        .collect();
-
-    progress.finish_with_message("done");
-    Ok(all_files)
+    fetch_files_parallel(config, &source)
 }
 
 /// Serialize the AST weight table to JSON and write to output path.
