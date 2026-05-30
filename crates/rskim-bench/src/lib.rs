@@ -17,6 +17,7 @@
 //! - [`tuning`]   — coordinate descent parameter search
 //! - [`types`]    — shared data types
 
+pub mod cochange;
 pub mod configs;
 pub mod extract;
 pub mod harness;

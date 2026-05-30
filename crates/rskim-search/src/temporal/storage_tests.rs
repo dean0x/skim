@@ -498,7 +498,9 @@ fn cochanges_for_file_returns_highest_jaccard_first_with_many_rows() {
 
     // Insert 20 co-change rows for "src/hub.rs" with varying jaccard values.
     // The pair with jaccard=1.00 should always appear first regardless of
-    // insertion order.
+    // insertion order. Values below MIN_JACCARD_THRESHOLD (0.10) are filtered
+    // out by the query, so only partner_01 (0.10) through partner_19 (1.00)
+    // are returned — partner_00 (0.05) is excluded.
     let rows: Vec<CochangeRow> = (0..20_u32)
         .map(|i| CochangeRow {
             // "src/hub.rs" < "src/partner_NN.rs" lexically so file_a = hub.
@@ -511,7 +513,11 @@ fn cochanges_for_file_returns_highest_jaccard_first_with_many_rows() {
     db.store_cochanges(&rows).unwrap();
 
     let results = db.cochanges_for_file("src/hub.rs").unwrap();
-    assert_eq!(results.len(), 20, "all 20 rows should be returned");
+    assert_eq!(
+        results.len(),
+        19,
+        "pairs below MIN_JACCARD_THRESHOLD filtered out"
+    );
     // Verify the result is sorted descending by jaccard.
     for window in results.windows(2) {
         assert!(

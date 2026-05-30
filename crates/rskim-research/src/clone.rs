@@ -48,7 +48,7 @@ impl FileSource for GitCloneSource {
     }
 }
 
-fn extract_repo_name(url: &str) -> anyhow::Result<String> {
+pub fn extract_repo_name(url: &str) -> anyhow::Result<String> {
     let name = url
         .rsplit('/')
         .next()
@@ -67,29 +67,43 @@ fn extract_repo_name(url: &str) -> anyhow::Result<String> {
 /// Timeout for any single `git` subprocess (seconds).
 const GIT_SUBPROCESS_TIMEOUT_SECS: u64 = 300;
 
-/// Spawn a `git` command and wait for it to finish, killing it if it exceeds
-/// `GIT_SUBPROCESS_TIMEOUT_SECS`.  Returns `Ok(true)` on success, `Ok(false)`
-/// on non-zero exit, and `Err` if the process could not be spawned or the
-/// timeout expired.
-fn git_run_with_timeout(mut cmd: std::process::Command, label: &str) -> anyhow::Result<bool> {
+/// Spawn a child process, hand it to a wait closure on a background thread,
+/// and enforce a hard deadline.  Returns `Err` if spawning fails, the wait
+/// closure returns an error, or the deadline expires.
+///
+/// The wait strategy is parameterised so callers can use either `Child::wait`
+/// (discard output) or `Child::wait_with_output` (capture stdout/stderr)
+/// without duplicating the spawn/channel/kill/join boilerplate.
+///
+/// # Platform notes
+///
+/// On timeout the child is killed via SIGKILL (Unix) or `taskkill /F` (Windows)
+/// using the pid captured before the child is moved onto the background thread.
+/// The background thread is then joined; because the process has already been
+/// killed this join completes immediately.
+fn run_with_timeout<F, T>(
+    child: std::process::Child,
+    label: &str,
+    timeout_secs: u64,
+    wait_fn: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce(std::process::Child) -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let mut child = cmd.spawn().with_context(|| format!("spawning {label}"))?;
-
-    // Move blocking `wait()` onto a background thread so the main thread can
-    // enforce the deadline without using any unstable API.
-    let (tx, rx) = mpsc::channel();
-    // Move the child into the background thread for blocking wait.  Capture the
-    // pid first so we can send SIGKILL on timeout without needing the Child handle.
+    // Capture the pid before moving `child` onto the background thread so we
+    // can send SIGKILL without needing the `Child` handle back from the thread.
     let child_id = child.id();
-    std::thread::spawn(move || {
-        let result = child.wait();
-        let _ = tx.send(result);
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let _ = tx.send(wait_fn(child));
     });
 
-    match rx.recv_timeout(Duration::from_secs(GIT_SUBPROCESS_TIMEOUT_SECS)) {
-        Ok(Ok(status)) => Ok(status.success()),
+    match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+        Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => Err(anyhow::anyhow!("{label} wait error: {e}")),
         Err(_timeout) => {
             // Kill the process using its pid via a platform-appropriate signal.
@@ -110,9 +124,39 @@ fn git_run_with_timeout(mut cmd: std::process::Command, label: &str) -> anyhow::
                     .args(["/F", "/PID", &child_id.to_string()])
                     .status();
             }
-            anyhow::bail!("{label} timed out after {GIT_SUBPROCESS_TIMEOUT_SECS}s");
+            // Join the background thread: the killed process exits quickly, so
+            // this does not block indefinitely.  Joining prevents the thread
+            // from becoming permanently detached after SIGKILL.
+            let _ = handle.join();
+            anyhow::bail!("{label} timed out after {timeout_secs}s");
         }
     }
+}
+
+/// Spawn a `git` command and wait for it to finish, killing it if it exceeds
+/// `GIT_SUBPROCESS_TIMEOUT_SECS`.  Returns `Ok(true)` on success, `Ok(false)`
+/// on non-zero exit, and `Err` if the process could not be spawned or the
+/// timeout expired.
+pub fn git_run_with_timeout(mut cmd: std::process::Command, label: &str) -> anyhow::Result<bool> {
+    let child = cmd.spawn().with_context(|| format!("spawning {label}"))?;
+    run_with_timeout(child, label, GIT_SUBPROCESS_TIMEOUT_SECS, |mut c| {
+        c.wait().map(|s| s.success())
+    })
+}
+
+/// Spawn a `git` command and wait for its output, killing it if it exceeds
+/// `timeout_secs`.  Returns the captured [`std::process::Output`] on success.
+///
+/// Unlike [`git_run_with_timeout`], this variant uses `wait_with_output()` on
+/// the background thread so that stdout/stderr are captured for the caller.
+/// The `cmd` must have `stdout(Stdio::piped())` set by the caller.
+pub fn git_output_with_timeout(
+    mut cmd: std::process::Command,
+    label: &str,
+    timeout_secs: u64,
+) -> anyhow::Result<std::process::Output> {
+    let child = cmd.spawn().with_context(|| format!("spawning {label}"))?;
+    run_with_timeout(child, label, timeout_secs, |c| c.wait_with_output())
 }
 
 fn clone_repo(url: &str, commit: &str, dest: &Path) -> anyhow::Result<()> {
@@ -274,6 +318,66 @@ pub fn load_fixture_files(dir: &Path) -> anyhow::Result<Vec<SourceFile>> {
     walk_and_load(dir)
 }
 
+/// Clone a repository with full history (no `--depth 1`) for co-change analysis.
+///
+/// Unlike [`GitCloneSource`] which shallow-clones to a pinned commit, this
+/// function always performs a full clone and stays at HEAD.  Full history is
+/// required by [`rskim_search::temporal::GixSource`] to compute co-change
+/// signal across the entire commit log.
+///
+/// # Idempotency
+///
+/// If `dest` already exists the function returns `Ok(())` immediately without
+/// re-cloning, matching the behaviour of [`clone_repo`].
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - `url` fails the HTTPS prefix check (to guard against shell-injection via
+///   `git://` or `file://` schemes).
+/// - The `git clone` subprocess fails or times out.
+pub fn clone_with_history(url: &str, dest: &Path) -> anyhow::Result<()> {
+    if !url.starts_with("https://") {
+        anyhow::bail!("clone_with_history: url must start with 'https://', got: {url}");
+    }
+
+    // Skip if already cloned (idempotent).
+    //
+    // Verify that the directory contains a valid git repository, not just a
+    // leftover from a partial or interrupted clone.  A partial clone creates
+    // the destination directory but may not write `.git/HEAD`, so checking for
+    // that file distinguishes a complete clone from a broken one.
+    if dest.exists() {
+        if dest.join(".git").join("HEAD").exists() {
+            return Ok(());
+        }
+        // Partial clone detected: remove the broken directory and re-clone.
+        std::fs::remove_dir_all(dest)
+            .with_context(|| format!("removing partial clone at {}", dest.display()))?;
+    }
+
+    let security_args = [
+        "-c",
+        "credential.helper=",
+        "-c",
+        "transfer.fsckObjects=true",
+    ];
+
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(security_args)
+        .args(["clone", "--single-branch", url])
+        .arg(dest);
+
+    let ok = git_run_with_timeout(cmd, "git clone (full history)")
+        .with_context(|| format!("cloning {url} with full history"))?;
+
+    if !ok {
+        anyhow::bail!("git clone failed for {url}");
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -289,6 +393,7 @@ mod tests {
             url: "https://github.com/example/repo".to_string(),
             commit: "4649aa9700619f94cf9c66876e9549d83420e16c".to_string(),
             language: "Rust".to_string(),
+            deep_clone: false,
         }
     }
 

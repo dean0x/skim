@@ -1,0 +1,61 @@
+# Corpus configuration for co-change validation benchmark.
+#
+# These repos are selected for:
+#   - ≥6 months of active development history
+#   - ≥50 multi-file commits (co-change signal present)
+#   - At least 3 languages represented across the set
+#   - Medium-sized repos (not linux-scale)
+#
+# All entries use deep_clone = true so GixSource receives full git history.
+# The `language` field is required by the shared RepoEntry type but is not
+# used by the co-change validator (it operates on raw file paths).
+
+# ---- Rust ----
+
+[[repos]]
+url = "https://github.com/BurntSushi/ripgrep"
+commit = "4519153e5e461527f4bca45b042fff45c4ec6fb9"
+language = "Rust"
+deep_clone = true
+
+[[repos]]
+url = "https://github.com/sharkdp/fd"
+commit = "7f1b1471d5e3f88087eaad77885dc70968750bb3"
+language = "Rust"
+deep_clone = true
+
+# ---- Python ----
+
+[[repos]]
+url = "https://github.com/pallets/flask"
+commit = "7374c85ddefc3f4b177a698ab9f0cbb6a5c0b392"
+language = "Python"
+deep_clone = true
+
+[[repos]]
+url = "https://github.com/pydantic/pydantic"
+commit = "8a1a222b60131e517ed8f6c0387d296d181490c3"
+language = "Python"
+deep_clone = true
+
+# ---- Go ----
+
+[[repos]]
+url = "https://github.com/gin-gonic/gin"
+commit = "5f4f9643258dc2a65e684b63f12c8d543c936c67"
+language = "Go"
+deep_clone = true
+
+[[repos]]
+url = "https://github.com/gofiber/fiber"
+commit = "33b7fd4718f7d94e05214f424ed8d44bdd601836"
+language = "Go"
+deep_clone = true
+
+# ---- TypeScript ----
+
+[[repos]]
+url = "https://github.com/nestjs/nest"
+commit = "8ee0aa52a04410a34b49fe9a80b3857ba738468b"
+language = "TypeScript"
+deep_clone = true

@@ -12,6 +12,10 @@ publish = false
 name = "rskim-bench"
 path = "src/main.rs"
 
+[[bin]]
+name = "cochange-validate"
+path = "src/bin/cochange_validate.rs"
+
 [lib]
 name = "rskim_bench"
 path = "src/lib.rs"
@@ -31,6 +35,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
+
+[features]
+## Expose `cochange::test_utils` helpers to integration tests and external test
+## harnesses.  Not included in production builds by default.
+test-utils = []
+
+[dev-dependencies]
+# Enable test-utils so integration tests in tests/ can import cochange::test_utils.
+rskim-bench = { path = ".", features = ["test-utils"] }
 
 [lints.clippy]
 unwrap_used = "deny"
