@@ -583,23 +583,29 @@ where
 /// called before any thread is spawned (before analytics background threads,
 /// rayon pools, etc.).
 fn strip_skim_wrappers_from_path() {
-    let wrappers_dir = match dirs::home_dir() {
-        Some(h) => h.join(".skim").join("bin"),
+    let wrappers_dir = match cmd::skim_wrappers_dir() {
+        Some(d) => d,
         None => return,
     };
+    // Normalize wrappers_dir once so that trailing slashes, `..` segments, and
+    // symlinked parent paths do not defeat the equality check (PF-003).
+    let wrappers_dir_canonical: std::path::PathBuf =
+        wrappers_dir.components().collect();
     let path = match std::env::var_os("PATH") {
         Some(p) => p,
         None => return,
     };
     let filtered: Vec<_> = std::env::split_paths(&path)
-        .filter(|p| p != &wrappers_dir)
+        .filter(|p| {
+            let normalized: std::path::PathBuf = p.components().collect();
+            normalized != wrappers_dir_canonical
+        })
         .collect();
     if let Ok(new_path) = std::env::join_paths(&filtered) {
         // SAFETY: single-threaded at this point (before any thread spawn).
         // strip_skim_wrappers_from_path() is called as the very first
         // statement in main() before debug init, analytics init, rayon,
         // or any other thread-spawning code.
-        #[allow(unused_unsafe)]
         unsafe {
             std::env::set_var("PATH", &new_path);
         }

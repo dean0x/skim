@@ -32,26 +32,26 @@ use std::path::{Path, PathBuf};
 
 /// Summary of a wrapper installation run.
 #[derive(Debug, Default)]
-pub(crate) struct InstallResult {
+pub(super) struct InstallResult {
     /// Symlinks newly created.
-    pub(crate) created: usize,
+    pub(super) created: usize,
     /// Symlinks already pointing to the correct target (skipped).
-    pub(crate) skipped_correct: usize,
+    pub(super) skipped_correct: usize,
     /// Symlinks updated (old symlink removed and re-created with new target).
-    pub(crate) updated: usize,
+    pub(super) updated: usize,
     /// Non-symlink files that were skipped to avoid overwriting (PF-003).
-    pub(crate) skipped_non_symlink: usize,
+    pub(super) skipped_non_symlink: usize,
 }
 
 /// Summary of a wrapper uninstallation run.
 #[derive(Debug, Default)]
-pub(crate) struct UninstallResult {
+pub(super) struct UninstallResult {
     /// Skim-pointing symlinks that were removed.
-    pub(crate) removed: usize,
+    pub(super) removed: usize,
     /// Non-skim files that were preserved.
-    pub(crate) preserved: usize,
+    pub(super) preserved: usize,
     /// Whether `~/.skim/bin` was removed because it became empty.
-    pub(crate) dir_removed: bool,
+    pub(super) dir_removed: bool,
 }
 
 // ============================================================================
@@ -60,10 +60,10 @@ pub(crate) struct UninstallResult {
 
 /// Return `~/.skim/bin/` — the wrappers directory.
 ///
-/// Returns an error when the home directory cannot be determined.
-pub(crate) fn wrappers_dir() -> anyhow::Result<PathBuf> {
-    dirs::home_dir()
-        .map(|h| h.join(".skim").join("bin"))
+/// Delegates to [`crate::cmd::skim_wrappers_dir`] — the single authoritative
+/// source for this path — and wraps the `Option` in an `anyhow::Result`.
+pub(super) fn wrappers_dir() -> anyhow::Result<PathBuf> {
+    crate::cmd::skim_wrappers_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))
 }
 
@@ -72,7 +72,7 @@ pub(crate) fn wrappers_dir() -> anyhow::Result<PathBuf> {
 /// Delegates to [`crate::cmd::wrapper_targets()`]. Every entry corresponds to a
 /// known skim subcommand that wraps an external tool (i.e. not a meta/management
 /// subcommand).
-pub(crate) fn wrapper_targets() -> Vec<&'static str> {
+pub(super) fn wrapper_targets() -> &'static [&'static str] {
     crate::cmd::wrapper_targets()
 }
 
@@ -100,7 +100,7 @@ pub(crate) fn wrapper_targets() -> Vec<&'static str> {
 /// When `dry_run` is `true`, no filesystem changes are made. The function
 /// prints `[dry-run] Would create/update …` lines and returns a result
 /// with the counts of what *would* have changed.
-pub(crate) fn install_wrappers(skim_binary: &Path, dry_run: bool) -> anyhow::Result<InstallResult> {
+pub(super) fn install_wrappers(skim_binary: &Path, dry_run: bool) -> anyhow::Result<InstallResult> {
     let dir = wrappers_dir()?;
     let targets = wrapper_targets();
     let mut result = InstallResult::default();
@@ -117,7 +117,7 @@ pub(crate) fn install_wrappers(skim_binary: &Path, dry_run: bool) -> anyhow::Res
         }
     }
 
-    for &tool in &targets {
+    for &tool in targets {
         let link_path = dir.join(tool);
         install_one_symlink(&link_path, skim_binary, tool, dry_run, &mut result)?;
     }
@@ -127,7 +127,10 @@ pub(crate) fn install_wrappers(skim_binary: &Path, dry_run: bool) -> anyhow::Res
 
 /// Install (or update) a single symlink.
 ///
-/// Separated for readability; mutates `result` to record the outcome.
+/// Uses `symlink_metadata` as the single atomic entry point, eliminating the
+/// TOCTOU window that would exist if we first checked `exists()` / `is_symlink()`
+/// and then called `symlink_metadata` again. Three cases are each handled by a
+/// dedicated helper to keep cyclomatic complexity low.
 #[cfg(unix)]
 fn install_one_symlink(
     link_path: &Path,
@@ -136,60 +139,95 @@ fn install_one_symlink(
     dry_run: bool,
     result: &mut InstallResult,
 ) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(link_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            handle_existing_symlink(link_path, skim_binary, dry_run, result)
+        }
+        Ok(_) => {
+            // PF-003: non-symlink file — never overwrite.
+            handle_non_symlink(link_path, tool, result);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            handle_new_symlink(link_path, skim_binary, dry_run, result)
+        }
+        Err(e) => {
+            Err(anyhow::anyhow!("stat {}: {}", link_path.display(), e))
+        }
+    }
+}
+
+/// Handle the case where a symlink already exists at `link_path`.
+///
+/// If it points to the correct target, skip. Otherwise update it.
+#[cfg(unix)]
+fn handle_existing_symlink(
+    link_path: &Path,
+    skim_binary: &Path,
+    dry_run: bool,
+    result: &mut InstallResult,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::symlink;
 
-    if link_path.exists() || link_path.is_symlink() {
-        // Path exists — determine what kind of entry it is.
-        let meta = std::fs::symlink_metadata(link_path)
-            .map_err(|e| anyhow::anyhow!("stat {}: {}", link_path.display(), e))?;
+    let current_target = std::fs::read_link(link_path)
+        .map_err(|e| anyhow::anyhow!("read_link {}: {}", link_path.display(), e))?;
 
-        if meta.file_type().is_symlink() {
-            // Check where it points.
-            let current_target = std::fs::read_link(link_path).unwrap_or_default();
-            if current_target == skim_binary {
-                // Already correct — idempotent skip.
-                result.skipped_correct += 1;
-                return Ok(());
-            }
-            // Points somewhere else — update.
-            if dry_run {
-                println!(
-                    "  [dry-run] Would update: {} -> {}",
-                    link_path.display(),
-                    skim_binary.display()
-                );
-                result.updated += 1;
-                return Ok(());
-            }
-            std::fs::remove_file(link_path)
-                .map_err(|e| anyhow::anyhow!("remove {}: {}", link_path.display(), e))?;
-            symlink(skim_binary, link_path)
-                .map_err(|e| anyhow::anyhow!("symlink {}: {}", link_path.display(), e))?;
-            result.updated += 1;
-        } else {
-            // PF-003: non-symlink file — never overwrite.
-            eprintln!(
-                "  warning: skipping '{tool}' — {} is not a symlink (not a skim wrapper)",
-                link_path.display()
-            );
-            result.skipped_non_symlink += 1;
-        }
-    } else {
-        // Nothing exists — create the symlink.
-        if dry_run {
-            println!(
-                "  [dry-run] Would create: {} -> {}",
-                link_path.display(),
-                skim_binary.display()
-            );
-            result.created += 1;
-            return Ok(());
-        }
-        symlink(skim_binary, link_path)
-            .map_err(|e| anyhow::anyhow!("symlink {}: {}", link_path.display(), e))?;
-        result.created += 1;
+    if current_target == skim_binary {
+        result.skipped_correct += 1;
+        return Ok(());
     }
 
+    if dry_run {
+        println!(
+            "  [dry-run] Would update: {} -> {}",
+            link_path.display(),
+            skim_binary.display()
+        );
+        result.updated += 1;
+        return Ok(());
+    }
+
+    std::fs::remove_file(link_path)
+        .map_err(|e| anyhow::anyhow!("remove {}: {}", link_path.display(), e))?;
+    symlink(skim_binary, link_path)
+        .map_err(|e| anyhow::anyhow!("symlink {}: {}", link_path.display(), e))?;
+    result.updated += 1;
+    Ok(())
+}
+
+/// Handle the case where a non-symlink file exists at `link_path` (PF-003 safety).
+#[cfg(unix)]
+fn handle_non_symlink(link_path: &Path, tool: &str, result: &mut InstallResult) {
+    eprintln!(
+        "  warning: skipping '{tool}' — {} is not a symlink (not a skim wrapper)",
+        link_path.display()
+    );
+    result.skipped_non_symlink += 1;
+}
+
+/// Handle the case where nothing exists at `link_path` — create a new symlink.
+#[cfg(unix)]
+fn handle_new_symlink(
+    link_path: &Path,
+    skim_binary: &Path,
+    dry_run: bool,
+    result: &mut InstallResult,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    if dry_run {
+        println!(
+            "  [dry-run] Would create: {} -> {}",
+            link_path.display(),
+            skim_binary.display()
+        );
+        result.created += 1;
+        return Ok(());
+    }
+
+    symlink(skim_binary, link_path)
+        .map_err(|e| anyhow::anyhow!("symlink {}: {}", link_path.display(), e))?;
+    result.created += 1;
     Ok(())
 }
 
@@ -215,7 +253,12 @@ fn install_one_symlink(
 /// If the directory is empty after cleanup, it is removed.
 ///
 /// When `dry_run` is `true`, no filesystem changes are made.
-pub(crate) fn uninstall_wrappers(dry_run: bool) -> anyhow::Result<UninstallResult> {
+pub(super) fn uninstall_wrappers(dry_run: bool) -> anyhow::Result<UninstallResult> {
+    // Circuit breaker: ~/.skim/bin/ is managed entirely by skim and should
+    // never contain more entries than the maximum number of wrapper targets.
+    // A much larger count indicates a corrupted or adversarial directory.
+    const MAX_ENTRIES: usize = 256;
+
     let dir = wrappers_dir()?;
     let mut result = UninstallResult::default();
 
@@ -226,7 +269,16 @@ pub(crate) fn uninstall_wrappers(dry_run: bool) -> anyhow::Result<UninstallResul
     let entries =
         std::fs::read_dir(&dir).map_err(|e| anyhow::anyhow!("read {}: {}", dir.display(), e))?;
 
+    let mut count = 0usize;
     for entry in entries {
+        count += 1;
+        if count > MAX_ENTRIES {
+            anyhow::bail!(
+                "{} contains more than {MAX_ENTRIES} entries — aborting to avoid unbounded iteration",
+                dir.display()
+            );
+        }
+
         let entry = entry.map_err(|e| anyhow::anyhow!("read dir entry: {e}"))?;
         let path = entry.path();
 
@@ -244,10 +296,16 @@ pub(crate) fn uninstall_wrappers(dry_run: bool) -> anyhow::Result<UninstallResul
             continue;
         }
 
-        // Check if the symlink target contains "skim" or "rskim".
-        let target = std::fs::read_link(&path).unwrap_or_default();
-        let target_str = target.to_string_lossy();
-        if !target_str.contains("skim") && !target_str.contains("rskim") {
+        // Only remove symlinks whose filename stem is exactly "skim" or "rskim".
+        // Substring matching (e.g. contains("skim")) would incorrectly remove
+        // symlinks pointing to binaries like `/usr/local/bin/someskimmer`.
+        let target = std::fs::read_link(&path)
+            .map_err(|e| anyhow::anyhow!("read_link {}: {}", path.display(), e))?;
+        let stem = target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if stem != "skim" && stem != "rskim" {
             result.preserved += 1;
             continue;
         }
@@ -302,7 +360,7 @@ mod tests {
         let targets = wrapper_targets();
         let mut created = 0usize;
 
-        for &tool in &targets {
+        for &tool in targets {
             let link = install_dir.join(tool);
             std::os::unix::fs::symlink(&fake_skim, &link).unwrap();
             // verify
@@ -329,12 +387,12 @@ mod tests {
         let install_dir = tmp.path().join("bin");
         std::fs::create_dir_all(&install_dir).unwrap();
 
-        for &tool in &wrapper_targets() {
+        for &tool in wrapper_targets() {
             let link = install_dir.join(tool);
             std::os::unix::fs::symlink(&fake_skim, &link).unwrap();
         }
 
-        for &tool in &wrapper_targets() {
+        for &tool in wrapper_targets() {
             let link = install_dir.join(tool);
             let target = std::fs::read_link(&link).unwrap();
             assert_eq!(
@@ -423,20 +481,27 @@ mod tests {
     fn test_uninstall_removes_only_skim_symlinks() {
         use tempfile::TempDir;
 
+        // The skim binary target must have an exact filename stem of "skim" or
+        // "rskim" — `uninstall_wrappers` uses stem matching, not substring
+        // matching, to avoid removing symlinks pointing to binaries like
+        // `/usr/local/bin/someskimmer`.
         let tmp = TempDir::new().unwrap();
-        let fake_skim = tmp.path().join("the_skim_binary");
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let fake_skim = tmp.path().join("skim");
         let other_tool = tmp.path().join("other_tool");
         std::fs::write(&fake_skim, "").unwrap();
         std::fs::write(&other_tool, "").unwrap();
 
-        let skim_link = tmp.path().join("git");
-        let other_link = tmp.path().join("python");
+        let skim_link = bin_dir.join("git");
+        let other_link = bin_dir.join("python");
 
         std::os::unix::fs::symlink(&fake_skim, &skim_link).unwrap();
         std::os::unix::fs::symlink(&other_tool, &other_link).unwrap();
 
-        // Manually run the uninstall logic (checking target contains "skim").
-        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+        // Verify the exact-stem matching logic used by uninstall_wrappers.
+        let entries: Vec<_> = std::fs::read_dir(&bin_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
@@ -450,9 +515,9 @@ mod tests {
             if !meta.file_type().is_symlink() {
                 continue; // real files
             }
-            let target = std::fs::read_link(&path).unwrap_or_default();
-            let target_str = target.to_string_lossy();
-            if target_str.contains("skim") || target_str.contains("rskim") {
+            let target = std::fs::read_link(&path).unwrap();
+            let stem = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if stem == "skim" || stem == "rskim" {
                 removed += 1;
             } else {
                 preserved += 1;
@@ -461,6 +526,32 @@ mod tests {
 
         assert_eq!(removed, 1, "only the skim-pointing symlink must be removed");
         assert_eq!(preserved, 1, "non-skim symlink must be preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_uninstall_does_not_remove_symlink_to_someskimmer() {
+        // Regression guard: a symlink whose target filename contains "skim" as a
+        // substring but is not exactly "skim" or "rskim" must be preserved.
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        // `/usr/local/bin/someskimmer` — substring match would falsely remove this.
+        let look_alike = tmp.path().join("someskimmer");
+        std::fs::write(&look_alike, "").unwrap();
+
+        let link = bin_dir.join("git");
+        std::os::unix::fs::symlink(&look_alike, &link).unwrap();
+
+        let target = std::fs::read_link(&link).unwrap();
+        let stem = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert!(
+            stem != "skim" && stem != "rskim",
+            "someskimmer must NOT be classified as a skim binary (stem = {stem:?})"
+        );
     }
 
     #[cfg(unix)]

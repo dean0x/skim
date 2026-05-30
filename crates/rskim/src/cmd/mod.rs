@@ -51,6 +51,7 @@ pub(crate) mod ux;
 use std::borrow::Cow;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::output::ParseResult;
@@ -89,6 +90,16 @@ pub(crate) use crate::runner::MAX_OUTPUT_BYTES as MAX_STDIN_BYTES;
 /// respected consistently everywhere.
 pub(crate) fn resolve_cache_dir() -> Option<std::path::PathBuf> {
     hook_log::CacheEnv::from_process().resolve_cache_dir()
+}
+
+/// Single authoritative source for `~/.skim/bin/` — the PATH-wrappers directory.
+///
+/// Returns `None` when the home directory cannot be determined. Both
+/// `main::strip_skim_wrappers_from_path` (recursion prevention) and
+/// `cmd::init::wrappers::wrappers_dir` (installer/uninstaller) delegate here so
+/// that a future directory change requires only one edit.
+pub(crate) fn skim_wrappers_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".skim").join("bin"))
 }
 
 /// Core bounded read loop, injectable for testing.
@@ -279,9 +290,31 @@ pub(crate) const META_SUBCOMMANDS: &[&str] = &[
 ///
 /// Meta subcommands are skim's own management commands and are NOT valid
 /// wrapper targets (see [`META_SUBCOMMANDS`]).
+///
+/// Uses binary search because `META_SUBCOMMANDS` is sorted — O(log n) vs O(n)
+/// for `.contains()`. At 10 entries the difference is negligible per call, but
+/// this runs on every invocation via `detect_argv0_for()` so correctness of the
+/// invariant matters more than the raw savings.
+///
+/// INVARIANT: `META_SUBCOMMANDS` must remain sorted. The
+/// `test_meta_subcommands_are_sorted` test enforces this.
 pub(crate) fn is_meta_subcommand(name: &str) -> bool {
-    META_SUBCOMMANDS.contains(&name)
+    META_SUBCOMMANDS.binary_search(&name).is_ok()
 }
+
+/// Precomputed list of wrapper targets — computed once at first use via [`LazyLock`].
+///
+/// Filtering `KNOWN_SUBCOMMANDS` against `META_SUBCOMMANDS` on every
+/// `wrapper_targets()` call allocates a new `Vec`. Since the result is
+/// deterministic (both arrays are `'static` and never mutated), we pay the
+/// allocation cost once and return a reference to it on every subsequent call.
+static WRAPPER_TARGETS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    KNOWN_SUBCOMMANDS
+        .iter()
+        .filter(|&&name| !is_meta_subcommand(name))
+        .copied()
+        .collect()
+});
 
 /// Return the list of subcommand names that are valid wrapper targets.
 ///
@@ -290,12 +323,11 @@ pub(crate) fn is_meta_subcommand(name: &str) -> bool {
 ///
 /// Used by the wrapper installer to determine which symlinks to create in
 /// `~/.skim/bin/`.
-pub(crate) fn wrapper_targets() -> Vec<&'static str> {
-    KNOWN_SUBCOMMANDS
-        .iter()
-        .filter(|&&name| !is_meta_subcommand(name))
-        .copied()
-        .collect()
+///
+/// Returns a reference to a precomputed static list — no allocation on repeated
+/// calls (see [`WRAPPER_TARGETS`]).
+pub(crate) fn wrapper_targets() -> &'static [&'static str] {
+    &WRAPPER_TARGETS
 }
 
 /// Check whether `name` is a registered subcommand.
@@ -1967,5 +1999,20 @@ mod tests {
                 "is_meta_subcommand('{name}') returned true — tool wrappers must return false"
             );
         }
+    }
+
+    /// META_SUBCOMMANDS must remain sorted so that `is_meta_subcommand` can use
+    /// binary search instead of a linear scan.
+    ///
+    /// If this test fails, re-sort the array in `META_SUBCOMMANDS` definition.
+    #[test]
+    fn test_meta_subcommands_are_sorted() {
+        let mut sorted = META_SUBCOMMANDS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            META_SUBCOMMANDS, sorted.as_slice(),
+            "META_SUBCOMMANDS is not sorted — binary_search in is_meta_subcommand() requires \
+             the array to be in ascending lexicographic order"
+        );
     }
 }
