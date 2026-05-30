@@ -20,7 +20,7 @@ mod helpers;
 mod install;
 mod state;
 mod uninstall;
-pub(crate) mod wrappers;
+pub(super) mod wrappers;
 
 use std::process::ExitCode;
 
