@@ -292,8 +292,7 @@ pub(crate) fn walk_and_load(
 
     // Build a HashSet once before the walk so extension lookup is O(1) per entry
     // instead of O(n) linear scan through the slice.
-    let allowed_set: Option<HashSet<&str>> =
-        extensions.map(|exts| exts.iter().copied().collect());
+    let allowed_set: Option<HashSet<&str>> = extensions.map(|exts| exts.iter().copied().collect());
 
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false) // include dot-files but .gitignore is respected

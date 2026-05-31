@@ -35,16 +35,26 @@ pub(super) fn cmd_ast_run(
         all_files.len()
     );
 
-    let table =
-        ast_pipeline::build_ast_weight_table(&all_files, threshold, collect_trigrams, &chrono_now());
+    let table = ast_pipeline::build_ast_weight_table(
+        &all_files,
+        threshold,
+        collect_trigrams,
+        &chrono_now(),
+    );
 
     eprintln!("Vocabulary: {} node kinds.", table.vocabulary.len());
     for (lang, weights) in &table.bigram_weights {
-        eprintln!("  {lang}: {} bigrams (threshold={threshold})", weights.len());
+        eprintln!(
+            "  {lang}: {} bigrams (threshold={threshold})",
+            weights.len()
+        );
     }
     for (lang, weights) in &table.trigram_weights {
         if !weights.is_empty() {
-            eprintln!("  {lang}: {} trigrams (threshold={threshold})", weights.len());
+            eprintln!(
+                "  {lang}: {} trigrams (threshold={threshold})",
+                weights.len()
+            );
         }
     }
 

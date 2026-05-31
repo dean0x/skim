@@ -580,9 +580,16 @@ mod tests {
         let rekeyed = rekey_bigram_df_map(&df_map, &remap);
 
         // Collision: both entries map to the same key; counts must be summed.
-        assert_eq!(rekeyed.len(), 1, "colliding bigrams must merge into one entry");
+        assert_eq!(
+            rekeyed.len(),
+            1,
+            "colliding bigrams must merge into one entry"
+        );
         let merged_key = encode_ast_bigram(0, 0);
-        assert_eq!(rekeyed[&merged_key], 20, "collision counts must be summed: 10 + 10 = 20");
+        assert_eq!(
+            rekeyed[&merged_key], 20,
+            "collision counts must be summed: 10 + 10 = 20"
+        );
     }
 
     #[test]
