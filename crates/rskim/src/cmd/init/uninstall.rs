@@ -272,7 +272,10 @@ mod tests {
         let arr = settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(arr.len(), 1, "only the non-skim entry must remain");
         assert!(
-            arr[0]["hooks"][0]["command"].as_str().unwrap().contains("other"),
+            arr[0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("other"),
             "the non-skim entry must be preserved"
         );
     }

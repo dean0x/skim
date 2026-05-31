@@ -35,8 +35,7 @@ use rskim_core::{Language, Mode};
 /// `cmd::dispatch()`).  `strip_skim_wrappers_from_path()` asserts this is
 /// still `false` so that a future reordering of `main()` is caught at
 /// runtime rather than silently producing a data race on `set_var`.
-static THREADS_SPAWNED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static THREADS_SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ============================================================================
 // Pre-parse routing (subcommand disambiguation)
@@ -1339,7 +1338,11 @@ mod tests {
             .expect("wrappers dir present — filter must return Some");
         let filtered: Vec<_> = std::env::split_paths(&result).collect();
 
-        assert_eq!(filtered.len(), 1, "both duplicate wrappers entries must be removed");
+        assert_eq!(
+            filtered.len(),
+            1,
+            "both duplicate wrappers entries must be removed"
+        );
         assert_eq!(filtered[0], other, "only /usr/bin must remain");
     }
 
@@ -1360,14 +1363,8 @@ mod tests {
     /// Bare binary name: stem is the name itself.
     #[test]
     fn test_extract_argv0_stem_bare_name() {
-        assert_eq!(
-            extract_argv0_stem("skim").as_deref(),
-            Some("skim"),
-        );
-        assert_eq!(
-            extract_argv0_stem("rskim").as_deref(),
-            Some("rskim"),
-        );
+        assert_eq!(extract_argv0_stem("skim").as_deref(), Some("skim"),);
+        assert_eq!(extract_argv0_stem("rskim").as_deref(), Some("rskim"),);
     }
 
     /// Deep nested path resolves correctly.
@@ -1394,10 +1391,7 @@ mod tests {
         // An empty string has no file name component.
         let result = extract_argv0_stem("");
         // Path::new("").file_stem() returns None on all platforms.
-        assert!(
-            result.is_none(),
-            "empty argv0 must yield None"
-        );
+        assert!(result.is_none(), "empty argv0 must yield None");
     }
 
     /// Path with extension: stem strips the extension (covers Windows .exe).

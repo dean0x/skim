@@ -2034,7 +2034,8 @@ mod tests {
         let mut sorted = META_SUBCOMMANDS.to_vec();
         sorted.sort_unstable();
         assert_eq!(
-            META_SUBCOMMANDS, sorted.as_slice(),
+            META_SUBCOMMANDS,
+            sorted.as_slice(),
             "META_SUBCOMMANDS is not sorted — binary_search in is_meta_subcommand() requires \
              the array to be in ascending lexicographic order"
         );
@@ -2049,7 +2050,8 @@ mod tests {
         let mut sorted = KNOWN_SUBCOMMANDS.to_vec();
         sorted.sort_unstable();
         assert_eq!(
-            KNOWN_SUBCOMMANDS, sorted.as_slice(),
+            KNOWN_SUBCOMMANDS,
+            sorted.as_slice(),
             "KNOWN_SUBCOMMANDS is not sorted — binary_search in is_known_subcommand() requires \
              the array to be in ascending lexicographic order"
         );

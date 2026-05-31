@@ -51,9 +51,7 @@ pub(super) fn resolve_instruction_path(
 ///
 /// Returns `Ok(None)` when the file should be skipped (too large or unreadable),
 /// which is treated as a soft warning rather than a hard error.
-pub(super) fn read_existing_safely(
-    path: &std::path::Path,
-) -> anyhow::Result<Option<String>> {
+pub(super) fn read_existing_safely(path: &std::path::Path) -> anyhow::Result<Option<String>> {
     if let Ok(meta) = std::fs::metadata(path)
         && meta.len() > MAX_INSTRUCTION_FILE_SIZE
     {
@@ -78,10 +76,7 @@ pub(super) fn read_existing_safely(
 }
 
 /// Write `new_content` as a new instruction file at `path` (create mode).
-pub(super) fn guidance_create(
-    path: &std::path::Path,
-    new_content: &str,
-) -> anyhow::Result<()> {
+pub(super) fn guidance_create(path: &std::path::Path, new_content: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -299,10 +294,7 @@ pub(super) fn strip_skim_section(content: &str) -> Option<String> {
 /// correct filesystem entry (e.g. `skim.mdc.tmp` → `skim.mdc`).
 ///
 /// Cleans up the tmp file on both write and rename failures (S1).
-pub(super) fn atomic_write_stripped(
-    path: &std::path::Path,
-    content: &str,
-) -> anyhow::Result<()> {
+pub(super) fn atomic_write_stripped(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
     // Build tmp extension: "<original_ext>.tmp" or "tmp" if no extension.
     let tmp_ext = match path.extension().and_then(|e| e.to_str()) {
         Some(ext) => format!("{ext}.tmp"),

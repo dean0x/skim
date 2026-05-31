@@ -168,9 +168,7 @@ fn install_one_symlink(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             handle_new_symlink(link_path, skim_binary, dry_run, result)
         }
-        Err(e) => {
-            Err(anyhow::anyhow!("stat {}: {}", link_path.display(), e))
-        }
+        Err(e) => Err(anyhow::anyhow!("stat {}: {}", link_path.display(), e)),
     }
 }
 
@@ -570,7 +568,10 @@ mod tests {
         // Call the real function with the temp directory.
         let result = uninstall_wrappers_in(&bin_dir, false).unwrap();
 
-        assert_eq!(result.removed, 1, "only the skim-pointing symlink must be removed");
+        assert_eq!(
+            result.removed, 1,
+            "only the skim-pointing symlink must be removed"
+        );
         assert_eq!(result.preserved, 1, "non-skim symlink must be preserved");
 
         // The skim-pointing symlink must be gone.
@@ -627,7 +628,10 @@ mod tests {
 
         let result = uninstall_wrappers_in(&bin_dir, false).unwrap();
 
-        assert_eq!(result.removed, 0, "someskimmer-pointing symlink must be preserved");
+        assert_eq!(
+            result.removed, 0,
+            "someskimmer-pointing symlink must be preserved"
+        );
         assert_eq!(result.preserved, 1, "non-skim symlink must be preserved");
         assert!(link.is_symlink(), "the symlink must still exist");
     }
