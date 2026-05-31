@@ -17,6 +17,8 @@ use rskim_research::{
     idf, types, validate,
 };
 
+use serde::Serialize;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -292,21 +294,32 @@ fn default_json_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("bigram_weights.json"))
 }
 
-/// Serialize the weight table to JSON and write it to the output path.
-fn write_weight_table(table: &types::WeightTable, output: Option<PathBuf>) -> anyhow::Result<()> {
-    let output_path = output.unwrap_or_else(default_json_path);
-
+/// Serialize a JSON-serializable value to the given output path (creating parent
+/// directories if needed). `label` is used only in the error/log messages so the
+/// caller can distinguish between table types in stderr output.
+fn write_json_table<T: Serialize>(
+    table: &T,
+    output_path: PathBuf,
+    label: &str,
+) -> anyhow::Result<()> {
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating output directory {}", parent.display()))?;
     }
 
-    let json = serde_json::to_string_pretty(table).context("serializing weight table")?;
+    let json =
+        serde_json::to_string_pretty(table).with_context(|| format!("serializing {label}"))?;
     std::fs::write(&output_path, json)
         .with_context(|| format!("writing {}", output_path.display()))?;
 
     eprintln!("Written: {}", output_path.display());
     Ok(())
+}
+
+/// Serialize the weight table to JSON and write it to the output path.
+fn write_weight_table(table: &types::WeightTable, output: Option<PathBuf>) -> anyhow::Result<()> {
+    let output_path = output.unwrap_or_else(default_json_path);
+    write_json_table(table, output_path, "weight table")
 }
 
 fn cmd_codegen(json_path: Option<PathBuf>, workspace_root: Option<PathBuf>) -> anyhow::Result<()> {
@@ -446,38 +459,28 @@ fn cmd_ast_run(
     };
 
     write_ast_weight_table(&table, output)?;
-
-    // Print a brief per-language summary to stderr so the user can assess quality
-    // without having to run ast-validate separately. Mirrors the feedback provided
-    // by cmd_run's log_validation_summary for the lexical pipeline.
-    eprintln!("=== AST weight table summary ===");
-    eprintln!("Vocabulary: {} node kinds", table.vocabulary.len());
-    let mut sorted_langs: Vec<&String> = table.bigram_weights.keys().collect();
-    sorted_langs.sort();
-    for lang in sorted_langs {
-        let bigrams = &table.bigram_weights[lang];
-        let trigrams = table.trigram_weights.get(lang).map_or(0, Vec::len);
-        let lang_stats = table
-            .corpus_stats
-            .language_stats
-            .iter()
-            .find(|s| &s.language == lang);
-        let error_rate = lang_stats
-            .map(|s| {
-                if s.total_node_count == 0 {
-                    0.0_f32
-                } else {
-                    100.0 * s.error_node_count as f32 / s.total_node_count as f32
-                }
-            })
-            .unwrap_or(0.0);
-        eprintln!(
-            "  {lang}: {} bigrams, {trigrams} trigrams, error_rate={error_rate:.2}%",
-            bigrams.len()
-        );
-    }
+    log_ast_summary(&table);
 
     Ok(())
+}
+
+/// Print a compact per-language summary to stderr so the user can assess quality
+/// without running `ast-validate` separately. Mirrors the feedback provided by
+/// `cmd_run`'s `log_validation_summary` for the lexical pipeline.
+///
+/// Reuses `run_ast_validation` for error-rate computation to avoid duplicating
+/// the formula that lives in `ast_validate`.
+fn log_ast_summary(table: &ast_types::AstWeightTable) {
+    let report = ast_validate::run_ast_validation(table);
+    eprintln!("=== AST weight table summary ===");
+    eprintln!("Vocabulary: {} node kinds", report.vocabulary_size);
+    for lang_report in &report.per_language {
+        let lang = &lang_report.bigram_distribution.language;
+        let bigrams = lang_report.bigram_distribution.count;
+        let trigrams = lang_report.trigram_distribution.count;
+        let error_rate = lang_report.error_node_rate * 100.0;
+        eprintln!("  {lang}: {bigrams} bigrams, {trigrams} trigrams, error_rate={error_rate:.2}%");
+    }
 }
 
 /// Clone/fetch all source files for the AST corpus using the AST extension walker.
@@ -500,18 +503,7 @@ fn write_ast_weight_table(
         ast_codegen::default_ast_weights_json_path()
             .unwrap_or_else(|_| PathBuf::from("ast_weights.json"))
     });
-
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating output directory {}", parent.display()))?;
-    }
-
-    let json = serde_json::to_string_pretty(table).context("serializing AST weight table")?;
-    std::fs::write(&output_path, json)
-        .with_context(|| format!("writing {}", output_path.display()))?;
-
-    eprintln!("Written: {}", output_path.display());
-    Ok(())
+    write_json_table(table, output_path, "AST weight table")
 }
 
 fn cmd_ast_codegen(
