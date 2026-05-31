@@ -252,8 +252,8 @@ impl NodeKindVocabulary {
     /// the stable ID assignment.  Call only after `stabilize` when sorted output
     /// is required.
     #[must_use]
-    pub fn kinds(&self) -> Vec<&str> {
-        self.id_to_kind.iter().map(String::as_str).collect()
+    pub fn kinds(&self) -> &[String] {
+        &self.id_to_kind
     }
 }
 

@@ -59,6 +59,12 @@ fn validate_ast_table(table: &AstWeightTable) -> anyhow::Result<()> {
     if table.vocabulary.is_empty() {
         anyhow::bail!("AST weight table vocabulary is empty");
     }
+    if table.bigram_weights.is_empty() {
+        anyhow::bail!("AST weight table has no bigram weights");
+    }
+    if table.trigram_weights.is_empty() {
+        anyhow::bail!("AST weight table has no trigram weights");
+    }
 
     for (lang, bigrams) in &table.bigram_weights {
         for w in bigrams {
@@ -150,7 +156,14 @@ fn write_vocabulary(buf: &mut Vec<u8>, vocabulary: &[String]) -> anyhow::Result<
 ///
 /// Special characters (`+`, `#`, `-`, space) are replaced with `_` and
 /// consecutive underscores (runs of any length) are collapsed to a single `_`.
-fn lang_to_ident(lang: &str) -> String {
+///
+/// # Errors
+///
+/// Returns an error if the resulting identifier is empty, starts with a digit,
+/// or contains a character that is not ASCII alphanumeric or `_`. These are
+/// hard production errors because the output is written verbatim into generated
+/// Rust source files.
+fn lang_to_ident(lang: &str) -> anyhow::Result<String> {
     let mapped: String = lang
         .chars()
         .map(|c| match c {
@@ -174,31 +187,103 @@ fn lang_to_ident(lang: &str) -> String {
         }
     }
 
-    debug_assert!(
-        result
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_alphabetic() || c == '_')
-            .unwrap_or(false),
-        "lang_to_ident produced an empty or non-identifier-starting string for input: {lang:?}"
-    );
-    debug_assert!(
-        result
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_'),
-        "lang_to_ident produced a non-identifier character for input: {lang:?}"
-    );
+    // Production guard: reject identifiers that would produce invalid Rust code.
+    // These are hard errors (not debug_assert!) because lang_to_ident output is
+    // written verbatim into generated source files.
+    if !result
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_alphabetic() || c == '_')
+        .unwrap_or(false)
+    {
+        anyhow::bail!(
+            "lang_to_ident produced an empty or non-identifier-starting string for language \
+             {lang:?} (result: {result:?}) — check the language name in the weight table"
+        );
+    }
+    if !result
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        anyhow::bail!(
+            "lang_to_ident produced a non-identifier character for language {lang:?} \
+             (result: {result:?}) — only ASCII alphanumeric and '_' are allowed in Rust identifiers"
+        );
+    }
 
-    result
+    Ok(result)
+}
+
+/// Collect the language keys from a HashMap, sort them, and resolve each to a
+/// Rust identifier via `lang_to_ident`.
+///
+/// Returns a vector of `(lang_name, ident)` pairs in ascending language-name order,
+/// or an error if any name fails identifier validation.
+fn sorted_lang_idents<V>(
+    map: &std::collections::HashMap<String, V>,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut langs: Vec<&String> = map.keys().collect();
+    langs.sort();
+    langs
+        .into_iter()
+        .map(|lang| lang_to_ident(lang).map(|ident| (lang.clone(), ident)))
+        .collect()
+}
+
+/// Write a `binary_search_by_key` lookup function into `buf`.
+///
+/// Parameters:
+/// - `fn_doc`       — first doc-comment line (e.g. `"/// Look up the IDF weight …"`).
+/// - `fn_name`      — bare function name (e.g. `"ast_bigram_weight"`).
+/// - `param_name`   — key parameter name in the generated signature (`"bigram"` or `"trigram"`).
+/// - `key_type`     — Rust type for the key (`"u32"` or `"u64"`).
+/// - `const_suffix` — suffix for the const array name (e.g. `"BIGRAM_WEIGHTS"`).
+/// - `lang_idents`  — sorted `(lang_name, ident)` pairs.
+fn write_lookup_fn(
+    buf: &mut Vec<u8>,
+    fn_doc: &str,
+    fn_name: &str,
+    param_name: &str,
+    key_type: &str,
+    const_suffix: &str,
+    lang_idents: &[(String, String)],
+) -> anyhow::Result<()> {
+    writeln!(buf, "{fn_doc}")?;
+    writeln!(buf, "///")?;
+    writeln!(
+        buf,
+        "/// Returns `None` if the language or {param_name} is not in the table."
+    )?;
+    writeln!(buf, "#[must_use]")?;
+    writeln!(
+        buf,
+        "pub fn {fn_name}(lang: &str, {param_name}: {key_type}) -> Option<f32> {{"
+    )?;
+    writeln!(buf, "    let table: &[({key_type}, f32)] = match lang {{")?;
+    for (lang, ident) in lang_idents {
+        writeln!(
+            buf,
+            "        {:?} => {ident}_AST_{const_suffix},",
+            lang.as_str()
+        )?;
+    }
+    writeln!(buf, "        _ => return None,")?;
+    writeln!(buf, "    }};")?;
+    writeln!(buf, "    table")?;
+    writeln!(
+        buf,
+        "        .binary_search_by_key(&{param_name}, |&(k, _)| k)"
+    )?;
+    writeln!(buf, "        .ok()")?;
+    writeln!(buf, "        .map(|idx| table[idx].1)")?;
+    writeln!(buf, "}}")?;
+    writeln!(buf)?;
+    Ok(())
 }
 
 fn write_language_bigram_arrays(buf: &mut Vec<u8>, table: &AstWeightTable) -> anyhow::Result<()> {
-    let mut sorted_langs: Vec<&String> = table.bigram_weights.keys().collect();
-    sorted_langs.sort();
-
-    for lang in sorted_langs {
-        let weights = &table.bigram_weights[lang];
-        let ident = lang_to_ident(lang);
+    for (lang, ident) in sorted_lang_idents(&table.bigram_weights)? {
+        let weights = &table.bigram_weights[&lang];
 
         // Sort by bigram key ascending for binary search.
         let mut sorted: Vec<_> = weights.iter().collect();
@@ -227,12 +312,8 @@ fn write_language_bigram_arrays(buf: &mut Vec<u8>, table: &AstWeightTable) -> an
 }
 
 fn write_language_trigram_arrays(buf: &mut Vec<u8>, table: &AstWeightTable) -> anyhow::Result<()> {
-    let mut sorted_langs: Vec<&String> = table.trigram_weights.keys().collect();
-    sorted_langs.sort();
-
-    for lang in sorted_langs {
-        let weights = &table.trigram_weights[lang];
-        let ident = lang_to_ident(lang);
+    for (lang, ident) in sorted_lang_idents(&table.trigram_weights)? {
+        let weights = &table.trigram_weights[&lang];
 
         // Sort by trigram key ascending for binary search.
         let mut sorted: Vec<_> = weights.iter().collect();
@@ -261,71 +342,27 @@ fn write_language_trigram_arrays(buf: &mut Vec<u8>, table: &AstWeightTable) -> a
 }
 
 fn write_bigram_lookup_fn(buf: &mut Vec<u8>, table: &AstWeightTable) -> anyhow::Result<()> {
-    writeln!(
+    write_lookup_fn(
         buf,
-        "/// Look up the IDF weight of an AST bigram for a given language."
-    )?;
-    writeln!(buf, "///")?;
-    writeln!(
-        buf,
-        "/// Returns `None` if the language or bigram is not in the table."
-    )?;
-    writeln!(buf, "#[must_use]")?;
-    writeln!(
-        buf,
-        "pub fn ast_bigram_weight(lang: &str, bigram: u32) -> Option<f32> {{"
-    )?;
-    writeln!(buf, "    let table: &[(u32, f32)] = match lang {{")?;
-
-    let mut sorted_langs: Vec<&String> = table.bigram_weights.keys().collect();
-    sorted_langs.sort();
-    for lang in sorted_langs {
-        let ident = lang_to_ident(lang);
-        writeln!(buf, "        {:?} => {ident}_AST_BIGRAM_WEIGHTS,", lang)?;
-    }
-    writeln!(buf, "        _ => return None,")?;
-    writeln!(buf, "    }};")?;
-    writeln!(buf, "    table")?;
-    writeln!(buf, "        .binary_search_by_key(&bigram, |&(k, _)| k)")?;
-    writeln!(buf, "        .ok()")?;
-    writeln!(buf, "        .map(|idx| table[idx].1)")?;
-    writeln!(buf, "}}")?;
-    writeln!(buf)?;
-    Ok(())
+        "/// Look up the IDF weight of an AST bigram for a given language.",
+        "ast_bigram_weight",
+        "bigram",
+        "u32",
+        "BIGRAM_WEIGHTS",
+        &sorted_lang_idents(&table.bigram_weights)?,
+    )
 }
 
 fn write_trigram_lookup_fn(buf: &mut Vec<u8>, table: &AstWeightTable) -> anyhow::Result<()> {
-    writeln!(
+    write_lookup_fn(
         buf,
-        "/// Look up the IDF weight of an AST trigram for a given language."
-    )?;
-    writeln!(buf, "///")?;
-    writeln!(
-        buf,
-        "/// Returns `None` if the language or trigram is not in the table."
-    )?;
-    writeln!(buf, "#[must_use]")?;
-    writeln!(
-        buf,
-        "pub fn ast_trigram_weight(lang: &str, trigram: u64) -> Option<f32> {{"
-    )?;
-    writeln!(buf, "    let table: &[(u64, f32)] = match lang {{")?;
-
-    let mut sorted_langs: Vec<&String> = table.trigram_weights.keys().collect();
-    sorted_langs.sort();
-    for lang in sorted_langs {
-        let ident = lang_to_ident(lang);
-        writeln!(buf, "        {:?} => {ident}_AST_TRIGRAM_WEIGHTS,", lang)?;
-    }
-    writeln!(buf, "        _ => return None,")?;
-    writeln!(buf, "    }};")?;
-    writeln!(buf, "    table")?;
-    writeln!(buf, "        .binary_search_by_key(&trigram, |&(k, _)| k)")?;
-    writeln!(buf, "        .ok()")?;
-    writeln!(buf, "        .map(|idx| table[idx].1)")?;
-    writeln!(buf, "}}")?;
-    writeln!(buf)?;
-    Ok(())
+        "/// Look up the IDF weight of an AST trigram for a given language.",
+        "ast_trigram_weight",
+        "trigram",
+        "u64",
+        "TRIGRAM_WEIGHTS",
+        &sorted_lang_idents(&table.trigram_weights)?,
+    )
 }
 
 fn write_ast_generated_tests(buf: &mut Vec<u8>) -> anyhow::Result<()> {
@@ -496,24 +533,45 @@ mod tests {
     #[test]
     fn lang_to_ident_handles_language_names() {
         // Language strings match ast-corpus.toml values (not raw C++/C#).
-        assert_eq!(lang_to_ident("Rust"), "RUST");
-        assert_eq!(lang_to_ident("TypeScript"), "TYPESCRIPT");
-        assert_eq!(lang_to_ident("Cpp"), "CPP");
-        assert_eq!(lang_to_ident("CSharp"), "CSHARP");
-        assert_eq!(lang_to_ident("C"), "C");
-        assert_eq!(lang_to_ident("JavaScript"), "JAVASCRIPT");
+        assert_eq!(lang_to_ident("Rust").unwrap(), "RUST");
+        assert_eq!(lang_to_ident("TypeScript").unwrap(), "TYPESCRIPT");
+        assert_eq!(lang_to_ident("Cpp").unwrap(), "CPP");
+        assert_eq!(lang_to_ident("CSharp").unwrap(), "CSHARP");
+        assert_eq!(lang_to_ident("C").unwrap(), "C");
+        assert_eq!(lang_to_ident("JavaScript").unwrap(), "JAVASCRIPT");
     }
 
     #[test]
     fn lang_to_ident_collapses_consecutive_underscores() {
         // Double underscores should collapse to a single underscore.
-        assert_eq!(lang_to_ident("C++"), "C_");
+        assert_eq!(lang_to_ident("C++").unwrap(), "C_");
         // Triple or more consecutive underscores (e.g. from "C# +" → "C__") must
         // also collapse to a single underscore — the previous split("__") approach
         // only handled exactly-double sequences.
-        assert_eq!(lang_to_ident("C# +"), "C_");
+        assert_eq!(lang_to_ident("C# +").unwrap(), "C_");
         // No underscores: unchanged.
-        assert_eq!(lang_to_ident("Go"), "GO");
+        assert_eq!(lang_to_ident("Go").unwrap(), "GO");
+    }
+
+    #[test]
+    fn lang_to_ident_rejects_digit_leading_name() {
+        // A language name starting with a digit produces an identifier-start error.
+        let err = lang_to_ident("1lang").unwrap_err();
+        assert!(
+            err.to_string().contains("empty or non-identifier-starting"),
+            "expected identifier-start error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn lang_to_ident_rejects_non_ascii_name() {
+        // A language name with a non-ASCII character (e.g. a Unicode letter not in
+        // [A-Za-z0-9_]) must fail the identifier-character check.
+        let err = lang_to_ident("Ré").unwrap_err();
+        assert!(
+            err.to_string().contains("non-identifier character"),
+            "expected non-identifier character error, got: {err}"
+        );
     }
 
     #[test]
@@ -571,6 +629,28 @@ mod tests {
         assert!(
             err.to_string().contains("invalid IDF"),
             "Infinity IDF should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_bigram_weights_returns_error() {
+        let mut table = sample_table();
+        table.bigram_weights.clear();
+        let err = validate_ast_table(&table).unwrap_err();
+        assert!(
+            err.to_string().contains("no bigram weights"),
+            "empty bigram_weights should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_trigram_weights_returns_error() {
+        let mut table = sample_table();
+        table.trigram_weights.clear();
+        let err = validate_ast_table(&table).unwrap_err();
+        assert!(
+            err.to_string().contains("no trigram weights"),
+            "empty trigram_weights should be rejected: {err}"
         );
     }
 }

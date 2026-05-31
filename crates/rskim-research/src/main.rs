@@ -452,7 +452,7 @@ fn cmd_ast_run(
     let table = ast_types::AstWeightTable {
         version: 1,
         generated_at: chrono_now(),
-        vocabulary: vocab.kinds().into_iter().map(str::to_string).collect(),
+        vocabulary: vocab.kinds().to_vec(),
         corpus_stats,
         bigram_weights: bigram_weights_map,
         trigram_weights: trigram_weights_map,
