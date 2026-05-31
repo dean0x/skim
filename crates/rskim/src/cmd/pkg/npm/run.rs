@@ -11,7 +11,6 @@
 //! unified into `ParseResult<String>` via `stringify_result` before being
 //! passed to `run_parsed_command_with_mode`.
 
-use std::borrow::Cow;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -74,8 +73,6 @@ pub(super) fn run_script(
     cmd_args.extend_from_slice(args);
 
     let use_stdin = crate::cmd::should_read_stdin(args);
-
-    // Determine if we should inject NO_COLOR.
     let env_overrides: &[(&str, &str)] = &[("NO_COLOR", "1")];
 
     crate::cmd::run_parsed_command_with_mode(
@@ -132,8 +129,7 @@ fn parse_npm_output(output: &CommandOutput, tool: ScriptTool) -> ParseResult<Str
         }
         ScriptTool::Unknown => {
             // Passthrough: no recognised tool, return raw output unchanged.
-            let combined: Cow<str> = super::combine_output(output);
-            ParseResult::Passthrough(combined.into_owned())
+            ParseResult::Passthrough(super::combine_output(output).into_owned())
         }
     }
 }

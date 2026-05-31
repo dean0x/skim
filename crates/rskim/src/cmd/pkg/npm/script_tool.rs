@@ -129,22 +129,17 @@ pub(super) fn extract_tool(script: &str) -> ScriptTool {
                 .or_else(|| stem.strip_suffix(".cjs"))
                 .unwrap_or(stem);
 
-            let tool = match stem {
-                "vitest" => ScriptTool::Vitest,
-                "jest" => ScriptTool::Jest,
-                "eslint" => ScriptTool::Eslint,
-                "biome" => ScriptTool::Biome,
-                "prettier" => ScriptTool::Prettier,
-                "oxlint" => ScriptTool::Oxlint,
-                "tsc" => ScriptTool::Tsc,
-                _ => ScriptTool::Unknown,
-            };
-
-            if tool != ScriptTool::Unknown {
-                return tool;
+            match stem {
+                "vitest" => return ScriptTool::Vitest,
+                "jest" => return ScriptTool::Jest,
+                "eslint" => return ScriptTool::Eslint,
+                "biome" => return ScriptTool::Biome,
+                "prettier" => return ScriptTool::Prettier,
+                "oxlint" => return ScriptTool::Oxlint,
+                "tsc" => return ScriptTool::Tsc,
+                // Unknown token — stop processing this segment (it's the actual command).
+                _ => break,
             }
-            // Unknown token — stop processing this segment (it's the actual command).
-            break;
         }
     }
     ScriptTool::Unknown

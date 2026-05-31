@@ -49,22 +49,7 @@ pub(crate) fn run(
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
-    let mut full_args = vec!["build".to_string()];
-    full_args.extend_from_slice(args);
-
-    if !user_has_flag(&full_args, &["--message-format"]) {
-        inject_flag_before_separator(&mut full_args, "--message-format=json");
-    }
-
-    run_parsed_command(
-        "cargo",
-        &full_args,
-        &[("CARGO_TERM_COLOR", "never")],
-        "install Rust from https://rustup.rs",
-        show_stats,
-        rec,
-        parse,
-    )
+    run_with_json_format("build", args, show_stats, rec)
 }
 
 /// Run `cargo check` with output compression.
@@ -78,22 +63,7 @@ pub(crate) fn run_check(
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
-    let mut full_args = vec!["check".to_string()];
-    full_args.extend_from_slice(args);
-
-    if !user_has_flag(&full_args, &["--message-format"]) {
-        inject_flag_before_separator(&mut full_args, "--message-format=json");
-    }
-
-    run_parsed_command(
-        "cargo",
-        &full_args,
-        &[("CARGO_TERM_COLOR", "never")],
-        "install Rust from https://rustup.rs",
-        show_stats,
-        rec,
-        parse,
-    )
+    run_with_json_format("check", args, show_stats, rec)
 }
 
 /// Run `cargo fmt` with output compression.
@@ -134,7 +104,20 @@ pub(crate) fn run_clippy(
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
-    let mut full_args = vec!["clippy".to_string()];
+    run_with_json_format("clippy", args, show_stats, rec)
+}
+
+/// Shared implementation for `run`, `run_check`, and `run_clippy`.
+///
+/// All three subcommands inject `--message-format=json` and use the same
+/// three-tier NDJSON parser. Only the subcommand token differs.
+fn run_with_json_format(
+    subcmd: &str,
+    args: &[String],
+    show_stats: bool,
+    rec: crate::analytics::RecordingContext<'_>,
+) -> anyhow::Result<ExitCode> {
+    let mut full_args = vec![subcmd.to_string()];
     full_args.extend_from_slice(args);
 
     if !user_has_flag(&full_args, &["--message-format"]) {
@@ -511,6 +494,45 @@ mod tests {
             "expected Passthrough, got {:?}",
             result.tier_name()
         );
+    }
+
+    // ========================================================================
+    // cargo fmt parser
+    // ========================================================================
+
+    #[test]
+    fn test_parse_fmt_empty_output_is_success() {
+        let output = make_output_full("", "", Some(0));
+        let result = parse_fmt(&output);
+        assert!(result.is_full(), "expected Full, got {:?}", result.tier_name());
+        if let ParseResult::Full(build_result) = &result {
+            assert!(build_result.success, "expected success for empty output");
+            assert_eq!(build_result.errors, 0);
+            assert_eq!(build_result.warnings, 0);
+        }
+    }
+
+    #[test]
+    fn test_parse_fmt_whitespace_only_is_success() {
+        let output = make_output_full("  \n\n", " \t\n", Some(0));
+        let result = parse_fmt(&output);
+        assert!(result.is_full(), "expected Full for whitespace-only output");
+        if let ParseResult::Full(build_result) = &result {
+            assert!(build_result.success);
+        }
+    }
+
+    #[test]
+    fn test_parse_fmt_error_output_is_passthrough() {
+        let stderr = "error: rustfmt not installed\n";
+        let output = make_output_full("", stderr, Some(1));
+        let result = parse_fmt(&output);
+        assert!(
+            result.is_passthrough(),
+            "expected Passthrough for error output, got {:?}",
+            result.tier_name()
+        );
+        assert!(result.content().contains("rustfmt not installed"));
     }
 
     // ========================================================================
