@@ -16,6 +16,7 @@
 //! `cmd/hooks/` for protocol-specific documentation.
 
 mod flags;
+mod guidance;
 mod helpers;
 mod install;
 mod state;
