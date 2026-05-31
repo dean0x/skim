@@ -452,11 +452,9 @@ fn cmd_ast_run(
     // by cmd_run's log_validation_summary for the lexical pipeline.
     eprintln!("=== AST weight table summary ===");
     eprintln!("Vocabulary: {} node kinds", table.vocabulary.len());
-    for lang in {
-        let mut langs: Vec<&String> = table.bigram_weights.keys().collect();
-        langs.sort();
-        langs
-    } {
+    let mut sorted_langs: Vec<&String> = table.bigram_weights.keys().collect();
+    sorted_langs.sort();
+    for lang in sorted_langs {
         let bigrams = &table.bigram_weights[lang];
         let trigrams = table.trigram_weights.get(lang).map_or(0, Vec::len);
         let lang_stats = table

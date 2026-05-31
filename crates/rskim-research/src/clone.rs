@@ -284,7 +284,10 @@ fn clone_repo(url: &str, commit: &str, dest: &Path) -> anyhow::Result<()> {
 /// (`TARGET_EXTENSIONS`) are used and `EXCLUDED_EXTENSIONS` is applied.
 /// If `extensions` is `Some(list)`, only those extensions are accepted and
 /// the exclusion list is NOT applied — the caller controls what is included.
-pub(crate) fn walk_and_load(root: &Path, extensions: Option<&[&str]>) -> anyhow::Result<Vec<SourceFile>> {
+pub(crate) fn walk_and_load(
+    root: &Path,
+    extensions: Option<&[&str]>,
+) -> anyhow::Result<Vec<SourceFile>> {
     let mut files = Vec::new();
 
     let walker = ignore::WalkBuilder::new(root)

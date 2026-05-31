@@ -21,7 +21,7 @@ use crate::types::SourceFile;
 const MAX_AST_DEPTH: usize = 500;
 
 /// Maximum number of AST nodes visited per file.
-const MAX_AST_NODES: usize = 100_000;
+const MAX_AST_NODES: u32 = 100_000;
 
 /// Maximum source file size accepted for AST extraction (100 KiB).
 const MAX_FILE_SIZE: usize = 100 * 1024;
@@ -137,7 +137,7 @@ fn walk_tree(
     grandparent_id: Option<NodeKindId>,
 ) {
     // Depth and node count guards.
-    if depth >= MAX_AST_DEPTH || *ctx.node_count >= MAX_AST_NODES as u32 {
+    if depth >= MAX_AST_DEPTH || *ctx.node_count >= MAX_AST_NODES {
         return;
     }
 
@@ -182,7 +182,7 @@ fn walk_tree(
         loop {
             walk_tree(cursor, ctx, depth + 1, current_id, parent_id);
 
-            if *ctx.node_count >= MAX_AST_NODES as u32 {
+            if *ctx.node_count >= MAX_AST_NODES {
                 break;
             }
 
@@ -547,7 +547,10 @@ mod tests {
 
         // Capture pre-stabilize vocabulary size for sanity.
         let pre_stabilize_size = vocab.len();
-        assert!(pre_stabilize_size > 0, "vocabulary must be non-empty after extraction");
+        assert!(
+            pre_stabilize_size > 0,
+            "vocabulary must be non-empty after extraction"
+        );
 
         // Stabilize: reassigns IDs alphabetically and returns the old→new remap table.
         let remap = vocab.stabilize();
@@ -566,7 +569,8 @@ mod tests {
         // Compute IDF weights — threshold=0.0 keeps all entries.
         let total_docs = corpus_stats.total_files;
         assert!(total_docs > 0, "corpus must have at least one file");
-        let bigram_weights = ast_idf::compute_ast_bigram_weights(&rekeyed_bigrams, total_docs, 0.0, &vocab);
+        let bigram_weights =
+            ast_idf::compute_ast_bigram_weights(&rekeyed_bigrams, total_docs, 0.0, &vocab);
 
         assert!(
             !bigram_weights.is_empty(),
