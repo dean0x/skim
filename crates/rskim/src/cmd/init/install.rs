@@ -350,16 +350,15 @@ fn install_search_integration() {
     // immediately after this block, so the window for a zombie entry in the
     // process table is negligible.  The build lock in `build_index` prevents
     // concurrent writes when multiple callers overlap.
-    if let Some(exe) = std::env::current_exe().ok() {
-        if let Ok(child) = std::process::Command::new(&exe)
+    if let Ok(exe) = std::env::current_exe()
+        && let Ok(child) = std::process::Command::new(&exe)
             .args(["search", "--build"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-        {
-            eprintln!("  Search index build started (PID {})", child.id());
-            drop(child); // Detach: do not wait for the background process.
-        }
+    {
+        eprintln!("  Search index build started (PID {})", child.id());
+        drop(child); // Detach: do not wait for the background process.
     }
 }
 
@@ -1053,7 +1052,10 @@ mod tests {
         );
         // File should not have been modified.
         let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(on_disk, corrupted, "file must be unchanged when markers are corrupted");
+        assert_eq!(
+            on_disk, corrupted,
+            "file must be unchanged when markers are corrupted"
+        );
     }
 
     #[test]
@@ -1065,10 +1067,16 @@ mod tests {
 
         let result = update_existing_guidance(&path, existing, "2.0.0", "new content").unwrap();
 
-        assert!(result, "same-version path must return true (done, skip write)");
+        assert!(
+            result,
+            "same-version path must return true (done, skip write)"
+        );
         // File should not have been modified.
         let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(on_disk, existing, "file must be unchanged when version matches");
+        assert_eq!(
+            on_disk, existing,
+            "file must be unchanged when version matches"
+        );
     }
 
     #[test]
@@ -1080,15 +1088,29 @@ mod tests {
         std::fs::write(&path, &existing).unwrap();
 
         let new_guidance = guidance_content("3.0.0");
-        let result =
-            update_existing_guidance(&path, &existing, "3.0.0", &new_guidance).unwrap();
+        let result = update_existing_guidance(&path, &existing, "3.0.0", &new_guidance).unwrap();
 
-        assert!(result, "different-version path must return true (update done)");
+        assert!(
+            result,
+            "different-version path must return true (update done)"
+        );
         let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert!(on_disk.contains("v3.0.0"), "updated file must contain new version");
-        assert!(!on_disk.contains("v1.0.0"), "updated file must not contain old version");
-        assert!(on_disk.contains("# Header"), "surrounding content must be preserved");
-        assert!(on_disk.contains("# Footer"), "surrounding content must be preserved");
+        assert!(
+            on_disk.contains("v3.0.0"),
+            "updated file must contain new version"
+        );
+        assert!(
+            !on_disk.contains("v1.0.0"),
+            "updated file must not contain old version"
+        );
+        assert!(
+            on_disk.contains("# Header"),
+            "surrounding content must be preserved"
+        );
+        assert!(
+            on_disk.contains("# Footer"),
+            "surrounding content must be preserved"
+        );
     }
 
     #[test]
@@ -1099,16 +1121,21 @@ mod tests {
         std::fs::write(&path, existing).unwrap();
 
         let new_guidance = guidance_content("2.5.0");
-        let result =
-            update_existing_guidance(&path, existing, "2.5.0", &new_guidance).unwrap();
+        let result = update_existing_guidance(&path, existing, "2.5.0", &new_guidance).unwrap();
 
         assert!(
             !result,
             "no-section path must return false (caller should print footer)"
         );
         let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert!(on_disk.starts_with("# My Rules"), "existing content must be kept");
-        assert!(on_disk.contains("<!-- skim-start v2.5.0 -->"), "new guidance must be appended");
+        assert!(
+            on_disk.starts_with("# My Rules"),
+            "existing content must be kept"
+        );
+        assert!(
+            on_disk.contains("<!-- skim-start v2.5.0 -->"),
+            "new guidance must be appended"
+        );
     }
 
     // ---- agent_from_state ----
@@ -1170,5 +1197,4 @@ mod tests {
             "maybe_install_wrappers(Some(false), _) must return Ok without touching the filesystem"
         );
     }
-
 }
