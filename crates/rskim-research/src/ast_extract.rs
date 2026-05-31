@@ -88,55 +88,67 @@ pub fn extract_ast_ngrams_from_file(
 
     let mut result = AstFileResult::default();
     let mut cursor = tree.walk();
-
-    walk_tree(
-        &mut cursor,
+    let mut ctx = WalkContext {
         vocab,
-        &mut result.bigrams,
-        &mut result.trigrams,
+        bigrams: &mut result.bigrams,
+        trigrams: &mut result.trigrams,
         collect_trigrams,
-        &mut result.error_node_count,
-        &mut result.node_count,
-        0,
-        None,
-        None,
-    );
+        error_count: &mut result.error_node_count,
+        node_count: &mut result.node_count,
+    };
+
+    walk_tree(&mut cursor, &mut ctx, 0, None, None);
 
     Ok(result)
 }
 
-/// Iterative tree walk using `TreeCursor` to avoid recursion depth limits.
+/// Mutable traversal state threaded through the recursive `walk_tree` calls.
 ///
-/// Collects parent→child bigrams and (when `collect_trigrams` is true)
-/// grandparent→parent→child trigrams. ERROR nodes are counted but not included
-/// in bigram/trigram pairs (they represent parse failures, not real grammar
-/// relationships).
-#[allow(clippy::too_many_arguments)]
+/// Bundles the vocabulary, output sets, counters, and configuration so that
+/// `walk_tree` takes only four parameters instead of ten.
+struct WalkContext<'a> {
+    /// Shared vocabulary mapping node-kind strings to compact IDs.
+    vocab: &'a mut NodeKindVocabulary,
+    /// Unique parent→child bigrams collected so far for this file.
+    bigrams: &'a mut HashSet<AstBigram>,
+    /// Unique grandparent→parent→child trigrams collected so far for this file.
+    trigrams: &'a mut HashSet<AstTrigram>,
+    /// Whether to collect trigrams at all.
+    collect_trigrams: bool,
+    /// Running count of ERROR nodes (parse failures).
+    error_count: &'a mut u32,
+    /// Running count of all AST nodes visited.
+    node_count: &'a mut u32,
+}
+
+/// Recursive tree walk using `TreeCursor` with a bounded depth limit.
+///
+/// Uses `MAX_AST_DEPTH` (500) to prevent stack overflow on pathological
+/// inputs. Collects parent→child bigrams and (when `collect_trigrams` is
+/// true) grandparent→parent→child trigrams from the AST.
+///
+/// ERROR nodes are counted but not included in bigram/trigram pairs (they
+/// represent parse failures, not real grammar relationships).
 fn walk_tree(
     cursor: &mut tree_sitter::TreeCursor,
-    vocab: &mut NodeKindVocabulary,
-    bigrams: &mut HashSet<AstBigram>,
-    trigrams: &mut HashSet<AstTrigram>,
-    collect_trigrams: bool,
-    error_count: &mut u32,
-    node_count: &mut u32,
+    ctx: &mut WalkContext<'_>,
     depth: usize,
     parent_id: Option<NodeKindId>,
     grandparent_id: Option<NodeKindId>,
 ) {
     // Depth and node count guards.
-    if depth >= MAX_AST_DEPTH || *node_count >= MAX_AST_NODES as u32 {
+    if depth >= MAX_AST_DEPTH || *ctx.node_count >= MAX_AST_NODES as u32 {
         return;
     }
 
     let node = cursor.node();
-    *node_count += 1;
+    *ctx.node_count += 1;
 
     let kind = node.kind();
     let is_error = node.is_error() || kind == "ERROR";
 
     if is_error {
-        *error_count += 1;
+        *ctx.error_count += 1;
         // Do not create bigrams/trigrams for ERROR nodes — they are not real
         // grammar relationships. Continue walking children so we can count all
         // error nodes in the subtree.
@@ -146,12 +158,12 @@ fn walk_tree(
     let current_id = if is_error {
         None
     } else {
-        Some(vocab.get_or_insert(kind))
+        Some(ctx.vocab.get_or_insert(kind))
     };
 
     // Emit bigram: parent → current.
     if let (Some(pid), Some(cid)) = (parent_id, current_id) {
-        bigrams.insert(encode_ast_bigram(pid, cid));
+        ctx.bigrams.insert(encode_ast_bigram(pid, cid));
     }
 
     // Emit trigram: grandparent → parent → current.
@@ -159,29 +171,18 @@ fn walk_tree(
     // overhead when the cap or flag is not set; clippy::collapsible_if would merge
     // them into an if-let chain that still allocates the Option tuple unconditionally.
     #[allow(clippy::collapsible_if)]
-    if collect_trigrams && trigrams.len() < MAX_TRIGRAMS_PER_FILE {
+    if ctx.collect_trigrams && ctx.trigrams.len() < MAX_TRIGRAMS_PER_FILE {
         if let (Some(gid), Some(pid), Some(cid)) = (grandparent_id, parent_id, current_id) {
-            trigrams.insert(encode_ast_trigram(gid, pid, cid));
+            ctx.trigrams.insert(encode_ast_trigram(gid, pid, cid));
         }
     }
 
-    // Walk children iteratively using the cursor.
+    // Walk children.
     if cursor.goto_first_child() {
         loop {
-            walk_tree(
-                cursor,
-                vocab,
-                bigrams,
-                trigrams,
-                collect_trigrams,
-                error_count,
-                node_count,
-                depth + 1,
-                current_id,
-                parent_id,
-            );
+            walk_tree(cursor, ctx, depth + 1, current_id, parent_id);
 
-            if *node_count >= MAX_AST_NODES as u32 {
+            if *ctx.node_count >= MAX_AST_NODES as u32 {
                 break;
             }
 
@@ -217,7 +218,7 @@ pub fn extract_ast_ngrams_from_corpus(
             .push(file);
     }
 
-    let total_files_seen: u32 = files.len() as u32;
+    let total_files_seen: u32 = u32::try_from(files.len()).unwrap_or(u32::MAX);
     let progress = ProgressBar::new(total_files_seen as u64);
     if let Ok(style) =
         ProgressStyle::with_template("[{elapsed_precise}] [{bar:40}] {pos}/{len} {msg}")
@@ -245,8 +246,9 @@ pub fn extract_ast_ngrams_from_corpus(
         let mut lang_error_nodes: u32 = 0;
         let mut lang_total_nodes: u32 = 0;
 
+        progress.set_message(lang_name.clone());
+
         for file in lang_files.iter() {
-            progress.set_message(lang_name.clone());
             progress.inc(1);
 
             let hash = content_hash(&file.content);
@@ -274,8 +276,8 @@ pub fn extract_ast_ngrams_from_corpus(
                 }
             };
 
-            lang_error_nodes += result.error_node_count;
-            lang_total_nodes += result.node_count;
+            lang_error_nodes = lang_error_nodes.saturating_add(result.error_node_count);
+            lang_total_nodes = lang_total_nodes.saturating_add(result.node_count);
 
             for bigram in result.bigrams {
                 *bigram_df.entry(bigram).or_default() += 1;
@@ -400,9 +402,31 @@ mod tests {
         let source = "fn broken(((( {}";
         let result =
             extract_ast_ngrams_from_file(source, Language::Rust, &mut vocab, false).unwrap();
-        // Should parse (tree-sitter doesn't hard-fail), result is valid even with errors.
-        // We just check that it doesn't panic.
-        let _ = result;
+
+        // Tree-sitter must have produced at least one ERROR node for this malformed input.
+        assert!(
+            result.error_node_count > 0,
+            "broken syntax should produce ERROR nodes, got 0"
+        );
+
+        // ERROR nodes must not be registered in the vocabulary — the implementation
+        // sets current_id = None for error nodes, so get_or_insert is never called.
+        assert!(
+            vocab.get("ERROR").is_none(),
+            "ERROR should not be registered in the vocabulary"
+        );
+
+        // No bigram should encode an ERROR node ID.  Since ERROR nodes are never
+        // inserted into the vocabulary, no valid NodeKindId exists for them, so
+        // no bigram can reference one.  Verify by checking every decoded bigram's
+        // parent and child IDs resolve to non-ERROR kinds.
+        for &bigram in &result.bigrams {
+            let (parent_id, child_id) = crate::ast_types::decode_ast_bigram(bigram);
+            let parent_kind = vocab.resolve(parent_id).unwrap_or("UNKNOWN");
+            let child_kind = vocab.resolve(child_id).unwrap_or("UNKNOWN");
+            assert_ne!(parent_kind, "ERROR", "bigram parent should not be ERROR");
+            assert_ne!(child_kind, "ERROR", "bigram child should not be ERROR");
+        }
     }
 
     #[test]
@@ -494,6 +518,94 @@ mod tests {
                 lang,
                 source
             );
+        }
+    }
+
+    // ── full pipeline: extract → stabilize → rekey → IDF ──────────────────
+    //
+    // This integration test guards against regressions in the sequencing that
+    // caused the remap bug (commit 605203a): bigram/trigram DF maps were keyed
+    // with pre-stabilize IDs but decoded against post-stabilize IDs, producing
+    // wrong kind-string resolution.
+
+    #[test]
+    fn stabilize_rekey_idf_pipeline_resolves_correct_kind_names() {
+        use crate::ast_idf;
+        use crate::ast_types::{rekey_bigram_df_map, rekey_trigram_df_map};
+        use std::path::PathBuf;
+
+        let rust_source = "fn greet(name: &str) -> String { format!(\"hello {}\", name) }";
+        let files = vec![SourceFile {
+            path: PathBuf::from("test.rs"),
+            language: Language::Rust,
+            content: rust_source.to_string(),
+        }];
+
+        let mut vocab = NodeKindVocabulary::new();
+        let (raw_bigram_df, raw_trigram_df, corpus_stats) =
+            extract_ast_ngrams_from_corpus(&files, &mut vocab, true);
+
+        // Capture pre-stabilize vocabulary size for sanity.
+        let pre_stabilize_size = vocab.len();
+        assert!(pre_stabilize_size > 0, "vocabulary must be non-empty after extraction");
+
+        // Stabilize: reassigns IDs alphabetically and returns the old→new remap table.
+        let remap = vocab.stabilize();
+
+        // Post-stabilize size must be unchanged (stabilize only reorders, never adds/removes).
+        assert_eq!(
+            vocab.len(),
+            pre_stabilize_size,
+            "stabilize must preserve vocabulary size"
+        );
+
+        // Re-key all DF maps so encoded IDs match the post-stabilize vocabulary.
+        let rust_bigram_df = raw_bigram_df.get("Rust").expect("Rust must have bigrams");
+        let rekeyed_bigrams = rekey_bigram_df_map(rust_bigram_df, &remap);
+
+        // Compute IDF weights — threshold=0.0 keeps all entries.
+        let total_docs = corpus_stats.total_files;
+        assert!(total_docs > 0, "corpus must have at least one file");
+        let bigram_weights = ast_idf::compute_ast_bigram_weights(&rekeyed_bigrams, total_docs, 0.0, &vocab);
+
+        assert!(
+            !bigram_weights.is_empty(),
+            "pipeline must produce at least one bigram weight for a Rust function"
+        );
+
+        // Every resolved weight must have non-empty kind strings.  An empty string
+        // would indicate that `vocab.resolve()` returned None — i.e. the DF map
+        // still contained pre-stabilize IDs that no longer exist in the vocabulary.
+        for w in &bigram_weights {
+            assert!(
+                !w.parent_kind.is_empty(),
+                "parent_kind must resolve to a non-empty string (pre-stabilize ID leak?)"
+            );
+            assert!(
+                !w.child_kind.is_empty(),
+                "child_kind must resolve to a non-empty string (pre-stabilize ID leak?)"
+            );
+        }
+
+        // Trigrams: same pipeline check.
+        if let Some(rust_trigram_df) = raw_trigram_df.get("Rust") {
+            let rekeyed_trigrams = rekey_trigram_df_map(rust_trigram_df, &remap);
+            let trigram_weights =
+                ast_idf::compute_ast_trigram_weights(&rekeyed_trigrams, total_docs, 0.0, &vocab);
+            for w in &trigram_weights {
+                assert!(
+                    !w.grandparent_kind.is_empty(),
+                    "grandparent_kind must resolve (pre-stabilize ID leak?)"
+                );
+                assert!(
+                    !w.parent_kind.is_empty(),
+                    "parent_kind must resolve (pre-stabilize ID leak?)"
+                );
+                assert!(
+                    !w.child_kind.is_empty(),
+                    "child_kind must resolve (pre-stabilize ID leak?)"
+                );
+            }
         }
     }
 }

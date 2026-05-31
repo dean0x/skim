@@ -1,8 +1,8 @@
 //! Validation and reporting for AST weight tables.
 //!
 //! Computes IDF distribution statistics and surfacing the most discriminating
-//! bigrams and trigrams per language. Output goes to stderr (not stdout) so
-//! it does not interfere with piped workflows.
+//! bigrams and trigrams per language. Output goes to stdout so the report can
+//! be piped or redirected by callers.
 
 use crate::ast_types::{AstBigramWeight, AstTrigramWeight, AstWeightTable};
 
@@ -141,35 +141,35 @@ fn percentile(sorted: &[f32], pct: f32) -> f32 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-/// Print the validation report to stderr.
+/// Print the validation report to stdout.
 pub fn print_ast_validation_report(report: &AstValidationReport) {
-    eprintln!("=== AST Weight Table Validation Report ===");
-    eprintln!("Vocabulary size: {} node kinds", report.vocabulary_size);
-    eprintln!();
+    println!("=== AST Weight Table Validation Report ===");
+    println!("Vocabulary size: {} node kinds", report.vocabulary_size);
+    println!();
 
     for lang_report in &report.per_language {
         let dist = &lang_report.bigram_distribution;
-        eprintln!("--- {} ---", dist.language);
-        eprintln!(
+        println!("--- {} ---", dist.language);
+        println!(
             "  Bigrams:  count={}, min={:.2}, max={:.2}, mean={:.2}, p50={:.2}, p90={:.2}, p99={:.2}",
             dist.count, dist.min, dist.max, dist.mean, dist.median, dist.p90, dist.p99
         );
 
         let tdist = &lang_report.trigram_distribution;
-        eprintln!(
+        println!(
             "  Trigrams: count={}, min={:.2}, max={:.2}, mean={:.2}, p50={:.2}, p90={:.2}, p99={:.2}",
             tdist.count, tdist.min, tdist.max, tdist.mean, tdist.median, tdist.p90, tdist.p99
         );
 
-        eprintln!(
+        println!(
             "  Error node rate: {:.2}%",
             lang_report.error_node_rate * 100.0
         );
 
         if !lang_report.top_bigrams.is_empty() {
-            eprintln!("  Top discriminating bigrams:");
+            println!("  Top discriminating bigrams:");
             for (i, w) in lang_report.top_bigrams.iter().enumerate().take(5) {
-                eprintln!(
+                println!(
                     "    {}. {} -> {} (IDF={:.2})",
                     i + 1,
                     w.parent_kind,
@@ -180,9 +180,9 @@ pub fn print_ast_validation_report(report: &AstValidationReport) {
         }
 
         if !lang_report.top_trigrams.is_empty() {
-            eprintln!("  Top discriminating trigrams:");
+            println!("  Top discriminating trigrams:");
             for (i, w) in lang_report.top_trigrams.iter().enumerate().take(5) {
-                eprintln!(
+                println!(
                     "    {}. {} -> {} -> {} (IDF={:.2})",
                     i + 1,
                     w.grandparent_kind,
@@ -193,7 +193,7 @@ pub fn print_ast_validation_report(report: &AstValidationReport) {
             }
         }
 
-        eprintln!();
+        println!();
     }
 }
 

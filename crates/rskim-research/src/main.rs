@@ -447,6 +447,38 @@ fn cmd_ast_run(
 
     write_ast_weight_table(&table, output)?;
 
+    // Print a brief per-language summary to stderr so the user can assess quality
+    // without having to run ast-validate separately. Mirrors the feedback provided
+    // by cmd_run's log_validation_summary for the lexical pipeline.
+    eprintln!("=== AST weight table summary ===");
+    eprintln!("Vocabulary: {} node kinds", table.vocabulary.len());
+    for lang in {
+        let mut langs: Vec<&String> = table.bigram_weights.keys().collect();
+        langs.sort();
+        langs
+    } {
+        let bigrams = &table.bigram_weights[lang];
+        let trigrams = table.trigram_weights.get(lang).map_or(0, Vec::len);
+        let lang_stats = table
+            .corpus_stats
+            .language_stats
+            .iter()
+            .find(|s| &s.language == lang);
+        let error_rate = lang_stats
+            .map(|s| {
+                if s.total_node_count == 0 {
+                    0.0_f32
+                } else {
+                    100.0 * s.error_node_count as f32 / s.total_node_count as f32
+                }
+            })
+            .unwrap_or(0.0);
+        eprintln!(
+            "  {lang}: {} bigrams, {trigrams} trigrams, error_rate={error_rate:.2}%",
+            bigrams.len()
+        );
+    }
+
     Ok(())
 }
 
