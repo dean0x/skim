@@ -67,6 +67,64 @@ pub(crate) fn run(
     )
 }
 
+/// Run `cargo check` with output compression.
+///
+/// Injects `--message-format=json` if not already set by the user, then
+/// parses the NDJSON output through the same three-tier parser as cargo build.
+/// `cargo check` verifies types and borrow rules without producing an artifact,
+/// so its JSON schema is identical to `cargo build`'s.
+pub(crate) fn run_check(
+    args: &[String],
+    show_stats: bool,
+    rec: crate::analytics::RecordingContext<'_>,
+) -> anyhow::Result<ExitCode> {
+    let mut full_args = vec!["check".to_string()];
+    full_args.extend_from_slice(args);
+
+    if !user_has_flag(&full_args, &["--message-format"]) {
+        inject_flag_before_separator(&mut full_args, "--message-format=json");
+    }
+
+    run_parsed_command(
+        "cargo",
+        &full_args,
+        &[("CARGO_TERM_COLOR", "never")],
+        "install Rust from https://rustup.rs",
+        show_stats,
+        rec,
+        parse,
+    )
+}
+
+/// Run `cargo fmt` with output compression.
+///
+/// `cargo fmt` reformats source in-place and emits output only on error.
+/// An empty combined output is treated as success. Non-empty output (e.g.
+/// diff output from `--check` mode falling through, or rustfmt errors)
+/// is passed through unchanged.
+///
+/// Note: `cargo fmt --check` is ACKed at the engine level (AD-RW-11) and
+/// never reaches this handler. This handler covers bare `cargo fmt` and
+/// `cargo fmt -- [rustfmt args]` (apply mode).
+pub(crate) fn run_fmt(
+    args: &[String],
+    show_stats: bool,
+    rec: crate::analytics::RecordingContext<'_>,
+) -> anyhow::Result<ExitCode> {
+    let mut full_args = vec!["fmt".to_string()];
+    full_args.extend_from_slice(args);
+
+    run_parsed_command(
+        "cargo",
+        &full_args,
+        &[],
+        "install Rust from https://rustup.rs",
+        show_stats,
+        rec,
+        parse_fmt,
+    )
+}
+
 /// Run `cargo clippy` with output compression.
 ///
 /// Same JSON injection and parsing as cargo build, but with clippy-specific
@@ -95,8 +153,24 @@ pub(crate) fn run_clippy(
 }
 
 // ============================================================================
-// Three-tier parser
+// Parsers
 // ============================================================================
+
+/// Parse `cargo fmt` output.
+///
+/// `cargo fmt` writes to combined stdout+stderr only when it encounters
+/// errors (e.g. `rustfmt` not installed, unformatted files in `--check` mode
+/// that bypass the ACK path). An empty combined output signals success.
+/// Any non-empty output is passed through unchanged.
+fn parse_fmt(output: &CommandOutput) -> ParseResult<BuildResult> {
+    let combined = format!("{}{}", output.stdout, output.stderr);
+    let trimmed = combined.trim();
+    if trimmed.is_empty() {
+        ParseResult::Full(BuildResult::new(true, 0, 0, None, vec![]))
+    } else {
+        ParseResult::Passthrough(trimmed.to_string())
+    }
+}
 
 /// Parse cargo build/clippy output through three degradation tiers.
 fn parse(output: &CommandOutput) -> ParseResult<BuildResult> {

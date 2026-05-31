@@ -10,6 +10,8 @@ mod audit;
 mod install;
 mod ls;
 mod outdated;
+mod run;
+mod script_tool;
 
 use std::process::ExitCode;
 
@@ -38,11 +40,13 @@ pub(crate) fn run(
         "audit" => audit::run_audit(subcmd_args, show_stats, json_output, rec),
         "outdated" => outdated::run_outdated(subcmd_args, show_stats, json_output, rec),
         "ls" | "list" => ls::run_ls(subcmd_args, show_stats, json_output, rec),
+        "test" | "t" => run::run_script("test", subcmd_args, show_stats, json_output, rec),
+        "run" | "run-script" => run::run_script("run", subcmd_args, show_stats, json_output, rec),
         other => {
             let safe = crate::cmd::sanitize_for_display(other);
             eprintln!(
                 "skim npm: unknown subcommand '{safe}'\n\
-                 Available: install, audit, outdated, ls\n\
+                 Available: install, audit, outdated, ls, test, run\n\
                  Run 'skim npm --help' for usage"
             );
             Ok(ExitCode::FAILURE)
@@ -60,11 +64,15 @@ fn print_help() {
     println!("  audit      Parse npm audit output");
     println!("  outdated   Parse npm outdated output");
     println!("  ls         Parse npm ls output");
+    println!("  test (t)   Run npm test with tool-detected output compression");
+    println!("  run        Run npm run <script> with tool-detected output compression");
     println!();
     println!("Examples:");
     println!("  skim npm install");
     println!("  skim npm audit");
     println!("  skim npm outdated");
     println!("  skim npm ls");
+    println!("  skim npm test");
+    println!("  skim npm run lint");
     println!("  npm install 2>&1 | skim npm install");
 }

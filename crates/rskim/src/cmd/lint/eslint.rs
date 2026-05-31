@@ -59,7 +59,7 @@ fn prepare_args(cmd_args: &mut Vec<String>) {
 }
 
 /// Three-tier parse function for eslint output.
-fn parse_impl(output: &CommandOutput) -> ParseResult<LintResult> {
+pub(crate) fn parse_impl(output: &CommandOutput) -> ParseResult<LintResult> {
     if let Some(result) = try_parse_json(&output.stdout) {
         return ParseResult::Full(result);
     }

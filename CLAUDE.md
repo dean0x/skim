@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ✅ **PHASE 3 COMPLETE** (100% of original roadmap)
 
 **What's Complete (Phases 1 & 2):**
-- ✅ Full Rust project with comprehensive test suite (3,558 tests passing)
+- ✅ Full Rust project with comprehensive test suite (4,852 tests passing)
 - ✅ 17 languages supported: TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, SQL, Kotlin, Swift, Markdown, JSON, YAML, TOML
 - ✅ 4 transformation modes: structure, signatures, types, full
 - ✅ CLI with stdin/stdout streaming support
@@ -167,7 +167,7 @@ cargo fmt -- --check           # Format check
 - `search` — n-gram code search over the project index. Build/update index with `skim search index` (`--force`, `--root`, `--max-files`). Query with `skim search <query>` (`--limit`, `--root`, `--json`, `--stats`, `--install-hooks`, `--remove-hooks`, `--build`, `--rebuild`, `--update`). Temporal sort/filter flags: `--hot` (sort by hotspot score), `--cold` (invert hotspot sort), `--risky` (sort by fix-risk score), `--blast-radius FILE` (pre-filter to co-change peers of FILE).
 
 **Multi-category dispatchers:**
-- `cargo` — Rust toolchain compression: test, build, clippy, audit, nextest
+- `cargo` — Rust toolchain compression: test, build, check, fmt, clippy, audit, nextest
 - `git` — Git output compression: AST-aware diff (function boundaries, `--mode`), status, log, fetch, show, commit, push. All support `--json`.
 - `go` — Go toolchain compression: test
 - `log` — Log compression: JSON structured + regex plaintext deduplication, debug filtering, stack trace collapsing (`--json`, `--show-stats`)
@@ -177,7 +177,7 @@ cargo fmt -- --check           # Format check
 - `gradle`, `gradlew`, `make`, `mvn`, `mvnw` — Build tool output compression
 - `tsc` — TypeScript build output compression
 - `biome`, `black`, `dprint`, `eslint`, `gofmt`, `golangci`, `mypy`, `oxlint`, `prettier`, `rubocop`, `ruff`, `rustfmt`, `swiftlint` — Lint/formatter output compression
-- `npm`, `pip`, `pnpm`, `yarn` — Package manager output compression
+- `npm`, `pip`, `pnpm`, `yarn` — Package manager output compression; `npm test`/`npm run` delegate to the tool detected in `package.json` (vitest, jest, eslint, biome, prettier, oxlint, tsc)
 - `aws`, `curl`, `dig`, `docker`, `gh`, `kubectl`, `nslookup`, `terraform`, `wget` — Infrastructure/container tool output compression (three-tier degradation, `--json`)
 - `mysql`, `psql`, `sqlite3` — Database query output compression (three-tier degradation, `--json`)
 - `df`, `diff`, `du`, `env`, `find`, `grep`, `ls`, `printenv`, `ps`, `rg`, `tree`, `wc` — File operations output compression
@@ -603,7 +603,7 @@ Cross-platform builds require different GitHub Actions runners:
 5. Create test fixtures
 6. Validate AST access works
 
-**NOTE:** All phases complete (100%). Phase 3 features (multi-file glob, caching, parallel processing, token counting) are fully implemented and tested with 3,558 tests passing. See README.md for full usage guide.
+**NOTE:** All phases complete (100%). Phase 3 features (multi-file glob, caching, parallel processing, token counting) are fully implemented and tested with 4,852 tests passing. See README.md for full usage guide.
 
 ### Critical First File: `src/parser.rs`
 

@@ -71,7 +71,7 @@ pub(crate) fn run(
 // ============================================================================
 
 /// Parse vitest/jest output through three degradation tiers.
-fn parse(raw: &str) -> ParseResult<TestResult> {
+pub(crate) fn parse(raw: &str) -> ParseResult<TestResult> {
     // Tier 1: Try JSON parse
     if let Some(result) = try_parse_json(raw) {
         return ParseResult::Full(result);

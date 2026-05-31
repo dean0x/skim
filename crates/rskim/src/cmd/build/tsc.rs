@@ -49,7 +49,7 @@ pub(crate) fn run(
 // ============================================================================
 
 /// Parse tsc output through three degradation tiers.
-fn parse_tsc(output: &CommandOutput) -> ParseResult<BuildResult> {
+pub(crate) fn parse_tsc(output: &CommandOutput) -> ParseResult<BuildResult> {
     // Tier 1: Regex on stderr (primary tsc output stream)
     if let Some(result) = try_tier1_regex(&output.stderr) {
         return result;

@@ -2079,3 +2079,92 @@ fn test_rewrite_nslookup_fires() {
         .success()
         .stdout(predicate::str::contains("skim nslookup"));
 }
+
+// ============================================================================
+// cargo check rewrite rules (#259)
+// ============================================================================
+
+#[test]
+fn test_rewrite_cargo_check() {
+    skim_cmd()
+        .args(["rewrite", "cargo", "check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim cargo check"));
+}
+
+#[test]
+fn test_rewrite_cargo_check_with_release() {
+    skim_cmd()
+        .args(["rewrite", "cargo", "check", "--release"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--release"));
+}
+
+// ============================================================================
+// cargo fmt rewrite rules (#259)
+// ============================================================================
+
+#[test]
+fn test_rewrite_cargo_fmt() {
+    skim_cmd()
+        .args(["rewrite", "cargo", "fmt"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim cargo fmt"));
+}
+
+/// AD-RW-11 regression: `cargo fmt --check` must remain ACKed (not rewritten)
+/// after adding the `cargo fmt` rule. The ACK path runs before the rule table.
+#[test]
+fn test_rewrite_cargo_fmt_check_still_acknowledged() {
+    skim_cmd()
+        .args(["rewrite", "cargo", "fmt", "--check"])
+        .assert()
+        .success()
+        // ACK echoes the original command on stdout (not a skim-prefixed form).
+        .stdout(predicate::str::contains("cargo fmt --check"))
+        .stdout(predicate::str::contains("skim cargo fmt").not());
+}
+
+// ============================================================================
+// npm test/run rewrite rules (#260)
+// ============================================================================
+
+#[test]
+fn test_rewrite_npm_test() {
+    skim_cmd()
+        .args(["rewrite", "npm", "test"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim npm test"));
+}
+
+#[test]
+fn test_rewrite_npm_t_alias() {
+    skim_cmd()
+        .args(["rewrite", "npm", "t"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim npm test"));
+}
+
+#[test]
+fn test_rewrite_npm_run() {
+    skim_cmd()
+        .args(["rewrite", "npm", "run", "lint"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim npm run lint"));
+}
+
+#[test]
+fn test_rewrite_npm_run_colon_preserved() {
+    // Colons in script names must be preserved (e.g. `build:prod`)
+    skim_cmd()
+        .args(["rewrite", "npm", "run", "build:prod"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim npm run build:prod"));
+}

@@ -114,7 +114,7 @@ fn prepare_check_args(cmd_args: &mut Vec<String>) {
 }
 
 /// Three-tier parse for `biome check` / `biome lint` output.
-fn parse_check_impl(output: &CommandOutput) -> ParseResult<LintResult> {
+pub(crate) fn parse_check_impl(output: &CommandOutput) -> ParseResult<LintResult> {
     if let Some(result) = try_parse_json(&output.stdout) {
         return ParseResult::Full(result);
     }
