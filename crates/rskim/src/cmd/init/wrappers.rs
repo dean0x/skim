@@ -278,7 +278,7 @@ pub(super) fn uninstall_wrappers(dry_run: bool) -> anyhow::Result<UninstallResul
 /// public API [`uninstall_wrappers`] delegates here after resolving the
 /// canonical path.
 ///
-/// Only removes symlinks whose target filename stem is exactly `"skim"` or
+/// Only removes symlinks whose target filename is exactly `"skim"` or
 /// `"rskim"`. Preserves all other files (regular files, other symlinks,
 /// directories). If the directory is empty after cleanup, it is removed.
 ///
@@ -325,7 +325,7 @@ pub(super) fn uninstall_wrappers_in(dir: &Path, dry_run: bool) -> anyhow::Result
             continue;
         }
 
-        // Only remove symlinks whose filename stem is exactly "skim" or "rskim".
+        // Only remove symlinks whose target filename is exactly "skim" or "rskim".
         // Substring matching (e.g. contains("skim")) would incorrectly remove
         // symlinks pointing to binaries like `/usr/local/bin/someskimmer`.
         let target = std::fs::read_link(&path)
@@ -598,6 +598,40 @@ mod tests {
         assert!(link.is_symlink(), "the symlink must still exist");
     }
 
+    /// uninstall_wrappers_in removes symlinks pointing to a file named "rskim".
+    ///
+    /// The binary is published as `rskim` on crates.io. Users who installed via
+    /// `cargo install rskim` will have symlinks targeting a file named "rskim",
+    /// not "skim". The uninstaller must accept both names.
+    #[cfg(unix)]
+    #[test]
+    fn test_uninstall_removes_rskim_pointed_symlinks() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        // Target file named "rskim" (cargo-installed binary name).
+        let fake_rskim = tmp.path().join("rskim");
+        std::fs::write(&fake_rskim, "").unwrap();
+
+        let link = bin_dir.join("git");
+        std::os::unix::fs::symlink(&fake_rskim, &link).unwrap();
+
+        let result = uninstall_wrappers_in(&bin_dir, false).unwrap();
+
+        assert_eq!(
+            result.removed, 1,
+            "symlink pointing to 'rskim' binary must be removed"
+        );
+        assert_eq!(result.preserved, 0);
+        assert!(
+            !link.exists() && !link.is_symlink(),
+            "the rskim-pointing symlink must have been removed"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_dry_run_produces_no_filesystem_changes() {
@@ -618,6 +652,35 @@ mod tests {
             "dry_run must not create any symlinks"
         );
         assert_eq!(result.created, 1, "dry_run reports would-create");
+    }
+
+    /// uninstall_wrappers_in returns an error when the directory contains more
+    /// than MAX_ENTRIES (256) files. This circuit breaker prevents unbounded
+    /// iteration on corrupted or adversarial directories.
+    #[cfg(unix)]
+    #[test]
+    fn test_uninstall_circuit_breaker_fires_above_256_entries() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        // Create 257 files — one above the MAX_ENTRIES limit.
+        for i in 0..=256usize {
+            std::fs::write(bin_dir.join(format!("file_{i}")), "").unwrap();
+        }
+
+        let result = uninstall_wrappers_in(&bin_dir, false);
+        assert!(
+            result.is_err(),
+            "directories with >256 entries must trigger the circuit breaker"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("256"),
+            "error message must mention the 256 entry limit: {err}"
+        );
     }
 
     // ========================================================================

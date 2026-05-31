@@ -537,4 +537,21 @@ mod tests {
             "error must mention mutual exclusion: {err}"
         );
     }
+
+    /// Reverse-order conflict: --no-wrappers before --wrappers must also be
+    /// rejected with a mutual-exclusion error. The parser must detect the
+    /// conflict regardless of argument order.
+    #[test]
+    fn test_parse_flags_no_wrappers_then_wrappers_conflict() {
+        let result = parse_flags(&["--no-wrappers".to_string(), "--wrappers".to_string()]);
+        assert!(
+            result.is_err(),
+            "--no-wrappers followed by --wrappers must conflict"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "error must mention mutual exclusion: {err}"
+        );
+    }
 }

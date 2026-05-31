@@ -28,6 +28,17 @@ use std::process::ExitCode;
 use rskim_core::{Language, Mode};
 
 // ============================================================================
+// Thread-spawn guard
+// ============================================================================
+
+/// Set to `true` immediately before the first thread is spawned (just before
+/// `cmd::dispatch()`).  `strip_skim_wrappers_from_path()` asserts this is
+/// still `false` so that a future reordering of `main()` is caught at
+/// runtime rather than silently producing a data race on `set_var`.
+static THREADS_SPAWNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// ============================================================================
 // Pre-parse routing (subcommand disambiguation)
 // ============================================================================
 
@@ -537,7 +548,7 @@ pub(crate) fn detect_argv0_for(name: &str) -> bool {
 /// `std::env::args()`.
 fn extract_argv0_stem(argv0: &str) -> Option<String> {
     std::path::Path::new(argv0)
-        .file_name()?
+        .file_stem()?
         .to_str()
         .map(str::to_string)
 }
@@ -589,9 +600,19 @@ where
 /// Extracted as a pure function (no `set_var`) so it can be unit-tested
 /// directly without touching the process environment.
 fn filter_wrappers_from_path(path: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    // Fast-path: if the raw PATH string contains no ".skim" substring, the
+    // wrappers directory cannot be present.  Skip the expensive
+    // split-normalize-filter-join entirely — this is the common case when
+    // `skim init --wrappers` has not been run.
+    if !path.to_string_lossy().contains(".skim") {
+        return None;
+    }
+
     let wrappers_dir = cmd::skim_wrappers_dir()?;
-    // Normalize once so that trailing slashes, `..` segments, and symlinked
-    // parent paths do not defeat the equality check (PF-003).
+    // Syntactic normalization only: collapses trailing slashes and `..`
+    // segments so they don't defeat the equality check.  Filesystem symlinks
+    // in *parent* directories are NOT resolved — use std::fs::canonicalize
+    // if that guarantee is ever needed (PF-003).
     let wrappers_dir_canonical: std::path::PathBuf = wrappers_dir.components().collect();
 
     let entries: Vec<_> = std::env::split_paths(path).collect();
@@ -631,15 +652,21 @@ fn filter_wrappers_from_path(path: &std::ffi::OsStr) -> Option<std::ffi::OsStrin
 /// called before any thread is spawned (before analytics background threads,
 /// rayon pools, etc.).
 fn strip_skim_wrappers_from_path() {
+    // Machine-checked single-thread invariant: assert that no thread has been
+    // spawned yet.  If a future refactor reorders main() and calls this
+    // function after spawning threads, this panics loudly rather than
+    // producing a silent data race on set_var.
+    assert!(
+        !THREADS_SPAWNED.load(std::sync::atomic::Ordering::SeqCst),
+        "strip_skim_wrappers_from_path() called after threads were spawned"
+    );
     let path = match std::env::var_os("PATH") {
         Some(p) => p,
         None => return,
     };
     if let Some(new_path) = filter_wrappers_from_path(&path) {
-        // SAFETY: single-threaded at this point (before any thread spawn).
-        // strip_skim_wrappers_from_path() is called as the very first
-        // statement in main() before debug init, analytics init, rayon,
-        // or any other thread-spawning code.
+        // SAFETY: THREADS_SPAWNED is false (asserted above), so no other
+        // thread can be reading the environment concurrently.
         unsafe {
             std::env::set_var("PATH", &new_path);
         }
@@ -680,6 +707,11 @@ fn main() -> ExitCode {
                 .filter(|s| analytics::is_safe_session_id(s))
         });
     let analytics = analytics::AnalyticsConfig::from_process(cli_disable_analytics, session_id);
+
+    // Mark the thread-spawn boundary.  Any code below this line may spawn
+    // threads; any code above may not.  strip_skim_wrappers_from_path()
+    // asserts this flag is still false, so future reorderings are caught.
+    THREADS_SPAWNED.store(true, std::sync::atomic::Ordering::SeqCst);
 
     // argv[0] dispatch: when invoked as ~/.skim/bin/git, bypass normal clap
     // parsing and route directly to the appropriate handler. PATH stripping
@@ -1171,6 +1203,58 @@ mod tests {
         );
     }
 
+    /// AD-SC-1: When neither --session-id flag nor a sidecar is present,
+    /// SKIM_SESSION_ID env var is used as the final fallback.
+    ///
+    /// `set_var` is not thread-safe in multi-threaded programs. `#[serial_test::serial]`
+    /// ensures no other test runs concurrently while the env var is mutated.
+    /// The env var is removed unconditionally via `catch_unwind` so a test
+    /// failure cannot poison the environment for subsequent tests.
+    #[serial_test::serial]
+    #[test]
+    fn test_fallback_chain_env_var_used_when_no_flag_and_no_sidecar() {
+        use tempfile::TempDir;
+
+        // Use a directory with no sidecar file so the middle leg returns None.
+        let dir = TempDir::new().unwrap();
+
+        let env_session = "env-session-007";
+
+        // Safety: single-threaded by #[serial_test::serial].
+        unsafe { std::env::set_var("SKIM_SESSION_ID", env_session) };
+
+        let outcome = std::panic::catch_unwind(|| {
+            // No --session-id flag → first leg returns None.
+            let from_parse = parse_session_id(["skim", "git", "status"]);
+            assert!(from_parse.is_none(), "precondition: no flag yields None");
+
+            // No sidecar in this temp dir → second leg returns None.
+            let after_sidecar =
+                from_parse.or_else(|| cmd::session_sidecar::read_session_id(dir.path()));
+            assert!(
+                after_sidecar.is_none(),
+                "precondition: absent sidecar yields None"
+            );
+
+            // Third leg: SKIM_SESSION_ID env var.
+            let resolved = after_sidecar.or_else(|| {
+                std::env::var("SKIM_SESSION_ID")
+                    .ok()
+                    .filter(|s| analytics::is_safe_session_id(s))
+            });
+            assert_eq!(
+                resolved.as_deref(),
+                Some(env_session),
+                "SKIM_SESSION_ID env var must be used as the final fallback"
+            );
+        });
+
+        // Always remove the env var — even if the assertions above panicked.
+        unsafe { std::env::remove_var("SKIM_SESSION_ID") };
+
+        outcome.expect("test panicked while SKIM_SESSION_ID was set");
+    }
+
     // ========================================================================
     // filter_wrappers_from_path tests (pure function, no set_var)
     // ========================================================================
@@ -1309,10 +1393,25 @@ mod tests {
     fn test_extract_argv0_stem_empty_string() {
         // An empty string has no file name component.
         let result = extract_argv0_stem("");
-        // Path::new("").file_name() returns None on all platforms.
+        // Path::new("").file_stem() returns None on all platforms.
         assert!(
             result.is_none(),
             "empty argv0 must yield None"
+        );
+    }
+
+    /// Path with extension: stem strips the extension (covers Windows .exe).
+    #[test]
+    fn test_extract_argv0_stem_strips_extension() {
+        assert_eq!(
+            extract_argv0_stem("/Users/x/.skim/bin/git.exe").as_deref(),
+            Some("git"),
+            "file_stem() must strip .exe so Windows wrappers dispatch correctly"
+        );
+        assert_eq!(
+            extract_argv0_stem("npm.cmd").as_deref(),
+            Some("npm"),
+            "file_stem() must strip .cmd extension"
         );
     }
 
@@ -1433,5 +1532,33 @@ mod tests {
             analytics::is_safe_session_id(valid),
             "valid session ID must be accepted"
         );
+    }
+
+    // ========================================================================
+    // filter_wrappers_from_path tests
+    // ========================================================================
+
+    /// Fast-path: PATH with no ".skim" substring returns None without allocation.
+    #[test]
+    fn test_filter_wrappers_fast_path_no_skim() {
+        let path = std::ffi::OsString::from("/usr/local/bin:/usr/bin:/bin");
+        let result = filter_wrappers_from_path(&path);
+        assert!(
+            result.is_none(),
+            "PATH with no '.skim' must return None immediately (fast-path)"
+        );
+    }
+
+    /// Fast-path passes through to full filter when ".skim" is present but
+    /// does not match the wrappers directory — result may be None (unchanged).
+    #[test]
+    fn test_filter_wrappers_fast_path_skim_present_but_no_match() {
+        // A path containing ".skim" in a different position should not cause
+        // a panic; it falls through to the full filter which returns None
+        // when nothing was removed.
+        let path = std::ffi::OsString::from("/usr/local/bin:/some/.skim-other/bin:/usr/bin");
+        // We can't assert the exact value because it depends on skim_wrappers_dir(),
+        // but we can assert no panic occurs and the function is callable.
+        let _ = filter_wrappers_from_path(&path);
     }
 }
