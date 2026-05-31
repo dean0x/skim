@@ -221,7 +221,7 @@ fn process_language_files(
     vocab: &mut NodeKindVocabulary,
     collect_trigrams: bool,
     progress: &indicatif::ProgressBar,
-) -> (u32, LangProcessResult) {
+) -> LangProcessResult {
     let mut seen_hashes: HashSet<[u8; 32]> = HashSet::new();
     let mut bigram_df: HashMap<AstBigram, u32> = HashMap::new();
     let mut trigram_df: HashMap<AstTrigram, u32> = HashMap::new();
@@ -274,7 +274,7 @@ fn process_language_files(
     let unique_bigrams = bigram_df.len();
     let unique_trigrams = trigram_df.len();
 
-    let lang_result = LangProcessResult {
+    LangProcessResult {
         bigram_df,
         trigram_df,
         stats: AstLanguageStats {
@@ -286,9 +286,7 @@ fn process_language_files(
             total_node_count: lang_total_nodes,
         },
         deduplicated,
-    };
-
-    (lang_file_count, lang_result)
+    }
 }
 
 /// Extract AST n-grams from an entire corpus, grouped by language.
@@ -343,10 +341,10 @@ pub fn extract_ast_ngrams_from_corpus(
         let lang_files = &by_language[&lang_name];
         progress.set_message(lang_name.clone());
 
-        let (unique_count, lang_result) =
+        let lang_result =
             process_language_files(&lang_name, lang_files, vocab, collect_trigrams, &progress);
 
-        total_unique_files = total_unique_files.saturating_add(unique_count);
+        total_unique_files = total_unique_files.saturating_add(lang_result.stats.file_count);
         total_deduplicated = total_deduplicated.saturating_add(lang_result.deduplicated);
         language_stats.push(lang_result.stats);
         bigram_df_maps.insert(lang_name.clone(), lang_result.bigram_df);
