@@ -3,6 +3,7 @@
 //! `GitCloneSource` clones repos with `git`; `FixtureSource` reads from
 //! a local directory. Both implement `FileSource` for testing and production.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -289,6 +290,11 @@ pub(crate) fn walk_and_load(
 ) -> anyhow::Result<Vec<SourceFile>> {
     let mut files = Vec::new();
 
+    // Build a HashSet once before the walk so extension lookup is O(1) per entry
+    // instead of O(n) linear scan through the slice.
+    let allowed_set: Option<HashSet<&str>> =
+        extensions.map(|exts| exts.iter().copied().collect());
+
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false) // include dot-files but .gitignore is respected
         .build();
@@ -306,7 +312,7 @@ pub(crate) fn walk_and_load(
             .unwrap_or("")
             .to_lowercase();
 
-        match extensions {
+        match &allowed_set {
             None => {
                 // Default lexical mode: apply exclusion list then target list.
                 if EXCLUDED_EXTENSIONS.contains(&ext.as_str()) {
@@ -317,8 +323,8 @@ pub(crate) fn walk_and_load(
                 }
             }
             Some(allowed) => {
-                // Explicit extension list: no exclusion, only allow listed exts.
-                if !allowed.contains(&ext.as_str()) {
+                // Explicit extension set: no exclusion, only allow listed exts.
+                if !allowed.contains(ext.as_str()) {
                     continue;
                 }
             }

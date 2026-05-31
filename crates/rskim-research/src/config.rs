@@ -96,7 +96,17 @@ pub fn load_ast_corpus_config(path: &Path) -> anyhow::Result<CorpusConfig> {
     Ok(config)
 }
 
-fn validate_ast_repo(index: usize, repo: &RepoEntry) -> anyhow::Result<()> {
+/// Shared validation for fields common to both corpus configs.
+///
+/// Checks HTTPS URL and validates the commit reference using the provided
+/// validator closure. Language validation is intentionally left to the caller
+/// because each corpus accepts a different set of languages.
+fn validate_repo_common(
+    index: usize,
+    repo: &RepoEntry,
+    is_valid_commit: impl Fn(&str) -> bool,
+    commit_hint: &str,
+) -> anyhow::Result<()> {
     // Validate URL must use HTTPS.
     if !repo.url.starts_with("https://") {
         bail!(
@@ -106,16 +116,26 @@ fn validate_ast_repo(index: usize, repo: &RepoEntry) -> anyhow::Result<()> {
         );
     }
 
-    // Validate commit: either "HEAD" or a 40-character hex SHA (upper or lowercase).
-    let commit_ok = repo.commit == "HEAD"
-        || (repo.commit.len() == 40 && repo.commit.chars().all(|c| c.is_ascii_hexdigit()));
-    if !commit_ok {
+    // Validate commit using the caller-supplied predicate.
+    if !is_valid_commit(&repo.commit) {
         bail!(
-            "repos[{}]: commit must be 'HEAD' or a 40-character hex SHA, got: {}",
+            "repos[{}]: commit must be {}, got: {}",
             index,
+            commit_hint,
             repo.commit
         );
     }
+
+    Ok(())
+}
+
+fn validate_ast_repo(index: usize, repo: &RepoEntry) -> anyhow::Result<()> {
+    validate_repo_common(
+        index,
+        repo,
+        |c| c == "HEAD" || (c.len() == 40 && c.chars().all(|ch| ch.is_ascii_hexdigit())),
+        "'HEAD' or a 40-character hex SHA",
+    )?;
 
     // Validate language is one of the AST-supported target languages.
     if !AST_VALID_LANGUAGES.contains(&repo.language.as_str()) {
@@ -131,23 +151,12 @@ fn validate_ast_repo(index: usize, repo: &RepoEntry) -> anyhow::Result<()> {
 }
 
 fn validate_repo(index: usize, repo: &RepoEntry) -> anyhow::Result<()> {
-    // Validate URL must use HTTPS.
-    if !repo.url.starts_with("https://") {
-        bail!(
-            "repos[{}]: url must start with 'https://', got: {}",
-            index,
-            repo.url
-        );
-    }
-
-    // Validate commit must be a 40-character lowercase hex string.
-    if repo.commit.len() != 40 || !repo.commit.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!(
-            "repos[{}]: commit must be a 40-character hex SHA, got: {}",
-            index,
-            repo.commit
-        );
-    }
+    validate_repo_common(
+        index,
+        repo,
+        |c| c.len() == 40 && c.chars().all(|ch| ch.is_ascii_hexdigit()),
+        "a 40-character hex SHA",
+    )?;
 
     // Validate language is one of the supported target languages.
     if !VALID_LANGUAGES.contains(&repo.language.as_str()) {

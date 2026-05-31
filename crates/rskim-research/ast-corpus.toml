@@ -12,9 +12,7 @@
 #
 # Run `rskim-research ast-run` to clone and analyze all repos.
 
-# ─────────────────────────────────────────────────────────────────────
-# Rust (5 repos — reused from corpus.toml)
-# ─────────────────────────────────────────────────────────────────────
+# ---- Rust (5 repos — reused from corpus.toml) ----
 
 [[repos]]
 url = "https://github.com/BurntSushi/ripgrep"
@@ -41,9 +39,7 @@ url = "https://github.com/rust-lang/cargo"
 commit = "11c687e0a9ccd7214c9419eaad05dc2c4c5c9255"
 language = "Rust"
 
-# ─────────────────────────────────────────────────────────────────────
-# TypeScript (5 repos — reused from corpus.toml)
-# ─────────────────────────────────────────────────────────────────────
+# ---- TypeScript (5 repos — reused from corpus.toml) ----
 
 [[repos]]
 url = "https://github.com/microsoft/TypeScript"
@@ -70,9 +66,7 @@ url = "https://github.com/prisma/prisma"
 commit = "d6d9fc9ed341946d45c7d0aba35081a7bd741aa1"
 language = "TypeScript"
 
-# ─────────────────────────────────────────────────────────────────────
-# Python (5 repos — reused from corpus.toml)
-# ─────────────────────────────────────────────────────────────────────
+# ---- Python (5 repos — reused from corpus.toml) ----
 
 [[repos]]
 url = "https://github.com/pallets/flask"
@@ -99,9 +93,7 @@ url = "https://github.com/tiangolo/fastapi"
 commit = "e89a37e50d27f124b77e947b7965b6df75052a35"
 language = "Python"
 
-# ─────────────────────────────────────────────────────────────────────
-# Go (5 repos — reused from corpus.toml)
-# ─────────────────────────────────────────────────────────────────────
+# ---- Go (5 repos — reused from corpus.toml) ----
 
 [[repos]]
 url = "https://github.com/kubernetes/kubernetes"
@@ -128,9 +120,7 @@ url = "https://github.com/grafana/grafana"
 commit = "3219aed082f7eda99f369641423159fd07401c57"
 language = "Go"
 
-# ─────────────────────────────────────────────────────────────────────
-# Java (5 repos — reused from corpus.toml)
-# ─────────────────────────────────────────────────────────────────────
+# ---- Java (5 repos — reused from corpus.toml) ----
 
 [[repos]]
 url = "https://github.com/spring-projects/spring-boot"
@@ -157,9 +147,7 @@ url = "https://github.com/apache/kafka"
 commit = "7a64fe88476143bd5375a61419579e2f065c0d6c"
 language = "Java"
 
-# ─────────────────────────────────────────────────────────────────────
-# JavaScript (3 repos — new for AST corpus)
-# ─────────────────────────────────────────────────────────────────────
+# ---- JavaScript (3 repos — new for AST corpus) ----
 
 [[repos]]
 url = "https://github.com/facebook/react"
@@ -176,9 +164,7 @@ url = "https://github.com/webpack/webpack"
 commit = "66f71f8b643a2a1a83ad59c9671ce38a9547f593"
 language = "JavaScript"
 
-# ─────────────────────────────────────────────────────────────────────
-# C (3 repos — new for AST corpus)
-# ─────────────────────────────────────────────────────────────────────
+# ---- C (3 repos — new for AST corpus) ----
 
 [[repos]]
 url = "https://github.com/redis/redis"
@@ -195,9 +181,7 @@ url = "https://github.com/jqlang/jq"
 commit = "df924eae91af10cc236a907cdadd97813827aa1f"
 language = "C"
 
-# ─────────────────────────────────────────────────────────────────────
-# C++ (2 repos — new for AST corpus)
-# ─────────────────────────────────────────────────────────────────────
+# ---- C++ (2 repos — new for AST corpus) ----
 
 [[repos]]
 url = "https://github.com/opencv/opencv"
@@ -209,9 +193,7 @@ url = "https://github.com/grpc/grpc"
 commit = "36e467cff163e4060d4c98977538cf9f18b002d3"
 language = "Cpp"
 
-# ─────────────────────────────────────────────────────────────────────
-# C# (2 repos — new for AST corpus)
-# ─────────────────────────────────────────────────────────────────────
+# ---- C# (2 repos — new for AST corpus) ----
 
 [[repos]]
 url = "https://github.com/dotnet/roslyn"
@@ -223,9 +205,7 @@ url = "https://github.com/dotnet/aspnetcore"
 commit = "4637df87bce65b1a7d870a329e5ed5ec73bdd541"
 language = "CSharp"
 
-# ─────────────────────────────────────────────────────────────────────
-# Ruby (2 repos — new for AST corpus)
-# ─────────────────────────────────────────────────────────────────────
+# ---- Ruby (2 repos — new for AST corpus) ----
 
 [[repos]]
 url = "https://github.com/rails/rails"
@@ -237,18 +217,14 @@ url = "https://github.com/jekyll/jekyll"
 commit = "202df571314ba1d18e9fccd81d12aaad4a703c38"
 language = "Ruby"
 
-# ─────────────────────────────────────────────────────────────────────
-# Kotlin (1 repo — new for AST corpus)
-# ─────────────────────────────────────────────────────────────────────
+# ---- Kotlin (1 repo — new for AST corpus) ----
 
 [[repos]]
 url = "https://github.com/ktorio/ktor"
 commit = "97c94671025aa3dc50556fb129941824f5205fb5"
 language = "Kotlin"
 
-# ─────────────────────────────────────────────────────────────────────
-# Swift (2 repos — new for AST corpus)
-# ─────────────────────────────────────────────────────────────────────
+# ---- Swift (2 repos — new for AST corpus) ----
 
 [[repos]]
 url = "https://github.com/apple/swift-algorithms"

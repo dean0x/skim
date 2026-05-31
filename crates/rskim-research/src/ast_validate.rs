@@ -265,6 +265,36 @@ mod tests {
     }
 
     #[test]
+    fn percentile_boundary_0th_returns_min() {
+        let sorted = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
+        // 0th percentile → first element.
+        let result = percentile(&sorted, 0.0);
+        assert!(
+            (result - 1.0).abs() < 0.001,
+            "percentile(0.0) should return min (1.0), got {result}"
+        );
+    }
+
+    #[test]
+    fn percentile_boundary_100th_returns_max() {
+        let sorted = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
+        // 100th percentile → last element.
+        let result = percentile(&sorted, 100.0);
+        assert!(
+            (result - 5.0).abs() < 0.001,
+            "percentile(100.0) should return max (5.0), got {result}"
+        );
+    }
+
+    #[test]
+    fn percentile_boundary_single_element() {
+        // Both 0th and 100th percentile of a single-element slice must return that element.
+        let sorted = vec![42.0f32];
+        assert!((percentile(&sorted, 0.0) - 42.0).abs() < 0.001);
+        assert!((percentile(&sorted, 100.0) - 42.0).abs() < 0.001);
+    }
+
+    #[test]
     fn distribution_stats_correct() {
         // For [1, 2, 3, 4, 5]:
         //   p50 → idx = round(0.50 * 4) = 2 → value 3.0
@@ -320,6 +350,50 @@ mod tests {
         let report = run_ast_validation(&table);
         // Table has 6 bigrams — all 6 should appear (< 20 cap).
         assert_eq!(report.per_language[0].top_bigrams.len(), 6);
+    }
+
+    #[test]
+    fn top_bigrams_capped_at_20_with_more_than_20_inputs() {
+        // Build a table with 25 bigrams to exercise the hard cap.
+        let bigrams: Vec<AstBigramWeight> = (0u16..25)
+            .map(|i| AstBigramWeight {
+                parent_kind: format!("parent_{i}"),
+                child_kind: format!("child_{i}"),
+                bigram: encode_ast_bigram(i, i + 1),
+                idf: 25.0 - i as f32,
+            })
+            .collect();
+
+        let mut bigram_weights = HashMap::new();
+        bigram_weights.insert("Rust".to_string(), bigrams);
+
+        let table = AstWeightTable {
+            version: 1,
+            generated_at: "unix:0".to_string(),
+            vocabulary: (0..30).map(|i| format!("kind_{i}")).collect(),
+            corpus_stats: AstCorpusStats {
+                total_files: 1,
+                deduplicated_files: 0,
+                language_stats: vec![AstLanguageStats {
+                    language: "Rust".to_string(),
+                    file_count: 1,
+                    unique_bigrams: 25,
+                    unique_trigrams: 0,
+                    error_node_count: 0,
+                    total_node_count: 100,
+                }],
+            },
+            bigram_weights,
+            trigram_weights: HashMap::new(),
+        };
+
+        let report = run_ast_validation(&table);
+        // 25 inputs — cap must truncate to exactly 20.
+        assert_eq!(
+            report.per_language[0].top_bigrams.len(),
+            20,
+            "top_bigrams should be capped at 20 when input exceeds the limit"
+        );
     }
 
     #[test]

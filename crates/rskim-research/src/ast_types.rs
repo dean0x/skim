@@ -148,6 +148,7 @@ impl NodeKindVocabulary {
     }
 
     /// Return the ID for `kind`, inserting a new entry if not yet present.
+    #[must_use]
     pub fn get_or_insert(&mut self, kind: &str) -> NodeKindId {
         if let Some(&id) = self.kind_to_id.get(kind) {
             return id;
@@ -231,7 +232,7 @@ impl NodeKindVocabulary {
         self.id_to_kind = sorted_indices
             .iter()
             .map(|&old_id| {
-                // SAFETY: sorted_indices is a permutation of [0, N), so each slot
+                // INVARIANT: sorted_indices is a permutation of [0, N), so each slot
                 // is taken exactly once.  The unwrap_or_else branch is unreachable.
                 old_kinds_opt[old_id]
                     .take()
@@ -331,6 +332,9 @@ pub struct AstWeightTable {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    // get_or_insert is called in test setup for its side effect only (populating
+    // the vocabulary); the returned ID is intentionally discarded in those cases.
+    #![allow(unused_must_use)]
 
     use super::*;
 
@@ -543,6 +547,34 @@ mod tests {
         assert_eq!(rekeyed.len(), 1);
         let new_bigram = remap_bigram(old_bigram, &remap).unwrap();
         assert_eq!(rekeyed[&new_bigram], 42);
+    }
+
+    #[test]
+    fn rekey_bigram_df_map_merges_collisions() {
+        // Two distinct old bigrams that remap to the same new bigram key after
+        // stabilize must have their counts summed (the += accumulation path).
+        //
+        // Manual remap table: remap = [0, 0] forces a collision —
+        //   both old ID 0 and old ID 1 map to new ID 0.
+        //
+        // bigram_a = (0, 1) → remaps to (0, 0)
+        // bigram_b = (1, 0) → remaps to (0, 0)
+        //
+        // Both have count 10 → merged count must be 20.
+        let remap: Vec<NodeKindId> = vec![0, 0];
+
+        let bigram_a = encode_ast_bigram(0, 1);
+        let bigram_b = encode_ast_bigram(1, 0);
+        let mut df_map = HashMap::new();
+        df_map.insert(bigram_a, 10_u32);
+        df_map.insert(bigram_b, 10_u32);
+
+        let rekeyed = rekey_bigram_df_map(&df_map, &remap);
+
+        // Collision: both entries map to the same key; counts must be summed.
+        assert_eq!(rekeyed.len(), 1, "colliding bigrams must merge into one entry");
+        let merged_key = encode_ast_bigram(0, 0);
+        assert_eq!(rekeyed[&merged_key], 20, "collision counts must be summed: 10 + 10 = 20");
     }
 
     #[test]

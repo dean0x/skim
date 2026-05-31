@@ -215,14 +215,18 @@ struct LangProcessResult {
 
 /// Process all files for one language, deduplicating by content hash and
 /// accumulating per-language DF maps and statistics.
+///
+/// `seen_hashes` is shared across all language groups so that a file that
+/// appears under multiple languages (e.g. `.h` files catalogued under both C
+/// and Cpp) is hashed and processed only once.
 fn process_language_files(
     lang_name: &str,
     lang_files: &[&SourceFile],
     vocab: &mut NodeKindVocabulary,
     collect_trigrams: bool,
     progress: &indicatif::ProgressBar,
+    seen_hashes: &mut HashSet<[u8; 32]>,
 ) -> LangProcessResult {
-    let mut seen_hashes: HashSet<[u8; 32]> = HashSet::new();
     let mut bigram_df: HashMap<AstBigram, u32> = HashMap::new();
     let mut trigram_df: HashMap<AstTrigram, u32> = HashMap::new();
 
@@ -334,6 +338,11 @@ pub fn extract_ast_ngrams_from_corpus(
     let mut total_unique_files: u32 = 0;
     let mut total_deduplicated: u32 = 0;
 
+    // Corpus-level dedup set: shared across all language groups so that a file
+    // appearing in multiple groups (e.g. .h catalogued under both C and Cpp) is
+    // processed only once.
+    let mut seen_hashes: HashSet<[u8; 32]> = HashSet::new();
+
     let mut sorted_languages: Vec<String> = by_language.keys().cloned().collect();
     sorted_languages.sort();
 
@@ -341,8 +350,14 @@ pub fn extract_ast_ngrams_from_corpus(
         let lang_files = &by_language[&lang_name];
         progress.set_message(lang_name.clone());
 
-        let lang_result =
-            process_language_files(&lang_name, lang_files, vocab, collect_trigrams, &progress);
+        let lang_result = process_language_files(
+            &lang_name,
+            lang_files,
+            vocab,
+            collect_trigrams,
+            &progress,
+            &mut seen_hashes,
+        );
 
         total_unique_files = total_unique_files.saturating_add(lang_result.stats.file_count);
         total_deduplicated = total_deduplicated.saturating_add(lang_result.deduplicated);
@@ -387,6 +402,9 @@ mod tests {
         assert!(result.bigrams.is_empty());
         assert!(result.trigrams.is_empty());
         assert_eq!(result.error_node_count, 0);
+        // Tree-sitter always produces a root `source_file` node even for empty
+        // input — node_count is 1, not 0.
+        assert_eq!(result.node_count, 1);
     }
 
     #[test]
@@ -542,6 +560,31 @@ mod tests {
             "JavaScript should have a DF map"
         );
         assert_eq!(stats.language_stats.len(), 2);
+    }
+
+    #[test]
+    fn corpus_deduplicates_identical_content_across_languages() {
+        // Same content catalogued under two different language groups.
+        // The corpus-level seen_hashes must deduplicate across languages so the
+        // content is processed exactly once total, not once per language group.
+        let shared_source = "int shared() { return 0; }";
+        let files = vec![
+            make_file(shared_source, Language::C),
+            make_file(shared_source, Language::Cpp),
+        ];
+        let mut vocab = NodeKindVocabulary::new();
+        let (_, _, stats) = extract_ast_ngrams_from_corpus(&files, &mut vocab, false);
+
+        // total_files = 1: the second occurrence (different language, same hash)
+        // must be counted as a duplicate, not a new file.
+        assert_eq!(
+            stats.total_files, 1,
+            "identical content in two language groups should be counted once"
+        );
+        assert_eq!(
+            stats.deduplicated_files, 1,
+            "the duplicate should be recorded in deduplicated_files"
+        );
     }
 
     #[test]
