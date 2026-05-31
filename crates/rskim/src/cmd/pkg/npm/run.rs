@@ -29,9 +29,7 @@ use super::script_tool::{ScriptTool, extract_tool, resolve_script};
 fn stringify_result<T: AsRef<str>>(result: ParseResult<T>) -> ParseResult<String> {
     match result {
         ParseResult::Full(v) => ParseResult::Full(v.as_ref().to_string()),
-        ParseResult::Degraded(v, markers) => {
-            ParseResult::Degraded(v.as_ref().to_string(), markers)
-        }
+        ParseResult::Degraded(v, markers) => ParseResult::Degraded(v.as_ref().to_string(), markers),
         ParseResult::Passthrough(s) => ParseResult::Passthrough(s),
     }
 }

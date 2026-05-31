@@ -204,7 +204,10 @@ mod tests {
 
     #[test]
     fn test_extract_tool_cross_env_prefix() {
-        assert_eq!(extract_tool("cross-env NODE_ENV=test vitest"), ScriptTool::Vitest);
+        assert_eq!(
+            extract_tool("cross-env NODE_ENV=test vitest"),
+            ScriptTool::Vitest
+        );
     }
 
     #[test]
@@ -214,7 +217,10 @@ mod tests {
 
     #[test]
     fn test_extract_tool_bin_path() {
-        assert_eq!(extract_tool("node_modules/.bin/vitest --run"), ScriptTool::Vitest);
+        assert_eq!(
+            extract_tool("node_modules/.bin/vitest --run"),
+            ScriptTool::Vitest
+        );
     }
 
     #[test]
@@ -246,7 +252,10 @@ mod tests {
     #[test]
     fn test_extract_tool_js_extension_stripped() {
         // Launchers sometimes keep the .js extension.
-        assert_eq!(extract_tool("node_modules/.bin/vitest.js --run"), ScriptTool::Vitest);
+        assert_eq!(
+            extract_tool("node_modules/.bin/vitest.js --run"),
+            ScriptTool::Vitest
+        );
     }
 
     #[test]
@@ -298,10 +307,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            resolve_script(&child, "test"),
-            Some("jest".to_string())
-        );
+        assert_eq!(resolve_script(&child, "test"), Some("jest".to_string()));
     }
 
     #[test]

@@ -90,7 +90,9 @@ pub(crate) fn run(
 }
 
 fn print_help() {
-    println!("skim {{cargo build|cargo check|cargo fmt|cargo clippy|gradle|make|mvn|tsc}} [args...]");
+    println!(
+        "skim {{cargo build|cargo check|cargo fmt|cargo clippy|gradle|make|mvn|tsc}} [args...]"
+    );
     println!();
     println!("  Run build tools and compress output for AI context windows.");
     println!();
