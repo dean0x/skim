@@ -695,8 +695,8 @@ pub(super) use super::guidance::{GUIDANCE_START, inject_guidance, remove_guidanc
 // Re-export additional guidance symbols for the unit tests below (via `use super::*`).
 #[cfg(test)]
 pub(super) use super::guidance::{
-    atomic_write_stripped, find_skim_section, guidance_append, guidance_update, strip_skim_section,
-    update_existing_guidance,
+    MAX_INSTRUCTION_FILE_SIZE, atomic_write_stripped, find_skim_section, guidance_append,
+    guidance_update, read_existing_safely, strip_skim_section, update_existing_guidance,
 };
 
 // ============================================================================
@@ -906,5 +906,115 @@ mod tests {
         }
 
         assert!(!path.exists(), "Empty file should be deleted");
+    }
+
+    // ---- read_existing_safely: oversized-file guard ----
+
+    #[test]
+    fn test_read_existing_safely_oversized_file_returns_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("large.md");
+
+        // Write a file that is exactly one byte over the limit.
+        let large_content = vec![b'x'; MAX_INSTRUCTION_FILE_SIZE as usize + 1];
+        std::fs::write(&path, &large_content).unwrap();
+
+        let result = read_existing_safely(&path).unwrap();
+        assert!(
+            result.is_none(),
+            "read_existing_safely must return None for files exceeding MAX_INSTRUCTION_FILE_SIZE"
+        );
+    }
+
+    #[test]
+    fn test_read_existing_safely_file_at_limit_is_accepted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ok.md");
+
+        // A file exactly at the limit should pass.
+        let content = vec![b'y'; MAX_INSTRUCTION_FILE_SIZE as usize];
+        std::fs::write(&path, &content).unwrap();
+
+        let result = read_existing_safely(&path).unwrap();
+        assert!(
+            result.is_some(),
+            "read_existing_safely must accept files at exactly MAX_INSTRUCTION_FILE_SIZE bytes"
+        );
+    }
+
+    // ---- update_existing_guidance: all four code paths ----
+
+    #[test]
+    fn test_update_existing_guidance_corrupted_markers_skips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        // End marker appears before start marker — corrupted.
+        let corrupted = "<!-- skim-end -->\nsome content\n<!-- skim-start v1.0.0 -->\n";
+        std::fs::write(&path, corrupted).unwrap();
+
+        let result = update_existing_guidance(&path, corrupted, "2.0.0", "new content").unwrap();
+
+        assert!(
+            result,
+            "corrupted markers path must return true (done, skip write)"
+        );
+        // File should not have been modified.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, corrupted, "file must be unchanged when markers are corrupted");
+    }
+
+    #[test]
+    fn test_update_existing_guidance_same_version_skips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        let existing = "<!-- skim-start v2.0.0 -->\nguidance\n<!-- skim-end -->\n";
+        std::fs::write(&path, existing).unwrap();
+
+        let result = update_existing_guidance(&path, existing, "2.0.0", "new content").unwrap();
+
+        assert!(result, "same-version path must return true (done, skip write)");
+        // File should not have been modified.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, existing, "file must be unchanged when version matches");
+    }
+
+    #[test]
+    fn test_update_existing_guidance_different_version_updates_in_place() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        let old_guidance = guidance_content("1.0.0");
+        let existing = format!("# Header\n\n{old_guidance}\n\n# Footer\n");
+        std::fs::write(&path, &existing).unwrap();
+
+        let new_guidance = guidance_content("3.0.0");
+        let result =
+            update_existing_guidance(&path, &existing, "3.0.0", &new_guidance).unwrap();
+
+        assert!(result, "different-version path must return true (update done)");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("v3.0.0"), "updated file must contain new version");
+        assert!(!on_disk.contains("v1.0.0"), "updated file must not contain old version");
+        assert!(on_disk.contains("# Header"), "surrounding content must be preserved");
+        assert!(on_disk.contains("# Footer"), "surrounding content must be preserved");
+    }
+
+    #[test]
+    fn test_update_existing_guidance_no_section_appends() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        let existing = "# My Rules\n\nSome existing content.\n";
+        std::fs::write(&path, existing).unwrap();
+
+        let new_guidance = guidance_content("2.5.0");
+        let result =
+            update_existing_guidance(&path, existing, "2.5.0", &new_guidance).unwrap();
+
+        assert!(
+            !result,
+            "no-section path must return false (caller should print footer)"
+        );
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.starts_with("# My Rules"), "existing content must be kept");
+        assert!(on_disk.contains("<!-- skim-start v2.5.0 -->"), "new guidance must be appended");
     }
 }

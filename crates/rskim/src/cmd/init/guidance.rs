@@ -200,8 +200,10 @@ pub(super) fn inject_guidance(
         guidance_create(&path, &new_content)?;
     }
 
-    // Legacy cleanup: remove skim markers from .cursorrules when writing skim.mdc
-    if path.to_string_lossy().contains("skim.mdc") {
+    // Legacy cleanup: remove skim markers from .cursorrules when writing skim.mdc.
+    // Use file_name() rather than contains() to avoid false positives on paths
+    // like /some/skim.mdc-backup/CLAUDE.md.
+    if path.file_name().is_some_and(|n| n == "skim.mdc") {
         clean_legacy_cursorrules()?;
     }
 
@@ -328,9 +330,13 @@ pub(super) fn clean_legacy_cursorrules() -> anyhow::Result<()> {
     }
     // S2: apply resolve_real_settings_path so symlinks are handled consistently
     let legacy = super::helpers::resolve_real_settings_path(&legacy)?;
-    if let Ok(content) = std::fs::read_to_string(&legacy)
-        && let Some(cleaned) = strip_skim_section(&content)
-    {
+    // Route through read_existing_safely to apply the 1 MiB size guard
+    // that protects all other instruction file reads.
+    let content = match read_existing_safely(&legacy)? {
+        Some(s) => s,
+        None => return Ok(()), // file too large or unreadable — skip silently
+    };
+    if let Some(cleaned) = strip_skim_section(&content) {
         // Leave the file in place even when cleaned is empty (user may own it).
         atomic_write_stripped(&legacy, &cleaned)?;
         println!("  {} Cleaned legacy .cursorrules markers", check_mark(true));
