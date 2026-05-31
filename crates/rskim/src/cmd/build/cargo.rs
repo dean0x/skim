@@ -504,7 +504,11 @@ mod tests {
     fn test_parse_fmt_empty_output_is_success() {
         let output = make_output_full("", "", Some(0));
         let result = parse_fmt(&output);
-        assert!(result.is_full(), "expected Full, got {:?}", result.tier_name());
+        assert!(
+            result.is_full(),
+            "expected Full, got {:?}",
+            result.tier_name()
+        );
         if let ParseResult::Full(build_result) = &result {
             assert!(build_result.success, "expected success for empty output");
             assert_eq!(build_result.errors, 0);
