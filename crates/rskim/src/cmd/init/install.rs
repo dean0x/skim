@@ -75,8 +75,11 @@ fn is_guidance_current(
     agent
         .instruction_file(global, env)
         .map(|p| {
-            std::fs::read_to_string(&p)
+            // Route through read_existing_safely to apply the 1 MiB size guard,
+            // matching the parallel path in inject_guidance.
+            read_existing_safely(&p)
                 .ok()
+                .flatten()
                 .map(|c| c.contains(&format!("{} v{}", GUIDANCE_START, skim_version)))
                 .unwrap_or(false)
         })
@@ -317,38 +320,47 @@ fn execute_install(
         inject_guidance(agent_from_state(state)?, global, env)?;
     }
 
-    // Search: install git hooks and start a background index build.
-    // Non-fatal: failures here must not abort the agent hook setup above.
-    // find_git_root_from_cwd already verifies .git exists, so the inner
-    // .git check is redundant — collapse both conditions.
-    if let Some(project_root) = find_git_root_from_cwd() {
-        if let Err(e) = crate::cmd::search::hooks::install_search_hooks(project_root.as_path()) {
-            eprintln!("  Note: could not install search hooks: {e}");
-        } else {
-            println!("  {} Search hooks installed", check_mark(true));
-        }
+    // Search hooks + background index — non-fatal, delegated to helper.
+    install_search_integration();
 
-        // Spawn a background build — fire-and-forget, non-blocking, non-fatal.
-        //
-        // The `Child` handle is intentionally dropped without calling `wait()`.
-        // On Unix the child process is reparented to init (PID 1) when this
-        // process exits and will be reaped there.  The `skim init` command exits
-        // immediately after this block, so the window for a zombie entry in the
-        // process table is negligible.  The build lock in `build_index` prevents
-        // concurrent writes when multiple callers overlap.
-        if let Some(exe) = std::env::current_exe().ok()
-            && let Ok(child) = std::process::Command::new(&exe)
-                .args(["search", "--build"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
+    Ok(())
+}
+
+/// Install search git hooks and spawn a background index build.
+///
+/// Non-fatal: all failures are printed as notices but do not abort the caller.
+/// `find_git_root_from_cwd` already verifies `.git` exists, so no inner `.git`
+/// check is needed — the outer `if let Some(...)` is the only guard required.
+fn install_search_integration() {
+    let Some(project_root) = find_git_root_from_cwd() else {
+        return;
+    };
+
+    if let Err(e) = crate::cmd::search::hooks::install_search_hooks(project_root.as_path()) {
+        eprintln!("  Note: could not install search hooks: {e}");
+    } else {
+        println!("  {} Search hooks installed", check_mark(true));
+    }
+
+    // Spawn a background build — fire-and-forget, non-blocking, non-fatal.
+    //
+    // The `Child` handle is intentionally dropped without calling `wait()`.
+    // On Unix the child process is reparented to init (PID 1) when this
+    // process exits and will be reaped there.  The `skim init` command exits
+    // immediately after this block, so the window for a zombie entry in the
+    // process table is negligible.  The build lock in `build_index` prevents
+    // concurrent writes when multiple callers overlap.
+    if let Some(exe) = std::env::current_exe().ok() {
+        if let Ok(child) = std::process::Command::new(&exe)
+            .args(["search", "--build"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
         {
             eprintln!("  Search index build started (PID {})", child.id());
             drop(child); // Detach: do not wait for the background process.
         }
     }
-
-    Ok(())
 }
 
 /// Install or prompt for shell wrapper installation in `~/.skim/bin/`.
@@ -419,7 +431,11 @@ fn maybe_install_wrappers(wrappers: Option<bool>, dry_run: bool) -> anyhow::Resu
 
 /// Walk up from `cwd` looking for a directory that contains `.git`.
 ///
-/// Returns `None` when no `.git` is found within 256 ancestors.
+/// Returns `None` when no `.git` is found within 64 ancestors.
+///
+/// The bound is 64: realistic repo nesting is rarely deeper than 10–20 levels,
+/// and capping at 64 reduces worst-case `stat` calls on slow/network filesystems
+/// while still covering all real-world cases.
 ///
 /// # Note
 ///
@@ -428,12 +444,11 @@ fn maybe_install_wrappers(wrappers: Option<bool>, dry_run: bool) -> anyhow::Resu
 /// is found) and canonicalises the start path first.  This function has
 /// different semantics: callers here need `None` to mean "not a git repo" so
 /// they can skip hook installation entirely.  The two functions are kept separate
-/// to preserve the distinct caller contracts; they share the same 256-ancestor
-/// bound to prevent unbounded traversal.
+/// to preserve the distinct caller contracts.
 fn find_git_root_from_cwd() -> Option<std::path::PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let mut current = cwd.as_path();
-    for _ in 0..256 {
+    for _ in 0..64 {
         if current.join(".git").exists() {
             return Some(current.to_path_buf());
         }
@@ -508,29 +523,7 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
     // compile-time CARGO_PKG_VERSION, so this is safe.
     let script_content = generate_hook_script(&state.skim_version, state.agent_cli_name);
 
-    // Atomic write: write to tmp, then rename to final path.
-    // A crash mid-write produces a tmp file instead of a truncated script.
-    // Cleanup guard: remove tmp on any failure (S1).
-    let tmp_path = hooks_dir.join(format!("{HOOK_SCRIPT_NAME}.tmp"));
-    if let Err(e) = std::fs::write(&tmp_path, script_content) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
-
-    // Set executable permissions on the tmp file before renaming
-    #[cfg(unix)]
-    {
-        let perms = std::fs::Permissions::from_mode(0o755);
-        if let Err(e) = std::fs::set_permissions(&tmp_path, perms) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
-        }
-    }
-
-    if let Err(e) = std::fs::rename(&tmp_path, &script_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
+    atomic_write_executable(&hooks_dir, &script_path, &script_content)?;
 
     // Compute and store SHA-256 hash for integrity verification (#57)
     if let Ok(hash) = crate::cmd::integrity::compute_file_hash(&script_path) {
@@ -540,6 +533,41 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
             HOOK_SCRIPT_NAME,
             &hash,
         );
+    }
+
+    Ok(())
+}
+
+/// Atomically write `content` to `script_path` and set executable permissions.
+///
+/// Writes to a `.tmp` sibling first, then renames — a crash mid-write produces
+/// a tmp file instead of a truncated script.  The tmp file is removed on any
+/// failure (cleanup guard).  On Unix, `0o755` permissions are applied to the
+/// tmp file *before* the rename so the final path is always executable.
+fn atomic_write_executable(
+    dir: &std::path::Path,
+    script_path: &std::path::Path,
+    content: &str,
+) -> anyhow::Result<()> {
+    let tmp_path = dir.join(format!("{HOOK_SCRIPT_NAME}.tmp"));
+
+    if let Err(e) = std::fs::write(&tmp_path, content) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+
+    #[cfg(unix)]
+    {
+        let perms = std::fs::Permissions::from_mode(0o755);
+        if let Err(e) = std::fs::set_permissions(&tmp_path, perms) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, script_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
     }
 
     Ok(())
@@ -690,13 +718,16 @@ fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
 // ============================================================================
 
 // Re-export guidance symbols used by production code in this module.
-pub(super) use super::guidance::{GUIDANCE_START, inject_guidance, remove_guidance};
+pub(super) use super::guidance::{
+    GUIDANCE_START, inject_guidance, read_existing_safely, remove_guidance,
+};
 
 // Re-export additional guidance symbols for the unit tests below (via `use super::*`).
+// `read_existing_safely` is already exported above for production use; omit here.
 #[cfg(test)]
 pub(super) use super::guidance::{
     MAX_INSTRUCTION_FILE_SIZE, atomic_write_stripped, find_skim_section, guidance_append,
-    guidance_update, read_existing_safely, strip_skim_section, update_existing_guidance,
+    guidance_update, strip_skim_section, update_existing_guidance,
 };
 
 // ============================================================================
@@ -759,6 +790,60 @@ mod tests {
             entries.len(),
             1,
             "running upsert twice should produce exactly one entry, not a duplicate"
+        );
+    }
+
+    // ---- is_hook_script_current ----
+
+    #[test]
+    fn test_is_hook_script_current_matching_version_and_bare_exec_returns_true() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("skim-rewrite.sh");
+        let content = "#!/bin/sh\n# skim-hook v1.2.3\nexec skim rewrite --hook \"$@\"\n";
+        std::fs::write(&path, content).unwrap();
+
+        assert!(
+            is_hook_script_current(&path, "1.2.3"),
+            "matching version + bare exec line must return true"
+        );
+    }
+
+    #[test]
+    fn test_is_hook_script_current_wrong_version_returns_false() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("skim-rewrite.sh");
+        // Script has v1.0.0 but we check for v2.0.0
+        let content = "#!/bin/sh\n# skim-hook v1.0.0\nexec skim rewrite --hook \"$@\"\n";
+        std::fs::write(&path, content).unwrap();
+
+        assert!(
+            !is_hook_script_current(&path, "2.0.0"),
+            "mismatched version must return false"
+        );
+    }
+
+    #[test]
+    fn test_is_hook_script_current_missing_file_returns_false() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nonexistent.sh");
+
+        assert!(
+            !is_hook_script_current(&path, "1.0.0"),
+            "unreadable/missing file must return false"
+        );
+    }
+
+    #[test]
+    fn test_is_hook_script_current_missing_bare_exec_returns_false() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("skim-rewrite.sh");
+        // Version matches but no bare `exec skim ` line
+        let content = "#!/bin/sh\n# skim-hook v1.2.3\nskim rewrite --hook \"$@\"\n";
+        std::fs::write(&path, content).unwrap();
+
+        assert!(
+            !is_hook_script_current(&path, "1.2.3"),
+            "missing bare exec line must return false even when version matches"
         );
     }
 
