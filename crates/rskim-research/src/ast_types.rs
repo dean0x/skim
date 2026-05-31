@@ -263,6 +263,10 @@ impl NodeKindVocabulary {
 // ─────────────────────────────────────────────────────────
 
 /// A single AST bigram with its IDF weight and human-readable kind strings.
+///
+/// **Sort contract:** When returned from `compute_ast_bigram_weights`, entries are
+/// sorted by `idf` descending. Consumers that re-sort (e.g. by bigram key for
+/// deterministic JSON output) must document their own sort order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AstBigramWeight {
     pub parent_kind: String,
@@ -272,6 +276,10 @@ pub struct AstBigramWeight {
 }
 
 /// A single AST trigram with its IDF weight and human-readable kind strings.
+///
+/// **Sort contract:** When returned from `compute_ast_trigram_weights`, entries are
+/// sorted by `idf` descending. Consumers that re-sort (e.g. by trigram key for
+/// deterministic JSON output) must document their own sort order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AstTrigramWeight {
     pub grandparent_kind: String,
