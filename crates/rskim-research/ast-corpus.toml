@@ -7,7 +7,8 @@
 # SQL and Markdown files are extracted from polyglot repos (django, spring-boot,
 # kubernetes, etc.) — no dedicated entries are needed for them.
 #
-# New repos use commit = "HEAD" as a placeholder; the extractor clones at HEAD.
+# All repos are pinned to a specific commit SHA for reproducibility.
+# To refresh: run `git ls-remote <url> HEAD` and update the commit field.
 #
 # Run `rskim-research ast-run` to clone and analyze all repos.
 
@@ -162,17 +163,17 @@ language = "Java"
 
 [[repos]]
 url = "https://github.com/facebook/react"
-commit = "HEAD"
+commit = "05ca66ad9c6f07b9ee2cc6a8f2129750e8f96fa4"
 language = "JavaScript"
 
 [[repos]]
 url = "https://github.com/expressjs/express"
-commit = "HEAD"
+commit = "dae209ae6559c29cfca2a1f4414c51d89ea643d5"
 language = "JavaScript"
 
 [[repos]]
 url = "https://github.com/webpack/webpack"
-commit = "HEAD"
+commit = "66f71f8b643a2a1a83ad59c9671ce38a9547f593"
 language = "JavaScript"
 
 # ─────────────────────────────────────────────────────────────────────
@@ -181,17 +182,17 @@ language = "JavaScript"
 
 [[repos]]
 url = "https://github.com/redis/redis"
-commit = "HEAD"
+commit = "65401042dc6105eac649dfc3b52eadb3fbb852a2"
 language = "C"
 
 [[repos]]
 url = "https://github.com/curl/curl"
-commit = "HEAD"
+commit = "6ac42e569112bfb8fb6bfec02db6d83612b184e3"
 language = "C"
 
 [[repos]]
 url = "https://github.com/jqlang/jq"
-commit = "HEAD"
+commit = "df924eae91af10cc236a907cdadd97813827aa1f"
 language = "C"
 
 # ─────────────────────────────────────────────────────────────────────
@@ -200,12 +201,12 @@ language = "C"
 
 [[repos]]
 url = "https://github.com/opencv/opencv"
-commit = "HEAD"
+commit = "ebb46d5f1708329450233e617bdb1b9eadea752a"
 language = "Cpp"
 
 [[repos]]
 url = "https://github.com/grpc/grpc"
-commit = "HEAD"
+commit = "36e467cff163e4060d4c98977538cf9f18b002d3"
 language = "Cpp"
 
 # ─────────────────────────────────────────────────────────────────────
@@ -214,12 +215,12 @@ language = "Cpp"
 
 [[repos]]
 url = "https://github.com/dotnet/roslyn"
-commit = "HEAD"
+commit = "ae3b522d4e196ac214b3e38ae77e7ec2b31806dd"
 language = "CSharp"
 
 [[repos]]
 url = "https://github.com/dotnet/aspnetcore"
-commit = "HEAD"
+commit = "4637df87bce65b1a7d870a329e5ed5ec73bdd541"
 language = "CSharp"
 
 # ─────────────────────────────────────────────────────────────────────
@@ -228,12 +229,12 @@ language = "CSharp"
 
 [[repos]]
 url = "https://github.com/rails/rails"
-commit = "HEAD"
+commit = "6d5c14cbb7e22604b6647662969c65f3625b9d8c"
 language = "Ruby"
 
 [[repos]]
 url = "https://github.com/jekyll/jekyll"
-commit = "HEAD"
+commit = "202df571314ba1d18e9fccd81d12aaad4a703c38"
 language = "Ruby"
 
 # ─────────────────────────────────────────────────────────────────────
@@ -242,7 +243,7 @@ language = "Ruby"
 
 [[repos]]
 url = "https://github.com/ktorio/ktor"
-commit = "HEAD"
+commit = "97c94671025aa3dc50556fb129941824f5205fb5"
 language = "Kotlin"
 
 # ─────────────────────────────────────────────────────────────────────
@@ -251,12 +252,12 @@ language = "Kotlin"
 
 [[repos]]
 url = "https://github.com/apple/swift-algorithms"
-commit = "HEAD"
+commit = "0b4376902cfc3901c496a79f2cb70f1ffd583fff"
 language = "Swift"
 
 [[repos]]
 url = "https://github.com/vapor/vapor"
-commit = "HEAD"
+commit = "712b0919a3ba772f7402ccaf07cdb6ca823dd650"
 language = "Swift"
 
 # NOTE: SQL and Markdown files are found in the polyglot repos above

@@ -74,7 +74,7 @@ pub fn extract_ast_ngrams_from_file(
         return Ok(AstFileResult::default());
     }
 
-    // Parser::new returns Err for non-tree-sitter languages (JSON, YAML, TOML, Markdown).
+    // Parser::new returns Err for non-tree-sitter languages (JSON, YAML, TOML).
     // We treat these as "no AST available" and return an empty result.
     let mut parser = match Parser::new(language) {
         Ok(p) => p,
@@ -129,6 +129,16 @@ struct WalkContext<'a> {
 ///
 /// ERROR nodes are counted but not included in bigram/trigram pairs (they
 /// represent parse failures, not real grammar relationships).
+///
+/// # Parameter design
+///
+/// `depth`, `parent_id`, and `grandparent_id` are stack-local values that
+/// change on every recursive call: `depth` increments by one and the
+/// parent/grandparent IDs shift forward as the cursor descends. Folding them
+/// into `WalkContext` would require saving and restoring their previous values
+/// around each recursive call, adding complexity without reducing the
+/// parameter count in any meaningful way. They remain separate parameters so
+/// that each activation frame carries its own correct state automatically.
 fn walk_tree(
     cursor: &mut tree_sitter::TreeCursor,
     ctx: &mut WalkContext<'_>,
@@ -194,6 +204,93 @@ fn walk_tree(
     }
 }
 
+/// Result of processing all files for a single language.
+struct LangProcessResult {
+    bigram_df: HashMap<AstBigram, u32>,
+    trigram_df: HashMap<AstTrigram, u32>,
+    stats: AstLanguageStats,
+    /// Number of duplicate files skipped via content-hash deduplication.
+    deduplicated: u32,
+}
+
+/// Process all files for one language, deduplicating by content hash and
+/// accumulating per-language DF maps and statistics.
+fn process_language_files(
+    lang_name: &str,
+    lang_files: &[&SourceFile],
+    vocab: &mut NodeKindVocabulary,
+    collect_trigrams: bool,
+    progress: &indicatif::ProgressBar,
+) -> (u32, LangProcessResult) {
+    let mut seen_hashes: HashSet<[u8; 32]> = HashSet::new();
+    let mut bigram_df: HashMap<AstBigram, u32> = HashMap::new();
+    let mut trigram_df: HashMap<AstTrigram, u32> = HashMap::new();
+
+    let mut lang_file_count: u32 = 0;
+    let mut lang_error_nodes: u32 = 0;
+    let mut lang_total_nodes: u32 = 0;
+    let mut deduplicated: u32 = 0;
+
+    for file in lang_files {
+        progress.inc(1);
+
+        let hash = content_hash(&file.content);
+        if !seen_hashes.insert(hash) {
+            deduplicated = deduplicated.saturating_add(1);
+            continue;
+        }
+
+        lang_file_count = lang_file_count.saturating_add(1);
+
+        let result = match extract_ast_ngrams_from_file(
+            &file.content,
+            file.language,
+            vocab,
+            collect_trigrams,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "Warning: AST extraction failed for {}: {e:#}",
+                    file.path.display()
+                );
+                continue;
+            }
+        };
+
+        lang_error_nodes = lang_error_nodes.saturating_add(result.error_node_count);
+        lang_total_nodes = lang_total_nodes.saturating_add(result.node_count);
+
+        for bigram in result.bigrams {
+            let count = bigram_df.entry(bigram).or_default();
+            *count = count.saturating_add(1);
+        }
+        for trigram in result.trigrams {
+            let count = trigram_df.entry(trigram).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+
+    let unique_bigrams = bigram_df.len();
+    let unique_trigrams = trigram_df.len();
+
+    let lang_result = LangProcessResult {
+        bigram_df,
+        trigram_df,
+        stats: AstLanguageStats {
+            language: lang_name.to_string(),
+            file_count: lang_file_count,
+            unique_bigrams,
+            unique_trigrams,
+            error_node_count: lang_error_nodes,
+            total_node_count: lang_total_nodes,
+        },
+        deduplicated,
+    };
+
+    (lang_file_count, lang_result)
+}
+
 /// Extract AST n-grams from an entire corpus, grouped by language.
 ///
 /// Returns:
@@ -202,6 +299,13 @@ fn walk_tree(
 /// - Aggregated corpus statistics.
 ///
 /// Files are SHA-256-deduplicated before counting DF values.
+///
+/// # Parallelism note
+///
+/// Extraction is sequential across languages because all files share a single
+/// `NodeKindVocabulary`. Parallel extraction would require per-thread vocabularies
+/// merged via a map-reduce step — a larger refactoring left for a dedicated
+/// optimization pass.
 pub fn extract_ast_ngrams_from_corpus(
     files: &[SourceFile],
     vocab: &mut NodeKindVocabulary,
@@ -226,8 +330,8 @@ pub fn extract_ast_ngrams_from_corpus(
         progress.set_style(style);
     }
 
-    let mut bigram_df_maps: HashMap<String, HashMap<AstBigram, u32>> = HashMap::new();
-    let mut trigram_df_maps: HashMap<String, HashMap<AstTrigram, u32>> = HashMap::new();
+    let mut bigram_df_maps: BigramDfMap = HashMap::new();
+    let mut trigram_df_maps: TrigramDfMap = HashMap::new();
     let mut language_stats: Vec<AstLanguageStats> = Vec::new();
     let mut total_unique_files: u32 = 0;
     let mut total_deduplicated: u32 = 0;
@@ -237,64 +341,16 @@ pub fn extract_ast_ngrams_from_corpus(
 
     for lang_name in sorted_languages {
         let lang_files = &by_language[&lang_name];
-
-        let mut seen_hashes: HashSet<[u8; 32]> = HashSet::new();
-        let bigram_df = bigram_df_maps.entry(lang_name.clone()).or_default();
-        let trigram_df = trigram_df_maps.entry(lang_name.clone()).or_default();
-
-        let mut lang_file_count: u32 = 0;
-        let mut lang_error_nodes: u32 = 0;
-        let mut lang_total_nodes: u32 = 0;
-
         progress.set_message(lang_name.clone());
 
-        for file in lang_files.iter() {
-            progress.inc(1);
+        let (unique_count, lang_result) =
+            process_language_files(&lang_name, lang_files, vocab, collect_trigrams, &progress);
 
-            let hash = content_hash(&file.content);
-            if !seen_hashes.insert(hash) {
-                total_deduplicated += 1;
-                continue;
-            }
-
-            lang_file_count += 1;
-            total_unique_files += 1;
-
-            let result = match extract_ast_ngrams_from_file(
-                &file.content,
-                file.language,
-                vocab,
-                collect_trigrams,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!(
-                        "Warning: AST extraction failed for {}: {e:#}",
-                        file.path.display()
-                    );
-                    continue;
-                }
-            };
-
-            lang_error_nodes = lang_error_nodes.saturating_add(result.error_node_count);
-            lang_total_nodes = lang_total_nodes.saturating_add(result.node_count);
-
-            for bigram in result.bigrams {
-                *bigram_df.entry(bigram).or_default() += 1;
-            }
-            for trigram in result.trigrams {
-                *trigram_df.entry(trigram).or_default() += 1;
-            }
-        }
-
-        language_stats.push(AstLanguageStats {
-            language: lang_name,
-            file_count: lang_file_count,
-            unique_bigrams: bigram_df.len(),
-            unique_trigrams: trigram_df.len(),
-            error_node_count: lang_error_nodes,
-            total_node_count: lang_total_nodes,
-        });
+        total_unique_files = total_unique_files.saturating_add(unique_count);
+        total_deduplicated = total_deduplicated.saturating_add(lang_result.deduplicated);
+        language_stats.push(lang_result.stats);
+        bigram_df_maps.insert(lang_name.clone(), lang_result.bigram_df);
+        trigram_df_maps.insert(lang_name, lang_result.trigram_df);
     }
 
     progress.finish_with_message("done");
