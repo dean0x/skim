@@ -6,6 +6,7 @@
 pub mod ast_codegen;
 pub mod ast_extract;
 pub mod ast_idf;
+pub mod ast_pipeline;
 pub mod ast_types;
 pub mod ast_validate;
 pub mod clone;
