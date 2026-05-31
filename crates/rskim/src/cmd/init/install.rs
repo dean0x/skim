@@ -1113,23 +1113,29 @@ mod tests {
 
     // ---- agent_from_state ----
 
+    /// Build a minimal `DetectedState` with the given `agent_cli_name` for
+    /// `agent_from_state` tests. All other fields are inert defaults.
+    fn state_with_cli_name(agent_cli_name: &'static str) -> DetectedState {
+        DetectedState {
+            skim_binary: std::path::PathBuf::from("/usr/bin/skim"),
+            skim_version: "1.0.0".to_string(),
+            config_dir: std::path::PathBuf::from("/tmp"),
+            settings_path: std::path::PathBuf::from("/tmp/settings.json"),
+            settings_exists: false,
+            hook_installed: false,
+            hook_version: None,
+            hook_uses_bare_command: false,
+            dual_scope_warning: None,
+            existing_hooks: vec![],
+            agent_cli_name,
+        }
+    }
+
     #[test]
     fn test_agent_from_state_valid_name_returns_ok() {
         // Every known cli_name must round-trip through agent_from_state without error.
         for agent in AgentKind::all_supported() {
-            let state = DetectedState {
-                skim_binary: std::path::PathBuf::from("/usr/bin/skim"),
-                skim_version: "1.0.0".to_string(),
-                config_dir: std::path::PathBuf::from("/tmp"),
-                settings_path: std::path::PathBuf::from("/tmp/settings.json"),
-                settings_exists: false,
-                hook_installed: false,
-                hook_version: None,
-                hook_uses_bare_command: false,
-                dual_scope_warning: None,
-                existing_hooks: vec![],
-                agent_cli_name: agent.cli_name(),
-            };
+            let state = state_with_cli_name(agent.cli_name());
             assert!(
                 agent_from_state(&state).is_ok(),
                 "agent_from_state must succeed for known cli_name {:?}",
@@ -1141,19 +1147,7 @@ mod tests {
     #[test]
     fn test_agent_from_state_invalid_name_returns_err() {
         // An unrecognised cli_name is a bug in state detection; must produce an Err.
-        let state = DetectedState {
-            skim_binary: std::path::PathBuf::from("/usr/bin/skim"),
-            skim_version: "1.0.0".to_string(),
-            config_dir: std::path::PathBuf::from("/tmp"),
-            settings_path: std::path::PathBuf::from("/tmp/settings.json"),
-            settings_exists: false,
-            hook_installed: false,
-            hook_version: None,
-            hook_uses_bare_command: false,
-            dual_scope_warning: None,
-            existing_hooks: vec![],
-            agent_cli_name: "not-a-real-agent",
-        };
+        let state = state_with_cli_name("not-a-real-agent");
         let err = agent_from_state(&state).unwrap_err();
         assert!(
             err.to_string().contains("unrecognised agent CLI name"),
@@ -1177,29 +1171,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_project_flag_true_means_wrappers_guard_fires() {
-        // The guard `if !flags.project` at the call sites in run_install_single
-        // ensures wrappers are never installed during project-scope init.
-        // Verify the condition directly so the test fails if the flag semantics change.
-        let project_flags = InitFlags {
-            project: true,
-            yes: false,
-            dry_run: false,
-            uninstall: false,
-            force: false,
-            no_guidance: true,
-            agent: Some(AgentKind::ClaudeCode),
-            wrappers: Some(true), // Even with wrappers explicitly requested...
-        };
-        // ...the guard `if !flags.project` must prevent the call.
-        assert!(
-            project_flags.project,
-            "project flag must be true to trigger the wrapper-skip guard"
-        );
-        assert!(
-            !(!project_flags.project),
-            "!flags.project must be false, so the wrapper install block is skipped"
-        );
-    }
 }

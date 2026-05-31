@@ -241,7 +241,8 @@ pub(super) fn remove_guidance(
         }
     };
 
-    // Issue 5: resolve symlinks before operating on the path
+    // Resolve symlinks before operating on the path so writes target the real
+    // file, not a dangling or redirected symlink (mirrors inject_guidance).
     let path = super::helpers::resolve_real_settings_path(&path)?;
 
     let content = match read_existing_safely(&path)? {
