@@ -452,6 +452,11 @@ pub(crate) fn generate_hook_script(version: &str, agent_cli_name: &str) -> Strin
          # Guard with directory existence: skip if ~/.skim/bin was never created\n\
          # (i.e. `skim init --wrappers` has not been run). The skim binary strips\n\
          # this entry at startup to prevent infinite recursion.\n\
+         # TRUST: $HOME is the user's own trust domain. An attacker with write\n\
+         # access to $HOME already has broader control than PATH manipulation\n\
+         # would provide. No ownership check is performed; $HOME membership is\n\
+         # the sole trust criterion (defence-in-depth is satisfied by the\n\
+         # directory-existence guard above and the recursion-prevention strip).\n\
          [ -d \"$HOME/.skim/bin\" ] && export PATH=\"$HOME/.skim/bin${{PATH:+:$PATH}}\"\n\
          exec skim rewrite --hook --agent {agent_cli_name}\n"
     )
@@ -536,6 +541,12 @@ mod tests {
             "PATH export must appear before exec line"
         );
         assert!(script.contains("exec skim rewrite --hook --agent test-agent"));
+        // Trust assumption must be documented inline so reviewers understand
+        // why no ownership check is performed.
+        assert!(
+            script.contains("TRUST:"),
+            "hook script must contain inline TRUST comment documenting the $HOME trust assumption"
+        );
     }
 
     #[test]
