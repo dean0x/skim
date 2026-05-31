@@ -153,15 +153,17 @@ impl NodeKindVocabulary {
             return id;
         }
         // In practice tree-sitter grammars have O(100) node kinds per language,
-        // so the u16 limit is never approached in normal usage.
-        debug_assert!(
+        // so the u16 limit is never approached in normal usage, but we guard
+        // in release builds too — silent truncation to 0 would corrupt all DF maps.
+        assert!(
             self.id_to_kind.len() < usize::from(NodeKindId::MAX),
             "NodeKindVocabulary overflow: {} kinds exceeds u16::MAX",
             self.id_to_kind.len()
         );
         let id = self.id_to_kind.len() as NodeKindId;
-        self.kind_to_id.insert(kind.to_string(), id);
-        self.id_to_kind.push(kind.to_string());
+        let owned = kind.to_string();
+        self.kind_to_id.insert(owned.clone(), id);
+        self.id_to_kind.push(owned);
         id
     }
 
@@ -205,29 +207,43 @@ impl NodeKindVocabulary {
     /// **Important:** Any bigram/trigram keys computed *before* calling `stabilize`
     /// must be re-encoded using the returned remap table.
     pub fn stabilize(&mut self) -> Vec<NodeKindId> {
-        // Build remap: for each old ID, record which kind it pointed to,
-        // then after sorting, look up the new ID for that kind.
+        // Build remap: sort the old kinds alphabetically, re-populate the vocab,
+        // then map each old ID to its new ID.
+        //
+        // We sort indices into old_kinds rather than cloning the whole vec, so each
+        // String is moved exactly once (into self.id_to_kind) with no extra copies.
         let old_kinds: Vec<String> = self.id_to_kind.drain(..).collect();
 
-        let mut sorted_kinds = old_kinds.clone();
-        sorted_kinds.sort_unstable();
+        // Sort indices by the corresponding kind string — no extra String allocation.
+        let mut sorted_indices: Vec<usize> = (0..old_kinds.len()).collect();
+        sorted_indices.sort_unstable_by(|&a, &b| old_kinds[a].cmp(&old_kinds[b]));
+
+        // Build remap[old_id] = new_id from the sorted index order.
+        let mut remap = vec![0u16; old_kinds.len()];
+        for (new_id, &old_id) in sorted_indices.iter().enumerate() {
+            remap[old_id] = new_id as NodeKindId;
+        }
 
         self.kind_to_id.clear();
-        self.id_to_kind = sorted_kinds;
+        // Reconstruct id_to_kind in sorted order by moving Strings out of old_kinds.
+        // sorted_indices contains each index exactly once, so the slot is always Some.
+        let mut old_kinds_opt: Vec<Option<String>> = old_kinds.into_iter().map(Some).collect();
+        self.id_to_kind = sorted_indices
+            .iter()
+            .map(|&old_id| {
+                // SAFETY: sorted_indices is a permutation of [0, N), so each slot
+                // is taken exactly once.  The unwrap_or_else branch is unreachable.
+                old_kinds_opt[old_id]
+                    .take()
+                    .unwrap_or_else(|| unreachable!("sorted_indices are unique"))
+            })
+            .collect();
 
         for (new_id, kind) in self.id_to_kind.iter().enumerate() {
             self.kind_to_id.insert(kind.clone(), new_id as NodeKindId);
         }
 
-        // Build remap[old_id] = new_id.
-        old_kinds
-            .iter()
-            .map(|kind| {
-                // After stabilize, every kind that existed before must still exist.
-                // The indexing is safe because stabilize only reorders, never removes.
-                self.kind_to_id[kind]
-            })
-            .collect()
+        remap
     }
 
     /// Returns all registered kind strings in sorted (alphabetical) order.
@@ -527,5 +543,67 @@ mod tests {
         assert_eq!(rekeyed.len(), 1);
         let new_bigram = remap_bigram(old_bigram, &remap).unwrap();
         assert_eq!(rekeyed[&new_bigram], 42);
+    }
+
+    #[test]
+    fn remap_trigram_correctness() {
+        let mut vocab = NodeKindVocabulary::new();
+        vocab.get_or_insert("z_kind"); // old ID 0
+        vocab.get_or_insert("m_kind"); // old ID 1
+        vocab.get_or_insert("a_kind"); // old ID 2
+
+        // Trigram encoded with pre-stabilize IDs: gp=0 (z), parent=1 (m), child=2 (a)
+        let old_trigram = encode_ast_trigram(0, 1, 2);
+
+        let remap = vocab.stabilize();
+        // After stabilize: a_kind=0, m_kind=1, z_kind=2
+        // remap[0]=2 (z), remap[1]=1 (m), remap[2]=0 (a)
+
+        let new_trigram = remap_trigram(old_trigram, &remap).unwrap();
+        let (new_gp, new_parent, new_child) = decode_ast_trigram(new_trigram);
+
+        // gp was z_kind (new ID 2), parent was m_kind (new ID 1), child was a_kind (new ID 0)
+        assert_eq!(new_gp, 2);
+        assert_eq!(new_parent, 1);
+        assert_eq!(new_child, 0);
+        assert_eq!(vocab.resolve(new_gp), Some("z_kind"));
+        assert_eq!(vocab.resolve(new_parent), Some("m_kind"));
+        assert_eq!(vocab.resolve(new_child), Some("a_kind"));
+    }
+
+    #[test]
+    fn rekey_trigram_df_map_preserves_counts() {
+        let mut vocab = NodeKindVocabulary::new();
+        vocab.get_or_insert("z_kind"); // old ID 0
+        vocab.get_or_insert("m_kind"); // old ID 1
+        vocab.get_or_insert("a_kind"); // old ID 2
+
+        let old_trigram = encode_ast_trigram(0, 1, 2);
+        let mut df_map = HashMap::new();
+        df_map.insert(old_trigram, 99u32);
+
+        let remap = vocab.stabilize();
+        let rekeyed = rekey_trigram_df_map(&df_map, &remap);
+
+        // Count preserved under the new key.
+        assert_eq!(rekeyed.len(), 1);
+        let new_trigram = remap_trigram(old_trigram, &remap).unwrap();
+        assert_eq!(rekeyed[&new_trigram], 99);
+    }
+
+    #[test]
+    fn remap_bigram_returns_none_for_out_of_bounds_id() {
+        // Remap table covers only IDs 0..=1; a bigram referencing ID 2 is out-of-bounds.
+        let remap: Vec<NodeKindId> = vec![1, 0]; // only IDs 0 and 1 are valid
+        let oob_bigram = encode_ast_bigram(0, 2); // child ID 2 is outside remap
+        assert_eq!(remap_bigram(oob_bigram, &remap), None);
+    }
+
+    #[test]
+    fn remap_trigram_returns_none_for_out_of_bounds_id() {
+        // Remap table covers only IDs 0..=1; a trigram referencing ID 3 is out-of-bounds.
+        let remap: Vec<NodeKindId> = vec![1, 0]; // only IDs 0 and 1 are valid
+        let oob_trigram = encode_ast_trigram(0, 1, 3); // child ID 3 is outside remap
+        assert_eq!(remap_trigram(oob_trigram, &remap), None);
     }
 }
