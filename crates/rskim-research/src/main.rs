@@ -8,8 +8,13 @@
 //! - `run`: clone corpus repos, extract bigrams, compute IDF, write JSON
 //! - `codegen`: read JSON weight table, generate weights.rs for rskim-search
 //! - `validate`: read JSON weight table, run border-weight validation report
+//! - `ast-run`: clone corpus repos, extract AST n-grams, compute IDF, write JSON
+//! - `ast-codegen`: read ast_weights.json, generate ast_weights.rs for rskim-search
+//! - `ast-validate`: read ast_weights.json, run AST validation report
 
 use rskim_research::{clone, codegen, config, extract, idf, types, validate};
+
+use serde::Serialize;
 
 use std::path::PathBuf;
 
@@ -67,6 +72,47 @@ enum Commands {
         #[arg(long)]
         json_path: Option<PathBuf>,
     },
+
+    /// Clone corpus repos, extract AST bigrams/trigrams, compute IDF weights, and write JSON.
+    AstRun {
+        /// Directory to clone repos into (defaults to a temporary directory).
+        #[arg(long)]
+        corpus_dir: Option<PathBuf>,
+
+        /// Minimum IDF threshold — bigrams/trigrams below this are excluded.
+        #[arg(long, default_value = "1.5")]
+        threshold: f32,
+
+        /// Path to ast-corpus.toml configuration file.
+        #[arg(long, default_value = "ast-corpus.toml")]
+        corpus_config: PathBuf,
+
+        /// Output path for ast_weights.json.
+        #[arg(long)]
+        output: Option<PathBuf>,
+
+        /// Collect AST trigrams in addition to bigrams.
+        #[arg(long, default_value = "true")]
+        trigrams: bool,
+    },
+
+    /// Read ast_weights.json and generate ast_weights.rs for rskim-search.
+    AstCodegen {
+        /// Path to ast_weights.json (defaults to crates/rskim-search/data/ast_weights.json).
+        #[arg(long)]
+        json_path: Option<PathBuf>,
+
+        /// Override workspace root detection (auto-detected if omitted).
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
+    },
+
+    /// Read ast_weights.json and run AST validation report.
+    AstValidate {
+        /// Path to ast_weights.json (defaults to crates/rskim-search/data/ast_weights.json).
+        #[arg(long)]
+        json_path: Option<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -86,6 +132,21 @@ fn main() -> anyhow::Result<()> {
         } => cmd_codegen(json_path, workspace_root),
 
         Commands::Validate { json_path } => cmd_validate(json_path),
+
+        Commands::AstRun {
+            corpus_dir,
+            threshold,
+            corpus_config,
+            output,
+            trigrams,
+        } => ast_cmd::cmd_ast_run(corpus_dir, threshold, &corpus_config, output, trigrams),
+
+        Commands::AstCodegen {
+            json_path,
+            workspace_root,
+        } => ast_cmd::cmd_ast_codegen(json_path, workspace_root),
+
+        Commands::AstValidate { json_path } => ast_cmd::cmd_ast_validate(json_path),
     }
 }
 
@@ -163,16 +224,12 @@ fn resolve_corpus_dir(
     Ok((path, guard))
 }
 
-/// Clone/fetch all source files from each configured repo in parallel.
-fn fetch_all_files(
+/// Clone/fetch all source files from each configured repo in parallel using `source`.
+fn fetch_files_parallel(
     config: &config::CorpusConfig,
-    corpus_dir: &std::path::Path,
+    source: &impl FileSource,
 ) -> anyhow::Result<Vec<types::SourceFile>> {
     use rayon::prelude::*;
-
-    let source = clone::GitCloneSource {
-        corpus_dir: corpus_dir.to_path_buf(),
-    };
 
     let progress = ProgressBar::new(config.repos.len() as u64);
     if let Ok(style) =
@@ -202,6 +259,17 @@ fn fetch_all_files(
     Ok(all_files)
 }
 
+/// Clone/fetch all source files from each configured repo in parallel.
+fn fetch_all_files(
+    config: &config::CorpusConfig,
+    corpus_dir: &std::path::Path,
+) -> anyhow::Result<Vec<types::SourceFile>> {
+    let source = clone::GitCloneSource {
+        corpus_dir: corpus_dir.to_path_buf(),
+    };
+    fetch_files_parallel(config, &source)
+}
+
 /// Print validation summary to stderr.
 fn log_validation_summary(weights: &[types::BigramWeight]) {
     let weight_pairs: Vec<(u16, f32)> = weights.iter().map(|w| (w.bigram, w.idf)).collect();
@@ -222,21 +290,32 @@ fn default_json_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("bigram_weights.json"))
 }
 
-/// Serialize the weight table to JSON and write it to the output path.
-fn write_weight_table(table: &types::WeightTable, output: Option<PathBuf>) -> anyhow::Result<()> {
-    let output_path = output.unwrap_or_else(default_json_path);
-
+/// Serialize a JSON-serializable value to the given output path (creating parent
+/// directories if needed). `label` is used only in the error/log messages so the
+/// caller can distinguish between table types in stderr output.
+fn write_json_table<T: Serialize>(
+    table: &T,
+    output_path: PathBuf,
+    label: &str,
+) -> anyhow::Result<()> {
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating output directory {}", parent.display()))?;
     }
 
-    let json = serde_json::to_string_pretty(table).context("serializing weight table")?;
+    let json =
+        serde_json::to_string_pretty(table).with_context(|| format!("serializing {label}"))?;
     std::fs::write(&output_path, json)
         .with_context(|| format!("writing {}", output_path.display()))?;
 
     eprintln!("Written: {}", output_path.display());
     Ok(())
+}
+
+/// Serialize the weight table to JSON and write it to the output path.
+fn write_weight_table(table: &types::WeightTable, output: Option<PathBuf>) -> anyhow::Result<()> {
+    let output_path = output.unwrap_or_else(default_json_path);
+    write_json_table(table, output_path, "weight table")
 }
 
 fn cmd_codegen(json_path: Option<PathBuf>, workspace_root: Option<PathBuf>) -> anyhow::Result<()> {
@@ -296,6 +375,12 @@ fn cmd_validate(json_path: Option<PathBuf>) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AST subcommand handlers (separate module)
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod ast_cmd;
 
 /// Returns a UTC timestamp string for the `generated_at` field.
 fn chrono_now() -> String {

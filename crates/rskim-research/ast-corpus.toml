@@ -1,0 +1,247 @@
+# Corpus configuration for rskim-research AST n-gram IDF analysis.
+# Covers all 14 tree-sitter languages: TypeScript, JavaScript, Python, Rust, Go,
+# Java, C, C++, C#, Ruby, SQL, Kotlin, Swift, Markdown.
+#
+# The language field marks the PRIMARY language of the repo.
+# The walker uses file extensions to assign language per file, not this field.
+# SQL and Markdown files are extracted from polyglot repos (django, spring-boot,
+# kubernetes, etc.) — no dedicated entries are needed for them.
+#
+# All repos are pinned to a specific commit SHA for reproducibility.
+# To refresh: run `git ls-remote <url> HEAD` and update the commit field.
+#
+# Run `rskim-research ast-run` to clone and analyze all repos.
+
+# ---- Rust (5 repos — reused from corpus.toml) ----
+
+[[repos]]
+url = "https://github.com/BurntSushi/ripgrep"
+commit = "4519153e5e461527f4bca45b042fff45c4ec6fb9"
+language = "Rust"
+
+[[repos]]
+url = "https://github.com/sharkdp/fd"
+commit = "7f1b1471d5e3f88087eaad77885dc70968750bb3"
+language = "Rust"
+
+[[repos]]
+url = "https://github.com/tokio-rs/tokio"
+commit = "7d3b0ad192fa6da7f0301fb0db7472031a3d253a"
+language = "Rust"
+
+[[repos]]
+url = "https://github.com/serde-rs/serde"
+commit = "fa7da4a93567ed347ad0735c28e439fca688ef26"
+language = "Rust"
+
+[[repos]]
+url = "https://github.com/rust-lang/cargo"
+commit = "11c687e0a9ccd7214c9419eaad05dc2c4c5c9255"
+language = "Rust"
+
+# ---- TypeScript (5 repos — reused from corpus.toml) ----
+
+[[repos]]
+url = "https://github.com/colinhacks/zod"
+commit = "bbc68f990c7e6a5e3f506c56fb04bd0279b9c9b5"
+language = "TypeScript"
+
+[[repos]]
+url = "https://github.com/microsoft/vscode"
+commit = "ed6d7dd68669cbcb1aaf84b9367df538635adb3e"
+language = "TypeScript"
+
+[[repos]]
+url = "https://github.com/nestjs/nest"
+commit = "8ee0aa52a04410a34b49fe9a80b3857ba738468b"
+language = "TypeScript"
+
+[[repos]]
+url = "https://github.com/trpc/trpc"
+commit = "23c723cfeaf07da28a52a5c35c3dcccf96a47578"
+language = "TypeScript"
+
+[[repos]]
+url = "https://github.com/prisma/prisma"
+commit = "d6d9fc9ed341946d45c7d0aba35081a7bd741aa1"
+language = "TypeScript"
+
+# ---- Python (5 repos — reused from corpus.toml) ----
+
+[[repos]]
+url = "https://github.com/pallets/flask"
+commit = "36e4a824f340fdee7ed50937ba8e7f6bc7d17f81"
+language = "Python"
+
+[[repos]]
+url = "https://github.com/django/django"
+commit = "335c6d0129400eda792f3bec5c71bb28af5e5d37"
+language = "Python"
+
+[[repos]]
+url = "https://github.com/psf/requests"
+commit = "c4367f231b5dc54f23f2983828562ce3a7555a8a"
+language = "Python"
+
+[[repos]]
+url = "https://github.com/pydantic/pydantic"
+commit = "8a1a222b60131e517ed8f6c0387d296d181490c3"
+language = "Python"
+
+[[repos]]
+url = "https://github.com/tiangolo/fastapi"
+commit = "e89a37e50d27f124b77e947b7965b6df75052a35"
+language = "Python"
+
+# ---- Go (5 repos — reused from corpus.toml) ----
+
+[[repos]]
+url = "https://github.com/kubernetes/kubernetes"
+commit = "eaa04458b241800ae37e07ad051415a2f2309a17"
+language = "Go"
+
+[[repos]]
+url = "https://github.com/gofiber/fiber"
+commit = "33b7fd4718f7d94e05214f424ed8d44bdd601836"
+language = "Go"
+
+[[repos]]
+url = "https://github.com/gin-gonic/gin"
+commit = "5f4f9643258dc2a65e684b63f12c8d543c936c67"
+language = "Go"
+
+[[repos]]
+url = "https://github.com/cli/cli"
+commit = "1e6bb88c6d8503189bca408f7be162018b1acf84"
+language = "Go"
+
+[[repos]]
+url = "https://github.com/grafana/grafana"
+commit = "3219aed082f7eda99f369641423159fd07401c57"
+language = "Go"
+
+# ---- Java (5 repos — reused from corpus.toml) ----
+
+[[repos]]
+url = "https://github.com/spring-projects/spring-boot"
+commit = "458b8baccf1b3999752a6ad4fa7e350f0f347926"
+language = "Java"
+
+[[repos]]
+url = "https://github.com/elastic/elasticsearch"
+commit = "c22398ffceb92b6eed87dc251b350e6ecc7775d3"
+language = "Java"
+
+[[repos]]
+url = "https://github.com/google/guava"
+commit = "6f3f85dfe1676e8fe7595e463da6bc7db9a31fb2"
+language = "Java"
+
+[[repos]]
+url = "https://github.com/square/retrofit"
+commit = "8e83a242eac1afc22a13c52098eddb27421353ff"
+language = "Java"
+
+[[repos]]
+url = "https://github.com/apache/kafka"
+commit = "7a64fe88476143bd5375a61419579e2f065c0d6c"
+language = "Java"
+
+# ---- JavaScript (3 repos — new for AST corpus) ----
+
+[[repos]]
+url = "https://github.com/facebook/react"
+commit = "05ca66ad9c6f07b9ee2cc6a8f2129750e8f96fa4"
+language = "JavaScript"
+
+[[repos]]
+url = "https://github.com/expressjs/express"
+commit = "dae209ae6559c29cfca2a1f4414c51d89ea643d5"
+language = "JavaScript"
+
+[[repos]]
+url = "https://github.com/webpack/webpack"
+commit = "66f71f8b643a2a1a83ad59c9671ce38a9547f593"
+language = "JavaScript"
+
+# ---- C (3 repos — new for AST corpus) ----
+
+[[repos]]
+url = "https://github.com/redis/redis"
+commit = "65401042dc6105eac649dfc3b52eadb3fbb852a2"
+language = "C"
+
+[[repos]]
+url = "https://github.com/curl/curl"
+commit = "6ac42e569112bfb8fb6bfec02db6d83612b184e3"
+language = "C"
+
+[[repos]]
+url = "https://github.com/jqlang/jq"
+commit = "df924eae91af10cc236a907cdadd97813827aa1f"
+language = "C"
+
+# ---- C++ (2 repos — new for AST corpus) ----
+
+[[repos]]
+url = "https://github.com/opencv/opencv"
+commit = "ebb46d5f1708329450233e617bdb1b9eadea752a"
+language = "Cpp"
+
+[[repos]]
+url = "https://github.com/grpc/grpc"
+commit = "36e467cff163e4060d4c98977538cf9f18b002d3"
+language = "Cpp"
+
+# ---- C# (2 repos — new for AST corpus) ----
+
+[[repos]]
+url = "https://github.com/dotnet/roslyn"
+commit = "ae3b522d4e196ac214b3e38ae77e7ec2b31806dd"
+language = "CSharp"
+
+[[repos]]
+url = "https://github.com/dotnet/aspnetcore"
+commit = "4637df87bce65b1a7d870a329e5ed5ec73bdd541"
+language = "CSharp"
+
+# ---- Ruby (2 repos — new for AST corpus) ----
+
+[[repos]]
+url = "https://github.com/rails/rails"
+commit = "f77b6c295c9a3dde113e7fbc0a046ce6ef9fd2d8"
+language = "Ruby"
+
+[[repos]]
+url = "https://github.com/jekyll/jekyll"
+commit = "202df571314ba1d18e9fccd81d12aaad4a703c38"
+language = "Ruby"
+
+# ---- Kotlin (1 repo — new for AST corpus) ----
+
+[[repos]]
+url = "https://github.com/ktorio/ktor"
+commit = "97c94671025aa3dc50556fb129941824f5205fb5"
+language = "Kotlin"
+
+# ---- Swift (2 repos — new for AST corpus) ----
+
+[[repos]]
+url = "https://github.com/apple/swift-algorithms"
+commit = "0b4376902cfc3901c496a79f2cb70f1ffd583fff"
+language = "Swift"
+
+[[repos]]
+url = "https://github.com/vapor/vapor"
+commit = "712b0919a3ba772f7402ccaf07cdb6ca823dd650"
+language = "Swift"
+
+# ---- SQL (1 repo — dedicated for AST corpus) ----
+# SQL and Markdown files are also found in the polyglot repos above
+# (django has .sql fixtures, spring-boot has .md docs, etc.).
+# Chinook provides dedicated multi-dialect SQL coverage (DDL, DML, schemas).
+
+[[repos]]
+url = "https://github.com/lerocha/chinook-database"
+commit = "7f67772503d71ba90f19283c38e93923addb43fa"
+language = "SQL"

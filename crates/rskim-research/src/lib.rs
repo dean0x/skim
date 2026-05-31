@@ -3,6 +3,12 @@
 //! This library is an implementation detail of the `rskim-research` binary
 //! and `gen-synthetic` bootstrap tool. It is not published.
 
+pub mod ast_codegen;
+pub mod ast_extract;
+pub mod ast_idf;
+pub mod ast_pipeline;
+pub mod ast_types;
+pub mod ast_validate;
 pub mod clone;
 pub mod codegen;
 pub mod config;

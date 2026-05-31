@@ -21,6 +21,7 @@ pub mod lexical;
 pub mod ngram;
 pub mod temporal;
 mod types;
+pub mod ast_weights;
 pub mod weights;
 
 pub use cochange::{CochangeMatrixBuilder, CochangeMatrixReader};

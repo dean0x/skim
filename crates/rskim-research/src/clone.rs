@@ -3,6 +3,7 @@
 //! `GitCloneSource` clones repos with `git`; `FixtureSource` reads from
 //! a local directory. Both implement `FileSource` for testing and production.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -17,11 +18,40 @@ const MAX_FILE_SIZE: u64 = 100 * 1024;
 /// Number of bytes to inspect for null bytes (binary detection).
 const BINARY_PROBE_BYTES: usize = 8192;
 
-/// File extensions explicitly excluded (data formats, not code).
+/// File extensions explicitly excluded for the lexical bigram corpus (data formats, not code).
+///
+/// This list is only applied when using the default `TARGET_EXTENSIONS`.
+/// When an explicit extension list is passed to `walk_and_load`, no extensions
+/// are excluded beyond what the caller provides.
 const EXCLUDED_EXTENSIONS: &[&str] = &["json", "yaml", "yml", "toml", "md", "markdown"];
 
-/// Target language file extensions accepted by the corpus.
+/// Target language file extensions accepted by the lexical bigram corpus.
 const TARGET_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "py", "go", "java"];
+
+/// Target file extensions for the AST n-gram corpus (all 14 tree-sitter languages).
+pub const AST_TARGET_EXTENSIONS: &[&str] = &[
+    "rs",    // Rust
+    "ts",    // TypeScript
+    "tsx",   // TypeScript (JSX)
+    "js",    // JavaScript
+    "jsx",   // JavaScript (JSX)
+    "py",    // Python
+    "go",    // Go
+    "java",  // Java
+    "c",     // C
+    "h",     // C headers
+    "cpp",   // C++
+    "cc",    // C++
+    "cxx",   // C++
+    "hpp",   // C++ headers
+    "cs",    // C#
+    "rb",    // Ruby
+    "sql",   // SQL
+    "kt",    // Kotlin
+    "kts",   // Kotlin script
+    "swift", // Swift
+    "md",    // Markdown
+];
 
 /// Abstraction over file loading — enables testing without network access.
 pub trait FileSource: Send + Sync {
@@ -35,17 +65,36 @@ pub struct GitCloneSource {
 
 impl FileSource for GitCloneSource {
     fn fetch_files(&self, repo: &RepoEntry) -> anyhow::Result<Vec<SourceFile>> {
-        let repo_name = extract_repo_name(&repo.url)?;
-        let dest = self.corpus_dir.join(&repo_name);
-
-        // Clone if not already present.
-        if !dest.exists() {
-            clone_repo(&repo.url, &repo.commit, &dest)
-                .with_context(|| format!("cloning {}", repo.url))?;
-        }
-
-        walk_and_load(&dest)
+        let dest = ensure_cloned(&self.corpus_dir, repo)?;
+        walk_and_load(&dest, None)
     }
+}
+
+/// An AST-aware file source that clones repos and walks with AST extensions.
+pub struct AstGitCloneSource {
+    pub corpus_dir: PathBuf,
+}
+
+impl FileSource for AstGitCloneSource {
+    fn fetch_files(&self, repo: &RepoEntry) -> anyhow::Result<Vec<SourceFile>> {
+        let dest = ensure_cloned(&self.corpus_dir, repo)?;
+        walk_and_load_ast(&dest)
+    }
+}
+
+/// Resolve the local clone directory for a repo, cloning it if not already present.
+///
+/// Returns the path to the checked-out repository root.
+fn ensure_cloned(corpus_dir: &Path, repo: &RepoEntry) -> anyhow::Result<PathBuf> {
+    let repo_name = extract_repo_name(&repo.url)?;
+    let dest = corpus_dir.join(&repo_name);
+
+    if !dest.exists() {
+        clone_repo(&repo.url, &repo.commit, &dest)
+            .with_context(|| format!("cloning {}", repo.url))?;
+    }
+
+    Ok(dest)
 }
 
 pub fn extract_repo_name(url: &str) -> anyhow::Result<String> {
@@ -229,8 +278,21 @@ fn clone_repo(url: &str, commit: &str, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn walk_and_load(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
+/// Walk `root` and load all source files matching the given extension list.
+///
+/// If `extensions` is `None`, the default lexical corpus extensions
+/// (`TARGET_EXTENSIONS`) are used and `EXCLUDED_EXTENSIONS` is applied.
+/// If `extensions` is `Some(list)`, only those extensions are accepted and
+/// the exclusion list is NOT applied — the caller controls what is included.
+pub(crate) fn walk_and_load(
+    root: &Path,
+    extensions: Option<&[&str]>,
+) -> anyhow::Result<Vec<SourceFile>> {
     let mut files = Vec::new();
+
+    // Build a HashSet once before the walk so extension lookup is O(1) per entry
+    // instead of O(n) linear scan through the slice.
+    let allowed_set: Option<HashSet<&str>> = extensions.map(|exts| exts.iter().copied().collect());
 
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false) // include dot-files but .gitignore is respected
@@ -249,14 +311,22 @@ fn walk_and_load(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
             .unwrap_or("")
             .to_lowercase();
 
-        // Skip excluded extensions.
-        if EXCLUDED_EXTENSIONS.contains(&ext.as_str()) {
-            continue;
-        }
-
-        // Skip non-target extensions.
-        if !TARGET_EXTENSIONS.contains(&ext.as_str()) {
-            continue;
+        match &allowed_set {
+            None => {
+                // Default lexical mode: apply exclusion list then target list.
+                if EXCLUDED_EXTENSIONS.contains(&ext.as_str()) {
+                    continue;
+                }
+                if !TARGET_EXTENSIONS.contains(&ext.as_str()) {
+                    continue;
+                }
+            }
+            Some(allowed) => {
+                // Explicit extension set: no exclusion, only allow listed exts.
+                if !allowed.contains(ext.as_str()) {
+                    continue;
+                }
+            }
         }
 
         // Skip files that are too large.
@@ -302,6 +372,14 @@ fn walk_and_load(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
     Ok(files)
 }
 
+/// Walk `root` and load source files for all 14 tree-sitter languages.
+///
+/// Uses `AST_TARGET_EXTENSIONS` as the extension filter. No exclusion list
+/// is applied — the caller decides which extensions to accept.
+pub fn walk_and_load_ast(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
+    walk_and_load(root, Some(AST_TARGET_EXTENSIONS))
+}
+
 /// Test file source that reads from a fixture directory.
 pub struct FixtureSource {
     pub fixture_dir: PathBuf,
@@ -309,13 +387,13 @@ pub struct FixtureSource {
 
 impl FileSource for FixtureSource {
     fn fetch_files(&self, _repo: &RepoEntry) -> anyhow::Result<Vec<SourceFile>> {
-        walk_and_load(&self.fixture_dir)
+        walk_and_load(&self.fixture_dir, None)
     }
 }
 
 /// Load all source files from a directory (public helper for the codegen step).
 pub fn load_fixture_files(dir: &Path) -> anyhow::Result<Vec<SourceFile>> {
-    walk_and_load(dir)
+    walk_and_load(dir, None)
 }
 
 /// Clone a repository with full history (no `--depth 1`) for co-change analysis.
@@ -526,5 +604,66 @@ mod tests {
     #[test]
     fn extract_repo_name_empty_url() {
         assert!(extract_repo_name("").is_err(), "empty URL should fail");
+    }
+
+    // --- walk_and_load with explicit extension list ---
+
+    /// Verify that `walk_and_load(root, Some(&["rs", "md"]))` includes `.md`
+    /// files even though they appear in `EXCLUDED_EXTENSIONS`.  This exercises
+    /// the `Some(extensions)` branch and guards against regressions where the
+    /// exclusion list is accidentally applied to caller-supplied extension lists.
+    #[test]
+    fn walk_and_load_explicit_extensions_includes_md() {
+        let root = fixtures_dir();
+        let files = walk_and_load(&root, Some(&["rs", "md"])).unwrap();
+
+        // .md file must be present
+        let has_md = files.iter().any(|f| {
+            f.path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e == "md")
+                .unwrap_or(false)
+        });
+        assert!(
+            has_md,
+            "walk_and_load with explicit exts should include .md files"
+        );
+
+        // .rs files must also be present
+        let has_rs = files.iter().any(|f| {
+            f.path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e == "rs")
+                .unwrap_or(false)
+        });
+        assert!(
+            has_rs,
+            "walk_and_load with explicit exts should include .rs files"
+        );
+
+        // .ts files must not be included (not in the explicit list)
+        let has_ts = files.iter().any(|f| {
+            f.path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e == "ts")
+                .unwrap_or(false)
+        });
+        assert!(
+            !has_ts,
+            "walk_and_load with explicit exts must not include .ts files"
+        );
+    }
+
+    // --- AstGitCloneSource trait-object compatibility ---
+
+    #[test]
+    fn ast_git_clone_source_is_trait_object_compatible() {
+        let _source: Box<dyn FileSource> = Box::new(AstGitCloneSource {
+            corpus_dir: PathBuf::from("/tmp/corpus"),
+        });
+        // Verifying this compiles as a trait object is sufficient.
     }
 }

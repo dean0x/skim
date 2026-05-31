@@ -14,7 +14,7 @@ exclude = ["data/"]
 # SkimError (for SearchError::Core interop). The transitive tree-sitter grammar
 # dependencies are acceptable: Wave 1 search layers will require language-aware
 # AST parsing, making rskim-core a natural runtime dependency at that point.
-rskim-core = { version = "2.9.0", path = "../rskim-core" }
+rskim-core = { version = "2.10.0", path = "../rskim-core" }
 thiserror = { workspace = true }
 serde = { workspace = true }
 
