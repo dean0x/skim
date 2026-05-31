@@ -149,18 +149,47 @@ fn write_vocabulary(buf: &mut Vec<u8>, vocabulary: &[String]) -> anyhow::Result<
 /// `"Cpp"` → `"CPP"`, `"CSharp"` → `"CSHARP"`, `"C"` → `"C"`.
 ///
 /// Special characters (`+`, `#`, `-`, space) are replaced with `_` and
-/// consecutive underscores are collapsed.
+/// consecutive underscores (runs of any length) are collapsed to a single `_`.
 fn lang_to_ident(lang: &str) -> String {
-    lang.chars()
+    let mapped: String = lang
+        .chars()
         .map(|c| match c {
             '+' | '#' | '-' | ' ' => '_',
             _ => c.to_ascii_uppercase(),
         })
-        .collect::<String>()
-        // Collapse any repeated underscores introduced by the mapping above.
-        .split("__")
-        .collect::<Vec<_>>()
-        .join("_")
+        .collect();
+
+    // Collapse runs of consecutive underscores (any length) to a single `_`.
+    let mut result = String::with_capacity(mapped.len());
+    let mut prev_underscore = false;
+    for c in mapped.chars() {
+        if c == '_' {
+            if !prev_underscore {
+                result.push(c);
+            }
+            prev_underscore = true;
+        } else {
+            result.push(c);
+            prev_underscore = false;
+        }
+    }
+
+    debug_assert!(
+        result
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false),
+        "lang_to_ident produced an empty or non-identifier-starting string for input: {lang:?}"
+    );
+    debug_assert!(
+        result
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "lang_to_ident produced a non-identifier character for input: {lang:?}"
+    );
+
+    result
 }
 
 fn write_language_bigram_arrays(buf: &mut Vec<u8>, table: &AstWeightTable) -> anyhow::Result<()> {
@@ -186,7 +215,7 @@ fn write_language_bigram_arrays(buf: &mut Vec<u8>, table: &AstWeightTable) -> an
         for w in &sorted {
             writeln!(
                 buf,
-                "    (0x{:08X}, {:.6}_f32), // {} -> {}",
+                "    (0x{:08X}, {:.6}_f32), // {:?} -> {:?}",
                 w.bigram, w.idf, w.parent_kind, w.child_kind
             )?;
         }
@@ -220,7 +249,7 @@ fn write_language_trigram_arrays(buf: &mut Vec<u8>, table: &AstWeightTable) -> a
         for w in &sorted {
             writeln!(
                 buf,
-                "    (0x{:016X}, {:.6}_f32), // {} -> {} -> {}",
+                "    (0x{:016X}, {:.6}_f32), // {:?} -> {:?} -> {:?}",
                 w.trigram, w.idf, w.grandparent_kind, w.parent_kind, w.child_kind
             )?;
         }
@@ -445,6 +474,18 @@ mod tests {
         assert_eq!(lang_to_ident("CSharp"), "CSHARP");
         assert_eq!(lang_to_ident("C"), "C");
         assert_eq!(lang_to_ident("JavaScript"), "JAVASCRIPT");
+    }
+
+    #[test]
+    fn lang_to_ident_collapses_consecutive_underscores() {
+        // Double underscores should collapse to a single underscore.
+        assert_eq!(lang_to_ident("C++"), "C_");
+        // Triple or more consecutive underscores (e.g. from "C# +" → "C__") must
+        // also collapse to a single underscore — the previous split("__") approach
+        // only handled exactly-double sequences.
+        assert_eq!(lang_to_ident("C# +"), "C_");
+        // No underscores: unchanged.
+        assert_eq!(lang_to_ident("Go"), "GO");
     }
 
     #[test]

@@ -106,7 +106,7 @@ fn validate_ast_repo(index: usize, repo: &RepoEntry) -> anyhow::Result<()> {
         );
     }
 
-    // Validate commit: either "HEAD" or a 40-character lowercase hex SHA.
+    // Validate commit: either "HEAD" or a 40-character hex SHA (upper or lowercase).
     let commit_ok = repo.commit == "HEAD"
         || (repo.commit.len() == 40 && repo.commit.chars().all(|c| c.is_ascii_hexdigit()));
     if !commit_ok {

@@ -21,7 +21,7 @@ name = "rskim_research"
 path = "src/lib.rs"
 
 [dependencies]
-rskim-core = { version = "2.9.0", path = "../rskim-core" }
+rskim-core = { version = "2.10.0", path = "../rskim-core" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
