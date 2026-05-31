@@ -1,9 +1,7 @@
 //! AST subcommand handlers: `ast-run`, `ast-codegen`, `ast-validate`.
 //!
-//! These handlers are extracted into a separate module to keep `main.rs` below
-//! the 500-line threshold. They share the pipeline helpers defined in `main.rs`
-//! (`resolve_corpus_dir`, `write_json_table`, `fetch_files_parallel`,
-//! `chrono_now`) via `super::`.
+//! Extracted from `main.rs` to keep it below the 500-line threshold.
+//! Shared helpers are imported from `super::` (see `use super::` below).
 
 use std::path::PathBuf;
 
@@ -38,7 +36,7 @@ pub(super) fn cmd_ast_run(
     );
 
     let table =
-        ast_pipeline::build_ast_weight_table(&all_files, threshold, collect_trigrams, chrono_now());
+        ast_pipeline::build_ast_weight_table(&all_files, threshold, collect_trigrams, &chrono_now());
 
     eprintln!("Vocabulary: {} node kinds.", table.vocabulary.len());
     for (lang, weights) in &table.bigram_weights {

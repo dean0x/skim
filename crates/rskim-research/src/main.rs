@@ -380,11 +380,6 @@ fn cmd_validate(json_path: Option<PathBuf>) -> anyhow::Result<()> {
 // AST subcommand handlers (separate module)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// AST subcommand handlers: `ast-run`, `ast-codegen`, `ast-validate`.
-///
-/// Extracted into a separate file to keep `main.rs` below the 500-line
-/// threshold. Shared helpers (`resolve_corpus_dir`, `write_json_table`,
-/// `fetch_files_parallel`, `chrono_now`) are imported from `super::`.
 mod ast_cmd;
 
 /// Returns a UTC timestamp string for the `generated_at` field.

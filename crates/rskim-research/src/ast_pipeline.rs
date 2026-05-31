@@ -41,7 +41,7 @@ pub fn build_ast_weight_table(
     files: &[SourceFile],
     threshold: f32,
     collect_trigrams: bool,
-    generated_at: String,
+    generated_at: &str,
 ) -> AstWeightTable {
     let mut vocab = NodeKindVocabulary::new();
 
@@ -73,7 +73,7 @@ pub fn build_ast_weight_table(
 
     AstWeightTable {
         version: 1,
-        generated_at,
+        generated_at: generated_at.to_string(),
         vocabulary: vocab.kinds().to_vec(),
         corpus_stats,
         bigram_weights: bigram_weights_map,
@@ -108,7 +108,7 @@ mod tests {
         let source = include_str!("../tests/fixtures/sample_rust.rs");
         let files = vec![make_file(source, Language::Rust)];
 
-        let table = build_ast_weight_table(&files, 0.0, true, "test".to_string());
+        let table = build_ast_weight_table(&files, 0.0, true, "test");
 
         // Vocabulary must be non-empty: real Rust source yields many node kinds.
         assert!(
@@ -160,7 +160,7 @@ mod tests {
             make_file(ts_source, Language::TypeScript),
         ];
 
-        let table = build_ast_weight_table(&files, 0.0, false, "test".to_string());
+        let table = build_ast_weight_table(&files, 0.0, false, "test");
 
         // Both languages should have bigram weight entries.
         assert!(
@@ -188,7 +188,7 @@ mod tests {
     /// Verify that empty input produces an empty table without panicking.
     #[test]
     fn pipeline_empty_corpus_returns_empty_table() {
-        let table = build_ast_weight_table(&[], 1.5, true, "test".to_string());
+        let table = build_ast_weight_table(&[], 1.5, true, "test");
 
         assert!(table.vocabulary.is_empty());
         assert!(table.bigram_weights.is_empty());
@@ -205,7 +205,7 @@ mod tests {
         let files = vec![make_file(source, Language::Rust)];
 
         // IDF max for 1 document is ln(1/2)+1 ≈ 0.31, so threshold=10.0 eliminates all.
-        let table = build_ast_weight_table(&files, 10.0, false, "test".to_string());
+        let table = build_ast_weight_table(&files, 10.0, false, "test");
 
         for (lang, weights) in &table.bigram_weights {
             assert!(
@@ -218,7 +218,7 @@ mod tests {
     /// Verify that `generated_at` is passed through unmodified.
     #[test]
     fn pipeline_preserves_generated_at() {
-        let table = build_ast_weight_table(&[], 0.0, false, "unix:12345".to_string());
+        let table = build_ast_weight_table(&[], 0.0, false, "unix:12345");
         assert_eq!(table.generated_at, "unix:12345");
     }
 }
