@@ -46,7 +46,7 @@ pub const AST_VALID_LANGUAGES: &[&str] = &[
     "Cpp",
     "CSharp",
     "Ruby",
-    "Sql",
+    "SQL",
     "Kotlin",
     "Swift",
     "Markdown",
@@ -82,7 +82,7 @@ pub fn load_corpus_config(path: &Path) -> anyhow::Result<CorpusConfig> {
 ///
 /// Returns an error if the file cannot be read, is not valid TOML, or
 /// contains invalid values (unsupported AST language, bad commit ref, non-https URL).
-pub fn load_ast_corpus_config(path: &std::path::Path) -> anyhow::Result<CorpusConfig> {
+pub fn load_ast_corpus_config(path: &Path) -> anyhow::Result<CorpusConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading ast corpus config from {}", path.display()))?;
 

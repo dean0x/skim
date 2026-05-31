@@ -64,37 +64,36 @@ pub struct GitCloneSource {
 
 impl FileSource for GitCloneSource {
     fn fetch_files(&self, repo: &RepoEntry) -> anyhow::Result<Vec<SourceFile>> {
-        let repo_name = extract_repo_name(&repo.url)?;
-        let dest = self.corpus_dir.join(&repo_name);
-
-        // Clone if not already present.
-        if !dest.exists() {
-            clone_repo(&repo.url, &repo.commit, &dest)
-                .with_context(|| format!("cloning {}", repo.url))?;
-        }
-
+        let dest = ensure_cloned(&self.corpus_dir, repo)?;
         walk_and_load(&dest, None)
     }
 }
 
 /// An AST-aware file source that clones repos and walks with AST extensions.
 pub struct AstGitCloneSource {
-    pub corpus_dir: std::path::PathBuf,
+    pub corpus_dir: PathBuf,
 }
 
 impl FileSource for AstGitCloneSource {
     fn fetch_files(&self, repo: &RepoEntry) -> anyhow::Result<Vec<SourceFile>> {
-        let repo_name = extract_repo_name(&repo.url)?;
-        let dest = self.corpus_dir.join(&repo_name);
-
-        // Clone if not already present.
-        if !dest.exists() {
-            clone_repo(&repo.url, &repo.commit, &dest)
-                .with_context(|| format!("cloning {}", repo.url))?;
-        }
-
+        let dest = ensure_cloned(&self.corpus_dir, repo)?;
         walk_and_load_ast(&dest)
     }
+}
+
+/// Resolve the local clone directory for a repo, cloning it if not already present.
+///
+/// Returns the path to the checked-out repository root.
+fn ensure_cloned(corpus_dir: &Path, repo: &RepoEntry) -> anyhow::Result<PathBuf> {
+    let repo_name = extract_repo_name(&repo.url)?;
+    let dest = corpus_dir.join(&repo_name);
+
+    if !dest.exists() {
+        clone_repo(&repo.url, &repo.commit, &dest)
+            .with_context(|| format!("cloning {}", repo.url))?;
+    }
+
+    Ok(dest)
 }
 
 pub fn extract_repo_name(url: &str) -> anyhow::Result<String> {
@@ -600,5 +599,66 @@ mod tests {
     #[test]
     fn extract_repo_name_empty_url() {
         assert!(extract_repo_name("").is_err(), "empty URL should fail");
+    }
+
+    // --- walk_and_load with explicit extension list ---
+
+    /// Verify that `walk_and_load(root, Some(&["rs", "md"]))` includes `.md`
+    /// files even though they appear in `EXCLUDED_EXTENSIONS`.  This exercises
+    /// the `Some(extensions)` branch and guards against regressions where the
+    /// exclusion list is accidentally applied to caller-supplied extension lists.
+    #[test]
+    fn walk_and_load_explicit_extensions_includes_md() {
+        let root = fixtures_dir();
+        let files = walk_and_load(&root, Some(&["rs", "md"])).unwrap();
+
+        // .md file must be present
+        let has_md = files.iter().any(|f| {
+            f.path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e == "md")
+                .unwrap_or(false)
+        });
+        assert!(
+            has_md,
+            "walk_and_load with explicit exts should include .md files"
+        );
+
+        // .rs files must also be present
+        let has_rs = files.iter().any(|f| {
+            f.path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e == "rs")
+                .unwrap_or(false)
+        });
+        assert!(
+            has_rs,
+            "walk_and_load with explicit exts should include .rs files"
+        );
+
+        // .ts files must not be included (not in the explicit list)
+        let has_ts = files.iter().any(|f| {
+            f.path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e == "ts")
+                .unwrap_or(false)
+        });
+        assert!(
+            !has_ts,
+            "walk_and_load with explicit exts must not include .ts files"
+        );
+    }
+
+    // --- AstGitCloneSource trait-object compatibility ---
+
+    #[test]
+    fn ast_git_clone_source_is_trait_object_compatible() {
+        let _source: Box<dyn FileSource> = Box::new(AstGitCloneSource {
+            corpus_dir: PathBuf::from("/tmp/corpus"),
+        });
+        // Verifying this compiles as a trait object is sufficient.
     }
 }

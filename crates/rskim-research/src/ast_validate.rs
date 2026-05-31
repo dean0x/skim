@@ -134,6 +134,10 @@ fn compute_distribution(language: &str, idfs: impl Iterator<Item = f32>) -> IdfD
 
 /// Compute the `pct`-th percentile from a sorted slice.
 fn percentile(sorted: &[f32], pct: f32) -> f32 {
+    debug_assert!(
+        (0.0..=100.0).contains(&pct) && !pct.is_nan(),
+        "pct must be in [0, 100] and not NaN, got {pct}"
+    );
     if sorted.is_empty() {
         return 0.0;
     }
@@ -205,8 +209,8 @@ mod tests {
 
     use super::*;
     use crate::ast_types::{
-        AstBigramWeight, AstCorpusStats, AstLanguageStats, AstTrigramWeight, AstWeightTable,
-        encode_ast_bigram, encode_ast_trigram,
+        encode_ast_bigram, encode_ast_trigram, AstBigramWeight, AstCorpusStats, AstLanguageStats,
+        AstTrigramWeight, AstWeightTable,
     };
 
     fn sample_table() -> AstWeightTable {
@@ -262,6 +266,10 @@ mod tests {
 
     #[test]
     fn distribution_stats_correct() {
+        // For [1, 2, 3, 4, 5]:
+        //   p50 → idx = round(0.50 * 4) = 2 → value 3.0
+        //   p90 → idx = round(0.90 * 4) = round(3.6) = 4 → value 5.0
+        //   p99 → idx = round(0.99 * 4) = round(3.96) = 4 → value 5.0
         let values = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
         let dist = compute_distribution("TestLang", values.into_iter());
         assert_eq!(dist.count, 5);
@@ -269,6 +277,16 @@ mod tests {
         assert!((dist.max - 5.0).abs() < 0.01);
         assert!((dist.mean - 3.0).abs() < 0.01);
         assert!((dist.median - 3.0).abs() < 0.01);
+        assert!(
+            (dist.p90 - 5.0).abs() < 0.01,
+            "p90 should be 5.0, got {}",
+            dist.p90
+        );
+        assert!(
+            (dist.p99 - 5.0).abs() < 0.01,
+            "p99 should be 5.0, got {}",
+            dist.p99
+        );
     }
 
     #[test]
