@@ -64,6 +64,7 @@ pub(super) struct UninstallResult {
 /// source for this path — and wraps the `Option` in an `anyhow::Result`.
 pub(super) fn wrappers_dir() -> anyhow::Result<PathBuf> {
     crate::cmd::skim_wrappers_dir()
+        .map(|p| p.to_path_buf())
         .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))
 }
 
@@ -285,9 +286,9 @@ pub(super) fn uninstall_wrappers(dry_run: bool) -> anyhow::Result<UninstallResul
 /// When `dry_run` is `true`, no filesystem changes are made.
 pub(super) fn uninstall_wrappers_in(dir: &Path, dry_run: bool) -> anyhow::Result<UninstallResult> {
     // Circuit breaker: ~/.skim/bin/ is managed entirely by skim and should
-    // never contain more entries than the maximum number of wrapper targets.
-    // A much larger count indicates a corrupted or adversarial directory.
-    const MAX_ENTRIES: usize = 256;
+    // never contain more entries than ~2× the number of wrapper targets (~59).
+    // A count well above that indicates a corrupted or adversarial directory.
+    const MAX_ENTRIES: usize = 128;
 
     let mut result = UninstallResult::default();
 
@@ -309,45 +310,7 @@ pub(super) fn uninstall_wrappers_in(dir: &Path, dry_run: bool) -> anyhow::Result
         }
 
         let entry = entry.map_err(|e| anyhow::anyhow!("read dir entry: {e}"))?;
-        let path = entry.path();
-
-        // Only process symlinks.
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => {
-                result.preserved += 1;
-                continue;
-            }
-        };
-
-        if !meta.file_type().is_symlink() {
-            result.preserved += 1;
-            continue;
-        }
-
-        // Only remove symlinks whose target filename is exactly "skim" or "rskim".
-        // Substring matching (e.g. contains("skim")) would incorrectly remove
-        // symlinks pointing to binaries like `/usr/local/bin/someskimmer`.
-        let target = std::fs::read_link(&path)
-            .map_err(|e| anyhow::anyhow!("read_link {}: {}", path.display(), e))?;
-        let stem = target
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        if stem != "skim" && stem != "rskim" {
-            result.preserved += 1;
-            continue;
-        }
-
-        // This is a skim-pointing symlink — remove it.
-        if dry_run {
-            println!("  [dry-run] Would remove: {}", path.display());
-            result.removed += 1;
-        } else {
-            std::fs::remove_file(&path)
-                .map_err(|e| anyhow::anyhow!("remove {}: {}", path.display(), e))?;
-            result.removed += 1;
-        }
+        classify_and_remove_entry(&entry.path(), dry_run, &mut result)?;
     }
 
     // Remove the directory if it is now empty.
@@ -360,6 +323,77 @@ pub(super) fn uninstall_wrappers_in(dir: &Path, dry_run: bool) -> anyhow::Result
     }
 
     Ok(result)
+}
+
+/// Classify a single directory entry and remove it if it is a skim-pointing symlink.
+///
+/// Three outcomes:
+/// - Not a symlink (or stat error) → `result.preserved` incremented, no removal.
+/// - Symlink whose target stem is not `"skim"` or `"rskim"` → `result.preserved`
+///   incremented, no removal.
+/// - Symlink whose target stem is `"skim"` or `"rskim"` → removal (or dry-run
+///   report) and `result.removed` incremented.
+///
+/// Non-UTF-8 symlink targets are treated as non-skim (preserved) and emit a
+/// debug-level warning so the edge case is visible without surfacing noise in
+/// normal operation.
+fn classify_and_remove_entry(
+    path: &Path,
+    dry_run: bool,
+    result: &mut UninstallResult,
+) -> anyhow::Result<()> {
+    // Only process symlinks; preserve anything else.
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => {
+            result.preserved += 1;
+            return Ok(());
+        }
+    };
+
+    if !meta.file_type().is_symlink() {
+        result.preserved += 1;
+        return Ok(());
+    }
+
+    // Only remove symlinks whose target filename stem is exactly "skim" or "rskim".
+    // Using file_stem() (not file_name()) strips extensions such as ".exe" on
+    // Windows, matching the behaviour of extract_argv0_stem() in main.rs.
+    // Substring matching (e.g. contains("skim")) would incorrectly remove
+    // symlinks pointing to binaries like `/usr/local/bin/someskimmer`.
+    let target = std::fs::read_link(path)
+        .map_err(|e| anyhow::anyhow!("read_link {}: {}", path.display(), e))?;
+    let stem = match target.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => {
+            // Non-UTF-8 path component — cannot match "skim"/"rskim"; preserve.
+            // Emit a debug warning so non-UTF-8 targets are diagnosable.
+            if std::env::var_os("SKIM_DEBUG").is_some() {
+                eprintln!(
+                    "  debug: preserving {} — target {:?} has non-UTF-8 stem",
+                    path.display(),
+                    target
+                );
+            }
+            result.preserved += 1;
+            return Ok(());
+        }
+    };
+
+    if stem != "skim" && stem != "rskim" {
+        result.preserved += 1;
+        return Ok(());
+    }
+
+    // This is a skim-pointing symlink — remove it.
+    if dry_run {
+        println!("  [dry-run] Would remove: {}", path.display());
+    } else {
+        std::fs::remove_file(path)
+            .map_err(|e| anyhow::anyhow!("remove {}: {}", path.display(), e))?;
+    }
+    result.removed += 1;
+    Ok(())
 }
 
 // ============================================================================
@@ -655,31 +689,63 @@ mod tests {
     }
 
     /// uninstall_wrappers_in returns an error when the directory contains more
-    /// than MAX_ENTRIES (256) files. This circuit breaker prevents unbounded
+    /// than MAX_ENTRIES (128) files. This circuit breaker prevents unbounded
     /// iteration on corrupted or adversarial directories.
     #[cfg(unix)]
     #[test]
-    fn test_uninstall_circuit_breaker_fires_above_256_entries() {
+    fn test_uninstall_circuit_breaker_fires_above_128_entries() {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         let bin_dir = tmp.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
 
-        // Create 257 files — one above the MAX_ENTRIES limit.
-        for i in 0..=256usize {
+        // Create 129 files — one above the MAX_ENTRIES limit.
+        for i in 0..=128usize {
             std::fs::write(bin_dir.join(format!("file_{i}")), "").unwrap();
         }
 
         let result = uninstall_wrappers_in(&bin_dir, false);
         assert!(
             result.is_err(),
-            "directories with >256 entries must trigger the circuit breaker"
+            "directories with >128 entries must trigger the circuit breaker"
         );
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("256"),
-            "error message must mention the 256 entry limit: {err}"
+            err.contains("128"),
+            "error message must mention the 128 entry limit: {err}"
+        );
+    }
+
+    /// classify_and_remove_entry uses file_stem() so that "skim.exe" on Windows
+    /// matches "skim". Regression guard: file_name() would return "skim.exe"
+    /// which does NOT equal "skim", breaking uninstall on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn test_uninstall_removes_symlink_to_skim_exe() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        // Simulate a Windows-style binary name as the symlink target.
+        let fake_skim_exe = tmp.path().join("skim.exe");
+        std::fs::write(&fake_skim_exe, "").unwrap();
+
+        let link = bin_dir.join("git");
+        std::os::unix::fs::symlink(&fake_skim_exe, &link).unwrap();
+
+        let result = uninstall_wrappers_in(&bin_dir, false).unwrap();
+
+        assert_eq!(
+            result.removed, 1,
+            "symlink pointing to 'skim.exe' must be removed (file_stem strips .exe)"
+        );
+        assert_eq!(result.preserved, 0);
+        assert!(
+            !link.exists() && !link.is_symlink(),
+            "the skim.exe-pointing symlink must have been removed"
         );
     }
 
