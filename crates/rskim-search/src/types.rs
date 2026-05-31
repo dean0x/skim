@@ -614,6 +614,14 @@ pub enum SearchError {
     /// no rusqlite types leak into this enum.
     #[error("Database error: {0}")]
     Database(String),
+
+    /// AST processing error (e.g. grammar load failure for a tree-sitter language).
+    ///
+    /// Distinct from parse errors (which produce empty results gracefully):
+    /// this variant signals that the language grammar itself failed to load,
+    /// which is an unrecoverable configuration problem, not a file-level error.
+    #[error("AST error: {0}")]
+    AstError(String),
 }
 
 /// Result type alias for all rskim-search operations.

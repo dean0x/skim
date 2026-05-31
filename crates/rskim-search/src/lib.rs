@@ -14,6 +14,7 @@
 //!
 //! CLI/binary code in `crates/rskim/src/cmd/search/mod.rs` handles user-facing I/O.
 
+pub mod ast_index;
 pub mod ast_weights;
 pub mod cochange;
 pub(crate) mod fields;
@@ -24,6 +25,7 @@ pub mod temporal;
 mod types;
 pub mod weights;
 
+pub use ast_index::{LinearNode, LinearizeResult, linearize_source};
 pub use cochange::{CochangeMatrixBuilder, CochangeMatrixReader};
 pub use index::{NgramIndexBuilder, NgramIndexReader};
 pub use lexical::{

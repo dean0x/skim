@@ -2380,6 +2380,7 @@ name = "rskim-search"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "criterion",
  "gix",
  "memmap2",
  "regex",
@@ -2389,6 +2390,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tree-sitter",
 ]
 
 [[package]]
