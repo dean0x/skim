@@ -279,6 +279,19 @@ pub(super) fn print_detected_state(state: &DetectedState) {
     println!();
 }
 
+/// Resolve the `AgentKind` for a state's `agent_cli_name`.
+///
+/// Returns an error when the name is unrecognised — this would indicate a bug
+/// in state detection, since `DetectedState` is always built from a known `AgentKind`.
+fn agent_from_state(state: &DetectedState) -> anyhow::Result<AgentKind> {
+    AgentKind::from_str(state.agent_cli_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unrecognised agent CLI name {:?}; this is a bug in state detection",
+            state.agent_cli_name
+        )
+    })
+}
+
 fn execute_install(
     state: &DetectedState,
     no_guidance: bool,
@@ -301,13 +314,7 @@ fn execute_install(
 
     // Inject guidance into agent instruction file
     if !no_guidance {
-        let agent = AgentKind::from_str(state.agent_cli_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "unrecognised agent CLI name {:?}; this is a bug in state detection",
-                state.agent_cli_name
-            )
-        })?;
-        inject_guidance(agent, global, env)?;
+        inject_guidance(agent_from_state(state)?, global, env)?;
     }
 
     // Search: install git hooks and start a background index build.
@@ -661,12 +668,7 @@ fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
     }
 
     // Upsert hook entry via the agent-specific protocol (correct event key and format)
-    let agent = AgentKind::from_str(state.agent_cli_name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unrecognised agent CLI name {:?}; this is a bug in state detection",
-            state.agent_cli_name
-        )
-    })?;
+    let agent = agent_from_state(state)?;
     let protocol = protocol_for_agent(agent);
     let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
     protocol.upsert_hook(&mut settings, &hook_script_path.display().to_string())?;
@@ -722,12 +724,7 @@ pub(super) fn print_dry_run_actions(
         state.settings_path.display()
     );
     if !no_guidance {
-        let agent = AgentKind::from_str(state.agent_cli_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "unrecognised agent CLI name {:?}; this is a bug in state detection",
-                state.agent_cli_name
-            )
-        })?;
+        let agent = agent_from_state(state)?;
         if let Some(path) = agent.instruction_file(global, env) {
             println!("  [dry-run] Would inject guidance into {}", path.display());
         }

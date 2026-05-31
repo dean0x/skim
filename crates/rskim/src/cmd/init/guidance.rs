@@ -200,8 +200,8 @@ pub(super) fn inject_guidance(
         guidance_create(&path, &new_content)?;
     }
 
-    // Legacy cleanup: remove skim markers from .cursorrules if this is a Cursor agent
-    if is_mdc && path.to_string_lossy().contains("skim.mdc") {
+    // Legacy cleanup: remove skim markers from .cursorrules when writing skim.mdc
+    if path.to_string_lossy().contains("skim.mdc") {
         clean_legacy_cursorrules()?;
     }
 
@@ -279,19 +279,15 @@ pub(super) fn remove_guidance(
 /// trailing newline appended when non-empty.
 pub(super) fn strip_skim_section(content: &str) -> Option<String> {
     let (start, end) = find_skim_section(content)?;
-    let trimmed = format!(
-        "{}{}",
-        content[..start].trim_end_matches('\n'),
-        &content[end..]
-    )
-    .trim()
-    .to_string();
-    let final_content = if trimmed.is_empty() {
+    let before = content[..start].trim_end_matches('\n');
+    let after = &content[end..];
+    let combined = format!("{before}{after}");
+    let trimmed = combined.trim();
+    Some(if trimmed.is_empty() {
         String::new()
     } else {
-        trimmed + "\n"
-    };
-    Some(final_content)
+        format!("{trimmed}\n")
+    })
 }
 
 /// Atomically write `content` to `path`, using a sibling `.tmp`-suffixed file.
