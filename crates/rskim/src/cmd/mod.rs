@@ -110,11 +110,10 @@ static SKIM_WRAPPERS_DIR: LazyLock<Option<std::path::PathBuf>> =
 /// `cmd::init::wrappers::wrappers_dir` (installer/uninstaller) delegate here so
 /// that a future directory change requires only one edit.
 ///
-/// Backed by [`SKIM_WRAPPERS_DIR`] — no allocation beyond the `Path`→`PathBuf`
-/// clone needed by callers that require an owned `PathBuf`. The path computation
-/// itself (home dir lookup + joins) is paid only once.
-pub(crate) fn skim_wrappers_dir() -> Option<std::path::PathBuf> {
-    SKIM_WRAPPERS_DIR.as_deref().map(|p| p.to_path_buf())
+/// Backed by [`SKIM_WRAPPERS_DIR`] — zero allocation on every call. Callers that
+/// need an owned `PathBuf` can call `.to_path_buf()` on the returned `&'static Path`.
+pub(crate) fn skim_wrappers_dir() -> Option<&'static std::path::Path> {
+    SKIM_WRAPPERS_DIR.as_deref()
 }
 
 /// Core bounded read loop, injectable for testing.
@@ -1967,7 +1966,7 @@ mod tests {
     fn test_meta_subcommands_are_in_known_subcommands() {
         for &meta in META_SUBCOMMANDS {
             assert!(
-                KNOWN_SUBCOMMANDS.contains(&meta),
+                is_known_subcommand(meta),
                 "META_SUBCOMMANDS entry '{meta}' is not in KNOWN_SUBCOMMANDS — \
                  every meta subcommand must also be registered in KNOWN_SUBCOMMANDS"
             );

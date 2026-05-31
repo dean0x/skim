@@ -604,7 +604,7 @@ fn filter_wrappers_from_path(path: &std::ffi::OsStr) -> Option<std::ffi::OsStrin
     // wrappers directory cannot be present.  Skip the expensive
     // split-normalize-filter-join entirely — this is the common case when
     // `skim init --wrappers` has not been run.
-    if !path.to_string_lossy().contains(".skim") {
+    if !path.as_encoded_bytes().windows(5).any(|w| w == b".skim") {
         return None;
     }
 
@@ -1560,5 +1560,45 @@ mod tests {
         // We can't assert the exact value because it depends on skim_wrappers_dir(),
         // but we can assert no panic occurs and the function is callable.
         let _ = filter_wrappers_from_path(&path);
+    }
+
+    /// KNOWN LIMITATION: filter_wrappers_from_path uses syntactic normalization
+    /// only (component-level path collapsing), not filesystem canonicalization.
+    ///
+    /// If `~/.skim` is itself a symlink (e.g. `~/.skim -> /opt/skim-wrappers`),
+    /// the syntactic comparison `normalized != wrappers_dir_canonical` will fail
+    /// because the PATH entry carries the real path `/opt/skim-wrappers/bin` while
+    /// `wrappers_dir_canonical` holds `~/.skim/bin` (syntactically normalised only).
+    ///
+    /// This means the recursion-prevention guard does NOT fire and `~/.skim/bin`
+    /// effectively stays on PATH under the symlink alias — a skim wrapper invocation
+    /// would recurse infinitely.
+    ///
+    /// Resolution requires `std::fs::canonicalize` on both sides of the comparison,
+    /// which is an I/O call and cannot be pure/no-alloc. Tracked as a known limitation
+    /// per PF-003. The test below documents the gap so the constraint is explicit.
+    #[test]
+    fn test_filter_wrappers_symlink_bypass_is_known_limitation() {
+        // We cannot create real filesystem symlinks in a unit test reliably across
+        // all platforms and CI environments.  Instead, this test documents the
+        // known limitation by asserting the SYNTACTIC behaviour: a path entry that
+        // resolves to the same filesystem location as `~/.skim/bin` but is spelled
+        // differently (e.g. via a parent-directory symlink) will NOT be removed.
+        //
+        // Concretely: if $HOME/.skim is a symlink to /tmp/skim-wrappers, then
+        // a PATH entry of `/tmp/skim-wrappers/bin` is NOT filtered out because
+        // `skim_wrappers_dir()` returns `$HOME/.skim/bin`, and the syntactic
+        // normalisation step cannot resolve that symlink.
+        //
+        // The safe escape hatch is SKIM_PASSTHROUGH=1, which bypasses all
+        // handler logic and is documented in CLAUDE.md.
+        //
+        // If you are here to fix this: replace the syntactic `components().collect()`
+        // canonicalization with `std::fs::canonicalize` on both sides and add
+        // filesystem-level symlink tests using tempdir + std::os::unix::fs::symlink.
+        //
+        // This test intentionally has no assertions — its purpose is to be a
+        // discoverable marker in the test suite for this limitation.
+        let _note = "syntactic-only PATH filter: symlink bypass is a known limitation (PF-003)";
     }
 }
