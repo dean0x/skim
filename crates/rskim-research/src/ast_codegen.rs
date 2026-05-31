@@ -164,28 +164,38 @@ fn write_vocabulary(buf: &mut Vec<u8>, vocabulary: &[String]) -> anyhow::Result<
 /// hard production errors because the output is written verbatim into generated
 /// Rust source files.
 fn lang_to_ident(lang: &str) -> anyhow::Result<String> {
-    let mapped: String = lang
-        .chars()
-        .map(|c| match c {
-            '+' | '#' | '-' | ' ' => '_',
-            _ => c.to_ascii_uppercase(),
-        })
-        .collect();
+    // Semantic mappings for languages whose punctuation-based names would
+    // collide after naive character substitution (e.g. "C++" and "C#" both
+    // become "C_" with simple replace-and-collapse).
+    let result = match lang {
+        "C++" => "CPP".to_string(),
+        "C#" => "CSHARP".to_string(),
+        _ => {
+            let mapped: String = lang
+                .chars()
+                .map(|c| match c {
+                    '+' | '#' | '-' | ' ' => '_',
+                    _ => c.to_ascii_uppercase(),
+                })
+                .collect();
 
-    // Collapse runs of consecutive underscores (any length) to a single `_`.
-    let mut result = String::with_capacity(mapped.len());
-    let mut prev_underscore = false;
-    for c in mapped.chars() {
-        if c == '_' {
-            if !prev_underscore {
-                result.push(c);
+            // Collapse runs of consecutive underscores (any length) to a single `_`.
+            let mut collapsed = String::with_capacity(mapped.len());
+            let mut prev_underscore = false;
+            for c in mapped.chars() {
+                if c == '_' {
+                    if !prev_underscore {
+                        collapsed.push(c);
+                    }
+                    prev_underscore = true;
+                } else {
+                    collapsed.push(c);
+                    prev_underscore = false;
+                }
             }
-            prev_underscore = true;
-        } else {
-            result.push(c);
-            prev_underscore = false;
+            collapsed
         }
-    }
+    };
 
     // Production guard: reject identifiers that would produce invalid Rust code.
     // These are hard errors (not debug_assert!) because lang_to_ident output is
@@ -224,10 +234,21 @@ fn sorted_lang_idents<V>(
 ) -> anyhow::Result<Vec<(String, String)>> {
     let mut langs: Vec<&String> = map.keys().collect();
     langs.sort();
-    langs
+    let pairs: Vec<(String, String)> = langs
         .into_iter()
         .map(|lang| lang_to_ident(lang).map(|ident| (lang.clone(), ident)))
-        .collect()
+        .collect::<anyhow::Result<_>>()?;
+
+    let mut seen = std::collections::HashSet::new();
+    for (lang, ident) in &pairs {
+        if !seen.insert(ident.as_str()) {
+            anyhow::bail!(
+                "lang_to_ident collision: language {lang:?} produces ident {ident:?} \
+                 which was already used by another language — add a semantic mapping"
+            );
+        }
+    }
+    Ok(pairs)
 }
 
 /// Write a `binary_search_by_key` lookup function into `buf`.
@@ -532,24 +553,18 @@ mod tests {
 
     #[test]
     fn lang_to_ident_handles_language_names() {
-        // Language strings match ast-corpus.toml values (not raw C++/C#).
         assert_eq!(lang_to_ident("Rust").unwrap(), "RUST");
         assert_eq!(lang_to_ident("TypeScript").unwrap(), "TYPESCRIPT");
-        assert_eq!(lang_to_ident("Cpp").unwrap(), "CPP");
-        assert_eq!(lang_to_ident("CSharp").unwrap(), "CSHARP");
         assert_eq!(lang_to_ident("C").unwrap(), "C");
         assert_eq!(lang_to_ident("JavaScript").unwrap(), "JAVASCRIPT");
+        // Semantic mappings for punctuation-heavy names that would collide.
+        assert_eq!(lang_to_ident("C++").unwrap(), "CPP");
+        assert_eq!(lang_to_ident("C#").unwrap(), "CSHARP");
     }
 
     #[test]
     fn lang_to_ident_collapses_consecutive_underscores() {
-        // Double underscores should collapse to a single underscore.
-        assert_eq!(lang_to_ident("C++").unwrap(), "C_");
-        // Triple or more consecutive underscores (e.g. from "C# +" → "C__") must
-        // also collapse to a single underscore — the previous split("__") approach
-        // only handled exactly-double sequences.
-        assert_eq!(lang_to_ident("C# +").unwrap(), "C_");
-        // No underscores: unchanged.
+        assert_eq!(lang_to_ident("some--lang").unwrap(), "SOME_LANG");
         assert_eq!(lang_to_ident("Go").unwrap(), "GO");
     }
 

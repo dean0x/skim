@@ -23,8 +23,12 @@ const MAX_AST_DEPTH: usize = 500;
 /// Maximum number of AST nodes visited per file.
 const MAX_AST_NODES: u32 = 100_000;
 
-/// Maximum source file size accepted for AST extraction (100 KiB).
+/// Maximum source file size accepted for AST extraction (100 KiB default).
 const MAX_FILE_SIZE: usize = 100 * 1024;
+
+/// Extended file size limit for languages whose typical files are large
+/// schema dumps or data-heavy documents (e.g. SQL migrations).
+const MAX_FILE_SIZE_LARGE: usize = 1024 * 1024;
 
 /// Maximum number of trigrams collected per file (memory guard).
 const MAX_TRIGRAMS_PER_FILE: usize = 50_000;
@@ -66,10 +70,14 @@ pub fn extract_ast_ngrams_from_file(
     vocab: &mut NodeKindVocabulary,
     collect_trigrams: bool,
 ) -> anyhow::Result<AstFileResult> {
-    if source.len() > MAX_FILE_SIZE {
+    let size_limit = match language {
+        Language::Sql => MAX_FILE_SIZE_LARGE,
+        _ => MAX_FILE_SIZE,
+    };
+    if source.len() > size_limit {
         eprintln!(
             "Warning: skipping file larger than {} KiB for AST extraction",
-            MAX_FILE_SIZE / 1024
+            size_limit / 1024
         );
         return Ok(AstFileResult::default());
     }

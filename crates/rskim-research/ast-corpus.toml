@@ -42,8 +42,8 @@ language = "Rust"
 # ---- TypeScript (5 repos — reused from corpus.toml) ----
 
 [[repos]]
-url = "https://github.com/microsoft/TypeScript"
-commit = "f350b52331494b68c90ab02e2b6d0828d2a22a74"
+url = "https://github.com/colinhacks/zod"
+commit = "bbc68f990c7e6a5e3f506c56fb04bd0279b9c9b5"
 language = "TypeScript"
 
 [[repos]]
@@ -70,7 +70,7 @@ language = "TypeScript"
 
 [[repos]]
 url = "https://github.com/pallets/flask"
-commit = "7374c85ddefc3f4b177a698ab9f0cbb6a5c0b392"
+commit = "36e4a824f340fdee7ed50937ba8e7f6bc7d17f81"
 language = "Python"
 
 [[repos]]
@@ -80,7 +80,7 @@ language = "Python"
 
 [[repos]]
 url = "https://github.com/psf/requests"
-commit = "6404f345e562d962abe6700a1c357ec1e7e18232"
+commit = "c4367f231b5dc54f23f2983828562ce3a7555a8a"
 language = "Python"
 
 [[repos]]
@@ -209,7 +209,7 @@ language = "CSharp"
 
 [[repos]]
 url = "https://github.com/rails/rails"
-commit = "6d5c14cbb7e22604b6647662969c65f3625b9d8c"
+commit = "f77b6c295c9a3dde113e7fbc0a046ce6ef9fd2d8"
 language = "Ruby"
 
 [[repos]]
@@ -236,6 +236,12 @@ url = "https://github.com/vapor/vapor"
 commit = "712b0919a3ba772f7402ccaf07cdb6ca823dd650"
 language = "Swift"
 
-# NOTE: SQL and Markdown files are found in the polyglot repos above
-# (django has .sql fixtures, spring-boot has .md docs, kubernetes has .md
-# documentation, etc.). No dedicated entries are needed.
+# ---- SQL (1 repo — dedicated for AST corpus) ----
+# SQL and Markdown files are also found in the polyglot repos above
+# (django has .sql fixtures, spring-boot has .md docs, etc.).
+# Chinook provides dedicated multi-dialect SQL coverage (DDL, DML, schemas).
+
+[[repos]]
+url = "https://github.com/lerocha/chinook-database"
+commit = "7f67772503d71ba90f19283c38e93923addb43fa"
+language = "SQL"
