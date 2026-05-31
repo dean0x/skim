@@ -16,10 +16,12 @@
 //! `cmd/hooks/` for protocol-specific documentation.
 
 mod flags;
+mod guidance;
 mod helpers;
 mod install;
 mod state;
 mod uninstall;
+pub(super) mod wrappers;
 
 use std::process::ExitCode;
 
@@ -113,5 +115,19 @@ pub(super) fn command() -> clap::Command {
                 .long("force")
                 .action(clap::ArgAction::SetTrue)
                 .help("Force operation (e.g., uninstall tampered hook)"),
+        )
+        .arg(
+            clap::Arg::new("wrappers")
+                .long("wrappers")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("no-wrappers")
+                .help("Install PATH wrappers in ~/.skim/bin/ (skip interactive prompt)"),
+        )
+        .arg(
+            clap::Arg::new("no-wrappers")
+                .long("no-wrappers")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("wrappers")
+                .help("Skip PATH wrapper installation (skip interactive prompt)"),
         )
 }

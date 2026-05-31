@@ -518,6 +518,15 @@ mod tests {
         assert!(script.contains("skim init --agent test-agent"));
         assert!(script.contains("SKIM_HOOK_VERSION=\"1.2.3\""));
         assert!(script.contains("exec skim rewrite --hook --agent test-agent"));
+        // Hook script must NOT prepend ~/.skim/bin to PATH. The wrapper dir
+        // contains tool-name symlinks (git, cargo, …) but no `skim` symlink,
+        // so the prepend cannot help `exec skim` resolve the binary. The
+        // prepend was removed because it was dead code: added then immediately
+        // stripped by strip_skim_wrappers_from_path() in the skim binary.
+        assert!(
+            !script.contains("export PATH="),
+            "hook script must not modify PATH (wrapper dir has no skim binary)"
+        );
     }
 
     #[test]

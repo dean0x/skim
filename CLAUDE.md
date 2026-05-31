@@ -157,7 +157,7 @@ cargo fmt -- --check           # Format check
 - `agents` — Display detected AI agents and their hook/session status (`--json`)
 - `completions` — Shell completion scripts
 - `discover` — Scan agent sessions for missed skim optimization opportunities (`--since`, `--agent`, `--json`, `--no-truncate`)
-- `init` — Install skim as an agent hook (Claude Code, Cursor, Codex, Gemini, Copilot, Crush)
+- `init` — Install skim as an agent hook (Claude Code, Cursor, Codex, Gemini, Copilot, Crush); `--wrappers` installs PATH wrappers for sub-agent interception, `--no-wrappers` skips wrapper installation
 - `learn` — Detect CLI error-retry patterns in agent sessions and generate correction rules (`--generate`, `--agent`, `--dry-run`, `--no-truncate`)
 - `rewrite` — Rewrite developer commands into skim equivalents (`--hook` for agent integration)
 - `stats` — Token analytics dashboard with per-session tracking (`--since`, `--format json`, `--verbose`, `--clear`)
@@ -173,11 +173,11 @@ cargo fmt -- --check           # Format check
 - `log` — Log compression: JSON structured + regex plaintext deduplication, debug filtering, stack trace collapsing (`--json`, `--show-stats`)
 
 **Direct tool subcommands (v2.8.0 flat dispatch):**
-- `jest`, `pytest`, `vitest` — Test runner output compression
-- `make` — GNU Make build output compression
+- `cypress`, `dotnet`, `jest`, `playwright`, `pytest`, `swift`, `vitest` — Test runner output compression
+- `gradle`, `gradlew`, `make`, `mvn`, `mvnw` — Build tool output compression
 - `tsc` — TypeScript build output compression
-- `biome`, `black`, `dprint`, `eslint`, `gofmt`, `golangci`, `mypy`, `oxlint`, `prettier`, `ruff`, `rustfmt` — Lint/formatter output compression
-- `npm`, `pnpm`, `pip` — Package manager output compression
+- `biome`, `black`, `dprint`, `eslint`, `gofmt`, `golangci`, `mypy`, `oxlint`, `prettier`, `rubocop`, `ruff`, `rustfmt`, `swiftlint` — Lint/formatter output compression
+- `npm`, `pip`, `pnpm`, `yarn` — Package manager output compression
 - `aws`, `curl`, `dig`, `docker`, `gh`, `kubectl`, `nslookup`, `terraform`, `wget` — Infrastructure/container tool output compression (three-tier degradation, `--json`)
 - `mysql`, `psql`, `sqlite3` — Database query output compression (three-tier degradation, `--json`)
 - `df`, `diff`, `du`, `env`, `find`, `grep`, `ls`, `printenv`, `ps`, `rg`, `tree`, `wc` — File operations output compression
@@ -188,6 +188,7 @@ cargo fmt -- --check           # Format check
 - `SKIM_DISABLE_ANALYTICS` — Set to `1`/`true`/`yes` to disable recording
 - `SKIM_INPUT_COST_PER_MTOK` — Override $/MTok for cost estimates (default: 3.0, rejects negative values)
 - `SKIM_ANALYTICS_DB` — Override analytics database path
+- `SKIM_SESSION_ID` — Session ID for analytics attribution across all skim invocations. Priority order: `--session-id` flag > sidecar > `SKIM_SESSION_ID` env > None. When using PATH wrappers, set alongside `PATH` export in your shell profile so sub-agents inherit it.
 
 **Session provider paths (used by `discover`, `learn`, `agents`):**
 - `SKIM_PROJECTS_DIR` — Override Claude Code projects directory (default: `~/.claude/projects/`)
@@ -205,6 +206,32 @@ cargo fmt -- --check           # Format check
 
 **Passthrough:**
 - `SKIM_PASSTHROUGH` — Set to `1`/`true`/`yes` to bypass all skim compression (hook, test, build). Useful for debugging when compressed output hides errors.
+
+### Shell Interception (PATH Wrappers)
+
+Sub-agents that spawn their own shell bypass PreToolUse hooks. PATH wrappers close this gap by intercepting commands at the OS level.
+
+**How it works:**
+1. `skim init --wrappers` creates symlinks `~/.skim/bin/<tool>` → skim binary for each supported tool
+2. User adds `export PATH="$HOME/.skim/bin:$PATH"` to their shell profile
+3. When any process invokes `git`, `npm`, etc., the shell resolves the symlink
+4. The skim binary detects `argv[0] == "git"` and dispatches through the existing git handler
+5. The binary strips `~/.skim/bin` from PATH as its first action — preventing infinite recursion
+
+**Recursion prevention:**
+- `strip_skim_wrappers_from_path()` is called as the very first statement in `main()` before any thread is spawned
+- When a handler runs `CommandRunner::run("git", …)`, the shell finds `/usr/bin/git` (not the symlink)
+- `SKIM_PASSTHROUGH=1` always works as an escape hatch — the handler checks it internally
+
+**Session attribution:**
+- Add `export SKIM_SESSION_ID="<id>"` to shell profile alongside the PATH export
+- This gives sub-agents a consistent session identity for analytics grouping
+- Priority order: `--session-id` flag > sidecar > `SKIM_SESSION_ID` env > None
+
+**Safety invariant:**
+- `install_wrappers` NEVER overwrites non-symlink files (regular files, directories, etc.)
+- Non-symlink paths are skipped with a warning
+- `uninstall_wrappers` ONLY removes symlinks whose target filename stem is exactly `"skim"` or `"rskim"`
 
 ### Benchmarking
 ```bash
