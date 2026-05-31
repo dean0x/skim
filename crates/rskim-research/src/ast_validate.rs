@@ -209,8 +209,8 @@ mod tests {
 
     use super::*;
     use crate::ast_types::{
-        encode_ast_bigram, encode_ast_trigram, AstBigramWeight, AstCorpusStats, AstLanguageStats,
-        AstTrigramWeight, AstWeightTable,
+        AstBigramWeight, AstCorpusStats, AstLanguageStats, AstTrigramWeight, AstWeightTable,
+        encode_ast_bigram, encode_ast_trigram,
     };
 
     fn sample_table() -> AstWeightTable {

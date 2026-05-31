@@ -429,25 +429,53 @@ mod tests {
     fn generated_source_contains_vocabulary() {
         let table = sample_table();
         let source = build_ast_weights_rs(&table).unwrap();
-        assert!(source.contains("NODE_KIND_VOCABULARY"));
-        assert!(source.contains("function_item"));
-        assert!(source.contains("identifier"));
+        // Structural markers — verifies the const declaration is syntactically valid Rust.
+        assert!(
+            source.contains("pub const NODE_KIND_VOCABULARY: &[&str]"),
+            "missing vocabulary const declaration"
+        );
+        assert!(
+            source.contains("\"function_item\""),
+            "vocabulary must contain function_item"
+        );
+        assert!(
+            source.contains("\"identifier\""),
+            "vocabulary must contain identifier"
+        );
     }
 
     #[test]
     fn generated_source_contains_language_arrays() {
         let table = sample_table();
         let source = build_ast_weights_rs(&table).unwrap();
-        assert!(source.contains("RUST_AST_BIGRAM_WEIGHTS"));
-        assert!(source.contains("RUST_AST_TRIGRAM_WEIGHTS"));
+        // Structural markers — verifies the const declarations are syntactically valid Rust.
+        assert!(
+            source.contains("pub const RUST_AST_BIGRAM_WEIGHTS: &[(u32, f32)]"),
+            "missing Rust bigram weights const"
+        );
+        assert!(
+            source.contains("pub const RUST_AST_TRIGRAM_WEIGHTS: &[(u64, f32)]"),
+            "missing Rust trigram weights const"
+        );
     }
 
     #[test]
     fn generated_source_contains_lookup_functions() {
         let table = sample_table();
         let source = build_ast_weights_rs(&table).unwrap();
-        assert!(source.contains("pub fn ast_bigram_weight"));
-        assert!(source.contains("pub fn ast_trigram_weight"));
+        // Structural markers — verifies the function signatures are syntactically valid Rust.
+        assert!(
+            source.contains("pub fn ast_bigram_weight(lang: &str, bigram: u32) -> Option<f32>"),
+            "missing ast_bigram_weight function signature"
+        );
+        assert!(
+            source.contains("pub fn ast_trigram_weight(lang: &str, trigram: u64) -> Option<f32>"),
+            "missing ast_trigram_weight function signature"
+        );
+        assert!(
+            source.contains("#[cfg(test)]"),
+            "generated source must include embedded test module"
+        );
     }
 
     #[test]
@@ -518,5 +546,31 @@ mod tests {
 
         let err = generate_ast_weights_rs(&json_path, &out_path).unwrap_err();
         assert!(err.to_string().contains("invalid IDF"));
+    }
+
+    #[test]
+    fn nan_idf_returns_error() {
+        // NaN cannot round-trip through JSON, so call validate_ast_table directly.
+        let mut table = sample_table();
+        table.bigram_weights.get_mut("Rust").unwrap()[0].idf = f32::NAN;
+
+        let err = validate_ast_table(&table).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid IDF"),
+            "NaN IDF should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn infinity_idf_returns_error() {
+        // Infinity cannot round-trip through JSON, so call validate_ast_table directly.
+        let mut table = sample_table();
+        table.bigram_weights.get_mut("Rust").unwrap()[0].idf = f32::INFINITY;
+
+        let err = validate_ast_table(&table).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid IDF"),
+            "Infinity IDF should be rejected: {err}"
+        );
     }
 }

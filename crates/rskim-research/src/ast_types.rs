@@ -246,14 +246,14 @@ impl NodeKindVocabulary {
         remap
     }
 
-    /// Returns all registered kind strings in sorted (alphabetical) order.
+    /// Returns all registered kind strings in the order of their assigned IDs.
     ///
-    /// Sorted order matches the ID assignment after [`stabilize`](Self::stabilize).
+    /// After [`stabilize`](Self::stabilize) this order is alphabetical, matching
+    /// the stable ID assignment.  Call only after `stabilize` when sorted output
+    /// is required.
     #[must_use]
     pub fn kinds(&self) -> Vec<&str> {
-        let mut v: Vec<&str> = self.id_to_kind.iter().map(String::as_str).collect();
-        v.sort_unstable();
-        v
+        self.id_to_kind.iter().map(String::as_str).collect()
     }
 }
 
