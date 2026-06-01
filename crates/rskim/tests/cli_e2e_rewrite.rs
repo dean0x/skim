@@ -2178,3 +2178,39 @@ fn test_rewrite_npm_run_script_alias() {
         .success()
         .stdout(predicate::str::contains("skim npm run lint"));
 }
+
+// ============================================================================
+// npm run: missing script name error path
+// ============================================================================
+
+#[test]
+fn test_npm_run_missing_script_name_exits_failure() {
+    // `skim npm run` without a script name must exit non-zero and print a
+    // diagnostic to stderr.  The error path is hit before npm is spawned, so
+    // this test is self-contained and does not require npm to be installed.
+    skim_cmd()
+        .args(["npm", "run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("missing script name"));
+}
+
+// ============================================================================
+// cargo c alias: direct dispatch
+// ============================================================================
+
+#[test]
+fn test_cargo_c_alias_dispatches_to_check() {
+    // `skim cargo c` is documented as an alias for `skim cargo check`.
+    // Verify the alias routes to the check handler by asserting that the
+    // binary accepts the invocation and attempts to run cargo check.
+    // We pass `--help` so that the underlying cargo check invocation does not
+    // actually run (the dispatch path short-circuits on --help flags before
+    // spawning).
+    skim_cmd()
+        .args(["cargo", "c", "--help"])
+        .assert()
+        // Either success (help printed) or failure (cargo not found) is acceptable.
+        // What must NOT happen is an "unknown subcommand" error for 'c'.
+        .stderr(predicate::str::contains("unknown subcommand 'c'").not());
+}

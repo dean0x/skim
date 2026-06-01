@@ -265,14 +265,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_npm_output_prettier_does_not_crash() {
+    fn test_parse_npm_output_prettier_produces_full() {
+        // prettier_check_fail.txt uses `[warn]` format — tier 1 (Full) for prettier parser.
         let fixture = crate::cmd::test_support::load_fixture("lint", "prettier_check_fail.txt");
         let output = make_output(&fixture, "", 1);
         let result = parse_npm_output(&output, ScriptTool::Prettier);
-        // Prettier text fixture should at minimum not panic.
         assert!(
-            result.is_full() || result.is_degraded() || result.is_passthrough(),
-            "Prettier branch must return a ParseResult variant"
+            result.is_full(),
+            "Expected Full parse for prettier [warn] fixture (tier 1), got {}",
+            result.tier_name()
         );
     }
 
@@ -290,15 +291,16 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_npm_output_tsc_does_not_crash() {
+    fn test_parse_npm_output_tsc_produces_full() {
+        // tsc_errors.txt contains `file(line,col): error TSxxxx` on stderr — tier 1 (Full).
         let fixture = crate::cmd::test_support::load_fixture("build", "tsc_errors.txt");
         // tsc writes errors to stderr.
         let output = make_output("", &fixture, 2);
         let result = parse_npm_output(&output, ScriptTool::Tsc);
-        // tsc error fixture should at minimum not panic.
         assert!(
-            result.is_full() || result.is_degraded() || result.is_passthrough(),
-            "Tsc branch must return a ParseResult variant"
+            result.is_full(),
+            "Expected Full parse for tsc error fixture (tier 1 regex on stderr), got {}",
+            result.tier_name()
         );
     }
 }
