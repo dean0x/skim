@@ -80,6 +80,9 @@ pub(super) fn run_script(
     let use_stdin = crate::cmd::should_read_stdin(args);
     let env_overrides: &[(&str, &str)] = &[("NO_COLOR", "1")];
 
+    // Cannot use run_pkg_subcommand here: (1) json_output needs conditional
+    // OutputFormat (Json vs Text), and (2) the parse function is dynamically
+    // selected by the detected tool rather than fixed at compile time.
     crate::cmd::run_parsed_command_with_mode(
         crate::cmd::ParsedCommandConfig {
             program: "npm",

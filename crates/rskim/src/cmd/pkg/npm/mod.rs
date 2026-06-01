@@ -1,7 +1,10 @@
 //! npm package manager parser (#105)
 //!
-//! Parses `npm install`, `npm audit`, `npm outdated`, and `npm ls` output
-//! using three-tier degradation: JSON -> regex -> passthrough.
+//! Parses `npm install`, `npm audit`, `npm outdated`, `npm ls`, `npm test`,
+//! and `npm run` output using three-tier degradation: JSON -> regex -> passthrough.
+//!
+//! `npm test` and `npm run` detect the underlying tool from `package.json`
+//! and delegate to the matching parser (vitest, jest, eslint, etc.).
 //!
 //! npm 7+ JSON schemas are supported. If JSON fails to parse, tier 2 regex
 //! is attempted on plain text output.
