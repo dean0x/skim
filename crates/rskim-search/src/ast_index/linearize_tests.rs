@@ -56,7 +56,7 @@ fn linear_node_is_copy() {
     let copy = n;
     assert_eq!(copy.kind_id, 42);
     assert_eq!(copy.depth, 3);
-    assert_eq!(n.kind_id, 42); // original still usable — confirmed Copy
+    assert_eq!(n.kind_id, 42); // using n after assignment proves Copy
 }
 
 #[test]

@@ -381,6 +381,20 @@ mod tests {
         }
     }
 
+    /// Assert that no bigram in `result` encodes a node whose kind resolves to `forbidden`.
+    ///
+    /// Used to verify that ERROR and MISSING nodes are never inserted into the vocabulary
+    /// and therefore cannot appear as parent or child in any emitted bigram.
+    fn assert_no_kind_in_bigrams(result: &AstFileResult, vocab: &NodeKindVocabulary, forbidden: &str) {
+        for &bigram in &result.bigrams {
+            let (parent_id, child_id) = crate::ast_types::decode_ast_bigram(bigram);
+            let parent_kind = vocab.resolve(parent_id).unwrap_or("UNKNOWN");
+            let child_kind = vocab.resolve(child_id).unwrap_or("UNKNOWN");
+            assert_ne!(parent_kind, forbidden, "bigram parent should not be {forbidden}");
+            assert_ne!(child_kind, forbidden, "bigram child should not be {forbidden}");
+        }
+    }
+
     // ── single-file extraction ─────────────────────────────────────────────
 
     #[test]
@@ -478,15 +492,8 @@ mod tests {
 
         // No bigram should encode an ERROR node ID.  Since ERROR nodes are never
         // inserted into the vocabulary, no valid NodeKindId exists for them, so
-        // no bigram can reference one.  Verify by checking every decoded bigram's
-        // parent and child IDs resolve to non-ERROR kinds.
-        for &bigram in &result.bigrams {
-            let (parent_id, child_id) = crate::ast_types::decode_ast_bigram(bigram);
-            let parent_kind = vocab.resolve(parent_id).unwrap_or("UNKNOWN");
-            let child_kind = vocab.resolve(child_id).unwrap_or("UNKNOWN");
-            assert_ne!(parent_kind, "ERROR", "bigram parent should not be ERROR");
-            assert_ne!(child_kind, "ERROR", "bigram child should not be ERROR");
-        }
+        // no bigram can reference one.
+        assert_no_kind_in_bigrams(&result, &vocab, "ERROR");
     }
 
     #[test]
@@ -580,13 +587,7 @@ mod tests {
         // No bigram should reference a MISSING node ID: since MISSING nodes are
         // never inserted into the vocabulary, their kind cannot appear in any
         // emitted bigram.
-        for &bigram in &result.bigrams {
-            let (parent_id, child_id) = crate::ast_types::decode_ast_bigram(bigram);
-            let parent_kind = vocab.resolve(parent_id).unwrap_or("UNKNOWN");
-            let child_kind = vocab.resolve(child_id).unwrap_or("UNKNOWN");
-            assert_ne!(parent_kind, "MISSING", "bigram parent should not be MISSING");
-            assert_ne!(child_kind, "MISSING", "bigram child should not be MISSING");
-        }
+        assert_no_kind_in_bigrams(&result, &vocab, "MISSING");
     }
 
     #[test]
