@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use crate::output::ParseResult;
 use crate::runner::{CommandOutput, CommandRunner};
 
-use super::{is_passthrough_mode, read_stdin_bounded, should_read_stdin, DEFAULT_CMD_TIMEOUT};
+use super::{DEFAULT_CMD_TIMEOUT, is_passthrough_mode, read_stdin_bounded, should_read_stdin};
 
 /// Controls the output format of parsed command results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -199,6 +199,7 @@ fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
 ///
 /// Separated from [`run_parsed_command_with_mode`] so the core parsing/rendering
 /// pipeline is readable as a linear sequence of steps.
+#[allow(clippy::too_many_arguments)]
 fn record_and_report(
     show_stats: bool,
     code: i32,
