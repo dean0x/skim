@@ -107,22 +107,15 @@ fn passthrough_subcmd(
     unknown: &str,
     args: &[String],
     subcmd_idx: usize,
+    supported: &str,
     env: &[(&str, &str)],
 ) -> anyhow::Result<ExitCode> {
     let safe = sanitize_for_display(unknown);
     eprintln!(
         "skim {tool}: unknown subcommand '{safe}' — passing through\n\
-         Supported subcommands: test"
+         Supported subcommands: {supported}"
     );
-    let mut all_args: Vec<String> = Vec::with_capacity(args.len());
-    all_args.push(unknown.to_string());
-    all_args.extend(
-        args.iter()
-            .enumerate()
-            .filter(|(i, _)| *i != subcmd_idx)
-            .map(|(_, s)| s.clone()),
-    );
-    run_raw_passthrough(tool, &all_args, env)
+    run_raw_passthrough(tool, &prepend_without(unknown, args, subcmd_idx), env)
 }
 
 // ============================================================================
@@ -314,7 +307,7 @@ fn dispatch_swift(
 
     match subcmd {
         "test" => test::run(&prepend_without("swift", args, idx), analytics),
-        unknown => passthrough_subcmd("swift", unknown, args, idx, &[]),
+        unknown => passthrough_subcmd("swift", unknown, args, idx, "test", &[]),
     }
 }
 
@@ -346,6 +339,7 @@ fn dispatch_dotnet(
             unknown,
             args,
             idx,
+            "test",
             &[("DOTNET_CLI_UI_LANGUAGE", "en-US")],
         ),
     }

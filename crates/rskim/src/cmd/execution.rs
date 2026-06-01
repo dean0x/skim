@@ -414,7 +414,7 @@ where
                 session_id: ctx.session_id.as_deref(),
             },
         },
-        |output| parse_fn(output),
+        parse_fn,
     )
 }
 
