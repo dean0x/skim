@@ -62,7 +62,12 @@ pub(super) fn run_script(
     };
 
     // Resolve and extract tool from package.json.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = std::env::current_dir().unwrap_or_else(|e| {
+        if crate::debug::is_debug_enabled() {
+            eprintln!("skim: npm run: current_dir() failed ({e}), using '.' as cwd");
+        }
+        PathBuf::from(".")
+    });
     let tool = resolve_script(&cwd, script_name)
         .map(|script| extract_tool(&script))
         .unwrap_or(ScriptTool::Unknown);
@@ -193,5 +198,107 @@ mod tests {
         let output = make_output("", "", 0);
         let result = parse_npm_output(&output, ScriptTool::Unknown);
         assert!(result.is_passthrough());
+    }
+
+    // -----------------------------------------------------------------------
+    // Known-tool branches: verify each arm calls the correct parser and does
+    // not panic.  The assertion checks that the result is not None (i.e. the
+    // parser ran and produced *some* tier), without prescribing which tier is
+    // chosen — that belongs to the individual parser's own test suite.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_npm_output_vitest_uses_vitest_parser() {
+        // vitest_regex_fail.txt is a plain-text vitest summary (tier 2 input).
+        let fixture = crate::cmd::test_support::load_fixture("test", "vitest_regex_fail.txt");
+        let output = make_output(&fixture, "", 1);
+        let result = parse_npm_output(&output, ScriptTool::Vitest);
+        assert!(
+            !result.is_passthrough() || result.content().contains("failed"),
+            "Vitest branch should parse regex fixture or at least forward content"
+        );
+        // The vitest regex parser recognises this fixture — expect Degraded.
+        assert!(
+            result.is_degraded(),
+            "Expected Degraded (regex tier) for vitest regex fixture, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_parse_npm_output_jest_uses_vitest_parser() {
+        // Jest delegates to the same vitest parser; the regex tier handles plain text.
+        let fixture = crate::cmd::test_support::load_fixture("test", "vitest_regex_fail.txt");
+        let output = make_output(&fixture, "", 1);
+        let result = parse_npm_output(&output, ScriptTool::Jest);
+        assert!(
+            result.is_degraded(),
+            "Expected Degraded (regex tier) for jest with vitest-format fixture, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_parse_npm_output_eslint_does_not_crash() {
+        let fixture = crate::cmd::test_support::load_fixture("lint", "eslint_fail.json");
+        let output = make_output(&fixture, "", 1);
+        let result = parse_npm_output(&output, ScriptTool::Eslint);
+        // Eslint JSON fixture — expect Full parse.
+        assert!(
+            result.is_full(),
+            "Expected Full parse for eslint JSON fixture, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_parse_npm_output_biome_does_not_crash() {
+        let fixture = crate::cmd::test_support::load_fixture("lint", "biome_check_fail.json");
+        let output = make_output(&fixture, "", 1);
+        let result = parse_npm_output(&output, ScriptTool::Biome);
+        // Biome JSON fixture — expect Full parse.
+        assert!(
+            result.is_full(),
+            "Expected Full parse for biome JSON fixture, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_parse_npm_output_prettier_does_not_crash() {
+        let fixture = crate::cmd::test_support::load_fixture("lint", "prettier_check_fail.txt");
+        let output = make_output(&fixture, "", 1);
+        let result = parse_npm_output(&output, ScriptTool::Prettier);
+        // Prettier text fixture should at minimum not panic.
+        assert!(
+            result.is_full() || result.is_degraded() || result.is_passthrough(),
+            "Prettier branch must return a ParseResult variant"
+        );
+    }
+
+    #[test]
+    fn test_parse_npm_output_oxlint_does_not_crash() {
+        let fixture = crate::cmd::test_support::load_fixture("lint", "oxlint_fail.json");
+        let output = make_output(&fixture, "", 1);
+        let result = parse_npm_output(&output, ScriptTool::Oxlint);
+        // Oxlint JSON fixture — expect Full parse.
+        assert!(
+            result.is_full(),
+            "Expected Full parse for oxlint JSON fixture, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_parse_npm_output_tsc_does_not_crash() {
+        let fixture = crate::cmd::test_support::load_fixture("build", "tsc_errors.txt");
+        // tsc writes errors to stderr.
+        let output = make_output("", &fixture, 2);
+        let result = parse_npm_output(&output, ScriptTool::Tsc);
+        // tsc error fixture should at minimum not panic.
+        assert!(
+            result.is_full() || result.is_degraded() || result.is_passthrough(),
+            "Tsc branch must return a ParseResult variant"
+        );
     }
 }
