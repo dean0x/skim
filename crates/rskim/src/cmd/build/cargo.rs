@@ -200,20 +200,28 @@ fn parse(output: &CommandOutput) -> ParseResult<BuildResult> {
     ParseResult::Passthrough(combined)
 }
 
-/// Accumulated counts from a single `compiler-message` JSON event.
-struct CompilerMessageCounts {
-    errors: usize,
-    warnings: usize,
-    error_messages: Vec<String>,
-    warning_codes: BTreeMap<String, usize>,
-}
-
 /// Extract counts, formatted messages, and warning codes from a single
-/// `{"reason":"compiler-message",...}` JSON object.
+/// `{"reason":"compiler-message",...}` JSON object, accumulating results into
+/// the caller's mutable accumulators.
 ///
-/// Returns `None` when the `message` key is absent (malformed event).
-fn process_compiler_message(json: &serde_json::Value) -> Option<CompilerMessageCounts> {
-    let message = json.get("message")?;
+/// Returns `false` when the `message` key is absent (malformed event), so the
+/// caller can skip the line without allocating any per-message heap objects.
+///
+/// Accepts `&mut` references to the caller's pre-allocated accumulators instead
+/// of returning a freshly heap-allocated struct per message. For large builds
+/// with hundreds of `compiler-message` events this eliminates all per-iteration
+/// allocation for `Vec<String>` and `BTreeMap<String, usize>`.
+fn process_compiler_message(
+    json: &serde_json::Value,
+    errors: &mut usize,
+    warnings: &mut usize,
+    error_messages: &mut Vec<String>,
+    warning_codes: &mut BTreeMap<String, usize>,
+) -> bool {
+    let message = match json.get("message") {
+        Some(m) => m,
+        None => return false,
+    };
     let level = message.get("level").and_then(|v| v.as_str()).unwrap_or("");
     let msg_text = message
         .get("message")
@@ -240,16 +248,9 @@ fn process_compiler_message(json: &serde_json::Value) -> Option<CompilerMessageC
         })
         .unwrap_or_default();
 
-    let mut counts = CompilerMessageCounts {
-        errors: 0,
-        warnings: 0,
-        error_messages: Vec::new(),
-        warning_codes: BTreeMap::new(),
-    };
-
     match level {
         "error" => {
-            counts.errors += 1;
+            *errors += 1;
             let formatted = if !code.is_empty() && !location.is_empty() {
                 format!("error[{code}]: {msg_text} in {location}")
             } else if !code.is_empty() {
@@ -259,18 +260,18 @@ fn process_compiler_message(json: &serde_json::Value) -> Option<CompilerMessageC
             } else {
                 format!("error: {msg_text}")
             };
-            counts.error_messages.push(formatted);
+            error_messages.push(formatted);
         }
         "warning" => {
-            counts.warnings += 1;
+            *warnings += 1;
             if !code.is_empty() {
-                *counts.warning_codes.entry(code.to_string()).or_insert(0) += 1;
+                *warning_codes.entry(code.to_string()).or_insert(0) += 1;
             }
         }
         _ => {}
     }
 
-    Some(counts)
+    true
 }
 
 /// Tier 1: Parse NDJSON lines from cargo's `--message-format=json` output.
@@ -299,14 +300,13 @@ fn try_tier1_json(stdout: &str) -> Option<ParseResult<BuildResult>> {
 
         match json.get("reason").and_then(|v| v.as_str()) {
             Some("compiler-message") => {
-                if let Some(counts) = process_compiler_message(&json) {
-                    errors += counts.errors;
-                    warnings += counts.warnings;
-                    error_messages.extend(counts.error_messages);
-                    for (code, count) in counts.warning_codes {
-                        *warning_codes.entry(code).or_insert(0) += count;
-                    }
-                }
+                process_compiler_message(
+                    &json,
+                    &mut errors,
+                    &mut warnings,
+                    &mut error_messages,
+                    &mut warning_codes,
+                );
             }
             Some("build-finished") => {
                 found_build_finished = true;
@@ -466,6 +466,141 @@ mod tests {
         } else {
             panic!("expected Full result");
         }
+    }
+
+    // ========================================================================
+    // process_compiler_message unit tests
+    // ========================================================================
+
+    /// Helper: build a minimal compiler-message JSON value.
+    fn make_compiler_message(
+        level: &str,
+        message: &str,
+        code: Option<&str>,
+        file: Option<&str>,
+        line_start: Option<u64>,
+    ) -> serde_json::Value {
+        use serde_json::json;
+        let code_obj = code
+            .map(|c| json!({"code": c}))
+            .unwrap_or(serde_json::Value::Null);
+        let spans = match (file, line_start) {
+            (Some(f), Some(l)) => json!([{"file_name": f, "line_start": l}]),
+            _ => json!([]),
+        };
+        json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": level,
+                "message": message,
+                "code": code_obj,
+                "spans": spans
+            }
+        })
+    }
+
+    #[test]
+    fn test_process_compiler_message_missing_message_key() {
+        // A JSON object with no "message" field must return false and leave
+        // all accumulators untouched.
+        let json = serde_json::json!({"reason": "compiler-message"});
+        let (mut errors, mut warnings) = (0usize, 0usize);
+        let mut msgs: Vec<String> = Vec::new();
+        let mut codes: BTreeMap<String, usize> = BTreeMap::new();
+
+        let ok = process_compiler_message(&json, &mut errors, &mut warnings, &mut msgs, &mut codes);
+
+        assert!(!ok, "should return false for missing message key");
+        assert_eq!(errors, 0);
+        assert_eq!(warnings, 0);
+        assert!(msgs.is_empty());
+        assert!(codes.is_empty());
+    }
+
+    #[test]
+    fn test_process_compiler_message_error_with_code_and_location() {
+        // An error event with both a rustc error code and a span should produce
+        // a fully qualified "error[E####]: ... in file:line" message.
+        let json = make_compiler_message(
+            "error",
+            "mismatched types",
+            Some("E0308"),
+            Some("src/main.rs"),
+            Some(42),
+        );
+        let (mut errors, mut warnings) = (0usize, 0usize);
+        let mut msgs: Vec<String> = Vec::new();
+        let mut codes: BTreeMap<String, usize> = BTreeMap::new();
+
+        let ok = process_compiler_message(&json, &mut errors, &mut warnings, &mut msgs, &mut codes);
+
+        assert!(ok, "should return true for valid compiler-message");
+        assert_eq!(errors, 1);
+        assert_eq!(warnings, 0);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0], "error[E0308]: mismatched types in src/main.rs:42");
+        assert!(
+            codes.is_empty(),
+            "no warning codes expected for error level"
+        );
+    }
+
+    #[test]
+    fn test_process_compiler_message_error_without_code_or_location() {
+        // An error with neither a code nor a span should fall back to the
+        // plain "error: <message>" format.
+        let json = make_compiler_message("error", "internal compiler error", None, None, None);
+        let (mut errors, mut warnings) = (0usize, 0usize);
+        let mut msgs: Vec<String> = Vec::new();
+        let mut codes: BTreeMap<String, usize> = BTreeMap::new();
+
+        let ok = process_compiler_message(&json, &mut errors, &mut warnings, &mut msgs, &mut codes);
+
+        assert!(ok);
+        assert_eq!(errors, 1);
+        assert_eq!(msgs[0], "error: internal compiler error");
+    }
+
+    #[test]
+    fn test_process_compiler_message_warning_with_code() {
+        // A warning event with a lint code should increment the warning counter
+        // and record the code in the warning_codes map, but add nothing to
+        // error_messages.
+        let json = make_compiler_message(
+            "warning",
+            "unused variable: `x`",
+            Some("dead_code"),
+            Some("src/lib.rs"),
+            Some(10),
+        );
+        let (mut errors, mut warnings) = (0usize, 0usize);
+        let mut msgs: Vec<String> = Vec::new();
+        let mut codes: BTreeMap<String, usize> = BTreeMap::new();
+
+        let ok = process_compiler_message(&json, &mut errors, &mut warnings, &mut msgs, &mut codes);
+
+        assert!(ok);
+        assert_eq!(errors, 0);
+        assert_eq!(warnings, 1);
+        assert!(msgs.is_empty(), "warnings should not add to error_messages");
+        assert_eq!(codes.get("dead_code"), Some(&1));
+    }
+
+    #[test]
+    fn test_process_compiler_message_warning_without_code() {
+        // A warning with no lint code should still increment the warning counter
+        // but leave warning_codes empty.
+        let json = make_compiler_message("warning", "unused import", None, None, None);
+        let (mut errors, mut warnings) = (0usize, 0usize);
+        let mut msgs: Vec<String> = Vec::new();
+        let mut codes: BTreeMap<String, usize> = BTreeMap::new();
+
+        let ok = process_compiler_message(&json, &mut errors, &mut warnings, &mut msgs, &mut codes);
+
+        assert!(ok);
+        assert_eq!(warnings, 1);
+        assert!(codes.is_empty());
+        assert!(msgs.is_empty());
     }
 
     #[test]
