@@ -114,8 +114,7 @@ pub fn extract_ast_ngrams_from_file(
 ///
 /// `AstWalkConfig::DEFAULT_MAX_DEPTH` (500) and `AstWalkConfig::DEFAULT_MAX_NODES`
 /// (100 K) are passed through to `AstWalkIter` as bounds guards.
-/// `MAX_TRIGRAMS_PER_FILE` stays here as a
-/// caller-level cap on output size.
+/// `MAX_TRIGRAMS_PER_FILE` stays here as a caller-level cap on output size.
 ///
 /// The trigram emission guard uses two nested `if` blocks intentionally: the
 /// outer guard on `collect_trigrams` and the trigram-cap avoids constructing

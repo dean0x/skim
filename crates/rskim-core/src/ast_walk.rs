@@ -497,10 +497,8 @@ mod tests {
         let mut iter = AstWalkIter::new(tree.walk(), config);
         let mut manual_count: u32 = 0;
 
-        for item in iter.by_ref() {
+        for _item in iter.by_ref() {
             manual_count += 1;
-            // Confirm per-item depth sanity.
-            let _ = item.depth;
         }
 
         assert_eq!(
