@@ -767,12 +767,23 @@ fn dispatch_cargo(
         return Ok(ExitCode::FAILURE);
     };
 
+    // Dispatch token convention for build::run:
+    //   - "cargo"  → routes to cargo::run  (build/check/fmt/clippy all live there)
+    //   - subcommand name ("check", "fmt", "clippy") → routes to the dedicated
+    //     cargo::run_check / run_fmt / run_clippy arm inside build::run.
+    //
+    // "build" uses "cargo" as its token (legacy; kept for backward compat with the
+    // original flat `skim cargo build` path).  All subcommands added after build
+    // use their own name so build::run can dispatch without ambiguity.
     match subcmd {
         "test" | "t" => test::run(&prepend_without("cargo", args, idx), analytics),
         // nextest: keep the "nextest" token — the test handler uses it to select
         // the nextest parse path instead of the plain cargo-test path.
         "nextest" => test::run(&prepend("cargo", args), analytics),
+        // "cargo" token (legacy): build::run routes Some("cargo") → cargo::run.
         "build" | "b" => build::run(&prepend_without("cargo", args, idx), analytics),
+        // Subcommand-name tokens: build::run routes Some("check"|"fmt"|"clippy")
+        // to their respective dedicated handlers.
         "check" | "c" => build::run(&prepend_without("check", args, idx), analytics),
         "fmt" => build::run(&prepend_without("fmt", args, idx), analytics),
         "clippy" => build::run(&prepend_without("clippy", args, idx), analytics),
