@@ -1,15 +1,17 @@
-//! Cargo build/clippy output compression (#51)
+//! Cargo build/check/clippy/fmt output compression (#51)
 //!
-//! Three-tier parser for `cargo build` and `cargo clippy` NDJSON output:
+//! Handlers for four `cargo` subcommands:
 //!
-//! - **Tier 1 (JSON):** Parse `--message-format=json` NDJSON from stdout.
-//!   Track warnings/errors from `compiler-message` events, detect success
-//!   from `build-finished` event.
+//! - **`cargo build` / `cargo check` / `cargo clippy`:** Three-tier NDJSON parser.
+//!   - **Tier 1 (JSON):** Parse `--message-format=json` NDJSON from stdout.
+//!     Track warnings/errors from `compiler-message` events, detect success
+//!     from `build-finished` event.
+//!   - **Tier 2 (regex):** Fall back to regex matching on stderr for
+//!     `error[E\d+]` patterns when JSON parsing is unavailable.
+//!   - **Tier 3 (passthrough):** Return raw output when nothing can be parsed.
 //!
-//! - **Tier 2 (regex):** Fall back to regex matching on stderr for
-//!   `error[E\d+]` patterns when JSON parsing is unavailable.
-//!
-//! - **Tier 3 (passthrough):** Return raw output when nothing can be parsed.
+//! - **`cargo fmt`:** Passthrough-or-success parser. Empty combined output
+//!   signals success; any non-empty output is passed through unchanged.
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -18,7 +20,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::run_parsed_command;
-use crate::cmd::{inject_flag_before_separator, user_has_flag};
+use crate::cmd::{combine_output, inject_flag_before_separator, user_has_flag};
 use crate::output::ParseResult;
 use crate::output::canonical::BuildResult;
 use crate::runner::CommandOutput;
@@ -49,12 +51,52 @@ pub(crate) fn run(
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
-    let mut full_args = vec!["build".to_string()];
-    full_args.extend_from_slice(args);
+    run_with_json_format("build", args, show_stats, rec)
+}
 
-    if !user_has_flag(&full_args, &["--message-format"]) {
-        inject_flag_before_separator(&mut full_args, "--message-format=json");
-    }
+/// Run `cargo check` with output compression.
+///
+/// Injects `--message-format=json` if not already set by the user, then
+/// parses the NDJSON output through the same three-tier parser as cargo build.
+/// `cargo check` verifies types and borrow rules without producing an artifact,
+/// so its JSON schema is identical to `cargo build`'s.
+pub(crate) fn run_check(
+    args: &[String],
+    show_stats: bool,
+    rec: crate::analytics::RecordingContext<'_>,
+) -> anyhow::Result<ExitCode> {
+    run_with_json_format("check", args, show_stats, rec)
+}
+
+/// Run `cargo fmt` with output compression.
+///
+/// `cargo fmt` reformats source in-place and emits output only on error.
+/// An empty combined output is treated as success. Non-empty output (e.g.
+/// diff output from `--check` mode falling through, or rustfmt errors)
+/// is passed through unchanged.
+///
+/// Note: `cargo fmt --check` is ACKed at the engine level (AD-RW-11) and
+/// never reaches this handler. This handler covers bare `cargo fmt` and
+/// `cargo fmt -- [rustfmt args]` (apply mode).
+///
+/// # Module placement
+///
+/// `cargo fmt` is categorized as a LINT operation by the rewrite engine
+/// (alongside `biome`, `eslint`, `rustfmt`, etc.), but its handler lives here
+/// in the build module rather than in `cmd/lint/`. This is intentional:
+/// `cargo fmt` shares the `cargo` executable, the `run_parsed_command` helper,
+/// and all cargo-specific plumbing (argument injection, env vars, install hints)
+/// with `cargo build`, `cargo check`, and `cargo clippy`. Splitting it into
+/// the lint module would require duplicating or re-exporting that infrastructure.
+/// The rewrite engine's categorization and the handler's module location are
+/// therefore deliberately decoupled.
+pub(crate) fn run_fmt(
+    args: &[String],
+    show_stats: bool,
+    rec: crate::analytics::RecordingContext<'_>,
+) -> anyhow::Result<ExitCode> {
+    let mut full_args = vec!["fmt".to_string()];
+    full_args.extend_from_slice(args);
 
     run_parsed_command(
         "cargo",
@@ -63,7 +105,7 @@ pub(crate) fn run(
         "install Rust from https://rustup.rs",
         show_stats,
         rec,
-        parse,
+        parse_fmt,
     )
 }
 
@@ -76,7 +118,20 @@ pub(crate) fn run_clippy(
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
-    let mut full_args = vec!["clippy".to_string()];
+    run_with_json_format("clippy", args, show_stats, rec)
+}
+
+/// Shared implementation for `run`, `run_check`, and `run_clippy`.
+///
+/// All three subcommands inject `--message-format=json` and use the same
+/// three-tier NDJSON parser. Only the subcommand token differs.
+fn run_with_json_format(
+    subcmd: &str,
+    args: &[String],
+    show_stats: bool,
+    rec: crate::analytics::RecordingContext<'_>,
+) -> anyhow::Result<ExitCode> {
+    let mut full_args = vec![subcmd.to_string()];
     full_args.extend_from_slice(args);
 
     if !user_has_flag(&full_args, &["--message-format"]) {
@@ -95,8 +150,31 @@ pub(crate) fn run_clippy(
 }
 
 // ============================================================================
-// Three-tier parser
+// Parsers
 // ============================================================================
+
+/// Parse `cargo fmt` output.
+///
+/// `cargo fmt` writes to combined stdout+stderr only when it encounters
+/// errors (e.g. `rustfmt` not installed, unformatted files in `--check` mode
+/// that bypass the ACK path).
+///
+/// When combined output is empty, the exit code determines success:
+/// `exit_code == Some(0)` → success; any other code (non-zero or signal-killed
+/// via `None`) → failure. This prevents a signal-killed or panicking `cargo fmt`
+/// from being reported as success just because it produced no output.
+///
+/// Any non-empty output is passed through unchanged.
+fn parse_fmt(output: &CommandOutput) -> ParseResult<BuildResult> {
+    let combined = combine_output(output);
+    let trimmed = combined.trim();
+    if trimmed.is_empty() {
+        let success = output.exit_code == Some(0);
+        ParseResult::Full(BuildResult::new(success, 0, 0, None, vec![]))
+    } else {
+        ParseResult::Passthrough(trimmed.to_string())
+    }
+}
 
 /// Parse cargo build/clippy output through three degradation tiers.
 fn parse(output: &CommandOutput) -> ParseResult<BuildResult> {
@@ -120,6 +198,79 @@ fn parse(output: &CommandOutput) -> ParseResult<BuildResult> {
     };
 
     ParseResult::Passthrough(combined)
+}
+
+/// Extract counts, formatted messages, and warning codes from a single
+/// `{"reason":"compiler-message",...}` JSON object, accumulating results into
+/// the caller's mutable accumulators.
+///
+/// Returns `false` when the `message` key is absent (malformed event), so the
+/// caller can skip the line without allocating any per-message heap objects.
+///
+/// Accepts `&mut` references to the caller's pre-allocated accumulators instead
+/// of returning a freshly heap-allocated struct per message. For large builds
+/// with hundreds of `compiler-message` events this eliminates all per-iteration
+/// allocation for `Vec<String>` and `BTreeMap<String, usize>`.
+fn process_compiler_message(
+    json: &serde_json::Value,
+    errors: &mut usize,
+    warnings: &mut usize,
+    error_messages: &mut Vec<String>,
+    warning_codes: &mut BTreeMap<String, usize>,
+) -> bool {
+    let Some(message) = json.get("message") else {
+        return false;
+    };
+    let level = message.get("level").and_then(|v| v.as_str()).unwrap_or("");
+    let msg_text = message
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let code = message
+        .get("code")
+        .and_then(|v| v.get("code"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Extract primary span location (file:line)
+    let location = message
+        .get("spans")
+        .and_then(|v| v.as_array())
+        .and_then(|spans| spans.first())
+        .map(|span| {
+            let file = span
+                .get("file_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let line = span.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!("{file}:{line}")
+        })
+        .unwrap_or_default();
+
+    match level {
+        "error" => {
+            *errors += 1;
+            let formatted = if !code.is_empty() && !location.is_empty() {
+                format!("error[{code}]: {msg_text} in {location}")
+            } else if !code.is_empty() {
+                format!("error[{code}]: {msg_text}")
+            } else if !location.is_empty() {
+                format!("error: {msg_text} in {location}")
+            } else {
+                format!("error: {msg_text}")
+            };
+            error_messages.push(formatted);
+        }
+        "warning" => {
+            *warnings += 1;
+            if !code.is_empty() {
+                *warning_codes.entry(code.to_string()).or_insert(0) += 1;
+            }
+        }
+        _ => {}
+    }
+
+    true
 }
 
 /// Tier 1: Parse NDJSON lines from cargo's `--message-format=json` output.
@@ -146,60 +297,15 @@ fn try_tier1_json(stdout: &str) -> Option<ParseResult<BuildResult>> {
             Err(_) => continue,
         };
 
-        let reason = json.get("reason").and_then(|v| v.as_str());
-
-        match reason {
+        match json.get("reason").and_then(|v| v.as_str()) {
             Some("compiler-message") => {
-                if let Some(message) = json.get("message") {
-                    let level = message.get("level").and_then(|v| v.as_str()).unwrap_or("");
-                    let msg_text = message
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let code = message
-                        .get("code")
-                        .and_then(|v| v.get("code"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-
-                    // Extract file and line from spans
-                    let location = message
-                        .get("spans")
-                        .and_then(|v| v.as_array())
-                        .and_then(|spans| spans.first())
-                        .map(|span| {
-                            let file = span
-                                .get("file_name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
-                            let line = span.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0);
-                            format!("{file}:{line}")
-                        })
-                        .unwrap_or_default();
-
-                    match level {
-                        "error" => {
-                            errors += 1;
-                            let formatted = if !code.is_empty() && !location.is_empty() {
-                                format!("error[{code}]: {msg_text} in {location}")
-                            } else if !code.is_empty() {
-                                format!("error[{code}]: {msg_text}")
-                            } else if !location.is_empty() {
-                                format!("error: {msg_text} in {location}")
-                            } else {
-                                format!("error: {msg_text}")
-                            };
-                            error_messages.push(formatted);
-                        }
-                        "warning" => {
-                            warnings += 1;
-                            if !code.is_empty() {
-                                *warning_codes.entry(code.to_string()).or_insert(0) += 1;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                process_compiler_message(
+                    &json,
+                    &mut errors,
+                    &mut warnings,
+                    &mut error_messages,
+                    &mut warning_codes,
+                );
             }
             Some("build-finished") => {
                 found_build_finished = true;
@@ -222,16 +328,18 @@ fn try_tier1_json(stdout: &str) -> Option<ParseResult<BuildResult>> {
     // a successful clippy run they are silently carried but not displayed.
     // Acceptable for v1 — a dedicated `warning_messages` field can be added if
     // we need to render warnings on success in the future.
-    if !warning_codes.is_empty() {
-        for (code, count) in &warning_codes {
-            error_messages.push(format!("{code}: {count} occurrence(s)"));
-        }
+    for (code, count) in &warning_codes {
+        error_messages.push(format!("{code}: {count} occurrence(s)"));
     }
 
     let duration_ms = None; // Cargo doesn't report build duration in JSON
-    let result = BuildResult::new(success, warnings, errors, duration_ms, error_messages);
-
-    Some(ParseResult::Full(result))
+    Some(ParseResult::Full(BuildResult::new(
+        success,
+        warnings,
+        errors,
+        duration_ms,
+        error_messages,
+    )))
 }
 
 /// Tier 2: Regex-based fallback parsing on stderr.
@@ -359,6 +467,141 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // process_compiler_message unit tests
+    // ========================================================================
+
+    /// Helper: build a minimal compiler-message JSON value.
+    fn make_compiler_message(
+        level: &str,
+        message: &str,
+        code: Option<&str>,
+        file: Option<&str>,
+        line_start: Option<u64>,
+    ) -> serde_json::Value {
+        use serde_json::json;
+        let code_obj = code
+            .map(|c| json!({"code": c}))
+            .unwrap_or(serde_json::Value::Null);
+        let spans = match (file, line_start) {
+            (Some(f), Some(l)) => json!([{"file_name": f, "line_start": l}]),
+            _ => json!([]),
+        };
+        json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": level,
+                "message": message,
+                "code": code_obj,
+                "spans": spans
+            }
+        })
+    }
+
+    #[test]
+    fn test_process_compiler_message_missing_message_key() {
+        // A JSON object with no "message" field must return false and leave
+        // all accumulators untouched.
+        let json = serde_json::json!({"reason": "compiler-message"});
+        let (mut errors, mut warnings) = (0usize, 0usize);
+        let mut msgs: Vec<String> = Vec::new();
+        let mut codes: BTreeMap<String, usize> = BTreeMap::new();
+
+        let ok = process_compiler_message(&json, &mut errors, &mut warnings, &mut msgs, &mut codes);
+
+        assert!(!ok, "should return false for missing message key");
+        assert_eq!(errors, 0);
+        assert_eq!(warnings, 0);
+        assert!(msgs.is_empty());
+        assert!(codes.is_empty());
+    }
+
+    #[test]
+    fn test_process_compiler_message_error_with_code_and_location() {
+        // An error event with both a rustc error code and a span should produce
+        // a fully qualified "error[E####]: ... in file:line" message.
+        let json = make_compiler_message(
+            "error",
+            "mismatched types",
+            Some("E0308"),
+            Some("src/main.rs"),
+            Some(42),
+        );
+        let (mut errors, mut warnings) = (0usize, 0usize);
+        let mut msgs: Vec<String> = Vec::new();
+        let mut codes: BTreeMap<String, usize> = BTreeMap::new();
+
+        let ok = process_compiler_message(&json, &mut errors, &mut warnings, &mut msgs, &mut codes);
+
+        assert!(ok, "should return true for valid compiler-message");
+        assert_eq!(errors, 1);
+        assert_eq!(warnings, 0);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0], "error[E0308]: mismatched types in src/main.rs:42");
+        assert!(
+            codes.is_empty(),
+            "no warning codes expected for error level"
+        );
+    }
+
+    #[test]
+    fn test_process_compiler_message_error_without_code_or_location() {
+        // An error with neither a code nor a span should fall back to the
+        // plain "error: <message>" format.
+        let json = make_compiler_message("error", "internal compiler error", None, None, None);
+        let (mut errors, mut warnings) = (0usize, 0usize);
+        let mut msgs: Vec<String> = Vec::new();
+        let mut codes: BTreeMap<String, usize> = BTreeMap::new();
+
+        let ok = process_compiler_message(&json, &mut errors, &mut warnings, &mut msgs, &mut codes);
+
+        assert!(ok);
+        assert_eq!(errors, 1);
+        assert_eq!(msgs[0], "error: internal compiler error");
+    }
+
+    #[test]
+    fn test_process_compiler_message_warning_with_code() {
+        // A warning event with a lint code should increment the warning counter
+        // and record the code in the warning_codes map, but add nothing to
+        // error_messages.
+        let json = make_compiler_message(
+            "warning",
+            "unused variable: `x`",
+            Some("dead_code"),
+            Some("src/lib.rs"),
+            Some(10),
+        );
+        let (mut errors, mut warnings) = (0usize, 0usize);
+        let mut msgs: Vec<String> = Vec::new();
+        let mut codes: BTreeMap<String, usize> = BTreeMap::new();
+
+        let ok = process_compiler_message(&json, &mut errors, &mut warnings, &mut msgs, &mut codes);
+
+        assert!(ok);
+        assert_eq!(errors, 0);
+        assert_eq!(warnings, 1);
+        assert!(msgs.is_empty(), "warnings should not add to error_messages");
+        assert_eq!(codes.get("dead_code"), Some(&1));
+    }
+
+    #[test]
+    fn test_process_compiler_message_warning_without_code() {
+        // A warning with no lint code should still increment the warning counter
+        // but leave warning_codes empty.
+        let json = make_compiler_message("warning", "unused import", None, None, None);
+        let (mut errors, mut warnings) = (0usize, 0usize);
+        let mut msgs: Vec<String> = Vec::new();
+        let mut codes: BTreeMap<String, usize> = BTreeMap::new();
+
+        let ok = process_compiler_message(&json, &mut errors, &mut warnings, &mut msgs, &mut codes);
+
+        assert!(ok);
+        assert_eq!(warnings, 1);
+        assert!(codes.is_empty());
+        assert!(msgs.is_empty());
+    }
+
     #[test]
     fn test_flag_injection_skipped() {
         // If user already has --message-format=json2, we should not inject our own
@@ -436,6 +679,106 @@ mod tests {
             result.is_passthrough(),
             "expected Passthrough, got {:?}",
             result.tier_name()
+        );
+    }
+
+    // ========================================================================
+    // cargo fmt parser
+    // ========================================================================
+
+    #[test]
+    fn test_parse_fmt_empty_output_is_success() {
+        let output = make_output_full("", "", Some(0));
+        let result = parse_fmt(&output);
+        assert!(
+            result.is_full(),
+            "expected Full, got {:?}",
+            result.tier_name()
+        );
+        if let ParseResult::Full(build_result) = &result {
+            assert!(build_result.success, "expected success for empty output");
+            assert_eq!(build_result.errors, 0);
+            assert_eq!(build_result.warnings, 0);
+        }
+    }
+
+    #[test]
+    fn test_parse_fmt_whitespace_only_is_success() {
+        let output = make_output_full("  \n\n", " \t\n", Some(0));
+        let result = parse_fmt(&output);
+        assert!(result.is_full(), "expected Full for whitespace-only output");
+        if let ParseResult::Full(build_result) = &result {
+            assert!(build_result.success);
+        }
+    }
+
+    #[test]
+    fn test_parse_fmt_empty_output_nonzero_exit_is_failure() {
+        // A signal-killed or internally-panicking `cargo fmt` may exit non-zero
+        // with no output at all. This must be reported as failure, not success.
+        let output = make_output_full("", "", Some(1));
+        let result = parse_fmt(&output);
+        assert!(
+            result.is_full(),
+            "expected Full for empty output, got {:?}",
+            result.tier_name()
+        );
+        if let ParseResult::Full(build_result) = &result {
+            assert!(
+                !build_result.success,
+                "empty output + non-zero exit must be reported as failure"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_fmt_empty_output_signal_killed_is_failure() {
+        // exit_code == None means the process was killed by a signal (Unix).
+        // This must be reported as failure, not success.
+        let output = make_output_full("", "", None);
+        let result = parse_fmt(&output);
+        assert!(result.is_full(), "expected Full for empty output");
+        if let ParseResult::Full(build_result) = &result {
+            assert!(
+                !build_result.success,
+                "empty output + signal-killed (exit_code None) must be reported as failure"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_fmt_error_output_is_passthrough() {
+        let stderr = "error: rustfmt not installed\n";
+        let output = make_output_full("", stderr, Some(1));
+        let result = parse_fmt(&output);
+        assert!(
+            result.is_passthrough(),
+            "expected Passthrough for error output, got {:?}",
+            result.tier_name()
+        );
+        assert!(result.content().contains("rustfmt not installed"));
+    }
+
+    #[test]
+    fn test_parse_fmt_stdout_and_stderr_separated_by_newline() {
+        // When both stdout and stderr have content, they must be joined with a
+        // newline separator so the last line of stdout and first line of stderr
+        // are not merged into a single line. Regression test for the
+        // format!("{}{}") → combine_output fix.
+        let stdout = "stdout line";
+        let stderr = "stderr line";
+        let output = make_output_full(stdout, stderr, Some(1));
+        let result = parse_fmt(&output);
+        assert!(
+            result.is_passthrough(),
+            "expected Passthrough for non-empty output, got {:?}",
+            result.tier_name()
+        );
+        let content = result.content();
+        // Lines must be separated by a newline, not concatenated: "stdout linestderr line"
+        assert!(
+            content.contains("stdout line\nstderr line"),
+            "stdout and stderr must be newline-separated in combined output: {content:?}"
         );
     }
 

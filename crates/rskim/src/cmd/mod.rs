@@ -24,7 +24,7 @@
 //! transparent for everything else.
 
 mod agents;
-mod build;
+pub(crate) mod build;
 mod completions;
 mod db;
 mod discover;
@@ -37,7 +37,7 @@ mod infra;
 mod init;
 mod integrity;
 mod learn;
-mod lint;
+pub(crate) mod lint;
 mod log;
 mod pkg;
 mod rewrite;
@@ -45,7 +45,7 @@ mod search;
 mod session;
 pub(crate) mod session_sidecar;
 mod stats;
-mod test;
+pub(crate) mod test;
 pub(crate) mod ux;
 
 use std::borrow::Cow;
@@ -760,19 +760,26 @@ fn dispatch_cargo(
     let Some((subcmd, idx)) = extract_subcmd(
         "cargo",
         args,
-        "skim cargo <test|build|clippy|audit|nextest> [args...]",
-        "test, nextest, build, clippy, audit",
+        "skim cargo <test|build|check|fmt|clippy|audit|nextest> [args...]",
+        "test, nextest, build, check, fmt, clippy, audit",
     )?
     else {
         return Ok(ExitCode::FAILURE);
     };
 
+    // Each subcommand is dispatched to build::run with its own name prepended as
+    // the leading token.  build::run matches on that token to select the correct
+    // cargo handler (cargo::run, cargo::run_check, cargo::run_fmt, etc.).
+    // All subcommands use their own name consistently — there is no legacy "cargo"
+    // alias for "build" any more.
     match subcmd {
         "test" | "t" => test::run(&prepend_without("cargo", args, idx), analytics),
         // nextest: keep the "nextest" token — the test handler uses it to select
         // the nextest parse path instead of the plain cargo-test path.
         "nextest" => test::run(&prepend("cargo", args), analytics),
-        "build" | "b" => build::run(&prepend_without("cargo", args, idx), analytics),
+        "build" | "b" => build::run(&prepend_without("build", args, idx), analytics),
+        "check" | "c" => build::run(&prepend_without("check", args, idx), analytics),
+        "fmt" => build::run(&prepend_without("fmt", args, idx), analytics),
         "clippy" => build::run(&prepend_without("clippy", args, idx), analytics),
         // audit: keep "audit" in args — pkg::run uses it to select the audit parser.
         "audit" => pkg::run(&prepend("cargo", args), analytics),
@@ -780,8 +787,8 @@ fn dispatch_cargo(
             let safe = sanitize_for_display(unknown);
             eprintln!(
                 "skim cargo: unknown subcommand '{safe}'\n\n\
-                 Usage: skim cargo <test|build|clippy|audit|nextest> [args...]\n\n\
-                 Supported subcommands: test, nextest, build, clippy, audit"
+                 Usage: skim cargo <test|build|check|fmt|clippy|audit|nextest> [args...]\n\n\
+                 Supported subcommands: test, nextest, build, check, fmt, clippy, audit"
             );
             Ok(ExitCode::FAILURE)
         }
@@ -829,6 +836,8 @@ fn print_cargo_help() {
            test (t)   Run and compress cargo test output\n\
            nextest    Run and compress cargo nextest output\n\
            build (b)  Run and compress cargo build output\n\
+           check (c)  Run and compress cargo check output\n\
+           fmt        Run and compress cargo fmt output\n\
            clippy     Run and compress cargo clippy output\n\
            audit      Run and compress cargo audit output\n\
          \n\
@@ -837,6 +846,8 @@ fn print_cargo_help() {
            skim cargo t          (alias for test)\n\
            skim cargo build --release\n\
            skim cargo b --release  (alias for build)\n\
+           skim cargo check\n\
+           skim cargo fmt\n\
            skim cargo clippy -- -D warnings\n\
            skim cargo audit\n"
     );

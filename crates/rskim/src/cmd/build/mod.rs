@@ -51,7 +51,9 @@ pub(crate) fn run(
         session_id: analytics.session_id.as_deref(),
     };
     match sub {
-        Some("cargo") => cargo::run(remaining, show_stats, rec),
+        Some("build") => cargo::run(remaining, show_stats, rec),
+        Some("check") => cargo::run_check(remaining, show_stats, rec),
+        Some("fmt") => cargo::run_fmt(remaining, show_stats, rec),
         Some("clippy") => cargo::run_clippy(remaining, show_stats, rec),
         Some(program @ ("gradle" | "gradlew")) => gradle::run(program, remaining, show_stats, rec),
         Some("make") => make::run(remaining, show_stats, rec),
@@ -66,7 +68,7 @@ pub(crate) fn run(
             let safe_unknown = crate::cmd::sanitize_for_display(unknown);
             eprintln!(
                 "skim: unknown subcommand '{safe_unknown}'\n\
-                 Supported tools: cargo, clippy, gradle, gradlew, make, mvn, mvnw, tsc"
+                 Supported tools: cargo (subcommands: build, check, fmt, clippy), gradle, gradlew, make, mvn, mvnw, tsc"
             );
             Ok(ExitCode::FAILURE)
         }
@@ -74,11 +76,13 @@ pub(crate) fn run(
             eprintln!(
                 "skim: missing build tool\n\n\
                  Usage: skim cargo build [args...]\n\
+                 Usage: skim cargo check [args...]\n\
+                 Usage: skim cargo fmt [args...]\n\
                  Usage: skim gradle [args...]\n\
                  Usage: skim make [args...]\n\
                  Usage: skim mvn [args...]\n\
                  Usage: skim tsc [args...]\n\n\
-                 Supported tools: cargo, clippy, gradle, gradlew, make, mvn, mvnw, tsc"
+                 Supported tools: cargo (subcommands: build, check, fmt, clippy), gradle, gradlew, make, mvn, mvnw, tsc"
             );
             Ok(ExitCode::FAILURE)
         }
@@ -86,17 +90,22 @@ pub(crate) fn run(
 }
 
 fn print_help() {
-    println!("skim {{cargo build|cargo clippy|gradle|make|mvn|tsc}} [args...]");
+    println!(
+        "skim {{cargo build|cargo check|cargo fmt|cargo clippy|gradle|make|mvn|tsc}} [args...]"
+    );
     println!();
     println!("  Run build tools and compress output for AI context windows.");
     println!();
     println!("Available tools:");
-    println!("  cargo      Run cargo build with output compression");
-    println!("  clippy     Run cargo clippy with output compression");
-    println!("  gradle     Run Gradle with output compression (also: gradlew)");
-    println!("  make       Run GNU make with output compression");
-    println!("  mvn        Run Maven with output compression (also: mvnw)");
-    println!("  tsc        Run TypeScript compiler with output compression");
+    println!("  cargo            Run cargo with output compression");
+    println!("    build          Run cargo build");
+    println!("    check          Run cargo check");
+    println!("    fmt            Run cargo fmt");
+    println!("    clippy         Run cargo clippy");
+    println!("  gradle           Run Gradle with output compression (also: gradlew)");
+    println!("  make             Run GNU make with output compression");
+    println!("  mvn              Run Maven with output compression (also: mvnw)");
+    println!("  tsc              Run TypeScript compiler with output compression");
     println!();
     println!("Flags:");
     println!("  --show-stats    Show token statistics");
@@ -104,6 +113,8 @@ fn print_help() {
     println!("Examples:");
     println!("  skim cargo build");
     println!("  skim cargo build --release");
+    println!("  skim cargo check");
+    println!("  skim cargo fmt");
     println!("  skim cargo clippy -- -W clippy::pedantic");
     println!("  skim gradle build");
     println!("  skim make");

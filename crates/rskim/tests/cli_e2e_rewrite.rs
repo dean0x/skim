@@ -2079,3 +2079,138 @@ fn test_rewrite_nslookup_fires() {
         .success()
         .stdout(predicate::str::contains("skim nslookup"));
 }
+
+// ============================================================================
+// cargo check rewrite rules (#259)
+// ============================================================================
+
+#[test]
+fn test_rewrite_cargo_check() {
+    skim_cmd()
+        .args(["rewrite", "cargo", "check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim cargo check"));
+}
+
+#[test]
+fn test_rewrite_cargo_check_with_release() {
+    skim_cmd()
+        .args(["rewrite", "cargo", "check", "--release"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--release"));
+}
+
+// ============================================================================
+// cargo fmt rewrite rules (#259)
+// ============================================================================
+
+#[test]
+fn test_rewrite_cargo_fmt() {
+    skim_cmd()
+        .args(["rewrite", "cargo", "fmt"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim cargo fmt"));
+}
+
+/// AD-RW-11 regression: `cargo fmt --check` must remain ACKed (not rewritten)
+/// after adding the `cargo fmt` rule. The ACK path runs before the rule table.
+#[test]
+fn test_rewrite_cargo_fmt_check_still_acknowledged() {
+    skim_cmd()
+        .args(["rewrite", "cargo", "fmt", "--check"])
+        .assert()
+        .success()
+        // ACK echoes the original command on stdout (not a skim-prefixed form).
+        .stdout(predicate::str::contains("cargo fmt --check"))
+        .stdout(predicate::str::contains("skim cargo fmt").not());
+}
+
+// ============================================================================
+// npm test/run rewrite rules (#260)
+// ============================================================================
+
+#[test]
+fn test_rewrite_npm_test() {
+    skim_cmd()
+        .args(["rewrite", "npm", "test"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim npm test"));
+}
+
+#[test]
+fn test_rewrite_npm_t_alias() {
+    skim_cmd()
+        .args(["rewrite", "npm", "t"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim npm test"));
+}
+
+#[test]
+fn test_rewrite_npm_run() {
+    skim_cmd()
+        .args(["rewrite", "npm", "run", "lint"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim npm run lint"));
+}
+
+#[test]
+fn test_rewrite_npm_run_colon_preserved() {
+    // Colons in script names must be preserved (e.g. `build:prod`)
+    skim_cmd()
+        .args(["rewrite", "npm", "run", "build:prod"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim npm run build:prod"));
+}
+
+#[test]
+fn test_rewrite_npm_run_script_alias() {
+    // `npm run-script` is an alias for `npm run` — must rewrite to same target
+    skim_cmd()
+        .args(["rewrite", "npm", "run-script", "lint"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim npm run lint"));
+}
+
+// ============================================================================
+// npm run: missing script name error path
+// ============================================================================
+
+#[test]
+fn test_npm_run_missing_script_name_exits_failure() {
+    // `skim npm run` without a script name must exit non-zero and print a
+    // diagnostic to stderr.  The error path is hit before npm is spawned, so
+    // this test is self-contained and does not require npm to be installed.
+    skim_cmd()
+        .args(["npm", "run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("missing script name"));
+}
+
+// ============================================================================
+// cargo c alias: direct dispatch
+// ============================================================================
+
+#[test]
+fn test_cargo_c_alias_dispatches_to_check() {
+    // `skim cargo c` is documented as an alias for `skim cargo check`.
+    // Verify the alias routes to the check handler by asserting that the
+    // binary accepts the invocation and attempts to run cargo check.
+    // We pass `--help` so that the underlying cargo check invocation does not
+    // actually run (the dispatch path short-circuits on --help flags before
+    // spawning).
+    skim_cmd()
+        .args(["cargo", "c", "--help"])
+        .assert()
+        // Either success (help printed) or failure (cargo not found) is acceptable.
+        // What must NOT happen is an "unknown subcommand" error for 'c'.
+        .stderr(predicate::str::contains("unknown subcommand 'c'").not());
+}

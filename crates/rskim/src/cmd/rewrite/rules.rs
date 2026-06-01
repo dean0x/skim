@@ -1,7 +1,7 @@
 //! Declarative rewrite rule table.
 //!
-//! 148 rules grouped into 8 category arrays: TEST (16), BUILD (12), GIT (7),
-//! LINT (42), PKG (24), INFRA (28), FILE_OPS (16), DB (3).
+//! 154 rules grouped into 8 category arrays: TEST (18), BUILD (13), GIT (7),
+//! LINT (43), PKG (26), INFRA (28), FILE_OPS (16), DB (3).
 //! Only `engine.rs` consumes `all_rules()`.
 //!
 //! v2.8.0: Flat dispatch — `rewrite_to` uses tool names directly
@@ -24,7 +24,7 @@ use std::sync::LazyLock;
 use super::types::{RewriteCategory, RewriteRule};
 
 // ============================================================================
-// TEST rules (16)
+// TEST rules (18)
 // ============================================================================
 
 const TEST_RULES: &[RewriteRule] = &[
@@ -174,6 +174,27 @@ const TEST_RULES: &[RewriteRule] = &[
         global_value_flags: &[],
         require_flag: &[],
     },
+    // npm test/t (longest prefix first — specific aliases before short)
+    RewriteRule {
+        prefix: &["npm", "test"],
+        rewrite_to: &["skim", "npm", "test"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Test,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["npm", "t"],
+        rewrite_to: &["skim", "npm", "test"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Test,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
     // swift test
     RewriteRule {
         prefix: &["swift", "test"],
@@ -199,7 +220,7 @@ const TEST_RULES: &[RewriteRule] = &[
 ];
 
 // ============================================================================
-// BUILD rules (12)
+// BUILD rules (13)
 // ============================================================================
 
 const BUILD_RULES: &[RewriteRule] = &[
@@ -216,6 +237,16 @@ const BUILD_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["cargo", "build"],
         rewrite_to: &["skim", "cargo", "build"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["cargo", "check"],
+        rewrite_to: &["skim", "cargo", "check"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
@@ -456,7 +487,7 @@ const GIT_RULES: &[RewriteRule] = &[
 ];
 
 // ============================================================================
-// LINT rules (42)
+// LINT rules (43)
 // ============================================================================
 
 const LINT_RULES: &[RewriteRule] = &[
@@ -667,6 +698,20 @@ const LINT_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["rustfmt", "--check"],
         rewrite_to: &["skim", "rustfmt"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    // cargo fmt (apply mode) — AFTER the longer `cargo fmt --check` and
+    // `cargo fmt -- --check` rules above, so shortest prefix fires last.
+    // `cargo fmt --check` is ACKed (engine.rs runs ACK before rule table),
+    // so this rule only fires for bare `cargo fmt` and `cargo fmt -- [args]`.
+    RewriteRule {
+        prefix: &["cargo", "fmt"],
+        rewrite_to: &["skim", "cargo", "fmt"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
@@ -924,7 +969,7 @@ const LINT_RULES: &[RewriteRule] = &[
 ];
 
 // ============================================================================
-// PKG rules (24)
+// PKG rules (26)
 // ============================================================================
 
 const PKG_RULES: &[RewriteRule] = &[
@@ -940,6 +985,26 @@ const PKG_RULES: &[RewriteRule] = &[
         require_flag: &[],
     },
     // npm (canonical + aliases)
+    RewriteRule {
+        prefix: &["npm", "run"],
+        rewrite_to: &["skim", "npm", "run"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["npm", "run-script"],
+        rewrite_to: &["skim", "npm", "run"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
     RewriteRule {
         prefix: &["npm", "audit"],
         rewrite_to: &["skim", "npm", "audit"],
@@ -1872,8 +1937,8 @@ mod tests {
     use super::*;
 
     /// Expected rule count — update this constant together with the category arrays.
-    /// TEST(16) + BUILD(12) + GIT(7) + LINT(42) + PKG(24) + INFRA(28) + FILE_OPS(16) + DB(3)
-    const EXPECTED_RULE_COUNT: usize = 16 + 12 + 7 + 42 + 24 + 28 + 16 + 3;
+    /// TEST(18) + BUILD(13) + GIT(7) + LINT(43) + PKG(26) + INFRA(28) + FILE_OPS(16) + DB(3)
+    const EXPECTED_RULE_COUNT: usize = 18 + 13 + 7 + 43 + 26 + 28 + 16 + 3;
 
     #[test]
     fn test_rule_count_matches_expected() {
