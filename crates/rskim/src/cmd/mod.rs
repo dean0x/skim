@@ -596,6 +596,64 @@ where
     }
 }
 
+/// Write raw command output to stdout/stderr and return the process exit code.
+///
+/// Used by the passthrough fast-path in [`run_parsed_command_with_mode`] when
+/// `SKIM_PASSTHROUGH=1` is set. Forwards stdout/stderr verbatim without any
+/// compression or parsing.
+fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
+    let code = output.exit_code.unwrap_or(1);
+    let mut out = io::stdout().lock();
+    write!(out, "{}", output.stdout)?;
+    out.flush()?;
+    if !output.stderr.is_empty() {
+        let mut err = io::stderr().lock();
+        write!(err, "{}", output.stderr)?;
+        err.flush()?;
+    }
+    Ok(ExitCode::from(code.clamp(0, 255) as u8))
+}
+
+/// Record token savings and emit the analytics event for a completed command.
+///
+/// Separated from [`run_parsed_command_with_mode`] so the core parsing/rendering
+/// pipeline is readable as a linear sequence of steps.
+fn record_and_report(
+    show_stats: bool,
+    code: i32,
+    original_stdout: String,
+    compressed: String,
+    rec: crate::analytics::RecordingContext<'_>,
+    tier_name: &'static str,
+    label: String,
+    duration: std::time::Duration,
+) {
+    // Hint fires on ALL non-zero exits regardless of tier. Passthrough tier
+    // still means skim processed the command through its rewrite hook — agents
+    // need the SKIM_PASSTHROUGH=1 escape hatch surfaced since the global
+    // CLAUDE.md docs no longer mention the flag. Text says "compressed" for
+    // consistency across tiers; the message's purpose is the escape hatch, not
+    // describing what skim did. When SKIM_PASSTHROUGH=1 is active, we already
+    // returned early in run_parsed_command_with_mode (the is_passthrough_mode()
+    // guard), so this never double-fires.
+    if code != 0 {
+        eprintln!("[skim] compressed output (exit {code}). SKIM_PASSTHROUGH=1 for full output.");
+    }
+
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&original_stdout, &compressed);
+        crate::process::report_token_stats(orig, comp, "");
+    }
+
+    crate::analytics::try_record_command(
+        rec.with_tier(tier_name),
+        original_stdout,
+        compressed,
+        label,
+        duration,
+    );
+}
+
 /// Execute an external command, parse its output, and emit the result.
 ///
 /// This is the standard entry point for subcommand parsers that follow the
@@ -631,16 +689,7 @@ where
 
     // Passthrough mode: bypass all compression and forward raw output.
     if is_passthrough_mode() {
-        let code = output.exit_code.unwrap_or(1);
-        let mut out = io::stdout().lock();
-        write!(out, "{}", output.stdout)?;
-        out.flush()?;
-        if !output.stderr.is_empty() {
-            let mut err = io::stderr().lock();
-            write!(err, "{}", output.stderr)?;
-            err.flush()?;
-        }
-        return Ok(ExitCode::from(code.clamp(0, 255) as u8));
+        return passthrough_raw(&output);
     }
 
     // Some tools must NOT have ANSI escape sequences stripped: strip_ansi_escapes
@@ -661,31 +710,19 @@ where
     let result = parse(&output);
     let _ = result.emit_markers(&mut io::stderr().lock());
     let code = output.exit_code.unwrap_or(1);
+    let label = format_analytics_label(family, program, &args.join(" "));
+    let tier_name = result.tier_name();
 
     let compressed = render_output(&result, output_format)?;
 
-    // Hint fires on ALL non-zero exits regardless of tier. Passthrough tier
-    // still means skim processed the command through its rewrite hook — agents
-    // need the SKIM_PASSTHROUGH=1 escape hatch surfaced since the global
-    // CLAUDE.md docs no longer mention the flag. Text says "compressed" for
-    // consistency across tiers; the message's purpose is the escape hatch, not
-    // describing what skim did. When SKIM_PASSTHROUGH=1 is active, we already
-    // returned early above (the `is_passthrough_mode()` guard), so this never
-    // double-fires.
-    if code != 0 {
-        eprintln!("[skim] compressed output (exit {code}). SKIM_PASSTHROUGH=1 for full output.");
-    }
-
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&output.stdout, &compressed);
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    crate::analytics::try_record_command(
-        rec.with_tier(result.tier_name()),
+    record_and_report(
+        show_stats,
+        code,
         output.stdout,
         compressed,
-        format_analytics_label(family, program, &args.join(" ")),
+        rec,
+        tier_name,
+        label,
         output.duration,
     );
 
