@@ -1102,6 +1102,93 @@ pub(crate) fn format_analytics_label(family: &str, program: &str, rest: &str) ->
     }
 }
 
+/// Flags whose *immediately following* space-separated token is a credential.
+/// Note: `-P` (port) intentionally omitted — it is not a credential.
+const SENSITIVE_FLAGS: &[&str] = &[
+    "-p",
+    "-U",
+    "-u",
+    "-h",
+    "-W",
+    "--password",
+    "--user",
+    "--username",
+    "--host",
+];
+/// Short flags that may have their value *attached* with no space (e.g. `-pS3cret`).
+const ATTACHED_PREFIXES: &[&str] = &["-p", "-u", "-U"];
+/// MySQL config-file flags whose value (path) must also be redacted.
+const CONFIG_FILE_FLAGS: &[&str] = &["--defaults-file", "--defaults-extra-file"];
+
+/// Classification of a single DB argument token for credential scrubbing.
+///
+/// Each variant encodes how the token (and possibly the next token) should be
+/// handled when building the redacted output string.  `classify_token` maps a
+/// raw token to one of these actions; `scrub_db_args` drives the state machine.
+#[derive(Debug)]
+enum TokenAction {
+    /// Token is a connection-string URI containing embedded credentials.
+    /// Replace the entire token with `[REDACTED_URI]`.
+    RedactUri,
+    /// Token is `--flag=value` where `flag` is sensitive.
+    /// Replace with `{flag}=[REDACTED]`; the `flag` field carries the prefix.
+    RedactEqualsValue { flag: String },
+    /// Token is an attached short flag (`-pSecret`).
+    /// Replace with `{prefix}[REDACTED]`; the `prefix` field carries the short flag.
+    RedactAttached { prefix: String },
+    /// Token is a standalone sensitive flag (`-p`, `--password`, `--defaults-file`, …).
+    /// Keep the flag token as-is, then redact the *next* token.
+    RedactNext,
+    /// Token carries no credential information; emit it verbatim.
+    Preserve,
+}
+
+/// Classify a single whitespace-split token for credential scrubbing.
+///
+/// Returns the [`TokenAction`] that `scrub_db_args` should apply to this token.
+/// All five classification branches from the original while-loop are preserved
+/// exactly, now expressed as a pure function without let-chains.
+fn classify_token(tok: &str) -> TokenAction {
+    // 1. Connection string URIs: postgresql://…@…, postgres://…@…, mysql://…@…
+    if (tok.starts_with("postgresql://")
+        || tok.starts_with("postgres://")
+        || tok.starts_with("mysql://"))
+        && tok.contains('@')
+    {
+        return TokenAction::RedactUri;
+    }
+
+    // 2. `--flag=value` form (sensitive flags and config-file flags)
+    if let Some(eq_pos) = tok.find('=') {
+        let flag = &tok[..eq_pos];
+        if SENSITIVE_FLAGS.contains(&flag) || CONFIG_FILE_FLAGS.contains(&flag) {
+            return TokenAction::RedactEqualsValue {
+                flag: flag.to_string(),
+            };
+        }
+    }
+
+    // 3. Attached short flags: -pPassword, -uroot, -Uadmin (no space, single-dash only)
+    if !tok.starts_with("--") {
+        if let Some(&prefix) = ATTACHED_PREFIXES
+            .iter()
+            .find(|&&p| tok.starts_with(p) && tok.len() > p.len())
+        {
+            return TokenAction::RedactAttached {
+                prefix: prefix.to_string(),
+            };
+        }
+    }
+
+    // 4. Space-separated sensitive flags and config-file flags
+    if SENSITIVE_FLAGS.contains(&tok) || CONFIG_FILE_FLAGS.contains(&tok) {
+        return TokenAction::RedactNext;
+    }
+
+    // 5. Non-sensitive token — preserve verbatim
+    TokenAction::Preserve
+}
+
 /// Scrub credential values from a DB tool argument string.
 ///
 /// DB CLIs accept credentials as flag-value pairs.  This function replaces the
@@ -1139,78 +1226,39 @@ pub(crate) fn format_analytics_label(family: &str, program: &str, rest: &str) ->
 /// 5. `--defaults-file` / `--defaults-extra-file` MySQL config file flags
 /// 6. `-P` (port) is NOT redacted — it is not a credential
 pub(crate) fn scrub_db_args(args: &str) -> String {
-    /// Flags whose *immediately following* space-separated token is a credential.
-    /// Note: `-P` (port) intentionally omitted — it is not a credential.
-    const SENSITIVE_FLAGS: &[&str] = &[
-        "-p",
-        "-U",
-        "-u",
-        "-h",
-        "-W",
-        "--password",
-        "--user",
-        "--username",
-        "--host",
-    ];
-    /// Short flags that may have their value *attached* with no space (e.g. `-pS3cret`).
-    const ATTACHED_PREFIXES: &[&str] = &["-p", "-u", "-U"];
-    /// MySQL config-file flags whose value (path) must also be redacted.
-    const CONFIG_FILE_FLAGS: &[&str] = &["--defaults-file", "--defaults-extra-file"];
-
     let tokens: Vec<&str> = args.split_whitespace().collect();
     let mut out: Vec<String> = Vec::with_capacity(tokens.len());
     let mut i = 0;
 
     while i < tokens.len() {
         let tok = tokens[i];
-
-        // 1. Connection string URIs: postgresql://user:pass@host, mysql://user:pass@host
-        if (tok.starts_with("postgresql://")
-            || tok.starts_with("postgres://")
-            || tok.starts_with("mysql://"))
-            && tok.contains('@')
-        {
-            out.push("[REDACTED_URI]".to_string());
-            i += 1;
-            continue;
-        }
-
-        // 2. `--flag=value` form (sensitive flags and config-file flags)
-        if let Some(eq_pos) = tok.find('=') {
-            let flag = &tok[..eq_pos];
-            if SENSITIVE_FLAGS.contains(&flag) || CONFIG_FILE_FLAGS.contains(&flag) {
+        match classify_token(tok) {
+            TokenAction::RedactUri => {
+                out.push("[REDACTED_URI]".to_string());
+                i += 1;
+            }
+            TokenAction::RedactEqualsValue { flag } => {
                 out.push(format!("{flag}=[REDACTED]"));
                 i += 1;
-                continue;
             }
-        }
-
-        // 3. Attached short flags: -pPassword, -uroot, -Uadmin (no space between flag and value)
-        //    Only applies to single-dash (short) flags that are NOT `--` prefixed.
-        if !tok.starts_with("--")
-            && let Some(&prefix) = ATTACHED_PREFIXES
-                .iter()
-                .find(|&&p| tok.starts_with(p) && tok.len() > p.len())
-        {
-            out.push(format!("{prefix}[REDACTED]"));
-            i += 1;
-            continue;
-        }
-
-        // 4. Space-separated sensitive flags and config-file flags
-        if SENSITIVE_FLAGS.contains(&tok) || CONFIG_FILE_FLAGS.contains(&tok) {
-            out.push(tok.to_string());
-            i += 1;
-            // Redact the following value token if present.
-            if i < tokens.len() {
-                out.push("[REDACTED]".to_string());
+            TokenAction::RedactAttached { prefix } => {
+                out.push(format!("{prefix}[REDACTED]"));
                 i += 1;
             }
-            continue;
+            TokenAction::RedactNext => {
+                out.push(tok.to_string());
+                i += 1;
+                // Redact the following value token if present.
+                if i < tokens.len() {
+                    out.push("[REDACTED]".to_string());
+                    i += 1;
+                }
+            }
+            TokenAction::Preserve => {
+                out.push(tok.to_string());
+                i += 1;
+            }
         }
-
-        out.push(tok.to_string());
-        i += 1;
     }
 
     out.join(" ")
@@ -1724,6 +1772,110 @@ mod tests {
             err_msg.contains("Unknown subcommand"),
             "error message should mention 'Unknown subcommand', got: {err_msg}"
         );
+    }
+
+    // ========================================================================
+    // classify_token tests
+    // ========================================================================
+
+    #[test]
+    fn test_classify_token_uri_with_at_sign() {
+        // postgresql://user:pass@host → RedactUri
+        match classify_token("postgresql://admin:hunter2@db.prod:5432/myapp") {
+            TokenAction::RedactUri => {}
+            other => panic!("expected RedactUri, got {other:?}"),
+        }
+        match classify_token("mysql://root:password@localhost/db") {
+            TokenAction::RedactUri => {}
+            other => panic!("expected RedactUri, got {other:?}"),
+        }
+        match classify_token("postgres://user:pass@host/db") {
+            TokenAction::RedactUri => {}
+            other => panic!("expected RedactUri, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_token_uri_without_at_sign_preserved() {
+        // A URI without @ has no embedded credential — preserve it
+        match classify_token("postgresql://localhost/mydb") {
+            TokenAction::Preserve => {}
+            other => panic!("expected Preserve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_token_equals_password() {
+        // --password=secret → RedactEqualsValue
+        match classify_token("--password=S3cret") {
+            TokenAction::RedactEqualsValue { flag } => {
+                assert_eq!(flag, "--password");
+            }
+            other => panic!("expected RedactEqualsValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_token_equals_defaults_file() {
+        // --defaults-file=path → RedactEqualsValue (CONFIG_FILE_FLAGS)
+        match classify_token("--defaults-file=/home/user/.my.cnf") {
+            TokenAction::RedactEqualsValue { flag } => {
+                assert_eq!(flag, "--defaults-file");
+            }
+            other => panic!("expected RedactEqualsValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_token_attached_password() {
+        // -pPassword → RedactAttached
+        match classify_token("-pS3cret") {
+            TokenAction::RedactAttached { prefix } => {
+                assert_eq!(prefix, "-p");
+            }
+            other => panic!("expected RedactAttached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_token_standalone_sensitive_flag() {
+        // -p (alone) → RedactNext
+        match classify_token("-p") {
+            TokenAction::RedactNext => {}
+            other => panic!("expected RedactNext, got {other:?}"),
+        }
+        match classify_token("--password") {
+            TokenAction::RedactNext => {}
+            other => panic!("expected RedactNext, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_token_port_not_redacted() {
+        // -P is port, NOT a credential → Preserve
+        match classify_token("-P") {
+            TokenAction::Preserve => {}
+            other => panic!("expected Preserve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_token_non_sensitive_preserved() {
+        for tok in &["-e", "SELECT", "1", "--host-name", "localhost"] {
+            match classify_token(tok) {
+                TokenAction::Preserve => {}
+                other => panic!("expected Preserve for {tok:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_classify_token_empty_string() {
+        // Empty string has no credential content → Preserve
+        match classify_token("") {
+            TokenAction::Preserve => {}
+            other => panic!("expected Preserve for empty string, got {other:?}"),
+        }
     }
 
     // ========================================================================
