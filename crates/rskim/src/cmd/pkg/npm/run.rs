@@ -108,6 +108,21 @@ pub(super) fn run_script(
 ///
 /// Each branch converts the parser's native `ParseResult<T>` to
 /// `ParseResult<String>` via `stringify_result`.
+///
+/// # Design: direct function imports vs trait dispatch
+///
+/// This function calls six parser functions by direct import (`parse_impl`,
+/// `parse_check_impl`, `parse_tsc`, `parse`). Those functions are `pub(crate)`
+/// rather than exposed through a trait registry.
+///
+/// This is intentional: `rskim` is a single-binary crate, so the "blast radius"
+/// of these cross-module imports is bounded at the crate boundary. A trait-based
+/// registry (e.g. `ToolParser` in `cmd/mod.rs`) would add an indirection layer
+/// without changing visibility or safety properties — `pub(crate)` already
+/// enforces internal-only access. The set of supported tools is closed and
+/// enumerated by `ScriptTool`; adding a new tool requires touching this match
+/// regardless of whether a registry exists, so the trait would not reduce
+/// coupling in practice.
 fn parse_npm_output(output: &CommandOutput, tool: ScriptTool) -> ParseResult<String> {
     match tool {
         ScriptTool::Vitest | ScriptTool::Jest => {
@@ -192,6 +207,34 @@ mod tests {
         let output = make_output_full("", "", Some(0));
         let result = parse_npm_output(&output, ScriptTool::Unknown);
         assert!(result.is_passthrough());
+    }
+
+    /// When stdout is empty and stderr is non-empty, `combine_output` produces
+    /// `"\n<stderr>"` (a leading newline before the stderr content).
+    ///
+    /// This is intentional pre-existing behaviour of `combine_output`: the fast
+    /// path (empty stderr) borrows stdout directly; the slow path concatenates
+    /// `"{stdout}\n{stderr}"`, which produces a leading newline when stdout is
+    /// empty.  Callers that need a clean string (e.g. `parse_fmt`) trim
+    /// explicitly.  The Unknown passthrough path does NOT trim — it preserves
+    /// the raw combined output so nothing is silently dropped.
+    #[test]
+    fn test_parse_npm_output_unknown_stderr_only_has_leading_newline() {
+        let output = make_output_full("", "error: something went wrong\n", Some(1));
+        let result = parse_npm_output(&output, ScriptTool::Unknown);
+        assert!(
+            result.is_passthrough(),
+            "Unknown tool should return Passthrough"
+        );
+        // The leading newline is present because combine_output formats as
+        // "{stdout}\n{stderr}" and stdout is empty.  This test documents and
+        // locks in the current behaviour so any future change to combine_output
+        // is visible.
+        assert_eq!(
+            result.content(),
+            "\nerror: something went wrong\n",
+            "combine_output with empty stdout produces a leading newline"
+        );
     }
 
     // -----------------------------------------------------------------------

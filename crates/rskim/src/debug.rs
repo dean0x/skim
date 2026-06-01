@@ -49,6 +49,29 @@ pub(crate) fn is_debug_enabled() -> bool {
     DEBUG_FORCE_ENABLED.load(Ordering::Acquire)
 }
 
+/// Emit a formatted message to stderr when debug output is enabled.
+///
+/// Equivalent to:
+/// ```ignore
+/// if crate::debug::is_debug_enabled() {
+///     eprintln!($fmt, $args...);
+/// }
+/// ```
+///
+/// Use this macro instead of the inline guard to reduce boilerplate at call
+/// sites where multiple consecutive debug messages appear (e.g. a function
+/// with several fallible operations each guarded separately).
+///
+/// The format string and arguments follow the same rules as [`eprintln!`].
+#[macro_export]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if $crate::debug::is_debug_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 /// Reset the debug flag to `false`.
 ///
 /// Only available in test builds.  Call at the start of any test that invokes

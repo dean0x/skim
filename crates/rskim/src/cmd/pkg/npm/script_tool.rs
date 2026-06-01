@@ -57,12 +57,10 @@ pub(super) fn resolve_script(start_dir: &Path, name: &str) -> Option<String> {
             break;
         }
     }
-    if crate::debug::is_debug_enabled() {
-        eprintln!(
-            "skim: script_tool: no package.json found starting from {}",
-            start_dir.display()
-        );
-    }
+    crate::debug_log!(
+        "skim: script_tool: no package.json found starting from {}",
+        start_dir.display()
+    );
     None
 }
 
@@ -96,9 +94,7 @@ fn try_parse_script(path: &std::path::Path, name: &str) -> Option<String> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) => {
-            if crate::debug::is_debug_enabled() {
-                eprintln!("skim: script_tool: failed to open {}: {e}", path.display());
-            }
+            crate::debug_log!("skim: script_tool: failed to open {}: {e}", path.display());
             return None;
         }
     };
@@ -108,32 +104,26 @@ fn try_parse_script(path: &std::path::Path, name: &str) -> Option<String> {
     let cap = MAX_PKG_JSON_BYTES as usize;
     let mut buf = Vec::with_capacity(cap.min(65_536));
     if let Err(e) = file.take(MAX_PKG_JSON_BYTES + 1).read_to_end(&mut buf) {
-        if crate::debug::is_debug_enabled() {
-            eprintln!("skim: script_tool: failed to read {}: {e}", path.display());
-        }
+        crate::debug_log!("skim: script_tool: failed to read {}: {e}", path.display());
         return None;
     }
 
     if buf.len() > cap {
-        if crate::debug::is_debug_enabled() {
-            eprintln!(
-                "skim: script_tool: skipping oversized package.json (> {} cap): {}",
-                MAX_PKG_JSON_BYTES,
-                path.display()
-            );
-        }
+        crate::debug_log!(
+            "skim: script_tool: skipping oversized package.json (> {} cap): {}",
+            MAX_PKG_JSON_BYTES,
+            path.display()
+        );
         return None;
     }
 
     let text = match std::str::from_utf8(&buf) {
         Ok(s) => s,
         Err(e) => {
-            if crate::debug::is_debug_enabled() {
-                eprintln!(
-                    "skim: script_tool: package.json is not valid UTF-8 at {}: {e}",
-                    path.display()
-                );
-            }
+            crate::debug_log!(
+                "skim: script_tool: package.json is not valid UTF-8 at {}: {e}",
+                path.display()
+            );
             return None;
         }
     };
@@ -141,9 +131,7 @@ fn try_parse_script(path: &std::path::Path, name: &str) -> Option<String> {
     let pkg: PkgScripts = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
-            if crate::debug::is_debug_enabled() {
-                eprintln!("skim: script_tool: failed to parse {}: {e}", path.display());
-            }
+            crate::debug_log!("skim: script_tool: failed to parse {}: {e}", path.display());
             return None;
         }
     };

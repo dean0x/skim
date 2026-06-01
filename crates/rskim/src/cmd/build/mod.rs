@@ -51,7 +51,7 @@ pub(crate) fn run(
         session_id: analytics.session_id.as_deref(),
     };
     match sub {
-        Some("cargo") => cargo::run(remaining, show_stats, rec),
+        Some("build") => cargo::run(remaining, show_stats, rec),
         Some("check") => cargo::run_check(remaining, show_stats, rec),
         Some("fmt") => cargo::run_fmt(remaining, show_stats, rec),
         Some("clippy") => cargo::run_clippy(remaining, show_stats, rec),
