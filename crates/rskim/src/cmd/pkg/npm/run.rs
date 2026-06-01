@@ -146,16 +146,7 @@ fn parse_npm_output(output: &CommandOutput, tool: ScriptTool) -> ParseResult<Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::CommandOutput;
-
-    fn make_output(stdout: &str, stderr: &str, exit_code: i32) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-            exit_code: Some(exit_code),
-            duration: std::time::Duration::ZERO,
-        }
-    }
+    use crate::cmd::test_support::{load_fixture, make_output_full};
 
     #[test]
     fn test_stringify_result_full() {
@@ -184,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_parse_npm_output_unknown_passthrough() {
-        let output = make_output("some output\n", "", 0);
+        let output = make_output_full("some output\n", "", Some(0));
         let result = parse_npm_output(&output, ScriptTool::Unknown);
         assert!(
             result.is_passthrough(),
@@ -195,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_parse_npm_output_unknown_empty_passthrough() {
-        let output = make_output("", "", 0);
+        let output = make_output_full("", "", Some(0));
         let result = parse_npm_output(&output, ScriptTool::Unknown);
         assert!(result.is_passthrough());
     }
@@ -210,13 +201,9 @@ mod tests {
     #[test]
     fn test_parse_npm_output_vitest_uses_vitest_parser() {
         // vitest_regex_fail.txt is a plain-text vitest summary (tier 2 input).
-        let fixture = crate::cmd::test_support::load_fixture("test", "vitest_regex_fail.txt");
-        let output = make_output(&fixture, "", 1);
+        let fixture = load_fixture("test", "vitest_regex_fail.txt");
+        let output = make_output_full(&fixture, "", Some(1));
         let result = parse_npm_output(&output, ScriptTool::Vitest);
-        assert!(
-            !result.is_passthrough() || result.content().contains("failed"),
-            "Vitest branch should parse regex fixture or at least forward content"
-        );
         // The vitest regex parser recognises this fixture — expect Degraded.
         assert!(
             result.is_degraded(),
@@ -228,8 +215,8 @@ mod tests {
     #[test]
     fn test_parse_npm_output_jest_uses_vitest_parser() {
         // Jest delegates to the same vitest parser; the regex tier handles plain text.
-        let fixture = crate::cmd::test_support::load_fixture("test", "vitest_regex_fail.txt");
-        let output = make_output(&fixture, "", 1);
+        let fixture = load_fixture("test", "vitest_regex_fail.txt");
+        let output = make_output_full(&fixture, "", Some(1));
         let result = parse_npm_output(&output, ScriptTool::Jest);
         assert!(
             result.is_degraded(),
@@ -240,8 +227,8 @@ mod tests {
 
     #[test]
     fn test_parse_npm_output_eslint_does_not_crash() {
-        let fixture = crate::cmd::test_support::load_fixture("lint", "eslint_fail.json");
-        let output = make_output(&fixture, "", 1);
+        let fixture = load_fixture("lint", "eslint_fail.json");
+        let output = make_output_full(&fixture, "", Some(1));
         let result = parse_npm_output(&output, ScriptTool::Eslint);
         // Eslint JSON fixture — expect Full parse.
         assert!(
@@ -253,8 +240,8 @@ mod tests {
 
     #[test]
     fn test_parse_npm_output_biome_does_not_crash() {
-        let fixture = crate::cmd::test_support::load_fixture("lint", "biome_check_fail.json");
-        let output = make_output(&fixture, "", 1);
+        let fixture = load_fixture("lint", "biome_check_fail.json");
+        let output = make_output_full(&fixture, "", Some(1));
         let result = parse_npm_output(&output, ScriptTool::Biome);
         // Biome JSON fixture — expect Full parse.
         assert!(
@@ -267,8 +254,8 @@ mod tests {
     #[test]
     fn test_parse_npm_output_prettier_produces_full() {
         // prettier_check_fail.txt uses `[warn]` format — tier 1 (Full) for prettier parser.
-        let fixture = crate::cmd::test_support::load_fixture("lint", "prettier_check_fail.txt");
-        let output = make_output(&fixture, "", 1);
+        let fixture = load_fixture("lint", "prettier_check_fail.txt");
+        let output = make_output_full(&fixture, "", Some(1));
         let result = parse_npm_output(&output, ScriptTool::Prettier);
         assert!(
             result.is_full(),
@@ -279,8 +266,8 @@ mod tests {
 
     #[test]
     fn test_parse_npm_output_oxlint_does_not_crash() {
-        let fixture = crate::cmd::test_support::load_fixture("lint", "oxlint_fail.json");
-        let output = make_output(&fixture, "", 1);
+        let fixture = load_fixture("lint", "oxlint_fail.json");
+        let output = make_output_full(&fixture, "", Some(1));
         let result = parse_npm_output(&output, ScriptTool::Oxlint);
         // Oxlint JSON fixture — expect Full parse.
         assert!(
@@ -293,9 +280,9 @@ mod tests {
     #[test]
     fn test_parse_npm_output_tsc_produces_full() {
         // tsc_errors.txt contains `file(line,col): error TSxxxx` on stderr — tier 1 (Full).
-        let fixture = crate::cmd::test_support::load_fixture("build", "tsc_errors.txt");
+        let fixture = load_fixture("build", "tsc_errors.txt");
         // tsc writes errors to stderr.
-        let output = make_output("", &fixture, 2);
+        let output = make_output_full("", &fixture, Some(2));
         let result = parse_npm_output(&output, ScriptTool::Tsc);
         assert!(
             result.is_full(),
