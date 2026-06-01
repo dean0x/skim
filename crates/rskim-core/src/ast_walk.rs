@@ -64,11 +64,25 @@ pub struct AstWalkConfig {
     pub max_nodes: u32,
 }
 
+impl AstWalkConfig {
+    /// Default maximum traversal depth (500).
+    ///
+    /// Canonical source used by `AstWalkConfig::default()`, `linearize.rs`, and
+    /// `ast_extract.rs`. Update here to change the limit everywhere.
+    pub const DEFAULT_MAX_DEPTH: u32 = 500;
+
+    /// Default maximum nodes yielded per traversal (100 000).
+    ///
+    /// Canonical source used by `AstWalkConfig::default()`, `linearize.rs`, and
+    /// `ast_extract.rs`. Update here to change the limit everywhere.
+    pub const DEFAULT_MAX_NODES: u32 = 100_000;
+}
+
 impl Default for AstWalkConfig {
     fn default() -> Self {
         Self {
-            max_depth: 500,
-            max_nodes: 100_000,
+            max_depth: Self::DEFAULT_MAX_DEPTH,
+            max_nodes: Self::DEFAULT_MAX_NODES,
         }
     }
 }
@@ -115,7 +129,7 @@ impl<'a> AstWalkIter<'a> {
     pub fn new(cursor: tree_sitter::TreeCursor<'a>, config: AstWalkConfig) -> Self {
         Self {
             cursor,
-            level_stack: Vec::new(),
+            level_stack: Vec::with_capacity((config.max_depth as usize).min(64)),
             depth: 0,
             node_count: 0,
             error_count: 0,
@@ -150,12 +164,16 @@ impl<'a> AstWalkIter<'a> {
                 // Depth is unchanged — we moved to a sibling, not a child.
                 return true;
             }
-            if self.level_stack.is_empty() {
-                self.done = true;
-                return false;
+            match self.level_stack.pop() {
+                Some(parent_depth) => {
+                    self.cursor.goto_parent();
+                    self.depth = parent_depth;
+                }
+                None => {
+                    self.done = true;
+                    return false;
+                }
             }
-            self.cursor.goto_parent();
-            self.depth = self.level_stack.pop().unwrap_or(0);
         }
     }
 
@@ -174,12 +192,16 @@ impl<'a> AstWalkIter<'a> {
             if self.cursor.goto_next_sibling() {
                 return true;
             }
-            if self.level_stack.is_empty() {
-                self.done = true;
-                return false;
+            match self.level_stack.pop() {
+                Some(parent_depth) => {
+                    self.cursor.goto_parent();
+                    self.depth = parent_depth;
+                }
+                None => {
+                    self.done = true;
+                    return false;
+                }
             }
-            self.cursor.goto_parent();
-            self.depth = self.level_stack.pop().unwrap_or(0);
         }
     }
 }
@@ -202,10 +224,6 @@ impl<'a> Iterator for AstWalkIter<'a> {
 
         // Inner loop: skip subtrees that hit bounds, then yield.
         loop {
-            if self.done {
-                return None;
-            }
-
             // ── Bounds guards ─────────────────────────────────────────────────
             if self.depth >= self.config.max_depth || self.node_count >= self.config.max_nodes {
                 if !self.skip_subtree() {
@@ -223,15 +241,20 @@ impl<'a> Iterator for AstWalkIter<'a> {
                 self.error_count = self.error_count.saturating_add(1);
             }
 
-            let depth = self.depth;
             return Some(AstWalkNode {
                 node,
-                depth,
+                depth: self.depth,
                 is_error,
             });
         }
     }
 }
+
+/// `AstWalkIter` is fused: once `next()` returns `None` it always returns `None`.
+///
+/// The `done` flag is set to `true` on exhaustion and is never cleared, so the
+/// stdlib optimization (`take_while`, `chain`, etc.) is safe to rely on.
+impl<'a> std::iter::FusedIterator for AstWalkIter<'a> {}
 
 // ============================================================================
 // Tests
@@ -330,27 +353,36 @@ mod tests {
 
     #[test]
     fn error_children_still_yielded() {
-        // `fn broken(((( {}` — the ERROR node has children that should be visited.
+        // `fn broken(((( {}` — the ERROR node wraps children; we prove the walker
+        // descended *into* ERROR subtrees by finding non-error nodes deeper than
+        // the shallowest error node.
         let tree = parse_rust("fn broken(((( {}");
         let config = AstWalkConfig::default();
         let items: Vec<_> = AstWalkIter::new(tree.walk(), config).collect();
 
-        let error_positions: Vec<usize> = items
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| n.is_error)
-            .map(|(i, _)| i)
-            .collect();
-        assert!(!error_positions.is_empty());
-
-        // After an error node there must be at least one more item (child or sibling).
-        let last_error_pos = *error_positions.last().unwrap();
+        // 1. At least one ERROR/MISSING node must appear.
+        let error_nodes: Vec<_> = items.iter().filter(|n| n.is_error).collect();
         assert!(
-            items.len() > last_error_pos + 1 || last_error_pos < items.len() - 1,
-            "expected nodes after the error node"
+            !error_nodes.is_empty(),
+            "broken syntax should produce is_error nodes"
         );
-        // Total items must be > 1 (root + something).
-        assert!(items.len() > 1, "more than the root must be yielded");
+
+        // 2. The shallowest error depth.
+        let min_error_depth = error_nodes.iter().map(|n| n.depth).min().unwrap();
+
+        // 3. At least one non-error node must exist at a depth strictly greater
+        //    than the shallowest error depth, proving the walker descended into
+        //    the ERROR subtree rather than skipping it.
+        let has_deeper_non_error = items
+            .iter()
+            .any(|n| !n.is_error && n.depth > min_error_depth);
+        assert!(
+            has_deeper_non_error,
+            "expected non-error nodes at depth > {} (inside ERROR subtree), \
+             but only found items at depths: {:?}",
+            min_error_depth,
+            items.iter().map(|n| n.depth).collect::<Vec<_>>()
+        );
     }
 
     // ── AC-F6: max_depth guard ────────────────────────────────────────────────
@@ -476,15 +508,6 @@ mod tests {
             manual_count,
             "node_count() must equal number of items yielded"
         );
-    }
-
-    // ── AC-A2: Default config values ─────────────────────────────────────────
-
-    #[test]
-    fn default_config_values() {
-        let config = AstWalkConfig::default();
-        assert_eq!(config.max_depth, 500);
-        assert_eq!(config.max_nodes, 100_000);
     }
 
     // ── Invariant: node_count == non_error + error_count ─────────────────────

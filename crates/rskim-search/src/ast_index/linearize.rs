@@ -33,16 +33,11 @@ use crate::types::SearchError;
 // Constants
 // ============================================================================
 
-/// Maximum traversal depth before stopping descent into children.
-///
-/// Prevents pathological inputs (e.g. deeply nested expressions) from
-/// consuming unbounded memory in the level stack.
-const MAX_AST_DEPTH: u16 = 500;
-
-/// Maximum number of AST nodes to emit per file.
-///
-/// Caps memory allocation for extremely large or generated files.
-const MAX_AST_NODES: u32 = 100_000;
+// Traversal bounds are centralized on `AstWalkConfig` as associated constants
+// (`DEFAULT_MAX_DEPTH` = 500, `DEFAULT_MAX_NODES` = 100 000).  Reference them
+// via `AstWalkConfig::DEFAULT_MAX_DEPTH` / `AstWalkConfig::DEFAULT_MAX_NODES`
+// wherever a local override is needed, or use `AstWalkConfig::default()` to
+// pick up both at once.
 
 /// Maximum source file size accepted for linearization (100 KiB).
 ///
@@ -236,16 +231,13 @@ pub fn linearize_source(
 ///
 /// `result.node_count == result.nodes.len() + result.error_count`
 fn linearize_tree(tree: &tree_sitter::Tree, lang_map: &[Option<u16>]) -> LinearizeResult {
-    let capacity = tree.root_node().descendant_count().min(MAX_AST_NODES as usize);
+    let capacity = tree
+        .root_node()
+        .descendant_count()
+        .min(AstWalkConfig::DEFAULT_MAX_NODES as usize);
     let mut nodes = Vec::with_capacity(capacity);
 
-    let mut iter = AstWalkIter::new(
-        tree.walk(),
-        AstWalkConfig {
-            max_depth: u32::from(MAX_AST_DEPTH),
-            max_nodes: MAX_AST_NODES,
-        },
-    );
+    let mut iter = AstWalkIter::new(tree.walk(), AstWalkConfig::default());
 
     for item in iter.by_ref() {
         if item.is_error {

@@ -16,12 +16,11 @@ use crate::ast_types::{
 use crate::extract::content_hash;
 use crate::types::SourceFile;
 
-/// Maximum AST traversal depth to prevent stack-overflow-equivalent run-away on
-/// pathological inputs.
-const MAX_AST_DEPTH: usize = 500;
-
-/// Maximum number of AST nodes visited per file.
-const MAX_AST_NODES: u32 = 100_000;
+// Traversal bounds are centralized on `AstWalkConfig` as associated constants
+// (`DEFAULT_MAX_DEPTH` = 500, `DEFAULT_MAX_NODES` = 100 000).  Reference them
+// via `AstWalkConfig::DEFAULT_MAX_DEPTH` / `AstWalkConfig::DEFAULT_MAX_NODES`
+// wherever a local override is needed, or use `AstWalkConfig::default()` to
+// pick up both at once.
 
 /// Maximum source file size accepted for AST extraction (100 KiB default).
 const MAX_FILE_SIZE: usize = 100 * 1024;
@@ -113,8 +112,9 @@ pub fn extract_ast_ngrams_from_file(
 /// `d`, or `None` if that node was an ERROR/MISSING node (which breaks the
 /// bigram/trigram chain for its children).
 ///
-/// `MAX_AST_DEPTH` (500) and `MAX_AST_NODES` (100 K) are passed through to
-/// `AstWalkIter` as bounds guards. `MAX_TRIGRAMS_PER_FILE` stays here as a
+/// `AstWalkConfig::DEFAULT_MAX_DEPTH` (500) and `AstWalkConfig::DEFAULT_MAX_NODES`
+/// (100 K) are passed through to `AstWalkIter` as bounds guards.
+/// `MAX_TRIGRAMS_PER_FILE` stays here as a
 /// caller-level cap on output size.
 ///
 /// The trigram emission guard uses two nested `if` blocks intentionally: the
@@ -131,18 +131,12 @@ fn walk_tree(
     // Depth-indexed ancestor table. `ancestors[d]` holds the NodeKindId of the
     // node at depth `d`, or `None` for ERROR/MISSING nodes.
     //
-    // We size it to MAX_AST_DEPTH + 1 so that indexing by any yielded depth is
-    // always in-bounds (AstWalkIter never yields depth >= max_depth).
-    let ancestor_cap = MAX_AST_DEPTH + 1;
+    // We size it to DEFAULT_MAX_DEPTH + 1 so that indexing by any yielded depth
+    // is always in-bounds (AstWalkIter never yields depth >= max_depth).
+    let ancestor_cap = (AstWalkConfig::DEFAULT_MAX_DEPTH + 1) as usize;
     let mut ancestors: Vec<Option<NodeKindId>> = vec![None; ancestor_cap];
 
-    let mut iter = AstWalkIter::new(
-        tree.walk(),
-        AstWalkConfig {
-            max_depth: MAX_AST_DEPTH as u32,
-            max_nodes: MAX_AST_NODES,
-        },
-    );
+    let mut iter = AstWalkIter::new(tree.walk(), AstWalkConfig::default());
 
     for item in iter.by_ref() {
         let depth = item.depth as usize;
