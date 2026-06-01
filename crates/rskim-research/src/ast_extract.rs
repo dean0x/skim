@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rskim_core::{Language, Parser};
+use rskim_core::{AstWalkConfig, AstWalkIter, Language, Parser};
 
 use crate::ast_types::{
     AstBigram, AstCorpusStats, AstLanguageStats, AstTrigram, NodeKindId, NodeKindVocabulary,
@@ -95,157 +95,106 @@ pub fn extract_ast_ngrams_from_file(
     };
 
     let mut result = AstFileResult::default();
-    let mut cursor = tree.walk();
-    let mut ctx = WalkContext {
-        vocab,
-        bigrams: &mut result.bigrams,
-        trigrams: &mut result.trigrams,
-        collect_trigrams,
-        error_count: &mut result.error_node_count,
-        node_count: &mut result.node_count,
-    };
 
-    walk_tree(&mut cursor, &mut ctx);
+    walk_tree(&tree, vocab, collect_trigrams, &mut result);
 
     Ok(result)
 }
 
-/// Mutable traversal state threaded through the iterative `walk_tree` calls.
+/// Iterative pre-order tree walk using `AstWalkIter` with ancestor tracking.
 ///
-/// Bundles the vocabulary, output sets, counters, and configuration so that
-/// `walk_tree` takes only two parameters instead of ten.
-struct WalkContext<'a> {
-    /// Shared vocabulary mapping node-kind strings to compact IDs.
-    vocab: &'a mut NodeKindVocabulary,
-    /// Unique parent→child bigrams collected so far for this file.
-    bigrams: &'a mut HashSet<AstBigram>,
-    /// Unique grandparent→parent→child trigrams collected so far for this file.
-    trigrams: &'a mut HashSet<AstTrigram>,
-    /// Whether to collect trigrams at all.
-    collect_trigrams: bool,
-    /// Running count of ERROR nodes (parse failures).
-    error_count: &'a mut u32,
-    /// Running count of all AST nodes visited.
-    node_count: &'a mut u32,
-}
-
-/// Iterative pre-order tree walk using `TreeCursor` with bounded depth and
-/// node-count guards.
+/// Replaces the previous hand-rolled `TreeCursor` loop. `AstWalkIter` handles
+/// all cursor management, depth tracking, and bounds guarding. This function
+/// adds the caller-specific logic: vocabulary lookup, bigram/trigram emission,
+/// and depth-indexed ancestor context.
 ///
-/// Replaces the previous recursive implementation to eliminate call-stack
-/// growth on pathological inputs. Uses a manual stack of
-/// `(depth, parent_id, grandparent_id)` entries — one per level — to track
-/// the same ancestor context that the recursive version carried in activation
-/// frames.
+/// Ancestor context is maintained in a `Vec<Option<NodeKindId>>` indexed by
+/// traversal depth. `ancestors[d]` is the `NodeKindId` of the node at depth
+/// `d`, or `None` if that node was an ERROR/MISSING node (which breaks the
+/// bigram/trigram chain for its children).
 ///
-/// `MAX_AST_DEPTH` (500) caps how deep we descend; `MAX_AST_NODES` (100 K)
-/// caps total nodes visited per file.
-///
-/// ERROR nodes are counted but not included in bigram/trigram pairs (they
-/// represent parse failures, not real grammar relationships). Children of
-/// ERROR nodes are still visited so we count all error nodes in the subtree.
+/// `MAX_AST_DEPTH` (500) and `MAX_AST_NODES` (100 K) are passed through to
+/// `AstWalkIter` as bounds guards. `MAX_TRIGRAMS_PER_FILE` stays here as a
+/// caller-level cap on output size.
 ///
 /// The trigram emission guard uses two nested `if` blocks intentionally: the
 /// outer guard on `collect_trigrams` and the trigram-cap avoids constructing
 /// the Option tuple when unnecessary; `clippy::collapsible_if` would merge
-/// them into an if-let chain that still allocates the tuple unconditionally.
-fn walk_tree(cursor: &mut tree_sitter::TreeCursor, ctx: &mut WalkContext<'_>) {
-    // Stack of (depth, parent_id, grandparent_id) for the current cursor
-    // position.  Each entry is pushed when we descend into a child level and
-    // popped when we return to the parent.
-    let mut level_stack: Vec<(usize, Option<NodeKindId>, Option<NodeKindId>)> = Vec::new();
+/// them into an if-let chain that still constructs the Option tuple
+/// unconditionally.
+fn walk_tree(
+    tree: &tree_sitter::Tree,
+    vocab: &mut NodeKindVocabulary,
+    collect_trigrams: bool,
+    result: &mut AstFileResult,
+) {
+    // Depth-indexed ancestor table. `ancestors[d]` holds the NodeKindId of the
+    // node at depth `d`, or `None` for ERROR/MISSING nodes.
+    //
+    // We size it to MAX_AST_DEPTH + 1 so that indexing by any yielded depth is
+    // always in-bounds (AstWalkIter never yields depth >= max_depth).
+    let ancestor_cap = MAX_AST_DEPTH + 1;
+    let mut ancestors: Vec<Option<NodeKindId>> = vec![None; ancestor_cap];
 
-    // Start at depth 0 with no parent or grandparent.
-    let mut depth: usize = 0;
-    let mut parent_id: Option<NodeKindId> = None;
-    let mut grandparent_id: Option<NodeKindId> = None;
+    let mut iter = AstWalkIter::new(
+        tree.walk(),
+        AstWalkConfig {
+            max_depth: MAX_AST_DEPTH as u32,
+            max_nodes: MAX_AST_NODES,
+        },
+    );
 
-    loop {
-        // ── Guard: depth and node-count caps ──────────────────────────────
-        if depth >= MAX_AST_DEPTH || *ctx.node_count >= MAX_AST_NODES {
-            // Skip this node and its subtree.  Move to the next sibling or
-            // ascend until we find one.
-            loop {
-                if cursor.goto_next_sibling() {
-                    break;
-                }
-                if level_stack.is_empty() {
-                    return;
-                }
-                cursor.goto_parent();
-                if let Some((d, p, g)) = level_stack.pop() {
-                    depth = d;
-                    parent_id = p;
-                    grandparent_id = g;
-                }
+    for item in iter.by_ref() {
+        let depth = item.depth as usize;
+
+        // ── Process current node ───────────────────────────────────────────
+        let kind = item.node.kind();
+
+        if item.is_error {
+            // Do not create bigrams/trigrams for ERROR/MISSING nodes.
+            // Break the chain: children of this node will see ancestors[depth] = None.
+            if depth < ancestor_cap {
+                ancestors[depth] = None;
             }
             continue;
         }
 
-        // ── Process current node ───────────────────────────────────────────
-        let node = cursor.node();
-        *ctx.node_count += 1;
+        // Get (or assign) ID for the current node kind.
+        let current_id = vocab.get_or_insert(kind);
 
-        let kind = node.kind();
-        let is_error = node.is_error() || node.is_missing();
+        // Resolve parent and grandparent from the ancestor table.
+        let parent_id: Option<NodeKindId> = depth
+            .checked_sub(1)
+            .and_then(|pd| ancestors.get(pd).copied().flatten());
+        let grandparent_id: Option<NodeKindId> = depth
+            .checked_sub(2)
+            .and_then(|gd| ancestors.get(gd).copied().flatten());
 
-        if is_error {
-            *ctx.error_count += 1;
-            // Do not create bigrams/trigrams for ERROR nodes — they are not
-            // real grammar relationships.  Continue walking children so we
-            // count all error nodes in the subtree.
+        // Record this node's ID at its depth for use by its children.
+        if depth < ancestor_cap {
+            ancestors[depth] = Some(current_id);
         }
 
-        // Get (or assign) ID for the current node kind.
-        let current_id = if is_error {
-            None
-        } else {
-            Some(ctx.vocab.get_or_insert(kind))
-        };
-
         // Emit bigram: parent → current.
-        if let (Some(pid), Some(cid)) = (parent_id, current_id) {
-            ctx.bigrams.insert(encode_ast_bigram(pid, cid));
+        if let Some(pid) = parent_id {
+            result.bigrams.insert(encode_ast_bigram(pid, current_id));
         }
 
         // Emit trigram: grandparent → parent → current.
-        // The two-level if is intentional: the outer guard avoids tuple
-        // construction overhead when the cap or flag is not set;
-        // clippy::collapsible_if would merge them into an if-let chain that
-        // still allocates the Option tuple unconditionally.
+        // The two-level if is intentional: see function doc comment.
         #[allow(clippy::collapsible_if)]
-        if ctx.collect_trigrams && ctx.trigrams.len() < MAX_TRIGRAMS_PER_FILE {
-            if let (Some(gid), Some(pid), Some(cid)) = (grandparent_id, parent_id, current_id) {
-                ctx.trigrams.insert(encode_ast_trigram(gid, pid, cid));
-            }
-        }
-
-        // ── Advance cursor ─────────────────────────────────────────────────
-        if cursor.goto_first_child() {
-            // Descend: push current level context and move one level deeper.
-            level_stack.push((depth, parent_id, grandparent_id));
-            grandparent_id = parent_id;
-            parent_id = current_id;
-            depth += 1;
-        } else {
-            // No children — try next sibling at the same level, or ascend.
-            loop {
-                if cursor.goto_next_sibling() {
-                    // Stay at current depth/parent/grandparent context.
-                    break;
-                }
-                if level_stack.is_empty() {
-                    return;
-                }
-                cursor.goto_parent();
-                if let Some((d, p, g)) = level_stack.pop() {
-                    depth = d;
-                    parent_id = p;
-                    grandparent_id = g;
-                }
+        if collect_trigrams && result.trigrams.len() < MAX_TRIGRAMS_PER_FILE {
+            if let (Some(gid), Some(pid)) = (grandparent_id, parent_id) {
+                result
+                    .trigrams
+                    .insert(encode_ast_trigram(gid, pid, current_id));
             }
         }
     }
+
+    // Populate counters from the iterator's final tally.
+    result.error_node_count = iter.error_count();
+    result.node_count = iter.node_count();
 }
 
 /// Result of processing all files for a single language.

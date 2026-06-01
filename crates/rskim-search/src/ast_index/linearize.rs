@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use rskim_core::{Language, Parser};
+use rskim_core::{AstWalkConfig, AstWalkIter, Language, Parser};
 
 use crate::ast_weights::NODE_KIND_VOCABULARY;
 use crate::types::SearchError;
@@ -226,87 +226,46 @@ pub fn linearize_source(
 // Tree traversal
 // ============================================================================
 
-/// Iterative pre-order DFS traversal of a tree-sitter CST.
+/// Iterative pre-order DFS traversal of a tree-sitter CST via `AstWalkIter`.
 ///
-/// Uses `TreeCursor` for efficient navigation without allocating per-node
-/// objects. The `level_stack` tracks the depth and pending return state as we
-/// descend and ascend.
+/// Delegates all cursor management, bounds guarding, and depth tracking to the
+/// shared `AstWalkIter` in `rskim-core`. Caller-specific logic (vocabulary
+/// lookup, `LinearNode` construction) stays here.
 ///
 /// # Invariant maintained
 ///
 /// `result.node_count == result.nodes.len() + result.error_count`
 fn linearize_tree(tree: &tree_sitter::Tree, lang_map: &[Option<u16>]) -> LinearizeResult {
-    let root = tree.root_node();
-    let capacity = root.descendant_count().min(MAX_AST_NODES as usize);
+    let capacity = tree.root_node().descendant_count().min(MAX_AST_NODES as usize);
+    let mut nodes = Vec::with_capacity(capacity);
 
-    let mut result = LinearizeResult {
-        nodes: Vec::with_capacity(capacity),
-        node_count: 0,
-        error_count: 0,
-    };
+    let mut iter = AstWalkIter::new(
+        tree.walk(),
+        AstWalkConfig {
+            max_depth: u32::from(MAX_AST_DEPTH),
+            max_nodes: MAX_AST_NODES,
+        },
+    );
 
-    let mut cursor = tree.walk();
-    // Stack entries: depth at the level we descended from, so that when we
-    // ascend we restore the correct depth.
-    let mut level_stack: Vec<u16> = Vec::new();
-    let mut depth: u16 = 0;
-
-    loop {
-        // ── Bounds guards ────────────────────────────────────────────────────
-        if depth >= MAX_AST_DEPTH || result.node_count >= MAX_AST_NODES {
-            // Skip this subtree. Move to next sibling or ascend.
-            loop {
-                if cursor.goto_next_sibling() {
-                    // Stay at current depth — we didn't descend.
-                    break;
-                }
-                if level_stack.is_empty() {
-                    return result;
-                }
-                cursor.goto_parent();
-                depth = level_stack.pop().unwrap_or(0);
-            }
+    for item in iter.by_ref() {
+        if item.is_error {
+            // ERROR/MISSING nodes are not emitted but their children are still
+            // visited. error_count is tracked by the iterator.
             continue;
         }
+        let ts_kind = item.node.kind_id() as usize;
+        let vocab_id = lang_map.get(ts_kind).copied().flatten().unwrap_or(0);
+        // Saturate depth to u16::MAX — traversal depth never reaches 500, but
+        // saturating_cast is the correct pattern for converting u32 → u16.
+        #[allow(clippy::cast_possible_truncation)]
+        let depth = item.depth.min(u32::from(u16::MAX)) as u16;
+        nodes.push(LinearNode { kind_id: vocab_id, depth });
+    }
 
-        // ── Process current node ─────────────────────────────────────────────
-        let node = cursor.node();
-        result.node_count = result.node_count.saturating_add(1);
-
-        if node.is_error() || node.is_missing() {
-            result.error_count = result.error_count.saturating_add(1);
-            // ERROR/MISSING nodes are not emitted but their children may be
-            // visited so we count all nodes in the subtree.
-        } else {
-            // Look up the vocabulary ID for this node kind.
-            let ts_kind = node.kind_id() as usize;
-            let vocab_id = lang_map.get(ts_kind).copied().flatten().unwrap_or(0);
-
-            result.nodes.push(LinearNode {
-                kind_id: vocab_id,
-                depth,
-            });
-        }
-
-        // ── Advance cursor ───────────────────────────────────────────────────
-        if cursor.goto_first_child() {
-            // Descend: record the current depth so we can restore it on ascent.
-            level_stack.push(depth);
-            depth = depth.saturating_add(1);
-        } else {
-            // No children — try next sibling at same depth, or ascend.
-            loop {
-                if cursor.goto_next_sibling() {
-                    // Same level: depth and level_stack unchanged.
-                    break;
-                }
-                if level_stack.is_empty() {
-                    return result;
-                }
-                cursor.goto_parent();
-                depth = level_stack.pop().unwrap_or(0);
-            }
-        }
+    LinearizeResult {
+        nodes,
+        node_count: iter.node_count(),
+        error_count: iter.error_count(),
     }
 }
 
