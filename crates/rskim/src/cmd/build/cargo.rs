@@ -101,7 +101,7 @@ pub(crate) fn run_fmt(
     run_parsed_command(
         "cargo",
         &full_args,
-        &[],
+        &[("CARGO_TERM_COLOR", "never")],
         "install Rust from https://rustup.rs",
         show_stats,
         rec,
@@ -157,13 +157,20 @@ fn run_with_json_format(
 ///
 /// `cargo fmt` writes to combined stdout+stderr only when it encounters
 /// errors (e.g. `rustfmt` not installed, unformatted files in `--check` mode
-/// that bypass the ACK path). An empty combined output signals success.
+/// that bypass the ACK path).
+///
+/// When combined output is empty, the exit code determines success:
+/// `exit_code == Some(0)` → success; any other code (non-zero or signal-killed
+/// via `None`) → failure. This prevents a signal-killed or panicking `cargo fmt`
+/// from being reported as success just because it produced no output.
+///
 /// Any non-empty output is passed through unchanged.
 fn parse_fmt(output: &CommandOutput) -> ParseResult<BuildResult> {
     let combined = combine_output(output);
     let trimmed = combined.trim();
     if trimmed.is_empty() {
-        ParseResult::Full(BuildResult::new(true, 0, 0, None, vec![]))
+        let success = output.exit_code == Some(0);
+        ParseResult::Full(BuildResult::new(success, 0, 0, None, vec![]))
     } else {
         ParseResult::Passthrough(trimmed.to_string())
     }
@@ -193,6 +200,73 @@ fn parse(output: &CommandOutput) -> ParseResult<BuildResult> {
     ParseResult::Passthrough(combined)
 }
 
+/// Accumulated counts from a single `compiler-message` JSON event.
+struct CompilerMessageCounts {
+    errors: usize,
+    warnings: usize,
+    error_messages: Vec<String>,
+    warning_codes: BTreeMap<String, usize>,
+}
+
+/// Extract counts, formatted messages, and warning codes from a single
+/// `{"reason":"compiler-message",...}` JSON object.
+///
+/// Returns `None` when the `message` key is absent (malformed event).
+fn process_compiler_message(json: &serde_json::Value) -> Option<CompilerMessageCounts> {
+    let message = json.get("message")?;
+    let level = message.get("level").and_then(|v| v.as_str()).unwrap_or("");
+    let msg_text = message.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    let code = message
+        .get("code")
+        .and_then(|v| v.get("code"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Extract primary span location (file:line)
+    let location = message
+        .get("spans")
+        .and_then(|v| v.as_array())
+        .and_then(|spans| spans.first())
+        .map(|span| {
+            let file = span.get("file_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let line = span.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!("{file}:{line}")
+        })
+        .unwrap_or_default();
+
+    let mut counts = CompilerMessageCounts {
+        errors: 0,
+        warnings: 0,
+        error_messages: Vec::new(),
+        warning_codes: BTreeMap::new(),
+    };
+
+    match level {
+        "error" => {
+            counts.errors += 1;
+            let formatted = if !code.is_empty() && !location.is_empty() {
+                format!("error[{code}]: {msg_text} in {location}")
+            } else if !code.is_empty() {
+                format!("error[{code}]: {msg_text}")
+            } else if !location.is_empty() {
+                format!("error: {msg_text} in {location}")
+            } else {
+                format!("error: {msg_text}")
+            };
+            counts.error_messages.push(formatted);
+        }
+        "warning" => {
+            counts.warnings += 1;
+            if !code.is_empty() {
+                *counts.warning_codes.entry(code.to_string()).or_insert(0) += 1;
+            }
+        }
+        _ => {}
+    }
+
+    Some(counts)
+}
+
 /// Tier 1: Parse NDJSON lines from cargo's `--message-format=json` output.
 ///
 /// Looks for:
@@ -217,67 +291,20 @@ fn try_tier1_json(stdout: &str) -> Option<ParseResult<BuildResult>> {
             Err(_) => continue,
         };
 
-        let reason = json.get("reason").and_then(|v| v.as_str());
-
-        match reason {
+        match json.get("reason").and_then(|v| v.as_str()) {
             Some("compiler-message") => {
-                if let Some(message) = json.get("message") {
-                    let level = message.get("level").and_then(|v| v.as_str()).unwrap_or("");
-                    let msg_text = message
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let code = message
-                        .get("code")
-                        .and_then(|v| v.get("code"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-
-                    // Extract file and line from spans
-                    let location = message
-                        .get("spans")
-                        .and_then(|v| v.as_array())
-                        .and_then(|spans| spans.first())
-                        .map(|span| {
-                            let file = span
-                                .get("file_name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
-                            let line = span.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0);
-                            format!("{file}:{line}")
-                        })
-                        .unwrap_or_default();
-
-                    match level {
-                        "error" => {
-                            errors += 1;
-                            let formatted = if !code.is_empty() && !location.is_empty() {
-                                format!("error[{code}]: {msg_text} in {location}")
-                            } else if !code.is_empty() {
-                                format!("error[{code}]: {msg_text}")
-                            } else if !location.is_empty() {
-                                format!("error: {msg_text} in {location}")
-                            } else {
-                                format!("error: {msg_text}")
-                            };
-                            error_messages.push(formatted);
-                        }
-                        "warning" => {
-                            warnings += 1;
-                            if !code.is_empty() {
-                                *warning_codes.entry(code.to_string()).or_insert(0) += 1;
-                            }
-                        }
-                        _ => {}
+                if let Some(counts) = process_compiler_message(&json) {
+                    errors += counts.errors;
+                    warnings += counts.warnings;
+                    error_messages.extend(counts.error_messages);
+                    for (code, count) in counts.warning_codes {
+                        *warning_codes.entry(code).or_insert(0) += count;
                     }
                 }
             }
             Some("build-finished") => {
                 found_build_finished = true;
-                success = json
-                    .get("success")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                success = json.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
             }
             _ => {}
         }
@@ -293,16 +320,18 @@ fn try_tier1_json(stdout: &str) -> Option<ParseResult<BuildResult>> {
     // a successful clippy run they are silently carried but not displayed.
     // Acceptable for v1 — a dedicated `warning_messages` field can be added if
     // we need to render warnings on success in the future.
-    if !warning_codes.is_empty() {
-        for (code, count) in &warning_codes {
-            error_messages.push(format!("{code}: {count} occurrence(s)"));
-        }
+    for (code, count) in &warning_codes {
+        error_messages.push(format!("{code}: {count} occurrence(s)"));
     }
 
     let duration_ms = None; // Cargo doesn't report build duration in JSON
-    let result = BuildResult::new(success, warnings, errors, duration_ms, error_messages);
-
-    Some(ParseResult::Full(result))
+    Some(ParseResult::Full(BuildResult::new(
+        success,
+        warnings,
+        errors,
+        duration_ms,
+        error_messages,
+    )))
 }
 
 /// Tier 2: Regex-based fallback parsing on stderr.
@@ -541,6 +570,40 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_fmt_empty_output_nonzero_exit_is_failure() {
+        // A signal-killed or internally-panicking `cargo fmt` may exit non-zero
+        // with no output at all. This must be reported as failure, not success.
+        let output = make_output_full("", "", Some(1));
+        let result = parse_fmt(&output);
+        assert!(
+            result.is_full(),
+            "expected Full for empty output, got {:?}",
+            result.tier_name()
+        );
+        if let ParseResult::Full(build_result) = &result {
+            assert!(
+                !build_result.success,
+                "empty output + non-zero exit must be reported as failure"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_fmt_empty_output_signal_killed_is_failure() {
+        // exit_code == None means the process was killed by a signal (Unix).
+        // This must be reported as failure, not success.
+        let output = make_output_full("", "", None);
+        let result = parse_fmt(&output);
+        assert!(result.is_full(), "expected Full for empty output");
+        if let ParseResult::Full(build_result) = &result {
+            assert!(
+                !build_result.success,
+                "empty output + signal-killed (exit_code None) must be reported as failure"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_fmt_error_output_is_passthrough() {
         let stderr = "error: rustfmt not installed\n";
         let output = make_output_full("", stderr, Some(1));
@@ -569,15 +632,10 @@ mod tests {
             result.tier_name()
         );
         let content = result.content();
-        // Lines must appear as separate lines, not merged into "stdout linestderr line"
+        // Lines must be separated by a newline, not concatenated: "stdout linestderr line"
         assert!(
-            content.contains("stdout line\nstderr line")
-                || (content.contains("stdout line") && content.contains("stderr line")),
-            "stdout and stderr must both appear in combined output: {content:?}"
-        );
-        assert!(
-            !content.contains("stdout linestderr line"),
-            "stdout and stderr must be separated by a newline, not concatenated directly: {content:?}"
+            content.contains("stdout line\nstderr line"),
+            "stdout and stderr must be newline-separated in combined output: {content:?}"
         );
     }
 
