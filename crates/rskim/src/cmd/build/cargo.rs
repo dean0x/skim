@@ -1,15 +1,17 @@
-//! Cargo build/clippy output compression (#51)
+//! Cargo build/check/clippy/fmt output compression (#51)
 //!
-//! Three-tier parser for `cargo build` and `cargo clippy` NDJSON output:
+//! Handlers for four `cargo` subcommands:
 //!
-//! - **Tier 1 (JSON):** Parse `--message-format=json` NDJSON from stdout.
-//!   Track warnings/errors from `compiler-message` events, detect success
-//!   from `build-finished` event.
+//! - **`cargo build` / `cargo check` / `cargo clippy`:** Three-tier NDJSON parser.
+//!   - **Tier 1 (JSON):** Parse `--message-format=json` NDJSON from stdout.
+//!     Track warnings/errors from `compiler-message` events, detect success
+//!     from `build-finished` event.
+//!   - **Tier 2 (regex):** Fall back to regex matching on stderr for
+//!     `error[E\d+]` patterns when JSON parsing is unavailable.
+//!   - **Tier 3 (passthrough):** Return raw output when nothing can be parsed.
 //!
-//! - **Tier 2 (regex):** Fall back to regex matching on stderr for
-//!   `error[E\d+]` patterns when JSON parsing is unavailable.
-//!
-//! - **Tier 3 (passthrough):** Return raw output when nothing can be parsed.
+//! - **`cargo fmt`:** Passthrough-or-success parser. Empty combined output
+//!   signals success; any non-empty output is passed through unchanged.
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -18,7 +20,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::run_parsed_command;
-use crate::cmd::{inject_flag_before_separator, user_has_flag};
+use crate::cmd::{combine_output, inject_flag_before_separator, user_has_flag};
 use crate::output::ParseResult;
 use crate::output::canonical::BuildResult;
 use crate::runner::CommandOutput;
@@ -146,7 +148,7 @@ fn run_with_json_format(
 /// that bypass the ACK path). An empty combined output signals success.
 /// Any non-empty output is passed through unchanged.
 fn parse_fmt(output: &CommandOutput) -> ParseResult<BuildResult> {
-    let combined = format!("{}{}", output.stdout, output.stderr);
+    let combined = combine_output(output);
     let trimmed = combined.trim();
     if trimmed.is_empty() {
         ParseResult::Full(BuildResult::new(true, 0, 0, None, vec![]))
@@ -537,6 +539,34 @@ mod tests {
             result.tier_name()
         );
         assert!(result.content().contains("rustfmt not installed"));
+    }
+
+    #[test]
+    fn test_parse_fmt_stdout_and_stderr_separated_by_newline() {
+        // When both stdout and stderr have content, they must be joined with a
+        // newline separator so the last line of stdout and first line of stderr
+        // are not merged into a single line. Regression test for the
+        // format!("{}{}") → combine_output fix.
+        let stdout = "stdout line";
+        let stderr = "stderr line";
+        let output = make_output_full(stdout, stderr, Some(1));
+        let result = parse_fmt(&output);
+        assert!(
+            result.is_passthrough(),
+            "expected Passthrough for non-empty output, got {:?}",
+            result.tier_name()
+        );
+        let content = result.content();
+        // Lines must appear as separate lines, not merged into "stdout linestderr line"
+        assert!(
+            content.contains("stdout line\nstderr line")
+                || (content.contains("stdout line") && content.contains("stderr line")),
+            "stdout and stderr must both appear in combined output: {content:?}"
+        );
+        assert!(
+            !content.contains("stdout linestderr line"),
+            "stdout and stderr must be separated by a newline, not concatenated directly: {content:?}"
+        );
     }
 
     // ========================================================================
