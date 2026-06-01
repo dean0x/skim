@@ -291,8 +291,7 @@ fn vocab_len_nonzero_and_fits_in_u16() {
 
 #[test]
 fn bigram_idf_known_rust_entry_above_default() {
-    // First entry in RUST_AST_BIGRAM_WEIGHTS:
-    //   (0x009A0125, 11.251047) → "abstract_type"(154) -> "bounded_type"(293)
+    // First entry in RUST_AST_BIGRAM_WEIGHTS: "abstract_type" -> "bounded_type"
     let parent = vocab_lookup("abstract_type").expect("abstract_type in vocab");
     let child = vocab_lookup("bounded_type").expect("bounded_type in vocab");
     let bg = AstBigram::encode(parent, child);
@@ -300,6 +299,21 @@ fn bigram_idf_known_rust_entry_above_default() {
     assert!(
         w > DEFAULT_AST_WEIGHT,
         "known Rust bigram must have weight > DEFAULT_AST_WEIGHT ({DEFAULT_AST_WEIGHT}), got {w}"
+    );
+}
+
+// ── T9b: ast_bigram_idf returns weight > DEFAULT for known TypeScript bigram ───
+
+#[test]
+fn bigram_idf_known_typescript_entry_above_default() {
+    // First entry in TYPESCRIPT_AST_BIGRAM_WEIGHTS: "abstract_class_declaration" -> "abstract"
+    let parent = vocab_lookup("abstract_class_declaration").expect("abstract_class_declaration in vocab");
+    let child = vocab_lookup("abstract").expect("abstract in vocab");
+    let bg = AstBigram::encode(parent, child);
+    let w = ast_bigram_idf(Language::TypeScript, bg);
+    assert!(
+        w > DEFAULT_AST_WEIGHT,
+        "known TypeScript bigram must have weight > DEFAULT_AST_WEIGHT ({DEFAULT_AST_WEIGHT}), got {w}"
     );
 }
 
@@ -334,8 +348,7 @@ fn bigram_idf_non_treesitter_languages_return_default() {
 
 #[test]
 fn trigram_idf_known_rust_entry_above_default() {
-    // First entry in RUST_AST_TRIGRAM_WEIGHTS:
-    //   (0x0000009A01250035, 11.251047) → "abstract_type"(154) -> "bounded_type"(293) -> "+"(53)
+    // First entry in RUST_AST_TRIGRAM_WEIGHTS: "abstract_type" -> "bounded_type" -> "+"
     let gp = vocab_lookup("abstract_type").expect("abstract_type in vocab");
     let parent = vocab_lookup("bounded_type").expect("bounded_type in vocab");
     let child = vocab_lookup("+").expect("'+' in vocab");
@@ -392,7 +405,44 @@ fn bigram_from_raw_consistent_with_encode() {
     assert_eq!(AstBigram::from_raw(bg.key()), bg);
 }
 
-// ── T14: DEFAULT_AST_WEIGHT constant value ────────────────────────────────────
+// ── T14: Ordering semantics ───────────────────────────────────────────────────
+
+/// Bigrams are parent-major: a higher parent always sorts after a lower parent,
+/// regardless of the child component.
+#[test]
+fn bigram_ordering_is_parent_major() {
+    let low_parent = AstBigram::encode(1, u16::MAX); // parent=1, child=MAX
+    let high_parent = AstBigram::encode(2, 0); // parent=2, child=0
+    assert!(
+        high_parent > low_parent,
+        "bigrams must sort parent-major: encode(2,0) > encode(1, MAX)"
+    );
+}
+
+/// Trigrams are grandparent-major: a higher grandparent always sorts last,
+/// then parent, then child.
+#[test]
+fn trigram_ordering_is_grandparent_major() {
+    let low_gp = AstTrigram::encode(1, u16::MAX, u16::MAX); // gp=1, rest=MAX
+    let high_gp = AstTrigram::encode(2, 0, 0); // gp=2, rest=0
+    assert!(
+        high_gp > low_gp,
+        "trigrams must sort grandparent-major: encode(2,0,0) > encode(1,MAX,MAX)"
+    );
+}
+
+/// Within the same parent, bigrams sort by child.
+#[test]
+fn bigram_ordering_child_tiebreak() {
+    let small_child = AstBigram::encode(5, 1);
+    let large_child = AstBigram::encode(5, 100);
+    assert!(
+        large_child > small_child,
+        "bigrams with equal parent must sort by child"
+    );
+}
+
+// ── T16: DEFAULT_AST_WEIGHT constant value ────────────────────────────────────
 
 #[test]
 fn default_ast_weight_is_one() {

@@ -41,7 +41,7 @@ pub type NodeKindId = u16;
 /// Default IDF weight returned when a bigram or trigram is not found in any
 /// per-language weight table.
 ///
-/// Matches [`crate::weights::DEFAULT_WEIGHT`] so that AST and lexical signals
+/// Matches the lexical `DEFAULT_WEIGHT` so that AST and lexical signals
 /// are on the same scale.
 pub const DEFAULT_AST_WEIGHT: f32 = 1.0;
 
@@ -58,7 +58,7 @@ pub const DEFAULT_AST_WEIGHT: f32 = 1.0;
 /// transformation.
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AstBigram(u32);
+pub struct AstBigram(pub(crate) u32);
 
 impl AstBigram {
     /// Encode a parent–child node-kind pair into an [`AstBigram`].
@@ -121,7 +121,7 @@ impl fmt::Display for AstBigram {
 /// The encoding matches [`crate::ast_weights::ast_trigram_weight`].
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AstTrigram(u64);
+pub struct AstTrigram(pub(crate) u64);
 
 impl AstTrigram {
     /// Encode a grandparent–parent–child node-kind triple into an [`AstTrigram`].
@@ -190,7 +190,7 @@ pub fn vocab_lookup(kind: &str) -> Option<NodeKindId> {
     NODE_KIND_VOCABULARY
         .binary_search(&kind)
         .ok()
-        .map(|idx| idx as NodeKindId)
+        .and_then(|idx| u16::try_from(idx).ok())
 }
 
 /// Resolve a [`NodeKindId`] back to its kind string.
