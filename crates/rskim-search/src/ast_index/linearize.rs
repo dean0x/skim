@@ -149,11 +149,18 @@ static LANG_MAPS: LazyLock<HashMap<Language, Vec<Option<u16>>>> = LazyLock::new(
         // For each kind_id, binary-search NODE_KIND_VOCABULARY for the kind
         // string to get its vocabulary index.
         let mut lang_map: Vec<Option<u16>> = vec![None; kind_count];
-        for (kind_id, entry) in lang_map.iter_mut().enumerate().take(kind_count) {
-            if let Some(kind_str) = ts_lang.node_kind_for_id(kind_id as u16) {
+        for (kind_id, entry) in lang_map.iter_mut().enumerate() {
+            // node_kind_for_id takes u16; skip any kind_id that would overflow.
+            // Current grammars have 200–500 kinds, so this path is unreachable
+            // in practice, but the pattern is safe for future grammar growth.
+            let kind_id_u16 = match u16::try_from(kind_id) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            if let Some(kind_str) = ts_lang.node_kind_for_id(kind_id_u16) {
                 // Binary search NODE_KIND_VOCABULARY (which is sorted).
+                // NODE_KIND_VOCABULARY.len() == 1740, well within u16::MAX.
                 if let Ok(vocab_idx) = NODE_KIND_VOCABULARY.binary_search(&kind_str) {
-                    // Safety: NODE_KIND_VOCABULARY.len() <= u16::MAX (1740 entries)
                     *entry = Some(vocab_idx as u16);
                 }
                 // Unknown kinds remain None; they emit sentinel ID 0 at traversal time.
@@ -177,12 +184,12 @@ static LANG_MAPS: LazyLock<HashMap<Language, Vec<Option<u16>>>> = LazyLock::new(
 /// - Non-tree-sitter languages (JSON, YAML, TOML)
 /// - Parse failures (tree-sitter is error-tolerant, so this is rare)
 ///
-/// Returns `Err(SearchError::AstError)` only when the grammar itself fails to
+/// Returns `Err(SearchError::Ast)` only when the grammar itself fails to
 /// load — a configuration-level failure, not a file-level parse failure.
 ///
 /// # Errors
 ///
-/// Returns `Err(SearchError::AstError)` if the tree-sitter grammar for
+/// Returns `Err(SearchError::Ast)` if the tree-sitter grammar for
 /// `language` fails to load (grammar crate not compiled in, ABI mismatch,
 /// etc.). This is distinct from a parse error, which produces an empty result.
 #[must_use = "linearize_source returns a Result that must be checked"]
@@ -204,7 +211,7 @@ pub fn linearize_source(
     // Parse. Parser::new failures for non-TS languages are already handled
     // above via LANG_MAPS lookup. A failure here means grammar load error.
     let mut parser = Parser::new(language)
-        .map_err(|e| SearchError::AstError(format!("grammar load failure for {language:?}: {e}")))?;
+        .map_err(|e| SearchError::Ast(format!("grammar load failure for {language:?}: {e}")))?;
 
     // Parse errors produce empty results (tree-sitter is error-tolerant, so
     // parse() only returns Err on internal grammar failures, which are rare).
@@ -213,7 +220,7 @@ pub fn linearize_source(
         Err(_) => return Ok(LinearizeResult::default()),
     };
 
-    linearize_tree(&tree, lang_map)
+    Ok(linearize_tree(&tree, lang_map))
 }
 
 // ============================================================================
@@ -229,10 +236,7 @@ pub fn linearize_source(
 /// # Invariant maintained
 ///
 /// `result.node_count == result.nodes.len() + result.error_count`
-fn linearize_tree(
-    tree: &tree_sitter::Tree,
-    lang_map: &[Option<u16>],
-) -> crate::types::Result<LinearizeResult> {
+fn linearize_tree(tree: &tree_sitter::Tree, lang_map: &[Option<u16>]) -> LinearizeResult {
     let root = tree.root_node();
     let capacity = root.descendant_count().min(MAX_AST_NODES as usize);
 
@@ -258,7 +262,7 @@ fn linearize_tree(
                     break;
                 }
                 if level_stack.is_empty() {
-                    return Ok(result);
+                    return result;
                 }
                 cursor.goto_parent();
                 depth = level_stack.pop().unwrap_or(0);
@@ -270,9 +274,7 @@ fn linearize_tree(
         let node = cursor.node();
         result.node_count += 1;
 
-        let is_error = node.is_error() || node.is_missing();
-
-        if is_error {
+        if node.is_error() || node.is_missing() {
             result.error_count += 1;
             // ERROR/MISSING nodes are not emitted but their children may be
             // visited so we count all nodes in the subtree.
@@ -305,7 +307,7 @@ fn linearize_tree(
                     break;
                 }
                 if level_stack.is_empty() {
-                    return Ok(result);
+                    return result;
                 }
                 cursor.goto_parent();
                 depth = level_stack.pop().unwrap_or(0);

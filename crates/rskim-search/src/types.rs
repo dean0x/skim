@@ -621,7 +621,7 @@ pub enum SearchError {
     /// this variant signals that the language grammar itself failed to load,
     /// which is an unrecoverable configuration problem, not a file-level error.
     #[error("AST error: {0}")]
-    AstError(String),
+    Ast(String),
 }
 
 /// Result type alias for all rskim-search operations.
