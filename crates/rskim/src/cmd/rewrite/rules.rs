@@ -1,7 +1,7 @@
 //! Declarative rewrite rule table.
 //!
-//! 153 rules grouped into 8 category arrays: TEST (18), BUILD (13), GIT (7),
-//! LINT (43), PKG (25), INFRA (28), FILE_OPS (16), DB (3).
+//! 154 rules grouped into 8 category arrays: TEST (18), BUILD (13), GIT (7),
+//! LINT (43), PKG (26), INFRA (28), FILE_OPS (16), DB (3).
 //! Only `engine.rs` consumes `all_rules()`.
 //!
 //! v2.8.0: Flat dispatch — `rewrite_to` uses tool names directly
@@ -969,7 +969,7 @@ const LINT_RULES: &[RewriteRule] = &[
 ];
 
 // ============================================================================
-// PKG rules (25)
+// PKG rules (26)
 // ============================================================================
 
 const PKG_RULES: &[RewriteRule] = &[
@@ -987,6 +987,16 @@ const PKG_RULES: &[RewriteRule] = &[
     // npm (canonical + aliases)
     RewriteRule {
         prefix: &["npm", "run"],
+        rewrite_to: &["skim", "npm", "run"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["npm", "run-script"],
         rewrite_to: &["skim", "npm", "run"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Pkg,
@@ -1927,8 +1937,8 @@ mod tests {
     use super::*;
 
     /// Expected rule count — update this constant together with the category arrays.
-    /// TEST(18) + BUILD(13) + GIT(7) + LINT(43) + PKG(25) + INFRA(28) + FILE_OPS(16) + DB(3)
-    const EXPECTED_RULE_COUNT: usize = 18 + 13 + 7 + 43 + 25 + 28 + 16 + 3;
+    /// TEST(18) + BUILD(13) + GIT(7) + LINT(43) + PKG(26) + INFRA(28) + FILE_OPS(16) + DB(3)
+    const EXPECTED_RULE_COUNT: usize = 18 + 13 + 7 + 43 + 26 + 28 + 16 + 3;
 
     #[test]
     fn test_rule_count_matches_expected() {

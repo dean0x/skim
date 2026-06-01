@@ -2168,3 +2168,13 @@ fn test_rewrite_npm_run_colon_preserved() {
         .success()
         .stdout(predicate::str::contains("skim npm run build:prod"));
 }
+
+#[test]
+fn test_rewrite_npm_run_script_alias() {
+    // `npm run-script` is an alias for `npm run` — must rewrite to same target
+    skim_cmd()
+        .args(["rewrite", "npm", "run-script", "lint"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim npm run lint"));
+}
