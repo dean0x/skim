@@ -230,7 +230,7 @@ fn no_node_has_depth_at_or_above_max_ast_depth() {
     );
     for node in &result.nodes {
         assert!(
-            node.depth < MAX_AST_DEPTH,
+            u32::from(node.depth) < MAX_AST_DEPTH,
             "node depth {} must be < MAX_AST_DEPTH {}",
             node.depth,
             MAX_AST_DEPTH
@@ -425,7 +425,7 @@ fn binary_like_input_returns_ok_default() {
 
 #[test]
 #[cfg(not(debug_assertions))]
-fn linearize_1000_line_file_under_5ms() {
+fn linearize_1000_line_file_under_10ms() {
     use std::time::Instant;
 
     // Generate a ~1000-line Rust file (well under MAX_FILE_SIZE).

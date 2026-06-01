@@ -33,11 +33,14 @@ use crate::types::SearchError;
 // Constants
 // ============================================================================
 
-// Traversal bounds are centralized on `AstWalkConfig` as associated constants
-// (`DEFAULT_MAX_DEPTH` = 500, `DEFAULT_MAX_NODES` = 100 000).  Reference them
-// via `AstWalkConfig::DEFAULT_MAX_DEPTH` / `AstWalkConfig::DEFAULT_MAX_NODES`
-// wherever a local override is needed, or use `AstWalkConfig::default()` to
-// pick up both at once.
+/// Maximum AST traversal depth. Re-exported from `AstWalkConfig::DEFAULT_MAX_DEPTH`
+/// so test code can import it directly from this module.
+pub const MAX_AST_DEPTH: u32 = AstWalkConfig::DEFAULT_MAX_DEPTH;
+
+/// Maximum AST nodes yielded per traversal. Re-exported from
+/// `AstWalkConfig::DEFAULT_MAX_NODES` so test code can import it directly from
+/// this module.
+pub const MAX_AST_NODES: u32 = AstWalkConfig::DEFAULT_MAX_NODES;
 
 /// Maximum source file size accepted for linearization (100 KiB).
 ///
@@ -187,6 +190,7 @@ static LANG_MAPS: LazyLock<HashMap<Language, Vec<Option<u16>>>> = LazyLock::new(
 /// Returns `Err(SearchError::Ast)` if the tree-sitter grammar for
 /// `language` fails to load (grammar crate not compiled in, ABI mismatch,
 /// etc.). This is distinct from a parse error, which produces an empty result.
+#[must_use]
 pub fn linearize_source(
     source: &str,
     language: Language,
