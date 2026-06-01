@@ -215,7 +215,10 @@ struct CompilerMessageCounts {
 fn process_compiler_message(json: &serde_json::Value) -> Option<CompilerMessageCounts> {
     let message = json.get("message")?;
     let level = message.get("level").and_then(|v| v.as_str()).unwrap_or("");
-    let msg_text = message.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    let msg_text = message
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let code = message
         .get("code")
         .and_then(|v| v.get("code"))
@@ -228,7 +231,10 @@ fn process_compiler_message(json: &serde_json::Value) -> Option<CompilerMessageC
         .and_then(|v| v.as_array())
         .and_then(|spans| spans.first())
         .map(|span| {
-            let file = span.get("file_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let file = span
+                .get("file_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             let line = span.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0);
             format!("{file}:{line}")
         })
@@ -304,7 +310,10 @@ fn try_tier1_json(stdout: &str) -> Option<ParseResult<BuildResult>> {
             }
             Some("build-finished") => {
                 found_build_finished = true;
-                success = json.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                success = json
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
             }
             _ => {}
         }
