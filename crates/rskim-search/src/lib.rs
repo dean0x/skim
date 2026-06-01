@@ -32,7 +32,10 @@ pub mod temporal;
 mod types;
 pub mod weights;
 
-pub use ast_index::{LinearNode, LinearizeResult, linearize_source};
+pub use ast_index::{
+    AstBigram, AstTrigram, DEFAULT_AST_WEIGHT, LinearNode, LinearizeResult, NodeKindId,
+    ast_bigram_idf, ast_trigram_idf, linearize_source, vocab_len, vocab_lookup, vocab_resolve,
+};
 pub use cochange::{CochangeMatrixBuilder, CochangeMatrixReader};
 pub use index::{NgramIndexBuilder, NgramIndexReader};
 pub use lexical::{

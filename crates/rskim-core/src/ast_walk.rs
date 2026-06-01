@@ -398,11 +398,7 @@ mod tests {
 
         // No item should have depth >= max_depth.
         for item in &items {
-            assert!(
-                item.depth < 3,
-                "depth {} >= max_depth 3",
-                item.depth
-            );
+            assert!(item.depth < 3, "depth {} >= max_depth 3", item.depth);
         }
     }
 

@@ -200,10 +200,7 @@ static LANG_MAPS: LazyLock<HashMap<Language, Vec<Option<u16>>>> = LazyLock::new(
 /// Returns `Err(SearchError::Ast)` if the tree-sitter grammar for
 /// `language` fails to load (grammar crate not compiled in, ABI mismatch,
 /// etc.). This is distinct from a parse error, which produces an empty result.
-pub fn linearize_source(
-    source: &str,
-    language: Language,
-) -> crate::types::Result<LinearizeResult> {
+pub fn linearize_source(source: &str, language: Language) -> crate::types::Result<LinearizeResult> {
     // Guard 1: oversized files return empty result (not an error).
     // SQL migrations/schema dumps can exceed 100 KiB, so SQL uses a larger
     // limit (1 MiB) consistent with rskim-research/src/ast_extract.rs.
@@ -270,7 +267,10 @@ fn linearize_tree(tree: &tree_sitter::Tree, lang_map: &[Option<u16>]) -> Lineari
         // saturating_cast is the correct pattern for converting u32 → u16.
         #[allow(clippy::cast_possible_truncation)]
         let depth = item.depth.min(u32::from(u16::MAX)) as u16;
-        nodes.push(LinearNode { kind_id: vocab_id, depth });
+        nodes.push(LinearNode {
+            kind_id: vocab_id,
+            depth,
+        });
     }
 
     LinearizeResult {

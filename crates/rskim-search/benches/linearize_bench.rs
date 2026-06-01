@@ -38,16 +38,19 @@ const RUST_FIXTURE: &str = include_str!("../../../tests/fixtures/rust/simple.rs"
 const TS_FIXTURE: &str = include_str!("../../../tests/fixtures/typescript/simple.ts");
 const PY_FIXTURE: &str = include_str!("../../../tests/fixtures/python/simple.py");
 const GO_FIXTURE: &str = "package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"hello\") }\n";
-const JAVA_FIXTURE: &str = "public class Foo { public static void main(String[] args) { System.out.println(\"hi\"); } }";
+const JAVA_FIXTURE: &str =
+    "public class Foo { public static void main(String[] args) { System.out.println(\"hi\"); } }";
 const C_FIXTURE: &str = "#include <stdio.h>\nint main() { printf(\"hi\"); return 0; }\n";
 const CPP_FIXTURE: &str = "#include <iostream>\nint main() { std::cout << \"hi\"; return 0; }\n";
 const JS_FIXTURE: &str = "function foo(x) { return x + 1; }\nconst bar = (y) => y * 2;\n";
-const CS_FIXTURE: &str = "using System;\nclass Foo { static void Main() { Console.WriteLine(\"hi\"); } }\n";
+const CS_FIXTURE: &str =
+    "using System;\nclass Foo { static void Main() { Console.WriteLine(\"hi\"); } }\n";
 const RUBY_FIXTURE: &str = "def greet(name)\n  puts \"Hello, #{name}\"\nend\n";
 const SQL_FIXTURE: &str = "SELECT id, name FROM users WHERE active = 1 ORDER BY name;\n";
 const KOTLIN_FIXTURE: &str = "fun greet(name: String): String = \"Hello, $name\"\n";
 const SWIFT_FIXTURE: &str = "func greet(name: String) -> String { return \"Hello, \\(name)\" }\n";
-const MD_FIXTURE: &str = "# Hello\n\nThis is a **paragraph** with `code`.\n\n## Section\n\nMore text.\n";
+const MD_FIXTURE: &str =
+    "# Hello\n\nThis is a **paragraph** with `code`.\n\n## Section\n\nMore text.\n";
 
 // ============================================================================
 // Group 1: Per-language linearization
@@ -92,13 +95,9 @@ fn bench_linearize_scaling(c: &mut Criterion) {
     for &n_fns in &[10usize, 50, 100, 500, 1000] {
         let source = gen_rust_fns(n_fns);
         // Benchmarks end-to-end linearize_source, including parsing overhead.
-        group.bench_with_input(
-            BenchmarkId::new("rust_fns", n_fns),
-            &source,
-            |b, src| {
-                b.iter(|| linearize_source(black_box(src.as_str()), black_box(Language::Rust)).unwrap())
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("rust_fns", n_fns), &source, |b, src| {
+            b.iter(|| linearize_source(black_box(src.as_str()), black_box(Language::Rust)).unwrap())
+        });
     }
 
     group.finish();
@@ -117,7 +116,9 @@ fn bench_linearize_depth(c: &mut Criterion) {
             BenchmarkId::new("rust_nested_depth", depth),
             &source,
             |b, src| {
-                b.iter(|| linearize_source(black_box(src.as_str()), black_box(Language::Rust)).unwrap())
+                b.iter(|| {
+                    linearize_source(black_box(src.as_str()), black_box(Language::Rust)).unwrap()
+                })
             },
         );
     }

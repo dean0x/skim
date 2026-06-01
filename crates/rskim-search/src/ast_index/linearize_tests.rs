@@ -40,7 +40,8 @@ fn resolve_kinds(result: &LinearizeResult) -> Vec<&'static str> {
 fn assert_node_count_invariant(result: &LinearizeResult) {
     let expected = result.nodes.len() as u32 + result.error_count;
     assert_eq!(
-        result.node_count, expected,
+        result.node_count,
+        expected,
         "invariant violated: node_count ({}) != nodes.len() ({}) + error_count ({})",
         result.node_count,
         result.nodes.len(),
@@ -52,7 +53,10 @@ fn assert_node_count_invariant(result: &LinearizeResult) {
 
 #[test]
 fn linear_node_is_copy() {
-    let n = LinearNode { kind_id: 42, depth: 3 };
+    let n = LinearNode {
+        kind_id: 42,
+        depth: 3,
+    };
     let copy = n;
     assert_eq!(copy.kind_id, 42);
     assert_eq!(copy.depth, 3);
@@ -83,7 +87,10 @@ fn vocabulary_is_non_empty_and_indexable_by_u16() {
     // kind_id (stored as u16) is a valid index. Exact size is an
     // implementation detail of the generated ast_weights.rs; testing it
     // causes breakage on every vocabulary regeneration.
-    assert!(!NODE_KIND_VOCABULARY.is_empty(), "NODE_KIND_VOCABULARY must not be empty");
+    assert!(
+        !NODE_KIND_VOCABULARY.is_empty(),
+        "NODE_KIND_VOCABULARY must not be empty"
+    );
     assert!(
         NODE_KIND_VOCABULARY.len() <= u16::MAX as usize,
         "vocabulary length {} exceeds u16::MAX — kind_id would overflow",
@@ -94,20 +101,36 @@ fn vocabulary_is_non_empty_and_indexable_by_u16() {
 #[test]
 fn rust_lang_map_contains_known_kinds() {
     let maps = &*LANG_MAPS;
-    let rust_map = maps.get(&Language::Rust).expect("Rust must have a lang map");
+    let rust_map = maps
+        .get(&Language::Rust)
+        .expect("Rust must have a lang map");
     // "function_item" is a core Rust grammar node — must be in the map.
     let found = rust_map.iter().any(|entry| {
-        entry.map(|idx| NODE_KIND_VOCABULARY[idx as usize] == "function_item").unwrap_or(false)
+        entry
+            .map(|idx| NODE_KIND_VOCABULARY[idx as usize] == "function_item")
+            .unwrap_or(false)
     });
-    assert!(found, "Rust lang map must map some kind_id to 'function_item'");
+    assert!(
+        found,
+        "Rust lang map must map some kind_id to 'function_item'"
+    );
 }
 
 #[test]
 fn serde_only_languages_not_in_lang_maps() {
     let maps = &*LANG_MAPS;
-    assert!(!maps.contains_key(&Language::Json), "JSON must not have a lang map");
-    assert!(!maps.contains_key(&Language::Yaml), "YAML must not have a lang map");
-    assert!(!maps.contains_key(&Language::Toml), "TOML must not have a lang map");
+    assert!(
+        !maps.contains_key(&Language::Json),
+        "JSON must not have a lang map"
+    );
+    assert!(
+        !maps.contains_key(&Language::Yaml),
+        "YAML must not have a lang map"
+    );
+    assert!(
+        !maps.contains_key(&Language::Toml),
+        "TOML must not have a lang map"
+    );
 }
 
 #[test]
@@ -139,7 +162,10 @@ fn empty_source_produces_root_only() {
 #[test]
 fn simple_fn_produces_multiple_nodes() {
     let result = parse_and_linearize("fn main() {}", Language::Rust);
-    assert!(result.nodes.len() > 1, "simple fn must produce more than one node");
+    assert!(
+        result.nodes.len() > 1,
+        "simple fn must produce more than one node"
+    );
     assert_node_count_invariant(&result);
 }
 
@@ -148,8 +174,7 @@ fn pre_order_root_comes_first() {
     let result = parse_and_linearize("fn main() {}", Language::Rust);
     // Root node is at depth 0 and must be the very first node.
     assert_eq!(
-        result.nodes[0].depth,
-        0,
+        result.nodes[0].depth, 0,
         "first node must be the root at depth 0"
     );
 }
@@ -275,9 +300,18 @@ fn oversized_file_returns_default() {
     // File larger than MAX_FILE_SIZE should return empty default result.
     let big = "fn x() {}\n".repeat(MAX_FILE_SIZE / 10 + 1);
     let result = parse_and_linearize(&big, Language::Rust);
-    assert!(result.nodes.is_empty(), "oversized file must return empty nodes");
-    assert_eq!(result.node_count, 0, "oversized file must return node_count 0");
-    assert_eq!(result.error_count, 0, "oversized file must return error_count 0");
+    assert!(
+        result.nodes.is_empty(),
+        "oversized file must return empty nodes"
+    );
+    assert_eq!(
+        result.node_count, 0,
+        "oversized file must return node_count 0"
+    );
+    assert_eq!(
+        result.error_count, 0,
+        "oversized file must return error_count 0"
+    );
 }
 
 // ── Cycle 6: Multi-language ───────────────────────────────────────────────────
@@ -400,7 +434,9 @@ fn unknown_kind_emits_sentinel_zero() {
     // We verify this contract without relying on parse output accidentally containing
     // kind_id == 0 (which would make the test vacuously pass if no such node exists).
     let maps = &*LANG_MAPS;
-    let rust_map = maps.get(&Language::Rust).expect("Rust must have a lang map");
+    let rust_map = maps
+        .get(&Language::Rust)
+        .expect("Rust must have a lang map");
 
     // Any index beyond the map length is out of bounds; grammars have 200–500 kinds.
     let out_of_bounds = rust_map.len();
