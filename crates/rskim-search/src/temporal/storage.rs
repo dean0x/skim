@@ -246,11 +246,11 @@ impl TemporalDb {
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "storage_tests.rs"]
 mod tests;
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "storage_perf_tests.rs"]
 mod perf_tests;

@@ -620,7 +620,7 @@ pub(crate) fn extract_markdown_headers_with_spans(
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in tests
 mod offset_map_tests {
     use super::compute_source_line_map_from_offset_map;
 
@@ -917,7 +917,7 @@ mod offset_map_tests {
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in tests
 mod markdown_line_map_tests {
     use super::extract_markdown_headers_with_spans;
     use crate::{Language, Parser};

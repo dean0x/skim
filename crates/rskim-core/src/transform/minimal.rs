@@ -403,7 +403,7 @@ pub(crate) fn trim_and_normalize(source: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in tests
 mod tests {
     use super::*;
 

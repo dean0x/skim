@@ -3,17 +3,25 @@
 //! # Architecture
 //!
 //! - Core types (`types` module) are **pure**: no I/O, no side effects.
+//! - The `ast_index` module linearises source files into pre-order AST node
+//!   sequences and exposes the `linearize_source` entry point used by indexing.
+//! - The `ast_weights` module maps AST node kinds to IDF-style weights derived
+//!   from the node-frequency research corpus.
 //! - The `index` module provides on-disk persistence via memory-mapped files.
+//! - The `lexical` module implements BM25F scoring over per-field n-gram indexes.
 //! - The `ngram` module handles bigram extraction (pure, no I/O).
 //! - The `temporal` module parses git history via gix and computes risk scoring
 //!   (hotspot, bug-fix density) with exponential decay. The `temporal::storage`
 //!   sub-module persists temporal data to SQLite with WAL mode.
 //! - The `cochange` module builds and queries a binary co-change matrix with
 //!   Jaccard similarity from git history.
+//! - The `weights` module provides composite n-gram weight tables combining
+//!   AST and lexical signals.
 //! - Returns Result types throughout — no panics in non-test code.
 //!
 //! CLI/binary code in `crates/rskim/src/cmd/search/mod.rs` handles user-facing I/O.
 
+pub mod ast_index;
 pub mod ast_weights;
 pub mod cochange;
 pub(crate) mod fields;
@@ -24,6 +32,7 @@ pub mod temporal;
 mod types;
 pub mod weights;
 
+pub use ast_index::{LinearNode, LinearizeResult, linearize_source};
 pub use cochange::{CochangeMatrixBuilder, CochangeMatrixReader};
 pub use index::{NgramIndexBuilder, NgramIndexReader};
 pub use lexical::{

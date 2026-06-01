@@ -416,7 +416,7 @@ pub fn default_ast_weights_json_path() -> anyhow::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::collections::HashMap;
 

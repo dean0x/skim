@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rskim_core::{Language, Parser};
+use rskim_core::{AstWalkConfig, AstWalkIter, Language, Parser};
 
 use crate::ast_types::{
     AstBigram, AstCorpusStats, AstLanguageStats, AstTrigram, NodeKindId, NodeKindVocabulary,
@@ -16,12 +16,11 @@ use crate::ast_types::{
 use crate::extract::content_hash;
 use crate::types::SourceFile;
 
-/// Maximum AST traversal depth to prevent stack-overflow-equivalent run-away on
-/// pathological inputs.
-const MAX_AST_DEPTH: usize = 500;
-
-/// Maximum number of AST nodes visited per file.
-const MAX_AST_NODES: u32 = 100_000;
+// Traversal bounds are centralized on `AstWalkConfig` as associated constants
+// (`DEFAULT_MAX_DEPTH` = 500, `DEFAULT_MAX_NODES` = 100 000).  Reference them
+// via `AstWalkConfig::DEFAULT_MAX_DEPTH` / `AstWalkConfig::DEFAULT_MAX_NODES`
+// wherever a local override is needed, or use `AstWalkConfig::default()` to
+// pick up both at once.
 
 /// Maximum source file size accepted for AST extraction (100 KiB default).
 const MAX_FILE_SIZE: usize = 100 * 1024;
@@ -95,157 +94,102 @@ pub fn extract_ast_ngrams_from_file(
     };
 
     let mut result = AstFileResult::default();
-    let mut cursor = tree.walk();
-    let mut ctx = WalkContext {
-        vocab,
-        bigrams: &mut result.bigrams,
-        trigrams: &mut result.trigrams,
-        collect_trigrams,
-        error_count: &mut result.error_node_count,
-        node_count: &mut result.node_count,
-    };
 
-    walk_tree(&mut cursor, &mut ctx);
+    walk_tree(&tree, vocab, collect_trigrams, &mut result);
 
     Ok(result)
 }
 
-/// Mutable traversal state threaded through the iterative `walk_tree` calls.
+/// Iterative pre-order tree walk using `AstWalkIter` with ancestor tracking.
 ///
-/// Bundles the vocabulary, output sets, counters, and configuration so that
-/// `walk_tree` takes only two parameters instead of ten.
-struct WalkContext<'a> {
-    /// Shared vocabulary mapping node-kind strings to compact IDs.
-    vocab: &'a mut NodeKindVocabulary,
-    /// Unique parent→child bigrams collected so far for this file.
-    bigrams: &'a mut HashSet<AstBigram>,
-    /// Unique grandparent→parent→child trigrams collected so far for this file.
-    trigrams: &'a mut HashSet<AstTrigram>,
-    /// Whether to collect trigrams at all.
-    collect_trigrams: bool,
-    /// Running count of ERROR nodes (parse failures).
-    error_count: &'a mut u32,
-    /// Running count of all AST nodes visited.
-    node_count: &'a mut u32,
-}
-
-/// Iterative pre-order tree walk using `TreeCursor` with bounded depth and
-/// node-count guards.
+/// Replaces the previous hand-rolled `TreeCursor` loop. `AstWalkIter` handles
+/// all cursor management, depth tracking, and bounds guarding. This function
+/// adds the caller-specific logic: vocabulary lookup, bigram/trigram emission,
+/// and depth-indexed ancestor context.
 ///
-/// Replaces the previous recursive implementation to eliminate call-stack
-/// growth on pathological inputs. Uses a manual stack of
-/// `(depth, parent_id, grandparent_id)` entries — one per level — to track
-/// the same ancestor context that the recursive version carried in activation
-/// frames.
+/// Ancestor context is maintained in a `Vec<Option<NodeKindId>>` indexed by
+/// traversal depth. `ancestors[d]` is the `NodeKindId` of the node at depth
+/// `d`, or `None` if that node was an ERROR/MISSING node (which breaks the
+/// bigram/trigram chain for its children).
 ///
-/// `MAX_AST_DEPTH` (500) caps how deep we descend; `MAX_AST_NODES` (100 K)
-/// caps total nodes visited per file.
-///
-/// ERROR nodes are counted but not included in bigram/trigram pairs (they
-/// represent parse failures, not real grammar relationships). Children of
-/// ERROR nodes are still visited so we count all error nodes in the subtree.
+/// `AstWalkConfig::DEFAULT_MAX_DEPTH` (500) and `AstWalkConfig::DEFAULT_MAX_NODES`
+/// (100 K) are passed through to `AstWalkIter` as bounds guards.
+/// `MAX_TRIGRAMS_PER_FILE` stays here as a caller-level cap on output size.
 ///
 /// The trigram emission guard uses two nested `if` blocks intentionally: the
 /// outer guard on `collect_trigrams` and the trigram-cap avoids constructing
 /// the Option tuple when unnecessary; `clippy::collapsible_if` would merge
-/// them into an if-let chain that still allocates the tuple unconditionally.
-fn walk_tree(cursor: &mut tree_sitter::TreeCursor, ctx: &mut WalkContext<'_>) {
-    // Stack of (depth, parent_id, grandparent_id) for the current cursor
-    // position.  Each entry is pushed when we descend into a child level and
-    // popped when we return to the parent.
-    let mut level_stack: Vec<(usize, Option<NodeKindId>, Option<NodeKindId>)> = Vec::new();
+/// them into an if-let chain that still constructs the Option tuple
+/// unconditionally.
+fn walk_tree(
+    tree: &tree_sitter::Tree,
+    vocab: &mut NodeKindVocabulary,
+    collect_trigrams: bool,
+    result: &mut AstFileResult,
+) {
+    // Depth-indexed ancestor table. `ancestors[d]` holds the NodeKindId of the
+    // node at depth `d`, or `None` for ERROR/MISSING nodes.
+    //
+    // Start with a small initial capacity (64) and grow on demand. Typical trees
+    // rarely exceed depth 20-30, so pre-allocating DEFAULT_MAX_DEPTH + 1 (501)
+    // entries wastes ~4 KiB per file in corpus extraction. The Vec grows only
+    // when a node's depth exceeds the current length.
+    let mut ancestors: Vec<Option<NodeKindId>> = vec![None; 64];
 
-    // Start at depth 0 with no parent or grandparent.
-    let mut depth: usize = 0;
-    let mut parent_id: Option<NodeKindId> = None;
-    let mut grandparent_id: Option<NodeKindId> = None;
+    let mut iter = AstWalkIter::new(tree.walk(), AstWalkConfig::default());
 
-    loop {
-        // ── Guard: depth and node-count caps ──────────────────────────────
-        if depth >= MAX_AST_DEPTH || *ctx.node_count >= MAX_AST_NODES {
-            // Skip this node and its subtree.  Move to the next sibling or
-            // ascend until we find one.
-            loop {
-                if cursor.goto_next_sibling() {
-                    break;
-                }
-                if level_stack.is_empty() {
-                    return;
-                }
-                cursor.goto_parent();
-                if let Some((d, p, g)) = level_stack.pop() {
-                    depth = d;
-                    parent_id = p;
-                    grandparent_id = g;
-                }
-            }
+    for item in iter.by_ref() {
+        let depth = item.depth as usize;
+
+        // ── Process current node ───────────────────────────────────────────
+        let kind = item.node.kind();
+
+        // Grow the ancestor table on demand if this node is deeper than current capacity.
+        if depth >= ancestors.len() {
+            ancestors.resize(depth + 1, None);
+        }
+
+        if item.is_error {
+            // Do not create bigrams/trigrams for ERROR/MISSING nodes.
+            // Break the chain: children of this node will see ancestors[depth] = None.
+            ancestors[depth] = None;
             continue;
         }
 
-        // ── Process current node ───────────────────────────────────────────
-        let node = cursor.node();
-        *ctx.node_count += 1;
-
-        let kind = node.kind();
-        let is_error = node.is_error() || kind == "ERROR";
-
-        if is_error {
-            *ctx.error_count += 1;
-            // Do not create bigrams/trigrams for ERROR nodes — they are not
-            // real grammar relationships.  Continue walking children so we
-            // count all error nodes in the subtree.
-        }
-
         // Get (or assign) ID for the current node kind.
-        let current_id = if is_error {
-            None
-        } else {
-            Some(ctx.vocab.get_or_insert(kind))
-        };
+        let current_id = vocab.get_or_insert(kind);
+
+        // Resolve parent and grandparent from the ancestor table.
+        let parent_id: Option<NodeKindId> = depth
+            .checked_sub(1)
+            .and_then(|pd| ancestors.get(pd).copied().flatten());
+        let grandparent_id: Option<NodeKindId> = depth
+            .checked_sub(2)
+            .and_then(|gd| ancestors.get(gd).copied().flatten());
+
+        // Record this node's ID at its depth for use by its children.
+        ancestors[depth] = Some(current_id);
 
         // Emit bigram: parent → current.
-        if let (Some(pid), Some(cid)) = (parent_id, current_id) {
-            ctx.bigrams.insert(encode_ast_bigram(pid, cid));
+        if let Some(pid) = parent_id {
+            result.bigrams.insert(encode_ast_bigram(pid, current_id));
         }
 
         // Emit trigram: grandparent → parent → current.
-        // The two-level if is intentional: the outer guard avoids tuple
-        // construction overhead when the cap or flag is not set;
-        // clippy::collapsible_if would merge them into an if-let chain that
-        // still allocates the Option tuple unconditionally.
+        // The two-level if is intentional: see function doc comment.
         #[allow(clippy::collapsible_if)]
-        if ctx.collect_trigrams && ctx.trigrams.len() < MAX_TRIGRAMS_PER_FILE {
-            if let (Some(gid), Some(pid), Some(cid)) = (grandparent_id, parent_id, current_id) {
-                ctx.trigrams.insert(encode_ast_trigram(gid, pid, cid));
-            }
-        }
-
-        // ── Advance cursor ─────────────────────────────────────────────────
-        if cursor.goto_first_child() {
-            // Descend: push current level context and move one level deeper.
-            level_stack.push((depth, parent_id, grandparent_id));
-            grandparent_id = parent_id;
-            parent_id = current_id;
-            depth += 1;
-        } else {
-            // No children — try next sibling at the same level, or ascend.
-            loop {
-                if cursor.goto_next_sibling() {
-                    // Stay at current depth/parent/grandparent context.
-                    break;
-                }
-                if level_stack.is_empty() {
-                    return;
-                }
-                cursor.goto_parent();
-                if let Some((d, p, g)) = level_stack.pop() {
-                    depth = d;
-                    parent_id = p;
-                    grandparent_id = g;
-                }
+        if collect_trigrams && result.trigrams.len() < MAX_TRIGRAMS_PER_FILE {
+            if let (Some(gid), Some(pid)) = (grandparent_id, parent_id) {
+                result
+                    .trigrams
+                    .insert(encode_ast_trigram(gid, pid, current_id));
             }
         }
     }
+
+    // Populate counters from the iterator's final tally.
+    result.error_node_count = iter.error_count();
+    result.node_count = iter.node_count();
 }
 
 /// Result of processing all files for a single language.
@@ -423,7 +367,7 @@ pub fn extract_ast_ngrams_from_corpus(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
     use crate::types::SourceFile;
@@ -434,6 +378,20 @@ mod tests {
             path: PathBuf::from("test"),
             language,
             content: content.to_string(),
+        }
+    }
+
+    /// Assert that no bigram in `result` encodes a node whose kind resolves to `forbidden`.
+    ///
+    /// Used to verify that ERROR and MISSING nodes are never inserted into the vocabulary
+    /// and therefore cannot appear as parent or child in any emitted bigram.
+    fn assert_no_kind_in_bigrams(result: &AstFileResult, vocab: &NodeKindVocabulary, forbidden: &str) {
+        for &bigram in &result.bigrams {
+            let (parent_id, child_id) = crate::ast_types::decode_ast_bigram(bigram);
+            let parent_kind = vocab.resolve(parent_id).unwrap_or("UNKNOWN");
+            let child_kind = vocab.resolve(child_id).unwrap_or("UNKNOWN");
+            assert_ne!(parent_kind, forbidden, "bigram parent should not be {forbidden}");
+            assert_ne!(child_kind, forbidden, "bigram child should not be {forbidden}");
         }
     }
 
@@ -534,15 +492,102 @@ mod tests {
 
         // No bigram should encode an ERROR node ID.  Since ERROR nodes are never
         // inserted into the vocabulary, no valid NodeKindId exists for them, so
-        // no bigram can reference one.  Verify by checking every decoded bigram's
-        // parent and child IDs resolve to non-ERROR kinds.
-        for &bigram in &result.bigrams {
-            let (parent_id, child_id) = crate::ast_types::decode_ast_bigram(bigram);
-            let parent_kind = vocab.resolve(parent_id).unwrap_or("UNKNOWN");
-            let child_kind = vocab.resolve(child_id).unwrap_or("UNKNOWN");
-            assert_ne!(parent_kind, "ERROR", "bigram parent should not be ERROR");
-            assert_ne!(child_kind, "ERROR", "bigram child should not be ERROR");
-        }
+        // no bigram can reference one.
+        assert_no_kind_in_bigrams(&result, &vocab, "ERROR");
+    }
+
+    #[test]
+    fn error_node_breaks_ancestor_chain_for_descendants() {
+        // This test targets the chain-break logic: when walk_tree encounters an
+        // ERROR node at depth D it sets ancestors[D] = None. Descendants at depth
+        // D+1 look up ancestors[D] for their parent — they must see None, so no
+        // bigram is emitted connecting the ERROR node's parent to those descendants.
+        //
+        // Concretely: with `fn broken(((( { let x = 1; }` the `((((` produces
+        // ERROR nodes inside the parameter list. The `let x = 1` body lives at a
+        // greater depth than those ERROR nodes. We verify:
+        //   1. At least one ERROR node was encountered (sanity guard).
+        //   2. No bigram whose parent resolves to the kind immediately above the
+        //      ERROR nodes ("parameters" or equivalent) pairs with any of the body
+        //      descendants — if the chain were not broken, such bigrams would exist.
+        //
+        // Because tree-sitter grammar shapes vary, we use a broader invariant that
+        // is grammar-independent: collect bigrams with and without a deliberately
+        // nested error, then confirm the broken-syntax set is a strict subset —
+        // the ERROR-break must suppress at least one bigram that the clean version
+        // emits, proving the chain was cut.
+        let mut vocab_clean = NodeKindVocabulary::new();
+        let clean = "fn ok(x: i32) { let y = x + 1; }";
+        let result_clean =
+            extract_ast_ngrams_from_file(clean, Language::Rust, &mut vocab_clean, false).unwrap();
+        assert_eq!(
+            result_clean.error_node_count, 0,
+            "clean source must have zero ERROR nodes"
+        );
+
+        let mut vocab_broken = NodeKindVocabulary::new();
+        // Same structure but parameters replaced with broken syntax, body intact.
+        let broken = "fn broken(((( { let x = 1; }";
+        let result_broken =
+            extract_ast_ngrams_from_file(broken, Language::Rust, &mut vocab_broken, false).unwrap();
+
+        assert!(
+            result_broken.error_node_count > 0,
+            "broken syntax must produce at least one ERROR node"
+        );
+
+        // The broken version must emit fewer bigrams than a clean function of
+        // similar structure — the chain-break suppresses the parameter → body
+        // bigrams that cross the ERROR boundary.
+        assert!(
+            result_broken.bigrams.len() < result_clean.bigrams.len(),
+            "ERROR chain-break should suppress bigrams: broken ({}) >= clean ({})",
+            result_broken.bigrams.len(),
+            result_clean.bigrams.len(),
+        );
+
+        // Grammar-stability guard: verify that the indirect count comparison above
+        // is non-trivially ordered — clean must produce at least one bigram so
+        // that "broken < clean" actually proves something rather than "0 < 0".
+        // This catches grammar regressions where error recovery changes and neither
+        // side emits any bigrams.
+        assert!(
+            !result_clean.bigrams.is_empty(),
+            "clean source must produce at least one bigram for the comparison to be meaningful"
+        );
+    }
+
+    #[test]
+    fn missing_nodes_excluded_from_bigrams() {
+        // Verify that MISSING nodes (tree-sitter parse artifacts inserted during
+        // error recovery) are treated the same as ERROR nodes by walk_tree:
+        // counted in error_node_count but excluded from bigram emission.
+        //
+        // `fn;` causes tree-sitter-rust to insert MISSING nodes to complete the
+        // grammar (e.g. a missing identifier and block). AstWalkIter flags both
+        // `is_error()` and `is_missing()` nodes via `is_error = true`, so
+        // walk_tree's chain-break applies to MISSING nodes as well.
+        let mut vocab = NodeKindVocabulary::new();
+        let result =
+            extract_ast_ngrams_from_file("fn;", Language::Rust, &mut vocab, false).unwrap();
+
+        // tree-sitter must have produced at least one error/missing node.
+        assert!(
+            result.error_node_count > 0,
+            "malformed 'fn;' should produce at least one ERROR or MISSING node"
+        );
+
+        // MISSING nodes must not appear in the vocabulary (get_or_insert is
+        // only called for non-error nodes).
+        assert!(
+            vocab.get("MISSING").is_none(),
+            "MISSING should not be registered in the vocabulary"
+        );
+
+        // No bigram should reference a MISSING node ID: since MISSING nodes are
+        // never inserted into the vocabulary, their kind cannot appear in any
+        // emitted bigram.
+        assert_no_kind_in_bigrams(&result, &vocab, "MISSING");
     }
 
     #[test]

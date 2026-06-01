@@ -116,7 +116,7 @@ pub fn extract_bigrams_from_corpus(files: &[SourceFile]) -> (HashMap<u16, u32>, 
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
 

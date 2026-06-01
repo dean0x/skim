@@ -623,7 +623,7 @@ fn strip_rust_return_type(function_node: Node, ranges: &mut Vec<(usize, usize)>)
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in tests
 mod tests {
     use super::*;
     use crate::{Mode, Parser, TransformConfig};

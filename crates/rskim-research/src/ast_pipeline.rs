@@ -82,7 +82,7 @@ pub fn build_ast_weight_table(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
     use crate::types::SourceFile;

@@ -458,7 +458,7 @@ pub fn clone_with_history(url: &str, dest: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
 

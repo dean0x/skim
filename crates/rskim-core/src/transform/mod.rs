@@ -396,7 +396,7 @@ pub(crate) fn reconcile_line_map_after_truncation(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in tests
 mod tests {
     use super::*;
 

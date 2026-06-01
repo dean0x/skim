@@ -1,6 +1,6 @@
 //! Tests for the format codec (format.rs).
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
 

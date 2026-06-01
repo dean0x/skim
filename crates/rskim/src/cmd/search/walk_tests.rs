@@ -1,6 +1,6 @@
 //! Tests for the file walker (walk.rs).
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::{discover_project_root, sha256_hex, walk_and_read, walk_metadata};
 use std::fs;

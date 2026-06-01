@@ -1,6 +1,6 @@
 //! Tests for the language ID mapping (lang_map.rs).
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
 

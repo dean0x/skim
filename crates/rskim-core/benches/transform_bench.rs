@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo bench
 
-#![allow(clippy::unwrap_used)] // Unwrapping is acceptable in benchmarks
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in benchmarks
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use rskim_core::{Language, Mode, transform, truncate_to_token_budget};

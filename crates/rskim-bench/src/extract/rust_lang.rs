@@ -120,7 +120,7 @@ fn find_last_identifier(
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // test code -- unwrap acceptable
+#[allow(clippy::unwrap_used, clippy::expect_used)] // test code -- unwrap/expect acceptable
 mod tests {
     use std::path::PathBuf;
 

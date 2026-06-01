@@ -1,6 +1,6 @@
 //! Tests for QueryEngine (query.rs).
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::{Arc, Mutex};
 

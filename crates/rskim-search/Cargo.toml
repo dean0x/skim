@@ -17,6 +17,7 @@ exclude = ["data/"]
 rskim-core = { version = "2.10.0", path = "../rskim-core" }
 thiserror = { workspace = true }
 serde = { workspace = true }
+tree-sitter = { workspace = true }
 
 memmap2 = { workspace = true }
 crc32fast = { workspace = true }
@@ -27,6 +28,11 @@ rusqlite = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "linearize_bench"
+harness = false
 
 [lints.clippy]
 unwrap_used = "deny"

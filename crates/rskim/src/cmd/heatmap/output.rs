@@ -251,7 +251,7 @@ pub(crate) fn render_insights_json(insights_result: &InsightsResult) -> anyhow::
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::cmd::heatmap::types::{

@@ -107,7 +107,7 @@ fn extract_import_path_last_segment(
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // test code -- unwrap acceptable
+#[allow(clippy::unwrap_used, clippy::expect_used)] // test code -- unwrap/expect acceptable
 mod tests {
     use std::path::PathBuf;
 

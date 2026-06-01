@@ -108,7 +108,7 @@ fn last_named_child(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // test code -- unwrap acceptable
+#[allow(clippy::unwrap_used, clippy::expect_used)] // test code -- unwrap/expect acceptable
 mod tests {
     use std::path::PathBuf;
 

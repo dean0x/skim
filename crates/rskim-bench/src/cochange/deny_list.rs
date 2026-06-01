@@ -131,7 +131,7 @@ pub fn filter_denied(files: &mut Vec<FileChangeInfo>) {
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::path::{Path, PathBuf};
 

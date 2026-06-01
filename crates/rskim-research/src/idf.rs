@@ -76,7 +76,7 @@ pub fn selectivity(query: &str, weights: &[(u16, f32)]) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
     use crate::extract::encode_bigram;

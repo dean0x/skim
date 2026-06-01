@@ -221,7 +221,7 @@ fn top_two_boost_fields(boosts: &[f32; FIELD_COUNT]) -> [usize; 2] {
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // test code — unwrap acceptable for test assertions
+#[allow(clippy::unwrap_used, clippy::expect_used)] // test code — unwrap/expect acceptable for test assertions
 mod tests {
     use super::*;
 

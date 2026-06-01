@@ -232,7 +232,7 @@ fn write_generated_tests(buf: &mut Vec<u8>) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
     use crate::types::{BigramWeight, CorpusStats, WeightTable};

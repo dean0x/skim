@@ -42,6 +42,8 @@
 // Public API — stable as of v1.0.0
 pub use types::{Language, Mode, Parser, Result, SkimError, TransformConfig, TransformResult};
 
+pub use ast_walk::{AstWalkConfig, AstWalkIter, AstWalkNode};
+
 /// Return the structural priority of a tree-sitter node kind (1–5).
 ///
 /// Used by the BM25F classifier to map node kinds to [`SearchField`] variants.
@@ -61,6 +63,7 @@ pub fn node_kind_priority(kind: &str) -> u8 {
     transform::utils::node_kind_info(kind).1
 }
 
+pub mod ast_walk;
 mod parser;
 mod transform;
 mod types;

@@ -203,7 +203,7 @@ pub fn print_ast_validation_report(report: &AstValidationReport) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::collections::HashMap;
 

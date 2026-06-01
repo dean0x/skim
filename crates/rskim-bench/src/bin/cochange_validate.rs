@@ -334,7 +334,7 @@ fn save_to_devflow(timestamp: &str, format: &OutputFormat, content: &str) -> any
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
