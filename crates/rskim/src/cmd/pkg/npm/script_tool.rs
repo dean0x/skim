@@ -85,10 +85,7 @@ fn try_parse_script(path: &std::path::Path, name: &str) -> Option<String> {
         }
         Err(e) => {
             if crate::debug::is_debug_enabled() {
-                eprintln!(
-                    "skim: script_tool: failed to stat {}: {e}",
-                    path.display()
-                );
+                eprintln!("skim: script_tool: failed to stat {}: {e}", path.display());
             }
             return None;
         }
@@ -99,10 +96,7 @@ fn try_parse_script(path: &std::path::Path, name: &str) -> Option<String> {
         Ok(t) => t,
         Err(e) => {
             if crate::debug::is_debug_enabled() {
-                eprintln!(
-                    "skim: script_tool: failed to read {}: {e}",
-                    path.display()
-                );
+                eprintln!("skim: script_tool: failed to read {}: {e}", path.display());
             }
             return None;
         }
@@ -112,10 +106,7 @@ fn try_parse_script(path: &std::path::Path, name: &str) -> Option<String> {
         Ok(v) => v,
         Err(e) => {
             if crate::debug::is_debug_enabled() {
-                eprintln!(
-                    "skim: script_tool: failed to parse {}: {e}",
-                    path.display()
-                );
+                eprintln!("skim: script_tool: failed to parse {}: {e}", path.display());
             }
             return None;
         }
@@ -146,9 +137,10 @@ fn split_shell_ops(script: &str) -> impl Iterator<Item = &str> {
     let mut i = 0usize;
 
     while i < len {
-        let op_len = if i + 1 < len && bytes[i] == b'&' && bytes[i + 1] == b'&' {
-            Some(2)
-        } else if i + 1 < len && bytes[i] == b'|' && bytes[i + 1] == b'|' {
+        let op_len = if i + 1 < len
+            && ((bytes[i] == b'&' && bytes[i + 1] == b'&')
+                || (bytes[i] == b'|' && bytes[i + 1] == b'|'))
+        {
             Some(2)
         } else if bytes[i] == b';' {
             Some(1)
@@ -157,9 +149,8 @@ fn split_shell_ops(script: &str) -> impl Iterator<Item = &str> {
         };
 
         if let Some(n) = op_len {
-            // SAFETY: `start..i` is a valid byte range within a `&str` slice
-            // produced by advancing at valid boundaries — all split points are
-            // ASCII, which are always single-byte UTF-8 code points.
+            // `start..i` is always on a valid UTF-8 boundary: all split points
+            // are ASCII bytes (&&, ||, ;), which are single-byte code points.
             let segment = &script[start..i];
             if !segment.trim().is_empty() {
                 segments.push(segment);
@@ -473,20 +464,11 @@ mod tests {
 
     #[test]
     fn test_resolve_script_oversized_rejected() {
-        // Write a valid JSON file that exceeds the size cap. Use a temp file
-        // and then use `try_parse_script` directly to inject the oversized
-        // check without creating a 16 MiB file on disk.
-        //
-        // We verify the cap by calling `try_parse_script` with a synthesised
-        // path pointing at a file whose `metadata().len()` would exceed the
-        // cap. Instead, we test the exported constant and the logic via a
-        // helper: write a file, then use std::fs::metadata to confirm it would
-        // be within limits, and assert that `resolve_script` still works.
-        // The actual cap is tested at the constant level — ensuring the value
-        // is 16 MiB and that a normal file is accepted.
+        // Verify the size cap constant is the documented 16 MiB value.
+        // Writing a real 16 MiB file in tests would be too slow; instead we
+        // assert the constant and confirm that a normal-sized file is accepted.
         assert_eq!(MAX_PKG_JSON_BYTES, 16 * 1024 * 1024);
 
-        // Confirm a normal file is not rejected.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("package.json"),
