@@ -91,7 +91,7 @@ fn bench_linearize_scaling(c: &mut Criterion) {
 
     for &n_fns in &[10usize, 50, 100, 500, 1000] {
         let source = gen_rust_fns(n_fns);
-        // Parsing happens in setup (outside b.iter()) — benchmark linearization only.
+        // Benchmarks end-to-end linearize_source, including parsing overhead.
         group.bench_with_input(
             BenchmarkId::new("rust_fns", n_fns),
             &source,

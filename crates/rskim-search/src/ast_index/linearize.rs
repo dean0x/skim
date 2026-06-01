@@ -46,8 +46,16 @@ pub(crate) const MAX_AST_NODES: u32 = AstWalkConfig::DEFAULT_MAX_NODES;
 /// Maximum source file size accepted for linearization (100 KiB).
 ///
 /// Files exceeding this limit return `Ok(LinearizeResult::default())` rather
-/// than an error. Consistent with the limit in `rskim-research/src/ast_extract.rs`.
+/// than an error.
 const MAX_FILE_SIZE: usize = 100 * 1024;
+
+/// Maximum source file size for SQL files (1 MiB).
+///
+/// SQL migrations and schema dumps are routinely larger than 100 KiB, so SQL
+/// uses a higher limit to match `rskim-research/src/ast_extract.rs`. Files
+/// between 100 KiB and 1 MiB that are SQL will be linearized; all other
+/// languages still use `MAX_FILE_SIZE`.
+const MAX_FILE_SIZE_LARGE: usize = 1024 * 1024;
 
 // ============================================================================
 // Public types
@@ -179,7 +187,8 @@ static LANG_MAPS: LazyLock<HashMap<Language, Vec<Option<u16>>>> = LazyLock::new(
 /// Linearize a source file into a pre-order depth-encoded node sequence.
 ///
 /// Returns `Ok(LinearizeResult::default())` (empty result) for:
-/// - Files exceeding `MAX_FILE_SIZE` (100 KiB)
+/// - Files exceeding `MAX_FILE_SIZE` (100 KiB) for most languages, or
+///   `MAX_FILE_SIZE_LARGE` (1 MiB) for SQL
 /// - Non-tree-sitter languages (JSON, YAML, TOML)
 /// - Parse failures (tree-sitter is error-tolerant, so this is rare)
 ///
@@ -196,7 +205,13 @@ pub fn linearize_source(
     language: Language,
 ) -> crate::types::Result<LinearizeResult> {
     // Guard 1: oversized files return empty result (not an error).
-    if source.len() > MAX_FILE_SIZE {
+    // SQL migrations/schema dumps can exceed 100 KiB, so SQL uses a larger
+    // limit (1 MiB) consistent with rskim-research/src/ast_extract.rs.
+    let size_limit = match language {
+        Language::Sql => MAX_FILE_SIZE_LARGE,
+        _ => MAX_FILE_SIZE,
+    };
+    if source.len() > size_limit {
         return Ok(LinearizeResult::default());
     }
 
