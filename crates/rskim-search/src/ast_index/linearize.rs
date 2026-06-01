@@ -80,7 +80,7 @@ pub struct LinearNode {
 /// `node_count == nodes.len() + error_count`
 ///
 /// This invariant holds at all times: every node visited either appears in
-/// `nodes` (named, non-error) or is counted in `error_count` (ERROR/MISSING).
+/// `nodes` (non-error) or is counted in `error_count` (ERROR/MISSING).
 #[derive(Debug, Clone, Default)]
 pub struct LinearizeResult {
     /// Linearized nodes in pre-order DFS order. Does not include ERROR or
@@ -192,7 +192,7 @@ static LANG_MAPS: LazyLock<HashMap<Language, Vec<Option<u16>>>> = LazyLock::new(
 /// Returns `Err(SearchError::Ast)` if the tree-sitter grammar for
 /// `language` fails to load (grammar crate not compiled in, ABI mismatch,
 /// etc.). This is distinct from a parse error, which produces an empty result.
-#[must_use = "linearize_source returns a Result that must be checked"]
+#[must_use]
 pub fn linearize_source(
     source: &str,
     language: Language,
@@ -272,10 +272,10 @@ fn linearize_tree(tree: &tree_sitter::Tree, lang_map: &[Option<u16>]) -> Lineari
 
         // ── Process current node ─────────────────────────────────────────────
         let node = cursor.node();
-        result.node_count += 1;
+        result.node_count = result.node_count.saturating_add(1);
 
         if node.is_error() || node.is_missing() {
-            result.error_count += 1;
+            result.error_count = result.error_count.saturating_add(1);
             // ERROR/MISSING nodes are not emitted but their children may be
             // visited so we count all nodes in the subtree.
         } else {
