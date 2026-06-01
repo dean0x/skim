@@ -78,6 +78,18 @@ pub(crate) fn run_check(
 /// Note: `cargo fmt --check` is ACKed at the engine level (AD-RW-11) and
 /// never reaches this handler. This handler covers bare `cargo fmt` and
 /// `cargo fmt -- [rustfmt args]` (apply mode).
+///
+/// # Module placement
+///
+/// `cargo fmt` is categorized as a LINT operation by the rewrite engine
+/// (alongside `biome`, `eslint`, `rustfmt`, etc.), but its handler lives here
+/// in the build module rather than in `cmd/lint/`. This is intentional:
+/// `cargo fmt` shares the `cargo` executable, the `run_parsed_command` helper,
+/// and all cargo-specific plumbing (argument injection, env vars, install hints)
+/// with `cargo build`, `cargo check`, and `cargo clippy`. Splitting it into
+/// the lint module would require duplicating or re-exporting that infrastructure.
+/// The rewrite engine's categorization and the handler's module location are
+/// therefore deliberately decoupled.
 pub(crate) fn run_fmt(
     args: &[String],
     show_stats: bool,

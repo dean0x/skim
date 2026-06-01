@@ -68,7 +68,7 @@ pub(crate) fn run(
             let safe_unknown = crate::cmd::sanitize_for_display(unknown);
             eprintln!(
                 "skim: unknown subcommand '{safe_unknown}'\n\
-                 Supported tools: cargo, check, fmt, clippy, gradle, gradlew, make, mvn, mvnw, tsc"
+                 Supported tools: cargo (subcommands: build, check, fmt, clippy), gradle, gradlew, make, mvn, mvnw, tsc"
             );
             Ok(ExitCode::FAILURE)
         }
@@ -82,7 +82,7 @@ pub(crate) fn run(
                  Usage: skim make [args...]\n\
                  Usage: skim mvn [args...]\n\
                  Usage: skim tsc [args...]\n\n\
-                 Supported tools: cargo, check, fmt, clippy, gradle, gradlew, make, mvn, mvnw, tsc"
+                 Supported tools: cargo (subcommands: build, check, fmt, clippy), gradle, gradlew, make, mvn, mvnw, tsc"
             );
             Ok(ExitCode::FAILURE)
         }
@@ -97,14 +97,15 @@ fn print_help() {
     println!("  Run build tools and compress output for AI context windows.");
     println!();
     println!("Available tools:");
-    println!("  cargo      Run cargo build with output compression");
-    println!("  check      Run cargo check with output compression");
-    println!("  fmt        Run cargo fmt with output compression");
-    println!("  clippy     Run cargo clippy with output compression");
-    println!("  gradle     Run Gradle with output compression (also: gradlew)");
-    println!("  make       Run GNU make with output compression");
-    println!("  mvn        Run Maven with output compression (also: mvnw)");
-    println!("  tsc        Run TypeScript compiler with output compression");
+    println!("  cargo            Run cargo with output compression");
+    println!("    build          Run cargo build");
+    println!("    check          Run cargo check");
+    println!("    fmt            Run cargo fmt");
+    println!("    clippy         Run cargo clippy");
+    println!("  gradle           Run Gradle with output compression (also: gradlew)");
+    println!("  make             Run GNU make with output compression");
+    println!("  mvn              Run Maven with output compression (also: mvnw)");
+    println!("  tsc              Run TypeScript compiler with output compression");
     println!();
     println!("Flags:");
     println!("  --show-stats    Show token statistics");
