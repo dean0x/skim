@@ -777,8 +777,6 @@ fn dispatch_cargo(
         // nextest: keep the "nextest" token — the test handler uses it to select
         // the nextest parse path instead of the plain cargo-test path.
         "nextest" => test::run(&prepend("cargo", args), analytics),
-        // Subcommand-name tokens: build::run routes on the leading token to the
-        // correct dedicated handler (cargo::run, run_check, run_fmt, run_clippy).
         "build" | "b" => build::run(&prepend_without("build", args, idx), analytics),
         "check" | "c" => build::run(&prepend_without("check", args, idx), analytics),
         "fmt" => build::run(&prepend_without("fmt", args, idx), analytics),

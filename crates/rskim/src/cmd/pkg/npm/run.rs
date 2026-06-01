@@ -63,9 +63,7 @@ pub(super) fn run_script(
 
     // Resolve and extract tool from package.json.
     let cwd = std::env::current_dir().unwrap_or_else(|e| {
-        if crate::debug::is_debug_enabled() {
-            eprintln!("skim: npm run: current_dir() failed ({e}), using '.' as cwd");
-        }
+        crate::debug_log!("skim: npm run: current_dir() failed ({e}), using '.' as cwd");
         PathBuf::from(".")
     });
     let tool = resolve_script(&cwd, script_name)
@@ -226,10 +224,6 @@ mod tests {
             result.is_passthrough(),
             "Unknown tool should return Passthrough"
         );
-        // The leading newline is present because combine_output formats as
-        // "{stdout}\n{stderr}" and stdout is empty.  This test documents and
-        // locks in the current behaviour so any future change to combine_output
-        // is visible.
         assert_eq!(
             result.content(),
             "\nerror: something went wrong\n",

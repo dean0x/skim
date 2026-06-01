@@ -218,9 +218,8 @@ fn process_compiler_message(
     error_messages: &mut Vec<String>,
     warning_codes: &mut BTreeMap<String, usize>,
 ) -> bool {
-    let message = match json.get("message") {
-        Some(m) => m,
-        None => return false,
+    let Some(message) = json.get("message") else {
+        return false;
     };
     let level = message.get("level").and_then(|v| v.as_str()).unwrap_or("");
     let msg_text = message
