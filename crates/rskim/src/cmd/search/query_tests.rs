@@ -1,6 +1,6 @@
 //! Tests for the query execution module (query.rs).
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::io::BufWriter;

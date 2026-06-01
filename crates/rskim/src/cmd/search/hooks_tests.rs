@@ -1,6 +1,6 @@
 //! Tests for the git hooks module (hooks.rs).
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 

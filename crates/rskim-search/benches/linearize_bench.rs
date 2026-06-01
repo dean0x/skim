@@ -8,7 +8,7 @@
 //!   3. linearize_depth       — controlled nesting: 5/10/50/100/200 levels
 //!   4. init_latency          — LazyLock LANG_MAPS initialization
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use rskim_core::Language;

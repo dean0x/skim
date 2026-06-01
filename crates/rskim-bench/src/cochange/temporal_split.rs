@@ -109,7 +109,7 @@ pub fn temporal_split(mut commits: Vec<CommitInfo>, train_fraction: f64) -> Temp
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::cochange::test_utils::{make_commit, make_commits_newest_first};

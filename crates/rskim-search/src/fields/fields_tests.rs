@@ -3,7 +3,7 @@
 //! Written in TDD order: tests were written before production code.
 //! Tests cover the contract invariants plus format-specific field mapping.
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::ops::Range;
 

@@ -632,7 +632,7 @@ pub type Result<T> = std::result::Result<T, SearchError>;
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

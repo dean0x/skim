@@ -2,8 +2,7 @@
 //!
 //! These tests validate the full pipeline from source → transformation.
 
-#![allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
-#![allow(clippy::expect_used)] // Expect is acceptable in tests
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in tests
 
 use rskim_core::{
     Language, Mode, TransformConfig, transform, transform_auto, transform_with_config,

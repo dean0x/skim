@@ -1,6 +1,6 @@
 //! Kotlin transformation tests — verify all modes work correctly
 
-#![allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in tests
 
 use rskim_core::{Language, Mode, transform};
 

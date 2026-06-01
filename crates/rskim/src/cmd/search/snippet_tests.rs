@@ -1,6 +1,6 @@
 //! Tests for the snippet extraction module (snippet.rs).
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(clippy::single_range_in_vec_init)]
 
 use std::fs;

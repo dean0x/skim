@@ -339,7 +339,7 @@ pub struct AstWeightTable {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     // get_or_insert is called in test setup for its side effect only (populating
     // the vocabulary); the returned ID is intentionally discarded in those cases.
     #![allow(unused_must_use)]

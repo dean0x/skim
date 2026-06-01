@@ -1,6 +1,6 @@
 //! Tests for the staleness detection module (staleness.rs).
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 

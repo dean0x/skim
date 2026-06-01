@@ -254,7 +254,7 @@ pub(crate) fn build_flagged_modules(result: &HeatmapResult) -> Vec<CompactModule
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::cmd::heatmap::types::{

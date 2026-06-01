@@ -12,7 +12,7 @@ pub mod language;
 
 // Tests moved to validate actual Parser struct (not deleted duplicate)
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in tests
 mod tests {
     use crate::{Language, Parser};
 

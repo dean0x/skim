@@ -225,7 +225,7 @@ pub fn covering_set_heuristic(query: &str, weights: &[(u16, f32)]) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
 
