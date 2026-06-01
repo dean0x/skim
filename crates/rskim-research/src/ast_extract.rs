@@ -187,7 +187,7 @@ fn walk_tree(cursor: &mut tree_sitter::TreeCursor, ctx: &mut WalkContext<'_>) {
         *ctx.node_count += 1;
 
         let kind = node.kind();
-        let is_error = node.is_error() || node.is_missing() || kind == "ERROR";
+        let is_error = node.is_error() || node.is_missing();
 
         if is_error {
             *ctx.error_count += 1;

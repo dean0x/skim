@@ -192,7 +192,6 @@ static LANG_MAPS: LazyLock<HashMap<Language, Vec<Option<u16>>>> = LazyLock::new(
 /// Returns `Err(SearchError::Ast)` if the tree-sitter grammar for
 /// `language` fails to load (grammar crate not compiled in, ABI mismatch,
 /// etc.). This is distinct from a parse error, which produces an empty result.
-#[must_use]
 pub fn linearize_source(
     source: &str,
     language: Language,
@@ -280,13 +279,8 @@ fn linearize_tree(tree: &tree_sitter::Tree, lang_map: &[Option<u16>]) -> Lineari
             // visited so we count all nodes in the subtree.
         } else {
             // Look up the vocabulary ID for this node kind.
-            let kind_id_ts = node.kind_id() as usize;
-            let vocab_id = if kind_id_ts < lang_map.len() {
-                lang_map[kind_id_ts].unwrap_or(0)
-            } else {
-                // kind_id out of range for this language — emit sentinel.
-                0
-            };
+            let ts_kind = node.kind_id() as usize;
+            let vocab_id = lang_map.get(ts_kind).copied().flatten().unwrap_or(0);
 
             result.nodes.push(LinearNode {
                 kind_id: vocab_id,
