@@ -13,6 +13,7 @@
 //! All I/O errors are treated as `None` (graceful degradation). When the tool
 //! cannot be identified the caller falls back to raw passthrough.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Maximum `package.json` size accepted for reading (16 MiB).
@@ -65,44 +66,79 @@ pub(super) fn resolve_script(start_dir: &Path, name: &str) -> Option<String> {
     None
 }
 
+/// Targeted deserialisation type: only captures the `scripts` map.
+///
+/// Using a specific struct instead of `serde_json::Value` avoids allocating
+/// the full DOM for large package.json files — only the `scripts` object is
+/// materialised.
+#[derive(serde::Deserialize)]
+struct PkgScripts {
+    #[serde(default)]
+    scripts: HashMap<String, String>,
+}
+
 /// Read `path`, enforce the size cap, parse JSON, and return the named script.
+///
+/// The size cap is enforced with a capped read (`Read::take`) rather than a
+/// separate `metadata()` call. This closes the TOCTOU window that existed when
+/// `metadata()` and `read_to_string()` were two separate filesystem operations:
+/// between those calls a file could be replaced with an oversized file and the
+/// check would not apply to what was actually read.
+///
+/// If the file exceeds [`MAX_PKG_JSON_BYTES`] the read yields more than that
+/// many bytes and `None` is returned.
 ///
 /// Extracted from [`resolve_script`] to reduce nesting depth. All failures
 /// return `None` with an optional debug log.
 fn try_parse_script(path: &std::path::Path, name: &str) -> Option<String> {
-    // Guard: reject oversized files before reading into memory.
-    match std::fs::metadata(path).map(|m| m.len()) {
-        Ok(len) if len > MAX_PKG_JSON_BYTES => {
-            if crate::debug::is_debug_enabled() {
-                eprintln!(
-                    "skim: script_tool: skipping oversized package.json ({} bytes > {} cap): {}",
-                    len,
-                    MAX_PKG_JSON_BYTES,
-                    path.display()
-                );
-            }
-            return None;
-        }
-        Err(e) => {
-            if crate::debug::is_debug_enabled() {
-                eprintln!("skim: script_tool: failed to stat {}: {e}", path.display());
-            }
-            return None;
-        }
-        Ok(_) => {} // within cap — proceed
-    }
+    use std::io::Read as _;
 
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
         Err(e) => {
             if crate::debug::is_debug_enabled() {
-                eprintln!("skim: script_tool: failed to read {}: {e}", path.display());
+                eprintln!("skim: script_tool: failed to open {}: {e}", path.display());
             }
             return None;
         }
     };
 
-    let json: serde_json::Value = match serde_json::from_str(&text) {
+    // Read at most MAX_PKG_JSON_BYTES + 1 bytes. If we get more than the cap,
+    // the file is oversized and we reject it — no separate metadata() call needed.
+    let cap = MAX_PKG_JSON_BYTES as usize;
+    let mut buf = Vec::with_capacity(cap.min(65_536));
+    if let Err(e) = file.take(MAX_PKG_JSON_BYTES + 1).read_to_end(&mut buf) {
+        if crate::debug::is_debug_enabled() {
+            eprintln!("skim: script_tool: failed to read {}: {e}", path.display());
+        }
+        return None;
+    }
+
+    if buf.len() > cap {
+        if crate::debug::is_debug_enabled() {
+            eprintln!(
+                "skim: script_tool: skipping oversized package.json (> {} cap): {}",
+                MAX_PKG_JSON_BYTES,
+                path.display()
+            );
+        }
+        return None;
+    }
+
+    let text = match std::str::from_utf8(&buf) {
+        Ok(s) => s,
+        Err(e) => {
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "skim: script_tool: package.json is not valid UTF-8 at {}: {e}",
+                    path.display()
+                );
+            }
+            return None;
+        }
+    };
+
+    let pkg: PkgScripts = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
             if crate::debug::is_debug_enabled() {
@@ -112,10 +148,7 @@ fn try_parse_script(path: &std::path::Path, name: &str) -> Option<String> {
         }
     };
 
-    json.get("scripts")
-        .and_then(|s| s.get(name))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
+    pkg.scripts.get(name).cloned()
 }
 
 /// Split `script` on shell compound operators (`&&`, `||`, `;`).
@@ -464,17 +497,31 @@ mod tests {
 
     #[test]
     fn test_resolve_script_oversized_rejected() {
-        // Verify the size cap constant is the documented 16 MiB value.
-        // Writing a real 16 MiB file in tests would be too slow; instead we
-        // assert the constant and confirm that a normal-sized file is accepted.
+        // Verify the 16 MiB constant is correct.
         assert_eq!(MAX_PKG_JSON_BYTES, 16 * 1024 * 1024);
 
+        // Write a file that is exactly one byte over the cap so the rejection
+        // path in try_parse_script is exercised.  The content does not need to
+        // be valid JSON — the size check runs before parsing.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts": {"test": "jest"}}"#,
-        )
-        .unwrap();
+        let oversized: Vec<u8> = vec![b'x'; MAX_PKG_JSON_BYTES as usize + 1];
+        std::fs::write(dir.path().join("package.json"), &oversized).unwrap();
+        assert_eq!(resolve_script(dir.path(), "test"), None);
+    }
+
+    #[test]
+    fn test_resolve_script_exactly_at_cap_accepted() {
+        // A file whose byte count equals the cap exactly must NOT be rejected.
+        let dir = tempfile::tempdir().unwrap();
+        // Build a package.json that is padded to exactly MAX_PKG_JSON_BYTES with
+        // whitespace inside the JSON string value so serde still parses it.
+        let payload = r#"{"scripts":{"test":"jest"}}"#;
+        let padding = MAX_PKG_JSON_BYTES as usize - payload.len();
+        let mut content = String::with_capacity(MAX_PKG_JSON_BYTES as usize);
+        content.push_str(payload);
+        content.extend(std::iter::repeat(' ').take(padding));
+        assert_eq!(content.len(), MAX_PKG_JSON_BYTES as usize);
+        std::fs::write(dir.path().join("package.json"), content.as_bytes()).unwrap();
         assert_eq!(resolve_script(dir.path(), "test"), Some("jest".to_string()));
     }
 }
