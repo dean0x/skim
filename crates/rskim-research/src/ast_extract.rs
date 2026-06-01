@@ -538,6 +538,55 @@ mod tests {
             result_broken.bigrams.len(),
             result_clean.bigrams.len(),
         );
+
+        // Grammar-stability guard: verify that the indirect count comparison above
+        // is non-trivially ordered — clean must produce at least one bigram so
+        // that "broken < clean" actually proves something rather than "0 < 0".
+        // This catches grammar regressions where error recovery changes and neither
+        // side emits any bigrams.
+        assert!(
+            !result_clean.bigrams.is_empty(),
+            "clean source must produce at least one bigram for the comparison to be meaningful"
+        );
+    }
+
+    #[test]
+    fn missing_nodes_excluded_from_bigrams() {
+        // Verify that MISSING nodes (tree-sitter parse artifacts inserted during
+        // error recovery) are treated the same as ERROR nodes by walk_tree:
+        // counted in error_node_count but excluded from bigram emission.
+        //
+        // `fn;` causes tree-sitter-rust to insert MISSING nodes to complete the
+        // grammar (e.g. a missing identifier and block). AstWalkIter flags both
+        // `is_error()` and `is_missing()` nodes via `is_error = true`, so
+        // walk_tree's chain-break applies to MISSING nodes as well.
+        let mut vocab = NodeKindVocabulary::new();
+        let result =
+            extract_ast_ngrams_from_file("fn;", Language::Rust, &mut vocab, false).unwrap();
+
+        // tree-sitter must have produced at least one error/missing node.
+        assert!(
+            result.error_node_count > 0,
+            "malformed 'fn;' should produce at least one ERROR or MISSING node"
+        );
+
+        // MISSING nodes must not appear in the vocabulary (get_or_insert is
+        // only called for non-error nodes).
+        assert!(
+            vocab.get("MISSING").is_none(),
+            "MISSING should not be registered in the vocabulary"
+        );
+
+        // No bigram should reference a MISSING node ID: since MISSING nodes are
+        // never inserted into the vocabulary, their kind cannot appear in any
+        // emitted bigram.
+        for &bigram in &result.bigrams {
+            let (parent_id, child_id) = crate::ast_types::decode_ast_bigram(bigram);
+            let parent_kind = vocab.resolve(parent_id).unwrap_or("UNKNOWN");
+            let child_kind = vocab.resolve(child_id).unwrap_or("UNKNOWN");
+            assert_ne!(parent_kind, "MISSING", "bigram parent should not be MISSING");
+            assert_ne!(child_kind, "MISSING", "bigram child should not be MISSING");
+        }
     }
 
     #[test]
