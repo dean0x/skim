@@ -1,6 +1,6 @@
 //! Tests for QueryEngine (query.rs).
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::{Arc, Mutex};
 
@@ -142,9 +142,10 @@ fn test_invalid_bm25f_config_rejected_before_search() {
     // layer is reached.
     let engine = QueryEngine::new(Box::new(PanicLayer));
     let mut query = SearchQuery::new("foo");
-    let mut bad_config = BM25FConfig::default();
-    bad_config.k1 = -1.0;
-    query.bm25f_config = Some(bad_config);
+    query.bm25f_config = Some(BM25FConfig {
+        k1: -1.0,
+        ..BM25FConfig::default()
+    });
 
     let err = engine.search(&query).unwrap_err();
     assert!(
@@ -160,9 +161,10 @@ fn test_invalid_bm25f_config_rejected_before_search() {
 fn test_nan_bm25f_config_rejected() {
     let engine = QueryEngine::new(Box::new(PanicLayer));
     let mut query = SearchQuery::new("foo");
-    let mut bad_config = BM25FConfig::default();
-    bad_config.k1 = f32::NAN;
-    query.bm25f_config = Some(bad_config);
+    query.bm25f_config = Some(BM25FConfig {
+        k1: f32::NAN,
+        ..BM25FConfig::default()
+    });
 
     let err = engine.search(&query).unwrap_err();
     assert!(
@@ -178,9 +180,10 @@ fn test_nan_bm25f_config_rejected() {
 fn test_infinity_bm25f_config_rejected() {
     let engine = QueryEngine::new(Box::new(PanicLayer));
     let mut query = SearchQuery::new("foo");
-    let mut bad_config = BM25FConfig::default();
-    bad_config.k1 = f32::INFINITY;
-    query.bm25f_config = Some(bad_config);
+    query.bm25f_config = Some(BM25FConfig {
+        k1: f32::INFINITY,
+        ..BM25FConfig::default()
+    });
 
     let err = engine.search(&query).unwrap_err();
     assert!(
@@ -196,9 +199,10 @@ fn test_infinity_bm25f_config_rejected() {
 fn test_neg_infinity_bm25f_config_rejected() {
     let engine = QueryEngine::new(Box::new(PanicLayer));
     let mut query = SearchQuery::new("foo");
-    let mut bad_config = BM25FConfig::default();
-    bad_config.k1 = f32::NEG_INFINITY;
-    query.bm25f_config = Some(bad_config);
+    query.bm25f_config = Some(BM25FConfig {
+        k1: f32::NEG_INFINITY,
+        ..BM25FConfig::default()
+    });
 
     let err = engine.search(&query).unwrap_err();
     assert!(

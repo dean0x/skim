@@ -1,6 +1,6 @@
 //! Tests for AST n-gram newtypes and vocabulary/weight helpers.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use rskim_core::Language;
 

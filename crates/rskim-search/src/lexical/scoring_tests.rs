@@ -1,6 +1,10 @@
 //! Tests for BM25F scoring functions.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::field_reassign_with_default
+)]
 
 use super::*;
 use crate::SearchField;

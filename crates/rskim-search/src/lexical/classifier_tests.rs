@@ -1,6 +1,6 @@
 //! Tests for classify_source().
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::*;
 use crate::SearchField;
@@ -89,12 +89,9 @@ fn test_source_at_limit_boundary_does_not_error() {
     let result = classify_source(&at_limit, rskim_core::Language::Json);
     // The size guard must not fire at exactly the limit — any result other
     // than FileTooLarge (Ok or a scanner error) is acceptable here.
-    match result {
-        Err(crate::SearchError::FileTooLarge { .. }) => {
-            panic!("MAX_SOURCE_BYTES itself must not trigger FileTooLarge");
-        }
-        _ => {} // Ok or a parser error — both are acceptable here.
-    }
+    if let Err(crate::SearchError::FileTooLarge { .. }) = result {
+        panic!("MAX_SOURCE_BYTES itself must not trigger FileTooLarge");
+    } // Ok or a parser error — both are acceptable here.
 }
 
 // -----------------------------------------------------------------------
