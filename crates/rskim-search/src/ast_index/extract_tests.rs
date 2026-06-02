@@ -195,6 +195,50 @@ fn sentinel_parent_suppresses_ngram() {
     );
 }
 
+// ── F6b: Sentinel grandparent suppresses trigram emission ────────────────────
+
+#[test]
+fn sentinel_grandparent_suppresses_trigram() {
+    // kind_id 0 is the sentinel — a node at grandparent depth with kind_id 0
+    // must not appear in any emitted trigram's grandparent slot.
+    //
+    // Sequence:
+    //   sentinel(0)@0 — grandparent (kind_id 0)
+    //   real(20)@1    — parent      (kind_id 20)
+    //   real(30)@2    — child       (kind_id 30)
+    //
+    // The would-be trigram (0→20→30) MUST NOT be emitted because gp == 0.
+    // The bigram (20→30) SHOULD be emitted — sentinel only suppresses at emit,
+    // not in the ancestor table, so node 20 is a valid parent for node 30.
+    // The bigram (0→20) MUST NOT be emitted — sentinel at parent depth.
+    let nodes = [node(0, 0), node(20, 1), node(30, 2)];
+
+    let result = extract_ast_ngrams_with_weights(&nodes, unit_bigram_weight, unit_trigram_weight);
+
+    // No emitted trigram may have grandparent kind_id == 0.
+    for entry in &result.trigrams {
+        let (gp, _parent, _child) = entry.ngram.decode();
+        assert_ne!(
+            gp, 0,
+            "sentinel kind_id 0 must not appear as trigram grandparent"
+        );
+    }
+
+    // The valid bigram (20→30) should still be emitted.
+    let b_deep = AstBigram::encode(20, 30);
+    let bigram_keys: Vec<u32> = result.bigrams.iter().map(|e| e.ngram.key()).collect();
+    assert!(
+        bigram_keys.contains(&b_deep.key()),
+        "deeper real node (20→30) should still emit as bigram"
+    );
+
+    // No trigrams at all — the only candidate (0→20→30) is suppressed.
+    assert!(
+        result.trigrams.is_empty(),
+        "all trigrams suppressed; none should be emitted when grandparent is sentinel"
+    );
+}
+
 // ── F7 + F9: Repeated edge deduplication with count ──────────────────────────
 
 #[test]
