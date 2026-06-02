@@ -165,6 +165,113 @@ pub(crate) fn scrub_db_args(args: &str) -> String {
     out.join(" ")
 }
 
+/// Scrub credential values from an infra tool argument string.
+///
+/// Infra tools (`curl`, `wget`, `aws`, `gh`, `kubectl`, `terraform`, `docker`)
+/// frequently receive sensitive data as flags that would otherwise persist
+/// verbatim to the analytics SQLite database.
+///
+/// # Flags redacted
+///
+/// | Flag form                                   | Tools              |
+/// |---------------------------------------------|--------------------|
+/// | `-H "Authorization: Bearer TOKEN"`          | curl               |
+/// | `-H "Proxy-Authorization: Basic CREDS"`     | curl               |
+/// | `--token TOKEN` / `--token=TOKEN`           | gh, kubectl, many  |
+/// | `--password TOKEN` / `--password=TOKEN`     | aws, docker        |
+/// | `--secret TOKEN` / `--secret=TOKEN`         | terraform, docker  |
+/// | `--api-key TOKEN` / `--api-key=TOKEN`       | aws, general       |
+/// | `--access-key TOKEN` / `--access-key=TOKEN` | aws                |
+/// | `--private-key TOKEN` / `--private-key=TOKEN` | general          |
+/// | `--aws-secret-access-key TOKEN/=TOKEN`      | aws                |
+///
+/// Only the flag *values* are redacted; the flag names are preserved in the
+/// label so analytics can still identify which flags were used.
+pub(crate) fn scrub_infra_args(args: &str) -> String {
+    const INFRA_SENSITIVE_FLAGS: &[&str] = &[
+        "--token",
+        "--password",
+        "--secret",
+        "--api-key",
+        "--access-key",
+        "--private-key",
+        "--aws-secret-access-key",
+        "-H",
+        "--header",
+    ];
+
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+
+    while i < tokens.len() {
+        let tok = tokens[i];
+
+        // `--flag=value` form: redact the value portion.
+        if let Some(eq_pos) = tok.find('=') {
+            let flag = &tok[..eq_pos];
+            if INFRA_SENSITIVE_FLAGS.contains(&flag) {
+                out.push(format!("{flag}=[REDACTED]"));
+                i += 1;
+                continue;
+            }
+        }
+
+        // `-H` / `--header`: the value that follows may be an auth header.
+        //
+        // When the shell passes `-H "Authorization: Bearer TOKEN"`, the entire
+        // `Authorization: Bearer TOKEN` string is a single CLI argument.  After
+        // `args.join(" ")` re-joins the Vec<String>, this becomes multiple
+        // whitespace-separated tokens: `Authorization:`, `Bearer`, `TOKEN`.
+        // We therefore check whether the next token STARTS with an auth header
+        // prefix and, if so, redact that token and all following tokens until
+        // the next CLI flag (`-` prefix) or URL (`https?://`).
+        if tok == "-H" || tok == "--header" {
+            out.push(tok.to_string());
+            i += 1;
+            if i < tokens.len() {
+                let header_val = tokens[i];
+                let lower = header_val.to_lowercase();
+                if lower.starts_with("authorization:") || lower.starts_with("proxy-authorization:")
+                {
+                    // Redact this token and all continuation tokens until the
+                    // next flag or URL-like token.
+                    out.push("[REDACTED]".to_string());
+                    i += 1;
+                    while i < tokens.len() {
+                        let cont = tokens[i];
+                        if cont.starts_with('-') || cont.starts_with("http://") || cont.starts_with("https://") {
+                            break;
+                        }
+                        i += 1; // skip redacted continuation tokens silently
+                    }
+                } else {
+                    out.push(header_val.to_string());
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Space-separated `--flag value` form (excluding -H already handled above).
+        if INFRA_SENSITIVE_FLAGS.contains(&tok) {
+            out.push(tok.to_string());
+            i += 1;
+            if i < tokens.len() {
+                out.push("[REDACTED]".to_string());
+                i += 1;
+            }
+            continue;
+        }
+
+        // Non-sensitive token — preserve verbatim.
+        out.push(tok.to_string());
+        i += 1;
+    }
+
+    out.join(" ")
+}
+
 /// Sanitize user input for safe display in error messages.
 ///
 /// Filters to printable ASCII characters to prevent terminal escape
@@ -468,6 +575,80 @@ mod tests {
             !result.contains("[REDACTED]"),
             "no redaction should occur for port: {result}"
         );
+    }
+
+    // ========================================================================
+    // scrub_infra_args tests
+    // ========================================================================
+
+    #[test]
+    fn test_scrub_infra_args_token_space_separated() {
+        let result = scrub_infra_args("--token mysecrettoken repo list");
+        assert!(
+            !result.contains("mysecrettoken"),
+            "--token value must be redacted: {result}"
+        );
+        assert!(result.contains("--token"), "flag name must be preserved: {result}");
+        assert!(result.contains("[REDACTED]"), "redaction marker must appear: {result}");
+        assert!(result.contains("repo list"), "non-sensitive args preserved: {result}");
+    }
+
+    #[test]
+    fn test_scrub_infra_args_token_equals_form() {
+        let result = scrub_infra_args("--token=mysecrettoken repo list");
+        assert!(
+            !result.contains("mysecrettoken"),
+            "--token=value must be redacted: {result}"
+        );
+        assert!(result.contains("--token="), "flag name must be preserved: {result}");
+        assert!(result.contains("[REDACTED]"), "redaction marker must appear: {result}");
+    }
+
+    #[test]
+    fn test_scrub_infra_args_authorization_header() {
+        let result = scrub_infra_args("-H authorization: Bearer secrettoken https://api.example.com");
+        assert!(
+            !result.contains("secrettoken"),
+            "auth header value must be redacted: {result}"
+        );
+        assert!(result.contains("-H"), "flag -H must be preserved: {result}");
+        assert!(result.contains("[REDACTED]"), "redaction marker must appear: {result}");
+        assert!(
+            result.contains("https://api.example.com"),
+            "URL must be preserved: {result}"
+        );
+    }
+
+    #[test]
+    fn test_scrub_infra_args_non_auth_header_preserved() {
+        let result =
+            scrub_infra_args("-H content-type: application/json https://api.example.com");
+        assert!(
+            result.contains("content-type: application/json"),
+            "non-auth header must NOT be redacted: {result}"
+        );
+    }
+
+    #[test]
+    fn test_scrub_infra_args_password_equals_form() {
+        let result = scrub_infra_args("--password=S3cret123 --region us-east-1");
+        assert!(
+            !result.contains("S3cret123"),
+            "--password=value must be redacted: {result}"
+        );
+        assert!(result.contains("us-east-1"), "non-sensitive args preserved: {result}");
+    }
+
+    #[test]
+    fn test_scrub_infra_args_no_sensitive_flags_unchanged() {
+        let input = "get pods -n myns --output json";
+        let result = scrub_infra_args(input);
+        assert_eq!(result, input, "args with no sensitive flags must be unchanged");
+    }
+
+    #[test]
+    fn test_scrub_infra_args_empty_string() {
+        assert_eq!(scrub_infra_args(""), "");
     }
 
     // ========================================================================

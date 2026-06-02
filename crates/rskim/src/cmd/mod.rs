@@ -67,7 +67,7 @@ pub(crate) use registry::{
 };
 
 mod security;
-pub(crate) use security::{sanitize_for_display, scrub_db_args};
+pub(crate) use security::{sanitize_for_display, scrub_db_args, scrub_infra_args};
 
 #[cfg(test)]
 pub(crate) mod test_support;

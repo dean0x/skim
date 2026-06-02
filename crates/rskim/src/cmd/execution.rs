@@ -12,7 +12,7 @@ use crate::output::ParseResult;
 use crate::runner::{CommandOutput, CommandRunner};
 
 use super::{DEFAULT_CMD_TIMEOUT, is_passthrough_mode, read_stdin_bounded, should_read_stdin};
-use super::scrub_db_args;
+use super::{scrub_db_args, scrub_infra_args};
 
 /// Controls the output format of parsed command results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -335,16 +335,20 @@ where
 /// Centralises the label format so streaming and non-streaming code paths
 /// cannot drift.  `rest` is the pre-joined argument string (may be empty).
 ///
-/// For the `"db"` family, sensitive flags (passwords, usernames, hostnames)
-/// are redacted before the label is stored.  DB commands frequently embed
-/// credentials in positional flags (`-p S3cret`, `--password=S3cret`,
-/// `-U admin`, `--user=admin`, `-h myhost`, `--host=myhost`), and these
-/// must not persist to the analytics SQLite database.
+/// Sensitive flags are redacted before the label is stored to prevent
+/// credentials persisting in the analytics SQLite database:
+///
+/// - `"db"` family: passwords, usernames, hostnames (psql/mysql flags).
+/// - `"infra"` family: Authorization headers, `--token`, `--password`,
+///   `--secret`, `--api-key`, and similar flags used by curl, aws, gh, etc.
 pub(crate) fn format_analytics_label(family: &str, program: &str, rest: &str) -> String {
     if rest.is_empty() {
         format!("skim {family} {program}")
     } else if family == "db" {
         let scrubbed = scrub_db_args(rest);
+        format!("skim {family} {program} {scrubbed}")
+    } else if family == "infra" {
+        let scrubbed = scrub_infra_args(rest);
         format!("skim {family} {program} {scrubbed}")
     } else {
         format!("skim {family} {program} {rest}")
@@ -468,12 +472,30 @@ mod tests {
     }
 
     #[test]
-    fn test_format_analytics_label_non_db_not_scrubbed() {
-        // For non-db families the args are forwarded verbatim.
+    fn test_format_analytics_label_non_sensitive_infra_not_scrubbed() {
+        // Non-sensitive infra args (no auth flags) are forwarded verbatim.
         let label = format_analytics_label("infra", "kubectl", "get pods -n myns");
         assert!(
             label.contains("myns"),
-            "non-db family must not scrub args: {label}"
+            "non-sensitive infra args must not be scrubbed: {label}"
+        );
+    }
+
+    #[test]
+    fn test_format_analytics_label_infra_scrubs_token() {
+        // Sensitive --token flag must be redacted for the infra family.
+        let label = format_analytics_label("infra", "gh", "--token ghp_secrettoken repo list");
+        assert!(
+            !label.contains("ghp_secrettoken"),
+            "token value must be redacted from infra analytics label: {label}"
+        );
+        assert!(
+            label.contains("[REDACTED]"),
+            "redaction marker must be present: {label}"
+        );
+        assert!(
+            label.contains("repo list"),
+            "non-sensitive args must be preserved: {label}"
         );
     }
 
