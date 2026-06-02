@@ -385,13 +385,23 @@ mod tests {
     ///
     /// Used to verify that ERROR and MISSING nodes are never inserted into the vocabulary
     /// and therefore cannot appear as parent or child in any emitted bigram.
-    fn assert_no_kind_in_bigrams(result: &AstFileResult, vocab: &NodeKindVocabulary, forbidden: &str) {
+    fn assert_no_kind_in_bigrams(
+        result: &AstFileResult,
+        vocab: &NodeKindVocabulary,
+        forbidden: &str,
+    ) {
         for &bigram in &result.bigrams {
             let (parent_id, child_id) = crate::ast_types::decode_ast_bigram(bigram);
             let parent_kind = vocab.resolve(parent_id).unwrap_or("UNKNOWN");
             let child_kind = vocab.resolve(child_id).unwrap_or("UNKNOWN");
-            assert_ne!(parent_kind, forbidden, "bigram parent should not be {forbidden}");
-            assert_ne!(child_kind, forbidden, "bigram child should not be {forbidden}");
+            assert_ne!(
+                parent_kind, forbidden,
+                "bigram parent should not be {forbidden}"
+            );
+            assert_ne!(
+                child_kind, forbidden,
+                "bigram child should not be {forbidden}"
+            );
         }
     }
 
