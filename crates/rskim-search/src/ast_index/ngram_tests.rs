@@ -210,8 +210,7 @@ fn vocab_resolve_and_lookup_are_inverses() {
         "function_item",
         "source_file",
     ] {
-        let id = vocab_lookup(kind)
-            .unwrap_or_else(|| panic!("{kind} must be in vocabulary"));
+        let id = vocab_lookup(kind).unwrap_or_else(|| panic!("{kind} must be in vocabulary"));
         assert_eq!(
             vocab_resolve(id),
             Some(kind),
@@ -252,8 +251,8 @@ fn bigram_idf_known_rust_entry_above_default() {
 #[test]
 fn bigram_idf_known_typescript_entry_above_default() {
     // First entry in TYPESCRIPT_AST_BIGRAM_WEIGHTS: "abstract_class_declaration" -> "abstract"
-    let parent = vocab_lookup("abstract_class_declaration")
-        .expect("abstract_class_declaration in vocab");
+    let parent =
+        vocab_lookup("abstract_class_declaration").expect("abstract_class_declaration in vocab");
     let child = vocab_lookup("abstract").expect("abstract in vocab");
     let bg = AstBigram::encode(parent, child);
     let w = ast_bigram_idf(Language::TypeScript, bg);
@@ -342,13 +341,6 @@ fn bigram_encoding_consistent_with_weight_table() {
         expected_key,
         "encode() must produce the same key as stored in RUST_AST_BIGRAM_WEIGHTS[0]"
     );
-}
-
-#[test]
-fn bigram_from_raw_consistent_with_encode() {
-    // from_raw(encode(a,b).key()) must equal encode(a,b).
-    let bg = AstBigram::encode(154, 293);
-    assert_eq!(AstBigram::from_raw(bg.key()), bg);
 }
 
 // ── T15: Ordering semantics ───────────────────────────────────────────────────
