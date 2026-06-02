@@ -49,7 +49,7 @@ pub(crate) mod test;
 pub(crate) mod ux;
 
 // ============================================================================
-// Extracted submodules (refactor #255)
+// Infrastructure submodules
 // ============================================================================
 
 mod dispatch;
