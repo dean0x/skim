@@ -26,17 +26,22 @@ const CONFIG_FILE_FLAGS: &[&str] = &["--defaults-file", "--defaults-extra-file"]
 /// Each variant encodes how the token (and possibly the next token) should be
 /// handled when building the redacted output string.  `classify_token` maps a
 /// raw token to one of these actions; `scrub_db_args` drives the state machine.
+///
+/// The lifetime `'a` is tied to the input token slice so that `flag` and
+/// `prefix` can borrow directly from the original argument string rather than
+/// allocating new `String` values.  `ATTACHED_PREFIXES` entries are
+/// `&'static str`, which coerces into `'a` on assignment.
 #[derive(Debug)]
-enum TokenAction {
+enum TokenAction<'a> {
     /// Token is a connection-string URI containing embedded credentials.
     /// Replace the entire token with `[REDACTED_URI]`.
     RedactUri,
     /// Token is `--flag=value` where `flag` is sensitive.
     /// Replace with `{flag}=[REDACTED]`; the `flag` field carries the prefix.
-    RedactEqualsValue { flag: String },
+    RedactEqualsValue { flag: &'a str },
     /// Token is an attached short flag (`-pSecret`).
     /// Replace with `{prefix}[REDACTED]`; the `prefix` field carries the short flag.
-    RedactAttached { prefix: String },
+    RedactAttached { prefix: &'a str },
     /// Token is a standalone sensitive flag (`-p`, `--password`, `--defaults-file`, …).
     /// Keep the flag token as-is, then redact the *next* token.
     RedactNext,
@@ -49,7 +54,7 @@ enum TokenAction {
 /// Returns the [`TokenAction`] that `scrub_db_args` should apply to this token.
 /// All five classification branches from the original while-loop are preserved
 /// exactly, now expressed as a pure function without let-chains.
-fn classify_token(tok: &str) -> TokenAction {
+fn classify_token<'a>(tok: &'a str) -> TokenAction<'a> {
     // 1. Connection string URIs: postgresql://…@…, postgres://…@…, mysql://…@…
     if (tok.starts_with("postgresql://")
         || tok.starts_with("postgres://")
@@ -63,9 +68,7 @@ fn classify_token(tok: &str) -> TokenAction {
     if let Some(eq_pos) = tok.find('=') {
         let flag = &tok[..eq_pos];
         if SENSITIVE_FLAGS.contains(&flag) || CONFIG_FILE_FLAGS.contains(&flag) {
-            return TokenAction::RedactEqualsValue {
-                flag: flag.to_string(),
-            };
+            return TokenAction::RedactEqualsValue { flag };
         }
     }
 
@@ -75,9 +78,7 @@ fn classify_token(tok: &str) -> TokenAction {
             .iter()
             .find(|&&p| tok.starts_with(p) && tok.len() > p.len())
     {
-        return TokenAction::RedactAttached {
-            prefix: prefix.to_string(),
-        };
+        return TokenAction::RedactAttached { prefix };
     }
 
     // 4. Space-separated sensitive flags and config-file flags
