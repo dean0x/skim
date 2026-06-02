@@ -48,6 +48,30 @@ mod stats;
 pub(crate) mod test;
 pub(crate) mod ux;
 
+// ============================================================================
+// Extracted submodules (refactor #255)
+// ============================================================================
+
+mod dispatch;
+pub(crate) use dispatch::{dispatch, run_raw_passthrough};
+
+mod execution;
+pub(crate) use execution::{
+    OutputFormat, ParsedCommandConfig, RunContext, ToolRunConfig, combine_output,
+    format_analytics_label, run_parsed_command_with_mode, run_tool,
+};
+
+mod registry;
+pub(crate) use registry::{
+    KNOWN_SUBCOMMANDS, is_known_subcommand, is_meta_subcommand, wrapper_targets,
+};
+
+mod security;
+pub(crate) use security::{sanitize_for_display, scrub_db_args};
+
+#[cfg(test)]
+pub(crate) mod test_support;
+
 use std::io::{self, Read};
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -94,7 +118,7 @@ pub(crate) fn resolve_cache_dir() -> Option<std::path::PathBuf> {
 /// it once and caching it eliminates repeated allocation.  Returns `None` when
 /// the home directory cannot be determined.
 ///
-/// Matches the same pattern used by [`WRAPPER_TARGETS`].
+/// Matches the same pattern used by [`wrapper_targets()`].
 static SKIM_WRAPPERS_DIR: LazyLock<Option<std::path::PathBuf>> =
     LazyLock::new(|| dirs::home_dir().map(|h| h.join(".skim").join("bin")));
 
@@ -178,11 +202,6 @@ pub(crate) fn check_passthrough_value(val: Option<String>) -> bool {
     val.map(|v| check_passthrough_str(&v)).unwrap_or(false)
 }
 
-mod registry;
-pub(crate) use registry::{
-    KNOWN_SUBCOMMANDS, is_known_subcommand, is_meta_subcommand, wrapper_targets,
-};
-
 // ============================================================================
 // Shared helpers for subcommand parsers
 // ============================================================================
@@ -255,21 +274,6 @@ pub(crate) fn inject_flag_before_separator(args: &mut Vec<String>, flag: &str) {
         args.push(flag.to_string());
     }
 }
-
-mod execution;
-pub(crate) use execution::{
-    OutputFormat, ParsedCommandConfig, RunContext, ToolRunConfig, combine_output,
-    format_analytics_label, run_parsed_command_with_mode, run_tool,
-};
-
-mod dispatch;
-pub(crate) use dispatch::{dispatch, run_raw_passthrough};
-
-mod security;
-pub(crate) use security::{sanitize_for_display, scrub_db_args};
-
-#[cfg(test)]
-pub(crate) mod test_support;
 
 // ============================================================================
 // Tests
