@@ -504,4 +504,53 @@ mod tests {
         let label = format_analytics_label("db", "psql", "");
         assert_eq!(label, "skim db psql");
     }
+
+    // ========================================================================
+    // combine_output tests
+    // ========================================================================
+
+    fn make_cmd_output(stdout: &str, stderr: &str) -> CommandOutput {
+        CommandOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn test_combine_output_empty_stderr_borrows() {
+        // Fast path: empty stderr must return Cow::Borrowed (zero-copy).
+        let output = make_cmd_output("hello world", "");
+        let combined = combine_output(&output);
+        assert!(
+            matches!(combined, Cow::Borrowed(_)),
+            "empty stderr must produce Cow::Borrowed (zero-copy): {combined:?}"
+        );
+        assert_eq!(combined.as_ref(), "hello world");
+    }
+
+    #[test]
+    fn test_combine_output_non_empty_stderr_concatenates() {
+        // Slow path: non-empty stderr triggers owned concatenation.
+        let output = make_cmd_output("stdout line", "stderr line");
+        let combined = combine_output(&output);
+        assert!(
+            matches!(combined, Cow::Owned(_)),
+            "non-empty stderr must produce Cow::Owned (concatenation): {combined:?}"
+        );
+        assert_eq!(combined.as_ref(), "stdout line\nstderr line");
+    }
+
+    #[test]
+    fn test_combine_output_both_empty_borrows() {
+        // Both empty: stdout is empty string; stderr is empty so fast path applies.
+        let output = make_cmd_output("", "");
+        let combined = combine_output(&output);
+        assert!(
+            matches!(combined, Cow::Borrowed(_)),
+            "both empty must produce Cow::Borrowed: {combined:?}"
+        );
+        assert_eq!(combined.as_ref(), "");
+    }
 }
