@@ -24,15 +24,9 @@ use rskim_core::Language;
 
 use crate::ast_weights::{NODE_KIND_VOCABULARY, ast_bigram_weight, ast_trigram_weight};
 
-// ============================================================================
-// Type alias
-// ============================================================================
-
-/// Compact numeric ID for a tree-sitter node kind string.
-///
-/// Indexes into [`NODE_KIND_VOCABULARY`]. `0` is the sentinel for unknown kinds
-/// (maps to `""`).
-pub type NodeKindId = u16;
+// NodeKindId is defined in the parent module (ast_index/mod.rs) and imported
+// here so that both `linearize` and `ngram` share the same canonical definition.
+use super::NodeKindId;
 
 // ============================================================================
 // Constants
@@ -254,3 +248,7 @@ fn fmt_kind_id(f: &mut fmt::Formatter<'_>, id: NodeKindId) -> fmt::Result {
 #[cfg(test)]
 #[path = "ngram_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ngram_display_tests.rs"]
+mod display_tests;

@@ -32,8 +32,22 @@
 mod linearize;
 mod ngram;
 
+// ============================================================================
+// Shared type alias
+// ============================================================================
+
+/// Compact numeric ID for a tree-sitter node kind string.
+///
+/// Indexes into [`crate::ast_weights::NODE_KIND_VOCABULARY`]. `0` is the
+/// sentinel for unknown kinds (maps to `""`).
+///
+/// Defined here (the shared parent module) so that both `linearize` and
+/// `ngram` reference the same canonical definition rather than each working
+/// with a raw `u16`.
+pub type NodeKindId = u16;
+
 pub use linearize::{LinearNode, LinearizeResult, linearize_source};
 pub use ngram::{
-    AstBigram, AstTrigram, DEFAULT_AST_WEIGHT, NodeKindId, ast_bigram_idf, ast_trigram_idf,
-    vocab_len, vocab_lookup, vocab_resolve,
+    AstBigram, AstTrigram, DEFAULT_AST_WEIGHT, ast_bigram_idf, ast_trigram_idf, vocab_len,
+    vocab_lookup, vocab_resolve,
 };

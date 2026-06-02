@@ -29,6 +29,8 @@ use rskim_core::{AstWalkConfig, AstWalkIter, Language, Parser};
 use crate::ast_weights::NODE_KIND_VOCABULARY;
 use crate::types::SearchError;
 
+use super::NodeKindId;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -75,7 +77,7 @@ const MAX_FILE_SIZE_LARGE: usize = 1024 * 1024;
 pub struct LinearNode {
     /// Vocabulary ID into `NODE_KIND_VOCABULARY`. `0` is the sentinel for
     /// unknown kinds.
-    pub kind_id: u16,
+    pub kind_id: NodeKindId,
     /// 0-indexed depth from the tree root (root node is depth 0).
     pub depth: u16,
 }
