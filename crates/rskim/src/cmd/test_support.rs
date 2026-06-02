@@ -7,8 +7,9 @@
 //! than per-module duplicates.  New subcommand parsers should import from here
 //! rather than defining local equivalents.
 
-use crate::runner::CommandOutput;
 use std::time::Duration;
+
+use crate::runner::CommandOutput;
 
 /// Build a `CommandOutput` from stdout only.
 ///

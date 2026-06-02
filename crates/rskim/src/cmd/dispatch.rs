@@ -4,6 +4,7 @@
 //! by multi-category dispatchers: argument extraction, subcommand scaffolding,
 //! raw passthrough, and per-family help printers.
 
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 use super::{
@@ -86,9 +87,13 @@ pub(crate) fn run_raw_passthrough(
     let runner = crate::runner::CommandRunner::new(Some(DEFAULT_CMD_TIMEOUT));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = runner.run_with_env(program, &arg_refs, env)?;
-    print!("{}", output.stdout);
+    let mut out = io::stdout().lock();
+    write!(out, "{}", output.stdout)?;
+    out.flush()?;
     if !output.stderr.is_empty() {
-        eprint!("{}", output.stderr);
+        let mut err = io::stderr().lock();
+        write!(err, "{}", output.stderr)?;
+        err.flush()?;
     }
     let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
     Ok(ExitCode::from(code))
@@ -455,6 +460,26 @@ mod tests {
         let args: Vec<String> = vec![];
         let result = extract_subcmd("cargo", &args, "usage", "test").unwrap();
         assert!(result.is_none());
+    }
+
+    // ========================================================================
+    // prepend tests
+    // ========================================================================
+
+    /// Happy path: prepend tool name in front of a non-empty arg slice.
+    #[test]
+    fn test_prepend_happy_path() {
+        let args: Vec<String> = vec!["--release".into(), "--verbose".into()];
+        let result = prepend("cargo", &args);
+        assert_eq!(result, vec!["cargo", "--release", "--verbose"]);
+    }
+
+    /// Empty arg slice: result contains only the tool name.
+    #[test]
+    fn test_prepend_empty_args() {
+        let args: Vec<String> = vec![];
+        let result = prepend("cargo", &args);
+        assert_eq!(result, vec!["cargo"]);
     }
 
     // ========================================================================
