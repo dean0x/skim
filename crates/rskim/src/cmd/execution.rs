@@ -12,6 +12,7 @@ use crate::output::ParseResult;
 use crate::runner::{CommandOutput, CommandRunner};
 
 use super::{DEFAULT_CMD_TIMEOUT, is_passthrough_mode, read_stdin_bounded, should_read_stdin};
+use super::scrub_db_args;
 
 /// Controls the output format of parsed command results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -325,7 +326,7 @@ pub(crate) fn format_analytics_label(family: &str, program: &str, rest: &str) ->
     if rest.is_empty() {
         format!("skim {family} {program}")
     } else if family == "db" {
-        let scrubbed = super::scrub_db_args(rest);
+        let scrubbed = scrub_db_args(rest);
         format!("skim {family} {program} {scrubbed}")
     } else {
         format!("skim {family} {program} {rest}")
