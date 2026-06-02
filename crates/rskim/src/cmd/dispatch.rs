@@ -27,7 +27,7 @@ fn prepend(tool: &str, args: &[String]) -> Vec<String> {
 /// Build a `Vec<String>` with `tool` prepended and the element at `skip_idx`
 /// removed, pre-allocating the exact capacity needed.
 fn prepend_without(tool: &str, args: &[String], skip_idx: usize) -> Vec<String> {
-    debug_assert!(
+    assert!(
         skip_idx < args.len(),
         "skip_idx {skip_idx} out of bounds for args len {}",
         args.len()
@@ -496,13 +496,11 @@ mod tests {
         assert_eq!(result, vec!["cargo"]);
     }
 
-    /// Out-of-bounds skip_idx fires the debug_assert (debug builds only).
+    /// Out-of-bounds skip_idx fires the assert in all build modes.
     ///
     /// This test documents the invariant: callers are responsible for passing a
-    /// valid index.  The assert only fires in debug builds (`cfg(debug_assertions)`),
-    /// so this test is gated on that condition.
+    /// valid index.  The assert fires in both debug and release builds.
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic(expected = "skip_idx 1 out of bounds for args len 1")]
     fn test_prepend_without_panics_on_out_of_bounds() {
         let args: Vec<String> = vec!["test".into()];
