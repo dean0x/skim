@@ -196,21 +196,39 @@ fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
 
-/// Record token savings and emit the analytics event for a completed command.
+/// Parameters for recording token savings and emitting the analytics event.
 ///
-/// Separated from [`run_parsed_command_with_mode`] so the core parsing/rendering
-/// pipeline is readable as a linear sequence of steps.
-#[allow(clippy::too_many_arguments)]
-fn record_and_report(
+/// Bundles the fields that [`record_and_report`] needs, replacing the
+/// eight-positional-parameter signature and removing the
+/// `#[allow(clippy::too_many_arguments)]` suppression.  Follows the same
+/// parameter-bundling pattern as [`ParsedCommandConfig`] and [`ToolRunConfig`].
+struct RecordReport<'a> {
     show_stats: bool,
     code: i32,
     original_stdout: String,
     compressed: String,
-    rec: crate::analytics::RecordingContext<'_>,
+    rec: crate::analytics::RecordingContext<'a>,
     tier_name: &'static str,
     label: String,
     duration: std::time::Duration,
-) {
+}
+
+/// Record token savings and emit the analytics event for a completed command.
+///
+/// Separated from [`run_parsed_command_with_mode`] so the core parsing/rendering
+/// pipeline is readable as a linear sequence of steps.
+fn record_and_report(report: RecordReport<'_>) {
+    let RecordReport {
+        show_stats,
+        code,
+        original_stdout,
+        compressed,
+        rec,
+        tier_name,
+        label,
+        duration,
+    } = report;
+
     // Hint fires on ALL non-zero exits regardless of tier. Passthrough tier
     // still means skim processed the command through its rewrite hook — agents
     // need the SKIM_PASSTHROUGH=1 escape hatch surfaced since the global
@@ -298,16 +316,16 @@ where
 
     let compressed = render_output(&result, output_format)?;
 
-    record_and_report(
+    record_and_report(RecordReport {
         show_stats,
         code,
-        output.stdout,
+        original_stdout: output.stdout,
         compressed,
         rec,
         tier_name,
         label,
-        output.duration,
-    );
+        duration: output.duration,
+    });
 
     Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
