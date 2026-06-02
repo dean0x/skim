@@ -308,13 +308,18 @@ pub(crate) fn scrub_infra_args(args: &str) -> String {
                 i += 1;
                 if i < tokens.len() {
                     let lower = tokens[i].to_lowercase();
-                    if lower.starts_with("authorization:") || lower.starts_with("proxy-authorization:") {
+                    if lower.starts_with("authorization:")
+                        || lower.starts_with("proxy-authorization:")
+                    {
                         out.push("[REDACTED]".to_string());
                         i += 1;
                         // Consume continuation tokens (e.g. `Bearer`, `TOKEN`).
                         while i < tokens.len() {
                             let cont = tokens[i];
-                            if cont.starts_with('-') || cont.starts_with("http://") || cont.starts_with("https://") {
+                            if cont.starts_with('-')
+                                || cont.starts_with("http://")
+                                || cont.starts_with("https://")
+                            {
                                 break;
                             }
                             i += 1;
@@ -659,9 +664,18 @@ mod tests {
             !result.contains("mysecrettoken"),
             "--token value must be redacted: {result}"
         );
-        assert!(result.contains("--token"), "flag name must be preserved: {result}");
-        assert!(result.contains("[REDACTED]"), "redaction marker must appear: {result}");
-        assert!(result.contains("repo list"), "non-sensitive args preserved: {result}");
+        assert!(
+            result.contains("--token"),
+            "flag name must be preserved: {result}"
+        );
+        assert!(
+            result.contains("[REDACTED]"),
+            "redaction marker must appear: {result}"
+        );
+        assert!(
+            result.contains("repo list"),
+            "non-sensitive args preserved: {result}"
+        );
     }
 
     #[test]
@@ -671,19 +685,29 @@ mod tests {
             !result.contains("mysecrettoken"),
             "--token=value must be redacted: {result}"
         );
-        assert!(result.contains("--token="), "flag name must be preserved: {result}");
-        assert!(result.contains("[REDACTED]"), "redaction marker must appear: {result}");
+        assert!(
+            result.contains("--token="),
+            "flag name must be preserved: {result}"
+        );
+        assert!(
+            result.contains("[REDACTED]"),
+            "redaction marker must appear: {result}"
+        );
     }
 
     #[test]
     fn test_scrub_infra_args_authorization_header() {
-        let result = scrub_infra_args("-H authorization: Bearer secrettoken https://api.example.com");
+        let result =
+            scrub_infra_args("-H authorization: Bearer secrettoken https://api.example.com");
         assert!(
             !result.contains("secrettoken"),
             "auth header value must be redacted: {result}"
         );
         assert!(result.contains("-H"), "flag -H must be preserved: {result}");
-        assert!(result.contains("[REDACTED]"), "redaction marker must appear: {result}");
+        assert!(
+            result.contains("[REDACTED]"),
+            "redaction marker must appear: {result}"
+        );
         assert!(
             result.contains("https://api.example.com"),
             "URL must be preserved: {result}"
@@ -692,8 +716,7 @@ mod tests {
 
     #[test]
     fn test_scrub_infra_args_non_auth_header_preserved() {
-        let result =
-            scrub_infra_args("-H content-type: application/json https://api.example.com");
+        let result = scrub_infra_args("-H content-type: application/json https://api.example.com");
         assert!(
             result.contains("content-type: application/json"),
             "non-auth header must NOT be redacted: {result}"
@@ -707,14 +730,20 @@ mod tests {
             !result.contains("S3cret123"),
             "--password=value must be redacted: {result}"
         );
-        assert!(result.contains("us-east-1"), "non-sensitive args preserved: {result}");
+        assert!(
+            result.contains("us-east-1"),
+            "non-sensitive args preserved: {result}"
+        );
     }
 
     #[test]
     fn test_scrub_infra_args_no_sensitive_flags_unchanged() {
         let input = "get pods -n myns --output json";
         let result = scrub_infra_args(input);
-        assert_eq!(result, input, "args with no sensitive flags must be unchanged");
+        assert_eq!(
+            result, input,
+            "args with no sensitive flags must be unchanged"
+        );
     }
 
     #[test]
@@ -817,9 +846,8 @@ mod tests {
 
     #[test]
     fn test_scrub_infra_args_credential_url_user_password() {
-        let result = scrub_infra_args(
-            "curl https://user:hunter2@api.example.com/upload --data @file.json",
-        );
+        let result =
+            scrub_infra_args("curl https://user:hunter2@api.example.com/upload --data @file.json");
         assert!(
             !result.contains("hunter2"),
             "password in URL must be scrubbed: {result}"
@@ -847,8 +875,7 @@ mod tests {
 
     #[test]
     fn test_scrub_infra_args_credential_url_alongside_token_flag() {
-        let result =
-            scrub_infra_args("--token mysecret https://user:pass@api.example.com/v1");
+        let result = scrub_infra_args("--token mysecret https://user:pass@api.example.com/v1");
         assert!(
             !result.contains("mysecret"),
             "flag credential must be scrubbed: {result}"

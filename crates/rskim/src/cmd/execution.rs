@@ -522,7 +522,8 @@ mod tests {
     #[test]
     fn test_combine_output_non_empty_stderr_concatenates() {
         // Slow path: non-empty stderr triggers owned concatenation.
-        let output = crate::cmd::test_support::make_output_full("stdout line", "stderr line", Some(0));
+        let output =
+            crate::cmd::test_support::make_output_full("stdout line", "stderr line", Some(0));
         let combined = combine_output(&output);
         assert!(
             matches!(combined, Cow::Owned(_)),
