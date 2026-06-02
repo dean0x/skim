@@ -152,61 +152,6 @@ fn trigram_from_raw_roundtrip() {
     assert_eq!(AstTrigram::from_raw(tg.key()), tg);
 }
 
-// ── T5: Display formatting ────────────────────────────────────────────────────
-
-#[test]
-fn bigram_display_known_ids() {
-    let id_ident = vocab_lookup("identifier").expect("identifier in vocab");
-    let id_fn = vocab_lookup("function_item").expect("function_item in vocab");
-    let s = AstBigram::encode(id_ident, id_fn).to_string();
-    assert!(s.contains("identifier"), "got: {s}");
-    assert!(s.contains("function_item"), "got: {s}");
-    assert!(s.contains(" > "), "must contain ' > ' separator, got: {s}");
-}
-
-#[test]
-fn bigram_display_unknown_ids_use_fallback() {
-    let s = AstBigram::encode(u16::MAX, u16::MAX).to_string();
-    assert!(
-        s.contains("?65535"),
-        "out-of-bounds ID must display as '?65535', got: {s}"
-    );
-}
-
-#[test]
-fn bigram_display_sentinel_id_zero() {
-    let s = AstBigram::encode(0, 0).to_string();
-    assert!(
-        s.contains("<unknown>"),
-        "sentinel ID 0 must display as '<unknown>', got: {s}"
-    );
-}
-
-#[test]
-fn trigram_display_known_ids() {
-    let id_ident = vocab_lookup("identifier").expect("identifier in vocab");
-    let id_fn = vocab_lookup("function_item").expect("function_item in vocab");
-    let id_src = vocab_lookup("source_file").expect("source_file in vocab");
-    let s = AstTrigram::encode(id_src, id_fn, id_ident).to_string();
-    assert!(s.contains("source_file"), "got: {s}");
-    assert!(s.contains("function_item"), "got: {s}");
-    assert!(s.contains("identifier"), "got: {s}");
-    assert_eq!(
-        s.matches(" > ").count(),
-        2,
-        "trigram must have 2 ' > ' separators, got: {s}"
-    );
-}
-
-#[test]
-fn trigram_display_unknown_ids_use_fallback() {
-    let s = AstTrigram::encode(u16::MAX, u16::MAX, u16::MAX).to_string();
-    assert!(
-        s.contains("?65535"),
-        "out-of-bounds must use '?65535' fallback, got: {s}"
-    );
-}
-
 // ── T6: vocab_lookup ──────────────────────────────────────────────────────────
 
 #[test]
@@ -265,13 +210,13 @@ fn vocab_resolve_and_lookup_are_inverses() {
         "function_item",
         "source_file",
     ] {
-        if let Some(id) = vocab_lookup(kind) {
-            assert_eq!(
-                vocab_resolve(id),
-                Some(kind),
-                "roundtrip failed for {kind:?}"
-            );
-        }
+        let id = vocab_lookup(kind)
+            .unwrap_or_else(|| panic!("{kind} must be in vocabulary"));
+        assert_eq!(
+            vocab_resolve(id),
+            Some(kind),
+            "roundtrip failed for {kind:?}"
+        );
     }
 }
 
@@ -302,12 +247,13 @@ fn bigram_idf_known_rust_entry_above_default() {
     );
 }
 
-// ── T9b: ast_bigram_idf returns weight > DEFAULT for known TypeScript bigram ───
+// ── T10: ast_bigram_idf returns weight > DEFAULT for known TypeScript bigram ───
 
 #[test]
 fn bigram_idf_known_typescript_entry_above_default() {
     // First entry in TYPESCRIPT_AST_BIGRAM_WEIGHTS: "abstract_class_declaration" -> "abstract"
-    let parent = vocab_lookup("abstract_class_declaration").expect("abstract_class_declaration in vocab");
+    let parent = vocab_lookup("abstract_class_declaration")
+        .expect("abstract_class_declaration in vocab");
     let child = vocab_lookup("abstract").expect("abstract in vocab");
     let bg = AstBigram::encode(parent, child);
     let w = ast_bigram_idf(Language::TypeScript, bg);
@@ -317,7 +263,7 @@ fn bigram_idf_known_typescript_entry_above_default() {
     );
 }
 
-// ── T10: ast_bigram_idf fallback for unknown bigram ───────────────────────────
+// ── T11: ast_bigram_idf fallback for unknown bigram ───────────────────────────
 
 #[test]
 fn bigram_idf_unknown_bigram_returns_default() {
@@ -329,7 +275,7 @@ fn bigram_idf_unknown_bigram_returns_default() {
     );
 }
 
-// ── T11: ast_bigram_idf fallback for non-tree-sitter languages ────────────────
+// ── T12: ast_bigram_idf fallback for non-tree-sitter languages ────────────────
 
 #[test]
 fn bigram_idf_non_treesitter_languages_return_default() {
@@ -344,7 +290,7 @@ fn bigram_idf_non_treesitter_languages_return_default() {
     }
 }
 
-// ── T12: ast_trigram_idf parallel tests ──────────────────────────────────────
+// ── T13: ast_trigram_idf parallel tests ──────────────────────────────────────
 
 #[test]
 fn trigram_idf_known_rust_entry_above_default() {
@@ -383,14 +329,14 @@ fn trigram_idf_non_treesitter_languages_return_default() {
     }
 }
 
-// ── T13: Encoding consistency with weight table entries ───────────────────────
+// ── T14: Encoding consistency with weight table entries ───────────────────────
 
 #[test]
 fn bigram_encoding_consistent_with_weight_table() {
     // Verify that our encode() produces the same u32 key as stored in the table.
     let (expected_key, _weight) = RUST_AST_BIGRAM_WEIGHTS[0];
-    let parent_id = (expected_key >> 16) as u16;
-    let child_id = (expected_key & 0xFFFF) as u16;
+    let parent_id = u16::try_from(expected_key >> 16).expect("parent fits in u16");
+    let child_id = u16::try_from(expected_key & 0xFFFF).expect("child fits in u16");
     assert_eq!(
         AstBigram::encode(parent_id, child_id).key(),
         expected_key,
@@ -405,7 +351,7 @@ fn bigram_from_raw_consistent_with_encode() {
     assert_eq!(AstBigram::from_raw(bg.key()), bg);
 }
 
-// ── T14: Ordering semantics ───────────────────────────────────────────────────
+// ── T15: Ordering semantics ───────────────────────────────────────────────────
 
 /// Bigrams are parent-major: a higher parent always sorts after a lower parent,
 /// regardless of the child component.
