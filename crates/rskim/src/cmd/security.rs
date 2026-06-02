@@ -31,7 +31,7 @@ const CONFIG_FILE_FLAGS: &[&str] = &["--defaults-file", "--defaults-extra-file"]
 /// Classification of a single DB argument token for credential scrubbing.
 ///
 /// Each variant encodes how the token (and possibly the next token) should be
-/// handled when building the redacted output string.  `classify_token` maps a
+/// handled when building the redacted output string.  `classify_db_token` maps a
 /// raw token to one of these actions; `scrub_db_args` drives the state machine.
 ///
 /// The lifetime `'a` is tied to the input token slice so that `flag` and
@@ -39,7 +39,7 @@ const CONFIG_FILE_FLAGS: &[&str] = &["--defaults-file", "--defaults-extra-file"]
 /// allocating new `String` values.  `ATTACHED_PREFIXES` entries are
 /// `&'static str`, which coerces into `'a` on assignment.
 #[derive(Debug)]
-enum TokenAction<'a> {
+enum DbTokenAction<'a> {
     /// Token is a connection-string URI containing embedded credentials.
     /// Replace the entire token with `[REDACTED_URI]`.
     RedactUri,
@@ -58,24 +58,24 @@ enum TokenAction<'a> {
 
 /// Classify a single whitespace-split token for credential scrubbing.
 ///
-/// Returns the [`TokenAction`] that `scrub_db_args` should apply to this token.
+/// Returns the [`DbTokenAction`] that `scrub_db_args` should apply to this token.
 /// All five classification branches from the original while-loop are preserved
 /// exactly, now expressed as a pure function without let-chains.
-fn classify_token<'a>(tok: &'a str) -> TokenAction<'a> {
+fn classify_db_token<'a>(tok: &'a str) -> DbTokenAction<'a> {
     // 1. Connection string URIs: postgresql://…@…, postgres://…@…, mysql://…@…
     if (tok.starts_with("postgresql://")
         || tok.starts_with("postgres://")
         || tok.starts_with("mysql://"))
         && tok.contains('@')
     {
-        return TokenAction::RedactUri;
+        return DbTokenAction::RedactUri;
     }
 
     // 2. `--flag=value` form (sensitive flags and config-file flags)
     if let Some(eq_pos) = tok.find('=') {
         let flag = &tok[..eq_pos];
         if SENSITIVE_FLAGS.contains(&flag) || CONFIG_FILE_FLAGS.contains(&flag) {
-            return TokenAction::RedactEqualsValue { flag };
+            return DbTokenAction::RedactEqualsValue { flag };
         }
     }
 
@@ -85,16 +85,16 @@ fn classify_token<'a>(tok: &'a str) -> TokenAction<'a> {
             .iter()
             .find(|&&p| tok.starts_with(p) && tok.len() > p.len())
     {
-        return TokenAction::RedactAttached { prefix };
+        return DbTokenAction::RedactAttached { prefix };
     }
 
     // 4. Space-separated sensitive flags and config-file flags
     if SENSITIVE_FLAGS.contains(&tok) || CONFIG_FILE_FLAGS.contains(&tok) {
-        return TokenAction::RedactNext;
+        return DbTokenAction::RedactNext;
     }
 
     // 5. Non-sensitive token — preserve verbatim
-    TokenAction::Preserve
+    DbTokenAction::Preserve
 }
 
 /// Scrub credential values from a DB tool argument string.
@@ -140,20 +140,20 @@ pub(crate) fn scrub_db_args(args: &str) -> String {
 
     while i < tokens.len() {
         let tok = tokens[i];
-        match classify_token(tok) {
-            TokenAction::RedactUri => {
+        match classify_db_token(tok) {
+            DbTokenAction::RedactUri => {
                 out.push("[REDACTED_URI]".to_string());
                 i += 1;
             }
-            TokenAction::RedactEqualsValue { flag } => {
+            DbTokenAction::RedactEqualsValue { flag } => {
                 out.push(format!("{flag}=[REDACTED]"));
                 i += 1;
             }
-            TokenAction::RedactAttached { prefix } => {
+            DbTokenAction::RedactAttached { prefix } => {
                 out.push(format!("{prefix}[REDACTED]"));
                 i += 1;
             }
-            TokenAction::RedactNext => {
+            DbTokenAction::RedactNext => {
                 out.push(tok.to_string());
                 i += 1;
                 // Redact the following value token if present.
@@ -162,7 +162,7 @@ pub(crate) fn scrub_db_args(args: &str) -> String {
                     i += 1;
                 }
             }
-            TokenAction::Preserve => {
+            DbTokenAction::Preserve => {
                 out.push(tok.to_string());
                 i += 1;
             }
@@ -191,7 +191,7 @@ const INFRA_HEADER_FLAGS: &[&str] = &["-H", "--header"];
 
 /// Classification of a single infra argument token for credential scrubbing.
 ///
-/// Mirrors the [`TokenAction`] enum used by `scrub_db_args`, applying the same
+/// Mirrors the [`DbTokenAction`] enum used by `scrub_db_args`, applying the same
 /// pure-function decomposition to `scrub_infra_args`.  Each variant encodes
 /// what `scrub_infra_args` should emit for this token (and possibly the next).
 #[derive(Debug)]
@@ -275,7 +275,7 @@ fn classify_infra_token<'a>(tok: &'a str) -> InfraTokenAction<'a> {
 /// # Design
 ///
 /// Uses [`InfraTokenAction`] + [`classify_infra_token`] decomposition, matching
-/// the `TokenAction` + `classify_token` pattern from `scrub_db_args`.  The
+/// the [`DbTokenAction`] + `classify_db_token` pattern from `scrub_db_args`.  The
 /// state machine in this function's while-loop is kept at one nesting level;
 /// all classification logic lives in the pure [`classify_infra_token`] function.
 pub(crate) fn scrub_infra_args(args: &str) -> String {
@@ -371,37 +371,37 @@ mod tests {
     use super::*;
 
     // ========================================================================
-    // classify_token tests
+    // classify_db_token tests
     // ========================================================================
 
     #[test]
-    fn test_classify_token_uri_with_at_sign() {
-        match classify_token("postgresql://admin:hunter2@db.prod:5432/myapp") {
-            TokenAction::RedactUri => {}
+    fn test_classify_db_token_uri_with_at_sign() {
+        match classify_db_token("postgresql://admin:hunter2@db.prod:5432/myapp") {
+            DbTokenAction::RedactUri => {}
             other => panic!("expected RedactUri, got {other:?}"),
         }
-        match classify_token("mysql://root:password@localhost/db") {
-            TokenAction::RedactUri => {}
+        match classify_db_token("mysql://root:password@localhost/db") {
+            DbTokenAction::RedactUri => {}
             other => panic!("expected RedactUri, got {other:?}"),
         }
-        match classify_token("postgres://user:pass@host/db") {
-            TokenAction::RedactUri => {}
+        match classify_db_token("postgres://user:pass@host/db") {
+            DbTokenAction::RedactUri => {}
             other => panic!("expected RedactUri, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_classify_token_uri_without_at_sign_preserved() {
-        match classify_token("postgresql://localhost/mydb") {
-            TokenAction::Preserve => {}
+    fn test_classify_db_token_uri_without_at_sign_preserved() {
+        match classify_db_token("postgresql://localhost/mydb") {
+            DbTokenAction::Preserve => {}
             other => panic!("expected Preserve, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_classify_token_equals_password() {
-        match classify_token("--password=S3cret") {
-            TokenAction::RedactEqualsValue { flag } => {
+    fn test_classify_db_token_equals_password() {
+        match classify_db_token("--password=S3cret") {
+            DbTokenAction::RedactEqualsValue { flag } => {
                 assert_eq!(flag, "--password");
             }
             other => panic!("expected RedactEqualsValue, got {other:?}"),
@@ -409,9 +409,9 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_token_equals_defaults_file() {
-        match classify_token("--defaults-file=/home/user/.my.cnf") {
-            TokenAction::RedactEqualsValue { flag } => {
+    fn test_classify_db_token_equals_defaults_file() {
+        match classify_db_token("--defaults-file=/home/user/.my.cnf") {
+            DbTokenAction::RedactEqualsValue { flag } => {
                 assert_eq!(flag, "--defaults-file");
             }
             other => panic!("expected RedactEqualsValue, got {other:?}"),
@@ -419,9 +419,9 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_token_attached_password() {
-        match classify_token("-pS3cret") {
-            TokenAction::RedactAttached { prefix } => {
+    fn test_classify_db_token_attached_password() {
+        match classify_db_token("-pS3cret") {
+            DbTokenAction::RedactAttached { prefix } => {
                 assert_eq!(prefix, "-p");
             }
             other => panic!("expected RedactAttached, got {other:?}"),
@@ -429,39 +429,39 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_token_standalone_sensitive_flag() {
-        match classify_token("-p") {
-            TokenAction::RedactNext => {}
+    fn test_classify_db_token_standalone_sensitive_flag() {
+        match classify_db_token("-p") {
+            DbTokenAction::RedactNext => {}
             other => panic!("expected RedactNext, got {other:?}"),
         }
-        match classify_token("--password") {
-            TokenAction::RedactNext => {}
+        match classify_db_token("--password") {
+            DbTokenAction::RedactNext => {}
             other => panic!("expected RedactNext, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_classify_token_port_not_redacted() {
-        match classify_token("-P") {
-            TokenAction::Preserve => {}
+    fn test_classify_db_token_port_not_redacted() {
+        match classify_db_token("-P") {
+            DbTokenAction::Preserve => {}
             other => panic!("expected Preserve, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_classify_token_non_sensitive_preserved() {
+    fn test_classify_db_token_non_sensitive_preserved() {
         for tok in &["-e", "SELECT", "1", "--host-name", "localhost"] {
-            match classify_token(tok) {
-                TokenAction::Preserve => {}
+            match classify_db_token(tok) {
+                DbTokenAction::Preserve => {}
                 other => panic!("expected Preserve for {tok:?}, got {other:?}"),
             }
         }
     }
 
     #[test]
-    fn test_classify_token_empty_string() {
-        match classify_token("") {
-            TokenAction::Preserve => {}
+    fn test_classify_db_token_empty_string() {
+        match classify_db_token("") {
+            DbTokenAction::Preserve => {}
             other => panic!("expected Preserve for empty string, got {other:?}"),
         }
     }
