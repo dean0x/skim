@@ -3,7 +3,14 @@
 //! Centralises credential scrubbing and safe-display sanitization so that
 //! these concerns are not scattered across the `cmd` subtree.
 
+use crate::cmd::git::shared::scrub_credential_url;
+
 /// Flags whose *immediately following* space-separated token is a credential.
+///
+/// **DB-family semantics**: `-h` maps to `--host` for psql/mysql.  This list
+/// is intentionally scoped to the DB family; do NOT reuse it for infra tools
+/// where `-h` means `--help`, not `--host`.
+///
 /// Note: `-P` (port) intentionally omitted — it is not a credential.
 const SENSITIVE_FLAGS: &[&str] = &[
     "-p",
@@ -165,16 +172,93 @@ pub(crate) fn scrub_db_args(args: &str) -> String {
     out.join(" ")
 }
 
+/// Sensitive flags for infra tools: value (space-separated or equals-joined)
+/// must be redacted. `-H` / `--header` are handled separately via
+/// [`InfraTokenAction::RedactAuthHeader`] because they require inspecting the
+/// *following* token to determine whether it is an auth header.
+const INFRA_SENSITIVE_FLAGS: &[&str] = &[
+    "--token",
+    "--password",
+    "--secret",
+    "--api-key",
+    "--access-key",
+    "--private-key",
+    "--aws-secret-access-key",
+];
+
+/// Header flags that introduce a value which may be an auth header.
+const INFRA_HEADER_FLAGS: &[&str] = &["-H", "--header"];
+
+/// Classification of a single infra argument token for credential scrubbing.
+///
+/// Mirrors the [`TokenAction`] enum used by `scrub_db_args`, applying the same
+/// pure-function decomposition to `scrub_infra_args`.  Each variant encodes
+/// what `scrub_infra_args` should emit for this token (and possibly the next).
+#[derive(Debug)]
+enum InfraTokenAction<'a> {
+    /// Token is a credential-bearing URL (`https://TOKEN@host/...`).
+    /// Replace the entire token with the scheme + host, stripping the auth part.
+    RedactCredentialUrl,
+    /// Token is `--flag=value` where `flag` is a sensitive infra flag.
+    /// Replace with `{flag}=[REDACTED]`; `flag` carries the prefix.
+    RedactEqualsValue { flag: &'a str },
+    /// Token is a header flag (`-H` / `--header`).
+    /// The *next* token is the header value; if it starts with `Authorization:`
+    /// or `Proxy-Authorization:`, redact it and all continuation tokens.
+    RedactAuthHeader,
+    /// Token is a standalone sensitive flag (`--token`, `--password`, …).
+    /// Preserve the flag, then redact the *next* token.
+    RedactNext,
+    /// Token carries no credential information; emit it verbatim.
+    Preserve,
+}
+
+/// Classify a single whitespace-split infra token for credential scrubbing.
+///
+/// Returns the [`InfraTokenAction`] that `scrub_infra_args` should apply.
+/// This is a pure function with no side effects — all state transitions live
+/// in the caller's while-loop, keeping nesting depth at one level.
+fn classify_infra_token<'a>(tok: &'a str) -> InfraTokenAction<'a> {
+    // 1. Credential-bearing URLs: https://TOKEN@host/..., git://user@host/...
+    //    Delegate detection to the shared regex from git/shared.rs so the two
+    //    code paths cannot drift.
+    if scrub_credential_url(tok).as_ref() != tok {
+        return InfraTokenAction::RedactCredentialUrl;
+    }
+
+    // 2. `--flag=value` form: the flag is before `=`.
+    if let Some(eq_pos) = tok.find('=') {
+        let flag = &tok[..eq_pos];
+        if INFRA_SENSITIVE_FLAGS.contains(&flag) {
+            return InfraTokenAction::RedactEqualsValue { flag };
+        }
+    }
+
+    // 3. Header flags: `-H` / `--header`.
+    if INFRA_HEADER_FLAGS.contains(&tok) {
+        return InfraTokenAction::RedactAuthHeader;
+    }
+
+    // 4. Space-separated sensitive flags: `--token TOKEN`.
+    if INFRA_SENSITIVE_FLAGS.contains(&tok) {
+        return InfraTokenAction::RedactNext;
+    }
+
+    // 5. Non-sensitive token — preserve verbatim.
+    InfraTokenAction::Preserve
+}
+
 /// Scrub credential values from an infra tool argument string.
 ///
 /// Infra tools (`curl`, `wget`, `aws`, `gh`, `kubectl`, `terraform`, `docker`)
-/// frequently receive sensitive data as flags that would otherwise persist
-/// verbatim to the analytics SQLite database.
+/// frequently receive sensitive data as flags or credential URLs that would
+/// otherwise persist verbatim to the analytics SQLite database.
 ///
-/// # Flags redacted
+/// # Flags and patterns redacted
 ///
-/// | Flag form                                   | Tools              |
+/// | Pattern                                     | Tools              |
 /// |---------------------------------------------|--------------------|
+/// | `https://TOKEN@host/...` credential URLs    | curl, wget, docker |
 /// | `-H "Authorization: Bearer TOKEN"`          | curl               |
 /// | `-H "Proxy-Authorization: Basic CREDS"`     | curl               |
 /// | `--token TOKEN` / `--token=TOKEN`           | gh, kubectl, many  |
@@ -187,86 +271,73 @@ pub(crate) fn scrub_db_args(args: &str) -> String {
 ///
 /// Only the flag *values* are redacted; the flag names are preserved in the
 /// label so analytics can still identify which flags were used.
+///
+/// # Design
+///
+/// Uses [`InfraTokenAction`] + [`classify_infra_token`] decomposition, matching
+/// the `TokenAction` + `classify_token` pattern from `scrub_db_args`.  The
+/// state machine in this function's while-loop is kept at one nesting level;
+/// all classification logic lives in the pure [`classify_infra_token`] function.
 pub(crate) fn scrub_infra_args(args: &str) -> String {
-    const INFRA_SENSITIVE_FLAGS: &[&str] = &[
-        "--token",
-        "--password",
-        "--secret",
-        "--api-key",
-        "--access-key",
-        "--private-key",
-        "--aws-secret-access-key",
-        "-H",
-        "--header",
-    ];
-
     let tokens: Vec<&str> = args.split_whitespace().collect();
     let mut out: Vec<String> = Vec::with_capacity(tokens.len());
     let mut i = 0;
 
     while i < tokens.len() {
         let tok = tokens[i];
-
-        // `--flag=value` form: redact the value portion.
-        if let Some(eq_pos) = tok.find('=') {
-            let flag = &tok[..eq_pos];
-            if INFRA_SENSITIVE_FLAGS.contains(&flag) {
+        match classify_infra_token(tok) {
+            InfraTokenAction::RedactCredentialUrl => {
+                // Replace only the `<auth>@` portion via scrub_credential_url,
+                // preserving the scheme and host for analytics legibility.
+                out.push(scrub_credential_url(tok).into_owned());
+                i += 1;
+            }
+            InfraTokenAction::RedactEqualsValue { flag } => {
                 out.push(format!("{flag}=[REDACTED]"));
                 i += 1;
-                continue;
             }
-        }
-
-        // `-H` / `--header`: the value that follows may be an auth header.
-        //
-        // When the shell passes `-H "Authorization: Bearer TOKEN"`, the entire
-        // `Authorization: Bearer TOKEN` string is a single CLI argument.  After
-        // `args.join(" ")` re-joins the Vec<String>, this becomes multiple
-        // whitespace-separated tokens: `Authorization:`, `Bearer`, `TOKEN`.
-        // We therefore check whether the next token STARTS with an auth header
-        // prefix and, if so, redact that token and all following tokens until
-        // the next CLI flag (`-` prefix) or URL (`https?://`).
-        if tok == "-H" || tok == "--header" {
-            out.push(tok.to_string());
-            i += 1;
-            if i < tokens.len() {
-                let header_val = tokens[i];
-                let lower = header_val.to_lowercase();
-                if lower.starts_with("authorization:") || lower.starts_with("proxy-authorization:")
-                {
-                    // Redact this token and all continuation tokens until the
-                    // next flag or URL-like token.
-                    out.push("[REDACTED]".to_string());
-                    i += 1;
-                    while i < tokens.len() {
-                        let cont = tokens[i];
-                        if cont.starts_with('-') || cont.starts_with("http://") || cont.starts_with("https://") {
-                            break;
+            InfraTokenAction::RedactAuthHeader => {
+                // Emit the header flag itself (`-H` or `--header`), then inspect
+                // the following token.  When the shell passes
+                // `-H "Authorization: Bearer TOKEN"` the entire value is a single
+                // CLI argument; after `args.join(" ")` it splits into multiple
+                // tokens: `Authorization:`, `Bearer`, `TOKEN`.  We redact the
+                // first token and skip continuation tokens until the next flag
+                // or URL-like boundary so the full header value is suppressed.
+                out.push(tok.to_string());
+                i += 1;
+                if i < tokens.len() {
+                    let lower = tokens[i].to_lowercase();
+                    if lower.starts_with("authorization:") || lower.starts_with("proxy-authorization:") {
+                        out.push("[REDACTED]".to_string());
+                        i += 1;
+                        // Consume continuation tokens (e.g. `Bearer`, `TOKEN`).
+                        while i < tokens.len() {
+                            let cont = tokens[i];
+                            if cont.starts_with('-') || cont.starts_with("http://") || cont.starts_with("https://") {
+                                break;
+                            }
+                            i += 1;
                         }
-                        i += 1; // skip redacted continuation tokens silently
+                    } else {
+                        out.push(tokens[i].to_string());
+                        i += 1;
                     }
-                } else {
-                    out.push(header_val.to_string());
+                }
+            }
+            InfraTokenAction::RedactNext => {
+                out.push(tok.to_string());
+                i += 1;
+                if i < tokens.len() {
+                    out.push("[REDACTED]".to_string());
                     i += 1;
                 }
             }
-            continue;
-        }
-
-        // Space-separated `--flag value` form (excluding -H already handled above).
-        if INFRA_SENSITIVE_FLAGS.contains(&tok) {
-            out.push(tok.to_string());
-            i += 1;
-            if i < tokens.len() {
-                out.push("[REDACTED]".to_string());
+            InfraTokenAction::Preserve => {
+                out.push(tok.to_string());
                 i += 1;
             }
-            continue;
         }
-
-        // Non-sensitive token — preserve verbatim.
-        out.push(tok.to_string());
-        i += 1;
     }
 
     out.join(" ")
@@ -649,6 +720,158 @@ mod tests {
     #[test]
     fn test_scrub_infra_args_empty_string() {
         assert_eq!(scrub_infra_args(""), "");
+    }
+
+    // ========================================================================
+    // classify_infra_token tests
+    // ========================================================================
+
+    #[test]
+    fn test_classify_infra_token_credential_url_https() {
+        match classify_infra_token("https://ghp_secret@github.com/org/repo.git") {
+            InfraTokenAction::RedactCredentialUrl => {}
+            other => panic!("expected RedactCredentialUrl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_infra_token_credential_url_user_password() {
+        match classify_infra_token("https://user:hunter2@gitlab.com/org/repo") {
+            InfraTokenAction::RedactCredentialUrl => {}
+            other => panic!("expected RedactCredentialUrl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_infra_token_clean_url_preserved() {
+        match classify_infra_token("https://api.example.com/v1/resource") {
+            InfraTokenAction::Preserve => {}
+            other => panic!("expected Preserve for clean URL, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_infra_token_equals_form() {
+        match classify_infra_token("--token=mysecret") {
+            InfraTokenAction::RedactEqualsValue { flag } => {
+                assert_eq!(flag, "--token");
+            }
+            other => panic!("expected RedactEqualsValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_infra_token_header_flag_short() {
+        match classify_infra_token("-H") {
+            InfraTokenAction::RedactAuthHeader => {}
+            other => panic!("expected RedactAuthHeader for -H, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_infra_token_header_flag_long() {
+        match classify_infra_token("--header") {
+            InfraTokenAction::RedactAuthHeader => {}
+            other => panic!("expected RedactAuthHeader for --header, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_infra_token_standalone_sensitive() {
+        match classify_infra_token("--token") {
+            InfraTokenAction::RedactNext => {}
+            other => panic!("expected RedactNext for --token, got {other:?}"),
+        }
+        match classify_infra_token("--aws-secret-access-key") {
+            InfraTokenAction::RedactNext => {}
+            other => panic!("expected RedactNext for --aws-secret-access-key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_infra_token_non_sensitive_preserved() {
+        for tok in &["--output", "-n", "myns", "get", "pods"] {
+            match classify_infra_token(tok) {
+                InfraTokenAction::Preserve => {}
+                other => panic!("expected Preserve for {tok:?}, got {other:?}"),
+            }
+        }
+    }
+
+    // ========================================================================
+    // scrub_infra_args credential URL tests
+    // ========================================================================
+
+    #[test]
+    fn test_scrub_infra_args_credential_url_https_token() {
+        let result = scrub_infra_args("https://ghp_supersecret@github.com/org/repo.git");
+        assert!(
+            !result.contains("ghp_supersecret"),
+            "token in URL must be scrubbed: {result}"
+        );
+        assert!(
+            result.contains("github.com/org/repo.git"),
+            "host+path must be preserved: {result}"
+        );
+    }
+
+    #[test]
+    fn test_scrub_infra_args_credential_url_user_password() {
+        let result = scrub_infra_args(
+            "curl https://user:hunter2@api.example.com/upload --data @file.json",
+        );
+        assert!(
+            !result.contains("hunter2"),
+            "password in URL must be scrubbed: {result}"
+        );
+        assert!(
+            !result.contains("user:"),
+            "username in URL must be scrubbed: {result}"
+        );
+        assert!(
+            result.contains("api.example.com/upload"),
+            "host+path must be preserved: {result}"
+        );
+        assert!(
+            result.contains("--data"),
+            "non-sensitive flags must be preserved: {result}"
+        );
+    }
+
+    #[test]
+    fn test_scrub_infra_args_clean_url_not_scrubbed() {
+        let input = "curl https://api.example.com/v1/resource -X GET";
+        let result = scrub_infra_args(input);
+        assert_eq!(result, input, "clean URL must not be modified");
+    }
+
+    #[test]
+    fn test_scrub_infra_args_credential_url_alongside_token_flag() {
+        let result =
+            scrub_infra_args("--token mysecret https://user:pass@api.example.com/v1");
+        assert!(
+            !result.contains("mysecret"),
+            "flag credential must be scrubbed: {result}"
+        );
+        assert!(
+            !result.contains("user:pass"),
+            "URL credential must be scrubbed: {result}"
+        );
+        assert!(
+            result.contains("api.example.com/v1"),
+            "host+path must be preserved: {result}"
+        );
+    }
+
+    #[test]
+    fn test_scrub_infra_args_dangling_sensitive_flag() {
+        // A sensitive flag with no following token must not panic or redact extra tokens.
+        let result = scrub_infra_args("kubectl get pods --token");
+        assert!(result.contains("--token"), "dangling flag kept: {result}");
+        assert!(
+            !result.contains("[REDACTED]"),
+            "no value to redact: {result}"
+        );
     }
 
     // ========================================================================

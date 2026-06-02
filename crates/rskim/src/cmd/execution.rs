@@ -343,16 +343,14 @@ where
 ///   `--secret`, `--api-key`, and similar flags used by curl, aws, gh, etc.
 pub(crate) fn format_analytics_label(family: &str, program: &str, rest: &str) -> String {
     if rest.is_empty() {
-        format!("skim {family} {program}")
-    } else if family == "db" {
-        let scrubbed = scrub_db_args(rest);
-        format!("skim {family} {program} {scrubbed}")
-    } else if family == "infra" {
-        let scrubbed = scrub_infra_args(rest);
-        format!("skim {family} {program} {scrubbed}")
-    } else {
-        format!("skim {family} {program} {rest}")
+        return format!("skim {family} {program}");
     }
+    let scrubbed_rest = match family {
+        "db" => scrub_db_args(rest),
+        "infra" => scrub_infra_args(rest),
+        _ => rest.to_string(),
+    };
+    format!("skim {family} {program} {scrubbed_rest}")
 }
 
 /// Cross-cutting configuration for a single-tool execution.
