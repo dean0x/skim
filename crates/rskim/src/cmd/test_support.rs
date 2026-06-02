@@ -1,11 +1,11 @@
 //! Shared test helpers for subcommand parser unit tests.
 //!
-//! Centralises `make_output`, `make_output_full`, and `load_fixture` so that
-//! the ~34 local `make_output` definitions and ~41 local `load_fixture`
-//! definitions across the `cmd` subtree are replaced by a single canonical
-//! source. This eliminates drift between test helpers and ensures all tests
-//! construct `CommandOutput` values consistently (e.g., `Duration::ZERO`
-//! rather than arbitrary millisecond values).
+//! Provides canonical `make_output`, `make_output_full`, `make_output_stderr`,
+//! and `load_fixture` helpers so that subcommand parsers (e.g. `log`, `eslint`,
+//! `mypy`) construct `CommandOutput` values consistently — `Duration::ZERO`
+//! rather than arbitrary durations, and a single fixture-loading path rather
+//! than per-module duplicates.  New subcommand parsers should import from here
+//! rather than defining local equivalents.
 
 use crate::runner::CommandOutput;
 use std::time::Duration;
