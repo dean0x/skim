@@ -193,7 +193,9 @@ pub fn extract_ast_ngrams_with_weights(
             && node.kind_id != 0
         {
             let key = AstBigram::encode(p, node.kind_id);
-            let entry = bigram_map.entry(key).or_insert_with(|| (bigram_weight(key), 0));
+            let entry = bigram_map
+                .entry(key)
+                .or_insert_with(|| (bigram_weight(key), 0));
             entry.1 = entry.1.saturating_add(1);
         }
 
@@ -208,7 +210,9 @@ pub fn extract_ast_ngrams_with_weights(
             && node.kind_id != 0
         {
             let key = AstTrigram::encode(gp, p, node.kind_id);
-            let entry = trigram_map.entry(key).or_insert_with(|| (trigram_weight(key), 0));
+            let entry = trigram_map
+                .entry(key)
+                .or_insert_with(|| (trigram_weight(key), 0));
             entry.1 = entry.1.saturating_add(1);
         }
 
