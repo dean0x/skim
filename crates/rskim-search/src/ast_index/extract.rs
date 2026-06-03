@@ -149,7 +149,7 @@ pub fn extract_ast_ngrams_with_weights(
     let mut prev_depth: Option<u16> = None;
 
     for node in nodes {
-        let d = node.depth as usize;
+        let d = usize::from(node.depth);
 
         // ── Gap-fill ──────────────────────────────────────────────────────
         // A jump of more than +1 in pre-order depth means nodes were dropped
@@ -193,9 +193,8 @@ pub fn extract_ast_ngrams_with_weights(
             && node.kind_id != 0
         {
             let key = AstBigram::encode(p, node.kind_id);
-            let w = bigram_weight(key);
-            let entry = bigram_map.entry(key).or_insert((w, 0));
-            entry.1 += 1;
+            let entry = bigram_map.entry(key).or_insert_with(|| (bigram_weight(key), 0));
+            entry.1 = entry.1.saturating_add(1);
         }
 
         // ── Emit trigram ──────────────────────────────────────────────────
@@ -209,9 +208,8 @@ pub fn extract_ast_ngrams_with_weights(
             && node.kind_id != 0
         {
             let key = AstTrigram::encode(gp, p, node.kind_id);
-            let w = trigram_weight(key);
-            let entry = trigram_map.entry(key).or_insert((w, 0));
-            entry.1 += 1;
+            let entry = trigram_map.entry(key).or_insert_with(|| (trigram_weight(key), 0));
+            entry.1 = entry.1.saturating_add(1);
         }
 
         // ── Record this node in the ancestor table ────────────────────────
