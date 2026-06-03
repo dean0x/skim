@@ -776,3 +776,109 @@ fn two_nodes_at_depth_zero_no_bigram() {
         "two depth-0 nodes: no trigrams possible"
     );
 }
+
+// ── B6: Multiple distinct edges — simultaneous count assertions ──────────────
+//
+// F7/F9 each assert count for a single edge in isolation. This test asserts
+// correct per-key counts for TWO distinct edges in the same result, catching
+// any cross-contamination between HashMap entries (e.g. a bug that merges
+// counts into the wrong slot or inflates counts by visiting shared keys).
+//
+// Input:
+//   edge A (10→20) appears 3 times: root(10)@0 → child(20)@1 × 3 repetitions
+//   edge B (10→30) appears 2 times: root(10)@0 → child(30)@1 × 2 repetitions
+// Both share parent kind 10 but differ in child kind, so their keys are distinct.
+// Deduplicated result must have exactly two bigram entries with counts 3 and 2.
+
+#[test]
+fn distinct_edges_counts_independent() {
+    let nodes = [
+        node(10, 0),
+        node(20, 1), // A #1: 10→20
+        node(10, 0),
+        node(30, 1), // B #1: 10→30
+        node(10, 0),
+        node(20, 1), // A #2: 10→20
+        node(10, 0),
+        node(30, 1), // B #2: 10→30
+        node(10, 0),
+        node(20, 1), // A #3: 10→20
+    ];
+
+    let result = extract_ast_ngrams_with_weights(&nodes, unit_bigram_weight, unit_trigram_weight);
+
+    assert_eq!(
+        result.bigrams.len(),
+        2,
+        "exactly two distinct bigram entries (10→20 and 10→30)"
+    );
+
+    let edge_a = AstBigram::encode(10, 20);
+    let edge_b = AstBigram::encode(10, 30);
+
+    let entry_a = result
+        .bigrams
+        .iter()
+        .find(|e| e.ngram.key() == edge_a.key())
+        .expect("bigram 10→20 must exist");
+    let entry_b = result
+        .bigrams
+        .iter()
+        .find(|e| e.ngram.key() == edge_b.key())
+        .expect("bigram 10→30 must exist");
+
+    assert_eq!(entry_a.count, 3, "edge A (10→20) must have count == 3");
+    assert_eq!(entry_b.count, 2, "edge B (10→30) must have count == 2");
+}
+
+// ── B7: Weight-constancy on repeated edges ────────────────────────────────────
+//
+// Contract: weight is a pure function of the key — set once at first insertion
+// (`or_insert((w, 0))`), not re-computed or accumulated on each occurrence.
+// This test injects a non-unit weight for a specific edge and then repeats
+// that edge 3×, asserting the entry's weight equals the injected value (not 3×
+// the injected value, and not the default on subsequent hits). Directly guards
+// the or_insert first-insertion path against a future regression that could
+// accumulate or overwrite weights on each occurrence.
+
+#[test]
+fn weight_set_once_count_accumulates() {
+    // Edge 10→20 will carry injected weight 5.5.
+    // It appears 3 times; weight must remain 5.5, count must be 3.
+    let injected_weight = 5.5_f32;
+    let target = AstBigram::encode(10, 20);
+
+    let nodes = [
+        node(10, 0),
+        node(20, 1), // occurrence #1
+        node(10, 0),
+        node(20, 1), // occurrence #2
+        node(10, 0),
+        node(20, 1), // occurrence #3
+    ];
+
+    let bigram_w = |b: AstBigram| {
+        if b.key() == target.key() {
+            injected_weight
+        } else {
+            1.0
+        }
+    };
+
+    let result = extract_ast_ngrams_with_weights(&nodes, bigram_w, unit_trigram_weight);
+
+    let entry = result
+        .bigrams
+        .iter()
+        .find(|e| e.ngram.key() == target.key())
+        .expect("bigram 10→20 must exist");
+
+    assert_eq!(
+        entry.weight, injected_weight,
+        "weight must equal injected value (set once at first insertion, not accumulated)"
+    );
+    assert_eq!(
+        entry.count, 3,
+        "count must equal number of occurrences (accumulates independently of weight)"
+    );
+}
