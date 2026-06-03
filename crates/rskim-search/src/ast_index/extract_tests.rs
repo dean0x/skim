@@ -481,12 +481,19 @@ fn crate_root_reexports_resolve() {
     let _ = extract_ast_ngrams(&[], Language::Rust);
 }
 
-// ── P1: Performance gate (release builds only) ───────────────────────────────
+// ── P1: Large-input smoke test ────────────────────────────────────────────────
+//
+// NOTE: The real performance gate lives in `benches/linearize_bench.rs`
+// (extract_ngrams Criterion group) and runs with `cargo bench`. The previous
+// wall-clock `< 5ms` assertion here was a flaky pattern — a single un-warmed
+// call on a shared CI runner does not reliably bound latency. Replacing it
+// with a correctness-only smoke test that asserts the call completes and
+// produces non-empty output for a realistic input (applies ADR-001: don't
+// silently cap coverage).
 
-#[cfg(not(debug_assertions))]
 #[test]
-fn extract_3000_line_file_under_budget() {
-    // Generate a ~3000-line Rust fixture inline
+fn large_input_smoke_completes_nonempty() {
+    // ~3000-line Rust fixture — 200 functions × ~15 nodes each ≈ 3000 nodes
     let source: String = (0..200)
         .map(|i| {
             format!(
@@ -496,14 +503,268 @@ fn extract_3000_line_file_under_budget() {
         .collect();
 
     let linearized = linearize_source(&source, Language::Rust).expect("linearize should not fail");
-
-    let start = std::time::Instant::now();
-    let _result = extract_ast_ngrams(&linearized.nodes, Language::Rust);
-    let elapsed = start.elapsed();
+    let result = extract_ast_ngrams(&linearized.nodes, Language::Rust);
 
     assert!(
-        elapsed.as_millis() < 5,
-        "extract_ast_ngrams on ~3000-line file took {}ms (budget: 5ms)",
-        elapsed.as_millis()
+        !result.bigrams.is_empty(),
+        "large input must produce at least one bigram"
+    );
+    assert!(
+        !result.trigrams.is_empty(),
+        "large input must produce at least one trigram"
+    );
+}
+
+// ── B1: u16::MAX depth — regression guard for Batch-1 overflow fix ───────────
+//
+// Prior to the Batch-1 fix, the gap-fill condition used `p + 1` (u16 arithmetic),
+// which would wrap/overflow when p == u16::MAX. The fix widened the comparison to
+// u32: `u32::from(node.depth) > u32::from(p) + 1`. This test locks that fix.
+
+#[test]
+fn u16_max_depth_no_panic_no_spurious_null() {
+    // A single node at depth u16::MAX:
+    //   - max_depth scan yields u16::MAX → ancestor table has 65536 slots (valid).
+    //   - First node at depth 0 establishes prev_depth = 0.
+    //   - Second node at depth u16::MAX triggers gap-fill check:
+    //       u32::from(u16::MAX) > u32::from(0) + 1  → 65535 > 1 → true
+    //     so ancestors[1..65535] are nulled (no bigram for the u16::MAX node since
+    //     its parent slot at depth 65534 was just nulled).
+    //
+    // This must not panic regardless of the depth value.
+    let nodes = [node(10, 0), node(20, u16::MAX)];
+    let result = extract_ast_ngrams_with_weights(&nodes, unit_bigram_weight, unit_trigram_weight);
+
+    // No bigram: the parent slot at depth (u16::MAX - 1) was nulled by gap-fill.
+    // If the old u16 overflow bug were present, `p + 1` would wrap to 0 for
+    // p == u16::MAX and the gap-fill range would be computed incorrectly,
+    // potentially panicking on a slice index or nulling the wrong range.
+    assert!(
+        result.bigrams.is_empty(),
+        "node at u16::MAX depth with gap should produce no bigram (parent slot nulled)"
+    );
+    assert!(
+        result.trigrams.is_empty(),
+        "node at u16::MAX depth with gap should produce no trigram"
+    );
+}
+
+#[test]
+fn two_nodes_at_u16_max_depth_no_panic() {
+    // Two consecutive nodes at depth u16::MAX — no gap between them.
+    // Both are siblings; the second overwrites ancestors[u16::MAX as usize].
+    // Must not panic.
+    //
+    // Sequence:
+    //   node(10, 0)           → root, no parent
+    //   node(20, u16::MAX)    → huge jump from prev_depth=0; gap-fill fires; no bigram
+    //   node(30, u16::MAX)    → prev_depth = u16::MAX; depth unchanged; no gap-fill
+    //                           parent = ancestors[u16::MAX - 1] = None (nulled by prev gap)
+    //                           → no bigram
+    let nodes = [node(10, 0), node(20, u16::MAX), node(30, u16::MAX)];
+    let result = extract_ast_ngrams_with_weights(&nodes, unit_bigram_weight, unit_trigram_weight);
+
+    // Gap-fill on the first u16::MAX node nulls ancestors[1..u16::MAX-1], so neither
+    // u16::MAX node can find a valid parent. No bigrams or trigrams.
+    assert!(
+        result.bigrams.is_empty(),
+        "consecutive nodes at u16::MAX must produce no bigrams"
+    );
+    assert!(
+        result.trigrams.is_empty(),
+        "consecutive nodes at u16::MAX must produce no trigrams"
+    );
+}
+
+// ── B2: Documented residual gap-fill edge case — characterization ─────────────
+//
+// From KNOWLEDGE.md lines 198-204:
+//   A dropped ERROR node that had a same-depth preceding sibling leaves no gap
+//   in depth values, so the orphaned child binds to that sibling as its parent —
+//   a spurious edge.
+//
+// This test characterizes the CURRENT (accepted) behaviour. If a future change
+// silently alters it, this test will fail — requiring an explicit decision.
+//
+// Scenario:
+//   A@0  (kind 10) — root
+//   B@1  (kind 20) — real sibling
+//   C@1  (kind 30) — orphaned child's mistaken parent (same depth as dropped ERROR)
+//   D@2  (kind 40) — the child that should be ERROR's child, now spuriously bound to C
+//
+// In a correct tree, D would be a child of the dropped ERROR node (itself at
+// depth 1), not of C. But since there is no depth gap between C@1 and D@2, the
+// gap-fill heuristic does not fire, and ancestors[1] = C (kind 30) when D is
+// processed. The spurious edge C→D IS emitted.
+
+#[test]
+fn dropped_error_with_same_depth_sibling_emits_documented_spurious_edge() {
+    // B and C are both at depth 1 (siblings under A). In the original broken
+    // tree, C was the sibling of a dropped ERROR node. D was the ERROR's child
+    // but the ERROR was dropped, so D appears as depth 2 directly after C@1
+    // without any depth gap.
+    let nodes = [node(10, 0), node(20, 1), node(30, 1), node(40, 2)];
+
+    let result = extract_ast_ngrams_with_weights(&nodes, unit_bigram_weight, unit_trigram_weight);
+
+    // The spurious edge C→D (30→40) MUST be present per the documented behaviour.
+    let spurious = AstBigram::encode(30, 40);
+    let keys: Vec<u32> = result.bigrams.iter().map(|e| e.ngram.key()).collect();
+    assert!(
+        keys.contains(&spurious.key()),
+        "documented spurious edge (same-depth-sibling parent) must be emitted at default weight"
+    );
+
+    // Confirm the spurious bigram has the default weight (1.0), as documented:
+    // the spurious pair almost always misses the selective weight table.
+    let spurious_entry = result
+        .bigrams
+        .iter()
+        .find(|e| e.ngram.key() == spurious.key())
+        .expect("spurious entry must exist");
+    assert_eq!(
+        spurious_entry.weight, DEFAULT_AST_WEIGHT,
+        "spurious edge must carry default weight (1.0)"
+    );
+
+    // The valid edges A→B (10→20) and A→C (10→30) must also be present.
+    let valid_ab = AstBigram::encode(10, 20);
+    let valid_ac = AstBigram::encode(10, 30);
+    assert!(keys.contains(&valid_ab.key()), "valid edge A→B must exist");
+    assert!(keys.contains(&valid_ac.key()), "valid edge A→C must exist");
+}
+
+// ── B3: Trigram count accumulation ───────────────────────────────────────────
+//
+// Bigram count tests (F7, F9) exist but no trigram-count test. Verify that
+// a repeated GP→P→C triple is deduplicated to a single entry with count == 3.
+
+#[test]
+fn trigram_count_accumulates_for_repeated_triple() {
+    // Repeat the GP(10)→P(20)→C(30) triple three times.
+    // Each repetition: root@0 → parent@1 → child@2.
+    let nodes = [
+        node(10, 0),
+        node(20, 1),
+        node(30, 2), // triple #1: GP=10, P=20, C=30
+        node(10, 0),
+        node(20, 1),
+        node(30, 2), // triple #2
+        node(10, 0),
+        node(20, 1),
+        node(30, 2), // triple #3
+    ];
+
+    let result = extract_ast_ngrams_with_weights(&nodes, unit_bigram_weight, unit_trigram_weight);
+
+    let target = AstTrigram::encode(10, 20, 30);
+    let entry = result
+        .trigrams
+        .iter()
+        .find(|e| e.ngram.key() == target.key())
+        .expect("trigram GP=10→P=20→C=30 should exist");
+
+    assert_eq!(
+        entry.count, 3,
+        "repeated trigram should accumulate count == 3"
+    );
+
+    // Deduplicated: exactly one entry for this triple.
+    let occurrences = result
+        .trigrams
+        .iter()
+        .filter(|e| e.ngram.key() == target.key())
+        .count();
+    assert_eq!(occurrences, 1, "trigram must be deduplicated to a single entry");
+}
+
+// ── B4: Max-depth boundary — gap-fill slice upper boundary ───────────────────
+//
+// A node at a high observed depth followed by a jump to max_depth exercises
+// the gap-fill slice `fill_start..d` when d approaches `ancestors.len() - 1`.
+// Pins the exact slice that previously lacked an explicit bounds guard.
+
+#[test]
+fn gap_fill_at_max_depth_boundary_no_panic() {
+    // max_depth will be 10.  Ancestor table: [None; 11].
+    // Node at depth 1 establishes prev_depth = 1.
+    // Node at depth 10 triggers gap-fill: fill_start = 2, d = 10.
+    // Slice is ancestors[2..10] — entirely within the table (len 11).
+    // ancestors[9] (the parent slot for depth 10) is nulled → no bigram.
+    let nodes = [node(10, 0), node(20, 1), node(30, 10)];
+
+    let result = extract_ast_ngrams_with_weights(&nodes, unit_bigram_weight, unit_trigram_weight);
+
+    // Only the 10→20 bigram should be valid; the node at depth 10 has no parent.
+    let valid = AstBigram::encode(10, 20);
+    let keys: Vec<u32> = result.bigrams.iter().map(|e| e.ngram.key()).collect();
+    assert!(
+        keys.contains(&valid.key()),
+        "valid bigram 10→20 must survive a max-depth gap-fill"
+    );
+    assert_eq!(
+        keys.len(),
+        1,
+        "only the valid bigram; the depth-10 node has no valid parent after gap-fill"
+    );
+    assert!(
+        result.trigrams.is_empty(),
+        "no trigrams: depth-10 node orphaned by gap-fill"
+    );
+}
+
+#[test]
+fn gap_fill_slice_to_exact_max_depth_no_panic() {
+    // max_depth = 5. prev_depth established at 0. Next node at depth 5 jumps
+    // by 5, driving gap-fill range to fill_start=1..d=5 (the table boundary
+    // is at index 5 = max_depth, slice [1..5] is valid and non-panicking).
+    let nodes = [node(10, 0), node(20, 5)];
+
+    let result = extract_ast_ngrams_with_weights(&nodes, unit_bigram_weight, unit_trigram_weight);
+
+    // No bigram: parent slot (depth 4) was nulled.
+    assert!(
+        result.bigrams.is_empty(),
+        "node with full-range gap-fill must produce no bigram"
+    );
+}
+
+// ── B5: Depth-0 underflow — checked_sub guards ───────────────────────────────
+//
+// A single node at depth 0 cannot compute a parent (checked_sub(1) = None) or
+// grandparent (checked_sub(2) = None), so no bigram or trigram is emitted.
+// Two nodes at depth 0 (siblings at root level) also produce no bigrams because
+// each has parent = None.
+
+#[test]
+fn single_node_depth_zero_no_output() {
+    // Only one node — depth 0, no parent possible.
+    let nodes = [node(10, 0)];
+    let result = extract_ast_ngrams_with_weights(&nodes, unit_bigram_weight, unit_trigram_weight);
+
+    assert!(
+        result.bigrams.is_empty(),
+        "single depth-0 node: checked_sub(1) = None → no bigram"
+    );
+    assert!(
+        result.trigrams.is_empty(),
+        "single depth-0 node: no trigram possible"
+    );
+}
+
+#[test]
+fn two_nodes_at_depth_zero_no_bigram() {
+    // Two depth-0 siblings — neither has a parent (checked_sub(1) = None for
+    // depth 0). The sibling→sibling edge must NOT be emitted.
+    let nodes = [node(10, 0), node(20, 0)];
+    let result = extract_ast_ngrams_with_weights(&nodes, unit_bigram_weight, unit_trigram_weight);
+
+    assert!(
+        result.bigrams.is_empty(),
+        "two depth-0 nodes: both have no parent → no bigrams"
+    );
+    assert!(
+        result.trigrams.is_empty(),
+        "two depth-0 nodes: no trigrams possible"
     );
 }
