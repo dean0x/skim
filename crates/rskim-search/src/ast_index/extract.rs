@@ -136,38 +136,28 @@ pub fn extract_ast_ngrams_with_weights(
         // A jump of more than +1 in pre-order depth means nodes were dropped
         // (ERROR/MISSING in the original CST). Null the skipped ancestor slots
         // to break the parent–child chain.
-        //
-        // The two-level `if` is intentional: the outer `if let` extracts
-        // `prev_depth`, the inner `if` checks the gap condition. Collapsing
-        // into `if let Some(p) = prev_depth && node.depth > p + 1` is
-        // equivalent but less readable. `#[allow(clippy::collapsible_if)]`
-        // keeps both guards explicit.
         #[allow(clippy::collapsible_if)]
         if let Some(p) = prev_depth {
             if node.depth > p + 1 {
-                let start = usize::from(p + 1);
-                let end = d; // d == node.depth as usize (exclusive upper bound)
-                if start < end && end <= ancestors.len() {
-                    for slot in &mut ancestors[start..end] {
-                        *slot = None;
-                    }
+                for slot in &mut ancestors[usize::from(p + 1)..d] {
+                    *slot = None;
                 }
             }
         }
 
         // ── Resolve parent and grandparent from the ancestor table ────────
-        let parent: Option<NodeKindId> = (d as u16)
+        let parent: Option<NodeKindId> = node
+            .depth
             .checked_sub(1)
             .and_then(|pd| ancestors.get(usize::from(pd)).copied().flatten());
 
-        let grandparent: Option<NodeKindId> = (d as u16)
+        let grandparent: Option<NodeKindId> = node
+            .depth
             .checked_sub(2)
             .and_then(|gd| ancestors.get(usize::from(gd)).copied().flatten());
 
         // ── Emit bigram ───────────────────────────────────────────────────
-        // Suppress when parent is None, parent kind_id == 0, or child kind_id == 0.
-        // The two-level `if` keeps the `if let` pattern-match separate from the
-        // sentinel-zero guard; see ast_extract.rs for the same convention.
+        // Suppress sentinel kind_id == 0 on both sides.
         #[allow(clippy::collapsible_if)]
         if let Some(p) = parent {
             if p != 0 && node.kind_id != 0 {
@@ -180,9 +170,6 @@ pub fn extract_ast_ngrams_with_weights(
 
         // ── Emit trigram ──────────────────────────────────────────────────
         // Suppress when any of the three kind IDs is 0 or an ancestor is None.
-        // The two-level `if` is intentional: the outer `if let` unpacks both
-        // ancestors; the inner `if` checks sentinel-zero guards. Collapsing
-        // would force construction of the Option tuple unconditionally.
         #[allow(clippy::collapsible_if)]
         if let (Some(gp), Some(p)) = (grandparent, parent) {
             if gp != 0 && p != 0 && node.kind_id != 0 {
