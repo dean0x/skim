@@ -680,7 +680,10 @@ fn trigram_count_accumulates_for_repeated_triple() {
         .iter()
         .filter(|e| e.ngram.key() == target.key())
         .count();
-    assert_eq!(occurrences, 1, "trigram must be deduplicated to a single entry");
+    assert_eq!(
+        occurrences, 1,
+        "trigram must be deduplicated to a single entry"
+    );
 }
 
 // ── B4: Max-depth boundary — gap-fill slice upper boundary ───────────────────

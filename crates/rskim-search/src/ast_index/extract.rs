@@ -160,7 +160,10 @@ pub fn extract_ast_ngrams_with_weights(
             && u32::from(node.depth) > u32::from(p) + 1
         {
             let fill_start = usize::from(p) + 1;
-            debug_assert!(fill_start < d, "gap-fill range [{fill_start}..{d}) must be non-empty");
+            debug_assert!(
+                fill_start < d,
+                "gap-fill range [{fill_start}..{d}) must be non-empty"
+            );
             for slot in &mut ancestors[fill_start..d] {
                 *slot = None;
             }
@@ -168,7 +171,10 @@ pub fn extract_ast_ngrams_with_weights(
 
         // ── Resolve parent and grandparent from the ancestor table ────────
         let table_len = ancestors.len();
-        debug_assert!(d < table_len, "depth {d} out of ancestor table (len={table_len})");
+        debug_assert!(
+            d < table_len,
+            "depth {d} out of ancestor table (len={table_len})"
+        );
 
         let parent: Option<NodeKindId> = node
             .depth
