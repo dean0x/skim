@@ -8,8 +8,11 @@
 //! # Design
 //!
 //! - Depth-jump gap-fill: a jump `> +1` in pre-order depth means a node was
-//!   dropped (ERROR/MISSING in the original CST). The ancestor slots for the
-//!   skipped depths are nulled to break the parent–child chain.
+//!   likely dropped (ERROR/MISSING in the original CST). The ancestor slots
+//!   for the skipped depths are nulled to approximately break the parent–child
+//!   chain. This is a depth-jump heuristic: it cannot detect a dropped ERROR
+//!   node that had a same-depth preceding sibling (no gap is left), so one
+//!   class of spurious edges remains — see the documented residual edge case.
 //! - Sentinel `kind_id == 0` nodes are recorded in the ancestor table (to
 //!   maintain correct depth positions) but never emitted in any n-gram key.
 //! - Output carries `(ngram, weight, count)` — `count` is the term frequency
@@ -87,7 +90,7 @@ pub struct AstNgramSet {
 /// 3. For each node in pre-order:
 ///    - **Gap-fill**: if depth jumped by more than one from the previous
 ///      node, null the skipped ancestor slots (dropped ERROR/MISSING nodes
-///      broke the chain).
+///      approximately broke the chain).
 ///    - Read `parent = ancestors[depth - 1]` and `gp = ancestors[depth - 2]`.
 ///    - **Emit bigram** when `parent` is `Some(p)` AND `p != 0` AND
 ///      `node.kind_id != 0` (sentinel suppression on both sides).
@@ -95,6 +98,15 @@ pub struct AstNgramSet {
 ///      three kind IDs are `!= 0`.
 ///    - Record `ancestors[depth] = Some(node.kind_id)`.
 /// 4. Convert accumulation maps → sorted entry vecs, return.
+///
+/// # Allocation
+///
+/// Allocates O(`max_depth`) for the ancestor table and O(`nodes.len()`) for
+/// the accumulation maps. Callers are responsible for bounding inputs.
+/// Production callers route through `linearize_source`, which caps depth at
+/// 500 and node count at 100K (`AstWalkConfig::DEFAULT_MAX_DEPTH/NODES`).
+/// When calling this function directly with synthetic nodes, ensure `depth`
+/// values and slice length stay within acceptable bounds.
 ///
 /// # Parameters
 ///
@@ -114,6 +126,10 @@ pub fn extract_ast_ngrams_with_weights(
     // Single bounded pass to find the maximum depth. This determines the
     // minimum ancestor table size — one allocation, no per-iteration growth.
     let max_depth = nodes.iter().map(|n| n.depth).max().unwrap_or(0);
+    debug_assert!(
+        usize::from(max_depth) < 65536,
+        "max_depth {max_depth} overflows ancestor table index"
+    );
 
     // Ancestor table: `ancestors[d]` = `Some(kind_id)` of the node at depth d,
     // or `None` if that slot was nulled by gap-fill or never filled.
@@ -123,9 +139,12 @@ pub fn extract_ast_ngrams_with_weights(
     // Accumulation maps: key → (weight, count).
     // Weight is a pure function of the key so it's constant per unique key;
     // count is the term frequency (number of emitted occurrences).
-    // Pre-size to nodes.len() as a reasonable upper bound on unique n-grams.
-    let mut bigram_map: HashMap<AstBigram, (f32, u32)> = HashMap::with_capacity(nodes.len());
-    let mut trigram_map: HashMap<AstTrigram, (f32, u32)> = HashMap::with_capacity(nodes.len());
+    // Cap initial capacity at 1024: unique n-grams are typically an order of
+    // magnitude smaller than the total node count (most edges repeat across
+    // a file), so pre-sizing to nodes.len() wastes memory.
+    let cap = nodes.len().min(1024);
+    let mut bigram_map: HashMap<AstBigram, (f32, u32)> = HashMap::with_capacity(cap);
+    let mut trigram_map: HashMap<AstTrigram, (f32, u32)> = HashMap::with_capacity(cap);
 
     let mut prev_depth: Option<u16> = None;
 
@@ -135,17 +154,21 @@ pub fn extract_ast_ngrams_with_weights(
         // ── Gap-fill ──────────────────────────────────────────────────────
         // A jump of more than +1 in pre-order depth means nodes were dropped
         // (ERROR/MISSING in the original CST). Null the skipped ancestor slots
-        // to break the parent–child chain.
-        #[allow(clippy::collapsible_if)]
-        if let Some(p) = prev_depth {
-            if node.depth > p + 1 {
-                for slot in &mut ancestors[usize::from(p + 1)..d] {
-                    *slot = None;
-                }
+        // to approximately break the parent–child chain.
+        // Widen to u32 before adding 1 to avoid u16 overflow when p == u16::MAX.
+        if let Some(p) = prev_depth
+            && u32::from(node.depth) > u32::from(p) + 1
+        {
+            let fill_start = usize::from(p) + 1;
+            debug_assert!(fill_start < d, "gap-fill range [{fill_start}..{d}) must be non-empty");
+            for slot in &mut ancestors[fill_start..d] {
+                *slot = None;
             }
         }
 
         // ── Resolve parent and grandparent from the ancestor table ────────
+        debug_assert!(d < ancestors.len(), "depth index {d} out of ancestor table (len={})", ancestors.len());
+
         let parent: Option<NodeKindId> = node
             .depth
             .checked_sub(1)
@@ -158,26 +181,30 @@ pub fn extract_ast_ngrams_with_weights(
 
         // ── Emit bigram ───────────────────────────────────────────────────
         // Suppress sentinel kind_id == 0 on both sides.
-        #[allow(clippy::collapsible_if)]
-        if let Some(p) = parent {
-            if p != 0 && node.kind_id != 0 {
-                let key = AstBigram::encode(p, node.kind_id);
-                let w = bigram_weight(key);
-                let entry = bigram_map.entry(key).or_insert((w, 0));
-                entry.1 += 1;
-            }
+        if let Some(p) = parent
+            && p != 0
+            && node.kind_id != 0
+        {
+            let key = AstBigram::encode(p, node.kind_id);
+            let w = bigram_weight(key);
+            let entry = bigram_map.entry(key).or_insert((w, 0));
+            entry.1 += 1;
         }
 
         // ── Emit trigram ──────────────────────────────────────────────────
         // Suppress when any of the three kind IDs is 0 or an ancestor is None.
-        #[allow(clippy::collapsible_if)]
-        if let (Some(gp), Some(p)) = (grandparent, parent) {
-            if gp != 0 && p != 0 && node.kind_id != 0 {
-                let key = AstTrigram::encode(gp, p, node.kind_id);
-                let w = trigram_weight(key);
-                let entry = trigram_map.entry(key).or_insert((w, 0));
-                entry.1 += 1;
-            }
+        // No explicit cap: input is already bounded upstream by DEFAULT_MAX_NODES
+        // (100K), so the total edge count is naturally bounded without a separate
+        // per-file trigram limit.
+        if let (Some(gp), Some(p)) = (grandparent, parent)
+            && gp != 0
+            && p != 0
+            && node.kind_id != 0
+        {
+            let key = AstTrigram::encode(gp, p, node.kind_id);
+            let w = trigram_weight(key);
+            let entry = trigram_map.entry(key).or_insert((w, 0));
+            entry.1 += 1;
         }
 
         // ── Record this node in the ancestor table ────────────────────────
