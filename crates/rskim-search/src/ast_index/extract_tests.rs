@@ -834,7 +834,7 @@ fn distinct_edges_counts_independent() {
 // ── B7: Weight-constancy on repeated edges ────────────────────────────────────
 //
 // Contract: weight is a pure function of the key — set once at first insertion
-// (`or_insert((w, 0))`), not re-computed or accumulated on each occurrence.
+// (`or_insert_with(|| (weight, 0))`), not re-computed or accumulated on each occurrence.
 // This test injects a non-unit weight for a specific edge and then repeats
 // that edge 3×, asserting the entry's weight equals the injected value (not 3×
 // the injected value, and not the default on subsequent hits). Directly guards
