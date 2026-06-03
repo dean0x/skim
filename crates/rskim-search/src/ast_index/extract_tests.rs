@@ -25,6 +25,11 @@ fn node(kind_id: u16, depth: u16) -> LinearNode {
     LinearNode { kind_id, depth }
 }
 
+/// Collect bigram keys from a result set for membership assertions.
+fn bigram_keys(set: &AstNgramSet) -> Vec<u32> {
+    set.bigrams.iter().map(|e| e.ngram.key()).collect()
+}
+
 // ── F1: Empty input ───────────────────────────────────────────────────────────
 
 #[test]
@@ -57,7 +62,7 @@ fn linear_chain_root_child_grandchild() {
 
     assert_eq!(result.bigrams.len(), 2, "expected exactly 2 bigrams");
 
-    let keys: Vec<u32> = result.bigrams.iter().map(|e| e.ngram.key()).collect();
+    let keys = bigram_keys(&result);
     assert!(keys.contains(&b1.key()), "missing bigram 10→20");
     assert!(keys.contains(&b2.key()), "missing bigram 20→30");
 
@@ -82,7 +87,7 @@ fn siblings_bind_to_parent_not_each_other() {
     let b_root_b = AstBigram::encode(10, 30);
     let b_sibling = AstBigram::encode(20, 30); // should NOT exist
 
-    let keys: Vec<u32> = result.bigrams.iter().map(|e| e.ngram.key()).collect();
+    let keys = bigram_keys(&result);
     assert!(keys.contains(&b_root_a.key()), "missing bigram root→sibA");
     assert!(keys.contains(&b_root_b.key()), "missing bigram root→sibB");
     assert!(
@@ -106,7 +111,7 @@ fn same_kind_two_depths_distinct_bigrams() {
     let b1 = AstBigram::encode(10, 50); // 10 → 50 (depth 0 → depth 1)
     let b2 = AstBigram::encode(60, 50); // 60 → 50 (depth 1 → depth 2)
 
-    let keys: Vec<u32> = result.bigrams.iter().map(|e| e.ngram.key()).collect();
+    let keys = bigram_keys(&result);
     assert!(keys.contains(&b1.key()), "missing bigram 10→50");
     assert!(keys.contains(&b2.key()), "missing bigram 60→50");
 
@@ -125,7 +130,7 @@ fn depth_jump_breaks_chain() {
 
     // The node at depth 3 should NOT emit a bigram because ancestors[2] = None (gap)
     let b_gap = AstBigram::encode(20, 30); // would be wrong — depth 2 was nulled
-    let keys: Vec<u32> = result.bigrams.iter().map(|e| e.ngram.key()).collect();
+    let keys = bigram_keys(&result);
 
     // Only the 10→20 bigram should exist; the jump-orphan at depth 3 must NOT appear
     assert!(
@@ -149,7 +154,7 @@ fn two_dropped_nodes_wide_gap() {
 
     // Node at depth 4 should NOT emit bigram since ancestors[3] = None
     // (both ancestors[2] and ancestors[3] were nulled by gap-fill)
-    let keys: Vec<u32> = result.bigrams.iter().map(|e| e.ngram.key()).collect();
+    let keys = bigram_keys(&result);
 
     // Only the 10→20 bigram should exist
     let b_valid = AstBigram::encode(10, 20);
@@ -188,7 +193,7 @@ fn sentinel_parent_suppresses_ngram() {
     // The node at depth 1 has parent kind_id 0 → suppressed; no bigram for (0→20)
     // The node at depth 2 has parent at depth 1 (kind 20) — valid bigram (20→30) should emit
     let b_deep = AstBigram::encode(20, 30);
-    let keys: Vec<u32> = result.bigrams.iter().map(|e| e.ngram.key()).collect();
+    let keys = bigram_keys(&result);
     assert!(
         keys.contains(&b_deep.key()),
         "deeper real node (20→30) should still emit"
@@ -226,7 +231,7 @@ fn sentinel_grandparent_suppresses_trigram() {
 
     // The valid bigram (20→30) should still be emitted.
     let b_deep = AstBigram::encode(20, 30);
-    let bigram_keys: Vec<u32> = result.bigrams.iter().map(|e| e.ngram.key()).collect();
+    let bigram_keys = bigram_keys(&result);
     assert!(
         bigram_keys.contains(&b_deep.key()),
         "deeper real node (20→30) should still emit as bigram"
@@ -609,7 +614,7 @@ fn dropped_error_with_same_depth_sibling_emits_documented_spurious_edge() {
 
     // The spurious edge C→D (30→40) MUST be present per the documented behaviour.
     let spurious = AstBigram::encode(30, 40);
-    let keys: Vec<u32> = result.bigrams.iter().map(|e| e.ngram.key()).collect();
+    let keys = bigram_keys(&result);
     assert!(
         keys.contains(&spurious.key()),
         "documented spurious edge (same-depth-sibling parent) must be emitted at default weight"
@@ -697,7 +702,7 @@ fn gap_fill_at_max_depth_boundary_no_panic() {
 
     // Only the 10→20 bigram should be valid; the node at depth 10 has no parent.
     let valid = AstBigram::encode(10, 20);
-    let keys: Vec<u32> = result.bigrams.iter().map(|e| e.ngram.key()).collect();
+    let keys = bigram_keys(&result);
     assert!(
         keys.contains(&valid.key()),
         "valid bigram 10→20 must survive a max-depth gap-fill"

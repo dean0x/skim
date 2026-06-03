@@ -167,7 +167,8 @@ pub fn extract_ast_ngrams_with_weights(
         }
 
         // ── Resolve parent and grandparent from the ancestor table ────────
-        debug_assert!(d < ancestors.len(), "depth index {d} out of ancestor table (len={})", ancestors.len());
+        let table_len = ancestors.len();
+        debug_assert!(d < table_len, "depth {d} out of ancestor table (len={table_len})");
 
         let parent: Option<NodeKindId> = node
             .depth
