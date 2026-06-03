@@ -355,12 +355,9 @@ fn extract_json_message(obj: &Value) -> Option<String> {
 /// - Does NOT itself match the `RE_LOG_STACK_TRACE` pattern (which would start
 ///   a new logical frame)
 ///
-/// Called only when `in_python_frame` is true to avoid false positives on
-/// non-Python indented content.
-fn is_python_continuation(line: &str, in_python_frame: bool) -> bool {
-    if !in_python_frame {
-        return false;
-    }
+/// Callers must gate on `in_python_frame` before calling — this function tests
+/// only the line's structure, not parser state.
+fn is_python_continuation(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return false;
@@ -407,12 +404,12 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
     let mut total_stack_frames_elided: usize = 0;
     // Tracks whether the last recognised stack frame was a Python `File "..."` line,
     // enabling source-preview and PEP 657 caret continuation detection.
-    let mut in_python_frame: bool = false;
+    let mut in_python_frame = false;
 
     for line in input.lines().take(MAX_INPUT_LINES) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            // Blank lines flush the pending stack (end of exception block).
+            // Step 1: Blank lines flush the pending stack (end of exception block).
             if !pending_stack.is_empty() && !all_entries.is_empty() {
                 flush_stack_frames(
                     &mut all_entries,
@@ -442,7 +439,7 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
         // Step 3: Python source-preview / PEP 657 caret continuation.
         // Must run BEFORE classify_log_line so source lines containing "ERROR:"
         // or similar keywords are not misclassified as new log entries.
-        if is_python_continuation(line, in_python_frame) {
+        if in_python_frame && is_python_continuation(line) {
             if let Some(last_frame) = pending_stack.back_mut() {
                 last_frame.push('\n');
                 last_frame.push_str(trimmed);
@@ -461,6 +458,7 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
             } else {
                 all_entries.push((None, trimmed.to_string()));
             }
+            in_python_frame = false;
             found_structured = true;
             continue;
         }
@@ -476,6 +474,7 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
                     &mut total_stack_frames_elided,
                 );
             }
+            in_python_frame = false;
             all_entries.push((None, trimmed.to_string()));
             continue;
         }
