@@ -8,7 +8,7 @@
 //! - **Tier 2 (Degraded)**: Regex on common log formats (timestamp + level)
 //! - **Tier 3 (Passthrough)**: Raw output
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 use std::sync::LazyLock;
@@ -22,12 +22,16 @@ use crate::output::canonical::{LogEntry, LogResult};
 /// Maximum input lines before truncation.
 const MAX_INPUT_LINES: usize = 100_000;
 
-/// Maximum frames buffered in `pending_stack` before the oldest is dropped.
+/// Maximum logical frames buffered in `pending_stack` before the oldest is dropped.
 ///
 /// Keeps memory at O(PENDING_STACK_CAP) regardless of input length.
 /// `flush_stack_frames` retains only the last 3 frames, so a cap of 4 is
 /// sufficient: the sliding window holds the 4 most-recent frames, and the
 /// flush then drops 1 more, yielding exactly the last 3 in output.
+///
+/// Each entry in `pending_stack` is a logical frame: a `File "..."` line
+/// with optional source-preview and PEP 657 caret lines appended (multi-line
+/// string). The cap counts logical frames, not raw lines.
 const PENDING_STACK_CAP: usize = 4;
 
 /// Matches ISO8601 / common log timestamp prefix to strip before dedup.
@@ -342,6 +346,29 @@ fn extract_json_message(obj: &Value) -> Option<String> {
 // Tier 2: regex-based log formats
 // ============================================================================
 
+/// Returns true when `line` is a Python source-preview or PEP 657 caret line
+/// that belongs to the preceding `File "..."` stack frame.
+///
+/// A continuation line is:
+/// - Non-empty after trimming
+/// - Starts with ASCII whitespace (indented)
+/// - Does NOT itself match the `RE_LOG_STACK_TRACE` pattern (which would start
+///   a new logical frame)
+///
+/// Called only when `in_python_frame` is true to avoid false positives on
+/// non-Python indented content.
+fn is_python_continuation(line: &str, in_python_frame: bool) -> bool {
+    if !in_python_frame {
+        return false;
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Must have leading whitespace (indented) but not be a new File/at frame.
+    line.starts_with(|c: char| c.is_ascii_whitespace()) && !RE_LOG_STACK_TRACE.is_match(line)
+}
+
 /// Parse regex-based log formats into a LogResult.
 ///
 /// # AD-LOG-10 (2026-04-11) — Stack trace capture and last-3-frame elision
@@ -350,19 +377,37 @@ fn extract_json_message(obj: &Value) -> Option<String> {
 /// frames are attached to the previous entry's message:
 ///
 /// 1. Total frame count is recorded as `total_frames`.
-/// 2. Keep only the **last** 3 frames (preserving their relative order):
-///    `pending_stack.iter().rev().take(3).rev()`.
+/// 2. Keep only the **last** 3 frames (preserving their relative order).
 /// 3. The frames are appended as a newline-joined suffix to the previous
 ///    entry's message.
 /// 4. Elided count: `total_frames.saturating_sub(3)` — accumulated across
 ///    all entries and surfaced in `LogResult::stack_frames_elided`.
+///
+/// # CPython traceback extensions (issue #137)
+/// Each entry in `pending_stack` is a **logical frame** — a `File "..."` line
+/// with optional source-preview and PEP 657 caret lines appended as a
+/// multi-line string. The cap (`PENDING_STACK_CAP`) counts logical frames so
+/// source-preview lines do not inflate the elision count.
+///
+/// Control flow (per line):
+/// 1. Blank line → flush + reset `in_python_frame`
+/// 2. `RE_LOG_STACK_TRACE` match → start/extend logical frame, set `in_python_frame`
+/// 3. `is_python_continuation` → append to current logical frame
+/// 4. Compute `without_ts` (strip timestamp once)
+/// 5. `Traceback (most recent call last)` → attach to last entry or create unstructured
+/// 6. Chained exception separator → flush + push separator as unstructured entry
+/// 7. Reset `in_python_frame = false`
+/// 8. Flush + classify as log entry
 fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
     let mut all_entries: Vec<(Option<String>, String)> = Vec::with_capacity(256);
     let mut total_lines = 0usize;
     let mut found_structured = false;
-    // Stack trace capture state (AD-LOG-10)
-    let mut pending_stack: Vec<String> = Vec::new();
+    // Stack trace capture state (AD-LOG-10); VecDeque for O(1) pop_front.
+    let mut pending_stack: VecDeque<String> = VecDeque::new();
     let mut total_stack_frames_elided: usize = 0;
+    // Tracks whether the last recognised stack frame was a Python `File "..."` line,
+    // enabling source-preview and PEP 657 caret continuation detection.
+    let mut in_python_frame: bool = false;
 
     for line in input.lines().take(MAX_INPUT_LINES) {
         let trimmed = line.trim();
@@ -375,22 +420,70 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
                     &mut total_stack_frames_elided,
                 );
             }
+            in_python_frame = false;
             continue;
         }
 
-        // Check on the original (untrimmed) line to detect leading whitespace.
+        // Step 2: Check on the original (untrimmed) line to detect leading whitespace.
         if RE_LOG_STACK_TRACE.is_match(line) {
-            // Sliding-window cap: drop the oldest frame and count it as elided
-            // immediately, keeping memory at O(PENDING_STACK_CAP).
+            // Sliding-window cap: drop the oldest logical frame (O(1) via pop_front)
+            // and count it as elided immediately, keeping memory at O(PENDING_STACK_CAP).
             if pending_stack.len() >= PENDING_STACK_CAP {
-                pending_stack.remove(0);
+                pending_stack.pop_front();
                 total_stack_frames_elided += 1;
             }
-            pending_stack.push(trimmed.to_string());
+            pending_stack.push_back(trimmed.to_string());
+            // Set flag so the next indented line is recognised as a continuation.
+            in_python_frame = trimmed.starts_with("File ");
+            found_structured = true;
             continue;
         }
 
-        // New log line: flush any accumulated stack frames onto the previous entry.
+        // Step 3: Python source-preview / PEP 657 caret continuation.
+        // Must run BEFORE classify_log_line so source lines containing "ERROR:"
+        // or similar keywords are not misclassified as new log entries.
+        if is_python_continuation(line, in_python_frame) {
+            if let Some(last_frame) = pending_stack.back_mut() {
+                last_frame.push('\n');
+                last_frame.push_str(trimmed);
+            }
+            continue;
+        }
+
+        // Step 4: Strip timestamp once; reuse for both Traceback and separator checks.
+        let without_ts = strip_timestamp(trimmed, flags.keep_timestamps);
+
+        // Step 5: Traceback header — attach to preceding entry (or create unstructured).
+        if without_ts.starts_with("Traceback (most recent call last)") {
+            if let Some((_, msg)) = all_entries.last_mut() {
+                msg.push('\n');
+                msg.push_str(trimmed);
+            } else {
+                all_entries.push((None, trimmed.to_string()));
+            }
+            found_structured = true;
+            continue;
+        }
+
+        // Step 6: Chained exception separator — flush pending stack, push separator.
+        if without_ts.starts_with("During handling of the above exception")
+            || without_ts.starts_with("The above exception was the direct cause")
+        {
+            if !pending_stack.is_empty() && !all_entries.is_empty() {
+                flush_stack_frames(
+                    &mut all_entries,
+                    &mut pending_stack,
+                    &mut total_stack_frames_elided,
+                );
+            }
+            all_entries.push((None, trimmed.to_string()));
+            continue;
+        }
+
+        // Step 7: Reset python-frame flag before classifying this line as a new entry.
+        in_python_frame = false;
+
+        // Step 8: New log line — flush any accumulated stack frames onto the previous entry.
         if !pending_stack.is_empty() && !all_entries.is_empty() {
             flush_stack_frames(
                 &mut all_entries,
@@ -401,7 +494,6 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
 
         total_lines += 1;
 
-        let without_ts = strip_timestamp(trimmed, flags.keep_timestamps);
         if let Some((level, message)) = classify_log_line(without_ts) {
             all_entries.push((Some(level), message));
             found_structured = true;
@@ -436,16 +528,19 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
 
 /// Flush `pending_stack` onto the last entry in `all_entries`.
 ///
-/// Keeps the last 3 frames (in original order) and appends them as a
+/// Keeps the last 3 logical frames (in original order) and appends them as a
 /// newline-joined suffix. Increments `elided` by the number dropped.
 ///
-/// Both `all_entries` and `pending_stack` must remain `&mut Vec` rather than
-/// slices: `all_entries` uses `.last_mut()` (Vec-level borrow), `pending_stack`
-/// calls `.clear()` which is not available on `&mut [_]`.
+/// Each entry in `pending_stack` is a logical frame — a `File "..."` line with
+/// optional source-preview and PEP 657 caret lines embedded as a multi-line
+/// string. The elision count is therefore a count of logical frames, not raw lines.
+///
+/// `all_entries` must be `&mut Vec` rather than `&mut [_]` because `.last_mut()`
+/// is a Vec-level borrow; `pending_stack` must be `&mut VecDeque` to call `.clear()`.
 #[allow(clippy::ptr_arg)]
 fn flush_stack_frames(
     all_entries: &mut Vec<(Option<String>, String)>,
-    pending_stack: &mut Vec<String>,
+    pending_stack: &mut VecDeque<String>,
     elided: &mut usize,
 ) {
     let total = pending_stack.len();
@@ -922,7 +1017,9 @@ mod tests {
         );
     }
 
-    /// AD-LOG-10: Python `File "..."` stack traces are recognised.
+    /// AD-LOG-10 / issue #137: Python `File "..."` stack traces with source-preview
+    /// lines are recognised. The fixture has 4 logical frames (4 `File` lines), each
+    /// with one source-preview line. Cap = 4 frames → 1 elided, last 3 kept.
     #[test]
     fn test_log_python_traceback_recognised() {
         let input = load_fixture("log", "stack_trace_python.txt");
@@ -933,16 +1030,21 @@ mod tests {
             .iter()
             .find(|e| e.level.as_deref() == Some("ERROR"))
             .expect("ERROR entry must exist");
-        // Python traces use `File "…"` — must be attached and last-3 kept.
+        // The last frame (threading.py) and its source-preview must be kept.
         assert!(
             error_entry.message.contains("threading.py"),
             "Last Python frame must be kept: {}",
             error_entry.message
         );
-        // 4 frames total, 3 kept → 1 elided.
+        assert!(
+            error_entry.message.contains("self.run()"),
+            "Source-preview of last frame must be kept: {}",
+            error_entry.message
+        );
+        // 4 logical frames, 3 kept → 1 elided.
         assert_eq!(
             result.stack_frames_elided, 1,
-            "Should elide 1 of 4 Python frames"
+            "Should elide 1 of 4 Python logical frames"
         );
     }
 
@@ -1152,6 +1254,375 @@ mod tests {
             result.chars().count(),
             MAX_JSON_LEVEL_LEN,
             "Level must be truncated to MAX_JSON_LEVEL_LEN chars"
+        );
+    }
+
+    // ============================================================================
+    // Group A: Updated Python Fixture (issue #137)
+    // ============================================================================
+
+    /// issue #137: Source-preview lines are attached to the preceding logical frame,
+    /// not counted as separate frames. The fixture has 4 `File` lines each with one
+    /// source-preview → last 3 logical frames kept, 1 elided.
+    #[test]
+    fn test_python_source_preview_lines_attached_to_frame() {
+        let input = load_fixture("log", "stack_trace_python.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        let error_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("ERROR"))
+            .expect("ERROR entry must exist");
+        // Last 3 logical frames are kept: threading.py/_bootstrap, run/handle_request, run/run.
+        assert!(
+            error_entry.message.contains("self.run()"),
+            "Source-preview of last frame (threading.py) must be present: {}",
+            error_entry.message
+        );
+        assert!(
+            error_entry.message.contains("handle_request(payload)"),
+            "Source-preview of 3rd-from-last frame must be present: {}",
+            error_entry.message
+        );
+        assert!(
+            error_entry.message.contains("return parse_value(data)"),
+            "Source-preview of 2nd-from-last frame must be present: {}",
+            error_entry.message
+        );
+        // First logical frame (parse_value) is elided — its source must be absent.
+        assert!(
+            !error_entry.message.contains("result = int(value)"),
+            "Source-preview of elided frame must not appear: {}",
+            error_entry.message
+        );
+    }
+
+    /// issue #137: Source-preview lines must not inflate the logical frame count.
+    /// 4 `File` lines → 4 logical frames → 1 elided (not 8 lines → 7 elided).
+    #[test]
+    fn test_python_source_preview_not_counted_as_frame() {
+        let input = load_fixture("log", "stack_trace_python.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        assert_eq!(
+            result.stack_frames_elided, 1,
+            "4 logical frames with source-preview → 1 elided; got {}",
+            result.stack_frames_elided
+        );
+    }
+
+    // ============================================================================
+    // Group B: Chained Exceptions
+    // ============================================================================
+
+    /// issue #137: Traceback headers must be attached to the preceding entry,
+    /// never emitted as standalone entries with a message starting with "Traceback".
+    #[test]
+    fn test_python_chained_traceback_headers_attached() {
+        let input = load_fixture("log", "stack_trace_python_chained.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        // No entry should have a message that begins with "Traceback"
+        for entry in &result.entries {
+            assert!(
+                !entry.message.starts_with("Traceback"),
+                "Traceback header leaked as standalone entry: {:?}",
+                entry.message
+            );
+        }
+    }
+
+    /// issue #137: Chained exception — each chain has 2 frames (≤ 3), so none elided.
+    #[test]
+    fn test_python_chained_traceback_elision_count() {
+        let input = load_fixture("log", "stack_trace_python_chained.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        assert_eq!(
+            result.stack_frames_elided, 0,
+            "Both chains have ≤ 3 frames each; expected 0 elided, got {}",
+            result.stack_frames_elided
+        );
+    }
+
+    /// issue #137: The INFO entry must not contain `File` or `Traceback` text
+    /// from the chained tracebacks.
+    #[test]
+    fn test_python_chained_traceback_info_not_contaminated() {
+        let input = load_fixture("log", "stack_trace_python_chained.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        let info_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("INFO"))
+            .expect("INFO entry must exist");
+        assert!(
+            !info_entry.message.contains("File"),
+            "INFO entry must not contain stack frame text: {}",
+            info_entry.message
+        );
+        assert!(
+            !info_entry.message.contains("Traceback"),
+            "INFO entry must not contain Traceback text: {}",
+            info_entry.message
+        );
+    }
+
+    // ============================================================================
+    // Group C: PEP 657 Caret Lines
+    // ============================================================================
+
+    /// issue #137: PEP 657 caret lines (`~~~~~~^~~~~~~~`) are attached to the
+    /// preceding `File` logical frame, not stripped.
+    #[test]
+    fn test_python_pep657_caret_lines_attached() {
+        let input = load_fixture("log", "stack_trace_python_pep657.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        let error_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("ERROR"))
+            .expect("ERROR entry must exist");
+        assert!(
+            error_entry.message.contains("~~~~~~^~~~~~~~"),
+            "PEP 657 caret line must be attached to its frame: {}",
+            error_entry.message
+        );
+    }
+
+    /// issue #137: PEP 657 caret lines must not inflate the logical frame count.
+    /// 3 `File` lines → 3 logical frames → 0 elided.
+    #[test]
+    fn test_python_pep657_not_counted_as_frame() {
+        let input = load_fixture("log", "stack_trace_python_pep657.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        assert_eq!(
+            result.stack_frames_elided, 0,
+            "3 logical frames (with PEP 657 carets) → 0 elided; got {}",
+            result.stack_frames_elided
+        );
+    }
+
+    // ============================================================================
+    // Group D: Regression Guards (inline input)
+    // ============================================================================
+
+    /// issue #137: Source-preview lines must not create additional log entries.
+    /// ERROR + 2 File/source pairs + INFO → exactly 2 entries (ERROR and INFO).
+    #[test]
+    fn test_source_preview_line_does_not_create_entry() {
+        let input = concat!(
+            "ERROR: something failed\n",
+            "  File \"/app/foo.py\", line 10, in bar\n",
+            "    do_thing()\n",
+            "  File \"/app/baz.py\", line 20, in qux\n",
+            "    call_other()\n",
+            "INFO: done\n",
+        );
+        let flags = make_flags();
+        let result = try_parse_regex_logs(input, &flags).unwrap();
+        assert_eq!(
+            result.entries.len(),
+            2,
+            "Only ERROR and INFO entries expected; got {:?}",
+            result
+                .entries
+                .iter()
+                .map(|e| (&e.level, &e.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// issue #137: A standalone Traceback (no preceding log-level line) with one
+    /// File/source and an exception line (no log-level prefix) must be parsed as
+    /// structured output (`try_parse_regex_logs` returns `Some`), because
+    /// `RE_LOG_STACK_TRACE` match sets `found_structured = true`.
+    #[test]
+    fn test_found_structured_gate_with_traceback_only() {
+        let input = concat!(
+            "ERROR: startup failed\n",
+            "Traceback (most recent call last):\n",
+            "  File \"/app/main.py\", line 5, in <module>\n",
+            "    start()\n",
+            "AssertionError: precondition failed\n",
+        );
+        let flags = make_flags();
+        let result = try_parse_regex_logs(input, &flags);
+        assert!(
+            result.is_some(),
+            "Input with ERROR + Traceback + File + AssertionError must parse as structured"
+        );
+    }
+
+    /// issue #137: A source-preview line that itself contains a log-level keyword
+    /// (e.g. `"ERROR: bad input"`) must NOT be misclassified as a new log entry.
+    #[test]
+    fn test_python_source_line_with_log_keyword_not_misclassified() {
+        // The source-preview line contains "ERROR: bad input" — this must stay
+        // attached to the File frame, not become a separate ERROR entry.
+        let input = concat!(
+            "ERROR: validation failed\n",
+            "Traceback (most recent call last):\n",
+            "  File \"/app/v.py\", line 7, in validate\n",
+            "    raise ValueError(\"ERROR: bad input\")\n",
+            "INFO: fallback used\n",
+        );
+        let flags = make_flags();
+        let result = try_parse_regex_logs(input, &flags).unwrap();
+        let error_entries: Vec<_> = result
+            .entries
+            .iter()
+            .filter(|e| e.level.as_deref() == Some("ERROR"))
+            .collect();
+        assert_eq!(
+            error_entries.len(),
+            1,
+            "Source-preview with log keyword must not create extra ERROR entry; got: {:?}",
+            error_entries.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// issue #137: Pending stack cap counts logical frames; source-preview lines
+    /// don't consume extra cap slots.
+    ///
+    /// ERROR + 10 logical frames (each with source-preview) + INFO:
+    /// cap = 4 → 7 cap-evictions, flush keeps last 3 → total 7 elided.
+    /// The last frame's source-preview is present; the first frame's source is absent.
+    #[test]
+    fn test_pending_stack_cap_with_source_preview() {
+        let mut input = String::from("ERROR: overflow\n");
+        for i in 1..=10 {
+            input.push_str(&format!(
+                "  File \"/app/mod.py\", line {i}, in call{i}\n    call{i}()\n"
+            ));
+        }
+        input.push_str("INFO: done\n");
+
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+
+        // 10 logical frames: cap evicts 7 incrementally, flush drops 0 more (3 kept) → 7 elided.
+        assert_eq!(
+            result.stack_frames_elided, 7,
+            "10 logical frames → 7 elided (last 3 kept); got {}",
+            result.stack_frames_elided
+        );
+
+        let error_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("ERROR"))
+            .expect("ERROR entry must exist");
+
+        // Last frame (call10) source must be present.
+        assert!(
+            error_entry.message.contains("call10()"),
+            "Last frame source-preview must be kept: {}",
+            error_entry.message
+        );
+        // First frame (call1) source must be absent (evicted by cap).
+        assert!(
+            !error_entry.message.contains("call1()"),
+            "Evicted frame source-preview must not appear: {}",
+            error_entry.message
+        );
+    }
+
+    /// issue #137: A `Traceback` header at the start (no preceding entry) becomes
+    /// an unstructured entry that is later flushed so it does not appear in the
+    /// INFO entry's message.
+    #[test]
+    fn test_traceback_header_only_input() {
+        let input = concat!(
+            "ERROR: boot failed\n",
+            "Traceback (most recent call last):\n",
+            "INFO: continuing\n",
+        );
+        let flags = make_flags();
+        let result = try_parse_regex_logs(input, &flags).unwrap();
+        let info_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("INFO"))
+            .expect("INFO entry must exist");
+        assert!(
+            !info_entry.message.contains("Traceback"),
+            "Traceback must not bleed into INFO entry: {}",
+            info_entry.message
+        );
+        // The Traceback text is attached to the preceding ERROR entry.
+        let error_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("ERROR"))
+            .expect("ERROR entry must exist");
+        assert!(
+            error_entry.message.contains("Traceback"),
+            "Traceback header must be attached to ERROR entry: {}",
+            error_entry.message
+        );
+    }
+
+    // ============================================================================
+    // Group F: Rendered Output
+    // ============================================================================
+
+    /// issue #137: The rendered output from the Python fixture must be coherent —
+    /// contains ValueError, the elision marker, and both log levels.
+    #[test]
+    fn test_python_rendered_output_coherent() {
+        let input = load_fixture("log", "stack_trace_python.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        let display = result.as_ref();
+        assert!(
+            display.contains("ValueError"),
+            "Rendered output must contain exception type: {display}"
+        );
+        assert!(
+            display.contains("frames elided"),
+            "Rendered output must contain elision marker: {display}"
+        );
+        assert!(
+            display.contains("ERROR:"),
+            "Rendered output must contain ERROR level: {display}"
+        );
+        assert!(
+            display.contains("INFO:"),
+            "Rendered output must contain INFO level: {display}"
+        );
+    }
+
+    /// issue #137: The chained exception rendered output must contain both error
+    /// types and the INFO recovery message as a separate entry.
+    #[test]
+    fn test_chained_rendered_output_not_split() {
+        let input = load_fixture("log", "stack_trace_python_chained.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        let display = result.as_ref();
+        assert!(
+            display.contains("DatabaseError"),
+            "Rendered output must contain DatabaseError: {display}"
+        );
+        assert!(
+            display.contains("ServiceError"),
+            "Rendered output must contain ServiceError: {display}"
+        );
+        // INFO entry must be a separate line, not embedded in error entries.
+        let info_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("INFO"))
+            .expect("INFO entry must exist");
+        assert!(
+            info_entry.message.contains("recovered"),
+            "INFO entry must contain recovery message: {}",
+            info_entry.message
         );
     }
 }
