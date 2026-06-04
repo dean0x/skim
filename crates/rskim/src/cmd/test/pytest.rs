@@ -273,7 +273,7 @@ fn parse_verbose_marker(line: &str) -> Option<(String, TestOutcome)> {
     } else {
         return None;
     };
-    Some((line[..line.len() - suffix.len()].to_string(), outcome))
+    Some((line.strip_suffix(suffix).unwrap().to_string(), outcome))
 }
 
 /// Tracks which section of pytest output the parser is currently inside.
@@ -290,6 +290,31 @@ enum PytestSection {
     Failures,
     /// Inside the `=== short test summary info ===` block.
     SummaryInfo,
+}
+
+/// Classify a `=== ... ===` section-header line.
+///
+/// Returns `Some(PytestSection)` when `trimmed` is a pytest section header,
+/// or `None` when it is not (allowing the caller to fall through to other
+/// processing).
+///
+/// The three patterns, in priority order:
+/// 1. Contains `"FAILURES"` → `Failures` section begins.
+/// 2. Contains `"short test summary info"` → `SummaryInfo` section begins.
+/// 3. Starts **and** ends with `"==="` (catch-all) → `Normal` (section ends).
+fn detect_section_header(trimmed: &str) -> Option<PytestSection> {
+    if !trimmed.starts_with("===") {
+        return None;
+    }
+    if trimmed.contains("FAILURES") {
+        Some(PytestSection::Failures)
+    } else if trimmed.contains("short test summary info") {
+        Some(PytestSection::SummaryInfo)
+    } else if trimmed.ends_with("===") {
+        Some(PytestSection::Normal)
+    } else {
+        None
+    }
 }
 
 /// Tier 1: Full text state machine parse.
@@ -315,34 +340,17 @@ fn tier1_parse(output: &str) -> Option<TestResult> {
             continue;
         }
 
-        // Detect FAILURES section header
-        if trimmed.starts_with("===") && trimmed.contains("FAILURES") {
-            section = PytestSection::Failures;
-            continue;
-        }
-
-        // Detect "short test summary info" section
-        if trimmed.starts_with("===") && trimmed.contains("short test summary info") {
-            section = PytestSection::SummaryInfo;
-            // Flush any pending failure
-            flush_failure(
-                &mut entries,
-                &mut current_failure_name,
-                &mut current_failure_detail,
-            );
-            continue;
-        }
-
-        // Detect any other section header (=== ... ===) that ends the current section
-        if trimmed.starts_with("===") && trimmed.ends_with("===") {
-            if section == PytestSection::Failures {
+        // Detect section headers (=== ... ===)
+        if let Some(new_section) = detect_section_header(trimmed) {
+            // Flush any pending failure when leaving the Failures section
+            if section == PytestSection::Failures || new_section == PytestSection::SummaryInfo {
                 flush_failure(
                     &mut entries,
                     &mut current_failure_name,
                     &mut current_failure_detail,
                 );
             }
-            section = PytestSection::Normal;
+            section = new_section;
             continue;
         }
 
@@ -847,5 +855,88 @@ FAILED tests/test_b.py::test_two - assert 1 == 2
             // The first occurrence (from verbose line) should be kept
             assert_eq!(fail_entries[0].name, "tests/test_b.py::test_two");
         }
+    }
+
+    // ========================================================================
+    // parse_verbose_marker unit tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_verbose_marker_passed() {
+        let (name, outcome) =
+            parse_verbose_marker("tests/test_a.py::test_one PASSED").expect("should match PASSED");
+        assert_eq!(name, "tests/test_a.py::test_one");
+        assert_eq!(outcome, TestOutcome::Pass);
+    }
+
+    #[test]
+    fn test_parse_verbose_marker_failed() {
+        let (name, outcome) =
+            parse_verbose_marker("tests/test_b.py::test_two FAILED").expect("should match FAILED");
+        assert_eq!(name, "tests/test_b.py::test_two");
+        assert_eq!(outcome, TestOutcome::Fail);
+    }
+
+    #[test]
+    fn test_parse_verbose_marker_skipped() {
+        let (name, outcome) = parse_verbose_marker("tests/test_c.py::test_three SKIPPED")
+            .expect("should match SKIPPED");
+        assert_eq!(name, "tests/test_c.py::test_three");
+        assert_eq!(outcome, TestOutcome::Skip);
+    }
+
+    #[test]
+    fn test_parse_verbose_marker_no_suffix_returns_none() {
+        assert!(
+            parse_verbose_marker("tests/test_a.py::test_one").is_none(),
+            "line with no outcome marker should return None"
+        );
+    }
+
+    #[test]
+    fn test_parse_verbose_marker_pathological_name_containing_marker_word() {
+        // A test whose name itself contains "FAILED" should still parse correctly
+        // as long as the line ends with the real suffix.
+        let (name, outcome) =
+            parse_verbose_marker("tests/test_FAILED_case.py::test_x PASSED")
+                .expect("should match PASSED suffix");
+        assert_eq!(name, "tests/test_FAILED_case.py::test_x");
+        assert_eq!(outcome, TestOutcome::Pass);
+    }
+
+    // ========================================================================
+    // detect_section_header unit tests
+    // ========================================================================
+
+    #[test]
+    fn test_detect_section_header_failures() {
+        assert_eq!(
+            detect_section_header("=== FAILURES ==="),
+            Some(PytestSection::Failures)
+        );
+    }
+
+    #[test]
+    fn test_detect_section_header_summary_info() {
+        assert_eq!(
+            detect_section_header("=== short test summary info ==="),
+            Some(PytestSection::SummaryInfo)
+        );
+    }
+
+    #[test]
+    fn test_detect_section_header_normal_catch_all() {
+        assert_eq!(
+            detect_section_header("=== warnings summary ==="),
+            Some(PytestSection::Normal)
+        );
+    }
+
+    #[test]
+    fn test_detect_section_header_non_header_returns_none() {
+        assert!(
+            detect_section_header("some regular output line").is_none(),
+            "non-header line should return None"
+        );
     }
 }
