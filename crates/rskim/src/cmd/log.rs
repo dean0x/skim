@@ -41,6 +41,31 @@ const PENDING_STACK_CAP: usize = 4;
 /// bypass the per-frame accounting that makes the invariant hold.
 const MAX_CONTINUATIONS_PER_FRAME: usize = 4;
 
+/// Tracks whether the parser is inside a Python `File "..."` logical frame.
+///
+/// `PythonFrame` means the last recognised stack-trace line was a Python
+/// `File "..."` line; continuation lines (source-preview, PEP 657 carets) are
+/// appended to the current logical frame until a line that does not match
+/// `is_python_continuation` resets state to `Idle`.
+///
+/// Using an explicit enum (rather than a bare `bool`) eliminates the ambiguity
+/// between "no frame ever started" and "frame just ended": both are `Idle`, and
+/// `PythonFrame` carries the associated continuation count so the two concerns
+/// are co-located and move together as a unit.
+#[derive(Debug, Clone, PartialEq)]
+enum FrameContext {
+    /// No active Python frame — continuation detection is inactive.
+    Idle,
+    /// Inside a Python `File "..."` logical frame.
+    PythonFrame {
+        /// Number of continuation lines already appended to the current frame.
+        /// Reset to 0 each time a new frame starts. Caps at
+        /// `MAX_CONTINUATIONS_PER_FRAME` to enforce the O(PENDING_STACK_CAP)
+        /// memory invariant.
+        continuation_count: usize,
+    },
+}
+
 /// Matches ISO8601 / common log timestamp prefix to strip before dedup.
 /// e.g. `2024-01-15T10:30:00Z `, `2024-01-15 10:30:00 `, `[2024-01-15T10:30:00]`
 static RE_LOG_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
@@ -362,8 +387,8 @@ fn extract_json_message(obj: &Value) -> Option<String> {
 /// - Does NOT itself match the `RE_LOG_STACK_TRACE` pattern (which would start
 ///   a new logical frame)
 ///
-/// Callers must gate on `in_python_frame` before calling — this function tests
-/// only the line's structure, not parser state.
+/// Callers must gate on `FrameContext::PythonFrame` before calling — this
+/// function tests only the line's structure, not parser state.
 fn is_python_continuation(line: &str) -> bool {
     !line.trim().is_empty() && line.starts_with(|c: char| c.is_ascii_whitespace())
 }
@@ -389,13 +414,13 @@ fn is_python_continuation(line: &str) -> bool {
 /// source-preview lines do not inflate the elision count.
 ///
 /// Control flow (per line):
-/// 1. Blank line → flush + reset `in_python_frame`
-/// 2. `RE_LOG_STACK_TRACE` match → start/extend logical frame, set `in_python_frame`
+/// 1. Blank line → flush + reset `frame_ctx` to `FrameContext::Idle`
+/// 2. `RE_LOG_STACK_TRACE` match → start/extend logical frame, set `frame_ctx`
 /// 3. `is_python_continuation` → append to current logical frame
 /// 4. Compute `without_ts` (strip timestamp once)
 /// 5. `Traceback (most recent call last)` → attach to last entry or create unstructured
 /// 6. Chained exception separator → flush + push separator as unstructured entry
-/// 7. Reset `in_python_frame = false`
+/// 7. Reset `frame_ctx` to `FrameContext::Idle`
 /// 8. Flush + classify as log entry
 fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
     let mut all_entries: Vec<(Option<String>, String)> = Vec::with_capacity(256);
@@ -404,13 +429,11 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
     // Stack trace capture state (AD-LOG-10); VecDeque for O(1) pop_front.
     let mut pending_stack: VecDeque<String> = VecDeque::new();
     let mut total_stack_frames_elided: usize = 0;
-    // Tracks whether the last recognised stack frame was a Python `File "..."` line,
+    // Tracks whether the parser is inside a Python `File "..."` logical frame,
     // enabling source-preview and PEP 657 caret continuation detection.
-    let mut in_python_frame = false;
-    // Counts continuation lines appended to the current logical frame.
-    // Reset to 0 each time a new frame starts (step 2). Enforces
-    // MAX_CONTINUATIONS_PER_FRAME to uphold the O(PENDING_STACK_CAP) memory invariant.
-    let mut frame_continuation_count: usize = 0;
+    // `PythonFrame` also carries the continuation count so both concerns move
+    // together as a unit; `Idle` covers every non-Python-frame state.
+    let mut frame_ctx = FrameContext::Idle;
 
     for line in input.lines().take(MAX_INPUT_LINES) {
         let trimmed = line.trim();
@@ -423,7 +446,7 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
                 &mut total_stack_frames_elided,
             );
             pending_stack.clear();
-            in_python_frame = false;
+            frame_ctx = FrameContext::Idle;
             continue;
         }
 
@@ -436,9 +459,14 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
                 total_stack_frames_elided += 1;
             }
             pending_stack.push_back(trimmed.to_string());
-            // Set flag so the next indented line is recognised as a continuation.
-            in_python_frame = trimmed.starts_with("File ");
-            frame_continuation_count = 0;
+            // Set context so the next indented line is recognised as a continuation.
+            frame_ctx = if trimmed.starts_with("File ") {
+                FrameContext::PythonFrame {
+                    continuation_count: 0,
+                }
+            } else {
+                FrameContext::Idle
+            };
             found_structured = true;
             continue;
         }
@@ -446,17 +474,21 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
         // Step 3: Python source-preview / PEP 657 caret continuation.
         // Must run BEFORE classify_log_line so source lines containing "ERROR:"
         // or similar keywords are not misclassified as new log entries.
-        if in_python_frame && is_python_continuation(line) {
+        if let FrameContext::PythonFrame {
+            ref mut continuation_count,
+        } = frame_ctx
+            && is_python_continuation(line)
+        {
             debug_assert!(
                 !pending_stack.is_empty(),
-                "in_python_frame=true requires a frame in pending_stack"
+                "FrameContext::PythonFrame requires a frame in pending_stack"
             );
-            if frame_continuation_count < MAX_CONTINUATIONS_PER_FRAME {
+            if *continuation_count < MAX_CONTINUATIONS_PER_FRAME {
                 if let Some(last_frame) = pending_stack.back_mut() {
                     last_frame.push('\n');
                     last_frame.push_str(trimmed);
                 }
-                frame_continuation_count += 1;
+                *continuation_count += 1;
             }
             continue;
         }
@@ -472,7 +504,7 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
             } else {
                 all_entries.push((None, trimmed.to_string()));
             }
-            in_python_frame = false;
+            frame_ctx = FrameContext::Idle;
             found_structured = true;
             continue;
         }
@@ -486,13 +518,13 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
                 &mut pending_stack,
                 &mut total_stack_frames_elided,
             );
-            in_python_frame = false;
+            frame_ctx = FrameContext::Idle;
             all_entries.push((None, trimmed.to_string()));
             continue;
         }
 
-        // Step 7: Reset python-frame flag before classifying this line as a new entry.
-        in_python_frame = false;
+        // Step 7: Reset python-frame context before classifying this line as a new entry.
+        frame_ctx = FrameContext::Idle;
 
         // Step 8: New log line — flush any accumulated stack frames onto the previous entry.
         try_flush_stack(
