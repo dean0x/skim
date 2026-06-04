@@ -897,9 +897,8 @@ FAILED tests/test_b.py::test_two - assert 1 == 2
     fn test_parse_verbose_marker_pathological_name_containing_marker_word() {
         // A test whose name itself contains "FAILED" should still parse correctly
         // as long as the line ends with the real suffix.
-        let (name, outcome) =
-            parse_verbose_marker("tests/test_FAILED_case.py::test_x PASSED")
-                .expect("should match PASSED suffix");
+        let (name, outcome) = parse_verbose_marker("tests/test_FAILED_case.py::test_x PASSED")
+            .expect("should match PASSED suffix");
         assert_eq!(name, "tests/test_FAILED_case.py::test_x");
         assert_eq!(outcome, TestOutcome::Pass);
     }

@@ -373,7 +373,7 @@ fn push_nextest_entry(
     entries: &mut Vec<TestEntry>,
 ) {
     if let Some(name) = extract_nextest_name(rest) {
-        let key = (name.clone(), outcome.clone());
+        let key = (name.clone(), outcome);
         if seen.insert(key) {
             entries.push(TestEntry {
                 name,
@@ -617,7 +617,10 @@ mod tests {
             matches!(state, CaptureState::Idle),
             "flush on Idle must return Idle"
         );
-        assert!(entries[0].detail.is_none(), "Idle flush must not set detail");
+        assert!(
+            entries[0].detail.is_none(),
+            "Idle flush must not set detail"
+        );
     }
 
     #[test]

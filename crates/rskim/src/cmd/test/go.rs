@@ -298,7 +298,7 @@ fn try_parse_ndjson(output: &str) -> Option<TestResult> {
     keys.sort();
 
     for key in &keys {
-        let outcome = test_outcomes.get(key).unwrap().clone();
+        let outcome = *test_outcomes.get(key).unwrap();
         let detail = if outcome == TestOutcome::Fail {
             // Collect output lines for failed tests, trimming trailing whitespace
             test_outputs.get(key).map(|lines| {
