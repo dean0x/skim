@@ -135,7 +135,7 @@ fn print_help() {
 /// # Design note: divergence from [`super::run_parsed_command_with_mode`]
 ///
 /// This function intentionally uses `bail!` on spawn failure rather than
-/// returning `Ok(None)` as [`super::obtain_output`] does. The difference is
+/// returning `Ok(None)` as `execution::obtain_output` does. The difference is
 /// semantic: build commands have no stdin-passthrough path, so a missing
 /// executable is always a hard error rather than a soft "try stdin instead"
 /// fallback. The two patterns are not consolidatable without changing that
