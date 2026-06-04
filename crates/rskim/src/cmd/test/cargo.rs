@@ -226,7 +226,7 @@ fn try_parse_json(stdout: &str) -> Option<TestResult> {
 /// Option was `Some` and the bool was `true` — so a single enum expresses the
 /// invariant directly.  The `flush` method centralises the three duplicated
 /// "drain-and-attach" blocks into one location.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CaptureState {
     /// No active capture block.
     Idle,
@@ -315,19 +315,6 @@ fn try_parse_nextest(stdout: &str) -> Option<TestResult> {
             }
             output.push_str(line.trim_end());
             continue;
-        }
-
-        // Reset capture block on non-indented lines that aren't part of capture.
-        if !trimmed.is_empty()
-            && !trimmed.starts_with("PASS")
-            && !trimmed.starts_with("FAIL")
-            && !trimmed.starts_with("SKIP")
-            && !trimmed.starts_with("Starting")
-            && !trimmed.starts_with("Summary")
-            && !trimmed.starts_with("Finished")
-            && !trimmed.starts_with("---")
-        {
-            capture = capture.flush(&mut entries);
         }
 
         // Parse test result lines: "PASS [0.003s] crate::tests::test_name"

@@ -52,7 +52,7 @@ const MAX_CONTINUATIONS_PER_FRAME: usize = 4;
 /// between "no frame ever started" and "frame just ended": both are `Idle`, and
 /// `PythonFrame` carries the associated continuation count so the two concerns
 /// are co-located and move together as a unit.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum FrameContext {
     /// No active Python frame — continuation detection is inactive.
     Idle,

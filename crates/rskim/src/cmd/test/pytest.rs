@@ -259,6 +259,23 @@ fn parse_summary_line(line: &str) -> Option<SummaryCounts> {
 // Tier 1: Text state machine
 // ============================================================================
 
+/// Extract `(name, outcome)` from a verbose pytest marker line.
+///
+/// Matches lines that end with ` PASSED`, ` FAILED`, or ` SKIPPED` (verbose
+/// mode output). Returns `None` for all other lines.
+fn parse_verbose_marker(line: &str) -> Option<(String, TestOutcome)> {
+    let (suffix, outcome) = if line.ends_with(" PASSED") {
+        (" PASSED", TestOutcome::Pass)
+    } else if line.ends_with(" FAILED") {
+        (" FAILED", TestOutcome::Fail)
+    } else if line.ends_with(" SKIPPED") {
+        (" SKIPPED", TestOutcome::Skip)
+    } else {
+        return None;
+    };
+    Some((line[..line.len() - suffix.len()].to_string(), outcome))
+}
+
 /// Tracks which section of pytest output the parser is currently inside.
 ///
 /// The two section booleans (`in_failures`, `in_summary_info`) were mutually
@@ -374,29 +391,14 @@ fn tier1_parse(output: &str) -> Option<TestResult> {
             continue;
         }
 
-        // Outside special sections: look for per-line PASSED/FAILED/SKIPPED markers
+        // Outside special sections: look for per-line PASSED/FAILED/SKIPPED markers.
         // These appear in verbose mode output like:
         //   tests/test_a.py::test_one PASSED
         //   tests/test_a.py::test_two FAILED
-        if trimmed.ends_with(" PASSED") {
-            let name = trimmed.trim_end_matches(" PASSED").to_string();
+        if let Some((name, outcome)) = parse_verbose_marker(trimmed) {
             entries.push(TestEntry {
                 name,
-                outcome: TestOutcome::Pass,
-                detail: None,
-            });
-        } else if trimmed.ends_with(" FAILED") {
-            let name = trimmed.trim_end_matches(" FAILED").to_string();
-            entries.push(TestEntry {
-                name,
-                outcome: TestOutcome::Fail,
-                detail: None,
-            });
-        } else if trimmed.ends_with(" SKIPPED") {
-            let name = trimmed.trim_end_matches(" SKIPPED").to_string();
-            entries.push(TestEntry {
-                name,
-                outcome: TestOutcome::Skip,
+                outcome,
                 detail: None,
             });
         }
