@@ -184,35 +184,56 @@ fn a9_gap_in_file_ids_rejected() {
 
 #[test]
 fn a2_posting_merge_sorted_unique_doc_ids() {
+    // NOTE ON THE SORT (defense-in-depth, not exercised by construction):
+    // The builder's sequential-FileId invariant means FileId(n).0 == n for every
+    // file added, so doc_ids are inserted into posting lists in ascending order.
+    // The `sort_unstable_by_key(|p| p.doc_id)` call in `build()` therefore never
+    // observes out-of-order input — it is defense-in-depth against future callers
+    // that might bypass the sequential guard (e.g. a parallel merge variant).
+    //
+    // What this test CAN verify (C1): the output is sorted and contains no
+    // duplicate doc_ids.  We assert this via `windows(2)` on a larger corpus
+    // (10 files × 3 distinct keys) so the invariant is observable even if the
+    // sort is a no-op in the current implementation.
+
     let dir = tempdir().unwrap();
     let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
-    let key: u32 = 0x0001_0002;
+    let key_a: u32 = 0x0001_0002;
+    let key_b: u32 = 0x0002_0003;
+    let key_c: u32 = 0x0003_0004;
 
-    // Insert same bigram key in files 2, 0, 1 (out of order by doc_id, sequential by FileId)
-    let set = single_bigram_set(key, 1);
-    builder
-        .add_file_ngrams(FileId(0), Language::Rust, &set, 10)
-        .unwrap();
-    builder
-        .add_file_ngrams(FileId(1), Language::Rust, &set, 10)
-        .unwrap();
-    builder
-        .add_file_ngrams(FileId(2), Language::Rust, &set, 10)
-        .unwrap();
+    // 10 files, each contributing all three bigram keys.
+    for i in 0..10u32 {
+        let set = multi_bigram_set(&[(key_a, 1), (key_b, 2), (key_c, 3)]);
+        builder
+            .add_file_ngrams(FileId(i), Language::Rust, &set, 10)
+            .unwrap();
+    }
 
     let reader = builder.build().unwrap();
-    let postings = reader
-        .lookup_bigram(crate::ast_index::AstBigram(key))
-        .unwrap();
 
-    assert_eq!(postings.len(), 3, "expected 3 postings");
-    // C1: sorted ascending by doc_id
-    assert_eq!(postings[0].doc_id, 0);
-    assert_eq!(postings[1].doc_id, 1);
-    assert_eq!(postings[2].doc_id, 2);
-    // C2 (no duplicate doc_ids): each doc_id appears exactly once
-    let unique: std::collections::HashSet<u32> = postings.iter().map(|p| p.doc_id).collect();
-    assert_eq!(unique.len(), 3);
+    // C1: each posting list is sorted ascending by doc_id with no duplicates.
+    for &key in &[key_a, key_b, key_c] {
+        let postings = reader
+            .lookup_bigram(crate::ast_index::AstBigram(key))
+            .unwrap();
+        assert_eq!(postings.len(), 10, "expected 10 postings for key {key:#x}");
+        assert!(
+            postings.windows(2).all(|w| w[0].doc_id < w[1].doc_id),
+            "C1 violated: postings for key {key:#x} are not strictly ascending by doc_id: {postings:?}"
+        );
+    }
+
+    // C1 (no duplicate doc_ids): spot-check key_a has exactly one entry per file.
+    let postings_a = reader
+        .lookup_bigram(crate::ast_index::AstBigram(key_a))
+        .unwrap();
+    let unique: std::collections::HashSet<u32> = postings_a.iter().map(|p| p.doc_id).collect();
+    assert_eq!(
+        unique.len(),
+        10,
+        "C1 violated: duplicate doc_ids in posting list for key_a"
+    );
 }
 
 // ============================================================================

@@ -4,9 +4,14 @@
 //!
 //! `ast_index.skpost` is written first, then `ast_index.skidx` (commit point).
 //! A reader that finds `.skidx` present can assume `.skpost` is coherent.
-//! A partial write (e.g. power loss between the two) leaves no `.skidx`, so
+//! A partial write (e.g. process crash between the two) leaves no `.skidx`, so
 //! the next `open` attempt fails cleanly with a "file not found" error rather
 //! than producing a corrupt read.
+//!
+//! Rename durability depends on the filesystem.  Without a directory fsync after
+//! `persist`, a power loss may leave the rename un-flushed on some filesystems
+//! (e.g. ext4 without `data=journal`).  A directory fsync is not performed here;
+//! this matches the posture of the cochange sibling.  Tracked as a follow-up.
 //!
 //! # Re-index concurrency safety
 //!
@@ -36,20 +41,16 @@ use rayon::prelude::*;
 use tempfile::NamedTempFile;
 
 use super::format::{
-    AST_BIGRAM_ENTRY_SIZE, AST_FILE_META_SIZE, AST_FORMAT_VERSION, AST_HEADER_SIZE,
-    AST_POSTING_ENTRY_SIZE, AST_SKIDX_MAGIC, AST_TRIGRAM_ENTRY_SIZE, AstBigramEntry,
-    AstFileMetaEntry, AstPostingEntry, AstSkidxHeader, AstTrigramEntry, encode_bigram_entry,
-    encode_file_meta, encode_header, encode_posting, encode_trigram_entry, lang_to_id,
+    AstBigramTableEntry, AstFileMetaEntry, AstPostingEntry, AstSkidxHeader, AstTrigramTableEntry,
+    FILE_META_SIZE, FORMAT_VERSION, HEADER_SIZE, POSTING_ENTRY_SIZE, SKAX_MAGIC,
+    encode_bigram_entry, encode_file_meta, encode_header, encode_posting, encode_trigram_entry,
+    lang_to_id,
 };
 use super::reader::AstIndexReader;
 use crate::{
     FileId, Result, SearchError,
     ast_index::{AstNgramSet, extract_ast_ngrams, linearize_source},
 };
-
-// ============================================================================
-// Public builder struct
-// ============================================================================
 
 /// Constructs the two-file mmap'd AST structural n-gram index.
 ///
@@ -83,6 +84,78 @@ pub struct AstIndexBuilder {
     /// Sum of distinct trigram counts per file (for avg_trigram_count).
     total_distinct_trigrams: u64,
 }
+
+// ============================================================================
+// Private serialization helper
+// ============================================================================
+
+/// Output of [`serialize_entry_table`]: the typed entry table and its flat
+/// encoded byte representation (ready to pass to the CRC hasher and skidx buf).
+struct EntryTableResult<E> {
+    /// Decoded entry structs (used for debug assertions and count checks).
+    table: Vec<E>,
+    /// Flat encoded bytes (entry_size × n), CRC-hashable and skidx-appendable.
+    encoded: Vec<u8>,
+}
+
+/// Shared serialization logic for bigram and trigram entry tables.
+///
+/// For each key in `sorted_keys`:
+/// 1. Records the current `postings_buf` length as `posting_offset`.
+/// 2. Serialises each posting entry in the list into `postings_buf`.
+/// 3. Computes `posting_length = list.len() × POSTING_ENTRY_SIZE` (checked).
+/// 4. Calls `make_entry(key, posting_offset, posting_length)` to build the typed entry.
+/// 5. Encodes the entry via `encode_entry` and appends to the entry byte buffer.
+///
+/// The key type `K` is any key that can be formatted with `{:#x}` and used as a
+/// `HashMap` key.  The entry type `E` is the on-disk struct (bigram or trigram).
+///
+/// # Errors
+///
+/// Returns [`SearchError::IndexCorrupted`] if any posting list overflows `usize`
+/// or `u32`.
+fn serialize_entry_table<K, E, const N: usize>(
+    sorted_keys: &[K],
+    postings_map: &HashMap<K, Vec<AstPostingEntry>>,
+    postings_buf: &mut Vec<u8>,
+    make_entry: impl Fn(K, u64, u32) -> E,
+    encode_entry: impl Fn(&E) -> [u8; N],
+    kind: &'static str,
+) -> Result<EntryTableResult<E>>
+where
+    K: std::hash::Hash + Eq + Copy + std::fmt::LowerHex,
+{
+    let mut table: Vec<E> = Vec::with_capacity(sorted_keys.len());
+    let mut encoded: Vec<u8> = Vec::with_capacity(sorted_keys.len() * N);
+
+    for &key in sorted_keys {
+        let list = &postings_map[&key];
+        let offset = postings_buf.len() as u64;
+        let byte_len = list.len().checked_mul(POSTING_ENTRY_SIZE).ok_or_else(|| {
+            SearchError::IndexCorrupted(format!(
+                "{kind} posting list for key {key:#x} overflows usize"
+            ))
+        })?;
+        // Applies PF-004 analogue: explicit try_from, no silent as-cast narrowing.
+        let length = u32::try_from(byte_len).map_err(|_| {
+            SearchError::IndexCorrupted(format!(
+                "{kind} posting list for key {key:#x} exceeds u32::MAX ({byte_len} bytes)"
+            ))
+        })?;
+        for p in list {
+            postings_buf.extend_from_slice(&encode_posting(p));
+        }
+        let entry = make_entry(key, offset, length);
+        encoded.extend_from_slice(&encode_entry(&entry));
+        table.push(entry);
+    }
+
+    Ok(EntryTableResult { table, encoded })
+}
+
+// ============================================================================
+// Public builder struct
+// ============================================================================
 
 impl AstIndexBuilder {
     /// Create a new builder that will write index files to `output_dir`.
@@ -243,6 +316,13 @@ impl AstIndexBuilder {
     /// Files are processed in the order they appear in `files`, so FileIds MUST
     /// be 0-based and contiguous in the slice.
     ///
+    /// # Peak memory
+    ///
+    /// The rayon stage materialises the entire extracted corpus before sequential
+    /// merge — peak memory is O(total distinct n-grams across all files held
+    /// transiently).  A chunked-build strategy that bounds peak memory is tracked
+    /// in issue #273.
+    ///
     /// # Errors
     ///
     /// Returns [`SearchError`] from extraction, merging, or I/O.
@@ -361,90 +441,51 @@ impl AstIndexBuilder {
                 .values()
                 .map(|v| v.len())
                 .sum::<usize>())
-            * AST_POSTING_ENTRY_SIZE;
+            * POSTING_ENTRY_SIZE;
         let mut postings_buf = Vec::with_capacity(total_posting_bytes_est);
 
         // ── Bigram entries ───────────────────────────────────────────────────
-        let mut bigram_entries: Vec<AstBigramEntry> = Vec::with_capacity(bigram_keys.len());
-        for &key in bigram_keys {
-            let list = &self.bigram_postings[&key];
-            let offset = postings_buf.len() as u64;
-            let byte_len = list
-                .len()
-                .checked_mul(AST_POSTING_ENTRY_SIZE)
-                .ok_or_else(|| {
-                    SearchError::IndexCorrupted(format!(
-                        "bigram posting list for key {key:#010x} overflows usize"
-                    ))
-                })?;
-            let length = u32::try_from(byte_len).map_err(|_| {
-                SearchError::IndexCorrupted(format!(
-                    "bigram posting list for key {key:#010x} exceeds u32::MAX ({byte_len} bytes)"
-                ))
-            })?;
-            for p in list {
-                postings_buf.extend_from_slice(&encode_posting(p));
-            }
-            bigram_entries.push(AstBigramEntry {
+        // build_entry_table writes each posting into postings_buf and returns the
+        // sorted entry table (offset/length pair per key).  Bigram keys are u32;
+        // widened to u64 inside the helper for the shared offset representation.
+        let bigram_entries = serialize_entry_table(
+            bigram_keys,
+            &self.bigram_postings,
+            &mut postings_buf,
+            |key, posting_offset, posting_length| AstBigramTableEntry {
                 key,
-                posting_offset: offset,
-                posting_length: length,
-            });
-        }
+                posting_offset,
+                posting_length,
+            },
+            encode_bigram_entry,
+            "bigram",
+        )?;
 
         // ── Trigram entries ──────────────────────────────────────────────────
-        let mut trigram_entries: Vec<AstTrigramEntry> = Vec::with_capacity(trigram_keys.len());
-        for &key in trigram_keys {
-            let list = &self.trigram_postings[&key];
-            let offset = postings_buf.len() as u64;
-            let byte_len = list
-                .len()
-                .checked_mul(AST_POSTING_ENTRY_SIZE)
-                .ok_or_else(|| {
-                    SearchError::IndexCorrupted(format!(
-                        "trigram posting list for key {key:#018x} overflows usize"
-                    ))
-                })?;
-            let length = u32::try_from(byte_len).map_err(|_| {
-                SearchError::IndexCorrupted(format!(
-                    "trigram posting list for key {key:#018x} exceeds u32::MAX ({byte_len} bytes)"
-                ))
-            })?;
-            for p in list {
-                postings_buf.extend_from_slice(&encode_posting(p));
-            }
-            trigram_entries.push(AstTrigramEntry {
+        let trigram_entries = serialize_entry_table(
+            trigram_keys,
+            &self.trigram_postings,
+            &mut postings_buf,
+            |key, posting_offset, posting_length| AstTrigramTableEntry {
                 key,
-                posting_offset: offset,
-                posting_length: length,
-            });
-        }
+                posting_offset,
+                posting_length,
+            },
+            encode_trigram_entry,
+            "trigram",
+        )?;
 
         // ── File meta buffer ─────────────────────────────────────────────────
-        let mut meta_buf: Vec<u8> = Vec::with_capacity(self.file_meta.len() * AST_FILE_META_SIZE);
+        let mut meta_buf: Vec<u8> = Vec::with_capacity(self.file_meta.len() * FILE_META_SIZE);
         for m in &self.file_meta {
             meta_buf.extend_from_slice(&encode_file_meta(m));
-        }
-
-        // ── Bigram entry buffer ──────────────────────────────────────────────
-        let mut bigram_entries_buf: Vec<u8> =
-            Vec::with_capacity(bigram_entries.len() * AST_BIGRAM_ENTRY_SIZE);
-        for e in &bigram_entries {
-            bigram_entries_buf.extend_from_slice(&encode_bigram_entry(e));
-        }
-
-        // ── Trigram entry buffer ─────────────────────────────────────────────
-        let mut trigram_entries_buf: Vec<u8> =
-            Vec::with_capacity(trigram_entries.len() * AST_TRIGRAM_ENTRY_SIZE);
-        for e in &trigram_entries {
-            trigram_entries_buf.extend_from_slice(&encode_trigram_entry(e));
         }
 
         // Debug assertion: bigram offsets are monotonic and contiguous.
         #[cfg(debug_assertions)]
         {
             let mut expected_offset = 0u64;
-            for e in &bigram_entries {
+            for e in &bigram_entries.table {
                 debug_assert_eq!(
                     e.posting_offset, expected_offset,
                     "bigram entry offsets must be contiguous"
@@ -452,7 +493,7 @@ impl AstIndexBuilder {
                 expected_offset += u64::from(e.posting_length);
             }
             // trigram entries continue immediately after bigram postings
-            for e in &trigram_entries {
+            for e in &trigram_entries.table {
                 debug_assert_eq!(
                     e.posting_offset, expected_offset,
                     "trigram entry offsets must be contiguous (continue after bigrams)"
@@ -463,31 +504,31 @@ impl AstIndexBuilder {
 
         // ── CRC32 over the post-header payload ───────────────────────────────
         // Serialization order: bigram entries + trigram entries + file meta.
-        // Must match the reader's slice: idx_mmap[AST_HEADER_SIZE..expected_idx].
+        // Must match the reader's slice: idx_mmap[HEADER_SIZE..expected_idx].
         let mut crc_hasher = crc32fast::Hasher::new();
-        crc_hasher.update(&bigram_entries_buf);
-        crc_hasher.update(&trigram_entries_buf);
+        crc_hasher.update(&bigram_entries.encoded);
+        crc_hasher.update(&trigram_entries.encoded);
         crc_hasher.update(&meta_buf);
         let checksum = crc_hasher.finalize();
 
         // ── Overflow-checked counts ──────────────────────────────────────────
-        let bigram_count = u32::try_from(bigram_entries.len()).map_err(|_| {
+        let bigram_count = u32::try_from(bigram_entries.table.len()).map_err(|_| {
             SearchError::IndexCorrupted(format!(
                 "bigram_count {} exceeds u32::MAX",
-                bigram_entries.len()
+                bigram_entries.table.len()
             ))
         })?;
-        let trigram_count = u32::try_from(trigram_entries.len()).map_err(|_| {
+        let trigram_count = u32::try_from(trigram_entries.table.len()).map_err(|_| {
             SearchError::IndexCorrupted(format!(
                 "trigram_count {} exceeds u32::MAX",
-                trigram_entries.len()
+                trigram_entries.table.len()
             ))
         })?;
 
         // ── Header ───────────────────────────────────────────────────────────
         let header = AstSkidxHeader {
-            magic: *AST_SKIDX_MAGIC,
-            version: AST_FORMAT_VERSION,
+            magic: *SKAX_MAGIC,
+            version: FORMAT_VERSION,
             bigram_count,
             trigram_count,
             file_count: self.file_count,
@@ -500,11 +541,14 @@ impl AstIndexBuilder {
 
         // ── Assemble .skidx: header + bigram entries + trigram entries + file_meta
         let mut skidx_buf = Vec::with_capacity(
-            AST_HEADER_SIZE + bigram_entries_buf.len() + trigram_entries_buf.len() + meta_buf.len(),
+            HEADER_SIZE
+                + bigram_entries.encoded.len()
+                + trigram_entries.encoded.len()
+                + meta_buf.len(),
         );
         skidx_buf.extend_from_slice(&encode_header(&header));
-        skidx_buf.extend_from_slice(&bigram_entries_buf);
-        skidx_buf.extend_from_slice(&trigram_entries_buf);
+        skidx_buf.extend_from_slice(&bigram_entries.encoded);
+        skidx_buf.extend_from_slice(&trigram_entries.encoded);
         skidx_buf.extend_from_slice(&meta_buf);
 
         Ok((postings_buf, skidx_buf))

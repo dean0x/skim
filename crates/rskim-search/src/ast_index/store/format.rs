@@ -33,9 +33,6 @@
 //! - **No `unwrap()` / `expect()` / `panic!()`** outside `#[cfg(test)]`.
 
 pub(crate) use crate::index::lang_map::lang_to_id;
-// lang_from_id is used in tests and by readers to recover Language from lang_id
-#[allow(unused_imports)]
-pub(crate) use crate::index::lang_map::lang_from_id;
 use crate::{Result, SearchError};
 
 // ============================================================================
@@ -46,29 +43,29 @@ use crate::{Result, SearchError};
 ///
 /// Distinct from the lexical index magic `b"SKIX"` so that opening an
 /// AST index dir containing only lexical files fails cleanly with Io/NotFound.
-pub(crate) const AST_SKIDX_MAGIC: &[u8; 4] = b"SKAX";
+pub(crate) const SKAX_MAGIC: &[u8; 4] = b"SKAX";
 
 /// Current on-disk format version.  Increment on ANY layout change.
 ///
 /// Version-bump policy: any change to field order, field width, or interpretation
 /// of any byte in any struct increments this number.  Old versions are rejected
 /// with an error message containing "format version".
-pub(crate) const AST_FORMAT_VERSION: u16 = 1;
+pub(crate) const FORMAT_VERSION: u16 = 1;
 
 /// Size in bytes of [`AstSkidxHeader`] on disk.
-pub(crate) const AST_HEADER_SIZE: usize = 48;
+pub(crate) const HEADER_SIZE: usize = 48;
 
-/// Size in bytes of a single [`AstBigramEntry`] on disk.
-pub(crate) const AST_BIGRAM_ENTRY_SIZE: usize = 16;
+/// Size in bytes of a single [`AstBigramTableEntry`] on disk.
+pub(crate) const BIGRAM_ENTRY_SIZE: usize = 16;
 
-/// Size in bytes of a single [`AstTrigramEntry`] on disk.
-pub(crate) const AST_TRIGRAM_ENTRY_SIZE: usize = 20;
+/// Size in bytes of a single [`AstTrigramTableEntry`] on disk.
+pub(crate) const TRIGRAM_ENTRY_SIZE: usize = 20;
 
 /// Size in bytes of a single [`AstPostingEntry`] on disk.
-pub(crate) const AST_POSTING_ENTRY_SIZE: usize = 8;
+pub(crate) const POSTING_ENTRY_SIZE: usize = 8;
 
 /// Size in bytes of a single [`AstFileMetaEntry`] on disk.
-pub(crate) const AST_FILE_META_SIZE: usize = 5;
+pub(crate) const FILE_META_SIZE: usize = 5;
 
 // ============================================================================
 // On-disk structs
@@ -92,9 +89,9 @@ pub(crate) const AST_FILE_META_SIZE: usize = 5;
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct AstSkidxHeader {
-    /// Must equal [`AST_SKIDX_MAGIC`].
+    /// Must equal [`SKAX_MAGIC`].
     pub magic: [u8; 4],
-    /// Must equal [`AST_FORMAT_VERSION`].
+    /// Must equal [`FORMAT_VERSION`].
     pub version: u16,
     /// Number of distinct AST bigram entries in the lookup table.
     pub bigram_count: u32,
@@ -125,8 +122,12 @@ pub(crate) struct AstSkidxHeader {
 /// [4..12]  posting_offset (u64)  8 bytes
 /// [12..16] posting_length (u32)  4 bytes
 /// ```
+///
+/// Not to be confused with `extract::AstBigramEntry` (which holds `ngram`,
+/// `weight`, and `count` for document-side extraction). This struct is the
+/// on-disk lookup-table row: key + posting offset + posting length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AstBigramEntry {
+pub(crate) struct AstBigramTableEntry {
     /// Encoded bigram key (`AstBigram::key()`).
     pub key: u32,
     /// Byte offset into `ast_index.skpost` where this bigram's posting list begins.
@@ -143,8 +144,12 @@ pub(crate) struct AstBigramEntry {
 /// [8..16]  posting_offset (u64)  8 bytes
 /// [16..20] posting_length (u32)  4 bytes
 /// ```
+///
+/// Not to be confused with `extract::AstTrigramEntry` (which holds `ngram`,
+/// `weight`, and `count` for document-side extraction). This struct is the
+/// on-disk lookup-table row: key + posting offset + posting length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AstTrigramEntry {
+pub(crate) struct AstTrigramTableEntry {
     /// Encoded trigram key (`AstTrigram::key()`).
     pub key: u64,
     /// Byte offset into `ast_index.skpost` where this trigram's posting list begins.
@@ -161,9 +166,12 @@ pub(crate) struct AstTrigramEntry {
 /// [4..8] count   4 bytes (u32, per-file structural term-frequency, >= 1)
 /// ```
 ///
-/// `count` is taken directly from `AstBigramEntry.count` / `AstTrigramEntry.count`
-/// (the structural term-frequency produced by `extract_ast_ngrams`).
-/// IDF weight is discarded at build time and recomputed at query time.
+/// `count` (C5) is the per-file structural term-frequency produced by
+/// `extract_ast_ngrams` — specifically the `count` field on
+/// `extract::AstBigramEntry` / `extract::AstTrigramEntry`, which records how
+/// many times that structural edge occurred in the file.  It is NOT a field on
+/// this struct.  IDF weight is discarded at build time and recomputed at query
+/// time (Wave 3f) via `ast_bigram_idf` / `ast_trigram_idf`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AstPostingEntry {
     /// The document (file) this posting belongs to.
@@ -181,12 +189,31 @@ pub(crate) struct AstPostingEntry {
 /// ```
 ///
 /// `node_count` equals `lin.nodes.len()` (emitted nodes, excludes ERROR/MISSING).
+///
+/// # C6 — language recovery
+///
+/// Call [`AstFileMetaEntry::language`] to recover the [`rskim_core::Language`]
+/// from `lang_id`.  Returns `None` for IDs that were valid at build time but are
+/// not recognised by the current binary (e.g. an index built with a future
+/// version).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AstFileMetaEntry {
     /// Language ID from [`lang_to_id`].
     pub lang_id: u8,
     /// Number of emitted AST nodes from `linearize_source` (excludes ERROR/MISSING).
     pub node_count: u32,
+}
+
+impl AstFileMetaEntry {
+    /// Recover the [`rskim_core::Language`] from this entry's `lang_id` (C6).
+    ///
+    /// Returns `None` if the ID is not recognised by the current binary — this
+    /// can happen when reading an index built with a newer version that introduced
+    /// additional language variants.
+    #[must_use]
+    pub fn language(&self) -> Option<rskim_core::Language> {
+        crate::index::lang_map::lang_from_id(self.lang_id)
+    }
 }
 
 // ============================================================================
@@ -205,8 +232,9 @@ fn read_array<const N: usize>(data: &[u8], start: usize, context: &'static str) 
         .and_then(|s| s.try_into().ok())
         .ok_or_else(|| {
             SearchError::IndexCorrupted(format!(
-                "{context}: need {N} bytes at offset {start}, got {}",
-                data.len()
+                "{context}: need {N} bytes at offset {start}, \
+                 {} bytes available from that offset",
+                data.len().saturating_sub(start)
             ))
         })
 }
@@ -216,8 +244,8 @@ fn read_array<const N: usize>(data: &[u8], start: usize, context: &'static str) 
 // ============================================================================
 
 /// Encode an [`AstSkidxHeader`] into its 48-byte on-disk representation.
-pub(crate) fn encode_header(h: &AstSkidxHeader) -> [u8; AST_HEADER_SIZE] {
-    let mut buf = [0u8; AST_HEADER_SIZE];
+pub(crate) fn encode_header(h: &AstSkidxHeader) -> [u8; HEADER_SIZE] {
+    let mut buf = [0u8; HEADER_SIZE];
     buf[0..4].copy_from_slice(&h.magic);
     buf[4..6].copy_from_slice(&h.version.to_le_bytes());
     buf[6..10].copy_from_slice(&h.bigram_count.to_le_bytes());
@@ -227,7 +255,7 @@ pub(crate) fn encode_header(h: &AstSkidxHeader) -> [u8; AST_HEADER_SIZE] {
     buf[26..30].copy_from_slice(&h.avg_bigram_count.to_le_bytes());
     buf[30..34].copy_from_slice(&h.avg_trigram_count.to_le_bytes());
     buf[34..38].copy_from_slice(&h.avg_node_count.to_le_bytes());
-    // [38..44] reserved — already zeroed by `[0u8; AST_HEADER_SIZE]`
+    // [38..44] reserved — already zeroed by `[0u8; HEADER_SIZE]`
     buf[44..48].copy_from_slice(&h.checksum.to_le_bytes());
     buf
 }
@@ -237,28 +265,28 @@ pub(crate) fn encode_header(h: &AstSkidxHeader) -> [u8; AST_HEADER_SIZE] {
 /// # Errors
 ///
 /// Returns [`SearchError::IndexCorrupted`] if:
-/// - The slice is shorter than [`AST_HEADER_SIZE`].
-/// - Magic bytes do not match [`AST_SKIDX_MAGIC`] (message contains "bad magic").
-/// - Version does not equal [`AST_FORMAT_VERSION`] (message contains "format version").
+/// - The slice is shorter than [`HEADER_SIZE`].
+/// - Magic bytes do not match [`SKAX_MAGIC`] (message contains "bad magic").
+/// - Version does not equal [`FORMAT_VERSION`] (message contains "format version").
 /// - Any of the three `avg_*` f32 fields is non-finite or < 0.0.
 pub(crate) fn decode_header(data: &[u8]) -> Result<AstSkidxHeader> {
-    if data.len() < AST_HEADER_SIZE {
+    if data.len() < HEADER_SIZE {
         return Err(SearchError::IndexCorrupted(format!(
-            "header truncated: need {AST_HEADER_SIZE} bytes, got {}",
+            "header truncated: need {HEADER_SIZE} bytes, got {}",
             data.len()
         )));
     }
     let magic: [u8; 4] = read_array(data, 0, "header: magic")?;
-    if &magic != AST_SKIDX_MAGIC {
+    if &magic != SKAX_MAGIC {
         return Err(SearchError::IndexCorrupted(format!(
             "bad magic: expected {:?}, got {:?}",
-            AST_SKIDX_MAGIC, magic
+            SKAX_MAGIC, magic
         )));
     }
     let version = u16::from_le_bytes(read_array(data, 4, "header: version")?);
-    if version != AST_FORMAT_VERSION {
+    if version != FORMAT_VERSION {
         return Err(SearchError::IndexCorrupted(format!(
-            "unsupported format version: {version} (expected {AST_FORMAT_VERSION}); \
+            "unsupported format version: {version} (expected {FORMAT_VERSION}); \
              please rebuild the AST index"
         )));
     }
@@ -302,28 +330,28 @@ pub(crate) fn decode_header(data: &[u8]) -> Result<AstSkidxHeader> {
 // AstBigramEntry encode / decode
 // ============================================================================
 
-/// Encode an [`AstBigramEntry`] into its 16-byte on-disk representation.
-pub(crate) fn encode_bigram_entry(e: &AstBigramEntry) -> [u8; AST_BIGRAM_ENTRY_SIZE] {
-    let mut buf = [0u8; AST_BIGRAM_ENTRY_SIZE];
+/// Encode an [`AstBigramTableEntry`] into its 16-byte on-disk representation.
+pub(crate) fn encode_bigram_entry(e: &AstBigramTableEntry) -> [u8; BIGRAM_ENTRY_SIZE] {
+    let mut buf = [0u8; BIGRAM_ENTRY_SIZE];
     buf[0..4].copy_from_slice(&e.key.to_le_bytes());
     buf[4..12].copy_from_slice(&e.posting_offset.to_le_bytes());
     buf[12..16].copy_from_slice(&e.posting_length.to_le_bytes());
     buf
 }
 
-/// Decode an [`AstBigramEntry`] from a 16-byte slice.
+/// Decode an [`AstBigramTableEntry`] from a 16-byte slice.
 ///
 /// # Errors
 ///
 /// Returns [`SearchError::IndexCorrupted`] if the slice is too short.
-pub(crate) fn decode_bigram_entry(data: &[u8]) -> Result<AstBigramEntry> {
-    if data.len() < AST_BIGRAM_ENTRY_SIZE {
+pub(crate) fn decode_bigram_entry(data: &[u8]) -> Result<AstBigramTableEntry> {
+    if data.len() < BIGRAM_ENTRY_SIZE {
         return Err(SearchError::IndexCorrupted(format!(
-            "bigram_entry truncated: need {AST_BIGRAM_ENTRY_SIZE} bytes, got {}",
+            "bigram_entry truncated: need {BIGRAM_ENTRY_SIZE} bytes, got {}",
             data.len()
         )));
     }
-    Ok(AstBigramEntry {
+    Ok(AstBigramTableEntry {
         key: u32::from_le_bytes(read_array(data, 0, "bigram_entry: key")?),
         posting_offset: u64::from_le_bytes(read_array(data, 4, "bigram_entry: posting_offset")?),
         posting_length: u32::from_le_bytes(read_array(data, 12, "bigram_entry: posting_length")?),
@@ -334,28 +362,28 @@ pub(crate) fn decode_bigram_entry(data: &[u8]) -> Result<AstBigramEntry> {
 // AstTrigramEntry encode / decode
 // ============================================================================
 
-/// Encode an [`AstTrigramEntry`] into its 20-byte on-disk representation.
-pub(crate) fn encode_trigram_entry(e: &AstTrigramEntry) -> [u8; AST_TRIGRAM_ENTRY_SIZE] {
-    let mut buf = [0u8; AST_TRIGRAM_ENTRY_SIZE];
+/// Encode an [`AstTrigramTableEntry`] into its 20-byte on-disk representation.
+pub(crate) fn encode_trigram_entry(e: &AstTrigramTableEntry) -> [u8; TRIGRAM_ENTRY_SIZE] {
+    let mut buf = [0u8; TRIGRAM_ENTRY_SIZE];
     buf[0..8].copy_from_slice(&e.key.to_le_bytes());
     buf[8..16].copy_from_slice(&e.posting_offset.to_le_bytes());
     buf[16..20].copy_from_slice(&e.posting_length.to_le_bytes());
     buf
 }
 
-/// Decode an [`AstTrigramEntry`] from a 20-byte slice.
+/// Decode an [`AstTrigramTableEntry`] from a 20-byte slice.
 ///
 /// # Errors
 ///
 /// Returns [`SearchError::IndexCorrupted`] if the slice is too short.
-pub(crate) fn decode_trigram_entry(data: &[u8]) -> Result<AstTrigramEntry> {
-    if data.len() < AST_TRIGRAM_ENTRY_SIZE {
+pub(crate) fn decode_trigram_entry(data: &[u8]) -> Result<AstTrigramTableEntry> {
+    if data.len() < TRIGRAM_ENTRY_SIZE {
         return Err(SearchError::IndexCorrupted(format!(
-            "trigram_entry truncated: need {AST_TRIGRAM_ENTRY_SIZE} bytes, got {}",
+            "trigram_entry truncated: need {TRIGRAM_ENTRY_SIZE} bytes, got {}",
             data.len()
         )));
     }
-    Ok(AstTrigramEntry {
+    Ok(AstTrigramTableEntry {
         key: u64::from_le_bytes(read_array(data, 0, "trigram_entry: key")?),
         posting_offset: u64::from_le_bytes(read_array(data, 8, "trigram_entry: posting_offset")?),
         posting_length: u32::from_le_bytes(read_array(data, 16, "trigram_entry: posting_length")?),
@@ -367,8 +395,8 @@ pub(crate) fn decode_trigram_entry(data: &[u8]) -> Result<AstTrigramEntry> {
 // ============================================================================
 
 /// Encode an [`AstPostingEntry`] into its 8-byte on-disk representation.
-pub(crate) fn encode_posting(p: &AstPostingEntry) -> [u8; AST_POSTING_ENTRY_SIZE] {
-    let mut buf = [0u8; AST_POSTING_ENTRY_SIZE];
+pub(crate) fn encode_posting(p: &AstPostingEntry) -> [u8; POSTING_ENTRY_SIZE] {
+    let mut buf = [0u8; POSTING_ENTRY_SIZE];
     buf[0..4].copy_from_slice(&p.doc_id.to_le_bytes());
     buf[4..8].copy_from_slice(&p.count.to_le_bytes());
     buf
@@ -381,9 +409,9 @@ pub(crate) fn encode_posting(p: &AstPostingEntry) -> [u8; AST_POSTING_ENTRY_SIZE
 /// Returns [`SearchError::IndexCorrupted`] if the slice is too short or
 /// `count == 0` (invariant: every posting has count >= 1).
 pub(crate) fn decode_posting(data: &[u8]) -> Result<AstPostingEntry> {
-    if data.len() < AST_POSTING_ENTRY_SIZE {
+    if data.len() < POSTING_ENTRY_SIZE {
         return Err(SearchError::IndexCorrupted(format!(
-            "ast_posting truncated: need {AST_POSTING_ENTRY_SIZE} bytes, got {}",
+            "ast_posting truncated: need {POSTING_ENTRY_SIZE} bytes, got {}",
             data.len()
         )));
     }
@@ -402,8 +430,8 @@ pub(crate) fn decode_posting(data: &[u8]) -> Result<AstPostingEntry> {
 // ============================================================================
 
 /// Encode an [`AstFileMetaEntry`] into its 5-byte on-disk representation.
-pub(crate) fn encode_file_meta(m: &AstFileMetaEntry) -> [u8; AST_FILE_META_SIZE] {
-    let mut buf = [0u8; AST_FILE_META_SIZE];
+pub(crate) fn encode_file_meta(m: &AstFileMetaEntry) -> [u8; FILE_META_SIZE] {
+    let mut buf = [0u8; FILE_META_SIZE];
     buf[0] = m.lang_id;
     buf[1..5].copy_from_slice(&m.node_count.to_le_bytes());
     buf
@@ -415,9 +443,9 @@ pub(crate) fn encode_file_meta(m: &AstFileMetaEntry) -> [u8; AST_FILE_META_SIZE]
 ///
 /// Returns [`SearchError::IndexCorrupted`] if the slice is too short.
 pub(crate) fn decode_file_meta(data: &[u8]) -> Result<AstFileMetaEntry> {
-    if data.len() < AST_FILE_META_SIZE {
+    if data.len() < FILE_META_SIZE {
         return Err(SearchError::IndexCorrupted(format!(
-            "ast_file_meta truncated: need {AST_FILE_META_SIZE} bytes, got {}",
+            "ast_file_meta truncated: need {FILE_META_SIZE} bytes, got {}",
             data.len()
         )));
     }
@@ -434,7 +462,7 @@ pub(crate) fn decode_file_meta(data: &[u8]) -> Result<AstFileMetaEntry> {
 /// Compute the CRC32 checksum of `data`.
 ///
 /// The header checksum covers the single contiguous post-header payload:
-/// `idx_mmap[AST_HEADER_SIZE..expected_idx_size]`, which includes bigram
+/// `idx_mmap[HEADER_SIZE..expected_idx_size]`, which includes bigram
 /// entries, trigram entries, and file-meta entries in serialization order.
 pub(crate) fn compute_checksum(data: &[u8]) -> u32 {
     crc32fast::hash(data)
@@ -444,18 +472,18 @@ pub(crate) fn compute_checksum(data: &[u8]) -> u32 {
 // Binary search helpers
 // ============================================================================
 
-/// Binary-search `entries_data` for an [`AstBigramEntry`] with the given `key`.
+/// Binary-search `entries_data` for an [`AstBigramTableEntry`] with the given `key`.
 ///
 /// `entries_data` must be a byte slice whose length is a multiple of
-/// [`AST_BIGRAM_ENTRY_SIZE`] and whose entries are sorted ascending by `key`.
+/// [`BIGRAM_ENTRY_SIZE`] and whose entries are sorted ascending by `key`.
 ///
 /// Returns `Ok(Some(entry))` if found, `Ok(None)` if absent, or
 /// [`SearchError::IndexCorrupted`] if the slice length is not a multiple of
 /// the entry size.
-pub(crate) fn lookup_bigram(entries_data: &[u8], key: u32) -> Result<Option<AstBigramEntry>> {
+pub(crate) fn lookup_bigram(entries_data: &[u8], key: u32) -> Result<Option<AstBigramTableEntry>> {
     binary_search_entries(
         entries_data,
-        AST_BIGRAM_ENTRY_SIZE,
+        BIGRAM_ENTRY_SIZE,
         |data, off| {
             let raw: [u8; 4] = data[off..off + 4]
                 .try_into()
@@ -463,22 +491,25 @@ pub(crate) fn lookup_bigram(entries_data: &[u8], key: u32) -> Result<Option<AstB
             Ok(u64::from(u32::from_le_bytes(raw)))
         },
         u64::from(key),
-        |data, off| decode_bigram_entry(&data[off..off + AST_BIGRAM_ENTRY_SIZE]).map(Some),
+        |data, off| decode_bigram_entry(&data[off..off + BIGRAM_ENTRY_SIZE]).map(Some),
     )
 }
 
-/// Binary-search `entries_data` for an [`AstTrigramEntry`] with the given `key`.
+/// Binary-search `entries_data` for an [`AstTrigramTableEntry`] with the given `key`.
 ///
 /// `entries_data` must be a byte slice whose length is a multiple of
-/// [`AST_TRIGRAM_ENTRY_SIZE`] and whose entries are sorted ascending by `key`.
+/// [`TRIGRAM_ENTRY_SIZE`] and whose entries are sorted ascending by `key`.
 ///
 /// Returns `Ok(Some(entry))` if found, `Ok(None)` if absent, or
 /// [`SearchError::IndexCorrupted`] if the slice length is not a multiple of
 /// the entry size.
-pub(crate) fn lookup_trigram(entries_data: &[u8], key: u64) -> Result<Option<AstTrigramEntry>> {
+pub(crate) fn lookup_trigram(
+    entries_data: &[u8],
+    key: u64,
+) -> Result<Option<AstTrigramTableEntry>> {
     binary_search_entries(
         entries_data,
-        AST_TRIGRAM_ENTRY_SIZE,
+        TRIGRAM_ENTRY_SIZE,
         |data, off| {
             let raw: [u8; 8] = data[off..off + 8]
                 .try_into()
@@ -486,7 +517,7 @@ pub(crate) fn lookup_trigram(entries_data: &[u8], key: u64) -> Result<Option<Ast
             Ok(u64::from_le_bytes(raw))
         },
         key,
-        |data, off| decode_trigram_entry(&data[off..off + AST_TRIGRAM_ENTRY_SIZE]).map(Some),
+        |data, off| decode_trigram_entry(&data[off..off + TRIGRAM_ENTRY_SIZE]).map(Some),
     )
 }
 

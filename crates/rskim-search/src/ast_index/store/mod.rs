@@ -27,9 +27,9 @@
 //!
 //! Structural query / scoring (Wave 3f) and CLI wiring (Wave 3g).
 
-pub mod builder;
+mod builder;
 pub(crate) mod format;
-pub mod reader;
+mod reader;
 
 pub use builder::AstIndexBuilder;
 pub use format::AstFileMetaEntry;

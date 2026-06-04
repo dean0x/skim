@@ -27,9 +27,9 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use super::format::{
-    AST_BIGRAM_ENTRY_SIZE, AST_FILE_META_SIZE, AST_HEADER_SIZE, AST_POSTING_ENTRY_SIZE,
-    AST_TRIGRAM_ENTRY_SIZE, AstFileMetaEntry, AstSkidxHeader, compute_checksum, decode_file_meta,
-    decode_header, decode_posting, lookup_bigram, lookup_trigram,
+    AstFileMetaEntry, AstSkidxHeader, BIGRAM_ENTRY_SIZE, FILE_META_SIZE, HEADER_SIZE,
+    POSTING_ENTRY_SIZE, TRIGRAM_ENTRY_SIZE, compute_checksum, decode_file_meta, decode_header,
+    decode_posting, lookup_bigram, lookup_trigram,
 };
 use crate::{
     Result, SearchError,
@@ -43,12 +43,22 @@ use crate::{
 /// One element of a decoded posting list.
 ///
 /// `doc_id` — the file index (0-based sequential FileId).
-/// `count`  — per-file structural term-frequency (always >= 1, per C4).
+/// `count`  — per-file structural term-frequency (always >= 1, per C4/C5).
 ///
-/// Guarantees upheld by the reader (C1–C5):
-/// - C1: returned slices are sorted ascending by `doc_id`.
-/// - C2: at most one posting per `doc_id` (builder invariant).
+/// Reader API contracts (C1–C7):
+/// - C1: postings returned by `lookup_bigram`/`lookup_trigram` are sorted
+///   ascending by `doc_id`, at most one per `doc_id` (validated on decode;
+///   see `lookup_postings_generic`).
+/// - C2: absent key → `Ok(vec![])` (no error, no panic).
+/// - C3: malformed entry (bad offset/len, OOB, `len % 8 != 0`) →
+///   `Err(IndexCorrupted)`.
 /// - C4: `count >= 1` (validated by `decode_posting`).
+/// - C5: `count` is the structural term-frequency from `extract_ast_ngrams`;
+///   use it for BM25-style scoring at query time (Wave 3f).
+/// - C6: `file_meta(i).language()` recovers the [`rskim_core::Language`] for
+///   file `i`; returns `None` for unrecognised IDs (future-compat).
+/// - C7: `AstIndexReader` is `Send + Sync` (verified by test A6 via generic
+///   bound).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AstPosting {
     /// Zero-based sequential file index.
@@ -85,12 +95,13 @@ impl std::fmt::Debug for AstIndexReader {
     }
 }
 
-// AstIndexReader is Send + Sync:
+// C7: AstIndexReader is Send + Sync.
 // - AstSkidxHeader: Copy (no heap)
 // - Mmap: Send + Sync (memmap2 guarantees)
 // - Option<Mmap>: inherits Send + Sync from Mmap
-// - All fields read-only after construction
-// The A6 test below verifies Send + Sync at compile time via generic bounds.
+// - All fields read-only after construction; no interior mutability.
+// The A6 test in reader_tests.rs verifies Send + Sync at compile time via
+// a generic bound: `fn assert_send_sync<T: Send + Sync>() {}`.
 
 impl AstIndexReader {
     /// Open an existing AST index from `dir`.
@@ -118,23 +129,21 @@ impl AstIndexReader {
 
         // ── Size validation (checked arithmetic) ────────────────────────────
         let bigram_bytes = (header.bigram_count as usize)
-            .checked_mul(AST_BIGRAM_ENTRY_SIZE)
+            .checked_mul(BIGRAM_ENTRY_SIZE)
             .ok_or_else(|| {
-                SearchError::IndexCorrupted("bigram_count * AST_BIGRAM_ENTRY_SIZE overflow".into())
+                SearchError::IndexCorrupted("bigram_count * BIGRAM_ENTRY_SIZE overflow".into())
             })?;
         let trigram_bytes = (header.trigram_count as usize)
-            .checked_mul(AST_TRIGRAM_ENTRY_SIZE)
+            .checked_mul(TRIGRAM_ENTRY_SIZE)
             .ok_or_else(|| {
-                SearchError::IndexCorrupted(
-                    "trigram_count * AST_TRIGRAM_ENTRY_SIZE overflow".into(),
-                )
+                SearchError::IndexCorrupted("trigram_count * TRIGRAM_ENTRY_SIZE overflow".into())
             })?;
         let meta_bytes = (header.file_count as usize)
-            .checked_mul(AST_FILE_META_SIZE)
+            .checked_mul(FILE_META_SIZE)
             .ok_or_else(|| {
-                SearchError::IndexCorrupted("file_count * AST_FILE_META_SIZE overflow".into())
+                SearchError::IndexCorrupted("file_count * FILE_META_SIZE overflow".into())
             })?;
-        let expected_idx_size = AST_HEADER_SIZE
+        let expected_idx_size = HEADER_SIZE
             .checked_add(bigram_bytes)
             .and_then(|s| s.checked_add(trigram_bytes))
             .and_then(|s| s.checked_add(meta_bytes))
@@ -148,9 +157,9 @@ impl AstIndexReader {
         }
 
         // ── CRC32 validation ─────────────────────────────────────────────────
-        // The checksum covers idx_mmap[AST_HEADER_SIZE..expected_idx_size],
+        // The checksum covers idx_mmap[HEADER_SIZE..expected_idx_size],
         // the contiguous post-header payload (bigrams + trigrams + file_meta).
-        let payload = &idx_mmap[AST_HEADER_SIZE..expected_idx_size];
+        let payload = &idx_mmap[HEADER_SIZE..expected_idx_size];
         let actual_checksum = compute_checksum(payload);
         if actual_checksum != header.checksum {
             return Err(SearchError::IndexCorrupted(format!(
@@ -222,11 +231,31 @@ impl AstIndexReader {
     ///
     /// `file_index` is the 0-based insertion order (equals the `FileId.0` value).
     ///
+    /// # C6 — language recovery
+    ///
+    /// Call [`AstFileMetaEntry::language`] on the returned entry to recover the
+    /// [`rskim_core::Language`] from `lang_id`.  Returns `None` for IDs not
+    /// recognised by the current binary (future-compat path).
+    ///
     /// # Errors
     ///
     /// Returns [`SearchError::IndexCorrupted`] if `file_index` is out of bounds.
     pub fn file_meta(&self, file_index: u32) -> Result<AstFileMetaEntry> {
-        self.file_meta_at(file_index)
+        let bigram_bytes = (self.header.bigram_count as usize) * BIGRAM_ENTRY_SIZE;
+        let trigram_bytes = (self.header.trigram_count as usize) * TRIGRAM_ENTRY_SIZE;
+        let meta_start = HEADER_SIZE + bigram_bytes + trigram_bytes;
+        let offset = meta_start + (file_index as usize) * FILE_META_SIZE;
+        let end = offset
+            .checked_add(FILE_META_SIZE)
+            .filter(|&e| e <= self.idx_mmap.len())
+            .ok_or_else(|| {
+                SearchError::IndexCorrupted(format!(
+                    "file_meta({file_index}): offset {offset} out of bounds \
+                     (idx_mmap len={})",
+                    self.idx_mmap.len()
+                ))
+            })?;
+        decode_file_meta(&self.idx_mmap[offset..end])
     }
 
     // -----------------------------------------------------------------------
@@ -244,8 +273,8 @@ impl AstIndexReader {
     ///
     /// Returns [`SearchError::IndexCorrupted`] if the posting data is malformed.
     pub fn lookup_bigram(&self, bigram: AstBigram) -> Result<Vec<AstPosting>> {
-        let bigram_start = AST_HEADER_SIZE;
-        let bigram_end = bigram_start + (self.header.bigram_count as usize) * AST_BIGRAM_ENTRY_SIZE;
+        let bigram_start = HEADER_SIZE;
+        let bigram_end = bigram_start + (self.header.bigram_count as usize) * BIGRAM_ENTRY_SIZE;
         let entries_data = &self.idx_mmap[bigram_start..bigram_end];
 
         let entry = match lookup_bigram(entries_data, bigram.key())? {
@@ -267,10 +296,8 @@ impl AstIndexReader {
     ///
     /// Returns [`SearchError::IndexCorrupted`] if the posting data is malformed.
     pub fn lookup_trigram(&self, trigram: AstTrigram) -> Result<Vec<AstPosting>> {
-        let trigram_start =
-            AST_HEADER_SIZE + (self.header.bigram_count as usize) * AST_BIGRAM_ENTRY_SIZE;
-        let trigram_end =
-            trigram_start + (self.header.trigram_count as usize) * AST_TRIGRAM_ENTRY_SIZE;
+        let trigram_start = HEADER_SIZE + (self.header.bigram_count as usize) * BIGRAM_ENTRY_SIZE;
+        let trigram_end = trigram_start + (self.header.trigram_count as usize) * TRIGRAM_ENTRY_SIZE;
         let entries_data = &self.idx_mmap[trigram_start..trigram_end];
 
         let entry = match lookup_trigram(entries_data, trigram.key())? {
@@ -287,8 +314,13 @@ impl AstIndexReader {
 
     /// Shared posting-list decode logic for bigram and trigram lookups.
     ///
-    /// Validates offset/length bounds, alignment to `AST_POSTING_ENTRY_SIZE`,
+    /// Validates offset/length bounds, alignment to `POSTING_ENTRY_SIZE`,
     /// and decodes each entry via `decode_posting` (which re-validates count >= 1).
+    ///
+    /// Additionally enforces C1 defensively: each decoded `doc_id` must be
+    /// strictly greater than the previous one.  A CRC-valid but unsorted file
+    /// (e.g. from a hostile or hand-crafted index) would otherwise produce
+    /// silently-wrong query results.
     fn lookup_postings_generic(
         &self,
         posting_offset: u64,
@@ -318,44 +350,34 @@ impl AstIndexReader {
                 post_mmap.len()
             )));
         }
-        if !length.is_multiple_of(AST_POSTING_ENTRY_SIZE) {
+        if !length.is_multiple_of(POSTING_ENTRY_SIZE) {
             return Err(SearchError::IndexCorrupted(format!(
-                "posting_length {length} not aligned to AST_POSTING_ENTRY_SIZE \
-                 {AST_POSTING_ENTRY_SIZE}"
+                "posting_length {length} not aligned to POSTING_ENTRY_SIZE {POSTING_ENTRY_SIZE}"
             )));
         }
 
         let data = &post_mmap[start..end];
-        let n = length / AST_POSTING_ENTRY_SIZE;
+        let n = length / POSTING_ENTRY_SIZE;
         let mut postings = Vec::with_capacity(n);
+        let mut prev_doc_id: Option<u32> = None;
         for i in 0..n {
-            let off = i * AST_POSTING_ENTRY_SIZE;
-            let raw = decode_posting(&data[off..off + AST_POSTING_ENTRY_SIZE])?;
+            let off = i * POSTING_ENTRY_SIZE;
+            let raw = decode_posting(&data[off..off + POSTING_ENTRY_SIZE])?;
+            // C1 defensive check: postings must be strictly ascending by doc_id.
+            // Collapsed from nested `if let`/`if` to satisfy clippy::collapsible_if.
+            if let Some(prev) = prev_doc_id.filter(|&prev| raw.doc_id <= prev) {
+                return Err(SearchError::IndexCorrupted(format!(
+                    "posting list not sorted: doc_id {prev} followed by {}",
+                    raw.doc_id
+                )));
+            }
+            prev_doc_id = Some(raw.doc_id);
             postings.push(AstPosting {
                 doc_id: raw.doc_id,
                 count: raw.count,
             });
         }
         Ok(postings)
-    }
-
-    /// Read the [`AstFileMetaEntry`] for the file at sequential index `file_index`.
-    fn file_meta_at(&self, file_index: u32) -> Result<AstFileMetaEntry> {
-        let bigram_bytes = (self.header.bigram_count as usize) * AST_BIGRAM_ENTRY_SIZE;
-        let trigram_bytes = (self.header.trigram_count as usize) * AST_TRIGRAM_ENTRY_SIZE;
-        let meta_start = AST_HEADER_SIZE + bigram_bytes + trigram_bytes;
-        let offset = meta_start + (file_index as usize) * AST_FILE_META_SIZE;
-        let end = offset
-            .checked_add(AST_FILE_META_SIZE)
-            .filter(|&e| e <= self.idx_mmap.len())
-            .ok_or_else(|| {
-                SearchError::IndexCorrupted(format!(
-                    "file_meta_at({file_index}): offset {offset} out of bounds \
-                     (idx_mmap len={})",
-                    self.idx_mmap.len()
-                ))
-            })?;
-        decode_file_meta(&self.idx_mmap[offset..end])
     }
 }
 

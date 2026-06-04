@@ -259,9 +259,9 @@ fn a11_flipped_version_rejected() {
 #[test]
 fn a11_flipped_payload_byte_crc_rejected() {
     let (orig_dir, mut idx, post) = build_single_file_index();
-    // Flip the first byte of the payload (byte AST_HEADER_SIZE)
-    if idx.len() > AST_HEADER_SIZE {
-        idx[AST_HEADER_SIZE] ^= 0xFF;
+    // Flip the first byte of the payload (byte HEADER_SIZE)
+    if idx.len() > HEADER_SIZE {
+        idx[HEADER_SIZE] ^= 0xFF;
     }
     let corrupt_dir = tempdir().unwrap();
     std::fs::write(corrupt_dir.path().join("ast_index.skidx"), &idx).unwrap();
@@ -392,7 +392,11 @@ fn a14_overflow_header_huge_bigram_count() {
 }
 
 // ============================================================================
-// A16 (as a #[ignore] test): index size < 5% of source bytes
+// A16: index size ratio < 1.8× source bytes
+// Measured baseline: ~1.23×.  Bound leaves ~46% margin above baseline to catch
+// genuine O(files²) bloat while staying realistic.  Applies ADR-002 (grounded
+// regression guard, not an empirically-baseless 5% target).  On-disk
+// compression tracked in issue #273.
 // ============================================================================
 
 /// Generate a representative Rust source module with `n_fns` functions.
@@ -457,9 +461,13 @@ fn ast_index_size_ratio() {
     // (skidx ≈ 8 KB of header/entries + skpost ≈ 1.3 MB of raw posting data
     //  vs. ~1.06 MB source).  Industry code-search indexes (Zoekt / Sourcegraph
     //  trigram) typically run 3–5× source, so a raw uncompressed AST posting
-    //  file at 1.2× is already competitive.  A <3× guard is a defensible
-    //  regression fence: it fires only on genuine bloat (e.g., an accidental
-    //  O(files²) posting bug), not on normal structural density.
+    //  file at 1.2× is already competitive.
+    //
+    // REGRESSION GUARD: < 1.8× (applies ADR-002)
+    //   The previous <3× bound was too loose — it would pass even a 2× regression.
+    //   The tighter <1.8× bound leaves a ~46% margin above the measured 1.23×
+    //   baseline (1.8 / 1.23 ≈ 1.46× headroom), wide enough to absorb corpus
+    //   variance but tight enough to fire on genuine O(files²) posting bloat.
     //
     // ON-DISK COMPRESSION (delta encoding + VarInt / Roaring Bitmaps) that
     // would push the ratio well below 1× is tracked in issue #273.
@@ -495,14 +503,273 @@ fn ast_index_size_ratio() {
          skidx={idx_len} bytes, skpost={post_len} bytes)"
     );
     // Guard against genuine bloat regressions (e.g. accidental O(files²)
-    // posting growth).  Measured baseline: ~1.23×.  Industry uncompressed
-    // trigram indexes run 3–5×, so <3× is a tight-but-realistic bound.
-    // See comment block above for full rationale.  On-disk compression
-    // tracked in #273.
+    // posting growth).  Measured baseline: ~1.23× on this representative
+    // 1000-file corpus.  Bound < 1.8× leaves a ~46% margin above the
+    // measured baseline (1.8 / 1.23 ≈ 1.46×), wide enough to absorb normal
+    // corpus variance while tight enough to fire on a real regression.
+    //
+    // ADR-002: regression guard must be empirically grounded.  The previous
+    // <3.0× bound was too loose to catch a 2× bloat regression; the tighter
+    // <1.8× bound is defensible without being flaky.
+    //
+    // ON-DISK COMPRESSION (delta encoding + VarInt / Roaring Bitmaps) that
+    // would push the ratio well below 1× is tracked in issue #273.
     assert!(
-        ratio < 3.0,
-        "index size ratio {ratio:.4} exceeds the <3.0× bloat guard \
-         (measured baseline ~1.23×). \
+        ratio < 1.8,
+        "index size ratio {ratio:.4} exceeds the <1.8× bloat guard \
+         (measured baseline ~1.23×, margin ~46%). \
          index={total_index_bytes} bytes, source={total_source_bytes} bytes"
+    );
+}
+
+// ============================================================================
+// C3: posting bounds / alignment guards in lookup_postings_generic
+//
+// The existing A11 corruption-matrix tests flip bytes in `.skidx` but do NOT
+// recompute the CRC, so the CRC gate in `open()` short-circuits before any
+// posting offset is dereferenced.  These tests corrupt TABLE entries AND
+// recompute the CRC so that `lookup_bigram` / `lookup_trigram` is actually
+// reached, exercising the four distinct guards in `lookup_postings_generic`:
+//
+//  (a) posting_offset exceeds post_mmap.len() (OOB)
+//  (b) posting slice arithmetic overflow: start + length wraps usize
+//  (c) posting_length is not a multiple of POSTING_ENTRY_SIZE (misaligned)
+//  (d) posting doc_ids are not strictly ascending (non-monotone)
+//
+// On 64-bit targets `usize::try_from(u64)` never fails, so there is no
+// distinct "offset exceeds usize" path.  The OOB guard (a) covers that
+// conceptual case on all platforms.
+// ============================================================================
+
+use super::super::format::{
+    AstBigramTableEntry, AstTrigramTableEntry, BIGRAM_ENTRY_SIZE, HEADER_SIZE, POSTING_ENTRY_SIZE,
+    TRIGRAM_ENTRY_SIZE, compute_checksum, encode_bigram_entry, encode_trigram_entry,
+};
+
+/// Build a valid single-file index with one bigram and one trigram, return
+/// (dir, idx_bytes, post_bytes).  The dir is kept alive by the caller.
+fn build_c3_index() -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
+    let dir = tempdir().unwrap();
+    let bigram_key: u32 = 0x0001_0002;
+    let trigram_key: u64 = 0x0001_0002_0003;
+
+    let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+
+    let mut set = make_bigram_set(bigram_key, 1);
+    set.trigrams.push(AstTrigramEntry {
+        ngram: AstTrigram(trigram_key),
+        weight: DEFAULT_AST_WEIGHT,
+        count: 2,
+    });
+    builder
+        .add_file_ngrams(FileId(0), Language::Rust, &set, 10)
+        .unwrap();
+    builder.build().unwrap();
+
+    let idx = std::fs::read(dir.path().join("ast_index.skidx")).unwrap();
+    let post = std::fs::read(dir.path().join("ast_index.skpost")).unwrap();
+    (dir, idx, post)
+}
+
+/// Rewrite the CRC field (bytes [44..48]) in `idx` to match the current
+/// payload (`idx[HEADER_SIZE..]`), so that `open()` passes the CRC gate and
+/// the lookup path is reached.
+fn recompute_crc(idx: &mut [u8]) {
+    let checksum = compute_checksum(&idx[HEADER_SIZE..]);
+    idx[44..48].copy_from_slice(&checksum.to_le_bytes());
+}
+
+/// Overwrite the bigram TABLE entry at byte offset `HEADER_SIZE` with the
+/// given `posting_offset` and `posting_length`, then recompute the CRC.
+fn corrupt_bigram_entry(idx: &mut [u8], posting_offset: u64, posting_length: u32) {
+    // First bigram entry starts at HEADER_SIZE.  Read the existing key so we
+    // preserve it (we only want to corrupt the offset/length fields).
+    let key_bytes: [u8; 4] = idx[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap();
+    let key = u32::from_le_bytes(key_bytes);
+
+    let entry = AstBigramTableEntry {
+        key,
+        posting_offset,
+        posting_length,
+    };
+    let encoded = encode_bigram_entry(&entry);
+    idx[HEADER_SIZE..HEADER_SIZE + BIGRAM_ENTRY_SIZE].copy_from_slice(&encoded);
+    recompute_crc(idx);
+}
+
+/// Overwrite the trigram TABLE entry (which starts after all bigram entries)
+/// with the given `posting_offset` and `posting_length`, then recompute the CRC.
+fn corrupt_trigram_entry(idx: &mut [u8], posting_offset: u64, posting_length: u32) {
+    // Header encodes bigram_count at bytes [6..10].
+    let bc_bytes: [u8; 4] = idx[6..10].try_into().unwrap();
+    let bigram_count = u32::from_le_bytes(bc_bytes) as usize;
+    let trigram_start = HEADER_SIZE + bigram_count * BIGRAM_ENTRY_SIZE;
+
+    // Read the existing trigram key so we preserve it.
+    let key_bytes: [u8; 8] = idx[trigram_start..trigram_start + 8].try_into().unwrap();
+    let key = u64::from_le_bytes(key_bytes);
+
+    let entry = AstTrigramTableEntry {
+        key,
+        posting_offset,
+        posting_length,
+    };
+    let encoded = encode_trigram_entry(&entry);
+    idx[trigram_start..trigram_start + TRIGRAM_ENTRY_SIZE].copy_from_slice(&encoded);
+    recompute_crc(idx);
+}
+
+/// Write modified (idx, post) bytes to a fresh tempdir and attempt to open +
+/// lookup; return the `SearchError` message.
+fn open_and_lookup_bigram(idx: &[u8], post: &[u8], key: u32) -> String {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("ast_index.skidx"), idx).unwrap();
+    std::fs::write(dir.path().join("ast_index.skpost"), post).unwrap();
+    let reader = AstIndexReader::open(dir.path()).unwrap();
+    let err = reader.lookup_bigram(AstBigram(key)).unwrap_err();
+    format!("{err}")
+}
+
+fn open_and_lookup_trigram(idx: &[u8], post: &[u8], key: u64) -> String {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("ast_index.skidx"), idx).unwrap();
+    std::fs::write(dir.path().join("ast_index.skpost"), post).unwrap();
+    let reader = AstIndexReader::open(dir.path()).unwrap();
+    let err = reader.lookup_trigram(AstTrigram(key)).unwrap_err();
+    format!("{err}")
+}
+
+/// (a) posting_offset beyond the end of post_mmap → IndexCorrupted (OOB).
+///
+/// On 64-bit targets this also covers the conceptual "posting_offset exceeds
+/// usize" guard because `usize == u64` there; u64::MAX as the offset exercises
+/// both checks simultaneously (it exceeds post_mmap.len() and would overflow
+/// `start + length`).
+#[test]
+fn c3_bigram_oob_posting_offset_returns_index_corrupted() {
+    let (_dir, mut idx, post) = build_c3_index();
+    // Set posting_offset to a value well beyond the post file's size.
+    corrupt_bigram_entry(&mut idx, u64::MAX / 2, POSTING_ENTRY_SIZE as u32);
+
+    let msg = open_and_lookup_bigram(&idx, &post, 0x0001_0002);
+    assert!(
+        msg.contains("Index corrupted"),
+        "expected IndexCorrupted for OOB bigram offset, got: {msg}"
+    );
+}
+
+#[test]
+fn c3_trigram_oob_posting_offset_returns_index_corrupted() {
+    let (_dir, mut idx, post) = build_c3_index();
+    corrupt_trigram_entry(&mut idx, u64::MAX / 2, POSTING_ENTRY_SIZE as u32);
+
+    let msg = open_and_lookup_trigram(&idx, &post, 0x0001_0002_0003);
+    assert!(
+        msg.contains("Index corrupted"),
+        "expected IndexCorrupted for OOB trigram offset, got: {msg}"
+    );
+}
+
+/// (b) posting slice arithmetic overflow: start + length would overflow usize.
+///
+/// usize::MAX as the offset makes `start` == usize::MAX; adding any positive
+/// length then overflows `checked_add`, triggering the overflow guard.
+/// (On 64-bit targets usize::try_from(u64) succeeds for this value, so this
+/// specifically exercises the `checked_add` overflow branch.)
+#[test]
+fn c3_bigram_slice_overflow_returns_index_corrupted() {
+    let (_dir, mut idx, post) = build_c3_index();
+    // posting_offset == usize::MAX as u64; adding any length overflows start + length.
+    corrupt_bigram_entry(&mut idx, usize::MAX as u64, POSTING_ENTRY_SIZE as u32);
+
+    let msg = open_and_lookup_bigram(&idx, &post, 0x0001_0002);
+    assert!(
+        msg.contains("Index corrupted"),
+        "expected IndexCorrupted for bigram slice overflow, got: {msg}"
+    );
+}
+
+#[test]
+fn c3_trigram_slice_overflow_returns_index_corrupted() {
+    let (_dir, mut idx, post) = build_c3_index();
+    corrupt_trigram_entry(&mut idx, usize::MAX as u64, POSTING_ENTRY_SIZE as u32);
+
+    let msg = open_and_lookup_trigram(&idx, &post, 0x0001_0002_0003);
+    assert!(
+        msg.contains("Index corrupted"),
+        "expected IndexCorrupted for trigram slice overflow, got: {msg}"
+    );
+}
+
+/// (c) posting_length not a multiple of POSTING_ENTRY_SIZE (8) → IndexCorrupted.
+#[test]
+fn c3_bigram_misaligned_posting_length_returns_index_corrupted() {
+    let (_dir, mut idx, post) = build_c3_index();
+    // posting_offset = 0 (valid), posting_length = 3 (not a multiple of 8)
+    corrupt_bigram_entry(&mut idx, 0, 3);
+
+    let msg = open_and_lookup_bigram(&idx, &post, 0x0001_0002);
+    assert!(
+        msg.contains("Index corrupted"),
+        "expected IndexCorrupted for misaligned bigram length, got: {msg}"
+    );
+}
+
+#[test]
+fn c3_trigram_misaligned_posting_length_returns_index_corrupted() {
+    let (_dir, mut idx, post) = build_c3_index();
+    corrupt_trigram_entry(&mut idx, 0, 3);
+
+    let msg = open_and_lookup_trigram(&idx, &post, 0x0001_0002_0003);
+    assert!(
+        msg.contains("Index corrupted"),
+        "expected IndexCorrupted for misaligned trigram length, got: {msg}"
+    );
+}
+
+/// (d) posting doc_ids not strictly ascending → IndexCorrupted (non-monotone check).
+///
+/// Build a two-file index, then manually write a posting list where the second
+/// doc_id equals the first (non-strictly-ascending).  The CRC covers only
+/// `.skidx`, NOT `.skpost`, so corrupting `.skpost` is invisible to CRC
+/// validation and reaches the monotonicity check in `lookup_postings_generic`.
+#[test]
+fn c3_non_ascending_doc_ids_returns_index_corrupted() {
+    // Build a 2-file index so there are 2 postings for the bigram key.
+    let dir = tempdir().unwrap();
+    let bigram_key: u32 = 0x0001_0002;
+    let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    let set = make_bigram_set(bigram_key, 1);
+    builder
+        .add_file_ngrams(FileId(0), Language::Rust, &set, 10)
+        .unwrap();
+    builder
+        .add_file_ngrams(FileId(1), Language::Rust, &set, 10)
+        .unwrap();
+    builder.build().unwrap();
+
+    let idx = std::fs::read(dir.path().join("ast_index.skidx")).unwrap();
+    let mut post = std::fs::read(dir.path().join("ast_index.skpost")).unwrap();
+
+    // The posting list has two 8-byte entries: (doc_id=0, count=1) (doc_id=1, count=1).
+    // Corrupt the second entry's doc_id to 0 — same as the first — so the list
+    // is no longer strictly ascending.
+    assert!(
+        post.len() >= 2 * POSTING_ENTRY_SIZE,
+        "expected at least 2 posting entries in post file"
+    );
+    // Second posting doc_id is at post[8..12] (POSTING_ENTRY_SIZE = 8, doc_id = first 4 bytes).
+    post[POSTING_ENTRY_SIZE..POSTING_ENTRY_SIZE + 4].copy_from_slice(&0u32.to_le_bytes());
+
+    let corrupt_dir = tempdir().unwrap();
+    std::fs::write(corrupt_dir.path().join("ast_index.skidx"), &idx).unwrap();
+    std::fs::write(corrupt_dir.path().join("ast_index.skpost"), &post).unwrap();
+
+    let reader = AstIndexReader::open(corrupt_dir.path()).unwrap();
+    let err = reader.lookup_bigram(AstBigram(bigram_key)).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("Index corrupted"),
+        "expected IndexCorrupted for non-ascending doc_ids, got: {msg}"
     );
 }

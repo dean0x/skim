@@ -10,8 +10,8 @@ use super::*;
 
 fn make_valid_header() -> AstSkidxHeader {
     AstSkidxHeader {
-        magic: *AST_SKIDX_MAGIC,
-        version: AST_FORMAT_VERSION,
+        magic: *SKAX_MAGIC,
+        version: FORMAT_VERSION,
         bigram_count: 10,
         trigram_count: 5,
         file_count: 3,
@@ -27,7 +27,7 @@ fn make_valid_header() -> AstSkidxHeader {
 fn header_roundtrip() {
     let h = make_valid_header();
     let encoded = encode_header(&h);
-    assert_eq!(encoded.len(), AST_HEADER_SIZE);
+    assert_eq!(encoded.len(), HEADER_SIZE);
     let decoded = decode_header(&encoded).unwrap();
     assert_eq!(decoded, h);
 }
@@ -35,8 +35,8 @@ fn header_roundtrip() {
 #[test]
 fn header_roundtrip_zero_avgs() {
     let h = AstSkidxHeader {
-        magic: *AST_SKIDX_MAGIC,
-        version: AST_FORMAT_VERSION,
+        magic: *SKAX_MAGIC,
+        version: FORMAT_VERSION,
         bigram_count: 0,
         trigram_count: 0,
         file_count: 0,
@@ -59,7 +59,7 @@ fn header_roundtrip_zero_avgs() {
 fn header_rejects_truncation() {
     let encoded = encode_header(&make_valid_header());
     // Truncate to one byte short
-    let err = decode_header(&encoded[..AST_HEADER_SIZE - 1]).unwrap_err();
+    let err = decode_header(&encoded[..HEADER_SIZE - 1]).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("truncated"), "expected 'truncated' in: {msg}");
 }
@@ -199,25 +199,25 @@ fn header_rejects_negative_avg_node_count() {
 }
 
 // ============================================================================
-// AstBigramEntry roundtrip
+// AstBigramTableEntry roundtrip
 // ============================================================================
 
 #[test]
 fn bigram_entry_roundtrip() {
-    let e = AstBigramEntry {
+    let e = AstBigramTableEntry {
         key: 0x0001_0002_u32,
         posting_offset: 512,
         posting_length: 32,
     };
     let encoded = encode_bigram_entry(&e);
-    assert_eq!(encoded.len(), AST_BIGRAM_ENTRY_SIZE);
+    assert_eq!(encoded.len(), BIGRAM_ENTRY_SIZE);
     let decoded = decode_bigram_entry(&encoded).unwrap();
     assert_eq!(decoded, e);
 }
 
 #[test]
 fn bigram_entry_boundary_max_key() {
-    let e = AstBigramEntry {
+    let e = AstBigramTableEntry {
         key: u32::MAX,
         posting_offset: u64::MAX,
         posting_length: u32::MAX,
@@ -229,37 +229,37 @@ fn bigram_entry_boundary_max_key() {
 
 #[test]
 fn bigram_entry_rejects_truncation() {
-    let e = AstBigramEntry {
+    let e = AstBigramTableEntry {
         key: 1,
         posting_offset: 0,
         posting_length: 8,
     };
     let encoded = encode_bigram_entry(&e);
-    let err = decode_bigram_entry(&encoded[..AST_BIGRAM_ENTRY_SIZE - 1]).unwrap_err();
+    let err = decode_bigram_entry(&encoded[..BIGRAM_ENTRY_SIZE - 1]).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("truncated"), "expected 'truncated' in: {msg}");
 }
 
 // ============================================================================
-// AstTrigramEntry roundtrip
+// AstTrigramTableEntry roundtrip
 // ============================================================================
 
 #[test]
 fn trigram_entry_roundtrip() {
-    let e = AstTrigramEntry {
+    let e = AstTrigramTableEntry {
         key: 0x0001_0002_0003_u64,
         posting_offset: 0,
         posting_length: 8,
     };
     let encoded = encode_trigram_entry(&e);
-    assert_eq!(encoded.len(), AST_TRIGRAM_ENTRY_SIZE);
+    assert_eq!(encoded.len(), TRIGRAM_ENTRY_SIZE);
     let decoded = decode_trigram_entry(&encoded).unwrap();
     assert_eq!(decoded, e);
 }
 
 #[test]
 fn trigram_entry_boundary_max_key() {
-    let e = AstTrigramEntry {
+    let e = AstTrigramTableEntry {
         key: u64::MAX,
         posting_offset: u64::MAX,
         posting_length: u32::MAX,
@@ -271,13 +271,13 @@ fn trigram_entry_boundary_max_key() {
 
 #[test]
 fn trigram_entry_rejects_truncation() {
-    let e = AstTrigramEntry {
+    let e = AstTrigramTableEntry {
         key: 1,
         posting_offset: 0,
         posting_length: 0,
     };
     let encoded = encode_trigram_entry(&e);
-    let err = decode_trigram_entry(&encoded[..AST_TRIGRAM_ENTRY_SIZE - 1]).unwrap_err();
+    let err = decode_trigram_entry(&encoded[..TRIGRAM_ENTRY_SIZE - 1]).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("truncated"), "expected 'truncated' in: {msg}");
 }
@@ -293,7 +293,7 @@ fn posting_roundtrip() {
         count: 7,
     };
     let encoded = encode_posting(&p);
-    assert_eq!(encoded.len(), AST_POSTING_ENTRY_SIZE);
+    assert_eq!(encoded.len(), POSTING_ENTRY_SIZE);
     let decoded = decode_posting(&encoded).unwrap();
     assert_eq!(decoded, p);
 }
@@ -331,7 +331,7 @@ fn posting_rejects_truncation() {
         count: 1,
     };
     let encoded = encode_posting(&p);
-    let err = decode_posting(&encoded[..AST_POSTING_ENTRY_SIZE - 1]).unwrap_err();
+    let err = decode_posting(&encoded[..POSTING_ENTRY_SIZE - 1]).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("truncated"), "expected 'truncated' in: {msg}");
 }
@@ -347,7 +347,7 @@ fn file_meta_roundtrip() {
         node_count: 256,
     };
     let encoded = encode_file_meta(&m);
-    assert_eq!(encoded.len(), AST_FILE_META_SIZE);
+    assert_eq!(encoded.len(), FILE_META_SIZE);
     let decoded = decode_file_meta(&encoded).unwrap();
     assert_eq!(decoded, m);
 }
@@ -370,7 +370,7 @@ fn file_meta_rejects_truncation() {
         node_count: 10,
     };
     let encoded = encode_file_meta(&m);
-    let err = decode_file_meta(&encoded[..AST_FILE_META_SIZE - 1]).unwrap_err();
+    let err = decode_file_meta(&encoded[..FILE_META_SIZE - 1]).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("truncated"), "expected 'truncated' in: {msg}");
 }
@@ -400,9 +400,9 @@ fn crc_differs_for_different_data() {
 
 /// Build a sorted flat byte buffer of bigram entries for lookup tests.
 fn build_bigram_entries_data(keys: &[u32]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(keys.len() * AST_BIGRAM_ENTRY_SIZE);
+    let mut buf = Vec::with_capacity(keys.len() * BIGRAM_ENTRY_SIZE);
     for (i, &key) in keys.iter().enumerate() {
-        let e = AstBigramEntry {
+        let e = AstBigramTableEntry {
             key,
             posting_offset: (i * 8) as u64,
             posting_length: 8,
@@ -463,7 +463,7 @@ fn lookup_bigram_single_entry_miss() {
 
 #[test]
 fn lookup_bigram_rejects_non_multiple_of_stride() {
-    let data = vec![0u8; AST_BIGRAM_ENTRY_SIZE + 1];
+    let data = vec![0u8; BIGRAM_ENTRY_SIZE + 1];
     let err = lookup_bigram(&data, 0).unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -478,9 +478,9 @@ fn lookup_bigram_rejects_non_multiple_of_stride() {
 
 /// Build a sorted flat byte buffer of trigram entries for lookup tests.
 fn build_trigram_entries_data(keys: &[u64]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(keys.len() * AST_TRIGRAM_ENTRY_SIZE);
+    let mut buf = Vec::with_capacity(keys.len() * TRIGRAM_ENTRY_SIZE);
     for (i, &key) in keys.iter().enumerate() {
-        let e = AstTrigramEntry {
+        let e = AstTrigramTableEntry {
             key,
             posting_offset: (i * 8) as u64,
             posting_length: 8,
@@ -520,7 +520,7 @@ fn lookup_trigram_empty_entries() {
 
 #[test]
 fn lookup_trigram_rejects_non_multiple_of_stride() {
-    let data = vec![0u8; AST_TRIGRAM_ENTRY_SIZE + 3];
+    let data = vec![0u8; TRIGRAM_ENTRY_SIZE + 3];
     let err = lookup_trigram(&data, 0).unwrap_err();
     let msg = format!("{err}");
     assert!(

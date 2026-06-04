@@ -5,7 +5,10 @@
 //! Benchmark groups:
 //!   1. build_1000_files  — build_from_files over ~1000 Rust functions (A15)
 //!
-//! A16 (index size ratio) is tested as an #[ignore] unit test in reader_tests.rs.
+//! A16 (index size ratio < 1.8×) is a normal unit test in reader_tests.rs.
+//! Measured baseline: ~1.23×.  Bound < 1.8× leaves ~46% margin above baseline
+//! while catching genuine O(files²) bloat regressions.  On-disk compression
+//! (delta + VarInt / Roaring posting) tracked in issue #273.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
