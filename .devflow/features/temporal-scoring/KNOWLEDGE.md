@@ -18,7 +18,7 @@ referencedFiles:
   - crates/rskim-search/src/types.rs
   - crates/rskim-search/src/lib.rs
 created: 2026-05-25
-updated: 2026-06-04
+updated: 2026-06-05
 ---
 
 # Temporal Risk Scoring
@@ -255,7 +255,10 @@ never call `SystemTime::now()` inside scoring functions.
 - `crates/rskim-search/src/types.rs` — `FileRiskScores`, `FileTemporalStats`, `CommitInfo`,
   `HistoryResult`, `TemporalSource`, `SearchError::Database`, `SearchError::AstError`,
   `SearchQuery` (includes `file_filter: Option<HashSet<FileId>>`)
-- `crates/rskim-search/src/lib.rs` — public crate re-exports; also exposes `pub mod ast_index`
+- `crates/rskim-search/src/lib.rs` — public crate re-exports; also exposes `pub mod ast_index`.
+  As of Wave 3d (#194) the `ast_index` re-export block adds `AstIndexBuilder`, `AstIndexReader`,
+  `AstPosting`, and `AstFileMetaEntry` (the on-disk structural index store). This is additive only
+  — the temporal scoring and `TemporalDb` re-exports are unchanged.
 
 ## Related
 

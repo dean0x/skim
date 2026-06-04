@@ -19,7 +19,7 @@ referencedFiles:
   - crates/rskim-search/src/temporal/storage_types.rs
   - crates/rskim-search/src/temporal/storage_ops.rs
 created: 2026-05-24
-updated: 2026-06-04
+updated: 2026-06-05
 ---
 
 # Co-Change Matrix
@@ -250,3 +250,9 @@ DELETE + batch INSERT in a single transaction.
 - `crates/rskim-search/src/types.rs` — `FileId`, `CochangeStats`, `HistoryResult`, `SearchError`
 - `crates/rskim-search/src/index/` — sibling persistence layer using the same atomic-write and
   mmap-read patterns; useful cross-reference for format evolution precedent
+- `crates/rskim-search/src/ast_index/store/` (Wave 3d, #194) — the closest format sibling: a
+  two-file mmap'd on-disk index (magic `b"SKAX"`, v1) for AST structural n-grams, built with the
+  identical `NamedTempFile` + `sync_all` + `persist` atomic-write contract and CRC32-validated
+  binary-search reader. Mirror its `format.rs`/`builder.rs`/`reader.rs` split when evolving `.skcc`.
+  Note `lib.rs` now also re-exports `AstIndexBuilder`/`AstIndexReader`/`AstPosting`/`AstFileMetaEntry`
+  alongside the cochange re-exports — no change to the cochange API surface itself.

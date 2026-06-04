@@ -1,4 +1,4 @@
-<!-- TL;DR: 4 pitfalls. Key: PF-001, PF-002, PF-003, PF-004 -->
+<!-- TL;DR: 5 pitfalls. Key: PF-001, PF-002, PF-003, PF-004, PF-005 -->
 # Known Pitfalls
 
 Area-specific gotchas, fragile areas, and past bugs.
@@ -38,3 +38,12 @@ Area-specific gotchas, fragile areas, and past bugs.
 - **Resolution**: always widen u16 depth values to u32 before arithmetic in comparisons -- use u32::from(p) + 1, not p + 1, when p is u16. Generalizes to any bounded integer: widen before adding an offset rather than risk wrap at the type maximum.
 - **Status**: Active
 - **Source**: self-learning:obs_kp2v7n
+
+## PF-005: Acceptance criteria copied verbatim from an issue may be empirically baseless — verify against research before treating as a hard gate
+
+- **Area**: acceptance criteria / quality gates for index size
+- **Issue**: a numeric acceptance criterion (A16: index < 5% of source) was inherited verbatim from the GitHub issue without empirical grounding
+- **Impact**: an impossible gate forces either a blocked PR, an #[ignore] cop-out, or test-gaming — all of which erode trust in the suite
+- **Resolution**: before enforcing an inherited numeric criterion, trace it to a measured basis
+- **Status**: Active
+- **Source**: self-learning:obs_acqv8m

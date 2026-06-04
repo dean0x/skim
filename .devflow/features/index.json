@@ -43,7 +43,7 @@
         "crates/rskim-search/src/temporal/storage_types.rs",
         "crates/rskim-search/src/temporal/storage_ops.rs"
       ],
-      "lastUpdated": "2026-06-04T09:44:13.758Z",
+      "lastUpdated": "2026-06-04T21:27:24.860Z",
       "createdBy": "implement"
     },
     "temporal-scoring": {
@@ -66,7 +66,7 @@
         "crates/rskim-search/src/types.rs",
         "crates/rskim-search/src/lib.rs"
       ],
-      "lastUpdated": "2026-06-04T09:44:21.976Z",
+      "lastUpdated": "2026-06-04T21:27:34.451Z",
       "createdBy": "implement"
     },
     "ast-index": {
