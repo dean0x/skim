@@ -246,19 +246,36 @@ struct CommitHeader {
     parents: Option<String>,
 }
 
+/// Parse phase for [`parse_header_lines`].
+///
+/// Replaces the `in_body: bool` + `subject_captured: bool` pair. The two
+/// booleans encoded three sequential, non-overlapping states that only ever
+/// advanced in one direction (Headers → AwaitingSubject → Body). An enum
+/// makes all three phases explicit and eliminates the impossible state where
+/// `in_body == false` but `subject_captured == true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitParsePhase {
+    /// Parsing git trailer lines (`commit`, `Author`, `Date`, `Merge`).
+    Headers,
+    /// Blank separator consumed; waiting for the first non-blank body line
+    /// (the commit subject).
+    AwaitingSubject,
+    /// Subject captured; accumulating remaining body lines.
+    Body,
+}
+
 /// Walk `header_region` lines and populate `header` with extracted fields.
 ///
 /// Returns the accumulated body lines as `Vec<&str>` slices borrowed from
 /// `header_region`, avoiding per-line allocations (zero-copy body accumulation).
 ///
 /// # State machine
-/// - Phase 0 (`in_body == false`): parse git trailer lines (`commit `,
+/// - `CommitParsePhase::Headers`: parse git trailer lines (`commit `,
 ///   `Author: `, `Date: `, `Merge: `). All other lines (gpgsig, mergetag,
 ///   continuation lines starting with a space) are silently skipped per AD-GIT-8.
-/// - Phase 1 (`in_body == true`, `subject_captured == false`): capture the
-///   subject (first non-blank body line), stripping the canonical 4-space indent.
-/// - Phase 2 (`in_body == true`, `subject_captured == true`): accumulate body
-///   lines, stripping 4-space indent.
+/// - `CommitParsePhase::AwaitingSubject`: capture the subject (first non-blank
+///   body line), stripping the canonical 4-space indent.
+/// - `CommitParsePhase::Body`: accumulate body lines, stripping 4-space indent.
 fn parse_header_lines<'a>(header_region: &'a str, header: &mut CommitHeader) -> Vec<&'a str> {
     // Extract the trimmed value from a `Key: value` header line.
     let header_value = |line: &str, prefix: &str| -> String {
@@ -268,34 +285,37 @@ fn parse_header_lines<'a>(header_region: &'a str, header: &mut CommitHeader) -> 
             .to_string()
     };
 
-    let mut in_body = false;
-    let mut subject_captured = false;
+    let mut phase = CommitParsePhase::Headers;
     let mut body_lines: Vec<&'a str> = Vec::new();
 
     for line in header_region.lines() {
-        if !in_body {
-            if line.starts_with("commit ") {
-                header.hash = header_value(line, "commit ");
-            } else if line.starts_with("Merge: ") {
-                // AD-GIT-8: capture merge parents as structured field.
-                header.parents = Some(header_value(line, "Merge: "));
-            } else if line.starts_with("Author: ") {
-                header.author = header_value(line, "Author: ");
-            } else if line.starts_with("Date: ") {
-                header.date = header_value(line, "Date: ");
-            } else if line.is_empty() && !header.hash.is_empty() {
-                in_body = true;
+        match phase {
+            CommitParsePhase::Headers => {
+                if line.starts_with("commit ") {
+                    header.hash = header_value(line, "commit ");
+                } else if line.starts_with("Merge: ") {
+                    // AD-GIT-8: capture merge parents as structured field.
+                    header.parents = Some(header_value(line, "Merge: "));
+                } else if line.starts_with("Author: ") {
+                    header.author = header_value(line, "Author: ");
+                } else if line.starts_with("Date: ") {
+                    header.date = header_value(line, "Date: ");
+                } else if line.is_empty() && !header.hash.is_empty() {
+                    phase = CommitParsePhase::AwaitingSubject;
+                }
             }
-        } else if !subject_captured {
-            // Phase 1: first non-blank line is the subject.
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                header.subject = line.strip_prefix("    ").unwrap_or(trimmed).to_string();
-                subject_captured = true;
+            CommitParsePhase::AwaitingSubject => {
+                // First non-blank line is the subject.
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    header.subject = line.strip_prefix("    ").unwrap_or(trimmed).to_string();
+                    phase = CommitParsePhase::Body;
+                }
             }
-        } else {
-            // Phase 2: borrow each body line slice — no allocation per line.
-            body_lines.push(line.strip_prefix("    ").unwrap_or(line));
+            CommitParsePhase::Body => {
+                // Borrow each body line slice — no allocation per line.
+                body_lines.push(line.strip_prefix("    ").unwrap_or(line));
+            }
         }
     }
 
