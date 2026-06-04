@@ -415,12 +415,14 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
     for line in input.lines().take(MAX_INPUT_LINES) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            // Step 1: Blank lines flush the pending stack (end of exception block).
+            // Step 1: Blank lines end the current exception block — flush frames onto
+            // the last entry, then discard any orphaned frames (no preceding entry).
             try_flush_stack(
                 &mut all_entries,
                 &mut pending_stack,
                 &mut total_stack_frames_elided,
             );
+            pending_stack.clear();
             in_python_frame = false;
             continue;
         }
@@ -516,10 +518,11 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
         &mut total_stack_frames_elided,
     );
 
-    // Issue 8: if no structured log levels were found, entries are plain text —
-    // return None to fall through to Passthrough rather than producing a
-    // misleading Degraded result.
-    if !found_structured {
+    // Fall through to passthrough when either (a) no structured content was
+    // found, or (b) structured markers fired but produced zero entries (e.g.
+    // orphaned stack frames with no preceding log line). Returning Some with
+    // an empty entry list would discard content — passthrough is strictly better.
+    if !found_structured || all_entries.is_empty() {
         return None;
     }
 
@@ -1722,6 +1725,57 @@ mod tests {
                 .iter()
                 .map(|e| (&e.level, &e.message))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Regression: orphaned stack frames ────────────────────────────────
+
+    #[test]
+    fn test_orphaned_stack_frames_fall_through_to_passthrough() {
+        // Stack frames with no preceding log entry should return None
+        // (passthrough), not Some with 0 entries that silently drops content.
+        let input = concat!(
+            "  File \"/app/foo.py\", line 10, in bar\n",
+            "    x = do_stuff()\n",
+            "  File \"/app/baz.py\", line 20, in qux\n",
+            "    y = crash()\n",
+        );
+        let flags = make_flags();
+        let result = try_parse_regex_logs(input, &flags);
+        assert!(
+            result.is_none(),
+            "Orphaned stack frames (no log entry) must fall through to passthrough"
+        );
+    }
+
+    #[test]
+    fn test_orphaned_frames_do_not_leak_across_blank_lines() {
+        // Orphaned frames before a blank line must not attach to a later entry.
+        let input = concat!(
+            "  File \"/app/old.py\", line 1, in stale_func\n",
+            "    old_code()\n",
+            "\n",
+            "ERROR: real problem here\n",
+            "  File \"/app/new.py\", line 2, in new_func\n",
+            "    new_code()\n",
+        );
+        let flags = make_flags();
+        let result = try_parse_regex_logs(input, &flags)
+            .expect("Should parse the ERROR entry");
+        let error_entry = result
+            .entries
+            .iter()
+            .find(|e| e.message.contains("real problem"))
+            .expect("ERROR entry must exist");
+        assert!(
+            !error_entry.message.contains("stale_func"),
+            "Orphaned frame from before blank line must not leak onto the ERROR entry; got: {:?}",
+            error_entry.message
+        );
+        assert!(
+            error_entry.message.contains("new_func"),
+            "Frame after the ERROR entry should be attached; got: {:?}",
+            error_entry.message
         );
     }
 }
