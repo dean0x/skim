@@ -1760,8 +1760,7 @@ mod tests {
             "    new_code()\n",
         );
         let flags = make_flags();
-        let result = try_parse_regex_logs(input, &flags)
-            .expect("Should parse the ERROR entry");
+        let result = try_parse_regex_logs(input, &flags).expect("Should parse the ERROR entry");
         let error_entry = result
             .entries
             .iter()
