@@ -365,15 +365,7 @@ fn extract_json_message(obj: &Value) -> Option<String> {
 /// Callers must gate on `in_python_frame` before calling — this function tests
 /// only the line's structure, not parser state.
 fn is_python_continuation(line: &str) -> bool {
-    // Callers (step 3) only invoke this after RE_LOG_STACK_TRACE.is_match failed in step 2,
-    // so the regex guard is provably dead work here. Only structural checks needed.
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    // Must have leading whitespace (indented). RE_LOG_STACK_TRACE non-match is guaranteed
-    // by the call site ordering: step 2 runs first and skips to `continue` on a match.
-    line.starts_with(|c: char| c.is_ascii_whitespace())
+    !line.trim().is_empty() && line.starts_with(|c: char| c.is_ascii_whitespace())
 }
 
 /// Parse regex-based log formats into a LogResult.
@@ -546,12 +538,9 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
 ///
 /// Each entry in `pending_stack` is a logical frame — a `File "..."` line with
 /// optional source-preview and PEP 657 caret lines embedded as a multi-line
-/// string. The elision count is therefore a count of logical frames, not raw lines.
-///
-/// `all_entries` must be `&mut Vec` rather than `&mut [_]` because clippy flags
-/// `&mut Vec<T>` parameters suggesting `&mut [T]`, but `Vec::push` is not available
-/// on slices and this function's callers rely on it. `pending_stack` must be
-/// `&mut VecDeque` to call `.clear()` and `.iter()`.
+/// string. The elision count is a count of logical frames, not raw lines.
+// `&mut Vec` / `&mut VecDeque` required: callers call Vec::push and VecDeque::clear,
+// which are not available on slice/deref targets that clippy would otherwise prefer.
 #[allow(clippy::ptr_arg)]
 fn flush_stack_frames(
     all_entries: &mut Vec<(Option<String>, String)>,
@@ -573,9 +562,8 @@ fn flush_stack_frames(
 }
 
 /// Guard-and-flush helper: flushes `pending_stack` only when both the stack and
-/// `all_entries` are non-empty. Reduces decision-point repetition at the 4 flush
-/// sites inside `try_parse_regex_logs` (blank-line, chained-separator, new-log-entry,
-/// end-of-input), lowering cyclomatic complexity by ~8 decision points.
+/// `all_entries` are non-empty. Reduces repetition across the 4 flush sites inside
+/// `try_parse_regex_logs` (blank-line, chained-separator, new-log-entry, end-of-input).
 #[allow(clippy::ptr_arg)]
 #[inline]
 fn try_flush_stack(
@@ -1322,7 +1310,9 @@ mod tests {
         // The call site (step 3) only runs after step 2 fails, so indented File
         // lines are caught by RE_LOG_STACK_TRACE first; this test documents the
         // responsibility boundary.
-        assert!(is_python_continuation("  File \"/app/foo.py\", line 10, in bar"));
+        assert!(is_python_continuation(
+            "  File \"/app/foo.py\", line 10, in bar"
+        ));
     }
 
     /// A valid continuation: indented source-preview line.
@@ -1727,7 +1717,11 @@ mod tests {
         assert!(
             has_db_error,
             "DatabaseError exception-type line must be preserved as an unstructured entry; entries: {:?}",
-            result.entries.iter().map(|e| (&e.level, &e.message)).collect::<Vec<_>>()
+            result
+                .entries
+                .iter()
+                .map(|e| (&e.level, &e.message))
+                .collect::<Vec<_>>()
         );
     }
 }
