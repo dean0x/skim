@@ -2383,6 +2383,7 @@ dependencies = [
  "criterion",
  "gix",
  "memmap2",
+ "rayon",
  "regex",
  "rskim-core",
  "rusqlite",

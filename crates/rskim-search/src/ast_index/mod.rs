@@ -32,6 +32,7 @@
 mod extract;
 mod linearize;
 mod ngram;
+pub mod store;
 
 // ============================================================================
 // Shared type alias
@@ -56,3 +57,4 @@ pub use ngram::{
     AstBigram, AstTrigram, DEFAULT_AST_WEIGHT, ast_bigram_idf, ast_trigram_idf, vocab_len,
     vocab_lookup, vocab_resolve,
 };
+pub use store::{AstFileMetaEntry, AstIndexBuilder, AstIndexReader, AstPosting};
