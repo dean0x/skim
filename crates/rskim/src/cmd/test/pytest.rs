@@ -259,6 +259,22 @@ fn parse_summary_line(line: &str) -> Option<SummaryCounts> {
 // Tier 1: Text state machine
 // ============================================================================
 
+/// Tracks which section of pytest output the parser is currently inside.
+///
+/// The two section booleans (`in_failures`, `in_summary_info`) were mutually
+/// exclusive — exactly one was true at any time, or both were false (Normal).
+/// An enum makes all three states explicit and eliminates the illegal state
+/// where both would be true simultaneously.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PytestSection {
+    /// Outside any special section.
+    Normal,
+    /// Inside the `=== FAILURES ===` block.
+    Failures,
+    /// Inside the `=== short test summary info ===` block.
+    SummaryInfo,
+}
+
 /// Tier 1: Full text state machine parse.
 ///
 /// Scans every line for PASSED/FAILED/SKIPPED/ERROR markers, extracts test names
@@ -266,8 +282,7 @@ fn parse_summary_line(line: &str) -> Option<SummaryCounts> {
 /// the summary line.
 fn tier1_parse(output: &str) -> Option<TestResult> {
     let mut entries: Vec<TestEntry> = Vec::new();
-    let mut in_failures = false;
-    let mut in_summary_info = false;
+    let mut section = PytestSection::Normal;
     let mut current_failure_name: Option<String> = None;
     let mut current_failure_detail: Vec<String> = Vec::new();
 
@@ -285,15 +300,13 @@ fn tier1_parse(output: &str) -> Option<TestResult> {
 
         // Detect FAILURES section header
         if trimmed.starts_with("===") && trimmed.contains("FAILURES") {
-            in_failures = true;
-            in_summary_info = false;
+            section = PytestSection::Failures;
             continue;
         }
 
         // Detect "short test summary info" section
         if trimmed.starts_with("===") && trimmed.contains("short test summary info") {
-            in_summary_info = true;
-            in_failures = false;
+            section = PytestSection::SummaryInfo;
             // Flush any pending failure
             flush_failure(
                 &mut entries,
@@ -305,20 +318,19 @@ fn tier1_parse(output: &str) -> Option<TestResult> {
 
         // Detect any other section header (=== ... ===) that ends the current section
         if trimmed.starts_with("===") && trimmed.ends_with("===") {
-            if in_failures {
+            if section == PytestSection::Failures {
                 flush_failure(
                     &mut entries,
                     &mut current_failure_name,
                     &mut current_failure_detail,
                 );
             }
-            in_failures = false;
-            in_summary_info = false;
+            section = PytestSection::Normal;
             continue;
         }
 
         // Inside FAILURES section: extract individual test failure blocks
-        if in_failures {
+        if section == PytestSection::Failures {
             // Test failure headers look like: "________ test_name ________"
             if trimmed.starts_with('_') && trimmed.ends_with('_') {
                 // Flush previous failure
@@ -339,7 +351,7 @@ fn tier1_parse(output: &str) -> Option<TestResult> {
         }
 
         // Inside "short test summary info": parse FAILED/ERROR lines
-        if in_summary_info {
+        if section == PytestSection::SummaryInfo {
             let rest = trimmed
                 .strip_prefix("FAILED ")
                 .or_else(|| trimmed.strip_prefix("ERROR "));
