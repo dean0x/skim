@@ -319,44 +319,17 @@ fn try_parse_nextest(stdout: &str) -> Option<TestResult> {
 
         // Parse test result lines: "PASS [0.003s] crate::tests::test_name"
         if let Some(rest) = trimmed.strip_prefix("PASS") {
-            if let Some(name) = extract_nextest_name(rest) {
-                let key = (name.clone(), "Pass".to_string());
-                if seen.insert(key) {
-                    entries.push(TestEntry {
-                        name,
-                        outcome: TestOutcome::Pass,
-                        detail: None,
-                    });
-                }
-            }
+            push_nextest_entry(rest, TestOutcome::Pass, &mut seen, &mut entries);
             continue;
         }
 
         if let Some(rest) = trimmed.strip_prefix("FAIL") {
-            if let Some(name) = extract_nextest_name(rest) {
-                let key = (name.clone(), "Fail".to_string());
-                if seen.insert(key) {
-                    entries.push(TestEntry {
-                        name,
-                        outcome: TestOutcome::Fail,
-                        detail: None,
-                    });
-                }
-            }
+            push_nextest_entry(rest, TestOutcome::Fail, &mut seen, &mut entries);
             continue;
         }
 
         if let Some(rest) = trimmed.strip_prefix("SKIP") {
-            if let Some(name) = extract_nextest_name(rest) {
-                let key = (name.clone(), "Skip".to_string());
-                if seen.insert(key) {
-                    entries.push(TestEntry {
-                        name,
-                        outcome: TestOutcome::Skip,
-                        detail: None,
-                    });
-                }
-            }
+            push_nextest_entry(rest, TestOutcome::Skip, &mut seen, &mut entries);
             continue;
         }
 
@@ -387,6 +360,28 @@ fn try_parse_nextest(stdout: &str) -> Option<TestResult> {
     };
 
     Some(TestResult::new(summary, entries))
+}
+
+/// Push a deduplicated nextest entry into `entries`.
+///
+/// Called for PASS, FAIL, and SKIP lines; the `outcome` discriminates the
+/// variant. Duplicate `(name, outcome)` pairs are silently dropped via `seen`.
+fn push_nextest_entry(
+    rest: &str,
+    outcome: TestOutcome,
+    seen: &mut HashSet<(String, String)>,
+    entries: &mut Vec<TestEntry>,
+) {
+    if let Some(name) = extract_nextest_name(rest) {
+        let key = (name.clone(), format!("{outcome:?}"));
+        if seen.insert(key) {
+            entries.push(TestEntry {
+                name,
+                outcome,
+                detail: None,
+            });
+        }
+    }
 }
 
 /// Extract the test name from a nextest result line remainder.
@@ -579,6 +574,135 @@ mod tests {
             1,
             "Expected exactly 1 failure entry (deduped), got {}",
             fail_entries.len()
+        );
+    }
+
+    #[test]
+    fn test_tier1_nextest_failure_detail_populated() {
+        // RUST-4 / TESTING-5: Verify that CaptureState::flush attaches the STDOUT
+        // block to the matching failure entry on the nextest path.
+        //
+        // The fixture's STDOUT block is delimited by:
+        //   --- STDOUT: rskim lib::tests::test_b ---
+        //   <content>
+        //   --- STDERR: rskim lib::tests::test_b ---
+        //
+        // Capture runs until the STDERR marker, which triggers flush.
+        let input = load_fixture("test", "cargo_nextest_fail.txt");
+        let result = try_parse_nextest(&input).expect("nextest parse must succeed");
+
+        let fail_entries: Vec<&TestEntry> = result
+            .entries
+            .iter()
+            .filter(|e| e.outcome == TestOutcome::Fail)
+            .collect();
+        assert_eq!(fail_entries.len(), 1, "Expected exactly 1 failure entry");
+        assert!(
+            fail_entries[0].detail.is_some(),
+            "Expected failure entry to have detail populated from STDOUT capture block"
+        );
+    }
+
+    // ========================================================================
+    // CaptureState::flush unit tests
+    // ========================================================================
+
+    #[test]
+    fn test_capture_flush_idle_is_noop() {
+        // Flush on Idle returns Idle and does not mutate entries.
+        let mut entries = vec![TestEntry {
+            name: "a::test".to_string(),
+            outcome: TestOutcome::Fail,
+            detail: None,
+        }];
+        let state = CaptureState::Idle.flush(&mut entries);
+        assert!(
+            matches!(state, CaptureState::Idle),
+            "flush on Idle must return Idle"
+        );
+        assert!(entries[0].detail.is_none(), "Idle flush must not set detail");
+    }
+
+    #[test]
+    fn test_capture_flush_attaches_content_to_matching_entry() {
+        // Flush with non-blank output sets detail on the matching entry.
+        let mut entries = vec![TestEntry {
+            name: "a::test".to_string(),
+            outcome: TestOutcome::Fail,
+            detail: None,
+        }];
+        let state = CaptureState::Capturing {
+            test_name: "a::test".to_string(),
+            output: "assertion failed: expected 1, got 2".to_string(),
+        }
+        .flush(&mut entries);
+        assert!(
+            matches!(state, CaptureState::Idle),
+            "flush must return Idle"
+        );
+        assert_eq!(
+            entries[0].detail.as_deref(),
+            Some("assertion failed: expected 1, got 2"),
+            "flush must attach non-blank output as detail"
+        );
+    }
+
+    #[test]
+    fn test_capture_flush_blank_output_is_noop() {
+        // Flush with whitespace-only output does not set detail.
+        let mut entries = vec![TestEntry {
+            name: "a::test".to_string(),
+            outcome: TestOutcome::Fail,
+            detail: None,
+        }];
+        let state = CaptureState::Capturing {
+            test_name: "a::test".to_string(),
+            output: "   \n  ".to_string(),
+        }
+        .flush(&mut entries);
+        assert!(
+            matches!(state, CaptureState::Idle),
+            "flush must return Idle"
+        );
+        assert!(
+            entries[0].detail.is_none(),
+            "blank output must not set detail"
+        );
+    }
+
+    #[test]
+    fn test_capture_block_delimited_by_stderr_marker() {
+        // RUST-4: Confirm that capture accumulation is bounded by the STDERR
+        // marker. Lines between the STDOUT marker and the STDERR marker are
+        // captured; lines after the STDERR marker are not included in detail.
+        let input = "\
+    Starting 1 tests across 1 test binary
+        FAIL [   0.001s] crate::tests::test_x
+--- STDOUT:              crate::tests::test_x ---
+captured line 1
+captured line 2
+--- STDERR:              crate::tests::test_x ---
+this line is stderr, not captured in stdout detail
+     Summary [   0.001s] 1 tests run: 0 passed, 1 failed, 0 skipped
+";
+        let result = try_parse_nextest(input).expect("must parse");
+        let fail = result
+            .entries
+            .iter()
+            .find(|e| e.outcome == TestOutcome::Fail)
+            .expect("must have failure entry");
+        let detail = fail.detail.as_deref().expect("detail must be populated");
+        assert!(
+            detail.contains("captured line 1"),
+            "detail must include stdout content"
+        );
+        assert!(
+            detail.contains("captured line 2"),
+            "detail must include all stdout content"
+        );
+        assert!(
+            !detail.contains("this line is stderr"),
+            "detail must not include lines after STDERR marker"
         );
     }
 
