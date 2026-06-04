@@ -269,7 +269,7 @@ impl CaptureState {
 /// by tracking `(name, outcome)` pairs.
 fn try_parse_nextest(stdout: &str) -> Option<TestResult> {
     let mut entries: Vec<TestEntry> = Vec::new();
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut seen: HashSet<(String, TestOutcome)> = HashSet::new();
     let mut summary_found = false;
     let mut total_passed: usize = 0;
     let mut total_failed: usize = 0;
@@ -369,11 +369,11 @@ fn try_parse_nextest(stdout: &str) -> Option<TestResult> {
 fn push_nextest_entry(
     rest: &str,
     outcome: TestOutcome,
-    seen: &mut HashSet<(String, String)>,
+    seen: &mut HashSet<(String, TestOutcome)>,
     entries: &mut Vec<TestEntry>,
 ) {
     if let Some(name) = extract_nextest_name(rest) {
-        let key = (name.clone(), format!("{outcome:?}"));
+        let key = (name.clone(), outcome.clone());
         if seen.insert(key) {
             entries.push(TestEntry {
                 name,
