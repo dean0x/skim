@@ -382,15 +382,19 @@ fn extract_json_message(obj: &Value) -> Option<String> {
 /// that belongs to the preceding `File "..."` stack frame.
 ///
 /// A continuation line is:
-/// - Non-empty after trimming
 /// - Starts with ASCII whitespace (indented)
-/// - Does NOT itself match the `RE_LOG_STACK_TRACE` pattern (which would start
-///   a new logical frame)
+/// - Non-empty after trimming
 ///
-/// Callers must gate on `FrameContext::PythonFrame` before calling — this
+/// **Call-site contract**: callers must invoke this function only AFTER the
+/// `RE_LOG_STACK_TRACE` check (step 2) has already failed. This function does
+/// not re-check that pattern; the exclusion of new logical frames is enforced
+/// by call ordering in `try_parse_regex_logs`, not by this predicate.
+///
+/// Callers must also gate on `FrameContext::PythonFrame` before calling — this
 /// function tests only the line's structure, not parser state.
 fn is_python_continuation(line: &str) -> bool {
-    !line.trim().is_empty() && line.starts_with(|c: char| c.is_ascii_whitespace())
+    let first = line.as_bytes().first().copied().unwrap_or(0);
+    first.is_ascii_whitespace() && !line.trim().is_empty()
 }
 
 /// Parse regex-based log formats into a LogResult.
@@ -1356,6 +1360,151 @@ mod tests {
     fn test_is_python_continuation_valid_source_preview() {
         assert!(is_python_continuation("    do_thing()"));
         assert!(is_python_continuation("\t    return value"));
+    }
+
+    // ============================================================================
+    // MAX_CONTINUATIONS_PER_FRAME enforcement (TEST-1)
+    // ============================================================================
+
+    /// MAX_CONTINUATIONS_PER_FRAME cap: a single `File "..."` frame with more than
+    /// 4 continuation lines must keep only the first 4; excess lines are silently
+    /// dropped (not counted as frames or new entries).
+    ///
+    /// Input: ERROR + 1 File frame + 6 continuation lines + INFO.
+    /// Expected: only the first 4 continuation lines are appended to the frame;
+    /// lines 5 and 6 are dropped. The INFO entry is a clean, separate entry.
+    #[test]
+    fn test_max_continuations_per_frame_enforced() {
+        let input = concat!(
+            "ERROR: too many continuations\n",
+            "  File \"/app/m.py\", line 1, in fn\n",
+            "    continuation_1\n",
+            "    continuation_2\n",
+            "    continuation_3\n",
+            "    continuation_4\n",
+            "    continuation_5\n", // beyond cap — must be dropped
+            "    continuation_6\n", // beyond cap — must be dropped
+            "INFO: done\n",
+        );
+        let flags = make_flags();
+        let result = try_parse_regex_logs(input, &flags).unwrap();
+
+        let error_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("ERROR"))
+            .expect("ERROR entry must exist");
+
+        // First 4 continuations must be kept.
+        assert!(
+            error_entry.message.contains("continuation_1"),
+            "continuation_1 must be kept: {}",
+            error_entry.message
+        );
+        assert!(
+            error_entry.message.contains("continuation_4"),
+            "continuation_4 must be kept: {}",
+            error_entry.message
+        );
+
+        // Lines 5 and 6 must be dropped (beyond MAX_CONTINUATIONS_PER_FRAME = 4).
+        assert!(
+            !error_entry.message.contains("continuation_5"),
+            "continuation_5 must be dropped (beyond cap): {}",
+            error_entry.message
+        );
+        assert!(
+            !error_entry.message.contains("continuation_6"),
+            "continuation_6 must be dropped (beyond cap): {}",
+            error_entry.message
+        );
+
+        // INFO must be a separate, clean entry — not contaminated by excess continuations.
+        let info_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("INFO"))
+            .expect("INFO entry must exist");
+        assert!(
+            !info_entry.message.contains("continuation"),
+            "INFO entry must not contain dropped continuation text: {}",
+            info_entry.message
+        );
+    }
+
+    // ============================================================================
+    // Chained exception separator variants (TEST-2)
+    // ============================================================================
+
+    /// The "During handling of the above exception" chained-exception separator
+    /// must flush the pending stack and become an unstructured entry — same
+    /// behaviour as the "direct cause" variant already covered by the fixture tests.
+    ///
+    /// Input: ERROR + 1 frame + separator + 1 frame + INFO.
+    /// Expected:
+    /// - 2 log-level entries: ERROR and INFO.
+    /// - stack_frames_elided == 0 (each chain has 1 frame, well under the cap).
+    /// - ERROR entry contains the first File frame.
+    /// - Separator text does not appear inside ERROR or INFO messages.
+    #[test]
+    fn test_chained_separator_during_handling() {
+        let input = concat!(
+            "ERROR: outer failure\n",
+            "Traceback (most recent call last):\n",
+            "  File \"/app/inner.py\", line 3, in do_inner\n",
+            "    inner()\n",
+            "ValueError: inner error\n",
+            "\n",
+            "During handling of the above exception, another exception occurred:\n",
+            "\n",
+            "Traceback (most recent call last):\n",
+            "  File \"/app/outer.py\", line 7, in do_outer\n",
+            "    outer()\n",
+            "RuntimeError: outer error\n",
+            "INFO: recovered\n",
+        );
+        let flags = make_flags();
+        let result = try_parse_regex_logs(input, &flags).unwrap();
+
+        // No frames should be elided — each chain has ≤ 3 frames.
+        assert_eq!(
+            result.stack_frames_elided, 0,
+            "Expected 0 elided frames; got {}",
+            result.stack_frames_elided
+        );
+
+        // ERROR and INFO must exist as log-level entries.
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(|e| e.level.as_deref() == Some("ERROR")),
+            "ERROR entry must exist"
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(|e| e.level.as_deref() == Some("INFO")),
+            "INFO entry must exist"
+        );
+
+        // INFO entry must not contain any traceback or frame text.
+        let info_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("INFO"))
+            .unwrap();
+        assert!(
+            !info_entry.message.contains("File"),
+            "INFO entry must not contain File frame text: {}",
+            info_entry.message
+        );
+        assert!(
+            !info_entry.message.contains("During handling"),
+            "INFO entry must not contain separator text: {}",
+            info_entry.message
+        );
     }
 
     // ============================================================================
