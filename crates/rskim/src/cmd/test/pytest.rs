@@ -342,7 +342,7 @@ fn tier1_parse(output: &str) -> Option<TestResult> {
 
         // Detect section headers (=== ... ===)
         if let Some(new_section) = detect_section_header(trimmed) {
-            // Flush any pending failure when leaving the Failures section
+            // Flush any pending failure when leaving Failures or entering SummaryInfo.
             if section == PytestSection::Failures || new_section == PytestSection::SummaryInfo {
                 flush_failure(
                     &mut entries,
@@ -937,6 +937,16 @@ FAILED tests/test_b.py::test_two - assert 1 == 2
         assert!(
             detect_section_header("some regular output line").is_none(),
             "non-header line should return None"
+        );
+    }
+
+    #[test]
+    fn test_detect_section_header_incomplete_banner_returns_none() {
+        // A line that starts with === but does not end with === and is neither
+        // FAILURES nor "short test summary info" — treat as non-header.
+        assert!(
+            detect_section_header("=== warnings summary").is_none(),
+            "=== prefix without === suffix should return None"
         );
     }
 }

@@ -579,15 +579,12 @@ mod tests {
 
     #[test]
     fn test_tier1_nextest_failure_detail_populated() {
-        // RUST-4 / TESTING-5: Verify that CaptureState::flush attaches the STDOUT
-        // block to the matching failure entry on the nextest path.
-        //
-        // The fixture's STDOUT block is delimited by:
+        // Verify that CaptureState::flush attaches the STDOUT block to the
+        // matching failure entry. The fixture's STDOUT block is delimited by:
         //   --- STDOUT: rskim lib::tests::test_b ---
         //   <content>
         //   --- STDERR: rskim lib::tests::test_b ---
-        //
-        // Capture runs until the STDERR marker, which triggers flush.
+        // Capture runs until the STDERR marker, which triggers the flush.
         let input = load_fixture("test", "cargo_nextest_fail.txt");
         let result = try_parse_nextest(&input).expect("nextest parse must succeed");
 
@@ -672,9 +669,9 @@ mod tests {
 
     #[test]
     fn test_capture_block_delimited_by_stderr_marker() {
-        // RUST-4: Confirm that capture accumulation is bounded by the STDERR
-        // marker. Lines between the STDOUT marker and the STDERR marker are
-        // captured; lines after the STDERR marker are not included in detail.
+        // Confirm that capture accumulation is bounded by the STDERR marker.
+        // Lines between the STDOUT and STDERR markers are captured; lines
+        // after the STDERR marker are not included in detail.
         let input = "\
     Starting 1 tests across 1 test binary
         FAIL [   0.001s] crate::tests::test_x
