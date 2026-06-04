@@ -52,7 +52,7 @@ const MAX_CONTINUATIONS_PER_FRAME: usize = 4;
 /// between "no frame ever started" and "frame just ended": both are `Idle`, and
 /// `PythonFrame` carries the associated continuation count so the two concerns
 /// are co-located and move together as a unit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameContext {
     /// No active Python frame — continuation detection is inactive.
     Idle,
@@ -483,13 +483,14 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
                 !pending_stack.is_empty(),
                 "FrameContext::PythonFrame requires a frame in pending_stack"
             );
-            if *continuation_count < MAX_CONTINUATIONS_PER_FRAME {
-                if let Some(last_frame) = pending_stack.back_mut() {
-                    last_frame.push('\n');
-                    last_frame.push_str(trimmed);
-                }
-                *continuation_count += 1;
+            if *continuation_count >= MAX_CONTINUATIONS_PER_FRAME {
+                continue;
             }
+            if let Some(last_frame) = pending_stack.back_mut() {
+                last_frame.push('\n');
+                last_frame.push_str(trimmed);
+            }
+            *continuation_count += 1;
             continue;
         }
 
