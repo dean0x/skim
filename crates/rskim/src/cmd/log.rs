@@ -34,6 +34,13 @@ const MAX_INPUT_LINES: usize = 100_000;
 /// string). The cap counts logical frames, not raw lines.
 const PENDING_STACK_CAP: usize = 4;
 
+/// Maximum continuation lines (source-preview / PEP 657 caret) appended to a
+/// single logical frame. Enforces the O(PENDING_STACK_CAP) memory invariant
+/// stated in the `try_parse_regex_logs` doc comment: without this cap, a
+/// pathological input could embed many continuation lines in one frame and
+/// bypass the per-frame accounting that makes the invariant hold.
+const MAX_CONTINUATIONS_PER_FRAME: usize = 4;
+
 /// Matches ISO8601 / common log timestamp prefix to strip before dedup.
 /// e.g. `2024-01-15T10:30:00Z `, `2024-01-15 10:30:00 `, `[2024-01-15T10:30:00]`
 static RE_LOG_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
@@ -358,12 +365,15 @@ fn extract_json_message(obj: &Value) -> Option<String> {
 /// Callers must gate on `in_python_frame` before calling — this function tests
 /// only the line's structure, not parser state.
 fn is_python_continuation(line: &str) -> bool {
+    // Callers (step 3) only invoke this after RE_LOG_STACK_TRACE.is_match failed in step 2,
+    // so the regex guard is provably dead work here. Only structural checks needed.
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return false;
     }
-    // Must have leading whitespace (indented) but not be a new File/at frame.
-    line.starts_with(|c: char| c.is_ascii_whitespace()) && !RE_LOG_STACK_TRACE.is_match(line)
+    // Must have leading whitespace (indented). RE_LOG_STACK_TRACE non-match is guaranteed
+    // by the call site ordering: step 2 runs first and skips to `continue` on a match.
+    line.starts_with(|c: char| c.is_ascii_whitespace())
 }
 
 /// Parse regex-based log formats into a LogResult.
@@ -405,18 +415,20 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
     // Tracks whether the last recognised stack frame was a Python `File "..."` line,
     // enabling source-preview and PEP 657 caret continuation detection.
     let mut in_python_frame = false;
+    // Counts continuation lines appended to the current logical frame.
+    // Reset to 0 each time a new frame starts (step 2). Enforces
+    // MAX_CONTINUATIONS_PER_FRAME to uphold the O(PENDING_STACK_CAP) memory invariant.
+    let mut frame_continuation_count: usize = 0;
 
     for line in input.lines().take(MAX_INPUT_LINES) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             // Step 1: Blank lines flush the pending stack (end of exception block).
-            if !pending_stack.is_empty() && !all_entries.is_empty() {
-                flush_stack_frames(
-                    &mut all_entries,
-                    &mut pending_stack,
-                    &mut total_stack_frames_elided,
-                );
-            }
+            try_flush_stack(
+                &mut all_entries,
+                &mut pending_stack,
+                &mut total_stack_frames_elided,
+            );
             in_python_frame = false;
             continue;
         }
@@ -432,6 +444,7 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
             pending_stack.push_back(trimmed.to_string());
             // Set flag so the next indented line is recognised as a continuation.
             in_python_frame = trimmed.starts_with("File ");
+            frame_continuation_count = 0;
             found_structured = true;
             continue;
         }
@@ -440,9 +453,16 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
         // Must run BEFORE classify_log_line so source lines containing "ERROR:"
         // or similar keywords are not misclassified as new log entries.
         if in_python_frame && is_python_continuation(line) {
-            if let Some(last_frame) = pending_stack.back_mut() {
-                last_frame.push('\n');
-                last_frame.push_str(trimmed);
+            debug_assert!(
+                !pending_stack.is_empty(),
+                "in_python_frame=true requires a frame in pending_stack"
+            );
+            if frame_continuation_count < MAX_CONTINUATIONS_PER_FRAME {
+                if let Some(last_frame) = pending_stack.back_mut() {
+                    last_frame.push('\n');
+                    last_frame.push_str(trimmed);
+                }
+                frame_continuation_count += 1;
             }
             continue;
         }
@@ -467,13 +487,11 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
         if without_ts.starts_with("During handling of the above exception")
             || without_ts.starts_with("The above exception was the direct cause")
         {
-            if !pending_stack.is_empty() && !all_entries.is_empty() {
-                flush_stack_frames(
-                    &mut all_entries,
-                    &mut pending_stack,
-                    &mut total_stack_frames_elided,
-                );
-            }
+            try_flush_stack(
+                &mut all_entries,
+                &mut pending_stack,
+                &mut total_stack_frames_elided,
+            );
             in_python_frame = false;
             all_entries.push((None, trimmed.to_string()));
             continue;
@@ -483,13 +501,11 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
         in_python_frame = false;
 
         // Step 8: New log line — flush any accumulated stack frames onto the previous entry.
-        if !pending_stack.is_empty() && !all_entries.is_empty() {
-            flush_stack_frames(
-                &mut all_entries,
-                &mut pending_stack,
-                &mut total_stack_frames_elided,
-            );
-        }
+        try_flush_stack(
+            &mut all_entries,
+            &mut pending_stack,
+            &mut total_stack_frames_elided,
+        );
 
         total_lines += 1;
 
@@ -502,13 +518,11 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
     }
 
     // Flush any trailing stack frames at end-of-input.
-    if !pending_stack.is_empty() && !all_entries.is_empty() {
-        flush_stack_frames(
-            &mut all_entries,
-            &mut pending_stack,
-            &mut total_stack_frames_elided,
-        );
-    }
+    try_flush_stack(
+        &mut all_entries,
+        &mut pending_stack,
+        &mut total_stack_frames_elided,
+    );
 
     // Issue 8: if no structured log levels were found, entries are plain text —
     // return None to fall through to Passthrough rather than producing a
@@ -534,8 +548,10 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
 /// optional source-preview and PEP 657 caret lines embedded as a multi-line
 /// string. The elision count is therefore a count of logical frames, not raw lines.
 ///
-/// `all_entries` must be `&mut Vec` rather than `&mut [_]` because `.last_mut()`
-/// is a Vec-level borrow; `pending_stack` must be `&mut VecDeque` to call `.clear()`.
+/// `all_entries` must be `&mut Vec` rather than `&mut [_]` because clippy flags
+/// `&mut Vec<T>` parameters suggesting `&mut [T]`, but `Vec::push` is not available
+/// on slices and this function's callers rely on it. `pending_stack` must be
+/// `&mut VecDeque` to call `.clear()` and `.iter()`.
 #[allow(clippy::ptr_arg)]
 fn flush_stack_frames(
     all_entries: &mut Vec<(Option<String>, String)>,
@@ -554,6 +570,22 @@ fn flush_stack_frames(
     }
 
     pending_stack.clear();
+}
+
+/// Guard-and-flush helper: flushes `pending_stack` only when both the stack and
+/// `all_entries` are non-empty. Reduces decision-point repetition at the 4 flush
+/// sites inside `try_parse_regex_logs` (blank-line, chained-separator, new-log-entry,
+/// end-of-input), lowering cyclomatic complexity by ~8 decision points.
+#[allow(clippy::ptr_arg)]
+#[inline]
+fn try_flush_stack(
+    all_entries: &mut Vec<(Option<String>, String)>,
+    pending_stack: &mut VecDeque<String>,
+    elided: &mut usize,
+) {
+    if !pending_stack.is_empty() && !all_entries.is_empty() {
+        flush_stack_frames(all_entries, pending_stack, elided);
+    }
 }
 
 /// Strip the timestamp prefix from a log line, unless `keep_timestamps` is true.
@@ -1257,6 +1289,50 @@ mod tests {
     }
 
     // ============================================================================
+    // is_python_continuation unit tests (TESTING-1)
+    // ============================================================================
+
+    /// Empty line is not a continuation.
+    #[test]
+    fn test_is_python_continuation_empty_line() {
+        assert!(!is_python_continuation(""));
+    }
+
+    /// Whitespace-only line is not a continuation (trimmed is empty).
+    #[test]
+    fn test_is_python_continuation_whitespace_only() {
+        assert!(!is_python_continuation("   "));
+        assert!(!is_python_continuation("\t"));
+    }
+
+    /// Non-whitespace-leading line is not a continuation (no leading indent).
+    #[test]
+    fn test_is_python_continuation_no_leading_whitespace() {
+        assert!(!is_python_continuation("raise ValueError"));
+        assert!(!is_python_continuation("INFO: something"));
+    }
+
+    /// A line matching RE_LOG_STACK_TRACE would have been consumed by step 2 at the
+    /// call site, so is_python_continuation doesn't need to re-check it. Verify the
+    /// predicate itself returns true for indented stack-frame-looking content (the call
+    /// site guard prevents misuse).
+    #[test]
+    fn test_is_python_continuation_indented_file_line_structural() {
+        // This IS indented, so the structural predicate returns true.
+        // The call site (step 3) only runs after step 2 fails, so indented File
+        // lines are caught by RE_LOG_STACK_TRACE first; this test documents the
+        // responsibility boundary.
+        assert!(is_python_continuation("  File \"/app/foo.py\", line 10, in bar"));
+    }
+
+    /// A valid continuation: indented source-preview line.
+    #[test]
+    fn test_is_python_continuation_valid_source_preview() {
+        assert!(is_python_continuation("    do_thing()"));
+        assert!(is_python_continuation("\t    return value"));
+    }
+
+    // ============================================================================
     // Group A: Updated Python Fixture (issue #137)
     // ============================================================================
 
@@ -1567,7 +1643,7 @@ mod tests {
     }
 
     // ============================================================================
-    // Group F: Rendered Output
+    // Group E: Rendered Output
     // ============================================================================
 
     /// issue #137: The rendered output from the Python fixture must be coherent —
@@ -1622,6 +1698,36 @@ mod tests {
             info_entry.message.contains("recovered"),
             "INFO entry must contain recovery message: {}",
             info_entry.message
+        );
+    }
+
+    /// TESTING-2: Python exception-type lines (e.g. `DatabaseError: msg`, `ServiceError: msg`)
+    /// that appear after stack frames — after the stack is flushed — must be preserved as
+    /// unstructured entries (level = None), not silently dropped.
+    #[test]
+    fn test_python_exception_type_lines_preserved_as_unstructured() {
+        // Traceback + File frame + exception-type line (no log-level prefix).
+        // The exception-type line must appear in all_entries with level=None.
+        let input = concat!(
+            "ERROR: startup failed\n",
+            "Traceback (most recent call last):\n",
+            "  File \"/app/db.py\", line 42, in connect\n",
+            "    conn = engine.connect()\n",
+            "DatabaseError: connection refused\n",
+            "INFO: retrying\n",
+        );
+        let flags = make_flags();
+        let result = try_parse_regex_logs(input, &flags).unwrap();
+
+        // DatabaseError: line must be present as an unstructured entry.
+        let has_db_error = result
+            .entries
+            .iter()
+            .any(|e| e.level.is_none() && e.message.contains("DatabaseError"));
+        assert!(
+            has_db_error,
+            "DatabaseError exception-type line must be preserved as an unstructured entry; entries: {:?}",
+            result.entries.iter().map(|e| (&e.level, &e.message)).collect::<Vec<_>>()
         );
     }
 }
