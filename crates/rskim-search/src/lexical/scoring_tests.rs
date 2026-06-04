@@ -56,9 +56,11 @@ fn test_single_field_positive_score() {
 fn test_higher_boost_increases_score() {
     // TypeDefinition field (boost 5.0) vs FunctionBody field (boost 1.0),
     // same TF and document lengths.
-    let mut cfg = BM25FConfig::default();
+    let mut cfg = BM25FConfig {
+        field_boosts: [0.0; FIELD_COUNT],
+        ..BM25FConfig::default()
+    };
     // All boosts 0 except index 0 → isolate TypeDefinition
-    cfg.field_boosts = [0.0; FIELD_COUNT];
     cfg.field_boosts[0] = 5.0;
 
     let mut tfs_high = zero_field_tfs();
@@ -88,9 +90,11 @@ fn test_higher_boost_increases_score() {
 
 #[test]
 fn test_zero_boost_field_ignored() {
-    let mut cfg = BM25FConfig::default();
-    // Zero out all boosts — every field is disabled.
-    cfg.field_boosts = [0.0; FIELD_COUNT];
+    let cfg = BM25FConfig {
+        // Zero out all boosts — every field is disabled.
+        field_boosts: [0.0; FIELD_COUNT],
+        ..BM25FConfig::default()
+    };
 
     let mut tfs = zero_field_tfs();
     tfs[3] = 10.0; // many occurrences in ImportExport field
@@ -114,12 +118,13 @@ fn test_zero_avg_field_length_no_panic() {
 #[test]
 fn test_k1_zero_acts_as_binary_presence() {
     // k1=0 → tf_weighted / (tf_weighted + 0) = 1.0 → score = idf * 1.0
-    let mut cfg = BM25FConfig::default();
-    cfg.k1 = 0.0;
-    // Use all boosts = 0 except one to isolate
-    cfg.field_boosts = [0.0; FIELD_COUNT];
+    let mut cfg = BM25FConfig {
+        k1: 0.0,
+        // Use all boosts = 0 except one to isolate
+        field_boosts: [0.0; FIELD_COUNT],
+        field_b: [0.0; FIELD_COUNT], // no length normalisation
+    };
     cfg.field_boosts[0] = 1.0;
-    cfg.field_b = [0.0; FIELD_COUNT]; // no length normalisation
 
     let mut tfs = zero_field_tfs();
     tfs[0] = 1.0;
@@ -136,9 +141,11 @@ fn test_k1_zero_acts_as_binary_presence() {
 #[test]
 fn test_b_zero_no_length_normalisation() {
     // b=0 means field length has no effect.
-    let mut cfg = BM25FConfig::default();
-    cfg.field_b = [0.0; FIELD_COUNT];
-    cfg.field_boosts = [0.0; FIELD_COUNT];
+    let mut cfg = BM25FConfig {
+        field_b: [0.0; FIELD_COUNT],
+        field_boosts: [0.0; FIELD_COUNT],
+        ..BM25FConfig::default()
+    };
     cfg.field_boosts[0] = 1.0;
 
     let mut tfs = zero_field_tfs();
@@ -177,9 +184,11 @@ fn test_extreme_length_ratio_finite() {
 fn test_zero_field_length_with_b_one_no_nan() {
     // b=1.0 and dl=0 produces norm=0.0 in the formula.
     // The guard should prevent NaN/Inf.
-    let mut cfg = BM25FConfig::default();
-    cfg.field_b = [1.0; FIELD_COUNT]; // full normalisation
-    cfg.field_boosts = [0.0; FIELD_COUNT];
+    let mut cfg = BM25FConfig {
+        field_b: [1.0; FIELD_COUNT], // full normalisation
+        field_boosts: [0.0; FIELD_COUNT],
+        ..BM25FConfig::default()
+    };
     cfg.field_boosts[0] = 1.0;
 
     let mut tfs = zero_field_tfs();

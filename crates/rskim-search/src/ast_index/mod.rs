@@ -29,6 +29,7 @@
 //! let weight = ast_bigram_idf(Language::Rust, bigram);
 //! ```
 
+mod extract;
 mod linearize;
 mod ngram;
 
@@ -46,6 +47,10 @@ mod ngram;
 /// with a raw `u16`.
 pub type NodeKindId = u16;
 
+pub use extract::{
+    AstBigramEntry, AstNgramSet, AstTrigramEntry, extract_ast_ngrams,
+    extract_ast_ngrams_with_weights,
+};
 pub use linearize::{LinearNode, LinearizeResult, linearize_source};
 pub use ngram::{
     AstBigram, AstTrigram, DEFAULT_AST_WEIGHT, ast_bigram_idf, ast_trigram_idf, vocab_len,

@@ -373,7 +373,7 @@ fn hotspot_for_file_returns_row_when_present() {
         changes_30d: 10,
         changes_90d: 25,
     };
-    db.store_hotspots(&[row.clone()]).unwrap();
+    db.store_hotspots(std::slice::from_ref(&row)).unwrap();
     let found = db.hotspot_for_file("src/auth.rs").unwrap().unwrap();
     assert_eq!(found, row);
 }
@@ -407,7 +407,7 @@ fn risk_for_file_returns_row_when_present() {
         fix_commits: 8,
         fix_density: 0.267,
     };
-    db.store_risks(&[row.clone()]).unwrap();
+    db.store_risks(std::slice::from_ref(&row)).unwrap();
     let found = db.risk_for_file("src/engine.rs").unwrap().unwrap();
     assert_eq!(found, row);
 }
@@ -429,7 +429,7 @@ fn cochanges_for_file_returns_both_directions() {
         count: 5,
         jaccard: 0.6,
     };
-    db.store_cochanges(&[row.clone()]).unwrap();
+    db.store_cochanges(std::slice::from_ref(&row)).unwrap();
 
     // Query for file_a should find it
     let from_a = db.cochanges_for_file("src/a.rs").unwrap();
@@ -481,7 +481,7 @@ fn cochanges_for_file_respects_canonical_ordering() {
         count: 12,
         jaccard: 0.72,
     };
-    db.store_cochanges(&[row.clone()]).unwrap();
+    db.store_cochanges(std::slice::from_ref(&row)).unwrap();
     // Both directions should find the same row
     let via_a = db.cochanges_for_file("src/auth.rs").unwrap();
     let via_b = db.cochanges_for_file("src/middleware.rs").unwrap();
@@ -691,7 +691,7 @@ fn cochanges_for_file_union_all_hits_file_b_index() {
         count: 9,
         jaccard: 0.77,
     };
-    db.store_cochanges(&[row.clone()]).unwrap();
+    db.store_cochanges(std::slice::from_ref(&row)).unwrap();
 
     let results = db.cochanges_for_file("src/z.rs").unwrap();
     assert_eq!(results.len(), 1, "file_b lookup must return the row");

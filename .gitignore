@@ -52,3 +52,6 @@ crates/rskim-search/data/
 
 # Benchmark corpus (large, reproducible via download)
 .bench-corpus/
+
+# Claude Code local runtime state
+.claude/scheduled_tasks.lock

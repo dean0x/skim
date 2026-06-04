@@ -480,19 +480,21 @@ fn test_ac2_configurable_boosts_reverse_ranking() {
 fn test_ac3_bm25f_validation_rejects_invalid() {
     use crate::lexical::BM25FConfig;
 
-    let mut bad_k1 = BM25FConfig::default();
-    bad_k1.k1 = -0.1;
+    let bad_k1 = BM25FConfig {
+        k1: -0.1,
+        ..BM25FConfig::default()
+    };
     assert!(bad_k1.validate().is_err(), "negative k1 must be rejected");
 
     let mut bad_boost = BM25FConfig::default();
-    bad_boost.field_boosts[0] = -1.0;
+    bad_boost.field_boosts[0] = -1.0; // array element mutation — struct-update syntax doesn't apply here
     assert!(
         bad_boost.validate().is_err(),
         "negative boost must be rejected"
     );
 
     let mut bad_b = BM25FConfig::default();
-    bad_b.field_b[2] = 1.5;
+    bad_b.field_b[2] = 1.5; // array element mutation — struct-update syntax doesn't apply here
     assert!(bad_b.validate().is_err(), "b > 1.0 must be rejected");
 
     // Valid config must pass.
@@ -557,8 +559,10 @@ fn test_open_with_config_stores_config() {
 
     // Open twice: once with the default config, once with k1 = 2.0.
     let default_reader = NgramIndexReader::open(dir.path()).unwrap();
-    let mut custom_config = BM25FConfig::default();
-    custom_config.k1 = 2.0; // higher k1 → lower saturation → lower score
+    let custom_config = BM25FConfig {
+        k1: 2.0,
+        ..BM25FConfig::default()
+    }; // higher k1 → lower saturation → lower score
     let custom_reader = NgramIndexReader::open_with_config(dir.path(), custom_config).unwrap();
 
     let default_results = default_reader.search(&SearchQuery::new("main")).unwrap();
@@ -659,8 +663,10 @@ fn test_open_with_config_rejects_invalid_config() {
         .unwrap();
     builder.build().unwrap();
 
-    let mut bad_config = BM25FConfig::default();
-    bad_config.k1 = -1.0; // invalid: must be >= 0.0
+    let bad_config = BM25FConfig {
+        k1: -1.0,
+        ..BM25FConfig::default()
+    }; // invalid: must be >= 0.0
 
     let result = NgramIndexReader::open_with_config(dir.path(), bad_config);
     assert!(

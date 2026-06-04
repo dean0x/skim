@@ -7,12 +7,13 @@
 //!   2. linearize_scaling     — Rust, 10/50/100/500/1000 functions
 //!   3. linearize_depth       — controlled nesting: 5/10/50/100/200 levels
 //!   4. init_latency          — LazyLock LANG_MAPS initialization
+//!   5. extract_ngrams        — AST sparse n-gram extraction over linearized nodes
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use rskim_core::Language;
-use rskim_search::linearize_source;
+use rskim_search::{extract_ast_ngrams, linearize_source};
 
 // ============================================================================
 // Fixture helpers
@@ -147,6 +148,30 @@ fn bench_init_latency(c: &mut Criterion) {
 }
 
 // ============================================================================
+// Group 5: AST sparse n-gram extraction
+// ============================================================================
+
+/// Benchmark `extract_ast_ngrams` over a pre-linearized ~3000-line Rust fixture.
+///
+/// Linearization is done once outside the timed closure so the benchmark
+/// measures extraction in isolation from parsing overhead.
+fn bench_extract_ngrams(c: &mut Criterion) {
+    let mut group = c.benchmark_group("extract_ngrams");
+
+    for &n_fns in &[100usize, 500, 1000] {
+        let source = gen_rust_fns(n_fns);
+        // Linearize once outside the timed closure.
+        let nodes = linearize_source(&source, Language::Rust).unwrap().nodes;
+
+        group.bench_with_input(BenchmarkId::new("rust_fns", n_fns), &nodes, |b, nodes| {
+            b.iter(|| extract_ast_ngrams(black_box(nodes), black_box(Language::Rust)))
+        });
+    }
+
+    group.finish();
+}
+
+// ============================================================================
 // Criterion main
 // ============================================================================
 
@@ -155,6 +180,7 @@ criterion_group!(
     bench_linearize_languages,
     bench_linearize_scaling,
     bench_linearize_depth,
-    bench_init_latency
+    bench_init_latency,
+    bench_extract_ngrams
 );
 criterion_main!(benches);

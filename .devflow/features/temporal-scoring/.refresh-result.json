@@ -1,0 +1,14 @@
+{
+  "referencedFiles": [
+    "crates/rskim-search/src/temporal/scoring.rs",
+    "crates/rskim-search/src/temporal/scoring_tests.rs",
+    "crates/rskim-search/src/temporal/mod.rs",
+    "crates/rskim-search/src/temporal/git_parser.rs",
+    "crates/rskim-search/src/temporal/storage.rs",
+    "crates/rskim-search/src/temporal/storage_ops.rs",
+    "crates/rskim-search/src/temporal/storage_types.rs",
+    "crates/rskim-search/src/types.rs",
+    "crates/rskim-search/src/lib.rs"
+  ],
+  "description": "Use when adding per-file risk metrics from git history, tuning decay parameters, integrating hotspot scores into search ranking, extending the temporal module with new scoring signals, or working with the SQLite temporal persistence layer. Keywords: temporal, hotspot, fix density, exponential decay, git history, risk scores, half-life, FileRiskScores, FileTemporalStats, compute_file_risk_scores, compute_file_temporal_stats, decay_weight, TemporalDb, storage, HotspotRow, RiskRow, CochangeRow, file_filter, SearchQuery, per-file lookup, top-N, hotspot_for_file, risk_for_file, cochanges_for_file, top_hotspots, top_risks, top_coldspots."
+}

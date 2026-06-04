@@ -116,7 +116,7 @@ fn decay_always_in_unit_range() {
     for (elapsed, half_life) in test_inputs {
         let w = decay_weight(elapsed, half_life);
         assert!(
-            w >= 0.0 && w <= 1.0,
+            (0.0..=1.0_f64).contains(&w),
             "out of range for ({elapsed}, {half_life}): {w}"
         );
         assert!(w.is_finite(), "non-finite for ({elapsed}, {half_life})");
@@ -145,7 +145,7 @@ fn decay_nan_half_life_panics() {
 fn decay_nan_elapsed_does_not_propagate() {
     let w = decay_weight(f64::NAN, HALF_LIFE);
     assert!(
-        w.is_finite() && w >= 0.0 && w <= 1.0,
+        w.is_finite() && (0.0..=1.0_f64).contains(&w),
         "expected finite value in [0,1] for NaN elapsed, got {w}"
     );
 }
@@ -157,7 +157,7 @@ fn decay_nan_elapsed_does_not_propagate() {
 fn decay_positive_infinity_elapsed() {
     let w = decay_weight(f64::INFINITY, HALF_LIFE);
     assert!(
-        w.is_finite() && w >= 0.0 && w <= 1.0,
+        w.is_finite() && (0.0..=1.0_f64).contains(&w),
         "expected finite value in [0,1] for +Inf elapsed, got {w}"
     );
     // exp(-Inf) = 0.0 clamped → 0.0
@@ -171,7 +171,7 @@ fn decay_positive_infinity_elapsed() {
 fn decay_negative_infinity_elapsed() {
     let w = decay_weight(f64::NEG_INFINITY, HALF_LIFE);
     assert!(
-        w.is_finite() && w >= 0.0 && w <= 1.0,
+        w.is_finite() && (0.0..=1.0_f64).contains(&w),
         "expected finite value in [0,1] for -Inf elapsed, got {w}"
     );
     // exp(+Inf) = +Inf → clamped to 1.0

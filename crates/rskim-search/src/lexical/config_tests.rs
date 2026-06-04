@@ -69,8 +69,10 @@ fn test_validate_ok_defaults() {
 
 #[test]
 fn test_validate_rejects_negative_k1() {
-    let mut cfg = BM25FConfig::default();
-    cfg.k1 = -0.1;
+    let cfg = BM25FConfig {
+        k1: -0.1,
+        ..BM25FConfig::default()
+    };
     let result = cfg.validate();
     assert!(result.is_err());
     let msg = format!("{}", result.unwrap_err());
@@ -148,8 +150,10 @@ fn test_partial_eq() {
     let b = BM25FConfig::default();
     assert_eq!(a, b);
 
-    let mut c = BM25FConfig::default();
-    c.k1 = 2.0;
+    let c = BM25FConfig {
+        k1: 2.0,
+        ..BM25FConfig::default()
+    };
     assert_ne!(a, c);
 }
 
