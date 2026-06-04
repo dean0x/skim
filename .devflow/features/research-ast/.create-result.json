@@ -1,0 +1,14 @@
+{
+  "referencedFiles": [
+    "crates/rskim-research/src/ast_types.rs",
+    "crates/rskim-research/src/ast_extract.rs",
+    "crates/rskim-research/src/ast_idf.rs",
+    "crates/rskim-research/src/ast_codegen.rs",
+    "crates/rskim-research/src/ast_validate.rs",
+    "crates/rskim-research/src/clone.rs",
+    "crates/rskim-research/src/config.rs",
+    "crates/rskim-research/src/main.rs",
+    "crates/rskim-research/src/lib.rs"
+  ],
+  "description": "Use when extending the AST n-gram pipeline, regenerating ast_weights.rs, adding new tree-sitter languages to the corpus, modifying the vocabulary stabilization step, or debugging IDF weight quality. Keywords: ast_weights, bigram, trigram, NodeKindVocabulary, stabilize, IDF, rskim-research, ast-corpus.toml, codegen."
+}

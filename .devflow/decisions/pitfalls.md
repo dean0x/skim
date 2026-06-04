@@ -1,4 +1,4 @@
-<!-- TL;DR: 3 pitfalls. Key: PF-001, PF-002, PF-003 -->
+<!-- TL;DR: 4 pitfalls. Key: PF-001, PF-002, PF-003, PF-004 -->
 # Known Pitfalls
 
 Area-specific gotchas, fragile areas, and past bugs.
@@ -29,3 +29,12 @@ Area-specific gotchas, fragile areas, and past bugs.
 - **Resolution**: before attributing any command failure to an external tool in a project where skim is installed, verify (1) whether skim's rewrite hook matched that command and (2) whether the rewrite itself could have caused the failure mode. Never declare 'not related to skim' without checking the engine.rs rule table for the failing command pattern.
 - **Status**: Active
 - **Source**: self-learning:obs_yw3m6d
+
+## PF-004: u16 depth arithmetic overflow: widen to u32 before adding an offset in depth comparisons
+
+- **Area**: extract.rs gap-fill depth arithmetic in extract_ast_ngrams_with_weights
+- **Issue**: the condition `node.depth > p + 1` uses u16 arithmetic, so when prev_depth p == u16::MAX the addition wraps to 0, making the condition silently false and skipping gap-fill entirely, risking a panic on the subsequent slice index or a spurious parent-child edge
+- **Impact**: a file with a CST node at depth 65535 (or a corrupt u16 in synthetic DI input) bypasses the gap-fill guard
+- **Resolution**: always widen u16 depth values to u32 before arithmetic in comparisons -- use u32::from(p) + 1, not p + 1, when p is u16. Generalizes to any bounded integer: widen before adding an offset rather than risk wrap at the type maximum.
+- **Status**: Active
+- **Source**: self-learning:obs_kp2v7n

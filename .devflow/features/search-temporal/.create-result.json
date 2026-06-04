@@ -1,0 +1,12 @@
+{
+  "referencedFiles": [
+    "crates/rskim/src/cmd/search/temporal.rs",
+    "crates/rskim/src/cmd/search/temporal_tests.rs",
+    "crates/rskim/src/cmd/search/types.rs",
+    "crates/rskim/src/cmd/search/mod.rs",
+    "crates/rskim/src/cmd/search/query.rs",
+    "crates/rskim-search/src/temporal/storage.rs",
+    "crates/rskim-search/src/lib.rs"
+  ],
+  "description": "Use when adding temporal flags to search, modifying --hot/--cold/--risky/--blast-radius behavior, implementing standalone vs combined temporal query dispatch, or understanding how BM25F results are re-sorted by temporal signals. Keywords: temporal, hotspot, risk, blast-radius, co-change, TemporalAnnotation, TemporalSort, standalone mode, enrichment."
+}
