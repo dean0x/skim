@@ -29,7 +29,7 @@ use memmap2::Mmap;
 use super::format::{
     AST_BIGRAM_ENTRY_SIZE, AST_FILE_META_SIZE, AST_HEADER_SIZE, AST_POSTING_ENTRY_SIZE,
     AST_TRIGRAM_ENTRY_SIZE, AstFileMetaEntry, AstSkidxHeader, compute_checksum, decode_file_meta,
-    decode_posting, lookup_bigram, lookup_trigram,
+    decode_header, decode_posting, lookup_bigram, lookup_trigram,
 };
 use crate::{
     Result, SearchError,
@@ -114,7 +114,7 @@ impl AstIndexReader {
         // this is an inherent constraint of mmap-based indexes (same as lexical).
         let idx_mmap = unsafe { Mmap::map(&idx_file) }?;
 
-        let header = decode_header_and_validate(&idx_mmap)?;
+        let header = decode_header(&idx_mmap)?;
 
         // ── Size validation (checked arithmetic) ────────────────────────────
         let bigram_bytes = (header.bigram_count as usize)
@@ -357,19 +357,6 @@ impl AstIndexReader {
             })?;
         decode_file_meta(&self.idx_mmap[offset..end])
     }
-}
-
-// ============================================================================
-// Header decode + validate (private free function)
-// ============================================================================
-
-/// Decode and validate the header from the start of the idx mmap.
-///
-/// Called exclusively by `AstIndexReader::open` so the validate logic is
-/// not duplicated between open and any future re-validate path.
-fn decode_header_and_validate(idx_mmap: &[u8]) -> Result<AstSkidxHeader> {
-    use super::format::decode_header;
-    decode_header(idx_mmap)
 }
 
 // ============================================================================

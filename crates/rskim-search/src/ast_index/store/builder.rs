@@ -218,7 +218,13 @@ impl AstIndexBuilder {
         lang: rskim_core::Language,
     ) -> Result<()> {
         let lin = linearize_source(content, lang)?;
-        let node_count = lin.nodes.len() as u32;
+        let node_count = u32::try_from(lin.nodes.len()).map_err(|_| {
+            SearchError::IndexCorrupted(format!(
+                "node_count {} exceeds u32::MAX for FileId {}",
+                lin.nodes.len(),
+                id.0
+            ))
+        })?;
         let set = extract_ast_ngrams(&lin.nodes, lang);
         self.add_file_ngrams(id, lang, &set, node_count)
     }
@@ -251,7 +257,13 @@ impl AstIndexBuilder {
             .par_iter()
             .map(|(id, content, lang)| {
                 let lin = linearize_source(content, *lang)?;
-                let node_count = lin.nodes.len() as u32;
+                let node_count = u32::try_from(lin.nodes.len()).map_err(|_| {
+                    SearchError::IndexCorrupted(format!(
+                        "node_count {} exceeds u32::MAX for FileId {}",
+                        lin.nodes.len(),
+                        id.0
+                    ))
+                })?;
                 let set = extract_ast_ngrams(&lin.nodes, *lang);
                 Ok((*id, *lang, set, node_count))
             })
