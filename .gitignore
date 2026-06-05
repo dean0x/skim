@@ -14,6 +14,7 @@ flamegraph.svg
 # IDE and editor files
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 *~
@@ -53,5 +54,15 @@ crates/rskim-search/data/
 # Benchmark corpus (large, reproducible via download)
 .bench-corpus/
 
-# Claude Code local runtime state
-.claude/scheduled_tasks.lock
+# Claude Code local state
+.claude/
+
+# Devflow ephemeral artifacts (keep decisions/ and features/ tracked)
+.devflow/docs/
+.devflow/dream/
+.devflow/features/**/.create-result.json
+.devflow/features/**/.refresh-result.json
+
+# Stale build artifacts
+librust_out.rlib
+package-lock.json

@@ -3,9 +3,10 @@
   "features": {
     "build-parsers": {
       "name": "Build Tool Output Parsers",
-      "description": "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, ParseResult, BuildResult, three-tier, NDJSON, flag injection, flat dispatch, multi-category dispatch, cmd refactor, dispatch.rs, execution.rs, registry.rs, security.rs.",
+      "description": "Use when adding a new build tool parser, modifying cargo/tsc/make compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection. NOTE: cmd/mod.rs was refactored in PR #267 — scrubbing logic is in security.rs, command execution in execution.rs, dispatch in dispatch.rs.",
       "directories": [
-        "crates/rskim/src/cmd/build/"
+        "crates/rskim/src/cmd/build/",
+        "crates/rskim/src/cmd/"
       ],
       "referencedFiles": [
         "crates/rskim/src/cmd/build/mod.rs",
@@ -17,9 +18,12 @@
         "crates/rskim/src/output/mod.rs",
         "crates/rskim/src/output/canonical.rs",
         "crates/rskim/src/cmd/mod.rs",
+        "crates/rskim/src/cmd/execution.rs",
+        "crates/rskim/src/cmd/dispatch.rs",
+        "crates/rskim/src/cmd/security.rs",
         "crates/rskim/src/runner.rs"
       ],
-      "lastUpdated": "2026-06-04T09:41:07.780Z",
+      "lastUpdated": "2026-06-03T00:00:00.000Z",
       "createdBy": "devflow-knowledge"
     },
     "cochange": {

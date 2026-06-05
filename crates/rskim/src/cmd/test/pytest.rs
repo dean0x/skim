@@ -259,6 +259,64 @@ fn parse_summary_line(line: &str) -> Option<SummaryCounts> {
 // Tier 1: Text state machine
 // ============================================================================
 
+/// Extract `(name, outcome)` from a verbose pytest marker line.
+///
+/// Matches lines that end with ` PASSED`, ` FAILED`, or ` SKIPPED` (verbose
+/// mode output). Returns `None` for all other lines.
+fn parse_verbose_marker(line: &str) -> Option<(String, TestOutcome)> {
+    let (suffix, outcome) = if line.ends_with(" PASSED") {
+        (" PASSED", TestOutcome::Pass)
+    } else if line.ends_with(" FAILED") {
+        (" FAILED", TestOutcome::Fail)
+    } else if line.ends_with(" SKIPPED") {
+        (" SKIPPED", TestOutcome::Skip)
+    } else {
+        return None;
+    };
+    Some((line.strip_suffix(suffix).unwrap().to_string(), outcome))
+}
+
+/// Tracks which section of pytest output the parser is currently inside.
+///
+/// The two section booleans (`in_failures`, `in_summary_info`) were mutually
+/// exclusive — exactly one was true at any time, or both were false (Normal).
+/// An enum makes all three states explicit and eliminates the illegal state
+/// where both would be true simultaneously.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PytestSection {
+    /// Outside any special section.
+    Normal,
+    /// Inside the `=== FAILURES ===` block.
+    Failures,
+    /// Inside the `=== short test summary info ===` block.
+    SummaryInfo,
+}
+
+/// Classify a `=== ... ===` section-header line.
+///
+/// Returns `Some(PytestSection)` when `trimmed` is a pytest section header,
+/// or `None` when it is not (allowing the caller to fall through to other
+/// processing).
+///
+/// The three patterns, in priority order:
+/// 1. Contains `"FAILURES"` → `Failures` section begins.
+/// 2. Contains `"short test summary info"` → `SummaryInfo` section begins.
+/// 3. Starts **and** ends with `"==="` (catch-all) → `Normal` (section ends).
+fn detect_section_header(trimmed: &str) -> Option<PytestSection> {
+    if !trimmed.starts_with("===") {
+        return None;
+    }
+    if trimmed.contains("FAILURES") {
+        Some(PytestSection::Failures)
+    } else if trimmed.contains("short test summary info") {
+        Some(PytestSection::SummaryInfo)
+    } else if trimmed.ends_with("===") {
+        Some(PytestSection::Normal)
+    } else {
+        None
+    }
+}
+
 /// Tier 1: Full text state machine parse.
 ///
 /// Scans every line for PASSED/FAILED/SKIPPED/ERROR markers, extracts test names
@@ -266,8 +324,7 @@ fn parse_summary_line(line: &str) -> Option<SummaryCounts> {
 /// the summary line.
 fn tier1_parse(output: &str) -> Option<TestResult> {
     let mut entries: Vec<TestEntry> = Vec::new();
-    let mut in_failures = false;
-    let mut in_summary_info = false;
+    let mut section = PytestSection::Normal;
     let mut current_failure_name: Option<String> = None;
     let mut current_failure_detail: Vec<String> = Vec::new();
 
@@ -283,42 +340,22 @@ fn tier1_parse(output: &str) -> Option<TestResult> {
             continue;
         }
 
-        // Detect FAILURES section header
-        if trimmed.starts_with("===") && trimmed.contains("FAILURES") {
-            in_failures = true;
-            in_summary_info = false;
-            continue;
-        }
-
-        // Detect "short test summary info" section
-        if trimmed.starts_with("===") && trimmed.contains("short test summary info") {
-            in_summary_info = true;
-            in_failures = false;
-            // Flush any pending failure
-            flush_failure(
-                &mut entries,
-                &mut current_failure_name,
-                &mut current_failure_detail,
-            );
-            continue;
-        }
-
-        // Detect any other section header (=== ... ===) that ends the current section
-        if trimmed.starts_with("===") && trimmed.ends_with("===") {
-            if in_failures {
+        // Detect section headers (=== ... ===)
+        if let Some(new_section) = detect_section_header(trimmed) {
+            // Flush any pending failure when leaving Failures or entering SummaryInfo.
+            if section == PytestSection::Failures || new_section == PytestSection::SummaryInfo {
                 flush_failure(
                     &mut entries,
                     &mut current_failure_name,
                     &mut current_failure_detail,
                 );
             }
-            in_failures = false;
-            in_summary_info = false;
+            section = new_section;
             continue;
         }
 
         // Inside FAILURES section: extract individual test failure blocks
-        if in_failures {
+        if section == PytestSection::Failures {
             // Test failure headers look like: "________ test_name ________"
             if trimmed.starts_with('_') && trimmed.ends_with('_') {
                 // Flush previous failure
@@ -339,7 +376,7 @@ fn tier1_parse(output: &str) -> Option<TestResult> {
         }
 
         // Inside "short test summary info": parse FAILED/ERROR lines
-        if in_summary_info {
+        if section == PytestSection::SummaryInfo {
             let rest = trimmed
                 .strip_prefix("FAILED ")
                 .or_else(|| trimmed.strip_prefix("ERROR "));
@@ -362,29 +399,14 @@ fn tier1_parse(output: &str) -> Option<TestResult> {
             continue;
         }
 
-        // Outside special sections: look for per-line PASSED/FAILED/SKIPPED markers
+        // Outside special sections: look for per-line PASSED/FAILED/SKIPPED markers.
         // These appear in verbose mode output like:
         //   tests/test_a.py::test_one PASSED
         //   tests/test_a.py::test_two FAILED
-        if trimmed.ends_with(" PASSED") {
-            let name = trimmed.trim_end_matches(" PASSED").to_string();
+        if let Some((name, outcome)) = parse_verbose_marker(trimmed) {
             entries.push(TestEntry {
                 name,
-                outcome: TestOutcome::Pass,
-                detail: None,
-            });
-        } else if trimmed.ends_with(" FAILED") {
-            let name = trimmed.trim_end_matches(" FAILED").to_string();
-            entries.push(TestEntry {
-                name,
-                outcome: TestOutcome::Fail,
-                detail: None,
-            });
-        } else if trimmed.ends_with(" SKIPPED") {
-            let name = trimmed.trim_end_matches(" SKIPPED").to_string();
-            entries.push(TestEntry {
-                name,
-                outcome: TestOutcome::Skip,
+                outcome,
                 detail: None,
             });
         }
@@ -833,5 +855,97 @@ FAILED tests/test_b.py::test_two - assert 1 == 2
             // The first occurrence (from verbose line) should be kept
             assert_eq!(fail_entries[0].name, "tests/test_b.py::test_two");
         }
+    }
+
+    // ========================================================================
+    // parse_verbose_marker unit tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_verbose_marker_passed() {
+        let (name, outcome) =
+            parse_verbose_marker("tests/test_a.py::test_one PASSED").expect("should match PASSED");
+        assert_eq!(name, "tests/test_a.py::test_one");
+        assert_eq!(outcome, TestOutcome::Pass);
+    }
+
+    #[test]
+    fn test_parse_verbose_marker_failed() {
+        let (name, outcome) =
+            parse_verbose_marker("tests/test_b.py::test_two FAILED").expect("should match FAILED");
+        assert_eq!(name, "tests/test_b.py::test_two");
+        assert_eq!(outcome, TestOutcome::Fail);
+    }
+
+    #[test]
+    fn test_parse_verbose_marker_skipped() {
+        let (name, outcome) = parse_verbose_marker("tests/test_c.py::test_three SKIPPED")
+            .expect("should match SKIPPED");
+        assert_eq!(name, "tests/test_c.py::test_three");
+        assert_eq!(outcome, TestOutcome::Skip);
+    }
+
+    #[test]
+    fn test_parse_verbose_marker_no_suffix_returns_none() {
+        assert!(
+            parse_verbose_marker("tests/test_a.py::test_one").is_none(),
+            "line with no outcome marker should return None"
+        );
+    }
+
+    #[test]
+    fn test_parse_verbose_marker_pathological_name_containing_marker_word() {
+        // A test whose name itself contains "FAILED" should still parse correctly
+        // as long as the line ends with the real suffix.
+        let (name, outcome) = parse_verbose_marker("tests/test_FAILED_case.py::test_x PASSED")
+            .expect("should match PASSED suffix");
+        assert_eq!(name, "tests/test_FAILED_case.py::test_x");
+        assert_eq!(outcome, TestOutcome::Pass);
+    }
+
+    // ========================================================================
+    // detect_section_header unit tests
+    // ========================================================================
+
+    #[test]
+    fn test_detect_section_header_failures() {
+        assert_eq!(
+            detect_section_header("=== FAILURES ==="),
+            Some(PytestSection::Failures)
+        );
+    }
+
+    #[test]
+    fn test_detect_section_header_summary_info() {
+        assert_eq!(
+            detect_section_header("=== short test summary info ==="),
+            Some(PytestSection::SummaryInfo)
+        );
+    }
+
+    #[test]
+    fn test_detect_section_header_normal_catch_all() {
+        assert_eq!(
+            detect_section_header("=== warnings summary ==="),
+            Some(PytestSection::Normal)
+        );
+    }
+
+    #[test]
+    fn test_detect_section_header_non_header_returns_none() {
+        assert!(
+            detect_section_header("some regular output line").is_none(),
+            "non-header line should return None"
+        );
+    }
+
+    #[test]
+    fn test_detect_section_header_incomplete_banner_returns_none() {
+        // A line that starts with === but does not end with === and is neither
+        // FAILURES nor "short test summary info" — treat as non-header.
+        assert!(
+            detect_section_header("=== warnings summary").is_none(),
+            "=== prefix without === suffix should return None"
+        );
     }
 }

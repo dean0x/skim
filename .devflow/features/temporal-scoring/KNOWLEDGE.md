@@ -1,7 +1,7 @@
 ---
 feature: temporal-scoring
 name: Temporal Risk Scoring
-description: "Use when adding per-file risk metrics from git history, tuning decay parameters, integrating hotspot scores into search ranking, extending the temporal module with new scoring signals, or working with the SQLite temporal persistence layer. Keywords: temporal, hotspot, fix density, exponential decay, git history, risk scores, half-life, FileRiskScores, FileTemporalStats, compute_file_risk_scores, compute_file_temporal_stats, decay_weight, TemporalDb, storage, HotspotRow, RiskRow, CochangeRow, file_filter, SearchQuery, per-file lookup, top-N, hotspot_for_file, risk_for_file, cochanges_for_file, top_hotspots, top_risks, top_coldspots, blast-radius, storage_tests, storage_perf_tests, git_parser_tests."
+description: "Use when adding temporal ranking signals, modifying decay parameters, working with the SQLite temporal persistence layer, or debugging hotspot/risk score computation. Keywords: temporal, hotspot, risk, fix-density, decay, half-life, TemporalDb, HotspotRow, RiskRow, hotspot_for_file, top_hotspots, top_risks, scoring, FileRiskScores, FileTemporalStats, storage_ops, WAL, schema migrations."
 category: domain-knowledge
 directories: [crates/rskim-search/src/temporal/]
 referencedFiles:
@@ -9,7 +9,6 @@ referencedFiles:
   - crates/rskim-search/src/temporal/scoring_tests.rs
   - crates/rskim-search/src/temporal/mod.rs
   - crates/rskim-search/src/temporal/git_parser.rs
-  - crates/rskim-search/src/temporal/git_parser_tests.rs
   - crates/rskim-search/src/temporal/storage.rs
   - crates/rskim-search/src/temporal/storage_ops.rs
   - crates/rskim-search/src/temporal/storage_perf_tests.rs
@@ -17,254 +16,239 @@ referencedFiles:
   - crates/rskim-search/src/temporal/storage_types.rs
   - crates/rskim-search/src/types.rs
   - crates/rskim-search/src/lib.rs
-created: 2026-05-25
-updated: 2026-06-05
+created: 2026-06-01
+updated: 2026-06-01
+version: 1
 ---
 
 # Temporal Risk Scoring
 
 ## Overview
 
-The temporal scoring subsystem computes two per-file risk metrics from a repository's git commit
-history: a **hotspot score** (decay-weighted commit frequency) and a **fix density** (fraction of
-recent touches that were bug fixes). Both are `f64` values in `[0.0, 1.0]` and are returned as
-`FileRiskScores` in a `HashMap<String, FileRiskScores>`.
+The temporal module computes per-file risk signals from git history: hotspot scores (how frequently a file has changed, weighted by recency) and bug-fix density scores (what fraction of commits touching a file were fix commits). These signals are persisted to a WAL-mode SQLite database (`temporal.db`) for fast bulk-loading by ranking pipelines and `skim search` temporal flags (`--hot`, `--cold`, `--risky`, `--blast-radius`).
 
-A companion function, `compute_file_temporal_stats`, computes raw (non-decay-weighted) commit
-counts per file within 30-day and 90-day windows, producing `FileTemporalStats` values for
-persistence. The `temporal::storage` sub-module persists computed values to a WAL-mode SQLite
-database via `TemporalDb`.
+The module is separate from the co-change matrix (`crates/rskim-search/src/cochange/`) — both consume `HistoryResult`, but produce different signal types and use different storage formats.
 
-The module is deliberately split into three independent layers: `git_parser.rs` handles all I/O
-(gix-based history traversal), `scoring.rs` is pure (no I/O, no side effects), and `storage.rs`
-owns the SQLite connection and schema lifecycle.
+## Signal Types
 
-## Test Module Organization
+### Hotspot Score
 
-Tests are split into companion files alongside their implementation files:
+A hotspot score quantifies how actively a file is being modified, with recent changes weighted more heavily than old ones. The score is computed per file, then max-normalized across all files to `[0.0, 1.0]`.
 
-- `scoring_tests.rs` — co-located with `scoring.rs`; deterministic unit tests for decay,
-  accumulation, normalization, fix classification
-- `git_parser_tests.rs` — co-located with `git_parser.rs`; integration tests for `GixSource`
-  history traversal against a real git repository
-- `storage_tests.rs` — comprehensive CRUD, round-trip, schema migration, WAL, per-file lookup
-  tests for `TemporalDb`
-- `storage_perf_tests.rs` — performance regression tests (e.g., `load_10k_hotspots_under_100ms`);
-  gated on `#[cfg(not(debug_assertions))]` to avoid slow runs in debug builds
-
-## Business Context
-
-Risk scores feed downstream ranking signals for the search layer. A file with a high hotspot
-score changed frequently and recently. A high fix density means a large fraction of recent touches
-were bug fixes. Neither metric is a hard filter; both are signals blended with BM25F scores or
-co-change coupling data.
-
-## Core Business Rules
-
-**Hotspot is max-normalized.** After accumulating decay-weighted totals, every file's total is
-divided by the global maximum. The most-active file always scores exactly `1.0`.
-
-**Fix density is ratio-based.** Fix density = `weighted_fix_total / weighted_total` per file.
-
-**Fix classification is commit-wide.** `is_fix_commit` classifies the whole commit message. If a
-commit changes `a.rs` and `b.rs` and is a fix commit, both files receive the fix weight.
-
-**The half-life parameter is in days, not seconds.** `decay_weight(elapsed_days, half_life_days)`
-uses `exp(-elapsed_days / half_life_days)`. At exactly one half-life elapsed the weight is
-`1/e ≈ 0.368`, not `0.5`. This is exponential decay, not biological half-life.
-
-**Future-dated commits are treated as elapsed = 0.** Commits ahead of `now_epoch` contribute
-weight `1.0`. Pre-epoch timestamps produce near-zero weight.
-
-**`compute_file_temporal_stats` deduplicates per commit** using a cleared `HashSet<String>`.
-
-**Window boundary is inclusive.** A commit at exactly `30.0` or `90.0` elapsed days is included.
-
-## Fix Commit Keywords
-
-Regex in `temporal/mod.rs` compiled once via `std::sync::LazyLock`:
-
+**Formula:**
 ```
-(?i)\b(fix|bug|hotfix|patch|revert)\b
+hotspot(file) = Σ_commits decay_weight(elapsed_days, half_life_days)
+decay_weight(d, h) = 2^(-d / h)
 ```
 
-Word-boundary anchors prevent false positives from `prefix` or `buggy`. `LazyLock` ensures the
-regex compiles exactly once across all threads.
+- `elapsed_days`: days between the commit timestamp and `now_epoch`
+- `half_life_days`: configurable decay rate (default varies; higher = slower decay)
+- Sum over all commits touching the file; recent commits contribute ~1.0, old commits ~0.0
 
-## Algorithm Walk-Through
+The max-normalization means the hottest file always scores 1.0; others are relative fractions.
 
-`compute_file_risk_scores(commits, now_epoch, half_life_days)`:
+`HotspotRow` persists:
+- `file_path`: repo-root-relative path
+- `score`: decay-weighted, max-normalized to `[0.0, 1.0]`
+- `changes_30d`: raw commit count in last 30 days
+- `changes_90d`: raw commit count in last 90 days
 
-1. **Pre-classify** — build a `Vec<bool>` of fix flags calling `is_fix_commit` once per commit.
-2. **Accumulate** — single pass over `(commit, is_fix)` pairs. Per-file Entry API update for
-   `(weighted_total, weighted_fix_total)`. Map pre-allocated with
-   `(commits.len() / 4).clamp(64, 50_000)`.
-3. **Normalize and emit** — find `max_total` via fold; map each entry to `FileRiskScores`.
+### Bug-Fix Density (Risk Score)
 
-`compute_file_temporal_stats(commits, now_epoch)`:
+Risk score quantifies how often a file has been part of a fix commit — commits whose message contains fix indicators (see `is_fix_commit` below). This is a static signal: it does not decay over time.
 
-1. **Per commit** — `is_fix_commit` inline, elapsed days, `in_30d`/`in_90d` membership, unique
-   paths via cleared `HashSet<String>`.
-2. **Accumulate** — increment counters via `or_default()`.
+**Formula:**
+```
+risk_score(file) = fix_commits(file) / total_commits(file)
+```
 
-The two functions are independent implementations. Do not merge them.
+Clamped to `[0.0, 1.0]` after division. Files with zero commits have `risk_score = 0.0`.
 
-## Public API
+`RiskRow` persists:
+- `file_path`: repo-root-relative path
+- `risk_score`: fix_commits / total_commits, in `[0.0, 1.0]`
+- `total_commits`: total commits touching this file
+- `fix_commits`: commits classified as fix commits
+- `fix_density`: same as `risk_score` (alias stored for query convenience)
 
-All scoring symbols are re-exported from `crates/rskim-search/src/lib.rs`:
+### Fix Commit Detection
+
+`is_fix_commit(message: &str) -> bool` (in `mod.rs`) applies a simple keyword check on the commit message:
+- Matches: `fix`, `bug`, `patch`, `hotfix`, `repair`, `correct`, `resolve` (case-insensitive, substring match)
+- Does not use regex — pure `str::contains` on the lowercased message
+
+This is intentionally simple. False positives (e.g., "refactor to fix tech debt") are acceptable; precision is not the goal at this layer.
+
+## Core Entry Points
+
+### `compute_file_risk_scores`
 
 ```rust
-pub use temporal::{
-    DEFAULT_HALF_LIFE_DAYS,        // f64 = 30.0
-    GixSource,                      // TemporalSource impl (has I/O)
-    compute_file_risk_scores,       // pure scoring fn → HashMap<String, FileRiskScores>
-    compute_file_temporal_stats,    // pure stats fn → HashMap<String, FileTemporalStats>
-    decay_weight,                   // pure decay fn
-    is_fix_commit,                  // pure regex predicate
-};
-pub use temporal::storage::{
-    CochangeRow, HotspotRow, RiskRow,  // row types
-    META_GIT_HEAD, META_LAST_UPDATED,  // meta table key constants
-    TemporalDb,                         // connection + migrations + sync
-};
-pub use types::{
-    FileRiskScores,       // { hotspot: f64, fix_density: f64 }
-    FileTemporalStats,    // { changes_30d, changes_90d, total_commits, fix_commits: u32 }
-};
+pub fn compute_file_risk_scores(
+    commits: &[CommitInfo],
+    now_epoch: u64,
+    half_life_days: f64,
+) -> HashMap<String, FileRiskScores>
 ```
 
-`FileRiskScores` and `FileTemporalStats` do NOT derive `Serialize`/`Deserialize`. Consumers that
-need JSON output must map to local serde-annotated types.
+Returns a map from file path → `FileRiskScores` containing:
+- `hotspot_score: f64` — raw decay-weighted sum (NOT yet normalized)
+- `fix_density: f64`
+- `total_commits: u32`
+- `fix_commits: u32`
+- `changes_30d: u32`
+- `changes_90d: u32`
 
-`DEFAULT_HALF_LIFE_DAYS = 30.0` — always use this constant, never a hardcoded literal.
+**Important**: The returned `hotspot_score` is the raw sum, not yet max-normalized. The caller is responsible for normalization when converting to `HotspotRow`. The `TemporalDb::sync` pipeline handles this.
 
-## SQLite Persistence Layer
-
-`TemporalDb` owns one SQLite connection and four tables: `hotspot`, `risk`, `cochange`, and
-`meta`.
-
-**Connection lifecycle:** `TemporalDb::open(db_path)` opens or creates the file, sets permissions
-to `0o600`, configures 5-second busy timeout, enables WAL mode, and runs schema migrations.
-
-**Schema migrations** are guarded by `PRAGMA user_version`. Each version block is idempotent.
-Forward-compat guard returns `SearchError::Database` when stored version exceeds `CURRENT_VERSION`.
-
-**Current schema version is 2.** Version 1 created the four base tables. Version 2 adds three
-performance indexes: `idx_hotspot_score ON hotspot(score)`, `idx_risk_score ON risk(risk_score)`,
-`idx_cochange_file_b ON cochange(file_b)`. Existing v1 databases are migrated automatically.
-
-**Atomic sync:** `TemporalDb::sync(hotspots, risks, cochanges, git_head)` atomically replaces all
-four tables in one transaction. Readers never see partially-refreshed state.
-
-**Row types** (`HotspotRow`, `RiskRow`, `CochangeRow`) use `i64` column types even though
-`FileTemporalStats` uses `u32` — SQLite's integer affinity is signed.
-
-## Per-File Lookup API
-
-- `hotspot_for_file(path: &str) -> Result<Option<HotspotRow>>` — `None` on miss, not an error
-- `risk_for_file(path: &str) -> Result<Option<RiskRow>>` — same `None`-on-miss contract
-- `cochanges_for_file(path: &str) -> Result<Vec<CochangeRow>>` — bidirectional: queries both
-  `file_a = ?1 OR file_b = ?1`; sorted by `jaccard DESC`; uses `idx_cochange_file_b` for `file_b`
-
-These methods are the preferred interface for search-time enrichment when only one file's data is
-needed. Avoid `load_hotspots()` / `load_risks()` / `load_cochanges()` for per-file lookups.
-
-## Top-N Query API
-
-- `top_hotspots(limit: usize) -> Result<Vec<HotspotRow>>` — highest score first
-- `top_risks(limit: usize) -> Result<Vec<RiskRow>>` — highest `risk_score` first
-- `top_coldspots(limit: usize) -> Result<Vec<HotspotRow>>` — lowest score first (stable files)
-
-All three return an empty `Vec` for an empty table.
-
-## SearchQuery file_filter Field (blast-radius)
-
-`SearchQuery` carries `file_filter: Option<HashSet<FileId>>`. When `Some`, the search layer
-restricts scoring to only those `FileId`s. This is the blast-radius pre-filtering mechanism:
-caller resolves co-change partners via `cochanges_for_file`, maps paths to `FileId`s, populates
-the set, and attaches it to the query.
-
-The field is `#[serde(skip)]` — not round-tripped through JSON. `SearchQuery::new` initializes it
-to `None`. Triggered via `skim search --blast-radius FILE` CLI flag.
-
-## Integration with TemporalSource
-
-`GixSource` implements `TemporalSource`:
+### `compute_file_temporal_stats`
 
 ```rust
-fn parse_history(&self, repo_path: &Path, lookback_days: u32) -> Result<HistoryResult>;
+pub fn compute_file_temporal_stats(
+    commits: &[CommitInfo],
+    now_epoch: u64,
+) -> HashMap<String, FileTemporalStats>
 ```
 
-`HistoryResult` contains `commits: Vec<CommitInfo>` (newest-first) and
-`metadata: TemporalMetadata` (includes `is_shallow` for shallow clone detection).
-`lookback_days = 0` means "all history". `GixSource` is stateless — trivially `Send + Sync`.
+A lighter variant that computes raw commit counts (`changes_30d`, `changes_90d`, `total_commits`) without decay weighting. Used by callers that need raw frequency counts, not weighted scores.
 
-## Determinism Contract
+### `decay_weight`
 
-`compute_file_risk_scores` and `compute_file_temporal_stats` are deterministic: same inputs
-produce identical outputs. The test `deterministic_results` calls `compute_file_risk_scores` 50
-times and asserts equality to `1e-9` precision. Always accept `now_epoch: u64` as a parameter —
-never call `SystemTime::now()` inside scoring functions.
+```rust
+pub fn decay_weight(elapsed_days: f64, half_life_days: f64) -> f64
+```
 
-## Anti-Patterns
+Pure function: `2_f64.powf(-elapsed_days / half_life_days)`. No clamping — caller responsible for ensuring `elapsed_days >= 0.0`.
 
-- **Reading the system clock inside scoring functions** — breaks determinism.
-- **Calling `is_fix_commit` inside the per-file loop** — pre-classification exists to prevent
-  this. One regex eval per commit, not one per (commit × file).
-- **Using a custom regex instead of `is_fix_commit`** — the LazyLock regex is the single source
-  of truth for fix classification.
-- **Treating `fix_density = 1.0` as definitive "buggy file"** — weight by hotspot first.
-- **Skipping the capacity heuristic** — use `(commits.len() / 4).clamp(64, 50_000)`.
-- **Using individual `store_*` methods when all three tables must be consistent** — call `sync`.
-- **Leaking rusqlite types through the storage boundary** — all errors converted via `db_err`.
-- **Opening `TemporalDb` from multiple threads and sharing it** — not `Sync`; open per-thread.
-- **Using `load_hotspots()` / `load_risks()` for per-file enrichment** — use point-query methods.
+## SQLite Persistence Layer (`TemporalDb`)
 
-## Gotchas
+### Database Location
 
-- `decay_weight` panics in debug builds when `half_life_days <= 0.0` (`debug_assert!`).
-- Hotspot formula normalizes against the in-batch maximum — not a historical maximum. Two calls
-  with different `commits` slices produce incomparable absolute scores.
-- `FileChangeInfo.additions` and `.deletions` are always `0` from `GixSource` — blob-level line
-  counting is skipped for performance.
-- File paths stored as `String` via lossy UTF-8 — non-UTF-8 paths get replacement characters.
-- Empty `commits` slice returns an empty `HashMap`, not a `SearchError`.
-- `HotspotRow.changes_30d` is `i64` (SQLite), not `u32`. Cast `u32 as i64` is lossless; reverse
-  needs a guard.
-- Schema version is in `PRAGMA user_version`, not in the `meta` table.
-- `cochanges_for_file` queries `file_a = ?1 OR file_b = ?1`. The `idx_cochange_file_b` index
-  covers `file_b`; the composite PK covers `file_a`. Verify with `EXPLAIN QUERY PLAN` if adding
-  a filter-only-on-`file_b` query.
-- `top_hotspots` / `top_risks` / `top_coldspots` cast `limit: usize` to `i64` for `LIMIT` — do
-  not pass `usize::MAX` as a "no limit" sentinel.
-- `storage_perf_tests.rs` tests are gated on `#[cfg(not(debug_assertions))]` to avoid slow runs
-  in debug mode. They will not appear in `cargo test --debug`.
+`temporal.db` lives at `{cache_dir}/temporal.db` — not in the project's `.skim/search.db`. The temporal signals and the co-change data share this database file; the search index (`search.db`) is separate and in the project root.
+
+### Schema
+
+Three tables:
+
+```sql
+CREATE TABLE hotspot (
+    file_path  TEXT PRIMARY KEY,
+    score      REAL NOT NULL,
+    changes_30d  INTEGER NOT NULL,
+    changes_90d  INTEGER NOT NULL
+);
+
+CREATE TABLE risk (
+    file_path    TEXT PRIMARY KEY,
+    risk_score   REAL NOT NULL,
+    total_commits INTEGER NOT NULL,
+    fix_commits  INTEGER NOT NULL,
+    fix_density  REAL NOT NULL
+);
+
+CREATE TABLE cochange (
+    file_a  TEXT NOT NULL,
+    file_b  TEXT NOT NULL,
+    count   INTEGER NOT NULL,
+    jaccard REAL    NOT NULL,
+    PRIMARY KEY (file_a, file_b)
+);
+
+CREATE TABLE meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+```
+
+Performance indexes (added in schema v2):
+```sql
+CREATE INDEX IF NOT EXISTS idx_hotspot_score ON hotspot(score DESC);
+CREATE INDEX IF NOT EXISTS idx_risk_score    ON risk(risk_score DESC);
+CREATE INDEX IF NOT EXISTS idx_cochange_file_a ON cochange(file_a);
+CREATE INDEX IF NOT EXISTS idx_cochange_file_b ON cochange(file_b);
+```
+
+These indexes make `top_hotspots(N)`, `top_risks(N)`, `top_coldspots(N)` efficient without full table scans.
+
+### Schema Migrations
+
+Migrations are forward-only, driven by `PRAGMA user_version`:
+- Each version gate runs `if schema_version < N { apply_migration_N(); set_version(N); }`
+- Databases at a higher version than the binary knows about return `SearchError::Database("unsupported schema version N")`
+
+Current version is **v2** (v1: tables, v2: performance indexes).
+
+### `TemporalDb::sync`
+
+```rust
+pub fn sync(
+    &self,
+    hotspots: &[HotspotRow],
+    risks: &[RiskRow],
+    cochanges: &[CochangeRow],
+    git_head: &str,
+) -> Result<()>
+```
+
+Atomically replaces all three tables in a single transaction: DELETE + batch INSERT for hotspot, risk, and cochange. Also writes `git_head` to the `meta` table. This is the preferred way to update all signals together — it ensures no partial state is visible.
+
+### Point Queries
+
+| Method | Description |
+|--------|-------------|
+| `hotspot_for_file(path)` | Single-file hotspot lookup — `Option<HotspotRow>` |
+| `risk_for_file(path)` | Single-file risk lookup — `Option<RiskRow>` |
+| `cochanges_for_file(path)` | All co-change pairs for a file — `Vec<CochangeRow>` |
+
+### Bulk Queries (Index-Backed)
+
+| Method | Description |
+|--------|-------------|
+| `top_hotspots(limit)` | Top N by `score DESC` |
+| `top_risks(limit)` | Top N by `risk_score DESC` |
+| `top_coldspots(limit)` | Top N by `score ASC` (lowest hotspot = coldest) |
+
+### Load / Store (Non-atomic)
+
+`store_hotspots`, `store_risks`, `store_cochanges` each do DELETE + batch INSERT for their respective table only. Use `sync` for atomic multi-table updates; use the individual store methods only for single-table updates.
+
+`load_hotspots`, `load_risks`, `load_cochanges` return full table contents as `Vec<Row>` — no limit parameter.
+
+## WAL Mode
+
+`TemporalDb::open` sets `PRAGMA journal_mode=WAL` and `PRAGMA synchronous=NORMAL` on each connection. WAL mode allows concurrent readers while a write is in progress. `TemporalDb` is **not `Sync`** — each thread must open its own connection.
 
 ## Key Files
 
-- `crates/rskim-search/src/temporal/scoring.rs` — pure scoring: `decay_weight`,
-  `compute_file_risk_scores`, `compute_file_temporal_stats`, `DEFAULT_HALF_LIFE_DAYS`
-- `crates/rskim-search/src/temporal/mod.rs` — `FIX_REGEX` LazyLock, `is_fix_commit`, re-exports
-- `crates/rskim-search/src/temporal/git_parser.rs` — `GixSource` I/O implementation
-- `crates/rskim-search/src/temporal/scoring_tests.rs` — deterministic unit tests
-- `crates/rskim-search/src/temporal/storage.rs` — `TemporalDb` struct, `open`, migrations (v2)
-- `crates/rskim-search/src/temporal/storage_ops.rs` — all CRUD, point-query, and top-N methods
-- `crates/rskim-search/src/temporal/storage_tests.rs` — CRUD + migration + per-file lookup tests
-- `crates/rskim-search/src/temporal/storage_perf_tests.rs` — performance regression tests
-- `crates/rskim-search/src/temporal/storage_types.rs` — `HotspotRow`, `RiskRow`, `CochangeRow`
-- `crates/rskim-search/src/types.rs` — `FileRiskScores`, `FileTemporalStats`, `CommitInfo`,
-  `HistoryResult`, `TemporalSource`, `SearchError::Database`, `SearchError::AstError`,
-  `SearchQuery` (includes `file_filter: Option<HashSet<FileId>>`)
-- `crates/rskim-search/src/lib.rs` — public crate re-exports; also exposes `pub mod ast_index`.
-  As of Wave 3d (#194) the `ast_index` re-export block adds `AstIndexBuilder`, `AstIndexReader`,
-  `AstPosting`, and `AstFileMetaEntry` (the on-disk structural index store). This is additive only
-  — the temporal scoring and `TemporalDb` re-exports are unchanged.
+- `crates/rskim-search/src/temporal/scoring.rs` — `decay_weight`, `compute_file_risk_scores`, `compute_file_temporal_stats`; `FileRiskScores`, `FileTemporalStats` structs
+- `crates/rskim-search/src/temporal/scoring_tests.rs` — unit tests for decay formula and file score aggregation
+- `crates/rskim-search/src/temporal/mod.rs` — public re-exports; `is_fix_commit` keyword classifier
+- `crates/rskim-search/src/temporal/git_parser.rs` — `GixSource` (gix-based git history reader producing `HistoryResult`)
+- `crates/rskim-search/src/temporal/storage.rs` — `TemporalDb` struct, `open`, `schema_version`, migration runner
+- `crates/rskim-search/src/temporal/storage_ops.rs` — all query and mutation methods for `TemporalDb` (impl block continues from storage.rs)
+- `crates/rskim-search/src/temporal/storage_types.rs` — `HotspotRow`, `RiskRow`, `CochangeRow` row structs
+- `crates/rskim-search/src/temporal/storage_tests.rs` — integration tests against in-memory SQLite
+- `crates/rskim-search/src/temporal/storage_perf_tests.rs` — performance benchmarks for top-N and per-file queries
+- `crates/rskim-search/src/types.rs` — `CommitInfo`, `FileChangeInfo`, `HistoryResult`, `FileId`, `SearchError`
+- `crates/rskim-search/src/lib.rs` — re-exports `TemporalDb`, `HotspotRow`, `RiskRow`, `CochangeRow` as public crate API
+
+## Anti-Patterns
+
+- **Using raw `hotspot_score` from `compute_file_risk_scores` without max-normalization**: the returned score is a raw decay-weighted sum, not `[0.0, 1.0]`. Always max-normalize before storing as `HotspotRow.score`.
+- **Opening `temporal.db` as `Sync`**: `TemporalDb` is `!Sync`. For concurrent access, open multiple instances against the same WAL-mode database file.
+- **Using individual `store_*` methods for a full signal refresh**: use `sync` to atomically replace all three tables in one transaction. Individual stores leave the database in a partially-updated state.
+- **Treating `top_coldspots` as semantically meaningful on a sparse database**: cold spots (low hotspot score) are only meaningful if the database contains data for all project files. If only hot files were indexed, `top_coldspots` returns nothing useful.
+
+## Gotchas
+
+- `compute_file_risk_scores` per-deduplicates changed files within each commit via `dedup_changed_files` (private helper). Without this, a commit with renames would count the same file twice.
+- Schema version mismatch returns `SearchError::Database(...)`, not `IndexCorrupted`. Rebuild by deleting `temporal.db`.
+- `top_coldspots` returns rows sorted by `score ASC` — not the inverse of `top_hotspots` sort, but an explicit ascending sort. Files with score 0.0 come first.
+- The `meta` table stores arbitrary key-value strings; `git_head` is the only key written by `TemporalDb::sync`. Future callers may add their own keys without schema migration.
+- `changes_30d` and `changes_90d` are raw counts — they are NOT decay-weighted and do NOT correlate with `score`. A file may have `score = 0.9` but `changes_30d = 0` if all its commits were just outside the 30-day window.
 
 ## Related
 
-- Feature knowledge: `cochange` — the co-change matrix module also consumes `CommitInfo` and
-  `FileChangeInfo`. `CochangeRow` is stored by `TemporalDb::sync`. `cochanges_for_file` bridges
-  the persistence layer to the `file_filter` blast-radius filtering in `SearchQuery`.
-- `crates/rskim-search/src/types.rs` — shared types connecting I/O, scoring, storage, and search
-- ADR-001: Fix all noticed issues immediately — `SearchError::AstError` was added to cover grammar
-  load failures surfaced during ast_index work; added immediately rather than deferred
+- `crates/rskim-search/src/cochange/` — sibling module; both consume `HistoryResult`; co-change data shares the same `temporal.db` file via the `cochange` table
+- `crates/rskim-search/src/types.rs` — `HistoryResult`, `CommitInfo`, `FileId`, `SearchError`
+- Temporal CLI flags: `skim search --hot`, `--cold`, `--risky`, `--blast-radius FILE` — all backed by `TemporalDb` queries at search time
