@@ -91,7 +91,7 @@
         "crates/rskim-search/src/lib.rs",
         "crates/rskim-search/benches/ast_index_bench.rs"
       ],
-      "lastUpdated": "2026-06-04T20:40:57.418Z",
+      "lastUpdated": "2026-06-05T10:05:57.000Z",
       "createdBy": "implement"
     }
   }

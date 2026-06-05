@@ -1,0 +1,10 @@
+{
+  "userSignals": "[\"<task-notification>\\n<task-id>bzg4cnf4z</task-id>\\n<tool-use-id>toolu_01KkvpW4W7Foa7jxgqiZ5RfE</tool-use-id>\\n<output-file>/private/tmp/claude-501/-Users-dean-Sandbox-skim-search/0f82ead3-d024-4c5c-9f99-e8bbca699965/tasks/bzg4cnf4z.output</output-file>\\n<status>completed</status>\\n<summary>Background command \\\"Poll CI checks until complete (bounded 10x60s)\\\" completed (exit code 0)</summary>\\n</task-notification>\"]",
+  "existingObservationIds": [
+    "obs_pr9kv2",
+    "obs_m7xw4n",
+    "obs_hz3r5t",
+    "obs_snyk8q"
+  ],
+  "timestamp": 1780643157
+}

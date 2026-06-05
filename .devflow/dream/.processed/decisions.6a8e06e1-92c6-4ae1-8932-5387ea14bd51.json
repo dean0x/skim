@@ -1,0 +1,15 @@
+{
+  "dialogPairs": "[{\"prior\":\"The CI poll is running in the background (bounded to 10 × 60s). I'll report the final resolution outcome once it completes. Here's where things stand:\\n\\n## Resolution Summary — PR #272 (Wave 3d AST index store)\\n\\n**Branch**: `feature/194-wave-3d-ast-index-store` → main · **Reviews processed**: 11 reports + synthesis from `2026-06-05_0025`\\n\\n### Results\\n| Outcome | Count |\\n|---------|-------|\\n| ✅ Fixed | 15 |\\n| ⚪ False Positive | 1 |\\n| ⏸️ Tech Debt | 0 |\\n| 🚫 Blocked | 0 |\\n\\nAll 3 priority items resolved (1 HIGH blocking visibility, 1 CRITICAL doc-contract, 1 HIGH test gap) plus all 12 MEDIUM/suggestion items. Per ADR-001, nothing was deferred.\\n\\n### Highlights\\n- **Visibility**: `pub mod builder/reader` → private + `pub use` (parity with lexical/cochange siblings)\\n- **New integrity check**: O(n) allocation-free `doc_id` monotonicity validation in `lookup_postings_generic` → `IndexCorrupted` on hostile-but-CRC-valid files (closes the security/reliability gap)\\n- **7 new C3 corruption tests** (CRC-recomputed): OOB offset, slice overflow, misaligned length, non-ascending doc_ids — the previously dead-untested reader bounds paths, sanity-checked as non-vacuous\\n- **Renames**: `AST_` const pref\",\"user\":\"<task-notification>\\n<task-id>bzg4cnf4z</task-id>\\n<tool-use-id>toolu_01KkvpW4W7Foa7jxgqiZ5RfE</tool-use-id>\\n<output-file>/private/tmp/claude-501/-Users-dean-Sandbox-skim-search/0f82ead3-d024-4c5c-9f99-e8bbca699965/tasks/bzg4cnf4z.output</output-file>\\n<status>completed</status>\\n<summary>Background command \\\"Poll CI checks until complete (bounded 10x60s)\\\" completed (exit code 0)</summary>\\n</task-notification>\"}]",
+  "existingObservationIds": [
+    "obs_wk7v3a",
+    "obs_n4bq8x",
+    "obs_dj6m2p",
+    "obs_tq5b9r",
+    "obs_kp2v7n",
+    "obs_r8m2wq",
+    "obs_v7n3px",
+    "obs_a16x3g",
+    "obs_acqv8m"
+  ],
+  "timestamp": 1780643157
+}

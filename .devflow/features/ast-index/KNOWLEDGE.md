@@ -19,7 +19,7 @@ referencedFiles:
   - crates/rskim-search/src/lib.rs
   - crates/rskim-search/benches/ast_index_bench.rs
 created: 2026-06-01
-updated: 2026-06-04
+updated: 2026-06-05
 ---
 
 # AST Index (CST Linearization + N-gram Encoding + On-Disk Store)
