@@ -11,7 +11,6 @@ use crate::{
     ast_index::{
         AstBigram, AstBigramEntry, AstNgramSet, AstTrigram, AstTrigramEntry, DEFAULT_AST_WEIGHT,
     },
-    index::lang_map::lang_from_id,
 };
 use rskim_core::Language;
 
@@ -136,31 +135,63 @@ fn a3_absent_trigram_returns_empty() {
 }
 
 // ============================================================================
-// A5/C6: lang_id recovery
+// A5/C6: lang_id recovery via the public `language()` accessor
 // ============================================================================
 
+/// C6 happy-path: `file_meta(i).language()` returns the language the file was
+/// indexed under.  This test exercises the public accessor documented in C6,
+/// not the internal `lang_from_id` helper.
 #[test]
 fn a5_lang_recovery_from_file_meta() {
     let (_, reader) = build_3_file_index();
 
-    let meta0 = reader.file_meta(0).unwrap();
-    let meta1 = reader.file_meta(1).unwrap();
-    let meta2 = reader.file_meta(2).unwrap();
-
+    // Retrieve through the public C6 accessor, not the internal helper.
     assert_eq!(
-        lang_from_id(meta0.lang_id),
+        reader.file_meta(0).unwrap().language(),
         Some(Language::Rust),
-        "file 0 should be Rust"
+        "file 0 should be Rust via .language()"
     );
     assert_eq!(
-        lang_from_id(meta1.lang_id),
+        reader.file_meta(1).unwrap().language(),
         Some(Language::Python),
-        "file 1 should be Python"
+        "file 1 should be Python via .language()"
     );
     assert_eq!(
-        lang_from_id(meta2.lang_id),
+        reader.file_meta(2).unwrap().language(),
         Some(Language::Go),
-        "file 2 should be Go"
+        "file 2 should be Go via .language()"
+    );
+}
+
+/// C6 None-path: an `AstFileMetaEntry` with an out-of-range `lang_id` must
+/// return `None` from `.language()` — this is the future-compat path documented
+/// in C6 (an index built by a newer binary may store IDs the current binary does
+/// not recognise).
+#[test]
+fn a5_lang_recovery_unrecognised_lang_id_returns_none() {
+    use super::super::format::AstFileMetaEntry;
+
+    // 255 is not assigned in lang_map; it exercises the `_ => None` arm.
+    let entry = AstFileMetaEntry {
+        lang_id: 255,
+        node_count: 0,
+    };
+    assert_eq!(
+        entry.language(),
+        None,
+        "unrecognised lang_id 255 should return None from .language()"
+    );
+
+    // A value just past the current highest assigned ID (16 = Yaml) also
+    // exercises the same None arm, guarding against a future off-by-one.
+    let entry2 = AstFileMetaEntry {
+        lang_id: 17,
+        node_count: 0,
+    };
+    assert_eq!(
+        entry2.language(),
+        None,
+        "unrecognised lang_id 17 should return None from .language()"
     );
 }
 
@@ -205,6 +236,73 @@ fn a7_empty_corpus_lookup_returns_empty() {
     assert!(reader.lookup_bigram(AstBigram(1)).unwrap().is_empty());
     assert!(reader.lookup_trigram(AstTrigram(1)).unwrap().is_empty());
     assert_eq!(reader.file_count(), 0);
+}
+
+// ============================================================================
+// A8: Multi-language round-trip (Issue 6)
+//
+// Builds an index spanning 5 languages — Rust, Python, Go, Kotlin, Java —
+// covering both common and less-common variants.  Asserts that:
+//   (a) `file_meta(i).language()` returns the expected language for each file.
+//   (b) postings for a bigram emitted by one language are independently
+//       retrievable (the n-gram data is not silently corrupted).
+//
+// `lang_map` is shared with the lexical index.  A regression in any of the 17
+// language IDs would surface here rather than only in tests for the three
+// languages covered by the fixture.
+// ============================================================================
+
+#[test]
+fn a8_multi_language_round_trip() {
+    let dir = tempdir().unwrap();
+    let bigram_key: u32 = 0x0001_0002;
+
+    let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+
+    // Five languages covering common (Rust, Python, Go) and less-common
+    // (Kotlin, Java) variants.  Each file gets the same bigram key so we can
+    // verify per-file postings are independently correct.
+    let languages = [
+        Language::Rust,
+        Language::Python,
+        Language::Go,
+        Language::Kotlin,
+        Language::Java,
+    ];
+
+    for (i, &lang) in languages.iter().enumerate() {
+        let set = make_bigram_set(bigram_key, (i as u32) + 1);
+        builder
+            .add_file_ngrams(FileId(i as u32), lang, &set, 10)
+            .unwrap();
+    }
+
+    let reader = builder.build().unwrap();
+
+    // (a) Language round-trip via the public C6 accessor.
+    for (i, &expected_lang) in languages.iter().enumerate() {
+        assert_eq!(
+            reader.file_meta(i as u32).unwrap().language(),
+            Some(expected_lang),
+            "file {i} language mismatch: expected {expected_lang:?}"
+        );
+    }
+
+    // (b) Postings are independently retrievable and carry the correct counts.
+    let postings = reader.lookup_bigram(AstBigram(bigram_key)).unwrap();
+    assert_eq!(
+        postings.len(),
+        languages.len(),
+        "expected one posting per file"
+    );
+    for (i, posting) in postings.iter().enumerate() {
+        assert_eq!(posting.doc_id, i as u32, "posting doc_id mismatch at {i}");
+        assert_eq!(
+            posting.count,
+            (i as u32) + 1,
+            "posting count mismatch at {i}"
+        );
+    }
 }
 
 // ============================================================================

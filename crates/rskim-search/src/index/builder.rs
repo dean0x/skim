@@ -8,11 +8,8 @@
 //! cleanly with a "file not found" rather than a corrupt read.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-
-use tempfile::NamedTempFile;
-
 use std::ops::Range;
+use std::path::PathBuf;
 
 use super::format::{
     FILE_META_SIZE, FORMAT_VERSION, FileMetaEntry, POSTING_ENTRY_SIZE, PostingEntry,
@@ -20,7 +17,10 @@ use super::format::{
     encode_file_meta, encode_header, encode_posting, lang_to_id,
 };
 use super::reader::NgramIndexReader;
-use crate::{FIELD_COUNT, FileId, LayerBuilder, Result, SearchError, SearchField, SearchLayer};
+use crate::{
+    FIELD_COUNT, FileId, LayerBuilder, Result, SearchError, SearchField, SearchLayer,
+    io_util::atomic_write,
+};
 
 // ============================================================================
 // Public builder struct
@@ -73,23 +73,6 @@ impl NgramIndexBuilder {
             total_doc_length: 0,
             total_field_lengths: [0u64; FIELD_COUNT],
         })
-    }
-
-    // -----------------------------------------------------------------------
-    // Private helpers
-    // -----------------------------------------------------------------------
-
-    /// Atomically write `data` to `path` using a temp file in the same directory.
-    ///
-    /// Creates a named temp file in `dir`, writes all data, then persists (renames)
-    /// it to `path`.  On most platforms the rename is atomic, preventing readers
-    /// from observing a partial write.
-    fn atomic_write(dir: &Path, path: &Path, data: &[u8]) -> Result<()> {
-        let mut tmp = NamedTempFile::new_in(dir)?;
-        use std::io::Write as _;
-        tmp.write_all(data)?;
-        tmp.persist(path).map_err(|e| e.error)?;
-        Ok(())
     }
 }
 
@@ -245,7 +228,7 @@ impl LayerBuilder for NgramIndexBuilder {
     /// Finalise the builder: serialise the index to disk and return a reader.
     ///
     /// Write order: `.skpost` first, then `.skidx` (commit point).  Both files
-    /// are written atomically via [`Self::atomic_write`].
+    /// are written atomically via [`crate::io_util::atomic_write`].
     ///
     /// # Errors
     ///
@@ -283,8 +266,8 @@ impl LayerBuilder for NgramIndexBuilder {
         let idx_path = self.output_dir.join("index.skidx");
 
         // Atomic writes: .skpost first, .skidx second (commit point).
-        Self::atomic_write(&self.output_dir, &post_path, &postings_buf)?;
-        Self::atomic_write(&self.output_dir, &idx_path, &skidx_buf)?;
+        atomic_write(&self.output_dir, &post_path, &postings_buf)?;
+        atomic_write(&self.output_dir, &idx_path, &skidx_buf)?;
 
         let reader = NgramIndexReader::open(&self.output_dir)?;
         Ok(Box::new(reader))

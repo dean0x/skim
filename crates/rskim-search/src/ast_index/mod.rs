@@ -32,7 +32,7 @@
 mod extract;
 mod linearize;
 mod ngram;
-pub mod store;
+mod store;
 
 // ============================================================================
 // Shared type alias

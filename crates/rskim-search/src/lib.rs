@@ -26,6 +26,7 @@ pub mod ast_weights;
 pub mod cochange;
 pub(crate) mod fields;
 pub mod index;
+pub(crate) mod io_util;
 pub mod lexical;
 pub mod ngram;
 pub mod temporal;

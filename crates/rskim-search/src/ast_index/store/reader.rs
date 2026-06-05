@@ -104,6 +104,39 @@ impl std::fmt::Debug for AstIndexReader {
 // a generic bound: `fn assert_send_sync<T: Send + Sync>() {}`.
 
 impl AstIndexReader {
+    // -----------------------------------------------------------------------
+    // Private layout helpers — single source of truth for section offsets.
+    // -----------------------------------------------------------------------
+
+    /// Byte range of the bigram table within `idx_mmap`: `[48 .. 48 + bigram_bytes)`.
+    ///
+    /// Safety: `open()` validates `idx_mmap.len() == expected_idx_size` using
+    /// checked arithmetic before constructing a reader, so
+    /// `bigram_count * BIGRAM_ENTRY_SIZE` is guaranteed not to overflow.
+    /// The `saturating_mul` / `saturating_add` here are belt-and-suspenders
+    /// guards that produce a coherent (shrunk) range rather than panicking
+    /// if the struct were somehow constructed with out-of-range counts.
+    fn bigram_table_range(&self) -> std::ops::Range<usize> {
+        let bigram_bytes = (self.header.bigram_count as usize).saturating_mul(BIGRAM_ENTRY_SIZE);
+        HEADER_SIZE..HEADER_SIZE.saturating_add(bigram_bytes)
+    }
+
+    /// Byte range of the trigram table: `[bigram_end .. bigram_end + trigram_bytes)`.
+    fn trigram_table_range(&self) -> std::ops::Range<usize> {
+        let bigram_end = self.bigram_table_range().end;
+        let trigram_bytes = (self.header.trigram_count as usize).saturating_mul(TRIGRAM_ENTRY_SIZE);
+        bigram_end..bigram_end.saturating_add(trigram_bytes)
+    }
+
+    /// Byte offset where the file-meta section starts (= trigram_table end).
+    fn meta_start(&self) -> usize {
+        self.trigram_table_range().end
+    }
+
+    // -----------------------------------------------------------------------
+    // Construction
+    // -----------------------------------------------------------------------
+
     /// Open an existing AST index from `dir`.
     ///
     /// Validates magic bytes, format version, file sizes, and the CRC32
@@ -241,9 +274,7 @@ impl AstIndexReader {
     ///
     /// Returns [`SearchError::IndexCorrupted`] if `file_index` is out of bounds.
     pub fn file_meta(&self, file_index: u32) -> Result<AstFileMetaEntry> {
-        let bigram_bytes = (self.header.bigram_count as usize) * BIGRAM_ENTRY_SIZE;
-        let trigram_bytes = (self.header.trigram_count as usize) * TRIGRAM_ENTRY_SIZE;
-        let meta_start = HEADER_SIZE + bigram_bytes + trigram_bytes;
+        let meta_start = self.meta_start();
         let offset = meta_start + (file_index as usize) * FILE_META_SIZE;
         let end = offset
             .checked_add(FILE_META_SIZE)
@@ -273,9 +304,8 @@ impl AstIndexReader {
     ///
     /// Returns [`SearchError::IndexCorrupted`] if the posting data is malformed.
     pub fn lookup_bigram(&self, bigram: AstBigram) -> Result<Vec<AstPosting>> {
-        let bigram_start = HEADER_SIZE;
-        let bigram_end = bigram_start + (self.header.bigram_count as usize) * BIGRAM_ENTRY_SIZE;
-        let entries_data = &self.idx_mmap[bigram_start..bigram_end];
+        let bigram_range = self.bigram_table_range();
+        let entries_data = &self.idx_mmap[bigram_range];
 
         let entry = match lookup_bigram(entries_data, bigram.key())? {
             Some(e) => e,
@@ -296,9 +326,8 @@ impl AstIndexReader {
     ///
     /// Returns [`SearchError::IndexCorrupted`] if the posting data is malformed.
     pub fn lookup_trigram(&self, trigram: AstTrigram) -> Result<Vec<AstPosting>> {
-        let trigram_start = HEADER_SIZE + (self.header.bigram_count as usize) * BIGRAM_ENTRY_SIZE;
-        let trigram_end = trigram_start + (self.header.trigram_count as usize) * TRIGRAM_ENTRY_SIZE;
-        let entries_data = &self.idx_mmap[trigram_start..trigram_end];
+        let trigram_range = self.trigram_table_range();
+        let entries_data = &self.idx_mmap[trigram_range];
 
         let entry = match lookup_trigram(entries_data, trigram.key())? {
             Some(e) => e,

@@ -35,10 +35,9 @@
 //! then merges postings sequentially via `add_file_ngrams`.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use rayon::prelude::*;
-use tempfile::NamedTempFile;
 
 use super::format::{
     AstBigramTableEntry, AstFileMetaEntry, AstPostingEntry, AstSkidxHeader, AstTrigramTableEntry,
@@ -50,6 +49,7 @@ use super::reader::AstIndexReader;
 use crate::{
     FileId, Result, SearchError,
     ast_index::{AstNgramSet, extract_ast_ngrams, linearize_source},
+    io_util::atomic_write,
 };
 
 /// Constructs the two-file mmap'd AST structural n-gram index.
@@ -83,6 +83,30 @@ pub struct AstIndexBuilder {
     total_distinct_bigrams: u64,
     /// Sum of distinct trigram counts per file (for avg_trigram_count).
     total_distinct_trigrams: u64,
+}
+
+// ============================================================================
+// Private helpers
+// ============================================================================
+
+/// Validate that a single n-gram entry has `count >= 1`.
+///
+/// Returns [`SearchError::InvalidQuery`] if `count == 0`.  Called once per
+/// bigram and once per trigram entry in [`AstIndexBuilder::add_file_ngrams`].
+#[inline]
+fn check_count_nonzero(
+    file_id: u32,
+    key: impl std::fmt::LowerHex,
+    count: u32,
+    kind: &str,
+) -> Result<()> {
+    if count == 0 {
+        return Err(SearchError::InvalidQuery(format!(
+            "{kind} entry for FileId {file_id} has count == 0 (key {key:#x}); \
+             every AstNgramSet entry must have count >= 1",
+        )));
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -232,7 +256,13 @@ impl AstIndexBuilder {
         self.seen_file_ids.insert(id.0);
 
         // ── Merge bigram postings ────────────────────────────────────────────
+        // Validate count >= 1 at the build boundary (aligns with reader C4 which
+        // rejects count == 0 in decode_posting).  A zero-count entry builds fine
+        // but makes every lookup fail with IndexCorrupted — a deferred trap that
+        // is hard to diagnose.  Catching it here converts the error to an
+        // immediate, located build-time failure.
         for entry in &set.bigrams {
+            check_count_nonzero(id.0, entry.ngram.key(), entry.count, "bigram")?;
             self.bigram_postings
                 .entry(entry.ngram.key())
                 .or_default()
@@ -244,6 +274,7 @@ impl AstIndexBuilder {
 
         // ── Merge trigram postings ───────────────────────────────────────────
         for entry in &set.trigrams {
+            check_count_nonzero(id.0, entry.ngram.key(), entry.count, "trigram")?;
             self.trigram_postings
                 .entry(entry.ngram.key())
                 .or_default()
@@ -260,9 +291,15 @@ impl AstIndexBuilder {
         });
 
         // ── Accumulate totals ────────────────────────────────────────────────
-        self.total_node_count += u64::from(node_count);
-        self.total_distinct_bigrams += set.bigrams.len() as u64;
-        self.total_distinct_trigrams += set.trigrams.len() as u64;
+        // Use saturating_add for parity with file_count's checked_add discipline
+        // (PF-004 analogue: no silent overflow in arithmetic accumulation).
+        self.total_node_count = self.total_node_count.saturating_add(u64::from(node_count));
+        self.total_distinct_bigrams = self
+            .total_distinct_bigrams
+            .saturating_add(set.bigrams.len() as u64);
+        self.total_distinct_trigrams = self
+            .total_distinct_trigrams
+            .saturating_add(set.trigrams.len() as u64);
 
         self.file_count = self.file_count.checked_add(1).ok_or_else(|| {
             SearchError::IndexCorrupted("file_count overflow: too many files".into())
@@ -366,14 +403,15 @@ impl AstIndexBuilder {
     /// Finalise the builder: serialise the index to disk and return a reader.
     ///
     /// Write order: `ast_index.skpost` first, then `ast_index.skidx` (commit
-    /// point).  Both files are written atomically via `NamedTempFile`.
+    /// point).  Both files are written atomically via
+    /// [`crate::io_util::atomic_write`].
     ///
     /// # Errors
     ///
     /// Returns [`SearchError::Io`] if writing fails, or
     /// [`SearchError::IndexCorrupted`] on overflow or if the reader rejects the
     /// result.
-    pub fn build(mut self) -> Result<AstIndexReader> {
+    pub fn build(self) -> Result<AstIndexReader> {
         // ── Corpus averages ──────────────────────────────────────────────────
         let (avg_bigram_count, avg_trigram_count, avg_node_count) = if self.file_count == 0 {
             (0.0f32, 0.0f32, 0.0f32)
@@ -386,13 +424,33 @@ impl AstIndexBuilder {
             )
         };
 
-        // ── Sort posting lists by doc_id ─────────────────────────────────────
-        // One posting per FileId per key (builder invariant: no count-merge).
-        for list in self.bigram_postings.values_mut() {
-            list.sort_unstable_by_key(|p| p.doc_id);
-        }
-        for list in self.trigram_postings.values_mut() {
-            list.sort_unstable_by_key(|p| p.doc_id);
+        // ── Assert posting lists are already ascending by doc_id ─────────────
+        // The sequential-FileId invariant (enforced in add_file_ngrams via the
+        // `id.0 == file_count` guard) guarantees that doc_ids are pushed in
+        // strictly increasing order per posting list.  No sort is needed.
+        // This replaces the previous `sort_unstable_by_key` no-op that scaled
+        // O(distinct_keys × files) for large corpora.
+        //
+        // NOTE: build_from_files parallelises extraction but merges sequentially
+        // in FileId order (the rayon par_iter collects into a Vec indexed by
+        // position, then iterates in order).  The invariant therefore holds for
+        // both add_file_ngrams and build_from_files callers.
+        #[cfg(debug_assertions)]
+        {
+            for list in self.bigram_postings.values() {
+                debug_assert!(
+                    list.windows(2).all(|w| w[0].doc_id < w[1].doc_id),
+                    "bigram posting list must be ascending by doc_id \
+                     (sequential FileId invariant violated)"
+                );
+            }
+            for list in self.trigram_postings.values() {
+                debug_assert!(
+                    list.windows(2).all(|w| w[0].doc_id < w[1].doc_id),
+                    "trigram posting list must be ascending by doc_id \
+                     (sequential FileId invariant violated)"
+                );
+            }
         }
 
         // ── Sort keys ascending ──────────────────────────────────────────────
@@ -414,8 +472,8 @@ impl AstIndexBuilder {
         let idx_path = self.output_dir.join("ast_index.skidx");
 
         // Atomic writes: .skpost first, .skidx second (commit point).
-        Self::atomic_write(&self.output_dir, &post_path, &postings_buf)?;
-        Self::atomic_write(&self.output_dir, &idx_path, &skidx_buf)?;
+        atomic_write(&self.output_dir, &post_path, &postings_buf)?;
+        atomic_write(&self.output_dir, &idx_path, &skidx_buf)?;
 
         AstIndexReader::open(&self.output_dir)
     }
@@ -431,17 +489,22 @@ impl AstIndexBuilder {
         avg_node_count: f32,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         // ── Postings buffer ──────────────────────────────────────────────────
-        let total_posting_bytes_est: usize = (self
+        // Use saturating_mul for parity with the crate's overflow discipline
+        // (PF-004 analogue: no silent overflow in size arithmetic).
+        // The result is used only as a Vec::with_capacity hint — an underestimate
+        // is harmless (it triggers at most one extra realloc).
+        let total_posting_count: usize = self
             .bigram_postings
             .values()
             .map(|v| v.len())
-            .sum::<usize>()
-            + self
-                .trigram_postings
-                .values()
-                .map(|v| v.len())
-                .sum::<usize>())
-            * POSTING_ENTRY_SIZE;
+            .fold(0usize, usize::saturating_add)
+            .saturating_add(
+                self.trigram_postings
+                    .values()
+                    .map(|v| v.len())
+                    .fold(0usize, usize::saturating_add),
+            );
+        let total_posting_bytes_est = total_posting_count.saturating_mul(POSTING_ENTRY_SIZE);
         let mut postings_buf = Vec::with_capacity(total_posting_bytes_est);
 
         // ── Bigram entries ───────────────────────────────────────────────────
@@ -552,26 +615,6 @@ impl AstIndexBuilder {
         skidx_buf.extend_from_slice(&meta_buf);
 
         Ok((postings_buf, skidx_buf))
-    }
-
-    /// Atomically write `data` to `path` using a temp file in `dir`.
-    ///
-    /// Mirrors the cochange atomic_write: `NamedTempFile::new_in` + `write_all`
-    /// + `sync_all` (crash safety) + `persist` (rename, atomic on POSIX).
-    fn atomic_write(dir: &Path, path: &Path, data: &[u8]) -> Result<()> {
-        let mut tmp = NamedTempFile::new_in(dir)?;
-        use std::io::Write as _;
-        tmp.write_all(data)?;
-        tmp.as_file().sync_all()?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644))?;
-        }
-
-        tmp.persist(path).map_err(|e| e.error)?;
-        Ok(())
     }
 }
 
