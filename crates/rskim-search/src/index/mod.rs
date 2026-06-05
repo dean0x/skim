@@ -29,7 +29,7 @@
 
 mod builder;
 mod format;
-mod lang_map;
+pub(crate) mod lang_map;
 mod reader;
 
 pub use builder::NgramIndexBuilder;

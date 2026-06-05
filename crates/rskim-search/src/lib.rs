@@ -26,6 +26,7 @@ pub mod ast_weights;
 pub mod cochange;
 pub(crate) mod fields;
 pub mod index;
+pub(crate) mod io_util;
 pub mod lexical;
 pub mod ngram;
 pub mod temporal;
@@ -33,8 +34,9 @@ mod types;
 pub mod weights;
 
 pub use ast_index::{
-    AstBigram, AstBigramEntry, AstNgramSet, AstTrigram, AstTrigramEntry, DEFAULT_AST_WEIGHT,
-    LinearNode, LinearizeResult, NodeKindId, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams,
+    AstBigram, AstBigramEntry, AstFileMetaEntry, AstIndexBuilder, AstIndexReader, AstNgramSet,
+    AstPosting, AstTrigram, AstTrigramEntry, DEFAULT_AST_WEIGHT, LinearNode, LinearizeResult,
+    NodeKindId, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams,
     extract_ast_ngrams_with_weights, linearize_source, vocab_len, vocab_lookup, vocab_resolve,
 };
 pub use cochange::{CochangeMatrixBuilder, CochangeMatrixReader};

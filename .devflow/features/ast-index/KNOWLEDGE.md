@@ -1,7 +1,7 @@
 ---
 feature: ast-index
-name: AST Index (CST Linearization + N-gram Encoding)
-description: "Use when implementing AST-based n-gram extraction, adding a new language to the structural index, debugging depth or node-count truncation, extending the shared vocabulary, working with AstBigram/AstTrigram IDF weights, extracting structural n-grams from linearized nodes, or using the shared AstWalkIter traversal primitive. Keywords: linearize, CST, AST, n-gram, bigram, trigram, NodeKindId, AstBigram, AstTrigram, AstNgramSet, AstBigramEntry, AstTrigramEntry, NODE_KIND_VOCABULARY, LANG_MAPS, LinearNode, AstWalkIter, AstWalkConfig, tree-sitter, depth-encoded, pre-order, IDF, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_weights."
+name: AST Index (CST Linearization + N-gram Encoding + On-Disk Store)
+description: "Use when implementing AST-based n-gram extraction, building or reading the on-disk structural index, adding a new language to the structural index, debugging depth or node-count truncation, extending the shared vocabulary, working with AstBigram/AstTrigram IDF weights, extracting structural n-grams from linearized nodes, or using the shared AstWalkIter traversal primitive. Keywords: linearize, CST, AST, n-gram, bigram, trigram, NodeKindId, AstBigram, AstTrigram, AstNgramSet, AstBigramEntry, AstTrigramEntry, NODE_KIND_VOCABULARY, LANG_MAPS, LinearNode, AstWalkIter, AstWalkConfig, tree-sitter, depth-encoded, pre-order, IDF, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_weights, store, AstIndexBuilder, AstIndexReader, AstPosting, AstFileMetaEntry, skidx, skpost, SKAX, on-disk index, mmap, posting list, build_from_files, lookup_bigram, lookup_trigram."
 category: architecture
 directories: [crates/rskim-search/src/ast_index/, crates/rskim-core/src/]
 referencedFiles:
@@ -11,23 +11,24 @@ referencedFiles:
   - crates/rskim-search/src/ast_index/ngram.rs
   - crates/rskim-search/src/ast_index/extract.rs
   - crates/rskim-search/src/ast_index/mod.rs
-  - crates/rskim-search/src/ast_index/linearize_tests.rs
-  - crates/rskim-search/src/ast_index/ngram_tests.rs
-  - crates/rskim-search/src/ast_index/extract_tests.rs
+  - crates/rskim-search/src/ast_index/store/format.rs
+  - crates/rskim-search/src/ast_index/store/builder.rs
+  - crates/rskim-search/src/ast_index/store/reader.rs
+  - crates/rskim-search/src/ast_index/store/mod.rs
   - crates/rskim-search/src/ast_weights.rs
   - crates/rskim-search/src/lib.rs
-  - crates/rskim-search/benches/linearize_bench.rs
+  - crates/rskim-search/benches/ast_index_bench.rs
 created: 2026-06-01
-updated: 2026-06-03T15:32Z
+updated: 2026-06-05
 ---
 
-# AST Index (CST Linearization + N-gram Encoding)
+# AST Index (CST Linearization + N-gram Encoding + On-Disk Store)
 
 ## Overview
 
 The `ast_index` module converts tree-sitter Concrete Syntax Trees (CSTs) into a
 compact, flat representation suitable for downstream n-gram extraction and IDF-weighted
-structural search. It has three sub-modules:
+structural search. It has four sub-modules:
 
 - **`linearize`** — converts source text into `Vec<LinearNode>`, a pre-order
   depth-first sequence where each node carries a vocabulary ID and traversal depth.
@@ -36,8 +37,10 @@ structural search. It has three sub-modules:
   and IDF weight lookup backed by the per-language weight tables in `ast_weights`.
 - **`extract`** — (Wave 3c) consumes a `Vec<LinearNode>` and produces a deduplicated,
   weighted `AstNgramSet` of structural bigrams and trigrams. This is the document-side
-  extraction step; query-side covering-set and on-disk index format are deferred to
-  future issues (#197, #194).
+  extraction step; query-side covering-set (#197) is deferred to Wave 3f.
+- **`store`** — (Wave 3d) persists an `AstNgramSet` corpus as a two-file mmap'd
+  on-disk inverted index, mirroring the lexical `index/` module. The structural
+  query engine (Wave 3f #197) is still out of scope.
 
 The design is intentionally minimal: `linearize_source` is the only stateful-setup
 entry point (it triggers `LANG_MAPS` initialization on first call). All n-gram
@@ -60,6 +63,9 @@ and future AST search layers). It depends on:
 - `crate::ast_weights::{ast_bigram_weight, ast_trigram_weight}` — per-language
   IDF weight tables keyed by the same packed integer encoding as `AstBigram`/`AstTrigram`
 - `crate::types::SearchError::Ast` for the one error path that is not gracefully silenced
+- `crate::index::lang_map::{lang_to_id, lang_from_id}` — single source of truth for
+  language ↔ u8 ID mapping. `index/mod.rs` was widened to `pub(crate) mod lang_map` so
+  the `store/` sub-module can reuse the same mapping without duplication.
 
 Non-tree-sitter languages (JSON, YAML, TOML) have no entry in `LANG_MAPS`. Calling
 `linearize_source` for these languages returns the empty default result without an
@@ -219,6 +225,104 @@ Capping at 1024 avoids a large `nodes.len()` (up to 100K) driving unnecessary
 allocation — unique structural edges are typically an order of magnitude smaller than
 total node count because most edges repeat within a file.
 
+### store sub-module (Wave 3d, PR #272)
+
+Persists an `AstNgramSet` corpus as a two-file mmap'd on-disk inverted index,
+mirroring the lexical `index/` module. Library-only; the structural query engine
+(Wave 3f #197) is still out of scope.
+
+#### On-Disk Format
+
+Two files are written to `output_dir`:
+
+- **`ast_index.skidx`** — fixed-size header + sorted bigram/trigram lookup tables + per-file metadata.
+- **`ast_index.skpost`** — concatenated posting lists (all bigram lists, then all trigram lists).
+
+Magic `b"SKAX"`, version `1`. Distinct from lexical `b"SKIX"` / `index.*` so both
+coexist in the same `.skim/` directory without collision.
+
+**Layout of `ast_index.skidx`:**
+
+| Section | Size | Details |
+|---|---|---|
+| `AstSkidxHeader` | 48 B | Magic, version, counts, averages, CRC32 |
+| `AstBigramEntry` × bigram_count | 16 B each | u32 key, u64 offset, u32 length |
+| `AstTrigramEntry` × trigram_count | 20 B each | u64 key, u64 offset, u32 length |
+| `AstFileMetaEntry` × file_count | 5 B each | u8 lang_id + u32 node_count |
+
+**Posting entry (`AstPostingEntry`):** 8 B — `doc_id: u32` + `count: u32`. Postings are
+uncompressed. `count` is the per-file structural term-frequency from `AstBigramEntry.count`
+/ `AstTrigramEntry.count`; the `weight` field is discarded at build time (IDF is
+recomputed at query time in Wave 3f via `ast_bigram_idf`, with language recovered via
+`AstFileMetaEntry.lang_id` → `lang_from_id`).
+
+**CRC32:** covers `idx_mmap[48..expected_idx_size]` as one contiguous slice —
+bigram entries + trigram entries + file-meta entries in serialization order. This
+matches the order they appear on disk, so no copies are needed during verification.
+
+#### AstIndexBuilder API
+
+Core merge primitive is `add_file_ngrams(id, lang, set, node_count)`. The convenience
+`add_file(id, content, lang)` calls `linearize_source` + `extract_ast_ngrams`
+internally. `build_from_files(output_dir, files)` rayon-parallelizes the pure extract
+step and merges sequentially — measured at ~12.8 ms for 1000 files, meeting the
+`<10 s` acceptance target with margin.
+
+**Atomic write contract:** `ast_index.skpost` is written first, then `ast_index.skidx`
+(commit point). A reader that finds `.skidx` present can assume `.skpost` is coherent.
+Uses `NamedTempFile::new_in` + `write_all` + `sync_all` + `persist` — matching the
+cochange sibling pattern; stronger than the lexical index (which uses simple rename).
+
+**FileId invariant (PRECONDITION):** FileIds must be dense, sequential, starting from
+zero. Every file — even files yielding zero n-grams (non-tree-sitter languages,
+`>100 KiB`, empty content) — must receive exactly one `add_file_ngrams` call and
+advances `file_count` by 1. The builder enforces this: duplicate FileId →
+`SearchError::InvalidQuery` (message: "duplicate"); non-sequential FileId →
+`SearchError::InvalidQuery` (message: "sequential"). The shared file manifest is
+owned by the CLI / Wave 4 layer, not this library.
+
+**`node_count` narrowing:** `add_file` uses `u32::try_from(lin.nodes.len())` — NOT
+`as u32` — producing `SearchError::IndexCorrupted` on overflow (applies PF-004 analog:
+no silent narrowing).
+
+**Re-index concurrency:** NOT concurrency-safe; same posture as the lexical index.
+Callers must serialize re-index operations against concurrent reads.
+
+#### AstIndexReader API
+
+`open(dir)` validates magic, version, file sizes, and CRC32 before returning. The
+`idx_mmap` is always present; `post_mmap` is `None` when `postings_file_size == 0`
+(prevents mmap-ing a zero-length file, which fails on some platforms).
+
+All size validation and posting bounds use `checked_*` arithmetic.
+
+Public accessors: `file_count()`, `avg_node_count()`, `avg_bigram_count()`,
+`avg_trigram_count()`, `file_meta(file_index)`.
+
+Lookup methods return `Vec<AstPosting>` (each posting: `doc_id: u32, count: u32`).
+
+#### Reader API Contract (C1–C7)
+
+These contracts are what Wave 3f's query engine relies on:
+
+| Contract | Guarantee |
+|---|---|
+| C1 | Postings sorted ascending by `doc_id`, at most one per `doc_id` |
+| C2 | Absent key → `Ok(vec![])` (no error) |
+| C3 | Malformed entry (bad offset/len, OOB, `len % 8 != 0`) → `Err(IndexCorrupted)` |
+| C4 | Every `count >= 1` (`decode_posting` rejects `count == 0`) |
+| C5 | `count` is structural TF, enables BM25 scoring |
+| C6 | `file_meta(i)` recovers `lang_id` → call `lang_from_id` to get `Language` |
+| C7 | `AstIndexReader: Send + Sync` (compile-time verified by test A6) |
+
+#### Cross-Index FileId Contract
+
+The AST index and the lexical index must be built over the identical, identically-ordered
+file set. The shared file manifest is owned by the CLI / Wave 4 layer; neither index
+builder owns it. `AstIndexBuilder` and `NgramIndexBuilder` both enforce the sequential-
+FileId invariant independently. Building them out of sync produces subtly mismatched
+results at query time with no runtime error.
+
 ## Component Interactions
 
 ```
@@ -247,6 +351,25 @@ extract_ast_ngrams(&[LinearNode], Language)
             ├── For each node: gap-fill → resolve parent/gp → emit → record
             └── Collect bigram_map + trigram_map → sort by key → AstNgramSet
 
+AstIndexBuilder::build_from_files(output_dir, files)
+    │
+    ├── rayon par_iter → linearize_source + extract_ast_ngrams per file (parallel)
+    ├── Sequential merge: add_file_ngrams(id, lang, set, node_count) per file
+    └── build()
+            ├── Sort posting lists by doc_id
+            ├── Sort keys ascending (bigram u32, trigram u64)
+            ├── Serialize postings + entries + file_meta + header
+            ├── CRC32 over post-header payload
+            ├── Atomic write: skpost first, then skidx (commit point)
+            └── AstIndexReader::open(output_dir)
+
+AstIndexReader::lookup_bigram(AstBigram)
+    │
+    ├── Binary search bigram entries in idx_mmap[48..bigram_end]
+    ├── Found entry → fetch offset/length into post_mmap
+    ├── Validate: OOB, alignment (len % 8 == 0)
+    └── Decode AstPostingEntry × n → Vec<AstPosting>
+
 ast_bigram_idf(Language, AstBigram) → f32
     └── ast_bigram_weight(lang.name(), bigram.key())
             └── binary search in per-language weight table
@@ -261,6 +384,11 @@ ast_bigram_idf(Language, AstBigram) → f32
 | `MAX_FILE_SIZE_LARGE` | 1 MiB | `linearize.rs` | SQL only: matches `rskim-research` |
 | `DEFAULT_MAX_DEPTH` | 500 | `AstWalkConfig` | Pathological nesting stops descent |
 | `DEFAULT_MAX_NODES` | 100,000 | `AstWalkConfig` | Caps output Vec allocation |
+| `AST_HEADER_SIZE` | 48 B | `store/format.rs` | Fixed header size |
+| `AST_BIGRAM_ENTRY_SIZE` | 16 B | `store/format.rs` | u32 key + u64 offset + u32 length |
+| `AST_TRIGRAM_ENTRY_SIZE` | 20 B | `store/format.rs` | u64 key + u64 offset + u32 length |
+| `AST_POSTING_ENTRY_SIZE` | 8 B | `store/format.rs` | u32 doc_id + u32 count |
+| `AST_FILE_META_SIZE` | 5 B | `store/format.rs` | u8 lang_id + u32 node_count |
 
 SQL uses `MAX_FILE_SIZE_LARGE` because migrations and schema dumps routinely exceed
 100 KiB. All other languages use `MAX_FILE_SIZE`. The branch is a `match` on
@@ -312,6 +440,10 @@ The module's public exports (via `mod.rs` and re-exported from `rskim_search`) a
 | `AstTrigramEntry` | `struct` | One trigram with weight and count |
 | `extract_ast_ngrams` | `fn` | Production extraction (uses real IDF tables) |
 | `extract_ast_ngrams_with_weights` | `fn` | DI core: caller supplies weight closures |
+| `AstIndexBuilder` | `struct` | Builds the two-file on-disk index |
+| `AstIndexReader` | `struct` | mmap'd read-only query layer |
+| `AstPosting` | `struct` | One decoded posting: `doc_id` + `count` |
+| `AstFileMetaEntry` | `struct` | Per-file `lang_id` + `node_count` (public) |
 
 ## Anti-Patterns
 
@@ -349,6 +481,18 @@ The module's public exports (via `mod.rs` and re-exported from `rskim_search`) a
   `count` is term frequency (occurrences in one file), not the number of documents
   containing the n-gram. Document frequency is a corpus-level metric computed at
   index build time, not here.
+
+- **Skipping `add_file_ngrams` for files that yield zero n-grams**: every file in
+  the manifest must produce exactly one call even if its `AstNgramSet` is empty.
+  Omitting it causes `file_count` to diverge from the lexical index's file count,
+  producing mismatched results at query time.
+
+- **Building the AST and lexical indexes from different file orderings**: both
+  indexes enforce sequential FileId starting from 0, but they check independently.
+  Building them over different file sets is a logic error with no runtime trap.
+
+- **Using `as u32` for `node_count` narrowing**: always use `u32::try_from(lin.nodes.len())`
+  so overflow surfaces as `IndexCorrupted` rather than a silent truncation (applies PF-004).
 
 ## Gotchas
 
@@ -397,26 +541,49 @@ The module's public exports (via `mod.rs` and re-exported from `rskim_search`) a
   allocates a fresh `Vec<Option<NodeKindId>>`. For batch extraction over many files,
   the allocation overhead is proportional to `max_depth`, which is bounded at 500.
 
+- **Index size ratio is ~1.23× source, NOT < 5%**: the original #194 acceptance criterion
+  "index < 5% of source" is structurally unachievable for structural AST n-grams. The
+  tiny vocabulary (~161 distinct bi/trigrams for Rust) means each key appears in nearly
+  every file, producing dense posting lists that scale O(vocab × files). The regression
+  guard is `< 3.0×` (measured ~1.23×). Industry uncompressed trigram indexes run 3–5×.
+  Actual compression (delta + VarInt / Roaring posting) is tracked in issue #273.
+
+- **`post_mmap` is `None` for an empty corpus**: `AstIndexReader::open` does not mmap
+  a zero-length `.skpost` file. `lookup_bigram`/`lookup_trigram` return `Ok(vec![])`
+  in this case — callers must not assume `None` means "not found" at the API level.
+
+- **`lang_map` visibility was widened to `pub(crate)`**: `index/mod.rs` now declares
+  `pub(crate) mod lang_map` so `store/format.rs` can reuse `lang_to_id`/`lang_from_id`
+  without a separate mapping. Do not add a second mapping table elsewhere.
+
 ## Key Files
 
 - `crates/rskim-core/src/ast_walk.rs` — `AstWalkIter`, `AstWalkConfig` (with `DEFAULT_MAX_DEPTH`/`DEFAULT_MAX_NODES`), `AstWalkNode`; shared DFS primitive and canonical limit source
 - `crates/rskim-search/src/ast_index/linearize.rs` — `LANG_MAPS`, `linearize_source`, `linearize_tree`; SQL size override; delegates DFS to `AstWalkIter`
 - `crates/rskim-search/src/ast_index/ngram.rs` — `AstBigram`, `AstTrigram`, `NodeKindId`, vocabulary helpers, IDF weight lookups
 - `crates/rskim-search/src/ast_index/extract.rs` — `extract_ast_ngrams`, `extract_ast_ngrams_with_weights`, `AstNgramSet`, `AstBigramEntry`, `AstTrigramEntry`; depth-indexed ancestor stack; document-side extraction only
-- `crates/rskim-search/src/ast_index/mod.rs` — public re-exports for all three sub-modules
+- `crates/rskim-search/src/ast_index/store/format.rs` — pure binary codec: all on-disk struct definitions, encode/decode functions, binary search helpers, CRC32; no I/O
+- `crates/rskim-search/src/ast_index/store/builder.rs` — `AstIndexBuilder`: merge primitive, parallel `build_from_files`, atomic write, FileId enforcement
+- `crates/rskim-search/src/ast_index/store/reader.rs` — `AstIndexReader`, `AstPosting`: mmap open/validate, `lookup_bigram`, `lookup_trigram`, `file_meta`, `Send + Sync`
+- `crates/rskim-search/src/ast_index/store/mod.rs` — re-exports `AstIndexBuilder`, `AstIndexReader`, `AstPosting`, `AstFileMetaEntry`
+- `crates/rskim-search/src/ast_index/mod.rs` — public re-exports for all four sub-modules
 - `crates/rskim-search/src/ast_index/linearize_tests.rs` — 8 test cycles: types, vocabulary, traversal, error nodes, bounds, multi-language, edge cases, performance
 - `crates/rskim-search/src/ast_index/ngram_tests.rs` — 14 test groups: encode/decode roundtrips, key formula, Display, vocab helpers, IDF weight lookup
 - `crates/rskim-search/src/ast_index/extract_tests.rs` — 26 test cases: empty input, chain, siblings, dedup/count, gap-fill, sentinel suppression (parent + grandparent), end-to-end, sort/uniqueness, determinism, input immutability, injected weights, unknown-weight default, crate-root re-exports, large-input smoke test; batch-2 regression tests: B1 u16::MAX depth overflow guard (×2), B2 documented spurious same-depth-sibling edge (×1), B3 trigram count accumulation (×1), B4 gap-fill at max-depth boundary (×2), B5 depth-0 underflow via checked_sub (×2). Helper `bigram_keys(set)` deduplicates bigram key extraction across tests.
+- `crates/rskim-search/src/ast_index/store/builder_tests.rs` — tests A7–A14 + build_from_files + parallel tests; FileId guards, zero-ngram file meta, avg stats, duplicate/non-sequential FileId errors
+- `crates/rskim-search/src/ast_index/store/reader_tests.rs` — tests A1–A6, C1–C7 contracts; `ast_index_size_ratio` normal test (not `#[ignore]`) asserting `< 3.0×`
+- `crates/rskim-search/src/ast_index/store/format_tests.rs` — encode/decode roundtrips and boundary checks for all on-disk structs
 - `crates/rskim-search/src/ast_weights.rs` — auto-generated `NODE_KIND_VOCABULARY` (1740 entries, sorted) and per-language bigram/trigram weight tables; do not edit manually
-- `crates/rskim-search/benches/linearize_bench.rs` — Criterion benchmarks: per-language, scaling by function count, nesting depth, LazyLock init latency, and extraction (`extract_ngrams` group, 100/500/1000-function Rust fixtures)
+- `crates/rskim-search/benches/ast_index_bench.rs` — Criterion benchmark `build_1000_rust_files` (A15: `< 10 s`); measured ~12.8 ms. A16 size ratio is a normal unit test in `reader_tests.rs`.
 
 ## Related
 
-- ADR-001: Fix all noticed issues immediately regardless of scope — applies when finding invariant violations or guard logic gaps during traversal or extraction changes. PR #269 applied this: all 13 review findings (1 blocking + 12 others) were fixed before merge.
-- PF-004: u16 depth arithmetic overflow — always widen to u32 before adding an offset in depth comparisons. See gap-fill note above.
-- Feature: `cochange` — consumes `FileId`-keyed data built from git history; future n-gram consumers will similarly receive `FileId`-keyed `LinearizeResult` and `AstNgramSet` output
+- ADR-001: Fix all noticed issues immediately regardless of scope — applies when finding invariant violations or guard logic gaps during traversal or extraction changes. PR #269 applied this (Wave 3c); PR #272 applied it again (Wave 3d).
+- PF-004: u16 depth arithmetic overflow — always widen to u32 before adding an offset in depth comparisons. See gap-fill note above. The store builder applies the analogous rule: `u32::try_from` for node_count narrowing, no silent `as u32`.
+- Feature: `cochange` — consumes `FileId`-keyed data built from git history; the store builder's atomic-write pattern (`NamedTempFile::new_in + sync_all + persist`) matches the cochange sibling.
 - Feature: `temporal-scoring` — parallel sibling in `rskim-search`; same `SearchError` type, same `Result<T>` alias pattern
 - `crates/rskim-search/src/ast_weights.rs` — vocabulary source; per-language bigram/trigram IDF tables; regenerated by `rskim-research ast-codegen`
 - `crates/rskim-core/src/parser.rs` — `Parser::new(Language)` and `parser.parse(&str)` used by `linearize_source`
-- Issue #197 (deferred): query-side covering-set from `AstNgramSet`
-- Issue #194 (deferred): on-disk index format for persisting `AstNgramSet` entries
+- `crates/rskim-search/src/index/mod.rs` — lexical sibling; `lang_map` was widened to `pub(crate)` here so `store/format.rs` can reuse `lang_to_id`/`lang_from_id`
+- Issue #197 (deferred): query-side covering-set from `AstNgramSet` (Wave 3f)
+- Issue #273 (follow-up): on-disk compression (delta encoding + VarInt / Roaring Bitmaps) to push index size below 1× source

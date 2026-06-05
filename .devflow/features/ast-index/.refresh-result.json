@@ -6,12 +6,14 @@
     "crates/rskim-search/src/ast_index/ngram.rs",
     "crates/rskim-search/src/ast_index/extract.rs",
     "crates/rskim-search/src/ast_index/mod.rs",
-    "crates/rskim-search/src/ast_index/linearize_tests.rs",
-    "crates/rskim-search/src/ast_index/ngram_tests.rs",
-    "crates/rskim-search/src/ast_index/extract_tests.rs",
+    "crates/rskim-search/src/ast_index/store/format.rs",
+    "crates/rskim-search/src/ast_index/store/builder.rs",
+    "crates/rskim-search/src/ast_index/store/reader.rs",
+    "crates/rskim-search/src/ast_index/store/mod.rs",
     "crates/rskim-search/src/ast_weights.rs",
     "crates/rskim-search/src/lib.rs",
-    "crates/rskim-search/benches/linearize_bench.rs"
+    "crates/rskim-search/benches/ast_index_bench.rs"
   ],
-  "description": "Use when implementing AST-based n-gram extraction, adding a new language to the structural index, debugging depth or node-count truncation, extending the shared vocabulary, working with AstBigram/AstTrigram IDF weights, extracting structural n-grams from linearized nodes, or using the shared AstWalkIter traversal primitive. Keywords: linearize, CST, AST, n-gram, bigram, trigram, NodeKindId, AstBigram, AstTrigram, AstNgramSet, AstBigramEntry, AstTrigramEntry, NODE_KIND_VOCABULARY, LANG_MAPS, LinearNode, AstWalkIter, AstWalkConfig, tree-sitter, depth-encoded, pre-order, IDF, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_weights."
+  "staleCheck": "all 13 referenced files present; KNOWLEDGE.md already reflects post-#272-resolution store state (private mod builder/reader + pub use re-exports, doc_id monotonicity C1 defensive check). Stale flag was a false positive from the bare-filename resolver, consistent with prior staleResolved entries on obs_wk7v3a/obs_tq5b9r/obs_kp2v7n.",
+  "description": "Use when implementing AST-based n-gram extraction, building or reading the on-disk structural index, adding a new language to the structural index, debugging depth or node-count truncation, extending the shared vocabulary, working with AstBigram/AstTrigram IDF weights, extracting structural n-grams from linearized nodes, or using the shared AstWalkIter traversal primitive. Keywords: linearize, CST, AST, n-gram, bigram, trigram, store, AstIndexBuilder, AstIndexReader, AstPosting, AstFileMetaEntry, skidx, skpost, SKAX, on-disk index, mmap, posting list, build_from_files, lookup_bigram, lookup_trigram."
 }

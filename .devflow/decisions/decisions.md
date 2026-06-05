@@ -1,4 +1,4 @@
-<!-- TL;DR: 2 decisions. Key: ADR-001, ADR-002 -->
+<!-- TL;DR: 3 decisions. Key: ADR-001, ADR-002, ADR-003 -->
 # Architectural Decisions
 
 Append-only. Status changes allowed; deletions prohibited.
@@ -20,3 +20,12 @@ Append-only. Status changes allowed; deletions prohibited.
 - **Decision**: Any prioritized work queue, roadmap tracker, or multi-issue progress tracker must be created as a GitHub issue (e.g., issue #268 "Roadmap: Next 5 issues"), not in WORKING-MEMORY.md or any devflow memory file.
 - **Consequences**: GitHub issues survive context compaction, are version-controlled, and are visible to all collaborators. Memory files are session-scoped and lose fidelity over time. **How to apply:** when the user asks to "track" multiple upcoming issues or create a work queue, default to `gh issue create` — not a memory file edit. WORKING-MEMORY.md should only reflect current session state (branch, latest commit, blockers), not a durable to-do list.
 - **Source**: sidecar:decisions.2fea848d-a8f7-46da-aa16-be990ed4d829
+
+## ADR-003: Replace empirically-baseless acceptance criteria with grounded regression guards rather than chasing impossible targets
+
+- **Date**: 2026-06-04
+- **Status**: Accepted
+- **Context**: issue #194 acceptance criterion A16 demanded the AST index be < 5% of source bytes, but structural AST n-grams are dense by design (O(vocab x files) posting entries) so 5% is unreachable and the figure had no empirical origin in any prior wave research
+- **Decision**: replace the 5% target with a defensible < 3x source-bytes regression guard (measured 1.23x) as a real non-ignored test, and file on-disk compression as a tracked follow-up (#273)
+- **Consequences**: a regression guard grounded in measurement and industry norms (uncompressed code-search trigram indexes run 3-5x) protects against real bloat, whereas an impossible target either blocks the PR or gets silently ignored
+- **Source**: self-learning:obs_a16x3g

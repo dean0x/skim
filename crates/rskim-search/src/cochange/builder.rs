@@ -3,21 +3,20 @@
 //!
 //! # Atomicity contract
 //!
-//! The output file is written atomically via [`tempfile::NamedTempFile`] + `persist`
-//! (rename), so readers never observe a partial write.
+//! The output file is written atomically via [`crate::io_util::atomic_write`]
+//! (`NamedTempFile::new_in` + `write_all` + `sync_all` + `persist`), so
+//! readers never observe a partial write.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::path::{Path, PathBuf};
-
-use tempfile::NamedTempFile;
+use std::path::PathBuf;
 
 use super::format::{
     FILE_COMMIT_ENTRY_SIZE, FORMAT_VERSION, FileCommitEntry, HEADER_SIZE, PAIR_ENTRY_SIZE,
     PairEntry, SKCC_MAGIC, SkccHeader, compute_checksum, encode_file_commit, encode_header,
     encode_pair,
 };
-use crate::{CochangeStats, FileId, HistoryResult, Result, SearchError};
+use crate::{CochangeStats, FileId, HistoryResult, Result, SearchError, io_util::atomic_write};
 
 /// Maximum number of files in a commit before the commit is skipped.
 ///
@@ -322,26 +321,6 @@ fn serialize(
     buf[..HEADER_SIZE].copy_from_slice(&encode_header(&header));
 
     Ok(buf)
-}
-
-/// Atomically write `data` to `path` using a temp file in `dir`.
-///
-/// Sets explicit `0o644` permissions on Unix before persisting so that a
-/// permissive process umask cannot leave the file world-writable.
-fn atomic_write(dir: &Path, path: &Path, data: &[u8]) -> Result<()> {
-    let mut tmp = NamedTempFile::new_in(dir)?;
-    use std::io::Write as _;
-    tmp.write_all(data)?;
-    tmp.as_file().sync_all()?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644))?;
-    }
-
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
 }
 
 // ============================================================================
