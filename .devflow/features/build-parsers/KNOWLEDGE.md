@@ -1,8 +1,8 @@
 ---
 feature: build-parsers
 name: Build Tool Output Parsers
-description: "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, ParseResult, BuildResult, three-tier, NDJSON, flag injection, flat dispatch, multi-category dispatch."
-category: domain-knowledge
+description: "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection."
+category: component-patterns
 directories: [crates/rskim/src/cmd/build/]
 referencedFiles:
   - crates/rskim/src/cmd/build/mod.rs
@@ -14,111 +14,255 @@ referencedFiles:
   - crates/rskim/src/output/mod.rs
   - crates/rskim/src/output/canonical.rs
   - crates/rskim/src/cmd/mod.rs
-  - crates/rskim/src/runner.rs
-created: 2026-06-03
-updated: 2026-06-03
+created: 2026-05-14
+updated: 2026-05-26
+version: 9
 ---
 
 # Build Tool Output Parsers
 
 ## Overview
 
-The `cmd/build/` module compresses and filters output from build tools (cargo, make, tsc, gradle, maven) using a three-tier parse degradation strategy. It is reached via two dispatch paths:
+The build parsers module (`crates/rskim/src/cmd/build/`) compresses output from build tools (cargo, clippy, tsc, make, gradle, maven) into compact summaries for AI context windows. Each tool has a dedicated file (`cargo.rs`, `tsc.rs`, `make.rs`, `gradle.rs`, `maven.rs`) plus a shared `mod.rs` that provides the dispatcher and the `run_parsed_command` infrastructure function used by all five.
 
-- **Flat dispatch**: `skim tsc`, `skim gradle`, `skim make` — the tool name is `argv[0]` when invoked as a PATH wrapper
-- **Multi-category dispatch**: `skim cargo build`, `skim cargo clippy`, `skim gradle build` — routed through `cmd/build/mod.rs::run()`
+The module is invoked via flat dispatch (`skim tsc`) or multi-category dispatch (`skim cargo build`, `skim cargo clippy`). All parsers share the same three-tier degradation model: Full (clean structured parse) → Degraded (partial parse with warning markers) → Passthrough (raw output returned unchanged).
 
-All handlers share the same `ParseResult<BuildResult>` output contract and delegate to `CommandRunner` for process execution.
+## Core Responsibilities
 
-## Three-Tier Parse Degradation
+Each parser file should:
+- Export a single `run()` function (plus `run_clippy()` for cargo)
+- Inject tool-specific flags before spawning, when the tool supports structured output
+- Delegate spawn + output capture to `run_parsed_command` in `mod.rs`
+- Implement a private `parse_*` function that maps `&CommandOutput` to `ParseResult<BuildResult>`
 
-The `output::ParseResult<T>` enum drives the degradation strategy:
+`mod.rs` should:
+- Dispatch by tool name and route to the correct handler
+- Own `run_parsed_command`, the shared spawn-parse-emit-record loop
+- Never contain tool-specific parsing logic
 
+## Three-Tier Degradation Pattern
+
+Every build parser implements the same three-tier cascade. Returning `None` from a tier signals "this tier cannot handle the input — try the next one":
+
+The cascade is always tried in order from most structured to least:
+
+```rust
+fn parse_cargo(output: &CommandOutput) -> ParseResult<BuildResult> {
+    // Tier 1: highest fidelity — JSON/NDJSON when available
+    if let Some(result) = try_tier1_json(&output.stdout) {
+        return result;  // Returns Full or Degraded
+    }
+
+    // Tier 2: regex fallback on stderr or combined output
+    if let Some(result) = try_tier2_regex(&output.stderr) {
+        return result;  // Returns Degraded with marker
+    }
+
+    // Tier 3: never returns None — always a valid ParseResult
+    ParseResult::Passthrough(combined)
+}
 ```
-Full(T)               — clean structured parse, all fields populated
-Degraded(T, warnings) — partial parse, forwarded with warning markers injected
-Passthrough(String)   — unrecognized format, output returned as-is
+
+Key invariants:
+- Tier 1 returns `ParseResult::Full` on clean parse, never `Degraded`
+- Tier 2 returns `ParseResult::Degraded` with a human-readable marker string
+- Tier 3 returns `ParseResult::Passthrough` — raw content, no marker
+- The `parse_*` function is passed by function pointer to `run_parsed_command`, typed as `fn(&CommandOutput) -> ParseResult<BuildResult>`
+
+## Tool-Specific Tier Strategies
+
+Each tool assigns tiers differently based on what structured output the tool provides:
+
+| Tool | Tier 1 | Tier 2 | Tier 3 |
+|------|--------|--------|--------|
+| cargo / clippy | NDJSON from `--message-format=json` (stdout) | Regex `error[E\d+]` on stderr | Passthrough combined |
+| tsc | Regex `file(line,col): error TSxxxx: msg` on stderr | Same regex on combined stdout+stderr | Passthrough combined |
+| make | GCC/Clang diagnostics + Makefile syntax errors + make failure + linker errors + noop detection on combined | Noise stripping (compiler invocations, directory changes, CMake progress, archiver lines, `compilation terminated.` literal) | Passthrough combined |
+| gradle / gradlew | Regex on task outcomes (`> Task :name OUTCOME`), Java/Kotlin diagnostics, `BUILD SUCCESSFUL/FAILED` summary | Noise strip (daemon startup, download progress, configure project, UP-TO-DATE/FROM-CACHE task lines) | Passthrough combined |
+| mvn / mvnw | Regex on `[ERROR]`/`[WARNING]` lines and `[INFO] BUILD SUCCESS/FAILURE` + total time | Noise strip (`Downloading from`, `Downloaded from`, `[INFO] ---` separator lines, scanning/building markers) | Passthrough combined |
+
+Note that tsc uses regex for its Tier 1 (not JSON) because tsc has no native structured output mode. Its Tier 2 is the same regex applied to a different stream, promoted to `Degraded` rather than `Full`.
+
+The `compilation terminated.` check in make's Tier 2 is a literal `starts_with` check, not a regex — it is hardcoded alongside the four `LazyLock<Regex>` noise patterns.
+
+## Flag Injection Pattern
+
+Tools with a structured-output flag (cargo `--message-format=json`) inject it automatically unless the user already supplied it. This prevents overriding user intent.
+
+The helpers live in `crate::cmd` (not inside `cmd/build/`):
+- `user_has_flag(&args, &["--message-format"])` — prefix-match check, handles `--flag=value` and `--flag value` styles
+- `inject_flag_before_separator(&mut args, "--message-format=json")` — inserts the flag before `--` so it targets the tool, not arguments after the separator
+- `extract_show_stats(&args)` — strips `--show-stats` from the arg list and returns `(filtered_args, bool)`. `build/mod.rs` calls this at the top of its `run()` function; the `bool` is threaded through to `run_parsed_command`. This was centralized from per-handler inline logic.
+
+Gradle and Maven do not inject flags — they have no native structured output mode, so their `run()` functions pass `&[]` as `env_vars` and perform no flag mutation.
+
+## Gradle Parser Details
+
+Gradle (`gradle.rs`) supports both `gradle` and `gradlew` aliases via the `program` parameter passed through from the dispatcher. The `run()` signature is `run(program: &str, args: &[String], ...)` — the program name is forwarded directly to `run_parsed_command`.
+
+Tier 1 recognizes four pattern types on the combined stdout+stderr stream:
+- Task outcomes: `> Task :name OUTCOME` via `GRADLE_TASK_RE` — tasks with `FAILED` outcome increment error count
+- Java diagnostics: `file.java:line: error|warning|note: message` via `JAVA_DIAG_RE`
+- Kotlin diagnostics: `e: file.kt: (line, col): message` or `w:` via `KOTLIN_DIAG_RE`
+- Build summary: `BUILD SUCCESSFUL in Xs` via `BUILD_SUCCESS_RE` (duration extracted) and `BUILD FAILED` via `BUILD_FAILED_RE`
+
+Success determination in Tier 1 requires all three conditions: `exit_code == Some(0) && errors == 0 && !BUILD_FAILED_RE.is_match(combined)`. A zero exit code alone is not enough — explicit `BUILD FAILED` text also marks failure.
+
+Duration parsing handles the `3.456 secs` format only (extracts the first token and multiplies by 1000). The `1 min 2 secs` format is not parsed — `parse_gradle_duration` returns `None` for multi-word durations.
+
+## Maven Parser Details
+
+Maven (`maven.rs`) supports `mvn`, `mvnw`, and the alias `maven` — all forwarded to `run_parsed_command` via the `program` parameter. No flag injection occurs.
+
+Tier 1 pattern types on the combined stream:
+- Error lines: `[ERROR] message` via `MAVEN_ERROR_RE`
+- Warning lines: `[WARNING] message` via `MAVEN_WARN_RE`
+- Build outcome: `[INFO] BUILD SUCCESS` and `[INFO] BUILD FAILURE` via `MAVEN_SUCCESS_RE` / `MAVEN_FAILURE_RE`
+- Total time: `[INFO] Total time:  2.345 s` via `MAVEN_TIME_RE`
+
+Success determination: `exit_code == Some(0) && MAVEN_SUCCESS_RE.is_match(combined) && errors == 0`. Unlike gradle, maven requires the `BUILD SUCCESS` marker to be present in the output — a zero exit code without the marker produces `success = false`.
+
+Duration parsing handles two formats:
+- `2.345 s` (seconds with decimal) → milliseconds
+- `1:23 min` (minutes:seconds) → milliseconds
+
+Tier 2 noise patterns strip `[INFO] Downloading/Downloaded from`, `[INFO] ---` separator lines, `[INFO] Scanning for projects`, `[INFO] Building`, reactor summary lines, and empty `[INFO]` lines via `MAVEN_INFO_NOISE_RE`.
+
+## `run_parsed_command` — Shared Infrastructure
+
+All five parsers call `super::run_parsed_command(...)` in `mod.rs` instead of spawning processes themselves. This function handles:
+1. Command spawn with a 600-second timeout (compile times can be long)
+2. ANSI escape code stripping from both stdout and stderr before parsing
+3. Calling the parser function pointer
+4. Emitting degradation markers to stderr (only when `--debug` / `SKIM_DEBUG=1` is active — silent by default)
+5. Printing result content to stdout
+6. Token stats (if `--show-stats`)
+7. Exit code determination from `BuildResult.success` or raw `output.exit_code`
+8. Analytics recording via `format_analytics_label("build", program, &args.join(" "))` (fire-and-forget)
+
+The full signature is:
+```rust
+pub(super) fn run_parsed_command(
+    program: &str,
+    args: &[String],
+    env_vars: &[(&str, &str)],
+    install_hint: &str,
+    show_stats: bool,
+    rec: crate::analytics::RecordingContext<'_>,  // constructed once in build::run()
+    parser: fn(&CommandOutput) -> ParseResult<BuildResult>,  // fn pointer, not FnOnce
+) -> anyhow::Result<ExitCode>
 ```
 
-Each build handler attempts `Full` parse first, degrades to `Degraded` on partial failures, and falls back to `Passthrough` only when the output format is entirely unrecognized. The degradation level is used by the analytics recording layer to track parse quality.
+Two details worth noting: `rec` is a `RecordingContext` threaded from `build::run()` (which constructs it once from `AnalyticsConfig` with `CommandType::Build`); and `parser` is a plain `fn` pointer, not a closure — build parsers need no captured state. The analytics call annotates the tier via `rec.with_tier(result.tier_name())`.
 
-## Component Architecture
+Spawn failures (missing executable) use `anyhow::bail!` — a hard error with an install hint. This differs from the non-build path: `obtain_output` in `cmd/mod.rs` returns `Ok(None)` on spawn failure (soft fallback), which `run_parsed_command_with_mode` then converts to `Ok(ExitCode::FAILURE)`. Build commands have no stdin-passthrough path, so `ENOENT` is always fatal.
 
-### `mod.rs` — Public Dispatch
+**Important**: build parsers use `run_parsed_command` (defined in `build/mod.rs`), not `run_parsed_command_with_mode` or `run_tool<T>` (both defined in `cmd/mod.rs`). The three are intentionally separate:
+- Build: no `use_stdin`, no `--json` output mode, no `SKIM_PASSTHROUGH` bypass, no compressed-output hint on failure, plain `fn()` parser pointer, bail-on-spawn, 600s timeout
+- Other families (lint, infra, db, file): use `run_tool<T>` (the generic runner added in #214) which wraps `run_parsed_command_with_mode`. `run_tool<T>` takes `ToolRunConfig<'a>` (program, env_overrides, install_hint, family, skip_ansi_strip, command_type), a `&RunContext`, a `prepare_args` closure, and a one-arg `parse_fn`
 
-Routes incoming args to the correct handler. Handles `--help` early exit. Extracts `--show-stats` flag via `cmd::extract_show_stats`. Match arms cover:
-- `"build"` / `"check"` / `"fmt"` / `"clippy"` / `"nextest"` / `"audit"` → `cargo::run_*`
-- `"gradle"` / `"gradlew"` → `gradle::run`
-- `"make"` → `make::run`
-- `"mvn"` / `"mvnw"` / `"maven"` → `maven::run`
-- Unknown subcommand → `cargo::run` (default, matches previous skim behavior for bare `skim cargo` invocations)
+`run_tool<T>` in `cmd/mod.rs` explicitly documents this boundary: "build::run_parsed_command is intentionally not replaced: it has a different call shape (no `ctx: &RunContext`, different analytics path)." Switching build parsers to use `run_tool<T>` is not just a refactor — the signatures are incompatible.
 
-### `cargo.rs` — Rust Toolchain
+The `ParsedCommandConfig` struct (in `cmd/mod.rs`) adds several fields not present in the build path: `family` (for analytics label disambiguation — prevents collision when `cargo` appears in both build and pkg), `skip_ansi_strip` (DB tools emit TSV; stripping would drop tab characters), and `output_format` (supports `--json` output mode). Build does none of these, which is why the two paths are separate rather than consolidated.
 
-Handles cargo build, check, fmt, clippy, nextest, and audit. Injects `--message-format=json` (or `--message-format json-diagnostic-rendered-ansi` for clippy) when the output destination allows structured capture. Parses NDJSON output from cargo. Collapses duplicate warning lines, extracts error/warning counts for the stats footer.
+## `BuildResult` — Output Type
 
-### `gradle.rs` — Gradle / Gradlew
+`BuildResult` (in `crates/rskim/src/output/canonical.rs`) carries:
+- `success: bool`
+- `warnings: usize`
+- `errors: usize`
+- `duration_ms: Option<u64>` — cargo does not report duration in JSON; gradle and maven do report duration when `BUILD SUCCESSFUL` appears
+- `error_messages: Vec<String>` — formatted per-error strings, plus grouped warning codes for clippy
 
-Handles gradle and gradlew invocations. Extracts task names from gradle's structured output lines (`:taskName OUTCOME`), filters build lifecycle noise, preserves error output verbatim.
+The `rendered` field is pre-computed in `BuildResult::new()`. On success it renders as `OK warnings: N errors: 0`; on failure it appends each `error_messages` entry indented with a space. Error messages are only printed on failure — clippy warning code summaries are appended to `error_messages` but silently carried on a successful clippy run.
 
-### `make.rs` — GNU Make
+`BuildResult::render` is a private `fn` in `canonical.rs`. The other canonical types (`LintResult`, `DbResult`, `GitResult`, `PkgResult`) follow the same pattern. As of #214, `DbResult::render` was decomposed into 5 private helper functions — the decomposition pattern is the standard for any canonical type whose render logic grows beyond a single screen.
 
-Handles make invocations. Extracts target names, filters `Entering directory`/`Leaving directory` lines, preserves compiler error output verbatim.
+## Regex Compilation
 
-### `maven.rs` — Maven / mvnw
+All regex patterns are compiled once via `LazyLock<Regex>` at module scope. This avoids per-call recompilation and is the standard pattern across all build and lint parsers.
 
-Handles mvn and mvnw invocations. Filters reactor summary lines, extracts module names, preserves BUILD SUCCESS/FAILURE and error output.
+```rust
+static CARGO_ERROR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"error\[E\d+\]").expect("valid regex"));
+```
 
-### `tsc.rs` — TypeScript Compiler
+Use `.expect("valid regex")` not `.unwrap()` — the expect message documents intent and is visible in panics.
 
-Handles tsc invocations. Parses TypeScript diagnostic output (`file.ts(line,col): error TS1234: message`), groups by file, deduplicates identical messages.
+## Shared Test Helpers
 
-### `output/mod.rs` — ParseResult + Infrastructure
+All build parser tests (and tests across the `cmd` subtree) use the shared helpers from `crate::cmd::test_support`, defined under `#[cfg(test)]` in `cmd/mod.rs`. As of #214, the ~34 local `make_output` definitions and ~41 local `load_fixture` definitions that existed across `cmd` subtree modules were replaced by this single canonical source.
 
-Provides:
-- `ParseResult<T>` enum (Full / Degraded / Passthrough)
-- ANSI stripping (`strip_ansi_codes`)
-- Progress line collapsing (cargo download progress, percentage lines)
-- Token-aware truncation
-- Filter transparency headers
+The three helpers are:
+- `make_output(stdout: &str) -> CommandOutput` — success case: stderr empty, exit_code Some(0), duration ZERO
+- `make_output_full(stdout, stderr, exit_code: Option<i32>) -> CommandOutput` — full control for non-zero exits, stderr content, signal-kill (None exit code)
+- `load_fixture(subdir: &str, name: &str) -> String` — loads from `tests/fixtures/cmd/{subdir}/{name}`; panics with clear message on missing file
 
-### `output/canonical.rs` — BuildResult
-
-`BuildResult` is the canonical structured form of build output. Fields capture: error count, warning count, duration, individual diagnostics, and the raw output for passthrough. All handlers produce `ParseResult<BuildResult>`.
-
-### `runner.rs` — CommandRunner
-
-Timeout-aware command runner. Executes via `Command::new().args()` (no shell). Captures stdout + stderr concurrently via threads to prevent pipe deadlocks. Exposes `CommandOutput { stdout, stderr, exit_code, duration }`. `CommandRunner` is dependency-injected into all handlers.
-
-## Integration Points
-
-- **Analytics**: every handler receives a `RecordingContext` and calls `analytics::record_build_result` on completion. Fire-and-forget background thread.
-- **PATH wrappers**: when `skim` binary detects `argv[0] == "gradle"` etc., it strips `~/.skim/bin` from `PATH` then calls `cmd/build/mod.rs::run()` with the tool name prepended to args.
-- **`--show-stats`**: handlers print a token-reduction stats footer to stderr when this flag is present.
+Build parser tests import these as `use super::super::test_support::{make_output, make_output_full, load_fixture}`. Do not redeclare local versions — use the canonical source to prevent drift.
 
 ## Anti-Patterns
 
-- **Shell-expanding arguments**: `CommandRunner` uses `Command::new().args()`, not a shell. Never pass shell metacharacters in args — they are passed literally.
-- **Calling `cargo::run` for non-cargo subcommands**: the default arm in `mod.rs` sends unknown subcommands to `cargo::run` only because bare `skim cargo` usage is the dominant case. Add explicit arms for any new tools.
-- **Logging parse failures to stdout**: degradation warnings go through `ParseResult::Degraded` and are rendered as comment-style markers in the output, not raw stderr noise.
+- **Adding tool-specific spawn logic to `run_parsed_command`**: the shared function must remain tool-agnostic. Tool-specific env vars (`CARGO_TERM_COLOR=never`) and flags belong in the per-tool `run()` function.
+
+- **Returning `ParseResult::Degraded` from Tier 1**: Tier 1 must only emit `Full`. If the parse is partial, it is not a Tier 1 parse — fall through to Tier 2. Mixing `Full` and `Degraded` from the same tier breaks the diagnostic signal.
+
+- **Using `try_tier1` signature for regex-only parsers**: tsc's "Tier 1" is regex on stderr, but it still returns `ParseResult::Full` (not `Degraded`) because stderr is the authoritative output stream. The Degraded tier is reserved for the combined-stream fallback where stream identity is unknown.
+
+- **Omitting the empty-output success check**: gradle, maven, tsc, and make all treat empty stdout+stderr as a successful build when `exit_code == Some(0)`. Skipping this check causes `ParseResult::Passthrough("")` instead of `ParseResult::Full(success)`.
+
+- **Switching build parsers to use `run_tool<T>` or `run_parsed_command_with_mode`**: the build family intentionally diverges. See the Infrastructure section above. The signatures are incompatible: `run_parsed_command` takes `fn(&CommandOutput)` (one arg, plain fn pointer); `run_tool<T>` takes `FnOnce(&CommandOutput)` via `run_parsed_command_with_mode` which takes `FnOnce(&CommandOutput, &[String])` (two args). Mixing them will fail to compile.
+
+- **Declaring a new tool in `run()` dispatch without adding it to the help text and error messages**: the unknown-tool error message and `print_help()` list supported tools by name — both must be updated when adding a new parser. Also add the tool name to `KNOWN_SUBCOMMANDS` in `cmd/mod.rs` and the `dispatch()` match arm in `cmd/mod.rs`.
+
+- **Adding a build tool as a passthrough dispatcher**: build tools should use the strict dispatcher model (error on unknown subcommand), not the passthrough model used by `swift`/`dotnet`. Build commands have a finite, well-defined subcommand set; passthrough is reserved for tools with wide lifecycle subcommand surfaces that agents invoke routinely.
+
+- **Declaring local `make_output` or `load_fixture` in build test modules**: use `super::super::test_support` instead. Local redeclarations drift from the canonical definition (e.g., duration field set to arbitrary millisecond values instead of `Duration::ZERO`).
 
 ## Gotchas
 
-- `cargo clippy` uses a different `--message-format` flag form than `cargo build`. The injected flag is `--message-format json-diagnostic-rendered-ansi` (space-separated), not `=` form.
-- `gradle` and `gradlew` share the same handler (`gradle::run`). The program name is threaded through so the handler can re-invoke the correct binary.
-- `maven` also matches `"mvnw"` (Maven wrapper). Both map to `maven::run`.
-- `--show-stats` is consumed by `cmd::extract_show_stats` before dispatch and never passed to the subprocess.
+- **Degradation markers and parse notices are silent by default**: `emit_markers` in `ParseResult` only writes to stderr when `SKIM_DEBUG=1` or `--debug` is set. In normal operation, Tier 2 (`Degraded`) and Tier 3 (`Passthrough`) passes are silent — no `[skim:warning]` or `[skim:notice]` lines appear. This means a build that degrades to regex fallback gives no on-screen indication unless debug mode is active. Enable `SKIM_DEBUG=1` when diagnosing unexpected parse behavior.
+
+- **`--message-format` injection must happen before `--`**: `inject_flag_before_separator` places the flag before `--`. If it were appended after `--`, cargo would treat it as an argument to the compiled binary, not to cargo itself.
+
+- **Cargo warning codes are grouped into `error_messages`, not a separate field**: clippy warning codes (`dead_code: 2 occurrence(s)`) are appended to `error_messages` in `BuildResult`. They are not rendered on a successful clippy run.
+
+- **Make combines stdout and stderr**: make sends compiler diagnostics to whichever stream the child compiler uses. Always combine both streams before parsing.
+
+- **`build-finished` is required for Tier 1 in cargo**: `try_tier1_json` returns `None` (falls through to Tier 2) if no `build-finished` NDJSON line appears. This means an incomplete JSON stream — e.g., a killed cargo process — degrades gracefully rather than reporting false success.
+
+- **`note` severity in GCC diagnostics is not counted as an error**: `try_tier1_diagnostics` in make.rs counts `error` and `fatal error` as errors, `warning` as warnings, and skips `note`. Notes are still included in `error_messages` for context.
+
+- **Make noop-after-errors must not discard accumulated diagnostics**: The `MAKE_NOOP_RE` check in `try_tier1_diagnostics` is guarded by `!any_match`. A "Nothing to be done" or "is up to date" line triggers an immediate success return ONLY when no diagnostic lines have been accumulated yet.
+
+- **Signal-killed process (exit code `None`) in empty-output path is failure**: The empty-output early return uses `output.exit_code == Some(0)` for success, not `!= Some(1)`. A signal-killed process has `exit_code: None` — that must map to `success = false`.
+
+- **Timeout is 600 seconds (10 minutes)**: build commands use a longer timeout than the default 300-second `DEFAULT_CMD_TIMEOUT` because compile times can be substantial.
+
+- **Gradle success requires both zero exit code AND absence of `BUILD FAILED` text**: a process can exit 0 while gradle still emits `BUILD FAILED` in certain edge cases. Both conditions are checked in Tier 1.
+
+- **Maven success requires `BUILD SUCCESS` text, not just zero exit code**: unlike most tools, maven's Tier 1 explicitly checks that `MAVEN_SUCCESS_RE.is_match(combined)` is true. A clean exit without the success marker sets `success = false`.
+
+- **Gradle duration parsing only handles `X.XXX secs` format**: the `parse_gradle_duration` function splits on whitespace and parses the first token as `f64`. Multi-part durations like `1 min 2 secs` return `None` and `duration_ms` is left as `None` in `BuildResult`.
+
+- **tsc empty-output check is placed after both tier 1 and tier 2**: unlike make.rs (which guards empty output at the top of `parse_make`), tsc.rs checks for empty output only after tier 1 and tier 2 both return `None`.
 
 ## Key Files
 
-- `crates/rskim/src/cmd/build/mod.rs` — dispatch table; add new tool here first
-- `crates/rskim/src/cmd/build/cargo.rs` — NDJSON + Rust diagnostic parsing; most complex handler
-- `crates/rskim/src/output/mod.rs` — `ParseResult<T>`, ANSI stripping, progress collapsing
-- `crates/rskim/src/output/canonical.rs` — `BuildResult` struct (shared output type)
-- `crates/rskim/src/runner.rs` — `CommandRunner` execution engine
+- `crates/rskim/src/cmd/build/mod.rs` — dispatcher (`run`), shared `run_parsed_command`, and `print_help`
+- `crates/rskim/src/cmd/build/cargo.rs` — cargo build and clippy: NDJSON Tier 1, regex Tier 2
+- `crates/rskim/src/cmd/build/tsc.rs` — TypeScript compiler: regex-on-stderr Tier 1, combined Tier 2, empty-output success (checked after both tiers)
+- `crates/rskim/src/cmd/build/make.rs` — GNU make: GCC diagnostics Tier 1, noise-strip Tier 2, eight `LazyLock<Regex>` patterns plus one literal `starts_with` check
+- `crates/rskim/src/cmd/build/gradle.rs` — Gradle/Gradlew: task outcome + Java/Kotlin diagnostic Tier 1 (with duration), noise-strip Tier 2 (six `LazyLock<Regex>` patterns)
+- `crates/rskim/src/cmd/build/maven.rs` — Maven/Mvnw: `[ERROR]`/`[WARNING]` + build summary Tier 1 (with duration), noise-strip Tier 2 (two `LazyLock<Regex>` patterns, two duration formats)
+- `crates/rskim/src/output/mod.rs` — `ParseResult<T>` enum definition and helpers (`is_full`, `is_degraded`, `tier_name`, `content`, `into_content`, `emit_markers`); `strip_ansi` and `strip_ansi_cow` (zero-copy fast path: borrows when no ESC byte present); `to_json_envelope` (not used by build family — build has no `--json` mode); `OutputMode`, `clean`, `PassthroughTruncator`, `FilterTransparencyHeader` (used by other families); sub-modules `guardrail` and `tee` (not used by build parsers — used by other consumers of the output infrastructure)
+- `crates/rskim/src/output/canonical.rs` — `BuildResult` struct with pre-rendered output; also owns `TestResult`, `GitResult`, `LintResult`, `DbResult`, `PkgResult` — the `DbResult::render` was decomposed into 5 private helpers in #214 as a model for growing render logic
+- `crates/rskim/src/cmd/mod.rs` — `user_has_flag`, `inject_flag_before_separator`, `extract_show_stats`, `extract_json_flag`, `extract_output_format`, `combine_output`, `sanitize_for_display`, `format_analytics_label`, `scrub_db_args`; structs `RunContext`, `ParsedCommandConfig<'_>`, `ToolRunConfig<'_>`, `OutputFormat`; generic runner `run_tool<T>` (used by lint, db, infra, file families — NOT by build); stdin infrastructure: `should_read_stdin`, `read_bounded`, `read_stdin_bounded`, `MAX_STDIN_BYTES`; passthrough infrastructure: `is_passthrough_mode`, `check_passthrough_str`, `check_passthrough_value`; resolver: `resolve_cache_dir`; `is_known_subcommand` (linear scan of `KNOWN_SUBCOMMANDS`); shared test helpers: `test_support` module (under `#[cfg(test)]`) with `make_output`, `make_output_full`, `load_fixture`; private `obtain_output` (soft spawn-failure path for non-build families); private `render_output<T>`; `run_parsed_command_with_mode` (used by non-build families); dispatcher helpers `dispatch()`, `dispatch_cargo()`, `dispatch_go()`, `dispatch_swift()`, `dispatch_dotnet()`, `run_raw_passthrough()`, `passthrough_subcmd()`; `extract_subcmd`, `prepend_without`; `KNOWN_SUBCOMMANDS`
 
 ## Related
 
-- ADR-001: Fix all noticed issues immediately regardless of scope
-- `crates/rskim/src/cmd/mod.rs` — top-level command dispatcher; routes `cargo`, `tsc`, `make` etc. to `cmd/build/`
-- `crates/rskim/src/analytics/` — records parse tier and token savings per build invocation
+- `crates/rskim/src/output/mod.rs` — owns `ParseResult<T>`, the type returned by all three-tier parsers across the whole codebase (lint, test, infra, build); `emit_markers` debug gate is defined here
+- `crates/rskim/src/output/canonical.rs` — owns `BuildResult`, `TestResult`, `GitResult`, `LintResult`; build parsers use `BuildResult`
+- `crates/rskim/src/runner.rs` — `CommandRunner`, `CommandOutput`, `is_spawn_error` — the execution layer called by `run_parsed_command`
+- `crates/rskim/src/cmd/lint/` — sibling module using the same three-tier pattern with `LintResult` instead of `BuildResult`; lint parsers use `run_tool<T>` (via `run_parsed_command_with_mode`) rather than `run_parsed_command`
+- `crates/rskim/src/cmd/test/` — sibling module using the same three-tier pattern with `TestResult`
+- ADR-001: Fix all noticed issues immediately regardless of scope — applies when adding a new build parser: fix any spotted inconsistencies in other parsers in the same PR rather than deferring

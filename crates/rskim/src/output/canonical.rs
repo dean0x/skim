@@ -13,7 +13,7 @@ use std::fmt;
 // ============================================================================
 
 /// Outcome of a single test case
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum TestOutcome {
     Pass,
     Fail,

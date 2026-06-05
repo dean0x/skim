@@ -3,9 +3,10 @@
   "features": {
     "build-parsers": {
       "name": "Build Tool Output Parsers",
-      "description": "Use when adding a new build tool parser, modifying cargo/tsc/make compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection.",
+      "description": "Use when adding a new build tool parser, modifying cargo/tsc/make compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection. NOTE: cmd/mod.rs was refactored in PR #267 — scrubbing logic is in security.rs, command execution in execution.rs, dispatch in dispatch.rs.",
       "directories": [
-        "crates/rskim/src/cmd/build/"
+        "crates/rskim/src/cmd/build/",
+        "crates/rskim/src/cmd/"
       ],
       "referencedFiles": [
         "crates/rskim/src/cmd/build/mod.rs",
@@ -15,9 +16,12 @@
         "crates/rskim/src/output/mod.rs",
         "crates/rskim/src/output/canonical.rs",
         "crates/rskim/src/cmd/mod.rs",
+        "crates/rskim/src/cmd/execution.rs",
+        "crates/rskim/src/cmd/dispatch.rs",
+        "crates/rskim/src/cmd/security.rs",
         "crates/rskim/src/runner.rs"
       ],
-      "lastUpdated": "2026-05-14T14:43:19.739Z",
+      "lastUpdated": "2026-06-03T00:00:00.000Z",
       "createdBy": "devflow-knowledge"
     },
     "cochange": {
@@ -37,7 +41,7 @@
         "crates/rskim-search/src/temporal/storage_types.rs",
         "crates/rskim-search/src/temporal/storage_ops.rs"
       ],
-      "lastUpdated": "2026-05-25T21:45:03.285Z",
+      "lastUpdated": "2026-06-03T00:00:00.000Z",
       "createdBy": "implement"
     },
     "temporal-scoring": {
@@ -57,7 +61,7 @@
         "crates/rskim-search/src/types.rs",
         "crates/rskim-search/src/lib.rs"
       ],
-      "lastUpdated": "2026-05-25T21:44:49.314Z",
+      "lastUpdated": "2026-06-03T00:00:00.000Z",
       "createdBy": "implement"
     }
   }
