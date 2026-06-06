@@ -223,6 +223,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use super::super::types::CommitInfo;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn base_window() -> ResolvedWindow {
@@ -393,7 +394,7 @@ mod tests {
         commit_count_since: Option<u64>,
     }
 
-    impl super::super::git_source::GitDataSource for MockGitSource {
+    impl GitDataSource for MockGitSource {
         fn is_git_repo(&self) -> bool {
             true
         }
@@ -406,10 +407,7 @@ mod tests {
         fn fetch_commit_count_since(&self, _n: usize) -> anyhow::Result<Option<u64>> {
             Ok(self.commit_count_since)
         }
-        fn fetch_commits(
-            &self,
-            _config: &super::super::types::HeatmapConfig,
-        ) -> anyhow::Result<Vec<super::super::types::CommitInfo>> {
+        fn fetch_commits(&self, _config: &HeatmapConfig) -> anyhow::Result<Vec<CommitInfo>> {
             Ok(vec![])
         }
     }
@@ -418,7 +416,7 @@ mod tests {
     /// the graceful-degradation path in the `--last N` branch of `resolve_config`.
     struct MockGitSourceErr;
 
-    impl super::super::git_source::GitDataSource for MockGitSourceErr {
+    impl GitDataSource for MockGitSourceErr {
         fn is_git_repo(&self) -> bool {
             true
         }
@@ -431,16 +429,13 @@ mod tests {
         fn fetch_commit_count_since(&self, _n: usize) -> anyhow::Result<Option<u64>> {
             Err(anyhow::anyhow!("simulated git error"))
         }
-        fn fetch_commits(
-            &self,
-            _config: &super::super::types::HeatmapConfig,
-        ) -> anyhow::Result<Vec<super::super::types::CommitInfo>> {
+        fn fetch_commits(&self, _config: &HeatmapConfig) -> anyhow::Result<Vec<CommitInfo>> {
             Ok(vec![])
         }
     }
 
-    fn base_args() -> super::super::types::HeatmapArgs {
-        super::super::types::HeatmapArgs::default()
+    fn base_args() -> HeatmapArgs {
+        HeatmapArgs::default()
     }
 
     /// `window_preset` and `last_n` must appear in `ResolvedWindow`, not in
