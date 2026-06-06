@@ -132,10 +132,10 @@ pub struct StructuralMetrics {
     /// Maximum CST traversal depth seen in this file (0 if empty).
     pub max_depth: u16,
     /// Maximum counted-child count in any function/method body block.
-    /// Saturates at `u16::MAX` (PF-004: saturating cast, never wrapping).
+    /// Saturates at `u16::MAX`; never wraps.
     pub max_block_stmts: u16,
     /// Maximum counted-child count in any parameter list.
-    /// Saturates at `u16::MAX` (PF-004: saturating cast, never wrapping).
+    /// Saturates at `u16::MAX`; never wraps.
     pub max_params: u16,
     /// Total count of branch-kind nodes in the file (if/while/for/match/etc.).
     /// Saturates at `u32::MAX`.
@@ -180,66 +180,34 @@ pub static COMMENT_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|| {
 ///
 /// # Design
 ///
-/// The set is built from known single-character and keyword token strings that
-/// appear in the vocabularies of our supported grammars. This is more precise
-/// than a length-based heuristic and more stable than tree-sitter `is_named()`.
-/// Only strings that are in the actual vocabulary contribute entries.
+/// The set is built by concatenating three named sub-slices — `PUNCT_TOKENS`,
+/// `OPERATOR_TOKENS`, and `STRUCTURAL_KEYWORDS` — so that each concern is
+/// clearly separated. This is more precise than a length-based heuristic and
+/// more stable than tree-sitter `is_named()`. Only strings that are in the
+/// actual vocabulary contribute entries.
 pub static PUNCTUATION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|| {
-    // Punctuation: single-character tokens that appear as named nodes in CSTs.
-    let punct_kinds: &[&str] = &[
+    /// Bracket / delimiter / separator tokens.
+    const PUNCT_TOKENS: &[&str] = &[
         // Brackets / delimiters
-        "{",
-        "}",
-        "(",
-        ")",
-        "[",
-        "]",
-        "<",
-        ">",
-        // Separators / terminators
-        ",",
-        ";",
-        ":",
-        "::",
-        ".",
-        "...",
-        "..",
-        "->",
-        "=>",
-        "@",
-        // Operators used as tokens at statement-block level
-        "|",
-        "&",
-        "*",
-        "+",
-        "-",
-        "/",
-        "%",
-        "=",
-        "==",
-        "!=",
-        "+=",
-        "-=",
-        "*=",
-        "/=",
-        "%=",
-        "&=",
-        "|=",
-        "^=",
-        "<=",
-        ">=",
-        "&&",
-        "||",
-        "!",
-        "~",
-        "^",
-        "<<",
-        ">>",
-        "?",
-        "??",
-        "?.",
-        "?:",
-        // Universal structural keywords (not statement-level constructs)
+        "{", "}", "(", ")", "[", "]", "<", ">", // Separators / terminators
+        ",", ";", ":", "::", ".", "...", "..", "->", "=>", "@",
+        // Annotation / preprocessor tokens
+        "#",
+    ];
+
+    /// Operator tokens that appear as named nodes at statement-block level.
+    const OPERATOR_TOKENS: &[&str] = &[
+        "|", "&", "*", "+", "-", "/", "%", "=", "==", "!=", "+=", "-=", "*=", "/=", "%=", "&=",
+        "|=", "^=", "<=", ">=", "&&", "||", "!", "~", "^", "<<", ">>", "?", "??", "?.", "?:",
+    ];
+
+    /// Universal structural keywords that are NOT statement-level constructs.
+    ///
+    /// These appear as named child tokens in CSTs (e.g. the `fn` keyword inside a
+    /// `function_item` node) but do not themselves represent a statement or
+    /// parameter — excluding them prevents double-counting.
+    const STRUCTURAL_KEYWORDS: &[&str] = &[
+        // Declarations / definitions
         "fn",
         "function",
         "def",
@@ -250,6 +218,7 @@ pub static PUNCTUATION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|
         "let",
         "var",
         "const",
+        // Control flow
         "return",
         "if",
         "else",
@@ -266,6 +235,7 @@ pub static PUNCTUATION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|
         "finally",
         "throw",
         "throws",
+        // Visibility / modifiers
         "public",
         "private",
         "protected",
@@ -275,6 +245,7 @@ pub static PUNCTUATION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|
         "async",
         "await",
         "yield",
+        // Modules / imports
         "import",
         "export",
         "from",
@@ -284,6 +255,7 @@ pub static PUNCTUATION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|
         "enum",
         "namespace",
         "module",
+        // Operators-as-keywords / value expressions
         "new",
         "delete",
         "typeof",
@@ -298,10 +270,12 @@ pub static PUNCTUATION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|
         "None",
         "True",
         "False",
+        // Self-reference
         "self",
         "Self",
         "super",
         "this",
+        // Rust-specific
         "mut",
         "ref",
         "pub",
@@ -314,6 +288,8 @@ pub static PUNCTUATION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|
         "move",
         "dyn",
         "box",
+        "unsafe",
+        // Go-specific
         "go",
         "defer",
         "chan",
@@ -321,10 +297,12 @@ pub static PUNCTUATION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|
         "range",
         "make",
         "append",
+        // Ruby-specific
         "rescue",
         "ensure",
         "begin",
         "end",
+        // Java/C#/Kotlin-specific
         "synchronized",
         "volatile",
         "native",
@@ -333,13 +311,17 @@ pub static PUNCTUATION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|
         "open",
         "closed",
         "sealed",
-        "unsafe",
+        // Other
         "pack",
         "unpack",
-        // Annotation / preprocessor tokens
-        "#",
     ];
-    punct_kinds.iter().filter_map(|k| vocab_lookup(k)).collect()
+
+    PUNCT_TOKENS
+        .iter()
+        .chain(OPERATOR_TOKENS.iter())
+        .chain(STRUCTURAL_KEYWORDS.iter())
+        .filter_map(|k| vocab_lookup(k))
+        .collect()
 });
 
 // ============================================================================

@@ -505,8 +505,11 @@ AstIndexReader::lookup_bigram(AstBigram)
 
 ## Related
 
-- PF-004: no silent `as` narrowing — use `try_from` + `IndexCorrupted`; u16 metric fields
-  use `min(u16::MAX)` before cast; `branch_count` saturates at `u32::MAX`.
+- PF-004: widen u16 depth values to u32 before arithmetic in depth comparisons
+  (`u32::from(p) + 1`, not `p + 1`) to prevent wrap at `u16::MAX`. Unrelated to
+  saturating casts: `max_block_stmts`/`max_params` saturate at `u16::MAX` (never wrap)
+  and `branch_count` saturates at `u32::MAX` — these are direct `min()`/`saturating_add`
+  patterns, not the PF-004 widening concern.
 - PF-005 / ADR-003: replace empirically-baseless acceptance criteria with grounded ones —
   the index size guard is a measured `< 2.2×` regression guard (measured ~1.23×), not a
   phantom number. Background: `< 5%` is structurally unachievable for structural AST n-grams.

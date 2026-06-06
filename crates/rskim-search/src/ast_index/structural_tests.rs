@@ -227,6 +227,100 @@ fn f1_branch_count_increments_for_branch_kinds() {
 }
 
 // ============================================================================
+// F1 (continued): max_block_stmts and max_params scalar values
+// ============================================================================
+
+#[test]
+fn f1_max_block_stmts_counts_body_children() {
+    use crate::ast_index::vocab_lookup;
+
+    let fn_id = match vocab_lookup("function_item") {
+        Some(id) => id,
+        None => return,
+    };
+    let block_id = match vocab_lookup("block") {
+        Some(id) => id,
+        None => return,
+    };
+    // Use expression_statement or fall back to the first counted kind in vocab.
+    let stmt_id = match vocab_lookup("expression_statement") {
+        Some(id) if id != 0 && is_counted_child(id) => id,
+        _ => (1u16..1740)
+            .find(|&id| is_counted_child(id))
+            .expect("at least one counted kind exists"),
+    };
+
+    // Build: function_item(depth=0) → block(depth=1) → 7×stmt_id(depth=2)
+    let mut nodes = vec![
+        LinearNode {
+            kind_id: fn_id,
+            depth: 0,
+        },
+        LinearNode {
+            kind_id: block_id,
+            depth: 1,
+        },
+    ];
+    for _ in 0..7 {
+        nodes.push(LinearNode {
+            kind_id: stmt_id,
+            depth: 2,
+        });
+    }
+
+    let (_, m) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
+    assert_eq!(
+        m.max_block_stmts, 7,
+        "block with 7 counted children must yield max_block_stmts == 7"
+    );
+}
+
+#[test]
+fn f1_max_params_counts_parameter_list_children() {
+    use crate::ast_index::vocab_lookup;
+
+    let fn_id = match vocab_lookup("function_item") {
+        Some(id) => id,
+        None => return,
+    };
+    let params_id = match vocab_lookup("parameters") {
+        Some(id) => id,
+        None => return,
+    };
+    // Use a counted-child kind as the stand-in for a parameter node.
+    let param_node_id = match vocab_lookup("identifier") {
+        Some(id) if id != 0 && is_counted_child(id) => id,
+        _ => (1u16..1740)
+            .find(|&id| is_counted_child(id))
+            .expect("at least one counted kind exists"),
+    };
+
+    // Build: function_item(depth=0) → parameters(depth=1) → 3×param_node(depth=2)
+    let mut nodes = vec![
+        LinearNode {
+            kind_id: fn_id,
+            depth: 0,
+        },
+        LinearNode {
+            kind_id: params_id,
+            depth: 1,
+        },
+    ];
+    for _ in 0..3 {
+        nodes.push(LinearNode {
+            kind_id: param_node_id,
+            depth: 2,
+        });
+    }
+
+    let (_, m) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
+    assert_eq!(
+        m.max_params, 3,
+        "parameter list with 3 counted children must yield max_params == 3"
+    );
+}
+
+// ============================================================================
 // F3: Cumulative bucket emissions at exact boundary values
 // ============================================================================
 
@@ -670,6 +764,67 @@ fn f2_one_real_statement_body_is_not_empty() {
     assert!(
         !set.bigrams.iter().any(|e| e.ngram == empty_key),
         "body with one real statement must NOT emit EMPTY_BODY→function_item"
+    );
+}
+
+// ============================================================================
+// F5 (continued): Bucket-edge / bucket_label invariant
+//
+// Guards the structural coupling between the three edge tables
+// (BODY_STMT_EDGES, PARAM_EDGES, DEPTH_EDGES) and the bucket_label() function.
+// If a new dimension is added or an edge table is resized, these assertions
+// will catch the inconsistency at test time.
+// ============================================================================
+
+#[test]
+fn f5_bucket_label_encodes_edge_index_correctly() {
+    // bucket_label(i) must equal BUCKET_LABEL_BASE + i for every valid edge index.
+    // This is the compile-time identity that keeps edge tables and labels in sync:
+    // changing BUCKET_LABEL_BASE or the formula in bucket_label() will break it.
+    for i in 0..BODY_STMT_EDGES.len() {
+        assert_eq!(
+            bucket_label(i),
+            BUCKET_LABEL_BASE + i as NodeKindId,
+            "BODY_STMT_EDGES: bucket_label({i}) must equal BUCKET_LABEL_BASE + {i}"
+        );
+    }
+    for i in 0..PARAM_EDGES.len() {
+        assert_eq!(
+            bucket_label(i),
+            BUCKET_LABEL_BASE + i as NodeKindId,
+            "PARAM_EDGES: bucket_label({i}) must equal BUCKET_LABEL_BASE + {i}"
+        );
+    }
+    for i in 0..DEPTH_EDGES.len() {
+        assert_eq!(
+            bucket_label(i),
+            BUCKET_LABEL_BASE + i as NodeKindId,
+            "DEPTH_EDGES: bucket_label({i}) must equal BUCKET_LABEL_BASE + {i}"
+        );
+    }
+}
+
+#[test]
+fn f5_all_edge_table_indices_are_within_max_bucket_edges() {
+    // Every index used by any edge table must be < MAX_BUCKET_EDGES.
+    // MAX_BUCKET_EDGES is the sentinel that keeps bucket labels below EMPTY_BODY.
+    assert!(
+        BODY_STMT_EDGES.len() <= MAX_BUCKET_EDGES as usize,
+        "BODY_STMT_EDGES has {} entries but MAX_BUCKET_EDGES is {}",
+        BODY_STMT_EDGES.len(),
+        MAX_BUCKET_EDGES
+    );
+    assert!(
+        PARAM_EDGES.len() <= MAX_BUCKET_EDGES as usize,
+        "PARAM_EDGES has {} entries but MAX_BUCKET_EDGES is {}",
+        PARAM_EDGES.len(),
+        MAX_BUCKET_EDGES
+    );
+    assert!(
+        DEPTH_EDGES.len() <= MAX_BUCKET_EDGES as usize,
+        "DEPTH_EDGES has {} entries but MAX_BUCKET_EDGES is {}",
+        DEPTH_EDGES.len(),
+        MAX_BUCKET_EDGES
     );
 }
 
