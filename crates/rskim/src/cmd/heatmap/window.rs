@@ -222,8 +222,8 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::*;
     use super::super::types::CommitInfo;
+    use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn base_window() -> ResolvedWindow {
@@ -474,8 +474,7 @@ mod tests {
         args.last_n = Some(50);
         let mut warnings = Vec::new();
 
-        let (config, window) =
-            resolve_config(args, &source, &mut warnings, NOW).unwrap();
+        let (config, window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
 
         // Graceful degradation: since is None (analyze all history)
         assert!(
@@ -494,7 +493,9 @@ mod tests {
             "expected at least one warning on git error"
         );
         assert!(
-            warnings.iter().any(|w| w.contains("Could not resolve --last")),
+            warnings
+                .iter()
+                .any(|w| w.contains("Could not resolve --last")),
             "warning must mention 'Could not resolve --last', got: {:?}",
             warnings
         );
