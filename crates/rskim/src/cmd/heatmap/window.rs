@@ -61,9 +61,6 @@ pub(super) fn resolve_config(
         last_n: args.last_n,
     };
 
-    // Resolved `since` epoch — set by whichever branch wins precedence.
-    let mut resolved_since: Option<u64> = None;
-
     // Count explicit time-selection flags
     let explicit_count = usize::from(args.since.is_some())
         + usize::from(window.last_n.is_some())
@@ -78,13 +75,11 @@ pub(super) fn resolve_config(
 
     if let Some(since) = args.since {
         // Already set — highest precedence
-        resolved_since = Some(since);
         window.since = Some(since);
     } else if let Some(n) = window.last_n {
         // --last N: find the timestamp of the Nth commit
         match source.fetch_commit_count_since(n) {
             Ok(Some(ts)) => {
-                resolved_since = Some(ts);
                 window.since = Some(ts);
             }
             Ok(None) => {
@@ -98,7 +93,6 @@ pub(super) fn resolve_config(
         }
     } else if let Some(ref preset) = window.window_preset {
         if let Some(since) = preset_to_since_secs(preset, now_epoch) {
-            resolved_since = Some(since);
             window.since = Some(since);
         } else {
             warnings.push(format!(
@@ -116,7 +110,6 @@ pub(super) fn resolve_config(
 
         // Use whichever captures more history (lower epoch = more history)
         let dual_resolved = time_since.min(count_since);
-        resolved_since = Some(dual_resolved);
         window.since = Some(dual_resolved);
         window.dual_mode = true;
         window.dual_time_since = Some(time_since);
@@ -127,7 +120,7 @@ pub(super) fn resolve_config(
     // (heap allocations) or copied (scalars). `window_preset`, `last_n`, and
     // `diff_base` are intentionally absent — they were consumed above.
     let config = HeatmapConfig {
-        since: resolved_since,
+        since: window.since,
         path: args.path,
         format_json: args.format_json,
         top_n: args.top_n,
@@ -421,12 +414,43 @@ mod tests {
         }
     }
 
+    /// Mock that always returns `Err` from `fetch_commit_count_since`, exercising
+    /// the graceful-degradation path in the `--last N` branch of `resolve_config`.
+    struct MockGitSourceErr;
+
+    impl super::super::git_source::GitDataSource for MockGitSourceErr {
+        fn is_git_repo(&self) -> bool {
+            true
+        }
+        fn get_repo_root(&self) -> anyhow::Result<String> {
+            Ok("/mock/repo".to_string())
+        }
+        fn detect_shallow_clone(&self) -> bool {
+            false
+        }
+        fn fetch_commit_count_since(&self, _n: usize) -> anyhow::Result<Option<u64>> {
+            Err(anyhow::anyhow!("simulated git error"))
+        }
+        fn fetch_commits(
+            &self,
+            _config: &super::super::types::HeatmapConfig,
+        ) -> anyhow::Result<Vec<super::super::types::CommitInfo>> {
+            Ok(vec![])
+        }
+    }
+
     fn base_args() -> super::super::types::HeatmapArgs {
         super::super::types::HeatmapArgs::default()
     }
 
     /// `window_preset` and `last_n` must appear in `ResolvedWindow`, not in
     /// `HeatmapConfig`. `HeatmapConfig` has neither field.
+    ///
+    /// Note: this test intentionally covers two independent fields in one pass
+    /// (`window_preset` move and `last_n` copy) because both are consumed at the
+    /// same point in `resolve_config`. A failure here implicates the
+    /// `ResolvedWindow` construction block, not a single field. If one of them
+    /// fails in isolation, add a targeted test for that field specifically.
     #[test]
     fn test_resolve_config_consumed_fields_go_to_window() {
         let source = MockGitSource {
@@ -439,10 +463,46 @@ mod tests {
 
         let (_config, window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
 
-        // `window_preset` moved into ResolvedWindow
+        // `window_preset` moved into ResolvedWindow (independent of last_n)
         assert_eq!(window.window_preset.as_deref(), Some("sprint"));
-        // `last_n` copied into ResolvedWindow
+        // `last_n` copied into ResolvedWindow (independent of window_preset)
         assert_eq!(window.last_n, Some(50));
+    }
+
+    /// When `fetch_commit_count_since` returns `Err` during `--last N` resolution,
+    /// `resolve_config` must degrade gracefully: `since` stays `None` (all history)
+    /// and a warning is emitted. The function must not return `Err` itself.
+    #[test]
+    fn test_resolve_config_last_n_git_error_degrades_to_all_history() {
+        let source = MockGitSourceErr;
+        let mut args = base_args();
+        args.last_n = Some(50);
+        let mut warnings = Vec::new();
+
+        let (config, window) =
+            resolve_config(args, &source, &mut warnings, NOW).unwrap();
+
+        // Graceful degradation: since is None (analyze all history)
+        assert!(
+            config.since.is_none(),
+            "expected since=None (all history) on git error, got {:?}",
+            config.since
+        );
+        assert!(
+            window.since.is_none(),
+            "expected window.since=None on git error, got {:?}",
+            window.since
+        );
+        // Warning must be emitted so the user knows why the fallback occurred
+        assert!(
+            !warnings.is_empty(),
+            "expected at least one warning on git error"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("Could not resolve --last")),
+            "warning must mention 'Could not resolve --last', got: {:?}",
+            warnings
+        );
     }
 
     /// Passthrough scalar and heap fields carry over unchanged from args to config.

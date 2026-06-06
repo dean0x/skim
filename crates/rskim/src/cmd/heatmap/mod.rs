@@ -165,8 +165,6 @@ fn prepare_commits(
 
     // Extract debug flag before moving args into resolve_config
     let debug = args.debug;
-    // Extract last_n before moving args — needed for pre-resolution debug label
-    let had_last_n = args.last_n.is_some();
 
     if debug {
         eprintln!("[skim:heatmap] repo root: {repo_root}");
@@ -186,7 +184,7 @@ fn prepare_commits(
     if debug {
         let mode = if window.dual_mode {
             "dual"
-        } else if had_last_n {
+        } else if window.last_n.is_some() {
             "count"
         } else {
             "time"
