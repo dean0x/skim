@@ -5,9 +5,8 @@
 //! Benchmark groups:
 //!   1. build_1000_files       — build_from_files over ~1000 Rust functions (A15)
 //!   2. extraction_overhead    — compare extract_ast_ngrams (v1) vs
-//!                               extract_ast_ngrams_with_metrics (v2) on a
-//!                               representative linearized corpus. Empirically
-//!                               backs P1 (extraction overhead <15%).
+//!      extract_ast_ngrams_with_metrics (v2) on a representative
+//!      linearized corpus. Empirically backs P1 (extraction overhead <15%).
 //!
 //! A16 (index size ratio < 2.2×) is a normal unit test in reader_tests.rs.
 //! Measured baseline: ~1.23× (v1), ~1.3× (v2 with structural markers).

@@ -715,7 +715,7 @@ fn f9_index_version_surfaces_v1_fixture() {
     v1_header[0..4].copy_from_slice(b"SKAX");
     v1_header[4..6].copy_from_slice(&1u16.to_le_bytes()); // version = 1
 
-    std::fs::write(dir.path().join("ast_index.skidx"), &v1_header).unwrap();
+    std::fs::write(dir.path().join("ast_index.skidx"), v1_header).unwrap();
 
     // (a) index_version should read Ok(1) — the probe does not enforce version.
     let version = AstIndexReader::index_version(dir.path()).unwrap();
