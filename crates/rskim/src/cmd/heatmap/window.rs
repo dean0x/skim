@@ -75,25 +75,21 @@ pub(super) fn resolve_config(
     // Resolve the effective `since` epoch. The result is stored only in
     // `HeatmapConfig::since` — `ResolvedWindow` no longer carries a redundant
     // copy, eliminating a previously-unenforceable "always identical" invariant.
+    //
+    // The dual-default branch sets window.dual_* as side effects, so `since`
+    // must be `mut` here rather than a pure expression.
     let mut since: Option<u64> = None;
 
     if let Some(s) = args.since {
-        // Already set — highest precedence
         since = Some(s);
     } else if let Some(n) = window.last_n {
         // --last N: find the timestamp of the Nth commit
         match source.fetch_commit_count_since(n) {
-            Ok(Some(ts)) => {
-                since = Some(ts);
-            }
-            Ok(None) => {
-                warnings.push(format!(
-                    "Repository has fewer than {n} commits — analyzing all history."
-                ));
-            }
-            Err(e) => {
-                warnings.push(format!("Could not resolve --last {n}: {e}"));
-            }
+            Ok(Some(ts)) => since = Some(ts),
+            Ok(None) => warnings.push(format!(
+                "Repository has fewer than {n} commits — analyzing all history."
+            )),
+            Err(e) => warnings.push(format!("Could not resolve --last {n}: {e}")),
         }
     } else if let Some(ref preset) = window.window_preset {
         if let Some(s) = preset_to_since_secs(preset, now_epoch) {
@@ -106,15 +102,12 @@ pub(super) fn resolve_config(
     } else {
         // Dual default: max(last 90 days, last 200 commits)
         let time_since = now_epoch.saturating_sub(90 * 86400);
-
         let count_since = match source.fetch_commit_count_since(200) {
             Ok(Some(ts)) => ts,
             _ => time_since, // fallback to time-based if lookup fails
         };
-
-        // Use whichever captures more history (lower epoch = more history)
-        let dual_resolved = time_since.min(count_since);
-        since = Some(dual_resolved);
+        // Lower epoch = more history; pick whichever window captures more.
+        since = Some(time_since.min(count_since));
         window.dual_mode = true;
         window.dual_time_since = Some(time_since);
         window.dual_count_since = Some(count_since);
@@ -168,9 +161,7 @@ pub(super) fn build_window_info(
         "dual".to_string()
     };
 
-    let since_str = since
-        .map(format_epoch)
-        .unwrap_or_else(|| "all".to_string());
+    let since_str = since.map(format_epoch).unwrap_or_else(|| "all".to_string());
 
     let effective_strategy = if window.dual_mode {
         let time_since = window.dual_time_since.unwrap_or(0);
@@ -394,8 +385,29 @@ mod tests {
 
     /// Minimal mock GitDataSource for unit-testing `resolve_config` without
     /// spawning a real git process.
+    ///
+    /// Set `commit_count_since` to control the `Ok(Some(ts))` / `Ok(None)` path.
+    /// Set `error_mode = true` to simulate a git error (`Err`) from
+    /// `fetch_commit_count_since`, exercising the graceful-degradation path.
     struct MockGitSource {
         commit_count_since: Option<u64>,
+        error_mode: bool,
+    }
+
+    impl MockGitSource {
+        fn ok(commit_count_since: Option<u64>) -> Self {
+            Self {
+                commit_count_since,
+                error_mode: false,
+            }
+        }
+
+        fn err() -> Self {
+            Self {
+                commit_count_since: None,
+                error_mode: true,
+            }
+        }
     }
 
     impl GitDataSource for MockGitSource {
@@ -409,29 +421,11 @@ mod tests {
             false
         }
         fn fetch_commit_count_since(&self, _n: usize) -> anyhow::Result<Option<u64>> {
-            Ok(self.commit_count_since)
-        }
-        fn fetch_commits(&self, _config: &HeatmapConfig) -> anyhow::Result<Vec<CommitInfo>> {
-            Ok(vec![])
-        }
-    }
-
-    /// Mock that always returns `Err` from `fetch_commit_count_since`, exercising
-    /// the graceful-degradation path in the `--last N` branch of `resolve_config`.
-    struct MockGitSourceErr;
-
-    impl GitDataSource for MockGitSourceErr {
-        fn is_git_repo(&self) -> bool {
-            true
-        }
-        fn get_repo_root(&self) -> anyhow::Result<String> {
-            Ok("/mock/repo".to_string())
-        }
-        fn detect_shallow_clone(&self) -> bool {
-            false
-        }
-        fn fetch_commit_count_since(&self, _n: usize) -> anyhow::Result<Option<u64>> {
-            Err(anyhow::anyhow!("simulated git error"))
+            if self.error_mode {
+                Err(anyhow::anyhow!("simulated git error"))
+            } else {
+                Ok(self.commit_count_since)
+            }
         }
         fn fetch_commits(&self, _config: &HeatmapConfig) -> anyhow::Result<Vec<CommitInfo>> {
             Ok(vec![])
@@ -452,9 +446,7 @@ mod tests {
     /// fails in isolation, add a targeted test for that field specifically.
     #[test]
     fn test_resolve_config_consumed_fields_go_to_window() {
-        let source = MockGitSource {
-            commit_count_since: Some(1_700_000_000),
-        };
+        let source = MockGitSource::ok(Some(1_700_000_000));
         let mut args = base_args();
         args.window_preset = Some("sprint".to_string());
         args.last_n = Some(50);
@@ -487,7 +479,7 @@ mod tests {
     /// and a warning is emitted. The function must not return `Err` itself.
     #[test]
     fn test_resolve_config_last_n_git_error_degrades_to_all_history() {
-        let source = MockGitSourceErr;
+        let source = MockGitSource::err();
         let mut args = base_args();
         args.last_n = Some(50);
         let mut warnings = Vec::new();
@@ -517,9 +509,7 @@ mod tests {
     /// Passthrough scalar and heap fields carry over unchanged from args to config.
     #[test]
     fn test_resolve_config_passthrough_fields() {
-        let source = MockGitSource {
-            commit_count_since: None,
-        };
+        let source = MockGitSource::ok(None);
         let mut args = base_args();
         args.top_n = 42;
         args.format_json = true;
@@ -552,9 +542,7 @@ mod tests {
     /// When `--since` is set, it wins regardless of preset/last_n.
     #[test]
     fn test_resolve_config_since_takes_precedence() {
-        let source = MockGitSource {
-            commit_count_since: Some(999_999),
-        };
+        let source = MockGitSource::ok(Some(999_999));
         let mut args = base_args();
         args.since = Some(1_700_000_000);
         args.window_preset = Some("sprint".to_string());
@@ -571,9 +559,7 @@ mod tests {
     /// When no window flags are set, dual-mode default is applied.
     #[test]
     fn test_resolve_config_dual_default() {
-        let source = MockGitSource {
-            commit_count_since: Some(1_680_000_000),
-        };
+        let source = MockGitSource::ok(Some(1_680_000_000));
         let args = base_args();
         let mut warnings = Vec::new();
 
@@ -590,9 +576,7 @@ mod tests {
     /// `None` (analyze all history). The function must not return `Err`.
     #[test]
     fn test_resolve_config_last_n_ok_none_degrades_to_all_history() {
-        let source = MockGitSource {
-            commit_count_since: None, // Ok(None): fewer commits than requested
-        };
+        let source = MockGitSource::ok(None); // Ok(None): fewer commits than requested
         let mut args = base_args();
         args.last_n = Some(50);
         let mut warnings = Vec::new();
@@ -620,9 +604,7 @@ mod tests {
     /// NOW = 1_704_067_200 (2024-01-01). "sprint" = NOW − 14 × 86400 = 1_702_857_600.
     #[test]
     fn test_resolve_config_known_preset_resolves_epoch() {
-        let source = MockGitSource {
-            commit_count_since: None, // Not called in the preset branch
-        };
+        let source = MockGitSource::ok(None); // fetch_commit_count_since not called in preset branch
         let mut args = base_args();
         args.window_preset = Some("sprint".to_string());
         let mut warnings = Vec::new();
@@ -652,9 +634,7 @@ mod tests {
     /// and a warning is emitted naming the unrecognised preset.
     #[test]
     fn test_resolve_config_unknown_preset_emits_warning() {
-        let source = MockGitSource {
-            commit_count_since: None,
-        };
+        let source = MockGitSource::ok(None);
         let mut args = base_args();
         args.window_preset = Some("biweekly".to_string());
         let mut warnings = Vec::new();
