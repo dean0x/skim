@@ -136,6 +136,47 @@ fn header_rejects_wrong_version_three() {
 }
 
 #[test]
+fn header_future_version_suggests_upgrade_not_rebuild() {
+    // Issue 3 (pre-existing, touched-file fix): a version > FORMAT_VERSION means the
+    // user needs a NEWER binary, not a rebuild.  The error message must say "upgrade"
+    // rather than "please rebuild the AST index" so the user gets actionable guidance.
+    let mut encoded = encode_header(&make_valid_header());
+    encoded[4..6].copy_from_slice(&3u16.to_le_bytes()); // v3 is a future version
+    let err = decode_header(&encoded).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("format version"),
+        "expected 'format version' in future-version message: {msg}"
+    );
+    assert!(
+        msg.contains("upgrade"),
+        "expected 'upgrade' in future-version message (not 'rebuild'): {msg}"
+    );
+    assert!(
+        !msg.contains("please rebuild the AST index"),
+        "future-version must NOT say 'please rebuild'; user needs a newer binary: {msg}"
+    );
+}
+
+#[test]
+fn header_old_version_suggests_rebuild_not_upgrade() {
+    // Complement: a version < FORMAT_VERSION (old index, current binary) must say
+    // "please rebuild" — not "upgrade".
+    let mut encoded = encode_header(&make_valid_header());
+    encoded[4..6].copy_from_slice(&1u16.to_le_bytes()); // v1 < FORMAT_VERSION
+    let err = decode_header(&encoded).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("please rebuild the AST index"),
+        "old-version (v1) must say 'please rebuild the AST index': {msg}"
+    );
+    assert!(
+        !msg.contains("upgrade"),
+        "old-version (v1) must NOT say 'upgrade'; user needs to rebuild: {msg}"
+    );
+}
+
+#[test]
 fn header_rejects_non_finite_avg_bigram_count() {
     let mut encoded = encode_header(&make_valid_header());
     encoded[26..30].copy_from_slice(&f32::NAN.to_le_bytes());

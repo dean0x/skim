@@ -321,10 +321,18 @@ pub(crate) fn decode_header(data: &[u8]) -> Result<AstSkidxHeader> {
     }
     let version = u16::from_le_bytes(read_array(data, 4, "header: version")?);
     if version != FORMAT_VERSION {
-        return Err(SearchError::IndexCorrupted(format!(
-            "unsupported format version: {version} (expected {FORMAT_VERSION}); \
-             please rebuild the AST index"
-        )));
+        let hint = if version > FORMAT_VERSION {
+            format!(
+                "unsupported format version: {version} (expected {FORMAT_VERSION}); \
+                 this index was created by a newer binary — upgrade rskim-search"
+            )
+        } else {
+            format!(
+                "unsupported format version: {version} (expected {FORMAT_VERSION}); \
+                 please rebuild the AST index"
+            )
+        };
+        return Err(SearchError::IndexCorrupted(hint));
     }
 
     let avg_bigram_count = f32::from_le_bytes(read_array(data, 26, "header: avg_bigram_count")?);
