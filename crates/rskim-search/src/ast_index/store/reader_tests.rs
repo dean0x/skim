@@ -949,6 +949,58 @@ fn c3_trigram_misaligned_posting_length_returns_index_corrupted() {
     );
 }
 
+/// (e) posting doc_id >= file_count → IndexCorrupted (out-of-range doc_id).
+///
+/// The CRC covers only `.skidx`, NOT `.skpost`, so corrupting `.skpost` is
+/// invisible to CRC validation.  A CRC-valid hostile index can embed a doc_id
+/// that is out of range for the `file_meta` / `file_metrics` arrays; this guard
+/// catches it before any downstream array access.
+#[test]
+fn c3_out_of_range_doc_id_returns_index_corrupted() {
+    // Build a single-file index (file_count = 1, so doc_id == 1 is out of range).
+    let dir = tempdir().unwrap();
+    let bigram_key: u32 = 0x0001_0002;
+    let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    let set = make_bigram_set(bigram_key, 1);
+    builder
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &set,
+            10,
+            StructuralMetrics::default(),
+        )
+        .unwrap();
+    builder.build().unwrap();
+
+    let idx = std::fs::read(dir.path().join("ast_index.skidx")).unwrap();
+    let mut post = std::fs::read(dir.path().join("ast_index.skpost")).unwrap();
+
+    // Overwrite the sole posting entry's doc_id (first 4 bytes) to 1, which is
+    // >= file_count (1).  The CRC does not cover skpost so open() still succeeds.
+    assert!(
+        post.len() >= POSTING_ENTRY_SIZE,
+        "expected at least one posting entry in post file"
+    );
+    post[0..4].copy_from_slice(&1u32.to_le_bytes()); // doc_id = 1, out of range
+
+    let corrupt_dir = tempdir().unwrap();
+    std::fs::write(corrupt_dir.path().join("ast_index.skidx"), &idx).unwrap();
+    std::fs::write(corrupt_dir.path().join("ast_index.skpost"), &post).unwrap();
+
+    let reader = AstIndexReader::open(corrupt_dir.path()).unwrap();
+    let err = reader.lookup_bigram(AstBigram(bigram_key)).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("Index corrupted"),
+        "expected IndexCorrupted for out-of-range doc_id, got: {msg}"
+    );
+    assert!(
+        msg.contains("out of range"),
+        "expected 'out of range' in error message, got: {msg}"
+    );
+}
+
 /// (d) posting doc_ids not strictly ascending → IndexCorrupted (non-monotone check).
 ///
 /// Build a two-file index, then manually write a posting list where the second

@@ -8,7 +8,7 @@
 //! [AstSkidxHeader: 48 bytes]
 //! [AstBigramEntry × bigram_count: 16 bytes each, sorted by key asc]
 //! [AstTrigramEntry × trigram_count: 20 bytes each, sorted by key asc]
-//! [AstFileMetaEntry × file_count: 5 bytes each]
+//! [AstFileMetaEntry × file_count: 15 bytes each]
 //! ```
 //!
 //! ## `ast_index.skpost`

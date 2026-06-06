@@ -325,7 +325,6 @@ pub static PUNCTUATION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|
         "ensure",
         "begin",
         "end",
-        "do",
         "synchronized",
         "volatile",
         "native",
@@ -337,11 +336,8 @@ pub static PUNCTUATION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|
         "unsafe",
         "pack",
         "unpack",
-        // Arrow/annotation tokens
-        "!",
-        "?",
+        // Annotation / preprocessor tokens
         "#",
-        "@",
     ];
     punct_kinds.iter().filter_map(|k| vocab_lookup(k)).collect()
 });

@@ -124,6 +124,24 @@ fn f2_real_statement_kinds_are_counted() {
     }
 }
 
+#[test]
+fn f2_punctuation_kinds_are_not_counted() {
+    // Regression guard for the PUNCTUATION_KIND_IDS set-membership branch in
+    // is_counted_child.  Uses vocab_lookup to resolve real kind_ids so the test
+    // remains correct even if the vocabulary is regenerated (applies ADR-003,
+    // avoids PF-005).  Tokens that resolve to None are absent from the active
+    // grammar vocabulary and are skipped rather than forcing a false failure.
+    use crate::ast_index::vocab_lookup;
+    for token in &["{", "}", "(", ")", ";", ","] {
+        if let Some(id) = vocab_lookup(token) {
+            assert!(
+                !is_counted_child(id),
+                "punctuation token {token:?} kind_id={id} must NOT be a counted child"
+            );
+        }
+    }
+}
+
 // ============================================================================
 // F1: StructuralMetrics computed from hand-built LinearNode sequences
 // ============================================================================

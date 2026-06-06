@@ -8,7 +8,7 @@
 //! [AstSkidxHeader: 48 bytes]
 //! [AstBigramEntry × bigram_count: 16 bytes each]
 //! [AstTrigramEntry × trigram_count: 20 bytes each]
-//! [AstFileMetaEntry × file_count: 5 bytes each]
+//! [AstFileMetaEntry × file_count: 15 bytes each]
 //! ```
 //!
 //! The `ast_index.skpost` file is memory-mapped when `postings_file_size > 0`.
@@ -310,7 +310,16 @@ impl AstIndexReader {
     /// Returns [`SearchError::IndexCorrupted`] if `file_index` is out of bounds.
     pub fn file_meta(&self, file_index: u32) -> Result<AstFileMetaEntry> {
         let meta_start = self.meta_start();
-        let offset = meta_start + (file_index as usize) * FILE_META_SIZE;
+        // avoids PF-004: use checked arithmetic throughout to prevent silent
+        // overflow on 32-bit targets where usize is 32 bits.
+        let offset = (file_index as usize)
+            .checked_mul(FILE_META_SIZE)
+            .and_then(|o| meta_start.checked_add(o))
+            .ok_or_else(|| {
+                SearchError::IndexCorrupted(format!(
+                    "file_meta({file_index}): offset overflow"
+                ))
+            })?;
         let end = offset
             .checked_add(FILE_META_SIZE)
             .filter(|&e| e <= self.idx_mmap.len())
@@ -455,6 +464,16 @@ impl AstIndexReader {
         for i in 0..n {
             let off = i * POSTING_ENTRY_SIZE;
             let raw = decode_posting(&data[off..off + POSTING_ENTRY_SIZE])?;
+            // C3: doc_id must refer to a file that actually exists in the index.
+            // A CRC-valid hostile index could embed an out-of-range doc_id; any
+            // downstream call to file_meta(doc_id) or file_metrics(doc_id) would
+            // then access garbage bytes.  Reject here rather than propagate.
+            if raw.doc_id >= self.header.file_count {
+                return Err(SearchError::IndexCorrupted(format!(
+                    "posting doc_id {} out of range (file_count={})",
+                    raw.doc_id, self.header.file_count
+                )));
+            }
             // C1 defensive check: postings must be strictly ascending by doc_id.
             // Collapsed from nested `if let`/`if` to satisfy clippy::collapsible_if.
             if let Some(prev) = prev_doc_id.filter(|&prev| raw.doc_id <= prev) {
