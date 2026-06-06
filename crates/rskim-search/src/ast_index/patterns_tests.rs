@@ -14,10 +14,10 @@ use std::collections::HashSet;
 use rskim_core::Language;
 
 use super::*;
+use crate::ast_index::structural::{DEEP_NODE, EMPTY_BODY, LARGE_BODY, MANY_PARAMS, bucket_label};
 use crate::ast_index::{
     AstBigram, AstTrigram, extract_ast_ngrams_with_metrics, linearize_source, vocab_resolve,
 };
-use crate::ast_index::structural::{DEEP_NODE, EMPTY_BODY, LARGE_BODY, MANY_PARAMS, bucket_label};
 
 // ============================================================================
 // F6: Catalog integrity
@@ -55,11 +55,7 @@ fn f6_all_categories_non_empty() {
 fn f6_pattern_names_are_unique() {
     let mut seen: HashSet<&str> = HashSet::new();
     for p in PATTERNS {
-        assert!(
-            seen.insert(p.name),
-            "duplicate pattern name: '{}'",
-            p.name
-        );
+        assert!(seen.insert(p.name), "duplicate pattern name: '{}'", p.name);
     }
 }
 
@@ -68,11 +64,7 @@ fn f6_lookup_hit_and_miss() {
     // Hit: every pattern in the catalog must be reachable by name
     for p in PATTERNS {
         let result = lookup_pattern(p.name);
-        assert!(
-            result.is_ok(),
-            "lookup_pattern('{}') must succeed",
-            p.name
-        );
+        assert!(result.is_ok(), "lookup_pattern('{}') must succeed", p.name);
         assert_eq!(
             result.unwrap().name,
             p.name,
@@ -83,7 +75,10 @@ fn f6_lookup_hit_and_miss() {
 
     // Miss: a random non-existent name must return Err
     let miss = lookup_pattern("__not_a_real_pattern__");
-    assert!(miss.is_err(), "lookup_pattern for unknown name must return Err");
+    assert!(
+        miss.is_err(),
+        "lookup_pattern for unknown name must return Err"
+    );
 }
 
 #[test]
@@ -233,12 +228,30 @@ fn a6_synthetic_name_resolution_roundtrip() {
     assert_eq!(resolve_kind_name("__deep_node__"), Some(DEEP_NODE));
 
     // Bucket labels
-    assert_eq!(resolve_kind_name("__large_body_b10__"), Some(bucket_label(0)));
-    assert_eq!(resolve_kind_name("__large_body_b20__"), Some(bucket_label(1)));
-    assert_eq!(resolve_kind_name("__large_body_b40__"), Some(bucket_label(2)));
-    assert_eq!(resolve_kind_name("__many_params_b5__"), Some(bucket_label(0)));
-    assert_eq!(resolve_kind_name("__many_params_b8__"), Some(bucket_label(1)));
-    assert_eq!(resolve_kind_name("__many_params_b12__"), Some(bucket_label(2)));
+    assert_eq!(
+        resolve_kind_name("__large_body_b10__"),
+        Some(bucket_label(0))
+    );
+    assert_eq!(
+        resolve_kind_name("__large_body_b20__"),
+        Some(bucket_label(1))
+    );
+    assert_eq!(
+        resolve_kind_name("__large_body_b40__"),
+        Some(bucket_label(2))
+    );
+    assert_eq!(
+        resolve_kind_name("__many_params_b5__"),
+        Some(bucket_label(0))
+    );
+    assert_eq!(
+        resolve_kind_name("__many_params_b8__"),
+        Some(bucket_label(1))
+    );
+    assert_eq!(
+        resolve_kind_name("__many_params_b12__"),
+        Some(bucket_label(2))
+    );
     assert_eq!(resolve_kind_name("__deep_node_b4__"), Some(bucket_label(0)));
     assert_eq!(resolve_kind_name("__deep_node_b6__"), Some(bucket_label(1)));
     assert_eq!(resolve_kind_name("__deep_node_b8__"), Some(bucket_label(2)));
@@ -249,7 +262,10 @@ fn a6_synthetic_name_resolution_roundtrip() {
 
     // Real vocab names still resolve through vocab_lookup
     let fn_item = resolve_kind_name("function_item");
-    assert!(fn_item.is_some(), "function_item must resolve via vocab_lookup");
+    assert!(
+        fn_item.is_some(),
+        "function_item must resolve via vocab_lookup"
+    );
 
     // Synthetic IDs are NOT in the vocabulary (isolation guarantee from F5)
     assert!(
@@ -278,7 +294,11 @@ fn a6_synthetic_bigram_encode_decode_matches_extract() {
 
     let p = lookup_pattern("deep-nesting").expect("deep-nesting must be in catalog");
     let resolved = p.resolved_bigrams();
-    assert_eq!(resolved.len(), 1, "deep-nesting must resolve exactly 1 bigram");
+    assert_eq!(
+        resolved.len(),
+        1,
+        "deep-nesting must resolve exactly 1 bigram"
+    );
     assert_eq!(
         resolved[0], expected_bigram,
         "deep-nesting bigram must equal AstBigram::encode(DEEP_NODE, bucket_label(0))"
@@ -297,7 +317,11 @@ fn a6_empty_body_bigram_matches_extract() {
     // empty-catch: EMPTY_BODY → catch_clause
     let p = lookup_pattern("empty-catch").expect("empty-catch must be in catalog");
     let resolved = p.resolved_bigrams();
-    assert_eq!(resolved.len(), 1, "empty-catch must resolve exactly 1 bigram");
+    assert_eq!(
+        resolved.len(),
+        1,
+        "empty-catch must resolve exactly 1 bigram"
+    );
 
     let produced = extract_bigrams(p.example, p.example_lang);
     assert!(
@@ -313,8 +337,15 @@ fn a6_god_function_bigram_matches_extract() {
 
     let p = lookup_pattern("god-function").expect("god-function must be in catalog");
     let resolved = p.resolved_bigrams();
-    assert_eq!(resolved.len(), 1, "god-function must resolve exactly 1 bigram");
-    assert_eq!(resolved[0], expected, "god-function bigram must be LARGE_BODY→bucket_label(1)");
+    assert_eq!(
+        resolved.len(),
+        1,
+        "god-function must resolve exactly 1 bigram"
+    );
+    assert_eq!(
+        resolved[0], expected,
+        "god-function bigram must be LARGE_BODY→bucket_label(1)"
+    );
 
     let produced = extract_bigrams(p.example, p.example_lang);
     assert!(
@@ -330,7 +361,11 @@ fn a6_excessive_params_bigram_matches_extract() {
 
     let p = lookup_pattern("excessive-params").expect("excessive-params must be in catalog");
     let resolved = p.resolved_bigrams();
-    assert_eq!(resolved.len(), 1, "excessive-params must resolve exactly 1 bigram");
+    assert_eq!(
+        resolved.len(),
+        1,
+        "excessive-params must resolve exactly 1 bigram"
+    );
     assert_eq!(
         resolved[0], expected,
         "excessive-params bigram must be MANY_PARAMS→bucket_label(0)"

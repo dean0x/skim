@@ -188,39 +188,162 @@ pub static PUNCTUATION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|
     // Punctuation: single-character tokens that appear as named nodes in CSTs.
     let punct_kinds: &[&str] = &[
         // Brackets / delimiters
-        "{", "}", "(", ")", "[", "]", "<", ">",
+        "{",
+        "}",
+        "(",
+        ")",
+        "[",
+        "]",
+        "<",
+        ">",
         // Separators / terminators
-        ",", ";", ":", "::", ".", "...", "..", "->", "=>", "@",
+        ",",
+        ";",
+        ":",
+        "::",
+        ".",
+        "...",
+        "..",
+        "->",
+        "=>",
+        "@",
         // Operators used as tokens at statement-block level
-        "|", "&", "*", "+", "-", "/", "%", "=", "==", "!=",
-        "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
-        "<=", ">=", "&&", "||", "!", "~", "^", "<<", ">>",
-        "?", "??", "?.","?:",
+        "|",
+        "&",
+        "*",
+        "+",
+        "-",
+        "/",
+        "%",
+        "=",
+        "==",
+        "!=",
+        "+=",
+        "-=",
+        "*=",
+        "/=",
+        "%=",
+        "&=",
+        "|=",
+        "^=",
+        "<=",
+        ">=",
+        "&&",
+        "||",
+        "!",
+        "~",
+        "^",
+        "<<",
+        ">>",
+        "?",
+        "??",
+        "?.",
+        "?:",
         // Universal structural keywords (not statement-level constructs)
-        "fn", "function", "def", "class", "struct", "impl", "trait",
-        "let", "var", "const", "return", "if", "else", "for", "while",
-        "do", "switch", "case", "default", "break", "continue",
-        "try", "catch", "finally", "throw", "throws",
-        "public", "private", "protected", "static", "final", "abstract",
-        "async", "await", "yield", "import", "export", "from", "as",
-        "type", "interface", "enum", "namespace", "module",
-        "new", "delete", "typeof", "instanceof", "in", "of",
-        "true", "false", "null", "undefined", "nil", "None", "True", "False",
-        "self", "Self", "super", "this",
-        "mut", "ref", "pub", "use", "mod", "crate", "extern",
-        "match", "where", "move", "dyn", "box",
-        "go", "defer", "chan", "select", "range", "make", "append",
-        "rescue", "ensure", "begin", "end", "do",
-        "synchronized", "volatile", "native", "transient",
-        "override", "open", "closed", "sealed",
-        "unsafe", "pack", "unpack",
+        "fn",
+        "function",
+        "def",
+        "class",
+        "struct",
+        "impl",
+        "trait",
+        "let",
+        "var",
+        "const",
+        "return",
+        "if",
+        "else",
+        "for",
+        "while",
+        "do",
+        "switch",
+        "case",
+        "default",
+        "break",
+        "continue",
+        "try",
+        "catch",
+        "finally",
+        "throw",
+        "throws",
+        "public",
+        "private",
+        "protected",
+        "static",
+        "final",
+        "abstract",
+        "async",
+        "await",
+        "yield",
+        "import",
+        "export",
+        "from",
+        "as",
+        "type",
+        "interface",
+        "enum",
+        "namespace",
+        "module",
+        "new",
+        "delete",
+        "typeof",
+        "instanceof",
+        "in",
+        "of",
+        "true",
+        "false",
+        "null",
+        "undefined",
+        "nil",
+        "None",
+        "True",
+        "False",
+        "self",
+        "Self",
+        "super",
+        "this",
+        "mut",
+        "ref",
+        "pub",
+        "use",
+        "mod",
+        "crate",
+        "extern",
+        "match",
+        "where",
+        "move",
+        "dyn",
+        "box",
+        "go",
+        "defer",
+        "chan",
+        "select",
+        "range",
+        "make",
+        "append",
+        "rescue",
+        "ensure",
+        "begin",
+        "end",
+        "do",
+        "synchronized",
+        "volatile",
+        "native",
+        "transient",
+        "override",
+        "open",
+        "closed",
+        "sealed",
+        "unsafe",
+        "pack",
+        "unpack",
         // Arrow/annotation tokens
-        "!", "?", "#", "@",
+        "!",
+        "?",
+        "#",
+        "@",
     ];
-    punct_kinds
-        .iter()
-        .filter_map(|k| vocab_lookup(k))
-        .collect()
+    punct_kinds.iter().filter_map(|k| vocab_lookup(k)).collect()
 });
 
 // ============================================================================
@@ -237,15 +360,15 @@ pub static FUNCTION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|| {
     // the broader function-construct list in node_kind_info.
     let fn_kinds = [
         // Generic / cross-language
-        "function_declaration",  // TypeScript/JavaScript/Go/C; Swift reuses same string
+        "function_declaration", // TypeScript/JavaScript/Go/C; Swift reuses same string
         "function_item",
-        "method_declaration",    // Java, C#, Kotlin reuse same string
+        "method_declaration", // Java, C#, Kotlin reuse same string
         "function_definition",
         "method_definition",
         "arrow_function",
         "function_expression",
         // C/C++
-        "declaration",           // covers many C/C++ function decls in tree-sitter
+        "declaration", // covers many C/C++ function decls in tree-sitter
         "template_declaration",
         // C# / Java
         "constructor_declaration",
@@ -259,10 +382,7 @@ pub static FUNCTION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|| {
         "secondary_constructor",
         "anonymous_initializer",
     ];
-    fn_kinds
-        .iter()
-        .filter_map(|k| vocab_lookup(k))
-        .collect()
+    fn_kinds.iter().filter_map(|k| vocab_lookup(k)).collect()
 });
 
 /// Body/block kind IDs (direct-child bodies of function constructs).
@@ -273,17 +393,14 @@ pub static FUNCTION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|| {
 /// Derived from rskim-core/src/transform/utils.rs get_body_node_kinds.
 pub static BODY_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|| {
     let body_kinds = [
-        "statement_block",   // TypeScript / JavaScript
-        "block",             // Python, Rust, Go, Java, C#, CSharp
+        "statement_block",    // TypeScript / JavaScript
+        "block",              // Python, Rust, Go, Java, C#, CSharp
         "compound_statement", // C / C++
-        "constructor_body",  // Java
-        "body_statement",    // Ruby
-        "function_body",     // Swift, Kotlin
+        "constructor_body",   // Java
+        "body_statement",     // Ruby
+        "function_body",      // Swift, Kotlin
     ];
-    body_kinds
-        .iter()
-        .filter_map(|k| vocab_lookup(k))
-        .collect()
+    body_kinds.iter().filter_map(|k| vocab_lookup(k)).collect()
 });
 
 /// Parameter list kind IDs.
@@ -298,10 +415,7 @@ pub static PARAM_LIST_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(||
         "parameter_list",        // C#, Kotlin, Swift (some grammars)
         "method_parameters",     // some grammars
     ];
-    param_kinds
-        .iter()
-        .filter_map(|k| vocab_lookup(k))
-        .collect()
+    param_kinds.iter().filter_map(|k| vocab_lookup(k)).collect()
 });
 
 /// Branch-construct kind IDs (for `branch_count` in `StructuralMetrics`).
@@ -312,26 +426,26 @@ pub static BRANCH_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|| {
     let branch_kinds = [
         // Conditionals
         "if_statement",
-        "if_expression",         // Rust
+        "if_expression",          // Rust
         "conditional_expression", // C/C++ ternary
-        "ternary_expression",    // TypeScript / JavaScript
+        "ternary_expression",     // TypeScript / JavaScript
         // Loops
         "while_statement",
-        "while_expression",      // Rust
+        "while_expression", // Rust
         "for_statement",
         "for_in_statement",
-        "for_expression",        // Rust
-        "loop_expression",       // Rust `loop`
-        "do_statement",          // Java, C/C++ do-while
+        "for_expression",  // Rust
+        "loop_expression", // Rust `loop`
+        "do_statement",    // Java, C/C++ do-while
         // Pattern matching / switch
-        "match_expression",      // Rust
+        "match_expression", // Rust
         "switch_statement",
-        "switch_expression",     // Java 14+
-        "case_statement",        // some grammars treat case as branch
+        "switch_expression", // Java 14+
+        "case_statement",    // some grammars treat case as branch
         // Misc
         "try_statement",
-        "except_clause",         // Python
-        "rescue_clause",         // Ruby
+        "except_clause", // Python
+        "rescue_clause", // Ruby
         "catch_clause",
     ];
     branch_kinds
@@ -366,9 +480,7 @@ pub static BRANCH_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|| {
 #[inline]
 #[must_use]
 pub fn is_counted_child(kind_id: NodeKindId) -> bool {
-    kind_id != 0
-        && !COMMENT_KIND_IDS.contains(&kind_id)
-        && !PUNCTUATION_KIND_IDS.contains(&kind_id)
+    kind_id != 0 && !COMMENT_KIND_IDS.contains(&kind_id) && !PUNCTUATION_KIND_IDS.contains(&kind_id)
 }
 
 // ============================================================================

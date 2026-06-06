@@ -330,13 +330,12 @@ pub fn extract_ast_ngrams_with_metrics(
 
     // Helper: emit a synthetic bigram with count=1, DEFAULT_AST_WEIGHT
     // into `bigram_map`.
-    let emit_synthetic = |bm: &mut HashMap<AstBigram, (f32, u32)>,
-                          parent: NodeKindId,
-                          child: NodeKindId| {
-        let key = AstBigram::encode(parent, child);
-        let entry = bm.entry(key).or_insert((DEFAULT_AST_WEIGHT, 0));
-        entry.1 = entry.1.saturating_add(1);
-    };
+    let emit_synthetic =
+        |bm: &mut HashMap<AstBigram, (f32, u32)>, parent: NodeKindId, child: NodeKindId| {
+            let key = AstBigram::encode(parent, child);
+            let entry = bm.entry(key).or_insert((DEFAULT_AST_WEIGHT, 0));
+            entry.1 = entry.1.saturating_add(1);
+        };
 
     for node in nodes {
         let d = usize::from(node.depth);
@@ -434,7 +433,10 @@ pub fn extract_ast_ngrams_with_metrics(
 
         // ── Resolve parent and grandparent (real n-gram emission) ─────────────
         let table_len = ancestors.len();
-        debug_assert!(d < table_len, "depth {d} out of ancestor table (len={table_len})");
+        debug_assert!(
+            d < table_len,
+            "depth {d} out of ancestor table (len={table_len})"
+        );
 
         let parent: Option<NodeKindId> = node
             .depth
@@ -486,13 +488,7 @@ pub fn extract_ast_ngrams_with_metrics(
     if let Some(p) = prev_depth {
         for d in (0..=usize::from(p)).rev() {
             if ancestors[d].is_some() {
-                close_depth(
-                    d,
-                    &child_counts,
-                    &depth_kind,
-                    &mut metrics,
-                    &mut bigram_map,
-                );
+                close_depth(d, &child_counts, &depth_kind, &mut metrics, &mut bigram_map);
             }
         }
     }
@@ -596,7 +592,6 @@ fn close_depth(
             }
         }
     }
-
 }
 
 /// Extract structural n-grams using the production per-language IDF tables.

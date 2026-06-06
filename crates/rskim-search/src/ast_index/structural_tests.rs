@@ -5,8 +5,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
-use crate::ast_index::{AstBigram, vocab_resolve};
 use crate::ast_index::extract::extract_ast_ngrams_with_metrics;
+use crate::ast_index::{AstBigram, vocab_resolve};
 
 // ============================================================================
 // F5: Synthetic ID isolation — vocab_resolve returns None for all synthetic IDs
@@ -42,11 +42,17 @@ fn f5_synthetic_ids_not_in_vocab() {
     }
     for (i, _) in PARAM_EDGES.iter().enumerate() {
         let id = bucket_label(i);
-        assert!(vocab_resolve(id).is_none(), "param bucket_label({i})={id} not in vocab");
+        assert!(
+            vocab_resolve(id).is_none(),
+            "param bucket_label({i})={id} not in vocab"
+        );
     }
     for (i, _) in DEPTH_EDGES.iter().enumerate() {
         let id = bucket_label(i);
-        assert!(vocab_resolve(id).is_none(), "depth bucket_label({i})={id} not in vocab");
+        assert!(
+            vocab_resolve(id).is_none(),
+            "depth bucket_label({i})={id} not in vocab"
+        );
     }
 }
 
@@ -57,7 +63,9 @@ fn f5_bucket_label_range_is_safe() {
     assert!(
         max_label < EMPTY_BODY,
         "bucket label range [{}..{}] must not overlap synthetic parent IDs [{}..)",
-        BUCKET_LABEL_BASE, max_label, EMPTY_BODY
+        BUCKET_LABEL_BASE,
+        max_label,
+        EMPTY_BODY
     );
 }
 
@@ -68,7 +76,10 @@ fn f5_bucket_label_range_is_safe() {
 #[test]
 fn f2_sentinel_is_not_counted() {
     // kind_id == 0 is the punctuation/unknown sentinel
-    assert!(!is_counted_child(0), "sentinel kind_id=0 must NOT be a counted child");
+    assert!(
+        !is_counted_child(0),
+        "sentinel kind_id=0 must NOT be a counted child"
+    );
 }
 
 #[test]
@@ -76,10 +87,16 @@ fn f2_comment_kinds_are_not_counted() {
     use crate::ast_index::vocab_lookup;
     // If "comment" is in vocab, it must not be counted
     if let Some(id) = vocab_lookup("comment") {
-        assert!(!is_counted_child(id), "'comment' kind_id={id} must NOT be a counted child");
+        assert!(
+            !is_counted_child(id),
+            "'comment' kind_id={id} must NOT be a counted child"
+        );
     }
     if let Some(id) = vocab_lookup("line_comment") {
-        assert!(!is_counted_child(id), "'line_comment' kind_id={id} must NOT be a counted child");
+        assert!(
+            !is_counted_child(id),
+            "'line_comment' kind_id={id} must NOT be a counted child"
+        );
     }
     if let Some(id) = vocab_lookup("block_comment") {
         assert!(
@@ -94,10 +111,16 @@ fn f2_real_statement_kinds_are_counted() {
     use crate::ast_index::vocab_lookup;
     // A real, non-comment kind that IS in the vocab should be counted
     if let Some(id) = vocab_lookup("function_item") {
-        assert!(is_counted_child(id), "'function_item' kind_id={id} must be a counted child");
+        assert!(
+            is_counted_child(id),
+            "'function_item' kind_id={id} must be a counted child"
+        );
     }
     if let Some(id) = vocab_lookup("if_statement") {
-        assert!(is_counted_child(id), "'if_statement' kind_id={id} must be a counted child");
+        assert!(
+            is_counted_child(id),
+            "'if_statement' kind_id={id} must be a counted child"
+        );
     }
 }
 
@@ -121,10 +144,22 @@ fn f1_empty_input_gives_zero_metrics() {
 fn f1_max_depth_tracks_maximum() {
     // Build a simple flat list: depths 0, 1, 2, 3
     let nodes = vec![
-        LinearNode { kind_id: 1, depth: 0 },
-        LinearNode { kind_id: 1, depth: 1 },
-        LinearNode { kind_id: 1, depth: 2 },
-        LinearNode { kind_id: 1, depth: 3 },
+        LinearNode {
+            kind_id: 1,
+            depth: 0,
+        },
+        LinearNode {
+            kind_id: 1,
+            depth: 1,
+        },
+        LinearNode {
+            kind_id: 1,
+            depth: 2,
+        },
+        LinearNode {
+            kind_id: 1,
+            depth: 3,
+        },
     ];
     let (_, m) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
     assert_eq!(m.max_depth, 3);
@@ -134,8 +169,14 @@ fn f1_max_depth_tracks_maximum() {
 fn f1_max_depth_handles_depth_jump() {
     // A depth jump (0 → 5 via gap): max should still be 5
     let nodes = vec![
-        LinearNode { kind_id: 1, depth: 0 },
-        LinearNode { kind_id: 1, depth: 5 }, // jump by 5
+        LinearNode {
+            kind_id: 1,
+            depth: 0,
+        },
+        LinearNode {
+            kind_id: 1,
+            depth: 5,
+        }, // jump by 5
     ];
     let (_, m) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
     assert_eq!(m.max_depth, 5);
@@ -152,7 +193,10 @@ fn f1_branch_count_increments_for_branch_kinds() {
     let nodes: Vec<LinearNode> = [if_id, while_id]
         .iter()
         .enumerate()
-        .map(|(i, &kid)| LinearNode { kind_id: kid, depth: i as u16 })
+        .map(|(i, &kid)| LinearNode {
+            kind_id: kid,
+            depth: i as u16,
+        })
         .collect();
 
     let (_, m) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
@@ -170,8 +214,8 @@ fn f1_branch_count_increments_for_branch_kinds() {
 
 #[test]
 fn f3_body_stmt_buckets_emit_cumulatively() {
-    use crate::ast_index::vocab_lookup;
     use crate::ast_index::extract::extract_ast_ngrams_with_metrics;
+    use crate::ast_index::vocab_lookup;
 
     let fn_id = match vocab_lookup("function_item") {
         Some(id) => id,
@@ -193,11 +237,20 @@ fn f3_body_stmt_buckets_emit_cumulatively() {
     // then `n_stmts` statement nodes at depth 2.
     let build_nodes = |n_stmts: u32| -> Vec<LinearNode> {
         let mut v = vec![
-            LinearNode { kind_id: fn_id, depth: 0 },
-            LinearNode { kind_id: block_id, depth: 1 },
+            LinearNode {
+                kind_id: fn_id,
+                depth: 0,
+            },
+            LinearNode {
+                kind_id: block_id,
+                depth: 1,
+            },
         ];
         for _ in 0..n_stmts {
-            v.push(LinearNode { kind_id: expr_id, depth: 2 });
+            v.push(LinearNode {
+                kind_id: expr_id,
+                depth: 2,
+            });
         }
         v
     };
@@ -215,26 +268,41 @@ fn f3_body_stmt_buckets_emit_cumulatively() {
     // 10 stmts → b0 only
     let (set10, _) = extract_ast_ngrams_with_metrics(&build_nodes(10), Language::Rust);
     assert!(
-        set10.bigrams.iter().any(|e| e.ngram == AstBigram::encode(LARGE_BODY, bucket_label(0))),
+        set10
+            .bigrams
+            .iter()
+            .any(|e| e.ngram == AstBigram::encode(LARGE_BODY, bucket_label(0))),
         "10 stmts must emit LARGE_BODY→bucket_label(0)"
     );
     assert!(
-        !set10.bigrams.iter().any(|e| e.ngram == AstBigram::encode(LARGE_BODY, bucket_label(1))),
+        !set10
+            .bigrams
+            .iter()
+            .any(|e| e.ngram == AstBigram::encode(LARGE_BODY, bucket_label(1))),
         "10 stmts must NOT emit LARGE_BODY→bucket_label(1)"
     );
 
     // 25 stmts → b0 AND b1
     let (set25, _) = extract_ast_ngrams_with_metrics(&build_nodes(25), Language::Rust);
     assert!(
-        set25.bigrams.iter().any(|e| e.ngram == AstBigram::encode(LARGE_BODY, bucket_label(0))),
+        set25
+            .bigrams
+            .iter()
+            .any(|e| e.ngram == AstBigram::encode(LARGE_BODY, bucket_label(0))),
         "25 stmts must emit LARGE_BODY→bucket_label(0)"
     );
     assert!(
-        set25.bigrams.iter().any(|e| e.ngram == AstBigram::encode(LARGE_BODY, bucket_label(1))),
+        set25
+            .bigrams
+            .iter()
+            .any(|e| e.ngram == AstBigram::encode(LARGE_BODY, bucket_label(1))),
         "25 stmts must emit LARGE_BODY→bucket_label(1)"
     );
     assert!(
-        !set25.bigrams.iter().any(|e| e.ngram == AstBigram::encode(LARGE_BODY, bucket_label(2))),
+        !set25
+            .bigrams
+            .iter()
+            .any(|e| e.ngram == AstBigram::encode(LARGE_BODY, bucket_label(2))),
         "25 stmts must NOT emit LARGE_BODY→bucket_label(2)"
     );
 
@@ -242,7 +310,10 @@ fn f3_body_stmt_buckets_emit_cumulatively() {
     let (set40, _) = extract_ast_ngrams_with_metrics(&build_nodes(40), Language::Rust);
     for i in 0..BODY_STMT_EDGES.len() {
         assert!(
-            set40.bigrams.iter().any(|e| e.ngram == AstBigram::encode(LARGE_BODY, bucket_label(i))),
+            set40
+                .bigrams
+                .iter()
+                .any(|e| e.ngram == AstBigram::encode(LARGE_BODY, bucket_label(i))),
             "40 stmts must emit LARGE_BODY→bucket_label({i})"
         );
     }
@@ -254,29 +325,40 @@ fn f3_depth_buckets_emit_cumulatively() {
     // A node at depth 6 must also emit bucket_label(1)
     // A node at depth 8 must emit bucket_label(0), bucket_label(1), bucket_label(2)
     let make_nodes_at_depth = |d: u16| -> Vec<LinearNode> {
-        (0..=d).map(|depth| LinearNode { kind_id: 1, depth }).collect()
+        (0..=d)
+            .map(|depth| LinearNode { kind_id: 1, depth })
+            .collect()
     };
 
     let (set4, _) = extract_ast_ngrams_with_metrics(&make_nodes_at_depth(4), Language::Rust);
     assert!(
-        set4.bigrams.iter().any(|e| e.ngram == AstBigram::encode(DEEP_NODE, bucket_label(0))),
+        set4.bigrams
+            .iter()
+            .any(|e| e.ngram == AstBigram::encode(DEEP_NODE, bucket_label(0))),
         "depth 4 must emit DEEP_NODE→bucket_label(0)"
     );
     assert!(
-        !set4.bigrams.iter().any(|e| e.ngram == AstBigram::encode(DEEP_NODE, bucket_label(1))),
+        !set4
+            .bigrams
+            .iter()
+            .any(|e| e.ngram == AstBigram::encode(DEEP_NODE, bucket_label(1))),
         "depth 4 must NOT emit DEEP_NODE→bucket_label(1)"
     );
 
     let (set6, _) = extract_ast_ngrams_with_metrics(&make_nodes_at_depth(6), Language::Rust);
     assert!(
-        set6.bigrams.iter().any(|e| e.ngram == AstBigram::encode(DEEP_NODE, bucket_label(1))),
+        set6.bigrams
+            .iter()
+            .any(|e| e.ngram == AstBigram::encode(DEEP_NODE, bucket_label(1))),
         "depth 6 must emit DEEP_NODE→bucket_label(1)"
     );
 
     let (set8, _) = extract_ast_ngrams_with_metrics(&make_nodes_at_depth(8), Language::Rust);
     for i in 0..DEPTH_EDGES.len() {
         assert!(
-            set8.bigrams.iter().any(|e| e.ngram == AstBigram::encode(DEEP_NODE, bucket_label(i))),
+            set8.bigrams
+                .iter()
+                .any(|e| e.ngram == AstBigram::encode(DEEP_NODE, bucket_label(i))),
             "depth 8 must emit DEEP_NODE→bucket_label({i})"
         );
     }
@@ -299,12 +381,22 @@ fn f3_param_buckets_emit_cumulatively() {
 
     let build_nodes = |n_params: u32| -> Vec<LinearNode> {
         let mut v = vec![
-            LinearNode { kind_id: fn_id, depth: 0 },
-            LinearNode { kind_id: params_id, depth: 1 },
+            LinearNode {
+                kind_id: fn_id,
+                depth: 0,
+            },
+            LinearNode {
+                kind_id: params_id,
+                depth: 1,
+            },
         ];
         for _ in 0..n_params {
             v.push(LinearNode {
-                kind_id: if is_counted_child(identifier_id) { identifier_id } else { 1 },
+                kind_id: if is_counted_child(identifier_id) {
+                    identifier_id
+                } else {
+                    1
+                },
                 depth: 2,
             });
         }
@@ -314,25 +406,35 @@ fn f3_param_buckets_emit_cumulatively() {
     // 4 params → no bucket
     let (set4, _) = extract_ast_ngrams_with_metrics(&build_nodes(4), Language::Rust);
     assert!(
-        !set4.bigrams.iter().any(|e| e.ngram == AstBigram::encode(MANY_PARAMS, bucket_label(0))),
+        !set4
+            .bigrams
+            .iter()
+            .any(|e| e.ngram == AstBigram::encode(MANY_PARAMS, bucket_label(0))),
         "4 params must NOT emit MANY_PARAMS bucket"
     );
 
     // 5 params → b0 only
     let (set5, _) = extract_ast_ngrams_with_metrics(&build_nodes(5), Language::Rust);
     assert!(
-        set5.bigrams.iter().any(|e| e.ngram == AstBigram::encode(MANY_PARAMS, bucket_label(0))),
+        set5.bigrams
+            .iter()
+            .any(|e| e.ngram == AstBigram::encode(MANY_PARAMS, bucket_label(0))),
         "5 params must emit MANY_PARAMS→bucket_label(0)"
     );
     assert!(
-        !set5.bigrams.iter().any(|e| e.ngram == AstBigram::encode(MANY_PARAMS, bucket_label(1))),
+        !set5
+            .bigrams
+            .iter()
+            .any(|e| e.ngram == AstBigram::encode(MANY_PARAMS, bucket_label(1))),
         "5 params must NOT emit bucket_label(1)"
     );
 
     // 8 params → b0, b1
     let (set8, _) = extract_ast_ngrams_with_metrics(&build_nodes(8), Language::Rust);
     assert!(
-        set8.bigrams.iter().any(|e| e.ngram == AstBigram::encode(MANY_PARAMS, bucket_label(1))),
+        set8.bigrams
+            .iter()
+            .any(|e| e.ngram == AstBigram::encode(MANY_PARAMS, bucket_label(1))),
         "8 params must emit MANY_PARAMS→bucket_label(1)"
     );
 
@@ -340,7 +442,10 @@ fn f3_param_buckets_emit_cumulatively() {
     let (set12, _) = extract_ast_ngrams_with_metrics(&build_nodes(12), Language::Rust);
     for i in 0..PARAM_EDGES.len() {
         assert!(
-            set12.bigrams.iter().any(|e| e.ngram == AstBigram::encode(MANY_PARAMS, bucket_label(i))),
+            set12
+                .bigrams
+                .iter()
+                .any(|e| e.ngram == AstBigram::encode(MANY_PARAMS, bucket_label(i))),
             "12 params must emit MANY_PARAMS→bucket_label({i})"
         );
     }
@@ -369,18 +474,36 @@ fn f4_empty_body_keyed_on_enclosing_kind() {
 
     // Empty catch: catch_clause at depth 0 → statement_block at depth 1, nothing at depth 2
     let catch_nodes = vec![
-        LinearNode { kind_id: catch_id, depth: 0 },
-        LinearNode { kind_id: block_id, depth: 1 },
+        LinearNode {
+            kind_id: catch_id,
+            depth: 0,
+        },
+        LinearNode {
+            kind_id: block_id,
+            depth: 1,
+        },
         // punctuation at depth 2 (should NOT count as a statement)
-        LinearNode { kind_id: 0, depth: 2 },
+        LinearNode {
+            kind_id: 0,
+            depth: 2,
+        },
     ];
 
     // Empty function: function_declaration at depth 0 → statement_block at depth 1
     let fn_nodes = vec![
-        LinearNode { kind_id: fn_id, depth: 0 },
-        LinearNode { kind_id: block_id, depth: 1 },
+        LinearNode {
+            kind_id: fn_id,
+            depth: 0,
+        },
+        LinearNode {
+            kind_id: block_id,
+            depth: 1,
+        },
         // punctuation at depth 2
-        LinearNode { kind_id: 0, depth: 2 },
+        LinearNode {
+            kind_id: 0,
+            depth: 2,
+        },
     ];
 
     let (catch_set, _) = extract_ast_ngrams_with_metrics(&catch_nodes, Language::TypeScript);
@@ -428,10 +551,22 @@ fn f2_punctuation_only_body_is_empty() {
 
     // Body contains only sentinel (punctuation) nodes at depth 2
     let nodes = vec![
-        LinearNode { kind_id: fn_id, depth: 0 },
-        LinearNode { kind_id: block_id, depth: 1 },
-        LinearNode { kind_id: 0, depth: 2 }, // punctuation
-        LinearNode { kind_id: 0, depth: 2 }, // punctuation
+        LinearNode {
+            kind_id: fn_id,
+            depth: 0,
+        },
+        LinearNode {
+            kind_id: block_id,
+            depth: 1,
+        },
+        LinearNode {
+            kind_id: 0,
+            depth: 2,
+        }, // punctuation
+        LinearNode {
+            kind_id: 0,
+            depth: 2,
+        }, // punctuation
     ];
     let (set, _) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
     let empty_key = AstBigram::encode(EMPTY_BODY, fn_id);
@@ -460,9 +595,18 @@ fn f2_comment_only_body_is_empty() {
 
     // Body contains only comment nodes at depth 2
     let nodes = vec![
-        LinearNode { kind_id: fn_id, depth: 0 },
-        LinearNode { kind_id: block_id, depth: 1 },
-        LinearNode { kind_id: comment_id, depth: 2 },
+        LinearNode {
+            kind_id: fn_id,
+            depth: 0,
+        },
+        LinearNode {
+            kind_id: block_id,
+            depth: 1,
+        },
+        LinearNode {
+            kind_id: comment_id,
+            depth: 2,
+        },
     ];
     let (set, _) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
     let empty_key = AstBigram::encode(EMPTY_BODY, fn_id);
@@ -490,9 +634,18 @@ fn f2_one_real_statement_body_is_not_empty() {
     };
 
     let nodes = vec![
-        LinearNode { kind_id: fn_id, depth: 0 },
-        LinearNode { kind_id: block_id, depth: 1 },
-        LinearNode { kind_id: stmt_id, depth: 2 }, // one real statement
+        LinearNode {
+            kind_id: fn_id,
+            depth: 0,
+        },
+        LinearNode {
+            kind_id: block_id,
+            depth: 1,
+        },
+        LinearNode {
+            kind_id: stmt_id,
+            depth: 2,
+        }, // one real statement
     ];
     let (set, _) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
     let empty_key = AstBigram::encode(EMPTY_BODY, fn_id);

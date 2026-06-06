@@ -21,7 +21,9 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use rskim_core::Language;
 use rskim_search::{
     AstIndexBuilder, FileId,
-    ast_index::{LinearNode, extract_ast_ngrams, extract_ast_ngrams_with_metrics, linearize_source},
+    ast_index::{
+        LinearNode, extract_ast_ngrams, extract_ast_ngrams_with_metrics, linearize_source,
+    },
 };
 use tempfile::TempDir;
 
@@ -100,9 +102,7 @@ fn bench_extraction_overhead(c: &mut Criterion) {
 
     // v2 path: extract_ast_ngrams_with_metrics returns StructuralMetrics too
     group.bench_function("extract_v2_with_metrics", |b| {
-        b.iter(|| {
-            extract_ast_ngrams_with_metrics(black_box(&nodes), black_box(Language::Rust))
-        })
+        b.iter(|| extract_ast_ngrams_with_metrics(black_box(&nodes), black_box(Language::Rust)))
     });
 
     group.finish();

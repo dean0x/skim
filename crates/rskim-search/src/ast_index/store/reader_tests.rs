@@ -52,7 +52,13 @@ fn build_3_file_index() -> (tempfile::TempDir, AstIndexReader) {
     // File 0: has a bigram
     let set0 = make_bigram_set(bigram_key, 3);
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &set0, 50, StructuralMetrics::default())
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &set0,
+            50,
+            StructuralMetrics::default(),
+        )
         .unwrap();
 
     // File 1: has both bigram and trigram
@@ -65,13 +71,25 @@ fn build_3_file_index() -> (tempfile::TempDir, AstIndexReader) {
     set1.bigrams.sort_unstable_by_key(|e| e.ngram.key());
     set1.trigrams.sort_unstable_by_key(|e| e.ngram.key());
     builder
-        .add_file_ngrams(FileId(1), Language::Python, &set1, 80, StructuralMetrics::default())
+        .add_file_ngrams(
+            FileId(1),
+            Language::Python,
+            &set1,
+            80,
+            StructuralMetrics::default(),
+        )
         .unwrap();
 
     // File 2: empty (non-TS language)
     let set2 = AstNgramSet::default();
     builder
-        .add_file_ngrams(FileId(2), Language::Go, &set2, 0, StructuralMetrics::default())
+        .add_file_ngrams(
+            FileId(2),
+            Language::Go,
+            &set2,
+            0,
+            StructuralMetrics::default(),
+        )
         .unwrap();
 
     let reader = builder.build().unwrap();
@@ -282,7 +300,13 @@ fn a8_multi_language_round_trip() {
     for (i, &lang) in languages.iter().enumerate() {
         let set = make_bigram_set(bigram_key, (i as u32) + 1);
         builder
-            .add_file_ngrams(FileId(i as u32), lang, &set, 10, StructuralMetrics::default())
+            .add_file_ngrams(
+                FileId(i as u32),
+                lang,
+                &set,
+                10,
+                StructuralMetrics::default(),
+            )
             .unwrap();
     }
 
@@ -323,7 +347,13 @@ fn build_single_file_index() -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
     let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
     let set = make_bigram_set(0x0001_0002, 1);
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &set, 10, StructuralMetrics::default())
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &set,
+            10,
+            StructuralMetrics::default(),
+        )
         .unwrap();
     builder.build().unwrap();
     let idx = std::fs::read(dir.path().join("ast_index.skidx")).unwrap();
@@ -659,7 +689,10 @@ fn f9_index_version_returns_2_for_v2_index() {
         super::super::format::FORMAT_VERSION,
         "index_version must return FORMAT_VERSION (2) for a freshly built index"
     );
-    assert_eq!(version, 2u16, "FORMAT_VERSION is expected to be 2 in this wave");
+    assert_eq!(
+        version, 2u16,
+        "FORMAT_VERSION is expected to be 2 in this wave"
+    );
 }
 
 /// F9 negative — v1 fixture:
@@ -745,7 +778,13 @@ fn build_c3_index() -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
         count: 2,
     });
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &set, 10, StructuralMetrics::default())
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &set,
+            10,
+            StructuralMetrics::default(),
+        )
         .unwrap();
     builder.build().unwrap();
 
@@ -924,10 +963,22 @@ fn c3_non_ascending_doc_ids_returns_index_corrupted() {
     let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
     let set = make_bigram_set(bigram_key, 1);
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &set, 10, StructuralMetrics::default())
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &set,
+            10,
+            StructuralMetrics::default(),
+        )
         .unwrap();
     builder
-        .add_file_ngrams(FileId(1), Language::Rust, &set, 10, StructuralMetrics::default())
+        .add_file_ngrams(
+            FileId(1),
+            Language::Rust,
+            &set,
+            10,
+            StructuralMetrics::default(),
+        )
         .unwrap();
     builder.build().unwrap();
 

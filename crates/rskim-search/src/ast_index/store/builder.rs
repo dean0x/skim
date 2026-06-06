@@ -48,7 +48,9 @@ use super::format::{
 use super::reader::AstIndexReader;
 use crate::{
     FileId, Result, SearchError,
-    ast_index::{AstNgramSet, StructuralMetrics, extract_ast_ngrams_with_metrics, linearize_source},
+    ast_index::{
+        AstNgramSet, StructuralMetrics, extract_ast_ngrams_with_metrics, linearize_source,
+    },
     io_util::atomic_write,
 };
 
@@ -382,7 +384,13 @@ impl AstIndexBuilder {
         // ── Parallel extraction ──────────────────────────────────────────────
         // Collect results into a Vec indexed by position in `files` so that
         // sequential merge preserves FileId order.
-        type ExtractedEntry = (FileId, rskim_core::Language, AstNgramSet, u32, StructuralMetrics);
+        type ExtractedEntry = (
+            FileId,
+            rskim_core::Language,
+            AstNgramSet,
+            u32,
+            StructuralMetrics,
+        );
         let extracted: Vec<Result<ExtractedEntry>> = files
             .par_iter()
             .map(|(id, content, lang)| {

@@ -215,7 +215,6 @@ impl Pattern {
 /// | **Total** | **29** |
 pub static PATTERNS: &[Pattern] = &[
     // ── ErrorHandling ────────────────────────────────────────────────────────
-
     Pattern {
         name: "try-catch",
         description: "A try/catch block (TypeScript/JavaScript). Exact: try_statement always \
@@ -283,12 +282,13 @@ pub static PATTERNS: &[Pattern] = &[
         exact: true,
         example: "try { f(); } catch (e) { g(); } finally { h(); }",
         example_lang: Language::TypeScript,
-        bigrams: &[("try_statement", "catch_clause"), ("try_statement", "finally_clause")],
+        bigrams: &[
+            ("try_statement", "catch_clause"),
+            ("try_statement", "finally_clause"),
+        ],
         trigrams: &[],
     },
-
     // ── Performance ──────────────────────────────────────────────────────────
-
     Pattern {
         name: "nested-loop",
         description: "A loop nested inside another loop (TypeScript/JavaScript for-statements). \
@@ -329,7 +329,11 @@ pub static PATTERNS: &[Pattern] = &[
         example: "for (const x of items) { process(x); }",
         example_lang: Language::TypeScript,
         bigrams: &[],
-        trigrams: &[("for_in_statement", "statement_block", "expression_statement")],
+        trigrams: &[(
+            "for_in_statement",
+            "statement_block",
+            "expression_statement",
+        )],
     },
     Pattern {
         name: "deep-nesting",
@@ -359,9 +363,7 @@ pub static PATTERNS: &[Pattern] = &[
         bigrams: &[],
         trigrams: &[("for_statement", "block", "for_statement")],
     },
-
     // ── Concurrency ──────────────────────────────────────────────────────────
-
     Pattern {
         name: "go-goroutine",
         description: "A goroutine launch (Go). Exact: go_statement is the tree-sitter node for \
@@ -428,9 +430,7 @@ pub static PATTERNS: &[Pattern] = &[
         bigrams: &[("synchronized_statement", "block")],
         trigrams: &[],
     },
-
     // ── Quality ──────────────────────────────────────────────────────────────
-
     Pattern {
         name: "function-with-body",
         description: "A function item with a body (Rust). Exact: function_item always contains \
@@ -518,9 +518,7 @@ pub static PATTERNS: &[Pattern] = &[
         bigrams: &[("expression_statement", "call_expression")],
         trigrams: &[],
     },
-
     // ── Structure ────────────────────────────────────────────────────────────
-
     Pattern {
         name: "switch-with-cases",
         description: "A switch statement with a switch body (TypeScript/JavaScript). Exact: \

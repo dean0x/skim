@@ -501,9 +501,7 @@ pub(crate) fn decode_file_meta(data: &[u8]) -> Result<AstFileMetaEntry> {
         lang_id: data[0],
         node_count: u32::from_le_bytes(read_array(data, 1, "ast_file_meta: node_count")?),
         max_depth: u16::from_le_bytes(read_array(data, 5, "ast_file_meta: max_depth")?),
-        max_block_stmts: u16::from_le_bytes(
-            read_array(data, 7, "ast_file_meta: max_block_stmts")?,
-        ),
+        max_block_stmts: u16::from_le_bytes(read_array(data, 7, "ast_file_meta: max_block_stmts")?),
         max_params: u16::from_le_bytes(read_array(data, 9, "ast_file_meta: max_params")?),
         branch_count: u32::from_le_bytes(read_array(data, 11, "ast_file_meta: branch_count")?),
     })

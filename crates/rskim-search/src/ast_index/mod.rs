@@ -33,8 +33,8 @@ mod extract;
 mod linearize;
 mod ngram;
 pub mod patterns;
-pub(crate) mod structural;
 mod store;
+pub(crate) mod structural;
 
 // ============================================================================
 // Shared type alias
@@ -59,8 +59,6 @@ pub use ngram::{
     AstBigram, AstTrigram, DEFAULT_AST_WEIGHT, ast_bigram_idf, ast_trigram_idf, vocab_len,
     vocab_lookup, vocab_resolve,
 };
-pub use patterns::{
-    Pattern, PatternCategory, all_patterns, lookup_pattern, pattern_to_query_set,
-};
+pub use patterns::{Pattern, PatternCategory, all_patterns, lookup_pattern, pattern_to_query_set};
 pub use store::{AstFileMetaEntry, AstIndexBuilder, AstIndexReader, AstPosting};
 pub use structural::StructuralMetrics;
