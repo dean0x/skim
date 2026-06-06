@@ -636,6 +636,76 @@ fn ast_index_size_ratio() {
 }
 
 // ============================================================================
+// F9: index_version probe — returns the stored version without full open()
+//
+// Acceptance criterion F9: "index_version(dir) returns 2 for a v2 index AND
+// surfaces a v1 index as needing rebuild (tested via a hand-written v1 header
+// fixture)."
+//
+// The function reads only magic (4 bytes) + version (2 bytes) and returns
+// Ok(version) for any file with valid SKAX magic. It does NOT reject v1 — that
+// is the responsibility of AstIndexReader::open() / decode_header(). The
+// probe is a cheap staleness check; the caller decides what to do with the value.
+// ============================================================================
+
+/// F9 positive: index_version returns Ok(FORMAT_VERSION) == Ok(2) for a real
+/// v2 index built by AstIndexBuilder.
+#[test]
+fn f9_index_version_returns_2_for_v2_index() {
+    let (dir, _reader) = build_3_file_index();
+    let version = AstIndexReader::index_version(dir.path()).unwrap();
+    assert_eq!(
+        version,
+        super::super::format::FORMAT_VERSION,
+        "index_version must return FORMAT_VERSION (2) for a freshly built index"
+    );
+    assert_eq!(version, 2u16, "FORMAT_VERSION is expected to be 2 in this wave");
+}
+
+/// F9 negative — v1 fixture:
+///   (a) index_version returns Ok(1) — the probe reads the stored version without
+///       rejecting it; rejection is the job of open() / decode_header().
+///   (b) AstIndexReader::open() on the same fixture fails with "please rebuild
+///       the AST index" — the full reader enforces the version gate.
+///
+/// The v1 header is hand-written to mirror the byte layout used by
+/// a3_reader_rejects_v1_header in format_tests.rs: magic b"SKAX" (4 bytes)
+/// followed by version=1 as u16-LE (2 bytes), remaining bytes zeroed.
+#[test]
+fn f9_index_version_surfaces_v1_fixture() {
+    let dir = tempdir().unwrap();
+
+    // Hand-craft a minimal v1 index file: magic + version=1, rest zeroed.
+    // 48 bytes matches HEADER_SIZE so that open() reaches the version check
+    // rather than failing on a short-read.
+    let mut v1_header = [0u8; 48];
+    v1_header[0..4].copy_from_slice(b"SKAX");
+    v1_header[4..6].copy_from_slice(&1u16.to_le_bytes()); // version = 1
+
+    std::fs::write(dir.path().join("ast_index.skidx"), &v1_header).unwrap();
+
+    // (a) index_version should read Ok(1) — the probe does not enforce version.
+    let version = AstIndexReader::index_version(dir.path()).unwrap();
+    assert_eq!(
+        version, 1u16,
+        "index_version must return Ok(1) for a v1 fixture — it reads the stored \
+         version without rejecting it"
+    );
+
+    // (b) Full open() must reject v1 with the "please rebuild" hint.
+    let err = AstIndexReader::open(dir.path()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("please rebuild the AST index"),
+        "open() on a v1 fixture must contain 'please rebuild the AST index', got: {msg}"
+    );
+    assert!(
+        msg.contains("format version"),
+        "open() on a v1 fixture must contain 'format version', got: {msg}"
+    );
+}
+
+// ============================================================================
 // C3: posting bounds / alignment guards in lookup_postings_generic
 //
 // The existing A11 corruption-matrix tests flip bytes in `.skidx` but do NOT
