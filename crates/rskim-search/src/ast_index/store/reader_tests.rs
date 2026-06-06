@@ -533,7 +533,7 @@ fn a14_overflow_header_huge_bigram_count() {
 // v1 measured baseline: ~1.23×.  v2 adds structural n-grams and +10 bytes/file
 // meta overhead; expected v2 ratio ~1.3×.  Guard raised to <2.2× per PF-005:
 // relaxation justified by measured ratio + structural capability expansion.
-// Applies ADR-002 (grounded regression guard).  On-disk compression tracked
+// Applies ADR-003 (grounded regression guard).  On-disk compression tracked
 // in issue #273.
 // ============================================================================
 
@@ -651,7 +651,7 @@ fn ast_index_size_ratio() {
     // structural markers; a genuine O(files²) bloat regression would push
     // the ratio well above 2.2× and still fires.
     //
-    // ADR-002: regression guard must be empirically grounded.
+    // ADR-003: regression guard must be empirically grounded.
     //
     // ON-DISK COMPRESSION (delta encoding + VarInt / Roaring Bitmaps) that
     // would push the ratio well below 1× is tracked in issue #273.
