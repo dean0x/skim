@@ -32,7 +32,7 @@
 mod extract;
 mod linearize;
 mod ngram;
-pub mod patterns;
+mod patterns;
 mod store;
 pub(crate) mod structural;
 
