@@ -316,9 +316,7 @@ impl AstIndexReader {
             .checked_mul(FILE_META_SIZE)
             .and_then(|o| meta_start.checked_add(o))
             .ok_or_else(|| {
-                SearchError::IndexCorrupted(format!(
-                    "file_meta({file_index}): offset overflow"
-                ))
+                SearchError::IndexCorrupted(format!("file_meta({file_index}): offset overflow"))
             })?;
         let end = offset
             .checked_add(FILE_META_SIZE)
