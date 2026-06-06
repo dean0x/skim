@@ -398,9 +398,7 @@ impl ExtractState {
     /// Update `metrics.max_depth` when `depth` exceeds the current maximum.
     #[inline]
     fn update_max_depth(&mut self, depth: u16) {
-        if depth > self.metrics.max_depth {
-            self.metrics.max_depth = depth;
-        }
+        self.metrics.max_depth = self.metrics.max_depth.max(depth);
     }
 
     /// Emit cumulative `DEEP_NODE → bucket_label(i)` synthetics for every
