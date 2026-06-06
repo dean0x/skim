@@ -571,12 +571,6 @@ fn ast_index_size_ratio() {
     //  trigram) typically run 3–5× source, so a raw uncompressed AST posting
     //  file at 1.2× is already competitive.
     //
-    // REGRESSION GUARD: < 1.8× (applies ADR-002)
-    //   The previous <3× bound was too loose — it would pass even a 2× regression.
-    //   The tighter <1.8× bound leaves a ~46% margin above the measured 1.23×
-    //   baseline (1.8 / 1.23 ≈ 1.46× headroom), wide enough to absorb corpus
-    //   variance but tight enough to fire on genuine O(files²) posting bloat.
-    //
     // ON-DISK COMPRESSION (delta encoding + VarInt / Roaring Bitmaps) that
     // would push the ratio well below 1× is tracked in issue #273.
     let dir = tempdir().unwrap();

@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ✅ **PHASE 3 COMPLETE** (100% of original roadmap)
 
 **What's Complete (Phases 1 & 2):**
-- ✅ Full Rust project with comprehensive test suite (3,626 tests passing)
+- ✅ Full Rust project with comprehensive test suite (5,191 tests passing)
 - ✅ 17 languages supported: TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, SQL, Kotlin, Swift, Markdown, JSON, YAML, TOML
 - ✅ 4 transformation modes: structure, signatures, types, full
 - ✅ CLI with stdin/stdout streaming support
@@ -79,7 +79,7 @@ analytics/          ← Token savings persistence (SQLite)
 
 **TEMPORAL SEARCH NOTE**: The `rskim-search` crate stores hotspot, risk, and co-change data in `<project-root>/.skim/search.db` (SQLite, WAL mode). Schema migrations are forward-only via `PRAGMA user_version` — each version gate runs only when the stored version is below the target. Databases created by a future version return an error rather than silently corrupting data. Current schema: v1 (hotspot, risk, cochange tables), v2 (performance indexes for top-N and per-file lookup queries).
 
-**AST INDEX FORMAT NOTE**: The `rskim-search` AST n-gram index (`ast_index.skidx` + `ast_index.skidx.postings`) is now **format v2** (Wave 3e, #196). v2 adds per-file structural metrics (max_depth, max_block_stmts, max_params, branch_count — +10 bytes per file) and stores `avg_max_depth:f32` in the header. Files created by v1 are rejected with "please rebuild". Run `skim search index --rebuild` after updating. Synthetic n-gram markers (EMPTY_BODY=65000, DEEP_NODE=65001, LARGE_BODY=65002, MANY_PARAMS=65003; bucket labels at 64900+) are emitted alongside real n-grams; vocab_resolve() returns None for all synthetic IDs (isolation guarantee).
+**AST INDEX FORMAT NOTE**: The `rskim-search` AST n-gram index (`ast_index.skidx` + `ast_index.skpost`) is now **format v2** (Wave 3e, #196). v2 adds per-file structural metrics (max_depth, max_block_stmts, max_params, branch_count — +10 bytes per file) and stores `avg_max_depth:f32` in the header. Files created by v1 are rejected with "please rebuild". Run `skim search index --rebuild` after updating. Synthetic n-gram markers (EMPTY_BODY=65000, DEEP_NODE=65001, LARGE_BODY=65002, MANY_PARAMS=65003; bucket labels at 64900+) are emitted alongside real n-grams; vocab_resolve() returns None for all synthetic IDs (isolation guarantee).
 
 ## Implementation Phases
 
@@ -605,7 +605,7 @@ Cross-platform builds require different GitHub Actions runners:
 5. Create test fixtures
 6. Validate AST access works
 
-**NOTE:** All phases complete (100%). Phase 3 features (multi-file glob, caching, parallel processing, token counting) are fully implemented and tested with 3,626 tests passing. See README.md for full usage guide.
+**NOTE:** All phases complete (100%). Phase 3 features (multi-file glob, caching, parallel processing, token counting) are fully implemented and tested with 5,191 tests passing. See README.md for full usage guide.
 
 ### Critical First File: `src/parser.rs`
 

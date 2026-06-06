@@ -417,7 +417,6 @@ pub fn extract_ast_ngrams_with_metrics(
                     if ancestors[depth_to_close].is_some() {
                         close_depth(
                             depth_to_close,
-                            &ancestors,
                             &child_counts,
                             &depth_kind,
                             &mut metrics,
@@ -489,7 +488,6 @@ pub fn extract_ast_ngrams_with_metrics(
             if ancestors[d].is_some() {
                 close_depth(
                     d,
-                    &ancestors,
                     &child_counts,
                     &depth_kind,
                     &mut metrics,
@@ -531,7 +529,6 @@ pub fn extract_ast_ngrams_with_metrics(
 /// was encountered, or because we're at end-of-stream).
 fn close_depth(
     depth_idx: usize,
-    ancestors: &[Option<NodeKindId>],
     child_counts: &[u32],
     depth_kind: &[NodeKindId],
     metrics: &mut StructuralMetrics,
@@ -600,9 +597,6 @@ fn close_depth(
         }
     }
 
-    // `ancestors` is not used in close_depth (only depth_kind is needed here),
-    // but it is kept in the signature for future use and to express the calling contract.
-    let _ = ancestors;
 }
 
 /// Extract structural n-grams using the production per-language IDF tables.

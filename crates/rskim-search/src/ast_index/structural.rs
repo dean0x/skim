@@ -237,17 +237,17 @@ pub static FUNCTION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|| {
     // the broader function-construct list in node_kind_info.
     let fn_kinds = [
         // Generic / cross-language
-        "function_declaration",
+        "function_declaration",  // TypeScript/JavaScript/Go/C; Swift reuses same string
         "function_item",
-        "method_declaration",
+        "method_declaration",    // Java, C#, Kotlin reuse same string
         "function_definition",
         "method_definition",
         "arrow_function",
         "function_expression",
         // C/C++
-        "declaration",          // covers many C/C++ function decls in tree-sitter
+        "declaration",           // covers many C/C++ function decls in tree-sitter
         "template_declaration",
-        // C#
+        // C# / Java
         "constructor_declaration",
         // Ruby
         "method",
@@ -255,13 +255,9 @@ pub static FUNCTION_KIND_IDS: LazyLock<HashSet<NodeKindId>> = LazyLock::new(|| {
         // Swift
         "init_declaration",
         "deinit_declaration",
-        "function_declaration", // Swift (same string, shared vocab)
         // Kotlin
         "secondary_constructor",
         "anonymous_initializer",
-        // Java
-        "method_declaration",   // (duplicate, deduplicated by HashSet)
-        "constructor_declaration",
     ];
     fn_kinds
         .iter()
