@@ -40,11 +40,11 @@ pub(crate) use rskim_search::{CommitInfo, FileChangeInfo};
 /// flag itself implies (e.g. `top_n` defaults to 20, `coupling_threshold` to 0.5).
 ///
 /// After `parse_args` returns:
-/// 1. [`super::mod::resolve_diff_files`] borrows `&mut HeatmapArgs` to fill
-///    `files` from a three-dot diff when `diff_base` is set.
+/// 1. `resolve_diff_files` borrows `&mut HeatmapArgs` to fill `files` from a
+///    three-dot diff when `diff_base` is set.
 /// 2. [`super::window::resolve_config`] consumes this struct by value, applies
 ///    presets and dual-window logic, and produces the immutable [`HeatmapConfig`].
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct HeatmapArgs {
     /// Epoch seconds — only analyze commits since this timestamp.
     pub(crate) since: Option<u64>,
@@ -152,8 +152,8 @@ pub(crate) struct HeatmapConfig {
 /// never confused with CLI flags.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedWindow {
-    /// The effective `--since` epoch (may differ from `HeatmapConfig::since`
-    /// after preset/dual resolution).
+    /// The effective `--since` epoch. Always identical to `HeatmapConfig::since`
+    /// by construction in `resolve_config` — both are set from the same resolved value.
     pub(crate) since: Option<u64>,
     /// True when using dual default windowing (no explicit flag was set).
     pub(crate) dual_mode: bool,

@@ -74,17 +74,17 @@ const VALUE_FLAG_TABLE: &[ValueFlagSpec] = &[
 /// Apply a value-taking flag to `args`. Each arm preserves exact validation
 /// logic and error messages from the original flag-by-flag implementation.
 fn apply_value_flag(
-    config: &mut HeatmapArgs,
+    args: &mut HeatmapArgs,
     action: &ValueFlagAction,
     val: String,
 ) -> anyhow::Result<()> {
     match action {
         ValueFlagAction::Since => {
             let ts = parse_since_value(&val)?;
-            config.since = Some(ts);
+            args.since = Some(ts);
         }
         ValueFlagAction::Path => {
-            config.path = Some(val);
+            args.path = Some(val);
         }
         ValueFlagAction::TopN => {
             let n: usize = val
@@ -93,11 +93,11 @@ fn apply_value_flag(
             if n == 0 {
                 anyhow::bail!("--top must be at least 1");
             }
-            config.top_n = n;
-            config.top_explicit = true;
+            args.top_n = n;
+            args.top_explicit = true;
         }
         ValueFlagAction::Window => {
-            config.window_preset = Some(val);
+            args.window_preset = Some(val);
         }
         ValueFlagAction::LastN => {
             let n: usize = val
@@ -106,13 +106,13 @@ fn apply_value_flag(
             if n == 0 {
                 anyhow::bail!("--last must be at least 1");
             }
-            config.last_n = Some(n);
+            args.last_n = Some(n);
         }
         ValueFlagAction::Exclude => {
-            config.extra_excludes.push(val);
+            args.extra_excludes.push(val);
         }
         ValueFlagAction::CouplingThreshold => {
-            config.coupling_threshold = val
+            args.coupling_threshold = val
                 .parse::<f64>()
                 .map_err(|_| {
                     anyhow::anyhow!("--coupling-threshold requires a float between 0 and 1")
@@ -126,17 +126,17 @@ fn apply_value_flag(
             if n == 0 {
                 anyhow::bail!("--fix-window must be at least 1");
             }
-            config.fix_window = n;
+            args.fix_window = n;
         }
         ValueFlagAction::Format => {
             if val == "json" {
-                config.format_json = true;
+                args.format_json = true;
             } else {
                 anyhow::bail!("--format only supports 'json', got: {val}");
             }
         }
         ValueFlagAction::Diff => {
-            config.diff_base = Some(val);
+            args.diff_base = Some(val);
         }
     }
     Ok(())
@@ -151,29 +151,29 @@ fn apply_value_flag(
 /// Follows the manual flag-parsing pattern used by `stats.rs` and `discover.rs`.
 /// Initialises `args.debug` from the process-wide debug flag so that
 /// `SKIM_DEBUG=1` (initialised by `main()` before dispatch) is honoured automatically.
-pub(super) fn parse_args(args: &[String]) -> anyhow::Result<HeatmapArgs> {
-    let mut config = HeatmapArgs {
+pub(super) fn parse_args(raw: &[String]) -> anyhow::Result<HeatmapArgs> {
+    let mut args = HeatmapArgs {
         // Inherit SKIM_DEBUG / --debug flag set by main() before subcommand dispatch.
         debug: crate::debug::is_debug_enabled(),
         ..HeatmapArgs::default()
     };
     let mut i = 0;
 
-    while i < args.len() {
-        let arg = args[i].as_str();
+    while i < raw.len() {
+        let arg = raw[i].as_str();
 
         // Missing value pre-check: if this arg is a value-taking flag but there's
         // no next argument, bail with an actionable error before falling through to
         // "unknown flag".
-        if VALUE_FLAG_TABLE.iter().any(|s| s.name == arg) && i + 1 >= args.len() {
+        if VALUE_FLAG_TABLE.iter().any(|s| s.name == arg) && i + 1 >= raw.len() {
             anyhow::bail!("{arg} requires a value");
         }
 
         // Table-driven value flag dispatch
         let mut matched = false;
         for spec in VALUE_FLAG_TABLE {
-            if let Some(val) = extract_value(args, &mut i, spec.name) {
-                apply_value_flag(&mut config, &spec.action, val)?;
+            if let Some(val) = extract_value(raw, &mut i, spec.name) {
+                apply_value_flag(&mut args, &spec.action, val)?;
                 matched = true;
                 break;
             }
@@ -183,7 +183,7 @@ pub(super) fn parse_args(args: &[String]) -> anyhow::Result<HeatmapArgs> {
         }
 
         // Boolean flags
-        if apply_boolean_flag(&mut config, arg)? {
+        if apply_boolean_flag(&mut args, arg)? {
             i += 1;
             continue;
         }
@@ -192,36 +192,36 @@ pub(super) fn parse_args(args: &[String]) -> anyhow::Result<HeatmapArgs> {
             anyhow::bail!("unknown flag: {arg}");
         }
         // Positional (non-flag) argument — file target.
-        config.files.push(arg.to_string());
+        args.files.push(arg.to_string());
         i += 1;
     }
 
     // Post-parse validation
-    if config.diff_base.is_some() && !config.files.is_empty() {
+    if args.diff_base.is_some() && !args.files.is_empty() {
         anyhow::bail!("cannot combine --diff with explicit file arguments");
     }
 
     // Normalize file paths: strip leading ./
-    for f in &mut config.files {
+    for f in &mut args.files {
         if let Some(stripped) = f.strip_prefix("./") {
             *f = stripped.to_string();
         }
     }
 
-    Ok(config)
+    Ok(args)
 }
 
 /// Apply a recognised boolean flag to `args`.
 ///
 /// Returns `Ok(true)` if the flag was recognised and applied, `Ok(false)` if
 /// the flag is unknown (caller falls through to the unknown-flag error).
-fn apply_boolean_flag(config: &mut HeatmapArgs, flag: &str) -> anyhow::Result<bool> {
+fn apply_boolean_flag(args: &mut HeatmapArgs, flag: &str) -> anyhow::Result<bool> {
     match flag {
-        "--json" => config.format_json = true,
-        "--no-exclude" => config.no_exclude = true,
-        "--insights" => config.insights = true,
+        "--json" => args.format_json = true,
+        "--no-exclude" => args.no_exclude = true,
+        "--insights" => args.insights = true,
         "--debug" => {
-            config.debug = true;
+            args.debug = true;
             crate::debug::force_enable_debug();
         }
         _ => return Ok(false),
