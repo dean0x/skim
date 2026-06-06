@@ -9,7 +9,7 @@ use std::time::UNIX_EPOCH;
 // Table-driven value flag dispatch
 // ============================================================================
 
-/// Identifies which config field a value-taking flag maps to.
+/// Identifies which args field a value-taking flag maps to.
 enum ValueFlagAction {
     Since,
     Path,
