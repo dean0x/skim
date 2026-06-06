@@ -4,7 +4,7 @@
 //! `--since` / `--last` / `--window` precedence, and display formatting.
 
 use super::git_source::GitDataSource;
-use super::types::{HeatmapConfig, ResolvedWindow, WindowInfo};
+use super::types::{HeatmapArgs, HeatmapConfig, ResolvedWindow, WindowInfo};
 
 // ============================================================================
 // Preset mapping
@@ -27,33 +27,47 @@ fn preset_to_since_secs(preset: &str, now_epoch: u64) -> Option<u64> {
 // Config resolution
 // ============================================================================
 
-/// Resolve the effective `HeatmapConfig` by applying presets and `--last`.
+/// Consume [`HeatmapArgs`] and produce a resolved, immutable [`HeatmapConfig`].
+///
+/// This is the type-state transition point: `HeatmapArgs` is mutable raw CLI
+/// parse output; `HeatmapConfig` is the resolved, immutable form that all
+/// downstream functions operate on.
 ///
 /// Precedence: `--since` > `--last` > `--window` preset > dual default.
+///
+/// Three fields from `HeatmapArgs` are consumed here and do NOT appear in
+/// `HeatmapConfig`:
+/// - `window_preset` — moved into the returned [`ResolvedWindow`]
+/// - `last_n` — copied into the returned [`ResolvedWindow`]
+/// - `diff_base` — already consumed by `resolve_diff_files` before this call
 ///
 /// Returns a tuple of:
 /// - `HeatmapConfig` with `since` set to the resolved epoch (used by `fetch_commits`)
 /// - `ResolvedWindow` carrying window metadata (mode, dual fields) for `build_window_info`
-pub(super) fn resolve_effective_config(
-    config: &HeatmapConfig,
+pub(super) fn resolve_config(
+    args: HeatmapArgs,
     source: &dyn GitDataSource,
     warnings: &mut Vec<String>,
     now_epoch: u64,
 ) -> anyhow::Result<(HeatmapConfig, ResolvedWindow)> {
-    let mut effective = config.clone();
+    // Move window_preset and last_n into ResolvedWindow first so we can read
+    // them from `window.*` rather than from `args` after partial move.
     let mut window = ResolvedWindow {
         since: None,
         dual_mode: false,
         dual_time_since: None,
         dual_count_since: None,
-        window_preset: config.window_preset.clone(),
-        last_n: config.last_n,
+        window_preset: args.window_preset,
+        last_n: args.last_n,
     };
 
+    // Resolved `since` epoch — set by whichever branch wins precedence.
+    let mut resolved_since: Option<u64> = None;
+
     // Count explicit time-selection flags
-    let explicit_count = usize::from(config.since.is_some())
-        + usize::from(config.last_n.is_some())
-        + usize::from(config.window_preset.is_some());
+    let explicit_count = usize::from(args.since.is_some())
+        + usize::from(window.last_n.is_some())
+        + usize::from(window.window_preset.is_some());
 
     if explicit_count > 1 {
         warnings.push(
@@ -62,15 +76,15 @@ pub(super) fn resolve_effective_config(
         );
     }
 
-    if let Some(since) = config.since {
+    if let Some(since) = args.since {
         // Already set — highest precedence
-        effective.since = Some(since);
+        resolved_since = Some(since);
         window.since = Some(since);
-    } else if let Some(n) = config.last_n {
+    } else if let Some(n) = window.last_n {
         // --last N: find the timestamp of the Nth commit
         match source.fetch_commit_count_since(n) {
             Ok(Some(ts)) => {
-                effective.since = Some(ts);
+                resolved_since = Some(ts);
                 window.since = Some(ts);
             }
             Ok(None) => {
@@ -82,9 +96,9 @@ pub(super) fn resolve_effective_config(
                 warnings.push(format!("Could not resolve --last {n}: {e}"));
             }
         }
-    } else if let Some(ref preset) = config.window_preset {
+    } else if let Some(ref preset) = window.window_preset {
         if let Some(since) = preset_to_since_secs(preset, now_epoch) {
-            effective.since = Some(since);
+            resolved_since = Some(since);
             window.since = Some(since);
         } else {
             warnings.push(format!(
@@ -101,15 +115,33 @@ pub(super) fn resolve_effective_config(
         };
 
         // Use whichever captures more history (lower epoch = more history)
-        let resolved_since = time_since.min(count_since);
-        effective.since = Some(resolved_since);
-        window.since = Some(resolved_since);
+        let dual_resolved = time_since.min(count_since);
+        resolved_since = Some(dual_resolved);
+        window.since = Some(dual_resolved);
         window.dual_mode = true;
         window.dual_time_since = Some(time_since);
         window.dual_count_since = Some(count_since);
     }
 
-    Ok((effective, window))
+    // Build the resolved, immutable HeatmapConfig. Fields are moved from args
+    // (heap allocations) or copied (scalars). `window_preset`, `last_n`, and
+    // `diff_base` are intentionally absent — they were consumed above.
+    let config = HeatmapConfig {
+        since: resolved_since,
+        path: args.path,
+        format_json: args.format_json,
+        top_n: args.top_n,
+        no_exclude: args.no_exclude,
+        extra_excludes: args.extra_excludes,
+        coupling_threshold: args.coupling_threshold,
+        fix_window: args.fix_window,
+        debug: args.debug,
+        files: args.files,
+        top_explicit: args.top_explicit,
+        insights: args.insights,
+    };
+
+    Ok((config, window))
 }
 
 // ============================================================================
@@ -356,5 +388,132 @@ mod tests {
         let info = build_window_info(&window, 999, NOW);
 
         assert_eq!(info.commits_analyzed, 999);
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_config — type-state transition tests
+    // -----------------------------------------------------------------------
+
+    /// Minimal mock GitDataSource for unit-testing `resolve_config` without
+    /// spawning a real git process.
+    struct MockGitSource {
+        commit_count_since: Option<u64>,
+    }
+
+    impl super::super::git_source::GitDataSource for MockGitSource {
+        fn is_git_repo(&self) -> bool {
+            true
+        }
+        fn get_repo_root(&self) -> anyhow::Result<String> {
+            Ok("/mock/repo".to_string())
+        }
+        fn detect_shallow_clone(&self) -> bool {
+            false
+        }
+        fn fetch_commit_count_since(&self, _n: usize) -> anyhow::Result<Option<u64>> {
+            Ok(self.commit_count_since)
+        }
+        fn fetch_commits(
+            &self,
+            _config: &super::super::types::HeatmapConfig,
+        ) -> anyhow::Result<Vec<super::super::types::CommitInfo>> {
+            Ok(vec![])
+        }
+    }
+
+    fn base_args() -> super::super::types::HeatmapArgs {
+        super::super::types::HeatmapArgs::default()
+    }
+
+    /// `window_preset` and `last_n` must appear in `ResolvedWindow`, not in
+    /// `HeatmapConfig`. `HeatmapConfig` has neither field.
+    #[test]
+    fn test_resolve_config_consumed_fields_go_to_window() {
+        let source = MockGitSource {
+            commit_count_since: Some(1_700_000_000),
+        };
+        let mut args = base_args();
+        args.window_preset = Some("sprint".to_string());
+        args.last_n = Some(50);
+        let mut warnings = Vec::new();
+
+        let (_config, window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
+
+        // `window_preset` moved into ResolvedWindow
+        assert_eq!(window.window_preset.as_deref(), Some("sprint"));
+        // `last_n` copied into ResolvedWindow
+        assert_eq!(window.last_n, Some(50));
+    }
+
+    /// Passthrough scalar and heap fields carry over unchanged from args to config.
+    #[test]
+    fn test_resolve_config_passthrough_fields() {
+        let source = MockGitSource {
+            commit_count_since: None,
+        };
+        let mut args = base_args();
+        args.top_n = 42;
+        args.format_json = true;
+        args.no_exclude = true;
+        args.coupling_threshold = 0.7;
+        args.fix_window = 10;
+        args.debug = true;
+        args.top_explicit = true;
+        args.insights = true;
+        args.path = Some("src/".to_string());
+        args.extra_excludes = vec!["*.generated.ts".to_string()];
+        args.files = vec!["src/main.rs".to_string()];
+        let mut warnings = Vec::new();
+
+        let (config, _window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
+
+        assert_eq!(config.top_n, 42);
+        assert!(config.format_json);
+        assert!(config.no_exclude);
+        assert!((config.coupling_threshold - 0.7).abs() < 1e-9);
+        assert_eq!(config.fix_window, 10);
+        assert!(config.debug);
+        assert!(config.top_explicit);
+        assert!(config.insights);
+        assert_eq!(config.path.as_deref(), Some("src/"));
+        assert_eq!(config.extra_excludes, vec!["*.generated.ts"]);
+        assert_eq!(config.files, vec!["src/main.rs"]);
+    }
+
+    /// When `--since` is set, it wins regardless of preset/last_n.
+    #[test]
+    fn test_resolve_config_since_takes_precedence() {
+        let source = MockGitSource {
+            commit_count_since: Some(999_999),
+        };
+        let mut args = base_args();
+        args.since = Some(1_700_000_000);
+        args.window_preset = Some("sprint".to_string());
+        args.last_n = Some(100);
+        let mut warnings = Vec::new();
+
+        let (config, window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
+
+        assert_eq!(config.since, Some(1_700_000_000));
+        assert_eq!(window.since, Some(1_700_000_000));
+        // Multiple flags → warning emitted
+        assert!(!warnings.is_empty());
+    }
+
+    /// When no window flags are set, dual-mode default is applied.
+    #[test]
+    fn test_resolve_config_dual_default() {
+        let source = MockGitSource {
+            commit_count_since: Some(1_680_000_000),
+        };
+        let args = base_args();
+        let mut warnings = Vec::new();
+
+        let (config, window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
+
+        assert!(config.since.is_some());
+        assert!(window.dual_mode);
+        assert!(window.dual_time_since.is_some());
+        assert!(window.dual_count_since.is_some());
     }
 }

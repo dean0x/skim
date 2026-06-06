@@ -1,5 +1,26 @@
 //! Data structures for the `skim heatmap` subcommand.
 //!
+//! # Lifecycle
+//!
+//! ```text
+//! CLI args  ──parse_args()──►  HeatmapArgs
+//!                                  │
+//!                      resolve_diff_files() mutates diff_base/files
+//!                                  │
+//!                         resolve_config()  (consumes HeatmapArgs)
+//!                                  │
+//!                     HeatmapConfig (resolved, immutable)
+//! ```
+//!
+//! `HeatmapArgs` is the raw parse output and is mutable until resolution.
+//! `HeatmapConfig` is the resolved, immutable form passed to all downstream
+//! functions. Three fields from `HeatmapArgs` are consumed during resolution
+//! and do NOT appear in `HeatmapConfig`:
+//!
+//! - `window_preset` — moved into [`ResolvedWindow`]
+//! - `last_n` — copied into [`ResolvedWindow`]
+//! - `diff_base` — consumed by `resolve_diff_files` via `.take()`
+//!
 //! No logic, no I/O. Pure data model.
 
 use serde::Serialize;
@@ -12,13 +33,19 @@ pub(crate) use rskim_search::{CommitInfo, FileChangeInfo};
 // CLI configuration
 // ============================================================================
 
-/// Parsed CLI flags for `skim heatmap`.
+/// Raw CLI parse output for `skim heatmap`.
 ///
-/// Contains raw user input only. Window resolution metadata (dual mode, since
-/// epochs) is separated into [`ResolvedWindow`] to avoid polluting this struct
-/// with derived state.
+/// Populated by [`super::args::parse_args`] from the raw `&[String]` argv slice.
+/// Fields map 1:1 to CLI flags — no resolution, no defaulting beyond what the
+/// flag itself implies (e.g. `top_n` defaults to 20, `coupling_threshold` to 0.5).
+///
+/// After `parse_args` returns:
+/// 1. [`super::mod::resolve_diff_files`] borrows `&mut HeatmapArgs` to fill
+///    `files` from a three-dot diff when `diff_base` is set.
+/// 2. [`super::window::resolve_config`] consumes this struct by value, applies
+///    presets and dual-window logic, and produces the immutable [`HeatmapConfig`].
 #[derive(Debug, Clone)]
-pub(crate) struct HeatmapConfig {
+pub(crate) struct HeatmapArgs {
     /// Epoch seconds — only analyze commits since this timestamp.
     pub(crate) since: Option<u64>,
     /// Scope analysis to files under this path.
@@ -38,12 +65,18 @@ pub(crate) struct HeatmapConfig {
     /// Enable debug output.
     pub(crate) debug: bool,
     /// Named window preset (e.g., "sprint", "quarter").
+    ///
+    /// Consumed by `resolve_config` — moved into [`ResolvedWindow`].
     pub(crate) window_preset: Option<String>,
     /// Limit analysis to last N commits.
+    ///
+    /// Consumed by `resolve_config` — copied into [`ResolvedWindow`].
     pub(crate) last_n: Option<usize>,
     /// Explicit file targets — scope display to these paths.
     pub(crate) files: Vec<String>,
     /// Base branch/ref for `--diff` three-dot diff.
+    ///
+    /// Consumed by `resolve_diff_files` via `.take()`.
     pub(crate) diff_base: Option<String>,
     /// True when `--top` was explicitly passed (vs. implied by file targeting).
     pub(crate) top_explicit: bool,
@@ -51,7 +84,7 @@ pub(crate) struct HeatmapConfig {
     pub(crate) insights: bool,
 }
 
-impl Default for HeatmapConfig {
+impl Default for HeatmapArgs {
     fn default() -> Self {
         Self {
             since: None,
@@ -73,10 +106,49 @@ impl Default for HeatmapConfig {
     }
 }
 
-/// Resolved window metadata produced by [`super::resolve_effective_config`].
+/// Resolved, immutable configuration for the `skim heatmap` pipeline.
 ///
-/// Separates derived window state from raw CLI input (`HeatmapConfig`), so
-/// `HeatmapConfig` remains a pure user-input struct and window metadata is
+/// Produced by [`super::window::resolve_config`] from [`HeatmapArgs`]. The three
+/// fields that are "consumed" during resolution (`window_preset`, `last_n`,
+/// `diff_base`) are intentionally absent here — they live in [`ResolvedWindow`]
+/// or are handled before resolution completes.
+///
+/// This type does not implement `Clone` or `Default` to enforce the invariant
+/// that it can only be constructed through `resolve_config` (the type-state
+/// transition), not by arbitrary callers.
+#[derive(Debug)]
+pub(crate) struct HeatmapConfig {
+    /// Resolved epoch seconds — only analyze commits since this timestamp.
+    /// Set by preset, `--last`, `--since`, or dual-default resolution.
+    pub(crate) since: Option<u64>,
+    /// Scope analysis to files under this path (passed through from args).
+    pub(crate) path: Option<String>,
+    /// Emit JSON output instead of text.
+    pub(crate) format_json: bool,
+    /// Maximum number of files to display (default 20).
+    pub(crate) top_n: usize,
+    /// Skip default exclude patterns.
+    pub(crate) no_exclude: bool,
+    /// Additional glob patterns to exclude.
+    pub(crate) extra_excludes: Vec<String>,
+    /// Coupling confidence threshold (default 0.5).
+    pub(crate) coupling_threshold: f64,
+    /// Fix-after-touch proximity window in commits (default 5).
+    pub(crate) fix_window: usize,
+    /// Enable debug output.
+    pub(crate) debug: bool,
+    /// Explicit file targets — scope display to these paths.
+    pub(crate) files: Vec<String>,
+    /// True when `--top` was explicitly passed (vs. implied by file targeting).
+    pub(crate) top_explicit: bool,
+    /// Show only threshold-filtered one-liner insights.
+    pub(crate) insights: bool,
+}
+
+/// Resolved window metadata produced by [`super::window::resolve_config`].
+///
+/// Separates derived window state from raw CLI input (`HeatmapArgs`), so
+/// `HeatmapArgs` remains a pure user-input struct and window metadata is
 /// never confused with CLI flags.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedWindow {

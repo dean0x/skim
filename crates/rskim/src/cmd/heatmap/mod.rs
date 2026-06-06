@@ -32,8 +32,8 @@ use metrics::{
     compute_fix_after_touch, compute_stability,
 };
 use output::{render_insights_json, render_insights_text, render_json, render_text};
-use types::{CommitInfo, FileMetrics, HeatmapConfig, HeatmapResult, ResolvedWindow};
-use window::{build_window_info, format_epoch, resolve_effective_config};
+use types::{CommitInfo, FileMetrics, HeatmapArgs, HeatmapConfig, HeatmapResult, ResolvedWindow};
+use window::{build_window_info, format_epoch, resolve_config};
 
 // ============================================================================
 // Entry point
@@ -49,8 +49,8 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let mut config = match parse_args(args) {
-        Ok(c) => c,
+    let mut raw_args = match parse_args(args) {
+        Ok(a) => a,
         Err(e) => {
             eprintln!("skim heatmap: {e}");
             eprintln!("Run `skim heatmap --help` for usage.");
@@ -60,15 +60,16 @@ pub(crate) fn run(
 
     let git_source = CliGitSource::new();
 
-    // Resolve --diff to concrete file list
-    if let Some(exit) = resolve_diff_files(&git_source, &mut config)? {
+    // Resolve --diff to concrete file list (borrows raw_args mutably)
+    if let Some(exit) = resolve_diff_files(&git_source, &mut raw_args)? {
         return Ok(exit);
     }
 
-    run_with_source(&git_source, &config, analytics)
+    // Move raw_args into run_with_source for resolution and execution
+    run_with_source(&git_source, raw_args, analytics)
 }
 
-/// Resolve `--diff` to a concrete file list, mutating `config.files`.
+/// Resolve `--diff` to a concrete file list, mutating `args.files`.
 ///
 /// Returns `Some(ExitCode::FAILURE)` for any early-exit condition so that `run()`
 /// can propagate it directly. Returns `Ok(None)` when resolution succeeded and the
@@ -81,9 +82,9 @@ pub(crate) fn run(
 /// with a clear message, and `prepare_commits` already handles the non-repo case.
 fn resolve_diff_files(
     git_source: &CliGitSource,
-    config: &mut HeatmapConfig,
+    args: &mut HeatmapArgs,
 ) -> anyhow::Result<Option<ExitCode>> {
-    let Some(base) = config.diff_base.take() else {
+    let Some(base) = args.diff_base.take() else {
         return Ok(None);
     };
 
@@ -105,7 +106,7 @@ fn resolve_diff_files(
                     );
                 }
             }
-            config.files = files;
+            args.files = files;
             Ok(None)
         }
         Err(e) => {
@@ -118,6 +119,8 @@ fn resolve_diff_files(
 /// Bundled output of [`prepare_commits`] — everything needed to call [`compute_heatmap`].
 struct PreparedCommits {
     commits: Vec<CommitInfo>,
+    /// Resolved, immutable configuration produced by [`resolve_config`].
+    config: HeatmapConfig,
     window: ResolvedWindow,
     now_epoch: u64,
     repo_root: String,
@@ -126,13 +129,16 @@ struct PreparedCommits {
 
 /// Execute Steps 1–4 of the heatmap pipeline (git I/O + exclusions).
 ///
+/// Consumes `args` by value — after this call `HeatmapArgs` is replaced by the
+/// resolved `HeatmapConfig` stored in `PreparedCommits`.
+///
 /// Returns `Ok(None)` for all early-exit conditions (not a git repo, no commits,
 /// all commits excluded). Callers treat `None` as a `ExitCode::FAILURE` signal.
 /// Returns `Ok(Some(PreparedCommits))` when the pipeline should proceed to
 /// metric computation.
 fn prepare_commits(
     source: &dyn GitDataSource,
-    config: &HeatmapConfig,
+    args: HeatmapArgs,
 ) -> anyhow::Result<Option<PreparedCommits>> {
     // Step 1: Validate git environment
     if !source.is_git_repo() {
@@ -157,26 +163,30 @@ fn prepare_commits(
         );
     }
 
-    if config.debug {
+    // Extract debug flag before moving args into resolve_config
+    let debug = args.debug;
+    // Extract last_n before moving args — needed for pre-resolution debug label
+    let had_last_n = args.last_n.is_some();
+
+    if debug {
         eprintln!("[skim:heatmap] repo root: {repo_root}");
     }
 
     // Capture a single clock snapshot for all window-resolution helpers so that
-    // preset_to_since_secs, resolve_effective_config, and build_window_info all
-    // use the same value (Issue 1: temporal consistency).
+    // preset_to_since_secs, resolve_config, and build_window_info all use the
+    // same value (temporal consistency).
     let now_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
-    // Step 2: Resolve effective config (presets and --last)
-    let (effective_config, window) =
-        resolve_effective_config(config, source, &mut warnings, now_epoch)?;
+    // Step 2: Resolve effective config (presets and --last). Consumes `args`.
+    let (config, window) = resolve_config(args, source, &mut warnings, now_epoch)?;
 
-    if config.debug {
+    if debug {
         let mode = if window.dual_mode {
             "dual"
-        } else if config.last_n.is_some() {
+        } else if had_last_n {
             "count"
         } else {
             "time"
@@ -191,7 +201,7 @@ fn prepare_commits(
     }
 
     // Step 3: Fetch commits
-    let raw_commits = match source.fetch_commits(&effective_config) {
+    let raw_commits = match source.fetch_commits(&config) {
         Ok(c) => c,
         Err(e) => {
             let msg = e.to_string();
@@ -204,7 +214,7 @@ fn prepare_commits(
         }
     };
 
-    if config.debug {
+    if debug {
         eprintln!("[skim:heatmap] raw commits fetched: {}", raw_commits.len());
     }
 
@@ -225,7 +235,7 @@ fn prepare_commits(
     // Remove commits that are now file-less after exclusion
     commits.retain(|c| !c.changed_files.is_empty());
 
-    if config.debug {
+    if debug {
         eprintln!(
             "[skim:heatmap] commits after exclusion: {} ({} excluded)",
             commits.len(),
@@ -240,6 +250,7 @@ fn prepare_commits(
 
     Ok(Some(PreparedCommits {
         commits,
+        config,
         window,
         now_epoch,
         repo_root,
@@ -249,27 +260,32 @@ fn prepare_commits(
 
 /// Orchestration with injected data source (enables testing).
 ///
+/// Takes `HeatmapArgs` by value — ownership moves into [`prepare_commits`] which
+/// consumes it via [`resolve_config`], producing the resolved `HeatmapConfig`
+/// stored in `PreparedCommits`.
+///
 /// All git I/O is routed through `source` — infra checks (repo detection, root,
 /// shallow clone, commit count) and the commit fetch all use the same trait object.
 fn run_with_source(
     source: &dyn GitDataSource,
-    config: &HeatmapConfig,
+    args: HeatmapArgs,
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
     let PreparedCommits {
         commits,
+        config,
         window,
         now_epoch,
         repo_root,
         warnings,
-    } = match prepare_commits(source, config)? {
+    } = match prepare_commits(source, args)? {
         Some(p) => p,
         None => return Ok(ExitCode::FAILURE),
     };
 
     // Steps 5-9: Compute metrics and assemble result
     let start_time = std::time::Instant::now();
-    let mut result = compute_heatmap(commits, config, &window, now_epoch, repo_root, warnings);
+    let mut result = compute_heatmap(commits, &config, &window, now_epoch, repo_root, warnings);
 
     // Apply file-targeting display filter (after full metric computation)
     if !config.files.is_empty() {

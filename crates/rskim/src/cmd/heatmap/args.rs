@@ -2,7 +2,7 @@
 //!
 //! Provides [`parse_args`] (table-driven flag dispatch) and [`print_help`].
 
-use super::types::HeatmapConfig;
+use super::types::HeatmapArgs;
 use std::time::UNIX_EPOCH;
 
 // ============================================================================
@@ -71,10 +71,10 @@ const VALUE_FLAG_TABLE: &[ValueFlagSpec] = &[
     },
 ];
 
-/// Apply a value-taking flag to `config`. Each arm preserves exact validation
+/// Apply a value-taking flag to `args`. Each arm preserves exact validation
 /// logic and error messages from the original flag-by-flag implementation.
 fn apply_value_flag(
-    config: &mut HeatmapConfig,
+    config: &mut HeatmapArgs,
     action: &ValueFlagAction,
     val: String,
 ) -> anyhow::Result<()> {
@@ -146,16 +146,16 @@ fn apply_value_flag(
 // Public API
 // ============================================================================
 
-/// Parse CLI args into `HeatmapConfig`.
+/// Parse CLI args into `HeatmapArgs`.
 ///
 /// Follows the manual flag-parsing pattern used by `stats.rs` and `discover.rs`.
-/// Initialises `config.debug` from the process-wide debug flag so that
+/// Initialises `args.debug` from the process-wide debug flag so that
 /// `SKIM_DEBUG=1` (initialised by `main()` before dispatch) is honoured automatically.
-pub(super) fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
-    let mut config = HeatmapConfig {
+pub(super) fn parse_args(args: &[String]) -> anyhow::Result<HeatmapArgs> {
+    let mut config = HeatmapArgs {
         // Inherit SKIM_DEBUG / --debug flag set by main() before subcommand dispatch.
         debug: crate::debug::is_debug_enabled(),
-        ..HeatmapConfig::default()
+        ..HeatmapArgs::default()
     };
     let mut i = 0;
 
@@ -211,11 +211,11 @@ pub(super) fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
     Ok(config)
 }
 
-/// Apply a recognised boolean flag to `config`.
+/// Apply a recognised boolean flag to `args`.
 ///
 /// Returns `Ok(true)` if the flag was recognised and applied, `Ok(false)` if
 /// the flag is unknown (caller falls through to the unknown-flag error).
-fn apply_boolean_flag(config: &mut HeatmapConfig, flag: &str) -> anyhow::Result<bool> {
+fn apply_boolean_flag(config: &mut HeatmapArgs, flag: &str) -> anyhow::Result<bool> {
     match flag {
         "--json" => config.format_json = true,
         "--no-exclude" => config.no_exclude = true,
@@ -355,80 +355,80 @@ mod tests {
 
     #[test]
     fn test_parse_args_defaults() {
-        let config = parse_args(&[]).unwrap();
-        assert_eq!(config.top_n, 20);
-        assert!((config.coupling_threshold - 0.5).abs() < 1e-9);
-        assert_eq!(config.fix_window, 5);
-        assert!(!config.format_json);
-        assert!(!config.no_exclude);
+        let args = parse_args(&[]).unwrap();
+        assert_eq!(args.top_n, 20);
+        assert!((args.coupling_threshold - 0.5).abs() < 1e-9);
+        assert_eq!(args.fix_window, 5);
+        assert!(!args.format_json);
+        assert!(!args.no_exclude);
     }
 
     #[test]
     fn test_parse_args_json_flag() {
-        let config = parse_args(&["--json".to_string()]).unwrap();
-        assert!(config.format_json);
+        let args = parse_args(&["--json".to_string()]).unwrap();
+        assert!(args.format_json);
     }
 
     #[test]
     fn test_parse_args_top_n() {
-        let config = parse_args(&["--top".to_string(), "5".to_string()]).unwrap();
-        assert_eq!(config.top_n, 5);
+        let args = parse_args(&["--top".to_string(), "5".to_string()]).unwrap();
+        assert_eq!(args.top_n, 5);
     }
 
     #[test]
     fn test_parse_args_top_n_equals() {
-        let config = parse_args(&["--top=10".to_string()]).unwrap();
-        assert_eq!(config.top_n, 10);
+        let args = parse_args(&["--top=10".to_string()]).unwrap();
+        assert_eq!(args.top_n, 10);
     }
 
     #[test]
     fn test_parse_args_window_preset() {
-        let config = parse_args(&["--window=sprint".to_string()]).unwrap();
-        assert_eq!(config.window_preset.as_deref(), Some("sprint"));
+        let args = parse_args(&["--window=sprint".to_string()]).unwrap();
+        assert_eq!(args.window_preset.as_deref(), Some("sprint"));
     }
 
     #[test]
     fn test_parse_args_last_n() {
-        let config = parse_args(&["--last=100".to_string()]).unwrap();
-        assert_eq!(config.last_n, Some(100));
+        let args = parse_args(&["--last=100".to_string()]).unwrap();
+        assert_eq!(args.last_n, Some(100));
     }
 
     #[test]
     fn test_parse_args_no_exclude() {
-        let config = parse_args(&["--no-exclude".to_string()]).unwrap();
-        assert!(config.no_exclude);
+        let args = parse_args(&["--no-exclude".to_string()]).unwrap();
+        assert!(args.no_exclude);
     }
 
     #[test]
     fn test_parse_args_coupling_threshold() {
-        let config = parse_args(&["--coupling-threshold=0.3".to_string()]).unwrap();
-        assert!((config.coupling_threshold - 0.3).abs() < 1e-9);
+        let args = parse_args(&["--coupling-threshold=0.3".to_string()]).unwrap();
+        assert!((args.coupling_threshold - 0.3).abs() < 1e-9);
     }
 
     #[test]
     fn test_parse_args_since_epoch() {
-        let config = parse_args(&["--since=1700000000".to_string()]).unwrap();
-        assert_eq!(config.since, Some(1_700_000_000));
+        let args = parse_args(&["--since=1700000000".to_string()]).unwrap();
+        assert_eq!(args.since, Some(1_700_000_000));
     }
 
     #[test]
     fn test_parse_args_since_duration() {
-        let config = parse_args(&["--since=30d".to_string()]).unwrap();
+        let args = parse_args(&["--since=30d".to_string()]).unwrap();
         // Should be set to some epoch in the past
-        assert!(config.since.is_some());
+        assert!(args.since.is_some());
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let since = config.since.unwrap();
+        let since = args.since.unwrap();
         let diff = now - since;
         assert!((29 * 86400..=31 * 86400).contains(&diff));
     }
 
     #[test]
     fn test_parse_args_path() {
-        let config = parse_args(&["--path=src/".to_string()]).unwrap();
-        assert_eq!(config.path.as_deref(), Some("src/"));
+        let args = parse_args(&["--path=src/".to_string()]).unwrap();
+        assert_eq!(args.path.as_deref(), Some("src/"));
     }
 
     #[test]
@@ -474,20 +474,20 @@ mod tests {
 
     #[test]
     fn test_parse_args_positional_files() {
-        let config = parse_args(&["src/main.rs".to_string(), "src/lib.rs".to_string()]).unwrap();
-        assert_eq!(config.files, vec!["src/main.rs", "src/lib.rs"]);
+        let args = parse_args(&["src/main.rs".to_string(), "src/lib.rs".to_string()]).unwrap();
+        assert_eq!(args.files, vec!["src/main.rs", "src/lib.rs"]);
     }
 
     #[test]
     fn test_parse_args_diff_flag() {
-        let config = parse_args(&["--diff".to_string(), "main".to_string()]).unwrap();
-        assert_eq!(config.diff_base, Some("main".to_string()));
+        let args = parse_args(&["--diff".to_string(), "main".to_string()]).unwrap();
+        assert_eq!(args.diff_base, Some("main".to_string()));
     }
 
     #[test]
     fn test_parse_args_diff_equals() {
-        let config = parse_args(&["--diff=develop".to_string()]).unwrap();
-        assert_eq!(config.diff_base, Some("develop".to_string()));
+        let args = parse_args(&["--diff=develop".to_string()]).unwrap();
+        assert_eq!(args.diff_base, Some("develop".to_string()));
     }
 
     #[test]
@@ -504,20 +504,20 @@ mod tests {
 
     #[test]
     fn test_parse_args_file_path_normalization() {
-        let config = parse_args(&["./src/main.rs".to_string()]).unwrap();
-        assert_eq!(config.files, vec!["src/main.rs"]);
+        let args = parse_args(&["./src/main.rs".to_string()]).unwrap();
+        assert_eq!(args.files, vec!["src/main.rs"]);
     }
 
     #[test]
     fn test_parse_args_top_explicit_flag() {
-        let config = parse_args(&["--top".to_string(), "5".to_string()]).unwrap();
-        assert!(config.top_explicit);
+        let args = parse_args(&["--top".to_string(), "5".to_string()]).unwrap();
+        assert!(args.top_explicit);
     }
 
     #[test]
     fn test_parse_args_top_implicit_by_default() {
-        let config = parse_args(&[]).unwrap();
-        assert!(!config.top_explicit);
+        let args = parse_args(&[]).unwrap();
+        assert!(!args.top_explicit);
     }
 
     #[test]
@@ -530,28 +530,28 @@ mod tests {
 
     #[test]
     fn test_parse_args_files_with_other_flags() {
-        let config = parse_args(&[
+        let args = parse_args(&[
             "--since".to_string(),
             "30d".to_string(),
             "src/main.rs".to_string(),
             "--json".to_string(),
         ])
         .unwrap();
-        assert_eq!(config.files, vec!["src/main.rs"]);
-        assert!(config.format_json);
-        assert!(config.since.is_some());
+        assert_eq!(args.files, vec!["src/main.rs"]);
+        assert!(args.format_json);
+        assert!(args.since.is_some());
     }
 
     #[test]
     fn test_parse_args_extra_exclude() {
-        let config = parse_args(&["--exclude=*.generated.ts".to_string()]).unwrap();
-        assert_eq!(config.extra_excludes, vec!["*.generated.ts"]);
+        let args = parse_args(&["--exclude=*.generated.ts".to_string()]).unwrap();
+        assert_eq!(args.extra_excludes, vec!["*.generated.ts"]);
     }
 
     #[test]
     fn test_parse_args_fix_window() {
-        let config = parse_args(&["--fix-window=10".to_string()]).unwrap();
-        assert_eq!(config.fix_window, 10);
+        let args = parse_args(&["--fix-window=10".to_string()]).unwrap();
+        assert_eq!(args.fix_window, 10);
     }
 
     // -----------------------------------------------------------------------
@@ -560,23 +560,20 @@ mod tests {
 
     #[test]
     fn test_parse_args_insights_flag() {
-        let config = parse_args(&["--insights".to_string()]).unwrap();
-        assert!(
-            config.insights,
-            "--insights should set config.insights=true"
-        );
+        let args = parse_args(&["--insights".to_string()]).unwrap();
+        assert!(args.insights, "--insights should set args.insights=true");
     }
 
     #[test]
     fn test_parse_args_insights_with_json() {
-        let config = parse_args(&["--insights".to_string(), "--json".to_string()]).unwrap();
-        assert!(config.insights, "--insights should be set");
-        assert!(config.format_json, "--json should be set");
+        let args = parse_args(&["--insights".to_string(), "--json".to_string()]).unwrap();
+        assert!(args.insights, "--insights should be set");
+        assert!(args.format_json, "--json should be set");
     }
 
     #[test]
     fn test_parse_args_insights_default_false() {
-        let config = parse_args(&[]).unwrap();
-        assert!(!config.insights, "insights should default to false");
+        let args = parse_args(&[]).unwrap();
+        assert!(!args.insights, "insights should default to false");
     }
 }
