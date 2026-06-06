@@ -655,9 +655,7 @@ fn close_depth(
     if PARAM_LIST_KIND_IDS.contains(&kind_id) {
         // PF-004: saturating cast — count can be up to DEFAULT_MAX_NODES (100K) > u16::MAX
         let count_u16 = count.min(u32::from(u16::MAX)) as u16;
-        if count_u16 > metrics.max_params {
-            metrics.max_params = count_u16;
-        }
+        metrics.max_params = metrics.max_params.max(count_u16);
         emit_bucket_crossings(bigram_map, MANY_PARAMS, &PARAM_EDGES, count);
     }
 }
@@ -687,9 +685,7 @@ fn emit_empty_or_large_body(
     {
         // PF-004: saturating cast — count can be up to DEFAULT_MAX_NODES (100K) > u16::MAX
         let count_u16 = count.min(u32::from(u16::MAX)) as u16;
-        if count_u16 > metrics.max_block_stmts {
-            metrics.max_block_stmts = count_u16;
-        }
+        metrics.max_block_stmts = metrics.max_block_stmts.max(count_u16);
         emit_bucket_crossings(bigram_map, LARGE_BODY, &BODY_STMT_EDGES, count);
     }
 }
