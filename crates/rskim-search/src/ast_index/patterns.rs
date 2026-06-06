@@ -632,7 +632,7 @@ pub fn lookup_pattern(name: &str) -> Result<&'static Pattern> {
 pub fn pattern_to_query_set(pattern: &Pattern) -> AstNgramSet {
     use crate::ast_index::{AstBigramEntry, AstTrigramEntry, DEFAULT_AST_WEIGHT};
 
-    let bigrams = pattern
+    let mut bigrams: Vec<AstBigramEntry> = pattern
         .resolved_bigrams()
         .into_iter()
         .map(|ngram| AstBigramEntry {
@@ -641,8 +641,10 @@ pub fn pattern_to_query_set(pattern: &Pattern) -> AstNgramSet {
             count: 1,
         })
         .collect();
+    // AstNgramSet invariant: both vecs must be sorted by key ascending.
+    bigrams.sort_unstable_by_key(|e| e.ngram.key());
 
-    let trigrams = pattern
+    let mut trigrams: Vec<AstTrigramEntry> = pattern
         .resolved_trigrams()
         .into_iter()
         .map(|ngram| AstTrigramEntry {
@@ -651,6 +653,8 @@ pub fn pattern_to_query_set(pattern: &Pattern) -> AstNgramSet {
             count: 1,
         })
         .collect();
+    // AstNgramSet invariant: both vecs must be sorted by key ascending.
+    trigrams.sort_unstable_by_key(|e| e.ngram.key());
 
     AstNgramSet { bigrams, trigrams }
 }

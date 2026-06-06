@@ -190,6 +190,21 @@ fn f7_gold_all_patterns() {
                 p.name,
             );
         }
+
+        // Guard: at least one declared n-gram must resolve for the GOLD loops
+        // above to verify anything. If ALL bigrams AND trigrams fail to resolve
+        // (e.g. a future vocab regen renames a node kind), both loops are no-ops
+        // and the pattern passes GOLD without verifying anything — a silent
+        // disarming of the honesty gate.
+        //
+        // applies ADR-003: test assertions must genuinely verify.
+        assert!(
+            !resolved_bs.is_empty() || !resolved_ts.is_empty(),
+            "GOLD GATE DISARMED for pattern '{}': zero declared n-grams resolved — \
+             both bigrams and trigrams failed to resolve. The GOLD verification loops \
+             are no-ops. Check that kind strings match the current vocabulary.",
+            p.name,
+        );
     }
 }
 
