@@ -19,6 +19,7 @@ fn make_valid_header() -> AstSkidxHeader {
         avg_bigram_count: 3.5_f32,
         avg_trigram_count: 1.2_f32,
         avg_node_count: 42.0_f32,
+        avg_max_depth: 5.2_f32,
         checksum: 0xDEAD_BEEF,
     }
 }
@@ -44,6 +45,7 @@ fn header_roundtrip_zero_avgs() {
         avg_bigram_count: 0.0,
         avg_trigram_count: 0.0,
         avg_node_count: 0.0,
+        avg_max_depth: 0.0,
         checksum: 0,
     };
     let encoded = encode_header(&h);
@@ -103,9 +105,28 @@ fn header_rejects_wrong_version_zero() {
 }
 
 #[test]
-fn header_rejects_wrong_version_two() {
+fn header_rejects_wrong_version_one() {
+    // v1 is no longer valid — it lacks v2 structural fields.
+    // The reader must reject it with "please rebuild the AST index".
     let mut encoded = encode_header(&make_valid_header());
-    encoded[4..6].copy_from_slice(&2u16.to_le_bytes());
+    encoded[4..6].copy_from_slice(&1u16.to_le_bytes());
+    let err = decode_header(&encoded).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("format version"),
+        "expected 'format version' in: {msg}"
+    );
+    assert!(
+        msg.contains("please rebuild the AST index"),
+        "expected 'please rebuild' in: {msg}"
+    );
+}
+
+#[test]
+fn header_rejects_wrong_version_three() {
+    // A future version (3) must also be rejected by this binary.
+    let mut encoded = encode_header(&make_valid_header());
+    encoded[4..6].copy_from_slice(&3u16.to_le_bytes());
     let err = decode_header(&encoded).unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -340,14 +361,44 @@ fn posting_rejects_truncation() {
 // AstFileMetaEntry roundtrip
 // ============================================================================
 
-#[test]
-fn file_meta_roundtrip() {
-    let m = AstFileMetaEntry {
+// ============================================================================
+// A2: AstFileMetaEntry v2 round-trip and size constant
+// ============================================================================
+
+fn make_file_meta() -> AstFileMetaEntry {
+    AstFileMetaEntry {
         lang_id: 11, // Rust
         node_count: 256,
+        max_depth: 12,
+        max_block_stmts: 25,
+        max_params: 6,
+        branch_count: 8,
+    }
+}
+
+#[test]
+fn file_meta_roundtrip() {
+    let m = make_file_meta();
+    let encoded = encode_file_meta(&m);
+    // A2: FILE_META_SIZE == 15 (P3: delta +10 bytes/file from v1's 5 bytes)
+    assert_eq!(encoded.len(), FILE_META_SIZE);
+    assert_eq!(FILE_META_SIZE, 15, "P3: file meta must be 15 bytes");
+    let decoded = decode_file_meta(&encoded).unwrap();
+    assert_eq!(decoded, m);
+}
+
+#[test]
+fn file_meta_roundtrip_all_fields() {
+    // Round-trip with boundary/max values to verify all field encodings
+    let m = AstFileMetaEntry {
+        lang_id: 0xFF,
+        node_count: u32::MAX,
+        max_depth: u16::MAX,
+        max_block_stmts: u16::MAX,
+        max_params: u16::MAX,
+        branch_count: u32::MAX,
     };
     let encoded = encode_file_meta(&m);
-    assert_eq!(encoded.len(), FILE_META_SIZE);
     let decoded = decode_file_meta(&encoded).unwrap();
     assert_eq!(decoded, m);
 }
@@ -357,6 +408,10 @@ fn file_meta_boundary_max_node_count() {
     let m = AstFileMetaEntry {
         lang_id: 0,
         node_count: u32::MAX,
+        max_depth: 0,
+        max_block_stmts: 0,
+        max_params: 0,
+        branch_count: 0,
     };
     let encoded = encode_file_meta(&m);
     let decoded = decode_file_meta(&encoded).unwrap();
@@ -365,14 +420,77 @@ fn file_meta_boundary_max_node_count() {
 
 #[test]
 fn file_meta_rejects_truncation() {
-    let m = AstFileMetaEntry {
-        lang_id: 9,
-        node_count: 10,
-    };
+    let m = make_file_meta();
     let encoded = encode_file_meta(&m);
     let err = decode_file_meta(&encoded[..FILE_META_SIZE - 1]).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("truncated"), "expected 'truncated' in: {msg}");
+}
+
+// ============================================================================
+// A1: FORMAT_VERSION == 2, magic unchanged
+// ============================================================================
+
+#[test]
+fn a1_format_version_is_2() {
+    assert_eq!(FORMAT_VERSION, 2, "A1: FORMAT_VERSION must be 2");
+}
+
+#[test]
+fn a1_magic_unchanged() {
+    assert_eq!(SKAX_MAGIC, b"SKAX", "A1: magic must remain b\"SKAX\"");
+}
+
+// ============================================================================
+// A3: Reader rejects v1 with "please rebuild the AST index"
+// ============================================================================
+
+#[test]
+fn a3_reader_rejects_v1_header() {
+    // Hand-craft a minimal v1 header (48 bytes, version = 1)
+    let mut v1_header = [0u8; 48];
+    v1_header[0..4].copy_from_slice(b"SKAX");
+    v1_header[4..6].copy_from_slice(&1u16.to_le_bytes()); // version = 1
+    // All other fields 0 (empty index)
+
+    let err = decode_header(&v1_header).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("please rebuild the AST index"),
+        "A3: v1 rejection must contain 'please rebuild the AST index', got: {msg}"
+    );
+    assert!(
+        msg.contains("format version"),
+        "A3: v1 rejection must contain 'format version', got: {msg}"
+    );
+}
+
+// ============================================================================
+// A8: avg_max_depth decodes correctly from header reserved bytes
+// ============================================================================
+
+#[test]
+fn a8_avg_max_depth_roundtrip() {
+    let h = AstSkidxHeader {
+        magic: *SKAX_MAGIC,
+        version: FORMAT_VERSION,
+        bigram_count: 0,
+        trigram_count: 0,
+        file_count: 0,
+        postings_file_size: 0,
+        avg_bigram_count: 0.0,
+        avg_trigram_count: 0.0,
+        avg_node_count: 0.0,
+        avg_max_depth: 7.5,
+        checksum: 0,
+    };
+    let encoded = encode_header(&h);
+    let decoded = decode_header(&encoded).unwrap();
+    assert!(
+        (decoded.avg_max_depth - 7.5).abs() < 1e-6,
+        "A8: avg_max_depth must round-trip; got {}",
+        decoded.avg_max_depth
+    );
 }
 
 // ============================================================================

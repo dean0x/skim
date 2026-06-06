@@ -28,12 +28,12 @@ use memmap2::Mmap;
 
 use super::format::{
     AstFileMetaEntry, AstSkidxHeader, BIGRAM_ENTRY_SIZE, FILE_META_SIZE, HEADER_SIZE,
-    POSTING_ENTRY_SIZE, TRIGRAM_ENTRY_SIZE, compute_checksum, decode_file_meta, decode_header,
-    decode_posting, lookup_bigram, lookup_trigram,
+    POSTING_ENTRY_SIZE, SKAX_MAGIC, TRIGRAM_ENTRY_SIZE, compute_checksum, decode_file_meta,
+    decode_header, decode_posting, lookup_bigram, lookup_trigram,
 };
 use crate::{
     Result, SearchError,
-    ast_index::{AstBigram, AstTrigram},
+    ast_index::{AstBigram, AstTrigram, StructuralMetrics},
 };
 
 // ============================================================================
@@ -236,6 +236,41 @@ impl AstIndexReader {
     // Public accessors
     // -----------------------------------------------------------------------
 
+    /// Probe the format version of an on-disk AST index without fully opening it.
+    ///
+    /// Reads only the first 6 bytes of `ast_index.skidx` (magic + version) to
+    /// cheaply determine the format version. Returns `Err(IndexCorrupted)` if
+    /// the file is too short, has bad magic bytes, or cannot be read.
+    ///
+    /// Intended for staleness checks (Wave 3f/3g): callers can probe the version
+    /// before attempting a full `open`, which would fail with a version error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::Io`] if the file cannot be opened.
+    /// Returns [`SearchError::IndexCorrupted`] if the file is too short or has
+    /// bad magic bytes.
+    pub fn index_version(dir: &Path) -> Result<u16> {
+        use std::io::Read;
+        let idx_path = dir.join("ast_index.skidx");
+        let mut file = std::fs::File::open(&idx_path)?;
+        let mut buf = [0u8; 6];
+        file.read_exact(&mut buf).map_err(|_| {
+            SearchError::IndexCorrupted(
+                "index_version: ast_index.skidx too short (need 6 bytes)".into(),
+            )
+        })?;
+        let magic = &buf[0..4];
+        if magic != SKAX_MAGIC {
+            return Err(SearchError::IndexCorrupted(format!(
+                "index_version: bad magic: expected {:?}, got {:?}",
+                SKAX_MAGIC, magic
+            )));
+        }
+        let version = u16::from_le_bytes([buf[4], buf[5]]);
+        Ok(version)
+    }
+
     /// Return the number of files in the index.
     #[must_use]
     pub fn file_count(&self) -> u32 {
@@ -287,6 +322,34 @@ impl AstIndexReader {
                 ))
             })?;
         decode_file_meta(&self.idx_mmap[offset..end])
+    }
+
+    /// Return the per-file structural metrics for the file at sequential index `file_index`.
+    ///
+    /// Reads the same on-disk entry as [`file_meta`][Self::file_meta] but
+    /// extracts the v2-only structural fields as a [`StructuralMetrics`] value.
+    ///
+    /// `file_index` is the 0-based insertion order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::IndexCorrupted`] if `file_index` is out of bounds.
+    pub fn file_metrics(&self, file_index: u32) -> Result<StructuralMetrics> {
+        let entry = self.file_meta(file_index)?;
+        Ok(StructuralMetrics {
+            max_depth: entry.max_depth,
+            max_block_stmts: entry.max_block_stmts,
+            max_params: entry.max_params,
+            branch_count: entry.branch_count,
+        })
+    }
+
+    /// Return the average maximum CST depth across all indexed files.
+    ///
+    /// Stored in header bytes [38..42] (was reserved in v1, now `avg_max_depth`).
+    #[must_use]
+    pub fn avg_max_depth(&self) -> f32 {
+        self.header.avg_max_depth
     }
 
     // -----------------------------------------------------------------------

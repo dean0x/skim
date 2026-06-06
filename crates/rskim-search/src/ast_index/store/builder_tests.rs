@@ -9,6 +9,7 @@ use crate::{
     FileId,
     ast_index::{
         AstBigram, AstBigramEntry, AstNgramSet, AstTrigram, AstTrigramEntry, DEFAULT_AST_WEIGHT,
+        StructuralMetrics,
     },
 };
 use rskim_core::Language;
@@ -99,13 +100,13 @@ fn a8_zero_ngram_file_gets_meta_entry() {
     let empty_set = AstNgramSet::default();
 
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &set_with, 100)
+        .add_file_ngrams(FileId(0), Language::Rust, &set_with, 100, StructuralMetrics::default())
         .unwrap();
     builder
-        .add_file_ngrams(FileId(1), Language::Python, &empty_set, 0)
+        .add_file_ngrams(FileId(1), Language::Python, &empty_set, 0, StructuralMetrics::default())
         .unwrap();
     builder
-        .add_file_ngrams(FileId(2), Language::Go, &empty_set, 50)
+        .add_file_ngrams(FileId(2), Language::Go, &empty_set, 50, StructuralMetrics::default())
         .unwrap();
 
     let reader = builder.build().unwrap();
@@ -132,10 +133,10 @@ fn a9_duplicate_file_id_rejected() {
     let empty = AstNgramSet::default();
 
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &empty, 0)
+        .add_file_ngrams(FileId(0), Language::Rust, &empty, 0, StructuralMetrics::default())
         .unwrap();
     let err = builder
-        .add_file_ngrams(FileId(0), Language::Rust, &empty, 0)
+        .add_file_ngrams(FileId(0), Language::Rust, &empty, 0, StructuralMetrics::default())
         .unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("duplicate"), "expected 'duplicate' in: {msg}");
@@ -149,7 +150,7 @@ fn a9_non_sequential_first_id_rejected() {
 
     // First FileId should be 0, not 5
     let err = builder
-        .add_file_ngrams(FileId(5), Language::Rust, &empty, 0)
+        .add_file_ngrams(FileId(5), Language::Rust, &empty, 0, StructuralMetrics::default())
         .unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -165,11 +166,11 @@ fn a9_gap_in_file_ids_rejected() {
     let empty = AstNgramSet::default();
 
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &empty, 0)
+        .add_file_ngrams(FileId(0), Language::Rust, &empty, 0, StructuralMetrics::default())
         .unwrap();
     // FileId(2) skips FileId(1)
     let err = builder
-        .add_file_ngrams(FileId(2), Language::Rust, &empty, 0)
+        .add_file_ngrams(FileId(2), Language::Rust, &empty, 0, StructuralMetrics::default())
         .unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -206,7 +207,7 @@ fn a2_posting_merge_sorted_unique_doc_ids() {
     for i in 0..10u32 {
         let set = multi_bigram_set(&[(key_a, 1), (key_b, 2), (key_c, 3)]);
         builder
-            .add_file_ngrams(FileId(i), Language::Rust, &set, 10)
+            .add_file_ngrams(FileId(i), Language::Rust, &set, 10, StructuralMetrics::default())
             .unwrap();
     }
 
@@ -248,7 +249,7 @@ fn a4_count_preserved_from_ngram_entry() {
 
     let set = single_bigram_set(key, 7);
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &set, 100)
+        .add_file_ngrams(FileId(0), Language::Rust, &set, 100, StructuralMetrics::default())
         .unwrap();
 
     let reader = builder.build().unwrap();
@@ -273,7 +274,7 @@ fn a10_atomic_write_no_temp_leftovers() {
     let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
     let empty = AstNgramSet::default();
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &empty, 0)
+        .add_file_ngrams(FileId(0), Language::Rust, &empty, 0, StructuralMetrics::default())
         .unwrap();
     builder.build().unwrap();
 
@@ -312,13 +313,13 @@ fn avg_node_count_computed_correctly() {
     let empty = AstNgramSet::default();
 
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &empty, 10)
+        .add_file_ngrams(FileId(0), Language::Rust, &empty, 10, StructuralMetrics::default())
         .unwrap();
     builder
-        .add_file_ngrams(FileId(1), Language::Python, &empty, 20)
+        .add_file_ngrams(FileId(1), Language::Python, &empty, 20, StructuralMetrics::default())
         .unwrap();
     builder
-        .add_file_ngrams(FileId(2), Language::Go, &empty, 30)
+        .add_file_ngrams(FileId(2), Language::Go, &empty, 30, StructuralMetrics::default())
         .unwrap();
 
     let reader = builder.build().unwrap();

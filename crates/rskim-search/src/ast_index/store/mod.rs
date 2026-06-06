@@ -10,7 +10,14 @@
 //!
 //! ## Magic / version
 //!
-//! Magic `b"SKAX"`, version `1`.  Any layout change increments the version.
+//! Magic `b"SKAX"`, version `2`.  Any layout change increments the version.
+//!
+//! ## AST INDEX FORMAT NOTE (v2)
+//!
+//! v2 extends `AstFileMetaEntry` from 5 to 15 bytes, adds `avg_max_depth` in
+//! previously-reserved header bytes [38..42], and stores synthetic n-grams from
+//! the AST Pattern Library alongside real n-grams. All v1 indexes must be
+//! rebuilt (`skim search index --rebuild`). Auto-rebuild is wired in Wave 3f/3g.
 //!
 //! # Public API
 //!
@@ -18,8 +25,9 @@
 //! then `build()`.  Use `build_from_files` for parallel bulk construction.
 //!
 //! [`AstIndexReader`] — returned by the builder.  Use `lookup_bigram` /
-//! `lookup_trigram` for posting-list access and `file_meta` for per-file
-//! metadata.
+//! `lookup_trigram` for posting-list access, `file_meta` for per-file
+//! metadata, `file_metrics` for structural metrics, and `index_version` for
+//! cheap version probing.
 //!
 //! [`AstPosting`] — individual posting element (`doc_id` + `count`).
 //!
