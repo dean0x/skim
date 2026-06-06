@@ -53,7 +53,6 @@ pub(super) fn resolve_config(
     // Move window_preset and last_n into ResolvedWindow first so we can read
     // them from `window.*` rather than from `args` after partial move.
     let mut window = ResolvedWindow {
-        since: None,
         dual_mode: false,
         dual_time_since: None,
         dual_count_since: None,
@@ -73,14 +72,19 @@ pub(super) fn resolve_config(
         );
     }
 
-    if let Some(since) = args.since {
+    // Resolve the effective `since` epoch. The result is stored only in
+    // `HeatmapConfig::since` — `ResolvedWindow` no longer carries a redundant
+    // copy, eliminating a previously-unenforceable "always identical" invariant.
+    let mut since: Option<u64> = None;
+
+    if let Some(s) = args.since {
         // Already set — highest precedence
-        window.since = Some(since);
+        since = Some(s);
     } else if let Some(n) = window.last_n {
         // --last N: find the timestamp of the Nth commit
         match source.fetch_commit_count_since(n) {
             Ok(Some(ts)) => {
-                window.since = Some(ts);
+                since = Some(ts);
             }
             Ok(None) => {
                 warnings.push(format!(
@@ -92,8 +96,8 @@ pub(super) fn resolve_config(
             }
         }
     } else if let Some(ref preset) = window.window_preset {
-        if let Some(since) = preset_to_since_secs(preset, now_epoch) {
-            window.since = Some(since);
+        if let Some(s) = preset_to_since_secs(preset, now_epoch) {
+            since = Some(s);
         } else {
             warnings.push(format!(
                 "Unknown window preset '{preset}' — valid: sprint, month, quarter, half, year, all. Analyzing all history."
@@ -110,7 +114,7 @@ pub(super) fn resolve_config(
 
         // Use whichever captures more history (lower epoch = more history)
         let dual_resolved = time_since.min(count_since);
-        window.since = Some(dual_resolved);
+        since = Some(dual_resolved);
         window.dual_mode = true;
         window.dual_time_since = Some(time_since);
         window.dual_count_since = Some(count_since);
@@ -120,7 +124,7 @@ pub(super) fn resolve_config(
     // (heap allocations) or copied (scalars). `window_preset`, `last_n`, and
     // `diff_base` are intentionally absent — they were consumed above.
     let config = HeatmapConfig {
-        since: window.since,
+        since,
         path: args.path,
         format_json: args.format_json,
         top_n: args.top_n,
@@ -142,8 +146,13 @@ pub(super) fn resolve_config(
 // ============================================================================
 
 /// Convert a [`ResolvedWindow`] + runtime context into a [`WindowInfo`] for output.
+///
+/// `since` is passed explicitly rather than read from `window` — `ResolvedWindow`
+/// no longer carries a `since` field (it was always identical to `HeatmapConfig::since`,
+/// which the type system could not enforce). Callers pass `config.since` here.
 pub(super) fn build_window_info(
     window: &ResolvedWindow,
+    since: Option<u64>,
     commits_analyzed: usize,
     now_epoch: u64,
 ) -> WindowInfo {
@@ -153,14 +162,13 @@ pub(super) fn build_window_info(
         preset.clone()
     } else if window.last_n.is_some() {
         "count".to_string()
-    } else if window.since.is_some() {
+    } else if since.is_some() {
         "time".to_string()
     } else {
         "dual".to_string()
     };
 
-    let since_str = window
-        .since
+    let since_str = since
         .map(format_epoch)
         .unwrap_or_else(|| "all".to_string());
 
@@ -228,7 +236,6 @@ mod tests {
 
     fn base_window() -> ResolvedWindow {
         ResolvedWindow {
-            since: None,
             dual_mode: false,
             dual_time_since: None,
             dual_count_since: None,
@@ -291,7 +298,7 @@ mod tests {
             ..base_window()
         };
 
-        let info = build_window_info(&window, 42, NOW);
+        let info = build_window_info(&window, None, 42, NOW);
 
         assert_eq!(info.mode, "dual");
         assert_eq!(info.commits_analyzed, 42);
@@ -308,7 +315,7 @@ mod tests {
             ..base_window()
         };
 
-        let info = build_window_info(&window, 10, NOW);
+        let info = build_window_info(&window, None, 10, NOW);
 
         assert_eq!(info.mode, "dual");
         assert_eq!(info.effective_strategy.as_deref(), Some("count"));
@@ -321,7 +328,7 @@ mod tests {
             ..base_window()
         };
 
-        let info = build_window_info(&window, 50, NOW);
+        let info = build_window_info(&window, None, 50, NOW);
 
         assert_eq!(info.mode, "quarter");
         assert!(info.effective_strategy.is_none());
@@ -334,7 +341,7 @@ mod tests {
             ..base_window()
         };
 
-        let info = build_window_info(&window, 200, NOW);
+        let info = build_window_info(&window, None, 200, NOW);
 
         assert_eq!(info.mode, "count");
         assert!(info.effective_strategy.is_none());
@@ -342,12 +349,9 @@ mod tests {
 
     #[test]
     fn test_build_window_info_time_mode() {
-        let window = ResolvedWindow {
-            since: Some(1_700_000_000),
-            ..base_window()
-        };
+        let window = base_window();
 
-        let info = build_window_info(&window, 77, NOW);
+        let info = build_window_info(&window, Some(1_700_000_000), 77, NOW);
 
         assert_eq!(info.mode, "time");
         assert_eq!(info.since, "2023-11-14"); // epoch 1_700_000_000
@@ -360,7 +364,7 @@ mod tests {
         // dual_mode=false, so effective_strategy is None (only set in the dual_mode branch).
         let window = base_window();
 
-        let info = build_window_info(&window, 0, NOW);
+        let info = build_window_info(&window, None, 0, NOW);
 
         assert_eq!(info.mode, "dual");
         assert!(info.effective_strategy.is_none());
@@ -370,7 +374,7 @@ mod tests {
     fn test_build_window_info_no_since_shows_all() {
         let window = base_window();
 
-        let info = build_window_info(&window, 0, NOW);
+        let info = build_window_info(&window, None, 0, NOW);
 
         assert_eq!(info.since, "all");
     }
@@ -379,7 +383,7 @@ mod tests {
     fn test_build_window_info_commits_analyzed_passthrough() {
         let window = base_window();
 
-        let info = build_window_info(&window, 999, NOW);
+        let info = build_window_info(&window, None, 999, NOW);
 
         assert_eq!(info.commits_analyzed, 999);
     }
@@ -456,12 +460,26 @@ mod tests {
         args.last_n = Some(50);
         let mut warnings = Vec::new();
 
-        let (_config, window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
+        let (config, window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
 
         // `window_preset` moved into ResolvedWindow (independent of last_n)
         assert_eq!(window.window_preset.as_deref(), Some("sprint"));
         // `last_n` copied into ResolvedWindow (independent of window_preset)
         assert_eq!(window.last_n, Some(50));
+        // With both --last and --window set, --last wins (--since > --last > --window).
+        // The mock returns Some(1_700_000_000) for fetch_commit_count_since, so since
+        // resolves from the --last branch.
+        assert_eq!(
+            config.since,
+            Some(1_700_000_000),
+            "expected config.since from --last branch, got {:?}",
+            config.since
+        );
+        // Both --last and --window set → multiple-flag warning emitted
+        assert!(
+            !warnings.is_empty(),
+            "expected multiple-flag warning, got none"
+        );
     }
 
     /// When `fetch_commit_count_since` returns `Err` during `--last N` resolution,
@@ -474,18 +492,13 @@ mod tests {
         args.last_n = Some(50);
         let mut warnings = Vec::new();
 
-        let (config, window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
+        let (config, _window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
 
         // Graceful degradation: since is None (analyze all history)
         assert!(
             config.since.is_none(),
             "expected since=None (all history) on git error, got {:?}",
             config.since
-        );
-        assert!(
-            window.since.is_none(),
-            "expected window.since=None on git error, got {:?}",
-            window.since
         );
         // Warning must be emitted so the user knows why the fallback occurred
         assert!(
@@ -548,10 +561,9 @@ mod tests {
         args.last_n = Some(100);
         let mut warnings = Vec::new();
 
-        let (config, window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
+        let (config, _window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
 
         assert_eq!(config.since, Some(1_700_000_000));
-        assert_eq!(window.since, Some(1_700_000_000));
         // Multiple flags → warning emitted
         assert!(!warnings.is_empty());
     }
@@ -571,5 +583,97 @@ mod tests {
         assert!(window.dual_mode);
         assert!(window.dual_time_since.is_some());
         assert!(window.dual_count_since.is_some());
+    }
+
+    /// When `fetch_commit_count_since` returns `Ok(None)` (repo has fewer than N
+    /// commits), `resolve_config` must emit a warning and leave `config.since` as
+    /// `None` (analyze all history). The function must not return `Err`.
+    #[test]
+    fn test_resolve_config_last_n_ok_none_degrades_to_all_history() {
+        let source = MockGitSource {
+            commit_count_since: None, // Ok(None): fewer commits than requested
+        };
+        let mut args = base_args();
+        args.last_n = Some(50);
+        let mut warnings = Vec::new();
+
+        let (config, _window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
+
+        assert!(
+            config.since.is_none(),
+            "expected since=None (all history) when repo has fewer than 50 commits, got {:?}",
+            config.since
+        );
+        assert!(
+            !warnings.is_empty(),
+            "expected a warning about fewer commits, got none"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("fewer than 50 commits")),
+            "warning must mention 'fewer than 50 commits', got: {:?}",
+            warnings
+        );
+    }
+
+    /// When a known preset is supplied, `config.since` is set to the expected epoch.
+    ///
+    /// NOW = 1_704_067_200 (2024-01-01). "sprint" = NOW − 14 × 86400 = 1_702_857_600.
+    #[test]
+    fn test_resolve_config_known_preset_resolves_epoch() {
+        let source = MockGitSource {
+            commit_count_since: None, // Not called in the preset branch
+        };
+        let mut args = base_args();
+        args.window_preset = Some("sprint".to_string());
+        let mut warnings = Vec::new();
+
+        let (config, window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
+
+        let expected_since = NOW - 14 * 86400; // 1_702_857_600
+        assert_eq!(
+            config.since,
+            Some(expected_since),
+            "expected config.since={expected_since} for 'sprint' preset, got {:?}",
+            config.since
+        );
+        assert_eq!(
+            window.window_preset.as_deref(),
+            Some("sprint"),
+            "preset must be preserved in ResolvedWindow for display logic"
+        );
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings for a known preset, got: {:?}",
+            warnings
+        );
+    }
+
+    /// When an unknown preset is supplied, `config.since` stays `None` (all history)
+    /// and a warning is emitted naming the unrecognised preset.
+    #[test]
+    fn test_resolve_config_unknown_preset_emits_warning() {
+        let source = MockGitSource {
+            commit_count_since: None,
+        };
+        let mut args = base_args();
+        args.window_preset = Some("biweekly".to_string());
+        let mut warnings = Vec::new();
+
+        let (config, _window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
+
+        assert!(
+            config.since.is_none(),
+            "expected since=None for unknown preset, got {:?}",
+            config.since
+        );
+        assert!(
+            !warnings.is_empty(),
+            "expected a warning about the unknown preset, got none"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("Unknown window preset")),
+            "warning must contain 'Unknown window preset', got: {:?}",
+            warnings
+        );
     }
 }

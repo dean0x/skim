@@ -150,11 +150,14 @@ pub(crate) struct HeatmapConfig {
 /// Separates derived window state from raw CLI input (`HeatmapArgs`), so
 /// `HeatmapArgs` remains a pure user-input struct and window metadata is
 /// never confused with CLI flags.
+///
+/// The effective `since` epoch is NOT stored here — it lives exclusively in
+/// [`HeatmapConfig::since`]. This eliminates the previously-redundant
+/// `ResolvedWindow::since` field whose invariant ("always identical to
+/// `HeatmapConfig::since`") could not be enforced by the type system. Callers
+/// that need the epoch for display pass it explicitly via [`super::window::build_window_info`].
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedWindow {
-    /// The effective `--since` epoch. Always identical to `HeatmapConfig::since`
-    /// by construction in `resolve_config` — both are set from the same resolved value.
-    pub(crate) since: Option<u64>,
     /// True when using dual default windowing (no explicit flag was set).
     pub(crate) dual_mode: bool,
     /// Epoch of the 90-day time window (populated in dual mode only).

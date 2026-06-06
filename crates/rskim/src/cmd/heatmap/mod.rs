@@ -190,7 +190,7 @@ fn prepare_commits(
             "time"
         };
         eprintln!("[skim:heatmap] window mode: {mode}");
-        if let Some(since) = window.since {
+        if let Some(since) = config.since {
             eprintln!(
                 "[skim:heatmap] since epoch: {since} ({})",
                 format_epoch(since)
@@ -497,7 +497,7 @@ fn compute_heatmap(
     file_metrics.sort_by_key(|f| f.stability_score);
 
     // Step 7: Build window info
-    let window_info = build_window_info(window, commits.len(), now_epoch);
+    let window_info = build_window_info(window, config.since, commits.len(), now_epoch);
 
     // Step 8: Get excluded patterns for output
     let excluded_patterns: Vec<String> = if config.no_exclude {
