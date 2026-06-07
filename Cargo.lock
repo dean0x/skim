@@ -2387,6 +2387,7 @@ dependencies = [
  "regex",
  "rskim-core",
  "rusqlite",
+ "rustc-hash",
  "serde",
  "serde_json",
  "tempfile",

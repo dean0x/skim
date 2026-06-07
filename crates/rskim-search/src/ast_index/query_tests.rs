@@ -303,15 +303,23 @@ fn parse_query_too_long_invalid() {
 
 #[test]
 fn parse_exactly_4096_bytes_ok() {
-    // A 4096-byte string of spaces trims to empty → "empty" error, not length error.
-    // Use a valid name repeated/padded to be exactly 4096 bytes containing '>'.
-    // Simplest: just check boundary at 4096 with an actual query that is valid length.
-    let s = "a".repeat(4096);
-    // This is at the limit — could be InvalidQuery for unknown kind, but NOT for length.
-    let err = parse_ast_query(&s).unwrap_err();
+    // Build a valid containment query (bigram "function_item > block") padded to
+    // exactly 4096 bytes with leading spaces — trimming removes them, so the
+    // length guard passes and the query is valid.
+    let base = "function_item > block";
+    let padding = " ".repeat(4096 - base.len());
+    let s = format!("{padding}{base}");
+    assert_eq!(s.len(), 4096, "precondition: string is exactly 4096 bytes");
+    // Should succeed (valid query within length limit).
+    let result = parse_ast_query(&s);
     assert!(
-        !err.to_string().contains("too long"),
-        "should not be length error: {err}"
+        result.is_ok(),
+        "4096-byte valid query should be accepted: {result:?}"
+    );
+    // Result should be a Containment bigram.
+    assert!(
+        matches!(result.unwrap(), AstQuery::Containment(_)),
+        "expected Containment bigram"
     );
 }
 
@@ -579,6 +587,88 @@ fn a5_synthetic_marker_pattern_matches() {
     );
 }
 
+// --- Golden BM25 with non-trivial length_norm (nc != avg) ---
+
+#[test]
+fn bm25_golden_value_non_trivial_length_norm() {
+    // Verifies the full BM25 formula with nc != avg so length_norm != 1.0.
+    //
+    // Setup: node_count=200, avg=100, count=1, Language::Rust.
+    //   length_norm = 1 - 0.75 + 0.75 * (200/100) = 0.25 + 1.5 = 1.75
+    //   tf_norm = 1.0 / 1.75
+    //   idf = ast_bigram_idf(Rust, bigram)
+    //   expected = idf * (tf_norm / (tf_norm + 1.2))
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let bigram = AstBigram::encode(fn_id, block_id);
+
+    let source = FakePostingSource::default()
+        .with_file(0, Language::Rust, 200)
+        .with_bigram(
+            bigram.key(),
+            vec![AstPosting {
+                doc_id: 0,
+                count: 1,
+            }],
+        )
+        .with_avg_node_count(100.0);
+
+    let engine = AstQueryEngine::new(source);
+    let q = AstQuery::Containment(make_bigram_set(bigram, 1));
+    let results = engine.search_ast(&q).unwrap();
+
+    assert_eq!(results.len(), 1);
+
+    use crate::ast_index::ast_bigram_idf;
+    let idf = f64::from(ast_bigram_idf(Language::Rust, bigram));
+    let avg = 100.0_f64;
+    let nc = 200.0_f64;
+    let k1 = AST_BM25_K1;
+    let b = AST_BM25_B;
+    let length_norm = 1.0 - b + b * (nc / avg); // = 1.75
+    let tf_norm = 1.0_f64 / length_norm;
+    let expected = idf * (tf_norm / (tf_norm + k1));
+
+    let got = results[0].1;
+    assert!(
+        (got - expected).abs() < 1e-9,
+        "golden BM25 mismatch: got {got}, expected {expected} (length_norm={length_norm})"
+    );
+}
+
+// --- avg_node_count == 0.0 path: length_norm → 1.0 ---
+
+#[test]
+fn bm25_avg_zero_length_norm_fallback_positive_score() {
+    // When avg_node_count == 0.0, the bm25 function takes the length_norm=1.0
+    // branch. The result must still be a positive score.
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let bigram = AstBigram::encode(fn_id, block_id);
+
+    // avg = 0.0 triggers the defensive branch.
+    let source = FakePostingSource::default()
+        .with_file(0, Language::Rust, 100)
+        .with_bigram(
+            bigram.key(),
+            vec![AstPosting {
+                doc_id: 0,
+                count: 1,
+            }],
+        )
+        .with_avg_node_count(0.0);
+
+    let engine = AstQueryEngine::new(source);
+    let q = AstQuery::Containment(make_bigram_set(bigram, 1));
+    let results = engine.search_ast(&q).unwrap();
+
+    assert_eq!(results.len(), 1, "should return the file even with avg=0");
+    assert!(
+        results[0].1 > 0.0,
+        "score must be positive with avg=0 (length_norm=1.0 fallback)"
+    );
+}
+
 // --- Double-counting PINNED test ---
 
 #[test]
@@ -782,9 +872,10 @@ fn b3_corrupt_doc_id_propagated() {
     );
 }
 
-// --- Performance unit tripwire (CI-safe) ---
+// --- Performance unit tripwire (CI-safe, gated behind --ignored for flake safety) ---
 
 #[test]
+#[ignore = "wall-clock assertion: run explicitly or rely on Criterion bench (ast_query.rs) for the real perf signal"]
 fn perf_tripwire_10k_postings_under_1s() {
     use std::time::Instant;
 
@@ -999,7 +1090,7 @@ fn b4_named_pattern_search_returns_results() {
     drop(dir);
 }
 
-// B4: limit / offset honored
+// B4: limit / offset honored — assert exact FileId identities in score-DESC order
 
 #[test]
 fn b4_limit_and_offset_honored() {
@@ -1009,6 +1100,8 @@ fn b4_limit_and_offset_honored() {
     let bigram = AstBigram::encode(fn_id, block_id);
 
     let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    // Files 0–4 with counts 5,4,3,2,1 → scores strictly decreasing by FileId.
+    // score-DESC order is FileId(0), FileId(1), FileId(2), FileId(3), FileId(4).
     for i in 0..5u32 {
         let set = AstNgramSet {
             bigrams: vec![AstBigramEntry {
@@ -1037,7 +1130,26 @@ fn b4_limit_and_offset_honored() {
     query.offset = Some(1);
     let results = engine.search(&query).unwrap();
 
+    // offset=1, limit=2 → skip the top-scored file (FileId(0)), take FileId(1) and FileId(2).
     assert_eq!(results.len(), 2, "limit=2 should yield 2 results");
+    let ids: Vec<FileId> = results.iter().map(|r| r.file_id).collect();
+    assert_eq!(
+        ids,
+        vec![FileId(1), FileId(2)],
+        "offset=1,limit=2 should yield [FileId(1), FileId(2)] in score-DESC order: got {ids:?}"
+    );
+
+    // Sibling: offset past the end → empty result.
+    let mut query_past = SearchQuery::new("q");
+    query_past.ast_pattern = Some("function_item > block".into());
+    query_past.limit = Some(2);
+    query_past.offset = Some(10);
+    let past_results = engine.search(&query_past).unwrap();
+    assert!(
+        past_results.is_empty(),
+        "offset=10 past end should return empty"
+    );
+
     drop(dir);
 }
 
