@@ -15,8 +15,8 @@ referencedFiles:
   - crates/rskim/src/output/canonical.rs
   - crates/rskim/src/cmd/mod.rs
 created: 2026-05-14
-updated: 2026-05-26
-version: 9
+updated: 2026-06-07
+version: 10
 ---
 
 # Build Tool Output Parsers
@@ -25,7 +25,9 @@ version: 9
 
 The build parsers module (`crates/rskim/src/cmd/build/`) compresses output from build tools (cargo, clippy, tsc, make, gradle, maven) into compact summaries for AI context windows. Each tool has a dedicated file (`cargo.rs`, `tsc.rs`, `make.rs`, `gradle.rs`, `maven.rs`) plus a shared `mod.rs` that provides the dispatcher and the `run_parsed_command` infrastructure function used by all five.
 
-The module is invoked via flat dispatch (`skim tsc`) or multi-category dispatch (`skim cargo build`, `skim cargo clippy`). All parsers share the same three-tier degradation model: Full (clean structured parse) → Degraded (partial parse with warning markers) → Passthrough (raw output returned unchanged).
+The module is invoked via flat dispatch (`skim tsc`) or multi-category dispatch (`skim cargo build`, `skim cargo check`, `skim cargo fmt`, `skim cargo clippy`). All parsers share the same three-tier degradation model: Full (clean structured parse) → Degraded (partial parse with warning markers) → Passthrough (raw output returned unchanged).
+
+The `cargo.rs` module gained two additional handlers in PR #264: `run_check()` (reuses existing JSON parser by injecting `--message-format=json`) and `run_fmt()` (thin success/passthrough splitter — empty output on success, passthrough diff on failure). These share the same `run_parsed_command` path as `run()` and `run_clippy()`. The internal `run_with_json_format(subcmd, ...)` helper deduplicates the JSON-injection pattern across `build`, `check`, and `clippy`.
 
 ## Core Responsibilities
 
@@ -191,11 +193,12 @@ Use `.expect("valid regex")` not `.unwrap()` — the expect message documents in
 
 ## Shared Test Helpers
 
-All build parser tests (and tests across the `cmd` subtree) use the shared helpers from `crate::cmd::test_support`, defined under `#[cfg(test)]` in `cmd/mod.rs`. As of #214, the ~34 local `make_output` definitions and ~41 local `load_fixture` definitions that existed across `cmd` subtree modules were replaced by this single canonical source.
+All build parser tests (and tests across the `cmd` subtree) use the shared helpers from `crate::cmd::test_support`. As of PR #267 (cmd/mod.rs complexity reduction), `test_support` is a dedicated file at `crates/rskim/src/cmd/test_support.rs` — no longer embedded as an inline `#[cfg(test)]` module inside `mod.rs`.
 
-The three helpers are:
+Four helpers are now available:
 - `make_output(stdout: &str) -> CommandOutput` — success case: stderr empty, exit_code Some(0), duration ZERO
 - `make_output_full(stdout, stderr, exit_code: Option<i32>) -> CommandOutput` — full control for non-zero exits, stderr content, signal-kill (None exit code)
+- `make_output_stderr(stderr: &str) -> CommandOutput` — stderr-only success case (stdout empty, exit_code Some(0)); for tools that write to stderr by default (e.g. wget, curl)
 - `load_fixture(subdir: &str, name: &str) -> String` — loads from `tests/fixtures/cmd/{subdir}/{name}`; panics with clear message on missing file
 
 Build parser tests import these as `use super::super::test_support::{make_output, make_output_full, load_fixture}`. Do not redeclare local versions — use the canonical source to prevent drift.
@@ -216,7 +219,7 @@ Build parser tests import these as `use super::super::test_support::{make_output
 
 - **Adding a build tool as a passthrough dispatcher**: build tools should use the strict dispatcher model (error on unknown subcommand), not the passthrough model used by `swift`/`dotnet`. Build commands have a finite, well-defined subcommand set; passthrough is reserved for tools with wide lifecycle subcommand surfaces that agents invoke routinely.
 
-- **Declaring local `make_output` or `load_fixture` in build test modules**: use `super::super::test_support` instead. Local redeclarations drift from the canonical definition (e.g., duration field set to arbitrary millisecond values instead of `Duration::ZERO`).
+- **Declaring local `make_output` or `load_fixture` in build test modules**: use `super::super::test_support` instead. Local redeclarations drift from the canonical definition (e.g., duration field set to arbitrary millisecond values instead of `Duration::ZERO`). Since PR #267, `test_support` is a dedicated file at `crates/rskim/src/cmd/test_support.rs`, not an inline `#[cfg(test)]` module.
 
 ## Gotchas
 
@@ -256,7 +259,12 @@ Build parser tests import these as `use super::super::test_support::{make_output
 - `crates/rskim/src/cmd/build/maven.rs` — Maven/Mvnw: `[ERROR]`/`[WARNING]` + build summary Tier 1 (with duration), noise-strip Tier 2 (two `LazyLock<Regex>` patterns, two duration formats)
 - `crates/rskim/src/output/mod.rs` — `ParseResult<T>` enum definition and helpers (`is_full`, `is_degraded`, `tier_name`, `content`, `into_content`, `emit_markers`); `strip_ansi` and `strip_ansi_cow` (zero-copy fast path: borrows when no ESC byte present); `to_json_envelope` (not used by build family — build has no `--json` mode); `OutputMode`, `clean`, `PassthroughTruncator`, `FilterTransparencyHeader` (used by other families); sub-modules `guardrail` and `tee` (not used by build parsers — used by other consumers of the output infrastructure)
 - `crates/rskim/src/output/canonical.rs` — `BuildResult` struct with pre-rendered output; also owns `TestResult`, `GitResult`, `LintResult`, `DbResult`, `PkgResult` — the `DbResult::render` was decomposed into 5 private helpers in #214 as a model for growing render logic
-- `crates/rskim/src/cmd/mod.rs` — `user_has_flag`, `inject_flag_before_separator`, `extract_show_stats`, `extract_json_flag`, `extract_output_format`, `combine_output`, `sanitize_for_display`, `format_analytics_label`, `scrub_db_args`; structs `RunContext`, `ParsedCommandConfig<'_>`, `ToolRunConfig<'_>`, `OutputFormat`; generic runner `run_tool<T>` (used by lint, db, infra, file families — NOT by build); stdin infrastructure: `should_read_stdin`, `read_bounded`, `read_stdin_bounded`, `MAX_STDIN_BYTES`; passthrough infrastructure: `is_passthrough_mode`, `check_passthrough_str`, `check_passthrough_value`; resolver: `resolve_cache_dir`; `is_known_subcommand` (linear scan of `KNOWN_SUBCOMMANDS`); shared test helpers: `test_support` module (under `#[cfg(test)]`) with `make_output`, `make_output_full`, `load_fixture`; private `obtain_output` (soft spawn-failure path for non-build families); private `render_output<T>`; `run_parsed_command_with_mode` (used by non-build families); dispatcher helpers `dispatch()`, `dispatch_cargo()`, `dispatch_go()`, `dispatch_swift()`, `dispatch_dotnet()`, `run_raw_passthrough()`, `passthrough_subcmd()`; `extract_subcmd`, `prepend_without`; `KNOWN_SUBCOMMANDS`
+- `crates/rskim/src/cmd/mod.rs` — (PR #267: reduced from 2,070 to ~420 lines) module declarations + re-exports of all `pub(crate)` items from sub-modules; retains shared utilities: `user_has_flag`, `inject_flag_before_separator`, `extract_show_stats`, `extract_json_flag`, `extract_output_format`, `combine_output`, `format_analytics_label`; stdin infrastructure: `should_read_stdin`, `read_bounded`, `read_stdin_bounded`, `MAX_STDIN_BYTES`; passthrough infrastructure: `is_passthrough_mode`, `check_passthrough_str`, `check_passthrough_value`; resolver: `resolve_cache_dir`; `prepend_without`, `extract_subcmd`
+- `crates/rskim/src/cmd/security.rs` — credential scrubbing: `scrub_db_args`, `sanitize_for_display`, `TokenAction` enum + `classify_token` helper (eliminated 4-level nesting)
+- `crates/rskim/src/cmd/registry.rs` — subcommand registry: `KNOWN_SUBCOMMANDS`, `META_SUBCOMMANDS`, `wrapper_targets`, `is_known_subcommand`
+- `crates/rskim/src/cmd/execution.rs` — execution pipeline: `RunContext`, `ParsedCommandConfig<'_>`, `ToolRunConfig<'_>`, `OutputFormat`, `run_tool<T>` (used by lint, db, infra, file families — NOT by build), `run_parsed_command_with_mode` (used by non-build families), `obtain_output`, `render_output<T>`, `passthrough_raw`, `record_and_report`
+- `crates/rskim/src/cmd/dispatch.rs` — top-level routing: `dispatch()`, `dispatch_cargo()`, `dispatch_go()`, `dispatch_swift()`, `dispatch_dotnet()`, `run_raw_passthrough()`, `passthrough_subcmd()`
+- `crates/rskim/src/cmd/test_support.rs` — test helpers (moved from inline `#[cfg(test)]` module): `make_output`, `make_output_full`, `make_output_stderr`, `load_fixture`; all items `pub(crate)`
 
 ## Related
 

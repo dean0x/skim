@@ -3,7 +3,7 @@
   "features": {
     "build-parsers": {
       "name": "Build Tool Output Parsers",
-      "description": "Use when adding a new build tool parser, modifying cargo/tsc/make compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection. NOTE: cmd/mod.rs was refactored in PR #267 — scrubbing logic is in security.rs, command execution in execution.rs, dispatch in dispatch.rs.",
+      "description": "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, check, fmt, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, run_clippy, security.rs, registry.rs, execution.rs, dispatch.rs, test_support.rs, make_output_stderr, TokenAction.",
       "directories": [
         "crates/rskim/src/cmd/build/",
         "crates/rskim/src/cmd/"
@@ -21,14 +21,16 @@
         "crates/rskim/src/cmd/execution.rs",
         "crates/rskim/src/cmd/dispatch.rs",
         "crates/rskim/src/cmd/security.rs",
+        "crates/rskim/src/cmd/registry.rs",
+        "crates/rskim/src/cmd/test_support.rs",
         "crates/rskim/src/runner.rs"
       ],
-      "lastUpdated": "2026-06-03T00:00:00.000Z",
+      "lastUpdated": "2026-06-07T10:05:21.359Z",
       "createdBy": "devflow-knowledge"
     },
     "cochange": {
       "name": "Co-Change Matrix",
-      "description": "Use when implementing co-change coupling queries, modifying the .skcc binary format, adding new query methods to CochangeMatrixReader, debugging Jaccard similarity calculations, or working with the SQLite temporal persistence layer for co-change pairs. Keywords: cochange, co-change, coupling, jaccard, skcc, binary format, cochange.skcc, CochangeMatrixBuilder, CochangeMatrixReader, CochangeRow, TemporalDb, HistoryResult, COUPLING_MAX_FILES, builder_tests, format_tests, reader_tests, test_helpers.",
+      "description": "Use when implementing co-change coupling queries, modifying the .skcc binary format, adding new query methods to CochangeMatrixReader, debugging Jaccard similarity calculations, or working with the SQLite temporal persistence layer for co-change pairs. Keywords: cochange, co-change, coupling, jaccard, skcc, binary format, cochange.skcc, CochangeMatrixBuilder, CochangeMatrixReader, CochangeRow, TemporalDb, HistoryResult, COUPLING_MAX_FILES, builder_tests, format_tests, reader_tests, test_helpers, atomic_write, io_util.",
       "directories": [
         "crates/rskim-search/src/cochange/"
       ],
@@ -47,12 +49,12 @@
         "crates/rskim-search/src/temporal/storage_types.rs",
         "crates/rskim-search/src/temporal/storage_ops.rs"
       ],
-      "lastUpdated": "2026-06-04T21:27:24.860Z",
+      "lastUpdated": "2026-06-07T16:20:48.693Z",
       "createdBy": "implement"
     },
     "temporal-scoring": {
       "name": "Temporal Risk Scoring",
-      "description": "Use when adding per-file risk metrics from git history, tuning decay parameters, integrating hotspot scores into search ranking, extending the temporal module with new scoring signals, or working with the SQLite temporal persistence layer. Keywords: temporal, hotspot, fix density, exponential decay, git history, risk scores, half-life, FileRiskScores, FileTemporalStats, compute_file_risk_scores, compute_file_temporal_stats, decay_weight, TemporalDb, storage, HotspotRow, RiskRow, CochangeRow, file_filter, SearchQuery, per-file lookup, top-N, hotspot_for_file, risk_for_file, cochanges_for_file, top_hotspots, top_risks, top_coldspots, blast-radius, storage_tests, storage_perf_tests, git_parser_tests.",
+      "description": "Use when adding per-file risk metrics from git history, tuning decay parameters, integrating hotspot scores into search ranking, extending the temporal module with new scoring signals, or working with the SQLite temporal persistence layer. Keywords: temporal, hotspot, fix density, exponential decay, git history, risk scores, half-life, FileRiskScores, FileTemporalStats, compute_file_risk_scores, compute_file_temporal_stats, decay_weight, TemporalDb, storage, HotspotRow, RiskRow, CochangeRow, file_filter, SearchQuery, per-file lookup, top-N, hotspot_for_file, risk_for_file, cochanges_for_file, top_hotspots, top_risks, top_coldspots, blast-radius, storage_tests, storage_perf_tests, git_parser_tests, META_GIT_HEAD, META_LAST_UPDATED.",
       "directories": [
         "crates/rskim-search/src/temporal/"
       ],
@@ -70,12 +72,12 @@
         "crates/rskim-search/src/types.rs",
         "crates/rskim-search/src/lib.rs"
       ],
-      "lastUpdated": "2026-06-04T21:27:34.451Z",
+      "lastUpdated": "2026-06-07T16:20:40.949Z",
       "createdBy": "implement"
     },
     "ast-index": {
       "name": "AST Index (CST Linearization + N-gram Encoding + On-Disk Store)",
-      "description": "Use when implementing AST-based n-gram extraction, building or reading the on-disk structural index, adding a new language to the structural index, debugging depth or node-count truncation, extending the shared vocabulary, working with AstBigram/AstTrigram IDF weights, extracting structural n-grams from linearized nodes, or using the shared AstWalkIter traversal primitive. Keywords: linearize, CST, AST, n-gram, bigram, trigram, NodeKindId, AstBigram, AstTrigram, AstNgramSet, AstBigramEntry, AstTrigramEntry, NODE_KIND_VOCABULARY, LANG_MAPS, LinearNode, AstWalkIter, AstWalkConfig, tree-sitter, depth-encoded, pre-order, IDF, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_weights, store, AstIndexBuilder, AstIndexReader, AstPosting, AstFileMetaEntry, skidx, skpost, SKAX, on-disk index, mmap, posting list, build_from_files, lookup_bigram, lookup_trigram.",
+      "description": "Use when implementing AST-based n-gram extraction, building or reading the on-disk structural index, adding a new language to the structural index, debugging depth or node-count truncation, extending the shared vocabulary, working with AstBigram/AstTrigram IDF weights, extracting structural n-grams or structural metrics from linearized nodes, using the Pattern Library (structural code patterns), using the shared AstWalkIter traversal primitive, or working with the Wave 3f BM25-ranked AST structural query engine (AstQueryEngine, AstQuery, parse_ast_query, AstPostingSource). Keywords: linearize, CST, AST, n-gram, bigram, trigram, NodeKindId, AstBigram, AstTrigram, AstNgramSet, AstBigramEntry, AstTrigramEntry, NODE_KIND_VOCABULARY, LANG_MAPS, LinearNode, AstWalkIter, AstWalkConfig, tree-sitter, depth-encoded, pre-order, IDF, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_metrics, extract_ast_ngrams_with_weights, StructuralMetrics, structural, Pattern, patterns, EMPTY_BODY, DEEP_NODE, LARGE_BODY, MANY_PARAMS, bucket_label, synthetic n-gram, store, AstIndexBuilder, AstIndexReader, AstPosting, AstFileMetaEntry, skidx, skpost, SKAX, FORMAT_VERSION, on-disk index, mmap, posting list, build_from_files, lookup_bigram, lookup_trigram, index_version, AstQuery, AstQueryEngine, AstPostingSource, parse_ast_query, search_ast, AST_BM25_K1, AST_BM25_B, query.rs, Wave 3f.",
       "directories": [
         "crates/rskim-search/src/ast_index/",
         "crates/rskim-core/src/"
@@ -86,6 +88,9 @@
         "crates/rskim-search/src/ast_index/linearize.rs",
         "crates/rskim-search/src/ast_index/ngram.rs",
         "crates/rskim-search/src/ast_index/extract.rs",
+        "crates/rskim-search/src/ast_index/structural.rs",
+        "crates/rskim-search/src/ast_index/patterns.rs",
+        "crates/rskim-search/src/ast_index/query.rs",
         "crates/rskim-search/src/ast_index/mod.rs",
         "crates/rskim-search/src/ast_index/store/format.rs",
         "crates/rskim-search/src/ast_index/store/builder.rs",
@@ -93,9 +98,10 @@
         "crates/rskim-search/src/ast_index/store/mod.rs",
         "crates/rskim-search/src/ast_weights.rs",
         "crates/rskim-search/src/lib.rs",
-        "crates/rskim-search/benches/ast_index_bench.rs"
+        "crates/rskim-search/benches/ast_index_bench.rs",
+        "crates/rskim-search/benches/ast_query.rs"
       ],
-      "lastUpdated": "2026-06-05T10:05:57.000Z",
+      "lastUpdated": "2026-06-07T16:20:31.320Z",
       "createdBy": "implement"
     }
   }

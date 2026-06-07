@@ -33,6 +33,7 @@ mod extract;
 mod linearize;
 mod ngram;
 mod patterns;
+pub mod query;
 mod store;
 pub(crate) mod structural;
 
@@ -60,5 +61,8 @@ pub use ngram::{
     vocab_lookup, vocab_resolve,
 };
 pub use patterns::{Pattern, PatternCategory, all_patterns, lookup_pattern, pattern_to_query_set};
+pub use query::{
+    AST_BM25_B, AST_BM25_K1, AstPostingSource, AstQuery, AstQueryEngine, parse_ast_query,
+};
 pub use store::{AstFileMetaEntry, AstIndexBuilder, AstIndexReader, AstPosting};
 pub use structural::StructuralMetrics;

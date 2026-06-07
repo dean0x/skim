@@ -1,4 +1,4 @@
-<!-- TL;DR: 3 decisions. Key: ADR-001, ADR-002, ADR-003 -->
+<!-- TL;DR: 5 decisions. Key: ADR-001, ADR-002, ADR-003, ADR-004, ADR-005 -->
 # Architectural Decisions
 
 Append-only. Status changes allowed; deletions prohibited.
@@ -29,3 +29,21 @@ Append-only. Status changes allowed; deletions prohibited.
 - **Decision**: replace the 5% target with a defensible < 3x source-bytes regression guard (measured 1.23x) as a real non-ignored test, and file on-disk compression as a tracked follow-up (#273)
 - **Consequences**: a regression guard grounded in measurement and industry norms (uncompressed code-search trigram indexes run 3-5x) protects against real bloat, whereas an impossible target either blocks the PR or gets silently ignored
 - **Source**: self-learning:obs_a16x3g
+
+## ADR-004: File follow-up and integration tickets up front as Step 0 (before any code), never post-merge, and never leave #NEW placeholder numbers in source
+
+- **Date**: 2026-06-07
+- **Status**: Accepted
+- **Context**: implementation plans repeatedly deferred follow-up and integration ticket filing until after merge, and used #NEW placeholders in source for not-yet-filed issue numbers, creating a fix-it-later trap where the placeholder survives the PR and the real number is never wired in
+- **Decision**: front-load all ticketing as an explicit Step 0 that runs before any code is written — file the follow-up ticket first so its real issue number can be hardcoded directly into code (e.g. into an error string), and annotate consuming/integration issues up front with the contracts they depend on
+- **Consequences**: a placeholder in code is silent debt that is easily forgotten
+- **Source**: self-learning:obs_tk3f9w
+
+## ADR-005: Never auto-merge a green PR — hand off for the user to explicitly request the squash-merge once CI passes
+
+- **Date**: 2026-06-07
+- **Status**: Accepted
+- **Context**: a feature PR (#284) reached green CI through the full implement/validate/scrutinize/align/QA pipeline and the agent had the standing capability to merge it, yet the agent declined to merge automatically
+- **Decision**: the agent must not auto-merge even when CI is fully green — merge is a user-gated action
+- **Consequences**: the user keeps the merge decision as a deliberate human gate so the final integration step is never taken without explicit human intent, even when every automated check has passed. How to apply: after CI goes green, report the verdict and stop — do not run gh pr merge or any merge command until the user explicitly asks for the squash-merge.
+- **Source**: self-learning:obs_mrg7vk
