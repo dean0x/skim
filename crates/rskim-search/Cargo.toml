@@ -39,6 +39,10 @@ harness = false
 name = "ast_index_bench"
 harness = false
 
+[[bench]]
+name = "ast_query"
+harness = false
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

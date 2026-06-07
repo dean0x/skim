@@ -34,10 +34,11 @@ mod types;
 pub mod weights;
 
 pub use ast_index::{
-    AstBigram, AstBigramEntry, AstFileMetaEntry, AstIndexBuilder, AstIndexReader, AstNgramSet,
-    AstPosting, AstTrigram, AstTrigramEntry, DEFAULT_AST_WEIGHT, LinearNode, LinearizeResult,
-    NodeKindId, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams,
-    extract_ast_ngrams_with_weights, linearize_source, vocab_len, vocab_lookup, vocab_resolve,
+    AST_BM25_B, AST_BM25_K1, AstBigram, AstBigramEntry, AstFileMetaEntry, AstIndexBuilder,
+    AstIndexReader, AstNgramSet, AstPosting, AstPostingSource, AstQuery, AstQueryEngine,
+    AstTrigram, AstTrigramEntry, DEFAULT_AST_WEIGHT, LinearNode, LinearizeResult, NodeKindId,
+    ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_weights,
+    linearize_source, parse_ast_query, vocab_len, vocab_lookup, vocab_resolve,
 };
 pub use cochange::{CochangeMatrixBuilder, CochangeMatrixReader};
 pub use index::{NgramIndexBuilder, NgramIndexReader};
