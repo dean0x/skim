@@ -3,7 +3,7 @@
   "features": {
     "build-parsers": {
       "name": "Build Tool Output Parsers",
-      "description": "Use when adding a new build tool parser, modifying cargo/tsc/make compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection. NOTE: cmd/mod.rs was refactored in PR #267 — scrubbing logic is in security.rs, command execution in execution.rs, dispatch in dispatch.rs.",
+      "description": "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, parse_fmt. NOTE: cmd/mod.rs was refactored in PR #267 — scrubbing logic is in security.rs, command execution in execution.rs, dispatch in dispatch.rs, registry in registry.rs, test helpers in test_utils.rs.",
       "directories": [
         "crates/rskim/src/cmd/build/",
         "crates/rskim/src/cmd/"
@@ -21,14 +21,16 @@
         "crates/rskim/src/cmd/execution.rs",
         "crates/rskim/src/cmd/dispatch.rs",
         "crates/rskim/src/cmd/security.rs",
+        "crates/rskim/src/cmd/registry.rs",
+        "crates/rskim/src/cmd/test_utils.rs",
         "crates/rskim/src/runner.rs"
       ],
-      "lastUpdated": "2026-06-03T00:00:00.000Z",
+      "lastUpdated": "2026-06-07T09:14:15.966Z",
       "createdBy": "devflow-knowledge"
     },
     "cochange": {
       "name": "Co-Change Matrix",
-      "description": "Use when implementing co-change coupling queries, modifying the .skcc binary format, adding new query methods to CochangeMatrixReader, debugging Jaccard similarity calculations, or working with the SQLite temporal persistence layer for co-change pairs. Keywords: cochange, co-change, coupling, jaccard, skcc, binary format, cochange.skcc, CochangeMatrixBuilder, CochangeMatrixReader, CochangeRow, TemporalDb, HistoryResult, COUPLING_MAX_FILES, builder_tests, format_tests, reader_tests, test_helpers.",
+      "description": "Use when implementing co-change coupling queries, modifying the .skcc binary format, adding new query methods to CochangeMatrixReader, debugging Jaccard similarity calculations, or working with the SQLite temporal persistence layer for co-change pairs. Keywords: cochange, co-change, coupling, jaccard, skcc, binary format, cochange.skcc, CochangeMatrixBuilder, CochangeMatrixReader, CochangeRow, TemporalDb, HistoryResult, COUPLING_MAX_FILES, builder_tests, format_tests, reader_tests, test_helpers, io_util, atomic_write.",
       "directories": [
         "crates/rskim-search/src/cochange/"
       ],
@@ -45,9 +47,10 @@
         "crates/rskim-search/src/lib.rs",
         "crates/rskim-search/src/temporal/storage.rs",
         "crates/rskim-search/src/temporal/storage_types.rs",
-        "crates/rskim-search/src/temporal/storage_ops.rs"
+        "crates/rskim-search/src/temporal/storage_ops.rs",
+        "crates/rskim-search/src/io_util.rs"
       ],
-      "lastUpdated": "2026-06-04T21:27:24.860Z",
+      "lastUpdated": "2026-06-06T20:08:58.364Z",
       "createdBy": "implement"
     },
     "temporal-scoring": {
@@ -70,7 +73,7 @@
         "crates/rskim-search/src/types.rs",
         "crates/rskim-search/src/lib.rs"
       ],
-      "lastUpdated": "2026-06-04T21:27:34.451Z",
+      "lastUpdated": "2026-06-06T20:09:07.956Z",
       "createdBy": "implement"
     },
     "ast-index": {

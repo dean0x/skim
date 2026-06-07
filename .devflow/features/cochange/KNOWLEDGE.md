@@ -18,8 +18,9 @@ referencedFiles:
   - crates/rskim-search/src/temporal/storage.rs
   - crates/rskim-search/src/temporal/storage_types.rs
   - crates/rskim-search/src/temporal/storage_ops.rs
+  - crates/rskim-search/src/io_util.rs
 created: 2026-05-24
-updated: 2026-06-05
+updated: 2026-06-06
 ---
 
 # Co-Change Matrix
@@ -172,9 +173,15 @@ concatenated with the `PairEntry` array bytes. When a format-breaking change is 
 
 ### Atomic write contract
 
-`builder.rs` uses `tempfile::NamedTempFile::new_in(dir)`, writes all bytes, calls `sync_all()` to
-flush to storage (crash safety), and then calls `.persist(path)` (a rename) so readers never
-observe a partially written file.
+`builder.rs` delegates to `crate::io_util::atomic_write(dir, path, data)` — a shared utility
+extracted in Wave 3d (PR #272) so `cochange/builder.rs`, `index/builder.rs`, and
+`ast_index/store/builder.rs` all use one implementation and cannot drift. Internally it uses
+`NamedTempFile::new_in(dir)`, `write_all`, `sync_all()` (flush to durable storage), sets
+`0o644` permissions on Unix, then `.persist(path)` (atomic rename) so readers never observe a
+partially written file. `cochange/builder.rs` no longer owns a private `atomic_write` function.
+
+`io_util` is a `pub(crate)` module in `crates/rskim-search/src/io_util.rs`; import as
+`crate::io_util::atomic_write`.
 
 ### SQLite co-change table schema
 
@@ -209,6 +216,9 @@ DELETE + batch INSERT in a single transaction.
   the assumption it scans the full pair array.
 - **Bypassing `CochangeMatrixBuilder` to write `.skcc` directly** requires manually maintaining
   CRC32, sort order, and format version.
+- **Replicating the atomic-write logic in `builder.rs`**: the `atomic_write` helper is now in
+  `crate::io_util`. Do not copy-paste the `NamedTempFile` + `sync_all` + `persist` sequence
+  into new builder files — use `io_util::atomic_write` so all builders stay consistent.
 - **Populating only the SQLite `cochange` table without writing `.skcc`** — point queries must go
   through `CochangeMatrixReader`.
 - **Adding tests inline in the implementation files** — tests live in `*_tests.rs` companion files
@@ -231,8 +241,10 @@ DELETE + batch INSERT in a single transaction.
 
 - `crates/rskim-search/src/cochange/format.rs` — pure binary codec; extend here when adding
   fields to the on-disk format
-- `crates/rskim-search/src/cochange/builder.rs` — accumulation logic and atomic write;
-  `COUPLING_MAX_FILES` and `MAX_PAIRS` constants live here
+- `crates/rskim-search/src/cochange/builder.rs` — accumulation logic; delegates atomic write to
+  `crate::io_util::atomic_write`; `COUPLING_MAX_FILES` and `MAX_PAIRS` constants live here
+- `crates/rskim-search/src/io_util.rs` — `pub(crate) fn atomic_write(dir, path, data)`;
+  shared across `cochange/builder.rs`, `index/builder.rs`, `ast_index/store/builder.rs`
 - `crates/rskim-search/src/cochange/reader.rs` — memory-mapped query API; `pairs_for_file` uses
   binary search
 - `crates/rskim-search/src/cochange/mod.rs` — public re-exports; usage doc example
@@ -250,9 +262,12 @@ DELETE + batch INSERT in a single transaction.
 - `crates/rskim-search/src/types.rs` — `FileId`, `CochangeStats`, `HistoryResult`, `SearchError`
 - `crates/rskim-search/src/index/` — sibling persistence layer using the same atomic-write and
   mmap-read patterns; useful cross-reference for format evolution precedent
+- `crates/rskim-search/src/io_util.rs` — shared `atomic_write(dir, path, data)` utility used by
+  `cochange/builder.rs`, `index/builder.rs`, and `ast_index/store/builder.rs`; extracted in PR #272
+  to ensure identical write semantics across all three on-disk store builders
 - `crates/rskim-search/src/ast_index/store/` (Wave 3d, #194) — the closest format sibling: a
   two-file mmap'd on-disk index (magic `b"SKAX"`, v1) for AST structural n-grams, built with the
-  identical `NamedTempFile` + `sync_all` + `persist` atomic-write contract and CRC32-validated
-  binary-search reader. Mirror its `format.rs`/`builder.rs`/`reader.rs` split when evolving `.skcc`.
-  Note `lib.rs` now also re-exports `AstIndexBuilder`/`AstIndexReader`/`AstPosting`/`AstFileMetaEntry`
-  alongside the cochange re-exports — no change to the cochange API surface itself.
+  identical `io_util::atomic_write` contract and CRC32-validated binary-search reader. Mirror its
+  `format.rs`/`builder.rs`/`reader.rs` split when evolving `.skcc`. `lib.rs` also re-exports
+  `AstIndexBuilder`/`AstIndexReader`/`AstPosting`/`AstFileMetaEntry` alongside the cochange
+  re-exports — no change to the cochange API surface itself.
