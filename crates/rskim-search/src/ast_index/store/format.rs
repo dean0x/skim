@@ -8,7 +8,7 @@
 //! [AstSkidxHeader: 48 bytes]
 //! [AstBigramEntry × bigram_count: 16 bytes each, sorted by key asc]
 //! [AstTrigramEntry × trigram_count: 20 bytes each, sorted by key asc]
-//! [AstFileMetaEntry × file_count: 5 bytes each]
+//! [AstFileMetaEntry × file_count: 15 bytes each]
 //! ```
 //!
 //! ## `ast_index.skpost`
@@ -50,7 +50,14 @@ pub(crate) const SKAX_MAGIC: &[u8; 4] = b"SKAX";
 /// Version-bump policy: any change to field order, field width, or interpretation
 /// of any byte in any struct increments this number.  Old versions are rejected
 /// with an error message containing "format version".
-pub(crate) const FORMAT_VERSION: u16 = 1;
+///
+/// v2 changes (Wave 3e):
+/// - `AstFileMetaEntry` extended from 5 to 15 bytes (added max_depth:u16,
+///   max_block_stmts:u16, max_params:u16, branch_count:u32).
+/// - Header reserved bytes [38..42] now store `avg_max_depth` as f32 LE.
+/// - Synthetic n-grams from the AST Pattern Library stored alongside real n-grams.
+/// - All v1 indexes are invalid; reader rejects them with "please rebuild the AST index".
+pub(crate) const FORMAT_VERSION: u16 = 2;
 
 /// Size in bytes of [`AstSkidxHeader`] on disk.
 pub(crate) const HEADER_SIZE: usize = 48;
@@ -64,8 +71,13 @@ pub(crate) const TRIGRAM_ENTRY_SIZE: usize = 20;
 /// Size in bytes of a single [`AstPostingEntry`] on disk.
 pub(crate) const POSTING_ENTRY_SIZE: usize = 8;
 
-/// Size in bytes of a single [`AstFileMetaEntry`] on disk.
-pub(crate) const FILE_META_SIZE: usize = 5;
+/// Size in bytes of a single [`AstFileMetaEntry`] on disk (v2).
+///
+/// v1: 5 bytes (`lang_id:u8` + `node_count:u32`)
+/// v2: 15 bytes (adds `max_depth:u16` + `max_block_stmts:u16` + `max_params:u16` + `branch_count:u32`)
+///
+/// Delta is exactly +10 bytes per file (performance criterion P3).
+pub(crate) const FILE_META_SIZE: usize = 15;
 
 // ============================================================================
 // On-disk structs
@@ -76,7 +88,7 @@ pub(crate) const FILE_META_SIZE: usize = 5;
 /// Layout (48 bytes, all integers little-endian):
 /// ```text
 /// [0..4]   magic b"SKAX"         4 bytes
-/// [4..6]   version = 1           2 bytes
+/// [4..6]   version = 2           2 bytes
 /// [6..10]  bigram_count          4 bytes (u32)
 /// [10..14] trigram_count         4 bytes (u32)
 /// [14..18] file_count            4 bytes (u32)
@@ -84,7 +96,8 @@ pub(crate) const FILE_META_SIZE: usize = 5;
 /// [26..30] avg_bigram_count      4 bytes (f32 LE)
 /// [30..34] avg_trigram_count     4 bytes (f32 LE)
 /// [34..38] avg_node_count        4 bytes (f32 LE)
-/// [38..44] reserved (= 0)        6 bytes
+/// [38..42] avg_max_depth         4 bytes (f32 LE) — was reserved in v1
+/// [42..44] reserved (= 0)        2 bytes
 /// [44..48] checksum (CRC32)      4 bytes (u32)
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -109,6 +122,11 @@ pub(crate) struct AstSkidxHeader {
     pub avg_trigram_count: f32,
     /// Average emitted-node count per file (nodes.len(), excludes ERROR/MISSING).
     pub avg_node_count: f32,
+    /// Average maximum CST traversal depth per file (from `StructuralMetrics::max_depth`).
+    ///
+    /// Stored in reserved bytes [38..42] (was zero in v1).
+    /// Useful for ranking normalization in Wave 4 (structural-complexity dimension).
+    pub avg_max_depth: f32,
     /// CRC32 of the post-header payload (bigram entries + trigram entries +
     /// file-meta entries, in that order).
     pub checksum: u32,
@@ -182,13 +200,19 @@ pub(crate) struct AstPostingEntry {
 
 /// Per-file metadata stored in the tail of `ast_index.skidx`.
 ///
-/// Layout (5 bytes, all integers little-endian):
+/// Layout (15 bytes, all integers little-endian) — v2 format:
 /// ```text
-/// [0]    lang_id    1 byte (u8, from lang_to_id)
-/// [1..5] node_count 4 bytes (u32, emitted-node count from linearize_source)
+/// [0]     lang_id         1 byte  (u8, from lang_to_id)
+/// [1..5]  node_count      4 bytes (u32, emitted-node count from linearize_source)
+/// [5..7]  max_depth       2 bytes (u16, maximum CST traversal depth in this file)
+/// [7..9]  max_block_stmts 2 bytes (u16, max counted-child count in any body block)
+/// [9..11] max_params      2 bytes (u16, max counted-child count in any param list)
+/// [11..15] branch_count   4 bytes (u32, total branch-kind node count)
 /// ```
 ///
 /// `node_count` equals `lin.nodes.len()` (emitted nodes, excludes ERROR/MISSING).
+/// `max_block_stmts` and `max_params` are saturated at `u16::MAX` (PF-004).
+/// `branch_count` is saturated at `u32::MAX`.
 ///
 /// # C6 — language recovery
 ///
@@ -202,6 +226,17 @@ pub struct AstFileMetaEntry {
     pub lang_id: u8,
     /// Number of emitted AST nodes from `linearize_source` (excludes ERROR/MISSING).
     pub node_count: u32,
+    /// Maximum CST traversal depth in this file (0 if empty).
+    pub max_depth: u16,
+    /// Maximum counted-child count in any function/method body block.
+    /// Saturated at `u16::MAX` (PF-004).
+    pub max_block_stmts: u16,
+    /// Maximum counted-child count in any parameter list.
+    /// Saturated at `u16::MAX` (PF-004).
+    pub max_params: u16,
+    /// Total count of branch-kind nodes in this file.
+    /// Saturated at `u32::MAX`.
+    pub branch_count: u32,
 }
 
 impl AstFileMetaEntry {
@@ -255,7 +290,8 @@ pub(crate) fn encode_header(h: &AstSkidxHeader) -> [u8; HEADER_SIZE] {
     buf[26..30].copy_from_slice(&h.avg_bigram_count.to_le_bytes());
     buf[30..34].copy_from_slice(&h.avg_trigram_count.to_le_bytes());
     buf[34..38].copy_from_slice(&h.avg_node_count.to_le_bytes());
-    // [38..44] reserved — already zeroed by `[0u8; HEADER_SIZE]`
+    buf[38..42].copy_from_slice(&h.avg_max_depth.to_le_bytes());
+    // [42..44] reserved — already zeroed by `[0u8; HEADER_SIZE]`
     buf[44..48].copy_from_slice(&h.checksum.to_le_bytes());
     buf
 }
@@ -285,10 +321,18 @@ pub(crate) fn decode_header(data: &[u8]) -> Result<AstSkidxHeader> {
     }
     let version = u16::from_le_bytes(read_array(data, 4, "header: version")?);
     if version != FORMAT_VERSION {
-        return Err(SearchError::IndexCorrupted(format!(
-            "unsupported format version: {version} (expected {FORMAT_VERSION}); \
-             please rebuild the AST index"
-        )));
+        let hint = if version > FORMAT_VERSION {
+            format!(
+                "unsupported format version: {version} (expected {FORMAT_VERSION}); \
+                 this index was created by a newer binary — upgrade rskim-search"
+            )
+        } else {
+            format!(
+                "unsupported format version: {version} (expected {FORMAT_VERSION}); \
+                 please rebuild the AST index"
+            )
+        };
+        return Err(SearchError::IndexCorrupted(hint));
     }
 
     let avg_bigram_count = f32::from_le_bytes(read_array(data, 26, "header: avg_bigram_count")?);
@@ -312,6 +356,13 @@ pub(crate) fn decode_header(data: &[u8]) -> Result<AstSkidxHeader> {
         )));
     }
 
+    let avg_max_depth = f32::from_le_bytes(read_array(data, 38, "header: avg_max_depth")?);
+    if !avg_max_depth.is_finite() || avg_max_depth < 0.0 {
+        return Err(SearchError::IndexCorrupted(format!(
+            "header: avg_max_depth must be finite and >= 0.0, got {avg_max_depth}"
+        )));
+    }
+
     Ok(AstSkidxHeader {
         magic,
         version,
@@ -322,6 +373,7 @@ pub(crate) fn decode_header(data: &[u8]) -> Result<AstSkidxHeader> {
         avg_bigram_count,
         avg_trigram_count,
         avg_node_count,
+        avg_max_depth,
         checksum: u32::from_le_bytes(read_array(data, 44, "header: checksum")?),
     })
 }
@@ -429,15 +481,19 @@ pub(crate) fn decode_posting(data: &[u8]) -> Result<AstPostingEntry> {
 // AstFileMetaEntry encode / decode
 // ============================================================================
 
-/// Encode an [`AstFileMetaEntry`] into its 5-byte on-disk representation.
+/// Encode an [`AstFileMetaEntry`] into its 15-byte on-disk representation (v2).
 pub(crate) fn encode_file_meta(m: &AstFileMetaEntry) -> [u8; FILE_META_SIZE] {
     let mut buf = [0u8; FILE_META_SIZE];
     buf[0] = m.lang_id;
     buf[1..5].copy_from_slice(&m.node_count.to_le_bytes());
+    buf[5..7].copy_from_slice(&m.max_depth.to_le_bytes());
+    buf[7..9].copy_from_slice(&m.max_block_stmts.to_le_bytes());
+    buf[9..11].copy_from_slice(&m.max_params.to_le_bytes());
+    buf[11..15].copy_from_slice(&m.branch_count.to_le_bytes());
     buf
 }
 
-/// Decode an [`AstFileMetaEntry`] from a 5-byte slice.
+/// Decode an [`AstFileMetaEntry`] from a 15-byte slice (v2).
 ///
 /// # Errors
 ///
@@ -452,6 +508,10 @@ pub(crate) fn decode_file_meta(data: &[u8]) -> Result<AstFileMetaEntry> {
     Ok(AstFileMetaEntry {
         lang_id: data[0],
         node_count: u32::from_le_bytes(read_array(data, 1, "ast_file_meta: node_count")?),
+        max_depth: u16::from_le_bytes(read_array(data, 5, "ast_file_meta: max_depth")?),
+        max_block_stmts: u16::from_le_bytes(read_array(data, 7, "ast_file_meta: max_block_stmts")?),
+        max_params: u16::from_le_bytes(read_array(data, 9, "ast_file_meta: max_params")?),
+        branch_count: u32::from_le_bytes(read_array(data, 11, "ast_file_meta: branch_count")?),
     })
 }
 

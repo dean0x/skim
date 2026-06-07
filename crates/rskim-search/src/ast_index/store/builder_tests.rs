@@ -9,6 +9,7 @@ use crate::{
     FileId,
     ast_index::{
         AstBigram, AstBigramEntry, AstNgramSet, AstTrigram, AstTrigramEntry, DEFAULT_AST_WEIGHT,
+        StructuralMetrics,
     },
 };
 use rskim_core::Language;
@@ -99,13 +100,31 @@ fn a8_zero_ngram_file_gets_meta_entry() {
     let empty_set = AstNgramSet::default();
 
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &set_with, 100)
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &set_with,
+            100,
+            StructuralMetrics::default(),
+        )
         .unwrap();
     builder
-        .add_file_ngrams(FileId(1), Language::Python, &empty_set, 0)
+        .add_file_ngrams(
+            FileId(1),
+            Language::Python,
+            &empty_set,
+            0,
+            StructuralMetrics::default(),
+        )
         .unwrap();
     builder
-        .add_file_ngrams(FileId(2), Language::Go, &empty_set, 50)
+        .add_file_ngrams(
+            FileId(2),
+            Language::Go,
+            &empty_set,
+            50,
+            StructuralMetrics::default(),
+        )
         .unwrap();
 
     let reader = builder.build().unwrap();
@@ -132,10 +151,22 @@ fn a9_duplicate_file_id_rejected() {
     let empty = AstNgramSet::default();
 
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &empty, 0)
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &empty,
+            0,
+            StructuralMetrics::default(),
+        )
         .unwrap();
     let err = builder
-        .add_file_ngrams(FileId(0), Language::Rust, &empty, 0)
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &empty,
+            0,
+            StructuralMetrics::default(),
+        )
         .unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("duplicate"), "expected 'duplicate' in: {msg}");
@@ -149,7 +180,13 @@ fn a9_non_sequential_first_id_rejected() {
 
     // First FileId should be 0, not 5
     let err = builder
-        .add_file_ngrams(FileId(5), Language::Rust, &empty, 0)
+        .add_file_ngrams(
+            FileId(5),
+            Language::Rust,
+            &empty,
+            0,
+            StructuralMetrics::default(),
+        )
         .unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -165,11 +202,23 @@ fn a9_gap_in_file_ids_rejected() {
     let empty = AstNgramSet::default();
 
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &empty, 0)
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &empty,
+            0,
+            StructuralMetrics::default(),
+        )
         .unwrap();
     // FileId(2) skips FileId(1)
     let err = builder
-        .add_file_ngrams(FileId(2), Language::Rust, &empty, 0)
+        .add_file_ngrams(
+            FileId(2),
+            Language::Rust,
+            &empty,
+            0,
+            StructuralMetrics::default(),
+        )
         .unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -206,7 +255,13 @@ fn a2_posting_merge_sorted_unique_doc_ids() {
     for i in 0..10u32 {
         let set = multi_bigram_set(&[(key_a, 1), (key_b, 2), (key_c, 3)]);
         builder
-            .add_file_ngrams(FileId(i), Language::Rust, &set, 10)
+            .add_file_ngrams(
+                FileId(i),
+                Language::Rust,
+                &set,
+                10,
+                StructuralMetrics::default(),
+            )
             .unwrap();
     }
 
@@ -248,7 +303,13 @@ fn a4_count_preserved_from_ngram_entry() {
 
     let set = single_bigram_set(key, 7);
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &set, 100)
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &set,
+            100,
+            StructuralMetrics::default(),
+        )
         .unwrap();
 
     let reader = builder.build().unwrap();
@@ -273,7 +334,13 @@ fn a10_atomic_write_no_temp_leftovers() {
     let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
     let empty = AstNgramSet::default();
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &empty, 0)
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &empty,
+            0,
+            StructuralMetrics::default(),
+        )
         .unwrap();
     builder.build().unwrap();
 
@@ -312,13 +379,31 @@ fn avg_node_count_computed_correctly() {
     let empty = AstNgramSet::default();
 
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &empty, 10)
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &empty,
+            10,
+            StructuralMetrics::default(),
+        )
         .unwrap();
     builder
-        .add_file_ngrams(FileId(1), Language::Python, &empty, 20)
+        .add_file_ngrams(
+            FileId(1),
+            Language::Python,
+            &empty,
+            20,
+            StructuralMetrics::default(),
+        )
         .unwrap();
     builder
-        .add_file_ngrams(FileId(2), Language::Go, &empty, 30)
+        .add_file_ngrams(
+            FileId(2),
+            Language::Go,
+            &empty,
+            30,
+            StructuralMetrics::default(),
+        )
         .unwrap();
 
     let reader = builder.build().unwrap();
@@ -388,5 +473,134 @@ fn new_missing_dir_returns_io_error() {
     assert!(
         msg.contains("IO error") || msg.contains("does not exist"),
         "expected IO/not-found error, got: {msg}"
+    );
+}
+
+// ============================================================================
+// file_metrics roundtrip with non-zero values (Issue 1)
+//
+// Every prior builder/reader test passes StructuralMetrics::default() (all zeros),
+// so a transposed field in encode_file_meta or the AstFileMetaEntry -> StructuralMetrics
+// mapping in file_metrics() would pass all existing tests silently.
+//
+// This test uses DISTINCT non-zero values for each field in each file so that
+// any field transposition or mis-offset in the 15-byte on-disk layout causes
+// an assertion failure.
+// ============================================================================
+
+#[test]
+fn file_metrics_roundtrip_non_zero_values() {
+    let dir = tempdir().unwrap();
+    let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    let empty = AstNgramSet::default();
+
+    let m0 = StructuralMetrics {
+        max_depth: 12,
+        max_block_stmts: 25,
+        max_params: 6,
+        branch_count: 8,
+    };
+    let m1 = StructuralMetrics {
+        max_depth: 3,
+        max_block_stmts: 1,
+        max_params: 0,
+        branch_count: 0,
+    };
+    // File 2 has max values to cover saturating casts
+    let m2 = StructuralMetrics {
+        max_depth: u16::MAX,
+        max_block_stmts: u16::MAX,
+        max_params: u16::MAX,
+        branch_count: u32::MAX,
+    };
+
+    builder
+        .add_file_ngrams(FileId(0), Language::Rust, &empty, 100, m0)
+        .unwrap();
+    builder
+        .add_file_ngrams(FileId(1), Language::Python, &empty, 50, m1)
+        .unwrap();
+    builder
+        .add_file_ngrams(FileId(2), Language::Go, &empty, 0, m2)
+        .unwrap();
+
+    let reader = builder.build().unwrap();
+
+    assert_eq!(
+        reader.file_metrics(0).unwrap(),
+        m0,
+        "file 0 metrics mismatch — possible field transposition in encode_file_meta"
+    );
+    assert_eq!(
+        reader.file_metrics(1).unwrap(),
+        m1,
+        "file 1 metrics mismatch — possible field transposition in encode_file_meta"
+    );
+    assert_eq!(
+        reader.file_metrics(2).unwrap(),
+        m2,
+        "file 2 metrics mismatch — possible field transposition or truncation at u16::MAX/u32::MAX"
+    );
+}
+
+// ============================================================================
+// avg_max_depth computed correctly through the builder (Issue 2)
+//
+// The existing a8_avg_max_depth_roundtrip in format_tests.rs injects avg_max_depth
+// directly into the header struct, bypassing the builder's accumulation at
+// builder.rs:314-316 and the division at builder.rs:446.  This test exercises
+// the COMPUTATION: build three files with max_depth 10, 20, 30 and assert
+// avg_max_depth() ~= 20.0.
+// ============================================================================
+
+#[test]
+fn avg_max_depth_computed_correctly() {
+    let dir = tempdir().unwrap();
+    let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    let empty = AstNgramSet::default();
+
+    builder
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &empty,
+            0,
+            StructuralMetrics {
+                max_depth: 10,
+                ..StructuralMetrics::default()
+            },
+        )
+        .unwrap();
+    builder
+        .add_file_ngrams(
+            FileId(1),
+            Language::Python,
+            &empty,
+            0,
+            StructuralMetrics {
+                max_depth: 20,
+                ..StructuralMetrics::default()
+            },
+        )
+        .unwrap();
+    builder
+        .add_file_ngrams(
+            FileId(2),
+            Language::Go,
+            &empty,
+            0,
+            StructuralMetrics {
+                max_depth: 30,
+                ..StructuralMetrics::default()
+            },
+        )
+        .unwrap();
+
+    let reader = builder.build().unwrap();
+    // avg = (10 + 20 + 30) / 3 = 20.0
+    assert!(
+        (reader.avg_max_depth() - 20.0_f32).abs() < 1e-4,
+        "avg_max_depth should be 20.0, got {}",
+        reader.avg_max_depth()
     );
 }

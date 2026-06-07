@@ -8,6 +8,7 @@
 use rskim_core::Language;
 
 use super::*;
+use crate::ast_index::structural::BUCKET_LABEL_BASE;
 use crate::ast_index::{AstBigram, AstTrigram, DEFAULT_AST_WEIGHT, linearize_source, vocab_lookup};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -683,6 +684,125 @@ fn trigram_count_accumulates_for_repeated_triple() {
     assert_eq!(
         occurrences, 1,
         "trigram must be deduplicated to a single entry"
+    );
+}
+
+// ── B_M1: Real n-gram parity — metrics path equals weights path ──────────────
+//
+// `extract_ast_ngrams_with_metrics` re-implements the full traversal loop
+// independently from `extract_ast_ngrams_with_weights`.  Any silent divergence
+// in edge cases (gap-fill ordering, sentinel handling, end-of-stream close)
+// would produce different real n-grams without a compile-time signal.
+//
+// This test runs both functions on the same input (a multi-node tree that
+// exercises gap-fill, siblings, and depth nesting) and asserts that the real
+// bigrams and trigrams match exactly after filtering out all synthetic markers
+// (parent or child ID >= BUCKET_LABEL_BASE = 64900).
+//
+// Filtering: a bigram is synthetic when parent >= 64900 OR child >= 64900.
+// Trigrams cannot be synthetic (synthetic IDs never appear in trigram slots).
+
+#[test]
+fn metrics_path_real_ngrams_match_weights_path() {
+    // Exercises: root→child, siblings, depth nesting, gap-fill (jump > +1).
+    // Kind IDs are well below 64900 — not in the synthetic range.
+    let nodes = [
+        node(10, 0), // root
+        node(20, 1), // child A of root
+        node(30, 2), // child of A
+        node(40, 2), // sibling of child above (depth-2 sibling)
+        node(50, 1), // sibling B of A (closes depth-2 subtrees)
+        node(60, 3), // depth jump 1→3: gap-fill nulls depth 2
+    ];
+
+    let weights_result =
+        extract_ast_ngrams_with_weights(&nodes, unit_bigram_weight, unit_trigram_weight);
+    let (metrics_result, _metrics) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
+
+    let is_real_bigram = |e: &AstBigramEntry| {
+        let (parent, child) = e.ngram.decode();
+        parent < BUCKET_LABEL_BASE && child < BUCKET_LABEL_BASE
+    };
+
+    let mut weights_bigram_keys: Vec<u32> = weights_result
+        .bigrams
+        .iter()
+        .filter(|e| is_real_bigram(e))
+        .map(|e| e.ngram.key())
+        .collect();
+    let mut metrics_bigram_keys: Vec<u32> = metrics_result
+        .bigrams
+        .iter()
+        .filter(|e| is_real_bigram(e))
+        .map(|e| e.ngram.key())
+        .collect();
+    weights_bigram_keys.sort_unstable();
+    metrics_bigram_keys.sort_unstable();
+
+    assert_eq!(
+        weights_bigram_keys, metrics_bigram_keys,
+        "real bigram keys from metrics path must match weights path (synthetic IDs filtered out)"
+    );
+
+    let mut weights_trigram_keys: Vec<u64> = weights_result
+        .trigrams
+        .iter()
+        .map(|e| e.ngram.key())
+        .collect();
+    let mut metrics_trigram_keys: Vec<u64> = metrics_result
+        .trigrams
+        .iter()
+        .map(|e| e.ngram.key())
+        .collect();
+    weights_trigram_keys.sort_unstable();
+    metrics_trigram_keys.sort_unstable();
+
+    assert_eq!(
+        weights_trigram_keys, metrics_trigram_keys,
+        "trigram keys from metrics path must match weights path"
+    );
+}
+
+// ── B_M2: u16::MAX depth regression guard — metrics path ─────────────────────
+//
+// B1 / B1-sibling lock the u16::MAX fix in `extract_ast_ngrams_with_weights`.
+// `extract_ast_ngrams_with_metrics` has its own gap-fill arithmetic (u32-widened
+// per PF-004) but previously had no regression guard.
+//
+// Structure mirrors B1:
+//   node(10, 0)        → root; prev_depth = 0
+//   node(20, u16::MAX) → jump 0→u16::MAX; gap-fill fires
+//                        (u32::from(u16::MAX) > u32::from(0) + 1 → true);
+//                        ancestors[1..65535] nulled → no real bigram
+//
+// Additional assertion: metrics.max_depth == u16::MAX.
+//
+// Applies ADR-003 (grounded regression guards); avoids PF-004 (u16 overflow).
+
+#[test]
+fn metrics_path_u16_max_depth_no_panic_max_depth_recorded() {
+    let nodes = [node(10, 0), node(20, u16::MAX)];
+    let (result, metrics) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
+
+    let is_real_bigram = |e: &AstBigramEntry| {
+        let (parent, child) = e.ngram.decode();
+        parent < BUCKET_LABEL_BASE && child < BUCKET_LABEL_BASE
+    };
+    let real_bigrams: Vec<_> = result
+        .bigrams
+        .iter()
+        .filter(|e| is_real_bigram(e))
+        .collect();
+    assert!(
+        real_bigrams.is_empty(),
+        "node at u16::MAX depth with gap must produce no real bigram (parent slot nulled); \
+         if this fails the PF-004 u32-widening guard in the metrics path is broken"
+    );
+
+    assert_eq!(
+        metrics.max_depth,
+        u16::MAX,
+        "metrics.max_depth must record the observed maximum depth (u16::MAX)"
     );
 }
 
