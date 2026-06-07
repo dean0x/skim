@@ -1368,8 +1368,16 @@ fn b4_equal_scores_tie_break_file_id_asc() {
     assert_eq!(results.len(), 2, "both files should match");
 
     // Scores must be bitwise-equal (same inputs, deterministic formula).
-    let score0 = results.iter().find(|r| r.file_id == FileId(0)).unwrap().score;
-    let score1 = results.iter().find(|r| r.file_id == FileId(1)).unwrap().score;
+    let score0 = results
+        .iter()
+        .find(|r| r.file_id == FileId(0))
+        .unwrap()
+        .score;
+    let score1 = results
+        .iter()
+        .find(|r| r.file_id == FileId(1))
+        .unwrap()
+        .score;
     assert_eq!(
         score0, score1,
         "precondition: both files must have equal scores (score0={score0}, score1={score1})"
