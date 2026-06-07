@@ -370,9 +370,6 @@ fn bm25(
         if n <= 0.0 { 1.0 } else { n }
     };
     let tf_norm = tf / ln;
-    if tf_norm == 0.0 {
-        return 0.0;
-    }
     idf * (tf_norm / (tf_norm + AST_BM25_K1))
 }
 
