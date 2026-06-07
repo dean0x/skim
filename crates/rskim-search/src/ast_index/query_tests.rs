@@ -1323,12 +1323,8 @@ fn b6_result_fields_are_honest_defaults() {
     drop(dir);
 }
 
-// B4: equal scores exercise the FileId-ASC tie-break
-//
-// Two files built from identical inputs (same language, same node_count, same
-// bigram count) produce bitwise-equal BM25 scores. The SearchLayer sort is
-// score-DESC with FileId-ASC as a tie-break. This test confirms the tie-break
-// branch is live: a refactor inverting the order would fail here.
+// B4: equal-score tie-break — identical inputs produce bitwise-equal scores, FileId-ASC wins
+
 #[test]
 fn b4_equal_scores_tie_break_file_id_asc() {
     let dir = tempdir().unwrap();

@@ -66,9 +66,8 @@ impl PartialEq for AstQuery {
 ///
 /// **Value-type coupling is intentional and bounded.** `AstPosting` and
 /// `AstFileMetaEntry` are deliberately treated as the stable query-layer value
-/// contract — they are `Copy`, gix-free, and mmap-free — so coupling to them
-/// is bounded and intentional, mirroring the "free of gix types" note on
-/// `CommitInfo` in `types.rs`.
+/// contract — they are `Copy`, gix-free, and mmap-free — mirroring the
+/// "free of gix types" note on `CommitInfo` in `types.rs`.
 ///
 /// **Finiteness contract.** `avg_node_count()` MUST return a finite, non-NaN
 /// value. `node_count` values in `AstFileMetaEntry` MUST be non-negative.
