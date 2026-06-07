@@ -194,6 +194,20 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Fast-path: indefinite/daemon commands must not be rewritten.
+    // When an agent runs `next dev` or `npm run dev`, passing it through the
+    // rewrite engine would try to capture its output — a dev server never
+    // exits, so the agent would hang. Treat these as no-rewrite passthroughs
+    // the same way already-skim commands are treated (audit + exit 0, empty
+    // stdout → agent runs the raw command unchanged). (ADR-008 Part C)
+    {
+        let quick_tokens: Vec<&str> = command.split_whitespace().collect();
+        if !quick_tokens.is_empty() && super::indefinite::is_indefinite_command(&quick_tokens) {
+            audit_hook(&command, false, "");
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+
     // Check for compound operator characters on the original string directly,
     // before tokenizing, to avoid unnecessary allocations on the hot path.
     let has_operator_chars = command.contains("&&")

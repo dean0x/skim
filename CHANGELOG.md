@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Removed internal command-execution timeout caps (ADR-008)** — `CommandRunner` no longer
+  imposes a wall-clock cap on wrapped commands. Previous versions killed `cargo test`,
+  `npm build`, and other long-but-finite commands after 300 s (default) or 600 s (builds).
+  Skim is a transparent command wrapper; a transparent wrapper must not change whether or
+  when a command completes. Bind child-process lifetime externally when needed: CI step
+  timeout, the shell `timeout(1)` utility, the agent tool timeout, or `Ctrl-C`. The 64 MiB
+  output memory cap (`MAX_OUTPUT_BYTES`) is unchanged — only the TIME bound is removed.
+  **Accepted side-effect**: long finite commands now produce no output until they exit
+  (skim buffers to compress); `SKIM_PASSTHROUGH=1` is the human escape hatch.
+
+### Fixed
+- **Kill-on-drop guard for spawned children (ADR-008)** — `CommandRunner` now wraps every
+  spawned process in a `ChildGuard` RAII struct. On any early-return path (size-cap error,
+  pipe-capture failure, reader-thread panic) the guard calls `kill()` + `wait()` on the
+  still-running child, preventing orphan processes. On the normal path the child has already
+  exited before drop fires, so `kill()` is a harmless no-op. This also fixes the pre-existing
+  orphan on the 64 MiB size-cap path.
+
+### Added
+- **Daemon / streaming command passthrough (ADR-008 Part C)** — Indefinitely-running
+  commands (`vite dev`, `npm run dev`, `jest --watch`, `tail -f`, `kubectl logs -f`, etc.)
+  are now detected before skim tries to capture their output. They are passed through with
+  fully inherited stdio: live output streams to the terminal, stdin is forwarded (interactive
+  dev servers work), and `Ctrl-C` terminates the child normally. Detection is heuristic and
+  conservative — a missed daemon degrades to the old buffered path (64 MiB cap still applies);
+  `SKIM_PASSTHROUGH=1` is an explicit escape hatch.
+  **Accepted limitation**: stdin-reading interactive commands on the buffered (non-daemon)
+  path could block on stdin; this is pre-existing and out of scope.
+
 ### Added
 - **Wave 3e: AST Pattern Library & Structural Index v2** — `rskim-search` AST index format bumped to v2 (breaking; re-index required). Adds per-file structural metrics (max depth, max block statements, max params, branch count) and synthetic n-gram markers (EMPTY_BODY, DEEP_NODE, LARGE_BODY, MANY_PARAMS) emitted via a single-pass extraction. Pattern library catalog with 29 named patterns (ErrorHandling, Performance, Concurrency, Quality, Structure) GOLD-verified against real parse output; each pattern is either exact (reliable subset of every occurrence) or approximate (description says "approximation" or "structural"). (#196)
 

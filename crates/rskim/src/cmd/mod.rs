@@ -74,17 +74,6 @@ pub(crate) mod test_utils;
 
 use std::io::{self, Read};
 use std::sync::LazyLock;
-use std::time::Duration;
-
-// ============================================================================
-// Stdin reading
-// ============================================================================
-
-/// Default timeout for command execution (5 minutes).
-///
-/// Applied to all [`CommandRunner`] sites that don't have an explicit longer
-/// timeout (build commands use 600 s because compile times can be substantial).
-pub(crate) const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Determine whether to read piped stdin instead of spawning the command.
 ///

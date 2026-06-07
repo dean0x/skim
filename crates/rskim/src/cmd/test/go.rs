@@ -145,15 +145,13 @@ fn build_go_args(user_args: &[String]) -> Vec<String> {
 /// Returns a user-facing hint when the `go` binary is not found, so the agent
 /// can immediately suggest the install path instead of a raw OS error.
 fn run_go(args: &[&str]) -> anyhow::Result<CommandOutput> {
-    CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT))
-        .run("go", args)
-        .map_err(|e| {
-            if crate::runner::is_spawn_error(&e) {
-                anyhow::anyhow!("{}\nHint: install Go from https://go.dev/dl/", e)
-            } else {
-                e
-            }
-        })
+    CommandRunner::new().run("go", args).map_err(|e| {
+        if crate::runner::is_spawn_error(&e) {
+            anyhow::anyhow!("{}\nHint: install Go from https://go.dev/dl/", e)
+        } else {
+            e
+        }
+    })
 }
 
 // ============================================================================

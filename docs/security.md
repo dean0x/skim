@@ -263,15 +263,30 @@ skim untrusted.ts --no-cache
 1. **Pin Skim version** - Don't use `latest`
 2. **Use `--no-cache`** - Avoid cache poisoning
 3. **Validate inputs** - Check file sizes before processing
-4. **Set timeouts** - Limit processing time
+4. **Set timeouts externally** - Limit processing time at the CI step or shell level
+
+**Important**: skim does NOT impose an internal wall-clock timeout on wrapped commands
+(removed in ADR-008). It imposes a **64 MiB memory cap** on captured output
+(`MAX_OUTPUT_BYTES`) — that protection remains. If you need a hard time bound, add it
+externally:
 
 ```yaml
-# GitHub Actions example
+# GitHub Actions example — bound command lifetime at the step level
+- name: Process code
+  timeout-minutes: 5
+  run: skim src/ --no-cache > docs/api.txt
+
+# Or use the shell timeout(1) wrapper
 - name: Process code
   run: |
-    # Timeout after 5 minutes
+    # External timeout — skim itself imposes no time cap
     timeout 300 skim src/ --no-cache > docs/api.txt
 ```
+
+For interactive dev servers and watch-mode commands (`vite dev`, `npm run dev`,
+`jest --watch`, etc.), skim detects them automatically and passes them through with
+inherited stdio — no buffering, no compression. This means `Ctrl-C` works and live
+output streams directly to the terminal.
 
 ### Glob Pattern Security
 

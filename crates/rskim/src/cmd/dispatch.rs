@@ -5,12 +5,11 @@
 //! raw passthrough, and per-family help printers.
 
 use std::io::{self, Write};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use super::{
-    DEFAULT_CMD_TIMEOUT, KNOWN_SUBCOMMANDS, agents, build, completions, db, discover, file, git,
-    heatmap, infra, init, learn, lint, log, pkg, rewrite, sanitize_for_display, search, stats,
-    test,
+    KNOWN_SUBCOMMANDS, agents, build, completions, db, discover, file, git, heatmap, infra, init,
+    learn, lint, log, pkg, rewrite, sanitize_for_display, search, stats, test,
 };
 
 // ============================================================================
@@ -73,6 +72,42 @@ fn extract_subcmd<'a>(
 }
 
 // ============================================================================
+// Inherited-stdio passthrough for daemon / streaming commands (ADR-008 Part C)
+// ============================================================================
+
+/// Run a daemon or streaming command with fully inherited stdio.
+///
+/// Used for commands detected by [`rewrite::indefinite::is_indefinite_command`]
+/// in the direct / PATH-wrapper dispatch path. Unlike [`run_raw_passthrough`]
+/// (which captures stdout/stderr and re-prints them), this helper lets the child
+/// share the parent's file descriptors directly:
+///
+/// - **stdin** is inherited — interactive prompts and `Ctrl-C` work.
+/// - **stdout / stderr** are inherited — live output streams to the terminal.
+/// - No capture, no compression, no analytics (skim is fully transparent).
+///
+/// PATH wrappers are already stripped from `PATH` by `main::strip_skim_wrappers_from_path`
+/// before any thread is spawned, so `Command::new(program)` resolves to the
+/// real binary without recursion.
+///
+/// Exit code mapping mirrors the streaming gh path:
+/// - ENOENT (program not found) → 127
+/// - Signal termination (code = `None`) → `ExitCode::FAILURE`
+/// - Otherwise → the child's actual exit code
+fn run_inherited_passthrough(program: &str, args: &[String]) -> ExitCode {
+    let status = Command::new(program).args(args).status();
+
+    match status {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ExitCode::from(127u8),
+        Err(_) => ExitCode::FAILURE,
+        Ok(s) => match s.code() {
+            Some(code) => ExitCode::from(code.clamp(0, 255) as u8),
+            None => ExitCode::FAILURE, // killed by signal
+        },
+    }
+}
+
+// ============================================================================
 // Raw passthrough
 // ============================================================================
 
@@ -84,7 +119,7 @@ pub(crate) fn run_raw_passthrough(
     args: &[String],
     env: &[(&str, &str)],
 ) -> anyhow::Result<ExitCode> {
-    let runner = crate::runner::CommandRunner::new(Some(DEFAULT_CMD_TIMEOUT));
+    let runner = crate::runner::CommandRunner::new();
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = runner.run_with_env(program, &arg_refs, env)?;
     let mut out = io::stdout().lock();
@@ -364,6 +399,38 @@ pub(crate) fn dispatch(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
+    // Daemon / streaming guard (ADR-008 Part C).
+    //
+    // Commands like `vite dev`, `npm run dev`, `jest --watch`, etc. run
+    // indefinitely. Capturing their output would cause skim to hang waiting
+    // for a process that never exits. Detect them early and run them with
+    // inherited stdio so live output streams directly to the terminal.
+    //
+    // Build the full token slice [subcommand, args...] to match the detection
+    // API, then delegate to `run_inherited_passthrough` which uses the real
+    // binary (PATH wrappers are already stripped from PATH by this point).
+    //
+    // SKIM_PASSTHROUGH=1 already causes the whole binary to behave as a
+    // transparent relay upstream (in main.rs), so we don't need to re-check
+    // it here — this guard is only reachable on non-passthrough invocations.
+    //
+    // Stdin exception: when stdin is piped (not a terminal) the invocation is
+    // a compression use case — the user or a pipeline is feeding the tool's
+    // output to skim for parsing. Daemon detection does not apply in that case;
+    // the normal dispatch path handles piped stdin via `should_read_stdin`.
+    {
+        use std::io::IsTerminal;
+        let stdin_piped = !std::io::stdin().is_terminal();
+        if !stdin_piped {
+            let mut all_tokens: Vec<&str> = Vec::with_capacity(args.len() + 1);
+            all_tokens.push(subcommand);
+            all_tokens.extend(args.iter().map(String::as_str));
+            if rewrite::indefinite::is_indefinite_command(&all_tokens) {
+                return Ok(run_inherited_passthrough(subcommand, args));
+            }
+        }
+    }
+
     match subcommand {
         // Unchanged meta/utility
         "agents" => agents::run(args, analytics),

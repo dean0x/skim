@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use crate::output::ParseResult;
 use crate::runner::{CommandOutput, CommandRunner};
 
-use super::{DEFAULT_CMD_TIMEOUT, is_passthrough_mode, read_stdin_bounded, should_read_stdin};
+use super::{is_passthrough_mode, read_stdin_bounded, should_read_stdin};
 use super::{scrub_db_args, scrub_infra_args};
 
 /// Controls the output format of parsed command results.
@@ -137,7 +137,7 @@ fn obtain_output(
         }
     }
 
-    let runner = CommandRunner::new(Some(DEFAULT_CMD_TIMEOUT));
+    let runner = CommandRunner::new();
     let args_str: Vec<&str> = args.iter().map(String::as_str).collect();
     match runner.run_with_env(program, &args_str, env_overrides) {
         Ok(out) => Ok(Some(out)),
