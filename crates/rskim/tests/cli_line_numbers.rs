@@ -431,16 +431,12 @@ fn test_line_numbers_signatures_mode_annotates_source_lines() {
     assert!(!lines.is_empty(), "Signatures mode should produce output");
     for line in &lines {
         // Every line should be annotated with a source line number
-        let parts: Vec<&str> = line.splitn(2, '\t').collect();
-        assert_eq!(
-            parts.len(),
-            2,
-            "Each output line should be tab-separated: {:?}",
-            line
-        );
-        let _num: usize = parts[0]
+        let Some((num_str, _)) = line.split_once('\t') else {
+            panic!("Each output line should be tab-separated: {:?}", line)
+        };
+        let _num: usize = num_str
             .parse()
-            .unwrap_or_else(|_| panic!("Line number should parse as usize, got: {:?}", parts[0]));
+            .unwrap_or_else(|_| panic!("Line number should parse as usize, got: {:?}", num_str));
     }
 }
 
@@ -477,16 +473,12 @@ fn test_line_numbers_types_mode_annotates_source_lines() {
             // a line-number prefix (source_line = 0 in the map). This is by design.
             continue;
         }
-        let parts: Vec<&str> = line.splitn(2, '\t').collect();
-        assert_eq!(
-            parts.len(),
-            2,
-            "Non-blank output line should be tab-separated: {:?}",
-            line
-        );
-        let _num: usize = parts[0]
+        let Some((num_str, _)) = line.split_once('\t') else {
+            panic!("Non-blank output line should be tab-separated: {:?}", line)
+        };
+        let _num: usize = num_str
             .parse()
-            .unwrap_or_else(|_| panic!("Line number should parse as usize, got: {:?}", parts[0]));
+            .unwrap_or_else(|_| panic!("Line number should parse as usize, got: {:?}", num_str));
         annotated_count += 1;
     }
     assert!(
@@ -568,10 +560,9 @@ fn test_line_numbers_with_last_lines_truncation_marker_no_prefix() {
     //    have a {num}\t prefix (their source_line is 0).
     for line in &lines {
         if line.contains("lines above") || line.contains("lines truncated") {
-            let has_number_prefix = {
-                let parts: Vec<&str> = line.splitn(2, '\t').collect();
-                parts.len() == 2 && parts[0].parse::<usize>().is_ok()
-            };
+            let has_number_prefix = line
+                .split_once('\t')
+                .is_some_and(|(num_str, _)| num_str.parse::<usize>().is_ok());
             assert!(
                 !has_number_prefix,
                 "Truncation marker must not have a line-number prefix, got: {:?}",
@@ -587,12 +578,8 @@ fn test_line_numbers_with_last_lines_truncation_marker_no_prefix() {
     let content_line_nums: Vec<usize> = lines
         .iter()
         .filter_map(|l| {
-            let parts: Vec<&str> = l.splitn(2, '\t').collect();
-            if parts.len() == 2 {
-                parts[0].parse::<usize>().ok()
-            } else {
-                None
-            }
+            let (num_str, _) = l.split_once('\t')?;
+            num_str.parse::<usize>().ok()
         })
         .collect();
 
@@ -717,8 +704,8 @@ fn test_line_numbers_multifile_headers_no_prefix() {
     }
     // At least some content lines should have line numbers
     let has_numbered_lines = stdout.lines().any(|l| {
-        let parts: Vec<&str> = l.splitn(2, '\t').collect();
-        parts.len() == 2 && parts[0].parse::<usize>().is_ok()
+        l.split_once('\t')
+            .is_some_and(|(n, _)| n.parse::<usize>().is_ok())
     });
     assert!(
         has_numbered_lines,
@@ -839,8 +826,8 @@ fn test_line_numbers_json_structure_mode_skips_annotation() {
     // Serde structure mode: output is restructured, so no line number annotations
     // should be applied. No tab-separated line numbers should appear.
     let has_numbered = stdout.lines().any(|l| {
-        let parts: Vec<&str> = l.splitn(2, '\t').collect();
-        parts.len() == 2 && parts[0].parse::<usize>().is_ok()
+        l.split_once('\t')
+            .is_some_and(|(n, _)| n.parse::<usize>().is_ok())
     });
     assert!(
         !has_numbered,
@@ -878,8 +865,8 @@ fn test_line_numbers_with_token_cascade() {
     let lines: Vec<&str> = stdout.lines().collect();
     // At least some lines should be annotated
     let has_numbered = lines.iter().any(|l| {
-        let parts: Vec<&str> = l.splitn(2, '\t').collect();
-        parts.len() == 2 && parts[0].parse::<usize>().is_ok()
+        l.split_once('\t')
+            .is_some_and(|(n, _)| n.parse::<usize>().is_ok())
     });
     assert!(
         has_numbered,
@@ -927,12 +914,8 @@ fn test_line_numbers_pseudo_mode_gaps() {
     let line_nums: Vec<usize> = lines
         .iter()
         .filter_map(|l| {
-            let parts: Vec<&str> = l.splitn(2, '\t').collect();
-            if parts.len() == 2 {
-                parts[0].parse::<usize>().ok()
-            } else {
-                None
-            }
+            let (num_str, _) = l.split_once('\t')?;
+            num_str.parse::<usize>().ok()
         })
         .collect();
 
@@ -1150,10 +1133,9 @@ fn test_line_numbers_last_lines_correct_source_numbers() {
 
     for marker in &marker_lines {
         // The truncation marker must NOT have a {num}\t prefix
-        let has_number_prefix = {
-            let parts: Vec<&str> = marker.splitn(2, '\t').collect();
-            parts.len() == 2 && parts[0].parse::<usize>().is_ok()
-        };
+        let has_number_prefix = marker
+            .split_once('\t')
+            .is_some_and(|(num_str, _)| num_str.parse::<usize>().is_ok());
         assert!(
             !has_number_prefix,
             "Truncation marker should NOT have a line-number prefix, got: {:?}",
@@ -1224,11 +1206,10 @@ fn test_line_numbers_guardrail_identity_map() {
         if line.is_empty() {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(2, '\t').collect();
-        if parts.len() == 2 {
+        if let Some((num_str, _)) = line.split_once('\t') {
             // If there's a tab separator, the left part must parse as usize
             assert!(
-                parts[0].parse::<usize>().is_ok(),
+                num_str.parse::<usize>().is_ok(),
                 "Left part of tab-separated line must be a valid line number, got: {:?}",
                 line
             );
@@ -1240,8 +1221,8 @@ fn test_line_numbers_guardrail_identity_map() {
     // or structure mode produces output. In both cases, at least one annotated line
     // should exist.
     let has_numbered = lines.iter().any(|l| {
-        let parts: Vec<&str> = l.splitn(2, '\t').collect();
-        parts.len() == 2 && parts[0].parse::<usize>().is_ok()
+        l.split_once('\t')
+            .is_some_and(|(n, _)| n.parse::<usize>().is_ok())
     });
     assert!(
         has_numbered,
@@ -1308,12 +1289,8 @@ fn test_line_numbers_last_lines_full_mode_duplicate_lines() {
 
     // Helper: extract tab-separated line number from an annotated line
     let parse_line_num = |s: &str| -> Option<usize> {
-        let parts: Vec<&str> = s.splitn(2, '\t').collect();
-        if parts.len() == 2 {
-            parts[0].parse::<usize>().ok()
-        } else {
-            None
-        }
+        let (num_str, _) = s.split_once('\t')?;
+        num_str.parse::<usize>().ok()
     };
 
     // Second line: source line 5 (`    return 2;`)

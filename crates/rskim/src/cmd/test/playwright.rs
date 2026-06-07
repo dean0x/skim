@@ -371,10 +371,7 @@ mod tests {
         assert!(failed.is_some(), "Should have a failed entry");
         let f = failed.unwrap();
         assert!(
-            f.detail
-                .as_ref()
-                .map(|d| d.contains("Expected"))
-                .unwrap_or(false),
+            f.detail.as_ref().is_some_and(|d| d.contains("Expected")),
             "Detail should contain error message, got: {:?}",
             f.detail
         );

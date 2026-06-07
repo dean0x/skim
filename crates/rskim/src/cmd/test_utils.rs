@@ -7,6 +7,7 @@
 //! than per-module duplicates.  New subcommand parsers should import from here
 //! rather than defining local equivalents.
 
+use std::path::Component;
 use std::time::Duration;
 
 use crate::runner::CommandOutput;
@@ -64,11 +65,12 @@ pub(crate) fn make_output_stderr(stderr: &str) -> CommandOutput {
 /// arguments are invalid or if the fixture file cannot be read, so test
 /// failures surface the problem immediately.
 pub(crate) fn load_fixture(subdir: &str, name: &str) -> String {
+    fn is_single_normal(s: &str) -> bool {
+        let mut it = std::path::Path::new(s).components();
+        matches!(it.next(), Some(Component::Normal(_))) && it.next().is_none()
+    }
     assert!(
-        !subdir.contains(['/', '\\'])
-            && subdir != ".."
-            && !name.contains(['/', '\\'])
-            && name != "..",
+        is_single_normal(subdir) && is_single_normal(name),
         "load_fixture: subdir/name must be a single path component, got subdir={subdir:?} name={name:?}"
     );
     let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

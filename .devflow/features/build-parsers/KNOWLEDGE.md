@@ -231,7 +231,7 @@ The four helpers available:
 - `make_output(stdout: &str) -> CommandOutput` — success case: stderr empty, exit_code Some(0), duration ZERO
 - `make_output_full(stdout, stderr, exit_code: Option<i32>) -> CommandOutput` — full control for non-zero exits, stderr content, signal-kill (None exit code)
 - `make_output_stderr(stderr: &str) -> CommandOutput` — all output on stderr, exit_code Some(0); for tools that default to stderr (wget, curl)
-- `load_fixture(subdir: &str, name: &str) -> String` — loads from `tests/fixtures/cmd/{subdir}/{name}`; panics with clear message on missing file
+- `load_fixture(subdir: &str, name: &str) -> String` — loads from `tests/fixtures/cmd/{subdir}/{name}`; both `subdir` and `name` must be single path components — the helper asserts and panics if either contains `/`, `\`, or equals `..`, preventing directory traversal outside the fixtures tree; also panics with a clear message if the file cannot be read
 
 Build parser tests import as `use crate::cmd::test_utils::{make_output_full, load_fixture}`. Do not redeclare local versions — use the canonical source to prevent drift.
 

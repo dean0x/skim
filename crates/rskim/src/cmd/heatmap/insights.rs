@@ -291,6 +291,9 @@ mod tests {
         }
     }
 
+    /// Params struct for `make_file` — collapses the former 8-positional signature into named
+    /// fields, eliminating `clippy::too_many_arguments` at the root (ADR-007) rather than
+    /// suppressing it with `#[allow]`.
     struct FileSpec<'a> {
         path: &'a str,
         stability: u8,
@@ -302,6 +305,9 @@ mod tests {
         blast_radius: Vec<CouplingEntry>,
     }
 
+    // Defaults fall below every insight threshold so tests assert only the fields they set.
+    // The three author fields (single_owner_risk, top_author_pct, author_count) form a coherent
+    // group — override all three together when testing author-concentration insights.
     impl Default for FileSpec<'_> {
         fn default() -> Self {
             Self {
