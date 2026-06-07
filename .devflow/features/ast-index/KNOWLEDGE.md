@@ -327,7 +327,7 @@ bigrams and trigrams). Without this, a pattern with duplicate n-gram entries wou
 double-score files. `debug_assert!` verifies post-dedup uniqueness.
 
 **C4 guarantee**: `AstPosting.count >= 1` is validated by `decode_posting` in the reader;
-the `bm25` helper relies on this — no separate guard for `tf > 0`.
+the `bm25_with_idf` helper relies on this — no separate guard for `tf > 0`.
 
 **`SearchLayer` adapter (Wave 3g)**:
 
@@ -347,15 +347,15 @@ is deferred to Wave 4.
 | Input form | Dispatch rule |
 |---|---|
 | Contains `-` and one segment | `lookup_pattern` → `AstQuery::Pattern` |
-| `A > B` (2 segments) | `parse_bigram_q` → `AstQuery::Containment` |
-| `A > B > C` (3 segments) | `parse_trigram_q` → `AstQuery::Containment` |
+| `A > B` (2 segments) | `parse_bigram` → `AstQuery::Containment` |
+| `A > B > C` (3 segments) | `parse_trigram` → `AstQuery::Containment` |
 | One segment, no `-` | `vocab_lookup` → `AstQuery::SingleNode` |
 | `>>` (transitive ancestor) | `Err(InvalidQuery)` |
 | Empty segment or > 3 segments | `Err(InvalidQuery)` |
 | > 4096 bytes | `Err(InvalidQuery)` |
 
-**Test coverage**: 42 unit tests in `query_tests.rs` using `FakePostingSource` harness.
-Groups: A1–A6 (engine correctness), B2–B6 (scoring, dedup, sort), parse error tests.
+**Test coverage**: comprehensive unit suite (groups A1–A6 engine correctness, B2–B6
+scoring/dedup/sort, plus parse-error tests) in `query_tests.rs` using `FakePostingSource` harness.
 Criterion bench in `benches/ast_query.rs`: 3 scenarios × 10k synthetic files
 (`bench_hot_bigram`, `bench_rare_trigram`, `bench_multi_ngram_pattern`).
 
