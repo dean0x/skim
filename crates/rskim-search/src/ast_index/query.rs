@@ -5,10 +5,9 @@
 //! Wave-3g [`SearchLayer`] adapter.
 
 use std::cmp::Ordering;
-use std::hash::BuildHasherDefault;
 use std::path::Path;
 
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::FxHashMap;
 
 use rskim_core::Language;
 
@@ -149,10 +148,8 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
 
         // Use FxHashMap (integer keys, trusted in-range doc_ids) with a capacity
         // hint to avoid rehashing on the hot insert path.
-        let mut scores: FxHashMap<u32, f64> = FxHashMap::with_capacity_and_hasher(
-            capacity,
-            BuildHasherDefault::<FxHasher>::default(),
-        );
+        let mut scores: FxHashMap<u32, f64> =
+            FxHashMap::with_capacity_and_hasher(capacity, Default::default());
 
         // Gap-fix #6: dedup by key (entries are sorted; O(n); prevents double-scoring dups).
         let mut bigrams: Vec<&AstBigramEntry> = set.bigrams.iter().collect();
@@ -178,7 +175,7 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
         let mut meta_cache: Option<FxHashMap<u32, AstFileMetaEntry>> = if total_ngrams > 1 {
             Some(FxHashMap::with_capacity_and_hasher(
                 capacity,
-                BuildHasherDefault::<FxHasher>::default(),
+                Default::default(),
             ))
         } else {
             None
