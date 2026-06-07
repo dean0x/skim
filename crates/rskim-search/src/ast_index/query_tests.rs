@@ -581,9 +581,19 @@ fn a5_synthetic_marker_pattern_matches() {
     let results = engine.search_ast(&q).unwrap();
 
     assert_eq!(results.len(), 1, "synthetic marker file should match");
+
+    // A5 exact score: synthetic keys are absent from the weight table, so
+    // ast_bigram_idf falls back to DEFAULT_AST_WEIGHT = 1.0.
+    // Setup: node_count=80, avg=80.0 → nc == avg → length_norm = 1.0
+    //   tf_norm = count / length_norm = 3.0 / 1.0 = 3.0
+    //   score = idf * (tf_norm / (tf_norm + k1)) = 1.0 * (3.0 / (3.0 + 1.2))
+    let k1 = AST_BM25_K1;
+    let tf_norm = 3.0_f64; // count=3, length_norm=1.0
+    let expected = tf_norm / (tf_norm + k1); // idf=1.0
+    let got = results[0].1;
     assert!(
-        results[0].1 > 0.0,
-        "score must be positive (IDF=1.0 fallback for synthetic)"
+        (got - expected).abs() < 1e-9,
+        "A5 synthetic score mismatch: got {got}, expected {expected} (idf=1.0, tf_norm={tf_norm})"
     );
 }
 
@@ -1310,5 +1320,68 @@ fn b6_result_fields_are_honest_defaults() {
         "field should be Other"
     );
     assert!(r.snippet.is_none(), "snippet should be None");
+    drop(dir);
+}
+
+// B4: equal scores exercise the FileId-ASC tie-break
+//
+// Two files built from identical inputs (same language, same node_count, same
+// bigram count) produce bitwise-equal BM25 scores. The SearchLayer sort is
+// score-DESC with FileId-ASC as a tie-break. This test confirms the tie-break
+// branch is live: a refactor inverting the order would fail here.
+#[test]
+fn b4_equal_scores_tie_break_file_id_asc() {
+    let dir = tempdir().unwrap();
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let bigram = AstBigram::encode(fn_id, block_id);
+
+    let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    // Two files with identical inputs → identical BM25 scores.
+    // Same language, node_count, posting count → same length_norm, tf_norm, idf.
+    for i in 0..2u32 {
+        let set = AstNgramSet {
+            bigrams: vec![AstBigramEntry {
+                ngram: bigram,
+                weight: DEFAULT_AST_WEIGHT,
+                count: 1,
+            }],
+            trigrams: vec![],
+        };
+        builder
+            .add_file_ngrams(
+                FileId(i),
+                Language::Rust,
+                &set,
+                100,
+                StructuralMetrics::default(),
+            )
+            .unwrap();
+    }
+    let reader = builder.build().unwrap();
+    let engine = AstQueryEngine::new(reader);
+
+    let mut query = SearchQuery::new("q");
+    query.ast_pattern = Some("function_item > block".into());
+    let results = engine.search(&query).unwrap();
+
+    assert_eq!(results.len(), 2, "both files should match");
+
+    // Scores must be bitwise-equal (same inputs, deterministic formula).
+    let score0 = results.iter().find(|r| r.file_id == FileId(0)).unwrap().score;
+    let score1 = results.iter().find(|r| r.file_id == FileId(1)).unwrap().score;
+    assert_eq!(
+        score0, score1,
+        "precondition: both files must have equal scores (score0={score0}, score1={score1})"
+    );
+
+    // When scores tie, FileId-ASC tie-break must apply: FileId(0) before FileId(1).
+    let ids: Vec<FileId> = results.iter().map(|r| r.file_id).collect();
+    assert_eq!(
+        ids,
+        vec![FileId(0), FileId(1)],
+        "tied scores must be broken FileId-ASC: got {ids:?}"
+    );
+
     drop(dir);
 }
