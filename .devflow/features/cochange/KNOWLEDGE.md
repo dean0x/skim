@@ -19,7 +19,7 @@ referencedFiles:
   - crates/rskim-search/src/temporal/storage_types.rs
   - crates/rskim-search/src/temporal/storage_ops.rs
 created: 2026-05-24
-updated: 2026-06-05
+updated: 2026-06-07
 ---
 
 # Co-Change Matrix
@@ -172,9 +172,11 @@ concatenated with the `PairEntry` array bytes. When a format-breaking change is 
 
 ### Atomic write contract
 
-`builder.rs` uses `tempfile::NamedTempFile::new_in(dir)`, writes all bytes, calls `sync_all()` to
-flush to storage (crash safety), and then calls `.persist(path)` (a rename) so readers never
-observe a partially written file.
+`builder.rs` delegates atomic writes to `crate::io_util::atomic_write` (PR #272 extracted the
+previously inline function into a shared helper). The helper uses `tempfile::NamedTempFile::new_in(dir)`,
+writes all bytes, calls `sync_all()` to flush to storage (crash safety), sets `0o644` permissions
+on Unix, and then calls `.persist(path)` (a rename) so readers never observe a partially written file.
+The `ast_index` store builder uses the same `atomic_write` helper.
 
 ### SQLite co-change table schema
 
@@ -250,9 +252,11 @@ DELETE + batch INSERT in a single transaction.
 - `crates/rskim-search/src/types.rs` — `FileId`, `CochangeStats`, `HistoryResult`, `SearchError`
 - `crates/rskim-search/src/index/` — sibling persistence layer using the same atomic-write and
   mmap-read patterns; useful cross-reference for format evolution precedent
-- `crates/rskim-search/src/ast_index/store/` (Wave 3d, #194) — the closest format sibling: a
-  two-file mmap'd on-disk index (magic `b"SKAX"`, v1) for AST structural n-grams, built with the
+- `crates/rskim-search/src/ast_index/store/` (Wave 3d–3f) — the closest format sibling: a
+  two-file mmap'd on-disk index (magic `b"SKAX"`, v2) for AST structural n-grams, built with the
   identical `NamedTempFile` + `sync_all` + `persist` atomic-write contract and CRC32-validated
   binary-search reader. Mirror its `format.rs`/`builder.rs`/`reader.rs` split when evolving `.skcc`.
-  Note `lib.rs` now also re-exports `AstIndexBuilder`/`AstIndexReader`/`AstPosting`/`AstFileMetaEntry`
-  alongside the cochange re-exports — no change to the cochange API surface itself.
+  As of Wave 3f (#197), `ast_index` additionally exports `AstQuery`, `AstQueryEngine`,
+  `AstPostingSource`, `parse_ast_query`, `AST_BM25_K1`, `AST_BM25_B` at both the `ast_index` and
+  crate-root levels. `Pattern`, `PatternCategory`, `StructuralMetrics`, and
+  `extract_ast_ngrams_with_metrics` remain accessible only via `rskim_search::ast_index::`.

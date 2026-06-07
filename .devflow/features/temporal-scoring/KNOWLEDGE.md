@@ -17,8 +17,8 @@ referencedFiles:
   - crates/rskim-search/src/types.rs
   - crates/rskim-search/src/lib.rs
 created: 2026-06-01
-updated: 2026-06-01
-version: 1
+updated: 2026-06-07
+version: 3
 ---
 
 # Temporal Risk Scoring
@@ -178,6 +178,19 @@ Migrations are forward-only, driven by `PRAGMA user_version`:
 
 Current version is **v2** (v1: tables, v2: performance indexes).
 
+### Meta Table Constants
+
+Two public string constants are defined in `storage.rs` and re-exported at the crate root:
+
+```rust
+pub const META_LAST_UPDATED: &str = "last_updated";  // Unix timestamp written by sync
+pub const META_GIT_HEAD: &str = "git_head";           // Commit SHA written by sync
+```
+
+These are the only keys written by `TemporalDb::sync`. External callers reading the `meta`
+table should use these constants rather than inline strings. Both are exported via
+`rskim_search::temporal::storage::{META_GIT_HEAD, META_LAST_UPDATED}` and at the crate root.
+
 ### `TemporalDb::sync`
 
 ```rust
@@ -190,7 +203,7 @@ pub fn sync(
 ) -> Result<()>
 ```
 
-Atomically replaces all three tables in a single transaction: DELETE + batch INSERT for hotspot, risk, and cochange. Also writes `git_head` to the `meta` table. This is the preferred way to update all signals together — it ensures no partial state is visible.
+Atomically replaces all three tables in a single transaction: DELETE + batch INSERT for hotspot, risk, and cochange. Also writes `git_head` to `META_GIT_HEAD` and a Unix timestamp to `META_LAST_UPDATED` in the `meta` table. This is the preferred way to update all signals together — it ensures no partial state is visible.
 
 ### Point Queries
 
@@ -224,7 +237,7 @@ Atomically replaces all three tables in a single transaction: DELETE + batch INS
 - `crates/rskim-search/src/temporal/scoring_tests.rs` — unit tests for decay formula and file score aggregation
 - `crates/rskim-search/src/temporal/mod.rs` — public re-exports; `is_fix_commit` keyword classifier
 - `crates/rskim-search/src/temporal/git_parser.rs` — `GixSource` (gix-based git history reader producing `HistoryResult`)
-- `crates/rskim-search/src/temporal/storage.rs` — `TemporalDb` struct, `open`, `schema_version`, migration runner
+- `crates/rskim-search/src/temporal/storage.rs` — `TemporalDb` struct, `open`, `schema_version`, migration runner; `META_GIT_HEAD` and `META_LAST_UPDATED` public constants
 - `crates/rskim-search/src/temporal/storage_ops.rs` — all query and mutation methods for `TemporalDb` (impl block continues from storage.rs)
 - `crates/rskim-search/src/temporal/storage_types.rs` — `HotspotRow`, `RiskRow`, `CochangeRow` row structs
 - `crates/rskim-search/src/temporal/storage_tests.rs` — integration tests against in-memory SQLite
@@ -244,11 +257,12 @@ Atomically replaces all three tables in a single transaction: DELETE + batch INS
 - `compute_file_risk_scores` per-deduplicates changed files within each commit via `dedup_changed_files` (private helper). Without this, a commit with renames would count the same file twice.
 - Schema version mismatch returns `SearchError::Database(...)`, not `IndexCorrupted`. Rebuild by deleting `temporal.db`.
 - `top_coldspots` returns rows sorted by `score ASC` — not the inverse of `top_hotspots` sort, but an explicit ascending sort. Files with score 0.0 come first.
-- The `meta` table stores arbitrary key-value strings; `git_head` is the only key written by `TemporalDb::sync`. Future callers may add their own keys without schema migration.
+- The `meta` table stores arbitrary key-value strings. `TemporalDb::sync` writes two keys: `META_GIT_HEAD` (commit SHA) and `META_LAST_UPDATED` (Unix timestamp as a string). Future callers may add their own keys without schema migration, but should avoid these reserved key names.
 - `changes_30d` and `changes_90d` are raw counts — they are NOT decay-weighted and do NOT correlate with `score`. A file may have `score = 0.9` but `changes_30d = 0` if all its commits were just outside the 30-day window.
 
 ## Related
 
 - `crates/rskim-search/src/cochange/` — sibling module; both consume `HistoryResult`; co-change data shares the same `temporal.db` file via the `cochange` table
 - `crates/rskim-search/src/types.rs` — `HistoryResult`, `CommitInfo`, `FileId`, `SearchError`
+- `crates/rskim-search/src/io_util.rs` — `atomic_write` shared helper; used by the cochange builder and the AST index store builder (not by `TemporalDb` which uses rusqlite transactions instead)
 - Temporal CLI flags: `skim search --hot`, `--cold`, `--risky`, `--blast-radius FILE` — all backed by `TemporalDb` queries at search time
