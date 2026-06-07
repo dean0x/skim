@@ -10,7 +10,8 @@ fn fixture_path(name: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("tests");
     path.push("fixtures");
-    path.push("vitest");
+    path.push("cmd");
+    path.push("test");
     path.push(name);
     path
 }

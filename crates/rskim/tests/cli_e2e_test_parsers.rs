@@ -143,7 +143,7 @@ fn test_cargo_passthrough_preserves_raw_content() {
 
 #[test]
 fn test_vitest_tier1_json_pass() {
-    let fixture = include_str!("fixtures/vitest/vitest_pass.json");
+    let fixture = include_str!("fixtures/cmd/test/vitest_pass.json");
     skim_cmd()
         .args(["vitest"])
         .write_stdin(fixture)
@@ -155,7 +155,7 @@ fn test_vitest_tier1_json_pass() {
 
 #[test]
 fn test_vitest_tier1_json_fail_with_detail() {
-    let fixture = include_str!("fixtures/vitest/vitest_fail.json");
+    let fixture = include_str!("fixtures/cmd/test/vitest_fail.json");
     skim_cmd()
         .args(["vitest"])
         .write_stdin(fixture)
@@ -167,7 +167,7 @@ fn test_vitest_tier1_json_fail_with_detail() {
 
 #[test]
 fn test_vitest_tier1_pnpm_prefix() {
-    let fixture = include_str!("fixtures/vitest/vitest_pnpm_prefix.json");
+    let fixture = include_str!("fixtures/cmd/test/vitest_pnpm_prefix.json");
     skim_cmd()
         .args(["vitest"])
         .write_stdin(fixture)
@@ -325,7 +325,7 @@ fn test_vitest_passthrough_silent_without_debug() {
 /// that tells the user how to see full raw output).
 #[test]
 fn test_stderr_hint_on_compressed_failure() {
-    let fixture = include_str!("fixtures/vitest/vitest_fail.json");
+    let fixture = include_str!("fixtures/cmd/test/vitest_fail.json");
     skim_cmd()
         .args(["vitest"])
         .write_stdin(fixture)
@@ -338,7 +338,7 @@ fn test_stderr_hint_on_compressed_failure() {
 /// it does NOT contain `[skim]` (hint must only fire on non-zero exit codes).
 #[test]
 fn test_no_stderr_hint_on_success() {
-    let fixture = include_str!("fixtures/vitest/vitest_pass.json");
+    let fixture = include_str!("fixtures/cmd/test/vitest_pass.json");
     skim_cmd()
         .args(["vitest"])
         .write_stdin(fixture)
@@ -374,7 +374,7 @@ fn test_no_stderr_hint_on_passthrough() {
 /// not just the prefix.
 #[test]
 fn test_stderr_hint_contains_passthrough_instruction() {
-    let fixture = include_str!("fixtures/vitest/vitest_fail.json");
+    let fixture = include_str!("fixtures/cmd/test/vitest_fail.json");
     skim_cmd()
         .args(["vitest"])
         .write_stdin(fixture)
@@ -450,7 +450,7 @@ fn test_go_passthrough_exec_path_surfaces_install_hint() {
 /// needing to re-run with SKIM_PASSTHROUGH=1.
 #[test]
 fn test_vitest_failure_context_banner_present() {
-    let fixture = include_str!("fixtures/vitest/vitest_fail.json");
+    let fixture = include_str!("fixtures/cmd/test/vitest_fail.json");
     skim_cmd()
         .args(["vitest"])
         .write_stdin(fixture)

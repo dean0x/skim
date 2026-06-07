@@ -102,7 +102,7 @@ fn test_exit_code_cargo_passthrough_garbage() {
 
 #[test]
 fn test_exit_code_vitest_pass_json() {
-    let fixture = include_str!("fixtures/vitest/vitest_pass.json");
+    let fixture = include_str!("fixtures/cmd/test/vitest_pass.json");
     skim_cmd()
         .args(["vitest"])
         .write_stdin(fixture)
@@ -113,7 +113,7 @@ fn test_exit_code_vitest_pass_json() {
 #[test]
 fn test_exit_code_vitest_fail_json() {
     // Vitest infers exit code from parsed results (fail > 0 => FAILURE)
-    let fixture = include_str!("fixtures/vitest/vitest_fail.json");
+    let fixture = include_str!("fixtures/cmd/test/vitest_fail.json");
     skim_cmd()
         .args(["vitest"])
         .write_stdin(fixture)

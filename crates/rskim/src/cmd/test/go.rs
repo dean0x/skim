@@ -450,13 +450,7 @@ fn try_parse_regex(output: &str) -> Option<TestResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn read_fixture(name: &str) -> String {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let path = format!("{manifest_dir}/tests/fixtures/go_test/{name}");
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to read fixture {name}: {e}"))
-    }
+    use crate::cmd::test_utils::load_fixture;
 
     // ========================================================================
     // Tier 1: NDJSON tests
@@ -464,7 +458,7 @@ mod tests {
 
     #[test]
     fn test_tier1_all_pass() {
-        let input = read_fixture("go_test_pass.json");
+        let input = load_fixture("test", "go_test_pass.json");
         let result = parse(&input);
 
         assert!(
@@ -503,7 +497,7 @@ mod tests {
 
     #[test]
     fn test_tier1_with_failures() {
-        let input = read_fixture("go_test_fail.json");
+        let input = load_fixture("test", "go_test_fail.json");
         let result = parse(&input);
 
         assert!(
@@ -586,7 +580,7 @@ mod tests {
 
     #[test]
     fn test_tier2_regex_fallback() {
-        let input = read_fixture("go_test_text.txt");
+        let input = load_fixture("test", "go_test_text.txt");
         let result = parse(&input);
 
         assert!(
