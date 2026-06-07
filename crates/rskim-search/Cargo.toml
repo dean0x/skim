@@ -26,7 +26,7 @@ gix = { workspace = true }
 regex = { workspace = true }
 rusqlite = { workspace = true }
 rayon = { workspace = true }
-rustc-hash = "1.1.0"
+rustc-hash = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
@@ -41,7 +41,7 @@ name = "ast_index_bench"
 harness = false
 
 [[bench]]
-name = "ast_query"
+name = "ast_query_bench"
 harness = false
 
 [lints.clippy]

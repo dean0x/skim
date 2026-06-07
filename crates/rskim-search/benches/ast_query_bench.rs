@@ -1,6 +1,6 @@
 //! Criterion benchmarks for Wave 3f: AST Structural Pattern Query Engine.
 //!
-//! Run with: cargo bench -p rskim-search --bench ast_query
+//! Run with: cargo bench -p rskim-search --bench ast_query_bench
 //!
 //! Goal: `search_ast` over a 10k-file synthetic index < 100ms (C1).
 //!

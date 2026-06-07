@@ -56,6 +56,10 @@ memmap2 = "0.9"
 crc32fast = "1.4"
 insta = "1.39"
 criterion = "0.5"
+# Pinned to 1.x (not 2.x) to unify with tiktoken-rs's transitive rustc-hash ^1.1.0
+# requirement — bumping to 2.x would force two major versions into the binary for
+# a zero-functional-gain hasher swap.  Review when tiktoken-rs drops the 1.x pin.
+rustc-hash = "1"
 serial_test = "3.0"
 libc = "0.2"
 filetime = "0.2"
