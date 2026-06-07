@@ -820,6 +820,62 @@ fn perf_tripwire_10k_postings_under_1s() {
     );
 }
 
+// --- Gap-fix #6: duplicate query n-gram key must score exactly once ---
+
+#[test]
+fn gap6_duplicate_query_ngram_key_scores_once() {
+    // Construct an AstNgramSet with two AstBigramEntry items sharing the same key.
+    // run_ngram_set must dedup before lookup so the key is looked up once, not twice.
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let bigram = AstBigram::encode(fn_id, block_id);
+
+    // Build a source that returns a known posting for the bigram key.
+    let source = FakePostingSource::default()
+        .with_file(0, Language::Rust, 100)
+        .with_bigram(
+            bigram.key(),
+            vec![AstPosting {
+                doc_id: 0,
+                count: 2,
+            }],
+        )
+        .with_avg_node_count(100.0);
+
+    let engine = AstQueryEngine::new(source);
+
+    // Single-entry set → baseline score.
+    let single = AstQuery::Containment(make_bigram_set(bigram, 1));
+    let single_results = engine.search_ast(&single).unwrap();
+    assert_eq!(single_results.len(), 1);
+    let baseline_score = single_results[0].1;
+
+    // Duplicate-entry set (same key, same ngram, sorted): should produce same score.
+    let dup_set = AstNgramSet {
+        bigrams: vec![
+            AstBigramEntry {
+                ngram: bigram,
+                weight: DEFAULT_AST_WEIGHT,
+                count: 1,
+            },
+            AstBigramEntry {
+                ngram: bigram,
+                weight: DEFAULT_AST_WEIGHT,
+                count: 1,
+            },
+        ],
+        trigrams: vec![],
+    };
+    let dup_results = engine.search_ast(&AstQuery::Containment(dup_set)).unwrap();
+    assert_eq!(dup_results.len(), 1);
+    let dup_score = dup_results[0].1;
+
+    assert!(
+        (dup_score - baseline_score).abs() < 1e-12,
+        "duplicate key must score once: baseline={baseline_score}, dup={dup_score}"
+    );
+}
+
 // ============================================================================
 // GROUP 3: SearchLayer adapter — real AstIndexBuilder/AstIndexReader
 // ============================================================================

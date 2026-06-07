@@ -22,7 +22,6 @@ use crate::{
 };
 
 // BM25 constants
-
 /// BM25 saturation parameter k1 for AST structural scoring.
 pub const AST_BM25_K1: f64 = 1.2;
 /// BM25 length-normalisation parameter b for AST structural scoring.
@@ -31,7 +30,6 @@ pub const AST_BM25_B: f64 = 0.75;
 const MAX_AST_QUERY_BYTES: usize = 4096;
 
 // Query enum
-
 /// A parsed, validated AST structural query.
 ///
 /// Created exclusively via [`parse_ast_query`] — the only `String → AstQuery`
@@ -58,7 +56,6 @@ impl PartialEq for AstQuery {
 }
 
 // DI seam
-
 /// Dependency-injection seam: implemented by [`AstIndexReader`] and test fakes.
 pub trait AstPostingSource: Send + Sync {
     /// Look up postings for an [`AstBigram`]; `Ok(vec![])` when absent (C2).
@@ -92,7 +89,6 @@ impl AstPostingSource for AstIndexReader {
 }
 
 // Query engine
-
 /// AST structural pattern query engine. Immutable; `&self`-only; `Send + Sync`.
 ///
 /// Use [`AstQueryEngine::new`] for DI (tests, Wave 4) or
@@ -136,10 +132,23 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
         // Per-call meta cache: manual check-then-insert (or_insert_with can't propagate Result).
         let mut meta_cache: HashMap<u32, AstFileMetaEntry> = HashMap::new();
 
-        // AstNgramSet invariant: bigrams/trigrams are sorted-unique by key.
-        // debug_assert omitted here; enforced by the set construction site.
+        // Gap-fix #6: dedup by key (entries are sorted; O(n); prevents double-scoring dups).
+        let mut bigrams: Vec<&AstBigramEntry> = set.bigrams.iter().collect();
+        bigrams.dedup_by_key(|e| e.ngram.key());
+        debug_assert!({
+            bigrams
+                .windows(2)
+                .all(|w| w[0].ngram.key() != w[1].ngram.key())
+        });
+        let mut trigrams: Vec<&AstTrigramEntry> = set.trigrams.iter().collect();
+        trigrams.dedup_by_key(|e| e.ngram.key());
+        debug_assert!({
+            trigrams
+                .windows(2)
+                .all(|w| w[0].ngram.key() != w[1].ngram.key())
+        });
 
-        for entry in &set.bigrams {
+        for entry in bigrams {
             for posting in self.reader.lookup_bigram(entry.ngram)? {
                 let meta = cached_meta(&self.reader, &mut meta_cache, posting.doc_id)?;
                 // DEFERRED (Wave 4): minimal-covering-set to remove trigram/sub-bigram
@@ -149,7 +158,7 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
                 });
             }
         }
-        for entry in &set.trigrams {
+        for entry in trigrams {
             for posting in self.reader.lookup_trigram(entry.ngram)? {
                 let meta = cached_meta(&self.reader, &mut meta_cache, posting.doc_id)?;
                 // DEFERRED (Wave 4): minimal-covering-set to remove trigram/sub-bigram
@@ -183,7 +192,6 @@ impl AstQueryEngine<AstIndexReader> {
 }
 
 // SearchLayer adapter (Wave 3g)
-
 impl SearchLayer for AstQueryEngine<AstIndexReader> {
     /// `ast_pattern = None` → `Ok(vec![])` (Wave-4 no-op).
     /// `ast_pattern = Some("")` → `Err(InvalidQuery("empty AST query"))`.
@@ -220,7 +228,7 @@ impl SearchLayer for AstQueryEngine<AstIndexReader> {
             hits
         };
 
-        // Sort score-DESC, FileId-ASC tie-break (NaN-safe; mirrors lexical reader.rs ~406).
+        // Sort score-DESC, FileId-ASC tie-break (NaN-safe; mirrors index/reader.rs ~406).
         filtered.sort_unstable_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(Ordering::Equal)
@@ -248,7 +256,6 @@ impl SearchLayer for AstQueryEngine<AstIndexReader> {
 }
 
 // Parser
-
 /// Parse a raw string into an [`AstQuery`].
 ///
 /// **Only** `String → AstQuery` boundary; total (never panics). Rejects
@@ -349,7 +356,6 @@ fn kind(seg: &str) -> Result<NodeKindId> {
 }
 
 // Scoring helpers
-
 /// BM25 score contribution for one n-gram posting.
 ///
 /// IDF = 1.0 when `meta.language()` is `None` (unknown lang fallback).
