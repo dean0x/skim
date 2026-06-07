@@ -70,7 +70,7 @@ mod security;
 pub(crate) use security::{sanitize_for_display, scrub_db_args, scrub_infra_args};
 
 #[cfg(test)]
-pub(crate) mod test_support;
+pub(crate) mod test_utils;
 
 use std::io::{self, Read};
 use std::sync::LazyLock;

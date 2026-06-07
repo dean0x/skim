@@ -426,8 +426,7 @@ mod tests {
         // Build 200 suites each with one passing spec — well above MAX_ENTRIES.
         let spec = r#"{"title":"t","ok":true,"tests":[{"timeout":30000,"annotations":[],"expectedStatus":"passed","projectId":"chromium","results":[{"status":"expected","duration":10,"error":null}]}]}"#;
         let suite_body = format!(r#"{{"title":"s","file":"f.ts","suites":[],"specs":[{spec}]}}"#);
-        let suites_array = std::iter::repeat(suite_body.as_str())
-            .take(200)
+        let suites_array = std::iter::repeat_n(suite_body.as_str(), 200)
             .collect::<Vec<_>>()
             .join(",");
         let json = format!(

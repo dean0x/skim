@@ -567,7 +567,7 @@ fn try_parse_nslookup_regex(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture, make_output};
+    use crate::cmd::test_utils::{load_fixture, make_output};
 
     // ========================================================================
     // dig: Tier 1

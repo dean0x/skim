@@ -648,7 +648,7 @@ mod tests {
         // Churn = 1/1 = 1.0 → penalty 40, recency ≈ 0 (old), volatility = 0
         // penalty ≈ 40, score ≈ 60
         assert!(
-            score >= 50 && score <= 70,
+            (50..=70).contains(&score),
             "expected moderate score for max-churn but old file, got {score}"
         );
     }

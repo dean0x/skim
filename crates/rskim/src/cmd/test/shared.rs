@@ -570,7 +570,7 @@ pub(super) fn extract_json_object(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::make_output_full;
+    use crate::cmd::test_utils::make_output_full;
 
     // ========================================================================
     // resolve_exit_code tests

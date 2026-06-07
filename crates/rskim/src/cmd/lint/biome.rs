@@ -340,7 +340,7 @@ mod tests {
     use super::*;
 
     use crate::cmd::lint::load_lint_fixture as load_fixture;
-    use crate::cmd::test_support::{make_output, make_output_full};
+    use crate::cmd::test_utils::{make_output, make_output_full};
 
     /// biome_check_fail.json: generated from biome v1.7.0 on 2026-04-15.
     #[test]

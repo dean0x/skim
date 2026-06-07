@@ -291,6 +291,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn make_file(
         path: &str,
         stability: u8,

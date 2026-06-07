@@ -189,9 +189,7 @@ fn test_line_numbers_structure_mode_skips_body_lines() {
     let numbered: Vec<(usize, &str)> = stdout
         .lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(2, '\t');
-            let num_str = parts.next()?;
-            let content = parts.next()?;
+            let (num_str, content) = line.split_once('\t')?;
             let num: usize = num_str.parse().ok()?;
             Some((num, content))
         })
@@ -335,9 +333,7 @@ fn test_line_numbers_structure_mode_large_source_gap() {
     let numbered: Vec<(usize, &str)> = stdout
         .lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(2, '\t');
-            let num_str = parts.next()?;
-            let content = parts.next()?;
+            let (num_str, content) = line.split_once('\t')?;
             let num: usize = num_str.parse().ok()?;
             Some((num, content))
         })
@@ -442,10 +438,9 @@ fn test_line_numbers_signatures_mode_annotates_source_lines() {
             "Each output line should be tab-separated: {:?}",
             line
         );
-        let _num: usize = parts[0].parse().expect(&format!(
-            "Line number should parse as usize, got: {:?}",
-            parts[0]
-        ));
+        let _num: usize = parts[0]
+            .parse()
+            .unwrap_or_else(|_| panic!("Line number should parse as usize, got: {:?}", parts[0]));
     }
 }
 
@@ -489,10 +484,9 @@ fn test_line_numbers_types_mode_annotates_source_lines() {
             "Non-blank output line should be tab-separated: {:?}",
             line
         );
-        let _num: usize = parts[0].parse().expect(&format!(
-            "Line number should parse as usize, got: {:?}",
-            parts[0]
-        ));
+        let _num: usize = parts[0]
+            .parse()
+            .unwrap_or_else(|_| panic!("Line number should parse as usize, got: {:?}", parts[0]));
         annotated_count += 1;
     }
     assert!(
@@ -534,7 +528,7 @@ fn test_line_numbers_with_max_lines_omission_markers_no_prefix() {
         if line.contains("/* ... */") || line.contains("// ...") || line.contains("# ...") {
             let trimmed = line.trim_start();
             assert!(
-                !trimmed.chars().next().map_or(false, |c| c.is_ascii_digit()),
+                !trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()),
                 "Omission markers should not have line number prefix: {:?}",
                 line
             );
@@ -713,7 +707,7 @@ fn test_line_numbers_multifile_headers_no_prefix() {
     for line in stdout.lines() {
         if line.contains("==>") || line.contains("<==") {
             // Header line — should not start with a digit (line number)
-            let starts_with_digit = line.chars().next().map_or(false, |c| c.is_ascii_digit());
+            let starts_with_digit = line.chars().next().is_some_and(|c| c.is_ascii_digit());
             assert!(
                 !starts_with_digit,
                 "File headers should not have line number prefix: {:?}",
@@ -1004,9 +998,7 @@ fn test_line_numbers_pseudo_python_def_signatures_get_prefix() {
 
     // Helper: parse `{num}\t{content}` → Some((num, content_string)), or None.
     let parse_annotated = |s: &str| -> Option<(usize, String)> {
-        let mut parts = s.splitn(2, '\t');
-        let num_str = parts.next()?;
-        let content = parts.next()?;
+        let (num_str, content) = s.split_once('\t')?;
         Some((num_str.parse::<usize>().ok()?, content.to_owned()))
     };
 
@@ -1081,13 +1073,9 @@ fn test_line_numbers_minimal_mode_gaps() {
     let annotated: Vec<(usize, &str)> = lines
         .iter()
         .filter_map(|l| {
-            let parts: Vec<&str> = l.splitn(2, '\t').collect();
-            if parts.len() == 2 {
-                if let Ok(num) = parts[0].parse::<usize>() {
-                    return Some((num, parts[1]));
-                }
-            }
-            None
+            let (num_str, content) = l.split_once('\t')?;
+            let num = num_str.parse::<usize>().ok()?;
+            Some((num, content))
         })
         .collect();
 
@@ -1177,13 +1165,9 @@ fn test_line_numbers_last_lines_correct_source_numbers() {
     let content_lines: Vec<(usize, &str)> = lines
         .iter()
         .filter_map(|l| {
-            let parts: Vec<&str> = l.splitn(2, '\t').collect();
-            if parts.len() == 2 {
-                if let Ok(num) = parts[0].parse::<usize>() {
-                    return Some((num, parts[1]));
-                }
-            }
-            None
+            let (num_str, content) = l.split_once('\t')?;
+            let num = num_str.parse::<usize>().ok()?;
+            Some((num, content))
         })
         .collect();
 
