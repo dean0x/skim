@@ -28,7 +28,8 @@ pub const AST_BM25_K1: f64 = 1.2;
 /// BM25 length-normalisation parameter b for AST structural scoring.
 pub const AST_BM25_B: f64 = 0.75;
 /// Maximum allowed byte length for a raw query string (reliability bound).
-const MAX_AST_QUERY_BYTES: usize = 4096;
+/// Aliased from [`crate::lexical::MAX_QUERY_BYTES`] so both layers share one source of truth.
+const MAX_AST_QUERY_BYTES: usize = crate::lexical::MAX_QUERY_BYTES;
 
 /// Shared error message for empty query strings — used in both `SearchLayer::search`
 /// and `parse_ast_query` so the two sites cannot silently drift.
@@ -73,6 +74,11 @@ impl PartialEq for AstQuery {
 /// value. `node_count` values in `AstFileMetaEntry` MUST be non-negative.
 /// The production reader validates these at header/entry decode time; custom
 /// implementations must uphold the same contract.
+///
+/// **Count contract (C4).** `count` in every returned [`AstPosting`] MUST be
+/// `>= 1`. Sources returning `count == 0` break the all-scores-positive
+/// invariant (`count >= 1 → tf > 0 → score > 0`) relied on by BM25 and the
+/// `debug_assert!` in [`AstQueryEngine::run_ngram_set`].
 pub trait AstPostingSource: Send + Sync {
     /// Look up postings for an [`AstBigram`]; `Ok(vec![])` when absent (C2).
     fn lookup_bigram(&self, b: AstBigram) -> Result<Vec<AstPosting>>;
@@ -233,7 +239,23 @@ impl SearchLayer for AstQueryEngine<AstIndexReader> {
     /// `ast_pattern = Some(s)` → parse + execute; apply filters; return score-DESC results.
     /// Filters (in order): `file_filter` allowlist, `lang`, `offset`/`limit`.
     /// Defaults: `offset` → 0, `limit` → 20 (results truncated when unset).
+    ///
+    /// `bm25f_config` is intentionally ignored: the AST layer uses its own BM25
+    /// parameterisation ([`AST_BM25_K1`] / [`AST_BM25_B`]) and the lexical BM25F
+    /// config has no meaning here.
+    ///
+    /// # Errors
+    /// Returns [`SearchError::InvalidQuery`] when `temporal_flags` is set —
+    /// temporal sorting is not yet supported on the AST layer (deferred to Wave 4).
     fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>> {
+        if query.temporal_flags.is_some() {
+            return Err(SearchError::InvalidQuery(
+                "temporal sorting (--hot / --cold / --risky) is not yet supported on the AST \
+                 layer; omit temporal flags or use the lexical search layer"
+                    .into(),
+            ));
+        }
+
         let raw = match &query.ast_pattern {
             None => return Ok(vec![]),
             Some(s) => s,
@@ -362,6 +384,7 @@ fn parse_bigram(a: &str, b: &str) -> Result<AstQuery> {
     Ok(AstQuery::Containment(AstNgramSet {
         bigrams: vec![AstBigramEntry {
             ngram: bigram,
+            // weight/count unused on query path; meaningful only at index build.
             weight: DEFAULT_AST_WEIGHT,
             count: 1,
         }],
@@ -375,6 +398,7 @@ fn parse_trigram(a: &str, b: &str, c: &str) -> Result<AstQuery> {
         bigrams: vec![],
         trigrams: vec![AstTrigramEntry {
             ngram: trigram,
+            // weight/count unused on query path; meaningful only at index build.
             weight: DEFAULT_AST_WEIGHT,
             count: 1,
         }],
@@ -390,6 +414,10 @@ fn kind(seg: &str) -> Result<NodeKindId> {
         ))
     })
 }
+
+/// IDF fallback for files whose language byte is unrecognised (neutral weight —
+/// does not amplify or suppress the BM25 term-frequency contribution).
+const UNKNOWN_LANG_IDF: f64 = 1.0;
 
 // Scoring helpers
 
@@ -412,7 +440,7 @@ fn score_postings<R: AstPostingSource>(
     // Per-n-gram IDF memoization: at most one distinct value per language.
     // Avoid HashMap overhead — track only the last seen (lang, idf) pair.
     let mut last_lang: Option<Language> = None;
-    let mut last_idf: f64 = 1.0;
+    let mut last_idf: f64 = UNKNOWN_LANG_IDF;
 
     for posting in postings {
         let meta = match meta_cache {
@@ -430,7 +458,7 @@ fn score_postings<R: AstPostingSource>(
                     v
                 }
             }
-            None => 1.0,
+            None => UNKNOWN_LANG_IDF,
         };
         *scores.entry(posting.doc_id).or_insert(0.0) += bm25_with_idf(posting, &meta, avg, idf);
     }
@@ -446,6 +474,10 @@ fn bm25_with_idf(posting: &AstPosting, meta: &AstFileMetaEntry, avg: f64, idf: f
     debug_assert!(
         avg.is_finite(),
         "avg_node_count must be finite (AstPostingSource contract)"
+    );
+    debug_assert!(
+        idf.is_finite() && idf > 0.0,
+        "idf must be finite and positive (language IDF contract)"
     );
     // Release-safe fallback: treat non-finite avg as 0 → length_norm=1.0.
     let avg = if avg.is_finite() { avg } else { 0.0 };
