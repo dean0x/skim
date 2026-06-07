@@ -291,9 +291,8 @@ mod tests {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn make_file(
-        path: &str,
+    struct FileSpec<'a> {
+        path: &'a str,
         stability: u8,
         combined_pct: f64,
         insufficient_data: bool,
@@ -301,26 +300,43 @@ mod tests {
         top_author_pct: f64,
         author_count: usize,
         blast_radius: Vec<CouplingEntry>,
-    ) -> FileMetrics {
+    }
+
+    impl Default for FileSpec<'_> {
+        fn default() -> Self {
+            Self {
+                path: "",
+                stability: 0,
+                combined_pct: 0.0,
+                insufficient_data: true,
+                single_owner_risk: false,
+                top_author_pct: 50.0,
+                author_count: 2,
+                blast_radius: vec![],
+            }
+        }
+    }
+
+    fn make_file(spec: FileSpec<'_>) -> FileMetrics {
         FileMetrics {
-            path: path.to_string(),
+            path: spec.path.to_string(),
             churn: ChurnMetrics {
                 commits: 5,
                 rate: 0.1,
             },
-            stability_score: stability,
+            stability_score: spec.stability,
             authors: AuthorMetrics {
-                count: author_count,
-                top_author_pct,
-                single_owner_risk,
+                count: spec.author_count,
+                top_author_pct: spec.top_author_pct,
+                single_owner_risk: spec.single_owner_risk,
             },
             fix_risk: FixRiskMetrics {
-                keyword_pct: combined_pct / 2.0,
-                proximity_pct: combined_pct / 2.0,
-                combined_pct,
-                insufficient_data,
+                keyword_pct: spec.combined_pct / 2.0,
+                proximity_pct: spec.combined_pct / 2.0,
+                combined_pct: spec.combined_pct,
+                insufficient_data: spec.insufficient_data,
             },
-            blast_radius,
+            blast_radius: spec.blast_radius,
         }
     }
 
@@ -348,9 +364,11 @@ mod tests {
     #[test]
     fn test_stability_critical_threshold() {
         let mut result = make_empty_result();
-        result
-            .files
-            .push(make_file("a.rs", 39, 0.0, true, false, 50.0, 2, vec![]));
+        result.files.push(make_file(FileSpec {
+            path: "a.rs",
+            stability: 39,
+            ..Default::default()
+        }));
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Critical);
@@ -371,9 +389,11 @@ mod tests {
     #[test]
     fn test_stability_warning_threshold() {
         let mut result = make_empty_result();
-        result
-            .files
-            .push(make_file("a.rs", 55, 0.0, true, false, 50.0, 2, vec![]));
+        result.files.push(make_file(FileSpec {
+            path: "a.rs",
+            stability: 55,
+            ..Default::default()
+        }));
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Warning);
@@ -384,9 +404,11 @@ mod tests {
     #[test]
     fn test_stability_above_threshold() {
         let mut result = make_empty_result();
-        result
-            .files
-            .push(make_file("a.rs", 70, 0.0, true, false, 50.0, 2, vec![]));
+        result.files.push(make_file(FileSpec {
+            path: "a.rs",
+            stability: 70,
+            ..Default::default()
+        }));
         let insights = compute_insights(&result);
         // stability=70 is AT the warning threshold, not below — no insight
         assert!(insights.is_empty(), "score=70 should yield no insight");
@@ -399,9 +421,13 @@ mod tests {
     #[test]
     fn test_fix_risk_critical() {
         let mut result = make_empty_result();
-        result
-            .files
-            .push(make_file("b.rs", 80, 50.1, false, false, 50.0, 2, vec![]));
+        result.files.push(make_file(FileSpec {
+            path: "b.rs",
+            stability: 80,
+            combined_pct: 50.1,
+            insufficient_data: false,
+            ..Default::default()
+        }));
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Critical);
@@ -412,9 +438,13 @@ mod tests {
     #[test]
     fn test_fix_risk_warning() {
         let mut result = make_empty_result();
-        result
-            .files
-            .push(make_file("b.rs", 80, 35.0, false, false, 50.0, 2, vec![]));
+        result.files.push(make_file(FileSpec {
+            path: "b.rs",
+            stability: 80,
+            combined_pct: 35.0,
+            insufficient_data: false,
+            ..Default::default()
+        }));
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Warning);
@@ -425,9 +455,13 @@ mod tests {
     #[test]
     fn test_fix_risk_below_threshold() {
         let mut result = make_empty_result();
-        result
-            .files
-            .push(make_file("b.rs", 80, 30.0, false, false, 50.0, 2, vec![]));
+        result.files.push(make_file(FileSpec {
+            path: "b.rs",
+            stability: 80,
+            combined_pct: 30.0,
+            insufficient_data: false,
+            ..Default::default()
+        }));
         let insights = compute_insights(&result);
         // combined_pct=30.0 is AT the warning threshold, not above — no insight
         assert!(insights.is_empty(), "combined=30% should yield no insight");
@@ -436,9 +470,12 @@ mod tests {
     #[test]
     fn test_fix_risk_insufficient_data_skipped() {
         let mut result = make_empty_result();
-        result
-            .files
-            .push(make_file("b.rs", 80, 80.0, true, false, 50.0, 2, vec![]));
+        result.files.push(make_file(FileSpec {
+            path: "b.rs",
+            stability: 80,
+            combined_pct: 80.0,
+            ..Default::default() // insufficient_data defaults to true — skip fix-risk
+        }));
         let insights = compute_insights(&result);
         assert!(
             insights.is_empty(),
@@ -453,9 +490,14 @@ mod tests {
     #[test]
     fn test_bus_factor_warning() {
         let mut result = make_empty_result();
-        result
-            .files
-            .push(make_file("c.rs", 80, 0.0, true, true, 90.0, 1, vec![]));
+        result.files.push(make_file(FileSpec {
+            path: "c.rs",
+            stability: 80,
+            single_owner_risk: true,
+            top_author_pct: 90.0,
+            author_count: 1,
+            ..Default::default()
+        }));
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Warning);
@@ -466,9 +508,13 @@ mod tests {
     #[test]
     fn test_bus_factor_no_risk() {
         let mut result = make_empty_result();
-        result
-            .files
-            .push(make_file("c.rs", 80, 0.0, true, false, 60.0, 3, vec![]));
+        result.files.push(make_file(FileSpec {
+            path: "c.rs",
+            stability: 80,
+            top_author_pct: 60.0,
+            author_count: 3,
+            ..Default::default()
+        }));
         let insights = compute_insights(&result);
         assert!(insights.is_empty(), "no bus-factor risk when false");
     }
@@ -518,20 +564,16 @@ mod tests {
     #[test]
     fn test_coupling_warning() {
         let mut result = make_empty_result();
-        result.files.push(make_file(
-            "a.rs",
-            80,
-            0.0,
-            true,
-            false,
-            50.0,
-            2,
-            vec![CouplingEntry {
+        result.files.push(make_file(FileSpec {
+            path: "a.rs",
+            stability: 80,
+            blast_radius: vec![CouplingEntry {
                 path: "b.rs".to_string(),
                 confidence: 0.85,
                 support: 5,
             }],
-        ));
+            ..Default::default()
+        }));
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Warning);
@@ -542,20 +584,16 @@ mod tests {
     #[test]
     fn test_coupling_below_threshold() {
         let mut result = make_empty_result();
-        result.files.push(make_file(
-            "a.rs",
-            80,
-            0.0,
-            true,
-            false,
-            50.0,
-            2,
-            vec![CouplingEntry {
+        result.files.push(make_file(FileSpec {
+            path: "a.rs",
+            stability: 80,
+            blast_radius: vec![CouplingEntry {
                 path: "b.rs".to_string(),
                 confidence: 0.80,
                 support: 5,
             }],
-        ));
+            ..Default::default()
+        }));
         let insights = compute_insights(&result);
         // confidence=0.80 is AT the threshold (not strictly above) — no insight
         assert!(
@@ -572,12 +610,16 @@ mod tests {
     fn test_sorted_critical_first() {
         let mut result = make_empty_result();
         // Warning first in data
-        result
-            .files
-            .push(make_file("a.rs", 55, 0.0, true, false, 50.0, 2, vec![])); // warning
-        result
-            .files
-            .push(make_file("b.rs", 39, 0.0, true, false, 50.0, 2, vec![])); // critical
+        result.files.push(make_file(FileSpec {
+            path: "a.rs",
+            stability: 55,
+            ..Default::default()
+        })); // warning
+        result.files.push(make_file(FileSpec {
+            path: "b.rs",
+            stability: 39,
+            ..Default::default()
+        })); // critical
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 2);
         assert_eq!(
@@ -596,12 +638,16 @@ mod tests {
     fn test_sorted_by_metric_within_severity() {
         let mut result = make_empty_result();
         // Two criticals: score 39 and score 20 (20 is worse)
-        result
-            .files
-            .push(make_file("a.rs", 39, 0.0, true, false, 50.0, 2, vec![]));
-        result
-            .files
-            .push(make_file("b.rs", 20, 0.0, true, false, 50.0, 2, vec![]));
+        result.files.push(make_file(FileSpec {
+            path: "a.rs",
+            stability: 39,
+            ..Default::default()
+        }));
+        result.files.push(make_file(FileSpec {
+            path: "b.rs",
+            stability: 20,
+            ..Default::default()
+        }));
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 2);
         // b.rs (score 20) is worse, should appear first
@@ -621,9 +667,13 @@ mod tests {
     fn test_multiple_categories_same_file() {
         let mut result = make_empty_result();
         // stability critical + fix_risk critical
-        result
-            .files
-            .push(make_file("a.rs", 39, 55.0, false, false, 50.0, 2, vec![]));
+        result.files.push(make_file(FileSpec {
+            path: "a.rs",
+            stability: 39,
+            combined_pct: 55.0,
+            insufficient_data: false,
+            ..Default::default()
+        }));
         let insights = compute_insights(&result);
         assert!(
             insights.len() >= 2,
@@ -642,26 +692,16 @@ mod tests {
     fn test_build_compact_files_only_flagged() {
         let mut result = make_empty_result();
         // a.rs triggers a stability insight; b.rs is clean
-        result.files.push(make_file(
-            "src/main.rs",
-            39,
-            0.0,
-            true,
-            false,
-            50.0,
-            2,
-            vec![],
-        ));
-        result.files.push(make_file(
-            "src/clean.rs",
-            80,
-            0.0,
-            true,
-            false,
-            50.0,
-            2,
-            vec![],
-        ));
+        result.files.push(make_file(FileSpec {
+            path: "src/main.rs",
+            stability: 39,
+            ..Default::default()
+        }));
+        result.files.push(make_file(FileSpec {
+            path: "src/clean.rs",
+            stability: 80,
+            ..Default::default()
+        }));
         let insights = compute_insights(&result);
         let compact = build_compact_files(&result, &insights);
         // Only src/main.rs has an insight; src/clean.rs must be excluded
@@ -672,16 +712,16 @@ mod tests {
     #[test]
     fn test_build_compact_files_fields() {
         let mut result = make_empty_result();
-        result.files.push(make_file(
-            "src/main.rs",
-            39,
-            25.0,
-            false,
-            true,
-            90.0,
-            1,
-            vec![],
-        ));
+        result.files.push(make_file(FileSpec {
+            path: "src/main.rs",
+            stability: 39,
+            combined_pct: 25.0,
+            insufficient_data: false,
+            single_owner_risk: true,
+            top_author_pct: 90.0,
+            author_count: 1,
+            blast_radius: vec![],
+        }));
         let insights = compute_insights(&result);
         let compact = build_compact_files(&result, &insights);
         assert_eq!(compact.len(), 1);
@@ -696,16 +736,11 @@ mod tests {
     fn test_build_compact_files_empty_insights() {
         let mut result = make_empty_result();
         // All clean files — no insights → top_files must be empty
-        result.files.push(make_file(
-            "src/clean.rs",
-            80,
-            0.0,
-            true,
-            false,
-            50.0,
-            2,
-            vec![],
-        ));
+        result.files.push(make_file(FileSpec {
+            path: "src/clean.rs",
+            stability: 80,
+            ..Default::default()
+        }));
         let insights = compute_insights(&result);
         assert!(insights.is_empty());
         let compact = build_compact_files(&result, &insights);
@@ -736,9 +771,11 @@ mod tests {
     #[test]
     fn test_build_insights_result_structure() {
         let mut result = make_empty_result();
-        result
-            .files
-            .push(make_file("a.rs", 39, 0.0, true, false, 50.0, 2, vec![]));
+        result.files.push(make_file(FileSpec {
+            path: "a.rs",
+            stability: 39,
+            ..Default::default()
+        }));
         result.modules.push(make_module("src/", 50.0));
 
         let insights = compute_insights(&result);

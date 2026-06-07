@@ -805,12 +805,11 @@ fn emit_result(result: &ParseResult<LogResult>, flags: &LogFlags) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::test_utils::load_fixture;
 
     fn make_flags() -> LogFlags {
         LogFlags::default()
     }
-
-    use crate::cmd::test_utils::load_fixture;
 
     // ============================================================================
     // Tier detection tests

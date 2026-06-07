@@ -58,9 +58,19 @@ pub(crate) fn make_output_stderr(stderr: &str) -> CommandOutput {
 
 /// Load a test fixture from `tests/fixtures/cmd/{subdir}/{name}`.
 ///
-/// Panics with a clear message if the fixture file cannot be read,
-/// so test failures surface the missing-file path immediately.
+/// Both `subdir` and `name` must be single path components — no `/`, `\`,
+/// or `..` are allowed. This prevents directory traversal from reaching
+/// files outside the fixtures tree. Panics with a clear message if the
+/// arguments are invalid or if the fixture file cannot be read, so test
+/// failures surface the problem immediately.
 pub(crate) fn load_fixture(subdir: &str, name: &str) -> String {
+    assert!(
+        !subdir.contains(['/', '\\'])
+            && subdir != ".."
+            && !name.contains(['/', '\\'])
+            && name != "..",
+        "load_fixture: subdir/name must be a single path component, got subdir={subdir:?} name={name:?}"
+    );
     let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("tests/fixtures/cmd");
     path.push(subdir);
