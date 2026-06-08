@@ -98,11 +98,10 @@ pub(crate) fn run(
         SearchAction::Query(ref text) if !text.is_empty() => run_query(text, &flags, analytics),
         // Empty query + --ast only → standalone AST dispatch.
         SearchAction::Query(_)
-            if flags.ast.is_some()
+            if let Some(ref raw) = flags.ast
                 && flags.temporal_sort.is_none()
                 && flags.blast_radius.is_none() =>
         {
-            let raw = flags.ast.as_deref().unwrap();
             let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
             std::fs::create_dir_all(&cache_dir)?;
             // Ensure both indexes are fresh before querying.
@@ -565,35 +564,30 @@ fn run_query(
     // Resolve AST file filter (#199): open the AST engine, execute the
     // structural query, collect matching FileIds.  Applied at the FileId level
     // inside execute_query (no path round-trip).
+    //
+    // Missing index → fail loud (return Err, #199).
+    // Query execution failure → degrade gracefully (warn, no AST filter).
     let ast_file_ids = if let Some(ref raw_ast) = flags.ast {
-        // ensure_indexes_fresh already ran in the dispatch arm above via
-        // auto_refresh_if_stale; here we just open the engine.
-        match ast::open_ast_engine(&cache_dir) {
-            Ok(engine) => {
-                match ast::resolve_ast_file_filter(&engine, raw_ast, None) {
-                    Ok(ids) => {
-                        if ids.is_empty() {
-                            eprintln!("skim search: --ast {:?} matched no indexed files", raw_ast);
-                        }
-                        Some(ids)
-                    }
-                    Err(e) => {
-                        // AST query failure: degrade gracefully (warn, no AST filter).
-                        if flags.json {
-                            let w = WarningJson {
-                                warning: &format!("AST query failed: {e}"),
-                            };
-                            println!("{}", serde_json::to_string(&w)?);
-                        } else {
-                            eprintln!("skim search: AST query warning: {e}");
-                        }
-                        None
-                    }
+        // auto_refresh_if_stale ran above; open the already-built engine.
+        let engine = ast::open_ast_engine(&cache_dir)?;
+        match ast::resolve_ast_file_filter(&engine, raw_ast, None) {
+            Ok(ids) => {
+                if ids.is_empty() {
+                    eprintln!("skim search: --ast {:?} matched no indexed files", raw_ast);
                 }
+                Some(ids)
             }
             Err(e) => {
-                // Missing AST index when --ast was specified: fail loud (#199).
-                return Err(e);
+                // Query execution failure: degrade gracefully (warn, no AST filter).
+                if flags.json {
+                    let w = WarningJson {
+                        warning: &format!("AST query failed: {e}"),
+                    };
+                    println!("{}", serde_json::to_string(&w)?);
+                } else {
+                    eprintln!("skim search: AST query warning: {e}");
+                }
+                None
             }
         }
     } else {

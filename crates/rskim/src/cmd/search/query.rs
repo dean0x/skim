@@ -79,7 +79,12 @@ pub(super) fn execute_query(
             let mut file_ids = std::collections::HashSet::new();
             for (idx, path) in sorted.iter().enumerate() {
                 if allowed_paths.contains(*path) {
-                    file_ids.insert(rskim_search::FileId(idx as u32));
+                    // PF-004: widen idx (usize) to u32 before constructing FileId.
+                    // The file cap (50 000) guarantees no overflow, but `try_from`
+                    // makes the widening explicit and safe by construction.
+                    if let Ok(id) = u32::try_from(idx) {
+                        file_ids.insert(rskim_search::FileId(id));
+                    }
                 }
             }
             if file_ids.is_empty() {

@@ -290,7 +290,7 @@ impl<'cfg> Pipeline<'cfg> {
             &mut new_manifest,
             rx,
             debug_enabled,
-        );
+        )?;
 
         // Wait for the producer to finish and propagate any panic.
         producer_handle.join().map_err(|e| {
@@ -394,11 +394,23 @@ impl<'cfg> Pipeline<'cfg> {
     /// Stage 3: consume [`ProcessedFile`]s from `rx`, index each one in BOTH
     /// the lexical and AST indexes, and build the new manifest.
     ///
-    /// Returns aggregated counts. Errors on individual files are fail-soft: the
-    /// file is skipped and indexing continues. On `FileId` overflow the loop
-    /// breaks early and the partial result is returned — the caller's
-    /// `builder.build()` + `ast_builder.build()` + `new_manifest.save()` still
-    /// execute, preserving the fail-soft contract.
+    /// Returns aggregated counts. Per-file *lexical* errors are fail-soft: the
+    /// file is skipped from BOTH indexes and indexing continues. On `FileId`
+    /// overflow the loop breaks early and the partial result is returned — the
+    /// caller's `builder.build()` + `ast_builder.build()` + `new_manifest.save()`
+    /// still execute, preserving the fail-soft contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` only when `add_file_ngrams` rejects an AST entry *after* the
+    /// lexical entry for the same `FileId` was already accepted. That can only
+    /// happen if the FileId-alignment invariant is already broken (e.g. a future
+    /// regression in `extract_ast_ngrams` emitting a zero-count n-gram), at which
+    /// point the two indexes are unrecoverably desynced. Aborting here propagates
+    /// up through `run()` so `new_manifest.save()` is NEVER reached — the old
+    /// manifest survives and the next query self-heals via a full rebuild. We do
+    /// NOT silently `continue`, which would advance `next_file_id` and cascade the
+    /// desync into a CRC-valid but corrupt index that gets committed.
     ///
     /// # FileId Invariants
     ///
@@ -415,7 +427,7 @@ impl<'cfg> Pipeline<'cfg> {
         new_manifest: &mut FileManifest,
         rx: crossbeam_channel::Receiver<ProcessedFile>,
         debug_enabled: bool,
-    ) -> ConsumeResult {
+    ) -> anyhow::Result<ConsumeResult> {
         let mut next_file_id: u32 = 0;
         let mut cache_hits: u32 = 0;
 
@@ -471,21 +483,28 @@ impl<'cfg> Pipeline<'cfg> {
                     }
                 };
 
-            // Add the AST entry for this file. On error, log and continue — the
-            // lexical entry was already added; both indexes share the same FileId.
+            // Add the AST entry for this file. The lexical entry for the SAME
+            // FileId was already accepted, so an error here means the indexes are
+            // now desynced for `next_file_id`. This is unrecoverable: abort the
+            // whole build (propagates to run() BEFORE new_manifest.save()), so the
+            // old manifest survives and the next query self-heals via a full
+            // rebuild. Silently continuing would advance next_file_id and cascade
+            // the desync into a committed-but-corrupt index. See the FileId-
+            // alignment invariant in the function doc.
             if let Err(e) = ast_builder.add_file_ngrams(
                 FileId(next_file_id),
                 pf.lang,
                 &ast_set,
                 ast_node_count,
                 ast_metrics,
-            ) && debug_enabled
-            {
-                eprintln!(
-                    "skim search index [debug]: add_file_ngrams failed for {:?}: {e}",
-                    pf.rel_path
-                );
-                // Continue — lexical entry is already written; best-effort AST.
+            ) {
+                return Err(anyhow::anyhow!(
+                    "AST index desync: add_file_ngrams failed for {:?} at FileId {}: {e} \
+                     (lexical entry already written; aborting build so the manifest is \
+                     not saved and the next query rebuilds from scratch)",
+                    pf.rel_path,
+                    next_file_id
+                ));
             }
 
             // Success: advance counter.
@@ -517,10 +536,10 @@ impl<'cfg> Pipeline<'cfg> {
             // `pf.content` dropped here — memory released immediately.
         }
 
-        ConsumeResult {
+        Ok(ConsumeResult {
             file_count: next_file_id,
             cache_hits,
-        }
+        })
     }
 }
 
