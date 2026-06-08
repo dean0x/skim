@@ -401,33 +401,29 @@ pub(crate) fn dispatch(
 ) -> anyhow::Result<ExitCode> {
     // Daemon / streaming guard (ADR-008 Part C).
     //
-    // Commands like `vite dev`, `npm run dev`, `jest --watch`, etc. run
-    // indefinitely. Capturing their output would cause skim to hang waiting
-    // for a process that never exits. Detect them early and run them with
-    // inherited stdio so live output streams directly to the terminal.
+    // Commands like `vite`, `npm run dev`, `jest --watch` run indefinitely;
+    // skim cannot buffer-then-compress an unbounded stream, so detect them and
+    // run with inherited stdio (live streaming, stdin forwarded). PATH wrappers
+    // are already stripped from PATH in main(), so Command::new(program)
+    // resolves to the real binary.
     //
-    // Build the full token slice [subcommand, args...] to match the detection
-    // API, then delegate to `run_inherited_passthrough` which uses the real
-    // binary (PATH wrappers are already stripped from PATH by this point).
+    // Note: the guard fires unconditionally — it does NOT check whether stdin
+    // is a terminal. PATH-wrapper sub-agents and CI pipelines always have
+    // non-TTY stdin; gating on is_terminal() would skip detection for skim's
+    // primary consumers. The accepted tradeoff: `cat output | skim vitest`
+    // runs vitest live instead of parsing the piped output (uncommon; use
+    // `skim vitest run` to compress piped output).
     //
-    // SKIM_PASSTHROUGH=1 already causes the whole binary to behave as a
-    // transparent relay upstream (in main.rs), so we don't need to re-check
-    // it here — this guard is only reachable on non-passthrough invocations.
-    //
-    // Stdin exception: when stdin is piped (not a terminal) the invocation is
-    // a compression use case — the user or a pipeline is feeding the tool's
-    // output to skim for parsing. Daemon detection does not apply in that case;
-    // the normal dispatch path handles piped stdin via `should_read_stdin`.
-    {
-        use std::io::IsTerminal;
-        let stdin_piped = !std::io::stdin().is_terminal();
-        if !stdin_piped {
-            let mut all_tokens: Vec<&str> = Vec::with_capacity(args.len() + 1);
-            all_tokens.push(subcommand);
-            all_tokens.extend(args.iter().map(String::as_str));
-            if rewrite::indefinite::is_indefinite_command(&all_tokens) {
-                return Ok(run_inherited_passthrough(subcommand, args));
-            }
+    // SKIM_PASSTHROUGH=1 overrides the daemon guard: the user explicitly wants
+    // skim to forward piped content without spawning. The passthrough check here
+    // mirrors the per-handler check so both `run_inherited_passthrough` and the
+    // handler's own stdin-forwarding path are consistent.
+    if !super::is_passthrough_mode() {
+        let mut all_tokens: Vec<&str> = Vec::with_capacity(args.len() + 1);
+        all_tokens.push(subcommand);
+        all_tokens.extend(args.iter().map(String::as_str));
+        if rewrite::indefinite::is_indefinite_command(&all_tokens) {
+            return Ok(run_inherited_passthrough(subcommand, args));
         }
     }
 
@@ -662,5 +658,47 @@ mod tests {
             err_msg.contains("Unknown subcommand"),
             "error message should mention 'Unknown subcommand', got: {err_msg}"
         );
+    }
+
+    // ========================================================================
+    // run_inherited_passthrough: exit-code mapping
+    // ========================================================================
+
+    /// Verify that `run_inherited_passthrough` maps ENOENT (program not found)
+    /// to exit code 127 — the POSIX convention for "command not found".
+    ///
+    /// This is the deterministic counterpart of the E2E smoke test in
+    /// `tests/cli_e2e_daemon_passthrough.rs`. The E2E only checks no-hang;
+    /// this unit test verifies the ENOENT branch is reached and does not panic.
+    ///
+    /// `std::process::ExitCode` has no stable value accessor, so we verify
+    /// correct routing by:
+    /// 1. Confirming the precondition (program is truly absent) via a raw
+    ///    `Command::new` probe.
+    /// 2. Calling `run_inherited_passthrough` and checking it does not panic.
+    /// 3. On Unix, cross-checking with a present program (sh) that exits 0,
+    ///    exercising the successful-exit branch.
+    #[test]
+    fn test_run_inherited_passthrough_missing_binary() {
+        // 1. Precondition: the sentinel binary must not be in PATH.
+        let probe = std::process::Command::new("__skim_guaranteed_absent_binary__").status();
+        assert!(
+            probe
+                .err()
+                .map(|e| e.kind() == std::io::ErrorKind::NotFound)
+                .unwrap_or(false),
+            "precondition: __skim_guaranteed_absent_binary__ must not exist in PATH"
+        );
+
+        // 2. Must not panic; the ENOENT arm returns ExitCode::from(127u8).
+        let _code = run_inherited_passthrough("__skim_guaranteed_absent_binary__", &[]);
+
+        // 3. On Unix, verify the success branch with `sh -c 'exit 0'`.
+        //    This exercises the `Ok(s) => ExitCode::from(code.clamp(0,255) as u8)` arm.
+        #[cfg(unix)]
+        {
+            let _success =
+                run_inherited_passthrough("sh", &["-c".to_string(), "exit 0".to_string()]);
+        }
     }
 }

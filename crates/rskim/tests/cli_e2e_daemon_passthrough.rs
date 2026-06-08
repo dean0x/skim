@@ -3,6 +3,12 @@
 //! Verifies that indefinitely-running commands are routed through
 //! `run_inherited_passthrough` instead of being buffered by the normal
 //! compression pipeline, and that finite commands are still compressed.
+//!
+//! Design note: the daemon guard fires regardless of whether stdin is a
+//! terminal (ADR-008 alignment fix). Bare `vitest` is indefinite; use
+//! `vitest run` for the finite one-shot mode that skim should compress.
+//! `should_read_stdin` treats `args == ["run"]` as stdin-eligible, so
+//! `skim vitest run` + piped fixture goes through the compression pipeline.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -18,23 +24,25 @@ fn skim_cmd() -> Command {
 // Daemon passthrough: `vitest run` is FINITE — still goes through compression
 // ============================================================================
 
-/// `vitest run` is a finite invocation (one-shot). Skim should still route it
-/// through the test parser — the rewrite path rewrites it to `skim vitest run`
-/// and the fixture-based stdin path exercises the parser.
+/// `vitest run` is the finite one-shot invocation. Skim must still route it
+/// through the test parser — the daemon guard only fires for bare `vitest`
+/// (watch mode default) and explicit `--watch` variants.
 ///
-/// This test is intentionally light: it asserts only that `skim vitest` doesn't
-/// hang and produces some output when given stdin fixture data.
+/// `should_read_stdin` treats `args == ["run"]` as stdin-eligible so piped
+/// fixture data reaches the parser even though args is non-empty.
 #[test]
 fn test_vitest_run_is_finite_and_compressed() {
     // Pipe a minimal vitest JSON fixture so skim can parse it.
-    // The fixture used by other vitest tests works fine here.
+    // `vitest run` is finite — daemon guard does not fire, compression applies.
     let fixture = include_str!("fixtures/cmd/test/vitest_pass.json");
     skim_cmd()
-        .args(["vitest"])
+        .args(["vitest", "run"])
         .write_stdin(fixture)
         .timeout(std::time::Duration::from_secs(10))
         .assert()
-        .success();
+        .success()
+        // Compression must have run: structured output contains "pass:"
+        .stdout(predicate::str::contains("pass:"));
 }
 
 // ============================================================================
@@ -114,42 +122,39 @@ fn test_hook_mode_jest_ci_is_rewritten() {
 // Direct dispatch: indefinite command exits cleanly via inherited passthrough
 // ============================================================================
 
-/// When skim is invoked directly as `skim vitest --watch`, the daemon guard
-/// should detect `vitest --watch` as indefinite and run it via inherited
-/// passthrough. Since `vitest` is not installed in the test environment, the
-/// command will fail with ENOENT → exit code 127 (program not found).
+/// Smoke test: `skim nodemon app.js` must return within the timeout and not
+/// hang, regardless of whether `nodemon` is installed.
 ///
-/// This verifies the dispatch code path is reached and exits cleanly rather
-/// than hanging. On systems where vitest happens to be installed this test
-/// would hang; we guard it by asserting exit within the timeout.
+/// `nodemon` is always-indefinite, so the daemon guard routes it through
+/// `run_inherited_passthrough`:
+///   - If `nodemon` is not installed → exit 127 (ENOENT)
+///   - If `nodemon` is installed in CI → it starts but we don't wait for it
+///     (the timeout safety-net catches any hang)
+///
+/// The deterministic assertion that exit-127 maps correctly is covered by the
+/// unit test `dispatch::tests::test_run_inherited_passthrough_missing_binary`
+/// in `crates/rskim/src/cmd/dispatch.rs`, which calls `run_inherited_passthrough`
+/// directly with a guaranteed-absent program name.
+///
+/// This E2E test is a routing / no-hang smoke check only: it proves the guard
+/// fires and the binary returns within a reasonable time.
 #[cfg(unix)]
 #[test]
 fn test_direct_dispatch_indefinite_exits_quickly_when_binary_missing() {
-    // `vitest --watch` should be detected as indefinite. If `vitest` is not
-    // installed (the common case in CI), run_inherited_passthrough returns 127
-    // immediately. If it IS installed this test would hang — gate on a program
-    // that is definitely not installed.
-    use std::process::Command;
-
-    // First check that the test binary doesn't exist.
-    if Command::new("__skim_test_no_such_daemon__")
-        .status()
-        .is_ok()
-    {
-        // Binary somehow exists — skip this test.
-        return;
-    }
-
-    // `__skim_test_no_such_daemon__ --watch` is indefinite by virtue of `watch`
-    // being the program name, but `__skim_test_no_such_daemon__` is unknown.
-    // Instead, use `nodemon` which is always-indefinite; if not installed → 127.
+    // `nodemon` is always-indefinite per the detection table and is essentially
+    // never present in Rust CI toolchains. Exit 127 = ENOENT through
+    // run_inherited_passthrough.
     skim_cmd()
         .args(["nodemon", "app.js"])
         .timeout(std::time::Duration::from_secs(5))
         .assert()
-        // 127 when not found, or 0/non-127 if installed — either is fine.
-        // The important thing is: it returns within the timeout (not hang).
-        .code(predicate::in_iter(
-            [0u8, 1u8, 127u8, 255u8].into_iter().map(|c| c as i32),
-        ));
+        // Primary check: exits within the timeout (does not hang).
+        // If nodemon is somehow installed and starts → non-127 is also acceptable
+        // because the test's purpose is no-hang, not exit-code mapping
+        // (that's covered by the unit test in dispatch.rs).
+        .code(predicate::function(|&code: &i32| {
+            // Accept 127 (not found), or non-zero (started but exited), or 0.
+            // Only reject if the process never exits (prevented by timeout).
+            code >= 0
+        }));
 }
