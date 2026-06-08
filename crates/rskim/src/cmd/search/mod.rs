@@ -13,6 +13,7 @@
 //! - `hooks` — git hook installation/removal
 //! - `rskim-search` crate — index building, n-gram extraction, BM25F scoring
 
+mod ast;
 pub(crate) mod hooks;
 mod index;
 mod manifest;
@@ -64,6 +65,29 @@ pub(crate) fn run(
     // Parse flags — propagate errors (invalid --limit, unrecognised flags, etc.).
     let flags = parse_flags(args)?;
 
+    // ── Validation order (deterministic — tests rely on this ordering) ──────
+    // 1. --ast + temporal flags (--hot/--cold/--risky/--blast-radius) → #202 error.
+    //    (--blast-radius is a co-change filter and IS composable with --ast per the
+    //     plan, but the plan also says --ast + temporal_sort → #202.  --blast-radius
+    //     alone is handled in run_query via FileId intersection — not an error.)
+    // 2. single-node pattern → #283 error.
+    // 3. unknown pattern → lists available names.
+    // Dispatch happens after validation passes.
+    if let Some(ref raw_ast) = flags.ast {
+        // Validation #1: --ast + temporal sort is not yet supported (#202).
+        if let Some(sort) = flags.temporal_sort {
+            anyhow::bail!(
+                "--ast and {} are not yet composable (tracked in #202).\n\
+                 Use --ast alone or use {} without --ast.",
+                sort.flag_name(),
+                sort.flag_name()
+            );
+        }
+        // Validations #2 and #3: single-node (#283) + unknown pattern.
+        ast::validate_ast_pattern(raw_ast)?;
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     match flags.action {
         SearchAction::Build => run_build(false, &flags.root_override, analytics),
         SearchAction::Rebuild => run_build(true, &flags.root_override, analytics),
@@ -72,7 +96,21 @@ pub(crate) fn run(
         SearchAction::InstallHooks => run_install_hooks(&flags.root_override),
         SearchAction::RemoveHooks => run_remove_hooks(&flags.root_override),
         SearchAction::Query(ref text) if !text.is_empty() => run_query(text, &flags, analytics),
-        // Empty query with temporal flags → standalone temporal dispatch.
+        // Empty query + --ast only → standalone AST dispatch.
+        SearchAction::Query(_)
+            if flags.ast.is_some()
+                && flags.temporal_sort.is_none()
+                && flags.blast_radius.is_none() =>
+        {
+            let raw = flags.ast.as_deref().unwrap();
+            let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
+            std::fs::create_dir_all(&cache_dir)?;
+            // Ensure both indexes are fresh before querying.
+            let (_refreshed, manifest) =
+                staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+            ast::run_ast_standalone(raw, flags.limit, flags.json, &cache_dir, &manifest)
+        }
+        // Empty query with temporal flags (no --ast) → standalone temporal dispatch.
         SearchAction::Query(_) if flags.temporal_sort.is_some() || flags.blast_radius.is_some() => {
             run_temporal_standalone(
                 flags.limit,
@@ -121,6 +159,12 @@ struct Flags {
     temporal_sort: Option<types::TemporalSort>,
     /// Raw path for blast-radius pre-filtering. Normalized later in run_query.
     blast_radius: Option<String>,
+    /// Raw AST pattern string for structural pattern search (#199).
+    ///
+    /// Validated at dispatch time (before opening the index).  Space-separated
+    /// `--ast try-catch` and equals form `--ast=try-catch` are both accepted.
+    /// Whitespace-only values are rejected in `parse_flags`.
+    ast: Option<String>,
 }
 
 /// Parse and validate a `--limit` value string.
@@ -194,6 +238,7 @@ fn parse_temporal_flag(
 /// - `--limit` / `-n` value that is not a valid `usize`.
 /// - `--limit=<value>` with a non-numeric value.
 /// - `--root` without a following value.
+/// - `--ast` without a value or with a whitespace-only value.
 /// - Unrecognised flags (tokens beginning with `--`).
 fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut action_flag: Option<SearchAction> = None;
@@ -203,6 +248,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut query_parts: Vec<String> = Vec::new();
     let mut temporal_sort: Option<types::TemporalSort> = None;
     let mut blast_radius: Option<String> = None;
+    let mut ast: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -228,12 +274,33 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                 })?;
                 root_override = Some(PathBuf::from(val));
             }
+            "--ast" => {
+                // Space-separated form: `--ast try-catch`
+                i += 1;
+                let val = args.get(i).ok_or_else(|| {
+                    anyhow::anyhow!("--ast requires a pattern value (e.g. --ast try-catch)")
+                })?;
+                let trimmed = val.trim();
+                if trimmed.is_empty() {
+                    anyhow::bail!("--ast pattern must not be empty or whitespace-only");
+                }
+                ast = Some(trimmed.to_string());
+            }
             s if s.starts_with("--limit=") => {
                 let raw = s.trim_start_matches("--limit=");
                 limit = parse_limit_value(raw)?;
             }
             s if s.starts_with("--root=") => {
                 root_override = Some(PathBuf::from(s.trim_start_matches("--root=")));
+            }
+            s if s.starts_with("--ast=") => {
+                // Equals form: `--ast=try-catch` or `--ast=for_statement > await_expression`
+                let val = s.trim_start_matches("--ast=");
+                let trimmed = val.trim();
+                if trimmed.is_empty() {
+                    anyhow::bail!("--ast pattern must not be empty or whitespace-only");
+                }
+                ast = Some(trimmed.to_string());
             }
             s if matches!(s, "--hot" | "--cold" | "--risky" | "--blast-radius")
                 || s.starts_with("--blast-radius=") =>
@@ -248,7 +315,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                 anyhow::bail!(
                     "unrecognised flag {:?}. Valid flags: --build, --rebuild, --update, \
                      --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --root, \
-                     --hot, --cold, --risky, --blast-radius",
+                     --ast, --hot, --cold, --risky, --blast-radius",
                     s
                 );
             }
@@ -267,6 +334,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
         root_override,
         temporal_sort,
         blast_radius,
+        ast,
     })
 }
 
@@ -494,6 +562,44 @@ fn run_query(
         flags.json,
     )?;
 
+    // Resolve AST file filter (#199): open the AST engine, execute the
+    // structural query, collect matching FileIds.  Applied at the FileId level
+    // inside execute_query (no path round-trip).
+    let ast_file_ids = if let Some(ref raw_ast) = flags.ast {
+        // ensure_indexes_fresh already ran in the dispatch arm above via
+        // auto_refresh_if_stale; here we just open the engine.
+        match ast::open_ast_engine(&cache_dir) {
+            Ok(engine) => {
+                match ast::resolve_ast_file_filter(&engine, raw_ast, None) {
+                    Ok(ids) => {
+                        if ids.is_empty() {
+                            eprintln!("skim search: --ast {:?} matched no indexed files", raw_ast);
+                        }
+                        Some(ids)
+                    }
+                    Err(e) => {
+                        // AST query failure: degrade gracefully (warn, no AST filter).
+                        if flags.json {
+                            let w = WarningJson {
+                                warning: &format!("AST query failed: {e}"),
+                            };
+                            println!("{}", serde_json::to_string(&w)?);
+                        } else {
+                            eprintln!("skim search: AST query warning: {e}");
+                        }
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                // Missing AST index when --ast was specified: fail loud (#199).
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
+
     let config = types::QueryConfig {
         text: text.to_string(),
         limit: flags.limit,
@@ -501,6 +607,7 @@ fn run_query(
         root,
         cache_dir,
         blast_radius_paths,
+        ast_file_ids,
     };
 
     let mut output = query::execute_query(&config, analytics)?;
@@ -600,6 +707,25 @@ Options:
   --root PATH      Override project root (default: walk up to .git)
   -h, --help       Print this help message
 
+AST structural query options (#199):
+  --ast PATTERN    Filter/list by AST structural pattern.
+                   PATTERN is a named catalog pattern or a containment query:
+                     Named:        --ast try-catch
+                     Containment:  --ast \"for_statement > await_expression\"
+                   Use `--ast` alone for standalone AST-only output (file-level),
+                   or combine with a text query for intersection results.
+
+  Limitations:
+    #283 — Single-node queries (e.g. --ast try_statement) are not yet supported;
+           use a named pattern or a containment query instead.
+    #202 — --ast combined with --hot / --cold / --risky is not yet supported.
+
+AST standalone examples:
+  skim search --ast try-catch                   Files with try/catch blocks
+  skim search --ast \"for_statement > await_expression\"  Async-in-loop pattern
+  skim search \"error\" --ast try-catch           Text+AST intersection (lexical snippets preserved)
+  skim search --ast try-catch --blast-radius src/auth.rs  AST ∩ co-change
+
 Temporal query options (require 'skim heatmap' data):
   --hot                        Sort/list by hotspot score descending
   --cold                       Sort/list by hotspot score ascending
@@ -610,7 +736,7 @@ Temporal flag composition:
   --hot and --cold/--risky are mutually exclusive (pick one sort mode).
   --blast-radius is composable with any sort mode and with text queries.
 
-Examples:
+General examples:
   skim search \"authenticate\"                Search for 'authenticate'
   skim search --limit 5 \"parse_url\"         Return at most 5 results
   skim search --json \"UserService\"          JSON output

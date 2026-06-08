@@ -104,6 +104,15 @@ pub(super) struct QueryConfig {
     /// so that the limit applies to the filtered result set rather than being
     /// wasted on files that would be discarded.
     pub blast_radius_paths: Option<std::collections::HashSet<String>>,
+    /// Optional set of FileIds from an AST structural pattern query (#199).
+    ///
+    /// When `Some`, only files whose `FileId` is in this set are scored.
+    /// This is the intersection filter for `text + --ast` combined queries.
+    /// Applied BEFORE `blast_radius_paths` intersection in `execute_query`.
+    ///
+    /// Additive: `None` means "no AST filter" (all existing callers compile
+    /// unchanged because they use `blast_radius_paths` field initialization).
+    pub ast_file_ids: Option<std::collections::HashSet<rskim_search::FileId>>,
 }
 
 /// A search result with the file path resolved and snippet extracted.

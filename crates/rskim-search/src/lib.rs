@@ -37,9 +37,17 @@ pub use ast_index::{
     AST_BM25_B, AST_BM25_K1, AstBigram, AstBigramEntry, AstFileMetaEntry, AstIndexBuilder,
     AstIndexReader, AstNgramSet, AstPosting, AstPostingSource, AstQuery, AstQueryEngine,
     AstTrigram, AstTrigramEntry, DEFAULT_AST_WEIGHT, LinearNode, LinearizeResult, NodeKindId,
-    ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_weights,
-    linearize_source, parse_ast_query, vocab_len, vocab_lookup, vocab_resolve,
+    Pattern, PatternCategory, StructuralMetrics, all_patterns, ast_bigram_idf, ast_trigram_idf,
+    extract_ast_ngrams, extract_ast_ngrams_with_metrics, extract_ast_ngrams_with_weights,
+    linearize_source, lookup_pattern, parse_ast_query, vocab_len, vocab_lookup, vocab_resolve,
 };
+
+/// Current on-disk format version for the AST index (`ast_index.skidx`).
+///
+/// Exposed at the crate level so CLI code (e.g. staleness self-heal in Wave 3g)
+/// can compare against the value returned by [`AstIndexReader::index_version`]
+/// without accessing crate-internal format constants.
+pub const AST_INDEX_FORMAT_VERSION: u16 = 2;
 pub use cochange::{CochangeMatrixBuilder, CochangeMatrixReader};
 pub use index::{NgramIndexBuilder, NgramIndexReader};
 pub use lexical::{

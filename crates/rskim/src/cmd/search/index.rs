@@ -29,7 +29,10 @@ use std::time::Instant;
 
 use anyhow::Context as _;
 use clap::Parser;
-use rskim_search::{FileId, LayerBuilder, NgramIndexBuilder, classify_source};
+use rskim_search::{
+    AstIndexBuilder, AstNgramSet, FileId, LayerBuilder, NgramIndexBuilder, StructuralMetrics,
+    classify_source, extract_ast_ngrams_with_metrics, linearize_source,
+};
 
 use super::manifest::{FileManifest, ManifestEntry, decode_field_map, encode_field_map};
 use super::staleness::read_git_head;
@@ -240,11 +243,18 @@ impl<'cfg> Pipeline<'cfg> {
         let (walk_entries, walk_skip_count) = self.walk()?;
 
         if walk_entries.is_empty() {
-            // Nothing to index — flush an empty index and manifest so that
-            // `check_staleness` can find `index.skidx` and treat the project
-            // as indexed rather than returning `NoIndex` on every query.
+            // Nothing to index — flush empty lexical + AST indexes and manifest
+            // so that `check_staleness` can find `index.skidx` and treat the
+            // project as indexed rather than returning `NoIndex` on every query.
             let builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
             let _layer = builder.build()?;
+            // Also build an empty AST index so self-heal doesn't trigger
+            // immediately after an empty-project build.
+            let ast_builder = AstIndexBuilder::new(self.cache_dir.clone())
+                .map_err(|e| anyhow::anyhow!("failed to create AST index builder: {e}"))?;
+            ast_builder
+                .build()
+                .map_err(|e| anyhow::anyhow!("AST index build failed: {e}"))?;
             let mut manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
             manifest.set_git_head(read_git_head(&self.config.root));
             manifest.save()?;
@@ -261,13 +271,26 @@ impl<'cfg> Pipeline<'cfg> {
         let (producer_handle, rx, producer_skips) =
             Self::spawn_producer(walk_entries, manifest, self.config.force, debug_enabled);
 
-        // Stage 3: Consume processed files, build the index.
+        // Stage 3: Consume processed files, build lexical + AST indexes.
         let mut builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
+        // AST index (#199): build alongside lexical so both share the same FileId
+        // sequence (correctness-critical — see FileId contract in ast_index/builder.rs).
+        // NOTE: both builders retain posting lists until build(); memory scales with
+        // file count (~tens of MB at 10k files) — tracked in #273 for chunked builds.
+        // Re-extract all files each refresh (no incremental cache) — tracked in #290.
+        let mut ast_builder = AstIndexBuilder::new(self.cache_dir.clone())
+            .map_err(|e| anyhow::anyhow!("failed to create AST index builder: {e}"))?;
         let mut new_manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
         let ConsumeResult {
             file_count,
             cache_hits,
-        } = Self::consume(&mut builder, &mut new_manifest, rx, debug_enabled);
+        } = Self::consume(
+            &mut builder,
+            &mut ast_builder,
+            &mut new_manifest,
+            rx,
+            debug_enabled,
+        );
 
         // Wait for the producer to finish and propagate any panic.
         producer_handle.join().map_err(|e| {
@@ -279,8 +302,19 @@ impl<'cfg> Pipeline<'cfg> {
             )
         })?;
 
-        // Finalize: flush index then write manifest (marks index as coherent).
+        // Commit ordering (crash-safety):
+        // (1) Lexical build — index.skidx + index.skfiles written.
+        // (2) AST build    — ast_index.skpost then ast_index.skidx written.
+        // (3) Manifest save (git HEAD recorded) — the commit point.
+        //
+        // If the AST build fails, the manifest is NOT saved so the next query
+        // sees the index as stale and triggers a full rebuild (self-heal path).
+        // "HEAD recorded ⟹ both indexes coherent" is the invariant.
         let _layer = builder.build()?;
+        ast_builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("AST index build failed: {e}"))?;
+
         // Record the current git HEAD in the manifest so staleness detection
         // can compare it on the next query without spawning a git subprocess.
         new_manifest.set_git_head(read_git_head(&self.config.root));
@@ -357,21 +391,27 @@ impl<'cfg> Pipeline<'cfg> {
         (handle, rx, producer_skips)
     }
 
-    /// Stage 3: consume [`ProcessedFile`]s from `rx`, index each one, and build
-    /// the new manifest.
+    /// Stage 3: consume [`ProcessedFile`]s from `rx`, index each one in BOTH
+    /// the lexical and AST indexes, and build the new manifest.
     ///
     /// Returns aggregated counts. Errors on individual files are fail-soft: the
     /// file is skipped and indexing continues. On `FileId` overflow the loop
     /// breaks early and the partial result is returned — the caller's
-    /// `builder.build()` + `new_manifest.save()` still execute, preserving
-    /// the fail-soft contract.
+    /// `builder.build()` + `ast_builder.build()` + `new_manifest.save()` still
+    /// execute, preserving the fail-soft contract.
     ///
-    /// # Invariant
+    /// # FileId Invariants
     ///
-    /// `next_file_id` only advances after a successful `add_file_classified`,
-    /// preserving the builder's sequential `FileId` requirement even on errors.
+    /// 1. `next_file_id` only advances after a successful `add_file_classified`.
+    ///    A lexical-builder error causes a `continue` — the file is excluded from
+    ///    BOTH indexes, keeping them in sync.
+    /// 2. AST entries are ALWAYS inserted (even on linearization error) via an
+    ///    empty `AstNgramSet` + zero node_count + default metrics. This preserves
+    ///    the AST builder's "every file gets exactly one call" contract and prevents
+    ///    FileId desync between the lexical and AST indexes.
     fn consume(
         builder: &mut NgramIndexBuilder,
+        ast_builder: &mut AstIndexBuilder,
         new_manifest: &mut FileManifest,
         rx: crossbeam_channel::Receiver<ProcessedFile>,
         debug_enabled: bool,
@@ -380,7 +420,8 @@ impl<'cfg> Pipeline<'cfg> {
         let mut cache_hits: u32 = 0;
 
         for pf in rx {
-            // Fail-soft: a builder error on one file must not abort a 50 K-file build.
+            // Fail-soft: a lexical builder error on one file must not abort a
+            // 50 K-file build. Skip the file from BOTH indexes (keeps FileIds in sync).
             if let Err(e) = builder.add_file_classified(
                 FileId(next_file_id),
                 &pf.content,
@@ -394,7 +435,57 @@ impl<'cfg> Pipeline<'cfg> {
                     );
                 }
                 // Do NOT increment next_file_id — invariant preserved.
+                // Do NOT add an AST entry either — file excluded from both indexes.
                 continue;
+            }
+
+            // AST index: linearize + extract n-grams.
+            // Fail-soft: on ANY error (grammar load failure, linearization error,
+            // or Ok(empty) for non-tree-sitter langs / large files), insert an
+            // EMPTY ALIGNED ENTRY so AST FileIds stay in sync with lexical FileIds.
+            // NEVER `?`-propagate (would abort the whole build).
+            // NEVER skip (would desync FileIds → silently mis-map results).
+            let (ast_set, ast_metrics, ast_node_count) =
+                match linearize_source(&pf.content, pf.lang) {
+                    Ok(lin) if !lin.nodes.is_empty() => {
+                        let (set, metrics) = extract_ast_ngrams_with_metrics(&lin.nodes, pf.lang);
+                        let node_count = u32::try_from(lin.nodes.len()).unwrap_or(u32::MAX);
+                        (set, metrics, node_count)
+                    }
+                    Ok(_empty) => {
+                        // Non-tree-sitter lang (JSON/YAML/TOML), file >100KiB,
+                        // empty source, or parse-only-error result — empty entry.
+                        (AstNgramSet::default(), StructuralMetrics::default(), 0u32)
+                    }
+                    Err(e) => {
+                        // Grammar load failure (SearchError::Ast) — only unrecoverable
+                        // error from linearize_source. Still insert empty aligned entry.
+                        if debug_enabled {
+                            eprintln!(
+                                "skim search index [debug]: linearize_source failed \
+                                 for {:?}: {e}",
+                                pf.rel_path
+                            );
+                        }
+                        (AstNgramSet::default(), StructuralMetrics::default(), 0u32)
+                    }
+                };
+
+            // Add the AST entry for this file. On error, log and continue — the
+            // lexical entry was already added; both indexes share the same FileId.
+            if let Err(e) = ast_builder.add_file_ngrams(
+                FileId(next_file_id),
+                pf.lang,
+                &ast_set,
+                ast_node_count,
+                ast_metrics,
+            ) && debug_enabled
+            {
+                eprintln!(
+                    "skim search index [debug]: add_file_ngrams failed for {:?}: {e}",
+                    pf.rel_path
+                );
+                // Continue — lexical entry is already written; best-effort AST.
             }
 
             // Success: advance counter.

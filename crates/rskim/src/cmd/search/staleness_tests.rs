@@ -42,6 +42,16 @@ fn create_ref_file(dir: &std::path::Path, ref_path: &str, sha: &str) {
     fs::write(&full_path, format!("{sha}\n")).unwrap();
 }
 
+/// Write a minimal valid AST index stub file in `cache_dir`.
+///
+/// `index_version` reads the first 6 bytes: magic `SKAX` + version u16 LE.
+/// Writing version 2 (the current format) prevents the AST self-heal from
+/// reporting `NoStoredHead` in unit tests that only stub the lexical index.
+fn write_ast_index_stub(cache_dir: &std::path::Path) {
+    // b"SKAX" = magic (4 bytes), 0x02 0x00 = version 2 in little-endian.
+    fs::write(cache_dir.join("ast_index.skidx"), b"SKAX\x02\x00").unwrap();
+}
+
 /// Write a manifest with the given git_head into `cache_dir`.
 fn write_manifest_with_head(
     root: &std::path::Path,
@@ -248,6 +258,8 @@ fn test_check_staleness_current_when_heads_match() {
 
     write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
     fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    // AST stub required so self-heal does not trigger before HEAD comparison.
+    write_ast_index_stub(&cache_dir);
 
     let (result, _) = check_staleness(&cache_dir, dir.path());
     assert!(
@@ -266,6 +278,8 @@ fn test_check_staleness_head_changed() {
 
     write_manifest_with_head(dir.path(), &cache_dir, Some(stored_sha));
     fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    // AST stub required so self-heal does not trigger before HEAD comparison.
+    write_ast_index_stub(&cache_dir);
 
     let (result, _) = check_staleness(&cache_dir, dir.path());
     match result {
@@ -284,6 +298,8 @@ fn test_check_staleness_non_git_project_is_current() {
     // No .git directory — non-git project
     write_manifest_with_head(dir.path(), &cache_dir, None);
     fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    // AST stub required so self-heal does not trigger before HEAD comparison.
+    write_ast_index_stub(&cache_dir);
 
     // Non-git: stored HEAD = None, current HEAD = None → Current (no rebuild loop).
     let (result, _) = check_staleness(&cache_dir, dir.path());
@@ -302,6 +318,8 @@ fn test_check_staleness_unreadable_git_is_current() {
     // Manifest records a HEAD (was a git repo at build time), but .git is absent now.
     write_manifest_with_head(dir.path(), &cache_dir, Some(stored_sha));
     fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    // AST stub required so self-heal does not trigger before HEAD comparison.
+    write_ast_index_stub(&cache_dir);
     // No .git directory — simulates git becoming unreadable.
 
     // stored HEAD = Some, current HEAD = None → Current (don't trigger rebuild).

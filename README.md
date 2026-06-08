@@ -106,6 +106,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - **n-gram index** — build an AST-aware search index with `skim search index` (incremental SHA-256 cache, 50K file cap, `--force` for full rebuild)
 - **Temporal sort flags** — rank results by git history signals: `--hot` (hotspot score), `--cold` (least-changed first), `--risky` (fix-commit density)
 - **Blast-radius filter** — `--blast-radius FILE` pre-filters candidates to files that historically co-change with FILE, then applies sort flags within that set
+- **AST structural search** — `--ast <pattern>` filters to files containing a named structural pattern (e.g. `try-catch`, `nested-loop`, `god-function`) or a containment query (e.g. `--ast "for_statement > await_expression"`); composable with text query and `--blast-radius`
 - Composable: `skim search "parse config" --risky --blast-radius src/config.rs` finds risky matches near a file's co-change cluster
 - `--json` for structured output, `--limit N` to cap results, `--root` for explicit project root
 

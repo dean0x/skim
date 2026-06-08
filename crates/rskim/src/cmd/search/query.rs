@@ -68,26 +68,52 @@ pub(super) fn execute_query(
     // file_filter construction and the path-resolution step below.
     let sorted = manifest.sorted_paths();
 
-    // When blast-radius paths are provided, convert them to FileId allowlist
-    // so the search engine filters BEFORE applying the limit. This ensures
-    // the limit applies to the filtered set rather than discarding matches
-    // that fall outside the top-N unfiltered results.
-    if let Some(ref allowed_paths) = config.blast_radius_paths {
-        let mut file_ids = std::collections::HashSet::new();
-        for (idx, path) in sorted.iter().enumerate() {
-            if allowed_paths.contains(*path) {
-                file_ids.insert(rskim_search::FileId(idx as u32));
+    // Build the FileId allowlist from blast-radius paths + AST file IDs.
+    // Intersection logic:
+    // - blast-radius only: path-based allowlist (path → FileId).
+    // - AST only: use the AST FileId set directly.
+    // - Both: intersection of the two sets (FileId-level, no path round-trip).
+    // - Neither: no filter (sq.file_filter stays None).
+    let blast_file_ids: Option<std::collections::HashSet<rskim_search::FileId>> =
+        if let Some(ref allowed_paths) = config.blast_radius_paths {
+            let mut file_ids = std::collections::HashSet::new();
+            for (idx, path) in sorted.iter().enumerate() {
+                if allowed_paths.contains(*path) {
+                    file_ids.insert(rskim_search::FileId(idx as u32));
+                }
             }
+            if file_ids.is_empty() {
+                eprintln!(
+                    "skim search: blast-radius filter matched 0 indexed files \
+                     (allowed {} paths, index has {} files)",
+                    allowed_paths.len(),
+                    sorted.len()
+                );
+            }
+            Some(file_ids)
+        } else {
+            None
+        };
+
+    match (blast_file_ids, config.ast_file_ids.as_ref()) {
+        (Some(blast), Some(ast)) => {
+            // Intersection: only files in BOTH sets.
+            let intersection: std::collections::HashSet<rskim_search::FileId> = blast
+                .iter()
+                .filter(|id| ast.contains(*id))
+                .copied()
+                .collect();
+            sq.file_filter = Some(intersection);
         }
-        if file_ids.is_empty() {
-            eprintln!(
-                "skim search: blast-radius filter matched 0 indexed files \
-                 (allowed {} paths, index has {} files)",
-                allowed_paths.len(),
-                sorted.len()
-            );
+        (Some(blast), None) => {
+            sq.file_filter = Some(blast);
         }
-        sq.file_filter = Some(file_ids);
+        (None, Some(ast)) => {
+            sq.file_filter = Some(ast.clone());
+        }
+        (None, None) => {
+            // No filter.
+        }
     }
 
     // Execute the search.
