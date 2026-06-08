@@ -50,6 +50,17 @@ pub(crate) fn is_indefinite_command(tokens: &[&str]) -> bool {
     let program = tokens[program_idx];
     let rest = &tokens[program_idx + 1..];
 
+    // Universal "print-and-exit" flags: `--help`/`-h`/`--version`/`-V` always
+    // make a command finite, no matter the program. A daemon/watch tool asked
+    // for its help or version text prints it and exits immediately — it never
+    // starts the server. Without this guard, `skim vitest --help`,
+    // `skim nodemon --help`, etc. are misclassified as indefinite and routed to
+    // `run_inherited_passthrough`, which spawns the real binary (or exits 127 if
+    // it is absent) instead of letting skim's own handler print help. (ADR-008)
+    if has_help_or_version_flag(rest) {
+        return false;
+    }
+
     match program {
         // ── watch ─────────────────────────────────────────────────────────
         // `watch` is always indefinite regardless of what it runs.
@@ -93,6 +104,17 @@ pub(crate) fn is_indefinite_command(tokens: &[&str]) -> bool {
 // ============================================================================
 // Helper predicates
 // ============================================================================
+
+/// True when `rest` contains a universal print-and-exit flag
+/// (`--help`, `-h`, `--version`, `-V`).
+///
+/// Any command carrying one of these prints text and exits immediately, so it
+/// is never indefinite regardless of the program. Checked before the
+/// program-specific match in [`is_indefinite_command`].
+fn has_help_or_version_flag(rest: &[&str]) -> bool {
+    rest.iter()
+        .any(|&s| matches!(s, "--help" | "-h" | "--version" | "-V"))
+}
 
 /// True when `rest` contains `-f`, `-F`, or `--follow`.
 fn has_follow_flag(rest: &[&str]) -> bool {
@@ -316,6 +338,40 @@ mod tests {
             assert!(
                 !is_indefinite(cmd),
                 "Expected is_indefinite_command to return false for: {cmd:?}"
+            );
+        }
+    }
+
+    // ─── Regression: --help / --version are always finite (ADR-008) ───────
+    //
+    // A daemon/watch tool asked for its help or version prints and exits; it
+    // never starts the server. Before the `has_help_or_version_flag` guard,
+    // `skim vitest --help` was misclassified as indefinite and routed to
+    // `run_inherited_passthrough`, exiting 127 (real binary absent) instead of
+    // printing skim's own help.
+    #[test]
+    fn test_help_and_version_flags_are_finite() {
+        let cases = [
+            "vitest --help",
+            "vitest -h",
+            "vitest --version",
+            "vitest -V",
+            "vite --help",
+            "vite -h",
+            "nodemon --help",
+            "serve --help",
+            "http-server --help",
+            "live-server --help",
+            "tsc --help",
+            "watch --help",
+            "tail --help",
+            "npm run dev --help",
+        ];
+
+        for cmd in &cases {
+            assert!(
+                !is_indefinite(cmd),
+                "Expected is_indefinite_command to return false (print-and-exit) for: {cmd:?}"
             );
         }
     }
