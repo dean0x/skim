@@ -79,9 +79,7 @@ pub(crate) fn is_indefinite_command(tokens: &[&str]) -> bool {
         "nodemon" | "serve" | "http-server" | "live-server" => true,
 
         // ── dev servers ───────────────────────────────────────────────────
-        "next" => rest.first().is_some_and(|&s| s == "dev"),
-
-        "nuxt" | "astro" => rest.first().is_some_and(|&s| s == "dev"),
+        "next" | "nuxt" | "astro" => rest.first().is_some_and(|&s| s == "dev"),
 
         "ng" => rest.first().is_some_and(|&s| s == "serve"),
 
@@ -140,11 +138,9 @@ fn vite_is_indefinite(rest: &[&str]) -> bool {
     let first_positional = rest.iter().find(|&&s| !s.starts_with('-'));
     match first_positional {
         Some(&"dev") | Some(&"serve") | Some(&"preview") => true,
-        // `vite build` is finite even with --watch ... keep conservative
-        Some(&"build") => has_watch_flag(rest),
-        // Any other subcommand: check for --watch
+        // `vite build` and all other subcommands: indefinite only with --watch.
         Some(_) => has_watch_flag(rest),
-        // No positional at all (only flags) — bare server
+        // No positional at all (only flags) — bare server.
         None => true,
     }
 }
