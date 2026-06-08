@@ -285,6 +285,9 @@ mod tests {
             "vite dev",
             "vite serve",
             "vite preview",
+            // rollup/esbuild with --watch are handled by has_watch_flag
+            "rollup --watch",
+            "esbuild --watch",
             "vitest",
             "vitest --watch",
             "next dev",
@@ -380,6 +383,9 @@ mod tests {
             "npm run dev",
             "pnpm run dev",
             "NODE_ENV=dev npm run dev",
+            // Multiple stacked env-var prefixes: position() must walk past all
+            // KEY=VALUE tokens to find the real program name at program_idx.
+            "A=1 B=2 npm run dev",
         ];
         for cmd in &indefinite {
             assert!(
@@ -391,7 +397,14 @@ mod tests {
 
     #[test]
     fn test_pm_finite_variants() {
-        let finite = ["yarn run build", "bun run build", "npm run build"];
+        let finite = [
+            "yarn run build",
+            "bun run build",
+            "npm run build",
+            // Env-var prefix must not shift program/script indices and misclassify
+            // a finite command: program is still "npm", script is still "build".
+            "NODE_ENV=prod npm run build",
+        ];
         for cmd in &finite {
             assert!(
                 !is_indefinite(cmd),

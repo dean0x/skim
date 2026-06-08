@@ -105,7 +105,7 @@ Each tool assigns tiers differently based on what structured output the tool pro
 
 Note that tsc uses regex for its Tier 1 (not JSON) because tsc has no native structured output mode. Its Tier 2 is the same regex applied to a different stream, promoted to `Degraded` rather than `Full`.
 
-The `compilation terminated.` check in make's Tier 2 is a literal `starts_with` check, not a regex — it is hardcoded alongside the four `LazyLock<Regex>` noise patterns.
+The `compilation terminated.` check in make's Tier 2 is a literal `starts_with` check, not a regex — it is hardcoded alongside the three `LazyLock<Regex>` noise patterns.
 
 ## Flag Injection Pattern
 

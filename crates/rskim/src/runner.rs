@@ -948,4 +948,50 @@ mod tests {
         // This must not panic — kill() returns ESRCH which the Drop impl ignores.
         drop(child); // must not panic
     }
+
+    /// End-to-end coverage of the 64 MiB output-cap path through `run_with_env`
+    /// (ADR-008). Previously the cap was only exercised at the `read_pipe` unit
+    /// level; this drives a real child whose stdout exceeds the cap and asserts
+    /// the function surfaces the cap error *and returns* — i.e. it does not hang
+    /// or leak the child when a reader thread caps out.
+    ///
+    /// # Why this does not (and cannot) assert a live-child `ChildGuard` kill
+    ///
+    /// `run_with_env` blocks on `child.0.wait()` *before* it joins the reader
+    /// threads and surfaces their cap `Err`. So by the time the function returns
+    /// on the cap path the child has already exited (its next write to the
+    /// reader-closed pipe gets SIGPIPE), and `ChildGuard::drop` only ever kills
+    /// an already-dead process here — a no-op. The guard's *live*-child kill
+    /// fires only on an early return between guard construction and `wait()`; the
+    /// sole such path is `PipeCaptureFailed`, which is unreachable through the
+    /// public API because `Stdio::piped()` is always set, so `stdout.take()` /
+    /// `stderr.take()` never return `None`. The `ChildGuard::drop` kill contract
+    /// itself is therefore covered in isolation by
+    /// [`child_guard_kills_running_child`]; this test covers the reachable
+    /// behavior — the cap path completes cleanly rather than hanging.
+    ///
+    /// The child emits 70 MiB via `dd` and then exits (no trailing `sleep`):
+    /// once the reader caps at 64 MiB and drops the read end, `dd`'s next write
+    /// gets EPIPE/SIGPIPE and the child exits, so `wait()` unblocks promptly and
+    /// the test is bounded — never a 1-hour `sleep` hang.
+    #[cfg(unix)]
+    #[test]
+    fn run_with_env_surfaces_cap_error_without_hanging() {
+        // 70 MiB > the 64 MiB MAX_OUTPUT_BYTES cap. `dd` is the child's last
+        // command, so when the capped reader drops the pipe `dd` dies on SIGPIPE
+        // and the shell exits — `wait()` returns without blocking.
+        let runner = CommandRunner::new();
+        let result = runner.run_with_env(
+            "sh",
+            &["-c", "dd if=/dev/zero bs=1048576 count=70 2>/dev/null"],
+            &[],
+        );
+
+        let err =
+            result.expect_err("run_with_env must return Err when stdout exceeds the 64 MiB cap");
+        assert!(
+            err.to_string().contains("byte limit"),
+            "error must mention the byte limit, got: {err}"
+        );
+    }
 }

@@ -485,7 +485,7 @@ pub(super) fn run_streamed_spawned(
             guard.record();
             match status.code() {
                 Some(0) => ExitCode::SUCCESS,
-                Some(code) => ExitCode::from(code as u8),
+                Some(code) => ExitCode::from(code.clamp(0, 255) as u8),
                 None => ExitCode::FAILURE,
             }
         }

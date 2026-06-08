@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output memory cap (`MAX_OUTPUT_BYTES`) is unchanged — only the TIME bound is removed.
   **Accepted side-effect**: long finite commands now produce no output until they exit
   (skim buffers to compress); `SKIM_PASSTHROUGH=1` is the human escape hatch.
+- **`skim vitest` now runs in watch mode by default (ADR-008 Part C)** — bare `skim vitest`
+  and `cat output | skim vitest` are detected as indefinite and passed through live (no
+  compression). To compress a one-shot run, use `skim vitest run` (or set
+  `SKIM_PASSTHROUGH=1` to forward piped content).
 
 ### Fixed
 - **Kill-on-drop guard for spawned children (ADR-008)** — `CommandRunner` now wraps every

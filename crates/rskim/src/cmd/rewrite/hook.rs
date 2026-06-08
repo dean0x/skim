@@ -220,12 +220,13 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         || command.contains(';')
         || command.contains('|');
 
-    let original = tokens.join(" ");
-
     // Fast path for non-compound commands
     let rewritten = if !has_operator_chars {
         try_rewrite(&tokens).map(|r| r.tokens.join(" "))
     } else {
+        // Defer joining until the compound branch — avoids a dead allocation on the
+        // common non-compound path where `original` is never read.
+        let original = tokens.join(" ");
         match split_compound(&original) {
             CompoundSplitResult::Bail => None,
             CompoundSplitResult::Simple(simple_tokens) => {
