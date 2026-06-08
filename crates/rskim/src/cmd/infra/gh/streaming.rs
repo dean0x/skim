@@ -61,9 +61,10 @@
 //!
 //! # DESIGN NOTE (AD-STR-9) — ChildGuard kills and reaps on drop
 //!
-//! The spawned child is wrapped in [`ChildGuard`], whose `Drop` implementation
-//! calls `kill()` followed by `wait()`.  This ensures the child is reaped when
-//! the parent exits early (SIGPIPE, SIGINT unwind, or any other panic path).
+//! The spawned child is wrapped in [`ChildGuard`] (canonical definition in
+//! `crate::runner`; ADR-001 / ADR-008), whose `Drop` implementation calls
+//! `kill()` followed by `wait()`.  This ensures the child is reaped when the
+//! parent exits early (SIGPIPE, SIGINT unwind, or any other panic path).
 //! `kill()` on an already-exited child is a no-op on all platforms (PF-025).
 
 use std::io::{self, BufRead, BufWriter, Read, Write};
@@ -71,6 +72,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use crate::output::strip_ansi;
+use crate::runner::ChildGuard;
 
 // ============================================================================
 // Constants
@@ -268,28 +270,6 @@ impl Drop for DropGuard {
         if !self.recorded && self.analytics_enabled {
             self.do_record();
         }
-    }
-}
-
-// ============================================================================
-// ChildGuard -- kill + reap on drop (AD-STR-9, PF-025)
-// ============================================================================
-
-/// RAII wrapper that kills and reaps a child process on drop.
-///
-/// When the parent exits early (SIGPIPE, panic, or any unwind path), the
-/// `Drop` implementation calls `kill()` followed by `wait()` to prevent the
-/// child from becoming a zombie.  `kill()` on an already-exited process is a
-/// no-op on Unix (returns `ESRCH`) and returns `InvalidInput` on Windows --
-/// both cases are explicitly ignored.
-struct ChildGuard(std::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        // kill() is a no-op on an already-exited child; ignore the result.
-        let _ = self.0.kill();
-        // wait() reaps the zombie; ignore result (process may already be reaped).
-        let _ = self.0.wait();
     }
 }
 

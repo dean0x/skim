@@ -79,6 +79,12 @@ pub(crate) enum RunnerError {
 /// interpretation. Stdout and stderr are captured concurrently via two reader
 /// threads to prevent pipe deadlocks on large output.
 ///
+/// # Stateless unit struct (ADR-008)
+///
+/// `CommandRunner` is a zero-field unit struct. `new()` takes no arguments and
+/// carries no configuration: there is no timeout, no retry count, and no
+/// buffering policy stored here. All policy is provided at call sites.
+///
 /// # No internal timeout (ADR-008)
 ///
 /// `CommandRunner` imposes no wall-clock cap. Skim is a transparent wrapper:
@@ -255,7 +261,18 @@ impl CommandRunner {
 /// and returns `InvalidInput` on Windows — both cases are explicitly ignored.
 /// On the normal execution path the child has already exited before drop fires,
 /// so this is always a harmless no-op.
-struct ChildGuard(std::process::Child);
+///
+/// # Limitation — direct child only
+///
+/// `kill()` signals the direct child process; grandchildren (e.g., the `node`
+/// subprocess spawned by `npm`, or `rustc` spawned by `cargo`) are not reached.
+/// Hardening to kill the full process group (`kill(-pgid, SIGKILL)`) is a
+/// Unix-only change deferred to a follow-up (ADR-001: noticed but out of scope
+/// for ADR-008).
+///
+/// `pub(crate)` so that `cmd::infra::gh::streaming` can reuse this guard
+/// instead of maintaining a duplicate definition (ADR-001).
+pub(crate) struct ChildGuard(pub(crate) std::process::Child);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -866,5 +883,69 @@ mod tests {
                 // completing without panic is sufficient verification.
             }
         }
+    }
+
+    /// Regression: CommandRunner imposes NO internal wall-clock cap (ADR-008).
+    ///
+    /// Runs a finite command that takes ~1.5 s and asserts it completes
+    /// successfully with full output — it must not be killed or truncated by
+    /// any internal timeout.
+    #[cfg(unix)]
+    #[test]
+    fn no_internal_timeout_finite_command_runs_to_completion() {
+        let runner = CommandRunner::new();
+        // A ~1.5-second command that exits 0 and prints "done" to stdout.
+        // Uses `sh -c` for portability across Unix platforms.
+        let result = runner
+            .run("sh", &["-c", "sleep 1.5; echo done"])
+            .expect("command should succeed");
+
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "finite 1.5-second command must exit 0 (ADR-008: no internal cap)"
+        );
+        assert!(
+            result.stdout.contains("done"),
+            "stdout must contain 'done' — command must not be truncated or killed"
+        );
+        // Sanity-check duration: must be at least 1 second (sleep ran) and
+        // less than 10 seconds (reasonable upper bound for a CI machine).
+        assert!(
+            result.duration >= Duration::from_secs(1),
+            "duration should be >= 1s, got {:?}",
+            result.duration
+        );
+        assert!(
+            result.duration < Duration::from_secs(10),
+            "duration should be < 10s, got {:?}",
+            result.duration
+        );
+    }
+
+    /// ChildGuard kill() on an already-exited child is a harmless no-op (ADR-008).
+    ///
+    /// Spawns a command that exits immediately, waits for it to exit, then
+    /// drops the guard.  Drop must not panic or return an error — `kill()` on
+    /// a reaped process is explicitly ignored in the Drop impl.
+    #[cfg(unix)]
+    #[test]
+    fn child_guard_kill_on_already_exited_child_is_noop() {
+        use std::process::Stdio;
+
+        let child = Command::new("true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn true");
+
+        // Reap the child manually so it is definitely exited before ChildGuard
+        // drops.  We use a separate handle to call wait() first.
+        let mut child = ChildGuard(child);
+        let _ = child.0.wait(); // child is now a zombie/reaped
+
+        // Dropping the guard calls kill() on an already-exited child.
+        // This must not panic — kill() returns ESRCH which the Drop impl ignores.
+        drop(child); // must not panic
     }
 }

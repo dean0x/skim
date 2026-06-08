@@ -265,10 +265,18 @@ skim untrusted.ts --no-cache
 3. **Validate inputs** - Check file sizes before processing
 4. **Set timeouts externally** - Limit processing time at the CI step or shell level
 
+#### No internal time cap — use external timeouts
+
 **Important**: skim does NOT impose an internal wall-clock timeout on wrapped commands
 (removed in ADR-008). It imposes a **64 MiB memory cap** on captured output
-(`MAX_OUTPUT_BYTES`) — that protection remains. If you need a hard time bound, add it
-externally:
+(`MAX_OUTPUT_BYTES`) — that protection remains. The cap is applied **per pipe**: stdout
+and stderr are each capped independently at 64 MiB, so worst-case combined retained
+output is ~128 MiB. If you need a hard time bound, add it externally:
+
+- **CI step timeout**: `timeout-minutes:` in GitHub Actions (or equivalent in other CI systems)
+- **Shell `timeout(1)`**: `timeout 300 skim ...`
+- **Agent tool timeout**: configure at the agent level
+- **Interactive**: `Ctrl-C`
 
 ```yaml
 # GitHub Actions example — bound command lifetime at the step level
@@ -283,10 +291,18 @@ externally:
     timeout 300 skim src/ --no-cache > docs/api.txt
 ```
 
+#### Dev servers and watch-mode commands
+
 For interactive dev servers and watch-mode commands (`vite dev`, `npm run dev`,
 `jest --watch`, etc.), skim detects them automatically and passes them through with
 inherited stdio — no buffering, no compression. This means `Ctrl-C` works and live
 output streams directly to the terminal.
+
+**Piped-stdin and vitest**: the indefinite-command guard fires regardless of whether
+stdin is a terminal. As an accepted tradeoff, `cat output | skim vitest` runs vitest
+live rather than compressing the piped input. To compress piped vitest output, use
+`skim vitest run` (the `run` subcommand marks the invocation as finite) or set
+`SKIM_PASSTHROUGH=1` to let skim forward piped content without spawning a new process.
 
 ### Glob Pattern Security
 

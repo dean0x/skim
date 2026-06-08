@@ -95,6 +95,13 @@ fn test_hook_mode_jest_watch_not_rewritten() {
 }
 
 /// In hook mode, finite `jest --ci` IS rewritten to `skim jest --ci`.
+///
+/// Hook mode never executes the tool — it only rewrites the command string.
+/// The output is therefore deterministic regardless of whether jest is installed.
+///
+/// Expected output: Claude Code hook response JSON containing the rewritten
+/// command `"skim jest --ci"` inside `hookSpecificOutput.updatedInput.command`.
+/// The JSON will contain the substring `"skim jest --ci"`.
 #[cfg(unix)]
 #[test]
 fn test_hook_mode_jest_ci_is_rewritten() {
@@ -112,10 +119,12 @@ fn test_hook_mode_jest_ci_is_rewritten() {
         .timeout(std::time::Duration::from_secs(10))
         .assert()
         .success()
-        // Non-empty stdout means it was rewritten.
-        .stdout(predicate::str::contains("skim").or(predicate::str::is_empty()));
-    // Note: jest --ci is only rewritten if jest is in the rule table.
-    // The important assertion is that jest --watch (above) is NOT rewritten.
+        // Hook mode emits a JSON response with the rewritten command.
+        // `jest` is in the rule table (prefix: ["jest"], rewrite_to: ["skim", "jest"])
+        // with no skip flags, so `jest --ci` always rewrites to `skim jest --ci`.
+        // The rewritten command is embedded in the hook response JSON — check both
+        // that the output is non-empty and that it contains the rewritten command.
+        .stdout(predicate::str::contains("skim jest --ci"));
 }
 
 // ============================================================================
@@ -146,7 +155,12 @@ fn test_direct_dispatch_indefinite_exits_quickly_when_binary_missing() {
     // run_inherited_passthrough.
     skim_cmd()
         .args(["nodemon", "app.js"])
-        .timeout(std::time::Duration::from_secs(5))
+        // No-hang safety net only (10s matches the sibling smoke tests above).
+        // The earlier 5s bound flaked under peak parallel-test CPU contention;
+        // the deterministic exit-127 mapping is covered by the dispatch.rs unit
+        // test cited above, so this bound just needs enough headroom to never
+        // trip on a healthy machine.
+        .timeout(std::time::Duration::from_secs(10))
         .assert()
         // Primary check: exits within the timeout (does not hang).
         // If nodemon is somehow installed and starts → non-127 is also acceptable

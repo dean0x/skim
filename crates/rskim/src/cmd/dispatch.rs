@@ -90,8 +90,24 @@ fn extract_subcmd<'a>(
 /// before any thread is spawned, so `Command::new(program)` resolves to the
 /// real binary without recursion.
 ///
-/// Exit code mapping mirrors the streaming gh path:
-/// - ENOENT (program not found) → 127
+/// # Why no `ChildGuard` is needed here
+///
+/// `CommandRunner`-based spawn paths use `ChildGuard` (a kill-on-drop RAII
+/// wrapper) to reap the child on any early-return path — e.g., the 64 MiB
+/// output cap error, a pipe-capture failure, or a reader-thread panic.
+///
+/// This function uses `Command::status()` instead, which blocks synchronously
+/// until the child exits and reaps it internally before returning.  There is
+/// no window between spawn and reap where an early return could leave an
+/// orphan process, so no separate guard is needed.  The fully-inherited stdio
+/// also means there are no capture threads, no pipe buffers to drain, and no
+/// intermediate state that could trigger an early return while the child is
+/// still running.
+///
+/// # Exit code mapping (mirrors the streaming `gh` path)
+///
+/// - ENOENT (program not found) → 127 (POSIX "command not found" convention)
+/// - Other spawn error → `ExitCode::FAILURE` (diagnostic printed to stderr)
 /// - Signal termination (code = `None`) → `ExitCode::FAILURE`
 /// - Otherwise → the child's actual exit code
 fn run_inherited_passthrough(program: &str, args: &[String]) -> ExitCode {
@@ -99,7 +115,13 @@ fn run_inherited_passthrough(program: &str, args: &[String]) -> ExitCode {
 
     match status {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => ExitCode::from(127u8),
-        Err(_) => ExitCode::FAILURE,
+        Err(e) => {
+            // Fail loud: report the actual spawn error rather than silently
+            // returning a failure exit code (avoids PF-003 — do not attribute
+            // failures to external tools without surfacing skim's own involvement).
+            eprintln!("error: failed to spawn {program}: {e}");
+            ExitCode::FAILURE
+        }
         Ok(s) => match s.code() {
             Some(code) => ExitCode::from(code.clamp(0, 255) as u8),
             None => ExitCode::FAILURE, // killed by signal
@@ -657,6 +679,42 @@ mod tests {
         assert!(
             err_msg.contains("Unknown subcommand"),
             "error message should mention 'Unknown subcommand', got: {err_msg}"
+        );
+    }
+
+    // ========================================================================
+    // is_indefinite_command — dispatch boundary classification
+    // ========================================================================
+
+    /// Verify that finite commands are NOT classified as indefinite at the
+    /// dispatch boundary, so they fall through to the normal handler rather
+    /// than `run_inherited_passthrough`.
+    ///
+    /// Positive control: a known-indefinite command (`tail -f`) must return
+    /// `true` to confirm the detector is active. Negative controls use
+    /// representative finite commands (`cargo test`, bare `tsc`) that must
+    /// never be routed to the inherited-stdio daemon path.
+    #[test]
+    fn test_is_indefinite_command_dispatch_boundary() {
+        use crate::cmd::rewrite::indefinite::is_indefinite_command;
+
+        // Positive control — `tail -f` is indefinite; it must be detected so
+        // daemon passthrough fires correctly.
+        assert!(
+            is_indefinite_command(&["tail", "-f", "app.log"]),
+            "tail -f must be classified as indefinite"
+        );
+
+        // Negative controls — finite build/test tools must NOT trigger daemon
+        // passthrough; routing them to run_inherited_passthrough would bypass
+        // output compression entirely.
+        assert!(
+            !is_indefinite_command(&["cargo", "test"]),
+            "cargo test must be classified as finite"
+        );
+        assert!(
+            !is_indefinite_command(&["tsc"]),
+            "bare tsc must be classified as finite (watch requires --watch/-w)"
         );
     }
 

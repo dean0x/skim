@@ -34,10 +34,18 @@
 /// degrades to the buffered capture path; a false-positive (wrongly flagged
 /// finite command) only loses compression for that invocation.
 ///
-/// The function must NEVER be called on zero-length slices — the assertion
-/// guards against that precondition violation.
+/// **Input format:** `tokens` must be pre-split on whitespace. The hook path
+/// splits the raw compound command string on whitespace; `dispatch()` passes
+/// the already-parsed argv. Both forms pass `&[&str]` directly without
+/// re-parsing inside this function.
+///
+/// **Leading env-var skipping** (`KEY=VALUE` tokens) primarily serves the hook
+/// path, where the raw command line includes env-var prefixes like
+/// `NODE_ENV=dev npm run dev`. The dispatch path has already resolved the
+/// subcommand before calling here, so those tokens typically do not appear.
+///
+/// **Empty input:** safely returns `false` — callers need not pre-check length.
 pub(crate) fn is_indefinite_command(tokens: &[&str]) -> bool {
-    debug_assert!(!tokens.is_empty(), "tokens must not be empty");
     if tokens.is_empty() {
         return false;
     }
@@ -210,16 +218,16 @@ fn pm_is_indefinite(program: &str, rest: &[&str]) -> bool {
         },
         // yarn and bun: first positional is either a built-in or the script name.
         // Both support `yarn run dev` and `bun run dev` but also `yarn dev` / `bun dev`.
+        //
+        // Flags may precede `run`, e.g. `yarn --silent run dev`. A single linear
+        // pass over positional tokens handles all styles correctly:
+        //   1. Collect non-flag tokens in order.
+        //   2. If the first positional is `run`/`run-script`, the script is the
+        //      second positional; otherwise the first positional is the script.
         _ => {
-            let first = rest.iter().copied().find(|s| !s.starts_with('-'));
-            match first {
-                Some("run") | Some("run-script") => {
-                    // yarn run dev / bun run dev
-                    rest.iter()
-                        .copied()
-                        .skip_while(|s| *s == "run" || *s == "run-script")
-                        .find(|s| !s.starts_with('-'))
-                }
+            let mut positionals = rest.iter().copied().filter(|s| !s.starts_with('-'));
+            match positionals.next() {
+                Some("run") | Some("run-script") => positionals.next(),
                 other => other,
             }
         }
@@ -335,6 +343,56 @@ mod tests {
         ];
 
         for cmd in &cases {
+            assert!(
+                !is_indefinite(cmd),
+                "Expected is_indefinite_command to return false for: {cmd:?}"
+            );
+        }
+    }
+
+    // ─── pm_is_indefinite: flags-before-run regression (ADR-008, ADR-001) ──
+    //
+    // `yarn --silent run dev` previously returned false (finite) because
+    // `skip_while(|s| *s == "run")` restarted from the beginning of `rest`,
+    // stopping immediately at `--silent`, so `.find(non-flag)` returned `"run"`
+    // itself as the script name — which is not in INDEFINITE_SCRIPTS.
+    // The single-pass positionals iterator fixes this.
+    #[test]
+    fn test_pm_flags_before_run_dev() {
+        // Regression: flag before `run` must not confuse script extraction.
+        assert!(
+            is_indefinite("yarn --silent run dev"),
+            "yarn --silent run dev must be indefinite"
+        );
+        // Sanity: finite script is still finite even with flags before run.
+        assert!(
+            !is_indefinite("yarn --silent run build"),
+            "yarn --silent run build must be finite"
+        );
+    }
+
+    #[test]
+    fn test_pm_indefinite_variants() {
+        let indefinite = [
+            "yarn run dev",
+            "yarn dev",
+            "bun run dev",
+            "npm run dev",
+            "pnpm run dev",
+            "NODE_ENV=dev npm run dev",
+        ];
+        for cmd in &indefinite {
+            assert!(
+                is_indefinite(cmd),
+                "Expected is_indefinite_command to return true for: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pm_finite_variants() {
+        let finite = ["yarn run build", "bun run build", "npm run build"];
+        for cmd in &finite {
             assert!(
                 !is_indefinite(cmd),
                 "Expected is_indefinite_command to return false for: {cmd:?}"
