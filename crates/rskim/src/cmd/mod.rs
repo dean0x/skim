@@ -89,6 +89,11 @@ use std::sync::LazyLock;
 /// `skim vitest` became indefinite (ADR-008 Part C), callers that want
 /// compression via piped stdin should use `skim vitest run`; `should_read_stdin`
 /// recognises this single-token case so existing stdin pipelines keep working.
+///
+/// Note: this is a generic predicate shared by every tool family that supports
+/// piped stdin (test, lint, infra, pkg, gh). The `run` exception's rationale is
+/// rooted in test-runner semantics, but the check is applied uniformly wherever
+/// stdin-eligibility is decided.
 pub(crate) fn should_read_stdin(args: &[String]) -> bool {
     use std::io::IsTerminal;
     let no_real_args = args.is_empty() || (args.len() == 1 && args[0] == "run");
