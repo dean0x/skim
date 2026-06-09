@@ -19,7 +19,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::HashSet;
 use std::fs;
 use std::io::BufWriter;
 use std::path::Path;
@@ -812,8 +811,6 @@ fn run_ast_standalone_with_real_index_maps_paths() {
 /// matches at least one Rust file in the fixture project.
 #[test]
 fn resolve_ast_file_filter_returns_matching_file_ids() {
-    use rskim_search::AstQueryEngine;
-
     let project = make_project_with_rust();
     let cache = tempfile::tempdir().unwrap();
 
@@ -1127,8 +1124,8 @@ fn text_ast_combined_self_heals_below_format_version_ast_index() {
 ///    `src/alpha.rs` (only alpha.rs co-changes with plain.rs in the DB).
 /// 3. The filtered set is STRICTLY SMALLER than the unfiltered set.
 ///    — This is the assertion that would have caught the original bug: if `--ast` were
-///      still being silently dropped (falling through to `run_temporal_standalone`),
-///      the AST result set would be unrestricted and both files would appear.
+///    still being silently dropped (falling through to `run_temporal_standalone`),
+///    the AST result set would be unrestricted and both files would appear.
 /// 4. Graceful-degrade: blast file with no temporal DB → full AST set, exit 0, no error.
 ///
 /// Strategy: drive `run_ast_standalone` directly with an injected `TemporalDb` (no git
@@ -1145,7 +1142,7 @@ fn text_ast_combined_self_heals_below_format_version_ast_index() {
 #[test]
 fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
     use super::super::manifest::FileManifest;
-    use rskim_search::{FileId, parse_ast_query};
+    use rskim_search::FileId;
 
     // Build a project where BOTH src/alpha.rs and src/beta.rs match rust-nested-loop.
     let project = make_project_with_two_nested_loop_files();
