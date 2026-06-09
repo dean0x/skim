@@ -1,46 +1,27 @@
-# Per-developer session state (fully transient)
-memory/
+# .devflow/ git-tracking policy
+# ---------------------------------------------------------------------------
+# Only curated, shared team knowledge is committed to git:
+#   - decisions/decisions.md, decisions/pitfalls.md      (ADR / pitfall records)
+#   - features/index.json, features/<slug>/KNOWLEDGE.md  (feature knowledge bases)
+#
+# Everything else under .devflow/ is per-developer or transient (memory, dream,
+# docs, locks, runtime state, manifest, scratch results) and is
+# intentionally ignored. Model: ignore-by-default, then re-include the curated
+# files. Any NEW file under .devflow/ is ignored unless explicitly listed below.
 
-# Sidecar dispatch system (fully transient)
-sidecar/
+# 1. Ignore everything under .devflow/ by default
+*
 
-# Per-developer observation logs and transient state
-learning/learning-log.jsonl
-learning/learning-log.v1.jsonl.bak
-learning/learning.json
-learning/.learning-manifest.json
-learning/.learning-notified-at
-learning/.learning-notifications.json
-learning/.learning-runs-today
-learning/.learning-session-count
-learning/.learning-batch-ids
-learning/debug/
+# 2. Keep this policy file
+!.gitignore
 
-# Per-developer decisions observation log and transient state
-decisions/decisions-log.jsonl
-decisions/decisions.json
-decisions/.decisions-manifest.json
-decisions/.decisions.lock/
-decisions/.decisions-usage.json
-decisions/.decisions-usage.lock/
-decisions/.decisions-notifications.json
-decisions/.decisions-runs-today
-decisions/.decisions-batch-ids
-decisions/.disabled
+# 3. Track the decisions knowledge (not its log / config / locks / usage state)
+!decisions/
+!decisions/decisions.md
+!decisions/pitfalls.md
 
-# Ephemeral doc artifacts
-docs/handoff-*.md
-docs/reviews/*/.last-review-head
-
-# Transient files in features
-features/.knowledge.lock/
-features/.knowledge-last-refresh
-features/.knowledge-refresh.lock
-features/.disabled
-features/.gitignore-configured
-
-# Install state (local-scope only)
-manifest.json
-
-# Init marker
-.gitignore-configured
+# 4. Track the feature knowledge bases (not locks / sentinels / scratch results)
+!features/
+!features/index.json
+!features/*/
+!features/*/KNOWLEDGE.md

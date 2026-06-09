@@ -167,9 +167,11 @@ fn test_alignment_npx_vitest_rewrite_and_handler() {
     // vitest handler accepts stdin. Use a fixture matching the PIPE_RE pattern:
     // "Tests  N passed | N failed | N total" so the handler parses it as Full/Degraded
     // and exits 0 (no failures).
+    // `vitest run` is the finite one-shot mode — daemon guard does not fire.
+    // should_read_stdin treats args==["run"] as stdin-eligible so piped stdin works.
     let fixture = include_str!("fixtures/cmd/test/vitest_regex_fail.txt");
     skim_cmd()
-        .args(["vitest"])
+        .args(["vitest", "run"])
         .write_stdin(fixture)
         .assert()
         // vitest exits 1 when there are failures; fixture has 1 failure.

@@ -104,7 +104,7 @@ fn test_exit_code_cargo_passthrough_garbage() {
 fn test_exit_code_vitest_pass_json() {
     let fixture = include_str!("fixtures/cmd/test/vitest_pass.json");
     skim_cmd()
-        .args(["vitest"])
+        .args(["vitest", "run"])
         .write_stdin(fixture)
         .assert()
         .code(0);
@@ -115,7 +115,7 @@ fn test_exit_code_vitest_fail_json() {
     // Vitest infers exit code from parsed results (fail > 0 => FAILURE)
     let fixture = include_str!("fixtures/cmd/test/vitest_fail.json");
     skim_cmd()
-        .args(["vitest"])
+        .args(["vitest", "run"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0));
@@ -125,7 +125,7 @@ fn test_exit_code_vitest_fail_json() {
 fn test_exit_code_vitest_passthrough_garbage() {
     // Vitest passthrough always returns ExitCode::FAILURE
     skim_cmd()
-        .args(["vitest"])
+        .args(["vitest", "run"])
         .write_stdin("completely unparseable garbage text\n")
         .assert()
         .code(predicate::ne(0));

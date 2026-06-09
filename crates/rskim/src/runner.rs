@@ -1,14 +1,37 @@
 //! Command execution engine (#40)
 //!
-//! Provides a safe, timeout-aware command runner that captures stdout/stderr
-//! concurrently to prevent pipe deadlocks. No shell interpretation — commands
-//! are executed directly via `Command::new().args()`.
+//! Provides a transparent command runner that captures stdout/stderr concurrently
+//! to prevent pipe deadlocks. No shell interpretation — commands are executed
+//! directly via `Command::new().args()`.
+//!
+//! # Design (ADR-008 — no internal timeout)
+//!
+//! Skim is a transparent command wrapper: it intercepts `cargo test`, `git diff`,
+//! `npm build`, etc., runs the real command, compresses the output, and prints.
+//! A transparent wrapper must NOT change whether or when a command completes.
+//! Previous versions imposed a wall-clock cap (300 s / 600 s) that could kill
+//! long-running but finite commands (e.g., a full `cargo test --all-features`
+//! run on a large workspace).
+//!
+//! **`CommandRunner` is now stateless and imposes no timeout.** Callers that need
+//! a time bound should use an external mechanism: CI step timeout, the shell
+//! `timeout(1)` command, the agent tool timeout, or `Ctrl-C`. The 64 MiB memory
+//! cap ([`MAX_OUTPUT_BYTES`]) is unchanged — this removes the TIME bound, not the
+//! MEMORY bound.
+//!
+//! # Kill-on-drop guard
+//!
+//! The spawned child is wrapped in [`ChildGuard`], whose `Drop` implementation
+//! calls `kill()` followed by `wait()`. On the normal execution path the child
+//! has already exited before `drop` fires, so `kill()` is a harmless no-op.
+//! On any early-return path (pipe-capture failure, reader-thread panic, size-cap
+//! error) the guard kills the still-running child, preventing orphans.
 
 // Infrastructure module — consumers arrive in later Phase B tickets.
 #![allow(dead_code)]
 
 use std::io::Read;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{io, thread};
 
@@ -37,10 +60,6 @@ pub(crate) enum RunnerError {
         source: io::Error,
     },
 
-    /// The command exceeded its timeout and was killed.
-    #[error("command timed out after {timeout:?}")]
-    Timeout { timeout: Duration },
-
     /// I/O error reading pipes.
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -54,28 +73,45 @@ pub(crate) enum RunnerError {
     ReaderPanicked { pipe: &'static str },
 }
 
-/// A command runner with optional timeout support.
+/// A stateless command runner.
 ///
 /// Commands are executed directly via `Command::new().args()` — no shell
-/// interpretation. Stdout and stderr are captured concurrently via two
-/// reader threads to prevent pipe deadlocks on large output.
-pub(crate) struct CommandRunner {
-    timeout: Option<Duration>,
-}
+/// interpretation. Stdout and stderr are captured concurrently via two reader
+/// threads to prevent pipe deadlocks on large output.
+///
+/// # Stateless unit struct (ADR-008)
+///
+/// `CommandRunner` is a zero-field unit struct. `new()` takes no arguments and
+/// carries no configuration: there is no timeout, no retry count, and no
+/// buffering policy stored here. All policy is provided at call sites.
+///
+/// # No internal timeout (ADR-008)
+///
+/// `CommandRunner` imposes no wall-clock cap. Skim is a transparent wrapper:
+/// a transparent wrapper must not change whether or when a command completes.
+/// Bound child-process lifetime externally if needed: use a CI step timeout,
+/// the shell `timeout(1)` utility, the agent tool timeout, or `Ctrl-C`.
+///
+/// The 64 MiB output cap ([`MAX_OUTPUT_BYTES`]) remains — only the TIME bound
+/// is removed, not the MEMORY bound.
+///
+/// On any early-return path (size-cap, pipe failure, thread panic) the spawned
+/// child is automatically killed and reaped by the [`ChildGuard`] RAII wrapper
+/// before `run_with_env` returns, preventing orphan processes.
+#[derive(Debug, Default)]
+pub(crate) struct CommandRunner;
 
 impl CommandRunner {
     /// Create a new runner.
-    ///
-    /// `timeout` — maximum wall-clock duration before the child is killed.
-    /// `None` means wait indefinitely.
-    pub(crate) fn new(timeout: Option<Duration>) -> Self {
-        Self { timeout }
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self
     }
 
     /// Execute `program` with `args`, capturing stdout and stderr.
     ///
     /// Returns [`CommandOutput`] on success or an error if the program cannot
-    /// be spawned, times out, or pipe I/O fails.
+    /// be spawned or pipe I/O fails.
     pub(crate) fn run(&self, program: &str, args: &[&str]) -> anyhow::Result<CommandOutput> {
         self.run_with_env(program, args, &[])
     }
@@ -83,7 +119,7 @@ impl CommandRunner {
     /// Execute `program` with `args` and environment variable overrides,
     /// capturing stdout and stderr.
     ///
-    /// Reuses the same timeout, output-size cap, and pipe-capture logic as
+    /// Reuses the same output-size cap and pipe-capture logic as
     /// [`run`](Self::run). Pass an empty slice for `env_vars` when no
     /// overrides are needed.
     pub(crate) fn run_with_env(
@@ -101,17 +137,24 @@ impl CommandRunner {
             cmd.env(key, value);
         }
 
-        let mut child = cmd.spawn().map_err(|source| RunnerError::SpawnFailed {
+        let child = cmd.spawn().map_err(|source| RunnerError::SpawnFailed {
             program: program.to_string(),
             source,
         })?;
 
+        // Wrap in ChildGuard: kills + reaps on any early return or unwind.
+        // On the normal path the child has already exited by the time drop fires,
+        // so kill() is a harmless no-op (returns ESRCH on Unix).
+        let mut child = ChildGuard(child);
+
         // Take pipes BEFORE spawning reader threads — avoids borrowing child later.
         let child_stdout = child
+            .0
             .stdout
             .take()
             .ok_or(RunnerError::PipeCaptureFailed { pipe: "stdout" })?;
         let child_stderr = child
+            .0
             .stderr
             .take()
             .ok_or(RunnerError::PipeCaptureFailed { pipe: "stderr" })?;
@@ -120,8 +163,8 @@ impl CommandRunner {
         let stdout_handle = thread::spawn(move || read_pipe(child_stdout));
         let stderr_handle = thread::spawn(move || read_pipe(child_stderr));
 
-        // Wait for child with optional timeout.
-        let status = self.wait_with_timeout(&mut child, start)?;
+        // Wait for child — no timeout; transparent wrapper must not impose a time cap.
+        let status = child.0.wait()?;
 
         // Join reader threads — propagate panics as anyhow errors.
         let stdout = stdout_handle
@@ -170,7 +213,7 @@ impl CommandRunner {
             Ok(out) => Ok(out),
             Err(original_err) => {
                 // Only attempt Node.js fallback resolution when the program was
-                // not found on PATH (SpawnFailed). Other errors — Timeout,
+                // not found on PATH (SpawnFailed). Other errors —
                 // PipeCaptureFailed, ReaderPanicked, Io — mean the program was
                 // found and launched; retrying via npx makes no sense and could
                 // mask real failures.
@@ -201,36 +244,42 @@ impl CommandRunner {
             }
         }
     }
+}
 
-    /// Wait for the child process, killing it if the timeout is exceeded.
-    ///
-    /// Uses polling with exponential backoff (1ms → 50ms cap) when a timeout
-    /// is set. Without a timeout, blocks on `child.wait()` directly.
-    fn wait_with_timeout(&self, child: &mut Child, start: Instant) -> anyhow::Result<ExitStatus> {
-        let Some(timeout) = self.timeout else {
-            return Ok(child.wait()?);
-        };
+// ============================================================================
+// ChildGuard — kill + reap on drop (ADR-008)
+// ============================================================================
 
-        let mut sleep_ms: u64 = 1;
-        const MAX_SLEEP_MS: u64 = 50;
+/// RAII wrapper that kills and reaps a child process on drop.
+///
+/// When the parent exits early (size-cap error, pipe failure, thread panic,
+/// or any other unwind path before `wait()` completes), the `Drop`
+/// implementation calls `kill()` followed by `wait()` to prevent the child
+/// from becoming a zombie or an orphan.
+///
+/// `kill()` on an already-exited process is a no-op on Unix (returns `ESRCH`)
+/// and returns `InvalidInput` on Windows — both cases are explicitly ignored.
+/// On the normal execution path the child has already exited before drop fires,
+/// so this is always a harmless no-op.
+///
+/// # Limitation — direct child only
+///
+/// `kill()` signals the direct child process; grandchildren (e.g., the `node`
+/// subprocess spawned by `npm`, or `rustc` spawned by `cargo`) are not reached.
+/// Hardening to kill the full process group (`kill(-pgid, SIGKILL)`) is a
+/// Unix-only change deferred to a follow-up (ADR-001: noticed but out of scope
+/// for ADR-008).
+///
+/// `pub(crate)` so that `cmd::infra::gh::streaming` can reuse this guard
+/// instead of maintaining a duplicate definition (ADR-001).
+pub(crate) struct ChildGuard(pub(crate) std::process::Child);
 
-        loop {
-            match child.try_wait()? {
-                Some(status) => return Ok(status),
-                None => {
-                    if start.elapsed() >= timeout {
-                        // Kill the child — ignore error (process may have exited
-                        // between try_wait and kill).
-                        let _ = child.kill();
-                        // Reap the zombie so the OS can reclaim its PID.
-                        let _ = child.wait();
-                        return Err(RunnerError::Timeout { timeout }.into());
-                    }
-                    thread::sleep(Duration::from_millis(sleep_ms));
-                    sleep_ms = (sleep_ms * 2).min(MAX_SLEEP_MS);
-                }
-            }
-        }
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        // kill() is a no-op on an already-exited child; ignore the result.
+        let _ = self.0.kill();
+        // wait() reaps the zombie; ignore result (process may already be reaped).
+        let _ = self.0.wait();
     }
 }
 
@@ -304,7 +353,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_echo_captures_stdout() {
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         let result = runner.run("echo", &["hello world"]).unwrap();
 
         assert_eq!(result.stdout.trim(), "hello world");
@@ -315,7 +364,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_captures_stderr() {
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         // Use a path that definitely does not exist.
         let result = runner
             .run("cat", &["/nonexistent/path/SKIM_TEST_404"])
@@ -328,7 +377,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_preserves_nonzero_exit_code() {
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         let result = runner.run("false", &[]).unwrap();
 
         assert_eq!(result.exit_code, Some(1));
@@ -337,7 +386,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_preserves_zero_exit_code() {
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         let result = runner.run("true", &[]).unwrap();
 
         assert_eq!(result.exit_code, Some(0));
@@ -346,7 +395,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_does_not_interpret_shell_metacharacters() {
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         // Pass `&& rm -rf /` as a single literal argument.
         let result = runner.run("echo", &["&& rm -rf /"]).unwrap();
 
@@ -360,7 +409,7 @@ mod tests {
 
     #[test]
     fn run_returns_error_for_nonexistent_program() {
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         let err = runner
             .run("skim_test_nonexistent_program_42", &[])
             .unwrap_err();
@@ -374,31 +423,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn run_kills_on_timeout() {
-        let runner = CommandRunner::new(Some(Duration::from_millis(100)));
-        let err = runner.run("sleep", &["10"]).unwrap_err();
-
-        let msg = err.to_string();
-        assert!(
-            msg.contains("timed out"),
-            "Expected 'timed out' in error, got: {msg}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn run_completes_within_timeout() {
-        let runner = CommandRunner::new(Some(Duration::from_secs(5)));
-        let result = runner.run("echo", &["fast"]).unwrap();
-
-        assert_eq!(result.stdout.trim(), "fast");
-        assert_eq!(result.exit_code, Some(0));
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn run_tracks_duration() {
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         let result = runner.run("echo", &["timing"]).unwrap();
 
         assert!(
@@ -415,7 +441,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_handles_large_stdout_without_deadlock() {
-        let runner = CommandRunner::new(Some(Duration::from_secs(10)));
+        let runner = CommandRunner::new();
         // `head -c 131072 /dev/zero` outputs exactly 131072 bytes of null bytes.
         let result = runner.run("head", &["-c", "131072", "/dev/zero"]).unwrap();
 
@@ -460,7 +486,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_handles_concurrent_stdout_stderr() {
-        let runner = CommandRunner::new(Some(Duration::from_secs(10)));
+        let runner = CommandRunner::new();
         // Use python3 to write large output to both stdout and stderr simultaneously.
         let result = runner
             .run(
@@ -487,7 +513,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_handles_empty_output() {
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         let result = runner.run("true", &[]).unwrap();
 
         assert!(result.stdout.is_empty());
@@ -497,7 +523,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dispatch_overhead_under_15ms() {
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         let result = runner.run("true", &[]).unwrap();
 
         // `true` completes instantly, so the entire duration is dispatch overhead.
@@ -514,7 +540,7 @@ mod tests {
 
     #[test]
     fn run_empty_program_name_errors() {
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         let err = runner.run("", &[]).unwrap_err();
         let msg = err.to_string();
         // Asserts Display format, not spawn detection — see is_spawn_error for control flow.
@@ -527,7 +553,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_stderr_with_zero_exit() {
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         let result = runner
             .run("bash", &["-c", "echo warn >&2; exit 0"])
             .unwrap();
@@ -542,20 +568,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn run_timeout_zero_kills_immediately() {
-        let runner = CommandRunner::new(Some(Duration::ZERO));
-        let err = runner.run("sleep", &["10"]).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("timed out"),
-            "Expected 'timed out' in error, got: {msg}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn run_args_with_literal_backslash_n() {
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         // Pass a literal `\n` (backslash + n) as an argument.
         // Since the runner doesn't use shell, echo should output it literally.
         let result = runner.run("echo", &["line1\\nline2"]).unwrap();
@@ -569,7 +583,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_binary_output_is_lossy() {
-        let runner = CommandRunner::new(Some(Duration::from_secs(10)));
+        let runner = CommandRunner::new();
         let result = runner.run("head", &["-c", "1024", "/dev/urandom"]).unwrap();
 
         assert!(
@@ -627,7 +641,7 @@ mod tests {
     #[test]
     fn test_node_fallback_direct_success_no_fallback() {
         // `echo` is always in PATH — succeeds on the first attempt.
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         let result = runner.run_with_node_fallback("echo", &["hello"]).unwrap();
         assert_eq!(result.stdout.trim(), "hello");
         assert_eq!(result.exit_code, Some(0));
@@ -636,7 +650,7 @@ mod tests {
     #[test]
     fn test_node_fallback_absolute_path_no_fallback() {
         // Absolute path — no fallback should be tried (contains '/').
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         let err = runner
             .run_with_node_fallback("/nonexistent-binary-1234", &[])
             .unwrap_err();
@@ -651,7 +665,7 @@ mod tests {
     #[test]
     fn test_node_fallback_relative_path_no_fallback() {
         // Relative path (contains '/') — no fallback.
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         let err = runner
             .run_with_node_fallback("./nonexistent-binary-5678", &[])
             .unwrap_err();
@@ -675,7 +689,7 @@ mod tests {
         // non-zero exit code (npx ran and reported failure).
         // Either outcome is acceptable — the key property is that the original
         // program (__skim_nonexistent_9999__) was never successfully executed.
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         match runner.run_with_node_fallback("__skim_nonexistent_9999__", &[]) {
             Err(e) => {
                 let msg = e.to_string();
@@ -716,7 +730,7 @@ mod tests {
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
         let result = std::panic::catch_unwind(|| {
-            let runner = CommandRunner::new(None);
+            let runner = CommandRunner::new();
             // `fake-tool` is not in PATH, but ./node_modules/.bin/fake-tool exists
             runner.run_with_node_fallback("fake-tool", &[]).unwrap()
         });
@@ -733,7 +747,7 @@ mod tests {
         // non-zero (package not found locally). When npx is not available, the
         // original spawn error is returned as Err.
         // Either way, the unknown program must never succeed (exit code != 0).
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         match runner.run_with_node_fallback("__skim_nonexistent_npx_test_8888__", &[]) {
             Err(e) => {
                 let msg = e.to_string();
@@ -765,7 +779,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_node_fallback_env_vars_forwarded() {
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         let env_overrides = &[("SKIM_TEST_ENV_FORWARD", "hello_from_skim")];
         // printenv KEY prints the value of KEY if set, exits 0; exits non-zero if unset.
         let result = runner
@@ -785,7 +799,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_node_fallback_args_preserved() {
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new();
         let result = runner
             .run_with_env_node_fallback("echo", &["arg_one", "arg_two", "arg_three"], &[])
             .unwrap();
@@ -812,15 +826,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_spawn_error_false_for_timeout() {
-        let err: anyhow::Error = RunnerError::Timeout {
-            timeout: Duration::from_secs(1),
-        }
-        .into();
-        assert!(!is_spawn_error(&err));
-    }
-
-    #[test]
     fn test_is_spawn_error_false_for_io() {
         let err: anyhow::Error =
             RunnerError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe")).into();
@@ -837,5 +842,156 @@ mod tests {
     fn test_is_spawn_error_false_for_reader_panicked() {
         let err: anyhow::Error = RunnerError::ReaderPanicked { pipe: "stderr" }.into();
         assert!(!is_spawn_error(&err));
+    }
+
+    // ========================================================================
+    // ChildGuard kill-on-drop contract (ADR-008)
+    // ========================================================================
+
+    /// Verify that ChildGuard kills a long-running child when dropped.
+    ///
+    /// Spawns `sleep 60`, immediately drops the guard, then uses `kill -0`
+    /// to confirm the child is no longer running.
+    #[cfg(unix)]
+    #[test]
+    fn child_guard_kills_running_child() {
+        use std::process::Stdio;
+
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn sleep");
+
+        let pid = child.id();
+        let guard = ChildGuard(child);
+
+        // Drop the guard: this calls kill() + wait() on the child.
+        drop(guard);
+
+        // kill -0 returns non-zero when the process does not exist.
+        let status = Command::new("kill").args(["-0", &pid.to_string()]).status();
+
+        match status {
+            Ok(s) => assert!(
+                !s.success(),
+                "process {pid} should have been killed by ChildGuard"
+            ),
+            Err(_) => {
+                // `kill` binary not found on this platform — spawn + drop
+                // completing without panic is sufficient verification.
+            }
+        }
+    }
+
+    /// Regression: CommandRunner imposes NO internal wall-clock cap (ADR-008).
+    ///
+    /// Runs a finite command that takes ~1.5 s and asserts it completes
+    /// successfully with full output — it must not be killed or truncated by
+    /// any internal timeout.
+    #[cfg(unix)]
+    #[test]
+    fn no_internal_timeout_finite_command_runs_to_completion() {
+        let runner = CommandRunner::new();
+        // A ~1.5-second command that exits 0 and prints "done" to stdout.
+        // Uses `sh -c` for portability across Unix platforms.
+        let result = runner
+            .run("sh", &["-c", "sleep 1.5; echo done"])
+            .expect("command should succeed");
+
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "finite 1.5-second command must exit 0 (ADR-008: no internal cap)"
+        );
+        assert!(
+            result.stdout.contains("done"),
+            "stdout must contain 'done' — command must not be truncated or killed"
+        );
+        // Sanity-check duration: must be at least 1 second (sleep ran) and
+        // less than 10 seconds (reasonable upper bound for a CI machine).
+        assert!(
+            result.duration >= Duration::from_secs(1),
+            "duration should be >= 1s, got {:?}",
+            result.duration
+        );
+        assert!(
+            result.duration < Duration::from_secs(10),
+            "duration should be < 10s, got {:?}",
+            result.duration
+        );
+    }
+
+    /// ChildGuard kill() on an already-exited child is a harmless no-op (ADR-008).
+    ///
+    /// Spawns a command that exits immediately, waits for it to exit, then
+    /// drops the guard.  Drop must not panic or return an error — `kill()` on
+    /// a reaped process is explicitly ignored in the Drop impl.
+    #[cfg(unix)]
+    #[test]
+    fn child_guard_kill_on_already_exited_child_is_noop() {
+        use std::process::Stdio;
+
+        let child = Command::new("true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn true");
+
+        // Reap the child manually so it is definitely exited before ChildGuard
+        // drops.  We use a separate handle to call wait() first.
+        let mut child = ChildGuard(child);
+        let _ = child.0.wait(); // child is now a zombie/reaped
+
+        // Dropping the guard calls kill() on an already-exited child.
+        // This must not panic — kill() returns ESRCH which the Drop impl ignores.
+        drop(child); // must not panic
+    }
+
+    /// End-to-end coverage of the 64 MiB output-cap path through `run_with_env`
+    /// (ADR-008). Previously the cap was only exercised at the `read_pipe` unit
+    /// level; this drives a real child whose stdout exceeds the cap and asserts
+    /// the function surfaces the cap error *and returns* — i.e. it does not hang
+    /// or leak the child when a reader thread caps out.
+    ///
+    /// # Why this does not (and cannot) assert a live-child `ChildGuard` kill
+    ///
+    /// `run_with_env` blocks on `child.0.wait()` *before* it joins the reader
+    /// threads and surfaces their cap `Err`. So by the time the function returns
+    /// on the cap path the child has already exited (its next write to the
+    /// reader-closed pipe gets SIGPIPE), and `ChildGuard::drop` only ever kills
+    /// an already-dead process here — a no-op. The guard's *live*-child kill
+    /// fires only on an early return between guard construction and `wait()`; the
+    /// sole such path is `PipeCaptureFailed`, which is unreachable through the
+    /// public API because `Stdio::piped()` is always set, so `stdout.take()` /
+    /// `stderr.take()` never return `None`. The `ChildGuard::drop` kill contract
+    /// itself is therefore covered in isolation by
+    /// [`child_guard_kills_running_child`]; this test covers the reachable
+    /// behavior — the cap path completes cleanly rather than hanging.
+    ///
+    /// The child emits 70 MiB via `dd` and then exits (no trailing `sleep`):
+    /// once the reader caps at 64 MiB and drops the read end, `dd`'s next write
+    /// gets EPIPE/SIGPIPE and the child exits, so `wait()` unblocks promptly and
+    /// the test is bounded — never a 1-hour `sleep` hang.
+    #[cfg(unix)]
+    #[test]
+    fn run_with_env_surfaces_cap_error_without_hanging() {
+        // 70 MiB > the 64 MiB MAX_OUTPUT_BYTES cap. `dd` is the child's last
+        // command, so when the capped reader drops the pipe `dd` dies on SIGPIPE
+        // and the shell exits — `wait()` returns without blocking.
+        let runner = CommandRunner::new();
+        let result = runner.run_with_env(
+            "sh",
+            &["-c", "dd if=/dev/zero bs=1048576 count=70 2>/dev/null"],
+            &[],
+        );
+
+        let err =
+            result.expect_err("run_with_env must return Err when stdout exceeds the 64 MiB cap");
+        assert!(
+            err.to_string().contains("byte limit"),
+            "error must mention the byte limit, got: {err}"
+        );
     }
 }

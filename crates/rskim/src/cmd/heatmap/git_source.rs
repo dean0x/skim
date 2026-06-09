@@ -3,8 +3,6 @@
 //! Uses `CommandRunner` to execute git commands and parses their output into
 //! `CommitInfo` values via a simple state machine.
 
-use std::time::Duration;
-
 use crate::runner::{CommandRunner, is_spawn_error};
 
 use super::types::{CommitInfo, FileChangeInfo, HeatmapConfig};
@@ -67,7 +65,7 @@ pub(crate) struct CliGitSource {
 impl CliGitSource {
     pub(crate) fn new() -> Self {
         Self {
-            runner: CommandRunner::new(Some(Duration::from_secs(120))),
+            runner: CommandRunner::new(),
         }
     }
 

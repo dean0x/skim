@@ -12,7 +12,6 @@ pub(crate) mod maven;
 pub(crate) mod tsc;
 
 use std::process::ExitCode;
-use std::time::Duration;
 
 use crate::output::ParseResult;
 use crate::output::canonical::BuildResult;
@@ -157,7 +156,7 @@ pub(super) fn run_parsed_command(
     rec: crate::analytics::RecordingContext<'_>,
     parser: fn(&CommandOutput) -> ParseResult<BuildResult>,
 ) -> anyhow::Result<ExitCode> {
-    let runner = CommandRunner::new(Some(Duration::from_secs(600)));
+    let runner = CommandRunner::new();
 
     let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
 
