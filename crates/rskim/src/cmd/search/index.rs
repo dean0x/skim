@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use clap::Parser;
@@ -155,11 +155,12 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
 /// # Concurrency
 ///
 /// Acquires an exclusive advisory lock on `{cache_dir}/.skim-build.lock` before
-/// running the pipeline. If another process holds the lock the call blocks until
-/// that build completes and then proceeds with its own build. This serialises
-/// all callers — `skim init` background spawn, git-hook `--update`, and direct
-/// `--build` / `--rebuild` — protecting `index.skidx` and `index.skfiles` from
-/// concurrent writes.
+/// running the pipeline, with a 120-second deadline.  If another process holds
+/// the lock, the call polls every 200 ms and prints a one-time notice to stderr
+/// so the user knows why it is waiting.  After 120 s the call returns an error
+/// rather than blocking indefinitely.  This serialises all callers — `skim init`
+/// background spawn, git-hook `--update`, and direct `--build` / `--rebuild` —
+/// protecting `index.skidx` and `index.skfiles` from concurrent writes.
 ///
 /// The lock is released when the returned [`IndexResult`] (or the `Err`) drops,
 /// i.e. at the end of this function. The lock file itself is never deleted so
@@ -175,9 +176,44 @@ pub(super) fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("failed to open build lock: {}", lock_path.display()))?;
-    lock_file
-        .lock()
-        .with_context(|| "failed to acquire exclusive build lock")?;
+
+    // Bounded lock acquisition: poll every 200 ms for up to 120 s.
+    // `try_lock()` returns Err(TryLockError::WouldBlock) when another process
+    // holds the lock, and Err(TryLockError::Error(_)) on a real OS error.
+    // Drop-based release is preserved — `lock_file` drops at function end.
+    const LOCK_POLL_MS: u64 = 200;
+    const LOCK_DEADLINE_SECS: u64 = 120;
+    let deadline = Instant::now() + Duration::from_secs(LOCK_DEADLINE_SECS);
+    let mut noticed = false;
+    loop {
+        match lock_file.try_lock() {
+            Ok(()) => break, // lock acquired
+            Err(std::fs::TryLockError::WouldBlock) => {
+                // Another process holds the lock.
+                if !noticed {
+                    eprintln!(
+                        "skim search index: waiting for concurrent build to finish \
+                         (lock: {}) …",
+                        lock_path.display()
+                    );
+                    noticed = true;
+                }
+                if Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!(
+                        "another skim build has held {} for >{} s; \
+                         if no build is running, delete the lock file and retry",
+                        lock_path.display(),
+                        LOCK_DEADLINE_SECS,
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(LOCK_POLL_MS));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(anyhow::anyhow!(e))
+                    .with_context(|| "failed to acquire exclusive build lock");
+            }
+        }
+    }
 
     // Lock is held for the duration of the build. `lock_file` drops (and
     // releases the lock) when this function returns.
@@ -326,6 +362,16 @@ impl<'cfg> Pipeline<'cfg> {
         // the "every file gets exactly one call" contract was broken somewhere in
         // the consume loop. Abort before any write so the old manifest survives
         // and the next query self-heals. (applies ADR-006)
+        //
+        // Why the comparison holds for realistic projects: `manifest_count` is the
+        // number of unique BTreeMap keys (normalized rel-path strings), and
+        // `file_count` is the number of successful `add_file_classified` calls.
+        // They agree when every successfully-indexed file has a distinct normalized
+        // path key — the invariant upheld by `walk_metadata`'s sorted, deduped
+        // output.  A mismatch would require two walk entries to normalize to the
+        // same path key, which cannot happen on case-sensitive file-systems and is
+        // a data-corruption signal on case-insensitive ones; hence this guard is
+        // intentionally defensive rather than a common-case check.
         let manifest_count = new_manifest.entry_count();
         if manifest_count != file_count as usize {
             return Err(anyhow::anyhow!(
@@ -345,6 +391,9 @@ impl<'cfg> Pipeline<'cfg> {
         new_manifest.set_git_head(read_git_head(&self.config.root));
         new_manifest.save()?;
 
+        // `producer_handle.join()` above is the happens-before edge: the atomic
+        // load below is only valid after join() returns.  Moving this load before
+        // the join would make `producer_skips` racy.
         let total_skipped =
             to_u32_capped(walk_skip_count).saturating_add(producer_skips.load(Ordering::Relaxed));
 
