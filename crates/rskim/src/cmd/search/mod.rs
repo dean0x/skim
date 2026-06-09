@@ -570,7 +570,7 @@ fn run_query(
     let ast_file_ids = if let Some(ref raw_ast) = flags.ast {
         // auto_refresh_if_stale ran above; open the already-built engine.
         let engine = ast::open_ast_engine(&cache_dir)?;
-        match ast::resolve_ast_file_filter(&engine, raw_ast, None) {
+        match ast::resolve_ast_file_filter(&engine, raw_ast) {
             Ok(ids) => {
                 if ids.is_empty() {
                     eprintln!("skim search: --ast {:?} matched no indexed files", raw_ast);

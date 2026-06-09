@@ -88,30 +88,25 @@ pub(super) fn validate_ast_pattern(raw: &str) -> anyhow::Result<()> {
 
 /// Resolve a `--ast` pattern to the set of matching `FileId`s.
 ///
-/// Opens the engine, runs `SearchQuery` with `ast_pattern` set and an
-/// unbounded limit so the full match set is returned.  The caller's
-/// `--limit` flag then applies to the intersection.
+/// Parses the pattern and calls [`AstQueryEngine::search_ast`] directly,
+/// which returns `Vec<(FileId, f64)>` sorted FileId-ASC — exactly what the
+/// intersection needs.  No `SearchResult` construction, no `usize::MAX` sort,
+/// no `SearchLayer` overhead.  The caller's `--limit` flag applies at
+/// intersection time inside the lexical search engine.
 ///
 /// # Errors
 ///
-/// Returns `Err` when the index cannot be opened or the query fails.
+/// Returns `Err` when the pattern is invalid or the query fails.
 pub(super) fn resolve_ast_file_filter(
     engine: &AstQueryEngine<AstIndexReader>,
     raw: &str,
-    lang: Option<rskim_core::Language>,
 ) -> anyhow::Result<HashSet<FileId>> {
-    // Build a SearchQuery with ast_pattern and a very high limit so we get
-    // the full unfiltered set — the lexical --limit applies at intersection time.
-    let mut sq = SearchQuery::new(String::new());
-    sq.ast_pattern = Some(raw.to_string());
-    sq.limit = Some(usize::MAX);
-    sq.lang = lang;
-
-    let results = engine
-        .search(&sq)
+    let query = rskim_search::parse_ast_query(raw.trim())
         .map_err(|e| anyhow::anyhow!("AST query failed: {e}"))?;
-
-    Ok(results.iter().map(|r| r.file_id).collect())
+    let hits = engine
+        .search_ast(&query)
+        .map_err(|e| anyhow::anyhow!("AST query failed: {e}"))?;
+    Ok(hits.into_iter().map(|(fid, _)| fid).collect())
 }
 
 // ============================================================================
@@ -151,16 +146,26 @@ pub(super) fn run_ast_standalone(
         .map_err(|e| anyhow::anyhow!("AST query failed: {e}"))?;
 
     // Resolve FileIds → repo-relative paths using the manifest.
+    // Warn on out-of-range FileIds (avoids PF-002 silent-drop anti-pattern,
+    // applies ADR-006 counterpart on the read side).
     let sorted = manifest.sorted_paths();
-    let resolved: Vec<AstResult> = results
-        .iter()
-        .filter_map(|r| {
-            sorted.get(r.file_id.0 as usize).map(|path| AstResult {
+    let mut resolved: Vec<AstResult> = Vec::with_capacity(results.len());
+    for r in &results {
+        let idx = r.file_id.0 as usize;
+        match sorted.get(idx) {
+            Some(path) => resolved.push(AstResult {
                 path: path.to_string(),
                 score: r.score,
-            })
-        })
-        .collect();
+            }),
+            None => {
+                eprintln!(
+                    "skim search [warn]: AST result FileId({idx}) is out of manifest range \
+                     (manifest has {} files) — index may be out of sync; run `skim search --rebuild`",
+                    sorted.len()
+                );
+            }
+        }
+    }
 
     // Resolve pattern metadata for display.
     let pattern_name = raw_pattern.trim();
@@ -265,7 +270,9 @@ pub(super) fn format_ast_text(
 /// No `line` or `snippet` keys (file-level only).
 #[derive(Serialize)]
 struct AstJson<'a> {
-    mode: &'static str,
+    /// Always `"ast"` — typed as `&'a str` for consistency with sibling JSON
+    /// envelopes in the search module (temporal, query).
+    mode: &'a str,
     pattern: &'a str,
     description: &'a str,
     total: usize,

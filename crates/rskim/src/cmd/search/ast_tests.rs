@@ -503,18 +503,15 @@ fn intersection_disjoint_text_and_ast_returns_empty_exit_0() {
     let root_str = project.path().to_string_lossy().to_string();
 
     // Build the index (uses system cache dir keyed on project root hash).
-    let build_result = super::super::run(
+    super::super::run(
         &[
             "--build".to_string(),
             "--root".to_string(),
             root_str.clone(),
         ],
         &TEST_ANALYTICS,
-    );
-    // If build fails (e.g. env restrictions), skip rather than fail.
-    if build_result.is_err() {
-        return;
-    }
+    )
+    .expect("--build must succeed; fix the build pipeline if it fails here");
 
     // "xyzzy_impossible_token" won't match any file lexically.
     let result = super::super::run(
@@ -626,5 +623,203 @@ fn unrecognised_flag_lists_ast_in_error() {
     assert!(
         msg.contains("--ast"),
         "unrecognised-flag message must include --ast, got: {msg}"
+    );
+}
+
+// ============================================================================
+// Group 7: Standalone --ast query against a real index (hermetic)
+// ============================================================================
+
+/// run_ast_standalone with a real index returns SUCCESS and maps FileIds to
+/// paths.  Guards the FileId→path mapping and the fail-loud absent-index path.
+#[test]
+fn run_ast_standalone_with_real_index_maps_paths() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_rust();
+    let cache = tempfile::tempdir().unwrap();
+
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Run standalone --ast query.  "try-catch" matches Rust match-on-Result patterns.
+    // run_ast_standalone writes to its own internal BufWriter(stdout); we only check
+    // the returned ExitCode here.
+    let result = super::run_ast_standalone(
+        "try-catch",
+        20,
+        false, // text output
+        cache.path(),
+        &manifest,
+    )
+    .unwrap();
+
+    assert_eq!(
+        result,
+        std::process::ExitCode::SUCCESS,
+        "standalone --ast must exit 0 (AC-F8)"
+    );
+
+    // Verify open_ast_engine fails loudly when the index is absent.
+    let empty = tempfile::tempdir().unwrap();
+    match super::open_ast_engine(empty.path()) {
+        Ok(_) => panic!("open_ast_engine must fail when index is absent"),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("--build") || msg.contains("--rebuild"),
+                "absent AST index must give build guidance, got: {msg}"
+            );
+        }
+    }
+}
+
+/// resolve_ast_file_filter returns a non-empty HashSet for a pattern that
+/// matches at least one Rust file in the fixture project.
+#[test]
+fn resolve_ast_file_filter_returns_matching_file_ids() {
+    use rskim_search::AstQueryEngine;
+
+    let project = make_project_with_rust();
+    let cache = tempfile::tempdir().unwrap();
+
+    build_project_index(project.path(), cache.path());
+
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+
+    // "rust-nested-loop" matches block → expression_statement → for_expression,
+    // which appears in src/loops.rs (nested for loops).
+    let ids = super::resolve_ast_file_filter(&engine, "rust-nested-loop").unwrap();
+
+    // The project has at least one Rust file with nested loops — assert non-empty.
+    assert!(
+        !ids.is_empty(),
+        "rust-nested-loop pattern must match at least one file in the fixture project"
+    );
+
+    // All returned FileIds must be within the manifest range.
+    use super::super::manifest::FileManifest;
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+    let file_count = manifest.sorted_paths().len();
+    for id in &ids {
+        assert!(
+            (id.0 as usize) < file_count,
+            "FileId({}) must be within manifest range [0, {})",
+            id.0,
+            file_count
+        );
+    }
+}
+
+// ============================================================================
+// Group 8: Text + --ast intersection (hermetic, real index)
+// ============================================================================
+
+/// Text+AST intersection returns only files that satisfy BOTH the lexical and
+/// AST filters.  Guards against union-instead-of-intersection and dropped-
+/// snippet bugs.
+///
+/// Strategy:
+/// - "nested" as text query → should match src/loops.rs (contains "nested").
+/// - "--ast rust-nested-loop" → should match src/loops.rs (nested for loops in Rust).
+/// - Intersection → src/loops.rs (in both sets, with lexical snippets preserved).
+///
+/// We drive through the engine directly (resolve_ast_file_filter + execute_query)
+/// so the test is hermetic (no system cache required).
+#[test]
+fn text_ast_intersection_preserves_lexical_snippets() {
+    use super::super::query::execute_query;
+    use super::super::types::QueryConfig;
+
+    let project = make_project_with_rust();
+    let cache = tempfile::tempdir().unwrap();
+
+    build_project_index(project.path(), cache.path());
+
+    // Build the AST file filter for "rust-nested-loop" (matches Rust nested for loops).
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+    let ast_ids = super::resolve_ast_file_filter(&engine, "rust-nested-loop").unwrap();
+
+    // The AST filter must be non-empty for this test to be meaningful.
+    assert!(
+        !ast_ids.is_empty(),
+        "rust-nested-loop must match at least one file so intersection is testable"
+    );
+
+    // Run the lexical query with the AST filter applied.
+    let config = QueryConfig {
+        text: "nested".to_string(),
+        limit: 20,
+        json: false,
+        root: project.path().to_path_buf(),
+        cache_dir: cache.path().to_path_buf(),
+        blast_radius_paths: None,
+        ast_file_ids: Some(ast_ids),
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // The intersection must contain at least one result (src/loops.rs matches both).
+    assert!(
+        !output.results.is_empty(),
+        "text+AST intersection must return results when both filters match a common file"
+    );
+
+    // Every result must have a non-empty path (FileId→path mapping is correct).
+    for r in &output.results {
+        assert!(
+            !r.path.is_empty(),
+            "resolved result path must not be empty (FileId→path mapping)"
+        );
+    }
+
+    // At least one result must have a snippet (lexical snippets are preserved
+    // after AST intersection — guards against dropped-snippet bug).
+    let has_snippet = output.results.iter().any(|r| r.snippet.is_some());
+    assert!(
+        has_snippet,
+        "at least one result must have a snippet (lexical enrichment preserved after AST filter)"
+    );
+}
+
+// ============================================================================
+// Group 9: Self-heal for below-FORMAT_VERSION probe (issue 10)
+// ============================================================================
+
+/// Writing an ast_index.skidx stub with valid SKAX magic but version=1
+/// (below AST_INDEX_FORMAT_VERSION=2) must cause check_staleness to return
+/// a stale outcome, triggering the self-heal rebuild path.
+///
+/// Uses `AstIndexReader::index_version` vs `rskim_search::AST_INDEX_FORMAT_VERSION`
+/// which is the single source of truth (ADR-001, single-source-of-truth compile-time
+/// assertion in lib.rs).
+#[test]
+fn self_heal_below_format_version_reports_stale() {
+    let project = make_project_with_rust();
+    let cache = tempfile::tempdir().unwrap();
+
+    // Build a real index first (puts index.skidx in cache so cold-start is not triggered).
+    build_project_index(project.path(), cache.path());
+
+    // Overwrite ast_index.skidx with a stub that has SKAX magic + version=1 (v1 format).
+    // `AstIndexReader::index_version` reads only the first 6 bytes: [magic:4][version:2 LE].
+    let stub: [u8; 6] = [b'S', b'K', b'A', b'X', 1, 0]; // version = 1 (below current 2)
+    fs::write(cache.path().join("ast_index.skidx"), stub).unwrap();
+
+    let (staleness, _) = super::super::staleness::check_staleness(cache.path(), project.path());
+    assert!(
+        !matches!(staleness, super::super::staleness::StalenessCheck::Current),
+        "below-FORMAT_VERSION ast_index.skidx must trigger stale (self-heal), got: {staleness:?}"
+    );
+
+    // Verify the version probe itself confirms the stub is below current.
+    let probed = rskim_search::AstIndexReader::index_version(cache.path()).unwrap();
+    assert_eq!(probed, 1, "stub must report version 1");
+    assert!(
+        probed < rskim_search::AST_INDEX_FORMAT_VERSION,
+        "stub version ({probed}) must be below AST_INDEX_FORMAT_VERSION ({})",
+        rskim_search::AST_INDEX_FORMAT_VERSION
     );
 }
