@@ -350,6 +350,85 @@ fn test_check_staleness_git_appeared_triggers_rebuild() {
 }
 
 // ============================================================================
+// check_staleness — AST self-heal manifest passthrough (Issue 2 fix guard)
+// ============================================================================
+
+/// When the lexical index exists and the manifest has a real git HEAD, but the
+/// AST index is absent, check_staleness must return NoStoredHead (to trigger
+/// rebuild) AND return the loaded manifest — NOT None.
+///
+/// Previously check_staleness returned (NoStoredHead, None) in this case,
+/// causing `--stats` to report "git HEAD: (none)" even though the HEAD was
+/// recorded in the manifest. The HEAD was there; only the AST index was missing.
+#[test]
+fn test_check_staleness_ast_stale_still_returns_manifest() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().to_path_buf();
+    let sha = "aabb1122aabb1122aabb1122aabb1122aabb1122";
+    create_fake_git_repo(dir.path(), &format!("{sha}\n"));
+
+    // Write a manifest with a real HEAD, plus a lexical index stub.
+    write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
+    fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    // Deliberately NO ast_index.skidx — simulates missing AST index.
+
+    let (result, manifest) = check_staleness(&cache_dir, dir.path());
+
+    // Outcome must be stale (rebuild triggered).
+    assert!(
+        !matches!(result, StalenessCheck::Current),
+        "missing AST index must trigger stale outcome, got {result:?}"
+    );
+    assert!(
+        matches!(result, StalenessCheck::NoStoredHead),
+        "missing AST index should return NoStoredHead, got {result:?}"
+    );
+
+    // The manifest must be Some — the real HEAD must be accessible to display consumers.
+    assert!(
+        manifest.is_some(),
+        "check_staleness must return the manifest even when AST is stale (Issue 2 fix)"
+    );
+    assert_eq!(
+        manifest.unwrap().stored_git_head(),
+        Some(sha),
+        "--stats must show the real git HEAD even when only the AST index is missing"
+    );
+}
+
+/// Same as above but with a below-FORMAT_VERSION AST stub instead of absent file.
+#[test]
+fn test_check_staleness_ast_below_version_still_returns_manifest() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().to_path_buf();
+    let sha = "ccdd3344ccdd3344ccdd3344ccdd3344ccdd3344";
+    create_fake_git_repo(dir.path(), &format!("{sha}\n"));
+
+    write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
+    fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    // Write a v1 AST stub (below current AST_INDEX_FORMAT_VERSION).
+    let stub: [u8; 6] = [b'S', b'K', b'A', b'X', 1, 0];
+    fs::write(cache_dir.join("ast_index.skidx"), stub).unwrap();
+
+    let (result, manifest) = check_staleness(&cache_dir, dir.path());
+
+    assert!(
+        !matches!(result, StalenessCheck::Current),
+        "below-version AST index must trigger stale outcome, got {result:?}"
+    );
+
+    assert!(
+        manifest.is_some(),
+        "check_staleness must return the manifest for below-version AST index"
+    );
+    assert_eq!(
+        manifest.unwrap().stored_git_head(),
+        Some(sha),
+        "--stats must show real HEAD when only the AST format version is outdated"
+    );
+}
+
+// ============================================================================
 // auto_refresh_if_stale
 // ============================================================================
 

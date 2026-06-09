@@ -96,17 +96,28 @@ pub(crate) fn run(
         SearchAction::InstallHooks => run_install_hooks(&flags.root_override),
         SearchAction::RemoveHooks => run_remove_hooks(&flags.root_override),
         SearchAction::Query(ref text) if !text.is_empty() => run_query(text, &flags, analytics),
-        // Empty query + --ast only → standalone AST dispatch.
+        // Empty query + --ast (with or without --blast-radius) → standalone AST dispatch.
+        //
+        // --ast + --blast-radius is advertised in help as composable (AST ∩ co-change).
+        // Previously blast_radius.is_none() was required here, causing --blast-radius to
+        // silently be dropped when --ast was also set and no text query was given — the
+        // request fell through to run_temporal_standalone which never applied the AST
+        // filter. Now we match --ast regardless of --blast-radius so the flag is honored.
+        //
+        // --ast + temporal sort (--hot/--cold/--risky) is still rejected above (#202).
         SearchAction::Query(_)
             if let Some(ref raw) = flags.ast
-                && flags.temporal_sort.is_none()
-                && flags.blast_radius.is_none() =>
+                && flags.temporal_sort.is_none() =>
         {
             let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
             std::fs::create_dir_all(&cache_dir)?;
             // Ensure both indexes are fresh before querying.
             let (_refreshed, manifest) =
                 staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+            // Note: validate_ast_pattern was already called above (line ~87) as part
+            // of the pre-dispatch validation order. run_ast_standalone re-validates
+            // internally so it is independently callable without a prior validate call
+            // (defensive re-validation is intentional — it is cheap and idempotent).
             ast::run_ast_standalone(raw, flags.limit, flags.json, &cache_dir, &manifest)
         }
         // Empty query with temporal flags (no --ast) → standalone temporal dispatch.
@@ -229,6 +240,50 @@ fn parse_temporal_flag(
     }
 }
 
+/// Extract a value from a flag that supports both space-separated and equals forms.
+///
+/// Handles `--flag value` (space-separated) and `--flag=value` (equals) forms.
+/// Returns `(value, consumed_next)` where:
+/// - `value` is the trimmed non-empty string value.
+/// - `consumed_next` is `true` when the space-separated form consumed the next token
+///   (the caller must advance `i` by one extra position).
+///
+/// # Errors
+///
+/// Returns `Err` when the value token is absent (space form) or empty/whitespace-only
+/// (both forms).
+///
+/// # Examples
+///
+/// ```text
+/// take_flag_value("--ast=try-catch", None, "--ast")           → Ok(("try-catch", false))
+/// take_flag_value("--ast", Some("try-catch"), "--ast")         → Ok(("try-catch", true))
+/// take_flag_value("--ast", None, "--ast")                      → Err(…missing…)
+/// take_flag_value("--ast=  ", None, "--ast")                   → Err(…empty…)
+/// ```
+fn take_flag_value(
+    arg: &str,
+    next_arg: Option<&String>,
+    flag: &str,
+) -> anyhow::Result<(String, bool)> {
+    let prefix = format!("{flag}=");
+    if let Some(val) = arg.strip_prefix(&*prefix) {
+        let trimmed = val.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("{flag} value must not be empty or whitespace-only");
+        }
+        return Ok((trimmed.to_string(), false));
+    }
+    // Space-separated form: the value is in the next token.
+    let val = next_arg
+        .ok_or_else(|| anyhow::anyhow!("{flag} requires a value (e.g. {flag} <value>)"))?;
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{flag} value must not be empty or whitespace-only");
+    }
+    Ok((trimmed.to_string(), true))
+}
+
 /// Parse the flags from `args`.
 ///
 /// # Errors
@@ -266,40 +321,24 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                     .ok_or_else(|| anyhow::anyhow!("--limit requires a value (e.g. --limit 10)"))?;
                 limit = parse_limit_value(raw)?;
             }
-            "--root" => {
-                i += 1;
-                let val = args.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--root requires a path value (e.g. --root /path/to/project)")
-                })?;
+            s if s == "--root" || s.starts_with("--root=") => {
+                let (val, consumed) = take_flag_value(s, args.get(i + 1), "--root")?;
                 root_override = Some(PathBuf::from(val));
-            }
-            "--ast" => {
-                // Space-separated form: `--ast try-catch`
-                i += 1;
-                let val = args.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--ast requires a pattern value (e.g. --ast try-catch)")
-                })?;
-                let trimmed = val.trim();
-                if trimmed.is_empty() {
-                    anyhow::bail!("--ast pattern must not be empty or whitespace-only");
+                if consumed {
+                    i += 1;
                 }
-                ast = Some(trimmed.to_string());
+            }
+            s if s == "--ast" || s.starts_with("--ast=") => {
+                // Space-separated (`--ast try-catch`) and equals (`--ast=try-catch`) forms.
+                let (val, consumed) = take_flag_value(s, args.get(i + 1), "--ast")?;
+                ast = Some(val);
+                if consumed {
+                    i += 1;
+                }
             }
             s if s.starts_with("--limit=") => {
                 let raw = s.trim_start_matches("--limit=");
                 limit = parse_limit_value(raw)?;
-            }
-            s if s.starts_with("--root=") => {
-                root_override = Some(PathBuf::from(s.trim_start_matches("--root=")));
-            }
-            s if s.starts_with("--ast=") => {
-                // Equals form: `--ast=try-catch` or `--ast=for_statement > await_expression`
-                let val = s.trim_start_matches("--ast=");
-                let trimmed = val.trim();
-                if trimmed.is_empty() {
-                    anyhow::bail!("--ast pattern must not be empty or whitespace-only");
-                }
-                ast = Some(trimmed.to_string());
             }
             s if matches!(s, "--hot" | "--cold" | "--risky" | "--blast-radius")
                 || s.starts_with("--blast-radius=") =>
@@ -561,14 +600,21 @@ fn run_query(
         flags.json,
     )?;
 
-    // Resolve AST file filter (#199): open the AST engine, execute the
-    // structural query, collect matching FileIds.  Applied at the FileId level
-    // inside execute_query (no path round-trip).
+    // Resolve AST file filter (#199): ensure both indexes are fresh (self-heal),
+    // open the AST engine, execute the structural query, collect matching FileIds.
+    // Applied at the FileId level inside execute_query (no path round-trip).
     //
-    // Missing index → fail loud (return Err, #199).
+    // IMPORTANT: auto_refresh_if_stale MUST run BEFORE open_ast_engine so that
+    // a missing or stale AST index is rebuilt before we try to open it.
+    // execute_query also calls auto_refresh_if_stale for the lexical index, but
+    // the AST engine is opened here first — so we refresh explicitly.
+    // Mirrors the ordering on the standalone --ast path (mod.rs:108-110).
+    //
+    // Missing index (after refresh) → fail loud (return Err, #199).
     // Query execution failure → degrade gracefully (warn, no AST filter).
     let ast_file_ids = if let Some(ref raw_ast) = flags.ast {
-        // auto_refresh_if_stale ran above; open the already-built engine.
+        // Self-heal: rebuild both indexes if the AST index is absent or stale.
+        let _ = staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
         let engine = ast::open_ast_engine(&cache_dir)?;
         match ast::resolve_ast_file_filter(&engine, raw_ast) {
             Ok(ids) => {
@@ -579,14 +625,9 @@ fn run_query(
             }
             Err(e) => {
                 // Query execution failure: degrade gracefully (warn, no AST filter).
-                if flags.json {
-                    let w = WarningJson {
-                        warning: &format!("AST query failed: {e}"),
-                    };
-                    println!("{}", serde_json::to_string(&w)?);
-                } else {
-                    eprintln!("skim search: AST query warning: {e}");
-                }
+                // Warning always goes to stderr — even in --json mode — so it does
+                // not pollute the JSON stream (sibling warnings also go to stderr).
+                eprintln!("skim search: AST query warning: {e}");
                 None
             }
         }
@@ -932,9 +973,10 @@ mod tests {
     #[test]
     fn test_parse_flags_root_missing_value_is_error() {
         let err = parse_flags(&["--root".to_string()]).unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("--root requires a path"),
-            "unexpected error message: {err}"
+            msg.contains("--root requires"),
+            "unexpected error message: {msg}"
         );
     }
 

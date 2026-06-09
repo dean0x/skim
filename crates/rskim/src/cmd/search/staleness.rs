@@ -218,17 +218,19 @@ pub(super) fn check_staleness(
             Err(_) => true, // Corrupt / unreadable → rebuild.
         }
     };
-    if ast_stale {
-        // Return NoStoredHead to trigger rebuild while keeping the manifest
-        // accessible for callers that need it (e.g. query path).
-        return (StalenessCheck::NoStoredHead, None);
-    }
 
-    // Load manifest to get stored git HEAD.
     let manifest = match FileManifest::load(project_root.to_path_buf(), cache_dir.to_path_buf()) {
         Ok(m) => m,
+        // Cannot load the manifest — treat as no stored HEAD.
         Err(_) => return (StalenessCheck::NoStoredHead, None),
     };
+
+    if ast_stale {
+        // AST index is absent or below the current format version.
+        // Return NoStoredHead to trigger a full rebuild, but carry the loaded
+        // manifest so display consumers (e.g. `--stats`) still show the real HEAD.
+        return (StalenessCheck::NoStoredHead, Some(manifest));
+    }
 
     let stored = manifest.stored_git_head().map(str::to_string);
 

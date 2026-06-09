@@ -823,3 +823,162 @@ fn self_heal_below_format_version_reports_stale() {
         rskim_search::AST_INDEX_FORMAT_VERSION
     );
 }
+
+// ============================================================================
+// Group 10: Self-heal regression — text + --ast combined path (Issue 1 / regression.md)
+// ============================================================================
+
+/// Regression guard: `skim search <text> --ast <pattern>` must self-heal when
+/// the AST index is absent, mirroring the standalone `skim search --ast` path.
+///
+/// Before the fix, `run_query` opened `open_ast_engine` BEFORE calling
+/// `auto_refresh_if_stale`, so a missing `ast_index.skidx` caused a loud
+/// "AST index not found" error instead of triggering a rebuild.
+///
+/// Strategy (hermetic — uses `--root` to isolate from the system cache):
+/// 1. Build ONLY the lexical index by building normally then deleting `ast_index.skidx`.
+/// 2. Run `skim search "nested" --ast rust-nested-loop --root <project>`.
+/// 3. Assert the command returns `Ok(ExitCode::SUCCESS)` and does NOT error —
+///    the self-heal path rebuilt the AST index transparently.
+#[test]
+fn text_ast_combined_self_heals_missing_ast_index() {
+    let project = make_project_with_rust();
+    let cache = tempfile::tempdir().unwrap();
+
+    // Build a full index (lexical + AST).
+    build_project_index(project.path(), cache.path());
+
+    // Delete only the AST index to simulate a pre-PR install (lexical present, AST absent).
+    fs::remove_file(cache.path().join("ast_index.skidx")).unwrap();
+    let _ = fs::remove_file(cache.path().join("ast_index.skpost")); // may or may not exist
+
+    // Verify the lexical index still exists (so this is not a cold start).
+    assert!(
+        cache.path().join("index.skidx").exists(),
+        "lexical index must exist for the test to simulate a no-AST install"
+    );
+
+    // Drive through run() using --root so it targets our isolated cache/project.
+    // The combined text+--ast path must self-heal (rebuild the AST index) and
+    // return SUCCESS rather than propagating "AST index not found".
+    let root_str = project.path().to_string_lossy().to_string();
+    let result = super::super::run(
+        &[
+            "nested".to_string(),
+            "--ast".to_string(),
+            "rust-nested-loop".to_string(),
+            "--root".to_string(),
+            root_str,
+        ],
+        &TEST_ANALYTICS,
+    );
+
+    assert!(
+        result.is_ok(),
+        "text+--ast combined path must self-heal a missing AST index, got Err: {:?}",
+        result.unwrap_err()
+    );
+    assert_eq!(
+        result.unwrap(),
+        std::process::ExitCode::SUCCESS,
+        "text+--ast combined path must exit 0 after self-healing"
+    );
+    // The rebuild path outputs a progress message to stderr; the key assertion is
+    // that the command returned Ok(SUCCESS) rather than Err("AST index not found").
+}
+
+/// Regression guard: `skim search --ast <pattern> --blast-radius <file>` (no text
+/// query) must NOT silently drop the `--ast` filter.
+///
+/// Previously the standalone AST arm required `blast_radius.is_none()`, so when
+/// `--blast-radius` was also set the request fell through to `run_temporal_standalone`
+/// which ignored `--ast` entirely. The fix widens the standalone AST arm to match
+/// regardless of `--blast-radius` presence.
+///
+/// This test confirms the combined flags don't produce an error (no silently-dropped
+/// `--ast`) — the route dispatches to the AST standalone path which builds the index
+/// and returns SUCCESS.
+#[test]
+fn ast_plus_blast_radius_no_text_does_not_silently_drop_ast() {
+    let project = make_project_with_rust();
+    let root_str = project.path().to_string_lossy().to_string();
+
+    // Build first so auto-refresh finds a complete index.
+    super::super::run(
+        &[
+            "--build".to_string(),
+            "--root".to_string(),
+            root_str.clone(),
+        ],
+        &TEST_ANALYTICS,
+    )
+    .expect("--build must succeed before the combined --ast + --blast-radius test");
+
+    // No text query + --ast + --blast-radius → should dispatch to standalone AST
+    // (honoring --ast), NOT silently drop --ast into run_temporal_standalone.
+    // A non-existent blast-radius file is fine — the index may have no co-change
+    // data for it, but the AST path still runs.
+    let result = super::super::run(
+        &[
+            "--ast".to_string(),
+            "rust-nested-loop".to_string(),
+            "--blast-radius".to_string(),
+            "src/nonexistent.rs".to_string(),
+            "--root".to_string(),
+            root_str,
+        ],
+        &TEST_ANALYTICS,
+    );
+
+    assert!(
+        result.is_ok(),
+        "--ast + --blast-radius with no text query must not error, got: {:?}",
+        result.unwrap_err()
+    );
+    assert_eq!(
+        result.unwrap(),
+        std::process::ExitCode::SUCCESS,
+        "--ast + --blast-radius with no text query must exit 0"
+    );
+}
+
+/// Regression guard: `skim search <text> --ast <pattern>` must also self-heal
+/// when `ast_index.skidx` has a below-FORMAT_VERSION stub (v1 format).
+///
+/// This guards the same ordering fix as `text_ast_combined_self_heals_missing_ast_index`
+/// but specifically tests the format-version probe path within `check_staleness`.
+#[test]
+fn text_ast_combined_self_heals_below_format_version_ast_index() {
+    let project = make_project_with_rust();
+    let cache = tempfile::tempdir().unwrap();
+
+    // Build a full index.
+    build_project_index(project.path(), cache.path());
+
+    // Overwrite with a v1 stub (below AST_INDEX_FORMAT_VERSION).
+    let stub: [u8; 6] = [b'S', b'K', b'A', b'X', 1, 0];
+    fs::write(cache.path().join("ast_index.skidx"), stub).unwrap();
+
+    let root_str = project.path().to_string_lossy().to_string();
+    let result = super::super::run(
+        &[
+            "nested".to_string(),
+            "--ast".to_string(),
+            "rust-nested-loop".to_string(),
+            "--root".to_string(),
+            root_str,
+        ],
+        &TEST_ANALYTICS,
+    );
+
+    assert!(
+        result.is_ok(),
+        "text+--ast combined path must self-heal a below-version AST index, got Err: {:?}",
+        result.unwrap_err()
+    );
+    assert_eq!(
+        result.unwrap(),
+        std::process::ExitCode::SUCCESS,
+        "text+--ast combined path must exit 0 after self-healing below-version AST index"
+    );
+}

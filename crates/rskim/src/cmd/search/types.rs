@@ -108,7 +108,8 @@ pub(super) struct QueryConfig {
     ///
     /// When `Some`, only files whose `FileId` is in this set are scored.
     /// This is the intersection filter for `text + --ast` combined queries.
-    /// Applied BEFORE `blast_radius_paths` intersection in `execute_query`.
+    /// Intersected with `blast_radius_paths` FileIds in `execute_query`
+    /// (set intersection is commutative — no ordering dependency).
     ///
     /// Additive: `None` means "no AST filter" (all existing callers compile
     /// unchanged because they use `blast_radius_paths` field initialization).
