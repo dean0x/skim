@@ -298,16 +298,14 @@ impl<'cfg> Pipeline<'cfg> {
 
         // Always join the producer first so a worker-thread panic is surfaced
         // regardless of whether consume succeeded or aborted (ADR-006 desync).
-        producer_handle
-            .join()
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "producer thread panicked: {:?}",
-                    e.downcast_ref::<String>()
-                        .map(String::as_str)
-                        .unwrap_or("<non-string panic>")
-                )
-            })?;
+        producer_handle.join().map_err(|e| {
+            anyhow::anyhow!(
+                "producer thread panicked: {:?}",
+                e.downcast_ref::<String>()
+                    .map(String::as_str)
+                    .unwrap_or("<non-string panic>")
+            )
+        })?;
 
         // Now propagate the consume error (if any) — producer is already joined.
         let ConsumeResult {

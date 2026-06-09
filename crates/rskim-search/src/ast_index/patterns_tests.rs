@@ -60,11 +60,31 @@ fn f6_per_category_counts() {
     let counts = |cat: PatternCategory| -> usize {
         all_patterns().iter().filter(|p| p.category == cat).count()
     };
-    assert_eq!(counts(PatternCategory::ErrorHandling), 6, "ErrorHandling must have 6 patterns");
-    assert_eq!(counts(PatternCategory::Performance), 5, "Performance must have 5 patterns");
-    assert_eq!(counts(PatternCategory::Concurrency), 6, "Concurrency must have 6 patterns");
-    assert_eq!(counts(PatternCategory::Quality), 7, "Quality must have 7 patterns");
-    assert_eq!(counts(PatternCategory::Structure), 5, "Structure must have 5 patterns");
+    assert_eq!(
+        counts(PatternCategory::ErrorHandling),
+        6,
+        "ErrorHandling must have 6 patterns"
+    );
+    assert_eq!(
+        counts(PatternCategory::Performance),
+        5,
+        "Performance must have 5 patterns"
+    );
+    assert_eq!(
+        counts(PatternCategory::Concurrency),
+        6,
+        "Concurrency must have 6 patterns"
+    );
+    assert_eq!(
+        counts(PatternCategory::Quality),
+        7,
+        "Quality must have 7 patterns"
+    );
+    assert_eq!(
+        counts(PatternCategory::Structure),
+        5,
+        "Structure must have 5 patterns"
+    );
 }
 
 #[test]

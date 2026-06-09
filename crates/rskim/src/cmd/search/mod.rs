@@ -275,8 +275,8 @@ fn take_flag_value(
         return Ok((trimmed.to_string(), false));
     }
     // Space-separated form: the value is in the next token.
-    let val = next_arg
-        .ok_or_else(|| anyhow::anyhow!("{flag} requires a value (e.g. {flag} <value>)"))?;
+    let val =
+        next_arg.ok_or_else(|| anyhow::anyhow!("{flag} requires a value (e.g. {flag} <value>)"))?;
     let trimmed = val.trim();
     if trimmed.is_empty() {
         anyhow::bail!("{flag} value must not be empty or whitespace-only");

@@ -602,11 +602,13 @@ fn test_streaming_skipped_includes_minified() {
 /// desync abort path documented in ADR-006. (applies ADR-006)
 #[test]
 fn test_adr006_desync_aborts_before_manifest_save() {
-    use rskim_search::{AstIndexBuilder, AstNgramSet, FileId, NgramIndexBuilder, StructuralMetrics};
+    use rskim_search::{
+        AstIndexBuilder, AstNgramSet, FileId, NgramIndexBuilder, StructuralMetrics,
+    };
 
-    use super::Pipeline;
     use super::super::manifest::FileManifest;
     use super::super::types::ProcessedFile;
+    use super::Pipeline;
 
     let project = make_project();
     let cache = tempfile::tempdir().unwrap();
@@ -631,19 +633,21 @@ fn test_adr006_desync_aborts_before_manifest_save() {
         .modified()
         .expect("mtime must be available on this platform");
 
-    let old_manifest =
-        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
-            .expect("old manifest must be loadable");
+    let old_manifest = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+        .expect("old manifest must be loadable");
     let old_entry_count = old_manifest.entry_count();
-    assert!(old_entry_count > 0, "old manifest must have entries for the test to be meaningful");
+    assert!(
+        old_entry_count > 0,
+        "old manifest must have entries for the test to be meaningful"
+    );
 
     // Stage 2: set up a consume call with a PRE-BROKEN AstIndexBuilder.
     // Pre-advancing it by one FileId forces it to expect FileId(1) as the next
     // call, so when consume tries FileId(0) the builder returns the desync error.
     let mut lexical_builder = NgramIndexBuilder::new(cache.path().to_path_buf())
         .expect("lexical builder must initialise");
-    let mut ast_builder = AstIndexBuilder::new(cache.path().to_path_buf())
-        .expect("AST builder must initialise");
+    let mut ast_builder =
+        AstIndexBuilder::new(cache.path().to_path_buf()).expect("AST builder must initialise");
 
     // Insert a dummy FileId(0) into the AST builder BEFORE consume runs.
     // This advances the builder's internal file_count to 1, so it expects FileId(1) next.
@@ -708,9 +712,8 @@ fn test_adr006_desync_aborts_before_manifest_save() {
     );
 
     // Double-check by loading: entry count must be the same as before the broken run.
-    let reloaded =
-        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
-            .expect("manifest must still be loadable after abort");
+    let reloaded = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+        .expect("manifest must still be loadable after abort");
     assert_eq!(
         reloaded.entry_count(),
         old_entry_count,
@@ -723,12 +726,14 @@ fn test_adr006_desync_aborts_before_manifest_save() {
 /// does not permanently break the project — the next `build_index` succeeds.
 #[test]
 fn test_adr006_self_heal_after_abort() {
-    use rskim_search::{AstIndexBuilder, AstNgramSet, FileId, NgramIndexBuilder, StructuralMetrics};
+    use rskim_search::{
+        AstIndexBuilder, AstNgramSet, FileId, NgramIndexBuilder, StructuralMetrics,
+    };
 
-    use super::Pipeline;
     use super::super::manifest::FileManifest;
-    use super::super::types::ProcessedFile;
     use super::super::types::IndexConfig;
+    use super::super::types::ProcessedFile;
+    use super::Pipeline;
     use super::build_index;
 
     let project = make_project();
@@ -738,16 +743,21 @@ fn test_adr006_self_heal_after_abort() {
     run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS)
         .expect("first build must succeed");
 
-    let old_manifest =
-        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
-            .expect("old manifest must be loadable");
+    let old_manifest = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+        .expect("old manifest must be loadable");
     let old_count = old_manifest.entry_count();
 
     // Simulate the desync abort (same as the previous test).
     let mut lexical_builder = NgramIndexBuilder::new(cache.path().to_path_buf()).unwrap();
     let mut ast_builder = AstIndexBuilder::new(cache.path().to_path_buf()).unwrap();
     ast_builder
-        .add_file_ngrams(FileId(0), rskim_core::Language::Rust, &AstNgramSet::default(), 0, StructuralMetrics::default())
+        .add_file_ngrams(
+            FileId(0),
+            rskim_core::Language::Rust,
+            &AstNgramSet::default(),
+            0,
+            StructuralMetrics::default(),
+        )
         .unwrap();
     let mut new_manifest =
         FileManifest::new(project.path().to_path_buf(), cache.path().to_path_buf());
@@ -770,7 +780,10 @@ fn test_adr006_self_heal_after_abort() {
         rx,
         false,
     );
-    assert!(abort_result.is_err(), "consume must abort for the self-heal test to be meaningful");
+    assert!(
+        abort_result.is_err(),
+        "consume must abort for the self-heal test to be meaningful"
+    );
 
     // Self-heal: a subsequent successful build must produce a new manifest.
     let config = IndexConfig {
