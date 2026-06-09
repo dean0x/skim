@@ -160,7 +160,7 @@ fn try_parse_tabular(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture, make_output};
+    use crate::cmd::test_utils::{load_fixture, make_output};
 
     #[test]
     fn test_tier1_json_podlist_full_result() {

@@ -195,7 +195,7 @@ fn try_parse_regex_fallback(text: &str) -> Option<DbResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::make_output;
+    use crate::cmd::test_utils::make_output;
 
     #[test]
     fn test_tier1_sqlite3_pipe_separated() {

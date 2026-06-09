@@ -342,15 +342,7 @@ fn extract_pruned_ref(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn fixture(name: &str) -> String {
-        let path = format!(
-            "{}/tests/fixtures/cmd/git/{name}",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("failed to read fixture {path}: {e}"))
-    }
+    use crate::cmd::test_utils::load_fixture;
 
     // ========================================================================
     // parse_fetch tests
@@ -372,14 +364,14 @@ mod tests {
 
     #[test]
     fn test_parse_fetch_up_to_date_fixture() {
-        let input = fixture("fetch_up_to_date.txt");
+        let input = load_fixture("git", "fetch_up_to_date.txt");
         let result = parse_fetch(&input);
         assert_eq!(result.summary, "up to date");
     }
 
     #[test]
     fn test_parse_fetch_with_updates() {
-        let input = fixture("fetch_refs.txt");
+        let input = load_fixture("git", "fetch_refs.txt");
         let result = parse_fetch(&input);
         // Should have: 2 updated, 2 new branches, 1 new tag
         assert!(
@@ -405,7 +397,7 @@ mod tests {
 
     #[test]
     fn test_parse_fetch_progress_stripped() {
-        let input = fixture("fetch_refs.txt");
+        let input = load_fixture("git", "fetch_refs.txt");
         let result = parse_fetch(&input);
         // Progress lines must not appear in output
         let rendered = result.to_string();
@@ -421,7 +413,7 @@ mod tests {
 
     #[test]
     fn test_parse_fetch_new_branches_in_details() {
-        let input = fixture("fetch_refs.txt");
+        let input = load_fixture("git", "fetch_refs.txt");
         let result = parse_fetch(&input);
         let details_str = result.details.join("\n");
         assert!(
@@ -447,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_parse_fetch_with_prune() {
-        let input = fixture("fetch_with_prune.txt");
+        let input = load_fixture("git", "fetch_with_prune.txt");
         let result = parse_fetch(&input);
         assert!(
             result.summary.contains("1 updated"),
@@ -468,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_parse_fetch_forced_update() {
-        let input = fixture("fetch_forced.txt");
+        let input = load_fixture("git", "fetch_forced.txt");
         let result = parse_fetch(&input);
         assert!(
             result.summary.contains("1 forced"),
@@ -488,7 +480,7 @@ mod tests {
 
     #[test]
     fn test_parse_fetch_submodules() {
-        let input = fixture("fetch_submodules.txt");
+        let input = load_fixture("git", "fetch_submodules.txt");
         let result = parse_fetch(&input);
         let details_str = result.details.join("\n");
         assert!(

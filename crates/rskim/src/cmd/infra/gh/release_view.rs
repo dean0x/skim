@@ -319,7 +319,7 @@ fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::make_output;
+    use crate::cmd::test_utils::make_output;
 
     // ---- JSON tier ----
 

@@ -196,7 +196,7 @@ mod tests {
     use super::*;
 
     use crate::cmd::lint::load_lint_fixture as load_fixture;
-    use crate::cmd::test_support::make_output_full;
+    use crate::cmd::test_utils::make_output_full;
 
     /// oxlint_fail.json: generated from oxlint v0.3.0 on 2026-04-15.
     /// Contains 3 messages: 1 error (no-unused-vars) + 1 warning (eqeqeq) in app.ts,

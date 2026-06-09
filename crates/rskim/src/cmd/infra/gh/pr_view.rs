@@ -215,7 +215,7 @@ fn try_parse_text(text: &str) -> Option<InfraResult> {
 mod tests {
     use super::super::load_gh_fixture as load_fixture;
     use super::*;
-    use crate::cmd::test_support::make_output;
+    use crate::cmd::test_utils::make_output;
 
     #[test]
     fn test_tier1_json() {

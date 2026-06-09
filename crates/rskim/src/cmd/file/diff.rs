@@ -231,7 +231,7 @@ fn build_file_result(file_stats: Vec<FileStat>) -> Option<FileResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture, make_output_full};
+    use crate::cmd::test_utils::{load_fixture, make_output_full};
 
     // ---- prepare_args tests ----
 
@@ -257,6 +257,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // `U3` refers to the `-U3` diff flag under test; renaming the
+    // test would obscure intent. Annotated rather than renamed to keep test identity stable.
     fn test_prepare_args_no_inject_when_U3_present() {
         let mut args = vec!["-U3".to_string(), "file1.txt".to_string()];
         prepare_args(&mut args);

@@ -303,7 +303,12 @@ fn resolve_rename(raw: &str) -> String {
 mod tests {
     use super::*;
 
-    fn make_log(entries: &[(&str, &str, u64, &str, &[(&str, &str, &str)])]) -> String {
+    /// `(add_count, del_count, path)` triplet for a file changed in a commit.
+    type FileEntry<'a> = (&'a str, &'a str, &'a str);
+    /// `(hash, author, timestamp, subject, files)` row for `make_log`.
+    type LogEntry<'a> = (&'a str, &'a str, u64, &'a str, &'a [FileEntry<'a>]);
+
+    fn make_log(entries: &[LogEntry<'_>]) -> String {
         let mut out = String::new();
         for (hash, author, ts, subject, files) in entries {
             out.push_str(&format!("COMMIT:{hash}|{author}|{ts}|{subject}\n"));

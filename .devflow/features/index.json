@@ -3,7 +3,7 @@
   "features": {
     "build-parsers": {
       "name": "Build Tool Output Parsers",
-      "description": "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, check, fmt, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, run_clippy, security.rs, registry.rs, execution.rs, dispatch.rs, test_support.rs, make_output_stderr, TokenAction.",
+      "description": "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, check, fmt, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, run_clippy, parse_fmt, make_output_stderr, TokenAction. NOTE: cmd/mod.rs was refactored in PR #267 — scrubbing logic is in security.rs, command execution in execution.rs, dispatch in dispatch.rs, registry in registry.rs, test helpers in test_utils.rs.",
       "directories": [
         "crates/rskim/src/cmd/build/",
         "crates/rskim/src/cmd/"
@@ -22,7 +22,7 @@
         "crates/rskim/src/cmd/dispatch.rs",
         "crates/rskim/src/cmd/security.rs",
         "crates/rskim/src/cmd/registry.rs",
-        "crates/rskim/src/cmd/test_support.rs",
+        "crates/rskim/src/cmd/test_utils.rs",
         "crates/rskim/src/runner.rs"
       ],
       "lastUpdated": "2026-06-07T10:05:21.359Z",
@@ -47,7 +47,8 @@
         "crates/rskim-search/src/lib.rs",
         "crates/rskim-search/src/temporal/storage.rs",
         "crates/rskim-search/src/temporal/storage_types.rs",
-        "crates/rskim-search/src/temporal/storage_ops.rs"
+        "crates/rskim-search/src/temporal/storage_ops.rs",
+        "crates/rskim-search/src/io_util.rs"
       ],
       "lastUpdated": "2026-06-07T16:20:48.693Z",
       "createdBy": "implement"

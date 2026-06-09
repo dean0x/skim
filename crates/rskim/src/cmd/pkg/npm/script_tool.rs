@@ -507,7 +507,7 @@ mod tests {
         let padding = MAX_PKG_JSON_BYTES as usize - payload.len();
         let mut content = String::with_capacity(MAX_PKG_JSON_BYTES as usize);
         content.push_str(payload);
-        content.extend(std::iter::repeat(' ').take(padding));
+        content.extend(std::iter::repeat_n(' ', padding));
         assert_eq!(content.len(), MAX_PKG_JSON_BYTES as usize);
         std::fs::write(dir.path().join("package.json"), content.as_bytes()).unwrap();
         assert_eq!(resolve_script(dir.path(), "test"), Some("jest".to_string()));

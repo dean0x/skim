@@ -416,7 +416,7 @@ fn base64_decoded_len(b64: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::make_output;
+    use crate::cmd::test_utils::make_output;
 
     // ---- JSON object ----
 

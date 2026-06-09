@@ -173,7 +173,7 @@ fn try_parse_tabular(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture, make_output};
+    use crate::cmd::test_utils::{load_fixture, make_output};
 
     fn ndjson_fixture() -> String {
         load_fixture("infra", "docker_ps.json")

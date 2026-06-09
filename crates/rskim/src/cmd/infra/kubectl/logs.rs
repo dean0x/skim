@@ -45,7 +45,7 @@ pub(crate) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture, make_output};
+    use crate::cmd::test_utils::{load_fixture, make_output};
 
     #[test]
     fn test_logs_structured() {

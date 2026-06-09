@@ -366,7 +366,7 @@ mod tests {
     use super::*;
 
     use crate::cmd::lint::load_lint_fixture as load_fixture;
-    use crate::cmd::test_support::{make_output, make_output_full};
+    use crate::cmd::test_utils::{make_output, make_output_full};
 
     // -------------------------------------------------------------------------
     // Check mode (existing tests, unchanged)

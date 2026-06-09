@@ -505,7 +505,7 @@ fn try_parse_regex(text: &str) -> Option<TestResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture, make_output, make_output_full};
+    use crate::cmd::test_utils::{load_fixture, make_output, make_output_full};
 
     // ========================================================================
     // Tier 1: JSON parsing

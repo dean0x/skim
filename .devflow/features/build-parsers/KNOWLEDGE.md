@@ -1,7 +1,7 @@
 ---
 feature: build-parsers
 name: Build Tool Output Parsers
-description: "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection."
+description: "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, parse_fmt."
 category: component-patterns
 directories: [crates/rskim/src/cmd/build/]
 referencedFiles:
@@ -14,9 +14,15 @@ referencedFiles:
   - crates/rskim/src/output/mod.rs
   - crates/rskim/src/output/canonical.rs
   - crates/rskim/src/cmd/mod.rs
+  - crates/rskim/src/cmd/execution.rs
+  - crates/rskim/src/cmd/dispatch.rs
+  - crates/rskim/src/cmd/security.rs
+  - crates/rskim/src/cmd/registry.rs
+  - crates/rskim/src/cmd/test_utils.rs
+  - crates/rskim/src/runner.rs
 created: 2026-05-14
 updated: 2026-06-07
-version: 10
+version: 11
 ---
 
 # Build Tool Output Parsers
@@ -25,9 +31,21 @@ version: 10
 
 The build parsers module (`crates/rskim/src/cmd/build/`) compresses output from build tools (cargo, clippy, tsc, make, gradle, maven) into compact summaries for AI context windows. Each tool has a dedicated file (`cargo.rs`, `tsc.rs`, `make.rs`, `gradle.rs`, `maven.rs`) plus a shared `mod.rs` that provides the dispatcher and the `run_parsed_command` infrastructure function used by all five.
 
-The module is invoked via flat dispatch (`skim tsc`) or multi-category dispatch (`skim cargo build`, `skim cargo check`, `skim cargo fmt`, `skim cargo clippy`). All parsers share the same three-tier degradation model: Full (clean structured parse) → Degraded (partial parse with warning markers) → Passthrough (raw output returned unchanged).
+The module is invoked via flat dispatch (`skim tsc`) or multi-category dispatch (`skim cargo build`, `skim cargo clippy`). All parsers share the same three-tier degradation model: Full (clean structured parse) → Degraded (partial parse with warning markers) → Passthrough (raw output returned unchanged).
 
-The `cargo.rs` module gained two additional handlers in PR #264: `run_check()` (reuses existing JSON parser by injecting `--message-format=json`) and `run_fmt()` (thin success/passthrough splitter — empty output on success, passthrough diff on failure). These share the same `run_parsed_command` path as `run()` and `run_clippy()`. The internal `run_with_json_format(subcmd, ...)` helper deduplicates the JSON-injection pattern across `build`, `check`, and `clippy`.
+## cmd/mod.rs Refactor (PR #267)
+
+`cmd/mod.rs` was refactored to reduce complexity. Functionality previously inline in `mod.rs` is now split across dedicated submodules:
+
+- `cmd/dispatch.rs` — `dispatch()`, `run_raw_passthrough()`, and per-tool dispatcher helpers (`dispatch_cargo`, `dispatch_go`, `dispatch_swift`, `dispatch_dotnet`, `passthrough_subcmd`, `extract_subcmd`, `prepend_without`)
+- `cmd/execution.rs` — `OutputFormat`, `RunContext`, `ParsedCommandConfig<'_>`, `ToolRunConfig<'_>`, `run_tool<T>`, `run_parsed_command_with_mode`, `format_analytics_label`
+- `cmd/security.rs` — `sanitize_for_display`, `scrub_db_args`, `scrub_infra_args`
+- `cmd/registry.rs` — `KNOWN_SUBCOMMANDS` (sorted, binary-searchable), `is_known_subcommand`, `is_meta_subcommand`, `wrapper_targets`
+- `cmd/test_utils.rs` — standalone `pub(crate)` module (compiled under `#[cfg(test)]` gate in `mod.rs`); canonical test helper source for all `cmd` subtree tests
+
+`cmd/mod.rs` remains the coordination point (declares all submodules, re-exports public API) and still houses the inline helpers: `user_has_flag`, `inject_flag_before_separator`, `extract_show_stats`, `extract_json_flag`, `extract_output_format`, `combine_output`, `should_read_stdin`, `read_bounded`, `read_stdin_bounded`, `MAX_STDIN_BYTES`, passthrough checks, `resolve_cache_dir`, `obtain_output`, `render_output<T>`, `DEFAULT_CMD_TIMEOUT`.
+
+When adding a new parser, register the tool in `cmd/registry.rs` (`KNOWN_SUBCOMMANDS` array) and `cmd/dispatch.rs` (`dispatch()` match arm), not in `cmd/mod.rs`.
 
 ## Core Responsibilities
 
@@ -77,7 +95,8 @@ Each tool assigns tiers differently based on what structured output the tool pro
 
 | Tool | Tier 1 | Tier 2 | Tier 3 |
 |------|--------|--------|--------|
-| cargo / clippy | NDJSON from `--message-format=json` (stdout) | Regex `error[E\d+]` on stderr | Passthrough combined |
+| cargo build / check / clippy | NDJSON from `--message-format=json` (stdout) | Regex `error[E\d+]` on stderr | Passthrough combined |
+| cargo fmt | `parse_fmt`: empty combined → `Full(success/failure by exit code)` | (n/a — two-tier only) | Non-empty combined → `Passthrough` |
 | tsc | Regex `file(line,col): error TSxxxx: msg` on stderr | Same regex on combined stdout+stderr | Passthrough combined |
 | make | GCC/Clang diagnostics + Makefile syntax errors + make failure + linker errors + noop detection on combined | Noise stripping (compiler invocations, directory changes, CMake progress, archiver lines, `compilation terminated.` literal) | Passthrough combined |
 | gradle / gradlew | Regex on task outcomes (`> Task :name OUTCOME`), Java/Kotlin diagnostics, `BUILD SUCCESSFUL/FAILED` summary | Noise strip (daemon startup, download progress, configure project, UP-TO-DATE/FROM-CACHE task lines) | Passthrough combined |
@@ -97,6 +116,19 @@ The helpers live in `crate::cmd` (not inside `cmd/build/`):
 - `extract_show_stats(&args)` — strips `--show-stats` from the arg list and returns `(filtered_args, bool)`. `build/mod.rs` calls this at the top of its `run()` function; the `bool` is threaded through to `run_parsed_command`. This was centralized from per-handler inline logic.
 
 Gradle and Maven do not inject flags — they have no native structured output mode, so their `run()` functions pass `&[]` as `env_vars` and perform no flag mutation.
+
+## `cargo check` and `cargo fmt` Handlers
+
+`cargo check` (`run_check`) uses the exact same `run_with_json_format("check", ...)` path as `cargo build` — it injects `--message-format=json` and runs the same three-tier NDJSON parser. The JSON schema for `cargo check` is identical to `cargo build` (both go through the rustc compiler message pipeline).
+
+`cargo fmt` (`run_fmt`) is deliberately different:
+
+- **No flag injection**: `cargo fmt` has no structured output mode. `run_fmt` directly calls `run_parsed_command("cargo", &full_args, &[("CARGO_TERM_COLOR", "never")], ..., parse_fmt)` — no `--message-format` injection occurs.
+- **Two-tier parser** (`parse_fmt`): If combined stdout+stderr (trimmed) is empty, returns `ParseResult::Full(BuildResult::new(success, ...))` where `success = output.exit_code == Some(0)`. If combined output is non-empty, returns `ParseResult::Passthrough(trimmed)` — no `Degraded` tier exists for fmt.
+- **Signal-killed treated as failure**: `output.exit_code == Some(0)` strictly — `None` (signal kill) and non-zero both produce `success = false`.
+- **Module placement**: `run_fmt` lives in `cmd/build/cargo.rs` despite `cargo fmt` being categorized as a LINT operation by the rewrite engine. This is intentional: `cargo fmt` shares the `cargo` executable, `run_parsed_command`, and all cargo plumbing. The rewrite engine's categorization and the handler's module location are deliberately decoupled.
+
+Both `run_check` and `run_fmt` are dispatched through `build/mod.rs`: `"check" => cargo::run_check(...)`, `"fmt" => cargo::run_fmt(...)`. The dispatcher in `cmd/dispatch.rs` also routes `"check"` and `"fmt"` via `build::run(&prepend_without(...), analytics)`.
 
 ## Gradle Parser Details
 
@@ -193,15 +225,15 @@ Use `.expect("valid regex")` not `.unwrap()` — the expect message documents in
 
 ## Shared Test Helpers
 
-All build parser tests (and tests across the `cmd` subtree) use the shared helpers from `crate::cmd::test_support`. As of PR #267 (cmd/mod.rs complexity reduction), `test_support` is a dedicated file at `crates/rskim/src/cmd/test_support.rs` — no longer embedded as an inline `#[cfg(test)]` module inside `mod.rs`.
+All build parser tests (and tests across the `cmd` subtree) use the shared helpers from `crate::cmd::test_utils`. This is now a **standalone file** (`cmd/test_utils.rs`) compiled under a `#[cfg(test)]` gate in `cmd/mod.rs` — it is NOT an inline `mod test_utils { ... }` block. As of #214, the ~34 local `make_output` definitions and ~41 local `load_fixture` definitions across `cmd` subtree modules were replaced by this single canonical source.
 
-Four helpers are now available:
+The four helpers available:
 - `make_output(stdout: &str) -> CommandOutput` — success case: stderr empty, exit_code Some(0), duration ZERO
 - `make_output_full(stdout, stderr, exit_code: Option<i32>) -> CommandOutput` — full control for non-zero exits, stderr content, signal-kill (None exit code)
-- `make_output_stderr(stderr: &str) -> CommandOutput` — stderr-only success case (stdout empty, exit_code Some(0)); for tools that write to stderr by default (e.g. wget, curl)
-- `load_fixture(subdir: &str, name: &str) -> String` — loads from `tests/fixtures/cmd/{subdir}/{name}`; panics with clear message on missing file
+- `make_output_stderr(stderr: &str) -> CommandOutput` — all output on stderr, exit_code Some(0); for tools that default to stderr (wget, curl)
+- `load_fixture(subdir: &str, name: &str) -> String` — loads from `tests/fixtures/cmd/{subdir}/{name}`; both `subdir` and `name` must be single path components — the helper asserts and panics if either contains `/`, `\`, or equals `..`, preventing directory traversal outside the fixtures tree; also panics with a clear message if the file cannot be read
 
-Build parser tests import these as `use super::super::test_support::{make_output, make_output_full, load_fixture}`. Do not redeclare local versions — use the canonical source to prevent drift.
+Build parser tests import as `use crate::cmd::test_utils::{make_output_full, load_fixture}`. Do not redeclare local versions — use the canonical source to prevent drift.
 
 ## Anti-Patterns
 
@@ -215,11 +247,15 @@ Build parser tests import these as `use super::super::test_support::{make_output
 
 - **Switching build parsers to use `run_tool<T>` or `run_parsed_command_with_mode`**: the build family intentionally diverges. See the Infrastructure section above. The signatures are incompatible: `run_parsed_command` takes `fn(&CommandOutput)` (one arg, plain fn pointer); `run_tool<T>` takes `FnOnce(&CommandOutput)` via `run_parsed_command_with_mode` which takes `FnOnce(&CommandOutput, &[String])` (two args). Mixing them will fail to compile.
 
-- **Declaring a new tool in `run()` dispatch without adding it to the help text and error messages**: the unknown-tool error message and `print_help()` list supported tools by name — both must be updated when adding a new parser. Also add the tool name to `KNOWN_SUBCOMMANDS` in `cmd/mod.rs` and the `dispatch()` match arm in `cmd/mod.rs`.
+- **Declaring a new tool in `run()` dispatch without adding it to the help text and error messages**: the unknown-tool error message and `print_help()` list supported tools by name — both must be updated when adding a new parser. Also add the tool name to `KNOWN_SUBCOMMANDS` in `cmd/registry.rs` and the `dispatch()` match arm in `cmd/dispatch.rs`.
 
 - **Adding a build tool as a passthrough dispatcher**: build tools should use the strict dispatcher model (error on unknown subcommand), not the passthrough model used by `swift`/`dotnet`. Build commands have a finite, well-defined subcommand set; passthrough is reserved for tools with wide lifecycle subcommand surfaces that agents invoke routinely.
 
-- **Declaring local `make_output` or `load_fixture` in build test modules**: use `super::super::test_support` instead. Local redeclarations drift from the canonical definition (e.g., duration field set to arbitrary millisecond values instead of `Duration::ZERO`). Since PR #267, `test_support` is a dedicated file at `crates/rskim/src/cmd/test_support.rs`, not an inline `#[cfg(test)]` module.
+- **Applying three-tier degradation to `cargo fmt`**: `parse_fmt` is intentionally two-tier (Full or Passthrough). Do not add a Tier 2 regex fallback to `parse_fmt` — `cargo fmt` produces no structured diagnostic output, so Degraded would carry no useful signal. The two-tier model is by design.
+
+- **Declaring local `make_output` or `load_fixture` in build test modules**: use `crate::cmd::test_utils` instead. Local redeclarations drift from the canonical definition (e.g., duration field set to arbitrary millisecond values instead of `Duration::ZERO`).
+
+- **Using `super::super::test_utils` import path**: the module is now a standalone file `cmd/test_utils.rs`, not an inline block. The canonical import path is `crate::cmd::test_utils::{...}` for any module in the `cmd` subtree.
 
 ## Gotchas
 
@@ -252,25 +288,25 @@ Build parser tests import these as `use super::super::test_support::{make_output
 ## Key Files
 
 - `crates/rskim/src/cmd/build/mod.rs` — dispatcher (`run`), shared `run_parsed_command`, and `print_help`
-- `crates/rskim/src/cmd/build/cargo.rs` — cargo build and clippy: NDJSON Tier 1, regex Tier 2
+- `crates/rskim/src/cmd/build/cargo.rs` — cargo build/check/clippy: `run`/`run_check`/`run_clippy` all delegate to `run_with_json_format` (NDJSON Tier 1, regex Tier 2); `run_fmt` uses a separate two-tier `parse_fmt` (empty → Full, non-empty → Passthrough)
 - `crates/rskim/src/cmd/build/tsc.rs` — TypeScript compiler: regex-on-stderr Tier 1, combined Tier 2, empty-output success (checked after both tiers)
 - `crates/rskim/src/cmd/build/make.rs` — GNU make: GCC diagnostics Tier 1, noise-strip Tier 2, eight `LazyLock<Regex>` patterns plus one literal `starts_with` check
 - `crates/rskim/src/cmd/build/gradle.rs` — Gradle/Gradlew: task outcome + Java/Kotlin diagnostic Tier 1 (with duration), noise-strip Tier 2 (six `LazyLock<Regex>` patterns)
 - `crates/rskim/src/cmd/build/maven.rs` — Maven/Mvnw: `[ERROR]`/`[WARNING]` + build summary Tier 1 (with duration), noise-strip Tier 2 (two `LazyLock<Regex>` patterns, two duration formats)
 - `crates/rskim/src/output/mod.rs` — `ParseResult<T>` enum definition and helpers (`is_full`, `is_degraded`, `tier_name`, `content`, `into_content`, `emit_markers`); `strip_ansi` and `strip_ansi_cow` (zero-copy fast path: borrows when no ESC byte present); `to_json_envelope` (not used by build family — build has no `--json` mode); `OutputMode`, `clean`, `PassthroughTruncator`, `FilterTransparencyHeader` (used by other families); sub-modules `guardrail` and `tee` (not used by build parsers — used by other consumers of the output infrastructure)
 - `crates/rskim/src/output/canonical.rs` — `BuildResult` struct with pre-rendered output; also owns `TestResult`, `GitResult`, `LintResult`, `DbResult`, `PkgResult` — the `DbResult::render` was decomposed into 5 private helpers in #214 as a model for growing render logic
-- `crates/rskim/src/cmd/mod.rs` — (PR #267: reduced from 2,070 to ~420 lines) module declarations + re-exports of all `pub(crate)` items from sub-modules; retains shared utilities: `user_has_flag`, `inject_flag_before_separator`, `extract_show_stats`, `extract_json_flag`, `extract_output_format`, `combine_output`, `format_analytics_label`; stdin infrastructure: `should_read_stdin`, `read_bounded`, `read_stdin_bounded`, `MAX_STDIN_BYTES`; passthrough infrastructure: `is_passthrough_mode`, `check_passthrough_str`, `check_passthrough_value`; resolver: `resolve_cache_dir`; `prepend_without`, `extract_subcmd`
-- `crates/rskim/src/cmd/security.rs` — credential scrubbing: `scrub_db_args`, `sanitize_for_display`, `TokenAction` enum + `classify_token` helper (eliminated 4-level nesting)
-- `crates/rskim/src/cmd/registry.rs` — subcommand registry: `KNOWN_SUBCOMMANDS`, `META_SUBCOMMANDS`, `wrapper_targets`, `is_known_subcommand`
-- `crates/rskim/src/cmd/execution.rs` — execution pipeline: `RunContext`, `ParsedCommandConfig<'_>`, `ToolRunConfig<'_>`, `OutputFormat`, `run_tool<T>` (used by lint, db, infra, file families — NOT by build), `run_parsed_command_with_mode` (used by non-build families), `obtain_output`, `render_output<T>`, `passthrough_raw`, `record_and_report`
-- `crates/rskim/src/cmd/dispatch.rs` — top-level routing: `dispatch()`, `dispatch_cargo()`, `dispatch_go()`, `dispatch_swift()`, `dispatch_dotnet()`, `run_raw_passthrough()`, `passthrough_subcmd()`
-- `crates/rskim/src/cmd/test_support.rs` — test helpers (moved from inline `#[cfg(test)]` module): `make_output`, `make_output_full`, `make_output_stderr`, `load_fixture`; all items `pub(crate)`
+- `crates/rskim/src/cmd/mod.rs` — coordination point: declares all submodules, re-exports public API; inline helpers: `user_has_flag`, `inject_flag_before_separator`, `extract_show_stats`, `extract_json_flag`, `extract_output_format`, `combine_output`, `should_read_stdin`, `read_bounded`, `read_stdin_bounded`, `MAX_STDIN_BYTES`; passthrough checks: `is_passthrough_mode`, `check_passthrough_str`, `check_passthrough_value`; resolver: `resolve_cache_dir`; private: `obtain_output` (soft spawn-failure path for non-build families), `render_output<T>`, `DEFAULT_CMD_TIMEOUT`
+- `crates/rskim/src/cmd/dispatch.rs` — `dispatch()`, `run_raw_passthrough()`, per-tool dispatcher helpers (`dispatch_cargo`, `dispatch_go`, `dispatch_swift`, `dispatch_dotnet`, `passthrough_subcmd`, `extract_subcmd`, `prepend_without`)
+- `crates/rskim/src/cmd/execution.rs` — `OutputFormat`, `RunContext`, `ParsedCommandConfig<'_>`, `ToolRunConfig<'_>`, `run_tool<T>`, `run_parsed_command_with_mode`, `format_analytics_label` (NOT used by build family — build uses `build/mod.rs::run_parsed_command`)
+- `crates/rskim/src/cmd/security.rs` — `sanitize_for_display`, `scrub_db_args`, `scrub_infra_args`
+- `crates/rskim/src/cmd/registry.rs` — `KNOWN_SUBCOMMANDS` (sorted, binary-searchable via `binary_search`), `is_known_subcommand`, `is_meta_subcommand`, `wrapper_targets`
+- `crates/rskim/src/cmd/test_utils.rs` — standalone test helper module (compiled under `#[cfg(test)]` gate): `make_output`, `make_output_full`, `make_output_stderr`, `load_fixture`; import as `crate::cmd::test_utils`
 
 ## Related
 
 - `crates/rskim/src/output/mod.rs` — owns `ParseResult<T>`, the type returned by all three-tier parsers across the whole codebase (lint, test, infra, build); `emit_markers` debug gate is defined here
 - `crates/rskim/src/output/canonical.rs` — owns `BuildResult`, `TestResult`, `GitResult`, `LintResult`; build parsers use `BuildResult`
 - `crates/rskim/src/runner.rs` — `CommandRunner`, `CommandOutput`, `is_spawn_error` — the execution layer called by `run_parsed_command`
-- `crates/rskim/src/cmd/lint/` — sibling module using the same three-tier pattern with `LintResult` instead of `BuildResult`; lint parsers use `run_tool<T>` (via `run_parsed_command_with_mode`) rather than `run_parsed_command`
+- `crates/rskim/src/cmd/lint/` — sibling module using the same three-tier pattern with `LintResult` instead of `BuildResult`; lint parsers use `run_tool<T>` (via `run_parsed_command_with_mode` in `execution.rs`) rather than `run_parsed_command`
 - `crates/rskim/src/cmd/test/` — sibling module using the same three-tier pattern with `TestResult`
 - ADR-001: Fix all noticed issues immediately regardless of scope — applies when adding a new build parser: fix any spotted inconsistencies in other parsers in the same PR rather than deferring
