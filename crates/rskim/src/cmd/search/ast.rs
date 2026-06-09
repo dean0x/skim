@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 
-use rskim_search::{AstIndexReader, AstQuery, AstQueryEngine, FileId, SearchLayer, SearchQuery};
+use rskim_search::{AstIndexReader, AstQuery, AstQueryEngine, FileId};
 use rskim_search::{all_patterns, parse_ast_query};
 use serde::Serialize;
 
@@ -102,7 +102,7 @@ pub(super) fn resolve_ast_file_filter(
     raw: &str,
 ) -> anyhow::Result<HashSet<FileId>> {
     let query = rskim_search::parse_ast_query(raw.trim())
-        .map_err(|e| anyhow::anyhow!("AST query failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("invalid AST pattern: {e}"))?;
     let hits = engine
         .search_ast(&query)
         .map_err(|e| anyhow::anyhow!("AST query failed: {e}"))?;
@@ -137,25 +137,25 @@ pub(super) fn run_ast_standalone(
 
     let engine = open_ast_engine(cache_dir)?;
 
-    let mut sq = SearchQuery::new(String::new());
-    sq.ast_pattern = Some(raw_pattern.to_string());
-    sq.limit = Some(limit);
-
-    let results = engine
-        .search(&sq)
+    let query = parse_ast_query(raw_pattern.trim())
+        .map_err(|e| anyhow::anyhow!("invalid AST pattern: {e}"))?;
+    let raw_results = engine
+        .search_ast(&query)
         .map_err(|e| anyhow::anyhow!("AST query failed: {e}"))?;
+    // Apply limit after the raw search (search_ast returns all matches sorted by FileId).
+    let results: Vec<_> = raw_results.into_iter().take(limit).collect();
 
     // Resolve FileIds → repo-relative paths using the manifest.
     // Warn on out-of-range FileIds (avoids PF-002 silent-drop anti-pattern,
     // applies ADR-006 counterpart on the read side).
     let sorted = manifest.sorted_paths();
     let mut resolved: Vec<AstResult> = Vec::with_capacity(results.len());
-    for r in &results {
-        let idx = r.file_id.0 as usize;
+    for (fid, score) in &results {
+        let idx = fid.0 as usize;
         match sorted.get(idx) {
             Some(path) => resolved.push(AstResult {
                 path: path.to_string(),
-                score: r.score,
+                score: *score,
             }),
             None => {
                 eprintln!(

@@ -267,7 +267,7 @@ fn take_flag_value(
     flag: &str,
 ) -> anyhow::Result<(String, bool)> {
     let prefix = format!("{flag}=");
-    if let Some(val) = arg.strip_prefix(&*prefix) {
+    if let Some(val) = arg.strip_prefix(&prefix) {
         let trimmed = val.trim();
         if trimmed.is_empty() {
             anyhow::bail!("{flag} value must not be empty or whitespace-only");

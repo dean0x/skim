@@ -53,15 +53,15 @@ pub use ast_index::{
 /// keeps them in sync — bumping only one will fail the build immediately.
 pub const AST_INDEX_FORMAT_VERSION: u16 = ast_index::store::format::FORMAT_VERSION;
 
-// Compile-time guard: the crate-root constant must equal the internal FORMAT_VERSION.
-// If a future v3 bump edits only format.rs, this assertion catches the divergence
-// at build time rather than silently producing a broken staleness check.
-// applies ADR-001: fix noticed issues immediately (silent drift between the two
-// literals was flagged; we resolve it by deriving rather than duplicating).
+// Compile-time guard: `AST_INDEX_FORMAT_VERSION` is currently defined as an alias
+// for `FORMAT_VERSION`, so this assert is trivially true. It is kept as an explicit
+// statement of the invariant so that any future refactoring (e.g. making it a
+// separate literal) will fail the build if the two values diverge.
 const _: () = assert!(
     AST_INDEX_FORMAT_VERSION == ast_index::store::format::FORMAT_VERSION,
     "AST_INDEX_FORMAT_VERSION must equal ast_index::store::format::FORMAT_VERSION"
 );
+
 pub use cochange::{CochangeMatrixBuilder, CochangeMatrixReader};
 pub use index::{NgramIndexBuilder, NgramIndexReader};
 pub use lexical::{
