@@ -321,12 +321,16 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
             "--install-hooks" => action_flag = Some(SearchAction::InstallHooks),
             "--remove-hooks" => action_flag = Some(SearchAction::RemoveHooks),
             "--json" | "-j" => json = true,
-            "--limit" | "-n" => {
-                i += 1;
-                let raw = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--limit requires a value (e.g. --limit 10)"))?;
-                limit = parse_limit_value(raw)?;
+            s if s == "--limit" || s == "-n" || s.starts_with("--limit=") => {
+                // Both space-separated (`--limit 10`, `-n 10`) and equals (`--limit=10`)
+                // forms are handled by take_flag_value — same idiom as --root and --ast.
+                // `-n` is a short alias; errors always say "--limit" for consistency.
+                // `-n` has no equals form so the "--limit=" prefix never fires for it.
+                let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--limit")?;
+                limit = parse_limit_value(&raw)?;
+                if consumed {
+                    i += 1;
+                }
             }
             s if s == "--root" || s.starts_with("--root=") => {
                 let (val, consumed) = take_flag_value(s, args.get(i + 1), "--root")?;
@@ -342,10 +346,6 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                 if consumed {
                     i += 1;
                 }
-            }
-            s if s.starts_with("--limit=") => {
-                let raw = s.trim_start_matches("--limit=");
-                limit = parse_limit_value(raw)?;
             }
             s if matches!(s, "--hot" | "--cold" | "--risky" | "--blast-radius")
                 || s.starts_with("--blast-radius=") =>
@@ -613,17 +613,20 @@ fn run_query(
     //
     // IMPORTANT: auto_refresh_if_stale MUST run BEFORE open_ast_engine so that
     // a missing or stale AST index is rebuilt before we try to open it.
-    // execute_query also calls auto_refresh_if_stale for the lexical index, but
-    // the AST engine is opened here first — so we refresh explicitly.
+    // The returned manifest is threaded into execute_query so it can skip its
+    // own auto_refresh_if_stale call — the combined text+--ast path refreshes
+    // exactly once here (applies ADR-006: self-heal ordering is load-bearing).
     // Mirrors the ordering on the standalone --ast path (mod.rs:108-110).
     //
     // Missing index (after refresh) → fail loud (return Err, #199).
     // Query execution failure → degrade gracefully (warn, no AST filter).
-    let ast_file_ids = if let Some(ref raw_ast) = flags.ast {
+    let (ast_file_ids, pre_loaded_manifest) = if let Some(ref raw_ast) = flags.ast {
         // Self-heal: rebuild both indexes if the AST index is absent or stale.
-        let _ = staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+        // Returns the manifest so execute_query skips a redundant refresh+load.
+        let (_refreshed, manifest) =
+            staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
         let engine = ast::open_ast_engine(&cache_dir)?;
-        match ast::resolve_ast_file_filter(&engine, raw_ast) {
+        let ids = match ast::resolve_ast_file_filter(&engine, raw_ast) {
             Ok(ids) => {
                 if ids.is_empty() {
                     eprintln!("skim search: --ast {:?} matched no indexed files", raw_ast);
@@ -637,9 +640,12 @@ fn run_query(
                 eprintln!("skim search: AST query warning: {e}");
                 None
             }
-        }
+        };
+        (ids, Some(manifest))
     } else {
-        None
+        // Pure-lexical path: no --ast flag. execute_query will call
+        // auto_refresh_if_stale itself exactly once.
+        (None, None)
     };
 
     let config = types::QueryConfig {
@@ -652,7 +658,11 @@ fn run_query(
         ast_file_ids,
     };
 
-    let mut output = query::execute_query(&config, analytics)?;
+    // Pass the already-refreshed manifest (text+--ast path) or None (pure-lexical
+    // path). execute_query_with_manifest refreshes internally only when
+    // pre_loaded_manifest is None, ensuring each path calls auto_refresh_if_stale
+    // exactly once.
+    let mut output = query::execute_query_with_manifest(&config, pre_loaded_manifest, analytics)?;
 
     // Apply temporal sort/annotation to the results.
     if let (Some(sort), Some(db)) = (flags.temporal_sort, &temporal_db) {

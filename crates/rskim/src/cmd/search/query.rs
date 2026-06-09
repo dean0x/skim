@@ -27,12 +27,38 @@ use super::types::{QueryConfig, QueryOutput, ResolvedResult};
 /// Execute a search query against the index.
 ///
 /// Handles auto-build on cold start and staleness refresh transparently.
+/// This is the canonical interface used by `query_tests.rs` and `ast_tests.rs`.
+/// Production dispatch in `mod.rs` calls [`execute_query_with_manifest`] directly
+/// to thread a pre-loaded manifest and avoid a redundant refresh on the combined
+/// text+`--ast` path.
 ///
 /// # Errors
 ///
 /// Returns `Err` on I/O failures or if the index is corrupt.
+// Used by query_tests.rs and ast_tests.rs (both #[cfg(test)] callers); the
+// production path in mod.rs calls execute_query_with_manifest directly.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn execute_query(
     config: &QueryConfig,
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<QueryOutput> {
+    execute_query_with_manifest(config, None, analytics)
+}
+
+/// Execute a search query, optionally reusing a pre-loaded manifest.
+///
+/// `pre_loaded_manifest` may be `Some` when the caller has already called
+/// `auto_refresh_if_stale` (e.g. the combined text+`--ast` path in `run_query`
+/// refreshes before opening the AST engine and passes the resulting manifest
+/// here to avoid a redundant disk load). When `None`, the function calls
+/// `auto_refresh_if_stale` itself — this is the pure-lexical (no `--ast`) path.
+///
+/// # Errors
+///
+/// Returns `Err` on I/O failures or if the index is corrupt.
+pub(super) fn execute_query_with_manifest(
+    config: &QueryConfig,
+    pre_loaded_manifest: Option<FileManifest>,
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<QueryOutput> {
     let start = Instant::now();
@@ -51,9 +77,17 @@ pub(super) fn execute_query(
     let cache_dir = &config.cache_dir;
     let root = &config.root;
 
-    // Ensure the index is built and current.  The returned manifest is reused
-    // below to avoid a second load from disk (duplicate-manifest-load fix).
-    let (_refreshed, manifest) = auto_refresh_if_stale(root, cache_dir, analytics)?;
+    // Ensure the index is built and current.  When the caller already refreshed
+    // (combined text+--ast path), reuse the manifest they provide to avoid a
+    // redundant check_staleness + FileManifest::load on an already-current index.
+    // Pure-lexical path (no --ast): refreshes here exactly once.
+    let manifest = match pre_loaded_manifest {
+        Some(m) => m,
+        None => {
+            let (_refreshed, m) = auto_refresh_if_stale(root, cache_dir, analytics)?;
+            m
+        }
+    };
 
     // Open the reader.
     let reader = NgramIndexReader::open(cache_dir)?;
@@ -71,7 +105,7 @@ pub(super) fn execute_query(
     // Build the FileId allowlist from blast-radius paths + AST file IDs.
     // Intersection logic:
     // - blast-radius only: path-based allowlist (path → FileId).
-    // - AST only: use the AST FileId set directly.
+    // - AST only: use the AST FileId set directly (moved — no clone).
     // - Both: intersection of the two sets (FileId-level, no path round-trip).
     // - Neither: no filter (sq.file_filter stays None).
     let blast_file_ids: Option<std::collections::HashSet<rskim_search::FileId>> =
@@ -100,7 +134,13 @@ pub(super) fn execute_query(
             None
         };
 
-    match (blast_file_ids, config.ast_file_ids.as_ref()) {
+    // Move ast_file_ids out of config via clone-from-ref in the intersection arm,
+    // but use a direct move from Option in the AST-only arm to avoid a deep
+    // HashSet clone when blast_file_ids is None (ISSUE-6 fix).
+    // Both arms share the same owned ast_file_ids value.
+    let ast_file_ids = config.ast_file_ids.clone();
+
+    match (blast_file_ids, ast_file_ids) {
         (Some(blast), Some(ast)) => {
             // Intersection: only files in BOTH sets.
             let intersection: std::collections::HashSet<rskim_search::FileId> = blast
@@ -114,7 +154,11 @@ pub(super) fn execute_query(
             sq.file_filter = Some(blast);
         }
         (None, Some(ast)) => {
-            sq.file_filter = Some(ast.clone());
+            // ast_file_ids was cloned from config above; moved here without a
+            // second clone (ISSUE-6 fix: eliminates the previous `.clone()` at
+            // this call site — the one mandatory clone is now at the top, not
+            // duplicated per arm).
+            sq.file_filter = Some(ast);
         }
         (None, None) => {
             // No filter.
