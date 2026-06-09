@@ -190,10 +190,9 @@ where
     F: FnOnce(&Path) + std::panic::UnwindSafe,
 {
     let isolated = tempfile::tempdir().expect("tempdir must succeed");
-    let cache_path = isolated.path().to_path_buf();
 
     // Safety: guarded by #[serial_test::serial] on every caller.
-    unsafe { std::env::set_var("SKIM_CACHE_DIR", &cache_path) };
+    unsafe { std::env::set_var("SKIM_CACHE_DIR", isolated.path()) };
 
     let result = std::panic::catch_unwind(|| f(isolated.path()));
 

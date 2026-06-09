@@ -134,10 +134,7 @@ pub(super) fn execute_query_with_manifest(
             None
         };
 
-    // Move ast_file_ids out of config via clone-from-ref in the intersection arm,
-    // but use a direct move from Option in the AST-only arm to avoid a deep
-    // HashSet clone when blast_file_ids is None (ISSUE-6 fix).
-    // Both arms share the same owned ast_file_ids value.
+    // Clone once so all match arms receive an owned value without per-arm clones.
     let ast_file_ids = config.ast_file_ids.clone();
 
     match (blast_file_ids, ast_file_ids) {
@@ -154,10 +151,6 @@ pub(super) fn execute_query_with_manifest(
             sq.file_filter = Some(blast);
         }
         (None, Some(ast)) => {
-            // ast_file_ids was cloned from config above; moved here without a
-            // second clone (ISSUE-6 fix: eliminates the previous `.clone()` at
-            // this call site — the one mandatory clone is now at the top, not
-            // duplicated per arm).
             sq.file_filter = Some(ast);
         }
         (None, None) => {

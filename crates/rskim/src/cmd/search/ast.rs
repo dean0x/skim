@@ -165,40 +165,36 @@ pub(super) fn run_ast_standalone(
                 None
             }
             Some(db) => {
-                match super::temporal::normalize_blast_radius_path(raw_path, root) {
-                    Err(e) => return Err(e),
-                    Ok(normalized) => {
-                        let partners = db.cochanges_for_file(&normalized)?;
-                        if partners.is_empty() {
-                            eprintln!("skim search: no co-change data for {raw_path:?}");
-                        }
-                        // Include the target file itself (mirrors resolve_blast_radius_filter).
-                        let mut allowed_paths =
-                            super::temporal::cochange_partner_paths(&partners, &normalized);
-                        allowed_paths.insert(normalized);
+                let normalized = super::temporal::normalize_blast_radius_path(raw_path, root)?;
+                let partners = db.cochanges_for_file(&normalized)?;
+                if partners.is_empty() {
+                    eprintln!("skim search: no co-change data for {raw_path:?}");
+                }
+                // Include the target file itself (mirrors resolve_blast_radius_filter).
+                let mut allowed_paths =
+                    super::temporal::cochange_partner_paths(&partners, &normalized);
+                allowed_paths.insert(normalized);
 
-                        // Convert path strings → FileIds via manifest sorted_paths().
-                        let sorted = manifest.sorted_paths();
-                        let mut file_ids = HashSet::new();
-                        for (idx, path) in sorted.iter().enumerate() {
-                            if allowed_paths.contains(*path) {
-                                // PF-004: widen idx (usize) to u32 before constructing FileId.
-                                if let Ok(id) = u32::try_from(idx) {
-                                    file_ids.insert(FileId(id));
-                                }
-                            }
+                // Convert path strings → FileIds via manifest sorted_paths().
+                let sorted = manifest.sorted_paths();
+                let mut file_ids = HashSet::new();
+                for (idx, path) in sorted.iter().enumerate() {
+                    if allowed_paths.contains(*path) {
+                        // PF-004: widen idx (usize) to u32 before constructing FileId.
+                        if let Ok(id) = u32::try_from(idx) {
+                            file_ids.insert(FileId(id));
                         }
-                        if file_ids.is_empty() {
-                            eprintln!(
-                                "skim search: blast-radius filter matched 0 indexed files \
-                                 (allowed {} paths, index has {} files)",
-                                allowed_paths.len(),
-                                sorted.len()
-                            );
-                        }
-                        Some(file_ids)
                     }
                 }
+                if file_ids.is_empty() {
+                    eprintln!(
+                        "skim search: blast-radius filter matched 0 indexed files \
+                         (allowed {} paths, index has {} files)",
+                        allowed_paths.len(),
+                        sorted.len()
+                    );
+                }
+                Some(file_ids)
             }
         }
     } else {
