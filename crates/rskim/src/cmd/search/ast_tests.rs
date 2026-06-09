@@ -769,17 +769,16 @@ fn run_ast_standalone_with_real_index_maps_paths() {
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
 
     // Run standalone --ast query.  "try-catch" matches Rust match-on-Result patterns.
-    // run_ast_standalone writes to its own internal BufWriter(stdout); we only check
-    // the returned ExitCode here.
+    // Capture output via a Vec<u8> buffer (satisfies PF-007: test observes real output).
+    let mut out: Vec<u8> = Vec::new();
     let result = super::run_ast_standalone(
         "try-catch",
         20,
         false, // text output
         cache.path(),
         &manifest,
-        None,                              // no --blast-radius
-        &cache.path().join("temporal.db"), // temporal DB path (absent = graceful degrade)
-        project.path(),                    // project root
+        None, // no --blast-radius
+        &mut out,
     )
     .unwrap();
 
@@ -787,6 +786,12 @@ fn run_ast_standalone_with_real_index_maps_paths() {
         result,
         std::process::ExitCode::SUCCESS,
         "standalone --ast must exit 0 (AC-F8)"
+    );
+    // Output must contain the pattern header (non-empty, well-formed).
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("AST pattern: try-catch"),
+        "output must contain pattern header; got:\n{text}"
     );
 
     // Verify open_ast_engine fails loudly when the index is absent.
@@ -1202,16 +1207,27 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
     write_cochange_db(&db_path, "src/alpha.rs", "src/plain.rs");
 
     // --- Step 3: Run standalone --ast with --blast-radius src/plain.rs ---
-    // src/plain.rs exists on disk → normalize_blast_radius_path succeeds.
+    // Resolve blast-radius → FileIds the same way mod.rs does (via the shared resolver).
+    // This exercises the production path: temporal::resolve_blast_radius_file_ids resolves
+    // paths to FileIds, then run_ast_standalone intersects and writes to the provided buffer.
+    let blast_fids = super::super::temporal::resolve_blast_radius_file_ids(
+        Some("src/plain.rs"),
+        project.path(),
+        &db_path,
+        &sorted,
+        false,
+    )
+    .unwrap();
+
+    let mut output_buf: Vec<u8> = Vec::new();
     let filtered_result = super::run_ast_standalone(
         "rust-nested-loop",
         20,
         false,
         cache.path(),
         &manifest,
-        Some("src/plain.rs"), // blast-radius: only alpha.rs is a co-change partner
-        &db_path,
-        project.path(),
+        blast_fids,
+        &mut output_buf,
     )
     .unwrap();
 
@@ -1221,62 +1237,71 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
         "--ast + --blast-radius must exit 0 (AC-F8)"
     );
 
-    // --- Step 4: Assert the filtered set is STRICTLY SMALLER (intersection applied) ---
-    // We derive the filtered FileId set the same way run_ast_standalone does internally:
-    // raw_results filtered by blast FileIds.  Re-use the engine to get the same raw set.
-    let raw_results = {
-        let q = parse_ast_query("rust-nested-loop").unwrap();
-        engine.search_ast(&q).unwrap()
-    };
-
-    // Blast-radius partners of src/plain.rs = {src/alpha.rs, src/plain.rs}.
-    // Convert to FileIds the same way run_ast_standalone does (PF-004: u32::try_from).
-    let plain_norm = "src/plain.rs";
-    let alpha_norm = "src/alpha.rs";
-    let blast_fids: HashSet<FileId> = sorted
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| **p == plain_norm || **p == alpha_norm)
-        .filter_map(|(i, _)| u32::try_from(i).ok().map(FileId))
-        .collect();
-
-    let filtered_count = raw_results
-        .iter()
-        .filter(|(fid, _)| blast_fids.contains(fid))
-        .count();
+    // --- Step 4: Assert the PRODUCTION OUTPUT shows alpha.rs but NOT beta.rs ---
+    //
+    // PF-007: this assertion observes the actual output written by run_ast_standalone,
+    // not a locally re-derived set.  A reversion of the dispatch gate to
+    // blast_radius.is_none() (PF-006 regression) would cause the full AST set
+    // (both alpha.rs AND beta.rs) to be output, failing the beta-absent check below.
+    let output_text = String::from_utf8(output_buf).unwrap();
 
     assert!(
-        filtered_count < unfiltered_count,
-        "intersection MUST be strictly smaller than unfiltered AST set \
-         (filtered={filtered_count}, unfiltered={unfiltered_count}); \
-         if equal, --blast-radius is being silently dropped (PF-006 regression)"
+        output_text.contains("alpha.rs"),
+        "production output must contain src/alpha.rs (only co-change partner of plain.rs that matches rust-nested-loop); \
+         got:\n{output_text}"
+    );
+    assert!(
+        !output_text.contains("beta.rs"),
+        "production output must NOT contain src/beta.rs (no co-change relationship with plain.rs); \
+         if beta.rs appears, --blast-radius intersection is being silently dropped (PF-006 regression); \
+         got:\n{output_text}"
     );
 
-    // src/plain.rs does NOT match rust-nested-loop (no nested loops in it), so only
-    // src/alpha.rs (which co-changes with plain.rs AND matches the AST pattern)
-    // survives the intersection.
-    assert_eq!(
-        filtered_count, 1,
-        "only src/alpha.rs should survive the intersection (it co-changes with plain.rs)"
-    );
+    // Also verify the count-based strict-subset property (belt-and-suspenders).
+    // The output contains "N file(s) matched pattern" — we check N < unfiltered_count.
+    let matched_count_line = output_text
+        .lines()
+        .find(|l| l.contains("file(s) matched pattern"));
+    if let Some(line) = matched_count_line {
+        let count: usize = line
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        assert!(
+            count < unfiltered_count,
+            "filtered count {count} must be strictly smaller than unfiltered AST set {unfiltered_count}; \
+             if equal, --blast-radius is being silently dropped (PF-006 regression)"
+        );
+    }
 
     // --- Step 5: Graceful-degrade — absent temporal DB → full AST set, exit 0, no error ---
-    // When the temporal DB is missing, run_ast_standalone warns to stderr and returns
-    // the full AST result set (no intersection).  This matches the committed behavior:
-    // open_temporal_db returns None → blast_file_ids = None → filter passes all.
-    //
-    // src/plain.rs is reused as the blast-radius target; it exists on disk so the
-    // path-not-found error path is not triggered — we reach the DB-absent path.
+    // When the temporal DB is missing, resolve_blast_radius_file_ids returns None and
+    // run_ast_standalone returns the full AST result set (no intersection).
     let absent_db = cache.path().join("no_such_temporal.db");
+    let degrade_blast_fids = super::super::temporal::resolve_blast_radius_file_ids(
+        Some("src/plain.rs"),
+        project.path(),
+        &absent_db,
+        &sorted,
+        false,
+    )
+    .unwrap();
+    // When the DB is absent, resolve_blast_radius_file_ids returns None.
+    assert!(
+        degrade_blast_fids.is_none(),
+        "absent temporal DB must yield None blast_file_ids"
+    );
+
+    let mut degrade_buf: Vec<u8> = Vec::new();
     let degrade_result = super::run_ast_standalone(
         "rust-nested-loop",
         20,
         false,
         cache.path(),
         &manifest,
-        Some("src/plain.rs"), // blast-radius requested (file exists on disk)
-        &absent_db,           // DB is absent → graceful degrade
-        project.path(),
+        degrade_blast_fids, // None → no intersection, full AST set
+        &mut degrade_buf,
     )
     .unwrap();
 
@@ -1286,17 +1311,14 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
         "absent temporal DB must degrade gracefully (exit 0, not error)"
     );
 
-    // On the degrade path the full AST set is returned (blast_file_ids = None).
-    // We cannot capture stdout in a unit test (run_ast_standalone writes to BufWriter(stdout)),
-    // but the key assertion is exit 0 — graceful degrade is proven by Ok(SUCCESS) above.
-    // Re-running the raw query confirms the engine returns the full unfiltered count.
-    let degrade_raw = {
-        let q = parse_ast_query("rust-nested-loop").unwrap();
-        engine.search_ast(&q).unwrap()
-    };
-    assert_eq!(
-        degrade_raw.len(),
-        unfiltered_count,
-        "graceful-degrade path must return the full AST set (no intersection when DB absent)"
+    // Graceful-degrade output must contain BOTH alpha.rs and beta.rs (full AST set).
+    let degrade_text = String::from_utf8(degrade_buf).unwrap();
+    assert!(
+        degrade_text.contains("alpha.rs"),
+        "graceful-degrade output must contain alpha.rs; got:\n{degrade_text}"
+    );
+    assert!(
+        degrade_text.contains("beta.rs"),
+        "graceful-degrade output must contain beta.rs (full set when DB absent); got:\n{degrade_text}"
     );
 }

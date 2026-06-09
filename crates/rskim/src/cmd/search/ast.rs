@@ -57,7 +57,7 @@ pub(super) fn open_ast_engine(cache_dir: &Path) -> anyhow::Result<AstQueryEngine
 // Pattern validation
 // ============================================================================
 
-/// Validate a raw `--ast` string at the CLI boundary.
+/// Validate a raw `--ast` string at the CLI boundary and return the parsed query.
 ///
 /// Calls [`parse_ast_query`] after trimming whitespace.  Returns a friendly
 /// error for:
@@ -66,10 +66,14 @@ pub(super) fn open_ast_engine(cache_dir: &Path) -> anyhow::Result<AstQueryEngine
 /// - Query > 4096 bytes → surfaces the library message.
 /// - Empty / whitespace-only → caught before this call in `parse_flags`.
 ///
+/// Returning the parsed `AstQuery` avoids a second `parse_ast_query` call in
+/// callers that need both validation and the query object (e.g. `run_ast_standalone`).
+/// Callers that only need validation can discard the return value with `?; let _ =`.
+///
 /// # Errors
 ///
 /// Returns `Err` on any invalid query, with a message ready for user display.
-pub(super) fn validate_ast_pattern(raw: &str) -> anyhow::Result<()> {
+pub(super) fn validate_ast_pattern(raw: &str) -> anyhow::Result<AstQuery> {
     match parse_ast_query(raw.trim()) {
         Ok(AstQuery::SingleNode(_)) => {
             anyhow::bail!(
@@ -78,7 +82,7 @@ pub(super) fn validate_ast_pattern(raw: &str) -> anyhow::Result<()> {
                  (e.g. `--ast \"for_statement > await_expression\"`)."
             );
         }
-        Ok(_) => Ok(()),
+        Ok(query) => Ok(query),
         Err(e) => Err(anyhow::anyhow!("{e}")),
     }
 }
@@ -119,90 +123,48 @@ pub(super) fn resolve_ast_file_filter(
 /// Mirrors `run_temporal_standalone` in `mod.rs`:
 /// - Validates the pattern before opening the index.
 /// - Opens the AST engine.
-/// - When `blast_radius` is set, resolves co-change peers via the temporal DB,
-///   converts them to `FileId`s, and intersects with the AST result set so that
-///   `--limit` applies to the already-filtered set (avoids PF-006 silent-drop,
-///   applies ADR-006 fail-loud counterpart on the read side).
+/// - `blast_file_ids`: pre-resolved co-change FileId allowlist from the caller
+///   (see `temporal::resolve_blast_radius_file_ids`).  When `Some`, intersects
+///   with the AST result set BEFORE applying `--limit` (avoids PF-006
+///   silent-drop, applies ADR-006 fail-loud counterpart on the read side).
+///   Caller is responsible for resolution so the parameter count stays below
+///   the clippy threshold and the `#[allow]` annotation is not needed.
 /// - Executes the query and formats output.
 ///
 /// # Errors
 ///
 /// Returns `Err` when the index is absent, the query is invalid, or I/O fails.
 /// Returns `Ok(ExitCode::SUCCESS)` for empty result sets (AC-F8).
-#[allow(clippy::too_many_arguments)]
+/// Execute a standalone `--ast` query, writing output to `w`.
+///
+/// The `w` parameter is the output sink — production callers pass a
+/// `BufWriter` over stdout; tests pass a `Vec<u8>` buffer to capture and
+/// assert the exact output (satisfies PF-007: regression tests must observe
+/// production output, not just assert exit 0).
 pub(super) fn run_ast_standalone(
     raw_pattern: &str,
     limit: usize,
     json: bool,
     cache_dir: &Path,
     manifest: &super::manifest::FileManifest,
-    blast_radius: Option<&str>,
-    temporal_db_path: &Path,
-    root: &Path,
+    blast_file_ids: Option<HashSet<FileId>>,
+    w: &mut impl Write,
 ) -> anyhow::Result<ExitCode> {
     // Validate before opening the index — fail fast with good error messages.
-    validate_ast_pattern(raw_pattern)?;
+    // Returns the parsed AstQuery to avoid a second parse_ast_query call below.
+    let query = validate_ast_pattern(raw_pattern)?;
 
     let engine = open_ast_engine(cache_dir)?;
 
-    let query = parse_ast_query(raw_pattern.trim())
-        .map_err(|e| anyhow::anyhow!("invalid AST pattern: {e}"))?;
     let raw_results = engine
         .search_ast(&query)
         .map_err(|e| anyhow::anyhow!("AST query failed: {e}"))?;
 
-    // Resolve the blast-radius FileId allowlist when --blast-radius is set.
-    // Mirrors the blast_radius_paths resolution in resolve_blast_radius_filter
-    // (mod.rs) then converts paths → FileIds exactly as query.rs does, so the
-    // intersection semantics are identical on both paths (avoids PF-006).
-    let blast_file_ids: Option<HashSet<FileId>> = if let Some(raw_path) = blast_radius {
-        match super::temporal::open_temporal_db(temporal_db_path) {
-            None => {
-                eprintln!(
-                    "skim search: no temporal data for --blast-radius — run 'skim heatmap' \
-                     to populate"
-                );
-                None
-            }
-            Some(db) => {
-                let normalized = super::temporal::normalize_blast_radius_path(raw_path, root)?;
-                let partners = db.cochanges_for_file(&normalized)?;
-                if partners.is_empty() {
-                    eprintln!("skim search: no co-change data for {raw_path:?}");
-                }
-                // Include the target file itself (mirrors resolve_blast_radius_filter).
-                let mut allowed_paths =
-                    super::temporal::cochange_partner_paths(&partners, &normalized);
-                allowed_paths.insert(normalized);
-
-                // Convert path strings → FileIds via manifest sorted_paths().
-                let sorted = manifest.sorted_paths();
-                let mut file_ids = HashSet::new();
-                for (idx, path) in sorted.iter().enumerate() {
-                    if allowed_paths.contains(*path) {
-                        // PF-004: widen idx (usize) to u32 before constructing FileId.
-                        if let Ok(id) = u32::try_from(idx) {
-                            file_ids.insert(FileId(id));
-                        }
-                    }
-                }
-                if file_ids.is_empty() {
-                    eprintln!(
-                        "skim search: blast-radius filter matched 0 indexed files \
-                         (allowed {} paths, index has {} files)",
-                        allowed_paths.len(),
-                        sorted.len()
-                    );
-                }
-                Some(file_ids)
-            }
-        }
-    } else {
-        None
-    };
-
     // Intersect AST results with blast-radius FileIds (when set), then apply limit.
     // Limit is applied AFTER intersection so it reflects the filtered set size.
+    // Hoist sorted_paths() here so it is computed once and reused for both the
+    // intersection-membership check (fid.0 as usize) and the path-resolution step.
+    let sorted = manifest.sorted_paths();
     let results: Vec<_> = raw_results
         .into_iter()
         .filter(|(fid, _)| {
@@ -216,7 +178,6 @@ pub(super) fn run_ast_standalone(
     // Resolve FileIds → repo-relative paths using the manifest.
     // Warn on out-of-range FileIds (avoids PF-002 silent-drop anti-pattern,
     // applies ADR-006 counterpart on the read side).
-    let sorted = manifest.sorted_paths();
     let mut resolved: Vec<AstResult> = Vec::with_capacity(results.len());
     for (fid, score) in &results {
         let idx = fid.0 as usize;
@@ -239,13 +200,11 @@ pub(super) fn run_ast_standalone(
     let pattern_name = raw_pattern.trim();
     let (display_name, description) = pattern_description(pattern_name);
 
-    let mut stdout = std::io::BufWriter::new(std::io::stdout());
     if json {
-        format_ast_json(&resolved, display_name, description, &mut stdout)?;
+        format_ast_json(&resolved, display_name, description, w)?;
     } else {
-        format_ast_text(&resolved, display_name, description, &mut stdout)?;
+        format_ast_text(&resolved, display_name, description, w)?;
     }
-    stdout.flush()?;
 
     Ok(ExitCode::SUCCESS)
 }

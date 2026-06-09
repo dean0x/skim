@@ -108,38 +108,20 @@ pub(super) fn execute_query_with_manifest(
     // - AST only: use the AST FileId set directly (moved — no clone).
     // - Both: intersection of the two sets (FileId-level, no path round-trip).
     // - Neither: no filter (sq.file_filter stays None).
-    let blast_file_ids: Option<std::collections::HashSet<rskim_search::FileId>> =
-        if let Some(ref allowed_paths) = config.blast_radius_paths {
-            let mut file_ids = std::collections::HashSet::new();
-            for (idx, path) in sorted.iter().enumerate() {
-                if allowed_paths.contains(*path) {
-                    // PF-004: widen idx (usize) to u32 before constructing FileId.
-                    // The file cap (50 000) guarantees no overflow, but `try_from`
-                    // makes the widening explicit and safe by construction.
-                    if let Ok(id) = u32::try_from(idx) {
-                        file_ids.insert(rskim_search::FileId(id));
-                    }
-                }
-            }
-            if file_ids.is_empty() {
-                eprintln!(
-                    "skim search: blast-radius filter matched 0 indexed files \
-                     (allowed {} paths, index has {} files)",
-                    allowed_paths.len(),
-                    sorted.len()
-                );
-            }
-            Some(file_ids)
-        } else {
-            None
-        };
+    //
+    // paths_to_file_ids is the single source of truth for the PF-004 widening
+    // (`u32::try_from`) and the "matched 0 indexed files" warning string.
+    let blast_file_ids: Option<std::collections::HashSet<rskim_search::FileId>> = config
+        .blast_radius_paths
+        .as_ref()
+        .map(|allowed_paths| super::temporal::paths_to_file_ids(&sorted, allowed_paths));
 
-    // Clone once so all match arms receive an owned value without per-arm clones.
-    let ast_file_ids = config.ast_file_ids.clone();
-
-    match (blast_file_ids, ast_file_ids) {
+    // Match on borrows so we clone only in the one arm that needs an owned value.
+    // In the (Some, Some) intersection arm the AST set is borrow-only (.contains),
+    // so cloning it upfront wastes an allocation on the heaviest combined-filter path.
+    match (blast_file_ids, config.ast_file_ids.as_ref()) {
         (Some(blast), Some(ast)) => {
-            // Intersection: only files in BOTH sets.
+            // Intersection: only files in BOTH sets (borrow ast — no clone needed).
             let intersection: std::collections::HashSet<rskim_search::FileId> = blast
                 .iter()
                 .filter(|id| ast.contains(*id))
@@ -151,7 +133,8 @@ pub(super) fn execute_query_with_manifest(
             sq.file_filter = Some(blast);
         }
         (None, Some(ast)) => {
-            sq.file_filter = Some(ast);
+            // Clone only here, where the owned set is needed for sq.file_filter.
+            sq.file_filter = Some(ast.clone());
         }
         (None, None) => {
             // No filter.

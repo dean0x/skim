@@ -98,9 +98,10 @@ pub(crate) fn run(
         SearchAction::Query(ref text) if !text.is_empty() => run_query(text, &flags, analytics),
         // Empty query + --ast (with or without --blast-radius) → standalone AST dispatch.
         //
-        // When --blast-radius is also set, run_ast_standalone resolves co-change peers
-        // via the temporal DB, converts them to FileIds, and intersects with the AST
-        // result set BEFORE applying --limit (avoids PF-006 silent feature-drop).
+        // When --blast-radius is also set, temporal::resolve_blast_radius_file_ids
+        // resolves co-change peers via the temporal DB, converts them to FileIds, and
+        // run_ast_standalone intersects with the AST result set BEFORE applying --limit
+        // (avoids PF-006 silent feature-drop).
         //
         // --ast + temporal sort (--hot/--cold/--risky) is still rejected above (#202).
         SearchAction::Query(_)
@@ -112,20 +113,34 @@ pub(crate) fn run(
             // Ensure both indexes are fresh before querying.
             let (_refreshed, manifest) =
                 staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+            // Resolve blast-radius → FileIds BEFORE calling run_ast_standalone.
+            // temporal::resolve_blast_radius_file_ids is the single resolver for all
+            // three blast-radius call sites, so JSON-aware warning and PF-004 widening
+            // live in one place.
+            let sorted = manifest.sorted_paths();
+            let blast_file_ids = temporal::resolve_blast_radius_file_ids(
+                flags.blast_radius.as_deref(),
+                &root,
+                &cache_dir.join("temporal.db"),
+                &sorted,
+                flags.json,
+            )?;
             // Note: validate_ast_pattern was already called above (line ~87) as part
             // of the pre-dispatch validation order. run_ast_standalone re-validates
             // internally so it is independently callable without a prior validate call
             // (defensive re-validation is intentional — it is cheap and idempotent).
-            ast::run_ast_standalone(
+            let mut stdout = BufWriter::new(std::io::stdout());
+            let result = ast::run_ast_standalone(
                 raw,
                 flags.limit,
                 flags.json,
                 &cache_dir,
                 &manifest,
-                flags.blast_radius.as_deref(),
-                &cache_dir.join("temporal.db"),
-                &root,
-            )
+                blast_file_ids,
+                &mut stdout,
+            );
+            stdout.flush()?;
+            result
         }
         // Empty query with temporal flags (no --ast) → standalone temporal dispatch.
         SearchAction::Query(_) if flags.temporal_sort.is_some() || flags.blast_radius.is_some() => {
@@ -531,45 +546,19 @@ fn run_remove_hooks(root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode>
 ///
 /// Returns `None` when no blast-radius was requested, or when the temporal DB
 /// is unavailable.  When `json` is true the warning is emitted as a JSON
-/// object to stdout (consistent with the JSON degradation path in
-/// `run_temporal_standalone`); otherwise it goes to stderr.
+/// object to stderr (consistent with `temporal::resolve_blast_radius_paths`);
+/// otherwise it goes to stderr.
+///
+/// Delegates to `temporal::resolve_blast_radius_paths` so path normalization,
+/// partner lookup, and JSON-aware warning live in one place (shared with the
+/// standalone `--ast --blast-radius` path).
 fn resolve_blast_radius_filter(
     blast_radius: Option<&str>,
-    temporal_db: &Option<rskim_search::TemporalDb>,
+    db_path: &std::path::Path,
     root: &std::path::Path,
     json: bool,
 ) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
-    let raw_path = match blast_radius {
-        Some(p) => p,
-        None => return Ok(None),
-    };
-
-    let db = match temporal_db {
-        Some(db) => db,
-        None => {
-            const MSG: &str = "no temporal data — run 'skim heatmap' to populate";
-            if json {
-                let w = WarningJson { warning: MSG };
-                println!("{}", serde_json::to_string(&w)?);
-            } else {
-                eprintln!("skim search: {MSG}");
-            }
-            return Ok(None);
-        }
-    };
-
-    let normalized = temporal::normalize_blast_radius_path(raw_path, root)?;
-    let partners = db.cochanges_for_file(&normalized)?;
-    if partners.is_empty() {
-        eprintln!("skim search: no co-change data for {raw_path:?}");
-    }
-
-    // Include the target file itself so text queries like
-    // `skim search auth --blast-radius src/auth.rs` surface matches
-    // within src/auth.rs in addition to its co-change partners.
-    let mut paths = temporal::cochange_partner_paths(&partners, &normalized);
-    paths.insert(normalized);
-    Ok(Some(paths))
+    temporal::resolve_blast_radius_paths(blast_radius, root, db_path, json)
 }
 
 fn run_query(
@@ -600,9 +589,10 @@ fn run_query(
     // is applied inside the search engine (before LIMIT). This ensures the
     // limit applies to the filtered set rather than silently discarding
     // co-change partners that ranked beyond the top-N unfiltered results.
+    // Delegates to temporal::resolve_blast_radius_paths (the shared resolver).
     let blast_radius_paths = resolve_blast_radius_filter(
         flags.blast_radius.as_deref(),
-        &temporal_db,
+        &cache_dir.join("temporal.db"),
         &root,
         flags.json,
     )?;
@@ -1067,23 +1057,25 @@ mod tests {
     // resolve_blast_radius_filter — None DB degradation path
     // ============================================================================
 
-    /// When blast_radius is Some but temporal_db is None (user hasn't run
+    /// When blast_radius is Some but temporal.db is absent (user hasn't run
     /// `skim heatmap` yet), the function must return Ok(None) without panicking.
     /// A stderr warning is expected but the caller handles the degradation.
     #[test]
     fn test_resolve_blast_radius_filter_no_db_returns_none() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        let result = resolve_blast_radius_filter(Some("src/auth.rs"), &None, root, false);
+        // Point to a non-existent DB file — resolver must degrade gracefully.
+        let absent_db = dir.path().join("no_such.db");
+        let result = resolve_blast_radius_filter(Some("src/auth.rs"), &absent_db, root, false);
         assert!(
             result.is_ok(),
-            "must not error when temporal_db is None, got: {:?}",
+            "must not error when temporal.db is absent, got: {:?}",
             result.unwrap_err()
         );
         assert_eq!(
             result.unwrap(),
             None,
-            "must return None (graceful degradation) when temporal_db is None"
+            "must return None (graceful degradation) when temporal.db is absent"
         );
     }
 

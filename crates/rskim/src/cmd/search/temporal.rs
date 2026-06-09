@@ -8,10 +8,11 @@
 //! - Combined text+temporal enrichment (`apply_temporal_enrichment`).
 //! - Output formatting for standalone temporal queries.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 
-use rskim_search::{HotspotRow, RiskRow, TemporalDb};
+use rskim_search::{FileId, HotspotRow, RiskRow, TemporalDb};
 use serde::Serialize;
 
 use super::types::{ResolvedResult, TemporalAnnotation, TemporalSort};
@@ -129,6 +130,132 @@ pub(super) fn open_temporal_db(db_path: &Path) -> Option<TemporalDb> {
         return None;
     }
     TemporalDb::open(db_path).ok()
+}
+
+// ============================================================================
+// Blast-radius → FileId resolution (shared helper)
+// ============================================================================
+
+/// Convert a set of repo-relative path strings to the corresponding `FileId`s.
+///
+/// Iterates the pre-computed `sorted_paths` slice once, collecting `FileId`s for
+/// every path in `allowed_paths`.  Applies PF-004 widening (`u32::try_from(idx)`)
+/// — never `as u32`.  Emits a one-line stderr warning when the result set is empty
+/// (the blast-radius paths are not indexed), so callers do not have to repeat the
+/// check.
+///
+/// Accepts a `&[&str]` slice (from `manifest.sorted_paths()`) so that callers
+/// which already hold the slice can pass it directly without a second allocation.
+///
+/// This function is the single source of truth for the path→FileId conversion
+/// used by all three blast-radius call sites (ast.rs standalone, query.rs lexical
+/// filter, and mod.rs resolve_blast_radius_filter).
+pub(super) fn paths_to_file_ids(
+    sorted_paths: &[&str],
+    allowed_paths: &HashSet<String>,
+) -> HashSet<FileId> {
+    let mut file_ids = HashSet::new();
+    for (idx, path) in sorted_paths.iter().enumerate() {
+        if allowed_paths.contains(*path) {
+            // PF-004: widen idx (usize) to u32 before constructing FileId.
+            // The file cap (50 000) guarantees no overflow, but `try_from`
+            // makes the widening explicit and safe by construction.
+            if let Ok(id) = u32::try_from(idx) {
+                file_ids.insert(FileId(id));
+            }
+        }
+    }
+    if file_ids.is_empty() {
+        eprintln!(
+            "skim search: blast-radius filter matched 0 indexed files \
+             (allowed {} paths, index has {} files)",
+            allowed_paths.len(),
+            sorted_paths.len()
+        );
+    }
+    file_ids
+}
+
+/// Resolve a `--blast-radius` raw path to the set of co-change partner paths.
+///
+/// Shared core for both `resolve_blast_radius_file_ids` (standalone AST path) and
+/// `resolve_blast_radius_filter` (text-query path in `mod.rs`).  Returns the set of
+/// repo-relative path strings that the blast-radius filter should allow, including
+/// the target file itself.  JSON-aware warning emitted when the temporal DB is absent.
+///
+/// Returns `Ok(None)` when `blast_radius` is `None` or the DB is absent/corrupt.
+///
+/// # Errors
+///
+/// Returns `Err` only when path normalization fails (outside-repo or missing file).
+pub(super) fn resolve_blast_radius_paths(
+    blast_radius: Option<&str>,
+    root: &Path,
+    db_path: &Path,
+    json: bool,
+) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
+    let raw_path = match blast_radius {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    match open_temporal_db(db_path) {
+        None => {
+            const MSG: &str =
+                "no temporal data for --blast-radius — run 'skim heatmap' to populate";
+            if json {
+                let envelope = serde_json::json!({ "warning": MSG });
+                eprintln!("{}", serde_json::to_string(&envelope)?);
+            } else {
+                eprintln!("skim search: {MSG}");
+            }
+            Ok(None)
+        }
+        Some(db) => {
+            let normalized = normalize_blast_radius_path(raw_path, root)?;
+            let partners = db.cochanges_for_file(&normalized)?;
+            if partners.is_empty() {
+                eprintln!("skim search: no co-change data for {raw_path:?}");
+            }
+            let mut allowed_paths = cochange_partner_paths(&partners, &normalized);
+            // Include the target file itself (mirrors resolve_blast_radius_filter).
+            allowed_paths.insert(normalized);
+            Ok(Some(allowed_paths))
+        }
+    }
+}
+
+/// Resolve a `--blast-radius` raw path to the set of matching `FileId`s.
+///
+/// Unified resolver used by every blast-radius call site:
+/// - `run_ast_standalone` caller in `mod.rs` (standalone `--ast --blast-radius`)
+/// - `execute_query_with_manifest` blast-radius arm (query.rs, via `paths_to_file_ids`)
+/// - `resolve_blast_radius_filter` (mod.rs, text + blast-radius)
+///
+/// Algorithm:
+/// 1. If `blast_radius` is `None`, return `Ok(None)` immediately.
+/// 2. Open `temporal.db` at `db_path`.  If absent/corrupt, emit the
+///    "no temporal data" warning (JSON-aware when `json=true`) and return `Ok(None)`.
+/// 3. Normalize the raw path to repo-relative form.
+/// 4. Look up co-change partners, add the target file itself.
+/// 5. Convert the path set to `FileId`s via `paths_to_file_ids`.
+/// 6. Return `Ok(Some(file_ids))`.
+///
+/// # Errors
+///
+/// Returns `Err` only when path normalization fails (outside-repo or missing file).
+pub(super) fn resolve_blast_radius_file_ids(
+    blast_radius: Option<&str>,
+    root: &Path,
+    db_path: &Path,
+    sorted_paths: &[&str],
+    json: bool,
+) -> anyhow::Result<Option<HashSet<FileId>>> {
+    let Some(allowed_paths) = resolve_blast_radius_paths(blast_radius, root, db_path, json)? else {
+        return Ok(None);
+    };
+    let file_ids = paths_to_file_ids(sorted_paths, &allowed_paths);
+    Ok(Some(file_ids))
 }
 
 /// Check whether the temporal database is stale compared to the current git HEAD.
