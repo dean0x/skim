@@ -47,7 +47,21 @@ pub use ast_index::{
 /// Exposed at the crate level so CLI code (e.g. staleness self-heal in Wave 3g)
 /// can compare against the value returned by [`AstIndexReader::index_version`]
 /// without accessing crate-internal format constants.
-pub const AST_INDEX_FORMAT_VERSION: u16 = 2;
+///
+/// This constant derives from the single source of truth in
+/// `ast_index::store::format::FORMAT_VERSION`. A compile-time assertion below
+/// keeps them in sync — bumping only one will fail the build immediately.
+pub const AST_INDEX_FORMAT_VERSION: u16 = ast_index::store::format::FORMAT_VERSION;
+
+// Compile-time guard: the crate-root constant must equal the internal FORMAT_VERSION.
+// If a future v3 bump edits only format.rs, this assertion catches the divergence
+// at build time rather than silently producing a broken staleness check.
+// applies ADR-001: fix noticed issues immediately (silent drift between the two
+// literals was flagged; we resolve it by deriving rather than duplicating).
+const _: () = assert!(
+    AST_INDEX_FORMAT_VERSION == ast_index::store::format::FORMAT_VERSION,
+    "AST_INDEX_FORMAT_VERSION must equal ast_index::store::format::FORMAT_VERSION"
+);
 pub use cochange::{CochangeMatrixBuilder, CochangeMatrixReader};
 pub use index::{NgramIndexBuilder, NgramIndexReader};
 pub use lexical::{
