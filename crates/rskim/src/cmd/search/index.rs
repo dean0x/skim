@@ -155,10 +155,10 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
 /// # Concurrency
 ///
 /// Acquires an exclusive advisory lock on `{cache_dir}/.skim-build.lock` before
-/// running the pipeline, with a 120-second deadline.  If another process holds
+/// running the pipeline, with a 120-second deadline. If another process holds
 /// the lock, the call polls every 200 ms and prints a one-time notice to stderr
-/// so the user knows why it is waiting.  After 120 s the call returns an error
-/// rather than blocking indefinitely.  This serialises all callers — `skim init`
+/// so the user knows why it is waiting. After 120 s the call returns an error
+/// rather than blocking indefinitely. This serialises all callers — `skim init`
 /// background spawn, git-hook `--update`, and direct `--build` / `--rebuild` —
 /// protecting `index.skidx` and `index.skfiles` from concurrent writes.
 ///
@@ -368,7 +368,7 @@ impl<'cfg> Pipeline<'cfg> {
         // `file_count` is the number of successful `add_file_classified` calls.
         // They agree when every successfully-indexed file has a distinct normalized
         // path key — the invariant upheld by `walk_metadata`'s sorted, deduped
-        // output.  A mismatch would require two walk entries to normalize to the
+        // output. A mismatch would require two walk entries to normalize to the
         // same path key, which cannot happen on case-sensitive file-systems and is
         // a data-corruption signal on case-insensitive ones; hence this guard is
         // intentionally defensive rather than a common-case check.
@@ -392,7 +392,7 @@ impl<'cfg> Pipeline<'cfg> {
         new_manifest.save()?;
 
         // `producer_handle.join()` above is the happens-before edge: the atomic
-        // load below is only valid after join() returns.  Moving this load before
+        // load below is only valid after join() returns. Moving this load before
         // the join would make `producer_skips` racy.
         let total_skipped =
             to_u32_capped(walk_skip_count).saturating_add(producer_skips.load(Ordering::Relaxed));
