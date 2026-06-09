@@ -1,7 +1,7 @@
 ---
 feature: cmd-search
 name: Search CLI (skim search subcommand)
-description: "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, resolve_search_cache_dir, parse_flags, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone."
+description: "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, resolve_search_cache_dir, parse_flags, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone, derive_ast_entry, search_ast, resolve_ast_file_filter."
 category: architecture
 directories:
   - crates/rskim/src/cmd/search/
@@ -18,6 +18,7 @@ referencedFiles:
   - crates/rskim/src/cmd/search/snippet.rs
 created: 2026-06-09
 updated: 2026-06-09
+version: 2
 ---
 
 # Search CLI (skim search subcommand)
@@ -48,7 +49,7 @@ Cache layout: `~/.cache/skim/search/{sha256(canonical_root)[..16]}/` (per-projec
 
 `SearchAction` enum encodes the mutually exclusive modes (`Build`, `Rebuild`, `Update`, `Stats`, `InstallHooks`, `RemoveHooks`, `Query(String)`). The final `match flags.action` is the single dispatch point — adding a new mode means adding a variant and one match arm.
 
-Flags that require a following token (`--limit N`, `--root PATH`, `--ast PATTERN`, `--blast-radius FILE`) support both space-separated and equals form (`--limit=10`). The parser advances `i` by one extra when it consumes the next token.
+Flags that require a following token (`--limit N`, `--root PATH`, `--ast PATTERN`, `--blast-radius FILE`) support both space-separated and equals form (`--limit=10`). The helper `take_flag_value(arg, next_arg, flag_name)` handles both forms without a deref coercion — returns `(value, consumed_next)`. The parser advances `i` by one extra when `consumed_next` is `true`.
 
 ### Dispatch Ordering — validation before dispatch
 
@@ -78,7 +79,11 @@ This ordering is tested and must not be changed without updating tests.
 ```
 If AST build fails, `manifest.save()` is NEVER reached. The old manifest survives and the next query self-heals. "HEAD recorded ⟹ both indexes coherent" is the invariant.
 
-**FileId-alignment invariant** (critical): the lexical builder and AST builder must receive exactly the same set of files in the same order. `next_file_id` only advances after a successful `add_file_classified`. A lexical builder error causes `continue` — the file is excluded from BOTH indexes. AST entries are always inserted (empty set on linearization error) so FileIds stay aligned. If `add_file_ngrams` fails after `add_file_classified` succeeded, the build aborts with an error and `manifest.save()` is skipped — preventing a committed-but-corrupt index.
+**FileId-alignment invariant** (critical): the lexical builder and AST builder must receive exactly the same set of files in the same order. `next_file_id` only advances after a successful `add_file_classified`. A lexical builder error causes `continue` — the file is excluded from BOTH indexes. AST entries are always inserted (empty set on linearization error) so FileIds stay aligned. If `add_file_ngrams` fails after `add_file_classified` succeeded, the build aborts with an error and `manifest.save()` is skipped — preventing a committed-but-corrupt index (ADR-006).
+
+**`derive_ast_entry` helper** (index.rs private function): encapsulates per-file AST linearization and extraction. Returns `(AstNgramSet, StructuralMetrics, node_count)`. Deliberately infallible — on any error (grammar failure, linearization error, empty language) returns an empty-but-valid triple so the consume loop can always insert an aligned empty AST entry. The fail-loud path lives in `consume` after `add_file_ngrams` rejects a post-lexical-success entry.
+
+**Producer join on abort**: the producer thread is joined before `consume` returns an error, preventing detached background threads from holding index files open or corrupting the state observed by the next rebuild.
 
 ### Staleness and Auto-Refresh — `staleness.rs`
 
@@ -91,6 +96,8 @@ If AST build fails, `manifest.save()` is NEVER reached. The old manifest survive
 - `NoIndex` — cold build triggered
 
 **AST self-heal**: `check_staleness` runs an additional check before comparing HEADs. If `ast_index.skidx` is absent OR its format version (6-byte probe via `AstIndexReader::index_version`) is below `AST_INDEX_FORMAT_VERSION`, it returns `NoStoredHead` to force a full rebuild. This handles: post-format-upgrade (v1→v2), crash between `lexical.build()` and `ast.build()`, and first run after adding `--ast` to an existing install.
+
+**Combined text+`--ast` path also self-heals**: `run_query` (in `mod.rs`) calls `auto_refresh_if_stale` before opening the AST engine. This mirrors the standalone `run_ast_standalone` path. Previously a bug existed where `open_ast_engine` was called before `auto_refresh_if_stale`, causing a loud error when the AST index was absent. The fix: always refresh before opening any index.
 
 `auto_refresh_if_stale(root, cache_dir, analytics)` is called at the start of every query path. It returns `(refreshed: bool, manifest: FileManifest)` so the caller never loads the manifest a second time.
 
@@ -111,13 +118,18 @@ After `execute_query`, `mod.rs` applies `apply_temporal_enrichment` (per-file DB
 
 ### AST Flag Helpers — `ast.rs`
 
-Three responsibilities:
+Four responsibilities:
 
 - `open_ast_engine(cache_dir)` — fails loud (Err) when `ast_index.skidx` is absent; gives build guidance in error message.
 - `validate_ast_pattern(raw)` — called at dispatch time BEFORE opening the index. Rejects `SingleNode` queries (`#283`) and unknown patterns.
-- `resolve_ast_file_filter(engine, raw, lang)` — runs `SearchQuery` with `ast_pattern` set and `limit = usize::MAX` to get the full unfiltered FileId set for intersection.
+- `resolve_ast_file_filter(engine, raw)` — **calls `search_ast` directly** (not through `SearchLayer`). Parses the pattern, calls `engine.search_ast(&query)`, returns `HashSet<FileId>` from the `Vec<(FileId, f64)>` result. No `SearchResult` construction, no `usize::MAX` sort, no `SearchLayer` overhead. The caller's `--limit` applies at intersection time inside the lexical engine.
+- `run_ast_standalone` — standalone `--ast` dispatch (no text query, no temporal flags). Also calls `search_ast` directly, applies `limit` via `.take(limit)` after the raw search, then warns on out-of-range FileIds rather than silently dropping them.
 
-Standalone `--ast` dispatch (no text query, no temporal flags): `run_ast_standalone` in `ast.rs`. Output is file-level only — no `:line` suffix (intentional, per spec).
+**`resolve_ast_file_filter` signature** (no `lang` parameter): the function no longer accepts a `lang: Option<Language>` parameter. Language filtering at the AST layer was removed — the intersection with lexical results handles language narrowing implicitly.
+
+**FileId warning in `run_ast_standalone`**: when `fid.0 as usize >= sorted.len()`, a warning is emitted to stderr: `"skim search [warn]: AST result FileId({idx}) is out of manifest range ..."`. This follows the ADR-006 counterpart on the read side (fail-loud-ish on desync, not silent drop).
+
+**Output-level only — no `:line` suffix**: standalone AST output is file-level. Results are formatted as `path  score: N.NNN` with no line number suffix.
 
 ### Temporal Flag Helpers — `temporal.rs`
 
@@ -147,6 +159,7 @@ skim binary
             ├── index.rs    ← build_index(config) [streaming pipeline]
             │     ├── walk.rs          ← walk_metadata, open_and_read, sha256_hex
             │     ├── manifest.rs      ← FileManifest (SHA cache + path map + HEAD)
+            │     ├── derive_ast_entry ← infallible per-file AST helper (index.rs private)
             │     └── rskim-search     ← NgramIndexBuilder, AstIndexBuilder,
             │                             classify_source, linearize_source,
             │                             extract_ast_ngrams_with_metrics
@@ -156,8 +169,10 @@ skim binary
             │     ├── snippet.rs       ← extract_snippet
             │     └── rskim-search     ← NgramIndexReader, QueryEngine, SearchQuery
             ├── ast.rs      ← open_ast_engine, validate_ast_pattern,
-            │                  resolve_ast_file_filter, run_ast_standalone
-            │     └── rskim-search     ← AstQueryEngine, AstIndexReader, parse_ast_query
+            │                  resolve_ast_file_filter (calls search_ast directly),
+            │                  run_ast_standalone (calls search_ast directly)
+            │     └── rskim-search     ← AstQueryEngine, AstIndexReader,
+            │                             parse_ast_query, search_ast
             └── temporal.rs ← normalize_blast_radius_path, apply_temporal_enrichment,
                                query_standalone, format_temporal_*
                   └── rskim-search     ← TemporalDb, HotspotRow, RiskRow, CochangeRow
@@ -175,6 +190,8 @@ skim binary
 
 **Validation order in `run()`**: the exact order (legacy subcommand, help, `--ast`+temporal, single-node, unknown pattern) is tested and must not change without updating the tests in `mod.rs`.
 
+**`auto_refresh_if_stale` before any index open**: both `run_ast_standalone` and `run_query` (the combined text+`--ast` path) must call `auto_refresh_if_stale` BEFORE opening the AST engine. Opening the engine first breaks self-heal for the combined path.
+
 ## Anti-Patterns
 
 **Adding I/O to `ast.rs` or `temporal.rs` beyond what they already have.** These are focused helper modules. New queries, formatters, or DB operations belong there, but filesystem operations (cache dir resolution, lock acquisition) belong in `mod.rs` or `index.rs`.
@@ -186,6 +203,12 @@ skim binary
 **Constructing FileIds from `idx as u32` (applies PF-004).** The file cap (50,000) makes overflow impossible in practice, but use `u32::try_from(idx)` everywhere FileId values are constructed from positional indexes. This is already the pattern in `query.rs` and must be followed consistently.
 
 **Breaking the `index.rs` consume loop's fail-soft / fail-loud contract.** Lexical errors (from `add_file_classified`) are fail-soft: `continue` and skip the file from both indexes. AST errors (from `add_file_ngrams`) after a successful lexical insert are fail-loud: `return Err(...)` to abort the build. Do not swap these — fail-soft AST errors after a lexical success would advance `next_file_id` and corrupt the index.
+
+**Routing CLI AST queries through `SearchLayer::search` instead of `search_ast`.** `resolve_ast_file_filter` and `run_ast_standalone` call `engine.search_ast(&query)` directly. Using `SearchLayer::search` adds overhead (SearchResult construction, usize::MAX sort) and the `lang` filter is not needed for the intersection/standalone paths.
+
+**Calling `open_ast_engine` before `auto_refresh_if_stale` in the combined text+`--ast` path.** This was the root cause of regression #10. The fix: in `run_query`, call `auto_refresh_if_stale` before any index open, same as `run_ast_standalone`.
+
+**Silently dropping out-of-range FileIds in AST result resolution.** `run_ast_standalone` warns on stderr when a FileId is beyond the manifest range. Do not revert to silent `filter_map` — out-of-range FileIds indicate index desync and the user needs to know.
 
 ## Gotchas
 
@@ -203,21 +226,38 @@ skim binary
 
 **`#289` temporal rebuild hook point**: `auto_refresh_if_stale` has a `TODO(#289)` comment immediately after the manifest load. When the temporal populate path is implemented, the call should go here (under the same `.skim-build.lock`, reusing the already-read HEAD).
 
+**`--stats HEAD` field**: the `run_stats` handler reads the git HEAD from the manifest (not from the git repo), so it reflects the HEAD at the time of the last build, not the current HEAD. This is intentional — it shows the state the index was built from.
+
+**`derive_ast_entry` is infallible by design**: any error in linearization or extraction returns an empty triple. The consume loop then inserts an empty AST entry for that FileId. This is correct — the FileId alignment invariant requires every lexically-accepted file to also have an AST entry. The only fail-loud path is when `add_file_ngrams` itself rejects the entry after a lexical success, which indicates a library-level invariant violation.
+
+## Test Coverage Summary (ast_tests.rs)
+
+The test file is organized in ten groups:
+- **Groups 1–5**: unit tests for `validate_ast_pattern`, `parse_flags` AST variants
+- **Group 6**: disjoint intersection (empty text + `--ast` returns empty, exit 0)
+- **Group 7**: `run_ast_standalone` with real index — FileId→path mapping, absent-index loud-fail
+- **Group 8**: text+`--ast` intersection against real index — preserves lexical snippets
+- **Group 9**: self-heal for below-FORMAT_VERSION probe (v1 stub → stale)
+- **Group 10**: regression — combined text+`--ast` path self-heals when AST index is absent
+
+Group 6 test was tightened from graceful-skip-on-build-error to `.expect("--build must succeed")`.
+
 ## Key Files
 
-- `crates/rskim/src/cmd/search/mod.rs` — entry point, flag parsing, dispatch, all action handlers, `resolve_blast_radius_filter`
-- `crates/rskim/src/cmd/search/index.rs` — `build_index`, `Pipeline::run/consume`, `resolve_search_cache_dir`, FileId-alignment invariant
+- `crates/rskim/src/cmd/search/mod.rs` — entry point, flag parsing, dispatch, all action handlers, `resolve_blast_radius_filter`, `take_flag_value`
+- `crates/rskim/src/cmd/search/index.rs` — `build_index`, `Pipeline::run/consume`, `derive_ast_entry`, `resolve_search_cache_dir`, FileId-alignment invariant
 - `crates/rskim/src/cmd/search/query.rs` — `execute_query`, FileId filter construction, `format_text_output`, `format_json_output`
 - `crates/rskim/src/cmd/search/staleness.rs` — `check_staleness`, `auto_refresh_if_stale`, AST self-heal, git HEAD file I/O
 - `crates/rskim/src/cmd/search/types.rs` — `QueryConfig`, `IndexConfig`, `ResolvedResult`, `QueryOutput`, `TemporalSort`, `TemporalAnnotation`, `WalkEntry`, `ProcessedFile`
-- `crates/rskim/src/cmd/search/ast.rs` — `open_ast_engine`, `validate_ast_pattern`, `resolve_ast_file_filter`, `run_ast_standalone`
+- `crates/rskim/src/cmd/search/ast.rs` — `open_ast_engine`, `validate_ast_pattern`, `resolve_ast_file_filter` (direct `search_ast`), `run_ast_standalone` (direct `search_ast` + FileId warn)
 - `crates/rskim/src/cmd/search/temporal.rs` — `normalize_blast_radius_path`, `apply_temporal_enrichment`, `query_standalone`, `format_temporal_*`
 - `crates/rskim/src/cmd/search/manifest.rs` — `FileManifest`, `ManifestEntry`, `ManifestHeader`, atomic write, wrong-root detection
 
 ## Related
 
-- Feature knowledge: `ast-index` — the `AstIndexBuilder`, `AstIndexReader`, `AstQueryEngine`, `AstNgramSet`, `StructuralMetrics`, `AST_INDEX_FORMAT_VERSION`, and `FORMAT_VERSION` probe used by `staleness.rs::check_staleness` and `index.rs::consume`
+- Feature knowledge: `ast-index` — the `AstIndexBuilder`, `AstIndexReader`, `AstQueryEngine`, `AstNgramSet`, `StructuralMetrics`, `AST_INDEX_FORMAT_VERSION` (alias of `FORMAT_VERSION`, compile-time assert), and `FORMAT_VERSION` probe used by `staleness.rs::check_staleness` and `index.rs::consume`; `search_ast` called directly by `ast.rs`
 - Feature knowledge: `temporal-scoring` — the `TemporalDb`, `HotspotRow`, `RiskRow`, `META_GIT_HEAD` used by `temporal.rs`; the `top_hotspots`, `top_risks`, `hotspot_for_file`, `risk_for_file`, `cochanges_for_file` queries called from the CLI layer
 - Feature knowledge: `cochange` — the `CochangeRow` and co-change data that backs `--blast-radius`
 - ADR-004: follow-up tickets filed before implementation — tracked deferrals in this feature: `#283` (single-node/unigram), `#202` (--ast+temporal compound), `#289` (temporal rebuild hook), `#290` (AST incremental build cache)
+- ADR-006: dual-index per-file desync aborts build before commit — the `consume` loop fail-loud-on-post-lexical-AST-error pattern and the `derive_ast_entry` infallible helper implement this decision
 - PF-004: u16→u32 widening before arithmetic — applied in `query.rs` when constructing `FileId(u32::try_from(idx)?)` from positional indexes

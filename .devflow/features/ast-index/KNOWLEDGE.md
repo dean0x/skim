@@ -24,7 +24,7 @@ referencedFiles:
   - crates/rskim-search/benches/ast_query.rs
 created: 2026-06-01
 updated: 2026-06-09
-version: 5
+version: 6
 ---
 
 # AST Index (CST Linearization + N-gram Encoding + On-Disk Store)
@@ -66,6 +66,15 @@ entry point. All n-gram encoding, weight lookup, extraction, and BM25 scoring ar
 The DFS traversal logic lives in `rskim-core::AstWalkIter` to be shared with
 `rskim-research` without duplicating cursor management or bounds guarding.
 
+## Module Visibility: store sub-modules are pub(crate)
+
+As of Wave 3g (#199, single-source-of-truth refactor), both `ast_index::store` and
+`ast_index::store::format` have `pub(crate)` module visibility (previously `mod`-private).
+This allows `crates/rskim-search/src/lib.rs` to reference `ast_index::store::format::FORMAT_VERSION`
+directly for the `AST_INDEX_FORMAT_VERSION` constant definition. Do not revert this to
+`mod`-private visibility — the CLI staleness check depends on `FORMAT_VERSION` being
+reachable at the crate-root level.
+
 ## Public API Exports
 
 ### From `rskim_search::ast_index::*`
@@ -102,11 +111,17 @@ linearize_source, lookup_pattern, parse_ast_query,
 vocab_len, vocab_lookup, vocab_resolve
 ```
 
-Additionally, `AST_INDEX_FORMAT_VERSION: u16 = 2` is a standalone crate-root constant
-(not re-exported from `ast_index` — defined directly in `lib.rs`). It is the single
-source of truth for CLI staleness checks: the self-heal probe in `crates/rskim/src/cmd/search/`
-compares `AstIndexReader::index_version(dir)` against this constant before deciding to
-rebuild.
+Additionally, `AST_INDEX_FORMAT_VERSION: u16` is a standalone crate-root constant
+(not re-exported from `ast_index` — defined directly in `lib.rs`). **As of Wave 3g
+single-source refactor**, it is defined as:
+
+```rust
+pub const AST_INDEX_FORMAT_VERSION: u16 = ast_index::store::format::FORMAT_VERSION;
+```
+
+A compile-time `assert!` keeps the two values in sync — bumping only one will fail
+the build. `AST_INDEX_FORMAT_VERSION` is the intended public interface for CLI staleness
+checks; the internal `FORMAT_VERSION` constant is the single source of truth.
 
 Note: `pattern_to_query_set` is in `ast_index::*` but is NOT re-exported at the crate root.
 Access it via `rskim_search::ast_index::pattern_to_query_set`.
@@ -259,6 +274,13 @@ The GOLD test (`patterns_tests.rs::f7_gold_all_patterns`) is the honesty gate:
 every pattern's example must actually emit all declared n-grams when linearized
 and extracted with `extract_ast_ngrams_with_metrics`.
 
+**Catalog count guard (Wave 3g addition):** Two new tests lock the catalog count:
+- `f6_exact_catalog_count` asserts `all_patterns().len() == 29`. Adding or removing
+  a pattern without updating CLAUDE.md, README, and the doc table in `patterns.rs`
+  will fail this test.
+- `f6_per_category_counts` locks the per-category breakdown: ErrorHandling=6,
+  Performance=5, Concurrency=6, Quality=7, Structure=5.
+
 **29 patterns in 5 categories:**
 
 | Category | Count | Examples |
@@ -322,6 +344,12 @@ impl AstQueryEngine<AstIndexReader> {
 
 `search_ast` returns results sorted **FileId-ASC** (Wave-4 merge-join contract).
 `SingleNode` variant returns `SearchError::InvalidQuery` referencing #283.
+
+**The CLI layer (`cmd/search/ast.rs`) calls `search_ast` directly** (not through
+`SearchLayer::search`) for both `resolve_ast_file_filter` and `run_ast_standalone`.
+This avoids `SearchResult` construction, `usize::MAX` sort, and `SearchLayer` overhead.
+`SearchLayer` is still implemented for Wave 4 integration but is not the primary
+CLI dispatch path as of Wave 3g.
 
 **OR-union BM25 scoring:**
 
@@ -513,7 +541,7 @@ AstQueryEngine::search_ast(q: &AstQuery)
 | `MANY_PARAMS` | 65003 | `structural.rs` |
 | `BUCKET_LABEL_BASE` | 64900 | `structural.rs` |
 | `MAX_BUCKET_EDGES` | 99 | `structural.rs` |
-| `AST_INDEX_FORMAT_VERSION` | 2 | `lib.rs` (crate root) |
+| `AST_INDEX_FORMAT_VERSION` | 2 (alias of `FORMAT_VERSION`) | `lib.rs` (crate root) |
 
 ## Anti-Patterns
 
@@ -573,6 +601,16 @@ AstQueryEngine::search_ast(q: &AstQuery)
 - **Using `FORMAT_VERSION` from `store/format.rs` for CLI staleness checks**: use
   `AST_INDEX_FORMAT_VERSION` from the crate root (`lib.rs`) instead. The crate-root
   constant is the intended public interface; the internal one may not be re-exported.
+
+- **Routing through `SearchLayer::search` for AST-only or AST+text queries from the CLI**:
+  the CLI layer (`cmd/search/ast.rs`) calls `search_ast` directly on `AstQueryEngine` for
+  both `resolve_ast_file_filter` and `run_ast_standalone`. This avoids overhead from
+  `SearchResult` construction, `usize::MAX` sort, and the `SearchLayer` wrapper. Use
+  `SearchLayer` only for Wave 4 integrations that need the unified interface.
+
+- **Reverting `ast_index::store` or `ast_index::store::format` to `mod`-private**: these
+  are `pub(crate)` to allow `lib.rs` to reference `FORMAT_VERSION` as the single source
+  of truth for `AST_INDEX_FORMAT_VERSION`. Reverting breaks the compile-time assertion.
 
 ## Gotchas
 
@@ -640,6 +678,10 @@ AstQueryEngine::search_ast(q: &AstQuery)
   the CLI currently re-extracts all files' AST n-grams on every refresh. Incremental
   caching is tracked in issue #290.
 
+- **`AST_INDEX_FORMAT_VERSION` is a type alias of `FORMAT_VERSION` with a compile-time
+  assert**: `pub const AST_INDEX_FORMAT_VERSION: u16 = ast_index::store::format::FORMAT_VERSION;`.
+  Changing it to a separate literal requires updating both constants and the assert.
+
 ## Key Files
 
 - `crates/rskim-core/src/ast_walk.rs` — `AstWalkIter`, `AstWalkConfig` (canonical limit source), `AstWalkNode`
@@ -647,14 +689,14 @@ AstQueryEngine::search_ast(q: &AstQuery)
 - `crates/rskim-search/src/ast_index/ngram.rs` — `AstBigram`, `AstTrigram`, vocabulary helpers, IDF weight lookups
 - `crates/rskim-search/src/ast_index/extract.rs` — `extract_ast_ngrams_with_metrics` (single-pass, Wave 3e), `extract_ast_ngrams_with_weights` (DI core), `AstNgramSet`, `AstBigramEntry`, `AstTrigramEntry`
 - `crates/rskim-search/src/ast_index/structural.rs` — synthetic IDs, bucket edge tables, `StructuralMetrics`, `is_counted_child`, `COMMENT_KIND_IDS`, `PUNCTUATION_KIND_IDS` (Wave 3e); `pub(crate)` visibility
-- `crates/rskim-search/src/ast_index/patterns.rs` — 29-pattern GOLD-verified catalog, `Pattern`, `PatternCategory`, `lookup_pattern`, `pattern_to_query_set` (Wave 3e)
+- `crates/rskim-search/src/ast_index/patterns.rs` — 29-pattern GOLD-verified catalog, `Pattern`, `PatternCategory`, `lookup_pattern`, `pattern_to_query_set` (Wave 3e); `f6_exact_catalog_count` and `f6_per_category_counts` tests lock catalog counts
 - **`crates/rskim-search/src/ast_index/query.rs`** — `AstQuery`, `AstQueryEngine`, `AstPostingSource`, `parse_ast_query`, BM25 scoring (Wave 3f, #197); `pub mod`
-- `crates/rskim-search/src/ast_index/store/format.rs` — pure binary codec: all on-disk struct definitions (v2), encode/decode, binary search helpers, CRC32; no I/O
+- `crates/rskim-search/src/ast_index/store/format.rs` — pure binary codec: all on-disk struct definitions (v2), encode/decode, binary search helpers, CRC32; no I/O; `pub(crate)` visibility (now accessible from `lib.rs`)
 - `crates/rskim-search/src/ast_index/store/builder.rs` — `AstIndexBuilder`: merge primitive, parallel `build_from_files`, atomic write via `crate::io_util::atomic_write`, FileId enforcement
 - `crates/rskim-search/src/ast_index/store/reader.rs` — `AstIndexReader`, `AstPosting`: mmap open/validate, `lookup_bigram`, `lookup_trigram`, `file_meta`, `file_metrics`, `index_version`, `avg_max_depth`
 - `crates/rskim-search/src/ast_index/mod.rs` — public re-exports for all seven sub-modules
 - `crates/rskim-search/src/ast_weights.rs` — auto-generated `NODE_KIND_VOCABULARY` (1740 entries, sorted) and per-language IDF tables; do not edit manually
-- `crates/rskim-search/src/lib.rs` — crate-root re-exports including `AST_INDEX_FORMAT_VERSION` constant and full Wave 3g export set
+- `crates/rskim-search/src/lib.rs` — crate-root re-exports including `AST_INDEX_FORMAT_VERSION` (alias of `FORMAT_VERSION` with compile-time assert) and full Wave 3g export set
 - `crates/rskim-search/benches/ast_query.rs` — Criterion benchmark: 3 scenarios × 10k synthetic files
 
 ## Related

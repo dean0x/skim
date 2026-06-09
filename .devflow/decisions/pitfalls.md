@@ -1,4 +1,4 @@
-<!-- TL;DR: 5 pitfalls. Key: PF-001, PF-002, PF-003, PF-004, PF-005 -->
+<!-- TL;DR: 6 pitfalls. Key: PF-002, PF-003, PF-004, PF-005, PF-006 -->
 # Known Pitfalls
 
 Area-specific gotchas, fragile areas, and past bugs.
@@ -47,3 +47,12 @@ Area-specific gotchas, fragile areas, and past bugs.
 - **Resolution**: before enforcing an inherited numeric criterion, trace it to a measured basis
 - **Status**: Active
 - **Source**: self-learning:obs_acqv8m
+
+## PF-006: A subcommand-dispatch guard that requires one flag to be absent silently drops a help-advertised flag combination by falling through to a different code path
+
+- **Area**: subcommand flag dispatch (rskim search empty-query action selection)
+- **Issue**: the standalone --ast dispatch arm was gated by blast_radius.is_none(), so when both --ast and --blast-radius were set with no text query the match fell through to run_temporal_standalone, which applies only the co-change filter and silently ignores --ast — even though help text advertises the combination as valid (AST intersect co-change)
+- **Impact**: a feature documented as supported was silently inert with no error — the worst failure mode, since the user gets plausible-looking results that omit the requested AST filter
+- **Resolution**: when a dispatch arm selects on a flag, never use a sibling-flag-absent guard (other_flag.is_none()) to disambiguate composable flags — match the primary flag unconditionally and let the arm body honor the secondary flag
+- **Status**: Active
+- **Source**: self-learning:obs_dsp4kn

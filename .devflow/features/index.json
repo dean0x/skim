@@ -49,7 +49,7 @@
         "crates/rskim-search/src/temporal/storage_types.rs",
         "crates/rskim-search/src/temporal/storage_ops.rs"
       ],
-      "lastUpdated": "2026-06-09T07:30:59.077Z",
+      "lastUpdated": "2026-06-09T10:17:42.547Z",
       "createdBy": "implement"
     },
     "temporal-scoring": {
@@ -71,7 +71,7 @@
         "crates/rskim-search/src/types.rs",
         "crates/rskim-search/src/lib.rs"
       ],
-      "lastUpdated": "2026-06-09T07:31:07.340Z",
+      "lastUpdated": "2026-06-09T10:17:50.613Z",
       "createdBy": "implement"
     },
     "ast-index": {
@@ -100,12 +100,12 @@
         "crates/rskim-search/benches/ast_index_bench.rs",
         "crates/rskim-search/benches/ast_query.rs"
       ],
-      "lastUpdated": "2026-06-08T21:53:43.524Z",
+      "lastUpdated": "2026-06-09T10:18:10.827Z",
       "createdBy": "implement"
     },
     "cmd-search": {
       "name": "Search CLI (skim search subcommand)",
-      "description": "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, resolve_search_cache_dir, parse_flags, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone.",
+      "description": "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, resolve_search_cache_dir, parse_flags, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone, derive_ast_entry, search_ast, resolve_ast_file_filter.",
       "directories": [
         "crates/rskim/src/cmd/search/"
       ],
@@ -121,7 +121,7 @@
         "crates/rskim/src/cmd/search/walk.rs",
         "crates/rskim/src/cmd/search/snippet.rs"
       ],
-      "lastUpdated": "2026-06-08T21:53:37.955Z",
+      "lastUpdated": "2026-06-09T10:18:22.330Z",
       "createdBy": "implement"
     }
   }
