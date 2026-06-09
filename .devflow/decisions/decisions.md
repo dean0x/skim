@@ -1,4 +1,4 @@
-<!-- TL;DR: 5 decisions. Key: ADR-001, ADR-002, ADR-003, ADR-004, ADR-005 -->
+<!-- TL;DR: 6 decisions. Key: ADR-002, ADR-003, ADR-004, ADR-005, ADR-006 -->
 # Architectural Decisions
 
 Append-only. Status changes allowed; deletions prohibited.
@@ -47,3 +47,12 @@ Append-only. Status changes allowed; deletions prohibited.
 - **Decision**: the agent must not auto-merge even when CI is fully green — merge is a user-gated action
 - **Consequences**: the user keeps the merge decision as a deliberate human gate so the final integration step is never taken without explicit human intent, even when every automated check has passed. How to apply: after CI goes green, report the verdict and stop — do not run gh pr merge or any merge command until the user explicitly asks for the squash-merge.
 - **Source**: self-learning:obs_mrg7vk
+
+## ADR-006: In a dual-index build, an unrecoverable per-file desync must abort BEFORE persisting the manifest so the old index survives and the next query self-heals via full rebuild — never silently continue past it
+
+- **Date**: 2026-06-09
+- **Status**: Accepted
+- **Context**: the search index build pipeline indexes each file into BOTH a lexical and an AST index under a shared FileId, then persists a manifest
+- **Decision**: treat an AST-add failure that occurs after the same-FileId lexical entry was already accepted as unrecoverable — propagate an error up through run() so it aborts BEFORE new_manifest.save() is ever reached
+- **Consequences**: persisting a desynced manifest commits silent corruption that survives across sessions, whereas aborting leaves the prior valid manifest in place so the next query self-heals via a full rebuild
+- **Source**: self-learning:obs_fdz9k3

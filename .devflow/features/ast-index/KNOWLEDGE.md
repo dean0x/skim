@@ -1,7 +1,7 @@
 ---
 feature: ast-index
 name: AST Index (CST Linearization + N-gram Encoding + On-Disk Store)
-description: "Use when implementing AST-based n-gram extraction, building or reading the on-disk structural index, adding a new language to the structural index, debugging depth or node-count truncation, extending the shared vocabulary, working with AstBigram/AstTrigram IDF weights, extracting structural n-grams or structural metrics from linearized nodes, using the Pattern Library (structural code patterns), using the shared AstWalkIter traversal primitive, or working with the Wave 3f BM25-ranked AST structural query engine (AstQueryEngine, AstQuery, parse_ast_query, AstPostingSource). Keywords: linearize, CST, AST, n-gram, bigram, trigram, NodeKindId, AstBigram, AstTrigram, AstNgramSet, AstBigramEntry, AstTrigramEntry, NODE_KIND_VOCABULARY, LANG_MAPS, LinearNode, AstWalkIter, AstWalkConfig, tree-sitter, depth-encoded, pre-order, IDF, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_metrics, extract_ast_ngrams_with_weights, StructuralMetrics, structural, Pattern, patterns, EMPTY_BODY, DEEP_NODE, LARGE_BODY, MANY_PARAMS, bucket_label, synthetic n-gram, store, AstIndexBuilder, AstIndexReader, AstPosting, AstFileMetaEntry, skidx, skpost, SKAX, FORMAT_VERSION, on-disk index, mmap, posting list, build_from_files, lookup_bigram, lookup_trigram, index_version, AstQuery, AstQueryEngine, AstPostingSource, parse_ast_query, search_ast, AST_BM25_K1, AST_BM25_B, query.rs, Wave 3f."
+description: "Use when implementing AST-based n-gram extraction, building or reading the on-disk structural index, adding a new language to the structural index, debugging depth or node-count truncation, extending the shared vocabulary, working with AstBigram/AstTrigram IDF weights, extracting structural n-grams or structural metrics from linearized nodes, using the Pattern Library (structural code patterns), using the shared AstWalkIter traversal primitive, or working with the Wave 3f BM25-ranked AST structural query engine (AstQueryEngine, AstQuery, parse_ast_query, AstPostingSource). Keywords: linearize, CST, AST, n-gram, bigram, trigram, NodeKindId, AstBigram, AstTrigram, AstNgramSet, AstBigramEntry, AstTrigramEntry, NODE_KIND_VOCABULARY, LANG_MAPS, LinearNode, AstWalkIter, AstWalkConfig, tree-sitter, depth-encoded, pre-order, IDF, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_metrics, extract_ast_ngrams_with_weights, StructuralMetrics, structural, Pattern, patterns, EMPTY_BODY, DEEP_NODE, LARGE_BODY, MANY_PARAMS, bucket_label, synthetic n-gram, store, AstIndexBuilder, AstIndexReader, AstPosting, AstFileMetaEntry, skidx, skpost, SKAX, FORMAT_VERSION, AST_INDEX_FORMAT_VERSION, on-disk index, mmap, posting list, build_from_files, lookup_bigram, lookup_trigram, index_version, AstQuery, AstQueryEngine, AstPostingSource, parse_ast_query, search_ast, AST_BM25_K1, AST_BM25_B, query.rs, Wave 3f, Wave 3g, cmd-search, self-heal, auto-rebuild."
 category: architecture
 directories: [crates/rskim-search/src/ast_index/, crates/rskim-core/src/]
 referencedFiles:
@@ -23,8 +23,8 @@ referencedFiles:
   - crates/rskim-search/benches/ast_index_bench.rs
   - crates/rskim-search/benches/ast_query.rs
 created: 2026-06-01
-updated: 2026-06-07
-version: 4
+updated: 2026-06-09
+version: 5
 ---
 
 # AST Index (CST Linearization + N-gram Encoding + On-Disk Store)
@@ -34,9 +34,9 @@ version: 4
 The `ast_index` module converts tree-sitter Concrete Syntax Trees (CSTs) into a
 compact, flat representation suitable for downstream n-gram extraction and IDF-weighted
 structural search. It is the AST layer of a 3-layer search system (Lexical, Temporal,
-AST n-gram) built across Waves 3a–3f.
+AST n-gram) built across Waves 3a–3g.
 
-Seven sub-modules make up the full Wave 3f implementation:
+Seven sub-modules make up the full Wave 3f/3g implementation:
 
 - **`linearize`** — converts source text into `Vec<LinearNode>` (pre-order depth-first
   sequence), each node carrying a shared vocabulary ID and traversal depth.
@@ -86,16 +86,30 @@ All items below are accessible via `rskim_search::ast_index::{name}`:
 
 ### From `rskim_search::*` (crate-root re-exports)
 
-Only a subset is re-exported at the crate root. Notably, `extract_ast_ngrams_with_metrics`,
-`Pattern`, `PatternCategory`, `all_patterns`, `lookup_pattern`, `pattern_to_query_set`, and
-`StructuralMetrics` are NOT yet at the crate root — access them via `rskim_search::ast_index::`.
-The crate root exports `AstBigram`, `AstBigramEntry`, `AstFileMetaEntry`, `AstIndexBuilder`,
-`AstIndexReader`, `AstNgramSet`, `AstPosting`, `AstTrigram`, `AstTrigramEntry`,
-`DEFAULT_AST_WEIGHT`, `LinearNode`, `LinearizeResult`, `NodeKindId`, `ast_bigram_idf`,
-`ast_trigram_idf`, `extract_ast_ngrams`, `extract_ast_ngrams_with_weights`, `linearize_source`,
-`vocab_len`, `vocab_lookup`, `vocab_resolve`.
-**Wave 3f additions at crate root**: `AST_BM25_B`, `AST_BM25_K1`, `AstPostingSource`,
-`AstQuery`, `AstQueryEngine`, `parse_ast_query`.
+As of Wave 3g (#199, lib.rs), the following items are re-exported at the crate root.
+This is the full set — use `rskim_search::{name}` for all of them:
+
+```
+AST_BM25_B, AST_BM25_K1,
+AstBigram, AstBigramEntry, AstFileMetaEntry, AstIndexBuilder, AstIndexReader,
+AstNgramSet, AstPosting, AstPostingSource, AstQuery, AstQueryEngine,
+AstTrigram, AstTrigramEntry,
+DEFAULT_AST_WEIGHT, LinearNode, LinearizeResult, NodeKindId,
+Pattern, PatternCategory, StructuralMetrics,
+all_patterns, ast_bigram_idf, ast_trigram_idf,
+extract_ast_ngrams, extract_ast_ngrams_with_metrics, extract_ast_ngrams_with_weights,
+linearize_source, lookup_pattern, parse_ast_query,
+vocab_len, vocab_lookup, vocab_resolve
+```
+
+Additionally, `AST_INDEX_FORMAT_VERSION: u16 = 2` is a standalone crate-root constant
+(not re-exported from `ast_index` — defined directly in `lib.rs`). It is the single
+source of truth for CLI staleness checks: the self-heal probe in `crates/rskim/src/cmd/search/`
+compares `AstIndexReader::index_version(dir)` against this constant before deciding to
+rebuild.
+
+Note: `pattern_to_query_set` is in `ast_index::*` but is NOT re-exported at the crate root.
+Access it via `rskim_search::ast_index::pattern_to_query_set`.
 
 ## System Context
 
@@ -402,8 +416,10 @@ zero. Every file — including those yielding zero n-grams — must receive exac
 non-sequential).
 
 **Version probing:** `AstIndexReader::index_version(dir)` reads only the first 6 bytes
-(magic + version) cheaply. Intended for staleness checks at Wave 3f/3g; callers can
-probe before attempting a full `open` that would fail with a version error.
+(magic + version) cheaply. The CLI self-heal path in `crates/rskim/src/cmd/search/`
+(Wave 3g, #199) uses this probe: if the stored version is absent or below
+`AST_INDEX_FORMAT_VERSION`, the CLI triggers an auto-rebuild before executing the query.
+See `cmd-search` feature knowledge for the consumer-side wiring.
 
 #### Reader API Contracts (C1–C7)
 
@@ -427,8 +443,8 @@ Reader also exposes:
 
 The AST index and the lexical index must be built over the identical, identically-ordered
 file set. Neither builder owns the file manifest — that is the CLI / Wave 4 layer's
-responsibility. Building them over different file sets is a logic error with no runtime
-trap.
+responsibility (enforced in `crates/rskim/src/cmd/search/` as of Wave 3g). Building them
+over different file sets is a logic error with no runtime trap.
 
 ## Component Interactions
 
@@ -497,6 +513,7 @@ AstQueryEngine::search_ast(q: &AstQuery)
 | `MANY_PARAMS` | 65003 | `structural.rs` |
 | `BUCKET_LABEL_BASE` | 64900 | `structural.rs` |
 | `MAX_BUCKET_EDGES` | 99 | `structural.rs` |
+| `AST_INDEX_FORMAT_VERSION` | 2 | `lib.rs` (crate root) |
 
 ## Anti-Patterns
 
@@ -553,6 +570,10 @@ AstQueryEngine::search_ast(q: &AstQuery)
 - **Accessing `structural` internals directly from outside `rskim-search`**: the module is
   `pub(crate)`. External callers use only `StructuralMetrics` re-exported from `ast_index`.
 
+- **Using `FORMAT_VERSION` from `store/format.rs` for CLI staleness checks**: use
+  `AST_INDEX_FORMAT_VERSION` from the crate root (`lib.rs`) instead. The crate-root
+  constant is the intended public interface; the internal one may not be re-exported.
+
 ## Gotchas
 
 - **`level_stack` is internal to `AstWalkIter`**: any depth-related bug fix must be made
@@ -579,8 +600,8 @@ AstQueryEngine::search_ast(q: &AstQuery)
 
 - **v1 indexes are hard-rejected**: `decode_header` returns "unsupported format version: 1
   (expected 2); please rebuild the AST index". The `index_version` probe lets callers detect
-  this before a full `open` call fails. Auto-rebuild wiring arrives in Wave 3g (#199),
-  mirroring `cmd/search/staleness.rs::auto_refresh_if_stale`.
+  this before a full `open` call fails. The CLI self-heal path (Wave 3g, #199) uses this probe
+  in `crates/rskim/src/cmd/search/` — see the `cmd-search` feature knowledge for wiring details.
 
 - **`COMMENT_KIND_IDS` and `PUNCTUATION_KIND_IDS` lazy init at first `is_counted_child` call**:
   the initialization is O(#kinds × log(vocab_len)), tiny but not zero. Benchmarks should
@@ -610,6 +631,15 @@ AstQueryEngine::search_ast(q: &AstQuery)
   with the same byte size but different language grammars will have different `length_norm`
   values if their node densities differ.
 
+- **`pattern_to_query_set` is NOT at the crate root**: unlike `all_patterns`, `lookup_pattern`,
+  and `Pattern`/`PatternCategory`, `pattern_to_query_set` is only available via
+  `rskim_search::ast_index::pattern_to_query_set`. The CLI layer accesses it through
+  `ast_index::*` imports, not the crate-root re-export.
+
+- **AST index is rebuilt on every `skim search index` call (no incremental cache yet)**:
+  the CLI currently re-extracts all files' AST n-grams on every refresh. Incremental
+  caching is tracked in issue #290.
+
 ## Key Files
 
 - `crates/rskim-core/src/ast_walk.rs` — `AstWalkIter`, `AstWalkConfig` (canonical limit source), `AstWalkNode`
@@ -624,6 +654,7 @@ AstQueryEngine::search_ast(q: &AstQuery)
 - `crates/rskim-search/src/ast_index/store/reader.rs` — `AstIndexReader`, `AstPosting`: mmap open/validate, `lookup_bigram`, `lookup_trigram`, `file_meta`, `file_metrics`, `index_version`, `avg_max_depth`
 - `crates/rskim-search/src/ast_index/mod.rs` — public re-exports for all seven sub-modules
 - `crates/rskim-search/src/ast_weights.rs` — auto-generated `NODE_KIND_VOCABULARY` (1740 entries, sorted) and per-language IDF tables; do not edit manually
+- `crates/rskim-search/src/lib.rs` — crate-root re-exports including `AST_INDEX_FORMAT_VERSION` constant and full Wave 3g export set
 - `crates/rskim-search/benches/ast_query.rs` — Criterion benchmark: 3 scenarios × 10k synthetic files
 
 ## Related
@@ -640,12 +671,22 @@ AstQueryEngine::search_ast(q: &AstQuery)
   builder's atomic-write pattern mirrors this module (both now use `crate::io_util::atomic_write`).
 - Feature: `temporal-scoring` — parallel sibling in `rskim-search`; same `SearchError` type
   and `Result<T>` alias pattern.
+- Feature: `cmd-search` — CLI command layer (`crates/rskim/src/cmd/search/`) that builds
+  and queries this index. Owns the file manifest, FileId alignment between AST and lexical
+  indexes, the `--ast` flag, and the self-heal/auto-rebuild path using `AstIndexReader::index_version`
+  vs `AST_INDEX_FORMAT_VERSION`. Cross-link: the `cmd-search` feature knowledge documents
+  the consumer-side wiring for Wave 3g.
 - Feature: `research-ast` — `rskim-research` crate that produces `ast_weights.rs` via
   `ast-codegen`; also uses `AstWalkIter` from `rskim-core`.
 - `crates/rskim-search/src/index/mod.rs` — lexical sibling; `lang_map` widened to `pub(crate)` here.
 - `crates/rskim-search/src/io_util.rs` — `atomic_write` shared helper (NamedTempFile + sync_all + persist).
 - Issue #197 (complete, Wave 3f): `AstQueryEngine`, `AstQuery`, `parse_ast_query`, BM25 scoring, `SearchLayer` adapter.
-- Issue #199 (deferred, Wave 3g): CLI `--ast` flag and auto-rebuild-on-version-mismatch.
+- Issue #199 (shipped, Wave 3g, PR #291): CLI `--ast` flag, building the AST index alongside
+  the lexical index with FileId alignment, and self-heal/auto-rebuild on absent-or-below-FORMAT_VERSION
+  via the `AstIndexReader::index_version` 6-byte probe. Consumer in `crates/rskim/src/cmd/search/`.
 - Issue #198 / #200 (deferred, Wave 4): ranking integration of structural-complexity scoring.
 - Issue #273 (follow-up): on-disk compression (delta + VarInt / Roaring Bitmaps).
 - Issue #283 (deferred): unigram index for `AstQuery::SingleNode` execution.
+- Issue #289 (follow-up): temporal populate path for the AST index.
+- Issue #290 (follow-up): AST incremental build cache — the CLI currently re-extracts all
+  files' AST n-grams on every `skim search index` refresh; no per-file cache yet.
