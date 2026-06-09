@@ -235,7 +235,7 @@ fn try_tier2_noise_strip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture, make_output_full};
+    use crate::cmd::test_utils::{load_fixture, make_output_full};
 
     // ========================================================================
     // Tier 1: GCC/Clang diagnostics, make failures, linker errors, noops

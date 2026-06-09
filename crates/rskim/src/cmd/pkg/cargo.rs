@@ -277,7 +277,7 @@ fn extract_field<'a>(block: &'a str, prefix: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture, make_output, make_output_full};
+    use crate::cmd::test_utils::{load_fixture, make_output, make_output_full};
 
     // ========================================================================
     // cargo audit: JSON

@@ -238,7 +238,7 @@ fn spawn_runner(
     args: &[String],
 ) -> anyhow::Result<(String, Option<i32>)> {
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
+    let runner = CommandRunner::new();
     let output = if config.node_fallback {
         runner.run_with_node_fallback(config.program, &arg_refs)
     } else if config.env_overrides.is_empty() {
@@ -266,7 +266,7 @@ fn spawn_runner_raw(
     config: &TestRunnerConfig<'_>,
     arg_refs: &[&str],
 ) -> anyhow::Result<CommandOutput> {
-    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
+    let runner = CommandRunner::new();
     if config.node_fallback {
         runner.run_with_node_fallback(config.program, arg_refs)
     } else if config.env_overrides.is_empty() {
@@ -570,7 +570,7 @@ pub(super) fn extract_json_object(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::make_output_full;
+    use crate::cmd::test_utils::make_output_full;
 
     // ========================================================================
     // resolve_exit_code tests

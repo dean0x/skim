@@ -244,7 +244,7 @@ pub(crate) fn parse_logs(output: &CommandOutput) -> ParseResult<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture, make_output};
+    use crate::cmd::test_utils::{load_fixture, make_output};
 
     fn compose_ps_fixture() -> String {
         load_fixture("infra", "docker_compose_ps.json")

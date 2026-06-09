@@ -168,7 +168,7 @@ fn build_args(user_args: &[String]) -> Vec<String> {
 
 /// Execute pytest with the given arguments.
 fn run_pytest(args: &[&str]) -> anyhow::Result<CommandOutput> {
-    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
+    let runner = CommandRunner::new();
     runner
         .run("pytest", args)
         .map_err(|e| anyhow::anyhow!("{e}\n\nHint: Is pytest installed? Try: pip install pytest"))
@@ -522,7 +522,7 @@ fn emit_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::load_fixture;
+    use crate::cmd::test_utils::load_fixture;
 
     // ========================================================================
     // Tier 1 tests

@@ -207,7 +207,7 @@ cargo fmt -- --check           # Format check
 - `SKIM_CACHE_DIR` — Override skim cache directory (default: `~/.cache/skim/`)
 
 **Passthrough:**
-- `SKIM_PASSTHROUGH` — Set to `1`/`true`/`yes` to bypass all skim compression (hook, test, build). Useful for debugging when compressed output hides errors.
+- `SKIM_PASSTHROUGH` — Set to `1`/`true`/`yes` to bypass all skim compression (hook, test, build). Useful for debugging when compressed output hides errors. Note: indefinitely-running commands (`vite dev`, `jest --watch`, `tail -f`, bare `skim vitest`) are auto-detected and passed through live with inherited stdio; use `skim vitest run` for a compressed one-shot run.
 
 ### Shell Interception (PATH Wrappers)
 

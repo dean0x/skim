@@ -3,7 +3,7 @@
 use std::io::BufWriter;
 use std::process::ExitCode;
 
-use rskim_search::{CochangeRow, HotspotRow, META_GIT_HEAD, RiskRow, TemporalDb};
+use rskim_search::{CochangeRow, HotspotRow, RiskRow, TemporalDb};
 use tempfile::TempDir;
 
 use super::{

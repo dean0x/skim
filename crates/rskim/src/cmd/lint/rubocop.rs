@@ -189,7 +189,7 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::make_output_full;
+    use crate::cmd::test_utils::make_output_full;
 
     const RUBOCOP_PASS_JSON: &str = r#"{"metadata":{"rubocop_version":"1.65.0","ruby_engine":"ruby","ruby_version":"3.3.0","ruby_patchlevel":"0","ruby_platform":"arm64-darwin23"},"files":[{"path":"app/models/user.rb","offenses":[]}],"summary":{"offense_count":0,"target_file_count":1,"inspected_file_count":1}}"#;
 

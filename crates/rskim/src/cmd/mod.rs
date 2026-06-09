@@ -70,31 +70,34 @@ mod security;
 pub(crate) use security::{sanitize_for_display, scrub_db_args, scrub_infra_args};
 
 #[cfg(test)]
-pub(crate) mod test_support;
+pub(crate) mod test_utils;
 
 use std::io::{self, Read};
 use std::sync::LazyLock;
-use std::time::Duration;
-
-// ============================================================================
-// Stdin reading
-// ============================================================================
-
-/// Default timeout for command execution (5 minutes).
-///
-/// Applied to all [`CommandRunner`] sites that don't have an explicit longer
-/// timeout (build commands use 600 s because compile times can be substantial).
-pub(crate) const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Determine whether to read piped stdin instead of spawning the command.
 ///
-/// Returns `true` when stdin is not a terminal AND `args` is empty. The
-/// `args.is_empty()` guard is critical: without it, subprocess contexts
+/// Returns `true` when stdin is not a terminal AND the args do not look like
+/// real runner arguments (test files, flags).
+///
+/// The `args.is_empty()` guard is critical: without it, subprocess contexts
 /// (Claude Code, CI) where stdin is never a terminal would always read from
 /// empty stdin instead of spawning the runner.
+///
+/// Exception: `args == ["run"]` is treated as stdin-eligible because `run` is
+/// a vitest/jest finite-mode routing hint (not a test file or flag). After
+/// `skim vitest` became indefinite (ADR-008 Part C), callers that want
+/// compression via piped stdin should use `skim vitest run`; `should_read_stdin`
+/// recognises this single-token case so existing stdin pipelines keep working.
+///
+/// Note: this is a generic predicate shared by every tool family that supports
+/// piped stdin (test, lint, infra, pkg, gh). The `run` exception's rationale is
+/// rooted in test-runner semantics, but the check is applied uniformly wherever
+/// stdin-eligibility is decided.
 pub(crate) fn should_read_stdin(args: &[String]) -> bool {
     use std::io::IsTerminal;
-    !std::io::stdin().is_terminal() && args.is_empty()
+    let no_real_args = args.is_empty() || (args.len() == 1 && args[0] == "run");
+    !std::io::stdin().is_terminal() && no_real_args
 }
 
 /// Maximum bytes read from stdin.
@@ -351,8 +354,10 @@ mod tests {
 
     #[test]
     fn test_should_read_stdin_args_gate_short_circuits() {
+        // Real args (flags, test files, multi-token) prevent stdin mode.
+        // Note: args==["run"] is intentionally excluded — it is treated as a
+        // routing hint, not a real arg, and is stdin-eligible (see next test).
         for args in [
-            vec!["run".to_string()],
             vec!["--reporter=verbose".to_string()],
             vec!["--reporter=verbose".to_string(), "math".to_string()],
             vec!["src/utils.test.ts".to_string()],
@@ -362,6 +367,22 @@ mod tests {
                 "should_read_stdin must return false for args: {args:?}"
             );
         }
+    }
+
+    /// `args == ["run"]` is the vitest/jest finite-mode subcommand. It should be
+    /// treated the same as empty args — the only decider is whether stdin is a
+    /// terminal. In `cargo test` stdin is a terminal → false, same as empty args.
+    #[test]
+    fn test_should_read_stdin_run_subcommand_defers_to_terminal() {
+        use std::io::IsTerminal;
+        let args = vec!["run".to_string()];
+        // In `cargo test` stdin is typically a terminal → result should be false.
+        // The important invariant: ["run"] behaves like [] (not like real args).
+        assert_eq!(
+            should_read_stdin(&args),
+            !std::io::stdin().is_terminal(),
+            "['run'] should defer to is_terminal(), just like empty args"
+        );
     }
 
     #[test]

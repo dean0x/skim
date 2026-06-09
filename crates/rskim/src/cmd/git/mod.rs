@@ -318,7 +318,7 @@ pub(super) fn run_passthrough(
     full_args.push(subcmd.to_string());
     full_args.extend_from_slice(args);
 
-    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
+    let runner = CommandRunner::new();
     let arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
     let output = runner.run("git", &arg_refs)?;
 
@@ -376,7 +376,7 @@ pub(super) fn run_parsed_command<F>(
 where
     F: FnOnce(&str) -> GitResult,
 {
-    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
+    let runner = CommandRunner::new();
     let arg_refs: Vec<&str> = subcmd_args.iter().map(String::as_str).collect();
     let output = runner.run("git", &arg_refs)?;
 

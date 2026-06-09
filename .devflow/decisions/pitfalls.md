@@ -1,4 +1,4 @@
-<!-- TL;DR: 7 pitfalls. Key: PF-003, PF-004, PF-005, PF-006, PF-007 -->
+<!-- TL;DR: 8 pitfalls. Key: PF-004, PF-005, PF-006, PF-007, PF-008 -->
 # Known Pitfalls
 
 Area-specific gotchas, fragile areas, and past bugs.
@@ -65,3 +65,12 @@ Area-specific gotchas, fragile areas, and past bugs.
 - **Resolution**: a regression test must assert the discriminating observable behavior, not just a non-failing exit code — here, prove the result set is a STRICT SUBSET when the filter is applied versus the unfiltered superset (and verify graceful degradation when inputs are absent), so the test fails the moment the filter is dropped. General rule: if a test would still pass with the feature deleted, it asserts nothing.
 - **Status**: Active
 - **Source**: self-learning:obs_xt9k2v
+
+## PF-008: Feature-knowledge files (KNOWLEDGE.md, index.json) go stale after a rename refactor, leaving broken import-path references
+
+- **Area**: .devflow feature-knowledge maintenance after refactors
+- **Issue**: a module or symbol rename (test_support to test_utils, PR #279) propagated through 77 compiled .rs files but left build-parsers KNOWLEDGE.md and index.json referencing the old name and a now-broken crate::cmd::test_support import path, because doc and metadata files are not type-checked by cargo
+- **Impact**: feature knowledge surfaced to future agents points at non-existent symbols, eroding trust in the pre-computed context and causing wasted exploration
+- **Resolution**: when a rename refactor touches symbols named in feature knowledge, grep KNOWLEDGE.md and index.json for the old identifier with word boundaries and update referencedFiles and import paths in the same PR — treat feature-knowledge drift as part of the refactor blast radius
+- **Status**: Active
+- **Source**: self-learning:obs_knstal

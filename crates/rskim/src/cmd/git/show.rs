@@ -427,7 +427,7 @@ fn run_git_show_raw(
     full_args.extend(["show".to_string(), "--no-color".to_string()]);
     full_args.extend_from_slice(git_args);
 
-    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
+    let runner = CommandRunner::new();
     let output = runner.run("git", &as_str_slice(&full_args))?;
 
     if output.exit_code != Some(0) {
@@ -742,7 +742,7 @@ fn run_show_file_content(
     // Pass through all original args (show.rs does not strip args for file-content mode).
     full_args.extend_from_slice(args);
 
-    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
+    let runner = CommandRunner::new();
     let output = runner.run("git", &as_str_slice(&full_args))?;
 
     if output.exit_code != Some(0) {

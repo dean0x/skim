@@ -362,7 +362,7 @@ fn count_tree_depth(line: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture, make_output};
+    use crate::cmd::test_utils::{load_fixture, make_output};
 
     #[test]
     fn test_tier1_ls_la() {

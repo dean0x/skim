@@ -10,7 +10,8 @@ fn fixture_path(name: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("tests");
     path.push("fixtures");
-    path.push("vitest");
+    path.push("cmd");
+    path.push("test");
     path.push(name);
     path
 }
@@ -33,8 +34,12 @@ fn skim_cmd() -> Command {
 #[test]
 fn test_skim_vitest_help() {
     // v2.8.0: `skim vitest --help` — "test" is no longer a subcommand.
-    Command::cargo_bin("skim")
-        .unwrap()
+    //
+    // Regression (ADR-008): use `skim_cmd()` so SKIM_PASSTHROUGH is removed and
+    // the daemon guard is ACTIVE. `--help` must be treated as finite (print and
+    // exit) — otherwise the guard would route `vitest --help` through
+    // `run_inherited_passthrough` and exit 127 instead of printing skim's help.
+    skim_cmd()
         .arg("vitest")
         .arg("--help")
         .assert()
@@ -51,7 +56,7 @@ fn test_skim_test_vitest_stdin_pass() {
     let fixture = read_fixture("vitest_pass.json");
 
     skim_cmd()
-        .arg("vitest")
+        .args(["vitest", "run"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -64,7 +69,7 @@ fn test_skim_test_vitest_stdin_fail() {
     let fixture = read_fixture("vitest_fail.json");
 
     skim_cmd()
-        .arg("vitest")
+        .args(["vitest", "run"])
         .write_stdin(fixture)
         .assert()
         .failure()
@@ -79,7 +84,7 @@ fn test_skim_test_vitest_stdin_pnpm_prefix() {
     let fixture = read_fixture("vitest_pnpm_prefix.json");
 
     skim_cmd()
-        .arg("vitest")
+        .args(["vitest", "run"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -96,8 +101,7 @@ fn test_skim_test_vitest_stdin_regex_fallback() {
     let input = "Tests  5 passed | 1 failed | 6 total";
 
     skim_cmd()
-        .arg("--debug")
-        .arg("vitest")
+        .args(["--debug", "vitest", "run"])
         .write_stdin(input)
         .assert()
         .failure() // fail > 0
@@ -115,8 +119,7 @@ fn test_skim_test_vitest_stdin_passthrough() {
     let input = "completely unparseable output";
 
     skim_cmd()
-        .arg("--debug")
-        .arg("vitest")
+        .args(["--debug", "vitest", "run"])
         .write_stdin(input)
         .assert()
         .failure()
@@ -155,14 +158,13 @@ fn test_skim_test_jest_alias_works() {
 
 #[test]
 fn test_vitest_with_args_does_not_read_stdin() {
-    // assert_cmd provides non-terminal stdin by default — exactly the bug
-    // scenario where `!is_terminal()` alone would incorrectly read stdin.
-    // With args present, skim should attempt to spawn vitest (and fail since
-    // it's not installed in the test environment).
+    // assert_cmd provides non-terminal stdin by default. Without write_stdin,
+    // stdin is non-terminal but EMPTY. `should_read_stdin(["run"])` returns true
+    // (run is treated as a routing hint, not a real arg), but `try_read_stdin`
+    // finds empty stdin → returns Ok(None) → falls through to the spawn path.
     //
-    // The key assertion: stdout must NOT be empty. Before the fix, skim would
-    // read empty stdin and produce empty stdout. After the fix, the spawn path
-    // is taken, producing either vitest output or an npm/runner error message.
+    // The key assertion: stdout must NOT be empty. Skim spawns vitest run (which
+    // is not installed), producing an error message on stdout.
     Command::cargo_bin("skim")
         .unwrap()
         .env_remove("SKIM_PASSTHROUGH")

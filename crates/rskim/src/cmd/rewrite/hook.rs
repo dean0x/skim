@@ -194,26 +194,39 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Check for compound operator characters on the original string directly,
-    // before tokenizing, to avoid unnecessary allocations on the hot path.
-    let has_operator_chars = command.contains("&&")
-        || command.contains("||")
-        || command.contains(';')
-        || command.contains('|');
-
-    // Tokenize into Vec<&str> (borrowing from `command`) to avoid String allocations.
+    // Tokenize once (borrowing from `command`) for both the indefinite-command
+    // check and the rewrite engine — a single allocation on this hot path.
     let tokens: Vec<&str> = command.split_whitespace().collect();
     if tokens.is_empty() {
         audit_hook(&command, false, "");
         return Ok(ExitCode::SUCCESS);
     }
 
-    let original = tokens.join(" ");
+    // Fast-path: indefinite/daemon commands must not be rewritten.
+    // When an agent runs `next dev` or `npm run dev`, passing it through the
+    // rewrite engine would try to capture its output — a dev server never
+    // exits, so the agent would hang. Treat these as no-rewrite passthroughs
+    // the same way already-skim commands are treated (audit + exit 0, empty
+    // stdout → agent runs the raw command unchanged). (ADR-008 Part C)
+    if super::indefinite::is_indefinite_command(&tokens) {
+        audit_hook(&command, false, "");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Check for compound operator characters on the original string directly
+    // rather than scanning the token slice, since operators may appear mid-token.
+    let has_operator_chars = command.contains("&&")
+        || command.contains("||")
+        || command.contains(';')
+        || command.contains('|');
 
     // Fast path for non-compound commands
     let rewritten = if !has_operator_chars {
         try_rewrite(&tokens).map(|r| r.tokens.join(" "))
     } else {
+        // Defer joining until the compound branch — avoids a dead allocation on the
+        // common non-compound path where `original` is never read.
+        let original = tokens.join(" ");
         match split_compound(&original) {
             CompoundSplitResult::Bail => None,
             CompoundSplitResult::Simple(simple_tokens) => {

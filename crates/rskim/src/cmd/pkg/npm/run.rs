@@ -162,7 +162,7 @@ fn parse_npm_output(output: &CommandOutput, tool: ScriptTool) -> ParseResult<Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_support::{load_fixture, make_output_full};
+    use crate::cmd::test_utils::{load_fixture, make_output_full};
 
     #[test]
     fn test_stringify_result_full() {

@@ -168,11 +168,11 @@ pub(crate) fn group_issues(tool: &str, issues: Vec<LintIssue>) -> LintResult {
 
 /// Shared fixture loader for lint parser unit tests.
 ///
-/// Delegates to `test_support::load_fixture` with the `"lint"` subdir
+/// Delegates to `test_utils::load_fixture` with the `"lint"` subdir
 /// pre-applied, consistent with the pattern used by `gh::test_helpers`.
 #[cfg(test)]
 pub(crate) fn load_lint_fixture(name: &str) -> String {
-    crate::cmd::test_support::load_fixture("lint", name)
+    crate::cmd::test_utils::load_fixture("lint", name)
 }
 
 // ============================================================================
@@ -184,7 +184,7 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
-    use crate::cmd::test_support::{make_output, make_output_full};
+    use crate::cmd::test_utils::{make_output, make_output_full};
     use crate::output::canonical::{LintIssue, LintSeverity};
 
     #[test]

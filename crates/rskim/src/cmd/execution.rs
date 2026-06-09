@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use crate::output::ParseResult;
 use crate::runner::{CommandOutput, CommandRunner};
 
-use super::{DEFAULT_CMD_TIMEOUT, is_passthrough_mode, read_stdin_bounded, should_read_stdin};
+use super::{is_passthrough_mode, read_stdin_bounded, should_read_stdin};
 use super::{scrub_db_args, scrub_infra_args};
 
 /// Controls the output format of parsed command results.
@@ -137,7 +137,7 @@ fn obtain_output(
         }
     }
 
-    let runner = CommandRunner::new(Some(DEFAULT_CMD_TIMEOUT));
+    let runner = CommandRunner::new();
     let args_str: Vec<&str> = args.iter().map(String::as_str).collect();
     match runner.run_with_env(program, &args_str, env_overrides) {
         Ok(out) => Ok(Some(out)),
@@ -510,7 +510,7 @@ mod tests {
     #[test]
     fn test_combine_output_empty_stderr_borrows() {
         // Fast path: empty stderr must return Cow::Borrowed (zero-copy).
-        let output = crate::cmd::test_support::make_output_full("hello world", "", Some(0));
+        let output = crate::cmd::test_utils::make_output_full("hello world", "", Some(0));
         let combined = combine_output(&output);
         assert!(
             matches!(combined, Cow::Borrowed(_)),
@@ -523,7 +523,7 @@ mod tests {
     fn test_combine_output_non_empty_stderr_concatenates() {
         // Slow path: non-empty stderr triggers owned concatenation.
         let output =
-            crate::cmd::test_support::make_output_full("stdout line", "stderr line", Some(0));
+            crate::cmd::test_utils::make_output_full("stdout line", "stderr line", Some(0));
         let combined = combine_output(&output);
         assert!(
             matches!(combined, Cow::Owned(_)),
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn test_combine_output_both_empty_borrows() {
         // Both empty: stdout is empty string; stderr is empty so fast path applies.
-        let output = crate::cmd::test_support::make_output_full("", "", Some(0));
+        let output = crate::cmd::test_utils::make_output_full("", "", Some(0));
         let combined = combine_output(&output);
         assert!(
             matches!(combined, Cow::Borrowed(_)),

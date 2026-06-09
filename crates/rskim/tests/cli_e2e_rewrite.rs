@@ -753,7 +753,7 @@ fn test_passthrough_forwards_raw_content() {
     // The vitest passthrough handler returns ExitCode::FAILURE when stdin has
     // data (exit code 1 is conservative — the tool status is unknown). The
     // important property is that raw content is forwarded without compression.
-    let fixture = include_str!("fixtures/vitest/vitest_fail.json");
+    let fixture = include_str!("fixtures/cmd/test/vitest_fail.json");
     let output = skim_cmd()
         .args(["vitest"])
         .env("SKIM_PASSTHROUGH", "1")
