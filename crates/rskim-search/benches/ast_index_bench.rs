@@ -3,18 +3,27 @@
 //! Run with: cargo bench -p rskim-search --bench ast_index_bench
 //!
 //! Benchmark groups:
-//!   1. build_1000_files  — build_from_files over ~1000 Rust functions (A15)
+//!   1. build_1000_files       — build_from_files over ~1000 Rust functions (A15)
+//!   2. extraction_overhead    — compare extract_ast_ngrams (v1) vs
+//!      extract_ast_ngrams_with_metrics (v2) on a representative
+//!      linearized corpus. Empirically backs P1 (extraction overhead <15%).
 //!
-//! A16 (index size ratio < 1.8×) is a normal unit test in reader_tests.rs.
-//! Measured baseline: ~1.23×.  Bound < 1.8× leaves ~46% margin above baseline
-//! while catching genuine O(files²) bloat regressions.  On-disk compression
+//! A16 (index size ratio < 2.2×) is a normal unit test in reader_tests.rs.
+//! Measured baseline: ~1.23× (v1), ~1.3× (v2 with structural markers).
+//! Bound < 2.2× absorbs the deliberate v2 capability expansion while still
+//! catching genuine O(files²) bloat regressions.  On-disk compression
 //! (delta + VarInt / Roaring posting) tracked in issue #273.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use rskim_core::Language;
-use rskim_search::{AstIndexBuilder, FileId};
+use rskim_search::{
+    AstIndexBuilder, FileId,
+    ast_index::{
+        LinearNode, extract_ast_ngrams, extract_ast_ngrams_with_metrics, linearize_source,
+    },
+};
 use tempfile::TempDir;
 
 // ============================================================================
@@ -72,8 +81,35 @@ fn bench_build_1000_files(c: &mut Criterion) {
 }
 
 // ============================================================================
+// Group 2: Extraction overhead — v1 vs v2 path (P1: < 15% overhead)
+// ============================================================================
+
+fn bench_extraction_overhead(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ast_extraction_overhead");
+
+    // Generate a representative Rust source once, linearize it once outside
+    // the timed closure so both benches measure only the extraction step.
+    let source = gen_rust_fns(50); // ~50 functions — representative corpus
+    let nodes: Vec<LinearNode> = linearize_source(&source, Language::Rust)
+        .expect("linearize failed")
+        .nodes;
+
+    // v1 path: extract_ast_ngrams discards metrics
+    group.bench_function("extract_v1_no_metrics", |b| {
+        b.iter(|| extract_ast_ngrams(black_box(&nodes), black_box(Language::Rust)))
+    });
+
+    // v2 path: extract_ast_ngrams_with_metrics returns StructuralMetrics too
+    group.bench_function("extract_v2_with_metrics", |b| {
+        b.iter(|| extract_ast_ngrams_with_metrics(black_box(&nodes), black_box(Language::Rust)))
+    });
+
+    group.finish();
+}
+
+// ============================================================================
 // Criterion main
 // ============================================================================
 
-criterion_group!(benches, bench_build_1000_files);
+criterion_group!(benches, bench_build_1000_files, bench_extraction_overhead);
 criterion_main!(benches);

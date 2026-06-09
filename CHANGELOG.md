@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Wave 3e: AST Pattern Library & Structural Index v2** — `rskim-search` AST index format bumped to v2 (breaking; re-index required). Adds per-file structural metrics (max depth, max block statements, max params, branch count) and synthetic n-gram markers (EMPTY_BODY, DEEP_NODE, LARGE_BODY, MANY_PARAMS) emitted via a single-pass extraction. Pattern library catalog with 29 named patterns (ErrorHandling, Performance, Concurrency, Quality, Structure) GOLD-verified against real parse output; each pattern is either exact (reliable subset of every occurrence) or approximate (description says "approximation" or "structural"). (#196)
+
+### Migration Note
+- **AST index format v2 (breaking change)** — Files written by Wave 3d (`format_version=1`) are rejected with "please rebuild". Run `skim search index --rebuild` (or `--force`) to regenerate. The v2 format adds 10 bytes per file entry for structural metrics and stores `avg_max_depth:f32` in the header. No data loss: v2 is a strict superset of v1.
+
+### Added
 - **Universal shell interception via PATH wrappers** — `skim init --wrappers` creates symlinks in `~/.skim/bin/` for all supported tools. The skim binary detects `argv[0]` and dispatches through the existing handlers. Recursion is prevented by stripping `~/.skim/bin` from PATH as the very first action in `main()`. `--no-wrappers` skips wrapper installation unconditionally; in TTY environments without either flag, the user is prompted interactively. Non-TTY environments default to skipping. (#258)
 - **Hook scripts include PATH prepend for wrapper activation** — Generated hook scripts now prepend `~/.skim/bin` to PATH so that sub-agents in restricted PATH environments still resolve wrapper symlinks. The prepend is guarded by a `[ -d "$HOME/.skim/bin" ]` check, so hooks installed before `skim init --wrappers` was run are unaffected. The skim binary's startup PATH strip prevents infinite recursion. (#258)
 

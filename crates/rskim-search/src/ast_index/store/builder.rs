@@ -48,7 +48,9 @@ use super::format::{
 use super::reader::AstIndexReader;
 use crate::{
     FileId, Result, SearchError,
-    ast_index::{AstNgramSet, extract_ast_ngrams, linearize_source},
+    ast_index::{
+        AstNgramSet, StructuralMetrics, extract_ast_ngrams_with_metrics, linearize_source,
+    },
     io_util::atomic_write,
 };
 
@@ -83,6 +85,8 @@ pub struct AstIndexBuilder {
     total_distinct_bigrams: u64,
     /// Sum of distinct trigram counts per file (for avg_trigram_count).
     total_distinct_trigrams: u64,
+    /// Sum of `max_depth` values across all files (for avg_max_depth).
+    total_max_depth: u64,
 }
 
 // ============================================================================
@@ -204,6 +208,7 @@ impl AstIndexBuilder {
             total_node_count: 0,
             total_distinct_bigrams: 0,
             total_distinct_trigrams: 0,
+            total_max_depth: 0,
         })
     }
 
@@ -211,7 +216,7 @@ impl AstIndexBuilder {
     // Core merge primitive
     // -----------------------------------------------------------------------
 
-    /// Record the n-grams for one file.
+    /// Record the n-grams and structural metrics for one file.
     ///
     /// This is the core merge primitive.  Every file — even files that yield
     /// zero n-grams — MUST produce exactly one `add_file_ngrams` call so that
@@ -224,6 +229,7 @@ impl AstIndexBuilder {
     /// - `lang` — language used for the `lang_id` byte in [`AstFileMetaEntry`].
     /// - `set` — the extracted [`AstNgramSet`] (may be empty).
     /// - `node_count` — emitted-node count from `linearize_source` (`lin.nodes.len()`).
+    /// - `metrics` — per-file structural complexity metrics from extraction.
     ///
     /// # Errors
     ///
@@ -238,6 +244,7 @@ impl AstIndexBuilder {
         lang: rskim_core::Language,
         set: &AstNgramSet,
         node_count: u32,
+        metrics: StructuralMetrics,
     ) -> Result<()> {
         // ── FileId guards (mirrors lexical builder, ADR-001) ────────────────
         if self.seen_file_ids.contains(&id.0) {
@@ -288,6 +295,10 @@ impl AstIndexBuilder {
         self.file_meta.push(AstFileMetaEntry {
             lang_id: lang_to_id(lang),
             node_count,
+            max_depth: metrics.max_depth,
+            max_block_stmts: metrics.max_block_stmts,
+            max_params: metrics.max_params,
+            branch_count: metrics.branch_count,
         });
 
         // ── Accumulate totals ────────────────────────────────────────────────
@@ -300,6 +311,9 @@ impl AstIndexBuilder {
         self.total_distinct_trigrams = self
             .total_distinct_trigrams
             .saturating_add(set.trigrams.len() as u64);
+        self.total_max_depth = self
+            .total_max_depth
+            .saturating_add(u64::from(metrics.max_depth));
 
         self.file_count = self.file_count.checked_add(1).ok_or_else(|| {
             SearchError::IndexCorrupted("file_count overflow: too many files".into())
@@ -335,8 +349,8 @@ impl AstIndexBuilder {
                 id.0
             ))
         })?;
-        let set = extract_ast_ngrams(&lin.nodes, lang);
-        self.add_file_ngrams(id, lang, &set, node_count)
+        let (set, metrics) = extract_ast_ngrams_with_metrics(&lin.nodes, lang);
+        self.add_file_ngrams(id, lang, &set, node_count, metrics)
     }
 
     // -----------------------------------------------------------------------
@@ -370,7 +384,14 @@ impl AstIndexBuilder {
         // ── Parallel extraction ──────────────────────────────────────────────
         // Collect results into a Vec indexed by position in `files` so that
         // sequential merge preserves FileId order.
-        let extracted: Vec<Result<(FileId, rskim_core::Language, AstNgramSet, u32)>> = files
+        type ExtractedEntry = (
+            FileId,
+            rskim_core::Language,
+            AstNgramSet,
+            u32,
+            StructuralMetrics,
+        );
+        let extracted: Vec<Result<ExtractedEntry>> = files
             .par_iter()
             .map(|(id, content, lang)| {
                 let lin = linearize_source(content, *lang)?;
@@ -381,16 +402,16 @@ impl AstIndexBuilder {
                         id.0
                     ))
                 })?;
-                let set = extract_ast_ngrams(&lin.nodes, *lang);
-                Ok((*id, *lang, set, node_count))
+                let (set, metrics) = extract_ast_ngrams_with_metrics(&lin.nodes, *lang);
+                Ok((*id, *lang, set, node_count, metrics))
             })
             .collect();
 
         // ── Sequential merge ─────────────────────────────────────────────────
         let mut builder = AstIndexBuilder::new(output_dir)?;
         for result in extracted {
-            let (id, lang, set, node_count) = result?;
-            builder.add_file_ngrams(id, lang, &set, node_count)?;
+            let (id, lang, set, node_count, metrics) = result?;
+            builder.add_file_ngrams(id, lang, &set, node_count, metrics)?;
         }
 
         builder.build()
@@ -413,16 +434,18 @@ impl AstIndexBuilder {
     /// result.
     pub fn build(self) -> Result<AstIndexReader> {
         // ── Corpus averages ──────────────────────────────────────────────────
-        let (avg_bigram_count, avg_trigram_count, avg_node_count) = if self.file_count == 0 {
-            (0.0f32, 0.0f32, 0.0f32)
-        } else {
-            let n = f64::from(self.file_count);
-            (
-                (self.total_distinct_bigrams as f64 / n) as f32,
-                (self.total_distinct_trigrams as f64 / n) as f32,
-                (self.total_node_count as f64 / n) as f32,
-            )
-        };
+        let (avg_bigram_count, avg_trigram_count, avg_node_count, avg_max_depth) =
+            if self.file_count == 0 {
+                (0.0f32, 0.0f32, 0.0f32, 0.0f32)
+            } else {
+                let n = f64::from(self.file_count);
+                (
+                    (self.total_distinct_bigrams as f64 / n) as f32,
+                    (self.total_distinct_trigrams as f64 / n) as f32,
+                    (self.total_node_count as f64 / n) as f32,
+                    (self.total_max_depth as f64 / n) as f32,
+                )
+            };
 
         // ── Assert posting lists are already ascending by doc_id ─────────────
         // The sequential-FileId invariant (enforced in add_file_ngrams via the
@@ -466,6 +489,7 @@ impl AstIndexBuilder {
             avg_bigram_count,
             avg_trigram_count,
             avg_node_count,
+            avg_max_depth,
         )?;
 
         let post_path = self.output_dir.join("ast_index.skpost");
@@ -487,6 +511,7 @@ impl AstIndexBuilder {
         avg_bigram_count: f32,
         avg_trigram_count: f32,
         avg_node_count: f32,
+        avg_max_depth: f32,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         // ── Postings buffer ──────────────────────────────────────────────────
         // Use saturating_mul for parity with the crate's overflow discipline
@@ -599,6 +624,7 @@ impl AstIndexBuilder {
             avg_bigram_count,
             avg_trigram_count,
             avg_node_count,
+            avg_max_depth,
             checksum,
         };
 
