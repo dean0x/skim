@@ -98,11 +98,9 @@ pub(crate) fn run(
         SearchAction::Query(ref text) if !text.is_empty() => run_query(text, &flags, analytics),
         // Empty query + --ast (with or without --blast-radius) → standalone AST dispatch.
         //
-        // --ast + --blast-radius is advertised in help as composable (AST ∩ co-change).
-        // Previously blast_radius.is_none() was required here, causing --blast-radius to
-        // silently be dropped when --ast was also set and no text query was given — the
-        // request fell through to run_temporal_standalone which never applied the AST
-        // filter. Now we match --ast regardless of --blast-radius so the flag is honored.
+        // When --blast-radius is also set, run_ast_standalone resolves co-change peers
+        // via the temporal DB, converts them to FileIds, and intersects with the AST
+        // result set BEFORE applying --limit (avoids PF-006 silent feature-drop).
         //
         // --ast + temporal sort (--hot/--cold/--risky) is still rejected above (#202).
         SearchAction::Query(_)
@@ -118,7 +116,16 @@ pub(crate) fn run(
             // of the pre-dispatch validation order. run_ast_standalone re-validates
             // internally so it is independently callable without a prior validate call
             // (defensive re-validation is intentional — it is cheap and idempotent).
-            ast::run_ast_standalone(raw, flags.limit, flags.json, &cache_dir, &manifest)
+            ast::run_ast_standalone(
+                raw,
+                flags.limit,
+                flags.json,
+                &cache_dir,
+                &manifest,
+                flags.blast_radius.as_deref(),
+                &cache_dir.join("temporal.db"),
+                &root,
+            )
         }
         // Empty query with temporal flags (no --ast) → standalone temporal dispatch.
         SearchAction::Query(_) if flags.temporal_sort.is_some() || flags.blast_radius.is_some() => {

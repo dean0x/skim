@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
+use std::process::ExitCode;
 
 use rskim_search::{AstIndexReader, AstQuery, AstQueryEngine, FileId};
 use rskim_search::{all_patterns, parse_ast_query};
@@ -116,22 +117,29 @@ pub(super) fn resolve_ast_file_filter(
 /// Execute a standalone `--ast` query (no text query, only AST pattern).
 ///
 /// Mirrors `run_temporal_standalone` in `mod.rs`:
-/// - Resolves project root + cache dir.
 /// - Validates the pattern before opening the index.
 /// - Opens the AST engine.
+/// - When `blast_radius` is set, resolves co-change peers via the temporal DB,
+///   converts them to `FileId`s, and intersects with the AST result set so that
+///   `--limit` applies to the already-filtered set (avoids PF-006 silent-drop,
+///   applies ADR-006 fail-loud counterpart on the read side).
 /// - Executes the query and formats output.
 ///
 /// # Errors
 ///
 /// Returns `Err` when the index is absent, the query is invalid, or I/O fails.
 /// Returns `Ok(ExitCode::SUCCESS)` for empty result sets (AC-F8).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run_ast_standalone(
     raw_pattern: &str,
     limit: usize,
     json: bool,
     cache_dir: &Path,
     manifest: &super::manifest::FileManifest,
-) -> anyhow::Result<std::process::ExitCode> {
+    blast_radius: Option<&str>,
+    temporal_db_path: &Path,
+    root: &Path,
+) -> anyhow::Result<ExitCode> {
     // Validate before opening the index — fail fast with good error messages.
     validate_ast_pattern(raw_pattern)?;
 
@@ -142,8 +150,72 @@ pub(super) fn run_ast_standalone(
     let raw_results = engine
         .search_ast(&query)
         .map_err(|e| anyhow::anyhow!("AST query failed: {e}"))?;
-    // Apply limit after the raw search (search_ast returns all matches sorted by FileId).
-    let results: Vec<_> = raw_results.into_iter().take(limit).collect();
+
+    // Resolve the blast-radius FileId allowlist when --blast-radius is set.
+    // Mirrors the blast_radius_paths resolution in resolve_blast_radius_filter
+    // (mod.rs) then converts paths → FileIds exactly as query.rs does, so the
+    // intersection semantics are identical on both paths (avoids PF-006).
+    let blast_file_ids: Option<HashSet<FileId>> = if let Some(raw_path) = blast_radius {
+        match super::temporal::open_temporal_db(temporal_db_path) {
+            None => {
+                eprintln!(
+                    "skim search: no temporal data for --blast-radius — run 'skim heatmap' \
+                     to populate"
+                );
+                None
+            }
+            Some(db) => {
+                match super::temporal::normalize_blast_radius_path(raw_path, root) {
+                    Err(e) => return Err(e),
+                    Ok(normalized) => {
+                        let partners = db.cochanges_for_file(&normalized)?;
+                        if partners.is_empty() {
+                            eprintln!("skim search: no co-change data for {raw_path:?}");
+                        }
+                        // Include the target file itself (mirrors resolve_blast_radius_filter).
+                        let mut allowed_paths =
+                            super::temporal::cochange_partner_paths(&partners, &normalized);
+                        allowed_paths.insert(normalized);
+
+                        // Convert path strings → FileIds via manifest sorted_paths().
+                        let sorted = manifest.sorted_paths();
+                        let mut file_ids = HashSet::new();
+                        for (idx, path) in sorted.iter().enumerate() {
+                            if allowed_paths.contains(*path) {
+                                // PF-004: widen idx (usize) to u32 before constructing FileId.
+                                if let Ok(id) = u32::try_from(idx) {
+                                    file_ids.insert(FileId(id));
+                                }
+                            }
+                        }
+                        if file_ids.is_empty() {
+                            eprintln!(
+                                "skim search: blast-radius filter matched 0 indexed files \
+                                 (allowed {} paths, index has {} files)",
+                                allowed_paths.len(),
+                                sorted.len()
+                            );
+                        }
+                        Some(file_ids)
+                    }
+                }
+            }
+        }
+    } else {
+        None
+    };
+
+    // Intersect AST results with blast-radius FileIds (when set), then apply limit.
+    // Limit is applied AFTER intersection so it reflects the filtered set size.
+    let results: Vec<_> = raw_results
+        .into_iter()
+        .filter(|(fid, _)| {
+            blast_file_ids
+                .as_ref()
+                .is_none_or(|allowed| allowed.contains(fid))
+        })
+        .take(limit)
+        .collect();
 
     // Resolve FileIds → repo-relative paths using the manifest.
     // Warn on out-of-range FileIds (avoids PF-002 silent-drop anti-pattern,
@@ -179,7 +251,7 @@ pub(super) fn run_ast_standalone(
     }
     stdout.flush()?;
 
-    Ok(std::process::ExitCode::SUCCESS)
+    Ok(ExitCode::SUCCESS)
 }
 
 // ============================================================================

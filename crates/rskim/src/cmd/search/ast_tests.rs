@@ -653,6 +653,9 @@ fn run_ast_standalone_with_real_index_maps_paths() {
         false, // text output
         cache.path(),
         &manifest,
+        None,                              // no --blast-radius
+        &cache.path().join("temporal.db"), // temporal DB path (absent = graceful degrade)
+        project.path(),                    // project root
     )
     .unwrap();
 
