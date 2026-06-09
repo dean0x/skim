@@ -27,12 +27,38 @@ use super::types::{QueryConfig, QueryOutput, ResolvedResult};
 /// Execute a search query against the index.
 ///
 /// Handles auto-build on cold start and staleness refresh transparently.
+/// This is the canonical interface used by `query_tests.rs` and `ast_tests.rs`.
+/// Production dispatch in `mod.rs` calls [`execute_query_with_manifest`] directly
+/// to thread a pre-loaded manifest and avoid a redundant refresh on the combined
+/// text+`--ast` path.
 ///
 /// # Errors
 ///
 /// Returns `Err` on I/O failures or if the index is corrupt.
+// Used by query_tests.rs and ast_tests.rs (both #[cfg(test)] callers); the
+// production path in mod.rs calls execute_query_with_manifest directly.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn execute_query(
     config: &QueryConfig,
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<QueryOutput> {
+    execute_query_with_manifest(config, None, analytics)
+}
+
+/// Execute a search query, optionally reusing a pre-loaded manifest.
+///
+/// `pre_loaded_manifest` may be `Some` when the caller has already called
+/// `auto_refresh_if_stale` (e.g. the combined text+`--ast` path in `run_query`
+/// refreshes before opening the AST engine and passes the resulting manifest
+/// here to avoid a redundant disk load). When `None`, the function calls
+/// `auto_refresh_if_stale` itself — this is the pure-lexical (no `--ast`) path.
+///
+/// # Errors
+///
+/// Returns `Err` on I/O failures or if the index is corrupt.
+pub(super) fn execute_query_with_manifest(
+    config: &QueryConfig,
+    pre_loaded_manifest: Option<FileManifest>,
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<QueryOutput> {
     let start = Instant::now();
@@ -51,9 +77,17 @@ pub(super) fn execute_query(
     let cache_dir = &config.cache_dir;
     let root = &config.root;
 
-    // Ensure the index is built and current.  The returned manifest is reused
-    // below to avoid a second load from disk (duplicate-manifest-load fix).
-    let (_refreshed, manifest) = auto_refresh_if_stale(root, cache_dir, analytics)?;
+    // Ensure the index is built and current.  When the caller already refreshed
+    // (combined text+--ast path), reuse the manifest they provide to avoid a
+    // redundant check_staleness + FileManifest::load on an already-current index.
+    // Pure-lexical path (no --ast): refreshes here exactly once.
+    let manifest = match pre_loaded_manifest {
+        Some(m) => m,
+        None => {
+            let (_refreshed, m) = auto_refresh_if_stale(root, cache_dir, analytics)?;
+            m
+        }
+    };
 
     // Open the reader.
     let reader = NgramIndexReader::open(cache_dir)?;
@@ -68,26 +102,43 @@ pub(super) fn execute_query(
     // file_filter construction and the path-resolution step below.
     let sorted = manifest.sorted_paths();
 
-    // When blast-radius paths are provided, convert them to FileId allowlist
-    // so the search engine filters BEFORE applying the limit. This ensures
-    // the limit applies to the filtered set rather than discarding matches
-    // that fall outside the top-N unfiltered results.
-    if let Some(ref allowed_paths) = config.blast_radius_paths {
-        let mut file_ids = std::collections::HashSet::new();
-        for (idx, path) in sorted.iter().enumerate() {
-            if allowed_paths.contains(*path) {
-                file_ids.insert(rskim_search::FileId(idx as u32));
-            }
+    // Build the FileId allowlist from blast-radius paths + AST file IDs.
+    // Intersection logic:
+    // - blast-radius only: path-based allowlist (path → FileId).
+    // - AST only: use the AST FileId set directly (moved — no clone).
+    // - Both: intersection of the two sets (FileId-level, no path round-trip).
+    // - Neither: no filter (sq.file_filter stays None).
+    //
+    // paths_to_file_ids is the single source of truth for the PF-004 widening
+    // (`u32::try_from`) and the "matched 0 indexed files" warning string.
+    let blast_file_ids: Option<std::collections::HashSet<rskim_search::FileId>> = config
+        .blast_radius_paths
+        .as_ref()
+        .map(|allowed_paths| super::temporal::paths_to_file_ids(&sorted, allowed_paths));
+
+    // Match on borrows so we clone only in the one arm that needs an owned value.
+    // In the (Some, Some) intersection arm the AST set is borrow-only (.contains),
+    // so cloning it upfront wastes an allocation on the heaviest combined-filter path.
+    match (blast_file_ids, config.ast_file_ids.as_ref()) {
+        (Some(blast), Some(ast)) => {
+            // Intersection: only files in BOTH sets (borrow ast — no clone needed).
+            let intersection: std::collections::HashSet<rskim_search::FileId> = blast
+                .iter()
+                .filter(|id| ast.contains(*id))
+                .copied()
+                .collect();
+            sq.file_filter = Some(intersection);
         }
-        if file_ids.is_empty() {
-            eprintln!(
-                "skim search: blast-radius filter matched 0 indexed files \
-                 (allowed {} paths, index has {} files)",
-                allowed_paths.len(),
-                sorted.len()
-            );
+        (Some(blast), None) => {
+            sq.file_filter = Some(blast);
         }
-        sq.file_filter = Some(file_ids);
+        (None, Some(ast)) => {
+            // Clone only here, where the owned set is needed for sq.file_filter.
+            sq.file_filter = Some(ast.clone());
+        }
+        (None, None) => {
+            // No filter.
+        }
     }
 
     // Execute the search.

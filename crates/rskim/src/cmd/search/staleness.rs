@@ -186,21 +186,51 @@ fn is_hex_sha(s: &str) -> bool {
 /// Returns [`StalenessCheck::NoStoredHead`] only when the manifest has no
 /// stored HEAD **and** the project is currently a git repo (i.e. git HEAD
 /// appeared since the last build — rebuild is warranted).
+///
+/// # AST self-heal (#199)
+///
+/// When the lexical index is CURRENT but the AST index is ABSENT or has a
+/// FORMAT_VERSION below the current version (post-upgrade / crash-between-builds),
+/// this function reports `NoStoredHead` so the next query triggers a full rebuild.
+/// The version check uses [`rskim_search::AstIndexReader::index_version`] which
+/// reads only the first 6 bytes of `ast_index.skidx` (magic + version) — cheap,
+/// no mmap, no CRC verification.
 pub(super) fn check_staleness(
     cache_dir: &Path,
     project_root: &Path,
 ) -> (StalenessCheck, Option<FileManifest>) {
-    // Cold start: no index file.
+    // Cold start: no lexical index file.
     let index_path = cache_dir.join("index.skidx");
     if !index_path.exists() {
         return (StalenessCheck::NoIndex, None);
     }
 
-    // Load manifest to get stored git HEAD.
+    // AST self-heal: if the lexical index exists but the AST index is absent
+    // or has an old format version, report stale so both rebuild atomically.
+    // This handles: post-upgrade (v1→v2), crash between lexical.build() and
+    // ast.build(), and first run after adding --ast to an existing install.
+    let ast_index_path = cache_dir.join("ast_index.skidx");
+    let ast_stale = if !ast_index_path.exists() {
+        true
+    } else {
+        match rskim_search::AstIndexReader::index_version(cache_dir) {
+            Ok(v) => v < rskim_search::AST_INDEX_FORMAT_VERSION,
+            Err(_) => true, // Corrupt / unreadable → rebuild.
+        }
+    };
+
     let manifest = match FileManifest::load(project_root.to_path_buf(), cache_dir.to_path_buf()) {
         Ok(m) => m,
+        // Cannot load the manifest — treat as no stored HEAD.
         Err(_) => return (StalenessCheck::NoStoredHead, None),
     };
+
+    if ast_stale {
+        // AST index is absent or below the current format version.
+        // Return NoStoredHead to trigger a full rebuild, but carry the loaded
+        // manifest so display consumers (e.g. `--stats`) still show the real HEAD.
+        return (StalenessCheck::NoStoredHead, Some(manifest));
+    }
 
     let stored = manifest.stored_git_head().map(str::to_string);
 
@@ -306,6 +336,13 @@ pub(super) fn auto_refresh_if_stale(
 
     // After a rebuild, load the freshly written manifest for the caller.
     let manifest = FileManifest::load(root.to_path_buf(), cache_dir.to_path_buf())?;
+
+    // ── #289 temporal hook point ─────────────────────────────────────────────
+    // TODO(#289): Call `rebuild_temporal(root, cache_dir, head)` here — under
+    // the same `.skim-build.lock`, reusing the already-read HEAD — once the
+    // temporal populate path exists. One call, no rework.
+    // ────────────────────────────────────────────────────────────────────────
+
     Ok((true, manifest))
 }
 

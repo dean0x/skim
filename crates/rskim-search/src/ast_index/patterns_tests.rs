@@ -32,6 +32,61 @@ fn f6_at_least_25_patterns() {
     );
 }
 
+/// Exact catalog-count guard: the "29-pattern catalog" referenced in documentation
+/// and CLAUDE.md must stay in sync with the actual array length. Adding or removing
+/// a pattern without updating documentation is a silent contract break.
+///
+/// applies ADR-001: fix noticed issues immediately — the count was hand-maintained
+/// with no test guard, enabling silent drift.
+/// applies PF-005/ADR-003: acceptance criteria must be grounded and actually verified.
+#[test]
+fn f6_exact_catalog_count() {
+    const EXPECTED: usize = 29;
+    assert_eq!(
+        all_patterns().len(),
+        EXPECTED,
+        "catalog must have exactly {EXPECTED} patterns — update CLAUDE.md, README, and \
+         the doc table in patterns.rs if you add or remove patterns"
+    );
+}
+
+/// Per-category count guard: the category breakdown table in patterns.rs and
+/// KNOWLEDGE.md documents 6/5/6/7/5 for ErrorHandling/Performance/Concurrency/Quality/Structure.
+/// This test locks those counts so a category subtotal cannot silently drift.
+///
+/// applies ADR-001: noticed drift risk; fix immediately.
+#[test]
+fn f6_per_category_counts() {
+    let counts = |cat: PatternCategory| -> usize {
+        all_patterns().iter().filter(|p| p.category == cat).count()
+    };
+    assert_eq!(
+        counts(PatternCategory::ErrorHandling),
+        6,
+        "ErrorHandling must have 6 patterns"
+    );
+    assert_eq!(
+        counts(PatternCategory::Performance),
+        5,
+        "Performance must have 5 patterns"
+    );
+    assert_eq!(
+        counts(PatternCategory::Concurrency),
+        6,
+        "Concurrency must have 6 patterns"
+    );
+    assert_eq!(
+        counts(PatternCategory::Quality),
+        7,
+        "Quality must have 7 patterns"
+    );
+    assert_eq!(
+        counts(PatternCategory::Structure),
+        5,
+        "Structure must have 5 patterns"
+    );
+}
+
 #[test]
 fn f6_all_categories_non_empty() {
     let categories = [

@@ -25,11 +25,14 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use clap::Parser;
-use rskim_search::{FileId, LayerBuilder, NgramIndexBuilder, classify_source};
+use rskim_search::{
+    AstIndexBuilder, AstNgramSet, FileId, LayerBuilder, NgramIndexBuilder, StructuralMetrics,
+    classify_source, extract_ast_ngrams_with_metrics, linearize_source,
+};
 
 use super::manifest::{FileManifest, ManifestEntry, decode_field_map, encode_field_map};
 use super::staleness::read_git_head;
@@ -152,11 +155,12 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
 /// # Concurrency
 ///
 /// Acquires an exclusive advisory lock on `{cache_dir}/.skim-build.lock` before
-/// running the pipeline. If another process holds the lock the call blocks until
-/// that build completes and then proceeds with its own build. This serialises
-/// all callers — `skim init` background spawn, git-hook `--update`, and direct
-/// `--build` / `--rebuild` — protecting `index.skidx` and `index.skfiles` from
-/// concurrent writes.
+/// running the pipeline, with a 120-second deadline. If another process holds
+/// the lock, the call polls every 200 ms and prints a one-time notice to stderr
+/// so the user knows why it is waiting. After 120 s the call returns an error
+/// rather than blocking indefinitely. This serialises all callers — `skim init`
+/// background spawn, git-hook `--update`, and direct `--build` / `--rebuild` —
+/// protecting `index.skidx` and `index.skfiles` from concurrent writes.
 ///
 /// The lock is released when the returned [`IndexResult`] (or the `Err`) drops,
 /// i.e. at the end of this function. The lock file itself is never deleted so
@@ -172,9 +176,44 @@ pub(super) fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("failed to open build lock: {}", lock_path.display()))?;
-    lock_file
-        .lock()
-        .with_context(|| "failed to acquire exclusive build lock")?;
+
+    // Bounded lock acquisition: poll every 200 ms for up to 120 s.
+    // `try_lock()` returns Err(TryLockError::WouldBlock) when another process
+    // holds the lock, and Err(TryLockError::Error(_)) on a real OS error.
+    // Drop-based release is preserved — `lock_file` drops at function end.
+    const LOCK_POLL_MS: u64 = 200;
+    const LOCK_DEADLINE_SECS: u64 = 120;
+    let deadline = Instant::now() + Duration::from_secs(LOCK_DEADLINE_SECS);
+    let mut noticed = false;
+    loop {
+        match lock_file.try_lock() {
+            Ok(()) => break, // lock acquired
+            Err(std::fs::TryLockError::WouldBlock) => {
+                // Another process holds the lock.
+                if !noticed {
+                    eprintln!(
+                        "skim search index: waiting for concurrent build to finish \
+                         (lock: {}) …",
+                        lock_path.display()
+                    );
+                    noticed = true;
+                }
+                if Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!(
+                        "another skim build has held {} for >{} s; \
+                         if no build is running, delete the lock file and retry",
+                        lock_path.display(),
+                        LOCK_DEADLINE_SECS,
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(LOCK_POLL_MS));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(anyhow::anyhow!(e))
+                    .with_context(|| "failed to acquire exclusive build lock");
+            }
+        }
+    }
 
     // Lock is held for the duration of the build. `lock_file` drops (and
     // releases the lock) when this function returns.
@@ -201,11 +240,12 @@ pub(super) struct Pipeline<'cfg> {
 const CHANNEL_CAPACITY: usize = 64;
 
 /// Aggregated output from [`Pipeline::consume`].
-struct ConsumeResult {
+#[derive(Debug)]
+pub(super) struct ConsumeResult {
     /// Number of files successfully added to the index.
-    file_count: u32,
+    pub(super) file_count: u32,
     /// Number of files whose cached `field_map` was reused (SHA match).
-    cache_hits: u32,
+    pub(super) cache_hits: u32,
 }
 
 impl<'cfg> Pipeline<'cfg> {
@@ -240,11 +280,18 @@ impl<'cfg> Pipeline<'cfg> {
         let (walk_entries, walk_skip_count) = self.walk()?;
 
         if walk_entries.is_empty() {
-            // Nothing to index — flush an empty index and manifest so that
-            // `check_staleness` can find `index.skidx` and treat the project
-            // as indexed rather than returning `NoIndex` on every query.
+            // Nothing to index — flush empty lexical + AST indexes and manifest
+            // so that `check_staleness` can find `index.skidx` and treat the
+            // project as indexed rather than returning `NoIndex` on every query.
             let builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
             let _layer = builder.build()?;
+            // Also build an empty AST index so self-heal doesn't trigger
+            // immediately after an empty-project build.
+            let ast_builder = AstIndexBuilder::new(self.cache_dir.clone())
+                .map_err(|e| anyhow::anyhow!("failed to create AST index builder: {e}"))?;
+            ast_builder
+                .build()
+                .map_err(|e| anyhow::anyhow!("AST index build failed: {e}"))?;
             let mut manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
             manifest.set_git_head(read_git_head(&self.config.root));
             manifest.save()?;
@@ -261,15 +308,32 @@ impl<'cfg> Pipeline<'cfg> {
         let (producer_handle, rx, producer_skips) =
             Self::spawn_producer(walk_entries, manifest, self.config.force, debug_enabled);
 
-        // Stage 3: Consume processed files, build the index.
+        // Stage 3: Consume processed files, build lexical + AST indexes.
         let mut builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
+        // AST index (#199): build alongside lexical so both share the same FileId
+        // sequence (correctness-critical — see FileId contract in ast_index/builder.rs).
+        // NOTE: both builders retain posting lists until build(); memory scales with
+        // file count (~tens of MB at 10k files) — tracked in #273 for chunked builds.
+        // Re-extract all files each refresh (no incremental cache) — tracked in #290.
+        let mut ast_builder = AstIndexBuilder::new(self.cache_dir.clone())
+            .map_err(|e| anyhow::anyhow!("failed to create AST index builder: {e}"))?;
         let mut new_manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
-        let ConsumeResult {
-            file_count,
-            cache_hits,
-        } = Self::consume(&mut builder, &mut new_manifest, rx, debug_enabled);
+        // Capture consume's result rather than propagating with `?` immediately.
+        // We MUST join the producer before propagating any error so that a worker-thread
+        // panic is surfaced on BOTH the success path AND the ADR-006 abort path.
+        // On the abort path, `rx` is consumed (dropped inside `consume`) before we reach
+        // the join, so the producer's `tx.send()` has already returned `Err` and the
+        // producer thread has already exited — no deadlock risk. (applies ADR-006)
+        let consume_result = Self::consume(
+            &mut builder,
+            &mut ast_builder,
+            &mut new_manifest,
+            rx,
+            debug_enabled,
+        );
 
-        // Wait for the producer to finish and propagate any panic.
+        // Always join the producer first so a worker-thread panic is surfaced
+        // regardless of whether consume succeeded or aborted (ADR-006 desync).
         producer_handle.join().map_err(|e| {
             anyhow::anyhow!(
                 "producer thread panicked: {:?}",
@@ -279,13 +343,57 @@ impl<'cfg> Pipeline<'cfg> {
             )
         })?;
 
-        // Finalize: flush index then write manifest (marks index as coherent).
+        // Now propagate the consume error (if any) — producer is already joined.
+        let ConsumeResult {
+            file_count,
+            cache_hits,
+        } = consume_result?;
+
+        // Commit ordering (crash-safety):
+        // (1) Lexical build — index.skidx + index.skfiles written.
+        // (2) AST build    — ast_index.skpost then ast_index.skidx written.
+        // (3) Manifest save (git HEAD recorded) — the commit point.
+        //
+        // If the AST build fails, the manifest is NOT saved so the next query
+        // sees the index as stale and triggers a full rebuild (self-heal path).
+        // "HEAD recorded ⟹ both indexes coherent" is the invariant.
+        // Commit-boundary invariant: both builders and the manifest must agree on
+        // the file count before we write anything to disk. A mismatch here means
+        // the "every file gets exactly one call" contract was broken somewhere in
+        // the consume loop. Abort before any write so the old manifest survives
+        // and the next query self-heals. (applies ADR-006)
+        //
+        // Why the comparison holds for realistic projects: `manifest_count` is the
+        // number of unique BTreeMap keys (normalized rel-path strings), and
+        // `file_count` is the number of successful `add_file_classified` calls.
+        // They agree when every successfully-indexed file has a distinct normalized
+        // path key — the invariant upheld by `walk_metadata`'s sorted, deduped
+        // output. A mismatch would require two walk entries to normalize to the
+        // same path key, which cannot happen on case-sensitive file-systems and is
+        // a data-corruption signal on case-insensitive ones; hence this guard is
+        // intentionally defensive rather than a common-case check.
+        let manifest_count = new_manifest.entry_count();
+        if manifest_count != file_count as usize {
+            return Err(anyhow::anyhow!(
+                "index commit aborted: manifest entry count ({manifest_count}) != \
+                 consume file count ({file_count}); FileId alignment is broken — \
+                 the old manifest survives and the next query will trigger a full rebuild"
+            ));
+        }
+
         let _layer = builder.build()?;
+        ast_builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("AST index build failed: {e}"))?;
+
         // Record the current git HEAD in the manifest so staleness detection
         // can compare it on the next query without spawning a git subprocess.
         new_manifest.set_git_head(read_git_head(&self.config.root));
         new_manifest.save()?;
 
+        // `producer_handle.join()` above is the happens-before edge: the atomic
+        // load below is only valid after join() returns. Moving this load before
+        // the join would make `producer_skips` racy.
         let total_skipped =
             to_u32_capped(walk_skip_count).saturating_add(producer_skips.load(Ordering::Relaxed));
 
@@ -357,30 +465,49 @@ impl<'cfg> Pipeline<'cfg> {
         (handle, rx, producer_skips)
     }
 
-    /// Stage 3: consume [`ProcessedFile`]s from `rx`, index each one, and build
-    /// the new manifest.
+    /// Stage 3: consume [`ProcessedFile`]s from `rx`, index each one in BOTH
+    /// the lexical and AST indexes, and build the new manifest.
     ///
-    /// Returns aggregated counts. Errors on individual files are fail-soft: the
-    /// file is skipped and indexing continues. On `FileId` overflow the loop
-    /// breaks early and the partial result is returned — the caller's
-    /// `builder.build()` + `new_manifest.save()` still execute, preserving
-    /// the fail-soft contract.
+    /// Returns aggregated counts. Per-file *lexical* errors are fail-soft: the
+    /// file is skipped from BOTH indexes and indexing continues. On `FileId`
+    /// overflow the loop breaks early and the partial result is returned — the
+    /// caller's `builder.build()` + `ast_builder.build()` + `new_manifest.save()`
+    /// still execute, preserving the fail-soft contract.
     ///
-    /// # Invariant
+    /// # Errors
     ///
-    /// `next_file_id` only advances after a successful `add_file_classified`,
-    /// preserving the builder's sequential `FileId` requirement even on errors.
-    fn consume(
+    /// Returns `Err` only when `add_file_ngrams` rejects an AST entry *after* the
+    /// lexical entry for the same `FileId` was already accepted. That can only
+    /// happen if the FileId-alignment invariant is already broken (e.g. a future
+    /// regression in `extract_ast_ngrams` emitting a zero-count n-gram), at which
+    /// point the two indexes are unrecoverably desynced. Aborting here propagates
+    /// up through `run()` so `new_manifest.save()` is NEVER reached — the old
+    /// manifest survives and the next query self-heals via a full rebuild. We do
+    /// NOT silently `continue`, which would advance `next_file_id` and cascade the
+    /// desync into a CRC-valid but corrupt index that gets committed.
+    ///
+    /// # FileId Invariants
+    ///
+    /// 1. `next_file_id` only advances after a successful `add_file_classified`.
+    ///    A lexical-builder error causes a `continue` — the file is excluded from
+    ///    BOTH indexes, keeping them in sync.
+    /// 2. AST entries are ALWAYS inserted (even on linearization error) via an
+    ///    empty `AstNgramSet` + zero node_count + default metrics. This preserves
+    ///    the AST builder's "every file gets exactly one call" contract and prevents
+    ///    FileId desync between the lexical and AST indexes.
+    pub(super) fn consume(
         builder: &mut NgramIndexBuilder,
+        ast_builder: &mut AstIndexBuilder,
         new_manifest: &mut FileManifest,
         rx: crossbeam_channel::Receiver<ProcessedFile>,
         debug_enabled: bool,
-    ) -> ConsumeResult {
+    ) -> anyhow::Result<ConsumeResult> {
         let mut next_file_id: u32 = 0;
         let mut cache_hits: u32 = 0;
 
         for pf in rx {
-            // Fail-soft: a builder error on one file must not abort a 50 K-file build.
+            // Fail-soft: a lexical builder error on one file must not abort a
+            // 50 K-file build. Skip the file from BOTH indexes (keeps FileIds in sync).
             if let Err(e) = builder.add_file_classified(
                 FileId(next_file_id),
                 &pf.content,
@@ -394,7 +521,38 @@ impl<'cfg> Pipeline<'cfg> {
                     );
                 }
                 // Do NOT increment next_file_id — invariant preserved.
+                // Do NOT add an AST entry either — file excluded from both indexes.
                 continue;
+            }
+
+            // AST index: derive n-grams (step 2 of 4-step loop contract).
+            // Fail-soft: on ANY error, returns an empty aligned entry so AST FileIds
+            // stay in sync with lexical FileIds. NEVER skips — see derive_ast_entry.
+            let (ast_set, ast_metrics, ast_node_count) =
+                derive_ast_entry(&pf.content, pf.lang, &pf.rel_path, debug_enabled);
+
+            // Add the AST entry for this file. The lexical entry for the SAME
+            // FileId was already accepted, so an error here means the indexes are
+            // now desynced for `next_file_id`. This is unrecoverable: abort the
+            // whole build (propagates to run() BEFORE new_manifest.save()), so the
+            // old manifest survives and the next query self-heals via a full
+            // rebuild. Silently continuing would advance next_file_id and cascade
+            // the desync into a committed-but-corrupt index. See the FileId-
+            // alignment invariant in the function doc.
+            if let Err(e) = ast_builder.add_file_ngrams(
+                FileId(next_file_id),
+                pf.lang,
+                &ast_set,
+                ast_node_count,
+                ast_metrics,
+            ) {
+                return Err(anyhow::anyhow!(
+                    "AST index desync: add_file_ngrams failed for {:?} at FileId {}: {e} \
+                     (lexical entry already written; aborting build so the manifest is \
+                     not saved and the next query rebuilds from scratch)",
+                    pf.rel_path,
+                    next_file_id
+                ));
             }
 
             // Success: advance counter.
@@ -426,10 +584,10 @@ impl<'cfg> Pipeline<'cfg> {
             // `pf.content` dropped here — memory released immediately.
         }
 
-        ConsumeResult {
+        Ok(ConsumeResult {
             file_count: next_file_id,
             cache_hits,
-        }
+        })
     }
 }
 
@@ -540,6 +698,57 @@ fn run_classify(
                 );
             }
             Vec::new()
+        }
+    }
+}
+
+/// Derive the AST n-gram entry for one file.
+///
+/// Returns `(AstNgramSet, StructuralMetrics, node_count)`.
+///
+/// # Error policy (fail-soft)
+///
+/// On ANY error (grammar load failure, linearization error, or an Ok-but-empty
+/// result for non-tree-sitter languages / large files / empty content), this
+/// function returns an empty-but-valid triple so the caller can still insert an
+/// ALIGNED EMPTY ENTRY into the AST builder. It never panics and never propagates
+/// an error — doing so would either abort the whole build (wrong for a per-file
+/// parse error) or skip the AST call entirely (which desynchronises FileIds).
+///
+/// The fail-loud path lives in [`Pipeline::consume`]: once the lexical entry for
+/// a FileId has been accepted, a failure from `add_file_ngrams` is unrecoverable
+/// (the two indexes are now desynced). That is the only place where abort is
+/// correct. This helper is deliberately infallible so the loop body reads as its
+/// 4-step contract: lexical-add-or-continue → derive → ast-add-or-abort → advance.
+fn derive_ast_entry(
+    content: &str,
+    lang: rskim_core::Language,
+    rel_path: &Path,
+    debug: bool,
+) -> (AstNgramSet, StructuralMetrics, u32) {
+    match linearize_source(content, lang) {
+        Ok(lin) if !lin.nodes.is_empty() => {
+            let (set, metrics) = extract_ast_ngrams_with_metrics(&lin.nodes, lang);
+            // Applies PF-004: explicit try_from, not `as u32`.
+            let node_count = u32::try_from(lin.nodes.len()).unwrap_or(u32::MAX);
+            (set, metrics, node_count)
+        }
+        Ok(_empty) => {
+            // Non-tree-sitter lang (JSON/YAML/TOML), file >100KiB,
+            // empty source, or parse-only-error result — empty aligned entry.
+            (AstNgramSet::default(), StructuralMetrics::default(), 0u32)
+        }
+        Err(e) => {
+            // Grammar load failure (SearchError::Ast) — only unrecoverable
+            // error path from linearize_source. Still return empty aligned entry
+            // so FileIds stay in sync with the lexical index.
+            if debug {
+                eprintln!(
+                    "skim search index [debug]: linearize_source failed for {:?}: {e}",
+                    rel_path
+                );
+            }
+            (AstNgramSet::default(), StructuralMetrics::default(), 0u32)
         }
     }
 }

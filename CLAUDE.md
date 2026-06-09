@@ -166,7 +166,7 @@ cargo fmt -- --check           # Format check
 
 **Analysis:**
 - `heatmap` — Git history risk/coupling analysis: churn, co-change coupling, stability scores, author concentration, fix-after-touch, module encapsulation (`--json`, `--since`, `--last`, `--window`, `--path`, `--top`, `--insights`)
-- `search` — n-gram code search over the project index. Build/update index with `skim search index` (`--force`, `--root`, `--max-files`). Query with `skim search <query>` (`--limit`, `--root`, `--json`, `--stats`, `--install-hooks`, `--remove-hooks`, `--build`, `--rebuild`, `--update`). Temporal sort/filter flags: `--hot` (sort by hotspot score), `--cold` (invert hotspot sort), `--risky` (sort by fix-risk score), `--blast-radius FILE` (pre-filter to co-change peers of FILE).
+- `search` — n-gram code search over the project index. Build/update index with `skim search index` (`--force`, `--root`, `--max-files`). Query with `skim search <query>` (`--limit`, `--root`, `--json`, `--stats`, `--install-hooks`, `--remove-hooks`, `--build`, `--rebuild`, `--update`). Temporal sort/filter flags: `--hot` (sort by hotspot score), `--cold` (invert hotspot sort), `--risky` (sort by fix-risk score), `--blast-radius FILE` (pre-filter to co-change peers of FILE). AST structural pattern flag: `--ast <pattern>` (named pattern from 29-pattern catalog, e.g. `try-catch`, `nested-loop`, `god-function`; or containment query `for_statement > block`; composable with text query and `--blast-radius`; standalone `skim search --ast try-catch`; `--ast` + temporal sort flags → #202 error; single-node queries → #283 error).
 
 **Multi-category dispatchers:**
 - `cargo` — Rust toolchain compression: test, build, check, fmt, clippy, audit, nextest

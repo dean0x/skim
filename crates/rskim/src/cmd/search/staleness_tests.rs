@@ -42,6 +42,16 @@ fn create_ref_file(dir: &std::path::Path, ref_path: &str, sha: &str) {
     fs::write(&full_path, format!("{sha}\n")).unwrap();
 }
 
+/// Write a minimal valid AST index stub file in `cache_dir`.
+///
+/// `index_version` reads the first 6 bytes: magic `SKAX` + version u16 LE.
+/// Writing version 2 (the current format) prevents the AST self-heal from
+/// reporting `NoStoredHead` in unit tests that only stub the lexical index.
+fn write_ast_index_stub(cache_dir: &std::path::Path) {
+    // b"SKAX" = magic (4 bytes), 0x02 0x00 = version 2 in little-endian.
+    fs::write(cache_dir.join("ast_index.skidx"), b"SKAX\x02\x00").unwrap();
+}
+
 /// Write a manifest with the given git_head into `cache_dir`.
 fn write_manifest_with_head(
     root: &std::path::Path,
@@ -248,6 +258,8 @@ fn test_check_staleness_current_when_heads_match() {
 
     write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
     fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    // AST stub required so self-heal does not trigger before HEAD comparison.
+    write_ast_index_stub(&cache_dir);
 
     let (result, _) = check_staleness(&cache_dir, dir.path());
     assert!(
@@ -266,6 +278,8 @@ fn test_check_staleness_head_changed() {
 
     write_manifest_with_head(dir.path(), &cache_dir, Some(stored_sha));
     fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    // AST stub required so self-heal does not trigger before HEAD comparison.
+    write_ast_index_stub(&cache_dir);
 
     let (result, _) = check_staleness(&cache_dir, dir.path());
     match result {
@@ -284,6 +298,8 @@ fn test_check_staleness_non_git_project_is_current() {
     // No .git directory — non-git project
     write_manifest_with_head(dir.path(), &cache_dir, None);
     fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    // AST stub required so self-heal does not trigger before HEAD comparison.
+    write_ast_index_stub(&cache_dir);
 
     // Non-git: stored HEAD = None, current HEAD = None → Current (no rebuild loop).
     let (result, _) = check_staleness(&cache_dir, dir.path());
@@ -302,6 +318,8 @@ fn test_check_staleness_unreadable_git_is_current() {
     // Manifest records a HEAD (was a git repo at build time), but .git is absent now.
     write_manifest_with_head(dir.path(), &cache_dir, Some(stored_sha));
     fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    // AST stub required so self-heal does not trigger before HEAD comparison.
+    write_ast_index_stub(&cache_dir);
     // No .git directory — simulates git becoming unreadable.
 
     // stored HEAD = Some, current HEAD = None → Current (don't trigger rebuild).
@@ -328,6 +346,85 @@ fn test_check_staleness_git_appeared_triggers_rebuild() {
     assert!(
         matches!(result, StalenessCheck::NoStoredHead),
         "git appeared since last build → NoStoredHead, got {result:?}"
+    );
+}
+
+// ============================================================================
+// check_staleness — AST self-heal manifest passthrough (Issue 2 fix guard)
+// ============================================================================
+
+/// When the lexical index exists and the manifest has a real git HEAD, but the
+/// AST index is absent, check_staleness must return NoStoredHead (to trigger
+/// rebuild) AND return the loaded manifest — NOT None.
+///
+/// Previously check_staleness returned (NoStoredHead, None) in this case,
+/// causing `--stats` to report "git HEAD: (none)" even though the HEAD was
+/// recorded in the manifest. The HEAD was there; only the AST index was missing.
+#[test]
+fn test_check_staleness_ast_stale_still_returns_manifest() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().to_path_buf();
+    let sha = "aabb1122aabb1122aabb1122aabb1122aabb1122";
+    create_fake_git_repo(dir.path(), &format!("{sha}\n"));
+
+    // Write a manifest with a real HEAD, plus a lexical index stub.
+    write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
+    fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    // Deliberately NO ast_index.skidx — simulates missing AST index.
+
+    let (result, manifest) = check_staleness(&cache_dir, dir.path());
+
+    // Outcome must be stale (rebuild triggered).
+    assert!(
+        !matches!(result, StalenessCheck::Current),
+        "missing AST index must trigger stale outcome, got {result:?}"
+    );
+    assert!(
+        matches!(result, StalenessCheck::NoStoredHead),
+        "missing AST index should return NoStoredHead, got {result:?}"
+    );
+
+    // The manifest must be Some — the real HEAD must be accessible to display consumers.
+    assert!(
+        manifest.is_some(),
+        "check_staleness must return the manifest even when AST is stale (Issue 2 fix)"
+    );
+    assert_eq!(
+        manifest.unwrap().stored_git_head(),
+        Some(sha),
+        "--stats must show the real git HEAD even when only the AST index is missing"
+    );
+}
+
+/// Same as above but with a below-FORMAT_VERSION AST stub instead of absent file.
+#[test]
+fn test_check_staleness_ast_below_version_still_returns_manifest() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().to_path_buf();
+    let sha = "ccdd3344ccdd3344ccdd3344ccdd3344ccdd3344";
+    create_fake_git_repo(dir.path(), &format!("{sha}\n"));
+
+    write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
+    fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    // Write a v1 AST stub (below current AST_INDEX_FORMAT_VERSION).
+    let stub: [u8; 6] = [b'S', b'K', b'A', b'X', 1, 0];
+    fs::write(cache_dir.join("ast_index.skidx"), stub).unwrap();
+
+    let (result, manifest) = check_staleness(&cache_dir, dir.path());
+
+    assert!(
+        !matches!(result, StalenessCheck::Current),
+        "below-version AST index must trigger stale outcome, got {result:?}"
+    );
+
+    assert!(
+        manifest.is_some(),
+        "check_staleness must return the manifest for below-version AST index"
+    );
+    assert_eq!(
+        manifest.unwrap().stored_git_head(),
+        Some(sha),
+        "--stats must show real HEAD when only the AST format version is outdated"
     );
 }
 

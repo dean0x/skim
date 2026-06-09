@@ -1,7 +1,7 @@
 ---
 feature: cochange
 name: Co-Change Matrix
-description: "Use when implementing co-change coupling queries, modifying the .skcc binary format, adding new query methods to CochangeMatrixReader, debugging Jaccard similarity calculations, or working with the SQLite temporal persistence layer for co-change pairs. Keywords: cochange, co-change, coupling, jaccard, skcc, binary format, cochange.skcc, CochangeMatrixBuilder, CochangeMatrixReader, CochangeRow, TemporalDb, HistoryResult, COUPLING_MAX_FILES, builder_tests, format_tests, reader_tests, test_helpers."
+description: "Use when implementing co-change coupling queries, modifying the .skcc binary format, adding new query methods to CochangeMatrixReader, debugging Jaccard similarity calculations, or working with the SQLite temporal persistence layer for co-change pairs. Keywords: cochange, co-change, coupling, jaccard, skcc, binary format, cochange.skcc, CochangeMatrixBuilder, CochangeMatrixReader, CochangeRow, TemporalDb, HistoryResult, COUPLING_MAX_FILES, builder_tests, format_tests, reader_tests, test_helpers, atomic_write, io_util, MIN_JACCARD_THRESHOLD, cochanges_for_file, UNION ALL."
 category: domain-knowledge
 directories: [crates/rskim-search/src/cochange/]
 referencedFiles:
@@ -19,7 +19,8 @@ referencedFiles:
   - crates/rskim-search/src/temporal/storage_types.rs
   - crates/rskim-search/src/temporal/storage_ops.rs
 created: 2026-05-24
-updated: 2026-06-07
+updated: 2026-06-09
+version: 2
 ---
 
 # Co-Change Matrix
@@ -27,14 +28,14 @@ updated: 2026-06-07
 ## Overview
 
 The co-change matrix captures file coupling signals from git history: when two files change
-together frequently, they have a high coupling score. The subsystem produces a single binary file
-(`cochange.skcc`) from a `HistoryResult` and provides a memory-mapped reader for Jaccard similarity
-queries and top-K partner retrieval.
+together frequently, they have a high coupling score. The subsystem produces a single binary
+file (`cochange.skcc`) from a `HistoryResult` and provides a memory-mapped reader for Jaccard
+similarity queries and top-K partner retrieval.
 
 The module is intentionally separate from the `LayerBuilder`/`SearchLayer` trait pair — it
-consumes a pre-parsed `HistoryResult` rather than raw file content, because the signal comes from
-commit graphs, not file bytes. This separation is explicit in the builder's doc comment and is a
-deliberate design constraint to preserve.
+consumes a pre-parsed `HistoryResult` rather than raw file content, because the signal comes
+from commit graphs, not file bytes. This separation is explicit in the builder's doc comment
+and is a deliberate design constraint to preserve.
 
 ## Test Module Organization
 
@@ -89,7 +90,8 @@ alongside `hotspot` and `risk` data.
 ### Canonical pair ordering
 
 Every co-change pair is stored as `(min(a, b), max(a, b))`. This invariant is enforced during
-accumulation by `accumulate_pairs` and verified with `debug_assert!` in the hot path. The reader's
+accumulation: `ids` are sorted and deduplicated before pair generation, so `a = ids[i]` and
+`b = ids[j]` with `i < j` guarantees `a < b` without calling `.min()` / `.max()`. The reader's
 `pair_count` and `jaccard` methods call `canonicalize()` before any lookup, so callers can pass
 IDs in either order without getting misses.
 
@@ -168,7 +170,7 @@ The `.skcc` file is a flat concatenation of three sections:
 
 All integers are little-endian. The CRC32 checksum covers the `FileCommitEntry` array bytes
 concatenated with the `PairEntry` array bytes. When a format-breaking change is needed, increment
-`FORMAT_VERSION` in `format.rs`.
+`FORMAT_VERSION` in `format.rs` (currently `1`).
 
 ### Atomic write contract
 
@@ -177,6 +179,17 @@ previously inline function into a shared helper). The helper uses `tempfile::Nam
 writes all bytes, calls `sync_all()` to flush to storage (crash safety), sets `0o644` permissions
 on Unix, and then calls `.persist(path)` (a rename) so readers never observe a partially written file.
 The `ast_index` store builder uses the same `atomic_write` helper.
+
+### `generate_pairs` capacity guard
+
+`generate_pairs` uses the `Entry` API for a single hash probe in the common (under-capacity) case.
+When the map is already full (`pair_counts.len() >= max_pairs`), the function allows incrementing
+existing entries but returns `SearchError::CapacityExceeded` if a new distinct pair would be added.
+This prevents memory growth from exceeding `max_pairs` while still accurately counting pairs already
+accumulated.
+
+The public `build` method calls `build_with_limit(history, path_map, MAX_PAIRS)`. The
+`pub(crate)` `build_with_limit` accepts a custom limit so tests can trigger the cap cheaply.
 
 ### SQLite co-change table schema
 
@@ -190,8 +203,38 @@ CREATE TABLE cochange (
 );
 ```
 
+Performance index (added in temporal schema **v2**):
+```sql
+CREATE INDEX IF NOT EXISTS idx_cochange_file_b ON cochange(file_b);
+```
+
+There is **no** `idx_cochange_file_b` on `file_a` — the composite PRIMARY KEY `(file_a, file_b)`
+already serves `file_a = ?` prefix queries. The `idx_cochange_file_b` secondary index enables
+efficient lookup of rows where `file_b` matches a given path.
+
 `file_a` is always lexically less than or equal to `file_b`. Both `store_cochanges` and `sync` use
-DELETE + batch INSERT in a single transaction.
+DELETE + batch INSERT in a single transaction. An `insert_cochanges_in_tx` helper enforces the
+`file_a < file_b` invariant via `debug_assert!`.
+
+### `cochanges_for_file` (SQLite query)
+
+The `TemporalDb::cochanges_for_file` method uses `UNION ALL` of two indexed sub-queries rather
+than `OR`:
+
+```sql
+SELECT file_a, file_b, count, jaccard FROM cochange
+  WHERE file_a = ?1 AND jaccard >= ?2
+UNION ALL
+SELECT file_a, file_b, count, jaccard FROM cochange
+  WHERE file_b = ?1 AND jaccard >= ?2
+ORDER BY jaccard DESC LIMIT 10000
+```
+
+- `?1` = the query path; `?2` = `MIN_JACCARD_THRESHOLD = 0.10`
+- `UNION ALL` (not `UNION`): the canonical ordering `file_a < file_b` means no row can satisfy
+  both arms, so deduplication is unnecessary and `ALL` avoids the extra sort.
+- Pairs with `jaccard < 0.10` are filtered out — they are noise with no predictive coupling signal
+  (empirically validated in benchmark #191).
 
 ## Error Handling
 
@@ -205,7 +248,7 @@ DELETE + batch INSERT in a single transaction.
 ## Anti-Patterns
 
 - **Skipping the `NamedTempFile` + `sync_all` + persist pattern** exposes readers to partial
-  writes on process interrupt. Always use atomic write.
+  writes on process interrupt. Always use `atomic_write`.
 - **Using the raw `u32` file IDs directly** instead of `FileId` wrappers breaks type safety.
 - **Treating `pairs_for_file` as an O(n) operation** — it is O(log n + k). Do not avoid it on
   the assumption it scans the full pair array.
@@ -215,6 +258,8 @@ DELETE + batch INSERT in a single transaction.
   through `CochangeMatrixReader`.
 - **Adding tests inline in the implementation files** — tests live in `*_tests.rs` companion files
   and `test_helpers.rs`. Follow the existing split.
+- **Adding `idx_cochange_file_a` to the temporal schema** — the PRIMARY KEY `(file_a, file_b)`
+  already covers file_a prefix queries; a secondary index is redundant and wastes space.
 
 ## Gotchas
 
@@ -227,23 +272,31 @@ DELETE + batch INSERT in a single transaction.
   immediately directing the caller to rebuild.
 - `SearchError::CapacityExceeded` (not `IndexCorrupted`) is returned when `MAX_PAIRS` is hit.
 - `TemporalDb` is not `Sync`. Each thread must open its own connection.
-- `CochangeRow::count` is `i64` (SQLite integer), not `u32`. Cast carefully when bridging.
+- `CochangeRow::count` is **`u32`** in `storage_types.rs` — rusqlite maps the SQLite INTEGER
+  column to `u32` via `row.get(2)?`. No `i64` cast is needed when reading from the database.
+- `cochanges_for_file` via `TemporalDb` only returns pairs with Jaccard ≥ `MIN_JACCARD_THRESHOLD`
+  (0.10). To see all pairs regardless of Jaccard, use `CochangeMatrixReader::pairs_for_file`
+  (the binary `.skcc` reader has no Jaccard filter).
+- `TemporalDb::cochanges_for_file` caps results at 10,000 rows. For files with very many co-change
+  partners (e.g., a shared constants file), callers will see only the top 10,000 by Jaccard.
 
 ## Key Files
 
 - `crates/rskim-search/src/cochange/format.rs` — pure binary codec; extend here when adding
-  fields to the on-disk format
-- `crates/rskim-search/src/cochange/builder.rs` — accumulation logic and atomic write;
-  `COUPLING_MAX_FILES` and `MAX_PAIRS` constants live here
+  fields to the on-disk format; `FORMAT_VERSION = 1`
+- `crates/rskim-search/src/cochange/builder.rs` — accumulation logic, `generate_pairs`, and
+  atomic write; `COUPLING_MAX_FILES = 50` and `MAX_PAIRS = 2_000_000` constants live here
 - `crates/rskim-search/src/cochange/reader.rs` — memory-mapped query API; `pairs_for_file` uses
-  binary search
+  binary search; offsets cached at `open()` time
 - `crates/rskim-search/src/cochange/mod.rs` — public re-exports; usage doc example
 - `crates/rskim-search/src/cochange/test_helpers.rs` — `build_matrix()` helper for tests
-- `crates/rskim-search/src/temporal/storage_types.rs` — `CochangeRow`, `HotspotRow`, `RiskRow`
+- `crates/rskim-search/src/temporal/storage_types.rs` — `CochangeRow` (count: u32), `HotspotRow`, `RiskRow`
 - `crates/rskim-search/src/temporal/storage.rs` — `TemporalDb` struct, schema migrations, WAL
-- `crates/rskim-search/src/temporal/storage_ops.rs` — `store_cochanges`, `load_cochanges`, `sync`
+- `crates/rskim-search/src/temporal/storage_ops.rs` — `store_cochanges`, `load_cochanges`,
+  `cochanges_for_file` with `MIN_JACCARD_THRESHOLD = 0.10` and `LIMIT 10000`
 - `crates/rskim-search/src/types.rs` — `CochangeStats`, `HistoryResult`, `FileId`, `SearchError`
 - `crates/rskim-search/src/lib.rs` — re-exports public crate API
+- `crates/rskim-search/src/io_util.rs` — `atomic_write` shared helper (NamedTempFile + sync_all + persist)
 
 ## Related
 
@@ -256,7 +309,3 @@ DELETE + batch INSERT in a single transaction.
   two-file mmap'd on-disk index (magic `b"SKAX"`, v2) for AST structural n-grams, built with the
   identical `NamedTempFile` + `sync_all` + `persist` atomic-write contract and CRC32-validated
   binary-search reader. Mirror its `format.rs`/`builder.rs`/`reader.rs` split when evolving `.skcc`.
-  As of Wave 3f (#197), `ast_index` additionally exports `AstQuery`, `AstQueryEngine`,
-  `AstPostingSource`, `parse_ast_query`, `AST_BM25_K1`, `AST_BM25_B` at both the `ast_index` and
-  crate-root levels. `Pattern`, `PatternCategory`, `StructuralMetrics`, and
-  `extract_ast_ngrams_with_metrics` remain accessible only via `rskim_search::ast_index::`.

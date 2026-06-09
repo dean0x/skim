@@ -13,6 +13,7 @@
 //! - `hooks` — git hook installation/removal
 //! - `rskim-search` crate — index building, n-gram extraction, BM25F scoring
 
+mod ast;
 pub(crate) mod hooks;
 mod index;
 mod manifest;
@@ -64,6 +65,29 @@ pub(crate) fn run(
     // Parse flags — propagate errors (invalid --limit, unrecognised flags, etc.).
     let flags = parse_flags(args)?;
 
+    // ── Validation order (deterministic — tests rely on this ordering) ──────
+    // 1. --ast + temporal flags (--hot/--cold/--risky/--blast-radius) → #202 error.
+    //    (--blast-radius is a co-change filter and IS composable with --ast per the
+    //     plan, but the plan also says --ast + temporal_sort → #202.  --blast-radius
+    //     alone is handled in run_query via FileId intersection — not an error.)
+    // 2. single-node pattern → #283 error.
+    // 3. unknown pattern → lists available names.
+    // Dispatch happens after validation passes.
+    if let Some(ref raw_ast) = flags.ast {
+        // Validation #1: --ast + temporal sort is not yet supported (#202).
+        if let Some(sort) = flags.temporal_sort {
+            anyhow::bail!(
+                "--ast and {} are not yet composable (tracked in #202).\n\
+                 Use --ast alone or use {} without --ast.",
+                sort.flag_name(),
+                sort.flag_name()
+            );
+        }
+        // Validations #2 and #3: single-node (#283) + unknown pattern.
+        ast::validate_ast_pattern(raw_ast)?;
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     match flags.action {
         SearchAction::Build => run_build(false, &flags.root_override, analytics),
         SearchAction::Rebuild => run_build(true, &flags.root_override, analytics),
@@ -72,7 +96,53 @@ pub(crate) fn run(
         SearchAction::InstallHooks => run_install_hooks(&flags.root_override),
         SearchAction::RemoveHooks => run_remove_hooks(&flags.root_override),
         SearchAction::Query(ref text) if !text.is_empty() => run_query(text, &flags, analytics),
-        // Empty query with temporal flags → standalone temporal dispatch.
+        // Empty query + --ast (with or without --blast-radius) → standalone AST dispatch.
+        //
+        // When --blast-radius is also set, temporal::resolve_blast_radius_file_ids
+        // resolves co-change peers via the temporal DB, converts them to FileIds, and
+        // run_ast_standalone intersects with the AST result set BEFORE applying --limit
+        // (avoids PF-006 silent feature-drop).
+        //
+        // --ast + temporal sort (--hot/--cold/--risky) is still rejected above (#202).
+        SearchAction::Query(_)
+            if let Some(ref raw) = flags.ast
+                && flags.temporal_sort.is_none() =>
+        {
+            let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
+            std::fs::create_dir_all(&cache_dir)?;
+            // Ensure both indexes are fresh before querying.
+            let (_refreshed, manifest) =
+                staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+            // Resolve blast-radius → FileIds BEFORE calling run_ast_standalone.
+            // temporal::resolve_blast_radius_file_ids is the single resolver for all
+            // three blast-radius call sites, so JSON-aware warning and PF-004 widening
+            // live in one place.
+            let sorted = manifest.sorted_paths();
+            let blast_file_ids = temporal::resolve_blast_radius_file_ids(
+                flags.blast_radius.as_deref(),
+                &root,
+                &cache_dir.join("temporal.db"),
+                &sorted,
+                flags.json,
+            )?;
+            // Note: validate_ast_pattern was already called above (line ~87) as part
+            // of the pre-dispatch validation order. run_ast_standalone re-validates
+            // internally so it is independently callable without a prior validate call
+            // (defensive re-validation is intentional — it is cheap and idempotent).
+            let mut stdout = BufWriter::new(std::io::stdout());
+            let result = ast::run_ast_standalone(
+                raw,
+                flags.limit,
+                flags.json,
+                &cache_dir,
+                &manifest,
+                blast_file_ids,
+                &mut stdout,
+            );
+            stdout.flush()?;
+            result
+        }
+        // Empty query with temporal flags (no --ast) → standalone temporal dispatch.
         SearchAction::Query(_) if flags.temporal_sort.is_some() || flags.blast_radius.is_some() => {
             run_temporal_standalone(
                 flags.limit,
@@ -121,6 +191,12 @@ struct Flags {
     temporal_sort: Option<types::TemporalSort>,
     /// Raw path for blast-radius pre-filtering. Normalized later in run_query.
     blast_radius: Option<String>,
+    /// Raw AST pattern string for structural pattern search (#199).
+    ///
+    /// Validated at dispatch time (before opening the index).  Space-separated
+    /// `--ast try-catch` and equals form `--ast=try-catch` are both accepted.
+    /// Whitespace-only values are rejected in `parse_flags`.
+    ast: Option<String>,
 }
 
 /// Parse and validate a `--limit` value string.
@@ -186,6 +262,50 @@ fn parse_temporal_flag(
     }
 }
 
+/// Extract a value from a flag that supports both space-separated and equals forms.
+///
+/// Handles `--flag value` (space-separated) and `--flag=value` (equals) forms.
+/// Returns `(value, consumed_next)` where:
+/// - `value` is the trimmed non-empty string value.
+/// - `consumed_next` is `true` when the space-separated form consumed the next token
+///   (the caller must advance `i` by one extra position).
+///
+/// # Errors
+///
+/// Returns `Err` when the value token is absent (space form) or empty/whitespace-only
+/// (both forms).
+///
+/// # Examples
+///
+/// ```text
+/// take_flag_value("--ast=try-catch", None, "--ast")           → Ok(("try-catch", false))
+/// take_flag_value("--ast", Some("try-catch"), "--ast")         → Ok(("try-catch", true))
+/// take_flag_value("--ast", None, "--ast")                      → Err(…missing…)
+/// take_flag_value("--ast=  ", None, "--ast")                   → Err(…empty…)
+/// ```
+fn take_flag_value(
+    arg: &str,
+    next_arg: Option<&String>,
+    flag: &str,
+) -> anyhow::Result<(String, bool)> {
+    let prefix = format!("{flag}=");
+    if let Some(val) = arg.strip_prefix(&prefix) {
+        let trimmed = val.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("{flag} value must not be empty or whitespace-only");
+        }
+        return Ok((trimmed.to_string(), false));
+    }
+    // Space-separated form: the value is in the next token.
+    let val =
+        next_arg.ok_or_else(|| anyhow::anyhow!("{flag} requires a value (e.g. {flag} <value>)"))?;
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{flag} value must not be empty or whitespace-only");
+    }
+    Ok((trimmed.to_string(), true))
+}
+
 /// Parse the flags from `args`.
 ///
 /// # Errors
@@ -194,6 +314,7 @@ fn parse_temporal_flag(
 /// - `--limit` / `-n` value that is not a valid `usize`.
 /// - `--limit=<value>` with a non-numeric value.
 /// - `--root` without a following value.
+/// - `--ast` without a value or with a whitespace-only value.
 /// - Unrecognised flags (tokens beginning with `--`).
 fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut action_flag: Option<SearchAction> = None;
@@ -203,6 +324,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut query_parts: Vec<String> = Vec::new();
     let mut temporal_sort: Option<types::TemporalSort> = None;
     let mut blast_radius: Option<String> = None;
+    let mut ast: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -214,26 +336,31 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
             "--install-hooks" => action_flag = Some(SearchAction::InstallHooks),
             "--remove-hooks" => action_flag = Some(SearchAction::RemoveHooks),
             "--json" | "-j" => json = true,
-            "--limit" | "-n" => {
-                i += 1;
-                let raw = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--limit requires a value (e.g. --limit 10)"))?;
-                limit = parse_limit_value(raw)?;
+            s if s == "--limit" || s == "-n" || s.starts_with("--limit=") => {
+                // Both space-separated (`--limit 10`, `-n 10`) and equals (`--limit=10`)
+                // forms are handled by take_flag_value — same idiom as --root and --ast.
+                // `-n` is a short alias; errors always say "--limit" for consistency.
+                // `-n` has no equals form so the "--limit=" prefix never fires for it.
+                let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--limit")?;
+                limit = parse_limit_value(&raw)?;
+                if consumed {
+                    i += 1;
+                }
             }
-            "--root" => {
-                i += 1;
-                let val = args.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--root requires a path value (e.g. --root /path/to/project)")
-                })?;
+            s if s == "--root" || s.starts_with("--root=") => {
+                let (val, consumed) = take_flag_value(s, args.get(i + 1), "--root")?;
                 root_override = Some(PathBuf::from(val));
+                if consumed {
+                    i += 1;
+                }
             }
-            s if s.starts_with("--limit=") => {
-                let raw = s.trim_start_matches("--limit=");
-                limit = parse_limit_value(raw)?;
-            }
-            s if s.starts_with("--root=") => {
-                root_override = Some(PathBuf::from(s.trim_start_matches("--root=")));
+            s if s == "--ast" || s.starts_with("--ast=") => {
+                // Space-separated (`--ast try-catch`) and equals (`--ast=try-catch`) forms.
+                let (val, consumed) = take_flag_value(s, args.get(i + 1), "--ast")?;
+                ast = Some(val);
+                if consumed {
+                    i += 1;
+                }
             }
             s if matches!(s, "--hot" | "--cold" | "--risky" | "--blast-radius")
                 || s.starts_with("--blast-radius=") =>
@@ -248,7 +375,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                 anyhow::bail!(
                     "unrecognised flag {:?}. Valid flags: --build, --rebuild, --update, \
                      --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --root, \
-                     --hot, --cold, --risky, --blast-radius",
+                     --ast, --hot, --cold, --risky, --blast-radius",
                     s
                 );
             }
@@ -267,6 +394,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
         root_override,
         temporal_sort,
         blast_radius,
+        ast,
     })
 }
 
@@ -410,55 +538,6 @@ fn run_remove_hooks(root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode>
 // Query execution
 // ============================================================================
 
-/// Resolve blast-radius partner paths from the temporal database.
-///
-/// Returns co-change partners **plus the target file itself**, so text queries
-/// like `skim search auth --blast-radius src/auth.rs` surface matches within
-/// `src/auth.rs` in addition to its co-change partners.
-///
-/// Returns `None` when no blast-radius was requested, or when the temporal DB
-/// is unavailable.  When `json` is true the warning is emitted as a JSON
-/// object to stdout (consistent with the JSON degradation path in
-/// `run_temporal_standalone`); otherwise it goes to stderr.
-fn resolve_blast_radius_filter(
-    blast_radius: Option<&str>,
-    temporal_db: &Option<rskim_search::TemporalDb>,
-    root: &std::path::Path,
-    json: bool,
-) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
-    let raw_path = match blast_radius {
-        Some(p) => p,
-        None => return Ok(None),
-    };
-
-    let db = match temporal_db {
-        Some(db) => db,
-        None => {
-            const MSG: &str = "no temporal data — run 'skim heatmap' to populate";
-            if json {
-                let w = WarningJson { warning: MSG };
-                println!("{}", serde_json::to_string(&w)?);
-            } else {
-                eprintln!("skim search: {MSG}");
-            }
-            return Ok(None);
-        }
-    };
-
-    let normalized = temporal::normalize_blast_radius_path(raw_path, root)?;
-    let partners = db.cochanges_for_file(&normalized)?;
-    if partners.is_empty() {
-        eprintln!("skim search: no co-change data for {raw_path:?}");
-    }
-
-    // Include the target file itself so text queries like
-    // `skim search auth --blast-radius src/auth.rs` surface matches
-    // within src/auth.rs in addition to its co-change partners.
-    let mut paths = temporal::cochange_partner_paths(&partners, &normalized);
-    paths.insert(normalized);
-    Ok(Some(paths))
-}
-
 fn run_query(
     text: &str,
     flags: &Flags,
@@ -487,12 +566,53 @@ fn run_query(
     // is applied inside the search engine (before LIMIT). This ensures the
     // limit applies to the filtered set rather than silently discarding
     // co-change partners that ranked beyond the top-N unfiltered results.
-    let blast_radius_paths = resolve_blast_radius_filter(
+    let blast_radius_paths = temporal::resolve_blast_radius_paths(
         flags.blast_radius.as_deref(),
-        &temporal_db,
         &root,
+        &cache_dir.join("temporal.db"),
         flags.json,
     )?;
+
+    // Resolve AST file filter (#199): ensure both indexes are fresh (self-heal),
+    // open the AST engine, execute the structural query, collect matching FileIds.
+    // Applied at the FileId level inside execute_query (no path round-trip).
+    //
+    // IMPORTANT: auto_refresh_if_stale MUST run BEFORE open_ast_engine so that
+    // a missing or stale AST index is rebuilt before we try to open it.
+    // The returned manifest is threaded into execute_query so it can skip its
+    // own auto_refresh_if_stale call — the combined text+--ast path refreshes
+    // exactly once here (applies ADR-006: self-heal ordering is load-bearing).
+    // Mirrors the ordering on the standalone --ast path (mod.rs:108-110).
+    //
+    // Missing index (after refresh) → fail loud (return Err, #199).
+    // Query execution failure → degrade gracefully (warn, no AST filter).
+    let (ast_file_ids, pre_loaded_manifest) = if let Some(ref raw_ast) = flags.ast {
+        // Self-heal: rebuild both indexes if the AST index is absent or stale.
+        // Returns the manifest so execute_query skips a redundant refresh+load.
+        let (_refreshed, manifest) =
+            staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+        let engine = ast::open_ast_engine(&cache_dir)?;
+        let ids = match ast::resolve_ast_file_filter(&engine, raw_ast) {
+            Ok(ids) => {
+                if ids.is_empty() {
+                    eprintln!("skim search: --ast {:?} matched no indexed files", raw_ast);
+                }
+                Some(ids)
+            }
+            Err(e) => {
+                // Query execution failure: degrade gracefully (warn, no AST filter).
+                // Warning always goes to stderr — even in --json mode — so it does
+                // not pollute the JSON stream (sibling warnings also go to stderr).
+                eprintln!("skim search: AST query warning: {e}");
+                None
+            }
+        };
+        (ids, Some(manifest))
+    } else {
+        // Pure-lexical path: no --ast flag. execute_query will call
+        // auto_refresh_if_stale itself exactly once.
+        (None, None)
+    };
 
     let config = types::QueryConfig {
         text: text.to_string(),
@@ -501,9 +621,14 @@ fn run_query(
         root,
         cache_dir,
         blast_radius_paths,
+        ast_file_ids,
     };
 
-    let mut output = query::execute_query(&config, analytics)?;
+    // Pass the already-refreshed manifest (text+--ast path) or None (pure-lexical
+    // path). execute_query_with_manifest refreshes internally only when
+    // pre_loaded_manifest is None, ensuring each path calls auto_refresh_if_stale
+    // exactly once.
+    let mut output = query::execute_query_with_manifest(&config, pre_loaded_manifest, analytics)?;
 
     // Apply temporal sort/annotation to the results.
     if let (Some(sort), Some(db)) = (flags.temporal_sort, &temporal_db) {
@@ -600,6 +725,25 @@ Options:
   --root PATH      Override project root (default: walk up to .git)
   -h, --help       Print this help message
 
+AST structural query options (#199):
+  --ast PATTERN    Filter/list by AST structural pattern.
+                   PATTERN is a named catalog pattern or a containment query:
+                     Named:        --ast try-catch
+                     Containment:  --ast \"for_statement > await_expression\"
+                   Use `--ast` alone for standalone AST-only output (file-level),
+                   or combine with a text query for intersection results.
+
+  Limitations:
+    #283 — Single-node queries (e.g. --ast try_statement) are not yet supported;
+           use a named pattern or a containment query instead.
+    #202 — --ast combined with --hot / --cold / --risky is not yet supported.
+
+AST standalone examples:
+  skim search --ast try-catch                   Files with try/catch blocks
+  skim search --ast \"for_statement > await_expression\"  Async-in-loop pattern
+  skim search \"error\" --ast try-catch           Text+AST intersection (lexical snippets preserved)
+  skim search --ast try-catch --blast-radius src/auth.rs  AST ∩ co-change
+
 Temporal query options (require 'skim heatmap' data):
   --hot                        Sort/list by hotspot score descending
   --cold                       Sort/list by hotspot score ascending
@@ -610,7 +754,7 @@ Temporal flag composition:
   --hot and --cold/--risky are mutually exclusive (pick one sort mode).
   --blast-radius is composable with any sort mode and with text queries.
 
-Examples:
+General examples:
   skim search \"authenticate\"                Search for 'authenticate'
   skim search --limit 5 \"parse_url\"         Return at most 5 results
   skim search --json \"UserService\"          JSON output
@@ -812,9 +956,10 @@ mod tests {
     #[test]
     fn test_parse_flags_root_missing_value_is_error() {
         let err = parse_flags(&["--root".to_string()]).unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("--root requires a path"),
-            "unexpected error message: {err}"
+            msg.contains("--root requires"),
+            "unexpected error message: {msg}"
         );
     }
 
@@ -885,26 +1030,29 @@ mod tests {
     }
 
     // ============================================================================
-    // resolve_blast_radius_filter — None DB degradation path
+    // resolve_blast_radius_paths — None DB degradation path
     // ============================================================================
 
-    /// When blast_radius is Some but temporal_db is None (user hasn't run
+    /// When blast_radius is Some but temporal.db is absent (user hasn't run
     /// `skim heatmap` yet), the function must return Ok(None) without panicking.
     /// A stderr warning is expected but the caller handles the degradation.
     #[test]
     fn test_resolve_blast_radius_filter_no_db_returns_none() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        let result = resolve_blast_radius_filter(Some("src/auth.rs"), &None, root, false);
+        // Point to a non-existent DB file — resolver must degrade gracefully.
+        let absent_db = dir.path().join("no_such.db");
+        let result =
+            temporal::resolve_blast_radius_paths(Some("src/auth.rs"), root, &absent_db, false);
         assert!(
             result.is_ok(),
-            "must not error when temporal_db is None, got: {:?}",
+            "must not error when temporal.db is absent, got: {:?}",
             result.unwrap_err()
         );
         assert_eq!(
             result.unwrap(),
             None,
-            "must return None (graceful degradation) when temporal_db is None"
+            "must return None (graceful degradation) when temporal.db is absent"
         );
     }
 

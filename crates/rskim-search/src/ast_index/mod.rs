@@ -34,7 +34,7 @@ mod linearize;
 mod ngram;
 mod patterns;
 pub mod query;
-mod store;
+pub(crate) mod store;
 pub(crate) mod structural;
 
 // ============================================================================
