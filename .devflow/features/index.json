@@ -105,7 +105,7 @@
     },
     "cmd-search": {
       "name": "Search CLI (skim search subcommand)",
-      "description": "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, resolve_search_cache_dir, parse_flags, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone, derive_ast_entry, search_ast, resolve_ast_file_filter.",
+      "description": "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, execute_query_with_manifest, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, resolve_search_cache_dir, parse_flags, parse_temporal_flag, parse_limit_value, take_flag_value, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone, derive_ast_entry, search_ast, resolve_ast_file_filter, hooks.rs, install_search_hooks, remove_search_hooks, cochange_partner_paths.",
       "directories": [
         "crates/rskim/src/cmd/search/"
       ],
@@ -119,9 +119,10 @@
         "crates/rskim/src/cmd/search/temporal.rs",
         "crates/rskim/src/cmd/search/manifest.rs",
         "crates/rskim/src/cmd/search/walk.rs",
-        "crates/rskim/src/cmd/search/snippet.rs"
+        "crates/rskim/src/cmd/search/snippet.rs",
+        "crates/rskim/src/cmd/search/hooks.rs"
       ],
-      "lastUpdated": "2026-06-09T10:18:22.330Z",
+      "lastUpdated": "2026-06-09T20:04:20.248Z",
       "createdBy": "implement"
     }
   }

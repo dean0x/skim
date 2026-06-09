@@ -1,4 +1,4 @@
-<!-- TL;DR: 6 pitfalls. Key: PF-002, PF-003, PF-004, PF-005, PF-006 -->
+<!-- TL;DR: 7 pitfalls. Key: PF-003, PF-004, PF-005, PF-006, PF-007 -->
 # Known Pitfalls
 
 Area-specific gotchas, fragile areas, and past bugs.
@@ -56,3 +56,12 @@ Area-specific gotchas, fragile areas, and past bugs.
 - **Resolution**: when a dispatch arm selects on a flag, never use a sibling-flag-absent guard (other_flag.is_none()) to disambiguate composable flags — match the primary flag unconditionally and let the arm body honor the secondary flag
 - **Status**: Active
 - **Source**: self-learning:obs_dsp4kn
+
+## PF-007: A regression test that only asserts the process exits 0 is vacuous — it passes even while the bug it claims to guard is live; replace it with a real assertion (strict subset / exact-set) that fails when the bug returns
+
+- **Area**: regression test design for CLI dispatch and filter behavior (rskim search --ast + --blast-radius)
+- **Issue**: a test named to guard the PF-006 silent-flag-drop bug asserted only that the process exits 0, so it passed identically whether --ast was honored or silently dropped — it was vacuous and gave false confidence, staying green across the very regression it claimed to catch
+- **Impact**: a green test suite masks a live bug, and the named guard actively misleads reviewers into believing the path is covered
+- **Resolution**: a regression test must assert the discriminating observable behavior, not just a non-failing exit code — here, prove the result set is a STRICT SUBSET when the filter is applied versus the unfiltered superset (and verify graceful degradation when inputs are absent), so the test fails the moment the filter is dropped. General rule: if a test would still pass with the feature deleted, it asserts nothing.
+- **Status**: Active
+- **Source**: self-learning:obs_xt9k2v
