@@ -583,6 +583,218 @@ fn test_streaming_skipped_includes_minified() {
     assert_eq!(result.file_count, 1, "only main.rs should be indexed");
 }
 
+// ============================================================================
+// ADR-006: dual-index desync abort — the central correctness invariant
+// ============================================================================
+
+/// ADR-006 abort path: when `add_file_ngrams` rejects a FileId after the same
+/// FileId's lexical entry was already accepted, `consume()` must return `Err`
+/// and the manifest must NOT be saved (old manifest survives).
+///
+/// This is the regression guard for commit 3aaa99f: a future refactor that
+/// silently `continue`s past the desync (instead of aborting) would commit a
+/// corrupt index — this test would catch it.
+///
+/// Mechanism: pre-advance the `AstIndexBuilder` by inserting FileId(0) before
+/// calling `consume`.  The builder then expects FileId(1) next.  When `consume`
+/// tries to insert FileId(0) for the first real file it returns `Err("FileId
+/// must equal sequential insertion index: expected 1, got 0")` — exactly the
+/// desync abort path documented in ADR-006. (applies ADR-006)
+#[test]
+fn test_adr006_desync_aborts_before_manifest_save() {
+    use rskim_search::{AstIndexBuilder, AstNgramSet, FileId, NgramIndexBuilder, StructuralMetrics};
+
+    use super::Pipeline;
+    use super::super::manifest::FileManifest;
+    use super::super::types::ProcessedFile;
+
+    let project = make_project();
+    let cache = tempfile::tempdir().unwrap();
+
+    // Stage 1: clean first build — establishes the "old manifest" on disk.
+    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS)
+        .expect("first build must succeed");
+
+    // Record old manifest state: load from disk and note the modification time
+    // of the manifest file so we can assert it was NOT overwritten.
+    let skfiles_path = cache
+        .path()
+        .read_dir()
+        .unwrap()
+        .flatten()
+        .find(|e| e.path().extension().is_some_and(|x| x == "skfiles"))
+        .expect("manifest (.skfiles) must exist after first build")
+        .path();
+
+    let old_mtime = fs::metadata(&skfiles_path)
+        .expect("skfiles must be stat-able")
+        .modified()
+        .expect("mtime must be available on this platform");
+
+    let old_manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+            .expect("old manifest must be loadable");
+    let old_entry_count = old_manifest.entry_count();
+    assert!(old_entry_count > 0, "old manifest must have entries for the test to be meaningful");
+
+    // Stage 2: set up a consume call with a PRE-BROKEN AstIndexBuilder.
+    // Pre-advancing it by one FileId forces it to expect FileId(1) as the next
+    // call, so when consume tries FileId(0) the builder returns the desync error.
+    let mut lexical_builder = NgramIndexBuilder::new(cache.path().to_path_buf())
+        .expect("lexical builder must initialise");
+    let mut ast_builder = AstIndexBuilder::new(cache.path().to_path_buf())
+        .expect("AST builder must initialise");
+
+    // Insert a dummy FileId(0) into the AST builder BEFORE consume runs.
+    // This advances the builder's internal file_count to 1, so it expects FileId(1) next.
+    ast_builder
+        .add_file_ngrams(
+            FileId(0),
+            rskim_core::Language::Rust,
+            &AstNgramSet::default(),
+            0,
+            StructuralMetrics::default(),
+        )
+        .expect("pre-advance must succeed");
+
+    let mut new_manifest =
+        FileManifest::new(project.path().to_path_buf(), cache.path().to_path_buf());
+
+    // Build a channel and send one real ProcessedFile so the loop body executes.
+    let (tx, rx) = crossbeam_channel::bounded::<ProcessedFile>(1);
+    let pf = ProcessedFile {
+        rel_path: std::path::PathBuf::from("src/main.rs"),
+        lang: rskim_core::Language::Rust,
+        content: "fn main() {}\n".to_string(),
+        sha256: "a".repeat(64),
+        mtime: None,
+        field_map: vec![],
+        cache_hit: false,
+    };
+    tx.send(pf).unwrap();
+    drop(tx); // close channel so consume loop terminates after one item
+
+    // Stage 3: call consume — it must return Err because add_file_ngrams rejects
+    // FileId(0) (the builder already has FileId(0) and expects FileId(1) next).
+    let result = Pipeline::consume(
+        &mut lexical_builder,
+        &mut ast_builder,
+        &mut new_manifest,
+        rx,
+        false,
+    );
+
+    assert!(
+        result.is_err(),
+        "consume must return Err on AST desync (ADR-006 abort path); got Ok"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("AST index desync") || err_msg.contains("sequential"),
+        "error must identify the desync; got: {err_msg}"
+    );
+
+    // Stage 4: verify the manifest was NOT saved — old manifest still on disk.
+    // The `new_manifest` in this test was never saved (consume returned Err before
+    // the caller's `new_manifest.save()` could be reached in `run()`).
+    let new_mtime = fs::metadata(&skfiles_path)
+        .expect("skfiles must still exist")
+        .modified()
+        .expect("mtime must be available on this platform");
+
+    assert_eq!(
+        old_mtime, new_mtime,
+        "manifest file mtime must not change — the old manifest must survive the abort (ADR-006)"
+    );
+
+    // Double-check by loading: entry count must be the same as before the broken run.
+    let reloaded =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+            .expect("manifest must still be loadable after abort");
+    assert_eq!(
+        reloaded.entry_count(),
+        old_entry_count,
+        "manifest entry count must be unchanged — new_manifest was never saved (ADR-006)"
+    );
+}
+
+/// ADR-006 self-heal: after an abort, a subsequent successful build restores
+/// the index and manifest. Verifies that the old-manifest-survives property
+/// does not permanently break the project — the next `build_index` succeeds.
+#[test]
+fn test_adr006_self_heal_after_abort() {
+    use rskim_search::{AstIndexBuilder, AstNgramSet, FileId, NgramIndexBuilder, StructuralMetrics};
+
+    use super::Pipeline;
+    use super::super::manifest::FileManifest;
+    use super::super::types::ProcessedFile;
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let project = make_project();
+    let cache = tempfile::tempdir().unwrap();
+
+    // First build — establishes the old manifest.
+    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS)
+        .expect("first build must succeed");
+
+    let old_manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+            .expect("old manifest must be loadable");
+    let old_count = old_manifest.entry_count();
+
+    // Simulate the desync abort (same as the previous test).
+    let mut lexical_builder = NgramIndexBuilder::new(cache.path().to_path_buf()).unwrap();
+    let mut ast_builder = AstIndexBuilder::new(cache.path().to_path_buf()).unwrap();
+    ast_builder
+        .add_file_ngrams(FileId(0), rskim_core::Language::Rust, &AstNgramSet::default(), 0, StructuralMetrics::default())
+        .unwrap();
+    let mut new_manifest =
+        FileManifest::new(project.path().to_path_buf(), cache.path().to_path_buf());
+    let (tx, rx) = crossbeam_channel::bounded::<ProcessedFile>(1);
+    let pf = ProcessedFile {
+        rel_path: std::path::PathBuf::from("src/main.rs"),
+        lang: rskim_core::Language::Rust,
+        content: "fn main() {}\n".to_string(),
+        sha256: "a".repeat(64),
+        mtime: None,
+        field_map: vec![],
+        cache_hit: false,
+    };
+    tx.send(pf).unwrap();
+    drop(tx);
+    let abort_result = Pipeline::consume(
+        &mut lexical_builder,
+        &mut ast_builder,
+        &mut new_manifest,
+        rx,
+        false,
+    );
+    assert!(abort_result.is_err(), "consume must abort for the self-heal test to be meaningful");
+
+    // Self-heal: a subsequent successful build must produce a new manifest.
+    let config = IndexConfig {
+        root: project.path().to_path_buf(),
+        max_files: None,
+        force: true, // force rebuild so we don't hit incremental cache confusion
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    let result = build_index(&config).expect("self-heal build must succeed");
+    assert!(
+        result.file_count > 0,
+        "self-heal build must index files; got file_count=0"
+    );
+
+    let healed_manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+            .expect("healed manifest must be loadable");
+    assert_eq!(
+        healed_manifest.entry_count(),
+        old_count,
+        "healed manifest must have the same entry count as the original"
+    );
+}
+
 /// With `max_files=2`, the streaming pipeline indexes exactly 2 files.
 #[test]
 fn test_streaming_respects_max_files() {

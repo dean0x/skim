@@ -204,11 +204,12 @@ pub(super) struct Pipeline<'cfg> {
 const CHANNEL_CAPACITY: usize = 64;
 
 /// Aggregated output from [`Pipeline::consume`].
-struct ConsumeResult {
+#[derive(Debug)]
+pub(super) struct ConsumeResult {
     /// Number of files successfully added to the index.
-    file_count: u32,
+    pub(super) file_count: u32,
     /// Number of files whose cached `field_map` was reused (SHA match).
-    cache_hits: u32,
+    pub(super) cache_hits: u32,
 }
 
 impl<'cfg> Pipeline<'cfg> {
@@ -281,26 +282,38 @@ impl<'cfg> Pipeline<'cfg> {
         let mut ast_builder = AstIndexBuilder::new(self.cache_dir.clone())
             .map_err(|e| anyhow::anyhow!("failed to create AST index builder: {e}"))?;
         let mut new_manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
-        let ConsumeResult {
-            file_count,
-            cache_hits,
-        } = Self::consume(
+        // Capture consume's result rather than propagating with `?` immediately.
+        // We MUST join the producer before propagating any error so that a worker-thread
+        // panic is surfaced on BOTH the success path AND the ADR-006 abort path.
+        // On the abort path, `rx` is consumed (dropped inside `consume`) before we reach
+        // the join, so the producer's `tx.send()` has already returned `Err` and the
+        // producer thread has already exited — no deadlock risk. (applies ADR-006)
+        let consume_result = Self::consume(
             &mut builder,
             &mut ast_builder,
             &mut new_manifest,
             rx,
             debug_enabled,
-        )?;
+        );
 
-        // Wait for the producer to finish and propagate any panic.
-        producer_handle.join().map_err(|e| {
-            anyhow::anyhow!(
-                "producer thread panicked: {:?}",
-                e.downcast_ref::<String>()
-                    .map(String::as_str)
-                    .unwrap_or("<non-string panic>")
-            )
-        })?;
+        // Always join the producer first so a worker-thread panic is surfaced
+        // regardless of whether consume succeeded or aborted (ADR-006 desync).
+        producer_handle
+            .join()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "producer thread panicked: {:?}",
+                    e.downcast_ref::<String>()
+                        .map(String::as_str)
+                        .unwrap_or("<non-string panic>")
+                )
+            })?;
+
+        // Now propagate the consume error (if any) — producer is already joined.
+        let ConsumeResult {
+            file_count,
+            cache_hits,
+        } = consume_result?;
 
         // Commit ordering (crash-safety):
         // (1) Lexical build — index.skidx + index.skfiles written.
@@ -310,6 +323,20 @@ impl<'cfg> Pipeline<'cfg> {
         // If the AST build fails, the manifest is NOT saved so the next query
         // sees the index as stale and triggers a full rebuild (self-heal path).
         // "HEAD recorded ⟹ both indexes coherent" is the invariant.
+        // Commit-boundary invariant: both builders and the manifest must agree on
+        // the file count before we write anything to disk. A mismatch here means
+        // the "every file gets exactly one call" contract was broken somewhere in
+        // the consume loop. Abort before any write so the old manifest survives
+        // and the next query self-heals. (applies ADR-006)
+        let manifest_count = new_manifest.entry_count();
+        if manifest_count != file_count as usize {
+            return Err(anyhow::anyhow!(
+                "index commit aborted: manifest entry count ({manifest_count}) != \
+                 consume file count ({file_count}); FileId alignment is broken — \
+                 the old manifest survives and the next query will trigger a full rebuild"
+            ));
+        }
+
         let _layer = builder.build()?;
         ast_builder
             .build()
@@ -421,7 +448,7 @@ impl<'cfg> Pipeline<'cfg> {
     ///    empty `AstNgramSet` + zero node_count + default metrics. This preserves
     ///    the AST builder's "every file gets exactly one call" contract and prevents
     ///    FileId desync between the lexical and AST indexes.
-    fn consume(
+    pub(super) fn consume(
         builder: &mut NgramIndexBuilder,
         ast_builder: &mut AstIndexBuilder,
         new_manifest: &mut FileManifest,
@@ -451,37 +478,11 @@ impl<'cfg> Pipeline<'cfg> {
                 continue;
             }
 
-            // AST index: linearize + extract n-grams.
-            // Fail-soft: on ANY error (grammar load failure, linearization error,
-            // or Ok(empty) for non-tree-sitter langs / large files), insert an
-            // EMPTY ALIGNED ENTRY so AST FileIds stay in sync with lexical FileIds.
-            // NEVER `?`-propagate (would abort the whole build).
-            // NEVER skip (would desync FileIds → silently mis-map results).
+            // AST index: derive n-grams (step 2 of 4-step loop contract).
+            // Fail-soft: on ANY error, returns an empty aligned entry so AST FileIds
+            // stay in sync with lexical FileIds. NEVER skips — see derive_ast_entry.
             let (ast_set, ast_metrics, ast_node_count) =
-                match linearize_source(&pf.content, pf.lang) {
-                    Ok(lin) if !lin.nodes.is_empty() => {
-                        let (set, metrics) = extract_ast_ngrams_with_metrics(&lin.nodes, pf.lang);
-                        let node_count = u32::try_from(lin.nodes.len()).unwrap_or(u32::MAX);
-                        (set, metrics, node_count)
-                    }
-                    Ok(_empty) => {
-                        // Non-tree-sitter lang (JSON/YAML/TOML), file >100KiB,
-                        // empty source, or parse-only-error result — empty entry.
-                        (AstNgramSet::default(), StructuralMetrics::default(), 0u32)
-                    }
-                    Err(e) => {
-                        // Grammar load failure (SearchError::Ast) — only unrecoverable
-                        // error from linearize_source. Still insert empty aligned entry.
-                        if debug_enabled {
-                            eprintln!(
-                                "skim search index [debug]: linearize_source failed \
-                                 for {:?}: {e}",
-                                pf.rel_path
-                            );
-                        }
-                        (AstNgramSet::default(), StructuralMetrics::default(), 0u32)
-                    }
-                };
+                derive_ast_entry(&pf.content, pf.lang, &pf.rel_path, debug_enabled);
 
             // Add the AST entry for this file. The lexical entry for the SAME
             // FileId was already accepted, so an error here means the indexes are
@@ -650,6 +651,57 @@ fn run_classify(
                 );
             }
             Vec::new()
+        }
+    }
+}
+
+/// Derive the AST n-gram entry for one file.
+///
+/// Returns `(AstNgramSet, StructuralMetrics, node_count)`.
+///
+/// # Error policy (fail-soft)
+///
+/// On ANY error (grammar load failure, linearization error, or an Ok-but-empty
+/// result for non-tree-sitter languages / large files / empty content), this
+/// function returns an empty-but-valid triple so the caller can still insert an
+/// ALIGNED EMPTY ENTRY into the AST builder. It never panics and never propagates
+/// an error — doing so would either abort the whole build (wrong for a per-file
+/// parse error) or skip the AST call entirely (which desynchronises FileIds).
+///
+/// The fail-loud path lives in [`Pipeline::consume`]: once the lexical entry for
+/// a FileId has been accepted, a failure from `add_file_ngrams` is unrecoverable
+/// (the two indexes are now desynced). That is the only place where abort is
+/// correct. This helper is deliberately infallible so the loop body reads as its
+/// 4-step contract: lexical-add-or-continue → derive → ast-add-or-abort → advance.
+fn derive_ast_entry(
+    content: &str,
+    lang: rskim_core::Language,
+    rel_path: &Path,
+    debug: bool,
+) -> (AstNgramSet, StructuralMetrics, u32) {
+    match linearize_source(content, lang) {
+        Ok(lin) if !lin.nodes.is_empty() => {
+            let (set, metrics) = extract_ast_ngrams_with_metrics(&lin.nodes, lang);
+            // Applies PF-004: explicit try_from, not `as u32`.
+            let node_count = u32::try_from(lin.nodes.len()).unwrap_or(u32::MAX);
+            (set, metrics, node_count)
+        }
+        Ok(_empty) => {
+            // Non-tree-sitter lang (JSON/YAML/TOML), file >100KiB,
+            // empty source, or parse-only-error result — empty aligned entry.
+            (AstNgramSet::default(), StructuralMetrics::default(), 0u32)
+        }
+        Err(e) => {
+            // Grammar load failure (SearchError::Ast) — only unrecoverable
+            // error path from linearize_source. Still return empty aligned entry
+            // so FileIds stay in sync with the lexical index.
+            if debug {
+                eprintln!(
+                    "skim search index [debug]: linearize_source failed for {:?}: {e}",
+                    rel_path
+                );
+            }
+            (AstNgramSet::default(), StructuralMetrics::default(), 0u32)
         }
     }
 }
