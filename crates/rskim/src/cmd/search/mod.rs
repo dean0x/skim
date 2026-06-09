@@ -538,29 +538,6 @@ fn run_remove_hooks(root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode>
 // Query execution
 // ============================================================================
 
-/// Resolve blast-radius partner paths from the temporal database.
-///
-/// Returns co-change partners **plus the target file itself**, so text queries
-/// like `skim search auth --blast-radius src/auth.rs` surface matches within
-/// `src/auth.rs` in addition to its co-change partners.
-///
-/// Returns `None` when no blast-radius was requested, or when the temporal DB
-/// is unavailable.  When `json` is true the warning is emitted as a JSON
-/// object to stderr (consistent with `temporal::resolve_blast_radius_paths`);
-/// otherwise it goes to stderr.
-///
-/// Delegates to `temporal::resolve_blast_radius_paths` so path normalization,
-/// partner lookup, and JSON-aware warning live in one place (shared with the
-/// standalone `--ast --blast-radius` path).
-fn resolve_blast_radius_filter(
-    blast_radius: Option<&str>,
-    db_path: &std::path::Path,
-    root: &std::path::Path,
-    json: bool,
-) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
-    temporal::resolve_blast_radius_paths(blast_radius, root, db_path, json)
-}
-
 fn run_query(
     text: &str,
     flags: &Flags,
@@ -589,11 +566,10 @@ fn run_query(
     // is applied inside the search engine (before LIMIT). This ensures the
     // limit applies to the filtered set rather than silently discarding
     // co-change partners that ranked beyond the top-N unfiltered results.
-    // Delegates to temporal::resolve_blast_radius_paths (the shared resolver).
-    let blast_radius_paths = resolve_blast_radius_filter(
+    let blast_radius_paths = temporal::resolve_blast_radius_paths(
         flags.blast_radius.as_deref(),
-        &cache_dir.join("temporal.db"),
         &root,
+        &cache_dir.join("temporal.db"),
         flags.json,
     )?;
 
@@ -1054,7 +1030,7 @@ mod tests {
     }
 
     // ============================================================================
-    // resolve_blast_radius_filter — None DB degradation path
+    // resolve_blast_radius_paths — None DB degradation path
     // ============================================================================
 
     /// When blast_radius is Some but temporal.db is absent (user hasn't run
@@ -1066,7 +1042,8 @@ mod tests {
         let root = dir.path();
         // Point to a non-existent DB file — resolver must degrade gracefully.
         let absent_db = dir.path().join("no_such.db");
-        let result = resolve_blast_radius_filter(Some("src/auth.rs"), &absent_db, root, false);
+        let result =
+            temporal::resolve_blast_radius_paths(Some("src/auth.rs"), root, &absent_db, false);
         assert!(
             result.is_ok(),
             "must not error when temporal.db is absent, got: {:?}",

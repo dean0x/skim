@@ -218,7 +218,8 @@ pub(super) fn resolve_blast_radius_paths(
                 eprintln!("skim search: no co-change data for {raw_path:?}");
             }
             let mut allowed_paths = cochange_partner_paths(&partners, &normalized);
-            // Include the target file itself (mirrors resolve_blast_radius_filter).
+            // Include the target file itself so queries like `skim search auth --blast-radius src/auth.rs`
+            // surface matches within the target file in addition to its co-change partners.
             allowed_paths.insert(normalized);
             Ok(Some(allowed_paths))
         }

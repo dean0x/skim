@@ -118,7 +118,8 @@ pub(super) fn resolve_ast_file_filter(
 // Standalone AST query
 // ============================================================================
 
-/// Execute a standalone `--ast` query (no text query, only AST pattern).
+/// Execute a standalone `--ast` query (no text query, only AST pattern),
+/// writing output to `w`.
 ///
 /// Mirrors `run_temporal_standalone` in `mod.rs`:
 /// - Validates the pattern before opening the index.
@@ -131,16 +132,14 @@ pub(super) fn resolve_ast_file_filter(
 ///   the clippy threshold and the `#[allow]` annotation is not needed.
 /// - Executes the query and formats output.
 ///
+/// `w` is the output sink — production callers pass a `BufWriter` over stdout;
+/// tests pass a `Vec<u8>` buffer to capture output (satisfies PF-007: regression
+/// tests must observe production output, not just assert exit 0).
+///
 /// # Errors
 ///
 /// Returns `Err` when the index is absent, the query is invalid, or I/O fails.
 /// Returns `Ok(ExitCode::SUCCESS)` for empty result sets (AC-F8).
-/// Execute a standalone `--ast` query, writing output to `w`.
-///
-/// The `w` parameter is the output sink — production callers pass a
-/// `BufWriter` over stdout; tests pass a `Vec<u8>` buffer to capture and
-/// assert the exact output (satisfies PF-007: regression tests must observe
-/// production output, not just assert exit 0).
 pub(super) fn run_ast_standalone(
     raw_pattern: &str,
     limit: usize,
