@@ -4,686 +4,108 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Skim** is a streaming code reader for AI agents built in Rust using tree-sitter. It transforms source code by stripping implementation details while preserving structure, signatures, and types - optimizing code for LLM context windows.
+**Skim** is a streaming code reader for AI agents, written in Rust on tree-sitter. It strips implementation detail while preserving structure, signatures, and types to optimize code for LLM context windows. It also compresses other agent context: test output, build errors, lint output, git diffs, logs, and raw shell commands.
 
-**Key Principle:** This is a **streaming reader** (like `cat` but smart), NOT a file compression tool. Output always goes to stdout for pipe workflows.
+**Key principle:** Skim is a *streaming reader* (`cat` but smart), not a file compressor. Output always goes to stdout for pipe workflows — never write intermediate files.
 
-## Current Project State
+User-facing install/usage lives in `README.md`; release mechanics in `CHANGELOG.md`. This file is for working *in* the repo.
 
-✅ **PHASE 3 COMPLETE** (100% of original roadmap)
+## Workspace
 
-**What's Complete (Phases 1 & 2):**
-- ✅ Full Rust project with comprehensive test suite (5,213 tests passing)
-- ✅ 17 languages supported: TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, SQL, Kotlin, Swift, Markdown, JSON, YAML, TOML
-- ✅ 4 transformation modes: structure, signatures, types, full
-- ✅ CLI with stdin/stdout streaming support
-- ✅ Multi-file glob support with parallel processing
-- ✅ Published to crates.io (`cargo install rskim`)
-- ✅ Published to npm (`npm install -g rskim` / `npx rskim`)
-- ✅ Cross-platform binaries (Linux, macOS x64/ARM, Windows)
-- ✅ CI/CD pipeline with automated releases
-- ✅ Comprehensive documentation (README, CLAUDE.md, API docs)
-- ✅ Performance benchmarks verified (14.6ms for 3000-line files)
+Cargo workspace, 5 crates:
+- `rskim-core` — pure transform library (parsing, modes; no I/O side effects)
+- `rskim` — CLI binary (`skim`): caching, analytics, command wrappers
+- `rskim-search` — code-search index (lexical n-gram, temporal, AST structural), stored in `<root>/.skim/search.db`
+- `rskim-research` — offline tooling that generates AST weight tables
+- `rskim-bench` — benchmarks
 
-**Phase 3 Status:**
-- ✅ Multi-file glob support (`rskim 'src/**/*.ts'`) - COMPLETE
-- ✅ Parallel processing with rayon (`--jobs` flag for multi-file operations) - COMPLETE
-- ✅ Performance benchmarks (verified: 14.6ms for 3000-line files) - COMPLETE
-- ✅ Parser caching layer (`~/.cache/skim/` with mtime invalidation) - COMPLETE
-  - Enabled by default, 40-50x speedup on cached reads
-  - `--no-cache` flag to disable, `--clear-cache` to clear
-  - Implemented at CLI layer, core library remains pure
-- ✅ Token counting feature (`--show-stats`) - COMPLETE
-  - Uses tiktoken (cl100k_base for GPT-3.5/GPT-4)
-  - Works with single files, globs, and stdin
-  - Output to stderr for clean piping
-
-## Technology Stack
-
-- **Language:** Rust (performance, zero-cost abstractions)
-- **Parser:** tree-sitter (multi-language AST parsing)
-- **CLI:** clap with derive API
-- **Output:** Streaming to stdout via `BufWriter`
-- **Distribution:** cargo-dist (cross-platform binaries + npm publishing)
-- **Performance Target:** <50ms for 1000-line files
+`crates/rskim-search/src/ast_weights.rs` is **auto-generated — do not edit**. Regenerate via `rskim-research ast-run` then `ast-codegen`.
 
 ## Architecture
 
 ```
 Parser Manager (language detection)
   ↓
-┌─────────────────────────────────────┐
-│     Strategy Pattern Dispatcher      │
-│   Language::transform_source()      │
-└─────────────┬───────────────────────┘
-              │
-    ┌─────────┴─────────┐
-    ↓                   ↓
-tree-sitter         serde-based
-(TS/JS/Python/      (JSON, YAML, TOML)
- Rust/Go/Java/
- C/C++/MD)
-    ↓                   ↓
-Transformation Layer (modes: structure/signatures/types/full)
+Language::transform_source()          ← Strategy Pattern dispatcher
+  ├─ tree-sitter  (14 code langs: TS/JS/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Kotlin/Swift/Markdown)
+  └─ serde-based  (JSON/YAML/TOML — data formats, not code)
   ↓
-Streaming Output (stdout, zero-copy when possible)
-
-analytics/          ← Token savings persistence (SQLite)
-  mod.rs            ← AnalyticsDb, AnalyticsStore trait, fire-and-forget recording
-  schema.rs         ← Versioned migrations (v1: token_savings, v2: analytics_meta)
+Transformation Layer (modes: structure / signatures / types / minimal / pseudo / full)
+  ↓
+Streaming output (stdout, zero-copy via &str slices where possible)
 ```
 
-**ARCHITECTURE NOTE**: JSON, YAML, and TOML use serde-based parsers instead of tree-sitter because they are data formats, not code. The Strategy Pattern in `Language::transform_source()` routes each language to its appropriate parser, eliminating special-case conditionals.
+`transform_source()` routes each language to its parser via the Strategy Pattern, avoiding special-case conditionals — each language encapsulates its own strategy.
 
-**ANALYTICS NOTE**: The `analytics/` module persists token savings to `~/.cache/skim/analytics.db` (SQLite with WAL mode). Recording is fire-and-forget via background threads. The `AnalyticsStore` trait enables MockStore-based testing of the stats dashboard without a real database. `--clear-cache` does NOT touch `analytics.db`.
-
-**TEMPORAL SEARCH NOTE**: The `rskim-search` crate stores hotspot, risk, and co-change data in `<project-root>/.skim/search.db` (SQLite, WAL mode). Schema migrations are forward-only via `PRAGMA user_version` — each version gate runs only when the stored version is below the target. Databases created by a future version return an error rather than silently corrupting data. Current schema: v1 (hotspot, risk, cochange tables), v2 (performance indexes for top-N and per-file lookup queries).
-
-**AST INDEX FORMAT NOTE**: The `rskim-search` AST n-gram index (`ast_index.skidx` + `ast_index.skpost`) is now **format v2** (Wave 3e, #196). v2 adds per-file structural metrics (max_depth, max_block_stmts, max_params, branch_count — +10 bytes per file) and stores `avg_max_depth:f32` in the header. Files created by v1 are rejected with "please rebuild". Run `skim search index --rebuild` after updating. Synthetic n-gram markers (EMPTY_BODY=65000, DEEP_NODE=65001, LARGE_BODY=65002, MANY_PARAMS=65003; bucket labels at 64900+) are emitted alongside real n-grams; vocab_resolve() returns None for all synthetic IDs (isolation guarantee).
-
-## Implementation Phases
-
-### Phase 1 (Weeks 1-4): Proof of Concept
-- Single language (TypeScript)
-- Basic structure extraction (strip function bodies)
-- CLI with mode flags
-- Streaming stdout output
-
-### Phase 2 (Weeks 5-8): Multi-Language
-- 5 languages (TypeScript, Python, Rust, Go, Java)
-- Language detection from file extensions
-- Performance optimization (<50ms target)
-- CI pipeline
-
-### Phase 3 (Weeks 9-12): Production
-- Caching layer (mtime-based)
-- Multi-file/glob support
-- Parallel processing (rayon)
-- Binary releases (cargo-dist for crates.io + npm)
-
-## Installation
-
-### For End Users
-
-```bash
-# Via Homebrew (macOS/Linux)
-brew install dean0x/tap/skim
-
-# Via npm (recommended - try without installing)
-npx rskim file.ts
-
-# Via npm (global install for regular use)
-npm install -g rskim
-
-# Via cargo (recommended for Rust developers)
-cargo install rskim
-
-# Via binary download (GitHub releases)
-curl -L https://github.com/dean0x/skim/releases/latest/download/rskim-x86_64-unknown-linux-gnu.tar.gz | tar xz
-```
-
-✅ **Package naming:** Successfully published as `rskim` on both npm and crates.io.
+**Non-obvious behavior (gotchas):**
+- **Analytics:** token savings persist to `~/.cache/skim/analytics.db` (SQLite/WAL), recorded fire-and-forget on background threads. `--clear-cache` clears only the parser cache, NOT `analytics.db` — use `skim stats --clear` for that. The `AnalyticsStore` trait + `MockStore` make the stats dashboard testable without a real DB.
+- **Search DB:** `rskim-search` stores hotspot/risk/co-change data in `<root>/.skim/search.db`. Migrations are forward-only via `PRAGMA user_version`; a DB written by a newer version errors rather than corrupting data.
+- **AST index:** the n-gram index (`ast_index.skidx` / `.skpost`) is format v2 — v1 files are rejected with "please rebuild" (`skim search index --rebuild`). Synthetic n-gram markers (IDs ≥ 64900) resolve to `None` in `vocab_resolve()`, keeping them isolated from real vocabulary.
 
 ## Commands
 
-**Local dev binary:** `target/release/skim` is on PATH for local testing. After every merge to main, run `cargo build --release` to keep it current.
+`target/release/skim` is on PATH for local testing. After merging to main, run `cargo build --release` to refresh it.
 
-### Build & Test
 ```bash
-cargo build --release          # Production build
-cargo test                     # Run test suite
-cargo test --all-features      # Run all tests
-cargo bench                    # Run benchmarks
+cargo build --release          # production build
+cargo test --all-features      # full test suite
+cargo clippy -- -D warnings    # lint (warnings are errors)
+cargo fmt -- --check           # format check
+cargo bench                    # criterion benchmarks
+cargo run --bin skim -- file.ts --mode=signatures   # run locally
 ```
 
-### Distribution (cargo-dist)
-```bash
-cargo dist init                # Initialize cargo-dist
-cargo dist build               # Build for all targets
-cargo dist plan                # Preview release artifacts
-```
-
-### Development
-```bash
-cargo run --bin skim -- file.ts           # Run with default mode
-cargo run --bin skim -- file.ts --mode=signatures
-cargo run --bin skim -- stats             # Analytics dashboard
-cargo run --bin skim -- stats --verbose   # With parse quality details
-cargo clippy -- -D warnings    # Lint check
-cargo fmt -- --check           # Format check
-```
+Modes are set via `--mode` only (no config file): `structure` (default), `signatures`, `types`, `minimal`, `pseudo`, `full`.
 
 ### Subcommands
 
-**Meta/utility:**
-- `agents` — Display detected AI agents and their hook/session status (`--json`)
-- `completions` — Shell completion scripts
-- `discover` — Scan agent sessions for missed skim optimization opportunities (`--since`, `--agent`, `--json`, `--no-truncate`)
-- `init` — Install skim as an agent hook (Claude Code, Cursor, Codex, Gemini, Copilot, Crush); `--wrappers` installs PATH wrappers for sub-agent interception, `--no-wrappers` skips wrapper installation
-- `learn` — Detect CLI error-retry patterns in agent sessions and generate correction rules (`--generate`, `--agent`, `--dry-run`, `--no-truncate`)
-- `rewrite` — Rewrite developer commands into skim equivalents (`--hook` for agent integration)
-- `stats` — Token analytics dashboard with per-session tracking (`--since`, `--format json`, `--verbose`, `--clear`)
+Most subcommands wrap a dev tool (cargo, git, npm, pytest, eslint, docker, psql, grep, …) and compress its output — run `skim --help` for the full catalog. The ones with non-obvious behavior:
 
-**Analysis:**
-- `heatmap` — Git history risk/coupling analysis: churn, co-change coupling, stability scores, author concentration, fix-after-touch, module encapsulation (`--json`, `--since`, `--last`, `--window`, `--path`, `--top`, `--insights`)
-- `search` — n-gram code search over the project index. Build/update index with `skim search index` (`--force`, `--root`, `--max-files`). Query with `skim search <query>` (`--limit`, `--root`, `--json`, `--stats`, `--install-hooks`, `--remove-hooks`, `--build`, `--rebuild`, `--update`). Temporal sort/filter flags: `--hot` (sort by hotspot score), `--cold` (invert hotspot sort), `--risky` (sort by fix-risk score), `--blast-radius FILE` (pre-filter to co-change peers of FILE). AST structural pattern flag: `--ast <pattern>` (named pattern from 29-pattern catalog, e.g. `try-catch`, `nested-loop`, `god-function`; or containment query `for_statement > block`; composable with text query and `--blast-radius`; standalone `skim search --ast try-catch`; `--ast` + temporal sort flags → #202 error; single-node queries → #283 error).
+- `search` — n-gram code search over a project index. Build/update: `skim search index` (`--rebuild`, `--force`, `--root`, `--max-files`). Query: `skim search <text>` (`--limit`, `--json`, `--stats`). Temporal sort/filter: `--hot`/`--cold` (hotspot score), `--risky` (fix-risk), `--blast-radius FILE` (co-change peers). Structural: `--ast <pattern>` — a named pattern (`try-catch`, `nested-loop`, `god-function`, …) or containment query (`for_statement > block`); composable with text query and `--blast-radius`. `--ast` with temporal flags, or single-node queries, errors out (#202 / #283).
+- `heatmap` — git-history risk/coupling analysis: churn, co-change, stability, fix-after-touch (`--json`, `--since`, `--window`, `--path`, `--insights`).
+- `init` — install skim as an agent hook (Claude/Cursor/Codex/Gemini/Copilot/Crush); `--wrappers` adds PATH wrappers for sub-agent interception.
+- `stats` — token analytics dashboard (`--since`, `--format json`, `--verbose`, `--clear`).
+- `discover` / `learn` / `rewrite` — scan agent sessions for missed optimizations, learn error-retry correction rules, and rewrite commands into skim equivalents.
 
-**Multi-category dispatchers:**
-- `cargo` — Rust toolchain compression: test, build, check, fmt, clippy, audit, nextest
-- `git` — Git output compression: AST-aware diff (function boundaries, `--mode`), status, log, fetch, show, commit, push. All support `--json`.
-- `go` — Go toolchain compression: test
-- `log` — Log compression: JSON structured + regex plaintext deduplication, debug filtering, stack trace collapsing (`--json`, `--show-stats`)
+### Shell interception (PATH wrappers)
 
-**Direct tool subcommands (v2.8.0 flat dispatch):**
-- `cypress`, `dotnet`, `jest`, `playwright`, `pytest`, `swift`, `vitest` — Test runner output compression
-- `gradle`, `gradlew`, `make`, `mvn`, `mvnw` — Build tool output compression
-- `tsc` — TypeScript build output compression
-- `biome`, `black`, `dprint`, `eslint`, `gofmt`, `golangci`, `mypy`, `oxlint`, `prettier`, `rubocop`, `ruff`, `rustfmt`, `swiftlint` — Lint/formatter output compression
-- `npm`, `pip`, `pnpm`, `yarn` — Package manager output compression; `npm test`/`npm run` delegate to the tool detected in `package.json` (vitest, jest, eslint, biome, prettier, oxlint, tsc)
-- `aws`, `curl`, `dig`, `docker`, `gh`, `kubectl`, `nslookup`, `terraform`, `wget` — Infrastructure/container tool output compression (three-tier degradation, `--json`)
-- `mysql`, `psql`, `sqlite3` — Database query output compression (three-tier degradation, `--json`)
-- `df`, `diff`, `du`, `env`, `find`, `grep`, `ls`, `printenv`, `ps`, `rg`, `tree`, `wc` — File operations output compression
+`skim init --wrappers` symlinks `~/.skim/bin/<tool>` → the skim binary so sub-agent shells route through skim even when they bypass PreToolUse hooks. The binary calls `strip_skim_wrappers_from_path()` as the very first statement in `main()` (before any thread spawns), so wrapped commands resolve to the real tool — this is what prevents infinite recursion. `SKIM_PASSTHROUGH=1` is the escape hatch. Wrapper install/uninstall only ever touches symlinks whose target stem is `skim`/`rskim` — never regular files.
 
-### Environment Variables
+## Environment Variables
 
-**Analytics:**
-- `SKIM_DISABLE_ANALYTICS` — Set to `1`/`true`/`yes` to disable recording
-- `SKIM_INPUT_COST_PER_MTOK` — Override $/MTok for cost estimates (default: 3.0, rejects negative values)
-- `SKIM_ANALYTICS_DB` — Override analytics database path
-- `SKIM_SESSION_ID` — Session ID for analytics attribution across all skim invocations. Priority order: `--session-id` flag > sidecar > `SKIM_SESSION_ID` env > None. When using PATH wrappers, set alongside `PATH` export in your shell profile so sub-agents inherit it.
-
-**Session provider paths (used by `discover`, `learn`, `agents`):**
-- `SKIM_PROJECTS_DIR` — Override Claude Code projects directory (default: `~/.claude/projects/`)
-- `SKIM_CODEX_SESSIONS_DIR` — Override Codex CLI sessions directory
-- `SKIM_COPILOT_DIR` — Override Copilot CLI sessions directory
-- `SKIM_CURSOR_DB_PATH` — Override Cursor workspace state database path
-- `SKIM_GEMINI_DIR` — Override Gemini CLI sessions directory
-- `SKIM_CRUSH_DIR` — Override Crush sessions directory
-
-**Debug:**
-- `SKIM_DEBUG` — Set to `1`/`true`/`yes` to enable debug output (warnings/notices on stderr). Also available as `--debug` CLI flag.
-
-**Cache:**
-- `SKIM_CACHE_DIR` — Override skim cache directory (default: `~/.cache/skim/`)
-
-**Passthrough:**
-- `SKIM_PASSTHROUGH` — Set to `1`/`true`/`yes` to bypass all skim compression (hook, test, build). Useful for debugging when compressed output hides errors. Note: indefinitely-running commands (`vite dev`, `jest --watch`, `tail -f`, bare `skim vitest`) are auto-detected and passed through live with inherited stdio; use `skim vitest run` for a compressed one-shot run.
-
-### Shell Interception (PATH Wrappers)
-
-Sub-agents that spawn their own shell bypass PreToolUse hooks. PATH wrappers close this gap by intercepting commands at the OS level.
-
-**How it works:**
-1. `skim init --wrappers` creates symlinks `~/.skim/bin/<tool>` → skim binary for each supported tool
-2. User adds `export PATH="$HOME/.skim/bin:$PATH"` to their shell profile
-3. When any process invokes `git`, `npm`, etc., the shell resolves the symlink
-4. The skim binary detects `argv[0] == "git"` and dispatches through the existing git handler
-5. The binary strips `~/.skim/bin` from PATH as its first action — preventing infinite recursion
-
-**Recursion prevention:**
-- `strip_skim_wrappers_from_path()` is called as the very first statement in `main()` before any thread is spawned
-- When a handler runs `CommandRunner::run("git", …)`, the shell finds `/usr/bin/git` (not the symlink)
-- `SKIM_PASSTHROUGH=1` always works as an escape hatch — the handler checks it internally
-
-**Session attribution:**
-- Add `export SKIM_SESSION_ID="<id>"` to shell profile alongside the PATH export
-- This gives sub-agents a consistent session identity for analytics grouping
-- Priority order: `--session-id` flag > sidecar > `SKIM_SESSION_ID` env > None
-
-**Safety invariant:**
-- `install_wrappers` NEVER overwrites non-symlink files (regular files, directories, etc.)
-- Non-symlink paths are skipped with a warning
-- `uninstall_wrappers` ONLY removes symlinks whose target filename stem is exactly `"skim"` or `"rskim"`
-
-### Benchmarking
-```bash
-cargo bench                    # Criterion benchmarks
-hyperfine 'skim file.ts'       # CLI performance
-cargo flamegraph --bin skim -- file.ts  # Profile hot paths
-```
-
-## Release Process
-
-### Release Prep Script
-Run `./scripts/release-prep.sh <version>` to automate pre-flight validation, version bumps, and test count sync. The script handles pre-flight checks and mechanical version/doc updates. You must create the release branch first and write the CHANGELOG entry manually.
-
-### Pre-Release Checklist
-1. Verify all target PRs are merged to main
-2. Run `cargo test --all-features` — confirm passing count
-3. Create release branch: `git checkout -b release/vX.Y.Z main`
-
-### Version Bump (3 files, 4 edits)
-> **Automated by `release-prep.sh`** — manual steps listed for reference.
-- `crates/rskim-core/Cargo.toml` — package version
-- `crates/rskim/Cargo.toml` — package version + rskim-core dependency version
-- Run `cargo check` to update Cargo.lock
-
-### Documentation Updates
-> **Test counts and version string automated by `release-prep.sh`** — CHANGELOG and subcommand descriptions are manual.
-- `CHANGELOG.md` — convert [Unreleased] to [X.Y.Z] - YYYY-MM-DD, add new [Unreleased], add Version History entry
-- `README.md` — update version string (line ~591) and test count (line ~620)
-- `CLAUDE.md` — update test count (2 locations: line ~16 and line ~560)
-
-### Release Commit & Merge
-```
-git commit -m "release: vX.Y.Z — <summary>"
-git checkout main
-git merge release/vX.Y.Z --no-ff -m "Merge release/vX.Y.Z into main"
-git tag vX.Y.Z
-git push origin main --tags
-```
-
-### Automated Pipeline (triggered by tag push)
-`.github/workflows/release.yml` runs: test → build (7 targets) → GitHub Release → crates.io (rskim-core first, then rskim) → npm (7 platform pkgs + main) → Homebrew tap dispatch.
-
-**Critical:** Cargo.toml versions MUST match the tag version exactly or the build job fails.
-
-### Post-Release Verification
-- `cargo install rskim` — shows new version
-- `npx rskim --version` — shows new version
-- GitHub Release page — 7 binary assets attached
-- `brew update && brew info dean0x/tap/skim` — formula updated
-
-### Rollback (if CI fails after tag push)
-1. Delete the tag: `git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`
-2. Fix the issue on the release branch
-3. Re-merge to main, re-tag, re-push
-
-### Post-Release Cleanup
-- Delete release branch: `git branch -d release/vX.Y.Z`
-- Rebuild local dev binary: `cargo build --release` (keeps `target/release/skim` current with main)
+- `SKIM_PASSTHROUGH=1` — bypass all compression (use when compressed output hides an error). Indefinite commands (`vite dev`, `jest --watch`, bare `skim vitest`) auto-pass-through live; use `skim vitest run` for a compressed one-shot.
+- `SKIM_DEBUG=1` (or `--debug`) — warnings/notices on stderr.
+- `SKIM_SESSION_ID` — analytics session attribution; priority `--session-id` > sidecar > env > none. Set it alongside the PATH export so sub-agents inherit it.
+- `SKIM_CACHE_DIR` / `SKIM_ANALYTICS_DB` — override the cache dir / analytics DB path.
+- `SKIM_DISABLE_ANALYTICS=1` — disable recording. `SKIM_INPUT_COST_PER_MTOK` — $/MTok for cost estimates (default 3.0).
+- Session-provider overrides for `discover`/`learn`/`agents`: `SKIM_PROJECTS_DIR`, `SKIM_CODEX_SESSIONS_DIR`, `SKIM_COPILOT_DIR`, `SKIM_CURSOR_DB_PATH`, `SKIM_GEMINI_DIR`, `SKIM_CRUSH_DIR`.
 
 ## Design Constraints
 
-### MUST Follow
+**MUST:** stream to stdout (never write intermediate files) · prefer `&str` slices over allocation in the hot path · tolerate incomplete code (rely on tree-sitter error nodes) · stay under 50ms for 1000-line files (benchmark regressions block) · fail loud with actionable messages, never silently · modes via CLI flags only, no `.skimrc`.
 
-1. **Streaming-first** - Output to stdout, never write intermediate files
-2. **Zero-copy when possible** - Use `&str` slices, avoid allocations
-3. **Error-tolerant** - tree-sitter handles incomplete code gracefully
-4. **Performance-critical** - <50ms for 1000 lines (benchmark regressions block)
-5. **Multi-language from day 1** - No artificial TypeScript-only limitation
+**MUST NOT:** add syntax highlighting (use `bat`), linting (use linters), type checking (use `tsc`/`mypy`), or LSP features — all out of scope.
 
-### MUST NOT Do
+**Targets:** parse+transform <50ms/1000 lines · 60–80% token reduction (structure mode) · <10ms startup · <1s for 100 files (parallel via rayon).
 
-1. ❌ Add syntax highlighting (use `bat`)
-2. ❌ Add linting (use language-specific linters)
-3. ❌ Add type checking (use `tsc`, `mypy`, etc.)
-4. ❌ Add LSP features (out of scope)
-5. ❌ Silent failures (fail loud with clear error messages)
+**Exit codes:** `0` success · `1` general error · `2` parse error · `3` unsupported language.
 
-## Performance Requirements
+## Adding a Language
 
-- **Parse + Transform:** <50ms for 1000-line files
-- **Token Reduction:** 60-80% (structure mode)
-- **Startup Time:** <10ms (instant feel)
-- **Multi-file:** <1 second for 100 files (parallel)
+**tree-sitter language:** add the `tree-sitter-<lang>` dep at the workspace version, then a match arm in `to_tree_sitter()`. ~30 min.
 
-**Benchmark against:**
-- `bat`: 10ms for 1000 lines (syntax highlighting)
-- `ripgrep`: 0.2s for 1M lines (search)
+**Data format (non-tree-sitter, like JSON/YAML/TOML):**
+1. Add a `Language` variant in `rskim-core/src/types.rs`; return `None` from `to_tree_sitter()` and from the `get_*_node_types()` functions.
+2. Implement a transform module (`src/transform/<fmt>.rs`) with security limits (max depth, max keys).
+3. Route it in `Language::transform_source()` (Strategy Pattern).
+4. Add the variant to `LanguageArg` in `crates/rskim/src/main.rs`.
 
-## Output Modes
+## Testing
 
-```bash
-skim file.ts                    # Default: structure-only
-skim file.ts --mode=signatures  # Function/method signatures only
-skim file.ts --mode=types       # Type definitions only
-skim file.ts --mode=full        # No transformation (like cat)
+Fixtures live in `tests/fixtures/<language>/`, ≥4 per language. Integration targets: ≥95% parse success on real-world code, output still parses, 60–80% token reduction.
 
-# Multi-file with glob patterns (NEW in v0.4.0)
-skim 'src/**/*.ts'              # Process all TypeScript files recursively
-skim '*.{js,ts}' --jobs 4       # Parallel processing with 4 threads
-skim 'src/*.py' --no-header     # Multi-file without headers
-```
+**Known edge cases:** incomplete code → tree-sitter error nodes · files >100MB → error (memmap is future work) · binary files → detect and reject · stdin supported (`cat file.ts | skim`).
 
-## tree-sitter Integration
+## Release
 
-### Adding New Language (tree-sitter based)
-
-```toml
-# Cargo.toml (workspace dependencies section)
-[dependencies]
-tree-sitter-newlang = "0.23"  # CRITICAL: Must match workspace version
-```
-
-```rust
-// src/language.rs
-SourceLanguage::NewLang => tree_sitter_newlang::LANGUAGE.into()
-```
-
-Should take <30 minutes per language.
-
-### Adding Non-tree-sitter Languages
-
-For data formats that don't fit tree-sitter model (e.g., JSON, YAML, TOML -- all already implemented):
-
-1. **Add Language variant** to `Language` enum in `src/types.rs`
-2. **Return None** from `to_tree_sitter()` method
-3. **Implement transform module** (e.g., `src/transform/json.rs`)
-4. **Use Strategy Pattern** in `Language::transform_source()` to route parsing
-5. **Return None** from all `get_*_node_types()` functions
-6. **Add security limits** (max depth, max keys, etc.)
-7. **Update CLI** - add variant to `LanguageArg` enum in `crates/rskim/src/main.rs`
-
-**Key Principle:** The Strategy Pattern in `Language::transform_source()` eliminates special-case conditionals. Each language encapsulates its own parsing strategy.
-
-```rust
-// Example: Language::transform_source() dispatches to appropriate parser
-impl Language {
-    pub(crate) fn transform_source(&self, source: &str, mode: Mode, config: &Config) -> Result<String> {
-        match self {
-            Language::Json => json::transform_json(source),   // serde_json
-            Language::Yaml => yaml::transform_yaml(source),   // serde_yaml_ng
-            Language::Toml => toml::transform_toml(source),   // toml crate
-            _ => tree_sitter_transform(source, *self, mode),  // tree-sitter
-        }
-    }
-}
-```
-
-### Grammar Quality
-
-| Language | Status | Notes |
-|----------|--------|-------|
-| TypeScript | ✅ Excellent | Maintained by tree-sitter team |
-| Python | ✅ Excellent | Complete coverage |
-| Rust | ✅ Excellent | Very up-to-date |
-| Go | ✅ Good | Stable |
-| Java | ⚠️ Good | Some edge cases |
-| C | ✅ Excellent | Full C11 support |
-| C++ | ✅ Good | C++20 support |
-| C# | ✅ Good | Structs, interfaces, generics |
-| Ruby | ✅ Good | Classes, modules, methods |
-| SQL | ✅ Good | DDL/DML via tree-sitter-sequel |
-| Kotlin | ✅ Good | Data classes, coroutines, sealed classes |
-| Swift | ✅ Good | Protocols, generics, SwiftUI structs |
-
-## Error Handling Philosophy
-
-**Fail fast, fail loud:**
-
-```rust
-// ✅ GOOD
-Error: File not found: nonexistent.ts
-Hint: Check the file path exists
-
-// ❌ BAD
-Error: parse failed
-```
-
-**Exit codes:**
-- `0` - Success
-- `1` - General error
-- `2` - Parse error
-- `3` - Unsupported language
-
-## Testing Strategy
-
-### Test Fixtures Required
-
-```
-tests/fixtures/
-  typescript/{simple,class,async,generics}.ts
-  python/{simple,class,async,decorators}.py
-  rust/{simple,struct,impl,traits}.rs
-  go/{simple,struct,interface}.go
-  java/{Simple,Class,Interface}.java
-  c/{simple,structs,enums,pointers,preprocessor}.c
-  cpp/{simple,classes,templates,namespaces,modern}.cpp
-  json/{simple,nested,array,edge}.json
-  yaml/{simple,kubernetes,github-actions}.yaml
-  toml/{simple,cargo,nested}.toml
-```
-
-**Minimum:** 4 fixtures per language.
-
-### Real-World Testing
-
-Test on actual open-source projects (not just fixtures):
-- TypeScript: VSCode extension samples
-- Python: Flask apps
-- Rust: ripgrep source
-- Go: Hugo samples
-- Java: Spring Boot controllers
-
-### Integration Tests
-
-Validate:
-- 95%+ parse success on real-world code
-- Output produces valid code (lints without errors)
-- All type information preserved
-- Token reduction achieves 60-80% savings
-
-## Known Edge Cases
-
-1. **Incomplete code** - tree-sitter handles gracefully (error nodes)
-2. **Very large files (>100MB)** - v1: Fail with error; v2: Use memmap2
-3. **Binary files** - Detect and reject with clear error
-4. **Stdin input** - Support `cat file.ts | skim`
-
-## Caching Strategy (Phase 3)
-
-**Cache transformed output, not AST:**
-
-```rust
-CacheKey {
-  path: PathBuf,
-  mtime: SystemTime,  // Invalidation trigger
-  mode: String,       // "structure", "signatures", etc.
-}
-```
-
-**Location:** `~/.cache/skim/`
-**Invalidation:** File mtime change or mode change
-**Rationale:** tree-sitter is fast enough that caching may not help v1
-
-**Also stored in `~/.cache/skim/`:** `analytics.db` (token savings database). Note: `--clear-cache` clears only the parser cache, not the analytics database. Use `skim stats --clear` to reset analytics.
-
-## Distribution Strategy (cargo-dist)
-
-### Why cargo-dist?
-
-**Recommended tool for Rust CLI → npm distribution:**
-- Auto-generates GitHub Actions for cross-platform builds
-- Publishes to crates.io AND npm simultaneously
-- Handles platform-specific binary downloads
-- Used by ripgrep, bat, fd (our performance benchmarks)
-- Reduces manual CI maintenance
-
-### Setup (Week 11 in plan.md)
-
-```bash
-# Install cargo-dist
-cargo install cargo-dist
-
-# Initialize (creates dist config in Cargo.toml)
-cargo dist init
-
-# Generates .github/workflows/release.yml
-```
-
-### Cargo.toml Configuration
-
-```toml
-[package]
-name = "skim"
-version = "2.0.0"
-
-# cargo-dist configuration
-[workspace.metadata.dist]
-cargo-dist-version = "0.14.0"
-ci = ["github"]
-installers = ["shell", "npm"]
-targets = [
-  "x86_64-unknown-linux-gnu",
-  "x86_64-apple-darwin",
-  "aarch64-apple-darwin",
-  "x86_64-pc-windows-msvc"
-]
-
-# npm-specific settings
-[workspace.metadata.dist.npm]
-scope = "@rskim"  # Publishes as @rskim/cli on npm
-```
-
-### Release Process
-
-```bash
-# 1. Update version in Cargo.toml
-# 2. Commit and tag
-git tag v2.0.0
-git push --tags
-
-# 3. GitHub Actions automatically:
-#    - Builds for all platforms
-#    - Creates GitHub release
-#    - Publishes to crates.io
-#    - Publishes to npm registry
-```
-
-### npm Package Structure (auto-generated by cargo-dist)
-
-```
-@rskim/cli/
-  package.json
-  bin/
-    skim.js          # Wrapper that spawns correct binary
-  npm/
-    skim-linux-x64/
-    skim-darwin-x64/
-    skim-darwin-arm64/
-    skim-win32-x64/
-```
-
-**Binary selection:** Wrapper detects `process.platform` and `process.arch`, downloads correct binary on first run.
-
-### Platform Support
-
-| Platform | Architecture | npm package |
-|----------|--------------|-------------|
-| Linux | x86_64 | `@rskim/cli-linux-x64` |
-| Linux | x86_64 (musl) | `@rskim/cli-linux-x64-musl` |
-| Linux | ARM64 | `@rskim/cli-linux-arm64` |
-| Linux | ARM64 (musl) | `@rskim/cli-linux-arm64-musl` |
-| macOS | x86_64 | `@rskim/cli-darwin-x64` |
-| macOS | ARM64 (M1/M2) | `@rskim/cli-darwin-arm64` |
-| Windows | x86_64 | `@rskim/cli-win32-x64` |
-
-### Trade-offs
-
-**Pros:**
-✅ Target audience (Node.js/TS devs) can `npx @rskim/cli`
-✅ Lower barrier to entry (no Rust toolchain needed)
-✅ Can be used in package.json scripts
-✅ Automated release process
-
-**Cons:**
-❌ Larger npm package size (~5-10MB per platform)
-❌ More complex CI (cross-compilation for 7 platforms)
-❌ Must keep Cargo.toml and package.json versions in sync
-❌ GitHub Actions runner costs (macOS/Windows runners are more expensive)
-
-### CI Cost Considerations
-
-Cross-platform builds require different GitHub Actions runners:
-- Linux: Free on public repos
-- macOS: 10x credits (more expensive)
-- Windows: 2x credits
-
-**Estimated:** ~5-10 minutes per release × 7 platforms = 35-70 CI minutes per release.
-
-**Note:** ARM64 Linux uses cross-compilation (via `cross-rs`) on x86_64 runners, so no additional runner costs beyond the standard Linux minutes.
-
-## Starter Implementation Guide
-
-### Week 1 Tasks (from plan.md)
-
-1. `cargo new rskim --bin`
-2. Add tree-sitter dependencies
-3. Basic CLI structure with clap
-4. Parse simple TypeScript file
-5. Create test fixtures
-6. Validate AST access works
-
-**NOTE:** All phases complete (100%). Phase 3 features (multi-file glob, caching, parallel processing, token counting) are fully implemented and tested with 5,213 tests passing. See README.md for full usage guide.
-
-### Critical First File: `src/parser.rs`
-
-```rust
-use tree_sitter::{Parser, Tree};
-
-pub fn parse_typescript(source: &str) -> Result<Tree, String> {
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())?;
-    parser.parse(source, None).ok_or("Parse failed")
-}
-```
-
-### Critical Second File: `src/transform.rs`
-
-Extract structure by:
-- Visiting AST nodes with cursor
-- Keeping signatures/types
-- Replacing function bodies with `/* ... */`
-- Preserving indentation and readability
-
-## Success Criteria
-
-**Phase 1 Gate:** Can `rskim file.ts --mode=structure | head` and get reasonable output
-
-**v1.0 Gate:**
-- [x] All tests pass (400/400)
-- [x] Benchmarks meet <50ms target (14.6ms for 3000-line files - 3x faster than target)
-- [x] 17 languages supported (TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, SQL, Kotlin, Swift, Markdown, JSON, YAML, TOML)
-- [x] `cargo install rskim` works
-- [x] Documentation complete
-- [x] CI green on all platforms
-- [x] npm distribution works (`npm install -g rskim`)
-
-## Resources
-
-- **tree-sitter docs:** https://tree-sitter.github.io/tree-sitter/
-- **tree-sitter grammars:** https://github.com/tree-sitter
-- **Rust AST example:** See research.md lines 97-113
-
-## Development Anti-Patterns
-
-Given the vision, avoid:
-
-1. **Adding config files** - Modes via CLI flags only (no `.skimrc`)
-2. **Intermediate file writes** - Stream directly to stdout
-3. **Line-buffered output** - Use `BufWriter` for performance
-4. **String allocations in hot path** - Use `&str` slices
-5. **Blocking on single file** - Use rayon for multi-file parallel processing
-
-## Reference Implementation Patterns
-
-### Zero-Copy String Slicing
-```rust
-// ✅ GOOD - Borrows source
-let text = node.utf8_text(source.as_bytes())?;
-
-// ❌ BAD - Allocates new String
-let text = node.text().to_string();
-```
-
-### Buffered Streaming Output
-```rust
-use std::io::{BufWriter, Write};
-
-let mut stdout = BufWriter::new(io::stdout());
-writeln!(stdout, "{}", output)?;  // Buffered
-stdout.flush()?;
-```
-
-### Language Detection
-```rust
-fn detect_language(path: &Path) -> Option<SourceLanguage> {
-    match path.extension()?.to_str()? {
-        "ts" | "tsx" => Some(SourceLanguage::TypeScript),
-        "py" => Some(SourceLanguage::Python),
-        // ...
-        _ => None,
-    }
-}
-```
+Run `./scripts/release-prep.sh <version>` (pre-flight checks + mechanical version bumps). You still create the `release/vX.Y.Z` branch and write the CHANGELOG entry by hand. The version lives in `crates/rskim-core/Cargo.toml` and `crates/rskim/Cargo.toml` (plus the `rskim-core` dependency version) — all MUST equal the tag exactly or the build job fails. Pushing tag `vX.Y.Z` triggers `.github/workflows/release.yml`: test → build (7 targets) → GitHub Release → crates.io (`rskim-core` then `rskim`) → npm → Homebrew tap.
