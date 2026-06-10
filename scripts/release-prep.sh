@@ -14,9 +14,8 @@
 #   3. Runs pre-flight checks (fmt, clippy, tests)
 #   4. Bumps version in all 3 locations (4 edits)
 #   5. Runs cargo check to update Cargo.lock
-#   6. Syncs test count in README.md and CLAUDE.md
-#   7. Syncs version string in README.md
-#   8. Prints summary with manual steps remaining
+#   6. Syncs version string in README.md
+#   7. Prints summary with manual steps remaining
 
 set -euo pipefail
 
@@ -121,19 +120,6 @@ if [ $TEST_EXIT -ne 0 ]; then
 fi
 echo -e "${GREEN}✓${RESET} cargo test"
 
-# Extract test count: sum all "N passed" lines (one per test binary),
-# or fall back to skim-formatted "PASS: N" summary
-RAW_COUNT=$(echo "$TEST_OUTPUT" | grep -oE '([0-9]+) passed' | grep -oE '[0-9]+' | awk '{s+=$1} END {print s}' || true)
-if [ -z "$RAW_COUNT" ] || [ "$RAW_COUNT" = "0" ]; then
-  RAW_COUNT=$(echo "$TEST_OUTPUT" | grep -oE 'PASS: [0-9]+' | grep -oE '[0-9]+' | awk '{s+=$1} END {print s}' || true)
-fi
-
-if [ -z "$RAW_COUNT" ]; then
-  echo -e "${YELLOW}⚠${RESET}  Could not extract test count from test output — test count sync will be skipped"
-else
-  echo -e "${GREEN}✓${RESET} Test count: $RAW_COUNT"
-fi
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 4: Version bump
 # ─────────────────────────────────────────────────────────────────────────────
@@ -183,43 +169,12 @@ fi
 echo -e "${GREEN}✓${RESET} Cargo.lock updated"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 6: Test count sync
-# ─────────────────────────────────────────────────────────────────────────────
-echo ""
-echo "── Test count sync ──"
-
-README="${REPO_ROOT}/README.md"
-CLAUDE_MD="${REPO_ROOT}/CLAUDE.md"
-
-if [ -n "$RAW_COUNT" ]; then
-  # Format with comma: 2629 → 2,629
-  # For numbers >= 1000, insert comma 3 chars from end
-  FORMATTED_COUNT=$(echo "$RAW_COUNT" | sed 's/\([0-9]\)\([0-9]\{3\}\)$/\1,\2/')
-
-  # README.md: replace "N,NNN tests passing" pattern
-  if grep -q '[0-9],[0-9][0-9][0-9] tests passing' "$README"; then
-    sed -i '' "s/[0-9][0-9]*,[0-9][0-9][0-9] tests passing/${FORMATTED_COUNT} tests passing/" "$README"
-    echo -e "${GREEN}✓${RESET} README.md — test count updated to $FORMATTED_COUNT"
-  else
-    echo -e "${YELLOW}⚠${RESET}  README.md — test count pattern not found (manual update required)"
-  fi
-
-  # CLAUDE.md: replace all occurrences of "N,NNN tests passing" (2 locations)
-  if grep -q '[0-9],[0-9][0-9][0-9] tests passing' "$CLAUDE_MD"; then
-    sed -i '' "s/[0-9][0-9]*,[0-9][0-9][0-9] tests passing/${FORMATTED_COUNT} tests passing/g" "$CLAUDE_MD"
-    echo -e "${GREEN}✓${RESET} CLAUDE.md — test count updated to $FORMATTED_COUNT (all occurrences)"
-  else
-    echo -e "${YELLOW}⚠${RESET}  CLAUDE.md — test count pattern not found (manual update required)"
-  fi
-else
-  echo -e "${YELLOW}⚠${RESET}  Skipping test count sync (count not available)"
-fi
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 7: Version string sync in README.md
+# Step 6: Version string sync in README.md
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "── Version string sync ──"
+
+README="${REPO_ROOT}/README.md"
 
 if grep -q "\*\*Current\*\*: v${OLD_VERSION} — Stable" "$README"; then
   sed -i '' "s/\*\*Current\*\*: v${OLD_VERSION} — Stable/**Current**: v${NEW_VERSION} — Stable/" "$README"
@@ -229,7 +184,7 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 8: Summary
+# Step 7: Summary
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "══════════════════════════════════════════════════"
@@ -240,12 +195,7 @@ echo "Files updated automatically:"
 echo "  • crates/rskim-core/Cargo.toml — package version"
 echo "  • crates/rskim/Cargo.toml — package version + rskim-core dependency"
 echo "  • Cargo.lock — propagated by cargo check"
-if [ -n "$RAW_COUNT" ]; then
-  echo "  • README.md — version string + test count (${FORMATTED_COUNT})"
-  echo "  • CLAUDE.md — test count (${FORMATTED_COUNT}, 2 locations)"
-else
-  echo "  • README.md — version string"
-fi
+echo "  • README.md — version string"
 echo ""
 echo -e "${YELLOW}Manual steps remaining:${RESET}"
 echo "  1. Write CHANGELOG.md entry for [${NEW_VERSION}]"
