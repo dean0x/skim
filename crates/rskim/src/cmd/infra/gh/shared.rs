@@ -33,6 +33,33 @@ use crate::runner::CommandOutput;
 use super::combine_stdout_stderr;
 
 // ============================================================================
+// Transparency gate helpers
+// ============================================================================
+
+/// gh flags by which the user controls output format. When any of these are
+/// present, skim passes gh's output through byte-faithfully.
+///
+/// `--web`/`-w` are intentionally EXCLUDED: `--web` emits no stdout to
+/// corrupt, and `-w` is ambiguous (`--workflow` on `gh run list`).
+pub(crate) const GH_OUTPUT_STEERING_FLAGS: &[&str] = &["--json", "--jq", "-q", "--template", "-t"];
+
+/// Return true if `args` contains any output-steering flag before a `--`
+/// separator.
+///
+/// Uses strict matching: `arg == flag` or `arg` starts with `flag=`.
+/// Mirrors the rewrite engine's `should_skip_by_flag` semantics so that
+/// both layers stay in sync.  Iterates `&str` refs without allocation.
+/// Glued short-value forms (`-q.body`) are NOT matched by design —
+/// consistent with the hook skip-list behaviour.
+pub(crate) fn user_steers_output(args: &[String]) -> bool {
+    args.iter().take_while(|a| a.as_str() != "--").any(|a| {
+        GH_OUTPUT_STEERING_FLAGS.iter().any(|f| {
+            a.as_str() == *f || (a.starts_with(f) && a.as_bytes().get(f.len()) == Some(&b'='))
+        })
+    })
+}
+
+// ============================================================================
 // Shared constants
 // ============================================================================
 
@@ -310,4 +337,135 @@ where
 
     // Tier 3: passthrough
     ParseResult::Passthrough(combined.into_owned())
+}
+
+// ============================================================================
+// Unit tests for user_steers_output
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // --- TRUE cases (steering flag present) ---
+
+    #[test]
+    fn test_user_steers_output_json() {
+        assert!(user_steers_output(&args(&[
+            "issue", "view", "93", "--json"
+        ])));
+    }
+
+    #[test]
+    fn test_user_steers_output_jq() {
+        assert!(user_steers_output(&args(&[
+            "issue", "view", "93", "--jq", ".body"
+        ])));
+    }
+
+    #[test]
+    fn test_user_steers_output_q_short() {
+        assert!(user_steers_output(&args(&[
+            "issue", "view", "93", "-q", ".body"
+        ])));
+    }
+
+    #[test]
+    fn test_user_steers_output_template() {
+        assert!(user_steers_output(&args(&[
+            "pr",
+            "view",
+            "15",
+            "--template",
+            "{{.title}}"
+        ])));
+    }
+
+    #[test]
+    fn test_user_steers_output_t_short() {
+        assert!(user_steers_output(&args(&[
+            "pr",
+            "view",
+            "15",
+            "-t",
+            "{{.title}}"
+        ])));
+    }
+
+    #[test]
+    fn test_user_steers_output_json_eq_value() {
+        assert!(user_steers_output(&args(&[
+            "issue",
+            "view",
+            "93",
+            "--json=number,title"
+        ])));
+    }
+
+    #[test]
+    fn test_user_steers_output_q_eq_value() {
+        assert!(user_steers_output(&args(&[
+            "issue", "view", "93", "-q=.body"
+        ])));
+    }
+
+    // --- FALSE cases (no steering flag) ---
+
+    #[test]
+    fn test_user_steers_output_empty() {
+        assert!(!user_steers_output(&args(&[])));
+    }
+
+    #[test]
+    fn test_user_steers_output_web_not_steering() {
+        // --web intentionally excluded (opens browser, no stdout to corrupt)
+        assert!(!user_steers_output(&args(&[
+            "issue", "view", "93", "--web"
+        ])));
+    }
+
+    #[test]
+    fn test_user_steers_output_w_not_steering() {
+        // -w excluded: ambiguous (--workflow on gh run list)
+        assert!(!user_steers_output(&args(&["run", "list", "-w", "ci.yml"])));
+    }
+
+    #[test]
+    fn test_user_steers_output_workflow_not_steering() {
+        assert!(!user_steers_output(&args(&[
+            "run",
+            "list",
+            "--workflow",
+            "ci.yml"
+        ])));
+    }
+
+    #[test]
+    fn test_user_steers_output_steering_after_separator_ignored() {
+        // Flags after `--` must not trigger the gate
+        assert!(!user_steers_output(&args(&[
+            "api",
+            "repos/o/r",
+            "--",
+            "--json"
+        ])));
+    }
+
+    #[test]
+    fn test_user_steers_output_glued_q_not_matched() {
+        // Glued -q.body: strict match does not fire for the short alias
+        assert!(!user_steers_output(&args(&[
+            "issue", "view", "93", "-q.body"
+        ])));
+    }
+
+    #[test]
+    fn test_user_steers_output_glued_qx_not_matched() {
+        // -qx: no `=` separator → strict match does not fire
+        assert!(!user_steers_output(&args(&["issue", "view", "93", "-qx"])));
+    }
 }

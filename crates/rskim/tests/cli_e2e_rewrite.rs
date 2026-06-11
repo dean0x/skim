@@ -1189,13 +1189,22 @@ fn test_rewrite_rg_json_skipped() {
 }
 
 #[test]
-fn test_rewrite_gh_json_rewrites() {
-    // --json is no longer a skip flag for gh list commands — handler supports
-    // --json output natively, so the rewrite should succeed (exit 0).
+fn test_rewrite_gh_json_skipped() {
+    // --json is now a skip flag for gh list/view commands — output-steering
+    // flags pass through with exact bytes, so the rewrite must be absent (exit 1).
     skim_cmd()
-        .args(["rewrite", "gh", "pr", "list", "--json", "title"])
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "pr",
+            "list",
+            "--json",
+            "title",
+        ])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
 }
 
 // ============================================================================
@@ -1244,13 +1253,23 @@ fn test_rewrite_git_log_oneline_roundtrip() {
 }
 
 #[test]
-fn test_rewrite_gh_pr_list_json_roundtrip() {
-    // v2.8.0: `gh pr list --json number` rewrites to `skim gh pr list --json number`
+fn test_rewrite_gh_pr_list_json_skipped() {
+    // --json is now a skip flag: gh pr list --json must not rewrite (exit 1,
+    // "match":false in --suggest output). Byte-faithful passthrough is handled
+    // by the handler gate (cmd/infra/gh/mod.rs) and the rules.rs skip-list.
     skim_cmd()
-        .args(["rewrite", "gh", "pr", "list", "--json", "number"])
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "pr",
+            "list",
+            "--json",
+            "number",
+        ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim gh pr list --json number"));
+        .stdout(predicate::str::contains("\"match\":false"));
 }
 
 #[test]
@@ -1416,6 +1435,110 @@ fn test_rewrite_gh_run_view_log_failed_skipped() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));
+}
+
+// ============================================================================
+// gh output-steering skip tests — Part 1A (hook path)
+// ============================================================================
+
+#[test]
+fn test_rewrite_gh_issue_view_q_skipped() {
+    // Reported repro: gh issue view 93 -q .body must not rewrite.
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "issue",
+            "view",
+            "93",
+            "-q",
+            ".body",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_gh_issue_view_t_skipped() {
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "issue",
+            "view",
+            "93",
+            "-t",
+            "{{.body}}",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_gh_issue_view_w_skipped() {
+    skim_cmd()
+        .args(["rewrite", "--suggest", "gh", "issue", "view", "93", "-w"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_gh_issue_view_json_skipped() {
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "issue",
+            "view",
+            "93",
+            "--json",
+            "number,title,body",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_gh_api_q_skipped() {
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "api",
+            "repos/o/r",
+            "-q",
+            ".name",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_gh_api_json_rewrites() {
+    // gh api has no --json flag (responses are always JSON natively).
+    // --json is therefore NOT in the api skip-list, so the rewrite fires.
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "api",
+            "repos/o/r",
+            "--json",
+            "x",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":true"));
 }
 
 // ============================================================================
