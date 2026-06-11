@@ -26,7 +26,7 @@
         "crates/rskim/src/runner.rs",
         "crates/rskim/src/cmd/rewrite/indefinite.rs"
       ],
-      "lastUpdated": "2026-06-08T19:02:20.508Z",
+      "lastUpdated": "2026-06-11T21:47:11.500Z",
       "createdBy": "devflow-knowledge"
     },
     "cochange": {
@@ -51,7 +51,7 @@
         "crates/rskim-search/src/temporal/storage_ops.rs",
         "crates/rskim-search/src/io_util.rs"
       ],
-      "lastUpdated": "2026-06-09T10:17:42.547Z",
+      "lastUpdated": "2026-06-11T21:46:58.466Z",
       "createdBy": "implement"
     },
     "temporal-scoring": {
@@ -73,12 +73,12 @@
         "crates/rskim-search/src/types.rs",
         "crates/rskim-search/src/lib.rs"
       ],
-      "lastUpdated": "2026-06-09T10:17:50.613Z",
+      "lastUpdated": "2026-06-11T21:46:49.560Z",
       "createdBy": "implement"
     },
     "ast-index": {
       "name": "AST Index (CST Linearization + N-gram Encoding + On-Disk Store)",
-      "description": "Use when implementing AST-based n-gram extraction, building or reading the on-disk structural index, adding a new language to the structural index, debugging depth or node-count truncation, extending the shared vocabulary, working with AstBigram/AstTrigram IDF weights, extracting structural n-grams or structural metrics from linearized nodes, using the Pattern Library (structural code patterns), using the shared AstWalkIter traversal primitive, or working with the Wave 3f BM25-ranked AST structural query engine (AstQueryEngine, AstQuery, parse_ast_query, AstPostingSource). Keywords: linearize, CST, AST, n-gram, bigram, trigram, NodeKindId, AstBigram, AstTrigram, AstNgramSet, AstBigramEntry, AstTrigramEntry, NODE_KIND_VOCABULARY, LANG_MAPS, LinearNode, AstWalkIter, AstWalkConfig, tree-sitter, depth-encoded, pre-order, IDF, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_metrics, extract_ast_ngrams_with_weights, StructuralMetrics, structural, Pattern, patterns, EMPTY_BODY, DEEP_NODE, LARGE_BODY, MANY_PARAMS, bucket_label, synthetic n-gram, store, AstIndexBuilder, AstIndexReader, AstPosting, AstFileMetaEntry, skidx, skpost, SKAX, FORMAT_VERSION, AST_INDEX_FORMAT_VERSION, on-disk index, mmap, posting list, build_from_files, lookup_bigram, lookup_trigram, index_version, AstQuery, AstQueryEngine, AstPostingSource, parse_ast_query, search_ast, AST_BM25_K1, AST_BM25_B, query.rs, Wave 3f, Wave 3g, cmd-search, self-heal, auto-rebuild.",
+      "description": "Use when implementing AST-based n-gram extraction, building or reading the on-disk structural index, adding a new language to the structural index, debugging depth or node-count truncation, extending the shared vocabulary, working with AstBigram/AstTrigram IDF weights, extracting structural n-grams or structural metrics from linearized nodes, using the Pattern Library (structural code patterns), using the shared AstWalkIter traversal primitive, or working with the Wave 3f BM25-ranked AST structural query engine (AstQueryEngine, AstQuery, parse_ast_query, AstPostingSource). Keywords: linearize, CST, AST, n-gram, bigram, trigram, NodeKindId, AstBigram, AstTrigram, AstNgramSet, AstBigramEntry, AstTrigramEntry, NODE_KIND_VOCABULARY, LANG_MAPS, LinearNode, AstWalkIter, AstWalkConfig, tree-sitter, depth-encoded, pre-order, IDF, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_metrics, extract_ast_ngrams_with_weights, StructuralMetrics, structural, Pattern, patterns, EMPTY_BODY, DEEP_NODE, LARGE_BODY, MANY_PARAMS, bucket_label, synthetic n-gram, store, AstIndexBuilder, AstIndexReader, AstPosting, AstFileMetaEntry, skidx, skpost, SKAX, FORMAT_VERSION, AST_INDEX_FORMAT_VERSION, on-disk index, mmap, posting list, build_from_files, lookup_bigram, lookup_trigram, index_version, AstQuery, AstQueryEngine, AstPostingSource, parse_ast_query, search_ast, AST_BM25_K1, AST_BM25_B, query.rs, Wave 3f, Wave 3g, cmd-search, self-heal, auto-rebuild, validate_ast_pattern.",
       "directories": [
         "crates/rskim-search/src/ast_index/",
         "crates/rskim-core/src/"
@@ -102,12 +102,12 @@
         "crates/rskim-search/benches/ast_index_bench.rs",
         "crates/rskim-search/benches/ast_query.rs"
       ],
-      "lastUpdated": "2026-06-09T10:18:10.827Z",
+      "lastUpdated": "2026-06-11T21:46:40.015Z",
       "createdBy": "implement"
     },
     "cmd-search": {
       "name": "Search CLI (skim search subcommand)",
-      "description": "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, execute_query_with_manifest, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, resolve_search_cache_dir, parse_flags, parse_temporal_flag, parse_limit_value, take_flag_value, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone, derive_ast_entry, search_ast, resolve_ast_file_filter, hooks.rs, install_search_hooks, remove_search_hooks, cochange_partner_paths.",
+      "description": "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, execute_query_with_manifest, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, resolve_search_cache_dir, parse_flags, parse_temporal_flag, parse_limit_value, take_flag_value, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone, derive_ast_entry, search_ast, resolve_ast_file_filter, hooks.rs, install_search_hooks, remove_search_hooks, resolve_blast_radius_paths, resolve_blast_radius_file_ids, paths_to_file_ids, cochange_partner_paths.",
       "directories": [
         "crates/rskim/src/cmd/search/"
       ],
@@ -124,7 +124,7 @@
         "crates/rskim/src/cmd/search/snippet.rs",
         "crates/rskim/src/cmd/search/hooks.rs"
       ],
-      "lastUpdated": "2026-06-09T20:04:20.248Z",
+      "lastUpdated": "2026-06-11T21:46:22.599Z",
       "createdBy": "implement"
     }
   }

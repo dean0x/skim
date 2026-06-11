@@ -1,7 +1,7 @@
 ---
 feature: cmd-search
 name: Search CLI (skim search subcommand)
-description: "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, execute_query_with_manifest, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, resolve_search_cache_dir, parse_flags, parse_temporal_flag, parse_limit_value, take_flag_value, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone, derive_ast_entry, search_ast, resolve_ast_file_filter, hooks.rs, install_search_hooks, remove_search_hooks, cochange_partner_paths."
+description: "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, execute_query_with_manifest, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, resolve_search_cache_dir, parse_flags, parse_temporal_flag, parse_limit_value, take_flag_value, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone, derive_ast_entry, search_ast, resolve_ast_file_filter, hooks.rs, install_search_hooks, remove_search_hooks, resolve_blast_radius_paths, resolve_blast_radius_file_ids, paths_to_file_ids, cochange_partner_paths."
 category: architecture
 directories:
   - crates/rskim/src/cmd/search/
@@ -18,8 +18,8 @@ referencedFiles:
   - crates/rskim/src/cmd/search/snippet.rs
   - crates/rskim/src/cmd/search/hooks.rs
 created: 2026-06-09
-updated: 2026-06-09
-version: 3
+updated: 2026-06-12
+version: 4
 ---
 
 # Search CLI (skim search subcommand)
@@ -28,7 +28,7 @@ version: 3
 
 `crates/rskim/src/cmd/search/` is the CLI orchestration layer for `skim search`. It is the only code that performs I/O, parses flags, coordinates the build pipeline, triggers auto-refresh, resolves paths, and formats output. All business logic — n-gram extraction, BM25F scoring, AST index construction, temporal risk scoring, co-change matrices — lives in the `rskim-search` library crate. This layer exists solely to wire those library features together into a cohesive user-facing command.
 
-The module is split into eleven focused files: `mod.rs` (dispatch + hand-rolled flag parsing), `index.rs` (streaming pipeline), `query.rs` (search execution + formatters), `staleness.rs` (git-HEAD-based auto-refresh + AST self-heal), `types.rs` (pure data types), `ast.rs` (AST flag helpers), `temporal.rs` (temporal flag helpers), `manifest.rs` (JSONL sidecar), `walk.rs` (file traversal), `snippet.rs` (context window extraction), and `hooks.rs` (git hook install/remove). The design rule is that I/O lives in `mod.rs`/`index.rs`/`query.rs` and helpers are pulled into the focused sub-modules — never scattered across files.
+The module is split into eleven focused files: `mod.rs` (dispatch + hand-rolled flag parsing), `index.rs` (streaming pipeline), `query.rs` (search execution + formatters), `staleness.rs` (git-HEAD-based auto-refresh + AST self-heal), `types.rs` (pure data types), `ast.rs` (AST flag helpers), `temporal.rs` (temporal flag helpers + blast-radius resolution), `manifest.rs` (JSONL sidecar), `walk.rs` (file traversal), `snippet.rs` (context window extraction), and `hooks.rs` (git hook install/remove). The design rule is that I/O lives in `mod.rs`/`index.rs`/`query.rs` and helpers are pulled into the focused sub-modules — never scattered across files.
 
 ## System Context
 
@@ -38,7 +38,7 @@ Cache layout: `~/.cache/skim/search/{sha256(canonical_root)[..16]}/` (per-projec
 
 - `index.skidx` / `index.skfiles` — lexical n-gram index (built by `NgramIndexBuilder`)
 - `ast_index.skidx` / `ast_index.skpost` — AST structural index (built by `AstIndexBuilder`)
-- `index.skfiles` / `manifest.json` — actually `index.skfiles` is a JSONL sidecar (`FileManifest`)
+- `index.skfiles` — JSONL sidecar (`FileManifest`)
 - `temporal.db` — SQLite temporal DB populated by `skim heatmap`
 - `.skim-build.lock` — advisory file-based lock for concurrent build safety
 
@@ -104,9 +104,11 @@ If AST build fails, `manifest.save()` is NEVER reached. The old manifest survive
 
 `StalenessCheck` outcomes:
 - `Current` — no action needed
-- `HeadChanged` — rebuild triggered
+- `HeadChanged { stored, current }` — rebuild triggered (struct variant with fields)
 - `NoStoredHead` — rebuild triggered (old manifest or new git repo)
 - `NoIndex` — cold build triggered
+
+`resolve_git_dir(project_root)` is a helper in `staleness.rs` that resolves the `.git` directory — handles ordinary directories and worktree pointers (`gitdir:` file). Exposed as `pub(super)` and reused by `read_git_head`.
 
 **AST self-heal**: `check_staleness` runs an additional check before comparing HEADs. If `ast_index.skidx` is absent OR its format version (6-byte probe via `AstIndexReader::index_version`) is below `AST_INDEX_FORMAT_VERSION`, it returns `NoStoredHead` to force a full rebuild. This handles: post-format-upgrade (v1→v2), crash between `lexical.build()` and `ast.build()`, and first run after adding `--ast` to an existing install.
 
@@ -119,12 +121,21 @@ If AST build fails, `manifest.save()` is NEVER reached. The old manifest survive
 - `execute_query(config, analytics)` — test-only entry point. Calls `execute_query_with_manifest(config, None, analytics)`. Annotated `#[cfg_attr(not(test), allow(dead_code))]`.
 - `execute_query_with_manifest(config, pre_loaded_manifest, analytics)` — production path. When `pre_loaded_manifest` is `Some`, skips `auto_refresh_if_stale` entirely (used by the combined text+`--ast` path in `run_query`, which already refreshed before opening the AST engine). When `None`, refreshes itself — this is the pure-lexical path.
 
+**`QueryConfig` fields** (in `types.rs`):
+- `text: String` — raw query text
+- `limit: usize` — max results
+- `json: bool` — JSON output mode
+- `root: PathBuf` — project root
+- `cache_dir: PathBuf` — cache dir
+- `blast_radius_paths: Option<HashSet<String>>` — optional set of allowed repo-relative path **strings** (resolved by `temporal::resolve_blast_radius_paths` in `mod.rs` before calling `execute_query_with_manifest`)
+- `ast_file_ids: Option<HashSet<FileId>>` — optional set of FileIds from an AST pattern query (resolved by `ast::resolve_ast_file_filter` before query)
+
 Steps in `execute_query_with_manifest`:
 1. Empty text → short-circuit immediately (no I/O).
 2. Refresh or use pre-loaded manifest.
 3. Open `NgramIndexReader` → wrap in `QueryEngine`.
 4. Build `SearchQuery`: set `limit` and `file_filter`.
-5. **File filter construction** — intersection of blast-radius FileIds ∩ AST FileIds. Applied before `LIMIT` so the limit applies to the filtered set. Uses `u32::try_from(idx)` (applies PF-004: safe widening, never `as u32`).
+5. **File filter construction** — intersection of blast-radius FileIds (converted from `blast_radius_paths` using `sorted_paths()`) ∩ AST FileIds. Applied before `LIMIT` so the limit applies to the filtered set. Uses `u32::try_from(idx)` (applies PF-004: safe widening, never `as u32`).
 6. `engine.search(&sq)` → raw `Vec<SearchResult>` with FileIds.
 7. `resolve_paths_and_snippets` — maps FileId → path via `manifest.sorted_paths()`, extracts snippets.
 8. Return `QueryOutput`.
@@ -136,13 +147,13 @@ After `execute_query_with_manifest`, `mod.rs` applies `apply_temporal_enrichment
 Four responsibilities:
 
 - `open_ast_engine(cache_dir)` — fails loud (Err) when `ast_index.skidx` is absent; gives build guidance in error message.
-- `validate_ast_pattern(raw)` — called at dispatch time BEFORE opening the index. Rejects `SingleNode` queries (`#283`) and unknown patterns.
+- `validate_ast_pattern(raw)` — called at dispatch time BEFORE opening the index. Rejects `SingleNode` queries (`#283`) and unknown patterns. **Returns the parsed `AstQuery`** (not just `()`), so callers that also need the query object avoid a second `parse_ast_query` call. Callers that only need validation can use the `?` operator and discard with `let _ =`.
 - `resolve_ast_file_filter(engine, raw)` — **calls `search_ast` directly** (not through `SearchLayer`). Parses the pattern, calls `engine.search_ast(&query)`, returns `HashSet<FileId>` from the `Vec<(FileId, f64)>` result. No `SearchResult` construction, no `usize::MAX` sort, no `SearchLayer` overhead. The caller's `--limit` applies at intersection time inside the lexical engine.
-- `run_ast_standalone` — standalone `--ast` dispatch (no text query, no temporal sort flags). Also calls `search_ast` directly. **Now supports `--blast-radius`**: resolves co-change peers via the temporal DB, converts paths → FileIds via `manifest.sorted_paths()`, and intersects with the AST result set BEFORE applying `--limit` (avoids PF-006 silent-drop). Then warns on out-of-range FileIds rather than silently dropping them.
+- `run_ast_standalone(raw_pattern, limit, json, cache_dir, manifest, blast_file_ids, w)` — standalone `--ast` dispatch (no text query). Accepts `blast_file_ids: Option<HashSet<FileId>>` (pre-resolved by the caller in `mod.rs` via `temporal::resolve_blast_radius_file_ids` — the parameter is pre-computed so this function has no DB access). Intersects with the AST result set BEFORE applying `--limit` (avoids PF-006 silent-drop). Warns on out-of-range FileIds rather than silently dropping them. Output sink `w: &mut impl Write` for testability.
 
 **`resolve_ast_file_filter` signature** (no `lang` parameter): language filtering at the AST layer was removed — the intersection with lexical results handles language narrowing implicitly.
 
-**`--ast + --blast-radius` on standalone path**: `run_ast_standalone` accepts `blast_radius: Option<&str>`, `temporal_db_path: &Path`, and `root: &Path`. When `blast_radius` is set, it opens `temporal.db` (via `temporal::open_temporal_db`), resolves the path to repo-relative form, looks up co-change partners, includes the target file itself (mirrors `resolve_blast_radius_filter`), converts paths → FileIds via `manifest.sorted_paths()`, and intersects with the AST result set. Limit is applied AFTER intersection.
+**`--ast + --blast-radius` on standalone path**: `mod.rs` resolves blast-radius into a `HashSet<FileId>` via `temporal::resolve_blast_radius_file_ids` BEFORE calling `run_ast_standalone`. The `blast_file_ids` parameter is `Option<HashSet<FileId>>` — `None` when `--blast-radius` was not set or the DB was absent. This keeps `run_ast_standalone` DB-free.
 
 **FileId warning in `run_ast_standalone`**: when `fid.0 as usize >= sorted.len()`, a warning is emitted to stderr. This is the fail-loud-ish counterpart on the read side (not silent drop).
 
@@ -150,15 +161,25 @@ Four responsibilities:
 
 ### Temporal Flag Helpers — `temporal.rs`
 
-Mirrors `ast.rs` in structure. Key functions:
+Mirrors `ast.rs` in structure but also owns ALL blast-radius resolution logic. Key functions:
 
 - **`normalize_blast_radius_path(raw, project_root)`**: resolves user path to repo-relative. Algorithm: if absolute, check existence; if relative, try project-root-relative first, then CWD-relative fallback. Canonicalizes, strips root prefix, replaces `\\` with `/`.
 - **`cochange_partner_paths(partners, target)`**: extracts partner paths from co-change rows, handling both `file_a`/`file_b` directions via `cochange_partner` helper. Does NOT include the target file itself — callers add it separately.
+- **`resolve_blast_radius_paths(blast_radius, root, db_path, json)`**: resolves blast-radius to a `HashSet<String>` of repo-relative path strings. Opens `temporal.db`, normalizes the path, looks up co-change partners, includes the target file itself. Returns `Ok(None)` when `blast_radius` is `None` or DB is absent/corrupt (with JSON-aware warning). Used by `run_query` in `mod.rs` for the text+blast-radius path.
+- **`paths_to_file_ids(sorted_paths, allowed_paths)`**: converts a set of repo-relative path strings to FileIds by iterating `sorted_paths`. Applies PF-004 widening (`u32::try_from(idx)`). Emits a warning when result set is empty.
+- **`resolve_blast_radius_file_ids(blast_radius, root, db_path, sorted_paths, json)`**: unified resolver combining `resolve_blast_radius_paths` + `paths_to_file_ids`. Returns `Option<HashSet<FileId>>`. Used for the standalone `--ast --blast-radius` path from `mod.rs`.
 - **`open_temporal_db(db_path)`**: returns `None` when absent or corrupt (graceful degradation).
 - **`check_temporal_staleness(db, project_root)`**: spawns `git rev-parse HEAD` with 5-second timeout (distinct from the pure-file-I/O `staleness.rs::read_git_head`). Advisory only.
 - **`query_standalone`**: dispatches to `top_hotspots`, `top_coldspots`, `top_risks`, or `cochanges_for_file` based on the sort/blast-radius flags.
 - **`apply_temporal_enrichment`**: annotates `Vec<ResolvedResult>` with hotspot/risk scores and re-sorts. O(N) DB queries at default `--limit 20`.
 - **`resort_partners_by_temporal`**: pre-truncates to `limit*5` (clamped at 100) before per-file DB lookups for blast-radius + sort combination.
+
+**Blast-radius call sites** (three total, all ultimately use `temporal.rs` helpers):
+1. `mod.rs` standalone `--ast --blast-radius` path → calls `temporal::resolve_blast_radius_file_ids` → passes `Option<HashSet<FileId>>` to `run_ast_standalone`
+2. `mod.rs` `run_query` (text + blast-radius path) → calls `temporal::resolve_blast_radius_paths` → passes `Option<HashSet<String>>` in `QueryConfig::blast_radius_paths` → converted to FileIds inside `execute_query_with_manifest` via `paths_to_file_ids`
+3. `mod.rs` `run_temporal_standalone` (blast-radius only, no text/AST) → passes raw path to `temporal::query_standalone` → normalizes internally
+
+**Note on removed `resolve_blast_radius_filter`**: the old standalone function `resolve_blast_radius_filter` in `mod.rs` has been removed. Its logic is now split between `temporal::resolve_blast_radius_paths` (shared path resolution) and `temporal::paths_to_file_ids` (path→FileId conversion). The `mod.rs` test that formerly tested `resolve_blast_radius_filter` now tests `temporal::resolve_blast_radius_paths` directly.
 
 ### Git Hook Management — `hooks.rs`
 
@@ -183,17 +204,19 @@ Writes are atomic (temp file + rename). Wrong-root detection: if the stored root
 
 ## Combined text+`--ast` Path — Single Refresh Guarantee
 
-The combined text+`--ast` query path (`run_query` → `execute_query_with_manifest`) calls `auto_refresh_if_stale` **exactly once**, before opening the AST engine:
+The combined text+`--ast` query path (`run_query`) calls `auto_refresh_if_stale` **exactly once**, before opening the AST engine:
 
 ```
 run_query():
+  resolve_blast_radius_paths() → blast_radius_paths (HashSet<String> or None)
   auto_refresh_if_stale() → (refreshed, manifest)   // self-heal AST index if needed
   open_ast_engine()                                   // safe: index guaranteed fresh
   resolve_ast_file_filter()                           // AST FileIds
   execute_query_with_manifest(pre_loaded=Some(manifest))  // skip redundant refresh
+  apply_temporal_enrichment()                         // if temporal sort active
 ```
 
-Previously, a bug caused `open_ast_engine` to be called before `auto_refresh_if_stale`, breaking self-heal on the combined path. The fix: always refresh before any index open, same as `run_ast_standalone`. The `pre_loaded_manifest` parameter threads the already-loaded manifest into `execute_query_with_manifest` so no second `auto_refresh_if_stale` occurs.
+The `blast_radius_paths` (path strings) are passed in `QueryConfig` and converted to FileIds inside `execute_query_with_manifest` via `paths_to_file_ids(sorted_paths(), blast_radius_paths)`.
 
 ## Component Interactions
 
@@ -212,14 +235,18 @@ skim binary
             │     ├── manifest.rs      ← sorted_paths() for FileId→path
             │     ├── snippet.rs       ← extract_snippet
             │     └── rskim-search     ← NgramIndexReader, QueryEngine, SearchQuery
-            ├── ast.rs      ← open_ast_engine, validate_ast_pattern,
+            ├── ast.rs      ← open_ast_engine, validate_ast_pattern (returns AstQuery),
             │                  resolve_ast_file_filter (direct search_ast),
-            │                  run_ast_standalone (direct search_ast + blast-radius + FileId warn)
+            │                  run_ast_standalone (blast_file_ids: Option<HashSet<FileId>>, no DB access)
             │     └── rskim-search     ← AstQueryEngine, AstIndexReader,
             │                             parse_ast_query, search_ast
             ├── temporal.rs ← normalize_blast_radius_path, cochange_partner_paths,
+            │                  resolve_blast_radius_paths (→ HashSet<String>),
+            │                  paths_to_file_ids (→ HashSet<FileId>),
+            │                  resolve_blast_radius_file_ids (unified path→FileId resolver),
             │                  apply_temporal_enrichment, query_standalone,
-            │                  format_temporal_*, resort_partners_by_temporal
+            │                  format_temporal_*, resort_partners_by_temporal,
+            │                  open_temporal_db, check_temporal_staleness
             │     └── rskim-search     ← TemporalDb, HotspotRow, RiskRow, CochangeRow
             └── hooks.rs    ← install_search_hooks, remove_search_hooks
                               (marker-delimited blocks in .git/hooks/)
@@ -237,19 +264,21 @@ skim binary
 
 **Validation order in `run()`**: the exact order (legacy subcommand, help, `--ast`+temporal, single-node, unknown pattern) is tested and must not change without updating the tests in `mod.rs`. `--ast` + `--blast-radius` (without temporal sort) is NOT in this error list — it is a valid combination.
 
-**`auto_refresh_if_stale` before any index open**: both `run_ast_standalone` and `run_query` (the combined text+`--ast` path) must call `auto_refresh_if_stale` BEFORE opening the AST engine. Opening the engine first breaks self-heal for the combined path.
+**`auto_refresh_if_stale` before any index open**: both `run_ast_standalone` dispatch (in `mod.rs`) and `run_query` (the combined text+`--ast` path) must call `auto_refresh_if_stale` BEFORE opening the AST engine. Opening the engine first breaks self-heal for the combined path.
 
 **`execute_query` is test-only**: production dispatch calls `execute_query_with_manifest` directly. Tests use `execute_query` (which delegates to `execute_query_with_manifest(config, None, analytics)`).
 
+**Blast-radius resolution is in `temporal.rs`**: `resolve_blast_radius_paths` and `resolve_blast_radius_file_ids` are in `temporal.rs`, not `mod.rs`. There is no `resolve_blast_radius_filter` function in `mod.rs` — that function was removed and its logic moved to the temporal helpers.
+
 ## Anti-Patterns
 
-**Adding I/O to `ast.rs` or `temporal.rs` beyond what they already have.** New queries, formatters, or DB operations belong there, but filesystem operations (cache dir resolution, lock acquisition) belong in `mod.rs` or `index.rs`.
+**Adding I/O to `ast.rs` beyond what it already has.** New DB access for blast-radius belonged in the caller (`mod.rs`) and the shared helper (`temporal.rs`), not inside `run_ast_standalone`. The function receives pre-resolved `blast_file_ids: Option<HashSet<FileId>>` — keep it DB-free.
 
 **Calling `manifest.save()` after a failed index build.** Any code path that calls `builder.build()` or `ast_builder.build()` and then calls `manifest.save()` regardless of success breaks the crash-safety invariant. The manifest must only be saved when ALL index writes succeed.
 
 **Adding temporal sort + `--ast` compound queries without resolving #202.** The current code explicitly errors on this combination. Do not silently degrade or ignore one of the flags.
 
-**Constructing FileIds from `idx as u32` (applies PF-004).** Use `u32::try_from(idx)` everywhere FileId values are constructed from positional indexes.
+**Constructing FileIds from `idx as u32` (applies PF-004).** Use `u32::try_from(idx)` everywhere FileId values are constructed from positional indexes. `paths_to_file_ids` in `temporal.rs` is the canonical example.
 
 **Breaking the `index.rs` consume loop's fail-soft / fail-loud contract.** Lexical errors are fail-soft: `continue` and skip the file from both indexes. AST errors after a successful lexical insert are fail-loud: `return Err(...)` to abort the build.
 
@@ -265,13 +294,15 @@ skim binary
 
 **Calling `producer_skips.load()` before `producer_handle.join()`.** The atomic load is only valid after join() returns — join() is the happens-before edge.
 
+**Adding blast-radius DB access to `run_ast_standalone`.** The function is intentionally DB-free: blast-radius resolution is done in the caller (`mod.rs` → `temporal::resolve_blast_radius_file_ids`) and the result passed as `blast_file_ids`. Adding direct DB access to `ast.rs` would violate the module boundary.
+
 ## Gotchas
 
 **`skim search index` vs `skim search --build`**: the `"index"` prefix check in `run()` is a legacy subcommand path. It dispatches to `index.rs::run()` which uses clap for its own flag parsing. The parent `run()` does not call `parse_flags()` for this path.
 
 **Help is checked before `parse_flags`**: `--help` / `-h` in the top-level handler is caught BEFORE calling `parse_flags`. If help appears anywhere in `args` alongside a subcommand, `print_help()` is called.
 
-**Blast-radius includes the target file itself**: `resolve_blast_radius_filter` adds the normalized path for the target file to the `HashSet` of partners. Same behavior in `run_ast_standalone`. This is intentional.
+**Blast-radius includes the target file itself**: `resolve_blast_radius_paths` adds the normalized path for the target file to the `HashSet` of partners. Same behavior in the blast-radius arm of `query_standalone`. This is intentional.
 
 **`sorted_paths()` order = FileId**: the manifest stores entries in a `BTreeMap<String, ManifestEntry>` keyed by path. `sorted_paths()` returns keys in sorted order. The NgramIndexBuilder assigns FileId 0 to the first file sent to `add_file_classified`, 1 to the second, and so on. These must stay in sync.
 
@@ -285,9 +316,13 @@ skim binary
 
 **`derive_ast_entry` is infallible by design**: any error in linearization or extraction returns an empty triple. The consume loop then inserts an empty AST entry for that FileId. The only fail-loud path is when `add_file_ngrams` itself rejects the entry after a lexical success.
 
-**`cochange_partner_paths` does NOT include the target**: unlike `resolve_blast_radius_filter` and the blast-radius arm of `run_ast_standalone`, `cochange_partner_paths` itself does not include the target file. Callers that need the target included must call `paths.insert(normalized)` explicitly after.
+**`cochange_partner_paths` does NOT include the target**: unlike `resolve_blast_radius_paths`, `cochange_partner_paths` itself does not include the target file. The caller (`resolve_blast_radius_paths`) inserts the normalized path with `allowed_paths.insert(normalized)` explicitly after calling `cochange_partner_paths`.
 
 **`parse_temporal_flag` handles blast-radius equals form**: `--blast-radius=FILE` (equals form) is handled by a `starts_with` arm in `parse_temporal_flag`, not by `take_flag_value`. This is distinct from `--limit` and `--root` which use `take_flag_value` for both forms.
+
+**`validate_ast_pattern` returns the parsed `AstQuery`**: as of the latest version, `validate_ast_pattern` returns `anyhow::Result<AstQuery>` (not `anyhow::Result<()>`). The `mod.rs` pre-dispatch call discards the result with the `?` operator; `run_ast_standalone` reuses the returned query to avoid a second `parse_ast_query` call.
+
+**`blast_radius_paths` in `QueryConfig` is `Option<HashSet<String>>`**: the lexical query path passes path strings, not FileIds, because `execute_query_with_manifest` converts them to FileIds internally using the manifest's `sorted_paths()` slice. This is distinct from the AST path where `blast_file_ids: Option<HashSet<FileId>>` are pre-resolved before calling `run_ast_standalone`.
 
 ## Test Coverage Summary
 
@@ -296,19 +331,19 @@ Test files are co-located alongside each source file:
 - `query_tests.rs` — execute_query against real index
 - `staleness_tests.rs` — check_staleness variants, auto_refresh_if_stale
 - `index_tests.rs` — Pipeline::consume, derive_ast_entry, FileId-alignment invariant, ADR-006 abort path
-- `temporal_tests.rs` — normalize_blast_radius_path, apply_temporal_enrichment, query_standalone
+- `temporal_tests.rs` — normalize_blast_radius_path, apply_temporal_enrichment, query_standalone, resolve_blast_radius_paths (replaces old resolve_blast_radius_filter tests)
 - `hooks_tests.rs` — install/remove idempotency, hook block format
 - `manifest_tests.rs`, `walk_tests.rs`, `snippet_tests.rs` — focused unit tests
 
 ## Key Files
 
-- `crates/rskim/src/cmd/search/mod.rs` — entry point, flag parsing (`parse_flags`, `parse_limit_value`, `parse_temporal_flag`, `take_flag_value`), dispatch, all action handlers, `resolve_blast_radius_filter`
+- `crates/rskim/src/cmd/search/mod.rs` — entry point, flag parsing (`parse_flags`, `parse_limit_value`, `parse_temporal_flag`, `take_flag_value`), dispatch, all action handlers
 - `crates/rskim/src/cmd/search/index.rs` — `build_index`, `Pipeline::run/consume`, `derive_ast_entry`, `resolve_search_cache_dir`, FileId-alignment invariant, bounded lock acquisition
-- `crates/rskim/src/cmd/search/query.rs` — `execute_query_with_manifest`, `execute_query` (test-only), FileId filter construction, `format_text_output`, `format_json_output`
-- `crates/rskim/src/cmd/search/staleness.rs` — `check_staleness`, `auto_refresh_if_stale`, AST self-heal, git HEAD file I/O
-- `crates/rskim/src/cmd/search/types.rs` — `QueryConfig`, `IndexConfig`, `ResolvedResult`, `QueryOutput`, `TemporalSort`, `TemporalAnnotation`, `WalkEntry`, `ProcessedFile`
-- `crates/rskim/src/cmd/search/ast.rs` — `open_ast_engine`, `validate_ast_pattern`, `resolve_ast_file_filter`, `run_ast_standalone` (blast-radius support + FileId warn)
-- `crates/rskim/src/cmd/search/temporal.rs` — `normalize_blast_radius_path`, `cochange_partner_paths`, `apply_temporal_enrichment`, `query_standalone`, `resort_partners_by_temporal`
+- `crates/rskim/src/cmd/search/query.rs` — `execute_query_with_manifest`, `execute_query` (test-only), FileId filter construction (converts `blast_radius_paths` strings → FileIds via `paths_to_file_ids`), `format_text_output`, `format_json_output`
+- `crates/rskim/src/cmd/search/staleness.rs` — `check_staleness`, `auto_refresh_if_stale`, AST self-heal, git HEAD file I/O (pure, no subprocess), `resolve_git_dir`
+- `crates/rskim/src/cmd/search/types.rs` — `QueryConfig` (`blast_radius_paths: Option<HashSet<String>>`, `ast_file_ids: Option<HashSet<FileId>>`), `IndexConfig`, `ResolvedResult`, `QueryOutput`, `TemporalSort`, `TemporalAnnotation`, `WalkEntry`, `ProcessedFile`
+- `crates/rskim/src/cmd/search/ast.rs` — `open_ast_engine`, `validate_ast_pattern` (returns `AstQuery`), `resolve_ast_file_filter`, `run_ast_standalone` (accepts `blast_file_ids: Option<HashSet<FileId>>`, no DB access)
+- `crates/rskim/src/cmd/search/temporal.rs` — `normalize_blast_radius_path`, `cochange_partner_paths`, `resolve_blast_radius_paths` (→ `HashSet<String>`), `paths_to_file_ids` (→ `HashSet<FileId>`), `resolve_blast_radius_file_ids` (unified), `apply_temporal_enrichment`, `query_standalone`, `resort_partners_by_temporal`, `open_temporal_db`, `check_temporal_staleness`
 - `crates/rskim/src/cmd/search/manifest.rs` — `FileManifest`, `ManifestEntry`, `ManifestHeader`, atomic write, wrong-root detection
 - `crates/rskim/src/cmd/search/hooks.rs` — `install_search_hooks`, `remove_search_hooks`, marker-delimited hook blocks
 
@@ -319,4 +354,4 @@ Test files are co-located alongside each source file:
 - Feature knowledge: `cochange` — the `CochangeRow` and co-change data that backs `--blast-radius`
 - ADR-004: follow-up tickets filed before implementation — tracked deferrals: `#283` (single-node/unigram), `#202` (--ast+temporal compound), `#289` (temporal rebuild hook), `#290` (AST incremental build cache)
 - ADR-006: dual-index per-file desync aborts build before commit — the `consume` loop fail-loud-on-post-lexical-AST-error pattern and the `derive_ast_entry` infallible helper implement this decision
-- PF-004: u16→u32 widening before arithmetic — applied in `query.rs` and `ast.rs` when constructing `FileId(u32::try_from(idx)?)` from positional indexes
+- PF-004: u16→u32 widening before arithmetic — applied in `query.rs`, `ast.rs`, and `temporal.ts::paths_to_file_ids` when constructing `FileId(u32::try_from(idx)?)` from positional indexes

@@ -17,8 +17,8 @@ referencedFiles:
   - crates/rskim-search/src/types.rs
   - crates/rskim-search/src/lib.rs
 created: 2026-06-01
-updated: 2026-06-09
-version: 4
+updated: 2026-06-12
+version: 5
 ---
 
 # Temporal Risk Scoring
@@ -34,6 +34,11 @@ temporal flags (`--hot`, `--cold`, `--risky`, `--blast-radius`).
 The module is separate from the co-change matrix (`crates/rskim-search/src/cochange/`) —
 both consume `HistoryResult`, but produce different signal types and use different
 storage formats.
+
+`temporal/mod.rs` declares `pub mod storage` (public visibility) — `TemporalDb` and
+its associated types are re-exported through the `temporal` module and up to the crate
+root. The sub-modules `git_parser` and `scoring` are private (`mod`-only); their public
+items are re-exported from `temporal/mod.rs` via `pub use`.
 
 ## Signal Types
 

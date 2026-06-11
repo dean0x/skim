@@ -23,8 +23,8 @@ referencedFiles:
   - crates/rskim-search/benches/ast_index_bench.rs
   - crates/rskim-search/benches/ast_query.rs
 created: 2026-06-01
-updated: 2026-06-09
-version: 6
+updated: 2026-06-12
+version: 7
 ---
 
 # AST Index (CST Linearization + N-gram Encoding + On-Disk Store)
@@ -350,6 +350,12 @@ impl AstQueryEngine<AstIndexReader> {
 This avoids `SearchResult` construction, `usize::MAX` sort, and `SearchLayer` overhead.
 `SearchLayer` is still implemented for Wave 4 integration but is not the primary
 CLI dispatch path as of Wave 3g.
+
+`validate_ast_pattern` in `cmd/search/ast.rs` returns `anyhow::Result<AstQuery>` (not
+`anyhow::Result<()>`). The return value is the parsed query, enabling callers that need
+both validation and the query object to avoid a second `parse_ast_query` call. The
+pre-dispatch call in `mod.rs` uses `?` and discards the value; `run_ast_standalone` calls
+`validate_ast_pattern` and uses the returned `AstQuery` directly.
 
 **OR-union BM25 scoring:**
 
@@ -726,6 +732,9 @@ AstQueryEngine::search_ast(q: &AstQuery)
 - Issue #199 (shipped, Wave 3g, PR #291): CLI `--ast` flag, building the AST index alongside
   the lexical index with FileId alignment, and self-heal/auto-rebuild on absent-or-below-FORMAT_VERSION
   via the `AstIndexReader::index_version` 6-byte probe. Consumer in `crates/rskim/src/cmd/search/`.
+  Note: `run_ast_standalone` in `ast.rs` accepts `blast_file_ids: Option<HashSet<FileId>>` (pre-resolved
+  by `mod.rs` via `temporal::resolve_blast_radius_file_ids`) — not raw path strings. The function is
+  DB-free by design.
 - Issue #198 / #200 (deferred, Wave 4): ranking integration of structural-complexity scoring.
 - Issue #273 (follow-up): on-disk compression (delta + VarInt / Roaring Bitmaps).
 - Issue #283 (deferred): unigram index for `AstQuery::SingleNode` execution.
