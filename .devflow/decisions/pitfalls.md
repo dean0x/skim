@@ -1,4 +1,4 @@
-<!-- TL;DR: 8 pitfalls. Key: PF-004, PF-005, PF-006, PF-007, PF-008 -->
+<!-- TL;DR: 9 pitfalls. Key: PF-005, PF-006, PF-007, PF-008, PF-009 -->
 # Known Pitfalls
 
 Area-specific gotchas, fragile areas, and past bugs.
@@ -74,3 +74,12 @@ Area-specific gotchas, fragile areas, and past bugs.
 - **Resolution**: when a rename refactor touches symbols named in feature knowledge, grep KNOWLEDGE.md and index.json for the old identifier with word boundaries and update referencedFiles and import paths in the same PR — treat feature-knowledge drift as part of the refactor blast radius
 - **Status**: Active
 - **Source**: self-learning:obs_knstal
+
+## PF-009: cargo clippy -p <crate> does not compile a binary crate's #[cfg(test)] modules, so warnings in test code pass per-crate local checks and only surface later under --all-targets or on CI
+
+- **Area**: Rust lint workflow for the cargo workspace (clippy on binary-crate test modules)
+- **Issue**: cargo clippy -p <crate> (and a bare cargo clippy without --all-targets) does NOT compile a binary crate's #[cfg(test)] modules, so any clippy warnings living in those test files — unused imports, doc overindentation, etc. — are not reported by the per-crate local check
+- **Impact**: under a zero-warnings -D warnings policy this means a locally-green branch can fail lint on merge/CI, wasting a round trip and eroding trust that local checks match the gate
+- **Resolution**: always run workspace lint as cargo clippy --workspace --all-targets -- -D warnings (not cargo clippy -p <crate>) so binary-crate test modules are compiled and linted
+- **Status**: Active
+- **Source**: self-learning:obs_clpat0
