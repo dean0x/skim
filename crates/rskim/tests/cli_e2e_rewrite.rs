@@ -1580,6 +1580,23 @@ fn write_fake_gh(bin_dir: &std::path::Path) -> std::path::PathBuf {
     gh_path
 }
 
+/// Create a temp directory with the fake `gh` shim on PATH.
+///
+/// Returns `(bin_dir, new_path)` where `bin_dir` must be kept alive for the
+/// duration of the test (dropping it removes the shim) and `new_path` is the
+/// `PATH` value to pass to the test command.
+#[cfg(unix)]
+fn fake_gh_on_path() -> (TempDir, String) {
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_gh(bin_dir.path());
+    let new_path = format!(
+        "{}:{}",
+        bin_dir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (bin_dir, new_path)
+}
+
 /// Layer 2 handler gate fires on `-q .body` → bytes forwarded verbatim.
 ///
 /// Asserts the discriminating observable (exact sentinel bytes in stdout),
@@ -1587,15 +1604,7 @@ fn write_fake_gh(bin_dir: &std::path::Path) -> std::path::PathBuf {
 #[cfg(unix)]
 #[test]
 fn test_gh_handler_gate_fires_on_q_flag_passes_through_verbatim() {
-    let bin_dir = TempDir::new().unwrap();
-    write_fake_gh(bin_dir.path());
-
-    // Prepend temp bin_dir so fake `gh` shadows any real gh on PATH.
-    let new_path = format!(
-        "{}:{}",
-        bin_dir.path().display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let (_bin_dir, new_path) = fake_gh_on_path();
 
     let output = Command::cargo_bin("skim")
         .unwrap()
@@ -1628,14 +1637,7 @@ fn test_gh_handler_gate_fires_on_q_flag_passes_through_verbatim() {
 #[cfg(unix)]
 #[test]
 fn test_gh_handler_gate_does_not_fire_without_steering_flag() {
-    let bin_dir = TempDir::new().unwrap();
-    write_fake_gh(bin_dir.path());
-
-    let new_path = format!(
-        "{}:{}",
-        bin_dir.path().display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let (_bin_dir, new_path) = fake_gh_on_path();
 
     let output = Command::cargo_bin("skim")
         .unwrap()
@@ -1664,14 +1666,7 @@ fn test_gh_handler_gate_does_not_fire_without_steering_flag() {
 #[cfg(unix)]
 #[test]
 fn test_gh_handler_gate_fires_on_json_flag() {
-    let bin_dir = TempDir::new().unwrap();
-    write_fake_gh(bin_dir.path());
-
-    let new_path = format!(
-        "{}:{}",
-        bin_dir.path().display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let (_bin_dir, new_path) = fake_gh_on_path();
 
     let output = Command::cargo_bin("skim")
         .unwrap()
@@ -1699,14 +1694,7 @@ fn test_gh_handler_gate_fires_on_json_flag() {
 #[cfg(unix)]
 #[test]
 fn test_gh_handler_gate_api_json_does_not_passthrough() {
-    let bin_dir = TempDir::new().unwrap();
-    write_fake_gh(bin_dir.path());
-
-    let new_path = format!(
-        "{}:{}",
-        bin_dir.path().display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let (_bin_dir, new_path) = fake_gh_on_path();
 
     let output = Command::cargo_bin("skim")
         .unwrap()
