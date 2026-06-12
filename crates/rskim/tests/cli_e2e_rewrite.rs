@@ -15,6 +15,9 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
+use tempfile::TempDir;
 
 fn skim_cmd() -> Command {
     let mut cmd = Command::cargo_bin("skim").unwrap();
@@ -1189,13 +1192,22 @@ fn test_rewrite_rg_json_skipped() {
 }
 
 #[test]
-fn test_rewrite_gh_json_rewrites() {
-    // --json is no longer a skip flag for gh list commands — handler supports
-    // --json output natively, so the rewrite should succeed (exit 0).
+fn test_rewrite_gh_json_skipped() {
+    // --json is now a skip flag for gh list/view commands — output-steering
+    // flags pass through with exact bytes, so the rewrite must be absent (exit 1).
     skim_cmd()
-        .args(["rewrite", "gh", "pr", "list", "--json", "title"])
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "pr",
+            "list",
+            "--json",
+            "title",
+        ])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
 }
 
 // ============================================================================
@@ -1244,13 +1256,23 @@ fn test_rewrite_git_log_oneline_roundtrip() {
 }
 
 #[test]
-fn test_rewrite_gh_pr_list_json_roundtrip() {
-    // v2.8.0: `gh pr list --json number` rewrites to `skim gh pr list --json number`
+fn test_rewrite_gh_pr_list_json_skipped() {
+    // --json is now a skip flag: gh pr list --json must not rewrite (exit 1,
+    // "match":false in --suggest output). Byte-faithful passthrough is handled
+    // by the handler gate (cmd/infra/gh/mod.rs) and the rules.rs skip-list.
     skim_cmd()
-        .args(["rewrite", "gh", "pr", "list", "--json", "number"])
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "pr",
+            "list",
+            "--json",
+            "number",
+        ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim gh pr list --json number"));
+        .stdout(predicate::str::contains("\"match\":false"));
 }
 
 #[test]
@@ -1416,6 +1438,282 @@ fn test_rewrite_gh_run_view_log_failed_skipped() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));
+}
+
+// ============================================================================
+// gh output-steering skip tests — Part 1A (hook path)
+// ============================================================================
+
+#[test]
+fn test_rewrite_gh_issue_view_q_skipped() {
+    // Reported repro: gh issue view 93 -q .body must not rewrite.
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "issue",
+            "view",
+            "93",
+            "-q",
+            ".body",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_gh_issue_view_t_skipped() {
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "issue",
+            "view",
+            "93",
+            "-t",
+            "{{.body}}",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_gh_issue_view_w_skipped() {
+    skim_cmd()
+        .args(["rewrite", "--suggest", "gh", "issue", "view", "93", "-w"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_gh_issue_view_json_skipped() {
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "issue",
+            "view",
+            "93",
+            "--json",
+            "number,title,body",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_gh_api_q_skipped() {
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "api",
+            "repos/o/r",
+            "-q",
+            ".name",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_gh_api_json_rewrites() {
+    // gh api has no --json flag (responses are always JSON natively).
+    // --json is therefore NOT in the api skip-list, so the rewrite fires.
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "api",
+            "repos/o/r",
+            "--json",
+            "x",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":true"));
+}
+
+// ============================================================================
+// gh handler gate: behavioral e2e tests (avoids PF-007, applies ADR-001)
+//
+// Verifies the Layer 2 handler gate in cmd/infra/gh/mod.rs: when an
+// output-steering flag is present, `run_raw_passthrough` forwards the fake
+// gh's exact output byte-for-byte.  A fake `gh` shim is placed on a temp
+// PATH so `CommandRunner`'s PATH lookup resolves to it (same mechanism as
+// the real tool lookup).
+// ============================================================================
+
+/// Build a fake `gh` shell script in `bin_dir` that prints a known multi-line
+/// payload to stdout and exits 0.
+///
+/// The payload is a minimal valid gh issue-view JSON that the issue_view
+/// compressor WILL parse into a structured summary (losing the raw bytes),
+/// but that `run_raw_passthrough` forwards verbatim.
+///
+/// Discriminator: the raw JSON contains `"__FAKE_GH_SENTINEL__"`.
+/// The skim-structured summary for this object will contain "issue view"
+/// (from `InfraResult::operation`) but NOT the sentinel literal.
+#[cfg(unix)]
+fn write_fake_gh(bin_dir: &std::path::Path) -> std::path::PathBuf {
+    let gh_path = bin_dir.join("gh");
+    // Valid issue-view JSON: has number + state + body (all required
+    // discriminators for issue_view::try_parse_json). The body contains the
+    // sentinel so we can distinguish raw passthrough from a structured summary.
+    fs::write(
+        &gh_path,
+        "#!/bin/sh\nprintf '%s' '{\"number\":93,\"state\":\"OPEN\",\"title\":\"Test\",\"body\":\"__FAKE_GH_SENTINEL__\",\"labels\":[],\"assignees\":[],\"comments\":[]}'\n",
+    )
+    .unwrap();
+    let perms = std::fs::Permissions::from_mode(0o755);
+    fs::set_permissions(&gh_path, perms).unwrap();
+    gh_path
+}
+
+/// Create a temp directory with the fake `gh` shim on PATH.
+///
+/// Returns `(bin_dir, new_path)` where `bin_dir` must be kept alive for the
+/// duration of the test (dropping it removes the shim) and `new_path` is the
+/// `PATH` value to pass to the test command.
+#[cfg(unix)]
+fn fake_gh_on_path() -> (TempDir, String) {
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_gh(bin_dir.path());
+    let new_path = format!(
+        "{}:{}",
+        bin_dir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (bin_dir, new_path)
+}
+
+/// Layer 2 handler gate fires on `-q .body` → bytes forwarded verbatim.
+///
+/// Asserts the discriminating observable (exact sentinel bytes in stdout),
+/// not just exit 0 — avoids PF-007.
+#[cfg(unix)]
+#[test]
+fn test_gh_handler_gate_fires_on_q_flag_passes_through_verbatim() {
+    let (_bin_dir, new_path) = fake_gh_on_path();
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .env_remove("SKIM_PASSTHROUGH")
+        .env("PATH", &new_path)
+        .args(["gh", "issue", "view", "93", "-q", ".body"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Gate must have fired: fake gh's exact sentinel is present in stdout.
+    assert!(
+        stdout.contains("__FAKE_GH_SENTINEL__"),
+        "gate must forward fake gh's exact bytes; got: {stdout}"
+    );
+    // Gate must NOT compress into a skim-structured summary.
+    assert!(
+        !stdout.contains("issue view"),
+        "gate must not produce a skim-structured summary; got: {stdout}"
+    );
+}
+
+/// Negative control: plain `skim gh issue view 93` (no steering flag) enters
+/// the compressing handler and the fake gh's issue JSON is parsed into a
+/// skim-structured summary, NOT forwarded verbatim.
+///
+/// The issue_view compressor turns the fake JSON into a summary containing
+/// "issue view"; the raw sentinel literal is not present in the summary output.
+/// This proves the gate is conditional, not always-on (avoids PF-007).
+#[cfg(unix)]
+#[test]
+fn test_gh_handler_gate_does_not_fire_without_steering_flag() {
+    let (_bin_dir, new_path) = fake_gh_on_path();
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .env_remove("SKIM_PASSTHROUGH")
+        .env("PATH", &new_path)
+        .args(["gh", "issue", "view", "93"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The compressor must have parsed the fake issue JSON into a structured
+    // summary.  Discriminating observable: the output is a skim-structured
+    // format (starts with `gh issue view`), NOT the raw JSON wire bytes
+    // (which start with `{`).  This proves run_tool ran, not run_raw_passthrough.
+    assert!(
+        !stdout.starts_with('{'),
+        "without a steering flag the gate must not forward raw JSON; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("issue view"),
+        "without a steering flag the compressor must produce a structured summary; got: {stdout}"
+    );
+}
+
+/// Gate also fires on `--json` for a non-api subcommand.
+#[cfg(unix)]
+#[test]
+fn test_gh_handler_gate_fires_on_json_flag() {
+    let (_bin_dir, new_path) = fake_gh_on_path();
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .env_remove("SKIM_PASSTHROUGH")
+        .env("PATH", &new_path)
+        .args(["gh", "issue", "view", "93", "--json", "number,body"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("__FAKE_GH_SENTINEL__"),
+        "gate must fire on --json for non-api subcommand; got: {stdout}"
+    );
+}
+
+/// Gate carve-out: `gh api --json` does NOT trigger raw passthrough.
+/// --json on gh api is not an output-steering flag (api responses are always
+/// JSON natively); the gate must agree with the rules.rs api skip-list.
+///
+/// When the gate does NOT fire, the api compressor runs and emits a flat
+/// `key: value` compact form — NOT the raw JSON wire bytes.  We check that
+/// the output does not contain the raw JSON braces + field names (passthrough
+/// format) but DOES contain the api handler's structured output.
+#[cfg(unix)]
+#[test]
+fn test_gh_handler_gate_api_json_does_not_passthrough() {
+    let (_bin_dir, new_path) = fake_gh_on_path();
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .env_remove("SKIM_PASSTHROUGH")
+        .env("PATH", &new_path)
+        .args(["gh", "api", "repos/o/r", "--json", "name"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // When the gate does not fire, the api compressor runs. The raw JSON wire
+    // bytes (`{"number":93,...}`) must NOT be forwarded verbatim; the compactor
+    // transforms the JSON into a flat key:value form.  Check for the absence
+    // of raw JSON structure (no outer `{...}` braces on a single line with all
+    // original keys present as a JSON string).
+    assert!(
+        !stdout.starts_with('{'),
+        "gate must not fire for gh api --json (raw JSON must not be forwarded verbatim); got: {stdout}"
+    );
 }
 
 // ============================================================================

@@ -44,7 +44,7 @@ Streaming output (stdout, zero-copy via &str slices where possible)
 
 ## Commands
 
-`target/release/skim` is on PATH for local testing. After merging to main, run `cargo build --release` to refresh it.
+To test changes in **this** clone, invoke its own build by path — `./target/release/skim` (refresh with `cargo build --release`). ⚠️ A bare `skim` on `$PATH` may resolve to a *different* local clone (this machine keeps parallel clones to avoid worktree churn), so it can silently exercise the wrong code.
 
 ```bash
 cargo build --release          # production build
@@ -54,6 +54,8 @@ cargo fmt -- --check           # format check
 cargo bench                    # criterion benchmarks
 cargo run --bin skim -- file.ts --mode=signatures   # run locally
 ```
+
+`rskim` is bin-only (the `skim` binary; no `src/lib.rs`) — scope its tests with `cargo test -p rskim --bins` (or `--all-targets`). `cargo test -p rskim --lib` errors with "no library targets found" (a cargo target-selection behavior, not a skim bug). `rskim-core`/`rskim-search` are libraries and accept `--lib`.
 
 Modes are set via `--mode` only (no config file): `structure` (default), `signatures`, `types`, `minimal`, `pseudo`, `full`.
 

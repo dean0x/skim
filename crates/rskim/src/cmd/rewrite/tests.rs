@@ -243,13 +243,12 @@ fn test_would_rewrite_git_diff_stat_rewrites() {
 }
 
 #[test]
-fn test_would_rewrite_gh_pr_list_json_rewrites() {
-    let result = would_rewrite("gh pr list --json number");
-    assert!(result.is_some(), "gh pr list --json should now rewrite");
-    let rewritten = result.unwrap();
-    assert!(
-        rewritten.contains("skim gh pr list"),
-        "Expected 'skim gh pr list' in output, got: {rewritten}"
+fn test_would_rewrite_gh_pr_list_json_skips() {
+    // --json is now in the skip-list for all gh list/view commands: passthrough.
+    assert_eq!(
+        would_rewrite("gh pr list --json number"),
+        None,
+        "gh pr list --json must skip rewrite (output-steering flag)"
     );
 }
 
@@ -735,5 +734,204 @@ fn test_env_minus_i_skips_via_flag_guard() {
         would_rewrite("env -i bash"),
         None,
         "env -i must not be rewritten — -i is in skip_if_flag_prefix"
+    );
+}
+
+// ========================================================================
+// gh output-steering skip tests (Part 1A)
+// Tests the hook-path skip-list for short aliases and --json.
+// ========================================================================
+
+// --- gh issue view ---
+
+#[test]
+fn test_gh_issue_view_q_skips() {
+    // Reported repro: gh issue view 93 -q .body must not be rewritten.
+    assert_eq!(
+        would_rewrite("gh issue view 93 -q .body"),
+        None,
+        "gh issue view -q must skip rewrite (short alias for --jq)"
+    );
+}
+
+#[test]
+fn test_gh_issue_view_t_skips() {
+    assert_eq!(
+        would_rewrite("gh issue view 93 -t {{.body}}"),
+        None,
+        "gh issue view -t must skip rewrite (short alias for --template)"
+    );
+}
+
+#[test]
+fn test_gh_issue_view_w_skips() {
+    assert_eq!(
+        would_rewrite("gh issue view 93 -w"),
+        None,
+        "gh issue view -w must skip rewrite (short alias for --web)"
+    );
+}
+
+#[test]
+fn test_gh_issue_view_json_skips() {
+    assert_eq!(
+        would_rewrite("gh issue view 93 --json number,title,body"),
+        None,
+        "gh issue view --json must skip rewrite (output-steering flag)"
+    );
+}
+
+// --- gh pr view ---
+
+#[test]
+fn test_gh_pr_view_q_skips() {
+    assert_eq!(
+        would_rewrite("gh pr view 15 -q .body"),
+        None,
+        "gh pr view -q must skip rewrite (short alias for --jq)"
+    );
+}
+
+// --- gh run list ---
+
+#[test]
+fn test_gh_run_list_json_skips() {
+    assert_eq!(
+        would_rewrite("gh run list --json status"),
+        None,
+        "gh run list --json must skip rewrite (output-steering flag)"
+    );
+}
+
+// --- gh release list ---
+
+#[test]
+fn test_gh_release_list_json_skips() {
+    assert_eq!(
+        would_rewrite("gh release list --json tagName"),
+        None,
+        "gh release list --json must skip rewrite (output-steering flag)"
+    );
+}
+
+// --- gh pr checks ---
+
+#[test]
+fn test_gh_pr_checks_json_skips() {
+    assert_eq!(
+        would_rewrite("gh pr checks 15 --json state"),
+        None,
+        "gh pr checks --json must skip rewrite (output-steering flag)"
+    );
+}
+
+// --- gh api ---
+
+#[test]
+fn test_gh_api_q_skips() {
+    assert_eq!(
+        would_rewrite("gh api repos/o/r -q .name"),
+        None,
+        "gh api -q must skip rewrite (short alias for --jq)"
+    );
+}
+
+#[test]
+fn test_gh_api_t_skips() {
+    assert_eq!(
+        would_rewrite("gh api repos/o/r -t {{.name}}"),
+        None,
+        "gh api -t must skip rewrite (short alias for --template)"
+    );
+}
+
+// --- guards: must still rewrite ---
+
+#[test]
+fn test_gh_api_json_still_rewrites() {
+    // gh api has no --json flag (responses are always JSON), so --json is NOT
+    // in the api skip-list. An invocation like `gh api ... --json x` would be
+    // an unrecognized flag that gh itself would reject, but the rewrite engine
+    // must still fire (it doesn't validate flag semantics).
+    let result = would_rewrite("gh api repos/o/r --json x");
+    assert!(
+        result.is_some(),
+        "gh api --json must still rewrite: --json is not in the api skip-list"
+    );
+}
+
+#[test]
+fn test_gh_run_list_w_workflow_still_rewrites() {
+    // On gh run list, -w means --workflow (a filter), NOT --web.
+    // gh run list has no --web, so -w is NOT in its skip-list.
+    let result = would_rewrite("gh run list -w ci.yml");
+    assert!(
+        result.is_some(),
+        "gh run list -w must still rewrite: -w means --workflow on run list, not --web"
+    );
+}
+
+#[test]
+fn test_gh_release_list_w_still_rewrites() {
+    // gh release list has no --web support, so -w is not in its skip-list.
+    let result = would_rewrite("gh release list -w");
+    assert!(
+        result.is_some(),
+        "gh release list -w must still rewrite: --web is not supported by release list"
+    );
+}
+
+// --- compound / pipe: unrewritten gh segment ---
+
+#[test]
+fn test_gh_issue_view_q_in_pipe_left_unrewritten() {
+    // In a compound `gh issue view 93 -q .body | jq .`, the full compound
+    // returns None because:
+    //   (a) the gh segment skips (the -q skip fires — see test_gh_issue_view_q_skips
+    //       which isolates that behavior), AND
+    //   (b) the `jq` segment is unhandled.
+    // Either reason alone would produce None; both apply here.
+    let result = would_rewrite("gh issue view 93 -q .body | jq .");
+    assert!(
+        result.is_none(),
+        "compound with skipped gh segment and unhandled jq must return None"
+    );
+}
+
+#[test]
+fn test_gh_issue_view_json_in_and_chain_unrewritten() {
+    // `x && gh issue view 93 --json y`: gh segment skips, x is unhandled.
+    let result = would_rewrite("x && gh issue view 93 --json y");
+    assert!(
+        result.is_none(),
+        "compound with skipped gh segment and unhandled x must return None"
+    );
+}
+
+// --- `--` end-of-options separator: steering flags after `--` must not skip ---
+
+#[test]
+fn test_gh_api_steering_after_separator_still_rewrites() {
+    // A steering flag that appears AFTER `--` must not trigger the skip-list.
+    // The engine splits at `--` and checks skip flags only in `before_sep`
+    // (the tokens before the separator); post-`--` tokens are passed through
+    // verbatim as arguments to the child command.
+    //
+    // This mirrors `test_user_steers_output_steering_after_separator_ignored`
+    // in shared.rs, pinning that both layers agree on `--` semantics (PF-007:
+    // assert the discriminating outcome — rewrite fires — not merely is_some).
+    let result = would_rewrite("gh api repos/o/r -- --json");
+    assert!(
+        result.is_some(),
+        "gh api repos/o/r -- --json must rewrite: --json after -- is not a steering flag"
+    );
+    let rewritten = result.unwrap();
+    assert!(
+        rewritten.starts_with("skim gh api"),
+        "rewritten command must start with 'skim gh api', got: {rewritten}"
+    );
+    assert!(
+        rewritten.contains("--json"),
+        "rewritten command must preserve --json as a positional arg, got: {rewritten}"
     );
 }

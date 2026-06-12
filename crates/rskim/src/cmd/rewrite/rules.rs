@@ -1273,22 +1273,69 @@ const KUBECTL_GLOBAL_FLAGS: &[&str] = &[
     "--user",
 ];
 
+/// Output-steering skip flags for gh rules that support `--web`/`-w`.
+///
+/// Used by the four view/list rules (pr view, pr list, issue view, issue list)
+/// whose skip-lists are byte-identical.  Rules with additional per-rule flags
+/// (`--watch`, `--log`, `--help`) keep their own inline arrays.
+///
+/// Parity invariant: wherever `--jq` skips, `-q` also skips; wherever
+/// `--template` skips, `-t` also skips; wherever `--web` skips, `-w` also
+/// skips.  Enforced by `test_gh_rules_output_flag_parity`.
+const GH_OUTPUT_SKIP_FLAGS: &[&str] = &["--web", "-w", "--jq", "-q", "--template", "-t", "--json"];
+
+/// Output-steering skip flags for gh rules that do NOT support `--web`/`-w`.
+///
+/// Used by `gh run list` and `gh release list`, where `-w` means `--workflow`
+/// (a filter flag), NOT `--web`.  Neither `--web` nor `-w` appear in their
+/// skip-lists — this is the -w=--workflow safety property.
+const GH_OUTPUT_SKIP_FLAGS_NO_WEB: &[&str] = &["--jq", "-q", "--template", "-t", "--json"];
+
 const INFRA_RULES: &[RewriteRule] = &[
     // gh (longest prefix first)
     //
-    // DESIGN DECISION: --jq and --template skip because they apply custom
-    // transformations to gh JSON output. Injecting --json fields would change
-    // what the filter operates on, breaking user-defined projections.
-    // --log and --log-failed skip for gh run view because they output raw CI
-    // step logs — a completely different format from structured run metadata.
+    // DESIGN DECISION: output-steering flags skip the rewrite so gh's raw bytes
+    // pass through untouched on the hook path (the handler gate in
+    // cmd/infra/gh/mod.rs handles the wrapper/direct path).
+    //
+    // Output-steering flags: --jq/-q, --template/-t, --json.
+    //   --jq/--template apply user-defined projections; injecting --json fields
+    //   would change what the filter sees.  --json returns caller-controlled JSON
+    //   (no further formatting needed by skim).  Short aliases -q/-t are
+    //   equivalent on every command where the long form skips.
+    //
     // --web skips on commands that support it (pr list/view, issue list/view,
-    // run view, release view, pr checks) because it opens a browser tab, not
-    // stdout. Note: gh run list and gh release list do NOT support --web.
-    // --watch skips because it produces a streaming TUI, not parseable output.
+    //   run view, release view, pr checks) because it opens a browser tab, not
+    //   stdout.  Short alias -w skips ONLY where --web skips.
+    //   IMPORTANT: gh run list and gh release list do NOT support --web; -w on
+    //   those means --workflow (a filter flag), so neither --web nor -w are in
+    //   their skip-lists.  This is the -w=-workflow safety property.
+    //
+    // --log/--log-failed skip for gh run view: they output raw CI step logs.
+    // --watch skips because it produces a streaming TUI.
+    //
+    // gh api has no --json flag (responses are always JSON natively) and no
+    //   --web, so those are absent from its skip-list.
+    //
+    // Parity invariant: wherever --jq skips, -q also skips; wherever
+    //   --template skips, -t also skips; wherever --web skips, -w also skips.
+    //   Enforced by test_gh_rules_output_flag_parity.
+    // GH_OUTPUT_SKIP_FLAGS and GH_OUTPUT_SKIP_FLAGS_NO_WEB named consts reduce the hand-typed
+    //   inline flag clusters to single-reference sites; rules with extra flags
+    //   (--watch, --log, --help) keep their own inline arrays.
     RewriteRule {
         prefix: &["gh", "pr", "checks"],
         rewrite_to: &["skim", "gh", "pr", "checks"],
-        skip_if_flag_prefix: &["--web", "--watch", "--jq", "--template"],
+        skip_if_flag_prefix: &[
+            "--web",
+            "-w",
+            "--watch",
+            "--jq",
+            "-q",
+            "--template",
+            "-t",
+            "--json",
+        ],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -1298,7 +1345,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["gh", "pr", "view"],
         rewrite_to: &["skim", "gh", "pr", "view"],
-        skip_if_flag_prefix: &["--web", "--jq", "--template"],
+        skip_if_flag_prefix: GH_OUTPUT_SKIP_FLAGS,
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -1308,7 +1355,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["gh", "pr", "list"],
         rewrite_to: &["skim", "gh", "pr", "list"],
-        skip_if_flag_prefix: &["--web", "--jq", "--template"],
+        skip_if_flag_prefix: GH_OUTPUT_SKIP_FLAGS,
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -1318,7 +1365,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["gh", "issue", "view"],
         rewrite_to: &["skim", "gh", "issue", "view"],
-        skip_if_flag_prefix: &["--web", "--jq", "--template"],
+        skip_if_flag_prefix: GH_OUTPUT_SKIP_FLAGS,
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -1328,7 +1375,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["gh", "issue", "list"],
         rewrite_to: &["skim", "gh", "issue", "list"],
-        skip_if_flag_prefix: &["--web", "--jq", "--template"],
+        skip_if_flag_prefix: GH_OUTPUT_SKIP_FLAGS,
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -1338,7 +1385,17 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["gh", "run", "view"],
         rewrite_to: &["skim", "gh", "run", "view"],
-        skip_if_flag_prefix: &["--web", "--log", "--log-failed", "--jq", "--template"],
+        skip_if_flag_prefix: &[
+            "--web",
+            "-w",
+            "--log",
+            "--log-failed",
+            "--jq",
+            "-q",
+            "--template",
+            "-t",
+            "--json",
+        ],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -1349,6 +1406,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     //
     // Routes to the streaming parser (cmd/infra/gh/run_watch.rs).
     // --help skips; --exit-status and --interval pass through to parser.
+    // No --json (streaming TUI), no output-steering aliases.
     RewriteRule {
         prefix: &["gh", "run", "watch"],
         rewrite_to: &["skim", "gh", "run", "watch"],
@@ -1359,10 +1417,12 @@ const INFRA_RULES: &[RewriteRule] = &[
         global_value_flags: &[],
         require_flag: &[],
     },
+    // gh run list: no --web (so no -w — -w means --workflow here), but does
+    // support --jq/-q, --template/-t, and --json.
     RewriteRule {
         prefix: &["gh", "run", "list"],
         rewrite_to: &["skim", "gh", "run", "list"],
-        skip_if_flag_prefix: &["--jq", "--template"],
+        skip_if_flag_prefix: GH_OUTPUT_SKIP_FLAGS_NO_WEB,
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -1376,17 +1436,27 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["gh", "release", "view"],
         rewrite_to: &["skim", "gh", "release", "view"],
-        skip_if_flag_prefix: &["--help", "--web", "--jq", "--template"],
+        skip_if_flag_prefix: &[
+            "--help",
+            "--web",
+            "-w",
+            "--jq",
+            "-q",
+            "--template",
+            "-t",
+            "--json",
+        ],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
         global_value_flags: &[],
         require_flag: &[],
     },
+    // gh release list: no --web (so no -w), but supports --jq/-q, --template/-t, --json.
     RewriteRule {
         prefix: &["gh", "release", "list"],
         rewrite_to: &["skim", "gh", "release", "list"],
-        skip_if_flag_prefix: &["--jq", "--template"],
+        skip_if_flag_prefix: GH_OUTPUT_SKIP_FLAGS_NO_WEB,
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -1397,11 +1467,13 @@ const INFRA_RULES: &[RewriteRule] = &[
     //
     // Compacts JSON responses, handles pagination boundaries, --paginate,
     // base64 content fields, and binary passthrough. See AD-API-1.
-    // --help skips; --jq/--template skip (user-defined transform).
+    // --help skips; --jq/-q and --template/-t skip (user-defined transform).
+    // NO --json: gh api responses are always JSON natively (no --json flag).
+    // NO --web/-w: gh api has no browser-open mode.
     RewriteRule {
         prefix: &["gh", "api"],
         rewrite_to: &["skim", "gh", "api"],
-        skip_if_flag_prefix: &["--help", "--jq", "--template"],
+        skip_if_flag_prefix: &["--help", "--jq", "-q", "--template", "-t"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -1948,6 +2020,48 @@ mod tests {
             "Update EXPECTED_RULE_COUNT when adding/removing rules (current: {})",
             count
         );
+    }
+
+    // ========================================================================
+    // gh output-flag parity test (PF-007)
+    // ========================================================================
+
+    /// Enforce that short aliases and --json membership are consistent across
+    /// all gh rules:
+    ///   - wherever --jq skips, -q must also skip
+    ///   - wherever --template skips, -t must also skip
+    ///   - wherever --web skips, -w must also skip
+    ///   - --json must be present on every gh rule EXCEPT ["gh","api"] and
+    ///     ["gh","run","watch"] (which are exempt by design)
+    ///
+    /// This prevents silent regressions where the long form is added to a rule
+    /// but the short alias is forgotten, restoring the original bug.
+    /// Each assertion is discriminating: a test that only checked `is_some()`
+    /// on the rule list would pass even with a missing alias (avoids PF-007).
+    #[test]
+    fn test_gh_rules_output_flag_parity() {
+        const ALIASES: &[(&str, &str)] = &[("--jq", "-q"), ("--template", "-t"), ("--web", "-w")];
+        for rule in all_rules() {
+            if rule.prefix.first() != Some(&"gh") {
+                continue;
+            }
+            for (long, short) in ALIASES {
+                if rule.skip_if_flag_prefix.contains(long) {
+                    assert!(
+                        rule.skip_if_flag_prefix.contains(short),
+                        "gh rule {:?} skips {long} but not alias {short}",
+                        rule.prefix
+                    );
+                }
+            }
+            let exempt = rule.prefix == ["gh", "api"] || rule.prefix == ["gh", "run", "watch"];
+            assert_eq!(
+                rule.skip_if_flag_prefix.contains(&"--json"),
+                !exempt,
+                "gh rule {:?} wrong --json membership (exempt={exempt})",
+                rule.prefix
+            );
+        }
     }
 
     // ========================================================================

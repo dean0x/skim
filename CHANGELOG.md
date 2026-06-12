@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`gh` output-steering flags now pass through on both paths** — Two bugs
+  caused `gh issue view 93 -q .body` and similar invocations to be reformatted + truncated
+  instead of passed through raw:
+  1. The hook rewrite skip-list (`rules.rs`) only contained the long-form flags (`--jq`,
+     `--template`, `--web`) but missed the short aliases (`-q`, `-t`, `-w`) and `--json`.
+     Now every gh rule that skips on a long form also skips on the short alias; `--json`
+     is added to every gh rule except `gh api` (which has no `--json` flag) and
+     `gh run watch` (streaming TUI).
+  2. The handler (`cmd/infra/gh/mod.rs`) — reached via the PATH wrapper and direct
+     `skim gh …` — had no output-steering check, so it reformatted and truncated output
+     regardless of flags. A new transparency gate fires before the subcommand match:
+     when `--json`, `--jq`, `-q`, `--template`, or `-t` are present (before `--`), gh
+     is invoked via `run_raw_passthrough` (UTF-8, capped at `MAX_OUTPUT_BYTES`; see
+     tracking issue #317 for the streaming/non-UTF-8 follow-up).
+
+  `--web`/`-w` are intentionally excluded from the handler gate (no stdout to corrupt;
+  `-w` is `--workflow` on `gh run list`). Glued short values like `-q.body` are not
+  matched by design — consistent with the existing engine strict-match semantics.
+  Plain `gh issue view N` (no output flag) still compresses as before.
+  `gh api` and `gh run watch` are exempt from the `--json` steering check at the
+  handler gate (matching the rewrite skip-list); only `--jq`/`-q`/`--template`/`-t`
+  trigger passthrough for those subcommands.
+
 ### Changed
 - **Removed internal command-execution timeout caps (ADR-008)** — `CommandRunner` no longer
   imposes a wall-clock cap on wrapped commands. Previous versions killed `cargo test`,
