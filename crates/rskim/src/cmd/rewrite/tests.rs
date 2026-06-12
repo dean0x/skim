@@ -885,9 +885,12 @@ fn test_gh_release_list_w_still_rewrites() {
 
 #[test]
 fn test_gh_issue_view_q_in_pipe_left_unrewritten() {
-    // In a compound `gh issue view 93 -q .body | jq .`, the gh segment must
-    // not be rewritten (the -q skip fires), so the full compound returns None
-    // (mixed rewrite + unhandled).
+    // In a compound `gh issue view 93 -q .body | jq .`, the full compound
+    // returns None because:
+    //   (a) the gh segment skips (the -q skip fires — see test_gh_issue_view_q_skips
+    //       which isolates that behavior), AND
+    //   (b) the `jq` segment is unhandled.
+    // Either reason alone would produce None; both apply here.
     let result = would_rewrite("gh issue view 93 -q .body | jq .");
     assert!(
         result.is_none(),
@@ -902,5 +905,33 @@ fn test_gh_issue_view_json_in_and_chain_unrewritten() {
     assert!(
         result.is_none(),
         "compound with skipped gh segment and unhandled x must return None"
+    );
+}
+
+// --- `--` end-of-options separator: steering flags after `--` must not skip ---
+
+#[test]
+fn test_gh_api_steering_after_separator_still_rewrites() {
+    // A steering flag that appears AFTER `--` must not trigger the skip-list.
+    // The engine splits at `--` and checks skip flags only in `before_sep`
+    // (the tokens before the separator); post-`--` tokens are passed through
+    // verbatim as arguments to the child command.
+    //
+    // This mirrors `test_user_steers_output_steering_after_separator_ignored`
+    // in shared.rs, pinning that both layers agree on `--` semantics (PF-007:
+    // assert the discriminating outcome — rewrite fires — not merely is_some).
+    let result = would_rewrite("gh api repos/o/r -- --json");
+    assert!(
+        result.is_some(),
+        "gh api repos/o/r -- --json must rewrite: --json after -- is not a steering flag"
+    );
+    let rewritten = result.unwrap();
+    assert!(
+        rewritten.starts_with("skim gh api"),
+        "rewritten command must start with 'skim gh api', got: {rewritten}"
+    );
+    assert!(
+        rewritten.contains("--json"),
+        "rewritten command must preserve --json as a positional arg, got: {rewritten}"
     );
 }
