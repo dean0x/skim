@@ -506,7 +506,10 @@ mod tests {
         // always JSON natively. The gate must agree with the rules.rs api
         // skip-list which omits --json. (cross-layer consistency)
         assert!(!user_steers_output(&args(&[
-            "api", "repos/o/r", "--json", "name"
+            "api",
+            "repos/o/r",
+            "--json",
+            "name"
         ])));
     }
 
@@ -514,7 +517,10 @@ mod tests {
     fn test_user_steers_output_api_q_is_steering() {
         // -q/-jq on gh api IS a steering flag (user-defined JQ projection).
         assert!(user_steers_output(&args(&[
-            "api", "repos/o/r", "-q", ".name"
+            "api",
+            "repos/o/r",
+            "-q",
+            ".name"
         ])));
     }
 
@@ -531,7 +537,11 @@ mod tests {
     fn test_user_steers_output_run_watch_q_is_steering() {
         // -q on gh run watch IS a steering flag.
         assert!(user_steers_output(&args(&[
-            "run", "watch", "12345", "-q", ".conclusion"
+            "run",
+            "watch",
+            "12345",
+            "-q",
+            ".conclusion"
         ])));
     }
 
