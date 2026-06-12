@@ -55,6 +55,8 @@ cargo bench                    # criterion benchmarks
 cargo run --bin skim -- file.ts --mode=signatures   # run locally
 ```
 
+`rskim` is bin-only (the `skim` binary; no `src/lib.rs`) — scope its tests with `cargo test -p rskim --bins` (or `--all-targets`). `cargo test -p rskim --lib` errors with "no library targets found" (a cargo target-selection behavior, not a skim bug). `rskim-core`/`rskim-search` are libraries and accept `--lib`.
+
 Modes are set via `--mode` only (no config file): `structure` (default), `signatures`, `types`, `minimal`, `pseudo`, `full`.
 
 ### Subcommands
