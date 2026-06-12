@@ -41,14 +41,14 @@ fn test_cargo_tier1_json_pass_structured_output() {
 
 #[test]
 fn test_cargo_tier1_json_fail_structured_output() {
-    // Cargo test via stdin always exits 0 because run_parsed_command_with_mode
-    // maps exit code from the synthetic CommandOutput, not from parsed results.
+    // #317: a piped failing run derives exit 1 from the parsed fail count,
+    // overriding the fabricated stdin exit 0.
     let fixture = include_str!("fixtures/cmd/test/cargo_fail.json");
     skim_cmd()
         .args(["cargo", "test"])
         .write_stdin(fixture)
         .assert()
-        .code(0)
+        .code(1)
         .stdout(predicate::str::contains("fail: 1"))
         .stdout(predicate::str::contains("pass: 1"));
 }

@@ -68,6 +68,14 @@ impl fmt::Display for TestSummary {
 pub(crate) struct TestResult {
     pub(crate) summary: TestSummary,
     pub(crate) entries: Vec<TestEntry>,
+    /// Raw failure-context block appended to the rendered output (#317).
+    ///
+    /// Safety net for parsers whose structured tiers cannot attach per-test
+    /// `detail` (e.g. stable-toolchain `cargo test` when the `---- name
+    /// stdout ----` blocks fail to parse). Rendered under a
+    /// `--- failure context ---` banner so the diagnostic is never dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context: Option<String>,
     #[serde(default, skip_serializing)]
     rendered: String,
 }
@@ -75,10 +83,20 @@ pub(crate) struct TestResult {
 impl TestResult {
     /// Create a new TestResult with pre-computed rendered output
     pub(crate) fn new(summary: TestSummary, entries: Vec<TestEntry>) -> Self {
-        let rendered = Self::render(&summary, &entries);
+        Self::with_context(summary, entries, None)
+    }
+
+    /// Create a TestResult carrying a raw failure-context block (#317).
+    pub(crate) fn with_context(
+        summary: TestSummary,
+        entries: Vec<TestEntry>,
+        context: Option<String>,
+    ) -> Self {
+        let rendered = Self::render(&summary, &entries, context.as_deref());
         Self {
             summary,
             entries,
+            context,
             rendered,
         }
     }
@@ -86,11 +104,11 @@ impl TestResult {
     /// Recompute rendered field if empty (e.g., after deserialization)
     pub(crate) fn ensure_rendered(&mut self) {
         if self.rendered.is_empty() {
-            self.rendered = Self::render(&self.summary, &self.entries);
+            self.rendered = Self::render(&self.summary, &self.entries, self.context.as_deref());
         }
     }
 
-    fn render(summary: &TestSummary, entries: &[TestEntry]) -> String {
+    fn render(summary: &TestSummary, entries: &[TestEntry], context: Option<&str>) -> String {
         use std::fmt::Write;
 
         let mut output = format!("{summary}");
@@ -104,6 +122,10 @@ impl TestResult {
                     }
                 }
             }
+        }
+
+        if let Some(ctx) = context {
+            let _ = write!(output, "\n\n--- failure context ---\n{ctx}");
         }
 
         output
@@ -1409,6 +1431,7 @@ mod tests {
                 duration_ms: None,
             },
             entries: vec![],
+            context: None,
             rendered: String::new(),
         };
         assert_eq!(result.as_ref(), "");

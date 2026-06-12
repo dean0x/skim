@@ -302,6 +302,23 @@ pub(crate) fn run_parsed_command_with_mode<T>(
 where
     T: AsRef<str> + serde::Serialize,
 {
+    run_parsed_command_with_exit(config, parse, |_| None)
+}
+
+/// [`run_parsed_command_with_mode`] with a parser-derived exit code (#317).
+///
+/// `derive_exit` inspects the parsed result and may return a non-zero exit
+/// code. The final exit is `max(child_exit, derived)` — needed on the stdin
+/// path, where `obtain_output` fabricates `exit_code: Some(0)` and a piped
+/// failing test run would otherwise exit 0.
+pub(crate) fn run_parsed_command_with_exit<T>(
+    config: ParsedCommandConfig<'_>,
+    parse: impl FnOnce(&CommandOutput) -> ParseResult<T>,
+    derive_exit: impl FnOnce(&ParseResult<T>) -> Option<i32>,
+) -> anyhow::Result<ExitCode>
+where
+    T: AsRef<str> + serde::Serialize,
+{
     let ParsedCommandConfig {
         program,
         args,
@@ -373,7 +390,12 @@ where
 
     let result = parse(&output);
     let _ = result.emit_markers(&mut io::stderr().lock());
-    let code = output.exit_code.unwrap_or(1);
+    // max(child, derived): the stdin path fabricates child exit 0, so a
+    // parser-derived failure code (e.g. cargo fail count > 0) wins (#317).
+    let code = output
+        .exit_code
+        .unwrap_or(1)
+        .max(derive_exit(&result).unwrap_or(0));
     let label = format_analytics_label(family, program, &args.join(" "));
     let tier_name = result.tier_name();
 

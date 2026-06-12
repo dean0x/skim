@@ -1,0 +1,24 @@
+   Compiling rskim v2.10.0 (/Users/dean/Sandbox/skim-search/crates/rskim)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.42s
+     Running unittests src/main.rs (target/debug/deps/skim-7c2f31a9d8e0b145)
+
+running 3 tests
+test output::tests::test_truncate_to_budget_basic ... ok
+test output::tests::test_floor_char_boundary ... ok
+test output::tests::test_truncate_single_line_char_boundary ... FAILED
+
+failures:
+
+---- output::tests::test_truncate_single_line_char_boundary stdout ----
+
+thread 'output::tests::test_truncate_single_line_char_boundary' panicked at crates/rskim/src/output/mod.rs:381:23:
+byte index 5 is not a char boundary; it is inside 'é' (bytes 4..6) of `aaaé bbbé ccc`
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    output::tests::test_truncate_single_line_char_boundary
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--lib`
