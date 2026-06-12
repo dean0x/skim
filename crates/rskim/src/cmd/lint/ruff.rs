@@ -34,6 +34,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     family: "lint",
     skip_ansi_strip: false,
     command_type: CommandType::Lint,
+    expected_exit_codes: &[1],
+    forward_stderr: false,
 };
 
 // Static regex patterns compiled once via LazyLock.

@@ -34,6 +34,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     family: "infra",
     skip_ansi_strip: false,
     command_type: CommandType::Infra,
+    expected_exit_codes: &[],
+    forward_stderr: false,
 };
 
 /// Maximum number of source fields in a JSON response before a truncation notice is added.

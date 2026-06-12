@@ -28,6 +28,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     family: "infra",
     skip_ansi_strip: false,
     command_type: CommandType::Infra,
+    expected_exit_codes: &[],
+    forward_stderr: false,
 };
 
 static RE_WGET_HTTP_STATUS: LazyLock<Regex> =

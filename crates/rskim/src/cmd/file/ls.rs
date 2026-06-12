@@ -39,6 +39,8 @@ const CONFIG_LS: ToolRunConfig<'static> = ToolRunConfig {
     family: "file",
     skip_ansi_strip: false,
     command_type: CommandType::FileOps,
+    expected_exit_codes: &[],
+    forward_stderr: true,
 };
 
 const CONFIG_TREE: ToolRunConfig<'static> = ToolRunConfig {
@@ -48,6 +50,8 @@ const CONFIG_TREE: ToolRunConfig<'static> = ToolRunConfig {
     family: "file",
     skip_ansi_strip: false,
     command_type: CommandType::FileOps,
+    expected_exit_codes: &[],
+    forward_stderr: true,
 };
 
 /// Matches a long-form ls entry line: permissions + link count + owner + ...

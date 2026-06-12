@@ -30,6 +30,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     family: "file",
     skip_ansi_strip: false,
     command_type: CommandType::FileOps,
+    expected_exit_codes: &[1],
+    forward_stderr: true,
 };
 
 /// Run `skim grep [args...]`.
@@ -39,9 +41,13 @@ pub(crate) fn run(
 ) -> anyhow::Result<std::process::ExitCode> {
     // No flag injection for grep -- flags are too varied
     let grep_args = GrepArgs::scan(args);
-    run_tool(CONFIG, args, ctx, |_| {}, move |output| {
-        parse_impl(output, &grep_args)
-    })
+    run_tool(
+        CONFIG,
+        args,
+        ctx,
+        |_| {},
+        move |output| parse_impl(output, &grep_args),
+    )
 }
 
 // ============================================================================
@@ -145,8 +151,7 @@ impl GrepArgs {
 
             // Short flag cluster (e.g. `-rn`, `-A3`, `-epat`).
             let cluster = &arg[1..];
-            let mut chars = cluster.char_indices();
-            while let Some((pos, c)) = chars.next() {
+            for (pos, c) in cluster.char_indices() {
                 match c {
                     'r' | 'R' => g.recursive = true,
                     'H' => g.with_filename = true,
@@ -552,7 +557,10 @@ mod tests {
         assert!(result.is_full());
         let rendered = result.content().to_string();
         assert!(rendered.contains("/tmp/t.txt"), "{rendered}");
-        assert!(rendered.contains("12:34: x"), "content verbatim: {rendered}");
+        assert!(
+            rendered.contains("12:34: x"),
+            "content verbatim: {rendered}"
+        );
     }
 
     #[test]

@@ -79,6 +79,10 @@ pub(crate) fn run(
             family: "test",
             skip_ansi_strip: false,
             rec,
+            // 101 = libtest's exit code for test failures (also compile
+            // errors, which fall through to the verbatim-combined tiers).
+            expected_exit_codes: &[101],
+            forward_stderr: false,
         },
         move |output| parse_impl(output, is_nextest),
     )

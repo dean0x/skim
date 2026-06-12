@@ -95,6 +95,39 @@ pub(crate) struct ParsedCommandConfig<'a> {
     /// `run_parsed_command_with_mode` annotates `parse_tier` via
     /// `rec.with_tier(result.tier_name())` before passing to `try_record_command`.
     pub rec: crate::analytics::RecordingContext<'a>,
+    /// Non-zero exit codes this tool's parser meaningfully compresses
+    /// (e.g. `&[1]` for grep "no matches"). Any other non-zero exit — or a
+    /// signal kill — forwards raw stdout+stderr instead of compressing. (#317)
+    pub expected_exit_codes: &'a [i32],
+    /// When `true`, forward child stderr verbatim to skim's stderr on the
+    /// compressed path. Set for tools whose parsers only consume stdout, so
+    /// warnings/diagnostics on stderr are never silently dropped. (#317)
+    pub forward_stderr: bool,
+}
+
+/// How a child process's exit status should steer output handling. (#317)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitDisposition {
+    /// Exit 0 — compress normally.
+    Success,
+    /// A non-zero code the tool's parser meaningfully compresses
+    /// (e.g. grep 1 = no matches, cargo test 101 = test failures).
+    ExpectedFailure,
+    /// Any other non-zero code, or a signal kill (`None`) — the output is a
+    /// diagnostic the parser was never designed for; forward it raw.
+    UnexpectedFailure,
+}
+
+/// Classify an exit code against a tool's expected non-zero codes.
+///
+/// Must be called on the raw `Option<i32>` BEFORE any `unwrap_or` default:
+/// a signal kill (`None`) is always an [`ExitDisposition::UnexpectedFailure`].
+fn classify_exit(code: Option<i32>, expected: &[i32]) -> ExitDisposition {
+    match code {
+        Some(0) => ExitDisposition::Success,
+        Some(c) if expected.contains(&c) => ExitDisposition::ExpectedFailure,
+        _ => ExitDisposition::UnexpectedFailure,
+    }
 }
 
 /// Merge stdout and stderr into a single string for fallback parsing.
@@ -229,15 +262,13 @@ fn record_and_report(report: RecordReport<'_>) {
         duration,
     } = report;
 
-    // Hint fires on ALL non-zero exits regardless of tier. Passthrough tier
-    // still means skim processed the command through its rewrite hook — agents
-    // need the SKIM_PASSTHROUGH=1 escape hatch surfaced since the global
-    // CLAUDE.md docs no longer mention the flag. Text says "compressed" for
-    // consistency across tiers; the message's purpose is the escape hatch, not
-    // describing what skim did. When SKIM_PASSTHROUGH=1 is active, we already
-    // returned early in run_parsed_command_with_mode (the is_passthrough_mode()
-    // guard), so this never double-fires.
-    if code != 0 {
+    // Notice matrix (#317). Unexpected failures already raw-forwarded and
+    // returned before reaching this point, so a non-zero `code` here is an
+    // EXPECTED failure (a code the parser meaningfully compresses):
+    // - tier Full/Degraded → surface the escape hatch: the body was re-encoded.
+    // - tier Passthrough → silent: the body is already verbatim, so any notice
+    //   would be noise the raw tool does not emit (grep's no-match silence).
+    if code != 0 && tier_name != "passthrough" {
         eprintln!("[skim] compressed output (exit {code}). SKIM_PASSTHROUGH=1 for full output.");
     }
 
@@ -282,6 +313,8 @@ where
         family,
         skip_ansi_strip,
         rec,
+        expected_exit_codes,
+        forward_stderr,
     } = config;
 
     let Some(output) = obtain_output(program, args, env_overrides, install_hint, use_stdin)? else {
@@ -292,6 +325,36 @@ where
     if is_passthrough_mode() {
         return passthrough_raw(&output);
     }
+
+    // Unexpected failure (#317): the parser was never designed for this
+    // output — compressing it would hide the very diagnostic the agent needs.
+    // Forward raw stdout+stderr byte-faithfully (checked BEFORE ANSI
+    // stripping) and record zero savings under the "raw" tier.
+    if classify_exit(output.exit_code, expected_exit_codes) == ExitDisposition::UnexpectedFailure {
+        match output.exit_code {
+            Some(code) => {
+                eprintln!("[skim] {program} exited {code}; raw output (not compressed).")
+            }
+            None => eprintln!("[skim] {program} killed by signal; raw output (not compressed)."),
+        }
+        let label = format_analytics_label(family, program, &args.join(" "));
+        crate::analytics::try_record_command(
+            rec.with_tier("raw"),
+            output.stdout.clone(),
+            output.stdout.clone(),
+            label,
+            output.duration,
+        );
+        return passthrough_raw(&output);
+    }
+
+    // Child stderr to forward verbatim on the compressed path (#317).
+    // Captured before ANSI stripping so the forwarded bytes are faithful.
+    let stderr_to_forward = if forward_stderr && !output.stderr.is_empty() {
+        Some(output.stderr.clone())
+    } else {
+        None
+    };
 
     // Some tools must NOT have ANSI escape sequences stripped: strip_ansi_escapes
     // treats ASCII control codes — including \t (0x09) — as part of escape
@@ -315,6 +378,15 @@ where
     let tier_name = result.tier_name();
 
     let compressed = render_output(&result, output_format)?;
+
+    if let Some(err_text) = stderr_to_forward {
+        let mut err = io::stderr().lock();
+        write!(err, "{err_text}")?;
+        if !err_text.ends_with('\n') {
+            writeln!(err)?;
+        }
+        err.flush()?;
+    }
 
     record_and_report(RecordReport {
         show_stats,
@@ -390,6 +462,12 @@ pub(crate) struct ToolRunConfig<'a> {
     pub skip_ansi_strip: bool,
     /// Analytics command type for recording.
     pub command_type: crate::analytics::CommandType,
+    /// Non-zero exit codes this tool's parser meaningfully compresses.
+    /// See [`ParsedCommandConfig::expected_exit_codes`]. (#317)
+    pub expected_exit_codes: &'a [i32],
+    /// Forward child stderr verbatim on the compressed path.
+    /// See [`ParsedCommandConfig::forward_stderr`]. (#317)
+    pub forward_stderr: bool,
 }
 
 /// Execute a tool, parse its output, and emit the result.
@@ -434,6 +512,8 @@ where
                 parse_tier: None,
                 session_id: ctx.session_id.as_deref(),
             },
+            expected_exit_codes: config.expected_exit_codes,
+            forward_stderr: config.forward_stderr,
         },
         parse_fn,
     )
@@ -446,6 +526,52 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // classify_exit tests (#317)
+    // ========================================================================
+
+    #[test]
+    fn test_classify_exit_zero_is_success() {
+        assert_eq!(classify_exit(Some(0), &[]), ExitDisposition::Success);
+        assert_eq!(classify_exit(Some(0), &[1, 2]), ExitDisposition::Success);
+    }
+
+    #[test]
+    fn test_classify_exit_expected_code() {
+        assert_eq!(
+            classify_exit(Some(1), &[1]),
+            ExitDisposition::ExpectedFailure
+        );
+        assert_eq!(
+            classify_exit(Some(101), &[101]),
+            ExitDisposition::ExpectedFailure
+        );
+    }
+
+    #[test]
+    fn test_classify_exit_unexpected_code() {
+        // grep exit 2 = real error (e.g. missing file) — never compress.
+        assert_eq!(
+            classify_exit(Some(2), &[1]),
+            ExitDisposition::UnexpectedFailure
+        );
+        assert_eq!(
+            classify_exit(Some(1), &[]),
+            ExitDisposition::UnexpectedFailure
+        );
+    }
+
+    #[test]
+    fn test_classify_exit_signal_kill_is_always_unexpected() {
+        // None (signal kill) must classify BEFORE any unwrap_or(1) default:
+        // even if 1 is expected, a signal kill is not an expected failure.
+        assert_eq!(
+            classify_exit(None, &[1]),
+            ExitDisposition::UnexpectedFailure
+        );
+        assert_eq!(classify_exit(None, &[]), ExitDisposition::UnexpectedFailure);
+    }
 
     // ========================================================================
     // format_analytics_label tests

@@ -23,6 +23,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     family: "file",
     skip_ansi_strip: false,
     command_type: CommandType::FileOps,
+    expected_exit_codes: &[1],
+    forward_stderr: true,
 };
 
 /// Run `skim rg [args...]`.
@@ -275,7 +277,10 @@ mod tests {
         assert_eq!(result.shown_count, 8);
         let rendered = format!("{result}");
         for i in 1..=8 {
-            assert!(rendered.contains(&format!("match {i}")), "match {i} missing");
+            assert!(
+                rendered.contains(&format!("match {i}")),
+                "match {i} missing"
+            );
         }
     }
 

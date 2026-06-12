@@ -97,6 +97,10 @@ pub(super) fn run_script(
             family: "pkg",
             skip_ansi_strip: false,
             rec,
+            // npm propagates the script's exit code; 1 = test/script failures,
+            // which the tool-specific parsers exist to compress.
+            expected_exit_codes: &[1],
+            forward_stderr: false,
         },
         move |output: &CommandOutput| parse_npm_output(output, tool),
     )

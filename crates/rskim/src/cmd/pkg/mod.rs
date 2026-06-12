@@ -113,6 +113,10 @@ where
             family: "pkg",
             skip_ansi_strip: false,
             rec,
+            // 1 = findings present (npm audit vulnerabilities, npm outdated
+            // packages, pip check conflicts) — the case these parsers exist for.
+            expected_exit_codes: &[1],
+            forward_stderr: false,
         },
         |output| parse_fn(output),
     )
