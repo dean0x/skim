@@ -385,6 +385,34 @@ impl PassthroughTruncator {
 }
 
 // ============================================================================
+// Loud elision markers (#317)
+// ============================================================================
+
+/// Build a loud elision marker for output that was bounded by a safety guardrail.
+///
+/// Skim's contract is "compress, never truncate": wrappers may re-encode output
+/// but must never silently show less than the raw tool. When a hard bound is
+/// genuinely unavoidable, the elision must state exact counts and how to get
+/// the rest. Returns `None` when nothing was omitted (`shown >= total`), so
+/// callers can unconditionally `extend()`/`push()` the result.
+pub(crate) fn elision_marker(shown: usize, total: usize, unit: &str) -> Option<String> {
+    if shown >= total {
+        return None;
+    }
+    let omitted = total - shown;
+    Some(format!(
+        "[skim] {omitted} {unit} omitted ({shown} of {total} shown) — SKIM_PASSTHROUGH=1 for full output"
+    ))
+}
+
+/// Streaming variant of [`elision_marker`] for sites where the total is
+/// unknowable (the input is consumed incrementally and elision happens
+/// mid-stream). `shown_desc` describes what WAS kept (e.g. `"first 64 KiB"`).
+pub(crate) fn elision_marker_unbounded(shown_desc: &str, unit: &str) -> String {
+    format!("[skim] {unit} elided beyond {shown_desc} — SKIM_PASSTHROUGH=1 for full output")
+}
+
+// ============================================================================
 // FilterTransparencyHeader
 // ============================================================================
 
@@ -433,6 +461,41 @@ impl FilterTransparencyHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // elision_marker tests
+    // ========================================================================
+
+    #[test]
+    fn test_elision_marker_none_when_nothing_omitted() {
+        assert_eq!(elision_marker(5, 5, "rows"), None);
+        assert_eq!(elision_marker(6, 5, "rows"), None);
+        assert_eq!(elision_marker(0, 0, "rows"), None);
+    }
+
+    #[test]
+    fn test_elision_marker_exact_counts_and_escape_hatch() {
+        let marker = elision_marker(300, 412, "lines").unwrap();
+        assert!(
+            marker.contains("112 lines omitted"),
+            "must state exact omitted count: {marker}"
+        );
+        assert!(
+            marker.contains("300 of 412 shown"),
+            "must state shown/total: {marker}"
+        );
+        assert!(
+            marker.contains("SKIM_PASSTHROUGH=1"),
+            "must surface the escape hatch: {marker}"
+        );
+    }
+
+    #[test]
+    fn test_elision_marker_unbounded_describes_kept_portion() {
+        let marker = elision_marker_unbounded("first 64 KiB", "line content");
+        assert!(marker.contains("first 64 KiB"), "{marker}");
+        assert!(marker.contains("SKIM_PASSTHROUGH=1"), "{marker}");
+    }
 
     // ========================================================================
     // ParseResult tests
