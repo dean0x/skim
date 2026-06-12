@@ -83,11 +83,12 @@ pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    // Transparency gate: user steered output → pass gh through byte-faithfully.
-    // Reuses run_raw_passthrough (separate stdout/stderr, inherited stdin, exit
-    // code preserved). Covers wrapper/argv0 + direct `skim gh`; the hook path
-    // is handled by the rules.rs skip-list. See the "compress, never truncate"
-    // tracking issue.
+    // Transparency gate: user steered output → pass gh through (UTF-8, capped —
+    // see #317 for the streaming/non-UTF-8 follow-up).  Reuses
+    // run_raw_passthrough (separate stdout/stderr, inherited stdin, exit code
+    // preserved). Covers wrapper/argv0 + direct `skim gh`; the hook path is
+    // handled by the rules.rs skip-list. See the "compress, never truncate"
+    // tracking issue (#317).
     if shared::user_steers_output(args) {
         return crate::cmd::run_raw_passthrough(CONFIG.program, args, CONFIG.env_overrides);
     }

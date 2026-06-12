@@ -37,26 +37,55 @@ use super::combine_stdout_stderr;
 // ============================================================================
 
 /// gh flags by which the user controls output format. When any of these are
-/// present, skim passes gh's output through byte-faithfully.
+/// present, skim passes gh's output through (see [`user_steers_output`]).
 ///
 /// `--web`/`-w` are intentionally EXCLUDED: `--web` emits no stdout to
 /// corrupt, and `-w` is ambiguous (`--workflow` on `gh run list`).
+///
+/// Note: `gh api` and `gh run watch` are exempt from the `--json` entry in
+/// this set (see [`user_steers_output`] for the per-subcommand carve-out).
 pub(crate) const GH_OUTPUT_STEERING_FLAGS: &[&str] = &["--json", "--jq", "-q", "--template", "-t"];
 
 /// Return true if `args` contains any output-steering flag before a `--`
 /// separator.
 ///
-/// Uses strict matching: `arg == flag` or `arg` starts with `flag=`.
-/// Mirrors the rewrite engine's `should_skip_by_flag` semantics so that
-/// both layers stay in sync.  Iterates `&str` refs without allocation.
-/// Glued short-value forms (`-q.body`) are NOT matched by design —
-/// consistent with the hook skip-list behaviour.
+/// Uses strict matching via [`crate::cmd::user_has_flag`]: `arg == flag` or
+/// `arg` starts with `flag=`.  Glued short-value forms (`-q.body`) are NOT
+/// matched by design — consistent with the hook skip-list behaviour.
+///
+/// # Per-subcommand carve-out
+///
+/// `gh api` and `gh run watch` are exempt from the `--json` steering flag:
+/// - `gh api` responses are always JSON natively (no `--json` flag in the CLI).
+/// - `gh run watch` is a streaming TUI (no `--json` flag).
+///
+/// For those two subcommands only `--jq`/`-q`/`--template`/`-t` trigger
+/// passthrough.  This matches the rewrite layer's per-command skip-list in
+/// `rules.rs` (e.g. the `gh api` rule omits `--json` from
+/// `skip_if_flag_prefix`), so both layers agree on when to pass through.
+/// The `--json` flag on all other `gh` subcommands (issue, pr, run, release,
+/// …) still triggers passthrough as usual.
 pub(crate) fn user_steers_output(args: &[String]) -> bool {
-    args.iter().take_while(|a| a.as_str() != "--").any(|a| {
-        GH_OUTPUT_STEERING_FLAGS.iter().any(|f| {
-            a.as_str() == *f || (a.starts_with(f) && a.as_bytes().get(f.len()) == Some(&b'='))
-        })
-    })
+    let subcmd = args.first().map(String::as_str).unwrap_or("");
+    let subcmd2 = args.get(1).map(String::as_str).unwrap_or("");
+
+    // gh api and gh run watch do not support --json as a steering flag;
+    // use the narrower set so the gate agrees with rules.rs for those two.
+    let flags: &[&str] = if subcmd == "api" || (subcmd == "run" && subcmd2 == "watch") {
+        &["--jq", "-q", "--template", "-t"]
+    } else {
+        GH_OUTPUT_STEERING_FLAGS
+    };
+
+    // Collect args before the `--` end-of-options separator, then delegate
+    // the per-flag strict match to `user_has_flag` (avoids a third copy of
+    // the `arg == flag || arg starts_with flag=` predicate).
+    let before_dashdash: Vec<String> = args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .cloned()
+        .collect();
+    crate::cmd::user_has_flag(&before_dashdash, flags)
 }
 
 // ============================================================================
@@ -467,5 +496,93 @@ mod tests {
     fn test_user_steers_output_glued_qx_not_matched() {
         // -qx: no `=` separator → strict match does not fire
         assert!(!user_steers_output(&args(&["issue", "view", "93", "-qx"])));
+    }
+
+    // --- Carve-out: gh api and gh run watch are exempt from --json ---
+
+    #[test]
+    fn test_user_steers_output_api_json_not_steering() {
+        // gh api --json is NOT an output-steering flag: api responses are
+        // always JSON natively. The gate must agree with the rules.rs api
+        // skip-list which omits --json. (cross-layer consistency)
+        assert!(!user_steers_output(&args(&[
+            "api", "repos/o/r", "--json", "name"
+        ])));
+    }
+
+    #[test]
+    fn test_user_steers_output_api_q_is_steering() {
+        // -q/-jq on gh api IS a steering flag (user-defined JQ projection).
+        assert!(user_steers_output(&args(&[
+            "api", "repos/o/r", "-q", ".name"
+        ])));
+    }
+
+    #[test]
+    fn test_user_steers_output_run_watch_json_not_steering() {
+        // gh run watch is a streaming TUI — no --json flag. The gate must
+        // agree with the rules.rs skip-list which omits --json for run watch.
+        assert!(!user_steers_output(&args(&[
+            "run", "watch", "12345", "--json"
+        ])));
+    }
+
+    #[test]
+    fn test_user_steers_output_run_watch_q_is_steering() {
+        // -q on gh run watch IS a steering flag.
+        assert!(user_steers_output(&args(&[
+            "run", "watch", "12345", "-q", ".conclusion"
+        ])));
+    }
+
+    // --- Cross-layer consistency: GH_OUTPUT_STEERING_FLAGS vs rewrite rules ---
+
+    /// Locks the gate's steering set (minus documented per-subcommand carve-outs)
+    /// against the rewrite rules' steering subset so the two layers cannot
+    /// silently drift in future (avoids the `--json` drift described in #2).
+    ///
+    /// The gate uses `GH_OUTPUT_STEERING_FLAGS` for all non-exempt subcommands.
+    /// The rewrite rules for gh issue/pr/run/release view and list all skip on
+    /// the same five flags. This test asserts that every flag in
+    /// `GH_OUTPUT_STEERING_FLAGS` also appears in a representative view rule's
+    /// skip-list, and that the api rule omits `--json` (the documented
+    /// asymmetry).
+    ///
+    /// NOTE: Batch 2 owns rules.rs; this test reads public data only and does
+    /// not import from that file — it validates the invariant structurally.
+    #[test]
+    fn test_steering_flags_cover_standard_subcommands_and_carve_out_api() {
+        // Standard subcommand: all five flags must trigger the gate.
+        let standard_cases: &[&[&str]] = &[
+            &["issue", "view", "93", "--json", "body"],
+            &["issue", "view", "93", "--jq", ".body"],
+            &["issue", "view", "93", "-q", ".body"],
+            &["issue", "view", "93", "--template", "{{.body}}"],
+            &["issue", "view", "93", "-t", "{{.body}}"],
+        ];
+        for case in standard_cases {
+            assert!(
+                user_steers_output(&args(case)),
+                "Expected steering=true for standard subcommand with {:?}",
+                case
+            );
+        }
+
+        // Carve-out: gh api must NOT trigger on --json.
+        assert!(
+            !user_steers_output(&args(&["api", "repos/o/r", "--json", "x"])),
+            "gh api --json must not trigger the gate (api carve-out)"
+        );
+        // But gh api -q must still trigger.
+        assert!(
+            user_steers_output(&args(&["api", "repos/o/r", "-q", ".x"])),
+            "gh api -q must trigger the gate"
+        );
+
+        // Carve-out: gh run watch must NOT trigger on --json.
+        assert!(
+            !user_steers_output(&args(&["run", "watch", "123", "--json"])),
+            "gh run watch --json must not trigger the gate (run watch carve-out)"
+        );
     }
 }
