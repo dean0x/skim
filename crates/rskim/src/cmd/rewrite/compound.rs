@@ -13,10 +13,76 @@
 //!
 //! SEE: AD-RW-2 — catch-all ls/grep + pipe exclusion design note.
 
-use super::engine::{try_rewrite, try_table_match_full};
+use super::engine::try_rewrite;
 use super::types::{
     CommandSegment, CompoundOp, CompoundSplitResult, QuoteState, RewriteCategory, RewriteResult,
 };
+
+// ---- Round-trip safety (#317) ----
+
+/// Return `true` when `cmd` contains shell syntax that the rewrite pipeline
+/// cannot reconstruct byte-faithfully — every rewrite path MUST bail.
+///
+/// A rewrite that errors, changes semantics, or loses bytes is worse than no
+/// rewrite: 72 sessions corrupted multi-line `git commit` heredocs before this
+/// guard existed (#317 Addendum 5). Checks are deliberately substring-based
+/// (even inside quotes): over-bailing only costs a missed optimization, while
+/// under-bailing corrupts the user's command.
+///
+/// Triggers:
+/// - any newline (tokenization flattens multi-line commands)
+/// - heredoc `<<`
+/// - command substitution `$(` / `${` or backticks
+/// - unmatched quotes
+/// - whitespace that does not survive split+rejoin (runs of spaces/tabs
+///   inside quoted arguments)
+pub(super) fn rewrite_would_corrupt(cmd: &str) -> bool {
+    if cmd.contains('\n')
+        || cmd.contains('`')
+        || cmd.contains("<<")
+        || cmd.contains("$(")
+        || cmd.contains("${")
+    {
+        return true;
+    }
+    if has_unmatched_quotes(cmd) {
+        return true;
+    }
+    // Whitespace round-trip guard: tokenization must be lossless.
+    let rejoined = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+    rejoined != cmd.trim()
+}
+
+/// Scan `cmd` with the same quote state machine as [`split_compound`],
+/// returning `true` when a quote is left open at end of input.
+fn has_unmatched_quotes(cmd: &str) -> bool {
+    let mut quote_state = QuoteState::None;
+    let mut chars = cmd.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match quote_state {
+            QuoteState::SingleQuote => {
+                if ch == '\'' {
+                    quote_state = QuoteState::None;
+                }
+            }
+            QuoteState::DoubleQuote => {
+                if ch == '\\' {
+                    chars.next(); // skip escaped char
+                } else if ch == '"' {
+                    quote_state = QuoteState::None;
+                }
+            }
+            QuoteState::None => {
+                if ch == '\'' {
+                    quote_state = QuoteState::SingleQuote;
+                } else if ch == '"' {
+                    quote_state = QuoteState::DoubleQuote;
+                }
+            }
+        }
+    }
+    quote_state != QuoteState::None
+}
 
 // ---- Redirect stripping (AD-RW-2) ----
 
@@ -323,13 +389,6 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
     CompoundSplitResult::Compound(segments)
 }
 
-// PIPE_EXCLUDED_SOURCES removed (AD-RW-2).
-// The pipe-source exclusion is handled via the `exclude_pipe_source` flag on
-// `RewriteRule` (types.rs).  `engine::try_table_match_full` reports both the
-// rewrite result and the pipe-exclusion flag in a single pass, so adding a new
-// catch-all only requires a single edit in `rules.rs`.
-// See `try_rewrite_compound_pipe` and `mod.rs::classify_compound_pipe`.
-
 /// Return true if any segment has a trailing pipe operator.
 pub(super) fn has_pipe_operator(segments: &[CommandSegment]) -> bool {
     segments
@@ -340,17 +399,17 @@ pub(super) fn has_pipe_operator(segments: &[CommandSegment]) -> bool {
 /// Attempt to rewrite a compound command expression.
 ///
 /// For `&&`/`||`/`;`: tries `try_rewrite()` on each segment independently.
-/// For `|`: only rewrites the first segment (the output producer).
+/// For `|`: NEVER rewrites (#317, user-approved): compressing a pipe
+/// producer silently changes what downstream `grep`/`wc`/`head` consume —
+/// the whole pipeline passes through untouched.
 /// Returns `Some(RewriteResult)` if ANY segment was rewritten, `None` otherwise.
 pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<RewriteResult> {
     if segments.is_empty() {
         return None;
     }
 
-    let has_pipe = has_pipe_operator(segments);
-
-    if has_pipe {
-        return try_rewrite_compound_pipe(segments);
+    if has_pipe_operator(segments) {
+        return None;
     }
 
     // For &&/||/; — try rewriting each segment independently
@@ -399,79 +458,57 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
     })
 }
 
-/// Reconstruct a pipe command from segments after the first segment has been
-/// rewritten.
-///
-/// Takes the already-rewritten first segment tokens (with redirects already
-/// spliced back) and the full segments slice.  Emits: `first_joined | seg2 | seg3`.
-/// Non-first segments are preserved verbatim with their redirects re-appended.
-///
-/// # Invariants
-/// - `segments` must be non-empty (caller gates on this).
-/// - First segment's redirects must be spliced into `first_rewritten` before
-///   calling (caller responsibility).
-pub(super) fn reconstruct_pipe_parts(
-    segments: &[CommandSegment],
-    first_rewritten: Vec<String>,
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    parts.push(first_rewritten.join(" "));
-
-    for (idx, seg) in segments.iter().enumerate() {
-        if idx == 0 {
-            // Already handled the first segment; add its trailing operator.
-            if let Some(op) = seg.trailing_operator {
-                parts.push(op.as_str().to_string());
-            }
-            continue;
-        }
-        // Restore redirects for non-rewritten segments.
-        let mut seg_tokens = seg.tokens.clone();
-        splice_redirects_back(&mut seg_tokens, &seg.stripped_redirects);
-        parts.push(seg_tokens.join(" "));
-        if let Some(op) = seg.trailing_operator {
-            parts.push(op.as_str().to_string());
-        }
-    }
-
-    parts.join(" ")
-}
-
-/// Rewrite a pipe expression. Only the first segment (output producer) is rewritten.
-fn try_rewrite_compound_pipe(segments: &[CommandSegment]) -> Option<RewriteResult> {
-    if segments.is_empty() {
-        return None;
-    }
-
-    let first = &segments[0];
-
-    let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
-
-    // Do not rewrite pipe-source-excluded commands (e.g. `ls | head`, `find . | head`).
-    // Use try_table_match_full for a single-pass check: if pipe_excluded is set,
-    // suppress the rewrite regardless of whether a rewrite would have matched.
-    // SEE: AD-RW-2.
-    let match_result = try_table_match_full(&token_refs);
-    if match_result.pipe_excluded {
-        return None;
-    }
-    let rewrite = match_result.rewrite?;
-
-    // Splice redirects back for the first segment before handing off.
-    let mut first_tokens = rewrite.tokens.clone();
-    splice_redirects_back(&mut first_tokens, &first.stripped_redirects);
-
-    let reconstructed = reconstruct_pipe_parts(segments, first_tokens);
-
-    Some(RewriteResult {
-        tokens: vec![reconstructed],
-        category: rewrite.category,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // rewrite_would_corrupt (#317 round-trip safety)
+    // ========================================================================
+
+    /// The exact corruption class from #317 Addendum 5: a multi-line
+    /// `git commit` message (heredoc-style) flattened by tokenization.
+    /// 72 sessions / 180 failures before this guard.
+    #[test]
+    fn test_corrupt_guard_multiline_commit_bails() {
+        let cmd = "git commit -m \"feat: subject line\n\nBody paragraph with detail.\n\"";
+        assert!(rewrite_would_corrupt(cmd), "newlines must bail");
+    }
+
+    #[test]
+    fn test_corrupt_guard_heredoc_bails() {
+        assert!(rewrite_would_corrupt("git commit -F- <<'EOF'"));
+        assert!(rewrite_would_corrupt("cat <<EOF"));
+    }
+
+    #[test]
+    fn test_corrupt_guard_substitution_and_backticks_bail() {
+        assert!(rewrite_would_corrupt("echo $(date)"));
+        assert!(rewrite_would_corrupt("echo ${HOME}"));
+        assert!(rewrite_would_corrupt("echo `date`"));
+    }
+
+    #[test]
+    fn test_corrupt_guard_unmatched_quote_bails() {
+        assert!(rewrite_would_corrupt("git commit -m \"unterminated"));
+        assert!(rewrite_would_corrupt("echo 'open"));
+    }
+
+    #[test]
+    fn test_corrupt_guard_lossy_whitespace_bails() {
+        // Double space inside a quoted argument does not survive
+        // split_whitespace + join(" ").
+        assert!(rewrite_would_corrupt("git commit -m \"two  spaces\""));
+        assert!(rewrite_would_corrupt("grep \"a\tb\" file.txt"));
+    }
+
+    #[test]
+    fn test_corrupt_guard_clean_commands_pass() {
+        assert!(!rewrite_would_corrupt("git commit -m \"one-line message\""));
+        assert!(!rewrite_would_corrupt("cargo test"));
+        assert!(!rewrite_would_corrupt("grep -rn pattern src/"));
+        assert!(!rewrite_would_corrupt("cargo test && cargo build"));
+    }
 
     // ========================================================================
     // split_compound state machine (#45)
@@ -751,21 +788,15 @@ mod tests {
         }
     }
 
-    /// `cargo test 2>&1 | head` must be rewritten and preserve the redirect.
+    /// #317 (user-approved): pipe expressions are NEVER rewritten — producer
+    /// compression silently changes what the downstream consumer sees.
     #[test]
-    fn test_compound_pipe_rewrite_preserves_redirect() {
+    fn test_compound_pipe_never_rewritten() {
         match split_compound("cargo test 2>&1 | head") {
             CompoundSplitResult::Compound(segments) => {
-                let result = try_rewrite_compound(&segments);
-                assert!(result.is_some(), "cargo test 2>&1 | head must be rewritten");
-                let joined = result.unwrap().tokens.join(" ");
                 assert!(
-                    joined.contains("2>&1"),
-                    "Redirect must be preserved in rewritten pipe: {joined}"
-                );
-                assert!(
-                    joined.contains("| head"),
-                    "Pipe consumer must be preserved: {joined}"
+                    try_rewrite_compound(&segments).is_none(),
+                    "pipe expressions must pass through untouched"
                 );
             }
             other => panic!("Expected Compound, got {:?}", other),

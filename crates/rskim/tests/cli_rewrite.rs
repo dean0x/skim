@@ -121,17 +121,15 @@ fn test_rewrite_compound_and_and() {
 }
 
 #[test]
-fn test_rewrite_compound_pipe() {
-    // Only the first segment (output producer) should be rewritten
+fn test_rewrite_compound_pipe_never_rewritten() {
+    // #317 (user-approved): pipe expressions are never rewritten — exit 1.
     Command::cargo_bin("skim")
         .unwrap()
         .arg("rewrite")
         .write_stdin("cargo test | head\n")
         .assert()
-        .success()
-        .stdout(predicate::str::contains("skim cargo test"))
-        .stdout(predicate::str::contains("|"))
-        .stdout(predicate::str::contains("head"));
+        .failure()
+        .stdout(predicate::str::is_empty());
 }
 
 #[test]
@@ -223,16 +221,15 @@ fn test_rewrite_compound_escaped_quotes() {
 
 #[test]
 fn test_rewrite_compound_mixed_pipe_and_sequential() {
-    // Mixed pipe + sequential: cargo test && cargo build | head
-    // The pipe causes the entire expression to go through the pipe path,
-    // which only rewrites the first segment.
+    // Mixed pipe + sequential: ANY top-level pipe makes the whole expression
+    // pass through untouched (#317) — exit 1.
     Command::cargo_bin("skim")
         .unwrap()
         .arg("rewrite")
         .write_stdin("cargo test && cargo build | head\n")
         .assert()
-        .success()
-        .stdout(predicate::str::contains("skim cargo test"));
+        .failure()
+        .stdout(predicate::str::is_empty());
 }
 
 #[test]
@@ -263,15 +260,15 @@ fn test_rewrite_redirect_stderr_to_stdout() {
 
 #[test]
 fn test_rewrite_redirect_stderr_to_stdout_pipe() {
+    // #317: pipes never rewrite — redirects in the producer are preserved
+    // implicitly because the ORIGINAL command runs unchanged.
     Command::cargo_bin("skim")
         .unwrap()
         .arg("rewrite")
         .write_stdin("cargo test 2>&1 | head\n")
         .assert()
-        .success()
-        .stdout(predicate::str::contains("skim cargo test 2>&1"))
-        .stdout(predicate::str::contains("|"))
-        .stdout(predicate::str::contains("head"));
+        .failure()
+        .stdout(predicate::str::is_empty());
 }
 
 #[test]

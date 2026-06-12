@@ -2512,3 +2512,205 @@ fn test_cargo_c_alias_dispatches_to_check() {
         // What must NOT happen is an "unknown subcommand" error for 'c'.
         .stderr(predicate::str::contains("unknown subcommand 'c'").not());
 }
+
+// ============================================================================
+// #317 — round-trip safety: a rewrite must never corrupt a command
+// ============================================================================
+
+/// The exact heredoc-corruption repro from #317 Addendum 5: a multi-line
+/// `git commit` message. 72 sessions / 180 failures were caused by the hook
+/// flattening these into one line. The hook must NOT rewrite (empty stdout).
+#[test]
+fn test_hook_multiline_commit_is_never_rewritten() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "git commit -m \"$(cat <<'EOF'\nfeat: subject\n\nBody text here.\nEOF\n)\""
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Any embedded newline bails — even without heredoc syntax.
+#[test]
+fn test_hook_newline_in_command_is_never_rewritten() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "git commit -m \"line one\nline two\""
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Whitespace round-trip guard: runs of spaces inside quoted args would be
+/// flattened by tokenize+join — the hook must bail.
+#[test]
+fn test_hook_double_space_in_quoted_arg_is_never_rewritten() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "git commit -m \"two  spaces preserved\""
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// One-line `git commit -m "x"` (single-spaced) still rewrites: the
+/// round-trip guard only bails when reconstruction would be lossy.
+#[test]
+fn test_hook_single_line_commit_still_rewrites() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "git commit -m \"fix: one-line message\""
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim git commit"));
+}
+
+// ============================================================================
+// #317 — pipes are wholly rewrite-free (user-approved)
+// ============================================================================
+
+/// `git diff | grep TODO` must pass through: compressing the producer would
+/// silently change what grep sees.
+#[test]
+fn test_hook_pipe_is_never_rewritten() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "git diff | grep TODO"
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Pipe with a rewritable producer (`cargo test | head`) also passes through.
+#[test]
+fn test_hook_pipe_with_rewritable_producer_passes_through() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "cargo test | head -50"
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+// ============================================================================
+// #317 — the emitted rewrite must EXECUTE (round-trip e2e)
+//
+// This is the test class that would have caught Addendum 4B: every
+// hook-rewritten `cat <file>` with session attribution emitted
+// `skim --session-id=… <file>`, which errored with
+// "unexpected argument '--session-id'".
+// ============================================================================
+
+/// Hook-rewrite `cat <tmp.rs>` with a session_id, then EXECUTE the emitted
+/// command. It must exit 0 and produce output.
+#[test]
+fn test_hook_rewritten_cat_with_session_id_executes() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("roundtrip.rs");
+    fs::write(&file, "pub fn answer() -> u32 {\n    42\n}\n").unwrap();
+
+    let input = serde_json::json!({
+        "session_id": "e2e-roundtrip-session",
+        "tool_input": {
+            "command": format!("cat {}", file.display())
+        }
+    });
+    let output = skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: serde_json::Value = serde_json::from_slice(&output).expect("hook emits JSON");
+    let rewritten = response["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .expect("rewritten command present");
+    assert!(
+        rewritten.contains("--session-id=e2e-roundtrip-session"),
+        "session id must be injected: {rewritten}"
+    );
+
+    // Execute the emitted tokens through the actual skim binary.
+    let tokens: Vec<&str> = rewritten.split_whitespace().collect();
+    assert_eq!(tokens[0], "skim");
+    skim_cmd()
+        .args(&tokens[1..])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("answer"));
+}
+
+// ============================================================================
+// #317 — declaration files keep their signal (.d.ts / .pyi)
+// ============================================================================
+
+/// `cat types.d.ts` must rewrite with --mode=structure (pseudo strips the
+/// entire file — it is all type declarations).
+#[test]
+fn test_hook_cat_declaration_file_uses_structure_mode() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "cat src/types.d.ts"
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--mode=structure"))
+        .stdout(predicate::str::contains("pseudo").not());
+}
+
+/// A declaration-file rewrite executed end-to-end retains the type signal.
+#[test]
+fn test_declaration_file_rewrite_output_retains_types() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("api.d.ts");
+    fs::write(
+        &file,
+        "export interface User {\n    id: number;\n    name: string;\n}\nexport declare function getUser(id: number): User;\n",
+    )
+    .unwrap();
+
+    skim_cmd()
+        .args([file.to_str().unwrap(), "--mode=structure"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("interface User"))
+        .stdout(predicate::str::contains("getUser"))
+        .stdout(predicate::str::contains("id: number"));
+}

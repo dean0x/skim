@@ -89,18 +89,15 @@ fn test_classify_compound_any_nomatch() {
 }
 
 #[test]
-fn test_classify_pipe_first_segment_rewritten() {
-    let result = classify_command("git show HEAD | less");
-    match result {
-        CommandClassification::Rewritten(s) => {
-            assert!(
-                s.contains("skim git show HEAD"),
-                "First pipe segment must be rewritten: {s}"
-            );
-            assert!(s.contains("| less"), "Pipe consumer must be preserved: {s}");
-        }
-        other => panic!("Expected Rewritten for pipe with rewritable first seg, got {other:?}"),
-    }
+fn test_classify_pipe_never_rewritten() {
+    // #317 (user-approved): pipes are never rewritten — even when the first
+    // segment matches a rule, compressing the producer changes what the
+    // downstream consumer sees.
+    assert_eq!(
+        classify_command("git show HEAD | less"),
+        CommandClassification::Unhandled,
+        "pipe with rewritable first segment must NOT be rewritten"
+    );
 }
 
 #[test]
@@ -132,23 +129,15 @@ fn test_classify_compound_preserves_stripped_redirects() {
     }
 }
 
-/// Stripped redirects must survive classify_compound_pipe reconstruction (Issue #2).
-///
-/// `cargo test 2>&1 | head` — the `2>&1` is stripped before rule matching
-/// and must be spliced back into the rewritten pipe command.
+/// #317: pipe expressions pass through untouched — redirects included,
+/// because the ORIGINAL command runs unchanged.
 #[test]
-fn test_classify_compound_pipe_preserves_stripped_redirects() {
-    let result = classify_command("cargo test 2>&1 | head");
-    match result {
-        CommandClassification::Rewritten(s) => {
-            assert!(
-                s.contains("2>&1"),
-                "Stripped redirect must be preserved in rewritten pipe: {s}"
-            );
-            assert!(s.contains("| head"), "Pipe consumer must be preserved: {s}");
-        }
-        other => panic!("Expected Rewritten, got {other:?}"),
-    }
+fn test_classify_compound_pipe_is_unhandled() {
+    assert_eq!(
+        classify_command("cargo test 2>&1 | head"),
+        CommandClassification::Unhandled,
+        "pipe expressions must not be rewritten"
+    );
 }
 
 #[test]
