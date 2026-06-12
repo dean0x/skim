@@ -2714,3 +2714,37 @@ fn test_declaration_file_rewrite_output_retains_types() {
         .stdout(predicate::str::contains("getUser"))
         .stdout(predicate::str::contains("id: number"));
 }
+
+/// Redirect-order hazard (post-review finding): `2>&1 >log.txt` routes
+/// stderr→terminal + stdout→log; the strip-and-append redirect handling
+/// would reorder it to `>log.txt 2>&1` (both→log). The hook must bail.
+#[test]
+fn test_hook_redirect_reorder_hazard_is_never_rewritten() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "cargo build 2>&1 >log.txt && cargo test"
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Safe redirect order (`>log 2>&1`) still rewrites — append preserves it.
+#[test]
+fn test_hook_safe_redirect_order_still_rewrites() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "cargo test >log.txt 2>&1"
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">log.txt 2>&1"));
+}

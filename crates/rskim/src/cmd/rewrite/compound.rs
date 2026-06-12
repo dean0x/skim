@@ -36,6 +36,8 @@ use super::types::{
 /// - unmatched quotes
 /// - whitespace that does not survive split+rejoin (runs of spaces/tabs
 ///   inside quoted arguments)
+/// - a recognized redirect followed by an unrecognized `>`-bearing token
+///   (see [`redirect_order_hazard`])
 pub(super) fn rewrite_would_corrupt(cmd: &str) -> bool {
     if cmd.contains('\n')
         || cmd.contains('`')
@@ -48,9 +50,36 @@ pub(super) fn rewrite_would_corrupt(cmd: &str) -> bool {
     if has_unmatched_quotes(cmd) {
         return true;
     }
+    if redirect_order_hazard(cmd) {
+        return true;
+    }
     // Whitespace round-trip guard: tokenization must be lossless.
     let rejoined = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
     rejoined != cmd.trim()
+}
+
+/// Return `true` when a recognized redirect token is followed anywhere by an
+/// unrecognized `>`-bearing token.
+///
+/// [`strip_segment_redirects`] removes only the recognized forms and
+/// [`splice_redirects_back`] re-appends them at segment end. An unrecognized
+/// `>file` redirect stays in place, so a recognized redirect that originally
+/// preceded it gets reordered PAST it — and redirect order is fd-routing
+/// semantics: `2>&1 >log.txt` (stderr→terminal, stdout→log) is not
+/// `>log.txt 2>&1` (both→log). Bail instead (#317: byte-faithful or bail).
+///
+/// Deliberately coarse and whole-command (over-bailing across segments, or on
+/// quoted `>` characters in args, only costs a missed optimization).
+fn redirect_order_hazard(cmd: &str) -> bool {
+    let mut saw_recognized = false;
+    for tok in cmd.split_whitespace() {
+        if is_single_redirect(tok) || tok == "2>" {
+            saw_recognized = true;
+        } else if saw_recognized && tok.contains('>') {
+            return true;
+        }
+    }
+    false
 }
 
 /// Scan `cmd` with the same quote state machine as [`split_compound`],
@@ -508,6 +537,55 @@ mod tests {
         assert!(!rewrite_would_corrupt("cargo test"));
         assert!(!rewrite_would_corrupt("grep -rn pattern src/"));
         assert!(!rewrite_would_corrupt("cargo test && cargo build"));
+    }
+
+    /// Redirect-order hazard: `2>&1 >log.txt` means stderr→terminal,
+    /// stdout→log. Strip-and-append would reorder it to `>log.txt 2>&1`
+    /// (both→log) — fd-routing corruption. Must bail.
+    #[test]
+    fn test_corrupt_guard_redirect_reorder_bails() {
+        assert!(rewrite_would_corrupt(
+            "cargo build 2>&1 >log.txt && cargo test"
+        ));
+        assert!(rewrite_would_corrupt(
+            "cargo test 2>/dev/null >out && cargo build"
+        ));
+        assert!(rewrite_would_corrupt("cargo test 2>&1 >log.txt"));
+        // Unrecognized-first, recognized, then another unrecognized.
+        assert!(rewrite_would_corrupt("cmd >a 2>&1 >b"));
+    }
+
+    /// Safe redirect shapes still rewrite: recognized-only combinations keep
+    /// their relative order through strip+append, and an unrecognized
+    /// redirect BEFORE a recognized one is appended after it unchanged.
+    #[test]
+    fn test_corrupt_guard_safe_redirect_orders_pass() {
+        assert!(!rewrite_would_corrupt("cargo test 2>&1"));
+        assert!(!rewrite_would_corrupt("cargo test 2>&1 && cargo build"));
+        assert!(!rewrite_would_corrupt("cargo test >log.txt 2>&1"));
+        assert!(!rewrite_would_corrupt("cargo test 2>&1 >/dev/null"));
+    }
+
+    /// Pin the reorder defect itself: with the guard bypassed (calling
+    /// split+rewrite directly), the hazard shape WOULD reorder — proving the
+    /// guard is load-bearing, not redundant.
+    #[test]
+    fn test_redirect_reorder_defect_is_real_without_guard() {
+        match split_compound("cargo build 2>&1 >log.txt && cargo test") {
+            CompoundSplitResult::Compound(segments) => {
+                let joined = try_rewrite_compound(&segments)
+                    .expect("rewrites without the guard")
+                    .tokens
+                    .join(" ");
+                let idx_merge = joined.find("2>&1").expect("2>&1 present");
+                let idx_log = joined.find(">log.txt").expect(">log.txt present");
+                assert!(
+                    idx_merge > idx_log,
+                    "documents the reorder the guard exists to prevent: {joined}"
+                );
+            }
+            other => panic!("Expected Compound, got {other:?}"),
+        }
     }
 
     // ========================================================================
