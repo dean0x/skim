@@ -92,23 +92,6 @@ pub(crate) fn user_steers_output(args: &[String]) -> bool {
 // Shared constants
 // ============================================================================
 
-/// Maximum body lines included in issue/PR view output.
-///
-/// Bodies are truncated to this many lines to prevent excessive context
-/// consumption when an issue has a multi-page description.
-pub const MAX_BODY_LINES: usize = 10;
-
-/// Maximum number of comments to include in issue/PR view output.
-///
-/// Only the most recent N comments are shown to surface actionable context.
-pub const MAX_COMMENTS: usize = 3;
-
-/// Maximum step details shown per failed job in run view.
-pub const MAX_STEP_DETAIL: usize = 5;
-
-/// Maximum items in list output.
-pub const MAX_ITEMS: usize = 100;
-
 /// Maximum byte length of JSON input accepted for Tier 1 parsing.
 ///
 /// Inputs larger than this are skipped and fall through to the regex tier,
@@ -183,26 +166,6 @@ pub fn inject_json_fields(cmd_args: &mut Vec<String>, fields: &str) {
     }
 }
 
-/// Truncate a body string to at most `max_lines` lines.
-///
-/// If the body fits within the limit it is returned as-is.
-/// Otherwise the first `max_lines` lines are kept and a suffix of the form
-/// `... (M more lines)` is appended.
-///
-/// Uses an iterator-based approach to avoid materializing all lines before
-/// truncating: only the kept lines are collected.
-pub fn truncate_body(body: &str, max_lines: usize) -> String {
-    let mut lines_iter = body.lines();
-    let kept: Vec<&str> = lines_iter.by_ref().take(max_lines).collect();
-    let remaining = lines_iter.count();
-    if remaining == 0 {
-        return body.to_string();
-    }
-    let mut result = kept.join("\n");
-    result.push_str(&format!("\n... ({remaining} more lines)"));
-    result
-}
-
 /// Parse `gh issue view` / `gh pr view` text output using regex.
 ///
 /// Both commands emit the same human-readable header + key-value format. The
@@ -274,14 +237,15 @@ where
     f(&obj)
 }
 
-/// Extract the last `max` comments, stripping quoted-reply (`>`) lines.
+/// Extract ALL comments, stripping quoted-reply (`>`) lines.
 ///
-/// Returns one entry per comment in the format `"@author: first_line..."`.
-/// Leading `>` lines (quoted replies in Markdown) are removed before
-/// extracting the first meaningful line so that only the new text is shown.
-pub fn extract_comments(comments: &[serde_json::Value], max: usize) -> Vec<String> {
-    let start = comments.len().saturating_sub(max);
-    comments[start..]
+/// Returns one entry per comment in the format `"@author: full text"` (#317):
+/// comment prose IS the meaning — no count cap, no character-preview cap.
+/// Leading `>` lines (quoted replies in Markdown) are genuine noise — the
+/// quoted text already appears in the comment being replied to — and are the
+/// only thing removed.
+pub fn extract_comments(comments: &[serde_json::Value]) -> Vec<String> {
+    comments
         .iter()
         .filter_map(|c| {
             let author = c
@@ -291,17 +255,16 @@ pub fn extract_comments(comments: &[serde_json::Value], max: usize) -> Vec<Strin
                 .or_else(|| c.get("login").and_then(|l| l.as_str()))
                 .unwrap_or("unknown");
             let body = c.get("body").and_then(|b| b.as_str()).unwrap_or("");
-            // Strip quoted lines (starting with `>`)
-            let first_line = body
+            // Strip quoted-reply lines (starting with `>`), keep everything else.
+            let kept: Vec<&str> = body
                 .lines()
-                .find(|l| !l.trim_start().starts_with('>') && !l.trim().is_empty())?;
-            // Use char_indices for byte-offset slicing to avoid heap allocation
-            // per comment: find the byte index of the 121st char boundary, if any.
-            let preview = match first_line.char_indices().nth(120) {
-                Some((idx, _)) => &first_line[..idx],
-                None => first_line,
-            };
-            Some(format!("@{author}: {preview}"))
+                .filter(|l| !l.trim_start().starts_with('>'))
+                .collect();
+            let text = kept.join("\n").trim().to_string();
+            if text.is_empty() {
+                return None;
+            }
+            Some(format!("@{author}: {text}"))
         })
         .collect()
 }

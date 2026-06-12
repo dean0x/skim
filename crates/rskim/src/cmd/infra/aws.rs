@@ -34,9 +34,6 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
 /// Keys stripped from AWS JSON responses (metadata, not useful data).
 const METADATA_KEYS: &[&str] = &["ResponseMetadata", "NextToken", "RequestId"];
 
-/// Maximum number of items surfaced from arrays or tables (prevents runaway output).
-const MAX_ITEMS: usize = 100;
-
 /// Maximum byte length of JSON input accepted for Tier 1 parsing.
 ///
 /// Inputs larger than this are skipped and fall through to the regex tier,
@@ -150,11 +147,12 @@ fn parse_json_object(map: &serde_json::Map<String, serde_json::Value>) -> Option
     ))
 }
 
-/// Extract display items from a JSON array, capped at MAX_ITEMS.
+/// Extract display items from a JSON array — every element (#317): the
+/// one-line summary per element IS the compression, and the input is already
+/// bounded by the JSON byte gate.
 fn extract_array_items(arr: &[serde_json::Value]) -> Vec<InfraItem> {
     arr.iter()
         .enumerate()
-        .take(MAX_ITEMS)
         .map(|(i, entry)| {
             // Try to find a meaningful identifier (Name, Id, Arn, etc.)
             let label = find_identifier(entry).unwrap_or_else(|| format!("item-{}", i + 1));
@@ -208,13 +206,10 @@ fn try_parse_regex(text: &str) -> Option<InfraResult> {
     let mut items: Vec<InfraItem> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    'lines: for line in text.lines() {
+    for line in text.lines() {
         // AWS table format: | value1  | value2 |
         if line.trim_start().starts_with('|') {
             for caps in RE_AWS_TABLE_ROW.captures_iter(line) {
-                if items.len() >= MAX_ITEMS {
-                    break 'lines;
-                }
                 let cell = caps[1].trim().to_string();
                 // Skip header-like rows and separators
                 if cell.chars().all(|c| c == '-' || c == '+') {

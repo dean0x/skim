@@ -709,13 +709,12 @@ impl fmt::Display for InfraResult {
 // DbResult types
 // ============================================================================
 
-/// Maximum rows rendered in a DbResult table.
-const MAX_DB_ROWS: usize = 100;
-
-/// Maximum column width before value is truncated with `…`.
-const MAX_COL_WIDTH: usize = 40;
-
 /// Result of a database tool query (psql, mysql, sqlite3, etc.)
+///
+/// Every parsed row is rendered in full (#317): the raw tools pad but never
+/// truncate, and skim must not show less than the raw tool. The only marker
+/// is a loud elision note when the tool's own footer row-count exceeds the
+/// rows the parser captured.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DbResult {
     pub(crate) tool: String,
@@ -723,7 +722,6 @@ pub(crate) struct DbResult {
     pub(crate) columns: Vec<String>,
     pub(crate) rows: Vec<Vec<String>>,
     pub(crate) row_count: usize,
-    pub(crate) truncated: bool,
     #[serde(default, skip_serializing)]
     rendered: String,
 }
@@ -735,16 +733,14 @@ impl DbResult {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
         row_count: usize,
-        truncated: bool,
     ) -> Self {
-        let rendered = Self::render(&tool, &columns, &rows, row_count, truncated);
+        let rendered = Self::render(&tool, &columns, &rows, row_count);
         Self {
             tool,
             query_summary,
             columns,
             rows,
             row_count,
-            truncated,
             rendered,
         }
     }
@@ -752,73 +748,42 @@ impl DbResult {
     /// Recompute rendered field if empty (e.g., after deserialization).
     pub(crate) fn ensure_rendered(&mut self) {
         if self.rendered.is_empty() {
-            self.rendered = Self::render(
-                &self.tool,
-                &self.columns,
-                &self.rows,
-                self.row_count,
-                self.truncated,
-            );
+            self.rendered = Self::render(&self.tool, &self.columns, &self.rows, self.row_count);
         }
     }
 
-    fn render(
-        tool: &str,
-        columns: &[String],
-        rows: &[Vec<String>],
-        row_count: usize,
-        truncated: bool,
-    ) -> String {
-        let trunc_label = if truncated { " (truncated)" } else { "" };
-        let mut output = format!("{tool} query {row_count} rows{trunc_label}");
+    fn render(tool: &str, columns: &[String], rows: &[Vec<String>], row_count: usize) -> String {
+        let mut output = format!("{tool} query {row_count} rows");
 
         if columns.is_empty() {
             return output;
         }
 
-        let display_rows = Self::truncate_display_rows(rows);
-        let widths = Self::compute_column_widths(columns, &display_rows);
+        let widths = Self::compute_column_widths(columns, rows);
         Self::render_header(&mut output, columns, &widths);
         Self::render_separator(&mut output, &widths);
-        Self::render_data_rows(&mut output, &display_rows, &widths);
+        Self::render_data_rows(&mut output, rows, &widths);
+
+        // The tool's footer claimed more rows than the parser captured —
+        // say so loudly instead of silently under-reporting (#317).
+        if let Some(marker) = crate::output::elision_marker(rows.len(), row_count, "rows") {
+            output.push('\n');
+            output.push_str(&marker);
+        }
 
         output
     }
 
-    /// Truncate `rows` to `MAX_DB_ROWS` and each cell value to `MAX_COL_WIDTH` chars.
-    ///
-    /// Cells that exceed `MAX_COL_WIDTH` characters are trimmed and suffixed with `…`.
-    /// This is a pure data transformation step, independent of rendering.
-    fn truncate_display_rows(rows: &[Vec<String>]) -> Vec<Vec<String>> {
-        rows.iter()
-            .take(MAX_DB_ROWS)
-            .map(|row| {
-                row.iter()
-                    .map(|v| {
-                        if v.chars().count() > MAX_COL_WIDTH {
-                            let mut s: String = v.chars().take(MAX_COL_WIDTH - 1).collect();
-                            s.push('…');
-                            s
-                        } else {
-                            v.clone()
-                        }
-                    })
-                    .collect()
-            })
-            .collect()
-    }
-
     /// Compute per-column display widths.
     ///
-    /// Each width is `max(header_char_count, max_cell_char_count)`, capped at
-    /// `MAX_COL_WIDTH`.  Accepts pre-truncated `display_rows` so cell lengths are
-    /// already bounded.
+    /// Each width is `max(header_char_count, max_cell_char_count)` — natural
+    /// widths, no cap: cells are rendered in full (#317).
     fn compute_column_widths(columns: &[String], display_rows: &[Vec<String>]) -> Vec<usize> {
         columns
             .iter()
             .enumerate()
             .map(|(i, col)| {
-                let header_len = col.chars().count().min(MAX_COL_WIDTH);
+                let header_len = col.chars().count();
                 let max_val = display_rows
                     .iter()
                     .map(|row| row.get(i).map(|v| v.chars().count()).unwrap_or(0))
@@ -1870,27 +1835,12 @@ mod tests {
             vec!["id".to_string(), "name".to_string()],
             vec![vec!["1".to_string(), "Alice".to_string()]],
             1,
-            false,
         );
         let display = format!("{result}");
         assert!(display.starts_with("psql query 1 rows\n"));
         assert!(display.contains("id"));
         assert!(display.contains("name"));
         assert!(display.contains("Alice"));
-    }
-
-    #[test]
-    fn test_db_result_truncated_label() {
-        let result = DbResult::new(
-            "mysql".to_string(),
-            "SELECT".to_string(),
-            vec![],
-            vec![],
-            200,
-            true,
-        );
-        let display = format!("{result}");
-        assert!(display.contains("(truncated)"));
     }
 
     #[test]
@@ -1901,26 +1851,55 @@ mod tests {
             vec![],
             vec![],
             0,
-            false,
         );
         let display = format!("{result}");
         assert_eq!(display, "sqlite3 query 0 rows");
     }
 
     #[test]
-    fn test_db_result_col_width_capped() {
-        let long_val = "a".repeat(50); // > MAX_COL_WIDTH=40
+    fn test_db_result_all_rows_and_full_cells_rendered() {
+        // #317: every row, full cell content — raw psql pads, never truncates.
+        let long_val = "a".repeat(50);
+        let rows: Vec<Vec<String>> = (0..120)
+            .map(|i| vec![format!("row{i}-{long_val}")])
+            .collect();
         let result = DbResult::new(
             "psql".to_string(),
             "SELECT".to_string(),
             vec!["col".to_string()],
-            vec![vec![long_val]],
-            1,
-            false,
+            rows,
+            120,
         );
         let display = format!("{result}");
-        // Value should be truncated with ellipsis
-        assert!(display.contains('…'));
+        assert!(display.contains(&format!("row0-{long_val}")), "full cell");
+        assert!(display.contains("row119-"), "all 120 rows rendered");
+        assert!(
+            !display.contains('…'),
+            "no cell-chop ellipsis: {display:.200}"
+        );
+        assert!(
+            !display.contains("omitted"),
+            "no elision when rows == footer count"
+        );
+    }
+
+    #[test]
+    fn test_db_result_loud_marker_when_parser_captured_fewer_rows() {
+        // Footer claimed 10 rows but only 3 parsed — must say so loudly (#317).
+        let rows: Vec<Vec<String>> = (0..3).map(|i| vec![i.to_string()]).collect();
+        let result = DbResult::new(
+            "psql".to_string(),
+            "SELECT".to_string(),
+            vec!["n".to_string()],
+            rows,
+            10,
+        );
+        let display = format!("{result}");
+        assert!(
+            display.contains("7 rows omitted (3 of 10 shown)"),
+            "exact loud marker required: {display}"
+        );
+        assert!(display.contains("SKIM_PASSTHROUGH=1"), "{display}");
     }
 
     #[test]
@@ -1931,7 +1910,6 @@ mod tests {
             vec!["n".to_string()],
             vec![vec!["1".to_string()]],
             1,
-            false,
         );
         let json = serde_json::to_string(&original).unwrap();
         let mut deserialized: DbResult = serde_json::from_str(&json).unwrap();
@@ -1947,35 +1925,11 @@ mod tests {
             columns: vec!["n".to_string()],
             rows: vec![vec!["42".to_string()]],
             row_count: 1,
-            truncated: false,
             rendered: String::new(),
         };
         assert_eq!(result.as_ref(), "");
         result.ensure_rendered();
         assert!(result.as_ref().contains("psql query 1 rows"));
-    }
-
-    // ========================================================================
-    // DbResult private helper unit tests (#214)
-    // ========================================================================
-
-    #[test]
-    fn test_truncate_display_rows_caps_at_max_db_rows() {
-        // Build MAX_DB_ROWS + 10 rows; only MAX_DB_ROWS should survive.
-        let rows: Vec<Vec<String>> = (0..MAX_DB_ROWS + 10).map(|i| vec![i.to_string()]).collect();
-        let display = DbResult::truncate_display_rows(&rows);
-        assert_eq!(display.len(), MAX_DB_ROWS);
-    }
-
-    #[test]
-    fn test_truncate_display_rows_truncates_long_cell() {
-        // A cell longer than MAX_COL_WIDTH should be truncated to MAX_COL_WIDTH chars with '…'.
-        let long_val = "x".repeat(MAX_COL_WIDTH + 5);
-        let rows = vec![vec![long_val]];
-        let display = DbResult::truncate_display_rows(&rows);
-        let cell = &display[0][0];
-        assert_eq!(cell.chars().count(), MAX_COL_WIDTH);
-        assert!(cell.ends_with('…'));
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::output::ParseResult;
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
-use super::{MAX_ITEMS, MAX_JSON_BYTES, RE_GH_TAB_ROW, three_tier_parse};
+use super::{MAX_JSON_BYTES, RE_GH_TAB_ROW, three_tier_parse};
 
 /// Inject `--json` fields for list commands if not already present.
 ///
@@ -148,21 +148,13 @@ pub(super) fn try_parse_json_list(trimmed: &str) -> Option<InfraResult> {
     }
 
     let arr: Vec<serde_json::Value> = serde_json::from_str(trimmed).ok()?;
-    let total = arr.len();
-    let truncated = total > MAX_ITEMS;
 
-    let items: Vec<InfraItem> = arr
-        .into_iter()
-        .take(MAX_ITEMS)
-        .filter_map(|entry| json_entry_to_infra_item(&entry))
-        .collect();
+    // Every entry is emitted (#317): the user's --limit controls list size,
+    // and the input is already bounded by MAX_JSON_BYTES.
+    let items: Vec<InfraItem> = arr.iter().filter_map(json_entry_to_infra_item).collect();
 
     let count = items.len();
-    let summary = if truncated {
-        format!("showing first {MAX_ITEMS} of {total} items")
-    } else {
-        format!("{count} item{}", if count == 1 { "" } else { "s" })
-    };
+    let summary = format!("{count} item{}", if count == 1 { "" } else { "s" });
     Some(InfraResult::new(
         "gh".to_string(),
         "list".to_string(),
@@ -183,9 +175,6 @@ pub(super) fn try_parse_regex(text: &str) -> Option<InfraResult> {
     let mut items: Vec<InfraItem> = Vec::new();
 
     for line in text.lines() {
-        if items.len() >= MAX_ITEMS {
-            break;
-        }
         if let Some(caps) = RE_GH_TAB_ROW.captures(line) {
             let num = caps[1].to_string();
             let rest = caps[2].trim().to_string();

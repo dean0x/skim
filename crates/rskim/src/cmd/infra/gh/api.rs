@@ -176,8 +176,10 @@ fn try_parse_json_object(obj: &serde_json::Value) -> Option<InfraResult> {
         }
 
         // Compact the data object.
-        let data_items = compact_json_value(data, "", 0);
+        let mut elided = false;
+        let data_items = compact_json_value(data, "", 0, &mut elided);
         items.extend(data_items);
+        push_elision_note(&mut items, elided);
 
         return Some(InfraResult::new(
             "gh".to_string(),
@@ -199,10 +201,12 @@ fn try_parse_json_object(obj: &serde_json::Value) -> Option<InfraResult> {
     }
 
     // Compact generic REST object.
-    let items = compact_json_value(&patched_obj, "", 0);
+    let mut elided = false;
+    let mut items = compact_json_value(&patched_obj, "", 0, &mut elided);
     if items.is_empty() {
         return None;
     }
+    push_elision_note(&mut items, elided);
 
     Some(InfraResult::new(
         "gh".to_string(),
@@ -213,26 +217,21 @@ fn try_parse_json_object(obj: &serde_json::Value) -> Option<InfraResult> {
 }
 
 /// Parse a JSON array from `gh api` output.
+///
+/// Every element is emitted (#317): the one-line-per-element summary IS the
+/// compression, and the input is already bounded by `MAX_JSON_BYTES`.
 fn try_parse_json_array(arr: &serde_json::Value) -> Option<InfraResult> {
     let items_arr = arr.as_array()?;
     let total = items_arr.len();
 
-    let mut items: Vec<InfraItem> = items_arr
+    let items: Vec<InfraItem> = items_arr
         .iter()
-        .take(50)
         .enumerate()
         .map(|(i, v)| InfraItem {
             label: format!("[{i}]"),
             value: json_value_summary(v),
         })
         .collect();
-
-    if total > 50 {
-        items.push(InfraItem {
-            label: "...".to_string(),
-            value: format!("{} more items", total - 50),
-        });
-    }
 
     Some(InfraResult::new(
         "gh".to_string(),
@@ -246,7 +245,16 @@ fn try_parse_json_array(arr: &serde_json::Value) -> Option<InfraResult> {
 ///
 /// Nested objects are flattened with `parent.child` dot notation up to
 /// depth 3.  Arrays are summarized as `[N items]`.
-fn compact_json_value(value: &serde_json::Value, prefix: &str, depth: usize) -> Vec<InfraItem> {
+///
+/// Elision is exact and loud (#317): a depth-elided object reports its exact
+/// field count (`{… N fields}`), a truncated string its exact char count, and
+/// `elided` is set so the caller can append one trailing passthrough hint.
+fn compact_json_value(
+    value: &serde_json::Value,
+    prefix: &str,
+    depth: usize,
+    elided: &mut bool,
+) -> Vec<InfraItem> {
     const MAX_DEPTH: usize = 3;
     const MAX_STRING_LEN: usize = 200;
 
@@ -255,9 +263,10 @@ fn compact_json_value(value: &serde_json::Value, prefix: &str, depth: usize) -> 
     match value {
         serde_json::Value::Object(map) => {
             if depth >= MAX_DEPTH {
+                *elided = true;
                 items.push(InfraItem {
                     label: prefix.to_string(),
-                    value: "{...}".to_string(),
+                    value: format!("{{… {} fields}}", map.len()),
                 });
                 return items;
             }
@@ -267,7 +276,7 @@ fn compact_json_value(value: &serde_json::Value, prefix: &str, depth: usize) -> 
                 } else {
                     format!("{prefix}.{k}")
                 };
-                items.extend(compact_json_value(v, &label, depth + 1));
+                items.extend(compact_json_value(v, &label, depth + 1, elided));
             }
         }
         serde_json::Value::Array(arr) => {
@@ -304,6 +313,7 @@ fn compact_json_value(value: &serde_json::Value, prefix: &str, depth: usize) -> 
         }
         serde_json::Value::String(s) => {
             let val = if s.len() > MAX_STRING_LEN {
+                *elided = true;
                 let boundary = utf8_safe_byte_end(s, MAX_STRING_LEN);
                 format!("{}... ({} chars)", &s[..boundary], s.chars().count())
             } else {
@@ -317,6 +327,18 @@ fn compact_json_value(value: &serde_json::Value, prefix: &str, depth: usize) -> 
     }
 
     items
+}
+
+/// Append one trailing passthrough hint when any depth/string elision fired
+/// during [`compact_json_value`] (#317 — elision must be loud).
+fn push_elision_note(items: &mut Vec<InfraItem>, elided: bool) {
+    if elided {
+        items.push(InfraItem {
+            label: "[skim]".to_string(),
+            value: "nested objects/long strings elided — SKIM_PASSTHROUGH=1 for full output"
+                .to_string(),
+        });
+    }
 }
 
 /// Produce a compact one-line summary of a JSON value.
