@@ -12,10 +12,7 @@ use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{
-    MAX_FILES_SHOWN, MAX_INPUT_LINES, MAX_MATCHES_PER_FILE, build_file_result,
-    try_parse_file_line_content,
-};
+use super::{MAX_INPUT_LINES, build_file_result, try_parse_file_line_content};
 use crate::analytics::CommandType;
 use crate::cmd::{ToolRunConfig, run_tool};
 
@@ -107,11 +104,15 @@ fn extract_match_fields(obj: &serde_json::Value) -> Option<(String, String)> {
 /// rg emits one JSON object per line with a `type` field:
 /// `"begin"`, `"match"`, `"end"`, `"summary"`.
 fn try_parse_json(stdout: &str) -> Option<FileResult> {
+    if stdout.lines().nth(MAX_INPUT_LINES).is_some() {
+        return None; // over the parse bound — degrade to lossless passthrough
+    }
+
     let mut file_matches: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut total_matches = 0usize;
     let mut found_any = false;
 
-    for line in stdout.lines().take(MAX_INPUT_LINES) {
+    for line in stdout.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -124,10 +125,7 @@ fn try_parse_json(stdout: &str) -> Option<FileResult> {
 
         if let Some((file_path, formatted)) = extract_match_fields(&obj) {
             total_matches += 1;
-            let file_entry = file_matches.entry(file_path).or_default();
-            if file_entry.len() < MAX_MATCHES_PER_FILE {
-                file_entry.push(formatted);
-            }
+            file_matches.entry(file_path).or_default().push(formatted);
         }
     }
 
@@ -135,13 +133,7 @@ fn try_parse_json(stdout: &str) -> Option<FileResult> {
         return None;
     }
 
-    build_file_result(
-        "rg",
-        total_matches,
-        file_matches,
-        MAX_FILES_SHOWN,
-        MAX_MATCHES_PER_FILE,
-    )
+    build_file_result("rg", total_matches, file_matches, Vec::new())
 }
 
 // ============================================================================
@@ -151,10 +143,11 @@ fn try_parse_json(stdout: &str) -> Option<FileResult> {
 /// Parse rg text output in `file:line:content` format.
 ///
 /// Delegates to the shared `try_parse_file_line_content` in `file/mod.rs`.
-/// `allow_stdin_fallback = false` because rg always includes file paths and
-/// line numbers in its text output.
+/// `fallback_label = None` because rg text output carries file paths and line
+/// numbers; an unattributable line aborts the parse so the caller degrades to
+/// lossless passthrough instead of dropping it. (#317)
 fn try_parse_regex(text: &str) -> Option<FileResult> {
-    try_parse_file_line_content("rg", text, false)
+    try_parse_file_line_content("rg", text, None)
 }
 
 // ============================================================================
@@ -251,20 +244,39 @@ mod tests {
     }
 
     #[test]
-    fn test_max_matches_per_file_cap() {
+    fn test_all_matches_emitted_no_per_file_cap() {
+        // 10 matches in one file — every one must appear (#317: never truncate).
         let input: String = (1..=10)
             .map(|i| format!("src/big.rs:{i}:match line {i}\n"))
             .collect();
         let result = try_parse_regex(&input).unwrap();
+        assert_eq!(result.total_count, 10);
+        assert_eq!(result.shown_count, 10, "shown must equal total");
         let rendered = format!("{result}");
         let match_lines: usize = rendered
             .lines()
             .filter(|l| l.trim().starts_with(':'))
             .count();
-        assert!(
-            match_lines <= MAX_MATCHES_PER_FILE,
-            "Expected at most {MAX_MATCHES_PER_FILE} match lines, got {match_lines}"
-        );
+        assert_eq!(match_lines, 10, "all 10 matches must be emitted");
+    }
+
+    #[test]
+    fn test_json_tier_emits_all_matches() {
+        // 8 JSON match records for one file — no per-file cap in Tier 1.
+        let input: String = (1..=8)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"match","data":{{"path":{{"text":"src/big.rs"}},"line_number":{i},"lines":{{"text":"match {i}"}}}}}}"#
+                ) + "\n"
+            })
+            .collect();
+        let result = try_parse_json(&input).unwrap();
+        assert_eq!(result.total_count, 8);
+        assert_eq!(result.shown_count, 8);
+        let rendered = format!("{result}");
+        for i in 1..=8 {
+            assert!(rendered.contains(&format!("match {i}")), "match {i} missing");
+        }
     }
 
     #[test]

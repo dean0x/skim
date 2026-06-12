@@ -29,7 +29,11 @@ const KNOWN_TOOLS: &[&str] = &[
 /// Maximum path/match entries shown in output (truncation cap).
 pub(crate) const MAX_DISPLAY_ENTRIES: usize = 100;
 
-/// Maximum lines accepted from a single tool invocation.
+/// Maximum lines accepted by structured parsers in this family.
+///
+/// Exceeding this bound never truncates: parsers return `None` so the caller
+/// degrades to lossless `Passthrough` (raw output is already bounded at the
+/// runner's 64 MiB cap). (#317)
 pub(crate) const MAX_INPUT_LINES: usize = 100_000;
 
 /// Entry point for `skim <tool> [args...]` (file handler).
@@ -111,37 +115,45 @@ fn print_help() {
 // Shared grep/rg regex constants and parser
 // ============================================================================
 
-/// Maximum matches shown per file (shared by grep and rg parsers).
-pub(super) const MAX_MATCHES_PER_FILE: usize = 5;
-
-/// Maximum number of files shown in output (shared by grep and rg parsers).
-pub(super) const MAX_FILES_SHOWN: usize = 50;
-
 /// Matches `file:line_number:content` format produced by both `grep -n` and `rg`.
 pub(super) static RE_FILE_LINE_CONTENT: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^([^:]+):(\d+):(.*)$").unwrap());
 
 /// Parse `file:line:content` text output shared by grep and rg.
 ///
-/// Groups matches by file path, capping per-file lines at `MAX_MATCHES_PER_FILE`
-/// and total files at `MAX_FILES_SHOWN`.
+/// Groups ALL matches by file path — grouping is re-encoding, never truncation:
+/// every match line in the input appears in the output. (#317)
 ///
 /// `tool` — binary name used in the result summary (e.g. `"grep"`, `"rg"`).
 /// `text` — raw stdout from the tool.
-/// `allow_stdin_fallback` — when `true`, lines that do not match the regex
-///   (and are not binary-file notices) are bucketed under `<stdin>` instead of
-///   being silently skipped.  grep uses `true` (output without `-n` has no
-///   line numbers); rg uses `false`.
+/// `fallback_label` — when `Some`, lines that do not match the regex are
+///   bucketed under this label (e.g. `"<stdin>"` when grep ran with no file
+///   operands, `"(no filename)"` under `-h`). When `None`, an unattributable
+///   line aborts the structured parse (returns `None`) so the caller degrades
+///   to lossless `Passthrough` instead of dropping or mislabeling lines.
 pub(super) fn try_parse_file_line_content(
     tool: &str,
     text: &str,
-    allow_stdin_fallback: bool,
+    fallback_label: Option<&str>,
 ) -> Option<FileResult> {
+    if text.lines().nth(MAX_INPUT_LINES).is_some() {
+        return None;
+    }
+
     let mut file_matches: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut binary_notices: Vec<String> = Vec::new();
     let mut total_matches = 0usize;
 
-    for line in text.lines().take(MAX_INPUT_LINES) {
+    for line in text.lines() {
         if line.trim().is_empty() {
+            continue;
+        }
+        if line == "--" {
+            // Context-group separator (grep -A/-B/-C) — pure formatting noise.
+            continue;
+        }
+        if line.starts_with("Binary file ") {
+            binary_notices.push(line.to_string());
             continue;
         }
         if let Some(caps) = RE_FILE_LINE_CONTENT.captures(line) {
@@ -149,17 +161,18 @@ pub(super) fn try_parse_file_line_content(
             let lineno = &caps[2];
             let content = caps[3].trim();
             total_matches += 1;
-            let file_entry = file_matches.entry(file).or_default();
-            if file_entry.len() < MAX_MATCHES_PER_FILE {
-                file_entry.push(format!("  :{lineno}: {content}"));
-            }
-        } else if allow_stdin_fallback && !line.starts_with("Binary file") {
-            // Plain match line without line number (grep without -n)
-            let file_entry = file_matches.entry("<stdin>".to_string()).or_default();
+            file_matches
+                .entry(file)
+                .or_default()
+                .push(format!("  :{lineno}: {content}"));
+        } else if let Some(label) = fallback_label {
             total_matches += 1;
-            if file_entry.len() < MAX_MATCHES_PER_FILE {
-                file_entry.push(format!("  {line}"));
-            }
+            file_matches
+                .entry(label.to_string())
+                .or_default()
+                .push(format!("  {line}"));
+        } else {
+            return None;
         }
     }
 
@@ -167,13 +180,7 @@ pub(super) fn try_parse_file_line_content(
         return None;
     }
 
-    build_file_result(
-        tool,
-        total_matches,
-        file_matches,
-        MAX_FILES_SHOWN,
-        MAX_MATCHES_PER_FILE,
-    )
+    build_file_result(tool, total_matches, file_matches, binary_notices)
 }
 
 // ============================================================================
@@ -182,51 +189,43 @@ pub(super) fn try_parse_file_line_content(
 
 /// Build a [`FileResult`] from grouped file matches.
 ///
+/// Emits every match in every file — no per-file or file-count caps, no
+/// `(showing K)` footer. `shown_count == total_count` so the canonical
+/// `tool N/N` header reads truthfully. (#317)
+///
 /// `tool` — binary name (e.g. `"grep"`, `"rg"`).
 /// `total_matches` — total match count across all files.
-/// `file_matches` — map from file path to formatted match lines (already capped per-file).
-/// `max_files` — maximum number of files to include in entries.
-/// `max_per_file` — maximum match lines shown per file (used only for Vec capacity hint).
+/// `file_matches` — map from file path to formatted match lines.
+/// `extra_entries` — verbatim lines appended after the groups (e.g.
+///   `Binary file x matches` notices); not counted as matches.
 pub(super) fn build_file_result(
     tool: &str,
     total_matches: usize,
     file_matches: BTreeMap<String, Vec<String>>,
-    max_files: usize,
-    max_per_file: usize,
+    extra_entries: Vec<String>,
 ) -> Option<FileResult> {
     let file_count = file_matches.len();
-    if file_count == 0 {
+    if file_count == 0 && extra_entries.is_empty() {
         return None;
     }
-    let shown_files = file_count.min(max_files);
-
-    let mut shown_matches = 0usize;
-    let mut entries: Vec<String> = Vec::with_capacity(shown_files * (max_per_file + 1));
-    for (file, matches) in file_matches.iter().take(max_files) {
-        entries.push(file.clone());
-        shown_matches += matches.len();
-        entries.extend(matches.iter().cloned());
-    }
-
-    let footer = if file_count > max_files {
-        Some(format!("... and {} more files", file_count - max_files))
-    } else {
-        None
-    };
 
     let summary = format!(
-        "{}: {total_matches} matches in {file_count} files (showing {shown_files})",
+        "{}: {total_matches} matches in {file_count} files",
         tool.to_uppercase()
     );
     let mut all_entries = vec![summary];
-    all_entries.extend(entries);
+    for (file, matches) in &file_matches {
+        all_entries.push(file.clone());
+        all_entries.extend(matches.iter().cloned());
+    }
+    all_entries.extend(extra_entries);
 
     Some(FileResult::new(
         tool.to_string(),
         total_matches,
-        shown_matches,
+        total_matches,
         all_entries,
-        footer,
+        None,
     ))
 }
 
