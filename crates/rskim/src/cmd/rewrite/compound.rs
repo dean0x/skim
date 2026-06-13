@@ -611,7 +611,9 @@ mod tests {
     fn test_corrupt_guard_process_substitution_bails() {
         assert!(rewrite_would_corrupt("diff <(sort a.txt) <(sort b.txt)"));
         assert!(rewrite_would_corrupt("tee >(gzip > out.gz)"));
-        assert!(rewrite_would_corrupt("cargo test && diff <(sort a) <(sort b)"));
+        assert!(rewrite_would_corrupt(
+            "cargo test && diff <(sort a) <(sort b)"
+        ));
     }
 
     #[test]
