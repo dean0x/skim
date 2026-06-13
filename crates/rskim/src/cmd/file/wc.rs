@@ -137,14 +137,7 @@ fn try_parse_wc(stdout: &str) -> Option<FileResult> {
     }
 
     let shown_count = entries.len();
-    let footer = if total_count > MAX_DISPLAY_ENTRIES {
-        Some(format!(
-            "... and {} more",
-            total_count - MAX_DISPLAY_ENTRIES
-        ))
-    } else {
-        footer_entry
-    };
+    let footer = crate::output::elision_marker(shown_count, total_count, "lines").or(footer_entry);
 
     Some(FileResult::new(
         "wc".to_string(),

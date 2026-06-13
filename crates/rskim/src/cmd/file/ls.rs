@@ -144,11 +144,7 @@ fn try_parse_ls_long(stdout: &str) -> Option<FileResult> {
     }
 
     let shown_count = entries.len();
-    let footer = if line_count > MAX_DISPLAY_ENTRIES {
-        Some(format!("... and {} more", line_count - MAX_DISPLAY_ENTRIES))
-    } else {
-        None
-    };
+    let footer = crate::output::elision_marker(shown_count, line_count, "entries");
 
     let summary_entry = format!("LS: {line_count} entries ({dirs} dirs, {files} files)");
     // Prepend summary as first entry
@@ -188,14 +184,7 @@ fn try_parse_ls_plain(stdout: &str) -> Option<FileResult> {
     }
 
     let shown_count = entries.len();
-    let footer = if total_count > MAX_DISPLAY_ENTRIES {
-        Some(format!(
-            "... and {} more",
-            total_count - MAX_DISPLAY_ENTRIES
-        ))
-    } else {
-        None
-    };
+    let footer = crate::output::elision_marker(shown_count, total_count, "entries");
 
     Some(FileResult::new(
         "ls".to_string(),

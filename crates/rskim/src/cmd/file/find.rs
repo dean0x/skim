@@ -74,14 +74,7 @@ fn try_parse_lines(stdout: &str, exit_code: Option<i32>) -> Option<FileResult> {
     }
 
     let shown_count = entries.len();
-    let footer = if total_count > MAX_DISPLAY_ENTRIES {
-        Some(format!(
-            "... and {} more",
-            total_count - MAX_DISPLAY_ENTRIES
-        ))
-    } else {
-        None
-    };
+    let footer = crate::output::elision_marker(shown_count, total_count, "entries");
 
     Some(FileResult::new(
         "find".to_string(),
@@ -135,8 +128,12 @@ mod tests {
         assert!(result.footer.is_some(), "Large fixture should have footer");
         let footer = result.footer.unwrap();
         assert!(
-            footer.contains("more"),
-            "Footer should mention remaining count"
+            footer.contains("entries omitted"),
+            "Footer should mention omitted entry count, got: {footer}"
+        );
+        assert!(
+            footer.contains("SKIM_PASSTHROUGH=1"),
+            "Footer should include SKIM_PASSTHROUGH=1 escape hatch, got: {footer}"
         );
     }
 
