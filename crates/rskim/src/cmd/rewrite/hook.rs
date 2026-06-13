@@ -128,8 +128,11 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         crate::cmd::hook_log::log_hook_warning("hook processing timed out after 5s, exiting");
         // SAFETY: process::exit(0) is intentional here. In hook mode, timeout means
         // passthrough (the agent sees empty stdout and proceeds normally). No Drop-based
-        // cleanup is relied upon — all writes use explicit flush before this point, and
-        // the watchdog only fires when processing has stalled beyond the timeout window.
+        // cleanup is relied upon. The only stdout write in the success path uses
+        // write_all + flush (see below) so the agent never receives a truncated JSON
+        // response: either flush completes before this timer fires, or the timer fires
+        // first and the agent sees empty stdout (passthrough). The watchdog only fires
+        // when processing has stalled beyond the timeout window.
         std::process::exit(0);
     });
 
@@ -274,7 +277,19 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
             // Use agent-specific response format
             let response = protocol.format_response(&final_cmd);
             let json_out = serde_json::to_string(&response)?;
-            println!("{json_out}");
+            // SAFETY: write_all + flush before returning ensures the full JSON
+            // response is on the wire before the watchdog's process::exit(0) can
+            // fire. The watchdog is running concurrently on a detached thread; a
+            // bare `println!` only flushes when the BufWriter decides to, so it
+            // could be truncated if exit fires mid-buffer. Locking stdout and
+            // flushing explicitly makes the emit atomic relative to the timeout.
+            {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                out.write_all(json_out.as_bytes())?;
+                out.write_all(b"\n")?;
+                out.flush()?;
+            }
         }
         None => {
             audit_hook(&command, false, "");
