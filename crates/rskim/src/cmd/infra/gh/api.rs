@@ -331,17 +331,26 @@ fn compact_json_value(
 
 /// Append one trailing passthrough hint when any depth/string elision fired
 /// during [`compact_json_value`] (#317 — elision must be loud).
+///
+/// Uses [`crate::output::elision_marker_unbounded`] so the suffix matches every
+/// other elision site: `[skim] … elided … — SKIM_PASSTHROUGH=1 for full output`.
 fn push_elision_note(items: &mut Vec<InfraItem>, elided: bool) {
     if elided {
         items.push(InfraItem {
             label: "[skim]".to_string(),
-            value: "nested objects/long strings elided — SKIM_PASSTHROUGH=1 for full output"
-                .to_string(),
+            value: crate::output::elision_marker_unbounded(
+                "depth-3 / 200-char limits",
+                "nested objects/long strings",
+            ),
         });
     }
 }
 
 /// Produce a compact one-line summary of a JSON value.
+///
+/// Strings longer than 80 bytes are truncated with an exact char count and the
+/// `SKIM_PASSTHROUGH=1` escape hatch (#317: elision must be loud even in
+/// terse one-line array-element summaries).
 fn json_value_summary(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Object(map) => {
@@ -356,7 +365,13 @@ fn json_value_summary(v: &serde_json::Value) -> String {
         serde_json::Value::Array(arr) => format!("[{} items]", arr.len()),
         serde_json::Value::String(s) => {
             if s.len() > 80 {
-                format!("{}...", &s[..utf8_safe_byte_end(s, 80)])
+                let boundary = utf8_safe_byte_end(s, 80);
+                let total_chars = s.chars().count();
+                format!(
+                    "{}… ({} chars) — SKIM_PASSTHROUGH=1 for full output",
+                    &s[..boundary],
+                    total_chars
+                )
             } else {
                 s.clone()
             }

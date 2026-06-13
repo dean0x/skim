@@ -395,6 +395,22 @@ impl PassthroughTruncator {
 /// genuinely unavoidable, the elision must state exact counts and how to get
 /// the rest. Returns `None` when nothing was omitted (`shown >= total`), so
 /// callers can unconditionally `extend()`/`push()` the result.
+///
+/// # Preferred `unit` strings
+///
+/// Use these terms consistently across all call sites to keep elision notices
+/// uniform (prevent string drift as new callers are added):
+///
+/// | Context                    | `unit` string     |
+/// |----------------------------|-------------------|
+/// | table / query result rows  | `"rows"`          |
+/// | file body / release notes  | `"body lines"`    |
+/// | release / workflow assets  | `"assets"`        |
+/// | object keys (JSON/curl)    | `"object keys"`   |
+/// | generic line output        | `"lines"`         |
+///
+/// For streaming sites where the total is unknowable, use
+/// [`elision_marker_unbounded`] instead (its `unit` follows the same table).
 pub(crate) fn elision_marker(shown: usize, total: usize, unit: &str) -> Option<String> {
     if shown >= total {
         return None;

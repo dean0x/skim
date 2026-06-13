@@ -85,10 +85,19 @@ use crate::runner::ChildGuard;
 /// This prevents unbounded allocation on pathological inputs (e.g., minified
 /// JS emitted by a build step) per AD-STR-1.
 ///
-/// The cap SPLITS overlong lines, it never drops bytes (#317): every byte read
-/// is emitted, and the remainder of the line arrives as subsequent chunks. A
-/// loud [`crate::output::elision_marker_unbounded`] marker is appended to each
+/// The cap SPLITS overlong lines (#317): every byte read is re-emitted, and the
+/// remainder of the line arrives as subsequent chunks. A loud
+/// [`crate::output::elision_marker_unbounded`] marker is appended to each
 /// capped chunk so the agent knows the line continues.
+///
+/// # Lossy UTF-8 caveat (AD-STR-6)
+///
+/// Bytes are decoded via [`String::from_utf8_lossy`]. When a multi-byte UTF-8
+/// codepoint straddles the 64 KiB cap boundary, each half is independently
+/// decoded: the incomplete byte sequence in the first chunk and the continuation
+/// bytes in the second chunk are each replaced with U+FFFD. The raw bytes are
+/// preserved, but the codepoint is fragmented across chunks rather than
+/// reconstructed. Valid ASCII lines survive the cap without any substitution.
 pub(super) const MAX_STREAM_LINE_BYTES: usize = 64 * 1024; // 64 KiB
 
 // ============================================================================
@@ -126,10 +135,14 @@ fn read_line_lossy(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> Option<Strin
     }
 
     // `n > MAX` means the take-limit was reached before a newline — the line
-    // exceeds the cap and was split. Every byte read is kept (#317: the cap
-    // bounds allocation, it must not drop data); the remainder of the line
+    // exceeds the cap and was split. Every byte read is re-emitted (#317: the
+    // cap bounds allocation, it must not drop data); the remainder of the line
     // arrives as the next chunk. The loud marker tells the agent this output
     // line is an incomplete slice of one raw line.
+    //
+    // AD-STR-6 lossy caveat: a multi-byte UTF-8 codepoint whose bytes straddle
+    // the cap boundary is decoded as U+FFFD in each chunk rather than
+    // reconstructed; valid ASCII content is unaffected.
     let split = n > MAX_STREAM_LINE_BYTES;
     let mut line = String::from_utf8_lossy(buf).into_owned();
     if split {
@@ -721,10 +734,14 @@ mod tests {
     }
 
     /// Verify that a line exceeding `MAX_STREAM_LINE_BYTES` is SPLIT — not
-    /// truncated (#317): every byte of the raw line survives across chunks,
-    /// and each capped chunk carries a loud marker.
+    /// dropped (#317) — and each capped chunk carries a loud marker.
+    ///
+    /// Uses ASCII-only content so `from_utf8_lossy` is lossless here. Per
+    /// AD-STR-6, a multi-byte UTF-8 codepoint straddling the 64 KiB boundary
+    /// would produce U+FFFD substitution in each chunk rather than being
+    /// reconstructed; that lossy case is intentional contract, not a defect.
     #[test]
-    fn test_read_line_lossy_splits_overlong_line_losslessly() {
+    fn test_read_line_lossy_splits_overlong_ascii_line() {
         let long_line: Vec<u8> = vec![b'A'; MAX_STREAM_LINE_BYTES + 100];
         let mut input = long_line;
         input.push(b'\n');
@@ -740,11 +757,11 @@ mod tests {
         );
         let content1 = chunk1.split(" [skim]").next().unwrap();
         let chunk2 = read_line_lossy(&mut reader, &mut buf).expect("continuation chunk");
-        // Reassembly must be lossless: no dropped +1 byte (the old defect).
+        // Every ASCII byte of the raw line survives across chunks (#317).
         assert_eq!(
             content1.len() + chunk2.len(),
             MAX_STREAM_LINE_BYTES + 100,
-            "all bytes of the raw line must survive across chunks"
+            "all ASCII bytes of the raw line must survive across chunks"
         );
         assert!(content1.bytes().all(|b| b == b'A'));
         assert!(chunk2.bytes().all(|b| b == b'A'), "{chunk2:.80}");
