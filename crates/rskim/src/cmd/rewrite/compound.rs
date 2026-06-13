@@ -46,6 +46,8 @@ pub(super) fn rewrite_would_corrupt(cmd: &str) -> bool {
         || cmd.contains("<<")
         || cmd.contains("$(")
         || cmd.contains("${")
+        || cmd.contains("<(")
+        || cmd.contains(">(")
     {
         return true;
     }
@@ -596,6 +598,20 @@ mod tests {
         assert!(rewrite_would_corrupt("echo $(date)"));
         assert!(rewrite_would_corrupt("echo ${HOME}"));
         assert!(rewrite_would_corrupt("echo `date`"));
+    }
+
+    /// Process substitution `<(cmd)` / `>(cmd)` must bail.
+    ///
+    /// The compound rewriter does not handle process substitution — a future
+    /// redirect-stripping change must not silently reorder around `<(` or `>(`.
+    /// Bail is defense-in-depth; the tokens pass through byte-faithfully today
+    /// because parens are not stripped, but the guard prevents silent breakage
+    /// if redirect handling is ever extended.
+    #[test]
+    fn test_corrupt_guard_process_substitution_bails() {
+        assert!(rewrite_would_corrupt("diff <(sort a.txt) <(sort b.txt)"));
+        assert!(rewrite_would_corrupt("tee >(gzip > out.gz)"));
+        assert!(rewrite_would_corrupt("cargo test && diff <(sort a) <(sort b)"));
     }
 
     #[test]
@@ -1150,6 +1166,26 @@ mod tests {
     // scan_operator regression — `>&N&&` must not confuse the `&&` scanner
     // (Task 6e)
     // ========================================================================
+
+    /// `foo |& bar` — bash-specific "pipe stderr and stdout to next command".
+    ///
+    /// `scan_operator` parses `|&` as `Pipe` (the `|`) plus a stray `&` token
+    /// on the next segment.  Since pipe segments are never rewritten
+    /// (`has_pipe_operator` short-circuits to `None`), the whole expression
+    /// passes through untouched, preserving shell semantics.  Pin this: the
+    /// rewriter must not transform `foo |& bar` into anything.
+    #[test]
+    fn test_pipe_stderr_passthrough_untouched() {
+        match split_compound("foo |& bar") {
+            CompoundSplitResult::Compound(segments) => {
+                assert!(
+                    try_rewrite_compound(&segments).is_none(),
+                    "|& expressions must pass through untouched (pipe short-circuit)"
+                );
+            }
+            other => panic!("Expected Compound for foo |& bar, got {other:?}"),
+        }
+    }
 
     /// `foo >&1&& bar` — `>&1` immediately followed by `&&` (no space).
     ///
