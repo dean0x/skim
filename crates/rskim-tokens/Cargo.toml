@@ -1,0 +1,53 @@
+[package]
+name = "rskim-tokens"
+version = "0.1.0"
+edition = "2024"
+authors = ["Skim Contributors"]
+license = "MIT"
+description = "Multi-provider token counting library for skim"
+repository = "https://github.com/dean0x/skim"
+# publish = false initially, matching rskim-search precedent.
+# Publish follow-up tracked in #324 (crates.io publish when external consumers need it).
+publish = false
+
+[dependencies]
+tiktoken-rs = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Optional: synchronous HTTP client for network-backed Anthropic counter.
+# Only included when feature "net-anthropic" is enabled — never in the default build.
+[dependencies.ureq]
+version = "2"
+optional = true
+features = ["rustls", "json"]
+default-features = false
+
+[dependencies.serde_json]
+version = "1.0"
+optional = true
+
+[features]
+# Non-default feature gate for the network counter.
+# Enabling this pulls ureq + rustls into the dependency graph.
+net-anthropic = ["dep:ureq", "dep:serde_json"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+static_assertions = { workspace = true }
+rskim-core = { version = "2.10.0", path = "../rskim-core" }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+
+[lib]
+name = "rskim_tokens"
+path = "src/lib.rs"
+
+[[bench]]
+name = "token_count"
+harness = false
