@@ -93,7 +93,30 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-features -- -D warnings
+        # --all-targets required per PF-009: catches warnings in #[cfg(test)] modules
+        # that are missed by cargo clippy without --all-targets.
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+      - name: Dependency-tree isolation check (AC9)
+        # Proves no HTTP/TLS crate appears in the default-features build of
+        # rskim-tokens or the skim binary. Uses set -o pipefail per PF-007.
+        run: |
+          set -o pipefail
+          echo "=== rskim-tokens default-features tree ==="
+          cargo tree -p rskim-tokens -e normal 2>&1 | tee /tmp/rskim-tokens-tree.txt
+          if grep -qE 'ureq|reqwest|hyper|rustls|native-tls|openssl' /tmp/rskim-tokens-tree.txt; then
+            echo "FAIL: HTTP/TLS dependency found in rskim-tokens default build"
+            exit 1
+          fi
+          echo "PASS: no HTTP/TLS in rskim-tokens default build"
+
+          echo "=== skim binary default-features tree ==="
+          cargo tree -p rskim -e normal 2>&1 | tee /tmp/rskim-tree.txt
+          if grep -qE 'ureq|reqwest|hyper|rustls|native-tls|openssl' /tmp/rskim-tree.txt; then
+            echo "FAIL: HTTP/TLS dependency found in skim binary default build"
+            exit 1
+          fi
+          echo "PASS: no HTTP/TLS in skim binary default build"
 
   build:
     name: Build Check
