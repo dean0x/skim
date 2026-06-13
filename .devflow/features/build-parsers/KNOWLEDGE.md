@@ -1,7 +1,7 @@
 ---
 feature: build-parsers
 name: Build Tool Output Parsers
-description: "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, ChildGuard, indefinite, is_indefinite_command."
+description: "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, ChildGuard, indefinite, is_indefinite_command, expected_exit_codes, forward_stderr, ExitDisposition, classify_exit, run_parsed_command_with_exit, elision_marker, failure_context_body, parse_failure_details, compress-never-truncate."
 category: component-patterns
 directories: [crates/rskim/src/cmd/build/, crates/rskim/src/cmd/]
 referencedFiles:
@@ -21,9 +21,11 @@ referencedFiles:
   - crates/rskim/src/cmd/test_utils.rs
   - crates/rskim/src/runner.rs
   - crates/rskim/src/cmd/rewrite/indefinite.rs
+  - crates/rskim/src/cmd/test/cargo.rs
+  - crates/rskim/src/cmd/test/shared.rs
 created: 2026-05-14
-updated: 2026-06-08
-version: 14
+updated: 2026-06-13
+version: 15
 ---
 
 # Build Tool Output Parsers
@@ -34,12 +36,22 @@ The build parsers module (`crates/rskim/src/cmd/build/`) compresses output from 
 
 The module is invoked via flat dispatch (`skim tsc`) or multi-category dispatch (`skim cargo build`, `skim cargo clippy`). All parsers share the same three-tier degradation model: Full (clean structured parse) → Degraded (partial parse with warning markers) → Passthrough (raw output returned unchanged).
 
+## Design Constraint: Compress, Never Truncate (#317)
+
+**Core invariant**: wrappers may re-encode output (compress, summarize) but must never silently show _less_ than the raw tool would show.
+
+Rules that flow from this constraint:
+- A hard safety bound that cannot be avoided must use `output::elision_marker` (exact count of omitted items + `SKIM_PASSTHROUGH=1` hint).
+- Unexpected non-zero exits (not in `expected_exit_codes`) forward raw stdout+stderr byte-faithfully instead of compressing.
+- Rewrites must reconstruct the command byte-faithfully or bail — never emit a command that errors or changes semantics.
+- Failure detail (panic location, assertion messages) must survive compression even on stable toolchains.
+
 ## cmd/mod.rs Refactor (PR #267)
 
 `cmd/mod.rs` was refactored to reduce complexity. Functionality previously inline in `mod.rs` is now split across dedicated submodules:
 
 - `cmd/dispatch.rs` — `dispatch()`, `run_raw_passthrough()`, and per-tool dispatcher helpers (`dispatch_cargo`, `dispatch_go`, `dispatch_swift`, `dispatch_dotnet`, `passthrough_subcmd`, `extract_subcmd`, `prepend_without`)
-- `cmd/execution.rs` — `OutputFormat`, `RunContext`, `ParsedCommandConfig<'_>`, `ToolRunConfig<'_>`, `run_tool<T>`, `run_parsed_command_with_mode`, `format_analytics_label`, `combine_output`, `obtain_output`, `render_output<T>`, `record_and_report`, `passthrough_raw`
+- `cmd/execution.rs` — `OutputFormat`, `RunContext`, `ParsedCommandConfig<'_>`, `ToolRunConfig<'_>`, `run_tool<T>`, `run_parsed_command_with_mode`, `run_parsed_command_with_exit`, `format_analytics_label`, `combine_output`, `obtain_output`, `render_output<T>`, `record_and_report`, `passthrough_raw`
 - `cmd/security.rs` — `sanitize_for_display`, `scrub_db_args`, `scrub_infra_args`
 - `cmd/registry.rs` — `KNOWN_SUBCOMMANDS` (sorted, binary-searchable), `is_known_subcommand`, `is_meta_subcommand`, `wrapper_targets`
 - `cmd/test_utils.rs` — standalone `pub(crate)` module (compiled under `#[cfg(test)]` gate in `mod.rs`); canonical test helper source for all `cmd` subtree tests
@@ -163,9 +175,9 @@ Duration parsing handles two formats:
 
 Tier 2 noise patterns strip `[INFO] Downloading/Downloaded from`, `[INFO] ---` separator lines, `[INFO] Scanning for projects`, `[INFO] Building`, reactor summary lines, and empty `[INFO]` lines via `MAVEN_INFO_NOISE_RE`.
 
-## `run_parsed_command` — Shared Infrastructure
+## `run_parsed_command` — Shared Infrastructure (Build Family)
 
-All five parsers call `super::run_parsed_command(...)` in `mod.rs` instead of spawning processes themselves. This function handles:
+All five build parsers call `super::run_parsed_command(...)` in `build/mod.rs` instead of spawning processes themselves. This function handles:
 1. Command spawn — blocks on a plain `wait()` with no internal timeout (see ADR-008)
 2. ANSI escape code stripping from both stdout and stderr before parsing
 3. Calling the parser function pointer
@@ -194,15 +206,150 @@ Spawn failures (missing executable) use `anyhow::bail!` — a hard error with an
 
 **Important**: build parsers use `run_parsed_command` (defined in `build/mod.rs`), not `run_parsed_command_with_mode` or `run_tool<T>` (both defined in `cmd/execution.rs`). The three are intentionally separate:
 - Build: no `use_stdin`, no `--json` output mode, no `SKIM_PASSTHROUGH` bypass, no compressed-output hint on failure, plain `fn()` parser pointer, bail-on-spawn, no internal timeout
-- Other families (lint, infra, db, file): use `run_tool<T>` (the generic runner added in #214) which wraps `run_parsed_command_with_mode`. `run_tool<T>` takes `ToolRunConfig<'a>` (program, env_overrides, install_hint, family, skip_ansi_strip, command_type), a `&RunContext`, a `prepare_args` closure, and a one-arg `parse_fn`
+- Other families (lint, infra, db, file): use `run_tool<T>` (the generic runner added in #214) which wraps `run_parsed_command_with_mode`. `run_tool<T>` takes `ToolRunConfig<'a>` (program, env_overrides, install_hint, family, skip_ansi_strip, command_type, expected_exit_codes, forward_stderr), a `&RunContext`, a `prepare_args` closure, and a one-arg `parse_fn`
 
 `run_tool<T>` in `cmd/execution.rs` explicitly documents this boundary: "build::run_parsed_command is intentionally not replaced: it has a different call shape (no `ctx: &RunContext`, different analytics path)." Switching build parsers to use `run_tool<T>` is not just a refactor — the signatures are incompatible.
 
-The `ParsedCommandConfig` struct (in `cmd/execution.rs`) adds several fields not present in the build path: `family` (for analytics label disambiguation — prevents collision when `cargo` appears in both build and pkg), `skip_ansi_strip` (DB tools emit TSV; stripping would drop tab characters), and `output_format` (supports `--json` output mode). Build does none of these, which is why the two paths are separate rather than consolidated.
+The `ParsedCommandConfig` struct (in `cmd/execution.rs`) adds several fields not present in the build path: `family` (for analytics label disambiguation — prevents collision when `cargo` appears in both build and pkg), `skip_ansi_strip` (DB tools emit TSV; stripping would drop tab characters), `output_format` (supports `--json` output mode), `expected_exit_codes`, and `forward_stderr`. Build does none of these, which is why the two paths are separate rather than consolidated.
+
+## Exit-Disposition Matrix (#317)
+
+`cmd/execution.rs` implements an exit-disposition matrix that applies to all non-build families via `run_parsed_command_with_exit` / `run_parsed_command_with_mode`:
+
+```
+ExitDisposition::Success          — exit 0        → compress normally
+ExitDisposition::ExpectedFailure  — non-zero in expected_exit_codes → compress
+ExitDisposition::UnexpectedFailure — all other non-zero, or signal kill → forward raw
+```
+
+`classify_exit(code: Option<i32>, expected: &[i32]) -> ExitDisposition` must be called on the raw `Option<i32>` BEFORE any `unwrap_or(1)` default: a signal kill (`None`) is always `UnexpectedFailure` even if `1` is in `expected_exit_codes`.
+
+**Unexpected failure path**: emits `[skim] {program} exited N; raw output (not compressed).` to stderr, records zero savings under the `"raw"` analytics tier, and calls `passthrough_raw` — byte-faithful forward of stdout+stderr before ANSI stripping.
+
+**`expected_exit_codes`** — non-zero codes the parser meaningfully compresses:
+- `grep`/`rg`: `&[1]` (no matches)
+- `diff`: `&[1]` (files differ)
+- `cargo test`: `&[101]` (test failures; also compile errors which fall through to Passthrough)
+- `swiftlint`/`terraform`: `&[2]`
+- `lint` family: `&[1]`
+- `pkg`: `&[1]`
+- `gofmt`/`db`/`infra`/`file`: `&[]` (expect only exit 0)
+
+**`forward_stderr`** — when `true`, child stderr is forwarded verbatim on the compressed path (captured before ANSI stripping for byte-faithfulness). Used for `file` and `db` families whose parsers consume only stdout, so warnings/diagnostics on stderr are never silently dropped.
+
+**Notice matrix**:
+- Unexpected failure → `[skim] {program} exited N; raw output (not compressed).` (stderr)
+- Expected failure at `Passthrough` tier → silent (matches raw tool behavior, e.g. grep no-match silence)
+- Expected failure at `Full`/`Degraded` tier → `[skim] compressed output (exit N). SKIM_PASSTHROUGH=1 for full output.` (stderr)
+
+**Build family is exempt**: `build::run_parsed_command` does not use this matrix — it has its own exit-code logic derived from `BuildResult.success`.
+
+## `run_parsed_command_with_exit` — Parser-Derived Exit Codes (#317)
+
+`run_parsed_command_with_mode` is now a thin wrapper around `run_parsed_command_with_exit`:
+
+```rust
+pub(crate) fn run_parsed_command_with_exit<T>(
+    config: ParsedCommandConfig<'_>,
+    parse: impl FnOnce(&CommandOutput) -> ParseResult<T>,
+    derive_exit: impl FnOnce(&ParseResult<T>) -> Option<i32>,
+) -> anyhow::Result<ExitCode>
+```
+
+`derive_exit` inspects the parsed result and may return a non-zero exit code. The final exit is `max(child_exit, derived)` — needed on the stdin path, where `obtain_output` fabricates `exit_code: Some(0)` and a piped failing test run would otherwise exit 0 even when `summary.fail > 0`.
+
+`run_parsed_command_with_mode` passes `|_| None` for `derive_exit` (no derived exit needed for families whose parsers cannot observe failure independently of the exit code).
+
+**`cargo test` uses `run_parsed_command_with_exit` directly** (not via `run_tool<T>`):
+```rust
+// In cmd/test/cargo.rs run():
+run_parsed_command_with_exit(
+    ParsedCommandConfig { ..., expected_exit_codes: &[101], forward_stderr: false, ... },
+    move |output| parse_impl(output, is_nextest),
+    |result| match result {
+        ParseResult::Full(r) | ParseResult::Degraded(r, _) if r.summary.fail > 0 => Some(1),
+        _ => None,
+    },
+)
+```
+
+## `TestResult` — Context Safety Net (#317)
+
+`TestResult` gained a `context: Option<String>` field and a `TestResult::with_context` constructor:
+
+```rust
+pub(crate) struct TestResult {
+    pub(crate) summary: TestSummary,
+    pub(crate) entries: Vec<TestEntry>,
+    pub(crate) context: Option<String>,  // raw failure-context block
+    rendered: String,
+}
+```
+
+When present, `context` is appended to the rendered output under a `--- failure context ---` banner. This is a safety net for parsers whose structured tiers cannot attach per-test `detail` — the diagnostic is never dropped even when `parse_failure_details` produces no block entries.
+
+`TestResult::render` appends `context` last:
+```
+{summary}
+ FAIL: test_name
+  {detail}
+...
+--- failure context ---
+{context}
+```
+
+## Cargo Tier-2: `parse_failure_details` + Context Safety Net (#317)
+
+On stable Rust (`cargo test` without `--format json`), libtest prints each failing test's captured output in blocks:
+
+```
+---- module::test_name stdout ----
+thread 'module::test_name' panicked at src/lib.rs:5:9:
+assertion failed: …
+
+failures:
+    module::test_name
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored
+```
+
+`parse_failure_details(text: &str) -> HashMap<String, String>` (in `cmd/test/cargo.rs`) is a state machine that parses these blocks and returns a map from test name to failure body. Header pattern: `RE_FAILURE_BLOCK_HEADER = r"^---- (.+?) (?:stdout|stderr) ----$"` (lazy `.+?` to handle doctest names with spaces like `src/lib.rs - module (line 10)`). A block ends at the next header, a bare `failures:` recap line, or a `test result:` summary line. Multiple blocks for the same test name (stdout + stderr) are appended rather than overwritten.
+
+`try_parse_regex` (Tier 2) uses `parse_failure_details` to attach `detail` to each `TestEntry`. If block parsing yields no `detail` for any entry (e.g. very old toolchain format), a `failure_context_body` safety net attaches the raw failure section as `context` so the `panicked at` diagnostic is never dropped.
+
+## `failure_context_body` + `emit_failure_context` (shared.rs, #317)
+
+`failure_context_body(raw_output: &str) -> Option<String>` (in `cmd/test/shared.rs`) extracts the failure-diagnostic section:
+
+- Section starts at the FIRST line containing any `FAILURE_MARKERS` token: `["FAILED", "--- FAIL:", "panicked at", "failures:", "AssertionError", "error[", "✕", "✗"]`
+- If no marker found → last 50 lines (legacy tail fallback)
+- Section ≤ 350 lines → returned whole (compress, never truncate)
+- Section > 350 lines → `head(300)` + `elision_marker(shown, total, "lines")` + `last_n_lines(50)` (recap block)
+- Returns `None` when output is empty/whitespace
+
+`emit_failure_context(raw_output: &str, exit_code: i32)` calls `failure_context_body` and, if `Some`, prints `--- failure context ---` to stdout followed by the body, then emits `[skim] compressed output (exit N). SKIM_PASSTHROUGH=1 for full output.` to stderr. Called by test-runner handlers (vitest, go, playwright, pytest) when failures are present.
+
+The cargo `run_parsed_command_with_exit` path does NOT call `emit_failure_context` — the context is attached directly to `TestResult.context` and rendered inline.
+
+## Loud Elision Markers (`output::elision_marker`, #317)
+
+When a genuine safety bound must truncate output, wrappers use the shared elision helpers in `crates/rskim/src/output/mod.rs`:
+
+```rust
+// Returns None when shown >= total (nothing omitted — no marker needed)
+pub(crate) fn elision_marker(shown: usize, total: usize, unit: &str) -> Option<String>
+// → "[skim] {omitted} {unit} omitted ({shown} of {total} shown) — SKIM_PASSTHROUGH=1 for full output"
+
+// For streaming sites where total is unknowable mid-stream
+pub(crate) fn elision_marker_unbounded(shown_desc: &str, unit: &str) -> String
+// → "[skim] {unit} elided beyond {shown_desc} — SKIM_PASSTHROUGH=1 for full output"
+```
+
+Always use these functions — never construct elision notices inline. `elision_marker` returns `None` when nothing is omitted, so callers can do `if let Some(m) = elision_marker(...) { ... }` cleanly.
 
 ## `CommandRunner` and `ChildGuard` — Execution Layer (ADR-008)
 
-`CommandRunner` (in `crates/rskim/src/runner.rs`) is now a **stateless unit struct** (`#[derive(Default)]`, `new()` takes no args). It imposes no internal wall-clock timeout. `run_with_env` blocks on a plain `wait()` until the child process exits naturally.
+`CommandRunner` (in `crates/rskim/src/runner.rs`) is a **stateless unit struct** (`#[derive(Default)]`, `new()` takes no args). It imposes no internal wall-clock timeout. `run_with_env` blocks on a plain `wait()` until the child process exits naturally.
 
 **No timeout inside skim.** Callers that need a time bound must apply one externally:
 - CI step timeout (GitHub Actions `timeout-minutes:`)
@@ -285,6 +432,8 @@ The `load_fixture` traversal guard uses `std::path::Path::new(s).components()` a
 
 Build parser tests import as `use crate::cmd::test_utils::{make_output_full, load_fixture}`. Fixture files for build parsers live at `tests/fixtures/cmd/build/` (e.g., `cargo_build_fail.json`, `cargo_build_ok.json`, `clippy_fail.json`, `clippy_warnings.json`, `make_errors.txt`, `tsc_errors.txt`).
 
+Cargo test parser fixtures live at `tests/fixtures/cmd/test/` (e.g., `cargo_pass.json`, `cargo_fail.json`, `cargo_panic_char_boundary.txt`).
+
 Do not redeclare local versions — use the canonical source to prevent drift.
 
 ## Anti-Patterns
@@ -316,6 +465,12 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 - **Using a generic watch-flag check for `is_indefinite_command`**: the function is keyed on specific program + flag pairs. Never add a generic "any command with `-f`" or "any command with `--watch`" branch — that would misfire on `grep -f`, `rm -f`, `git push -f`, etc. Add program-specific branches only.
 
 - **Forgetting the `--help`/`--version` short-circuit in new indefinite programs**: when adding a new program to `is_indefinite_command`, the `has_help_or_version_flag` guard at the top of the function already protects all programs. Do not add per-program help checks — the universal guard handles it.
+
+- **Omitting `expected_exit_codes` and `forward_stderr` when constructing `ToolRunConfig` or `ParsedCommandConfig`**: both fields have no defaults — every construction site must supply them explicitly. Missing them will fail to compile. Audit the appropriate values for the tool (see the Exit-Disposition Matrix section above).
+
+- **Silently truncating output without `elision_marker`**: any hard bound that drops output must use `output::elision_marker` (or `elision_marker_unbounded` for streaming). Never emit a cap message inline — it would lack exact counts and the `SKIM_PASSTHROUGH=1` escape hatch.
+
+- **Calling `classify_exit` on `unwrap_or(1)` output**: `classify_exit` must be called on the raw `Option<i32>` so that `None` (signal kill) maps to `UnexpectedFailure` regardless of what value `expected_exit_codes` contains.
 
 ## Gotchas
 
@@ -355,6 +510,14 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 
 - **`pm_is_indefinite` guards against FINITE_SCRIPTS before returning false for unknown scripts**: both `INDEFINITE_SCRIPTS` and `FINITE_SCRIPTS` are checked. An unknown script name (not in either list) returns `false` — treat as finite. This is conservative: a new package-manager script that isn't in either list won't accidentally block compression.
 
+- **`cargo test` Tier-2 on stable toolchain may produce no per-entry `detail` when block parsing fails**: `parse_failure_details` attaches per-test panic output from `---- name stdout ----` blocks. If no blocks are found (e.g. very old toolchain or unusual output format), the safety net sets `TestResult.context` to `failure_context_body(text)` so the raw failure section is still surfaced in the rendered output.
+
+- **`failure_context_body` uses pointer arithmetic to slice from the marker line**: `let offset = first_marker_line.as_ptr() as usize - cleaned.as_ptr() as usize`. This is valid because `first_marker_line` is a `lines()` iterator element that borrows from `cleaned`. Do not replicate this pattern without confirming the lifetime guarantee.
+
+- **`emit_failure_context` writes to stdout (body) and stderr (hint)**: the `--- failure context ---` banner and body go to stdout; the `[skim] compressed output` hint goes to stderr. This matches the convention where stderr carries skim's own notices, not the tool's diagnostic content.
+
+- **`run_parsed_command_with_exit` applies `max(child, derived)` not `child.or(derived)`**: `max` means a child exit 101 is preserved even if `derive_exit` returns `Some(1)`. The derived exit only wins when the child exit is 0 (stdin fabrication path).
+
 ## Key Files
 
 - `crates/rskim/src/cmd/build/mod.rs` — dispatcher (`run`), shared `run_parsed_command`, and `print_help`
@@ -363,25 +526,28 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 - `crates/rskim/src/cmd/build/make.rs` — GNU make: GCC diagnostics Tier 1, noise-strip Tier 2, eight `LazyLock<Regex>` patterns plus one literal `starts_with` check
 - `crates/rskim/src/cmd/build/gradle.rs` — Gradle/Gradlew: task outcome + Java/Kotlin diagnostic Tier 1 (with duration), noise-strip Tier 2 (six `LazyLock<Regex>` patterns)
 - `crates/rskim/src/cmd/build/maven.rs` — Maven/Mvnw: `[ERROR]`/`[WARNING]` + build summary Tier 1 (with duration), noise-strip Tier 2 (two `LazyLock<Regex>` patterns, two duration formats)
-- `crates/rskim/src/output/mod.rs` — `ParseResult<T>` enum definition and helpers (`is_full`, `is_degraded`, `is_passthrough`, `tier_name`, `content`, `into_content`, `emit_markers`); `strip_ansi` and `strip_ansi_cow` (zero-copy fast path: borrows when no ESC byte present); `to_json_envelope` (not used by build family — build has no `--json` mode); `OutputMode`, `clean`, `clean_with_mode`, `PassthroughTruncator`, `FilterTransparencyHeader` (used by other families); sub-modules `guardrail` and `tee` (not used by build parsers — used by other consumers of the output infrastructure)
-- `crates/rskim/src/output/canonical.rs` — `BuildResult` struct with pre-rendered output; also owns `TestResult`, `GitResult`, `LintResult`, `DbResult`, `PkgResult`, `InfraResult`, `LogResult`, `DiffResult`, `FileResult` — the `DbResult::render` was decomposed into 5 private helpers in #214 as a model for growing render logic
+- `crates/rskim/src/output/mod.rs` — `ParseResult<T>` enum definition and helpers (`is_full`, `is_degraded`, `is_passthrough`, `tier_name`, `content`, `into_content`, `emit_markers`); `strip_ansi` and `strip_ansi_cow` (zero-copy fast path: borrows when no ESC byte present); `to_json_envelope` (not used by build family); `elision_marker`, `elision_marker_unbounded` (#317 loud elision helpers); `OutputMode`, `clean`, `clean_with_mode`, `PassthroughTruncator`, `FilterTransparencyHeader`
+- `crates/rskim/src/output/canonical.rs` — `BuildResult` (pre-rendered output); `TestResult` (with `context: Option<String>` safety net and `with_context` constructor, #317); `TestEntry`, `TestSummary`, `TestOutcome`; `GitResult`, `LintResult`, `DbResult`, `PkgResult`, `InfraResult`, `LogResult`, `DiffResult`, `FileResult`
 - `crates/rskim/src/cmd/mod.rs` — coordination point: declares all submodules, re-exports public API; inline helpers: `user_has_flag`, `inject_flag_before_separator`, `extract_show_stats`, `extract_json_flag`, `extract_output_format`, `should_read_stdin` (stdin-eligible when empty args OR `args == ["run"]`), `read_bounded`, `read_stdin_bounded`, `MAX_STDIN_BYTES`; passthrough checks: `is_passthrough_mode`, `check_passthrough_str`, `check_passthrough_value`; resolvers: `resolve_cache_dir`, `skim_wrappers_dir`
-- `crates/rskim/src/cmd/dispatch.rs` — `dispatch()`, `run_raw_passthrough()`, `run_inherited_passthrough()` (inherited-stdio path for daemon/streaming commands); per-tool dispatcher helpers (`dispatch_cargo`, `dispatch_go`, `dispatch_swift`, `dispatch_dotnet`, `passthrough_subcmd`, `extract_subcmd`, `prepend`, `prepend_without`)
-- `crates/rskim/src/cmd/execution.rs` — `OutputFormat`, `RunContext`, `ParsedCommandConfig<'_>`, `ToolRunConfig<'_>`, `run_tool<T>`, `run_parsed_command_with_mode`, `format_analytics_label`, `combine_output`, `obtain_output` (soft spawn-failure path for non-build families), `render_output<T>`, `record_and_report`, `passthrough_raw` (NOT used by build family — build uses `build/mod.rs::run_parsed_command`)
+- `crates/rskim/src/cmd/dispatch.rs` — `dispatch()`, `run_raw_passthrough()`, `run_inherited_passthrough()` (inherited-stdio path for daemon/streaming commands); per-tool dispatcher helpers
+- `crates/rskim/src/cmd/execution.rs` — `OutputFormat`, `RunContext`, `ParsedCommandConfig<'_>` (with `expected_exit_codes`, `forward_stderr`, #317), `ToolRunConfig<'_>` (with `expected_exit_codes`, `forward_stderr`, #317), `run_tool<T>`, `run_parsed_command_with_mode`, `run_parsed_command_with_exit` (#317), `ExitDisposition`, `classify_exit` (#317), `format_analytics_label`, `combine_output`, `obtain_output`, `render_output<T>`, `record_and_report`, `passthrough_raw`
 - `crates/rskim/src/cmd/security.rs` — `sanitize_for_display`, `scrub_db_args`, `scrub_infra_args`
 - `crates/rskim/src/cmd/registry.rs` — `KNOWN_SUBCOMMANDS` (sorted, binary-searchable via `binary_search`), `is_known_subcommand`, `is_meta_subcommand`, `wrapper_targets`
 - `crates/rskim/src/cmd/test_utils.rs` — standalone test helper module (compiled under `#[cfg(test)]` gate): `make_output`, `make_output_full`, `make_output_stderr`, `load_fixture` (with `Component::Normal` traversal guard); import as `crate::cmd::test_utils`; renamed from `test_support` in PR #126
 - `crates/rskim/src/runner.rs` — `CommandRunner` (stateless unit struct, `#[derive(Default)]`), `CommandOutput`, `ChildGuard` (kill-on-drop RAII), `is_spawn_error`, `MAX_OUTPUT_BYTES` (64 MiB); no timeout, no `RunnerError::Timeout`
 - `crates/rskim/src/cmd/rewrite/indefinite.rs` — `is_indefinite_command(tokens: &[&str]) -> bool`; program-aware daemon/streaming detection with env-var prefix stripping; consumed by the rewrite hook path and by `dispatch()`'s `run_inherited_passthrough` gate
+- `crates/rskim/src/cmd/test/cargo.rs` — `run()` for `skim cargo test`; uses `run_parsed_command_with_exit` with `expected_exit_codes: &[101]`; `parse_failure_details` state machine for stable-toolchain `---- name stdout ----` blocks (#317)
+- `crates/rskim/src/cmd/test/shared.rs` — `run_test_runner`, `scrape_failures`, `failure_context_body`, `emit_failure_context` (#317), `try_read_stdin`, `TestKind`, `ExitSource`, `ArgPreparation`, `TestRunnerConfig`
 - `crates/rskim/tests/fixtures/cmd/build/` — fixture files: `cargo_build_fail.json`, `cargo_build_ok.json`, `clippy_fail.json`, `clippy_warnings.json`, `make_errors.txt`, `make_nothing.txt`, `make_recursive.txt`, `make_success.txt`, `make_warnings_only.txt`, `tsc_errors.txt`
+- `crates/rskim/tests/fixtures/cmd/test/` — fixture files: `cargo_pass.json`, `cargo_fail.json`, `cargo_panic_char_boundary.txt` (regression for Addendum 2 char-boundary panic)
 
 ## Related
 
-- `crates/rskim/src/output/mod.rs` — owns `ParseResult<T>`, the type returned by all three-tier parsers across the whole codebase (lint, test, infra, build); `emit_markers` debug gate is defined here
-- `crates/rskim/src/output/canonical.rs` — owns `BuildResult`, `TestResult`, `GitResult`, `LintResult`; build parsers use `BuildResult`
+- `crates/rskim/src/output/mod.rs` — owns `ParseResult<T>`, the type returned by all three-tier parsers across the whole codebase (lint, test, infra, build); `emit_markers` debug gate; `elision_marker`/`elision_marker_unbounded` (#317)
+- `crates/rskim/src/output/canonical.rs` — owns `BuildResult`, `TestResult` (with `context` safety net), `GitResult`, `LintResult`
 - `crates/rskim/src/runner.rs` — `CommandRunner` (stateless, ADR-008), `CommandOutput`, `ChildGuard` (kill-on-drop), `is_spawn_error`; no internal timeout, no `RunnerError::Timeout`
 - `crates/rskim/src/cmd/rewrite/indefinite.rs` — `is_indefinite_command`; guards daemon/streaming commands from being captured; consumed by `dispatch()` and the rewrite hook path
 - `crates/rskim/src/cmd/lint/` — sibling module using the same three-tier pattern with `LintResult` instead of `BuildResult`; lint parsers use `run_tool<T>` (via `run_parsed_command_with_mode` in `execution.rs`) rather than `run_parsed_command`
-- `crates/rskim/src/cmd/test/` — sibling module using the same three-tier pattern with `TestResult`
+- `crates/rskim/src/cmd/test/` — sibling module using the same three-tier pattern with `TestResult`; cargo.rs uses `run_parsed_command_with_exit` directly
 - ADR-008: Remove internal subprocess timeout/duration caps; bound child-process lifetime with `ChildGuard` kill-on-drop instead of an arbitrary timeout
 - ADR-001: Fix all noticed issues immediately regardless of scope — applies when adding a new build parser: fix any spotted inconsistencies in other parsers in the same PR rather than deferring
