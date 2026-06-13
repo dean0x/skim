@@ -1045,13 +1045,13 @@ test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out
         assert!(
             details
                 .get("crate::tests::test_one")
-                .map_or(false, |b| b.contains("panic in test_one")),
+                .is_some_and(|b| b.contains("panic in test_one")),
             "test_one detail must be populated"
         );
         assert!(
             details
                 .get("crate::tests::test_two")
-                .map_or(false, |b| b.contains("panic in test_two")),
+                .is_some_and(|b| b.contains("panic in test_two")),
             "test_two detail must be populated"
         );
     }
