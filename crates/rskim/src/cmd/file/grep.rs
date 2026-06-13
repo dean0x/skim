@@ -122,28 +122,8 @@ impl GrepArgs {
             }
 
             if let Some(long) = arg.strip_prefix("--") {
-                let (name, has_inline_value) = match long.split_once('=') {
-                    Some((n, _)) => (n, true),
-                    None => (long, false),
-                };
-                match name {
-                    "recursive" | "dereference-recursive" => g.recursive = true,
-                    "with-filename" => g.with_filename = true,
-                    "no-filename" => g.no_filename = true,
-                    "line-number" => g.line_numbers = true,
-                    "count" | "files-with-matches" | "files-without-match" => {
-                        g.count_or_list = true;
-                    }
-                    "regexp" | "file" => {
-                        has_pattern_source = true;
-                        if !has_inline_value {
-                            i += 1; // value is the next token
-                        }
-                    }
-                    _ if LONG_VALUE_FLAGS.contains(&name) && !has_inline_value => {
-                        i += 1; // value is the next token
-                    }
-                    _ => {}
+                if g.scan_long_flag(long, &mut has_pattern_source) {
+                    i += 1; // long flag's value was the next token
                 }
                 i += 1;
                 continue;
@@ -151,25 +131,8 @@ impl GrepArgs {
 
             // Short flag cluster (e.g. `-rn`, `-A3`, `-epat`).
             let cluster = &arg[1..];
-            for (pos, c) in cluster.char_indices() {
-                match c {
-                    'r' | 'R' => g.recursive = true,
-                    'H' => g.with_filename = true,
-                    'h' => g.no_filename = true,
-                    'n' => g.line_numbers = true,
-                    'c' | 'l' | 'L' => g.count_or_list = true,
-                    'e' | 'f' | 'm' | 'A' | 'B' | 'C' | 'D' | 'd' => {
-                        if matches!(c, 'e' | 'f') {
-                            has_pattern_source = true;
-                        }
-                        // Value is the rest of the cluster, or the next token.
-                        if pos + c.len_utf8() >= cluster.len() {
-                            i += 1;
-                        }
-                        break;
-                    }
-                    _ => {}
-                }
+            if g.scan_short_cluster(cluster, &mut has_pattern_source) {
+                i += 1; // cluster's value-flag consumed the next token
             }
             i += 1;
         }
@@ -182,8 +145,68 @@ impl GrepArgs {
         g
     }
 
+    /// Parse a single long flag (everything after `--`).
+    ///
+    /// Returns `true` when the flag's value is the next argv token (caller must
+    /// advance the index past it).
+    fn scan_long_flag(&mut self, long: &str, has_pattern_source: &mut bool) -> bool {
+        let (name, has_inline_value) = match long.split_once('=') {
+            Some((n, _)) => (n, true),
+            None => (long, false),
+        };
+        match name {
+            "recursive" | "dereference-recursive" => self.recursive = true,
+            "with-filename" => self.with_filename = true,
+            "no-filename" => self.no_filename = true,
+            "line-number" => self.line_numbers = true,
+            "count" | "files-with-matches" | "files-without-match" => {
+                self.count_or_list = true;
+            }
+            "regexp" | "file" => {
+                *has_pattern_source = true;
+                return !has_inline_value;
+            }
+            _ if LONG_VALUE_FLAGS.contains(&name) => {
+                return !has_inline_value;
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// Parse a short flag cluster (everything after the leading `-`).
+    ///
+    /// Returns `true` when a value-consuming flag was last in the cluster and
+    /// its value is the next argv token (caller must advance the index past it).
+    fn scan_short_cluster(&mut self, cluster: &str, has_pattern_source: &mut bool) -> bool {
+        for (pos, c) in cluster.char_indices() {
+            match c {
+                'r' | 'R' => self.recursive = true,
+                'H' => self.with_filename = true,
+                'h' => self.no_filename = true,
+                'n' => self.line_numbers = true,
+                'c' | 'l' | 'L' => self.count_or_list = true,
+                'e' | 'f' | 'm' | 'A' | 'B' | 'C' | 'D' | 'd' => {
+                    if matches!(c, 'e' | 'f') {
+                        *has_pattern_source = true;
+                    }
+                    // Value is the rest of the cluster, or (if exhausted) the next token.
+                    return pos + c.len_utf8() >= cluster.len();
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// When grep prints NO `file:` prefix and we know the single real target:
     /// exactly one file operand that is not `-` (stdin), no recursion, no `-H`.
+    ///
+    /// **Label provenance**: the returned label is the argv token verbatim —
+    /// it is not verified against grep's actual filesystem access (e.g., brace
+    /// expansion or shell variables are not resolved here). Downstream consumers
+    /// should treat this label as "what the user asked grep to read", not as a
+    /// canonical resolved path.
     fn single_unprefixed_target(&self) -> Option<&str> {
         if self.recursive || self.with_filename || self.file_operands.len() != 1 {
             return None;
