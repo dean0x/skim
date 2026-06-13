@@ -32,6 +32,7 @@ pub(super) fn run_install(
         super::PkgSubcommandConfig {
             program: "yarn",
             subcommand: "install",
+            expected_exit_codes: &[1],
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install Yarn: npm install -g yarn",
         },

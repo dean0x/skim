@@ -48,6 +48,7 @@ pub(super) fn run_audit(
         super::PkgSubcommandConfig {
             program: "npm",
             subcommand: "audit",
+            expected_exit_codes: &[1],
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install Node.js from https://nodejs.org",
         },

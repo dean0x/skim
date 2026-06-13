@@ -90,6 +90,7 @@ fn run_install(
         super::PkgSubcommandConfig {
             program: "pip",
             subcommand: "install",
+            expected_exit_codes: &[1],
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install Python from https://python.org",
         },
@@ -152,6 +153,7 @@ fn run_check(
         super::PkgSubcommandConfig {
             program: "pip",
             subcommand: "check",
+            expected_exit_codes: &[1],
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install Python from https://python.org",
         },
@@ -229,6 +231,7 @@ fn run_list(
         super::PkgSubcommandConfig {
             program: "pip",
             subcommand: "list",
+            expected_exit_codes: &[1],
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install Python from https://python.org",
         },

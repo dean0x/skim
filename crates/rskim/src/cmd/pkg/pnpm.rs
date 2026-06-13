@@ -87,6 +87,7 @@ fn run_install(
         super::PkgSubcommandConfig {
             program: "pnpm",
             subcommand: "install",
+            expected_exit_codes: &[1],
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install pnpm via https://pnpm.io/installation",
         },
@@ -164,6 +165,7 @@ fn run_audit(
         super::PkgSubcommandConfig {
             program: "pnpm",
             subcommand: "audit",
+            expected_exit_codes: &[1],
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install pnpm via https://pnpm.io/installation",
         },
@@ -264,6 +266,7 @@ fn run_outdated(
         super::PkgSubcommandConfig {
             program: "pnpm",
             subcommand: "outdated",
+            expected_exit_codes: &[1],
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install pnpm via https://pnpm.io/installation",
         },

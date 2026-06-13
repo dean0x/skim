@@ -75,6 +75,12 @@ pub(super) use super::combine_output;
 pub(super) struct PkgSubcommandConfig<'a> {
     pub program: &'a str,
     pub subcommand: &'a str,
+    /// Exit codes that mean "ran fine, findings present" rather than an
+    /// unexpected failure (#317). Most subcommands exit `1` on findings, but
+    /// `yarn audit` uses a severity bitmask (`1|2|4|8|16`, OR-combined), so it
+    /// declares the full `1..=31` range. Threaded into `classify_exit` so a
+    /// findings exit is compressed instead of raw-forwarded.
+    pub expected_exit_codes: &'a [i32],
     pub env_overrides: &'a [(&'a str, &'a str)],
     pub install_hint: &'a str,
 }
@@ -113,9 +119,10 @@ where
             family: "pkg",
             skip_ansi_strip: false,
             rec,
-            // 1 = findings present (npm audit vulnerabilities, npm outdated
-            // packages, pip check conflicts) — the case these parsers exist for.
-            expected_exit_codes: &[1],
+            // Per-subcommand: `1` for most (npm audit vulnerabilities, npm
+            // outdated packages, pip check conflicts), the severity-bitmask
+            // range for `yarn audit`. See `PkgSubcommandConfig`.
+            expected_exit_codes: config.expected_exit_codes,
             forward_stderr: false,
         },
         |output| parse_fn(output),

@@ -33,6 +33,7 @@ pub(super) fn run_install(
         super::PkgSubcommandConfig {
             program: "npm",
             subcommand: "install",
+            expected_exit_codes: &[1],
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install Node.js from https://nodejs.org",
         },

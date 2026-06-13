@@ -12,6 +12,17 @@ use super::combine_output;
 static RE_YARN_AUDIT_VULN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\d+)\s+vulnerabilit").expect("valid regex"));
 
+/// yarn classic v1 `audit` encodes severity in a bitmask exit code that is
+/// OR-combined across all reported severities: 1=INFO, 2=LOW, 4=MODERATE,
+/// 8=HIGH, 16=CRITICAL. Any non-zero combination therefore lands in `1..=31`
+/// and means "ran fine, vulnerabilities found" — exactly the case the NDJSON
+/// parser exists to compress. Without the full range, a HIGH-only run (exit 8)
+/// would be misclassified as an unexpected failure and raw-forwarded (#317).
+const YARN_AUDIT_EXIT_CODES: &[i32] = &[
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+    27, 28, 29, 30, 31,
+];
+
 pub(super) fn run_audit(
     args: &[String],
     show_stats: bool,
@@ -22,6 +33,7 @@ pub(super) fn run_audit(
         super::PkgSubcommandConfig {
             program: "yarn",
             subcommand: "audit",
+            expected_exit_codes: YARN_AUDIT_EXIT_CODES,
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install Yarn: npm install -g yarn",
         },
@@ -177,6 +189,29 @@ mod tests {
         assert!(result.is_some());
         let r = result.unwrap();
         assert!(r.success);
+    }
+
+    /// #322: yarn classic v1 `audit` encodes severity in a bitmask exit code
+    /// (1=INFO, 2=LOW, 4=MODERATE, 8=HIGH, 16=CRITICAL, OR-combined). Every
+    /// reachable non-zero combination must be declared expected so a findings
+    /// run (e.g. exit 8 for HIGH) is compressed, not raw-forwarded.
+    #[test]
+    fn test_yarn_audit_exit_codes_cover_severity_bitmask() {
+        for severity_flag in [1, 2, 4, 8, 16] {
+            assert!(
+                YARN_AUDIT_EXIT_CODES.contains(&severity_flag),
+                "severity flag {severity_flag} must be an expected exit code"
+            );
+        }
+        // Representative OR-combinations: HIGH|CRITICAL and all severities.
+        assert!(YARN_AUDIT_EXIT_CODES.contains(&24)); // 8 | 16
+        assert!(YARN_AUDIT_EXIT_CODES.contains(&31)); // 1|2|4|8|16
+        // Exactly the non-zero bitmask range — 0 stays Success, 32+ stays an
+        // unexpected failure and is forwarded raw.
+        assert_eq!(YARN_AUDIT_EXIT_CODES.first(), Some(&1));
+        assert_eq!(YARN_AUDIT_EXIT_CODES.last(), Some(&31));
+        assert!(!YARN_AUDIT_EXIT_CODES.contains(&0));
+        assert!(!YARN_AUDIT_EXIT_CODES.contains(&32));
     }
 
     #[test]
