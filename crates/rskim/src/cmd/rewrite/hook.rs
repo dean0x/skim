@@ -66,12 +66,18 @@ pub(super) const HOOK_TIMEOUT_SECS: u64 = 5;
 ///
 /// Assumes `sid` has already passed the safety check (alphanumeric, `-`, `_`, `.` only).
 fn inject_session_id_into_parts(parts: &[String], sid: &str) -> String {
-    // Simple-path shape: the first part is exactly the `skim` token.
-    if parts.first().map(String::as_str) == Some("skim") {
+    // Simple-path shape: the first non-env token is exactly the `skim` token.
+    // Leading `KEY=val` env assignments (`RUST_LOG=debug skim ...`) shift `skim`
+    // off index 0, so scan past them using the same env-detection rule the
+    // rewrite engine applied when it produced these tokens. Without this, an
+    // env-prefixed simple command silently loses its `--session-id` flag.
+    let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+    let env_count = super::engine::strip_env_vars(&refs);
+    if parts.get(env_count).map(String::as_str) == Some("skim") {
         let mut out: Vec<String> = Vec::with_capacity(parts.len() + 1);
-        out.push("skim".to_string());
+        out.extend(parts[..=env_count].iter().cloned());
         out.push(format!("--session-id={sid}"));
-        out.extend(parts.iter().skip(1).cloned());
+        out.extend(parts.iter().skip(env_count + 1).cloned());
         return out.join(" ");
     }
 
@@ -673,6 +679,44 @@ mod tests {
     fn test_session_id_safe_chars_accepted() {
         let result = inject_session_id(&["skim", "git", "status"], Some("sess_123-abc.def"));
         assert_eq!(result, "skim --session-id=sess_123-abc.def git status");
+    }
+
+    // ========================================================================
+    // #322: env-var-prefixed simple commands must still receive session_id
+    // ========================================================================
+
+    /// #322: a leading `KEY=val` env assignment shifts the `skim` token off
+    /// index 0. Injection must scan past it (same rule as the rewrite engine's
+    /// `strip_env_vars`) or the analytics flag is silently dropped (AD-HK-2).
+    #[test]
+    fn test_session_id_injected_after_leading_env_var() {
+        let result = inject_session_id(
+            &["RUST_LOG=debug", "skim", "gh", "pr", "list"],
+            Some("sess-abc"),
+        );
+        assert_eq!(
+            result, "RUST_LOG=debug skim --session-id=sess-abc gh pr list",
+            "env-prefixed simple command must receive --session-id after the skim token"
+        );
+    }
+
+    /// #322: multiple leading env assignments are all skipped before injection.
+    #[test]
+    fn test_session_id_injected_after_multiple_env_vars() {
+        let result = inject_session_id(
+            &[
+                "CARGO_TERM_COLOR=never",
+                "RUST_LOG=debug",
+                "skim",
+                "cargo",
+                "test",
+            ],
+            Some("s1"),
+        );
+        assert_eq!(
+            result,
+            "CARGO_TERM_COLOR=never RUST_LOG=debug skim --session-id=s1 cargo test"
+        );
     }
 
     // ========================================================================
