@@ -289,6 +289,39 @@ mod tests {
         assert!(tail.tokens.join(" ").contains("--mode=structure"));
     }
 
+    /// #322: the `is_code_file` gate runs BEFORE `is_declaration_file`, so the
+    /// `.d.mts`/`.d.cts` terminal extensions must be known to
+    /// `Language::from_extension` or the whole declaration path is unreachable
+    /// for half the extensions workstream 5d promises.
+    #[test]
+    fn test_is_code_file_mts_cts() {
+        assert!(is_code_file("api.mts"));
+        assert!(is_code_file("api.cts"));
+        assert!(is_code_file("types.d.mts"));
+        assert!(is_code_file("dist/index.d.cts"));
+    }
+
+    #[test]
+    fn test_cat_declaration_mts_cts_uses_structure_mode() {
+        for path in ["src/api.d.mts", "dist/index.d.cts"] {
+            let result = try_rewrite_cat(&[path]).unwrap_or_else(|| panic!("must rewrite {path}"));
+            let joined = result.tokens.join(" ");
+            assert!(
+                joined.contains("--mode=structure"),
+                "declaration file {path} needs structure mode: {joined}"
+            );
+            assert!(!joined.contains("pseudo"), "{joined}");
+        }
+    }
+
+    #[test]
+    fn test_head_tail_declaration_mts_cts_uses_structure_mode() {
+        let head = try_rewrite_head(&["-20", "src/api.d.mts"]).expect("must rewrite");
+        assert!(head.tokens.join(" ").contains("--mode=structure"));
+        let tail = try_rewrite_tail(&["-20", "dist/index.d.cts"]).expect("must rewrite");
+        assert!(tail.tokens.join(" ").contains("--mode=structure"));
+    }
+
     // ========================================================================
     // parse_line_count_and_files
     // ========================================================================
