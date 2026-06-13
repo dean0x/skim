@@ -6,11 +6,11 @@
 //!
 //! ## Exit code semantics by parser
 //!
-//! - **cargo test**: Uses `run_parsed_command_with_mode()` which maps exit code
-//!   from `output.exit_code` (not from parsed results). When stdin is piped,
-//!   `exit_code` is always `Some(0)`, so cargo test via stdin always exits 0
-//!   regardless of test results. This is the designed behavior — the exit code
-//!   reflects the transport, not the content.
+//! - **cargo test**: Uses `run_parsed_command_with_exit()` (#317): the final
+//!   exit is `max(child_exit, derived)`. On the stdin path the child exit is
+//!   the fabricated `Some(0)`, but a parsed `fail > 0` derives exit 1 — a
+//!   piped failing run no longer exits 0. Passthrough-tier stdin (unparseable
+//!   content) still exits 0 because nothing was derived.
 //!
 //! - **pytest/vitest**: Have their own `run()` implementations that infer exit
 //!   code from parsed results when `exit_code` is `None`. Failures in parsed
@@ -45,17 +45,30 @@ fn test_exit_code_cargo_pass_json() {
 
 #[test]
 fn test_exit_code_cargo_fail_json() {
-    // Cargo test via stdin always exits 0 because run_parsed_command_with_mode
-    // maps exit code from the synthetic CommandOutput (exit_code: Some(0)),
-    // not from the parsed test results.
+    // #317: a piped failing run must exit non-zero — the parser derives
+    // exit 1 from fail > 0 even though the stdin transport fabricates exit 0.
     let fixture = include_str!("fixtures/cmd/test/cargo_fail.json");
     skim_cmd()
         .args(["cargo", "test"])
         .write_stdin(fixture)
         .assert()
-        .code(0)
-        // Verify the output correctly shows failures even though exit code is 0
+        .code(1)
         .stdout(predicate::str::contains("fail: 1"));
+}
+
+#[test]
+fn test_exit_code_cargo_stable_panic_via_stdin() {
+    // The exact #317 Addendum-2 repro: stable-toolchain output with a panic.
+    // Both the panic diagnostic AND a failure exit code must survive.
+    let fixture = include_str!("fixtures/cmd/test/cargo_panic_char_boundary.txt");
+    skim_cmd()
+        .args(["cargo", "test"])
+        .write_stdin(fixture)
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("fail: 1"))
+        .stdout(predicate::str::contains("panicked at"))
+        .stdout(predicate::str::contains("char boundary"));
 }
 
 #[test]

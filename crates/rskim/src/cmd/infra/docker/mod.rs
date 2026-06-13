@@ -40,6 +40,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     family: "infra",
     skip_ansi_strip: false,
     command_type: CommandType::Infra,
+    expected_exit_codes: &[],
+    forward_stderr: false,
 };
 
 /// Global docker flags that accept a value in the following token.

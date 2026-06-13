@@ -3,7 +3,7 @@
   "features": {
     "build-parsers": {
       "name": "Build Tool Output Parsers",
-      "description": "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, check, fmt, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, run_clippy, parse_fmt, make_output_stderr, TokenAction, ChildGuard, indefinite, is_indefinite_command. NOTE: cmd/mod.rs was refactored in PR #267 — scrubbing logic is in security.rs, command execution in execution.rs, dispatch in dispatch.rs, registry in registry.rs, test helpers in test_utils.rs.",
+      "description": "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, ChildGuard, indefinite, is_indefinite_command, expected_exit_codes, forward_stderr, ExitDisposition, classify_exit, run_parsed_command_with_exit, elision_marker, failure_context_body, parse_failure_details, compress-never-truncate.",
       "directories": [
         "crates/rskim/src/cmd/build/",
         "crates/rskim/src/cmd/"
@@ -24,9 +24,11 @@
         "crates/rskim/src/cmd/registry.rs",
         "crates/rskim/src/cmd/test_utils.rs",
         "crates/rskim/src/runner.rs",
-        "crates/rskim/src/cmd/rewrite/indefinite.rs"
+        "crates/rskim/src/cmd/rewrite/indefinite.rs",
+        "crates/rskim/src/cmd/test/cargo.rs",
+        "crates/rskim/src/cmd/test/shared.rs"
       ],
-      "lastUpdated": "2026-06-11T21:47:11.500Z",
+      "lastUpdated": "2026-06-13T08:30:34.026Z",
       "createdBy": "devflow-knowledge"
     },
     "cochange": {

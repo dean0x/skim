@@ -23,6 +23,17 @@
 //! Running `install_wrappers` twice produces the same result as running it once.
 //! Symlinks that already point to the correct target are skipped. Symlinks
 //! pointing to a different target are updated (re-created).
+//!
+//! ## Known limitation: pipelines double-intercept (#319)
+//!
+//! PATH wrappers operate per-process, so `git diff | grep TODO` becomes
+//! `skim git diff | skim grep TODO` — the grep consumer sees COMPRESSED
+//! producer output rather than raw output. The rewrite hook refuses to
+//! rewrite piped commands (#317), but wrappers cannot see the pipeline
+//! shape. This is not solvable process-locally: agent harnesses pipe all
+//! stdio, so isatty heuristics would disable wrappers entirely.
+//! Workaround: `SKIM_PASSTHROUGH=1` on the pipeline. Tracked in #319
+//! (includes whether wrappers should intercept the harness Grep tool).
 
 use std::path::{Path, PathBuf};
 

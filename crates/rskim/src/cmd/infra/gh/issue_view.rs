@@ -22,8 +22,7 @@ use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
 use super::{
-    MAX_BODY_LINES, MAX_COMMENTS, extract_comments, inject_json_fields, parse_view_text,
-    three_tier_parse, truncate_body, try_parse_json_object,
+    extract_comments, inject_json_fields, parse_view_text, three_tier_parse, try_parse_json_object,
 };
 
 /// JSON fields to inject for `gh issue view`.
@@ -141,7 +140,7 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
         value: milestone.to_string(),
     });
 
-    // Body — truncated to MAX_BODY_LINES
+    // Body — full text (#317): the prose IS the meaning; never truncate.
     let body = obj
         .get("body")
         .and_then(|v| v.as_str())
@@ -150,14 +149,14 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
     let body_value = if body.is_empty() {
         "(empty)".to_string()
     } else {
-        truncate_body(body, MAX_BODY_LINES)
+        body.to_string()
     };
     items.push(InfraItem {
         label: "body".to_string(),
         value: body_value,
     });
 
-    // Comments count + last MAX_COMMENTS previews
+    // Comments count + ALL comments in full (#317).
     let comments_arr = obj
         .get("comments")
         .and_then(|v| v.as_array())
@@ -168,7 +167,7 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
         label: "comments".to_string(),
         value: format!("{count} total"),
     });
-    for c in extract_comments(comments_arr, MAX_COMMENTS) {
+    for c in extract_comments(comments_arr) {
         items.push(InfraItem {
             label: "comment".to_string(),
             value: c,
@@ -219,21 +218,29 @@ mod tests {
     }
 
     #[test]
-    fn test_tier1_body_truncation() {
+    fn test_tier1_body_complete() {
+        // #317: the full body is emitted — prose is the meaning.
         let input = load_fixture("gh_issue_view.json");
         let obj: serde_json::Value = serde_json::from_str(&input).unwrap();
         let result = try_parse_json(&obj).unwrap();
-        // Body has more than MAX_BODY_LINES lines — should be truncated
         let body_item = result.items.iter().find(|i| i.label == "body").unwrap();
         assert!(
-            body_item.value.contains("more lines"),
-            "Expected body truncation marker, got: {}",
+            !body_item.value.contains("more lines"),
+            "Body must not be truncated, got: {}",
+            body_item.value
+        );
+        let raw_body = obj.get("body").and_then(|b| b.as_str()).unwrap();
+        let last_line = raw_body.trim().lines().last().unwrap().trim();
+        assert!(
+            body_item.value.contains(last_line),
+            "Last body line must survive: {last_line:?} not in {:?}",
             body_item.value
         );
     }
 
     #[test]
-    fn test_tier1_comment_limit() {
+    fn test_tier1_all_comments_emitted() {
+        // #317: all 5 fixture comments are emitted — no count cap.
         let input = load_fixture("gh_issue_view.json");
         let obj: serde_json::Value = serde_json::from_str(&input).unwrap();
         let result = try_parse_json(&obj).unwrap();
@@ -242,11 +249,15 @@ mod tests {
             .iter()
             .filter(|i| i.label == "comment")
             .collect();
-        // Fixture has 5 comments, MAX_COMMENTS is 3 → should show 3
+        let total = obj
+            .get("comments")
+            .and_then(|c| c.as_array())
+            .map(|a| a.len())
+            .unwrap();
         assert_eq!(
             comment_items.len(),
-            MAX_COMMENTS,
-            "Expected {MAX_COMMENTS} comment items, got {}",
+            total,
+            "Expected all {total} comments, got {}",
             comment_items.len()
         );
     }

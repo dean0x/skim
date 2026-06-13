@@ -32,6 +32,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     family: "db",
     skip_ansi_strip: true,
     command_type: CommandType::Db,
+    expected_exit_codes: &[],
+    forward_stderr: true,
 };
 
 /// Matches the psql row-count footer: `(N rows)` or `(1 row)`.
@@ -137,15 +139,12 @@ fn try_parse_tabular(text: &str) -> Option<DbResult> {
         .map(|l| parse_psql_row(l, columns.len()))
         .collect();
 
-    let truncated = rows.len() > 100;
-
     Some(DbResult::new(
         "psql".to_string(),
         format!("SELECT returned {row_count} row(s)"),
         columns,
         rows,
         row_count,
-        truncated,
     ))
 }
 
@@ -183,7 +182,6 @@ fn try_parse_regex_fallback(text: &str) -> Option<DbResult> {
                 vec![],
                 vec![],
                 row_count,
-                false,
             ));
         }
     }
@@ -272,8 +270,8 @@ mod tests {
     }
 
     #[test]
-    fn test_column_truncation_in_render() {
-        // Value wider than MAX_COL_WIDTH (40) should be truncated with ellipsis in render
+    fn test_long_cell_renders_in_full() {
+        // #317: full cell content must render — raw psql pads, never truncates.
         let long_val = "a".repeat(50);
         let text = format!(
             " col1 | col2\n------+------\n {} | short\n(1 row)\n",
@@ -281,20 +279,20 @@ mod tests {
         );
         let output = make_output(&text);
         let result = parse_impl(&output);
-        // Should parse as Full
         if let ParseResult::Full(r) = result {
             let rendered = r.as_ref();
-            // The rendered output should contain the truncation ellipsis
             assert!(
-                rendered.contains('…'),
-                "expected truncation ellipsis in rendered output"
+                rendered.contains(&long_val),
+                "full 50-char cell must render without a 40-char chop"
             );
+        } else {
+            panic!("expected Full parse");
         }
     }
 
     #[test]
-    fn test_large_result_truncated_flag() {
-        // Build a result with 120 rows (exceeds MAX_DB_ROWS=100)
+    fn test_large_result_renders_every_row() {
+        // #317: 120 rows (former cap was 100) — all must render, no marker.
         let mut text = " id | val\n----+-----\n".to_string();
         for i in 1..=120 {
             text.push_str(&format!("  {} | v{}\n", i, i));
@@ -304,7 +302,11 @@ mod tests {
         let result = parse_impl(&output);
         if let ParseResult::Full(r) = result {
             assert_eq!(r.row_count, 120);
-            assert!(r.truncated, "expected truncated=true for 120 rows");
+            let rendered = r.as_ref();
+            assert!(rendered.contains("v120"), "all 120 rows must render");
+            assert!(!rendered.contains("omitted"), "no elision marker");
+        } else {
+            panic!("expected Full parse");
         }
     }
 

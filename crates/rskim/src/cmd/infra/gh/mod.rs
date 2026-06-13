@@ -51,10 +51,9 @@ pub(super) mod streaming;
 // Re-export everything from `shared` so that submodule `use super::…` imports
 // continue to resolve without any changes to the sub-parser files.
 pub(super) use shared::{
-    MAX_BODY_LINES, MAX_COMMENTS, MAX_ITEMS, MAX_JSON_BYTES, MAX_STEP_DETAIL, RE_GH_CHECK_SYMBOL,
-    RE_GH_CHECK_TAB, RE_GH_RUN_HEADER, RE_GH_RUN_JOB, RE_GH_TAB_ROW, RE_GH_VIEW_FIELD,
-    extract_comments, inject_json_fields, parse_view_text, three_tier_parse, truncate_body,
-    try_parse_json_object,
+    MAX_JSON_BYTES, RE_GH_CHECK_SYMBOL, RE_GH_CHECK_TAB, RE_GH_RUN_HEADER, RE_GH_RUN_JOB,
+    RE_GH_TAB_ROW, RE_GH_VIEW_FIELD, extract_comments, inject_json_fields, parse_view_text,
+    three_tier_parse, try_parse_json_object,
 };
 
 use crate::output::ParseResult;
@@ -72,6 +71,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     family: "infra",
     skip_ansi_strip: false,
     command_type: CommandType::Infra,
+    expected_exit_codes: &[],
+    forward_stderr: false,
 };
 
 // ============================================================================
@@ -270,27 +271,11 @@ mod tests {
     use super::*;
     use crate::cmd::test_utils::{make_output, make_output_full};
 
-    // --- truncate_body ---
-
-    #[test]
-    fn test_truncate_body_fits() {
-        let body = "line1\nline2\nline3";
-        assert_eq!(truncate_body(body, 10), body);
-    }
-
-    #[test]
-    fn test_truncate_body_truncates() {
-        let body = "a\nb\nc\nd\ne";
-        let result = truncate_body(body, 3);
-        assert!(result.contains("... (2 more lines)"));
-        assert!(result.starts_with("a\nb\nc"));
-    }
-
     // --- extract_comments ---
 
     #[test]
     fn test_extract_comments_empty() {
-        let result = extract_comments(&[], 3);
+        let result = extract_comments(&[]);
         assert!(result.is_empty());
     }
 
@@ -300,7 +285,7 @@ mod tests {
             "author": {"login": "alice"},
             "body": "> quoted text\n\nActual reply here"
         })];
-        let result = extract_comments(&comments, 3);
+        let result = extract_comments(&comments);
         assert_eq!(result.len(), 1);
         assert!(
             result[0].contains("Actual reply here"),
@@ -311,8 +296,10 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_comments_limits_to_last_n() {
-        let comments: Vec<serde_json::Value> = (0..10)
+    fn test_extract_comments_emits_all_in_full() {
+        // #317: every comment, full text — no count cap, no preview cap.
+        let long_body = format!("First line\nSecond line with detail: {}", "x".repeat(300));
+        let mut comments: Vec<serde_json::Value> = (0..10)
             .map(|i| {
                 serde_json::json!({
                     "author": {"login": format!("user{i}")},
@@ -320,11 +307,23 @@ mod tests {
                 })
             })
             .collect();
-        let result = extract_comments(&comments, 3);
-        assert_eq!(result.len(), 3);
-        // Should contain the last 3 (7, 8, 9)
-        assert!(result.iter().any(|s| s.contains("user7")));
+        comments.push(serde_json::json!({
+            "author": {"login": "verbose"},
+            "body": long_body
+        }));
+        let result = extract_comments(&comments);
+        assert_eq!(result.len(), 11, "all comments must be emitted");
+        assert!(result.iter().any(|s| s.contains("user0")));
         assert!(result.iter().any(|s| s.contains("user9")));
+        let verbose = result.iter().find(|s| s.contains("@verbose")).unwrap();
+        assert!(
+            verbose.contains("Second line with detail"),
+            "full multi-line text must survive: {verbose:.80}"
+        );
+        assert!(
+            verbose.contains(&"x".repeat(300)),
+            "no 120-char preview cap"
+        );
     }
 
     // --- auto-detect ---

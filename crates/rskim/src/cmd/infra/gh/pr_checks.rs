@@ -41,7 +41,7 @@ use crate::output::ParseResult;
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
-use super::{MAX_ITEMS, MAX_JSON_BYTES, RE_GH_CHECK_SYMBOL, RE_GH_CHECK_TAB, three_tier_parse};
+use super::{MAX_JSON_BYTES, RE_GH_CHECK_SYMBOL, RE_GH_CHECK_TAB, three_tier_parse};
 
 /// A single parsed check entry, shared across text and JSON parse paths.
 ///
@@ -138,7 +138,6 @@ pub(super) fn try_parse_checks_json(trimmed: &str) -> Option<InfraResult> {
     build_checks_result(
         checks
             .iter()
-            .take(MAX_ITEMS)
             .map(|c| {
                 let name = c
                     .get("name")
@@ -180,9 +179,6 @@ pub(super) fn try_parse_checks_text(text: &str) -> Option<InfraResult> {
     let mut parsed: Vec<ParsedCheck> = Vec::new();
 
     for line in text.lines() {
-        if parsed.len() >= MAX_ITEMS {
-            break;
-        }
         let line = line.trim();
         if line.is_empty() {
             continue;

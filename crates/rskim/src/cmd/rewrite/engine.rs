@@ -4,19 +4,6 @@ use super::handlers::{try_rewrite_cat, try_rewrite_head, try_rewrite_tail};
 use super::rules;
 use super::types::RewriteResult;
 
-/// Result of matching tokens against the rewrite rule table.
-///
-/// Encodes both "can this be rewritten?" and "should pipe-source rewriting
-/// be suppressed?" in a single pass over the rule table.  Replaces the
-/// two-call pattern (`try_table_match` + `is_pipe_source_excluded`) with a
-/// single traversal.  SEE: AD-RW-2.
-pub(super) struct TableMatchResult {
-    /// The rewrite output, if a non-skipped rule matched.
-    pub rewrite: Option<RewriteResult>,
-    /// True if the matching rule has `exclude_pipe_source: true`.
-    pub pipe_excluded: bool,
-}
-
 /// Return true if any token in `middle` matches a skip-flag prefix.
 ///
 /// Uses strict matching: `arg == flag` or `arg` starts with `flag=`.
@@ -37,32 +24,16 @@ fn should_skip_by_flag(middle: &[&str], skip_prefixes: &[&str]) -> bool {
 /// Attempt to rewrite a tokenized command. Returns `Some(RewriteResult)` on
 /// match, `None` if no rewrite applies.
 ///
-/// Thin wrapper around [`try_table_match_full`] that discards the
-/// `pipe_excluded` field, preserving the existing `Option<RewriteResult>` API.
-pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
-    try_table_match_full(tokens).rewrite
-}
-
-/// Single-pass table match that returns both the rewrite output and the
-/// pipe-source exclusion flag.
-///
-/// Use this in pipe-context callers to avoid two separate traversals of the
-/// rule table.  For non-pipe callers that only need the rewrite result, use
-/// the [`try_rewrite`] wrapper instead.
-///
 /// # Algorithm
 ///
-/// Performs the same env-var strip, toolchain strip, and separator split as
-/// `try_rewrite`, then walks the rule table once.  When a skip flag fires on
-/// a rule, iteration continues (not returns) so that the pipe-exclusion flag
-/// from a subsequent catch-all rule is still reported — matching the
-/// `is_pipe_source_excluded` semantics.  SEE: AD-RW-2.
-pub(super) fn try_table_match_full(tokens: &[&str]) -> TableMatchResult {
+/// Performs an env-var strip, toolchain strip, and separator split, then
+/// walks the rule table once.  When a skip flag fires on a rule, iteration
+/// continues (not returns) — but if a LATER rule then matches, the skipped
+/// more-specific rule suppresses the rewrite (returns `None`).  This keeps
+/// "specific rule said no" authoritative over broader catch-alls.
+pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
     if tokens.is_empty() {
-        return TableMatchResult {
-            rewrite: None,
-            pipe_excluded: false,
-        };
+        return None;
     }
 
     // Step 1: Strip leading env vars
@@ -71,10 +42,7 @@ pub(super) fn try_table_match_full(tokens: &[&str]) -> TableMatchResult {
     let command_tokens = &tokens[env_split..];
 
     if command_tokens.is_empty() {
-        return TableMatchResult {
-            rewrite: None,
-            pipe_excluded: false,
-        };
+        return None;
     }
 
     // Step 1b: Honor SKIM_PASSTHROUGH=<truthy> as a command prefix.
@@ -84,10 +52,7 @@ pub(super) fn try_table_match_full(tokens: &[&str]) -> TableMatchResult {
     // lets callers bypass rewriting for a single invocation without setting
     // or unsetting the global env, which is useful in scripts. SEE: AD-RW-14.
     if env_vars_contain_passthrough(env_vars) {
-        return TableMatchResult {
-            rewrite: None,
-            pipe_excluded: false,
-        };
+        return None;
     }
 
     // Step 2: Strip cargo toolchain prefix (+nightly etc.)
@@ -196,12 +161,7 @@ pub(super) fn try_table_match_full(tokens: &[&str]) -> TableMatchResult {
 
         if skipped {
             // A more-specific rule was skipped by its flag — no rewrite.
-            // Report this rule's pipe exclusion flag so pipe-context callers
-            // know to suppress the rewrite even when no output is produced.
-            return TableMatchResult {
-                rewrite: None,
-                pipe_excluded: rule.exclude_pipe_source,
-            };
+            return None;
         }
 
         // Normal match — build rewrite output.
@@ -238,21 +198,14 @@ pub(super) fn try_table_match_full(tokens: &[&str]) -> TableMatchResult {
                 .collect()
         };
 
-        return TableMatchResult {
-            rewrite: Some(RewriteResult {
-                tokens: output,
-                category: rule.category,
-            }),
-            pipe_excluded: rule.exclude_pipe_source,
-        };
+        return Some(RewriteResult {
+            tokens: output,
+            category: rule.category,
+        });
     }
 
     // No rule matched — fall through to custom handlers for cat/head/tail.
-    let custom = try_custom_handlers(env_vars, command_tokens);
-    TableMatchResult {
-        rewrite: custom,
-        pipe_excluded: false,
-    }
+    try_custom_handlers(env_vars, command_tokens)
 }
 
 /// Skip global flags in a token slice to find the subcommand index.
@@ -718,76 +671,38 @@ mod tests {
     }
 
     // ========================================================================
-    // try_table_match_full: pipe_excluded + rewrite in single pass (AD-RW-2)
+    // Skipped-specific-rule suppression (preserved through the #317 collapse
+    // of try_table_match_full into try_rewrite)
     // ========================================================================
 
-    /// `grep --count` has no `-rn` or `-r` prefix, so it matches only the
-    /// catch-all `grep` rule which has `exclude_pipe_source: true`.
+    /// `grep -rn --count` matches the specific `grep -rn` rule, whose skip
+    /// flag (`--count`) fires → skipped=true. When the catch-all `grep` rule
+    /// is then reached, the skipped more-specific rule SUPPRESSES the rewrite:
+    /// "specific rule said no" stays authoritative over broader catch-alls.
     #[test]
-    fn test_table_match_full_grep_count_catch_all_pipe_excluded() {
-        let r = try_table_match_full(&["grep", "--count"]);
+    fn test_skipped_specific_rule_suppresses_catch_all() {
         assert!(
-            r.pipe_excluded,
-            "grep --count must be pipe-source-excluded via catch-all rule"
-        );
-    }
-
-    /// `grep -rn --count` matches the specific `grep -rn` rule, which fires
-    /// its skip flag (`--count`) → skipped=true, iteration continues.
-    /// The catch-all `grep` rule (`exclude_pipe_source: true`) is then reached.
-    /// Verifies the asymmetry: rewrite returns None but pipe_excluded is true.
-    #[test]
-    fn test_table_match_full_grep_rn_count_falls_through_to_catch_all() {
-        let r = try_table_match_full(&["grep", "-rn", "--count"]);
-        assert!(
-            r.pipe_excluded,
-            "grep -rn --count must be pipe-source-excluded: skip flag fires on specific rule, \
-             falls through to catch-all grep rule"
-        );
-        assert!(
-            r.rewrite.is_none(),
-            "grep -rn --count must not rewrite (skip flag hit)"
+            try_rewrite(&["grep", "-rn", "--count"]).is_none(),
+            "grep -rn --count must not rewrite (skip flag on specific rule \
+             suppresses the later catch-all)"
         );
     }
 
     /// `grep -rn pattern` has no skip flag → specific rule fires normally.
-    /// `exclude_pipe_source` is `false` on the specific grep -rn rule.
     #[test]
-    fn test_table_match_full_grep_rn_no_skip_flag_not_pipe_excluded() {
-        let r = try_table_match_full(&["grep", "-rn", "pattern"]);
+    fn test_grep_rn_no_skip_flag_rewrites() {
         assert!(
-            !r.pipe_excluded,
-            "grep -rn without a skip flag has exclude_pipe_source=false on the specific rule"
-        );
-        assert!(
-            r.rewrite.is_some(),
+            try_rewrite(&["grep", "-rn", "pattern"]).is_some(),
             "grep -rn pattern must produce a rewrite"
         );
     }
 
-    /// `ls` has `exclude_pipe_source: true` and produces a rewrite.
-    /// Verifies the case where both pipe_excluded and rewrite are set.
+    /// `grep --count` matches only the catch-all `grep` rule (no skip flag on
+    /// the catch-all) → a rewrite IS produced.
     #[test]
-    fn test_table_match_full_pipe_excluded_with_rewrite() {
-        let r = try_table_match_full(&["ls"]);
+    fn test_catch_all_grep_count_rewrites() {
         assert!(
-            r.pipe_excluded,
-            "ls must be pipe-source-excluded (catch-all rule)"
-        );
-        assert!(r.rewrite.is_some(), "ls must produce a rewrite result");
-    }
-
-    /// `grep --count` skips the specific rules → no rewrite, but pipe_excluded
-    /// is propagated from the catch-all rule (skip-then-catch-all path).
-    #[test]
-    fn test_table_match_full_skip_then_catch_all_pipe_excluded() {
-        // Same as grep_rn_count but using the catch-all directly.
-        let r = try_table_match_full(&["grep", "--count"]);
-        assert!(r.pipe_excluded, "catch-all grep must report pipe_excluded");
-        // The catch-all rule itself does not skip (no skip flags match),
-        // so a rewrite IS produced.
-        assert!(
-            r.rewrite.is_some(),
+            try_rewrite(&["grep", "--count"]).is_some(),
             "catch-all grep --count should produce a rewrite (no skip flag on catch-all)"
         );
     }

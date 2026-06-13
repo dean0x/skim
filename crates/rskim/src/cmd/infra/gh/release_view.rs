@@ -185,10 +185,10 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
             });
         }
 
-        if total > MAX_RELEASE_ASSETS {
+        if let Some(marker) = crate::output::elision_marker(shown, total, "assets") {
             items.push(InfraItem {
                 label: "assets".to_string(),
-                value: format!("… {} more assets", total - MAX_RELEASE_ASSETS),
+                value: marker,
             });
         }
     }
@@ -294,10 +294,9 @@ fn truncate_body_outside_fences(body: &str, max_lines: usize) -> String {
     }
 
     let truncated = lines[..cut_at].join("\n");
-    if cut_at < lines.len() {
-        format!("{truncated}\n… {} lines truncated", lines.len() - cut_at)
-    } else {
-        truncated
+    match crate::output::elision_marker(cut_at, lines.len(), "body lines") {
+        Some(marker) => format!("{truncated}\n{marker}"),
+        None => truncated,
     }
 }
 
@@ -390,8 +389,21 @@ mod tests {
         let result = parse_impl(&output);
         match result {
             crate::output::ParseResult::Full(r) => {
-                let more = r.items.iter().find(|i| i.value.contains("more assets"));
-                assert!(more.is_some(), "should have 'more assets' line");
+                let marker = r
+                    .items
+                    .iter()
+                    .find(|i| i.label == "assets" && i.value.contains("omitted"))
+                    .expect("should have a loud assets elision marker");
+                assert!(
+                    marker.value.contains("5 assets omitted (20 of 25 shown)"),
+                    "marker must state exact counts: {}",
+                    marker.value
+                );
+                assert!(
+                    marker.value.contains("SKIM_PASSTHROUGH=1"),
+                    "{}",
+                    marker.value
+                );
             }
             other => panic!("Expected Full, got: {other:?}"),
         }
@@ -409,7 +421,11 @@ mod tests {
         let line_count = result.lines().count();
         // Should have ~200 lines + truncation marker.
         assert!(line_count <= 202, "truncated: {line_count} lines");
-        assert!(result.contains("truncated"));
+        assert!(
+            result.contains("100 body lines omitted (200 of 300 shown)"),
+            "marker must state exact counts: {result:.400}"
+        );
+        assert!(result.contains("SKIM_PASSTHROUGH=1"));
     }
 
     #[test]

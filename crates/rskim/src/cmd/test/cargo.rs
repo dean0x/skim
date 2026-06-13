@@ -14,21 +14,21 @@
 //! which we parse via tier 2. The JSON tier exists for piped nightly output and future
 //! compatibility when libtest stabilizes the JSON format.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
 use crate::cmd::{
-    OutputFormat, ParsedCommandConfig, inject_flag_before_separator, run_parsed_command_with_mode,
+    OutputFormat, ParsedCommandConfig, inject_flag_before_separator, run_parsed_command_with_exit,
     should_read_stdin, user_has_flag,
 };
 use crate::output::ParseResult;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::runner::CommandOutput;
 
-use super::shared::{TestKind, scrape_failures};
+use super::shared::{TestKind, failure_context_body, scrape_failures};
 
 // Static regex patterns compiled once via LazyLock (avoids per-call compilation).
 static RE_PASSED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+passed").unwrap());
@@ -37,6 +37,12 @@ static RE_SKIPPED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+skipp
 static RE_CARGO_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"test result: \w+\.\s+(\d+)\s+passed;\s+(\d+)\s+failed;\s+(\d+)\s+ignored").unwrap()
 });
+
+/// Header of a libtest failure-output block on stable toolchains:
+/// `---- module::test_name stdout ----`. Lazy `.+?` because doctest names
+/// contain spaces (e.g. `src/lib.rs - module (line 10)`).
+static RE_FAILURE_BLOCK_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^---- (.+?) (?:stdout|stderr) ----$").expect("valid regex"));
 
 /// Run `skim cargo test [args...]`.
 ///
@@ -67,7 +73,7 @@ pub(crate) fn run(
     // test parsers: stdin must be piped AND no user args provided.
     let use_stdin = should_read_stdin(args);
 
-    run_parsed_command_with_mode(
+    run_parsed_command_with_exit(
         ParsedCommandConfig {
             program: "cargo",
             args: &cmd_args,
@@ -79,8 +85,18 @@ pub(crate) fn run(
             family: "test",
             skip_ansi_strip: false,
             rec,
+            // 101 = libtest's exit code for test failures (also compile
+            // errors, which fall through to the verbatim-combined tiers).
+            expected_exit_codes: &[101],
+            forward_stderr: false,
         },
         move |output| parse_impl(output, is_nextest),
+        // Stdin fabricates exit 0 (#317 Addendum 2): derive a failure exit
+        // from the parsed summary so piped failing runs do not exit 0.
+        |result| match result {
+            ParseResult::Full(r) | ParseResult::Degraded(r, _) if r.summary.fail > 0 => Some(1),
+            _ => None,
+        },
     )
 }
 
@@ -415,6 +431,7 @@ fn parse_nextest_summary(line: &str) -> Option<(usize, usize, usize, Option<u64>
     // Extract duration from brackets
     if let Some(start) = line.find('[')
         && let Some(end) = line.find(']')
+        && start < end
     {
         let dur_str = line[start + 1..end].trim();
         if let Some(secs_str) = dur_str.strip_suffix('s')
@@ -455,14 +472,67 @@ fn parse_nextest_summary(line: &str) -> Option<(usize, usize, usize, Option<u64>
 // Tier 2: regex fallback
 // ============================================================================
 
+/// Extract per-test failure output from stable-toolchain libtest text (#317).
+///
+/// Stable `cargo test` prints each failing test's captured output as:
+///
+/// ```text
+/// ---- module::test_name stdout ----
+/// thread 'module::test_name' panicked at src/lib.rs:5:9:
+/// assertion failed: …
+/// ```
+///
+/// A block ends at the next block header, a bare `failures:` recap line, or a
+/// `test result:` summary line. The ENTIRE block is kept — the
+/// `panicked at <file:line:col>` diagnostic always survives.
+fn parse_failure_details(text: &str) -> HashMap<String, String> {
+    let mut details: HashMap<String, String> = HashMap::new();
+    let mut current: Option<(String, Vec<&str>)> = None;
+
+    let mut flush = |cur: &mut Option<(String, Vec<&str>)>| {
+        if let Some((name, lines)) = cur.take() {
+            let body = lines.join("\n").trim().to_string();
+            if !body.is_empty() {
+                // First block wins; a later stderr block appends.
+                details
+                    .entry(name)
+                    .and_modify(|d| {
+                        d.push('\n');
+                        d.push_str(&body);
+                    })
+                    .or_insert(body);
+            }
+        }
+    };
+
+    for line in text.lines() {
+        if let Some(caps) = RE_FAILURE_BLOCK_HEADER.captures(line) {
+            flush(&mut current);
+            current = Some((caps[1].to_string(), Vec::new()));
+            continue;
+        }
+        if line.trim_end() == "failures:" || line.starts_with("test result:") {
+            flush(&mut current);
+            continue;
+        }
+        if let Some((_, lines)) = current.as_mut() {
+            lines.push(line);
+        }
+    }
+    flush(&mut current);
+
+    details
+}
+
 /// Attempt to parse standard cargo test summary lines using regex.
 ///
 /// Cargo runs multiple test binaries, each producing its own summary line:
 /// `test result: ok. N passed; N failed; N ignored`
 ///
 /// This function finds ALL such lines and aggregates the totals. When failures
-/// are present, individual test names are scraped via [`scrape_failures`] so
-/// LLMs receive a list of failing tests (AD-Commit2, 2026-04-11).
+/// are present, individual test names are scraped via [`scrape_failures`] and
+/// each entry's `detail` is filled from its `---- name stdout ----` block so
+/// panic messages survive compression on stable toolchains (#317).
 fn try_parse_regex(text: &str) -> Option<TestResult> {
     let mut total_passed: usize = 0;
     let mut total_failed: usize = 0;
@@ -487,15 +557,29 @@ fn try_parse_regex(text: &str) -> Option<TestResult> {
         duration_ms: None,
     };
 
-    // Scrape failing test names from the full text output so the Tier-2 result
-    // includes individual test names rather than an empty entries list.
-    let entries = if total_failed > 0 {
-        scrape_failures(text, TestKind::Cargo)
+    if total_failed == 0 {
+        return Some(TestResult::new(summary, vec![]));
+    }
+
+    // Scrape failing test names, then attach each test's captured output block.
+    let mut entries = scrape_failures(text, TestKind::Cargo);
+    let mut details = parse_failure_details(text);
+    for entry in &mut entries {
+        if entry.detail.is_none() {
+            entry.detail = details.remove(&entry.name);
+        }
+    }
+
+    // Safety net: when block parsing produced no per-test details, attach the
+    // raw failure section as context so the diagnostic is never dropped.
+    // (Skipped when details exist — avoids printing the same panic twice.)
+    let context = if entries.iter().all(|e| e.detail.is_none()) {
+        failure_context_body(text)
     } else {
-        vec![]
+        None
     };
 
-    Some(TestResult::new(summary, entries))
+    Some(TestResult::with_context(summary, entries, context))
 }
 
 // ============================================================================
@@ -711,6 +795,23 @@ this line is stderr, not captured in stdout detail
     // ========================================================================
 
     #[test]
+    fn test_parse_nextest_summary_reversed_brackets_no_panic() {
+        // Garbled summary line with ] before [ must degrade gracefully (returns
+        // None for duration, but still parses count fields if present) rather
+        // than panicking on a reversed slice range. Guards the start < end check
+        // added in REL-1.
+        let garbled = "Summary ] x [ 3 tests run: 2 passed, 1 failed, 0 skipped";
+        // Must not panic — any return value is acceptable as long as we stay alive.
+        let result = parse_nextest_summary(garbled);
+        // The count regexes still match, so the summary is Some; duration is None.
+        if let Some((passed, failed, skipped, duration)) = result {
+            assert_eq!(duration, None, "reversed brackets must produce no duration");
+            let _ = (passed, failed, skipped); // counts are tolerated as-is
+        }
+        // If it returns None that's also fine — the key assertion is no panic.
+    }
+
+    #[test]
     fn test_tier2_regex_fallback() {
         let text = "running 10 tests\ntest result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
         let result = try_parse_regex(text);
@@ -847,6 +948,169 @@ this line is stderr, not captured in stdout detail
             result.entries.iter().any(|e| e.name.contains("test_foo")),
             "must contain test_foo: {:?}",
             result.entries
+        );
+    }
+
+    // ========================================================================
+    // Tier-2 failure-detail capture (#317 — stable toolchain panic loss)
+    // ========================================================================
+
+    #[test]
+    fn test_parse_failure_details_extracts_block() {
+        let input = load_fixture("test", "cargo_panic_char_boundary.txt");
+        let details = parse_failure_details(&input);
+        let block = details
+            .get("output::tests::test_truncate_single_line_char_boundary")
+            .expect("failure block must be keyed by test name");
+        assert!(
+            block.contains("panicked at crates/rskim/src/output/mod.rs:381:23"),
+            "panic location must survive: {block}"
+        );
+        assert!(
+            block.contains("byte index 5 is not a char boundary"),
+            "panic message must survive: {block}"
+        );
+    }
+
+    #[test]
+    fn test_parse_failure_details_doctest_name_with_spaces() {
+        // Doctest names contain spaces — the `.+?` in the header regex.
+        let input = "\
+---- src/lib.rs - module::func (line 42) stdout ----
+thread 'main' panicked at src/lib.rs:44:5:
+doctest assertion failed
+
+failures:
+    src/lib.rs - module::func (line 42)
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+";
+        let details = parse_failure_details(input);
+        let block = details
+            .get("src/lib.rs - module::func (line 42)")
+            .expect("doctest block must parse");
+        assert!(block.contains("doctest assertion failed"), "{block}");
+    }
+
+    #[test]
+    fn test_parse_failure_details_two_blocks_appended() {
+        // A test emitting both stdout and stderr blocks: the second block's body
+        // must be appended to the first under the same test-name key (and_modify
+        // branch in parse_failure_details).
+        let input = "\
+---- module::test_append stdout ----
+thread 'module::test_append' panicked at src/lib.rs:10:5:
+stdout content here
+
+---- module::test_append stderr ----
+stderr content here
+
+failures:
+    module::test_append
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+";
+        let details = parse_failure_details(input);
+        let block = details
+            .get("module::test_append")
+            .expect("block must be keyed by test name");
+        assert!(
+            block.contains("stdout content here"),
+            "stdout body must be present: {block}"
+        );
+        assert!(
+            block.contains("stderr content here"),
+            "stderr body must be appended: {block}"
+        );
+    }
+
+    #[test]
+    fn test_parse_failure_details_multi_failure_transcript() {
+        // Multiple distinct failing tests: each gets its own entry in the map.
+        let input = "\
+---- crate::tests::test_one stdout ----
+panic in test_one
+
+---- crate::tests::test_two stdout ----
+panic in test_two
+
+failures:
+    crate::tests::test_one
+    crate::tests::test_two
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out
+";
+        let details = parse_failure_details(input);
+        assert_eq!(details.len(), 2, "must have one entry per failing test");
+        assert!(
+            details
+                .get("crate::tests::test_one")
+                .is_some_and(|b| b.contains("panic in test_one")),
+            "test_one detail must be populated"
+        );
+        assert!(
+            details
+                .get("crate::tests::test_two")
+                .is_some_and(|b| b.contains("panic in test_two")),
+            "test_two detail must be populated"
+        );
+    }
+
+    #[test]
+    fn test_tier2_panic_line_survives_rendering() {
+        // The exact Addendum-2 repro: stable cargo test output piped through
+        // the Tier-2 regex path must keep the panic diagnostic in the render.
+        let input = load_fixture("test", "cargo_panic_char_boundary.txt");
+        let result = try_parse_regex(&input).expect("Tier-2 parse must succeed");
+        assert_eq!(result.summary.fail, 1);
+        let rendered = format!("{result}");
+        assert!(
+            rendered.contains("panicked at"),
+            "panic line must be visible in compressed output: {rendered}"
+        );
+        assert!(
+            rendered.contains("char boundary"),
+            "panic message must be visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_tier2_context_safety_net_when_no_blocks() {
+        // Failures present but no `---- name stdout ----` blocks: the raw
+        // failure section is attached as context instead of being dropped.
+        let input = "\
+running 2 tests
+test a::t1 ... ok
+test a::t2 ... FAILED
+
+error: something went wrong without a capture block
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+";
+        let result = try_parse_regex(input).expect("Tier-2 parse must succeed");
+        assert!(result.context.is_some(), "context safety net must engage");
+        let rendered = format!("{result}");
+        assert!(
+            rendered.contains("--- failure context ---"),
+            "context banner must render: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_tier2_no_double_print_when_details_exist() {
+        let input = load_fixture("test", "cargo_panic_char_boundary.txt");
+        let result = try_parse_regex(&input).expect("Tier-2 parse must succeed");
+        assert!(
+            result.context.is_none(),
+            "context must be skipped when per-test details parsed"
+        );
+        let rendered = format!("{result}");
+        assert_eq!(
+            rendered
+                .matches("byte index 5 is not a char boundary")
+                .count(),
+            1,
+            "panic must appear exactly once: {rendered}"
         );
     }
 

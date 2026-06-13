@@ -36,10 +36,10 @@ use std::process::ExitCode;
 
 use acknowledge::is_segment_ack;
 use compound::{
-    has_pipe_operator, reconstruct_pipe_parts, splice_redirects_back, split_compound,
+    has_pipe_operator, rewrite_would_corrupt, splice_redirects_back, split_compound,
     try_rewrite_compound,
 };
-use engine::{try_rewrite, try_table_match_full};
+use engine::try_rewrite;
 use hook::{parse_agent_flag, run_hook_mode};
 use suggest::{print_help, print_suggest};
 use types::{CommandSegment, CompoundOp, CompoundSplitResult, RewriteCategory, RewriteResult};
@@ -79,6 +79,13 @@ pub(crate) enum CommandClassification {
 pub(crate) fn classify_command(command: &str) -> CommandClassification {
     let command = command.trim();
     if command.is_empty() || command.starts_with("skim ") {
+        return CommandClassification::Unhandled;
+    }
+
+    // Round-trip safety (#317): syntax the pipeline cannot reconstruct
+    // byte-faithfully (newlines, heredocs, substitutions, unmatched quotes,
+    // lossy whitespace) is never rewritten.
+    if rewrite_would_corrupt(command) {
         return CommandClassification::Unhandled;
     }
 
@@ -282,38 +289,20 @@ fn classify_compound(segments: &[CommandSegment]) -> CommandClassification {
 
 /// Classify a pipe expression.
 ///
-/// Only the first segment (output producer) is considered for rewriting.
-/// If the first segment is `AlreadyCompact`, the whole pipe is `AlreadyCompact`.
-/// If the first segment is `NoMatch` (or unclassified), the whole pipe is `Unhandled`.
+/// Pipes are NEVER rewritten (#317, user-approved): compressing the producer
+/// silently changes what downstream consumers (`grep`, `wc`, `head`) see.
+/// The first segment is only inspected to distinguish "already optimal"
+/// (`AlreadyCompact`) from a genuine compression gap (`Unhandled`).
 fn classify_compound_pipe(segments: &[CommandSegment]) -> CommandClassification {
-    if segments.is_empty() {
+    let Some(first) = segments.first() else {
         return CommandClassification::Unhandled;
-    }
+    };
 
-    let first = &segments[0];
     let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
-
-    // Do not classify catch-all rules on the pipe-source side (e.g. `ls | wc -l`).
-    // Use try_table_match_full for a single-pass check: if pipe_excluded is set,
-    // the whole pipe expression is Unhandled regardless of rewrite result.
-    // Mirrors the same check in `try_rewrite_compound_pipe`.  SEE: AD-RW-2.
-    let full_result = try_table_match_full(&token_refs);
-    if full_result.pipe_excluded {
-        return CommandClassification::Unhandled;
-    }
-
-    let first_classification = classify_segment_fine(&token_refs);
-
-    match first_classification {
-        SegmentClassification::AlreadyCompact(_) => CommandClassification::AlreadyCompact,
-        SegmentClassification::NoMatch => CommandClassification::Unhandled,
-        SegmentClassification::Rewritten(mut rewritten_tokens) => {
-            // Splice redirects back for the first segment, then delegate to
-            // the shared pipe-reconstruction helper (Issue #2 / AD-RW-2).
-            splice_redirects_back(&mut rewritten_tokens, &first.stripped_redirects);
-            let reconstructed = reconstruct_pipe_parts(segments, rewritten_tokens);
-            CommandClassification::Rewritten(reconstructed)
-        }
+    if is_segment_ack(&token_refs) {
+        CommandClassification::AlreadyCompact
+    } else {
+        CommandClassification::Unhandled
     }
 }
 
@@ -472,6 +461,12 @@ pub(super) fn collect_input_tokens(
 /// fast-path below already uses it implicitly via `is_segment_ack`.
 fn run_classify_and_emit(suggest_mode: bool, tokens: &[String]) -> anyhow::Result<ExitCode> {
     let original = tokens.join(" ");
+
+    // Round-trip safety (#317): never emit a rewrite for syntax the pipeline
+    // cannot reconstruct byte-faithfully.
+    if rewrite_would_corrupt(&original) {
+        return emit_result(suggest_mode, &original, None, false);
+    }
 
     // Fast path: if no compound operator chars are present, use classify_command
     // which also handles the AlreadyCompact case (AD-RW-3).

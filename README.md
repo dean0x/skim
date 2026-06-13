@@ -60,6 +60,8 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - PreToolUse hook rewrites `cat`, `head`, `tail`, `cargo test`, `vitest`, `git diff` into skim equivalents
 - Two-layer rule system with declarative prefix-swap and custom argument handlers
 - One command installs the hook for automatic, invisible context savings
+- Round-trip safe: commands with pipes, newlines, heredocs, or command substitution are never rewritten
+- Known limitation: PATH wrappers (`skim init --wrappers`) intercept each pipeline segment independently, so a piped consumer sees compressed producer output — use `SKIM_PASSTHROUGH=1` on pipelines (tracked in #319)
 
 ### Test Output Compression
 - `skim cargo test`, `skim pytest`, `skim vitest`, `skim jest`, `skim go test`

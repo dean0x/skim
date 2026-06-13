@@ -6,9 +6,9 @@
 //! # Design Decision: Step detail depth for failed jobs
 //!
 //! When a job fails, agents need to see which specific step failed in order
-//! to diagnose CI failures without fetching full logs. We include up to
-//! [`MAX_STEP_DETAIL`] steps per failed job, filtered to only show non-passing
-//! steps. Successful jobs show only a one-line summary to minimize context.
+//! to diagnose CI failures without fetching full logs. We include EVERY
+//! non-passing step per failed job (#317 — failed steps are diagnostics).
+//! Successful jobs show only a one-line summary to minimize context.
 //!
 //! # AD-INFRA-15 (2026-04-11) — URL surfacing for failed jobs
 //!
@@ -22,8 +22,8 @@ use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
 use super::{
-    MAX_STEP_DETAIL, RE_GH_RUN_HEADER, RE_GH_RUN_JOB, RE_GH_VIEW_FIELD, inject_json_fields,
-    three_tier_parse, try_parse_json_object,
+    RE_GH_RUN_HEADER, RE_GH_RUN_JOB, RE_GH_VIEW_FIELD, inject_json_fields, three_tier_parse,
+    try_parse_json_object,
 };
 
 /// JSON fields to inject for `gh run view`.
@@ -89,7 +89,8 @@ fn extract_job_items(jobs: &[serde_json::Value], items: &mut Vec<InfraItem>) {
             value: job_value,
         });
 
-        // For failed jobs, show step details (up to MAX_STEP_DETAIL non-passing steps)
+        // For failed jobs, show EVERY non-passing step (#317): failed steps
+        // are diagnostics; filtering passing steps is the compression.
         if job_conclusion == "failure" || job_conclusion == "failed" {
             let steps = job
                 .get("steps")
@@ -97,11 +98,7 @@ fn extract_job_items(jobs: &[serde_json::Value], items: &mut Vec<InfraItem>) {
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
 
-            let mut shown = 0;
             for step in steps {
-                if shown >= MAX_STEP_DETAIL {
-                    break;
-                }
                 let step_name = step.get("name").and_then(|v| v.as_str()).unwrap_or("step");
                 let step_conclusion = step
                     .get("conclusion")
@@ -115,7 +112,6 @@ fn extract_job_items(jobs: &[serde_json::Value], items: &mut Vec<InfraItem>) {
                         label: format!("  step:{step_name}"),
                         value: step_conclusion,
                     });
-                    shown += 1;
                 }
             }
         }
@@ -125,7 +121,7 @@ fn extract_job_items(jobs: &[serde_json::Value], items: &mut Vec<InfraItem>) {
 /// Parse a `gh run view --json` object into an [`InfraResult`].
 ///
 /// Shows one item per job with status. For failed jobs, adds indented step
-/// details (up to [`MAX_STEP_DETAIL`]) showing only non-passing steps.
+/// details showing only non-passing steps.
 ///
 /// Accepts a pre-parsed JSON `Value` so this function can also be called
 /// from the auto-detect dispatcher (which uses `"jobs"` field as discriminator).

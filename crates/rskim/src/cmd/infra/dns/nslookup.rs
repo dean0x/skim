@@ -47,6 +47,8 @@ const CONFIG_DIG: ToolRunConfig<'static> = ToolRunConfig {
     // so RE_DIG_RECORD can no longer match. Skip stripping for dig and nslookup.
     skip_ansi_strip: true,
     command_type: CommandType::Infra,
+    expected_exit_codes: &[],
+    forward_stderr: false,
 };
 
 const CONFIG_NSLOOKUP: ToolRunConfig<'static> = ToolRunConfig {
@@ -58,6 +60,8 @@ const CONFIG_NSLOOKUP: ToolRunConfig<'static> = ToolRunConfig {
     // See CONFIG_DIG comment for the full rationale.
     skip_ansi_strip: true,
     command_type: CommandType::Infra,
+    expected_exit_codes: &[],
+    forward_stderr: false,
 };
 
 // ============================================================================

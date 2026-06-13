@@ -17,6 +17,8 @@ pub(super) fn run_ls(
         super::PkgSubcommandConfig {
             program: "npm",
             subcommand: "ls",
+            expected_exit_codes: &[1],
+            forward_stderr: false,
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install Node.js from https://nodejs.org",
         },
