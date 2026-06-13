@@ -42,7 +42,7 @@ static RE_CARGO_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
 /// `---- module::test_name stdout ----`. Lazy `.+?` because doctest names
 /// contain spaces (e.g. `src/lib.rs - module (line 10)`).
 static RE_FAILURE_BLOCK_HEADER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^---- (.+?) (?:stdout|stderr) ----$").unwrap());
+    LazyLock::new(|| Regex::new(r"^---- (.+?) (?:stdout|stderr) ----$").expect("valid regex"));
 
 /// Run `skim cargo test [args...]`.
 ///
@@ -431,6 +431,7 @@ fn parse_nextest_summary(line: &str) -> Option<(usize, usize, usize, Option<u64>
     // Extract duration from brackets
     if let Some(start) = line.find('[')
         && let Some(end) = line.find(']')
+        && start < end
     {
         let dur_str = line[start + 1..end].trim();
         if let Some(secs_str) = dur_str.strip_suffix('s')
@@ -794,6 +795,23 @@ this line is stderr, not captured in stdout detail
     // ========================================================================
 
     #[test]
+    fn test_parse_nextest_summary_reversed_brackets_no_panic() {
+        // Garbled summary line with ] before [ must degrade gracefully (returns
+        // None for duration, but still parses count fields if present) rather
+        // than panicking on a reversed slice range. Guards the start < end check
+        // added in REL-1.
+        let garbled = "Summary ] x [ 3 tests run: 2 passed, 1 failed, 0 skipped";
+        // Must not panic — any return value is acceptable as long as we stay alive.
+        let result = parse_nextest_summary(garbled);
+        // The count regexes still match, so the summary is Some; duration is None.
+        if let Some((passed, failed, skipped, duration)) = result {
+            assert_eq!(duration, None, "reversed brackets must produce no duration");
+            let _ = (passed, failed, skipped); // counts are tolerated as-is
+        }
+        // If it returns None that's also fine — the key assertion is no panic.
+    }
+
+    #[test]
     fn test_tier2_regex_fallback() {
         let text = "running 10 tests\ntest result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
         let result = try_parse_regex(text);
@@ -972,6 +990,70 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
             .get("src/lib.rs - module::func (line 42)")
             .expect("doctest block must parse");
         assert!(block.contains("doctest assertion failed"), "{block}");
+    }
+
+    #[test]
+    fn test_parse_failure_details_two_blocks_appended() {
+        // A test emitting both stdout and stderr blocks: the second block's body
+        // must be appended to the first under the same test-name key (and_modify
+        // branch in parse_failure_details).
+        let input = "\
+---- module::test_append stdout ----
+thread 'module::test_append' panicked at src/lib.rs:10:5:
+stdout content here
+
+---- module::test_append stderr ----
+stderr content here
+
+failures:
+    module::test_append
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+";
+        let details = parse_failure_details(input);
+        let block = details
+            .get("module::test_append")
+            .expect("block must be keyed by test name");
+        assert!(
+            block.contains("stdout content here"),
+            "stdout body must be present: {block}"
+        );
+        assert!(
+            block.contains("stderr content here"),
+            "stderr body must be appended: {block}"
+        );
+    }
+
+    #[test]
+    fn test_parse_failure_details_multi_failure_transcript() {
+        // Multiple distinct failing tests: each gets its own entry in the map.
+        let input = "\
+---- crate::tests::test_one stdout ----
+panic in test_one
+
+---- crate::tests::test_two stdout ----
+panic in test_two
+
+failures:
+    crate::tests::test_one
+    crate::tests::test_two
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out
+";
+        let details = parse_failure_details(input);
+        assert_eq!(details.len(), 2, "must have one entry per failing test");
+        assert!(
+            details
+                .get("crate::tests::test_one")
+                .map_or(false, |b| b.contains("panic in test_one")),
+            "test_one detail must be populated"
+        );
+        assert!(
+            details
+                .get("crate::tests::test_two")
+                .map_or(false, |b| b.contains("panic in test_two")),
+            "test_two detail must be populated"
+        );
     }
 
     #[test]
