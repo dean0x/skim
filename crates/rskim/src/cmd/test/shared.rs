@@ -515,7 +515,7 @@ pub(super) fn failure_context_body(raw_output: &str) -> Option<String> {
     let tail = last_n_lines(section, MAX_FAILURE_CONTEXT_LINES);
     let shown = FAILURE_CONTEXT_HEAD_LINES + MAX_FAILURE_CONTEXT_LINES;
     let marker = crate::output::elision_marker(shown, total, "lines")
-        .unwrap_or_else(|| "[skim] lines omitted".to_string());
+        .expect("elision: head+tail < total by construction (total > FAILURE_CONTEXT_WHOLE_THRESHOLD = 350, shown = 350)");
 
     Some(format!(
         "{}\n{}\n{}",
@@ -542,7 +542,7 @@ pub(super) fn emit_failure_context(raw_output: &str, exit_code: i32) {
         println!("\n--- failure context ---");
         println!("{body}");
     }
-    eprintln!("[skim] compressed output (exit {exit_code}). SKIM_PASSTHROUGH=1 for full output.");
+    eprintln!("{}", crate::output::compressed_output_hint(exit_code));
 }
 
 /// Return the last `n` lines of `text` as a `&str` slice.

@@ -29,6 +29,10 @@ fn skim_cmd() -> Command {
 ///
 /// The payloads are written to sidecar files and `cat`-ed by the script, so no
 /// shell escaping of the content is needed.
+///
+/// Unix-only: the script uses `#!/bin/sh` and the executable bit requires
+/// `std::os::unix::fs::PermissionsExt`.
+#[cfg(unix)]
 fn make_stub(dir: &Path, name: &str, stdout: &str, stderr: &str, code: i32) {
     let out_path = dir.join(format!("{name}.out"));
     let err_path = dir.join(format!("{name}.err"));
@@ -49,6 +53,9 @@ fn make_stub(dir: &Path, name: &str, stdout: &str, stderr: &str, code: i32) {
 }
 
 /// PATH with the stub dir prepended so skim's spawned child resolves to it.
+///
+/// Unix-only: uses `:` as the PATH separator.
+#[cfg(unix)]
 fn stub_path(dir: &Path) -> String {
     format!(
         "{}:{}",
@@ -120,6 +127,7 @@ fn test_grep_single_file_attributed_and_complete() {
 // Unexpected failure on an infra tool — raw stdout+stderr, child exit code
 // ============================================================================
 
+#[cfg(unix)]
 #[test]
 fn test_kubectl_unexpected_failure_raw_forwards_everything() {
     let dir = tempfile::tempdir().unwrap();
@@ -151,6 +159,7 @@ fn test_kubectl_unexpected_failure_raw_forwards_everything() {
 // forward_stderr: db tool success with warnings — stderr surfaces
 // ============================================================================
 
+#[cfg(unix)]
 #[test]
 fn test_psql_success_with_stderr_warning_forwarded() {
     let dir = tempfile::tempdir().unwrap();
@@ -176,6 +185,7 @@ fn test_psql_success_with_stderr_warning_forwarded() {
 // Expected failure with Full tier — escape-hatch notice still fires
 // ============================================================================
 
+#[cfg(unix)]
 #[test]
 fn test_eslint_expected_failure_full_tier_keeps_notice() {
     let dir = tempfile::tempdir().unwrap();
@@ -203,6 +213,7 @@ fn test_eslint_expected_failure_full_tier_keeps_notice() {
 // Signal-kill classification sanity: unexpected exit code ≠ in expected list
 // ============================================================================
 
+#[cfg(unix)]
 #[test]
 fn test_lint_unexpected_exit_code_goes_raw() {
     // eslint expects exit 1; exit 2 (config error) must raw-forward.

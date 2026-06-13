@@ -269,7 +269,7 @@ fn record_and_report(report: RecordReport<'_>) {
     // - tier Passthrough → silent: the body is already verbatim, so any notice
     //   would be noise the raw tool does not emit (grep's no-match silence).
     if code != 0 && tier_name != "passthrough" {
-        eprintln!("[skim] compressed output (exit {code}). SKIM_PASSTHROUGH=1 for full output.");
+        eprintln!("{}", crate::output::compressed_output_hint(code));
     }
 
     if show_stats {

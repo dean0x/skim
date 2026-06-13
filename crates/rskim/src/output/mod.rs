@@ -428,6 +428,16 @@ pub(crate) fn elision_marker_unbounded(shown_desc: &str, unit: &str) -> String {
     format!("[skim] {unit} elided beyond {shown_desc} — SKIM_PASSTHROUGH=1 for full output")
 }
 
+/// Canonical compressed-output hint emitted to stderr after a non-zero exit
+/// that skim has compressed (expected failure path).
+///
+/// Used by [`crate::cmd::test::shared::emit_failure_context`] and the notice
+/// matrix in [`crate::cmd::execution::record_and_report`] to keep the hint
+/// string byte-identical across both paths — single source of truth (#317).
+pub(crate) fn compressed_output_hint(code: i32) -> String {
+    format!("[skim] compressed output (exit {code}). SKIM_PASSTHROUGH=1 for full output.")
+}
+
 // ============================================================================
 // FilterTransparencyHeader
 // ============================================================================

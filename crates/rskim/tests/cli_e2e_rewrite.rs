@@ -736,7 +736,7 @@ fn test_passthrough_direct_vitest_no_json_injection() {
 
     // Passthrough forwards the raw input unchanged.
     let stdout = String::from_utf8(output.stdout).unwrap();
-    // Raw text must contain source markers from the fixture.
+    // Raw text must contain the words from the inline plain_text string.
     assert!(
         stdout.contains("Tests") && stdout.contains("passed"),
         "passthrough must forward the raw input, got: {stdout}"
@@ -2664,6 +2664,9 @@ fn test_hook_rewritten_cat_with_session_id_executes() {
     );
 
     // Execute the emitted tokens through the actual skim binary.
+    // NOTE: split_whitespace is used for simplicity and relies on TempDir
+    // producing a space-free path (standard on Linux/macOS /tmp). If the
+    // temp dir ever introduces spaces, switch to a proper shell-word splitter.
     let tokens: Vec<&str> = rewritten.split_whitespace().collect();
     assert_eq!(tokens[0], "skim");
     skim_cmd()
