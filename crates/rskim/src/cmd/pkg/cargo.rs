@@ -76,6 +76,7 @@ fn run_audit(
             program: "cargo",
             subcommand: "audit",
             expected_exit_codes: &[1],
+            forward_stderr: false,
             env_overrides: &[("CARGO_TERM_COLOR", "never")],
             install_hint: "Install cargo-audit via: cargo install cargo-audit",
         },

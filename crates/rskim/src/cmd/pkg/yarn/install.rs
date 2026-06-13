@@ -33,6 +33,7 @@ pub(super) fn run_install(
             program: "yarn",
             subcommand: "install",
             expected_exit_codes: &[1],
+            forward_stderr: false,
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install Yarn: npm install -g yarn",
         },

@@ -34,6 +34,7 @@ pub(super) fn run_audit(
             program: "yarn",
             subcommand: "audit",
             expected_exit_codes: YARN_AUDIT_EXIT_CODES,
+            forward_stderr: false,
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install Yarn: npm install -g yarn",
         },
