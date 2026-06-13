@@ -38,6 +38,8 @@ use super::types::{
 ///   inside quoted arguments)
 /// - a recognized redirect followed by an unrecognized `>`-bearing token
 ///   (see [`redirect_order_hazard`])
+/// - a recognized redirect token sitting inside quoted text (see
+///   [`quoted_redirect_hazard`])
 pub(super) fn rewrite_would_corrupt(cmd: &str) -> bool {
     if cmd.contains('\n')
         || cmd.contains('`')
@@ -53,9 +55,88 @@ pub(super) fn rewrite_would_corrupt(cmd: &str) -> bool {
     if redirect_order_hazard(cmd) {
         return true;
     }
+    if quoted_redirect_hazard(cmd) {
+        return true;
+    }
     // Whitespace round-trip guard: tokenization must be lossless.
     let rejoined = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
     rejoined != cmd.trim()
+}
+
+/// Return `true` when a recognized redirect token (`2>&1`, `>/dev/null`, …)
+/// sits *inside quoted text* as a bare, whitespace-delimited token.
+///
+/// The compound rewriter tokenises each segment with `split_whitespace`, which
+/// is quote-blind, so a quoted argument like `"msg 2>&1 here"` yields a bare
+/// `2>&1` token. [`strip_segment_redirects`] then strips it and
+/// [`splice_redirects_back`] re-appends it at segment end — silently deleting
+/// text from the quoted argument AND injecting a real fd redirect the user
+/// never wrote: `git commit -m "msg 2>&1 here" && true` would become
+/// `skim git commit -m "msg here" 2>&1 && true`. Bail instead (#317:
+/// byte-faithful or bail).
+///
+/// A redirect glued to its quote (`"2>&1`, no inner space) keeps the quote in
+/// its token, so it is not recognized by [`is_single_redirect`] and never
+/// stripped — those inputs correctly do not trip this guard. Deliberately
+/// coarse: a lone `2>` token, or a quoted redirect in a non-compound command,
+/// over-bails, which only costs a missed optimization.
+fn quoted_redirect_hazard(cmd: &str) -> bool {
+    let mut quote_state = QuoteState::None;
+    let mut token = String::new();
+    let mut token_in_quote = false;
+    let mut chars = cmd.chars();
+
+    let is_hazard = |tok: &str| is_single_redirect(tok) || tok == "2>";
+
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            // Token boundary (matches split_whitespace). Whitespace inside a
+            // quote does not change quote_state, but it still splits tokens.
+            if token_in_quote && is_hazard(&token) {
+                return true;
+            }
+            token.clear();
+            token_in_quote = false;
+            continue;
+        }
+
+        // Non-whitespace char belongs to the current token. Flag the token when
+        // we are already inside a quote as the char is consumed.
+        if quote_state != QuoteState::None {
+            token_in_quote = true;
+        }
+
+        match quote_state {
+            QuoteState::SingleQuote => {
+                if ch == '\'' {
+                    quote_state = QuoteState::None;
+                }
+            }
+            QuoteState::DoubleQuote => {
+                if ch == '\\' {
+                    // Escaped char stays part of the token; consume it verbatim.
+                    token.push(ch);
+                    if let Some(next) = chars.next() {
+                        token.push(next);
+                    }
+                    continue;
+                } else if ch == '"' {
+                    quote_state = QuoteState::None;
+                }
+            }
+            QuoteState::None => {
+                if ch == '\'' {
+                    quote_state = QuoteState::SingleQuote;
+                } else if ch == '"' {
+                    quote_state = QuoteState::DoubleQuote;
+                }
+            }
+        }
+        token.push(ch);
+    }
+
+    // Trailing token (no terminating whitespace).
+    token_in_quote && is_hazard(&token)
 }
 
 /// Return `true` when a recognized redirect token is followed anywhere by an
@@ -564,6 +645,60 @@ mod tests {
         assert!(!rewrite_would_corrupt("cargo test 2>&1 && cargo build"));
         assert!(!rewrite_would_corrupt("cargo test >log.txt 2>&1"));
         assert!(!rewrite_would_corrupt("cargo test 2>&1 >/dev/null"));
+    }
+
+    /// #322: a recognized redirect token sitting *inside* quoted text becomes a
+    /// bare `2>&1` token after `split_whitespace`. The compound rewriter would
+    /// strip it from the quoted argument and splice a real fd redirect onto the
+    /// segment — corrupting the quoted prose AND changing fd routing. Must bail.
+    #[test]
+    fn test_corrupt_guard_quoted_redirect_bails() {
+        assert!(rewrite_would_corrupt(
+            "git commit -m \"msg 2>&1 here\" && true"
+        ));
+        assert!(rewrite_would_corrupt("echo \"log >/dev/null marker\" ; ls"));
+        assert!(rewrite_would_corrupt(
+            "printf \"a 2>/dev/null b\" && cargo test"
+        ));
+        // Single-quoted text trips the guard too.
+        assert!(rewrite_would_corrupt(
+            "git commit -m 'note &>/dev/null end' && true"
+        ));
+        // Over-bails even without a compound operator (safe — missed opt only).
+        assert!(rewrite_would_corrupt("git commit -m \"msg 2>&1 here\""));
+    }
+
+    /// #322: a redirect glued to its quote (`"2>&1`, no inner space) keeps the
+    /// quote in its token, so strip never recognizes it — those inputs must NOT
+    /// over-bail. Real redirects outside quotes also keep rewriting.
+    #[test]
+    fn test_corrupt_guard_quoted_redirect_false_positives_pass() {
+        assert!(!rewrite_would_corrupt("grep \"2>&1\" file.txt"));
+        assert!(!rewrite_would_corrupt("grep \"2>&1 foo\" file.txt"));
+        assert!(!rewrite_would_corrupt(
+            "echo \"plain message\" && cargo test"
+        ));
+        assert!(!rewrite_would_corrupt("cargo test 2>&1 && cargo build"));
+    }
+
+    /// #322: pin the corruption itself — with the guard bypassed (split+rewrite
+    /// directly), the quoted `2>&1` is stripped from the argument and re-spliced
+    /// as a real redirect, proving the guard is load-bearing, not redundant.
+    #[test]
+    fn test_quoted_redirect_corruption_is_real_without_guard() {
+        match split_compound("cargo test \"x 2>&1 y\" && cargo build") {
+            CompoundSplitResult::Compound(segments) => {
+                let joined = try_rewrite_compound(&segments)
+                    .expect("rewrites without the guard")
+                    .tokens
+                    .join(" ");
+                assert!(
+                    !joined.contains("2>&1 y"),
+                    "documents the quoted-redirect corruption the guard prevents: {joined}"
+                );
+            }
+            other => panic!("Expected Compound, got {other:?}"),
+        }
     }
 
     /// Pin the reorder defect itself: with the guard bypassed (calling
