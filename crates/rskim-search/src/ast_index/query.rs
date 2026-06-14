@@ -13,10 +13,11 @@
 //!   introduced post-#284 already collapses O(postings) IDF lookups to
 //!   O(distinct-langs-in-run).  The mixed-language bench confirms no thrash.
 //!   Closed-by-#284-refactor; no `LANG_COUNT` constant introduced (ADR-003).
-//! - **P3 (capacity sizing)**: `run_ngram_set` collects ALL posting lists first,
-//!   measures the maximum list length, and sizes `scores`/`meta_cache` from
-//!   that instead of `file_count()`.  Solves both the over-allocation (broad
-//!   queries) and the empty-first-list under-sizing (AC7) cases.
+//! - **P3 (capacity sizing)**: `run_ngram_set` starts at `CAPACITY_FLOOR` and
+//!   calls `scores.reserve(n)` before processing each posting list of length
+//!   `n`, growing the map at most once per n-gram instead of pre-allocating
+//!   `file_count()`.  Solves both the over-allocation (broad queries) and the
+//!   empty-first-list under-sizing (AC7) cases.
 //! - **P4 (lang filter fold-in)**: `run_ngram_set` accepts an optional
 //!   `lang_filter`; when set, each posting is skipped before insertion if its
 //!   `lang_id` does not match, eliminating the second per-file `file_meta`
@@ -170,6 +171,12 @@ struct LiteMeta {
     node_count: u32,
 }
 
+impl From<(u8, u32)> for LiteMeta {
+    fn from((lang_id, node_count): (u8, u32)) -> Self {
+        Self { lang_id, node_count }
+    }
+}
+
 // Query engine
 /// AST structural pattern query engine. Immutable; `&self`-only; `Send + Sync`.
 ///
@@ -277,15 +284,9 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
 
         for entry in &bigrams {
             let postings = self.reader.lookup_bigram(entry.ngram)?;
-            // Reserve only new slots: total entries ≤ file_count, so clamp to
-            // avoid over-allocation when scores already contains overlapping docs.
-            let new_slots = postings.len().min(file_count).saturating_sub(scores.len());
-            if new_slots > 0 {
-                scores.reserve(new_slots);
-                if let Some(ref mut cache) = meta_cache {
-                    cache.reserve(new_slots);
-                }
-            }
+            // Reserve only new slots: clamped to file_count to avoid over-allocation
+            // when scores already contains overlapping docs (AC6/AC7, P3 #286).
+            reserve_for_postings(&postings, file_count, &mut scores, &mut meta_cache);
             score_postings(
                 &postings,
                 &mut scores,
@@ -300,13 +301,7 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
             let postings = self.reader.lookup_trigram(entry.ngram)?;
             // DEFERRED (Wave 4): minimal-covering-set to remove trigram/sub-bigram
             // double-counting (#198). For now, contributions are additive.
-            let new_slots = postings.len().min(file_count).saturating_sub(scores.len());
-            if new_slots > 0 {
-                scores.reserve(new_slots);
-                if let Some(ref mut cache) = meta_cache {
-                    cache.reserve(new_slots);
-                }
-            }
+            reserve_for_postings(&postings, file_count, &mut scores, &mut meta_cache);
             score_postings(
                 &postings,
                 &mut scores,
@@ -531,6 +526,27 @@ fn kind(seg: &str) -> Result<NodeKindId> {
 /// does not amplify or suppress the BM25 term-frequency contribution).
 const UNKNOWN_LANG_IDF: f64 = 1.0;
 
+/// Reserve capacity in `scores` and `meta_cache` before inserting a posting
+/// list of `postings.len()` entries.
+///
+/// Reserves only *new* slots: clamped to `file_count` (total distinct docs) and
+/// reduced by the current `scores.len()` so overlapping posting lists never
+/// over-allocate (AC6 broad, AC7 empty-first, P3 #286).
+fn reserve_for_postings(
+    postings: &[AstPosting],
+    file_count: usize,
+    scores: &mut FxHashMap<u32, f64>,
+    meta_cache: &mut Option<FxHashMap<u32, LiteMeta>>,
+) {
+    let new_slots = postings.len().min(file_count).saturating_sub(scores.len());
+    if new_slots > 0 {
+        scores.reserve(new_slots);
+        if let Some(cache) = meta_cache {
+            cache.reserve(new_slots);
+        }
+    }
+}
+
 // Scoring helpers
 
 /// Accumulate BM25 scores for one set of postings into `scores`.
@@ -568,13 +584,7 @@ fn score_postings<R: AstPostingSource>(
     for posting in postings {
         let lite = match meta_cache {
             Some(cache) => cached_lite_meta(reader, cache, posting.doc_id)?,
-            None => {
-                let (lang_id, node_count) = reader.file_lang_and_node_count(posting.doc_id)?;
-                LiteMeta {
-                    lang_id,
-                    node_count,
-                }
-            }
+            None => reader.file_lang_and_node_count(posting.doc_id)?.into(),
         };
 
         // Recover Language from the stored lang_id.
@@ -655,11 +665,7 @@ fn cached_lite_meta<R: AstPostingSource>(
     if let Some(e) = cache.get(&doc_id) {
         return Ok(*e);
     }
-    let (lang_id, node_count) = reader.file_lang_and_node_count(doc_id)?;
-    let lite = LiteMeta {
-        lang_id,
-        node_count,
-    };
+    let lite: LiteMeta = reader.file_lang_and_node_count(doc_id)?.into();
     cache.insert(doc_id, lite);
     Ok(lite)
 }

@@ -1737,57 +1737,41 @@ fn ac7_empty_first_ngram_large_second_returns_correct_results() {
     }
 }
 
-// ---- AC9: P4 lang filter narrows to strict non-empty subset (real reader) ---
+// ---- AC9–AC11 shared fixture: 4 Rust + 3 Python files on function_item>block -
 
-#[test]
-fn ac9_p4_lang_filter_narrows_to_strict_subset_real_reader() {
+/// Build a `function_item > block` index with 4 Rust files (ids 0–3) and 3
+/// Python files (ids 4–6).  The `TempDir` is returned alongside the engine so
+/// the caller keeps it alive for the duration of the test.
+fn build_mixed_lang_engine() -> (
+    tempfile::TempDir,
+    AstQueryEngine<crate::ast_index::AstIndexReader>,
+) {
+    use crate::ast_index::StructuralMetrics;
     let dir = tempfile::tempdir().unwrap();
     let fn_id = vocab_lookup("function_item").unwrap();
     let block_id = vocab_lookup("block").unwrap();
     let bigram = AstBigram::encode(fn_id, block_id);
+    let set = make_bigram_set(bigram, 1);
     let mut builder = crate::ast_index::AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
-    use crate::ast_index::StructuralMetrics;
-
     for i in 0..4u32 {
-        let set = AstNgramSet {
-            bigrams: vec![AstBigramEntry {
-                ngram: bigram,
-                weight: DEFAULT_AST_WEIGHT,
-                count: 1,
-            }],
-            trigrams: vec![],
-        };
         builder
-            .add_file_ngrams(
-                FileId(i),
-                Language::Rust,
-                &set,
-                100,
-                StructuralMetrics::default(),
-            )
+            .add_file_ngrams(FileId(i), Language::Rust, &set, 100, StructuralMetrics::default())
             .unwrap();
     }
     for i in 4..7u32 {
-        let set = AstNgramSet {
-            bigrams: vec![AstBigramEntry {
-                ngram: bigram,
-                weight: DEFAULT_AST_WEIGHT,
-                count: 1,
-            }],
-            trigrams: vec![],
-        };
         builder
-            .add_file_ngrams(
-                FileId(i),
-                Language::Python,
-                &set,
-                100,
-                StructuralMetrics::default(),
-            )
+            .add_file_ngrams(FileId(i), Language::Python, &set, 100, StructuralMetrics::default())
             .unwrap();
     }
-    let reader = builder.build().unwrap();
-    let engine = AstQueryEngine::new(reader);
+    let engine = AstQueryEngine::new(builder.build().unwrap());
+    (dir, engine)
+}
+
+// ---- AC9: P4 lang filter narrows to strict non-empty subset (real reader) ---
+
+#[test]
+fn ac9_p4_lang_filter_narrows_to_strict_subset_real_reader() {
+    let (_dir, engine) = build_mixed_lang_engine();
 
     let mut q_all = crate::types::SearchQuery::new("q");
     q_all.ast_pattern = Some("function_item > block".into());
@@ -1810,11 +1794,7 @@ fn ac9_p4_lang_filter_narrows_to_strict_subset_real_reader() {
     );
     assert_eq!(rust_only.len(), 4, "exactly 4 Rust files should match");
     for r in &rust_only {
-        assert!(
-            r.file_id.0 < 4,
-            "filtered result must be a Rust file: {}",
-            r.file_id
-        );
+        assert!(r.file_id.0 < 4, "filtered result must be a Rust file: {}", r.file_id);
     }
     let unfiltered_ids: std::collections::HashSet<FileId> =
         unfiltered.iter().map(|r| r.file_id).collect();
@@ -1825,61 +1805,13 @@ fn ac9_p4_lang_filter_narrows_to_strict_subset_real_reader() {
             r.file_id
         );
     }
-
-    drop(dir);
 }
 
 // ---- AC10: P4 lang=None path unchanged (avoids PF-006) ---------------------
 
 #[test]
 fn ac10_p4_lang_none_path_unchanged_real_reader() {
-    let dir = tempfile::tempdir().unwrap();
-    let fn_id = vocab_lookup("function_item").unwrap();
-    let block_id = vocab_lookup("block").unwrap();
-    let bigram = AstBigram::encode(fn_id, block_id);
-    let mut builder = crate::ast_index::AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
-    use crate::ast_index::StructuralMetrics;
-
-    for i in 0..4u32 {
-        let set = AstNgramSet {
-            bigrams: vec![AstBigramEntry {
-                ngram: bigram,
-                weight: DEFAULT_AST_WEIGHT,
-                count: 1,
-            }],
-            trigrams: vec![],
-        };
-        builder
-            .add_file_ngrams(
-                FileId(i),
-                Language::Rust,
-                &set,
-                100,
-                StructuralMetrics::default(),
-            )
-            .unwrap();
-    }
-    for i in 4..7u32 {
-        let set = AstNgramSet {
-            bigrams: vec![AstBigramEntry {
-                ngram: bigram,
-                weight: DEFAULT_AST_WEIGHT,
-                count: 1,
-            }],
-            trigrams: vec![],
-        };
-        builder
-            .add_file_ngrams(
-                FileId(i),
-                Language::Python,
-                &set,
-                100,
-                StructuralMetrics::default(),
-            )
-            .unwrap();
-    }
-    let reader = builder.build().unwrap();
-    let engine = AstQueryEngine::new(reader);
+    let (_dir, engine) = build_mixed_lang_engine();
 
     let mut q = crate::types::SearchQuery::new("q");
     q.ast_pattern = Some("function_item > block".into());
@@ -1893,61 +1825,13 @@ fn ac10_p4_lang_none_path_unchanged_real_reader() {
         assert_eq!(r1.file_id, r2.file_id, "FileId mismatch");
         assert_eq!(r1.score.to_bits(), r2.score.to_bits(), "score bits differ");
     }
-
-    drop(dir);
 }
 
 // ---- AC11: P4 filter-composition order (file_filter + lang + limit) ---------
 
 #[test]
 fn ac11_p4_filter_composition_with_file_filter_and_limit() {
-    let dir = tempfile::tempdir().unwrap();
-    let fn_id = vocab_lookup("function_item").unwrap();
-    let block_id = vocab_lookup("block").unwrap();
-    let bigram = AstBigram::encode(fn_id, block_id);
-    let mut builder = crate::ast_index::AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
-    use crate::ast_index::StructuralMetrics;
-
-    for i in 0..4u32 {
-        let set = AstNgramSet {
-            bigrams: vec![AstBigramEntry {
-                ngram: bigram,
-                weight: DEFAULT_AST_WEIGHT,
-                count: 1,
-            }],
-            trigrams: vec![],
-        };
-        builder
-            .add_file_ngrams(
-                FileId(i),
-                Language::Rust,
-                &set,
-                100,
-                StructuralMetrics::default(),
-            )
-            .unwrap();
-    }
-    for i in 4..7u32 {
-        let set = AstNgramSet {
-            bigrams: vec![AstBigramEntry {
-                ngram: bigram,
-                weight: DEFAULT_AST_WEIGHT,
-                count: 1,
-            }],
-            trigrams: vec![],
-        };
-        builder
-            .add_file_ngrams(
-                FileId(i),
-                Language::Python,
-                &set,
-                100,
-                StructuralMetrics::default(),
-            )
-            .unwrap();
-    }
-    let reader = builder.build().unwrap();
-    let engine = AstQueryEngine::new(reader);
+    let (_dir, engine) = build_mixed_lang_engine();
 
     // file_filter = {0, 1, 2, 4, 5}, lang = Rust, limit = 2.
     // Expected: Rust files in allowlist = {0, 1, 2}; limit=2 → top-2 by score
@@ -1974,8 +1858,6 @@ fn ac11_p4_filter_composition_with_file_filter_and_limit() {
             r.file_id
         );
     }
-
-    drop(dir);
 }
 
 // ---- AC12: P4 search_ast returns unfiltered results (lang param always None) -
