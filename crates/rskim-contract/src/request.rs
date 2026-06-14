@@ -91,7 +91,7 @@ pub struct Turn {
     ///
     /// The raw bytes can be extracted via `serde_json::to_vec` for re-emission.
     /// For hot-zone turns, the *original buffer splice* takes precedence over
-    /// re-serialization — see [`StructuralView::hot_zone_byte_range`].
+    /// re-serialization — see [`crate::zone::splice_hot_zone`].
     pub value: Value,
 }
 

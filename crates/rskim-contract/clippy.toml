@@ -18,4 +18,12 @@
 disallowed-methods = [
     { path = "std::time::SystemTime::now", reason = "non-deterministic — forbidden in L3 transform path (invariant 5)" },
     { path = "std::time::Instant::now", reason = "non-deterministic — forbidden in L3 transform path (invariant 5)" },
+    # rand / getrandom entry points (AC10 — "rand/getrandom entry points" denied at minimum).
+    # These are listed unconditionally: clippy's disallowed-methods does not require the
+    # crate to depend on the path, so the gate denies the call the moment it is introduced.
+    { path = "rand::random", reason = "non-deterministic entropy — forbidden in L3 transform path (invariant 5)" },
+    { path = "rand::thread_rng", reason = "non-deterministic entropy — forbidden in L3 transform path (invariant 5)" },
+    { path = "rand::rng", reason = "non-deterministic entropy — forbidden in L3 transform path (invariant 5)" },
+    { path = "getrandom::getrandom", reason = "OS entropy — forbidden in L3 transform path (invariant 5)" },
+    { path = "getrandom::fill", reason = "OS entropy — forbidden in L3 transform path (invariant 5)" },
 ]

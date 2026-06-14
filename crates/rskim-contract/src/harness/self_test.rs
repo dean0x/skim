@@ -8,23 +8,30 @@
 //!
 //! # Broken implementation roster (AC18)
 //!
-//! - Per core invariant (8):
-//!   - [`InflatingContract`] — violates invariant 2 (never-inflate)
-//!   - [`HotZoneMutatingContract`] — violates invariant 3 (hot-zone byte-identity)
-//!   - [`TurnDroppingContract`] — violates invariant 4 (append-only)
-//!   - [`NondeterministicContract`] — violates invariant 5 (determinism) [static simulation]
-//!   - [`ToolsAlteringContract`] — violates invariant 6 (canonical tool equality)
-//!   - [`SacrosanctMutatingContract`] — violates invariant 7 (sacrosanct fields)
-//!   - [`UnloggedModifyingContract`] — violates invariant 8 (logged-never-silent)
-//!   - [`FailingOpenContract`] — violates invariant 1 only to demonstrate it CAN'T
-//!     (returns Outcome, fail-open is type-level enforced; this tests the record)
+//! Implemented broken impls (each has a self-test asserting it fails on the
+//! specific invariant it violates):
 //!
-//! - Per waiver narrowed-rule (2):
-//!   - [`MarkerOverflowInjector`] — violates `MetadataReorderWithMarkers` cap rule
-//!   - [`NonBlockPositionInjector`] — injects at non-block positions (waiver rule violation)
+//! - [`InflatingContract`] — violates invariant 2 (never-inflate); fails `AC4-never-inflate`
+//! - [`TurnDroppingContract`] — violates invariant 4 (append-only); fails `AC8-append-only`
+//! - [`UnloggedModifyingContract`] — violates invariant 8 (logged-never-silent);
+//!   fails `AC13-logged-never-silent`
+//! - [`MarkerOverflowInjector`] — violates the `MetadataReorderWithMarkers` cap
+//!   narrowed rule (waiver rule 1); fails its own `verify_marker_cap`
+//! - [`MarkerDroppingContract`] — violates the marker-immutability extension
+//!   invariant; fails `ext:marker-immutability`
 //!
-//! - Marker-dropping implementation (1):
-//!   - [`MarkerDroppingContract`] — violates the marker-immutability extension invariant
+//! Invariants 1 (fail-open), 3 (hot-zone byte-identity), and 5 (determinism) are
+//! enforced *by construction* rather than by a runtime-falsifiable broken impl:
+//! fail-open is type-level (the `transform` method has no error variant, so a
+//! "failing-open" impl cannot be written); hot-zone byte-identity is guaranteed
+//! by splice from the original buffer (`zone::splice_hot_zone`), and offset
+//! derivation is a per-consumer responsibility (#302); and determinism is
+//! enforced by the clippy `disallowed-methods` static gate plus the replay check.
+//! Negative coverage for invariants 6 (canonical tool equality) and 7 (sacrosanct
+//! fields), and for the second waiver rule (non-block-form marker positions),
+//! lands with the consumer that owns the precise byte-offset model (#302/#306);
+//! see the `canonical` and `request` module unit tests for the positive-side
+//! checks available at this layer.
 
 use crate::contract::{Contract, IdentityContract, Outcome};
 use crate::log::DecisionRecord;
