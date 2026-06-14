@@ -283,33 +283,26 @@ pub fn assert_unlogged_fails_logged_never_silent(request_id: &str) {
     );
 }
 
-/// Verify that `MarkerDroppingContract` fails the marker-immutability extension.
+/// Verify that `MarkerDroppingContract` fails the marker-immutability extension
+/// on an input that contains a marker.
 pub fn assert_marker_dropping_fails_extension(request_id: &str) {
-    use super::run_conformance_suite_with_extensions;
     use crate::extension::{ExtensionRegistry, marker_immutability_check};
 
     let mut registry = ExtensionRegistry::new();
     registry.register("marker-immutability", marker_immutability_check());
 
-    let report =
-        run_conformance_suite_with_extensions(&MarkerDroppingContract, request_id, Some(&registry));
-    let ext_results: Vec<_> = report
-        .results
-        .iter()
-        .filter(|r| r.invariant == "ext:marker-immutability")
-        .collect();
-    // Only run against corpus inputs that have markers.
-    // The assertion is that at least one marker-containing input fails.
-    // (Other inputs vacuously pass since there's no marker to drop.)
-    // If no ext results, the extension wasn't exercised — check the corpus.
-    if !ext_results.is_empty() {
-        // Check that at least one fails (for the input with a marker).
-        // The corpus includes ANTHROPIC_SACROSANCT which has cache_control;
-        // but our marker_immutability_check looks for "cache_control" in the raw bytes.
-        // MarkerDroppingContract may or may not find a marker in each fixture.
-        // The test is valid as long as we exercise at least one marker-containing input.
-        let _ = ext_results; // documented: extension result present
-    }
+    // Use an input that contains the marker so the extension check is not vacuous.
+    let marker = b",\"cache_control\":{\"type\":\"ephemeral\"}";
+    let mut input = b"prefix".to_vec();
+    input.extend_from_slice(marker);
+    input.extend_from_slice(b"suffix");
+
+    let outcome = MarkerDroppingContract.transform(&input, request_id);
+    let ext_results = registry.run_all(&input, &outcome.bytes);
+    assert!(
+        ext_results.iter().any(|r| !r.passed),
+        "MarkerDroppingContract must fail marker-immutability on a marker-containing input"
+    );
 }
 
 /// Verify that `MarkerOverflowInjector` fails its own cap rule.

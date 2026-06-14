@@ -225,13 +225,11 @@ pub fn parse_request(input: &[u8]) -> Option<StructuralView> {
         .unwrap_or_default();
 
     // Locate last assistant turn for zone boundary.
-    // Iterate from the end using rposition-equivalent logic.
     let last_assistant_index = turns
         .iter()
-        .enumerate()
         .rev()
-        .find(|(_, t)| t.role == TurnRole::Assistant)
-        .map(|(i, _)| i);
+        .find(|t| t.role == TurnRole::Assistant)
+        .map(|t| t.index);
 
     let turn_count = turns.len();
     let zone = ZoneBoundary {

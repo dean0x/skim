@@ -191,15 +191,6 @@ mod tests {
         assert_eq!(byte_gate(0, 1), ByteGateVerdict::Rejected);
     }
 
-    #[test]
-    fn byte_gate_no_tokenizer_reachable() {
-        // This test documents the dependency assertion (AC5): byte_gate takes
-        // no token-counting parameter and has no import of any tokenizer.
-        // The compiler enforces this; this test is the observable record.
-        let v = byte_gate(50, 30);
-        assert_eq!(v, ByteGateVerdict::Accepted);
-    }
-
     // ========================================================================
     // whole_request_check tests
     // ========================================================================

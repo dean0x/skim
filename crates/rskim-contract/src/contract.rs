@@ -245,11 +245,4 @@ mod tests {
         assert_send_sync::<IdentityContract>();
     }
 
-    #[test]
-    fn outcome_is_must_use() {
-        // Verifying that Outcome carries #[must_use] is compile-time; this
-        // test just exercises the type to confirm it exists in scope.
-        let outcome = Outcome::passthrough(vec![1, 2, 3], "r", "c");
-        assert_eq!(outcome.bytes.len(), 3);
-    }
 }

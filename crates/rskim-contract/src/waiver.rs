@@ -246,7 +246,7 @@ impl SameSlotShrink for MockSameSlotShrinker {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::contract::{Contract, IdentityContract};
+    use crate::contract::Contract;
 
     #[test]
     fn marker_injection_cap_nominal() {
@@ -328,16 +328,6 @@ mod tests {
         // Not passthrough (modification) and output is shorter.
         assert!(!outcome.is_passthrough());
         assert!(outcome.bytes.len() < input.len());
-    }
-
-    #[test]
-    fn identity_contract_not_a_waiver_type() {
-        // IdentityContract does NOT implement MetadataReorderWithMarkers or SameSlotShrink.
-        // This test documents that the identity reference impl has no waiver surface.
-        let _c = IdentityContract;
-        // If this test compiles, the identity contract has no apply_reorder / apply_shrink
-        // methods — demonstrating that the core trait lacks the waiver surface.
-        // (No runtime assertion needed; the type system is the proof.)
     }
 
     #[test]

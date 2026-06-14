@@ -148,48 +148,33 @@ pub fn canonical_equal_raw(raw_a: &str, raw_b: &str) -> Option<bool> {
     // Parse both as JSON values preserving number representation via to_string().
     let a: Value = serde_json::from_str(raw_a).ok()?;
     let b: Value = serde_json::from_str(raw_b).ok()?;
-    Some(canonical_equal_raw_value(&a, &b, raw_a, raw_b, 0))
+    Some(canonical_equal_raw_value(&a, &b, 0))
 }
 
-/// Inner recursive comparison with raw source context.
+/// Inner recursive comparison for `canonical_equal_raw`.
 ///
-/// For numbers, extracts the raw token string and compares bytes.
-/// For other types, delegates to `canonical_equal_inner`.
-fn canonical_equal_raw_value(
-    a: &Value,
-    b: &Value,
-    _raw_a: &str,
-    _raw_b: &str,
-    depth: usize,
-) -> bool {
+/// Numbers fall back to `Value`-level comparison (post-parse). For exact raw-token
+/// number comparison, callers with `RawValue` references should use `raw_numbers_equal`
+/// directly. All other types delegate to `canonical_equal_inner`.
+fn canonical_equal_raw_value(a: &Value, b: &Value, depth: usize) -> bool {
     if depth > MAX_CANONICAL_DEPTH {
         return false;
     }
 
     match (a, b) {
-        (Value::Number(_), Value::Number(_)) => {
-            // For the raw-token comparison, we compare the raw string representations.
-            // Since we don't have offset information into raw_a/raw_b here, we fall back
-            // to Value-level comparison. The full raw-token comparison is available via
-            // `raw_numbers_equal` for callers that have `RawValue` references.
-            a == b
-        }
         (Value::Array(xs), Value::Array(ys)) => {
-            if xs.len() != ys.len() {
-                return false;
-            }
-            xs.iter()
-                .zip(ys.iter())
-                .all(|(x, y)| canonical_equal_raw_value(x, y, "", "", depth + 1))
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .zip(ys.iter())
+                    .all(|(x, y)| canonical_equal_raw_value(x, y, depth + 1))
         }
         (Value::Object(xm), Value::Object(ym)) => {
-            if xm.len() != ym.len() {
-                return false;
-            }
-            xm.iter().all(|(k, xv)| match ym.get(k) {
-                Some(yv) => canonical_equal_raw_value(xv, yv, "", "", depth + 1),
-                None => false,
-            })
+            xm.len() == ym.len()
+                && xm.iter().all(|(k, xv)| match ym.get(k) {
+                    Some(yv) => canonical_equal_raw_value(xv, yv, depth + 1),
+                    None => false,
+                })
         }
         _ => canonical_equal_inner(a, b, depth),
     }

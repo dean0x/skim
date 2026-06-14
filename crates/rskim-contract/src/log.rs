@@ -37,8 +37,6 @@
 
 use std::sync::Arc;
 
-use crossbeam_channel::TrySendError;
-
 // ============================================================================
 // Sensitive field scrub lists (declared here, not imported from rskim binary)
 // ============================================================================
@@ -265,12 +263,8 @@ impl ChannelDecisionSink {
 
 impl DecisionSink for ChannelDecisionSink {
     fn try_send(&self, record: DecisionRecord) -> std::result::Result<(), SinkFull> {
-        match self.sender.try_send(record) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(SinkFull),
-            // Disconnected receiver: treat as full so callers fall back to passthrough.
-            Err(TrySendError::Disconnected(_)) => Err(SinkFull),
-        }
+        // Both Full and Disconnected map to SinkFull: callers fall back to passthrough.
+        self.sender.try_send(record).map_err(|_| SinkFull)
     }
 }
 
