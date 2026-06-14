@@ -35,8 +35,6 @@ fn get_counter() -> &'static Counter {
 /// Build the cl100k counter, falling back to the heuristic on (practically dead) init failure.
 ///
 /// Separated from the OnceLock closure so the error-handling logic is readable.
-/// `rskim` does not have `expect_used = deny` in its clippy config, but we still
-/// avoid `.expect()` in production code by using explicit `match` arms.
 fn build_counter_with_fallback() -> Counter {
     match Counter::new(Encoding::Cl100k) {
         Ok(counter) => counter,
@@ -46,15 +44,9 @@ fn build_counter_with_fallback() -> Counter {
                 "[skim] warning: cl100k tokenizer init failed ({e}); \
                  falling back to byte-length heuristic"
             );
-            // Counter::new(Heuristic) is unconditionally Ok (no tiktoken init).
-            // Use a match to avoid any .expect() call in non-test code.
-            match Counter::new(Encoding::Heuristic) {
-                Ok(h) => h,
-                // Structurally unreachable (Heuristic variant requires no I/O).
-                // If somehow reached, there is nothing safe to return; this path
-                // exists only to satisfy Rust's exhaustiveness checker.
-                Err(_) => unreachable!("Heuristic counter init must always succeed"),
-            }
+            // Heuristic::new is unconditionally Ok — no tiktoken init involved.
+            Counter::new(Encoding::Heuristic)
+                .unwrap_or_else(|_| unreachable!("Heuristic counter init must always succeed"))
         }
     }
 }

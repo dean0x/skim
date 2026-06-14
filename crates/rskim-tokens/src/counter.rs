@@ -57,28 +57,42 @@ pub struct Counter {
 
 /// Internal representation of the counting strategy.
 enum CounterInner {
-    /// cl100k_base BPE (lazy-initialised via [`OnceLock`]).
+    /// cl100k_base BPE (pre-filled at construction).
     Cl100k(OnceLock<CoreBPE>),
-    /// o200k_base BPE (lazy-initialised via [`OnceLock`]).
+    /// o200k_base BPE (pre-filled at construction).
     O200k(OnceLock<CoreBPE>),
-    /// Anthropic offline approximation (wraps cl100k counter).
+    /// Anthropic offline approximation — uses a cl100k BPE internally.
     AnthropicOffline(OnceLock<CoreBPE>),
     /// Byte-length heuristic (no BPE needed).
     Heuristic,
 }
 
+/// Create a pre-filled `OnceLock<CoreBPE>`.
+///
+/// The lock is set immediately so [`OnceLock::get`] always returns `Some`
+/// for any `CounterInner` variant that carries one.
+fn prefilled_lock(bpe: CoreBPE) -> OnceLock<CoreBPE> {
+    let lock = OnceLock::new();
+    let _ = lock.set(bpe);
+    lock
+}
+
+/// Count BPE tokens for a pre-filled lock, falling back to byte length if the
+/// lock is somehow unset (structurally impossible — preserved for the
+/// infallible contract).
+#[inline]
+fn count_bpe(lock: &OnceLock<CoreBPE>, text: &str) -> usize {
+    lock.get()
+        .map(|bpe| bpe.encode_with_special_tokens(text).len())
+        .unwrap_or_else(|| count_heuristic(text))
+}
+
 impl Counter {
     /// Construct a counter for the given [`Encoding`].
     ///
-    /// For tiktoken-backed encodings (`Cl100k`, `O200k`, `AnthropicOffline`),
-    /// the BPE encoder is initialised lazily on the first call to [`count`][Self::count].
-    /// Construction itself is always `Ok` — init failures surface at first use
-    /// and are propagated as a thread-local panic or handled via the
-    /// `from_raw_bpe` seam (see [`Counter::from_raw_bpe`] for fault injection).
-    ///
-    /// Actually, to maintain the no-panic invariant and satisfy AC10, we
-    /// eagerly validate the BPE at construction time so callers get `Err`
-    /// before any counting attempt.
+    /// The BPE encoder is validated eagerly at construction time so callers
+    /// receive `Err` before any counting attempt (satisfies AC10 no-panic
+    /// invariant).
     ///
     /// # Errors
     ///
@@ -86,35 +100,25 @@ impl Counter {
     /// fails to decode. This is practically unreachable at runtime.
     pub fn new(encoding: Encoding) -> Result<Self, TokenError> {
         let inner = match encoding {
-            Encoding::Cl100k => {
-                // Eagerly validate at construction to surface any init failure
-                let bpe = tiktoken_rs::cl100k_base().map_err(|e| TokenError::TiktokenInit {
+            Encoding::Cl100k => CounterInner::Cl100k(prefilled_lock(
+                tiktoken_rs::cl100k_base().map_err(|e| TokenError::TiktokenInit {
                     encoding: "cl100k_base",
                     source: e,
-                })?;
-                let lock = OnceLock::new();
-                let _ = lock.set(bpe);
-                CounterInner::Cl100k(lock)
-            }
-            Encoding::O200k => {
-                let bpe = tiktoken_rs::o200k_base().map_err(|e| TokenError::TiktokenInit {
+                })?,
+            )),
+            Encoding::O200k => CounterInner::O200k(prefilled_lock(
+                tiktoken_rs::o200k_base().map_err(|e| TokenError::TiktokenInit {
                     encoding: "o200k_base",
                     source: e,
-                })?;
-                let lock = OnceLock::new();
-                let _ = lock.set(bpe);
-                CounterInner::O200k(lock)
-            }
-            Encoding::AnthropicOffline => {
-                // AnthropicOffline delegates to cl100k counts, so we still need cl100k.
-                let bpe = tiktoken_rs::cl100k_base().map_err(|e| TokenError::TiktokenInit {
+                })?,
+            )),
+            // AnthropicOffline delegates to cl100k counts internally.
+            Encoding::AnthropicOffline => CounterInner::AnthropicOffline(prefilled_lock(
+                tiktoken_rs::cl100k_base().map_err(|e| TokenError::TiktokenInit {
                     encoding: "cl100k_base (for AnthropicOffline)",
                     source: e,
-                })?;
-                let lock = OnceLock::new();
-                let _ = lock.set(bpe);
-                CounterInner::AnthropicOffline(lock)
-            }
+                })?,
+            )),
             Encoding::Heuristic => CounterInner::Heuristic,
         };
         Ok(Self { inner })
@@ -130,12 +134,12 @@ impl Counter {
     /// For normal use, prefer [`Counter::new`].
     #[cfg(test)]
     pub(crate) fn from_raw_bpe(encoding: Encoding, bpe: CoreBPE) -> Self {
-        let lock = OnceLock::new();
-        let _ = lock.set(bpe);
+        let lock = prefilled_lock(bpe);
         let inner = match encoding {
             Encoding::Cl100k => CounterInner::Cl100k(lock),
             Encoding::O200k => CounterInner::O200k(lock),
             Encoding::AnthropicOffline => CounterInner::AnthropicOffline(lock),
+            // Heuristic carries no BPE — the lock (and the bpe inside it) is dropped here.
             Encoding::Heuristic => CounterInner::Heuristic,
         };
         Self { inner }
@@ -152,34 +156,12 @@ impl Counter {
     ///
     /// Special tokens such as `<|endoftext|>` are counted as single tokens
     /// (not tokenized as plain text), matching the legacy `tokens.rs` behaviour.
-    ///
-    /// # Invariant
-    ///
-    /// The internal `OnceLock<CoreBPE>` is **always pre-filled during construction**
-    /// (both in [`Counter::new`] and in `from_raw_bpe`). If somehow `None` is
-    /// returned (which is structurally impossible), the heuristic byte-length
-    /// fallback is used to preserve the infallible contract.
     #[must_use]
     pub fn count(&self, text: &str) -> usize {
         match &self.inner {
-            CounterInner::Cl100k(lock) => {
-                // OnceLock is always set during construction — get() is always Some.
-                // If somehow None (structurally impossible), fall back to byte length
-                // to preserve the infallible contract without panicking.
-                lock.get()
-                    .map(|bpe| bpe.encode_with_special_tokens(text).len())
-                    .unwrap_or_else(|| count_heuristic(text))
-            }
-            CounterInner::O200k(lock) => lock
-                .get()
-                .map(|bpe| bpe.encode_with_special_tokens(text).len())
-                .unwrap_or_else(|| count_heuristic(text)),
+            CounterInner::Cl100k(lock) | CounterInner::O200k(lock) => count_bpe(lock, text),
             CounterInner::AnthropicOffline(lock) => {
-                let cl100k_count = lock
-                    .get()
-                    .map(|bpe| bpe.encode_with_special_tokens(text).len())
-                    .unwrap_or_else(|| count_heuristic(text));
-                count_anthropic_offline(cl100k_count)
+                count_anthropic_offline(count_bpe(lock, text))
             }
             CounterInner::Heuristic => count_heuristic(text),
         }

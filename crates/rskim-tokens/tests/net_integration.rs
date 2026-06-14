@@ -14,19 +14,9 @@ mod ac9_net_tests {
     use rskim_tokens::{TokenError, net::AnthropicNetworkCounter};
 
     #[test]
-    fn ac9_missing_api_key_returns_err() {
-        // Use a temp env without the key by using new() directly with empty key.
-        // (std::env::remove_var is unsafe in Rust 2024 due to multi-thread concerns.)
-        // This achieves the same result: verifying Err on missing/empty key.
-        let result = AnthropicNetworkCounter::new("claude-sonnet-4-5", String::new());
-        assert!(
-            matches!(result, Err(TokenError::MissingApiKey)),
-            "Empty/missing API key must return Err(MissingApiKey)"
-        );
-    }
-
-    #[test]
     fn ac9_empty_api_key_returns_err() {
+        // Use new() with empty key rather than manipulating env vars
+        // (std::env::remove_var is unsafe in Rust 2024 due to multi-thread concerns).
         let result = AnthropicNetworkCounter::new("claude-sonnet-4-5", String::new());
         assert!(
             matches!(result, Err(TokenError::MissingApiKey)),
@@ -40,7 +30,10 @@ mod ac9_net_tests {
         // from_env() must return Err(MissingApiKey).
         // This test is conditional: if the key IS set (e.g. in a developer's shell),
         // we skip the assertion and trust the dependency-tree check (primary AC9 gate).
-        if std::env::var("ANTHROPIC_API_KEY").unwrap_or_default().is_empty() {
+        if std::env::var("ANTHROPIC_API_KEY")
+            .unwrap_or_default()
+            .is_empty()
+        {
             let result = AnthropicNetworkCounter::from_env("claude-sonnet-4-5");
             assert!(
                 matches!(result, Err(TokenError::MissingApiKey)),
