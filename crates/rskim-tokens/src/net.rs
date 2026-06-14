@@ -60,6 +60,29 @@ const COUNT_TOKENS_ENDPOINT: &str = "https://api.anthropic.com/v1/messages/count
 /// Anthropic API version header value.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// Truncate `s` to at most `max_bytes` **without splitting a UTF-8 character**,
+/// appending an ellipsis when truncation occurs.
+///
+/// `serde_json::Value::to_string` emits raw (non-ASCII-escaped) UTF-8 for string
+/// content, so an Anthropic error body containing multi-byte characters (CJK,
+/// emoji, accented text) can place a character boundary across a fixed byte
+/// offset. A naive `&s[..max_bytes]` slice would **panic** ("byte index is not a
+/// char boundary") on such input — a reachable panic on a hostile/non-ASCII
+/// response. This helper walks back to the nearest char boundary at or below
+/// `max_bytes`, keeping the no-panic contract intact (constraint 4 / AC10).
+fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_owned();
+    }
+    // Walk down from max_bytes to the nearest char boundary (always terminates:
+    // byte 0 is always a boundary, so the loop is bounded by max_bytes iterations).
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 /// A network-backed token counter that calls the Anthropic count-tokens API.
 ///
 /// Constructed via [`AnthropicNetworkCounter::from_env`] (reads `ANTHROPIC_API_KEY`
@@ -220,11 +243,8 @@ impl AnthropicNetworkCounter {
                             // Truncate embedded body to bound error-message length
                             // (parse-at-boundary discipline — avoids unbounded strings in Err).
                             let body_repr = json.to_string();
-                            let truncated = if body_repr.len() > MAX_ERROR_BODY_LEN {
-                                format!("{}…", &body_repr[..MAX_ERROR_BODY_LEN])
-                            } else {
-                                body_repr
-                            };
+                            let truncated =
+                                truncate_on_char_boundary(&body_repr, MAX_ERROR_BODY_LEN);
                             TokenError::ApiResponse(format!(
                                 "missing 'input_tokens' field in response: {truncated}"
                             ))
@@ -255,5 +275,67 @@ impl AnthropicNetworkCounter {
         Err(TokenError::NetworkRequest(
             last_err.unwrap_or_else(|| "unknown network error".to_owned()),
         ))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod truncate_tests {
+    use super::{MAX_ERROR_BODY_LEN, truncate_on_char_boundary};
+
+    #[test]
+    fn short_input_is_returned_verbatim() {
+        let s = "short body";
+        assert_eq!(truncate_on_char_boundary(s, MAX_ERROR_BODY_LEN), s);
+    }
+
+    #[test]
+    fn exact_length_input_is_not_truncated() {
+        let s = "a".repeat(MAX_ERROR_BODY_LEN);
+        let out = truncate_on_char_boundary(&s, MAX_ERROR_BODY_LEN);
+        assert_eq!(out, s, "input at exactly max_bytes must not be truncated");
+        assert!(!out.ends_with('…'));
+    }
+
+    /// Regression guard: a multi-byte UTF-8 character straddling the cut byte
+    /// must NOT cause a panic (the old `&s[..max]` slice paniced here). The
+    /// truncated result must remain valid UTF-8 and stay within max_bytes.
+    #[test]
+    fn multibyte_char_straddling_cut_does_not_panic() {
+        // 'é' is 2 bytes (0xC3 0xA9). Placing it so byte MAX_ERROR_BODY_LEN lands
+        // on its continuation byte is exactly the panic scenario.
+        let mut s = "a".repeat(MAX_ERROR_BODY_LEN - 1);
+        s.push('é'); // bytes [MAX-1, MAX] — boundary at MAX is mid-char
+        s.push_str(&"b".repeat(50));
+
+        // Must not panic.
+        let out = truncate_on_char_boundary(&s, MAX_ERROR_BODY_LEN);
+
+        // Result is valid UTF-8 (guaranteed by being a String), ends with ellipsis,
+        // and the body portion never exceeds max_bytes.
+        assert!(
+            out.ends_with('…'),
+            "truncated output must carry the ellipsis"
+        );
+        let body_len = out.len() - '…'.len_utf8();
+        assert!(
+            body_len <= MAX_ERROR_BODY_LEN,
+            "truncated body {body_len} bytes must be <= {MAX_ERROR_BODY_LEN}"
+        );
+        // The retained prefix must be the 'a' run only (the straddling 'é' is dropped).
+        assert!(out.starts_with(&"a".repeat(MAX_ERROR_BODY_LEN - 1)));
+    }
+
+    #[test]
+    fn all_multibyte_input_truncates_safely() {
+        // Pure CJK body well over the limit — every char is 3 bytes, so most
+        // byte offsets are NOT char boundaries.
+        let s = "日".repeat(MAX_ERROR_BODY_LEN); // 3 * MAX bytes
+        let out = truncate_on_char_boundary(&s, MAX_ERROR_BODY_LEN);
+        assert!(out.ends_with('…'));
+        let body_len = out.len() - '…'.len_utf8();
+        assert!(body_len <= MAX_ERROR_BODY_LEN);
+        // Body length must be a multiple of 3 (whole CJK chars retained).
+        assert_eq!(body_len % 3, 0, "must not split a 3-byte CJK char");
     }
 }
