@@ -1514,7 +1514,7 @@ fn ac1_ac5_multi_ngram_score_equivalence_with_tied_scores() {
     // strictly above files 0/1; file 3 (larger node_count) must score strictly
     // below files 0/1.  The fixture was built to discriminate these paths, so
     // asserting the relative ordering proves the non-tie scoring path is also
-    // correct — not just the tie-break (low/testing #286).
+    // correct — not just the tie-break (#286).
     let s2 = results.iter().find(|(f, _)| *f == FileId(2)).unwrap().1;
     let s3 = results.iter().find(|(f, _)| *f == FileId(3)).unwrap().1;
     assert!(
@@ -1655,7 +1655,7 @@ fn ac4_format_constants_unchanged() {
 // regression: the 5 files that match the selective bigram get an extra
 // contribution from the second n-gram that the broad-only files do not, so
 // their scores must strictly exceed the broad-only files' scores.
-// (high/testing discriminating assertion, #286)
+// (discriminating assertion, #286)
 
 #[test]
 fn ac6_selective_query_returns_exact_posting_count_multi_ngram() {
@@ -1770,7 +1770,7 @@ fn ac6_selective_query_returns_exact_posting_count_multi_ngram() {
 // discriminating assertion verifies that multi-n-gram scores are correct
 // (the large-bigram contribution appears, and empty-bigram contributes
 // nothing), proving reserve() executed on the right posting list.
-// (high/testing discriminating assertion, #286)
+// (discriminating assertion, #286)
 
 #[test]
 fn ac7_empty_first_ngram_large_second_returns_correct_results() {
@@ -1858,7 +1858,7 @@ fn ac7_empty_first_ngram_large_second_returns_correct_results() {
 //
 // A stale-cache regression (wrong `last_idf` used across language boundaries)
 // would cause score divergence between the cached and reference paths.
-// (low/testing AC8 discriminating assertion, #286)
+// (discriminating assertion, #286)
 
 #[test]
 fn ac8_scalar_idf_cache_score_equivalence() {
@@ -2058,7 +2058,7 @@ fn ac11_p4_filter_composition_with_file_filter_and_limit() {
     // tie-break must yield [FileId(0), FileId(1)] as the top-2.
     // Asserting the exact ordered pair (not just allowlist membership) is what
     // AC11 exists to prove: the score-DESC/FileId-ASC ordering-under-limit
-    // is correct when lang, file_filter, and limit are all active (high/testing #286).
+    // is correct when lang, file_filter, and limit are all active (#286).
     let ids: Vec<FileId> = results.iter().map(|r| r.file_id).collect();
     assert_eq!(
         ids,
@@ -2123,4 +2123,320 @@ fn ac12_search_ast_is_unfiltered_after_p4() {
     for i in 1..r1.len() {
         assert!(r1[i - 1].0 < r1[i].0, "results must be FileId-ASC");
     }
+}
+
+// ---- AC6b/AC7b: P3 capacity hook — posting-driven sizing verified (#286) ----
+//
+// The plan (AC6/AC7) called for a `#[cfg(test)]` capacity hook that was not
+// added in the initial implementation.  `run_ngram_set_with_capacity` exposes
+// the `scores` map capacity after scoring so we can confirm P3 reserves
+// proportional to the posting-list length rather than `file_count()`.
+//
+// For a selective 5-posting query in a 100-file corpus the capacity after
+// scoring must be ≥ 5 (all results fit) and < 100 (not file_count-sized).
+// For an empty-first + 200-posting second the capacity must be ≥ 200.
+
+#[test]
+fn ac6b_p3_capacity_bounded_by_posting_list_not_file_count() {
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let try_id = vocab_lookup("try_statement").unwrap();
+    let catch_id = vocab_lookup("catch_clause").unwrap();
+
+    let broad_bigram = AstBigram::encode(fn_id, block_id);
+    let selective_bigram = AstBigram::encode(try_id, catch_id);
+
+    let mut source = FakePostingSource::default().with_avg_node_count(100.0);
+    for i in 0..100u32 {
+        source = source.with_file(i, Language::Rust, 100);
+    }
+    // Selective n-gram: only 5 postings.
+    let selective_postings: Vec<AstPosting> = (0..5u32)
+        .map(|i| AstPosting {
+            doc_id: i,
+            count: 1,
+        })
+        .collect();
+    source
+        .bigrams
+        .insert(selective_bigram.key(), selective_postings);
+
+    let engine = AstQueryEngine::new(source);
+
+    // Single-n-gram selective query: capacity must be ≥ 5 (holds results)
+    // and strictly < file_count (100), proving P3 does NOT pre-allocate file_count.
+    let set = make_bigram_set(selective_bigram, 1);
+    let (results, cap) = engine.run_ngram_set_with_capacity(&set, None).unwrap();
+    assert_eq!(
+        results.len(),
+        5,
+        "selective query must return exactly 5 files"
+    );
+    assert!(
+        cap >= 5,
+        "capacity must be at least posting-list length (5): cap={cap}"
+    );
+    assert!(
+        cap < 100,
+        "capacity must be < file_count (100) for selective queries (P3): cap={cap}"
+    );
+
+    // Multi-n-gram with broad bigram (100 postings) + selective (5): capacity
+    // must grow to fit all 100 results.
+    let mut source2 = FakePostingSource::default().with_avg_node_count(100.0);
+    for i in 0..100u32 {
+        source2 = source2.with_file(i, Language::Rust, 100);
+    }
+    let broad_postings: Vec<AstPosting> = (0..100u32)
+        .map(|i| AstPosting {
+            doc_id: i,
+            count: 1,
+        })
+        .collect();
+    source2.bigrams.insert(broad_bigram.key(), broad_postings);
+    let selective_postings2: Vec<AstPosting> = (0..5u32)
+        .map(|i| AstPosting {
+            doc_id: i,
+            count: 2,
+        })
+        .collect();
+    source2
+        .bigrams
+        .insert(selective_bigram.key(), selective_postings2);
+
+    let engine2 = AstQueryEngine::new(source2);
+    let mut bigram_entries = vec![
+        AstBigramEntry {
+            ngram: broad_bigram,
+            weight: DEFAULT_AST_WEIGHT,
+            count: 1,
+        },
+        AstBigramEntry {
+            ngram: selective_bigram,
+            weight: DEFAULT_AST_WEIGHT,
+            count: 1,
+        },
+    ];
+    bigram_entries.sort_unstable_by_key(|e| e.ngram.key());
+    let multi_set = AstNgramSet {
+        bigrams: bigram_entries,
+        trigrams: vec![],
+    };
+    let (multi_results, multi_cap) = engine2
+        .run_ngram_set_with_capacity(&multi_set, None)
+        .unwrap();
+    assert_eq!(
+        multi_results.len(),
+        100,
+        "multi-ngram must return all 100 files"
+    );
+    assert!(
+        multi_cap >= 100,
+        "capacity must grow to fit all 100 results after broad n-gram: cap={multi_cap}"
+    );
+}
+
+#[test]
+fn ac7b_p3_empty_first_ngram_capacity_grows_for_second() {
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let try_id = vocab_lookup("try_statement").unwrap();
+    let catch_id = vocab_lookup("catch_clause").unwrap();
+
+    let empty_bigram = AstBigram::encode(fn_id, block_id);
+    let large_bigram = AstBigram::encode(try_id, catch_id);
+
+    let mut source = FakePostingSource::default().with_avg_node_count(100.0);
+    for i in 0..200u32 {
+        source = source.with_file(i, Language::Rust, 100);
+    }
+    source.bigrams.insert(empty_bigram.key(), vec![]);
+    let large_postings: Vec<AstPosting> = (0..200u32)
+        .map(|i| AstPosting {
+            doc_id: i,
+            count: 1,
+        })
+        .collect();
+    source.bigrams.insert(large_bigram.key(), large_postings);
+
+    let engine = AstQueryEngine::new(source);
+    let mut bigram_entries = vec![
+        AstBigramEntry {
+            ngram: empty_bigram,
+            weight: DEFAULT_AST_WEIGHT,
+            count: 1,
+        },
+        AstBigramEntry {
+            ngram: large_bigram,
+            weight: DEFAULT_AST_WEIGHT,
+            count: 1,
+        },
+    ];
+    bigram_entries.sort_unstable_by_key(|e| e.ngram.key());
+    let set = AstNgramSet {
+        bigrams: bigram_entries,
+        trigrams: vec![],
+    };
+    let (results, cap) = engine.run_ngram_set_with_capacity(&set, None).unwrap();
+    assert_eq!(
+        results.len(),
+        200,
+        "all 200 files must appear despite empty first n-gram"
+    );
+    assert!(
+        cap >= 200,
+        "capacity must grow to fit 200 results (large second n-gram): cap={cap}"
+    );
+}
+
+// ---- P4 forward-compat: unknown lang_id file in corpus with active lang filter ----
+//
+// AC3 tests search_ast (which always passes lang_filter=None).  This test
+// instead uses the SearchLayer path (lang_filter=Some) and places a file with
+// an UNKNOWN lang_id alongside a valid-language file.  The unknown-lang file
+// must be SKIPPED (not scored) when the lang filter is active (#286 P4).
+
+#[test]
+fn p4_unknown_lang_id_skipped_under_active_lang_filter() {
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let bigram = AstBigram::encode(fn_id, block_id);
+
+    // Corpus: file 0 has unknown lang_id 200; file 1 has Language::Rust.
+    let mut source = FakePostingSource::default().with_avg_node_count(100.0);
+    source.file_metas.insert(
+        0,
+        AstFileMetaEntry {
+            lang_id: 200, // unknown — lang_from_id returns None
+            node_count: 100,
+            max_depth: 3,
+            max_block_stmts: 5,
+            max_params: 2,
+            branch_count: 1,
+        },
+    );
+    source = source.with_file(1, Language::Rust, 100);
+    source.file_count = 2;
+    source.bigrams.insert(
+        bigram.key(),
+        vec![
+            AstPosting {
+                doc_id: 0,
+                count: 1,
+            },
+            AstPosting {
+                doc_id: 1,
+                count: 1,
+            },
+        ],
+    );
+
+    let engine = AstQueryEngine::new(source);
+
+    // Without lang filter: both files should score positively (AC3 behaviour).
+    let q_no_filter = AstQuery::Containment(make_bigram_set(bigram, 1));
+    let unfiltered = engine.search_ast(&q_no_filter).unwrap();
+    assert_eq!(
+        unfiltered.len(),
+        2,
+        "without lang filter both files must score"
+    );
+
+    // With lang filter = Rust: unknown-lang file (0) must be SKIPPED; only file 1 returned.
+    let set = make_bigram_set(bigram, 1);
+    let (filtered, _cap) = engine
+        .run_ngram_set_with_capacity(&set, Some(Language::Rust))
+        .unwrap();
+    assert_eq!(
+        filtered.len(),
+        1,
+        "with lang=Rust filter, unknown-lang file must be skipped: got {filtered:?}"
+    );
+    assert_eq!(
+        filtered[0].0,
+        FileId(1),
+        "only the Rust file must appear in filtered results"
+    );
+    assert!(filtered[0].1 > 0.0, "Rust file must have positive score");
+}
+
+// ---- AC1/AC5 extended: independent BM25 score verification on multi-n-gram path ----
+//
+// The original ac1_ac5 test verifies determinism, tie equality, and relative
+// ordering, but does not compute an independent expected BM25 value.  This
+// companion test adds an exact golden-score assertion for the multi-n-gram
+// meta_cache path, so a systematic scoring defect in the new bm25_with_lite /
+// LiteMeta path that preserved determinism and relative ordering would still
+// fail (#286).
+
+#[test]
+fn ac1_ac5_multi_ngram_independent_golden_score() {
+    use crate::ast_index::{ast_bigram_idf, ast_trigram_idf};
+
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let expr_id = vocab_lookup("expression_statement").unwrap();
+
+    let bigram = AstBigram::encode(fn_id, block_id);
+    let trigram = AstTrigram::encode(fn_id, block_id, expr_id);
+
+    // Single file corpus: node_count=100, avg=100 → length_norm=1.0.
+    // bigram count=2, trigram count=1.
+    let source = FakePostingSource::default()
+        .with_file(0, Language::Rust, 100)
+        .with_bigram(
+            bigram.key(),
+            vec![AstPosting {
+                doc_id: 0,
+                count: 2,
+            }],
+        )
+        .with_trigram(
+            trigram.key(),
+            vec![AstPosting {
+                doc_id: 0,
+                count: 1,
+            }],
+        )
+        .with_avg_node_count(100.0);
+
+    let engine = AstQueryEngine::new(source);
+
+    let set = AstNgramSet {
+        bigrams: vec![AstBigramEntry {
+            ngram: bigram,
+            weight: DEFAULT_AST_WEIGHT,
+            count: 1,
+        }],
+        trigrams: vec![AstTrigramEntry {
+            ngram: trigram,
+            weight: DEFAULT_AST_WEIGHT,
+            count: 1,
+        }],
+    };
+    let q = AstQuery::Containment(set);
+    let results = engine.search_ast(&q).unwrap();
+
+    assert_eq!(results.len(), 1);
+
+    // Independent golden BM25 computation:
+    //   length_norm = 1 - 0.75 + 0.75 * (100/100) = 1.0
+    //   bigram:  tf_norm = 2.0 / 1.0 = 2.0
+    //            score_b = idf_b * (2.0 / (2.0 + 1.2))
+    //   trigram: tf_norm = 1.0 / 1.0 = 1.0
+    //            score_t = idf_t * (1.0 / (1.0 + 1.2))
+    //   total   = score_b + score_t
+    let k1 = AST_BM25_K1;
+    let idf_b = f64::from(ast_bigram_idf(Language::Rust, bigram));
+    let idf_t = f64::from(ast_trigram_idf(Language::Rust, trigram));
+    let tf_norm_b = 2.0_f64; // count=2, length_norm=1.0
+    let tf_norm_t = 1.0_f64; // count=1, length_norm=1.0
+    let expected = idf_b * (tf_norm_b / (tf_norm_b + k1)) + idf_t * (tf_norm_t / (tf_norm_t + k1));
+
+    let got = results[0].1;
+    assert!(
+        (got - expected).abs() < 1e-9,
+        "multi-ngram meta_cache golden score mismatch: got={got}, expected={expected} \
+         (idf_b={idf_b}, idf_t={idf_t}, tf_norm_b={tf_norm_b}, tf_norm_t={tf_norm_t})"
+    );
 }
