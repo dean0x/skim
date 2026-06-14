@@ -24,8 +24,8 @@ referencedFiles:
   - crates/rskim/src/cmd/test/cargo.rs
   - crates/rskim/src/cmd/test/shared.rs
 created: 2026-05-14
-updated: 2026-06-13
-version: 15
+updated: 2026-06-14
+version: 16
 ---
 
 # Build Tool Output Parsers
@@ -224,7 +224,7 @@ ExitDisposition::UnexpectedFailure — all other non-zero, or signal kill → fo
 
 `classify_exit(code: Option<i32>, expected: &[i32]) -> ExitDisposition` must be called on the raw `Option<i32>` BEFORE any `unwrap_or(1)` default: a signal kill (`None`) is always `UnexpectedFailure` even if `1` is in `expected_exit_codes`.
 
-**Unexpected failure path**: emits `[skim] {program} exited N; raw output (not compressed).` to stderr, records zero savings under the `"raw"` analytics tier, and calls `passthrough_raw` — byte-faithful forward of stdout+stderr before ANSI stripping.
+**Unexpected failure path**: emits `[skim] {program} exited N; raw output (not compressed).` (non-zero exit) or `[skim] {program} killed by signal; raw output (not compressed).` (signal kill / `None` exit code) to stderr, records zero savings under the `"raw"` analytics tier, and calls `passthrough_raw` — byte-faithful forward of stdout+stderr before ANSI stripping.
 
 **`expected_exit_codes`** — non-zero codes the parser meaningfully compresses:
 - `grep`/`rg`: `&[1]` (no matches)
@@ -343,9 +343,25 @@ pub(crate) fn elision_marker(shown: usize, total: usize, unit: &str) -> Option<S
 // For streaming sites where total is unknowable mid-stream
 pub(crate) fn elision_marker_unbounded(shown_desc: &str, unit: &str) -> String
 // → "[skim] {unit} elided beyond {shown_desc} — SKIM_PASSTHROUGH=1 for full output"
+
+// Canonical compressed-output hint for stderr after a non-zero expected-failure exit (#317)
+pub(crate) fn compressed_output_hint(code: i32) -> String
+// → "[skim] compressed output (exit {code}). SKIM_PASSTHROUGH=1 for full output."
 ```
 
 Always use these functions — never construct elision notices inline. `elision_marker` returns `None` when nothing is omitted, so callers can do `if let Some(m) = elision_marker(...) { ... }` cleanly.
+
+**`compressed_output_hint`** is the single source of truth for the compressed-output hint string. It is used by both `cmd/execution.rs` (`record_and_report`'s notice matrix) and `cmd/test/shared.rs` (`emit_failure_context`) to keep the hint byte-identical across both paths.
+
+**Preferred `unit` strings for `elision_marker`** — use these consistently across call sites to prevent string drift:
+
+| Context                    | `unit` string     |
+|----------------------------|-------------------|
+| table / query result rows  | `"rows"`          |
+| file body / release notes  | `"body lines"`    |
+| release / workflow assets  | `"assets"`        |
+| object keys (JSON/curl)    | `"object keys"`   |
+| generic line output        | `"lines"`         |
 
 ## `CommandRunner` and `ChildGuard` — Execution Layer (ADR-008)
 
@@ -526,7 +542,7 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 - `crates/rskim/src/cmd/build/make.rs` — GNU make: GCC diagnostics Tier 1, noise-strip Tier 2, eight `LazyLock<Regex>` patterns plus one literal `starts_with` check
 - `crates/rskim/src/cmd/build/gradle.rs` — Gradle/Gradlew: task outcome + Java/Kotlin diagnostic Tier 1 (with duration), noise-strip Tier 2 (six `LazyLock<Regex>` patterns)
 - `crates/rskim/src/cmd/build/maven.rs` — Maven/Mvnw: `[ERROR]`/`[WARNING]` + build summary Tier 1 (with duration), noise-strip Tier 2 (two `LazyLock<Regex>` patterns, two duration formats)
-- `crates/rskim/src/output/mod.rs` — `ParseResult<T>` enum definition and helpers (`is_full`, `is_degraded`, `is_passthrough`, `tier_name`, `content`, `into_content`, `emit_markers`); `strip_ansi` and `strip_ansi_cow` (zero-copy fast path: borrows when no ESC byte present); `to_json_envelope` (not used by build family); `elision_marker`, `elision_marker_unbounded` (#317 loud elision helpers); `OutputMode`, `clean`, `clean_with_mode`, `PassthroughTruncator`, `FilterTransparencyHeader`
+- `crates/rskim/src/output/mod.rs` — `ParseResult<T>` enum definition and helpers (`is_full`, `is_degraded`, `is_passthrough`, `tier_name`, `content`, `into_content`, `emit_markers`); `strip_ansi` and `strip_ansi_cow` (zero-copy fast path: borrows when no ESC byte present); `to_json_envelope` (not used by build family); `elision_marker`, `elision_marker_unbounded`, `compressed_output_hint` (#317 loud elision + hint helpers — see the preferred `unit` strings table above); `OutputMode`, `clean`, `clean_with_mode`, `PassthroughTruncator`, `FilterTransparencyHeader`
 - `crates/rskim/src/output/canonical.rs` — `BuildResult` (pre-rendered output); `TestResult` (with `context: Option<String>` safety net and `with_context` constructor, #317); `TestEntry`, `TestSummary`, `TestOutcome`; `GitResult`, `LintResult`, `DbResult`, `PkgResult`, `InfraResult`, `LogResult`, `DiffResult`, `FileResult`
 - `crates/rskim/src/cmd/mod.rs` — coordination point: declares all submodules, re-exports public API; inline helpers: `user_has_flag`, `inject_flag_before_separator`, `extract_show_stats`, `extract_json_flag`, `extract_output_format`, `should_read_stdin` (stdin-eligible when empty args OR `args == ["run"]`), `read_bounded`, `read_stdin_bounded`, `MAX_STDIN_BYTES`; passthrough checks: `is_passthrough_mode`, `check_passthrough_str`, `check_passthrough_value`; resolvers: `resolve_cache_dir`, `skim_wrappers_dir`
 - `crates/rskim/src/cmd/dispatch.rs` — `dispatch()`, `run_raw_passthrough()`, `run_inherited_passthrough()` (inherited-stdio path for daemon/streaming commands); per-tool dispatcher helpers
