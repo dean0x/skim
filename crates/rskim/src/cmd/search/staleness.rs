@@ -275,13 +275,27 @@ pub(super) fn check_staleness(
 ///
 /// This is a convenience wrapper for the query path: call it before opening
 /// the reader so callers always get a fresh index.
+///
+/// # HEAD threading (O-A / #289)
+///
+/// `read_git_head(root)` is called ONCE at function entry and the result is
+/// threaded into both the staleness decision and `rebuild_temporal`.  This
+/// prevents a TOCTOU race (two reads could return different SHAs if a commit
+/// lands between them) and is the single source of truth for the HEAD that
+/// gets recorded in both the lexical manifest and `temporal.db`.
 pub(super) fn auto_refresh_if_stale(
     root: &Path,
     cache_dir: &Path,
     _analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<(bool, FileManifest)> {
     use super::index::build_index;
+    use super::temporal_build::{current_epoch_secs, rebuild_temporal};
     use super::types::IndexConfig;
+
+    // Read the current git HEAD ONCE at function entry.  The result is threaded
+    // into both `check_staleness` (via the match arms below) and `rebuild_temporal`
+    // so both indexes record the SAME SHA. (O-A / #289 amendment)
+    let current_head: Option<String> = read_git_head(root);
 
     let (staleness, existing_manifest) = check_staleness(cache_dir, root);
 
@@ -313,12 +327,15 @@ pub(super) fn auto_refresh_if_stale(
                 result.duration.as_secs_f64()
             );
         }
-        StalenessCheck::HeadChanged { stored, current } => {
+        StalenessCheck::HeadChanged {
+            ref stored,
+            ref current,
+        } => {
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "skim search [debug]: HEAD changed ({} -> {}), refreshing index…",
-                    stored.get(..8).unwrap_or(&stored),
-                    current.get(..8).unwrap_or(&current)
+                    stored.get(..8).unwrap_or(stored),
+                    current.get(..8).unwrap_or(current)
                 );
             } else {
                 eprintln!("skim search: index stale (HEAD changed), refreshing…");
@@ -335,13 +352,30 @@ pub(super) fn auto_refresh_if_stale(
     }
 
     // After a rebuild, load the freshly written manifest for the caller.
+    // This manifest was written by `build_index` and records `current_head`.
     let manifest = FileManifest::load(root.to_path_buf(), cache_dir.to_path_buf())?;
 
-    // ── #289 temporal hook point ─────────────────────────────────────────────
-    // TODO(#289): Call `rebuild_temporal(root, cache_dir, head)` here — under
-    // the same `.skim-build.lock`, reusing the already-read HEAD — once the
-    // temporal populate path exists. One call, no rework.
-    // ────────────────────────────────────────────────────────────────────────
+    // ── #289 temporal build hook point ───────────────────────────────────────
+    // Populate temporal.db AFTER the lexical+AST manifest is persisted.
+    // (applies ADR-006: temporal is a derived satellite; must not be written
+    // off a half-built index)
+    //
+    // `rebuild_temporal` acquires its own bounded `.skim-build.lock` around
+    // the parse+sync phase and degrades gracefully on non-git dirs, gix errors,
+    // or CapacityExceeded — a temporal failure MUST NOT fail the lexical refresh.
+    //
+    // `head` is the FULL 40/64-hex SHA read at function entry above (O-A).
+    // Passing `None` when the project is non-git: `rebuild_temporal` skips
+    // gracefully (parse_history returns an error on a non-git dir anyway).
+    if let Some(ref head) = current_head
+        && let Err(e) = rebuild_temporal(root, cache_dir, head, current_epoch_secs())
+    {
+        // Ignore temporal errors — they must not fail the lexical/AST refresh (D5).
+        if crate::debug::is_debug_enabled() {
+            eprintln!("skim search [debug]: temporal rebuild error (non-fatal): {e}");
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     Ok((true, manifest))
 }

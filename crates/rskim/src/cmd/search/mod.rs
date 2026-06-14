@@ -21,6 +21,7 @@ mod query;
 mod snippet;
 mod staleness;
 mod temporal;
+mod temporal_build;
 mod types;
 mod walk;
 
@@ -671,11 +672,13 @@ fn run_temporal_standalone(
     let Some(db) = temporal::open_temporal_db(&temporal_db_path) else {
         if json {
             let msg = WarningJson {
-                warning: "no temporal data — run 'skim heatmap' to populate",
+                warning: "no temporal data — run 'skim search' on a git repo to auto-populate",
             };
             println!("{}", serde_json::to_string(&msg)?);
         } else {
-            eprintln!("skim search: no temporal data — run 'skim heatmap' to populate");
+            eprintln!(
+                "skim search: no temporal data — run 'skim search' on a git repo to auto-populate"
+            );
         }
         return Ok(ExitCode::SUCCESS);
     };
@@ -744,7 +747,7 @@ AST standalone examples:
   skim search \"error\" --ast try-catch           Text+AST intersection (lexical snippets preserved)
   skim search --ast try-catch --blast-radius src/auth.rs  AST ∩ co-change
 
-Temporal query options (require 'skim heatmap' data):
+Temporal query options (auto-populated by 'skim search' on a git repo):
   --hot                        Sort/list by hotspot score descending
   --cold                       Sort/list by hotspot score ascending
   --risky                      Sort/list by bug-fix density descending

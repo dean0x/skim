@@ -201,8 +201,7 @@ pub(super) fn resolve_blast_radius_paths(
 
     match open_temporal_db(db_path) {
         None => {
-            const MSG: &str =
-                "no temporal data for --blast-radius — run 'skim heatmap' to populate";
+            const MSG: &str = "no temporal data for --blast-radius — run 'skim search' on a git repo to auto-populate";
             if json {
                 let envelope = serde_json::json!({ "warning": MSG });
                 eprintln!("{}", serde_json::to_string(&envelope)?);
@@ -271,7 +270,7 @@ pub(super) fn check_temporal_staleness(db: &TemporalDb, project_root: &Path) -> 
     if stored_head.trim() != current_head.trim() {
         Some(format!(
             "skim search: temporal data is stale (stored: {}, current: {}). \
-             Run 'skim heatmap' to refresh.",
+             Run 'skim search' on this repo to auto-refresh.",
             stored_head.get(..7).unwrap_or(&stored_head),
             current_head.get(..7).unwrap_or(&current_head),
         ))
