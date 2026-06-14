@@ -173,7 +173,10 @@ struct LiteMeta {
 
 impl From<(u8, u32)> for LiteMeta {
     fn from((lang_id, node_count): (u8, u32)) -> Self {
-        Self { lang_id, node_count }
+        Self {
+            lang_id,
+            node_count,
+        }
     }
 }
 

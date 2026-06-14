@@ -1755,12 +1755,24 @@ fn build_mixed_lang_engine() -> (
     let mut builder = crate::ast_index::AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
     for i in 0..4u32 {
         builder
-            .add_file_ngrams(FileId(i), Language::Rust, &set, 100, StructuralMetrics::default())
+            .add_file_ngrams(
+                FileId(i),
+                Language::Rust,
+                &set,
+                100,
+                StructuralMetrics::default(),
+            )
             .unwrap();
     }
     for i in 4..7u32 {
         builder
-            .add_file_ngrams(FileId(i), Language::Python, &set, 100, StructuralMetrics::default())
+            .add_file_ngrams(
+                FileId(i),
+                Language::Python,
+                &set,
+                100,
+                StructuralMetrics::default(),
+            )
             .unwrap();
     }
     let engine = AstQueryEngine::new(builder.build().unwrap());
@@ -1794,7 +1806,11 @@ fn ac9_p4_lang_filter_narrows_to_strict_subset_real_reader() {
     );
     assert_eq!(rust_only.len(), 4, "exactly 4 Rust files should match");
     for r in &rust_only {
-        assert!(r.file_id.0 < 4, "filtered result must be a Rust file: {}", r.file_id);
+        assert!(
+            r.file_id.0 < 4,
+            "filtered result must be a Rust file: {}",
+            r.file_id
+        );
     }
     let unfiltered_ids: std::collections::HashSet<FileId> =
         unfiltered.iter().map(|r| r.file_id).collect();
