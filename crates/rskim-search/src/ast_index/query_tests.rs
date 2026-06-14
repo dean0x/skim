@@ -1599,7 +1599,6 @@ fn ac3_unknown_lang_id_still_scores_positively() {
             branch_count: 1,
         },
     );
-    source.file_count = 2;
     source = source.with_file(1, Language::Rust, 100);
     source.bigrams.insert(
         bigram.key(),

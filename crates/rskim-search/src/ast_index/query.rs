@@ -554,10 +554,6 @@ fn ast_query_to_ngram_set(q: &AstQuery) -> Result<Cow<'_, AstNgramSet>> {
 /// Bundles `scores`, `meta_cache`, and the corpus `file_count` so that
 /// capacity reservation and score accumulation share the same mutable state
 /// without a 7-parameter function signature (medium/complexity #286).
-///
-/// **Invariant**: `score_postings` calls `reserve` before inserting, so the
-/// reservation and the insert are always co-located — the temporal coupling
-/// present in the prior `reserve_for_postings` free function is eliminated.
 struct ScoringCtx {
     scores: FxHashMap<u32, f64>,
     /// `None` for single-n-gram queries (no cross-list cache benefit, C1).
