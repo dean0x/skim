@@ -20,7 +20,8 @@
 //! - [`NoncanonicalToolsContract`] — violates invariant 6 (canonical tool equality)
 //!   by rewriting number tokens (e.g., `1e3` → `1000`); fails `canonical::tools_arrays_equal`
 //! - [`SacrosanctLeakingContract`] — violates invariant 7 (sacrosanct-field passthrough)
-//!   by embedding a known sensitive key name in its output; fails `AC12-sacrosanct-redaction`
+//!   by embedding a known sensitive key name in its `request_id`; detected by
+//!   `check_sacrosanct_redaction` via `AC12-sacrosanct-redaction`
 //!
 //! ## Invariants by construction (no runtime-falsifiable broken impl)
 //!
@@ -40,8 +41,8 @@
 //!
 //! - [`MarkerOverflowInjector`] — violates the `MetadataReorderWithMarkers` cap
 //!   narrowed rule (waiver rule 1: marker-count cap); fails its own `verify_marker_cap`
-//! - Second waiver rule (non-block-form marker positions) lands with the consumer
-//!   that owns the precise byte-offset model (#302/#306).
+//! - [`SameSlotShrinkViolatorContract`] — violates the `SameSlotShrink` narrowed rule
+//!   (waiver rule 2) by growing bytes instead of shrinking; fails `verify_shrink_rule`
 //!
 //! ## Extension invariant broken impl (1)
 //!
@@ -49,8 +50,8 @@
 //!   invariant; fails `ext:marker-immutability`
 
 use crate::contract::{Contract, IdentityContract, Outcome};
-use crate::log::DecisionRecord;
-use crate::waiver::{MARKER_BYTES, MAX_MARKERS, MetadataReorderWithMarkers};
+use crate::log::{Decision, DecisionRecord};
+use crate::waiver::{MARKER_BYTES, MAX_MARKERS, MetadataReorderWithMarkers, SameSlotShrink};
 
 // ============================================================================
 // Broken impl 1: InflatingContract (violates invariant 2)
@@ -194,32 +195,53 @@ fn try_normalise_numbers(input: &[u8]) -> Option<Vec<u8>> {
 // Broken impl 5: SacrosanctLeakingContract (violates invariant 7)
 // ============================================================================
 
-/// Embeds a known sensitive key name in its output bytes.
+/// Embeds a known sensitive key name as the `request_id` in its decision record.
 ///
-/// Violates invariant 7 (sacrosanct-field passthrough): leaks auth material
-/// into the byte stream (simulating a component that accidentally captures and
-/// echoes a sensitive key name). Verified via `AC12-sacrosanct-redaction`.
+/// Violates invariant 7 (sacrosanct-field passthrough / AC12): the decision record
+/// produced by this component contains a SENSITIVE_EXACT key name as the `request_id`
+/// value — simulating a component that accidentally uses an env-var key name as the
+/// correlation identifier, causing auth material to appear in the persisted log record.
 ///
-/// Note: the output is smaller than the input (to avoid tripping the never-inflate
-/// gate), so we use the identity bytes and append a sentinel that would be caught
-/// by `AC12-sacrosanct-redaction` if it were a record value. In practice this
-/// broken impl is used in unit tests of the redaction logic rather than the
-/// conformance harness (which checks decision record JSON, not output bytes).
+/// The harness `check_sacrosanct_redaction` check must detect this and report
+/// `AC12-sacrosanct-redaction` as `passed: false` when this component is under test.
+///
+/// Output bytes are passthrough (never-inflate is not our violation).
 #[derive(Debug, Clone, Copy)]
 pub struct SacrosanctLeakingContract;
+
+/// The leaked key name embedded verbatim in the `request_id` of the decision record.
+///
+/// This is a SENSITIVE_EXACT entry. `check_sacrosanct_redaction` calls
+/// `contains_sensitive_value_unredacted` which scans the serialised record JSON for
+/// this string as a JSON value — `"ANTHROPIC_API_KEY"` — and must find it.
+pub const LEAKED_KEY_NAME: &str = "ANTHROPIC_API_KEY";
 
 impl Contract for SacrosanctLeakingContract {
     fn component_name(&self) -> &'static str {
         "broken-sacrosanct-leaking"
     }
 
-    fn transform(&self, input: &[u8], request_id: &str) -> Outcome {
+    fn transform(&self, input: &[u8], _request_id: &str) -> Outcome {
         // Passthrough bytes (never-inflate is not our violation).
-        // The violation is that we construct a DecisionRecord whose JSON would
-        // contain the literal string "ANTHROPIC_API_KEY" as a value. We simulate
-        // this by returning a normal Outcome but our unit test checks that
-        // `is_sensitive_key` correctly identifies the leak scenario.
-        Outcome::passthrough(input.to_vec(), request_id, self.component_name())
+        // The AC12 violation: construct a DecisionRecord whose `request_id` field
+        // contains a literal SENSITIVE_EXACT key name. When serialised to JSON this
+        // produces `"request_id":"ANTHROPIC_API_KEY"` — exactly what
+        // `contains_sensitive_value_unredacted` scans for.
+        //
+        // A real producer of this bug would be a proxy that derives request_id from a
+        // request header containing an auth key (e.g., an x-api-key echo pattern).
+        // This broken impl makes that leak observable and testable.
+        let bytes_in = input.len();
+        Outcome {
+            bytes: input.to_vec(),
+            decision: DecisionRecord {
+                request_id: LEAKED_KEY_NAME.to_owned(),
+                component: self.component_name(),
+                decision: Decision::Passthrough,
+                bytes_in,
+                bytes_out: bytes_in,
+            },
+        }
     }
 }
 
@@ -306,12 +328,56 @@ impl MetadataReorderWithMarkers for MarkerOverflowInjector {
 }
 
 // ============================================================================
+// Broken impl 9: SameSlotShrinkViolatorContract (violates SameSlotShrink rule)
+// ============================================================================
+
+/// Violates the `SameSlotShrink` narrowed rule (waiver rule 2) by growing the
+/// slot instead of shrinking it.
+///
+/// A real violator would grow the bytes in a given slot, breaking the invariant
+/// that `apply_shrink` must satisfy `output_slot.len() <= input_slot.len()`.
+/// This broken impl returns one extra byte — verifiable via `verify_shrink_rule`.
+///
+/// Exists solely to satisfy AC18's requirement of a broken impl per waiver rule
+/// (rule 2: `SameSlotShrink` narrowed-rule negative case).
+#[derive(Debug, Clone, Copy)]
+pub struct SameSlotShrinkViolatorContract;
+
+impl Contract for SameSlotShrinkViolatorContract {
+    fn component_name(&self) -> &'static str {
+        "broken-same-slot-shrink-violator"
+    }
+
+    fn transform(&self, input: &[u8], request_id: &str) -> Outcome {
+        // Attempt to apply the (violating) shrink; inflate is caught by verify_shrink_rule.
+        match self.apply_shrink(input, 0, request_id) {
+            Some(output) => {
+                Outcome::modified(output, input.len(), request_id, self.component_name())
+            }
+            None => Outcome::passthrough(input.to_vec(), request_id, self.component_name()),
+        }
+    }
+}
+
+impl SameSlotShrink for SameSlotShrinkViolatorContract {
+    fn apply_shrink(&self, input: &[u8], _slot_index: usize, _request_id: &str) -> Option<Vec<u8>> {
+        if input.is_empty() {
+            return None;
+        }
+        // AC18 violation: grow by one byte instead of shrinking.
+        let mut output = input.to_vec();
+        output.push(b' ');
+        Some(output)
+    }
+}
+
+// ============================================================================
 // Self-test assertions (AC18)
 // ============================================================================
 
 /// Verify that the identity contract passes the full conformance suite.
 ///
-/// Called by the integration test in `tests/conformance.rs`.
+/// Called by the in-crate `#[cfg(test)]` module below.
 pub fn assert_identity_passes(request_id: &str) {
     use super::run_conformance_suite;
     let report = run_conformance_suite(&IdentityContract, request_id);
@@ -418,24 +484,40 @@ pub fn assert_noncanonical_tools_fails_invariant_6() {
     );
 }
 
-/// Verify that `SacrosanctLeakingContract` is correctly identified as a
-/// violation by the `is_sensitive_key` guard (invariant 7 / AC12).
-pub fn assert_sacrosanct_leaking_detected() {
-    use crate::log::is_sensitive_key;
-    // The leaking contract would use a sensitive key name in its decision record.
-    // Verify that `is_sensitive_key` catches the patterns we test against.
+/// Verify that `SacrosanctLeakingContract` is caught by the conformance harness
+/// as an AC12-sacrosanct-redaction violation.
+///
+/// This is a **real negative test**: `SacrosanctLeakingContract` embeds a SENSITIVE_EXACT
+/// key name (`ANTHROPIC_API_KEY`) verbatim in its decision record's `request_id` field.
+/// Running it through `run_conformance_suite` must produce a `AC12-sacrosanct-redaction`
+/// result with `passed: false` — proving the harness *observably catches* the violation
+/// rather than only tautologically asserting the helper function.
+///
+/// Without this test, removing or breaking `check_sacrosanct_redaction` in `mod.rs`
+/// would leave no failing test. With this test, any regression in the AC12 gate causes
+/// an immediate failure here (PF-005: each AC must be observable/testable).
+pub fn assert_sacrosanct_leaking_detected(request_id: &str) {
+    use super::run_conformance_suite;
+
+    let report = run_conformance_suite(&SacrosanctLeakingContract, request_id);
+
+    // The AC12-sacrosanct-redaction check must be present in the report.
+    let ac12_results: Vec<_> = report
+        .results
+        .iter()
+        .filter(|r| r.invariant == "AC12-sacrosanct-redaction")
+        .collect();
     assert!(
-        is_sensitive_key("ANTHROPIC_API_KEY"),
-        "ANTHROPIC_API_KEY must be flagged as sensitive (AC12)"
+        !ac12_results.is_empty(),
+        "AC12-sacrosanct-redaction check must run against SacrosanctLeakingContract"
     );
+
+    // And it must FAIL — the leaking component embeds ANTHROPIC_API_KEY in the record.
     assert!(
-        is_sensitive_key("OPENAI_API_KEY"),
-        "OPENAI_API_KEY must be flagged as sensitive (AC12)"
-    );
-    // And that non-sensitive names pass through.
-    assert!(
-        !is_sensitive_key("REQUEST_ID"),
-        "REQUEST_ID must not be flagged as sensitive"
+        ac12_results.iter().any(|r| !r.passed),
+        "SacrosanctLeakingContract must fail AC12-sacrosanct-redaction \
+         (its decision record request_id contains a SENSITIVE_EXACT key name), \
+         but all checks passed — the AC12 gate is not observing the violation"
     );
 }
 
@@ -448,6 +530,24 @@ pub fn assert_marker_overflow_fails_cap(request_id: &str) {
         assert!(
             !injector.verify_marker_cap(input.len(), output.len()),
             "MarkerOverflowInjector must fail the cap rule"
+        );
+    }
+}
+
+/// Verify that `SameSlotShrinkViolatorContract` fails the `SameSlotShrink` narrowed rule.
+///
+/// This is the AC18 negative test for waiver rule 2 (`SameSlotShrink`): the violator
+/// grows bytes instead of shrinking, so `verify_shrink_rule` must return `false`.
+pub fn assert_same_slot_shrink_violator_fails_rule(request_id: &str) {
+    let violator = SameSlotShrinkViolatorContract;
+    let input = b"hello world";
+    if let Some(output) = violator.apply_shrink(input, 0, request_id) {
+        assert!(
+            !violator.verify_shrink_rule(input.len(), output.len()),
+            "SameSlotShrinkViolatorContract must fail verify_shrink_rule: \
+             output ({}) must be > input ({}) to trigger the violation",
+            output.len(),
+            input.len()
         );
     }
 }
@@ -494,7 +594,12 @@ mod tests {
 
     #[test]
     fn sacrosanct_leaking_detected() {
-        assert_sacrosanct_leaking_detected();
+        assert_sacrosanct_leaking_detected("self-test-008");
+    }
+
+    #[test]
+    fn same_slot_shrink_violator_fails_rule() {
+        assert_same_slot_shrink_violator_fails_rule("self-test-009");
     }
 
     // ========================================================================

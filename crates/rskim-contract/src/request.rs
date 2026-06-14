@@ -9,9 +9,14 @@
 //!
 //! # Byte preservation
 //!
-//! The structural view stores byte offsets into the *original buffer*. Hot-zone
-//! content is re-emitted by splicing from the original — never re-serialized.
-//! This is the enforcement mechanism for invariant 3 (hot-zone byte-identity).
+//! The structural view stores parsed `serde_json::Value` clones of each message
+//! object, not raw byte offsets into the original buffer. Byte-offset derivation
+//! for hot-zone splicing is a per-consumer responsibility (#302); this layer
+//! provides the structural parse and zone-boundary classification only.
+//! Hot-zone content must be re-emitted from the original buffer by
+//! [`crate::zone::splice_hot_zone`] — re-serialization via `serde_json::to_vec`
+//! is forbidden because it can change key order, number tokens, or whitespace,
+//! busting the prompt cache. See `zone.rs` for the splice mechanism.
 //!
 //! # Bounded recursion (AC17)
 //!
@@ -47,6 +52,7 @@ pub const MAX_ANALYSIS_DEPTH: usize = 64;
 
 /// Provider schema variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Provider {
     /// Anthropic `/v1/messages` schema.
     Anthropic,
@@ -55,7 +61,14 @@ pub enum Provider {
 }
 
 /// The role of a message turn in the conversation.
+///
+/// All roles — including unrecognized ones — are retained as turn slots so
+/// that `Turn.index` and `ZoneBoundary.turn_count` share the same index space.
+/// Silently dropping unknown-role turns would misalign `last_assistant_index`
+/// (original-space) with `turn_count` (filtered-space), producing incorrect
+/// zone boundaries. Use `TurnRole::Other` for any role not explicitly listed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TurnRole {
     /// A user or human turn.
     User,
@@ -65,17 +78,27 @@ pub enum TurnRole {
     System,
     /// A tool result turn (OpenAI `"tool"` role, Anthropic `tool_result` block).
     Tool,
+    /// An unrecognized or future role (e.g., OpenAI `"developer"`, custom roles).
+    ///
+    /// Retained as a turn slot to preserve index-space alignment with the original
+    /// messages array. A dropped unknown-role turn would shift `turn_count` relative
+    /// to `last_assistant_index`, making `live_zone_range()` inaccurate.
+    Other,
 }
 
 impl TurnRole {
     /// Parse a role string from either provider schema.
+    ///
+    /// Always returns `Some` — unknown roles map to [`TurnRole::Other`] rather
+    /// than `None`, preserving the turn slot and keeping index spaces aligned.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "user" | "human" => Some(TurnRole::User),
             "assistant" | "model" => Some(TurnRole::Assistant),
             "system" => Some(TurnRole::System),
             "tool" => Some(TurnRole::Tool),
-            _ => None,
+            // OpenAI "developer" role (added 2024) and any other unknown role.
+            _ => Some(TurnRole::Other),
         }
     }
 }
@@ -87,11 +110,14 @@ pub struct Turn {
     pub index: usize,
     /// The role of this turn.
     pub role: TurnRole,
-    /// The raw JSON value of this message object (borrowed from the parsed body).
+    /// The parsed JSON value of this message object (cloned from the parsed body).
     ///
-    /// The raw bytes can be extracted via `serde_json::to_vec` for re-emission.
-    /// For hot-zone turns, the *original buffer splice* takes precedence over
-    /// re-serialization — see [`crate::zone::splice_hot_zone`].
+    /// This is an owned `serde_json::Value` clone, NOT byte offsets into the original
+    /// buffer. Re-emitting via `serde_json::to_vec` is explicitly **forbidden** for
+    /// hot-zone turns because it may change key order, number tokens, or whitespace,
+    /// busting the prompt cache (invariant 3). For hot-zone turns, callers must splice
+    /// directly from the original buffer via [`crate::zone::splice_hot_zone`] using
+    /// byte offsets derived by the #302 consumer.
     pub value: Value,
 }
 
@@ -206,32 +232,48 @@ pub fn parse_request(input: &[u8]) -> Option<StructuralView> {
     let model = obj.get("model").and_then(|v| v.as_str()).map(String::from);
 
     // Parse messages array.
+    //
+    // All slots are retained — including unknown roles — so that `Turn.index` and
+    // `ZoneBoundary.turn_count` share the same index space as the original array.
+    // Silently dropping unknown-role turns would misalign `last_assistant_index`
+    // (original-space) with `turn_count` (filtered-space), producing inverted or
+    // empty live-zone ranges for requests that mix in unknown-role messages
+    // (e.g., OpenAI `"developer"` turns). Unknown roles map to `TurnRole::Other`.
     let messages = obj.get("messages").and_then(|v| v.as_array());
     let turns: Vec<Turn> = messages
         .map(|arr| {
             arr.iter()
                 .enumerate()
-                .filter_map(|(i, msg)| {
-                    let role_str = msg.get("role")?.as_str()?;
-                    let role = TurnRole::parse(role_str)?;
-                    Some(Turn {
+                .map(|(i, msg)| {
+                    // `TurnRole::parse` always returns Some (unknown → Other).
+                    // If role is missing or not a string, treat as Other.
+                    let role = msg
+                        .get("role")
+                        .and_then(|v| v.as_str())
+                        .and_then(TurnRole::parse)
+                        .unwrap_or(TurnRole::Other);
+                    Turn {
                         index: i,
                         role,
                         value: msg.clone(),
-                    })
+                    }
                 })
                 .collect()
         })
         .unwrap_or_default();
 
     // Locate last assistant turn for zone boundary.
+    // `Turn.index` is the original array index; `turn_count` is the original array
+    // length — both index spaces are aligned because no turns were dropped.
     let last_assistant_index = turns
         .iter()
         .rev()
         .find(|t| t.role == TurnRole::Assistant)
         .map(|t| t.index);
 
-    let turn_count = turns.len();
+    // Use the messages array length (not turns.len()) so that turn_count is always
+    // the original-space count even if future code changes the collection logic.
+    let turn_count = messages.map(|arr| arr.len()).unwrap_or(0);
     let zone = ZoneBoundary {
         last_assistant_index,
         turn_count,
@@ -597,8 +639,13 @@ mod tests {
     }
 
     #[test]
-    fn turn_role_parse_unknown_returns_none() {
-        assert_eq!(TurnRole::parse("unknown_role"), None);
-        assert_eq!(TurnRole::parse(""), None);
+    fn turn_role_parse_unknown_returns_other() {
+        // Unknown roles map to TurnRole::Other (not None) to preserve index-space
+        // alignment: no turn slot is dropped, so Turn.index and ZoneBoundary.turn_count
+        // remain consistent with the original messages array positions.
+        assert_eq!(TurnRole::parse("unknown_role"), Some(TurnRole::Other));
+        assert_eq!(TurnRole::parse(""), Some(TurnRole::Other));
+        // OpenAI "developer" role (added 2024) maps to Other until explicitly added.
+        assert_eq!(TurnRole::parse("developer"), Some(TurnRole::Other));
     }
 }

@@ -86,8 +86,10 @@ impl ByteRange {
 ///
 /// # Safety properties (PF-004)
 ///
-/// Offset arithmetic uses `saturating_sub` to avoid underflow. If `range.start`
-/// or `range.end` exceed `original.len()`, `None` is returned — never a panic.
+/// `range.end` is capped to `original.len()` via `.min()` before slicing.
+/// If `range.start > capped_end` (inverted or wholly-out-of-bounds range),
+/// `None` is returned — the slice `&original[start..end]` is never attempted
+/// with an invalid range, so no panic can occur.
 pub fn splice_hot_zone(original: &[u8], range: ByteRange) -> Option<&[u8]> {
     let start = range.start;
     // Saturating end: if range.end > original.len(), cap to original.len().
@@ -100,23 +102,24 @@ pub fn splice_hot_zone(original: &[u8], range: ByteRange) -> Option<&[u8]> {
 
 /// Locate the byte range of the hot zone in the serialised JSON.
 ///
-/// This is a best-effort locator: we find the `"messages"` key in `source`
-/// and determine which bytes correspond to elements 0..=last_assistant_index.
+/// # Status: stub — always returns `None` until #302 provides the typed offset model.
 ///
-/// Returns `None` if:
-/// - The `"messages"` key cannot be found
+/// The intended algorithm: find the `"messages"` key in `source` and derive byte
+/// ranges for elements 0..=`last_assistant_index`. The required per-element byte
+/// offsets are not available at this layer (the structural view stores cloned
+/// `serde_json::Value` objects, not raw buffer offsets). Full offset extraction
+/// is a per-consumer responsibility (#302).
+///
+/// Returning `None` causes the caller to emit passthrough (fail-open), which is
+/// correct and safe — the hot zone is preserved verbatim by passing all bytes
+/// through unchanged.
+///
+/// Returns `None` unconditionally (stub). Once the full implementation lands in
+/// #302, will return `None` when any of these conditions hold:
+///
 /// - The structural view has no assistant turns (hot zone is empty)
-/// - Arithmetic overflows (guarded by checked/saturating ops, PF-004)
-///
-/// When `None` is returned, the caller MUST emit passthrough (fail-open).
-///
-/// # Note on precision
-///
-/// This function relies on serde_json's `preserve_order` feature (already
-/// enabled workspace-wide) for stable key ordering, but it does NOT attempt
-/// to re-parse nested JSON for offset extraction. For the harness self-test,
-/// byte-identity is verified by comparing the original buffer slice with
-/// re-serialisation of untouched fields.
+/// - The `"messages"` key cannot be located at byte level
+/// - Arithmetic overflows (PF-004 checked/saturating ops)
 pub fn locate_hot_zone_range(source: &[u8], view: &StructuralView) -> Option<ByteRange> {
     let last_idx = view.zone.last_assistant_index?;
     // The hot zone ends after element `last_idx` in the messages array.
@@ -142,23 +145,21 @@ pub fn locate_hot_zone_range(source: &[u8], view: &StructuralView) -> Option<Byt
 
 /// Apply a set of live-zone slot edits to produce an output buffer.
 ///
-/// # Algorithm
+/// # Status: stub — always returns `None` until #302 provides the typed offset model.
 ///
+/// The intended algorithm once #302 lands:
 /// 1. Reconstruct the messages array from the structural view's turns.
 /// 2. For each turn in the live zone, apply any matching `SlotEdit`.
-/// 3. Re-serialise only the live-zone turns; hot-zone bytes come from the
-///    original buffer via `splice_hot_zone`.
+/// 3. Re-emit hot-zone bytes from the original buffer via `splice_hot_zone`
+///    (using byte offsets provided by the #302 typed model).
 ///
-/// Returns `None` if any invariant would be violated:
+/// Returns `None` unconditionally (stub). Will return `None` when any invariant
+/// would be violated:
 /// - A slot edit is outside the live zone
 /// - A slot edit's bytes exceed the original slot bytes (inflation)
 /// - Offset arithmetic overflows
 ///
-/// # Current scope
-///
-/// This function is a skeleton for the harness tests. Full offset-level
-/// reconstruction is implemented by `rskim-llm` (#302), which has access
-/// to the typed model required for precise byte-offset extraction.
+/// The caller emits passthrough on `None`, which is correct — no edits applied.
 pub fn apply_live_zone_edits(
     _original: &[u8],
     _view: &StructuralView,

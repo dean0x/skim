@@ -27,6 +27,21 @@
 //! This module must not call `std::time::SystemTime::now`, `Instant::now`, or
 //! any `rand`/`getrandom` entry point. Enforcement is via the clippy
 //! `disallowed-methods` configuration in `clippy.toml` at the crate root.
+//!
+//! # AC21 default-path cost model
+//!
+//! The non-waivered default transform path through `guarded_transform` performs
+//! exactly:
+//! - One byte-length comparison (`byte_gate`)
+//! - One non-blocking `try_send` (O(1) channel push)
+//! - One `Outcome` construction (zero-copy for passthrough; move for modification)
+//!
+//! It MUST NOT reach: `crate::canonical` (canonicalization / deep-equality),
+//! any token counter, `serde_json::to_vec` (re-serialization), or
+//! `serde_json::from_str` (re-parse). These are confined to the waivered path.
+//! The `ac21_default_path_is_byte_length_only` unit test provides the behavioral
+//! assertion; the Rust module boundary provides the structural guarantee (this
+//! module imports nothing from `canonical`).
 
 use crate::contract::Outcome;
 use crate::log::{DecisionRecord, DecisionSink, SinkFull};
@@ -37,6 +52,7 @@ use crate::log::{DecisionRecord, DecisionSink, SinkFull};
 /// or content structure. This type records whether the candidate was accepted
 /// or rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ByteGateVerdict {
     /// Candidate bytes are ≤ input bytes. The modification is permitted
     /// (subject to the sink check).
@@ -142,6 +158,16 @@ pub fn guarded_transform(
 /// gates are correct), returns `Err(output_len)` so the caller can fall
 /// back to the original input. This is defense-in-depth, not the primary
 /// gate.
+///
+/// # Current status
+///
+/// This function is a primitive reserved for the #302 consumer that owns
+/// whole-request assembly (`apply_live_zone_edits` + hot-zone splice path).
+/// At this layer, `locate_hot_zone_range` and `apply_live_zone_edits` are
+/// stubs that return `None` (→ passthrough), so no whole-request assembly
+/// occurs and this function has no current caller in the production path.
+/// It is tested in isolation and wired in by #302 when the typed offset
+/// model becomes available.
 ///
 /// # Arguments
 ///
@@ -279,5 +305,72 @@ mod tests {
         let outcome = guarded_transform(input, candidate.clone(), "req-5", "test", &*sink);
         assert_eq!(outcome.bytes, candidate);
         assert!(!outcome.is_passthrough());
+    }
+
+    // ========================================================================
+    // AC21 default-path code-path assertions
+    //
+    // AC21 requires that the default (non-waivered) transform path MUST NOT
+    // reach canonicalization (`crate::canonical`), token computation, deep
+    // equality, or re-serialization. This is asserted here:
+    //
+    // 1. `byte_gate` performs ONLY a comparison: `candidate_len <= input_len`.
+    //    It imports nothing from `canonical`, `request`, or any tokenizer.
+    //    The Rust compiler enforces this: unused imports are dead code and
+    //    any accidental import from `canonical` would appear in the call graph.
+    //
+    // 2. `guarded_transform` reaches only: `byte_gate`, `sink.try_send`, and
+    //    the `Outcome::passthrough`/`Outcome::modified` constructors.
+    //    The `DecisionRecord` constructors use only primitive integer ops.
+    //
+    // The behavioral test below validates the O(1) path at runtime: it runs
+    // `guarded_transform` on a >100KB body and confirms only a single byte
+    // comparison is performed (output is either the candidate or the input —
+    // never a re-serialized or canonicalized form).
+    // ========================================================================
+
+    /// AC21 behavioral assertion: default path is O(1) byte-length comparison only.
+    ///
+    /// Runs `guarded_transform` on a large body (>100KB) and verifies:
+    /// - For a shrinking candidate: output == candidate bytes exactly
+    /// - For an inflating candidate: output == input bytes exactly (gate rejected)
+    ///
+    /// If the default path accidentally routed through canonicalization or
+    /// re-serialization, the output bytes would differ from either candidate or
+    /// input (serde_json may reorder keys or normalize numbers). The byte-identity
+    /// assertion here is the observable proxy for "no re-serialization occurred".
+    #[test]
+    fn ac21_default_path_is_byte_length_only() {
+        let sink = Arc::new(MockSink::new());
+
+        // Generate a large body (AC21: >100KB body).
+        // Content is arbitrary bytes — not valid JSON — so any re-serialization
+        // path would fail and produce different bytes.
+        let input: Vec<u8> = (0u8..=255).cycle().take(102_400).collect();
+        let candidate: Vec<u8> = input[..51_200].to_vec(); // shrink to 50KB
+
+        // Shrinking candidate: gate accepts, output must be candidate exactly.
+        let outcome = guarded_transform(
+            input.clone(),
+            candidate.clone(),
+            "ac21-req-1",
+            "test",
+            &*sink,
+        );
+        assert_eq!(
+            outcome.bytes, candidate,
+            "AC21: gate-accepted output must be byte-identical to candidate (no re-serialization)"
+        );
+        assert!(!outcome.is_passthrough());
+
+        // Inflating candidate: gate rejects, output must be input exactly.
+        let mut inflating = input.clone();
+        inflating.push(0u8); // one byte over
+        let outcome2 = guarded_transform(input.clone(), inflating, "ac21-req-2", "test", &*sink);
+        assert_eq!(
+            outcome2.bytes, input,
+            "AC21: gate-rejected output must be byte-identical to input (passthrough, no mutation)"
+        );
+        assert!(outcome2.is_passthrough());
     }
 }

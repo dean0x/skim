@@ -100,6 +100,13 @@ pub fn run_conformance_suite(component: &dyn Contract, request_id: &str) -> Conf
 }
 
 /// Run the full conformance suite with optional extension invariant checks.
+///
+/// # Arguments
+///
+/// - `component` — the component under test
+/// - `request_id` — request identifier to use for harness calls
+/// - `extensions` — optional extension-invariant registry; when `Some`, each
+///   registered check runs against every corpus input after the core suite
 pub fn run_conformance_suite_with_extensions(
     component: &dyn Contract,
     request_id: &str,
@@ -174,13 +181,14 @@ pub fn run_conformance_suite_with_extensions(
 fn check_fail_open(component: &dyn Contract, request_id: &str, results: &mut Vec<InvariantResult>) {
     for &corpus_input in corpus::ADVERSARIAL_CORPUS {
         let outcome = component.transform(corpus_input, request_id);
-        // For adversarial inputs (malformed/truncated/etc.), identity components
-        // must return passthrough. Non-identity components may return modifications
-        // only if the output is valid; passthrough is always acceptable.
-        // The invariant here: no panic, no upward error (both guaranteed by the
-        // transform return type), and for malformed inputs specifically, the identity
-        // contract returns passthrough.
-        let passthrough_check = outcome.bytes.len() <= corpus_input.len();
+        // AC3 requires byte-identity on adversarial inputs: output MUST equal input
+        // bytes (not just be no larger). A component that truncates or rewrites a
+        // malformed input — producing different-but-not-longer bytes — passes a
+        // len-only check but still violates the fail-open (passthrough) requirement.
+        //
+        // Asserting byte-identity mirrors the `check_hot_zone_splice_byte_identity`
+        // passthrough branch (mod.rs) and eliminates the false-positive window.
+        let passthrough_check = outcome.bytes.as_slice() == corpus_input;
         results.push(InvariantResult {
             invariant: "AC3-fail-open".to_string(),
             passed: passthrough_check,
@@ -188,7 +196,8 @@ fn check_fail_open(component: &dyn Contract, request_id: &str, results: &mut Vec
                 None
             } else {
                 Some(format!(
-                    "output ({} bytes) > input ({} bytes) on adversarial input",
+                    "output ({} bytes) differs from input ({} bytes) on adversarial input — \
+                     fail-open requires byte-identical passthrough, not just no-inflate",
                     outcome.bytes.len(),
                     corpus_input.len()
                 ))
@@ -370,7 +379,9 @@ fn check_sink_full_passthrough(
     // The core contract trait has no sink parameter; full sink-full testing is done
     // via `guarded_transform` unit tests. Here we verify statelessness (same input →
     // same output), which is the trait-level proxy for sink-failure safety.
-    let input = corpus::VALID_CORPUS[0];
+    let Some(&input) = corpus::VALID_CORPUS.first() else {
+        return;
+    };
     let outcome_1 = component.transform(input, request_id);
     let outcome_2 = component.transform(input, request_id);
     let passed = outcome_1.bytes == outcome_2.bytes;
@@ -511,7 +522,10 @@ fn check_sacrosanct_redaction(
     // literal auth key values from SENSITIVE_EXACT as data values.
     // We test this by using a request_id that looks like an auth key value.
     let fake_key_value = "sk-ant-api03-FAKEKEYFORTESTING1234567890abcdef";
-    let outcome = component.transform(corpus::VALID_CORPUS[0], request_id);
+    let Some(&first_corpus) = corpus::VALID_CORPUS.first() else {
+        return;
+    };
+    let outcome = component.transform(first_corpus, request_id);
 
     // Serialize the decision record to JSON.
     let record_json = outcome.decision.to_json().unwrap_or_default();
@@ -636,19 +650,62 @@ fn check_pathological_inputs(
     });
 }
 
-/// Returns `true` if the JSON string contains any of the SENSITIVE_EXACT values
-/// as bare string values (not as field names).
+/// Returns `true` if the JSON string contains any sensitive key name or suffix
+/// as a bare string value (not as a field name).
 ///
-/// This is a best-effort scan — not a full parser — but is sufficient for
-/// the harness check since the record schema is known.
+/// Delegates to [`crate::log::is_sensitive_key`] for exact-key and suffix matching,
+/// covering both `SENSITIVE_EXACT` and `SENSITIVE_SUFFIXES` uniformly. This is a
+/// best-effort scan — not a full JSON parser — but is sufficient for the harness
+/// check since the record schema is known and bounded.
+///
+/// The scan looks for patterns of the form `:"<TOKEN>"` or `"<TOKEN>"` where TOKEN
+/// is a word that `is_sensitive_key` classifies as sensitive, preventing both
+/// accidental direct-value leaks and suffix-matching bypasses.
 fn contains_sensitive_value_unredacted(json: &str) -> bool {
-    use crate::log::SENSITIVE_EXACT;
-    for key in SENSITIVE_EXACT {
-        // Check if the key appears as a JSON string value (not as a field name
-        // which would be followed by a colon). This catches direct value leakage.
+    use crate::log::{SENSITIVE_EXACT, SENSITIVE_SUFFIXES};
+    // Fast path: check SENSITIVE_EXACT names as quoted JSON values.
+    for &key in SENSITIVE_EXACT {
         if json.contains(&format!("\"{}\"", key)) {
             return true;
         }
+    }
+    // Suffix path: scan all quoted tokens in the JSON for sensitive suffix matches.
+    // This ensures SENSITIVE_SUFFIXES are covered, not just the exact list.
+    // We walk the JSON looking for `"WORD"` patterns and test each WORD.
+    let bytes = json.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            // Find the closing quote (simple scan; JSON strings in record are ASCII).
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != b'"' && bytes[j] != b'\n' {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'"' {
+                // We have a quoted token bytes[start..j].
+                if let Ok(token) = std::str::from_utf8(&bytes[start..j]) {
+                    // Only test tokens that look like identifier-style keys (all ASCII,
+                    // contain at least one underscore or uppercase letter — heuristic to
+                    // skip short values like "modified" or "passthrough").
+                    let looks_like_key = token.len() >= 4
+                        && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && token.contains('_');
+                    if looks_like_key {
+                        // Check suffixes only (exact keys already handled above).
+                        let upper = token.to_uppercase();
+                        for &suffix in SENSITIVE_SUFFIXES {
+                            if upper.ends_with(suffix) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
     }
     false
 }

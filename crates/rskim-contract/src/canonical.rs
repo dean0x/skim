@@ -96,8 +96,20 @@ fn parse_raw_node(raw_src: &str, depth: usize) -> Option<RawNode> {
         }
         b'{' => {
             // Parse object entries preserving individual raw value tokens.
-            // Object key-order doesn't matter for equality (we compare order-insensitively),
-            // so HashMap is fine here.
+            // `HashMap` is used here because:
+            // - `raw_nodes_equal` compares objects order-insensitively via `.find()`,
+            //   so HashMap iteration order does not affect the equality RESULT.
+            // - The comparison result (true/false) is fully deterministic per input
+            //   regardless of HashMap iteration order — the boolean outcome does not
+            //   vary across runs or platforms.
+            // - Duplicate keys collapse to last-wins (same as serde_json's own `Value`
+            //   parse), which is consistent. Duplicate keys in tool schemas are
+            //   pathological and not produced by real providers.
+            //
+            // The crate's `disallowed-methods` gate bans entropy sources, not data
+            // structures. HashMap key ordering is non-deterministic in theory but the
+            // boolean equality result derived from it is deterministic per (a, b) input
+            // pair, satisfying invariant 5.
             let map: std::collections::HashMap<String, Box<serde_json::value::RawValue>> =
                 serde_json::from_str(token).ok()?;
             let mut result = Vec::with_capacity(map.len());
@@ -119,6 +131,17 @@ fn parse_raw_node(raw_src: &str, depth: usize) -> Option<RawNode> {
 /// - Objects: order-insensitive key comparison
 /// - Arrays: order-sensitive
 /// - Numbers: raw byte equality (the AC11 invariant)
+///
+/// # Depth bound (AC17)
+///
+/// `raw_nodes_equal` is recursive but carries no explicit depth counter.
+/// Termination is transitively bounded: `RawNode` trees are produced by
+/// `parse_raw_node`, which checks `depth > MAX_CANONICAL_DEPTH` at each
+/// recursion level and returns `None` for over-depth inputs. A tree deeper
+/// than the bound therefore cannot be constructed — so `raw_nodes_equal`
+/// can only receive trees whose depth is ≤ `MAX_CANONICAL_DEPTH`.
+/// This satisfies AC17's "all recursion explicitly bounded" requirement,
+/// though the bound is at the parse site rather than the comparison site.
 fn raw_nodes_equal(a: &RawNode, b: &RawNode) -> bool {
     match (a, b) {
         (RawNode::Null, RawNode::Null) => true,
@@ -154,7 +177,10 @@ pub const MAX_CANONICAL_DEPTH: usize = 64;
 /// Returns `true` iff `a` and `b` are semantically equal under the pinned
 /// canonicalization:
 /// - Object keys are compared order-insensitively (recursive key-sort)
-/// - Numbers are compared as raw source-token bytes
+/// - Numbers are compared as parsed f64 values (since `arbitrary_precision` is
+///   NOT enabled, `1e3` and `1000` are considered equal — use
+///   [`canonical_equal_raw`] or [`tools_arrays_equal`] for the invariant-6
+///   raw-token-byte comparison required on the waivered tools-array path)
 /// - Arrays are order-sensitive
 /// - Exceeding `MAX_CANONICAL_DEPTH` returns `false`
 ///

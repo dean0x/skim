@@ -71,6 +71,7 @@ libc = "0.2"
 filetime = "0.2"
 crossbeam-channel = "0.5"
 static_assertions = "1.1"
+trybuild = "1.0"
 gix = { version = "0.72", default-features = false, features = ["max-performance-safe", "blob-diff"] }
 quick-xml = "0.37"
 

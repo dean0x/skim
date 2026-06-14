@@ -12,7 +12,7 @@
 //!
 //! # Motivating example: marker-immutability (#308)
 //!
-//! The `rskim-proxy` crate (#308) injects `cache_control` markers. Once a
+//! The #308 marker-layer consumer injects `cache_control` markers. Once a
 //! marker is injected, it must remain byte-identical in future passes
 //! (marker-immutability invariant). This is not one of the eight core invariants
 //! but can be registered as an extension:

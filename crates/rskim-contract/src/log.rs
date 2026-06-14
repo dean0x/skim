@@ -102,6 +102,7 @@ pub fn is_sensitive_key(key: &str) -> bool {
 /// The decision variant: whether bytes were modified or passed through.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Decision {
     /// Output bytes differ from input bytes.
     Modified,
@@ -139,7 +140,25 @@ impl DecisionRecord {
     ///
     /// `bytes_in == bytes_out` for passthrough; the invariant is recorded
     /// in both fields for consistency.
+    ///
+    /// # Caller contract: `request_id` must not contain auth material
+    ///
+    /// `request_id` is serialized verbatim into the record JSON. AC12 mandates
+    /// that auth material MUST NEVER appear unredacted in any log record. Callers
+    /// MUST use an opaque, non-secret correlation identifier (e.g., a UUID or a
+    /// hashed request identifier), never a bearer token, API key, or value derived
+    /// from a request header that could carry auth material.
+    ///
+    /// A `debug_assert` checks this at construction time in debug builds.
     pub fn passthrough(request_id: &str, component: &'static str, bytes_in: usize) -> Self {
+        // Defense-in-depth: assert in debug builds that request_id is not a
+        // known sensitive key name. This catches obvious misuse at the trust
+        // boundary during development without overhead in release builds.
+        debug_assert!(
+            !is_sensitive_key(request_id),
+            "AC12 violation: request_id '{request_id}' matches a sensitive key pattern — \
+             use an opaque correlation identifier, not an auth material value"
+        );
         Self {
             request_id: request_id.to_owned(),
             component,
@@ -150,12 +169,21 @@ impl DecisionRecord {
     }
 
     /// Construct a modification record.
+    ///
+    /// # Caller contract: `request_id` must not contain auth material
+    ///
+    /// See [`DecisionRecord::passthrough`] for the full AC12 caller contract.
     pub fn modified(
         request_id: &str,
         component: &'static str,
         bytes_in: usize,
         bytes_out: usize,
     ) -> Self {
+        debug_assert!(
+            !is_sensitive_key(request_id),
+            "AC12 violation: request_id '{request_id}' matches a sensitive key pattern — \
+             use an opaque correlation identifier, not an auth material value"
+        );
         Self {
             request_id: request_id.to_owned(),
             component,
@@ -203,8 +231,8 @@ pub struct SinkFull;
 /// # Dependency injection
 ///
 /// The sink is a constructor parameter, not a global. Tests use [`MockSink`];
-/// production code uses [`ChannelDecisionSink`]. The `rskim-proxy` crate
-/// (#305) provides the persistent database-backed implementation.
+/// production code uses [`ChannelDecisionSink`]. The #305 sink-persistence
+/// consumer provides the persistent database-backed implementation.
 pub trait DecisionSink: Send + Sync {
     /// Attempt to send `record` to the sink without blocking.
     ///

@@ -4,10 +4,18 @@
 // never-inflate and append-only invariants. These tests use proptest to
 // generate adversarial inputs that probe the invariant boundaries.
 //
-// Both the IdentityContract (reference) and broken impls are exercised.
+// Both the IdentityContract (reference) AND broken impls / enforcement
+// mechanisms are exercised — specifically `guarded_transform` (the never-inflate
+// gate) and `InflatingContract` (the canonical broken impl for that invariant).
+// Testing only the IdentityContract in isolation is tautological because
+// identity passthrough cannot inflate by construction. Decision 8 requires
+// "adversarial inputs, not just fixtures" — these tests drive the GATE.
 
 use proptest::prelude::*;
 use rskim_contract::contract::{Contract, IdentityContract};
+use rskim_contract::guardrail::guarded_transform;
+use rskim_contract::log::MockSink;
+use std::sync::Arc;
 
 // ============================================================================
 // Strategy: generate arbitrary byte sequences
@@ -160,5 +168,106 @@ proptest! {
         let out3 = c.transform(&input, "prop-req-6").bytes;
         prop_assert_eq!(&out1, &out2, "non-deterministic output between run 1 and 2");
         prop_assert_eq!(&out2, &out3, "non-deterministic output between run 2 and 3");
+    }
+}
+
+// ============================================================================
+// Property: guarded_transform rejects inflation (invariant 2 / Decision 8)
+//
+// These are the NON-TAUTOLOGICAL properties mandated by Decision 8.
+// They exercise the actual enforcement mechanism — `guarded_transform` and its
+// `byte_gate` — against generated candidate/input pairs, not just the identity
+// passthrough which cannot inflate by construction.
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 200,
+        max_shrink_iters: 500,
+        ..ProptestConfig::default()
+    })]
+
+    /// `guarded_transform` must always produce output ≤ input for any candidate.
+    ///
+    /// When `candidate.len() > input.len()`, the gate must reject and return
+    /// byte-identical passthrough. This exercises the actual `byte_gate` enforcement
+    /// path rather than the identity contract (which trivially cannot inflate).
+    #[test]
+    fn prop_guarded_transform_never_inflates(
+        input in arb_bytes(),
+        candidate in arb_bytes(),
+    ) {
+        let sink = Arc::new(MockSink::new());
+        let input_len = input.len();
+        let candidate_len = candidate.len();
+        let outcome = guarded_transform(
+            input.clone(),
+            candidate,
+            "prop-gate-1",
+            "test",
+            &*sink,
+        );
+        prop_assert!(
+            outcome.bytes.len() <= input_len,
+            "guarded_transform must never produce output ({}) > input ({}) for \
+             any candidate ({}) — byte_gate must reject inflation",
+            outcome.bytes.len(),
+            input_len,
+            candidate_len,
+        );
+    }
+
+    /// When `candidate.len() > input.len()`, `guarded_transform` must return
+    /// byte-identical input (passthrough) — not just a non-inflated result.
+    ///
+    /// This is the stricter form: the gate fallback must be the ORIGINAL bytes,
+    /// not a different-but-shorter transformation.
+    #[test]
+    fn prop_guarded_transform_inflation_falls_back_to_input(
+        input in arb_bytes().prop_filter("non-empty input", |b| !b.is_empty()),
+        extra in prop::collection::vec(any::<u8>(), 1..=64),
+    ) {
+        // Construct a candidate that is strictly larger than input.
+        let mut candidate = input.clone();
+        candidate.extend_from_slice(&extra);
+        prop_assume!(candidate.len() > input.len());
+
+        let sink = Arc::new(MockSink::new());
+        let outcome = guarded_transform(
+            input.clone(),
+            candidate,
+            "prop-gate-2",
+            "test",
+            &*sink,
+        );
+        // Gate must reject → output must be byte-identical to input (passthrough).
+        prop_assert_eq!(
+            outcome.bytes, input,
+            "rejected-by-gate outcome must be byte-identical to input"
+        );
+        // No decision record must be sent (gate rejection, not sink dispatch).
+        prop_assert!(sink.is_empty(), "byte_gate rejection must send no record to sink");
+    }
+
+    /// When `candidate.len() <= input.len()` and sink accepts, `guarded_transform`
+    /// must return the candidate bytes (not the input).
+    #[test]
+    fn prop_guarded_transform_shrink_accepted(
+        input in arb_bytes().prop_filter("need at least 2 bytes to shrink", |b| b.len() >= 2),
+    ) {
+        // Candidate is a strict prefix — always shorter.
+        let candidate = input[..input.len() / 2].to_vec();
+        let sink = Arc::new(MockSink::new());
+        let outcome = guarded_transform(
+            input.clone(),
+            candidate.clone(),
+            "prop-gate-3",
+            "test",
+            &*sink,
+        );
+        prop_assert_eq!(
+            outcome.bytes, candidate,
+            "gate-accepted shrink must return candidate bytes"
+        );
     }
 }

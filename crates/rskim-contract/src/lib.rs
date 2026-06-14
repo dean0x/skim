@@ -27,8 +27,9 @@
 //!
 //! 5. **Determinism** — No wall-clock time, no entropy in the transform path.
 //!    `SystemTime::now`, `Instant::now`, and `rand`/`getrandom` are statically
-//!    banned by a clippy `disallowed-methods` gate. All injected clocks and entropy
-//!    sources are constructor parameters.
+//!    banned by the clippy `disallowed-methods` gate (AC10). The `Contract::transform`
+//!    signature carries no clock parameter — enforcement is structural absence, not
+//!    dependency injection.
 //!
 //! 6. **Canonical tool equality** — Any waivered tools-array reorder must be
 //!    deep-equal to the original. Numbers are compared as **raw source-token bytes
