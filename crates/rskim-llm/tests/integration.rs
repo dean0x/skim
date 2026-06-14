@@ -223,6 +223,27 @@ fn ac8_error_conditions() {
 }
 
 #[test]
+fn ac8_top_level_string_multibyte_boundary_no_panic() {
+    // Regression: describe_value() truncates long top-level strings for the
+    // NotAnObject diagnostic. A raw byte slice at index 32 can fall mid-codepoint
+    // and panic on hostile input. The error path must return Err, never panic (AC8).
+    let mut s = String::new();
+    for _ in 0..31 {
+        s.push('a'); // 31 ASCII bytes
+    }
+    s.push('é'); // 2 bytes occupying indices 31..33 — byte 32 is mid-codepoint
+    for _ in 0..20 {
+        s.push('b'); // push past the 32-byte truncation threshold
+    }
+    let json = serde_json::to_string(&s).expect("encode string");
+    let result = parse(json.as_bytes());
+    assert!(
+        result.is_err(),
+        "top-level string must return Err (NotAnObject), not panic"
+    );
+}
+
+#[test]
 fn ac8_errors_have_non_empty_diagnostics() {
     let cases: &[(&[u8], &str)] = &[
         (b"", "empty input"),

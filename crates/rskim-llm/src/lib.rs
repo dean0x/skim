@@ -62,7 +62,9 @@
 //! typical tool-result-heavy bodies. This accounts for: the input buffer (1×), the
 //! parsed `serde_json::Value` intermediate (≤1.5×), and the typed model (≤1×). The
 //! `RawValue` mechanism avoids re-encoding number tokens so there is no size inflation.
-//! Measured and asserted in the integration test suite with a counting allocator.
+//! The `k = 3.5×` figure is an analytical estimate; wiring it up as an enforced
+//! counting-allocator regression gate (AC14) is a tracked follow-up (Wave-1 perf gate,
+//! #309) — there is no isolated counting-allocator test binary in this crate yet.
 //!
 //! # No I/O, no ambient state
 //!

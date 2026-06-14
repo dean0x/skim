@@ -1,20 +1,19 @@
 //! Criterion benchmark for rskim-llm parse+classify+serialize pipeline.
 //!
-//! # Relative linearity gate (ADR-003/AC14)
+//! # Relative linearity baseline (ADR-003/AC14)
 //!
-//! The absolute <=1ms/100KB figure is RECORDED as a baseline, NOT enforced as a gate
-//! (1ms is within CI-runner noise per ADR-003). The enforced gates are:
+//! This benchmark RECORDS the absolute parse+classify+serialize times across
+//! 100KB / 1MB / 10MB tool-result-heavy bodies. Per ADR-003, the absolute
+//! <=1ms/100KB figure is a baseline, NOT a pass/fail gate (1ms is within
+//! CI-runner noise).
 //!
-//! - time(1MB) <= 15x time(100KB)
-//! - time(10MB) <= 15x time(1MB)
-//!
-//! These are asserted in the integration test suite (not here) using stored Criterion
-//! estimates from the benches output directory. This file records the absolute times.
-//!
-//! # Memory constant k
-//!
-//! See `tests/memory_alloc.rs` for the isolated counting-allocator test that verifies
-//! peak allocation <= k × body_size.
+//! The relative-linearity gate (time(1MB) <= 15x time(100KB) and
+//! time(10MB) <= 15x time(1MB)) and the counting-allocator memory k-bound
+//! (peak allocation <= k × body_size) described in AC14 are NOT yet wired up as
+//! enforced assertions — there is no in-run linearity assertion and no isolated
+//! counting-allocator test binary in this crate today. Tracking those two
+//! grounded gates is a follow-up (see #309 / Wave-1 perf-gate follow-up); this
+//! file currently provides the measured baseline they will be grounded against.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rskim_llm::{classify_body, parse, serialize};

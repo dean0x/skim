@@ -531,10 +531,10 @@ pub(crate) fn anthropic_leaf_texts(body: &AnthropicBody) -> Vec<(String, &str)> 
                             }
                             Some(ToolResultContent::Blocks(leaves)) => {
                                 for (li, leaf) in leaves.iter().enumerate() {
-                                    if leaf.block_type == "text" {
-                                        if let Some(s) = leaf.text.as_deref() {
-                                            out.push((format!("m{mi}b{bi}l{li}"), s));
-                                        }
+                                    if leaf.block_type == "text"
+                                        && let Some(s) = leaf.text.as_deref()
+                                    {
+                                        out.push((format!("m{mi}b{bi}l{li}"), s));
                                     }
                                 }
                             }

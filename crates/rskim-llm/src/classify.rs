@@ -345,9 +345,15 @@ fn has_bracketed_prefix(line: &str) -> bool {
 
 /// Extract the language hint from the tag portion of a fence opener (the text after ` ``` `).
 fn fence_lang_hint(after_fence_markers: &str) -> Option<String> {
-    let tag_end = after_fence_markers.find('\n').unwrap_or(after_fence_markers.len());
+    let tag_end = after_fence_markers
+        .find('\n')
+        .unwrap_or(after_fence_markers.len());
     let lang = after_fence_markers[..tag_end].trim();
-    if lang.is_empty() { None } else { Some(lang.to_string()) }
+    if lang.is_empty() {
+        None
+    } else {
+        Some(lang.to_string())
+    }
 }
 
 /// Try to classify as mixed (prose with embedded fenced code blocks).
