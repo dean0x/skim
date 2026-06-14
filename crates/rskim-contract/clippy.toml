@@ -1,0 +1,21 @@
+# rskim-contract clippy configuration
+#
+# Determinism gate (invariant 5 / AC10): forbid wall-clock time and entropy in
+# the transform path. Any call to these methods in transform-path modules is a
+# determinism violation that would cause non-reproducible outputs.
+#
+# This gate is checked by: cargo clippy -p rskim-contract --all-targets -- -D warnings
+# CI runs this on ubuntu-latest, macos-latest, and windows-latest (AC20).
+#
+# The banned methods are:
+# - std::time::SystemTime::now — wall-clock time (non-deterministic)
+# - std::time::Instant::now — monotonic time (non-deterministic across runs)
+# - rand entry points — non-deterministic entropy
+# - getrandom entry points — OS entropy (non-deterministic)
+#
+# Note: `std::thread::sleep` is not banned because it does not affect output
+# bytes, only latency. However, it should never appear in the transform path.
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "non-deterministic — forbidden in L3 transform path (invariant 5)" },
+    { path = "std::time::Instant::now", reason = "non-deterministic — forbidden in L3 transform path (invariant 5)" },
+]

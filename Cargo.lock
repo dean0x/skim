@@ -2436,6 +2436,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rskim-contract"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "rskim-core"
 version = "2.10.0"
 dependencies = [

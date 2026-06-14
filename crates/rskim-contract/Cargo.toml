@@ -1,0 +1,38 @@
+[package]
+name = "rskim-contract"
+version = "0.1.0"
+edition = "2024"
+authors = ["Skim Contributors"]
+license = "MIT"
+description = "Safety invariant contract and fail-open guardrail module for skim Layer 3"
+repository = "https://github.com/dean0x/skim"
+# publish = false matching rskim-search / rskim-tokens precedent.
+# Layer-3 crate: no l3- infix per Decision 2 / #309 naming convention.
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[features]
+# harness feature gates the conformance-test support module.
+# Downstream crates (rskim-llm, etc.) add:
+#   [dev-dependencies]
+#   rskim-contract = { path = "..", features = ["harness"] }
+# to get the reusable adversarial corpus and per-invariant assertion functions.
+harness = []
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+
+[lib]
+name = "rskim_contract"
+path = "src/lib.rs"
