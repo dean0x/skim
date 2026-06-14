@@ -133,10 +133,10 @@ pub fn locate_hot_zone_range(source: &[u8], view: &StructuralView) -> Option<Byt
     // byte offsets from their own typed model. This crate provides the splice
     // mechanism and the invariant; the offset derivation is a per-consumer
     // responsibility.
-    let _ = last_idx; // acknowledged: full implementation in consumers
-    let _ = source;
-    // Return None to indicate "hot zone location not yet implemented at this layer."
-    // Callers should fall back to passthrough for hot-zone-touching operations.
+    // acknowledged: full offset-derivation is a per-consumer responsibility (#302).
+    let _ = (last_idx, source);
+    // Return None: hot zone location is not implemented at this layer.
+    // Callers fall back to passthrough for hot-zone-touching operations.
     None
 }
 
@@ -193,16 +193,12 @@ mod tests {
     }
 
     #[test]
-    fn splice_hot_zone_out_of_bounds_returns_none() {
+    fn splice_hot_zone_end_beyond_buf_is_capped() {
         let buf = b"short";
-        // end > buf.len() — out of range must return None.
+        // end (100) > buf.len() (5) — end is capped to 5, start (3) < 5 → Some(&buf[3..5]).
         let range = ByteRange { start: 3, end: 100 };
-        // end is capped to buf.len() (5), start (3) < end (5) → Some(&buf[3..5]) = b"rt"
-        // Actually: we cap end to buf.len()=5, 3 < 5 → returns Some.
-        // Only None when start > end after capping.
         let result = splice_hot_zone(buf, range);
-        assert!(result.is_some()); // start 3 < capped_end 5
-        assert_eq!(result.unwrap(), b"rt");
+        assert_eq!(result, Some(b"rt".as_ref()));
     }
 
     #[test]
@@ -210,10 +206,10 @@ mod tests {
         let buf = b"hello";
         // start > end → None after capping.
         let range = ByteRange {
-            start: 10, // beyond buf
-            end: 3,    // end caps to 5, but start(10) > 5 → none
+            start: 10, // beyond buf.len() (5), so start > capped_end (3)
+            end: 3,
         };
-        // end = 3, capped to 3, start = 10 > end 3 → None
+        // end (3) < buf.len() (5) → stays 3; start (10) > end (3) → None
         let result = splice_hot_zone(buf, range);
         assert!(result.is_none());
     }

@@ -91,10 +91,8 @@ pub const SENSITIVE_SUFFIXES: &[&str] = &[
 /// ```
 pub fn is_sensitive_key(key: &str) -> bool {
     let upper = key.to_uppercase();
-    if SENSITIVE_EXACT.iter().any(|&e| e == upper) {
-        return true;
-    }
-    SENSITIVE_SUFFIXES.iter().any(|&s| upper.ends_with(s))
+    SENSITIVE_EXACT.iter().any(|&e| e == upper)
+        || SENSITIVE_SUFFIXES.iter().any(|&s| upper.ends_with(s))
 }
 
 // ============================================================================

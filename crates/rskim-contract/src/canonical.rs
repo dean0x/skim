@@ -123,7 +123,7 @@ fn raw_nodes_equal(a: &RawNode, b: &RawNode) -> bool {
     match (a, b) {
         (RawNode::Null, RawNode::Null) => true,
         (RawNode::Bool(x), RawNode::Bool(y)) => x == y,
-        (RawNode::Number(x), RawNode::Number(y)) => x.as_bytes() == y.as_bytes(),
+        (RawNode::Number(x), RawNode::Number(y)) => x == y,
         (RawNode::JsonString(x), RawNode::JsonString(y)) => x == y,
         (RawNode::Array(xs), RawNode::Array(ys)) => {
             xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| raw_nodes_equal(x, y))
@@ -194,19 +194,9 @@ fn canonical_equal_inner(a: &Value, b: &Value, depth: usize) -> bool {
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::String(x), Value::String(y)) => x == y,
         (Value::Number(x), Value::Number(y)) => {
-            // Compare numbers as raw source-token bytes.
-            // serde_json::Number's to_string() produces the canonical representation
-            // of the parsed number. Since `arbitrary_precision` is NOT enabled,
-            // serde_json normalises numbers to f64 internally, so `1e3` and `1000.0`
-            // may compare equal at the Value level.
-            //
-            // For exact raw-token comparison (the full invariant 6 guarantee),
-            // callers should use `serde_json::value::RawValue` and compare the
-            // raw JSON source strings before parsing. This function compares
-            // Value::Number objects, which is the post-parse representation.
-            //
-            // The harness uses raw-string comparison (see `canonical_equal_raw`)
-            // for the full invariant 6 check.
+            // Post-parse comparison: `arbitrary_precision` is NOT enabled, so
+            // serde_json normalises numbers to f64 (e.g., `1e3` == `1000`).
+            // For full invariant 6 (raw-token byte equality), use `canonical_equal_raw`.
             x == y
         }
         (Value::Array(xs), Value::Array(ys)) => {
@@ -305,19 +295,14 @@ pub fn tools_arrays_equal(raw_original: &str, raw_reordered: &str) -> bool {
     // Use the raw-node path so numbers are compared as token bytes, not as
     // parsed f64 values (which would normalise 1e3 == 1000 without
     // arbitrary_precision). This is the canonical path for AC11.
-    let a = match parse_raw_node(raw_original, 0) {
-        Some(n) => n,
-        None => return false,
-    };
-    let b = match parse_raw_node(raw_reordered, 0) {
-        Some(n) => n,
-        None => return false,
+    let (Some(a), Some(b)) = (
+        parse_raw_node(raw_original, 0),
+        parse_raw_node(raw_reordered, 0),
+    ) else {
+        return false;
     };
     // Both must be arrays.
-    match (&a, &b) {
-        (RawNode::Array(_), RawNode::Array(_)) => raw_nodes_equal(&a, &b),
-        _ => false,
-    }
+    matches!((&a, &b), (RawNode::Array(_), RawNode::Array(_))) && raw_nodes_equal(&a, &b)
 }
 
 #[cfg(test)]

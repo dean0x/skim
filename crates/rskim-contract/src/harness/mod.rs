@@ -362,10 +362,9 @@ fn check_sink_full_passthrough(
     request_id: &str,
     results: &mut Vec<InvariantResult>,
 ) {
-    // We test this invariant via the guardrail module directly.
-    // The core contract trait doesn't expose a sink parameter;
-    // the invariant is enforced at the guarded_transform level.
-    // Here we verify the contract type's transform is deterministic and fail-open.
+    // The core contract trait has no sink parameter; full sink-full testing is done
+    // via `guarded_transform` unit tests. Here we verify statelessness (same input →
+    // same output), which is the trait-level proxy for sink-failure safety.
     let input = corpus::VALID_CORPUS[0];
     let outcome_1 = component.transform(input, request_id);
     let outcome_2 = component.transform(input, request_id);
