@@ -18,6 +18,7 @@ crossbeam-channel = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+trybuild = "1.0"
 
 [features]
 # harness feature gates the conformance-test support module.

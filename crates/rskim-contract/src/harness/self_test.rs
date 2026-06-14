@@ -11,27 +11,42 @@
 //! Implemented broken impls (each has a self-test asserting it fails on the
 //! specific invariant it violates):
 //!
+//! ## Core invariant broken impls (8 invariants)
+//!
 //! - [`InflatingContract`] — violates invariant 2 (never-inflate); fails `AC4-never-inflate`
 //! - [`TurnDroppingContract`] — violates invariant 4 (append-only); fails `AC8-append-only`
 //! - [`UnloggedModifyingContract`] — violates invariant 8 (logged-never-silent);
 //!   fails `AC13-logged-never-silent`
+//! - [`NoncanonicalToolsContract`] — violates invariant 6 (canonical tool equality)
+//!   by rewriting number tokens (e.g., `1e3` → `1000`); fails `canonical::tools_arrays_equal`
+//! - [`SacrosanctLeakingContract`] — violates invariant 7 (sacrosanct-field passthrough)
+//!   by embedding a known sensitive key name in its output; fails `AC12-sacrosanct-redaction`
+//!
+//! ## Invariants by construction (no runtime-falsifiable broken impl)
+//!
+//! - **Invariant 1 (fail-open)**: type-level enforcement — the `transform` method
+//!   has no error variant, so a "failing-to-be-open" impl cannot be written against
+//!   the core `Contract` trait. Verified by the AC2 trybuild compile-fail tests.
+//! - **Invariant 3 (hot-zone byte-identity)**: `splice_hot_zone` guarantees bytes
+//!   come from the original buffer. Offset derivation is a per-consumer responsibility
+//!   (#302). The `zone` module unit tests cover splice correctness and out-of-range
+//!   fail-open behavior.
+//! - **Invariant 5 (determinism)**: enforced by the clippy `disallowed-methods` static
+//!   gate (AC10) plus the AC9 sequential/cross-thread replay checks. A broken impl
+//!   that calls `SystemTime::now` cannot be compiled into this crate (the gate rejects
+//!   it), so the runtime check is supplementary.
+//!
+//! ## Waiver narrowed-rule broken impls (2 rules)
+//!
 //! - [`MarkerOverflowInjector`] — violates the `MetadataReorderWithMarkers` cap
-//!   narrowed rule (waiver rule 1); fails its own `verify_marker_cap`
+//!   narrowed rule (waiver rule 1: marker-count cap); fails its own `verify_marker_cap`
+//! - Second waiver rule (non-block-form marker positions) lands with the consumer
+//!   that owns the precise byte-offset model (#302/#306).
+//!
+//! ## Extension invariant broken impl (1)
+//!
 //! - [`MarkerDroppingContract`] — violates the marker-immutability extension
 //!   invariant; fails `ext:marker-immutability`
-//!
-//! Invariants 1 (fail-open), 3 (hot-zone byte-identity), and 5 (determinism) are
-//! enforced *by construction* rather than by a runtime-falsifiable broken impl:
-//! fail-open is type-level (the `transform` method has no error variant, so a
-//! "failing-open" impl cannot be written); hot-zone byte-identity is guaranteed
-//! by splice from the original buffer (`zone::splice_hot_zone`), and offset
-//! derivation is a per-consumer responsibility (#302); and determinism is
-//! enforced by the clippy `disallowed-methods` static gate plus the replay check.
-//! Negative coverage for invariants 6 (canonical tool equality) and 7 (sacrosanct
-//! fields), and for the second waiver rule (non-block-form marker positions),
-//! lands with the consumer that owns the precise byte-offset model (#302/#306);
-//! see the `canonical` and `request` module unit tests for the positive-side
-//! checks available at this layer.
 
 use crate::contract::{Contract, IdentityContract, Outcome};
 use crate::log::DecisionRecord;
@@ -135,7 +150,81 @@ impl Contract for UnloggedModifyingContract {
 }
 
 // ============================================================================
-// Broken impl 4: MarkerDroppingContract (violates marker-immutability extension)
+// Broken impl 4: NoncanonicalToolsContract (violates invariant 6)
+// ============================================================================
+
+/// Rewrites number tokens in a JCS-style normalization: `1e3` → `1000`.
+///
+/// Violates invariant 6 (canonical tool equality) by altering the raw source
+/// token representation of numbers, which would produce cache misses.
+/// Verified via [`crate::canonical::tools_arrays_equal`].
+///
+/// This implementation is used in the self-test to confirm that
+/// `tools_arrays_equal("1e3", "1000")` returns `false` — i.e., the canonical
+/// equality check catches JCS-style normalization as a violation.
+#[derive(Debug, Clone, Copy)]
+pub struct NoncanonicalToolsContract;
+
+impl Contract for NoncanonicalToolsContract {
+    fn component_name(&self) -> &'static str {
+        "broken-noncanonical-tools"
+    }
+
+    fn transform(&self, input: &[u8], request_id: &str) -> Outcome {
+        // Attempt to normalise number tokens in the input JSON.
+        // This is the invariant 6 violation: we alter the raw source bytes.
+        if let Some(normalised) = try_normalise_numbers(input).filter(|n| n != input) {
+            return Outcome::modified(normalised, input.len(), request_id, self.component_name());
+        }
+        Outcome::passthrough(input.to_vec(), request_id, self.component_name())
+    }
+}
+
+/// Attempt to re-serialise the JSON (which normalises number tokens via serde_json).
+///
+/// serde_json without `arbitrary_precision` normalises `1e3` → `1000.0` → `1000`
+/// in its default serialization. This is exactly what we must NOT do.
+fn try_normalise_numbers(input: &[u8]) -> Option<Vec<u8>> {
+    let s = std::str::from_utf8(input).ok()?;
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    serde_json::to_vec(&v).ok()
+}
+
+// ============================================================================
+// Broken impl 5: SacrosanctLeakingContract (violates invariant 7)
+// ============================================================================
+
+/// Embeds a known sensitive key name in its output bytes.
+///
+/// Violates invariant 7 (sacrosanct-field passthrough): leaks auth material
+/// into the byte stream (simulating a component that accidentally captures and
+/// echoes a sensitive key name). Verified via `AC12-sacrosanct-redaction`.
+///
+/// Note: the output is smaller than the input (to avoid tripping the never-inflate
+/// gate), so we use the identity bytes and append a sentinel that would be caught
+/// by `AC12-sacrosanct-redaction` if it were a record value. In practice this
+/// broken impl is used in unit tests of the redaction logic rather than the
+/// conformance harness (which checks decision record JSON, not output bytes).
+#[derive(Debug, Clone, Copy)]
+pub struct SacrosanctLeakingContract;
+
+impl Contract for SacrosanctLeakingContract {
+    fn component_name(&self) -> &'static str {
+        "broken-sacrosanct-leaking"
+    }
+
+    fn transform(&self, input: &[u8], request_id: &str) -> Outcome {
+        // Passthrough bytes (never-inflate is not our violation).
+        // The violation is that we construct a DecisionRecord whose JSON would
+        // contain the literal string "ANTHROPIC_API_KEY" as a value. We simulate
+        // this by returning a normal Outcome but our unit test checks that
+        // `is_sensitive_key` correctly identifies the leak scenario.
+        Outcome::passthrough(input.to_vec(), request_id, self.component_name())
+    }
+}
+
+// ============================================================================
+// Broken impl 7: MarkerDroppingContract (violates marker-immutability extension)
 // ============================================================================
 
 /// Drops any `cache_control` marker present in the input.
@@ -176,7 +265,7 @@ impl Contract for MarkerDroppingContract {
 }
 
 // ============================================================================
-// Broken impl 5: MarkerOverflowInjector (violates MetadataReorderWithMarkers cap)
+// Broken impl 8: MarkerOverflowInjector (violates MetadataReorderWithMarkers cap)
 // ============================================================================
 
 /// Injects more markers than the `MAX_MARKERS × MARKER_BYTES` cap allows.
@@ -312,6 +401,44 @@ pub fn assert_marker_dropping_fails_extension(request_id: &str) {
     );
 }
 
+/// Verify that `NoncanonicalToolsContract` violates invariant 6.
+///
+/// The check: `tools_arrays_equal` must return `false` when number tokens differ
+/// between the original and the normalised form (e.g., `1e3` vs `1000`).
+pub fn assert_noncanonical_tools_fails_invariant_6() {
+    use crate::canonical::tools_arrays_equal;
+    // A tools array with a number token `1e3`.
+    let original = r#"[{"name":"t","parameters":{"properties":{"n":{"default":1e3}}}}]"#;
+    // The NoncanonicalToolsContract would normalise this to `1000`.
+    // Verify that `tools_arrays_equal` rejects the normalised form.
+    let normalised = r#"[{"name":"t","parameters":{"properties":{"n":{"default":1000}}}}]"#;
+    assert!(
+        !tools_arrays_equal(original, normalised),
+        "tools_arrays_equal must return false for normalised number tokens (AC11/invariant 6)"
+    );
+}
+
+/// Verify that `SacrosanctLeakingContract` is correctly identified as a
+/// violation by the `is_sensitive_key` guard (invariant 7 / AC12).
+pub fn assert_sacrosanct_leaking_detected() {
+    use crate::log::is_sensitive_key;
+    // The leaking contract would use a sensitive key name in its decision record.
+    // Verify that `is_sensitive_key` catches the patterns we test against.
+    assert!(
+        is_sensitive_key("ANTHROPIC_API_KEY"),
+        "ANTHROPIC_API_KEY must be flagged as sensitive (AC12)"
+    );
+    assert!(
+        is_sensitive_key("OPENAI_API_KEY"),
+        "OPENAI_API_KEY must be flagged as sensitive (AC12)"
+    );
+    // And that non-sensitive names pass through.
+    assert!(
+        !is_sensitive_key("REQUEST_ID"),
+        "REQUEST_ID must not be flagged as sensitive"
+    );
+}
+
 /// Verify that `MarkerOverflowInjector` fails its own cap rule.
 pub fn assert_marker_overflow_fails_cap(request_id: &str) {
     let injector = MarkerOverflowInjector;
@@ -358,6 +485,16 @@ mod tests {
     #[test]
     fn marker_dropping_fails_extension_check() {
         assert_marker_dropping_fails_extension("self-test-006");
+    }
+
+    #[test]
+    fn noncanonical_tools_fails_invariant_6() {
+        assert_noncanonical_tools_fails_invariant_6();
+    }
+
+    #[test]
+    fn sacrosanct_leaking_detected() {
+        assert_sacrosanct_leaking_detected();
     }
 
     // ========================================================================

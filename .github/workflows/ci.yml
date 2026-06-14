@@ -43,6 +43,14 @@ jobs:
       - name: Run cargo doc tests
         run: cargo test --doc
 
+      # AC20 (rskim-contract): Run the conformance harness and AC2 compile-fail
+      # tests for the safety-substrate crate. Gates on real process exit status
+      # (no piping through tail/head — PF-007).
+      # Cross-OS matrix (macos-latest + windows-latest) is owned by the #323
+      # CI-coordination ticket; this step runs the harness on ubuntu-latest.
+      - name: AC20 rskim-contract conformance harness
+        run: cargo test -p rskim-contract --all-features --all-targets
+
       # AC12: run the 25ms latency test in --release mode so the real ceiling is
       # enforced, not just the debug-build 2000ms sentinel. The test's own #[cfg]
       # selects the 25ms branch only in non-debug (release) builds.
@@ -115,6 +123,13 @@ jobs:
         # --all-targets required per PF-009: catches warnings in #[cfg(test)] modules
         # that are missed by cargo clippy without --all-targets.
         run: cargo clippy --all-features --all-targets -- -D warnings
+
+      # AC20 / AC10 (rskim-contract): Run the disallowed-methods determinism gate
+      # specifically for rskim-contract (clippy.toml in the crate root).
+      # This gate bans SystemTime::now, Instant::now, rand, and getrandom from
+      # the transform path. Gates on real exit status (PF-007).
+      - name: AC10/AC20 rskim-contract disallowed-methods gate
+        run: cargo clippy -p rskim-contract --all-features --all-targets -- -D warnings
 
       - name: Dependency-tree isolation check (AC9)
         # Proves no HTTP/TLS crate appears in the default-features build of

@@ -15,15 +15,19 @@
 //! - `1.0` → `1` (different bytes)
 //! - Large precision floats may be altered
 //!
-//! The canonical equality in this module compares numbers as the `serde_json::Value`
-//! representation of the raw token bytes. Two `Value::Number` objects are equal
-//! iff their raw string representations are byte-identical.
+//! The canonical equality in this module uses [`serde_json::value::RawValue`] to
+//! preserve number token bytes exactly. Two number tokens are equal iff their raw
+//! string representations are byte-identical (see [`raw_numbers_equal`]).
+//!
+//! The primary entry points [`tools_arrays_equal`] and [`canonical_equal_raw`] both
+//! route number comparison through the raw-token path, not through `Value::Number`
+//! (which normalises tokens after parse without `arbitrary_precision`).
 //!
 //! # Recursive key-sort deep-equality
 //!
 //! Two JSON values are canonically equal if:
 //! - Both are null, bool, or string: standard equality
-//! - Both are numbers: raw source-token bytes are equal
+//! - Both are numbers: raw source-token bytes are equal (via [`raw_numbers_equal`])
 //! - Both are objects: same keys (order-insensitive), each key's value is
 //!   recursively canonically equal
 //! - Both are arrays: same length, each element is recursively canonically equal
@@ -41,6 +45,104 @@
 //! harness would flag the reorder as unsafe).
 
 use serde_json::Value;
+
+// ============================================================================
+// RawValue-based recursive comparison (the canonical path, AC11)
+// ============================================================================
+
+/// Node parsed from a raw JSON string, keeping numbers as their raw token bytes.
+///
+/// This is the internal representation used by [`tools_arrays_equal`] to ensure
+/// number tokens are compared byte-for-byte rather than as parsed f64 values.
+enum RawNode {
+    Null,
+    Bool(bool),
+    Number(String), // raw token bytes, owned
+    JsonString(String),
+    Array(Vec<RawNode>),
+    Object(Vec<(String, RawNode)>),
+}
+
+/// Parse a raw JSON string into a `RawNode`, preserving raw number tokens.
+///
+/// Returns `None` if the source cannot be parsed, falling back conservative.
+fn parse_raw_node(raw_src: &str, depth: usize) -> Option<RawNode> {
+    if depth > MAX_CANONICAL_DEPTH {
+        return None;
+    }
+    // Parse via RawValue to get the canonical token.
+    let raw: Box<serde_json::value::RawValue> = serde_json::from_str(raw_src).ok()?;
+    let token = raw.get().trim();
+    // Determine JSON type by first byte.
+    let first = token.as_bytes().first()?;
+    match first {
+        b'n' => Some(RawNode::Null),
+        b't' => Some(RawNode::Bool(true)),
+        b'f' => Some(RawNode::Bool(false)),
+        b'"' => {
+            // Unescape by parsing as a serde_json string.
+            let s: String = serde_json::from_str(token).ok()?;
+            Some(RawNode::JsonString(s))
+        }
+        b'[' => {
+            // Parse array elements preserving individual raw tokens.
+            let elems: Vec<Box<serde_json::value::RawValue>> = serde_json::from_str(token).ok()?;
+            let mut result = Vec::with_capacity(elems.len());
+            for elem in elems {
+                let node = parse_raw_node(elem.get(), depth + 1)?;
+                result.push(node);
+            }
+            Some(RawNode::Array(result))
+        }
+        b'{' => {
+            // Parse object entries preserving individual raw value tokens.
+            // Object key-order doesn't matter for equality (we compare order-insensitively),
+            // so HashMap is fine here.
+            let map: std::collections::HashMap<String, Box<serde_json::value::RawValue>> =
+                serde_json::from_str(token).ok()?;
+            let mut result = Vec::with_capacity(map.len());
+            for (k, v) in map {
+                let node = parse_raw_node(v.get(), depth + 1)?;
+                result.push((k, node));
+            }
+            Some(RawNode::Object(result))
+        }
+        _ => {
+            // A number: keep the raw token as an owned string.
+            Some(RawNode::Number(token.to_owned()))
+        }
+    }
+}
+
+/// Compare two `RawNode` trees for canonical equality.
+///
+/// - Objects: order-insensitive key comparison
+/// - Arrays: order-sensitive
+/// - Numbers: raw byte equality (the AC11 invariant)
+fn raw_nodes_equal(a: &RawNode, b: &RawNode) -> bool {
+    match (a, b) {
+        (RawNode::Null, RawNode::Null) => true,
+        (RawNode::Bool(x), RawNode::Bool(y)) => x == y,
+        (RawNode::Number(x), RawNode::Number(y)) => x.as_bytes() == y.as_bytes(),
+        (RawNode::JsonString(x), RawNode::JsonString(y)) => x == y,
+        (RawNode::Array(xs), RawNode::Array(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| raw_nodes_equal(x, y))
+        }
+        (RawNode::Object(xm), RawNode::Object(ym)) => {
+            if xm.len() != ym.len() {
+                return false;
+            }
+            // Order-insensitive: for each key in a, find it in b.
+            xm.iter().all(|(k, xv)| {
+                ym.iter()
+                    .find(|(bk, _)| bk == k)
+                    .map(|(_, yv)| raw_nodes_equal(xv, yv))
+                    .unwrap_or(false)
+            })
+        }
+        _ => false, // type mismatch
+    }
+}
 
 /// Maximum recursion depth for canonical equality checks.
 ///
@@ -145,39 +247,10 @@ fn canonical_equal_inner(a: &Value, b: &Value, depth: usize) -> bool {
 /// Returns `Some(true)` if the values are canonically equal with raw-token number comparison.
 /// Returns `Some(false)` if they differ.
 pub fn canonical_equal_raw(raw_a: &str, raw_b: &str) -> Option<bool> {
-    // Parse both as JSON values preserving number representation via to_string().
-    let a: Value = serde_json::from_str(raw_a).ok()?;
-    let b: Value = serde_json::from_str(raw_b).ok()?;
-    Some(canonical_equal_raw_value(&a, &b, 0))
-}
-
-/// Inner recursive comparison for `canonical_equal_raw`.
-///
-/// Numbers fall back to `Value`-level comparison (post-parse). For exact raw-token
-/// number comparison, callers with `RawValue` references should use `raw_numbers_equal`
-/// directly. All other types delegate to `canonical_equal_inner`.
-fn canonical_equal_raw_value(a: &Value, b: &Value, depth: usize) -> bool {
-    if depth > MAX_CANONICAL_DEPTH {
-        return false;
-    }
-
-    match (a, b) {
-        (Value::Array(xs), Value::Array(ys)) => {
-            xs.len() == ys.len()
-                && xs
-                    .iter()
-                    .zip(ys.iter())
-                    .all(|(x, y)| canonical_equal_raw_value(x, y, depth + 1))
-        }
-        (Value::Object(xm), Value::Object(ym)) => {
-            xm.len() == ym.len()
-                && xm.iter().all(|(k, xv)| match ym.get(k) {
-                    Some(yv) => canonical_equal_raw_value(xv, yv, depth + 1),
-                    None => false,
-                })
-        }
-        _ => canonical_equal_inner(a, b, depth),
-    }
+    // Use the RawNode path so numbers are compared as token bytes.
+    let a = parse_raw_node(raw_a, 0)?;
+    let b = parse_raw_node(raw_b, 0)?;
+    Some(raw_nodes_equal(&a, &b))
 }
 
 /// Compare two number tokens as raw source byte strings.
@@ -207,6 +280,10 @@ pub fn raw_numbers_equal(a: &str, b: &str) -> bool {
 /// Used by the harness to verify that a `MetadataReorderWithMarkers` waiver
 /// did not alter any tool description or schema content.
 ///
+/// **Number comparison uses raw source-token bytes** (Decision 1 / AC11):
+/// `1e3` and `1000` are treated as distinct tokens even though they are
+/// mathematically equal. This is the correct invariant for cache-key faithfulness.
+///
 /// Both arguments must be valid JSON arrays; returns `false` if either fails
 /// to parse or if the arrays are not canonically equal.
 ///
@@ -225,17 +302,20 @@ pub fn raw_numbers_equal(a: &str, b: &str) -> bool {
 /// assert!(!tools_arrays_equal(original, modified));
 /// ```
 pub fn tools_arrays_equal(raw_original: &str, raw_reordered: &str) -> bool {
-    let a: Value = match serde_json::from_str(raw_original) {
-        Ok(v) => v,
-        Err(_) => return false,
+    // Use the raw-node path so numbers are compared as token bytes, not as
+    // parsed f64 values (which would normalise 1e3 == 1000 without
+    // arbitrary_precision). This is the canonical path for AC11.
+    let a = match parse_raw_node(raw_original, 0) {
+        Some(n) => n,
+        None => return false,
     };
-    let b: Value = match serde_json::from_str(raw_reordered) {
-        Ok(v) => v,
-        Err(_) => return false,
+    let b = match parse_raw_node(raw_reordered, 0) {
+        Some(n) => n,
+        None => return false,
     };
     // Both must be arrays.
     match (&a, &b) {
-        (Value::Array(_), Value::Array(_)) => canonical_equal(&a, &b),
+        (RawNode::Array(_), RawNode::Array(_)) => raw_nodes_equal(&a, &b),
         _ => false,
     }
 }
@@ -431,5 +511,44 @@ mod tests {
         let a = r#"{"b":1,"a":2}"#;
         let b = r#"{"a":2,"b":1}"#;
         assert_eq!(canonical_equal_raw(a, b), Some(true));
+    }
+
+    // ========================================================================
+    // AC11 critical gate: raw-token number comparison in canonical path
+    // ========================================================================
+
+    /// AC11 gate: `tools_arrays_equal` must treat `1e3` and `1000` as distinct
+    /// tokens (different cache key bytes) even though they are mathematically equal.
+    ///
+    /// Without raw-token comparison, serde_json would normalise both to f64=1000.0
+    /// and they would compare equal — silently breaking the cache-key invariant.
+    #[test]
+    fn tools_arrays_equal_raw_number_token_not_normalised() {
+        // A tool with number literal `1e3` in a schema property.
+        let original = r#"[{"name":"t","parameters":{"properties":{"n":{"default":1e3}}}}]"#;
+        // Same value but different token representation — must be NOT equal.
+        let normalised = r#"[{"name":"t","parameters":{"properties":{"n":{"default":1000}}}}]"#;
+        assert!(
+            !tools_arrays_equal(original, normalised),
+            "1e3 and 1000 must be treated as distinct raw tokens (AC11)"
+        );
+    }
+
+    /// AC11 gate: `canonical_equal_raw` must treat `1.0` and `1` as distinct tokens.
+    #[test]
+    fn canonical_equal_raw_number_token_1_0_vs_1_not_equal() {
+        // 1.0 and 1 have different raw bytes → must NOT be equal.
+        assert_eq!(
+            canonical_equal_raw("1.0", "1"),
+            Some(false),
+            "1.0 and 1 must be distinct raw tokens (AC11)"
+        );
+    }
+
+    /// AC11 gate: matching raw number tokens → equal.
+    #[test]
+    fn canonical_equal_raw_same_number_token_equal() {
+        assert_eq!(canonical_equal_raw("1e3", "1e3"), Some(true));
+        assert_eq!(canonical_equal_raw("1000", "1000"), Some(true));
     }
 }
