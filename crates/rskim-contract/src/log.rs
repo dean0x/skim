@@ -434,7 +434,7 @@ impl DecisionSink for ChannelDecisionSink {
 /// sink.try_send(record).unwrap();
 /// let records = sink.drain();
 /// assert_eq!(records.len(), 1);
-/// assert_eq!(records[0].request_id, "req-1");
+/// assert_eq!(records[0].request_id(), "req-1");
 /// ```
 pub struct MockSink {
     records: std::sync::Mutex<Vec<DecisionRecord>>,
