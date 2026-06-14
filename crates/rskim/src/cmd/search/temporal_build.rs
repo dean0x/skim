@@ -139,7 +139,7 @@ pub(super) fn acquire_build_lock(cache_dir: &Path) -> anyhow::Result<std::fs::Fi
 ///    counts from `history.commits`, skipping commits touching >
 ///    [`COUPLING_MAX_FILES`] files (matches heatmap/metrics.rs).
 /// 2. Compute Jaccard per pair = `count_ab / (count_a + count_b - count_ab)`
-///    (formula from `cochange/reader.rs:148`).
+///    (same formula as `CochangeMatrixReader::jaccard` in `cochange/reader.rs`).
 /// 3. Filter to `jaccard >= MIN_JACCARD` (0.10) at write time to match
 ///    `MIN_JACCARD_THRESHOLD` used by the read query (AC4).
 ///
@@ -316,8 +316,9 @@ pub(super) fn build_risk_rows(
 /// # Call site contract (applies ADR-006)
 ///
 /// This function MUST be called AFTER the lexical+AST manifest is persisted.
-/// The hook point in `staleness.rs:auto_refresh_if_stale` at line 340 is
-/// correctly post-manifest — do not move it earlier.
+/// The hook point in `staleness.rs:auto_refresh_if_stale` (the "#289 temporal
+/// build hook point" comment, after `FileManifest::load`) is correctly
+/// post-manifest — do not move it earlier.
 ///
 /// # Lookback semantics (O-C / ADR-003)
 ///

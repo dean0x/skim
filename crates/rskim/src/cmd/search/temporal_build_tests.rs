@@ -600,7 +600,8 @@ fn test_rebuild_temporal_90d_cutoff() {
         .unwrap();
 
     // Two old commits outside the 90-day window.
-    // now_epoch = 2026-06-15 00:00:00 UTC; 90 days prior = 2026-03-17; use 2025-10-01 (well outside).
+    // now_epoch is pinned below to 1_781_337_600 = 2026-06-13 08:00:00 UTC;
+    // 90 days prior ≈ 2026-03-15, so 2025-10-01 is well outside the window.
     let old_git_date = "2025-10-01 00:00:00 +0000";
 
     for i in 0..2u32 {
@@ -644,8 +645,10 @@ fn test_rebuild_temporal_90d_cutoff() {
         .unwrap();
     let head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
 
-    // Pin now_epoch to 2026-06-15 00:00:00 UTC so elapsed is deterministic.
-    // 2026-06-15 00:00:00 UTC = 1_781_337_600 seconds since UNIX_EPOCH.
+    // Pin now_epoch so the windowed counts are deterministic regardless of the
+    // wall clock. 1_781_337_600 = 2026-06-13 08:00:00 UTC. The recent commits are
+    // dated 2026-06-15 (slightly AFTER now_epoch); `compute_file_temporal_stats`
+    // treats future commits as elapsed = 0, so they still fall inside both windows.
     let now_epoch: u64 = 1_781_337_600;
 
     rebuild_temporal(dir.path(), &cache_dir, &head, now_epoch).unwrap();
@@ -663,8 +666,8 @@ fn test_rebuild_temporal_90d_cutoff() {
         "changes_90d must be 2 (only in-window commits counted), got {} (AC13)",
         hotspot.changes_90d
     );
-    // changes_30d depends on whether recent commits are within 30 days of now_epoch;
-    // 2026-06-15 vs 2026-06-15 → 0 elapsed days → within 30d window.
+    // The recent commits are dated after now_epoch → treated as elapsed = 0 →
+    // inside the 30d window; the old commits (2025-10-01) are far outside it.
     assert_eq!(
         hotspot.changes_30d, 2,
         "changes_30d must be 2 (recent commits are within 30d of now_epoch), got {}",
