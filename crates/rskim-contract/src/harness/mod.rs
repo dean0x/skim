@@ -233,7 +233,12 @@ fn check_append_only(
     for &corpus_input in corpus::VALID_CORPUS {
         let outcome = component.transform(corpus_input, request_id);
         let passed = turn_count_invariant(corpus_input, &outcome.bytes);
-        push_result(results, "AC8-append-only", passed, "turn count decreased in output");
+        push_result(
+            results,
+            "AC8-append-only",
+            passed,
+            "turn count decreased in output",
+        );
     }
 }
 
@@ -442,7 +447,10 @@ fn check_hot_zone_splice_byte_identity(
     );
 
     // Test 2: out-of-range offset returns None (fail-open, no panic — PF-004).
-    let out_of_range = ByteRange { start: 1000, end: 2000 };
+    let out_of_range = ByteRange {
+        start: 1000,
+        end: 2000,
+    };
     let fail_open_works = splice_hot_zone(test_buf, out_of_range).is_none();
     push_result(
         results,
