@@ -1,28 +1,70 @@
 //! Token counting using OpenAI's tiktoken tokenizer
 //!
-//! ARCHITECTURE: Uses cl100k_base encoding (GPT-3.5-turbo, GPT-4)
-//! - Provides accurate token counts for LLM context window calculation
-//! - Counts tokens before and after transformation
-//! - Reports reduction statistics
-//! - Lazy initialization to avoid recreating tokenizer on every call
+//! ARCHITECTURE: Uses cl100k_base encoding (GPT-3.5-turbo, GPT-4) via rskim-tokens.
+//! - Delegates to `rskim_tokens::Counter` for deterministic, panic-free counting.
+//! - Preserves `encode_with_special_tokens` semantics (AC3 / constraint 13).
+//! - Counter is constructed once and cached globally (constraint 11 latency).
+//!
+//! Public signature `pub(crate) fn count_tokens(text: &str) -> Result<usize>` is
+//! FROZEN — zero call-site signature churn (AC15). Callers (cascade.rs, process.rs,
+//! guardrail.rs, analytics/mod.rs, output/mod.rs, cmd/discover.rs) are unchanged.
+//!
+//! TokenStats and format_number remain binary-private (OQ7) — CLI display concerns
+//! that do not belong in the library API.
 
 use anyhow::Result;
+use rskim_tokens::{Counter, Encoding};
 use std::sync::OnceLock;
-use tiktoken_rs::{CoreBPE, cl100k_base};
 
-/// Global tokenizer instance (lazy-initialized on first use)
-static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
+/// Global cl100k counter (lazy-initialised on first use via OnceLock).
+///
+/// Constructed once; subsequent calls to `count_tokens` reuse the same counter
+/// for performance (constraint 11 — avoid recreating tokenizer on every call).
+static COUNTER: OnceLock<Counter> = OnceLock::new();
 
-/// Get or initialize the global tokenizer instance
-fn get_tokenizer() -> &'static CoreBPE {
-    TOKENIZER.get_or_init(|| cl100k_base().expect("Failed to initialize cl100k_base tokenizer"))
+/// Get or initialize the global cl100k counter.
+fn get_counter() -> &'static Counter {
+    COUNTER.get_or_init(|| {
+        // Counter::new for cl100k is practically infallible (embedded vocab in tiktoken-rs).
+        // On the dead Err path (embedded vocab corrupt), fall back to the byte-length
+        // heuristic so the process continues rather than crashing (constraint 4).
+        build_counter_with_fallback()
+    })
 }
 
-/// Count tokens in text using cl100k_base encoding (GPT-3.5-turbo, GPT-4)
+/// Build the cl100k counter, falling back to the heuristic on (practically dead) init failure.
+///
+/// Separated from the OnceLock closure so the error-handling logic is readable.
+///
+/// Uses `Counter::heuristic()` (infallible by construction) as the fallback so
+/// no panic macro is required on the dead error path (AC10 no-panic invariant).
+fn build_counter_with_fallback() -> Counter {
+    match Counter::new(Encoding::Cl100k) {
+        Ok(counter) => counter,
+        Err(e) => {
+            // Practically dead: tiktoken embeds its vocab at compile time.
+            // Counter::heuristic() is unconditionally infallible — no panic macro needed.
+            eprintln!(
+                "[skim] warning: cl100k tokenizer init failed ({e}); \
+                 falling back to byte-length heuristic"
+            );
+            Counter::heuristic()
+        }
+    }
+}
+
+/// Count tokens in text using cl100k_base encoding (GPT-3.5-turbo, GPT-4).
+///
+/// Delegates to [`rskim_tokens::Counter`] with `Encoding::Cl100k`, preserving
+/// `encode_with_special_tokens` semantics (constraint 13 / AC3).
+///
+/// # Frozen signature (AC15)
+///
+/// The signature `pub(crate) fn count_tokens(text: &str) -> Result<usize>` is
+/// frozen. All existing call sites handle `Err` with their current patterns and
+/// require no changes.
 pub(crate) fn count_tokens(text: &str) -> Result<usize> {
-    let tokenizer = get_tokenizer();
-    let tokens = tokenizer.encode_with_special_tokens(text);
-    Ok(tokens.len())
+    Ok(get_counter().count(text))
 }
 
 /// Statistics for token reduction
@@ -49,12 +91,6 @@ impl TokenStats {
             return 0.0;
         }
         ((self.original as f32 - self.transformed as f32) / self.original as f32) * 100.0
-    }
-
-    /// Get tokens saved
-    #[allow(dead_code)]
-    pub(crate) fn tokens_saved(&self) -> usize {
-        self.original.saturating_sub(self.transformed)
     }
 
     /// Format stats for display
@@ -92,14 +128,13 @@ mod tests {
         let text = "Hello, world!";
         let count = count_tokens(text).unwrap();
         assert!(count > 0);
-        assert!(count < 10); // Should be around 3-4 tokens
+        assert!(count < 10);
     }
 
     #[test]
     fn test_token_stats() {
         let stats = TokenStats::new(1000, 200);
         assert_eq!(stats.reduction_percentage(), 80.0);
-        assert_eq!(stats.tokens_saved(), 800);
     }
 
     #[test]
