@@ -23,38 +23,87 @@ use super::RawBlob;
 /// without re-encoding. This preserves insignificant whitespace, non-canonical
 /// number tokens (`1.0e3`), `\uXXXX` escapes, and arbitrary field ordering.
 ///
-/// After mutation, `raw_bytes` is cleared and serialization rebuilds from the
-/// typed fields, which may reformat the output (field order follows struct
-/// declaration order, numbers use canonical representation). Only the mutated
-/// path loses verbatim formatting — the unmutated path is always byte-identical.
+/// After mutation via [`crate::mutate_block`], the raw bytes are updated in-place
+/// using byte-range surgery (the replaced span only), so every byte outside the
+/// mutated payload span remains byte-identical to the original input.
 ///
 /// `extra_fields` retains all top-level fields not modeled as typed members.
-/// It is used only on the mutated-body path; on the unmutated path, `raw_bytes`
+/// It is used only on the fall-back rebuild path; on the normal path, `raw_bytes`
 /// is used instead.
+///
+/// # No-envelope-mutation invariant (AC11)
+///
+/// The structural fields `model`, `messages`, and `extra_fields` are intentionally
+/// not `pub` to enforce that no caller can drop, reorder, duplicate, or add messages,
+/// or mutate envelope fields (`model`, `max_tokens`, etc.) through this crate's
+/// public API. Read-only access is provided via [`AnthropicBody::model`],
+/// [`AnthropicBody::messages`], and [`AnthropicBody::extra_fields`].
+/// All mutation routes through [`crate::mutate_block`] which enforces the
+/// text-for-text invariant. Envelope mutation lives in a separate layer above this
+/// crate (Resolved Decision 7).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicBody {
     /// The model identifier (e.g., `"claude-3-5-sonnet-20241022"`).
-    pub model: String,
+    ///
+    /// Not `pub` — use [`AnthropicBody::model`] for read-only access.
+    /// Mutation of the model identifier is envelope mutation and is forbidden
+    /// in this crate (Resolved Decision 7; AC11).
+    pub(crate) model: String,
 
     /// The conversation turns.
-    pub messages: Vec<AnthropicMessage>,
+    ///
+    /// Not `pub` — use [`AnthropicBody::messages`] for read-only access.
+    /// Structural manipulation (push/remove/reorder) is forbidden in this crate
+    /// (AC11 no-turn-manipulation invariant).
+    pub(crate) messages: Vec<AnthropicMessage>,
 
-    /// Unknown top-level fields retained for the mutated-rebuild path.
+    /// Unknown top-level fields retained for the fall-back rebuild path.
     ///
     /// This includes `system`, `max_tokens`, `tools`, `temperature`, `top_p`,
     /// `stream`, `tool_choice`, `metadata`, and any other top-level fields.
-    /// These are serialized using their `serde_json::Value` representation (not
-    /// verbatim source bytes) and are only used when `raw_bytes` is empty.
+    ///
+    /// Not `pub` — use [`AnthropicBody::extra_fields`] for read-only access.
+    /// Inserting or removing extra fields is envelope mutation and is forbidden
+    /// (AC11; Resolved Decision 7).
     #[serde(flatten)]
-    pub extra_fields: serde_json::Map<String, serde_json::Value>,
+    pub(crate) extra_fields: serde_json::Map<String, serde_json::Value>,
 
     /// Original JSON bytes for byte-identical unmutated serialize.
     ///
-    /// Set by [`crate::parse`] from the input bytes. Cleared by
-    /// `mutate_block` after any mutation so the typed-field path is used.
+    /// Set by [`crate::parse`] from the input bytes. Updated by
+    /// `mutate_block` via byte-range surgery after any mutation.
     /// Not serialized — this is crate-internal state only.
     #[serde(skip)]
     pub(crate) raw_bytes: Vec<u8>,
+}
+
+impl AnthropicBody {
+    /// The model identifier (e.g., `"claude-3-5-sonnet-20241022"`).
+    ///
+    /// Read-only — envelope mutation is not supported in this crate (AC11).
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The conversation turns, in order.
+    ///
+    /// Returns an immutable slice — structural manipulation (push/remove/reorder)
+    /// is not supported through this crate's public API (AC11 no-turn-manipulation
+    /// invariant). Use [`crate::mutate_block`] to replace leaf text payloads.
+    pub fn messages(&self) -> &[AnthropicMessage] {
+        &self.messages
+    }
+
+    /// Unknown top-level fields retained for byte-identical round-trips.
+    ///
+    /// These are all top-level fields other than `model` and `messages`:
+    /// `system`, `max_tokens`, `tools`, `temperature`, etc.
+    ///
+    /// Read-only — inserting or removing fields is envelope mutation and is
+    /// not supported in this crate (Resolved Decision 7; AC11).
+    pub fn extra_fields(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.extra_fields
+    }
 }
 
 /// The `system` field — either a plain string or an array of content blocks.

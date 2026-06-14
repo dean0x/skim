@@ -66,7 +66,7 @@ pub enum ParsedBody {
 /// let json = r#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}"#;
 /// let body = parse(json.as_bytes())?;
 /// match body {
-///     ParsedBody::Anthropic(b) => assert_eq!(b.model, "claude-3-5-sonnet-20241022"),
+///     ParsedBody::Anthropic(b) => assert_eq!(b.model(), "claude-3-5-sonnet-20241022"),
 ///     ParsedBody::OpenAi(_) => panic!("unexpected"),
 /// }
 /// # Ok::<(), rskim_llm::LlmError>(())

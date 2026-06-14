@@ -34,26 +34,67 @@ use super::RawBlob;
 ///
 /// See [`AnthropicBody`] for the raw-bytes cache rationale. The same mechanism
 /// applies here: `raw_bytes` is stored on parse and returned verbatim on
-/// unmutated serialize; cleared after mutation to use typed-field serialization.
+/// unmutated serialize.
+///
+/// # No-envelope-mutation invariant (AC11)
+///
+/// The structural fields `model`, `messages`, and `extra_fields` are intentionally
+/// not `pub` to prevent callers from dropping, reordering, duplicating, or adding
+/// messages, or mutating envelope fields through this crate's public API.
+/// Read-only access is provided via [`OpenAiBody::model`], [`OpenAiBody::messages`],
+/// and [`OpenAiBody::extra_fields`]. Envelope mutation lives in a separate layer
+/// above this crate (Resolved Decision 7; AC11).
 ///
 /// [`AnthropicBody`]: crate::model::anthropic::AnthropicBody
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiBody {
     /// The model identifier (e.g., `"gpt-4o"`).
-    pub model: String,
+    ///
+    /// Not `pub` — use [`OpenAiBody::model`] for read-only access.
+    pub(crate) model: String,
 
     /// The conversation messages.
-    pub messages: Vec<OpenAiMessage>,
+    ///
+    /// Not `pub` — use [`OpenAiBody::messages`] for read-only access.
+    pub(crate) messages: Vec<OpenAiMessage>,
 
-    /// Unknown top-level fields retained for the mutated-rebuild path.
+    /// Unknown top-level fields retained for the fall-back rebuild path.
+    ///
+    /// Not `pub` — use [`OpenAiBody::extra_fields`] for read-only access.
     #[serde(flatten)]
-    pub extra_fields: serde_json::Map<String, serde_json::Value>,
+    pub(crate) extra_fields: serde_json::Map<String, serde_json::Value>,
 
     /// Original JSON bytes for byte-identical unmutated serialize.
     ///
     /// Set by [`crate::parse`] from the input bytes. Not serialized.
     #[serde(skip)]
     pub(crate) raw_bytes: Vec<u8>,
+}
+
+impl OpenAiBody {
+    /// The model identifier (e.g., `"gpt-4o"`).
+    ///
+    /// Read-only — envelope mutation is not supported in this crate (AC11).
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The conversation messages, in order.
+    ///
+    /// Returns an immutable slice — structural manipulation (push/remove/reorder)
+    /// is not supported through this crate's public API (AC11 no-turn-manipulation
+    /// invariant).
+    pub fn messages(&self) -> &[OpenAiMessage] {
+        &self.messages
+    }
+
+    /// Unknown top-level fields retained for byte-identical round-trips.
+    ///
+    /// Read-only — inserting or removing fields is envelope mutation and is
+    /// not supported in this crate (Resolved Decision 7; AC11).
+    pub fn extra_fields(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.extra_fields
+    }
 }
 
 /// A single message in an OpenAI chat conversation.

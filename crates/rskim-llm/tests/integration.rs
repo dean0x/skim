@@ -80,7 +80,7 @@ fn ac1_anthropic_unknown_block_preserved() {
         ParsedBody::Anthropic(body) => {
             // The 07 fixture has a future_param at top level
             assert!(
-                body.extra_fields.contains_key("future_param"),
+                body.extra_fields().contains_key("future_param"),
                 "extra_fields should contain 'future_param'"
             );
         }
@@ -119,7 +119,7 @@ fn ac2_openai_legacy_function_call_preserved() {
     match body {
         ParsedBody::OpenAi(b) => {
             // The legacy function_call should be in extra_fields of the assistant message
-            let assistant = b.messages.iter().find(|m| m.role == "assistant");
+            let assistant = b.messages().iter().find(|m| m.role == "assistant");
             assert!(assistant.is_some(), "no assistant message found");
             let asst = assistant.unwrap();
             assert!(
@@ -141,11 +141,11 @@ fn ac2_openai_all_roles_parse() {
     match body {
         ParsedBody::OpenAi(b) => {
             assert_eq!(
-                b.messages.len(),
+                b.messages().len(),
                 5,
                 "expected 5 messages for all-roles fixture"
             );
-            let roles: Vec<&str> = b.messages.iter().map(|m| m.role.as_str()).collect();
+            let roles: Vec<&str> = b.messages().iter().map(|m| m.role.as_str()).collect();
             assert!(roles.contains(&"system"));
             assert!(roles.contains(&"developer"));
             assert!(roles.contains(&"user"));
@@ -165,7 +165,7 @@ fn ac2_openai_tool_call_id_preserved() {
 
     match body {
         ParsedBody::OpenAi(b) => {
-            let tool_msg = b.messages.iter().find(|m| m.role == "tool");
+            let tool_msg = b.messages().iter().find(|m| m.role == "tool");
             assert!(tool_msg.is_some(), "no tool message found");
             let tool = tool_msg.unwrap();
             assert_eq!(

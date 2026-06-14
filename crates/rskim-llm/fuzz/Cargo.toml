@@ -1,0 +1,21 @@
+[package]
+name = "rskim-llm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rskim-llm = { path = ".." }
+
+# Prevent this from interfering with the workspace
+[workspace]
+
+[[bin]]
+name = "parse_fuzz"
+path = "fuzz_targets/parse_fuzz.rs"
+test = false
+doc = false

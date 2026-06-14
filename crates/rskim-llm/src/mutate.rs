@@ -7,7 +7,11 @@
 //! - **Position preserved:** The mutated block remains at the same index in the
 //!   messages/blocks arrays.
 //! - **Surrounding regions byte-identical:** All bytes outside the replaced payload span
-//!   are byte-identical to the input.
+//!   are byte-identical to the input.  This is enforced by byte-range surgery
+//!   (`crate::splice`): the raw JSON bytes are scanned to find the exact span of the
+//!   target string value, and only those bytes are replaced.  The `raw_bytes` cache is
+//!   updated with the spliced result so that subsequent `serialize()` calls return it
+//!   verbatim (satisfying AC9(b) and AC10).
 //! - **No envelope mutation:** The crate never modifies the request envelope
 //!   (`model`, `max_tokens`, `system`, `tools`, etc.). Only leaf text payloads are mutable.
 //!   Envelope mutation lives in a separate layer above this crate (Resolved Decision 7).
@@ -20,7 +24,8 @@
 use crate::model::anthropic::{
     AnthropicBlock, AnthropicBody, AnthropicContent, LeafRef, ToolResultContent,
 };
-use crate::{LlmError, ParsedBody, Result, serialize::serialize};
+use crate::splice::{find_leaf_span, splice_replace};
+use crate::{LlmError, ParsedBody, Result};
 
 /// Replace the text payload of a single block identified by `block_id`.
 ///
@@ -58,16 +63,28 @@ fn mutate_anthropic(body: &mut AnthropicBody, block_id: &str, new_text: &str) ->
         .find(|l| l.id() == block_id)
         .ok_or_else(|| LlmError::BlockNotFound(block_id.to_string()))?;
 
-    // Apply the mutation
+    // Byte-range surgery (AC9b / AC10):
+    //
+    // We locate the exact byte span of the string value named by `leaf` inside
+    // `raw_bytes`, then splice-replace only those bytes.  Every byte outside the
+    // replaced span is byte-identical to the original input — no reformatting of
+    // numbers, whitespace, escapes, or envelope fields.
+    //
+    // The typed model fields are also updated so that subsequent `list_blocks` /
+    // `text_leaves` calls see the new value, and repeated mutations chain correctly.
+    let span = find_leaf_span(&body.raw_bytes, &leaf)?;
+    let new_raw = splice_replace(&body.raw_bytes, span, new_text)?;
+
+    // Update the typed field so that the in-memory model stays consistent with
+    // the new raw bytes.  This is needed for repeat-mutation idempotency (AC9d).
     apply_leaf_mutation(body, &leaf, new_text)?;
 
-    // Clear raw_bytes so serialize() uses the typed-field path (rebuild from struct).
-    // The original verbatim bytes are now stale — content has changed.
-    body.raw_bytes.clear();
+    // Replace raw_bytes with the spliced result.  Subsequent serialize() calls
+    // will return this verbatim (the "unmutated path" in serialize.rs), which is
+    // now the post-mutation bytes.
+    body.raw_bytes = new_raw.clone();
 
-    // Re-serialize from typed fields
-    let serialized = serialize(&ParsedBody::Anthropic(body.clone()))?;
-    Ok(serialized)
+    Ok(new_raw)
 }
 
 fn apply_leaf_mutation(body: &mut AnthropicBody, leaf: &LeafRef, new_text: &str) -> Result<()> {

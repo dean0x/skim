@@ -94,6 +94,7 @@ pub mod mutate;
 pub mod parse;
 pub mod provider;
 pub mod serialize;
+pub(crate) mod splice;
 
 pub use classify::{Class, Classification, classify};
 pub use error::LlmError;
