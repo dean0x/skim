@@ -8,12 +8,17 @@
 //! CI-runner noise).
 //!
 //! The relative-linearity gate (time(1MB) <= 15x time(100KB) and
-//! time(10MB) <= 15x time(1MB)) and the counting-allocator memory k-bound
-//! (peak allocation <= k × body_size) described in AC14 are NOT yet wired up as
-//! enforced assertions — there is no in-run linearity assertion and no isolated
-//! counting-allocator test binary in this crate today. Tracking those two
-//! grounded gates is a follow-up (see #309 / Wave-1 perf-gate follow-up); this
-//! file currently provides the measured baseline they will be grounded against.
+//! time(10MB) <= 15x time(1MB)) described in AC14 is enforced as an in-run
+//! assertion in `tests/linearity.rs` (`ac14_relative_linearity_gate`). This
+//! benchmark provides the measured absolute baseline that gate is grounded
+//! against.
+//!
+//! The counting-allocator memory k-bound (peak allocation <= k × body_size) is
+//! NOT yet wired up as an enforced assertion — there is no isolated
+//! counting-allocator test binary in this crate today (a global allocator must
+//! not be shared with parallel tests). The k ≈ 3.5 bound is documented
+//! analytically in `lib.rs`; wiring it as a regression gate is a follow-up
+//! (see #309 / Wave-1 perf-gate follow-up).
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rskim_llm::{classify_body, parse, serialize};

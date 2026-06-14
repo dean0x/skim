@@ -41,10 +41,12 @@ use crate::{ParsedBody, Result};
 /// # Ok::<(), rskim_llm::LlmError>(())
 /// ```
 pub fn serialize(body: &ParsedBody) -> Result<Vec<u8>> {
-    // Unmutated path: return the original raw bytes verbatim.
-    // This preserves insignificant whitespace, non-canonical number tokens,
-    // \uXXXX escape sequences, and arbitrary field ordering (Invariant 5).
-    // After mutation, raw_bytes is cleared so the typed-field path is used.
+    // Raw-bytes path (normal): return the cached raw bytes verbatim.
+    // On parse, raw_bytes holds the original input; after `mutate_block`, it holds
+    // the byte-surgery result (original bytes with only the replaced payload span
+    // substituted). Either way, returning it verbatim preserves insignificant
+    // whitespace, non-canonical number tokens, \uXXXX escape sequences, and
+    // arbitrary field ordering outside the mutated span (Invariants 5 & 8).
     let raw = match body {
         ParsedBody::Anthropic(b) => &b.raw_bytes,
         ParsedBody::OpenAi(b) => &b.raw_bytes,
@@ -53,9 +55,11 @@ pub fn serialize(body: &ParsedBody) -> Result<Vec<u8>> {
         return Ok(raw.clone());
     }
 
-    // Mutated path: re-serialize from typed fields.
-    // Field order follows struct declaration order; number formatting is canonical.
-    // This path is only taken after mutate_block() clears raw_bytes.
+    // Typed-fields fallback: only reachable if raw_bytes is empty, which never
+    // happens for a body produced by `parse`/`mutate_block` (both always set it).
+    // Retained as a defensive path so serialize() is total for any constructible
+    // ParsedBody. Field order follows struct declaration order; number formatting
+    // is canonical here (no byte-identity guarantee on this path).
     let bytes = serde_json::to_vec(body)?;
     Ok(bytes)
 }

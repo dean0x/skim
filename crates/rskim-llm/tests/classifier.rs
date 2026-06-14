@@ -77,15 +77,19 @@ fn ac5_corpus_matches_labels_100_percent() {
             fail += 1;
         } else {
             pass += 1;
-            // Check language hint for Code/Mixed
+            // Check language hint for Code/Mixed. AC5 requires that code/mixed
+            // fixtures with a fence tag carry the expected language hint, so a
+            // mismatch is a hard failure (not just a warning) — otherwise the
+            // language-hint half of AC5 would be unobservable (PF-005).
             if expected_class == Class::Code || expected_class == Class::Mixed {
-                if let Some(expected_lang) = &entry.language_hint {
-                    if result.language_hint.as_deref() != Some(expected_lang.as_str()) {
-                        eprintln!(
-                            "LANG_HINT MISMATCH {}: expected {:?}, got {:?}",
-                            entry.file, entry.language_hint, result.language_hint
-                        );
-                    }
+                let expected_hint = entry.language_hint.as_deref();
+                let actual_hint = result.language_hint.as_deref();
+                if actual_hint != expected_hint {
+                    eprintln!(
+                        "LANG_HINT MISMATCH {}: expected {:?}, got {:?}",
+                        entry.file, expected_hint, actual_hint
+                    );
+                    fail += 1;
                 }
             }
         }
@@ -94,7 +98,8 @@ fn ac5_corpus_matches_labels_100_percent() {
     assert_eq!(
         fail,
         0,
-        "{fail} classifier fixture(s) failed (pass={pass}, total={})",
+        "{fail} classifier fixture(s) failed class or language-hint check \
+         (pass={pass}, total={})",
         manifest.len()
     );
 }
