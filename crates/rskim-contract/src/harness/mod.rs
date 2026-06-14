@@ -287,7 +287,6 @@ fn check_determinism(
 
     // Pass 2: cross-thread determinism check.
     // The Contract trait is Send + Sync, so we can share a reference across threads.
-    // We wrap the reference in a pointer to satisfy the borrow checker for thread spawning.
     check_cross_thread_determinism(component, request_id, results);
 }
 
@@ -295,7 +294,7 @@ fn check_determinism(
 /// and compare outputs byte-for-byte. AC9 requires ≥2 threads.
 ///
 /// Uses `std::thread::scope` for safe borrowing — the scoped thread cannot
-/// outlive the enclosing scope, so no unsafe pointer manipulation is needed.
+/// outlive the enclosing scope, and `component` is borrowed directly.
 fn check_cross_thread_determinism(
     component: &dyn Contract,
     request_id: &str,

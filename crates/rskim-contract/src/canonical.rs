@@ -297,7 +297,7 @@ pub fn canonical_equal_raw(raw_a: &str, raw_b: &str) -> Option<bool> {
 /// assert!(!raw_numbers_equal("1.0", "1"));
 /// ```
 pub fn raw_numbers_equal(a: &str, b: &str) -> bool {
-    a.as_bytes() == b.as_bytes()
+    a == b
 }
 
 /// Check that two tools arrays are canonically equal (waiver verification).

@@ -204,15 +204,16 @@ proptest! {
         if let (Some(input_count), Some(output_count)) =
             (count_turns(input), count_turns(&outcome.bytes))
         {
-            if !outcome.is_passthrough() {
-                prop_assert!(
-                    output_count < input_count,
-                    "TurnDroppingContract modified output but did not decrease turn count: \
-                     {} → {} turns. The broken impl must actually drop turns on multi-turn input.",
-                    input_count,
-                    output_count
-                );
+            if outcome.is_passthrough() {
+                return Ok(());
             }
+            prop_assert!(
+                output_count < input_count,
+                "TurnDroppingContract modified output but did not decrease turn count: \
+                 {} → {} turns. The broken impl must actually drop turns on multi-turn input.",
+                input_count,
+                output_count
+            );
         }
     }
 }

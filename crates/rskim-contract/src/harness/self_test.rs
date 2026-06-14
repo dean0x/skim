@@ -580,7 +580,6 @@ pub fn assert_noncanonical_tools_fails_invariant_6() {
 /// Without this test, removing or breaking `check_sacrosanct_redaction` in `mod.rs`
 /// would leave no failing test. With this test, any regression in the AC12 gate causes
 /// an immediate failure here (PF-005: each AC must be observable/testable).
-/// Verify that `SacrosanctLeakingContract` is caught by the conformance harness.
 ///
 /// AC18 isolation: must fail `AC12-sacrosanct-redaction` because it embeds
 /// `ANTHROPIC_API_KEY` verbatim as the `request_id`. `AC4-never-inflate` and
