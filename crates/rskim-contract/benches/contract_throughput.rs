@@ -1,9 +1,17 @@
 // AC21 relative-regression criterion bench for rskim-contract.
 //
-// Per ADR-003: no absolute ms gate — the baseline is committed to
-// `.bench-baselines/` and used as a relative regression guard.
-// `cargo bench -p rskim-contract --bench contract_throughput -- --baseline ci-baseline`
-// is the CI gate step (paired with the existing rskim-tokens bench step).
+// Per ADR-003: no absolute ms gate. AC21's gate is the code-path/dependency
+// assertion (`ac21_default_path_is_byte_length_only` in guardrail.rs, which
+// proves the default path never reaches canonicalization / re-serialization);
+// this bench is the AC21 "SHOULD" relative-regression tripwire on a >100KB body.
+//
+// It is run locally as a relative guard:
+//   cargo bench -p rskim-contract --bench contract_throughput -- --save-baseline <name>
+//   cargo bench -p rskim-contract --bench contract_throughput -- --baseline <name>
+// CI wiring for this bench (a committed `.bench-baselines/` baseline + a ci.yml
+// step mirroring the rskim-tokens `token_count` bench) is not yet in place — it
+// is a follow-up, not a claimed-existing gate. AC20's CI gate is the conformance
+// harness + clippy determinism step, not this bench.
 //
 // What is measured:
 // - `guarded_transform` (the default, non-waivered transform path) on a >100KB body.
