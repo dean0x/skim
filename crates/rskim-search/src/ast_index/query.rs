@@ -23,6 +23,7 @@
 //!   `lang_id` does not match, eliminating the second per-file `file_meta`
 //!   decode loop that previously ran in `SearchLayer::search`.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::path::Path;
 
@@ -180,6 +181,18 @@ impl From<(u8, u32)> for LiteMeta {
     }
 }
 
+impl LiteMeta {
+    /// Recover the [`Language`] from this entry's `lang_id`.
+    ///
+    /// Mirrors [`crate::ast_index::store::format::AstFileMetaEntry::language`]
+    /// so that lang-id → Language recovery lives in one conceptual place per
+    /// struct rather than being inlined at every call site (low/consistency #286).
+    #[inline]
+    fn language(self) -> Option<Language> {
+        crate::index::lang_map::lang_from_id(self.lang_id)
+    }
+}
+
 // Query engine
 /// AST structural pattern query engine. Immutable; `&self`-only; `Send + Sync`.
 ///
@@ -206,16 +219,8 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
     /// - [`SearchError::InvalidQuery`] for [`AstQuery::SingleNode`] (→ #283).
     /// - [`SearchError::IndexCorrupted`] on corrupt backing index.
     pub fn search_ast(&self, q: &AstQuery) -> Result<Vec<(FileId, f64)>> {
-        match q {
-            AstQuery::SingleNode(_) => Err(SearchError::InvalidQuery(
-                "single-node structural search requires the unigram index — tracked in #283".into(),
-            )),
-            AstQuery::Pattern(pattern) => {
-                let set = crate::ast_index::pattern_to_query_set(pattern);
-                self.run_ngram_set(&set, None)
-            }
-            AstQuery::Containment(set) => self.run_ngram_set(set, None),
-        }
+        let set = ast_query_to_ngram_set(q)?;
+        self.run_ngram_set(set.as_ref(), None)
     }
 
     /// Inner scoring loop for both `search_ast` (no lang filter) and the
@@ -265,10 +270,6 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
         // grow-from-1 churn on the very first posting.
         let file_count = self.reader.file_count() as usize;
 
-        // Use FxHashMap (integer keys, trusted in-range doc_ids).
-        let mut scores: FxHashMap<u32, f64> =
-            FxHashMap::with_capacity_and_hasher(CAPACITY_FLOOR, Default::default());
-
         // Per-call meta cache: skip for single-n-gram queries — by contract C1,
         // each posting list has at most one posting per doc_id, so cross-n-gram
         // cache hits only occur when total_ngrams > 1.
@@ -276,7 +277,12 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
         // P1 (#286): Value type shrunk from `AstFileMetaEntry` (15 bytes) to
         // `LiteMeta` (5 bytes).  BM25 scoring only needs `lang_id` and
         // `node_count`; the other fields are only needed for `file_metrics`.
-        let mut meta_cache: Option<FxHashMap<u32, LiteMeta>> = if total_ngrams > 1 {
+        //
+        // Note: on lang-filtered runs, `meta_cache` may hold entries for
+        // postings whose language did not pass the filter (decoded to learn the
+        // lang_id, then skipped).  These entries are never re-read so they do
+        // not affect correctness; their count is bounded by `file_count`.
+        let meta_cache: Option<FxHashMap<u32, LiteMeta>> = if total_ngrams > 1 {
             Some(FxHashMap::with_capacity_and_hasher(
                 CAPACITY_FLOOR,
                 Default::default(),
@@ -285,39 +291,32 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
             None
         };
 
+        let mut ctx = ScoringCtx {
+            scores: FxHashMap::with_capacity_and_hasher(CAPACITY_FLOOR, Default::default()),
+            meta_cache,
+            file_count,
+        };
+
         for entry in &bigrams {
             let postings = self.reader.lookup_bigram(entry.ngram)?;
-            // Reserve only new slots: clamped to file_count to avoid over-allocation
-            // when scores already contains overlapping docs (AC6/AC7, P3 #286).
-            reserve_for_postings(&postings, file_count, &mut scores, &mut meta_cache);
-            score_postings(
-                &postings,
-                &mut scores,
-                &mut meta_cache,
-                &self.reader,
-                avg,
-                lang_filter,
-                |lang| f64::from(ast_bigram_idf(lang, entry.ngram)),
-            )?;
+            ctx.score_postings(&postings, &self.reader, avg, lang_filter, |lang| {
+                f64::from(ast_bigram_idf(lang, entry.ngram))
+            })?;
         }
         for entry in &trigrams {
             let postings = self.reader.lookup_trigram(entry.ngram)?;
             // DEFERRED (Wave 4): minimal-covering-set to remove trigram/sub-bigram
             // double-counting (#198). For now, contributions are additive.
-            reserve_for_postings(&postings, file_count, &mut scores, &mut meta_cache);
-            score_postings(
-                &postings,
-                &mut scores,
-                &mut meta_cache,
-                &self.reader,
-                avg,
-                lang_filter,
-                |lang| f64::from(ast_trigram_idf(lang, entry.ngram)),
-            )?;
+            ctx.score_postings(&postings, &self.reader, avg, lang_filter, |lang| {
+                f64::from(ast_trigram_idf(lang, entry.ngram))
+            })?;
         }
 
-        let mut out: Vec<(FileId, f64)> =
-            scores.into_iter().map(|(id, s)| (FileId(id), s)).collect();
+        let mut out: Vec<(FileId, f64)> = ctx
+            .scores
+            .into_iter()
+            .map(|(id, s)| (FileId(id), s))
+            .collect();
 
         // B2: unique (FxHashMap), all > 0 (BM25 with C4: count>=1 → tf>0 → score>0),
         // sorted FileId-ASC (Wave-4 contract).
@@ -376,19 +375,14 @@ impl SearchLayer for AstQueryEngine<AstIndexReader> {
         // insertion — filter-application order becomes lang-then-file_filter
         // rather than file_filter-then-lang, but the final set is identical
         // (both are pure membership filters; AC11).
+        //
+        // `ast_query_to_ngram_set` is the single dispatch point for
+        // AstQuery → AstNgramSet, shared with `search_ast` to eliminate
+        // duplicated match arms and error strings (medium/architecture #286).
         let ast_q = parse_ast_query(trimmed)?;
-        let ngram_set = match &ast_q {
-            AstQuery::SingleNode(_) => {
-                return Err(SearchError::InvalidQuery(
-                    "single-node structural search requires the unigram index — tracked in #283"
-                        .into(),
-                ));
-            }
-            AstQuery::Pattern(pattern) => crate::ast_index::pattern_to_query_set(pattern),
-            AstQuery::Containment(set) => set.clone(),
-        };
+        let ngram_set = ast_query_to_ngram_set(&ast_q)?;
 
-        let mut hits = self.run_ngram_set(&ngram_set, query.lang)?;
+        let mut hits = self.run_ngram_set(ngram_set.as_ref(), query.lang)?;
         // hits is FileId-ASC from run_ngram_set; lang filter already applied.
 
         // Apply file_filter allowlist (no I/O).
@@ -529,100 +523,152 @@ fn kind(seg: &str) -> Result<NodeKindId> {
 /// does not amplify or suppress the BM25 term-frequency contribution).
 const UNKNOWN_LANG_IDF: f64 = 1.0;
 
-/// Reserve capacity in `scores` and `meta_cache` before inserting a posting
-/// list of `postings.len()` entries.
+// Dispatch helper
+
+/// Resolve an [`AstQuery`] to its [`AstNgramSet`], returning a borrowed or
+/// owned value depending on the variant.
 ///
-/// Reserves only *new* slots: clamped to `file_count` (total distinct docs) and
-/// reduced by the current `scores.len()` so overlapping posting lists never
-/// over-allocate (AC6 broad, AC7 empty-first, P3 #286).
-fn reserve_for_postings(
-    postings: &[AstPosting],
-    file_count: usize,
-    scores: &mut FxHashMap<u32, f64>,
-    meta_cache: &mut Option<FxHashMap<u32, LiteMeta>>,
-) {
-    let new_slots = postings.len().min(file_count).saturating_sub(scores.len());
-    if new_slots > 0 {
-        scores.reserve(new_slots);
-        if let Some(cache) = meta_cache {
-            cache.reserve(new_slots);
+/// This is the single `AstQuery → AstNgramSet` dispatch point, shared by
+/// [`AstQueryEngine::search_ast`] and [`SearchLayer::search`] so the match
+/// arms and [`SearchError::InvalidQuery`] message for `SingleNode` cannot
+/// silently drift between the two call sites (medium/architecture #286).
+///
+/// Returns `Err(InvalidQuery)` for [`AstQuery::SingleNode`] (→ #283).
+fn ast_query_to_ngram_set(q: &AstQuery) -> Result<Cow<'_, AstNgramSet>> {
+    match q {
+        AstQuery::SingleNode(_) => Err(SearchError::InvalidQuery(
+            "single-node structural search requires the unigram index — tracked in #283".into(),
+        )),
+        AstQuery::Pattern(pattern) => {
+            Ok(Cow::Owned(crate::ast_index::pattern_to_query_set(pattern)))
         }
+        // Borrow directly — no clone on the hot Containment path (medium/rust #286).
+        AstQuery::Containment(set) => Ok(Cow::Borrowed(set)),
     }
 }
 
-// Scoring helpers
+// Scoring context
 
-/// Accumulate BM25 scores for one set of postings into `scores`.
+/// Accumulated scoring state for one [`AstQueryEngine::run_ngram_set`] call.
 ///
-/// IDF is computed once per distinct language via a tiny last-value cache,
-/// reducing O(postings) binary-search calls to O(distinct_languages).
+/// Bundles `scores`, `meta_cache`, and the corpus `file_count` so that
+/// capacity reservation and score accumulation share the same mutable state
+/// without a 7-parameter function signature (medium/complexity #286).
 ///
-/// P1 (#286): Uses `file_lang_and_node_count` instead of `file_meta` to
-/// decode only the 5 bytes needed for BM25 scoring.  `meta_cache` now holds
-/// `LiteMeta` (5 bytes) instead of `AstFileMetaEntry` (15 bytes).
-///
-/// P4 (#286): `lang_filter` — when `Some(L)`, a posting whose `lang_id` does
-/// not resolve to `L` is skipped before insertion into `scores`.  When `None`,
-/// all postings are scored (unfiltered; `search_ast` always passes `None`).
-///
-/// When `meta_cache` is `None` (single-n-gram query), the lite meta is fetched
-/// directly without caching — by contract C1 each posting list has at most one
-/// posting per doc_id, so cross-list cache hits never occur for a single n-gram.
-fn score_postings<R: AstPostingSource>(
-    postings: &[AstPosting],
-    scores: &mut FxHashMap<u32, f64>,
-    meta_cache: &mut Option<FxHashMap<u32, LiteMeta>>,
-    reader: &R,
-    avg: f64,
-    lang_filter: Option<Language>,
-    idf_fn: impl Fn(Language) -> f64,
-) -> Result<()> {
-    // Per-n-gram IDF memoization: at most one distinct value per language.
-    // Avoid HashMap overhead — track only the last seen (lang, idf) pair.
-    // P2 (#286): scalar cache already collapses O(postings) IDF lookups to
-    // O(distinct-langs-in-run); no array needed (ADR-003, closed-by-#284).
-    let mut last_lang: Option<Language> = None;
-    let mut last_idf: f64 = UNKNOWN_LANG_IDF;
+/// **Invariant**: `score_postings` calls `reserve` before inserting, so the
+/// reservation and the insert are always co-located — the temporal coupling
+/// present in the prior `reserve_for_postings` free function is eliminated.
+struct ScoringCtx {
+    scores: FxHashMap<u32, f64>,
+    /// `None` for single-n-gram queries (no cross-list cache benefit, C1).
+    /// Capacity note: on lang-filtered runs this cache is a loose upper bound —
+    /// it reserves based on `scores.len()` (smaller), which is intentional:
+    /// `reserve(additional)` is additive, so using the smaller map's count
+    /// never under-sizes the cache (low/performance #286).
+    meta_cache: Option<FxHashMap<u32, LiteMeta>>,
+    file_count: usize,
+}
 
-    for posting in postings {
-        let lite = match meta_cache {
-            Some(cache) => cached_lite_meta(reader, cache, posting.doc_id)?,
-            None => reader.file_lang_and_node_count(posting.doc_id)?.into(),
-        };
-
-        // Recover Language from the stored lang_id.
-        let language = crate::index::lang_map::lang_from_id(lite.lang_id);
-
-        // P4 (#286): skip this posting before insertion if the lang filter is
-        // active and this file's language doesn't match (avoids PF-006: filter
-        // is purely additive narrowing; lang=None path is byte-identical).
-        // AC3 (#286): unknown lang_id (lang_from_id returns None) is skipped
-        // when a lang filter is active — consistent with pre-P4 behaviour
-        // where an unknown lang never matches Some(lang).
-        if let Some(required_lang) = lang_filter {
-            match language {
-                Some(l) if l == required_lang => {}
-                _ => continue,
+impl ScoringCtx {
+    /// Accumulate BM25 scores for one set of postings.
+    ///
+    /// Reserves capacity before inserting (P3 invariant: reservation and
+    /// insert are always co-located; low/architecture #286).
+    ///
+    /// IDF is computed once per distinct language via a tiny last-value cache,
+    /// reducing O(postings) binary-search calls to O(distinct_languages).
+    ///
+    /// P1 (#286): Uses `file_lang_and_node_count` instead of `file_meta` to
+    /// decode only the 5 bytes needed for BM25 scoring.
+    ///
+    /// P4 (#286): `lang_filter` — when `Some(L)`, a posting whose `lang_id`
+    /// does not resolve to `L` is skipped before insertion into `scores`.
+    /// When `None`, all postings are scored (unfiltered; `search_ast` always
+    /// passes `None`).
+    fn score_postings<R: AstPostingSource>(
+        &mut self,
+        postings: &[AstPosting],
+        reader: &R,
+        avg: f64,
+        lang_filter: Option<Language>,
+        idf_fn: impl Fn(Language) -> f64,
+    ) -> Result<()> {
+        // Reserve only new slots: clamped to file_count to avoid over-allocation
+        // when scores already contains overlapping docs (AC6 broad, AC7 empty-first,
+        // P3 #286).  P3 invariant: reservation and insert are co-located here so
+        // callers cannot omit or reorder the reserve step (low/architecture #286).
+        let new_slots = postings
+            .len()
+            .min(self.file_count)
+            .saturating_sub(self.scores.len());
+        if new_slots > 0 {
+            self.scores.reserve(new_slots);
+            if let Some(cache) = self.meta_cache.as_mut() {
+                // The cache reserve uses `scores.len()` (pre-insert), which is
+                // ≤ cache.len() on lang-filtered runs.  This is intentionally a
+                // loose upper bound: `reserve(additional)` is additive so we
+                // never under-size (low/performance note, #286).
+                cache.reserve(new_slots);
             }
         }
 
-        let idf = match language {
-            Some(lang) => {
-                if last_lang == Some(lang) {
-                    last_idf
-                } else {
-                    let v = idf_fn(lang);
-                    last_lang = Some(lang);
-                    last_idf = v;
-                    v
+        // Per-n-gram IDF memoization: at most one distinct value per language.
+        // Avoid HashMap overhead — track only the last seen (lang, idf) pair.
+        // P2 (#286): scalar cache already collapses O(postings) IDF lookups to
+        // O(distinct-langs-in-run); no array needed (ADR-003, closed-by-#284).
+        //
+        // AC8 (#286): the scalar `last_lang`/`last_idf` cache is reset each
+        // `score_postings` call (per-n-gram scope).  Score-equivalence vs. a
+        // naive no-cache reference is verified in test `ac8_scalar_idf_cache_score_equivalence`.
+        let mut last_lang: Option<Language> = None;
+        let mut last_idf: f64 = UNKNOWN_LANG_IDF;
+
+        for posting in postings {
+            let lite = match self.meta_cache.as_mut() {
+                Some(cache) => cached_lite_meta(reader, cache, posting.doc_id)?,
+                None => reader.file_lang_and_node_count(posting.doc_id)?.into(),
+            };
+
+            // Recover Language from the stored lang_id via LiteMeta::language(),
+            // keeping lang-id → Language recovery in one place per struct
+            // (low/consistency #286).
+            let language = lite.language();
+
+            // P4 (#286): skip this posting before insertion if the lang filter is
+            // active and this file's language doesn't match (avoids PF-006: filter
+            // is purely additive narrowing; lang=None path is byte-identical).
+            // AC3 (#286): unknown lang_id (lang_from_id returns None) is skipped
+            // when a lang filter is active — consistent with pre-P4 behaviour
+            // where an unknown lang never matches Some(lang).
+            if let Some(required_lang) = lang_filter {
+                match language {
+                    Some(l) if l == required_lang => {}
+                    _ => continue,
                 }
             }
-            None => UNKNOWN_LANG_IDF,
-        };
-        *scores.entry(posting.doc_id).or_insert(0.0) +=
-            bm25_with_lite(posting, lite.node_count, avg, idf);
+
+            // Per-posting lang→idf lookup, memoized by last-value scalar cache.
+            // `lang_from_id` (called inside `lite.language()` above) is a cheap
+            // match/jump table with no I/O; calling it once per posting is
+            // performance-neutral (low/performance note, #286).
+            let idf = match language {
+                Some(lang) => {
+                    if last_lang == Some(lang) {
+                        last_idf
+                    } else {
+                        let v = idf_fn(lang);
+                        last_lang = Some(lang);
+                        last_idf = v;
+                        v
+                    }
+                }
+                None => UNKNOWN_LANG_IDF,
+            };
+            *self.scores.entry(posting.doc_id).or_insert(0.0) +=
+                bm25_with_lite(posting, lite.node_count, avg, idf);
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// BM25 score contribution for one n-gram posting, given a pre-computed IDF

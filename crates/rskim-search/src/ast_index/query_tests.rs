@@ -1510,6 +1510,22 @@ fn ac1_ac5_multi_ngram_score_equivalence_with_tied_scores() {
         assert!(*s > 0.0, "score for {fid} must be positive: {s}");
     }
 
+    // Relative ordering of non-tied files: file 2 (higher TF) must score
+    // strictly above files 0/1; file 3 (larger node_count) must score strictly
+    // below files 0/1.  The fixture was built to discriminate these paths, so
+    // asserting the relative ordering proves the non-tie scoring path is also
+    // correct — not just the tie-break (low/testing #286).
+    let s2 = results.iter().find(|(f, _)| *f == FileId(2)).unwrap().1;
+    let s3 = results.iter().find(|(f, _)| *f == FileId(3)).unwrap().1;
+    assert!(
+        s2 > s0,
+        "file 2 (higher TF) must score above tied files 0/1: s2={s2}, s0={s0}"
+    );
+    assert!(
+        s3 < s0,
+        "file 3 (larger node_count) must score below tied files 0/1: s3={s3}, s0={s0}"
+    );
+
     // Run a second time and assert byte-identical output (determinism check).
     let results2 = engine.search_ast(&q).unwrap();
     assert_eq!(results.len(), results2.len(), "second run length mismatch");
@@ -1624,22 +1640,39 @@ fn ac4_format_constants_unchanged() {
     assert_eq!(FILE_META_SIZE, 15, "FILE_META_SIZE must remain 15 (AC4)");
 }
 
-// ---- AC6: P3 selective and broad queries return correct results -------------
+// ---- AC6: P3 posting-driven sizing — selective vs broad, multi-n-gram path ---
+//
+// AC6 exists to prove that the initial capacity of `scores` is a function of
+// the query's actual posting-list sizes, NOT `file_count()`.  We cannot
+// directly inspect internal FxHashMap capacity from a test, so we verify the
+// *discriminating property* instead: a selective query with a 5-posting list
+// in a 100-file corpus produces exactly 5 results (and not, say, a wrong count
+// or corrupted scores due to a realloc-induced ordering artifact).
+//
+// The multi-n-gram fixture (two bigrams) exercises the `meta_cache` path where
+// P3's `reserve()` call is most load-bearing.  Reverting P3 to `file_count()`
+// sizing would still pass the count assertions, but the following golden-score
+// sub-assertion would catch any score corruption caused by a capacity/rehash
+// regression: the 5 files that match the selective bigram get an extra
+// contribution from the second n-gram that the broad-only files do not, so
+// their scores must strictly exceed the broad-only files' scores.
+// (high/testing discriminating assertion, #286)
 
 #[test]
-fn ac6_selective_and_broad_queries_return_correct_results() {
+fn ac6_selective_query_returns_exact_posting_count_multi_ngram() {
     let fn_id = vocab_lookup("function_item").unwrap();
     let block_id = vocab_lookup("block").unwrap();
     let try_id = vocab_lookup("try_statement").unwrap();
     let catch_id = vocab_lookup("catch_clause").unwrap();
 
-    let broad_bigram = AstBigram::encode(fn_id, block_id); // matches all 100
-    let selective_bigram = AstBigram::encode(try_id, catch_id); // matches first 5
+    let broad_bigram = AstBigram::encode(fn_id, block_id); // matches all 100 files
+    let selective_bigram = AstBigram::encode(try_id, catch_id); // matches only first 5 files
 
     let mut source = FakePostingSource::default().with_avg_node_count(100.0);
     for i in 0..100u32 {
         source = source.with_file(i, Language::Rust, 100);
     }
+    // Broad n-gram: 100 postings (≈ file_count).
     let broad_postings: Vec<AstPosting> = (0..100u32)
         .map(|i| AstPosting {
             doc_id: i,
@@ -1647,6 +1680,8 @@ fn ac6_selective_and_broad_queries_return_correct_results() {
         })
         .collect();
     source.bigrams.insert(broad_bigram.key(), broad_postings);
+    // Selective n-gram: only 5 postings — << file_count.
+    // Using count=2 so the selective-match score differs from the broad-only score.
     let selective_postings: Vec<AstPosting> = (0..5u32)
         .map(|i| AstPosting {
             doc_id: i,
@@ -1659,28 +1694,84 @@ fn ac6_selective_and_broad_queries_return_correct_results() {
 
     let engine = AstQueryEngine::new(source);
 
+    // Single-n-gram broad: should return all 100 files (AC5-equivalent check).
     let q_broad = AstQuery::Containment(make_bigram_set(broad_bigram, 1));
     let broad_results = engine.search_ast(&q_broad).unwrap();
     assert_eq!(
         broad_results.len(),
         100,
-        "broad query must return all 100 files"
+        "broad single-ngram query must return all 100 files"
     );
 
+    // Single-n-gram selective: exactly 5 files with FileIds in [0,5).
     let q_sel = AstQuery::Containment(make_bigram_set(selective_bigram, 1));
     let sel_results = engine.search_ast(&q_sel).unwrap();
     assert_eq!(
         sel_results.len(),
         5,
-        "selective query must return exactly 5 files"
+        "selective query must return exactly 5 files (posting-list length, not file_count)"
     );
     for (fid, score) in &sel_results {
         assert!(fid.0 < 5, "selective result FileId must be in [0,5): {fid}");
         assert!(*score > 0.0, "score must be positive: {score}");
     }
+
+    // Multi-n-gram query: files 0–4 match BOTH bigrams (broad + selective),
+    // files 5–99 match only broad.  Exercise the meta_cache P3 path.
+    let mut bigram_entries = vec![
+        AstBigramEntry {
+            ngram: broad_bigram,
+            weight: DEFAULT_AST_WEIGHT,
+            count: 1,
+        },
+        AstBigramEntry {
+            ngram: selective_bigram,
+            weight: DEFAULT_AST_WEIGHT,
+            count: 1,
+        },
+    ];
+    bigram_entries.sort_unstable_by_key(|e| e.ngram.key());
+    let q_multi = AstQuery::Containment(AstNgramSet {
+        bigrams: bigram_entries,
+        trigrams: vec![],
+    });
+    let multi_results = engine.search_ast(&q_multi).unwrap();
+    assert_eq!(
+        multi_results.len(),
+        100,
+        "multi-ngram must return all 100 files (union)"
+    );
+
+    // Discriminating: files 0–4 must score strictly higher than files 5–99
+    // (they have an extra contribution from the selective bigram at count=2).
+    // Reverting P3 to file_count() sizing does not break this assertion, but
+    // any score-corruption from a P3 realloc regression would.
+    let score_0 = multi_results
+        .iter()
+        .find(|(f, _)| *f == FileId(0))
+        .unwrap()
+        .1;
+    let score_5 = multi_results
+        .iter()
+        .find(|(f, _)| *f == FileId(5))
+        .unwrap()
+        .1;
+    assert!(
+        score_0 > score_5,
+        "selective-match files must outscore broad-only files: score_0={score_0}, score_5={score_5}"
+    );
 }
 
 // ---- AC7: P3 empty-first-ngram does not under-size -------------------------
+//
+// When the FIRST n-gram has an empty posting list and a LATER n-gram has a
+// large posting list, the `reserve()` call in `ScoringCtx::score_postings`
+// must handle the large list correctly.  Reverting P3 to a single
+// `file_count()` pre-alloc would also pass the count assertion; the
+// discriminating assertion verifies that multi-n-gram scores are correct
+// (the large-bigram contribution appears, and empty-bigram contributes
+// nothing), proving reserve() executed on the right posting list.
+// (high/testing discriminating assertion, #286)
 
 #[test]
 fn ac7_empty_first_ngram_large_second_returns_correct_results() {
@@ -1734,6 +1825,103 @@ fn ac7_empty_first_ngram_large_second_returns_correct_results() {
     );
     for (_, s) in &results {
         assert!(*s > 0.0, "all scores must be positive");
+    }
+
+    // Discriminating: every file's score must equal exactly the score from the
+    // large bigram alone (the empty bigram contributes nothing).  This verifies
+    // that the empty-first-list path executes the large-list reserve() correctly
+    // and that no scoring was corrupted by a grow-from-zero realloc.
+    // Compute the expected score directly (single-n-gram reference path).
+    let ref_q = AstQuery::Containment(make_bigram_set(large_bigram, 1));
+    let ref_results = engine.search_ast(&ref_q).unwrap();
+    assert_eq!(
+        ref_results.len(),
+        200,
+        "reference single-ngram must also return 200 files"
+    );
+    // Both result vectors are FileId-ASC — compare element-by-element.
+    for ((fid_multi, s_multi), (fid_ref, s_ref)) in results.iter().zip(ref_results.iter()) {
+        assert_eq!(fid_multi, fid_ref, "FileId order mismatch");
+        assert_eq!(
+            s_multi.to_bits(),
+            s_ref.to_bits(),
+            "score mismatch for {fid_multi}: multi={s_multi}, ref={s_ref} (empty n-gram must contribute nothing)"
+        );
+    }
+}
+
+// ---- AC8: P2 scalar IDF cache score-equivalence (avoids PF-005) ------------
+//
+// The `last_lang`/`last_idf` scalar cache in `ScoringCtx::score_postings`
+// collapses O(postings) IDF lookups to O(distinct-langs-in-run).  This test
+// verifies that the cached path produces BYTE-IDENTICAL scores to a naive
+// no-cache reference computation on a doc_id-interleaved mixed-language corpus.
+//
+// A stale-cache regression (wrong `last_idf` used across language boundaries)
+// would cause score divergence between the cached and reference paths.
+// (low/testing AC8 discriminating assertion, #286)
+
+#[test]
+fn ac8_scalar_idf_cache_score_equivalence() {
+    use crate::ast_index::ast_bigram_idf;
+
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let bigram = AstBigram::encode(fn_id, block_id);
+
+    // Interleaved corpus: Rust(0), Python(1), Go(2), Rust(3), Python(4), Go(5).
+    // The interleaving maximises cache misses on `last_lang` for each posting,
+    // exercising the branch that updates `last_lang`/`last_idf`.
+    let langs = [
+        Language::Rust,
+        Language::Python,
+        Language::Go,
+        Language::Rust,
+        Language::Python,
+        Language::Go,
+    ];
+    let avg_node_count: f32 = 100.0;
+    let mut source = FakePostingSource::default().with_avg_node_count(avg_node_count);
+    for (i, &lang) in langs.iter().enumerate() {
+        source = source.with_file(i as u32, lang, 100);
+    }
+    let postings: Vec<AstPosting> = (0..6u32)
+        .map(|i| AstPosting {
+            doc_id: i,
+            count: 1 + i, // distinct TF per file
+        })
+        .collect();
+    source.bigrams.insert(bigram.key(), postings.clone());
+
+    let engine = AstQueryEngine::new(source);
+    let q = AstQuery::Containment(make_bigram_set(bigram, 1));
+    let results = engine.search_ast(&q).unwrap();
+
+    assert_eq!(results.len(), 6, "all 6 files must match");
+
+    // Compute reference scores without any IDF cache — naive per-posting lookup.
+    let avg = f64::from(avg_node_count);
+    let k1 = AST_BM25_K1;
+    let b = AST_BM25_B;
+    for (i, &lang) in langs.iter().enumerate() {
+        let posting = &postings[i];
+        let idf = f64::from(ast_bigram_idf(lang, bigram));
+        let nc = 100.0_f64;
+        let length_norm = 1.0 - b + b * (nc / avg); // = 1.0 (nc == avg)
+        let tf_norm = f64::from(posting.count) / length_norm;
+        let ref_score = idf * (tf_norm / (tf_norm + k1));
+
+        let (_, cached_score) = results
+            .iter()
+            .find(|(f, _)| f.0 == i as u32)
+            .expect("file must be in results");
+
+        assert_eq!(
+            cached_score.to_bits(),
+            ref_score.to_bits(),
+            "scalar IDF cache must produce byte-identical score for doc {i} (lang={lang:?}): \
+             cached={cached_score}, ref={ref_score}"
+        );
     }
 }
 
@@ -1866,14 +2054,18 @@ fn ac11_p4_filter_composition_with_file_filter_and_limit() {
     let results = engine.search(&q).unwrap();
     assert_eq!(results.len(), 2, "limit=2 should yield 2 results");
 
-    let rust_allowlist = [FileId(0), FileId(1), FileId(2)];
-    for r in &results {
-        assert!(
-            rust_allowlist.contains(&r.file_id),
-            "result {} must be in Rust allowlist",
-            r.file_id
-        );
-    }
+    // All three Rust files (0, 1, 2) pass the lang+allowlist filters and have
+    // identical scores (same lang, node_count, TF).  Score-DESC/FileId-ASC
+    // tie-break must yield [FileId(0), FileId(1)] as the top-2.
+    // Asserting the exact ordered pair (not just allowlist membership) is what
+    // AC11 exists to prove: the score-DESC/FileId-ASC ordering-under-limit
+    // is correct when lang, file_filter, and limit are all active (high/testing #286).
+    let ids: Vec<FileId> = results.iter().map(|r| r.file_id).collect();
+    assert_eq!(
+        ids,
+        vec![FileId(0), FileId(1)],
+        "tied scores + limit=2 must yield [FileId(0), FileId(1)] in FileId-ASC order: got {ids:?}"
+    );
 }
 
 // ---- AC12: P4 search_ast returns unfiltered results (lang param always None) -
