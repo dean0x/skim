@@ -24,7 +24,7 @@ features = ["rustls", "json"]
 default-features = false
 
 [dependencies.serde_json]
-version = "1.0"
+workspace = true
 optional = true
 
 [features]

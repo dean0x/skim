@@ -407,14 +407,145 @@ fn ac7_mandated_ids_resolve_correctly() {
     );
 }
 
-/// This test asserts that `encoding_for_model` is the SOLE model→encoding mapping
-/// in the rskim-tokens crate. The workspace-level CI grep check (in ci.yml) provides
-/// the broader cross-workspace guarantee per AC7.
 #[test]
 fn ac7_encoding_for_model_is_public() {
     // Verify the function is accessible from outside the crate
     let enc = rskim_tokens::encoding_for_model("gpt-4");
     assert_eq!(enc, Encoding::Cl100k);
+}
+
+/// Detect whether `src` declares any `fn` that takes a borrowed-str parameter
+/// and returns a type whose final path segment is `Encoding` — i.e. a model→
+/// encoding lookup/table. Tolerates qualified return paths (`-> crate::Encoding`,
+/// `-> rskim_tokens::Encoding`), surrounding whitespace, and a `Result<Encoding>`
+/// wrapper. Excludes `&self` getters because they take no `&str` parameter.
+fn file_has_str_to_encoding_fn(src: &str) -> bool {
+    // Walk each `fn ` declaration and inspect its signature header (up to the
+    // opening brace or `;`).
+    for (start, _) in src.match_indices("fn ") {
+        let after = &src[start..];
+        let header_end = after.find('{').unwrap_or(after.len());
+        let header = &after[..header_end];
+
+        // Must take a borrowed str parameter (the model id).
+        if !header.contains("&str") {
+            continue;
+        }
+        // Must return something ending in `Encoding`. Find the return arrow and
+        // check the returned type path ends in the `Encoding` identifier.
+        if let Some(arrow) = header.find("->") {
+            let ret = header[arrow + 2..].trim();
+            // Strip a `Result<...>` / `Option<...>` wrapper if present.
+            let inner = ret
+                .strip_prefix("Result<")
+                .or_else(|| ret.strip_prefix("Option<"))
+                .map_or(ret, |r| r.split([',', '>']).next().unwrap_or(r).trim());
+            // Last path segment of the returned type.
+            let last_seg = inner
+                .trim_start_matches('&')
+                .rsplit("::")
+                .next()
+                .unwrap_or("")
+                .trim();
+            if last_seg == "Encoding" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// AC7 (sole-mapping gate): assert that `encoding.rs` is the ONLY workspace
+/// source file declaring a `&str -> Encoding` model→encoding mapping. This is
+/// the repository assertion AC7 mandates ("a test MUST assert this table is the
+/// sole mapping in the workspace") — it fails the moment a second ticket (#301,
+/// #302, …) reintroduces a parallel table instead of calling `encoding_for_model`.
+#[test]
+fn ac7_model_encoding_mapping_is_sole_in_workspace() {
+    use std::path::Path;
+
+    // Resolve the workspace `crates/` root relative to this crate's manifest.
+    let crates_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("rskim-tokens has a parent (crates/)")
+        .to_path_buf();
+    assert!(
+        crates_root.join("rskim-tokens").is_dir(),
+        "expected crates/ root at {crates_root:?}"
+    );
+
+    // The single authorised location for the model→encoding table.
+    let authorised = crates_root.join("rskim-tokens/src/encoding.rs");
+
+    // Recursively collect all .rs files under crates/.
+    let mut offenders: Vec<String> = Vec::new();
+    let mut stack = vec![crates_root.clone()];
+    // Bounded directory walk (no symlink following; finite tree).
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Skip build artefacts.
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && path != authorised
+                // Exclude THIS test file: its explanatory comment names the
+                // detected signature shape and would otherwise self-trigger.
+                && path.file_name().is_none_or(|n| n != "integration.rs")
+            {
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                if file_has_str_to_encoding_fn(&src) {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "AC7 violation: a second `&str -> Encoding` mapping exists outside \
+         encoding.rs (call `encoding_for_model` instead). Offending files: {offenders:?}"
+    );
+}
+
+/// Guard against a vacuous AC7 gate (PF-007): the detector must FIRE on every
+/// realistic parallel-mapping shape and stay SILENT on non-mappings.
+#[test]
+fn ac7_detector_catches_parallel_mappings_and_ignores_getters() {
+    // Positive cases — these MUST be flagged.
+    assert!(file_has_str_to_encoding_fn(
+        "pub fn t(model: &str) -> Encoding { todo!() }"
+    ));
+    assert!(file_has_str_to_encoding_fn(
+        "fn t(m: &str) -> crate::Encoding { todo!() }"
+    ));
+    assert!(file_has_str_to_encoding_fn(
+        "fn t(m: &str) -> rskim_tokens::Encoding {\n}"
+    ));
+    assert!(file_has_str_to_encoding_fn(
+        "pub fn t(m: &str)\n    -> Result<Encoding, Error> { todo!() }"
+    ));
+
+    // Negative cases — these MUST NOT be flagged.
+    assert!(
+        !file_has_str_to_encoding_fn("pub fn encoding(&self) -> Encoding { self.enc }"),
+        "&self getter (no &str param) must not be flagged"
+    );
+    assert!(
+        !file_has_str_to_encoding_fn("fn name(&self) -> &str { self.name }"),
+        "&str return (not Encoding) must not be flagged"
+    );
+    assert!(
+        !file_has_str_to_encoding_fn("fn count(text: &str) -> usize { text.len() }"),
+        "unrelated &str fn must not be flagged"
+    );
 }
 
 // ============================================================================
@@ -631,4 +762,33 @@ fn ac6_heuristic_gte_for_single_byte() {
         h >= cl.max(o2),
         "heuristic >= max for single byte: h={h} cl={cl} o2={o2}"
     );
+}
+
+// True property-style coverage of the AC6 invariant: for ARBITRARY UTF-8 input
+// (not just a fixed corpus), the byte-length heuristic must never undercount the
+// real BPE tokenizers. Generated inputs probe cases the fixed corpus cannot.
+//
+// Counters are built ONCE outside the proptest closure (BPE construction decodes
+// the embedded vocab and is comparatively expensive); the closure only borrows
+// them, keeping the generated-case loop fast.
+#[test]
+fn ac6_heuristic_gte_max_bpe_property() {
+    let cl100k = Counter::new(Encoding::Cl100k).unwrap();
+    let o200k = Counter::new(Encoding::O200k).unwrap();
+    let heuristic = Counter::new(Encoding::Heuristic).unwrap();
+
+    let mut runner = proptest::test_runner::TestRunner::default();
+    runner
+        .run(&proptest::prelude::any::<String>(), |s| {
+            let h = heuristic.count(&s);
+            let cl = cl100k.count(&s);
+            let o2 = o200k.count(&s);
+            proptest::prop_assert!(
+                h >= cl.max(o2),
+                "heuristic must be >= max(cl100k, o200k) for arbitrary input: \
+                 input={s:?} heuristic={h} cl100k={cl} o200k={o2}"
+            );
+            Ok(())
+        })
+        .expect("AC6 property must hold for all generated inputs");
 }

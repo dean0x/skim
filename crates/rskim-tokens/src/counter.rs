@@ -77,6 +77,20 @@ fn prefilled_lock(bpe: CoreBPE) -> OnceLock<CoreBPE> {
     lock
 }
 
+/// Map a raw `tiktoken-rs` BPE-construction result into our error domain.
+///
+/// Centralises the `Result<CoreBPE, anyhow::Error> -> Result<CoreBPE, TokenError>`
+/// translation used by every tiktoken-backed encoding (avoids triplicating the
+/// `map_err`). It is also the **fault-injection seam for AC10**: feeding it an
+/// `Err` exercises the `TokenError::TiktokenInit` arm that the embedded vocab
+/// never triggers in practice (see `counter_tests::build_bpe_err_path_*`).
+fn build_bpe(
+    encoding: &'static str,
+    result: Result<CoreBPE, anyhow::Error>,
+) -> Result<CoreBPE, TokenError> {
+    result.map_err(|source| TokenError::TiktokenInit { encoding, source })
+}
+
 /// Count BPE tokens for a pre-filled lock, falling back to byte length if the
 /// lock is somehow unset (structurally impossible — preserved for the
 /// infallible contract).
@@ -100,25 +114,21 @@ impl Counter {
     /// fails to decode. This is practically unreachable at runtime.
     pub fn new(encoding: Encoding) -> Result<Self, TokenError> {
         let inner = match encoding {
-            Encoding::Cl100k => CounterInner::Cl100k(prefilled_lock(
-                tiktoken_rs::cl100k_base().map_err(|e| TokenError::TiktokenInit {
-                    encoding: "cl100k_base",
-                    source: e,
-                })?,
-            )),
-            Encoding::O200k => CounterInner::O200k(prefilled_lock(
-                tiktoken_rs::o200k_base().map_err(|e| TokenError::TiktokenInit {
-                    encoding: "o200k_base",
-                    source: e,
-                })?,
-            )),
+            Encoding::Cl100k => CounterInner::Cl100k(prefilled_lock(build_bpe(
+                "cl100k_base",
+                tiktoken_rs::cl100k_base(),
+            )?)),
+            Encoding::O200k => CounterInner::O200k(prefilled_lock(build_bpe(
+                "o200k_base",
+                tiktoken_rs::o200k_base(),
+            )?)),
             // AnthropicOffline delegates to cl100k counts internally.
-            Encoding::AnthropicOffline => CounterInner::AnthropicOffline(prefilled_lock(
-                tiktoken_rs::cl100k_base().map_err(|e| TokenError::TiktokenInit {
-                    encoding: "cl100k_base (for AnthropicOffline)",
-                    source: e,
-                })?,
-            )),
+            Encoding::AnthropicOffline => {
+                CounterInner::AnthropicOffline(prefilled_lock(build_bpe(
+                    "cl100k_base (for AnthropicOffline)",
+                    tiktoken_rs::cl100k_base(),
+                )?))
+            }
             Encoding::Heuristic => CounterInner::Heuristic,
         };
         Ok(Self { inner })
@@ -160,9 +170,7 @@ impl Counter {
     pub fn count(&self, text: &str) -> usize {
         match &self.inner {
             CounterInner::Cl100k(lock) | CounterInner::O200k(lock) => count_bpe(lock, text),
-            CounterInner::AnthropicOffline(lock) => {
-                count_anthropic_offline(count_bpe(lock, text))
-            }
+            CounterInner::AnthropicOffline(lock) => count_anthropic_offline(count_bpe(lock, text)),
             CounterInner::Heuristic => count_heuristic(text),
         }
     }
@@ -199,15 +207,18 @@ impl Counter {
     }
 }
 
-// Counter is Send + Sync because:
-// - OnceLock<CoreBPE> is Send + Sync (CoreBPE is Send + Sync per tiktoken-rs design).
-// - CounterInner::Heuristic has no heap data.
-// The static assertions in tests/integration.rs confirm this at compile time (AC11).
-unsafe impl Send for Counter {}
-unsafe impl Sync for Counter {}
+// Counter is Send + Sync *automatically* (auto-derived by the compiler):
+// - OnceLock<CoreBPE> is Send + Sync because CoreBPE is Send + Sync.
+// - CounterInner::Heuristic carries no data.
+//
+// We deliberately do NOT hand-write `unsafe impl Send/Sync` here: doing so would
+// suppress the compiler's auto-trait check and could silently mask a genuine data
+// race if a future field were not thread-safe. The static assertions in
+// tests/integration.rs (`assert_impl_all!(Counter: Send, Sync)`) verify the
+// auto-derived bounds hold at compile time (AC11).
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod counter_tests {
     use super::*;
 
@@ -228,9 +239,6 @@ mod counter_tests {
         );
     }
 
-    /// AC10: verify the Err path is reachable via the Result API contract.
-    /// The tiktoken-rs init is practically infallible (embedded vocab), so we
-    /// verify the structural Err type exists and is non-empty.
     #[test]
     fn counter_new_ok_for_all_encodings() {
         for encoding in [
@@ -244,5 +252,41 @@ mod counter_tests {
                 "Counter::new({encoding:?}) must return Ok"
             );
         }
+    }
+
+    /// AC10: the `TokenError::TiktokenInit` Err arm is **exercised**, not merely
+    /// asserted to exist. The embedded vocab never fails in practice, so we inject
+    /// a failure through `build_bpe` (the same translation `Counter::new` uses) and
+    /// confirm it produces a `TiktokenInit` error carrying the encoding name.
+    #[test]
+    fn build_bpe_err_path_is_exercised() {
+        let injected = build_bpe(
+            "cl100k_base",
+            Err(anyhow::anyhow!("simulated embedded-vocab decode failure")),
+        );
+        match injected {
+            Err(TokenError::TiktokenInit { encoding, source }) => {
+                assert_eq!(encoding, "cl100k_base");
+                assert!(
+                    source.to_string().contains("simulated"),
+                    "source error must be propagated, got: {source}"
+                );
+            }
+            // CoreBPE has no Debug impl, so describe the unexpected arm by hand.
+            Err(other) => panic!("expected TiktokenInit Err, got a different error: {other}"),
+            Ok(_) => panic!("expected Err, got Ok(CoreBPE)"),
+        }
+    }
+
+    /// AC10: the Ok arm of `build_bpe` passes a valid BPE straight through, so the
+    /// helper used by `Counter::new` is verified on both arms.
+    #[test]
+    fn build_bpe_ok_path_passes_bpe_through() {
+        let bpe = tiktoken_rs::cl100k_base().unwrap();
+        let wrapped = build_bpe("cl100k_base", Ok(bpe));
+        assert!(
+            wrapped.is_ok(),
+            "build_bpe must pass a valid BPE through as Ok"
+        );
     }
 }

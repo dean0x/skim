@@ -77,8 +77,7 @@ impl AnthropicNetworkCounter {
     ///
     /// - [`TokenError::MissingApiKey`] — `ANTHROPIC_API_KEY` not set.
     pub fn from_env(model_id: &str) -> Result<Self, TokenError> {
-        let api_key =
-            std::env::var("ANTHROPIC_API_KEY").map_err(|_| TokenError::MissingApiKey)?;
+        let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| TokenError::MissingApiKey)?;
         if api_key.is_empty() {
             return Err(TokenError::MissingApiKey);
         }
