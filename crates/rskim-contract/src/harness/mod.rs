@@ -635,35 +635,14 @@ fn check_pathological_inputs(
     );
 }
 
-/// Provider API key value prefixes that should never appear in a log record.
-///
-/// These are *value* patterns (not key-name patterns) — the shapes that real
-/// leaked API key values take. They complement the key-name suffix scan so the
-/// gate is falsifiable on both "key name leaked as value" and "key value leaked".
-///
-/// - `sk-ant-` — Anthropic API key prefix
-/// - `sk-` — OpenAI API key prefix
-/// - `ghp_`, `gho_`, `ghs_`, `ghr_`, `github_pat_` — GitHub token prefixes
-/// - `AKIA` — AWS access key prefix
-const SENSITIVE_VALUE_PREFIXES: &[&str] = &[
-    "sk-ant-",
-    "sk-",
-    "ghp_",
-    "gho_",
-    "ghs_",
-    "ghr_",
-    "github_pat_",
-    "AKIA",
-];
-
 /// Returns `true` if the JSON string contains any sensitive key name or value
 /// that should not appear unredacted in a decision record.
 ///
 /// The scan covers two axes:
 /// 1. **Key-name axis** — checks `SENSITIVE_EXACT` names and `SENSITIVE_SUFFIXES`
 ///    as quoted JSON values (identifier-shaped tokens containing `_`).
-/// 2. **Key-value axis** — checks `SENSITIVE_VALUE_PREFIXES` for provider API
-///    key value shapes (e.g., `sk-ant-`, `ghp_`, `AKIA`). This ensures the gate
+/// 2. **Key-value axis** — checks [`crate::log::SENSITIVE_VALUE_PREFIXES`] for provider
+///    API key value shapes (e.g., `sk-ant-`, `ghp_`, `AKIA`). This ensures the gate
 ///    is falsifiable even when the leaked material is the raw key value, not just
 ///    the variable name.
 ///
@@ -731,6 +710,7 @@ fn token_has_sensitive_suffix(token: &str, suffixes: &[&str]) -> bool {
 /// (e.g., `sk-ant-`, `ghp_`, `AKIA`). These patterns identify raw key *values*
 /// that must not appear in a decision record, complementing the key-name scan.
 fn token_has_sensitive_value_prefix(token: &str) -> bool {
+    use crate::log::SENSITIVE_VALUE_PREFIXES;
     // Require a minimum length to avoid false positives on short strings.
     if token.len() < 8 {
         return false;

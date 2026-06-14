@@ -574,24 +574,20 @@ mod tests {
     //
     // AC9's plan mandates a fixture "exercising any internal map iteration"
     // that asserts map-backed output is deterministic. The RawNode::Object arm
-    // in `parse_raw_node` uses HashMap, whose iteration order varies per run.
-    // However, `raw_nodes_equal` is order-insensitive (it finds each key via
-    // `.find()`), so the boolean RESULT is deterministic even if HashMap
-    // iteration order is not. These tests make that property observable.
-    //
-    // Note: per-process HashMap seed is fixed at process start (Rust's
-    // standard HashMap uses RandomState seeded once), so within a single
-    // process run, iteration order is stable but NOT guaranteed to be the
-    // same across processes. The equality RESULT must be stable across all
-    // orderings because `raw_nodes_equal` uses order-insensitive comparison.
+    // in `parse_raw_node` uses BTreeMap (deterministic key order), so
+    // `raw_nodes_equal` iterates in sorted-key order. However, `raw_nodes_equal`
+    // compares objects order-insensitively via `.find()` — so the boolean result
+    // is deterministic regardless of which collection backs the node.
+    // These tests make that property observable with objects whose keys arrive in
+    // different source orders.
     // ========================================================================
 
     /// AC9 map-iteration fixture: two objects with the same keys in different
     /// source orders must compare equal via `canonical_equal_raw`.
     ///
     /// This is the canonical AC9 map-iteration test: the raw JSON strings
-    /// differ in key order, so `parse_raw_node` will encounter the keys in
-    /// different HashMap iteration sequences, yet the result must be `true`.
+    /// differ in key order, yet `raw_nodes_equal` uses order-insensitive
+    /// comparison (`.find()` per key), so the result must be `true`.
     #[test]
     fn canonical_equal_raw_many_keys_different_source_order() {
         // 10 key object in two different source orderings.
@@ -613,9 +609,9 @@ mod tests {
     /// AC9 map-iteration fixture for `tools_arrays_equal`: tool objects with
     /// many keys in different source orders must compare equal.
     ///
-    /// This exercises `parse_raw_node`'s HashMap arm on a realistic tool schema
-    /// and confirms the order-insensitive `.find()` loop produces the same verdict
-    /// regardless of HashMap iteration sequence.
+    /// This exercises `parse_raw_node`'s object arm on a realistic tool schema
+    /// and confirms the order-insensitive `.find()` loop in `raw_nodes_equal`
+    /// produces the same verdict regardless of source key order.
     #[test]
     fn tools_arrays_equal_many_keys_different_source_order() {
         let original = r#"[{"name":"t","description":"desc","parameters":{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"integer"},"c":{"type":"boolean"},"d":{"type":"number"},"e":{"type":"array","items":{"type":"string"}}}}}]"#;
