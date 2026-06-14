@@ -93,12 +93,6 @@ impl TokenStats {
         ((self.original as f32 - self.transformed as f32) / self.original as f32) * 100.0
     }
 
-    /// Get tokens saved
-    #[allow(dead_code)]
-    pub(crate) fn tokens_saved(&self) -> usize {
-        self.original.saturating_sub(self.transformed)
-    }
-
     /// Format stats for display
     pub(crate) fn format(&self) -> String {
         format!(
@@ -134,14 +128,13 @@ mod tests {
         let text = "Hello, world!";
         let count = count_tokens(text).unwrap();
         assert!(count > 0);
-        assert!(count < 10); // Should be around 3-4 tokens
+        assert!(count < 10);
     }
 
     #[test]
     fn test_token_stats() {
         let stats = TokenStats::new(1000, 200);
         assert_eq!(stats.reduction_percentage(), 80.0);
-        assert_eq!(stats.tokens_saved(), 800);
     }
 
     #[test]

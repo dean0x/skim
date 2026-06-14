@@ -27,24 +27,18 @@
 //!   **never logged** (constraint 15).
 //! - Requests use a fixed timeout and a bounded retry count (constraint 3).
 
-#[cfg(feature = "net-anthropic")]
 use crate::TokenError;
-#[cfg(feature = "net-anthropic")]
 use std::time::Duration;
 
-#[cfg(feature = "net-anthropic")]
 /// Request timeout for each Anthropic API call.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[cfg(feature = "net-anthropic")]
 /// Maximum number of retries on transient failure.
 const MAX_RETRIES: u32 = 2;
 
-#[cfg(feature = "net-anthropic")]
 /// Endpoint for the Anthropic token-counting API.
 const COUNT_TOKENS_ENDPOINT: &str = "https://api.anthropic.com/v1/messages/count_tokens";
 
-#[cfg(feature = "net-anthropic")]
 /// Anthropic API version header value.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -57,7 +51,6 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 ///
 /// The API key is stored in memory for the lifetime of this struct but is
 /// **never logged**, printed, or included in error messages.
-#[cfg(feature = "net-anthropic")]
 pub struct AnthropicNetworkCounter {
     /// The Anthropic model ID to pass in the count-tokens request.
     model: String,
@@ -67,7 +60,6 @@ pub struct AnthropicNetworkCounter {
     api_key: String,
 }
 
-#[cfg(feature = "net-anthropic")]
 impl AnthropicNetworkCounter {
     /// Construct a counter by reading `ANTHROPIC_API_KEY` from the environment.
     ///
