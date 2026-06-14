@@ -305,25 +305,20 @@ fn has_log_level_prefix(line: &str) -> bool {
         "TRC",
     ];
 
-    for level in LEVELS {
+    LEVELS.iter().any(|level| {
         // Bare prefix: "ERROR:" or "ERROR " or "ERROR\t"
-        if let Some(rest) = line.strip_prefix(level)
-            && (rest.is_empty()
+        let bare = line.strip_prefix(level).is_some_and(|rest| {
+            rest.is_empty()
                 || rest.starts_with(':')
                 || rest.starts_with(' ')
-                || rest.starts_with('\t'))
-        {
-            return true;
-        }
+                || rest.starts_with('\t')
+        });
         // Bracketed: "[ERROR]" or "[INFO]" — check without allocating
-        if line.starts_with('[')
+        let bracketed = line.starts_with('[')
             && line[1..].starts_with(level)
-            && line[1 + level.len()..].starts_with(']')
-        {
-            return true;
-        }
-    }
-    false
+            && line[1 + level.len()..].starts_with(']');
+        bare || bracketed
+    })
 }
 
 /// Check for a generic bracketed prefix pattern.

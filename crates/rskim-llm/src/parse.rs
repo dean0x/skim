@@ -162,9 +162,9 @@ fn describe_value(v: &serde_json::Value) -> String {
                 // raw byte index can fall mid-codepoint and panic on hostile input.
                 let end = s
                     .char_indices()
-                    .map(|(i, _)| i)
-                    .take_while(|&i| i <= 32)
+                    .take_while(|(i, _)| *i <= 32)
                     .last()
+                    .map(|(i, _)| i)
                     .unwrap_or(0);
                 format!("string(\"{}...\")", &s[..end])
             } else {

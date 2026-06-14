@@ -51,8 +51,8 @@ impl ChunkIngestionBuilder {
     /// Create a builder with a provider hint, skipping auto-detection.
     pub fn with_provider(provider: Provider) -> Self {
         Self {
-            buf: Vec::new(),
             provider_hint: Some(provider),
+            ..Self::default()
         }
     }
 
