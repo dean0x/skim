@@ -300,7 +300,7 @@ fn ac5_anthropic_offline_zero_network_io() {
 fn ac6_heuristic_gte_max_cl100k_o200k() {
     let cl100k = Counter::new(Encoding::Cl100k).expect("cl100k");
     let o200k = Counter::new(Encoding::O200k).expect("o200k");
-    let heuristic = Counter::new(Encoding::Heuristic).expect("heuristic");
+    let heuristic = Counter::heuristic();
 
     let corpus: &[&str] = &[
         // Mixed corpus (prose, code, JSON, logs, CJK, emoji)
@@ -331,7 +331,7 @@ fn ac6_heuristic_gte_max_cl100k_o200k() {
 fn ac6_heuristic_adversarial_large_repeat() {
     let cl100k = Counter::new(Encoding::Cl100k).expect("cl100k");
     let o200k = Counter::new(Encoding::O200k).expect("o200k");
-    let heuristic = Counter::new(Encoding::Heuristic).expect("heuristic");
+    let heuristic = Counter::heuristic();
 
     // 10000x single-byte repeat
     let input = "a".repeat(10_000);
@@ -348,7 +348,7 @@ fn ac6_heuristic_adversarial_large_repeat() {
 fn ac6_heuristic_adversarial_pure_cjk() {
     let cl100k = Counter::new(Encoding::Cl100k).expect("cl100k");
     let o200k = Counter::new(Encoding::O200k).expect("o200k");
-    let heuristic = Counter::new(Encoding::Heuristic).expect("heuristic");
+    let heuristic = Counter::heuristic();
 
     // Pure CJK block (each char is 3 UTF-8 bytes)
     let input = "日".repeat(100);
@@ -365,7 +365,7 @@ fn ac6_heuristic_adversarial_pure_cjk() {
 fn ac6_heuristic_adversarial_pure_emoji() {
     let cl100k = Counter::new(Encoding::Cl100k).expect("cl100k");
     let o200k = Counter::new(Encoding::O200k).expect("o200k");
-    let heuristic = Counter::new(Encoding::Heuristic).expect("heuristic");
+    let heuristic = Counter::heuristic();
 
     // Pure emoji block (each emoji is 4 UTF-8 bytes)
     let input = "🦀".repeat(100);
@@ -380,7 +380,7 @@ fn ac6_heuristic_adversarial_pure_emoji() {
 
 #[test]
 fn ac6_heuristic_never_errors() {
-    let counter = Counter::new(Encoding::Heuristic).expect("heuristic");
+    let counter = Counter::heuristic();
     // Infallible: calling count on any input must not panic or fail
     assert_eq!(counter.count(""), 0);
     assert!(counter.count("hello") > 0);
@@ -783,7 +783,7 @@ fn ac5_anthropic_formula_is_ceil_cl100k_times_1_25() {
 fn ac6_heuristic_gte_for_single_byte() {
     let cl100k = Counter::new(Encoding::Cl100k).unwrap();
     let o200k = Counter::new(Encoding::O200k).unwrap();
-    let heuristic = Counter::new(Encoding::Heuristic).unwrap();
+    let heuristic = Counter::heuristic();
 
     // Single byte
     let s = "a";
@@ -807,7 +807,7 @@ fn ac6_heuristic_gte_for_single_byte() {
 fn ac6_heuristic_gte_max_bpe_property() {
     let cl100k = Counter::new(Encoding::Cl100k).unwrap();
     let o200k = Counter::new(Encoding::O200k).unwrap();
-    let heuristic = Counter::new(Encoding::Heuristic).unwrap();
+    let heuristic = Counter::heuristic();
 
     let mut runner = proptest::test_runner::TestRunner::default();
     runner

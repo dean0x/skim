@@ -57,10 +57,10 @@ pub struct Counter {
 
 /// Internal representation of the counting strategy.
 enum CounterInner {
-    /// cl100k_base BPE (pre-filled at construction).
-    Cl100k(OnceLock<CoreBPE>),
-    /// o200k_base BPE (pre-filled at construction).
-    O200k(OnceLock<CoreBPE>),
+    /// BPE-backed counter (cl100k_base or o200k_base). The `Encoding` tag
+    /// distinguishes which vocabulary is loaded so `Counter::encoding()` can
+    /// report the correct variant without storing a separate field.
+    Bpe(Encoding, OnceLock<CoreBPE>),
     /// Anthropic offline approximation — uses a cl100k BPE internally.
     AnthropicOffline(OnceLock<CoreBPE>),
     /// Byte-length heuristic (no BPE needed).
@@ -114,14 +114,14 @@ impl Counter {
     /// fails to decode. This is practically unreachable at runtime.
     pub fn new(encoding: Encoding) -> Result<Self, TokenError> {
         let inner = match encoding {
-            Encoding::Cl100k => CounterInner::Cl100k(prefilled_lock(build_bpe(
-                "cl100k_base",
-                tiktoken_rs::cl100k_base(),
-            )?)),
-            Encoding::O200k => CounterInner::O200k(prefilled_lock(build_bpe(
-                "o200k_base",
-                tiktoken_rs::o200k_base(),
-            )?)),
+            Encoding::Cl100k => CounterInner::Bpe(
+                Encoding::Cl100k,
+                prefilled_lock(build_bpe("cl100k_base", tiktoken_rs::cl100k_base())?),
+            ),
+            Encoding::O200k => CounterInner::Bpe(
+                Encoding::O200k,
+                prefilled_lock(build_bpe("o200k_base", tiktoken_rs::o200k_base())?),
+            ),
             // AnthropicOffline delegates to cl100k counts internally.
             Encoding::AnthropicOffline => {
                 CounterInner::AnthropicOffline(prefilled_lock(build_bpe(
@@ -146,8 +146,7 @@ impl Counter {
     pub(crate) fn from_raw_bpe(encoding: Encoding, bpe: CoreBPE) -> Self {
         let lock = prefilled_lock(bpe);
         let inner = match encoding {
-            Encoding::Cl100k => CounterInner::Cl100k(lock),
-            Encoding::O200k => CounterInner::O200k(lock),
+            Encoding::Cl100k | Encoding::O200k => CounterInner::Bpe(encoding, lock),
             Encoding::AnthropicOffline => CounterInner::AnthropicOffline(lock),
             // Heuristic carries no BPE — the lock (and the bpe inside it) is dropped here.
             Encoding::Heuristic => CounterInner::Heuristic,
@@ -169,7 +168,7 @@ impl Counter {
     #[must_use]
     pub fn count(&self, text: &str) -> usize {
         match &self.inner {
-            CounterInner::Cl100k(lock) | CounterInner::O200k(lock) => count_bpe(lock, text),
+            CounterInner::Bpe(_, lock) => count_bpe(lock, text),
             CounterInner::AnthropicOffline(lock) => count_anthropic_offline(count_bpe(lock, text)),
             CounterInner::Heuristic => count_heuristic(text),
         }
@@ -224,8 +223,7 @@ impl Counter {
     #[must_use]
     pub fn encoding(&self) -> Encoding {
         match &self.inner {
-            CounterInner::Cl100k(_) => Encoding::Cl100k,
-            CounterInner::O200k(_) => Encoding::O200k,
+            CounterInner::Bpe(enc, _) => *enc,
             CounterInner::AnthropicOffline(_) => Encoding::AnthropicOffline,
             CounterInner::Heuristic => Encoding::Heuristic,
         }
