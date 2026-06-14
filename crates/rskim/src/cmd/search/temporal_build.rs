@@ -117,7 +117,7 @@ pub(super) fn acquire_build_lock(cache_dir: &Path) -> anyhow::Result<std::fs::Fi
                         LOCK_DEADLINE_SECS,
                     ));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(LOCK_POLL_MS));
+                std::thread::sleep(Duration::from_millis(LOCK_POLL_MS));
             }
             Err(std::fs::TryLockError::Error(e)) => {
                 return Err(anyhow::anyhow!(e))
@@ -228,6 +228,19 @@ pub(super) fn build_cochange_rows(history: &HistoryResult) -> Vec<CochangeRow> {
 // Row join helpers (D1 step 5 / AC11)
 // ============================================================================
 
+/// Collect the union of path keys from two maps into a `HashSet<&str>`.
+///
+/// Used by both row-join functions so the same pattern is not repeated twice.
+fn union_paths<'a, V1, V2>(
+    a: &'a HashMap<String, V1>,
+    b: &'a HashMap<String, V2>,
+) -> std::collections::HashSet<&'a str> {
+    a.keys()
+        .map(String::as_str)
+        .chain(b.keys().map(String::as_str))
+        .collect()
+}
+
 /// Join `compute_file_risk_scores` and `compute_file_temporal_stats` outputs
 /// into `Vec<HotspotRow>`.
 ///
@@ -242,14 +255,7 @@ pub(super) fn build_hotspot_rows(
     risk_scores: &HashMap<String, rskim_search::FileRiskScores>,
     temporal_stats: &HashMap<String, rskim_search::FileTemporalStats>,
 ) -> Vec<HotspotRow> {
-    // Union of all path keys from both maps.
-    let all_paths: std::collections::HashSet<&str> = risk_scores
-        .keys()
-        .map(String::as_str)
-        .chain(temporal_stats.keys().map(String::as_str))
-        .collect();
-
-    all_paths
+    union_paths(risk_scores, temporal_stats)
         .into_iter()
         .map(|path| {
             let score = risk_scores.get(path).map(|r| r.hotspot).unwrap_or(0.0);
@@ -272,32 +278,27 @@ pub(super) fn build_hotspot_rows(
 ///
 /// Same union-of-keys strategy as [`build_hotspot_rows`] (AC11 contract).
 ///
-/// `risk_score` and `fix_density` come from [`FileRiskScores`];
+/// `risk_score` and `fix_density` both come from `FileRiskScores.fix_density`
+/// (bug-fix density is both the risk score and the stored density ratio);
 /// `total_commits` and `fix_commits` come from [`FileTemporalStats`].
 pub(super) fn build_risk_rows(
     risk_scores: &HashMap<String, rskim_search::FileRiskScores>,
     temporal_stats: &HashMap<String, rskim_search::FileTemporalStats>,
 ) -> Vec<RiskRow> {
-    let all_paths: std::collections::HashSet<&str> = risk_scores
-        .keys()
-        .map(String::as_str)
-        .chain(temporal_stats.keys().map(String::as_str))
-        .collect();
-
-    all_paths
+    union_paths(risk_scores, temporal_stats)
         .into_iter()
         .map(|path| {
-            let (risk_score, fix_density) = risk_scores
-                .get(path)
-                .map(|r| (r.fix_density, r.fix_density))
-                .unwrap_or((0.0, 0.0));
+            let fix_density = risk_scores.get(path).map(|r| r.fix_density).unwrap_or(0.0);
             let (total_commits, fix_commits) = temporal_stats
                 .get(path)
                 .map(|s| (s.total_commits, s.fix_commits))
                 .unwrap_or((0, 0));
             RiskRow {
                 file_path: path.to_string(),
-                risk_score,
+                // risk_score and fix_density are both the decay-weighted bug-fix
+                // density from FileRiskScores — the schema stores them separately
+                // so the read query can ORDER BY either column independently.
+                risk_score: fix_density,
                 total_commits,
                 fix_commits,
                 fix_density,
