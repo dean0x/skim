@@ -493,6 +493,32 @@ pub(crate) fn encode_file_meta(m: &AstFileMetaEntry) -> [u8; FILE_META_SIZE] {
     buf
 }
 
+/// Decode only `lang_id` (byte 0) and `node_count` (bytes 1..5) from a
+/// 15-byte file-meta slice (v2) — the two fields consumed by the hot BM25
+/// scoring path (P1, #286).
+///
+/// This is the single source of truth for those two field offsets; both
+/// `decode_file_meta` and `AstIndexReader::file_lang_and_node_count` call
+/// this helper so the byte offsets cannot drift between the two paths.
+///
+/// # Errors
+///
+/// Returns [`SearchError::IndexCorrupted`] if the slice is shorter than 5
+/// bytes (`lang_id` + `node_count`).
+pub(crate) fn decode_lang_and_node_count(data: &[u8]) -> Result<(u8, u32)> {
+    // Minimum bytes needed: 1 (lang_id) + 4 (node_count) = 5.
+    const MIN_LEN: usize = 5;
+    if data.len() < MIN_LEN {
+        return Err(SearchError::IndexCorrupted(format!(
+            "ast_file_meta truncated: need {MIN_LEN} bytes for lang/node_count, got {}",
+            data.len()
+        )));
+    }
+    let lang_id = data[0];
+    let node_count = u32::from_le_bytes(read_array(data, 1, "ast_file_meta: node_count")?);
+    Ok((lang_id, node_count))
+}
+
 /// Decode an [`AstFileMetaEntry`] from a 15-byte slice (v2).
 ///
 /// # Errors
@@ -505,9 +531,13 @@ pub(crate) fn decode_file_meta(data: &[u8]) -> Result<AstFileMetaEntry> {
             data.len()
         )));
     }
+    // Use the shared helper for the first two fields so byte offsets stay
+    // in sync with the fast path in `AstIndexReader::file_lang_and_node_count`
+    // (#286 P1).
+    let (lang_id, node_count) = decode_lang_and_node_count(data)?;
     Ok(AstFileMetaEntry {
-        lang_id: data[0],
-        node_count: u32::from_le_bytes(read_array(data, 1, "ast_file_meta: node_count")?),
+        lang_id,
+        node_count,
         max_depth: u16::from_le_bytes(read_array(data, 5, "ast_file_meta: max_depth")?),
         max_block_stmts: u16::from_le_bytes(read_array(data, 7, "ast_file_meta: max_block_stmts")?),
         max_params: u16::from_le_bytes(read_array(data, 9, "ast_file_meta: max_params")?),

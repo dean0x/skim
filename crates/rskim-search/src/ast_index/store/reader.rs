@@ -29,7 +29,7 @@ use memmap2::Mmap;
 use super::format::{
     AstFileMetaEntry, AstSkidxHeader, BIGRAM_ENTRY_SIZE, FILE_META_SIZE, HEADER_SIZE,
     POSTING_ENTRY_SIZE, SKAX_MAGIC, TRIGRAM_ENTRY_SIZE, compute_checksum, decode_file_meta,
-    decode_header, decode_posting, lookup_bigram, lookup_trigram,
+    decode_header, decode_lang_and_node_count, decode_posting, lookup_bigram, lookup_trigram,
 };
 use crate::{
     Result, SearchError,
@@ -329,6 +329,50 @@ impl AstIndexReader {
                 ))
             })?;
         decode_file_meta(&self.idx_mmap[offset..end])
+    }
+
+    /// Partial decode — returns only `(lang_id, node_count)` for `file_index`,
+    /// reading bytes `[0..5]` of the 15-byte on-disk record.
+    ///
+    /// This is the hot-path accessor used by `score_postings` (P1, #286).
+    /// Skipping the remaining 10 bytes (`max_depth`, `max_block_stmts`,
+    /// `max_params`, `branch_count`) reduces the decode cost on the BM25
+    /// scoring path while remaining byte-for-byte identical to
+    /// `file_meta(file_index)?.lang_id` / `?.node_count`.
+    ///
+    /// The byte offsets are read through [`decode_lang_and_node_count`] — the
+    /// single source of truth shared with [`decode_file_meta`] — so the two
+    /// paths cannot drift.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::IndexCorrupted`] if `file_index` is out of bounds
+    /// (same error variant as [`file_meta`][Self::file_meta]).
+    pub fn file_lang_and_node_count(&self, file_index: u32) -> Result<(u8, u32)> {
+        let meta_start = self.meta_start();
+        // avoids PF-004: checked arithmetic throughout.
+        let offset = (file_index as usize)
+            .checked_mul(FILE_META_SIZE)
+            .and_then(|o| meta_start.checked_add(o))
+            .ok_or_else(|| {
+                SearchError::IndexCorrupted(format!(
+                    "file_lang_and_node_count({file_index}): offset overflow"
+                ))
+            })?;
+        // We need at least 5 bytes (lang_id + node_count); require the full
+        // FILE_META_SIZE slice so the bounds check is identical to file_meta.
+        let end = offset
+            .checked_add(FILE_META_SIZE)
+            .filter(|&e| e <= self.idx_mmap.len())
+            .ok_or_else(|| {
+                SearchError::IndexCorrupted(format!(
+                    "file_lang_and_node_count({file_index}): offset {offset} out of bounds \
+                     (idx_mmap len={})",
+                    self.idx_mmap.len()
+                ))
+            })?;
+        // decode_lang_and_node_count reads data[0] and data[1..5].
+        decode_lang_and_node_count(&self.idx_mmap[offset..end])
     }
 
     /// Return the per-file structural metrics for the file at sequential index `file_index`.

@@ -1059,3 +1059,97 @@ fn c3_non_ascending_doc_ids_returns_index_corrupted() {
         "expected IndexCorrupted for non-ascending doc_ids, got: {msg}"
     );
 }
+
+// ============================================================================
+// AC2 (#286): file_lang_and_node_count matches file_meta, shares byte offsets
+// ============================================================================
+
+/// AC2: For every in-range doc_id, `file_lang_and_node_count(d)` returns
+/// `(file_meta(d).lang_id, file_meta(d).node_count)`.  For an out-of-range
+/// doc_id both return the same `Err(IndexCorrupted)` variant.
+///
+/// The byte offsets are read through the shared `decode_lang_and_node_count`
+/// helper in `format.rs`; this test guards against drift between the two
+/// code paths.
+#[test]
+fn ac2_file_lang_and_node_count_matches_file_meta_real_reader() {
+    let dir = tempdir().unwrap();
+    let bigram_key: u32 = 0x0001_0002;
+    let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+
+    // Four files with distinct languages and node counts.
+    let fixtures = [
+        (Language::Rust, 42u32),
+        (Language::Python, 100u32),
+        (Language::Go, 7u32),
+        (Language::TypeScript, 999u32),
+    ];
+    for (i, (lang, nc)) in fixtures.iter().enumerate() {
+        let set = make_bigram_set(bigram_key, 1);
+        builder
+            .add_file_ngrams(
+                FileId(i as u32),
+                *lang,
+                &set,
+                *nc,
+                crate::ast_index::StructuralMetrics::default(),
+            )
+            .unwrap();
+    }
+    let reader = builder.build().unwrap();
+
+    // In-range: (lang_id, node_count) must equal file_meta's fields.
+    for (i, _) in fixtures.iter().enumerate() {
+        let doc_id = i as u32;
+        let meta = reader.file_meta(doc_id).unwrap();
+        let (lang_id, nc) = reader.file_lang_and_node_count(doc_id).unwrap();
+        assert_eq!(
+            lang_id, meta.lang_id,
+            "lang_id mismatch for doc_id={doc_id}: file_lang_and_node_count={lang_id}, file_meta={}",
+            meta.lang_id
+        );
+        assert_eq!(
+            nc, meta.node_count,
+            "node_count mismatch for doc_id={doc_id}: file_lang_and_node_count={nc}, file_meta={}",
+            meta.node_count
+        );
+    }
+
+    // Out-of-range (file_count == 4, so doc_id=4 is OOB).
+    let oob = fixtures.len() as u32;
+    let err_meta = reader.file_meta(oob).unwrap_err();
+    let err_lite = reader.file_lang_and_node_count(oob).unwrap_err();
+    assert!(
+        matches!(err_meta, crate::SearchError::IndexCorrupted(_)),
+        "file_meta OOB should be IndexCorrupted: {err_meta:?}"
+    );
+    assert!(
+        matches!(err_lite, crate::SearchError::IndexCorrupted(_)),
+        "file_lang_and_node_count OOB should be IndexCorrupted: {err_lite:?}"
+    );
+}
+
+/// AC2 (format.rs): `decode_file_meta` and `decode_lang_and_node_count` must
+/// agree on `lang_id` and `node_count` for a known byte buffer.
+#[test]
+fn ac2_decode_helpers_agree_on_known_buffer() {
+    use super::super::format::{FILE_META_SIZE, decode_file_meta, decode_lang_and_node_count};
+
+    // Craft a valid 15-byte AstFileMetaEntry buffer.
+    // lang_id = 11 (Rust), node_count = 42 (LE: 42, 0, 0, 0).
+    let mut buf = [0u8; FILE_META_SIZE];
+    buf[0] = 11; // lang_id = Rust
+    buf[1..5].copy_from_slice(&42u32.to_le_bytes()); // node_count
+    buf[5..7].copy_from_slice(&3u16.to_le_bytes()); // max_depth
+    buf[7..9].copy_from_slice(&5u16.to_le_bytes()); // max_block_stmts
+    buf[9..11].copy_from_slice(&2u16.to_le_bytes()); // max_params
+    buf[11..15].copy_from_slice(&1u32.to_le_bytes()); // branch_count
+
+    let meta = decode_file_meta(&buf).unwrap();
+    let (lang_id, node_count) = decode_lang_and_node_count(&buf).unwrap();
+
+    assert_eq!(lang_id, meta.lang_id, "lang_id must agree");
+    assert_eq!(node_count, meta.node_count, "node_count must agree");
+    assert_eq!(lang_id, 11, "expected Rust lang_id=11");
+    assert_eq!(node_count, 42, "expected node_count=42");
+}

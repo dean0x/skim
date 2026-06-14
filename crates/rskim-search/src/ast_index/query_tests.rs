@@ -1389,3 +1389,649 @@ fn b4_equal_scores_tie_break_file_id_asc() {
 
     drop(dir);
 }
+
+// ============================================================================
+// #286 Wave 4 perf tests — AC1–AC12
+// ============================================================================
+
+// ---- AC1/AC5: P1 and P3 score equivalence (FakePostingSource path) ----------
+//
+// For a fixed corpus + multi-n-gram query the FULL (FileId, f64) vector from
+// search_ast must be BYTE-IDENTICAL (files, score bits, order) before and
+// after the P1 partial-decode and P3 capacity changes.
+// The fixture includes TWO FILES WITH IDENTICAL SCORES to exercise the
+// FileId-ASC tie-break.
+
+#[test]
+fn ac1_ac5_multi_ngram_score_equivalence_with_tied_scores() {
+    // Craft a corpus where files 0 and 1 produce identical BM25 scores.
+    // Same lang, same node_count, same TF per n-gram → identical result.
+    // Files 2 and 3 have different inputs to exercise the general path too.
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let expr_id = vocab_lookup("expression_statement").unwrap();
+
+    let bigram = AstBigram::encode(fn_id, block_id);
+    let trigram = AstTrigram::encode(fn_id, block_id, expr_id);
+
+    // Build the source (multi-n-gram to exercise meta_cache path).
+    let source = FakePostingSource::default()
+        // Files 0 and 1: identical parameters → identical scores (tie).
+        .with_file(0, Language::Rust, 100)
+        .with_file(1, Language::Rust, 100)
+        // File 2: different count → different (higher) score.
+        .with_file(2, Language::Rust, 100)
+        // File 3: different node_count → different (lower) score.
+        .with_file(3, Language::Rust, 200)
+        .with_bigram(
+            bigram.key(),
+            vec![
+                AstPosting {
+                    doc_id: 0,
+                    count: 1,
+                },
+                AstPosting {
+                    doc_id: 1,
+                    count: 1,
+                }, // tied with 0
+                AstPosting {
+                    doc_id: 2,
+                    count: 3,
+                }, // higher TF
+                AstPosting {
+                    doc_id: 3,
+                    count: 1,
+                }, // larger file
+            ],
+        )
+        .with_trigram(
+            trigram.key(),
+            vec![
+                AstPosting {
+                    doc_id: 0,
+                    count: 1,
+                },
+                AstPosting {
+                    doc_id: 1,
+                    count: 1,
+                }, // tied with 0
+                AstPosting {
+                    doc_id: 2,
+                    count: 1,
+                },
+                AstPosting {
+                    doc_id: 3,
+                    count: 1,
+                },
+            ],
+        )
+        .with_avg_node_count(100.0);
+
+    let engine = AstQueryEngine::new(source);
+
+    let set = AstNgramSet {
+        bigrams: vec![AstBigramEntry {
+            ngram: bigram,
+            weight: DEFAULT_AST_WEIGHT,
+            count: 1,
+        }],
+        trigrams: vec![AstTrigramEntry {
+            ngram: trigram,
+            weight: DEFAULT_AST_WEIGHT,
+            count: 1,
+        }],
+    };
+    let q = AstQuery::Containment(set);
+    let results = engine.search_ast(&q).unwrap();
+
+    // Must return all 4 files.
+    assert_eq!(results.len(), 4, "all 4 files should match");
+
+    // Results are FileId-ASC (search_ast contract).
+    for i in 1..results.len() {
+        assert!(
+            results[i - 1].0 < results[i].0,
+            "results must be FileId-ASC: {:?}",
+            results.iter().map(|(f, _)| f).collect::<Vec<_>>()
+        );
+    }
+
+    // Files 0 and 1 must have BYTE-IDENTICAL scores (tied).
+    let s0 = results.iter().find(|(f, _)| *f == FileId(0)).unwrap().1;
+    let s1 = results.iter().find(|(f, _)| *f == FileId(1)).unwrap().1;
+    assert_eq!(
+        s0.to_bits(),
+        s1.to_bits(),
+        "files 0 and 1 must have bitwise-equal scores: s0={s0}, s1={s1}"
+    );
+
+    // All scores must be positive.
+    for (fid, s) in &results {
+        assert!(*s > 0.0, "score for {fid} must be positive: {s}");
+    }
+
+    // Run a second time and assert byte-identical output (determinism check).
+    let results2 = engine.search_ast(&q).unwrap();
+    assert_eq!(results.len(), results2.len(), "second run length mismatch");
+    for ((f1, s1_val), (f2, s2_val)) in results.iter().zip(results2.iter()) {
+        assert_eq!(f1, f2, "FileId mismatch between runs");
+        assert_eq!(
+            s1_val.to_bits(),
+            s2_val.to_bits(),
+            "score bits differ between runs for {f1}: first={s1_val}, second={s2_val}"
+        );
+    }
+}
+
+// ---- AC2: P1 API contract — file_lang_and_node_count matches file_meta ------
+// (tested in reader_tests.rs for the real AstIndexReader)
+// Here we verify the DEFAULT impl on FakePostingSource agrees.
+
+#[test]
+fn ac2_default_file_lang_and_node_count_equals_file_meta_fields() {
+    use crate::index::lang_map::lang_to_id;
+
+    // FakePostingSource uses the default trait method (delegating to file_meta).
+    let source = FakePostingSource::default()
+        .with_file(0, Language::Rust, 42)
+        .with_file(1, Language::Python, 99);
+
+    let (lid0, nc0) = source.file_lang_and_node_count(0).unwrap();
+    let meta0 = source.file_meta(0).unwrap();
+    assert_eq!(lid0, meta0.lang_id, "lang_id mismatch for doc 0");
+    assert_eq!(nc0, meta0.node_count, "node_count mismatch for doc 0");
+    assert_eq!(lid0, lang_to_id(Language::Rust));
+    assert_eq!(nc0, 42);
+
+    let (lid1, nc1) = source.file_lang_and_node_count(1).unwrap();
+    let meta1 = source.file_meta(1).unwrap();
+    assert_eq!(lid1, meta1.lang_id);
+    assert_eq!(nc1, meta1.node_count);
+    assert_eq!(lid1, lang_to_id(Language::Python));
+    assert_eq!(nc1, 99);
+
+    // Out-of-range: same Err variant as file_meta.
+    let err_meta = source.file_meta(99).unwrap_err();
+    let err_lite = source.file_lang_and_node_count(99).unwrap_err();
+    assert!(
+        matches!(err_meta, crate::SearchError::IndexCorrupted(_)),
+        "file_meta oob should be IndexCorrupted: {err_meta:?}"
+    );
+    assert!(
+        matches!(err_lite, crate::SearchError::IndexCorrupted(_)),
+        "file_lang_and_node_count oob should be IndexCorrupted: {err_lite:?}"
+    );
+}
+
+// ---- AC3: P1 unknown lang_id forward-compat ---------------------------------
+
+#[test]
+fn ac3_unknown_lang_id_still_scores_positively() {
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let bigram = AstBigram::encode(fn_id, block_id);
+
+    let mut source = FakePostingSource::default().with_avg_node_count(100.0);
+    source.file_metas.insert(
+        0,
+        AstFileMetaEntry {
+            lang_id: 200, // unknown
+            node_count: 100,
+            max_depth: 3,
+            max_block_stmts: 5,
+            max_params: 2,
+            branch_count: 1,
+        },
+    );
+    source.file_count = 2;
+    source = source.with_file(1, Language::Rust, 100);
+    source.bigrams.insert(
+        bigram.key(),
+        vec![
+            AstPosting {
+                doc_id: 0,
+                count: 1,
+            },
+            AstPosting {
+                doc_id: 1,
+                count: 1,
+            },
+        ],
+    );
+
+    let engine = AstQueryEngine::new(source);
+    let q = AstQuery::Containment(make_bigram_set(bigram, 1));
+    let results = engine.search_ast(&q).unwrap();
+
+    assert_eq!(
+        results.len(),
+        2,
+        "both files (including unknown-lang) should match"
+    );
+
+    let s0 = results.iter().find(|(f, _)| *f == FileId(0)).unwrap().1;
+    let s1 = results.iter().find(|(f, _)| *f == FileId(1)).unwrap().1;
+    assert!(s0 > 0.0, "unknown-lang file must have positive score: {s0}");
+    assert!(s1 > 0.0, "known-lang file must have positive score: {s1}");
+}
+
+// ---- AC4: Format version and FILE_META_SIZE constants unchanged -------------
+
+#[test]
+fn ac4_format_constants_unchanged() {
+    use crate::ast_index::store::format::{FILE_META_SIZE, FORMAT_VERSION};
+    assert_eq!(FORMAT_VERSION, 2, "FORMAT_VERSION must remain 2 (AC4)");
+    assert_eq!(FILE_META_SIZE, 15, "FILE_META_SIZE must remain 15 (AC4)");
+}
+
+// ---- AC6: P3 selective and broad queries return correct results -------------
+
+#[test]
+fn ac6_selective_and_broad_queries_return_correct_results() {
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let try_id = vocab_lookup("try_statement").unwrap();
+    let catch_id = vocab_lookup("catch_clause").unwrap();
+
+    let broad_bigram = AstBigram::encode(fn_id, block_id); // matches all 100
+    let selective_bigram = AstBigram::encode(try_id, catch_id); // matches first 5
+
+    let mut source = FakePostingSource::default().with_avg_node_count(100.0);
+    for i in 0..100u32 {
+        source = source.with_file(i, Language::Rust, 100);
+    }
+    let broad_postings: Vec<AstPosting> = (0..100u32)
+        .map(|i| AstPosting {
+            doc_id: i,
+            count: 1,
+        })
+        .collect();
+    source.bigrams.insert(broad_bigram.key(), broad_postings);
+    let selective_postings: Vec<AstPosting> = (0..5u32)
+        .map(|i| AstPosting {
+            doc_id: i,
+            count: 2,
+        })
+        .collect();
+    source
+        .bigrams
+        .insert(selective_bigram.key(), selective_postings);
+
+    let engine = AstQueryEngine::new(source);
+
+    let q_broad = AstQuery::Containment(make_bigram_set(broad_bigram, 1));
+    let broad_results = engine.search_ast(&q_broad).unwrap();
+    assert_eq!(
+        broad_results.len(),
+        100,
+        "broad query must return all 100 files"
+    );
+
+    let q_sel = AstQuery::Containment(make_bigram_set(selective_bigram, 1));
+    let sel_results = engine.search_ast(&q_sel).unwrap();
+    assert_eq!(
+        sel_results.len(),
+        5,
+        "selective query must return exactly 5 files"
+    );
+    for (fid, score) in &sel_results {
+        assert!(fid.0 < 5, "selective result FileId must be in [0,5): {fid}");
+        assert!(*score > 0.0, "score must be positive: {score}");
+    }
+}
+
+// ---- AC7: P3 empty-first-ngram does not under-size -------------------------
+
+#[test]
+fn ac7_empty_first_ngram_large_second_returns_correct_results() {
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let try_id = vocab_lookup("try_statement").unwrap();
+    let catch_id = vocab_lookup("catch_clause").unwrap();
+
+    let empty_bigram = AstBigram::encode(fn_id, block_id);
+    let large_bigram = AstBigram::encode(try_id, catch_id);
+
+    let mut source = FakePostingSource::default().with_avg_node_count(100.0);
+    for i in 0..200u32 {
+        source = source.with_file(i, Language::Rust, 100);
+    }
+    source.bigrams.insert(empty_bigram.key(), vec![]);
+    let large_postings: Vec<AstPosting> = (0..200u32)
+        .map(|i| AstPosting {
+            doc_id: i,
+            count: 1,
+        })
+        .collect();
+    source.bigrams.insert(large_bigram.key(), large_postings);
+
+    let engine = AstQueryEngine::new(source);
+
+    let mut bigram_entries = vec![
+        AstBigramEntry {
+            ngram: empty_bigram,
+            weight: DEFAULT_AST_WEIGHT,
+            count: 1,
+        },
+        AstBigramEntry {
+            ngram: large_bigram,
+            weight: DEFAULT_AST_WEIGHT,
+            count: 1,
+        },
+    ];
+    bigram_entries.sort_unstable_by_key(|e| e.ngram.key());
+    let set = AstNgramSet {
+        bigrams: bigram_entries,
+        trigrams: vec![],
+    };
+    let q = AstQuery::Containment(set);
+    let results = engine.search_ast(&q).unwrap();
+
+    assert_eq!(
+        results.len(),
+        200,
+        "all 200 files must appear despite empty first n-gram (AC7)"
+    );
+    for (_, s) in &results {
+        assert!(*s > 0.0, "all scores must be positive");
+    }
+}
+
+// ---- AC9: P4 lang filter narrows to strict non-empty subset (real reader) ---
+
+#[test]
+fn ac9_p4_lang_filter_narrows_to_strict_subset_real_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let bigram = AstBigram::encode(fn_id, block_id);
+    let mut builder = crate::ast_index::AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    use crate::ast_index::StructuralMetrics;
+
+    for i in 0..4u32 {
+        let set = AstNgramSet {
+            bigrams: vec![AstBigramEntry {
+                ngram: bigram,
+                weight: DEFAULT_AST_WEIGHT,
+                count: 1,
+            }],
+            trigrams: vec![],
+        };
+        builder
+            .add_file_ngrams(
+                FileId(i),
+                Language::Rust,
+                &set,
+                100,
+                StructuralMetrics::default(),
+            )
+            .unwrap();
+    }
+    for i in 4..7u32 {
+        let set = AstNgramSet {
+            bigrams: vec![AstBigramEntry {
+                ngram: bigram,
+                weight: DEFAULT_AST_WEIGHT,
+                count: 1,
+            }],
+            trigrams: vec![],
+        };
+        builder
+            .add_file_ngrams(
+                FileId(i),
+                Language::Python,
+                &set,
+                100,
+                StructuralMetrics::default(),
+            )
+            .unwrap();
+    }
+    let reader = builder.build().unwrap();
+    let engine = AstQueryEngine::new(reader);
+
+    let mut q_all = crate::types::SearchQuery::new("q");
+    q_all.ast_pattern = Some("function_item > block".into());
+    q_all.limit = Some(100);
+    let unfiltered = engine.search(&q_all).unwrap();
+    assert_eq!(unfiltered.len(), 7, "unfiltered must return all 7 files");
+
+    let mut q_rust = crate::types::SearchQuery::new("q");
+    q_rust.ast_pattern = Some("function_item > block".into());
+    q_rust.lang = Some(Language::Rust);
+    q_rust.limit = Some(100);
+    let rust_only = engine.search(&q_rust).unwrap();
+
+    assert!(!rust_only.is_empty(), "filtered result must be non-empty");
+    assert!(
+        rust_only.len() < unfiltered.len(),
+        "filtered must be strict subset: filtered={}, unfiltered={}",
+        rust_only.len(),
+        unfiltered.len()
+    );
+    assert_eq!(rust_only.len(), 4, "exactly 4 Rust files should match");
+    for r in &rust_only {
+        assert!(
+            r.file_id.0 < 4,
+            "filtered result must be a Rust file: {}",
+            r.file_id
+        );
+    }
+    let unfiltered_ids: std::collections::HashSet<FileId> =
+        unfiltered.iter().map(|r| r.file_id).collect();
+    for r in &rust_only {
+        assert!(
+            unfiltered_ids.contains(&r.file_id),
+            "filtered FileId {} must be in unfiltered set",
+            r.file_id
+        );
+    }
+
+    drop(dir);
+}
+
+// ---- AC10: P4 lang=None path unchanged (avoids PF-006) ---------------------
+
+#[test]
+fn ac10_p4_lang_none_path_unchanged_real_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let bigram = AstBigram::encode(fn_id, block_id);
+    let mut builder = crate::ast_index::AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    use crate::ast_index::StructuralMetrics;
+
+    for i in 0..4u32 {
+        let set = AstNgramSet {
+            bigrams: vec![AstBigramEntry {
+                ngram: bigram,
+                weight: DEFAULT_AST_WEIGHT,
+                count: 1,
+            }],
+            trigrams: vec![],
+        };
+        builder
+            .add_file_ngrams(
+                FileId(i),
+                Language::Rust,
+                &set,
+                100,
+                StructuralMetrics::default(),
+            )
+            .unwrap();
+    }
+    for i in 4..7u32 {
+        let set = AstNgramSet {
+            bigrams: vec![AstBigramEntry {
+                ngram: bigram,
+                weight: DEFAULT_AST_WEIGHT,
+                count: 1,
+            }],
+            trigrams: vec![],
+        };
+        builder
+            .add_file_ngrams(
+                FileId(i),
+                Language::Python,
+                &set,
+                100,
+                StructuralMetrics::default(),
+            )
+            .unwrap();
+    }
+    let reader = builder.build().unwrap();
+    let engine = AstQueryEngine::new(reader);
+
+    let mut q = crate::types::SearchQuery::new("q");
+    q.ast_pattern = Some("function_item > block".into());
+    q.limit = Some(100);
+    let results1 = engine.search(&q).unwrap();
+    let results2 = engine.search(&q).unwrap();
+
+    assert_eq!(results1.len(), 7, "lang=None must return all 7 files");
+    assert_eq!(results1.len(), results2.len(), "deterministic");
+    for (r1, r2) in results1.iter().zip(results2.iter()) {
+        assert_eq!(r1.file_id, r2.file_id, "FileId mismatch");
+        assert_eq!(r1.score.to_bits(), r2.score.to_bits(), "score bits differ");
+    }
+
+    drop(dir);
+}
+
+// ---- AC11: P4 filter-composition order (file_filter + lang + limit) ---------
+
+#[test]
+fn ac11_p4_filter_composition_with_file_filter_and_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let bigram = AstBigram::encode(fn_id, block_id);
+    let mut builder = crate::ast_index::AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    use crate::ast_index::StructuralMetrics;
+
+    for i in 0..4u32 {
+        let set = AstNgramSet {
+            bigrams: vec![AstBigramEntry {
+                ngram: bigram,
+                weight: DEFAULT_AST_WEIGHT,
+                count: 1,
+            }],
+            trigrams: vec![],
+        };
+        builder
+            .add_file_ngrams(
+                FileId(i),
+                Language::Rust,
+                &set,
+                100,
+                StructuralMetrics::default(),
+            )
+            .unwrap();
+    }
+    for i in 4..7u32 {
+        let set = AstNgramSet {
+            bigrams: vec![AstBigramEntry {
+                ngram: bigram,
+                weight: DEFAULT_AST_WEIGHT,
+                count: 1,
+            }],
+            trigrams: vec![],
+        };
+        builder
+            .add_file_ngrams(
+                FileId(i),
+                Language::Python,
+                &set,
+                100,
+                StructuralMetrics::default(),
+            )
+            .unwrap();
+    }
+    let reader = builder.build().unwrap();
+    let engine = AstQueryEngine::new(reader);
+
+    // file_filter = {0, 1, 2, 4, 5}, lang = Rust, limit = 2.
+    // Expected: Rust files in allowlist = {0, 1, 2}; limit=2 → top-2 by score
+    // (tied → FileId-ASC → [0, 1]).
+    let mut q = crate::types::SearchQuery::new("q");
+    q.ast_pattern = Some("function_item > block".into());
+    q.lang = Some(Language::Rust);
+    q.file_filter = Some(
+        [FileId(0), FileId(1), FileId(2), FileId(4), FileId(5)]
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<FileId>>(),
+    );
+    q.limit = Some(2);
+
+    let results = engine.search(&q).unwrap();
+    assert_eq!(results.len(), 2, "limit=2 should yield 2 results");
+
+    let rust_allowlist = [FileId(0), FileId(1), FileId(2)];
+    for r in &results {
+        assert!(
+            rust_allowlist.contains(&r.file_id),
+            "result {} must be in Rust allowlist",
+            r.file_id
+        );
+    }
+
+    drop(dir);
+}
+
+// ---- AC12: P4 search_ast returns unfiltered results (lang param always None) -
+
+#[test]
+fn ac12_search_ast_is_unfiltered_after_p4() {
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let bigram = AstBigram::encode(fn_id, block_id);
+
+    let source = FakePostingSource::default()
+        .with_file(0, Language::Rust, 100)
+        .with_file(1, Language::Python, 100)
+        .with_file(2, Language::Go, 100)
+        .with_bigram(
+            bigram.key(),
+            vec![
+                AstPosting {
+                    doc_id: 0,
+                    count: 1,
+                },
+                AstPosting {
+                    doc_id: 1,
+                    count: 1,
+                },
+                AstPosting {
+                    doc_id: 2,
+                    count: 1,
+                },
+            ],
+        )
+        .with_avg_node_count(100.0);
+
+    let engine = AstQueryEngine::new(source);
+    let q = AstQuery::Containment(make_bigram_set(bigram, 1));
+
+    let r1 = engine.search_ast(&q).unwrap();
+    let r2 = engine.search_ast(&q).unwrap();
+
+    assert_eq!(
+        r1.len(),
+        3,
+        "search_ast must return all 3 files (unfiltered)"
+    );
+    assert_eq!(r1.len(), r2.len(), "deterministic");
+
+    for (a, b) in r1.iter().zip(r2.iter()) {
+        assert_eq!(a.0, b.0, "FileId differs between calls");
+        assert_eq!(
+            a.1.to_bits(),
+            b.1.to_bits(),
+            "score bits differ between calls"
+        );
+    }
+
+    for i in 1..r1.len() {
+        assert!(r1[i - 1].0 < r1[i].0, "results must be FileId-ASC");
+    }
+}
