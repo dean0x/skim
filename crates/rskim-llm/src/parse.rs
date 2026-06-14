@@ -13,6 +13,25 @@ use crate::model::openai::OpenAiBody;
 use crate::provider::Provider;
 use crate::{LlmError, MAX_DEPTH, Result, provider};
 
+/// Validate the UTF-8 text as a top-level JSON object with a `messages` array.
+///
+/// Shared by [`parse`] and [`parse_with_provider`] to avoid duplicating the
+/// pre-parse validation steps.
+fn validate(text: &str) -> Result<serde_json::Map<String, serde_json::Value>> {
+    check_depth(text)?;
+    let top: serde_json::Value = serde_json::from_str(text)?;
+    let obj = top
+        .as_object()
+        .ok_or_else(|| LlmError::NotAnObject(describe_value(&top)))?
+        .clone();
+    match obj.get("messages") {
+        None => return Err(LlmError::MissingMessages),
+        Some(serde_json::Value::Array(_)) => {}
+        Some(other) => return Err(LlmError::MessagesNotArray(describe_value(other))),
+    }
+    Ok(obj)
+}
+
 /// A parsed LLM request body.
 ///
 /// Holds either an Anthropic or OpenAI body, preserving all unknown fields as raw
@@ -54,25 +73,9 @@ pub enum ParsedBody {
 /// ```
 pub fn parse(bytes: &[u8]) -> Result<ParsedBody> {
     let text = std::str::from_utf8(bytes).map_err(|e| LlmError::InvalidUtf8(e.to_string()))?;
-
-    check_depth(text)?;
-
-    // Parse to a generic Map first for provider detection
-    let top: serde_json::Value = serde_json::from_str(text)?;
-
-    let obj = top
-        .as_object()
-        .ok_or_else(|| LlmError::NotAnObject(describe_value(&top)))?;
-
-    // Validate messages field exists and is an array
-    match obj.get("messages") {
-        None => return Err(LlmError::MissingMessages),
-        Some(serde_json::Value::Array(_)) => {}
-        Some(other) => return Err(LlmError::MessagesNotArray(describe_value(other))),
-    }
-
-    let detected = provider::detect(obj).unwrap_or(Provider::Anthropic);
-    parse_as(text, detected)
+    let obj = validate(text)?;
+    let provider = provider::detect(&obj);
+    parse_as(text, provider)
 }
 
 /// Parse raw JSON bytes with an explicit provider hint.
@@ -85,21 +88,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedBody> {
 /// Same as [`parse`].
 pub fn parse_with_provider(bytes: &[u8], p: Provider) -> Result<ParsedBody> {
     let text = std::str::from_utf8(bytes).map_err(|e| LlmError::InvalidUtf8(e.to_string()))?;
-
-    check_depth(text)?;
-
-    // Validate top-level structure
-    let top: serde_json::Value = serde_json::from_str(text)?;
-    let obj = top
-        .as_object()
-        .ok_or_else(|| LlmError::NotAnObject(describe_value(&top)))?;
-
-    match obj.get("messages") {
-        None => return Err(LlmError::MissingMessages),
-        Some(serde_json::Value::Array(_)) => {}
-        Some(other) => return Err(LlmError::MessagesNotArray(describe_value(other))),
-    }
-
+    validate(text)?;
     parse_as(text, p)
 }
 

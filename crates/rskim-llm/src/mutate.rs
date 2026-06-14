@@ -46,16 +46,9 @@ use crate::{LlmError, ParsedBody, Result, serialize::serialize};
 pub fn mutate_block(body: &mut ParsedBody, block_id: &str, new_text: &str) -> Result<Vec<u8>> {
     match body {
         ParsedBody::Anthropic(b) => mutate_anthropic(b, block_id, new_text),
-        ParsedBody::OpenAi(_) => {
-            // OpenAI mutation: not yet implemented — OpenAI text fields are accessible
-            // but mutation of tool messages and content-part text is handled below.
-            mutate_openai_not_implemented(block_id)
-        }
+        // OpenAI mutation is not yet implemented — follow-up tracked separately.
+        ParsedBody::OpenAi(_) => Err(LlmError::BlockNotFound(block_id.to_string())),
     }
-}
-
-fn mutate_openai_not_implemented(block_id: &str) -> Result<Vec<u8>> {
-    Err(LlmError::BlockNotFound(block_id.to_string()))
 }
 
 fn mutate_anthropic(body: &mut AnthropicBody, block_id: &str, new_text: &str) -> Result<Vec<u8>> {

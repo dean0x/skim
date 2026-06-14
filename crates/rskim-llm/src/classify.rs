@@ -315,9 +315,11 @@ fn has_log_level_prefix(line: &str) -> bool {
         {
             return true;
         }
-        // Bracketed: "[ERROR]" or "[INFO]"
-        let bracketed = format!("[{level}]");
-        if line.starts_with(&bracketed) {
+        // Bracketed: "[ERROR]" or "[INFO]" — check without allocating
+        if line.starts_with('[')
+            && line[1..].starts_with(level)
+            && line[1 + level.len()..].starts_with(']')
+        {
             return true;
         }
     }
@@ -341,46 +343,23 @@ fn has_bracketed_prefix(line: &str) -> bool {
     after.starts_with(' ') || after.starts_with(':')
 }
 
+/// Extract the language hint from the tag portion of a fence opener (the text after ` ``` `).
+fn fence_lang_hint(after_fence_markers: &str) -> Option<String> {
+    let tag_end = after_fence_markers.find('\n').unwrap_or(after_fence_markers.len());
+    let lang = after_fence_markers[..tag_end].trim();
+    if lang.is_empty() { None } else { Some(lang.to_string()) }
+}
+
 /// Try to classify as mixed (prose with embedded fenced code blocks).
 ///
 /// Returns `Some(language_hint)` if the text contains at least one fenced code
 /// block that is NOT the entire content of the text.
 fn try_classify_mixed(text: &str) -> Option<Option<String>> {
-    // Already handled as pure Code above; here we look for embedded fences in prose
+    // Already handled as pure Code above; here we look for embedded fences in prose.
     let trimmed = text.trim();
-
-    // Find the first occurrence of ```
     let fence_pos = trimmed.find("```")?;
-
-    // If the fence is at position 0, this was already handled by try_classify_fenced.
-    // But try_classify_fenced might have returned None (e.g., unclosed fence).
-    // Here we are looking for fences embedded in prose (not at start).
-    if fence_pos == 0 {
-        // Only reached if try_classify_fenced returned None (e.g., unclosed fence).
-        // Find the end of the fence tag line to extract language.
-        let after_fence = &trimmed[3..];
-        let tag_end = after_fence.find('\n').unwrap_or(after_fence.len());
-        let lang = after_fence[..tag_end].trim();
-        let lang_hint = if lang.is_empty() {
-            None
-        } else {
-            Some(lang.to_string())
-        };
-        return Some(lang_hint);
-    }
-
-    // Fence is not at the start — extract language hint from the fence line
-    let fence_line_start = fence_pos + 3;
-    let fence_line_text = &trimmed[fence_line_start..];
-    let tag_end = fence_line_text.find('\n').unwrap_or(fence_line_text.len());
-    let lang = fence_line_text[..tag_end].trim();
-    let lang_hint = if lang.is_empty() {
-        None
-    } else {
-        Some(lang.to_string())
-    };
-
-    Some(lang_hint)
+    // Skip past the ``` markers to the tag text.
+    Some(fence_lang_hint(&trimmed[fence_pos + 3..]))
 }
 
 #[cfg(test)]

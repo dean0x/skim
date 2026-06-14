@@ -33,22 +33,22 @@ pub enum Provider {
 
 /// Detect the provider from a top-level JSON object.
 ///
-/// Returns `Some(Provider)` if the body matches a known provider's structure,
-/// or `None` if detection is ambiguous.
+/// Always returns a `Provider` — the detection is a heuristic that falls back to
+/// Anthropic when no discriminating signal is found (Anthropic is the most common
+/// usage context for this crate).
 ///
 /// # Detection heuristics
 ///
-/// 1. If any message has `tool_call_id` → OpenAI (Anthropic uses `tool_use_id` inside blocks)
-/// 2. If any message has `tool_calls` → OpenAI
-/// 3. If any message content array has `type: "tool_use"` or `type: "tool_result"` → Anthropic
-/// 4. If any message content array has `type: "thinking"` → Anthropic
-/// 5. If top-level has `max_tokens` AND no OpenAI-only fields → Anthropic
-/// 6. If top-level has `response_format` → OpenAI
-/// 7. Default: Anthropic (most common usage context for this crate)
-pub fn detect(obj: &Map<String, serde_json::Value>) -> Option<Provider> {
+/// 1. If top-level has `response_format` → OpenAI
+/// 2. If any message has `tool_call_id` or `tool_calls` → OpenAI
+/// 3. If any message has `role: "developer"` → OpenAI
+/// 4. If any message content array has `type: "tool_use"`, `"tool_result"`, or `"thinking"` → Anthropic
+/// 5. If top-level has `max_tokens` → Anthropic
+/// 6. Default: Anthropic
+pub fn detect(obj: &Map<String, serde_json::Value>) -> Provider {
     // Check top-level OpenAI-only fields
     if obj.contains_key("response_format") {
-        return Some(Provider::OpenAi);
+        return Provider::OpenAi;
     }
 
     // Check messages array for provider-specific fields
@@ -60,14 +60,14 @@ pub fn detect(obj: &Map<String, serde_json::Value>) -> Option<Provider> {
 
             // OpenAI-specific message fields
             if msg_obj.contains_key("tool_calls") || msg_obj.contains_key("tool_call_id") {
-                return Some(Provider::OpenAi);
+                return Provider::OpenAi;
             }
 
             // OpenAI-specific role
             if let Some(serde_json::Value::String(role)) = msg_obj.get("role")
                 && role == "developer"
             {
-                return Some(Provider::OpenAi);
+                return Provider::OpenAi;
             }
 
             // Check content array for Anthropic-specific block types
@@ -79,7 +79,7 @@ pub fn detect(obj: &Map<String, serde_json::Value>) -> Option<Provider> {
                     if let Some(serde_json::Value::String(ty)) = blk_obj.get("type") {
                         match ty.as_str() {
                             "tool_use" | "tool_result" | "thinking" => {
-                                return Some(Provider::Anthropic);
+                                return Provider::Anthropic;
                             }
                             _ => {}
                         }
@@ -91,9 +91,9 @@ pub fn detect(obj: &Map<String, serde_json::Value>) -> Option<Provider> {
 
     // Anthropic-specific top-level field
     if obj.contains_key("max_tokens") {
-        return Some(Provider::Anthropic);
+        return Provider::Anthropic;
     }
 
     // Default: Anthropic
-    Some(Provider::Anthropic)
+    Provider::Anthropic
 }

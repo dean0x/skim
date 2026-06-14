@@ -508,57 +508,43 @@ impl LeafRef {
     }
 }
 
-/// Map from block composite-ID to its mutable text (for classifier indexing).
+/// Enumerate `(block_id, text)` pairs for all mutable text leaves in a body.
 ///
-/// Returns an iterator of `(id, text_ref)` pairs for all mutable text leaves.
+/// Single-pass walk used by the classifier. Only mutable text leaves are included;
+/// exempt blocks (tool_use, thinking, etc.) are skipped.
 pub(crate) fn anthropic_leaf_texts(body: &AnthropicBody) -> Vec<(String, &str)> {
     let mut out = Vec::new();
-    for leaf in body.text_leaves() {
-        let text = match &leaf {
-            LeafRef::MessageString { msg_idx } => match &body.messages[*msg_idx].content {
-                AnthropicContent::Text(s) => s.as_str(),
-                _ => continue,
-            },
-            LeafRef::TextBlock { msg_idx, blk_idx } => match &body.messages[*msg_idx].content {
-                AnthropicContent::Blocks(blocks) => match &blocks[*blk_idx] {
-                    AnthropicBlock::Text(tb) => tb.text.as_str(),
-                    _ => continue,
-                },
-                _ => continue,
-            },
-            LeafRef::ToolResultString { msg_idx, blk_idx } => {
-                match &body.messages[*msg_idx].content {
-                    AnthropicContent::Blocks(blocks) => match &blocks[*blk_idx] {
+    for (mi, msg) in body.messages.iter().enumerate() {
+        match &msg.content {
+            AnthropicContent::Text(s) => {
+                out.push((format!("m{mi}"), s.as_str()));
+            }
+            AnthropicContent::Blocks(blocks) => {
+                for (bi, block) in blocks.iter().enumerate() {
+                    match block {
+                        AnthropicBlock::Text(tb) => {
+                            out.push((format!("m{mi}b{bi}"), tb.text.as_str()));
+                        }
                         AnthropicBlock::ToolResult(tr) => match &tr.content {
-                            Some(ToolResultContent::Text(s)) => s.as_str(),
-                            _ => continue,
+                            Some(ToolResultContent::Text(s)) => {
+                                out.push((format!("m{mi}b{bi}s"), s.as_str()));
+                            }
+                            Some(ToolResultContent::Blocks(leaves)) => {
+                                for (li, leaf) in leaves.iter().enumerate() {
+                                    if leaf.block_type == "text" {
+                                        if let Some(s) = leaf.text.as_deref() {
+                                            out.push((format!("m{mi}b{bi}l{li}"), s));
+                                        }
+                                    }
+                                }
+                            }
+                            None => {}
                         },
-                        _ => continue,
-                    },
-                    _ => continue,
+                        _ => {}
+                    }
                 }
             }
-            LeafRef::ToolResultLeaf {
-                msg_idx,
-                blk_idx,
-                leaf_idx,
-            } => match &body.messages[*msg_idx].content {
-                AnthropicContent::Blocks(blocks) => match &blocks[*blk_idx] {
-                    AnthropicBlock::ToolResult(tr) => match &tr.content {
-                        Some(ToolResultContent::Blocks(leaves)) => {
-                            match leaves[*leaf_idx].text.as_deref() {
-                                Some(s) => s,
-                                None => continue,
-                            }
-                        }
-                        _ => continue,
-                    },
-                    _ => continue,
-                },
-                _ => continue,
-            },
-        };
-        out.push((leaf.id(), text));
+        }
     }
     out
 }
