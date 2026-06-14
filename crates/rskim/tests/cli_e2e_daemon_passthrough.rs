@@ -9,9 +9,17 @@
 //! `vitest run` for the finite one-shot mode that skim should compress.
 //! `should_read_stdin` treats `args == ["run"]` as stdin-eligible, so
 //! `skim vitest run` + piped fixture goes through the compression pipeline.
+//!
+//! Parallelism note: every test here spawns the `skim` binary as a subprocess
+//! with a 10-second wall-clock timeout. When the full workspace test suite runs
+//! (≥2990 tests in parallel) these subprocesses are starved of CPU time and
+//! reach the timeout boundary before completing. The `#[serial]` attribute runs
+//! each test sequentially so they never compete with each other or the rest of
+//! the parallel suite for process-spawn headroom.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use serial_test::serial;
 
 fn skim_cmd() -> Command {
     let mut cmd = Command::cargo_bin("skim").unwrap();
@@ -31,6 +39,7 @@ fn skim_cmd() -> Command {
 /// `should_read_stdin` treats `args == ["run"]` as stdin-eligible so piped
 /// fixture data reaches the parser even though args is non-empty.
 #[test]
+#[serial]
 fn test_vitest_run_is_finite_and_compressed() {
     // Pipe a minimal vitest JSON fixture so skim can parse it.
     // `vitest run` is finite — daemon guard does not fire, compression applies.
@@ -53,6 +62,7 @@ fn test_vitest_run_is_finite_and_compressed() {
 /// stdout (exit 0), telling the agent to run the original command unchanged.
 #[cfg(unix)]
 #[test]
+#[serial]
 fn test_hook_mode_indefinite_command_not_rewritten() {
     // Construct a minimal Claude Code hook payload for `npm run dev`.
     let payload = serde_json::json!({
@@ -76,6 +86,7 @@ fn test_hook_mode_indefinite_command_not_rewritten() {
 /// In hook mode, `jest --watch` is indefinite — must not be rewritten.
 #[cfg(unix)]
 #[test]
+#[serial]
 fn test_hook_mode_jest_watch_not_rewritten() {
     let payload = serde_json::json!({
         "tool_name": "Bash",
@@ -104,6 +115,7 @@ fn test_hook_mode_jest_watch_not_rewritten() {
 /// The JSON will contain the substring `"skim jest --ci"`.
 #[cfg(unix)]
 #[test]
+#[serial]
 fn test_hook_mode_jest_ci_is_rewritten() {
     let payload = serde_json::json!({
         "tool_name": "Bash",
@@ -149,6 +161,7 @@ fn test_hook_mode_jest_ci_is_rewritten() {
 /// fires and the binary returns within a reasonable time.
 #[cfg(unix)]
 #[test]
+#[serial]
 fn test_direct_dispatch_indefinite_exits_quickly_when_binary_missing() {
     // `nodemon` is always-indefinite per the detection table and is essentially
     // never present in Rust CI toolchains. Exit 127 = ENOENT through
