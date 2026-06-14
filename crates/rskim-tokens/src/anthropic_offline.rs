@@ -29,8 +29,8 @@
 //!
 //! This module performs **zero network I/O**. It relies only on the embedded
 //! `cl100k_base` vocabulary (compiled in by `tiktoken-rs`). For a live count
-//! via the Anthropic API, use the `net-anthropic` feature and
-//! [`crate::net::AnthropicNetworkCounter`].
+//! via the Anthropic API, enable the `net-anthropic` feature and use
+//! `net::AnthropicNetworkCounter` (available only when that feature is active).
 
 /// Uplift factor applied to cl100k counts to approximate Anthropic token usage.
 ///

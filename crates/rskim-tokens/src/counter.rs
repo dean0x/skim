@@ -41,7 +41,7 @@ use crate::{
 
 /// A constructed token counter that owns a single [`Encoding`].
 ///
-/// Use [`Counter::new`] or [`Encoding::counter`] to construct. Construction
+/// Use [`Counter::new`] to construct. Construction
 /// returns `Result<Counter, TokenError>` and is the only fallible step.
 /// Once built, [`Counter::count`] is infallible.
 ///
@@ -178,7 +178,7 @@ impl Counter {
     /// Return a closure adapter that satisfies `Fn(&str) -> usize`.
     ///
     /// The returned closure borrows `self` and is suitable for use with
-    /// [`rskim_core::truncate_to_token_budget`] (AC2).
+    /// `rskim_core::truncate_to_token_budget` (AC2).
     ///
     /// # Examples
     ///
@@ -193,6 +193,31 @@ impl Counter {
     /// ```
     pub fn as_closure(&self) -> impl Fn(&str) -> usize + '_ {
         move |text| self.count(text)
+    }
+
+    /// Construct an infallible byte-length heuristic counter.
+    ///
+    /// This constructor never fails and requires no embedded vocabulary.
+    /// Use it as a guaranteed fallback when tiktoken initialisation is
+    /// unavailable (e.g. the `Cl100k`/`O200k` arms of `Counter::new` return
+    /// `Err` on a corrupted build). Satisfies the no-panic requirement of
+    /// AC10: callers can use this instead of `unreachable!()` or `unwrap()`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rskim_tokens::{Counter, Encoding};
+    ///
+    /// let counter = Counter::heuristic();
+    /// assert_eq!(counter.encoding(), Encoding::Heuristic);
+    /// // Byte-length heuristic: "hello" is 5 bytes
+    /// assert_eq!(counter.count("hello"), 5);
+    /// ```
+    #[must_use]
+    pub fn heuristic() -> Self {
+        Self {
+            inner: CounterInner::Heuristic,
+        }
     }
 
     /// Return the [`Encoding`] this counter was constructed for.

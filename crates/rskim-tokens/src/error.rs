@@ -16,7 +16,8 @@ pub enum TokenError {
     /// This is practically unreachable at runtime because the vocab is
     /// embedded at compile time and decoded from a known-valid asset.
     /// It is surfaced here to satisfy the no-panic contract (AC10) and
-    /// to allow fault-injection testing via [`crate::counter::Counter::from_raw_bpe`].
+    /// to allow fault-injection testing via `Counter::from_raw_bpe`
+    /// (available in `#[cfg(test)]` only).
     #[error("tiktoken initialisation failed for {encoding}: {source}")]
     TiktokenInit {
         /// Human-readable encoding name (e.g. "cl100k_base").

@@ -35,18 +35,20 @@ fn get_counter() -> &'static Counter {
 /// Build the cl100k counter, falling back to the heuristic on (practically dead) init failure.
 ///
 /// Separated from the OnceLock closure so the error-handling logic is readable.
+///
+/// Uses `Counter::heuristic()` (infallible by construction) as the fallback so
+/// no panic macro is required on the dead error path (AC10 no-panic invariant).
 fn build_counter_with_fallback() -> Counter {
     match Counter::new(Encoding::Cl100k) {
         Ok(counter) => counter,
         Err(e) => {
             // Practically dead: tiktoken embeds its vocab at compile time.
+            // Counter::heuristic() is unconditionally infallible — no panic macro needed.
             eprintln!(
                 "[skim] warning: cl100k tokenizer init failed ({e}); \
                  falling back to byte-length heuristic"
             );
-            // Heuristic::new is unconditionally Ok — no tiktoken init involved.
-            Counter::new(Encoding::Heuristic)
-                .unwrap_or_else(|_| unreachable!("Heuristic counter init must always succeed"))
+            Counter::heuristic()
         }
     }
 }
