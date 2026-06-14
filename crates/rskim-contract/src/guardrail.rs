@@ -106,11 +106,22 @@ pub fn byte_gate(input_len: usize, candidate_len: usize) -> ByteGateVerdict {
 ///
 /// # Arguments
 ///
-/// - `input` — original input bytes
-/// - `candidate` — proposed output bytes (may be the same as input on trivial paths)
+/// - `input` — original input bytes (owned; moved into the passthrough `Outcome`
+///   on gate rejection or `SinkFull`, avoiding a copy on the most common paths)
+/// - `candidate` — proposed output bytes (owned; moved into the modification `Outcome`
+///   on acceptance, also avoiding a copy; `&[u8]` would require `.to_vec()` at each
+///   accept site — owned here keeps the hot path allocation-free on acceptance)
 /// - `request_id` — caller-assigned request identifier
 /// - `component` — stable component name for the decision record
 /// - `sink` — injected decision sink
+///
+/// # Borrow vs. own trade-off
+///
+/// This is the one place in the crate that takes `Vec<u8>` instead of `&[u8]`.
+/// The owned signature allows the passthrough and modification paths to MOVE the
+/// buffer into the `Outcome` rather than clone it — a zero-copy hot path (AC21).
+/// Call sites that have a `&[u8]` must `.to_vec()` once before calling; that cost
+/// is equal to the clone `guarded_transform` would need internally if it took `&[u8]`.
 ///
 /// # Returns
 ///

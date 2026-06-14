@@ -43,9 +43,9 @@ use std::sync::Arc;
 
 /// Exact key names that must be redacted in decision record values.
 ///
-/// Matches the scrub list in `crates/rskim/src/cmd/file/env.rs::SENSITIVE_EXACT`
-/// plus additional L3-relevant keys. Kept in sync manually; the canonical source
-/// for binary-facing redaction is the env.rs list.
+/// Matches the scrub list in `crates/rskim/src/cmd/file/env.rs::SENSITIVE_EXACT`.
+/// Kept in sync manually; the canonical source for binary-facing redaction is the
+/// env.rs list.
 pub const SENSITIVE_EXACT: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
@@ -78,8 +78,34 @@ pub const SENSITIVE_SUFFIXES: &[&str] = &[
     "_AUTH",
 ];
 
-/// Returns `true` if `key` matches a sensitive key name and its value should
-/// be redacted before appearing in any log record.
+/// Provider API key value prefixes that indicate a raw secret value.
+///
+/// These match the `SENSITIVE_VALUE_PREFIXES` defined in
+/// `crates/rskim-contract/src/harness/mod.rs` for the test-time scan.
+/// Extending the production redaction path to cover this axis closes the
+/// defense-in-depth gap (AC12 / invariant 7): a `request_id` shaped like
+/// a raw key VALUE (e.g., `sk-ant-api03-...`, `ghp_...`, `AKIA...`) is now
+/// also redacted, mirroring the harness's value-axis scanner.
+///
+/// This is the "x-api-key echo proxy anti-pattern" guard: if a reverse-proxy
+/// inadvertently echoes the bearer token back as the correlation id, this
+/// constant ensures it is redacted before reaching a decision record.
+pub const SENSITIVE_VALUE_PREFIXES: &[&str] = &[
+    "sk-ant-",
+    "sk-",
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "AKIA",
+];
+
+/// Returns `true` if `key` matches a sensitive key NAME (identifier-axis) and
+/// its value should be redacted before appearing in any log record.
+///
+/// Uses case-insensitive ASCII comparison to avoid heap allocation on every
+/// call (avoids `to_uppercase()` — request_ids are ASCII correlators).
 ///
 /// # Examples
 ///
@@ -90,20 +116,46 @@ pub const SENSITIVE_SUFFIXES: &[&str] = &[
 /// assert!(!is_sensitive_key("MODEL_NAME"));
 /// ```
 pub fn is_sensitive_key(key: &str) -> bool {
-    let upper = key.to_uppercase();
-    SENSITIVE_EXACT.iter().any(|&e| e == upper)
-        || SENSITIVE_SUFFIXES.iter().any(|&s| upper.ends_with(s))
+    // Exact match (case-insensitive, no allocation).
+    SENSITIVE_EXACT
+        .iter()
+        .any(|&e| e.eq_ignore_ascii_case(key))
+        // Suffix match: sensitive suffixes are all uppercase; compare with
+        // an ASCII case-insensitive ends_with to avoid to_uppercase().
+        || SENSITIVE_SUFFIXES
+            .iter()
+            .any(|&s| key.len() >= s.len() && key[key.len() - s.len()..].eq_ignore_ascii_case(s))
+}
+
+/// Returns `true` if `value` starts with a known provider API key VALUE prefix
+/// (e.g., `sk-ant-`, `ghp_`, `AKIA`).
+///
+/// This is the value-axis companion to [`is_sensitive_key`] (which covers the
+/// key-name axis). Together they close the AC12 defense-in-depth gap: a
+/// `request_id` that IS a raw API key value is now also redacted.
+///
+/// Minimum length guard (8 bytes) prevents false positives on short strings.
+pub fn is_sensitive_value(value: &str) -> bool {
+    if value.len() < 8 {
+        return false;
+    }
+    SENSITIVE_VALUE_PREFIXES
+        .iter()
+        .any(|&p| value.starts_with(p))
 }
 
 /// Sanitize a `request_id` for safe embedding in a decision record.
 ///
-/// Returns the input unchanged if it does not match a sensitive key pattern.
-/// Returns `"<redacted>"` if [`is_sensitive_key`] matches — this fires in all
-/// build profiles (release AND debug), not just in assertions.
+/// Returns the input unchanged if it matches neither a sensitive key pattern nor
+/// a known API key value prefix. Returns `"<redacted>"` if either axis matches —
+/// this fires in all build profiles (release AND debug), not just in assertions.
 ///
-/// This is the production enforcement for AC12: no auth material in the
-/// decision log, enforced at the construction boundary of every record, not
-/// by documentation or debug-only assertions.
+/// Covers two axes (AC12 / invariant 7 defense-in-depth):
+/// 1. **Key-name axis**: [`is_sensitive_key`] — redacts identifier-shaped strings
+///    like `ANTHROPIC_API_KEY` or `MY_TOKEN`.
+/// 2. **Value axis**: [`is_sensitive_value`] — redacts raw API key values like
+///    `sk-ant-api03-...`, `ghp_...`, `AKIA...` (the x-api-key echo proxy
+///    anti-pattern).
 ///
 /// # Examples
 ///
@@ -112,9 +164,11 @@ pub fn is_sensitive_key(key: &str) -> bool {
 /// assert_eq!(sanitize_request_id("req-abc-123"), "req-abc-123");
 /// assert_eq!(sanitize_request_id("ANTHROPIC_API_KEY"), "<redacted>");
 /// assert_eq!(sanitize_request_id("my_token"), "<redacted>");
+/// assert_eq!(sanitize_request_id("sk-ant-api03-abc123"), "<redacted>");
+/// assert_eq!(sanitize_request_id("ghp_abc123456"), "<redacted>");
 /// ```
 pub fn sanitize_request_id(request_id: &str) -> &str {
-    if is_sensitive_key(request_id) {
+    if is_sensitive_key(request_id) || is_sensitive_value(request_id) {
         "<redacted>"
     } else {
         request_id
@@ -147,10 +201,22 @@ pub enum Decision {
 /// An unlogged modification must not be emitted. If [`DecisionSink::try_send`]
 /// returns `Err(SinkFull)`, the transform MUST fall back to passthrough.
 /// See [`crate::guardrail::guarded_transform`].
+///
+/// # AC12 redaction boundary
+///
+/// `request_id` is private so that all construction goes through
+/// [`DecisionRecord::passthrough`] or [`DecisionRecord::modified`], which call
+/// [`sanitize_request_id`] unconditionally. Struct-literal construction that
+/// bypasses sanitization cannot be written against the public API — enforcing
+/// the 'parse at boundaries, trust internally' principle.
+///
+/// Downstream consumers (#305, #306, #307) that build records directly MUST use
+/// the constructor methods; they cannot bypass redaction via a struct literal.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DecisionRecord {
     /// Caller-assigned request identifier. Never generated by the transform path.
-    pub request_id: String,
+    /// Private so all construction goes through the sanitizing constructors.
+    request_id: String,
     /// Stable component name (e.g., `"metadata-reorder"`, `"identity"`).
     pub component: &'static str,
     /// Whether this record represents a modification or passthrough.
@@ -213,9 +279,45 @@ impl DecisionRecord {
         }
     }
 
+    /// Returns the sanitized request identifier embedded in this record.
+    ///
+    /// The value was sanitized via [`sanitize_request_id`] at construction time;
+    /// sensitive key names and raw API key values are replaced with `"<redacted>"`.
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
     /// Returns `true` if this is a passthrough record.
     pub fn is_passthrough(&self) -> bool {
         matches!(self.decision, Decision::Passthrough)
+    }
+
+    /// Construct a record with an UNSANITIZED `request_id`.
+    ///
+    /// # Safety
+    ///
+    /// This bypasses [`sanitize_request_id`] and allows any string — including
+    /// sensitive key names — to appear as the `request_id`. It exists ONLY for
+    /// the AC18 self-test broken impl ([`crate::harness::self_test::SacrosanctLeakingContract`])
+    /// that must demonstrate the harness catches an unredacted sensitive id.
+    ///
+    /// **Production code MUST use [`DecisionRecord::passthrough`] or
+    /// [`DecisionRecord::modified`] instead.**
+    #[cfg(any(test, feature = "harness"))]
+    pub fn with_unsanitized_request_id(
+        request_id: impl Into<String>,
+        component: &'static str,
+        decision: Decision,
+        bytes_in: usize,
+        bytes_out: usize,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            component,
+            decision,
+            bytes_in,
+            bytes_out,
+        }
     }
 
     /// Serialise this record to a compact JSON string.
@@ -356,10 +458,9 @@ impl MockSink {
 
     /// Drain and return all captured records, leaving the sink empty.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned (only happens when a thread
-    /// panicked while holding the lock — acceptable in test code).
+    /// Never panics: the internal mutex is poison-tolerant — if a thread panicked
+    /// while holding the lock, `lock()` recovers the guard via `into_inner()`
+    /// rather than panicking.
     pub fn drain(&self) -> Vec<DecisionRecord> {
         std::mem::take(&mut *self.lock())
     }
@@ -438,7 +539,7 @@ mod tests {
     #[test]
     fn decision_record_passthrough_fields() {
         let r = DecisionRecord::passthrough("req-1", "identity", 100);
-        assert_eq!(r.request_id, "req-1");
+        assert_eq!(r.request_id(), "req-1");
         assert_eq!(r.component, "identity");
         assert!(r.is_passthrough());
         assert_eq!(r.bytes_in, 100);
@@ -472,7 +573,7 @@ mod tests {
         let r = DecisionRecord::passthrough("r1", "c", 10);
         sink.try_send(r).expect("channel has capacity");
         let received = rx.try_recv().expect("record must be present");
-        assert_eq!(received.request_id, "r1");
+        assert_eq!(received.request_id(), "r1");
     }
 
     #[test]
@@ -513,8 +614,8 @@ mod tests {
             .unwrap();
         let records = sink.drain();
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].request_id, "r1");
-        assert_eq!(records[1].request_id, "r2");
+        assert_eq!(records[0].request_id(), "r1");
+        assert_eq!(records[1].request_id(), "r2");
         assert!(sink.is_empty());
     }
 
@@ -567,12 +668,42 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_request_id_value_prefix_redacted() {
+        // AC12 value-axis: raw API key values must also be redacted (defense-in-depth).
+        // This covers the x-api-key echo proxy anti-pattern.
+        assert_eq!(
+            sanitize_request_id("sk-ant-api03-abc1234567890abcdef"),
+            "<redacted>",
+            "Anthropic key value prefix must be redacted"
+        );
+        assert_eq!(
+            sanitize_request_id("ghp_abc123456789abcdef"),
+            "<redacted>",
+            "GitHub token value prefix must be redacted"
+        );
+        assert_eq!(
+            sanitize_request_id("AKIAIOSFODNN7EXAMPLE"),
+            "<redacted>",
+            "AWS access key value prefix must be redacted"
+        );
+    }
+
+    #[test]
+    fn is_sensitive_value_short_strings_not_redacted() {
+        // Short strings (< 8 bytes) must not false-positive.
+        assert!(!is_sensitive_value("sk-"));
+        assert!(!is_sensitive_value("ghp_"));
+        assert!(!is_sensitive_value("short"));
+    }
+
+    #[test]
     fn decision_record_passthrough_sanitizes_sensitive_request_id() {
         // Simulate a caller accidentally passing a sensitive key name as request_id.
         // The constructor must sanitize it to "<redacted>" in all build profiles.
         let r = DecisionRecord::passthrough("ANTHROPIC_API_KEY", "identity", 100);
         assert_eq!(
-            r.request_id, "<redacted>",
+            r.request_id(),
+            "<redacted>",
             "sensitive key name must be redacted to '<redacted>' in production"
         );
         // Verify it round-trips to JSON without the sensitive key name.
@@ -588,9 +719,29 @@ mod tests {
     }
 
     #[test]
+    fn decision_record_passthrough_sanitizes_api_key_value() {
+        // AC12 value-axis: raw API key value as request_id must be redacted.
+        let r = DecisionRecord::passthrough(
+            "sk-ant-api03-FAKEKEYFORTESTING1234567890",
+            "identity",
+            100,
+        );
+        assert_eq!(
+            r.request_id(),
+            "<redacted>",
+            "raw API key value must be redacted to '<redacted>'"
+        );
+        let json = r.to_json().expect("serialisation must succeed");
+        assert!(
+            !json.contains("sk-ant-api03"),
+            "raw API key value must not appear in record JSON"
+        );
+    }
+
+    #[test]
     fn decision_record_modified_sanitizes_sensitive_request_id() {
         let r = DecisionRecord::modified("MY_TOKEN", "transform", 200, 150);
-        assert_eq!(r.request_id, "<redacted>");
+        assert_eq!(r.request_id(), "<redacted>");
         let json = r.to_json().expect("serialisation must succeed");
         assert!(!json.contains("MY_TOKEN"));
         assert!(json.contains("<redacted>"));
@@ -600,6 +751,6 @@ mod tests {
     fn decision_record_normal_request_id_preserved() {
         // Non-sensitive request IDs pass through unchanged.
         let r = DecisionRecord::passthrough("req-00001", "identity", 42);
-        assert_eq!(r.request_id, "req-00001");
+        assert_eq!(r.request_id(), "req-00001");
     }
 }

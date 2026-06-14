@@ -45,8 +45,12 @@ name = "proptest_invariants"
 required-features = ["harness"]
 
 # AC21 relative-regression bench: default transform path on a >100KB body.
-# Per ADR-003: no absolute ms gate — the baseline is committed and used as a
-# relative guard (cargo bench compares against the stored baseline).
+# Per ADR-003: no absolute ms gate. The baseline is generated locally via:
+#   cargo bench -p rskim-contract --bench contract_throughput -- --save-baseline <name>
+#   cargo bench -p rskim-contract --bench contract_throughput -- --baseline <name>
+# A committed .bench-baselines/ baseline + CI wiring is a follow-up, not an
+# existing gate. AC20's CI gate is the conformance harness + clippy step, not
+# this bench (see benches/contract_throughput.rs header comment).
 [[bench]]
 name = "contract_throughput"
 harness = false

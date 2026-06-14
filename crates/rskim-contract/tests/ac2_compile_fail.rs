@@ -25,6 +25,13 @@
 // `guarded_transform` is the PRIMARY enforcement for byte-growth; the type system
 // provides absence-of-dedicated-API as a secondary signal.
 //
+// NOTE: cases (b)/(c)/(d) call NON-EXISTENT methods (`grow_bytes_unchecked`,
+// `reorder_turns`, `mutate_hot_zone_at`). They fail to compile for the same reason
+// ANY call to a non-existent method fails — they do NOT prove the operation is
+// type-level impossible. A future change that ADDED a real byte-growth method under
+// a different name would not make these tests fail. The tests correctly document
+// "no dedicated API for violation exists today" — not "violation is unrepresentable."
+//
 // AC2's plan text says the trybuild tests are "the gate." For cases (b)–(d) this
 // means: the gate is "no convenience API for violation exists" — not "violation is
 // structurally impossible." This is documented here to prevent future confusion.

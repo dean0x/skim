@@ -106,9 +106,11 @@ pub fn splice_hot_zone(original: &[u8], range: ByteRange) -> Option<&[u8]> {
 ///
 /// The intended algorithm: find the `"messages"` key in `source` and derive byte
 /// ranges for elements 0..=`last_assistant_index`. The required per-element byte
-/// offsets are not available at this layer (the structural view stores cloned
-/// `serde_json::Value` objects, not raw buffer offsets). Full offset extraction
-/// is a per-consumer responsibility (#302).
+/// offsets are not available at this layer — the structural view stores only
+/// structural metadata (`index`, `role`) per turn, NOT `serde_json::Value` clones
+/// and NOT raw buffer offsets. The per-element byte-offset model is a per-consumer
+/// responsibility that lands with #302 (see `request.rs` module doc and the
+/// TODO(#302) at `request.rs:115`).
 ///
 /// Returning `None` causes the caller to emit passthrough (fail-open), which is
 /// correct and safe — the hot zone is preserved verbatim by passing all bytes
@@ -134,10 +136,12 @@ pub fn locate_hot_zone_range(_source: &[u8], _view: &StructuralView) -> Option<B
 /// # Status: stub — always returns `None` until #302 provides the typed offset model.
 ///
 /// The intended algorithm once #302 lands:
-/// 1. Reconstruct the messages array from the structural view's turns.
+/// 1. Using per-turn byte offsets from the #302 typed model (not available here —
+///    the structural view stores only `index`/`role` metadata, not Value clones or
+///    buffer offsets), locate each slot in `original`.
 /// 2. For each turn in the live zone, apply any matching `SlotEdit`.
 /// 3. Re-emit hot-zone bytes from the original buffer via `splice_hot_zone`
-///    (using byte offsets provided by the #302 typed model).
+///    (using byte offsets from the #302 typed model).
 ///
 /// Returns `None` unconditionally (stub). Will return `None` when any invariant
 /// would be violated:

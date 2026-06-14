@@ -74,14 +74,22 @@ fn bench_default_transform_path(c: &mut Criterion) {
 
     // Bench 2: guarded_transform — the full default-path guardrail.
     // Candidate == input bytes so the gate accepts and dispatches the record.
+    // Uses `iter_batched` to drain the MockSink between batches so the sink's
+    // internal Vec stays bounded and doesn't skew later-iteration timings with
+    // reallocation noise (per review: unbounded sink growth is a measurement-
+    // hygiene issue on this relative-regression tripwire).
     group.bench_function("guarded_transform_passthrough_candidate", |b| {
-        b.iter(|| {
-            // Clone input for guarded_transform (it takes ownership).
-            let input_clone = body.clone();
-            let candidate = body.clone();
-            let outcome = guarded_transform(input_clone, candidate, "bench-req", "bench", &*sink);
-            criterion::black_box(outcome.bytes.len())
-        });
+        b.iter_batched(
+            || (body.clone(), body.clone()), // setup: clone per-batch
+            |(input_clone, candidate)| {
+                let outcome =
+                    guarded_transform(input_clone, candidate, "bench-req", "bench", &*sink);
+                // Drain so the Vec doesn't grow unboundedly across iterations.
+                sink.drain();
+                criterion::black_box(outcome.bytes.len())
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     // Bench 3: parse_request on the large body.

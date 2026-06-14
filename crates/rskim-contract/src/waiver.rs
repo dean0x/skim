@@ -31,7 +31,14 @@
 /// Byte length of one `cache_control` marker injection.
 ///
 /// Derived from the minimal JSON form of `,"cache_control":{"type":"ephemeral"}`.
-/// Pinned by #306's compact serialization — not invented (ADR-003 / PF-005).
+/// Verified by `debug_assert_eq!(marker.len(), MARKER_BYTES)` in `apply_reorder`
+/// and the `marker_bytes_constant_is_correct` unit test — the string is 37 bytes.
+///
+/// **Plan/AC15 supersession note (ADR-003):** the 301 plan, risk table, and
+/// DECISIONS-RESOLVED.md Decision 7 cited `MARKER_BYTES = 38` as an estimate.
+/// The verified compact-serialization length is 37 bytes; 37 supersedes 38 per
+/// ADR-003 (numeric criteria must trace to a measured basis, not an invented figure).
+/// The code is correct; the plan figure was off by one.
 pub const MARKER_BYTES: usize = 37;
 
 /// Maximum number of markers injected per request by the `#306` component.
@@ -149,15 +156,26 @@ pub trait SameSlotShrink: crate::contract::Contract {
 // ============================================================================
 // Mock waivered components (for AC15 harness tests)
 // ============================================================================
+//
+// These mock types are gated behind `#[cfg(any(test, feature = "harness"))]` so
+// they are absent from production builds (release binaries, downstream #306/#307
+// that do not enable the harness feature). Without this gate the types would
+// appear in the public API surface of every consumer of rskim-contract and be
+// compiled into all release binaries — a minor SRP/layering leak. The gate
+// makes test fixtures stay in test infrastructure.
 
 /// Mock marker-injection component that passes its narrowed rule.
 ///
 /// Injects a single mock marker (exactly MARKER_BYTES bytes) into a copy of the
 /// input. Used by AC15 to verify the waiver passes its narrowed rule while failing
 /// the strict baseline (which requires output.len() ≤ input.len()).
+///
+/// Only available under `#[cfg(any(test, feature = "harness"))]`.
+#[cfg(any(test, feature = "harness"))]
 #[derive(Debug, Clone, Copy)]
 pub struct MockMarkerInjector;
 
+#[cfg(any(test, feature = "harness"))]
 impl crate::contract::Contract for MockMarkerInjector {
     fn component_name(&self) -> &'static str {
         "mock-marker-injector"
@@ -194,6 +212,7 @@ impl crate::contract::Contract for MockMarkerInjector {
     }
 }
 
+#[cfg(any(test, feature = "harness"))]
 impl MetadataReorderWithMarkers for MockMarkerInjector {
     fn apply_reorder(&self, input: &[u8], _request_id: &str) -> Option<Vec<u8>> {
         // Inject one mock marker (MARKER_BYTES bytes) to simulate #306 injection.
@@ -208,9 +227,13 @@ impl MetadataReorderWithMarkers for MockMarkerInjector {
 /// Mock same-slot-shrink component that passes its narrowed rule.
 ///
 /// Truncates the input by one byte (if possible) to simulate #307 shrinking.
+///
+/// Only available under `#[cfg(any(test, feature = "harness"))]`.
+#[cfg(any(test, feature = "harness"))]
 #[derive(Debug, Clone, Copy)]
 pub struct MockSameSlotShrinker;
 
+#[cfg(any(test, feature = "harness"))]
 impl crate::contract::Contract for MockSameSlotShrinker {
     fn component_name(&self) -> &'static str {
         "mock-same-slot-shrinker"
@@ -233,6 +256,7 @@ impl crate::contract::Contract for MockSameSlotShrinker {
     }
 }
 
+#[cfg(any(test, feature = "harness"))]
 impl SameSlotShrink for MockSameSlotShrinker {
     fn apply_shrink(&self, input: &[u8], _slot_index: usize, _request_id: &str) -> Option<Vec<u8>> {
         if input.is_empty() {

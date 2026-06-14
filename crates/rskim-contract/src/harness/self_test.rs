@@ -203,6 +203,14 @@ fn try_normalise_numbers(input: &[u8]) -> Option<Vec<u8>> {
 /// `AC12-sacrosanct-redaction` as `passed: false` when this component is under test.
 ///
 /// Output bytes are passthrough (never-inflate is not our violation).
+///
+/// # How the bypass works
+///
+/// `request_id` is private on [`crate::log::DecisionRecord`]; all public constructors
+/// route through [`crate::log::sanitize_request_id`]. This broken impl uses
+/// [`crate::log::DecisionRecord::with_unsanitized_request_id`], which is only
+/// available under `#[cfg(any(test, feature = "harness"))]` — exactly the guard
+/// that makes this escape hatch test-only.
 #[derive(Debug, Clone, Copy)]
 pub struct SacrosanctLeakingContract;
 
@@ -231,19 +239,23 @@ impl Contract for SacrosanctLeakingContract {
         let bytes_in = input.len();
         Outcome {
             bytes: input.to_vec(),
-            decision: DecisionRecord {
-                request_id: LEAKED_KEY_NAME.to_owned(),
-                component: self.component_name(),
-                decision: Decision::Passthrough,
+            // AC18 broken impl: deliberately bypass sanitize_request_id to embed a
+            // SENSITIVE_EXACT key name verbatim in the request_id field. This is only
+            // possible via `with_unsanitized_request_id`, which is gated behind
+            // `#[cfg(any(test, feature = "harness"))]` — production code cannot do this.
+            decision: DecisionRecord::with_unsanitized_request_id(
+                LEAKED_KEY_NAME,
+                self.component_name(),
+                Decision::Passthrough,
                 bytes_in,
-                bytes_out: bytes_in,
-            },
+                bytes_in,
+            ),
         }
     }
 }
 
 // ============================================================================
-// Broken impl 7: MarkerDroppingContract (violates marker-immutability extension)
+// Broken impl 6: MarkerDroppingContract (violates marker-immutability extension)
 // ============================================================================
 
 /// Drops any `cache_control` marker present in the input.
@@ -284,7 +296,7 @@ impl Contract for MarkerDroppingContract {
 }
 
 // ============================================================================
-// Broken impl 8: MarkerOverflowInjector (violates MetadataReorderWithMarkers cap)
+// Broken impl 7: MarkerOverflowInjector (violates MetadataReorderWithMarkers cap)
 // ============================================================================
 
 /// Injects more markers than the `MAX_MARKERS × MARKER_BYTES` cap allows.
@@ -325,7 +337,7 @@ impl MetadataReorderWithMarkers for MarkerOverflowInjector {
 }
 
 // ============================================================================
-// Broken impl 9: SameSlotShrinkViolatorContract (violates SameSlotShrink rule)
+// Broken impl 8: SameSlotShrinkViolatorContract (violates SameSlotShrink rule)
 // ============================================================================
 
 /// Violates the `SameSlotShrink` narrowed rule (waiver rule 2) by growing the

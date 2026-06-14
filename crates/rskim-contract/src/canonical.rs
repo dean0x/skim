@@ -96,21 +96,17 @@ fn parse_raw_node(raw_src: &str, depth: usize) -> Option<RawNode> {
         }
         b'{' => {
             // Parse object entries preserving individual raw value tokens.
-            // `HashMap` is used here because:
-            // - `raw_nodes_equal` compares objects order-insensitively via `.find()`,
-            //   so HashMap iteration order does not affect the equality RESULT.
-            // - The comparison result (true/false) is fully deterministic per input
-            //   regardless of HashMap iteration order — the boolean outcome does not
-            //   vary across runs or platforms.
-            // - Duplicate keys collapse to last-wins (same as serde_json's own `Value`
-            //   parse), which is consistent. Duplicate keys in tool schemas are
-            //   pathological and not produced by real providers.
+            // `BTreeMap` is used here (not HashMap) to make the determinism guarantee
+            // structural rather than argued-in-a-comment (AC9). Although `raw_nodes_equal`
+            // compares objects order-insensitively via `.find()` — so the boolean result
+            // is deterministic regardless of iteration order — using BTreeMap makes it
+            // impossible for a future maintainer to copy this pattern into a path where
+            // iteration order DOES reach output bytes and silently break determinism.
             //
-            // The crate's `disallowed-methods` gate bans entropy sources, not data
-            // structures. HashMap key ordering is non-deterministic in theory but the
-            // boolean equality result derived from it is deterministic per (a, b) input
-            // pair, satisfying invariant 5.
-            let map: std::collections::HashMap<String, Box<serde_json::value::RawValue>> =
+            // Duplicate keys: BTreeMap last-wins semantics match serde_json's own `Value`
+            // parse behaviour. Duplicate keys in tool schemas are pathological and not
+            // produced by real providers.
+            let map: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> =
                 serde_json::from_str(token).ok()?;
             let mut result = Vec::with_capacity(map.len());
             for (k, v) in map {
