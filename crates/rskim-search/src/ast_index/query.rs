@@ -235,6 +235,30 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
         set: &AstNgramSet,
         lang_filter: Option<Language>,
     ) -> Result<Vec<(FileId, f64)>> {
+        let ctx = self.score_ngram_set(set, lang_filter)?;
+
+        let mut out: Vec<(FileId, f64)> = ctx
+            .scores
+            .into_iter()
+            .map(|(id, s)| (FileId(id), s))
+            .collect();
+
+        // B2: unique (FxHashMap), all > 0 (BM25 with C4: count>=1 → tf>0 → score>0),
+        // sorted FileId-ASC (Wave-4 contract).
+        debug_assert!(out.iter().all(|(_, s)| *s > 0.0), "all scores must be > 0");
+        out.sort_unstable_by_key(|(fid, _)| *fid);
+        Ok(out)
+    }
+
+    /// Build and populate a [`ScoringCtx`] for `set` + `lang_filter`.
+    ///
+    /// Shared by `run_ngram_set` (production) and `run_ngram_set_with_capacity`
+    /// (test-only capacity hook) to eliminate duplicated dedup + scoring loop code.
+    fn score_ngram_set(
+        &self,
+        set: &AstNgramSet,
+        lang_filter: Option<Language>,
+    ) -> Result<ScoringCtx> {
         let avg = f64::from(self.reader.avg_node_count());
 
         // Gap-fix #6: dedup by key (entries are sorted; O(n); prevents double-scoring dups).
@@ -255,34 +279,15 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
 
         let total_ngrams = bigrams.len() + trigrams.len();
 
-        // P3 (#286): posting-driven, single-pass capacity with reserve().
-        //
-        // Strategy: start with `CAPACITY_FLOOR`, then call `scores.reserve(n)`
-        // before processing each posting list of length `n`.  This means the
-        // map grows at most once per n-gram rather than rehashing during insert,
-        // while never over-allocating to `file_count()` for selective queries.
-        //
-        // AC6 (broad): for a posting list of length ≥ file_count the initial
-        // reserve brings the capacity to file_count — no further rehash occurs.
-        // AC7 (empty-first): an empty first list does not reserve anything;
-        // subsequent large lists call reserve just before their insertions.
-        // The floor at CAPACITY_FLOOR (see constant docs) prevents pathological
-        // grow-from-1 churn on the very first posting.
+        // P3 (#286): posting-driven capacity — start at CAPACITY_FLOOR, reserve(n) per
+        // posting list. Avoids over-allocating file_count() for selective queries (AC6)
+        // and correctly handles an empty first list followed by a large second (AC7).
         let file_count = self.reader.file_count() as usize;
 
-        // Per-call meta cache: skip for single-n-gram queries — by contract C1,
-        // each posting list has at most one posting per doc_id, so cross-n-gram
-        // cache hits only occur when total_ngrams > 1.
-        //
-        // P1 (#286): Value type shrunk from `AstFileMetaEntry` (15 bytes) to
-        // `LiteMeta` (5 bytes).  BM25 scoring only needs `lang_id` and
-        // `node_count`; the other fields are only needed for `file_metrics`.
-        //
-        // Note: on lang-filtered runs, `meta_cache` may hold entries for
-        // postings whose language did not pass the filter (decoded to learn the
-        // lang_id, then skipped).  These entries are never re-read so they do
-        // not affect correctness; their count is bounded by `file_count`.
-        let meta_cache: Option<FxHashMap<u32, LiteMeta>> = if total_ngrams > 1 {
+        // Per-call meta cache: skip for single-n-gram queries (C1: at most one posting
+        // per doc_id per list, so cross-list cache hits only occur when total_ngrams > 1).
+        // P1 (#286): value type is LiteMeta (5 bytes) not AstFileMetaEntry (15 bytes).
+        let meta_cache = if total_ngrams > 1 {
             Some(FxHashMap::with_capacity_and_hasher(
                 CAPACITY_FLOOR,
                 Default::default(),
@@ -312,17 +317,7 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
             })?;
         }
 
-        let mut out: Vec<(FileId, f64)> = ctx
-            .scores
-            .into_iter()
-            .map(|(id, s)| (FileId(id), s))
-            .collect();
-
-        // B2: unique (FxHashMap), all > 0 (BM25 with C4: count>=1 → tf>0 → score>0),
-        // sorted FileId-ASC (Wave-4 contract).
-        debug_assert!(out.iter().all(|(_, s)| *s > 0.0), "all scores must be > 0");
-        out.sort_unstable_by_key(|(fid, _)| *fid);
-        Ok(out)
+        Ok(ctx)
     }
 }
 
@@ -603,12 +598,9 @@ impl ScoringCtx {
         if new_slots > 0 {
             self.scores.reserve(new_slots);
             if let Some(cache) = self.meta_cache.as_mut() {
-                // The cache reserve uses `new_slots` (derived from `scores.len()`
-                // pre-insert).  On lang-filtered runs `scores.len()` may be smaller
-                // than `cache.len()` (filtered postings are decoded into the cache
-                // but never inserted into scores), so `new_slots` is a loose lower
-                // bound for the cache.  `reserve(additional)` is additive, so the
-                // cache is never under-sized (#286).
+                // Additive reserve; on lang-filtered runs scores.len() < cache.len()
+                // is possible (filtered postings enter the cache but not scores), so
+                // `new_slots` is a lower bound — never under-sizes the cache (#286).
                 cache.reserve(new_slots);
             }
         }
@@ -678,44 +670,7 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
         set: &AstNgramSet,
         lang_filter: Option<Language>,
     ) -> Result<(Vec<(FileId, f64)>, usize)> {
-        let avg = f64::from(self.reader.avg_node_count());
-
-        let mut bigrams: Vec<&AstBigramEntry> = set.bigrams.iter().collect();
-        bigrams.dedup_by_key(|e| e.ngram.key());
-        let mut trigrams: Vec<&AstTrigramEntry> = set.trigrams.iter().collect();
-        trigrams.dedup_by_key(|e| e.ngram.key());
-
-        let total_ngrams = bigrams.len() + trigrams.len();
-        let file_count = self.reader.file_count() as usize;
-
-        let meta_cache: Option<FxHashMap<u32, LiteMeta>> = if total_ngrams > 1 {
-            Some(FxHashMap::with_capacity_and_hasher(
-                CAPACITY_FLOOR,
-                Default::default(),
-            ))
-        } else {
-            None
-        };
-
-        let mut ctx = ScoringCtx {
-            scores: FxHashMap::with_capacity_and_hasher(CAPACITY_FLOOR, Default::default()),
-            meta_cache,
-            file_count,
-        };
-
-        for entry in &bigrams {
-            let postings = self.reader.lookup_bigram(entry.ngram)?;
-            ctx.score_postings(&postings, &self.reader, avg, lang_filter, |lang| {
-                f64::from(ast_bigram_idf(lang, entry.ngram))
-            })?;
-        }
-        for entry in &trigrams {
-            let postings = self.reader.lookup_trigram(entry.ngram)?;
-            ctx.score_postings(&postings, &self.reader, avg, lang_filter, |lang| {
-                f64::from(ast_trigram_idf(lang, entry.ngram))
-            })?;
-        }
-
+        let ctx = self.score_ngram_set(set, lang_filter)?;
         let cap = ctx.scores_capacity();
         let mut out: Vec<(FileId, f64)> = ctx
             .scores
@@ -795,7 +750,7 @@ fn cached_lite_meta<R: AstPostingSource>(
     if let Some(e) = cache.get(&doc_id) {
         return Ok(*e);
     }
-    let lite: LiteMeta = reader.file_lang_and_node_count(doc_id)?.into();
+    let lite = reader.file_lang_and_node_count(doc_id)?.into();
     cache.insert(doc_id, lite);
     Ok(lite)
 }
