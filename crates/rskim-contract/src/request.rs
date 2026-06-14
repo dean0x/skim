@@ -9,10 +9,10 @@
 //!
 //! # Byte preservation
 //!
-//! The structural view stores parsed `serde_json::Value` clones of each message
-//! object, not raw byte offsets into the original buffer. Byte-offset derivation
-//! for hot-zone splicing is a per-consumer responsibility (#302); this layer
-//! provides the structural parse and zone-boundary classification only.
+//! The structural view stores only the structural metadata for each message
+//! (`index`, `role`), not parsed `serde_json::Value` clones. Byte-offset
+//! derivation for hot-zone splicing is a per-consumer responsibility (#302);
+//! this layer provides only the structural parse and zone-boundary classification.
 //! Hot-zone content must be re-emitted from the original buffer by
 //! [`crate::zone::splice_hot_zone`] — re-serialization via `serde_json::to_vec`
 //! is forbidden because it can change key order, number tokens, or whitespace,
@@ -89,36 +89,37 @@ pub enum TurnRole {
 impl TurnRole {
     /// Parse a role string from either provider schema.
     ///
-    /// Always returns `Some` — unknown roles map to [`TurnRole::Other`] rather
-    /// than `None`, preserving the turn slot and keeping index spaces aligned.
-    pub fn parse(s: &str) -> Option<Self> {
+    /// Infallible — unknown roles map to [`TurnRole::Other`] rather than
+    /// returning `None`, preserving the turn slot and keeping index spaces aligned.
+    /// This function always returns a value, so the return type is `Self`.
+    pub fn parse(s: &str) -> Self {
         match s {
-            "user" | "human" => Some(TurnRole::User),
-            "assistant" | "model" => Some(TurnRole::Assistant),
-            "system" => Some(TurnRole::System),
-            "tool" => Some(TurnRole::Tool),
+            "user" | "human" => TurnRole::User,
+            "assistant" | "model" => TurnRole::Assistant,
+            "system" => TurnRole::System,
+            "tool" => TurnRole::Tool,
             // OpenAI "developer" role (added 2024) and any other unknown role.
-            _ => Some(TurnRole::Other),
+            _ => TurnRole::Other,
         }
     }
 }
 
 /// A single turn (message) in the conversation array.
+///
+/// Stores only the structural metadata needed for zone-boundary computation
+/// (`index`, `role`). The raw JSON bytes of each message are NOT cloned here
+/// because this layer cannot know which turns will be hot-zone vs live-zone
+/// until #302 provides the typed offset model. Callers that need message
+/// content must retain the original `&[u8]` buffer and splice via
+/// [`crate::zone::splice_hot_zone`] at known byte offsets (#302 consumer).
+// TODO(#302): when the typed offset model is available, extend Turn with a
+// `ByteRange` for the original-buffer slice instead of an owned Value clone.
 #[derive(Debug, Clone)]
 pub struct Turn {
     /// Zero-based index in the messages array.
     pub index: usize,
     /// The role of this turn.
     pub role: TurnRole,
-    /// The parsed JSON value of this message object (cloned from the parsed body).
-    ///
-    /// This is an owned `serde_json::Value` clone, NOT byte offsets into the original
-    /// buffer. Re-emitting via `serde_json::to_vec` is explicitly **forbidden** for
-    /// hot-zone turns because it may change key order, number tokens, or whitespace,
-    /// busting the prompt cache (invariant 3). For hot-zone turns, callers must splice
-    /// directly from the original buffer via [`crate::zone::splice_hot_zone`] using
-    /// byte offsets derived by the #302 consumer.
-    pub value: Value,
 }
 
 /// Zone boundary for the messages array.
@@ -245,18 +246,13 @@ pub fn parse_request(input: &[u8]) -> Option<StructuralView> {
             arr.iter()
                 .enumerate()
                 .map(|(i, msg)| {
-                    // `TurnRole::parse` always returns Some (unknown → Other).
+                    // `TurnRole::parse` is infallible (unknown → Other).
                     // If role is missing or not a string, treat as Other.
                     let role = msg
                         .get("role")
                         .and_then(|v| v.as_str())
-                        .and_then(TurnRole::parse)
-                        .unwrap_or(TurnRole::Other);
-                    Turn {
-                        index: i,
-                        role,
-                        value: msg.clone(),
-                    }
+                        .map_or(TurnRole::Other, TurnRole::parse);
+                    Turn { index: i, role }
                 })
                 .collect()
         })
@@ -346,9 +342,10 @@ fn detect_thinking_blocks(obj: &serde_json::Map<String, Value>) -> bool {
 /// # Bounds
 ///
 /// - `max_depth` must be ≤ 128 (serde_json's ceiling).
-/// - Uses `u32` for depth counter to avoid overflow on adversarial input
-///   (a 64GB file of `[` characters would overflow `usize` on 32-bit targets;
-///   `u32` overflows at 4G characters, but we bail early on exceed anyway).
+/// - Uses `u32` for the depth counter with `saturating_add`. The counter
+///   never reaches a meaningful large value because we bail early once it
+///   exceeds `max_depth` (capped to ≤ 128). The `u32` + `saturating_add`
+///   combination is therefore overflow-safe regardless of input length.
 fn estimated_depth_exceeds(input: &[u8], max_depth: usize) -> bool {
     // Widening to u32 before comparison with max_depth (PF-004).
     let max_u32 = max_depth.min(128) as u32;
@@ -630,22 +627,22 @@ mod tests {
 
     #[test]
     fn turn_role_parse_known_roles() {
-        assert_eq!(TurnRole::parse("user"), Some(TurnRole::User));
-        assert_eq!(TurnRole::parse("human"), Some(TurnRole::User));
-        assert_eq!(TurnRole::parse("assistant"), Some(TurnRole::Assistant));
-        assert_eq!(TurnRole::parse("model"), Some(TurnRole::Assistant));
-        assert_eq!(TurnRole::parse("system"), Some(TurnRole::System));
-        assert_eq!(TurnRole::parse("tool"), Some(TurnRole::Tool));
+        assert_eq!(TurnRole::parse("user"), TurnRole::User);
+        assert_eq!(TurnRole::parse("human"), TurnRole::User);
+        assert_eq!(TurnRole::parse("assistant"), TurnRole::Assistant);
+        assert_eq!(TurnRole::parse("model"), TurnRole::Assistant);
+        assert_eq!(TurnRole::parse("system"), TurnRole::System);
+        assert_eq!(TurnRole::parse("tool"), TurnRole::Tool);
     }
 
     #[test]
     fn turn_role_parse_unknown_returns_other() {
-        // Unknown roles map to TurnRole::Other (not None) to preserve index-space
-        // alignment: no turn slot is dropped, so Turn.index and ZoneBoundary.turn_count
+        // Unknown roles map to TurnRole::Other to preserve index-space alignment:
+        // no turn slot is dropped, so Turn.index and ZoneBoundary.turn_count
         // remain consistent with the original messages array positions.
-        assert_eq!(TurnRole::parse("unknown_role"), Some(TurnRole::Other));
-        assert_eq!(TurnRole::parse(""), Some(TurnRole::Other));
+        assert_eq!(TurnRole::parse("unknown_role"), TurnRole::Other);
+        assert_eq!(TurnRole::parse(""), TurnRole::Other);
         // OpenAI "developer" role (added 2024) maps to Other until explicitly added.
-        assert_eq!(TurnRole::parse("developer"), Some(TurnRole::Other));
+        assert_eq!(TurnRole::parse("developer"), TurnRole::Other);
     }
 }

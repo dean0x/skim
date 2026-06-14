@@ -19,6 +19,7 @@ crossbeam-channel = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 trybuild = { workspace = true }
+criterion = { workspace = true }
 
 [features]
 # harness feature gates the conformance-test support module.
@@ -37,3 +38,15 @@ todo = "warn"
 [lib]
 name = "rskim_contract"
 path = "src/lib.rs"
+
+# proptest_invariants uses TurnDroppingContract from the harness module.
+[[test]]
+name = "proptest_invariants"
+required-features = ["harness"]
+
+# AC21 relative-regression bench: default transform path on a >100KB body.
+# Per ADR-003: no absolute ms gate — the baseline is committed and used as a
+# relative guard (cargo bench compares against the stored baseline).
+[[bench]]
+name = "contract_throughput"
+harness = false

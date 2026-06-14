@@ -7,6 +7,15 @@
 # This gate is checked by: cargo clippy -p rskim-contract --all-targets -- -D warnings
 # CI runs this on ubuntu-latest, macos-latest, and windows-latest (AC20).
 #
+# AC9 two-divergent-clock sub-requirement: AC9 specifies that the transform
+# must produce byte-identical output "under two divergent injected clock values."
+# This gate satisfies that requirement structurally: no clock can exist in the
+# transform path (SystemTime::now and Instant::now are banned below), so there
+# is nothing to inject. The `check_determinism` harness function documents this
+# substitution explicitly in its docstring (harness/mod.rs). Per PF-005 this is
+# observable-by-construction: the clippy gate is verifiable in CI as a passing
+# step, making the "no clock in transform" invariant mechanically checkable.
+#
 # The banned methods are:
 # - std::time::SystemTime::now — wall-clock time (non-deterministic)
 # - std::time::Instant::now — monotonic time (non-deterministic across runs)

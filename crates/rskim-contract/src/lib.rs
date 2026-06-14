@@ -71,9 +71,10 @@
 //! The `transform` method returns `Outcome` (no `Result`). This generalises the
 //! proven `ParseResult<T>` precedent where `Passthrough(String)` is a typed
 //! *success* variant, not an `Err`. Failure-to-modify is not an error — it is
-//! the conservative correct behaviour. `Result` appears only in construction
-//! (constructors for contract impls) and in harness assertion APIs (where a
-//! broken impl is the expected error case).
+//! the conservative correct behaviour. `Result` does not appear on the transform path. It appears at construction
+//! (constructors for contract impls), in harness assertion APIs (where a
+//! broken impl is the expected error case), and in defense-in-depth helpers
+//! such as [`guardrail::whole_request_check`] reserved for the #302 consumer.
 //!
 //! ### Typed waivers over capability tokens (invariants 3, 4, 6)
 //!

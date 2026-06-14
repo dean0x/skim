@@ -120,6 +120,8 @@ pub fn splice_hot_zone(original: &[u8], range: ByteRange) -> Option<&[u8]> {
 /// - The structural view has no assistant turns (hot zone is empty)
 /// - The `"messages"` key cannot be located at byte level
 /// - Arithmetic overflows (PF-004 checked/saturating ops)
+// TODO(#302): implement locate_hot_zone_range — remove the stub note from the
+// rustdoc above once the typed offset model is available.
 pub fn locate_hot_zone_range(_source: &[u8], _view: &StructuralView) -> Option<ByteRange> {
     // Stub: always returns None until #302 provides the typed offset model.
     // Callers fall back to passthrough, which is safe and correct at this layer.
@@ -144,6 +146,8 @@ pub fn locate_hot_zone_range(_source: &[u8], _view: &StructuralView) -> Option<B
 /// - Offset arithmetic overflows
 ///
 /// The caller emits passthrough on `None`, which is correct — no edits applied.
+// TODO(#302): implement apply_live_zone_edits — remove the stub note from the
+// rustdoc above once the typed offset model is available.
 pub fn apply_live_zone_edits(
     _original: &[u8],
     _view: &StructuralView,

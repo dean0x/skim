@@ -43,7 +43,7 @@
 /// A single named invariant check: takes input and output bytes, returns `true`
 /// if the invariant holds for this (input, output) pair.
 ///
-/// A returning `false` means the component violated the registered invariant.
+/// Returning `false` means the component violated the registered invariant.
 pub type InvariantCheck = dyn Fn(&[u8], &[u8]) -> bool + Send + Sync;
 
 /// Result of running extension invariant checks.

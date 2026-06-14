@@ -95,6 +95,32 @@ pub fn is_sensitive_key(key: &str) -> bool {
         || SENSITIVE_SUFFIXES.iter().any(|&s| upper.ends_with(s))
 }
 
+/// Sanitize a `request_id` for safe embedding in a decision record.
+///
+/// Returns the input unchanged if it does not match a sensitive key pattern.
+/// Returns `"<redacted>"` if [`is_sensitive_key`] matches — this fires in all
+/// build profiles (release AND debug), not just in assertions.
+///
+/// This is the production enforcement for AC12: no auth material in the
+/// decision log, enforced at the construction boundary of every record, not
+/// by documentation or debug-only assertions.
+///
+/// # Examples
+///
+/// ```rust
+/// use rskim_contract::log::sanitize_request_id;
+/// assert_eq!(sanitize_request_id("req-abc-123"), "req-abc-123");
+/// assert_eq!(sanitize_request_id("ANTHROPIC_API_KEY"), "<redacted>");
+/// assert_eq!(sanitize_request_id("my_token"), "<redacted>");
+/// ```
+pub fn sanitize_request_id(request_id: &str) -> &str {
+    if is_sensitive_key(request_id) {
+        "<redacted>"
+    } else {
+        request_id
+    }
+}
+
 // ============================================================================
 // DecisionRecord
 // ============================================================================
@@ -141,7 +167,7 @@ impl DecisionRecord {
     /// `bytes_in == bytes_out` for passthrough; the invariant is recorded
     /// in both fields for consistency.
     ///
-    /// # Caller contract: `request_id` must not contain auth material
+    /// # AC12 request_id sanitization (enforced in all build profiles)
     ///
     /// `request_id` is serialized verbatim into the record JSON. AC12 mandates
     /// that auth material MUST NEVER appear unredacted in any log record. Callers
@@ -149,18 +175,16 @@ impl DecisionRecord {
     /// hashed request identifier), never a bearer token, API key, or value derived
     /// from a request header that could carry auth material.
     ///
-    /// A `debug_assert` checks this at construction time in debug builds.
+    /// As a defense-in-depth **production** safeguard (not merely a debug
+    /// assertion), this constructor redacts any `request_id` that matches a
+    /// known sensitive key pattern — replacing it with the literal string
+    /// `"<redacted>"`. This covers the realistic proxy anti-pattern where a
+    /// caller derives the request_id from a request header containing an auth
+    /// key (e.g., an x-api-key echo). The redaction fires in release builds
+    /// unlike a `debug_assert!`.
     pub fn passthrough(request_id: &str, component: &'static str, bytes_in: usize) -> Self {
-        // Defense-in-depth: assert in debug builds that request_id is not a
-        // known sensitive key name. This catches obvious misuse at the trust
-        // boundary during development without overhead in release builds.
-        debug_assert!(
-            !is_sensitive_key(request_id),
-            "AC12 violation: request_id '{request_id}' matches a sensitive key pattern — \
-             use an opaque correlation identifier, not an auth material value"
-        );
         Self {
-            request_id: request_id.to_owned(),
+            request_id: sanitize_request_id(request_id).to_owned(),
             component,
             decision: Decision::Passthrough,
             bytes_in,
@@ -170,22 +194,18 @@ impl DecisionRecord {
 
     /// Construct a modification record.
     ///
-    /// # Caller contract: `request_id` must not contain auth material
+    /// # AC12 request_id sanitization
     ///
-    /// See [`DecisionRecord::passthrough`] for the full AC12 caller contract.
+    /// See [`DecisionRecord::passthrough`] for the full AC12 sanitization contract.
+    /// The same production-safe redaction is applied here.
     pub fn modified(
         request_id: &str,
         component: &'static str,
         bytes_in: usize,
         bytes_out: usize,
     ) -> Self {
-        debug_assert!(
-            !is_sensitive_key(request_id),
-            "AC12 violation: request_id '{request_id}' matches a sensitive key pattern — \
-             use an opaque correlation identifier, not an auth material value"
-        );
         Self {
-            request_id: request_id.to_owned(),
+            request_id: sanitize_request_id(request_id).to_owned(),
             component,
             decision: Decision::Modified,
             bytes_in,
@@ -518,5 +538,68 @@ mod tests {
         sink.try_send(DecisionRecord::passthrough("r1", "c", 5))
             .unwrap();
         assert_eq!(sink.len(), 1);
+    }
+
+    // ========================================================================
+    // sanitize_request_id tests (AC12 production enforcement)
+    // ========================================================================
+
+    #[test]
+    fn sanitize_request_id_safe_values_unchanged() {
+        assert_eq!(sanitize_request_id("req-abc-123"), "req-abc-123");
+        assert_eq!(sanitize_request_id("uuid-1234-5678"), "uuid-1234-5678");
+        assert_eq!(sanitize_request_id(""), "");
+    }
+
+    #[test]
+    fn sanitize_request_id_sensitive_exact_match_redacted() {
+        assert_eq!(sanitize_request_id("ANTHROPIC_API_KEY"), "<redacted>");
+        assert_eq!(sanitize_request_id("OPENAI_API_KEY"), "<redacted>");
+        assert_eq!(sanitize_request_id("GITHUB_TOKEN"), "<redacted>");
+    }
+
+    #[test]
+    fn sanitize_request_id_sensitive_suffix_redacted() {
+        // A value that looks like an env var key name with a sensitive suffix.
+        assert_eq!(sanitize_request_id("MY_TOKEN"), "<redacted>");
+        assert_eq!(sanitize_request_id("SERVICE_API_KEY"), "<redacted>");
+        assert_eq!(sanitize_request_id("DB_PASSWORD"), "<redacted>");
+    }
+
+    #[test]
+    fn decision_record_passthrough_sanitizes_sensitive_request_id() {
+        // Simulate a caller accidentally passing a sensitive key name as request_id.
+        // The constructor must sanitize it to "<redacted>" in all build profiles.
+        let r = DecisionRecord::passthrough("ANTHROPIC_API_KEY", "identity", 100);
+        assert_eq!(
+            r.request_id, "<redacted>",
+            "sensitive key name must be redacted to '<redacted>' in production"
+        );
+        // Verify it round-trips to JSON without the sensitive key name.
+        let json = r.to_json().expect("serialisation must succeed");
+        assert!(
+            !json.contains("ANTHROPIC_API_KEY"),
+            "sensitive key must not appear in record JSON"
+        );
+        assert!(
+            json.contains("<redacted>"),
+            "redaction marker must appear in record JSON"
+        );
+    }
+
+    #[test]
+    fn decision_record_modified_sanitizes_sensitive_request_id() {
+        let r = DecisionRecord::modified("MY_TOKEN", "transform", 200, 150);
+        assert_eq!(r.request_id, "<redacted>");
+        let json = r.to_json().expect("serialisation must succeed");
+        assert!(!json.contains("MY_TOKEN"));
+        assert!(json.contains("<redacted>"));
+    }
+
+    #[test]
+    fn decision_record_normal_request_id_preserved() {
+        // Non-sensitive request IDs pass through unchanged.
+        let r = DecisionRecord::passthrough("req-00001", "identity", 42);
+        assert_eq!(r.request_id, "req-00001");
     }
 }

@@ -174,13 +174,22 @@ pub const MAX_CANONICAL_DEPTH: usize = 64;
 
 /// Check canonical deep-equality between two JSON values.
 ///
+/// # Footgun warning — wrong function for invariant-6 checks
+///
+/// This function compares numbers as **parsed f64 values** (not as raw token
+/// bytes). Without `arbitrary_precision`, serde_json normalises `1e3 == 1000.0`,
+/// so this function considers `1e3` and `1000` equal. That is intentionally
+/// different from the invariant-6 requirement, where cache-key faithfulness
+/// demands `1e3 ≠ 1000` (different source tokens, different cache key impact).
+///
+/// **For invariant-6 (tools-array reorder verification), use [`canonical_equal_raw`]
+/// or [`tools_arrays_equal`] instead.** This function is for structural equality
+/// tests that do NOT need raw-token number fidelity.
+///
 /// Returns `true` iff `a` and `b` are semantically equal under the pinned
 /// canonicalization:
 /// - Object keys are compared order-insensitively (recursive key-sort)
-/// - Numbers are compared as parsed f64 values (since `arbitrary_precision` is
-///   NOT enabled, `1e3` and `1000` are considered equal — use
-///   [`canonical_equal_raw`] or [`tools_arrays_equal`] for the invariant-6
-///   raw-token-byte comparison required on the waivered tools-array path)
+/// - Numbers are compared as parsed f64 values (f64-normalised, NOT raw tokens)
 /// - Arrays are order-sensitive
 /// - Exceeding `MAX_CANONICAL_DEPTH` returns `false`
 ///
@@ -561,5 +570,82 @@ mod tests {
     fn canonical_equal_raw_same_number_token_equal() {
         assert_eq!(canonical_equal_raw("1e3", "1e3"), Some(true));
         assert_eq!(canonical_equal_raw("1000", "1000"), Some(true));
+    }
+
+    // ========================================================================
+    // AC9 map-iteration determinism: canonical_equal_raw / tools_arrays_equal
+    // on objects with many keys in different source orders.
+    //
+    // AC9's plan mandates a fixture "exercising any internal map iteration"
+    // that asserts map-backed output is deterministic. The RawNode::Object arm
+    // in `parse_raw_node` uses HashMap, whose iteration order varies per run.
+    // However, `raw_nodes_equal` is order-insensitive (it finds each key via
+    // `.find()`), so the boolean RESULT is deterministic even if HashMap
+    // iteration order is not. These tests make that property observable.
+    //
+    // Note: per-process HashMap seed is fixed at process start (Rust's
+    // standard HashMap uses RandomState seeded once), so within a single
+    // process run, iteration order is stable but NOT guaranteed to be the
+    // same across processes. The equality RESULT must be stable across all
+    // orderings because `raw_nodes_equal` uses order-insensitive comparison.
+    // ========================================================================
+
+    /// AC9 map-iteration fixture: two objects with the same keys in different
+    /// source orders must compare equal via `canonical_equal_raw`.
+    ///
+    /// This is the canonical AC9 map-iteration test: the raw JSON strings
+    /// differ in key order, so `parse_raw_node` will encounter the keys in
+    /// different HashMap iteration sequences, yet the result must be `true`.
+    #[test]
+    fn canonical_equal_raw_many_keys_different_source_order() {
+        // 10 key object in two different source orderings.
+        let a = r#"{"k1":1,"k2":2,"k3":3,"k4":4,"k5":5,"k6":6,"k7":7,"k8":8,"k9":9,"k10":10}"#;
+        let b = r#"{"k10":10,"k9":9,"k8":8,"k7":7,"k6":6,"k5":5,"k4":4,"k3":3,"k2":2,"k1":1}"#;
+        assert_eq!(
+            canonical_equal_raw(a, b),
+            Some(true),
+            "objects with same keys in different source order must be equal (AC9 map-iteration)"
+        );
+        // Same keys, same values — repeated call must produce the same result.
+        assert_eq!(
+            canonical_equal_raw(a, b),
+            Some(true),
+            "canonical_equal_raw must be deterministic across repeated calls (AC9)"
+        );
+    }
+
+    /// AC9 map-iteration fixture for `tools_arrays_equal`: tool objects with
+    /// many keys in different source orders must compare equal.
+    ///
+    /// This exercises `parse_raw_node`'s HashMap arm on a realistic tool schema
+    /// and confirms the order-insensitive `.find()` loop produces the same verdict
+    /// regardless of HashMap iteration sequence.
+    #[test]
+    fn tools_arrays_equal_many_keys_different_source_order() {
+        let original = r#"[{"name":"t","description":"desc","parameters":{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"integer"},"c":{"type":"boolean"},"d":{"type":"number"},"e":{"type":"array","items":{"type":"string"}}}}}]"#;
+        // Same content with shuffled key order inside the tool and parameters objects.
+        let reordered = r#"[{"parameters":{"properties":{"e":{"items":{"type":"string"},"type":"array"},"d":{"type":"number"},"c":{"type":"boolean"},"b":{"type":"integer"},"a":{"type":"string"}},"type":"object"},"description":"desc","name":"t"}]"#;
+        assert!(
+            tools_arrays_equal(original, reordered),
+            "tools_arrays_equal must be order-insensitive for object keys (AC9 map-iteration)"
+        );
+        // Determinism: same call produces the same result.
+        assert!(
+            tools_arrays_equal(original, reordered),
+            "tools_arrays_equal must be deterministic across repeated calls (AC9)"
+        );
+    }
+
+    /// AC9 map-iteration negative case: objects with same keys but different values
+    /// must compare NOT equal, regardless of iteration order.
+    #[test]
+    fn canonical_equal_raw_same_keys_different_values_not_equal() {
+        let a = r#"{"k1":1,"k2":2,"k3":3,"k4":4,"k5":99}"#;
+        let b = r#"{"k5":100,"k4":4,"k3":3,"k2":2,"k1":1}"#; // k5 differs
+        assert_eq!(
+            canonical_equal_raw(a, b),
+            Some(false),
+            "objects with same keys but different values must not be equal (AC9 negative)"
+        );
     }
 }

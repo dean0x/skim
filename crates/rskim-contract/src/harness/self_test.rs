@@ -386,6 +386,12 @@ pub fn assert_identity_passes(request_id: &str) {
 }
 
 /// Verify that `InflatingContract` fails the never-inflate invariant.
+///
+/// AC18 isolation: `InflatingContract` must fail `AC4-never-inflate` and the
+/// inflation-derived checks (`AC3-fail-open`, `AC3-large-payload-never-inflate`)
+/// because it appends a byte to every input. Critically, `AC8-append-only` and
+/// `AC13-logged-never-silent` results must NOT fail due to the inflation alone —
+/// those are tested by separate broken impls.
 pub fn assert_inflating_fails_never_inflate(request_id: &str) {
     use super::run_conformance_suite;
     let report = run_conformance_suite(&InflatingContract, request_id);
@@ -402,9 +408,40 @@ pub fn assert_inflating_fails_never_inflate(request_id: &str) {
         never_inflate_results.iter().any(|r| !r.passed),
         "InflatingContract must fail AC4-never-inflate, but all passed"
     );
+    // AC18 isolation: append-only and logged-never-silent must not be the
+    // reason InflatingContract is considered broken. We don't assert they
+    // ALL pass (inflation breaks AC3/fail-open too) but at minimum the
+    // append-only count must pass (turn count is preserved — we add a byte
+    // to the output, not drop a message) and AC13 must pass (the decision
+    // record correctly says `modified`).
+    let append_only_all_pass = report
+        .results
+        .iter()
+        .filter(|r| r.invariant == "AC8-append-only")
+        .all(|r| r.passed);
+    assert!(
+        append_only_all_pass,
+        "InflatingContract must NOT also fail AC8-append-only — \
+         the isolation must be: only never-inflate is the targeted failure. \
+         Turn-dropping is a separate broken impl (TurnDroppingContract)."
+    );
+    let logged_all_pass = report
+        .results
+        .iter()
+        .filter(|r| r.invariant == "AC13-logged-never-silent")
+        .all(|r| r.passed);
+    assert!(
+        logged_all_pass,
+        "InflatingContract must NOT also fail AC13-logged-never-silent — \
+         it correctly reports `modified` in its decision record."
+    );
 }
 
 /// Verify that `TurnDroppingContract` fails the append-only invariant.
+///
+/// AC18 isolation: must fail `AC8-append-only` because it drops the last message.
+/// `AC4-never-inflate` must PASS (dropping a turn produces fewer bytes, not more).
+/// `AC13-logged-never-silent` must PASS (the record correctly says `modified`).
 pub fn assert_turn_dropping_fails_append_only(request_id: &str) {
     use super::run_conformance_suite;
     let report = run_conformance_suite(&TurnDroppingContract, request_id);
@@ -421,9 +458,42 @@ pub fn assert_turn_dropping_fails_append_only(request_id: &str) {
         append_only_results.iter().any(|r| !r.passed),
         "TurnDroppingContract must fail AC8-append-only, but all passed"
     );
+    // AC18 isolation: never-inflate must NOT also fail (dropping bytes ≤ input).
+    let never_inflate_all_pass = report
+        .results
+        .iter()
+        .filter(|r| r.invariant == "AC4-never-inflate")
+        .all(|r| r.passed);
+    assert!(
+        never_inflate_all_pass,
+        "TurnDroppingContract must NOT also fail AC4-never-inflate — \
+         dropping a turn shrinks bytes. InflatingContract is the never-inflate broken impl."
+    );
+    // AC18 isolation: logged-never-silent must NOT also fail (the record says modified).
+    let logged_all_pass = report
+        .results
+        .iter()
+        .filter(|r| r.invariant == "AC13-logged-never-silent")
+        .all(|r| r.passed);
+    assert!(
+        logged_all_pass,
+        "TurnDroppingContract must NOT also fail AC13-logged-never-silent — \
+         it correctly reports `modified` in its decision record."
+    );
 }
 
 /// Verify that `UnloggedModifyingContract` fails the logged-never-silent invariant.
+///
+/// AC18 isolation: must fail `AC13-logged-never-silent` because it claims
+/// passthrough while actually changing bytes. `AC4-never-inflate` must PASS
+/// because the modified byte is the same length (wrapping_add doesn't change len).
+///
+/// Note: `AC8-append-only` may ALSO fail as a side-effect — corrupting the first
+/// byte of the JSON output makes `count_turns(output)` return `None` (unparseable
+/// JSON), so the turn-count invariant triggers. This is a cascade effect from the
+/// byte corruption, not a separate invariant violation. The targeted invariant is
+/// AC13 (mislabeled decision record), and the AC18 isolation focuses on confirming
+/// that AC4 (never-inflate) does NOT fail — the cascade on AC8 is expected here.
 pub fn assert_unlogged_fails_logged_never_silent(request_id: &str) {
     use super::run_conformance_suite;
     let report = run_conformance_suite(&UnloggedModifyingContract, request_id);
@@ -440,6 +510,23 @@ pub fn assert_unlogged_fails_logged_never_silent(request_id: &str) {
         logged_results.iter().any(|r| !r.passed),
         "UnloggedModifyingContract must fail AC13-logged-never-silent, but all passed"
     );
+    // AC18 isolation: never-inflate must NOT also fail (single-byte in-place change
+    // keeps length identical to input).
+    let never_inflate_all_pass = report
+        .results
+        .iter()
+        .filter(|r| r.invariant == "AC4-never-inflate")
+        .all(|r| r.passed);
+    assert!(
+        never_inflate_all_pass,
+        "UnloggedModifyingContract must NOT also fail AC4-never-inflate — \
+         it changes a byte in-place (same length). InflatingContract is the never-inflate broken impl."
+    );
+    // AC18 isolation: AC8-append-only may cascade-fail due to JSON corruption
+    // (first-byte XOR makes the output unparseable). That is acceptable — the
+    // targeted violation is AC13, and AC4 isolation (above) is the primary gate.
+    // We do NOT assert AC8 here because cascade is expected behavior for a
+    // component that corrupts the first byte of JSON.
 }
 
 /// Verify that `MarkerDroppingContract` fails the marker-immutability extension
@@ -493,6 +580,16 @@ pub fn assert_noncanonical_tools_fails_invariant_6() {
 /// Without this test, removing or breaking `check_sacrosanct_redaction` in `mod.rs`
 /// would leave no failing test. With this test, any regression in the AC12 gate causes
 /// an immediate failure here (PF-005: each AC must be observable/testable).
+/// Verify that `SacrosanctLeakingContract` is caught by the conformance harness.
+///
+/// AC18 isolation: must fail `AC12-sacrosanct-redaction` because it embeds
+/// `ANTHROPIC_API_KEY` verbatim as the `request_id`. `AC4-never-inflate` and
+/// `AC8-append-only` must PASS (bytes are passthrough, turns are unchanged).
+///
+/// Additionally verifies that `AC12-request-id-preserved` ALSO fails for this
+/// component — because `SacrosanctLeakingContract` ignores the caller-supplied
+/// `request_id` and substitutes the leaked key name, the harness's request_id
+/// will not be found in the record.
 pub fn assert_sacrosanct_leaking_detected(request_id: &str) {
     use super::run_conformance_suite;
 
@@ -515,6 +612,29 @@ pub fn assert_sacrosanct_leaking_detected(request_id: &str) {
         "SacrosanctLeakingContract must fail AC12-sacrosanct-redaction \
          (its decision record request_id contains a SENSITIVE_EXACT key name), \
          but all checks passed — the AC12 gate is not observing the violation"
+    );
+
+    // AC18 isolation: never-inflate and append-only must NOT also fail
+    // (output bytes are passthrough; messages array is untouched).
+    let never_inflate_all_pass = report
+        .results
+        .iter()
+        .filter(|r| r.invariant == "AC4-never-inflate")
+        .all(|r| r.passed);
+    assert!(
+        never_inflate_all_pass,
+        "SacrosanctLeakingContract must NOT also fail AC4-never-inflate — \
+         it emits passthrough bytes. AC4 failure here indicates a different regression."
+    );
+    let append_only_all_pass = report
+        .results
+        .iter()
+        .filter(|r| r.invariant == "AC8-append-only")
+        .all(|r| r.passed);
+    assert!(
+        append_only_all_pass,
+        "SacrosanctLeakingContract must NOT also fail AC8-append-only — \
+         it does not modify the messages array."
     );
 }
 

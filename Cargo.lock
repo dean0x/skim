@@ -2445,6 +2445,7 @@ dependencies = [
 name = "rskim-contract"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "crossbeam-channel",
  "proptest",
  "serde",
