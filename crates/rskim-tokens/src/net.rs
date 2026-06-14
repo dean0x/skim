@@ -105,8 +105,8 @@ impl AnthropicNetworkCounter {
     /// request envelope overhead and is **not** comparable to bare-text offline
     /// counts.
     ///
-    /// Retries up to [`MAX_RETRIES`] times on transient failure. A fixed
-    /// per-request timeout of [`REQUEST_TIMEOUT`] is enforced.
+    /// Retries up to `MAX_RETRIES` (2) times on transient failure. A fixed
+    /// per-request timeout of `REQUEST_TIMEOUT` (10s) is enforced.
     ///
     /// # Errors
     ///

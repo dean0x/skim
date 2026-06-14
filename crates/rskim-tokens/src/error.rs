@@ -27,14 +27,6 @@ pub enum TokenError {
         source: anyhow::Error,
     },
 
-    /// Network counter is disabled — the `net-anthropic` feature is not enabled,
-    /// or the `ANTHROPIC_API_KEY` environment variable is missing.
-    #[error("network counter unavailable: {reason}")]
-    NetworkUnavailable {
-        /// Human-readable reason.
-        reason: &'static str,
-    },
-
     /// The `ANTHROPIC_API_KEY` environment variable is not set.
     #[error("ANTHROPIC_API_KEY is not set")]
     MissingApiKey,
