@@ -27,7 +27,11 @@ pub enum TokenError {
         source: anyhow::Error,
     },
 
-    /// The `ANTHROPIC_API_KEY` environment variable is not set.
+    /// The `ANTHROPIC_API_KEY` environment variable is not set or is empty.
+    ///
+    /// Only reachable when the `net-anthropic` feature is enabled — the key is
+    /// only checked when constructing [`crate::net::AnthropicNetworkCounter`].
+    #[cfg(feature = "net-anthropic")]
     #[error("ANTHROPIC_API_KEY is not set")]
     MissingApiKey,
 

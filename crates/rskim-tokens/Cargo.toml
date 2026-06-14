@@ -18,7 +18,7 @@ anyhow = { workspace = true }
 # Optional: synchronous HTTP client for network-backed Anthropic counter.
 # Only included when feature "net-anthropic" is enabled — never in the default build.
 [dependencies.ureq]
-version = "2"
+version = "2.8"
 optional = true
 features = ["rustls", "json"]
 default-features = false

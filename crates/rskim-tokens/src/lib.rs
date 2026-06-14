@@ -78,6 +78,10 @@ pub use counter::Counter;
 pub use encoding::{Encoding, encoding_for_model};
 pub use error::TokenError;
 
+/// Crate-level `Result` alias — mirrors the `rskim-core` / `rskim-search` workspace
+/// convention of exporting `pub type Result<T> = std::result::Result<T, <CrateError>>`.
+pub type Result<T> = std::result::Result<T, TokenError>;
+
 /// Convenience constructor: build a [`Counter`] for a model ID.
 ///
 /// Equivalent to `Counter::new(encoding_for_model(model_id))`.
@@ -97,6 +101,6 @@ pub use error::TokenError;
 /// assert!(n > 0);
 /// # Ok::<(), rskim_tokens::TokenError>(())
 /// ```
-pub fn counter_for_model(model_id: &str) -> Result<Counter, TokenError> {
+pub fn counter_for_model(model_id: &str) -> Result<Counter> {
     Counter::new(encoding_for_model(model_id))
 }

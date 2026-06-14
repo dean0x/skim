@@ -43,6 +43,25 @@ jobs:
       - name: Run cargo doc tests
         run: cargo test --doc
 
+      # AC12: run the 25ms latency test in --release mode so the real ceiling is
+      # enforced, not just the debug-build 2000ms sentinel. The test's own #[cfg]
+      # selects the 25ms branch only in non-debug (release) builds.
+      # Relates to: ADR-003 (grounded regression guards), PF-005 (testable ACs),
+      # PF-007 (gate on real exit status — set -o pipefail not needed for cargo test).
+      - name: AC12 latency gate (release build)
+        run: cargo test -p rskim-tokens --release --test integration ac12_100kb_latency_under_25ms
+
+      # AC12 criterion baseline comparison (ADR-003 relative regression guard).
+      # Compares the current run against the committed baseline in .bench-baselines/.
+      # Uses CRITERION_HOME to read from the tracked directory.
+      # Note: criterion 0.5 exits 0 regardless of regression detection; this step
+      # prints relative % change to the log for human visibility. The hard gate is
+      # the release-mode 25ms test above (which exits non-zero when exceeded).
+      - name: AC12 criterion benchmark (relative regression visibility)
+        env:
+          CRITERION_HOME: ${{ github.workspace }}/.bench-baselines
+        run: cargo bench -p rskim-tokens --bench token_count -- --baseline ci-baseline
+
   security-tests:
     name: Security Test Suites
     runs-on: ubuntu-latest

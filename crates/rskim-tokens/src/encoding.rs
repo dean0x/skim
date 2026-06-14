@@ -116,10 +116,12 @@ pub fn encoding_for_model(model_id: &str) -> Encoding {
 ///
 /// Never panics; always returns a valid encoding.
 fn family_prefix_fallback(model_id: &str) -> Encoding {
-    // OpenAI-family prefixes: unknown IDs resolve to o200k (newer-than-table assumption)
+    // OpenAI-family prefixes: unknown IDs resolve to o200k (newer-than-table assumption).
+    // Covered prefixes: gpt-*, o1*, o3*, o4*, chatgpt-* — matching the spec (OQ5).
+    // Note: o2 is intentionally absent — OpenAI ships no o2 model line and the
+    // spec does not enumerate it. Dropping it keeps code and doc in sync.
     if model_id.starts_with("gpt-")
         || model_id.starts_with("o1")
-        || model_id.starts_with("o2")
         || model_id.starts_with("o3")
         || model_id.starts_with("o4")
         || model_id.starts_with("chatgpt-")
