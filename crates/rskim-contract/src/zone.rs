@@ -120,26 +120,10 @@ pub fn splice_hot_zone(original: &[u8], range: ByteRange) -> Option<&[u8]> {
 /// - The structural view has no assistant turns (hot zone is empty)
 /// - The `"messages"` key cannot be located at byte level
 /// - Arithmetic overflows (PF-004 checked/saturating ops)
-pub fn locate_hot_zone_range(source: &[u8], view: &StructuralView) -> Option<ByteRange> {
-    let last_idx = view.zone.last_assistant_index?;
-    // The hot zone ends after element `last_idx` in the messages array.
-    // We use the structural view's turn values to reconstruct byte boundaries.
-    // For now, this is a placeholder returning the whole buffer as the hot zone
-    // when there are turns — the detailed byte-offset extraction is implemented
-    // in the harness tests via round-trip verification.
-    //
-    // The key invariant: hot-zone bytes are re-emitted from the original buffer,
-    // not from re-serialised serde_json::Value objects. This function locates
-    // the hot-zone range; `splice_hot_zone` does the actual slicing.
-    //
-    // Production implementations (rskim-llm / #302) will inject the precise
-    // byte offsets from their own typed model. This crate provides the splice
-    // mechanism and the invariant; the offset derivation is a per-consumer
-    // responsibility.
-    // acknowledged: full offset-derivation is a per-consumer responsibility (#302).
-    let _ = (last_idx, source);
-    // Return None: hot zone location is not implemented at this layer.
-    // Callers fall back to passthrough for hot-zone-touching operations.
+pub fn locate_hot_zone_range(_source: &[u8], _view: &StructuralView) -> Option<ByteRange> {
+    // Stub: always returns None until #302 provides the typed offset model.
+    // Callers fall back to passthrough, which is safe and correct at this layer.
+    // Precise byte-offset extraction is a per-consumer responsibility (#302).
     None
 }
 

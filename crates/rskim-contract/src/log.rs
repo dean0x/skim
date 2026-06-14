@@ -341,18 +341,21 @@ impl MockSink {
     /// Panics if the internal mutex is poisoned (only happens when a thread
     /// panicked while holding the lock — acceptable in test code).
     pub fn drain(&self) -> Vec<DecisionRecord> {
-        let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *guard)
+        std::mem::take(&mut *self.lock())
     }
 
     /// Return the number of records currently held.
     pub fn len(&self) -> usize {
-        self.records.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.lock().len()
     }
 
     /// Returns `true` if no records have been captured.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.lock().is_empty()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<DecisionRecord>> {
+        self.records.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -367,8 +370,7 @@ impl DecisionSink for MockSink {
         if self.full.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(SinkFull);
         }
-        let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
-        guard.push(record);
+        self.lock().push(record);
         Ok(())
     }
 }

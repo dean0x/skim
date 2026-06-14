@@ -147,21 +147,17 @@ pub fn run_conformance_suite_with_extensions(
     if let Some(registry) = extensions {
         for &corpus_input in corpus::ALL_CORPUS {
             let outcome = component.transform(corpus_input, request_id);
-            let ext_results = registry.run_all(corpus_input, &outcome.bytes);
-            for ext_result in ext_results {
-                results.push(InvariantResult {
-                    invariant: format!("ext:{}", ext_result.invariant_name),
-                    passed: ext_result.passed,
-                    detail: if ext_result.passed {
-                        None
-                    } else {
-                        Some(format!(
-                            "extension '{}' failed on corpus input ({} bytes)",
-                            ext_result.invariant_name,
-                            corpus_input.len()
-                        ))
-                    },
-                });
+            for ext_result in registry.run_all(corpus_input, &outcome.bytes) {
+                push_result(
+                    &mut results,
+                    &format!("ext:{}", ext_result.invariant_name),
+                    ext_result.passed,
+                    format!(
+                        "extension '{}' failed on corpus input ({} bytes)",
+                        ext_result.invariant_name,
+                        corpus_input.len()
+                    ),
+                );
             }
         }
     }
@@ -188,21 +184,18 @@ fn check_fail_open(component: &dyn Contract, request_id: &str, results: &mut Vec
         //
         // Asserting byte-identity mirrors the `check_hot_zone_splice_byte_identity`
         // passthrough branch (mod.rs) and eliminates the false-positive window.
-        let passthrough_check = outcome.bytes.as_slice() == corpus_input;
-        results.push(InvariantResult {
-            invariant: "AC3-fail-open".to_string(),
-            passed: passthrough_check,
-            detail: if passthrough_check {
-                None
-            } else {
-                Some(format!(
-                    "output ({} bytes) differs from input ({} bytes) on adversarial input — \
-                     fail-open requires byte-identical passthrough, not just no-inflate",
-                    outcome.bytes.len(),
-                    corpus_input.len()
-                ))
-            },
-        });
+        let passed = outcome.bytes.as_slice() == corpus_input;
+        push_result(
+            results,
+            "AC3-fail-open",
+            passed,
+            format!(
+                "output ({} bytes) differs from input ({} bytes) on adversarial input — \
+                 fail-open requires byte-identical passthrough, not just no-inflate",
+                outcome.bytes.len(),
+                corpus_input.len()
+            ),
+        );
     }
 }
 
@@ -215,19 +208,16 @@ fn check_never_inflate(
     for &corpus_input in corpus::ALL_CORPUS {
         let outcome = component.transform(corpus_input, request_id);
         let passed = outcome.bytes.len() <= corpus_input.len();
-        results.push(InvariantResult {
-            invariant: "AC4-never-inflate".to_string(),
+        push_result(
+            results,
+            "AC4-never-inflate",
             passed,
-            detail: if passed {
-                None
-            } else {
-                Some(format!(
-                    "output {} bytes > input {} bytes",
-                    outcome.bytes.len(),
-                    corpus_input.len()
-                ))
-            },
-        });
+            format!(
+                "output {} bytes > input {} bytes",
+                outcome.bytes.len(),
+                corpus_input.len()
+            ),
+        );
     }
 }
 
@@ -243,15 +233,7 @@ fn check_append_only(
     for &corpus_input in corpus::VALID_CORPUS {
         let outcome = component.transform(corpus_input, request_id);
         let passed = turn_count_invariant(corpus_input, &outcome.bytes);
-        results.push(InvariantResult {
-            invariant: "AC8-append-only".to_string(),
-            passed,
-            detail: if passed {
-                None
-            } else {
-                Some("turn count decreased in output".to_string())
-            },
-        });
+        push_result(results, "AC8-append-only", passed, "turn count decreased in output");
     }
 }
 
@@ -280,15 +262,12 @@ fn check_determinism(
         let second = component.transform(corpus_input, request_id);
         let third = component.transform(corpus_input, request_id);
         let passed = first.bytes == second.bytes && second.bytes == third.bytes;
-        results.push(InvariantResult {
-            invariant: "AC9-determinism".to_string(),
+        push_result(
+            results,
+            "AC9-determinism",
             passed,
-            detail: if passed {
-                None
-            } else {
-                Some("non-deterministic output across 3 sequential replays".to_string())
-            },
-        });
+            "non-deterministic output across 3 sequential replays",
+        );
     }
 
     // Pass 2: cross-thread determinism check.
@@ -325,15 +304,12 @@ fn check_cross_thread_determinism(
         handle.join().unwrap_or(false)
     });
 
-    results.push(InvariantResult {
-        invariant: "AC9-determinism-cross-thread".to_string(),
+    push_result(
+        results,
+        "AC9-determinism-cross-thread",
         passed,
-        detail: if passed {
-            None
-        } else {
-            Some("cross-thread output differed from single-thread output".to_string())
-        },
-    });
+        "cross-thread output differed from single-thread output",
+    );
 }
 
 /// AC13: Logged-never-silent — if output ≠ input, exactly one decision record
@@ -352,17 +328,14 @@ fn check_logged_never_silent(
         let record_says_modified = !outcome.decision.is_passthrough();
         // The record must accurately reflect the transformation type.
         let passed = is_modification == record_says_modified;
-        results.push(InvariantResult {
-            invariant: "AC13-logged-never-silent".to_string(),
+        push_result(
+            results,
+            "AC13-logged-never-silent",
             passed,
-            detail: if passed {
-                None
-            } else {
-                Some(format!(
-                    "bytes_changed={is_modification} but record_says_modified={record_says_modified}"
-                ))
-            },
-        });
+            format!(
+                "bytes_changed={is_modification} but record_says_modified={record_says_modified}"
+            ),
+        );
     }
 }
 
@@ -385,20 +358,35 @@ fn check_sink_full_passthrough(
     let outcome_1 = component.transform(input, request_id);
     let outcome_2 = component.transform(input, request_id);
     let passed = outcome_1.bytes == outcome_2.bytes;
-    results.push(InvariantResult {
-        invariant: "AC14-sink-full-passthrough".to_string(),
+    push_result(
+        results,
+        "AC14-sink-full-passthrough",
         passed,
-        detail: if passed {
-            None
-        } else {
-            Some("non-deterministic output implies state leakage".to_string())
-        },
-    });
+        "non-deterministic output implies state leakage",
+    );
 }
 
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Push a pass/fail invariant result. `failure_detail` is `None` on pass.
+fn push_result(
+    results: &mut Vec<InvariantResult>,
+    invariant: &str,
+    passed: bool,
+    failure_detail: impl Into<String>,
+) {
+    results.push(InvariantResult {
+        invariant: invariant.to_string(),
+        passed,
+        detail: if passed {
+            None
+        } else {
+            Some(failure_detail.into())
+        },
+    });
+}
 
 /// Verify that the turn count in output is ≥ turn count in input.
 fn turn_count_invariant(input: &[u8], output: &[u8]) -> bool {
@@ -446,32 +434,22 @@ fn check_hot_zone_splice_byte_identity(
     let hot_range = ByteRange { start: 0, end: 27 }; // "system_prompt|assistant_msg"
     let spliced = splice_hot_zone(test_buf, hot_range);
     let splice_works = spliced == Some(&test_buf[..27]);
-    results.push(InvariantResult {
-        invariant: "AC6-hot-zone-splice-byte-identity".to_string(),
-        passed: splice_works,
-        detail: if splice_works {
-            None
-        } else {
-            Some("splice_hot_zone did not produce byte-identical slice".to_string())
-        },
-    });
+    push_result(
+        results,
+        "AC6-hot-zone-splice-byte-identity",
+        splice_works,
+        "splice_hot_zone did not produce byte-identical slice",
+    );
 
     // Test 2: out-of-range offset returns None (fail-open, no panic — PF-004).
-    let out_of_range = ByteRange {
-        start: 1000,
-        end: 2000,
-    };
-    let splice_result = splice_hot_zone(test_buf, out_of_range);
-    let fail_open_works = splice_result.is_none();
-    results.push(InvariantResult {
-        invariant: "AC7-hot-zone-out-of-range-fail-open".to_string(),
-        passed: fail_open_works,
-        detail: if fail_open_works {
-            None
-        } else {
-            Some("splice_hot_zone did not return None for out-of-range offset".to_string())
-        },
-    });
+    let out_of_range = ByteRange { start: 1000, end: 2000 };
+    let fail_open_works = splice_hot_zone(test_buf, out_of_range).is_none();
+    push_result(
+        results,
+        "AC7-hot-zone-out-of-range-fail-open",
+        fail_open_works,
+        "splice_hot_zone did not return None for out-of-range offset",
+    );
 
     // Test 3: when locate_hot_zone_range returns None (current stub behavior),
     // a passthrough-only component still satisfies invariant 3 because all bytes
@@ -482,21 +460,13 @@ fn check_hot_zone_splice_byte_identity(
         // This means ALL bytes are byte-identical, including what would be the hot zone.
         // For a modification, we cannot assert hot-zone identity at this layer
         // (we don't have the byte offsets), so we accept both.
-        let passed = if outcome.is_passthrough() {
-            outcome.bytes.as_slice() == corpus_input
-        } else {
-            // Modification is allowed; hot-zone identity is verified per-consumer (#302).
-            true
-        };
-        results.push(InvariantResult {
-            invariant: "AC6-passthrough-byte-identity".to_string(),
+        let passed = !outcome.is_passthrough() || outcome.bytes.as_slice() == corpus_input;
+        push_result(
+            results,
+            "AC6-passthrough-byte-identity",
             passed,
-            detail: if passed {
-                None
-            } else {
-                Some("passthrough outcome bytes differ from input bytes".to_string())
-            },
-        });
+            "passthrough outcome bytes differ from input bytes",
+        );
     }
 }
 
@@ -542,32 +512,21 @@ fn check_sacrosanct_redaction(
     // and `request_id: &str` — it has no access to env vars. So the record cannot
     // contain env var values by construction. We verify the record is valid JSON
     // and does not contain the sensitive patterns as bare values.
-    let passed = !contains_sensitive_value_unredacted(&record_json);
-
-    results.push(InvariantResult {
-        invariant: "AC12-sacrosanct-redaction".to_string(),
-        passed,
-        detail: if passed {
-            None
-        } else {
-            Some("decision record JSON contains unredacted sensitive material".to_string())
-        },
-    });
+    push_result(
+        results,
+        "AC12-sacrosanct-redaction",
+        !contains_sensitive_value_unredacted(&record_json),
+        "decision record JSON contains unredacted sensitive material",
+    );
 
     // Additional check: request_id is preserved verbatim in the record (it's a
     // caller-assigned field, not sensitive). This verifies the record structure.
-    let request_id_in_record = record_json.contains(request_id);
-    results.push(InvariantResult {
-        invariant: "AC12-request-id-preserved".to_string(),
-        passed: request_id_in_record,
-        detail: if request_id_in_record {
-            None
-        } else {
-            Some(format!(
-                "request_id '{request_id}' not found in decision record JSON"
-            ))
-        },
-    });
+    push_result(
+        results,
+        "AC12-request-id-preserved",
+        record_json.contains(request_id),
+        format!("request_id '{request_id}' not found in decision record JSON"),
+    );
 
     // Verify with an input that contains a fake API key in the body.
     // The component must not echo the key material into its decision record.
@@ -576,18 +535,12 @@ fn check_sacrosanct_redaction(
     );
     let outcome2 = component.transform(body_with_fake_key.as_bytes(), request_id);
     let record2_json = outcome2.decision.to_json().unwrap_or_default();
-    // The decision record fields are: request_id, component, decision, bytes_in, bytes_out.
-    // None of these should contain the API key value.
-    let api_key_in_record = record2_json.contains(fake_key_value);
-    results.push(InvariantResult {
-        invariant: "AC12-api-key-not-in-record".to_string(),
-        passed: !api_key_in_record,
-        detail: if !api_key_in_record {
-            None
-        } else {
-            Some("API key material found in decision record JSON".to_string())
-        },
-    });
+    push_result(
+        results,
+        "AC12-api-key-not-in-record",
+        !record2_json.contains(fake_key_value),
+        "API key material found in decision record JSON",
+    );
 }
 
 /// AC3/AC17: Pathological / large inputs run through the transform.
@@ -617,20 +570,16 @@ fn check_pathological_inputs(
     ];
     for input in &large_inputs {
         let outcome = component.transform(input, request_id);
-        let passed = outcome.bytes.len() <= input.len();
-        results.push(InvariantResult {
-            invariant: "AC3-large-payload-never-inflate".to_string(),
-            passed,
-            detail: if passed {
-                None
-            } else {
-                Some(format!(
-                    "output {} bytes > input {} bytes on large payload",
-                    outcome.bytes.len(),
-                    input.len()
-                ))
-            },
-        });
+        push_result(
+            results,
+            "AC3-large-payload-never-inflate",
+            outcome.bytes.len() <= input.len(),
+            format!(
+                "output {} bytes > input {} bytes on large payload",
+                outcome.bytes.len(),
+                input.len()
+            ),
+        );
     }
 
     // (2) Nesting beyond MAX_ANALYSIS_DEPTH (AC17 pathological-nesting class).
@@ -638,16 +587,12 @@ fn check_pathological_inputs(
     // a hang. Reaching this assertion is itself the no-stack-overflow evidence.
     let deep = corpus::generate_deep_nesting(crate::request::MAX_ANALYSIS_DEPTH + 50);
     let outcome = component.transform(&deep, request_id);
-    let passed = outcome.bytes.len() <= deep.len();
-    results.push(InvariantResult {
-        invariant: "AC17-pathological-nesting-fail-open".to_string(),
-        passed,
-        detail: if passed {
-            None
-        } else {
-            Some("over-depth input did not resolve to fail-open passthrough".to_string())
-        },
-    });
+    push_result(
+        results,
+        "AC17-pathological-nesting-fail-open",
+        outcome.bytes.len() <= deep.len(),
+        "over-depth input did not resolve to fail-open passthrough",
+    );
 }
 
 /// Returns `true` if the JSON string contains any sensitive key name or suffix

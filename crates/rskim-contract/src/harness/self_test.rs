@@ -131,16 +131,13 @@ impl Contract for UnloggedModifyingContract {
 
     fn transform(&self, input: &[u8], request_id: &str) -> Outcome {
         // Modify the bytes but report passthrough in the decision record.
-        // This simulates a component that bypasses the sink-failure rule.
+        // This simulates a component that bypasses the logged-never-silent rule.
         if input.is_empty() {
             return Outcome::passthrough(vec![], request_id, self.component_name());
         }
         let mut output = input.to_vec();
-        // Replace last byte with itself (no-op in bytes, but we'll claim modification
-        // via a wrong passthrough record).
-        // Actually: to make bytes differ, we change one byte if possible.
         if output.len() > 1 {
-            output[0] = output[0].wrapping_add(1); // change first byte
+            output[0] = output[0].wrapping_add(1); // change first byte to make bytes differ
         }
         // Deliberately report passthrough even though bytes changed.
         Outcome {
