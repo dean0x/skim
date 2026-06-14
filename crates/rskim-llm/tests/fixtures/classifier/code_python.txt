@@ -1,0 +1,11 @@
+```python
+def classify_text(text: str) -> str:
+    if text.strip().startswith("```"):
+        return "code"
+    try:
+        json.loads(text.strip())
+        return "json"
+    except json.JSONDecodeError:
+        pass
+    return "text"
+```

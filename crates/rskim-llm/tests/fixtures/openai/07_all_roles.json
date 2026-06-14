@@ -1,0 +1,1 @@
+{"model":"gpt-4o","messages":[{"role":"system","content":"System prompt"},{"role":"developer","content":"Dev instructions"},{"role":"user","content":"User message"},{"role":"assistant","content":"Assistant response"},{"role":"tool","content":"Tool result","tool_call_id":"call_xyz"}]}

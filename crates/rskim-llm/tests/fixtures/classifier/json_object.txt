@@ -1,0 +1,1 @@
+{"status":"success","data":{"user_id":"usr_123","name":"Alice","email":"alice@example.com","created_at":"2024-01-15T10:30:00Z"},"meta":{"request_id":"req_abc","duration_ms":42}}

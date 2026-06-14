@@ -1,0 +1,9 @@
+Here is a script to automate the task:
+
+```python
+import subprocess
+result = subprocess.run(["cargo", "test"], capture_output=True)
+print(result.stdout.decode())
+```
+
+Run it with `python script.py`.

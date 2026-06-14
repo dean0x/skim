@@ -1,0 +1,15 @@
+Here are two examples. First, a simple function:
+
+```python
+def greet(name):
+    return f"Hello, {name}!"
+```
+
+And here is how to call it:
+
+```python
+result = greet("World")
+print(result)  # Hello, World!
+```
+
+Both snippets demonstrate basic Python syntax.

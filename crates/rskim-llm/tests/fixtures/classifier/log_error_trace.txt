@@ -1,0 +1,8 @@
+ERROR: Failed to process request: connection timeout
+WARN: Retrying operation (attempt 1/3)
+WARN: Retrying operation (attempt 2/3)
+ERROR: All retry attempts exhausted
+INFO: Rolling back transaction
+ERROR: Database connection lost
+INFO: Attempting reconnection
+INFO: Reconnection successful after 2.3s

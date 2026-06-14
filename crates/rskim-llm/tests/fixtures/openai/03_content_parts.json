@@ -1,0 +1,1 @@
+{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"text","text":"Describe this image:"},{"type":"image_url","image_url":{"url":"https://example.com/image.jpg"}}]}]}

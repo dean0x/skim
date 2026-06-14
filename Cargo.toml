@@ -6,6 +6,7 @@ members = [
     "crates/rskim-research",
     "crates/rskim-bench",
     "crates/rskim-tokens",
+    "crates/rskim-llm",
 ]
 resolver = "2"
 
