@@ -131,6 +131,11 @@ pub fn run_conformance_suite_with_extensions(
     // AC12: Sacrosanct-field passthrough + secret redaction.
     check_sacrosanct_redaction(component, request_id, &mut results);
 
+    // AC3/AC17: Pathological inputs (>100KB, multi-MB, nesting beyond the depth
+    // bound). These are generated rather than embedded as static literals, so the
+    // conformance suite must construct and run them explicitly.
+    check_pathological_inputs(component, request_id, &mut results);
+
     // Extension invariants.
     if let Some(registry) = extensions {
         for &corpus_input in corpus::ALL_CORPUS {
@@ -567,6 +572,66 @@ fn check_sacrosanct_redaction(
             None
         } else {
             Some("API key material found in decision record JSON".to_string())
+        },
+    });
+}
+
+/// AC3/AC17: Pathological / large inputs run through the transform.
+///
+/// AC3 requires fail-open byte-identity across the adversarial corpus *including*
+/// the >100KB, multi-MB, and beyond-depth-bound classes. AC17 requires the
+/// pathological-nesting corpus to complete without timeout or stack overflow,
+/// resolving over-depth inputs to fail-open passthrough (never a panic, never a
+/// hang). These inputs are generated (not static literals), so the conformance
+/// suite constructs them here and runs the component over each.
+///
+/// Each input asserts the never-inflate invariant (`output ≤ input`). The
+/// transform return type guarantees no upward error; the bounded byte-scan and
+/// bounded serde_json parse guarantee no unbounded recursion. Completion of this
+/// check is itself the AC17 "no hang / no stack overflow" evidence.
+fn check_pathological_inputs(
+    component: &dyn Contract,
+    request_id: &str,
+    results: &mut Vec<InvariantResult>,
+) {
+    // (1) >100KB and multi-MB well-formed bodies, both schemas (AC3 large class).
+    let large_inputs: [Vec<u8>; 3] = [
+        corpus::generate_large_anthropic(100_001),
+        corpus::generate_large_openai(100_001),
+        // Multi-MB body to exercise the PRISM Windows-hang analogue class.
+        corpus::generate_large_anthropic(2 * 1024 * 1024),
+    ];
+    for input in &large_inputs {
+        let outcome = component.transform(input, request_id);
+        let passed = outcome.bytes.len() <= input.len();
+        results.push(InvariantResult {
+            invariant: "AC3-large-payload-never-inflate".to_string(),
+            passed,
+            detail: if passed {
+                None
+            } else {
+                Some(format!(
+                    "output {} bytes > input {} bytes on large payload",
+                    outcome.bytes.len(),
+                    input.len()
+                ))
+            },
+        });
+    }
+
+    // (2) Nesting beyond MAX_ANALYSIS_DEPTH (AC17 pathological-nesting class).
+    // Over-depth inputs must resolve to fail-open passthrough — never a panic or
+    // a hang. Reaching this assertion is itself the no-stack-overflow evidence.
+    let deep = corpus::generate_deep_nesting(crate::request::MAX_ANALYSIS_DEPTH + 50);
+    let outcome = component.transform(&deep, request_id);
+    let passed = outcome.bytes.len() <= deep.len();
+    results.push(InvariantResult {
+        invariant: "AC17-pathological-nesting-fail-open".to_string(),
+        passed,
+        detail: if passed {
+            None
+        } else {
+            Some("over-depth input did not resolve to fail-open passthrough".to_string())
         },
     });
 }

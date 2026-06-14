@@ -15,15 +15,25 @@
 #
 # Note: `std::thread::sleep` is not banned because it does not affect output
 # bytes, only latency. However, it should never appear in the transform path.
+#
+# `allow-invalid = true` on the rand/getrandom entries: this crate intentionally
+# does NOT depend on rand/getrandom, so those paths are currently unresolvable.
+# Without `allow-invalid`, clippy emits a config-load warning for each unresolved
+# path (violating the zero-warnings policy). With `allow-invalid = true`, clippy
+# silently skips the entry WHILE THE PATH IS UNRESOLVABLE, and re-activates the
+# deny the moment the path becomes reachable (e.g., if a future change adds a
+# rand/getrandom dependency) — which is exactly the AC10 "deny the moment it is
+# introduced" semantics. The SystemTime/Instant entries resolve in std and need
+# no override (verified to trip the gate on a reachable call).
 disallowed-methods = [
     { path = "std::time::SystemTime::now", reason = "non-deterministic — forbidden in L3 transform path (invariant 5)" },
     { path = "std::time::Instant::now", reason = "non-deterministic — forbidden in L3 transform path (invariant 5)" },
     # rand / getrandom entry points (AC10 — "rand/getrandom entry points" denied at minimum).
     # These are listed unconditionally: clippy's disallowed-methods does not require the
     # crate to depend on the path, so the gate denies the call the moment it is introduced.
-    { path = "rand::random", reason = "non-deterministic entropy — forbidden in L3 transform path (invariant 5)" },
-    { path = "rand::thread_rng", reason = "non-deterministic entropy — forbidden in L3 transform path (invariant 5)" },
-    { path = "rand::rng", reason = "non-deterministic entropy — forbidden in L3 transform path (invariant 5)" },
-    { path = "getrandom::getrandom", reason = "OS entropy — forbidden in L3 transform path (invariant 5)" },
-    { path = "getrandom::fill", reason = "OS entropy — forbidden in L3 transform path (invariant 5)" },
+    { path = "rand::random", reason = "non-deterministic entropy — forbidden in L3 transform path (invariant 5)", allow-invalid = true },
+    { path = "rand::thread_rng", reason = "non-deterministic entropy — forbidden in L3 transform path (invariant 5)", allow-invalid = true },
+    { path = "rand::rng", reason = "non-deterministic entropy — forbidden in L3 transform path (invariant 5)", allow-invalid = true },
+    { path = "getrandom::getrandom", reason = "OS entropy — forbidden in L3 transform path (invariant 5)", allow-invalid = true },
+    { path = "getrandom::fill", reason = "OS entropy — forbidden in L3 transform path (invariant 5)", allow-invalid = true },
 ]
