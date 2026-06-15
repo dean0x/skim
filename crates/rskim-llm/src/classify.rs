@@ -195,13 +195,21 @@ fn try_classify_fenced(text: &str) -> Option<Classification> {
 /// Try to classify as a JSON value.
 ///
 /// Returns true if the trimmed text starts with `{` or `[` and parses as valid JSON.
+///
+/// Uses `serde::de::IgnoredAny` as the deserialization target so the parser
+/// validates structure without materializing a `serde_json::Value` tree.  This
+/// avoids the O(N) throwaway allocation that a full `Value` parse would produce
+/// for large JSON tool-result payloads on the classifier hot path (AC21 spirit:
+/// cheap default path).
 fn try_classify_json(text: &str) -> bool {
     let trimmed = text.trim();
     if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
         return false;
     }
-    // Attempt full parse — no partial JSON
-    serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
+    // `serde::de::IgnoredAny` drives the serde_json parser to validate the JSON
+    // structure without allocating a Value tree — the parse result (Ok/Err) is
+    // all we need.
+    serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_ok()
 }
 
 /// Try to classify as log output.

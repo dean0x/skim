@@ -133,6 +133,14 @@ fn parse_as(text: &str, provider: Provider) -> Result<ParsedBody> {
 ///
 /// Uses PF-004-safe arithmetic: depth is accumulated in `u32` with saturating
 /// addition to prevent overflow before the comparison.
+///
+/// # Structural validation dependency
+///
+/// This function does NOT validate JSON structure — it only counts nesting tokens.
+/// Unbalanced closers (e.g. a leading `}`) are absorbed by `saturating_sub` without
+/// error.  Structural validity is enforced by the `serde_json::from_str` call that
+/// immediately follows in `validate()`.  If that call were ever removed or reordered,
+/// structurally malformed bodies could pass the depth check silently.
 fn check_depth(text: &str) -> Result<()> {
     let mut depth: u32 = 0;
     let mut in_string = false;

@@ -12,7 +12,7 @@
     clippy::unwrap_in_result
 )]
 
-use rskim_llm::{Provider, parse, parse_with_provider, serialize};
+use rskim_llm::{ParsedBody, Provider, parse, parse_with_provider, serialize};
 use std::path::PathBuf;
 
 fn fixtures_dir() -> PathBuf {
@@ -102,10 +102,55 @@ fn ac3_adversarial_number_tokens() {
 
 #[test]
 fn ac3_unicode_escape_preservation() {
-    // \uXXXX escapes vs literal characters must survive.
-    // serde_json::Value would decode Hello to "Hello".
-    let input = r#"{"model":"m","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}"#;
-    assert_round_trip(input.as_bytes(), "unicode_escapes");
+    // Real \uXXXX escape tokens in JSON source must survive byte-identically.
+    // serde_json::Value would decode 世 -> 世 (literal UTF-8); the raw-bytes
+    // mechanism must preserve the original \uXXXX source tokens verbatim.
+    //
+    // The byte literal below contains literal backslash-u sequences (NOT literal UTF-8):
+    // 世界 is the JSON encoding of 世界 using 6-byte escape sequences.
+    let input = b"{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"\\u4e16\\u754c\"}],\"max_tokens\":100}";
+    // Verify the test input actually contains \uXXXX bytes (not UTF-8 codepoints)
+    assert!(
+        input.windows(2).any(|w| w == b"\\u"),
+        "test fixture must contain literal \\uXXXX escape sequences"
+    );
+    assert_round_trip(input, "unicode_escapes_real");
+}
+
+#[test]
+fn ac3_unicode_escape_mutation_preserves_surrounding_escapes() {
+    // Mutating one block in a body whose surrounding bytes contain \uXXXX escapes
+    // must not decode those escapes — byte-surgery must leave non-mutated regions
+    // byte-identical, including escape notation in adjacent string values.
+    use rskim_llm::{list_blocks, mutate_block};
+    let input = b"{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"\\u4e16\\u754c\"},{\"role\":\"assistant\",\"content\":\"REPLACE_ME\"}],\"max_tokens\":100}";
+    let mut body = parse(input).expect("parse failed");
+    let blocks = list_blocks(&body);
+    // Find the "REPLACE_ME" block (second message, plain string content)
+    let target = blocks.iter().find(|b| b.id == "m1").expect("m1 not found");
+    let bid = target.id.clone();
+    let result = mutate_block(&mut body, &bid, "NEW").expect("mutate failed");
+    // The 世界 escape in message 0 must survive unchanged
+    assert!(
+        result.windows(2).any(|w| w == b"\\u"),
+        "\\uXXXX escapes in unmutated messages must survive byte-surgery"
+    );
+    // The mutated message must contain NEW
+    assert!(result.windows(3).any(|w| w == b"NEW"));
+    // Re-parse must succeed and decode escapes correctly
+    let reparsed = parse(&result).expect("re-parse failed");
+    match &reparsed {
+        ParsedBody::Anthropic(b) => {
+            use rskim_llm::model::anthropic::AnthropicContent;
+            match &b.messages()[0].content {
+                AnthropicContent::Text(s) => {
+                    assert_eq!(s, "世界", "\\u4e16\\u754c must decode to 世界 on re-parse");
+                }
+                _ => panic!("expected string content in message 0"),
+            }
+        }
+        _ => panic!("expected Anthropic"),
+    }
 }
 
 #[test]

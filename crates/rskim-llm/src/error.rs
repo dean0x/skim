@@ -33,9 +33,13 @@ pub enum LlmError {
     ///
     /// See [`crate::MAX_DEPTH`] for the documented bound.
     ///
-    /// The error message value (64) must equal [`crate::MAX_DEPTH`]. If MAX_DEPTH
-    /// is ever changed, update the string here too (or use a const format string
-    /// when Rust stable stabilizes const string formatting).
+    /// # Maintenance note
+    ///
+    /// The literal `64` in the format string must equal [`crate::MAX_DEPTH`].
+    /// A unit test (`error_depth_exceeded_message_embeds_max_depth` in `tests/integration.rs`)
+    /// asserts `LlmError::DepthExceeded(MAX_DEPTH + 1).to_string()` contains the
+    /// `MAX_DEPTH` value as a string, so changing `MAX_DEPTH` without updating this
+    /// string will cause that test to fail rather than silently diverging.
     #[error("JSON nesting depth {0} exceeds maximum 64")]
     DepthExceeded(u32),
 

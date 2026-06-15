@@ -72,13 +72,24 @@ pub fn mutate_block(body: &mut ParsedBody, block_id: &str, new_text: &str) -> Re
 }
 
 fn mutate_anthropic(body: &mut AnthropicBody, block_id: &str, new_text: &str) -> Result<Vec<u8>> {
-    // First try to find the block among mutable leaves (fast path).
-    // If not found there, consult list_anthropic_blocks to distinguish
-    // BlockNotMutable (block exists but is exempt) from BlockNotFound (absent).
-    let leaf = match body.text_leaves().find(|l| l.id() == block_id) {
+    // Fast-path: scan mutable leaves without allocating a String per leaf.
+    // `walk_leaves` yields (LeafRef, text) pairs; we compare the candidate id
+    // lazily so the common (found) path produces exactly one String allocation
+    // (the winning id, via LeafRef::id()).
+    let mut found_leaf = None;
+    body.walk_leaves(|leaf_ref, _text| {
+        if found_leaf.is_none() && leaf_ref.id() == block_id {
+            found_leaf = Some(leaf_ref);
+        }
+    });
+
+    let leaf = match found_leaf {
         Some(l) => l,
         None => {
-            // Block not mutable — check whether it exists at all.
+            // Block not in mutable set — check whether it exists at all (as an
+            // exempt block) to distinguish BlockNotMutable from BlockNotFound.
+            // We do a single pass over list_anthropic_blocks rather than a second
+            // walk_leaves pass, because exempt blocks are not visited by walk_leaves.
             let descriptor = list_anthropic_blocks(body)
                 .into_iter()
                 .find(|d| d.id == block_id);
@@ -103,6 +114,7 @@ fn mutate_anthropic(body: &mut AnthropicBody, block_id: &str, new_text: &str) ->
 
     // Update the typed field so that the in-memory model stays consistent with
     // the new raw bytes.  This is needed for repeat-mutation idempotency (AC9d).
+    // Subsequent `walk_leaves` calls will see the new value.
     apply_leaf_mutation(body, &leaf, new_text)?;
 
     // Replace raw_bytes with the spliced result.  Subsequent serialize() calls
@@ -219,70 +231,74 @@ pub fn list_blocks(body: &ParsedBody) -> Vec<BlockDescriptor> {
     }
 }
 
+/// Build a descriptor list for all leaves in the body (mutable and exempt).
+///
+/// Derived from [`AnthropicBody::walk_leaves`] for mutable entries plus a single
+/// supplementary pass for exempt blocks (ToolUse, Thinking, Unknown, non-text
+/// ToolResultLeaf).  This is the single source of truth for the descriptor view.
 fn list_anthropic_blocks(body: &AnthropicBody) -> Vec<BlockDescriptor> {
-    let mut out = Vec::new();
+    // Phase 1: collect all mutable leaves via the canonical walk (no duplicate
+    // traversal logic — the kind mapping lives here rather than in the walk).
+    let mut out: Vec<BlockDescriptor> = Vec::new();
+    body.walk_leaves(|leaf_ref, _text| {
+        let kind = match &leaf_ref {
+            crate::model::anthropic::LeafRef::MessageString { .. } => "message-string",
+            crate::model::anthropic::LeafRef::TextBlock { .. } => "text",
+            crate::model::anthropic::LeafRef::ToolResultString { .. } => "tool_result-string",
+            crate::model::anthropic::LeafRef::ToolResultLeaf { .. } => "tool_result-leaf-text",
+        };
+        out.push(BlockDescriptor {
+            id: leaf_ref.id(),
+            mutable: true,
+            kind: kind.to_string(),
+        });
+    });
 
+    // Phase 2: supplement with exempt (non-mutable) block positions.
+    // These are not visited by walk_leaves, so we enumerate them here.
     for (mi, msg) in body.messages.iter().enumerate() {
-        match &msg.content {
-            AnthropicContent::Text(_) => {
-                out.push(BlockDescriptor {
-                    id: format!("m{mi}"),
-                    mutable: true,
-                    kind: "message-string".to_string(),
-                });
-            }
-            AnthropicContent::Blocks(blocks) => {
-                for (bi, block) in blocks.iter().enumerate() {
-                    match block {
-                        AnthropicBlock::Text(_) => {
-                            out.push(BlockDescriptor {
-                                id: format!("m{mi}b{bi}"),
-                                mutable: true,
-                                kind: "text".to_string(),
-                            });
-                        }
-                        AnthropicBlock::ToolUse(_) => {
-                            out.push(BlockDescriptor {
-                                id: format!("m{mi}b{bi}"),
-                                mutable: false,
-                                kind: "tool_use".to_string(),
-                            });
-                        }
-                        AnthropicBlock::ToolResult(tr) => match &tr.content {
-                            None => {}
-                            Some(ToolResultContent::Text(_)) => {
-                                out.push(BlockDescriptor {
-                                    id: format!("m{mi}b{bi}s"),
-                                    mutable: true,
-                                    kind: "tool_result-string".to_string(),
-                                });
-                            }
-                            Some(ToolResultContent::Blocks(leaves)) => {
-                                for (li, leaf) in leaves.iter().enumerate() {
-                                    let is_text = leaf.block_type == "text" && leaf.text.is_some();
+        if let AnthropicContent::Blocks(blocks) = &msg.content {
+            for (bi, block) in blocks.iter().enumerate() {
+                match block {
+                    AnthropicBlock::ToolUse(_) => {
+                        out.push(BlockDescriptor {
+                            id: format!("m{mi}b{bi}"),
+                            mutable: false,
+                            kind: "tool_use".to_string(),
+                        });
+                    }
+                    AnthropicBlock::Thinking(_) => {
+                        out.push(BlockDescriptor {
+                            id: format!("m{mi}b{bi}"),
+                            mutable: false,
+                            kind: "thinking".to_string(),
+                        });
+                    }
+                    AnthropicBlock::Unknown(_) => {
+                        out.push(BlockDescriptor {
+                            id: format!("m{mi}b{bi}"),
+                            mutable: false,
+                            kind: "unknown".to_string(),
+                        });
+                    }
+                    AnthropicBlock::ToolResult(tr) => {
+                        // Non-text (e.g. image) leaves inside a tool_result block array
+                        // are exempt.  Text leaves were already added in Phase 1;
+                        // the None / Text(string) content cases were also covered.
+                        if let Some(ToolResultContent::Blocks(leaves)) = &tr.content {
+                            for (li, leaf) in leaves.iter().enumerate() {
+                                if !(leaf.block_type == "text" && leaf.text.is_some()) {
                                     out.push(BlockDescriptor {
                                         id: format!("m{mi}b{bi}l{li}"),
-                                        mutable: is_text,
+                                        mutable: false,
                                         kind: format!("tool_result-leaf-{}", leaf.block_type),
                                     });
                                 }
                             }
-                        },
-                        AnthropicBlock::Thinking(_) => {
-                            out.push(BlockDescriptor {
-                                id: format!("m{mi}b{bi}"),
-                                mutable: false,
-                                kind: "thinking".to_string(),
-                            });
-                        }
-                        AnthropicBlock::Unknown(_) => {
-                            out.push(BlockDescriptor {
-                                id: format!("m{mi}b{bi}"),
-                                mutable: false,
-                                kind: "unknown".to_string(),
-                            });
                         }
                     }
+                    // Text and MessageString are mutable — handled in Phase 1.
+                    _ => {}
                 }
             }
         }

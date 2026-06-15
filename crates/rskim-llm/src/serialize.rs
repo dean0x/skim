@@ -52,6 +52,12 @@ pub fn serialize(body: &ParsedBody) -> Result<Vec<u8>> {
         ParsedBody::OpenAi(b) => &b.raw_bytes,
     };
     if !raw.is_empty() {
+        // Clone is unavoidable here: `serialize` returns owned bytes (callers may
+        // modify the buffer), and the signature `-> Result<Vec<u8>>` requires
+        // ownership transfer.  An `Arc<[u8]>`-backed body or a
+        // `serialize_borrowed() -> &[u8]` accessor could eliminate the copy for
+        // callers that only need a borrow; that is a future API option if
+        // `serialize` is called repeatedly on large bodies in a hot path (#309).
         return Ok(raw.clone());
     }
 

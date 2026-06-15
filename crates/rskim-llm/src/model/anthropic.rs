@@ -482,56 +482,89 @@ pub struct AnthropicTool {
     pub extra_fields: serde_json::Map<String, serde_json::Value>,
 }
 
-// Implement a helper for enumerating addressable leaf blocks from an Anthropic body.
-// This is used by the mutation API to find blocks by composite ID.
+// ---------------------------------------------------------------------------
+// Canonical single-pass tree-walk
+// ---------------------------------------------------------------------------
+//
+// The Anthropic message→content→block→leaf tree has one canonical traversal
+// shared by classification, mutation, and descriptor enumeration.  All three
+// consumers derive from `walk_leaves` below; a future schema change (new mutable
+// block type, or a change to the ID scheme) requires only one edit here rather
+// than synchronized edits across three sites.
+//
+// Walk semantics:
+//   - Every position that carries a mutable text payload is visited exactly once.
+//   - Exempt positions (ToolUse, Thinking, Unknown, non-text ToolResultLeaf) are
+//     NOT visited — callers that need them (e.g. list_anthropic_blocks) extend
+//     the walk independently at their level.
+//   - The visitor `f` receives `(LeafRef, text, is_text_block_type)` where the
+//     third argument is `true` only for `ToolResultLeaf` entries whose
+//     `block_type == "text"` (already guaranteed by the walk predicate).
+
 impl AnthropicBody {
-    /// Iterate over all addressable leaf text positions in the body.
+    /// Single-pass walk over all mutable text leaves.
     ///
-    /// Returns `(message_index, block_index, leaf_index_or_none)` tuples for every
-    /// mutable text position. Used internally by the mutation API.
-    pub(crate) fn text_leaves(&self) -> impl Iterator<Item = LeafRef> {
-        let mut leaves = Vec::new();
+    /// The closure `f` is called once per mutable leaf with `(leaf_ref, text_value)`.
+    /// Exempt positions (tool_use, thinking, unknown, non-text tool_result leaves)
+    /// are skipped — only positions reachable via [`LeafRef`] are visited.
+    ///
+    /// This is the single source of truth for the message→content→block→leaf
+    /// traversal.  [`anthropic_leaf_texts`] and `list_anthropic_blocks` derive
+    /// from this walk.  `mutate_anthropic` calls it directly for the mutable-leaf
+    /// search.
+    pub(crate) fn walk_leaves<'a>(&'a self, mut f: impl FnMut(LeafRef, &'a str)) {
         for (mi, msg) in self.messages.iter().enumerate() {
             match &msg.content {
-                AnthropicContent::Text(_) => {
-                    leaves.push(LeafRef::MessageString { msg_idx: mi });
+                AnthropicContent::Text(s) => {
+                    f(LeafRef::MessageString { msg_idx: mi }, s.as_str());
                 }
                 AnthropicContent::Blocks(blocks) => {
                     for (bi, block) in blocks.iter().enumerate() {
                         match block {
-                            AnthropicBlock::Text(_) => {
-                                leaves.push(LeafRef::TextBlock {
-                                    msg_idx: mi,
-                                    blk_idx: bi,
-                                });
-                            }
-                            AnthropicBlock::ToolResult(tr) => match &tr.content {
-                                Some(ToolResultContent::Text(_)) => {
-                                    leaves.push(LeafRef::ToolResultString {
+                            AnthropicBlock::Text(tb) => {
+                                f(
+                                    LeafRef::TextBlock {
                                         msg_idx: mi,
                                         blk_idx: bi,
-                                    });
+                                    },
+                                    tb.text.as_str(),
+                                );
+                            }
+                            AnthropicBlock::ToolResult(tr) => match &tr.content {
+                                Some(ToolResultContent::Text(s)) => {
+                                    f(
+                                        LeafRef::ToolResultString {
+                                            msg_idx: mi,
+                                            blk_idx: bi,
+                                        },
+                                        s.as_str(),
+                                    );
                                 }
                                 Some(ToolResultContent::Blocks(leaves_arr)) => {
                                     for (li, leaf) in leaves_arr.iter().enumerate() {
-                                        if leaf.block_type == "text" && leaf.text.is_some() {
-                                            leaves.push(LeafRef::ToolResultLeaf {
-                                                msg_idx: mi,
-                                                blk_idx: bi,
-                                                leaf_idx: li,
-                                            });
+                                        if leaf.block_type == "text"
+                                            && let Some(s) = leaf.text.as_deref()
+                                        {
+                                            f(
+                                                LeafRef::ToolResultLeaf {
+                                                    msg_idx: mi,
+                                                    blk_idx: bi,
+                                                    leaf_idx: li,
+                                                },
+                                                s,
+                                            );
                                         }
                                     }
                                 }
                                 None => {}
                             },
+                            // Exempt: ToolUse, Thinking, Unknown — not visited
                             _ => {}
                         }
                     }
                 }
             }
         }
-        leaves.into_iter()
     }
 }
 
@@ -555,7 +588,17 @@ pub(crate) enum LeafRef {
 impl LeafRef {
     /// Encode this reference as a composite block ID string.
     ///
-    /// Format: `"m{msg_idx}b{blk_idx}"` or `"m{msg_idx}b{blk_idx}l{leaf_idx}"`.
+    /// Four formats are used, one per leaf kind:
+    ///
+    /// | Variant | Format |
+    /// |---------|--------|
+    /// | `MessageString` | `"m{msg_idx}"` |
+    /// | `TextBlock` | `"m{msg_idx}b{blk_idx}"` |
+    /// | `ToolResultString` | `"m{msg_idx}b{blk_idx}s"` |
+    /// | `ToolResultLeaf` | `"m{msg_idx}b{blk_idx}l{leaf_idx}"` |
+    ///
+    /// These are the only ID formats produced by [`anthropic_leaf_texts`] and
+    /// `list_anthropic_blocks` (both derived from [`AnthropicBody::walk_leaves`]).
     pub fn id(&self) -> String {
         match self {
             LeafRef::MessageString { msg_idx } => format!("m{msg_idx}"),
@@ -576,41 +619,13 @@ impl LeafRef {
 
 /// Enumerate `(block_id, text)` pairs for all mutable text leaves in a body.
 ///
-/// Single-pass walk used by the classifier. Only mutable text leaves are included;
-/// exempt blocks (tool_use, thinking, etc.) are skipped.
+/// Derived from [`AnthropicBody::walk_leaves`] — single source of truth for the
+/// tree traversal.  Only mutable text leaves are included; exempt blocks
+/// (tool_use, thinking, etc.) are skipped.
 pub(crate) fn anthropic_leaf_texts(body: &AnthropicBody) -> Vec<(String, &str)> {
     let mut out = Vec::new();
-    for (mi, msg) in body.messages.iter().enumerate() {
-        match &msg.content {
-            AnthropicContent::Text(s) => {
-                out.push((format!("m{mi}"), s.as_str()));
-            }
-            AnthropicContent::Blocks(blocks) => {
-                for (bi, block) in blocks.iter().enumerate() {
-                    match block {
-                        AnthropicBlock::Text(tb) => {
-                            out.push((format!("m{mi}b{bi}"), tb.text.as_str()));
-                        }
-                        AnthropicBlock::ToolResult(tr) => match &tr.content {
-                            Some(ToolResultContent::Text(s)) => {
-                                out.push((format!("m{mi}b{bi}s"), s.as_str()));
-                            }
-                            Some(ToolResultContent::Blocks(leaves)) => {
-                                for (li, leaf) in leaves.iter().enumerate() {
-                                    if leaf.block_type == "text"
-                                        && let Some(s) = leaf.text.as_deref()
-                                    {
-                                        out.push((format!("m{mi}b{bi}l{li}"), s));
-                                    }
-                                }
-                            }
-                            None => {}
-                        },
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
+    body.walk_leaves(|leaf_ref, text| {
+        out.push((leaf_ref.id(), text));
+    });
     out
 }

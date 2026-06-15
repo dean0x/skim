@@ -448,27 +448,32 @@ fn ac10_only_differences_lie_within_replaced_span() {
 
 #[test]
 fn ac11_no_mutation_api_through_public_fields() {
-    // Compile-time proof that structural mutation is not reachable through the
-    // public API: this test asserts that calling read-only accessor methods does
-    // NOT return a mutable reference, and that no public API surface exposes
-    // messages.push / messages.remove / model assignment.
+    // Documents the read-only public API contract for AnthropicBody.
     //
-    // The actual type-level enforcement is performed by the Rust compiler
-    // (private fields + no `&mut` accessor = no mutation possible).  This test
-    // documents and exercises the read-only contract so that a future regression
-    // (accidentally making a field pub) would surface as a compile error in the
-    // test file rather than silently at runtime.
+    // The AC11 no-turn-manipulation invariant is enforced at compile time by the
+    // Rust type system: `model`, `messages`, and `extra_fields` are `pub(crate)`,
+    // and no `&mut` accessors are exposed.  No caller outside this crate can call
+    // `messages.push()`, assign `model`, or otherwise manipulate the envelope.
+    //
+    // What this test ACTUALLY verifies:
+    //   - The three read-only accessors (model(), messages(), extra_fields()) compile
+    //     and return the expected types and values.
+    //   - The no-mutation invariant is described accurately so reviewers understand
+    //     where the guarantee comes from (rustc, not this runtime assertion).
+    //
+    // What this test does NOT verify:
+    //   - It does NOT attempt an assignment to a `pub` field (that would be a
+    //     compile-error in a trybuild/compile-fail test, not a runtime test).
+    //   - If a field were accidentally made `pub`, this test would still compile and
+    //     pass — the compiler's privacy rules remain the primary enforcement.
     let input = br#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}"#;
     let body = parse(input).expect("parse failed");
     match &body {
         ParsedBody::Anthropic(b) => {
-            // These are the ONLY read paths available — no &mut is returned.
+            // These are the ONLY public read paths — no &mut is returned.
             let _model: &str = b.model();
             let _msgs: &[_] = b.messages();
             let _extra: &serde_json::Map<_, _> = b.extra_fields();
-            // Cannot call b.messages_mut() — no such method exists.
-            // Cannot do b.model = "other" — field is pub(crate).
-            // This test passes if and only if those invariants hold at compile time.
             assert_eq!(_model, "claude-3-5-sonnet-20241022");
             assert_eq!(_msgs.len(), 1);
         }
@@ -535,21 +540,44 @@ fn mutation_with_json_escaped_replacement() {
     );
 }
 
-// Property test: message count and order invariant through parse->classify->mutate->serialize.
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(20))]
+// ---------------------------------------------------------------------------
+// AC11 property tests: message count AND order invariance through mutation
+// ---------------------------------------------------------------------------
 
+// Helper to extract role sequence from a parsed body.
+fn roles_of(body: &ParsedBody) -> Vec<String> {
+    match body {
+        ParsedBody::Anthropic(b) => b.messages().iter().map(|m| m.role.clone()).collect(),
+        _ => vec![],
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// AC11 property test: message COUNT is invariant through parse→mutate→serialize.
+    ///
+    /// Generates multi-turn conversations with mixed block types (string content,
+    /// text blocks, tool_result blocks) and verifies that `mutate_block` never
+    /// changes the number of messages.
     #[test]
     fn ac11_proptest_message_count_invariant(
         // Number of messages: 1 to 5
         n_messages in 1usize..=5,
         // Replacement text for the first mutable block
         replacement in "[A-Za-z0-9 ]{1,50}",
+        // Body shape: 0=string, 1=text block, 2=tool_result
+        shape in 0u8..3,
     ) {
         let mut messages = Vec::new();
         for i in 0..n_messages {
+            let content = match shape {
+                0 => format!(r#""Message {i}""#),
+                1 => format!(r#"[{{"type":"text","text":"Message {i}"}}]"#),
+                _ => format!(r#"[{{"type":"tool_result","tool_use_id":"c{i}","content":"Result {i}"}}]"#),
+            };
             messages.push(format!(
-                r#"{{"role":"user","content":"Message {i}"}}"#,
+                r#"{{"role":"user","content":{content}}}"#,
             ));
         }
         let body_str = format!(
@@ -562,19 +590,27 @@ proptest! {
             ParsedBody::Anthropic(b) => b.messages().len(),
             _ => return Ok(()),
         };
+        let initial_roles = roles_of(&body);
 
         // Mutate the first mutable block
         let blocks = list_blocks(&body);
         if let Some(mutable) = blocks.iter().find(|b| b.mutable) {
             let block_id = mutable.id.clone();
-            let result = mutate_block(&mut body, &block_id, &replacement);
-            if let Ok(result) = result {
+            if let Ok(result) = mutate_block(&mut body, &block_id, &replacement) {
                 let reparsed = parse(&result).expect("re-parse failed");
                 let count_after = match &reparsed {
                     ParsedBody::Anthropic(b) => b.messages().len(),
                     _ => return Ok(()),
                 };
-                prop_assert_eq!(initial_count, count_after, "message count must be invariant");
+                prop_assert_eq!(initial_count, count_after, "message count must be invariant through mutation");
+
+                // AC11: role ORDER must also be invariant post-mutation
+                let roles_after = roles_of(&reparsed);
+                prop_assert_eq!(
+                    initial_roles,
+                    roles_after,
+                    "role sequence must be invariant through mutation (AC11 order invariance)"
+                );
             }
         }
     }

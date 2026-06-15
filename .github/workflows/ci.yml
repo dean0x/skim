@@ -167,21 +167,18 @@ jobs:
         run: cargo +nightly install cargo-fuzz --locked
 
       # AC15: bounded 60s cargo-fuzz smoke run, gated on real process exit status
-      # (PF-007: set -o pipefail, explicit exit-code check — NOT a piped tail).
+      # (PF-007: set -euo pipefail — the fuzz command runs as the last statement so
+      # `set -e` gates on its real exit status directly without the $?-capture race).
       # The -timeout=5 flag enforces the per-input 5s hang bound.
       # Scope note: cross-OS fuzz matrix belongs to #323; this job is the AC15
       # per-#302 deliverable (Linux-only smoke, nightly-pinned to this job only).
       - name: AC15 fuzz smoke (parse_fuzz, 60s)
         run: |
-          set -o pipefail
+          set -euo pipefail
           cd crates/rskim-llm
+          echo "Starting fuzz smoke run (60s max_total_time, 5s per-input timeout)..."
           cargo +nightly fuzz run parse_fuzz fuzz/corpus/parse_fuzz -- \
-            -max_total_time=60 -timeout=5 2>&1
-          FUZZ_EXIT=$?
-          if [ "$FUZZ_EXIT" -ne 0 ]; then
-            echo "FAIL: fuzz smoke run exited with status $FUZZ_EXIT"
-            exit "$FUZZ_EXIT"
-          fi
+            -max_total_time=60 -timeout=5
           echo "PASS: fuzz smoke run completed without crash or hang"
 
   build:

@@ -12,7 +12,7 @@
     clippy::unwrap_in_result
 )]
 
-use rskim_llm::{ParsedBody, Provider, parse, parse_with_provider};
+use rskim_llm::{LlmError, MAX_DEPTH, ParsedBody, Provider, parse, parse_with_provider};
 use std::path::PathBuf;
 
 fn fixtures_dir() -> PathBuf {
@@ -206,13 +206,22 @@ fn ac8_error_conditions() {
     let result = parse(b"{\"model\":\"claude-3\",\"messages\":\"not-array\"}");
     assert!(result.is_err(), "non-array messages should fail");
 
-    // Over-depth input
+    // Over-depth input — must return LlmError::DepthExceeded (not a generic Err)
     let depth = 66;
     let deep = "[".repeat(depth) + &"]".repeat(depth);
     let body =
         format!("{{\"model\":\"m\",\"messages\":[{{\"role\":\"user\",\"content\":{deep}}}]}}");
     let result = parse(body.as_bytes());
-    assert!(result.is_err(), "over-depth input should fail");
+    match result {
+        Err(LlmError::DepthExceeded(d)) => {
+            assert!(
+                d > MAX_DEPTH,
+                "DepthExceeded depth {d} must exceed MAX_DEPTH {MAX_DEPTH}"
+            );
+        }
+        Ok(_) => panic!("over-depth input should fail"),
+        Err(other) => panic!("expected LlmError::DepthExceeded, got: {other}"),
+    }
 
     // Invalid UTF-8
     let invalid_utf8 = b"\xff\xfe\x00\x01";
@@ -269,6 +278,23 @@ fn ac8_errors_have_non_empty_diagnostics() {
             "error message should not be empty for {label}"
         );
     }
+}
+
+/// Asserts that `LlmError::DepthExceeded` error message contains the literal
+/// `MAX_DEPTH` value as a string, converting the manual-sync comment in `error.rs`
+/// into an enforced invariant.  A change to `MAX_DEPTH` without updating the
+/// `#[error("...maximum 64...")]` format string will fail this test.
+#[test]
+fn error_depth_exceeded_message_embeds_max_depth() {
+    let err = LlmError::DepthExceeded(MAX_DEPTH + 1);
+    let msg = err.to_string();
+    let max_depth_str = MAX_DEPTH.to_string();
+    assert!(
+        msg.contains(&max_depth_str),
+        "DepthExceeded error message must contain the MAX_DEPTH value ({MAX_DEPTH}) \
+         as a string; got: {msg:?}\n\
+         If MAX_DEPTH was changed, update error.rs #[error(\"...maximum N\")] to match."
+    );
 }
 
 /// AC3 — Provider auto-detection via `parse()` (no explicit provider hint).
