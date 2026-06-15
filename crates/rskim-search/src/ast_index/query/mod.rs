@@ -2,7 +2,7 @@
 //!
 //! Answers named-pattern and containment queries with OR-union additive BM25
 //! ranking. Exposes a Wave-4 intersection hook (`search_ast`) and a
-//! Wave-3g [`SearchLayer`] adapter.
+//! Wave-3g [`SearchLayer`](crate::types::SearchLayer) adapter.
 //!
 //! # Wave 4 performance changes (#286)
 //!
@@ -25,10 +25,10 @@
 //!
 //! # Module structure (A1/CX2, #287)
 //!
-//! - [`parse`] — `AstQuery` enum, `parse_ast_query()`, and parsing helpers.
-//! - [`engine`] — `AstQueryEngine` and `SearchLayer` adapter.
-//! - [`scoring`] — `ScoringCtx`, BM25 helpers, IDF memoization, `LiteMeta`.
-//! - [`adapter`] — `AstPostingSource` trait and its `AstIndexReader` impl.
+//! - `parse` — `AstQuery` enum, `parse_ast_query()`, and parsing helpers.
+//! - `engine` — `AstQueryEngine` and `SearchLayer` adapter.
+//! - `scoring` — `ScoringCtx`, BM25 helpers, IDF memoization, `LiteMeta`.
+//! - `adapter` — `AstPostingSource` trait and its `AstIndexReader` impl.
 
 mod adapter;
 mod engine;
