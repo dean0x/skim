@@ -46,7 +46,11 @@ fn validate(text: &str) -> Result<serde_json::Map<String, serde_json::Value>> {
     match obj.get("messages") {
         None => return Err(LlmError::MissingMessages),
         Some(serde_json::Value::Array(_)) => {}
-        Some(other) => return Err(LlmError::MessagesNotArray(describe_value(other).to_string())),
+        Some(other) => {
+            return Err(LlmError::MessagesNotArray(
+                describe_value(other).to_string(),
+            ));
+        }
     }
     Ok(obj)
 }
