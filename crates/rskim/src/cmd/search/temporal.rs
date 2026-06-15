@@ -198,30 +198,27 @@ pub(super) fn resolve_blast_radius_paths(
         return Ok(None);
     };
 
-    match open_temporal_db(db_path) {
-        None => {
-            const MSG: &str = "no temporal data for --blast-radius — run 'skim search' on a git repo to auto-populate";
-            if json {
-                let envelope = serde_json::json!({ "warning": MSG });
-                eprintln!("{}", serde_json::to_string(&envelope)?);
-            } else {
-                eprintln!("skim search: {MSG}");
-            }
-            Ok(None)
+    let Some(db) = open_temporal_db(db_path) else {
+        const MSG: &str = "no temporal data for --blast-radius — run 'skim search' on a git repo to auto-populate";
+        if json {
+            let envelope = serde_json::json!({ "warning": MSG });
+            eprintln!("{}", serde_json::to_string(&envelope)?);
+        } else {
+            eprintln!("skim search: {MSG}");
         }
-        Some(db) => {
-            let normalized = normalize_blast_radius_path(raw_path, root)?;
-            let partners = db.cochanges_for_file(&normalized)?;
-            if partners.is_empty() {
-                eprintln!("skim search: no co-change data for {raw_path:?}");
-            }
-            let mut allowed_paths = cochange_partner_paths(&partners, &normalized);
-            // Include the target file itself so queries like `skim search auth --blast-radius src/auth.rs`
-            // surface matches within the target file in addition to its co-change partners.
-            allowed_paths.insert(normalized);
-            Ok(Some(allowed_paths))
-        }
+        return Ok(None);
+    };
+
+    let normalized = normalize_blast_radius_path(raw_path, root)?;
+    let partners = db.cochanges_for_file(&normalized)?;
+    if partners.is_empty() {
+        eprintln!("skim search: no co-change data for {raw_path:?}");
     }
+    let mut allowed_paths = cochange_partner_paths(&partners, &normalized);
+    // Include the target file itself so queries like `skim search auth --blast-radius src/auth.rs`
+    // surface matches within the target file in addition to its co-change partners.
+    allowed_paths.insert(normalized);
+    Ok(Some(allowed_paths))
 }
 
 /// Resolve a `--blast-radius` raw path to the set of matching `FileId`s.
@@ -652,6 +649,25 @@ struct BlastRadiusJson<'a> {
     results: Vec<CochangeJsonRow<'a>>,
 }
 
+/// Serialize a hotspot/coldspot row slice to JSON and write it.
+fn write_hotcold_json(mode: &str, rows: &[HotspotRow], w: &mut impl Write) -> anyhow::Result<()> {
+    let envelope = HotColdJson {
+        mode,
+        total: rows.len(),
+        results: rows
+            .iter()
+            .map(|r| HotspotJsonRow {
+                path: &r.file_path,
+                hotspot_score: r.score,
+                changes_30d: r.changes_30d,
+                changes_90d: r.changes_90d,
+            })
+            .collect(),
+    };
+    writeln!(w, "{}", serde_json::to_string_pretty(&envelope)?)?;
+    Ok(())
+}
+
 /// Format a standalone temporal query result as JSON.
 ///
 /// Uses `#[derive(Serialize)]` typed structs so field names are defined in one
@@ -662,38 +678,8 @@ pub(super) fn format_temporal_json(
     w: &mut impl Write,
 ) -> anyhow::Result<()> {
     match output {
-        TemporalQueryOutput::Hotspots(rows) => {
-            let envelope = HotColdJson {
-                mode: "hot",
-                total: rows.len(),
-                results: rows
-                    .iter()
-                    .map(|r| HotspotJsonRow {
-                        path: &r.file_path,
-                        hotspot_score: r.score,
-                        changes_30d: r.changes_30d,
-                        changes_90d: r.changes_90d,
-                    })
-                    .collect(),
-            };
-            writeln!(w, "{}", serde_json::to_string_pretty(&envelope)?)?;
-        }
-        TemporalQueryOutput::Coldspots(rows) => {
-            let envelope = HotColdJson {
-                mode: "cold",
-                total: rows.len(),
-                results: rows
-                    .iter()
-                    .map(|r| HotspotJsonRow {
-                        path: &r.file_path,
-                        hotspot_score: r.score,
-                        changes_30d: r.changes_30d,
-                        changes_90d: r.changes_90d,
-                    })
-                    .collect(),
-            };
-            writeln!(w, "{}", serde_json::to_string_pretty(&envelope)?)?;
-        }
+        TemporalQueryOutput::Hotspots(rows) => write_hotcold_json("hot", rows, w)?,
+        TemporalQueryOutput::Coldspots(rows) => write_hotcold_json("cold", rows, w)?,
         TemporalQueryOutput::Risks(rows) => {
             let envelope = RiskyJson {
                 mode: "risky",

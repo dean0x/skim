@@ -101,7 +101,7 @@ pub(super) fn build_cochange_rows(history: &HistoryResult) -> Vec<CochangeRow> {
         };
         let n_dedup = paths.len();
 
-        // Increment per-file counts — borrow the path string, no clone needed.
+        // Increment per-file counts.
         for p in &paths {
             *file_counts.entry(p.clone()).or_insert(0) += 1;
         }
@@ -245,10 +245,6 @@ pub(super) fn build_risk_rows(
 }
 
 // ============================================================================
-// Main entry point (D1 / D3 / D4 / D5)
-// ============================================================================
-
-// ============================================================================
 // Internal helper (D5 graceful-degradation pattern)
 // ============================================================================
 
@@ -268,6 +264,10 @@ macro_rules! warn_skip {
         return Ok(());
     }};
 }
+
+// ============================================================================
+// Main entry point (D1 / D3 / D4 / D5)
+// ============================================================================
 
 /// Rebuild the temporal database after a successful lexical+AST index build.
 ///
