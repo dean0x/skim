@@ -178,14 +178,9 @@ fn describe_value(v: &serde_json::Value) -> String {
         serde_json::Value::Number(n) => format!("number({n})"),
         serde_json::Value::String(s) => {
             if s.len() > 32 {
-                // Truncate on a UTF-8 char boundary at or before byte 32 — slicing a
-                // raw byte index can fall mid-codepoint and panic on hostile input.
-                let end = s
-                    .char_indices()
-                    .take_while(|(i, _)| *i <= 32)
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
+                // Truncate at a UTF-8 char boundary at or before byte 32 — direct
+                // byte indexing can fall mid-codepoint and panic on multi-byte input.
+                let end = s.char_indices().map(|(i, _)| i).filter(|&i| i <= 32).last().unwrap_or(0);
                 format!("string(\"{}...\")", &s[..end])
             } else {
                 format!("string(\"{s}\")")

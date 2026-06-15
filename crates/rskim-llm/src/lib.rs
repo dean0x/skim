@@ -173,7 +173,7 @@ pub fn classify_body(body: &ParsedBody) -> Vec<(String, Classification)> {
                             }
                         }
                     }
-                    None => {}
+                    None => {}  // assistant messages with only tool_calls have no content
                 }
             }
             results

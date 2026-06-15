@@ -179,35 +179,17 @@ pub fn classify(text: &str) -> Classification {
 /// (optionally with a language tag on the opening fence line).
 fn try_classify_fenced(text: &str) -> Option<Classification> {
     let trimmed = text.trim();
-    if !trimmed.starts_with("```") {
+    // Must start and end with ``` and have a newline separating opener from closer.
+    if !trimmed.starts_with("```") || !trimmed.ends_with("```") || !trimmed.contains('\n') {
         return None;
     }
-
-    // Must end with ``` (possibly with trailing whitespace)
-    if !trimmed.ends_with("```") {
-        return None;
-    }
-
-    // Must be more than just the fence markers
+    // Must be more than just the fence markers (```\n```)
     if trimmed.len() < 6 {
         return None;
     }
-
-    // Extract language tag from the first line
-    let first_line_end = trimmed.find('\n').unwrap_or(trimmed.len());
-    let first_line = &trimmed[3..first_line_end]; // skip the opening ```
-    let lang = first_line.trim();
-
-    // Verify the closing fence is on its own line (not the same line as opening)
-    if !trimmed.contains('\n') {
-        return None;
-    }
-
-    let lang_hint = if lang.is_empty() {
-        None
-    } else {
-        Some(lang.to_string())
-    };
+    // Extract language tag from the first line (text after the opening ```)
+    let first_line_end = trimmed.find('\n').expect("contains newline checked above");
+    let lang_hint = fence_lang_hint(&trimmed[3..first_line_end]);
     Some(Classification::code(lang_hint))
 }
 
@@ -243,26 +225,13 @@ fn try_classify_log(text: &str) -> bool {
 /// Test whether a single line matches log-line heuristics.
 fn is_log_line(line: &str) -> bool {
     let trimmed = line.trim();
-
     // Pattern 1: timestamp prefix (ISO-8601-like, or unix timestamp)
     // e.g. "2024-01-15T10:30:00Z", "2024-01-15 10:30:00", "[2024-01-15]"
-    if has_timestamp_prefix(trimmed) {
-        return true;
-    }
-
     // Pattern 2: log-level keyword at the start or in brackets
     // e.g. "ERROR:", "WARN:", "[INFO]", "[DEBUG]", "error:"
-    if has_log_level_prefix(trimmed) {
-        return true;
-    }
-
     // Pattern 3: bracketed prefix pattern common in structured logs
     // e.g. "[component] message", "(module) message"
-    if has_bracketed_prefix(trimmed) {
-        return true;
-    }
-
-    false
+    has_timestamp_prefix(trimmed) || has_log_level_prefix(trimmed) || has_bracketed_prefix(trimmed)
 }
 
 /// Check for a timestamp-like prefix.

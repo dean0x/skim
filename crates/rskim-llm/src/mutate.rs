@@ -72,32 +72,22 @@ pub fn mutate_block(body: &mut ParsedBody, block_id: &str, new_text: &str) -> Re
 }
 
 fn mutate_anthropic(body: &mut AnthropicBody, block_id: &str, new_text: &str) -> Result<Vec<u8>> {
-    // Before looking up in text_leaves() (which only yields mutable leaves),
-    // check list_anthropic_blocks() for the id: if the id exists but is
-    // non-mutable (tool_use, thinking, unknown), return BlockNotMutable so the
-    // error contract documented in the rustdoc is honored.  Only if the id is
-    // absent from both mutable and exempt blocks do we return BlockNotFound.
-    let descriptor = list_anthropic_blocks(body)
-        .into_iter()
-        .find(|d| d.id == block_id);
-    if let Some(d) = &descriptor {
-        if !d.mutable {
-            return Err(LlmError::BlockNotMutable(
-                block_id.to_string(),
-                d.kind.clone(),
-            ));
+    // First try to find the block among mutable leaves (fast path).
+    // If not found there, consult list_anthropic_blocks to distinguish
+    // BlockNotMutable (block exists but is exempt) from BlockNotFound (absent).
+    let leaf = match body.text_leaves().find(|l| l.id() == block_id) {
+        Some(l) => l,
+        None => {
+            // Block not mutable — check whether it exists at all.
+            let descriptor = list_anthropic_blocks(body)
+                .into_iter()
+                .find(|d| d.id == block_id);
+            return match descriptor {
+                Some(d) => Err(LlmError::BlockNotMutable(block_id.to_string(), d.kind)),
+                None => Err(LlmError::BlockNotFound(block_id.to_string())),
+            };
         }
-    } else {
-        // Block id not found in the body at all.
-        return Err(LlmError::BlockNotFound(block_id.to_string()));
-    }
-
-    // Now look up the mutable leaf reference (guaranteed to exist after the
-    // check above, since descriptor was Some and mutable == true).
-    let leaf = body
-        .text_leaves()
-        .find(|l| l.id() == block_id)
-        .ok_or_else(|| LlmError::BlockNotFound(block_id.to_string()))?;
+    };
 
     // Byte-range surgery (AC9b / AC10):
     //
