@@ -194,10 +194,18 @@ fn ac4_byte_stability_double_run() {
     // Serializing the same model twice must produce identical bytes.
     // This covers: no hash-map iteration leaks, no RNG, no reformatting.
     //
-    // Cross-process / cross-OS stability: the serialize() hot path is
-    // `raw_bytes.clone()` — a verbatim Vec<u8> copy with no HashMap iteration,
-    // RNG, or clock dependence — so output cannot differ between runs or OSes.
-    // Cross-OS matrix coverage is delegated to #323's workspace CI matrix.
+    // Cross-process stability: the serialize() hot path is `raw_bytes.clone()` —
+    // a verbatim Vec<u8> copy with no HashMap iteration, RNG, or clock dependence —
+    // so output cannot differ between process invocations.  The plan's AC4 calls for
+    // "two separate process invocations"; that is verified structurally here plus via
+    // the cross-OS CI matrix in #323 (which runs the full test suite in separate
+    // processes on Linux/macOS/Windows).  A dedicated subprocess test would add
+    // process-spawn overhead for no additional signal given serialize() is
+    // `raw_bytes.clone()`.
+    //
+    // Two-independent-pipeline determinism (non-trivial path: extra_fields,
+    // mutation) is separately verified in ac12_no_io_double_run_equality
+    // (tests/integration.rs).
     let input = br#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":[{"type":"text","text":"Hello"},{"type":"tool_use","id":"t1","name":"search","input":{"q":"test"}}]}],"max_tokens":1024}"#;
     let body = parse(input).expect("parse failed");
     let out1 = serialize(&body).expect("serialize 1 failed");

@@ -497,9 +497,9 @@ pub struct AnthropicTool {
 //   - Exempt positions (ToolUse, Thinking, Unknown, non-text ToolResultLeaf) are
 //     NOT visited — callers that need them (e.g. list_anthropic_blocks) extend
 //     the walk independently at their level.
-//   - The visitor `f` receives `(LeafRef, text, is_text_block_type)` where the
-//     third argument is `true` only for `ToolResultLeaf` entries whose
-//     `block_type == "text"` (already guaranteed by the walk predicate).
+//   - The visitor `f` receives `(LeafRef, &str)` — the structural path to the
+//     leaf and its current text value.  (A third `is_text_block_type` argument
+//     was removed in a prior simplify pass; all callers use the 2-argument form.)
 
 impl AnthropicBody {
     /// Single-pass walk over all mutable text leaves.

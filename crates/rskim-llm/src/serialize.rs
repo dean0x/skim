@@ -68,15 +68,16 @@ pub fn serialize(body: &ParsedBody) -> Result<Vec<u8>> {
     //
     // This path is NOT byte-faithful: field order follows struct-declaration order,
     // number formatting is canonical (e.g. 1e3 → 1000.0), and optional fields with
-    // `skip_serializing_if` may be omitted (e.g. `"content":null` in OpenAI tool-only
-    // messages). It is retained so serialize() is total for any constructible
-    // ParsedBody, but callers must not rely on it producing byte-identical output.
-    debug_assert!(
-        false,
-        "serialize fallback path reached — raw_bytes should always be populated"
-    );
-    let bytes = serde_json::to_vec(body)?;
-    Ok(bytes)
+    // `skip_serializing_if` may be omitted.  We return an error in BOTH debug and
+    // release builds rather than silently producing non-byte-faithful output, per the
+    // project's fail-loud design constraint (CLAUDE.md) and ADR-006 (unrecoverable
+    // desync fails loud).  A release-mode regression that empties raw_bytes would
+    // otherwise break Invariant 5 with no visible signal.
+    Err(crate::LlmError::BlockNotFound(
+        "serialize: raw_bytes is empty — body was not produced by parse() or mutate_block() \
+         (this is an internal invariant violation)"
+            .to_string(),
+    ))
 }
 
 /// Serialize a parsed body to a UTF-8 string.

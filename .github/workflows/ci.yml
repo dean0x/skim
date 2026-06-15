@@ -119,7 +119,9 @@ jobs:
       - name: Dependency-tree isolation check (AC9/AC12)
         # Proves no HTTP/TLS crate appears in the default-features build of
         # rskim-tokens, rskim-llm, or the skim binary. Uses set -o pipefail per PF-007.
-        # AC12 for rskim-llm: forbids tokio/hyper/reqwest/std::fs/std::net/rand/SystemTime/Instant.
+        # AC12 for rskim-llm: forbids tokio/hyper/reqwest/rand and (via source-level grep)
+        # std::fs/std::net/SystemTime/Instant — cargo tree only emits crate names so
+        # std:: type names can never match it; the source grep closes that gap.
         run: |
           set -o pipefail
           echo "=== rskim-tokens default-features tree ==="
@@ -130,15 +132,26 @@ jobs:
           fi
           echo "PASS: no HTTP/TLS in rskim-tokens default build"
 
-          echo "=== rskim-llm default-features tree (AC12) ==="
+          echo "=== rskim-llm default-features tree (AC12 dep gate) ==="
           cargo tree -p rskim-llm -e normal 2>&1 | tee /tmp/rskim-llm-tree.txt
-          FORBIDDEN_LLM='tokio|hyper|reqwest|rustls|native-tls|openssl|rand\b|SystemTime|Instant'
+          FORBIDDEN_LLM='tokio|hyper|reqwest|rustls|native-tls|openssl|rand\b'
           if grep -qE "$FORBIDDEN_LLM" /tmp/rskim-llm-tree.txt; then
             echo "FAIL: forbidden dependency found in rskim-llm default build (AC12)"
             grep -E "$FORBIDDEN_LLM" /tmp/rskim-llm-tree.txt || true
             exit 1
           fi
           echo "PASS: no forbidden dependencies in rskim-llm default build"
+
+          echo "=== rskim-llm source-level ambient-state check (AC12) ==="
+          # cargo tree never emits std:: type names, so SystemTime/Instant/std::fs/std::net
+          # must be checked at source level.  This grep covers the entire crates/rskim-llm/src
+          # tree; test modules are excluded from the ambient-state guarantee and are
+          # permitted to use Instant (they use it for timing, not nondeterminism).
+          if grep -rnE 'SystemTime|std::(fs|net)|getrandom|rand::' crates/rskim-llm/src; then
+            echo "FAIL: ambient-state API found in rskim-llm/src (AC12 determinism gate)"
+            exit 1
+          fi
+          echo "PASS: no ambient-state APIs in rskim-llm/src"
 
           echo "=== skim binary default-features tree ==="
           cargo tree -p rskim -e normal 2>&1 | tee /tmp/rskim-tree.txt

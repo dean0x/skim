@@ -20,7 +20,7 @@
 //! analytically in `lib.rs`; wiring it as a regression gate is a follow-up
 //! (see #309 / Wave-1 perf-gate follow-up).
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use rskim_llm::{classify_body, parse, serialize};
 
 /// Build a tool-result-heavy Anthropic body of approximately `target_bytes` bytes.
@@ -67,12 +67,14 @@ fn bench_parse_classify_serialize(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("anthropic", label), &input, |b, input| {
             b.iter(|| {
                 // Unwrap is acceptable in benchmarks — a parse failure is a bug,
-                // not a graceful error path.
+                // not a graceful error path.  black_box prevents LTO/codegen-units=1
+                // from dead-code-eliminating the measured pipeline (matches the
+                // sibling crates rskim-tokens and rskim-core bench pattern).
                 #[allow(clippy::unwrap_used)]
-                let body = parse(input).unwrap();
-                let _classifications = classify_body(&body);
+                let body = parse(black_box(input)).unwrap();
+                black_box(classify_body(&body));
                 #[allow(clippy::unwrap_used)]
-                let _serialized = serialize(&body).unwrap();
+                black_box(serialize(&body).unwrap());
             });
         });
     }

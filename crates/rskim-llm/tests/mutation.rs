@@ -553,13 +553,20 @@ fn roles_of(body: &ParsedBody) -> Vec<String> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(30))]
+    #![proptest_config(ProptestConfig::with_cases(50))]
 
     /// AC11 property test: message COUNT is invariant through parse→mutate→serialize.
     ///
     /// Generates multi-turn conversations with mixed block types (string content,
     /// text blocks, tool_result blocks) and verifies that `mutate_block` never
     /// changes the number of messages.
+    ///
+    /// # OpenAI scope note
+    ///
+    /// This property test covers Anthropic bodies only (OpenAI mutation returns
+    /// `BlockNotMutable("openai-not-implemented")` — see #332).  OpenAI
+    /// parse→classify→serialize turn-invariance is covered separately in
+    /// `ac11_openai_parse_classify_serialize_turn_invariant` below.
     #[test]
     fn ac11_proptest_message_count_invariant(
         // Number of messages: 1 to 5
@@ -613,5 +620,80 @@ proptest! {
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AC11 — OpenAI parse→classify→serialize turn invariance (mutation not yet
+// implemented for OpenAI, but parse/classify/serialize ARE implemented).
+// This covers the non-mutation half of AC11's "multi-turn Anthropic AND OpenAI"
+// scope requirement (#332 tracks OpenAI mutation).
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// AC11 property test: message COUNT and role ORDER are invariant through
+    /// parse→classify_body→serialize for multi-turn OpenAI bodies.
+    ///
+    /// Mutation is not yet supported for OpenAI bodies (#332), so we exercise the
+    /// classify/serialize pipeline (which ARE fully implemented for OpenAI) to verify
+    /// that round-tripping a body through the library does not add, drop, or reorder
+    /// messages.
+    #[test]
+    fn ac11_openai_parse_classify_serialize_turn_invariant(
+        n_messages in 1usize..=5,
+        include_system in proptest::bool::ANY,
+    ) {
+        let mut messages = Vec::new();
+        if include_system {
+            messages.push(r#"{"role":"system","content":"Be helpful"}"#.to_string());
+        }
+        for i in 0..n_messages {
+            messages.push(format!(r#"{{"role":"user","content":"Message {i}"}}"#));
+        }
+
+        let body_str = format!(
+            r#"{{"model":"gpt-4o","messages":[{}]}}"#,
+            messages.join(",")
+        );
+
+        let body = parse_with_provider(body_str.as_bytes(), Provider::OpenAi)
+            .expect("OpenAI parse failed");
+
+        let initial_count = match &body {
+            ParsedBody::OpenAi(b) => b.messages().len(),
+            _ => return Ok(()),
+        };
+        let initial_roles: Vec<String> = match &body {
+            ParsedBody::OpenAi(b) => b.messages().iter().map(|m| m.role.clone()).collect(),
+            _ => return Ok(()),
+        };
+
+        // classify_body must not mutate the model
+        let _classifications = rskim_llm::classify_body(&body);
+
+        // serialize + re-parse must preserve count and order
+        let serialized = serialize(&body).expect("serialize failed");
+        let reparsed = parse_with_provider(&serialized, Provider::OpenAi)
+            .expect("re-parse failed");
+
+        let reparsed_count = match &reparsed {
+            ParsedBody::OpenAi(b) => b.messages().len(),
+            _ => return Ok(()),
+        };
+        prop_assert_eq!(
+            initial_count, reparsed_count,
+            "OpenAI message count must be invariant through parse→classify→serialize (AC11)"
+        );
+
+        let reparsed_roles: Vec<String> = match &reparsed {
+            ParsedBody::OpenAi(b) => b.messages().iter().map(|m| m.role.clone()).collect(),
+            _ => return Ok(()),
+        };
+        prop_assert_eq!(
+            initial_roles, reparsed_roles,
+            "OpenAI role order must be invariant through parse→classify→serialize (AC11)"
+        );
     }
 }

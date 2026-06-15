@@ -62,4 +62,11 @@ pub enum LlmError {
     /// The input contained invalid UTF-8 bytes.
     #[error("input contains invalid UTF-8: {0}")]
     InvalidUtf8(String),
+
+    /// The chunked ingestion buffer exceeded the configured byte limit.
+    ///
+    /// See [`crate::ChunkIngestionBuilder::with_max_bytes`] for the limit source.
+    /// The embedded value is the total bytes accumulated when the limit was hit.
+    #[error("chunked ingestion body too large: {0} bytes accumulated (limit exceeded)")]
+    BodyTooLarge(usize),
 }

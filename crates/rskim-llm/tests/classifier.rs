@@ -157,17 +157,23 @@ fn ac13_classifier_returns_only_six_classes() {
 }
 
 #[test]
-fn ac13_no_rule_fires_returns_unknown_from_classify_body() {
-    // classify() itself never returns Unknown — it always falls back to Text.
-    // Unknown is returned by classify_body() for exempt blocks (which are not in
-    // the text_leaves iterator). This test verifies that classify("plain text") != Unknown.
+fn ac13_no_rule_fires_returns_text_not_unknown() {
+    // classify() never returns Unknown — it always falls back to Text when no rule
+    // fires.  AC13's "unknown on no-rule" clause is satisfied differently: exempt
+    // blocks are filtered out of classify_body() results entirely (they never reach
+    // classify()), so Unknown is only returned for explicitly exempt entries in
+    // classify_body(), not as a classify() default.
     let result = classify("plain text without any classifiable pattern");
     assert_ne!(
         result.class,
         Class::Unknown,
-        "classify() should not return Unknown for plain text"
+        "classify() must not return Unknown for plain text — Unknown is reserved for exempt blocks"
     );
-    assert_eq!(result.class, Class::Text);
+    assert_eq!(
+        result.class,
+        Class::Text,
+        "classify() must fall back to Text when no rule fires"
+    );
 }
 
 #[test]
@@ -243,57 +249,70 @@ fn ac5_boundary_indented_code_is_text() {
 /// sacrosanct fields (Resolved Decision 6) and must NOT produce any classification
 /// entry in `classify_body()` results.
 ///
-/// This test ensures that if `classify_body()` is ever extended to walk tool_calls
-/// or other message-level fields, those opaque-model-emitted payloads would not
-/// silently receive a classification id that could be mistaken for an addressable
-/// block (they are not addressable through `list_blocks` / `mutate_block`).
+/// # Positive-behavior assertion
+///
+/// A body whose ONLY user-facing content is inside opaque/exempt fields must produce
+/// no classification results (or only results for the non-exempt `content` field).
+/// This is the observable invariant for Decision-6: if the exemption were removed and
+/// `classify_body` started walking `tool_calls.function.arguments`, the assertion below
+/// would fail because a new classification id would appear.
 #[test]
 fn ac13_openai_exempt_fields_not_classified() {
     use rskim_llm::{Provider, classify_body, parse_with_provider};
 
-    // A body with tool_calls (function.arguments), tool_call_id, and a reasoning
-    // field — all of which are exempt opaque/sacrosanct fields per Decision 6.
-    let body_json = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"What is 2+2?"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_abc","type":"function","function":{"name":"calculator","arguments":"{\"a\":2,\"b\":2}"}}]},{"role":"tool","content":"4","tool_call_id":"call_abc"}]}"#;
-    let body = parse_with_provider(body_json.as_bytes(), Provider::OpenAi).expect("parse failed");
+    // Body where the ONLY potentially-classifiable content is the opaque `tool_calls`
+    // field on the assistant message.  The assistant message has `content: null`, so
+    // there is no text content to classify.  If classify_body ever started walking
+    // tool_calls, it would emit an id for this message — caught by the assertion below.
+    let tool_only_json = r#"{"model":"gpt-4o","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call_abc","type":"function","function":{"name":"calculator","arguments":"{\"a\":2,\"b\":2}"}}]}]}"#;
+    let body =
+        parse_with_provider(tool_only_json.as_bytes(), Provider::OpenAi).expect("parse failed");
     let results = classify_body(&body);
-
-    // Verify that none of the classification IDs correspond to opaque fields.
-    // tool_calls.function.arguments is at the assistant message level — it must
-    // not appear as a classifiable block.
-    for (id, _class) in &results {
-        assert!(
-            !id.contains("tool_calls"),
-            "tool_calls must not appear in classify_body results (id={id:?})"
-        );
-    }
-
-    // The tool message has text content ("4") — it may be classified, but
-    // tool_call_id (a correlation string on the same message) must not.
-    // Since classify_body only emits ids for Text/Parts content (not tool_call_id),
-    // verify that any tool-message id refers only to text content.
-    let tool_msg_ids: Vec<&str> = results
-        .iter()
-        .filter(|(id, _)| id.starts_with("m2"))
-        .map(|(id, _)| id.as_str())
-        .collect();
-    // tool_call_id is "m2.tool_call_id"-shaped (hypothetically); it must not appear
     assert!(
-        tool_msg_ids.iter().all(|id| !id.contains("tool_call_id")),
-        "tool_call_id must not appear as a classification id: {tool_msg_ids:?}"
+        results.is_empty(),
+        "a body with only tool_calls content (no text content) must produce no classify_body \
+         results; got {results:?} — Decision-6 exemption for opaque fields may be violated"
     );
 
-    // Verify no reasoning field produces a classification id.
-    // Build an OpenAI body with a top-level reasoning field (o1/o3 model format).
-    let reasoning_json = r#"{"model":"o1-mini","messages":[{"role":"user","content":"Solve this"},{"role":"assistant","content":"The answer is 42","reasoning":"Let me think step by step..."}]}"#;
-    let reasoning_body =
-        parse_with_provider(reasoning_json.as_bytes(), Provider::OpenAi).expect("parse failed");
+    // Body where the ONLY content is the sacrosanct `reasoning` field on an assistant
+    // message that has no text `content`.  If classify_body ever started walking
+    // `reasoning`, it would emit a classification id — caught below.
+    let reasoning_only_json = r#"{"model":"o1-mini","messages":[{"role":"assistant","content":null,"reasoning":"Let me think step by step..."}]}"#;
+    let reasoning_body = parse_with_provider(reasoning_only_json.as_bytes(), Provider::OpenAi)
+        .expect("parse failed");
     let reasoning_results = classify_body(&reasoning_body);
-    for (id, _) in &reasoning_results {
+    assert!(
+        reasoning_results.is_empty(),
+        "a body with only reasoning content (no text content) must produce no classify_body \
+         results; got {reasoning_results:?} — Decision-6 exemption for reasoning may be violated"
+    );
+
+    // Body with real text content alongside exempt fields — the text IS classified,
+    // but tool_call_id (a correlation string on a tool message) must not be.
+    let mixed_json = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"What is 2+2?"},{"role":"tool","content":"4","tool_call_id":"call_abc"}]}"#;
+    let mixed_body =
+        parse_with_provider(mixed_json.as_bytes(), Provider::OpenAi).expect("parse failed");
+    let mixed_results = classify_body(&mixed_body);
+    // Both messages have text content, so some results are expected.
+    // None of them must correspond to tool_call_id.
+    for (id, _class) in &mixed_results {
         assert!(
-            !id.contains("reasoning"),
-            "reasoning field must not appear in classify_body results (id={id:?})"
+            !id.contains("tool_call_id"),
+            "tool_call_id must not appear as a classification id; got {id:?}"
         );
     }
+    // The m1 message content ("4") should have a classification id of the form "m1",
+    // not "m1.tool_call_id" or any compound form.
+    let m1_ids: Vec<&str> = mixed_results
+        .iter()
+        .filter(|(id, _)| id.starts_with("m1"))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    assert!(
+        m1_ids.iter().all(|id| *id == "m1"),
+        "tool message classification id must be 'm1' (content only), not a compound id; \
+         got {m1_ids:?}"
+    );
 }
 
 #[test]

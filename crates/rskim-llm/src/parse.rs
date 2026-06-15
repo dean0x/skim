@@ -184,26 +184,19 @@ fn check_depth(text: &str) -> Result<()> {
 }
 
 /// Describe a JSON value type for error messages.
+///
+/// For scalar types, emits only the JSON type tag — not the value content.  This is
+/// a defence-in-depth log-hygiene measure: if a downstream caller logs `LlmError`
+/// display output, no fragment of attacker-controlled request content lands in logs.
+/// The type tag alone is sufficient to explain the shape error (the reachable cases
+/// are a bare-string top-level body or a non-array `messages` value; neither needs
+/// content to be diagnosable).
 fn describe_value(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Null => "null".to_string(),
-        serde_json::Value::Bool(b) => format!("bool({b})"),
-        serde_json::Value::Number(n) => format!("number({n})"),
-        serde_json::Value::String(s) => {
-            if s.len() > 32 {
-                // Truncate at a UTF-8 char boundary at or before byte 32 — direct
-                // byte indexing can fall mid-codepoint and panic on multi-byte input.
-                // Walk down from 32 to the nearest char boundary (always terminates
-                // at 0, which is a valid boundary).
-                let mut end = 32;
-                while end > 0 && !s.is_char_boundary(end) {
-                    end -= 1;
-                }
-                format!("string(\"{}...\")", &s[..end])
-            } else {
-                format!("string(\"{s}\")")
-            }
-        }
+        serde_json::Value::Bool(_) => "bool".to_string(),
+        serde_json::Value::Number(_) => "number".to_string(),
+        serde_json::Value::String(_) => "string".to_string(),
         serde_json::Value::Array(_) => "array".to_string(),
         serde_json::Value::Object(_) => "object".to_string(),
     }

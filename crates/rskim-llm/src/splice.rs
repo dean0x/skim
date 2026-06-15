@@ -45,17 +45,37 @@ pub struct StringSpan {
 /// replaced by the JSON-encoded form of `new_text`, and all other bytes are
 /// byte-identical to `raw`.
 ///
+/// # Panics (debug)
+///
+/// `debug_assert!` fires if the span is inconsistent with `raw`:
+/// `span.start <= span.end && span.end <= raw.len()`.  In release builds the
+/// assertion is compiled out and the slice operations would panic or produce
+/// wrong output, so callers MUST ensure the span was derived from the same `raw`
+/// buffer.  The only live call site (`mutate_anthropic` in `mutate.rs`) derives
+/// the span from `find_leaf_span(&body.raw_bytes, …)` and immediately calls
+/// `splice_replace(&body.raw_bytes, span, …)` on the same buffer, so the
+/// invariant holds by construction.
+///
 /// # Errors
 ///
 /// Returns `Err` if `serde_json::to_string` fails (OOM). In practice this is
 /// unreachable for a `&str` argument.
 pub fn splice_replace(raw: &[u8], span: StringSpan, new_text: &str) -> Result<Vec<u8>> {
+    debug_assert!(
+        span.start <= span.end && span.end <= raw.len(),
+        "splice_replace: span {span:?} is out of bounds for raw buffer of len {}",
+        raw.len()
+    );
+
     // JSON-quote the replacement text.  serde_json::to_string always produces
     // valid UTF-8 JSON; the only fallible scenario is an OOM — which is surfaced
     // as a Json error rather than a panic.
     let quoted = serde_json::to_string(new_text)?;
     let new_bytes = quoted.as_bytes();
 
+    // The subtraction `raw.len() - (span.end - span.start)` is safe here:
+    // the debug_assert above guarantees span.end - span.start <= raw.len(),
+    // so the subtraction cannot underflow on valid input.
     let mut out = Vec::with_capacity(raw.len() - (span.end - span.start) + new_bytes.len());
     out.extend_from_slice(&raw[..span.start]);
     out.extend_from_slice(new_bytes);
@@ -447,16 +467,30 @@ impl<'a> Scanner<'a> {
     ///
     /// The scanner must have already consumed the `{` via `enter_object()`.
     /// After this call, the cursor is positioned at the start of the value for `key`.
+    ///
+    /// # Duplicate-key semantics
+    ///
+    /// If the same key appears more than once (non-conformant JSON), this function
+    /// seeks to the **last** occurrence, matching `serde_json` with `preserve_order`
+    /// semantics (which also retains the last value on duplicate keys, per its
+    /// documented behaviour in `model/mod.rs:30-35`). This prevents a divergence
+    /// where `walk_leaves` sees the last value (via the typed model) while the
+    /// byte-surgery locates the first span — which would cause `mutate_block` to
+    /// splice the wrong span.
+    ///
+    /// Real Anthropic/OpenAI bodies do not carry duplicate mutable-text keys;
+    /// this is a defense-in-depth correctness fix for adversarial input.
     fn seek_key(&mut self, key: &str) -> Result<()> {
+        // We need to find the LAST occurrence, so we scan the full object once,
+        // recording the cursor position just before the target value each time
+        // we find a matching key.  After the full scan we restore the cursor to
+        // the recorded position.
+        let mut found_pos: Option<usize> = None;
+
         loop {
             // Check for empty object or end
             match self.peek() {
-                None | Some(b'}') => {
-                    return Err(LlmError::BlockNotFound(format!(
-                        "key {:?} not found in object",
-                        key
-                    )));
-                }
+                None | Some(b'}') => break,
                 _ => {}
             }
             // Read the key string
@@ -465,24 +499,30 @@ impl<'a> Scanner<'a> {
             self.consume_byte(b':')?;
 
             if found_key == key {
-                // Found! Cursor is now before the value.
-                return Ok(());
-            } else {
-                // Skip the value and any trailing comma
+                // Record this position (cursor is now before the value).
+                found_pos = Some(self.pos);
+                // Skip the value so we can keep scanning for a later occurrence.
                 self.skip_value()?;
-                match self.peek() {
-                    Some(b',') => {
-                        self.pos += 1;
-                    }
-                    Some(b'}') | None => {
-                        return Err(LlmError::BlockNotFound(format!(
-                            "key {:?} not found in object",
-                            key
-                        )));
-                    }
-                    _ => {}
-                }
+            } else {
+                self.skip_value()?;
             }
+
+            // Advance past trailing comma (if present) to reach the next key or `}`.
+            if self.peek() == Some(b',') {
+                self.pos += 1;
+            }
+            // Either `}` (end of object) or end-of-input — loop exit on next peek.
+        }
+
+        match found_pos {
+            Some(pos) => {
+                self.pos = pos;
+                Ok(())
+            }
+            None => Err(LlmError::BlockNotFound(format!(
+                "key {:?} not found in object",
+                key
+            ))),
         }
     }
 
@@ -620,5 +660,40 @@ mod tests {
         let span = find_leaf_span(raw, &leaf).expect("find span");
         let result = splice_replace(raw, span, "Bye").expect("splice failed");
         assert!(std::str::from_utf8(&result).unwrap().contains("\"Bye\""));
+    }
+
+    /// Duplicate-key determinism: seek_key must return the LAST occurrence, matching
+    /// serde_json preserve_order semantics (which also keeps the last value on
+    /// duplicate keys).  For a non-conformant body with a duplicate mutable key,
+    /// `find_leaf_span` must locate the same occurrence that the typed model holds
+    /// so that `mutate_block` splices the correct span.
+    ///
+    /// This is a defense-in-depth test for adversarial input; real Anthropic/OpenAI
+    /// bodies do not carry duplicate keys.
+    #[test]
+    fn seek_key_returns_last_occurrence_on_duplicate() {
+        // The body has two "content" keys at the message level (non-conformant JSON).
+        // serde_json preserve_order keeps the LAST value ("SECOND").
+        // find_leaf_span must locate "SECOND", not "FIRST".
+        let raw = br#"{"model":"m","messages":[{"role":"user","content":"FIRST","content":"SECOND"}],"max_tokens":1}"#;
+        let leaf = LeafRef::MessageString { msg_idx: 0 };
+        let span = find_leaf_span(raw, &leaf).expect("find span failed");
+        let value = std::str::from_utf8(&raw[span.start..span.end]).unwrap();
+        assert_eq!(
+            value, "\"SECOND\"",
+            "seek_key must return the LAST occurrence to match serde preserve_order semantics; \
+             got {value:?}"
+        );
+    }
+
+    #[test]
+    fn splice_replace_debug_assert_span_in_bounds() {
+        // Only exercises the happy path in release builds; the debug_assert is
+        // tested indirectly via all other splice tests that use valid spans.
+        let raw = b"hello";
+        let span = StringSpan { start: 1, end: 4 };
+        // Valid span: start <= end <= raw.len() => no assert fires
+        let result = splice_replace(raw, span, "X");
+        assert!(result.is_ok());
     }
 }

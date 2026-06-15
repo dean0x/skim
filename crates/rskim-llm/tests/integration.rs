@@ -363,10 +363,41 @@ fn ac3_auto_detect_anthropic_from_block_type() {
 
 #[test]
 fn ac12_no_io_double_run_equality() {
-    // Serialize the same parsed model twice and assert identical bytes
-    let input = br#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}"#;
-    let body = parse(input).expect("parse failed");
-    let out1 = rskim_llm::serialize(&body).expect("serialize failed 1");
-    let out2 = rskim_llm::serialize(&body).expect("serialize failed 2");
-    assert_eq!(out1, out2, "double-run serialization must be identical");
+    // AC12: two INDEPENDENT full pipelines (parse→classify_body→mutate→serialize)
+    // on the same input bytes must produce identical output.  Serializing the same
+    // model twice only tests Vec::clone determinism; running two separate parse
+    // calls exercises any HashMap-iteration or RNG dependence in the pipeline.
+    //
+    // We use a body with a mutation (forcing the typed-field serialize path to be
+    // exercised) and extra_fields (to exercise map-iteration order) so that a
+    // future nondeterminism regression in those paths would be caught here.
+    use rskim_llm::{list_blocks, mutate_block, serialize};
+
+    let input = br#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Hello"},{"role":"assistant","content":[{"type":"text","text":"Hi there"},{"type":"tool_use","id":"t1","name":"search","input":{"q":"test"}}]}],"max_tokens":1024,"unknown_extra":"preserved"}"#;
+
+    // Pipeline A: parse → classify → mutate first mutable block → serialize
+    let mut body_a = parse(input).expect("pipeline A parse failed");
+    let _cls_a = rskim_llm::classify_body(&body_a);
+    let blocks_a = list_blocks(&body_a);
+    let out_a = if let Some(b) = blocks_a.iter().find(|b| b.mutable) {
+        mutate_block(&mut body_a, &b.id, "REPLACED").expect("pipeline A mutate failed")
+    } else {
+        serialize(&body_a).expect("pipeline A serialize failed")
+    };
+
+    // Pipeline B: independent parse → classify → mutate → serialize
+    let mut body_b = parse(input).expect("pipeline B parse failed");
+    let _cls_b = rskim_llm::classify_body(&body_b);
+    let blocks_b = list_blocks(&body_b);
+    let out_b = if let Some(b) = blocks_b.iter().find(|b| b.mutable) {
+        mutate_block(&mut body_b, &b.id, "REPLACED").expect("pipeline B mutate failed")
+    } else {
+        serialize(&body_b).expect("pipeline B serialize failed")
+    };
+
+    assert_eq!(
+        out_a, out_b,
+        "two independent parse→classify→mutate→serialize pipelines must produce \
+         identical bytes (AC12 determinism)"
+    );
 }
