@@ -194,9 +194,8 @@ pub(super) fn resolve_blast_radius_paths(
     db_path: &Path,
     json: bool,
 ) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
-    let raw_path = match blast_radius {
-        Some(p) => p,
-        None => return Ok(None),
+    let Some(raw_path) = blast_radius else {
+        return Ok(None);
     };
 
     match open_temporal_db(db_path) {
@@ -506,23 +505,28 @@ pub(super) fn format_temporal_text(
     w: &mut impl Write,
 ) -> anyhow::Result<()> {
     match output {
-        TemporalQueryOutput::Hotspots(rows) | TemporalQueryOutput::Coldspots(rows) => {
-            let is_hot = matches!(output, TemporalQueryOutput::Hotspots(_));
-            let empty_msg = if is_hot {
-                "No hotspot data available."
-            } else {
-                "No coldspot data available."
-            };
-            let header_msg = if is_hot {
-                format!("Hotspots (top {}, 90-day decay):\n", rows.len())
-            } else {
-                format!("Coldspots (top {}, least active):\n", rows.len())
-            };
+        TemporalQueryOutput::Hotspots(rows) => {
             if rows.is_empty() {
-                writeln!(w, "{empty_msg}")?;
+                writeln!(w, "No hotspot data available.")?;
                 return Ok(());
             }
-            write!(w, "{header_msg}")?;
+            writeln!(w, "Hotspots (top {}, 90-day decay):", rows.len())?;
+            writeln!(w, "  Score  30d  90d  Path")?;
+            writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
+            for r in rows {
+                writeln!(
+                    w,
+                    "  {:.3}   {:>4} {:>4}  {}",
+                    r.score, r.changes_30d, r.changes_90d, r.file_path
+                )?;
+            }
+        }
+        TemporalQueryOutput::Coldspots(rows) => {
+            if rows.is_empty() {
+                writeln!(w, "No coldspot data available.")?;
+                return Ok(());
+            }
+            writeln!(w, "Coldspots (top {}, least active):", rows.len())?;
             writeln!(w, "  Score  30d  90d  Path")?;
             writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
             for r in rows {
