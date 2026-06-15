@@ -7,6 +7,26 @@
 //! Before structural parsing, the raw JSON is scanned for nesting depth to prevent
 //! stack overflow from adversarial input. Any body exceeding [`crate::MAX_DEPTH`]
 //! returns [`crate::LlmError::DepthExceeded`].
+//!
+//! # Single-pass provider detection
+//!
+//! The [`parse`] function performs provider detection via [`crate::provider::detect_str`],
+//! which runs a single shallow deserialization that captures only the fields needed
+//! for provider selection (`model`, `response_format`, `max_tokens`,
+//! `messages[*].{role,tool_calls,tool_call_id,content[*].type}`), discarding all
+//! other field values via `serde::de::IgnoredAny`.  The typed parse in [`parse_as`]
+//! is the only deep parse of the body.
+//!
+//! # Memory profile
+//!
+//! For a body of size B, peak allocation is approximately:
+//!
+//! - Input buffer: 1× B (owned `Vec<u8>` in the caller or `ChunkIngestionBuilder`)
+//! - Shallow detection: sub-linear in B (only discriminating fields materialised)
+//! - Typed model (`AnthropicBody`/`OpenAiBody`): ≤1× B
+//!
+//! This gives k ≈ 2× B for the parse path — a significant improvement over the
+//! previous k ≈ 3.5× that included a full `serde_json::Value` intermediate.
 
 use crate::model::anthropic::AnthropicBody;
 use crate::model::openai::OpenAiBody;
@@ -16,43 +36,6 @@ use crate::{LlmError, MAX_DEPTH, Result, provider};
 /// Convert raw bytes to UTF-8, returning [`LlmError::InvalidUtf8`] on failure.
 pub(crate) fn to_utf8(bytes: &[u8]) -> Result<&str> {
     std::str::from_utf8(bytes).map_err(|e| LlmError::InvalidUtf8(e.to_string()))
-}
-
-/// Validate the UTF-8 text as a top-level JSON object with a `messages` array,
-/// and return the parsed `Value` so the caller can reuse it for provider detection
-/// without a second `serde_json::from_str` pass.
-///
-/// Returns the top-level `serde_json::Value::Object` by value (not cloned — the
-/// intermediate `Value` is moved out).  On the `parse_with_provider` path the
-/// returned value is dropped immediately; on the `parse` path it is used once
-/// by `provider::detect` (which takes a borrow) and then dropped.
-///
-/// # Complexity
-///
-/// One O(n) depth scan + one serde_json parse.  Provider detection and the
-/// typed-model parse in `parse_as` then re-parse the same bytes independently
-/// (one extra pass for the typed model), but the intermediate `Value` used here
-/// is not kept alive — it is dropped before `parse_as` is called.
-fn validate(text: &str) -> Result<serde_json::Map<String, serde_json::Value>> {
-    check_depth(text)?;
-    let top: serde_json::Value = serde_json::from_str(text)?;
-    // Move the map out of the Value rather than cloning — avoids a full O(body)
-    // deep copy.  We only need to check the shape and return the map for
-    // provider::detect to borrow briefly.
-    let obj = match top {
-        serde_json::Value::Object(m) => m,
-        other => return Err(LlmError::NotAnObject(describe_value(&other).to_string())),
-    };
-    match obj.get("messages") {
-        None => return Err(LlmError::MissingMessages),
-        Some(serde_json::Value::Array(_)) => {}
-        Some(other) => {
-            return Err(LlmError::MessagesNotArray(
-                describe_value(other).to_string(),
-            ));
-        }
-    }
-    Ok(obj)
 }
 
 /// A parsed LLM request body.
@@ -102,9 +85,38 @@ pub enum ParsedBody {
 /// ```
 pub fn parse(bytes: &[u8]) -> Result<ParsedBody> {
     let text = to_utf8(bytes)?;
-    let obj = validate(text)?;
-    let provider = provider::detect(&obj);
-    parse_as(text, provider)
+    check_depth(text)?;
+    // Single shallow parse: provider detection + shape validation.
+    let det = detect_or_shape_err(text)?;
+    parse_as(text, det.provider)
+}
+
+/// Detect provider or return the correct shape error.
+///
+/// Combines the top-level type check (NotAnObject) with the shallow detection
+/// (MissingMessages, MessagesNotArray).  Separated from [`parse`] so
+/// [`parse_with_provider`] can reuse the shape-validation half.
+fn detect_or_shape_err(text: &str) -> Result<provider::Detection> {
+    let text_trimmed = text.trim();
+    let first = text_trimmed.as_bytes().first();
+    match first {
+        Some(b'[') => return Err(LlmError::NotAnObject("array".to_string())),
+        Some(b'"') => return Err(LlmError::NotAnObject("string".to_string())),
+        Some(b't') => return Err(LlmError::NotAnObject("bool".to_string())),
+        Some(b'f') => return Err(LlmError::NotAnObject("bool".to_string())),
+        Some(b'n') => return Err(LlmError::NotAnObject("null".to_string())),
+        Some(b'0'..=b'9') | Some(b'-') => return Err(LlmError::NotAnObject("number".to_string())),
+        _ => {}
+    }
+
+    let det = provider::detect_str(text)?;
+    if !det.messages_present {
+        return Err(LlmError::MissingMessages);
+    }
+    if !det.messages_is_array {
+        return Err(LlmError::MessagesNotArray("non-array".to_string()));
+    }
+    Ok(det)
 }
 
 /// Parse raw JSON bytes with an explicit provider hint.
@@ -117,7 +129,9 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedBody> {
 /// Same as [`parse`].
 pub fn parse_with_provider(bytes: &[u8], p: Provider) -> Result<ParsedBody> {
     let text = to_utf8(bytes)?;
-    validate(text)?;
+    check_depth(text)?;
+    // Shape validation only (provider hint overrides detection).
+    detect_or_shape_err(text)?;
     parse_as(text, p)
 }
 
@@ -147,9 +161,9 @@ fn parse_as(text: &str, provider: Provider) -> Result<ParsedBody> {
 ///
 /// This function does NOT validate JSON structure — it only counts nesting tokens.
 /// Unbalanced closers (e.g. a leading `}`) are absorbed by `saturating_sub` without
-/// error.  Structural validity is enforced by the `serde_json::from_str` call that
-/// immediately follows in `validate()`.  If that call were ever removed or reordered,
-/// structurally malformed bodies could pass the depth check silently.
+/// error.  Structural validity is enforced by the `serde_json::from_str` calls that
+/// follow in `detect_str` and `parse_as`.  If those calls were ever removed or
+/// reordered, structurally malformed bodies could pass the depth check silently.
 fn check_depth(text: &str) -> Result<()> {
     let mut depth: u32 = 0;
     let mut in_string = false;
@@ -185,23 +199,4 @@ fn check_depth(text: &str) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Describe a JSON value type for error messages.
-///
-/// For scalar types, emits only the JSON type tag — not the value content.  This is
-/// a defence-in-depth log-hygiene measure: if a downstream caller logs `LlmError`
-/// display output, no fragment of attacker-controlled request content lands in logs.
-/// The type tag alone is sufficient to explain the shape error (the reachable cases
-/// are a bare-string top-level body or a non-array `messages` value; neither needs
-/// content to be diagnosable).
-fn describe_value(v: &serde_json::Value) -> &'static str {
-    match v {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "bool",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
 }

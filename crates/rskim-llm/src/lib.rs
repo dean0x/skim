@@ -58,11 +58,13 @@
 //!
 //! # Memory constant k
 //!
-//! Peak allocation during parse is bounded by approximately `k = 3.5 × body_size` for
-//! typical tool-result-heavy bodies. This accounts for: the input buffer (1×), the
-//! parsed `serde_json::Value` intermediate (≤1.5×), and the typed model (≤1×). The
-//! `RawValue` mechanism avoids re-encoding number tokens so there is no size inflation.
-//! The `k = 3.5×` figure is an analytical estimate; wiring it up as an enforced
+//! Peak allocation during parse is bounded by approximately `k ≈ 2 × body_size` for
+//! typical tool-result-heavy bodies. This accounts for: the input buffer (1×) and the
+//! typed model (≤1×). The shallow provider-detection pass (via `serde::de::IgnoredAny`)
+//! allocates only for the narrow set of discriminating fields, which is sub-linear in
+//! body size. The previous k ≈ 3.5× was dominated by a throwaway `serde_json::Value`
+//! intermediate; that intermediate was eliminated in the single-parse refactor.
+//! The `k ≈ 2×` figure is an analytical estimate; wiring it up as an enforced
 //! counting-allocator regression gate (AC14) is a tracked follow-up (Wave-1 perf gate,
 //! #309) — there is no isolated counting-allocator test binary in this crate yet.
 //!

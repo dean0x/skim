@@ -19,11 +19,13 @@
 //!
 //! # Memory constant k
 //!
-//! Peak allocation during parse is bounded analytically by k ≈ 3.5 × body_size
-//! (input buffer 1×, serde_json::Value intermediate ≤1.5×, typed model ≤1×). A
+//! Peak allocation during parse is bounded analytically by k ≈ 2 × body_size
+//! (input buffer 1×, typed model ≤1×). The previous k ≈ 3.5× that included a
+//! throwaway serde_json::Value intermediate was eliminated in the single-parse
+//! refactor (provider detection now uses a shallow IgnoredAny scan). A
 //! counting-allocator regression gate would require a custom global allocator in an
 //! isolated binary; that infrastructure is a tracked follow-up (#309 Wave-1 perf gate).
-//! The analytical k = 3.5 bound is documented in lib.rs as the design intent.
+//! The analytical k ≈ 2× bound is documented in lib.rs as the design intent.
 //!
 //! # Test isolation
 //!
@@ -115,7 +117,9 @@ fn min_time_cycle(input: &[u8]) -> u128 {
 ///
 /// # Memory-k bound follow-up
 ///
-/// Peak allocation during parse is analytically bounded at k ≈ 3.5 × body_size.
+/// Peak allocation during parse is analytically bounded at k ≈ 2 × body_size
+/// (input buffer 1×, typed model ≤1×) after the single-parse refactor that
+/// eliminated the throwaway serde_json::Value intermediate.
 /// Wiring this as an enforced counting-allocator test (AC14) is tracked in a
 /// dedicated follow-up (#333, filed alongside #323-#328 per ADR-004).  The
 /// isolated counting-allocator binary must not share the global allocator with
