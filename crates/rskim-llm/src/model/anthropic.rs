@@ -5,10 +5,10 @@
 //!
 //! # Non-exhaustive types
 //!
-//! All public enums are `#[non_exhaustive]` — new block types added by Anthropic in
-//! future schema versions will fall through to the `Unknown` variant rather than
-//! failing to parse, and no callers can match exhaustively (additive-only insurance,
-//! per Resolved Decision 7).
+//! [`AnthropicBlock`], [`AnthropicSystem`], [`AnthropicContent`], and
+//! [`ToolResultContent`] are all `#[non_exhaustive]` — new variants added by
+//! Anthropic in future schema versions will not break downstream crates that match on
+//! these enums (additive-only insurance, per Resolved Decision 7).
 
 use serde::{Deserialize, Serialize};
 
@@ -110,8 +110,16 @@ impl AnthropicBody {
 ///
 /// Both forms are valid in the Anthropic API. The array form supports `cache_control`
 /// on individual system entries.
+///
+/// # Note: not used in the typed model
+///
+/// `AnthropicBody` stores `system` (and all other non-`model`/`messages` top-level
+/// fields) in `extra_fields` as a raw `serde_json::Value` to preserve byte identity.
+/// This type is provided as public API for callers that want to parse the `system`
+/// field from `extra_fields` manually; it is not used internally by [`crate::parse`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum AnthropicSystem {
     /// Plain string system prompt.
     Text(String),
@@ -162,6 +170,7 @@ pub struct AnthropicMessage {
 /// Message content — either a plain string or an array of typed blocks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum AnthropicContent {
     /// Plain string content (shorthand for a single text block).
     Text(String),
@@ -401,6 +410,7 @@ pub struct ToolResultBlock {
 /// Content of a tool result — string or block array.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum ToolResultContent {
     /// Plain string result.
     Text(String),
@@ -444,6 +454,13 @@ pub struct ThinkingBlock {
 }
 
 /// A tool definition in the Anthropic request.
+///
+/// # Note: not used in the typed model
+///
+/// `AnthropicBody` stores `tools` in `extra_fields` as a raw `serde_json::Value`
+/// to preserve byte identity. This type is provided as public API for callers that
+/// want to parse tool definitions from `extra_fields` manually; it is not used
+/// internally by [`crate::parse`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicTool {
     /// The tool name.

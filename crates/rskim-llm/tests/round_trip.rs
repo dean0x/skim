@@ -148,6 +148,11 @@ fn ac3_large_body_round_trip() {
 fn ac4_byte_stability_double_run() {
     // Serializing the same model twice must produce identical bytes.
     // This covers: no hash-map iteration leaks, no RNG, no reformatting.
+    //
+    // Cross-process / cross-OS stability: the serialize() hot path is
+    // `raw_bytes.clone()` — a verbatim Vec<u8> copy with no HashMap iteration,
+    // RNG, or clock dependence — so output cannot differ between runs or OSes.
+    // Cross-OS matrix coverage is delegated to #323's workspace CI matrix.
     let input = br#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":[{"type":"text","text":"Hello"},{"type":"tool_use","id":"t1","name":"search","input":{"q":"test"}}]}],"max_tokens":1024}"#;
     let body = parse(input).expect("parse failed");
     let out1 = serialize(&body).expect("serialize 1 failed");

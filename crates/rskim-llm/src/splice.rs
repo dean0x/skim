@@ -24,7 +24,7 @@
 //! `Err(NotFound)` rather than guessing if the structure is unexpected.
 
 use crate::model::anthropic::LeafRef;
-use crate::{LlmError, Result as LlmResult};
+use crate::{LlmError, Result};
 
 /// The byte range `[start, end)` of a JSON string value in a raw bytes buffer.
 ///
@@ -48,7 +48,7 @@ pub struct StringSpan {
 ///
 /// Returns `Err` if `serde_json::to_string` fails (OOM). In practice this is
 /// unreachable for a `&str` argument.
-pub fn splice_replace(raw: &[u8], span: StringSpan, new_text: &str) -> LlmResult<Vec<u8>> {
+pub fn splice_replace(raw: &[u8], span: StringSpan, new_text: &str) -> Result<Vec<u8>> {
     // JSON-quote the replacement text.  serde_json::to_string always produces
     // valid UTF-8 JSON; the only fallible scenario is an OOM — which is surfaced
     // as a Json error rather than a panic.
@@ -67,7 +67,7 @@ pub fn splice_replace(raw: &[u8], span: StringSpan, new_text: &str) -> LlmResult
 /// Returns `Err(LlmError::BlockNotFound)` if the structural path does not exist
 /// in the raw bytes (this should not happen if the body was parsed from `raw`,
 /// but is returned defensively).
-pub fn find_leaf_span(raw: &[u8], leaf: &LeafRef) -> LlmResult<StringSpan> {
+pub fn find_leaf_span(raw: &[u8], leaf: &LeafRef) -> Result<StringSpan> {
     // Validate UTF-8 — the raw bytes should always be valid UTF-8 JSON, but we
     // check defensively before indexing into the text with char boundaries.
     let text = std::str::from_utf8(raw).map_err(|e| LlmError::InvalidUtf8(e.to_string()))?;
@@ -186,6 +186,21 @@ enum RestPath {
 ///
 /// Error on unexpected structure returns `LlmError::BlockNotFound` (the
 /// structural path the caller asked for does not exist in the raw bytes).
+///
+/// # Recursion depth bound
+///
+/// `skip_value` is mutually recursive with `skip_object`/`skip_array` (each
+/// calls the other for nested structures). The recursion depth is bounded
+/// implicitly by [`crate::MAX_DEPTH`] = 64: every `ParsedBody` is constructed
+/// only via [`crate::parse`] / [`crate::parse_with_provider`], both of which
+/// call `validate` → `check_depth` first.  Any body that passes `check_depth`
+/// has nesting ≤ 64, so the recursion depth here is also ≤ 64.
+///
+/// **Callers MUST ensure the bytes passed to `find_leaf_span` have already
+/// cleared `check_depth`.** Passing un-validated bytes would allow unbounded
+/// recursion.  The `splice_replace` function JSON-quotes the replacement text
+/// before storing it in `raw_bytes`, so a post-mutation body cannot introduce
+/// structural nesting that exceeds the original depth.
 struct Scanner<'a> {
     src: &'a str,
     pos: usize,
@@ -214,7 +229,7 @@ impl<'a> Scanner<'a> {
 
     /// Consume the next non-whitespace byte, returning an error if it doesn't
     /// match `expected`.
-    fn consume_byte(&mut self, expected: u8) -> LlmResult<()> {
+    fn consume_byte(&mut self, expected: u8) -> Result<()> {
         self.skip_ws();
         let byte = self.src.as_bytes().get(self.pos).copied().ok_or_else(|| {
             LlmError::BlockNotFound(format!(
@@ -233,12 +248,12 @@ impl<'a> Scanner<'a> {
     }
 
     /// Enter a JSON object: consume the opening `{`.
-    fn enter_object(&mut self) -> LlmResult<()> {
+    fn enter_object(&mut self) -> Result<()> {
         self.consume_byte(b'{')
     }
 
     /// Enter a JSON array: consume the opening `[`.
-    fn enter_array(&mut self) -> LlmResult<()> {
+    fn enter_array(&mut self) -> Result<()> {
         self.consume_byte(b'[')
     }
 
@@ -256,7 +271,7 @@ impl<'a> Scanner<'a> {
     /// Advance past a complete JSON string, returning its byte span `[start, end)`.
     ///
     /// `start` is the index of the opening `"`, `end` is one past the closing `"`.
-    fn scan_string(&mut self) -> LlmResult<StringSpan> {
+    fn scan_string(&mut self) -> Result<StringSpan> {
         self.skip_ws();
         let start = self.pos;
         self.consume_byte(b'"')?;
@@ -273,7 +288,20 @@ impl<'a> Scanner<'a> {
                     // Escape sequence: skip both the backslash and the next byte.
                     // For \uXXXX the loop will handle the 4 hex digits naturally
                     // since they are all ASCII and none are `"` or `\`.
-                    i += 2;
+                    //
+                    // Guard: if the backslash is the last byte before EOF, `i + 2`
+                    // would exceed `bytes.len()`.  The loop's `i >= bytes.len()`
+                    // check at the top would still catch it (no out-of-bounds read),
+                    // but we advance conservatively to keep the scanner robust
+                    // against un-validated input (defense-in-depth per PF-004).
+                    if i + 1 < bytes.len() {
+                        i += 2;
+                    } else {
+                        // Trailing lone backslash — unterminated string
+                        return Err(LlmError::BlockNotFound(
+                            "unterminated JSON string (trailing backslash)".to_string(),
+                        ));
+                    }
                 }
                 b'"' => {
                     i += 1;
@@ -289,7 +317,7 @@ impl<'a> Scanner<'a> {
     }
 
     /// Advance past a complete JSON number (integer or float).
-    fn skip_number(&mut self) -> LlmResult<()> {
+    fn skip_number(&mut self) -> Result<()> {
         self.skip_ws();
         let bytes = self.src.as_bytes();
         let start = self.pos;
@@ -311,7 +339,7 @@ impl<'a> Scanner<'a> {
     }
 
     /// Skip a `true` / `false` / `null` literal.
-    fn skip_literal(&mut self, lit: &[u8]) -> LlmResult<()> {
+    fn skip_literal(&mut self, lit: &[u8]) -> Result<()> {
         let end = self.pos + lit.len();
         if self.src.as_bytes().get(self.pos..end) == Some(lit) {
             self.pos = end;
@@ -326,7 +354,11 @@ impl<'a> Scanner<'a> {
     }
 
     /// Skip a complete JSON value of any type.
-    fn skip_value(&mut self) -> LlmResult<()> {
+    ///
+    /// Mutually recursive with `skip_object`/`skip_array`. Recursion depth is
+    /// bounded by [`crate::MAX_DEPTH`] via the upstream `check_depth` gate —
+    /// see [`Scanner`] for the invariant.
+    fn skip_value(&mut self) -> Result<()> {
         match self
             .peek()
             .ok_or_else(|| LlmError::BlockNotFound("unexpected end of input".to_string()))?
@@ -357,7 +389,7 @@ impl<'a> Scanner<'a> {
     }
 
     /// Skip a complete JSON object (including nested objects and arrays).
-    fn skip_object(&mut self) -> LlmResult<()> {
+    fn skip_object(&mut self) -> Result<()> {
         self.consume_byte(b'{')?;
         loop {
             self.skip_ws();
@@ -391,7 +423,7 @@ impl<'a> Scanner<'a> {
     }
 
     /// Skip a complete JSON array.
-    fn skip_array(&mut self) -> LlmResult<()> {
+    fn skip_array(&mut self) -> Result<()> {
         self.consume_byte(b'[')?;
         loop {
             self.skip_ws();
@@ -419,7 +451,7 @@ impl<'a> Scanner<'a> {
     ///
     /// The scanner must have already consumed the `{` via `enter_object()`.
     /// After this call, the cursor is positioned at the start of the value for `key`.
-    fn seek_key(&mut self, key: &str) -> LlmResult<()> {
+    fn seek_key(&mut self, key: &str) -> Result<()> {
         loop {
             self.skip_ws();
             // Check for empty object or end
@@ -465,7 +497,7 @@ impl<'a> Scanner<'a> {
     ///
     /// This is distinct from `scan_string()` in that it is used for the final
     /// target value — we want its span, not to skip past it.
-    fn find_string_span(&mut self) -> LlmResult<StringSpan> {
+    fn find_string_span(&mut self) -> Result<StringSpan> {
         self.skip_ws();
         let next = self.src.as_bytes().get(self.pos).copied();
         if next != Some(b'"') {

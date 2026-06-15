@@ -126,6 +126,15 @@ pub const MAX_DEPTH: u32 = 64;
 /// leaf. Exempt blocks are not included (they always return `unknown` if
 /// [`classify`] is called on them directly).
 ///
+/// # OpenAI id asymmetry
+///
+/// For OpenAI bodies, this function emits block ids of the form `m{i}` (string
+/// content) and `m{i}p{j}` (content part). However, [`list_blocks`] returns an
+/// empty list for OpenAI bodies, so these ids are **not** addressable through
+/// [`mutate_block`]. Attempting to mutate an OpenAI body using an id returned
+/// here will return [`LlmError::BlockNotMutable`]. This asymmetry is a known
+/// limitation until OpenAI mutation is implemented (#329).
+///
 /// # Examples
 ///
 /// ```

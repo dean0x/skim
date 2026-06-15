@@ -266,13 +266,69 @@ fn error_block_not_found() {
 }
 
 #[test]
-fn error_exempt_block_not_mutable() {
-    // OpenAI body — mutation not yet implemented (returns BlockNotFound)
+fn error_exempt_block_anthropic_tool_use() {
+    // An Anthropic body with a tool_use block (exempt from mutation).
+    // list_blocks returns a descriptor with mutable:false and kind "tool_use".
+    // mutate_block must return Err(BlockNotMutable), NOT BlockNotFound.
+    let json = br#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_abc","name":"bash","input":{"cmd":"ls"}}]}],"max_tokens":100}"#;
+    let mut body = parse(json).expect("parse failed");
+
+    // list_blocks must expose the tool_use block with mutable:false
+    let blocks = list_blocks(&body);
+    assert_eq!(blocks.len(), 1, "should have one block descriptor");
+    assert!(!blocks[0].mutable, "tool_use must be non-mutable");
+    assert_eq!(blocks[0].kind, "tool_use");
+    let tool_id = blocks[0].id.clone();
+
+    // mutate_block on an exempt id must return BlockNotMutable, not BlockNotFound
+    let result = mutate_block(&mut body, &tool_id, "replacement");
+    assert!(result.is_err(), "mutating exempt block must return Err");
+    match result.unwrap_err() {
+        rskim_llm::LlmError::BlockNotMutable(id, kind) => {
+            assert_eq!(id, tool_id, "error id must match requested id");
+            assert_eq!(kind, "tool_use", "error kind must match block kind");
+        }
+        other => panic!("expected BlockNotMutable, got: {other}"),
+    }
+}
+
+#[test]
+fn error_exempt_block_anthropic_thinking() {
+    // An Anthropic body with a thinking block (exempt from mutation).
+    let json = br#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"Let me think..."}]}],"max_tokens":100}"#;
+    let mut body = parse(json).expect("parse failed");
+
+    let blocks = list_blocks(&body);
+    assert_eq!(blocks.len(), 1);
+    assert!(!blocks[0].mutable, "thinking must be non-mutable");
+    assert_eq!(blocks[0].kind, "thinking");
+    let thinking_id = blocks[0].id.clone();
+
+    let result = mutate_block(&mut body, &thinking_id, "replacement");
+    match result.unwrap_err() {
+        rskim_llm::LlmError::BlockNotMutable(id, kind) => {
+            assert_eq!(id, thinking_id);
+            assert_eq!(kind, "thinking");
+        }
+        other => panic!("expected BlockNotMutable, got: {other}"),
+    }
+}
+
+#[test]
+fn error_openai_body_returns_block_not_mutable() {
+    // OpenAI body — mutation not yet implemented.
+    // Must return BlockNotMutable (not BlockNotFound) so callers can distinguish
+    // "unsupported provider" from "id does not exist".
     let openai_json = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}"#;
     let mut body = parse_with_provider(openai_json, Provider::OpenAi).expect("parse failed");
     let result = mutate_block(&mut body, "m0", "text");
-    // OpenAI mutation returns BlockNotFound (not yet implemented)
-    assert!(result.is_err());
+    match result.unwrap_err() {
+        rskim_llm::LlmError::BlockNotMutable(id, kind) => {
+            assert_eq!(id, "m0");
+            assert_eq!(kind, "openai-not-implemented");
+        }
+        other => panic!("expected BlockNotMutable(openai-not-implemented), got: {other}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +474,65 @@ fn ac11_no_mutation_api_through_public_fields() {
         }
         _ => panic!("expected Anthropic"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// JSON-escaping mutation (coverage for splice_replace's serde_json::to_string path)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mutation_with_json_escaped_replacement() {
+    // Replacement text contains characters that require JSON escaping:
+    // double-quote, backslash, newline, tab, and a non-ASCII codepoint.
+    // splice_replace uses serde_json::to_string to produce the quoted replacement,
+    // so the round-trip must: (a) re-parse successfully, (b) decode back to the
+    // original replacement text, (c) be byte-stable under repeat mutation, and
+    // (d) leave surrounding bytes unchanged.
+    let input: &[u8] = br#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"ORIGINAL"}],"max_tokens":100}"#;
+    let new_text = "she said \"hi\"\nline2\t\u{1f600}";
+
+    let mut body = parse(input).expect("parse failed");
+    let blocks = list_blocks(&body);
+    let bid = blocks
+        .iter()
+        .find(|b| b.mutable)
+        .expect("no mutable block")
+        .id
+        .clone();
+
+    // (a) mutation must succeed and produce valid JSON
+    let result = mutate_block(&mut body, &bid, new_text).expect("mutation failed");
+    let reparsed = parse(&result).expect("re-parse after escape-triggering mutation failed");
+
+    // (b) the replacement text must round-trip correctly through JSON
+    match &reparsed {
+        ParsedBody::Anthropic(b) => match &b.messages()[0].content {
+            rskim_llm::model::anthropic::AnthropicContent::Text(s) => {
+                assert_eq!(
+                    s, new_text,
+                    "JSON-escaped replacement must decode back to original text"
+                );
+            }
+            _ => panic!("expected string content"),
+        },
+        _ => panic!("expected Anthropic"),
+    }
+
+    // (c) repeat mutation must produce byte-identical output (idempotency)
+    let result2 = mutate_block(&mut body, &bid, new_text).expect("second mutation failed");
+    assert_eq!(
+        result, result2,
+        "repeat mutation with escaped text must be byte-identical"
+    );
+
+    // (d) surrounding bytes must be unchanged
+    let prefix_end = result
+        .windows(b"ORIGINAL".len())
+        .position(|w| w == b"ORIGINAL");
+    assert!(
+        prefix_end.is_none(),
+        "old payload 'ORIGINAL' must not appear in result"
+    );
 }
 
 // Property test: message count and order invariant through parse->classify->mutate->serialize.

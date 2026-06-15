@@ -238,14 +238,19 @@ fn ac5_boundary_indented_code_is_text() {
 }
 
 #[test]
-fn ac6_cross_process_determinism_simulation() {
-    // Simulates cross-process by running classify in a separate call stack via a fn ptr.
-    // True cross-process testing is done via CI (manually verified).
-    let classify_fn: fn(&str) -> rskim_llm::classify::Classification = classify;
-
+fn ac6_same_process_determinism() {
+    // Verifies that classify() is deterministic within the same process: 100
+    // back-to-back calls on identical input always return identical output.
+    //
+    // This does NOT simulate cross-process execution (a fn pointer call is
+    // identical to a direct call — no new process or address space is created).
+    // Cross-process determinism follows structurally from the implementation:
+    // classify.rs contains no HashMap iteration, RNG, clock reads, or mutable
+    // global state, so outputs cannot differ between runs. The cross-OS matrix
+    // in #323 will provide additional assurance.
     let text = r#"{"model":"test","result":[1,2,3]}"#;
-    let first = classify_fn(text);
+    let first = classify(text);
     for _ in 0..100 {
-        assert_eq!(classify_fn(text), first);
+        assert_eq!(classify(text), first, "classify must be deterministic");
     }
 }

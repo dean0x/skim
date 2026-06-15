@@ -63,6 +63,8 @@ fn ac1_anthropic_corpus_parses_to_ok() {
             ParsedBody::OpenAi(_) => {
                 // Some Anthropic fixtures might be ambiguous — still a valid parse
             }
+            // non_exhaustive: wildcard required for future provider variants
+            _ => {}
         }
     }
 }
@@ -266,6 +268,70 @@ fn ac8_errors_have_non_empty_diagnostics() {
             !msg.is_empty(),
             "error message should not be empty for {label}"
         );
+    }
+}
+
+/// AC3 — Provider auto-detection via `parse()` (no explicit provider hint).
+///
+/// Tests that `parse()` correctly identifies OpenAI bodies even when they have
+/// no discriminating message-level fields (no tool_calls, no tool_call_id, no
+/// role:"developer", no response_format).  Previously, such bodies would be
+/// silently misclassified as Anthropic.
+#[test]
+fn ac3_auto_detect_openai_from_model_prefix() {
+    // A minimal plain-chat OpenAI body: no tool signals, just a model name.
+    let cases: &[(&[u8], &str)] = &[
+        (
+            br#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}"#,
+            "gpt-4o",
+        ),
+        (
+            br#"{"model":"gpt-3.5-turbo","messages":[{"role":"system","content":"Be helpful"},{"role":"user","content":"Hi"}]}"#,
+            "gpt-3.5-turbo",
+        ),
+        (
+            br#"{"model":"o1-mini","messages":[{"role":"user","content":"Solve this"}]}"#,
+            "o1-mini",
+        ),
+        (
+            br#"{"model":"o3-mini","messages":[{"role":"user","content":"Test"}]}"#,
+            "o3-mini",
+        ),
+    ];
+
+    for (bytes, model) in cases {
+        let result = parse(bytes);
+        assert!(
+            result.is_ok(),
+            "parse failed for model {model}: {:?}",
+            result.unwrap_err()
+        );
+        match result.unwrap() {
+            ParsedBody::OpenAi(b) => {
+                assert_eq!(b.model(), *model, "model field must be preserved");
+            }
+            ParsedBody::Anthropic(_) => {
+                panic!("model {model} was misdetected as Anthropic — should be OpenAI");
+            }
+            // non_exhaustive: wildcard required for future provider variants
+            _ => panic!("unexpected ParsedBody variant for model {model}"),
+        }
+    }
+}
+
+/// A plain Anthropic body (no max_tokens discriminant) must still detect as Anthropic
+/// when its message content contains an Anthropic-specific block type.
+#[test]
+fn ac3_auto_detect_anthropic_from_block_type() {
+    let json = br#"{"model":"claude-opus-4","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"Let me reason..."}]}]}"#;
+    let body = parse(json).expect("parse failed");
+    match body {
+        ParsedBody::Anthropic(_) => {}
+        ParsedBody::OpenAi(_) => {
+            panic!("body with thinking block must detect as Anthropic")
+        }
+        // non_exhaustive: wildcard required for future provider variants
+        _ => panic!("unexpected ParsedBody variant"),
     }
 }
 

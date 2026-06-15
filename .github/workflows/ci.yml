@@ -116,9 +116,10 @@ jobs:
         # that are missed by cargo clippy without --all-targets.
         run: cargo clippy --all-features --all-targets -- -D warnings
 
-      - name: Dependency-tree isolation check (AC9)
+      - name: Dependency-tree isolation check (AC9/AC12)
         # Proves no HTTP/TLS crate appears in the default-features build of
-        # rskim-tokens or the skim binary. Uses set -o pipefail per PF-007.
+        # rskim-tokens, rskim-llm, or the skim binary. Uses set -o pipefail per PF-007.
+        # AC12 for rskim-llm: forbids tokio/hyper/reqwest/std::fs/std::net/rand/SystemTime/Instant.
         run: |
           set -o pipefail
           echo "=== rskim-tokens default-features tree ==="
@@ -129,6 +130,16 @@ jobs:
           fi
           echo "PASS: no HTTP/TLS in rskim-tokens default build"
 
+          echo "=== rskim-llm default-features tree (AC12) ==="
+          cargo tree -p rskim-llm -e normal 2>&1 | tee /tmp/rskim-llm-tree.txt
+          FORBIDDEN_LLM='tokio|hyper|reqwest|rustls|native-tls|openssl|rand\b|SystemTime|Instant'
+          if grep -qE "$FORBIDDEN_LLM" /tmp/rskim-llm-tree.txt; then
+            echo "FAIL: forbidden dependency found in rskim-llm default build (AC12)"
+            grep -E "$FORBIDDEN_LLM" /tmp/rskim-llm-tree.txt || true
+            exit 1
+          fi
+          echo "PASS: no forbidden dependencies in rskim-llm default build"
+
           echo "=== skim binary default-features tree ==="
           cargo tree -p rskim -e normal 2>&1 | tee /tmp/rskim-tree.txt
           if grep -qE 'ureq|reqwest|hyper|rustls|native-tls|openssl' /tmp/rskim-tree.txt; then
@@ -136,6 +147,42 @@ jobs:
             exit 1
           fi
           echo "PASS: no HTTP/TLS in skim binary default build"
+
+  fuzz-smoke:
+    name: Fuzz Smoke (AC15, rskim-llm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust nightly (required for cargo-fuzz / libFuzzer)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-nightly-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+
+      # AC15: bounded 60s cargo-fuzz smoke run, gated on real process exit status
+      # (PF-007: set -o pipefail, explicit exit-code check — NOT a piped tail).
+      # The -timeout=5 flag enforces the per-input 5s hang bound.
+      # Scope note: cross-OS fuzz matrix belongs to #323; this job is the AC15
+      # per-#302 deliverable (Linux-only smoke, nightly-pinned to this job only).
+      - name: AC15 fuzz smoke (parse_fuzz, 60s)
+        run: |
+          set -o pipefail
+          cd crates/rskim-llm
+          cargo +nightly fuzz run parse_fuzz fuzz/corpus/parse_fuzz -- \
+            -max_total_time=60 -timeout=5 2>&1
+          FUZZ_EXIT=$?
+          if [ "$FUZZ_EXIT" -ne 0 ]; then
+            echo "FAIL: fuzz smoke run exited with status $FUZZ_EXIT"
+            exit "$FUZZ_EXIT"
+          fi
+          echo "PASS: fuzz smoke run completed without crash or hang"
 
   build:
     name: Build Check

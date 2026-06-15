@@ -13,17 +13,31 @@ use crate::model::openai::OpenAiBody;
 use crate::provider::Provider;
 use crate::{LlmError, MAX_DEPTH, Result, provider};
 
-/// Validate the UTF-8 text as a top-level JSON object with a `messages` array.
+/// Validate the UTF-8 text as a top-level JSON object with a `messages` array,
+/// and return the parsed `Value` so the caller can reuse it for provider detection
+/// without a second `serde_json::from_str` pass.
 ///
-/// Shared by [`parse`] and [`parse_with_provider`] to avoid duplicating the
-/// pre-parse validation steps.
+/// Returns the top-level `serde_json::Value::Object` by value (not cloned — the
+/// intermediate `Value` is moved out).  On the `parse_with_provider` path the
+/// returned value is dropped immediately; on the `parse` path it is used once
+/// by `provider::detect` (which takes a borrow) and then dropped.
+///
+/// # Complexity
+///
+/// One O(n) depth scan + one serde_json parse.  Provider detection and the
+/// typed-model parse in `parse_as` then re-parse the same bytes independently
+/// (one extra pass for the typed model), but the intermediate `Value` used here
+/// is not kept alive — it is dropped before `parse_as` is called.
 fn validate(text: &str) -> Result<serde_json::Map<String, serde_json::Value>> {
     check_depth(text)?;
     let top: serde_json::Value = serde_json::from_str(text)?;
-    let obj = top
-        .as_object()
-        .ok_or_else(|| LlmError::NotAnObject(describe_value(&top)))?
-        .clone();
+    // Move the map out of the Value rather than cloning — avoids a full O(body)
+    // deep copy.  We only need to check the shape and return the map for
+    // provider::detect to borrow briefly.
+    let obj = match top {
+        serde_json::Value::Object(m) => m,
+        other => return Err(LlmError::NotAnObject(describe_value(&other))),
+    };
     match obj.get("messages") {
         None => return Err(LlmError::MissingMessages),
         Some(serde_json::Value::Array(_)) => {}
@@ -36,7 +50,11 @@ fn validate(text: &str) -> Result<serde_json::Map<String, serde_json::Value>> {
 ///
 /// Holds either an Anthropic or OpenAI body, preserving all unknown fields as raw
 /// byte spans for byte-identical round-trips.
+///
+/// This enum is `#[non_exhaustive]` — future providers can be added without a
+/// breaking change (additive-only insurance per Resolved Decision 7).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ParsedBody {
     /// An Anthropic `/v1/messages` request body.
     Anthropic(AnthropicBody),
@@ -68,6 +86,8 @@ pub enum ParsedBody {
 /// match body {
 ///     ParsedBody::Anthropic(b) => assert_eq!(b.model(), "claude-3-5-sonnet-20241022"),
 ///     ParsedBody::OpenAi(_) => panic!("unexpected"),
+///     // ParsedBody is #[non_exhaustive] — wildcard required for future variants
+///     _ => panic!("unexpected variant"),
 /// }
 /// # Ok::<(), rskim_llm::LlmError>(())
 /// ```

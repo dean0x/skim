@@ -20,9 +20,10 @@
 //!
 //! # Non-exhaustive types
 //!
-//! Public enums are `#[non_exhaustive]` where applicable. The `OpenAiRole` enum
-//! is exhaustive over the five documented roles but new roles land in
-//! `extra_fields` via the `flatten` mechanism on `OpenAiMessage`.
+//! [`OpenAiContent`] is `#[non_exhaustive]` — new content variants can be added
+//! without breaking downstream matches.  The message `role` field is modeled as a
+//! plain `String` (not an enum) so new roles are handled gracefully without a
+//! dedicated enum variant.
 
 use serde::{Deserialize, Serialize};
 
@@ -139,6 +140,7 @@ pub struct OpenAiMessage {
 /// OpenAI message content — string or array of content parts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum OpenAiContent {
     /// Plain string content.
     Text(String),

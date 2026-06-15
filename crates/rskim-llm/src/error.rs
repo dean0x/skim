@@ -6,7 +6,12 @@ use thiserror::Error;
 ///
 /// All public operations on this crate return `Result<T, LlmError>` — no panics,
 /// no partial builds, no silent failures.
+///
+/// This enum is `#[non_exhaustive]` — new error variants may be added without
+/// a breaking change as the crate gains capabilities (additive-only insurance per
+/// Resolved Decision 7).
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum LlmError {
     /// The input bytes could not be parsed as valid JSON.
     #[error("JSON parse error: {0}")]
@@ -27,6 +32,10 @@ pub enum LlmError {
     /// The JSON object nesting depth exceeds the documented maximum.
     ///
     /// See [`crate::MAX_DEPTH`] for the documented bound.
+    ///
+    /// The error message value (64) must equal [`crate::MAX_DEPTH`]. If MAX_DEPTH
+    /// is ever changed, update the string here too (or use a const format string
+    /// when Rust stable stabilizes const string formatting).
     #[error("JSON nesting depth {0} exceeds maximum 64")]
     DepthExceeded(u32),
 

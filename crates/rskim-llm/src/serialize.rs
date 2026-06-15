@@ -56,10 +56,19 @@ pub fn serialize(body: &ParsedBody) -> Result<Vec<u8>> {
     }
 
     // Typed-fields fallback: only reachable if raw_bytes is empty, which never
-    // happens for a body produced by `parse`/`mutate_block` (both always set it).
-    // Retained as a defensive path so serialize() is total for any constructible
-    // ParsedBody. Field order follows struct declaration order; number formatting
-    // is canonical here (no byte-identity guarantee on this path).
+    // happens for a body produced by `parse`/`mutate_block` (both always set it,
+    // and AnthropicBody/OpenAiBody fields are pub(crate) so no external caller
+    // can construct a body with empty raw_bytes).
+    //
+    // This path is NOT byte-faithful: field order follows struct-declaration order,
+    // number formatting is canonical (e.g. 1e3 → 1000.0), and optional fields with
+    // `skip_serializing_if` may be omitted (e.g. `"content":null` in OpenAI tool-only
+    // messages). It is retained so serialize() is total for any constructible
+    // ParsedBody, but callers must not rely on it producing byte-identical output.
+    debug_assert!(
+        false,
+        "serialize fallback path reached — raw_bytes should always be populated"
+    );
     let bytes = serde_json::to_vec(body)?;
     Ok(bytes)
 }

@@ -30,7 +30,16 @@ use crate::{LlmError, ParsedBody, Result};
 /// Replace the text payload of a single block identified by `block_id`.
 ///
 /// Only mutable blocks may be targeted. Exempt blocks (tool_use input, thinking,
-/// OpenAI opaque fields, unrecognized types) return [`LlmError::BlockNotMutable`].
+/// unrecognized types) return [`LlmError::BlockNotMutable`]. Use
+/// [`crate::list_blocks`] to enumerate blocks and check their `mutable` field
+/// before calling this function.
+///
+/// # OpenAI limitation
+///
+/// OpenAI bodies are not yet mutable through this API. [`crate::list_blocks`]
+/// returns an empty list for OpenAI bodies, and calling `mutate_block` on any
+/// OpenAI body returns [`LlmError::BlockNotMutable`] with kind `"openai-not-implemented"`.
+/// OpenAI mutation is tracked as a follow-up (#329).
 ///
 /// # Arguments
 ///
@@ -45,19 +54,46 @@ use crate::{LlmError, ParsedBody, Result};
 ///
 /// # Errors
 ///
-/// - [`LlmError::BlockNotFound`] — no block with the given ID
-/// - [`LlmError::BlockNotMutable`] — block is exempt from mutation
+/// - [`LlmError::BlockNotFound`] — no block with the given ID exists in the body
+/// - [`LlmError::BlockNotMutable`] — block exists but is exempt from mutation
+///   (tool_use, thinking, unknown block type, or OpenAI body)
 /// - [`LlmError::NoTextPayload`] — block has no text payload
 pub fn mutate_block(body: &mut ParsedBody, block_id: &str, new_text: &str) -> Result<Vec<u8>> {
     match body {
         ParsedBody::Anthropic(b) => mutate_anthropic(b, block_id, new_text),
-        // OpenAI mutation is not yet implemented — follow-up tracked separately.
-        ParsedBody::OpenAi(_) => Err(LlmError::BlockNotFound(block_id.to_string())),
+        // OpenAI mutation is not yet implemented — follow-up tracked as #329.
+        // Return BlockNotMutable (not BlockNotFound) so callers can distinguish
+        // "this provider is unsupported" from "this ID does not exist".
+        ParsedBody::OpenAi(_) => Err(LlmError::BlockNotMutable(
+            block_id.to_string(),
+            "openai-not-implemented".to_string(),
+        )),
     }
 }
 
 fn mutate_anthropic(body: &mut AnthropicBody, block_id: &str, new_text: &str) -> Result<Vec<u8>> {
-    // Find the leaf that matches the block_id
+    // Before looking up in text_leaves() (which only yields mutable leaves),
+    // check list_anthropic_blocks() for the id: if the id exists but is
+    // non-mutable (tool_use, thinking, unknown), return BlockNotMutable so the
+    // error contract documented in the rustdoc is honored.  Only if the id is
+    // absent from both mutable and exempt blocks do we return BlockNotFound.
+    let descriptor = list_anthropic_blocks(body)
+        .into_iter()
+        .find(|d| d.id == block_id);
+    if let Some(d) = &descriptor {
+        if !d.mutable {
+            return Err(LlmError::BlockNotMutable(
+                block_id.to_string(),
+                d.kind.clone(),
+            ));
+        }
+    } else {
+        // Block id not found in the body at all.
+        return Err(LlmError::BlockNotFound(block_id.to_string()));
+    }
+
+    // Now look up the mutable leaf reference (guaranteed to exist after the
+    // check above, since descriptor was Some and mutable == true).
     let leaf = body
         .text_leaves()
         .find(|l| l.id() == block_id)
@@ -81,10 +117,10 @@ fn mutate_anthropic(body: &mut AnthropicBody, block_id: &str, new_text: &str) ->
 
     // Replace raw_bytes with the spliced result.  Subsequent serialize() calls
     // will return this verbatim (the "unmutated path" in serialize.rs), which is
-    // now the post-mutation bytes.
-    body.raw_bytes = new_raw.clone();
-
-    Ok(new_raw)
+    // now the post-mutation bytes.  We store it first and then return a clone
+    // to avoid a second full-body allocation compared to .clone()/.clone().
+    body.raw_bytes = new_raw;
+    Ok(body.raw_bytes.clone())
 }
 
 fn apply_leaf_mutation(body: &mut AnthropicBody, leaf: &LeafRef, new_text: &str) -> Result<()> {
@@ -161,6 +197,18 @@ pub struct BlockDescriptor {
 /// Returns descriptors for every leaf block — both mutable (text payload) and
 /// non-mutable (exempt) blocks. Use the `id` field with [`mutate_block`].
 ///
+/// # OpenAI limitation
+///
+/// OpenAI bodies currently expose **no mutable blocks**: this function returns
+/// an empty `Vec` for any [`ParsedBody::OpenAi`] body. OpenAI mutation is
+/// tracked as a follow-up (#329). If you call [`mutate_block`] on an OpenAI
+/// body, it returns [`crate::LlmError::BlockNotMutable`].
+///
+/// Note: [`crate::classify_body`] does walk OpenAI content and returns
+/// classification results with ids of the form `m{i}` / `m{i}p{j}`, but these
+/// ids are **not** addressable through `list_blocks` or `mutate_block` on OpenAI
+/// bodies.
+///
 /// # Examples
 ///
 /// ```
@@ -176,6 +224,7 @@ pub struct BlockDescriptor {
 pub fn list_blocks(body: &ParsedBody) -> Vec<BlockDescriptor> {
     match body {
         ParsedBody::Anthropic(b) => list_anthropic_blocks(b),
+        // OpenAI mutation is not yet implemented — follow-up tracked as #329.
         ParsedBody::OpenAi(_) => vec![],
     }
 }

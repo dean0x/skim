@@ -9,7 +9,11 @@ use serde_json::Map;
 ///
 /// Provider detection is structural — it inspects field names, not field values.
 /// Detection is deterministic and does not depend on runtime state.
+///
+/// This enum is `#[non_exhaustive]` — future providers can be added without a
+/// breaking change (additive-only insurance per Resolved Decision 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Provider {
     /// An Anthropic `/v1/messages` request body.
     ///
@@ -31,20 +35,35 @@ pub enum Provider {
     OpenAi,
 }
 
+/// Known OpenAI model name prefixes for positive OpenAI detection.
+///
+/// A `model` field starting with any of these strings is a strong signal that
+/// the body is an OpenAI request even when no other discriminating field is
+/// present (e.g. a plain `{"model":"gpt-4o","messages":[...]}` with no
+/// `tool_calls`/`response_format`).  The list covers documented OpenAI model
+/// series as of mid-2025; it is intentionally conservative so false-positives
+/// against future Anthropic model names are avoided.
+const OPENAI_MODEL_PREFIXES: &[&str] = &["gpt-", "o1-", "o3-", "o4-", "text-davinci", "davinci"];
+
 /// Detect the provider from a top-level JSON object.
 ///
 /// Always returns a `Provider` — the detection is a heuristic that falls back to
 /// Anthropic when no discriminating signal is found (Anthropic is the most common
 /// usage context for this crate).
 ///
-/// # Detection heuristics
+/// # Detection heuristics (in order)
 ///
 /// 1. If top-level has `response_format` → OpenAI
 /// 2. If any message has `tool_call_id` or `tool_calls` → OpenAI
 /// 3. If any message has `role: "developer"` → OpenAI
 /// 4. If any message content array has `type: "tool_use"`, `"tool_result"`, or `"thinking"` → Anthropic
 /// 5. If top-level has `max_tokens` → Anthropic
-/// 6. Default: Anthropic
+/// 6. If `model` starts with a known OpenAI prefix (e.g. `"gpt-"`, `"o1-"`) → OpenAI
+/// 7. Default: Anthropic
+///
+/// Heuristic 6 prevents plain OpenAI bodies (no discriminating message-level
+/// fields) from being misclassified as Anthropic, which was a latent gap when
+/// `parse()` (not `parse_with_provider`) was used with bare OpenAI fixtures.
 pub fn detect(obj: &Map<String, serde_json::Value>) -> Provider {
     // Check top-level OpenAI-only fields
     if obj.contains_key("response_format") {
@@ -92,6 +111,18 @@ pub fn detect(obj: &Map<String, serde_json::Value>) -> Provider {
     // Anthropic-specific top-level field
     if obj.contains_key("max_tokens") {
         return Provider::Anthropic;
+    }
+
+    // Model-name prefix heuristic: catch plain OpenAI bodies that lack any
+    // message-level discriminant (e.g. `{"model":"gpt-4o","messages":[...]}`
+    // with no tool_calls/response_format).  This prevents silent misclassification
+    // as Anthropic (applies ADR-001: fix noticed issues immediately).
+    if let Some(serde_json::Value::String(model)) = obj.get("model") {
+        for prefix in OPENAI_MODEL_PREFIXES {
+            if model.starts_with(prefix) {
+                return Provider::OpenAi;
+            }
+        }
     }
 
     // Default: Anthropic
