@@ -1,0 +1,5 @@
+error[E0599]: no method named `mutate_hot_zone_at` found for struct `Outcome` in the current scope
+  --> tests/compile_fail/d_hot_zone_mutation.rs:19:13
+   |
+19 |         out.mutate_hot_zone_at(0, b"new bytes") //~^ ERROR no method named `mutate_hot_zone_at`
+   |             ^^^^^^^^^^^^^^^^^^ method not found in `Outcome`
