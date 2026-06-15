@@ -1,0 +1,8 @@
+2024-01-15T10:30:00Z INFO Starting HTTP server on :8080
+2024-01-15T10:30:00Z INFO Database connection established: postgres://localhost/mydb
+2024-01-15T10:30:01Z INFO Server ready, listening for connections
+2024-01-15T10:31:05Z INFO GET /api/users 200 OK (42ms)
+2024-01-15T10:31:06Z WARN Slow query detected: SELECT * FROM logs (850ms)
+2024-01-15T10:31:10Z INFO POST /api/messages 201 Created (15ms)
+2024-01-15T10:31:15Z ERROR Failed to send email: SMTP timeout
+2024-01-15T10:31:15Z INFO Retrying email delivery (attempt 2/3)

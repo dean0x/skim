@@ -1,0 +1,10 @@
+The parse function returns a Result type to handle errors gracefully:
+
+```rust
+pub fn parse(bytes: &[u8]) -> Result<ParsedBody> {
+    let text = std::str::from_utf8(bytes)?;
+    serde_json::from_str(text).map_err(LlmError::Json)
+}
+```
+
+This ensures that all error conditions are handled explicitly without panicking.

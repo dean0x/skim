@@ -2482,6 +2482,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rskim-llm"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "rskim-research"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,11 @@
+```typescript
+interface ParseResult {
+  body: ParsedBody;
+  provider: Provider;
+}
+
+async function parseRequest(bytes: Uint8Array): Promise<Result<ParseResult>> {
+  const text = new TextDecoder().decode(bytes);
+  return Ok({ body: await parse(text), provider: detectProvider(text) });
+}
+```

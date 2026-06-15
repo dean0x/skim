@@ -1,0 +1,14 @@
+# LLM Request Body Format
+
+## Anthropic
+
+The Anthropic Messages API uses a JSON request body with the following structure:
+
+- `model`: the model identifier (required)
+- `messages`: array of conversation turns (required)
+- `max_tokens`: maximum tokens to generate
+- `system`: optional system prompt (string or block array)
+
+## OpenAI
+
+The OpenAI Chat Completions API uses a similar structure with `model` and `messages` fields, plus additional fields like `response_format` and `tool_calls`.

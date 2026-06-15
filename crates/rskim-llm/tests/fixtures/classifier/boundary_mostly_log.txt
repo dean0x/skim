@@ -1,0 +1,5 @@
+2024-01-15T10:30:00Z INFO Starting process
+2024-01-15T10:30:01Z INFO Connecting to database
+2024-01-15T10:30:01Z WARN Slow response from replica
+This non-log line doesn't match the pattern.
+2024-01-15T10:30:02Z INFO Process completed successfully
