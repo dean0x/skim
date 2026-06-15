@@ -24,6 +24,7 @@
 //! `Err(NotFound)` rather than guessing if the structure is unexpected.
 
 use crate::model::anthropic::LeafRef;
+use crate::parse::to_utf8;
 use crate::{LlmError, Result};
 
 /// The byte range `[start, end)` of a JSON string value in a raw bytes buffer.
@@ -70,7 +71,7 @@ pub fn splice_replace(raw: &[u8], span: StringSpan, new_text: &str) -> Result<Ve
 pub fn find_leaf_span(raw: &[u8], leaf: &LeafRef) -> Result<StringSpan> {
     // Validate UTF-8 — the raw bytes should always be valid UTF-8 JSON, but we
     // check defensively before indexing into the text with char boundaries.
-    let text = std::str::from_utf8(raw).map_err(|e| LlmError::InvalidUtf8(e.to_string()))?;
+    let text = to_utf8(raw)?;
 
     let mut scanner = Scanner::new(text);
 
@@ -392,7 +393,6 @@ impl<'a> Scanner<'a> {
     fn skip_object(&mut self) -> Result<()> {
         self.consume_byte(b'{')?;
         loop {
-            self.skip_ws();
             match self.peek() {
                 Some(b'}') => {
                     self.pos += 1;
@@ -400,10 +400,8 @@ impl<'a> Scanner<'a> {
                 }
                 Some(b'"') => {
                     self.scan_string()?; // key
-                    self.skip_ws();
                     self.consume_byte(b':')?;
                     self.skip_value()?; // value
-                    self.skip_ws();
                     match self.peek() {
                         Some(b',') => {
                             self.pos += 1;
@@ -426,7 +424,6 @@ impl<'a> Scanner<'a> {
     fn skip_array(&mut self) -> Result<()> {
         self.consume_byte(b'[')?;
         loop {
-            self.skip_ws();
             match self.peek() {
                 Some(b']') => {
                     self.pos += 1;
@@ -434,7 +431,6 @@ impl<'a> Scanner<'a> {
                 }
                 _ => {
                     self.skip_value()?;
-                    self.skip_ws();
                     match self.peek() {
                         Some(b',') => {
                             self.pos += 1;
@@ -453,7 +449,6 @@ impl<'a> Scanner<'a> {
     /// After this call, the cursor is positioned at the start of the value for `key`.
     fn seek_key(&mut self, key: &str) -> Result<()> {
         loop {
-            self.skip_ws();
             // Check for empty object or end
             match self.peek() {
                 None | Some(b'}') => {
@@ -467,7 +462,6 @@ impl<'a> Scanner<'a> {
             // Read the key string
             let key_span = self.scan_string()?;
             let found_key = &self.src[key_span.start + 1..key_span.end - 1];
-            self.skip_ws();
             self.consume_byte(b':')?;
 
             if found_key == key {
@@ -476,7 +470,6 @@ impl<'a> Scanner<'a> {
             } else {
                 // Skip the value and any trailing comma
                 self.skip_value()?;
-                self.skip_ws();
                 match self.peek() {
                     Some(b',') => {
                         self.pos += 1;

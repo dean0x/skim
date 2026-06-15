@@ -13,6 +13,11 @@ use crate::model::openai::OpenAiBody;
 use crate::provider::Provider;
 use crate::{LlmError, MAX_DEPTH, Result, provider};
 
+/// Convert raw bytes to UTF-8, returning [`LlmError::InvalidUtf8`] on failure.
+pub(crate) fn to_utf8(bytes: &[u8]) -> Result<&str> {
+    std::str::from_utf8(bytes).map_err(|e| LlmError::InvalidUtf8(e.to_string()))
+}
+
 /// Validate the UTF-8 text as a top-level JSON object with a `messages` array,
 /// and return the parsed `Value` so the caller can reuse it for provider detection
 /// without a second `serde_json::from_str` pass.
@@ -92,7 +97,7 @@ pub enum ParsedBody {
 /// # Ok::<(), rskim_llm::LlmError>(())
 /// ```
 pub fn parse(bytes: &[u8]) -> Result<ParsedBody> {
-    let text = std::str::from_utf8(bytes).map_err(|e| LlmError::InvalidUtf8(e.to_string()))?;
+    let text = to_utf8(bytes)?;
     let obj = validate(text)?;
     let provider = provider::detect(&obj);
     parse_as(text, provider)
@@ -107,7 +112,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedBody> {
 ///
 /// Same as [`parse`].
 pub fn parse_with_provider(bytes: &[u8], p: Provider) -> Result<ParsedBody> {
-    let text = std::str::from_utf8(bytes).map_err(|e| LlmError::InvalidUtf8(e.to_string()))?;
+    let text = to_utf8(bytes)?;
     validate(text)?;
     parse_as(text, p)
 }

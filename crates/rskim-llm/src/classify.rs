@@ -218,15 +218,13 @@ fn try_classify_json(text: &str) -> bool {
 /// shared extraction: #327). A block is classified as log if at least 50% of its
 /// non-empty lines match log-line patterns.
 fn try_classify_log(text: &str) -> bool {
-    let non_empty: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    if non_empty.is_empty() {
-        return false;
-    }
-
-    let matching = non_empty.iter().filter(|&&line| is_log_line(line)).count();
-
-    // At least 50% of non-empty lines must match (aggregate heuristic, OQ7)
-    matching * 2 >= non_empty.len()
+    // Count total non-empty lines and log-matching lines in a single pass.
+    // At least 50% of non-empty lines must match (aggregate heuristic, OQ7).
+    let (total, matching) = text.lines().filter(|l| !l.trim().is_empty()).fold(
+        (0usize, 0usize),
+        |(total, matching), line| (total + 1, matching + usize::from(is_log_line(line))),
+    );
+    total > 0 && matching * 2 >= total
 }
 
 /// Test whether a single line matches log-line heuristics.

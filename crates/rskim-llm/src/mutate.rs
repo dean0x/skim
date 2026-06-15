@@ -242,10 +242,10 @@ fn list_anthropic_blocks(body: &AnthropicBody) -> Vec<BlockDescriptor> {
     let mut out: Vec<BlockDescriptor> = Vec::new();
     body.walk_leaves(|leaf_ref, _text| {
         let kind = match &leaf_ref {
-            crate::model::anthropic::LeafRef::MessageString { .. } => "message-string",
-            crate::model::anthropic::LeafRef::TextBlock { .. } => "text",
-            crate::model::anthropic::LeafRef::ToolResultString { .. } => "tool_result-string",
-            crate::model::anthropic::LeafRef::ToolResultLeaf { .. } => "tool_result-leaf-text",
+            LeafRef::MessageString { .. } => "message-string",
+            LeafRef::TextBlock { .. } => "text",
+            LeafRef::ToolResultString { .. } => "tool_result-string",
+            LeafRef::ToolResultLeaf { .. } => "tool_result-leaf-text",
         };
         out.push(BlockDescriptor {
             id: leaf_ref.id(),
