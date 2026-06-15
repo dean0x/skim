@@ -184,8 +184,10 @@ impl SearchLayer for AstQueryEngine<AstIndexReader> {
             Some(s) => s,
         };
 
-        // `parse_ast_query` handles empty, whitespace-only, and all error cases
-        // (including emitting EMPTY_QUERY_MSG); no pre-flight check needed here.
+        // Trim before parsing so that the >4096-byte length guard in
+        // `parse_ast_query` applies to the actual query content rather than
+        // incidental surrounding whitespace (restores pre-split behaviour; the
+        // CLI path in ast.rs:109 also trims before calling).
         //
         // P4 (#286): fold the lang filter into scoring so the second
         // file_meta decode loop is eliminated.  `run_ngram_set` with
@@ -197,7 +199,7 @@ impl SearchLayer for AstQueryEngine<AstIndexReader> {
         // `ast_query_to_ngram_set` is the single dispatch point for
         // AstQuery → AstNgramSet, shared with `search_ast` to eliminate
         // duplicated match arms and error strings (#286).
-        let ast_q = parse_ast_query(raw)?;
+        let ast_q = parse_ast_query(raw.trim())?;
         let ngram_set = ast_query_to_ngram_set(&ast_q)?;
 
         let mut hits = self.run_ngram_set(ngram_set.as_ref(), query.lang)?;

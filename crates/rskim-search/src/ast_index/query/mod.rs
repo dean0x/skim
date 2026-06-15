@@ -25,8 +25,8 @@
 //!
 //! # Module structure (A1/CX2, #287)
 //!
-//! - [`parse`] — `parse_ast_query()` and parsing helpers.
-//! - [`engine`] — `AstQuery` enum, `AstQueryEngine`, `SearchLayer` adapter.
+//! - [`parse`] — `AstQuery` enum, `parse_ast_query()`, and parsing helpers.
+//! - [`engine`] — `AstQueryEngine` and `SearchLayer` adapter.
 //! - [`scoring`] — `ScoringCtx`, BM25 helpers, IDF memoization, `LiteMeta`.
 //! - [`adapter`] — `AstPostingSource` trait and its `AstIndexReader` impl.
 

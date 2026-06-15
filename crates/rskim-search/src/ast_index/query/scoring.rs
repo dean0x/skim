@@ -16,7 +16,7 @@ pub const AST_BM25_B: f64 = 0.75;
 
 /// IDF fallback for files whose language byte is unrecognised (neutral weight —
 /// does not amplify or suppress the BM25 term-frequency contribution).
-pub(super) const UNKNOWN_LANG_IDF: f64 = 1.0;
+const UNKNOWN_LANG_IDF: f64 = 1.0;
 
 // P3: capacity sizing constants (#286).
 //
@@ -36,8 +36,8 @@ pub(super) const CAPACITY_FLOOR: usize = 16;
 /// the cache footprint is 5 bytes per entry instead of 15 bytes.
 #[derive(Clone, Copy)]
 pub(super) struct LiteMeta {
-    pub(super) lang_id: u8,
-    pub(super) node_count: u32,
+    lang_id: u8,
+    node_count: u32,
 }
 
 impl From<(u8, u32)> for LiteMeta {
@@ -56,7 +56,7 @@ impl LiteMeta {
     /// so that lang-id → Language recovery lives in one conceptual place per
     /// struct rather than being inlined at every call site (#286).
     #[inline]
-    pub(super) fn language(self) -> Option<Language> {
+    fn language(self) -> Option<Language> {
         crate::index::lang_map::lang_from_id(self.lang_id)
     }
 }
@@ -195,7 +195,7 @@ impl ScoringCtx {
 /// the hot posting loop (was: `match` inside `if last_lang == Some(lang)` inside
 /// `match language`).  Unknown / `None` languages use [`UNKNOWN_LANG_IDF`].
 #[inline]
-pub(super) fn idf_for_language(
+fn idf_for_language(
     language: Option<Language>,
     last_lang: &mut Option<Language>,
     last_idf: &mut f64,
@@ -222,7 +222,7 @@ pub(super) fn idf_for_language(
 /// `tf_norm = tf / length_norm`; avdl==0 → length_norm=1.0; norm<=0 → 1.0
 /// (defensive-only: with b=0.75 and nc>=0, n is always >= 0.25, so n<=0.0 is
 /// unreachable in practice).
-pub(super) fn bm25_with_lite(posting: &AstPosting, node_count: u32, avg: f64, idf: f64) -> f64 {
+fn bm25_with_lite(posting: &AstPosting, node_count: u32, avg: f64, idf: f64) -> f64 {
     debug_assert!(
         avg.is_finite(),
         "avg_node_count must be finite (AstPostingSource contract)"
@@ -248,7 +248,7 @@ pub(super) fn bm25_with_lite(posting: &AstPosting, node_count: u32, avg: f64, id
 /// Fetch `LiteMeta` from FxHashMap cache; insert on miss (P1, #286).
 ///
 /// Manual check-then-insert because `or_insert_with` cannot propagate `Result`.
-pub(super) fn cached_lite_meta<R: AstPostingSource>(
+fn cached_lite_meta<R: AstPostingSource>(
     reader: &R,
     cache: &mut FxHashMap<u32, LiteMeta>,
     doc_id: u32,
