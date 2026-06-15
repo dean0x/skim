@@ -82,6 +82,12 @@ fn build_body(target_bytes: usize) -> Vec<u8> {
 ///
 /// Returns a single aggregate measurement (sum of REPS iterations). Caller takes
 /// the minimum across SAMPLES independent calls to eliminate outliers.
+// AC14 perf test legitimately reads wall-clock time. The crate clippy.toml bans
+// `Instant::now` to keep ambient state out of production `src/` (AC10/AC12 determinism
+// gate); the gate's own note explicitly sanctions timing in tests. clippy.toml cannot
+// path-scope to `src/`, so a targeted allow keeps the gate strict everywhere except
+// this measurement helper.
+#[allow(clippy::disallowed_methods)]
 fn time_cycle(input: &[u8]) -> u128 {
     let start = Instant::now();
     for _ in 0..REPS {
@@ -121,7 +127,7 @@ fn min_time_cycle(input: &[u8]) -> u128 {
 /// (input buffer 1×, typed model ≤1×) after the single-parse refactor that
 /// eliminated the throwaway serde_json::Value intermediate.
 /// Wiring this as an enforced counting-allocator test (AC14) is tracked in a
-/// dedicated follow-up (#333, filed alongside #323-#328 per ADR-004).  The
+/// dedicated follow-up (tracked under #309 per ADR-004).  The
 /// isolated counting-allocator binary must not share the global allocator with
 /// parallel test threads.
 #[test]
