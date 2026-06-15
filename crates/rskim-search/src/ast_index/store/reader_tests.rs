@@ -1099,8 +1099,8 @@ fn ac2_file_lang_and_node_count_matches_file_meta_real_reader() {
     let reader = builder.build().unwrap();
 
     // In-range: (lang_id, node_count) must equal file_meta's fields.
-    for (i, _) in fixtures.iter().enumerate() {
-        let doc_id = i as u32;
+    for i in 0..fixtures.len() as u32 {
+        let doc_id = i;
         let meta = reader.file_meta(doc_id).unwrap();
         let (lang_id, nc) = reader.file_lang_and_node_count(doc_id).unwrap();
         assert_eq!(

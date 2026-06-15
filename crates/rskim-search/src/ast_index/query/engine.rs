@@ -89,18 +89,18 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
         // Gap-fix #6: dedup by key (entries are sorted; O(n); prevents double-scoring dups).
         let mut bigrams: Vec<&AstBigramEntry> = set.bigrams.iter().collect();
         bigrams.dedup_by_key(|e| e.ngram.key());
-        debug_assert!({
+        debug_assert!(
             bigrams
                 .windows(2)
                 .all(|w| w[0].ngram.key() != w[1].ngram.key())
-        });
+        );
         let mut trigrams: Vec<&AstTrigramEntry> = set.trigrams.iter().collect();
         trigrams.dedup_by_key(|e| e.ngram.key());
-        debug_assert!({
+        debug_assert!(
             trigrams
                 .windows(2)
                 .all(|w| w[0].ngram.key() != w[1].ngram.key())
-        });
+        );
 
         let total_ngrams = bigrams.len() + trigrams.len();
 
