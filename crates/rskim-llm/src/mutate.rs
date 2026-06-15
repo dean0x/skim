@@ -72,10 +72,11 @@ pub fn mutate_block(body: &mut ParsedBody, block_id: &str, new_text: &str) -> Re
 }
 
 fn mutate_anthropic(body: &mut AnthropicBody, block_id: &str, new_text: &str) -> Result<Vec<u8>> {
-    // Fast-path: scan mutable leaves without allocating a String per leaf.
-    // `walk_leaves` yields (LeafRef, text) pairs; we compare the candidate id
-    // lazily so the common (found) path produces exactly one String allocation
-    // (the winning id, via LeafRef::id()).
+    // Scan mutable leaves for the one whose composite id matches `block_id`.
+    // `walk_leaves` yields (LeafRef, text) pairs with no early exit, so the
+    // `found_leaf.is_none()` guard stops further `id()` comparisons once a match
+    // is found (each `LeafRef::id()` call allocates, so we avoid re-deriving the
+    // id for the remaining leaves after the match).
     let mut found_leaf = None;
     body.walk_leaves(|leaf_ref, _text| {
         if found_leaf.is_none() && leaf_ref.id() == block_id {

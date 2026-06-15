@@ -19,7 +19,7 @@ use super::RawBlob;
 /// # Byte-identical round-trips
 ///
 /// Byte identity is achieved via a raw-bytes cache (`raw_bytes`): the original
-/// JSON bytes are stored verbatim on parse and returned by [`crate::serialize`]
+/// JSON bytes are stored verbatim on parse and returned by [`crate::serialize()`]
 /// without re-encoding. This preserves insignificant whitespace, non-canonical
 /// number tokens (`1.0e3`), `\uXXXX` escapes, and arbitrary field ordering.
 ///
@@ -70,7 +70,7 @@ pub struct AnthropicBody {
 
     /// Original JSON bytes for byte-identical unmutated serialize.
     ///
-    /// Set by [`crate::parse`] from the input bytes. Updated by
+    /// Set by [`crate::parse()`] from the input bytes. Updated by
     /// `mutate_block` via byte-range surgery after any mutation.
     /// Not serialized — this is crate-internal state only.
     #[serde(skip)]
@@ -116,7 +116,7 @@ impl AnthropicBody {
 /// `AnthropicBody` stores `system` (and all other non-`model`/`messages` top-level
 /// fields) in `extra_fields` as a raw `serde_json::Value` to preserve byte identity.
 /// This type is provided as public API for callers that want to parse the `system`
-/// field from `extra_fields` manually; it is not used internally by [`crate::parse`].
+/// field from `extra_fields` manually; it is not used internally by [`crate::parse()`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 #[non_exhaustive]
@@ -460,7 +460,7 @@ pub struct ThinkingBlock {
 /// `AnthropicBody` stores `tools` in `extra_fields` as a raw `serde_json::Value`
 /// to preserve byte identity. This type is provided as public API for callers that
 /// want to parse tool definitions from `extra_fields` manually; it is not used
-/// internally by [`crate::parse`].
+/// internally by [`crate::parse()`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicTool {
     /// The tool name.

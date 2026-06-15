@@ -124,7 +124,7 @@ pub const MAX_DEPTH: u32 = 64;
 ///
 /// Returns a list of `(block_id, classification)` pairs for every mutable text
 /// leaf. Exempt blocks are not included (they always return `unknown` if
-/// [`classify`] is called on them directly).
+/// [`classify()`] is called on them directly).
 ///
 /// # OpenAI id asymmetry
 ///

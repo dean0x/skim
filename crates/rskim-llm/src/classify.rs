@@ -220,10 +220,12 @@ fn try_classify_json(text: &str) -> bool {
 fn try_classify_log(text: &str) -> bool {
     // Count total non-empty lines and log-matching lines in a single pass.
     // At least 50% of non-empty lines must match (aggregate heuristic, OQ7).
-    let (total, matching) = text.lines().filter(|l| !l.trim().is_empty()).fold(
-        (0usize, 0usize),
-        |(total, matching), line| (total + 1, matching + usize::from(is_log_line(line))),
-    );
+    let (total, matching) = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .fold((0usize, 0usize), |(total, matching), line| {
+            (total + 1, matching + usize::from(is_log_line(line)))
+        });
     total > 0 && matching * 2 >= total
 }
 

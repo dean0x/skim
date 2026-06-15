@@ -66,11 +66,11 @@ impl ChunkIngestionBuilder {
     /// Finish ingestion and parse the accumulated bytes.
     ///
     /// Parses the accumulated buffer as a complete LLM request body. The result is
-    /// byte-identical to parsing the same bytes in a single call to [`crate::parse`].
+    /// byte-identical to parsing the same bytes in a single call to [`crate::parse()`].
     ///
     /// # Errors
     ///
-    /// Same error conditions as [`crate::parse`].
+    /// Same error conditions as [`crate::parse()`].
     pub fn finish(self) -> Result<ParsedBody> {
         match self.provider_hint {
             Some(p) => crate::parse::parse_with_provider(&self.buf, p),
