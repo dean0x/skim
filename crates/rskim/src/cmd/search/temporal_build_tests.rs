@@ -581,6 +581,20 @@ fn test_rebuild_temporal_blast_radius_partner() {
 /// Two recent commits (within 90d) and two old commits (set via commit date
 /// manipulation — we use the git committer date env var).
 /// Discriminating: changes_90d == 2 (only in-window), not 4.
+///
+/// # Implementation note (Decision O-B)
+///
+/// After the fix that removed the dead 90-day hotspot walk, `rebuild_temporal`
+/// now performs a single full-history walk and delegates windowing to
+/// `compute_file_temporal_stats` via timestamp comparison against `now_epoch`.
+/// This test remains discriminating because it verifies that the windowed
+/// field (`changes_90d`) is correctly computed from timestamps — changing
+/// `now_epoch` or the commit dates changes the result.  The prior version of
+/// this test was non-discriminating because it asserted `changes_90d` produced
+/// by `compute_file_temporal_stats` (timestamp-based windowing) while the
+/// 90-day `parse_history` walk being tested was only used for an `is_empty()`
+/// guard.  Now the single walk feeds all computation, so the test correctly
+/// exercises the full data path.
 #[test]
 fn test_rebuild_temporal_90d_cutoff() {
     let dir = tempdir().unwrap();
@@ -902,16 +916,19 @@ fn test_rebuild_temporal_sub_threshold_pair_not_in_db() {
 // AC12 — CapacityExceeded leaves prior DB rows intact
 // ============================================================================
 
-/// AC12: When rebuild_temporal returns CapacityExceeded, prior DB rows and
-/// META_GIT_HEAD must remain untouched (no partial write).
+/// Second-run stability: rebuild_temporal on the same repo twice does not corrupt
+/// the temporal DB or lose the stored HEAD.
 ///
-/// We seed temporal.db with a known row (via a first successful rebuild),
-/// then verify that a second call on the same repo doesn't corrupt it.
-/// (True CapacityExceeded requires >500k rows, which is impractical to
-/// simulate in a unit test. This test verifies the DB is not corrupted
-/// during normal operation, which is the observable AC12 invariant for
-/// the common case. The CapacityExceeded arm itself is integration-tested
-/// at the storage layer in rskim-search/src/temporal/storage_tests.rs.)
+/// This test covers the "happy path idempotency" invariant: two successive rebuilds
+/// on the same 1-commit repo produce a valid DB with META_GIT_HEAD set both times.
+///
+/// # Scope (not AC12)
+///
+/// True AC12 (CapacityExceeded leaves prior DB rows intact) requires >500k rows,
+/// which is impractical to simulate in a unit test. The CapacityExceeded arm is
+/// integration-tested at the storage layer in
+/// `rskim-search/src/temporal/storage_tests.rs`. This test only verifies
+/// normal-operation DB stability; it does NOT exercise CapacityExceeded.
 #[test]
 fn test_rebuild_temporal_second_run_preserves_prior_head() {
     let dir = tempdir().unwrap();

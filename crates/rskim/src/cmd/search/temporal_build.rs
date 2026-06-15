@@ -27,36 +27,18 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rskim_search::{
-    CochangeRow, DEFAULT_HALF_LIFE_DAYS, GixSource, HistoryResult, HotspotRow, RiskRow, TemporalDb,
-    TemporalSource,
+    COUPLING_MAX_FILES, CochangeRow, DEFAULT_HALF_LIFE_DAYS, GixSource, HistoryResult, HotspotRow,
+    MIN_COCHANGE_JACCARD, RiskRow, TemporalDb, TemporalSource,
 };
 
 // ============================================================================
 // Constants
 // ============================================================================
-
-/// Commits touching more than this many files are excluded from pair enumeration.
-///
-/// Matches the constant in `crates/rskim/src/cmd/heatmap/metrics.rs`
-/// (`COUPLING_MAX_FILES = 50`) to keep coupling signal consistent.
-/// Verified against `MIN_JACCARD_THRESHOLD` in `storage_ops.rs` (0.10).
-const COUPLING_MAX_FILES: usize = 50;
-
-/// Minimum Jaccard similarity for a co-change pair to be persisted.
-///
-/// Must match `MIN_JACCARD_THRESHOLD` in `storage_ops.rs` (0.10) exactly —
-/// the read query applies the same threshold, so emitting sub-threshold rows
-/// is dead weight the reader discards anyway.
-const MIN_JACCARD: f64 = 0.10;
-
-/// Lookback window for the hotspot walk (days).
-///
-/// Changes_30d/changes_90d fields track only windowed counts, so 90 days is
-/// the natural cap for the hotspot decay walk. Risk/lifetime stats are computed
-/// over the full history (lookback_days = 0). (Applies ADR-003: the 90-day
-/// default is grounded in the schema — it is the widest window the persisted
-/// stats represent for hotspot scoring.)
-const HOTSPOT_LOOKBACK_DAYS: u32 = 90;
+// NOTE: COUPLING_MAX_FILES and MIN_COCHANGE_JACCARD are re-exported from
+// rskim-search (Decision O-D) — this file does NOT redeclare them. The
+// single source of truth lives in:
+//   - COUPLING_MAX_FILES  → rskim_search::cochange::builder (pub)
+//   - MIN_COCHANGE_JACCARD → rskim_search::temporal::storage (pub)
 
 // ============================================================================
 // Co-change pair builder (D2 / AC10)
@@ -67,11 +49,11 @@ const HOTSPOT_LOOKBACK_DAYS: u32 = 90;
 /// Algorithm:
 /// 1. Accumulate per-file commit counts and canonical `(file_a < file_b)` pair
 ///    counts from `history.commits`, skipping commits touching >
-///    [`COUPLING_MAX_FILES`] files (matches heatmap/metrics.rs).
+///    [`COUPLING_MAX_FILES`] files (matches `rskim_search::COUPLING_MAX_FILES`).
 /// 2. Compute Jaccard per pair = `count_ab / (count_a + count_b - count_ab)`
 ///    (same formula as `CochangeMatrixReader::jaccard` in `cochange/reader.rs`).
-/// 3. Filter to `jaccard >= MIN_JACCARD` (0.10) at write time to match
-///    `MIN_JACCARD_THRESHOLD` used by the read query (AC4).
+/// 3. Filter to `jaccard >= MIN_COCHANGE_JACCARD` (0.10) at write time to match
+///    `MIN_COCHANGE_JACCARD` used by the read query (AC4 / Decision O-D).
 ///
 /// # Pair ordering invariant
 ///
@@ -102,6 +84,10 @@ pub(super) fn build_cochange_rows(history: &HistoryResult) -> Vec<CochangeRow> {
         }
 
         // Collect de-duplicated string paths for this commit.
+        // We materialise exactly one `String` per unique path per commit
+        // (into_owned). The pair-key clones below (a.clone()/b.clone()) are
+        // inherent to HashMap ownership — they happen only for pairs in the
+        // 2..=COUPLING_MAX_FILES range, not for excluded commits.
         let paths: Vec<String> = {
             let mut v: Vec<String> = commit
                 .changed_files
@@ -115,18 +101,18 @@ pub(super) fn build_cochange_rows(history: &HistoryResult) -> Vec<CochangeRow> {
         };
         let n_dedup = paths.len();
 
-        // Increment per-file counts.
+        // Increment per-file counts — borrow the path string, no clone needed.
         for p in &paths {
             *file_counts.entry(p.clone()).or_insert(0) += 1;
         }
 
         // Enumerate canonical (a < b) pairs.
+        // Ordering is guaranteed by the sorted-and-deduped paths slice.
         for i in 0..n_dedup {
             for j in (i + 1)..n_dedup {
-                let a = &paths[i];
-                let b = &paths[j];
-                // Ordering is guaranteed by the sorted paths slice.
-                *pair_counts.entry((a.clone(), b.clone())).or_insert(0) += 1;
+                *pair_counts
+                    .entry((paths[i].clone(), paths[j].clone()))
+                    .or_insert(0) += 1;
             }
         }
     }
@@ -138,19 +124,21 @@ pub(super) fn build_cochange_rows(history: &HistoryResult) -> Vec<CochangeRow> {
         let count_b = *file_counts.get(b).unwrap_or(&0);
         // Invariant: count_ab <= min(count_a, count_b) because per-commit paths are
         // deduped (sort_unstable+dedup above) and git tree-diff yields each path at
-        // most once per commit. The subtraction is therefore safe for u32.
-        // The debug_assert guards against future refactors that break this invariant
-        // (e.g. a change to the >COUPLING_MAX_FILES branch that counts non-deduped files).
+        // most once per commit.  Use saturating arithmetic on u64 so a future refactor
+        // that breaks this invariant produces a 0 union (skipped row) rather than a
+        // u32 wrap in release builds — fail-safe rather than silent corruption.
         debug_assert!(
             count_a >= *count_ab && count_b >= *count_ab,
             "union underflow: count_ab={count_ab} but count_a={count_a}, count_b={count_b}"
         );
-        let union = count_a + count_b - count_ab;
+        let union = (count_a as u64)
+            .saturating_add(count_b as u64)
+            .saturating_sub(*count_ab as u64);
         if union == 0 {
             continue;
         }
-        let jaccard = f64::from(*count_ab) / f64::from(union);
-        if jaccard < MIN_JACCARD {
+        let jaccard = f64::from(*count_ab) / union as f64;
+        if jaccard < MIN_COCHANGE_JACCARD {
             continue;
         }
         rows.push(CochangeRow {
@@ -260,6 +248,27 @@ pub(super) fn build_risk_rows(
 // Main entry point (D1 / D3 / D4 / D5)
 // ============================================================================
 
+// ============================================================================
+// Internal helper (D5 graceful-degradation pattern)
+// ============================================================================
+
+/// Emit a debug-gated warning and return `Ok(())` to degrade gracefully.
+///
+/// All recoverable early-return arms in `rebuild_temporal` use this helper so
+/// the D5 isolation policy ("temporal failure MUST NOT fail lexical") is
+/// expressed once and the function body reads as sequential happy-path logic.
+macro_rules! warn_skip {
+    ($fmt:literal $(, $arg:expr)* $(,)?) => {{
+        if crate::debug::is_debug_enabled() {
+            eprintln!(
+                concat!("skim search temporal [debug]: ", $fmt, " — skipping temporal build"),
+                $($arg)*
+            );
+        }
+        return Ok(());
+    }};
+}
+
 /// Rebuild the temporal database after a successful lexical+AST index build.
 ///
 /// # Call site contract (applies ADR-006)
@@ -271,10 +280,12 @@ pub(super) fn build_risk_rows(
 ///
 /// # Lookback semantics (O-C / ADR-003)
 ///
-/// - Hotspot walk: `HOTSPOT_LOOKBACK_DAYS` (90) — windowed, matches the 90d
-///   schema field and decay model.
-/// - Risk/lifetime walk: `lookback_days = 0` (full history) — `total_commits`
-///   and `fix_commits` are lifetime counts per the schema docs.
+/// A single full-history walk (`lookback_days = 0`) supplies all data:
+/// - `compute_file_risk_scores` applies exponential decay internally.
+/// - `compute_file_temporal_stats` computes windowed counts (30d/90d) via
+///   timestamp arithmetic against `now_epoch`, so no separate 90-day walk
+///   is needed (Decision O-B: the former 90-day hotspot walk was dead I/O).
+/// - `total_commits` and `fix_commits` are lifetime counts per schema docs.
 ///
 /// # Failure isolation (D5)
 ///
@@ -303,60 +314,36 @@ pub(super) fn rebuild_temporal(
 ) -> anyhow::Result<()> {
     let src = GixSource;
 
-    // ── Hotspot walk (90-day windowed) ────────────────────────────────────────
-    let hotspot_history = match src.parse_history(root, HOTSPOT_LOOKBACK_DAYS) {
-        Ok(h) => h,
-        Err(e) => {
-            if crate::debug::is_debug_enabled() {
-                eprintln!(
-                    "skim search temporal [debug]: hotspot parse_history failed: {e} — skipping temporal build"
-                );
-            }
-            return Ok(());
-        }
-    };
-
-    if hotspot_history.commits.is_empty() {
-        if crate::debug::is_debug_enabled() {
-            eprintln!(
-                "skim search temporal [debug]: no commits in 90-day window — skipping temporal build"
-            );
-        }
-        return Ok(());
-    }
-
-    // ── Risk / lifetime walk (full history) ──────────────────────────────────
-    // total_commits / fix_commits are lifetime counts per storage_types.rs docs.
-    // A 90-day cap would compute fix_density over a windowed denominator and
-    // change the semantic from lifetime to "recent" — incorrect. (ADR-003)
+    // ── Single full-history walk ──────────────────────────────────────────────
+    // One parse_history call supplies all data. The 30d/90d windowing for
+    // changes_30d/changes_90d is done inside compute_file_temporal_stats via
+    // timestamp comparison against now_epoch — no separate windowed walk needed
+    // (Decision O-B: the former 90-day hotspot walk was dead I/O; it was only
+    // used for an is_empty() guard that risk_history already provides).
     let risk_history = match src.parse_history(root, 0) {
         Ok(h) => h,
-        Err(e) => {
-            if crate::debug::is_debug_enabled() {
-                eprintln!(
-                    "skim search temporal [debug]: risk parse_history failed: {e} — skipping temporal build"
-                );
-            }
-            return Ok(());
-        }
+        Err(e) => warn_skip!("parse_history failed: {}", e),
     };
+
+    if risk_history.commits.is_empty() {
+        warn_skip!("no commits in history");
+    }
 
     // ── Score computation (pure, no I/O) ─────────────────────────────────────
     // risk_scores: decay-weighted hotspot/fix_density from the full-history walk
-    // (O-C / ADR-003). Passing risk_history ensures the decay weights are over
-    // the full commit lifetime, not capped at 90 days.
+    // (O-C / ADR-003). Full history ensures decay weights span the commit
+    // lifetime rather than being capped at 90 days.
     let risk_scores = rskim_search::compute_file_risk_scores(
         &risk_history.commits,
         now_epoch,
         DEFAULT_HALF_LIFE_DAYS,
     );
     // temporal_stats: windowed counts (changes_30d/90d) PLUS lifetime totals
-    // (total_commits/fix_commits). Passing risk_history gives correct lifetime
-    // counts for RiskRow; the 30d/90d window fields reflect commits
-    // inside the window relative to now_epoch. (O-C / ADR-003)
+    // (total_commits/fix_commits). The 30d/90d fields reflect commits inside
+    // the window relative to now_epoch (timestamp arithmetic, no walk cap).
     let temporal_stats =
         rskim_search::compute_file_temporal_stats(&risk_history.commits, now_epoch);
-    // cochange intentionally uses full history (lifetime co-change coupling).
+    // cochange uses full history (lifetime co-change coupling).
     let cochange_rows = build_cochange_rows(&risk_history);
 
     // ── Row join ──────────────────────────────────────────────────────────────
@@ -374,14 +361,7 @@ pub(super) fn rebuild_temporal(
     let db_path = cache_dir.join("temporal.db");
     let db = match TemporalDb::open(&db_path) {
         Ok(d) => d,
-        Err(e) => {
-            if crate::debug::is_debug_enabled() {
-                eprintln!(
-                    "skim search temporal [debug]: failed to open temporal.db: {e} — skipping"
-                );
-            }
-            return Ok(());
-        }
+        Err(e) => warn_skip!("failed to open temporal.db: {}", e),
     };
 
     match db.sync(&hotspot_rows, &risk_rows, &cochange_rows, head) {
@@ -398,18 +378,10 @@ pub(super) fn rebuild_temporal(
         }
         Err(rskim_search::SearchError::CapacityExceeded(msg)) => {
             // Too many rows (>500k) — degrade gracefully (D5).
-            // Emit an actionable debug message rather than silently failing.
-            if crate::debug::is_debug_enabled() {
-                eprintln!(
-                    "skim search temporal [debug]: CapacityExceeded — temporal.db not updated: {msg}. \
-                     Consider a shorter lookback window or a smaller repository."
-                );
-            }
+            warn_skip!("CapacityExceeded — {}. Consider a smaller repository", msg);
         }
         Err(e) => {
-            if crate::debug::is_debug_enabled() {
-                eprintln!("skim search temporal [debug]: sync failed: {e} — temporal.db unchanged");
-            }
+            warn_skip!("sync failed: {}", e);
         }
     }
 

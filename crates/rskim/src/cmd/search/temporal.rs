@@ -262,6 +262,15 @@ pub(super) fn resolve_blast_radius_file_ids(
 /// Returns `Some(warning_message)` when the stored HEAD differs from the
 /// current HEAD, `None` when current or when the staleness check cannot be
 /// performed (missing git, non-git repo, missing meta key).
+///
+/// # Usage note (Decision O-B)
+///
+/// This function is no longer called on the production query path —
+/// `auto_refresh_if_stale` in `staleness.rs` guarantees freshness before any
+/// query executes, making this staleness warning dead code on the happy path.
+/// It is retained for test use only (AC6 discriminating assertion in
+/// `temporal_build_tests.rs`).
+#[cfg(test)]
 pub(super) fn check_temporal_staleness(db: &TemporalDb, project_root: &Path) -> Option<String> {
     let stored_head = db.get_meta(rskim_search::META_GIT_HEAD).ok().flatten()?;
 
@@ -286,6 +295,9 @@ pub(super) fn check_temporal_staleness(db: &TemporalDb, project_root: &Path) -> 
 /// The timeout prevents indefinite hangs on network-mounted repos or
 /// corrupted `.git` directories. The staleness check is advisory, so
 /// timing out is safe — the caller degrades gracefully.
+///
+/// Only compiled in test builds — see `check_temporal_staleness` doc.
+#[cfg(test)]
 fn read_git_head(root: &Path) -> Option<String> {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -510,7 +522,9 @@ pub(super) fn format_temporal_text(
                 writeln!(w, "No hotspot data available.")?;
                 return Ok(());
             }
-            writeln!(w, "Hotspots (top {}, 90-day decay):\n", rows.len())?;
+            // Single newline after header (writeln! already appends \n; no
+            // extra \n in the format string — that would insert a blank line).
+            writeln!(w, "Hotspots (top {}, 90-day decay):", rows.len())?;
             writeln!(w, "  Score  30d  90d  Path")?;
             writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
             for r in rows {
@@ -526,7 +540,7 @@ pub(super) fn format_temporal_text(
                 writeln!(w, "No coldspot data available.")?;
                 return Ok(());
             }
-            writeln!(w, "Coldspots (top {}, least active):\n", rows.len())?;
+            writeln!(w, "Coldspots (top {}, least active):", rows.len())?;
             writeln!(w, "  Score  30d  90d  Path")?;
             writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
             for r in rows {
