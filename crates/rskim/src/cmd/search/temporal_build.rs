@@ -103,7 +103,7 @@ pub(super) fn acquire_build_lock(cache_dir: &Path) -> anyhow::Result<std::fs::Fi
             Err(std::fs::TryLockError::WouldBlock) => {
                 if !noticed {
                     eprintln!(
-                        "skim search temporal: waiting for concurrent build to finish \
+                        "skim search: waiting for concurrent build to finish \
                          (lock: {}) …",
                         lock_path.display()
                     );

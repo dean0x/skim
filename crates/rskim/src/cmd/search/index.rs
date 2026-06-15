@@ -25,9 +25,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use anyhow::Context as _;
 use clap::Parser;
 use rskim_search::{
     AstIndexBuilder, AstNgramSet, FileId, LayerBuilder, NgramIndexBuilder, StructuralMetrics,
@@ -154,69 +153,28 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
 ///
 /// # Concurrency
 ///
-/// Acquires an exclusive advisory lock on `{cache_dir}/.skim-build.lock` before
-/// running the pipeline, with a 120-second deadline. If another process holds
-/// the lock, the call polls every 200 ms and prints a one-time notice to stderr
-/// so the user knows why it is waiting. After 120 s the call returns an error
-/// rather than blocking indefinitely. This serialises all callers — `skim init`
-/// background spawn, git-hook `--update`, and direct `--build` / `--rebuild` —
-/// protecting `index.skidx` and `index.skfiles` from concurrent writes.
+/// Acquires an exclusive advisory lock on `{cache_dir}/.skim-build.lock` via
+/// [`super::temporal_build::acquire_build_lock`] before running the pipeline.
+/// That helper polls every 200 ms for up to 120 s, then returns an error.
+/// This serialises all callers — `skim init` background spawn, git-hook
+/// `--update`, and direct `--build` / `--rebuild` — protecting `index.skidx`
+/// and `index.skfiles` from concurrent writes, and also serialises against
+/// `rebuild_temporal` (which acquires the same lock after the lexical build).
 ///
-/// The lock is released when the returned [`IndexResult`] (or the `Err`) drops,
-/// i.e. at the end of this function. The lock file itself is never deleted so
-/// the OS can reuse it across processes.
+/// The lock is released when the returned file handle drops, i.e. at the end
+/// of this function.  The lock file itself is never deleted so the OS can
+/// reuse it across processes.
 pub(super) fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     let pipeline = Pipeline::new(config)?;
 
-    // Acquire the advisory build lock before touching index files.
-    let lock_path = pipeline.cache_dir.join(".skim-build.lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open build lock: {}", lock_path.display()))?;
+    // Acquire the shared advisory build lock.  The single bounded
+    // implementation lives in `temporal_build::acquire_build_lock` so that
+    // both the lexical build (here) and the temporal rebuild (called from
+    // staleness.rs after the manifest persists) use ONE lock loop — no
+    // duplicate. The lock is held for the duration of `pipeline.run()` and
+    // released when `_lock` drops at function end. (applies ADR-006)
+    let _lock = super::temporal_build::acquire_build_lock(&pipeline.cache_dir)?;
 
-    // Bounded lock acquisition: poll every 200 ms for up to 120 s.
-    // `try_lock()` returns Err(TryLockError::WouldBlock) when another process
-    // holds the lock, and Err(TryLockError::Error(_)) on a real OS error.
-    // Drop-based release is preserved — `lock_file` drops at function end.
-    const LOCK_POLL_MS: u64 = 200;
-    const LOCK_DEADLINE_SECS: u64 = 120;
-    let deadline = Instant::now() + Duration::from_secs(LOCK_DEADLINE_SECS);
-    let mut noticed = false;
-    loop {
-        match lock_file.try_lock() {
-            Ok(()) => break, // lock acquired
-            Err(std::fs::TryLockError::WouldBlock) => {
-                // Another process holds the lock.
-                if !noticed {
-                    eprintln!(
-                        "skim search index: waiting for concurrent build to finish \
-                         (lock: {}) …",
-                        lock_path.display()
-                    );
-                    noticed = true;
-                }
-                if Instant::now() >= deadline {
-                    return Err(anyhow::anyhow!(
-                        "another skim build has held {} for >{} s; \
-                         if no build is running, delete the lock file and retry",
-                        lock_path.display(),
-                        LOCK_DEADLINE_SECS,
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(LOCK_POLL_MS));
-            }
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(anyhow::anyhow!(e))
-                    .with_context(|| "failed to acquire exclusive build lock");
-            }
-        }
-    }
-
-    // Lock is held for the duration of the build. `lock_file` drops (and
-    // releases the lock) when this function returns.
     pipeline.run()
 }
 
