@@ -14,7 +14,7 @@ use rskim_core::Language;
 use rustc_hash::FxHashMap;
 
 use super::adapter::AstPostingSource;
-use super::parse::{AstQuery, EMPTY_QUERY_MSG, parse_ast_query};
+use super::parse::{AstQuery, parse_ast_query};
 use super::scoring::{CAPACITY_FLOOR, ScoringCtx};
 use crate::{
     FileId, Result, SearchError,
@@ -183,11 +183,10 @@ impl SearchLayer for AstQueryEngine<AstIndexReader> {
             None => return Ok(vec![]),
             Some(s) => s,
         };
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Err(SearchError::InvalidQuery(EMPTY_QUERY_MSG.into()));
-        }
 
+        // `parse_ast_query` handles empty, whitespace-only, and all error cases
+        // (including emitting EMPTY_QUERY_MSG); no pre-flight check needed here.
+        //
         // P4 (#286): fold the lang filter into scoring so the second
         // file_meta decode loop is eliminated.  `run_ngram_set` with
         // `lang_filter = Some(lang)` skips mismatched postings before
@@ -198,7 +197,7 @@ impl SearchLayer for AstQueryEngine<AstIndexReader> {
         // `ast_query_to_ngram_set` is the single dispatch point for
         // AstQuery → AstNgramSet, shared with `search_ast` to eliminate
         // duplicated match arms and error strings (#286).
-        let ast_q = parse_ast_query(trimmed)?;
+        let ast_q = parse_ast_query(raw)?;
         let ngram_set = ast_query_to_ngram_set(&ast_q)?;
 
         let mut hits = self.run_ngram_set(ngram_set.as_ref(), query.lang)?;

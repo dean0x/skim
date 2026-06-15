@@ -43,9 +43,7 @@ impl PartialEq for AstQuery {
 /// Aliased from [`crate::lexical::MAX_QUERY_BYTES`] so both layers share one source of truth.
 pub(super) const MAX_AST_QUERY_BYTES: usize = crate::lexical::MAX_QUERY_BYTES;
 
-/// Shared error message for empty query strings — used in both `SearchLayer::search`
-/// and `parse_ast_query` so the two sites cannot silently drift.
-pub(super) const EMPTY_QUERY_MSG: &str = "empty AST query";
+const EMPTY_QUERY_MSG: &str = "empty AST query";
 
 /// Parse a raw string into an [`AstQuery`].
 ///
