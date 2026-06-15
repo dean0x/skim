@@ -133,20 +133,18 @@ fn apply_leaf_mutation(body: &mut AnthropicBody, leaf: &LeafRef, new_text: &str)
     // construction.  The debug_assert below converts a future refactor mistake
     // (desync between LeafRef and body) into a clear assertion failure instead of
     // a silent index-out-of-bounds panic (ADR-006: unrecoverable desync fails loud).
-    {
-        let msg_idx = match leaf {
-            LeafRef::MessageString { msg_idx } => *msg_idx,
-            LeafRef::TextBlock { msg_idx, .. } => *msg_idx,
-            LeafRef::ToolResultString { msg_idx, .. } => *msg_idx,
-            LeafRef::ToolResultLeaf { msg_idx, .. } => *msg_idx,
-        };
-        debug_assert!(
-            msg_idx < body.messages.len(),
-            "apply_leaf_mutation: msg_idx {msg_idx} out of bounds (messages.len={}); \
-             LeafRef was not derived from this body (ADR-006)",
-            body.messages.len()
-        );
-    }
+    let msg_idx = match leaf {
+        LeafRef::MessageString { msg_idx } => *msg_idx,
+        LeafRef::TextBlock { msg_idx, .. } => *msg_idx,
+        LeafRef::ToolResultString { msg_idx, .. } => *msg_idx,
+        LeafRef::ToolResultLeaf { msg_idx, .. } => *msg_idx,
+    };
+    debug_assert!(
+        msg_idx < body.messages.len(),
+        "apply_leaf_mutation: msg_idx {msg_idx} out of bounds (messages.len={}); \
+         LeafRef was not derived from this body (ADR-006)",
+        body.messages.len()
+    );
 
     match leaf {
         LeafRef::MessageString { msg_idx } => match &mut body.messages[*msg_idx].content {

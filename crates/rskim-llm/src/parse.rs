@@ -41,12 +41,12 @@ fn validate(text: &str) -> Result<serde_json::Map<String, serde_json::Value>> {
     // provider::detect to borrow briefly.
     let obj = match top {
         serde_json::Value::Object(m) => m,
-        other => return Err(LlmError::NotAnObject(describe_value(&other))),
+        other => return Err(LlmError::NotAnObject(describe_value(&other).to_string())),
     };
     match obj.get("messages") {
         None => return Err(LlmError::MissingMessages),
         Some(serde_json::Value::Array(_)) => {}
-        Some(other) => return Err(LlmError::MessagesNotArray(describe_value(other))),
+        Some(other) => return Err(LlmError::MessagesNotArray(describe_value(other).to_string())),
     }
     Ok(obj)
 }
@@ -191,13 +191,13 @@ fn check_depth(text: &str) -> Result<()> {
 /// The type tag alone is sufficient to explain the shape error (the reachable cases
 /// are a bare-string top-level body or a non-array `messages` value; neither needs
 /// content to be diagnosable).
-fn describe_value(v: &serde_json::Value) -> String {
+fn describe_value(v: &serde_json::Value) -> &'static str {
     match v {
-        serde_json::Value::Null => "null".to_string(),
-        serde_json::Value::Bool(_) => "bool".to_string(),
-        serde_json::Value::Number(_) => "number".to_string(),
-        serde_json::Value::String(_) => "string".to_string(),
-        serde_json::Value::Array(_) => "array".to_string(),
-        serde_json::Value::Object(_) => "object".to_string(),
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }

@@ -488,12 +488,10 @@ impl<'a> Scanner<'a> {
         let mut found_pos: Option<usize> = None;
 
         loop {
-            // Check for empty object or end
             match self.peek() {
                 None | Some(b'}') => break,
                 _ => {}
             }
-            // Read the key string
             let key_span = self.scan_string()?;
             let found_key = &self.src[key_span.start + 1..key_span.end - 1];
             self.consume_byte(b':')?;
@@ -501,11 +499,10 @@ impl<'a> Scanner<'a> {
             if found_key == key {
                 // Record this position (cursor is now before the value).
                 found_pos = Some(self.pos);
-                // Skip the value so we can keep scanning for a later occurrence.
-                self.skip_value()?;
-            } else {
-                self.skip_value()?;
             }
+            // Always skip the value — to continue scanning for a later occurrence
+            // (duplicate-key semantics: we want the last occurrence, not the first).
+            self.skip_value()?;
 
             // Advance past trailing comma (if present) to reach the next key or `}`.
             if self.peek() == Some(b',') {
