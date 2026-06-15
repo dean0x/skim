@@ -7,7 +7,7 @@ use rskim_core::Language;
 use rustc_hash::FxHashMap;
 
 use super::adapter::AstPostingSource;
-use crate::{Result, ast_index::AstPosting};
+use crate::{FileId, Result, ast_index::AstPosting};
 
 // BM25 constants
 /// BM25 saturation parameter k1 for AST structural scoring.
@@ -167,6 +167,21 @@ impl ScoringCtx {
                 bm25_with_lite(posting, lite.node_count, avg, idf);
         }
         Ok(())
+    }
+
+    /// Consume the context and return scores as a `Vec<(FileId, f64)>` sorted
+    /// ascending by `FileId` (Wave-4 merge-join contract).
+    ///
+    /// Shared by [`super::engine::AstQueryEngine::run_ngram_set`] and
+    /// `run_ngram_set_with_capacity` so the collect + sort logic lives in one place.
+    pub(super) fn into_sorted_vec(self) -> Vec<(FileId, f64)> {
+        let mut out: Vec<(FileId, f64)> = self
+            .scores
+            .into_iter()
+            .map(|(id, s)| (FileId(id), s))
+            .collect();
+        out.sort_unstable_by_key(|(fid, _)| *fid);
+        out
     }
 
     /// Return the `scores` map capacity after all postings have been processed.

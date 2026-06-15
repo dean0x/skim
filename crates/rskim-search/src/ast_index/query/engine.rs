@@ -92,17 +92,11 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
         lang_filter: Option<Language>,
     ) -> Result<Vec<(FileId, f64)>> {
         let ctx = self.score_ngram_set(set, lang_filter)?;
-
-        let mut out: Vec<(FileId, f64)> = ctx
-            .scores
-            .into_iter()
-            .map(|(id, s)| (FileId(id), s))
-            .collect();
+        let out = ctx.into_sorted_vec();
 
         // B2: unique (FxHashMap), all > 0 (BM25 with C4: count>=1 → tf>0 → score>0),
         // sorted FileId-ASC (Wave-4 contract).
         debug_assert!(out.iter().all(|(_, s)| *s > 0.0), "all scores must be > 0");
-        out.sort_unstable_by_key(|(fid, _)| *fid);
         Ok(out)
     }
 
@@ -284,17 +278,9 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
     ) -> Result<(Vec<(FileId, f64)>, usize)> {
         let ctx = self.score_ngram_set(set, lang_filter)?;
         let cap = ctx.scores_capacity();
-        let mut out: Vec<(FileId, f64)> = ctx
-            .scores
-            .into_iter()
-            .map(|(id, s)| (FileId(id), s))
-            .collect();
-        out.sort_unstable_by_key(|(fid, _)| *fid);
-        Ok((out, cap))
+        Ok((ctx.into_sorted_vec(), cap))
     }
 }
-
-// Dispatch helper
 
 /// Resolve an [`AstQuery`] to its [`AstNgramSet`], returning a borrowed or
 /// owned value depending on the variant.

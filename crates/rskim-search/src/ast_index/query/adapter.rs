@@ -9,7 +9,6 @@ use crate::{
     ast_index::{AstBigram, AstFileMetaEntry, AstPosting, AstTrigram},
 };
 
-// DI seam
 /// Dependency-injection seam: implemented by [`AstIndexReader`] and test fakes.
 ///
 /// **Value-type coupling is intentional and bounded.** `AstPosting` and

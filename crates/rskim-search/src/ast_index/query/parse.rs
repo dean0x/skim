@@ -70,7 +70,7 @@ pub fn parse_ast_query(s: &str) -> Result<AstQuery> {
     }
 }
 
-pub(super) fn parse_single(token: &str) -> Result<AstQuery> {
+fn parse_single(token: &str) -> Result<AstQuery> {
     if token.contains('-') {
         return Ok(AstQuery::Pattern(lookup_pattern(token)?));
     }
@@ -84,7 +84,7 @@ pub(super) fn parse_single(token: &str) -> Result<AstQuery> {
         })
 }
 
-pub(super) fn parse_bigram(a: &str, b: &str) -> Result<AstQuery> {
+fn parse_bigram(a: &str, b: &str) -> Result<AstQuery> {
     let bigram = AstBigram::encode(kind(a)?, kind(b)?);
     Ok(AstQuery::Containment(AstNgramSet {
         bigrams: vec![AstBigramEntry {
@@ -97,7 +97,7 @@ pub(super) fn parse_bigram(a: &str, b: &str) -> Result<AstQuery> {
     }))
 }
 
-pub(super) fn parse_trigram(a: &str, b: &str, c: &str) -> Result<AstQuery> {
+fn parse_trigram(a: &str, b: &str, c: &str) -> Result<AstQuery> {
     let trigram = AstTrigram::encode(kind(a)?, kind(b)?, kind(c)?);
     Ok(AstQuery::Containment(AstNgramSet {
         bigrams: vec![],
@@ -111,7 +111,7 @@ pub(super) fn parse_trigram(a: &str, b: &str, c: &str) -> Result<AstQuery> {
 }
 
 /// Resolve a containment segment to a [`NodeKindId`] or return `InvalidQuery`.
-pub(super) fn kind(seg: &str) -> Result<NodeKindId> {
+fn kind(seg: &str) -> Result<NodeKindId> {
     vocab_lookup(seg).ok_or_else(|| {
         SearchError::InvalidQuery(format!(
             "unknown node kind '{seg}' in containment query; \
