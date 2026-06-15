@@ -2,13 +2,42 @@
 //!
 //! The only public entry point is [`parse_ast_query`], which validates and
 //! classifies a raw query string into a typed [`AstQuery`] variant.
+//!
+//! [`AstQuery`] lives here rather than in `engine` because this module is its
+//! sole constructor; hoisting the type here breaks the otherwise-cyclic
+//! `parse → engine → parse` import chain and lets dependencies flow
+//! `engine → parse` in one direction only.
 
-use super::engine::AstQuery;
 use crate::ast_index::{
     AstBigram, AstBigramEntry, AstNgramSet, AstTrigram, AstTrigramEntry, DEFAULT_AST_WEIGHT,
-    NodeKindId, lookup_pattern, vocab_lookup,
+    NodeKindId, Pattern, lookup_pattern, vocab_lookup,
 };
 use crate::{Result, SearchError};
+
+/// A parsed, validated AST structural query.
+///
+/// Created exclusively via [`parse_ast_query`] — the only
+/// `String → AstQuery` boundary.
+#[derive(Debug, Clone)]
+pub enum AstQuery {
+    /// Named catalog pattern (e.g. `"try-catch"`). Resolved at execution time.
+    Pattern(&'static Pattern),
+    /// Depth-1 bigram (`A > B`) or depth-2 trigram (`A > B > C`); deduped.
+    Containment(AstNgramSet),
+    /// Validated single node kind. Execution deferred to #283 (unigram index).
+    SingleNode(NodeKindId),
+}
+
+impl PartialEq for AstQuery {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Pattern(a), Self::Pattern(b)) => std::ptr::eq(*a, *b),
+            (Self::Containment(a), Self::Containment(b)) => a == b,
+            (Self::SingleNode(a), Self::SingleNode(b)) => a == b,
+            _ => false,
+        }
+    }
+}
 
 /// Maximum allowed byte length for a raw query string (reliability bound).
 /// Aliased from [`crate::lexical::MAX_QUERY_BYTES`] so both layers share one source of truth.
@@ -18,7 +47,6 @@ pub(super) const MAX_AST_QUERY_BYTES: usize = crate::lexical::MAX_QUERY_BYTES;
 /// and `parse_ast_query` so the two sites cannot silently drift.
 pub(super) const EMPTY_QUERY_MSG: &str = "empty AST query";
 
-// Parser
 /// Parse a raw string into an [`AstQuery`].
 ///
 /// **Only** `String → AstQuery` boundary; total (never panics). Rejects

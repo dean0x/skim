@@ -24,7 +24,7 @@ use crate::{
 /// **Count contract (C4).** `count` in every returned [`AstPosting`] MUST be
 /// `>= 1`. Sources returning `count == 0` break the all-scores-positive
 /// invariant (`count >= 1 → tf > 0 → score > 0`) relied on by BM25 and the
-/// `debug_assert!` in [`crate::ast_index::AstQueryEngine::run_ngram_set`].
+/// `debug_assert!` in [`super::engine::AstQueryEngine::run_ngram_set`].
 pub trait AstPostingSource: Send + Sync {
     /// Look up postings for an [`AstBigram`]; `Ok(vec![])` when absent (C2).
     fn lookup_bigram(&self, b: AstBigram) -> Result<Vec<AstPosting>>;

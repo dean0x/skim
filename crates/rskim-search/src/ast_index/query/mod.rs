@@ -39,8 +39,8 @@ mod scoring;
 // AC-3: this set must be byte-identical to the pre-split `pub use query::{...}`
 // block in ast_index/mod.rs (lines 64-66).
 pub use adapter::AstPostingSource;
-pub use engine::{AstQuery, AstQueryEngine};
-pub use parse::parse_ast_query;
+pub use engine::AstQueryEngine;
+pub use parse::{AstQuery, parse_ast_query};
 pub use scoring::{AST_BM25_B, AST_BM25_K1};
 
 // Re-exports used by the test module via `use super::*`. These are already

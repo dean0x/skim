@@ -2,6 +2,9 @@
 //!
 //! [`AstQueryEngine`] is the immutable, `Send + Sync` entry point for both
 //! direct structural queries (`search_ast`) and the `SearchLayer` search path.
+//!
+//! [`AstQuery`] is defined in [`super::parse`] (its sole constructor) so
+//! that dependencies flow `engine → parse` in one direction only.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -11,45 +14,17 @@ use rskim_core::Language;
 use rustc_hash::FxHashMap;
 
 use super::adapter::AstPostingSource;
-use super::parse::{EMPTY_QUERY_MSG, parse_ast_query};
+use super::parse::{AstQuery, EMPTY_QUERY_MSG, parse_ast_query};
 use super::scoring::{CAPACITY_FLOOR, ScoringCtx};
-use crate::ast_index::Pattern;
 use crate::{
     FileId, Result, SearchError,
     ast_index::{
-        AstBigramEntry, AstIndexReader, AstNgramSet, AstTrigramEntry, NodeKindId, ast_bigram_idf,
+        AstBigramEntry, AstIndexReader, AstNgramSet, AstTrigramEntry, ast_bigram_idf,
         ast_trigram_idf,
     },
     types::{SearchField, SearchLayer, SearchQuery, SearchResult},
 };
 
-// Query enum
-/// A parsed, validated AST structural query.
-///
-/// Created exclusively via [`super::parse::parse_ast_query`] — the only
-/// `String → AstQuery` boundary.
-#[derive(Debug, Clone)]
-pub enum AstQuery {
-    /// Named catalog pattern (e.g. `"try-catch"`). Resolved at execution time.
-    Pattern(&'static Pattern),
-    /// Depth-1 bigram (`A > B`) or depth-2 trigram (`A > B > C`); deduped.
-    Containment(AstNgramSet),
-    /// Validated single node kind. Execution deferred to #283 (unigram index).
-    SingleNode(NodeKindId),
-}
-
-impl PartialEq for AstQuery {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Pattern(a), Self::Pattern(b)) => std::ptr::eq(*a, *b),
-            (Self::Containment(a), Self::Containment(b)) => a == b,
-            (Self::SingleNode(a), Self::SingleNode(b)) => a == b,
-            _ => false,
-        }
-    }
-}
-
-// Query engine
 /// AST structural pattern query engine. Immutable; `&self`-only; `Send + Sync`.
 ///
 /// Use [`AstQueryEngine::new`] for DI (tests, Wave 4) or
@@ -180,7 +155,6 @@ impl AstQueryEngine<AstIndexReader> {
     }
 }
 
-// SearchLayer adapter (Wave 3g)
 impl SearchLayer for AstQueryEngine<AstIndexReader> {
     /// `ast_pattern = None` → `Ok(vec![])` (Wave-4 no-op).
     /// `ast_pattern = Some("")` → `Err(InvalidQuery("empty AST query"))`.

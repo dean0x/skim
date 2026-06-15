@@ -9,7 +9,6 @@ use rustc_hash::FxHashMap;
 use super::adapter::AstPostingSource;
 use crate::{FileId, Result, ast_index::AstPosting};
 
-// BM25 constants
 /// BM25 saturation parameter k1 for AST structural scoring.
 pub const AST_BM25_K1: f64 = 1.2;
 /// BM25 length-normalisation parameter b for AST structural scoring.
@@ -31,7 +30,6 @@ pub(super) const UNKNOWN_LANG_IDF: f64 = 1.0;
 // equals `file_count` anyway, so the floor only applies on narrow queries.
 pub(super) const CAPACITY_FLOOR: usize = 16;
 
-// Lite scoring metadata (P1, #286)
 /// Minimal file metadata needed for BM25 scoring: `lang_id` and `node_count`.
 ///
 /// Used as the value type in `meta_cache` (replacing `AstFileMetaEntry`) so
@@ -62,8 +60,6 @@ impl LiteMeta {
         crate::index::lang_map::lang_from_id(self.lang_id)
     }
 }
-
-// Scoring context
 
 /// Accumulated scoring state for one `run_ngram_set` call.
 ///
