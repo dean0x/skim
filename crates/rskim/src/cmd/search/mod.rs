@@ -14,6 +14,7 @@
 //! - `rskim-search` crate — index building, n-gram extraction, BM25F scoring
 
 mod ast;
+mod build_lock;
 pub(crate) mod hooks;
 mod index;
 mod manifest;
@@ -1036,8 +1037,8 @@ mod tests {
     // resolve_blast_radius_paths — None DB degradation path
     // ============================================================================
 
-    /// When blast_radius is Some but temporal.db is absent (user hasn't run
-    /// `skim heatmap` yet), the function must return Ok(None) without panicking.
+    /// When blast_radius is Some but temporal.db is absent (temporal data not yet
+    /// auto-populated), the function must return Ok(None) without panicking.
     /// A stderr warning is expected but the caller handles the degradation.
     #[test]
     fn test_resolve_blast_radius_filter_no_db_returns_none() {

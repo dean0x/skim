@@ -430,8 +430,8 @@ fn test_rebuild_temporal_head_full_sha_and_fresh() {
 
 /// AC7 — Temporal failure on non-git directory does NOT fail lexical query.
 ///
-/// Discriminating: rebuild_temporal returns Ok(()) on a non-git dir; no error
-/// propagates to the caller.
+/// Discriminating: rebuild_temporal returns Ok(()) on a non-git dir AND
+/// temporal.db is NOT created (no data to write on a non-git root).
 #[test]
 fn test_rebuild_temporal_nongit_returns_ok() {
     let dir = tempdir().unwrap();
@@ -451,11 +451,12 @@ fn test_rebuild_temporal_nongit_returns_ok() {
         result.is_ok(),
         "rebuild_temporal must return Ok(()) on non-git directory (AC7), got: {result:?}"
     );
-    // temporal.db should NOT be created (no data to write).
-    // (It may be created by TemporalDb::open, but that only happens after a
-    // successful parse_history — which fails here, so we return before open.)
-    // NOTE: the file MIGHT exist if a prior parse succeeded; this test just
-    // verifies the function returns Ok, which is the AC7 discriminating criterion.
+    // temporal.db must NOT be created — parse_history fails before TemporalDb::open.
+    let db_path = cache_dir.join("temporal.db");
+    assert!(
+        !db_path.exists(),
+        "temporal.db must not be created on non-git root (AC7 postcondition)"
+    );
 }
 
 /// AC1 / AC2 — After auto-refresh on a git repo, top_hotspots and top_risks
@@ -672,5 +673,324 @@ fn test_rebuild_temporal_90d_cutoff() {
         hotspot.changes_30d, 2,
         "changes_30d must be 2 (recent commits are within 30d of now_epoch), got {}",
         hotspot.changes_30d
+    );
+}
+
+// ============================================================================
+// O-C / ADR-003 — Full-history risk stats correctness
+// ============================================================================
+
+/// O-C: total_commits must count commits outside the 90-day window.
+///
+/// A file has 2 old commits (well outside the 90-day window from now_epoch)
+/// and 1 recent commit. The risk row must report total_commits = 3, not 1.
+/// This tests that rebuild_temporal feeds the full-history walk to
+/// compute_file_temporal_stats (not just the 90-day hotspot walk).
+///
+/// Discriminating: total_commits == 3 (not == 1 if windowed).
+#[test]
+fn test_risk_row_total_commits_includes_out_of_window_commits() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // git init
+    Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "t@t.com"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "T"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    // now_epoch pinned to 2026-06-13 08:00:00 UTC.
+    let now_epoch: u64 = 1_781_337_600;
+
+    // Two old commits well outside the 90-day window (2024-01-01 is ~890 days ago).
+    let old_date = "2024-01-01 00:00:00 +0000";
+    for i in 0..2u32 {
+        std::fs::write(dir.path().join("tracked.rs"), format!("// old {i}")).unwrap();
+        Command::new("git")
+            .args(["add", "tracked.rs"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", &format!("fix: old fix {i}")])
+            .current_dir(dir.path())
+            .env("GIT_AUTHOR_DATE", old_date)
+            .env("GIT_COMMITTER_DATE", old_date)
+            .output()
+            .unwrap();
+    }
+
+    // One recent commit inside the 90-day window.
+    let recent_date = "2026-06-01 00:00:00 +0000";
+    std::fs::write(dir.path().join("tracked.rs"), "// recent").unwrap();
+    Command::new("git")
+        .args(["add", "tracked.rs"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "feat: recent"])
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_DATE", recent_date)
+        .env("GIT_COMMITTER_DATE", recent_date)
+        .output()
+        .unwrap();
+
+    let head_out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+
+    rebuild_temporal(dir.path(), &cache_dir, &head, now_epoch).unwrap();
+
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let risk = db
+        .risk_for_file("tracked.rs")
+        .unwrap()
+        .expect("tracked.rs must have a risk row");
+
+    assert_eq!(
+        risk.total_commits, 3,
+        "total_commits must count ALL commits including those >90 days ago (O-C / ADR-003), \
+         got {} (regression: windowed 90-day walk used instead of full history)",
+        risk.total_commits
+    );
+    // 2 of the 3 commits are fix commits (the old ones have "fix:" prefix).
+    assert_eq!(
+        risk.fix_commits, 2,
+        "fix_commits must count fix commits across full history, got {}",
+        risk.fix_commits
+    );
+}
+
+// ============================================================================
+// fix_density contract — raw ratio, not decay-weighted
+// ============================================================================
+
+/// RiskRow.fix_density must equal fix_commits/total_commits (raw ratio).
+///
+/// build_risk_rows previously set fix_density to FileRiskScores.fix_density
+/// (decay-weighted), which violated the schema contract in storage_types.rs
+/// ("ratio of fix commits to total commits"). Discriminating: fix_density must
+/// equal the exact fraction fix_commits/total_commits from the stats, not the
+/// decay-weighted ratio.
+#[test]
+fn test_risk_row_fix_density_is_raw_ratio() {
+    // Hand-built maps — no I/O, no git.
+    let mut risk_scores: HashMap<String, rskim_search::FileRiskScores> = HashMap::new();
+    risk_scores.insert(
+        "p.rs".to_string(),
+        rskim_search::FileRiskScores {
+            hotspot: 0.8,
+            // Decay-weighted fix_density — deliberately different from raw ratio.
+            fix_density: 0.9,
+        },
+    );
+
+    let mut temporal_stats: HashMap<String, rskim_search::FileTemporalStats> = HashMap::new();
+    temporal_stats.insert(
+        "p.rs".to_string(),
+        rskim_search::FileTemporalStats {
+            changes_30d: 1,
+            changes_90d: 2,
+            total_commits: 8,
+            fix_commits: 2, // raw ratio = 2/8 = 0.25
+        },
+    );
+
+    let rows = build_risk_rows(&risk_scores, &temporal_stats);
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+
+    // fix_density must be the raw ratio (2/8 = 0.25), NOT the decay-weighted 0.9.
+    let expected_raw = 2.0_f64 / 8.0;
+    assert!(
+        (row.fix_density - expected_raw).abs() < 1e-9,
+        "fix_density must be raw fix_commits/total_commits ({:.4}), got {:.4} \
+         (should NOT be the decay-weighted FileRiskScores.fix_density = 0.9)",
+        expected_raw,
+        row.fix_density
+    );
+    // risk_score must still be the decay-weighted fix_density for ranking.
+    assert!(
+        (row.risk_score - 0.9).abs() < 1e-9,
+        "risk_score must be decay-weighted fix_density (0.9 from FileRiskScores), got {:.4}",
+        row.risk_score
+    );
+}
+
+// ============================================================================
+// AC4 discriminating — sub-threshold pairs absent in the DB
+// ============================================================================
+
+/// AC4: After rebuild, sub-threshold Jaccard pair must NOT exist in the DB.
+///
+/// This is the discriminating complement of test_cochange_sub_threshold_excluded
+/// (which tests the pure builder). This test exercises the full rebuild path
+/// and verifies the DB contains no (A.rs, D.rs) row after a rebuild with a
+/// sub-threshold pair.
+#[test]
+fn test_rebuild_temporal_sub_threshold_pair_not_in_db() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // A and D co-change in 1 of 10 commits each.
+    // Jaccard = 1/(10+10-1) = 1/19 ≈ 0.053 < 0.10 — must be filtered.
+    // Build the commits directly via shell so we don't need to fight lifetime
+    // constraints on format!() temporaries in a Vec<(&str, Vec<(&str, &str)>)>.
+    Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "t@t.com"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "T"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    // 1 joint commit.
+    std::fs::write(dir.path().join("A.rs"), "// a").unwrap();
+    std::fs::write(dir.path().join("D.rs"), "// d").unwrap();
+    Command::new("git")
+        .args(["add", "A.rs", "D.rs"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "feat: joint"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    // 9 A-only commits.
+    for i in 1..10u32 {
+        std::fs::write(dir.path().join("A.rs"), format!("// a{i}")).unwrap();
+        Command::new("git")
+            .args(["add", "A.rs"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "feat: a"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+    }
+
+    // 9 D-only commits.
+    for i in 1..10u32 {
+        std::fs::write(dir.path().join("D.rs"), format!("// d{i}")).unwrap();
+        Command::new("git")
+            .args(["add", "D.rs"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "feat: d"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+    }
+
+    let head_out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+
+    let now = super::current_epoch_secs();
+    rebuild_temporal(dir.path(), &cache_dir, &head, now).unwrap();
+
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+
+    // The sub-threshold (A.rs, D.rs) pair must NOT appear in the DB.
+    let partners_for_a = db.cochanges_for_file("A.rs").unwrap();
+    let ad_in_db = partners_for_a.iter().any(|p| {
+        (p.file_a == "A.rs" && p.file_b == "D.rs") || (p.file_a == "D.rs" && p.file_b == "A.rs")
+    });
+    assert!(
+        !ad_in_db,
+        "sub-threshold (A.rs, D.rs) pair (Jaccard ≈ 0.053) must NOT be in the DB (AC4 DB layer)"
+    );
+}
+
+// ============================================================================
+// AC12 — CapacityExceeded leaves prior DB rows intact
+// ============================================================================
+
+/// AC12: When rebuild_temporal returns CapacityExceeded, prior DB rows and
+/// META_GIT_HEAD must remain untouched (no partial write).
+///
+/// We seed temporal.db with a known row (via a first successful rebuild),
+/// then verify that a second call on the same repo doesn't corrupt it.
+/// (True CapacityExceeded requires >500k rows, which is impractical to
+/// simulate in a unit test. This test verifies the DB is not corrupted
+/// during normal operation, which is the observable AC12 invariant for
+/// the common case. The CapacityExceeded arm itself is integration-tested
+/// at the storage layer in rskim-search/src/temporal/storage_tests.rs.)
+#[test]
+fn test_rebuild_temporal_second_run_preserves_prior_head() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let head = create_real_git_repo(dir.path(), &[("feat: first", &[("main.rs", "fn a() {}")])]);
+    assert_eq!(head.len(), 40, "git rev-parse must produce a 40-char SHA");
+
+    let now = super::current_epoch_secs();
+    // First successful rebuild — seeds the DB.
+    rebuild_temporal(dir.path(), &cache_dir, &head, now).unwrap();
+
+    let db_path = cache_dir.join("temporal.db");
+    assert!(
+        db_path.exists(),
+        "temporal.db must be created after first rebuild"
+    );
+
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let stored_head = db
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .unwrap()
+        .expect("META_GIT_HEAD must be set after first rebuild");
+    assert_eq!(
+        stored_head, head,
+        "META_GIT_HEAD must equal the passed HEAD"
+    );
+
+    // Second rebuild with same head — DB must not be corrupted.
+    rebuild_temporal(dir.path(), &cache_dir, &head, now).unwrap();
+
+    let db2 = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let stored_head2 = db2
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .unwrap()
+        .expect("META_GIT_HEAD must still be set after second rebuild");
+    assert_eq!(
+        stored_head2, head,
+        "META_GIT_HEAD must be preserved (or updated) after second rebuild (AC12)"
     );
 }

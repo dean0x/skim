@@ -567,6 +567,58 @@ fn test_auto_refresh_non_git_project_no_rebuild_loop() {
     );
 }
 
+/// AC7 / AC14 — Temporal hook integration: temporal rebuild called from
+/// auto_refresh_if_stale does NOT cause lexical search to fail.
+///
+/// This is the discriminating integration test for the hook wiring in
+/// staleness.rs. It exercises the SAME code path that AC7 protects — the
+/// call `rebuild_temporal(root, cache_dir, head, now)` inside
+/// `auto_refresh_if_stale` — and verifies that:
+/// 1. auto_refresh_if_stale returns Ok even when the temporal rebuild
+///    degrades gracefully (non-git root: temporal.db not written, no panic).
+/// 2. The returned manifest is valid (the lexical refresh succeeded).
+///
+/// A fake git repo is not needed here — the non-git path exercises the
+/// graceful-degradation arm of rebuild_temporal, which is the live failure
+/// mode the AC7 hook path must handle.
+#[test]
+fn test_auto_refresh_hook_temporal_failure_does_not_fail_lexical() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Build an initial non-git index so the next call is a "NoIndex" rebuild.
+    // (NoIndex triggers build_index, which then calls rebuild_temporal.)
+    // We don't call build_index_in first — NoIndex triggers the rebuild arm.
+
+    let analytics = TEST_ANALYTICS;
+    // auto_refresh_if_stale on a fresh non-git dir: NoIndex → build_index → rebuild_temporal.
+    // rebuild_temporal will fail gracefully (no git) and must NOT propagate the error.
+    let result = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics);
+
+    assert!(
+        result.is_ok(),
+        "auto_refresh_if_stale must succeed even when rebuild_temporal \
+         degrades on non-git root (AC7 / AC14 hook integration)"
+    );
+
+    // The returned manifest must be valid (lexical index was built).
+    let (_refreshed, manifest) = result.unwrap();
+    // Non-git project: stored_git_head is None (no git repo).
+    assert_eq!(
+        manifest.stored_git_head(),
+        None,
+        "non-git project manifest must have no stored HEAD"
+    );
+
+    // temporal.db must NOT be created (rebuild_temporal returned Ok early on non-git root).
+    let temporal_db_path = cache_dir.join("temporal.db");
+    assert!(
+        !temporal_db_path.exists(),
+        "temporal.db must not be created when rebuild_temporal degrades on non-git root (AC14)"
+    );
+}
+
 // ============================================================================
 // Display impl for StalenessCheck
 // ============================================================================

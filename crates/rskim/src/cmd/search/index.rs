@@ -153,27 +153,26 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
 ///
 /// # Concurrency
 ///
-/// Acquires an exclusive advisory lock on `{cache_dir}/.skim-build.lock` via
-/// [`super::temporal_build::acquire_build_lock`] before running the pipeline.
-/// That helper polls every 200 ms for up to 120 s, then returns an error.
-/// This serialises all callers — `skim init` background spawn, git-hook
-/// `--update`, and direct `--build` / `--rebuild` — protecting `index.skidx`
-/// and `index.skfiles` from concurrent writes, and also serialises against
-/// `rebuild_temporal` (which acquires the same lock after the lexical build).
+/// Acquires the shared advisory build lock via [`super::build_lock::acquire`]
+/// before running the pipeline. Both `build_index` (this function) and
+/// `rebuild_temporal` use the SAME lock so concurrent skim processes serialise
+/// correctly against both the lexical/AST write and the temporal write. The
+/// lock polls every 200 ms for up to 120 s, prints a one-time notice, then
+/// returns an error if the deadline expires.
 ///
-/// The lock is released when the returned file handle drops, i.e. at the end
-/// of this function.  The lock file itself is never deleted so the OS can
-/// reuse it across processes.
+/// The lock is released when the returned [`IndexResult`] (or the `Err`) drops,
+/// i.e. at the end of this function. The lock file itself is never deleted so
+/// the OS can reuse it across processes.
 pub(super) fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     let pipeline = Pipeline::new(config)?;
 
-    // Acquire the shared advisory build lock.  The single bounded
-    // implementation lives in `temporal_build::acquire_build_lock` so that
-    // both the lexical build (here) and the temporal rebuild (called from
-    // staleness.rs after the manifest persists) use ONE lock loop — no
-    // duplicate. The lock is held for the duration of `pipeline.run()` and
-    // released when `_lock` drops at function end. (applies ADR-006)
-    let _lock = super::temporal_build::acquire_build_lock(&pipeline.cache_dir)?;
+    // Acquire the shared advisory build lock. The single bounded implementation
+    // lives in `build_lock::acquire` so that both the lexical build (here) and
+    // the temporal rebuild (called from staleness.rs) use ONE lock loop with
+    // consistent wait message and deadline. The lock is held for the duration of
+    // `pipeline.run()` and released when `_lock` drops at function end.
+    // (applies ADR-006: serialises concurrent skim processes)
+    let _lock = super::build_lock::acquire("skim search index", &pipeline.cache_dir)?;
 
     pipeline.run()
 }

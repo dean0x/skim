@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rskim_search::{
     CochangeRow, DEFAULT_HALF_LIFE_DAYS, GixSource, HistoryResult, HotspotRow, RiskRow, TemporalDb,
@@ -57,76 +57,6 @@ const MIN_JACCARD: f64 = 0.10;
 /// default is grounded in the schema — it is the widest window the persisted
 /// stats represent for hotspot scoring.)
 const HOTSPOT_LOOKBACK_DAYS: u32 = 90;
-
-/// Lock polling interval (milliseconds).
-const LOCK_POLL_MS: u64 = 200;
-
-/// Lock acquisition deadline (seconds).
-const LOCK_DEADLINE_SECS: u64 = 120;
-
-// ============================================================================
-// Lock helper (D4 / applies ADR-006)
-// ============================================================================
-
-/// Acquire the shared advisory build lock at `{cache_dir}/.skim-build.lock`.
-///
-/// This is the SINGLE bounded lock-acquisition implementation shared between
-/// `build_index` (crates/rskim/src/cmd/search/index.rs) and `rebuild_temporal`.
-/// Both callers use the same file, the same poll interval, and the same deadline
-/// so the lock correctly serialises concurrent skim processes.
-///
-/// # Returns
-///
-/// An open `std::fs::File` holding the exclusive advisory lock.  The lock is
-/// released when the file is dropped.
-///
-/// # Errors
-///
-/// Returns `Err` when the lock cannot be opened or the 120-second deadline
-/// expires without acquiring it.
-pub(super) fn acquire_build_lock(cache_dir: &Path) -> anyhow::Result<std::fs::File> {
-    use anyhow::Context as _;
-
-    let lock_path = cache_dir.join(".skim-build.lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open build lock: {}", lock_path.display()))?;
-
-    let deadline = Instant::now() + Duration::from_secs(LOCK_DEADLINE_SECS);
-    let mut noticed = false;
-    loop {
-        match lock_file.try_lock() {
-            Ok(()) => break,
-            Err(std::fs::TryLockError::WouldBlock) => {
-                if !noticed {
-                    eprintln!(
-                        "skim search: waiting for concurrent build to finish \
-                         (lock: {}) …",
-                        lock_path.display()
-                    );
-                    noticed = true;
-                }
-                if Instant::now() >= deadline {
-                    return Err(anyhow::anyhow!(
-                        "another skim build has held {} for >{} s; \
-                         if no build is running, delete the lock file and retry",
-                        lock_path.display(),
-                        LOCK_DEADLINE_SECS,
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(LOCK_POLL_MS));
-            }
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(anyhow::anyhow!(e))
-                    .with_context(|| "failed to acquire exclusive build lock");
-            }
-        }
-    }
-    Ok(lock_file)
-}
 
 // ============================================================================
 // Co-change pair builder (D2 / AC10)
@@ -206,6 +136,15 @@ pub(super) fn build_cochange_rows(history: &HistoryResult) -> Vec<CochangeRow> {
     for ((a, b), count_ab) in &pair_counts {
         let count_a = *file_counts.get(a).unwrap_or(&0);
         let count_b = *file_counts.get(b).unwrap_or(&0);
+        // Invariant: count_ab <= min(count_a, count_b) because per-commit paths are
+        // deduped (sort_unstable+dedup above) and git tree-diff yields each path at
+        // most once per commit. The subtraction is therefore safe for u32.
+        // The debug_assert guards against future refactors that break this invariant
+        // (e.g. a change to the >COUPLING_MAX_FILES branch that counts non-deduped files).
+        debug_assert!(
+            count_a >= *count_ab && count_b >= *count_ab,
+            "union underflow: count_ab={count_ab} but count_a={count_a}, count_b={count_b}"
+        );
         let union = count_a + count_b - count_ab;
         if union == 0 {
             continue;
@@ -278,9 +217,13 @@ pub(super) fn build_hotspot_rows(
 ///
 /// Same union-of-keys strategy as [`build_hotspot_rows`] (AC11 contract).
 ///
-/// `risk_score` and `fix_density` both come from `FileRiskScores.fix_density`
-/// (bug-fix density is both the risk score and the stored density ratio);
-/// `total_commits` and `fix_commits` come from [`FileTemporalStats`].
+/// - `risk_score` = `FileRiskScores.fix_density` (decay-weighted, used for
+///   ranking by `ORDER BY risk_score DESC`).
+/// - `fix_density` = raw `fix_commits / total_commits` from [`FileTemporalStats`]
+///   (matches the schema docs in storage_types.rs: "ratio of fix commits to
+///   total commits" — shown in the `Fix%` column of `--risky`).
+/// - `total_commits` and `fix_commits` = lifetime counts from [`FileTemporalStats`]
+///   (computed over the full-history walk, not the 90-day window — O-C / ADR-003).
 pub(super) fn build_risk_rows(
     risk_scores: &HashMap<String, rskim_search::FileRiskScores>,
     temporal_stats: &HashMap<String, rskim_search::FileTemporalStats>,
@@ -288,20 +231,26 @@ pub(super) fn build_risk_rows(
     union_paths(risk_scores, temporal_stats)
         .into_iter()
         .map(|path| {
-            let fix_density = risk_scores.get(path).map(|r| r.fix_density).unwrap_or(0.0);
+            let decay_fix_density = risk_scores.get(path).map(|r| r.fix_density).unwrap_or(0.0);
             let (total_commits, fix_commits) = temporal_stats
                 .get(path)
                 .map(|s| (s.total_commits, s.fix_commits))
                 .unwrap_or((0, 0));
+            // raw_fix_density = fix_commits / total_commits (per storage_types.rs schema).
+            // Distinct from decay_fix_density (which is decay-weighted and used as risk_score).
+            let raw_fix_density = if total_commits > 0 {
+                f64::from(fix_commits) / f64::from(total_commits)
+            } else {
+                0.0
+            };
             RiskRow {
                 file_path: path.to_string(),
-                // risk_score and fix_density are both the decay-weighted bug-fix
-                // density from FileRiskScores — the schema stores them separately
-                // so the read query can ORDER BY either column independently.
-                risk_score: fix_density,
+                // risk_score = decay-weighted fix density for ranking (ORDER BY risk_score DESC).
+                risk_score: decay_fix_density,
                 total_commits,
                 fix_commits,
-                fix_density,
+                // fix_density = raw ratio (shown in Fix% column; matches schema contract).
+                fix_density: raw_fix_density,
             }
         })
         .collect()
@@ -393,13 +342,21 @@ pub(super) fn rebuild_temporal(
     };
 
     // ── Score computation (pure, no I/O) ─────────────────────────────────────
+    // risk_scores: decay-weighted hotspot/fix_density from the full-history walk
+    // (O-C / ADR-003). Passing risk_history ensures the decay weights are over
+    // the full commit lifetime, not capped at 90 days.
     let risk_scores = rskim_search::compute_file_risk_scores(
-        &hotspot_history.commits,
+        &risk_history.commits,
         now_epoch,
         DEFAULT_HALF_LIFE_DAYS,
     );
+    // temporal_stats: windowed counts (changes_30d/90d) PLUS lifetime totals
+    // (total_commits/fix_commits). Passing risk_history gives correct lifetime
+    // counts for RiskRow; the 30d/90d window fields reflect commits
+    // inside the window relative to now_epoch. (O-C / ADR-003)
     let temporal_stats =
-        rskim_search::compute_file_temporal_stats(&hotspot_history.commits, now_epoch);
+        rskim_search::compute_file_temporal_stats(&risk_history.commits, now_epoch);
+    // cochange intentionally uses full history (lifetime co-change coupling).
     let cochange_rows = build_cochange_rows(&risk_history);
 
     // ── Row join ──────────────────────────────────────────────────────────────
@@ -409,7 +366,10 @@ pub(super) fn rebuild_temporal(
     // ── Acquire lock (D4), then sync ─────────────────────────────────────────
     // The lock serialises temporal writes against concurrent lexical builds.
     // Acquired AFTER compute (pure) to minimise lock hold time.
-    let _lock = acquire_build_lock(cache_dir)?;
+    // Delegates to `build_lock::acquire` — the SINGLE bounded implementation
+    // shared with `build_index` (index.rs). Both callers use the same file,
+    // the same poll interval, and the same deadline (applies ADR-006).
+    let _lock = super::build_lock::acquire("skim search", cache_dir)?;
 
     let db_path = cache_dir.join("temporal.db");
     let db = match TemporalDb::open(&db_path) {

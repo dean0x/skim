@@ -279,10 +279,13 @@ pub(super) fn check_staleness(
 /// # HEAD threading (O-A / #289)
 ///
 /// `read_git_head(root)` is called ONCE at function entry and the result is
-/// threaded into both the staleness decision and `rebuild_temporal`.  This
-/// prevents a TOCTOU race (two reads could return different SHAs if a commit
-/// lands between them) and is the single source of truth for the HEAD that
-/// gets recorded in both the lexical manifest and `temporal.db`.
+/// threaded into `rebuild_temporal`. Note that `check_staleness` also calls
+/// `read_git_head` internally — both calls are advisory and safe because the
+/// lexical manifest records the HEAD that `build_index` writes, and
+/// `rebuild_temporal` records the HEAD passed here. If a commit lands between
+/// the two reads the manifest will record the pre-commit HEAD and temporal.db
+/// will record the post-commit HEAD; both will appear stale on the next query,
+/// triggering one more refresh. This is the accepted TOCTOU trade-off.
 pub(super) fn auto_refresh_if_stale(
     root: &Path,
     cache_dir: &Path,
@@ -292,9 +295,8 @@ pub(super) fn auto_refresh_if_stale(
     use super::temporal_build::{current_epoch_secs, rebuild_temporal};
     use super::types::IndexConfig;
 
-    // Read the current git HEAD ONCE at function entry.  The result is threaded
-    // into both `check_staleness` (via the match arms below) and `rebuild_temporal`
-    // so both indexes record the SAME SHA. (O-A / #289 amendment)
+    // Read the current git HEAD once at function entry so rebuild_temporal can
+    // record the same SHA that will be in the manifest after build_index runs.
     let current_head: Option<String> = read_git_head(root);
 
     let (staleness, existing_manifest) = check_staleness(cache_dir, root);
@@ -327,15 +329,12 @@ pub(super) fn auto_refresh_if_stale(
                 result.duration.as_secs_f64()
             );
         }
-        StalenessCheck::HeadChanged {
-            ref stored,
-            ref current,
-        } => {
+        StalenessCheck::HeadChanged { stored, current } => {
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "skim search [debug]: HEAD changed ({} -> {}), refreshing index…",
-                    stored.get(..8).unwrap_or(stored),
-                    current.get(..8).unwrap_or(current)
+                    stored.get(..8).unwrap_or(&stored),
+                    current.get(..8).unwrap_or(&current)
                 );
             } else {
                 eprintln!("skim search: index stale (HEAD changed), refreshing…");
@@ -364,9 +363,9 @@ pub(super) fn auto_refresh_if_stale(
     // the parse+sync phase and degrades gracefully on non-git dirs, gix errors,
     // or CapacityExceeded — a temporal failure MUST NOT fail the lexical refresh.
     //
-    // `head` is the FULL 40/64-hex SHA read at function entry above (O-A).
-    // Passing `None` when the project is non-git: `rebuild_temporal` skips
-    // gracefully (parse_history returns an error on a non-git dir anyway).
+    // `head` is the HEAD SHA read at function entry above. Passing `None` when
+    // the project is non-git: `rebuild_temporal` skips gracefully (parse_history
+    // returns an error on a non-git dir anyway).
     if let Some(ref head) = current_head
         && let Err(e) = rebuild_temporal(root, cache_dir, head, current_epoch_secs())
     {
