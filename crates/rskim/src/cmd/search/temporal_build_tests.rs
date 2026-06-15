@@ -330,12 +330,8 @@ fn test_join_path_only_in_temporal_stats() {
 // Integration tests requiring a real git repository
 // ============================================================================
 
-/// Create a real git repository with commits via git subprocess.
-///
-/// `git init` + `git config` + `git add` + `git commit` for each commit entry.
-/// `commit_files` is `(message, &[(filename, content)])`.
-fn create_real_git_repo(dir: &std::path::Path, commit_files: &[(&str, &[(&str, &str)])]) -> String {
-    // git init
+/// Initialise an empty git repository in `dir` with test identity.
+fn init_git_repo(dir: &std::path::Path) {
     Command::new("git")
         .args(["init"])
         .current_dir(dir)
@@ -351,6 +347,14 @@ fn create_real_git_repo(dir: &std::path::Path, commit_files: &[(&str, &[(&str, &
         .current_dir(dir)
         .output()
         .expect("git config name");
+}
+
+/// Create a real git repository with commits via git subprocess.
+///
+/// `git init` + `git config` + `git add` + `git commit` for each commit entry.
+/// `commit_files` is `(message, &[(filename, content)])`.
+fn create_real_git_repo(dir: &std::path::Path, commit_files: &[(&str, &[(&str, &str)])]) -> String {
+    init_git_repo(dir);
 
     for (msg, files) in commit_files {
         for (name, content) in *files {
@@ -583,22 +587,7 @@ fn test_rebuild_temporal_90d_cutoff() {
     let cache_dir = dir.path().join("cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
 
-    // git init
-    Command::new("git")
-        .args(["init"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
-    Command::new("git")
-        .args(["config", "user.email", "t@t.com"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
-    Command::new("git")
-        .args(["config", "user.name", "T"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
+    init_git_repo(dir.path());
 
     // Two old commits outside the 90-day window.
     // now_epoch is pinned below to 1_781_337_600 = 2026-06-13 08:00:00 UTC;
@@ -694,22 +683,7 @@ fn test_risk_row_total_commits_includes_out_of_window_commits() {
     let cache_dir = dir.path().join("cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
 
-    // git init
-    Command::new("git")
-        .args(["init"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
-    Command::new("git")
-        .args(["config", "user.email", "t@t.com"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
-    Command::new("git")
-        .args(["config", "user.name", "T"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
+    init_git_repo(dir.path());
 
     // now_epoch pinned to 2026-06-13 08:00:00 UTC.
     let now_epoch: u64 = 1_781_337_600;
@@ -854,21 +828,7 @@ fn test_rebuild_temporal_sub_threshold_pair_not_in_db() {
     // Jaccard = 1/(10+10-1) = 1/19 ≈ 0.053 < 0.10 — must be filtered.
     // Build the commits directly via shell so we don't need to fight lifetime
     // constraints on format!() temporaries in a Vec<(&str, Vec<(&str, &str)>)>.
-    Command::new("git")
-        .args(["init"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
-    Command::new("git")
-        .args(["config", "user.email", "t@t.com"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
-    Command::new("git")
-        .args(["config", "user.name", "T"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
+    init_git_repo(dir.path());
 
     // 1 joint commit.
     std::fs::write(dir.path().join("A.rs"), "// a").unwrap();
