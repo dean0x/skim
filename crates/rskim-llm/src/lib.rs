@@ -133,7 +133,7 @@ pub const MAX_DEPTH: u32 = 64;
 /// empty list for OpenAI bodies, so these ids are **not** addressable through
 /// [`mutate_block`]. Attempting to mutate an OpenAI body using an id returned
 /// here will return [`LlmError::BlockNotMutable`]. This asymmetry is a known
-/// limitation until OpenAI mutation is implemented (#329).
+/// limitation until OpenAI mutation is implemented (#332).
 ///
 /// # Examples
 ///
@@ -173,7 +173,7 @@ pub fn classify_body(body: &ParsedBody) -> Vec<(String, Classification)> {
                             }
                         }
                     }
-                    None => {}  // assistant messages with only tool_calls have no content
+                    None => {} // assistant messages with only tool_calls have no content
                 }
             }
             results

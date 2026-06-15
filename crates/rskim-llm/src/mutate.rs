@@ -39,7 +39,7 @@ use crate::{LlmError, ParsedBody, Result};
 /// OpenAI bodies are not yet mutable through this API. [`crate::list_blocks`]
 /// returns an empty list for OpenAI bodies, and calling `mutate_block` on any
 /// OpenAI body returns [`LlmError::BlockNotMutable`] with kind `"openai-not-implemented"`.
-/// OpenAI mutation is tracked as a follow-up (#329).
+/// OpenAI mutation is tracked as a follow-up (#332).
 ///
 /// # Arguments
 ///
@@ -61,7 +61,7 @@ use crate::{LlmError, ParsedBody, Result};
 pub fn mutate_block(body: &mut ParsedBody, block_id: &str, new_text: &str) -> Result<Vec<u8>> {
     match body {
         ParsedBody::Anthropic(b) => mutate_anthropic(b, block_id, new_text),
-        // OpenAI mutation is not yet implemented — follow-up tracked as #329.
+        // OpenAI mutation is not yet implemented — follow-up tracked as #332.
         // Return BlockNotMutable (not BlockNotFound) so callers can distinguish
         // "this provider is unsupported" from "this ID does not exist".
         ParsedBody::OpenAi(_) => Err(LlmError::BlockNotMutable(
@@ -191,7 +191,7 @@ pub struct BlockDescriptor {
 ///
 /// OpenAI bodies currently expose **no mutable blocks**: this function returns
 /// an empty `Vec` for any [`ParsedBody::OpenAi`] body. OpenAI mutation is
-/// tracked as a follow-up (#329). If you call [`mutate_block`] on an OpenAI
+/// tracked as a follow-up (#332). If you call [`mutate_block`] on an OpenAI
 /// body, it returns [`crate::LlmError::BlockNotMutable`].
 ///
 /// Note: [`crate::classify_body`] does walk OpenAI content and returns
@@ -214,7 +214,7 @@ pub struct BlockDescriptor {
 pub fn list_blocks(body: &ParsedBody) -> Vec<BlockDescriptor> {
     match body {
         ParsedBody::Anthropic(b) => list_anthropic_blocks(b),
-        // OpenAI mutation is not yet implemented — follow-up tracked as #329.
+        // OpenAI mutation is not yet implemented — follow-up tracked as #332.
         ParsedBody::OpenAi(_) => vec![],
     }
 }

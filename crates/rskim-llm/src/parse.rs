@@ -180,7 +180,12 @@ fn describe_value(v: &serde_json::Value) -> String {
             if s.len() > 32 {
                 // Truncate at a UTF-8 char boundary at or before byte 32 — direct
                 // byte indexing can fall mid-codepoint and panic on multi-byte input.
-                let end = s.char_indices().map(|(i, _)| i).filter(|&i| i <= 32).last().unwrap_or(0);
+                // Walk down from 32 to the nearest char boundary (always terminates
+                // at 0, which is a valid boundary).
+                let mut end = 32;
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
                 format!("string(\"{}...\")", &s[..end])
             } else {
                 format!("string(\"{s}\")")

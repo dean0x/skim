@@ -179,16 +179,15 @@ pub fn classify(text: &str) -> Classification {
 /// (optionally with a language tag on the opening fence line).
 fn try_classify_fenced(text: &str) -> Option<Classification> {
     let trimmed = text.trim();
-    // Must start and end with ``` and have a newline separating opener from closer.
-    if !trimmed.starts_with("```") || !trimmed.ends_with("```") || !trimmed.contains('\n') {
+    // Must start and end with ``` and be more than just the fence markers (```\n```).
+    if !trimmed.starts_with("```") || !trimmed.ends_with("```") || trimmed.len() < 6 {
         return None;
     }
-    // Must be more than just the fence markers (```\n```)
-    if trimmed.len() < 6 {
-        return None;
-    }
+    // Must have a newline separating opener from closer. `find` locates it in a
+    // single scan; `?` returns None when absent (no panic path — `expect_used` is
+    // denied crate-wide).
+    let first_line_end = trimmed.find('\n')?;
     // Extract language tag from the first line (text after the opening ```)
-    let first_line_end = trimmed.find('\n').expect("contains newline checked above");
     let lang_hint = fence_lang_hint(&trimmed[3..first_line_end]);
     Some(Classification::code(lang_hint))
 }

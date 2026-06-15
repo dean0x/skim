@@ -117,10 +117,10 @@ pub fn detect(obj: &Map<String, serde_json::Value>) -> Provider {
     // message-level discriminant (e.g. `{"model":"gpt-4o","messages":[...]}`
     // with no tool_calls/response_format).  This prevents silent misclassification
     // as Anthropic (applies ADR-001: fix noticed issues immediately).
-    if let Some(serde_json::Value::String(model)) = obj.get("model") {
-        if OPENAI_MODEL_PREFIXES.iter().any(|p| model.starts_with(p)) {
-            return Provider::OpenAi;
-        }
+    if let Some(serde_json::Value::String(model)) = obj.get("model")
+        && OPENAI_MODEL_PREFIXES.iter().any(|p| model.starts_with(p))
+    {
+        return Provider::OpenAi;
     }
 
     // Default: Anthropic
