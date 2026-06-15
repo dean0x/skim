@@ -1,4 +1,4 @@
-<!-- TL;DR: 9 pitfalls. Key: PF-005, PF-006, PF-007, PF-008, PF-009 -->
+<!-- TL;DR: 10 pitfalls. Key: PF-006, PF-007, PF-008, PF-009, PF-010 -->
 # Known Pitfalls
 
 Area-specific gotchas, fragile areas, and past bugs.
@@ -83,3 +83,12 @@ Area-specific gotchas, fragile areas, and past bugs.
 - **Resolution**: always run workspace lint as cargo clippy --workspace --all-targets -- -D warnings (not cargo clippy -p <crate>) so binary-crate test modules are compiled and linted
 - **Status**: Active
 - **Source**: self-learning:obs_clpat0
+
+## PF-010: Dynamic/parallel agent workflows stall (180s no-output guard) and can thrash the host because nothing in the stack caps parallelism: many agents x cargo all-cores x multiple clones x no shared build cache x subprocess-spawning tests
+
+- **Area**: orchestrating dynamic/parallel agent workflows that run cargo on a multi-core host (especially with multiple repo clones)
+- **Issue**: the runtime kills any agent silent for 180s, and a single workspace-wide cargo test --all-features wedges because subprocess-spawning E2E tests (daemon passthrough, nested cargo) get CPU-starved and never return under the load multiplier of many-agents x cargo-all-cores x multiple-clones x no-shared-cache x heavy-deps -- the same load can exhaust RAM and swap-thrash the host into a hard restart
+- **Impact**: workflows fail after burning all retries (>1.3M tokens, hours of wall-clock), and the developer machine can become unusable mid-session
+- **Resolution**: scope every in-workflow cargo command per-crate (cargo check/clippy/test -p <crate>) and split heavy commands into separate Bash calls so each returns well under 180s
+- **Status**: Active
+- **Source**: self-learning:obs_wfstall
