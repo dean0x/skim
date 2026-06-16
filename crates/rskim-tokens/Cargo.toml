@@ -48,5 +48,5 @@ name = "rskim_tokens"
 path = "src/lib.rs"
 
 [[bench]]
-name = "token_count"
+name = "token_count_bench"
 harness = false

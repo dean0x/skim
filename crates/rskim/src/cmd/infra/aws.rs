@@ -119,9 +119,19 @@ fn try_parse_json(stdout: &str) -> Option<InfraResult> {
 }
 
 /// Parse an AWS JSON object response, routing on the primary data key.
+///
+/// Key selection is alphabetical among non-metadata keys so that enabling
+/// `serde_json`'s `preserve_order` feature (IndexMap) does not change which
+/// dataset is summarised relative to the previous BTreeMap (alphabetical) order.
 fn parse_json_object(map: &serde_json::Map<String, serde_json::Value>) -> Option<InfraResult> {
-    // Find the primary data key (skip metadata keys)
-    let data_key = map.keys().find(|k| !METADATA_KEYS.contains(&k.as_str()))?;
+    // Find the primary data key (skip metadata keys), sorted for determinism.
+    // `preserve_order` switches serde_json::Map from BTreeMap to IndexMap, so
+    // iteration order is now source order rather than alphabetical — we restore
+    // deterministic (alphabetical-first) selection explicitly here.
+    let data_key = map
+        .keys()
+        .filter(|k| !METADATA_KEYS.contains(&k.as_str()))
+        .min_by(|a, b| a.cmp(b))?;
 
     let data = &map[data_key];
     let (count, items) = match data {

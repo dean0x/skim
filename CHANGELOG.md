@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`rskim-tokens` crate (L3 Wave-1)** — Multi-provider token counting library (cl100k /
+  o200k / Anthropic-offline / heuristic). Default build is HTTP-free; `net-anthropic` feature
+  gates the API-backed counter. `skim`'s internal token counting now delegates here
+  (`--show-stats` output unchanged). (#300)
+- **`rskim-contract` crate (L3 Wave-1)** — Byte-faithful contract / fail-open guardrail layer
+  for LLM transcript mutation; codifies 8 safety invariants as a typed contract + conformance
+  harness. (#301)
+- **`rskim-llm` crate (L3 Wave-1)** — Typed LLM request model for Anthropic/OpenAI bodies
+  with byte-identical round-trips, provider auto-detection, and content-block classification.
+  (#302)
+
 ### Fixed
 - **`gh` output-steering flags now pass through on both paths** — Two bugs
   caused `gh issue view 93 -q .body` and similar invocations to be reformatted + truncated
@@ -32,11 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trigger passthrough for those subcommands.
 
 ### Changed
-- **`skim stats --json` key ordering changed from alphabetical to insertion order** — Enabling
-  `serde_json`'s `preserve_order` feature workspace-wide (#302) switches `serde_json::Map`
-  from `BTreeMap` (alphabetical) to `IndexMap` (declaration/insertion order). `skim stats
-  --json` and `skim init`'s settings.json rewrite now emit keys in logical/insertion order.
-  JSON-spec-compatible; no test pins key order. Downstream `| jq` pipelines that rely on
+- **`serde_json` `preserve_order` feature enabled workspace-wide — key ordering changes** — (#302)
+  Enabling `preserve_order` switches `serde_json::Map` from `BTreeMap` (alphabetical) to
+  `IndexMap` (declaration/insertion order) for every crate in the workspace. Visible effects:
+  - `skim stats --json` and `skim init`'s settings.json rewrite now emit keys in
+    logical/insertion order instead of alphabetical order.
+  - `skim aws`, `skim gh api`, and `skim curl` JSON-compression output changes key ordering
+    from alphabetical to source order in truncated responses (first-N-key truncation paths).
+  - `skim aws` primary-data-key selection is now explicitly alphabetical (restored by sorting
+    candidate keys) so the summarised dataset is stable regardless of AWS response field order.
+  JSON-spec-compatible; no test pins key order. Downstream `| jq` pipelines that relied on
   alphabetical key ordering may need to add an explicit `| keys_unsorted` or `| to_entries`
   sort step.
 - **Removed internal command-execution timeout caps (ADR-008)** — `CommandRunner` no longer

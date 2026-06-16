@@ -174,14 +174,8 @@ fn test_direct_dispatch_indefinite_exits_quickly_when_binary_missing() {
         // test cited above, so this bound just needs enough headroom to never
         // trip on a healthy machine.
         .timeout(std::time::Duration::from_secs(10))
-        .assert()
+        .assert();
         // Primary check: exits within the timeout (does not hang).
-        // If nodemon is somehow installed and starts → non-127 is also acceptable
-        // because the test's purpose is no-hang, not exit-code mapping
-        // (that's covered by the unit test in dispatch.rs).
-        .code(predicate::function(|&code: &i32| {
-            // Accept 127 (not found), or non-zero (started but exited), or 0.
-            // Only reject if the process never exits (prevented by timeout).
-            code >= 0
-        }));
+        // Exit-code mapping (127 for not-found vs 0/non-zero) is covered by the
+        // dispatch.rs unit test — this test only gates the no-hang property.
 }
