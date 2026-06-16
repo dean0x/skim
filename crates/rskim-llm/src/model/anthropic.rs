@@ -615,6 +615,102 @@ impl LeafRef {
             }
         }
     }
+
+    /// Compare this leaf's composite ID to `candidate` without allocating.
+    ///
+    /// Equivalent to `self.id() == candidate` but avoids the `String` allocation
+    /// that `id()` produces.  Use this in the mutate-block search hot path
+    /// (called once per leaf until a match is found).  Use `id()` only for
+    /// error messages or descriptor construction where allocation is acceptable.
+    ///
+    /// # ID formats (byte-by-byte match)
+    ///
+    /// | Variant | Pattern |
+    /// |---------|---------|
+    /// | `MessageString` | `"m{i}"` |
+    /// | `TextBlock` | `"m{i}b{j}"` |
+    /// | `ToolResultString` | `"m{i}b{j}s"` |
+    /// | `ToolResultLeaf` | `"m{i}b{j}l{k}"` |
+    pub(crate) fn id_eq(&self, candidate: &str) -> bool {
+        // Compare byte-by-byte without allocating a String.
+        // We use a tiny inline helper that writes usize digits into a stack buffer
+        // and matches them against the candidate byte-by-byte, avoiding any heap
+        // allocation (unlike `id()` which calls `format!`).
+        //
+        // The helper is a simple cursor over a fixed-size stack buffer; 64 bytes
+        // is far larger than any realistic id (max realistic: "m999b999l999" = 12
+        // bytes for msg_idx/blk_idx/leaf_idx all in the hundreds).
+        struct Cursor {
+            buf: [u8; 64],
+            pos: usize,
+        }
+        impl Cursor {
+            fn new() -> Self {
+                Self { buf: [0u8; 64], pos: 0 }
+            }
+            fn push(&mut self, b: u8) {
+                if self.pos < self.buf.len() {
+                    self.buf[self.pos] = b;
+                    self.pos += 1;
+                }
+            }
+            fn push_usize(&mut self, mut n: usize) {
+                // Write decimal digits for `n` into the buffer.
+                // We write into a small sub-buffer in reverse then copy forward.
+                let mut tmp = [0u8; 20]; // max usize decimal = 20 digits
+                let mut len = 0;
+                if n == 0 {
+                    self.push(b'0');
+                    return;
+                }
+                while n > 0 {
+                    tmp[len] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                    len += 1;
+                }
+                for i in (0..len).rev() {
+                    self.push(tmp[i]);
+                }
+            }
+            fn as_bytes(&self) -> &[u8] {
+                &self.buf[..self.pos]
+            }
+        }
+
+        let mut c = Cursor::new();
+        match self {
+            LeafRef::MessageString { msg_idx } => {
+                c.push(b'm');
+                c.push_usize(*msg_idx);
+            }
+            LeafRef::TextBlock { msg_idx, blk_idx } => {
+                c.push(b'm');
+                c.push_usize(*msg_idx);
+                c.push(b'b');
+                c.push_usize(*blk_idx);
+            }
+            LeafRef::ToolResultString { msg_idx, blk_idx } => {
+                c.push(b'm');
+                c.push_usize(*msg_idx);
+                c.push(b'b');
+                c.push_usize(*blk_idx);
+                c.push(b's');
+            }
+            LeafRef::ToolResultLeaf {
+                msg_idx,
+                blk_idx,
+                leaf_idx,
+            } => {
+                c.push(b'm');
+                c.push_usize(*msg_idx);
+                c.push(b'b');
+                c.push_usize(*blk_idx);
+                c.push(b'l');
+                c.push_usize(*leaf_idx);
+            }
+        }
+        c.as_bytes() == candidate.as_bytes()
+    }
 }
 
 /// Enumerate `(block_id, text)` pairs for all mutable text leaves in a body.
@@ -628,4 +724,78 @@ pub(crate) fn anthropic_leaf_texts(body: &AnthropicBody) -> Vec<(String, &str)> 
         out.push((leaf_ref.id(), text));
     });
     out
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Verify that `id_eq` agrees with `id() == candidate` for all four ID shapes.
+    ///
+    /// This tests real equivalence — each assertion can fail if the formats diverge.
+    /// Avoids PF-007 (vacuous tests): the test would fail if id_eq returned `true`
+    /// unconditionally, or if id() produced a different format than id_eq.
+    #[test]
+    fn id_eq_agrees_with_id_for_all_shapes() {
+        // Shape 1: MessageString → "m{i}"
+        let ms = LeafRef::MessageString { msg_idx: 3 };
+        let ms_id = ms.id();
+        assert!(ms.id_eq(&ms_id), "id_eq must match id() for MessageString");
+        assert_eq!(ms_id, "m3");
+        assert!(!ms.id_eq("m4"), "id_eq must not match a different index");
+        assert!(!ms.id_eq("m3b0"), "id_eq must not match a longer id");
+        assert!(!ms.id_eq("m3s"), "id_eq must not match a suffixed id");
+
+        // Shape 2: TextBlock → "m{i}b{j}"
+        let tb = LeafRef::TextBlock {
+            msg_idx: 1,
+            blk_idx: 5,
+        };
+        let tb_id = tb.id();
+        assert!(tb.id_eq(&tb_id), "id_eq must match id() for TextBlock");
+        assert_eq!(tb_id, "m1b5");
+        assert!(!tb.id_eq("m1b6"), "id_eq must not match a different blk_idx");
+        assert!(!tb.id_eq("m1b5s"), "id_eq must not match the ToolResultString suffix");
+
+        // Shape 3: ToolResultString → "m{i}b{j}s"
+        let trs = LeafRef::ToolResultString {
+            msg_idx: 0,
+            blk_idx: 2,
+        };
+        let trs_id = trs.id();
+        assert!(trs.id_eq(&trs_id), "id_eq must match id() for ToolResultString");
+        assert_eq!(trs_id, "m0b2s");
+        assert!(!trs.id_eq("m0b2"), "id_eq must not match the TextBlock (no suffix) form");
+        assert!(!trs.id_eq("m0b2l0"), "id_eq must not match the ToolResultLeaf form");
+
+        // Shape 4: ToolResultLeaf → "m{i}b{j}l{k}"
+        let trl = LeafRef::ToolResultLeaf {
+            msg_idx: 2,
+            blk_idx: 0,
+            leaf_idx: 7,
+        };
+        let trl_id = trl.id();
+        assert!(trl.id_eq(&trl_id), "id_eq must match id() for ToolResultLeaf");
+        assert_eq!(trl_id, "m2b0l7");
+        assert!(!trl.id_eq("m2b0l8"), "id_eq must not match a different leaf_idx");
+        assert!(!trl.id_eq("m2b0"), "id_eq must not match the shorter TextBlock form");
+    }
+
+    /// Guard: id_eq must handle multi-digit indices correctly.
+    /// A naive string comparison bug or off-by-one in the buffer write could
+    /// produce incorrect results for indices ≥ 10.
+    #[test]
+    fn id_eq_multi_digit_indices() {
+        let leaf = LeafRef::ToolResultLeaf {
+            msg_idx: 10,
+            blk_idx: 20,
+            leaf_idx: 30,
+        };
+        let id = leaf.id();
+        assert_eq!(id, "m10b20l30");
+        assert!(leaf.id_eq("m10b20l30"));
+        assert!(!leaf.id_eq("m10b20l3"), "must not match a prefix of a multi-digit leaf_idx");
+        assert!(!leaf.id_eq("m1b20l30"), "must not match single-digit prefix of msg_idx");
+    }
 }

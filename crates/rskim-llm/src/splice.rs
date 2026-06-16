@@ -32,11 +32,11 @@ use crate::{LlmError, Result};
 /// Both `start` and `end` are byte indices; `start` points to the opening `"` and
 /// `end` points one past the closing `"` of the JSON-quoted string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StringSpan {
+pub(crate) struct StringSpan {
     /// Index of the opening `"` of the JSON string.
-    pub start: usize,
+    pub(crate) start: usize,
     /// One past the closing `"` of the JSON string.
-    pub end: usize,
+    pub(crate) end: usize,
 }
 
 /// Splice-replace the text at `span` in `raw` with `new_text` (JSON-quoted).
@@ -60,7 +60,7 @@ pub struct StringSpan {
 ///
 /// Returns `Err` if `serde_json::to_string` fails (OOM). In practice this is
 /// unreachable for a `&str` argument.
-pub fn splice_replace(raw: &[u8], span: StringSpan, new_text: &str) -> Result<Vec<u8>> {
+pub(crate) fn splice_replace(raw: &[u8], span: StringSpan, new_text: &str) -> Result<Vec<u8>> {
     debug_assert!(
         span.start <= span.end && span.end <= raw.len(),
         "splice_replace: span {span:?} is out of bounds for raw buffer of len {}",
@@ -88,7 +88,7 @@ pub fn splice_replace(raw: &[u8], span: StringSpan, new_text: &str) -> Result<Ve
 /// Returns `Err(LlmError::BlockNotFound)` if the structural path does not exist
 /// in the raw bytes (this should not happen if the body was parsed from `raw`,
 /// but is returned defensively).
-pub fn find_leaf_span(raw: &[u8], leaf: &LeafRef) -> Result<StringSpan> {
+pub(crate) fn find_leaf_span(raw: &[u8], leaf: &LeafRef) -> Result<StringSpan> {
     // Validate UTF-8 — the raw bytes should always be valid UTF-8 JSON, but we
     // check defensively before indexing into the text with char boundaries.
     let text = to_utf8(raw)?;
@@ -102,10 +102,7 @@ pub fn find_leaf_span(raw: &[u8], leaf: &LeafRef) -> Result<StringSpan> {
     // Step 2: navigate to messages[msg_idx]
     let (msg_idx, rest_path) = leaf_path_head(leaf);
     scanner.enter_array()?;
-    for _ in 0..msg_idx {
-        scanner.skip_value()?;
-        scanner.skip_comma();
-    }
+    scanner.skip_to_index(msg_idx)?;
 
     // Step 3: enter the message object and navigate to "content"
     scanner.enter_object()?;
@@ -120,10 +117,7 @@ pub fn find_leaf_span(raw: &[u8], leaf: &LeafRef) -> Result<StringSpan> {
         RestPath::TextBlock { blk_idx } => {
             // content is an array; navigate to blocks[blk_idx], then "text"
             scanner.enter_array()?;
-            for _ in 0..blk_idx {
-                scanner.skip_value()?;
-                scanner.skip_comma();
-            }
+            scanner.skip_to_index(blk_idx)?;
             scanner.enter_object()?;
             scanner.seek_key("text")?;
             scanner.find_string_span()
@@ -132,10 +126,7 @@ pub fn find_leaf_span(raw: &[u8], leaf: &LeafRef) -> Result<StringSpan> {
         RestPath::ToolResultString { blk_idx } => {
             // content[blk_idx].content (string)
             scanner.enter_array()?;
-            for _ in 0..blk_idx {
-                scanner.skip_value()?;
-                scanner.skip_comma();
-            }
+            scanner.skip_to_index(blk_idx)?;
             scanner.enter_object()?;
             scanner.seek_key("content")?;
             scanner.find_string_span()
@@ -144,17 +135,11 @@ pub fn find_leaf_span(raw: &[u8], leaf: &LeafRef) -> Result<StringSpan> {
         RestPath::ToolResultLeaf { blk_idx, leaf_idx } => {
             // content[blk_idx].content[leaf_idx].text
             scanner.enter_array()?;
-            for _ in 0..blk_idx {
-                scanner.skip_value()?;
-                scanner.skip_comma();
-            }
+            scanner.skip_to_index(blk_idx)?;
             scanner.enter_object()?;
             scanner.seek_key("content")?;
             scanner.enter_array()?;
-            for _ in 0..leaf_idx {
-                scanner.skip_value()?;
-                scanner.skip_comma();
-            }
+            scanner.skip_to_index(leaf_idx)?;
             scanner.enter_object()?;
             scanner.seek_key("text")?;
             scanner.find_string_span()
@@ -521,6 +506,19 @@ impl<'a> Scanner<'a> {
                 key
             ))),
         }
+    }
+
+    /// Skip `n` array elements (each followed by an optional comma).
+    ///
+    /// Factored out of the four `find_leaf_span` match arms to eliminate the
+    /// repeated `for _ in 0..n { skip_value(); skip_comma(); }` idiom.
+    /// Behavior is identical to inlining the loop at each call site.
+    fn skip_to_index(&mut self, n: usize) -> Result<()> {
+        for _ in 0..n {
+            self.skip_value()?;
+            self.skip_comma();
+        }
+        Ok(())
     }
 
     /// Return the byte span of the current string value (at the current cursor position).

@@ -74,12 +74,13 @@ pub fn mutate_block(body: &mut ParsedBody, block_id: &str, new_text: &str) -> Re
 fn mutate_anthropic(body: &mut AnthropicBody, block_id: &str, new_text: &str) -> Result<Vec<u8>> {
     // Scan mutable leaves for the one whose composite id matches `block_id`.
     // `walk_leaves` yields (LeafRef, text) pairs with no early exit, so the
-    // `found_leaf.is_none()` guard stops further `id()` comparisons once a match
-    // is found (each `LeafRef::id()` call allocates, so we avoid re-deriving the
-    // id for the remaining leaves after the match).
+    // `found_leaf.is_none()` guard stops further comparisons once a match is found.
+    // `id_eq` compares byte-by-byte without allocating (unlike `id()` which
+    // allocates a String via format!); the allocating `id()` is reserved for
+    // error/descriptor paths where one allocation is acceptable.
     let mut found_leaf = None;
     body.walk_leaves(|leaf_ref, _text| {
-        if found_leaf.is_none() && leaf_ref.id() == block_id {
+        if found_leaf.is_none() && leaf_ref.id_eq(block_id) {
             found_leaf = Some(leaf_ref);
         }
     });
@@ -130,16 +131,23 @@ fn apply_leaf_mutation(body: &mut AnthropicBody, leaf: &LeafRef, new_text: &str)
     // Index-validity invariant: every LeafRef is produced by walk_leaves over this
     // same body (in mutate_anthropic above), and no structural mutation occurs
     // between the walk and this call.  All indices are therefore in-bounds by
-    // construction.  The debug_assert below converts a future refactor mistake
-    // (desync between LeafRef and body) into a clear assertion failure instead of
-    // a silent index-out-of-bounds panic (ADR-006: unrecoverable desync fails loud).
+    // construction.
+    //
+    // We use `assert!` (not `debug_assert!`) so the check is active in release
+    // builds as well.  A LeafRef desync cannot be triggered by untrusted input
+    // alone — it requires a code bug (e.g., a future refactor passes a LeafRef
+    // derived from a different body).  However, ADR-006 requires that an
+    // unrecoverable desync fails loud rather than silently; and in release the
+    // slice index on line 150 would already panic on out-of-bounds, but with
+    // a cryptic index-panic message.  Keeping `assert!` gives a clear diagnostic
+    // in all build modes at negligible cost (one usize comparison per mutation).
     let msg_idx = match leaf {
         LeafRef::MessageString { msg_idx } => *msg_idx,
         LeafRef::TextBlock { msg_idx, .. } => *msg_idx,
         LeafRef::ToolResultString { msg_idx, .. } => *msg_idx,
         LeafRef::ToolResultLeaf { msg_idx, .. } => *msg_idx,
     };
-    debug_assert!(
+    assert!(
         msg_idx < body.messages.len(),
         "apply_leaf_mutation: msg_idx {msg_idx} out of bounds (messages.len={}); \
          LeafRef was not derived from this body (ADR-006)",
