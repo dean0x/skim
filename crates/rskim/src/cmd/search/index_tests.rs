@@ -1381,7 +1381,7 @@ fn test_index_data_format_and_empty_files_served_from_cache() {
 /// by SHAs that no manifest entry can authorize — survive on disk.
 ///
 /// This exercises the empty-walk branch in `Pipeline::run` that writes
-/// `AstNgramCache::empty().save(...)`.  Without that write, a stale skcache from
+/// `AstNgramCache::with_dir(cache_dir).save()`.  Without that write, a stale skcache from
 /// the prior non-empty build would persist.  The discriminating observable: the
 /// skcache loads to an empty cache after the project is emptied (not exit-0).
 #[test]

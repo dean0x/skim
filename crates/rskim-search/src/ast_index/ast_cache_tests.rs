@@ -162,11 +162,13 @@ fn cache_save_and_load() {
     let dir = tempfile::tempdir().expect("tempdir must succeed");
     let cache_dir = dir.path();
 
-    let mut cache = AstNgramCache::empty();
+    // Use `with_dir` so `save()` knows where to write without a path argument,
+    // matching the `FileManifest` pattern (cache_dir stored as a field). (applies ADR-003)
+    let mut cache = AstNgramCache::with_dir(cache_dir);
     let sha = "d".repeat(SHA_HEX_LEN);
     let entry = make_entry();
     cache.insert(sha.clone(), entry.clone());
-    cache.save(cache_dir).expect("save must succeed");
+    cache.save().expect("save must succeed");
 
     let loaded = AstNgramCache::load(cache_dir);
     let found = loaded
@@ -198,10 +200,10 @@ fn version_mismatch_discards_cache() {
     let cache_dir = dir.path();
 
     // Write a valid skcache.
-    let mut cache = AstNgramCache::empty();
+    let mut cache = AstNgramCache::with_dir(cache_dir);
     let sha = "e".repeat(SHA_HEX_LEN);
     cache.insert(sha.clone(), make_entry());
-    cache.save(cache_dir).expect("save must succeed");
+    cache.save().expect("save must succeed");
 
     // Corrupt the version byte (offset 4 in the file).
     let skcache_path = cache_dir.join(CACHE_FILENAME);
@@ -228,9 +230,9 @@ fn magic_mismatch_discards_cache() {
     let cache_dir = dir.path();
 
     // Write a valid skcache, then corrupt the magic.
-    let mut cache = AstNgramCache::empty();
+    let mut cache = AstNgramCache::with_dir(cache_dir);
     cache.insert("f".repeat(SHA_HEX_LEN), make_entry());
-    cache.save(cache_dir).expect("save");
+    cache.save().expect("save");
 
     let skcache_path = cache_dir.join(CACHE_FILENAME);
     let mut bytes = std::fs::read(&skcache_path).expect("read");

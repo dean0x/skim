@@ -252,8 +252,10 @@ impl<'cfg> Pipeline<'cfg> {
         let manifest = self.load_manifest()?;
         // Load the prior AST n-gram cache.  On --force, skip the cache entirely
         // (--force must re-extract everything, AC11).
+        // `with_dir` on the force path creates an empty cache that knows where
+        // to write its skcache — the same pattern as `FileManifest::new`.
         let ast_cache = if self.config.force {
-            AstNgramCache::empty()
+            AstNgramCache::with_dir(&self.cache_dir)
         } else {
             AstNgramCache::load(&self.cache_dir)
         };
@@ -282,7 +284,7 @@ impl<'cfg> Pipeline<'cfg> {
         // On the abort path, `rx` is consumed (dropped inside `consume`) before we reach
         // the join, so the producer's `tx.send()` has already returned `Err` and the
         // producer thread has already exited — no deadlock risk. (applies ADR-006)
-        let mut new_ast_cache = AstNgramCache::empty();
+        let mut new_ast_cache = AstNgramCache::with_dir(&self.cache_dir);
         let consume_result = Self::consume(
             &mut builder,
             &mut ast_builder,
@@ -356,7 +358,7 @@ impl<'cfg> Pipeline<'cfg> {
         // manifest SHA is the sole cache-key authority; a skcache entry present
         // without a matching manifest SHA is simply unused on the next build.
         new_ast_cache
-            .save(&self.cache_dir)
+            .save()
             .map_err(|e| anyhow::anyhow!("AST cache save failed: {e}"))?;
 
         // Record the current git HEAD in the manifest so staleness detection
@@ -416,8 +418,8 @@ impl<'cfg> Pipeline<'cfg> {
             .build()
             .map_err(|e| anyhow::anyhow!("AST index build failed: {e}"))?;
         // Write an empty skcache to maintain the self-pruning invariant.
-        AstNgramCache::empty()
-            .save(&self.cache_dir)
+        AstNgramCache::with_dir(&self.cache_dir)
+            .save()
             .map_err(|e| anyhow::anyhow!("AST cache save failed: {e}"))?;
         let mut manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
         manifest.set_git_head(read_git_head(&self.config.root));
@@ -548,10 +550,14 @@ impl<'cfg> Pipeline<'cfg> {
             // AST index: resolve payload from cache (hit) or derive fresh (miss).
             // The invariant: EVERY file that passes the lexical stage gets exactly
             // ONE `add_file_ngrams` call — hit or miss. NEVER skip. (applies ADR-006)
+            //
+            // `pf.sha256` is borrowed here so it can be moved into the ManifestEntry
+            // below without a redundant heap clone — the SHA is a 64-char hex string
+            // that only needs to be allocated once per file. (applies ADR-003)
             let is_hit = pf.ast_cached.is_some();
             let entry = resolve_ast_entry(
                 new_ast_cache,
-                pf.sha256.clone(),
+                &pf.sha256,
                 pf.ast_cached,
                 &pf.content,
                 pf.lang,
@@ -659,7 +665,7 @@ impl<'cfg> Pipeline<'cfg> {
 /// unaware of it, keeping responsibilities separate.
 fn resolve_ast_entry<'cache>(
     new_ast_cache: &'cache mut AstNgramCache,
-    sha_key: String,
+    sha_key: &str,
     cached: Option<CachedAstEntry>,
     content: &str,
     lang: rskim_core::Language,
@@ -671,7 +677,10 @@ fn resolve_ast_entry<'cache>(
     let entry = cached.unwrap_or_else(|| derive_ast_entry(content, lang, rel_path, debug_enabled));
     // Entry API: hashes sha_key once, inserts if absent, returns &CachedAstEntry.
     // Eliminates the insert-then-lookup double-probe.
-    new_ast_cache.get_or_insert(sha_key, entry)
+    // `sha_key` is borrowed from the caller's `ProcessedFile.sha256`; `.to_string()`
+    // here allocates the HashMap key string only when an insertion is needed.
+    // The caller can then move `pf.sha256` into the ManifestEntry without a clone.
+    new_ast_cache.get_or_insert(sha_key.to_string(), entry)
 }
 
 /// Read a file's content, apply 2-tier SHA cache logic, and produce a

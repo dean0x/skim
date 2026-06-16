@@ -426,9 +426,14 @@ fn decode_file(buf: &[u8]) -> Option<HashMap<String, CachedAstEntry>> {
 
 /// In-memory AST n-gram cache, backed by `ast_index.skcache`.
 ///
+/// The cache stores its own `cache_dir` so callers do not need to carry the path
+/// separately for [`AstNgramCache::save`].  This mirrors the [`crate::FileManifest`]
+/// pattern where both the root and the cache directory are stored as struct fields.
+///
 /// # Lifecycle
 ///
-/// 1. [`AstNgramCache::load`] at the start of a build — reads the prior skcache.
+/// 1. [`AstNgramCache::load`] at the start of a build — reads the prior skcache
+///    and stores `cache_dir` for later writes.
 /// 2. [`AstNgramCache::lookup`] during the consume loop — for each file, check
 ///    whether the SHA already has cached n-grams.
 /// 3. [`AstNgramCache::insert`] during the consume loop — record fresh payloads
@@ -438,10 +443,18 @@ fn decode_file(buf: &[u8]) -> Option<HashMap<String, CachedAstEntry>> {
 pub struct AstNgramCache {
     /// Entries keyed by content SHA-256 (64-char hex string).
     entries: HashMap<String, CachedAstEntry>,
+    /// Directory where `ast_index.skcache` is written.
+    ///
+    /// `PathBuf::new()` (empty path) when the cache was created via [`Self::empty`]
+    /// with no backing store — callers must not call [`Self::save`] on such instances.
+    cache_dir: std::path::PathBuf,
 }
 
 impl AstNgramCache {
     /// Load the prior `ast_index.skcache` from `cache_dir`.
+    ///
+    /// Stores `cache_dir` internally so [`Self::save`] requires no path argument,
+    /// matching the [`crate::FileManifest`] pattern.
     ///
     /// Returns an empty cache on any of:
     /// - File not found (first build, or post-upgrade).
@@ -466,24 +479,51 @@ impl AstNgramCache {
             .is_ok_and(|m| m.len() > MAX_CACHE_FILE_BYTES)
         {
             // Oversized — discard silently and cold-start.
-            return Self::empty();
+            return Self::with_dir(cache_dir);
         }
 
         let Ok(bytes) = std::fs::read(&path) else {
             // Not found or unreadable — cold start.
-            return Self::empty();
+            return Self::with_dir(cache_dir);
         };
         // Version mismatch or corrupt magic → None → cold start.
         decode_file(&bytes)
-            .map(|entries| Self { entries })
-            .unwrap_or_else(Self::empty)
+            .map(|entries| Self {
+                entries,
+                cache_dir: cache_dir.to_owned(),
+            })
+            .unwrap_or_else(|| Self::with_dir(cache_dir))
     }
 
-    /// Create an empty cache (no prior entries).
+    /// Create an empty cache bound to `cache_dir`.
+    ///
+    /// Use this when constructing a cache that will later be populated and saved
+    /// (e.g. on `--force` builds or in `flush_empty`).  The stored `cache_dir`
+    /// is used by [`Self::save`] so callers need not carry the path separately.
+    ///
+    /// Prefer [`Self::load`] for the incremental build path — it reads the prior
+    /// skcache AND stores the directory.  This constructor is for the `--force`
+    /// and empty-project paths where no prior skcache is consulted.
+    #[must_use]
+    pub fn with_dir(cache_dir: &Path) -> Self {
+        Self {
+            entries: HashMap::new(),
+            cache_dir: cache_dir.to_owned(),
+        }
+    }
+
+    /// Create a detached empty cache with no backing store.
+    ///
+    /// For test helpers and throwaway consumers (e.g. ADR-006 abort tests) that
+    /// inspect the cache in-memory but never call [`Self::save`].  Calling `save`
+    /// on an `empty()` instance will attempt to write to the current directory
+    /// (empty path) and likely fail — callers that need `save` must use
+    /// [`Self::with_dir`] or [`Self::load`] instead.
     #[must_use]
     pub fn empty() -> Self {
         Self {
             entries: HashMap::new(),
+            cache_dir: std::path::PathBuf::new(),
         }
     }
 
@@ -527,12 +567,16 @@ impl AstNgramCache {
         self.entries.entry(sha).or_insert(entry)
     }
 
-    /// Atomically write `ast_index.skcache` to `cache_dir`.
+    /// Atomically write `ast_index.skcache` to the `cache_dir` stored at construction.
     ///
     /// Uses `io_util::atomic_write` (temp file + rename) so readers never
     /// observe a partial write.  The written file contains only the entries
     /// accumulated during the current build — deleted/renamed files self-prune
     /// because their SHAs are never inserted.
+    ///
+    /// The `cache_dir` is stored as a field (set by [`Self::load`] or
+    /// [`Self::with_dir`]), matching the [`crate::FileManifest`] pattern where
+    /// callers do not need to carry the path separately.
     ///
     /// # Errors
     ///
@@ -541,10 +585,10 @@ impl AstNgramCache {
     /// `new_manifest.save()`, ensuring the manifest is never saved when the
     /// skcache write fails.  This preserves the ADR-006 invariant: the next
     /// query self-heals via full rebuild. (applies ADR-006)
-    pub fn save(&self, cache_dir: &Path) -> Result<()> {
-        let path = cache_dir.join(CACHE_FILENAME);
+    pub fn save(&self) -> Result<()> {
+        let path = self.cache_dir.join(CACHE_FILENAME);
         let buf = encode_file(&self.entries);
-        atomic_write(cache_dir, &path, &buf)
+        atomic_write(&self.cache_dir, &path, &buf)
     }
 
     /// Return the number of entries in the cache.
