@@ -31,6 +31,17 @@ pub use storage_types::{CochangeRow, HotspotRow, RiskRow};
 #[path = "storage_ops.rs"]
 mod storage_ops;
 
+/// Minimum Jaccard similarity for co-change read-query results.
+///
+/// This constant is the single source of truth for the Jaccard filter that the
+/// co-change read query applies (`cochanges_for_file`). Write-side code that
+/// pre-filters emitted rows MUST use the same threshold so stored and queried
+/// values stay consistent (Decision O-D).
+///
+/// Value: 0.10 — empirically determined via co-change validation benchmark
+/// (#191); see `storage_ops::MIN_JACCARD_THRESHOLD` doc for rationale.
+pub const MIN_COCHANGE_JACCARD: f64 = storage_ops::MIN_JACCARD_THRESHOLD;
+
 use std::path::Path;
 use std::time::Duration;
 

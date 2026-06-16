@@ -63,7 +63,7 @@ const _: () = assert!(
     "AST_INDEX_FORMAT_VERSION must equal ast_index::store::format::FORMAT_VERSION"
 );
 
-pub use cochange::{CochangeMatrixBuilder, CochangeMatrixReader};
+pub use cochange::{COUPLING_MAX_FILES, CochangeMatrixBuilder, CochangeMatrixReader};
 pub use compound::{
     CompositeWeights, RRF_K, WEIGHT_AST, WEIGHT_LEXICAL, intersect_and_rank, recompose_with_lexical,
 };
@@ -77,7 +77,8 @@ pub use ngram::{
     extract_query_ngrams_with_weights,
 };
 pub use temporal::storage::{
-    CochangeRow, HotspotRow, META_GIT_HEAD, META_LAST_UPDATED, RiskRow, TemporalDb,
+    CochangeRow, HotspotRow, META_GIT_HEAD, META_LAST_UPDATED, MIN_COCHANGE_JACCARD, RiskRow,
+    TemporalDb,
 };
 pub use temporal::{
     DEFAULT_HALF_LIFE_DAYS, GixSource, compute_file_risk_scores, compute_file_temporal_stats,

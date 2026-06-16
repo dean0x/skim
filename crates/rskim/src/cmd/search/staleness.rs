@@ -275,13 +275,29 @@ pub(super) fn check_staleness(
 ///
 /// This is a convenience wrapper for the query path: call it before opening
 /// the reader so callers always get a fresh index.
+///
+/// # HEAD threading (O-A / #289)
+///
+/// `read_git_head(root)` is called ONCE at function entry and the result is
+/// threaded into `rebuild_temporal`. Note that `check_staleness` also calls
+/// `read_git_head` internally — both calls are advisory and safe because the
+/// lexical manifest records the HEAD that `build_index` writes, and
+/// `rebuild_temporal` records the HEAD passed here. If a commit lands between
+/// the two reads the manifest will record the pre-commit HEAD and temporal.db
+/// will record the post-commit HEAD; both will appear stale on the next query,
+/// triggering one more refresh. This is the accepted TOCTOU trade-off.
 pub(super) fn auto_refresh_if_stale(
     root: &Path,
     cache_dir: &Path,
     _analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<(bool, FileManifest)> {
     use super::index::build_index;
+    use super::temporal_build::{current_epoch_secs, rebuild_temporal};
     use super::types::IndexConfig;
+
+    // Read the current git HEAD once at function entry so rebuild_temporal can
+    // record the same SHA that will be in the manifest after build_index runs.
+    let current_head: Option<String> = read_git_head(root);
 
     let (staleness, existing_manifest) = check_staleness(cache_dir, root);
 
@@ -335,13 +351,30 @@ pub(super) fn auto_refresh_if_stale(
     }
 
     // After a rebuild, load the freshly written manifest for the caller.
+    // This manifest was written by `build_index` and records `current_head`.
     let manifest = FileManifest::load(root.to_path_buf(), cache_dir.to_path_buf())?;
 
-    // ── #289 temporal hook point ─────────────────────────────────────────────
-    // TODO(#289): Call `rebuild_temporal(root, cache_dir, head)` here — under
-    // the same `.skim-build.lock`, reusing the already-read HEAD — once the
-    // temporal populate path exists. One call, no rework.
-    // ────────────────────────────────────────────────────────────────────────
+    // ── #289 temporal build hook point ───────────────────────────────────────
+    // Populate temporal.db AFTER the lexical+AST manifest is persisted.
+    // (applies ADR-006: temporal is a derived satellite; must not be written
+    // off a half-built index)
+    //
+    // `rebuild_temporal` acquires its own bounded `.skim-build.lock` around
+    // the parse+sync phase and degrades gracefully on non-git dirs, gix errors,
+    // or CapacityExceeded — a temporal failure MUST NOT fail the lexical refresh.
+    //
+    // `head` is the HEAD SHA read at function entry above. Passing `None` when
+    // the project is non-git: `rebuild_temporal` skips gracefully (parse_history
+    // returns an error on a non-git dir anyway).
+    if let Some(ref head) = current_head
+        && let Err(e) = rebuild_temporal(root, cache_dir, head, current_epoch_secs())
+    {
+        // Ignore temporal errors — they must not fail the lexical/AST refresh (D5).
+        if crate::debug::is_debug_enabled() {
+            eprintln!("skim search [debug]: temporal rebuild error (non-fatal): {e}");
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     Ok((true, manifest))
 }

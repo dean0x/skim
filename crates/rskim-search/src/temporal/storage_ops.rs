@@ -26,7 +26,12 @@ const MAX_ROWS_PER_TABLE: usize = 500_000;
 /// nearly doubling precision vs. unfiltered (10.9% → 21.5%) while retaining
 /// 41% recall. Pairs below this threshold are noise — they co-occurred in
 /// commits but the coupling signal is too weak to be predictive.
-const MIN_JACCARD_THRESHOLD: f64 = 0.10;
+///
+/// Exposed via `rskim_search::MIN_COCHANGE_JACCARD` so that the temporal
+/// write-path (`rskim`'s `temporal_build.rs`) uses the same threshold as this
+/// read-path query — preventing silent drift if the threshold ever changes
+/// (Decision O-D).
+pub(super) const MIN_JACCARD_THRESHOLD: f64 = 0.10;
 
 // ============================================================================
 // Private insert helpers — accept an open Transaction

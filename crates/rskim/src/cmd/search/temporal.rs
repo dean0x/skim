@@ -194,36 +194,31 @@ pub(super) fn resolve_blast_radius_paths(
     db_path: &Path,
     json: bool,
 ) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
-    let raw_path = match blast_radius {
-        Some(p) => p,
-        None => return Ok(None),
+    let Some(raw_path) = blast_radius else {
+        return Ok(None);
     };
 
-    match open_temporal_db(db_path) {
-        None => {
-            const MSG: &str =
-                "no temporal data for --blast-radius — run 'skim heatmap' to populate";
-            if json {
-                let envelope = serde_json::json!({ "warning": MSG });
-                eprintln!("{}", serde_json::to_string(&envelope)?);
-            } else {
-                eprintln!("skim search: {MSG}");
-            }
-            Ok(None)
+    let Some(db) = open_temporal_db(db_path) else {
+        const MSG: &str = "no temporal data for --blast-radius — run 'skim search' on a git repo to auto-populate";
+        if json {
+            let envelope = serde_json::json!({ "warning": MSG });
+            eprintln!("{}", serde_json::to_string(&envelope)?);
+        } else {
+            eprintln!("skim search: {MSG}");
         }
-        Some(db) => {
-            let normalized = normalize_blast_radius_path(raw_path, root)?;
-            let partners = db.cochanges_for_file(&normalized)?;
-            if partners.is_empty() {
-                eprintln!("skim search: no co-change data for {raw_path:?}");
-            }
-            let mut allowed_paths = cochange_partner_paths(&partners, &normalized);
-            // Include the target file itself so queries like `skim search auth --blast-radius src/auth.rs`
-            // surface matches within the target file in addition to its co-change partners.
-            allowed_paths.insert(normalized);
-            Ok(Some(allowed_paths))
-        }
+        return Ok(None);
+    };
+
+    let normalized = normalize_blast_radius_path(raw_path, root)?;
+    let partners = db.cochanges_for_file(&normalized)?;
+    if partners.is_empty() {
+        eprintln!("skim search: no co-change data for {raw_path:?}");
     }
+    let mut allowed_paths = cochange_partner_paths(&partners, &normalized);
+    // Include the target file itself so queries like `skim search auth --blast-radius src/auth.rs`
+    // surface matches within the target file in addition to its co-change partners.
+    allowed_paths.insert(normalized);
+    Ok(Some(allowed_paths))
 }
 
 /// Resolve a `--blast-radius` raw path to the set of matching `FileId`s.
@@ -264,6 +259,15 @@ pub(super) fn resolve_blast_radius_file_ids(
 /// Returns `Some(warning_message)` when the stored HEAD differs from the
 /// current HEAD, `None` when current or when the staleness check cannot be
 /// performed (missing git, non-git repo, missing meta key).
+///
+/// # Usage note (Decision O-B)
+///
+/// This function is no longer called on the production query path —
+/// `auto_refresh_if_stale` in `staleness.rs` guarantees freshness before any
+/// query executes, making this staleness warning dead code on the happy path.
+/// It is retained for test use only (AC6 discriminating assertion in
+/// `temporal_build_tests.rs`).
+#[cfg(test)]
 pub(super) fn check_temporal_staleness(db: &TemporalDb, project_root: &Path) -> Option<String> {
     let stored_head = db.get_meta(rskim_search::META_GIT_HEAD).ok().flatten()?;
 
@@ -271,7 +275,7 @@ pub(super) fn check_temporal_staleness(db: &TemporalDb, project_root: &Path) -> 
     if stored_head.trim() != current_head.trim() {
         Some(format!(
             "skim search: temporal data is stale (stored: {}, current: {}). \
-             Run 'skim heatmap' to refresh.",
+             Run 'skim search' on this repo to auto-refresh.",
             stored_head.get(..7).unwrap_or(&stored_head),
             current_head.get(..7).unwrap_or(&current_head),
         ))
@@ -288,6 +292,9 @@ pub(super) fn check_temporal_staleness(db: &TemporalDb, project_root: &Path) -> 
 /// The timeout prevents indefinite hangs on network-mounted repos or
 /// corrupted `.git` directories. The staleness check is advisory, so
 /// timing out is safe — the caller degrades gracefully.
+///
+/// Only compiled in test builds — see `check_temporal_staleness` doc.
+#[cfg(test)]
 fn read_git_head(root: &Path) -> Option<String> {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -507,23 +514,30 @@ pub(super) fn format_temporal_text(
     w: &mut impl Write,
 ) -> anyhow::Result<()> {
     match output {
-        TemporalQueryOutput::Hotspots(rows) | TemporalQueryOutput::Coldspots(rows) => {
-            let is_hot = matches!(output, TemporalQueryOutput::Hotspots(_));
-            let empty_msg = if is_hot {
-                "No hotspot data available."
-            } else {
-                "No coldspot data available."
-            };
-            let header_msg = if is_hot {
-                format!("Hotspots (top {}, 90-day decay):\n", rows.len())
-            } else {
-                format!("Coldspots (top {}, least active):\n", rows.len())
-            };
+        TemporalQueryOutput::Hotspots(rows) => {
             if rows.is_empty() {
-                writeln!(w, "{empty_msg}")?;
+                writeln!(w, "No hotspot data available.")?;
                 return Ok(());
             }
-            write!(w, "{header_msg}")?;
+            // Single newline after header (writeln! already appends \n; no
+            // extra \n in the format string — that would insert a blank line).
+            writeln!(w, "Hotspots (top {}, 90-day decay):", rows.len())?;
+            writeln!(w, "  Score  30d  90d  Path")?;
+            writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
+            for r in rows {
+                writeln!(
+                    w,
+                    "  {:.3}   {:>4} {:>4}  {}",
+                    r.score, r.changes_30d, r.changes_90d, r.file_path
+                )?;
+            }
+        }
+        TemporalQueryOutput::Coldspots(rows) => {
+            if rows.is_empty() {
+                writeln!(w, "No coldspot data available.")?;
+                return Ok(());
+            }
+            writeln!(w, "Coldspots (top {}, least active):", rows.len())?;
             writeln!(w, "  Score  30d  90d  Path")?;
             writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
             for r in rows {
@@ -635,6 +649,25 @@ struct BlastRadiusJson<'a> {
     results: Vec<CochangeJsonRow<'a>>,
 }
 
+/// Serialize a hotspot/coldspot row slice to JSON and write it.
+fn write_hotcold_json(mode: &str, rows: &[HotspotRow], w: &mut impl Write) -> anyhow::Result<()> {
+    let envelope = HotColdJson {
+        mode,
+        total: rows.len(),
+        results: rows
+            .iter()
+            .map(|r| HotspotJsonRow {
+                path: &r.file_path,
+                hotspot_score: r.score,
+                changes_30d: r.changes_30d,
+                changes_90d: r.changes_90d,
+            })
+            .collect(),
+    };
+    writeln!(w, "{}", serde_json::to_string_pretty(&envelope)?)?;
+    Ok(())
+}
+
 /// Format a standalone temporal query result as JSON.
 ///
 /// Uses `#[derive(Serialize)]` typed structs so field names are defined in one
@@ -645,27 +678,8 @@ pub(super) fn format_temporal_json(
     w: &mut impl Write,
 ) -> anyhow::Result<()> {
     match output {
-        TemporalQueryOutput::Hotspots(rows) | TemporalQueryOutput::Coldspots(rows) => {
-            let mode = if matches!(output, TemporalQueryOutput::Hotspots(_)) {
-                "hot"
-            } else {
-                "cold"
-            };
-            let envelope = HotColdJson {
-                mode,
-                total: rows.len(),
-                results: rows
-                    .iter()
-                    .map(|r| HotspotJsonRow {
-                        path: &r.file_path,
-                        hotspot_score: r.score,
-                        changes_30d: r.changes_30d,
-                        changes_90d: r.changes_90d,
-                    })
-                    .collect(),
-            };
-            writeln!(w, "{}", serde_json::to_string_pretty(&envelope)?)?;
-        }
+        TemporalQueryOutput::Hotspots(rows) => write_hotcold_json("hot", rows, w)?,
+        TemporalQueryOutput::Coldspots(rows) => write_hotcold_json("cold", rows, w)?,
         TemporalQueryOutput::Risks(rows) => {
             let envelope = RiskyJson {
                 mode: "risky",
