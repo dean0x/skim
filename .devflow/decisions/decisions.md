@@ -25,10 +25,10 @@ Append-only. Status changes allowed; deletions prohibited.
 
 - **Date**: 2026-06-04
 - **Status**: Accepted
-- **Context**: issue #194 acceptance criterion A16 demanded the AST index be < 5% of source bytes, but structural AST n-grams are dense by design (O(vocab x files) posting entries) so 5% is unreachable and the figure had no empirical origin in any prior wave research
-- **Decision**: replace the 5% target with a defensible < 3x source-bytes regression guard (measured 1.23x) as a real non-ignored test, and file on-disk compression as a tracked follow-up (#273)
-- **Consequences**: a regression guard grounded in measurement and industry norms (uncompressed code-search trigram indexes run 3-5x) protects against real bloat, whereas an impossible target either blocks the PR or gets silently ignored
-- **Source**: self-learning:obs_a16x3g
+- **Context**: issue #194 acceptance criterion A16 demanded the AST index be < 5% of source bytes, but structural AST n-grams are dense by design (O(vocab x files) posting entries) so 5% is unreachable and the figure had no empirical origin in any prior wave research. A numeric criterion copied verbatim from an issue may be empirically baseless and structurally unachievable.
+- **Decision**: before enforcing an inherited numeric acceptance criterion, trace it to a measured basis; if none exists, replace the target with a defensible grounded regression guard (here < 3x source-bytes, measured 1.23x) as a real non-ignored test, amend the issue, and file the follow-up work (on-disk compression filed as #273)
+- **Consequences**: an impossible gate forces a blocked PR, an #[ignore] cop-out, or test-gaming — all of which erode trust in the suite; a regression guard grounded in measurement and industry norms (uncompressed code-search trigram indexes run 3-5x) protects against real bloat, whereas an impossible target either blocks the PR or gets silently ignored
+- **Source**: self-learning:obs_a16x3g (absorbs retired PF-005)
 
 ## ADR-004: File follow-up and integration tickets up front as Step 0 (before any code), never post-merge, and never leave #NEW placeholder numbers in source
 
