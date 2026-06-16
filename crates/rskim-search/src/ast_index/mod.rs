@@ -29,6 +29,7 @@
 //! let weight = ast_bigram_idf(Language::Rust, bigram);
 //! ```
 
+pub mod ast_cache;
 mod extract;
 mod linearize;
 mod ngram;
@@ -51,6 +52,10 @@ pub(crate) mod structural;
 /// with a raw `u16`.
 pub type NodeKindId = u16;
 
+pub use ast_cache::{
+    AstNgramCache, CACHE_FILENAME as AST_CACHE_FILENAME,
+    CACHE_FORMAT_VERSION as AST_CACHE_FORMAT_VERSION, CachedAstEntry,
+};
 pub use extract::{
     AstBigramEntry, AstNgramSet, AstTrigramEntry, extract_ast_ngrams,
     extract_ast_ngrams_with_metrics, extract_ast_ngrams_with_weights,

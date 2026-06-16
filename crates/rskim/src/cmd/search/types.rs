@@ -203,8 +203,15 @@ pub(super) struct IndexResult {
     pub file_count: u32,
     /// Number of files skipped (unsupported, too large, non-UTF8, etc.).
     pub skipped: u32,
-    /// Number of files whose field_map was reused from the manifest cache.
+    /// Number of files whose field_map was reused from the manifest cache
+    /// (lexical cache hits).
     pub cache_hits: u32,
+    /// Number of files whose AST n-grams were served from `ast_index.skcache`
+    /// (AST cache hits — extraction skipped).
+    pub ast_cache_hits: u32,
+    /// Number of files whose AST n-grams were freshly extracted (AST cache
+    /// misses — `derive_ast_entry` was called).
+    pub ast_reextracted: u32,
     /// Wall-clock duration of the build.
     pub duration: Duration,
 }
@@ -274,6 +281,16 @@ pub(super) struct ProcessedFile {
     pub field_map: Vec<(Range<usize>, SearchField)>,
     /// `true` when field_map was reused from the manifest cache (no classify call).
     pub cache_hit: bool,
+    /// Cached AST n-gram payload from `ast_index.skcache`, when the file's
+    /// content SHA matched a prior build's entry.
+    ///
+    /// `Some(entry)` → consumer uses payload directly (no `derive_ast_entry` call).
+    /// `None`         → consumer calls `derive_ast_entry` and records the result.
+    ///
+    /// A `Some` here DOES NOT imply `cache_hit == true`: if the lexical field_map
+    /// was a miss but the AST payload was already cached from a different build
+    /// path, both are tracked independently.
+    pub ast_cached: Option<rskim_search::CachedAstEntry>,
 }
 
 // ============================================================================
