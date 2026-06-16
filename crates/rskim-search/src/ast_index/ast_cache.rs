@@ -437,13 +437,10 @@ impl AstNgramCache {
             // Not found or unreadable — cold start.
             return Self::empty();
         };
-        match decode_file(&bytes) {
-            Some(entries) => Self { entries },
-            None => {
-                // Version mismatch or corrupt magic — discard, cold start.
-                Self::empty()
-            }
-        }
+        // Version mismatch or corrupt magic → None → cold start.
+        decode_file(&bytes)
+            .map(|entries| Self { entries })
+            .unwrap_or_else(Self::empty)
     }
 
     /// Create an empty cache (no prior entries).

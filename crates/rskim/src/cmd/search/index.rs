@@ -547,19 +547,20 @@ impl<'cfg> Pipeline<'cfg> {
                 // Cache miss: run the full extraction and record the payload.
                 // Fail-soft: on ANY error, returns an empty aligned entry so AST
                 // FileIds stay in sync with lexical FileIds. NEVER skips.
-                let entry = derive_ast_entry(&pf.content, pf.lang, &pf.rel_path, debug_enabled);
+                let (ngrams, metrics, node_count) =
+                    derive_ast_entry(&pf.content, pf.lang, &pf.rel_path, debug_enabled);
                 ast_reextracted = ast_reextracted.saturating_add(1);
                 // Record in new_ast_cache (including empty entries for data-format
                 // files — cached empty is valid, not corrupt). (avoids PF-005)
                 new_ast_cache.insert(
                     pf.sha256.clone(),
                     CachedAstEntry {
-                        ngrams: entry.0.clone(),
-                        metrics: entry.1,
-                        node_count: entry.2,
+                        ngrams: ngrams.clone(),
+                        metrics,
+                        node_count,
                     },
                 );
-                entry
+                (ngrams, metrics, node_count)
             };
 
             // Add the AST entry for this file. The lexical entry for the SAME
@@ -779,15 +780,11 @@ fn derive_ast_entry(
             let node_count = u32::try_from(lin.nodes.len()).unwrap_or(u32::MAX);
             (set, metrics, node_count)
         }
-        Ok(_empty) => {
-            // Non-tree-sitter lang (JSON/YAML/TOML), file >100KiB,
-            // empty source, or parse-only-error result — empty aligned entry.
-            (AstNgramSet::default(), StructuralMetrics::default(), 0u32)
-        }
+        // Non-tree-sitter lang (JSON/YAML/TOML), file >100KiB, empty source,
+        // parse-only-error, or grammar load failure — return empty aligned entry
+        // so FileIds stay in sync with the lexical index.
+        Ok(_empty) => (AstNgramSet::default(), StructuralMetrics::default(), 0u32),
         Err(e) => {
-            // Grammar load failure (SearchError::Ast) — only unrecoverable
-            // error path from linearize_source. Still return empty aligned entry
-            // so FileIds stay in sync with the lexical index.
             if debug {
                 eprintln!(
                     "skim search index [debug]: linearize_source failed for {:?}: {e}",

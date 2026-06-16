@@ -47,12 +47,6 @@ fn make_entry() -> CachedAstEntry {
     }
 }
 
-/// Build an empty CachedAstEntry, mirroring what non-tree-sitter / large /
-/// empty files produce. (AC6 — empty payloads are valid, not corrupt)
-fn make_empty_entry() -> CachedAstEntry {
-    CachedAstEntry::empty()
-}
-
 // ============================================================================
 // Round-trip: encode → decode (AC6)
 // ============================================================================
@@ -73,7 +67,7 @@ fn round_trip_entry_populated() {
 /// (AC6 — empty is valid)
 #[test]
 fn round_trip_entry_empty() {
-    let original = make_empty_entry();
+    let original = CachedAstEntry::empty();
     let encoded = encode_entry(&original);
     let decoded = decode_entry(&encoded).expect("empty entry must round-trip cleanly");
     assert_eq!(decoded, original, "decoded empty entry must equal original");
@@ -127,7 +121,7 @@ fn round_trip_file_level() {
     let sha1 = "a".repeat(SHA_HEX_LEN);
     let sha2 = "b".repeat(SHA_HEX_LEN);
     entries.insert(sha1.clone(), make_entry());
-    entries.insert(sha2.clone(), make_empty_entry());
+    entries.insert(sha2.clone(), CachedAstEntry::empty());
 
     let buf = encode_file(&entries);
     let decoded = decode_file(&buf).expect("file round-trip must decode");
@@ -391,7 +385,7 @@ fn len_and_is_empty_reflect_state() {
     assert!(cache.is_empty());
     assert_eq!(cache.len(), 0);
 
-    cache.insert("k".repeat(SHA_HEX_LEN), make_empty_entry());
+    cache.insert("k".repeat(SHA_HEX_LEN), CachedAstEntry::empty());
     assert!(!cache.is_empty());
     assert_eq!(cache.len(), 1);
 }
