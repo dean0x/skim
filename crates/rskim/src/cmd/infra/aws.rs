@@ -131,7 +131,7 @@ fn parse_json_object(map: &serde_json::Map<String, serde_json::Value>) -> Option
     let data_key = map
         .keys()
         .filter(|k| !METADATA_KEYS.contains(&k.as_str()))
-        .min_by(|a, b| a.cmp(b))?;
+        .min()?;
 
     let data = &map[data_key];
     let (count, items) = match data {
