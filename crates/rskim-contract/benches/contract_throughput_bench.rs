@@ -6,12 +6,13 @@
 // this bench is the AC21 "SHOULD" relative-regression tripwire on a >100KB body.
 //
 // It is run locally as a relative guard:
-//   cargo bench -p rskim-contract --bench contract_throughput -- --save-baseline <name>
-//   cargo bench -p rskim-contract --bench contract_throughput -- --baseline <name>
+//   cargo bench -p rskim-contract --bench contract_throughput_bench -- --save-baseline <name>
+//   cargo bench -p rskim-contract --bench contract_throughput_bench -- --baseline <name>
 // CI wiring for this bench (a committed `.bench-baselines/` baseline + a ci.yml
-// step mirroring the rskim-tokens `token_count` bench) is not yet in place — it
-// is a follow-up, not a claimed-existing gate. AC20's CI gate is the conformance
-// harness + clippy determinism step, not this bench.
+// step mirroring the rskim-tokens `token_count_bench` bench) is tracked in #323
+// (the Wave-1 CI-coordination ticket) — it is a follow-up, not a claimed-existing
+// gate. AC20's CI gate is the conformance harness + clippy determinism step, not
+// this bench.
 //
 // What is measured:
 // - `guarded_transform` (the default, non-waivered transform path) on a >100KB body.

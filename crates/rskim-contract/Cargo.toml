@@ -46,11 +46,12 @@ required-features = ["harness"]
 
 # AC21 relative-regression bench: default transform path on a >100KB body.
 # Per ADR-003: no absolute ms gate. The baseline is generated locally via:
-#   cargo bench -p rskim-contract --bench contract_throughput -- --save-baseline <name>
-#   cargo bench -p rskim-contract --bench contract_throughput -- --baseline <name>
-# A committed .bench-baselines/ baseline + CI wiring is a follow-up, not an
-# existing gate. AC20's CI gate is the conformance harness + clippy step, not
-# this bench (see benches/contract_throughput.rs header comment).
+#   cargo bench -p rskim-contract --bench contract_throughput_bench -- --save-baseline <name>
+#   cargo bench -p rskim-contract --bench contract_throughput_bench -- --baseline <name>
+# A committed .bench-baselines/ baseline + CI wiring is a follow-up tracked in
+# #323 (the Wave-1 CI-coordination ticket), not an existing gate. AC20's CI gate
+# is the conformance harness + clippy step, not this bench (see
+# benches/contract_throughput_bench.rs header comment).
 [[bench]]
 name = "contract_throughput_bench"
 harness = false
