@@ -627,14 +627,12 @@ fn ac12_u16_max_metrics_no_overflow() {
 
 #[test]
 fn ac13_core_fn_returns_plain_vec() {
-    // This test is a compile-time proof: `intersect_and_rank` returns
-    // `Vec<(FileId, f64)>`, not `Result<_, _>`.  If the signature were
-    // changed to return Result, the direct `.len()` call would not compile.
+    // Compile-time proof: the explicit type annotation fails to compile if the
+    // return type is changed to Result<Vec<_>, _>.
     let lexical = vec![make_lex_result(1, 1.0)];
     let ast = vec![(FileId(1), 1.0)];
-    let result: Vec<(FileId, f64)> =
+    let _: Vec<(FileId, f64)> =
         intersect_and_rank(&lexical, &ast, no_metrics, 0.0, CompositeWeights::default());
-    let _ = result.len(); // compiles only if result is Vec, not Result<Vec,_>
 }
 
 // ============================================================================

@@ -10,12 +10,13 @@
 //! 6. For each result, attempt `extract_snippet`.
 //! 7. Return `QueryOutput`.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
 use rskim_search::{
-    CompositeWeights, NgramIndexReader, QueryEngine, SearchLayer, SearchQuery, intersect_and_rank,
-    recompose_with_lexical,
+    CompositeWeights, FileId, IndexStats, NgramIndexReader, QueryEngine, SearchLayer, SearchQuery,
+    SearchResult, StructuralMetrics, intersect_and_rank, recompose_with_lexical,
 };
 
 use super::manifest::FileManifest;
@@ -103,7 +104,7 @@ pub(super) fn execute_query_with_manifest(
 
     // Build the FileId allowlist from blast-radius paths.
     // Used for blast-radius-only and blast+AST paths.
-    let blast_file_ids: Option<std::collections::HashSet<rskim_search::FileId>> = config
+    let blast_file_ids: Option<HashSet<FileId>> = config
         .blast_radius_paths
         .as_ref()
         .map(|allowed_paths| super::temporal::paths_to_file_ids(&sorted, allowed_paths));
@@ -190,13 +191,13 @@ pub(super) fn execute_query_with_manifest(
 #[allow(clippy::too_many_arguments)]
 fn run_compound_query(
     config: &super::types::QueryConfig,
-    ast_scored_vec: &[(rskim_search::FileId, f64)],
-    blast_file_ids: Option<std::collections::HashSet<rskim_search::FileId>>,
+    ast_scored_vec: &[(FileId, f64)],
+    blast_file_ids: Option<HashSet<FileId>>,
     engine: &QueryEngine,
     sorted: &[&str],
     root: &Path,
     manifest: &FileManifest,
-    stats: rskim_search::IndexStats,
+    stats: IndexStats,
     start: Instant,
 ) -> anyhow::Result<QueryOutput> {
     // Wider lexical pool before compound ranking.
@@ -211,9 +212,8 @@ fn run_compound_query(
     // Build a HashSet of AST FileIds once for O(1) membership tests — avoids
     // the O(blast × ast) nested scan that a linear .any() scan would produce.
     if let Some(ref blast) = blast_file_ids {
-        let ast_fid_set: std::collections::HashSet<rskim_search::FileId> =
-            ast_scored_vec.iter().map(|&(fid, _)| fid).collect();
-        let intersection: std::collections::HashSet<rskim_search::FileId> = blast
+        let ast_fid_set: HashSet<FileId> = ast_scored_vec.iter().map(|&(fid, _)| fid).collect();
+        let intersection: HashSet<FileId> = blast
             .iter()
             .filter(|id| ast_fid_set.contains(*id))
             .copied()
@@ -228,19 +228,17 @@ fn run_compound_query(
     // Compound intersect + RRF fusion (pure, no I/O, closures only).
     // Structural lookup is a no-op until #290 threads AstIndexReader through
     // QueryConfig, at which point this closure is replaced with a real lookup.
-    let no_metrics =
-        |_fid: rskim_search::FileId| -> Option<rskim_search::StructuralMetrics> { None };
     let ranked = intersect_and_rank(
         &raw_lex,
         ast_scored_vec,
-        no_metrics,
-        0.0_f32, // avg_max_depth — placeholder until #290
+        |_: FileId| -> Option<StructuralMetrics> { None }, // placeholder until #290
+        0.0_f32,                                           // avg_max_depth — placeholder until #290
         CompositeWeights::default(),
     );
 
     // Recompose: carry lexical SearchResult (snippet + line_range), replace score.
     // Truncate to --limit LAST (rank-then-truncate-LAST invariant, Amendment).
-    let recomposed: Vec<rskim_search::SearchResult> = recompose_with_lexical(&ranked, &raw_lex)
+    let recomposed: Vec<SearchResult> = recompose_with_lexical(&ranked, &raw_lex)
         .into_iter()
         .take(config.limit)
         .collect();
@@ -259,7 +257,7 @@ fn run_compound_query(
 
 /// Map `FileId`s to paths and extract snippets.
 fn resolve_paths_and_snippets(
-    raw_results: &[rskim_search::SearchResult],
+    raw_results: &[SearchResult],
     sorted_paths: &[&str],
     root: &Path,
     manifest: &FileManifest,
