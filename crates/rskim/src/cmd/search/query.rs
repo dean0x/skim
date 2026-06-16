@@ -189,13 +189,8 @@ pub(super) fn execute_query_with_manifest(
     sq.limit = Some(config.limit);
 
     // Build the FileId allowlist from blast-radius paths only (no AST in this path).
-    match blast_file_ids {
-        Some(blast) => {
-            sq.file_filter = Some(blast);
-        }
-        None => {
-            // No filter.
-        }
+    if let Some(blast) = blast_file_ids {
+        sq.file_filter = Some(blast);
     }
 
     // Execute the search.

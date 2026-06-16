@@ -170,24 +170,7 @@ pub fn intersect_and_rank(
     // without arbitrary thresholds (ADR-003).
     // PF-004: widen u16→u32→f64 BEFORE any arithmetic.
     let avg_depth_f64 = f64::from(avg_max_depth);
-    let mut ast_ranked: Vec<(FileId, f64)> = ast_scored
-        .iter()
-        .map(|&(fid, score)| {
-            let ordering_key = if let Some(m) = structural_lookup(fid) {
-                // avoids PF-004: u32::from(max_depth) before f64::from
-                let depth = f64::from(u32::from(m.max_depth));
-                // Normalise by (1 + avg_depth) — strictly positive denominator.
-                depth / (1.0 + avg_depth_f64)
-            } else {
-                0.0
-            };
-            // Pack (ordering_key, ast_score) as a f64 for sort: use ordering_key
-            // as primary and ast_score as tiebreaker.
-            // We combine by sorting on (ordering_key, score) tuple below.
-            let _ = ordering_key; // used in the sort closure below
-            (fid, score)
-        })
-        .collect();
+    let mut ast_ranked: Vec<(FileId, f64)> = ast_scored.to_vec();
 
     // Sort AST candidates DESC by (structural depth key, ast_score) for rank assignment.
     ast_ranked.sort_unstable_by(|&(a_fid, a_score), &(b_fid, b_score)| {
