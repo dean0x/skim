@@ -1,4 +1,4 @@
-<!-- TL;DR: 9 pitfalls. Key: PF-005, PF-006, PF-007, PF-008, PF-009 -->
+<!-- TL;DR: 10 pitfalls. Key: PF-006, PF-007, PF-008, PF-009, PF-010 -->
 # Known Pitfalls
 
 Area-specific gotchas, fragile areas, and past bugs.
@@ -83,3 +83,12 @@ Area-specific gotchas, fragile areas, and past bugs.
 - **Resolution**: always run workspace lint as cargo clippy --workspace --all-targets -- -D warnings (not cargo clippy -p <crate>) so binary-crate test modules are compiled and linted
 - **Status**: Active
 - **Source**: self-learning:obs_clpat0
+
+## PF-010: In a multi-agent dynamic-build workflow, cargo serializes every build on one shared target/ lock — parallel agent fan-out plus per-mutation full-suite runs cause lock-wait stalls that the Bash timeout kills and retries, masquerading as a hang
+
+- **Area**: multi-agent dynamic-build workflows that shell out to cargo from concurrent agents (DevFlow dynamic-build, parallel reviewer/evaluator fan-out)
+- **Issue**: cargo serializes every build on a single lock for the shared target/ directory, so when several agents invoke cargo at once all but one block on the lock at 0% CPU — this looks identical to a hang. The default 120s Bash timeout then kills and retries the blocked invocations, producing thrash that is misread as a stuck command. Two design choices amplify it: a parallel reviewer/evaluator fan-out where read-only agents needlessly build, and a Gate-1 inner loop that re-runs the full --all-features workspace suite after every mutation
+- **Impact**: a workflow appears stalled for tens of minutes, wasting wall-clock and eroding trust that the build is making progress, when in fact it is lock-serialized
+- **Resolution**: (1) keep read-only agents (reviewers/evaluators/verifiers) static — they read files and git diff and must NOT run cargo, removing the concurrent-cargo storm at the source
+- **Status**: Active
+- **Source**: self-learning:obs_clkw3n
