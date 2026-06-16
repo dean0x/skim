@@ -15,6 +15,9 @@ path = "src/main.rs"
 [dependencies]
 rskim-core = { version = "2.10.0", path = "../rskim-core" }
 rskim-search = { path = "../rskim-search" }
+# Delegates token counting to the multi-provider library (AC13, AC15).
+# Do NOT enable "net-anthropic" here — default build must remain HTTP-free (AC9).
+rskim-tokens = { path = "../rskim-tokens" }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = { workspace = true }
 globset = { workspace = true }
@@ -24,7 +27,6 @@ dirs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-tiktoken-rs = { workspace = true }
 thiserror = { workspace = true }
 clap_complete = { workspace = true }
 strip-ansi-escapes = { workspace = true }

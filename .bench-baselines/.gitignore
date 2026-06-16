@@ -1,0 +1,6 @@
+# Ignore criterion-generated artifacts — only commit ci-baseline/ JSON data.
+# The report/, new/, and change/ directories are generated on each run and
+# should not be tracked (they contain SVG/HTML and run-specific snapshots).
+**/report/
+**/new/
+**/change/
