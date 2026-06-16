@@ -6,9 +6,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
-use crate::ast_index::extract::{AstBigramEntry, AstTrigramEntry};
 use crate::ast_index::{
-    AstBigram, AstTrigram, extract::AstNgramSet, structural::StructuralMetrics,
+    AstBigram, AstBigramEntry, AstNgramSet, AstTrigram, AstTrigramEntry, StructuralMetrics,
 };
 
 // ============================================================================

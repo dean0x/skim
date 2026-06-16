@@ -29,9 +29,8 @@ use std::time::Instant;
 
 use clap::Parser;
 use rskim_search::{
-    AstIndexBuilder, AstNgramCache, AstNgramSet, CachedAstEntry, FileId, LayerBuilder,
-    NgramIndexBuilder, StructuralMetrics, classify_source, extract_ast_ngrams_with_metrics,
-    linearize_source,
+    AstIndexBuilder, AstNgramCache, CachedAstEntry, FileId, LayerBuilder, NgramIndexBuilder,
+    classify_source, extract_ast_ngrams_with_metrics, linearize_source,
 };
 
 use super::manifest::{FileManifest, ManifestEntry, decode_field_map, encode_field_map};
@@ -667,22 +666,11 @@ fn resolve_ast_entry<'cache>(
     rel_path: &std::path::Path,
     debug_enabled: bool,
 ) -> &'cache CachedAstEntry {
-    let entry = match cached {
-        Some(hit) => hit,
-        None => {
-            // Cache miss: full extraction (fail-soft: always returns a valid triple).
-            // Record in new_ast_cache including empty entries for data-format files.
-            let (ngrams, metrics, node_count) =
-                derive_ast_entry(content, lang, rel_path, debug_enabled);
-            CachedAstEntry {
-                ngrams,
-                metrics,
-                node_count,
-            }
-        }
-    };
+    // Cache miss: full extraction (fail-soft: always returns a valid entry).
+    // Empty entries for data-format files are valid cache entries, not corrupt.
+    let entry = cached.unwrap_or_else(|| derive_ast_entry(content, lang, rel_path, debug_enabled));
     // Entry API: hashes sha_key once, inserts if absent, returns &CachedAstEntry.
-    // Eliminates the insert-then-lookup double-probe and removes the .expect() panic.
+    // Eliminates the insert-then-lookup double-probe.
     new_ast_cache.get_or_insert(sha_key, entry)
 }
 
@@ -808,13 +796,13 @@ fn run_classify(
 
 /// Derive the AST n-gram entry for one file.
 ///
-/// Returns `(AstNgramSet, StructuralMetrics, node_count)`.
+/// Returns a [`CachedAstEntry`] ready to store in `new_ast_cache`.
 ///
 /// # Error policy (fail-soft)
 ///
 /// On ANY error (grammar load failure, linearization error, or an Ok-but-empty
 /// result for non-tree-sitter languages / large files / empty content), this
-/// function returns an empty-but-valid triple so the caller can still insert an
+/// function returns an empty-but-valid entry so the caller can still insert an
 /// ALIGNED EMPTY ENTRY into the AST builder. It never panics and never propagates
 /// an error — doing so would either abort the whole build (wrong for a per-file
 /// parse error) or skip the AST call entirely (which desynchronises FileIds).
@@ -829,18 +817,10 @@ fn derive_ast_entry(
     lang: rskim_core::Language,
     rel_path: &Path,
     debug: bool,
-) -> (AstNgramSet, StructuralMetrics, u32) {
-    match linearize_source(content, lang) {
-        Ok(lin) if !lin.nodes.is_empty() => {
-            let (set, metrics) = extract_ast_ngrams_with_metrics(&lin.nodes, lang);
-            // Applies PF-004: explicit try_from, not `as u32`.
-            let node_count = u32::try_from(lin.nodes.len()).unwrap_or(u32::MAX);
-            (set, metrics, node_count)
-        }
-        // Non-tree-sitter lang (JSON/YAML/TOML), file >100KiB, empty source,
-        // parse-only-error, or grammar load failure — return empty aligned entry
-        // so FileIds stay in sync with the lexical index.
-        Ok(_empty) => (AstNgramSet::default(), StructuralMetrics::default(), 0u32),
+) -> CachedAstEntry {
+    let lin = match linearize_source(content, lang) {
+        Ok(lin) if !lin.nodes.is_empty() => lin,
+        Ok(_) => return CachedAstEntry::default(),
         Err(e) => {
             if debug {
                 eprintln!(
@@ -848,8 +828,20 @@ fn derive_ast_entry(
                     rel_path
                 );
             }
-            (AstNgramSet::default(), StructuralMetrics::default(), 0u32)
+            return CachedAstEntry::default();
         }
+    };
+    // Non-tree-sitter lang (JSON/YAML/TOML), file >100KiB, empty source,
+    // parse-only-error, or grammar load failure returns early above —
+    // only non-empty linearizations reach here. FileIds stay in sync with
+    // the lexical index for all cases.
+    let (ngrams, metrics) = extract_ast_ngrams_with_metrics(&lin.nodes, lang);
+    // Applies PF-004: explicit try_from, not `as u32`.
+    let node_count = u32::try_from(lin.nodes.len()).unwrap_or(u32::MAX);
+    CachedAstEntry {
+        ngrams,
+        metrics,
+        node_count,
     }
 }
 
