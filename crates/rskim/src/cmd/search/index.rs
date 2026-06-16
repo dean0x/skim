@@ -29,8 +29,9 @@ use std::time::Instant;
 
 use clap::Parser;
 use rskim_search::{
-    AstIndexBuilder, AstNgramSet, FileId, LayerBuilder, NgramIndexBuilder, StructuralMetrics,
-    classify_source, extract_ast_ngrams_with_metrics, linearize_source,
+    AstIndexBuilder, AstNgramCache, AstNgramSet, CachedAstEntry, FileId, LayerBuilder,
+    NgramIndexBuilder, StructuralMetrics, classify_source, extract_ast_ngrams_with_metrics,
+    linearize_source,
 };
 
 use super::manifest::{FileManifest, ManifestEntry, decode_field_map, encode_field_map};
@@ -76,10 +77,13 @@ pub(super) fn run(
     let result = build_index(&config)?;
 
     eprintln!(
-        "skim search index: indexed {} files ({} skipped, {} cache hits) in {:.1}s",
+        "skim search index: indexed {} files ({} skipped, {} field-map hits, \
+         {} AST reused, {} AST re-extracted) in {:.1}s",
         result.file_count,
         result.skipped,
         result.cache_hits,
+        result.ast_cache_hits,
+        result.ast_reextracted,
         result.duration.as_secs_f64(),
     );
 
@@ -203,6 +207,10 @@ pub(super) struct ConsumeResult {
     pub(super) file_count: u32,
     /// Number of files whose cached `field_map` was reused (SHA match).
     pub(super) cache_hits: u32,
+    /// Number of files whose AST n-grams were served from `ast_index.skcache`.
+    pub(super) ast_cache_hits: u32,
+    /// Number of files whose AST n-grams were freshly extracted.
+    pub(super) ast_reextracted: u32,
 }
 
 impl<'cfg> Pipeline<'cfg> {
@@ -256,22 +264,38 @@ impl<'cfg> Pipeline<'cfg> {
                 file_count: 0,
                 skipped: to_u32_capped(walk_skip_count),
                 cache_hits: 0,
+                ast_cache_hits: 0,
+                ast_reextracted: 0,
                 duration: self.start.elapsed(),
             });
         }
 
-        // Stage 2: Load the manifest for incremental builds, then spawn producer.
+        // Stage 2: Load the manifest and the AST cache for incremental builds,
+        // then spawn producer.
         let manifest = self.load_manifest()?;
-        let (producer_handle, rx, producer_skips) =
-            Self::spawn_producer(walk_entries, manifest, self.config.force, debug_enabled);
+        // Load the prior AST n-gram cache.  On --force, skip the cache entirely
+        // (--force must re-extract everything, AC11).
+        let ast_cache = if self.config.force {
+            AstNgramCache::empty()
+        } else {
+            AstNgramCache::load(&self.cache_dir)
+        };
+        let (producer_handle, rx, producer_skips) = Self::spawn_producer(
+            walk_entries,
+            manifest,
+            ast_cache,
+            self.config.force,
+            debug_enabled,
+        );
 
         // Stage 3: Consume processed files, build lexical + AST indexes.
         let mut builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
-        // AST index (#199): build alongside lexical so both share the same FileId
-        // sequence (correctness-critical — see FileId contract in ast_index/builder.rs).
+        // AST index (#199 + #290): build alongside lexical so both share the same
+        // FileId sequence (correctness-critical — see FileId contract in
+        // ast_index/builder.rs).  Incremental cache (#290): unchanged files reuse
+        // their cached AstNgramSet from ast_index.skcache instead of re-extracting.
         // NOTE: both builders retain posting lists until build(); memory scales with
         // file count (~tens of MB at 10k files) — tracked in #273 for chunked builds.
-        // Re-extract all files each refresh (no incremental cache) — tracked in #290.
         let mut ast_builder = AstIndexBuilder::new(self.cache_dir.clone())
             .map_err(|e| anyhow::anyhow!("failed to create AST index builder: {e}"))?;
         let mut new_manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
@@ -281,10 +305,12 @@ impl<'cfg> Pipeline<'cfg> {
         // On the abort path, `rx` is consumed (dropped inside `consume`) before we reach
         // the join, so the producer's `tx.send()` has already returned `Err` and the
         // producer thread has already exited — no deadlock risk. (applies ADR-006)
+        let mut new_ast_cache = AstNgramCache::empty();
         let consume_result = Self::consume(
             &mut builder,
             &mut ast_builder,
             &mut new_manifest,
+            &mut new_ast_cache,
             rx,
             debug_enabled,
         );
@@ -304,6 +330,8 @@ impl<'cfg> Pipeline<'cfg> {
         let ConsumeResult {
             file_count,
             cache_hits,
+            ast_cache_hits,
+            ast_reextracted,
         } = consume_result?;
 
         // Commit ordering (crash-safety):
@@ -343,6 +371,17 @@ impl<'cfg> Pipeline<'cfg> {
             .build()
             .map_err(|e| anyhow::anyhow!("AST index build failed: {e}"))?;
 
+        // Commit ordering (applies ADR-006):
+        // Write the AST n-gram cache AFTER ast_builder.build() and BEFORE
+        // new_manifest.save().  A write failure here returns Err so the
+        // manifest is never saved — the next query self-heals via full rebuild.
+        // The skcache is advisory: a stale entry cannot be served because the
+        // manifest SHA is the sole cache-key authority; a skcache entry present
+        // without a matching manifest SHA is simply unused on the next build.
+        new_ast_cache
+            .save(&self.cache_dir)
+            .map_err(|e| anyhow::anyhow!("AST cache save failed: {e}"))?;
+
         // Record the current git HEAD in the manifest so staleness detection
         // can compare it on the next query without spawning a git subprocess.
         new_manifest.set_git_head(read_git_head(&self.config.root));
@@ -358,6 +397,8 @@ impl<'cfg> Pipeline<'cfg> {
             file_count,
             skipped: total_skipped,
             cache_hits,
+            ast_cache_hits,
+            ast_reextracted,
             duration: self.start.elapsed(),
         })
     }
@@ -384,9 +425,14 @@ impl<'cfg> Pipeline<'cfg> {
     ///
     /// Returns a join handle, the receiving end of the bounded channel, and a
     /// shared skip counter that the producer increments on read/classify errors.
+    ///
+    /// `ast_cache` is moved into the producer thread and consulted for each
+    /// file: a SHA match in the cache attaches the cached payload to the
+    /// `ProcessedFile.ast_cached` field so the consumer skips `derive_ast_entry`.
     fn spawn_producer(
         walk_entries: Vec<WalkEntry>,
         manifest: FileManifest,
+        ast_cache: AstNgramCache,
         force: bool,
         debug_enabled: bool,
     ) -> (
@@ -398,12 +444,11 @@ impl<'cfg> Pipeline<'cfg> {
         let producer_skips = Arc::new(AtomicU32::new(0));
         let skips = Arc::clone(&producer_skips);
 
-        // Both `walk_entries` and `manifest` are moved into the producer thread.
-        // `Vec<WalkEntry>` and `FileManifest` must be `Send`; the compiler
-        // enforces this at the `thread::spawn` call site.
+        // `walk_entries`, `manifest`, and `ast_cache` are moved into the producer
+        // thread.  All three must be `Send`; the compiler enforces this.
         let handle = std::thread::spawn(move || {
             for entry in &walk_entries {
-                match read_and_classify(entry, &manifest, force, debug_enabled) {
+                match read_and_classify(entry, &manifest, &ast_cache, force, debug_enabled) {
                     Ok(pf) => {
                         // Send blocks when channel is full — backpressure limits peak memory.
                         if tx.send(pf).is_err() {
@@ -448,19 +493,26 @@ impl<'cfg> Pipeline<'cfg> {
     /// 1. `next_file_id` only advances after a successful `add_file_classified`.
     ///    A lexical-builder error causes a `continue` — the file is excluded from
     ///    BOTH indexes, keeping them in sync.
-    /// 2. AST entries are ALWAYS inserted (even on linearization error) via an
-    ///    empty `AstNgramSet` + zero node_count + default metrics. This preserves
+    /// 2. AST entries are ALWAYS inserted (even on linearization error or cache
+    ///    hit) via exactly one `add_file_ngrams` call per file. This preserves
     ///    the AST builder's "every file gets exactly one call" contract and prevents
     ///    FileId desync between the lexical and AST indexes.
+    /// 3. `new_ast_cache` accumulates payloads for all files in this build (hits
+    ///    re-inserted from the prior cache, misses inserted after extraction).
+    ///    The caller writes it atomically after `ast_builder.build()` and before
+    ///    `new_manifest.save()`. (applies ADR-006)
     pub(super) fn consume(
         builder: &mut NgramIndexBuilder,
         ast_builder: &mut AstIndexBuilder,
         new_manifest: &mut FileManifest,
+        new_ast_cache: &mut AstNgramCache,
         rx: crossbeam_channel::Receiver<ProcessedFile>,
         debug_enabled: bool,
     ) -> anyhow::Result<ConsumeResult> {
         let mut next_file_id: u32 = 0;
         let mut cache_hits: u32 = 0;
+        let mut ast_cache_hits: u32 = 0;
+        let mut ast_reextracted: u32 = 0;
 
         for pf in rx {
             // Fail-soft: a lexical builder error on one file must not abort a
@@ -482,11 +534,33 @@ impl<'cfg> Pipeline<'cfg> {
                 continue;
             }
 
-            // AST index: derive n-grams (step 2 of 4-step loop contract).
-            // Fail-soft: on ANY error, returns an empty aligned entry so AST FileIds
-            // stay in sync with lexical FileIds. NEVER skips — see derive_ast_entry.
-            let (ast_set, ast_metrics, ast_node_count) =
-                derive_ast_entry(&pf.content, pf.lang, &pf.rel_path, debug_enabled);
+            // AST index: resolve payload from cache (hit) or derive fresh (miss).
+            // The invariant: EVERY file that passes the lexical stage gets exactly
+            // ONE `add_file_ngrams` call — hit or miss. NEVER skip. (applies ADR-006)
+            let (ast_set, ast_metrics, ast_node_count) = if let Some(cached) = pf.ast_cached {
+                // Cache hit: reuse persisted n-grams, no tree-sitter pass.
+                ast_cache_hits = ast_cache_hits.saturating_add(1);
+                // Re-insert into new_ast_cache so the entry survives to the next build.
+                new_ast_cache.insert(pf.sha256.clone(), cached.clone());
+                (cached.ngrams, cached.metrics, cached.node_count)
+            } else {
+                // Cache miss: run the full extraction and record the payload.
+                // Fail-soft: on ANY error, returns an empty aligned entry so AST
+                // FileIds stay in sync with lexical FileIds. NEVER skips.
+                let entry = derive_ast_entry(&pf.content, pf.lang, &pf.rel_path, debug_enabled);
+                ast_reextracted = ast_reextracted.saturating_add(1);
+                // Record in new_ast_cache (including empty entries for data-format
+                // files — cached empty is valid, not corrupt). (avoids PF-005)
+                new_ast_cache.insert(
+                    pf.sha256.clone(),
+                    CachedAstEntry {
+                        ngrams: entry.0.clone(),
+                        metrics: entry.1,
+                        node_count: entry.2,
+                    },
+                );
+                entry
+            };
 
             // Add the AST entry for this file. The lexical entry for the SAME
             // FileId was already accepted, so an error here means the indexes are
@@ -495,7 +569,7 @@ impl<'cfg> Pipeline<'cfg> {
             // old manifest survives and the next query self-heals via a full
             // rebuild. Silently continuing would advance next_file_id and cascade
             // the desync into a committed-but-corrupt index. See the FileId-
-            // alignment invariant in the function doc.
+            // alignment invariant in the function doc. (applies ADR-006)
             if let Err(e) = ast_builder.add_file_ngrams(
                 FileId(next_file_id),
                 pf.lang,
@@ -544,6 +618,8 @@ impl<'cfg> Pipeline<'cfg> {
         Ok(ConsumeResult {
             file_count: next_file_id,
             cache_hits,
+            ast_cache_hits,
+            ast_reextracted,
         })
     }
 }
@@ -556,17 +632,21 @@ impl<'cfg> Pipeline<'cfg> {
 /// [`ProcessedFile`] — or a [`SkipReason`] if the file should be excluded.
 ///
 /// Cache tiers:
-/// - SHA match → reuse `field_map` from manifest (cache hit, no classify call).
-/// - SHA mismatch or `--force` → run `classify_source` (cache miss).
+/// - SHA match → reuse `field_map` from manifest (lexical cache hit, no
+///   classify call); also attaches the AST payload from `ast_cache` when
+///   available (AST cache hit, no `derive_ast_entry` call in consumer).
+/// - SHA mismatch or `--force` → run `classify_source`; `ast_cached` is `None`
+///   so the consumer calls `derive_ast_entry`.
 ///
 /// Mtime is stored in the manifest for forward-looking aggressive-mode support
 /// (where mtime mismatch could skip SHA entirely) but is not read here — SHA is
-/// the sole cache authority in safe mode.
+/// the sole cache authority in safe mode. (avoids PF-005)
 ///
 /// Called by the producer thread for each [`WalkEntry`].
 fn read_and_classify(
     entry: &WalkEntry,
     manifest: &FileManifest,
+    ast_cache: &AstNgramCache,
     force: bool,
     debug: bool,
 ) -> Result<ProcessedFile, SkipReason> {
@@ -593,22 +673,30 @@ fn read_and_classify(
         return Err(SkipReason::Minified(entry.abs_path.clone()));
     }
 
-    // Always compute SHA — it is the correctness guarantee.
+    // Always compute SHA — it is the correctness guarantee for both the
+    // lexical and AST caches.  Content SHA-256 is the sole cache authority;
+    // mtime is never consulted for cache decisions. (applies ADR-003)
     let sha = sha256_hex(content.as_bytes());
 
-    // 2-tier SHA cache: SHA match → hit, mismatch/--force → miss.
+    // Lexical 2-tier SHA cache: SHA match → hit, mismatch/--force → miss.
     let path_key = entry.rel_path.to_string_lossy().replace('\\', "/");
 
     let (field_map, cache_hit) = if !force
         && let Some(cached) = manifest.lookup(&path_key)
         && cached.sha256 == sha
     {
-        // SHA match → reuse field_map (cache hit).
+        // SHA match → reuse field_map (lexical cache hit).
         (decode_field_map(&cached.field_map), true)
     } else {
         // Cache miss or --force → classify.
         (run_classify(&content, entry.lang, debug), false)
     };
+
+    // AST cache lookup: independent of the lexical cache hit/miss.
+    // On --force, ast_cache is empty so lookup always returns None (AC11).
+    // A SHA-match-but-cache-absent case (e.g. first build after version bump,
+    // or a corrupt entry) returns None here → consumer re-extracts. (AC5)
+    let ast_cached = ast_cache.lookup(&sha).cloned();
 
     Ok(ProcessedFile {
         rel_path: entry.rel_path.clone(),
@@ -618,6 +706,7 @@ fn read_and_classify(
         mtime: entry.mtime,
         field_map,
         cache_hit,
+        ast_cached,
     })
 }
 

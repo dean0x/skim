@@ -674,16 +674,19 @@ fn test_adr006_desync_aborts_before_manifest_save() {
         mtime: None,
         field_map: vec![],
         cache_hit: false,
+        ast_cached: None,
     };
     tx.send(pf).unwrap();
     drop(tx); // close channel so consume loop terminates after one item
 
     // Stage 3: call consume — it must return Err because add_file_ngrams rejects
     // FileId(0) (the builder already has FileId(0) and expects FileId(1) next).
+    let mut throwaway_ast_cache = rskim_search::AstNgramCache::empty();
     let result = Pipeline::consume(
         &mut lexical_builder,
         &mut ast_builder,
         &mut new_manifest,
+        &mut throwaway_ast_cache,
         rx,
         false,
     );
@@ -770,13 +773,16 @@ fn test_adr006_self_heal_after_abort() {
         mtime: None,
         field_map: vec![],
         cache_hit: false,
+        ast_cached: None,
     };
     tx.send(pf).unwrap();
     drop(tx);
+    let mut throwaway_ast_cache = rskim_search::AstNgramCache::empty();
     let abort_result = Pipeline::consume(
         &mut lexical_builder,
         &mut ast_builder,
         &mut new_manifest,
+        &mut throwaway_ast_cache,
         rx,
         false,
     );
