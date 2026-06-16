@@ -109,7 +109,7 @@ pub(super) fn resolve_ast_scored(
     engine: &AstQueryEngine<AstIndexReader>,
     raw: &str,
 ) -> anyhow::Result<Vec<(FileId, f64)>> {
-    let query = rskim_search::parse_ast_query(raw.trim())
+    let query = parse_ast_query(raw.trim())
         .map_err(|e| anyhow::anyhow!("invalid AST pattern: {e}"))?;
     let hits = engine
         .search_ast(&query)

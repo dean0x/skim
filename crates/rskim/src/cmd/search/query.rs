@@ -261,7 +261,7 @@ fn run_compound_query(
     // Truncating here bounds the clone work in recompose_with_lexical to O(limit) rather
     // than O(limit * CANDIDATE_POOL_K); without this, recompose clones every candidate
     // and .take(limit) discards up to 3*limit clones immediately.
-    let ranked_limited: Vec<(FileId, f64)> = ranked.into_iter().take(config.limit).collect();
+    let ranked_limited: Vec<_> = ranked.into_iter().take(config.limit).collect();
 
     // Recompose: carry lexical SearchResult (snippet + line_range), replace score (AC11).
     let recomposed = recompose_with_lexical(&ranked_limited, &raw_lex);

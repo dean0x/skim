@@ -75,10 +75,9 @@ fn ac7_compound_fn_is_pure_no_io() {
         !ranked.is_empty(),
         "AC7: pure fn must return results for overlapping inputs"
     );
-    // Verify scores are finite (NaN-safe, AC9).
+    // Verify scores are finite (is_finite() implies not NaN — covers AC9 NaN-safety too).
     for (_, score) in &ranked {
         assert!(score.is_finite(), "AC7: score must be finite, got {score}");
-        assert!(!score.is_nan(), "AC7: score must not be NaN, got {score}");
     }
 }
 
@@ -423,11 +422,6 @@ fn ac8_rrf_is_scale_free() {
         );
     }
 
-    // Sanity: confirm named consts exist and are referenced.
-    let _ = RRF_K;
-    let _ = WEIGHT_LEXICAL;
-    let _ = WEIGHT_AST;
-
     // Additional AC8 assertion: with AST-heavy weights, the ordering inverts.
     // Proves that weights control which layer dominates — not raw magnitudes.
     let ast_heavy = CompositeWeights {
@@ -465,11 +459,7 @@ fn ac9_nan_safe_all_equal_scores() {
         "AC9: all 3 files must appear (all in both layers)"
     );
     for &(_, score) in &ranked_1 {
-        assert!(
-            !score.is_nan(),
-            "AC9: score must not be NaN (RRF denominator always positive)"
-        );
-        assert!(score.is_finite(), "AC9: score must be finite");
+        assert!(score.is_finite(), "AC9: score must be finite (is_finite implies not NaN)");
     }
     // Determinism: two invocations with identical inputs must produce identical output.
     assert_eq!(
@@ -492,11 +482,7 @@ fn ac9_nan_safe_single_element_layer() {
         "AC9: single-file intersection must have 1 result"
     );
     let (_, score) = ranked[0];
-    assert!(
-        !score.is_nan(),
-        "AC9: score must not be NaN for single-element layer"
-    );
-    assert!(score.is_finite(), "AC9: score must be finite");
+    assert!(score.is_finite(), "AC9: score must be finite (is_finite implies not NaN)");
 
     // Verify the score matches the expected RRF formula (both rank-1):
     // score = WEIGHT_LEXICAL / (RRF_K + 1) + WEIGHT_AST / (RRF_K + 1)
@@ -637,10 +623,9 @@ fn ac12_u16_max_metrics_no_overflow() {
     for &(fid, score) in &ranked {
         assert!(
             score.is_finite(),
-            "AC12: score must be finite with u16::MAX metrics for FileId({:?})",
+            "AC12: score must be finite (implies not NaN) with u16::MAX metrics for FileId({:?})",
             fid
         );
-        assert!(!score.is_nan(), "AC12: score must not be NaN");
     }
 }
 
