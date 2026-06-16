@@ -10,11 +10,11 @@
 //!
 //! # Single-pass provider detection
 //!
-//! The [`parse`] function performs provider detection via [`crate::provider::detect_str`],
+//! The [`parse`] function performs provider detection via `crate::provider::detect_str`,
 //! which runs a single shallow deserialization that captures only the fields needed
 //! for provider selection (`model`, `response_format`, `max_tokens`,
 //! `messages[*].{role,tool_calls,tool_call_id,content[*].type}`), discarding all
-//! other field values via `serde::de::IgnoredAny`.  The typed parse in [`parse_as`]
+//! other field values via `serde::de::IgnoredAny`.  The typed parse in `parse_as`
 //! is the only deep parse of the body.
 //!
 //! # Memory profile

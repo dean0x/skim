@@ -5,7 +5,7 @@
 //!
 //! # Single-pass detection
 //!
-//! [`detect_str`] is the primary entry point.  It performs a single shallow
+//! `detect_str` is the primary entry point.  It performs a single shallow
 //! deserialization that captures only the fields needed for provider detection
 //! (`model`, `response_format`, `max_tokens`, `messages[*].{role,tool_calls,
 //! tool_call_id,content[*].type}`), discarding all other fields via
@@ -13,7 +13,7 @@
 //! `serde_json::Value` tree — the typed parse in `parse_as` is the only deep
 //! parse of the body.
 //!
-//! [`detect_str`] is the sole provider-detection entry point for the parse path.
+//! `detect_str` is the sole provider-detection entry point for the parse path.
 
 use serde::Deserialize;
 

@@ -158,7 +158,7 @@ impl Outcome {
 /// # Harness registration
 ///
 /// Implementors should register with the conformance harness behind the
-/// `harness` feature. See [`crate::harness`] for details and
+/// `harness` feature. See `crate::harness` for details and
 /// `run_conformance_suite` for the one-call registration API.
 pub trait Contract: Send + Sync {
     /// Returns the stable component name for decision records and harness registration.
