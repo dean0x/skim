@@ -143,6 +143,20 @@ fn ac1_intersection_strict_subset_gate() {
 // AC2 — composite fusion actually reorders vs pure-lexical
 // ============================================================================
 
+/// Verify that the AST signal reaches composite scoring and can invert lexical order.
+///
+/// # Weight note
+///
+/// This test uses asymmetric weights (ast: 10.0 / lexical: 1.0) rather than
+/// the production equal-weight default (`CompositeWeights::default()`).  With
+/// exactly 2 intersecting files and symmetric complementary ranks (f1: lex-1/ast-2,
+/// f2: lex-2/ast-1), equal weights yield identical RRF scores — impossible to
+/// assert a deterministic ordering difference without the FileId-ASC tiebreaker.
+/// Asymmetric weights make the AST signal decisive and the assertion unambiguous.
+///
+/// The equal-weight production path is covered by `ac3d_equal_weight_production_path_ast_signal_wired`,
+/// which uses 3-file inputs where the ranks are NOT symmetric and the ordering
+/// difference is provable under equal weights.
 #[test]
 fn ac2_composite_fusion_reorders_vs_lexical() {
     // lexical: 3 files — f1 (rank 1, score 10), f2 (rank 2, score 5), f3 (rank 3, score 1).
@@ -581,6 +595,15 @@ fn ac11_snippets_preserved_from_lexical() {
 // AC12 — u16/u32 metric widening (no overflow)
 // ============================================================================
 
+/// Verify that u16/u32 structural metrics do not overflow when widened.
+///
+/// # Note: injectable path, deferred production wiring (#290)
+///
+/// This test exercises the `structural_lookup` injection seam with real
+/// `StructuralMetrics` values.  On the production CLI path in Wave 4a,
+/// `run_compound_query` passes `|_| None` and `avg_max_depth = 0.0`, so this
+/// code path is never reached in production.  The test validates the overflow-
+/// free widening logic for the #290 milestone that will wire a real lookup.
 #[test]
 fn ac12_u16_max_metrics_no_overflow() {
     // Feed StructuralMetrics with max values — must not overflow or panic.
@@ -639,6 +662,18 @@ fn ac13_core_fn_returns_plain_vec() {
 // Structural refinement changes ordering
 // ============================================================================
 
+/// Verify that depth-based structural refinement correctly re-ranks the AST list.
+///
+/// # Note: injectable path, deferred production wiring (#290)
+///
+/// This test injects a real `structural_lookup` closure and a non-zero
+/// `avg_max_depth`, exercising the depth-based AST re-ranking logic inside
+/// `intersect_and_rank`.  On the production CLI path in Wave 4a,
+/// `run_compound_query` always passes `|_| None` and `0.0_f32`, so the
+/// depth key is 0.0 for every file and the AST decorate-sort reduces to
+/// pure `ast_score`-DESC order.  The test validates the correctness of the
+/// structural-refinement logic against the #290 milestone; it does NOT
+/// represent live production behaviour.
 #[test]
 fn structural_depth_refines_ast_rank() {
     // Structural refinement changes the AST ranked list: files with higher

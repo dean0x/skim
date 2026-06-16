@@ -138,12 +138,14 @@ pub(super) fn execute_query_with_manifest(
             config,
             ast_scored_vec,
             blast_file_ids,
-            &engine,
-            &sorted,
-            root,
-            &manifest,
-            stats,
-            start,
+            QueryContext {
+                engine: &engine,
+                sorted: &sorted,
+                root,
+                manifest: &manifest,
+                stats,
+                start,
+            },
         );
     }
     // ── End compound text+AST path ────────────────────────────────────────────
@@ -175,6 +177,21 @@ pub(super) fn execute_query_with_manifest(
     })
 }
 
+/// Execution context threaded through the compound query path.
+///
+/// Bundles the read-only index state that is computed once in
+/// [`execute_query_with_manifest`] and forwarded to [`run_compound_query`].
+/// This eliminates the >5 positional argument count and makes the caller
+/// site self-documenting.
+struct QueryContext<'a> {
+    engine: &'a QueryEngine,
+    sorted: &'a [&'a str],
+    root: &'a Path,
+    manifest: &'a FileManifest,
+    stats: IndexStats,
+    start: Instant,
+}
+
 /// Execute the compound text+AST query branch (#198).
 ///
 /// Fetches a wider lexical candidate pool, applies an optional blast-radius
@@ -188,21 +205,20 @@ pub(super) fn execute_query_with_manifest(
 /// # Errors
 ///
 /// Returns `Err` when the lexical engine search fails.
-#[allow(clippy::too_many_arguments)]
 fn run_compound_query(
     config: &super::types::QueryConfig,
     ast_scored_vec: &[(FileId, f64)],
     blast_file_ids: Option<HashSet<FileId>>,
-    engine: &QueryEngine,
-    sorted: &[&str],
-    root: &Path,
-    manifest: &FileManifest,
-    stats: IndexStats,
-    start: Instant,
+    ctx: QueryContext<'_>,
 ) -> anyhow::Result<QueryOutput> {
     // Wider lexical pool before compound ranking.
     // K=4: lighter than temporal.rs (K=5 with .max(100) floor) because the
     // intersection gate already narrows candidates — no floor needed.
+    // NOTE: K=4 is a heuristic with no measured corpus basis; a file that is
+    // in both AST and lexical sets but ranks beyond position limit*4 in the
+    // unfiltered lexical ranking will be silently excluded.  This is the
+    // intentional trade-off (enables composite ranking vs old file_filter gate).
+    // Calibrating K for large corpora is tracked in #290.
     const CANDIDATE_POOL_K: usize = 4;
     let mut sq = SearchQuery::new(config.text.clone());
     // saturating_mul: a hostile `--limit` near usize::MAX must not overflow.
@@ -223,35 +239,42 @@ fn run_compound_query(
     // (No else: without blast-radius, no lexical file_filter — the compound
     // intersection acts as the filter, not the lexical engine's file_filter.)
 
-    let raw_lex = engine.search(&sq)?;
+    let raw_lex = ctx.engine.search(&sq)?;
 
     // Compound intersect + RRF fusion (pure, no I/O, closures only).
-    // Structural lookup is a no-op until #290 threads AstIndexReader through
-    // QueryConfig, at which point this closure is replaced with a real lookup.
+    //
+    // WAVE 4a — structural seam is a no-op:
+    // The structural_lookup and avg_max_depth parameters exist to enable
+    // depth-based AST re-ranking (AC2/AC12), but on this production path both
+    // are placeholders deferred to #290.  As a result every entry's depth_key
+    // is 0.0 and the AST decorate-sort reduces to pure ast_score-DESC order.
+    // The shipped Wave 4a ranking is lexical-rank + AST-score-rank RRF only.
     let ranked = intersect_and_rank(
         &raw_lex,
         ast_scored_vec,
-        |_: FileId| -> Option<StructuralMetrics> { None }, // placeholder until #290
+        |_: FileId| -> Option<StructuralMetrics> { None }, // structural seam — placeholder until #290
         0.0_f32,                                           // avg_max_depth — placeholder until #290
         CompositeWeights::default(),
     );
 
-    // Recompose: carry lexical SearchResult (snippet + line_range), replace score.
-    // Truncate to --limit LAST (rank-then-truncate-LAST invariant, Amendment).
-    let recomposed: Vec<SearchResult> = recompose_with_lexical(&ranked, &raw_lex)
-        .into_iter()
-        .take(config.limit)
-        .collect();
+    // Truncate to --limit BEFORE recompose (rank-then-truncate-LAST invariant, Amendment).
+    // Truncating here bounds the clone work in recompose_with_lexical to O(limit) rather
+    // than O(limit * CANDIDATE_POOL_K); without this, recompose clones every candidate
+    // and .take(limit) discards up to 3*limit clones immediately.
+    let ranked_limited: Vec<(FileId, f64)> = ranked.into_iter().take(config.limit).collect();
 
-    let results = resolve_paths_and_snippets(&recomposed, sorted, root, manifest);
+    // Recompose: carry lexical SearchResult (snippet + line_range), replace score (AC11).
+    let recomposed = recompose_with_lexical(&ranked_limited, &raw_lex);
+
+    let results = resolve_paths_and_snippets(&recomposed, ctx.sorted, ctx.root, ctx.manifest);
     let total = results.len();
-    let duration_ms = start.elapsed().as_millis() as u64;
+    let duration_ms = ctx.start.elapsed().as_millis() as u64;
     Ok(QueryOutput {
         query: config.text.clone(),
         total,
         results,
         duration_ms,
-        index_stats: Some(stats),
+        index_stats: Some(ctx.stats),
     })
 }
 

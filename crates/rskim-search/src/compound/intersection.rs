@@ -22,6 +22,41 @@
 //! * Pure / I/O-free — all lookups are injected via `impl Fn` closures; no
 //!   reader, DB, or filesystem access inside this module.
 //!
+//! # Structural refinement status (Wave 4a)
+//!
+//! The `structural_lookup` closure and `avg_max_depth` parameter are the
+//! extension seam for depth-based AST re-ranking, planned in AC2/AC12 and
+//! deferred to #290.  **On the production CLI path in Wave 4a, the caller
+//! (`run_compound_query`) always passes `|_| None` and `avg_max_depth = 0.0`**,
+//! so every entry's `depth_key` evaluates to `0.0 / 1.0 = 0.0`.  The AST
+//! decorate-sort therefore reduces to pure `ast_score`-DESC order — depth
+//! re-ranking is not live in production.  The seam is exercised only by
+//! unit tests that inject real closures; those tests validate the logic in
+//! isolation against the #290 implementation milestone.
+//!
+//! Shipped composite ranking in Wave 4a: **lexical-rank + AST-score-rank RRF only**.
+//!
+//! # AC7 parameter note
+//!
+//! The original plan AC7 specified an additional `impl Fn(FileId) -> Option<f64>`
+//! temporal multiplier parameter.  This parameter was dropped in the Cross-Plan
+//! Amendment because the `#202` gate blocks the combined `--ast + temporal` path
+//! entirely in Wave 4a, making a temporal multiplier unreachable and therefore
+//! baseless per ADR-003.  The omission is intentional and traceable to the amendment;
+//! #202 lifting it is the prerequisite for adding it.
+//!
+//! # Lexical candidate pool and completeness
+//!
+//! The production caller fetches a **wider** lexical pool of `limit * 4` candidates
+//! (no lexical `file_filter` on the text+AST path) and intersects with the full AST
+//! set.  A file that is in both AST and lexical sets but ranks beyond position
+//! `limit * 4` in the unfiltered lexical ranking will not appear in the output.
+//! The K=4 multiplier is a heuristic with no measured corpus basis; it is documented
+//! here for the #290 follow-up to calibrate.  This is an intentional trade-off: the
+//! old `file_filter` gate guaranteed completeness within the AST set but precluded
+//! composite ranking; the new wider-pool approach enables composite ranking at the
+//! cost of a bounded completeness gap.
+//!
 //! # Extension points for #200
 //!
 //! `CompositeWeights` holds the per-layer weights so #200 can add temporal and
@@ -110,13 +145,16 @@ impl Default for CompositeWeights {
 /// * `avg_max_depth` — corpus average max CST depth, from
 ///   `AstIndexReader::avg_max_depth()`.  Used as the ordering key baseline so
 ///   the structural refinement is grounded (avoids ADR-003 baseless magic).
+///   **Wave 4a**: the production caller passes `0.0` (structural seam deferred
+///   to #290); depth re-ranking is not live until #290 wires a real lookup.
 /// * `weights` — per-signal RRF weights; use [`CompositeWeights::default()`]
 ///   for the equal-weight blend.
 ///
 /// # Invariants enforced
 ///
 /// * Only files present in **both** layers are returned (intersection gate).
-/// * Empty intersection → `Ok(vec![])` (not an error).
+/// * Empty intersection → returns an empty `Vec` (infallible; this function
+///   never returns `Result` — see AC13).
 /// * `u16` structural metrics are widened via `u32::from` / `f64::from` before
 ///   any arithmetic (avoids PF-004 overflow).
 /// * The fused score denominator `RRF_K + rank` is always positive → NaN-safe.
@@ -130,6 +168,13 @@ impl Default for CompositeWeights {
 /// The caller is responsible for resolving FileIds to paths and extracting
 /// snippets from the lexical `SearchResult`s (AC11: carry the lexical result,
 /// replace `.score` with the composite score).
+///
+/// # Note: structural refinement in Wave 4a
+///
+/// The `structural_lookup` / `avg_max_depth` seam is live only in unit tests
+/// that inject real closures.  The production caller always injects `|_| None`
+/// and `0.0`, so the shipped Wave 4a ranking is lexical-rank + AST-score-rank
+/// RRF only.  Depth-aware ranking is wired in #290.
 ///
 /// # Doc: limit semantics
 ///
@@ -214,10 +259,10 @@ pub fn intersect_and_rank(
         .collect();
 
     // Sort DESC by (depth_key, ast_score); FileId-ASC as deterministic tiebreaker.
+    // Use total_cmp throughout for NaN-safe, clippy-idiomatic fully-ordered f64 keys.
     ast_decorated.sort_unstable_by(|&(ak, as_, af), &(bk, bs, bf)| {
-        bk.partial_cmp(&ak)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(bs.partial_cmp(&as_).unwrap_or(std::cmp::Ordering::Equal))
+        bk.total_cmp(&ak)
+            .then(bs.total_cmp(&as_))
             .then(af.0.cmp(&bf.0))
     });
 
@@ -271,6 +316,16 @@ pub fn intersect_and_rank(
 ///
 /// Stale FileId skew (FileId in `ranked` not found in `lexical_scored`) →
 /// silent drop, consistent with `resolve_paths_and_snippets`.
+///
+/// # Performance note
+///
+/// This function builds a second `HashMap<FileId, &SearchResult>` over
+/// `lexical_scored`.  [`intersect_and_rank`] already builds a
+/// `HashMap<FileId, rank>` over the same slice.  Across the public API boundary
+/// the two builds are necessary (each function is independently callable), but
+/// callers on the hot path should pass a pre-truncated `ranked` slice (bounded
+/// to `--limit`) so clone work is O(limit), not O(limit * pool_factor).
+/// Consolidating the two maps into a shared data structure is tracked in #290.
 #[must_use]
 pub fn recompose_with_lexical(
     ranked: &[(FileId, f64)],
