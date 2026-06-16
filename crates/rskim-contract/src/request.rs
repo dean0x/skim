@@ -11,7 +11,7 @@
 //!
 //! The structural view stores only the structural metadata for each message
 //! (`index`, `role`), not parsed `serde_json::Value` clones. Byte-offset
-//! derivation for hot-zone splicing is a per-consumer responsibility (#302);
+//! derivation for hot-zone splicing is a per-consumer responsibility (#306/#307);
 //! this layer provides only the structural parse and zone-boundary classification.
 //! Hot-zone content must be re-emitted from the original buffer by
 //! [`crate::zone::splice_hot_zone`] — re-serialization via `serde_json::to_vec`
@@ -108,12 +108,13 @@ impl TurnRole {
 ///
 /// Stores only the structural metadata needed for zone-boundary computation
 /// (`index`, `role`). The raw JSON bytes of each message are NOT cloned here
-/// because this layer cannot know which turns will be hot-zone vs live-zone
-/// until #302 provides the typed offset model. Callers that need message
-/// content must retain the original `&[u8]` buffer and splice via
-/// [`crate::zone::splice_hot_zone`] at known byte offsets (#302 consumer).
-// TODO(#302): when the typed offset model is available, extend Turn with a
-// `ByteRange` for the original-buffer slice instead of an owned Value clone.
+/// because determining per-turn byte ranges requires consumer-side offset wiring.
+/// Callers that need message content must retain the original `&[u8]` buffer
+/// and splice via [`crate::zone::splice_hot_zone`] at known byte offsets.
+/// Per-turn `ByteRange` extension is deferred to the KV-cache consumer (#306)
+/// and the same-slot byte-shrink consumer (#307).
+// TODO(#306, #307): when a consumer wires per-turn byte offsets, extend Turn
+// with a `ByteRange` for the original-buffer slice.
 #[derive(Debug, Clone)]
 pub struct Turn {
     /// Zero-based index in the messages array.

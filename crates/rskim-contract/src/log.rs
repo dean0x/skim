@@ -36,6 +36,7 @@
 //! so they are available to all consumers without pulling in `rskim`.
 
 use std::sync::Arc;
+use thiserror::Error;
 
 // ============================================================================
 // Sensitive field scrub lists (declared here, not imported from rskim binary)
@@ -338,7 +339,7 @@ impl DecisionRecord {
 /// When `try_send` returns `SinkFull`, the caller MUST emit byte-faithful
 /// passthrough (invariant 8 / AC14). A modification whose record was not
 /// accepted MUST fail conformance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("decision sink is full — caller must fall back to passthrough")]
 pub struct SinkFull;
 

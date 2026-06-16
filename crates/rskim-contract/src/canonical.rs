@@ -152,6 +152,13 @@ fn raw_nodes_equal(a: &RawNode, b: &RawNode) -> bool {
                 return false;
             }
             // Order-insensitive: for each key in a, find it in b.
+            //
+            // This linear scan per key is O(n²) in the number of object keys.
+            // The bound is safe in practice: `parse_raw_node` only builds a
+            // `RawNode::Object` for inputs that passed the `MAX_CANONICAL_DEPTH`
+            // gate (64 levels), and real tool-schema objects are shallow (typically
+            // 4–10 top-level keys). A HashMap rewrite would add allocation and
+            // complexity for no measurable gain on this off-hot-path check.
             xm.iter().all(|(k, xv)| {
                 ym.iter()
                     .find(|(bk, _)| bk == k)

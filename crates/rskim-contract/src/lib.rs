@@ -129,6 +129,8 @@
 
 #![deny(missing_docs)]
 
+use thiserror::Error;
+
 pub mod canonical;
 pub mod contract;
 pub mod extension;
@@ -155,7 +157,7 @@ pub type Result<T> = std::result::Result<T, ContractError>;
 /// `ContractError` is the only error type visible to callers. The transform
 /// path (`Contract::transform`) never returns an error — it returns `Outcome`,
 /// where passthrough is a success variant.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ContractError {
     /// The request body is structurally invalid JSON.

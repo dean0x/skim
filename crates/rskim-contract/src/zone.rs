@@ -102,46 +102,48 @@ pub fn splice_hot_zone(original: &[u8], range: ByteRange) -> Option<&[u8]> {
 
 /// Locate the byte range of the hot zone in the serialised JSON.
 ///
-/// # Status: stub — always returns `None` until #302 provides the typed offset model.
+/// # Status: stub — returns `None` (passthrough) pending the per-consumer byte-offset
+/// model wired by #306 (KV-cache `cache_control` mutation layer) and #307 (in-place
+/// same-slot byte-shrink). This crate provides the structural view and splice
+/// primitive; the per-element offset arithmetic is a per-consumer responsibility.
 ///
 /// The intended algorithm: find the `"messages"` key in `source` and derive byte
 /// ranges for elements 0..=`last_assistant_index`. The required per-element byte
 /// offsets are not available at this layer — the structural view stores only
 /// structural metadata (`index`, `role`) per turn, NOT `serde_json::Value` clones
-/// and NOT raw buffer offsets. The per-element byte-offset model is a per-consumer
-/// responsibility that lands with #302 (see `request.rs` module doc and the
-/// TODO(#302) at `request.rs:115`).
+/// and NOT raw buffer offsets.
 ///
 /// Returning `None` causes the caller to emit passthrough (fail-open), which is
 /// correct and safe — the hot zone is preserved verbatim by passing all bytes
 /// through unchanged.
 ///
-/// Returns `None` unconditionally (stub). Once the full implementation lands in
-/// #302, will return `None` when any of these conditions hold:
+/// Returns `None` unconditionally (stub). Once a consumer wires the offset model,
+/// will return `None` only when any of these conditions hold:
 ///
 /// - The structural view has no assistant turns (hot zone is empty)
 /// - The `"messages"` key cannot be located at byte level
 /// - Arithmetic overflows (PF-004 checked/saturating ops)
-// TODO(#302): implement locate_hot_zone_range — remove the stub note from the
-// rustdoc above once the typed offset model is available.
+// TODO(#306, #307): wire locate_hot_zone_range — remove stub note once a consumer
+// provides the per-element byte-offset model.
 pub fn locate_hot_zone_range(_source: &[u8], _view: &StructuralView) -> Option<ByteRange> {
-    // Stub: always returns None until #302 provides the typed offset model.
-    // Callers fall back to passthrough, which is safe and correct at this layer.
-    // Precise byte-offset extraction is a per-consumer responsibility (#302).
+    // Stub: always returns None. Passthrough is fail-open and correct.
+    // Per-element byte-offset wiring is deferred to consumers #306 and #307.
     None
 }
 
 /// Apply a set of live-zone slot edits to produce an output buffer.
 ///
-/// # Status: stub — always returns `None` until #302 provides the typed offset model.
+/// # Status: stub — returns `None` (passthrough) pending the per-consumer byte-offset
+/// model wired by #307 (in-place same-slot byte-shrink). This crate defines the
+/// `SlotEdit` type and the splice primitive; the assembly loop that applies edits
+/// using per-turn byte ranges is a per-consumer responsibility.
 ///
-/// The intended algorithm once #302 lands:
-/// 1. Using per-turn byte offsets from the #302 typed model (not available here —
-///    the structural view stores only `index`/`role` metadata, not Value clones or
-///    buffer offsets), locate each slot in `original`.
+/// The intended algorithm once a consumer wires the offset model:
+/// 1. Using per-turn byte offsets (provided by the consumer — not stored here;
+///    the structural view holds only `index`/`role` metadata), locate each slot
+///    in `original`.
 /// 2. For each turn in the live zone, apply any matching `SlotEdit`.
-/// 3. Re-emit hot-zone bytes from the original buffer via `splice_hot_zone`
-///    (using byte offsets from the #302 typed model).
+/// 3. Re-emit hot-zone bytes from the original buffer via `splice_hot_zone`.
 ///
 /// Returns `None` unconditionally (stub). Will return `None` when any invariant
 /// would be violated:
@@ -150,17 +152,15 @@ pub fn locate_hot_zone_range(_source: &[u8], _view: &StructuralView) -> Option<B
 /// - Offset arithmetic overflows
 ///
 /// The caller emits passthrough on `None`, which is correct — no edits applied.
-// TODO(#302): implement apply_live_zone_edits — remove the stub note from the
-// rustdoc above once the typed offset model is available.
+// TODO(#307): implement apply_live_zone_edits — remove stub note once the
+// same-slot byte-shrink consumer wires the per-turn byte-offset model.
 pub fn apply_live_zone_edits(
     _original: &[u8],
     _view: &StructuralView,
     _edits: &[SlotEdit],
 ) -> Option<Vec<u8>> {
-    // Full live-zone edit assembly requires the typed model from #302.
-    // At this layer we return None (→ passthrough) for any attempt to
-    // apply edits, ensuring the invariant is maintained until the full
-    // implementation lands.
+    // Stub: always returns None (→ passthrough). Per-turn byte-offset wiring
+    // and the edit-assembly loop are deferred to consumer #307 (SameSlotShrink).
     None
 }
 
