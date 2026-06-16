@@ -257,6 +257,13 @@ impl<'cfg> Pipeline<'cfg> {
             ast_builder
                 .build()
                 .map_err(|e| anyhow::anyhow!("AST index build failed: {e}"))?;
+            // Write an empty skcache to maintain the "self-pruning, rebuilt from
+            // scratch each build" invariant — without this, a stale skcache from
+            // a prior non-empty build would survive on disk even though no SHAs
+            // in the new (empty) manifest can authorize its entries.
+            AstNgramCache::empty()
+                .save(&self.cache_dir)
+                .map_err(|e| anyhow::anyhow!("AST cache save failed: {e}"))?;
             let mut manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
             manifest.set_git_head(read_git_head(&self.config.root));
             manifest.save()?;
@@ -537,31 +544,42 @@ impl<'cfg> Pipeline<'cfg> {
             // AST index: resolve payload from cache (hit) or derive fresh (miss).
             // The invariant: EVERY file that passes the lexical stage gets exactly
             // ONE `add_file_ngrams` call — hit or miss. NEVER skip. (applies ADR-006)
-            let (ast_set, ast_metrics, ast_node_count) = if let Some(cached) = pf.ast_cached {
-                // Cache hit: reuse persisted n-grams, no tree-sitter pass.
+            //
+            // Ownership strategy (avoids double-clone):
+            //   1. Insert the CachedAstEntry into new_ast_cache by value (one SHA clone).
+            //   2. Borrow the entry back from the map for add_file_ngrams.
+            // This eliminates the cache-hit double-clone and the cache-miss
+            // ngrams.clone() that existed when the entry and the borrow were separate.
+            // `add_file_ngrams` takes &AstNgramSet and StructuralMetrics is Copy,
+            // so a borrow from the map is sufficient. (applies ADR-003)
+            let sha_key = pf.sha256.clone(); // one SHA clone per file — used as cache key
+            if let Some(cached) = pf.ast_cached {
+                // Cache hit: re-insert the owned entry so it survives to the next build.
                 ast_cache_hits = ast_cache_hits.saturating_add(1);
-                // Re-insert into new_ast_cache so the entry survives to the next build.
-                new_ast_cache.insert(pf.sha256.clone(), cached.clone());
-                (cached.ngrams, cached.metrics, cached.node_count)
+                new_ast_cache.insert(sha_key, cached);
             } else {
-                // Cache miss: run the full extraction and record the payload.
+                // Cache miss: run the full extraction and record the owned payload.
                 // Fail-soft: on ANY error, returns an empty aligned entry so AST
                 // FileIds stay in sync with lexical FileIds. NEVER skips.
                 let (ngrams, metrics, node_count) =
                     derive_ast_entry(&pf.content, pf.lang, &pf.rel_path, debug_enabled);
                 ast_reextracted = ast_reextracted.saturating_add(1);
                 // Record in new_ast_cache (including empty entries for data-format
-                // files — cached empty is valid, not corrupt). (avoids PF-005)
+                // files — cached empty is valid, not corrupt). (applies ADR-003)
                 new_ast_cache.insert(
-                    pf.sha256.clone(),
+                    sha_key,
                     CachedAstEntry {
-                        ngrams: ngrams.clone(),
+                        ngrams,
                         metrics,
                         node_count,
                     },
                 );
-                (ngrams, metrics, node_count)
-            };
+            }
+            // Borrow the just-inserted entry back for add_file_ngrams.
+            // SAFETY: we just inserted above; the key is pf.sha256 which we cloned.
+            let entry = new_ast_cache
+                .lookup(&pf.sha256)
+                .expect("just inserted; must be present");
 
             // Add the AST entry for this file. The lexical entry for the SAME
             // FileId was already accepted, so an error here means the indexes are
@@ -574,9 +592,9 @@ impl<'cfg> Pipeline<'cfg> {
             if let Err(e) = ast_builder.add_file_ngrams(
                 FileId(next_file_id),
                 pf.lang,
-                &ast_set,
-                ast_node_count,
-                ast_metrics,
+                &entry.ngrams,
+                entry.node_count,
+                entry.metrics,
             ) {
                 return Err(anyhow::anyhow!(
                     "AST index desync: add_file_ngrams failed for {:?} at FileId {}: {e} \
@@ -641,7 +659,7 @@ impl<'cfg> Pipeline<'cfg> {
 ///
 /// Mtime is stored in the manifest for forward-looking aggressive-mode support
 /// (where mtime mismatch could skip SHA entirely) but is not read here — SHA is
-/// the sole cache authority in safe mode. (avoids PF-005)
+/// the sole cache authority in safe mode. (applies ADR-003)
 ///
 /// Called by the producer thread for each [`WalkEntry`].
 fn read_and_classify(

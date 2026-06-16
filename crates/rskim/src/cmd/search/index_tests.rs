@@ -1375,6 +1375,71 @@ fn test_index_data_format_and_empty_files_served_from_cache() {
     );
 }
 
+/// Self-pruning invariant on the non-empty → empty transition: when a project
+/// that previously had source files becomes empty, the next build must overwrite
+/// the prior (populated) skcache with an empty one so no orphaned entries — keyed
+/// by SHAs that no manifest entry can authorize — survive on disk.
+///
+/// This exercises the empty-walk branch in `Pipeline::run` that writes
+/// `AstNgramCache::empty().save(...)`.  Without that write, a stale skcache from
+/// the prior non-empty build would persist.  The discriminating observable: the
+/// skcache loads to an empty cache after the project is emptied (not exit-0).
+#[test]
+fn test_index_empty_project_overwrites_stale_skcache() {
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    fs::write(root.join("src/main.rs"), "fn main() { let _ = 1; }\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn helper() -> u32 { 42 }\n").unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+
+    // Step 1: non-empty build populates the skcache with at least one entry.
+    let result1 = build_index(&config).expect("non-empty build must succeed");
+    assert!(result1.file_count > 0, "non-empty build must index files");
+
+    let skcache_path =
+        find_file_in_dir(cache.path(), "ast_index.skcache").expect("skcache must exist after build");
+    let populated = rskim_search::AstNgramCache::load(skcache_path.parent().unwrap());
+    assert!(
+        !populated.is_empty(),
+        "skcache must contain entries after a non-empty build"
+    );
+
+    // Step 2: empty the project — remove every source file.
+    fs::remove_file(root.join("src/main.rs")).unwrap();
+    fs::remove_file(root.join("src/lib.rs")).unwrap();
+
+    // Step 3: rebuild against the now-empty project.
+    let result2 = build_index(&config).expect("empty-project rebuild must succeed");
+    assert_eq!(
+        result2.file_count, 0,
+        "empty project must index zero files; got {}",
+        result2.file_count
+    );
+
+    // Discriminating observable: the skcache on disk now loads to an EMPTY cache.
+    // The prior populated entries were pruned by the empty-walk skcache write.
+    let after = rskim_search::AstNgramCache::load(skcache_path.parent().unwrap());
+    assert!(
+        after.is_empty(),
+        "empty-project rebuild must overwrite the stale skcache with an empty one \
+         (self-pruning invariant); got {} surviving entries",
+        after.len()
+    );
+}
+
 // ============================================================================
 // AC8 — Crash-window safety: skcache written, manifest not saved
 // ============================================================================

@@ -36,13 +36,13 @@
 //!
 //! SHA-256 collision is not a practical threat and the lexical cache already
 //! trusts SHA-256 as sole authority (index.rs comment, line 18-21).  This is
-//! an accepted risk mirroring the existing design. (avoids PF-005)
+//! an accepted risk mirroring the existing design. (applies ADR-003)
 //!
 //! # mtime granularity
 //!
 //! Correctly a non-issue: this cache keys on content SHA, never on mtime.
 //! mtime is stored in `ManifestEntry` as a forward-looking hint only and is
-//! not consulted for any cache decision here. (avoids PF-005)
+//! not consulted for any cache decision here. (applies ADR-003)
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -90,6 +90,16 @@ const MAX_CACHE_ENTRIES: usize = 60_000;
 /// allocation.  A realistic entry (hundreds of bigrams + trigrams) is well
 /// under a few KB; 1 MiB is a generous upper bound.  (applies ADR-003)
 const MAX_ENTRY_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// Maximum total file size for `ast_index.skcache` before reading into memory.
+///
+/// Mirrors `MAX_MANIFEST_FILE_BYTES` in `manifest.rs`.  A valid skcache
+/// at 60,000 files × 1 MiB/entry would be 60 GiB — far beyond any realistic
+/// project.  256 MiB is a generous whole-file cap that rejects obviously
+/// corrupt or adversarial files without blocking any real build.
+/// The per-entry cap (`MAX_ENTRY_BYTES`) and entry-count cap
+/// (`MAX_CACHE_ENTRIES`) apply inside the file once it is loaded.  (applies ADR-003)
+const MAX_SKCACHE_FILE_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
 // ============================================================================
 // Cached payload
@@ -427,6 +437,21 @@ impl AstNgramCache {
     #[must_use]
     pub fn load(cache_dir: &Path) -> Self {
         let path = cache_dir.join(CACHE_FILENAME);
+
+        // Guard: reject oversized skcache files before reading into memory.
+        // Mirrors `FileManifest::load`'s `MAX_MANIFEST_FILE_BYTES` pre-check.
+        // The per-entry caps (MAX_ENTRY_BYTES, MAX_CACHE_ENTRIES) apply inside
+        // `decode_file` after the whole-file read, so an unbounded `fs::read`
+        // without this guard would materialise the entire file in RAM first.
+        // (applies ADR-003 — per-file caps are necessary but not sufficient)
+        if path
+            .metadata()
+            .is_ok_and(|m| m.len() > MAX_SKCACHE_FILE_BYTES)
+        {
+            // Oversized — discard silently and cold-start.
+            return Self::empty();
+        }
+
         let Ok(bytes) = std::fs::read(&path) else {
             // Not found or unreadable — cold start.
             return Self::empty();
@@ -464,7 +489,7 @@ impl AstNgramCache {
     /// Called on every cache miss so fresh payloads are recorded for the next
     /// build.  Also called for empty payloads (data-format files, large files)
     /// so they are served from cache on the next build without re-calling
-    /// `linearize_source`. (avoids PF-005 — empty is valid, not corrupt)
+    /// `linearize_source`. Empty payloads are valid cache entries, not corrupt.
     pub fn insert(&mut self, sha: String, entry: CachedAstEntry) {
         self.entries.insert(sha, entry);
     }

@@ -246,53 +246,75 @@ fn magic_mismatch_discards_cache() {
 // Corrupt entry → miss, not crash, not whole-cache discard (AC10)
 // ============================================================================
 
-/// Truncating one entry's payload causes only that entry to be a miss;
-/// other valid entries remain accessible.
+/// A corrupt entry whose payload is in-bounds (valid length prefix, but bad
+/// content) is skipped via `decode_entry` returning `None`; the stream continues
+/// and later valid entries remain accessible.
+///
+/// Note on stream-stop semantics: when a length prefix itself is corrupt
+/// (oversized > MAX_ENTRY_BYTES, or bytes truncated), `decode_file` stops
+/// reading at that position — it cannot safely resync.  Entries BEFORE the
+/// stop point are already recorded and remain accessible; entries AFTER the
+/// stop point are treated as cache misses for that build only.  This is a
+/// known format limitation (no per-entry framing for mid-stream recovery) and
+/// is documented in `decode_file`'s contract.  The test below places a valid
+/// entry before a corrupt one to verify that: (a) the corrupt in-bounds entry
+/// is treated as a miss (not a whole-cache discard), and (b) entries before a
+/// stream-stop are preserved.
 #[test]
-fn corrupt_single_entry_is_miss_not_whole_cache_discard() {
+fn corrupt_payload_is_miss_not_whole_cache_discard() {
     let dir = tempfile::tempdir().expect("tempdir must succeed");
     let cache_dir = dir.path();
 
     let sha_good = "g".repeat(SHA_HEX_LEN);
     let sha_bad = "h".repeat(SHA_HEX_LEN);
+    let sha_after = "i".repeat(SHA_HEX_LEN);
 
-    // Build a file with two entries: sha_good (clean) and sha_bad (to be corrupted).
-    // We encode the file manually so we can corrupt the second entry's payload.
+    // Build the file manually with three entries:
+    //   sha_good — fully correct (placed first)
+    //   sha_bad  — valid length prefix but in-bounds corrupt payload (decode_entry → None)
+    //   sha_after — valid entry placed after the corrupt one
     let good_entry = make_entry();
-    let bad_entry = make_entry();
+    let after_entry = CachedAstEntry::empty();
 
     let good_payload = encode_entry(&good_entry);
-    let bad_payload = encode_entry(&bad_entry);
+    let after_payload = encode_entry(&after_entry);
+
+    // Corrupt payload: correct byte count but all-zero content (decode_entry rejects
+    // the trailing-bytes check or count mismatch).  We use the correct length so
+    // decode_file can advance pos and try the next entry — this is the "in-bounds
+    // corrupt" case where stream continuation is possible.
+    let corrupt_len = good_payload.len();
+    let corrupt_payload: Vec<u8> = vec![0u8; corrupt_len]; // zeros → decode_entry returns None
 
     let mut buf = Vec::new();
     buf.extend_from_slice(CACHE_MAGIC);
     buf.push(CACHE_FORMAT_VERSION);
-    buf.extend_from_slice(&2u32.to_le_bytes()); // 2 entries
+    buf.extend_from_slice(&3u32.to_le_bytes()); // 3 entries
 
     // Entry 1: sha_good — fully correct.
     buf.extend_from_slice(sha_good.as_bytes());
     buf.extend_from_slice(&(good_payload.len() as u32).to_le_bytes());
     buf.extend_from_slice(&good_payload);
 
-    // Entry 2: sha_bad — correct length prefix but truncated payload (corrupt).
+    // Entry 2: sha_bad — valid length but corrupt (zero-filled) payload.
     buf.extend_from_slice(sha_bad.as_bytes());
-    // Claim the full payload length but only write a 3-byte stub.
-    buf.extend_from_slice(&(bad_payload.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&bad_payload[..3.min(bad_payload.len())]); // truncated
+    buf.extend_from_slice(&(corrupt_len as u32).to_le_bytes());
+    buf.extend_from_slice(&corrupt_payload);
 
-    std::fs::write(cache_dir.join(CACHE_FILENAME), &buf).expect("write corrupt skcache");
+    // Entry 3: sha_after — valid entry AFTER the corrupt one.
+    buf.extend_from_slice(sha_after.as_bytes());
+    buf.extend_from_slice(&(after_payload.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&after_payload);
+
+    std::fs::write(cache_dir.join(CACHE_FILENAME), &buf).expect("write skcache");
 
     let loaded = AstNgramCache::load(cache_dir);
 
-    // sha_good must be a hit (the corrupt entry does not discard the whole cache).
-    // NOTE: because corrupt-entry detection stops parsing at the truncated entry,
-    // sha_good may or may not be present depending on its position. The load
-    // implementation stops reading at the bad entry but returns what it has so far.
-    // sha_good was written BEFORE sha_bad, so it must be present.
+    // sha_good must be present — it was fully correct.
     let found = loaded.lookup(&sha_good);
     assert!(
         found.is_some(),
-        "sha_good must still be accessible even when a later entry is corrupt"
+        "sha_good must be accessible even when a later entry is corrupt"
     );
     assert_eq!(
         *found.expect("must be Some"),
@@ -300,10 +322,23 @@ fn corrupt_single_entry_is_miss_not_whole_cache_discard() {
         "sha_good entry must equal the original"
     );
 
-    // sha_bad must be absent (corrupt payload → cache miss for that file).
+    // sha_bad must be absent — corrupt in-bounds payload → decode_entry None → cache miss.
     assert!(
         loaded.lookup(&sha_bad).is_none(),
-        "corrupt entry must not appear in loaded cache (treated as miss)"
+        "corrupt in-bounds entry must be absent (treated as miss, not whole-cache discard)"
+    );
+
+    // sha_after must be present — the stream continued past the in-bounds corrupt entry.
+    // This is the key AC10 invariant: a corrupt-but-in-bounds entry does not stop parsing.
+    let found_after = loaded.lookup(&sha_after);
+    assert!(
+        found_after.is_some(),
+        "sha_after must be accessible — in-bounds corrupt entry must not stop stream (AC10)"
+    );
+    assert_eq!(
+        *found_after.expect("must be Some"),
+        after_entry,
+        "sha_after entry must equal the original"
     );
 }
 

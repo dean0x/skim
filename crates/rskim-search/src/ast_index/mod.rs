@@ -53,7 +53,7 @@ pub(crate) mod structural;
 pub type NodeKindId = u16;
 
 pub use ast_cache::{
-    AstNgramCache, CACHE_FORMAT_VERSION as AST_CACHE_FORMAT_VERSION, CachedAstEntry,
+    AstNgramCache, CACHE_FILENAME, CACHE_FORMAT_VERSION as AST_CACHE_FORMAT_VERSION, CachedAstEntry,
 };
 pub use extract::{
     AstBigramEntry, AstNgramSet, AstTrigramEntry, extract_ast_ngrams,
