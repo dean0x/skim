@@ -52,5 +52,5 @@ required-features = ["harness"]
 # existing gate. AC20's CI gate is the conformance harness + clippy step, not
 # this bench (see benches/contract_throughput.rs header comment).
 [[bench]]
-name = "contract_throughput"
+name = "contract_throughput_bench"
 harness = false

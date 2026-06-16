@@ -129,10 +129,9 @@
 
 #![deny(missing_docs)]
 
-use thiserror::Error;
-
 pub mod canonical;
 pub mod contract;
+pub mod error;
 pub mod extension;
 pub mod guardrail;
 pub mod log;
@@ -144,6 +143,7 @@ pub mod zone;
 pub mod harness;
 
 pub use contract::{Contract, Outcome};
+pub use error::ContractError;
 pub use log::{ChannelDecisionSink, DecisionRecord, DecisionSink, SinkFull};
 
 /// Crate-level `Result` alias for construction/configuration errors.
@@ -151,22 +151,3 @@ pub use log::{ChannelDecisionSink, DecisionRecord, DecisionSink, SinkFull};
 /// `Result` appears only at construction boundaries and in harness assertion
 /// APIs. The transform path itself is infallible (`Outcome`, no `Result`).
 pub type Result<T> = std::result::Result<T, ContractError>;
-
-/// Errors that can occur during construction or configuration.
-///
-/// `ContractError` is the only error type visible to callers. The transform
-/// path (`Contract::transform`) never returns an error — it returns `Outcome`,
-/// where passthrough is a success variant.
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum ContractError {
-    /// The request body is structurally invalid JSON.
-    ///
-    /// The caller should fall back to passing the body through unmodified.
-    #[error("invalid JSON in request body: {0}")]
-    InvalidJson(#[from] serde_json::Error),
-
-    /// A configuration value is out of range or otherwise invalid.
-    #[error("invalid configuration: {0}")]
-    InvalidConfig(String),
-}
