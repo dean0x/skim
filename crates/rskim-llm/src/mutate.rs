@@ -88,15 +88,16 @@ fn mutate_anthropic(body: &mut AnthropicBody, block_id: &str, new_text: &str) ->
     let leaf = match found_leaf {
         Some(l) => l,
         None => {
-            // Block not in mutable set — check whether it exists at all (as an
-            // exempt block) to distinguish BlockNotMutable from BlockNotFound.
-            // We do a single pass over list_anthropic_blocks rather than a second
-            // walk_leaves pass, because exempt blocks are not visited by walk_leaves.
-            let descriptor = list_anthropic_blocks(body)
-                .into_iter()
-                .find(|d| d.id == block_id);
-            return match descriptor {
-                Some(d) => Err(LlmError::BlockNotMutable(block_id.to_string(), d.kind)),
+            // Block not in mutable set — check whether it exists as an exempt block
+            // to distinguish BlockNotMutable from BlockNotFound.
+            // `exempt_block_kind` is a zero-alloc-per-leaf scan over exempt blocks only
+            // (ToolUse, Thinking, Unknown, non-text ToolResultLeaf).  It avoids the
+            // O(B) `list_anthropic_blocks` call (which calls `walk_leaves` again plus
+            // Phase-2 with a `format!`-allocated id per leaf).  The mutable set was
+            // already scanned above with zero-alloc `id_eq`; we only need the exempt
+            // pass here.
+            return match exempt_block_kind(body, block_id) {
+                Some(kind) => Err(LlmError::BlockNotMutable(block_id.to_string(), kind)),
                 None => Err(LlmError::BlockNotFound(block_id.to_string())),
             };
         }
@@ -154,20 +155,34 @@ fn apply_leaf_mutation(body: &mut AnthropicBody, leaf: &LeafRef, new_text: &str)
         body.messages.len()
     );
 
+    // `payload_slot_mut` navigates the typed model to the mutable `&mut String` named
+    // by `leaf`, collapsing all structural-mismatch arms to one `NoTextPayload` site
+    // (ADR-001).  The LeafRef was produced by `walk_leaves`, so a mismatch here can
+    // only be caused by a code bug, not by untrusted input.
+    let slot = payload_slot_mut(body, leaf)?;
+    *slot = new_text.to_string();
+    Ok(())
+}
+
+/// Navigate `body` to the mutable `&mut String` named by `leaf`.
+///
+/// Returns `Err(LlmError::NoTextPayload)` if the structural path does not match
+/// the expected shape for `leaf`.  Because every `LeafRef` is produced by
+/// `walk_leaves` over the same body, a mismatch here indicates a code bug
+/// (e.g., a concurrent structural mutation between the walk and this call),
+/// not untrusted input.
+///
+/// Extracts the 4-level nested match / multi-site `NoTextPayload` duplication from
+/// `apply_leaf_mutation` into a single helper with one error site per arm (ADR-001).
+fn payload_slot_mut<'b>(body: &'b mut AnthropicBody, leaf: &LeafRef) -> Result<&'b mut String> {
     match leaf {
         LeafRef::MessageString { msg_idx } => match &mut body.messages[*msg_idx].content {
-            AnthropicContent::Text(s) => {
-                *s = new_text.to_string();
-                Ok(())
-            }
+            AnthropicContent::Text(s) => Ok(s),
             _ => Err(LlmError::NoTextPayload(leaf.id())),
         },
         LeafRef::TextBlock { msg_idx, blk_idx } => match &mut body.messages[*msg_idx].content {
             AnthropicContent::Blocks(blocks) => match &mut blocks[*blk_idx] {
-                AnthropicBlock::Text(tb) => {
-                    tb.text = new_text.to_string();
-                    Ok(())
-                }
+                AnthropicBlock::Text(tb) => Ok(&mut tb.text),
                 _ => Err(LlmError::NoTextPayload(leaf.id())),
             },
             _ => Err(LlmError::NoTextPayload(leaf.id())),
@@ -176,10 +191,7 @@ fn apply_leaf_mutation(body: &mut AnthropicBody, leaf: &LeafRef, new_text: &str)
             match &mut body.messages[*msg_idx].content {
                 AnthropicContent::Blocks(blocks) => match &mut blocks[*blk_idx] {
                     AnthropicBlock::ToolResult(tr) => match &mut tr.content {
-                        Some(ToolResultContent::Text(s)) => {
-                            *s = new_text.to_string();
-                            Ok(())
-                        }
+                        Some(ToolResultContent::Text(s)) => Ok(s),
                         _ => Err(LlmError::NoTextPayload(leaf.id())),
                     },
                     _ => Err(LlmError::NoTextPayload(leaf.id())),
@@ -196,11 +208,11 @@ fn apply_leaf_mutation(body: &mut AnthropicBody, leaf: &LeafRef, new_text: &str)
                 AnthropicBlock::ToolResult(tr) => match &mut tr.content {
                     Some(ToolResultContent::Blocks(leaves)) => {
                         let leaf_block = &mut leaves[*leaf_idx];
-                        if leaf_block.text.is_none() {
-                            return Err(LlmError::NoTextPayload(leaf.id()));
-                        }
-                        leaf_block.text = Some(new_text.to_string());
-                        Ok(())
+                        // `text` is `Option<String>`: None means no text payload.
+                        leaf_block
+                            .text
+                            .as_mut()
+                            .ok_or_else(|| LlmError::NoTextPayload(leaf.id()))
                     }
                     _ => Err(LlmError::NoTextPayload(leaf.id())),
                 },
@@ -257,6 +269,61 @@ pub fn list_blocks(body: &ParsedBody) -> Vec<BlockDescriptor> {
         // OpenAI mutation is not yet implemented — follow-up tracked as #332.
         ParsedBody::OpenAi(_) => vec![],
     }
+}
+
+/// Return the `kind` string for an exempt (non-mutable) block matching `block_id`,
+/// or `None` if no exempt block has that ID.
+///
+/// This is the zero-alloc fast path for the error branch of `mutate_anthropic`:
+/// rather than calling `list_anthropic_blocks` (which re-walks mutable leaves via
+/// `walk_leaves` AND allocates a `format!` id per leaf in Phase 2), we iterate only
+/// the exempt block positions (ToolUse, Thinking, Unknown, non-text ToolResultLeaf)
+/// and compare against `block_id` using `format!` only at the point of a match.
+///
+/// This is Phase 2 of `list_anthropic_blocks` extracted as a targeted lookup:
+/// O(B) iteration but no per-leaf allocation until a match is found (and matches
+/// are expected to be rare — this is the error path).
+fn exempt_block_kind(body: &AnthropicBody, block_id: &str) -> Option<String> {
+    for (mi, msg) in body.messages.iter().enumerate() {
+        if let AnthropicContent::Blocks(blocks) = &msg.content {
+            for (bi, block) in blocks.iter().enumerate() {
+                match block {
+                    AnthropicBlock::ToolUse(_) => {
+                        if format!("m{mi}b{bi}") == block_id {
+                            return Some("tool_use".to_string());
+                        }
+                    }
+                    AnthropicBlock::Thinking(_) => {
+                        if format!("m{mi}b{bi}") == block_id {
+                            return Some("thinking".to_string());
+                        }
+                    }
+                    AnthropicBlock::Unknown(_) => {
+                        if format!("m{mi}b{bi}") == block_id {
+                            return Some("unknown".to_string());
+                        }
+                    }
+                    AnthropicBlock::ToolResult(tr) => {
+                        if let Some(ToolResultContent::Blocks(leaves)) = &tr.content {
+                            for (li, leaf) in leaves.iter().enumerate() {
+                                if !(leaf.block_type == "text" && leaf.text.is_some())
+                                    && format!("m{mi}b{bi}l{li}") == block_id
+                                {
+                                    return Some(format!(
+                                        "tool_result-leaf-{}",
+                                        leaf.block_type
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    // Text and MessageString are mutable — handled by walk_leaves, not here.
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Build a descriptor list for all leaves in the body (mutable and exempt).
