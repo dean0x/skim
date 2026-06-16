@@ -576,10 +576,13 @@ fn test_rebuild_temporal_blast_radius_partner() {
     );
 }
 
-/// AC13 — 90-day lookback: changes_90d reflects only in-window commits.
+/// AC13 — window bucketing: a single full-history walk's commits are bucketed
+/// into the 30d/90d windows by timestamp. This is NOT a 90-day walk *cutoff* —
+/// the walk covers all history; windowing happens downstream (see the
+/// implementation note below).
 ///
-/// Two recent commits (within 90d) and two old commits (set via commit date
-/// manipulation — we use the git committer date env var).
+/// Two recent commits (within the windows) and two old commits (set via commit
+/// date manipulation — we use the git committer date env var).
 /// Discriminating: changes_90d == 2 (only in-window), not 4.
 ///
 /// # Implementation note (Decision O-B)
@@ -596,7 +599,7 @@ fn test_rebuild_temporal_blast_radius_partner() {
 /// guard.  Now the single walk feeds all computation, so the test correctly
 /// exercises the full data path.
 #[test]
-fn test_rebuild_temporal_90d_cutoff() {
+fn test_rebuild_temporal_window_bucketing() {
     let dir = tempdir().unwrap();
     let cache_dir = dir.path().join("cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
