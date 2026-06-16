@@ -145,7 +145,10 @@ impl AnthropicNetworkCounter {
     }
 
     fn with_endpoint(model_id: &str, api_key: String, endpoint: &'static str) -> Self {
-        let agent = ureq::AgentBuilder::new().timeout(REQUEST_TIMEOUT).build();
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(REQUEST_TIMEOUT))
+            .build()
+            .into();
         Self {
             model: model_id.to_owned(),
             agent,
@@ -166,9 +169,10 @@ impl AnthropicNetworkCounter {
     /// published API surface.
     #[doc(hidden)]
     pub fn new_for_test(model_id: &str, api_key: &str, endpoint: &'static str) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_millis(500))
-            .build();
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_millis(500)))
+            .build()
+            .into();
         Self {
             model: model_id.to_owned(),
             agent,
@@ -215,14 +219,14 @@ impl AnthropicNetworkCounter {
             let result = self
                 .agent
                 .post(self.endpoint)
-                .set("x-api-key", &self.api_key)
-                .set("anthropic-version", ANTHROPIC_VERSION)
-                .set("content-type", "application/json")
-                .send_string(&body_str);
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("content-type", "application/json")
+                .send(&body_str);
 
             match result {
                 Ok(response) => return parse_count_response(response),
-                Err(ureq::Error::Status(code, _)) if (400..500).contains(&code) && code != 429 => {
+                Err(ureq::Error::StatusCode(code)) if (400..500).contains(&code) && code != 429 => {
                     // Permanent 4xx client error (e.g. 401 invalid key, 400 bad request,
                     // 403 forbidden, 413 payload too large). Do NOT retry — the error is
                     // non-transient and retrying only burns latency and request quota.
@@ -253,13 +257,18 @@ impl AnthropicNetworkCounter {
 ///
 /// - [`TokenError::ApiResponse`] — body read error, invalid JSON, or missing
 ///   `input_tokens` field.
-fn parse_count_response(response: ureq::Response) -> Result<usize> {
+fn parse_count_response(response: ureq::http::Response<ureq::Body>) -> Result<usize> {
     // Read with a bounded reader to guard against unbounded allocation
     // from a buggy or hostile server (reliability: every resource bounded).
-    let reader = response.into_reader();
+    // ureq 3.x: body is extracted via into_body(); limit() caps allocation
+    // before any bytes are read, equivalent to the ureq 2.x .take() pattern.
+    let mut reader = response
+        .into_body()
+        .into_with_config()
+        .limit(MAX_BODY_BYTES)
+        .reader();
     let mut raw = Vec::new();
     reader
-        .take(MAX_BODY_BYTES)
         .read_to_end(&mut raw)
         .map_err(|e| TokenError::ApiResponse(format!("response read error: {e}")))?;
 
