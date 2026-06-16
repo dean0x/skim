@@ -109,8 +109,8 @@ pub(super) fn resolve_ast_scored(
     engine: &AstQueryEngine<AstIndexReader>,
     raw: &str,
 ) -> anyhow::Result<Vec<(FileId, f64)>> {
-    let query = parse_ast_query(raw.trim())
-        .map_err(|e| anyhow::anyhow!("invalid AST pattern: {e}"))?;
+    let query =
+        parse_ast_query(raw.trim()).map_err(|e| anyhow::anyhow!("invalid AST pattern: {e}"))?;
     let hits = engine
         .search_ast(&query)
         .map_err(|e| anyhow::anyhow!("AST query failed: {e}"))?;

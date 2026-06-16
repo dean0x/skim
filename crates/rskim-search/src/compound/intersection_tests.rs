@@ -459,7 +459,10 @@ fn ac9_nan_safe_all_equal_scores() {
         "AC9: all 3 files must appear (all in both layers)"
     );
     for &(_, score) in &ranked_1 {
-        assert!(score.is_finite(), "AC9: score must be finite (is_finite implies not NaN)");
+        assert!(
+            score.is_finite(),
+            "AC9: score must be finite (is_finite implies not NaN)"
+        );
     }
     // Determinism: two invocations with identical inputs must produce identical output.
     assert_eq!(
@@ -482,7 +485,10 @@ fn ac9_nan_safe_single_element_layer() {
         "AC9: single-file intersection must have 1 result"
     );
     let (_, score) = ranked[0];
-    assert!(score.is_finite(), "AC9: score must be finite (is_finite implies not NaN)");
+    assert!(
+        score.is_finite(),
+        "AC9: score must be finite (is_finite implies not NaN)"
+    );
 
     // Verify the score matches the expected RRF formula (both rank-1):
     // score = WEIGHT_LEXICAL / (RRF_K + 1) + WEIGHT_AST / (RRF_K + 1)
