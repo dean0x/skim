@@ -50,7 +50,7 @@ fn make_config(root: &std::path::Path, cache_dir: &std::path::Path, text: &str) 
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
         blast_radius_paths: None,
-        ast_file_ids: None,
+        ast_scored: None,
     }
 }
 
@@ -380,7 +380,7 @@ fn test_execute_query_blast_radius_includes_only_allowed_paths() {
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
         blast_radius_paths: Some(allowed),
-        ast_file_ids: None,
+        ast_scored: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -421,7 +421,7 @@ fn test_execute_query_blast_radius_target_file_is_included() {
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
         blast_radius_paths: Some(allowed),
-        ast_file_ids: None,
+        ast_scored: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();

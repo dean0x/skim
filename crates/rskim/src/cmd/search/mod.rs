@@ -586,18 +586,21 @@ fn run_query(
     //
     // Missing index (after refresh) → fail loud (return Err, #199).
     // Query execution failure → degrade gracefully (warn, no AST filter).
-    let (ast_file_ids, pre_loaded_manifest) = if let Some(ref raw_ast) = flags.ast {
+    let (ast_scored, pre_loaded_manifest) = if let Some(ref raw_ast) = flags.ast {
         // Self-heal: rebuild both indexes if the AST index is absent or stale.
         // Returns the manifest so execute_query skips a redundant refresh+load.
         let (_refreshed, manifest) =
             staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
         let engine = ast::open_ast_engine(&cache_dir)?;
-        let ids = match ast::resolve_ast_file_filter(&engine, raw_ast) {
-            Ok(ids) => {
-                if ids.is_empty() {
+        // Changed from #199 (lossy HashSet) to #198 (scored vec for RRF).
+        // resolve_ast_scored returns Vec<(FileId, f64)> sorted FileId-ASC,
+        // preserving AST scores so intersect_and_rank can build the rank map.
+        let ast_scored = match ast::resolve_ast_scored(&engine, raw_ast) {
+            Ok(hits) => {
+                if hits.is_empty() {
                     eprintln!("skim search: --ast {:?} matched no indexed files", raw_ast);
                 }
-                Some(ids)
+                Some(hits)
             }
             Err(e) => {
                 // Query execution failure: degrade gracefully (warn, no AST filter).
@@ -607,7 +610,7 @@ fn run_query(
                 None
             }
         };
-        (ids, Some(manifest))
+        (ast_scored, Some(manifest))
     } else {
         // Pure-lexical path: no --ast flag. execute_query will call
         // auto_refresh_if_stale itself exactly once.
@@ -621,7 +624,7 @@ fn run_query(
         root,
         cache_dir,
         blast_radius_paths,
-        ast_file_ids,
+        ast_scored,
     };
 
     // Pass the already-refreshed manifest (text+--ast path) or None (pure-lexical
