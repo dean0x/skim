@@ -189,6 +189,33 @@ fn redact_url_credentials(value: &str) -> String {
 }
 
 // ============================================================================
+// Test-only accessors for cross-crate consistency checks
+// ============================================================================
+
+/// Return the exact sensitive key names list for cross-crate consistency tests.
+///
+/// Only available under `#[cfg(test)]`. Integration tests in `crates/rskim/tests/`
+/// use this to assert that `rskim_contract::log::SENSITIVE_EXACT` is a superset
+/// of this list, detecting silent desync between the two scrub-list copies.
+///
+/// The function is `#[doc(hidden)]` because it is not part of the public API;
+/// the binary has no `pub` API surface — this accessor exists only for testing.
+#[cfg(test)]
+#[doc(hidden)]
+pub fn env_sensitive_exact_for_test() -> &'static [&'static str] {
+    SENSITIVE_EXACT
+}
+
+/// Return the sensitive key suffixes list for cross-crate consistency tests.
+///
+/// Companion to [`env_sensitive_exact_for_test`] — same rationale.
+#[cfg(test)]
+#[doc(hidden)]
+pub fn env_sensitive_suffixes_for_test() -> &'static [&'static str] {
+    SENSITIVE_SUFFIXES
+}
+
+// ============================================================================
 // Unit tests
 // ============================================================================
 

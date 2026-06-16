@@ -55,3 +55,4 @@ predicates = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
 filetime = { workspace = true }
+rskim-contract = { path = "../rskim-contract" }

@@ -2406,6 +2406,7 @@ dependencies = [
  "quick-xml",
  "rayon",
  "regex",
+ "rskim-contract",
  "rskim-core",
  "rskim-search",
  "rskim-tokens",
