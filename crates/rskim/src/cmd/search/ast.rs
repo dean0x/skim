@@ -4,7 +4,7 @@
 //!
 //! - Open the AST query engine with a clear error when the index is absent (#199).
 //! - Validate the raw pattern string at the CLI boundary (before opening the index).
-//! - Resolve a `--ast` pattern to a `HashSet<FileId>` for intersection filtering.
+//! - Resolve a `--ast` pattern to scored `Vec<(FileId, f64)>` for compound RRF ranking (#198).
 //! - Standalone AST query dispatch (`--ast` only, no text query).
 //! - Output formatters: text and JSON for AST-only results.
 //!

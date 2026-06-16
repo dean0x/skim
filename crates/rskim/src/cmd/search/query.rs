@@ -116,74 +116,34 @@ pub(super) fn execute_query_with_manifest(
     //   1. Fetch a WIDER lexical candidate pool (limit * CANDIDATE_POOL_K) so
     //      files that rank lower in pure-lexical order but higher in composite
     //      order are not truncated before the blend sees them.
-    //      (Mirrors temporal.rs:420 window logic — same constant K=4.)
+    //      temporal.rs uses limit.saturating_mul(5) with a .max(100) floor;
+    //      the compound path uses K=4 (no floor) — a deliberately lighter pool
+    //      because the intersection gate already narrows the candidate set.
     //   2. Optionally restrict lexical candidates by blast-radius (if set).
-    //   3. Run intersect_and_rank: linear merge-join + weighted RRF fusion.
+    //   3. Run intersect_and_rank: HashMap join + weighted RRF fusion.
     //   4. Recompose: carry the lexical SearchResult (snippet + line_range)
     //      with the composite RRF score replacing the raw lexical score (AC11).
     //   5. Truncate to --limit LAST (rank-then-truncate-LAST invariant).
     //
-    // The AST index does not expose an AstIndexReader here (that reader lives in
-    // mod.rs / ast.rs), so structural metrics are injected as a no-op lookup for
-    // now (pure depth-based refinement requires the AstIndexReader to be threaded
-    // through; that is a follow-up in the same ticket — the compound fn already
-    // accepts the injected closure and honours it when non-None).
-    // DEFERRED: threading AstIndexReader into execute_query_with_manifest for
-    // structural metrics.  For 4a the structural lookup is a no-op; the RRF
-    // fusion of lexical+AST rank alone replaces the file_filter gate (#198).
+    // Structural refinement (depth-based via AstIndexReader) is not yet threaded
+    // through the CLI layer — the AstIndexReader is opened in mod.rs and dropped
+    // before execute_query_with_manifest is called.  Wiring it through is tracked
+    // in #290 (thread AstIndexReader / pre-fetched FileId→StructuralMetrics map
+    // into QueryConfig / execute_query_with_manifest to close this seam).
+    // For 4a the structural lookup is a no-op; the RRF fusion of lexical+AST rank
+    // alone replaces the old file_filter gate (#198).
     if let Some(ref ast_scored_vec) = config.ast_scored {
-        // Wider lexical pool before compound ranking.
-        const CANDIDATE_POOL_K: usize = 4;
-        let mut sq = SearchQuery::new(config.text.clone());
-        // saturating_mul: a hostile `--limit` near usize::MAX must not overflow
-        // (debug panic / release wraparound). Mirrors temporal.rs:420's
-        // `limit.saturating_mul(5)` window-widening pattern.
-        sq.limit = Some(config.limit.saturating_mul(CANDIDATE_POOL_K));
-
-        // Apply blast-radius pre-filter when present (blast ∩ AST path).
-        if let Some(ref blast) = blast_file_ids {
-            // Intersection of blast-radius set with AST FileId set.
-            let intersection: std::collections::HashSet<rskim_search::FileId> = blast
-                .iter()
-                .filter(|id| ast_scored_vec.iter().any(|(fid, _)| fid == *id))
-                .copied()
-                .collect();
-            sq.file_filter = Some(intersection);
-        }
-        // (No else: without blast-radius, no lexical file_filter — the compound
-        // intersection acts as the filter, not the lexical engine's file_filter.)
-
-        let raw_lex = engine.search(&sq)?;
-
-        // Compound intersect + RRF fusion (pure, no I/O, closures only).
-        // Structural lookup: no-op for 4a (AstIndexReader not threaded here).
-        let no_metrics =
-            |_fid: rskim_search::FileId| -> Option<rskim_search::StructuralMetrics> { None };
-        let ranked = intersect_and_rank(
-            &raw_lex,
+        return run_compound_query(
+            config,
             ast_scored_vec,
-            no_metrics,
-            0.0_f32, // avg_max_depth — no-op when structural lookup is None
-            CompositeWeights::default(),
+            blast_file_ids,
+            &engine,
+            &sorted,
+            root,
+            &manifest,
+            stats,
+            start,
         );
-
-        // Recompose: carry lexical SearchResult (snippet + line_range), replace score.
-        // Truncate to --limit LAST (rank-then-truncate-LAST invariant, Amendment).
-        let recomposed: Vec<rskim_search::SearchResult> = recompose_with_lexical(&ranked, &raw_lex)
-            .into_iter()
-            .take(config.limit)
-            .collect();
-
-        let results = resolve_paths_and_snippets(&recomposed, &sorted, root, &manifest);
-        let total = results.len();
-        let duration_ms = start.elapsed().as_millis() as u64;
-        return Ok(QueryOutput {
-            query: config.text.clone(),
-            total,
-            results,
-            duration_ms,
-            index_stats: Some(stats),
-        });
     }
     // ── End compound text+AST path ────────────────────────────────────────────
 
@@ -205,6 +165,89 @@ pub(super) fn execute_query_with_manifest(
     let total = results.len();
     let duration_ms = start.elapsed().as_millis() as u64;
 
+    Ok(QueryOutput {
+        query: config.text.clone(),
+        total,
+        results,
+        duration_ms,
+        index_stats: Some(stats),
+    })
+}
+
+/// Execute the compound text+AST query branch (#198).
+///
+/// Fetches a wider lexical candidate pool, applies an optional blast-radius
+/// pre-filter, runs `intersect_and_rank` (HashMap join + weighted RRF fusion),
+/// recomposes the results with lexical snippets, and returns a [`QueryOutput`].
+///
+/// Extracted from [`execute_query_with_manifest`] to give each path a
+/// single-responsibility scope and eliminate the duplicated `QueryOutput`
+/// construction tail.
+///
+/// # Errors
+///
+/// Returns `Err` when the lexical engine search fails.
+#[allow(clippy::too_many_arguments)]
+fn run_compound_query(
+    config: &super::types::QueryConfig,
+    ast_scored_vec: &[(rskim_search::FileId, f64)],
+    blast_file_ids: Option<std::collections::HashSet<rskim_search::FileId>>,
+    engine: &QueryEngine,
+    sorted: &[&str],
+    root: &Path,
+    manifest: &FileManifest,
+    stats: rskim_search::IndexStats,
+    start: Instant,
+) -> anyhow::Result<QueryOutput> {
+    // Wider lexical pool before compound ranking.
+    // K=4: lighter than temporal.rs (K=5 with .max(100) floor) because the
+    // intersection gate already narrows candidates — no floor needed.
+    const CANDIDATE_POOL_K: usize = 4;
+    let mut sq = SearchQuery::new(config.text.clone());
+    // saturating_mul: a hostile `--limit` near usize::MAX must not overflow.
+    sq.limit = Some(config.limit.saturating_mul(CANDIDATE_POOL_K));
+
+    // Apply blast-radius pre-filter when present (blast ∩ AST path).
+    // Build a HashSet of AST FileIds once for O(1) membership tests — avoids
+    // the O(blast × ast) nested scan that a linear .any() scan would produce.
+    if let Some(ref blast) = blast_file_ids {
+        let ast_fid_set: std::collections::HashSet<rskim_search::FileId> =
+            ast_scored_vec.iter().map(|&(fid, _)| fid).collect();
+        let intersection: std::collections::HashSet<rskim_search::FileId> = blast
+            .iter()
+            .filter(|id| ast_fid_set.contains(*id))
+            .copied()
+            .collect();
+        sq.file_filter = Some(intersection);
+    }
+    // (No else: without blast-radius, no lexical file_filter — the compound
+    // intersection acts as the filter, not the lexical engine's file_filter.)
+
+    let raw_lex = engine.search(&sq)?;
+
+    // Compound intersect + RRF fusion (pure, no I/O, closures only).
+    // Structural lookup is a no-op until #290 threads AstIndexReader through
+    // QueryConfig, at which point this closure is replaced with a real lookup.
+    let no_metrics =
+        |_fid: rskim_search::FileId| -> Option<rskim_search::StructuralMetrics> { None };
+    let ranked = intersect_and_rank(
+        &raw_lex,
+        ast_scored_vec,
+        no_metrics,
+        0.0_f32, // avg_max_depth — placeholder until #290
+        CompositeWeights::default(),
+    );
+
+    // Recompose: carry lexical SearchResult (snippet + line_range), replace score.
+    // Truncate to --limit LAST (rank-then-truncate-LAST invariant, Amendment).
+    let recomposed: Vec<rskim_search::SearchResult> = recompose_with_lexical(&ranked, &raw_lex)
+        .into_iter()
+        .take(config.limit)
+        .collect();
+
+    let results = resolve_paths_and_snippets(&recomposed, sorted, root, manifest);
+    let total = results.len();
+    let duration_ms = start.elapsed().as_millis() as u64;
     Ok(QueryOutput {
         query: config.text.clone(),
         total,

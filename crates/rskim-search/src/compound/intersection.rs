@@ -2,8 +2,10 @@
 //!
 //! # Algorithm (Wave 4a, #198)
 //!
-//! 1. **Intersect** lexical and AST results by `FileId` via a linear merge-join.
-//!    Both layers emit FileId-ASC (by contract) so the join is O(n+m).
+//! 1. **Intersect** lexical and AST results by `FileId` via HashMap-based join.
+//!    The lexical layer is indexed into a `HashMap<FileId, rank>` (O(n)); the AST
+//!    layer (arriving FileId-ASC by contract) is iterated once with O(1) lookup
+//!    per entry, for O(n+m) overall.
 //! 2. **Fuse** via weighted Reciprocal Rank Fusion (RRF):
 //!    `score(d) = Σᵢ wᵢ / (RRF_K + rankᵢ(d))`
 //!    where `rankᵢ(d)` is d's 1-based position in layer i's DESC-sorted list
@@ -146,6 +148,27 @@ pub fn intersect_and_rank(
         return vec![];
     }
 
+    // Enforce input contracts with debug assertions so callers catch violations
+    // early in development without paying in release builds.
+    // Contract 1: AST list must be unique FileIds.
+    debug_assert!(
+        {
+            let mut seen = std::collections::HashSet::new();
+            ast_scored.iter().all(|(fid, _)| seen.insert(*fid))
+        },
+        "intersect_and_rank: ast_scored must contain unique FileIds"
+    );
+    // Contract 2: AST list must be sorted FileId-ASC.
+    debug_assert!(
+        ast_scored.windows(2).all(|w| w[0].0 <= w[1].0),
+        "intersect_and_rank: ast_scored must be sorted FileId-ASC"
+    );
+    // Contract 3: All AST scores must be > 0.
+    debug_assert!(
+        ast_scored.iter().all(|(_, s)| *s > 0.0),
+        "intersect_and_rank: all ast_scored scores must be > 0"
+    );
+
     // --- Step 1: build rank maps from each layer ---
 
     // Lexical rank map: FileId → 1-based rank position in DESC-score order.
@@ -169,45 +192,47 @@ pub fn intersect_and_rank(
     // depth as the primary sort key and ast_score as tiebreaker achieves this
     // without arbitrary thresholds (ADR-003).
     // PF-004: widen u16→u32→f64 BEFORE any arithmetic.
+    //
+    // Decorate-sort-undecorate: precompute depth key once per entry (O(m) closure
+    // calls), then sort on the precomputed key.  Calling `structural_lookup`
+    // inside `sort_unstable_by` would invoke it O(m log m) times — 2× per
+    // comparison — which wastes work and causes quadratic behaviour for non-trivial
+    // lookups once AstIndexReader is threaded in (#290).
     let avg_depth_f64 = f64::from(avg_max_depth);
-    let mut ast_ranked: Vec<(FileId, f64)> = ast_scored.to_vec();
 
-    // Sort AST candidates DESC by (structural depth key, ast_score) for rank assignment.
-    ast_ranked.sort_unstable_by(|&(a_fid, a_score), &(b_fid, b_score)| {
-        let a_depth = structural_lookup(a_fid)
-            .map(|m| f64::from(u32::from(m.max_depth)))
-            .unwrap_or(0.0);
-        let b_depth = structural_lookup(b_fid)
-            .map(|m| f64::from(u32::from(m.max_depth)))
-            .unwrap_or(0.0);
-        let a_key = a_depth / (1.0 + avg_depth_f64);
-        let b_key = b_depth / (1.0 + avg_depth_f64);
-        // Descending: higher key = lower rank number = better position.
-        b_key
-            .partial_cmp(&a_key)
+    // Decorated: (depth_key, ast_score, FileId) for sort.  We keep ast_score
+    // in the tuple so the tiebreaker has access to it without a second lookup.
+    let mut ast_decorated: Vec<(f64, f64, FileId)> = ast_scored
+        .iter()
+        .map(|&(fid, score)| {
+            let depth = structural_lookup(fid)
+                .map(|m| f64::from(u32::from(m.max_depth)))
+                .unwrap_or(0.0);
+            let key = depth / (1.0 + avg_depth_f64);
+            (key, score, fid)
+        })
+        .collect();
+
+    // Sort DESC by (depth_key, ast_score); FileId-ASC as deterministic tiebreaker.
+    ast_decorated.sort_unstable_by(|&(ak, as_, af), &(bk, bs, bf)| {
+        bk.partial_cmp(&ak)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                b_score
-                    .partial_cmp(&a_score)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
-            // Tiebreaker: FileId-ASC for determinism.
-            .then(a_fid.0.cmp(&b_fid.0))
+            .then(bs.partial_cmp(&as_).unwrap_or(std::cmp::Ordering::Equal))
+            .then(af.0.cmp(&bf.0))
     });
 
     // AST rank map: FileId → 1-based rank (after structural refinement).
-    let ast_rank: HashMap<FileId, usize> = ast_ranked
+    let ast_rank: HashMap<FileId, usize> = ast_decorated
         .iter()
         .enumerate()
-        .map(|(i, &(fid, _))| (fid, i + 1))
+        .map(|(i, &(_, _, fid))| (fid, i + 1))
         .collect();
 
-    // --- Step 2: linear merge-join on FileId-ASC to build intersection ---
+    // --- Step 2: HashMap-based intersection ---
     //
-    // Both `ast_scored` arrives FileId-ASC (frozen contract); lexical results
-    // need to be sorted by FileId for the merge-join step.
-    // We already have lexical_rank as a HashMap, so we use that for O(1) lookup
-    // and collect the AST FileIds that appear in lexical_rank.
+    // `ast_scored` arrives FileId-ASC (frozen contract). `lexical_rank` is a
+    // HashMap so each AST entry gets an O(1) membership test; the loop is O(m).
+    // Total complexity including Step 1 (O(n) map build) is O(n+m).
 
     let mut candidates: Vec<(FileId, f64)> = ast_scored
         .iter()

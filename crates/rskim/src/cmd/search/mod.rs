@@ -595,7 +595,7 @@ fn run_query(
         // Changed from #199 (lossy HashSet) to #198 (scored vec for RRF).
         // resolve_ast_scored returns Vec<(FileId, f64)> sorted FileId-ASC,
         // preserving AST scores so intersect_and_rank can build the rank map.
-        let ids = match ast::resolve_ast_scored(&engine, raw_ast) {
+        let ast_scored = match ast::resolve_ast_scored(&engine, raw_ast) {
             Ok(hits) => {
                 if hits.is_empty() {
                     eprintln!("skim search: --ast {:?} matched no indexed files", raw_ast);
@@ -610,7 +610,7 @@ fn run_query(
                 None
             }
         };
-        (ids, Some(manifest))
+        (ast_scored, Some(manifest))
     } else {
         // Pure-lexical path: no --ast flag. execute_query will call
         // auto_refresh_if_stale itself exactly once.

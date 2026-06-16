@@ -199,8 +199,12 @@ fn ac2_composite_fusion_reorders_vs_lexical() {
 // AC3 — single-layer pass-through
 // ============================================================================
 
+/// AC3a: When only one layer is non-empty but the other is empty, the
+/// intersection is empty (there are no files common to both layers).
+/// Renamed from the incorrectly-labeled `ac3a_empty_ast_returns_empty` —
+/// that test was covering the empty-input case (AC6 territory), not AC3.
 #[test]
-fn ac3a_empty_ast_returns_empty() {
+fn ac3a_empty_layer_yields_empty_intersection() {
     // Empty AST input → empty intersection (no files in both layers).
     let lexical = vec![make_lex_result(1, 5.0), make_lex_result(2, 3.0)];
     let ast: Vec<(FileId, f64)> = vec![];
@@ -213,8 +217,9 @@ fn ac3a_empty_ast_returns_empty() {
     );
 }
 
+/// AC3b: Empty lexical input → empty intersection regardless of AST content.
 #[test]
-fn ac3b_empty_lexical_returns_empty() {
+fn ac3b_empty_lexical_yields_empty_intersection() {
     // Empty lexical input → empty intersection.
     let lexical: Vec<SearchResult> = vec![];
     let ast = vec![(FileId(1), 2.0)];
@@ -224,6 +229,88 @@ fn ac3b_empty_lexical_returns_empty() {
     assert!(
         ranked.is_empty(),
         "AC3b: empty lexical must yield empty intersection, got {ranked:?}"
+    );
+}
+
+/// AC3c: Pure-lexical pass-through — all lexical files appear in the intersection
+/// when the AST set is a superset of the lexical set (no file is dropped).
+/// This is AC3 proper: with the right inputs, the intersection does not shrink
+/// the lexical set, proving no spurious gating.
+#[test]
+fn ac3c_all_lexical_files_pass_when_ast_is_superset() {
+    // Lexical has {1, 2}; AST covers {1, 2, 3} (superset).
+    // Intersection must be exactly {1, 2} — no files are dropped by the gate.
+    let lexical = vec![make_lex_result(1, 5.0), make_lex_result(2, 3.0)];
+    let ast = vec![(FileId(1), 2.0), (FileId(2), 1.5), (FileId(3), 1.0)];
+
+    let ranked = intersect_and_rank(&lexical, &ast, no_metrics, 0.0, CompositeWeights::default());
+
+    let fids: Vec<u32> = ranked.iter().map(|&(f, _)| f.0).collect();
+    assert_eq!(
+        ranked.len(),
+        2,
+        "AC3c: intersection must preserve all lexical files when AST is a superset, got {fids:?}"
+    );
+    assert!(fids.contains(&1), "AC3c: file 1 must be present");
+    assert!(fids.contains(&2), "AC3c: file 2 must be present");
+    assert!(!fids.contains(&3), "AC3c: AST-only file 3 must be absent");
+}
+
+/// AC3d: AST-only pass-through — with equal-weight default config, the composite
+/// ordering is stable and both files appear.  Verifies that the AST signal reaches
+/// the scoring layer (not just gating) even with equal weights.
+///
+/// This is the production path: `CompositeWeights::default()` (equal weights).
+/// Two files with complementary rank positions produce *different* composite scores
+/// only if one layer has more than 2 items — with exactly 2 intersecting files and
+/// symmetric ranks the scores are equal and the tiebreaker (FileId-ASC) determines
+/// order.  The test proves the AST signal is wired into the fusion path at all.
+#[test]
+fn ac3d_equal_weight_production_path_ast_signal_wired() {
+    // 3 lexical results; AST has only files {2, 3} — so file 1 is dropped by the gate.
+    // With equal weights:
+    //   f2: lex_rank=2, ast_rank=1 (AST score 9.0) → 1/62 + 1/61 ≈ 0.02780
+    //   f3: lex_rank=3, ast_rank=2 (AST score 3.0) → 1/63 + 1/62 ≈ 0.02751
+    // f2 > f3 (AST signal pushes f2 above its lexical rank).
+    let lexical = vec![
+        make_lex_result(1, 10.0), // lex rank 1 — NOT in AST
+        make_lex_result(2, 5.0),  // lex rank 2
+        make_lex_result(3, 2.0),  // lex rank 3
+    ];
+    let ast = vec![
+        (FileId(2), 9.0), // FileId-ASC; AST rank 1
+        (FileId(3), 3.0), // AST rank 2
+    ];
+
+    let ranked = intersect_and_rank(&lexical, &ast, no_metrics, 0.0, CompositeWeights::default());
+
+    assert_eq!(
+        ranked.len(),
+        2,
+        "AC3d: only the 2 files in both layers must appear, got {:?}",
+        ranked
+    );
+
+    // f1 must be absent (AST gate removes it even under equal weights).
+    let fids: Vec<u32> = ranked.iter().map(|&(f, _)| f.0).collect();
+    assert!(
+        !fids.contains(&1),
+        "AC3d: file 1 (lexical-only) must be absent under equal-weight default"
+    );
+
+    // f2 must rank above f3: lex_rank(f2)=2 + ast_rank(f2)=1 outscores
+    // lex_rank(f3)=3 + ast_rank(f3)=2 — the AST signal contributes to the ordering.
+    assert_eq!(
+        ranked[0].0,
+        FileId(2),
+        "AC3d: f2 must rank first (better composite score), got {ranked:?}"
+    );
+    assert_eq!(ranked[1].0, FileId(3), "AC3d: f3 must rank second");
+
+    // Verify scores are strictly ordered (not equal — the ranks are NOT symmetric).
+    assert!(
+        ranked[0].1 > ranked[1].1,
+        "AC3d: equal-weight composite scores must be strictly ordered (f2 > f3), got {ranked:?}"
     );
 }
 
@@ -627,17 +714,29 @@ fn structural_depth_refines_ast_rank() {
 }
 
 // ============================================================================
-// Merge-join algorithmic bound — verify single linear pass (AC14)
+// AC14 — O(n+m) intersection (no nested scan)
 // ============================================================================
 
+/// Verifies the intersection produces correct results for larger inputs.
+///
+/// # Algorithmic note
+///
+/// AC14 requires the intersection to be O(n+m), not O(n*m).  The implementation
+/// achieves this via a `HashMap<FileId, rank>` built from the lexical layer (O(n))
+/// followed by a single pass over the AST layer with O(1) HashMap lookups (O(m)).
+///
+/// This test verifies the correctness of that approach for 100 lexical × 50 AST
+/// entries (intersection = 50 even FileIds).  The linear complexity is enforced
+/// at the implementation level; the test proves correct membership and count.
+/// It would pass an O(n*m) implementation too, but the code review and the
+/// `debug_assert!` input-contract guards document and enforce the invariant.
 #[test]
-fn ac14_merge_join_is_linear_no_nested_scan() {
-    // Build a larger input to verify the merge-join is O(n+m):
-    // 100 lexical results, 50 AST results — intersection should be the overlap.
+fn ac14_intersection_is_correct_for_larger_inputs() {
+    // 100 lexical results, 50 AST results — intersection should be the 50 even FileIds.
     let lexical: Vec<SearchResult> = (0u32..100)
         .map(|i| make_lex_result(i, 100.0 - i as f64))
         .collect();
-    // AST covers even FileIds 0,2,4,...,98 → 50 entries.
+    // AST covers even FileIds 0,2,4,...,98 → 50 entries, FileId-ASC (contract).
     let ast: Vec<(FileId, f64)> = (0u32..50)
         .map(|i| (FileId(i * 2), 50.0 - i as f64))
         .collect();
@@ -657,6 +756,13 @@ fn ac14_merge_join_is_linear_no_nested_scan() {
             0,
             "AC14: only even FileIds must appear, got {}",
             fid.0
+        );
+    }
+    // All scores must be finite and positive (RRF denominator is always positive).
+    for &(_, score) in &ranked {
+        assert!(
+            score.is_finite() && score > 0.0,
+            "AC14: all composite scores must be finite and positive"
         );
     }
 }
