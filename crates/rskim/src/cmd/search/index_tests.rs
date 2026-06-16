@@ -267,6 +267,16 @@ fn test_index_force_flag_ignores_manifest() {
         "--force must produce zero cache hits (manifest was ignored); got {}",
         result.cache_hits
     );
+    assert_eq!(
+        result.ast_cache_hits, 0,
+        "--force must produce zero AST cache hits (skcache was ignored, AC11); got {}",
+        result.ast_cache_hits
+    );
+    assert_eq!(
+        result.ast_reextracted, result.file_count,
+        "--force must re-extract every file's AST n-grams; got {} re-extracted of {} files",
+        result.ast_reextracted, result.file_count
+    );
     assert!(
         result.file_count > 0,
         "--force rebuild should index at least one file"
@@ -310,6 +320,98 @@ fn test_index_incremental_cache_hits_count() {
         result2.cache_hits, result2.file_count,
         "all {} files should be cache hits; got {}",
         result2.file_count, result2.cache_hits
+    );
+}
+
+#[test]
+fn test_index_incremental_ast_cache_hits_count() {
+    // End-to-end wiring guard for the #290 AST n-gram cache (ast_index.skcache):
+    // cold start must re-extract everything, and a second build over unchanged
+    // files must serve every AST entry from the skcache (zero re-extraction).
+    // This catches the silent-no-op failure mode where the producer never
+    // attaches `ast_cached` or the second build re-extracts regardless. (AC5)
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let project = make_project();
+    let cache = tempfile::tempdir().unwrap();
+
+    let config = IndexConfig {
+        root: project.path().to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+
+    // Cold start — no skcache exists, so every file is re-extracted.
+    let result1 = build_index(&config).expect("first build should succeed");
+    assert!(result1.file_count > 0, "first build should index files");
+    assert_eq!(
+        result1.ast_cache_hits, 0,
+        "cold start must have zero AST cache hits"
+    );
+    assert_eq!(
+        result1.ast_reextracted, result1.file_count,
+        "cold start must re-extract every file; got {} re-extracted of {}",
+        result1.ast_reextracted, result1.file_count
+    );
+
+    // Incremental — all files unchanged, every AST entry must come from skcache.
+    let result2 = build_index(&config).expect("second build should succeed");
+    assert_eq!(
+        result2.ast_cache_hits, result2.file_count,
+        "all {} files should be AST cache hits; got {}",
+        result2.file_count, result2.ast_cache_hits
+    );
+    assert_eq!(
+        result2.ast_reextracted, 0,
+        "unchanged incremental build must re-extract nothing; got {}",
+        result2.ast_reextracted
+    );
+}
+
+#[test]
+fn test_index_incremental_modified_file_reextracts_ast() {
+    // A modified file (SHA change) must miss the AST cache and be re-extracted,
+    // while the unchanged files remain AST cache hits. Guards against a stale
+    // skcache entry being served for changed content. (AC5)
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let project = make_project();
+    let cache = tempfile::tempdir().unwrap();
+    let config = IndexConfig {
+        root: project.path().to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+
+    // Cold start populates the skcache.
+    let result1 = build_index(&config).expect("first build should succeed");
+    assert!(result1.file_count >= 2, "fixture must have multiple files");
+
+    // Modify exactly one file so its SHA changes.
+    fs::write(
+        project.path().join("src/main.rs"),
+        "fn main() { eprintln!(\"changed\"); }\n",
+    )
+    .unwrap();
+
+    let result2 = build_index(&config).expect("second build should succeed");
+
+    // Exactly one file changed → one re-extraction, the rest are AST cache hits.
+    assert_eq!(
+        result2.ast_reextracted, 1,
+        "only the modified file should be re-extracted; got {}",
+        result2.ast_reextracted
+    );
+    assert_eq!(
+        result2.ast_cache_hits,
+        result2.file_count - 1,
+        "all unchanged files should be AST cache hits; got {} of {}",
+        result2.ast_cache_hits,
+        result2.file_count - 1
     );
 }
 
