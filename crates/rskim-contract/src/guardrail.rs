@@ -172,12 +172,12 @@ pub fn guarded_transform(
 ///
 /// # Current status
 ///
-/// This function is a primitive reserved for the #302 consumer that owns
+/// This function is a primitive reserved for the #306/#307 consumer that owns
 /// whole-request assembly (`apply_live_zone_edits` + hot-zone splice path).
 /// At this layer, `locate_hot_zone_range` and `apply_live_zone_edits` are
 /// stubs that return `None` (→ passthrough), so no whole-request assembly
 /// occurs and this function has no current caller in the production path.
-/// It is tested in isolation and wired in by #302 when the typed offset
+/// It is tested in isolation and wired in by #307 when the typed offset
 /// model becomes available.
 ///
 /// # Arguments

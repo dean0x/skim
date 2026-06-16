@@ -74,7 +74,7 @@
 //! the conservative correct behaviour. `Result` appears only at construction
 //! boundaries (constructors for contract impls), in harness assertion APIs (where a
 //! broken impl is the expected error case), and in defense-in-depth helpers
-//! such as [`guardrail::whole_request_check`] reserved for the #302 consumer.
+//! such as [`guardrail::whole_request_check`] reserved for the #306/#307 consumer.
 //!
 //! ### Typed waivers over capability tokens (invariants 3, 4, 6)
 //!

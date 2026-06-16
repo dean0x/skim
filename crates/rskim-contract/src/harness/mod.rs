@@ -429,11 +429,12 @@ fn count_turns(bytes: &[u8]) -> Option<usize> {
 /// 1. `splice_hot_zone` for known byte ranges produces byte-identical slices.
 /// 2. `splice_hot_zone` with an out-of-range offset returns None (fail-open).
 /// 3. On corpus inputs where `locate_hot_zone_range` returns None (which is the
-///    current stub behavior until #302 provides the typed model), the component
-///    must produce passthrough — meaning ALL bytes (including the would-be hot
-///    zone) are byte-identical, satisfying invariant 3 for the current layer.
+///    current stub behavior pending the per-consumer byte-offset model (#306/#307)),
+///    the component must produce passthrough — meaning ALL bytes (including the
+///    would-be hot zone) are byte-identical, satisfying invariant 3 for the
+///    current layer.
 ///
-/// Precise byte-offset extraction is a per-consumer responsibility (#302);
+/// Precise byte-offset extraction is a per-consumer responsibility (#306/#307);
 /// the splice mechanism itself is what this layer owns and what these tests
 /// verify.
 fn check_hot_zone_splice_byte_identity(
