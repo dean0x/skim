@@ -596,27 +596,29 @@ fn find_file_with_ext(dir: &Path, ext: &str) -> bool {
 }
 
 /// Search for a file with the given name (not just extension) in `dir`,
-/// up to 5 levels deep.  Returns the first match found.
-fn find_file_in_dir(dir: &Path, name: &str) -> Option<std::path::PathBuf> {
-    fn recurse(dir: &Path, name: &str, depth: usize) -> Option<std::path::PathBuf> {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return None;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if depth > 0
-                    && let Some(found) = recurse(&path, name, depth - 1)
-                {
-                    return Some(found);
-                }
-            } else if path.file_name().is_some_and(|f| f == name) {
-                return Some(path);
+/// up to `max_depth` levels deep.  Returns the first match found.
+fn find_file_in_dir_depth(dir: &Path, name: &str, max_depth: usize) -> Option<std::path::PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if max_depth > 0
+                && let Some(found) = find_file_in_dir_depth(&path, name, max_depth - 1)
+            {
+                return Some(found);
             }
+        } else if path.file_name().is_some_and(|f| f == name) {
+            return Some(path);
         }
-        None
     }
-    recurse(dir, name, 5)
+    None
+}
+
+/// Search for a file with the given name in `dir`, up to 5 levels deep.
+fn find_file_in_dir(dir: &Path, name: &str) -> Option<std::path::PathBuf> {
+    find_file_in_dir_depth(dir, name, 5)
 }
 
 /// After a full build, the manifest must contain a 64-char lowercase hex SHA-256

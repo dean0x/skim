@@ -166,9 +166,7 @@ fn encode_entry(entry: &CachedAstEntry) -> Vec<u8> {
 
     let mut buf = Vec::with_capacity(payload_len);
 
-    // bigram_count
     buf.extend_from_slice(&(bigram_count as u32).to_le_bytes());
-    // trigram_count
     buf.extend_from_slice(&(trigram_count as u32).to_le_bytes());
 
     for b in &entry.ngrams.bigrams {
@@ -333,19 +331,15 @@ fn decode_file(buf: &[u8]) -> Option<HashMap<String, CachedAstEntry>> {
     if buf.len() < 9 {
         return None;
     }
-
-    let magic = &buf[0..4];
-    let version = buf[4];
-    let entry_count = u32::from_le_bytes(buf[5..9].try_into().ok()?) as usize;
-
-    if magic != CACHE_MAGIC {
+    if &buf[0..4] != CACHE_MAGIC {
         return None;
     }
-    if version != CACHE_FORMAT_VERSION {
+    if buf[4] != CACHE_FORMAT_VERSION {
         // Version mismatch → discard entire cache, cold-start extraction.
         // Guards ast_weights.rs regeneration and extract.rs algorithm changes.
         return None;
     }
+    let entry_count = u32::from_le_bytes(buf[5..9].try_into().ok()?) as usize;
     if entry_count > MAX_CACHE_ENTRIES {
         // Corrupt entry count — reject.
         return None;
