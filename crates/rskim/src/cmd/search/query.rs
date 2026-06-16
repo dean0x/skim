@@ -135,7 +135,10 @@ pub(super) fn execute_query_with_manifest(
         // Wider lexical pool before compound ranking.
         const CANDIDATE_POOL_K: usize = 4;
         let mut sq = SearchQuery::new(config.text.clone());
-        sq.limit = Some(config.limit * CANDIDATE_POOL_K);
+        // saturating_mul: a hostile `--limit` near usize::MAX must not overflow
+        // (debug panic / release wraparound). Mirrors temporal.rs:420's
+        // `limit.saturating_mul(5)` window-widening pattern.
+        sq.limit = Some(config.limit.saturating_mul(CANDIDATE_POOL_K));
 
         // Apply blast-radius pre-filter when present (blast ∩ AST path).
         if let Some(ref blast) = blast_file_ids {
