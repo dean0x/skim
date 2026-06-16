@@ -68,7 +68,7 @@ jobs:
       - name: AC12 criterion benchmark (relative regression visibility)
         env:
           CRITERION_HOME: ${{ github.workspace }}/.bench-baselines
-        run: cargo bench -p rskim-tokens --bench token_count -- --baseline ci-baseline
+        run: cargo bench -p rskim-tokens --bench token_count_bench -- --baseline ci-baseline
 
   security-tests:
     name: Security Test Suites
