@@ -45,25 +45,27 @@ pub(crate) struct StringSpan {
 /// replaced by the JSON-encoded form of `new_text`, and all other bytes are
 /// byte-identical to `raw`.
 ///
-/// # Panics (debug)
+/// # Panics
 ///
-/// `debug_assert!` fires if the span is inconsistent with `raw`:
-/// `span.start <= span.end && span.end <= raw.len()`.  In release builds the
-/// assertion is compiled out and the slice operations would panic or produce
-/// wrong output, so callers MUST ensure the span was derived from the same `raw`
-/// buffer.  The only live call site (`mutate_anthropic` in `mutate.rs`) derives
-/// the span from `find_leaf_span(&body.raw_bytes, …)` and immediately calls
-/// `splice_replace(&body.raw_bytes, span, …)` on the same buffer, so the
-/// invariant holds by construction.
+/// Panics in both debug and release builds if the span is inconsistent with `raw`:
+/// `span.start <= span.end && span.end <= raw.len()`.  A violated span cannot be
+/// triggered by untrusted input alone — it requires a code bug (e.g., passing a
+/// span derived from a different buffer).  Per ADR-006, an unrecoverable invariant
+/// violation must fail loud in release builds rather than silently producing wrong
+/// output or a cryptic index panic.  The only live call site (`mutate_anthropic`
+/// in `mutate.rs`) derives the span from `find_leaf_span(&body.raw_bytes, …)` and
+/// immediately calls `splice_replace(&body.raw_bytes, span, …)` on the same buffer,
+/// so the invariant holds by construction.  This matches the sibling `apply_leaf_mutation`
+/// which also uses `assert!` (not `debug_assert!`) for its index-bounds check (ADR-006).
 ///
 /// # Errors
 ///
 /// Returns `Err` if `serde_json::to_string` fails (OOM). In practice this is
 /// unreachable for a `&str` argument.
 pub(crate) fn splice_replace(raw: &[u8], span: StringSpan, new_text: &str) -> Result<Vec<u8>> {
-    debug_assert!(
+    assert!(
         span.start <= span.end && span.end <= raw.len(),
-        "splice_replace: span {span:?} is out of bounds for raw buffer of len {}",
+        "splice_replace: span {span:?} is out of bounds for raw buffer of len {} (ADR-006)",
         raw.len()
     );
 
@@ -74,7 +76,7 @@ pub(crate) fn splice_replace(raw: &[u8], span: StringSpan, new_text: &str) -> Re
     let new_bytes = quoted.as_bytes();
 
     // The subtraction `raw.len() - (span.end - span.start)` is safe here:
-    // the debug_assert above guarantees span.end - span.start <= raw.len(),
+    // the assert above guarantees span.end - span.start <= raw.len(),
     // so the subtraction cannot underflow on valid input.
     let mut out = Vec::with_capacity(raw.len() - (span.end - span.start) + new_bytes.len());
     out.extend_from_slice(&raw[..span.start]);
@@ -682,13 +684,22 @@ mod tests {
     }
 
     #[test]
-    fn splice_replace_debug_assert_span_in_bounds() {
-        // Only exercises the happy path in release builds; the debug_assert is
-        // tested indirectly via all other splice tests that use valid spans.
+    fn splice_replace_assert_span_in_bounds() {
+        // Exercises the happy path; the assert fires in all build modes on bad spans.
+        // Out-of-bounds spans are tested via should_panic in the next test.
         let raw = b"hello";
         let span = StringSpan { start: 1, end: 4 };
-        // Valid span: start <= end <= raw.len() => no assert fires
+        // Valid span: start <= end <= raw.len() => assert does not fire
         let result = splice_replace(raw, span, "X");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "ADR-006")]
+    fn splice_replace_panics_on_out_of_bounds_span_in_release() {
+        // assert! (not debug_assert!) fires in release builds for a span past raw.len().
+        let raw = b"hi";
+        let bad_span = StringSpan { start: 0, end: 10 }; // end > raw.len()
+        let _ = splice_replace(raw, bad_span, "X");
     }
 }
