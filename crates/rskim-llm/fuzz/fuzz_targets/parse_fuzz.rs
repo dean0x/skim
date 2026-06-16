@@ -51,6 +51,15 @@ fuzz_target!(|data: &[u8]| {
         "serialize output must be valid UTF-8"
     );
 
+    // Round-trip invariant: serialize(parse(data)) == data byte-for-byte.
+    // serialize() returns raw_bytes verbatim, which is set to the original input
+    // in parse_as().  avoids PF-007 (vacuous test — asserting only valid-UTF-8
+    // would pass even if byte identity were broken).
+    assert_eq!(
+        serialized, data,
+        "serialize(parse(data)) must be byte-identical to the original input"
+    );
+
     // --- Step 3: list_blocks ---
     // Must never panic.
     let blocks = list_blocks(&body);
