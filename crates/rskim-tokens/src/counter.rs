@@ -283,6 +283,7 @@ mod counter_tests {
     /// a failure through `build_bpe` (the same translation `Counter::new` uses) and
     /// confirm it produces a `TiktokenInit` error carrying the encoding name.
     #[test]
+    #[allow(unreachable_patterns)] // see the feature-gating note on the match's catch-all arm
     fn build_bpe_err_path_is_exercised() {
         let injected = build_bpe(
             "cl100k_base",
@@ -297,6 +298,10 @@ mod counter_tests {
                 );
             }
             // CoreBPE has no Debug impl, so describe the unexpected arm by hand.
+            // The `Err(other)` arm is unreachable under default features (only
+            // `TiktokenInit` exists) but required for exhaustiveness under
+            // `--all-features`, where `TokenError`'s net-anthropic-gated variants
+            // (`MissingApiKey`/`NetworkRequest`/`ApiResponse`) appear.
             Err(other) => panic!("expected TiktokenInit Err, got a different error: {other}"),
             Ok(_) => panic!("expected Err, got Ok(CoreBPE)"),
         }
