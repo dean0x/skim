@@ -59,6 +59,16 @@ pub enum ParsedBody {
 /// Provider is auto-detected from the body structure. Use [`parse_with_provider`]
 /// to force a specific provider.
 ///
+/// # Size cap
+///
+/// `parse` has no built-in byte-size limit — it will attempt to allocate
+/// approximately 2× the input size (see *Memory profile* in the module docs).
+/// Callers that accept untrusted input from a network or file should cap the
+/// buffer size **before** calling this function.  The
+/// [`crate::ChunkIngestionBuilder`] enforces a 64 MiB cap automatically; for
+/// single-shot use, reject inputs above your operational limit before calling
+/// `parse`.
+///
 /// # Errors
 ///
 /// - [`LlmError::InvalidUtf8`] — bytes are not valid UTF-8
@@ -123,6 +133,11 @@ fn detect_or_shape_err(text: &str) -> Result<provider::Detection> {
 ///
 /// Skips provider auto-detection. Useful when the provider is known from context
 /// (e.g., the API endpoint URL).
+///
+/// # Size cap
+///
+/// Same as [`parse`] — no built-in byte-size limit. Cap the buffer before
+/// calling this function when accepting untrusted input.
 ///
 /// # Errors
 ///
