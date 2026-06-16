@@ -34,10 +34,9 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     family: "infra",
     skip_ansi_strip: false,
     command_type: CommandType::Infra,
+    expected_exit_codes: &[],
+    forward_stderr: false,
 };
-
-/// Maximum number of source fields in a JSON response before a truncation notice is added.
-const MAX_ITEMS: usize = 100;
 
 /// Maximum byte length of JSON input accepted for Tier 1 parsing.
 ///
@@ -577,13 +576,6 @@ fn try_parse_json(stdout: &str, http_status: Option<&str>) -> Option<InfraResult
         Value::Array(arr) => {
             let (summary, extra) = summarize_json_array(arr);
             items.extend(extra);
-            // Truncation notice when source array exceeds cap
-            if arr.len() > MAX_ITEMS {
-                items.push(InfraItem {
-                    label: "truncated".to_string(),
-                    value: format!("output capped at {MAX_ITEMS} items"),
-                });
-            }
             summary
         }
         Value::Object(map) => {
@@ -595,11 +587,13 @@ fn try_parse_json(stdout: &str, http_status: Option<&str>) -> Option<InfraResult
 
             let (summary, extra) = summarize_json_object(map);
             items.extend(extra);
-            // Truncation notice when source object exceeds MAX_OBJECT_KEYS
-            if map.len() > MAX_OBJECT_KEYS {
+            // Loud, exact elision notice when the object exceeds MAX_OBJECT_KEYS (#317)
+            if let Some(marker) =
+                crate::output::elision_marker(MAX_OBJECT_KEYS, map.len(), "object keys")
+            {
                 items.push(InfraItem {
                     label: "truncated".to_string(),
-                    value: format!("showing {MAX_OBJECT_KEYS} of {} keys", map.len()),
+                    value: marker,
                 });
             }
 
@@ -749,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tier1_max_items_cap() {
+    fn test_tier1_object_keys_elision_is_loud() {
         let fields: String = (0..200)
             .map(|i| format!("\"key{i}\": \"val{i}\""))
             .collect::<Vec<_>>()
@@ -758,9 +752,15 @@ mod tests {
         let result = try_parse_json(&json, None);
         assert!(result.is_some());
         let result = result.unwrap();
+        let notice = result
+            .items
+            .iter()
+            .find(|i| i.label == "truncated")
+            .expect("elision notice must be present for >MAX_OBJECT_KEYS fields");
         assert!(
-            result.items.iter().any(|i| i.label == "truncated"),
-            "Expected truncation notice item when JSON has > {MAX_ITEMS} fields"
+            notice.value.contains("of 200") && notice.value.contains("SKIM_PASSTHROUGH=1"),
+            "notice must state exact counts + escape hatch: {}",
+            notice.value
         );
     }
 

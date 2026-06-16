@@ -38,6 +38,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     family: "file",
     skip_ansi_strip: false,
     command_type: CommandType::FileOps,
+    expected_exit_codes: &[],
+    forward_stderr: true,
 };
 
 /// Regex to detect and redact URL credentials: scheme://user:pass@host
@@ -139,14 +141,7 @@ fn try_parse_env(stdout: &str) -> Option<FileResult> {
     }
 
     let shown_count = entries.len();
-    let footer = if total_count > MAX_DISPLAY_ENTRIES {
-        Some(format!(
-            "... and {} more",
-            total_count - MAX_DISPLAY_ENTRIES
-        ))
-    } else {
-        None
-    };
+    let footer = crate::output::elision_marker(shown_count, total_count, "variables");
 
     Some(FileResult::new(
         "env".to_string(),

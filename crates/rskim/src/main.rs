@@ -73,6 +73,7 @@ fn is_flag_with_value(flag: &str) -> bool {
             | "--agent"
             | "--format"
             | "--blast-radius"
+            | "--session-id"
     )
 }
 
@@ -327,6 +328,20 @@ struct Args {
     /// Disable analytics recording for this invocation
     #[arg(long, help = "Disable analytics recording")]
     disable_analytics: bool,
+
+    /// Session attribution ID injected by the rewrite hook (#317).
+    ///
+    /// Consumed pre-clap by `parse_session_id`; this field exists ONLY so the
+    /// FileOperation path accepts the flag. Without it, every hook-rewritten
+    /// `cat <file>` (→ `skim --session-id=… <file>`) errored with
+    /// "unexpected argument '--session-id'".
+    #[arg(
+        long = "session-id",
+        hide = true,
+        require_equals = true,
+        value_name = "ID"
+    )]
+    _session_id: Option<String>,
 
     /// Enable debug output (warnings/notices on stderr)
     #[arg(long, global = true)]
@@ -998,6 +1013,7 @@ mod tests {
         "--agent",
         "--format",
         "--blast-radius",
+        "--session-id",
     ];
 
     /// Ensure every value-consuming flag (non-boolean, non-positional) in `Args`

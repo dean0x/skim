@@ -16,9 +16,7 @@ use crate::cmd::user_has_flag;
 use crate::output::ParseResult;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 
-use super::shared::{
-    ArgPreparation, MAX_ENTRIES, TestRunnerConfig, extract_json_object, run_test_runner,
-};
+use super::shared::{ArgPreparation, TestRunnerConfig, extract_json_object, run_test_runner};
 
 // ============================================================================
 // Tier-2 regex patterns
@@ -221,8 +219,8 @@ fn try_parse_json(raw: &str) -> Option<TestResult> {
 ///
 /// `depth` tracks call depth; recursion stops at `MAX_SUITE_DEPTH` to prevent
 /// stack overflows from pathologically-deep or adversarial JSON payloads.
-/// `MAX_ENTRIES` (from `shared`) caps total entries collected to match the
-/// Tier-2 regex path and prevent unbounded accumulation from wide payloads.
+/// Entry count is NOT capped (#317): entries are a subset of input already
+/// bounded by the JSON guardrail, and test names are diagnostics.
 const MAX_SUITE_DEPTH: usize = 64;
 
 fn collect_entries_from_suites(suites: &[PlaywrightSuite], entries: &mut Vec<TestEntry>) {
@@ -234,18 +232,12 @@ fn collect_entries_from_suites_inner(
     entries: &mut Vec<TestEntry>,
     depth: usize,
 ) {
-    if depth >= MAX_SUITE_DEPTH || entries.len() >= MAX_ENTRIES {
+    if depth >= MAX_SUITE_DEPTH {
         return;
     }
     for suite in suites {
-        if entries.len() >= MAX_ENTRIES {
-            return;
-        }
         collect_entries_from_suites_inner(&suite.suites, entries, depth + 1);
         for spec in &suite.specs {
-            if entries.len() >= MAX_ENTRIES {
-                return;
-            }
             for test in &spec.tests {
                 // Only use the first result per test
                 if let Some(result) = test.results.first() {
@@ -416,11 +408,11 @@ mod tests {
         );
     }
 
-    /// Regression: a wide JSON payload with more than MAX_ENTRIES suites at depth 1
-    /// must not accumulate more than MAX_ENTRIES entries (unbounded accumulation guard).
+    /// A wide JSON payload yields one entry per test — no entry cap (#317):
+    /// test names are diagnostics, and the input is already bounded upstream.
     #[test]
-    fn test_collect_entries_capped_at_max_entries() {
-        // Build 200 suites each with one passing spec — well above MAX_ENTRIES.
+    fn test_collect_entries_emits_every_test() {
+        // Build 200 suites each with one passing spec.
         let spec = r#"{"title":"t","ok":true,"tests":[{"timeout":30000,"annotations":[],"expectedStatus":"passed","projectId":"chromium","results":[{"status":"expected","duration":10,"error":null}]}]}"#;
         let suite_body = format!(r#"{{"title":"s","file":"f.ts","suites":[],"specs":[{spec}]}}"#);
         let suites_array = std::iter::repeat_n(suite_body.as_str(), 200)
@@ -433,9 +425,10 @@ mod tests {
         let result = try_parse_json(&json);
         assert!(result.is_some(), "JSON parse should succeed");
         let r = result.unwrap();
-        assert!(
-            r.entries.len() <= MAX_ENTRIES,
-            "entries must not exceed MAX_ENTRIES={MAX_ENTRIES}, got {}",
+        assert_eq!(
+            r.entries.len(),
+            200,
+            "every test must yield an entry, got {}",
             r.entries.len()
         );
     }

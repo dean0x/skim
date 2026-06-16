@@ -52,7 +52,7 @@ impl Language {
     /// ```
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {
-            "ts" | "tsx" => Some(Self::TypeScript),
+            "ts" | "tsx" | "mts" | "cts" => Some(Self::TypeScript),
             "js" | "jsx" | "cjs" | "mjs" => Some(Self::JavaScript),
             "py" | "pyi" => Some(Self::Python),
             "rs" => Some(Self::Rust),

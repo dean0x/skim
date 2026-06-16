@@ -75,6 +75,17 @@ pub(super) use super::combine_output;
 pub(super) struct PkgSubcommandConfig<'a> {
     pub program: &'a str,
     pub subcommand: &'a str,
+    /// Exit codes that mean "ran fine, findings present" rather than an
+    /// unexpected failure (#317). Most subcommands exit `1` on findings, but
+    /// `yarn audit` uses a severity bitmask (`1|2|4|8|16`, OR-combined), so it
+    /// declares the full `1..=31` range. Threaded into `classify_exit` so a
+    /// findings exit is compressed instead of raw-forwarded.
+    pub expected_exit_codes: &'a [i32],
+    /// Whether to forward child stderr verbatim on the compressed path (#317).
+    /// All pkg subcommands are stdout-only parsers, so this is `false` at every
+    /// construction site — but it must be explicit so every site is auditable and
+    /// uniform with `ToolRunConfig` / `ParsedCommandConfig`.
+    pub forward_stderr: bool,
     pub env_overrides: &'a [(&'a str, &'a str)],
     pub install_hint: &'a str,
 }
@@ -113,6 +124,14 @@ where
             family: "pkg",
             skip_ansi_strip: false,
             rec,
+            // Per-subcommand: `1` for most (npm audit vulnerabilities, npm
+            // outdated packages, pip check conflicts), the severity-bitmask
+            // range for `yarn audit`. See `PkgSubcommandConfig`.
+            expected_exit_codes: config.expected_exit_codes,
+            // All pkg parsers consume stdout only; stderr is never forwarded.
+            // Threaded from the construction site so every caller is explicit
+            // and auditable (#317).
+            forward_stderr: config.forward_stderr,
         },
         |output| parse_fn(output),
     )

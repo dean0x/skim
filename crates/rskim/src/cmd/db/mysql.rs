@@ -35,6 +35,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     family: "db",
     skip_ansi_strip: true,
     command_type: CommandType::Db,
+    expected_exit_codes: &[],
+    forward_stderr: true,
 };
 
 /// Matches MySQL's "Empty set" output.
@@ -75,7 +77,6 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<DbResult> {
             vec![],
             vec![],
             0,
-            false,
         ));
     }
 
@@ -145,7 +146,6 @@ fn try_parse_tsv(text: &str) -> Option<DbResult> {
         .collect();
 
     let row_count = rows.len();
-    let truncated = row_count > 100;
 
     let summary = if multi_result {
         format!("query returned {row_count} row(s) (multiple result sets — first shown)")
@@ -159,7 +159,6 @@ fn try_parse_tsv(text: &str) -> Option<DbResult> {
         columns,
         rows,
         row_count,
-        truncated,
     ))
 }
 
@@ -229,15 +228,12 @@ fn try_parse_bordered(text: &str) -> Option<DbResult> {
         })
         .unwrap_or(rows.len());
 
-    let truncated = rows.len() > 100;
-
     Some(DbResult::new(
         "mysql".to_string(),
         format!("query returned {row_count} row(s)"),
         columns,
         rows,
         row_count,
-        truncated,
     ))
 }
 
@@ -350,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn test_large_result_truncated_flag() {
+    fn test_large_result_renders_every_row() {
         // 120 TSV rows → truncated=true
         let mut text = "id\tval\n".to_string();
         for i in 1..=120 {
@@ -359,12 +355,16 @@ mod tests {
         let output = make_output(&text);
         let result = parse_impl(&output);
         if let ParseResult::Full(r) = result {
-            assert!(r.truncated, "expected truncated=true for 120 rows");
+            let rendered = r.as_ref();
+            assert!(rendered.contains("v120"), "all 120 rows must render");
+            assert!(!rendered.contains("omitted"), "no elision marker");
+        } else {
+            panic!("expected Full parse");
         }
     }
 
     #[test]
-    fn test_column_truncation_in_render() {
+    fn test_long_cell_renders_in_full() {
         let long_val = "a".repeat(50);
         let text = format!("col1\tcol2\n{}\tshort\n", long_val);
         let output = make_output(&text);
@@ -372,9 +372,11 @@ mod tests {
         if let ParseResult::Full(r) = result {
             let rendered = r.as_ref();
             assert!(
-                rendered.contains('…'),
-                "long values must be truncated with ellipsis"
+                rendered.contains(&long_val),
+                "full cell content must render — no 40-char chop (#317)"
             );
+        } else {
+            panic!("expected Full parse");
         }
     }
 }

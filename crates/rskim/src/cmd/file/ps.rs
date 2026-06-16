@@ -23,6 +23,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     family: "file",
     skip_ansi_strip: false,
     command_type: CommandType::FileOps,
+    expected_exit_codes: &[],
+    forward_stderr: true,
 };
 
 /// Run `skim ps [args...]`.
@@ -81,14 +83,7 @@ fn try_parse_ps(stdout: &str) -> Option<FileResult> {
     }
 
     let shown_count = entries.len().saturating_sub(1); // exclude header
-    let footer = if process_count > MAX_DISPLAY_ENTRIES {
-        Some(format!(
-            "... and {} more processes",
-            process_count - MAX_DISPLAY_ENTRIES
-        ))
-    } else {
-        None
-    };
+    let footer = crate::output::elision_marker(shown_count, process_count, "processes");
 
     Some(FileResult::new(
         "ps".to_string(),
@@ -143,8 +138,12 @@ mod tests {
         assert!(result.footer.is_some(), "Should have footer when truncated");
         let footer = result.footer.as_ref().unwrap();
         assert!(
-            footer.contains("processes"),
-            "Footer should mention processes"
+            footer.contains("processes omitted"),
+            "Footer should mention omitted process count, got: {footer}"
+        );
+        assert!(
+            footer.contains("SKIM_PASSTHROUGH=1"),
+            "Footer should include SKIM_PASSTHROUGH=1 escape hatch, got: {footer}"
         );
     }
 

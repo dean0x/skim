@@ -82,9 +82,22 @@ use crate::runner::ChildGuard;
 ///
 /// The `read_until` reader is capped at `MAX_STREAM_LINE_BYTES + 1` bytes per
 /// call via `Read::take`, bounding allocation before the UTF-8 decode step.
-/// A `...` marker is appended when a line is truncated.  This prevents unbounded
-/// allocation on pathological inputs (e.g., minified JS emitted by a build
-/// step) per AD-STR-1.
+/// This prevents unbounded allocation on pathological inputs (e.g., minified
+/// JS emitted by a build step) per AD-STR-1.
+///
+/// The cap SPLITS overlong lines (#317): every byte read is re-emitted, and the
+/// remainder of the line arrives as subsequent chunks. A loud
+/// [`crate::output::elision_marker_unbounded`] marker is appended to each
+/// capped chunk so the agent knows the line continues.
+///
+/// # Lossy UTF-8 caveat (AD-STR-6)
+///
+/// Bytes are decoded via [`String::from_utf8_lossy`]. When a multi-byte UTF-8
+/// codepoint straddles the 64 KiB cap boundary, each half is independently
+/// decoded: the incomplete byte sequence in the first chunk and the continuation
+/// bytes in the second chunk are each replaced with U+FFFD. The raw bytes are
+/// preserved, but the codepoint is fragmented across chunks rather than
+/// reconstructed. Valid ASCII lines survive the cap without any substitution.
 pub(super) const MAX_STREAM_LINE_BYTES: usize = 64 * 1024; // 64 KiB
 
 // ============================================================================
@@ -122,15 +135,22 @@ fn read_line_lossy(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> Option<Strin
     }
 
     // `n > MAX` means the take-limit was reached before a newline — the line
-    // exceeds the cap.  Bound the decoded content to `MAX_STREAM_LINE_BYTES`
-    // before appending the marker so consumers see at most `MAX + marker`.
-    let truncated = n > MAX_STREAM_LINE_BYTES;
-    if truncated {
-        buf.truncate(MAX_STREAM_LINE_BYTES);
-    }
+    // exceeds the cap and was split. Every byte read is re-emitted (#317: the
+    // cap bounds allocation, it must not drop data); the remainder of the line
+    // arrives as the next chunk. The loud marker tells the agent this output
+    // line is an incomplete slice of one raw line.
+    //
+    // AD-STR-6 lossy caveat: a multi-byte UTF-8 codepoint whose bytes straddle
+    // the cap boundary is decoded as U+FFFD in each chunk rather than
+    // reconstructed; valid ASCII content is unaffected.
+    let split = n > MAX_STREAM_LINE_BYTES;
     let mut line = String::from_utf8_lossy(buf).into_owned();
-    if truncated {
-        line.push('\u{2026}'); // U+2026 HORIZONTAL ELLIPSIS
+    if split {
+        line.push(' ');
+        line.push_str(&crate::output::elision_marker_unbounded(
+            "the 64 KiB line cap (continues in next chunk)",
+            "line content",
+        ));
     }
     Some(line)
 }
@@ -713,10 +733,15 @@ mod tests {
         assert!(eof.is_none(), "expected EOF");
     }
 
-    /// Verify that a line exceeding `MAX_STREAM_LINE_BYTES` is truncated and
-    /// gets a truncation marker suffix, with the content portion bounded by the cap.
+    /// Verify that a line exceeding `MAX_STREAM_LINE_BYTES` is SPLIT — not
+    /// dropped (#317) — and each capped chunk carries a loud marker.
+    ///
+    /// Uses ASCII-only content so `from_utf8_lossy` is lossless here. Per
+    /// AD-STR-6, a multi-byte UTF-8 codepoint straddling the 64 KiB boundary
+    /// would produce U+FFFD substitution in each chunk rather than being
+    /// reconstructed; that lossy case is intentional contract, not a defect.
     #[test]
-    fn test_read_line_lossy_truncates_overlong_line() {
+    fn test_read_line_lossy_splits_overlong_ascii_line() {
         let long_line: Vec<u8> = vec![b'A'; MAX_STREAM_LINE_BYTES + 100];
         let mut input = long_line;
         input.push(b'\n');
@@ -724,17 +749,22 @@ mod tests {
         let mut reader = io::BufReader::new(input.as_slice());
         let mut buf = Vec::new();
 
-        let result = read_line_lossy(&mut reader, &mut buf).expect("line");
-        // U+2026 is the truncation marker appended by read_line_lossy.
+        let chunk1 = read_line_lossy(&mut reader, &mut buf).expect("first chunk");
         assert!(
-            result.ends_with('\u{2026}'),
-            "truncated line should end with ellipsis (U+2026)"
+            chunk1.contains("SKIM_PASSTHROUGH=1"),
+            "capped chunk must carry the loud marker: {:.120}",
+            chunk1
         );
-        let without_marker: &str = result.trim_end_matches('\u{2026}');
-        assert!(
-            without_marker.len() <= MAX_STREAM_LINE_BYTES,
-            "content before marker must be within cap"
+        let content1 = chunk1.split(" [skim]").next().unwrap();
+        let chunk2 = read_line_lossy(&mut reader, &mut buf).expect("continuation chunk");
+        // Every ASCII byte of the raw line survives across chunks (#317).
+        assert_eq!(
+            content1.len() + chunk2.len(),
+            MAX_STREAM_LINE_BYTES + 100,
+            "all ASCII bytes of the raw line must survive across chunks"
         );
+        assert!(content1.bytes().all(|b| b == b'A'));
+        assert!(chunk2.bytes().all(|b| b == b'A'), "{chunk2:.80}");
     }
 
     /// Verify that `run_streamed_spawned` handles concurrent stdout+stderr

@@ -38,6 +38,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     family: "lint",
     skip_ansi_strip: false,
     command_type: CommandType::Lint,
+    expected_exit_codes: &[1],
+    forward_stderr: false,
 };
 
 static RE_RUSTFMT_DIFF_HEADER: LazyLock<Regex> =

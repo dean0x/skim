@@ -413,14 +413,9 @@ pub(super) fn run_passthrough(
 /// the runner's full output format, which is precisely what Tier-1 JSON exists
 /// to avoid.
 ///
-/// Maximum number of test entries collected during parsing (Tier-1 and Tier-2).
-///
-/// Caps both the regex-scrape path in [`scrape_failures`] and Tier-1 JSON
-/// collection in parsers that have wide (many suites, shallow depth) payloads.
-/// All parsers import this constant rather than defining their own.
-pub(super) const MAX_ENTRIES: usize = 100;
-
-/// Cap matches [`MAX_ENTRIES`] to keep output size predictable regardless of tier.
+/// Failing test names are diagnostics — every one is scraped (#317). The
+/// entries are a subset of input already bounded by the runner's output cap,
+/// so no unbounded allocation is possible.
 pub(super) fn scrape_failures(text: &str, kind: TestKind) -> Vec<TestEntry> {
     // Strip ANSI escape codes so color-enabled output (e.g. pytest --color=yes,
     // vitest with TTY detected) does not break pattern matching.
@@ -440,9 +435,6 @@ pub(super) fn scrape_failures(text: &str, kind: TestKind) -> Vec<TestEntry> {
 
     let mut entries: Vec<TestEntry> = Vec::new();
     for line in cleaned.lines() {
-        if entries.len() >= MAX_ENTRIES {
-            break;
-        }
         if let Some(caps) = re.captures(line) {
             let name = caps[1].trim().to_string();
             if !name.is_empty() {
@@ -462,12 +454,76 @@ pub(super) fn scrape_failures(text: &str, kind: TestKind) -> Vec<TestEntry> {
 // Raw failure context helpers
 // ============================================================================
 
-/// Maximum number of raw output lines to append as failure context.
-///
-/// This gives the agent enough signal to understand why a test failed
-/// without overwhelming the context window. Full output is always
-/// available via `SKIM_PASSTHROUGH=1`.
+/// Tail lines kept as a fallback when no failure marker is found, and as the
+/// recap block after a loud elision.
 pub(super) const MAX_FAILURE_CONTEXT_LINES: usize = 50;
+
+/// A failure section at or under this many lines is returned whole (#317).
+const FAILURE_CONTEXT_WHOLE_THRESHOLD: usize = 350;
+
+/// Head lines kept when the failure section exceeds the threshold. The first
+/// failure marker is inside the head by construction (the section starts at it).
+const FAILURE_CONTEXT_HEAD_LINES: usize = 300;
+
+/// Lines that mark the start of failure diagnostics across the supported
+/// runners (cargo, go, pytest, vitest/jest, dotnet). A false-early match only
+/// WIDENS the section — never loses the real error below it.
+const FAILURE_MARKERS: &[&str] = &[
+    "FAILED",
+    "--- FAIL:",
+    "panicked at",
+    "failures:",
+    "AssertionError",
+    "error[",
+    "✕",
+    "✗",
+];
+
+/// Extract the failure-diagnostic section from raw test-runner output (#317).
+///
+/// The section runs from the FIRST failure-marker line to the end of output:
+/// - section ≤ 350 lines → returned whole (compress, never truncate);
+/// - longer → head(300) — which contains the first error by construction —
+///   then a loud [`crate::output::elision_marker`], then the last 50 lines
+///   (the runners' recap block).
+/// - no marker found → last 50 lines (legacy tail fallback).
+///
+/// Returns `None` when the output is empty/whitespace.
+pub(super) fn failure_context_body(raw_output: &str) -> Option<String> {
+    let cleaned = crate::output::strip_ansi_cow(raw_output);
+
+    let section: &str = cleaned
+        .lines()
+        .find(|line| FAILURE_MARKERS.iter().any(|m| line.contains(m)))
+        .map(|first_marker_line| {
+            // Slice from the marker line's start to the end of output.
+            let offset = first_marker_line.as_ptr() as usize - cleaned.as_ptr() as usize;
+            &cleaned[offset..]
+        })
+        .unwrap_or_else(|| last_n_lines(&cleaned, MAX_FAILURE_CONTEXT_LINES));
+
+    if section.trim().is_empty() {
+        return None;
+    }
+
+    let total = section.lines().count();
+    if total <= FAILURE_CONTEXT_WHOLE_THRESHOLD {
+        return Some(section.trim_end().to_string());
+    }
+
+    let head: Vec<&str> = section.lines().take(FAILURE_CONTEXT_HEAD_LINES).collect();
+    let tail = last_n_lines(section, MAX_FAILURE_CONTEXT_LINES);
+    let shown = FAILURE_CONTEXT_HEAD_LINES + MAX_FAILURE_CONTEXT_LINES;
+    let marker = crate::output::elision_marker(shown, total, "lines")
+        .expect("elision: head+tail < total by construction (total > FAILURE_CONTEXT_WHOLE_THRESHOLD = 350, shown = 350)");
+
+    Some(format!(
+        "{}\n{}\n{}",
+        head.join("\n"),
+        marker,
+        tail.trim_end()
+    ))
+}
 
 /// Append raw failure context to stdout and emit a compressed-output hint to
 /// stderr.
@@ -476,29 +532,17 @@ pub(super) const MAX_FAILURE_CONTEXT_LINES: usize = 50;
 /// the agent can read the actual error messages without re-running with
 /// `SKIM_PASSTHROUGH=1`.
 ///
-/// # Performance
-/// Applies [`last_n_lines`] first (zero-allocation `&str` slice) and then runs
-/// [`crate::output::strip_ansi`] only on the ~50-line tail, limiting the ANSI
-/// strip allocation to the tail rather than the full output string.
-///
 /// # Parameters
 /// - `raw_output`: the full raw output string from the test runner.
 /// - `exit_code`: the actual process exit code (e.g. `1` for test failures,
 ///   `2` for compilation errors in `go test`). Used in the stderr hint so the
 ///   caller knows the precise exit status to reproduce.
 pub(super) fn emit_failure_context(raw_output: &str, exit_code: i32) {
-    // Take the tail first (zero-allocation slice), then strip ANSI only on
-    // those ~50 lines instead of the entire output buffer.
-    let tail_raw = last_n_lines(raw_output, MAX_FAILURE_CONTEXT_LINES);
-    let tail = crate::output::strip_ansi(tail_raw);
-    if !tail.is_empty() {
-        println!(
-            "\n--- failure context (last {} lines) ---",
-            tail.lines().count()
-        );
-        println!("{tail}");
+    if let Some(body) = failure_context_body(raw_output) {
+        println!("\n--- failure context ---");
+        println!("{body}");
     }
-    eprintln!("[skim] compressed output (exit {exit_code}). SKIM_PASSTHROUGH=1 for full output.");
+    eprintln!("{}", crate::output::compressed_output_hint(exit_code));
 }
 
 /// Return the last `n` lines of `text` as a `&str` slice.
@@ -820,8 +864,8 @@ mod tests {
     }
 
     #[test]
-    fn test_scrape_failures_cap_at_100() {
-        // Build 200-failure fixture.
+    fn test_scrape_failures_collects_every_failure() {
+        // 200 failures — every failing test name is a diagnostic (#317).
         let mut text = String::new();
         for i in 0..200 {
             text.push_str(&format!("test test_{i} ... FAILED\n"));
@@ -829,10 +873,89 @@ mod tests {
         let entries = scrape_failures(&text, TestKind::Cargo);
         assert_eq!(
             entries.len(),
-            100,
-            "must be capped at 100: {}",
+            200,
+            "all failing test names must be collected: {}",
             entries.len()
         );
+    }
+
+    // ========================================================================
+    // failure_context_body tests (#317)
+    // ========================================================================
+
+    #[test]
+    fn test_failure_context_starts_at_first_marker() {
+        let mut text = String::new();
+        for i in 0..200 {
+            text.push_str(&format!("noise line {i}\n"));
+        }
+        text.push_str("thread 'tests::t' panicked at src/lib.rs:5:9:\n");
+        text.push_str("assertion failed: oops\n");
+        let body = failure_context_body(&text).expect("must produce a body");
+        assert!(
+            body.starts_with("thread 'tests::t' panicked at"),
+            "section must start at the first failure marker: {body}"
+        );
+        assert!(body.contains("assertion failed: oops"), "{body}");
+        assert!(!body.contains("noise line 199"), "preamble noise excluded");
+    }
+
+    #[test]
+    fn test_failure_context_whole_section_under_threshold() {
+        let mut text = String::from("failures:\n");
+        for i in 0..100 {
+            text.push_str(&format!("detail {i}\n"));
+        }
+        let body = failure_context_body(&text).expect("must produce a body");
+        for i in 0..100 {
+            assert!(body.contains(&format!("detail {i}")), "line {i} missing");
+        }
+        assert!(
+            !body.contains("omitted"),
+            "no elision under the threshold: {body}"
+        );
+    }
+
+    #[test]
+    fn test_failure_context_long_section_elides_loudly() {
+        // 500-line section: head 300 (contains the panic) + marker + tail 50.
+        let mut text = String::from("thread 'tests::t' panicked at src/lib.rs:5:9:\n");
+        for i in 0..499 {
+            text.push_str(&format!("trace line {i}\n"));
+        }
+        let body = failure_context_body(&text).expect("must produce a body");
+        assert!(
+            body.contains("panicked at"),
+            "first error in head: {body:.80}"
+        );
+        assert!(
+            body.contains("lines omitted") && body.contains("SKIM_PASSTHROUGH=1"),
+            "elision must be loud with the escape hatch: {body:.400}"
+        );
+        assert!(
+            body.contains("trace line 498"),
+            "tail recap block must be present"
+        );
+    }
+
+    #[test]
+    fn test_failure_context_no_marker_falls_back_to_tail() {
+        let mut text = String::new();
+        for i in 0..100 {
+            text.push_str(&format!("plain line {i}\n"));
+        }
+        let body = failure_context_body(&text).expect("must produce a body");
+        assert!(body.contains("plain line 99"), "{body}");
+        assert!(
+            !body.contains("plain line 0\n"),
+            "fallback keeps only the tail"
+        );
+    }
+
+    #[test]
+    fn test_failure_context_empty_output_is_none() {
+        assert!(failure_context_body("").is_none());
+        assert!(failure_context_body("   \n  \n").is_none());
     }
 
     #[test]

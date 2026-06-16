@@ -23,6 +23,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     family: "file",
     skip_ansi_strip: false,
     command_type: CommandType::FileOps,
+    expected_exit_codes: &[],
+    forward_stderr: true,
 };
 
 /// Run `skim du [args...]`.
@@ -78,14 +80,7 @@ fn try_parse_du(stdout: &str) -> Option<FileResult> {
     }
 
     let shown_count = entries.len();
-    let footer = if total_count > MAX_DISPLAY_ENTRIES {
-        Some(format!(
-            "... and {} more",
-            total_count - MAX_DISPLAY_ENTRIES
-        ))
-    } else {
-        None
-    };
+    let footer = crate::output::elision_marker(shown_count, total_count, "entries");
 
     Some(FileResult::new(
         "du".to_string(),

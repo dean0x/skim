@@ -17,7 +17,7 @@ use crate::cmd::user_has_flag;
 use crate::output::ParseResult;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 
-use super::shared::{ArgPreparation, MAX_ENTRIES, TestRunnerConfig, run_test_runner};
+use super::shared::{ArgPreparation, TestRunnerConfig, run_test_runner};
 
 // ============================================================================
 // Regex patterns
@@ -347,7 +347,7 @@ fn parse_trx_xml(xml: &str) -> Option<TestResult> {
                 b"Counters" => {
                     counters = parse_counters_element(e.attributes().flatten());
                 }
-                b"UnitTestResult" if entries.len() < MAX_ENTRIES => {
+                b"UnitTestResult" => {
                     let (name, outcome) = parse_unit_test_result_attrs(e.attributes().flatten());
                     if let (Some(name), Some(outcome)) = (name, outcome) {
                         entries.push(TestEntry {
@@ -380,21 +380,14 @@ fn parse_trx_xml(xml: &str) -> Option<TestResult> {
             }
             Ok(Event::End(e)) => match e.name().as_ref() {
                 b"UnitTestResult" => {
-                    if entries.len() < MAX_ENTRIES {
-                        if let (Some(name), Some(outcome)) =
-                            (current_test_name.take(), current_outcome.take())
-                        {
-                            entries.push(TestEntry {
-                                name,
-                                outcome,
-                                detail: current_error.take(),
-                            });
-                        }
-                    } else {
-                        // Discard accumulated state for this entry.
-                        current_test_name.take();
-                        current_outcome.take();
-                        current_error.take();
+                    if let (Some(name), Some(outcome)) =
+                        (current_test_name.take(), current_outcome.take())
+                    {
+                        entries.push(TestEntry {
+                            name,
+                            outcome,
+                            detail: current_error.take(),
+                        });
                     }
                 }
                 b"Message" => {

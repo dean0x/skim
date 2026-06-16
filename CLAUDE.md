@@ -60,6 +60,16 @@ cargo run --bin skim -- file.ts --mode=signatures   # run locally
 
 `rskim` is bin-only (the `skim` binary; no `src/lib.rs`) — scope its tests with `cargo test -p rskim --bins` (or `--all-targets`). `cargo test -p rskim --lib` errors with "no library targets found" (a cargo target-selection behavior, not a skim bug). `rskim-core`/`rskim-search` are libraries and accept `--lib`.
 
+### Build/test resource limits
+
+A machine-global `~/.cargo/config.toml` caps every cargo invocation at `jobs = 4` and `RUST_TEST_THREADS = 4`, and routes compilation through `sccache` (a compile cache shared across parallel clones). **That config file is the enforcement layer — it protects every branch and clone regardless of this doc; the guidance below exists because the cap alone can still be multiplied by parallelism.** Running unbounded parallel builds across two clones once exhausted 64 GB RAM (heavy tree-sitter/SQLite/rustls deps + release LTO/`codegen-units=1`) and hard-restarted the machine. The root multiplier was **two clones with separate `target/` dirs compiling identical heavy deps at once**. Rules for agents and workflows:
+
+- **Scope cargo per-crate** (`-p <crate>`). Never `--workspace` or `--all-features` *inside an agent* — those fan out across all 5 crates and their heavy deps simultaneously.
+- **Never `cargo test -p rskim` in an agent**: it spawns a *nested* cargo (daemon meta-tests) on top of subprocess-spawning E2E tests. Use `cargo test -p rskim --bins` / `--all-targets` (see the scoping note above).
+- **Prefer `cargo nextest run -p <crate> -j 4`** for unit/integration tests, **plus `cargo test -p <crate> --doc`** for doctests (nextest cannot run doctests).
+- **Never run two release/LTO builds concurrently**, and never kick off a heavy build in both clones at the same time.
+- **Defer the full `--all-features` regression** to the main loop or a human, run when the machine is otherwise idle.
+
 Modes are set via `--mode` only (no config file): `structure` (default), `signatures`, `types`, `minimal`, `pseudo`, `full`.
 
 ### Subcommands
@@ -87,7 +97,7 @@ Most subcommands wrap a dev tool (cargo, git, npm, pytest, eslint, docker, psql,
 
 ## Design Constraints
 
-**MUST:** stream to stdout (never write intermediate files) · prefer `&str` slices over allocation in the hot path · tolerate incomplete code (rely on tree-sitter error nodes) · stay under 50ms for 1000-line files (benchmark regressions block) · fail loud with actionable messages, never silently · modes via CLI flags only, no `.skimrc`.
+**MUST:** stream to stdout (never write intermediate files) · prefer `&str` slices over allocation in the hot path · tolerate incomplete code (rely on tree-sitter error nodes) · stay under 50ms for 1000-line files (benchmark regressions block) · fail loud with actionable messages, never silently · modes via CLI flags only, no `.skimrc` · **compress, never truncate** (#317): wrappers may re-encode output but never show less than the raw tool; an unavoidable safety bound must use `output::elision_marker` (exact counts + `SKIM_PASSTHROUGH=1` hint); unexpected non-zero exits forward raw output instead of compressing; rewrites must reconstruct the command byte-faithfully or bail (never emit a command that errors or changes semantics).
 
 **MUST NOT:** add syntax highlighting (use `bat`), linting (use linters), type checking (use `tsc`/`mypy`), or LSP features — all out of scope.
 

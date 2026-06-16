@@ -23,6 +23,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     family: "file",
     skip_ansi_strip: false,
     command_type: CommandType::FileOps,
+    expected_exit_codes: &[],
+    forward_stderr: true,
 };
 
 /// Run `skim df [args...]`.
@@ -80,14 +82,7 @@ fn try_parse_df(stdout: &str) -> Option<FileResult> {
 
     // entries includes the header, so shown_count = entries.len() - 1 (data rows)
     let shown_count = entries.len().saturating_sub(1);
-    let footer = if filesystem_count > MAX_DISPLAY_ENTRIES {
-        Some(format!(
-            "... and {} more",
-            filesystem_count - MAX_DISPLAY_ENTRIES
-        ))
-    } else {
-        None
-    };
+    let footer = crate::output::elision_marker(shown_count, filesystem_count, "filesystems");
 
     Some(FileResult::new(
         "df".to_string(),
@@ -175,8 +170,12 @@ mod tests {
         );
         let footer = result.footer.as_ref().unwrap();
         assert!(
-            footer.contains("more"),
-            "Footer should mention the omitted count, got: {footer}"
+            footer.contains("filesystems omitted"),
+            "Footer should mention omitted filesystems count, got: {footer}"
+        );
+        assert!(
+            footer.contains("SKIM_PASSTHROUGH=1"),
+            "Footer should include SKIM_PASSTHROUGH=1 escape hatch, got: {footer}"
         );
     }
 
