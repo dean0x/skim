@@ -13,7 +13,10 @@
 use std::path::Path;
 use std::time::Instant;
 
-use rskim_search::{NgramIndexReader, QueryEngine, SearchLayer, SearchQuery};
+use rskim_search::{
+    CompositeWeights, NgramIndexReader, QueryEngine, SearchLayer, SearchQuery, intersect_and_rank,
+    recompose_with_lexical,
+};
 
 use super::manifest::FileManifest;
 use super::snippet::{SnippetOutcome, extract_snippet};
@@ -94,49 +97,103 @@ pub(super) fn execute_query_with_manifest(
     let stats = reader.stats();
     let engine = QueryEngine::new(Box::new(reader));
 
-    // Build the query.
-    let mut sq = SearchQuery::new(config.text.clone());
-    sq.limit = Some(config.limit);
-
     // Hoist sorted_paths() so it is computed once and reused for both the
     // file_filter construction and the path-resolution step below.
     let sorted = manifest.sorted_paths();
 
-    // Build the FileId allowlist from blast-radius paths + AST file IDs.
-    // Intersection logic:
-    // - blast-radius only: path-based allowlist (path → FileId).
-    // - AST only: use the AST FileId set directly (moved — no clone).
-    // - Both: intersection of the two sets (FileId-level, no path round-trip).
-    // - Neither: no filter (sq.file_filter stays None).
-    //
-    // paths_to_file_ids is the single source of truth for the PF-004 widening
-    // (`u32::try_from`) and the "matched 0 indexed files" warning string.
+    // Build the FileId allowlist from blast-radius paths.
+    // Used for blast-radius-only and blast+AST paths.
     let blast_file_ids: Option<std::collections::HashSet<rskim_search::FileId>> = config
         .blast_radius_paths
         .as_ref()
         .map(|allowed_paths| super::temporal::paths_to_file_ids(&sorted, allowed_paths));
 
-    // Match on borrows so we clone only in the one arm that needs an owned value.
-    // In the (Some, Some) intersection arm the AST set is borrow-only (.contains),
-    // so cloning it upfront wastes an allocation on the heaviest combined-filter path.
-    match (blast_file_ids, config.ast_file_ids.as_ref()) {
-        (Some(blast), Some(ast)) => {
-            // Intersection: only files in BOTH sets (borrow ast — no clone needed).
+    // ── Compound text+AST path (#198) ─────────────────────────────────────────
+    //
+    // When `ast_scored` is Some, replace the old file_filter gate with true
+    // weighted-RRF composite intersection:
+    //
+    //   1. Fetch a WIDER lexical candidate pool (limit * CANDIDATE_POOL_K) so
+    //      files that rank lower in pure-lexical order but higher in composite
+    //      order are not truncated before the blend sees them.
+    //      (Mirrors temporal.rs:420 window logic — same constant K=4.)
+    //   2. Optionally restrict lexical candidates by blast-radius (if set).
+    //   3. Run intersect_and_rank: linear merge-join + weighted RRF fusion.
+    //   4. Recompose: carry the lexical SearchResult (snippet + line_range)
+    //      with the composite RRF score replacing the raw lexical score (AC11).
+    //   5. Truncate to --limit LAST (rank-then-truncate-LAST invariant).
+    //
+    // The AST index does not expose an AstIndexReader here (that reader lives in
+    // mod.rs / ast.rs), so structural metrics are injected as a no-op lookup for
+    // now (pure depth-based refinement requires the AstIndexReader to be threaded
+    // through; that is a follow-up in the same ticket — the compound fn already
+    // accepts the injected closure and honours it when non-None).
+    // DEFERRED: threading AstIndexReader into execute_query_with_manifest for
+    // structural metrics.  For 4a the structural lookup is a no-op; the RRF
+    // fusion of lexical+AST rank alone replaces the file_filter gate (#198).
+    if let Some(ref ast_scored_vec) = config.ast_scored {
+        // Wider lexical pool before compound ranking.
+        const CANDIDATE_POOL_K: usize = 4;
+        let mut sq = SearchQuery::new(config.text.clone());
+        sq.limit = Some(config.limit * CANDIDATE_POOL_K);
+
+        // Apply blast-radius pre-filter when present (blast ∩ AST path).
+        if let Some(ref blast) = blast_file_ids {
+            // Intersection of blast-radius set with AST FileId set.
             let intersection: std::collections::HashSet<rskim_search::FileId> = blast
                 .iter()
-                .filter(|id| ast.contains(*id))
+                .filter(|id| ast_scored_vec.iter().any(|(fid, _)| fid == *id))
                 .copied()
                 .collect();
             sq.file_filter = Some(intersection);
         }
-        (Some(blast), None) => {
+        // (No else: without blast-radius, no lexical file_filter — the compound
+        // intersection acts as the filter, not the lexical engine's file_filter.)
+
+        let raw_lex = engine.search(&sq)?;
+
+        // Compound intersect + RRF fusion (pure, no I/O, closures only).
+        // Structural lookup: no-op for 4a (AstIndexReader not threaded here).
+        let no_metrics =
+            |_fid: rskim_search::FileId| -> Option<rskim_search::StructuralMetrics> { None };
+        let ranked = intersect_and_rank(
+            &raw_lex,
+            ast_scored_vec,
+            no_metrics,
+            0.0_f32, // avg_max_depth — no-op when structural lookup is None
+            CompositeWeights::default(),
+        );
+
+        // Recompose: carry lexical SearchResult (snippet + line_range), replace score.
+        // Truncate to --limit LAST (rank-then-truncate-LAST invariant, Amendment).
+        let recomposed: Vec<rskim_search::SearchResult> = recompose_with_lexical(&ranked, &raw_lex)
+            .into_iter()
+            .take(config.limit)
+            .collect();
+
+        let results = resolve_paths_and_snippets(&recomposed, &sorted, root, &manifest);
+        let total = results.len();
+        let duration_ms = start.elapsed().as_millis() as u64;
+        return Ok(QueryOutput {
+            query: config.text.clone(),
+            total,
+            results,
+            duration_ms,
+            index_stats: Some(stats),
+        });
+    }
+    // ── End compound text+AST path ────────────────────────────────────────────
+
+    // ── Pure-lexical / blast-radius-only path (unchanged from #199) ──────────
+    let mut sq = SearchQuery::new(config.text.clone());
+    sq.limit = Some(config.limit);
+
+    // Build the FileId allowlist from blast-radius paths only (no AST in this path).
+    match blast_file_ids {
+        Some(blast) => {
             sq.file_filter = Some(blast);
         }
-        (None, Some(ast)) => {
-            // Clone only here, where the owned set is needed for sq.file_filter.
-            sq.file_filter = Some(ast.clone());
-        }
-        (None, None) => {
+        None => {
             // No filter.
         }
     }

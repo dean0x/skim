@@ -807,10 +807,14 @@ fn run_ast_standalone_with_real_index_maps_paths() {
     }
 }
 
-/// resolve_ast_file_filter returns a non-empty HashSet for a pattern that
+/// resolve_ast_scored returns a non-empty Vec for a pattern that
 /// matches at least one Rust file in the fixture project.
+///
+/// Previously `resolve_ast_file_filter` returned `HashSet<FileId>` (scores
+/// discarded).  After #198 it returns `Vec<(FileId, f64)>` so the compound
+/// intersector can build a rank map from actual scores.
 #[test]
-fn resolve_ast_file_filter_returns_matching_file_ids() {
+fn resolve_ast_scored_returns_matching_file_ids() {
     let project = make_project_with_rust();
     let cache = tempfile::tempdir().unwrap();
 
@@ -820,27 +824,38 @@ fn resolve_ast_file_filter_returns_matching_file_ids() {
 
     // "rust-nested-loop" matches block → expression_statement → for_expression,
     // which appears in src/loops.rs (nested for loops).
-    let ids = super::resolve_ast_file_filter(&engine, "rust-nested-loop").unwrap();
+    let hits = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
 
     // The project has at least one Rust file with nested loops — assert non-empty.
     assert!(
-        !ids.is_empty(),
+        !hits.is_empty(),
         "rust-nested-loop pattern must match at least one file in the fixture project"
     );
 
-    // All returned FileIds must be within the manifest range.
+    // All returned FileIds must be within the manifest range; all scores > 0.
     use super::super::manifest::FileManifest;
     let manifest =
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
     let file_count = manifest.sorted_paths().len();
-    for id in &ids {
+    for (id, score) in &hits {
         assert!(
             (id.0 as usize) < file_count,
             "FileId({}) must be within manifest range [0, {})",
             id.0,
             file_count
         );
+        assert!(
+            *score > 0.0,
+            "AST score for FileId({}) must be > 0, got {score}",
+            id.0
+        );
     }
+    // Results must be sorted FileId-ASC (frozen Wave-4 contract from #287).
+    let fids: Vec<u32> = hits.iter().map(|(f, _)| f.0).collect();
+    assert!(
+        fids.windows(2).all(|w| w[0] <= w[1]),
+        "resolve_ast_scored must return results sorted FileId-ASC (Wave-4 contract): {fids:?}"
+    );
 }
 
 // ============================================================================
@@ -856,7 +871,7 @@ fn resolve_ast_file_filter_returns_matching_file_ids() {
 /// - "--ast rust-nested-loop" → should match src/loops.rs (nested for loops in Rust).
 /// - Intersection → src/loops.rs (in both sets, with lexical snippets preserved).
 ///
-/// We drive through the engine directly (resolve_ast_file_filter + execute_query)
+/// We drive through the engine directly (resolve_ast_scored + execute_query)
 /// so the test is hermetic (no system cache required).
 #[test]
 fn text_ast_intersection_preserves_lexical_snippets() {
@@ -868,17 +883,18 @@ fn text_ast_intersection_preserves_lexical_snippets() {
 
     build_project_index(project.path(), cache.path());
 
-    // Build the AST file filter for "rust-nested-loop" (matches Rust nested for loops).
+    // Fetch the AST scored results for "rust-nested-loop" (matches Rust nested for loops).
+    // After #198, resolve_ast_scored returns Vec<(FileId, f64)> for compound RRF fusion.
     let engine = super::open_ast_engine(cache.path()).unwrap();
-    let ast_ids = super::resolve_ast_file_filter(&engine, "rust-nested-loop").unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
 
-    // The AST filter must be non-empty for this test to be meaningful.
+    // The AST results must be non-empty for this test to be meaningful.
     assert!(
-        !ast_ids.is_empty(),
+        !ast_scored.is_empty(),
         "rust-nested-loop must match at least one file so intersection is testable"
     );
 
-    // Run the lexical query with the AST filter applied.
+    // Run the compound query with the AST scored results.
     let config = QueryConfig {
         text: "nested".to_string(),
         limit: 20,
@@ -886,7 +902,7 @@ fn text_ast_intersection_preserves_lexical_snippets() {
         root: project.path().to_path_buf(),
         cache_dir: cache.path().to_path_buf(),
         blast_radius_paths: None,
-        ast_file_ids: Some(ast_ids),
+        ast_scored: Some(ast_scored),
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
@@ -1154,9 +1170,9 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
 
     // --- Step 1: Verify the UNFILTERED AST result set contains BOTH alpha and beta ---
-    // Use resolve_ast_file_filter (same code path as run_ast_standalone internally).
+    // Use resolve_ast_scored (returns Vec<(FileId,f64)> for compound RRF, #198).
     let engine = super::open_ast_engine(cache.path()).unwrap();
-    let all_ast_ids = super::resolve_ast_file_filter(&engine, "rust-nested-loop").unwrap();
+    let all_ast_hits = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
 
     // Confirm both alpha.rs and beta.rs are in the AST result set.
     let sorted = manifest.sorted_paths();
@@ -1180,14 +1196,14 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
         "src/beta.rs must be in the manifest (fixture setup)"
     );
     assert!(
-        all_ast_ids.contains(&alpha_fid.unwrap()),
+        all_ast_hits.iter().any(|(f, _)| f == &alpha_fid.unwrap()),
         "src/alpha.rs must match rust-nested-loop (precondition for intersection test)"
     );
     assert!(
-        all_ast_ids.contains(&beta_fid.unwrap()),
+        all_ast_hits.iter().any(|(f, _)| f == &beta_fid.unwrap()),
         "src/beta.rs must match rust-nested-loop (precondition for intersection test)"
     );
-    let unfiltered_count = all_ast_ids.len();
+    let unfiltered_count = all_ast_hits.len();
 
     // --- Step 2: Populate TemporalDb with known co-change: alpha.rs <-> plain.rs ---
     // Only src/alpha.rs co-changes with src/plain.rs.  src/beta.rs has NO co-change

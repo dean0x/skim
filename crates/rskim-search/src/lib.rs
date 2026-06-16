@@ -24,6 +24,7 @@
 pub mod ast_index;
 pub mod ast_weights;
 pub mod cochange;
+pub mod compound;
 pub(crate) mod fields;
 pub mod index;
 pub(crate) mod io_util;
@@ -63,6 +64,9 @@ const _: () = assert!(
 );
 
 pub use cochange::{CochangeMatrixBuilder, CochangeMatrixReader};
+pub use compound::{
+    CompositeWeights, RRF_K, WEIGHT_AST, WEIGHT_LEXICAL, intersect_and_rank, recompose_with_lexical,
+};
 pub use index::{NgramIndexBuilder, NgramIndexReader};
 pub use lexical::{
     BM25FConfig, FIELD_COUNT, MAX_QUERY_BYTES, QueryEngine, bm25f_score, classify_source,

@@ -91,27 +91,30 @@ pub(super) fn validate_ast_pattern(raw: &str) -> anyhow::Result<AstQuery> {
 // FileId resolution
 // ============================================================================
 
-/// Resolve a `--ast` pattern to the set of matching `FileId`s.
+/// Resolve a `--ast` pattern to scored AST results for compound ranking (#198).
 ///
 /// Parses the pattern and calls [`AstQueryEngine::search_ast`] directly,
-/// which returns `Vec<(FileId, f64)>` sorted FileId-ASC — exactly what the
-/// intersection needs.  No `SearchResult` construction, no `usize::MAX` sort,
-/// no `SearchLayer` overhead.  The caller's `--limit` flag applies at
-/// intersection time inside the lexical search engine.
+/// which returns `Vec<(FileId, f64)>` sorted FileId-ASC — the frozen Wave-4
+/// contract used by the compound intersector.  Scores are preserved so the
+/// compound module can refine the AST ranked list with structural metrics.
+///
+/// **Changed from #199:** previously returned a lossy `HashSet<FileId>` (scores
+/// discarded).  Now returns the full scored vec so `intersect_and_rank` can
+/// build the AST rank map from actual scores.
 ///
 /// # Errors
 ///
 /// Returns `Err` when the pattern is invalid or the query fails.
-pub(super) fn resolve_ast_file_filter(
+pub(super) fn resolve_ast_scored(
     engine: &AstQueryEngine<AstIndexReader>,
     raw: &str,
-) -> anyhow::Result<HashSet<FileId>> {
+) -> anyhow::Result<Vec<(FileId, f64)>> {
     let query = rskim_search::parse_ast_query(raw.trim())
         .map_err(|e| anyhow::anyhow!("invalid AST pattern: {e}"))?;
     let hits = engine
         .search_ast(&query)
         .map_err(|e| anyhow::anyhow!("AST query failed: {e}"))?;
-    Ok(hits.into_iter().map(|(fid, _)| fid).collect())
+    Ok(hits)
 }
 
 // ============================================================================

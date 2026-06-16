@@ -104,16 +104,16 @@ pub(super) struct QueryConfig {
     /// so that the limit applies to the filtered result set rather than being
     /// wasted on files that would be discarded.
     pub blast_radius_paths: Option<std::collections::HashSet<String>>,
-    /// Optional set of FileIds from an AST structural pattern query (#199).
+    /// Optional scored AST results from a structural pattern query (#198).
     ///
-    /// When `Some`, only files whose `FileId` is in this set are scored.
-    /// This is the intersection filter for `text + --ast` combined queries.
-    /// Intersected with `blast_radius_paths` FileIds in `execute_query`
-    /// (set intersection is commutative — no ordering dependency).
+    /// When `Some`, carries `Vec<(FileId, f64)>` sorted ASC by FileId (the
+    /// frozen Wave-4 contract from #287).  The compound intersector in
+    /// `execute_query_with_manifest` uses these scores for weighted-RRF fusion
+    /// with the lexical results (replaces the old lossy HashSet gate from #199).
     ///
-    /// Additive: `None` means "no AST filter" (all existing callers compile
-    /// unchanged because they use `blast_radius_paths` field initialization).
-    pub ast_file_ids: Option<std::collections::HashSet<rskim_search::FileId>>,
+    /// `None` means "no AST filter" — pure-lexical path (all existing callers
+    /// compile unchanged because they initialize this field explicitly).
+    pub ast_scored: Option<Vec<(rskim_search::FileId, f64)>>,
 }
 
 /// A search result with the file path resolved and snippet extracted.
