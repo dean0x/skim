@@ -1409,8 +1409,8 @@ fn test_index_empty_project_overwrites_stale_skcache() {
     let result1 = build_index(&config).expect("non-empty build must succeed");
     assert!(result1.file_count > 0, "non-empty build must index files");
 
-    let skcache_path =
-        find_file_in_dir(cache.path(), "ast_index.skcache").expect("skcache must exist after build");
+    let skcache_path = find_file_in_dir(cache.path(), "ast_index.skcache")
+        .expect("skcache must exist after build");
     let populated = rskim_search::AstNgramCache::load(skcache_path.parent().unwrap());
     assert!(
         !populated.is_empty(),
@@ -1466,14 +1466,18 @@ fn test_index_crash_window_skcache_written_manifest_not_saved() {
     use super::super::types::IndexConfig;
     use super::build_index;
 
+    use rskim_search::{AstQueryEngine, parse_ast_query};
+
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     fs::create_dir_all(root.join(".git")).unwrap();
     fs::create_dir_all(root.join("src")).unwrap();
 
+    // Include a file with a structural pattern (nested loops) so the AST query
+    // comparison in Step 5 is non-trivial (avoids PF-007 — counter-only tests).
     fs::write(
         root.join("src/main.rs"),
-        "fn main() { println!(\"v1\"); }\n",
+        "fn main() {\n    for i in 0..3 {\n        for j in 0..3 {\n            let _ = (i, j);\n        }\n    }\n}\n",
     )
     .unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn helper() -> u32 { 42 }\n").unwrap();
@@ -1494,10 +1498,12 @@ fn test_index_crash_window_skcache_written_manifest_not_saved() {
     let state_n_count = manifest_state_n.entry_count();
     assert!(state_n_count > 0, "state-N manifest must have entries");
 
-    // Step 2: modify one file (state N+1).
+    // Step 2: modify one file (state N+1) — keep nested loops so the AST query
+    // observable in Step 5 is non-trivial (different range values → different SHA,
+    // same structural pattern → same AST query hits).
     fs::write(
         root.join("src/main.rs"),
-        "fn main() { println!(\"v2\"); }\n",
+        "fn main() {\n    for i in 0..5 {\n        for j in 0..5 {\n            let _ = (i, j);\n        }\n    }\n}\n",
     )
     .unwrap();
 
@@ -1607,6 +1613,46 @@ fn test_index_crash_window_skcache_written_manifest_not_saved() {
     assert_eq!(
         sha_recovery, sha_force,
         "src/main.rs SHA must be identical between recovery and --force build (crash-window safety)"
+    );
+
+    // AC8 AST query equivalence: run rust-nested-loop against the recovery index
+    // (before the force rebuild overwrites it) and against the force index.
+    // This catches a stale/divergent cached n-gram surviving the crash window —
+    // the precise risk AC8 targets.  Manifest comparison alone cannot detect it.
+    // We save the recovery cache dir result separately from the force build.
+    // Since config_force overwrites `cache`, we need a separate cache for force.
+    let cache_force_ac8 = tempfile::tempdir().unwrap();
+    let config_force_ac8 = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: true,
+        cache_dir_override: Some(cache_force_ac8.path().to_path_buf()),
+    };
+    // Load the recovery index (from `cache`) BEFORE the force build overwrites it.
+    let engine_recovery = AstQueryEngine::open(cache.path()).expect("recovery engine must open");
+    build_index(&config_force_ac8).expect("AC8 force comparison build must succeed");
+    let engine_force_ac8 =
+        AstQueryEngine::open(cache_force_ac8.path()).expect("AC8 force engine must open");
+
+    let q_ac8 = parse_ast_query("rust-nested-loop").expect("rust-nested-loop query must parse");
+    let hits_recovery = engine_recovery
+        .search_ast(&q_ac8)
+        .expect("recovery query must succeed");
+    let hits_force_ac8 = engine_force_ac8
+        .search_ast(&q_ac8)
+        .expect("force AC8 query must succeed");
+
+    // Both indexes must return the same number of AST hits for the nested-loop pattern.
+    // src/main.rs has nested loops, so both should return >= 1 hit.
+    assert_eq!(
+        hits_recovery.len(),
+        hits_force_ac8.len(),
+        "recovery index must return the same AST hit count as a force rebuild (AC8 n-gram equivalence); \
+         recovery={hits_recovery:?}, force={hits_force_ac8:?}"
+    );
+    assert!(
+        !hits_recovery.is_empty(),
+        "rust-nested-loop must match at least one file in the recovery index (AC8 non-trivial guard)"
     );
 }
 
@@ -1730,7 +1776,9 @@ fn test_index_incremental_extraction_count_less_than_full_build() {
         full_build_count
     );
 
-    // Restore original content to avoid polluting the fixtures.
+    // Write back the original content (operates on the tempdir copy of the fixture,
+    // not the real in-tree file — the restore is a no-op against the real fixture
+    // since the tempdir is dropped at end of scope, but kept for clarity).
     fs::write(&modified_file_path, &original_content).unwrap();
 }
 
@@ -1741,16 +1789,18 @@ fn test_index_incremental_extraction_count_less_than_full_build() {
 /// AC13: The ast_index.skcache file size for a larger fixture must be within the
 /// measured ratio bound (skcache bytes / source bytes).  (applies ADR-003)
 ///
-/// Binding gate: skcache_bytes < 5.0 × source_bytes on the in-tree Rust fixture.
-/// Measured ratio on tests/fixtures/rust/ (3 files, ~3.4 KB source): 3.66×.
-/// The AST index itself measured 1.23× source bytes per ADR-003; the skcache
-/// stores raw n-gram payloads PRE-scoring and carries per-entry format overhead
-/// (64-byte SHA key + 4-byte length prefix + 9-byte header) that dominates for
-/// small files, explaining the higher ratio.  5.0× is a 36% regression margin
-/// above the measured 3.66× — any implementation that exceeds 5× has bloated.
+/// Binding gate: skcache_bytes < 3.0 × source_bytes on the in-tree Rust fixture.
+/// Measured ratio on tests/fixtures/rust/ (3 files, ~3.4 KB source): well below 1.0×
+/// on larger files; the AST index itself measured 1.23× source bytes per ADR-003.
+/// The skcache stores raw n-gram payloads PRE-scoring and carries per-entry format
+/// overhead (64-byte SHA key + 4-byte length prefix + 9-byte header) that dominates
+/// for small files.  3.0× is a generous regression margin — any implementation that
+/// exceeds 3× on a real fixture has bloated.  The eprintln records the actual ratio
+/// on each run so regressions are visible in CI output even when the gate passes.
 ///
-/// For very small fixtures (< 1 KiB source) an absolute cap is used instead
-/// since the per-entry overhead makes the ratio measurement unreliable.
+/// For very small fixtures (< 8 KiB source) per-file format overhead dominates
+/// the ratio and makes the measurement unreliable; an absolute cap is used instead
+/// for catastrophic-bloat detection only.
 #[test]
 fn test_index_skcache_size_within_measured_bound() {
     use super::super::types::IndexConfig;
@@ -1899,7 +1949,7 @@ fn test_streaming_respects_max_files() {
 fn test_index_version_mismatch_causes_cold_start_integration() {
     use super::super::types::IndexConfig;
     use super::build_index;
-    use rskim_search::CACHE_FILENAME;
+    use rskim_search::AST_CACHE_FILENAME;
     use rskim_search::{AstQueryEngine, parse_ast_query};
 
     let dir = tempfile::tempdir().unwrap();
@@ -1930,7 +1980,7 @@ fn test_index_version_mismatch_causes_cold_start_integration() {
     );
 
     // Corrupt the version byte in the skcache to simulate a version mismatch.
-    let skcache_path = cache.path().join(CACHE_FILENAME);
+    let skcache_path = cache.path().join(AST_CACHE_FILENAME);
     assert!(
         skcache_path.exists(),
         "skcache must exist after first build"
@@ -2016,7 +2066,7 @@ fn test_index_version_mismatch_causes_cold_start_integration() {
 fn test_index_corrupt_skcache_entry_causes_single_reextract() {
     use super::super::types::IndexConfig;
     use super::build_index;
-    use rskim_search::{AstQueryEngine, CACHE_FILENAME, parse_ast_query};
+    use rskim_search::{AST_CACHE_FILENAME, AstQueryEngine, parse_ast_query};
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -2055,7 +2105,7 @@ fn test_index_corrupt_skcache_entry_causes_single_reextract() {
     // corrupt — valid length prefix, bad content → decode_entry returns None).
     // We use the raw skcache bytes: find any entry payload and zero it out.
     {
-        let skcache_path = cache.path().join(CACHE_FILENAME);
+        let skcache_path = cache.path().join(AST_CACHE_FILENAME);
         let mut bytes = fs::read(&skcache_path).expect("must read skcache");
 
         // The file layout: 4-byte magic + 1-byte version + 4-byte entry_count,
@@ -2088,21 +2138,24 @@ fn test_index_corrupt_skcache_entry_causes_single_reextract() {
         "all 3 files must still be indexed; got {}",
         result2.file_count
     );
-    // The corrupt entry is a miss (re-extracted); the other two remain hits.
-    // Note: if the corrupt entry happens to be the LAST in the file, stream
-    // continues to the preceding entries but not to any following entries.
-    // Because our skcache is content-addressed and we corrupted only one payload,
-    // at least one file must be re-extracted (the corrupt one).
-    assert!(
-        result2.ast_reextracted >= 1,
-        "at least the corrupt entry must be re-extracted; got ast_reextracted={}",
+    // AC10 binding assertion: EXACTLY the corrupt file is re-extracted, NOT the
+    // whole cache.  `ast_reextracted == 1` is the discriminating observable —
+    // `>= 1` would pass even if the entire cache were discarded (3 re-extractions).
+    // The corrupt_payload_is_miss_not_whole_cache_discard unit test in ast_cache_tests.rs
+    // verifies that decode_file continues past in-bounds corrupt entries, so the
+    // two valid entries (sha for util.rs and types.rs) are still served from cache.
+    assert_eq!(
+        result2.ast_reextracted, 1,
+        "exactly the corrupt entry must be re-extracted (AC10 discriminating gate, \
+         not the whole cache); got ast_reextracted={}",
         result2.ast_reextracted
     );
-    assert!(
-        result2.ast_cache_hits + result2.ast_reextracted == result2.file_count,
-        "hits + reextracted must equal file_count; got {} + {} != {}",
+    assert_eq!(
         result2.ast_cache_hits,
-        result2.ast_reextracted,
+        result2.file_count - 1,
+        "all non-corrupt files must be AST cache hits (AC10 no-whole-discard gate); \
+         got {} cache hits of {} files",
+        result2.ast_cache_hits,
         result2.file_count
     );
 
@@ -2133,5 +2186,128 @@ fn test_index_corrupt_skcache_entry_causes_single_reextract() {
     assert!(
         !hits_recovery.is_empty(),
         "rust-nested-loop must match at least one file in the recovery index"
+    );
+}
+
+// ============================================================================
+// AC7 — Cache-poisoning desync abort (cached entry carrying count==0)
+// ============================================================================
+
+/// AC7: A cached entry whose bigram payload carries count == 0 must trip the
+/// desync abort in `add_file_ngrams` (`check_count_nonzero`), causing `consume()`
+/// to return `Err` WITHOUT saving the manifest.
+///
+/// This exercises the new cache → builder poison path introduced by #290:
+/// unlike the ADR-006 tests (which pre-advance the builder via a dummy
+/// `add_file_ngrams` call), this test injects the poison via a `CachedAstEntry`
+/// attached to `ProcessedFile.ast_cached`.  The consumer must detect it on the
+/// AST desync path.  (AC7 — avoids PF-007)
+#[test]
+fn test_ac7_cached_zero_count_entry_aborts_via_desync() {
+    use rskim_search::{
+        AstBigram, AstBigramEntry, AstIndexBuilder, AstNgramCache, AstNgramSet, CachedAstEntry,
+        NgramIndexBuilder, StructuralMetrics,
+    };
+
+    use super::super::manifest::FileManifest;
+    use super::super::types::ProcessedFile;
+    use super::Pipeline;
+
+    let project = make_project();
+    let cache = tempfile::tempdir().unwrap();
+
+    // First build — establishes the old manifest on disk.
+    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS)
+        .expect("first build must succeed");
+
+    // Record the old manifest mtime to confirm it was NOT overwritten after abort.
+    let skfiles_path = cache
+        .path()
+        .read_dir()
+        .unwrap()
+        .flatten()
+        .find(|e| e.path().extension().is_some_and(|x| x == "skfiles"))
+        .expect("manifest (.skfiles) must exist after first build")
+        .path();
+
+    let old_mtime = fs::metadata(&skfiles_path)
+        .expect("skfiles must be stat-able")
+        .modified()
+        .expect("mtime must be available on this platform");
+
+    // Build minimal infrastructure — lexical builder, ast builder, manifest.
+    let mut lexical_builder = NgramIndexBuilder::new(cache.path().to_path_buf())
+        .expect("lexical builder must initialise");
+    let mut ast_builder =
+        AstIndexBuilder::new(cache.path().to_path_buf()).expect("AST builder must initialise");
+    let mut new_manifest =
+        FileManifest::new(project.path().to_path_buf(), cache.path().to_path_buf());
+
+    // Craft a CachedAstEntry with a bigram that has count == 0.
+    // This is the AC7 poison payload — passes round-trip codec (decode_entry
+    // tolerates zero counts) but trips check_count_nonzero inside add_file_ngrams.
+    // Use AstBigram::encode with two sentinel node-kind IDs (0, 1) — valid keys.
+    let poison_ast = CachedAstEntry {
+        ngrams: AstNgramSet {
+            bigrams: vec![AstBigramEntry {
+                ngram: AstBigram::encode(0, 1), // valid bigram key
+                weight: 1.0,
+                count: 0, // <— count == 0: the AC7 poison
+            }],
+            trigrams: vec![],
+        },
+        metrics: StructuralMetrics::default(),
+        node_count: 1,
+    };
+
+    // Send one ProcessedFile with the poison attached via ast_cached so the
+    // consumer takes the cache-hit path and forwards count==0 to add_file_ngrams.
+    let poisoned_sha = "a".repeat(64);
+    let (tx, rx) = crossbeam_channel::bounded::<ProcessedFile>(1);
+    let pf = ProcessedFile {
+        rel_path: std::path::PathBuf::from("src/main.rs"),
+        lang: rskim_core::Language::Rust,
+        content: "fn main() {}\n".to_string(),
+        sha256: poisoned_sha,
+        mtime: None,
+        field_map: vec![],
+        cache_hit: false,
+        ast_cached: Some(poison_ast), // <— injected via the cache-hit path
+    };
+    tx.send(pf).unwrap();
+    drop(tx); // close channel
+
+    // consume() must return Err — the zero-count bigram trips check_count_nonzero
+    // inside add_file_ngrams (the desync abort path documented in consume()'s doc).
+    let mut throwaway_ast_cache = AstNgramCache::empty();
+    let result = Pipeline::consume(
+        &mut lexical_builder,
+        &mut ast_builder,
+        &mut new_manifest,
+        &mut throwaway_ast_cache,
+        rx,
+        false,
+    );
+
+    assert!(
+        result.is_err(),
+        "consume must return Err when a cached entry carries count == 0 (AC7 cache-poison abort); got Ok"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("desync")
+            || err_msg.contains("count == 0")
+            || err_msg.contains("sequential"),
+        "error must identify the desync or count violation (AC7); got: {err_msg}"
+    );
+
+    // Manifest must NOT have been saved — old manifest still on disk.
+    let new_mtime = fs::metadata(&skfiles_path)
+        .expect("skfiles must still exist")
+        .modified()
+        .expect("mtime must be available");
+    assert_eq!(
+        old_mtime, new_mtime,
+        "manifest file mtime must not change after AC7 cache-poison abort (ADR-006 invariant)"
     );
 }

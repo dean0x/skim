@@ -245,36 +245,7 @@ impl<'cfg> Pipeline<'cfg> {
         let (walk_entries, walk_skip_count) = self.walk()?;
 
         if walk_entries.is_empty() {
-            // Nothing to index — flush empty lexical + AST indexes and manifest
-            // so that `check_staleness` can find `index.skidx` and treat the
-            // project as indexed rather than returning `NoIndex` on every query.
-            let builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
-            let _layer = builder.build()?;
-            // Also build an empty AST index so self-heal doesn't trigger
-            // immediately after an empty-project build.
-            let ast_builder = AstIndexBuilder::new(self.cache_dir.clone())
-                .map_err(|e| anyhow::anyhow!("failed to create AST index builder: {e}"))?;
-            ast_builder
-                .build()
-                .map_err(|e| anyhow::anyhow!("AST index build failed: {e}"))?;
-            // Write an empty skcache to maintain the "self-pruning, rebuilt from
-            // scratch each build" invariant — without this, a stale skcache from
-            // a prior non-empty build would survive on disk even though no SHAs
-            // in the new (empty) manifest can authorize its entries.
-            AstNgramCache::empty()
-                .save(&self.cache_dir)
-                .map_err(|e| anyhow::anyhow!("AST cache save failed: {e}"))?;
-            let mut manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
-            manifest.set_git_head(read_git_head(&self.config.root));
-            manifest.save()?;
-            return Ok(IndexResult {
-                file_count: 0,
-                skipped: to_u32_capped(walk_skip_count),
-                cache_hits: 0,
-                ast_cache_hits: 0,
-                ast_reextracted: 0,
-                duration: self.start.elapsed(),
-            });
+            return self.flush_empty(walk_skip_count);
         }
 
         // Stage 2: Load the manifest and the AST cache for incremental builds,
@@ -428,6 +399,40 @@ impl<'cfg> Pipeline<'cfg> {
         }
     }
 
+    /// Flush empty lexical + AST indexes, an empty skcache, and an empty manifest
+    /// when the project has no indexable files.
+    ///
+    /// Called when `walk_entries` is empty so that `check_staleness` can find
+    /// `index.skidx` and treat the project as indexed (rather than returning
+    /// `NoIndex` on every query).  Writing an empty skcache preserves the
+    /// "self-pruning, rebuilt from scratch each build" invariant — without it, a
+    /// stale skcache from a prior non-empty build would persist on disk.
+    fn flush_empty(self, walk_skip_count: usize) -> anyhow::Result<IndexResult> {
+        let builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
+        let _layer = builder.build()?;
+        // Build an empty AST index so self-heal doesn't trigger immediately.
+        let ast_builder = AstIndexBuilder::new(self.cache_dir.clone())
+            .map_err(|e| anyhow::anyhow!("failed to create AST index builder: {e}"))?;
+        ast_builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("AST index build failed: {e}"))?;
+        // Write an empty skcache to maintain the self-pruning invariant.
+        AstNgramCache::empty()
+            .save(&self.cache_dir)
+            .map_err(|e| anyhow::anyhow!("AST cache save failed: {e}"))?;
+        let mut manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
+        manifest.set_git_head(read_git_head(&self.config.root));
+        manifest.save()?;
+        Ok(IndexResult {
+            file_count: 0,
+            skipped: to_u32_capped(walk_skip_count),
+            cache_hits: 0,
+            ast_cache_hits: 0,
+            ast_reextracted: 0,
+            duration: self.start.elapsed(),
+        })
+    }
+
     /// Stage 2b: spawn the producer thread.
     ///
     /// Returns a join handle, the receiving end of the bounded channel, and a
@@ -544,42 +549,21 @@ impl<'cfg> Pipeline<'cfg> {
             // AST index: resolve payload from cache (hit) or derive fresh (miss).
             // The invariant: EVERY file that passes the lexical stage gets exactly
             // ONE `add_file_ngrams` call — hit or miss. NEVER skip. (applies ADR-006)
-            //
-            // Ownership strategy (avoids double-clone):
-            //   1. Insert the CachedAstEntry into new_ast_cache by value (one SHA clone).
-            //   2. Borrow the entry back from the map for add_file_ngrams.
-            // This eliminates the cache-hit double-clone and the cache-miss
-            // ngrams.clone() that existed when the entry and the borrow were separate.
-            // `add_file_ngrams` takes &AstNgramSet and StructuralMetrics is Copy,
-            // so a borrow from the map is sufficient. (applies ADR-003)
-            let sha_key = pf.sha256.clone(); // one SHA clone per file — used as cache key
-            if let Some(cached) = pf.ast_cached {
-                // Cache hit: re-insert the owned entry so it survives to the next build.
+            let is_hit = pf.ast_cached.is_some();
+            let entry = resolve_ast_entry(
+                new_ast_cache,
+                pf.sha256.clone(),
+                pf.ast_cached,
+                &pf.content,
+                pf.lang,
+                &pf.rel_path,
+                debug_enabled,
+            );
+            if is_hit {
                 ast_cache_hits = ast_cache_hits.saturating_add(1);
-                new_ast_cache.insert(sha_key, cached);
             } else {
-                // Cache miss: run the full extraction and record the owned payload.
-                // Fail-soft: on ANY error, returns an empty aligned entry so AST
-                // FileIds stay in sync with lexical FileIds. NEVER skips.
-                let (ngrams, metrics, node_count) =
-                    derive_ast_entry(&pf.content, pf.lang, &pf.rel_path, debug_enabled);
                 ast_reextracted = ast_reextracted.saturating_add(1);
-                // Record in new_ast_cache (including empty entries for data-format
-                // files — cached empty is valid, not corrupt). (applies ADR-003)
-                new_ast_cache.insert(
-                    sha_key,
-                    CachedAstEntry {
-                        ngrams,
-                        metrics,
-                        node_count,
-                    },
-                );
             }
-            // Borrow the just-inserted entry back for add_file_ngrams.
-            // SAFETY: we just inserted above; the key is pf.sha256 which we cloned.
-            let entry = new_ast_cache
-                .lookup(&pf.sha256)
-                .expect("just inserted; must be present");
 
             // Add the AST entry for this file. The lexical entry for the SAME
             // FileId was already accepted, so an error here means the indexes are
@@ -646,6 +630,61 @@ impl<'cfg> Pipeline<'cfg> {
 // ============================================================================
 // Streaming producer helper
 // ============================================================================
+
+/// Resolve the AST n-gram payload for one file into `new_ast_cache`, returning
+/// a shared borrow of the stored entry.
+///
+/// # Responsibility
+///
+/// This helper extracts the multi-branch AST cache hit/miss logic from the
+/// consume loop so `consume()` reads as a flat sequence of four steps:
+/// lexical-add → resolve-ast → ast-add → advance.
+///
+/// # Cache semantics
+///
+/// - **Hit** (`cached.is_some()`): the owned `CachedAstEntry` arrived with the
+///   `ProcessedFile`; insert it into `new_ast_cache` so it survives to the next
+///   build, then return a borrow.  Uses `get_or_insert` (Entry API) so the SHA
+///   key is hashed only once — no insert-then-re-probe double-hash. (applies ADR-003)
+///
+/// - **Miss** (`cached.is_none()`): run `derive_ast_entry` (fail-soft: always
+///   returns a valid, possibly empty triple), construct a `CachedAstEntry`, insert
+///   it, and return a borrow.  Empty entries for data-format files are valid cache
+///   entries, not corrupt. (applies ADR-003)
+///
+/// # AC7 poison-check note
+///
+/// A zero-count entry from the cache reaching `add_file_ngrams` will trigger the
+/// desync abort in `add_file_ngrams`'s `check_count_nonzero` guard (applies
+/// ADR-006).  That path is not handled here — `resolve_ast_entry` is intentionally
+/// unaware of it, keeping responsibilities separate.
+fn resolve_ast_entry<'cache>(
+    new_ast_cache: &'cache mut AstNgramCache,
+    sha_key: String,
+    cached: Option<CachedAstEntry>,
+    content: &str,
+    lang: rskim_core::Language,
+    rel_path: &std::path::Path,
+    debug_enabled: bool,
+) -> &'cache CachedAstEntry {
+    let entry = match cached {
+        Some(hit) => hit,
+        None => {
+            // Cache miss: full extraction (fail-soft: always returns a valid triple).
+            // Record in new_ast_cache including empty entries for data-format files.
+            let (ngrams, metrics, node_count) =
+                derive_ast_entry(content, lang, rel_path, debug_enabled);
+            CachedAstEntry {
+                ngrams,
+                metrics,
+                node_count,
+            }
+        }
+    };
+    // Entry API: hashes sha_key once, inserts if absent, returns &CachedAstEntry.
+    // Eliminates the insert-then-lookup double-probe and removes the .expect() panic.
+    new_ast_cache.get_or_insert(sha_key, entry)
+}
 
 /// Read a file's content, apply 2-tier SHA cache logic, and produce a
 /// [`ProcessedFile`] — or a [`SkipReason`] if the file should be excluded.

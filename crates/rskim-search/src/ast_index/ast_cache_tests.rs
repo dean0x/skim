@@ -67,7 +67,7 @@ fn round_trip_entry_populated() {
 /// (AC6 — empty is valid)
 #[test]
 fn round_trip_entry_empty() {
-    let original = CachedAstEntry::empty();
+    let original = CachedAstEntry::default();
     let encoded = encode_entry(&original);
     let decoded = decode_entry(&encoded).expect("empty entry must round-trip cleanly");
     assert_eq!(decoded, original, "decoded empty entry must equal original");
@@ -121,7 +121,7 @@ fn round_trip_file_level() {
     let sha1 = "a".repeat(SHA_HEX_LEN);
     let sha2 = "b".repeat(SHA_HEX_LEN);
     entries.insert(sha1.clone(), make_entry());
-    entries.insert(sha2.clone(), CachedAstEntry::empty());
+    entries.insert(sha2.clone(), CachedAstEntry::default());
 
     let buf = encode_file(&entries);
     let decoded = decode_file(&buf).expect("file round-trip must decode");
@@ -274,7 +274,7 @@ fn corrupt_payload_is_miss_not_whole_cache_discard() {
     //   sha_bad  — valid length prefix but in-bounds corrupt payload (decode_entry → None)
     //   sha_after — valid entry placed after the corrupt one
     let good_entry = make_entry();
-    let after_entry = CachedAstEntry::empty();
+    let after_entry = CachedAstEntry::default();
 
     let good_payload = encode_entry(&good_entry);
     let after_payload = encode_entry(&after_entry);
@@ -420,7 +420,7 @@ fn len_and_is_empty_reflect_state() {
     assert!(cache.is_empty());
     assert_eq!(cache.len(), 0);
 
-    cache.insert("k".repeat(SHA_HEX_LEN), CachedAstEntry::empty());
+    cache.insert("k".repeat(SHA_HEX_LEN), CachedAstEntry::default());
     assert!(!cache.is_empty());
     assert_eq!(cache.len(), 1);
 }

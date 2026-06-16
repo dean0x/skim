@@ -78,7 +78,7 @@ pub const CACHE_FILENAME: &str = "ast_index.skcache";
 /// SHA-256 hex string length (64 lowercase ASCII chars).
 const SHA_HEX_LEN: usize = 64;
 
-/// Maximum number of entries the cache will accept on load.
+/// Maximum number of file entries the cache will accept on load.
 ///
 /// Guards against allocation bombs from a corrupted file claiming millions of
 /// entries.  Mirrors `MAX_MANIFEST_ENTRIES` in `manifest.rs`.
@@ -91,6 +91,17 @@ const MAX_CACHE_ENTRIES: usize = 60_000;
 /// under a few KB; 1 MiB is a generous upper bound.  (applies ADR-003)
 const MAX_ENTRY_BYTES: usize = 1024 * 1024; // 1 MiB
 
+/// Maximum number of bigrams or trigrams in a single decoded cache entry.
+///
+/// Used in `decode_entry` to bound per-entry n-gram vector pre-allocations —
+/// a distinct concept from the whole-file entry cap (`MAX_CACHE_ENTRIES`).
+/// Derived from `MAX_ENTRY_BYTES`: a payload saturated with the smallest n-gram
+/// entry (bigram = 12 bytes) could hold at most 87,381 entries, but realistic
+/// Rust files rarely exceed a few thousand n-grams.  64 KiB-worth is generous.
+/// Using a dedicated constant avoids reusing the unrelated file-count cap and
+/// matches the one-constant-per-concept discipline. (applies ADR-003)
+const MAX_NGRAMS_PER_ENTRY: usize = MAX_ENTRY_BYTES / BIGRAM_ENTRY_BYTES; // ~87 K
+
 /// Maximum total file size for `ast_index.skcache` before reading into memory.
 ///
 /// Mirrors `MAX_MANIFEST_FILE_BYTES` in `manifest.rs`.  A valid skcache
@@ -99,7 +110,7 @@ const MAX_ENTRY_BYTES: usize = 1024 * 1024; // 1 MiB
 /// corrupt or adversarial files without blocking any real build.
 /// The per-entry cap (`MAX_ENTRY_BYTES`) and entry-count cap
 /// (`MAX_CACHE_ENTRIES`) apply inside the file once it is loaded.  (applies ADR-003)
-const MAX_SKCACHE_FILE_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
 // ============================================================================
 // Cached payload
@@ -110,7 +121,13 @@ const MAX_SKCACHE_FILE_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 /// `node_count` is `u32` matching `derive_ast_entry`'s return type.
 /// `StructuralMetrics.max_depth` is `u16` — arithmetic on it must widen to
 /// `u32` before ordering operations. (avoids PF-004)
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Default` yields an empty entry (all zero/empty fields), mirroring what
+/// `derive_ast_entry` returns for non-tree-sitter / large / empty files.
+/// Storing and serving empty entries from cache is correct — they avoid
+/// re-calling `linearize_source` on data-format files (JSON/YAML/TOML)
+/// that are known to produce no n-grams.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CachedAstEntry {
     /// Deduplicated structural n-grams for the file.
     pub ngrams: AstNgramSet,
@@ -119,23 +136,6 @@ pub struct CachedAstEntry {
     /// Number of CST nodes seen during linearization (0 for non-tree-sitter
     /// languages, empty files, and files >100 KiB).
     pub node_count: u32,
-}
-
-impl CachedAstEntry {
-    /// An empty entry, mirroring what `derive_ast_entry` returns for
-    /// non-tree-sitter / large / empty files.
-    ///
-    /// Storing and serving empty entries from cache is correct — they avoid
-    /// re-calling `linearize_source` on data-format files (JSON/YAML/TOML)
-    /// that are known to produce no n-grams.
-    #[must_use]
-    pub fn empty() -> Self {
-        Self {
-            ngrams: AstNgramSet::default(),
-            metrics: StructuralMetrics::default(),
-            node_count: 0,
-        }
-    }
 }
 
 // ============================================================================
@@ -176,8 +176,17 @@ fn encode_entry(entry: &CachedAstEntry) -> Vec<u8> {
 
     let mut buf = Vec::with_capacity(payload_len);
 
-    buf.extend_from_slice(&(bigram_count as u32).to_le_bytes());
-    buf.extend_from_slice(&(trigram_count as u32).to_le_bytes());
+    // Applies PF-004: try_from with saturating fallback, not `as u32`.
+    buf.extend_from_slice(
+        &u32::try_from(bigram_count)
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    buf.extend_from_slice(
+        &u32::try_from(trigram_count)
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
 
     for b in &entry.ngrams.bigrams {
         buf.extend_from_slice(&b.ngram.key().to_le_bytes());
@@ -245,8 +254,10 @@ fn decode_entry(buf: &[u8]) -> Option<CachedAstEntry> {
     let bigram_count = read_u32!() as usize;
     let trigram_count = read_u32!() as usize;
 
-    // Sanity-check counts against MAX_CACHE_ENTRIES to prevent giant allocs.
-    if bigram_count > MAX_CACHE_ENTRIES || trigram_count > MAX_CACHE_ENTRIES {
+    // Sanity-check per-entry n-gram counts using the dedicated per-entry cap
+    // (not the whole-file entry-count cap) to prevent giant Vec pre-allocations
+    // from a single forged entry. (applies ADR-003)
+    if bigram_count > MAX_NGRAMS_PER_ENTRY || trigram_count > MAX_NGRAMS_PER_ENTRY {
         return None;
     }
 
@@ -313,7 +324,8 @@ fn decode_entry(buf: &[u8]) -> Option<CachedAstEntry> {
 //     payload_len bytes: encoded CachedAstEntry
 
 fn encode_file(entries: &HashMap<String, CachedAstEntry>) -> Vec<u8> {
-    let entry_count = entries.len() as u32;
+    // Applies PF-004: try_from with saturating fallback, not `as u32`.
+    let entry_count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
     // Pre-size for header + rough per-entry estimate.
     let mut buf = Vec::with_capacity(9 + entries.len() * (SHA_HEX_LEN + 4 + 256));
 
@@ -325,7 +337,12 @@ fn encode_file(entries: &HashMap<String, CachedAstEntry>) -> Vec<u8> {
         debug_assert_eq!(sha.len(), SHA_HEX_LEN, "SHA key must be exactly 64 chars");
         buf.extend_from_slice(sha.as_bytes());
         let payload = encode_entry(entry);
-        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        // Applies PF-004: try_from with saturating fallback, not `as u32`.
+        buf.extend_from_slice(
+            &u32::try_from(payload.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
         buf.extend_from_slice(&payload);
     }
 
@@ -446,7 +463,7 @@ impl AstNgramCache {
         // (applies ADR-003 — per-file caps are necessary but not sufficient)
         if path
             .metadata()
-            .is_ok_and(|m| m.len() > MAX_SKCACHE_FILE_BYTES)
+            .is_ok_and(|m| m.len() > MAX_CACHE_FILE_BYTES)
         {
             // Oversized — discard silently and cold-start.
             return Self::empty();
@@ -492,6 +509,22 @@ impl AstNgramCache {
     /// `linearize_source`. Empty payloads are valid cache entries, not corrupt.
     pub fn insert(&mut self, sha: String, entry: CachedAstEntry) {
         self.entries.insert(sha, entry);
+    }
+
+    /// Insert `entry` for `sha` if absent, then return a shared borrow.
+    ///
+    /// Uses the HashMap Entry API so the key is hashed exactly once — no
+    /// insert-then-lookup double-probe.  The borrow is valid for `'_` (tied
+    /// to `&mut self`), so the caller can use the returned reference for
+    /// `add_file_ngrams` without an additional lookup.
+    ///
+    /// # Duplicate-SHA note
+    ///
+    /// If two distinct files share the same content SHA (content-addressed
+    /// deduplication), only the first insert wins and both files borrow the
+    /// same entry — which is the correct and intended behaviour.
+    pub fn get_or_insert(&mut self, sha: String, entry: CachedAstEntry) -> &CachedAstEntry {
+        self.entries.entry(sha).or_insert(entry)
     }
 
     /// Atomically write `ast_index.skcache` to `cache_dir`.
