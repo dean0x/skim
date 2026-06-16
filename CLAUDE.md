@@ -12,12 +12,15 @@ User-facing install/usage lives in `README.md`; release mechanics in `CHANGELOG.
 
 ## Workspace
 
-Cargo workspace, 5 crates:
+Cargo workspace, 8 crates:
 - `rskim-core` — pure transform library (parsing, modes; no I/O side effects)
 - `rskim` — CLI binary (`skim`): caching, analytics, command wrappers
 - `rskim-search` — code-search index (lexical n-gram, temporal, AST structural), stored in `<root>/.skim/search.db`
 - `rskim-research` — offline tooling that generates AST weight tables
 - `rskim-bench` — benchmarks
+- `rskim-tokens` — offline + optional-network token counting (multi-provider; `net-anthropic` feature gates HTTP)
+- `rskim-contract` — byte-faithful contract / guardrail layer for transcript mutation
+- `rskim-llm` — LLM transcript parsing (OpenAI/Anthropic) + classifier
 
 `crates/rskim-search/src/ast_weights.rs` is **auto-generated — do not edit**. Regenerate via `rskim-research ast-run` then `ast-codegen`.
 

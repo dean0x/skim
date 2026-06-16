@@ -32,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trigger passthrough for those subcommands.
 
 ### Changed
+- **`skim stats --json` key ordering changed from alphabetical to insertion order** — Enabling
+  `serde_json`'s `preserve_order` feature workspace-wide (#302) switches `serde_json::Map`
+  from `BTreeMap` (alphabetical) to `IndexMap` (declaration/insertion order). `skim stats
+  --json` and `skim init`'s settings.json rewrite now emit keys in logical/insertion order.
+  JSON-spec-compatible; no test pins key order. Downstream `| jq` pipelines that rely on
+  alphabetical key ordering may need to add an explicit `| keys_unsorted` or `| to_entries`
+  sort step.
 - **Removed internal command-execution timeout caps (ADR-008)** — `CommandRunner` no longer
   imposes a wall-clock cap on wrapped commands. Previous versions killed `cargo test`,
   `npm build`, and other long-but-finite commands after 300 s (default) or 600 s (builds).

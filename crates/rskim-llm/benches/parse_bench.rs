@@ -16,9 +16,10 @@
 //! The counting-allocator memory k-bound (peak allocation <= k × body_size) is
 //! NOT yet wired up as an enforced assertion — there is no isolated
 //! counting-allocator test binary in this crate today (a global allocator must
-//! not be shared with parallel tests). The k ≈ 3.5 bound is documented
-//! analytically in `lib.rs`; wiring it as a regression gate is a follow-up
-//! (see #309 / Wave-1 perf-gate follow-up).
+//! not be shared with parallel tests). The k ≈ 2× bound (reduced from ~3.5×
+//! by the single-pass provider detection / IgnoredAny fix, commit f1c1a18c) is
+//! documented analytically in `lib.rs`; wiring it as a regression gate is a
+//! follow-up (see #309 / Wave-1 perf-gate follow-up).
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use rskim_llm::{classify_body, parse, serialize};

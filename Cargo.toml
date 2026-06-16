@@ -75,6 +75,9 @@ static_assertions = "1.1"
 trybuild = "1.0"
 gix = { version = "0.72", default-features = false, features = ["max-performance-safe", "blob-diff"] }
 quick-xml = "0.37"
+# Optional synchronous HTTP client for rskim-tokens net-anthropic feature.
+# Pinned to 2.8 — rustls 0.21 transitive dep; bump to 3.x after cargo audit follow-up (#324).
+ureq = { version = "2.8", default-features = false, features = ["rustls", "json"] }
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.14.0"
