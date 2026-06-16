@@ -9,6 +9,10 @@ use thiserror::Error;
 /// internal base64 decode of a bundled asset that ships valid. This means
 /// [`TokenError::TiktokenInit`] is practically unreachable at runtime, but is
 /// surfaced as `Err` so callers never see a panic (constraint 4 / AC10).
+///
+/// This enum is `#[non_exhaustive]` — new error variants may be added in future
+/// releases without a SemVer break (required before crates.io publish, #324).
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum TokenError {
     /// Failed to initialise a tiktoken BPE encoder.

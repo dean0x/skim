@@ -36,7 +36,8 @@ use std::sync::OnceLock;
 use tiktoken_rs::CoreBPE;
 
 use crate::{
-    Encoding, TokenError, anthropic_offline::count_anthropic_offline, heuristic::count_heuristic,
+    Encoding, Result, TokenError, anthropic_offline::count_anthropic_offline,
+    heuristic::count_heuristic,
 };
 
 /// A constructed token counter that owns a single [`Encoding`].
@@ -79,15 +80,15 @@ fn prefilled_lock(bpe: CoreBPE) -> OnceLock<CoreBPE> {
 
 /// Map a raw `tiktoken-rs` BPE-construction result into our error domain.
 ///
-/// Centralises the `Result<CoreBPE, anyhow::Error> -> Result<CoreBPE, TokenError>`
+/// Centralises the `std::result::Result<CoreBPE, anyhow::Error> -> Result<CoreBPE>`
 /// translation used by every tiktoken-backed encoding (avoids triplicating the
 /// `map_err`). It is also the **fault-injection seam for AC10**: feeding it an
 /// `Err` exercises the `TokenError::TiktokenInit` arm that the embedded vocab
 /// never triggers in practice (see `counter_tests::build_bpe_err_path_*`).
 fn build_bpe(
     encoding: &'static str,
-    result: Result<CoreBPE, anyhow::Error>,
-) -> Result<CoreBPE, TokenError> {
+    result: std::result::Result<CoreBPE, anyhow::Error>,
+) -> Result<CoreBPE> {
     result.map_err(|source| TokenError::TiktokenInit { encoding, source })
 }
 
@@ -112,7 +113,7 @@ impl Counter {
     ///
     /// Returns [`TokenError::TiktokenInit`] if the embedded BPE vocabulary
     /// fails to decode. This is practically unreachable at runtime.
-    pub fn new(encoding: Encoding) -> Result<Self, TokenError> {
+    pub fn new(encoding: Encoding) -> Result<Self> {
         let inner = match encoding {
             Encoding::Cl100k => CounterInner::Bpe(
                 Encoding::Cl100k,

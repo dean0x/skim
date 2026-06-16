@@ -31,7 +31,7 @@
 //!   client errors short-circuit immediately to avoid burning the retry budget
 //!   on a definitively failed request.
 
-use crate::TokenError;
+use crate::{Result, TokenError};
 use std::io::Read as _;
 use std::thread;
 use std::time::Duration;
@@ -114,7 +114,7 @@ impl AnthropicNetworkCounter {
     /// # Errors
     ///
     /// - [`TokenError::MissingApiKey`] — `ANTHROPIC_API_KEY` not set.
-    pub fn from_env(model_id: &str) -> Result<Self, TokenError> {
+    pub fn from_env(model_id: &str) -> Result<Self> {
         let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| TokenError::MissingApiKey)?;
         if api_key.is_empty() {
             return Err(TokenError::MissingApiKey);
@@ -133,7 +133,7 @@ impl AnthropicNetworkCounter {
     /// # Errors
     ///
     /// Returns [`TokenError::MissingApiKey`] if `api_key` is empty.
-    pub fn new(model_id: &str, api_key: String) -> Result<Self, TokenError> {
+    pub fn new(model_id: &str, api_key: String) -> Result<Self> {
         if api_key.is_empty() {
             return Err(TokenError::MissingApiKey);
         }
@@ -192,7 +192,7 @@ impl AnthropicNetworkCounter {
     ///
     /// - [`TokenError::NetworkRequest`] — connection failed, timed out, or got a non-2xx response.
     /// - [`TokenError::ApiResponse`] — response body was not valid JSON or lacked `input_tokens`.
-    pub fn count(&self, text: &str) -> Result<usize, TokenError> {
+    pub fn count(&self, text: &str) -> Result<usize> {
         let body = serde_json::json!({
             "model": self.model,
             "messages": [{"role": "user", "content": text}]
@@ -221,42 +221,7 @@ impl AnthropicNetworkCounter {
                 .send_string(&body_str);
 
             match result {
-                Ok(response) => {
-                    // Read with a bounded reader to guard against unbounded allocation
-                    // from a buggy or hostile server (reliability: every resource bounded).
-                    let reader = response.into_reader();
-                    let mut raw = Vec::new();
-                    reader
-                        .take(MAX_BODY_BYTES)
-                        .read_to_end(&mut raw)
-                        .map_err(|e| {
-                            TokenError::ApiResponse(format!("response read error: {e}"))
-                        })?;
-
-                    let json: serde_json::Value = serde_json::from_slice(&raw)
-                        .map_err(|e| TokenError::ApiResponse(format!("JSON parse error: {e}")))?;
-
-                    let input_tokens = json
-                        .get("input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .ok_or_else(|| {
-                            // Truncate embedded body to bound error-message length
-                            // (parse-at-boundary discipline — avoids unbounded strings in Err).
-                            let body_repr = json.to_string();
-                            let truncated =
-                                truncate_on_char_boundary(&body_repr, MAX_ERROR_BODY_LEN);
-                            TokenError::ApiResponse(format!(
-                                "missing 'input_tokens' field in response: {truncated}"
-                            ))
-                        })?;
-
-                    // Saturating cast: u64 → usize.
-                    // Token counts exceeding usize::MAX are astronomically unlikely,
-                    // but we use checked conversion + saturation for correctness on
-                    // 32-bit targets (avoids PF-004 silent narrowing).
-                    let count = usize::try_from(input_tokens).unwrap_or(usize::MAX);
-                    return Ok(count);
-                }
+                Ok(response) => return parse_count_response(response),
                 Err(ureq::Error::Status(code, _)) if (400..500).contains(&code) && code != 429 => {
                     // Permanent 4xx client error (e.g. 401 invalid key, 400 bad request,
                     // 403 forbidden, 413 payload too large). Do NOT retry — the error is
@@ -276,6 +241,49 @@ impl AnthropicNetworkCounter {
             last_err.unwrap_or_else(|| "unknown network error".to_owned()),
         ))
     }
+}
+
+/// Parse a successful Anthropic API response into a token count.
+///
+/// Reads the response body through a bounded reader (64 KiB cap), parses it as
+/// JSON, and extracts the `input_tokens` field. This is a pure parse-at-boundary
+/// helper — all I/O and retry logic lives in [`AnthropicNetworkCounter::count`].
+///
+/// # Errors
+///
+/// - [`TokenError::ApiResponse`] — body read error, invalid JSON, or missing
+///   `input_tokens` field.
+fn parse_count_response(response: ureq::Response) -> Result<usize> {
+    // Read with a bounded reader to guard against unbounded allocation
+    // from a buggy or hostile server (reliability: every resource bounded).
+    let reader = response.into_reader();
+    let mut raw = Vec::new();
+    reader
+        .take(MAX_BODY_BYTES)
+        .read_to_end(&mut raw)
+        .map_err(|e| TokenError::ApiResponse(format!("response read error: {e}")))?;
+
+    let json: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| TokenError::ApiResponse(format!("JSON parse error: {e}")))?;
+
+    let input_tokens = json
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            // Truncate embedded body to bound error-message length
+            // (parse-at-boundary discipline — avoids unbounded strings in Err).
+            let body_repr = json.to_string();
+            let truncated = truncate_on_char_boundary(&body_repr, MAX_ERROR_BODY_LEN);
+            TokenError::ApiResponse(format!(
+                "missing 'input_tokens' field in response: {truncated}"
+            ))
+        })?;
+
+    // Saturating cast: u64 → usize.
+    // Token counts exceeding usize::MAX are astronomically unlikely,
+    // but we use checked conversion + saturation for correctness on
+    // 32-bit targets (avoids PF-004 silent narrowing).
+    Ok(usize::try_from(input_tokens).unwrap_or(usize::MAX))
 }
 
 #[cfg(test)]

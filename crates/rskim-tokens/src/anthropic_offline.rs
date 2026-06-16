@@ -83,7 +83,7 @@ pub fn count_anthropic_offline(cl100k_count: usize) -> usize {
     if ceiling >= usize::MAX as f64 {
         usize::MAX
     } else {
-        // SAFETY: ceiling is finite, non-negative, and < usize::MAX as f64
+        // ceiling is finite, non-negative, and < usize::MAX as f64 — cast is lossless
         ceiling as usize
     }
 }
