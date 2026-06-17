@@ -309,10 +309,7 @@ fn exempt_block_kind(body: &AnthropicBody, block_id: &str) -> Option<String> {
                                 if !(leaf.block_type == "text" && leaf.text.is_some())
                                     && format!("m{mi}b{bi}l{li}") == block_id
                                 {
-                                    return Some(format!(
-                                        "tool_result-leaf-{}",
-                                        leaf.block_type
-                                    ));
+                                    return Some(format!("tool_result-leaf-{}", leaf.block_type));
                                 }
                             }
                         }

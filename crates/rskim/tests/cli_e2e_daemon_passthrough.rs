@@ -175,7 +175,7 @@ fn test_direct_dispatch_indefinite_exits_quickly_when_binary_missing() {
         // trip on a healthy machine.
         .timeout(std::time::Duration::from_secs(10))
         .assert();
-        // Primary check: exits within the timeout (does not hang).
-        // Exit-code mapping (127 for not-found vs 0/non-zero) is covered by the
-        // dispatch.rs unit test — this test only gates the no-hang property.
+    // Primary check: exits within the timeout (does not hang).
+    // Exit-code mapping (127 for not-found vs 0/non-zero) is covered by the
+    // dispatch.rs unit test — this test only gates the no-hang property.
 }

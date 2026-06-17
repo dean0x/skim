@@ -646,7 +646,10 @@ impl LeafRef {
         }
         impl Cursor {
             fn new() -> Self {
-                Self { buf: [0u8; 64], pos: 0 }
+                Self {
+                    buf: [0u8; 64],
+                    pos: 0,
+                }
             }
             fn push(&mut self, b: u8) {
                 if self.pos < self.buf.len() {
@@ -755,8 +758,14 @@ mod tests {
         let tb_id = tb.id();
         assert!(tb.id_eq(&tb_id), "id_eq must match id() for TextBlock");
         assert_eq!(tb_id, "m1b5");
-        assert!(!tb.id_eq("m1b6"), "id_eq must not match a different blk_idx");
-        assert!(!tb.id_eq("m1b5s"), "id_eq must not match the ToolResultString suffix");
+        assert!(
+            !tb.id_eq("m1b6"),
+            "id_eq must not match a different blk_idx"
+        );
+        assert!(
+            !tb.id_eq("m1b5s"),
+            "id_eq must not match the ToolResultString suffix"
+        );
 
         // Shape 3: ToolResultString → "m{i}b{j}s"
         let trs = LeafRef::ToolResultString {
@@ -764,10 +773,19 @@ mod tests {
             blk_idx: 2,
         };
         let trs_id = trs.id();
-        assert!(trs.id_eq(&trs_id), "id_eq must match id() for ToolResultString");
+        assert!(
+            trs.id_eq(&trs_id),
+            "id_eq must match id() for ToolResultString"
+        );
         assert_eq!(trs_id, "m0b2s");
-        assert!(!trs.id_eq("m0b2"), "id_eq must not match the TextBlock (no suffix) form");
-        assert!(!trs.id_eq("m0b2l0"), "id_eq must not match the ToolResultLeaf form");
+        assert!(
+            !trs.id_eq("m0b2"),
+            "id_eq must not match the TextBlock (no suffix) form"
+        );
+        assert!(
+            !trs.id_eq("m0b2l0"),
+            "id_eq must not match the ToolResultLeaf form"
+        );
 
         // Shape 4: ToolResultLeaf → "m{i}b{j}l{k}"
         let trl = LeafRef::ToolResultLeaf {
@@ -776,10 +794,19 @@ mod tests {
             leaf_idx: 7,
         };
         let trl_id = trl.id();
-        assert!(trl.id_eq(&trl_id), "id_eq must match id() for ToolResultLeaf");
+        assert!(
+            trl.id_eq(&trl_id),
+            "id_eq must match id() for ToolResultLeaf"
+        );
         assert_eq!(trl_id, "m2b0l7");
-        assert!(!trl.id_eq("m2b0l8"), "id_eq must not match a different leaf_idx");
-        assert!(!trl.id_eq("m2b0"), "id_eq must not match the shorter TextBlock form");
+        assert!(
+            !trl.id_eq("m2b0l8"),
+            "id_eq must not match a different leaf_idx"
+        );
+        assert!(
+            !trl.id_eq("m2b0"),
+            "id_eq must not match the shorter TextBlock form"
+        );
     }
 
     /// Guard: id_eq must handle multi-digit indices correctly.
@@ -795,7 +822,13 @@ mod tests {
         let id = leaf.id();
         assert_eq!(id, "m10b20l30");
         assert!(leaf.id_eq("m10b20l30"));
-        assert!(!leaf.id_eq("m10b20l3"), "must not match a prefix of a multi-digit leaf_idx");
-        assert!(!leaf.id_eq("m1b20l30"), "must not match single-digit prefix of msg_idx");
+        assert!(
+            !leaf.id_eq("m10b20l3"),
+            "must not match a prefix of a multi-digit leaf_idx"
+        );
+        assert!(
+            !leaf.id_eq("m1b20l30"),
+            "must not match single-digit prefix of msg_idx"
+        );
     }
 }
