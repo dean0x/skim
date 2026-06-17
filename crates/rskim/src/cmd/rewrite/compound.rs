@@ -20,6 +20,26 @@ use super::types::{
 
 // ---- Round-trip safety (#317) ----
 
+/// Return `true` when `cmd` (after stripping trailing whitespace) contains an
+/// **interior** newline that would make the command unsafe to rewrite.
+///
+/// Trailing newlines are benign — agent PreToolUse hooks often add a trailing
+/// `\n` to the command string, which does not affect tokenization.  Interior
+/// newlines (e.g., a multi-line commit message) indicate multi-line commands
+/// that `split_whitespace` would flatten, corrupting the byte sequence.
+///
+/// Fix C (fix/rewrite-hook-falseneg): the hook layer previously called
+/// `rewrite_would_corrupt` which checks `cmd.contains('\n')`, bailing even on
+/// commands with only a trailing newline — commands from agent hooks that were
+/// otherwise safely rewritable.  This function is the hook-layer guard: it
+/// trims trailing whitespace first so trailing newlines pass through, then
+/// delegates the full corruption check to [`rewrite_would_corrupt`].
+///
+/// Must be called with the raw hook-input command string.
+pub(super) fn command_needs_passthrough(cmd: &str) -> bool {
+    rewrite_would_corrupt(cmd.trim_end())
+}
+
 /// Return `true` when `cmd` contains shell syntax that the rewrite pipeline
 /// cannot reconstruct byte-faithfully — every rewrite path MUST bail.
 ///
@@ -1227,5 +1247,62 @@ mod tests {
                 panic!("foo >&1&& bar should split on && but got Bail")
             }
         }
+    }
+
+    // ========================================================================
+    // command_needs_passthrough — Fix C (fix/rewrite-hook-falseneg)
+    // ========================================================================
+
+    /// A trailing newline only (agent hooks add one) must NOT trigger passthrough.
+    ///
+    /// Fix C regression guard: `rewrite_would_corrupt` bails on ALL `\n`,
+    /// including trailing ones added by agent hook infrastructure.  A command
+    /// like `"cargo test\n"` is safe to rewrite after trimming.
+    #[test]
+    fn fix_c_trailing_newline_passes() {
+        assert!(
+            !command_needs_passthrough("cargo test\n"),
+            "trailing newline must not force passthrough"
+        );
+        assert!(
+            !command_needs_passthrough("grep -rn pattern src/\n"),
+            "grep -rn with trailing newline must not force passthrough"
+        );
+        assert!(
+            !command_needs_passthrough("cargo test\r\n"),
+            "Windows-style trailing CRLF must not force passthrough"
+        );
+    }
+
+    /// An interior newline (multi-line command body) MUST still trigger passthrough.
+    ///
+    /// This is the corruption case: `split_whitespace` flattens `\n` into a
+    /// space, destroying the original byte sequence.
+    #[test]
+    fn fix_c_interior_newline_bails() {
+        assert!(
+            command_needs_passthrough(
+                "git commit -m \"feat: subject\n\nBody paragraph.\""
+            ),
+            "interior newline must force passthrough"
+        );
+        assert!(
+            command_needs_passthrough("echo first\necho second"),
+            "two commands joined by interior newline must force passthrough"
+        );
+    }
+
+    /// A clean command with no newline must pass through `command_needs_passthrough`
+    /// unaffected — the wrapper must not introduce false positives.
+    #[test]
+    fn fix_c_clean_command_passes() {
+        assert!(
+            !command_needs_passthrough("cargo test"),
+            "clean command must not need passthrough"
+        );
+        assert!(
+            !command_needs_passthrough("cargo test && cargo build"),
+            "compound clean command must not need passthrough"
+        );
     }
 }
