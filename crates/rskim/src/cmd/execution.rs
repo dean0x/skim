@@ -749,7 +749,10 @@ mod tests {
     fn test_grep_exit2_is_not_benign() {
         let code = 2;
         let is_benign = code == 1 && BENIGN_EXIT1_PROGRAMS.contains(&"grep");
-        assert!(!is_benign, "grep exit 2 must NOT be benign — hint should fire");
+        assert!(
+            !is_benign,
+            "grep exit 2 must NOT be benign — hint should fire"
+        );
     }
 
     /// A non-benign tool (e.g., cargo) at exit 1 is NOT suppressed.

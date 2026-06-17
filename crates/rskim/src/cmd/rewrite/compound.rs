@@ -1281,9 +1281,7 @@ mod tests {
     #[test]
     fn fix_c_interior_newline_bails() {
         assert!(
-            command_needs_passthrough(
-                "git commit -m \"feat: subject\n\nBody paragraph.\""
-            ),
+            command_needs_passthrough("git commit -m \"feat: subject\n\nBody paragraph.\""),
             "interior newline must force passthrough"
         );
         assert!(

@@ -2071,8 +2071,7 @@ mod tests {
     #[test]
     fn test_grep_r_preserves_flag() {
         use crate::cmd::rewrite::engine::try_rewrite;
-        let result = try_rewrite(&["grep", "-r", "pattern", "src/"])
-            .expect("grep -r must rewrite");
+        let result = try_rewrite(&["grep", "-r", "pattern", "src/"]).expect("grep -r must rewrite");
         assert!(
             result.tokens.contains(&"-r".to_string()),
             "-r must be preserved in rewrite output; got: {:?}",
@@ -2212,9 +2211,7 @@ mod tests {
                      rewrite_to and without a WRAPPER_REINJECTS entry. \
                      Either add {:?} to rewrite_to, or add an allowlist entry \
                      citing the compensating wrapper fn.",
-                    rule.prefix,
-                    flag,
-                    flag
+                    rule.prefix, flag, flag
                 );
             }
         }

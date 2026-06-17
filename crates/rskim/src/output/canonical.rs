@@ -2065,7 +2065,10 @@ mod tests {
         );
         let output = format!("{result}");
         // Fix F: no truncation (shown==total) → plain count, not ratio.
-        assert!(output.starts_with("find 5"), "header must be 'find 5': {output:?}");
+        assert!(
+            output.starts_with("find 5"),
+            "header must be 'find 5': {output:?}"
+        );
         assert!(
             !output.starts_with("find 5/5"),
             "N/N tautology header must be gone (Fix F): {output:?}"
@@ -2122,8 +2125,16 @@ mod tests {
         result.ensure_rendered();
         assert!(!result.rendered.is_empty());
         // Fix F: shown_count==total_count → plain count header.
-        assert!(result.rendered.contains("rg 2"), "header must contain 'rg 2': {:?}", result.rendered);
-        assert!(!result.rendered.contains("rg 2/2"), "N/N tautology must be gone (Fix F): {:?}", result.rendered);
+        assert!(
+            result.rendered.contains("rg 2"),
+            "header must contain 'rg 2': {:?}",
+            result.rendered
+        );
+        assert!(
+            !result.rendered.contains("rg 2/2"),
+            "N/N tautology must be gone (Fix F): {:?}",
+            result.rendered
+        );
     }
 
     #[test]
@@ -2131,8 +2142,14 @@ mod tests {
         let result = FileResult::new("find".to_string(), 0, 0, vec![], None);
         let output = format!("{result}");
         // Fix F: 0/0 is a tautology → plain count "find 0".
-        assert!(output.contains("find 0"), "header must be 'find 0': {output:?}");
-        assert!(!output.contains("find 0/0"), "N/N tautology must be gone (Fix F): {output:?}");
+        assert!(
+            output.contains("find 0"),
+            "header must be 'find 0': {output:?}"
+        );
+        assert!(
+            !output.contains("find 0/0"),
+            "N/N tautology must be gone (Fix F): {output:?}"
+        );
     }
 
     // ========================================================================
@@ -2144,13 +2161,7 @@ mod tests {
     /// show just `N` instead.  `N/N` is a tautology that adds noise.
     #[test]
     fn fix_f_no_ratio_header_when_not_truncated() {
-        let result = FileResult::new(
-            "grep".to_string(),
-            7,
-            7,
-            vec!["entry".to_string()],
-            None,
-        );
+        let result = FileResult::new("grep".to_string(), 7, 7, vec!["entry".to_string()], None);
         let output = format!("{result}");
         assert!(
             output.starts_with("grep 7"),

@@ -1509,7 +1509,10 @@ mod tests {
 }
 "#;
         let result = rskim_core::transform(rust_src, Language::Rust, Mode::Pseudo);
-        assert!(result.is_ok(), "Pseudo transform of Rust source must succeed");
+        assert!(
+            result.is_ok(),
+            "Pseudo transform of Rust source must succeed"
+        );
         let output = result.unwrap();
         // In Pseudo mode the body should be visible (unlike Structure which strips it).
         assert!(
