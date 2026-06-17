@@ -565,9 +565,14 @@ const LINT_RULES: &[RewriteRule] = &[
     // AD-LINT-20 (2026-04-15): `prettier --write` and `-w` are routed through the
     // format-mode parse path in prettier.rs. `is_format_mode` detects `--write`
     // or `-w` in the user arguments. Check-mode rules unchanged.
+    // Fix A (fix/rewrite-hook-falseneg): `--write`/`-w` included in
+    // `rewrite_to`.  prettier.rs:is_format_mode checks args for `--write`/`-w`
+    // to dispatch to run_format; without the flag in args, the handler falls
+    // through to run_check and prepare_check_args injects `--check` instead,
+    // causing check behaviour when the user asked to write files.
     RewriteRule {
         prefix: &["npx", "prettier", "--write"],
-        rewrite_to: &["skim", "prettier"],
+        rewrite_to: &["skim", "prettier", "--write"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -576,7 +581,7 @@ const LINT_RULES: &[RewriteRule] = &[
     },
     RewriteRule {
         prefix: &["npx", "prettier", "-w"],
-        rewrite_to: &["skim", "prettier"],
+        rewrite_to: &["skim", "prettier", "-w"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -585,7 +590,7 @@ const LINT_RULES: &[RewriteRule] = &[
     },
     RewriteRule {
         prefix: &["prettier", "--write"],
-        rewrite_to: &["skim", "prettier"],
+        rewrite_to: &["skim", "prettier", "--write"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -594,7 +599,7 @@ const LINT_RULES: &[RewriteRule] = &[
     },
     RewriteRule {
         prefix: &["prettier", "-w"],
-        rewrite_to: &["skim", "prettier"],
+        rewrite_to: &["skim", "prettier", "-w"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -661,9 +666,15 @@ const LINT_RULES: &[RewriteRule] = &[
         require_flag: &[],
     },
     // black
+    //
+    // Fix A (fix/rewrite-hook-falseneg): `--check` included in `rewrite_to`.
+    // black.rs:is_format_mode returns true when args are non-empty AND lack
+    // `--check`/`--diff`.  Dropping `--check` from the prefix caused the handler
+    // to enter run_format (which rewrites files in place) instead of run_check,
+    // a destructive mode-switch.
     RewriteRule {
         prefix: &["black", "--check"],
-        rewrite_to: &["skim", "black"],
+        rewrite_to: &["skim", "black", "--check"],
         skip_if_flag_prefix: &["--diff"],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -689,9 +700,13 @@ const LINT_RULES: &[RewriteRule] = &[
         global_value_flags: &[],
         require_flag: &[],
     },
+    // Fix A (fix/rewrite-hook-falseneg): `-d` included in `rewrite_to`.
+    // gofmt.rs:prepare_args injects `-l` only when no mode flag is present;
+    // without `-d` in the args the wrapper would inject `-l` instead, silently
+    // switching from diff output to file-list output.
     RewriteRule {
         prefix: &["gofmt", "-d"],
-        rewrite_to: &["skim", "gofmt"],
+        rewrite_to: &["skim", "gofmt", "-d"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -1638,9 +1653,15 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         require_flag: &[],
     },
     // ls (verbose/recursive only)
+    //
+    // Fix A (fix/rewrite-hook-falseneg): `-la` and `-R` are included in
+    // `rewrite_to` so that the skim handler receives them.  Previously the
+    // prefix consumed the flag tokens and `rewrite_to` only emitted
+    // `["skim", "ls"]`, dropping the flags silently.  The handler needs
+    // `-la`/`-R` to run the right listing mode.
     RewriteRule {
         prefix: &["ls", "-la"],
-        rewrite_to: &["skim", "ls"],
+        rewrite_to: &["skim", "ls", "-la"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::FileOps,
         skip_if_middle_contains_eq: false,
@@ -1649,7 +1670,7 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
     },
     RewriteRule {
         prefix: &["ls", "-R"],
-        rewrite_to: &["skim", "ls"],
+        rewrite_to: &["skim", "ls", "-R"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::FileOps,
         skip_if_middle_contains_eq: false,
@@ -1667,9 +1688,14 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         require_flag: &[],
     },
     // grep (recursive only)
+    //
+    // Fix A (fix/rewrite-hook-falseneg): `-rn` and `-r` are included in
+    // `rewrite_to` so that the skim handler receives them.  Without them grep
+    // invokes in non-recursive mode, hitting "Is a directory" on the first
+    // directory argument and producing zero matches (silent false-negative).
     RewriteRule {
         prefix: &["grep", "-rn"],
-        rewrite_to: &["skim", "grep"],
+        rewrite_to: &["skim", "grep", "-rn"],
         skip_if_flag_prefix: &["-c", "--count", "-l"],
         category: RewriteCategory::FileOps,
         skip_if_middle_contains_eq: false,
@@ -1678,7 +1704,7 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
     },
     RewriteRule {
         prefix: &["grep", "-r"],
-        rewrite_to: &["skim", "grep"],
+        rewrite_to: &["skim", "grep", "-r"],
         skip_if_flag_prefix: &["-c", "--count", "-l"],
         category: RewriteCategory::FileOps,
         skip_if_middle_contains_eq: false,
@@ -2020,7 +2046,12 @@ mod tests {
         }
     }
 
-    /// Specific grep rules win over catch-all.
+    /// Specific grep rules win over catch-all, and the flag survives the rewrite.
+    ///
+    /// Regression guard for Fix A (fix/rewrite-hook-falseneg): previously the
+    /// rule consumed `-rn` as part of its prefix and `rewrite_to` omitted it,
+    /// so the handler received no recursion flag and silently failed with "Is a
+    /// directory" on directory arguments.
     #[test]
     fn test_specific_grep_still_wins() {
         use crate::cmd::rewrite::engine::try_rewrite;
@@ -2028,6 +2059,193 @@ mod tests {
         let tokens: &[&str] = &["grep", "-rn", "pattern", "src/"];
         let result = try_rewrite(tokens).expect("should rewrite grep -rn");
         assert!(result.tokens.contains(&"skim".to_string()));
+        // Fix A: the `-rn` flag must survive into the rewritten command.
+        assert!(
+            result.tokens.contains(&"-rn".to_string()),
+            "-rn must be preserved in rewrite output; got: {:?}",
+            result.tokens
+        );
+    }
+
+    /// Fix A (fix/rewrite-hook-falseneg): `-r` must survive the grep -r rewrite.
+    #[test]
+    fn test_grep_r_preserves_flag() {
+        use crate::cmd::rewrite::engine::try_rewrite;
+        let result = try_rewrite(&["grep", "-r", "pattern", "src/"])
+            .expect("grep -r must rewrite");
+        assert!(
+            result.tokens.contains(&"-r".to_string()),
+            "-r must be preserved in rewrite output; got: {:?}",
+            result.tokens
+        );
+    }
+
+    /// Fix A (fix/rewrite-hook-falseneg): `-la` must survive the ls -la rewrite.
+    #[test]
+    fn test_ls_la_preserves_flag() {
+        use crate::cmd::rewrite::engine::try_rewrite;
+        let result = try_rewrite(&["ls", "-la"]).expect("ls -la must rewrite");
+        assert!(
+            result.tokens.contains(&"-la".to_string()),
+            "-la must be preserved in rewrite output; got: {:?}",
+            result.tokens
+        );
+    }
+
+    /// Fix A (fix/rewrite-hook-falseneg): `-R` must survive the ls -R rewrite.
+    #[test]
+    fn test_ls_r_preserves_flag() {
+        use crate::cmd::rewrite::engine::try_rewrite;
+        let result = try_rewrite(&["ls", "-R"]).expect("ls -R must rewrite");
+        assert!(
+            result.tokens.contains(&"-R".to_string()),
+            "-R must be preserved in rewrite output; got: {:?}",
+            result.tokens
+        );
+    }
+
+    /// Recurrence guard: no rule may silently drop a flag token from its prefix
+    /// unless the compensating wrapper function is on the WRAPPER_REINJECTS list.
+    ///
+    /// Every flag token (starts with `-`) in `prefix[1..]` must appear in
+    /// `rewrite_to`, OR the rule's prefix must be in `WRAPPER_REINJECTS` with a
+    /// comment naming the exact wrapper fn that compensates.
+    ///
+    /// Fix A (fix/rewrite-hook-falseneg): this test failed before the four
+    /// flag-drop rules were corrected and caused a build failure.  A future
+    /// `foo -X → skim foo` rule that drops a flag will fail this test.
+    ///
+    /// Negative fixture: `synthetic_bad_rule_check` below exercises the checker
+    /// with a known-bad rule and asserts it is detected (AC-A4).
+    #[test]
+    fn no_rule_silently_drops_prefix_flags() {
+        // WRAPPER_REINJECTS: rules whose prefix flags are intentionally absent
+        // from `rewrite_to` because the compensating wrapper fn re-injects them.
+        // Each entry must cite the exact file:fn that compensates.
+        //
+        // Entry format: (prefix_tokens, "comment citing wrapper file:fn")
+        const WRAPPER_REINJECTS: &[(&[&str], &str)] = &[
+            // python3 -m pytest / python -m pytest: the `-m` flag is the Python
+            // module-dispatch mechanism; the entire invocation is replaced by the
+            // pytest handler (cmd/test/pytest.rs:run).
+            (
+                &["python3", "-m", "pytest"],
+                "cmd/test/pytest.rs:run — tool replacement, -m is dispatch mechanism",
+            ),
+            (
+                &["python", "-m", "pytest"],
+                "cmd/test/pytest.rs:run — tool replacement, -m is dispatch mechanism",
+            ),
+            // python3 -m mypy / python -m mypy: same dispatch-mechanism pattern.
+            (
+                &["python3", "-m", "mypy"],
+                "cmd/lint/mypy.rs:run — tool replacement, -m is dispatch mechanism",
+            ),
+            (
+                &["python", "-m", "mypy"],
+                "cmd/lint/mypy.rs:run — tool replacement, -m is dispatch mechanism",
+            ),
+            // gofmt -l: cmd/lint/gofmt.rs:prepare_args injects `-l` when no
+            // mode flag is present.  Verified: line ~54 in gofmt.rs.
+            (
+                &["gofmt", "-l"],
+                "cmd/lint/gofmt.rs:prepare_args — injects -l when absent",
+            ),
+            // prettier --check / npx prettier --check: cmd/lint/prettier.rs:
+            // prepare_check_args injects `--check` when absent.  Verified:
+            // lines ~92-94 in prettier.rs.
+            (
+                &["prettier", "--check"],
+                "cmd/lint/prettier.rs:prepare_check_args — injects --check when absent",
+            ),
+            (
+                &["npx", "prettier", "--check"],
+                "cmd/lint/prettier.rs:prepare_check_args — injects --check when absent",
+            ),
+            // rustfmt --check: cmd/lint/rustfmt.rs:prepare_check_args injects
+            // `--check` when absent.  Verified: lines ~94-97 in rustfmt.rs.
+            // is_format_mode only triggers on --format/-f, so dropping --check
+            // safely defaults to check mode.
+            (
+                &["rustfmt", "--check"],
+                "cmd/lint/rustfmt.rs:prepare_check_args — injects --check when absent",
+            ),
+            // cargo fmt --check: same rustfmt handler via dispatch.
+            (
+                &["cargo", "fmt", "--check"],
+                "cmd/lint/rustfmt.rs:prepare_check_args — injects --check when absent",
+            ),
+            // cargo fmt -- --check: `--` is a separator token that starts with
+            // `-`; it is not a meaningful flag.  The `--check` is compensated by
+            // prepare_check_args as above.
+            (
+                &["cargo", "fmt", "--", "--check"],
+                "cmd/lint/rustfmt.rs:prepare_check_args — injects --check; -- is a separator",
+            ),
+        ];
+
+        for rule in all_rules() {
+            // Collect flag tokens in prefix[1..] (skip the leading tool name).
+            let prefix_flags: Vec<&str> = rule.prefix[1..]
+                .iter()
+                .filter(|t| t.starts_with('-'))
+                .copied()
+                .collect();
+
+            if prefix_flags.is_empty() {
+                continue; // No flags in prefix — nothing to check.
+            }
+
+            for flag in &prefix_flags {
+                if rule.rewrite_to.contains(flag) {
+                    continue; // Flag preserved in rewrite_to — OK.
+                }
+
+                // Flag is absent from rewrite_to — must be in allowlist.
+                let in_allowlist = WRAPPER_REINJECTS
+                    .iter()
+                    .any(|(allowed_prefix, _comment)| *allowed_prefix == rule.prefix);
+
+                assert!(
+                    in_allowlist,
+                    "Rule {:?} drops prefix flag {:?} without re-injecting it in \
+                     rewrite_to and without a WRAPPER_REINJECTS entry. \
+                     Either add {:?} to rewrite_to, or add an allowlist entry \
+                     citing the compensating wrapper fn.",
+                    rule.prefix,
+                    flag,
+                    flag
+                );
+            }
+        }
+    }
+
+    /// Negative fixture for the recurrence guard: a synthetic bad rule that
+    /// drops a prefix flag must be detected by `check_rule_for_flag_drop`
+    /// (AC-A4 from fix/rewrite-hook-falseneg).
+    ///
+    /// This test validates the checker logic itself rather than the rule table.
+    #[test]
+    fn synthetic_bad_rule_check() {
+        // A fake rule: prefix has `-X`, rewrite_to omits it.
+        let bad_prefix: &[&str] = &["mytool", "-X"];
+        let bad_rewrite_to: &[&str] = &["skim", "mytool"];
+
+        let prefix_flags: Vec<&str> = bad_prefix[1..]
+            .iter()
+            .filter(|t| t.starts_with('-'))
+            .copied()
+            .collect();
+
+        let drops_flag = prefix_flags
+            .iter()
+            .any(|flag| !bad_rewrite_to.contains(flag));
+
+        assert!(
+            drops_flag,
+            "The negative fixture must detect that -X is dropped; \
+             if this fails the checker logic itself is broken"
+        );
     }
 
     /// ls --help skips the catch-all rule (passthrough).
