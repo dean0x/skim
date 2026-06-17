@@ -1250,7 +1250,11 @@ mod tests {
     /// Returns a `(reader, test_commits, path_map)` tuple.  The `CochangeMatrixReader`
     /// holds an internal mmap into the tempdir which is kept alive by the caller
     /// keeping the returned reader in scope.
-    fn make_minimal_corpus() -> (CochangeMatrixReader, Vec<CommitInfo>, HashMap<PathBuf, FileId>) {
+    fn make_minimal_corpus() -> (
+        CochangeMatrixReader,
+        Vec<CommitInfo>,
+        HashMap<PathBuf, FileId>,
+    ) {
         use rskim_search::{HistoryResult, TemporalMetadata};
         let index_dir = tempfile::tempdir().expect("tempdir for minimal corpus");
 
@@ -1298,9 +1302,7 @@ mod tests {
                 .expect("evaluate_at_thresholds (hardcoded jaccard) must succeed");
 
         // Run via the PairScorer seam wrapping the same reader.
-        let scorer = |a: FileId, b: FileId| -> f64 {
-            reader.jaccard(a, b).unwrap_or(0.0)
-        };
+        let scorer = |a: FileId, b: FileId| -> f64 { reader.jaccard(a, b).unwrap_or(0.0) };
         let (seam_metrics, seam_unmapped) =
             evaluate_at_thresholds_with_scorer(&scorer, &test_commits, &path_map, &thresholds)
                 .expect("evaluate_at_thresholds_with_scorer (jaccard seam) must succeed");
@@ -1362,12 +1364,14 @@ mod tests {
         let thresholds = vec![0.1, 0.3];
 
         // Baseline: jaccard-only.
-        let scorer_baseline = |a: FileId, b: FileId| -> f64 {
-            reader.jaccard(a, b).unwrap_or(0.0)
-        };
-        let (baseline_metrics, _) =
-            evaluate_at_thresholds_with_scorer(&scorer_baseline, &test_commits, &path_map, &thresholds)
-                .expect("baseline scorer must succeed");
+        let scorer_baseline = |a: FileId, b: FileId| -> f64 { reader.jaccard(a, b).unwrap_or(0.0) };
+        let (baseline_metrics, _) = evaluate_at_thresholds_with_scorer(
+            &scorer_baseline,
+            &test_commits,
+            &path_map,
+            &thresholds,
+        )
+        .expect("baseline scorer must succeed");
 
         // Composite scorer: same jaccard (no extended signals with non-zero weight yet,
         // so this is equal to baseline — the guard asserts >=, not >).
@@ -1379,9 +1383,13 @@ mod tests {
             // until a real extended signal is promoted.
             reader.jaccard(a, b).unwrap_or(0.0)
         };
-        let (composite_metrics, _) =
-            evaluate_at_thresholds_with_scorer(&scorer_composite, &test_commits, &path_map, &thresholds)
-                .expect("composite scorer must succeed");
+        let (composite_metrics, _) = evaluate_at_thresholds_with_scorer(
+            &scorer_composite,
+            &test_commits,
+            &path_map,
+            &thresholds,
+        )
+        .expect("composite scorer must succeed");
 
         // AC9: composite macro-F1 >= baseline macro-F1 at every threshold.
         for (base, comp) in baseline_metrics.iter().zip(composite_metrics.iter()) {
@@ -1406,12 +1414,14 @@ mod tests {
         let thresholds = vec![0.1];
 
         // Baseline: real jaccard scorer.
-        let scorer_baseline = |a: FileId, b: FileId| -> f64 {
-            reader.jaccard(a, b).unwrap_or(0.0)
-        };
-        let (baseline_metrics, _) =
-            evaluate_at_thresholds_with_scorer(&scorer_baseline, &test_commits, &path_map, &thresholds)
-                .expect("baseline scorer must succeed");
+        let scorer_baseline = |a: FileId, b: FileId| -> f64 { reader.jaccard(a, b).unwrap_or(0.0) };
+        let (baseline_metrics, _) = evaluate_at_thresholds_with_scorer(
+            &scorer_baseline,
+            &test_commits,
+            &path_map,
+            &thresholds,
+        )
+        .expect("baseline scorer must succeed");
 
         // Known-bad scorer: always 0.0 (predicts nothing → F1 = 0).
         let scorer_bad = |_: FileId, _: FileId| 0.0f64;

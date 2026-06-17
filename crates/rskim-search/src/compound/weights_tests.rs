@@ -36,7 +36,9 @@ fn test_default_values() {
 fn test_default_validates_ok() {
     // AC1: validate() must return Ok for the six-signal profile.
     assert!(
-        CompositeWeights6::with_six_signal_defaults().validate().is_ok(),
+        CompositeWeights6::with_six_signal_defaults()
+            .validate()
+            .is_ok(),
         "six-signal default weights must pass validate()"
     );
 }

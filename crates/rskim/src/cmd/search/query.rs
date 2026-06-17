@@ -369,22 +369,14 @@ fn run_blast_radius_composite_query(
     // Each co-change partner path → FileId (via sorted_paths index).
     // Score = 1.0 (uniform; RRF uses rank not magnitude, so this suffices).
     // The target file itself is included in blast_paths by resolve_blast_radius_paths.
-    let temporal_layer: Vec<(FileId, f64)> = match blast_file_ids {
-        Some(ids) => {
-            let mut layer: Vec<(FileId, f64)> = ids.iter().map(|&fid| (fid, 1.0)).collect();
-            // Sort by FileId for deterministic rank assignment within the layer.
-            // All have equal scores, so the sort order determines their temporal ranks.
-            // FileId-ASC is a stable, arbitrary tie-break.
-            layer.sort_unstable_by_key(|&(fid, _)| fid.0);
-            layer
-        }
-        None => {
-            // blast_file_ids is None when the temporal DB was absent at path resolution.
-            // Fall back to the lexical result set sorted by score (temporal = no signal).
-            // This gracefully degrades to lexical-only ranking when temporal data is absent.
-            vec![]
-        }
-    };
+    // When blast_file_ids is None (temporal DB absent), degrades to lexical-only ranking.
+    let mut temporal_layer: Vec<(FileId, f64)> = blast_file_ids
+        .as_ref()
+        .map(|ids| ids.iter().map(|&fid| (fid, 1.0)).collect())
+        .unwrap_or_default();
+    // Sort by FileId for deterministic rank assignment within the layer.
+    // All have equal scores, so the sort order determines their temporal ranks.
+    temporal_layer.sort_unstable_by_key(|&(fid, _)| fid.0);
 
     // Step 3: lexical ranked list from raw_lex (already sorted DESC by score).
     let lexical_layer: Vec<(FileId, f64)> = raw_lex.iter().map(|r| (r.file_id, r.score)).collect();
@@ -410,56 +402,49 @@ fn run_blast_radius_composite_query(
     let lex_map: std::collections::HashMap<FileId, &SearchResult> =
         raw_lex.iter().map(|r| (r.file_id, r)).collect();
 
-    let sorted = ctx.sorted;
-    let results: Vec<super::types::ResolvedResult> = ranked_limited
-        .iter()
-        .filter_map(|&(fid, composite_score)| {
-            let path = sorted.get(fid.0 as usize)?;
-            let manifest_entry = ctx.manifest.lookup(path);
+    let results: Vec<super::types::ResolvedResult> =
+        ranked_limited
+            .iter()
+            .filter_map(|&(fid, composite_score)| {
+                let path = ctx.sorted.get(fid.0 as usize)?;
+                let manifest_entry = ctx.manifest.lookup(path);
 
-            if let Some(&lex_result) = lex_map.get(&fid) {
-                // File has a lexical hit: carry its snippet/line data.
-                let mut r = lex_result.clone();
-                r.score = composite_score;
-                let (line_number, line_range, snippet, stale) =
-                    match extract_snippet(ctx.root, path, &r.match_positions, manifest_entry) {
-                        SnippetOutcome::Ok {
-                            match_line,
-                            line_range,
-                            context,
-                        } => (Some(match_line), Some(line_range), Some(context), false),
-                        SnippetOutcome::Stale => (None, None, None, true),
-                        SnippetOutcome::Unavailable => (None, None, None, false),
-                    };
-                Some(super::types::ResolvedResult {
-                    path: path.to_string(),
-                    score: composite_score,
-                    field: r.field.name().to_string(),
-                    line_number,
-                    line_range,
-                    snippet,
-                    stale,
-                    match_positions: r.match_positions.clone(),
-                    temporal: None,
-                })
-            } else {
-                // Co-change-only file: no lexical hit → no snippet (AC12, UNION mode).
-                // These files appear because their temporal rank contributes to the
-                // fused score even though the text query did not match them.
-                Some(super::types::ResolvedResult {
-                    path: path.to_string(),
-                    score: composite_score,
-                    field: "co_change_partner".to_string(),
-                    line_number: None,
-                    line_range: None,
-                    snippet: None,
-                    stale: false,
-                    match_positions: vec![],
-                    temporal: None,
-                })
-            }
-        })
-        .collect();
+                if let Some(&lex_result) = lex_map.get(&fid) {
+                    // File has a lexical hit: carry its snippet/line data.
+                    let mut r = lex_result.clone();
+                    r.score = composite_score;
+                    let (line_number, line_range, snippet, stale) = decode_snippet(
+                        extract_snippet(ctx.root, path, &r.match_positions, manifest_entry),
+                    );
+                    Some(super::types::ResolvedResult {
+                        path: path.to_string(),
+                        score: composite_score,
+                        field: r.field.name().to_string(),
+                        line_number,
+                        line_range,
+                        snippet,
+                        stale,
+                        match_positions: r.match_positions.clone(),
+                        temporal: None,
+                    })
+                } else {
+                    // Co-change-only file: no lexical hit → no snippet (AC12, UNION mode).
+                    // These files appear because their temporal rank contributes to the
+                    // fused score even though the text query did not match them.
+                    Some(super::types::ResolvedResult {
+                        path: path.to_string(),
+                        score: composite_score,
+                        field: "co_change_partner".to_string(),
+                        line_number: None,
+                        line_range: None,
+                        snippet: None,
+                        stale: false,
+                        match_positions: vec![],
+                        temporal: None,
+                    })
+                }
+            })
+            .collect();
 
     let total = results.len();
     let duration_ms = ctx.start.elapsed().as_millis() as u64;
@@ -470,6 +455,26 @@ fn run_blast_radius_composite_query(
         duration_ms,
         index_stats: Some(ctx.stats),
     })
+}
+
+/// Decode a `SnippetOutcome` into the 4-tuple used by `ResolvedResult`.
+fn decode_snippet(
+    outcome: SnippetOutcome,
+) -> (
+    Option<u32>,
+    Option<std::ops::Range<usize>>,
+    Option<super::types::SnippetContext>,
+    bool,
+) {
+    match outcome {
+        SnippetOutcome::Ok {
+            match_line,
+            line_range,
+            context,
+        } => (Some(match_line), Some(line_range), Some(context), false),
+        SnippetOutcome::Stale => (None, None, None, true),
+        SnippetOutcome::Unavailable => (None, None, None, false),
+    }
 }
 
 /// Map `FileId`s to paths and extract snippets.
@@ -486,16 +491,12 @@ fn resolve_paths_and_snippets(
 
             let manifest_entry = manifest.lookup(path);
 
-            let (line_number, line_range, snippet, stale) =
-                match extract_snippet(root, path, &r.match_positions, manifest_entry) {
-                    SnippetOutcome::Ok {
-                        match_line,
-                        line_range,
-                        context,
-                    } => (Some(match_line), Some(line_range), Some(context), false),
-                    SnippetOutcome::Stale => (None, None, None, true),
-                    SnippetOutcome::Unavailable => (None, None, None, false),
-                };
+            let (line_number, line_range, snippet, stale) = decode_snippet(extract_snippet(
+                root,
+                path,
+                &r.match_positions,
+                manifest_entry,
+            ));
 
             Some(ResolvedResult {
                 path: path.to_string(),

@@ -113,15 +113,16 @@ pub fn merge_layer_scores(layers: &[(Vec<(FileId, f64)>, f64)]) -> Vec<(FileId, 
 
         // Assign 1-based ranks and accumulate RRF contributions.
         // For duplicate FileIds within the same layer, the first occurrence
-        // (highest score after DESC sort) wins — subsequent occurrences are
-        // skipped via the `HashMap::entry` vacancy check.
-        let mut first_occurrence: HashMap<FileId, usize> = HashMap::new();
+        // (highest score after DESC sort) wins — track via a per-layer seen set.
+        let mut seen_in_layer: std::collections::HashSet<FileId> = std::collections::HashSet::new();
         for (i, &(fid, _)) in sorted_layer.iter().enumerate() {
-            // Record only the first (best-score) rank per FileId.
-            let rank = *first_occurrence.entry(fid).or_insert(i + 1);
+            // Skip non-first occurrences within this layer.
+            if !seen_in_layer.insert(fid) {
+                continue;
+            }
             // Accumulate weighted RRF term: wᵢ / (RRF_K + rankᵢ(d)).
-            // RRF_K = 60, rank ≥ 1 → denominator ≥ 61 → never zero → never NaN.
-            let contribution = weight / (RRF_K + rank as f64);
+            // rank = i+1 (1-based); RRF_K = 60 → denominator ≥ 61 → never NaN.
+            let contribution = weight / (RRF_K + (i + 1) as f64);
             *scores.entry(fid).or_insert(0.0) += contribution;
         }
     }
