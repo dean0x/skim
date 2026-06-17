@@ -477,9 +477,16 @@ const LINT_RULES: &[RewriteRule] = &[
     // AD-LINT-20 (2026-04-15): `ruff format --check` and `ruff format` (apply mode)
     // are routed through the format-mode parse path in ruff.rs. The ruff parser
     // detects `is_format_mode` from the first user argument (`"format"`).
+    //
+    // Fix A (fix/rewrite-hook-falseneg): rewrite_to must include both "format" and
+    // "--check" because the engine places `middle = prefix_tail..`; the prefix
+    // tokens are consumed and never reach the handler unless they are in rewrite_to.
+    // Dropping --check silently switches ruff format --check (dry-run) to apply
+    // mode, which is destructive.  Dropping "format" routes the call to run_check
+    // instead of run_format — semantically wrong.
     RewriteRule {
         prefix: &["ruff", "format", "--check"],
-        rewrite_to: &["skim", "ruff"],
+        rewrite_to: &["skim", "ruff", "format", "--check"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -488,7 +495,7 @@ const LINT_RULES: &[RewriteRule] = &[
     },
     RewriteRule {
         prefix: &["ruff", "format"],
-        rewrite_to: &["skim", "ruff"],
+        rewrite_to: &["skim", "ruff", "format"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
