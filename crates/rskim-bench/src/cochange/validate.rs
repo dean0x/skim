@@ -395,20 +395,7 @@ pub fn evaluate_at_thresholds_with_scorer(
         }
 
         // Pre-compute scorer pairs once per commit, then sweep thresholds.
-        let q = known_ids.len();
-        while scorer_scratch.len() < q {
-            scorer_scratch.push(Vec::new());
-        }
-        scorer_scratch.truncate(q);
-        for (q_idx, &query_id) in known_ids.iter().enumerate() {
-            scorer_scratch[q_idx].clear();
-            build_pairs_into_with_scorer(
-                query_id,
-                &all_file_ids,
-                scorer,
-                &mut scorer_scratch[q_idx],
-            );
-        }
+        fill_scorer_scratch(&known_ids, &all_file_ids, scorer, &mut scorer_scratch);
 
         all_known_scratch.clear();
         all_known_scratch.extend(known_ids.iter().copied());
@@ -911,6 +898,27 @@ fn build_jaccard_pairs_into(
         }
     }
     Ok(())
+}
+
+/// Fill `scratch` in-place with per-query scorer pairs for a single commit.
+///
+/// Mirror of [`fill_jaccard_scratch`] for a generic `Fn(FileId, FileId) -> f64`
+/// scorer.  Grows, truncates, and refills the scratch buffer identically.
+fn fill_scorer_scratch(
+    known_ids: &[FileId],
+    all_file_ids: &[FileId],
+    scorer: &impl Fn(FileId, FileId) -> f64,
+    scratch: &mut Vec<Vec<(FileId, f64)>>,
+) {
+    let q = known_ids.len();
+    while scratch.len() < q {
+        scratch.push(Vec::new());
+    }
+    scratch.truncate(q);
+    for (q_idx, &query_id) in known_ids.iter().enumerate() {
+        scratch[q_idx].clear();
+        build_pairs_into_with_scorer(query_id, all_file_ids, scorer, &mut scratch[q_idx]);
+    }
 }
 
 /// Fill `out` using a generic `PairScorer` closure instead of `CochangeMatrixReader`.

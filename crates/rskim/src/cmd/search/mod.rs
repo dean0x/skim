@@ -201,9 +201,9 @@ struct Flags {
     ast: Option<String>,
     /// Composite RRF weights for the blast-radius UNION ranking path (#200).
     ///
-    /// Format: `"lexical,ast,temporal"` (3 comma-separated non-negative f64).
-    /// `None` → use `CompositeWeights6::default()` (0.5, 0.3, 0.2).
-    weights: Option<String>,
+    /// Parsed from `--weights lexical,ast,temporal` and validated at flag-parse
+    /// time.  `None` → use `CompositeWeights6::default()` (0.5, 0.3, 0.2).
+    weights: Option<rskim_search::CompositeWeights6>,
 }
 
 /// Parse and validate a `--limit` value string.
@@ -333,7 +333,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut temporal_sort: Option<types::TemporalSort> = None;
     let mut blast_radius: Option<String> = None;
     let mut ast: Option<String> = None;
-    let mut weights: Option<String> = None;
+    let mut weights: Option<rskim_search::CompositeWeights6> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -373,13 +373,13 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
             }
             s if s == "--weights" || s.starts_with("--weights=") => {
                 // Composite RRF weights: `--weights l,a,t` or `--weights=l,a,t` (#200).
-                // Parsed and validated here so invalid values produce a clear CLI error
-                // before any index I/O (AC5: non-zero exit with actionable message).
+                // Parse and validate immediately so invalid values produce a clear CLI
+                // error before any index I/O (AC5: non-zero exit with actionable message).
                 let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--weights")?;
-                // Validate now — surface errors before any disk I/O.
-                rskim_search::CompositeWeights6::parse_weights_flag(&raw)
-                    .map_err(|e| anyhow::anyhow!("--weights: {e}"))?;
-                weights = Some(raw);
+                weights = Some(
+                    rskim_search::CompositeWeights6::parse_weights_flag(&raw)
+                        .map_err(|e| anyhow::anyhow!("--weights: {e}"))?,
+                );
                 if consumed {
                     i += 1;
                 }
@@ -643,14 +643,6 @@ fn run_query(
         (None, None)
     };
 
-    // Parse composite weights from --weights flag (#200).
-    // Already validated in parse_flags; re-parse here to get the typed struct.
-    // Absent → None → execute_query_with_manifest uses CompositeWeights6::default().
-    let composite_weights = flags.weights.as_deref().map(|s| {
-        rskim_search::CompositeWeights6::parse_weights_flag(s)
-            .expect("--weights already validated in parse_flags")
-    });
-
     let config = types::QueryConfig {
         text: text.to_string(),
         limit: flags.limit,
@@ -659,7 +651,7 @@ fn run_query(
         cache_dir,
         blast_radius_paths,
         ast_scored,
-        composite_weights,
+        composite_weights: flags.weights,
     };
 
     // Pass the already-refreshed manifest (text+--ast path) or None (pure-lexical

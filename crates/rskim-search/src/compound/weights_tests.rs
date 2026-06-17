@@ -9,26 +9,13 @@ use crate::types::SearchError;
 // ============================================================================
 
 #[test]
-fn test_default_lexical() {
+fn test_default_values() {
     let w = CompositeWeights6::default();
+    // Core signals.
     assert_eq!(w.lexical, 0.5, "lexical default must be 0.5 (AC1)");
-}
-
-#[test]
-fn test_default_ast() {
-    let w = CompositeWeights6::default();
     assert_eq!(w.ast, 0.3, "ast default must be 0.3 (AC1)");
-}
-
-#[test]
-fn test_default_temporal() {
-    let w = CompositeWeights6::default();
     assert_eq!(w.temporal, 0.2, "temporal default must be 0.2 (AC1)");
-}
-
-#[test]
-fn test_default_extended_signals_are_zero() {
-    let w = CompositeWeights6::default();
+    // Extended signals default to 0.0 (ADR-003 gated until measured).
     assert_eq!(
         w.import_graph, 0.0,
         "import_graph must default to 0.0 (ADR-003 gated)"
