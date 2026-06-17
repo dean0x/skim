@@ -2622,6 +2622,57 @@ fn test_hook_pipe_with_rewritable_producer_passes_through() {
         .stdout(predicate::str::is_empty());
 }
 
+/// Fix E (fix/rewrite-hook-falseneg): `git diff | grep "^+"` must NOT be
+/// rewritten.  Rewiring `git diff` to `skim git diff` in a pipe would change
+/// the byte stream that `grep` sees — the compressed diff format differs from
+/// raw `git diff` output.  The hook must emit empty stdout (passthrough).
+#[test]
+fn fix_e_git_diff_pipe_grep_passes_through() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "git diff | grep \"^+\""
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Fix E: `git log | grep feat` must pass through — same pipe-source rule.
+#[test]
+fn fix_e_git_log_pipe_grep_passes_through() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "git log --oneline | grep feat"
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Fix E: `git show HEAD:src/lib.rs | wc -l` must pass through.
+#[test]
+fn fix_e_git_show_pipe_passes_through() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "git show HEAD:src/lib.rs | wc -l"
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
 // ============================================================================
 // #317 — the emitted rewrite must EXECUTE (round-trip e2e)
 //
