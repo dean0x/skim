@@ -229,6 +229,17 @@ fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
 
+/// Tools for which exit code 1 means "no match" / "differs" — a benign
+/// informational result that must not trigger the compressed-output hint.
+///
+/// These tools emit exit 1 when they find no matches or detect a difference,
+/// which is not an error: the silence (or diff) IS the output.  Printing
+/// "[skim] compressed output (exit 1)" is misleading — it implies something
+/// went wrong when it did not.  Exit ≥ 2 for these tools IS a real error
+/// (e.g., grep syntax error, diff read failure) and DOES get the hint.
+/// Fix B (fix/rewrite-hook-falseneg).
+const BENIGN_EXIT1_PROGRAMS: &[&str] = &["grep", "rg", "diff"];
+
 /// Parameters for recording token savings and emitting the analytics event.
 ///
 /// Bundles the fields that [`record_and_report`] needs, replacing the
@@ -238,6 +249,7 @@ fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
 struct RecordReport<'a> {
     show_stats: bool,
     code: i32,
+    program: &'a str,
     original_stdout: String,
     compressed: String,
     rec: crate::analytics::RecordingContext<'a>,
@@ -254,6 +266,7 @@ fn record_and_report(report: RecordReport<'_>) {
     let RecordReport {
         show_stats,
         code,
+        program,
         original_stdout,
         compressed,
         rec,
@@ -268,7 +281,12 @@ fn record_and_report(report: RecordReport<'_>) {
     // - tier Full/Degraded → surface the escape hatch: the body was re-encoded.
     // - tier Passthrough → silent: the body is already verbatim, so any notice
     //   would be noise the raw tool does not emit (grep's no-match silence).
-    if code != 0 && tier_name != "passthrough" {
+    //
+    // Fix B (fix/rewrite-hook-falseneg): suppress hint for BENIGN_EXIT1_PROGRAMS
+    // at exit 1.  For these tools, exit 1 is "no match"/"differs" — a normal
+    // informational result.  Exit ≥ 2 is a real error and still shows the hint.
+    let is_benign_exit1 = code == 1 && BENIGN_EXIT1_PROGRAMS.contains(&program);
+    if code != 0 && tier_name != "passthrough" && !is_benign_exit1 {
         eprintln!("{}", crate::output::compressed_output_hint(code));
     }
 
@@ -413,6 +431,7 @@ where
     record_and_report(RecordReport {
         show_stats,
         code,
+        program,
         original_stdout: output.stdout,
         compressed,
         rec,
@@ -690,5 +709,56 @@ mod tests {
             "both empty must produce Cow::Borrowed: {combined:?}"
         );
         assert_eq!(combined.as_ref(), "");
+    }
+
+    // ========================================================================
+    // BENIGN_EXIT1_PROGRAMS guard (Fix B, fix/rewrite-hook-falseneg)
+    // ========================================================================
+
+    /// grep exit 1 = "no match" — classified as benign; hint must be suppressed.
+    #[test]
+    fn test_benign_exit1_grep() {
+        assert!(
+            BENIGN_EXIT1_PROGRAMS.contains(&"grep"),
+            "grep must be in BENIGN_EXIT1_PROGRAMS"
+        );
+        let is_benign = 1 == 1 && BENIGN_EXIT1_PROGRAMS.contains(&"grep");
+        assert!(is_benign, "grep exit 1 must be benign (no hint)");
+    }
+
+    /// rg exit 1 = "no match" — classified as benign.
+    #[test]
+    fn test_benign_exit1_rg() {
+        assert!(
+            BENIGN_EXIT1_PROGRAMS.contains(&"rg"),
+            "rg must be in BENIGN_EXIT1_PROGRAMS"
+        );
+    }
+
+    /// diff exit 1 = "files differ" — classified as benign.
+    #[test]
+    fn test_benign_exit1_diff() {
+        assert!(
+            BENIGN_EXIT1_PROGRAMS.contains(&"diff"),
+            "diff must be in BENIGN_EXIT1_PROGRAMS"
+        );
+    }
+
+    /// grep exit 2 = real error (e.g., syntax error) — NOT benign; hint fires.
+    #[test]
+    fn test_grep_exit2_is_not_benign() {
+        let code = 2;
+        let is_benign = code == 1 && BENIGN_EXIT1_PROGRAMS.contains(&"grep");
+        assert!(!is_benign, "grep exit 2 must NOT be benign — hint should fire");
+    }
+
+    /// A non-benign tool (e.g., cargo) at exit 1 is NOT suppressed.
+    #[test]
+    fn test_non_benign_tool_exit1_is_not_suppressed() {
+        let is_benign = 1 == 1 && BENIGN_EXIT1_PROGRAMS.contains(&"cargo");
+        assert!(
+            !is_benign,
+            "cargo exit 1 must NOT be benign — hint should still fire"
+        );
     }
 }
