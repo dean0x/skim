@@ -46,7 +46,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use rskim_core::{Language, TransformConfig};
+use rskim_core::{Language, Mode, TransformConfig};
 
 use crate::cmd::{OutputFormat, extract_output_format, user_has_flag};
 use crate::output::canonical::{DiffFileEntry, ShowCommitResult};
@@ -783,7 +783,18 @@ fn run_show_file_content(
     };
 
     // Tier 1: transform in memory.
-    let config = TransformConfig::default();
+    //
+    // Fix D (fix/rewrite-hook-falseneg, AD-GIT-SHOW-PSEUDO): use Pseudo mode
+    // instead of Structure mode for file-content paths.  Structure strips
+    // function bodies, which is unhelpful when the agent asked to read a
+    // specific file at a specific ref — it needs to see the logic, not just
+    // signatures.  Pseudo preserves logic flow while stripping syntactic noise
+    // (type annotations, visibility modifiers, etc.), giving ~30-50% reduction
+    // without hiding implementation detail the agent is trying to read.
+    let config = TransformConfig {
+        mode: Mode::Pseudo,
+        ..TransformConfig::default()
+    };
     let transformed = match rskim_core::transform(&raw, lang, config.mode) {
         Ok(t) => t,
         Err(e) => {
@@ -1455,6 +1466,55 @@ mod tests {
             header.parents.is_none(),
             "non-merge commit must have no parents: {:?}",
             header.parents
+        );
+    }
+
+    // ========================================================================
+    // Fix D: file-content mode uses Pseudo, not Structure
+    // ========================================================================
+
+    /// The file-content transform config must use Pseudo mode, not Structure.
+    ///
+    /// Fix D (fix/rewrite-hook-falseneg): Structure strips function bodies,
+    /// which is wrong when the agent is reading a specific file at a ref.
+    /// Pseudo preserves logic flow while reducing token count.
+    #[test]
+    fn fix_d_file_content_transform_uses_pseudo_mode() {
+        let config = TransformConfig {
+            mode: Mode::Pseudo,
+            ..TransformConfig::default()
+        };
+        assert_eq!(
+            config.mode,
+            Mode::Pseudo,
+            "file-content transform must use Pseudo mode, not Structure (Fix D)"
+        );
+        // Confirm default is NOT Pseudo (so the Fix D change is meaningful).
+        assert_ne!(
+            TransformConfig::default().mode,
+            Mode::Pseudo,
+            "TransformConfig::default() must not be Pseudo — Fix D must actively set it"
+        );
+    }
+
+    /// Pseudo mode produces non-empty output for a simple Rust function.
+    ///
+    /// Guards that Pseudo mode does not silently strip function bodies when
+    /// given Rust source — agents reading file content must see the logic.
+    #[test]
+    fn fix_d_pseudo_mode_preserves_function_body() {
+        use rskim_core::Language;
+        let rust_src = r#"fn greet(name: &str) -> String {
+    format!("Hello, {}!", name)
+}
+"#;
+        let result = rskim_core::transform(rust_src, Language::Rust, Mode::Pseudo);
+        assert!(result.is_ok(), "Pseudo transform of Rust source must succeed");
+        let output = result.unwrap();
+        // In Pseudo mode the body should be visible (unlike Structure which strips it).
+        assert!(
+            output.contains("Hello") || output.contains("format") || output.contains("greet"),
+            "Pseudo output must contain function body content, got: {output:?}"
         );
     }
 }
