@@ -2180,8 +2180,8 @@ mod tests {
     fn fix_f_ratio_header_present_when_truncated() {
         let result = FileResult::new(
             "ls".to_string(),
-            50,  // shown
             342, // total
+            50,  // shown
             (0..50).map(|i| format!("file{i}")).collect(),
             Some("... and 292 more".to_string()),
         );
