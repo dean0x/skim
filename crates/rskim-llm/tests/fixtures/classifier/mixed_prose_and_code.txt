@@ -1,0 +1,7 @@
+To install the tool, run the following command:
+
+```bash
+cargo install rskim --locked
+```
+
+After installation, verify it works with `skim --version`.

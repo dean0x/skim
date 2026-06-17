@@ -1,0 +1,1 @@
+{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Test numbers"}],"max_tokens":1.0e3,"temperature":0.5e0,"top_p":-0.5e-1}

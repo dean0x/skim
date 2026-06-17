@@ -1,0 +1,5 @@
+error[E0599]: no method named `grow_bytes_unchecked` found for struct `Outcome` in the current scope
+  --> tests/compile_fail/b_grow_bytes.rs:20:13
+   |
+20 |         out.grow_bytes_unchecked(100) //~^ ERROR no method named `grow_bytes_unchecked`
+   |             ^^^^^^^^^^^^^^^^^^^^ method not found in `Outcome`

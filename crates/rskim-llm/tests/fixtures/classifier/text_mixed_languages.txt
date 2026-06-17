@@ -1,0 +1,1 @@
+The system supports multiple languages. In French: Bonjour le monde. In German: Guten Tag. In Japanese: こんにちは世界。In Arabic: مرحبا بالعالم. The encoding handles all Unicode code points correctly, preserving byte-exact representations of all characters in the JSON payload.

@@ -1,0 +1,1 @@
+{"success":true,"results":[{"url":"https://example.com/1","title":"Result 1","description":"First result description"},{"url":"https://example.com/2","title":"Result 2","description":"Second result description"}],"query_time_ms":123}
