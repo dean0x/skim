@@ -41,7 +41,7 @@
 //! outperforms condorcet and individual rank learning methods.  *Proc. SIGIR
 //! 2009*, pp. 758–759.  `RRF_K = 60` is the constant from that paper.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::types::FileId;
 
@@ -114,7 +114,7 @@ pub fn merge_layer_scores(layers: &[(Vec<(FileId, f64)>, f64)]) -> Vec<(FileId, 
         // Assign 1-based ranks and accumulate RRF contributions.
         // For duplicate FileIds within the same layer, the first occurrence
         // (highest score after DESC sort) wins — track via a per-layer seen set.
-        let mut seen_in_layer: std::collections::HashSet<FileId> = std::collections::HashSet::new();
+        let mut seen_in_layer: HashSet<FileId> = HashSet::new();
         for (i, &(fid, _)) in sorted_layer.iter().enumerate() {
             // Skip non-first occurrences within this layer.
             if !seen_in_layer.insert(fid) {

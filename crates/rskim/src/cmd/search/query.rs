@@ -10,7 +10,7 @@
 //! 6. For each result, attempt `extract_snippet`.
 //! 7. Return `QueryOutput`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -399,8 +399,7 @@ fn run_blast_radius_composite_query(
     // the lexical SearchResult, replace score with the composite RRF value.
     // For co-change-only files (absent from lexical pool): produce a stub
     // ResolvedResult with score = fused RRF score and no snippet.
-    let lex_map: std::collections::HashMap<FileId, &SearchResult> =
-        raw_lex.iter().map(|r| (r.file_id, r)).collect();
+    let lex_map: HashMap<FileId, &SearchResult> = raw_lex.iter().map(|r| (r.file_id, r)).collect();
 
     let results: Vec<super::types::ResolvedResult> =
         ranked_limited

@@ -190,7 +190,7 @@ fn extract_ts_specifiers(content: &str) -> Vec<String> {
     for line in content.lines() {
         let line = line.trim();
         // Static import: `import ... from "..."`.
-        if let Some(spec) = extract_from_clause(line, "from") {
+        if let Some(spec) = extract_from_clause(line) {
             specs.push(spec);
         }
         // require() / import(): extract the string literal argument.
@@ -304,12 +304,10 @@ fn extract_go_specifiers(content: &str) -> Vec<String> {
 // ============================================================================
 
 /// Extract the specifier from a `from "..."` or `from '...'` clause.
-fn extract_from_clause(line: &str, keyword: &str) -> Option<String> {
+fn extract_from_clause(line: &str) -> Option<String> {
     // Find `from ` or ` from ` preceded by some content.
-    let idx = line
-        .find(&format!("{keyword} "))
-        .or_else(|| line.find(&format!(" {keyword} ")))?;
-    let after = &line[idx + keyword.len() + 1..].trim_start();
+    let idx = line.find("from ").or_else(|| line.find(" from "))?;
+    let after = &line[idx + "from ".len()..].trim_start();
     extract_quoted_string(after)
 }
 

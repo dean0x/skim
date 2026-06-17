@@ -17,7 +17,7 @@
 //! gated to default weight 0.0 in `CompositeWeights6`.  Follow-up ticket #336
 //! tracks the full implementation with a benchmark-grounded weight.
 //!
-//! # Future implementation notes (for #314)
+//! # Future implementation notes (for #336)
 //!
 //! The structural-coupling score measures how strongly two files are coupled
 //! via shared type references or trait implementations:
@@ -60,7 +60,7 @@ use crate::types::FileId;
 /// `0.0` (neutral score — no coupling assumed in the scaffold phase).
 #[must_use]
 pub fn structural_coupling_score(_source: FileId, _target: FileId) -> f64 {
-    // Scaffold: always 0.0 until #314 implements the full signal.
+    // Scaffold: always 0.0 until #336 implements the full signal.
     // See module-level doc comment for the deferral rationale.
     0.0
 }
