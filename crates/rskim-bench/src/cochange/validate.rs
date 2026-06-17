@@ -205,6 +205,11 @@ pub fn check_quality_gates(commits: &[CommitInfo]) -> anyhow::Result<()> {
 ///
 /// `unmapped_files_count` is the number of file references in test commits
 /// that had no mapping in `path_map` (and were therefore excluded from recall).
+///
+/// # Note
+///
+/// This function uses `CochangeMatrixReader::jaccard` as the predictor.  For
+/// sweeping an arbitrary signal, use [`evaluate_at_thresholds_with_scorer`].
 pub fn evaluate_at_thresholds(
     reader: &CochangeMatrixReader,
     test_commits: &[CommitInfo],
@@ -295,6 +300,121 @@ pub fn evaluate_at_thresholds(
         // Sweep thresholds over the cached jaccard values.
         sweep_thresholds(
             &jaccard_scratch,
+            &all_known_scratch,
+            &known_ids,
+            thresholds,
+            &mut accumulators,
+            &mut predicted_scratch,
+        );
+    }
+
+    let metrics = accumulators.finalize(thresholds);
+    Ok((metrics, unmapped_files_total))
+}
+
+/// Evaluate blast-radius predictions using any `Fn(FileId, FileId) -> f64` scorer
+/// (`PairScorer` seam for AC9 — marginal-lift regression guard).
+///
+/// Generalises [`evaluate_at_thresholds`] by replacing the hard-wired
+/// `CochangeMatrixReader::jaccard` call with a caller-supplied scorer closure.
+/// The scorer must be O(1)/pair (no per-pair allocation or nested scan) so the
+/// asymptotic complexity of the outer loop stays O(F²×T).
+///
+/// This is the single seam through which BOTH the jaccard-only baseline AND
+/// every new/composite signal are swept via the SAME metric helpers
+/// (`compute_precision`, `compute_recall`, `compute_f1`), satisfying AC9.
+///
+/// # Arguments
+///
+/// * `scorer` — any `Fn(FileId, FileId) -> f64`; returns 0.0 for unknown pairs.
+///   Must not allocate or perform I/O per call.
+/// * `test_commits`, `path_map`, `thresholds` — same semantics as
+///   [`evaluate_at_thresholds`].
+///
+/// # Returns
+///
+/// `(metrics_by_threshold, unmapped_files_count)` — same schema as
+/// [`evaluate_at_thresholds`].
+///
+/// # Errors
+///
+/// Returns `Err` when the file or commit count exceeds the evaluation caps
+/// (same guards as [`evaluate_at_thresholds`]).
+pub fn evaluate_at_thresholds_with_scorer(
+    scorer: &impl Fn(FileId, FileId) -> f64,
+    test_commits: &[CommitInfo],
+    path_map: &HashMap<PathBuf, FileId>,
+    thresholds: &[f64],
+) -> anyhow::Result<(Vec<ThresholdMetrics>, usize)> {
+    let all_file_ids: Vec<FileId> = {
+        let mut ids: Vec<FileId> = path_map.values().copied().collect();
+        ids.sort_unstable();
+        ids
+    };
+
+    if all_file_ids.len() > MAX_FILES_FOR_EVALUATION {
+        anyhow::bail!(
+            "file count {} exceeds evaluation limit {} — skip this repo or raise MAX_FILES_FOR_EVALUATION",
+            all_file_ids.len(),
+            MAX_FILES_FOR_EVALUATION
+        );
+    }
+
+    if test_commits.len() > MAX_TEST_COMMITS {
+        anyhow::bail!(
+            "test commit count {} exceeds limit {}",
+            test_commits.len(),
+            MAX_TEST_COMMITS
+        );
+    }
+
+    let mut unmapped_files_total = 0usize;
+    let mut accumulators = EvalAccumulators::new(thresholds.len());
+
+    let mut scorer_scratch: Vec<Vec<(FileId, f64)>> = Vec::with_capacity(MAX_FILES_PER_COMMIT);
+    let mut all_known_scratch: HashSet<FileId> = HashSet::with_capacity(MAX_FILES_PER_COMMIT);
+    let mut known_ids: Vec<FileId> = Vec::with_capacity(MAX_FILES_PER_COMMIT);
+    let mut predicted_scratch: HashSet<FileId> = HashSet::with_capacity(MAX_FILES_PER_COMMIT);
+
+    for commit in test_commits {
+        known_ids.clear();
+        let mut unmapped = 0usize;
+        for fc in &commit.changed_files {
+            match path_map.get(&fc.path) {
+                Some(&fid) => known_ids.push(fid),
+                None => unmapped += 1,
+            }
+        }
+        unmapped_files_total += unmapped;
+
+        if known_ids.len() < 2 {
+            continue;
+        }
+        if known_ids.len() > MAX_FILES_PER_COMMIT {
+            continue;
+        }
+
+        // Pre-compute scorer pairs once per commit, then sweep thresholds.
+        let q = known_ids.len();
+        while scorer_scratch.len() < q {
+            scorer_scratch.push(Vec::new());
+        }
+        scorer_scratch.truncate(q);
+        for (q_idx, &query_id) in known_ids.iter().enumerate() {
+            scorer_scratch[q_idx].clear();
+            build_pairs_into_with_scorer(
+                query_id,
+                &all_file_ids,
+                scorer,
+                &mut scorer_scratch[q_idx],
+            );
+        }
+
+        all_known_scratch.clear();
+        all_known_scratch.extend(known_ids.iter().copied());
+
+        sweep_thresholds(
+            &scorer_scratch,
             &all_known_scratch,
             &known_ids,
             thresholds,
@@ -791,6 +911,28 @@ fn build_jaccard_pairs_into(
         }
     }
     Ok(())
+}
+
+/// Fill `out` using a generic `PairScorer` closure instead of `CochangeMatrixReader`.
+///
+/// Identical to [`build_jaccard_pairs_into`] except the scorer is any
+/// `Fn(FileId, FileId) -> f64`.  Scores ≤ 0.0 are excluded (same as jaccard).
+/// This function is O(1)/pair (no per-pair allocation).
+fn build_pairs_into_with_scorer(
+    query_id: FileId,
+    all_file_ids: &[FileId],
+    scorer: &impl Fn(FileId, FileId) -> f64,
+    out: &mut Vec<(FileId, f64)>,
+) {
+    for &candidate_id in all_file_ids {
+        if candidate_id == query_id {
+            continue; // skip self-pair
+        }
+        let score = scorer(query_id, candidate_id);
+        if score > 0.0 {
+            out.push((candidate_id, score));
+        }
+    }
 }
 
 /// Sweep all thresholds over pre-computed jaccard pairs for one commit.

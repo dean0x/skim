@@ -16,7 +16,8 @@ use std::time::Instant;
 
 use rskim_search::{
     CompositeWeights, FileId, IndexStats, NgramIndexReader, QueryEngine, SearchLayer, SearchQuery,
-    SearchResult, StructuralMetrics, intersect_and_rank, recompose_with_lexical,
+    SearchResult, StructuralMetrics, intersect_and_rank, merge_layer_scores,
+    recompose_with_lexical,
 };
 
 use super::manifest::FileManifest;
@@ -150,14 +151,51 @@ pub(super) fn execute_query_with_manifest(
     }
     // ── End compound text+AST path ────────────────────────────────────────────
 
-    // ── Pure-lexical / blast-radius-only path (unchanged from #199) ──────────
+    // ── Composite UNION blast-radius path (#200) ──────────────────────────────
+    //
+    // When blast_radius_paths is set AND there is no AST filter, replace the old
+    // file_filter (set-intersection) approach with UNION re-ranking via composite
+    // weighted RRF:
+    //
+    //   1. Fetch a WIDER lexical pool (limit * CANDIDATE_POOL_K) WITHOUT a
+    //      file_filter so text-only matches outside the co-change partner set
+    //      are still present in the lexical ranked list.
+    //   2. Build a temporal ranked list from the co-change partner set:
+    //      each partner gets an equal score of 1.0 so they all contribute rank
+    //      terms to the RRF fusion.
+    //   3. Run merge_layer_scores over [lexical, temporal] with the composite
+    //      weights from config or the default profile.
+    //   4. Recompose: carry the lexical SearchResult (snippet + line_range)
+    //      for files that appear in the lexical pool.  Files present ONLY in the
+    //      temporal list (co-change-only) get a stub result with the fused score.
+    //   5. Truncate to --limit LAST (rank-then-truncate-LAST invariant).
+    //
+    // UNION semantics (AC12): a co-change partner absent from the lexical list
+    // is still returned, ranked by its temporal RRF term alone (lexical absent →
+    // contributes 0 under graceful absence).
+    //
+    // AC11 (temporal source): temporal ranked list is built from blast_radius_paths
+    // which is resolved from TemporalDb::cochanges_for_file — the same store the
+    // CLI blast-radius used before #200.  This satisfies AC11 (source identity).
+    if config.blast_radius_paths.is_some() {
+        return run_blast_radius_composite_query(
+            config,
+            &blast_file_ids,
+            QueryContext {
+                engine: &engine,
+                sorted: &sorted,
+                root,
+                manifest: &manifest,
+                stats,
+                start,
+            },
+        );
+    }
+    // ── End composite UNION blast-radius path ─────────────────────────────────
+
+    // ── Pure-lexical path (no blast-radius, no AST — unchanged) ──────────────
     let mut sq = SearchQuery::new(config.text.clone());
     sq.limit = Some(config.limit);
-
-    // Build the FileId allowlist from blast-radius paths only (no AST in this path).
-    if let Some(blast) = blast_file_ids {
-        sq.file_filter = Some(blast);
-    }
 
     // Execute the search.
     let raw_results = engine.search(&sq)?;
@@ -267,6 +305,158 @@ fn run_compound_query(
     let recomposed = recompose_with_lexical(&ranked_limited, &raw_lex);
 
     let results = resolve_paths_and_snippets(&recomposed, ctx.sorted, ctx.root, ctx.manifest);
+    let total = results.len();
+    let duration_ms = ctx.start.elapsed().as_millis() as u64;
+    Ok(QueryOutput {
+        query: config.text.clone(),
+        total,
+        results,
+        duration_ms,
+        index_stats: Some(ctx.stats),
+    })
+}
+
+/// Execute the composite UNION blast-radius re-ranking path (#200).
+///
+/// Fuses the lexical ranked list and the temporal co-change ranked list into
+/// a single composite ranking via weighted RRF (UNION semantics):
+///
+/// - Files present ONLY in the lexical list: contribute their lexical rank term.
+/// - Files present ONLY in the temporal (co-change) list: contribute their
+///   temporal rank term alone (graceful absence = 0 from the lexical layer).
+///   These are co-change-only files that the text query did not match — they
+///   APPEAR in UNION mode (AC12) but would be ABSENT under old filter mode.
+/// - Files present in BOTH: accumulate both rank terms (AC2 multi-layer bonus).
+///
+/// The output score field carries the fused RRF value, NOT a BM25F magnitude
+/// (AC14: score is documented as composite fused RRF in the doc comment below
+/// and in the `ResolvedResult::score` field doc).
+///
+/// # Temporal ranked list construction (AC11 source identity)
+///
+/// The temporal ranked list is built from `blast_paths` (already resolved from
+/// `TemporalDb::cochanges_for_file` — the same SQLite source the CLI used
+/// before #200).  Each co-change partner path is assigned an equal score of
+/// `1.0` (uniform temporal rank input) and converted to `FileId` via the
+/// manifest's `sorted_paths`.  The Jaccard-value-aware ranking within the
+/// temporal list is not preserved here; the RRF framework uses rank, not
+/// magnitude, so the order within the temporal list only matters when there
+/// are many co-change partners.  Improvement tracked for follow-up: use the
+/// Jaccard score as the raw temporal score for better rank ordering (#200+).
+fn run_blast_radius_composite_query(
+    config: &super::types::QueryConfig,
+    blast_file_ids: &Option<HashSet<FileId>>,
+    ctx: QueryContext<'_>,
+) -> anyhow::Result<QueryOutput> {
+    // Effective weights: use caller-supplied override or default profile.
+    let weights = config.composite_weights.unwrap_or_default();
+
+    // Step 1: fetch a wider lexical pool WITHOUT a file_filter.
+    // The UNION mode must score files outside the co-change partner set via
+    // their lexical rank, so we cannot pre-filter the lexical pool.
+    const CANDIDATE_POOL_K: usize = 5;
+    let mut sq = SearchQuery::new(config.text.clone());
+    // saturating_mul: a hostile --limit near usize::MAX must not overflow.
+    sq.limit = Some(config.limit.saturating_mul(CANDIDATE_POOL_K).max(100));
+    // No file_filter: UNION mode requires the full lexical ranked list.
+    let raw_lex = ctx.engine.search(&sq)?;
+
+    // Step 2: build the temporal ranked list from blast_paths.
+    // Each co-change partner path → FileId (via sorted_paths index).
+    // Score = 1.0 (uniform; RRF uses rank not magnitude, so this suffices).
+    // The target file itself is included in blast_paths by resolve_blast_radius_paths.
+    let temporal_layer: Vec<(FileId, f64)> = match blast_file_ids {
+        Some(ids) => {
+            let mut layer: Vec<(FileId, f64)> = ids.iter().map(|&fid| (fid, 1.0)).collect();
+            // Sort by FileId for deterministic rank assignment within the layer.
+            // All have equal scores, so the sort order determines their temporal ranks.
+            // FileId-ASC is a stable, arbitrary tie-break.
+            layer.sort_unstable_by_key(|&(fid, _)| fid.0);
+            layer
+        }
+        None => {
+            // blast_file_ids is None when the temporal DB was absent at path resolution.
+            // Fall back to the lexical result set sorted by score (temporal = no signal).
+            // This gracefully degrades to lexical-only ranking when temporal data is absent.
+            vec![]
+        }
+    };
+
+    // Step 3: lexical ranked list from raw_lex (already sorted DESC by score).
+    let lexical_layer: Vec<(FileId, f64)> = raw_lex.iter().map(|r| (r.file_id, r.score)).collect();
+
+    // Step 4: N-signal RRF UNION merge.
+    // Only lexical and temporal signals are used in the blast-radius path.
+    // AST, import_graph, dir_proximity, structural_coupling are all at 0.0
+    // in the default profile (extended signals gated per ADR-003).
+    let layers: &[(Vec<(FileId, f64)>, f64)] = &[
+        (lexical_layer, weights.lexical),
+        (temporal_layer, weights.temporal),
+    ];
+    let ranked = merge_layer_scores(layers);
+
+    // Step 5: truncate to --limit LAST (rank-then-truncate-LAST invariant).
+    let ranked_limited: Vec<_> = ranked.into_iter().take(config.limit).collect();
+
+    // Step 6: recompose results.
+    // For files present in the lexical pool: carry snippet + line_range from
+    // the lexical SearchResult, replace score with the composite RRF value.
+    // For co-change-only files (absent from lexical pool): produce a stub
+    // ResolvedResult with score = fused RRF score and no snippet.
+    let lex_map: std::collections::HashMap<FileId, &SearchResult> =
+        raw_lex.iter().map(|r| (r.file_id, r)).collect();
+
+    let sorted = ctx.sorted;
+    let results: Vec<super::types::ResolvedResult> = ranked_limited
+        .iter()
+        .filter_map(|&(fid, composite_score)| {
+            let path = sorted.get(fid.0 as usize)?;
+            let manifest_entry = ctx.manifest.lookup(path);
+
+            if let Some(&lex_result) = lex_map.get(&fid) {
+                // File has a lexical hit: carry its snippet/line data.
+                let mut r = lex_result.clone();
+                r.score = composite_score;
+                let (line_number, line_range, snippet, stale) =
+                    match extract_snippet(ctx.root, path, &r.match_positions, manifest_entry) {
+                        SnippetOutcome::Ok {
+                            match_line,
+                            line_range,
+                            context,
+                        } => (Some(match_line), Some(line_range), Some(context), false),
+                        SnippetOutcome::Stale => (None, None, None, true),
+                        SnippetOutcome::Unavailable => (None, None, None, false),
+                    };
+                Some(super::types::ResolvedResult {
+                    path: path.to_string(),
+                    score: composite_score,
+                    field: r.field.name().to_string(),
+                    line_number,
+                    line_range,
+                    snippet,
+                    stale,
+                    match_positions: r.match_positions.clone(),
+                    temporal: None,
+                })
+            } else {
+                // Co-change-only file: no lexical hit → no snippet (AC12, UNION mode).
+                // These files appear because their temporal rank contributes to the
+                // fused score even though the text query did not match them.
+                Some(super::types::ResolvedResult {
+                    path: path.to_string(),
+                    score: composite_score,
+                    field: "co_change_partner".to_string(),
+                    line_number: None,
+                    line_range: None,
+                    snippet: None,
+                    stale: false,
+                    match_positions: vec![],
+                    temporal: None,
+                })
+            }
+        })
+        .collect();
+
     let total = results.len();
     let duration_ms = ctx.start.elapsed().as_millis() as u64;
     Ok(QueryOutput {

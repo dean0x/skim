@@ -51,6 +51,7 @@ fn make_config(root: &std::path::Path, cache_dir: &std::path::Path, text: &str) 
         cache_dir: cache_dir.to_path_buf(),
         blast_radius_paths: None,
         ast_scored: None,
+        composite_weights: None,
     }
 }
 
@@ -356,9 +357,14 @@ fn test_resolved_result_line_range_none_serializes_null() {
 // blast_radius_paths filter
 // ============================================================================
 
-/// When blast_radius_paths is set, execute_query must restrict results to
-/// the allowed paths. The target file itself is included in the set (Issue fix:
-/// previously only co-change *partners* were included, excluding the target).
+/// When blast_radius_paths is set, execute_query uses UNION composite ranking
+/// (#200): the blast-radius member that lexically matches must appear in results.
+///
+/// Note: as of #200 the blast-radius path uses UNION semantics (not the old
+/// filter/intersection semantics).  Lexically relevant files outside the
+/// blast-radius set may also appear in results — this is intentional.  The
+/// invariant under test is that the blast member IS included, not that the
+/// result set is restricted to it.
 #[test]
 fn test_execute_query_blast_radius_includes_only_allowed_paths() {
     use std::collections::HashSet;
@@ -369,7 +375,7 @@ fn test_execute_query_blast_radius_includes_only_allowed_paths() {
     fs::create_dir_all(&cache_dir).unwrap();
     create_test_project(&root);
 
-    // Allow only src/auth.rs in the blast-radius set.
+    // blast-radius set: src/auth.rs only.
     let mut allowed: HashSet<String> = HashSet::new();
     allowed.insert("src/auth.rs".to_string());
 
@@ -381,18 +387,21 @@ fn test_execute_query_blast_radius_includes_only_allowed_paths() {
         cache_dir: cache_dir.to_path_buf(),
         blast_radius_paths: Some(allowed),
         ast_scored: None,
+        composite_weights: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
-    // All results must be from the allowed set.
-    for r in &output.results {
-        assert_eq!(
-            r.path, "src/auth.rs",
-            "blast-radius filter must restrict results to allowed paths, got: {}",
-            r.path
-        );
-    }
+    // UNION mode (#200): src/auth.rs lexically matches "authenticate" AND is
+    // in the blast-radius set → it MUST appear in results.
+    let has_auth = output.results.iter().any(|r| r.path == "src/auth.rs");
+    assert!(
+        has_auth,
+        "blast-radius member that lexically matches must appear in UNION results (AC12)"
+    );
+
+    // query must succeed and return at least one result.
+    assert!(!output.results.is_empty(), "results must not be empty");
 }
 
 /// When blast_radius_paths contains the target file, a query that matches
@@ -422,6 +431,7 @@ fn test_execute_query_blast_radius_target_file_is_included() {
         cache_dir: cache_dir.to_path_buf(),
         blast_radius_paths: Some(allowed),
         ast_scored: None,
+        composite_weights: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
