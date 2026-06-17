@@ -348,16 +348,20 @@ fn run_blast_radius_composite_query(
     blast_file_ids: &Option<HashSet<FileId>>,
     ctx: QueryContext<'_>,
 ) -> anyhow::Result<QueryOutput> {
-    // Effective weights: use caller-supplied override or default profile.
-    let weights = config.composite_weights.unwrap_or_default();
+    // Effective weights: use caller-supplied override or the six-signal #200 profile.
+    let weights = config
+        .composite_weights
+        .unwrap_or_else(CompositeWeights::with_six_signal_defaults);
 
-    // Step 1: fetch a wider lexical pool WITHOUT a file_filter.
-    // The UNION mode must score files outside the co-change partner set via
-    // their lexical rank, so we cannot pre-filter the lexical pool.
-    const CANDIDATE_POOL_K: usize = 5;
+    // Step 1: fetch the FULL lexical ranked list WITHOUT a file_filter and WITHOUT
+    // a limit cap.  The UNION contract requires ranking the complete candidate set
+    // (all files that appear in *either* the lexical or temporal list) before
+    // truncation.  Applying a pre-limit here would silently drop co-change partners
+    // whose lexical rank exceeds the cap, violating the rank-then-truncate-LAST
+    // invariant (Cross-Plan Amendment, Intent Drift 3 fix).
     let mut sq = SearchQuery::new(config.text.clone());
-    // saturating_mul: a hostile --limit near usize::MAX must not overflow.
-    sq.limit = Some(config.limit.saturating_mul(CANDIDATE_POOL_K).max(100));
+    // No limit: we truncate AFTER fusion (Step 5). No file_filter: UNION mode.
+    sq.limit = None;
     // No file_filter: UNION mode requires the full lexical ranked list.
     let raw_lex = ctx.engine.search(&sq)?;
 

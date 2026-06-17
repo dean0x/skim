@@ -184,6 +184,7 @@ fn ac2_composite_fusion_reorders_vs_lexical() {
     let weights = CompositeWeights {
         lexical: 1.0,
         ast: 10.0,
+        ..Default::default()
     };
     let ranked = intersect_and_rank(&lexical, &ast, no_metrics, 0.0, weights);
 
@@ -383,6 +384,7 @@ fn ac8_rrf_is_scale_free() {
     let lex_heavy = CompositeWeights {
         lexical: 1.0,
         ast: 0.1,
+        ..Default::default()
     };
     let ranked_a = intersect_and_rank(&lexical, &ast_a, no_metrics, 0.0, lex_heavy);
 
@@ -427,6 +429,7 @@ fn ac8_rrf_is_scale_free() {
     let ast_heavy = CompositeWeights {
         lexical: 0.1,
         ast: 1.0,
+        ..Default::default()
     };
     let ranked_c = intersect_and_rank(&lexical, &ast_a, no_metrics, 0.0, ast_heavy);
     assert_eq!(
@@ -716,6 +719,7 @@ fn structural_depth_refines_ast_rank() {
     let ast_heavy = CompositeWeights {
         lexical: 0.1,
         ast: 10.0,
+        ..Default::default()
     };
     let ranked = intersect_and_rank(&lexical, &ast, structural_lookup, 10.0_f32, ast_heavy);
 

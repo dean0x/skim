@@ -202,7 +202,7 @@ struct Flags {
     /// Composite RRF weights for the blast-radius UNION ranking path (#200).
     ///
     /// Parsed from `--weights lexical,ast,temporal` and validated at flag-parse
-    /// time.  `None` → use `CompositeWeights6::default()` (0.5, 0.3, 0.2).
+    /// time.  `None` → use `CompositeWeights6::with_six_signal_defaults()` (0.5, 0.3, 0.2).
     weights: Option<rskim_search::CompositeWeights6>,
 }
 

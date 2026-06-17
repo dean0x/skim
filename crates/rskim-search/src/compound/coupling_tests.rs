@@ -29,7 +29,8 @@ fn test_scaffold_returns_zero() {
 #[test]
 fn test_default_weight_is_zero() {
     use crate::compound::CompositeWeights6;
-    let w = CompositeWeights6::default();
+    // Use the six-signal profile (lexical=0.5, ast=0.3, temporal=0.2, extended=0.0).
+    let w = CompositeWeights6::with_six_signal_defaults();
     assert_eq!(
         w.structural_coupling, 0.0,
         "structural_coupling default weight must be 0.0 (ADR-003 gated, AC8b)"
@@ -37,11 +38,11 @@ fn test_default_weight_is_zero() {
 }
 
 /// Guard: no #NEW placeholder exists for the follow-up ticket.
-/// The deferred ticket is #314 — referenced in the module doc comment.
+/// The deferred ticket is #336 — referenced in the module doc comment.
 /// This test verifies the module doc contains the real ticket number.
 #[test]
 fn test_no_new_placeholder_in_source() {
-    // The deferred ticket number (#314) must be referenced and the source
+    // The deferred ticket number (#336) must be referenced and the source
     // must NOT contain the placeholder "#NEW".
     let source = include_str!("coupling.rs");
     assert!(
@@ -49,7 +50,7 @@ fn test_no_new_placeholder_in_source() {
         "coupling.rs must not contain '#NEW' placeholder (AC8b requirement)"
     );
     assert!(
-        source.contains("#314"),
-        "coupling.rs must reference follow-up ticket #314 (AC8b requirement)"
+        source.contains("#336"),
+        "coupling.rs must reference follow-up ticket #336 (AC8b requirement)"
     );
 }

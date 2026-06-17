@@ -30,7 +30,7 @@ fn test_multi_layer_match_ranks_higher_than_single_layer_dominant() {
     let temporal = layer(&[(0, 0.9)]);
 
     // Default weights: lexical=0.5, ast=0.3, temporal=0.2, rest=0.0
-    let w = CompositeWeights6::default();
+    let w = CompositeWeights6::with_six_signal_defaults();
     let result = merge_composite(lexical, vec![], temporal, vec![], vec![], vec![], w);
 
     assert!(!result.is_empty(), "result must not be empty");
@@ -62,7 +62,7 @@ fn test_multi_layer_match_ranks_higher_than_single_layer_dominant() {
         vec![],
         vec![],
         vec![],
-        CompositeWeights6::default(),
+        CompositeWeights6::with_six_signal_defaults(),
     );
     let pos_a2 = result2.iter().position(|&(fid, _)| fid.0 == 0).unwrap();
     let pos_b2 = result2.iter().position(|&(fid, _)| fid.0 == 1).unwrap();
@@ -111,7 +111,7 @@ fn test_rank_invariance() {
 
 #[test]
 fn test_deterministic_two_calls_identical() {
-    let w = CompositeWeights6::default();
+    let w = CompositeWeights6::with_six_signal_defaults();
     let lex = layer(&[(2, 10.0), (0, 8.0), (1, 6.0)]);
     let tmp = layer(&[(1, 0.9), (0, 0.7)]);
 
@@ -159,7 +159,7 @@ fn test_equal_fused_scores_break_by_file_id_asc() {
 
 #[test]
 fn test_all_finite_scores() {
-    let w = CompositeWeights6::default();
+    let w = CompositeWeights6::with_six_signal_defaults();
     let lex = layer(&[(0, 1.0), (1, 2.0)]);
     let result = merge_composite(lex, vec![], vec![], vec![], vec![], vec![], w);
     for &(_, score) in &result {
@@ -177,7 +177,7 @@ fn test_all_finite_scores() {
 #[test]
 fn test_empty_layer_contributes_nothing_weight_not_redistributed() {
     // AC4(a): empty layer contributes 0 to every file; weight NOT redistributed.
-    let w = CompositeWeights6::default();
+    let w = CompositeWeights6::with_six_signal_defaults();
     let lex = layer(&[(0, 1.0)]);
     // All other layers empty.
     let result = merge_composite(lex, vec![], vec![], vec![], vec![], vec![], w);
@@ -198,7 +198,7 @@ fn test_empty_layer_contributes_nothing_weight_not_redistributed() {
 #[test]
 fn test_single_file_layer() {
     // AC4(b): single-file layer must produce one output entry.
-    let w = CompositeWeights6::default();
+    let w = CompositeWeights6::with_six_signal_defaults();
     let lex = layer(&[(42, 99.0)]);
     let result = merge_composite(lex, vec![], vec![], vec![], vec![], vec![], w);
     assert_eq!(result.len(), 1);
@@ -209,7 +209,7 @@ fn test_single_file_layer() {
 #[test]
 fn test_all_equal_scores_layer_deterministic() {
     // AC4(c): all-equal-scores layer must not produce non-deterministic order.
-    let w = CompositeWeights6::default();
+    let w = CompositeWeights6::with_six_signal_defaults();
     let lex = layer(&[(0, 5.0), (1, 5.0), (2, 5.0)]);
     let r1 = merge_composite(lex.clone(), vec![], vec![], vec![], vec![], vec![], w);
     let r2 = merge_composite(lex, vec![], vec![], vec![], vec![], vec![], w);
@@ -226,7 +226,7 @@ fn test_all_equal_scores_layer_deterministic() {
 fn test_union_inclusion_single_layer_only_file_is_present() {
     // AC4(d): a FileId present in only ONE of several layers MUST appear in output.
     // File 99 is present only in the temporal layer; not in lexical or ast.
-    let w = CompositeWeights6::default();
+    let w = CompositeWeights6::with_six_signal_defaults();
     let lex = layer(&[(0, 10.0), (1, 8.0)]);
     let ast = layer(&[(0, 5.0)]);
     let temporal = layer(&[(99, 0.95)]); // Only here.
@@ -249,7 +249,7 @@ fn test_union_inclusion_single_layer_only_file_is_present() {
 #[test]
 fn test_union_no_files_dropped_from_any_layer() {
     // All FileIds across all layers must appear in the output.
-    let w = CompositeWeights6::default();
+    let w = CompositeWeights6::with_six_signal_defaults();
     let lex = layer(&[(0, 10.0), (1, 8.0), (2, 6.0)]);
     let temporal = layer(&[(3, 0.9), (4, 0.7)]);
     let expected_ids: std::collections::HashSet<u32> = [0, 1, 2, 3, 4].into();
@@ -264,7 +264,7 @@ fn test_union_no_files_dropped_from_any_layer() {
 #[test]
 fn test_no_panic_all_empty_layers() {
     // AC4(a): all-empty input must return an empty Vec, not panic.
-    let w = CompositeWeights6::default();
+    let w = CompositeWeights6::with_six_signal_defaults();
     let result = merge_composite(vec![], vec![], vec![], vec![], vec![], vec![], w);
     assert!(
         result.is_empty(),
@@ -275,7 +275,7 @@ fn test_no_panic_all_empty_layers() {
 #[test]
 fn test_no_duplicate_file_ids_in_output() {
     // AC13: a FileId appearing in multiple input lists must appear ONCE in output.
-    let w = CompositeWeights6::default();
+    let w = CompositeWeights6::with_six_signal_defaults();
     let lex = layer(&[(5, 10.0), (6, 8.0)]);
     let temporal = layer(&[(5, 0.9), (7, 0.6)]); // FileId 5 in both layers.
     let result = merge_composite(lex, vec![], temporal, vec![], vec![], vec![], w);

@@ -13,7 +13,7 @@
 //! - [`merge`] — N-signal weighted-RRF over the UNION of all FileId sets.
 //! - [`proximity`] — directory-proximity pairwise signal.
 //! - [`import_graph`] — import/use/require edge extraction signal.
-//! - [`coupling`] — structural-coupling scaffold (deferred to #314).
+//! - [`coupling`] — structural-coupling scaffold (deferred to #336).
 
 pub mod coupling;
 pub mod import_graph;

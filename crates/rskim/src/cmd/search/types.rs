@@ -134,7 +134,20 @@ pub(super) struct QueryConfig {
 pub(super) struct ResolvedResult {
     /// Repo-relative path (forward slashes, no leading `.`).
     pub path: String,
-    /// BM25F relevance score (higher is better).
+    /// Relevance score (higher is better).
+    ///
+    /// Semantics depend on the active query path:
+    /// - **Plain lexical / AST path** (no `--blast-radius`): BM25F magnitude from
+    ///   the lexical ranking layer.
+    /// - **Composite UNION blast-radius path** (`--blast-radius` with composite
+    ///   ranking active, #200): fused weighted-RRF score —
+    ///   `Σᵢ wᵢ / (RRF_K + rankᵢ(file))`.  This is a small positive number
+    ///   (typically well below 1.0) and is NOT a BM25F magnitude.  Consumers
+    ///   reading this field as BM25F on the composite path will silently
+    ///   misinterpret it.
+    ///
+    /// The `field` value `"co_change_partner"` indicates a co-change-only result
+    /// whose score is the temporal RRF term alone (no lexical component).
     pub score: f64,
     /// Name of the AST field type (e.g. `"function_signature"`).
     pub field: String,

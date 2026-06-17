@@ -10,7 +10,9 @@ use crate::types::SearchError;
 
 #[test]
 fn test_default_values() {
-    let w = CompositeWeights6::default();
+    // AC1: six-signal profile via with_six_signal_defaults() (CompositeWeights6
+    // is a type alias for CompositeWeights; Default returns the 2-signal profile).
+    let w = CompositeWeights6::with_six_signal_defaults();
     // Core signals.
     assert_eq!(w.lexical, 0.5, "lexical default must be 0.5 (AC1)");
     assert_eq!(w.ast, 0.3, "ast default must be 0.3 (AC1)");
@@ -32,10 +34,10 @@ fn test_default_values() {
 
 #[test]
 fn test_default_validates_ok() {
-    // AC1: validate() must return Ok for the default profile.
+    // AC1: validate() must return Ok for the six-signal profile.
     assert!(
-        CompositeWeights6::default().validate().is_ok(),
-        "default weights must pass validate()"
+        CompositeWeights6::with_six_signal_defaults().validate().is_ok(),
+        "six-signal default weights must pass validate()"
     );
 }
 

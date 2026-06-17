@@ -1,11 +1,11 @@
-//! Structural-coupling signal scaffold (#200, phase deferred to #314).
+//! Structural-coupling signal scaffold (#200, phase deferred to #336).
 //!
 //! # Status
 //!
 //! This module is a **compile-ready scaffold** with a neutral (0.0) implementation
 //! and a default weight of 0.0 (see [`crate::compound::weights::WEIGHT6_STRUCTURAL_COUPLING`]).
 //!
-//! The full implementation is deferred to follow-up ticket **#314** because:
+//! The full implementation is deferred to follow-up ticket **#336** because:
 //! 1. AC8 explicitly allows phasing ("may be phased separately").
 //! 2. No corpus-grounded lift measurement has been performed yet (ADR-003).
 //! 3. Extracting shared type references / trait impls requires deeper AST
@@ -14,7 +14,7 @@
 //! # AC8 deferral (explicit)
 //!
 //! AC8(b) applies: the API returns a documented neutral value (0.0) and is
-//! gated to default weight 0.0 in `CompositeWeights6`.  Follow-up ticket #314
+//! gated to default weight 0.0 in `CompositeWeights6`.  Follow-up ticket #336
 //! tracks the full implementation with a benchmark-grounded weight.
 //!
 //! # Future implementation notes (for #314)
@@ -40,13 +40,13 @@ use crate::types::FileId;
 ///
 /// Always returns `0.0`.  This is intentional: the signal is gated to
 /// `weight = 0.0` in [`crate::compound::weights::CompositeWeights6`] until
-/// a benchmark-grounded promotion is performed in ticket #314.
+/// a benchmark-grounded promotion is performed in ticket #336.
 ///
-/// # Future behaviour (post-#314)
+/// # Future behaviour (post-#336)
 ///
 /// Will return a `[0.0, 1.0]` Jaccard score measuring the overlap of the
 /// two files' shared type-reference / trait-implementation sets.  The
-/// implementation in #314 must use `total_cmp` for any f64 comparisons and
+/// implementation in #336 must use `total_cmp` for any f64 comparisons and
 /// widen all structural metric counters via `u32::from` / `f64::from` before
 /// arithmetic (PF-004).
 ///
