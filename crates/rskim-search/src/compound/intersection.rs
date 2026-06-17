@@ -135,20 +135,17 @@ pub struct CompositeWeights {
 }
 
 impl Default for CompositeWeights {
-    /// Two-signal (#198) equal-weight default.
+    /// Six-signal (#200) default profile.
     ///
-    /// Returns `lexical = 1.0`, `ast = 1.0`, all extended signals `0.0`.
-    /// Use [`CompositeWeights::with_six_signal_defaults`] for the six-signal
-    /// #200 profile.
+    /// Returns `lexical = 0.5`, `ast = 0.3`, `temporal = 0.2`, all extended
+    /// signals `0.0`.  This is the canonical #200 starting profile as specified
+    /// in AC1.
+    ///
+    /// The #198 two-signal equal-weight profile (`lexical = 1.0`, `ast = 1.0`)
+    /// is available via the `WEIGHT_LEXICAL` / `WEIGHT_AST` constants for
+    /// callers that need the legacy two-signal path explicitly.
     fn default() -> Self {
-        Self {
-            lexical: WEIGHT_LEXICAL,
-            ast: WEIGHT_AST,
-            temporal: 0.0,
-            import_graph: 0.0,
-            dir_proximity: 0.0,
-            structural_coupling: 0.0,
-        }
+        Self::with_six_signal_defaults()
     }
 }
 

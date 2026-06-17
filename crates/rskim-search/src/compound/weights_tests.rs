@@ -10,9 +10,9 @@ use crate::types::SearchError;
 
 #[test]
 fn test_default_values() {
-    // AC1: six-signal profile via with_six_signal_defaults() (CompositeWeights6
-    // is a type alias for CompositeWeights; Default returns the 2-signal profile).
-    let w = CompositeWeights6::with_six_signal_defaults();
+    // AC1: Default::default() must return the six-signal profile
+    // (lexical=0.5, ast=0.3, temporal=0.2, extended=0.0).
+    let w = CompositeWeights6::default();
     // Core signals.
     assert_eq!(w.lexical, 0.5, "lexical default must be 0.5 (AC1)");
     assert_eq!(w.ast, 0.3, "ast default must be 0.3 (AC1)");
@@ -30,15 +30,19 @@ fn test_default_values() {
         w.structural_coupling, 0.0,
         "structural_coupling must default to 0.0 (ADR-003 gated)"
     );
+    // Confirm with_six_signal_defaults() and Default::default() are identical.
+    assert_eq!(
+        w,
+        CompositeWeights6::with_six_signal_defaults(),
+        "Default::default() must equal with_six_signal_defaults() (AC1)"
+    );
 }
 
 #[test]
 fn test_default_validates_ok() {
-    // AC1: validate() must return Ok for the six-signal profile.
+    // AC1: validate() must return Ok for Default::default() (the six-signal profile).
     assert!(
-        CompositeWeights6::with_six_signal_defaults()
-            .validate()
-            .is_ok(),
+        CompositeWeights6::default().validate().is_ok(),
         "six-signal default weights must pass validate()"
     );
 }
