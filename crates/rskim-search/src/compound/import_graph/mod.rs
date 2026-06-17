@@ -305,8 +305,9 @@ fn extract_go_specifiers(content: &str) -> Vec<String> {
 
 /// Extract the specifier from a `from "..."` or `from '...'` clause.
 fn extract_from_clause(line: &str) -> Option<String> {
-    // Find `from ` or ` from ` preceded by some content.
-    let idx = line.find("from ").or_else(|| line.find(" from "))?;
+    // The `from ` needle already subsumes the ` from ` case (the leading-space
+    // variant always contains `from `), so a single search suffices.
+    let idx = line.find("from ")?;
     let after = &line[idx + "from ".len()..].trim_start();
     extract_quoted_string(after)
 }

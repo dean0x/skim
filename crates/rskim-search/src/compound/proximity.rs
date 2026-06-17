@@ -10,8 +10,8 @@
 //! ```
 //!
 //! where `shared_prefix_segments` is the number of path components that `a`
-//! and `b` share from the left, and `depth_a`/`depth_b` are the number of
-//! components in each path (not counting the file name).
+//! and `b` share from the left, and `depth_a`/`depth_b` are the total number of
+//! components in each path (including the file name).
 //!
 //! # Properties
 //!
