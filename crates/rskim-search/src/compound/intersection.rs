@@ -73,7 +73,7 @@
 use std::collections::HashMap;
 
 use crate::ast_index::StructuralMetrics;
-use crate::types::{FileId, SearchResult};
+use crate::types::{FileId, Result, SearchError, SearchResult};
 
 // ============================================================================
 // Constants
@@ -105,23 +105,168 @@ pub const WEIGHT_AST: f64 = 1.0;
 /// Per-signal fusion weights for weighted RRF.
 ///
 /// #198 defines the two-signal (lexical + AST) blend.  #200 extends this
-/// struct additively to N signals (temporal, graph, ...).  Keep the equal-
-/// weight default as the baseline; document each weight with its signal's
-/// identity and the rationale for its value.
-#[derive(Debug, Clone, Copy)]
+/// struct additively to N signals — temporal, import-graph, dir-proximity, and
+/// structural-coupling are added here as the canonical extension, not a separate
+/// struct.  The equal-weight default for the #198 two-signal path uses
+/// `WEIGHT_LEXICAL = 1.0` / `WEIGHT_AST = 1.0`; the six-signal profile (from
+/// `WEIGHT6_*`) is captured in the `with_six_signal_defaults()` constructor.
+///
+/// # Extension by #200
+///
+/// The four new fields (`temporal`, `import_graph`, `dir_proximity`,
+/// `structural_coupling`) default to `0.0` per ADR-003 — each will be promoted
+/// to a non-zero value after a measured relative-lift benchmark confirms positive
+/// marginal lift on the same corpus in the same run.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompositeWeights {
     /// Weight for the lexical (BM25F) ranked list.
     pub lexical: f64,
     /// Weight for the AST structural ranked list.
     pub ast: f64,
+    /// Weight for the temporal co-change Jaccard ranked list (default 0.0 for
+    /// the two-signal #198 path; 0.2 in the six-signal #200 profile).
+    pub temporal: f64,
+    /// Weight for the import-graph signal (default 0.0 — ADR-003 gated).
+    pub import_graph: f64,
+    /// Weight for the directory-proximity signal (default 0.0 — ADR-003 gated).
+    pub dir_proximity: f64,
+    /// Weight for the structural-coupling signal (default 0.0 — ADR-003 gated).
+    pub structural_coupling: f64,
 }
 
 impl Default for CompositeWeights {
+    /// Six-signal (#200) default profile.
+    ///
+    /// Returns `lexical = 0.5`, `ast = 0.3`, `temporal = 0.2`, all extended
+    /// signals `0.0`.  This is the canonical #200 starting profile as specified
+    /// in AC1.
+    ///
+    /// The #198 two-signal equal-weight profile (`lexical = 1.0`, `ast = 1.0`)
+    /// is available via the `WEIGHT_LEXICAL` / `WEIGHT_AST` constants for
+    /// callers that need the legacy two-signal path explicitly.
     fn default() -> Self {
+        Self::with_six_signal_defaults()
+    }
+}
+
+impl CompositeWeights {
+    /// Six-signal (#200) default profile.
+    ///
+    /// Returns the canonical #200 starting weights:
+    /// `lexical = 0.5`, `ast = 0.3`, `temporal = 0.2`, extended `0.0`.
+    /// Extended signals will be promoted from `0.0` after measured relative-lift
+    /// benchmarks confirm positive marginal lift (ADR-003).
+    ///
+    /// These literal values mirror `WEIGHT6_*` constants in `compound::weights`.
+    /// They are inlined here to avoid a circular dependency
+    /// (`intersection` → `weights` → `intersection`).
+    #[must_use]
+    pub fn with_six_signal_defaults() -> Self {
         Self {
-            lexical: WEIGHT_LEXICAL,
-            ast: WEIGHT_AST,
+            lexical: 0.5,
+            ast: 0.3,
+            temporal: 0.2,
+            import_graph: 0.0,
+            dir_proximity: 0.0,
+            structural_coupling: 0.0,
         }
+    }
+
+    /// Validate that all weights are finite and non-negative.
+    ///
+    /// Returns `Ok(())` when all six weights satisfy:
+    /// - Not NaN (`w.is_nan()` is false)
+    /// - Not infinite (`w.is_infinite()` is false)
+    /// - Non-negative (`w >= 0.0`)
+    ///
+    /// Returns `Err(SearchError::InvalidQuery(...))` for the first invalid
+    /// weight encountered.  This function never panics (engineering rule:
+    /// Result, never throw in business logic).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use rskim_search::compound::CompositeWeights;
+    /// assert!(CompositeWeights::with_six_signal_defaults().validate().is_ok());
+    ///
+    /// let bad = CompositeWeights { lexical: -0.5, ..Default::default() };
+    /// assert!(bad.validate().is_err());
+    /// ```
+    pub fn validate(&self) -> Result<()> {
+        let fields = [
+            ("lexical", self.lexical),
+            ("ast", self.ast),
+            ("temporal", self.temporal),
+            ("import_graph", self.import_graph),
+            ("dir_proximity", self.dir_proximity),
+            ("structural_coupling", self.structural_coupling),
+        ];
+        for (name, w) in fields {
+            if w.is_nan() {
+                return Err(SearchError::InvalidQuery(format!(
+                    "weight '{name}' is NaN — all weights must be finite and non-negative"
+                )));
+            }
+            if w.is_infinite() {
+                return Err(SearchError::InvalidQuery(format!(
+                    "weight '{name}' is infinite — all weights must be finite and non-negative"
+                )));
+            }
+            if w < 0.0 {
+                return Err(SearchError::InvalidQuery(format!(
+                    "weight '{name}' is negative ({w}) — all weights must be >= 0.0"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse a comma-separated weights string `"l,a,t"` into a `CompositeWeights`.
+    ///
+    /// Accepts exactly 3 values: lexical, ast, temporal.  Extended-signal weights
+    /// (import_graph, dir_proximity, structural_coupling) remain at their defaults
+    /// (all 0.0) — they are not user-configurable until benchmark lift is measured
+    /// (applies ADR-003).
+    ///
+    /// Returns `Err` when the string does not contain exactly 3 comma-separated
+    /// values, or any value fails to parse as a finite non-negative f64.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use rskim_search::compound::CompositeWeights;
+    /// let w = CompositeWeights::parse_weights_flag("0.5,0.3,0.2").unwrap();
+    /// assert_eq!(w.lexical, 0.5);
+    /// assert_eq!(w.ast, 0.3);
+    /// assert_eq!(w.temporal, 0.2);
+    /// ```
+    pub fn parse_weights_flag(s: &str) -> Result<Self> {
+        let parts: Vec<&str> = s.split(',').collect();
+        if parts.len() != 3 {
+            return Err(SearchError::InvalidQuery(format!(
+                "--weights requires exactly 3 comma-separated values (lexical,ast,temporal), got: {s:?}"
+            )));
+        }
+        let mut vals = [0.0f64; 3];
+        for (i, part) in parts.iter().enumerate() {
+            let v: f64 = part.trim().parse().map_err(|_| {
+                SearchError::InvalidQuery(format!(
+                    "--weights value {part:?} is not a valid number (field {})",
+                    ["lexical", "ast", "temporal"][i]
+                ))
+            })?;
+            vals[i] = v;
+        }
+        let candidate = Self {
+            lexical: vals[0],
+            ast: vals[1],
+            temporal: vals[2],
+            import_graph: 0.0,
+            dir_proximity: 0.0,
+            structural_coupling: 0.0,
+        };
+        candidate.validate()?;
+        Ok(candidate)
     }
 }
 

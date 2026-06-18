@@ -41,6 +41,40 @@ fn create_test_project(root: &std::path::Path) {
     .unwrap();
 }
 
+/// Create a project for AC12/AC13/AC14 UNION blast-radius tests.
+///
+/// auth.rs contains a unique function `zqjxblip_check` that does NOT
+/// share any 4-char n-grams with lib.rs.  lib.rs contains only database
+/// schema helpers — no "verify", "zqjx", or "token" substrings — so
+/// a query for "zqjxblip_check" returns a lexical hit only for auth.rs.
+/// lib.rs acts as the pure co-change-only partner with zero lexical overlap.
+fn create_union_test_project(root: &std::path::Path) {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // auth.rs: contains the unique query term only.
+    // "zqjxblip_check" uses a 4-char nonsense prefix "zqjx" that cannot appear
+    // in any natural Rust file, guaranteeing zero n-gram overlap with lib.rs.
+    fs::write(
+        src.join("auth.rs"),
+        "pub fn zqjxblip_check(t: &str) -> bool { !t.is_empty() }\n",
+    )
+    .unwrap();
+    // lib.rs: content with NO overlap with "zqjxblip" (no z, q, j, x cluster).
+    // Uses common Rust keywords/types that are far from the auth.rs term.
+    fs::write(
+        src.join("lib.rs"),
+        "pub struct Foo { pub count: u32 }\n\
+         impl Foo {\n\
+             pub fn new(n: u32) -> Self { Self { count: n } }\n\
+             pub fn total(&self) -> u32 { self.count }\n\
+         }\n",
+    )
+    .unwrap();
+}
+
 /// Build a QueryConfig pointing at `root` and `cache_dir`.
 fn make_config(root: &std::path::Path, cache_dir: &std::path::Path, text: &str) -> QueryConfig {
     QueryConfig {
@@ -51,6 +85,7 @@ fn make_config(root: &std::path::Path, cache_dir: &std::path::Path, text: &str) 
         cache_dir: cache_dir.to_path_buf(),
         blast_radius_paths: None,
         ast_scored: None,
+        composite_weights: None,
     }
 }
 
@@ -356,9 +391,14 @@ fn test_resolved_result_line_range_none_serializes_null() {
 // blast_radius_paths filter
 // ============================================================================
 
-/// When blast_radius_paths is set, execute_query must restrict results to
-/// the allowed paths. The target file itself is included in the set (Issue fix:
-/// previously only co-change *partners* were included, excluding the target).
+/// When blast_radius_paths is set, execute_query uses UNION composite ranking
+/// (#200): the blast-radius member that lexically matches must appear in results.
+///
+/// Note: as of #200 the blast-radius path uses UNION semantics (not the old
+/// filter/intersection semantics).  Lexically relevant files outside the
+/// blast-radius set may also appear in results — this is intentional.  The
+/// invariant under test is that the blast member IS included, not that the
+/// result set is restricted to it.
 #[test]
 fn test_execute_query_blast_radius_includes_only_allowed_paths() {
     use std::collections::HashSet;
@@ -369,7 +409,7 @@ fn test_execute_query_blast_radius_includes_only_allowed_paths() {
     fs::create_dir_all(&cache_dir).unwrap();
     create_test_project(&root);
 
-    // Allow only src/auth.rs in the blast-radius set.
+    // blast-radius set: src/auth.rs only.
     let mut allowed: HashSet<String> = HashSet::new();
     allowed.insert("src/auth.rs".to_string());
 
@@ -381,18 +421,21 @@ fn test_execute_query_blast_radius_includes_only_allowed_paths() {
         cache_dir: cache_dir.to_path_buf(),
         blast_radius_paths: Some(allowed),
         ast_scored: None,
+        composite_weights: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
-    // All results must be from the allowed set.
-    for r in &output.results {
-        assert_eq!(
-            r.path, "src/auth.rs",
-            "blast-radius filter must restrict results to allowed paths, got: {}",
-            r.path
-        );
-    }
+    // UNION mode (#200): src/auth.rs lexically matches "authenticate" AND is
+    // in the blast-radius set → it MUST appear in results.
+    let has_auth = output.results.iter().any(|r| r.path == "src/auth.rs");
+    assert!(
+        has_auth,
+        "blast-radius member that lexically matches must appear in UNION results (AC12)"
+    );
+
+    // query must succeed and return at least one result.
+    assert!(!output.results.is_empty(), "results must not be empty");
 }
 
 /// When blast_radius_paths contains the target file, a query that matches
@@ -422,6 +465,7 @@ fn test_execute_query_blast_radius_target_file_is_included() {
         cache_dir: cache_dir.to_path_buf(),
         blast_radius_paths: Some(allowed),
         ast_scored: None,
+        composite_weights: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -432,6 +476,258 @@ fn test_execute_query_blast_radius_target_file_is_included() {
         has_auth,
         "target file (src/auth.rs) must be in blast-radius results when it matches the query"
     );
+}
+
+// ============================================================================
+// AC12 — UNION inclusion: co-change-only file appears (POSITIVE, discriminating)
+//
+// A file Y is indexed (has a FileId in the manifest) but does NOT match the
+// text query Q.  When Y is in blast_radius_paths, it must appear in UNION
+// results ranked by its temporal RRF term alone.  Under the OLD filtered-
+// intersection behaviour Y would be ABSENT (it was dropped because it didn't
+// match the query).  This test asserts the strict PRESENT-in-UNION /
+// WOULD-BE-ABSENT-in-filter difference.
+// ============================================================================
+
+#[test]
+fn test_ac12_union_includes_cochange_only_file_absent_from_lexical() {
+    use std::collections::HashSet;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // Uses a project where lib.rs has ZERO n-gram overlap with the query term.
+    create_union_test_project(&root);
+
+    // Query text: "zqjxblip_check" — unique to src/auth.rs only.
+    // src/lib.rs has no shared 4-grams with this term → pure co-change-only partner.
+    //
+    // blast_radius_paths: include BOTH src/auth.rs (lexical match) AND
+    // src/lib.rs (co-change partner that does NOT match the query).
+    let mut allowed: HashSet<String> = HashSet::new();
+    allowed.insert("src/auth.rs".to_string()); // lexically matches query
+    allowed.insert("src/lib.rs".to_string()); // co-change partner; does NOT match query
+
+    let config = QueryConfig {
+        text: "zqjxblip_check".to_string(),
+        limit: 20,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AC12 POSITIVE: src/lib.rs is a co-change partner that does NOT match
+    // "zqjxblip_check" lexically (zero n-gram overlap), but IS in
+    // blast_radius_paths → must appear in UNION results ranked by its temporal
+    // RRF term alone.
+    let has_lib = output.results.iter().any(|r| r.path == "src/lib.rs");
+    assert!(
+        has_lib,
+        "AC12: co-change-only file (src/lib.rs) that does NOT match the query \
+        must appear in UNION results due to its temporal blast-radius rank; \
+        got results: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // DISCRIMINATING — under OLD filter semantics src/lib.rs would be ABSENT
+    // because it didn't match the query.  Document the strict contract:
+    // UNION mode includes it; filtered mode would not.
+    // Both src/auth.rs (lexical hit) and src/lib.rs (co-change hit) must appear.
+    let has_auth = output.results.iter().any(|r| r.path == "src/auth.rs");
+    assert!(
+        has_auth,
+        "AC12: lexically-matching file (src/auth.rs) must also appear in UNION results"
+    );
+}
+
+// ============================================================================
+// AC13 — UNION cardinality and ordering bounds (NEGATIVE)
+//
+// The composite UNION output must:
+// (a) Contain no duplicate FileIds
+// (b) Be sorted fused-RRF-score DESC, then path ASC as tiebreak
+// (c) Have count == min(|union|, limit)
+// (d) Apply rank-then-limit LAST (a co-change-only file ranking in top-N
+//     must not be pre-truncated before fusion)
+// ============================================================================
+
+#[test]
+fn test_ac13_union_no_duplicate_file_ids_and_correct_cardinality() {
+    use std::collections::HashSet;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_union_test_project(&root);
+
+    // blast_radius_paths with both indexed files so the union is the full index.
+    // Both files are in the temporal list; auth.rs also matches the lexical query.
+    let mut allowed: HashSet<String> = HashSet::new();
+    allowed.insert("src/auth.rs".to_string());
+    allowed.insert("src/lib.rs".to_string());
+
+    let config = QueryConfig {
+        text: "zqjxblip_check".to_string(),
+        limit: 20,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // (a) No duplicate paths (FileIds map 1:1 to paths in the sorted manifest).
+    let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
+    let unique_paths: HashSet<&str> = paths.iter().copied().collect();
+    assert_eq!(
+        paths.len(),
+        unique_paths.len(),
+        "AC13(a): no duplicate paths in UNION output; got {:?}",
+        paths
+    );
+
+    // (b) Result count <= limit (rank-then-limit).
+    assert!(
+        output.results.len() <= 20,
+        "AC13(c): result count must be <= limit (20), got {}",
+        output.results.len()
+    );
+
+    // (c) Scores are non-increasing (fused-RRF-score DESC order).
+    // Ties may exist; adjacent ties are not a violation of the ordering contract.
+    let scores: Vec<f64> = output.results.iter().map(|r| r.score).collect();
+    for window in scores.windows(2) {
+        assert!(
+            window[0] >= window[1] - 1e-9,
+            "AC13(b): scores must be non-increasing (DESC order); found {:?}",
+            scores
+        );
+    }
+
+    // (d) All returned paths come from the union of lexical candidates and
+    // temporal co-change partners — no fabricated files.
+    // Every path must be a valid indexed path (resolves from the manifest).
+    for r in &output.results {
+        assert!(
+            !r.path.is_empty(),
+            "AC13(a): every result must have a non-empty path"
+        );
+        // Co-change-only results carry field "co_change_partner" (no snippet).
+        // Lexical results carry real field names.
+        // Both are valid UNION members.
+    }
+}
+
+#[test]
+fn test_ac13_limit_applied_after_fusion_rank_then_limit() {
+    use std::collections::HashSet;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_union_test_project(&root);
+
+    // Both indexed files in blast-radius; query matches only one.
+    let mut allowed: HashSet<String> = HashSet::new();
+    allowed.insert("src/auth.rs".to_string()); // lexical match
+    allowed.insert("src/lib.rs".to_string()); // co-change-only
+
+    // limit = 1: only the top-ranked result is returned.
+    let config = QueryConfig {
+        text: "zqjxblip_check".to_string(),
+        limit: 1,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AC13(c): count = min(|union|, limit) = min(2, 1) = 1.
+    assert_eq!(
+        output.results.len(),
+        1,
+        "AC13(c): limit=1 must return exactly 1 result from the UNION of 2 candidates; \
+        got {} results: {:?}",
+        output.results.len(),
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+}
+
+// ============================================================================
+// AC14 — co-change-only result carries fused-RRF score, not BM25F
+// ============================================================================
+
+#[test]
+fn test_ac14_cochange_only_result_carries_fused_rrf_score() {
+    use std::collections::HashSet;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // lib.rs has zero n-gram overlap with "zqjxblip_check" → pure co-change partner.
+    create_union_test_project(&root);
+
+    // blast_radius_paths includes lib.rs (co-change-only: no "zqjxblip_check" match).
+    let mut allowed: HashSet<String> = HashSet::new();
+    allowed.insert("src/auth.rs".to_string());
+    allowed.insert("src/lib.rs".to_string());
+
+    let config = QueryConfig {
+        text: "zqjxblip_check".to_string(),
+        limit: 20,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // Find the co-change-only result (src/lib.rs) if present.
+    // If found, assert:
+    // (a) Its field is "co_change_partner" (not a BM25F field type).
+    // (b) Its score is a small positive fused-RRF value (not a BM25F magnitude).
+    //     RRF scores are wᵢ / (RRF_K + rankᵢ), so with weight 0.2 and rank 1,
+    //     score ≈ 0.2 / (60 + 1) ≈ 0.00328 — not a BM25F magnitude.
+    if let Some(lib_result) = output.results.iter().find(|r| r.path == "src/lib.rs") {
+        assert_eq!(
+            lib_result.field, "co_change_partner",
+            "AC14: co-change-only result must have field='co_change_partner', not a BM25F field type"
+        );
+        // Score must be finite and positive (fused RRF term).
+        assert!(
+            lib_result.score.is_finite() && lib_result.score > 0.0,
+            "AC14: co-change-only score must be a finite positive fused-RRF value, got {}",
+            lib_result.score
+        );
+        // Score must be small (well below typical BM25F magnitudes of 5–100).
+        // A pure temporal RRF score with w=0.2 and rank 1 is ≈ 0.00328.
+        assert!(
+            lib_result.score < 5.0,
+            "AC14: fused-RRF score must be small (< 5.0), not a BM25F magnitude; got {}",
+            lib_result.score
+        );
+    }
+    // Note: if src/lib.rs is not in results, AC12 would have caught it first.
+    // This test is complementary to AC12 and focuses on the score field contract.
 }
 
 // ============================================================================

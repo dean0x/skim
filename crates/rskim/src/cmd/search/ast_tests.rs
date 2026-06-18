@@ -703,6 +703,7 @@ fn intersection_disjoint_text_and_ast_returns_empty_exit_0() {
                 cache_dir: cache_dir.clone(),
                 blast_radius_paths: None,
                 ast_scored: Some(ast_scored),
+                composite_weights: None,
             };
             if let Ok(output) = execute_query(&config, &TEST_ANALYTICS) {
                 assert!(
@@ -975,6 +976,7 @@ fn text_ast_intersection_preserves_lexical_snippets() {
         cache_dir: cache.path().to_path_buf(),
         blast_radius_paths: None,
         ast_scored: Some(ast_scored),
+        composite_weights: None,
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
@@ -1039,6 +1041,7 @@ fn text_ast_combined_is_strict_subset_of_lexical_ac1() {
         cache_dir: cache.path().to_path_buf(),
         blast_radius_paths: None,
         ast_scored: None,
+        composite_weights: None,
     };
     let lex_output = execute_query(&lex_config, &TEST_ANALYTICS).unwrap();
     let lex_paths: std::collections::HashSet<&str> =
@@ -1074,6 +1077,7 @@ fn text_ast_combined_is_strict_subset_of_lexical_ac1() {
         cache_dir: cache.path().to_path_buf(),
         blast_radius_paths: None,
         ast_scored: Some(ast_scored),
+        composite_weights: None,
     };
     let compound_output = execute_query(&compound_config, &TEST_ANALYTICS).unwrap();
     let compound_paths: std::collections::HashSet<&str> = compound_output

@@ -199,6 +199,11 @@ struct Flags {
     /// `--ast try-catch` and equals form `--ast=try-catch` are both accepted.
     /// Whitespace-only values are rejected in `parse_flags`.
     ast: Option<String>,
+    /// Composite RRF weights for the blast-radius UNION ranking path (#200).
+    ///
+    /// Parsed from `--weights lexical,ast,temporal` and validated at flag-parse
+    /// time.  `None` → use `CompositeWeights6::with_six_signal_defaults()` (0.5, 0.3, 0.2).
+    weights: Option<rskim_search::CompositeWeights6>,
 }
 
 /// Parse and validate a `--limit` value string.
@@ -317,6 +322,7 @@ fn take_flag_value(
 /// - `--limit=<value>` with a non-numeric value.
 /// - `--root` without a following value.
 /// - `--ast` without a value or with a whitespace-only value.
+/// - `--weights` without a value or with an invalid weight string.
 /// - Unrecognised flags (tokens beginning with `--`).
 fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut action_flag: Option<SearchAction> = None;
@@ -327,6 +333,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut temporal_sort: Option<types::TemporalSort> = None;
     let mut blast_radius: Option<String> = None;
     let mut ast: Option<String> = None;
+    let mut weights: Option<rskim_search::CompositeWeights6> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -364,6 +371,19 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                     i += 1;
                 }
             }
+            s if s == "--weights" || s.starts_with("--weights=") => {
+                // Composite RRF weights: `--weights l,a,t` or `--weights=l,a,t` (#200).
+                // Parse and validate immediately so invalid values produce a clear CLI
+                // error before any index I/O (AC5: non-zero exit with actionable message).
+                let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--weights")?;
+                weights = Some(
+                    rskim_search::CompositeWeights6::parse_weights_flag(&raw)
+                        .map_err(|e| anyhow::anyhow!("--weights: {e}"))?,
+                );
+                if consumed {
+                    i += 1;
+                }
+            }
             s if matches!(s, "--hot" | "--cold" | "--risky" | "--blast-radius")
                 || s.starts_with("--blast-radius=") =>
             {
@@ -377,7 +397,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                 anyhow::bail!(
                     "unrecognised flag {:?}. Valid flags: --build, --rebuild, --update, \
                      --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --root, \
-                     --ast, --hot, --cold, --risky, --blast-radius",
+                     --ast, --hot, --cold, --risky, --blast-radius, --weights",
                     s
                 );
             }
@@ -397,6 +417,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
         temporal_sort,
         blast_radius,
         ast,
+        weights,
     })
 }
 
@@ -630,6 +651,7 @@ fn run_query(
         cache_dir,
         blast_radius_paths,
         ast_scored,
+        composite_weights: flags.weights,
     };
 
     // Pass the already-refreshed manifest (text+--ast path) or None (pure-lexical

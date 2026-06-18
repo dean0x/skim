@@ -68,6 +68,12 @@ pub use cochange::{COUPLING_MAX_FILES, CochangeMatrixBuilder, CochangeMatrixRead
 pub use compound::{
     CompositeWeights, RRF_K, WEIGHT_AST, WEIGHT_LEXICAL, intersect_and_rank, recompose_with_lexical,
 };
+// #200: N-signal composite ranking (UNION mode, 6-signal weights).
+pub use compound::{
+    CompositeWeights6, ImportGraph, ImportLanguage, WEIGHT6_AST, WEIGHT6_DIR_PROXIMITY,
+    WEIGHT6_IMPORT_GRAPH, WEIGHT6_LEXICAL, WEIGHT6_STRUCTURAL_COUPLING, WEIGHT6_TEMPORAL,
+    dir_proximity_score, merge_composite, merge_layer_scores, structural_coupling_score,
+};
 pub use index::{NgramIndexBuilder, NgramIndexReader};
 pub use lexical::{
     BM25FConfig, FIELD_COUNT, MAX_QUERY_BYTES, QueryEngine, bm25f_score, classify_source,

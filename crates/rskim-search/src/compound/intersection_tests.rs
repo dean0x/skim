@@ -8,7 +8,7 @@ use std::ops::Range;
 
 use crate::ast_index::StructuralMetrics;
 use crate::compound::intersection::{
-    CompositeWeights, RRF_K, WEIGHT_AST, WEIGHT_LEXICAL, intersect_and_rank, recompose_with_lexical,
+    CompositeWeights, RRF_K, intersect_and_rank, recompose_with_lexical,
 };
 use crate::types::{FileId, SearchField, SearchResult};
 
@@ -184,6 +184,7 @@ fn ac2_composite_fusion_reorders_vs_lexical() {
     let weights = CompositeWeights {
         lexical: 1.0,
         ast: 10.0,
+        ..Default::default()
     };
     let ranked = intersect_and_rank(&lexical, &ast, no_metrics, 0.0, weights);
 
@@ -383,6 +384,7 @@ fn ac8_rrf_is_scale_free() {
     let lex_heavy = CompositeWeights {
         lexical: 1.0,
         ast: 0.1,
+        ..Default::default()
     };
     let ranked_a = intersect_and_rank(&lexical, &ast_a, no_metrics, 0.0, lex_heavy);
 
@@ -427,6 +429,7 @@ fn ac8_rrf_is_scale_free() {
     let ast_heavy = CompositeWeights {
         lexical: 0.1,
         ast: 1.0,
+        ..Default::default()
     };
     let ranked_c = intersect_and_rank(&lexical, &ast_a, no_metrics, 0.0, ast_heavy);
     assert_eq!(
@@ -490,9 +493,11 @@ fn ac9_nan_safe_single_element_layer() {
         "AC9: score must be finite (is_finite implies not NaN)"
     );
 
-    // Verify the score matches the expected RRF formula (both rank-1):
-    // score = WEIGHT_LEXICAL / (RRF_K + 1) + WEIGHT_AST / (RRF_K + 1)
-    let expected = WEIGHT_LEXICAL / (RRF_K + 1.0) + WEIGHT_AST / (RRF_K + 1.0);
+    // Verify the score matches the expected RRF formula (both rank-1).
+    // Default::default() is the six-signal profile: lexical=0.5, ast=0.3.
+    // score = 0.5 / (RRF_K + 1) + 0.3 / (RRF_K + 1)
+    let w = CompositeWeights::default();
+    let expected = w.lexical / (RRF_K + 1.0) + w.ast / (RRF_K + 1.0);
     assert!(
         (score - expected).abs() < 1e-12,
         "AC9: expected score {expected:.6}, got {score:.6}"
@@ -507,9 +512,19 @@ fn ac9_nan_safe_single_element_layer() {
 fn ac10_deterministic_tiebreaker_fileid_asc() {
     // Two files with equal rank in BOTH layers → equal composite scores.
     // Use symmetric complementary ranks (f10 lex-rank-1/ast-rank-2 and
-    // f20 lex-rank-2/ast-rank-1) — these yield identical RRF scores:
-    //   f10: 1/(60+1) + 1/(60+2) == f20: 1/(60+2) + 1/(60+1)
+    // f20 lex-rank-2/ast-rank-1) — these yield identical RRF scores ONLY when
+    // lexical_weight == ast_weight.  Use explicit equal weights (1.0/1.0) so
+    // the tiebreaker test is independent of the Default profile.
+    //   f10: 1.0/(60+1) + 1.0/(60+2) == f20: 1.0/(60+2) + 1.0/(60+1)
     // FileId-ASC tiebreaker must put FileId(10) before FileId(20).
+    let equal_weights = CompositeWeights {
+        lexical: 1.0,
+        ast: 1.0,
+        temporal: 0.0,
+        import_graph: 0.0,
+        dir_proximity: 0.0,
+        structural_coupling: 0.0,
+    };
     let lexical = vec![
         make_lex_result(10, 10.0), // lex rank 1
         make_lex_result(20, 5.0),  // lex rank 2
@@ -518,8 +533,8 @@ fn ac10_deterministic_tiebreaker_fileid_asc() {
     // Symmetric complementary ranks → equal composite scores.
     let ast = vec![(FileId(10), 1.0), (FileId(20), 9.0)];
 
-    let ranked_1 = intersect_and_rank(&lexical, &ast, no_metrics, 0.0, CompositeWeights::default());
-    let ranked_2 = intersect_and_rank(&lexical, &ast, no_metrics, 0.0, CompositeWeights::default());
+    let ranked_1 = intersect_and_rank(&lexical, &ast, no_metrics, 0.0, equal_weights);
+    let ranked_2 = intersect_and_rank(&lexical, &ast, no_metrics, 0.0, equal_weights);
 
     assert_eq!(
         ranked_1, ranked_2,
@@ -716,6 +731,7 @@ fn structural_depth_refines_ast_rank() {
     let ast_heavy = CompositeWeights {
         lexical: 0.1,
         ast: 10.0,
+        ..Default::default()
     };
     let ranked = intersect_and_rank(&lexical, &ast, structural_lookup, 10.0_f32, ast_heavy);
 

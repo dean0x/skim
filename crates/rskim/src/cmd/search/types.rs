@@ -103,6 +103,10 @@ pub(super) struct QueryConfig {
     /// scored. The filter is applied inside the search engine (before LIMIT)
     /// so that the limit applies to the filtered result set rather than being
     /// wasted on files that would be discarded.
+    ///
+    /// In the UNION composite path (#200), this set drives the temporal ranked
+    /// list: each path in the set is assigned a temporal Jaccard score and
+    /// merged with the lexical results via weighted RRF (UNION semantics).
     pub blast_radius_paths: Option<std::collections::HashSet<String>>,
     /// Optional scored AST results from a structural pattern query (#198).
     ///
@@ -114,6 +118,14 @@ pub(super) struct QueryConfig {
     /// `None` means "no AST filter" — pure-lexical path (all existing callers
     /// compile unchanged because they initialize this field explicitly).
     pub ast_scored: Option<Vec<(rskim_search::FileId, f64)>>,
+    /// Optional composite weights for the UNION blast-radius re-ranking path (#200).
+    ///
+    /// When `Some`, the blast-radius path uses N-signal weighted RRF (UNION mode)
+    /// instead of the legacy filter-then-rank approach.  The lexical and temporal
+    /// signals are weighted according to these values.
+    ///
+    /// `None` → use `CompositeWeights6::default()` when composite ranking is active.
+    pub composite_weights: Option<rskim_search::CompositeWeights6>,
 }
 
 /// A search result with the file path resolved and snippet extracted.
@@ -122,7 +134,20 @@ pub(super) struct QueryConfig {
 pub(super) struct ResolvedResult {
     /// Repo-relative path (forward slashes, no leading `.`).
     pub path: String,
-    /// BM25F relevance score (higher is better).
+    /// Relevance score (higher is better).
+    ///
+    /// Semantics depend on the active query path:
+    /// - **Plain lexical / AST path** (no `--blast-radius`): BM25F magnitude from
+    ///   the lexical ranking layer.
+    /// - **Composite UNION blast-radius path** (`--blast-radius` with composite
+    ///   ranking active, #200): fused weighted-RRF score —
+    ///   `Σᵢ wᵢ / (RRF_K + rankᵢ(file))`.  This is a small positive number
+    ///   (typically well below 1.0) and is NOT a BM25F magnitude.  Consumers
+    ///   reading this field as BM25F on the composite path will silently
+    ///   misinterpret it.
+    ///
+    /// The `field` value `"co_change_partner"` indicates a co-change-only result
+    /// whose score is the temporal RRF term alone (no lexical component).
     pub score: f64,
     /// Name of the AST field type (e.g. `"function_signature"`).
     pub field: String,
