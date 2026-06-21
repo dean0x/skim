@@ -57,8 +57,8 @@ pub(crate) fn run(
 /// entry's exempted flag is actually re-injected here.
 pub(crate) const INJECTS: &[&str] = &["-l"];
 
-/// Inject `-l` if no mode flag is present. Injects `INJECTS` so the
-/// re-injection set stays the single source of truth for the coupling test.
+/// Inject `-l` if no mode flag is present; uses `INJECTS[0]` so the flag
+/// literal is not duplicated across the const and the injection site.
 fn prepare_args(cmd_args: &mut Vec<String>) {
     if !user_has_flag(cmd_args, &["-l", "-d", "-w", "-e"]) {
         cmd_args.insert(0, INJECTS[0].to_string());

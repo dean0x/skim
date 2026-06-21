@@ -95,8 +95,8 @@ fn run_check(
 /// entry's exempted flag is actually re-injected here.
 pub(crate) const INJECTS: &[&str] = &["--check"];
 
-/// Inject `--check` if not already present. Injects `INJECTS` so the
-/// re-injection set stays the single source of truth for the coupling test.
+/// Inject `--check` if not already present; uses `INJECTS[0]` so the flag
+/// literal is not duplicated across the const and the injection site.
 fn prepare_check_args(cmd_args: &mut Vec<String>) {
     if !user_has_flag(cmd_args, &["--check", "-c", "--list-different", "-l"]) {
         cmd_args.insert(0, INJECTS[0].to_string());
