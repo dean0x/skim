@@ -841,7 +841,7 @@ fn test_rewrite_ruff_format_check() {
         .args(["rewrite", "ruff", "format", "--check", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim ruff"));
+        .stdout(predicate::str::contains("skim ruff format --check ."));
 }
 
 #[test]
@@ -1143,7 +1143,7 @@ fn test_rewrite_ls_la() {
         .args(["rewrite", "ls", "-la"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim ls"));
+        .stdout(predicate::str::contains("skim ls -la"));
 }
 
 #[test]
@@ -1161,7 +1161,7 @@ fn test_rewrite_grep_r() {
         .args(["rewrite", "grep", "-r", "TODO", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim grep"));
+        .stdout(predicate::str::contains("skim grep -r TODO src/"));
 }
 
 #[test]
@@ -1726,7 +1726,7 @@ fn test_rewrite_black_check() {
         .args(["rewrite", "black", "--check", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim black"));
+        .stdout(predicate::str::contains("skim black --check src/"));
 }
 
 #[test]
@@ -1749,11 +1749,14 @@ fn test_rewrite_black_diff_skipped() {
 
 #[test]
 fn test_rewrite_gofmt_l() {
+    // gofmt -l rewrites to `skim gofmt ./...` (no -l in rewrite_to): the
+    // gofmt handler (prepare_args) re-injects -l when no mode flag is present
+    // (WRAPPER_REINJECTS entry in no_rule_silently_drops_prefix_flags).
     skim_cmd()
         .args(["rewrite", "gofmt", "-l", "./..."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim gofmt"));
+        .stdout(predicate::str::contains("skim gofmt ./..."));
 }
 
 #[test]
@@ -2859,13 +2862,16 @@ fn cli_rewrite_interior_newline_passes_through() {
 #[test]
 fn cli_rewrite_trailing_newline_still_rewrites() {
     // Trailing newline only — command_needs_passthrough trims it, so no bail.
+    // collect_input_tokens then splits on whitespace (stripping the \n), and
+    // the rule prefix=["grep","-rn"] with rewrite_to=["skim","grep","-rn"]
+    // yields the full `skim grep -rn x dir` form.
     let cmd_with_trailing_newline = "grep -rn x dir\n";
 
     skim_cmd()
         .args(["rewrite", cmd_with_trailing_newline])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim grep"));
+        .stdout(predicate::str::contains("skim grep -rn x dir"));
 }
 
 /// AC-C3 regression: normal multi-word positional args (no newline) still rewrite.
