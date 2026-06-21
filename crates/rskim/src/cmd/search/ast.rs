@@ -6,22 +6,31 @@
 //! - Validate the raw pattern string at the CLI boundary (before opening the index).
 //! - Resolve a `--ast` pattern to scored `Vec<(FileId, f64)>` for compound RRF ranking (#198).
 //! - Standalone AST query dispatch (`--ast` only, no text query).
-//! - Output formatters: text and JSON for AST-only results.
+//! - Output formatters: text and JSON for AST-only results (delegates to `rskim_search::compound::output`).
+//! - Line-span re-parse: after limit is applied, re-parse each matched file to
+//!   recover a representative line number and snippet (AC-F1, #201).
 //!
 //! # Relationship to temporal.rs
 //!
 //! This module mirrors the structure of `temporal.rs` — one focused module per
-//! search layer, with minimal hooks in `mod.rs`.  AST scores are file-level
-//! (no line numbers); text+AST intersection uses lexical formatters unchanged.
+//! search layer, with minimal hooks in `mod.rs`.
+//!
+//! # Crate split (#201)
+//!
+//! - Pure row type + format logic → `rskim_search::compound::output` (no I/O).
+//! - File-reading snippet extraction → this module (reads disk, applies mtime guard).
 
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
 use rskim_search::{AstIndexReader, AstQuery, AstQueryEngine, FileId};
 use rskim_search::{all_patterns, parse_ast_query};
-use serde::Serialize;
+// #201: enriched row type + formatters from rskim-search.
+// pub(super) re-exports so test module (ast_tests.rs) can call them as super::.
+pub(super) use rskim_search::AstResult;
+use rskim_search::recover_line;
+pub(super) use rskim_search::{format_ast_json, format_ast_text};
 
 // ============================================================================
 // Engine helpers
@@ -139,10 +148,27 @@ pub(super) fn resolve_ast_scored(
 /// tests pass a `Vec<u8>` buffer to capture output (satisfies PF-007: regression
 /// tests must observe production output, not just assert exit 0).
 ///
+/// # Line-span re-parse (#201)
+///
+/// After applying `--limit`, each matched file is re-parsed to recover a
+/// representative line number. Re-parse uses `rskim_search::recover_line`
+/// (see `compound/reparse.rs`) which:
+/// - Is bounded to at most `limit` files (AC-API3).
+/// - Fails-soft to `None` on grammar miss, size guard, mtime mismatch (AC-F2).
+/// - Returns a 1-indexed line; never 0 (AC-F4 NEGATIVE).
+///
+/// The snippet is extracted by reading the specific line from the file content.
+/// Both operations happen AFTER `--limit` is applied (AC-API3).
+///
 /// # Errors
 ///
 /// Returns `Err` when the index is absent, the query is invalid, or I/O fails.
 /// Returns `Ok(ExitCode::SUCCESS)` for empty result sets (AC-F8).
+// Eight cohesive runtime inputs for the `search --ast` CLI entrypoint (pattern,
+// limit, json, cache dir, manifest, blast-radius filter, root, writer). Bundling
+// them into a struct would be artificial, and #202 extends this signature further
+// (temporal sort + DB), so the argument count is allowed here intentionally.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run_ast_standalone(
     raw_pattern: &str,
     limit: usize,
@@ -150,7 +176,8 @@ pub(super) fn run_ast_standalone(
     cache_dir: &Path,
     manifest: &super::manifest::FileManifest,
     blast_file_ids: Option<HashSet<FileId>>,
-    w: &mut impl Write,
+    root: &Path,
+    w: &mut impl std::io::Write,
 ) -> anyhow::Result<ExitCode> {
     // Validate before opening the index — fail fast with good error messages.
     // Returns the parsed AstQuery to avoid a second parse_ast_query call below.
@@ -167,7 +194,7 @@ pub(super) fn run_ast_standalone(
     // Hoist sorted_paths() here so it is computed once and reused for both the
     // intersection-membership check (fid.0 as usize) and the path-resolution step.
     let sorted = manifest.sorted_paths();
-    let results: Vec<_> = raw_results
+    let limited: Vec<_> = raw_results
         .into_iter()
         .filter(|(fid, _)| {
             blast_file_ids
@@ -177,17 +204,42 @@ pub(super) fn run_ast_standalone(
         .take(limit)
         .collect();
 
-    // Resolve FileIds → repo-relative paths using the manifest.
+    // Resolve FileIds → repo-relative paths using the manifest, then re-parse
+    // each matched file to recover a representative line number and snippet.
+    //
+    // Re-parse happens strictly AFTER --limit (AC-API3: at most `limit` files).
+    // Each per-file recover_line call is bounded by the 100 KiB size guard.
+    //
     // Warn on out-of-range FileIds (avoids PF-002 silent-drop anti-pattern,
     // applies ADR-006 counterpart on the read side).
-    let mut resolved: Vec<AstResult> = Vec::with_capacity(results.len());
-    for (fid, score) in &results {
+    let mut resolved: Vec<AstResult> = Vec::with_capacity(limited.len());
+    for (fid, score) in &limited {
         let idx = fid.0 as usize;
         match sorted.get(idx) {
-            Some(path) => resolved.push(AstResult {
-                path: path.to_string(),
-                score: *score,
-            }),
+            Some(rel_path) => {
+                let abs_path = root.join(rel_path);
+                // Recover the stored mtime from the manifest for the stale guard.
+                let stored_mtime = manifest.lookup(rel_path).and_then(|e| e.mtime);
+                // Re-parse to get a representative line (AC-F1, #201).
+                // fail-soft: recover_line returns None on any error (AC-F2).
+                let (line, snippet) = match recover_line(&abs_path, &query, stored_mtime) {
+                    Some((ln, byte_range)) => {
+                        // Extract the single representative line as snippet text.
+                        let snip =
+                            read_line_at(&abs_path, ln, rskim_search::MAX_REPARSE_FILE_BYTES);
+                        // Suppress snippet if byte_range is empty (parse artifact).
+                        let snip = if byte_range.is_empty() { None } else { snip };
+                        (Some(ln), snip)
+                    }
+                    None => (None, None),
+                };
+                resolved.push(AstResult::ast_only(
+                    rel_path.to_string(),
+                    *score,
+                    line,
+                    snippet,
+                ));
+            }
             None => {
                 eprintln!(
                     "skim search [warn]: AST result FileId({idx}) is out of manifest range \
@@ -212,17 +264,30 @@ pub(super) fn run_ast_standalone(
 }
 
 // ============================================================================
-// Output formatters
+// Snippet extraction helpers
 // ============================================================================
 
-/// A resolved AST search result (file-level, no line numbers).
-#[derive(Debug)]
-pub(super) struct AstResult {
-    /// Repo-relative path (forward slashes, no leading `.`).
-    pub path: String,
-    /// AST BM25 relevance score.
-    pub score: f64,
+/// Read the text of a specific 1-indexed line from a file.
+///
+/// Returns `None` when the file cannot be read, is non-UTF8, exceeds
+/// `max_bytes`, or the line number is out of range.
+///
+/// This is the "file-reading" half of the crate split (#201): pure formatting
+/// lives in `rskim_search::compound::output`; disk I/O lives here.
+fn read_line_at(abs_path: &Path, line_1indexed: u32, max_bytes: u64) -> Option<String> {
+    let meta = std::fs::metadata(abs_path).ok()?;
+    if meta.len() > max_bytes {
+        return None;
+    }
+    let content = std::fs::read(abs_path).ok()?;
+    let text = std::str::from_utf8(&content).ok()?;
+    let target = line_1indexed.saturating_sub(1) as usize; // → 0-indexed
+    text.lines().nth(target).map(|l| l.to_string())
 }
+
+// ============================================================================
+// Pattern metadata lookup
+// ============================================================================
 
 /// Look up human-readable metadata for a pattern name.
 ///
@@ -235,108 +300,6 @@ fn pattern_description(raw: &str) -> (&str, &str) {
     }
     // Containment query — use raw string.
     (raw, "")
-}
-
-/// Format standalone AST results as human-readable text.
-///
-/// Format:
-/// ```text
-/// AST pattern: try-catch — Try/catch error handling block
-///
-///   src/auth.rs  score: 2.450
-///   src/db.rs    score: 1.200
-///
-/// 2 file(s) matched pattern "try-catch"
-/// ```
-///
-/// Empty result → "no files match pattern" (exit 0, AC-F8).
-/// File-level only — NO `:line` suffix (AC-F1 / spec §Part C).
-pub(super) fn format_ast_text(
-    results: &[AstResult],
-    pattern_name: &str,
-    description: &str,
-    w: &mut impl Write,
-) -> anyhow::Result<()> {
-    if description.is_empty() {
-        writeln!(w, "AST pattern: {pattern_name}")?;
-    } else {
-        writeln!(w, "AST pattern: {pattern_name} — {description}")?;
-    }
-    writeln!(w)?;
-
-    if results.is_empty() {
-        writeln!(w, "no files match pattern {:?}", pattern_name)?;
-        return Ok(());
-    }
-
-    for r in results {
-        writeln!(w, "  {}  score: {:.3}", r.path, r.score)?;
-    }
-
-    writeln!(w)?;
-    writeln!(
-        w,
-        "{} file(s) matched pattern {:?}",
-        results.len(),
-        pattern_name
-    )?;
-    Ok(())
-}
-
-/// JSON envelope for a standalone AST query result.
-///
-/// Shape (AC-A1):
-/// ```json
-/// {
-///   "mode": "ast",
-///   "pattern": "try-catch",
-///   "description": "...",
-///   "total": 3,
-///   "results": [{"path": "src/foo.rs", "score": 2.45}, ...]
-/// }
-/// ```
-///
-/// No `line` or `snippet` keys (file-level only).
-#[derive(Serialize)]
-struct AstJson<'a> {
-    /// Always `"ast"` — typed as `&'a str` for consistency with sibling JSON
-    /// envelopes in the search module (temporal, query).
-    mode: &'a str,
-    pattern: &'a str,
-    description: &'a str,
-    total: usize,
-    results: Vec<AstJsonRow<'a>>,
-}
-
-/// One file entry in the AST-only JSON output.
-#[derive(Serialize)]
-struct AstJsonRow<'a> {
-    path: &'a str,
-    score: f64,
-}
-
-/// Format standalone AST results as a JSON object.
-pub(super) fn format_ast_json(
-    results: &[AstResult],
-    pattern_name: &str,
-    description: &str,
-    w: &mut impl Write,
-) -> anyhow::Result<()> {
-    let envelope = AstJson {
-        mode: "ast",
-        pattern: pattern_name,
-        description,
-        total: results.len(),
-        results: results
-            .iter()
-            .map(|r| AstJsonRow {
-                path: &r.path,
-                score: r.score,
-            })
-            .collect(),
-    };
-    writeln!(w, "{}", serde_json::to_string_pretty(&envelope)?)?;
-    Ok(())
 }
 
 // ============================================================================

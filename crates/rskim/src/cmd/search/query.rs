@@ -201,7 +201,7 @@ pub(super) fn execute_query_with_manifest(
     let raw_results = engine.search(&sq)?;
 
     // Resolve and enrich results.
-    let results = resolve_paths_and_snippets(&raw_results, &sorted, root, &manifest);
+    let results = resolve_paths_and_snippets(&raw_results, &sorted, root, &manifest, &[]);
 
     let total = results.len();
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -304,7 +304,14 @@ fn run_compound_query(
     // Recompose: carry lexical SearchResult (snippet + line_range), replace score (AC11).
     let recomposed = recompose_with_lexical(&ranked_limited, &raw_lex);
 
-    let results = resolve_paths_and_snippets(&recomposed, ctx.sorted, ctx.root, ctx.manifest);
+    // AC-F6: text+AST compound path → layers_matched = ["lexical","ast"] (stable order).
+    let results = resolve_paths_and_snippets(
+        &recomposed,
+        ctx.sorted,
+        ctx.root,
+        ctx.manifest,
+        &["lexical", "ast"],
+    );
     let total = results.len();
     let duration_ms = ctx.start.elapsed().as_millis() as u64;
     Ok(QueryOutput {
@@ -425,6 +432,7 @@ fn run_blast_radius_composite_query(
                         stale,
                         match_positions: r.match_positions.clone(),
                         temporal: None,
+                        layers_matched: vec![],
                     })
                 } else {
                     // Co-change-only file: no lexical hit → no snippet (AC12, UNION mode).
@@ -440,6 +448,7 @@ fn run_blast_radius_composite_query(
                         stale: false,
                         match_positions: vec![],
                         temporal: None,
+                        layers_matched: vec![],
                     })
                 }
             })
@@ -477,11 +486,17 @@ fn decode_snippet(
 }
 
 /// Map `FileId`s to paths and extract snippets.
+///
+/// `layers_matched` is the set of layers that contributed non-zero signal for
+/// every result on this path. For the pure-lexical path, pass `&[]` (empty →
+/// serialised as absent via `skip_serializing_if`). For the text+AST compound
+/// path, pass `&["lexical","ast"]` (AC-F6).
 fn resolve_paths_and_snippets(
     raw_results: &[SearchResult],
     sorted_paths: &[&str],
     root: &Path,
     manifest: &FileManifest,
+    layers_matched: &[&'static str],
 ) -> Vec<ResolvedResult> {
     raw_results
         .iter()
@@ -507,6 +522,7 @@ fn resolve_paths_and_snippets(
                 stale,
                 match_positions: r.match_positions.clone(),
                 temporal: None,
+                layers_matched: layers_matched.to_vec(),
             })
         })
         .collect()
