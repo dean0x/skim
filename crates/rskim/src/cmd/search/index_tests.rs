@@ -2311,3 +2311,72 @@ fn test_ac7_cached_zero_count_entry_aborts_via_desync() {
         "manifest file mtime must not change after AC7 cache-poison abort (ADR-006 invariant)"
     );
 }
+
+// ============================================================================
+// B3a — E2E mutual exclusion: build_index waits for an externally-held lock
+// ============================================================================
+
+/// Prove that `build_index` acquires the same `{cache_dir}/.skim-build.lock`
+/// that `build_lock::acquire` uses.
+///
+/// The test itself holds the lock for ~300 ms, then releases it. A worker
+/// thread calls `build_index` concurrently. We assert:
+///   - the build eventually succeeds (Ok), AND
+///   - it completed AFTER the lock was released (t_complete >= t_release),
+///     i.e. it genuinely waited through `build_lock::acquire`.
+///
+/// The mpsc channel is bounded with a 30-second recv_timeout so the test
+/// never hangs indefinitely.
+#[test]
+fn e2e_build_index_waits_for_lock() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    // Set up a minimal project and a dedicated cache dir.
+    let project = make_project();
+    let cache = tempfile::tempdir().unwrap();
+
+    // The test itself acquires the advisory lock directly — same path that
+    // build_index uses internally via build_lock::acquire.
+    let lock_holder =
+        super::super::build_lock::acquire("e2e-holder", cache.path()).expect("must acquire lock");
+
+    // Build args pointing at our temp dirs.
+    let config = IndexConfig {
+        root: project.path().to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+
+    // Channel: worker sends (is_ok, t_complete) after build_index returns.
+    let (tx, rx) = mpsc::channel::<(bool, Instant)>();
+
+    let worker = std::thread::spawn(move || {
+        let result = build_index(&config);
+        let t_complete = Instant::now();
+        tx.send((result.is_ok(), t_complete)).ok();
+    });
+
+    // Hold the lock for ~300 ms, then record t_release and drop.
+    std::thread::sleep(Duration::from_millis(300));
+    let t_release = Instant::now();
+    drop(lock_holder);
+
+    // Wait up to 30 s for the worker — build should proceed quickly once unlocked.
+    let (is_ok, t_complete) = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("worker did not complete within 30 s");
+
+    worker.join().expect("worker thread panicked");
+
+    assert!(is_ok, "build_index must succeed after lock is released");
+    assert!(
+        t_complete >= t_release,
+        "build_index must complete AFTER the lock was released \
+         (t_complete={t_complete:?}, t_release={t_release:?})"
+    );
+}

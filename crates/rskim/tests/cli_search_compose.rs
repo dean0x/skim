@@ -85,7 +85,34 @@ fn search_help_documents_full_surface_and_degradation() {
         .stdout(predicate::str::contains("#283"))
         // AC-N2: no residual interim-guard language for --ast + temporal.
         .stdout(predicate::str::contains("#202").not())
-        .stdout(predicate::str::contains("not yet composable").not());
+        .stdout(predicate::str::contains("not yet composable").not())
+        // A4(i): --weights flag and its default are documented in help.
+        .stdout(predicate::str::contains("--weights"))
+        .stdout(predicate::str::contains("0.5,0.3,0.2"));
+}
+
+// ============================================================================
+// T-C2: docs↔code guard — default weight string matches WEIGHT6_* constants
+// ============================================================================
+
+/// Assert that the `skim search --help` default weight string matches the
+/// WEIGHT6_* constants exported from `rskim_search::compound::weights`.
+///
+/// If a future code change bumps a default, this test will fail and remind
+/// the author to update the help text (ADR-003: no empirically-baseless claims).
+#[test]
+fn weights_help_default_matches_code_default() {
+    use rskim_search::compound::weights::{WEIGHT6_AST, WEIGHT6_LEXICAL, WEIGHT6_TEMPORAL};
+
+    // format!("{}", f64) yields "0.5", "0.3", "0.2" for the current defaults.
+    let expected = format!("{},{},{}", WEIGHT6_LEXICAL, WEIGHT6_AST, WEIGHT6_TEMPORAL);
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["search", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(expected));
 }
 
 // ============================================================================

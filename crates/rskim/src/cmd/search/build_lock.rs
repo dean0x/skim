@@ -41,6 +41,26 @@ const LOCK_DEADLINE_SECS: u64 = 120;
 /// Returns `Err` when the lock file cannot be opened or the 120-second deadline
 /// expires without acquiring it.
 pub(super) fn acquire(caller: &str, cache_dir: &Path) -> anyhow::Result<std::fs::File> {
+    acquire_bounded(
+        caller,
+        cache_dir,
+        Duration::from_millis(LOCK_POLL_MS),
+        Duration::from_secs(LOCK_DEADLINE_SECS),
+    )
+}
+
+/// Inner bounded implementation — extracted for testability.
+///
+/// `poll` is the sleep interval between `try_lock` attempts. `deadline_after`
+/// is the maximum total wait time before returning `Err`. The deadline error
+/// message reports `deadline_after` (not a hardcoded constant), so sub-second
+/// test deadlines produce truthful messages.
+fn acquire_bounded(
+    caller: &str,
+    cache_dir: &Path,
+    poll: Duration,
+    deadline_after: Duration,
+) -> anyhow::Result<std::fs::File> {
     use anyhow::Context as _;
 
     let lock_path = cache_dir.join(".skim-build.lock");
@@ -51,7 +71,7 @@ pub(super) fn acquire(caller: &str, cache_dir: &Path) -> anyhow::Result<std::fs:
         .open(&lock_path)
         .with_context(|| format!("failed to open build lock: {}", lock_path.display()))?;
 
-    let deadline = Instant::now() + Duration::from_secs(LOCK_DEADLINE_SECS);
+    let deadline = Instant::now() + deadline_after;
     let mut noticed = false;
     loop {
         match lock_file.try_lock() {
@@ -67,13 +87,13 @@ pub(super) fn acquire(caller: &str, cache_dir: &Path) -> anyhow::Result<std::fs:
                 }
                 if Instant::now() >= deadline {
                     return Err(anyhow::anyhow!(
-                        "another skim build has held {} for >{} s; \
+                        "another skim build has held {} for >{:?}; \
                          if no build is running, delete the lock file and retry",
                         lock_path.display(),
-                        LOCK_DEADLINE_SECS,
+                        deadline_after,
                     ));
                 }
-                std::thread::sleep(Duration::from_millis(LOCK_POLL_MS));
+                std::thread::sleep(poll);
             }
             Err(std::fs::TryLockError::Error(e)) => {
                 return Err(anyhow::anyhow!(e))
@@ -83,3 +103,7 @@ pub(super) fn acquire(caller: &str, cache_dir: &Path) -> anyhow::Result<std::fs:
     }
     Ok(lock_file)
 }
+
+#[cfg(test)]
+#[path = "build_lock_tests.rs"]
+mod tests;
