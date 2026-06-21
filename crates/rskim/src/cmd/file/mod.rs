@@ -190,8 +190,8 @@ pub(super) fn try_parse_file_line_content(
 /// Build a [`FileResult`] from grouped file matches.
 ///
 /// Emits every match in every file — no per-file or file-count caps, no
-/// `(showing K)` footer. `shown_count == total_count` so the canonical
-/// `tool N/N` header reads truthfully. (#317)
+/// elision footer. `shown_count == total_count` so the canonical header
+/// renders as `tool N` (no truncation ratio; Fix F). (#317)
 ///
 /// `tool` — binary name (e.g. `"grep"`, `"rg"`).
 /// `total_matches` — total match count across all files.

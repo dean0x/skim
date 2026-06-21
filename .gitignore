@@ -66,3 +66,6 @@ crates/rskim-search/data/
 # Stale build artifacts
 librust_out.rlib
 package-lock.json
+
+# Devflow runtime data (local by default; remove to share via git)
+.devflow/

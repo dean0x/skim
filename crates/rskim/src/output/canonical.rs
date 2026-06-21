@@ -1017,7 +1017,17 @@ impl FileResult {
     ) -> String {
         use std::fmt::Write;
 
-        let mut output = format!("{tool} {shown_count}/{total_count}");
+        // Fix F (fix/rewrite-hook-falseneg): only emit a ratio header when
+        // truncation actually occurred (shown_count < total_count).  When all
+        // results fit in the output, `N/N` is a tautology that adds no
+        // information — show just the count instead.  When truncation did
+        // occur, `shown/total` communicates what was omitted.
+        let header = if shown_count < total_count {
+            format!("{tool} {shown_count}/{total_count}")
+        } else {
+            format!("{tool} {total_count}")
+        };
+        let mut output = header;
         for entry in entries {
             let _ = write!(output, "\n {entry}");
         }
@@ -2054,7 +2064,15 @@ mod tests {
             None,
         );
         let output = format!("{result}");
-        assert!(output.starts_with("find 5/5"));
+        // Fix F: no truncation (shown==total) → plain count, not ratio.
+        assert!(
+            output.starts_with("find 5"),
+            "header must be 'find 5': {output:?}"
+        );
+        assert!(
+            !output.starts_with("find 5/5"),
+            "N/N tautology header must be gone (Fix F): {output:?}"
+        );
         assert!(output.contains(" ./src/main.rs"));
         assert!(output.contains(" ./Cargo.toml"));
     }
@@ -2106,14 +2124,72 @@ mod tests {
         };
         result.ensure_rendered();
         assert!(!result.rendered.is_empty());
-        assert!(result.rendered.contains("rg 2/2"));
+        // Fix F: shown_count==total_count → plain count header.
+        assert!(
+            result.rendered.contains("rg 2"),
+            "header must contain 'rg 2': {:?}",
+            result.rendered
+        );
+        assert!(
+            !result.rendered.contains("rg 2/2"),
+            "N/N tautology must be gone (Fix F): {:?}",
+            result.rendered
+        );
     }
 
     #[test]
     fn test_file_result_empty_entries() {
         let result = FileResult::new("find".to_string(), 0, 0, vec![], None);
         let output = format!("{result}");
-        assert!(output.contains("find 0/0"));
+        // Fix F: 0/0 is a tautology → plain count "find 0".
+        assert!(
+            output.contains("find 0"),
+            "header must be 'find 0': {output:?}"
+        );
+        assert!(
+            !output.contains("find 0/0"),
+            "N/N tautology must be gone (Fix F): {output:?}"
+        );
+    }
+
+    // ========================================================================
+    // Fix F: header format — no ratio when not truncated
+    // ========================================================================
+
+    /// Fix F (fix/rewrite-hook-falseneg): when all results are shown
+    /// (shown_count == total_count), the header must NOT emit `N/N` —
+    /// show just `N` instead.  `N/N` is a tautology that adds noise.
+    #[test]
+    fn fix_f_no_ratio_header_when_not_truncated() {
+        let result = FileResult::new("grep".to_string(), 7, 7, vec!["entry".to_string()], None);
+        let output = format!("{result}");
+        assert!(
+            output.starts_with("grep 7"),
+            "header must start with 'grep 7': {output:?}"
+        );
+        assert!(
+            !output.starts_with("grep 7/7"),
+            "N/N ratio header must be absent (Fix F): {output:?}"
+        );
+    }
+
+    /// Fix F: when truncation DID occur (shown_count < total_count),
+    /// the ratio header MUST still be emitted so the agent knows output
+    /// was capped.
+    #[test]
+    fn fix_f_ratio_header_present_when_truncated() {
+        let result = FileResult::new(
+            "ls".to_string(),
+            342, // total
+            50,  // shown
+            (0..50).map(|i| format!("file{i}")).collect(),
+            Some("... and 292 more".to_string()),
+        );
+        let output = format!("{result}");
+        assert!(
+            output.starts_with("ls 50/342"),
+            "truncated header must show ratio 50/342: {output:?}"
+        );
     }
 
     // ========================================================================

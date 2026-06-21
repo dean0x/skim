@@ -1,7 +1,7 @@
 ---
 feature: build-parsers
 name: Build Tool Output Parsers
-description: "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, ChildGuard, indefinite, is_indefinite_command, expected_exit_codes, forward_stderr, ExitDisposition, classify_exit, run_parsed_command_with_exit, elision_marker, failure_context_body, parse_failure_details, compress-never-truncate."
+description: "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, ChildGuard, indefinite, is_indefinite_command, expected_exit_codes, forward_stderr, ExitDisposition, classify_exit, run_parsed_command_with_exit, elision_marker, failure_context_body, parse_failure_details, compress-never-truncate, spawn_status_to_code, run_with_node_fallback, should_emit_compressed_hint, BENIGN_EXIT1_PROGRAMS, FileResult."
 category: component-patterns
 directories: [crates/rskim/src/cmd/build/, crates/rskim/src/cmd/]
 referencedFiles:
@@ -24,8 +24,8 @@ referencedFiles:
   - crates/rskim/src/cmd/test/cargo.rs
   - crates/rskim/src/cmd/test/shared.rs
 created: 2026-05-14
-updated: 2026-06-13
-version: 15
+updated: 2026-06-21
+version: 17
 ---
 
 # Build Tool Output Parsers
@@ -51,7 +51,7 @@ Rules that flow from this constraint:
 `cmd/mod.rs` was refactored to reduce complexity. Functionality previously inline in `mod.rs` is now split across dedicated submodules:
 
 - `cmd/dispatch.rs` — `dispatch()`, `run_raw_passthrough()`, and per-tool dispatcher helpers (`dispatch_cargo`, `dispatch_go`, `dispatch_swift`, `dispatch_dotnet`, `passthrough_subcmd`, `extract_subcmd`, `prepend_without`)
-- `cmd/execution.rs` — `OutputFormat`, `RunContext`, `ParsedCommandConfig<'_>`, `ToolRunConfig<'_>`, `run_tool<T>`, `run_parsed_command_with_mode`, `run_parsed_command_with_exit`, `format_analytics_label`, `combine_output`, `obtain_output`, `render_output<T>`, `record_and_report`, `passthrough_raw`
+- `cmd/execution.rs` — `OutputFormat`, `RunContext`, `ParsedCommandConfig<'_>`, `ToolRunConfig<'_>`, `run_tool<T>`, `run_parsed_command_with_mode`, `run_parsed_command_with_exit`, `format_analytics_label`, `combine_output`, `obtain_output`, `render_output<T>`, `record_and_report`, `passthrough_raw`, `RecordReport<'_>`, `should_emit_compressed_hint`, `BENIGN_EXIT1_PROGRAMS`
 - `cmd/security.rs` — `sanitize_for_display`, `scrub_db_args`, `scrub_infra_args`
 - `cmd/registry.rs` — `KNOWN_SUBCOMMANDS` (sorted, binary-searchable), `is_known_subcommand`, `is_meta_subcommand`, `wrapper_targets`
 - `cmd/test_utils.rs` — standalone `pub(crate)` module (compiled under `#[cfg(test)]` gate in `mod.rs`); canonical test helper source for all `cmd` subtree tests
@@ -237,12 +237,54 @@ ExitDisposition::UnexpectedFailure — all other non-zero, or signal kill → fo
 
 **`forward_stderr`** — when `true`, child stderr is forwarded verbatim on the compressed path (captured before ANSI stripping for byte-faithfulness). Used for `file` and `db` families whose parsers consume only stdout, so warnings/diagnostics on stderr are never silently dropped.
 
-**Notice matrix**:
+**Notice matrix** (applies PF-003 — avoids misattributing tool behavior to skim):
 - Unexpected failure → `[skim] {program} exited N; raw output (not compressed).` (stderr)
 - Expected failure at `Passthrough` tier → silent (matches raw tool behavior, e.g. grep no-match silence)
-- Expected failure at `Full`/`Degraded` tier → `[skim] compressed output (exit N). SKIM_PASSTHROUGH=1 for full output.` (stderr)
+- Expected failure at `Full`/`Degraded` tier → compressed-output hint IF `should_emit_compressed_hint` returns true (see below)
 
 **Build family is exempt**: `build::run_parsed_command` does not use this matrix — it has its own exit-code logic derived from `BuildResult.success`.
+
+## Compressed-Output Hint: `should_emit_compressed_hint` and `BENIGN_EXIT1_PROGRAMS` (Fix B, PR #340)
+
+The `[skim] compressed output (exit N). SKIM_PASSTHROUGH=1 for full output.` stderr hint fires only when `should_emit_compressed_hint` returns `true`. This pure function is the **single source of truth** for the notice-matrix decision (applies PF-003):
+
+```rust
+const BENIGN_EXIT1_PROGRAMS: &[&str] = &["grep", "rg", "diff"];
+
+fn should_emit_compressed_hint(program: &str, code: i32, tier_name: &str) -> bool {
+    let is_benign_exit1 = code == 1 && BENIGN_EXIT1_PROGRAMS.contains(&program);
+    code != 0 && tier_name != "passthrough" && !is_benign_exit1
+}
+```
+
+All three conditions must hold to emit:
+1. `code != 0` — exit 0 never gets a hint.
+2. `tier_name != "passthrough"` — the body is already verbatim on the passthrough tier, so a hint would duplicate raw behavior.
+3. NOT a benign exit-1 — for `grep`, `rg`, and `diff`, exit 1 means "no match" / "files differ" (a normal informational result), not an error. Printing the hint would mislead agents into thinking something failed.
+
+Exit ≥ 2 for `BENIGN_EXIT1_PROGRAMS` tools IS a real error (e.g., `grep` syntax error, `diff` read failure) and still gets the hint. Non-benign tools (e.g., `cargo`) at exit 1 also get the hint.
+
+`RecordReport<'_>` (the parameter bundle passed to `record_and_report`) carries a `program` field specifically so `should_emit_compressed_hint` can inspect it without threading the program name as an extra positional argument.
+
+Unexpected failures (codes outside `expected_exit_codes`) raw-forward and return before reaching `record_and_report`, so `should_emit_compressed_hint` is only ever called for expected failures that the parser meaningfully compressed.
+
+## `FileResult::render` — Conditional Ratio Header (Fix F, PR #340)
+
+`FileResult::render` in `canonical.rs` emits the header conditionally:
+
+```rust
+let header = if shown_count < total_count {
+    format!("{tool} {shown_count}/{total_count}")  // truncation occurred — show ratio
+} else {
+    format!("{tool} {total_count}")                // all results fit — just the count
+};
+```
+
+Before Fix F, the header was always `"{tool} {shown_count}/{total_count}"`, producing a tautological `N/N` header when no truncation occurred (e.g., `find 3/3`). This misled agents into thinking results were capped. Now:
+- When `shown_count < total_count` (truncation happened): `"{tool} shown/total"` — communicates what was omitted.
+- When `shown_count == total_count` (no truncation): `"{tool} total"` — no ratio, no false signal.
+
+The JSON envelope is unchanged: `total_count` and `shown_count` serialize independently; `rendered` is `#[serde(skip_serializing)]`.
 
 ## `run_parsed_command_with_exit` — Parser-Derived Exit Codes (#317)
 
@@ -363,6 +405,13 @@ The 64 MiB memory cap (`MAX_OUTPUT_BYTES`) is unchanged — ADR-008 removes the 
 
 `RunnerError::Timeout` and `wait_with_timeout` no longer exist. Any code referencing them will not compile.
 
+**Node.js tool resolution fallback.** `CommandRunner` also provides two higher-level methods for commands that may be installed as Node.js local packages rather than globally on `$PATH`:
+
+- `run_with_node_fallback(program, args)` — tries in order: (1) direct `$PATH` lookup, (2) `./node_modules/.bin/{program}` (local bin check), (3) `npx --no-install {program}`. Returns the original spawn error when all three fail. Absolute or relative paths (containing `/`) skip fallback — the caller is explicit about the binary location. Only activates on `SpawnFailed` errors (ENOENT); other runner errors (`PipeCaptureFailed`, `ReaderPanicked`) are returned immediately without retry, since the binary was found and launched.
+- `run_with_env_node_fallback(program, args, env_vars)` — same tri-strategy resolution with environment variable overrides forwarded to every candidate.
+
+Build parsers do NOT use the Node.js fallback methods — they use `run_parsed_command` in `build/mod.rs`, which calls `CommandRunner::run_with_env` directly. The fallback is used by Node.js-ecosystem handlers (e.g., vitest, jest, eslint) where local package installs are the norm.
+
 ## Indefinite-Command Detection (`cmd/rewrite/indefinite.rs`)
 
 `crates/rskim/src/cmd/rewrite/indefinite.rs` (added in ADR-008 Part C) provides `is_indefinite_command(tokens: &[&str]) -> bool`. It detects daemon processes, watch modes, and live log followers so the dispatcher can pass them through with inherited stdio rather than capturing and compressing their output.
@@ -472,6 +521,12 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 
 - **Calling `classify_exit` on `unwrap_or(1)` output**: `classify_exit` must be called on the raw `Option<i32>` so that `None` (signal kill) maps to `UnexpectedFailure` regardless of what value `expected_exit_codes` contains.
 
+- **Re-implementing the compressed-output hint inline**: the decision of whether to emit `[skim] compressed output (exit N)` belongs to `should_emit_compressed_hint`. Do not reproduce the three-way condition inline in new code — call the function. Tests drive the same code path (PF-003 / PF-007).
+
+- **Adding a tool to `BENIGN_EXIT1_PROGRAMS` without verifying exit semantics**: the list is conservative. Only add a tool here when exit 1 is universally "no result / no change" for that tool (not just sometimes). For tools where exit 1 can mean either "no match" or a real error depending on flags, do not add them — leave exit 1 as a hint-emitting expected failure.
+
+- **Emitting `N/N` ratio in `FileResult` header**: the `FileResult::render` conditional means `shown_count == total_count` produces just `"{tool} {total_count}"`. Do not pass `shown_count == total_count` and expect a ratio — callers that always set `shown_count = total_count` will get the simpler header, which is correct.
+
 ## Gotchas
 
 - **Degradation markers and parse notices are silent by default**: `emit_markers` in `ParseResult` only writes to stderr when `SKIM_DEBUG=1` or `--debug` is set. In normal operation, Tier 2 (`Degraded`) and Tier 3 (`Passthrough`) passes are silent — no `[skim:warning]` or `[skim:notice]` lines appear. This means a build that degrades to regex fallback gives no on-screen indication unless debug mode is active. Enable `SKIM_DEBUG=1` when diagnosing unexpected parse behavior.
@@ -518,6 +573,12 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 
 - **`run_parsed_command_with_exit` applies `max(child, derived)` not `child.or(derived)`**: `max` means a child exit 101 is preserved even if `derive_exit` returns `Some(1)`. The derived exit only wins when the child exit is 0 (stdin fabrication path).
 
+- **`should_emit_compressed_hint` is only called for expected-failure codes**: unexpected failures raw-forward and return before reaching `record_and_report`. Any `code != 0` seen inside `should_emit_compressed_hint` is guaranteed to be in `expected_exit_codes`. The benign-exit1 guard is therefore only relevant for tools that have `1` in their `expected_exit_codes` list (`grep`, `rg`, `diff`, `lint` family, `pkg`).
+
+- **`RecordReport::program` is the tool binary name, not the skim subcommand**: when `record_and_report` calls `should_emit_compressed_hint(program, ...)`, `program` is the actual binary spawned (e.g., `"grep"`, `"rg"`), not `"skim"`. The field was added to `RecordReport` specifically to thread this through without an extra positional arg.
+
+- **`FileResult` JSON envelope fields are unaffected by Fix F**: `total_count` and `shown_count` serialize independently in the JSON output. Only the pre-computed `rendered` field (which is `#[serde(skip_serializing)]`) is affected by the conditional header logic. Callers comparing JSON before/after Fix F will see identical envelopes.
+
 ## Key Files
 
 - `crates/rskim/src/cmd/build/mod.rs` — dispatcher (`run`), shared `run_parsed_command`, and `print_help`
@@ -527,14 +588,14 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 - `crates/rskim/src/cmd/build/gradle.rs` — Gradle/Gradlew: task outcome + Java/Kotlin diagnostic Tier 1 (with duration), noise-strip Tier 2 (six `LazyLock<Regex>` patterns)
 - `crates/rskim/src/cmd/build/maven.rs` — Maven/Mvnw: `[ERROR]`/`[WARNING]` + build summary Tier 1 (with duration), noise-strip Tier 2 (two `LazyLock<Regex>` patterns, two duration formats)
 - `crates/rskim/src/output/mod.rs` — `ParseResult<T>` enum definition and helpers (`is_full`, `is_degraded`, `is_passthrough`, `tier_name`, `content`, `into_content`, `emit_markers`); `strip_ansi` and `strip_ansi_cow` (zero-copy fast path: borrows when no ESC byte present); `to_json_envelope` (not used by build family); `elision_marker`, `elision_marker_unbounded` (#317 loud elision helpers); `OutputMode`, `clean`, `clean_with_mode`, `PassthroughTruncator`, `FilterTransparencyHeader`
-- `crates/rskim/src/output/canonical.rs` — `BuildResult` (pre-rendered output); `TestResult` (with `context: Option<String>` safety net and `with_context` constructor, #317); `TestEntry`, `TestSummary`, `TestOutcome`; `GitResult`, `LintResult`, `DbResult`, `PkgResult`, `InfraResult`, `LogResult`, `DiffResult`, `FileResult`
+- `crates/rskim/src/output/canonical.rs` — `BuildResult` (pre-rendered output); `TestResult` (with `context: Option<String>` safety net and `with_context` constructor, #317); `TestEntry`, `TestSummary`, `TestOutcome`; `GitResult`, `LintResult`, `DbResult`, `PkgResult`, `InfraResult`, `LogResult`, `DiffResult`; `FileResult` (conditional ratio header: `shown/total` only when truncation occurred, Fix F)
 - `crates/rskim/src/cmd/mod.rs` — coordination point: declares all submodules, re-exports public API; inline helpers: `user_has_flag`, `inject_flag_before_separator`, `extract_show_stats`, `extract_json_flag`, `extract_output_format`, `should_read_stdin` (stdin-eligible when empty args OR `args == ["run"]`), `read_bounded`, `read_stdin_bounded`, `MAX_STDIN_BYTES`; passthrough checks: `is_passthrough_mode`, `check_passthrough_str`, `check_passthrough_value`; resolvers: `resolve_cache_dir`, `skim_wrappers_dir`
-- `crates/rskim/src/cmd/dispatch.rs` — `dispatch()`, `run_raw_passthrough()`, `run_inherited_passthrough()` (inherited-stdio path for daemon/streaming commands); per-tool dispatcher helpers
-- `crates/rskim/src/cmd/execution.rs` — `OutputFormat`, `RunContext`, `ParsedCommandConfig<'_>` (with `expected_exit_codes`, `forward_stderr`, #317), `ToolRunConfig<'_>` (with `expected_exit_codes`, `forward_stderr`, #317), `run_tool<T>`, `run_parsed_command_with_mode`, `run_parsed_command_with_exit` (#317), `ExitDisposition`, `classify_exit` (#317), `format_analytics_label`, `combine_output`, `obtain_output`, `render_output<T>`, `record_and_report`, `passthrough_raw`
+- `crates/rskim/src/cmd/dispatch.rs` — `dispatch()`, `run_raw_passthrough()`, `run_inherited_passthrough()` (inherited-stdio path for daemon/streaming commands); `spawn_status_to_code(status: io::Result<ExitStatus>) -> u8` (pure exit-code mapper: ENOENT→127, other error→1, signal-kill→1, otherwise clamp to `[0,255]`; `pub(crate)` and independently unit-tested); per-tool dispatcher helpers
+- `crates/rskim/src/cmd/execution.rs` — `OutputFormat`, `RunContext`, `ParsedCommandConfig<'_>` (with `expected_exit_codes`, `forward_stderr`, #317), `ToolRunConfig<'_>` (with `expected_exit_codes`, `forward_stderr`, #317), `run_tool<T>`, `run_parsed_command_with_mode`, `run_parsed_command_with_exit` (#317), `ExitDisposition`, `classify_exit` (#317), `format_analytics_label`, `combine_output`, `obtain_output`, `render_output<T>`, `record_and_report`, `passthrough_raw`, `RecordReport<'_>` (parameter bundle with `program` field), `should_emit_compressed_hint` (pure fn, single source of truth for hint emission), `BENIGN_EXIT1_PROGRAMS` (Fix B: `["grep", "rg", "diff"]`)
 - `crates/rskim/src/cmd/security.rs` — `sanitize_for_display`, `scrub_db_args`, `scrub_infra_args`
 - `crates/rskim/src/cmd/registry.rs` — `KNOWN_SUBCOMMANDS` (sorted, binary-searchable via `binary_search`), `is_known_subcommand`, `is_meta_subcommand`, `wrapper_targets`
 - `crates/rskim/src/cmd/test_utils.rs` — standalone test helper module (compiled under `#[cfg(test)]` gate): `make_output`, `make_output_full`, `make_output_stderr`, `load_fixture` (with `Component::Normal` traversal guard); import as `crate::cmd::test_utils`; renamed from `test_support` in PR #126
-- `crates/rskim/src/runner.rs` — `CommandRunner` (stateless unit struct, `#[derive(Default)]`), `CommandOutput`, `ChildGuard` (kill-on-drop RAII), `is_spawn_error`, `MAX_OUTPUT_BYTES` (64 MiB); no timeout, no `RunnerError::Timeout`
+- `crates/rskim/src/runner.rs` — `CommandRunner` (stateless unit struct, `#[derive(Default)]`), `CommandOutput`, `ChildGuard` (kill-on-drop RAII), `is_spawn_error`, `MAX_OUTPUT_BYTES` (64 MiB); no timeout, no `RunnerError::Timeout`; `run_with_node_fallback` / `run_with_env_node_fallback` for three-strategy Node.js tool resolution (PATH → `./node_modules/.bin/` → `npx --no-install`; not used by build parsers)
 - `crates/rskim/src/cmd/rewrite/indefinite.rs` — `is_indefinite_command(tokens: &[&str]) -> bool`; program-aware daemon/streaming detection with env-var prefix stripping; consumed by the rewrite hook path and by `dispatch()`'s `run_inherited_passthrough` gate
 - `crates/rskim/src/cmd/test/cargo.rs` — `run()` for `skim cargo test`; uses `run_parsed_command_with_exit` with `expected_exit_codes: &[101]`; `parse_failure_details` state machine for stable-toolchain `---- name stdout ----` blocks (#317)
 - `crates/rskim/src/cmd/test/shared.rs` — `run_test_runner`, `scrape_failures`, `failure_context_body`, `emit_failure_context` (#317), `try_read_stdin`, `TestKind`, `ExitSource`, `ArgPreparation`, `TestRunnerConfig`
@@ -544,10 +605,11 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 ## Related
 
 - `crates/rskim/src/output/mod.rs` — owns `ParseResult<T>`, the type returned by all three-tier parsers across the whole codebase (lint, test, infra, build); `emit_markers` debug gate; `elision_marker`/`elision_marker_unbounded` (#317)
-- `crates/rskim/src/output/canonical.rs` — owns `BuildResult`, `TestResult` (with `context` safety net), `GitResult`, `LintResult`
-- `crates/rskim/src/runner.rs` — `CommandRunner` (stateless, ADR-008), `CommandOutput`, `ChildGuard` (kill-on-drop), `is_spawn_error`; no internal timeout, no `RunnerError::Timeout`
+- `crates/rskim/src/output/canonical.rs` — owns `BuildResult`, `TestResult` (with `context` safety net), `GitResult`, `LintResult`, `FileResult` (Fix F conditional header)
+- `crates/rskim/src/runner.rs` — `CommandRunner` (stateless, ADR-008), `CommandOutput`, `ChildGuard` (kill-on-drop), `is_spawn_error`; `run_with_node_fallback`/`run_with_env_node_fallback` (Node.js tool resolution; not used by build parsers); no internal timeout, no `RunnerError::Timeout`
 - `crates/rskim/src/cmd/rewrite/indefinite.rs` — `is_indefinite_command`; guards daemon/streaming commands from being captured; consumed by `dispatch()` and the rewrite hook path
 - `crates/rskim/src/cmd/lint/` — sibling module using the same three-tier pattern with `LintResult` instead of `BuildResult`; lint parsers use `run_tool<T>` (via `run_parsed_command_with_mode` in `execution.rs`) rather than `run_parsed_command`
 - `crates/rskim/src/cmd/test/` — sibling module using the same three-tier pattern with `TestResult`; cargo.rs uses `run_parsed_command_with_exit` directly
 - ADR-008: Remove internal subprocess timeout/duration caps; bound child-process lifetime with `ChildGuard` kill-on-drop instead of an arbitrary timeout
 - ADR-001: Fix all noticed issues immediately regardless of scope — applies when adding a new build parser: fix any spotted inconsistencies in other parsers in the same PR rather than deferring
+- PF-003: Applies compress-never-truncate; corrected by PR #340 (Fix B) — the rewrite hook was misattributing grep/diff exit-1 as errors, printing the compressed-output hint when the raw tool would be silent

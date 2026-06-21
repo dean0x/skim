@@ -229,6 +229,41 @@ fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
 
+/// Tools for which exit code 1 means "no match" / "differs" — a benign
+/// informational result that must not trigger the compressed-output hint.
+///
+/// These tools emit exit 1 when they find no matches or detect a difference,
+/// which is not an error: the silence (or diff) IS the output.  Printing
+/// "[skim] compressed output (exit 1)" is misleading — it implies something
+/// went wrong when it did not.  Exit ≥ 2 for these tools IS a real error
+/// (e.g., grep syntax error, diff read failure) and DOES get the hint.
+/// Fix B (fix/rewrite-hook-falseneg).
+const BENIGN_EXIT1_PROGRAMS: &[&str] = &["grep", "rg", "diff"];
+
+/// Decide whether [`record_and_report`] should emit the compressed-output hint.
+///
+/// This is the single source of truth for the notice-matrix decision (#317),
+/// extracted as a pure function so it is unit-testable without spawning a
+/// process — the test and the production path call the *same* code, so a
+/// regression in any of the three conditions is caught (PF-007: a test that
+/// re-derives the expression inline asserts nothing).
+///
+/// Emit the hint when ALL hold:
+/// - `code != 0` — exit 0 never gets a hint.
+/// - `tier_name != "passthrough"` — a verbatim body needs no escape-hatch
+///   notice (it already matches the raw tool, e.g. grep's no-match silence).
+/// - NOT a benign exit-1 (Fix B): `code == 1` for a [`BENIGN_EXIT1_PROGRAMS`]
+///   tool is "no match"/"differs", a normal informational result. Exit ≥ 2 for
+///   those tools is a real error and still gets the hint.
+///
+/// Unexpected failures (codes outside `expected_exit_codes`) raw-forward and
+/// return BEFORE reaching `record_and_report`, so a non-zero `code` seen here
+/// is always an EXPECTED failure the parser meaningfully compresses.
+fn should_emit_compressed_hint(program: &str, code: i32, tier_name: &str) -> bool {
+    let is_benign_exit1 = code == 1 && BENIGN_EXIT1_PROGRAMS.contains(&program);
+    code != 0 && tier_name != "passthrough" && !is_benign_exit1
+}
+
 /// Parameters for recording token savings and emitting the analytics event.
 ///
 /// Bundles the fields that [`record_and_report`] needs, replacing the
@@ -238,6 +273,7 @@ fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
 struct RecordReport<'a> {
     show_stats: bool,
     code: i32,
+    program: &'a str,
     original_stdout: String,
     compressed: String,
     rec: crate::analytics::RecordingContext<'a>,
@@ -254,6 +290,7 @@ fn record_and_report(report: RecordReport<'_>) {
     let RecordReport {
         show_stats,
         code,
+        program,
         original_stdout,
         compressed,
         rec,
@@ -268,7 +305,13 @@ fn record_and_report(report: RecordReport<'_>) {
     // - tier Full/Degraded → surface the escape hatch: the body was re-encoded.
     // - tier Passthrough → silent: the body is already verbatim, so any notice
     //   would be noise the raw tool does not emit (grep's no-match silence).
-    if code != 0 && tier_name != "passthrough" {
+    //
+    // Fix B (fix/rewrite-hook-falseneg): suppress hint for BENIGN_EXIT1_PROGRAMS
+    // at exit 1.  For these tools, exit 1 is "no match"/"differs" — a normal
+    // informational result.  Exit ≥ 2 is a real error and still shows the hint.
+    // The decision lives in `should_emit_compressed_hint` so it is unit-tested
+    // against the same code path (PF-007).
+    if should_emit_compressed_hint(program, code, tier_name) {
         eprintln!("{}", crate::output::compressed_output_hint(code));
     }
 
@@ -413,6 +456,7 @@ where
     record_and_report(RecordReport {
         show_stats,
         code,
+        program,
         original_stdout: output.stdout,
         compressed,
         rec,
@@ -690,5 +734,144 @@ mod tests {
             "both empty must produce Cow::Borrowed: {combined:?}"
         );
         assert_eq!(combined.as_ref(), "");
+    }
+
+    // ========================================================================
+    // BENIGN_EXIT1_PROGRAMS guard (Fix B, fix/rewrite-hook-falseneg)
+    // ========================================================================
+
+    // These tests drive the real `should_emit_compressed_hint` decision used by
+    // `record_and_report` (PF-007): each one would FAIL if the production guard
+    // regressed (e.g. dropping `program` from the check, flipping `code == 1`,
+    // or removing the `!is_benign_exit1` term). The Full and Degraded tier names
+    // exercise the non-passthrough branch where the hint is live.
+
+    /// grep exit 1 = "no match" — benign; the compressed-output hint is suppressed.
+    #[test]
+    fn test_benign_exit1_grep() {
+        assert!(
+            BENIGN_EXIT1_PROGRAMS.contains(&"grep"),
+            "grep must be in BENIGN_EXIT1_PROGRAMS"
+        );
+        assert!(
+            !should_emit_compressed_hint("grep", 1, "full"),
+            "grep exit 1 is benign — hint must be suppressed"
+        );
+        assert!(
+            !should_emit_compressed_hint("grep", 1, "degraded"),
+            "grep exit 1 is benign at the degraded tier too"
+        );
+    }
+
+    /// rg exit 1 = "no match" — benign; hint suppressed.
+    #[test]
+    fn test_benign_exit1_rg() {
+        assert!(
+            BENIGN_EXIT1_PROGRAMS.contains(&"rg"),
+            "rg must be in BENIGN_EXIT1_PROGRAMS"
+        );
+        assert!(
+            !should_emit_compressed_hint("rg", 1, "full"),
+            "rg exit 1 is benign — hint must be suppressed"
+        );
+    }
+
+    /// diff exit 1 = "files differ" — benign; hint suppressed.
+    #[test]
+    fn test_benign_exit1_diff() {
+        assert!(
+            BENIGN_EXIT1_PROGRAMS.contains(&"diff"),
+            "diff must be in BENIGN_EXIT1_PROGRAMS"
+        );
+        assert!(
+            !should_emit_compressed_hint("diff", 1, "full"),
+            "diff exit 1 is benign — hint must be suppressed"
+        );
+    }
+
+    /// grep exit 2 = real error (e.g., syntax error) — NOT benign; hint fires.
+    #[test]
+    fn test_grep_exit2_is_not_benign() {
+        assert!(
+            should_emit_compressed_hint("grep", 2, "full"),
+            "grep exit 2 is a real error — hint must fire"
+        );
+    }
+
+    /// A non-benign tool (e.g., cargo) at exit 1 still gets the hint.
+    #[test]
+    fn test_non_benign_tool_exit1_is_not_suppressed() {
+        assert!(
+            should_emit_compressed_hint("cargo", 1, "full"),
+            "cargo exit 1 is not benign — hint must still fire"
+        );
+    }
+
+    /// Passthrough tier is always silent: the body is already verbatim, so even
+    /// a non-benign non-zero exit emits no hint (would duplicate raw behavior).
+    #[test]
+    fn test_passthrough_tier_never_hints() {
+        assert!(
+            !should_emit_compressed_hint("cargo", 1, "passthrough"),
+            "passthrough tier must never emit the compressed-output hint"
+        );
+        assert!(
+            !should_emit_compressed_hint("grep", 2, "passthrough"),
+            "passthrough tier is silent even for a real grep error"
+        );
+    }
+
+    /// Exit 0 never emits the hint, regardless of tier.
+    #[test]
+    fn test_exit0_never_hints() {
+        assert!(
+            !should_emit_compressed_hint("cargo", 0, "full"),
+            "exit 0 must never emit the compressed-output hint"
+        );
+        assert!(
+            !should_emit_compressed_hint("grep", 0, "degraded"),
+            "exit 0 is success — no hint"
+        );
+    }
+
+    /// Lint and pkg tools at exit 1 are NOT in BENIGN_EXIT1_PROGRAMS, so the
+    /// hint MUST fire when they produce a compressed (Full/Degraded) body.
+    ///
+    /// This complements the grep/rg/diff benign-suppression tests: those assert
+    /// the hint is suppressed; these assert it is NOT suppressed for families
+    /// where exit 1 means "lint violations found" or "package op failed" — a
+    /// real problem, not a normal informational result.
+    ///
+    /// Discriminates against a future regression that blanket-suppresses exit-1
+    /// for ALL programs regardless of BENIGN_EXIT1_PROGRAMS membership.
+    #[test]
+    fn test_lint_exit1_is_not_suppressed() {
+        // eslint exit 1 = lint violations found — not benign; hint must fire.
+        assert!(
+            !BENIGN_EXIT1_PROGRAMS.contains(&"eslint"),
+            "eslint must NOT be in BENIGN_EXIT1_PROGRAMS"
+        );
+        assert!(
+            should_emit_compressed_hint("eslint", 1, "full"),
+            "eslint exit 1 is lint violations — hint must fire (not suppressed)"
+        );
+        assert!(
+            should_emit_compressed_hint("eslint", 1, "degraded"),
+            "eslint exit 1 hint must fire at the degraded tier too"
+        );
+    }
+
+    /// pkg tool (cargo subcommand) at exit 1 — hint fires.
+    #[test]
+    fn test_pkg_exit1_is_not_suppressed() {
+        // npm exit 1 = package operation error — not a benign "no result".
+        assert!(
+            !BENIGN_EXIT1_PROGRAMS.contains(&"npm"),
+            "npm must NOT be in BENIGN_EXIT1_PROGRAMS"
+        );
+        assert!(
+            should_emit_compressed_hint("npm", 1, "full"),
+            "npm exit 1 is a real error — hint must fire"
+        );
     }
 }

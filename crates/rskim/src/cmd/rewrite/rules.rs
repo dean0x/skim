@@ -7,17 +7,17 @@
 //! v2.8.0: Flat dispatch — `rewrite_to` uses tool names directly
 //! (e.g. `["skim", "cargo", "test"]` instead of `["skim", "test", "cargo"]`).
 //!
-//! # Pipe-source exclusion (AD-RW-2)
+//! # Pipe-source passthrough (AD-RW-2)
 //!
-//! Rules with `exclude_pipe_source: true` are suppressed when the command is
-//! the *source* side of a pipe expression (e.g. `ls | head`, `find . | head`,
-//! `rg pat | head`).  The check is co-located with the rule — adding a new
-//! excluded command only requires setting the flag in the rule struct.
-//!
-//! Current excluded commands: `ls` (catch-all), `grep` (catch-all), `find`,
-//! `rg`.  Catch-alls are also guarded by `skip_if_flag_prefix` for `--help`,
-//! `--version`, and `-V` so that informational invocations pass through
-//! unmodified.  SEE: AD-RW-2.
+//! Commands that appear as the *source* side of a pipe (e.g. `ls | head`,
+//! `git diff | head`, `rg pat | head`) are NEVER rewritten.  This is enforced
+//! GLOBALLY in `compound.rs`: `try_rewrite_compound` checks
+//! `has_pipe_operator` on the full segment list and returns `None` immediately
+//! if any pipe operator is present, so the entire pipeline passes through
+//! untouched (enforced by the `has_pipe_operator` short-circuit in
+//! `try_rewrite_compound`, compound.rs).  No per-rule flag is needed or
+//! used — git diff/log/show as pipe sources are protected by this global
+//! short-circuit, not by any field on `RewriteRule`.  SEE: AD-RW-2.
 
 use std::sync::LazyLock;
 
@@ -477,9 +477,16 @@ const LINT_RULES: &[RewriteRule] = &[
     // AD-LINT-20 (2026-04-15): `ruff format --check` and `ruff format` (apply mode)
     // are routed through the format-mode parse path in ruff.rs. The ruff parser
     // detects `is_format_mode` from the first user argument (`"format"`).
+    //
+    // Fix A (fix/rewrite-hook-falseneg): rewrite_to must include both "format" and
+    // "--check" because the engine places `middle = prefix_tail..`; the prefix
+    // tokens are consumed and never reach the handler unless they are in rewrite_to.
+    // Dropping --check silently switches ruff format --check (dry-run) to apply
+    // mode, which is destructive.  Dropping "format" routes the call to run_check
+    // instead of run_format — semantically wrong.
     RewriteRule {
         prefix: &["ruff", "format", "--check"],
-        rewrite_to: &["skim", "ruff"],
+        rewrite_to: &["skim", "ruff", "format", "--check"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -488,7 +495,7 @@ const LINT_RULES: &[RewriteRule] = &[
     },
     RewriteRule {
         prefix: &["ruff", "format"],
-        rewrite_to: &["skim", "ruff"],
+        rewrite_to: &["skim", "ruff", "format"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -565,9 +572,14 @@ const LINT_RULES: &[RewriteRule] = &[
     // AD-LINT-20 (2026-04-15): `prettier --write` and `-w` are routed through the
     // format-mode parse path in prettier.rs. `is_format_mode` detects `--write`
     // or `-w` in the user arguments. Check-mode rules unchanged.
+    // Fix A (fix/rewrite-hook-falseneg): `--write`/`-w` included in
+    // `rewrite_to`.  prettier.rs:is_format_mode checks args for `--write`/`-w`
+    // to dispatch to run_format; without the flag in args, the handler falls
+    // through to run_check and prepare_check_args injects `--check` instead,
+    // causing check behaviour when the user asked to write files.
     RewriteRule {
         prefix: &["npx", "prettier", "--write"],
-        rewrite_to: &["skim", "prettier"],
+        rewrite_to: &["skim", "prettier", "--write"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -576,7 +588,7 @@ const LINT_RULES: &[RewriteRule] = &[
     },
     RewriteRule {
         prefix: &["npx", "prettier", "-w"],
-        rewrite_to: &["skim", "prettier"],
+        rewrite_to: &["skim", "prettier", "-w"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -585,7 +597,7 @@ const LINT_RULES: &[RewriteRule] = &[
     },
     RewriteRule {
         prefix: &["prettier", "--write"],
-        rewrite_to: &["skim", "prettier"],
+        rewrite_to: &["skim", "prettier", "--write"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -594,7 +606,7 @@ const LINT_RULES: &[RewriteRule] = &[
     },
     RewriteRule {
         prefix: &["prettier", "-w"],
-        rewrite_to: &["skim", "prettier"],
+        rewrite_to: &["skim", "prettier", "-w"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -661,9 +673,15 @@ const LINT_RULES: &[RewriteRule] = &[
         require_flag: &[],
     },
     // black
+    //
+    // Fix A (fix/rewrite-hook-falseneg): `--check` included in `rewrite_to`.
+    // black.rs:is_format_mode returns true when args are non-empty AND lack
+    // `--check`/`--diff`.  Dropping `--check` from the prefix caused the handler
+    // to enter run_format (which rewrites files in place) instead of run_check,
+    // a destructive mode-switch.
     RewriteRule {
         prefix: &["black", "--check"],
-        rewrite_to: &["skim", "black"],
+        rewrite_to: &["skim", "black", "--check"],
         skip_if_flag_prefix: &["--diff"],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -689,9 +707,13 @@ const LINT_RULES: &[RewriteRule] = &[
         global_value_flags: &[],
         require_flag: &[],
     },
+    // Fix A (fix/rewrite-hook-falseneg): `-d` included in `rewrite_to`.
+    // gofmt.rs:prepare_args injects `-l` only when no mode flag is present;
+    // without `-d` in the args the wrapper would inject `-l` instead, silently
+    // switching from diff output to file-list output.
     RewriteRule {
         prefix: &["gofmt", "-d"],
-        rewrite_to: &["skim", "gofmt"],
+        rewrite_to: &["skim", "gofmt", "-d"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -1638,9 +1660,15 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         require_flag: &[],
     },
     // ls (verbose/recursive only)
+    //
+    // Fix A (fix/rewrite-hook-falseneg): `-la` and `-R` are included in
+    // `rewrite_to` so that the skim handler receives them.  Previously the
+    // prefix consumed the flag tokens and `rewrite_to` only emitted
+    // `["skim", "ls"]`, dropping the flags silently.  The handler needs
+    // `-la`/`-R` to run the right listing mode.
     RewriteRule {
         prefix: &["ls", "-la"],
-        rewrite_to: &["skim", "ls"],
+        rewrite_to: &["skim", "ls", "-la"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::FileOps,
         skip_if_middle_contains_eq: false,
@@ -1649,7 +1677,7 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
     },
     RewriteRule {
         prefix: &["ls", "-R"],
-        rewrite_to: &["skim", "ls"],
+        rewrite_to: &["skim", "ls", "-R"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::FileOps,
         skip_if_middle_contains_eq: false,
@@ -1667,9 +1695,14 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         require_flag: &[],
     },
     // grep (recursive only)
+    //
+    // Fix A (fix/rewrite-hook-falseneg): `-rn` and `-r` are included in
+    // `rewrite_to` so that the skim handler receives them.  Without them grep
+    // invokes in non-recursive mode, hitting "Is a directory" on the first
+    // directory argument and producing zero matches (silent false-negative).
     RewriteRule {
         prefix: &["grep", "-rn"],
-        rewrite_to: &["skim", "grep"],
+        rewrite_to: &["skim", "grep", "-rn"],
         skip_if_flag_prefix: &["-c", "--count", "-l"],
         category: RewriteCategory::FileOps,
         skip_if_middle_contains_eq: false,
@@ -1678,7 +1711,7 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
     },
     RewriteRule {
         prefix: &["grep", "-r"],
-        rewrite_to: &["skim", "grep"],
+        rewrite_to: &["skim", "grep", "-r"],
         skip_if_flag_prefix: &["-c", "--count", "-l"],
         category: RewriteCategory::FileOps,
         skip_if_middle_contains_eq: false,
@@ -1783,9 +1816,9 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
     // (e.g., `ls -la`, `ls -R`).  Guards on --help/--version/-V so that
     // informational invocations pass through unmodified.
     //
-    // `exclude_pipe_source: true` prevents this rule from rewriting the source
-    // side of a pipe (`ls | head`).  The compound pipeline engine skips rules
-    // with this flag set on the pipe-source segment.  SEE: AD-RW-2.
+    // Pipe-source passthrough (`ls | head`) is handled GLOBALLY by
+    // `has_pipe_operator` short-circuit in `try_rewrite_compound` (compound.rs)
+    // — not by any per-rule field.  SEE: AD-RW-2.
     RewriteRule {
         prefix: &["ls"],
         rewrite_to: &["skim", "ls"],
@@ -1800,8 +1833,9 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
     // Fires for any `grep` invocation not matched by a more-specific earlier
     // rule (e.g., `grep -rn`, `grep -r`).  Guards on --help/--version/-V.
     //
-    // `exclude_pipe_source: true` prevents `grep | head` from being rewritten on the
-    // source side.  SEE: AD-RW-2.
+    // Pipe-source passthrough (`grep pat | head`) is handled GLOBALLY by
+    // `has_pipe_operator` short-circuit in `try_rewrite_compound` (compound.rs)
+    // — not by any per-rule field.  SEE: AD-RW-2.
     RewriteRule {
         prefix: &["grep"],
         rewrite_to: &["skim", "grep"],
@@ -2020,7 +2054,12 @@ mod tests {
         }
     }
 
-    /// Specific grep rules win over catch-all.
+    /// Specific grep rules win over catch-all, and the flag survives the rewrite.
+    ///
+    /// Regression guard for Fix A (fix/rewrite-hook-falseneg): previously the
+    /// rule consumed `-rn` as part of its prefix and `rewrite_to` omitted it,
+    /// so the handler received no recursion flag and silently failed with "Is a
+    /// directory" on directory arguments.
     #[test]
     fn test_specific_grep_still_wins() {
         use crate::cmd::rewrite::engine::try_rewrite;
@@ -2028,6 +2067,280 @@ mod tests {
         let tokens: &[&str] = &["grep", "-rn", "pattern", "src/"];
         let result = try_rewrite(tokens).expect("should rewrite grep -rn");
         assert!(result.tokens.contains(&"skim".to_string()));
+        // Fix A: the `-rn` flag must survive into the rewritten command.
+        assert!(
+            result.tokens.contains(&"-rn".to_string()),
+            "-rn must be preserved in rewrite output; got: {:?}",
+            result.tokens
+        );
+    }
+
+    /// Fix A (fix/rewrite-hook-falseneg): `-r` must survive the grep -r rewrite.
+    #[test]
+    fn test_grep_r_preserves_flag() {
+        use crate::cmd::rewrite::engine::try_rewrite;
+        let result = try_rewrite(&["grep", "-r", "pattern", "src/"]).expect("grep -r must rewrite");
+        assert!(
+            result.tokens.contains(&"-r".to_string()),
+            "-r must be preserved in rewrite output; got: {:?}",
+            result.tokens
+        );
+    }
+
+    /// Fix A (fix/rewrite-hook-falseneg): `-la` must survive the ls -la rewrite.
+    #[test]
+    fn test_ls_la_preserves_flag() {
+        use crate::cmd::rewrite::engine::try_rewrite;
+        let result = try_rewrite(&["ls", "-la"]).expect("ls -la must rewrite");
+        assert!(
+            result.tokens.contains(&"-la".to_string()),
+            "-la must be preserved in rewrite output; got: {:?}",
+            result.tokens
+        );
+    }
+
+    /// Fix A (fix/rewrite-hook-falseneg): `-R` must survive the ls -R rewrite.
+    #[test]
+    fn test_ls_r_preserves_flag() {
+        use crate::cmd::rewrite::engine::try_rewrite;
+        let result = try_rewrite(&["ls", "-R"]).expect("ls -R must rewrite");
+        assert!(
+            result.tokens.contains(&"-R".to_string()),
+            "-R must be preserved in rewrite output; got: {:?}",
+            result.tokens
+        );
+    }
+
+    /// Returns the first prefix flag that `rewrite_to` drops without an
+    /// allowlist entry, or `None` if the rule preserves all its prefix flags
+    /// (or is exempt via the allowlist). Shared by the structural guard
+    /// `no_rule_silently_drops_prefix_flags` and its negative fixture so the
+    /// fixture protects the REAL checker (AC-A4, fix/rewrite-hook-falseneg).
+    ///
+    /// Logic: compute whether the rule is allowlist-exempt once, then scan
+    /// `prefix[1..]` tokens that start with `-`; for each, if
+    /// `rewrite_to.contains(flag)` the flag is preserved; else if the whole
+    /// rule is exempt return `None`; else return `Some(flag)`.  The allowlist
+    /// check is per-rule: a single entry exempts ALL flags in that prefix.
+    ///
+    /// **Scope note (conservative invariant):** only dash-prefixed tokens are
+    /// checked; bare subcommands consumed by a prefix (e.g. a hypothetical
+    /// `format`/`check` subcommand not prefixed with `-`) would not be caught
+    /// by this helper.  No current rule has that shape, and the guard direction
+    /// is conservative (would over-flag on a false alarm, never under-flag on a
+    /// real drop), so this is safe to leave as a documented limitation rather
+    /// than widen the check.  Similarly, the global-flag branch in the engine
+    /// is not modelled here — the guard is conservative in that direction too.
+    fn check_rule_for_flag_drop<'a>(
+        prefix: &[&'a str],
+        rewrite_to: &[&str],
+        allowlist: &[(&[&str], &str)],
+    ) -> Option<&'a str> {
+        // Compute exemption once — allowlist is per-rule, not per-flag.
+        let rule_is_exempt = allowlist
+            .iter()
+            .any(|(allowed_prefix, _comment)| *allowed_prefix == prefix);
+        for flag in prefix
+            .get(1..)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|t| t.starts_with('-'))
+            .copied()
+        {
+            if rewrite_to.contains(&flag) {
+                continue; // Flag preserved — OK.
+            }
+            if rule_is_exempt {
+                return None; // Entire rule is exempt — no dropped flag.
+            }
+            return Some(flag); // Dropped flag, not on allowlist.
+        }
+        None // All flags preserved or no flags in prefix.
+    }
+
+    /// Recurrence guard: no rule may silently drop a flag token from its prefix
+    /// unless the compensating wrapper function is on the WRAPPER_REINJECTS list.
+    ///
+    /// Every flag token (starts with `-`) in `prefix[1..]` must appear in
+    /// `rewrite_to`, OR the rule's prefix must be in `WRAPPER_REINJECTS` with a
+    /// comment naming the exact wrapper fn that compensates.
+    ///
+    /// Fix A (fix/rewrite-hook-falseneg): this test failed before the four
+    /// flag-drop rules were corrected and caused a build failure.  A future
+    /// `foo -X → skim foo` rule that drops a flag will fail this test.
+    ///
+    /// Negative fixture: `synthetic_bad_rule_check` below calls the SAME
+    /// `check_rule_for_flag_drop` helper so the fixture protects the REAL
+    /// checker rather than a copy (AC-A4).
+    #[test]
+    fn no_rule_silently_drops_prefix_flags() {
+        // WRAPPER_REINJECTS: rules whose prefix flags are intentionally absent
+        // from `rewrite_to` because the compensating wrapper fn re-injects them.
+        // Each entry must cite the exact file:fn that compensates.
+        //
+        // Entry format: (prefix_tokens, "comment citing wrapper file:fn")
+        const WRAPPER_REINJECTS: &[(&[&str], &str)] = &[
+            // python3 -m pytest / python -m pytest: the `-m` flag is the Python
+            // module-dispatch mechanism; the entire invocation is replaced by the
+            // pytest handler (cmd/test/pytest.rs:run).
+            (
+                &["python3", "-m", "pytest"],
+                "cmd/test/pytest.rs:run — tool replacement, -m is dispatch mechanism",
+            ),
+            (
+                &["python", "-m", "pytest"],
+                "cmd/test/pytest.rs:run — tool replacement, -m is dispatch mechanism",
+            ),
+            // python3 -m mypy / python -m mypy: same dispatch-mechanism pattern.
+            (
+                &["python3", "-m", "mypy"],
+                "cmd/lint/mypy.rs:run — tool replacement, -m is dispatch mechanism",
+            ),
+            (
+                &["python", "-m", "mypy"],
+                "cmd/lint/mypy.rs:run — tool replacement, -m is dispatch mechanism",
+            ),
+            // gofmt -l: cmd/lint/gofmt.rs:prepare_args injects `-l` when no
+            // mode flag is present.
+            (
+                &["gofmt", "-l"],
+                "cmd/lint/gofmt.rs:prepare_args — injects -l when absent",
+            ),
+            // prettier --check / npx prettier --check: cmd/lint/prettier.rs:
+            // prepare_check_args injects `--check` when absent.
+            (
+                &["prettier", "--check"],
+                "cmd/lint/prettier.rs:prepare_check_args — injects --check when absent",
+            ),
+            (
+                &["npx", "prettier", "--check"],
+                "cmd/lint/prettier.rs:prepare_check_args — injects --check when absent",
+            ),
+            // rustfmt --check: cmd/lint/rustfmt.rs:prepare_check_args injects
+            // `--check` when absent.  is_format_mode only triggers on
+            // --format/-f, so dropping --check safely defaults to check mode.
+            (
+                &["rustfmt", "--check"],
+                "cmd/lint/rustfmt.rs:prepare_check_args — injects --check when absent",
+            ),
+            // cargo fmt --check: same rustfmt handler via dispatch.
+            (
+                &["cargo", "fmt", "--check"],
+                "cmd/lint/rustfmt.rs:prepare_check_args — injects --check when absent",
+            ),
+            // cargo fmt -- --check: `--` is a separator token that starts with
+            // `-`; it is not a meaningful flag.  The `--check` is compensated by
+            // prepare_check_args as above.
+            (
+                &["cargo", "fmt", "--", "--check"],
+                "cmd/lint/rustfmt.rs:prepare_check_args — injects --check; -- is a separator",
+            ),
+        ];
+
+        for rule in all_rules() {
+            if let Some(dropped) =
+                check_rule_for_flag_drop(rule.prefix, rule.rewrite_to, WRAPPER_REINJECTS)
+            {
+                panic!(
+                    "Rule {:?} drops prefix flag {:?} without re-injecting it in \
+                     rewrite_to and without a WRAPPER_REINJECTS entry. \
+                     Either add {:?} to rewrite_to, or add an allowlist entry \
+                     citing the compensating wrapper fn.",
+                    rule.prefix, dropped, dropped
+                );
+            }
+        }
+    }
+
+    /// Negative fixture for `check_rule_for_flag_drop` (AC-A4).
+    ///
+    /// Calls the SAME `check_rule_for_flag_drop` helper used by
+    /// `no_rule_silently_drops_prefix_flags`.  This means any regression in the
+    /// checker (e.g. inverting the `rewrite_to.contains` condition) will make
+    /// BOTH tests go red — the fixture protects the REAL guard, not a copy.
+    ///
+    /// Three controls:
+    ///   1. Bad rule (flag dropped, empty allowlist) → must return Some("-X").
+    ///   2. Good rule (flag preserved)               → must return None.
+    ///   3. Allowlist-exempt bad rule                → must return None.
+    #[test]
+    fn synthetic_bad_rule_check() {
+        let bad_prefix: &[&str] = &["mytool", "-X"];
+        let bad_rewrite_to: &[&str] = &["skim", "mytool"];
+        let good_rewrite_to: &[&str] = &["skim", "mytool", "-X"];
+
+        // Control 1: dropped flag detected against empty allowlist.
+        let result = check_rule_for_flag_drop(bad_prefix, bad_rewrite_to, &[]);
+        assert_eq!(
+            result,
+            Some("-X"),
+            "Bad rule must be detected; check_rule_for_flag_drop returned {:?}",
+            result
+        );
+
+        // Control 2: preserved flag returns None.
+        let result = check_rule_for_flag_drop(bad_prefix, good_rewrite_to, &[]);
+        assert_eq!(
+            result, None,
+            "Good rule must not be flagged; check_rule_for_flag_drop returned {:?}",
+            result
+        );
+
+        // Control 3: exempt via allowlist — bad rule with prefix on allowlist returns None.
+        let allowlist: &[(&[&str], &str)] =
+            &[(&["mytool", "-X"], "synthetic: allowlist-exemption control")];
+        let result = check_rule_for_flag_drop(bad_prefix, bad_rewrite_to, allowlist);
+        assert_eq!(
+            result, None,
+            "Allowlisted rule must be exempt; check_rule_for_flag_drop returned {:?}",
+            result
+        );
+    }
+
+    /// WRAPPER_REINJECTS coupling test (S7, fix/rewrite-hook-falseneg).
+    ///
+    /// Asserts that every allowlist entry in `no_rule_silently_drops_prefix_flags`
+    /// whose dropped flag is re-injected by a lint handler actually has that flag
+    /// present in the handler's `INJECTS` const.  If a handler later removes the
+    /// injection without updating `INJECTS`, this test goes red — turning the
+    /// prose comment into a compiler/test-checked link.
+    ///
+    /// Entries using tool-replacement dispatch (`-m` mechanism for pytest/mypy)
+    /// are excluded: their flag is structurally replaced, not re-injected.
+    #[test]
+    fn wrapper_reinjects_matches_handler_injects() {
+        use crate::cmd::lint::{gofmt, prettier, rustfmt};
+
+        // Map: (prefix_tokens, dropped_flag, handler_INJECTS)
+        // Only entries where a lint handler's prepare_* fn is responsible.
+        let cases: &[(&[&str], &str, &[&str])] = &[
+            (&["gofmt", "-l"], "-l", gofmt::INJECTS),
+            (&["prettier", "--check"], "--check", prettier::INJECTS),
+            (
+                &["npx", "prettier", "--check"],
+                "--check",
+                prettier::INJECTS,
+            ),
+            (&["rustfmt", "--check"], "--check", rustfmt::INJECTS),
+            (&["cargo", "fmt", "--check"], "--check", rustfmt::INJECTS),
+            (
+                &["cargo", "fmt", "--", "--check"],
+                "--check",
+                rustfmt::INJECTS,
+            ),
+        ];
+
+        for (prefix, dropped_flag, handler_injects) in cases {
+            assert!(
+                handler_injects.contains(dropped_flag),
+                "WRAPPER_REINJECTS entry {:?} claims handler re-injects {:?}, \
+                 but that flag is absent from the handler's INJECTS const {:?}. \
+                 Update the handler's INJECTS or fix the allowlist.",
+                prefix,
+                dropped_flag,
+                handler_injects,
+            );
+        }
     }
 
     /// ls --help skips the catch-all rule (passthrough).
