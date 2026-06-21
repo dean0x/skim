@@ -19,24 +19,15 @@ use super::types::CompoundSplitResult;
 /// Logs a warning for unknown agent names (never errors — hook mode must
 /// never fail). Callers default `None` to `AgentKind::ClaudeCode`.
 pub(super) fn parse_agent_flag(args: &[String]) -> Option<AgentKind> {
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--agent" {
-            i += 1;
-            if i < args.len() {
-                let result = AgentKind::from_str(&args[i]);
-                if result.is_none() {
-                    crate::cmd::hook_log::log_hook_warning(&format!(
-                        "unknown --agent value '{}', falling back to claude-code",
-                        &args[i]
-                    ));
-                }
-                return result;
-            }
-        }
-        i += 1;
+    let pos = args.iter().position(|a| a == "--agent")?;
+    let value = args.get(pos + 1)?;
+    let result = AgentKind::from_str(value);
+    if result.is_none() {
+        crate::cmd::hook_log::log_hook_warning(&format!(
+            "unknown --agent value '{value}', falling back to claude-code"
+        ));
     }
-    None
+    result
 }
 
 /// Maximum bytes to read from stdin in hook mode (64 KiB).
