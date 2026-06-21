@@ -1,6 +1,6 @@
 # Wave-4 Search: Test-Hardening Plan
 
-> **PLAN ONLY — no gap-test code landed this pass.**
+> **PLAN-ONLY — no gap-test code landed this pass.**
 > Implementing these gap tests and the GCI.1 git-guard fixes is tracked separately.
 > This document records feasibility notes, Evaluator-verifiable Acceptance Criteria,
 > and three-dimension Test Plans for every identified gap.
