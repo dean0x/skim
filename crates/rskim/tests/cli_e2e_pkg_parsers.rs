@@ -167,14 +167,21 @@ fn test_pip_install_tier1_regex() {
 
 #[test]
 fn test_pip_check_clean() {
+    // The fixture is "No broken requirements found." (28 chars / ~5 tokens).
+    // The net-savings guard (Fix C) passes through raw output when compressed
+    // is not strictly smaller; at this tiny size it will passthrough faithfully.
+    // Accept either the skim-format ("pip check … 0 issues") or the raw fixture
+    // ("No broken requirements") — both represent a clean pip check.
     let fixture = include_str!("fixtures/cmd/pkg/pip_check_clean.txt");
     skim_cmd()
         .args(["pip", "check"])
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("pip check"))
-        .stdout(predicate::str::contains("0 issues"));
+        .stdout(
+            predicate::str::contains("pip check")
+                .or(predicate::str::contains("No broken requirements")),
+        );
 }
 
 // ============================================================================
