@@ -1259,7 +1259,7 @@ mod tests {
     /// including trailing ones added by agent hook infrastructure.  A command
     /// like `"cargo test\n"` is safe to rewrite after trimming.
     #[test]
-    fn fix_c_trailing_newline_passes() {
+    fn test_fix_c_trailing_newline_passes() {
         assert!(
             !command_needs_passthrough("cargo test\n"),
             "trailing newline must not force passthrough"
@@ -1279,7 +1279,7 @@ mod tests {
     /// This is the corruption case: `split_whitespace` flattens `\n` into a
     /// space, destroying the original byte sequence.
     #[test]
-    fn fix_c_interior_newline_bails() {
+    fn test_fix_c_interior_newline_bails() {
         assert!(
             command_needs_passthrough("git commit -m \"feat: subject\n\nBody paragraph.\""),
             "interior newline must force passthrough"
@@ -1293,7 +1293,7 @@ mod tests {
     /// A clean command with no newline must pass through `command_needs_passthrough`
     /// unaffected — the wrapper must not introduce false positives.
     #[test]
-    fn fix_c_clean_command_passes() {
+    fn test_fix_c_clean_command_passes() {
         assert!(
             !command_needs_passthrough("cargo test"),
             "clean command must not need passthrough"

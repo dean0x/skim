@@ -488,7 +488,9 @@ fn run_classify_and_emit(suggest_mode: bool, tokens: &[String]) -> anyhow::Resul
     let original = tokens.join(" ");
 
     // Round-trip safety (#317): never emit a rewrite for syntax the pipeline
-    // cannot reconstruct byte-faithfully.
+    // cannot reconstruct byte-faithfully. Interior newlines are already filtered
+    // upstream by `command_needs_passthrough`; this guard catches heredocs, command
+    // substitutions, unmatched quotes, and redirect hazards that survive tokenization.
     if rewrite_would_corrupt(&original) {
         return emit_result(suggest_mode, &original, None, false);
     }
