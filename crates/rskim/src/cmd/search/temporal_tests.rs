@@ -40,6 +40,7 @@ fn make_result(path: &str, score: f64) -> ResolvedResult {
         stale: false,
         match_positions: vec![],
         temporal: None,
+        layers_matched: vec![],
     }
 }
 
@@ -972,6 +973,7 @@ fn format_text_output_includes_both_hotspot_and_risk_tags() {
             risk_score: Some(0.80),
             ..Default::default()
         }),
+        layers_matched: vec![],
     };
 
     let output = QueryOutput {

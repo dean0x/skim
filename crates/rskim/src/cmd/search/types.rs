@@ -169,6 +169,16 @@ pub(super) struct ResolvedResult {
     /// Optional temporal data for this file, populated when temporal flags are active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temporal: Option<TemporalAnnotation>,
+    /// Layers that contributed non-zero signal for this file (#201).
+    ///
+    /// Absent on degraded rows (pure-lexical path without `--ast`), present on
+    /// compound paths.  Uses `skip_serializing_if` so existing pure-lexical JSON
+    /// consumers see no new key (additive, back-compat with pre-#201 schema).
+    ///
+    /// `["lexical","ast"]` for text+`--ast` intersection (AC-F6).
+    /// `["lexical"]` for pure-lexical or blast-radius paths (no AST layer).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub layers_matched: Vec<&'static str>,
 }
 
 /// Output produced by a query execution run.

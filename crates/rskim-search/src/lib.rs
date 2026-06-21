@@ -74,6 +74,11 @@ pub use compound::{
     WEIGHT6_IMPORT_GRAPH, WEIGHT6_LEXICAL, WEIGHT6_STRUCTURAL_COUPLING, WEIGHT6_TEMPORAL,
     dir_proximity_score, merge_composite, merge_layer_scores, structural_coupling_score,
 };
+// #201: enriched result row type, formatters, and line-span re-parse.
+pub use compound::{
+    AstResult, MAX_REPARSE_FILE_BYTES, TemporalAnnotation, format_ast_json, format_ast_text,
+    recover_line,
+};
 pub use index::{NgramIndexBuilder, NgramIndexReader};
 pub use lexical::{
     BM25FConfig, FIELD_COUNT, MAX_QUERY_BYTES, QueryEngine, bm25f_score, classify_source,

@@ -529,17 +529,12 @@ fn format_ast_text_empty_results_says_no_match() {
 }
 
 #[test]
-fn format_ast_text_no_colon_line_suffix() {
-    // AC-F1: AST text output must NOT include `:line` suffix.
+fn format_ast_text_degraded_rows_have_no_colon_line_suffix() {
+    // AC-F2: degraded rows (line=None) must NOT include `:line` suffix.
+    // This is the pre-#201 behavior for file-level-only results.
     let results = vec![
-        super::AstResult {
-            path: "src/foo.rs".to_string(),
-            score: 2.5,
-        },
-        super::AstResult {
-            path: "src/bar.rs".to_string(),
-            score: 1.2,
-        },
+        super::AstResult::ast_only("src/foo.rs".to_string(), 2.5, None, None),
+        super::AstResult::ast_only("src/bar.rs".to_string(), 1.2, None, None),
     ];
     let mut buf = BufWriter::new(Vec::new());
     super::format_ast_text(&results, "try-catch", "Try/catch blocks", &mut buf).unwrap();
@@ -552,10 +547,10 @@ fn format_ast_text_no_colon_line_suffix() {
         out.contains("src/bar.rs"),
         "output should contain second path"
     );
-    // No `:line` suffix on AST-only results (file-level).
+    // Degraded rows must NOT have :line suffix (AC-F2 NEGATIVE).
     assert!(
         !out.contains("src/foo.rs:"),
-        "AST text output must NOT have :line suffix (AC-F1)"
+        "degraded AST text output must NOT have :line suffix (AC-F2)"
     );
     assert!(
         out.contains("AST pattern: try-catch"),
@@ -564,19 +559,22 @@ fn format_ast_text_no_colon_line_suffix() {
 }
 
 #[test]
-fn format_ast_json_mode_is_ast_no_line_keys() {
-    // AC-A1: mode=="ast", no line/snippet keys.
-    let results = vec![super::AstResult {
-        path: "src/foo.rs".to_string(),
-        score: 2.5,
-    }];
+fn format_ast_json_mode_is_ast_degraded_row_no_line_snippet_keys() {
+    // AC-F4 NEGATIVE: degraded row (line=None) → line and snippet keys ABSENT.
+    // layers_matched IS present (always, AC-F5).
+    let results = vec![super::AstResult::ast_only(
+        "src/foo.rs".to_string(),
+        2.5,
+        None,
+        None,
+    )];
     let mut buf = BufWriter::new(Vec::new());
     super::format_ast_json(&results, "try-catch", "Try/catch blocks", &mut buf).unwrap();
     let out = String::from_utf8(buf.into_inner().unwrap()).unwrap();
 
     let v: serde_json::Value =
         serde_json::from_str(&out).expect("format_ast_json must produce valid JSON");
-    assert_eq!(v["mode"], "ast", "mode must be 'ast' (AC-A1)");
+    assert_eq!(v["mode"], "ast", "mode must be 'ast'");
     assert_eq!(v["pattern"], "try-catch");
     assert_eq!(v["total"], 1);
     assert!(v["results"].is_array());
@@ -584,10 +582,19 @@ fn format_ast_json_mode_is_ast_no_line_keys() {
     let first = &v["results"][0];
     assert!(first["path"].is_string());
     assert!(first["score"].is_number());
-    // No line or snippet keys in AST-level JSON.
+    // Degraded row: line and snippet keys must be ABSENT (AC-F4 NEGATIVE).
     assert!(
-        first.get("line").is_none() && first.get("snippet").is_none(),
-        "AST JSON must not have line or snippet keys (AC-A1)"
+        first.get("line").is_none(),
+        "degraded row: 'line' key must be ABSENT (AC-F4); got: {first}"
+    );
+    assert!(
+        first.get("snippet").is_none(),
+        "degraded row: 'snippet' key must be ABSENT (AC-F4); got: {first}"
+    );
+    // layers_matched must be present (AC-F5).
+    assert!(
+        first.get("layers_matched").is_some(),
+        "layers_matched must be present on every row (AC-F5); got: {first}"
     );
 }
 
@@ -850,6 +857,7 @@ fn run_ast_standalone_with_real_index_maps_paths() {
         cache.path(),
         &manifest,
         None, // no --blast-radius
+        project.path(),
         &mut out,
     )
     .unwrap();
@@ -1431,6 +1439,7 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
         cache.path(),
         &manifest,
         blast_fids,
+        project.path(),
         &mut output_buf,
     )
     .unwrap();
@@ -1505,6 +1514,7 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
         cache.path(),
         &manifest,
         degrade_blast_fids, // None → no intersection, full AST set
+        project.path(),
         &mut degrade_buf,
     )
     .unwrap();

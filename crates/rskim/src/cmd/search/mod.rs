@@ -139,6 +139,7 @@ pub(crate) fn run(
                 &cache_dir,
                 &manifest,
                 blast_file_ids,
+                &root,
                 &mut stdout,
             );
             stdout.flush()?;

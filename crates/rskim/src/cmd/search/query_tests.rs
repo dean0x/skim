@@ -214,6 +214,7 @@ fn test_format_text_output_includes_path_and_score() {
         stale: false,
         match_positions: vec![],
         temporal: None,
+        layers_matched: vec![],
     };
 
     let output = QueryOutput {
@@ -254,6 +255,7 @@ fn test_format_text_output_includes_stale_marker() {
         stale: true,
         match_positions: vec![],
         temporal: None,
+        layers_matched: vec![],
     };
 
     let output = QueryOutput {
@@ -352,6 +354,7 @@ fn test_resolved_result_line_range_some_serializes_start_end() {
         stale: false,
         match_positions: vec![],
         temporal: None,
+        layers_matched: vec![],
     };
 
     let value = serde_json::to_value(&result).expect("ResolvedResult must serialize");
@@ -377,6 +380,7 @@ fn test_resolved_result_line_range_none_serializes_null() {
         stale: false,
         match_positions: vec![],
         temporal: None,
+        layers_matched: vec![],
     };
 
     let value = serde_json::to_value(&result).expect("ResolvedResult must serialize");
@@ -775,6 +779,7 @@ fn test_format_text_output_includes_temporal_hotspot() {
             hotspot_score: Some(0.95),
             ..Default::default()
         }),
+        layers_matched: vec![],
     };
 
     let output = QueryOutput {
@@ -816,6 +821,7 @@ fn test_format_text_output_includes_temporal_risk() {
             risk_score: Some(0.80),
             ..Default::default()
         }),
+        layers_matched: vec![],
     };
 
     let output = QueryOutput {
@@ -854,6 +860,7 @@ fn test_format_text_output_omits_temporal_when_none() {
         stale: false,
         match_positions: vec![],
         temporal: None,
+        layers_matched: vec![],
     };
 
     let output = QueryOutput {
@@ -896,6 +903,7 @@ fn test_format_json_output_includes_temporal_annotations() {
             risk_score: Some(0.70),
             ..Default::default()
         }),
+        layers_matched: vec![],
     };
 
     let output = QueryOutput {

@@ -28,8 +28,11 @@ rusqlite = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 
-[dev-dependencies]
+# serde_json is a regular dep (not dev-only) because compound::output::format_ast_json
+# uses serde_json::to_string_pretty — the formatter lives in the library crate.
 serde_json = { workspace = true }
+
+[dev-dependencies]
 criterion = { workspace = true }
 
 [[bench]]
