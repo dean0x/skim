@@ -24,13 +24,15 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::process::ExitCode;
 
-use rskim_search::{AstIndexReader, AstQuery, AstQueryEngine, FileId};
+use rskim_search::{AstIndexReader, AstQuery, AstQueryEngine, FileId, TemporalDb};
 use rskim_search::{all_patterns, parse_ast_query};
 // #201: enriched row type + formatters from rskim-search.
 // pub(super) re-exports so test module (ast_tests.rs) can call them as super::.
 pub(super) use rskim_search::AstResult;
 use rskim_search::recover_line;
 pub(super) use rskim_search::{format_ast_json, format_ast_text};
+
+use super::types::TemporalSort;
 
 // ============================================================================
 // Engine helpers
@@ -138,36 +140,47 @@ pub(super) fn resolve_ast_scored(
 /// - Opens the AST engine.
 /// - `blast_file_ids`: pre-resolved co-change FileId allowlist from the caller
 ///   (see `temporal::resolve_blast_radius_file_ids`).  When `Some`, intersects
-///   with the AST result set BEFORE applying `--limit` (avoids PF-006
-///   silent-drop, applies ADR-006 fail-loud counterpart on the read side).
-///   Caller is responsible for resolution so the parameter count stays below
-///   the clippy threshold and the `#[allow]` annotation is not needed.
+///   with the AST result set BEFORE truncation (avoids PF-006 silent-drop,
+///   applies ADR-006 fail-loud counterpart on the read side).  The caller owns
+///   resolution so the JSON-aware warning lives in one place.
+/// - `temporal_sort` / `temporal_db`: when both are `Some`, the AST matches are
+///   temporally enriched and re-sorted (hot/cold/risky) before truncation.  When
+///   `temporal_db` is `None` (absent heatmap data) results stay in raw AST order,
+///   unannotated — graceful degradation (the caller emits the warning).
 /// - Executes the query and formats output.
 ///
 /// `w` is the output sink — production callers pass a `BufWriter` over stdout;
 /// tests pass a `Vec<u8>` buffer to capture output (satisfies PF-007: regression
 /// tests must observe production output, not just assert exit 0).
 ///
+/// # Truncation order
+///
+/// 1. blast-radius filter → matching files in raw AST/FileId order.
+/// 2. take a bounded window (`limit` without a sort; `limit*5 ≥ 100` with one).
+/// 3. temporal enrichment + re-sort (when a sort is active).
+/// 4. truncate to `limit` — AFTER the re-sort (AC-F4), so the top-`limit` by
+///    temporal score survive rather than the top-`limit` by raw order.
+///
 /// # Line-span re-parse (#201)
 ///
-/// After applying `--limit`, each matched file is re-parsed to recover a
-/// representative line number. Re-parse uses `rskim_search::recover_line`
-/// (see `compound/reparse.rs`) which:
-/// - Is bounded to at most `limit` files (AC-API3).
+/// AFTER truncation, each surviving file is re-parsed to recover a representative
+/// line number. Re-parse uses `rskim_search::recover_line` (see
+/// `compound/reparse.rs`) which:
+/// - Is bounded to at most `limit` files (AC-API3) — re-parse runs post-truncation.
 /// - Fails-soft to `None` on grammar miss, size guard, mtime mismatch (AC-F2).
 /// - Returns a 1-indexed line; never 0 (AC-F4 NEGATIVE).
 ///
 /// The snippet is extracted by reading the specific line from the file content.
-/// Both operations happen AFTER `--limit` is applied (AC-API3).
 ///
 /// # Errors
 ///
 /// Returns `Err` when the index is absent, the query is invalid, or I/O fails.
 /// Returns `Ok(ExitCode::SUCCESS)` for empty result sets (AC-F8).
-// Eight cohesive runtime inputs for the `search --ast` CLI entrypoint (pattern,
-// limit, json, cache dir, manifest, blast-radius filter, root, writer). Bundling
-// them into a struct would be artificial, and #202 extends this signature further
-// (temporal sort + DB), so the argument count is allowed here intentionally.
+// Ten cohesive runtime inputs for the `search --ast` CLI entrypoint (pattern,
+// limit, json, cache dir, manifest, blast-radius filter, temporal sort, temporal
+// DB, root, writer). Bundling them into a struct would be artificial — they are
+// all independent caller-supplied knobs — so the argument count is allowed here
+// intentionally.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_ast_standalone(
     raw_pattern: &str,
@@ -176,6 +189,8 @@ pub(super) fn run_ast_standalone(
     cache_dir: &Path,
     manifest: &super::manifest::FileManifest,
     blast_file_ids: Option<HashSet<FileId>>,
+    temporal_sort: Option<TemporalSort>,
+    temporal_db: Option<&TemporalDb>,
     root: &Path,
     w: &mut impl std::io::Write,
 ) -> anyhow::Result<ExitCode> {
@@ -189,55 +204,46 @@ pub(super) fn run_ast_standalone(
         .search_ast(&query)
         .map_err(|e| anyhow::anyhow!("AST query failed: {e}"))?;
 
-    // Intersect AST results with blast-radius FileIds (when set), then apply limit.
-    // Limit is applied AFTER intersection so it reflects the filtered set size.
-    // Hoist sorted_paths() here so it is computed once and reused for both the
-    // intersection-membership check (fid.0 as usize) and the path-resolution step.
+    // Hoist sorted_paths() once — reused for the blast-radius membership check
+    // (fid.0 as usize) and the path-resolution step below.
     let sorted = manifest.sorted_paths();
-    let limited: Vec<_> = raw_results
+
+    // A temporal sort defers truncation: take a bounded window (limit*5 ≥ 100) so
+    // the re-sort can promote a temporally-hot file that ranks beyond `limit` in
+    // raw FileId/AST order (AC-F4). Without a sort, take exactly `limit` — the
+    // non-temporal base case is byte-identical to before (GAP-2 carve-out, AC-A1).
+    let temporal_active = temporal_sort.is_some() && temporal_db.is_some();
+    let window = if temporal_active {
+        super::temporal::resort_window(limit)
+    } else {
+        limit
+    };
+
+    // Intersect AST results with blast-radius FileIds (when set), then take the
+    // working window. The filter runs BEFORE truncation so the window reflects the
+    // filtered set size (avoids PF-006 silent feature-drop).
+    let windowed: Vec<_> = raw_results
         .into_iter()
         .filter(|(fid, _)| {
             blast_file_ids
                 .as_ref()
                 .is_none_or(|allowed| allowed.contains(fid))
         })
-        .take(limit)
+        .take(window)
         .collect();
 
-    // Resolve FileIds → repo-relative paths using the manifest, then re-parse
-    // each matched file to recover a representative line number and snippet.
-    //
-    // Re-parse happens strictly AFTER --limit (AC-API3: at most `limit` files).
-    // Each per-file recover_line call is bounded by the 100 KiB size guard.
-    //
-    // Warn on out-of-range FileIds (avoids PF-002 silent-drop anti-pattern,
-    // applies ADR-006 counterpart on the read side).
-    let mut resolved: Vec<AstResult> = Vec::with_capacity(limited.len());
-    for (fid, score) in &limited {
+    // Resolve FileIds → repo-relative paths (no re-parse yet). Warn on out-of-range
+    // FileIds (avoids PF-002 silent-drop; applies ADR-006 counterpart on the read side).
+    let mut resolved: Vec<AstResult> = Vec::with_capacity(windowed.len());
+    for (fid, score) in &windowed {
         let idx = fid.0 as usize;
         match sorted.get(idx) {
             Some(rel_path) => {
-                let abs_path = root.join(rel_path);
-                // Recover the stored mtime from the manifest for the stale guard.
-                let stored_mtime = manifest.lookup(rel_path).and_then(|e| e.mtime);
-                // Re-parse to get a representative line (AC-F1, #201).
-                // fail-soft: recover_line returns None on any error (AC-F2).
-                let (line, snippet) = match recover_line(&abs_path, &query, stored_mtime) {
-                    Some((ln, byte_range)) => {
-                        // Extract the single representative line as snippet text.
-                        let snip =
-                            read_line_at(&abs_path, ln, rskim_search::MAX_REPARSE_FILE_BYTES);
-                        // Suppress snippet if byte_range is empty (parse artifact).
-                        let snip = if byte_range.is_empty() { None } else { snip };
-                        (Some(ln), snip)
-                    }
-                    None => (None, None),
-                };
                 resolved.push(AstResult::ast_only(
                     rel_path.to_string(),
                     *score,
-                    line,
-                    snippet,
+                    None,
+                    None,
                 ));
             }
             None => {
@@ -247,6 +253,33 @@ pub(super) fn run_ast_standalone(
                     sorted.len()
                 );
             }
+        }
+    }
+
+    // Temporal enrichment + re-sort, THEN truncate to `limit` (truncate after the
+    // sort so the top-`limit` by temporal score survive — AC-F4). Enrichment
+    // performs at most `window` per-file DB lookups (AC-P1). When the temporal
+    // DB is absent (temporal_db == None) results stay in raw AST order, unannotated
+    // (graceful degradation — AC-A3; the warning is emitted by the caller).
+    if let (Some(sort), Some(db)) = (temporal_sort, temporal_db) {
+        super::temporal::enrich_ast_results(&mut resolved, sort, db);
+        resolved.truncate(limit);
+    }
+
+    // Re-parse the final (≤ `limit`) set to recover a representative line + snippet.
+    // Re-parse runs strictly AFTER truncation (AC-API3, #201: at most `limit` files);
+    // each per-file recover_line call is bounded by the 100 KiB size guard.
+    // fail-soft: recover_line returns None on any error → degraded row (AC-F2).
+    for r in &mut resolved {
+        let abs_path = root.join(&r.path);
+        // Recover the stored mtime from the manifest for the stale guard.
+        let stored_mtime = manifest.lookup(&r.path).and_then(|e| e.mtime);
+        if let Some((ln, byte_range)) = recover_line(&abs_path, &query, stored_mtime) {
+            // Extract the single representative line as snippet text; suppress when
+            // the byte range is empty (parse artifact).
+            let snip = read_line_at(&abs_path, ln, rskim_search::MAX_REPARSE_FILE_BYTES);
+            r.line = Some(ln);
+            r.snippet = if byte_range.is_empty() { None } else { snip };
         }
     }
 

@@ -311,34 +311,110 @@ fn parse_flags_ast_plus_hot_parsed_ok() {
     assert!(flags.temporal_sort.is_some());
 }
 
+/// AC-F2 (DISCRIMINATING): `--ast <pattern> --hot` orders matches by descending
+/// hotspot score and annotates each surviving row with temporal data.
+///
+/// Replaces the old guard test that asserted an error for this combination — the
+/// interim guard is removed, so it now runs and re-sorts instead of erroring.
+/// Hermetic: drives `run_ast_standalone` directly against a tempdir index plus an
+/// injected `TemporalDb` (no git history, no system cache), mirroring Group 11.
+///
+/// A no-op enrichment (or a reinstated guard) would fail this test: the order
+/// assertion catches "ran but did not sort", the annotation assertion catches
+/// "sorted but did not annotate" (avoids PF-007 vacuous exit-0 guard).
 #[test]
-fn run_ast_plus_hot_returns_202_error() {
-    // run() must return Err with #202 reference when --ast + --hot combined.
-    // Validation fires BEFORE cache resolution so no system cache is written.
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_string_lossy().to_string();
-    let err = super::super::run(
-        &[
-            "--ast".to_string(),
-            "try-catch".to_string(),
-            "--hot".to_string(),
-            "--root".to_string(),
-            root,
-        ],
-        &TEST_ANALYTICS,
+fn run_ast_standalone_hot_sorts_by_hotspot_and_annotates() {
+    use rskim_search::{HotspotRow, TemporalDb};
+
+    use super::super::manifest::FileManifest;
+
+    // alpha.rs and beta.rs both match rust-nested-loop.
+    let project = make_project_with_two_nested_loop_files();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Seed distinct hotspot scores: beta hotter than alpha.
+    let db_path = cache.path().join("temporal.db");
+    let db = TemporalDb::open(&db_path).unwrap();
+    db.store_hotspots(&[
+        HotspotRow {
+            file_path: "src/alpha.rs".to_string(),
+            score: 0.2,
+            changes_30d: 1,
+            changes_90d: 2,
+        },
+        HotspotRow {
+            file_path: "src/beta.rs".to_string(),
+            score: 0.9,
+            changes_30d: 9,
+            changes_90d: 20,
+        },
+    ])
+    .unwrap();
+
+    // Run `--ast rust-nested-loop --hot` (JSON) so order + annotation are assertable.
+    let mut out: Vec<u8> = Vec::new();
+    let result = super::run_ast_standalone(
+        "rust-nested-loop",
+        20,
+        true, // JSON
+        cache.path(),
+        &manifest,
+        None, // no --blast-radius
+        Some(super::super::types::TemporalSort::Hot),
+        Some(&db),
+        project.path(),
+        &mut out,
     )
-    .unwrap_err();
-    let msg = err.to_string();
+    .unwrap();
+    assert_eq!(result, std::process::ExitCode::SUCCESS);
+
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap()).unwrap();
+    let results = v["results"].as_array().unwrap();
     assert!(
-        msg.contains("#202"),
-        "--ast + --hot should reference #202, got: {msg}"
+        results.len() >= 2,
+        "both nested-loop files should match; got {results:?}"
+    );
+
+    // Descending hotspot: beta.rs (0.9) must precede alpha.rs (0.2).
+    let beta_pos = results
+        .iter()
+        .position(|r| r["path"].as_str().unwrap().ends_with("beta.rs"));
+    let alpha_pos = results
+        .iter()
+        .position(|r| r["path"].as_str().unwrap().ends_with("alpha.rs"));
+    assert!(
+        beta_pos.is_some() && alpha_pos.is_some(),
+        "both files must be present; got {results:?}"
+    );
+    assert!(
+        beta_pos.unwrap() < alpha_pos.unwrap(),
+        "--hot must order beta.rs (hotter) before alpha.rs; got: {results:?}"
+    );
+
+    // Annotation present on the hottest row (discriminating: a no-op enrichment
+    // would leave `temporal` absent).
+    assert!(
+        results[beta_pos.unwrap()]["temporal"]["hotspot_score"].is_number(),
+        "hottest row must carry temporal.hotspot_score; got: {results:?}"
     );
 }
 
+/// AC-N1 (DISCRIMINATING): `--ast bogus --hot` must fail validation with an
+/// unknown-pattern message that lists valid pattern names.  Proves
+/// `validate_ast_pattern` still runs pre-dispatch through the now-composable path.
+///
+/// Discriminating against guard reappearance: if the old interim guard were back,
+/// it would fire BEFORE `validate_ast_pattern` and produce a "not composable"
+/// message that does NOT list pattern names — failing the assertion below.
+///
+/// Validation fires BEFORE cache resolution, so no system cache is written.
+/// Replaces the old bogus-pattern guard-order test.
 #[test]
-fn run_ast_bogus_plus_hot_returns_202_first() {
-    // Validation order: #202 fires BEFORE unknown-pattern check.
-    // Validation fires BEFORE cache resolution so no system cache is written.
+fn run_ast_unknown_pattern_plus_hot_validates() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_string_lossy().to_string();
     let err = super::super::run(
@@ -354,8 +430,9 @@ fn run_ast_bogus_plus_hot_returns_202_first() {
     .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("#202"),
-        "#202 check should fire before unknown-pattern check, got: {msg}"
+        msg.contains("try-catch") || msg.contains("nested-loop") || msg.contains("god-function"),
+        "unknown pattern should list valid pattern names (proving validation fired, \
+         not an interim guard), got: {msg}"
     );
 }
 
@@ -857,6 +934,8 @@ fn run_ast_standalone_with_real_index_maps_paths() {
         cache.path(),
         &manifest,
         None, // no --blast-radius
+        None, // no temporal sort
+        None, // no temporal DB
         project.path(),
         &mut out,
     )
@@ -1439,6 +1518,8 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
         cache.path(),
         &manifest,
         blast_fids,
+        None, // no temporal sort
+        None, // no temporal DB
         project.path(),
         &mut output_buf,
     )
@@ -1514,6 +1595,8 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
         cache.path(),
         &manifest,
         degrade_blast_fids, // None → no intersection, full AST set
+        None,               // no temporal sort
+        None,               // no temporal DB
         project.path(),
         &mut degrade_buf,
     )

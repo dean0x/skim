@@ -7,8 +7,9 @@ use rskim_search::{CochangeRow, HotspotRow, RiskRow, TemporalDb};
 use tempfile::TempDir;
 
 use super::{
-    TemporalQueryOutput, apply_temporal_enrichment, check_temporal_staleness, format_temporal_json,
-    format_temporal_text, normalize_blast_radius_path, open_temporal_db, query_standalone,
+    TemporalQueryOutput, apply_temporal_enrichment, check_temporal_staleness, enrich_ast_results,
+    format_temporal_json, format_temporal_text, normalize_blast_radius_path, open_temporal_db,
+    query_standalone, resort_window,
 };
 use crate::cmd::search::types::{ResolvedResult, TemporalSort};
 
@@ -667,6 +668,161 @@ fn combined_json_has_temporal_annotations() {
         json["temporal"]["hotspot_score"].is_number(),
         "temporal.hotspot_score must be present in JSON"
     );
+}
+
+// ============================================================================
+// Standalone-AST temporal enrichment (enrich_ast_results)
+//
+// Mirrors the lexical enrichment tests above. Asserts the AST path applies the
+// IDENTICAL ordering contract (descending/ascending hotspot, descending risk,
+// absent-files-sort-last) so both query paths expose one observable behaviour
+// (AC-A2 / design decision 4).
+// ============================================================================
+
+/// Build a minimal standalone-AST result row (line/snippet absent, as produced
+/// before re-parse — enrichment only touches `path`/`temporal`).
+fn make_ast(path: &str, score: f64) -> rskim_search::AstResult {
+    rskim_search::AstResult::ast_only(path.to_string(), score, None, None)
+}
+
+#[test]
+fn enrich_ast_hot_sorts_by_hotspot_desc() {
+    let (_db_dir, db) = temp_db();
+    db.store_hotspots(&[
+        HotspotRow {
+            file_path: "low.rs".to_string(),
+            score: 0.2,
+            changes_30d: 1,
+            changes_90d: 2,
+        },
+        HotspotRow {
+            file_path: "high.rs".to_string(),
+            score: 0.9,
+            changes_30d: 8,
+            changes_90d: 20,
+        },
+    ])
+    .unwrap();
+
+    // high.rs has the lower AST score but the higher hotspot — sort must reorder.
+    let mut results = vec![make_ast("low.rs", 10.0), make_ast("high.rs", 5.0)];
+    enrich_ast_results(&mut results, TemporalSort::Hot, &db);
+
+    assert_eq!(
+        results[0].path, "high.rs",
+        "hot sort should put high hotspot first"
+    );
+    assert!(
+        results[0]
+            .temporal
+            .as_ref()
+            .and_then(|t| t.hotspot_score)
+            .is_some(),
+        "hot result should carry a hotspot annotation"
+    );
+}
+
+#[test]
+fn enrich_ast_cold_sorts_by_hotspot_asc() {
+    let (_db_dir, db) = temp_db();
+    db.store_hotspots(&[
+        HotspotRow {
+            file_path: "hot.rs".to_string(),
+            score: 0.95,
+            changes_30d: 20,
+            changes_90d: 50,
+        },
+        HotspotRow {
+            file_path: "cold.rs".to_string(),
+            score: 0.05,
+            changes_30d: 0,
+            changes_90d: 1,
+        },
+    ])
+    .unwrap();
+
+    let mut results = vec![make_ast("hot.rs", 10.0), make_ast("cold.rs", 10.0)];
+    enrich_ast_results(&mut results, TemporalSort::Cold, &db);
+
+    assert_eq!(
+        results[0].path, "cold.rs",
+        "cold sort should put lowest hotspot first"
+    );
+}
+
+#[test]
+fn enrich_ast_risky_sorts_by_density_desc() {
+    let (_db_dir, db) = temp_db();
+    db.store_risks(&[
+        RiskRow {
+            file_path: "safe.rs".to_string(),
+            risk_score: 0.1,
+            total_commits: 10,
+            fix_commits: 1,
+            fix_density: 0.1,
+        },
+        RiskRow {
+            file_path: "buggy.rs".to_string(),
+            risk_score: 0.9,
+            total_commits: 10,
+            fix_commits: 9,
+            fix_density: 0.9,
+        },
+    ])
+    .unwrap();
+
+    let mut results = vec![make_ast("safe.rs", 10.0), make_ast("buggy.rs", 8.0)];
+    enrich_ast_results(&mut results, TemporalSort::Risky, &db);
+
+    assert_eq!(
+        results[0].path, "buggy.rs",
+        "risky sort should put most risky first"
+    );
+    assert!(
+        results[0]
+            .temporal
+            .as_ref()
+            .and_then(|t| t.risk_score)
+            .is_some(),
+        "risky result should carry a risk annotation"
+    );
+}
+
+#[test]
+fn enrich_ast_missing_files_sort_last() {
+    let (_db_dir, db) = temp_db();
+    db.store_hotspots(&[HotspotRow {
+        file_path: "known.rs".to_string(),
+        score: 0.5,
+        changes_30d: 3,
+        changes_90d: 7,
+    }])
+    .unwrap();
+
+    let mut results = vec![
+        make_ast("unknown.rs", 10.0), // not in temporal DB
+        make_ast("known.rs", 5.0),    // in temporal DB
+    ];
+    enrich_ast_results(&mut results, TemporalSort::Hot, &db);
+
+    assert_eq!(
+        results[0].path, "known.rs",
+        "files with temporal data must sort before unannotated files in Hot mode"
+    );
+    assert!(
+        results[1].temporal.is_none(),
+        "unknown file must have no annotation"
+    );
+}
+
+#[test]
+fn resort_window_clamps_to_floor_and_scales() {
+    // Small limits clamp to the 100 floor; large limits scale by 5×.
+    assert_eq!(resort_window(1), 100, "small limit clamps to floor");
+    assert_eq!(resort_window(20), 100, "20*5=100 == floor");
+    assert_eq!(resort_window(50), 250, "50*5=250 above floor");
+    // Hostile limit near usize::MAX must not overflow (saturating_mul).
+    assert_eq!(resort_window(usize::MAX), usize::MAX);
 }
 
 // ============================================================================
