@@ -187,13 +187,19 @@ where
             ec
         }
         ParseResult::Passthrough(raw) => {
-            // NOTE: Do NOT add the savings guard here. Cluster D owns the
-            // exit-code bug at this arm (L162-166 in the original); changing
-            // output routing here would complicate that fix. The passthrough
-            // arm already emits verbatim raw — the guard would be a no-op anyway.
+            // Passthrough: the parser could not structurally parse the output —
+            // emit verbatim raw.  The exit code must reflect the REAL process
+            // exit, not a hardcoded FAILURE.  A PASSING suite that skim merely
+            // could not parse should still exit 0 so downstream tooling (CI,
+            // scripts) sees the correct result.
+            //
+            // resolve_exit_code(0, exit_source) means:
+            //   - 0 parser failures (we have no structural data to say otherwise)
+            //   - defer entirely to the process exit: 0 → SUCCESS, non-zero/signal → FAILURE
+            // This matches the Full/Degraded arm's semantics when fail_count == 0.
             println!("{raw}");
             let _ = result.emit_markers(&mut io::stderr().lock());
-            ExitCode::FAILURE
+            resolve_exit_code(0, exit_source)
         }
     };
 
@@ -1259,6 +1265,133 @@ mod tests {
         assert!(
             result.is_none(),
             "unclosed brace must return None, got: {result:?}"
+        );
+    }
+
+    // ========================================================================
+    // Cluster D: passthrough arm exit-code correctness (#3.1)
+    //
+    // Root cause: the Passthrough arm previously hardcoded ExitCode::FAILURE,
+    // discarding the real exit_source. A PASSING suite that skim couldn't
+    // structurally parse would therefore exit 1 and be reported as failed.
+    //
+    // Fix: Passthrough arm now uses resolve_exit_code(0, exit_source), which
+    // defers entirely to the process exit when there are no parser-reported
+    // failures.  These tests drive the same resolve_exit_code path (the fix
+    // replaces the hardcoded FAILURE with a call to this function), so they
+    // exercise the corrected behaviour without needing a live process.
+    // ========================================================================
+
+    /// Passthrough + process exits 0 → SUCCESS.
+    ///
+    /// Before the fix: hardcoded FAILURE even when the suite passed.
+    /// After the fix: resolve_exit_code(0, Process(Some(0))) → SUCCESS.
+    ///
+    /// Surfaces the exact bug: a PASSING vitest suite whose output skim
+    /// couldn't structurally parse would exit 1 with "[skim] compressed output
+    /// (exit 1)" — confusing CI into thinking the suite failed.
+    #[test]
+    fn test_passthrough_arm_passing_suite_exit_zero_gives_success() {
+        // Simulate: parser returned Passthrough, process exited 0.
+        let code = resolve_exit_code(0, ExitSource::Process(Some(0)));
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "passthrough + exit 0 must give SUCCESS (not the hardcoded FAILURE from pre-fix)"
+        );
+    }
+
+    /// Passthrough + process exits 1 (test failures) → FAILURE.
+    /// The real exit code is preserved even on the passthrough arm.
+    #[test]
+    fn test_passthrough_arm_failing_suite_exit_nonzero_gives_failure() {
+        let code = resolve_exit_code(0, ExitSource::Process(Some(1)));
+        assert_eq!(
+            code,
+            ExitCode::FAILURE,
+            "passthrough + exit 1 (test failures) must give FAILURE"
+        );
+    }
+
+    /// Passthrough + process exits 2 (compilation error before tests ran) → exit 2.
+    #[test]
+    fn test_passthrough_arm_compilation_error_exit_code_preserved() {
+        let code = resolve_exit_code(0, ExitSource::Process(Some(2)));
+        assert_eq!(
+            code,
+            ExitCode::from(2u8),
+            "compilation error exit code 2 must be forwarded through passthrough arm"
+        );
+    }
+
+    /// Passthrough + signal-kill → FAILURE (clamped to 1).
+    #[test]
+    fn test_passthrough_arm_signal_kill_gives_failure() {
+        let code = resolve_exit_code(0, ExitSource::Process(None));
+        assert_eq!(
+            code,
+            ExitCode::FAILURE,
+            "signal-killed process must give FAILURE on passthrough arm"
+        );
+    }
+
+    // ========================================================================
+    // TestResult Display leads with summary (#3.1)
+    //
+    // Compressed output from run_test_runner MUST always lead with the
+    // PASS/FAIL summary (pass: N fail: N skip: N), so that agents can scan
+    // the first line for the result without reading all failure details.
+    // ========================================================================
+
+    /// TestResult Display always leads with the summary line.
+    #[test]
+    fn test_test_result_display_leads_with_summary() {
+        use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
+
+        let summary = TestSummary {
+            pass: 5,
+            fail: 1,
+            skip: 0,
+            duration_ms: Some(123),
+        };
+        let entries = vec![TestEntry {
+            name: "math > fails".to_string(),
+            outcome: TestOutcome::Fail,
+            detail: None,
+        }];
+        let result = TestResult::new(summary, entries);
+        let rendered = result.to_string();
+
+        // First line must contain "pass:" and "fail:" counts.
+        let first_line = rendered.lines().next().unwrap_or("");
+        assert!(
+            first_line.contains("pass:") && first_line.contains("fail:"),
+            "first line of TestResult Display must be the summary; got: {first_line:?}"
+        );
+        assert!(
+            first_line.starts_with("pass:"),
+            "summary must lead (starts_with 'pass:'); got: {first_line:?}"
+        );
+    }
+
+    /// TestResult Display with zero failures still leads with the summary.
+    #[test]
+    fn test_test_result_display_leads_with_summary_zero_failures() {
+        use crate::output::canonical::{TestResult, TestSummary};
+
+        let summary = TestSummary {
+            pass: 10,
+            fail: 0,
+            skip: 2,
+            duration_ms: None,
+        };
+        let result = TestResult::new(summary, vec![]);
+        let rendered = result.to_string();
+
+        let first_line = rendered.lines().next().unwrap_or("");
+        assert!(
+            first_line.contains("pass: 10") && first_line.contains("fail: 0"),
+            "summary line must contain counts even for passing suites; got: {first_line:?}"
         );
     }
 }
