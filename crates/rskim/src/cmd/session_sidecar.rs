@@ -4,17 +4,23 @@
 //!
 //! ~50% of skim analytics records are "untagged" (NULL `session_id`) because
 //! direct skim invocations (e.g., `skim cargo test`) bypass the rewrite hook
-//! that normally injects `--session-id=<value>`.
+//! that previously injected `--session-id=<value>`.
 //!
-//! ## Solution (AD-SC-1)
+//! ## Solution (AD-SC-1) — sidecar is now the PRIMARY attribution path
+//!
+//! The hook no longer injects `--session-id` into the rewritten command text
+//! (#1.1 / fix/rewrite-compression-batch). Injecting the flag caused version-
+//! skew hard-failures ("unexpected argument --session-id") on older binaries.
+//! The sidecar is the canonical out-of-band attribution channel.
 //!
 //! **Write path** — On every hook invocation that carries a `session_id`, the
 //! hook writes the value to `~/.cache/skim/sessions/{ppid}.id` (keyed by the
 //! agent/shell PID, i.e., the parent of the hook process).
 //!
-//! **Read path** — Any skim invocation that lacks `--session-id` walks its
-//! process ancestry (up to [`MAX_ANCESTRY_DEPTH`] levels) looking for a
-//! matching sidecar file. The first fresh file found wins.
+//! **Read path** — Any skim invocation walks its process ancestry (up to
+//! [`MAX_ANCESTRY_DEPTH`] levels) looking for a matching sidecar file.
+//! The first fresh file found wins. Resolution priority in `main()`:
+//! `sidecar > SKIM_SESSION_ID env var > --session-id flag (compat fallback)`.
 //!
 //! ## Security
 //!
@@ -548,13 +554,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Fallback priority: explicit session_id wins over sidecar
+    // Sidecar is primary: read_session_id is the first resolver in main()
+    //
+    // The sidecar round-trip must work correctly (write then read returns the
+    // same value). Additionally, `or_else` short-circuits so a pre-resolved
+    // Some value from an earlier ancestor sidecar is not overwritten.
     // -----------------------------------------------------------------------
 
-    /// When an explicit session ID is already resolved, `read_session_id` is the
-    /// fallback — it is only used when the caller has `None`. This test confirms
-    /// that a sidecar written for the current PID is readable, and that a
-    /// pre-existing `Some` value is unaffected by what the sidecar contains.
+    /// read_session_id returns the sidecar value when present, and a pre-
+    /// resolved value (from an earlier priority step) is not clobbered.
+    /// This tests the sidecar API itself — the priority ordering is in main().
     #[test]
     fn test_read_session_id_is_a_fallback() {
         let dir = TempDir::new().unwrap();
