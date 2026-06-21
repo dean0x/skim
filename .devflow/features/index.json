@@ -3,7 +3,7 @@
   "features": {
     "build-parsers": {
       "name": "Build Tool Output Parsers",
-      "description": "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, ChildGuard, indefinite, is_indefinite_command, expected_exit_codes, forward_stderr, ExitDisposition, classify_exit, run_parsed_command_with_exit, elision_marker, failure_context_body, parse_failure_details, compress-never-truncate, spawn_status_to_code, run_with_node_fallback.",
+      "description": "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, ChildGuard, indefinite, is_indefinite_command, expected_exit_codes, forward_stderr, ExitDisposition, classify_exit, run_parsed_command_with_exit, elision_marker, failure_context_body, parse_failure_details, compress-never-truncate, spawn_status_to_code, run_with_node_fallback, should_emit_compressed_hint, BENIGN_EXIT1_PROGRAMS, FileResult.",
       "directories": [
         "crates/rskim/src/cmd/build/",
         "crates/rskim/src/cmd/"
@@ -28,8 +28,8 @@
         "crates/rskim/src/cmd/test/cargo.rs",
         "crates/rskim/src/cmd/test/shared.rs"
       ],
-      "lastUpdated": "2026-06-17T11:53:10.154Z",
-      "createdBy": "devflow-knowledge"
+      "lastUpdated": "2026-06-21T09:14:02.872Z",
+      "createdBy": "implement"
     },
     "cochange": {
       "name": "Co-Change Matrix",
