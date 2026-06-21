@@ -1,0 +1,12 @@
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "The search query"
+    }
+  },
+  "required": ["query"]
+}
+```

@@ -1,0 +1,6 @@
+Here is an example of how to use the parse function:
+
+    let bytes = b"{\"model\":\"claude-3-5-sonnet-20241022\",\"messages\":[],\"max_tokens\":100}";
+    let body = parse(bytes).unwrap();
+
+The above code parses a minimal Anthropic request body. Note that indented code blocks like this are not detected as Code in v1 of the classifier — they fall to Text. See #326 for the follow-up to add deterministic unfenced-code inference.

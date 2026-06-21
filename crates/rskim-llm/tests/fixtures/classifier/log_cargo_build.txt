@@ -1,0 +1,5 @@
+2024-01-15T10:30:00Z INFO Compiling rskim-llm v0.1.0 (src/lib.rs)
+2024-01-15T10:30:01Z WARN unused variable: `x` at src/lib.rs:42:9
+2024-01-15T10:30:01Z WARN `rskim-llm` generated 1 warning
+2024-01-15T10:30:02Z INFO Compiling rskim-core v0.1.0
+2024-01-15T10:30:05Z INFO Finished `dev` profile in 5.23s

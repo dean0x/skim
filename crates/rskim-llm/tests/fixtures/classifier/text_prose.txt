@@ -1,0 +1,3 @@
+The Anthropic Messages API supports a rich content model for both request and response bodies. Messages can contain text, tool use requests, tool results, and extended thinking content. Each message has a role (user or assistant) and content that can be a plain string or an array of typed blocks.
+
+The byte-stable serialization mechanism ensures that request bodies can be parsed and re-serialized without any modification to the underlying JSON representation, including preservation of non-canonical number formats, Unicode escape sequences, and unknown fields.

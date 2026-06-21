@@ -1,0 +1,4 @@
+This is plain text.
+More plain text here.
+2024-01-15T10:30:00Z INFO Only one log line
+This is more plain text that is not a log line at all.

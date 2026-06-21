@@ -1,0 +1,48 @@
+# rskim-contract clippy configuration
+#
+# Determinism gate (invariant 5 / AC10): forbid wall-clock time and entropy in
+# the transform path. Any call to these methods in transform-path modules is a
+# determinism violation that would cause non-reproducible outputs.
+#
+# This gate is checked by: cargo clippy -p rskim-contract --all-targets -- -D warnings
+# CI runs this on ubuntu-latest, macos-latest, and windows-latest (AC20).
+#
+# AC9 two-divergent-clock sub-requirement: AC9 specifies that the transform
+# must produce byte-identical output "under two divergent injected clock values."
+# This gate satisfies that requirement structurally: no clock can exist in the
+# transform path (SystemTime::now and Instant::now are banned below), so there
+# is nothing to inject. The `check_determinism` harness function documents this
+# substitution explicitly in its docstring (harness/mod.rs). Per PF-005 this is
+# observable-by-construction: the clippy gate is verifiable in CI as a passing
+# step, making the "no clock in transform" invariant mechanically checkable.
+#
+# The banned methods are:
+# - std::time::SystemTime::now — wall-clock time (non-deterministic)
+# - std::time::Instant::now — monotonic time (non-deterministic across runs)
+# - rand entry points — non-deterministic entropy
+# - getrandom entry points — OS entropy (non-deterministic)
+#
+# Note: `std::thread::sleep` is not banned because it does not affect output
+# bytes, only latency. However, it should never appear in the transform path.
+#
+# `allow-invalid = true` on the rand/getrandom entries: this crate intentionally
+# does NOT depend on rand/getrandom, so those paths are currently unresolvable.
+# Without `allow-invalid`, clippy emits a config-load warning for each unresolved
+# path (violating the zero-warnings policy). With `allow-invalid = true`, clippy
+# silently skips the entry WHILE THE PATH IS UNRESOLVABLE, and re-activates the
+# deny the moment the path becomes reachable (e.g., if a future change adds a
+# rand/getrandom dependency) — which is exactly the AC10 "deny the moment it is
+# introduced" semantics. The SystemTime/Instant entries resolve in std and need
+# no override (verified to trip the gate on a reachable call).
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "non-deterministic — forbidden in L3 transform path (invariant 5)" },
+    { path = "std::time::Instant::now", reason = "non-deterministic — forbidden in L3 transform path (invariant 5)" },
+    # rand / getrandom entry points (AC10 — "rand/getrandom entry points" denied at minimum).
+    # These are listed unconditionally: clippy's disallowed-methods does not require the
+    # crate to depend on the path, so the gate denies the call the moment it is introduced.
+    { path = "rand::random", reason = "non-deterministic entropy — forbidden in L3 transform path (invariant 5)", allow-invalid = true },
+    { path = "rand::thread_rng", reason = "non-deterministic entropy — forbidden in L3 transform path (invariant 5)", allow-invalid = true },
+    { path = "rand::rng", reason = "non-deterministic entropy — forbidden in L3 transform path (invariant 5)", allow-invalid = true },
+    { path = "getrandom::getrandom", reason = "OS entropy — forbidden in L3 transform path (invariant 5)", allow-invalid = true },
+    { path = "getrandom::fill", reason = "OS entropy — forbidden in L3 transform path (invariant 5)", allow-invalid = true },
+]

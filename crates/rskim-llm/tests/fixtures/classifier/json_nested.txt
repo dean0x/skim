@@ -1,0 +1,1 @@
+{"search_results":{"query":"AI news","total":157,"page":1,"results":[{"title":"GPT-5 Released","url":"https://openai.com/gpt5","score":0.98,"snippet":"OpenAI releases..."},{"title":"Claude 3.5 Sonnet","url":"https://anthropic.com","score":0.95,"snippet":"Anthropic releases..."}]}}

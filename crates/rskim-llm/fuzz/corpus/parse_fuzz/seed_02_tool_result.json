@@ -1,0 +1,1 @@
+{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_001","content":"result text"}]}],"max_tokens":100}

@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use crate::cmd::session::AgentKind;
 
-use super::compound::{rewrite_would_corrupt, split_compound, try_rewrite_compound};
+use super::compound::{command_needs_passthrough, split_compound, try_rewrite_compound};
 use super::engine::try_rewrite;
 use super::types::CompoundSplitResult;
 
@@ -209,7 +209,13 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
     // command substitution, backticks, unmatched quotes, and whitespace that
     // does not survive split+rejoin. The simple path previously ran
     // split_whitespace()+join(" ") with NO checks.
-    if rewrite_would_corrupt(&command) {
+    //
+    // Fix C (fix/rewrite-hook-falseneg): use `command_needs_passthrough`
+    // instead of `rewrite_would_corrupt` directly.  The hook-layer function
+    // trims trailing whitespace first so trailing newlines (commonly added
+    // by agent hooks) are ignored, while interior newlines (multi-line
+    // commands that would corrupt tokenization) still cause a bail-out.
+    if command_needs_passthrough(&command) {
         audit_hook(&command, false, "");
         return Ok(ExitCode::SUCCESS);
     }

@@ -1,0 +1,7 @@
+The query syntax is:
+
+```
+SELECT column FROM table WHERE condition
+```
+
+Use this syntax to filter results.

@@ -1,0 +1,13 @@
+error[E0053]: method `transform` has an incompatible type for trait
+  --> tests/compile_fail/a_error_return.rs:17:60
+   |
+17 |     fn transform(&self, input: &[u8], request_id: &str) -> Result<Outcome, String> {
+   |                                                            ^^^^^^^^^^^^^^^^^^^^^^^ expected `Outcome`, found `Result<Outcome, String>`
+   |
+   = note: expected signature `fn(&HostileErrorReturner, &[u8], &str) -> Outcome`
+              found signature `fn(&HostileErrorReturner, &[u8], &str) -> Result<Outcome, String>`
+help: change the output type to match the trait
+   |
+17 -     fn transform(&self, input: &[u8], request_id: &str) -> Result<Outcome, String> {
+17 +     fn transform(&self, input: &[u8], request_id: &str) -> Outcome {
+   |

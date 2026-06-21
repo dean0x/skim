@@ -526,6 +526,50 @@ fn test_skim_git_show_file_content_unsupported_ext_passthrough() {
     );
 }
 
+/// Fix D (fix/rewrite-hook-falseneg, AD-GIT-SHOW-PSEUDO): `git show <ref>:<file>`
+/// must use Pseudo mode (preserves function bodies), NOT Structure mode (collapses
+/// them to `{...}`).  This drives the real production path (`run_show_file_content`,
+/// show.rs) end-to-end against a committed fixture and is the PF-007 guard for the
+/// mode constant: it FAILS if that site reverts to Structure.
+///
+/// The asserted tokens live ONLY inside function bodies in the fixture (not in any
+/// signature, doc comment, `use`, or struct field), so Structure mode — which keeps
+/// signatures and imports — strips every one of them.  Their presence proves Pseudo
+/// is live in production, not merely at the transform layer.
+#[test]
+fn test_skim_git_show_file_content_pseudo_preserves_bodies() {
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args([
+            "git",
+            "show",
+            "HEAD:crates/rskim/tests/fixtures/cmd/git/show_file.rs",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "skim git show of a committed .rs file should exit 0; got exit code {:?}",
+        output.status.code()
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    for token in [
+        "find_user_by_username",
+        "Invalid credentials",
+        "duration_since",
+    ] {
+        assert!(
+            stdout.contains(token),
+            "Pseudo-mode `git show` must preserve body token {token:?} \
+             (Structure mode would strip it); got: {}",
+            &stdout[..stdout.len().min(600)]
+        );
+    }
+}
+
 // ============================================================================
 // Git dispatcher coverage (MEDIUM-28, #132)
 // ============================================================================

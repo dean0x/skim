@@ -43,6 +43,33 @@ jobs:
       - name: Run cargo doc tests
         run: cargo test --doc
 
+      # AC20 (rskim-contract): Run the conformance harness and AC2 compile-fail
+      # tests for the safety-substrate crate. Gates on real process exit status
+      # (no piping through tail/head — PF-007).
+      # Cross-OS matrix (macos-latest + windows-latest) is owned by the #323
+      # CI-coordination ticket; this step runs the harness on ubuntu-latest.
+      - name: AC20 rskim-contract conformance harness
+        run: cargo test -p rskim-contract --all-features --all-targets
+
+      # AC12: run the 25ms latency test in --release mode so the real ceiling is
+      # enforced, not just the debug-build 2000ms sentinel. The test's own #[cfg]
+      # selects the 25ms branch only in non-debug (release) builds.
+      # Relates to: ADR-003 (grounded regression guards), PF-005 (testable ACs),
+      # PF-007 (gate on real exit status — set -o pipefail not needed for cargo test).
+      - name: AC12 latency gate (release build)
+        run: cargo test -p rskim-tokens --release --test integration ac12_100kb_latency_under_25ms
+
+      # AC12 criterion baseline comparison (ADR-003 relative regression guard).
+      # Compares the current run against the committed baseline in .bench-baselines/.
+      # Uses CRITERION_HOME to read from the tracked directory.
+      # Note: criterion 0.5 exits 0 regardless of regression detection; this step
+      # prints relative % change to the log for human visibility. The hard gate is
+      # the release-mode 25ms test above (which exits non-zero when exceeded).
+      - name: AC12 criterion benchmark (relative regression visibility)
+        env:
+          CRITERION_HOME: ${{ github.workspace }}/.bench-baselines
+        run: cargo bench -p rskim-tokens --bench token_count_bench -- --baseline ci-baseline
+
   security-tests:
     name: Security Test Suites
     runs-on: ubuntu-latest
@@ -93,7 +120,94 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-features -- -D warnings
+        # --all-targets required per PF-009: catches warnings in #[cfg(test)] modules
+        # that are missed by cargo clippy without --all-targets.
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+      # AC20 / AC10 (rskim-contract): Run the disallowed-methods determinism gate
+      # specifically for rskim-contract (clippy.toml in the crate root).
+      # This gate bans SystemTime::now, Instant::now, rand, and getrandom from
+      # the transform path. Gates on real exit status (PF-007).
+      - name: AC10/AC20 rskim-contract disallowed-methods gate
+        run: cargo clippy -p rskim-contract --all-features --all-targets -- -D warnings
+
+      - name: Dependency-tree isolation check (AC9/AC12)
+        # Proves no HTTP/TLS crate appears in the default-features build of
+        # rskim-tokens, rskim-llm, or the skim binary. Uses set -o pipefail per PF-007.
+        # AC12 for rskim-llm: forbids tokio/hyper/reqwest/rand and (via source-level grep)
+        # std::fs/std::net/SystemTime/Instant — cargo tree only emits crate names so
+        # std:: type names can never match it; the source grep closes that gap.
+        run: |
+          set -o pipefail
+          echo "=== rskim-tokens default-features tree ==="
+          cargo tree -p rskim-tokens -e normal 2>&1 | tee /tmp/rskim-tokens-tree.txt
+          if grep -qE 'ureq|reqwest|hyper|rustls|native-tls|openssl' /tmp/rskim-tokens-tree.txt; then
+            echo "FAIL: HTTP/TLS dependency found in rskim-tokens default build"
+            exit 1
+          fi
+          echo "PASS: no HTTP/TLS in rskim-tokens default build"
+
+          echo "=== rskim-llm default-features tree (AC12 dep gate) ==="
+          cargo tree -p rskim-llm -e normal 2>&1 | tee /tmp/rskim-llm-tree.txt
+          FORBIDDEN_LLM='tokio|hyper|reqwest|rustls|native-tls|openssl|rand\b'
+          if grep -qE "$FORBIDDEN_LLM" /tmp/rskim-llm-tree.txt; then
+            echo "FAIL: forbidden dependency found in rskim-llm default build (AC12)"
+            grep -E "$FORBIDDEN_LLM" /tmp/rskim-llm-tree.txt || true
+            exit 1
+          fi
+          echo "PASS: no forbidden dependencies in rskim-llm default build"
+
+          echo "=== rskim-llm source-level ambient-state check (AC12) ==="
+          # cargo tree never emits std:: type names, so SystemTime/Instant/std::fs/std::net
+          # must be checked at source level.  This grep covers the entire crates/rskim-llm/src
+          # tree; test modules are excluded from the ambient-state guarantee and are
+          # permitted to use Instant (they use it for timing, not nondeterminism).
+          if grep -rnE 'SystemTime|std::(fs|net)|getrandom|rand::' crates/rskim-llm/src; then
+            echo "FAIL: ambient-state API found in rskim-llm/src (AC12 determinism gate)"
+            exit 1
+          fi
+          echo "PASS: no ambient-state APIs in rskim-llm/src"
+
+          echo "=== skim binary default-features tree ==="
+          cargo tree -p rskim -e normal 2>&1 | tee /tmp/rskim-tree.txt
+          if grep -qE 'ureq|reqwest|hyper|rustls|native-tls|openssl' /tmp/rskim-tree.txt; then
+            echo "FAIL: HTTP/TLS dependency found in skim binary default build"
+            exit 1
+          fi
+          echo "PASS: no HTTP/TLS in skim binary default build"
+
+  fuzz-smoke:
+    name: Fuzz Smoke (AC15, rskim-llm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust nightly (required for cargo-fuzz / libFuzzer)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-nightly-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+
+      # AC15: bounded 60s cargo-fuzz smoke run, gated on real process exit status
+      # (PF-007: set -euo pipefail — the fuzz command runs as the last statement so
+      # `set -e` gates on its real exit status directly without the $?-capture race).
+      # The -timeout=5 flag enforces the per-input 5s hang bound.
+      # Scope note: cross-OS fuzz matrix belongs to #323; this job is the AC15
+      # per-#302 deliverable (Linux-only smoke, nightly-pinned to this job only).
+      - name: AC15 fuzz smoke (parse_fuzz, 60s)
+        run: |
+          set -euo pipefail
+          cd crates/rskim-llm
+          echo "Starting fuzz smoke run (60s max_total_time, 5s per-input timeout)..."
+          cargo +nightly fuzz run parse_fuzz fuzz/corpus/parse_fuzz -- \
+            -max_total_time=60 -timeout=5
+          echo "PASS: fuzz smoke run completed without crash or hang"
 
   build:
     name: Build Check

@@ -1,0 +1,5 @@
+error[E0599]: no method named `reorder_turns` found for struct `Outcome` in the current scope
+  --> tests/compile_fail/c_reorder_turns.rs:19:13
+   |
+19 |         out.reorder_turns(|_turns| {}) //~^ ERROR no method named `reorder_turns`
+   |             ^^^^^^^^^^^^^ method not found in `Outcome`

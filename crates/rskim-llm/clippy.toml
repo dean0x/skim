@@ -1,0 +1,22 @@
+# Clippy configuration for rskim-llm.
+#
+# AC12 / AC10 determinism gate — enforce at compile time that no ambient-state
+# API enters production source (src/).  These are sources of nondeterminism:
+#  - SystemTime::now  — wall-clock reads make output depend on execution time
+#  - Instant::now     — monotonic reads (fine in tests, not in production code)
+#  - rand::*          — RNG (would make serialization nondeterministic)
+#  - getrandom        — entropy source
+#
+# The CI source-level grep in ci.yml covers the same set for the src/ tree.
+# This clippy.toml adds compile-time enforcement that fires before CI, giving
+# faster feedback for the common ambient-state mistake.
+#
+# Note: test code (`tests/`, `benches/`) is legitimately exempt from
+# `Instant::now` because linearity.rs uses it for timing measurements.
+# The deny-list here applies to the library crate target (src/), not to
+# integration tests or benchmarks.  clippy --all-targets will still fire
+# these warnings on test code only if the same disallowed paths appear there.
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "ambient-state: use deterministic data in rskim-llm (AC12)" },
+    { path = "std::time::Instant::now", reason = "ambient-state: timing reads must not appear in production src/ (use tests for timing; AC12)" },
+]

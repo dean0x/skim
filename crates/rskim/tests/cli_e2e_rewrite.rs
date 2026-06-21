@@ -841,7 +841,7 @@ fn test_rewrite_ruff_format_check() {
         .args(["rewrite", "ruff", "format", "--check", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim ruff"));
+        .stdout(predicate::str::contains("skim ruff format --check ."));
 }
 
 #[test]
@@ -1143,7 +1143,7 @@ fn test_rewrite_ls_la() {
         .args(["rewrite", "ls", "-la"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim ls"));
+        .stdout(predicate::str::contains("skim ls -la"));
 }
 
 #[test]
@@ -1161,7 +1161,7 @@ fn test_rewrite_grep_r() {
         .args(["rewrite", "grep", "-r", "TODO", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim grep"));
+        .stdout(predicate::str::contains("skim grep -r TODO src/"));
 }
 
 #[test]
@@ -1726,7 +1726,7 @@ fn test_rewrite_black_check() {
         .args(["rewrite", "black", "--check", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim black"));
+        .stdout(predicate::str::contains("skim black --check src/"));
 }
 
 #[test]
@@ -1749,11 +1749,14 @@ fn test_rewrite_black_diff_skipped() {
 
 #[test]
 fn test_rewrite_gofmt_l() {
+    // gofmt -l rewrites to `skim gofmt ./...` (no -l in rewrite_to): the
+    // gofmt handler (prepare_args) re-injects -l when no mode flag is present
+    // (WRAPPER_REINJECTS entry in no_rule_silently_drops_prefix_flags).
     skim_cmd()
         .args(["rewrite", "gofmt", "-l", "./..."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim gofmt"));
+        .stdout(predicate::str::contains("skim gofmt ./..."));
 }
 
 #[test]
@@ -2622,6 +2625,57 @@ fn test_hook_pipe_with_rewritable_producer_passes_through() {
         .stdout(predicate::str::is_empty());
 }
 
+/// Fix E (fix/rewrite-hook-falseneg): `git diff | grep "^+"` must NOT be
+/// rewritten.  Rewiring `git diff` to `skim git diff` in a pipe would change
+/// the byte stream that `grep` sees — the compressed diff format differs from
+/// raw `git diff` output.  The hook must emit empty stdout (passthrough).
+#[test]
+fn fix_e_git_diff_pipe_grep_passes_through() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "git diff | grep \"^+\""
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Fix E: `git log | grep feat` must pass through — same pipe-source rule.
+#[test]
+fn fix_e_git_log_pipe_grep_passes_through() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "git log --oneline | grep feat"
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Fix E: `git show HEAD:src/lib.rs | wc -l` must pass through.
+#[test]
+fn fix_e_git_show_pipe_passes_through() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "git show HEAD:src/lib.rs | wc -l"
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
 // ============================================================================
 // #317 — the emitted rewrite must EXECUTE (round-trip e2e)
 //
@@ -2750,4 +2804,85 @@ fn test_hook_safe_redirect_order_still_rewrites() {
         .assert()
         .success()
         .stdout(predicate::str::contains(">log.txt 2>&1"));
+}
+
+// ============================================================================
+// Fix C — CLI path: interior newline must pass through (AC-C1 / AC-C2 / AC-C3)
+//
+// The hook path already bails on interior newlines (via command_needs_passthrough
+// in hook.rs). The CLI positional-args path had a different bug: collect_input_tokens
+// flattened the newline via split_whitespace BEFORE the corruption guard ran,
+// so the guard never saw it and happily emitted a corrupt merged command.
+// Fix: check command_needs_passthrough on the joined raw string BEFORE tokenising.
+// ============================================================================
+
+/// AC-C1 CLI: a single quoted arg containing an INTERIOR newline must NOT
+/// produce a corrupt merged rewrite — the two shell statements must never be
+/// joined into one command line.
+///
+/// Repro: `skim rewrite "$(printf 'git log -1 abc123\nprintf done')"` previously
+/// emitted `skim git log -1 abc123 printf done` (corrupt merged command, exit 0).
+/// Correct behavior: no-match passthrough (empty stdout, exit 1) — the CLI path
+/// uses ExitCode::FAILURE for "no rewrite match", consistent with the existing
+/// rewrite_would_corrupt guard in run_classify_and_emit.
+#[test]
+fn cli_rewrite_interior_newline_passes_through() {
+    // A Rust string literal with a real \n char — matches the shell repro.
+    let cmd_with_interior_newline = "git log -1 abc123\nprintf done";
+
+    let output = skim_cmd()
+        .args(["rewrite", cmd_with_interior_newline])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Must NOT emit the corrupt merged form (the regression being fixed).
+    assert!(
+        !stdout.contains("skim git log -1 abc123 printf done"),
+        "interior newline must not produce a merged rewritten command; got: {stdout:?}"
+    );
+    // Must NOT emit any skim-prefixed rewrite — the whole arg is a corruption trigger.
+    assert!(
+        !stdout.contains("skim git log"),
+        "interior newline must not rewrite the first statement in isolation; got: {stdout:?}"
+    );
+    // stdout must be empty (no-match passthrough, per existing convention).
+    assert!(
+        stdout.is_empty(),
+        "interior newline passthrough must produce empty stdout; got: {stdout:?}"
+    );
+}
+
+/// AC-C2 CLI: a single arg with ONLY a trailing newline must still rewrite.
+///
+/// Agent hooks commonly add a trailing `\n` to the command field. That trailing
+/// newline is benign — it survives trim_end in command_needs_passthrough and
+/// does not indicate a multi-statement command. The rewrite must proceed.
+#[test]
+fn cli_rewrite_trailing_newline_still_rewrites() {
+    // Trailing newline only — command_needs_passthrough trims it, so no bail.
+    // collect_input_tokens then splits on whitespace (stripping the \n), and
+    // the rule prefix=["grep","-rn"] with rewrite_to=["skim","grep","-rn"]
+    // yields the full `skim grep -rn x dir` form.
+    let cmd_with_trailing_newline = "grep -rn x dir\n";
+
+    skim_cmd()
+        .args(["rewrite", cmd_with_trailing_newline])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim grep -rn x dir"));
+}
+
+/// AC-C3 regression: normal multi-word positional args (no newline) still rewrite.
+///
+/// Proves that the new early-bail guard did not break the common path where the
+/// user passes the command as separate tokens rather than a single quoted string.
+#[test]
+fn cli_rewrite_no_newline_still_rewrites() {
+    skim_cmd()
+        .args(["rewrite", "grep", "-rn", "x", "dir"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim grep -rn x dir"));
 }

@@ -1,0 +1,8 @@
+[database] Connection pool initialized (size=10)
+[cache] Redis connected at localhost:6379
+[auth] JWT secret loaded from environment
+[api] Routes registered: GET /users, POST /users, GET /health
+[worker] Background job queue started
+[scheduler] Cron jobs configured: 5 jobs
+[api] Request received: GET /api/v1/status from 127.0.0.1
+[database] Query executed in 3ms: SELECT 1

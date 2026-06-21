@@ -12,12 +12,15 @@ User-facing install/usage lives in `README.md`; release mechanics in `CHANGELOG.
 
 ## Workspace
 
-Cargo workspace, 5 crates:
+Cargo workspace, 8 crates:
 - `rskim-core` — pure transform library (parsing, modes; no I/O side effects)
 - `rskim` — CLI binary (`skim`): caching, analytics, command wrappers
 - `rskim-search` — code-search index (lexical n-gram, temporal, AST structural), stored in `<root>/.skim/search.db`
 - `rskim-research` — offline tooling that generates AST weight tables
 - `rskim-bench` — benchmarks
+- `rskim-tokens` — offline + optional-network token counting (multi-provider; `net-anthropic` feature gates HTTP)
+- `rskim-contract` — byte-faithful contract / guardrail layer for transcript mutation
+- `rskim-llm` — LLM transcript parsing (OpenAI/Anthropic) + classifier
 
 `crates/rskim-search/src/ast_weights.rs` is **auto-generated — do not edit**. Regenerate via `rskim-research ast-run` then `ast-codegen`.
 
@@ -57,6 +60,16 @@ cargo run --bin skim -- file.ts --mode=signatures   # run locally
 
 `rskim` is bin-only (the `skim` binary; no `src/lib.rs`) — scope its tests with `cargo test -p rskim --bins` (or `--all-targets`). `cargo test -p rskim --lib` errors with "no library targets found" (a cargo target-selection behavior, not a skim bug). `rskim-core`/`rskim-search` are libraries and accept `--lib`.
 
+### Build/test resource limits
+
+A machine-global `~/.cargo/config.toml` caps every cargo invocation at `jobs = 4` and `RUST_TEST_THREADS = 4`, and routes compilation through `sccache` (a compile cache shared across parallel clones). **That config file is the enforcement layer — it protects every branch and clone regardless of this doc; the guidance below exists because the cap alone can still be multiplied by parallelism.** Running unbounded parallel builds across two clones once exhausted 64 GB RAM (heavy tree-sitter/SQLite/rustls deps + release LTO/`codegen-units=1`) and hard-restarted the machine. The root multiplier was **two clones with separate `target/` dirs compiling identical heavy deps at once**. Rules for agents and workflows:
+
+- **Scope cargo per-crate** (`-p <crate>`). Never `--workspace` or `--all-features` *inside an agent* — those fan out across all 8 crates and their heavy deps simultaneously.
+- **Never `cargo test -p rskim` in an agent**: it spawns a *nested* cargo (daemon meta-tests) on top of subprocess-spawning E2E tests. Use `cargo test -p rskim --bins` / `--all-targets` (see the scoping note above).
+- **Prefer `cargo nextest run -p <crate> -j 4`** for unit/integration tests, **plus `cargo test -p <crate> --doc`** for doctests (nextest cannot run doctests).
+- **Never run two release/LTO builds concurrently**, and never kick off a heavy build in both clones at the same time.
+- **Defer the full `--all-features` regression** to the main loop or a human, run when the machine is otherwise idle.
+
 Modes are set via `--mode` only (no config file): `structure` (default), `signatures`, `types`, `minimal`, `pseudo`, `full`.
 
 ### Subcommands
@@ -69,9 +82,15 @@ Most subcommands wrap a dev tool (cargo, git, npm, pytest, eslint, docker, psql,
 - `stats` — token analytics dashboard (`--since`, `--format json`, `--verbose`, `--clear`).
 - `discover` / `learn` / `rewrite` — scan agent sessions for missed optimizations, learn error-retry correction rules, and rewrite commands into skim equivalents.
 
-### Shell interception (PATH wrappers)
+### Two interception surfaces (they work differently — don't conflate them)
 
-`skim init --wrappers` symlinks `~/.skim/bin/<tool>` → the skim binary so sub-agent shells route through skim even when they bypass PreToolUse hooks. The binary calls `strip_skim_wrappers_from_path()` as the very first statement in `main()` (before any thread spawns), so wrapped commands resolve to the real tool — this is what prevents infinite recursion. `SKIM_PASSTHROUGH=1` is the escape hatch. Wrapper install/uninstall only ever touches symlinks whose target stem is `skim`/`rskim` — never regular files.
+skim intercepts a sub-agent's shell command through **two independent mechanisms**, and only one of them rewrites anything. Confusing them produces false coverage claims (e.g. "flag preservation verified on both surfaces" — it can't be; see below).
+
+1. **Rewrite engine** — the PreToolUse hook and the `skim rewrite` CLI. Operates on the command *as text, before it runs*: `cmd/rewrite/` `try_rewrite()` transforms the string `grep -rn x` → `skim grep -rn x`. This is the **only** surface where flag preservation (Fix A — don't drop `-rn` during the rewrite), corruption-bail (Fix C), and pipe-source passthrough (Fix E) exist — they are properties of the *text transformation*.
+
+2. **PATH wrappers** — `skim init --wrappers` symlinks `~/.skim/bin/<tool>` → the skim binary (with `~/.skim/bin` first on `PATH`) so sub-agent shells route through skim even when they bypass PreToolUse hooks. Here skim *is* the tool: the OS runs the binary with `argv[0]=<tool>`, `main()` calls `strip_skim_wrappers_from_path()` as its very first statement (before any thread spawns, so the real tool is found and recursion is impossible), then `detect_argv0_dispatch()` routes straight to `cmd::dispatch(tool, args)` — **`try_rewrite` is never called**. Flags arrive as ordinary argv and pass to the handler unchanged; there is no rewrite step to "preserve" them through. `SKIM_PASSTHROUGH=1` is the escape hatch. Wrapper install/uninstall only ever touches symlinks whose target stem is `skim`/`rskim` — never regular files.
+
+**Testing / verification implication:** the two surfaces share the per-tool *handlers* (output compression) but NOT the dispatch front-end. A test that drives the `--hook`/`rewrite` path does **not** exercise the wrapper path, and vice-versa. When verifying behavior — and when confirming Snyk/CI actually cover a change — identify *which* surface a test hits and cover both where the behavior could diverge. Rewrite-engine guarantees (flag preservation, corruption-bail, pipe passthrough) simply do not apply to the wrapper surface.
 
 ## Environment Variables
 

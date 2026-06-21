@@ -1,0 +1,34 @@
+[package]
+name = "rskim-llm"
+version = "0.1.0"
+edition = "2024"
+authors = ["Skim Contributors"]
+license = "MIT"
+description = "LLM message model: parse/serialize Anthropic & OpenAI request bodies with content-block classification"
+repository = "https://github.com/dean0x/skim"
+# publish = false initially, matching rskim-search / rskim-tokens precedent.
+# Wave-1 crate — in-workspace only. External publish tracked in #309.
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+
+[lib]
+name = "rskim_llm"
+path = "src/lib.rs"
+
+[[bench]]
+name = "parse_bench"
+harness = false

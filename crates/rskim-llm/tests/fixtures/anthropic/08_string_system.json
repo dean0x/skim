@@ -1,0 +1,1 @@
+{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Please review this code: def foo(): return 42"}],"system":"You are a code review assistant. Review code carefully and provide constructive feedback.","max_tokens":1024}

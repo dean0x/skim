@@ -1,0 +1,8 @@
+2024-01-15T10:30:00Z INFO running 14 tests
+2024-01-15T10:30:00Z INFO test classify::tests::pure_fenced_code_rust ... ok
+2024-01-15T10:30:00Z INFO test classify::tests::json_object ... ok
+2024-01-15T10:30:01Z INFO test classify::tests::plain_text ... ok
+2024-01-15T10:30:01Z INFO test classify::tests::log_lines_iso_timestamp ... ok
+2024-01-15T10:30:01Z INFO test classify::tests::mixed_prose_with_code ... ok
+2024-01-15T10:30:01Z INFO test result: ok. 14 passed; 0 failed
+2024-01-15T10:30:01Z INFO Finished `test` profile in 1.23s
