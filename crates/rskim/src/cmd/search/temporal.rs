@@ -133,6 +133,24 @@ pub(super) fn open_temporal_db(db_path: &Path) -> Option<TemporalDb> {
 }
 
 // ============================================================================
+// Bounded re-sort window
+// ============================================================================
+
+/// Compute the bounded candidate window for a temporal re-sort.
+///
+/// `limit * 5`, clamped to at least 100, mirroring the original inline bound in
+/// `query_standalone`.  Callers fetch this many candidates (in raw ranked order)
+/// before enriching + re-sorting by temporal score, then truncate to `limit`.
+/// This keeps per-file DB lookups bounded (`O(window)`, not `O(all matches)` —
+/// AC-P1) while ensuring a temporally-hot file that ranks beyond `limit` in raw
+/// order can still surface after the re-sort (AC-F4).
+///
+/// `saturating_mul` guards a hostile `--limit` near `usize::MAX` from overflowing.
+pub(super) fn resort_window(limit: usize) -> usize {
+    limit.saturating_mul(5).max(100)
+}
+
+// ============================================================================
 // Blast-radius → FileId resolution (shared helper)
 // ============================================================================
 
@@ -424,8 +442,7 @@ pub(super) fn query_standalone(
             // The cochange query already returns results sorted by Jaccard DESC,
             // so the highest co-change partners are at the front. Window is
             // limit*5 clamped to at least 100 so small limits don't over-prune.
-            let resort_window = (limit.saturating_mul(5)).max(100);
-            partners.truncate(resort_window);
+            partners.truncate(resort_window(limit));
             resort_partners_by_temporal(&mut partners, sort_mode, &normalized, db)?;
         }
 
@@ -817,6 +834,109 @@ fn annotate_risks(results: &mut [ResolvedResult], db: &TemporalDb) {
         match db.risk_for_file(&result.path) {
             Ok(Some(row)) => {
                 result.temporal = Some(TemporalAnnotation {
+                    risk_score: Some(row.risk_score),
+                    fix_density: Some(row.fix_density),
+                    ..Default::default()
+                });
+            }
+            Ok(None) => {} // File not in temporal DB — leave unannotated.
+            Err(e) => {
+                eprintln!("skim search: temporal enrichment warning: {e}");
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Standalone-AST temporal enrichment (full-CLI integration)
+// ============================================================================
+
+/// Annotate and re-sort standalone `--ast` results with temporal data.
+///
+/// The AST analogue of [`apply_temporal_enrichment`]: it applies the **identical**
+/// ordering contract — absent files sort last (score sentinel `-1.0`) and equal
+/// temporal scores tie-break by `path.cmp` — so the two query paths expose one
+/// observable sort behaviour (design decision 4 / AC-A2).
+///
+/// It operates on [`rskim_search::AstResult`] and writes the library-side
+/// [`rskim_search::TemporalAnnotation`].  The small mirror (rather than a shared
+/// generic) is deliberate: the two row types carry different annotation structs,
+/// and a trait abstraction would add more indirection than the duplication saves.
+///
+/// Callers MUST pre-truncate `results` to the bounded re-sort window
+/// ([`resort_window`]) before calling so per-file DB lookups stay bounded (AC-P1).
+pub(super) fn enrich_ast_results(
+    results: &mut [rskim_search::AstResult],
+    sort: TemporalSort,
+    db: &TemporalDb,
+) {
+    match sort {
+        TemporalSort::Hot | TemporalSort::Cold => {
+            annotate_ast_hotspots(results, db);
+            let hotspot_score = |r: &rskim_search::AstResult| {
+                r.temporal
+                    .as_ref()
+                    .and_then(|t| t.hotspot_score)
+                    .unwrap_or(-1.0)
+            };
+            results.sort_by(|a, b| {
+                let cmp = hotspot_score(a)
+                    .partial_cmp(&hotspot_score(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.path.cmp(&b.path));
+                if sort == TemporalSort::Hot {
+                    cmp.reverse()
+                } else {
+                    cmp
+                }
+            });
+        }
+        TemporalSort::Risky => {
+            annotate_ast_risks(results, db);
+            let risk_score = |r: &rskim_search::AstResult| {
+                r.temporal
+                    .as_ref()
+                    .and_then(|t| t.risk_score)
+                    .unwrap_or(-1.0)
+            };
+            results.sort_by(|a, b| {
+                risk_score(b)
+                    .partial_cmp(&risk_score(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.path.cmp(&b.path))
+            });
+        }
+    }
+}
+
+/// Annotate `AstResult`s with hotspot data via per-file lookups (one DB query
+/// per result). On lookup failure, emits a warning and leaves the row unannotated.
+fn annotate_ast_hotspots(results: &mut [rskim_search::AstResult], db: &TemporalDb) {
+    for result in results.iter_mut() {
+        match db.hotspot_for_file(&result.path) {
+            Ok(Some(row)) => {
+                result.temporal = Some(rskim_search::TemporalAnnotation {
+                    hotspot_score: Some(row.score),
+                    changes_30d: Some(row.changes_30d),
+                    changes_90d: Some(row.changes_90d),
+                    ..Default::default()
+                });
+            }
+            Ok(None) => {} // File not in temporal DB — leave unannotated.
+            Err(e) => {
+                eprintln!("skim search: temporal enrichment warning: {e}");
+            }
+        }
+    }
+}
+
+/// Annotate `AstResult`s with risk data via per-file lookups (one DB query per
+/// result). On lookup failure, emits a warning and leaves the row unannotated.
+fn annotate_ast_risks(results: &mut [rskim_search::AstResult], db: &TemporalDb) {
+    for result in results.iter_mut() {
+        match db.risk_for_file(&result.path) {
+            Ok(Some(row)) => {
+                result.temporal = Some(rskim_search::TemporalAnnotation {
                     risk_score: Some(row.risk_score),
                     fix_density: Some(row.fix_density),
                     ..Default::default()

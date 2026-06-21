@@ -68,24 +68,15 @@ pub(crate) fn run(
     let flags = parse_flags(args)?;
 
     // ── Validation order (deterministic — tests rely on this ordering) ──────
-    // 1. --ast + temporal flags (--hot/--cold/--risky/--blast-radius) → #202 error.
-    //    (--blast-radius is a co-change filter and IS composable with --ast per the
-    //     plan, but the plan also says --ast + temporal_sort → #202.  --blast-radius
-    //     alone is handled in run_query via FileId intersection — not an error.)
-    // 2. single-node pattern → #283 error.
-    // 3. unknown pattern → lists available names.
-    // Dispatch happens after validation passes.
+    // --ast patterns are validated BEFORE dispatch so the error fires regardless
+    // of which downstream path the flags resolve to:
+    //   1. single-node pattern → #283 error.
+    //   2. unknown pattern → lists available names.
+    // --ast now composes freely with temporal flags (--hot/--cold/--risky/
+    // --blast-radius), a text query, --limit, and --json — there is NO flag
+    // combination that errors here (mutual exclusion of sort modes is still
+    // enforced earlier, in parse_flags).
     if let Some(ref raw_ast) = flags.ast {
-        // Validation #1: --ast + temporal sort is not yet supported (#202).
-        if let Some(sort) = flags.temporal_sort {
-            anyhow::bail!(
-                "--ast and {} are not yet composable (tracked in #202).\n\
-                 Use --ast alone or use {} without --ast.",
-                sort.flag_name(),
-                sort.flag_name()
-            );
-        }
-        // Validations #2 and #3: single-node (#283) + unknown pattern.
         ast::validate_ast_pattern(raw_ast)?;
     }
     // ────────────────────────────────────────────────────────────────────────
@@ -98,23 +89,25 @@ pub(crate) fn run(
         SearchAction::InstallHooks => run_install_hooks(&flags.root_override),
         SearchAction::RemoveHooks => run_remove_hooks(&flags.root_override),
         SearchAction::Query(ref text) if !text.is_empty() => run_query(text, &flags, analytics),
-        // Empty query + --ast (with or without --blast-radius) → standalone AST dispatch.
+        // Empty query + --ast → standalone AST dispatch.  This arm now also handles
+        // --ast combined with a temporal sort (--hot/--cold/--risky) and/or
+        // --blast-radius (the interim guard that blocked the combination was removed):
         //
-        // When --blast-radius is also set, temporal::resolve_blast_radius_file_ids
-        // resolves co-change peers via the temporal DB, converts them to FileIds, and
-        // run_ast_standalone intersects with the AST result set BEFORE applying --limit
-        // (avoids PF-006 silent feature-drop).
+        // - --blast-radius: temporal::resolve_blast_radius_file_ids resolves co-change
+        //   peers to FileIds; run_ast_standalone intersects them with the AST result
+        //   set BEFORE truncation (avoids PF-006 silent feature-drop).
+        // - --hot/--cold/--risky: the opened temporal DB is threaded in; run_ast_standalone
+        //   enriches + re-sorts the AST matches by temporal score, then truncates to --limit.
         //
-        // --ast + temporal sort (--hot/--cold/--risky) is still rejected above (#202).
-        SearchAction::Query(_)
-            if let Some(ref raw) = flags.ast
-                && flags.temporal_sort.is_none() =>
-        {
+        // Ordered BEFORE the temporal-only arm so `--ast --hot` lands here (the AST
+        // filter is honoured), never silently in run_temporal_standalone (R1/GAP-6).
+        SearchAction::Query(_) if let Some(ref raw) = flags.ast => {
             let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
             std::fs::create_dir_all(&cache_dir)?;
-            // Ensure both indexes are fresh before querying.
+            // ADR-006: refresh BOTH indexes before opening either engine.
             let (_refreshed, manifest) =
                 staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+            let temporal_db_path = cache_dir.join("temporal.db");
             // Resolve blast-radius → FileIds BEFORE calling run_ast_standalone.
             // temporal::resolve_blast_radius_file_ids is the single resolver for all
             // three blast-radius call sites, so JSON-aware warning and PF-004 widening
@@ -123,14 +116,25 @@ pub(crate) fn run(
             let blast_file_ids = temporal::resolve_blast_radius_file_ids(
                 flags.blast_radius.as_deref(),
                 &root,
-                &cache_dir.join("temporal.db"),
+                &temporal_db_path,
                 &sorted,
                 flags.json,
             )?;
-            // Note: validate_ast_pattern was already called above (line ~87) as part
-            // of the pre-dispatch validation order. run_ast_standalone re-validates
-            // internally so it is independently callable without a prior validate call
-            // (defensive re-validation is intentional — it is cheap and idempotent).
+            // Open the temporal DB only when a sort is requested.  Absent DB →
+            // graceful degradation: warn on stderr and run unsorted (exit 0, AC-A3),
+            // mirroring run_temporal_standalone's missing-data message.
+            let temporal_db = if flags.temporal_sort.is_some() {
+                let db = temporal::open_temporal_db(&temporal_db_path);
+                if db.is_none() {
+                    eprintln!(
+                        "skim search: no temporal data — run 'skim search' on a git repo \
+                         to auto-populate; returning unsorted --ast results"
+                    );
+                }
+                db
+            } else {
+                None
+            };
             let mut stdout = BufWriter::new(std::io::stdout());
             let result = ast::run_ast_standalone(
                 raw,
@@ -139,6 +143,8 @@ pub(crate) fn run(
                 &cache_dir,
                 &manifest,
                 blast_file_ids,
+                flags.temporal_sort,
+                temporal_db.as_ref(),
                 &root,
                 &mut stdout,
             );
@@ -644,9 +650,19 @@ fn run_query(
         (None, None)
     };
 
+    // GAP-1: when a temporal sort is active, fetch a bounded candidate
+    // window (limit*5 ≥ 100) so the re-sort can promote a temporally-hot file that
+    // ranks beyond `--limit` in raw lexical/composite order; truncate to --limit
+    // AFTER the sort (below). Without a sort, query exactly --limit (unchanged).
+    let query_limit = if flags.temporal_sort.is_some() {
+        temporal::resort_window(flags.limit)
+    } else {
+        flags.limit
+    };
+
     let config = types::QueryConfig {
         text: text.to_string(),
-        limit: flags.limit,
+        limit: query_limit,
         json: flags.json,
         root,
         cache_dir,
@@ -661,9 +677,14 @@ fn run_query(
     // exactly once.
     let mut output = query::execute_query_with_manifest(&config, pre_loaded_manifest, analytics)?;
 
-    // Apply temporal sort/annotation to the results.
+    // Apply temporal sort/annotation to the results, then truncate to --limit.
+    // Truncating AFTER the re-sort (not via the engine's LIMIT) is the GAP-1
+    // invariant: the top-`limit` BY TEMPORAL SCORE survive, not the top-`limit`
+    // by lexical relevance re-ordered.
     if let (Some(sort), Some(db)) = (flags.temporal_sort, &temporal_db) {
         temporal::apply_temporal_enrichment(&mut output.results, sort, db)?;
+        output.results.truncate(flags.limit);
+        output.total = output.results.len();
     }
 
     let mut stdout = BufWriter::new(std::io::stdout());
@@ -769,13 +790,20 @@ AST structural query options (#199):
   Limitations:
     #283 — Single-node queries (e.g. --ast try_statement) are not yet supported;
            use a named pattern or a containment query instead.
-    #202 — --ast combined with --hot / --cold / --risky is not yet supported.
+
+  --ast composes with every temporal flag (--hot / --cold / --risky /
+  --blast-radius), a text query, --limit, and --json.  When heatmap data is
+  absent, temporal sorts degrade gracefully: a warning is printed to stderr and
+  results are returned unsorted (exit 0).
 
 AST standalone examples:
   skim search --ast try-catch                   Files with try/catch blocks
   skim search --ast \"for_statement > await_expression\"  Async-in-loop pattern
   skim search \"error\" --ast try-catch           Text+AST intersection (lexical snippets preserved)
   skim search --ast try-catch --blast-radius src/auth.rs  AST ∩ co-change
+  skim search --ast god-function --hot           AST matches sorted by hotspot score
+  skim search \"error\" --ast try-catch --hot --blast-radius src/auth.rs --limit 20 --json
+                                                 Full CLI surface: text + AST + temporal + co-change + JSON
 
 Temporal query options (auto-populated by 'skim search' on a git repo):
   --hot                        Sort/list by hotspot score descending
