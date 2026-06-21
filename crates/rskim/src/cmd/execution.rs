@@ -29,9 +29,9 @@ use crate::runner::{CommandOutput, CommandRunner};
 /// path (`process.rs`) and `git/show.rs`.  This enum applies token-based savings
 /// to the *command-handler* sinks that guardrail.rs does not cover (execution,
 /// git, build, test, log).  There is no double-guard conflict: if guardrail.rs
-/// already emitted raw, `savings_decision` sees raw == compressed and returns
-/// `Keep` (equal bytes → byte fallback says keep; token fallback says equal →
-/// `Passthrough`, then the raw is the same as compressed so either is correct).
+/// already emitted raw, `savings_decision` sees raw == compressed and the tie rule
+/// returns `Passthrough` — but since raw == compressed at that point, emitting raw
+/// is identical to emitting compressed, so the outcome is the same either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub(crate) enum SavingsDecision {
@@ -44,17 +44,25 @@ pub(crate) enum SavingsDecision {
 
 /// Decide whether to emit `compressed` or fall back to `raw`.
 ///
-/// **Conservative rule:** keep compressed iff `compressed_tokens < raw_tokens`
-/// (strictly smaller).  Tie or larger → `Passthrough`.
+/// **Conservative rule:** keep compressed IFF `compressed_tokens < raw_tokens`
+/// (strictly less).  Tie (equal) or larger → `Passthrough`.
+/// This is the verbatim user decision: *"conservative — keep compressed ONLY IF
+/// strictly smaller than raw, measured in tokens, always."*
+/// Boundary: saving exactly 0 tokens → Passthrough; saving 1 token → Keep.
 ///
 /// **Tokenizer-unavailable fallback:** if `count_token_pair` returns `(None, None)`
 /// (counter init failed), fall back to a **byte** comparison:
-/// keep iff `compressed.len() < raw.len()`.  Never panics, never expands.
+/// keep iff `compressed.len() < raw.len()` (strictly less).
+/// Never panics, never expands.
 ///
 /// **Comparison normalization:** trailing whitespace is trimmed from both sides
 /// before comparison so a single trailing newline does not flip the decision
 /// arbitrarily (e.g. `println!` always appends `\n`; the raw command may or may
-/// not end with `\n`).  This keeps ties stable.
+/// not end with `\n`).  This keeps boundary cases stable.
+///
+/// **Empty-raw behaviour:** if raw is empty/whitespace-only, compressed output is
+/// NOT strictly smaller (0 < 0 fails) → Passthrough (emit raw, i.e. nothing).
+/// A silent command stays silent, matching the raw tool exactly.
 ///
 /// **JSON exempt:** callers are responsible for not calling this function when
 /// `output_format == OutputFormat::Json`.  JSON responses must never be rewritten
@@ -82,58 +90,55 @@ pub(crate) fn savings_decision(raw: &str, compressed: &str) -> SavingsDecision {
     let raw_t = raw.trim();
     let comp_t = compressed.trim();
 
-    // Special case: empty raw output.
+    // Conservative rule: keep compressed IFF strictly smaller than raw.
     //
-    // When the underlying command produced no output at all (e.g. a silent
-    // `make` recipe that exits 0 with no stdout/stderr), emitting a compressed
-    // summary like "OK warnings: 0 errors: 0" is strictly more output than
-    // the raw tool, so the standard token/byte comparison would fire
-    // `Passthrough` and emit nothing — suppressing the only signal the user
-    // gets that the build succeeded.
+    // Tie (equal tokens/bytes) or larger → Passthrough.  This is intentionally
+    // conservative: the guard only ever moves output toward more-complete raw, so
+    // it cannot show LESS than the raw tool.  A tie means no savings; the raw form
+    // is equally complete and always safe to emit.
     //
-    // Decision: Keep when raw is empty/whitespace-only.  The user already sees
-    // nothing from the raw tool; any compressed output adds information rather
-    // than expanding noise.  This is consistent with the "never expand" spirit
-    // (no information is lost; the result is strictly more useful than silence).
-    if raw_t.is_empty() {
-        return SavingsDecision::Keep;
-    }
+    // Empty-raw case: if raw is empty/whitespace-only, comp_t.len() > 0 means
+    // compressed is NOT strictly smaller (0 < n fails "comp < raw").  The uniform
+    // rule therefore emits raw (nothing) — which is the faithful "never expand"
+    // behaviour: a silent command stays silent, matching the raw tool exactly.
+    //
+    // Oversized inputs (> 64 MiB): tokenization is skipped for performance;
+    // byte comparison is used instead — consistent with the "never expand" promise.
 
-    // Fast path: byte comparison avoids tokenization for strictly larger or oversized inputs.
-    // Oversized inputs (> 64 MiB) skip tokenization for performance and fall back to bytes.
-    //
-    // Decision threshold: compressed must be strictly LONGER (> raw) to trigger Passthrough.
-    // Ties (equal trimmed-byte length) are kept — in practice equal-length cases represent
-    // semantic equivalence (e.g., `[]` → `OK`, 2 bytes each) where the compressed form is
-    // at least as informative as the raw form.  Expanding by ≥1 byte after trimming is the
-    // meaningful "expansion" we guard against.
-    if comp_t.len() > raw_t.len() || raw.len() > TOKEN_SIZE_CAP || compressed.len() > TOKEN_SIZE_CAP
-    {
-        // When we arrive here via the size-cap guard, bytes are the comparison.
-        // When we arrive via the strict-expansion guard, bytes already said "compressed longer".
-        return if comp_t.len() <= raw_t.len() {
-            // Above the cap but bytes say NOT longer — keep.
+    // Fast path: if compressed is already strictly shorter by bytes, check with tokens.
+    // If compressed is >= raw by bytes, decide immediately (Passthrough on tie/larger).
+    if raw.len() > TOKEN_SIZE_CAP || compressed.len() > TOKEN_SIZE_CAP {
+        // Above cap: byte comparison only (no tokenisation).
+        return if comp_t.len() < raw_t.len() {
             SavingsDecision::Keep
         } else {
+            // Tie or larger — Passthrough.
             SavingsDecision::Passthrough
         };
     }
 
-    // comp_t.len() <= raw_t.len() here.  If strictly shorter, confirm with tokens.
-    // If equal (tie), token comparison on the TRIMMED strings decides — tied tokens → Keep.
-    // We tokenize the trimmed versions so trailing whitespace (e.g., a `println!` newline)
-    // does not inflate the compressed token count and flip a byte-tie to Passthrough.
+    // Below cap: use tokens for the final decision, bytes for early exit.
+    if comp_t.len() >= raw_t.len() {
+        // Bytes say compressed is not shorter (tie or larger) — Passthrough immediately.
+        // This covers the empty-raw case: raw_t.is_empty() means raw_t.len() == 0,
+        // so comp_t.len() >= 0 is always true → Passthrough (emit raw, i.e. nothing).
+        return SavingsDecision::Passthrough;
+    }
+
+    // comp_t.len() < raw_t.len() here — bytes say compressed is strictly shorter.
+    // Confirm with token counts; if the tokenizer says compressed uses MORE tokens
+    // than raw (byte-compression but token-expansion), passthrough.
     match crate::process::count_token_pair(raw_t, comp_t) {
         (Some(raw_tok), Some(comp_tok)) => {
-            if comp_tok <= raw_tok {
-                // Token tie or savings — keep compressed.
+            if comp_tok < raw_tok {
+                // Strictly fewer tokens — keep compressed.
                 SavingsDecision::Keep
             } else {
-                // Tokens say compressed is longer even though bytes were shorter or equal.
+                // Token tie or token-expansion even though bytes were shorter → Passthrough.
                 SavingsDecision::Passthrough
             }
         }
-        // Tokenizer unavailable: byte comparison says comp_t.len() <= raw_t.len() → Keep.
+        // Tokenizer unavailable: byte comparison says comp_t.len() < raw_t.len() → Keep.
         _ => SavingsDecision::Keep,
     }
 }
@@ -1081,38 +1086,45 @@ mod tests {
 
     // ========================================================================
     // savings_decision tests (Cluster C / #317)
+    // Conservative rule: Keep IFF compressed strictly smaller; tie → Passthrough.
     // ========================================================================
 
-    /// Empty raw with empty compressed — both empty → Keep (nothing to expand from).
-    #[test]
-    fn savings_decision_empty_raw_empty_compressed_keep() {
-        // raw is empty → Keep regardless (empty-raw special case).
-        assert_eq!(savings_decision("", ""), SavingsDecision::Keep);
-    }
+    // -- Boundary tests: exactly 0 tokens saved → Passthrough; 1 token → Keep --
 
-    /// Empty raw with non-empty compressed: the parser produced a summary.
-    /// Should Keep because raw was empty — this is informational, not expansion.
+    /// Empty raw, empty compressed: tie (0 == 0) → Passthrough.
+    /// A silent command stays silent; emitting nothing matches the raw tool.
     #[test]
-    fn savings_decision_empty_raw_non_empty_compressed_keep() {
+    fn savings_decision_empty_raw_empty_compressed_passthrough() {
         assert_eq!(
-            savings_decision("", "OK warnings: 0 errors: 0\n"),
-            SavingsDecision::Keep,
-            "empty raw: keep parser-produced summary (better than silence)"
+            savings_decision("", ""),
+            SavingsDecision::Passthrough,
+            "empty tie → Passthrough (conservative: strictly-smaller-to-keep)"
         );
     }
 
-    /// Raw and compressed identical — semantic tie → Keep (tie policy).
+    /// Empty raw, non-empty compressed: compressed is NOT strictly smaller (0 < n fails) →
+    /// Passthrough.  The conservative rule means a silent command stays silent.
     #[test]
-    fn savings_decision_identical_input_keep() {
+    fn savings_decision_empty_raw_non_empty_compressed_passthrough() {
+        assert_eq!(
+            savings_decision("", "OK warnings: 0 errors: 0\n"),
+            SavingsDecision::Passthrough,
+            "non-empty compressed vs empty raw: compressed is not strictly smaller → Passthrough"
+        );
+    }
+
+    /// Exactly 0 tokens saved (identical strings) — tie → Passthrough.
+    #[test]
+    fn savings_decision_identical_input_passthrough() {
         let text = "hello world\n";
         assert_eq!(
             savings_decision(text, text),
-            SavingsDecision::Keep,
-            "tie (identical strings) must Keep — compressed is not longer"
+            SavingsDecision::Passthrough,
+            "tie (identical strings) → Passthrough (strictly-smaller rule)"
         );
     }
 
-    /// Compressed is strictly shorter by bytes → Keep.
+    /// Compressed strictly shorter by bytes → Keep.
     #[test]
     fn savings_decision_shorter_compressed_keep() {
         let raw = "a".repeat(100);
@@ -1133,15 +1145,16 @@ mod tests {
 
     /// Trailing-newline normalisation: `println!` appends `\n` to the compressed
     /// string; the raw command may not end with `\n`.  After trimming both sides
-    /// the trimmed lengths are equal → Keep (tie policy: keep on equal-length).
+    /// the trimmed lengths are EQUAL — a tie — so the conservative rule gives
+    /// Passthrough (tie is not strictly smaller).
     #[test]
-    fn savings_decision_trailing_newline_tie_keep() {
+    fn savings_decision_trailing_newline_tie_passthrough() {
         let raw = "same content"; // no trailing newline
         let compressed = "same content\n"; // println! adds newline
         assert_eq!(
             savings_decision(raw, compressed),
-            SavingsDecision::Keep,
-            "trailing newline must not flip a tie to Passthrough (tie policy: Keep)"
+            SavingsDecision::Passthrough,
+            "trailing-newline tie: trimmed lengths equal → Passthrough (strictly-smaller rule)"
         );
     }
 
@@ -1164,8 +1177,20 @@ mod tests {
         );
     }
 
+    /// Boundary: compressed is exactly raw minus 1 byte (strictly shorter) → Keep.
+    #[test]
+    fn savings_decision_one_byte_saving_keep() {
+        let raw = "helloX"; // 6 bytes
+        let compressed = "hello"; // 5 bytes — 1 byte strictly smaller
+        assert_eq!(
+            savings_decision(raw, compressed),
+            SavingsDecision::Keep,
+            "saving exactly 1 byte → Keep"
+        );
+    }
+
     /// Large input above TOKEN_SIZE_CAP (64 MiB): falls back to byte comparison.
-    /// Compressed shorter → Keep.
+    /// Compressed strictly shorter → Keep.
     #[test]
     fn savings_decision_above_cap_bytes_keep() {
         let raw = "x".repeat(65 * 1024 * 1024); // 65 MiB
@@ -1184,28 +1209,36 @@ mod tests {
         );
     }
 
-    /// Large input above TOKEN_SIZE_CAP: same-size → Keep (tie policy applies above cap too).
+    /// Large input above TOKEN_SIZE_CAP: same-size → Passthrough (tie rule applies above cap too).
     #[test]
-    fn savings_decision_above_cap_bytes_tie_keep() {
+    fn savings_decision_above_cap_bytes_tie_passthrough() {
         let raw = "x".repeat(65 * 1024 * 1024); // 65 MiB
-        let compressed = "y".repeat(65 * 1024 * 1024); // same size
-        assert_eq!(savings_decision(&raw, &compressed), SavingsDecision::Keep);
+        let compressed = "y".repeat(65 * 1024 * 1024); // same size — tie
+        assert_eq!(
+            savings_decision(&raw, &compressed),
+            SavingsDecision::Passthrough,
+            "above-cap tie → Passthrough (strictly-smaller rule)"
+        );
     }
 
     /// Verify the must_use attribute fires (compile-time; checked via doc).
-    /// Property: savings_decision never returns a value that emits more than raw.
-    /// (Runtime property; cannot be verified exhaustively, but spot-check here.)
+    /// Property: savings_decision never returns Keep when compressed is not strictly
+    /// smaller than raw (by trimmed bytes, as the byte gate fires first).
     #[test]
-    fn savings_decision_keep_always_means_compressed_shorter_bytes() {
-        // Fuzz-style: for all (raw, compressed) pairs where Keep is returned,
-        // compressed.trim_end().len() < raw.trim_end().len() must hold.
-        let cases = vec![("abcdef", "ab"), ("line1\nline2\nline3\n", "summary\n")];
+    fn savings_decision_keep_always_means_compressed_strictly_shorter_bytes() {
+        // For all (raw, compressed) pairs where Keep is returned,
+        // compressed.trim().len() MUST be < raw.trim().len().
+        let cases = vec![
+            ("abcdef", "ab"),
+            ("line1\nline2\nline3\n", "summary\n"),
+            ("long raw content here", "short"),
+        ];
         for (raw, compressed) in cases {
             let decision = savings_decision(raw, compressed);
             if decision == SavingsDecision::Keep {
                 assert!(
-                    compressed.trim_end().len() < raw.trim_end().len(),
-                    "Keep returned but compressed is not shorter: raw={raw:?} comp={compressed:?}"
+                    compressed.trim().len() < raw.trim().len(),
+                    "Keep returned but compressed is not strictly shorter: raw={raw:?} comp={compressed:?}"
                 );
             }
         }
