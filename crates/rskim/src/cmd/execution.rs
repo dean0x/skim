@@ -833,4 +833,45 @@ mod tests {
             "exit 0 is success — no hint"
         );
     }
+
+    /// Lint and pkg tools at exit 1 are NOT in BENIGN_EXIT1_PROGRAMS, so the
+    /// hint MUST fire when they produce a compressed (Full/Degraded) body.
+    ///
+    /// This complements the grep/rg/diff benign-suppression tests: those assert
+    /// the hint is suppressed; these assert it is NOT suppressed for families
+    /// where exit 1 means "lint violations found" or "package op failed" — a
+    /// real problem, not a normal informational result.
+    ///
+    /// Discriminates against a future regression that blanket-suppresses exit-1
+    /// for ALL programs regardless of BENIGN_EXIT1_PROGRAMS membership.
+    #[test]
+    fn test_lint_exit1_is_not_suppressed() {
+        // eslint exit 1 = lint violations found — not benign; hint must fire.
+        assert!(
+            !BENIGN_EXIT1_PROGRAMS.contains(&"eslint"),
+            "eslint must NOT be in BENIGN_EXIT1_PROGRAMS"
+        );
+        assert!(
+            should_emit_compressed_hint("eslint", 1, "full"),
+            "eslint exit 1 is lint violations — hint must fire (not suppressed)"
+        );
+        assert!(
+            should_emit_compressed_hint("eslint", 1, "degraded"),
+            "eslint exit 1 hint must fire at the degraded tier too"
+        );
+    }
+
+    /// pkg tool (cargo subcommand) at exit 1 — hint fires.
+    #[test]
+    fn test_pkg_exit1_is_not_suppressed() {
+        // npm exit 1 = package operation error — not a benign "no result".
+        assert!(
+            !BENIGN_EXIT1_PROGRAMS.contains(&"npm"),
+            "npm must NOT be in BENIGN_EXIT1_PROGRAMS"
+        );
+        assert!(
+            should_emit_compressed_hint("npm", 1, "full"),
+            "npm exit 1 is a real error — hint must fire"
+        );
+    }
 }

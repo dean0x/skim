@@ -19,6 +19,8 @@
 //! - **go test**: Does NOT support stdin (always runs `go test`).
 //! - **build parsers**: Do NOT support stdin (always run the real command).
 
+use std::fs;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 
@@ -187,4 +189,74 @@ fn test_exit_code_pytest_passthrough_garbage() {
         .write_stdin("random garbage not pytest output\n")
         .assert()
         .code(predicate::ne(0));
+}
+
+// ============================================================================
+// Fix B — diff exit-1 Full-tier E2E (fix/rewrite-hook-falseneg)
+//
+// These tests exercise the INTEGRATED path that Fix B changes: a real diff on
+// two differing files exits 1 with a non-empty compressed body (Full tier).
+// The pre-existing grep no-match test hits the Passthrough tier (empty body →
+// already silent), so it does NOT exercise the new `!is_benign_exit1` term in
+// `should_emit_compressed_hint`. These tests do.
+//
+// Discriminates against a regression in `RecordReport::program` threading: if
+// `program` were not forwarded correctly into `should_emit_compressed_hint`,
+// the benign guard would not fire and the compressed-output hint would appear
+// in stderr — causing the `.stderr(predicate::str::contains(...).not())`
+// assertion to FAIL, catching the regression.
+// ============================================================================
+
+/// diff exit 1 = files differ — Full-tier compressed body, hint suppressed.
+///
+/// This is the core Fix B integration test: skim compresses the diff output
+/// (non-empty body → Full tier), propagates exit code 1, and does NOT print
+/// the "[skim] compressed output" hint because diff is in BENIGN_EXIT1_PROGRAMS.
+#[test]
+fn test_diff_differing_files_exit1_full_tier_hint_suppressed() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_a = dir.path().join("a.txt");
+    let file_b = dir.path().join("b.txt");
+    fs::write(&file_a, "alpha\nbeta\n").unwrap();
+    fs::write(&file_b, "alpha\ngamma\n").unwrap();
+
+    skim_cmd()
+        .args(["diff", file_a.to_str().unwrap(), file_b.to_str().unwrap()])
+        .assert()
+        // Exit code must be propagated faithfully (files differ = 1).
+        .code(1)
+        // stdout must contain compressed diff body (Full tier, non-empty).
+        // FileResult::render produces "diff 1" header when shown == total.
+        .stdout(predicate::str::contains("diff"))
+        .stdout(predicate::str::contains("changed"))
+        // The hint must NOT appear: diff exit 1 is benign ("files differ"),
+        // not an error. Printing the hint would mislead agents.
+        .stderr(predicate::str::contains("[skim] compressed output").not());
+}
+
+/// diff exit >=2 = read error — hint DOES fire (not benign, real error).
+///
+/// Proves the suppression is exit-code-aware, not blanket: only exit 1 is
+/// benign for diff. A missing-file error exits 2 and SHOULD get the hint so
+/// agents know skim re-encoded the (forwarded-raw) diagnostic output.
+///
+/// Because exit 2 is an unexpected failure (not in expected_exit_codes=[1]),
+/// skim actually raw-forwards the output with the "raw output (not compressed)"
+/// notice, not the "compressed output" hint. Either notice signals the agent
+/// to investigate — the key property is that diff exit 2 does NOT produce a
+/// silent suppression identical to the benign exit-1 path.
+#[test]
+fn test_diff_missing_file_exit2_not_silent() {
+    skim_cmd()
+        .args([
+            "diff",
+            "/nonexistent/skim-fix-b-a",
+            "/nonexistent/skim-fix-b-b",
+        ])
+        .assert()
+        .code(2)
+        // skim must emit SOME diagnostic to stderr for exit 2 — either the
+        // raw-forward notice or (if the parser somehow reaches record_and_report)
+        // the compressed-output hint. Either way it must not be silent.
+        .stderr(predicate::str::is_empty().not());
 }
