@@ -7,17 +7,16 @@
 //! v2.8.0: Flat dispatch — `rewrite_to` uses tool names directly
 //! (e.g. `["skim", "cargo", "test"]` instead of `["skim", "test", "cargo"]`).
 //!
-//! # Pipe-source exclusion (AD-RW-2)
+//! # Pipe-source passthrough (AD-RW-2)
 //!
-//! Rules with `exclude_pipe_source: true` are suppressed when the command is
-//! the *source* side of a pipe expression (e.g. `ls | head`, `find . | head`,
-//! `rg pat | head`).  The check is co-located with the rule — adding a new
-//! excluded command only requires setting the flag in the rule struct.
-//!
-//! Current excluded commands: `ls` (catch-all), `grep` (catch-all), `find`,
-//! `rg`.  Catch-alls are also guarded by `skip_if_flag_prefix` for `--help`,
-//! `--version`, and `-V` so that informational invocations pass through
-//! unmodified.  SEE: AD-RW-2.
+//! Commands that appear as the *source* side of a pipe (e.g. `ls | head`,
+//! `git diff | head`, `rg pat | head`) are NEVER rewritten.  This is enforced
+//! GLOBALLY in `compound.rs`: `try_rewrite_compound` checks
+//! `has_pipe_operator` on the full segment list and returns `None` immediately
+//! if any pipe operator is present, so the entire pipeline passes through
+//! untouched (lines 543-545 of compound.rs).  No per-rule flag is needed or
+//! used — git diff/log/show as pipe sources are protected by this global
+//! short-circuit, not by any field on `RewriteRule`.  SEE: AD-RW-2.
 
 use std::sync::LazyLock;
 
@@ -1816,9 +1815,9 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
     // (e.g., `ls -la`, `ls -R`).  Guards on --help/--version/-V so that
     // informational invocations pass through unmodified.
     //
-    // `exclude_pipe_source: true` prevents this rule from rewriting the source
-    // side of a pipe (`ls | head`).  The compound pipeline engine skips rules
-    // with this flag set on the pipe-source segment.  SEE: AD-RW-2.
+    // Pipe-source passthrough (`ls | head`) is handled GLOBALLY by
+    // `try_rewrite_compound` in compound.rs (has_pipe_operator check,
+    // lines 543-545) — not by any per-rule field.  SEE: AD-RW-2.
     RewriteRule {
         prefix: &["ls"],
         rewrite_to: &["skim", "ls"],
@@ -1833,8 +1832,9 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
     // Fires for any `grep` invocation not matched by a more-specific earlier
     // rule (e.g., `grep -rn`, `grep -r`).  Guards on --help/--version/-V.
     //
-    // `exclude_pipe_source: true` prevents `grep | head` from being rewritten on the
-    // source side.  SEE: AD-RW-2.
+    // Pipe-source passthrough (`grep pat | head`) is handled GLOBALLY by
+    // `try_rewrite_compound` in compound.rs (has_pipe_operator check,
+    // lines 543-545) — not by any per-rule field.  SEE: AD-RW-2.
     RewriteRule {
         prefix: &["grep"],
         rewrite_to: &["skim", "grep"],
@@ -2110,6 +2110,38 @@ mod tests {
         );
     }
 
+    /// Returns the first prefix flag that `rewrite_to` drops without an
+    /// allowlist entry, or `None` if the rule preserves all its prefix flags
+    /// (or is exempt via the allowlist). Shared by the structural guard
+    /// `no_rule_silently_drops_prefix_flags` and its negative fixture so the
+    /// fixture protects the REAL checker (AC-A4, fix/rewrite-hook-falseneg).
+    ///
+    /// Logic: collect `prefix[1..]` tokens that start with `-`; for each, if
+    /// `rewrite_to.contains(flag)` the flag is preserved; else if the prefix
+    /// appears in `allowlist` the whole rule is exempt (return `None`); else
+    /// return `Some(flag)`.  The allowlist check is per-rule: a single entry
+    /// exempts ALL flags in that prefix.
+    fn check_rule_for_flag_drop<'a>(
+        prefix: &[&'a str],
+        rewrite_to: &[&str],
+        allowlist: &[(&[&str], &str)],
+    ) -> Option<&'a str> {
+        for flag in prefix[1..].iter().filter(|t| t.starts_with('-')).copied() {
+            if rewrite_to.contains(&flag) {
+                continue; // Flag preserved — OK.
+            }
+            // Flag absent from rewrite_to; check allowlist.
+            let in_allowlist = allowlist
+                .iter()
+                .any(|(allowed_prefix, _comment)| *allowed_prefix == prefix);
+            if in_allowlist {
+                return None; // Entire rule is exempt — no dropped flag.
+            }
+            return Some(flag); // Dropped flag, not on allowlist.
+        }
+        None // All flags preserved or no flags in prefix.
+    }
+
     /// Recurrence guard: no rule may silently drop a flag token from its prefix
     /// unless the compensating wrapper function is on the WRAPPER_REINJECTS list.
     ///
@@ -2121,8 +2153,9 @@ mod tests {
     /// flag-drop rules were corrected and caused a build failure.  A future
     /// `foo -X → skim foo` rule that drops a flag will fail this test.
     ///
-    /// Negative fixture: `synthetic_bad_rule_check` below exercises the checker
-    /// with a known-bad rule and asserts it is detected (AC-A4).
+    /// Negative fixture: `synthetic_bad_rule_check` below calls the SAME
+    /// `check_rule_for_flag_drop` helper so the fixture protects the REAL
+    /// checker rather than a copy (AC-A4).
     #[test]
     fn no_rule_silently_drops_prefix_flags() {
         // WRAPPER_REINJECTS: rules whose prefix flags are intentionally absent
@@ -2191,64 +2224,62 @@ mod tests {
         ];
 
         for rule in all_rules() {
-            // Collect flag tokens in prefix[1..] (skip the leading tool name).
-            let prefix_flags: Vec<&str> = rule.prefix[1..]
-                .iter()
-                .filter(|t| t.starts_with('-'))
-                .copied()
-                .collect();
-
-            if prefix_flags.is_empty() {
-                continue; // No flags in prefix — nothing to check.
-            }
-
-            for flag in &prefix_flags {
-                if rule.rewrite_to.contains(flag) {
-                    continue; // Flag preserved in rewrite_to — OK.
-                }
-
-                // Flag is absent from rewrite_to — must be in allowlist.
-                let in_allowlist = WRAPPER_REINJECTS
-                    .iter()
-                    .any(|(allowed_prefix, _comment)| *allowed_prefix == rule.prefix);
-
-                assert!(
-                    in_allowlist,
+            if let Some(dropped) =
+                check_rule_for_flag_drop(rule.prefix, rule.rewrite_to, WRAPPER_REINJECTS)
+            {
+                panic!(
                     "Rule {:?} drops prefix flag {:?} without re-injecting it in \
                      rewrite_to and without a WRAPPER_REINJECTS entry. \
                      Either add {:?} to rewrite_to, or add an allowlist entry \
                      citing the compensating wrapper fn.",
-                    rule.prefix, flag, flag
+                    rule.prefix, dropped, dropped
                 );
             }
         }
     }
 
-    /// Negative fixture for the recurrence guard: a synthetic bad rule that
-    /// drops a prefix flag must be detected by `check_rule_for_flag_drop`
-    /// (AC-A4 from fix/rewrite-hook-falseneg).
+    /// Negative fixture for `check_rule_for_flag_drop` (AC-A4).
     ///
-    /// This test validates the checker logic itself rather than the rule table.
+    /// Calls the SAME `check_rule_for_flag_drop` helper used by
+    /// `no_rule_silently_drops_prefix_flags`.  This means any regression in the
+    /// checker (e.g. inverting the `rewrite_to.contains` condition) will make
+    /// BOTH tests go red — the fixture protects the REAL guard, not a copy.
+    ///
+    /// Three controls:
+    ///   1. Bad rule (flag dropped, empty allowlist) → must return Some("-X").
+    ///   2. Good rule (flag preserved)               → must return None.
+    ///   3. Allowlist-exempt bad rule                → must return None.
     #[test]
     fn synthetic_bad_rule_check() {
-        // A fake rule: prefix has `-X`, rewrite_to omits it.
         let bad_prefix: &[&str] = &["mytool", "-X"];
         let bad_rewrite_to: &[&str] = &["skim", "mytool"];
+        let good_rewrite_to: &[&str] = &["skim", "mytool", "-X"];
 
-        let prefix_flags: Vec<&str> = bad_prefix[1..]
-            .iter()
-            .filter(|t| t.starts_with('-'))
-            .copied()
-            .collect();
+        // Control 1: dropped flag detected against empty allowlist.
+        let result = check_rule_for_flag_drop(bad_prefix, bad_rewrite_to, &[]);
+        assert_eq!(
+            result,
+            Some("-X"),
+            "Bad rule must be detected; check_rule_for_flag_drop returned {:?}",
+            result
+        );
 
-        let drops_flag = prefix_flags
-            .iter()
-            .any(|flag| !bad_rewrite_to.contains(flag));
+        // Control 2: preserved flag returns None.
+        let result = check_rule_for_flag_drop(bad_prefix, good_rewrite_to, &[]);
+        assert_eq!(
+            result, None,
+            "Good rule must not be flagged; check_rule_for_flag_drop returned {:?}",
+            result
+        );
 
-        assert!(
-            drops_flag,
-            "The negative fixture must detect that -X is dropped; \
-             if this fails the checker logic itself is broken"
+        // Control 3: exempt via allowlist — bad rule with prefix on allowlist returns None.
+        let allowlist: &[(&[&str], &str)] =
+            &[(&["mytool", "-X"], "synthetic: allowlist-exemption control")];
+        let result = check_rule_for_flag_drop(bad_prefix, bad_rewrite_to, allowlist);
+        assert_eq!(
+            result, None,
+            "Allowlisted rule must be exempt; check_rule_for_flag_drop returned {:?}",
+            result
         );
     }
 
