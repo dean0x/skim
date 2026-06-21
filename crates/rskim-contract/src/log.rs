@@ -929,6 +929,37 @@ mod tests {
         }
     }
 
+    /// Family guard (discriminating): passing a modification-family reason to
+    /// `passthrough_with_reason` MUST trip the debug_assert. Deleting the guard
+    /// would let a caller record `Decision::Passthrough` with reason `Full`,
+    /// silently violating the 5→3 mapping (the PF-006 silent-wrong-path class).
+    #[test]
+    #[should_panic(expected = "passthrough_with_reason called with a modification-family reason")]
+    fn passthrough_with_reason_rejects_modification_family() {
+        let _ = DecisionRecord::passthrough_with_reason(
+            "req-bad",
+            "block-router",
+            100,
+            OutcomeReason::Full,
+        );
+    }
+
+    /// Family guard (discriminating): passing a passthrough-family reason to
+    /// `modified_with_reason` MUST trip the debug_assert. Deleting the guard
+    /// would let a caller record `Decision::Modified` with reason `FailedOpen`,
+    /// silently violating the 5→3 mapping (the PF-006 silent-wrong-path class).
+    #[test]
+    #[should_panic(expected = "modified_with_reason called with a passthrough-family reason")]
+    fn modified_with_reason_rejects_passthrough_family() {
+        let _ = DecisionRecord::modified_with_reason(
+            "req-bad",
+            "block-router",
+            100,
+            80,
+            OutcomeReason::FailedOpen,
+        );
+    }
+
     #[test]
     fn channel_sink_accepts_records() {
         let (sink, rx) = ChannelDecisionSink::new(16);
