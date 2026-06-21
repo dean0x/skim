@@ -82,9 +82,15 @@ Most subcommands wrap a dev tool (cargo, git, npm, pytest, eslint, docker, psql,
 - `stats` — token analytics dashboard (`--since`, `--format json`, `--verbose`, `--clear`).
 - `discover` / `learn` / `rewrite` — scan agent sessions for missed optimizations, learn error-retry correction rules, and rewrite commands into skim equivalents.
 
-### Shell interception (PATH wrappers)
+### Two interception surfaces (they work differently — don't conflate them)
 
-`skim init --wrappers` symlinks `~/.skim/bin/<tool>` → the skim binary so sub-agent shells route through skim even when they bypass PreToolUse hooks. The binary calls `strip_skim_wrappers_from_path()` as the very first statement in `main()` (before any thread spawns), so wrapped commands resolve to the real tool — this is what prevents infinite recursion. `SKIM_PASSTHROUGH=1` is the escape hatch. Wrapper install/uninstall only ever touches symlinks whose target stem is `skim`/`rskim` — never regular files.
+skim intercepts a sub-agent's shell command through **two independent mechanisms**, and only one of them rewrites anything. Confusing them produces false coverage claims (e.g. "flag preservation verified on both surfaces" — it can't be; see below).
+
+1. **Rewrite engine** — the PreToolUse hook and the `skim rewrite` CLI. Operates on the command *as text, before it runs*: `cmd/rewrite/` `try_rewrite()` transforms the string `grep -rn x` → `skim grep -rn x`. This is the **only** surface where flag preservation (Fix A — don't drop `-rn` during the rewrite), corruption-bail (Fix C), and pipe-source passthrough (Fix E) exist — they are properties of the *text transformation*.
+
+2. **PATH wrappers** — `skim init --wrappers` symlinks `~/.skim/bin/<tool>` → the skim binary (with `~/.skim/bin` first on `PATH`) so sub-agent shells route through skim even when they bypass PreToolUse hooks. Here skim *is* the tool: the OS runs the binary with `argv[0]=<tool>`, `main()` calls `strip_skim_wrappers_from_path()` as its very first statement (before any thread spawns, so the real tool is found and recursion is impossible), then `detect_argv0_dispatch()` routes straight to `cmd::dispatch(tool, args)` — **`try_rewrite` is never called**. Flags arrive as ordinary argv and pass to the handler unchanged; there is no rewrite step to "preserve" them through. `SKIM_PASSTHROUGH=1` is the escape hatch. Wrapper install/uninstall only ever touches symlinks whose target stem is `skim`/`rskim` — never regular files.
+
+**Testing / verification implication:** the two surfaces share the per-tool *handlers* (output compression) but NOT the dispatch front-end. A test that drives the `--hook`/`rewrite` path does **not** exercise the wrapper path, and vice-versa. When verifying behavior — and when confirming Snyk/CI actually cover a change — identify *which* surface a test hits and cover both where the behavior could diverge. Rewrite-engine guarantees (flag preservation, corruption-bail, pipe passthrough) simply do not apply to the wrapper surface.
 
 ## Environment Variables
 
