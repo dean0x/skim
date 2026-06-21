@@ -776,9 +776,8 @@ mod tests {
         assert!(r.is_passthrough());
         assert_eq!(r.bytes_in, 100);
         assert_eq!(r.bytes_out, 100);
-        // #342: passthrough constructor always sets reason=Passthrough.
+        // #342 additive guarantee: reason defaults to Passthrough without changing call sites.
         assert_eq!(r.reason, OutcomeReason::Passthrough);
-        // #342: token counts default to None.
         assert_eq!(r.tokens_in, None);
         assert_eq!(r.tokens_out, None);
     }
@@ -789,7 +788,7 @@ mod tests {
         assert_eq!(r.bytes_in, 200);
         assert_eq!(r.bytes_out, 150);
         assert!(!r.is_passthrough());
-        // #342: modified constructor defaults to reason=Full (clean compression).
+        // #342 additive guarantee: reason defaults to Full without changing call sites.
         assert_eq!(r.reason, OutcomeReason::Full);
     }
 
@@ -802,11 +801,10 @@ mod tests {
         assert_eq!(parsed["request_id"], "req-3");
         assert_eq!(parsed["component"], "test");
         assert_eq!(parsed["decision"], "passthrough");
-        // #342: reason field is present in JSON.
         assert_eq!(parsed["reason"], "passthrough");
         assert_eq!(parsed["bytes_in"], 42);
         assert_eq!(parsed["bytes_out"], 42);
-        // #342: tokens_in/tokens_out are absent when None (skip_serializing_if).
+        // tokens_in/tokens_out are absent when None (skip_serializing_if).
         assert!(
             parsed.get("tokens_in").is_none(),
             "tokens_in must be absent when None"
@@ -821,29 +819,17 @@ mod tests {
     // OutcomeReason and new constructors (#342)
     // ========================================================================
 
-    /// Discriminating test: OutcomeReason variants must be distinct and non-default.
-    /// A deleted OutcomeReason variant would cause this to fail to compile.
+    /// Compile-time guard: all 5 OutcomeReason variants must exist.
+    /// Deleting a variant causes this array construction to fail to compile.
     #[test]
     fn outcome_reason_variants_are_distinct() {
-        let reasons = [
+        let _reasons = [
             OutcomeReason::Full,
             OutcomeReason::Degraded,
             OutcomeReason::Passthrough,
             OutcomeReason::FailedOpen,
             OutcomeReason::PolicyPassthrough,
         ];
-        // All 5 variants must exist and be distinguishable.
-        assert_eq!(reasons.len(), 5);
-        assert_ne!(reasons[0], reasons[1]);
-        assert_ne!(reasons[0], reasons[2]);
-        assert_ne!(reasons[0], reasons[3]);
-        assert_ne!(reasons[0], reasons[4]);
-        assert_ne!(reasons[1], reasons[2]);
-        assert_ne!(reasons[1], reasons[3]);
-        assert_ne!(reasons[1], reasons[4]);
-        assert_ne!(reasons[2], reasons[3]);
-        assert_ne!(reasons[2], reasons[4]);
-        assert_ne!(reasons[3], reasons[4]);
     }
 
     /// passthrough_with_reason sets a specific passthrough-family reason.
@@ -911,36 +897,21 @@ mod tests {
         assert_eq!(r.reason, OutcomeReason::Full);
     }
 
-    /// Tokens are serialized into JSON when present and absent when None.
+    /// Tokens are serialized into JSON when present.
+    /// Absence when None is already covered by decision_record_to_json_round_trips.
     #[test]
     fn token_fields_json_round_trip() {
         let r = DecisionRecord::modified("req-tj", "block-router", 800, 400).with_tokens(100, 50);
         let json = r.to_json().expect("serialisation must succeed");
         let parsed: serde_json::Value =
             serde_json::from_str(&json).expect("must produce valid JSON");
-        // Tokens present → serialized.
         assert_eq!(parsed["tokens_in"], 100, "tokens_in must appear in JSON");
         assert_eq!(parsed["tokens_out"], 50, "tokens_out must appear in JSON");
-
-        // Without tokens → absent (skip_serializing_if).
-        let r_no_tokens = DecisionRecord::modified("req-no-tok", "id", 100, 80);
-        let json2 = r_no_tokens.to_json().expect("serialisation must succeed");
-        let parsed2: serde_json::Value =
-            serde_json::from_str(&json2).expect("must produce valid JSON");
-        assert!(
-            parsed2.get("tokens_in").is_none(),
-            "tokens_in must be absent from JSON when None"
-        );
-        assert!(
-            parsed2.get("tokens_out").is_none(),
-            "tokens_out must be absent from JSON when None"
-        );
     }
 
     /// OutcomeReason serializes with snake_case names (per serde rename_all).
     #[test]
     fn outcome_reason_serde_snake_case() {
-        // #342: reason field uses snake_case serialization.
         let cases = [
             (OutcomeReason::Full, "full"),
             (OutcomeReason::Degraded, "degraded"),
@@ -956,36 +927,6 @@ mod tests {
                 "OutcomeReason::{reason:?} must serialize as \"{expected_str}\""
             );
         }
-    }
-
-    /// Existing passthrough constructor behavior is unchanged (#342 additive guarantee).
-    ///
-    /// This test is a regression guard: deleting the additive changes would still
-    /// compile (the signature is unchanged), but the DEFAULT reason would revert.
-    /// This forces the default to be asserted.
-    #[test]
-    fn existing_passthrough_ctor_reason_is_passthrough() {
-        // Existing call sites use DecisionRecord::passthrough(id, component, bytes_in).
-        // The reason field must default to Passthrough without any change to callers.
-        let r = DecisionRecord::passthrough("req-compat", "identity", 42);
-        assert_eq!(
-            r.reason,
-            OutcomeReason::Passthrough,
-            "passthrough() must set reason=Passthrough for backward compatibility"
-        );
-    }
-
-    /// Existing modified constructor behavior is unchanged (#342 additive guarantee).
-    #[test]
-    fn existing_modified_ctor_reason_is_full() {
-        // Existing call sites use DecisionRecord::modified(id, component, in, out).
-        // The reason field must default to Full without any change to callers.
-        let r = DecisionRecord::modified("req-compat", "compressor", 200, 150);
-        assert_eq!(
-            r.reason,
-            OutcomeReason::Full,
-            "modified() must set reason=Full for backward compatibility"
-        );
     }
 
     #[test]
