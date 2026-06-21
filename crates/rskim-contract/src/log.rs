@@ -254,6 +254,12 @@ pub enum OutcomeReason {
     Degraded,
     /// Block skipped or forwarded: pre-filter hit, tie, or misclassification.
     /// Maps to wire [`Decision::Passthrough`].
+    ///
+    /// This is also the **schema-evolution default** for records written by a
+    /// pre-#342 binary that lacks the `reason` key.  `#[serde(default)]` on
+    /// [`DecisionRecord::reason`] causes serde to call `OutcomeReason::default()`
+    /// when the key is absent, yielding `Passthrough` — the most conservative
+    /// interpretation of an unknown-origin record.
     Passthrough,
     /// Compressor returned `Err`; block forwarded byte-identical (fail-open).
     /// Maps to wire [`Decision::Passthrough`].
@@ -262,6 +268,23 @@ pub enum OutcomeReason {
     /// Every block is forwarded byte-identical; no compressor runs.
     /// Maps to wire [`Decision::Passthrough`].
     PolicyPassthrough,
+}
+
+impl Default for OutcomeReason {
+    /// Returns [`OutcomeReason::Passthrough`].
+    ///
+    /// Used by `#[serde(default)]` on [`DecisionRecord::reason`] to handle
+    /// records written by a pre-#342 binary that lacks the `reason` key in
+    /// their JSON.  `Passthrough` is chosen because it is the most conservative
+    /// interpretation: a record with an unknown reason is treated as a
+    /// passthrough rather than silently attributed to a modification tier.
+    ///
+    /// This pairs with the [`DecisionRecord::passthrough`] default and matches
+    /// the wire [`Decision::Passthrough`] default, keeping the two vocabularies
+    /// consistent for legacy records.
+    fn default() -> Self {
+        OutcomeReason::Passthrough
+    }
 }
 
 /// A structured decision record produced by every L3 transform.
@@ -308,6 +331,21 @@ pub struct DecisionRecord {
     /// [`OutcomeReason::Full`] on modification; use
     /// [`DecisionRecord::modified_with_reason`] or
     /// [`DecisionRecord::passthrough_with_reason`] for other values.
+    ///
+    /// # Schema evolution / backward compatibility
+    ///
+    /// `#[serde(default)]` makes this field optional on the **deserialization**
+    /// side: records written by a pre-#342 binary that lack the `reason` key
+    /// deserialize successfully, with the field defaulting to
+    /// [`OutcomeReason::Passthrough`] (see [`OutcomeReason::default`]).
+    ///
+    /// This mirrors the pattern used by the sibling optional fields
+    /// `tokens_in`/`tokens_out` (which are `Option<usize>` + `skip_serializing_if`
+    /// and therefore absent-when-None on both directions), and satisfies the
+    /// 'parse at boundaries, trust internally' principle: a schema-additive field
+    /// must not hard-fail on valid pre-field records at the persistence boundary
+    /// (#305, per ADR-001 / ADR-004).
+    #[serde(default)]
     pub reason: OutcomeReason,
     /// Input byte count.
     pub bytes_in: usize,
@@ -317,16 +355,26 @@ pub struct DecisionRecord {
     ///
     /// `None` when the caller has no token counter or token counting is disabled.
     /// Populated by #304's `BlockRouter` via its injected `token_counter` closure.
-    /// Must NOT influence the never-inflate accept/reject decision (AC15).
+    /// Must NOT influence the never-inflate accept/reject decision (AC10).
+    ///
+    /// Typed `usize` to match `rskim_tokens::Counter::count(&str) -> usize` and
+    /// the `token_counter: Arc<dyn Fn(&str) -> usize + Send + Sync>` closure
+    /// documented in the #304 plan (304-plan.md:108,118), keeping this field
+    /// consistent with the producing API and the sibling `bytes_in`/`bytes_out`
+    /// fields (also `usize`). Using `u64` here would require a lossy-looking
+    /// `as u64` cast at every call site (ADR-001: fix type drift before it
+    /// propagates to #304/#305 consumers).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tokens_in: Option<u64>,
+    pub tokens_in: Option<usize>,
     /// Output token count (accounting only — never used in the byte gate).
     ///
     /// `None` when the caller has no token counter or token counting is disabled.
     /// Populated by #304's `BlockRouter` after substitution.
-    /// Must NOT influence the never-inflate accept/reject decision (AC15).
+    /// Must NOT influence the never-inflate accept/reject decision (AC10).
+    ///
+    /// Typed `usize` for the same reason as [`DecisionRecord::tokens_in`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tokens_out: Option<u64>,
+    pub tokens_out: Option<usize>,
 }
 
 impl DecisionRecord {
@@ -381,16 +429,21 @@ impl DecisionRecord {
     ///
     /// # Panics
     ///
-    /// Debug-mode assertion: `reason` MUST be a passthrough-family variant
-    /// (`Passthrough`, `FailedOpen`, or `PolicyPassthrough`). Passing a
-    /// modification-family variant (`Full`, `Degraded`) here is a caller bug.
+    /// `reason` MUST be a passthrough-family variant (`Passthrough`, `FailedOpen`,
+    /// or `PolicyPassthrough`). Passing a modification-family variant (`Full`,
+    /// `Degraded`) here is a caller bug. This is a **release-active** assertion
+    /// (`assert!`, not `debug_assert!`) because these are public module-boundary
+    /// constructors — a mismatched pair produces a silently-inconsistent record
+    /// that breaks the binding 5→3 wire-vocabulary mapping (the PF-006
+    /// silent-wrong-path class). Panicking on a caller bug is defensible at a
+    /// boundary constructor; hot-path code elsewhere uses `debug_assert!`.
     pub fn passthrough_with_reason(
         request_id: &str,
         component: &'static str,
         bytes_in: usize,
         reason: OutcomeReason,
     ) -> Self {
-        debug_assert!(
+        assert!(
             matches!(
                 reason,
                 OutcomeReason::Passthrough
@@ -453,9 +506,10 @@ impl DecisionRecord {
     ///
     /// # Panics
     ///
-    /// Debug-mode assertion: `reason` MUST be a modification-family variant
-    /// (`Full` or `Degraded`). Passing a passthrough-family variant here is a
-    /// caller bug.
+    /// `reason` MUST be a modification-family variant (`Full` or `Degraded`).
+    /// Passing a passthrough-family variant here is a caller bug. This is a
+    /// **release-active** assertion (`assert!`, not `debug_assert!`) — see
+    /// [`DecisionRecord::passthrough_with_reason`] for the full rationale.
     pub fn modified_with_reason(
         request_id: &str,
         component: &'static str,
@@ -463,7 +517,7 @@ impl DecisionRecord {
         bytes_out: usize,
         reason: OutcomeReason,
     ) -> Self {
-        debug_assert!(
+        assert!(
             matches!(reason, OutcomeReason::Full | OutcomeReason::Degraded),
             "modified_with_reason called with a passthrough-family reason ({reason:?}); \
              use passthrough_with_reason instead"
@@ -483,9 +537,13 @@ impl DecisionRecord {
     /// Attach token counts to an existing record, returning the updated record.
     ///
     /// Token counts are **accounting only** — they MUST NOT influence the
-    /// never-inflate accept/reject decision (AC15 / #342). Call this after
+    /// never-inflate accept/reject decision (AC10 / #342). Call this after
     /// the byte gate has already accepted or rejected the candidate, and only
     /// when a token counter is available.
+    ///
+    /// Both arguments are `usize` to match `rskim_tokens::Counter::count(&str) -> usize`
+    /// and the `token_counter: Arc<dyn Fn(&str) -> usize + Send + Sync>` closure
+    /// documented in the #304 plan, avoiding a `as u64` cast at every call site.
     ///
     /// Returns `Self` (consumes and rebuilds) so callers can chain:
     /// ```rust
@@ -496,7 +554,7 @@ impl DecisionRecord {
     /// assert_eq!(r.tokens_out, Some(72));
     /// ```
     #[must_use]
-    pub fn with_tokens(self, tokens_in: u64, tokens_out: u64) -> Self {
+    pub fn with_tokens(self, tokens_in: usize, tokens_out: usize) -> Self {
         Self {
             tokens_in: Some(tokens_in),
             tokens_out: Some(tokens_out),
@@ -929,10 +987,134 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // Typed round-trip deserialization tests (PF-007 load-bearing direction)
+    // ========================================================================
+
+    /// Legacy-JSON backward-compatibility (schema-evolution default, #342).
+    ///
+    /// A record written by a pre-#342 binary omits the `reason` key entirely.
+    /// `#[serde(default)]` on `DecisionRecord::reason` must cause it to
+    /// deserialize as `OutcomeReason::Passthrough` rather than failing.
+    /// Also verifies that absent `tokens_in`/`tokens_out` produce `None`.
+    ///
+    /// This test is the discriminating guard for the `#[serde(default)]` fix:
+    /// deleting that attribute causes this test to fail with
+    /// `missing field "reason"`.
+    ///
+    /// Note: `DecisionRecord::component` is typed `&'static str`, so the
+    /// derived `Deserialize` impl only satisfies `Deserialize<'static>`.
+    /// We use a `&'static str` JSON literal (via `include_str!`-compatible
+    /// `static`) to satisfy the lifetime constraint.
+    #[test]
+    fn legacy_record_deserializes_without_reason_or_tokens() {
+        // 'static string literal satisfies the Deserialize<'static> bound
+        // imposed by `component: &'static str` in DecisionRecord.
+        static LEGACY_JSON: &str = r#"{"request_id":"req-1","component":"identity","decision":"passthrough","bytes_in":100,"bytes_out":100}"#;
+        let record: DecisionRecord =
+            serde_json::from_str(LEGACY_JSON).expect("pre-#342 record must deserialize");
+        assert_eq!(
+            record.reason,
+            OutcomeReason::Passthrough,
+            "absent reason key must default to Passthrough"
+        );
+        assert_eq!(record.tokens_in, None, "absent tokens_in must be None");
+        assert_eq!(record.tokens_out, None, "absent tokens_out must be None");
+        assert_eq!(record.request_id(), "req-1");
+    }
+
+    /// Typed round-trip: passthrough record serializes then deserializes back to
+    /// the exact same typed fields. This is the load-bearing direction for #305
+    /// persistence (which reads records back), per PF-007.
+    ///
+    /// Uses a `Box::leak`-promoted `String` to obtain a `&'static str` for
+    /// `serde_json::from_str`, which requires `'static` due to the
+    /// `component: &'static str` field in `DecisionRecord`.
+    #[test]
+    fn passthrough_record_typed_round_trip() {
+        let r = DecisionRecord::passthrough("req-rt-pt", "identity", 200);
+        let json: &'static str =
+            Box::leak(r.to_json().expect("serialisation must succeed").into_boxed_str());
+        let back: DecisionRecord =
+            serde_json::from_str(json).expect("typed deserialization must succeed");
+        assert_eq!(back.reason, OutcomeReason::Passthrough);
+        assert_eq!(back.tokens_in, None);
+        assert_eq!(back.tokens_out, None);
+        assert_eq!(back.bytes_in, 200);
+        assert_eq!(back.bytes_out, 200);
+    }
+
+    /// Typed round-trip: `modified_with_reason(Degraded)` record.
+    /// Validates that the `Degraded` reason survives serde round-trip.
+    #[test]
+    fn modified_with_reason_degraded_typed_round_trip() {
+        let r = DecisionRecord::modified_with_reason(
+            "req-rt-deg",
+            "block-router",
+            1000,
+            700,
+            OutcomeReason::Degraded,
+        );
+        let json: &'static str =
+            Box::leak(r.to_json().expect("serialisation must succeed").into_boxed_str());
+        let back: DecisionRecord =
+            serde_json::from_str(json).expect("typed deserialization must succeed");
+        assert_eq!(back.reason, OutcomeReason::Degraded);
+        assert_eq!(back.tokens_in, None);
+        assert_eq!(back.tokens_out, None);
+        assert_eq!(back.bytes_in, 1000);
+        assert_eq!(back.bytes_out, 700);
+    }
+
+    /// Typed round-trip: `with_tokens(Some path)` record.
+    /// Validates that `tokens_in`/`tokens_out` survive serde round-trip typed as
+    /// `Option<usize>` (discriminating: a ser/de type mismatch would surface
+    /// as an unexpected value in the typed field after round-trip).
+    #[test]
+    fn with_tokens_typed_round_trip() {
+        let r = DecisionRecord::modified("req-rt-tok", "block-router", 800, 400)
+            .with_tokens(120, 72);
+        let json: &'static str =
+            Box::leak(r.to_json().expect("serialisation must succeed").into_boxed_str());
+        let back: DecisionRecord =
+            serde_json::from_str(json).expect("typed deserialization must succeed");
+        assert_eq!(back.reason, OutcomeReason::Full);
+        assert_eq!(back.tokens_in, Some(120usize));
+        assert_eq!(back.tokens_out, Some(72usize));
+        assert_eq!(back.bytes_in, 800);
+        assert_eq!(back.bytes_out, 400);
+    }
+
+    /// OutcomeReason typed deserialization: all 5 variants must round-trip.
+    /// A snake_case mismatch (e.g. `"failed_open"` → missing variant) would
+    /// fail this test.  `OutcomeReason` is a pure enum with no `&'static str`
+    /// fields, so `from_str` works with any lifetime.
+    #[test]
+    fn outcome_reason_typed_deserialize_all_variants() {
+        let cases = [
+            ("\"full\"", OutcomeReason::Full),
+            ("\"degraded\"", OutcomeReason::Degraded),
+            ("\"passthrough\"", OutcomeReason::Passthrough),
+            ("\"failed_open\"", OutcomeReason::FailedOpen),
+            ("\"policy_passthrough\"", OutcomeReason::PolicyPassthrough),
+        ];
+        for (json_str, expected) in cases {
+            let got: OutcomeReason = serde_json::from_str(json_str)
+                .expect("OutcomeReason variant must deserialize from snake_case JSON string");
+            assert_eq!(got, expected, "OutcomeReason from {json_str}");
+        }
+    }
+
+    // ========================================================================
+    // Family-consistency invariant tests (release-active assert! guards)
+    // ========================================================================
+
     /// Family guard (discriminating): passing a modification-family reason to
-    /// `passthrough_with_reason` MUST trip the debug_assert. Deleting the guard
-    /// would let a caller record `Decision::Passthrough` with reason `Full`,
-    /// silently violating the 5→3 mapping (the PF-006 silent-wrong-path class).
+    /// `passthrough_with_reason` MUST trip the `assert!`. This fires in BOTH
+    /// debug and release builds (unlike the former `debug_assert!`). Deleting
+    /// the guard would let a caller record `Decision::Passthrough` with reason
+    /// `Full`, silently violating the 5→3 mapping (the PF-006 silent-wrong-path
+    /// class).
     #[test]
     #[should_panic(expected = "passthrough_with_reason called with a modification-family reason")]
     fn passthrough_with_reason_rejects_modification_family() {
@@ -945,9 +1127,10 @@ mod tests {
     }
 
     /// Family guard (discriminating): passing a passthrough-family reason to
-    /// `modified_with_reason` MUST trip the debug_assert. Deleting the guard
-    /// would let a caller record `Decision::Modified` with reason `FailedOpen`,
-    /// silently violating the 5→3 mapping (the PF-006 silent-wrong-path class).
+    /// `modified_with_reason` MUST trip the `assert!` (fires in debug AND
+    /// release). Deleting the guard would let a caller record
+    /// `Decision::Modified` with reason `FailedOpen`, silently violating the
+    /// 5→3 mapping (the PF-006 silent-wrong-path class).
     #[test]
     #[should_panic(expected = "modified_with_reason called with a passthrough-family reason")]
     fn modified_with_reason_rejects_passthrough_family() {
