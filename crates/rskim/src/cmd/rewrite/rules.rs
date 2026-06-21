@@ -14,7 +14,8 @@
 //! GLOBALLY in `compound.rs`: `try_rewrite_compound` checks
 //! `has_pipe_operator` on the full segment list and returns `None` immediately
 //! if any pipe operator is present, so the entire pipeline passes through
-//! untouched (lines 543-545 of compound.rs).  No per-rule flag is needed or
+//! untouched (enforced by the `has_pipe_operator` short-circuit in
+//! `try_rewrite_compound`, compound.rs).  No per-rule flag is needed or
 //! used — git diff/log/show as pipe sources are protected by this global
 //! short-circuit, not by any field on `RewriteRule`.  SEE: AD-RW-2.
 
@@ -1816,8 +1817,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
     // informational invocations pass through unmodified.
     //
     // Pipe-source passthrough (`ls | head`) is handled GLOBALLY by
-    // `try_rewrite_compound` in compound.rs (has_pipe_operator check,
-    // lines 543-545) — not by any per-rule field.  SEE: AD-RW-2.
+    // `has_pipe_operator` short-circuit in `try_rewrite_compound` (compound.rs)
+    // — not by any per-rule field.  SEE: AD-RW-2.
     RewriteRule {
         prefix: &["ls"],
         rewrite_to: &["skim", "ls"],
@@ -1833,8 +1834,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
     // rule (e.g., `grep -rn`, `grep -r`).  Guards on --help/--version/-V.
     //
     // Pipe-source passthrough (`grep pat | head`) is handled GLOBALLY by
-    // `try_rewrite_compound` in compound.rs (has_pipe_operator check,
-    // lines 543-545) — not by any per-rule field.  SEE: AD-RW-2.
+    // `has_pipe_operator` short-circuit in `try_rewrite_compound` (compound.rs)
+    // — not by any per-rule field.  SEE: AD-RW-2.
     RewriteRule {
         prefix: &["grep"],
         rewrite_to: &["skim", "grep"],
@@ -2116,25 +2117,40 @@ mod tests {
     /// `no_rule_silently_drops_prefix_flags` and its negative fixture so the
     /// fixture protects the REAL checker (AC-A4, fix/rewrite-hook-falseneg).
     ///
-    /// Logic: collect `prefix[1..]` tokens that start with `-`; for each, if
-    /// `rewrite_to.contains(flag)` the flag is preserved; else if the prefix
-    /// appears in `allowlist` the whole rule is exempt (return `None`); else
-    /// return `Some(flag)`.  The allowlist check is per-rule: a single entry
-    /// exempts ALL flags in that prefix.
+    /// Logic: compute whether the rule is allowlist-exempt once, then scan
+    /// `prefix[1..]` tokens that start with `-`; for each, if
+    /// `rewrite_to.contains(flag)` the flag is preserved; else if the whole
+    /// rule is exempt return `None`; else return `Some(flag)`.  The allowlist
+    /// check is per-rule: a single entry exempts ALL flags in that prefix.
+    ///
+    /// **Scope note (conservative invariant):** only dash-prefixed tokens are
+    /// checked; bare subcommands consumed by a prefix (e.g. a hypothetical
+    /// `format`/`check` subcommand not prefixed with `-`) would not be caught
+    /// by this helper.  No current rule has that shape, and the guard direction
+    /// is conservative (would over-flag on a false alarm, never under-flag on a
+    /// real drop), so this is safe to leave as a documented limitation rather
+    /// than widen the check.  Similarly, the global-flag branch in the engine
+    /// is not modelled here — the guard is conservative in that direction too.
     fn check_rule_for_flag_drop<'a>(
         prefix: &[&'a str],
         rewrite_to: &[&str],
         allowlist: &[(&[&str], &str)],
     ) -> Option<&'a str> {
-        for flag in prefix[1..].iter().filter(|t| t.starts_with('-')).copied() {
+        // Compute exemption once — allowlist is per-rule, not per-flag.
+        let rule_is_exempt = allowlist
+            .iter()
+            .any(|(allowed_prefix, _comment)| *allowed_prefix == prefix);
+        for flag in prefix
+            .get(1..)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|t| t.starts_with('-'))
+            .copied()
+        {
             if rewrite_to.contains(&flag) {
                 continue; // Flag preserved — OK.
             }
-            // Flag absent from rewrite_to; check allowlist.
-            let in_allowlist = allowlist
-                .iter()
-                .any(|(allowed_prefix, _comment)| *allowed_prefix == prefix);
-            if in_allowlist {
+            if rule_is_exempt {
                 return None; // Entire rule is exempt — no dropped flag.
             }
             return Some(flag); // Dropped flag, not on allowlist.
@@ -2185,14 +2201,13 @@ mod tests {
                 "cmd/lint/mypy.rs:run — tool replacement, -m is dispatch mechanism",
             ),
             // gofmt -l: cmd/lint/gofmt.rs:prepare_args injects `-l` when no
-            // mode flag is present.  Verified: line ~54 in gofmt.rs.
+            // mode flag is present.
             (
                 &["gofmt", "-l"],
                 "cmd/lint/gofmt.rs:prepare_args — injects -l when absent",
             ),
             // prettier --check / npx prettier --check: cmd/lint/prettier.rs:
-            // prepare_check_args injects `--check` when absent.  Verified:
-            // lines ~92-94 in prettier.rs.
+            // prepare_check_args injects `--check` when absent.
             (
                 &["prettier", "--check"],
                 "cmd/lint/prettier.rs:prepare_check_args — injects --check when absent",
@@ -2202,9 +2217,8 @@ mod tests {
                 "cmd/lint/prettier.rs:prepare_check_args — injects --check when absent",
             ),
             // rustfmt --check: cmd/lint/rustfmt.rs:prepare_check_args injects
-            // `--check` when absent.  Verified: lines ~94-97 in rustfmt.rs.
-            // is_format_mode only triggers on --format/-f, so dropping --check
-            // safely defaults to check mode.
+            // `--check` when absent.  is_format_mode only triggers on
+            // --format/-f, so dropping --check safely defaults to check mode.
             (
                 &["rustfmt", "--check"],
                 "cmd/lint/rustfmt.rs:prepare_check_args — injects --check when absent",
@@ -2281,6 +2295,52 @@ mod tests {
             "Allowlisted rule must be exempt; check_rule_for_flag_drop returned {:?}",
             result
         );
+    }
+
+    /// WRAPPER_REINJECTS coupling test (S7, fix/rewrite-hook-falseneg).
+    ///
+    /// Asserts that every allowlist entry in `no_rule_silently_drops_prefix_flags`
+    /// whose dropped flag is re-injected by a lint handler actually has that flag
+    /// present in the handler's `INJECTS` const.  If a handler later removes the
+    /// injection without updating `INJECTS`, this test goes red — turning the
+    /// prose comment into a compiler/test-checked link.
+    ///
+    /// Entries using tool-replacement dispatch (`-m` mechanism for pytest/mypy)
+    /// are excluded: their flag is structurally replaced, not re-injected.
+    #[test]
+    fn wrapper_reinjects_matches_handler_injects() {
+        use crate::cmd::lint::{gofmt, prettier, rustfmt};
+
+        // Map: (prefix_tokens, dropped_flag, handler_INJECTS)
+        // Only entries where a lint handler's prepare_* fn is responsible.
+        let cases: &[(&[&str], &str, &[&str])] = &[
+            (&["gofmt", "-l"], "-l", gofmt::INJECTS),
+            (&["prettier", "--check"], "--check", prettier::INJECTS),
+            (
+                &["npx", "prettier", "--check"],
+                "--check",
+                prettier::INJECTS,
+            ),
+            (&["rustfmt", "--check"], "--check", rustfmt::INJECTS),
+            (&["cargo", "fmt", "--check"], "--check", rustfmt::INJECTS),
+            (
+                &["cargo", "fmt", "--", "--check"],
+                "--check",
+                rustfmt::INJECTS,
+            ),
+        ];
+
+        for (prefix, dropped_flag, handler_injects) in cases {
+            assert!(
+                handler_injects.contains(dropped_flag),
+                "WRAPPER_REINJECTS entry {:?} claims handler re-injects {:?}, \
+                 but that flag is absent from the handler's INJECTS const {:?}. \
+                 Update the handler's INJECTS or fix the allowlist.",
+                prefix,
+                dropped_flag,
+                handler_injects,
+            );
+        }
     }
 
     /// ls --help skips the catch-all rule (passthrough).

@@ -88,10 +88,18 @@ fn run_check(
     run_tool(CONFIG, args, ctx, prepare_check_args, parse_check_impl)
 }
 
-/// Inject `--check` if not already present.
+/// Flags this handler injects in check mode when absent from user args.
+///
+/// Consumed by the `WRAPPER_REINJECTS` coupling test in
+/// `crates/rskim/src/cmd/rewrite/rules.rs` to assert that every allowlist
+/// entry's exempted flag is actually re-injected here.
+pub(crate) const INJECTS: &[&str] = &["--check"];
+
+/// Inject `--check` if not already present. Injects `INJECTS` so the
+/// re-injection set stays the single source of truth for the coupling test.
 fn prepare_check_args(cmd_args: &mut Vec<String>) {
     if !user_has_flag(cmd_args, &["--check", "-c", "--list-different", "-l"]) {
-        cmd_args.insert(0, "--check".to_string());
+        cmd_args.insert(0, INJECTS[0].to_string());
     }
 }
 

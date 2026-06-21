@@ -50,10 +50,18 @@ pub(crate) fn run(
     run_tool(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
-/// Inject `-l` if no mode flag is present.
+/// Flags this handler injects when absent from user args.
+///
+/// Consumed by the `WRAPPER_REINJECTS` coupling test in
+/// `crates/rskim/src/cmd/rewrite/rules.rs` to assert that every allowlist
+/// entry's exempted flag is actually re-injected here.
+pub(crate) const INJECTS: &[&str] = &["-l"];
+
+/// Inject `-l` if no mode flag is present. Injects `INJECTS` so the
+/// re-injection set stays the single source of truth for the coupling test.
 fn prepare_args(cmd_args: &mut Vec<String>) {
     if !user_has_flag(cmd_args, &["-l", "-d", "-w", "-e"]) {
-        cmd_args.insert(0, "-l".to_string());
+        cmd_args.insert(0, INJECTS[0].to_string());
     }
 }
 
