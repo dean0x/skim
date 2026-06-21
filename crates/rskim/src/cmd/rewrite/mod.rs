@@ -36,8 +36,8 @@ use std::process::ExitCode;
 
 use acknowledge::is_segment_ack;
 use compound::{
-    has_pipe_operator, rewrite_would_corrupt, splice_redirects_back, split_compound,
-    try_rewrite_compound,
+    command_needs_passthrough, has_pipe_operator, rewrite_would_corrupt, splice_redirects_back,
+    split_compound, try_rewrite_compound,
 };
 use engine::try_rewrite;
 use hook::{parse_agent_flag, run_hook_mode};
@@ -371,6 +371,31 @@ pub(crate) fn run(
         .iter()
         .map(|s| s.as_str())
         .collect();
+
+    // Round-trip safety (#317, Fix C — CLI path): check the raw command string
+    // BEFORE `collect_input_tokens` flattens it via `split_whitespace`.
+    //
+    // `collect_input_tokens` uses `flat_map(|s| s.split_whitespace())`, which
+    // treats an interior `\n` as ordinary whitespace and merges two shell
+    // statements into one token list. By the time `run_classify_and_emit` runs
+    // `tokens.join(" ")`, the newline is already gone — so the existing
+    // `rewrite_would_corrupt` guard never sees it and happily rewrites the
+    // corrupt merged command.
+    //
+    // Fix: join `positional_args` first (preserving the raw newline), run
+    // `command_needs_passthrough` (which trims trailing whitespace so a lone
+    // trailing `\n` does NOT bail), and bail before tokenization when the raw
+    // command contains an interior newline or other corruption trigger.
+    //
+    // `positional_args.join(" ")` is correct for both shell invocation shapes:
+    //   `skim rewrite 'git log\nprintf done'`  → one arg with interior `\n` → bail ✓
+    //   `skim rewrite grep -rn x dir`          → multiple args, no `\n` → proceeds ✓
+    if !positional_args.is_empty() {
+        let raw = positional_args.join(" ");
+        if command_needs_passthrough(&raw) {
+            return emit_result(suggest_mode, &raw, None, false);
+        }
+    }
 
     let tokens = match collect_input_tokens(&positional_args)? {
         Some(t) => t,

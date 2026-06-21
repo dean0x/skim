@@ -2802,3 +2802,81 @@ fn test_hook_safe_redirect_order_still_rewrites() {
         .success()
         .stdout(predicate::str::contains(">log.txt 2>&1"));
 }
+
+// ============================================================================
+// Fix C — CLI path: interior newline must pass through (AC-C1 / AC-C2 / AC-C3)
+//
+// The hook path already bails on interior newlines (via command_needs_passthrough
+// in hook.rs). The CLI positional-args path had a different bug: collect_input_tokens
+// flattened the newline via split_whitespace BEFORE the corruption guard ran,
+// so the guard never saw it and happily emitted a corrupt merged command.
+// Fix: check command_needs_passthrough on the joined raw string BEFORE tokenising.
+// ============================================================================
+
+/// AC-C1 CLI: a single quoted arg containing an INTERIOR newline must NOT
+/// produce a corrupt merged rewrite — the two shell statements must never be
+/// joined into one command line.
+///
+/// Repro: `skim rewrite "$(printf 'git log -1 abc123\nprintf done')"` previously
+/// emitted `skim git log -1 abc123 printf done` (corrupt merged command, exit 0).
+/// Correct behavior: no-match passthrough (empty stdout, exit 1) — the CLI path
+/// uses ExitCode::FAILURE for "no rewrite match", consistent with the existing
+/// rewrite_would_corrupt guard in run_classify_and_emit.
+#[test]
+fn cli_rewrite_interior_newline_passes_through() {
+    // A Rust string literal with a real \n char — matches the shell repro.
+    let cmd_with_interior_newline = "git log -1 abc123\nprintf done";
+
+    let output = skim_cmd()
+        .args(["rewrite", cmd_with_interior_newline])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Must NOT emit the corrupt merged form (the regression being fixed).
+    assert!(
+        !stdout.contains("skim git log -1 abc123 printf done"),
+        "interior newline must not produce a merged rewritten command; got: {stdout:?}"
+    );
+    // Must NOT emit any skim-prefixed rewrite — the whole arg is a corruption trigger.
+    assert!(
+        !stdout.contains("skim git log"),
+        "interior newline must not rewrite the first statement in isolation; got: {stdout:?}"
+    );
+    // stdout must be empty (no-match passthrough, per existing convention).
+    assert!(
+        stdout.is_empty(),
+        "interior newline passthrough must produce empty stdout; got: {stdout:?}"
+    );
+}
+
+/// AC-C2 CLI: a single arg with ONLY a trailing newline must still rewrite.
+///
+/// Agent hooks commonly add a trailing `\n` to the command field. That trailing
+/// newline is benign — it survives trim_end in command_needs_passthrough and
+/// does not indicate a multi-statement command. The rewrite must proceed.
+#[test]
+fn cli_rewrite_trailing_newline_still_rewrites() {
+    // Trailing newline only — command_needs_passthrough trims it, so no bail.
+    let cmd_with_trailing_newline = "grep -rn x dir\n";
+
+    skim_cmd()
+        .args(["rewrite", cmd_with_trailing_newline])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim grep"));
+}
+
+/// AC-C3 regression: normal multi-word positional args (no newline) still rewrite.
+///
+/// Proves that the new early-bail guard did not break the common path where the
+/// user passes the command as separate tokens rather than a single quoted string.
+#[test]
+fn cli_rewrite_no_newline_still_rewrites() {
+    skim_cmd()
+        .args(["rewrite", "grep", "-rn", "x", "dir"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim grep -rn x dir"));
+}
