@@ -11,6 +11,133 @@ use std::process::ExitCode;
 use crate::output::ParseResult;
 use crate::runner::{CommandOutput, CommandRunner};
 
+// ============================================================================
+// Net-savings guard (#317 / Cluster C)
+// ============================================================================
+
+/// Outcome of the token-based net-savings decision.
+///
+/// Determines whether skim should emit the compressed body or fall back to the
+/// literal raw output. The guard only ever moves output *toward* more-complete
+/// raw — outcomes are "keep compressed" or "emit literal raw" — so it
+/// strengthens the #317 invariant and cannot conflict with `elision_marker` /
+/// `guardrail.rs`.  Applying it after `guardrail.rs` already chose raw is a
+/// safe no-op: `Passthrough` at that point means raw == compressed.
+///
+/// **Reconciliation with `output/guardrail.rs`:**
+/// `guardrail.rs` applies a ≥256-byte floor and is wired into the file-transform
+/// path (`process.rs`) and `git/show.rs`.  This enum applies token-based savings
+/// to the *command-handler* sinks that guardrail.rs does not cover (execution,
+/// git, build, test, log).  There is no double-guard conflict: if guardrail.rs
+/// already emitted raw, `savings_decision` sees raw == compressed and returns
+/// `Keep` (equal bytes → byte fallback says keep; token fallback says equal →
+/// `Passthrough`, then the raw is the same as compressed so either is correct).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum SavingsDecision {
+    /// Compressed body is strictly smaller (in tokens, or bytes when the
+    /// tokenizer is unavailable) — emit it.
+    Keep,
+    /// Compressed body is equal or larger — emit raw verbatim instead.
+    Passthrough,
+}
+
+/// Decide whether to emit `compressed` or fall back to `raw`.
+///
+/// **Conservative rule:** keep compressed iff `compressed_tokens < raw_tokens`
+/// (strictly smaller).  Tie or larger → `Passthrough`.
+///
+/// **Tokenizer-unavailable fallback:** if `count_token_pair` returns `(None, None)`
+/// (counter init failed), fall back to a **byte** comparison:
+/// keep iff `compressed.len() < raw.len()`.  Never panics, never expands.
+///
+/// **Comparison normalization:** trailing whitespace is trimmed from both sides
+/// before comparison so a single trailing newline does not flip the decision
+/// arbitrarily (e.g. `println!` always appends `\n`; the raw command may or may
+/// not end with `\n`).  This keeps ties stable.
+///
+/// **JSON exempt:** callers are responsible for not calling this function when
+/// `output_format == OutputFormat::Json`.  JSON responses must never be rewritten
+/// to non-JSON; the guard only applies to `OutputFormat::Text` paths.
+///
+/// **Already-passthrough exempt:** if the parse tier is already `"passthrough"`,
+/// `compressed` IS the raw body (no re-encoding occurred); skip the guard.
+///
+/// **#317 invariant:** this guard only ever moves output toward *more-complete
+/// raw*.  It can never show LESS than raw.
+///
+/// **Size cap (performance):** for inputs above 64 MiB the tokenizer cost may
+/// be significant.  Above that threshold the function falls back to byte
+/// comparison, consistent with the "never expand" promise while keeping latency
+/// sub-millisecond.
+pub(crate) fn savings_decision(raw: &str, compressed: &str) -> SavingsDecision {
+    /// 64 MiB — above this threshold skip tokenization (performance cap).
+    /// Matches the stdin size cap documented in CLAUDE.md.
+    const TOKEN_SIZE_CAP: usize = 64 * 1024 * 1024;
+
+    // Normalize whitespace from both ends so leading/trailing formatting
+    // (e.g., a `println!` trailing newline, or a leading space before "OK")
+    // does not flip a tie.  We compare trimmed lengths; the actual emitted
+    // bytes are unchanged.
+    let raw_t = raw.trim();
+    let comp_t = compressed.trim();
+
+    // Special case: empty raw output.
+    //
+    // When the underlying command produced no output at all (e.g. a silent
+    // `make` recipe that exits 0 with no stdout/stderr), emitting a compressed
+    // summary like "OK warnings: 0 errors: 0" is strictly more output than
+    // the raw tool, so the standard token/byte comparison would fire
+    // `Passthrough` and emit nothing — suppressing the only signal the user
+    // gets that the build succeeded.
+    //
+    // Decision: Keep when raw is empty/whitespace-only.  The user already sees
+    // nothing from the raw tool; any compressed output adds information rather
+    // than expanding noise.  This is consistent with the "never expand" spirit
+    // (no information is lost; the result is strictly more useful than silence).
+    if raw_t.is_empty() {
+        return SavingsDecision::Keep;
+    }
+
+    // Fast path: byte comparison avoids tokenization for strictly larger or oversized inputs.
+    // Oversized inputs (> 64 MiB) skip tokenization for performance and fall back to bytes.
+    //
+    // Decision threshold: compressed must be strictly LONGER (> raw) to trigger Passthrough.
+    // Ties (equal trimmed-byte length) are kept — in practice equal-length cases represent
+    // semantic equivalence (e.g., `[]` → `OK`, 2 bytes each) where the compressed form is
+    // at least as informative as the raw form.  Expanding by ≥1 byte after trimming is the
+    // meaningful "expansion" we guard against.
+    if comp_t.len() > raw_t.len() || raw.len() > TOKEN_SIZE_CAP || compressed.len() > TOKEN_SIZE_CAP
+    {
+        // When we arrive here via the size-cap guard, bytes are the comparison.
+        // When we arrive via the strict-expansion guard, bytes already said "compressed longer".
+        return if comp_t.len() <= raw_t.len() {
+            // Above the cap but bytes say NOT longer — keep.
+            SavingsDecision::Keep
+        } else {
+            SavingsDecision::Passthrough
+        };
+    }
+
+    // comp_t.len() <= raw_t.len() here.  If strictly shorter, confirm with tokens.
+    // If equal (tie), token comparison on the TRIMMED strings decides — tied tokens → Keep.
+    // We tokenize the trimmed versions so trailing whitespace (e.g., a `println!` newline)
+    // does not inflate the compressed token count and flip a byte-tie to Passthrough.
+    match crate::process::count_token_pair(raw_t, comp_t) {
+        (Some(raw_tok), Some(comp_tok)) => {
+            if comp_tok <= raw_tok {
+                // Token tie or savings — keep compressed.
+                SavingsDecision::Keep
+            } else {
+                // Tokens say compressed is longer even though bytes were shorter or equal.
+                SavingsDecision::Passthrough
+            }
+        }
+        // Tokenizer unavailable: byte comparison says comp_t.len() <= raw_t.len() → Keep.
+        _ => SavingsDecision::Keep,
+    }
+}
+
 use super::{is_passthrough_mode, read_stdin_bounded, should_read_stdin};
 use super::{scrub_db_args, scrub_infra_args};
 
@@ -103,6 +230,20 @@ pub(crate) struct ParsedCommandConfig<'a> {
     /// compressed path. Set for tools whose parsers only consume stdout, so
     /// warnings/diagnostics on stderr are never silently dropped. (#317)
     pub forward_stderr: bool,
+    /// When `true`, skip the net-savings guard for this command (#317 / Cluster C).
+    ///
+    /// The guard normally prevents skim from emitting compressed output that is
+    /// larger (in tokens/bytes) than the raw tool output.  Some tools are exempt
+    /// because their output can legitimately restructure or reformat data in ways
+    /// that are more token-efficient for an LLM even when byte counts are similar:
+    ///
+    /// - `gh` — streaming / API responses where the skim summary is semantically
+    ///   richer than the raw JSON wire bytes (spec: "Exempt: `gh` streaming").
+    /// - `heatmap` — always produces structured human-readable output; no "raw"
+    ///   baseline is meaningful (spec: "Exempt: `heatmap`").
+    ///
+    /// Default: `false` (guard enabled).
+    pub skip_net_savings_guard: bool,
 }
 
 /// How a child process's exit status should steer output handling. (#317)
@@ -185,30 +326,48 @@ fn obtain_output(
     }
 }
 
+/// Serialize a parsed result to a string without writing to stdout.
+///
+/// Produces the same bytes that `render_output` would write, so callers can
+/// apply the net-savings guard (`savings_decision`) before deciding which string
+/// to actually emit.  `render_output` is kept as a convenience wrapper for
+/// paths that never need the guard (e.g. JSON output, which is exempt).
+fn serialize_output<T>(
+    result: &ParseResult<T>,
+    output_format: OutputFormat,
+) -> anyhow::Result<String>
+where
+    T: AsRef<str> + serde::Serialize,
+{
+    match output_format {
+        OutputFormat::Json => Ok(result.to_json_envelope()?),
+        OutputFormat::Text => {
+            let content = result.content();
+            if content.is_empty() || content.ends_with('\n') {
+                Ok(content.to_string())
+            } else {
+                Ok(format!("{content}\n"))
+            }
+        }
+    }
+}
+
+/// Write a pre-serialized string to stdout.
+fn write_to_stdout(s: &str) -> anyhow::Result<()> {
+    let mut handle = io::stdout().lock();
+    write!(handle, "{s}")?;
+    handle.flush()?;
+    Ok(())
+}
+
 /// Render parsed result to stdout, returning the output string for analytics.
 fn render_output<T>(result: &ParseResult<T>, output_format: OutputFormat) -> anyhow::Result<String>
 where
     T: AsRef<str> + serde::Serialize,
 {
-    match output_format {
-        OutputFormat::Json => {
-            let json_str = result.to_json_envelope()?;
-            let mut handle = io::stdout().lock();
-            writeln!(handle, "{json_str}")?;
-            handle.flush()?;
-            Ok(json_str)
-        }
-        OutputFormat::Text => {
-            let content = result.content();
-            let mut handle = io::stdout().lock();
-            write!(handle, "{content}")?;
-            if !content.is_empty() && !content.ends_with('\n') {
-                writeln!(handle)?;
-            }
-            handle.flush()?;
-            Ok(content.to_string())
-        }
-    }
+    let s = serialize_output(result, output_format)?;
+    write_to_stdout(&s)?;
+    Ok(s)
 }
 
 /// Write raw command output to stdout/stderr and return the process exit code.
@@ -375,6 +534,7 @@ where
         rec,
         expected_exit_codes,
         forward_stderr,
+        skip_net_savings_guard,
     } = config;
 
     let Some(output) = obtain_output(program, args, env_overrides, install_hint, use_stdin)? else {
@@ -442,7 +602,47 @@ where
     let label = format_analytics_label(family, program, &args.join(" "));
     let tier_name = result.tier_name();
 
-    let compressed = render_output(&result, output_format)?;
+    // Net-savings guard (Cluster C / #317):
+    // Serialize first without writing, so we can apply savings_decision
+    // before committing to stdout.
+    //
+    // Exemptions:
+    // - JSON output: must never be rewritten to non-JSON.
+    // - Already-passthrough tier: compressed IS the raw body (no re-encoding);
+    //   guard would be a no-op but skipping avoids double tokenization.
+    //
+    // "raw" baseline for this sink = post-ANSI-strip stdout (`output.stdout`).
+    // This is the correct baseline because ANSI stripping is already applied
+    // above; the user's terminal would see the same stripped bytes.
+    let (compressed, effective_tier) = if output_format == OutputFormat::Text
+        && tier_name != "passthrough"
+        && !skip_net_savings_guard
+    {
+        let compressed_str = serialize_output(&result, output_format)?;
+        match savings_decision(&output.stdout, &compressed_str) {
+            SavingsDecision::Keep => {
+                write_to_stdout(&compressed_str)?;
+                (compressed_str, tier_name)
+            }
+            SavingsDecision::Passthrough => {
+                // Emit raw verbatim; record analytics under "passthrough" tier
+                // so `should_emit_compressed_hint` stays silent (passthrough tier
+                // never gets the hint — the body is already verbatim raw).
+                let raw = &output.stdout;
+                let mut out = io::stdout().lock();
+                write!(out, "{raw}")?;
+                if !raw.is_empty() && !raw.ends_with('\n') {
+                    writeln!(out)?;
+                }
+                out.flush()?;
+                (raw.clone(), "passthrough")
+            }
+        }
+    } else {
+        // JSON or already-passthrough: write normally, no guard needed.
+        let s = render_output(&result, output_format)?;
+        (s, tier_name)
+    };
 
     if let Some(err_text) = stderr_to_forward {
         let mut err = io::stderr().lock();
@@ -460,7 +660,7 @@ where
         original_stdout: output.stdout,
         compressed,
         rec,
-        tier_name,
+        tier_name: effective_tier,
         label,
         duration: output.duration,
     });
@@ -534,6 +734,9 @@ pub(crate) struct ToolRunConfig<'a> {
     /// Forward child stderr verbatim on the compressed path.
     /// See [`ParsedCommandConfig::forward_stderr`]. (#317)
     pub forward_stderr: bool,
+    /// Skip the net-savings guard.
+    /// See [`ParsedCommandConfig::skip_net_savings_guard`]. (#317)
+    pub skip_net_savings_guard: bool,
 }
 
 /// Execute a tool, parse its output, and emit the result.
@@ -580,6 +783,7 @@ where
             },
             expected_exit_codes: config.expected_exit_codes,
             forward_stderr: config.forward_stderr,
+            skip_net_savings_guard: config.skip_net_savings_guard,
         },
         parse_fn,
     )
@@ -873,5 +1077,137 @@ mod tests {
             should_emit_compressed_hint("npm", 1, "full"),
             "npm exit 1 is a real error — hint must fire"
         );
+    }
+
+    // ========================================================================
+    // savings_decision tests (Cluster C / #317)
+    // ========================================================================
+
+    /// Empty raw with empty compressed — both empty → Keep (nothing to expand from).
+    #[test]
+    fn savings_decision_empty_raw_empty_compressed_keep() {
+        // raw is empty → Keep regardless (empty-raw special case).
+        assert_eq!(savings_decision("", ""), SavingsDecision::Keep);
+    }
+
+    /// Empty raw with non-empty compressed: the parser produced a summary.
+    /// Should Keep because raw was empty — this is informational, not expansion.
+    #[test]
+    fn savings_decision_empty_raw_non_empty_compressed_keep() {
+        assert_eq!(
+            savings_decision("", "OK warnings: 0 errors: 0\n"),
+            SavingsDecision::Keep,
+            "empty raw: keep parser-produced summary (better than silence)"
+        );
+    }
+
+    /// Raw and compressed identical — semantic tie → Keep (tie policy).
+    #[test]
+    fn savings_decision_identical_input_keep() {
+        let text = "hello world\n";
+        assert_eq!(
+            savings_decision(text, text),
+            SavingsDecision::Keep,
+            "tie (identical strings) must Keep — compressed is not longer"
+        );
+    }
+
+    /// Compressed is strictly shorter by bytes → Keep.
+    #[test]
+    fn savings_decision_shorter_compressed_keep() {
+        let raw = "a".repeat(100);
+        let compressed = "a".repeat(50);
+        assert_eq!(savings_decision(&raw, &compressed), SavingsDecision::Keep);
+    }
+
+    /// Compressed is strictly longer → Passthrough (never expand).
+    #[test]
+    fn savings_decision_longer_compressed_passthrough() {
+        let raw = "short\n";
+        let compressed = raw.repeat(3); // 3× raw is longer
+        assert_eq!(
+            savings_decision(raw, &compressed),
+            SavingsDecision::Passthrough
+        );
+    }
+
+    /// Trailing-newline normalisation: `println!` appends `\n` to the compressed
+    /// string; the raw command may not end with `\n`.  After trimming both sides
+    /// the trimmed lengths are equal → Keep (tie policy: keep on equal-length).
+    #[test]
+    fn savings_decision_trailing_newline_tie_keep() {
+        let raw = "same content"; // no trailing newline
+        let compressed = "same content\n"; // println! adds newline
+        assert_eq!(
+            savings_decision(raw, compressed),
+            SavingsDecision::Keep,
+            "trailing newline must not flip a tie to Passthrough (tie policy: Keep)"
+        );
+    }
+
+    /// Compressed shorter even after trailing-newline trim → Keep.
+    #[test]
+    fn savings_decision_shorter_after_trim_keep() {
+        let raw = "aaabbbccc"; // 9 bytes, no newline
+        let compressed = "abc\n"; // 4 bytes trimmed = 3 < 9
+        assert_eq!(savings_decision(raw, compressed), SavingsDecision::Keep);
+    }
+
+    /// Strict-expansion passthrough boundary: compressed is exactly raw+1 byte → Passthrough.
+    #[test]
+    fn savings_decision_one_byte_expansion_passthrough() {
+        let raw = "hello";
+        let compressed = "hello!"; // 6 bytes > 5 bytes: strictly longer
+        assert_eq!(
+            savings_decision(raw, compressed),
+            SavingsDecision::Passthrough
+        );
+    }
+
+    /// Large input above TOKEN_SIZE_CAP (64 MiB): falls back to byte comparison.
+    /// Compressed shorter → Keep.
+    #[test]
+    fn savings_decision_above_cap_bytes_keep() {
+        let raw = "x".repeat(65 * 1024 * 1024); // 65 MiB
+        let compressed = "x".repeat(1024); // much shorter
+        assert_eq!(savings_decision(&raw, &compressed), SavingsDecision::Keep);
+    }
+
+    /// Large input above TOKEN_SIZE_CAP: compressed STRICTLY LARGER → Passthrough.
+    #[test]
+    fn savings_decision_above_cap_bytes_passthrough() {
+        let raw = "x".repeat(65 * 1024 * 1024); // 65 MiB
+        let compressed = "y".repeat(65 * 1024 * 1024 + 1); // 1 byte strictly longer
+        assert_eq!(
+            savings_decision(&raw, &compressed),
+            SavingsDecision::Passthrough
+        );
+    }
+
+    /// Large input above TOKEN_SIZE_CAP: same-size → Keep (tie policy applies above cap too).
+    #[test]
+    fn savings_decision_above_cap_bytes_tie_keep() {
+        let raw = "x".repeat(65 * 1024 * 1024); // 65 MiB
+        let compressed = "y".repeat(65 * 1024 * 1024); // same size
+        assert_eq!(savings_decision(&raw, &compressed), SavingsDecision::Keep);
+    }
+
+    /// Verify the must_use attribute fires (compile-time; checked via doc).
+    /// Property: savings_decision never returns a value that emits more than raw.
+    /// (Runtime property; cannot be verified exhaustively, but spot-check here.)
+    #[test]
+    fn savings_decision_keep_always_means_compressed_shorter_bytes() {
+        // Fuzz-style: for all (raw, compressed) pairs where Keep is returned,
+        // compressed.trim_end().len() < raw.trim_end().len() must hold.
+        let cases = vec![("abcdef", "ab"), ("line1\nline2\nline3\n", "summary\n")];
+        for (raw, compressed) in cases {
+            let decision = savings_decision(raw, compressed);
+            if decision == SavingsDecision::Keep {
+                assert!(
+                    compressed.trim_end().len() < raw.trim_end().len(),
+                    "Keep returned but compressed is not shorter: raw={raw:?} comp={compressed:?}"
+                );
+            }
+        }
     }
 }

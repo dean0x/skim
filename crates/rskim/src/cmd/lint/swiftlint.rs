@@ -29,6 +29,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::Lint,
     expected_exit_codes: &[2],
     forward_stderr: false,
+    skip_net_savings_guard: false,
 };
 
 /// `file.swift:line:col: warning: message (rule_id)`

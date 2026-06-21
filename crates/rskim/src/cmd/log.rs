@@ -159,7 +159,35 @@ pub(crate) fn run(
     let stdin_buf = super::read_stdin_bounded()?;
     let raw_input = stdin_buf.as_str();
     let result = compress_log(raw_input, &flags);
-    let compressed = emit_result(&result, &flags)?;
+
+    // Net-savings guard (Cluster C / #317):
+    // For log, "raw" = stdin_buf (the user's log input).
+    // Exempt: JSON output (must never rewrite to non-JSON) and already-passthrough tier.
+    // The guard is applied before emit_result so we can choose what to write.
+    let effective_tier = result.tier_name();
+    let (compressed, effective_tier) = if !flags.json_output && effective_tier != "passthrough" {
+        let compressed_str = result.content().to_string();
+        match crate::cmd::execution::savings_decision(raw_input, &compressed_str) {
+            crate::cmd::execution::SavingsDecision::Keep => {
+                // Emit compressed normally.
+                let s = emit_result(&result, &flags)?;
+                (s, effective_tier)
+            }
+            crate::cmd::execution::SavingsDecision::Passthrough => {
+                // Emit raw verbatim to stdout.
+                let mut stdout = io::stdout().lock();
+                write!(stdout, "{raw_input}")?;
+                if !raw_input.is_empty() && !raw_input.ends_with('\n') {
+                    writeln!(stdout)?;
+                }
+                stdout.flush()?;
+                (raw_input.to_string(), "passthrough")
+            }
+        }
+    } else {
+        let s = emit_result(&result, &flags)?;
+        (s, effective_tier)
+    };
 
     // Issue 4: compute token counts before analytics to avoid re-tokenizing in
     // the background thread (avoids copying up to 64 MiB via raw_input.to_string()).
@@ -175,7 +203,7 @@ pub(crate) fn run(
         raw_tokens,
         compressed_tokens,
         duration,
-        result.tier_name(),
+        effective_tier,
         analytics.session_id.as_deref(),
     );
     Ok(ExitCode::SUCCESS)

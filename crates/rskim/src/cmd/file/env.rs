@@ -40,6 +40,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::FileOps,
     expected_exit_codes: &[],
     forward_stderr: true,
+    skip_net_savings_guard: false,
 };
 
 /// Regex to detect and redact URL credentials: scheme://user:pass@host

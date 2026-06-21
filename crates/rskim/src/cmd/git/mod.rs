@@ -420,17 +420,45 @@ where
     let result = parser(&raw);
     // Capture parse_tier before result is consumed by rendering.
     let parse_tier = result.parse_tier;
-    let result_str = match output_format {
+
+    // Serialize first without printing so the net-savings guard can decide.
+    //
+    // Exemptions:
+    // - JSON output: must never be rewritten to non-JSON.
+    // - Already-passthrough tier: `raw` IS the body; guard is a no-op.
+    //
+    // "raw" baseline = post-ANSI-strip `raw` (stdout or combined stderr+stdout).
+    let (result_str, effective_tier) = match output_format {
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize result: {e}"))?;
             println!("{json}");
-            json
+            (json, parse_tier)
         }
         OutputFormat::Text => {
             let s = result.to_string();
-            println!("{s}");
-            s
+            let tier_str: Option<&'static str> = if parse_tier.is_some_and(|t| t == "passthrough") {
+                // Already passthrough — skip guard, print as-is.
+                println!("{s}");
+                parse_tier
+            } else {
+                // Apply net-savings guard.
+                match crate::cmd::execution::savings_decision(&raw, &s) {
+                    crate::cmd::execution::SavingsDecision::Keep => {
+                        println!("{s}");
+                        parse_tier
+                    }
+                    crate::cmd::execution::SavingsDecision::Passthrough => {
+                        // Emit raw verbatim; record under "passthrough" tier.
+                        print!("{raw}");
+                        if !raw.is_empty() && !raw.ends_with('\n') {
+                            println!();
+                        }
+                        Some("passthrough")
+                    }
+                }
+            };
+            (s, tier_str)
         }
     };
 
@@ -443,12 +471,13 @@ where
     // `label` is supplied by the caller from the user's original (pre-rewrite) args
     // so the analytics DB records the invocation as the user typed it.
     // `parse_tier` propagates the parser's tier annotation to the analytics DB (AD-GIT-12).
+    // When savings_decision flips to Passthrough, effective_tier overrides parse_tier.
     finalize_git_output_owned(
         analytics_raw,
         result_str,
         label,
         show_stats,
-        rec.with_tier_opt(parse_tier),
+        rec.with_tier_opt(effective_tier),
         output.duration,
     );
 

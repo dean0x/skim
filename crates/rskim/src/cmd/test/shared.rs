@@ -146,20 +146,51 @@ where
 
     let result = parse_fn(&raw_output);
 
+    // Track the effective analytics tier; may be overridden to "passthrough"
+    // if the net-savings guard fires on the Full/Degraded arm.
+    let mut effective_tier = result.tier_name();
+
     let exit_code = match &result {
         ParseResult::Full(test_result) | ParseResult::Degraded(test_result, _) => {
-            println!("{test_result}");
             let stderr = io::stderr();
             let mut handle = stderr.lock();
             let _ = result.emit_markers(&mut handle);
 
             let ec = resolve_exit_code(test_result.summary.fail, exit_source);
+
+            // Net-savings guard (Cluster C / #317):
+            // "raw" baseline = raw_output (combined stdout+stderr, ANSI-stripped).
+            // Exempt: already-passthrough tier (handled in the arm below).
+            // Preserve emit_failure_context — it writes to stdout AFTER the
+            // main result, and reads from raw_output (not the compressed string),
+            // so it is unaffected by whether we emit compressed or raw here.
+            let compressed_str = test_result.to_string();
+            let decision = crate::cmd::execution::savings_decision(&raw_output, &compressed_str);
+            match decision {
+                crate::cmd::execution::SavingsDecision::Keep => {
+                    println!("{test_result}");
+                }
+                crate::cmd::execution::SavingsDecision::Passthrough => {
+                    // Emit raw verbatim; drop the compressed summary.
+                    // Record analytics under "passthrough" so the hint stays silent.
+                    print!("{raw_output}");
+                    if !raw_output.is_empty() && !raw_output.ends_with('\n') {
+                        println!();
+                    }
+                    effective_tier = "passthrough";
+                }
+            }
+
             if ec != ExitCode::SUCCESS {
                 emit_failure_context(&raw_output, exit_code_byte(exit_source) as i32);
             }
             ec
         }
         ParseResult::Passthrough(raw) => {
+            // NOTE: Do NOT add the savings guard here. Cluster D owns the
+            // exit-code bug at this arm (L162-166 in the original); changing
+            // output routing here would complicate that fix. The passthrough
+            // arm already emits verbatim raw — the guard would be a no-op anyway.
             println!("{raw}");
             let _ = result.emit_markers(&mut io::stderr().lock());
             ExitCode::FAILURE
@@ -172,7 +203,7 @@ where
     }
 
     crate::analytics::try_record_command(
-        rec.with_tier(result.tier_name()),
+        rec.with_tier(effective_tier),
         raw_output,
         result.content().to_string(),
         crate::cmd::format_analytics_label("test", config.program, &args.join(" ")),

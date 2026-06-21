@@ -36,6 +36,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::Infra,
     expected_exit_codes: &[],
     forward_stderr: false,
+    skip_net_savings_guard: false,
 };
 
 /// Maximum byte length of JSON input accepted for Tier 1 parsing.

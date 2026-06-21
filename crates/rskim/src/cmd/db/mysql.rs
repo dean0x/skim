@@ -37,6 +37,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::Db,
     expected_exit_codes: &[],
     forward_stderr: true,
+    skip_net_savings_guard: false,
 };
 
 /// Matches MySQL's "Empty set" output.

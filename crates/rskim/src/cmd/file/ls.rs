@@ -41,6 +41,7 @@ const CONFIG_LS: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::FileOps,
     expected_exit_codes: &[],
     forward_stderr: true,
+    skip_net_savings_guard: false,
 };
 
 const CONFIG_TREE: ToolRunConfig<'static> = ToolRunConfig {
@@ -52,6 +53,7 @@ const CONFIG_TREE: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::FileOps,
     expected_exit_codes: &[],
     forward_stderr: true,
+    skip_net_savings_guard: false,
 };
 
 /// Matches a long-form ls entry line: permissions + link count + owner + ...
