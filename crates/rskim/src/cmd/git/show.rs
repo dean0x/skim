@@ -791,10 +791,7 @@ fn run_show_file_content(
     // signatures.  Pseudo preserves logic flow while stripping syntactic noise
     // (type annotations, visibility modifiers, etc.), giving ~30-50% reduction
     // without hiding implementation detail the agent is trying to read.
-    let config = TransformConfig {
-        mode: Mode::Pseudo,
-        ..TransformConfig::default()
-    };
+    let config = TransformConfig::with_mode(Mode::Pseudo);
     let transformed = match rskim_core::transform(&raw, lang, config.mode) {
         Ok(t) => t,
         Err(e) => {
@@ -1479,11 +1476,8 @@ mod tests {
     /// which is wrong when the agent is reading a specific file at a ref.
     /// Pseudo preserves logic flow while reducing token count.
     #[test]
-    fn fix_d_file_content_transform_uses_pseudo_mode() {
-        let config = TransformConfig {
-            mode: Mode::Pseudo,
-            ..TransformConfig::default()
-        };
+    fn test_fix_d_file_content_transform_uses_pseudo_mode() {
+        let config = TransformConfig::with_mode(Mode::Pseudo);
         assert_eq!(
             config.mode,
             Mode::Pseudo,
@@ -1502,7 +1496,7 @@ mod tests {
     /// Guards that Pseudo mode does not silently strip function bodies when
     /// given Rust source — agents reading file content must see the logic.
     #[test]
-    fn fix_d_pseudo_mode_preserves_function_body() {
+    fn test_fix_d_pseudo_mode_preserves_function_body() {
         use rskim_core::Language;
         let rust_src = r#"fn greet(name: &str) -> String {
     format!("Hello, {}!", name)
@@ -1519,5 +1513,55 @@ mod tests {
             output.contains("Hello") || output.contains("format") || output.contains("greet"),
             "Pseudo output must contain function body content, got: {output:?}"
         );
+    }
+
+    /// Pseudo mode retains body logic that Structure mode strips.
+    ///
+    /// Transform-level companion to the production-path E2E
+    /// `test_skim_git_show_file_content_pseudo_preserves_bodies` (tests/cli_git.rs).
+    /// This asserts WHY Fix D's mode choice matters: at the `rskim_core::transform`
+    /// layer that `run_show_file_content` drives, Pseudo surfaces function-body
+    /// tokens while Structure collapses bodies to `{...}` and drops them.  It does
+    /// NOT, on its own, guard the production mode constant — it calls `transform`
+    /// with explicit modes, so it would pass even if show.rs reverted to Structure.
+    /// That production guard is the cli_git.rs E2E, which drives the real
+    /// `git show <ref>:<file>` path end-to-end.
+    ///
+    /// The tokens below live ONLY inside function bodies in the fixture (not in
+    /// any signature, doc comment, `use`, or struct field), so Structure — which
+    /// keeps signatures/imports — must drop every one of them.
+    #[test]
+    fn test_fix_d_pseudo_vs_structure_discriminates_body_tokens() {
+        use rskim_core::Language;
+        let source = include_str!("../../../tests/fixtures/cmd/git/show_file.rs");
+        let lang = Language::from_path(std::path::Path::new("show_file.rs"))
+            .expect("show_file.rs must be detected as Rust");
+
+        // Structure mode — what Fix D replaces — collapses function bodies.
+        let structure_out = rskim_core::transform(source, lang, Mode::Structure)
+            .expect("Structure transform must succeed");
+
+        // Pseudo mode — what Fix D uses — preserves logic flow inside bodies.
+        let pseudo_out = rskim_core::transform(source, lang, Mode::Pseudo)
+            .expect("Pseudo transform must succeed");
+
+        // Body-only tokens: a method call, an error string, and a stdlib call
+        // that each appear solely inside a collapsed function body.
+        let body_tokens = [
+            "find_user_by_username",
+            "Invalid credentials",
+            "duration_since",
+        ];
+        for t in body_tokens {
+            assert!(
+                pseudo_out.contains(t),
+                "Pseudo mode must retain body token {t:?} so agents can read logic; got: {pseudo_out:?}"
+            );
+            assert!(
+                !structure_out.contains(t),
+                "Structure mode must strip body token {t:?} — confirms the modes \
+                 differ, validating that Fix D's Pseudo choice matters; got: {structure_out:?}"
+            );
+        }
     }
 }
