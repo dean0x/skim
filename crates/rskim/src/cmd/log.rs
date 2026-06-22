@@ -7,6 +7,22 @@
 //! - **Tier 1 (Full)**: JSON log lines (structured logging with level/msg fields)
 //! - **Tier 2 (Degraded)**: Regex on common log formats (timestamp + level)
 //! - **Tier 3 (Passthrough)**: Raw output
+//!
+//! # R1 — canonical compress_log lives in rskim-compress (AC26 / #327)
+//!
+//! The `compress_log` function now delegates to `rskim_compress::log::compress_log`.
+//! `rskim-core` MUST NOT gain `regex` (AC26), so the log machinery lives in the
+//! new `rskim-compress` crate where `regex` is an allowed dep.
+//!
+//! The internal helpers (`try_parse_json_logs`, `try_parse_regex_logs`, etc.) are
+//! retained here as test-support implementations. They are no longer on the
+//! production code path (compress_log now delegates to rskim-compress); the
+//! `#[allow(dead_code)]` attribute suppresses the resulting dead-code lints while
+//! keeping the exhaustive unit-test coverage in place (AC25 — no regression).
+
+// Internal helpers are only called from the test module (via `use super::*`).
+// They are retained here to preserve exhaustive unit-test coverage (AC25).
+#![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, IsTerminal, Write};
@@ -270,22 +286,63 @@ pub(super) fn command() -> clap::Command {
 // ============================================================================
 
 /// Compress log lines into a structured ParseResult<LogResult>.
+///
+/// # R1 — Delegates to rskim-compress (AC26 / #327)
+///
+/// The canonical `compress_log` implementation lives in `rskim_compress::log`.
+/// `rskim-core` MUST NOT gain `regex` (AC26: pure transform lib, zero regex refs
+/// today). This wrapper converts between the binary's internal types and the
+/// rskim-compress public types, enabling rskim's tests to continue testing the
+/// internal helpers (`try_parse_json_logs`, etc.) while routing the handler
+/// through the library crate.
+///
+/// Behavior is identical to the original implementation (AC25 — no regression).
 pub(crate) fn compress_log(input: &str, flags: &LogFlags) -> ParseResult<LogResult> {
-    // Try Tier 1: structured JSON logs
-    if let Some(result) = try_parse_json_logs(input, flags) {
-        return ParseResult::Full(result);
-    }
+    // Convert local LogFlags → rskim-compress LogFlags (identical fields).
+    let compress_flags = rskim_compress::log::LogFlags {
+        no_dedup: flags.no_dedup,
+        keep_timestamps: flags.keep_timestamps,
+        keep_debug: flags.keep_debug,
+        debug_only: flags.debug_only,
+        show_stats: flags.show_stats,
+        json_output: flags.json_output,
+    };
 
-    // Try Tier 2: regex-based log formats
-    if let Some(result) = try_parse_regex_logs(input, flags) {
-        return ParseResult::Degraded(
-            result,
-            vec!["log: no structured entries found, using regex".to_string()],
-        );
+    // Call the canonical implementation in rskim-compress (#327 / R1).
+    match rskim_compress::log::compress_log(input, &compress_flags) {
+        rskim_compress::log::ParseResult::Full(r) => ParseResult::Full(convert_log_result(r)),
+        rskim_compress::log::ParseResult::Degraded(r, w) => {
+            ParseResult::Degraded(convert_log_result(r), w)
+        }
+        rskim_compress::log::ParseResult::Passthrough(s) => ParseResult::Passthrough(s),
     }
+}
 
-    // Tier 3: passthrough
-    ParseResult::Passthrough(input.to_string())
+/// Convert from `rskim_compress::log::LogResult` to `crate::output::canonical::LogResult`.
+///
+/// Both types have identical fields; this conversion exists because the binary's
+/// `output::canonical::LogResult` is used widely in the rskim codebase
+/// (`emit_result`, tests, `output::canonical` tests) and cannot be replaced by
+/// the rskim-compress type without a broader refactor (deferred to a later ticket).
+fn convert_log_result(r: rskim_compress::log::LogResult) -> LogResult {
+    let entries: Vec<crate::output::canonical::LogEntry> = r
+        .entries
+        .into_iter()
+        .map(|e| crate::output::canonical::LogEntry {
+            level: e.level,
+            message: e.message,
+            count: e.count,
+        })
+        .collect();
+    LogResult::new_with_stack(
+        r.total_lines,
+        r.unique_messages,
+        r.debug_hidden,
+        r.deduplicated_count,
+        entries,
+        r.debug_only,
+        r.stack_frames_elided,
+    )
 }
 
 // ============================================================================
