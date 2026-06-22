@@ -815,6 +815,19 @@ Temporal flag composition:
   --hot and --cold/--risky are mutually exclusive (pick one sort mode).
   --blast-radius is composable with any sort mode and with text queries.
 
+Composite ranking options (#200):
+  --weights L,A,T      Tune the --blast-radius composite RRF ranking.
+                       Exactly 3 comma-separated ratio values: lexical, ast, temporal.
+                       Default: 0.5,0.3,0.2
+                       Values are ratios only — NOT normalized; zero and non-sum-to-1
+                       are allowed. Negative, NaN, and inf are rejected.
+                       Only active on the --blast-radius composite ranking path;
+                       the 3 extended signals (import_graph, dir_proximity,
+                       structural_coupling) are fixed at 0.0 until measured.
+
+  Example: --weights 0.8,0.1,0.1  (lexical-heavy)
+           --weights 0.2,0.2,0.6  (temporal-heavy)
+
 General examples:
   skim search \"authenticate\"                Search for 'authenticate'
   skim search --limit 5 \"parse_url\"         Return at most 5 results

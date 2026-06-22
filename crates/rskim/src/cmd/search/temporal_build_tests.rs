@@ -974,3 +974,95 @@ fn test_rebuild_temporal_second_run_preserves_prior_head() {
         "META_GIT_HEAD must be preserved (or updated) after second rebuild (AC12)"
     );
 }
+
+// ============================================================================
+// B3b — E2E mutual exclusion: rebuild_temporal waits for the same lock
+// ============================================================================
+
+/// Prove that `rebuild_temporal` acquires the same `{cache_dir}/.skim-build.lock`
+/// used by `build_index`, so both build paths are mutually exclusive.
+///
+/// Requires git. If git is unavailable the test prints "SKIP: ..." and returns.
+///
+/// The test acquires the advisory lock directly, spawns a worker thread that
+/// calls `rebuild_temporal` on a real git repo, holds the lock ~300 ms, then
+/// records `t_release` and releases. We assert:
+///   - the worker succeeds (Ok), AND
+///   - it completed AFTER `t_release` (t_complete >= t_release).
+///
+/// A 30-second `recv_timeout` ensures the test never hangs.
+#[test]
+fn e2e_rebuild_temporal_waits_for_same_lock() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use super::current_epoch_secs;
+    use super::rebuild_temporal;
+
+    // ── git availability guard ────────────────────────────────────────────────
+    let init_check = Command::new("git").arg("--version").output();
+    if init_check.map(|o| !o.status.success()).unwrap_or(true) {
+        eprintln!("SKIP e2e_rebuild_temporal_waits_for_same_lock: git not available");
+        return;
+    }
+
+    // ── set up a real git repo ────────────────────────────────────────────────
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let head = create_real_git_repo(
+        dir.path(),
+        &[
+            ("feat: first", &[("hot.rs", "fn a() {}")]),
+            ("feat: second", &[("hot.rs", "fn b() {}")]),
+        ],
+    );
+
+    if head.is_empty() {
+        eprintln!(
+            "SKIP e2e_rebuild_temporal_waits_for_same_lock: git commit failed (no identity?)"
+        );
+        return;
+    }
+
+    // ── acquire the SAME advisory lock that rebuild_temporal will use ─────────
+    let lock_holder = super::super::build_lock::acquire("e2e-holder-temporal", &cache_dir)
+        .expect("must acquire lock");
+
+    // Channel: worker sends (is_ok, t_complete) after rebuild_temporal returns.
+    let (tx, rx) = mpsc::channel::<(bool, Instant)>();
+
+    let root_path = dir.path().to_path_buf();
+    let cache_path = cache_dir.clone();
+    let head_clone = head.clone();
+    let worker = std::thread::spawn(move || {
+        let now = current_epoch_secs();
+        let result = rebuild_temporal(&root_path, &cache_path, &head_clone, now);
+        let t_complete = Instant::now();
+        tx.send((result.is_ok(), t_complete)).ok();
+    });
+
+    // Hold the lock for ~300 ms, then record t_release and drop.
+    std::thread::sleep(Duration::from_millis(300));
+    let t_release = Instant::now();
+    drop(lock_holder);
+
+    // Wait up to 30 s for the worker.
+    let (is_ok, t_complete) = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("worker did not complete within 30 s");
+
+    worker.join().expect("worker thread panicked");
+
+    assert!(
+        is_ok,
+        "rebuild_temporal must succeed after lock is released"
+    );
+    assert!(
+        t_complete >= t_release,
+        "rebuild_temporal must complete AFTER the lock was released — \
+         proving it contends on the same .skim-build.lock as build_index \
+         (t_complete={t_complete:?}, t_release={t_release:?})"
+    );
+}
