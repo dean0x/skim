@@ -35,6 +35,7 @@
 //! since indexing, the mtime will differ and the caller's stale guard will degrade
 //! to file-level output before this function is called.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
 
@@ -117,11 +118,13 @@ pub fn recover_line(
     // Parse.
     let tree = parser.parse(source).ok()?;
 
-    // Resolve the pattern to a set of target NodeKindIds.
-    // We collect the child-side (the deepest node) of each bigram/trigram.
-    let target_kind_ids: Vec<NodeKindId> = collect_target_kinds(query);
+    // Resolve the query ONCE into an O(1) lookup table for the CST walk.
+    // The resolved bigram/trigram sets are loop-invariant (they depend only on
+    // `query`, not on any node), so resolving them per node would re-allocate and
+    // re-run `resolve_kind_name` for every node in the tree.
+    let match_table = MatchTable::build(query);
 
-    if target_kind_ids.is_empty() {
+    if match_table.is_empty() {
         // Pattern has no resolvable kinds in this grammar → degrade.
         return None;
     }
@@ -131,22 +134,14 @@ pub fn recover_line(
     let iter = AstWalkIter::new(tree.walk(), walk_config);
     let mut prev_kind: Option<NodeKindId> = None;
 
-    // We need to track the previous node's kind to check bigrams (parent → child).
-    // The AstWalkIter already visits nodes in pre-order; we inspect each consecutive
-    // pair. For a bigram (P, C), we report the C node's location when we observe the
-    // sequence prev_kind == P followed by current kind == C.
-    //
-    // For Pattern queries, resolved_bigrams() returns the (parent, child) pairs;
-    // we report the first node where child-kind is in our target set AND the
-    // preceding node was the parent kind.
-    //
-    // For simplicity and determinism, we use a one-pass approach:
-    // report the first node whose kind (as a NodeKindId via vocabulary) is in
-    // the target set, taking into account the bigram context.
+    // The AstWalkIter visits nodes in pre-order; we inspect each consecutive
+    // (prev, current) pair against the precomputed table. For a bigram (P, C) we
+    // report the C node's location when we observe prev_kind == P followed by
+    // current kind == C. Trigrams are approximated by their innermost child
+    // (exact trigram re-match tracked in #338).
     //
     // Implementation note: tree-sitter node kinds use per-grammar numeric IDs,
     // not global vocabulary IDs. We map via `vocab_lookup(node.kind())`.
-
     for walk_node in iter {
         let node = walk_node.node;
         let kind_str = node.kind();
@@ -157,8 +152,8 @@ pub fn recover_line(
             continue;
         };
 
-        // Check if this node is a valid match given the bigram context.
-        if is_match(query, prev_kind, kind_id) {
+        // O(1) match check against the precomputed table, given the bigram context.
+        if match_table.matches(prev_kind, kind_id) {
             // Found! Recover 1-indexed line and byte range.
             let row = node.start_position().row; // 0-indexed
             // Widen usize → u32 safely; line numbers beyond u32::MAX are
@@ -175,96 +170,76 @@ pub fn recover_line(
     None
 }
 
-/// Check whether the current node (with kind `current`) is a valid match
-/// given the query and the previous sibling/parent kind.
+/// Precomputed O(1) lookup table for the CST walk.
 ///
-/// For [`AstQuery::Pattern`]: the node matches if `current` is the child-side
-/// of any resolved bigram AND `prev` is the corresponding parent-side.
-/// (Trigrams are approximated by checking just the innermost child for
-/// simplicity; exact trigram re-match is tracked in #338.)
+/// Resolving a query's bigrams/trigrams is loop-invariant, so we resolve once
+/// and store the result as hash sets the per-node walk can probe in O(1):
+/// - `bigrams`: the `(parent, child)` kind pairs of every resolved bigram.
+/// - `trigram_children`: the innermost-child kind of every resolved trigram.
+///   Parent/grandparent context is approximated — exact trigram re-match is
+///   tracked in #338.
 ///
-/// For [`AstQuery::Containment`]: same logic applied to the query's bigrams
-/// and trigrams.
-fn is_match(query: &AstQuery, prev: Option<NodeKindId>, current: NodeKindId) -> bool {
-    let Some(prev_kind) = prev else {
-        // No previous node — bigram context unavailable.
-        return false;
-    };
-
-    match query {
-        AstQuery::Pattern(pattern) => {
-            // Check resolved bigrams: (parent, child).
-            for bigram in pattern.resolved_bigrams() {
-                let (parent, child) = bigram.decode();
-                if parent == prev_kind && child == current {
-                    return true;
-                }
-            }
-            // Check resolved trigrams (innermost child only for simplicity).
-            for trigram in pattern.resolved_trigrams() {
-                let (_, _, child) = trigram.decode();
-                if child == current {
-                    return true;
-                }
-            }
-            false
-        }
-        AstQuery::Containment(ngram_set) => {
-            // Check bigrams.
-            for entry in &ngram_set.bigrams {
-                let (parent, child) = entry.ngram.decode();
-                if parent == prev_kind && child == current {
-                    return true;
-                }
-            }
-            // Check trigrams (innermost child).
-            for entry in &ngram_set.trigrams {
-                let (_, _, child) = entry.ngram.decode();
-                if child == current {
-                    return true;
-                }
-            }
-            false
-        }
-        AstQuery::SingleNode(_) => {
-            // SingleNode is not supported (errors at CLI boundary in validate_ast_pattern).
-            false
-        }
-    }
+/// [`AstQuery::Pattern`] and [`AstQuery::Containment`] share identical match
+/// logic and differ only in their source of bigrams/trigrams, so both collapse
+/// into one table.
+struct MatchTable {
+    bigrams: HashSet<(NodeKindId, NodeKindId)>,
+    trigram_children: HashSet<NodeKindId>,
 }
 
-/// Collect the set of NodeKindIds that serve as matching targets for `query`.
-///
-/// Returns the child-side of every resolved bigram and the innermost child of
-/// every resolved trigram. This set is used to build the O(1) lookup table for
-/// the CST walk.
-fn collect_target_kinds(query: &AstQuery) -> Vec<NodeKindId> {
-    match query {
-        AstQuery::Pattern(pattern) => {
-            let mut kinds: Vec<NodeKindId> = Vec::new();
-            for bigram in pattern.resolved_bigrams() {
-                let (_, child) = bigram.decode();
-                kinds.push(child);
+impl MatchTable {
+    /// Resolve `query` into the lookup table once, before the walk begins.
+    fn build(query: &AstQuery) -> Self {
+        let mut bigrams = HashSet::new();
+        let mut trigram_children = HashSet::new();
+        match query {
+            AstQuery::Pattern(pattern) => {
+                for bigram in pattern.resolved_bigrams() {
+                    let (parent, child) = bigram.decode();
+                    bigrams.insert((parent, child));
+                }
+                for trigram in pattern.resolved_trigrams() {
+                    let (_, _, child) = trigram.decode();
+                    trigram_children.insert(child);
+                }
             }
-            for trigram in pattern.resolved_trigrams() {
-                let (_, _, child) = trigram.decode();
-                kinds.push(child);
+            AstQuery::Containment(ngram_set) => {
+                for entry in &ngram_set.bigrams {
+                    let (parent, child) = entry.ngram.decode();
+                    bigrams.insert((parent, child));
+                }
+                for entry in &ngram_set.trigrams {
+                    let (_, _, child) = entry.ngram.decode();
+                    trigram_children.insert(child);
+                }
             }
-            kinds
+            // SingleNode is rejected at the CLI boundary (validate_ast_pattern);
+            // an empty table degrades recover_line to None.
+            AstQuery::SingleNode(_) => {}
         }
-        AstQuery::Containment(ngram_set) => {
-            let mut kinds: Vec<NodeKindId> = Vec::new();
-            for entry in &ngram_set.bigrams {
-                let (_, child) = entry.ngram.decode();
-                kinds.push(child);
-            }
-            for entry in &ngram_set.trigrams {
-                let (_, _, child) = entry.ngram.decode();
-                kinds.push(child);
-            }
-            kinds
+        Self {
+            bigrams,
+            trigram_children,
         }
-        AstQuery::SingleNode(_) => Vec::new(),
+    }
+
+    /// `true` when the query resolved to no matchable kinds in this grammar.
+    fn is_empty(&self) -> bool {
+        self.bigrams.is_empty() && self.trigram_children.is_empty()
+    }
+
+    /// Whether the `current` node kind matches, given the preceding kind `prev`.
+    ///
+    /// Preserves the original per-node semantics exactly: a `None` predecessor
+    /// never matches (the bigram parent context is unavailable, and this gates
+    /// the trigram check too), and otherwise a match is either a resolved
+    /// `(prev, current)` bigram pair or a resolved trigram whose innermost child
+    /// is `current`.
+    fn matches(&self, prev: Option<NodeKindId>, current: NodeKindId) -> bool {
+        let Some(prev_kind) = prev else {
+            return false;
+        };
+        self.bigrams.contains(&(prev_kind, current)) || self.trigram_children.contains(&current)
     }
 }
 
