@@ -70,6 +70,48 @@ pub(crate) mod health;
 pub(crate) mod logging;
 pub(crate) mod server;
 
+/// Test utilities for integration testing the running proxy server.
+///
+/// These utilities expose the async server entry point so integration tests
+/// (in `tests/`) can spin up a real proxy on an ephemeral port, drive requests
+/// through it against a fake upstream, and verify byte-identity on the wire.
+///
+/// Available only when compiling under `cfg(test)` or as a `dev-dependency`
+/// with the `testing` feature.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use std::sync::Arc;
+
+    use crate::analytics::AnalyticsHook;
+    use crate::config::ProxyConfig;
+    use crate::errors::ProxyError;
+    use crate::seam::TransformPipeline;
+
+    /// Run the proxy server asynchronously inside an existing tokio runtime.
+    ///
+    /// Unlike [`crate::serve_with_stage`] (which creates its own runtime), this
+    /// function is `async` and is meant to be spawned as a `tokio::task` inside
+    /// a test's `#[tokio::test]` runtime:
+    ///
+    /// ```ignore
+    /// let handle = tokio::spawn(rskim_proxy::testing::run_server_async(config, pipeline, analytics));
+    /// // drive requests…
+    /// handle.abort(); // shut down when done
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProxyError`] for bind/TLS failures. Forwarding-path errors
+    /// are never surfaced — they resolve to fail-open.
+    pub async fn run_server_async(
+        config: ProxyConfig,
+        pipeline: TransformPipeline,
+        analytics: Arc<dyn AnalyticsHook>,
+    ) -> Result<(), ProxyError> {
+        crate::server::run_server(config, pipeline, analytics).await
+    }
+}
+
 use std::sync::Arc;
 
 /// Serve the proxy with the given configuration and transform pipeline.
