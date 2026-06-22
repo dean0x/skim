@@ -1,0 +1,35 @@
+[package]
+name = "rskim-compress"
+version = "0.1.0"
+edition = "2024"
+authors = ["Skim Contributors"]
+license = "MIT"
+description = "Per-content-type block compression router for skim Layer-3 (BlockRouter, log compression)"
+repository = "https://github.com/dean0x/skim"
+# publish = false: L3 internal crate, following rskim-search/rskim-tokens/rskim-contract precedent.
+# AC26: rskim-compress MUST be publish=false and not pulled by default --workspace builds.
+publish = false
+
+[dependencies]
+rskim-contract = { path = "../rskim-contract" }
+rskim-core = { path = "../rskim-core" }
+regex = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rskim-contract = { path = "../rskim-contract", features = ["harness"] }
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[lints.clippy]
+# Enforce strict error handling in non-test code (matching rskim-contract pattern).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+
+[lib]
+name = "rskim_compress"
+path = "src/lib.rs"

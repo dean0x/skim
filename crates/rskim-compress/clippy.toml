@@ -1,0 +1,28 @@
+# rskim-compress clippy configuration
+#
+# Determinism gate (invariant 5 / AC10): forbid wall-clock time and entropy in
+# the transform path. Copied from rskim-contract/clippy.toml per AC26 / AD-010.
+#
+# This gate is checked by: cargo clippy -p rskim-compress --all-targets -- -D warnings
+#
+# The banned methods are:
+# - std::time::SystemTime::now — wall-clock time (non-deterministic)
+# - std::time::Instant::now — monotonic time (non-deterministic across runs)
+# - rand entry points — non-deterministic entropy
+# - getrandom entry points — OS entropy (non-deterministic)
+#
+# `allow-invalid = true` on the rand/getrandom entries: this crate intentionally
+# does NOT depend on rand/getrandom, so those paths are currently unresolvable.
+# Without `allow-invalid`, clippy emits a config-load warning for each unresolved
+# path (violating the zero-warnings policy). With `allow-invalid = true`, clippy
+# silently skips the entry WHILE THE PATH IS UNRESOLVABLE, and re-activates the
+# deny the moment the path becomes reachable.
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "non-deterministic — forbidden in L3 transform path (invariant 5 / AD-010)" },
+    { path = "std::time::Instant::now", reason = "non-deterministic — forbidden in L3 transform path (invariant 5 / AD-010)" },
+    { path = "rand::random", reason = "non-deterministic entropy — forbidden in L3 transform path (invariant 5 / AD-010)", allow-invalid = true },
+    { path = "rand::thread_rng", reason = "non-deterministic entropy — forbidden in L3 transform path (invariant 5 / AD-010)", allow-invalid = true },
+    { path = "rand::rng", reason = "non-deterministic entropy — forbidden in L3 transform path (invariant 5 / AD-010)", allow-invalid = true },
+    { path = "getrandom::getrandom", reason = "OS entropy — forbidden in L3 transform path (invariant 5 / AD-010)", allow-invalid = true },
+    { path = "getrandom::fill", reason = "OS entropy — forbidden in L3 transform path (invariant 5 / AD-010)", allow-invalid = true },
+]
