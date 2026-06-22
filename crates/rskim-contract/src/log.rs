@@ -938,7 +938,6 @@ mod tests {
         assert!(r.is_passthrough());
         // discriminating: must be FailedOpen, not generic Passthrough
         assert_eq!(r.reason, OutcomeReason::FailedOpen);
-        assert_ne!(r.reason, OutcomeReason::Passthrough);
         assert_eq!(r.bytes_in, 500);
         assert_eq!(r.bytes_out, 500);
     }
@@ -971,7 +970,6 @@ mod tests {
         assert!(!r.is_passthrough());
         // discriminating: must be Degraded, not Full
         assert_eq!(r.reason, OutcomeReason::Degraded);
-        assert_ne!(r.reason, OutcomeReason::Full);
         assert_eq!(r.decision, Decision::Modified);
         assert_eq!(r.bytes_in, 1000);
         assert_eq!(r.bytes_out, 700);
@@ -1003,29 +1001,50 @@ mod tests {
         assert_eq!(parsed["tokens_out"], 50, "tokens_out must appear in JSON");
     }
 
-    /// OutcomeReason serializes with snake_case names (per serde rename_all).
+    /// OutcomeReason serde round-trip: all 5 variants serialize to snake_case
+    /// (per `#[serde(rename_all = "snake_case")]`) and deserialize back to the
+    /// same variant. A mismatch in either direction (e.g. `"failed_open"` →
+    /// missing variant, or wrong serialization string) fails this test.
+    /// `OutcomeReason` is a pure enum with no `&'static str` fields, so
+    /// `from_str` works with any lifetime.
     #[test]
-    fn outcome_reason_serde_snake_case() {
+    fn outcome_reason_serde_round_trips_all_variants() {
         let cases = [
-            (OutcomeReason::Full, "full"),
-            (OutcomeReason::Degraded, "degraded"),
-            (OutcomeReason::Passthrough, "passthrough"),
-            (OutcomeReason::FailedOpen, "failed_open"),
-            (OutcomeReason::PolicyPassthrough, "policy_passthrough"),
+            (OutcomeReason::Full, "\"full\""),
+            (OutcomeReason::Degraded, "\"degraded\""),
+            (OutcomeReason::Passthrough, "\"passthrough\""),
+            (OutcomeReason::FailedOpen, "\"failed_open\""),
+            (OutcomeReason::PolicyPassthrough, "\"policy_passthrough\""),
         ];
-        for (reason, expected_str) in cases {
+        for (reason, expected_json) in cases {
             let serialized = serde_json::to_string(&reason).expect("serialization must succeed");
             assert_eq!(
-                serialized,
-                format!("\"{expected_str}\""),
-                "OutcomeReason::{reason:?} must serialize as \"{expected_str}\""
+                serialized, expected_json,
+                "OutcomeReason::{reason:?} must serialize as {expected_json}"
             );
+            let got: OutcomeReason = serde_json::from_str(&serialized)
+                .expect("OutcomeReason variant must deserialize from snake_case JSON string");
+            assert_eq!(got, reason, "OutcomeReason round-trip from {expected_json}");
         }
     }
 
     // ========================================================================
     // Typed round-trip deserialization tests (PF-007 load-bearing direction)
     // ========================================================================
+
+    /// Serialize a `DecisionRecord` to a `&'static str` for serde round-trip tests.
+    ///
+    /// `serde_json::from_str` requires `'static` when `DecisionRecord` contains
+    /// `component: &'static str`. `Box::leak` promotes the heap-allocated JSON
+    /// string to `'static` so the round-trip can be expressed without unsafe.
+    /// This is test-only; the leak is bounded by the test process lifetime.
+    fn leak_json(r: &DecisionRecord) -> &'static str {
+        Box::leak(
+            r.to_json()
+                .expect("serialisation must succeed")
+                .into_boxed_str(),
+        )
+    }
 
     /// Legacy-JSON backward-compatibility (schema-evolution default, #342).
     ///
@@ -1062,20 +1081,11 @@ mod tests {
     /// Typed round-trip: passthrough record serializes then deserializes back to
     /// the exact same typed fields. This is the load-bearing direction for #305
     /// persistence (which reads records back), per PF-007.
-    ///
-    /// Uses a `Box::leak`-promoted `String` to obtain a `&'static str` for
-    /// `serde_json::from_str`, which requires `'static` due to the
-    /// `component: &'static str` field in `DecisionRecord`.
     #[test]
     fn passthrough_record_typed_round_trip() {
         let r = DecisionRecord::passthrough("req-rt-pt", "identity", 200);
-        let json: &'static str = Box::leak(
-            r.to_json()
-                .expect("serialisation must succeed")
-                .into_boxed_str(),
-        );
         let back: DecisionRecord =
-            serde_json::from_str(json).expect("typed deserialization must succeed");
+            serde_json::from_str(leak_json(&r)).expect("typed deserialization must succeed");
         assert_eq!(back.reason, OutcomeReason::Passthrough);
         assert_eq!(back.tokens_in, None);
         assert_eq!(back.tokens_out, None);
@@ -1094,13 +1104,8 @@ mod tests {
             700,
             OutcomeReason::Degraded,
         );
-        let json: &'static str = Box::leak(
-            r.to_json()
-                .expect("serialisation must succeed")
-                .into_boxed_str(),
-        );
         let back: DecisionRecord =
-            serde_json::from_str(json).expect("typed deserialization must succeed");
+            serde_json::from_str(leak_json(&r)).expect("typed deserialization must succeed");
         assert_eq!(back.reason, OutcomeReason::Degraded);
         assert_eq!(back.tokens_in, None);
         assert_eq!(back.tokens_out, None);
@@ -1116,38 +1121,13 @@ mod tests {
     fn with_tokens_typed_round_trip() {
         let r =
             DecisionRecord::modified("req-rt-tok", "block-router", 800, 400).with_tokens(120, 72);
-        let json: &'static str = Box::leak(
-            r.to_json()
-                .expect("serialisation must succeed")
-                .into_boxed_str(),
-        );
         let back: DecisionRecord =
-            serde_json::from_str(json).expect("typed deserialization must succeed");
+            serde_json::from_str(leak_json(&r)).expect("typed deserialization must succeed");
         assert_eq!(back.reason, OutcomeReason::Full);
-        assert_eq!(back.tokens_in, Some(120usize));
-        assert_eq!(back.tokens_out, Some(72usize));
+        assert_eq!(back.tokens_in, Some(120));
+        assert_eq!(back.tokens_out, Some(72));
         assert_eq!(back.bytes_in, 800);
         assert_eq!(back.bytes_out, 400);
-    }
-
-    /// OutcomeReason typed deserialization: all 5 variants must round-trip.
-    /// A snake_case mismatch (e.g. `"failed_open"` → missing variant) would
-    /// fail this test.  `OutcomeReason` is a pure enum with no `&'static str`
-    /// fields, so `from_str` works with any lifetime.
-    #[test]
-    fn outcome_reason_typed_deserialize_all_variants() {
-        let cases = [
-            ("\"full\"", OutcomeReason::Full),
-            ("\"degraded\"", OutcomeReason::Degraded),
-            ("\"passthrough\"", OutcomeReason::Passthrough),
-            ("\"failed_open\"", OutcomeReason::FailedOpen),
-            ("\"policy_passthrough\"", OutcomeReason::PolicyPassthrough),
-        ];
-        for (json_str, expected) in cases {
-            let got: OutcomeReason = serde_json::from_str(json_str)
-                .expect("OutcomeReason variant must deserialize from snake_case JSON string");
-            assert_eq!(got, expected, "OutcomeReason from {json_str}");
-        }
     }
 
     // ========================================================================
