@@ -2,6 +2,7 @@
 members = [
     "crates/rskim-core",
     "crates/rskim",
+    "crates/rskim-proxy",
     "crates/rskim-search",
     "crates/rskim-research",
     "crates/rskim-bench",
@@ -78,6 +79,27 @@ quick-xml = "0.37"
 # Optional synchronous HTTP client for rskim-tokens net-anthropic feature.
 # Uses rustls for TLS (transitive via ureq 3.x); json feature not needed — net.rs uses serde_json directly.
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
+
+# Async runtime for rskim-proxy (AD-PXY-01). First async runtime in the workspace;
+# isolated to rskim-proxy so the compile cost is opt-in, not imposed on all crates.
+# tokio 1.44.2 — stable, well-soaked (dep-soak guidance: ~30 days).
+tokio = { version = "1.44", default-features = false }
+
+# HTTP/1.1 server + client — hyper 1.x stable series.
+# hyper 1.10 — mature stable release, aligns with hyper-util 0.1.x.
+hyper = { version = "1.10", default-features = false }
+hyper-util = { version = "0.1", default-features = false }
+http-body-util = { version = "0.1" }
+
+# TLS — rustls 0.23.x matches the existing lockfile entry (pulled in by ureq 3.3).
+# webpki-roots: hermetic root-cert bundle; no OS trust-store access (#346 tracks opt-in).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# hyper-rustls 0.27 targets rustls 0.23.x.
+hyper-rustls = { version = "0.27", default-features = false }
+
+# Structured tracing for rskim-proxy JSON logs.
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", default-features = false }
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.14.0"
