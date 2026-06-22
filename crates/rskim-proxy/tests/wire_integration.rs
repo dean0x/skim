@@ -35,11 +35,8 @@
 
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{
-    Arc,
-    Mutex,
-};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -216,8 +213,7 @@ impl FakeUpstream {
             .await
             .expect("fake upstream bind");
         let addr = listener.local_addr().expect("local_addr");
-        let captured_headers: Arc<Mutex<Vec<hyper::HeaderMap>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let captured_headers: Arc<Mutex<Vec<hyper::HeaderMap>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
 
         let ch = Arc::clone(&captured_headers);
@@ -374,7 +370,8 @@ async fn test_ac3_wire_ambiguous_forwards_to_default() {
     // Path /v1/unknown-endpoint won't match either known suffix → shape fallback.
     // A body with both `messages` (OpenAI) and `system` (Anthropic) is both-shaped → Unknown.
     // With a default upstream, Unknown → forward to default.
-    let both_shaped = br#"{"messages":[{"role":"user","content":"hi"}],"system":"sys","model":"gpt-4"}"#;
+    let both_shaped =
+        br#"{"messages":[{"role":"user","content":"hi"}],"system":"sys","model":"gpt-4"}"#;
 
     use hyper::Uri;
     use hyper_util::client::legacy::Client;
@@ -701,9 +698,8 @@ async fn test_ac7_large_response_streaming_bounded_memory() {
     // Discriminating assertion: with streaming, first bytes arrive well before
     // the entire 64 MiB is uploaded. The full upload would take NUM_CHUNKS * CHUNK_DELAY.
     // With streaming, first bytes must arrive in less than half that time.
-    let half_total_delay = Duration::from_millis(
-        (NUM_CHUNKS as u64) * CHUNK_DELAY.as_millis() as u64 / 2,
-    );
+    let half_total_delay =
+        Duration::from_millis((NUM_CHUNKS as u64) * CHUNK_DELAY.as_millis() as u64 / 2);
     assert!(
         t_first < half_total_delay,
         "AC7: first bytes must arrive before full response is uploaded (streaming, not buffering). \
@@ -777,7 +773,11 @@ async fn test_ac9_new_connection_after_panicking_stage() {
     );
 
     let captured = upstream.drain_bodies();
-    assert_eq!(captured.len(), 1, "upstream must have received exactly 1 body");
+    assert_eq!(
+        captured.len(),
+        1,
+        "upstream must have received exactly 1 body"
+    );
     assert_eq!(
         captured[0], body1,
         "AC9: upstream must receive original body (fail-open)"
@@ -792,7 +792,11 @@ async fn test_ac9_new_connection_after_panicking_stage() {
     );
 
     let captured2 = upstream.drain_bodies();
-    assert_eq!(captured2.len(), 1, "upstream must have received exactly 1 body");
+    assert_eq!(
+        captured2.len(),
+        1,
+        "upstream must have received exactly 1 body"
+    );
     assert_eq!(
         captured2[0], body2,
         "AC9: second request must be byte-identical"
@@ -895,7 +899,8 @@ async fn test_ac4_arm_b_inflating_stage_wire_forwards_original_bytes() {
          proves the seam gate is wired into handle_request (not just the pipeline unit)"
     );
     assert!(
-        !captured[0].windows(b"WIRE_INFLATION_SUFFIX".len())
+        !captured[0]
+            .windows(b"WIRE_INFLATION_SUFFIX".len())
             .any(|w| w == b"WIRE_INFLATION_SUFFIX"),
         "AC4 arm B: inflated suffix must NOT reach upstream (gate must have rejected)"
     );
@@ -969,7 +974,8 @@ async fn test_ac10_midstream_disconnect_terminates_cleanly() {
             tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
                 // Send a valid HTTP response start then drop without closing body.
-                let partial = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"partial\"";
+                let partial =
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"partial\"";
                 let _ = stream.write_all(partial).await;
                 // Drop stream (TCP RST / abrupt close).
                 drop(stream);
@@ -1142,11 +1148,8 @@ async fn test_ac13_auth_sentinel_never_in_logs() {
             .ok();
     });
 
-    let (abort, proxy_addr) = start_proxy_with_analytics(
-        &upstream.url(),
-        Arc::new(NoopAnalyticsHook),
-    )
-    .await;
+    let (abort, proxy_addr) =
+        start_proxy_with_analytics(&upstream.url(), Arc::new(NoopAnalyticsHook)).await;
 
     // Send request with sentinel values in both auth headers.
     use hyper::Uri;
@@ -1540,7 +1543,10 @@ async fn test_ac23_graceful_shutdown_drains_and_exits() {
 
     // 1. In-flight request before shutdown.
     let (status, _) = post_body(proxy_addr, b"{}").await;
-    assert_eq!(status, 200, "AC23: in-flight request before shutdown must succeed");
+    assert_eq!(
+        status, 200,
+        "AC23: in-flight request before shutdown must succeed"
+    );
 
     // 2. Abort the proxy (simulates SIGTERM).
     abort.abort();
@@ -1650,9 +1656,8 @@ async fn test_ac14_regression_guard_can_fail() {
         .build()
         .expect("proxy config");
     let slowed_addr = slowed_config.bind_addr();
-    let slowed_pipeline = rskim_proxy::seam::TransformPipeline::from_stages(vec![
-        Box::new(SlowedIdentityStage),
-    ]);
+    let slowed_pipeline =
+        rskim_proxy::seam::TransformPipeline::from_stages(vec![Box::new(SlowedIdentityStage)]);
     let slowed_task = tokio::spawn(rskim_proxy::testing::run_server_async(
         slowed_config,
         slowed_pipeline,
@@ -1741,8 +1746,7 @@ async fn test_ac15_zero_failures_panicking_hook() {
     abort.abort();
 
     assert_eq!(
-        failures,
-        0,
+        failures, 0,
         "AC15: panicking analytics hook must cause ZERO request failures \
          (catch_unwind isolates the panic). Got {failures}/{N} failures."
     );
@@ -1791,8 +1795,7 @@ async fn test_ac15_zero_failures_saturated_channel() {
     abort.abort();
 
     assert_eq!(
-        failures,
-        0,
+        failures, 0,
         "AC15: saturated analytics channel must cause ZERO request failures \
          (events dropped without blocking, bounded channel). Got {failures}/{N} failures."
     );

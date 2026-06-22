@@ -118,7 +118,10 @@ use crate::seam::{HeaderView, TransformContext, TransformPipeline};
 struct NullSink;
 
 impl DecisionSink for NullSink {
-    fn try_send(&self, _record: rskim_contract::log::DecisionRecord) -> Result<(), rskim_contract::log::SinkFull> {
+    fn try_send(
+        &self,
+        _record: rskim_contract::log::DecisionRecord,
+    ) -> Result<(), rskim_contract::log::SinkFull> {
         // Intentional no-op. Zero allocation, zero blocking.
         Ok(())
     }

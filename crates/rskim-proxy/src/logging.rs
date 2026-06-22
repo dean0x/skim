@@ -130,7 +130,8 @@ mod tests {
     fn test_authorization_header_is_redacted() {
         let result = redact_header_value("authorization", "Bearer sk-ant-api03-SENTINEL");
         assert_eq!(
-            result.as_ref(), "[REDACTED]",
+            result.as_ref(),
+            "[REDACTED]",
             "Authorization header must be redacted"
         );
     }
@@ -138,7 +139,11 @@ mod tests {
     #[test]
     fn test_x_api_key_header_is_redacted() {
         let result = redact_header_value("x-api-key", "sk-ant-api03-SENTINEL");
-        assert_eq!(result.as_ref(), "[REDACTED]", "x-api-key header must be redacted");
+        assert_eq!(
+            result.as_ref(),
+            "[REDACTED]",
+            "x-api-key header must be redacted"
+        );
     }
 
     #[test]
@@ -162,19 +167,22 @@ mod tests {
         let real_value = "application/json";
         let result = redact_header_value("content-type", real_value);
         assert_eq!(
-            result.as_ref(), real_value,
+            result.as_ref(),
+            real_value,
             "non-sensitive header must return the actual value for logging"
         );
 
         let accept_val = "text/event-stream";
         assert_eq!(
-            redact_header_value("accept", accept_val).as_ref(), accept_val,
+            redact_header_value("accept", accept_val).as_ref(),
+            accept_val,
             "accept header must return real value"
         );
 
         let req_id = "req-12345";
         assert_eq!(
-            redact_header_value("x-request-id", req_id).as_ref(), req_id,
+            redact_header_value("x-request-id", req_id).as_ref(),
+            req_id,
             "x-request-id must return real value"
         );
     }

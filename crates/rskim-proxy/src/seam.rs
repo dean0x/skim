@@ -413,13 +413,8 @@ impl TransformPipeline {
                 // guarded_transform enforces candidate_len <= input_len and records
                 // a Modified DecisionRecord; falls back to passthrough if the gate
                 // rejects inflation.
-                let gated = guarded_transform(
-                    pre_stage,
-                    stage_output,
-                    ctx.request_id,
-                    stage.name(),
-                    sink,
-                );
+                let gated =
+                    guarded_transform(pre_stage, stage_output, ctx.request_id, stage.name(), sink);
                 current = gated.bytes;
             }
         }

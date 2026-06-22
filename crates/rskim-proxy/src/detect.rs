@@ -111,8 +111,8 @@ pub(crate) const SHAPE_SNIFF_LIMIT: usize = 8 * 1024;
 /// MUST NOT construct a full `Value` tree. MUST NOT call `rskim_llm::parse`.
 /// AD-PXY-02: shape detection is the fallback, not the primary path.
 fn detect_by_shape(body: &[u8]) -> Option<ProxyProvider> {
-    use serde::de::IgnoredAny;
     use serde::Deserialize;
+    use serde::de::IgnoredAny;
 
     // Only inspect up to SHAPE_SNIFF_LIMIT bytes.
     let sniff = if body.len() > SHAPE_SNIFF_LIMIT {
@@ -168,13 +168,13 @@ fn detect_by_shape(body: &[u8]) -> Option<ProxyProvider> {
     let model_is_set = !model_str.is_empty();
 
     // Check messages array for OpenAI-specific role values.
-    let has_openai_role = body
-        .messages
-        .as_ref()
-        .is_some_and(|msgs| {
-            msgs.iter()
-                .any(|msg| msg.role.as_deref().is_some_and(|r| matches!(r, "system" | "developer")))
-        });
+    let has_openai_role = body.messages.as_ref().is_some_and(|msgs| {
+        msgs.iter().any(|msg| {
+            msg.role
+                .as_deref()
+                .is_some_and(|r| matches!(r, "system" | "developer"))
+        })
+    });
     let has_messages = body.messages.is_some();
 
     // Score Anthropic signals.
