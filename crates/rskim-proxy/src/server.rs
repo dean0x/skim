@@ -250,27 +250,19 @@ async fn handle_request(
     };
 
     // ---- Determine upstream URL ----
-    // #[non_exhaustive]: the wildcard arm is required by the language for non_exhaustive
-    // enums when matched outside the defining crate. The compiler may warn it is
-    // unreachable (all current variants are matched above); the allow annotation
-    // suppresses the false-positive for future-proofing (AC24 / AD-PXY-02).
+    // Map provider to the key used in ProxyConfig::upstream_for.
+    // #[non_exhaustive]: the wildcard arm is required for non_exhaustive enums matched
+    // outside the defining crate (AC24 / AD-PXY-02). Future variants fall back to
+    // the default upstream via an empty key (no per-provider override → upstream_for
+    // returns upstream_default).
     #[allow(unreachable_patterns)]
     let provider_key = match &provider {
         ProxyProvider::Anthropic => "anthropic",
         ProxyProvider::OpenAI => "openai",
-        ProxyProvider::Unknown => "",
-        // Non-exhaustive enum: future variants fall back to empty key → default upstream.
         _ => "",
     };
-    let upstream_url = config
-        .upstream_for(if provider_key.is_empty() {
-            ""
-        } else {
-            provider_key
-        })
-        .or_else(|| config.upstream_default.as_deref())
-        .unwrap_or("")
-        .to_owned();
+    // upstream_for already falls back to upstream_default when provider_key has no entry.
+    let upstream_url = config.upstream_for(provider_key).unwrap_or("").to_owned();
 
     if upstream_url.is_empty() {
         return Ok(json_response(

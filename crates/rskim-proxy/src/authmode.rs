@@ -67,10 +67,9 @@ pub fn classify_auth<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>) -> A
     let mut has_bearer = false;
 
     for (name, value) in headers {
-        let name_lower: &str = name;
-        if name_lower == HEADER_API_KEY {
+        if name == HEADER_API_KEY {
             has_api_key = true;
-        } else if name_lower == HEADER_AUTHORIZATION {
+        } else if name == HEADER_AUTHORIZATION {
             // Only `Authorization: Bearer …` classifies as Subscription.
             // `Authorization: Basic …` or `Authorization: Token …` → Ambiguous
             // because we cannot safely assume they map to a subscription flow.

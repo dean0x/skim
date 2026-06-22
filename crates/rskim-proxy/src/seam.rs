@@ -262,9 +262,8 @@ impl Contract for IdentityStageContractAdapter {
     fn transform(&self, input: &[u8], request_id: &str) -> Outcome {
         // Construct a minimal TransformContext sufficient for the identity stage.
         // The identity stage ignores all context fields except `request_id`.
-        // Header slice is empty — no header access in the identity path.
-        let headers_slice: Vec<(String, String)> = Vec::new();
-        let header_view = HeaderView::new(&headers_slice);
+        // Use an empty static slice — no allocation needed, no header access in the identity path.
+        let header_view = HeaderView::new(&[]);
         let ctx = TransformContext {
             provider: ProxyProvider::Anthropic,
             auth_mode: AuthMode::Ambiguous,

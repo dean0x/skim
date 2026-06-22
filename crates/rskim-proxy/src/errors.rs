@@ -49,13 +49,4 @@ pub enum ProxyError {
         /// The provider name that has no configured upstream.
         provider: String,
     },
-
-    /// A placeholder for the skeleton phase — removed once the server is implemented.
-    ///
-    /// This variant exists only during Phase 1 (crate skeleton + CLI wiring) to
-    /// allow the crate to compile and the CLI path to exercise the entry point.
-    /// It will be replaced by the actual server startup logic in Phase 2.
-    #[doc(hidden)]
-    #[error("not yet implemented: {0}")]
-    NotImplemented(String),
 }

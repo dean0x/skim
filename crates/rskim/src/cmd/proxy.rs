@@ -207,9 +207,7 @@ fn print_help() {
          \n\
          EXAMPLES:\n\
              skim proxy --port 41322 --upstream-default https://api.anthropic.com\n\
-             skim proxy --port 41500 --bind 0.0.0.0 --upstream-default https://api.openai.com\n\
-         \n\
-         NOTE: This is a Phase 1 skeleton — the proxy server body is not yet implemented."
+             skim proxy --port 41500 --bind 0.0.0.0 --upstream-default https://api.openai.com"
     );
 }
 

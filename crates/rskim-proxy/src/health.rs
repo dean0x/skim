@@ -53,6 +53,17 @@ pub const READINESS_STALE_WINDOW_SECS: u64 = 10;
 // ReadinessState — shared atomic state
 // ============================================================================
 
+/// Return the current Unix timestamp in whole seconds.
+///
+/// Used to initialise `last_success_unix_secs` at proxy start. Falls back to 0
+/// on the (unreachable in practice) case where `SystemTime` is before the epoch.
+fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs() as i64
+}
+
 /// Shared atomic state for the readiness watchdog.
 ///
 /// Uses atomic integers for lock-free read from multiple health-check handlers.
@@ -85,14 +96,9 @@ impl ReadinessState {
     /// The initial last-success timestamp is the current time so that a freshly
     /// started proxy with no traffic is not immediately declared stale.
     pub fn new() -> Arc<Self> {
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs() as i64;
-
         Arc::new(Self {
             consecutive_failures: AtomicU64::new(0),
-            last_success_unix_secs: AtomicI64::new(now_secs),
+            last_success_unix_secs: AtomicI64::new(unix_now_secs()),
             is_ready: AtomicBool::new(true),
         })
     }
@@ -103,13 +109,8 @@ impl ReadinessState {
     /// timestamp. Flips `is_ready` back to true if it was false.
     pub fn record_success(&self) {
         self.consecutive_failures.store(0, Ordering::Relaxed);
-
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs() as i64;
         self.last_success_unix_secs
-            .store(now_secs, Ordering::Relaxed);
+            .store(unix_now_secs(), Ordering::Relaxed);
 
         // Flip ready if we were unready (SeqCst to ensure visibility).
         self.is_ready.store(true, Ordering::SeqCst);
@@ -144,13 +145,8 @@ impl ReadinessState {
         }
 
         // Staleness check: flip to not-ready if last success is too old.
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs() as i64;
-
         let last = self.last_success_unix_secs.load(Ordering::Relaxed);
-        let staleness = (now_secs - last).max(0) as u64;
+        let staleness = (unix_now_secs() - last).max(0) as u64;
 
         if staleness > READINESS_STALE_WINDOW_SECS {
             self.is_ready.store(false, Ordering::SeqCst);
@@ -164,13 +160,9 @@ impl ReadinessState {
 impl Default for ReadinessState {
     fn default() -> Self {
         // Cannot return Arc here; default is for the value, not the Arc wrapper.
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs() as i64;
         Self {
             consecutive_failures: AtomicU64::new(0),
-            last_success_unix_secs: AtomicI64::new(now_secs),
+            last_success_unix_secs: AtomicI64::new(unix_now_secs()),
             is_ready: AtomicBool::new(true),
         }
     }

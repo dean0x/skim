@@ -169,26 +169,6 @@ pub fn upstream_authority(upstream_base: &str) -> Option<String> {
 }
 
 // ============================================================================
-// ForwardResult
-// ============================================================================
-
-/// Outcome of forwarding a single request to the upstream.
-///
-/// Always resolves to a response — even connection-refused or timeout produces
-/// a clean HTTP response (502/504) rather than a dropped socket (AC10/AC20).
-///
-/// Reserved for future use when streaming-with-backpressure is implemented
-/// directly in this module. Currently server.rs drives the body collection
-/// directly from the `Response<Incoming>` returned by `forward_request`.
-#[allow(dead_code)]
-pub(crate) struct ForwardResult {
-    /// The HTTP response to relay to the client.
-    pub response: Response<hyper::body::Incoming>,
-    /// Total bytes in the response body (measured during streaming).
-    pub response_bytes: u64,
-}
-
-// ============================================================================
 // Forward function
 // ============================================================================
 
