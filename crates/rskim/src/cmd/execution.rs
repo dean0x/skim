@@ -74,14 +74,21 @@ pub(crate) enum SavingsDecision {
 /// **#317 invariant:** this guard only ever moves output toward *more-complete
 /// raw*.  It can never show LESS than raw.
 ///
-/// **Size cap (performance):** for inputs above 64 MiB the tokenizer cost may
-/// be significant.  Above that threshold the function falls back to byte
-/// comparison, consistent with the "never expand" promise while keeping latency
-/// sub-millisecond.
+/// **Size cap (performance):** tokenizing costs ~0.3 s/MB in release builds
+/// (~10× that unoptimized/debug), so for inputs above 64 KiB the function falls
+/// back to byte comparison — keeping the guard's added latency to roughly tens
+/// of milliseconds at the cap in release, comfortably within budget — consistent
+/// with the "never expand" promise.  Below the cap the exact token decision is
+/// used; above it, byte length is a safe proxy (a large output that compresses
+/// wins on both axes; only near-ties differ, and those are rare at scale).
+/// Token accuracy matters most for small outputs (tight expansion margins);
+/// those are well below the cap and always tokenized.
 pub(crate) fn savings_decision(raw: &str, compressed: &str) -> SavingsDecision {
-    /// 64 MiB — above this threshold skip tokenization (performance cap).
-    /// Matches the stdin size cap documented in CLAUDE.md.
-    const TOKEN_SIZE_CAP: usize = 64 * 1024 * 1024;
+    /// 64 KiB — above this threshold skip tokenization (performance cap).
+    /// Tokenization costs ~0.3 s/MB in release (~10× in debug), so this bounds
+    /// the guard's added latency to roughly tens of ms at the cap in release;
+    /// larger outputs fall back to byte comparison.
+    const TOKEN_SIZE_CAP: usize = 64 * 1024;
 
     // Normalize whitespace from both ends so leading/trailing formatting
     // (e.g., a `println!` trailing newline, or a leading space before "OK")
@@ -102,7 +109,7 @@ pub(crate) fn savings_decision(raw: &str, compressed: &str) -> SavingsDecision {
     // rule therefore emits raw (nothing) — which is the faithful "never expand"
     // behaviour: a silent command stays silent, matching the raw tool exactly.
     //
-    // Oversized inputs (> 64 MiB): tokenization is skipped for performance;
+    // Oversized inputs (> 64 KiB): tokenization is skipped for performance;
     // byte comparison is used instead — consistent with the "never expand" promise.
 
     // Fast path: if compressed is already strictly shorter by bytes, check with tokens.
@@ -1189,11 +1196,11 @@ mod tests {
         );
     }
 
-    /// Large input above TOKEN_SIZE_CAP (64 MiB): falls back to byte comparison.
+    /// Large input above TOKEN_SIZE_CAP (64 KiB): falls back to byte comparison.
     /// Compressed strictly shorter → Keep.
     #[test]
     fn savings_decision_above_cap_bytes_keep() {
-        let raw = "x".repeat(65 * 1024 * 1024); // 65 MiB
+        let raw = "x".repeat(128 * 1024); // 128 KiB — above the 64 KiB cap
         let compressed = "x".repeat(1024); // much shorter
         assert_eq!(savings_decision(&raw, &compressed), SavingsDecision::Keep);
     }
@@ -1201,8 +1208,8 @@ mod tests {
     /// Large input above TOKEN_SIZE_CAP: compressed STRICTLY LARGER → Passthrough.
     #[test]
     fn savings_decision_above_cap_bytes_passthrough() {
-        let raw = "x".repeat(65 * 1024 * 1024); // 65 MiB
-        let compressed = "y".repeat(65 * 1024 * 1024 + 1); // 1 byte strictly longer
+        let raw = "x".repeat(128 * 1024); // 128 KiB — above the 64 KiB cap
+        let compressed = "y".repeat(128 * 1024 + 1); // 1 byte strictly longer
         assert_eq!(
             savings_decision(&raw, &compressed),
             SavingsDecision::Passthrough
@@ -1212,8 +1219,8 @@ mod tests {
     /// Large input above TOKEN_SIZE_CAP: same-size → Passthrough (tie rule applies above cap too).
     #[test]
     fn savings_decision_above_cap_bytes_tie_passthrough() {
-        let raw = "x".repeat(65 * 1024 * 1024); // 65 MiB
-        let compressed = "y".repeat(65 * 1024 * 1024); // same size — tie
+        let raw = "x".repeat(128 * 1024); // 128 KiB — above the 64 KiB cap
+        let compressed = "y".repeat(128 * 1024); // same size — tie
         assert_eq!(
             savings_decision(&raw, &compressed),
             SavingsDecision::Passthrough,
@@ -1242,5 +1249,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ========================================================================
+    // Task 1: Performance verification for savings_decision (#317 / Cluster C)
+    //
+    // WHY #[test] RATHER THAN A CRITERION BENCH:
+    // `rskim` is a bin-only crate (no `src/lib.rs`).  A criterion bench in
+    // `crates/rskim/benches/` would be compiled as a separate binary that
+    // cannot import crate-private symbols (including `savings_decision`, which
+    // is `pub(crate)`).  Exposing it via `pub` solely for benchmarking would
+    // require a structural lib-refactor that is out of scope.  A deterministic
+    // `#[test]` in this `#[cfg(test)]` module has access to `pub(crate)` items.
+    // The CAP-ENGAGED test below is the performance verification: a >cap (1 MiB)
+    // input must be decided in well under 500 ms, proving tokenization is skipped
+    // above the cap (tokenizing 1 MiB is ~3 s, so the huge margin makes this
+    // robust, not flaky). Sub-cap tokenization correctness is covered by the many
+    // small-input result tests above; a wall-clock assertion on the tokenization
+    // path is intentionally avoided — it is confounded by one-time tokenizer init
+    // and would be flaky (a testing anti-pattern).
+    // ========================================================================
+
+    /// CAP-ENGAGED: a >64 KiB input must be decided via the fast byte path, NOT
+    /// by tokenizing.  Tokenizing ~1 MiB costs ~3 s (empirically), so a
+    /// sub-500 ms decision proves the cap engaged.  This is the test that actually
+    /// bounds the guard's worst-case latency; the generous margin (500 ms vs a
+    /// sub-millisecond byte path vs a ~3 s broken path) makes it robust, not flaky.
+    #[test]
+    fn savings_decision_size_cap_uses_byte_comparison_not_tokenization() {
+        // 1 MiB — well above the 64 KiB cap.
+        let raw = "a".repeat(1024 * 1024);
+        let compressed = "a".repeat(512 * 1024); // strictly shorter
+
+        let start = std::time::Instant::now();
+        let decision = savings_decision(&raw, &compressed);
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            decision,
+            SavingsDecision::Keep,
+            "above cap: strictly shorter compressed → Keep (byte path, not tokenizer)"
+        );
+        assert!(
+            elapsed.as_millis() < 500,
+            "1 MiB decision took {}ms — the 64 KiB cap must skip tokenization \
+             (tokenizing 1 MiB is ~3 s); the size cap has regressed",
+            elapsed.as_millis()
+        );
+
+        // Same-size above cap → tie → Passthrough (conservative rule, byte path).
+        let raw_tie = "a".repeat(128 * 1024);
+        let compressed_tie = "b".repeat(128 * 1024);
+        assert_eq!(
+            savings_decision(&raw_tie, &compressed_tie),
+            SavingsDecision::Passthrough,
+            "above cap: tie → Passthrough (strictly-smaller rule, byte path)"
+        );
     }
 }
