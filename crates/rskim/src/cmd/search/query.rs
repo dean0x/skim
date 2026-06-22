@@ -389,9 +389,12 @@ fn run_blast_radius_composite_query(
     let lexical_layer: Vec<(FileId, f64)> = raw_lex.iter().map(|r| (r.file_id, r.score)).collect();
 
     // Step 4: N-signal RRF UNION merge.
-    // Only lexical and temporal signals are used in the blast-radius path.
-    // AST, import_graph, dir_proximity, structural_coupling are all at 0.0
-    // in the default profile (extended signals gated per ADR-003).
+    // The blast-radius path fuses only the lexical and co-change (temporal)
+    // signals, so only those two layers are constructed here. The `ast` weight
+    // (0.3 by default) and the extended signals (import_graph, dir_proximity,
+    // structural_coupling — all 0.0 by default per ADR-003) have no layer to
+    // apply to on this path; wiring the full text+AST+temporal compound dispatch
+    // is tracked in #339.
     let layers: &[(Vec<(FileId, f64)>, f64)] = &[
         (lexical_layer, weights.lexical),
         (temporal_layer, weights.temporal),
