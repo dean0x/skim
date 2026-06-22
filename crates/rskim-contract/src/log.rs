@@ -121,11 +121,19 @@ pub fn is_sensitive_key(key: &str) -> bool {
     SENSITIVE_EXACT
         .iter()
         .any(|&e| e.eq_ignore_ascii_case(key))
-        // Suffix match: sensitive suffixes are all uppercase; compare with
-        // an ASCII case-insensitive ends_with to avoid to_uppercase().
+        // Suffix match: compare on bytes to avoid char-boundary panics when
+        // `key` contains multibyte UTF-8 (e.g. `req-€x`).  All suffix
+        // constants are pure ASCII, so `s.len()` is a byte length and
+        // `eq_ignore_ascii_case` on byte slices is semantically identical to
+        // the string version — but never panics on a non-char-boundary index.
         || SENSITIVE_SUFFIXES
             .iter()
-            .any(|&s| key.len() >= s.len() && key[key.len() - s.len()..].eq_ignore_ascii_case(s))
+            .any(|&s| {
+                let kb = key.as_bytes();
+                let sb = s.as_bytes();
+                kb.len() >= sb.len()
+                    && kb[kb.len() - sb.len()..].eq_ignore_ascii_case(sb)
+            })
 }
 
 /// Returns `true` if `value` starts with a known provider API key VALUE prefix
@@ -340,11 +348,17 @@ pub struct DecisionRecord {
     /// [`OutcomeReason::Passthrough`] (see [`OutcomeReason::default`]).
     ///
     /// This mirrors the pattern used by the sibling optional fields
-    /// `tokens_in`/`tokens_out` (which are `Option<usize>` + `skip_serializing_if`
-    /// and therefore absent-when-None on both directions), and satisfies the
-    /// 'parse at boundaries, trust internally' principle: a schema-additive field
-    /// must not hard-fail on valid pre-field records at the persistence boundary
-    /// (#305, per ADR-001 / ADR-004).
+    /// `tokens_in`/`tokens_out`: those are `Option<usize>` with
+    /// `skip_serializing_if = "Option::is_none"` for the *serialize* direction,
+    /// while serde's built-in `Option` defaulting (absent key → `None`)
+    /// handles the *deserialize* direction independently — no `#[serde(default)]`
+    /// is required for them because `Option` already defaults to `None`.
+    /// The `reason` field uses the same split: `skip_serializing_if` governs
+    /// serialization; `#[serde(default)]` governs deserialization.
+    /// Together they satisfy the 'parse at boundaries, trust internally'
+    /// principle: a schema-additive field must not hard-fail on valid
+    /// pre-field records at the persistence boundary (#305, per ADR-001 /
+    /// ADR-004).
     #[serde(default)]
     pub reason: OutcomeReason,
     /// Input byte count.
@@ -824,6 +838,28 @@ mod tests {
     fn is_sensitive_key_case_insensitive() {
         assert!(is_sensitive_key("anthropic_api_key"));
         assert!(is_sensitive_key("my_service_token"));
+    }
+
+    /// Regression test for the char-boundary panic in `is_sensitive_key`.
+    ///
+    /// Before the fix, `key[key.len() - s.len()..]` was used for suffix matching.
+    /// When `key` ends in a multibyte UTF-8 code point and `s.len()` (a byte
+    /// count) lands inside that code point, Rust string slicing panics with
+    /// 'byte index N is not a char boundary'.  The byte-slice fix avoids this
+    /// entirely because `as_bytes()` operates on raw bytes.
+    ///
+    /// This test is the discriminating guard: reverting to string slicing causes
+    /// a panic here (not a false-positive failure).
+    #[test]
+    fn is_sensitive_key_multibyte_utf8_no_panic() {
+        // "req-€x" ends in 'x' preceded by the 3-byte UTF-8 sequence for '€'.
+        // `key.len()` = 7; a suffix like "_KEY" (4 bytes) produces byte index 3,
+        // which lands inside the '€' sequence — a non-char-boundary panic before the fix.
+        assert!(!is_sensitive_key("req-€x"));
+        // Longer multibyte suffix — '€' is 3 bytes; offset 4 from end is boundary inside '€'.
+        assert!(!is_sensitive_key("req-€"));
+        // A key that genuinely matches a suffix but also contains multibyte chars must still work.
+        assert!(is_sensitive_key("préfix_TOKEN"));
     }
 
     #[test]
