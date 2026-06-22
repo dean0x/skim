@@ -2262,14 +2262,9 @@ mod tests {
         // Only the two compressing rows contribute: 2 × (1000 - 100) = 1800.
         assert_eq!(summary.tokens_saved, 1800);
 
-        let daily = db.query_daily(None).unwrap();
         // tokens_saved is u64 — non-negativity is guaranteed by the type.
-        // We still call .query_daily() to ensure it does not panic with
-        // expansion-heavy data.
-        let _ = &daily;
-
-        let by_cmd = db.query_by_command(None).unwrap();
-        // Same: .query_by_command() must not panic.
-        let _ = &by_cmd;
+        // Call both queries to ensure they do not panic with expansion-heavy data.
+        db.query_daily(None).unwrap();
+        db.query_by_command(None).unwrap();
     }
 }
