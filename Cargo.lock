@@ -2624,6 +2624,7 @@ dependencies = [
 name = "rskim-proxy"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "crossbeam-channel",
  "http-body-util",
  "hyper",
@@ -2637,9 +2638,11 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "trybuild",
+ "webpki-roots",
 ]
 
 [[package]]

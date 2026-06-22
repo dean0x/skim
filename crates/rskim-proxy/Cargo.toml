@@ -28,6 +28,16 @@ http-body-util = { workspace = true }
 # OS trust-store option (rustls-native-certs) is a follow-up per #346.
 rustls = { workspace = true }
 hyper-rustls = { workspace = true, features = ["webpki-roots", "http1"] }
+tokio-rustls = { workspace = true }
+
+# Byte buffer type shared by hyper body handling (Forward/server.rs).
+bytes = { workspace = true }
+
+# WebPKI root certificate bundle for upstream TLS client (AD-PXY-04 / #346).
+webpki-roots = { workspace = true }
+
+# Note: in-flight connection tracking uses a simple inline RAII struct (Drop impl)
+# rather than scopeguard, which has a different macro interface than expected.
 
 # Safety substrate — seam composes #301's Outcome / guarded_transform.
 # AD-PXY-05: reuse Outcome (fail-open success variant) to avoid duplicating the

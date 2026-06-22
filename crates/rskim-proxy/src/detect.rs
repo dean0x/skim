@@ -91,8 +91,9 @@ fn detect_by_path(path: &str) -> Option<ProxyProvider> {
 /// 8 KiB is sufficient to see all top-level discriminator keys for both
 /// Anthropic and OpenAI payloads (model, messages, system are always near the
 /// start of any conforming request body). Bodies shorter than 8 KiB are fully
-/// inspected.
-const SHAPE_SNIFF_LIMIT: usize = 8 * 1024;
+/// inspected. Used by `server.rs` to slice the body before calling
+/// [`detect_provider`].
+pub(crate) const SHAPE_SNIFF_LIMIT: usize = 8 * 1024;
 
 /// Classify a request body by shallow JSON shape analysis.
 ///

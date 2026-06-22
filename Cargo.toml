@@ -97,6 +97,23 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # hyper-rustls 0.27 targets rustls 0.23.x.
 hyper-rustls = { version = "0.27", default-features = false }
 
+# Byte buffer type shared by hyper body handling in rskim-proxy.
+# bytes 1.11.x — aligned with hyper 1.x's own bytes dependency.
+bytes = "1.11"
+
+# WebPKI root certificate bundle — hermetic TLS for rskim-proxy upstream client.
+# webpki-roots 1.0.7 — soaked, already in the lockfile via hyper-rustls transitive dep.
+# OS trust-store option tracked in #346.
+webpki-roots = "1.0"
+
+# tokio-rustls — the async TLS adapter used by hyper-rustls under the hood.
+# 0.26.4 — already in the lockfile via hyper-rustls.
+tokio-rustls = { version = "0.26", default-features = false }
+
+# scopeguard — RAII guard used in server.rs for in-flight connection tracking.
+# 1.2.0 — already in the lockfile via transitive deps.
+scopeguard = "1.2"
+
 # Structured tracing for rskim-proxy JSON logs.
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", default-features = false }

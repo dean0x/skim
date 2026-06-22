@@ -29,8 +29,7 @@ use rskim_proxy::config::ProxyConfig;
 /// Cleartext-exposure warning emitted to stderr when `--bind` is a non-loopback address.
 ///
 /// AC1 / AD-PXY-03: this exact string is the contract; tests assert it appears on stderr.
-const CLEARTEXT_WARNING: &str =
-    "WARNING: skim proxy is bound to a non-loopback address. \
+const CLEARTEXT_WARNING: &str = "WARNING: skim proxy is bound to a non-loopback address. \
      Auth material (API keys, bearer tokens) will be transmitted in cleartext \
      unless the client uses TLS. Only bind to non-loopback addresses in trusted \
      network environments. Set SKIM_PROXY_BIND=127.0.0.1 or omit --bind to \
@@ -89,16 +88,9 @@ pub(crate) fn run(
         eprintln!("{CLEARTEXT_WARNING}");
     }
 
-    // Call serve() — blocks until shutdown.
+    // Call serve() — blocks until SIGINT/SIGTERM and drain completes (AC23).
     match rskim_proxy::serve(config) {
         Ok(()) => Ok(ExitCode::SUCCESS),
-        Err(rskim_proxy::errors::ProxyError::NotImplemented(msg)) => {
-            // Phase 1 skeleton: the server body is not yet implemented.
-            // Print a clear message so the CLI path is exercisable in tests
-            // without the full server being built.
-            eprintln!("skim proxy: {msg}");
-            Ok(ExitCode::FAILURE)
-        }
         Err(e) => {
             eprintln!("skim proxy: error: {e}");
             Ok(ExitCode::FAILURE)
@@ -136,18 +128,18 @@ fn parse_proxy_args(args: &[String]) -> anyhow::Result<ProxyArgs> {
         match arg {
             "--port" => {
                 i += 1;
-                let val = args.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--port requires a value")
-                })?;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--port requires a value"))?;
                 port = val.parse::<u16>().map_err(|_| {
                     anyhow::anyhow!("--port value '{}' is not a valid port number", val)
                 })?;
             }
             "--bind" => {
                 i += 1;
-                let val = args.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--bind requires a value")
-                })?;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--bind requires a value"))?;
                 let ip: IpAddr = val.parse().map_err(|_| {
                     anyhow::anyhow!("--bind value '{}' is not a valid IP address", val)
                 })?;
@@ -155,9 +147,9 @@ fn parse_proxy_args(args: &[String]) -> anyhow::Result<ProxyArgs> {
             }
             "--upstream-default" => {
                 i += 1;
-                let val = args.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--upstream-default requires a value")
-                })?;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--upstream-default requires a value"))?;
                 upstream_default = Some(val.clone());
             }
             other if other.starts_with("--port=") => {
@@ -237,7 +229,10 @@ mod tests {
         let parsed = parse_proxy_args(&args).expect("parse must succeed with empty args");
         assert_eq!(parsed.port, DEFAULT_PROXY_PORT);
         assert!(parsed.bind_ip.is_none(), "bind_ip defaults to None");
-        assert!(parsed.upstream_default.is_none(), "upstream_default defaults to None");
+        assert!(
+            parsed.upstream_default.is_none(),
+            "upstream_default defaults to None"
+        );
     }
 
     // AC25: --port flag is parsed.
@@ -261,10 +256,7 @@ mod tests {
     fn test_parse_proxy_args_bind_flag() {
         let args: Vec<String> = vec!["--bind".into(), "0.0.0.0".into()];
         let parsed = parse_proxy_args(&args).expect("parse must succeed");
-        assert_eq!(
-            parsed.bind_ip,
-            Some("0.0.0.0".parse().expect("valid IP"))
-        );
+        assert_eq!(parsed.bind_ip, Some("0.0.0.0".parse().expect("valid IP")));
     }
 
     // AC25: --upstream-default flag is parsed.
@@ -322,9 +314,7 @@ mod tests {
     // This test ensures the config validation is load-bearing (not just present).
     #[test]
     fn test_port_below_range_fails_build() {
-        let result = ProxyConfig::builder()
-            .port(PORT_RANGE_MIN - 1)
-            .build();
+        let result = ProxyConfig::builder().port(PORT_RANGE_MIN - 1).build();
         assert!(
             result.is_err(),
             "port {} must fail (below PORT_RANGE_MIN {})",

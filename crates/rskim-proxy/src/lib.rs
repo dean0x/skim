@@ -65,13 +65,18 @@ pub mod seam;
 
 // Internal modules — not part of the public API surface.
 // Exposed pub(crate) for integration test access where needed.
+pub(crate) mod forward;
+pub(crate) mod health;
 pub(crate) mod logging;
+pub(crate) mod server;
+
+use std::sync::Arc;
 
 /// Serve the proxy with the given configuration and transform pipeline.
 ///
 /// This is the primary entry point called by `rskim`'s `cmd/proxy.rs` handler.
-/// The function takes ownership of the runtime and blocks until the server
-/// shuts down (SIGINT/SIGTERM received and drain completes).
+/// The function creates a tokio runtime and blocks until the server shuts down
+/// (SIGINT/SIGTERM received and drain completes).
 ///
 /// # Errors
 ///
@@ -83,16 +88,51 @@ pub(crate) mod logging;
 ///
 /// The `rskim_proxy` crate is a separate optional workspace member so that
 /// hyper/tokio/rustls compile cost is isolated from users who never run the proxy.
-pub fn serve(_config: config::ProxyConfig) -> Result<(), errors::ProxyError> {
-    // Phase 1 (this ticket): config + CLI wiring only. The actual server
-    // implementation lands in a later phase (Steps 7-9 of the plan).
-    // This stub validates that the crate skeleton, config, and wiring compile
-    // end-to-end before the server internals are built.
-    //
-    // AC1 (Functionality): `skim proxy --port <P>` starts and binds — wired in
-    // cmd/proxy.rs; the serve() function here will block on the tokio runtime
-    // once the server internals (server.rs) are implemented in the next phase.
-    Err(errors::ProxyError::NotImplemented(
-        "proxy server not yet implemented — skeleton phase only".to_string(),
-    ))
+pub fn serve(config: config::ProxyConfig) -> Result<(), errors::ProxyError> {
+    serve_with_analytics(config, Arc::new(analytics::NoopAnalyticsHook))
+}
+
+/// Serve the proxy with a custom analytics hook and the identity pipeline.
+///
+/// Used for testing and for callers that want to capture analytics events.
+/// The `analytics` hook is fired once per completed request (AC6 / AC15).
+///
+/// # Errors
+///
+/// Same as [`serve`].
+pub fn serve_with_analytics(
+    config: config::ProxyConfig,
+    analytics: Arc<dyn analytics::AnalyticsHook>,
+) -> Result<(), errors::ProxyError> {
+    serve_with_stage(config, seam::TransformPipeline::identity(), analytics)
+}
+
+/// Serve the proxy with a custom transform pipeline and analytics hook.
+///
+/// This is the injection point for #304's `BlockRouter`:
+/// ```ignore
+/// rskim_proxy::serve_with_stage(config, TransformPipeline::from_stages(vec![
+///     Box::new(BlockRouter::new(…)),
+/// ]), analytics_hook);
+/// ```
+///
+/// The identity pipeline (no compression) is the #303 default. #304 replaces
+/// it by injecting `BlockRouter` at this construction point (D1 / AD-PXY-06).
+///
+/// # Errors
+///
+/// Same as [`serve`].
+pub fn serve_with_stage(
+    config: config::ProxyConfig,
+    pipeline: seam::TransformPipeline,
+    analytics: Arc<dyn analytics::AnalyticsHook>,
+) -> Result<(), errors::ProxyError> {
+    // Build a tokio runtime and run the async server.
+    // The runtime blocks until the server shuts down (AC23).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| errors::ProxyError::InvalidConfig(format!("tokio runtime init: {e}")))?;
+
+    rt.block_on(server::run_server(config, pipeline, analytics))
 }
