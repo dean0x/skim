@@ -1069,8 +1069,11 @@ mod tests {
     #[test]
     fn passthrough_record_typed_round_trip() {
         let r = DecisionRecord::passthrough("req-rt-pt", "identity", 200);
-        let json: &'static str =
-            Box::leak(r.to_json().expect("serialisation must succeed").into_boxed_str());
+        let json: &'static str = Box::leak(
+            r.to_json()
+                .expect("serialisation must succeed")
+                .into_boxed_str(),
+        );
         let back: DecisionRecord =
             serde_json::from_str(json).expect("typed deserialization must succeed");
         assert_eq!(back.reason, OutcomeReason::Passthrough);
@@ -1091,8 +1094,11 @@ mod tests {
             700,
             OutcomeReason::Degraded,
         );
-        let json: &'static str =
-            Box::leak(r.to_json().expect("serialisation must succeed").into_boxed_str());
+        let json: &'static str = Box::leak(
+            r.to_json()
+                .expect("serialisation must succeed")
+                .into_boxed_str(),
+        );
         let back: DecisionRecord =
             serde_json::from_str(json).expect("typed deserialization must succeed");
         assert_eq!(back.reason, OutcomeReason::Degraded);
@@ -1108,10 +1114,13 @@ mod tests {
     /// as an unexpected value in the typed field after round-trip).
     #[test]
     fn with_tokens_typed_round_trip() {
-        let r = DecisionRecord::modified("req-rt-tok", "block-router", 800, 400)
-            .with_tokens(120, 72);
-        let json: &'static str =
-            Box::leak(r.to_json().expect("serialisation must succeed").into_boxed_str());
+        let r =
+            DecisionRecord::modified("req-rt-tok", "block-router", 800, 400).with_tokens(120, 72);
+        let json: &'static str = Box::leak(
+            r.to_json()
+                .expect("serialisation must succeed")
+                .into_boxed_str(),
+        );
         let back: DecisionRecord =
             serde_json::from_str(json).expect("typed deserialization must succeed");
         assert_eq!(back.reason, OutcomeReason::Full);
