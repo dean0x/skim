@@ -9,7 +9,7 @@ use std::process::{Command, ExitCode};
 
 use super::{
     KNOWN_SUBCOMMANDS, agents, build, completions, db, discover, file, git, heatmap, infra, init,
-    learn, lint, log, pkg, rewrite, sanitize_for_display, search, stats, test,
+    learn, lint, log, pkg, proxy, rewrite, sanitize_for_display, search, stats, test,
 };
 
 // ============================================================================
@@ -482,6 +482,12 @@ pub(crate) fn dispatch(
         "init" => init::run(args, analytics),
         "learn" => learn::run(args, analytics),
         "log" => log::run(args, analytics),
+        // AD-PXY-01: proxy is a meta subcommand (server, not a tool to intercept).
+        // The indefinite-command guard MUST NOT route `skim proxy` to
+        // run_inherited_passthrough — `proxy` is not an indefinite streaming command
+        // (AC25 / AD-PXY-03). It is excluded from PATH-wrapper targets via
+        // META_SUBCOMMANDS in registry.rs.
+        "proxy" => proxy::run(args, analytics),
         "rewrite" => rewrite::run(args, analytics),
         "search" => search::run(args, analytics),
         "stats" => stats::run(args, analytics),
@@ -738,6 +744,16 @@ mod tests {
         assert!(
             !is_indefinite_command(&["tsc"]),
             "bare tsc must be classified as finite (watch requires --watch/-w)"
+        );
+
+        // AC25: `skim proxy` is a meta subcommand (server), NOT an indefinite
+        // streaming command. The indefinite-guard must NOT route it to
+        // run_inherited_passthrough — that would bypass the proxy startup path.
+        // It is classified as finite by construction (it does not appear in the
+        // indefinite-command list) so the dispatch arm in proxy.rs is reached.
+        assert!(
+            !is_indefinite_command(&["proxy"]),
+            "proxy must be classified as finite (server startup, not a streaming tool)"
         );
     }
 

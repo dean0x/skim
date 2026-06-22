@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 rskim-core = { version = "2.10.0", path = "../rskim-core" }
+rskim-proxy = { path = "../rskim-proxy" }
 rskim-search = { path = "../rskim-search" }
 # Delegates token counting to the multi-provider library (AC13, AC15).
 # Do NOT enable "net-anthropic" here — default build must remain HTTP-free (AC9).

@@ -2,6 +2,7 @@
 members = [
     "crates/rskim-core",
     "crates/rskim",
+    "crates/rskim-proxy",
     "crates/rskim-search",
     "crates/rskim-research",
     "crates/rskim-bench",
@@ -78,6 +79,42 @@ quick-xml = "0.37"
 # Optional synchronous HTTP client for rskim-tokens net-anthropic feature.
 # Uses rustls for TLS (transitive via ureq 3.x); json feature not needed — net.rs uses serde_json directly.
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
+
+# Async runtime for rskim-proxy (AD-PXY-01). First async runtime in the workspace.
+# Version constraint "1.44" — resolves to tokio 1.52.3 in Cargo.lock (stable series).
+tokio = { version = "1.44", default-features = false }
+
+# HTTP/1.1 server + client — hyper 1.x stable series.
+# hyper 1.10 — mature stable release, aligns with hyper-util 0.1.x.
+hyper = { version = "1.10", default-features = false }
+hyper-util = { version = "0.1", default-features = false }
+http-body-util = { version = "0.1" }
+# http-body 1.x — the core Body trait; transitive via hyper 1.x.
+# Pinned to 1.x matching hyper 1.10.
+http-body = { version = "1" }
+
+# TLS — rustls 0.23.x matches the existing lockfile entry (pulled in by ureq 3.3).
+# webpki-roots: hermetic root-cert bundle; no OS trust-store access (#346 tracks opt-in).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# hyper-rustls 0.27 targets rustls 0.23.x.
+hyper-rustls = { version = "0.27", default-features = false }
+
+# Byte buffer type shared by hyper body handling in rskim-proxy.
+# bytes 1.11.x — aligned with hyper 1.x's own bytes dependency.
+bytes = "1.11"
+
+# WebPKI root certificate bundle — hermetic TLS for rskim-proxy upstream client.
+# webpki-roots 1.0.7 — soaked, already in the lockfile via hyper-rustls transitive dep.
+# OS trust-store option tracked in #346.
+webpki-roots = "1.0"
+
+# tokio-rustls — the async TLS adapter used by hyper-rustls under the hood.
+# version "0.26" (net-new transitive dep pulled in by this branch via hyper-rustls).
+tokio-rustls = { version = "0.26", default-features = false }
+
+# Structured tracing for rskim-proxy JSON logs.
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", default-features = false }
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.14.0"
