@@ -164,10 +164,7 @@ async fn find_proxy_test_port() -> u16 {
     let base: u16 = 41100;
     for offset in 0..800_u16 {
         let port = base + offset;
-        if TcpListener::bind(format!("127.0.0.1:{port}"))
-            .await
-            .is_ok()
-        {
+        if TcpListener::bind(format!("127.0.0.1:{port}")).await.is_ok() {
             return port;
         }
     }
@@ -189,9 +186,9 @@ impl ProxyHandle {
         let pipeline = TransformPipeline::identity();
         let analytics = Arc::new(NoopAnalyticsHook);
 
-        let task = tokio::spawn(
-            rskim_proxy::testing::run_server_async(config, pipeline, analytics),
-        );
+        let task = tokio::spawn(rskim_proxy::testing::run_server_async(
+            config, pipeline, analytics,
+        ));
         let abort_handle = task.abort_handle();
 
         // Give the proxy a moment to bind and start accepting.
@@ -445,9 +442,8 @@ async fn test_ac11_statelessness_determinism() {
 
         let mut handles = Vec::with_capacity(AC11_CONCURRENT_CLIENTS);
         for _ in 0..AC11_CONCURRENT_CLIENTS {
-            let handle = tokio::spawn(async move {
-                post_to_proxy(proxy_addr, canonical_body).await
-            });
+            let handle =
+                tokio::spawn(async move { post_to_proxy(proxy_addr, canonical_body).await });
             handles.push(handle);
         }
 

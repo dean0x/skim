@@ -119,11 +119,7 @@ impl rskim_proxy::seam::TransformStage for SlowedIdentityStage {
         // std::thread::sleep is intentional: bench stages may block threads
         // without violating production constraints (this stage is test-only).
         std::thread::sleep(Duration::from_millis(50));
-        rskim_contract::contract::Outcome::passthrough(
-            body.to_vec(),
-            ctx.request_id,
-            self.name(),
-        )
+        rskim_contract::contract::Outcome::passthrough(body.to_vec(), ctx.request_id, self.name())
     }
 }
 
@@ -193,10 +189,7 @@ struct ProxyHandle {
 /// Uses the upper subrange (48000-48999) to avoid collision with test ports (41100-41900).
 async fn find_bench_port() -> u16 {
     for port in 48000..49000_u16 {
-        if TcpListener::bind(format!("127.0.0.1:{port}"))
-            .await
-            .is_ok()
-        {
+        if TcpListener::bind(format!("127.0.0.1:{port}")).await.is_ok() {
             return port;
         }
     }
@@ -375,58 +368,57 @@ fn bench_ac14_identity_latency(c: &mut Criterion) {
 fn bench_ac15_analytics_hooks(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
-    let (proxy_sleeping_addr, proxy_panicking_addr, proxy_saturated_addr) =
-        rt.block_on(async {
-            let upstream_addr = start_fake_upstream().await;
-            let upstream_url = format!("http://{upstream_addr}");
+    let (proxy_sleeping_addr, proxy_panicking_addr, proxy_saturated_addr) = rt.block_on(async {
+        let upstream_addr = start_fake_upstream().await;
+        let upstream_url = format!("http://{upstream_addr}");
 
-            // Arm A: ChannelAnalyticsHook with a slow background consumer (50ms sleep).
-            // The request path sends to the bounded channel and returns immediately;
-            // the sleeping is done by the consumer thread off the critical path.
-            let (sleeping_hook, rx_a) = ChannelAnalyticsHook::new(64);
-            // Spawn the slow consumer on a background thread.
-            std::thread::spawn(move || {
-                for _event in rx_a.iter() {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            });
-            let proxy_sleeping = ProxyHandle::start(
-                &upstream_url,
-                TransformPipeline::identity(),
-                Arc::new(sleeping_hook),
-            )
-            .await;
-
-            // Arm B: panicking hook — proxy must catch the panic (AC9 / AC15).
-            let proxy_panicking = ProxyHandle::start(
-                &upstream_url,
-                TransformPipeline::identity(),
-                Arc::new(PanickingHook),
-            )
-            .await;
-
-            // Arm C: saturated channel — capacity=1, no consumer.
-            // Events are dropped on overflow without blocking the request path.
-            let (saturated_hook, rx_c) = ChannelAnalyticsHook::new(1);
-            // Consumer never reads — channel fills, subsequent events drop.
-            // Keep rx_c alive to prevent sender from seeing a disconnected error.
-            std::mem::forget(rx_c);
-            let proxy_saturated = ProxyHandle::start(
-                &upstream_url,
-                TransformPipeline::identity(),
-                Arc::new(saturated_hook),
-            )
-            .await;
-
-            let sleeping_addr = proxy_sleeping.proxy_addr;
-            let panicking_addr = proxy_panicking.proxy_addr;
-            let saturated_addr = proxy_saturated.proxy_addr;
-            std::mem::forget(proxy_sleeping);
-            std::mem::forget(proxy_panicking);
-            std::mem::forget(proxy_saturated);
-
-            (sleeping_addr, panicking_addr, saturated_addr)
+        // Arm A: ChannelAnalyticsHook with a slow background consumer (50ms sleep).
+        // The request path sends to the bounded channel and returns immediately;
+        // the sleeping is done by the consumer thread off the critical path.
+        let (sleeping_hook, rx_a) = ChannelAnalyticsHook::new(64);
+        // Spawn the slow consumer on a background thread.
+        std::thread::spawn(move || {
+            for _event in rx_a.iter() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
         });
+        let proxy_sleeping = ProxyHandle::start(
+            &upstream_url,
+            TransformPipeline::identity(),
+            Arc::new(sleeping_hook),
+        )
+        .await;
+
+        // Arm B: panicking hook — proxy must catch the panic (AC9 / AC15).
+        let proxy_panicking = ProxyHandle::start(
+            &upstream_url,
+            TransformPipeline::identity(),
+            Arc::new(PanickingHook),
+        )
+        .await;
+
+        // Arm C: saturated channel — capacity=1, no consumer.
+        // Events are dropped on overflow without blocking the request path.
+        let (saturated_hook, rx_c) = ChannelAnalyticsHook::new(1);
+        // Consumer never reads — channel fills, subsequent events drop.
+        // Keep rx_c alive to prevent sender from seeing a disconnected error.
+        std::mem::forget(rx_c);
+        let proxy_saturated = ProxyHandle::start(
+            &upstream_url,
+            TransformPipeline::identity(),
+            Arc::new(saturated_hook),
+        )
+        .await;
+
+        let sleeping_addr = proxy_sleeping.proxy_addr;
+        let panicking_addr = proxy_panicking.proxy_addr;
+        let saturated_addr = proxy_saturated.proxy_addr;
+        std::mem::forget(proxy_sleeping);
+        std::mem::forget(proxy_panicking);
+        std::mem::forget(proxy_saturated);
+
+        (sleeping_addr, panicking_addr, saturated_addr)
+    });
 
     let body = Bytes::from(bench_body());
     let mut group = c.benchmark_group("proxy_ac15_analytics_hook_arms");

@@ -104,3 +104,7 @@ path = "src/lib.rs"
 name = "proxy_latency_bench"
 path = "benches/proxy_latency_bench.rs"
 harness = false
+# The bench spins up a live proxy via rskim_proxy::testing::run_server_async,
+# which is gated behind #[cfg(any(test, feature = "testing"))].  Bench targets
+# are NOT compiled under the `test` cfg, so the feature must be declared here.
+required-features = ["testing"]
