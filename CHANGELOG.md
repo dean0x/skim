@@ -44,6 +44,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trigger passthrough for those subcommands.
 
 ### Changed
+- **Net-savings guard token-decision cap raised 64 KiB → 256 KiB; new 4 KiB longest-run guard
+  for degenerate inputs** (#317 / #350) — The cap controlling when `savings_decision` falls
+  back from exact token counts to fast byte comparison is raised from 64 KiB to 256 KiB,
+  improving token-accurate decisions for moderately large outputs.  A complementary
+  longest-run guard is added: when either string contains a non-whitespace run exceeding
+  4 KiB (and both strings are below the size cap), the function falls back to byte comparison
+  to avoid O(n²) BPE merge cost on minified JS / base64 / binary-as-text single-line inputs.
+  Real line-oriented shell output never triggers the run guard; the "never expand" safety
+  invariant is unchanged on all paths.
+- **Analytics stores true (gross) compressed-token counts on expansion rows** (#317 / #350) —
+  Previously `compressed_tokens` was clamped to `raw_tokens` when the output expanded.  It is
+  now stored as the true value.  The `tokens_saved` aggregate (in `query_summary`, `query_daily`,
+  and all other aggregate queries) is floored per-row to 0 via `CASE WHEN`, consistent with
+  existing `query_by_command` / `query_by_language` / `query_by_mode` / `query_by_session`
+  behavior.  Row-level `raw_tokens` / `compressed_tokens` now carry true gross counts, allowing
+  accurate expansion-rate analysis.  **Note:** rows written before this change remain clamped
+  (mixed historical data); this is acceptable for cumulative analytics — no migration is needed.
+- **`--show-stats` token counts reused for analytics recording** (#317 / #350) — When
+  `--show-stats` is active, the token counts already computed for the stats display are reused
+  to record the analytics row via `try_record_command_with_counts`, avoiding redundant
+  background re-tokenization.  The common path (no `--show-stats`) is unchanged.
 - **`serde_json` `preserve_order` feature enabled workspace-wide — key ordering changes** — (#302)
   Enabling `preserve_order` switches `serde_json::Map` from `BTreeMap` (alphabetical) to
   `IndexMap` (declaration/insertion order) for every crate in the workspace. Visible effects:
