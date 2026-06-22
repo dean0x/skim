@@ -1,4 +1,4 @@
-// Wire integration tests: AC1, AC3, AC5, AC6, AC7, AC9, AC10, AC12, AC13, AC16, AC20, AC21, AC22, AC23
+// Wire integration tests: AC1, AC3, AC5, AC6, AC7, AC9, AC10, AC12, AC13, AC14, AC15, AC16, AC20, AC21, AC22, AC23
 //
 // These tests require the `testing` feature to access `rskim_proxy::testing::run_server_async`.
 // Run with: cargo test -p rskim-proxy --all-targets --features testing
@@ -26,6 +26,8 @@
 //! | AC16 (readiness flip over-the-wire) | `test_ac16_readiness_flip_wire` |
 //! | AC20 (upstream timeout → 504) | `test_ac20_upstream_timeout_504` |
 //! | AC21 (client disconnect cancels upstream) | `test_ac21_client_disconnect_cancels_upstream` |
+//! | AC14 (regression guard can fail) | `test_ac14_regression_guard_can_fail` |
+//! | AC15 (zero failures: panicking/saturated) | `test_ac15_zero_failures_panicking_hook` / `test_ac15_zero_failures_saturated_channel` |
 //! | AC22 (connection cap) | `test_ac22_connection_cap_bounded_accept` |
 //! | AC23 (graceful shutdown) | `test_ac23_graceful_shutdown_drains_and_exits` |
 
@@ -48,7 +50,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use rskim_proxy::analytics::{AnalyticsHook, NoopAnalyticsHook, ProxyEvent};
+use rskim_proxy::analytics::{AnalyticsHook, ChannelAnalyticsHook, NoopAnalyticsHook, ProxyEvent};
 use rskim_proxy::config::ProxyConfig;
 use rskim_proxy::seam::TransformPipeline;
 use tokio::net::TcpListener;
@@ -1442,5 +1444,237 @@ async fn test_ac23_graceful_shutdown_drains_and_exits() {
     assert!(
         refused,
         "AC23: after shutdown, new connections must be refused or timeout"
+    );
+}
+
+// ============================================================================
+// AC14 — Latency regression guard: discriminating gate MUST fail for slowed arm
+// ============================================================================
+
+/// A `TransformStage` that sleeps 50ms before returning identity passthrough.
+///
+/// ## AC14 discriminating requirement (PF-007)
+///
+/// The plan requires a gate that CAN FAIL. This stage introduces a fixed 50ms
+/// blocking sleep so the measured latency structurally exceeds the relative
+/// regression guard multiple (`REGRESSION_GUARD_MULTIPLE × baseline`). A proxy
+/// without a latency regression gate would silently accept this stage.
+struct SlowedIdentityStage;
+
+impl rskim_proxy::seam::TransformStage for SlowedIdentityStage {
+    fn name(&self) -> &'static str {
+        "test-slowed-identity"
+    }
+
+    fn apply(
+        &self,
+        body: &[u8],
+        ctx: &rskim_proxy::seam::TransformContext<'_>,
+        _sink: &dyn rskim_contract::log::DecisionSink,
+    ) -> rskim_contract::contract::Outcome {
+        // Deliberate 50ms blocking sleep — the AC14 discriminating arm.
+        // std::thread::sleep is intentional: this is a test-only stage that
+        // proves the gate can fail (PF-007).
+        std::thread::sleep(Duration::from_millis(50));
+        rskim_contract::contract::Outcome::passthrough(body.to_vec(), ctx.request_id, self.name())
+    }
+}
+
+/// AC14 (asserting gate): the slowed-identity arm MUST report latency
+/// significantly above the no-op baseline × `REGRESSION_GUARD_MULTIPLE`.
+///
+/// This is the gate-can-fail proof required by AC14 / PF-007.
+///
+/// ## Method
+///
+/// 1. Run N sequential requests through a baseline (noop identity) proxy and
+///    compute the mean round-trip time.
+/// 2. Run N sequential requests through a slowed-identity proxy (50ms sleep per
+///    stage) and compute the mean round-trip time.
+/// 3. Assert: `slowed_mean >= REGRESSION_GUARD_MULTIPLE × baseline_mean`.
+///
+/// The 50ms sleep structurally guarantees the slowed arm exceeds any reasonable
+/// baseline on any hardware (identity overhead is measured in microseconds to
+/// low milliseconds). This is a timing assertion, not a flakiness risk.
+#[tokio::test]
+async fn test_ac14_regression_guard_can_fail() {
+    /// Documented relative regression guard multiple (AD-PXY-16 / D7).
+    /// Matches `REGRESSION_GUARD_MULTIPLE` in the criterion bench.
+    const REGRESSION_GUARD_MULTIPLE: u64 = 3;
+
+    /// Number of sequential requests per arm. Small enough to be fast in CI,
+    /// large enough to amortise per-request setup overhead.
+    const N: usize = 5;
+
+    let upstream = FakeUpstream::start_echo().await;
+    let upstream_url = upstream.url();
+
+    // --- Baseline arm: noop hook, identity pipeline ---
+    let (baseline_abort, baseline_addr) = start_proxy(&upstream_url).await;
+
+    let mut baseline_times = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t0 = std::time::Instant::now();
+        let (status, _) = post_body(baseline_addr, b"{}").await;
+        let elapsed = t0.elapsed();
+        assert_eq!(status, 200, "AC14 baseline: unexpected status");
+        baseline_times.push(elapsed.as_micros() as u64);
+    }
+    baseline_abort.abort();
+    let baseline_mean_us: u64 = baseline_times.iter().sum::<u64>() / N as u64;
+
+    // --- Slowed arm: noop hook, slowed-identity pipeline (50ms sleep per stage) ---
+    let slowed_port = find_test_port().await;
+    let slowed_config = ProxyConfig::builder()
+        .port(slowed_port)
+        .upstream_default(&upstream_url)
+        .build()
+        .expect("proxy config");
+    let slowed_addr = slowed_config.bind_addr();
+    let slowed_pipeline = rskim_proxy::seam::TransformPipeline::from_stages(vec![
+        Box::new(SlowedIdentityStage),
+    ]);
+    let slowed_task = tokio::spawn(rskim_proxy::testing::run_server_async(
+        slowed_config,
+        slowed_pipeline,
+        Arc::new(NoopAnalyticsHook),
+    ));
+    let slowed_abort = slowed_task.abort_handle();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let mut slowed_times = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t0 = std::time::Instant::now();
+        let (status, _) = post_body(slowed_addr, b"{}").await;
+        let elapsed = t0.elapsed();
+        assert_eq!(status, 200, "AC14 slowed arm: unexpected status");
+        slowed_times.push(elapsed.as_micros() as u64);
+    }
+    slowed_abort.abort();
+    let slowed_mean_us: u64 = slowed_times.iter().sum::<u64>() / N as u64;
+
+    // Gate: slowed arm MUST exceed REGRESSION_GUARD_MULTIPLE × baseline_mean.
+    // The 50ms sleep (50_000µs) structurally guarantees this on any hardware
+    // where baseline_mean < 16_000µs (16ms) — i.e., 3 × 16ms = 48ms < 50ms.
+    // In practice, proxy baseline is <5ms, so slowed will be ~50-55ms (10-11×).
+    // If baseline somehow exceeds 16ms on a pathologically loaded CI runner,
+    // we add a floor guard to keep the assertion meaningful.
+    let ceiling_us = REGRESSION_GUARD_MULTIPLE * baseline_mean_us.max(1_000); // at least 1ms floor
+    assert!(
+        slowed_mean_us >= ceiling_us,
+        "AC14: slowed arm ({slowed_mean_us}µs mean) must exceed \
+         {REGRESSION_GUARD_MULTIPLE}× baseline ({baseline_mean_us}µs mean = ceiling {ceiling_us}µs). \
+         Gate MUST be able to fail (PF-007)."
+    );
+}
+
+// ============================================================================
+// AC15 — Analytics-hook arms: zero failures for panicking/saturated hooks
+// ============================================================================
+
+/// Analytics hook that panics unconditionally (AC15 discriminating arm).
+///
+/// The proxy catches panics via `std::panic::catch_unwind` at the analytics
+/// call site (AC9 / AC15 / server.rs). Zero request failures must result
+/// even when this hook is configured.
+struct PanickingHook;
+
+impl AnalyticsHook for PanickingHook {
+    fn on_request(&self, _event: &ProxyEvent) {
+        panic!("deliberate analytics panic — AC15 discriminating arm");
+    }
+}
+
+/// AC15 (asserting gate, panicking hook): requests through a proxy whose
+/// analytics hook panics on every event MUST all return 200.
+///
+/// This proves `std::panic::catch_unwind` at the analytics call site
+/// isolates the panicking hook from the request path (AC9 / AC15).
+#[tokio::test]
+async fn test_ac15_zero_failures_panicking_hook() {
+    const N: usize = 10;
+
+    let upstream = FakeUpstream::start_echo().await;
+    let port = find_test_port().await;
+    let config = ProxyConfig::builder()
+        .port(port)
+        .upstream_default(upstream.url())
+        .build()
+        .expect("proxy config");
+    let proxy_addr = config.bind_addr();
+    let task = tokio::spawn(rskim_proxy::testing::run_server_async(
+        config,
+        rskim_proxy::seam::TransformPipeline::identity(),
+        Arc::new(PanickingHook),
+    ));
+    let abort = task.abort_handle();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let mut failures = 0usize;
+    for i in 0..N {
+        let (status, _) = post_body(proxy_addr, b"{}").await;
+        if status != 200 {
+            failures += 1;
+        }
+        // Trace for diagnosis — does NOT affect the assertion.
+        let _ = i;
+    }
+    abort.abort();
+
+    assert_eq!(
+        failures,
+        0,
+        "AC15: panicking analytics hook must cause ZERO request failures \
+         (catch_unwind isolates the panic). Got {failures}/{N} failures."
+    );
+}
+
+/// AC15 (asserting gate, saturated channel): requests through a proxy whose
+/// analytics channel is full (capacity=1, no consumer) MUST all return 200.
+///
+/// Events are dropped silently without blocking the request path (bounded channel
+/// / drop-on-overflow, AC15 discriminating property).
+#[tokio::test]
+async fn test_ac15_zero_failures_saturated_channel() {
+    const N: usize = 10;
+
+    let upstream = FakeUpstream::start_echo().await;
+    let port = find_test_port().await;
+    let config = ProxyConfig::builder()
+        .port(port)
+        .upstream_default(upstream.url())
+        .build()
+        .expect("proxy config");
+    let proxy_addr = config.bind_addr();
+
+    // Capacity=1, no consumer — channel fills immediately; subsequent events drop.
+    let (hook, rx) = ChannelAnalyticsHook::new(1);
+    // Keep rx alive so the sender does not observe a disconnected error.
+    // We deliberately never read from it to saturate the channel.
+    std::mem::forget(rx);
+
+    let task = tokio::spawn(rskim_proxy::testing::run_server_async(
+        config,
+        rskim_proxy::seam::TransformPipeline::identity(),
+        Arc::new(hook),
+    ));
+    let abort = task.abort_handle();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let mut failures = 0usize;
+    for i in 0..N {
+        let (status, _) = post_body(proxy_addr, b"{}").await;
+        if status != 200 {
+            failures += 1;
+        }
+        let _ = i;
+    }
+    abort.abort();
+
+    assert_eq!(
+        failures,
+        0,
+        "AC15: saturated analytics channel must cause ZERO request failures \
+         (events dropped without blocking, bounded channel). Got {failures}/{N} failures."
     );
 }
