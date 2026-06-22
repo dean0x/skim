@@ -58,6 +58,9 @@ tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
 rskim-contract = { path = "../rskim-contract", features = ["harness"] }
 tokio = { workspace = true, features = ["full"] }
 proptest = { workspace = true }
+# Compile-fail tests for AC24 non_exhaustive enforcement.
+# Precedent: rskim-contract/tests/ac2_compile_fail.rs.
+trybuild = { workspace = true }
 
 [features]
 # Optional typed-view seam helper — #304 can enable when it calls ctx.parse_typed().

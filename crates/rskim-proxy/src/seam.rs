@@ -129,6 +129,32 @@ pub struct TransformContext<'a> {
     pub headers: &'a HeaderView<'a>,
 }
 
+impl<'a> TransformContext<'a> {
+    /// Construct a [`TransformContext`] from its required fields.
+    ///
+    /// This constructor exists so external crates (including integration test crates
+    /// in `tests/`) can build a context without relying on struct literal syntax,
+    /// which is forbidden for `#[non_exhaustive]` structs outside the defining crate.
+    ///
+    /// # AD-PXY-09
+    ///
+    /// `turn_id` is intentionally absent (spec in #344). The constructor signature
+    /// will be extended non-breakingly when #305 adds `turn_id`.
+    pub fn new(
+        provider: ProxyProvider,
+        auth_mode: AuthMode,
+        request_id: &'a str,
+        headers: &'a HeaderView<'a>,
+    ) -> Self {
+        Self {
+            provider,
+            auth_mode,
+            request_id,
+            headers,
+        }
+    }
+}
+
 // ============================================================================
 // TransformStage trait
 // ============================================================================

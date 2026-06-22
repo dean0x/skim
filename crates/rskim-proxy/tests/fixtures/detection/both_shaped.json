@@ -1,0 +1,14 @@
+{
+  "model": "claude-opus-4-5",
+  "system": "You are a helpful assistant.",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Be concise."
+    },
+    {
+      "role": "user",
+      "content": "Hello."
+    }
+  ]
+}
