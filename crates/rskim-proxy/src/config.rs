@@ -19,10 +19,11 @@
 //!
 //! ## AD-PXY-10 — Request-body max-size bound
 //!
-//! Requests with bodies larger than [`DEFAULT_MAX_BODY_BYTES`] (64 MiB) are
-//! streamed through untransformed (fail-open) and logged. This aligns with
-//! `rskim-llm`'s `ChunkIngestionBuilder` 64 MiB cap as the upper reference.
-//! Oversize requests never produce a proxy-originated error response.
+//! Request bodies larger than [`DEFAULT_MAX_BODY_BYTES`] (64 MiB) are rejected
+//! at the buffering stage (http_body_util::Limited). The #303 implementation
+//! returns a 400 for oversize bodies; a full streaming-passthrough path is a
+//! deferred enhancement for #304 (requires the forward layer's streaming path).
+//! This aligns with `rskim-llm`'s `ChunkIngestionBuilder` 64 MiB cap.
 //!
 //! ## AD-PXY-14 — Lifecycle bounds (auto-resolved #6)
 //!
@@ -90,8 +91,9 @@ pub const DEFAULT_READINESS_FLIP_SECS: u64 = 3;
 /// Request-body buffering bound: 64 MiB.
 ///
 /// Aligns with `rskim-llm`'s `ChunkIngestionBuilder` 64 MiB cap as the upper
-/// reference. Bodies larger than this limit are streamed through untransformed
-/// (fail-open) and logged. The limit does NOT apply to response bodies — those
+/// reference. The #303 implementation enforces this via `http_body_util::Limited`;
+/// bodies exceeding this limit are rejected with 400 (a streaming-passthrough path
+/// is a #304 enhancement). The limit does NOT apply to response bodies — those
 /// are always streamed chunk-by-chunk without buffering (AC7).
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
@@ -169,7 +171,8 @@ pub struct ProxyConfig {
 
     /// Maximum request body bytes to buffer for transform and detection.
     ///
-    /// Bodies larger than this are streamed through untransformed (fail-open).
+    /// Bodies larger than this cause the request to abort with 400 in #303.
+    /// A streaming-passthrough path for oversize bodies is deferred to #304.
     /// Default: [`DEFAULT_MAX_BODY_BYTES`] (64 MiB). AD-PXY-10.
     pub max_body_bytes: usize,
 
@@ -182,6 +185,13 @@ pub struct ProxyConfig {
     /// client disconnects.
     ///
     /// Default: [`DEFAULT_CLIENT_DISCONNECT_CANCEL_MS`] (500ms). AD-PXY-14.
+    ///
+    /// # Implementation status
+    ///
+    /// In #303, client-disconnect cancellation happens implicitly via tokio task
+    /// drop when the connection task ends — this field is stored but NOT enforced
+    /// as an explicit timeout. An explicit `timeout(client_disconnect_cancel, …)`
+    /// on the upstream forward is a #304 enhancement.
     pub client_disconnect_cancel: Duration,
 
     /// Graceful drain interval on SIGINT/SIGTERM.
@@ -190,11 +200,17 @@ pub struct ProxyConfig {
     /// [`DEFAULT_GRACEFUL_DRAIN_SECS`] (5s). AD-PXY-14.
     pub graceful_drain: Duration,
 
-    /// Readiness watchdog flip interval.
+    /// Readiness watchdog staleness window reference.
     ///
-    /// After K=3 consecutive forward failures or last-success staleness >10s,
-    /// /readyz flips non-200. Default: [`DEFAULT_READINESS_FLIP_SECS`] (3s).
-    /// AD-PXY-11.
+    /// The observable contract is the K=3 / 10s window (see `health.rs`
+    /// `READINESS_FAILURE_THRESHOLD_K` / `READINESS_STALE_WINDOW_SECS`).
+    /// Default: [`DEFAULT_READINESS_FLIP_SECS`] (3s). AD-PXY-11.
+    ///
+    /// # Implementation status
+    ///
+    /// In #303, `health.rs` uses its own hardcoded constants. This field is stored
+    /// but NOT read by `ReadinessState` — wiring it through is a #304 enhancement
+    /// (requires passing the Duration into `ReadinessState::new`).
     pub readiness_flip: Duration,
 }
 

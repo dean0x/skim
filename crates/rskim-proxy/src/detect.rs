@@ -1,4 +1,4 @@
-//! Self-contained provider detection: path-suffix → bounded JSON shape → Unknown.
+//! Self-contained provider detection: path-suffix → bounded shallow-JSON shape → Unknown.
 //!
 //! ## AD-PXY-02 — Detection algorithm
 //!
@@ -11,12 +11,14 @@
 //!    allows Azure-style custom base paths to classify correctly (AC2).
 //!
 //! 2. **Bounded shallow-JSON shape fallback** — only when path matches neither.
-//!    Reads a shallow JSON sniff of the buffered body without constructing a full
-//!    `Value` tree. Discriminators:
+//!    Uses a `#[derive(Deserialize)]` struct with `IgnoredAny` for non-discriminator
+//!    values (mirrors the #302 ShallowBody technique). No full `serde_json::Value`
+//!    tree is constructed. Discriminators (AD-PXY-02 §3.4):
 //!    - Top-level `system` field AND/OR `messages` array AND/OR `model` starting
 //!      with `"claude"` → Anthropic.
 //!    - `messages` array with a `role` of `"system"` or `"developer"` AND/OR
 //!      `model` NOT starting with `"claude"` → OpenAI.
+//!    - `choices` is an OpenAI RESPONSE field, not a request discriminator — excluded.
 //!
 //! 3. **Tie-break** — both-shaped, neither-shaped, or body truncated/oversize →
 //!    **Unknown**. Detection MUST NOT reject, delay, or modify the request.
@@ -97,7 +99,11 @@ pub(crate) const SHAPE_SNIFF_LIMIT: usize = 8 * 1024;
 
 /// Classify a request body by shallow JSON shape analysis.
 ///
-/// Reads only the top-level keys of the JSON object. Returns:
+/// Reads only the discriminator keys of the JSON object using a
+/// `#[derive(Deserialize)]` struct with `serde::de::IgnoredAny` for all
+/// non-discriminator values. This mirrors the #302 ShallowBody technique
+/// (AD-PXY-02, §3.4): no full `Value` tree is constructed, only the keys we
+/// need are materialised. Returns:
 /// - `Some(Anthropic)` when the shape is exclusively Anthropic-shaped.
 /// - `Some(OpenAI)` when the shape is exclusively OpenAI-shaped.
 /// - `None` for both-shaped, neither-shaped, parse failure, or truncated body.
@@ -105,6 +111,9 @@ pub(crate) const SHAPE_SNIFF_LIMIT: usize = 8 * 1024;
 /// MUST NOT construct a full `Value` tree. MUST NOT call `rskim_llm::parse`.
 /// AD-PXY-02: shape detection is the fallback, not the primary path.
 fn detect_by_shape(body: &[u8]) -> Option<ProxyProvider> {
+    use serde::de::IgnoredAny;
+    use serde::Deserialize;
+
     // Only inspect up to SHAPE_SNIFF_LIMIT bytes.
     let sniff = if body.len() > SHAPE_SNIFF_LIMIT {
         &body[..SHAPE_SNIFF_LIMIT]
@@ -117,57 +126,64 @@ fn detect_by_shape(body: &[u8]) -> Option<ProxyProvider> {
         return None;
     };
 
-    // Shallow-parse: extract top-level string values for known discriminator keys
-    // using serde_json with IgnoredAny for all non-discriminator values. This avoids
-    // constructing a full Value tree while remaining robust to key ordering.
+    // Shallow-parse: only materialise the discriminator keys. All other top-level
+    // fields are consumed as IgnoredAny (no allocation). Nested message role values
+    // use a minimal role-only struct; all other message fields are IgnoredAny.
+    // This mirrors the #302 ShallowBody technique (AD-PXY-02 §3.4).
     //
-    // We parse a `serde_json::Map<String, serde_json::Value>` with `preserve_order`
-    // workspace feature, but only look at the values we care about.
-    // Using serde_json::Value::Object variant directly keeps it simple.
-    let value: Result<serde_json::Value, _> = serde_json::from_str(text);
-    let Ok(serde_json::Value::Object(obj)) = value else {
+    // Discriminator table (AD-PXY-02 §3.4):
+    //   Anthropic: top-level `system` field present; OR `model` starting with "claude".
+    //   OpenAI:    `messages[].role` contains "system" or "developer"; OR `model`
+    //              NOT starting with "claude" (when model is set).
+    //
+    // Note: `choices` is an OpenAI RESPONSE field — never present in a request body.
+    //       It is not a valid request discriminator and is excluded from this table.
+
+    #[derive(Deserialize)]
+    struct ShallowMessage {
+        #[serde(default)]
+        role: Option<String>,
+        #[serde(flatten)]
+        _rest: std::collections::HashMap<String, IgnoredAny>,
+    }
+
+    #[derive(Deserialize)]
+    struct ShallowBody {
+        #[serde(default)]
+        system: Option<IgnoredAny>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        messages: Option<Vec<ShallowMessage>>,
+    }
+
+    let Ok(body) = serde_json::from_str::<ShallowBody>(text) else {
         return None;
     };
 
-    // Anthropic discriminators: `system` field present, OR top-level `messages` array
-    // with no `role: "system"/"developer"` in them, OR `model` starting with "claude".
-    //
-    // OpenAI discriminators: `messages` array where any message has
-    // `role: "system"` or `role: "developer"`, OR `model` that does NOT start with
-    // "claude".
-    //
-    // Note: both APIs can have `messages` and `model` — we use the combination
-    // of signals to decide, falling back to Unknown for ambiguity.
-
-    let has_system_field = obj.contains_key("system");
-
-    let model_str = obj.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    // Anthropic discriminators.
+    let has_system_field = body.system.is_some();
+    let model_str = body.model.as_deref().unwrap_or("");
     let model_is_claude = model_str.starts_with("claude");
     let model_is_set = !model_str.is_empty();
 
     // Check messages array for OpenAI-specific role values.
-    let has_openai_role = obj
-        .get("messages")
-        .and_then(|v| v.as_array())
-        .map(|msgs| {
-            msgs.iter().any(|msg| {
-                msg.get("role")
-                    .and_then(|r| r.as_str())
-                    .map(|r| matches!(r, "system" | "developer"))
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
+    let has_openai_role = body
+        .messages
+        .as_ref()
+        .is_some_and(|msgs| {
+            msgs.iter()
+                .any(|msg| msg.role.as_deref().is_some_and(|r| matches!(r, "system" | "developer")))
+        });
+    let has_messages = body.messages.is_some();
 
     // Score Anthropic signals.
     let anthropic_signals = (has_system_field as u8)
         + (model_is_claude as u8)
-        + (obj.contains_key("messages") && !has_openai_role) as u8;
+        + (has_messages && !has_openai_role) as u8;
 
-    // Score OpenAI signals.
-    let openai_signals = (has_openai_role as u8)
-        + ((model_is_set && !model_is_claude) as u8)
-        + (obj.contains_key("choices") as u8); // choices is an OpenAI response field
+    // Score OpenAI signals (request-body signals only — no response-only fields).
+    let openai_signals = (has_openai_role as u8) + ((model_is_set && !model_is_claude) as u8);
 
     match (anthropic_signals, openai_signals) {
         (a, 0) if a > 0 => Some(ProxyProvider::Anthropic),

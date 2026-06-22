@@ -1,11 +1,20 @@
 //! Fire-and-forget analytics hook for per-request proxy telemetry.
 //!
-//! ## AD-PXY-15 — Analytics must not block the request path
+//! ## AD-PXY-17 — Analytics must not block the request path (AC15 / AC6)
 //!
-//! The hook fires once per completed request on a bounded channel — the request
-//! path MUST NOT wait for the hook to execute. When the channel is full, the
-//! event is dropped (lossy fire-and-forget). A drop counter tracks lost events;
-//! no request is ever failed or delayed because of analytics.
+//! Note: AD-PXY-15 is reserved for the header rewrite allowed-list decision in
+//! `forward.rs`. This analytics decision is AD-PXY-17.
+//!
+//! The proxy calls `AnalyticsHook::on_request` SYNCHRONOUSLY (catch_unwind-guarded)
+//! on the request path. The non-blocking guarantee is therefore a property of the
+//! HOOK IMPLEMENTATION, not of the proxy itself. The recommended implementation is
+//! [`ChannelAnalyticsHook`], which uses `try_send` on a bounded crossbeam channel —
+//! non-blocking and lossy on overflow. A hook that sleeps or blocks WILL delay the
+//! request; callers must use `ChannelAnalyticsHook` (or similar) to satisfy AC15.
+//!
+//! When the channel is full, the event is dropped and `drop_count` is incremented
+//! (AC15: events MUST be observably dropped, not silently blocked on overflow).
+//! #305 connects [`ChannelAnalyticsHook`] into `serve()` with a spawned consumer.
 //!
 //! The concrete [`ChannelAnalyticsHook`] ships a bounded `crossbeam_channel`
 //! sender. #305 will extend [`ProxyEvent`] with usage counters (token fields)
@@ -97,16 +106,17 @@ impl ProxyEvent {
 
 /// Fire-and-forget per-request analytics hook.
 ///
-/// Implementations MUST NOT block or return errors. A slow or panicking hook
-/// MUST NOT fail or delay any request. The proxy hands off via a bounded channel
-/// and drops the event on overflow (AC15 / AD-PXY-15).
+/// The proxy calls `on_request` SYNCHRONOUSLY on the request path (wrapped in
+/// `catch_unwind`). Implementations MUST NOT block; use [`ChannelAnalyticsHook`]
+/// (or a similar bounded-channel wrapper) so the call returns immediately. A
+/// panicking implementation does not fail the request (AC9 / AD-PXY-12).
 ///
 /// The default impl is [`NoopAnalyticsHook`] — a no-op sink with zero overhead.
 pub trait AnalyticsHook: Send + Sync {
     /// Called exactly once per completed request.
     ///
     /// MUST NOT block. MUST NOT panic (panics are caught at the call site via
-    /// `std::panic::catch_unwind` on the channel-send path, per AC9 / AD-PXY-12).
+    /// `std::panic::catch_unwind`, per AC9 / AD-PXY-12).
     fn on_request(&self, event: &ProxyEvent);
 }
 
@@ -129,18 +139,19 @@ impl AnalyticsHook for NoopAnalyticsHook {
 }
 
 // ============================================================================
-// Channel-based fire-and-forget sink (AC15 / AD-PXY-15)
+// Channel-based fire-and-forget sink (AC15 / AD-PXY-17)
 // ============================================================================
 
 /// Bounded-channel analytics hook: non-blocking, lossy on overflow.
 ///
-/// The proxy sends events via a bounded `crossbeam_channel`. When the channel
-/// is at capacity, the event is dropped and `drop_count` is incremented (AC15:
+/// Uses `crossbeam_channel::try_send` — the `on_request` call returns immediately
+/// without blocking the request path (AC15 / AD-PXY-17). When the channel is at
+/// capacity, the event is dropped and `drop_count` is incremented (AC15 discriminator:
 /// events MUST be observably dropped, not silently blocked on overflow).
 ///
-/// A background consumer processes events asynchronously — the forwarding path
-/// never waits for processing (AC15 discriminator: sleeping consumer does not
-/// regress request p99 beyond the documented multiple).
+/// The caller must spawn a consumer on the returned `Receiver` to process events
+/// asynchronously. Dropping the receiver ends the channel; subsequent sends are
+/// counted as drops.
 pub struct ChannelAnalyticsHook {
     sender: crossbeam_channel::Sender<ProxyEvent>,
     drop_count: Arc<AtomicU64>,

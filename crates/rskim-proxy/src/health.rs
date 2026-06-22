@@ -134,8 +134,15 @@ impl ReadinessState {
     /// Check whether the proxy is ready to serve requests.
     ///
     /// Returns `false` if:
-    /// - The consecutive-failure counter is ≥ K (K = [`READINESS_FAILURE_THRESHOLD_K`]).
+    /// - The `is_ready` flag is `false` (flipped by `record_failure` after K
+    ///   consecutive failures).
     /// - The last-success timestamp is more than [`READINESS_STALE_WINDOW_SECS`] ago.
+    ///
+    /// This method is a PURE READ — it does NOT write `is_ready`. Writes to
+    /// `is_ready` are the sole responsibility of `record_success` and `record_failure`
+    /// (the forwarding path — one writer per request at a time). Health-check
+    /// handlers can call `is_ready` concurrently without causing data races or
+    /// violating the single-writer-per-flag invariant.
     ///
     /// The staleness check runs on every call to catch "no traffic but upstream
     /// is down" scenarios at low load.
@@ -144,12 +151,16 @@ impl ReadinessState {
             return false;
         }
 
-        // Staleness check: flip to not-ready if last success is too old.
+        // Staleness check: compute without writing — pure read.
+        // record_success() is the only path that updates `is_ready` to true;
+        // a stale read here returns false (conservative) without a side-effecting store.
         let last = self.last_success_unix_secs.load(Ordering::Relaxed);
         let staleness = (unix_now_secs() - last).max(0) as u64;
 
         if staleness > READINESS_STALE_WINDOW_SECS {
-            self.is_ready.store(false, Ordering::SeqCst);
+            // Do NOT store here — is_ready() is a pure read.
+            // The flip will happen when record_failure() is next called, or we
+            // continue returning false until record_success() resets the state.
             return false;
         }
 

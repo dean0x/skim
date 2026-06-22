@@ -10,8 +10,8 @@
 //!    failure, and sink-full all resolve to byte-identical forward + structured
 //!    warning. Never a proxy-originated 4xx/5xx on the forwarding path (except
 //!    the named carve-outs: 502 for unknown provider with no default upstream,
-//!    503+Retry-After when connection cap is chosen as the cap behavior, and 504
-//!    for upstream timeout).
+//!    and 504 for upstream timeout). The connection cap uses bounded-accept TCP
+//!    backpressure (AD-PXY-13) — the proxy does NOT emit 503+Retry-After.
 //!
 //! 2. **Never-inflate** — the transform seam composes #301's `guarded_transform`
 //!    gate; output bytes ≤ input bytes per stage (invariant 2). The identity stage
@@ -28,8 +28,10 @@
 //!    names — do not rely on it for auth headers). See AC13.
 //!
 //! 5. **No ML, no tokenizer, no blocking on the request path** — detection is
-//!    path-first + bounded JSON shape fallback. Analytics is fire-and-forget on a
-//!    bounded channel.
+//!    path-first + bounded JSON shape fallback. Analytics fires synchronously via
+//!    `AnalyticsHook::on_request` (catch_unwind-guarded). The recommended
+//!    implementation is [`analytics::ChannelAnalyticsHook`] which hands off via a
+//!    bounded channel and is non-blocking. #305 wires the channel hook into `serve()`.
 //!
 //! 6. **Single static binary** — rustls + webpki-roots (no system-CA dependency).
 //!    OS trust-store option is a follow-up tracked in #346.
@@ -37,9 +39,12 @@
 //! ## AD-PXY-01: Separate crate rationale
 //!
 //! hyper, tokio, and rustls are heavy dependencies and introduce the first async
-//! runtime in the workspace. A separate optional crate isolates compile cost from
-//! users who never run the proxy, and from `release` LTO of the main binary.
-//! This follows the `rskim-search` precedent: depends on `rskim-core`/`rskim-contract`
+//! runtime in the workspace. A separate crate isolates incremental-rebuild churn:
+//! changes to proxy internals do not re-link all other crates. NOTE: `rskim`
+//! currently depends on `rskim-proxy` unconditionally (not feature-gated), so
+//! hyper/tokio/rustls ARE compiled into every `skim` build and flow through release
+//! LTO. A `proxy` feature gate is a future cleanup (#todo). This follows the
+//! `rskim-search` precedent: depends on `rskim-core`/`rskim-contract`
 //! without changing their APIs.
 //!
 //! ## Public API surface

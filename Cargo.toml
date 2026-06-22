@@ -80,9 +80,8 @@ quick-xml = "0.37"
 # Uses rustls for TLS (transitive via ureq 3.x); json feature not needed — net.rs uses serde_json directly.
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 
-# Async runtime for rskim-proxy (AD-PXY-01). First async runtime in the workspace;
-# isolated to rskim-proxy so the compile cost is opt-in, not imposed on all crates.
-# tokio 1.44.2 — stable, well-soaked (dep-soak guidance: ~30 days).
+# Async runtime for rskim-proxy (AD-PXY-01). First async runtime in the workspace.
+# Version constraint "1.44" — resolves to tokio 1.52.3 in Cargo.lock (stable series).
 tokio = { version = "1.44", default-features = false }
 
 # HTTP/1.1 server + client — hyper 1.x stable series.
@@ -107,12 +106,8 @@ bytes = "1.11"
 webpki-roots = "1.0"
 
 # tokio-rustls — the async TLS adapter used by hyper-rustls under the hood.
-# 0.26.4 — already in the lockfile via hyper-rustls.
+# version "0.26" (net-new transitive dep pulled in by this branch via hyper-rustls).
 tokio-rustls = { version = "0.26", default-features = false }
-
-# scopeguard — RAII guard used in server.rs for in-flight connection tracking.
-# 1.2.0 — already in the lockfile via transitive deps.
-scopeguard = "1.2"
 
 # Structured tracing for rskim-proxy JSON logs.
 tracing = { version = "0.1" }

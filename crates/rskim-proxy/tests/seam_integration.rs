@@ -168,6 +168,78 @@ mod ac4_inflating_stage_tests {
             "AC4: identity stage must pass (output == input, never-inflate satisfied)"
         );
     }
+
+    /// AC4-ArmB (NEGATIVE / DISCRIMINATING): pipeline-level never-inflate enforcement.
+    ///
+    /// A stage that returns inflated bytes WITHOUT calling `guarded_transform` internally
+    /// must still be caught by the seam's structural gate in `TransformPipeline::run`.
+    ///
+    /// This test uses a stage that bypasses `guarded_transform` and returns raw inflated
+    /// bytes. With the structural enforcement in `run()`, the output must equal the
+    /// ORIGINAL bytes (not the inflated output). Deleting the `guarded_transform` call
+    /// inside `run()` would cause this test to fail — proving the gate in `run()` is
+    /// load-bearing, not just stage-level voluntary compliance.
+    ///
+    /// Discriminating property (PF-007): if `run()` did NOT structurally enforce the gate,
+    /// the inflated bytes would propagate and this assertion would fail.
+    #[test]
+    fn test_ac4_arm_b_pipeline_structural_gate_catches_unguarded_inflation() {
+        /// An inflating stage that intentionally BYPASSES guarded_transform.
+        /// Real stages must call guarded_transform; this is a bad actor used only
+        /// to prove the seam's structural gate catches it.
+        struct UnguardedInflatingStage;
+
+        impl TransformStage for UnguardedInflatingStage {
+            fn name(&self) -> &'static str {
+                "test-unguarded-inflate"
+            }
+
+            fn apply(
+                &self,
+                body: &[u8],
+                ctx: &TransformContext<'_>,
+                _sink: &dyn DecisionSink,
+            ) -> Outcome {
+                // Deliberately bypass guarded_transform: return inflated bytes directly.
+                // This simulates a buggy/malicious stage that ignores the discipline.
+                let mut inflated = body.to_vec();
+                inflated.extend_from_slice(b"BAD_INFLATION");
+                // Use passthrough variant carrying the inflated bytes — intentionally
+                // incorrect to test the seam's structural enforcement.
+                Outcome::passthrough(inflated, ctx.request_id, self.name())
+            }
+        }
+
+        let body = b"original body for seam gate test".to_vec();
+        let original = body.clone();
+
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let ctx = TransformContext::new(
+            ProxyProvider::Anthropic,
+            AuthMode::ApiKey,
+            "req-ac4-armb",
+            &hv,
+        );
+        let sink = MockSink::new();
+
+        let pipeline = TransformPipeline::from_stages(vec![Box::new(UnguardedInflatingStage)]);
+        let outcome = pipeline.run(body, &ctx, &sink);
+
+        // The structural gate in run() must have caught the inflation.
+        assert_eq!(
+            outcome.bytes.as_slice(),
+            original.as_slice(),
+            "AC4-ArmB: seam's structural gate must catch unguarded inflation — output must be ORIGINAL bytes"
+        );
+        assert!(
+            !outcome
+                .bytes
+                .windows(b"BAD_INFLATION".len())
+                .any(|w| w == b"BAD_INFLATION"),
+            "AC4-ArmB: inflated suffix must NOT appear — structural gate must have caught it"
+        );
+    }
 }
 
 // ============================================================================

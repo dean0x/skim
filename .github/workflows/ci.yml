@@ -304,7 +304,7 @@ jobs:
       # - AC19b on-the-wire byte-identity over ALL_CORPUS.
       # - AC11 statelessness/determinism (16 concurrent + restart).
       #
-      # Excludes benchmarks (--benches) and the full workspace (PF-010).
+      # Uses --all-targets (includes benches compiled as tests) and scoped to -p rskim-proxy (PF-010).
       # Cross-link #323: the general Windows matrix (rskim-core, rskim-llm, etc.)
       # is owned by #323 and will supersede this scoped job when it lands.
       - name: Clippy rskim-proxy (Windows, PF-009)

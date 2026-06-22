@@ -64,6 +64,18 @@ pub(crate) fn run(
         }
     };
 
+    // D8: require --upstream-default. The flag is documented as required for routing;
+    // starting without it means every request 502s (no upstream to forward to). Fail
+    // fast at startup rather than serving a silently-useless proxy.
+    if parsed.upstream_default.is_none() {
+        eprintln!(
+            "skim proxy: --upstream-default is required (D8). \
+             Without it, all requests return 502. \
+             Example: skim proxy --port 41322 --upstream-default https://api.anthropic.com"
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+
     // Build and validate ProxyConfig.
     let mut builder = ProxyConfig::builder().port(parsed.port);
 
@@ -318,6 +330,34 @@ mod tests {
             "port {} must fail (below PORT_RANGE_MIN {})",
             PORT_RANGE_MIN - 1,
             PORT_RANGE_MIN
+        );
+    }
+
+    // D8 / NEGATIVE discriminating (PF-007): --upstream-default absence is caught by parse_proxy_args.
+    // The upstream_default field defaults to None; the run() function enforces it is set.
+    #[test]
+    fn test_parse_proxy_args_upstream_defaults_to_none() {
+        let args: Vec<String> = vec![];
+        let parsed = parse_proxy_args(&args).expect("parse must succeed");
+        // upstream_default is None by default; run() will reject and fail before serving.
+        assert!(
+            parsed.upstream_default.is_none(),
+            "no upstream_default must be None (rejected by run() per D8)"
+        );
+    }
+
+    // D8: upstream_default presence is parsed correctly.
+    #[test]
+    fn test_parse_proxy_args_upstream_set() {
+        let args: Vec<String> = vec![
+            "--upstream-default".into(),
+            "https://api.anthropic.com".into(),
+        ];
+        let parsed = parse_proxy_args(&args).expect("parse must succeed");
+        assert_eq!(
+            parsed.upstream_default.as_deref(),
+            Some("https://api.anthropic.com"),
+            "upstream_default must be set from --upstream-default flag"
         );
     }
 }

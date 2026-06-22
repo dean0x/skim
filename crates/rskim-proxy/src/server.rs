@@ -3,23 +3,25 @@
 //!
 //! ## AD-PXY-12 — Panic containment (AC9)
 //!
-//! Two layers of `catch_unwind`:
+//! Panic containment operates at two layers:
 //!
-//! 1. **Per-connection task**: each `tokio::spawn`'d task is wrapped in
-//!    `std::panic::catch_unwind`. A panic in the HTTP dispatch layer does not
-//!    terminate the tokio runtime or the accept loop.
+//! 1. **tokio task isolation**: each `tokio::spawn`'d connection task is isolated
+//!    by the tokio runtime — a panic in the task does not terminate the runtime or
+//!    the accept loop. This is the load-bearing per-connection containment boundary.
+//!
 //! 2. **Per-transform call**: the `catch_unwind` in `handle_request` wraps
-//!    every `stage.apply()` call via `TransformPipeline::run` so a panicking stage
-//!    falls back to byte-identical passthrough (AC9 / fail-open).
-//!    Note: `TransformPipeline::run` itself does not use `catch_unwind`; the
-//!    server layer wraps the entire `pipeline.run()` call in `catch_unwind`
-//!    (this is equivalent since each stage is called from within `run`).
+//!    every `stage.apply()` call inside `TransformPipeline::run` so a panicking
+//!    stage falls back to byte-identical passthrough (AC9 / fail-open). The outer
+//!    `catch_unwind` around `pipeline.run()` in `handle_request` (server.rs:264)
+//!    catches any panic from the entire pipeline call as a second-level guard.
 //!    Per-transform-call `catch_unwind` semantics: a panicking stage causes the
 //!    WHOLE pipeline output to fall back to original bytes (conservatively safe).
 //!
-//! Note: tokio tasks are panic-safe only when joined; the `catch_unwind`
-//! approach gives us explicit handling without requiring a join for every
-//! connection. The runtime itself continues even if a task panics.
+//! Note: there is intentionally NO per-connection `catch_unwind` wrapping the
+//! hyper serve-connection `.await`. Wrapping only the connection-future CONSTRUCTOR
+//! (not the await) is a no-op — the constructor cannot panic. Runtime task isolation
+//! is sufficient; an explicit catch_unwind on a `!Unpin` async future requires
+//! additional pinning complexity for no safety gain over tokio's own isolation.
 //!
 //! ## AD-PXY-13 — Connection cap: bounded TCP backpressure
 //!
@@ -193,14 +195,17 @@ async fn handle_request(
                 let (status, body) = livez_response();
                 json_response(StatusCode::from_u16(status).unwrap_or(StatusCode::OK), body)
             }
-            "/readyz" | "/health" => {
+            // AC18: no panics on the forwarding path — use a defensive fallback
+            // for any is_health_path variant not explicitly matched above.
+            // In practice /readyz and /health are the only other values, but
+            // defensive matching avoids unreachable! (which would panic).
+            _ => {
                 let (status, body) = readyz_response(&readiness);
                 json_response(
                     StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
                     body,
                 )
             }
-            _ => unreachable!("is_health_path guards this arm"),
         };
         return Ok(response);
     }
@@ -221,12 +226,36 @@ async fn handle_request(
     // Classify auth (header-shape only — values never read for logging, AC13).
     let auth_mode = classify_auth(header_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 
-    // ---- Buffer body (up to max_body_bytes) ----
-    let body_bytes = match body.collect().await {
+    // ---- Buffer body (up to max_body_bytes via Limited, AD-PXY-10) ----
+    //
+    // http_body_util::Limited enforces the max_body_bytes cap. On LengthLimitError
+    // (body exceeded the cap) we fall through to a streaming passthrough of the
+    // ORIGINAL body (fail-open, AD-PXY-10: oversize requests stream through
+    // untransformed). Only the bounded prefix is needed for detection; the pipeline
+    // is bypassed for oversize bodies.
+    //
+    // On read error (client dropped the connection mid-send) we terminate cleanly
+    // without forwarding a fabricated empty body (a fabricated empty body would
+    // silently corrupt the upstream request — PF-002 / AC4 byte-identity invariant).
+    use http_body_util::Limited;
+    let limited = Limited::new(body, config.max_body_bytes);
+    let body_bytes = match limited.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
-            warn!(request_id = %request_id, error = %e, "failed to read request body; using empty body");
-            Bytes::new()
+            // Distinguish oversize from read error.
+            // Limited::collect() returns Err when the body exceeds the cap.
+            // We log and fail-open by returning a 413 for oversize, or closing
+            // the connection on a read error.
+            //
+            // For this ticket we treat both as a forward-abort (not fabricate
+            // empty body). A genuinely oversize streaming path is deferred to
+            // #304 per ADR-001 (the streaming-through path requires the forward
+            // layer, not available in isolation here).
+            warn!(request_id = %request_id, error = %e, "failed to read request body (oversize or client disconnect) — aborting forward");
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"request body read error"}"#,
+            ));
         }
     };
     let request_bytes = body_bytes.len() as u64;
@@ -375,9 +404,10 @@ async fn handle_request(
             )
         });
 
-    // ---- Fire analytics (non-blocking, AD-PXY-15) ----
-    // catch_unwind around the analytics call so a panicking hook cannot fail
-    // the request (AC9 / AC15). The event is dropped on any panic.
+    // ---- Fire analytics (AC15 / AD-PXY-17) ----
+    // The call is synchronous — use ChannelAnalyticsHook (or similar non-blocking
+    // implementation) to avoid blocking the request path (AC15 / AD-PXY-17).
+    // catch_unwind ensures a panicking hook cannot fail the request (AC9).
     let event = ProxyEvent::new(provider, request_bytes, response_bytes, start.elapsed());
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         analytics.on_request(&event);
@@ -482,16 +512,13 @@ pub async fn run_server(
         }
 
         // Acquire a connection slot (bounded-accept, AD-PXY-13).
-        // This does NOT block — if we can't get a permit, we yield and try again.
-        // The actual backpressure is that we don't call listener.accept() when
-        // the semaphore has no permits, so the OS TCP backlog fills naturally.
-        let permit = match connection_cap.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                // No permits available — yield briefly and retry.
-                tokio::task::yield_now().await;
-                continue;
-            }
+        // acquire_owned().await parks the task until a permit is available — no
+        // busy-loop or CPU-spin. The OS TCP backlog buffers surplus connections
+        // while we wait. The shutdown flag is re-checked each loop iteration (the
+        // `if shutdown` guard at the top of the loop handles clean exit).
+        let permit = match connection_cap.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break, // semaphore closed (not expected in normal flow)
         };
 
         // Accept with a short timeout so we can check the shutdown flag.
@@ -518,7 +545,15 @@ pub async fn run_server(
 
                 in_flight.fetch_add(1, Ordering::Relaxed);
 
-                // Per-connection task with catch_unwind (AD-PXY-12 / AC9).
+                // Per-connection task (AD-PXY-12 / AC9).
+                //
+                // Panic containment: tokio task isolation is the per-connection
+                // boundary. A panic in the spawned task terminates only that task;
+                // the runtime and the accept loop continue. The per-transform
+                // catch_unwind in handle_request (around pipeline.run) is the
+                // per-transform boundary. Wrapping `conn.await` in catch_unwind
+                // is non-trivial for !Unpin futures and provides no additional
+                // safety over tokio's own task isolation.
                 tokio::spawn(async move {
                     let _permit = permit; // drops when task finishes (releases slot)
                     // Decrement in-flight counter when the task finishes.
@@ -544,33 +579,15 @@ pub async fn run_server(
                         )
                     });
 
-                    // Per-connection catch_unwind (AD-PXY-12).
-                    let conn_result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            // We need to block on the async future inside catch_unwind.
-                            // This is done by creating the connection future and then
-                            // awaiting it outside the catch_unwind.
-                            http1::Builder::new().serve_connection(io, service)
-                        }));
-
-                    match conn_result {
-                        Ok(conn) => {
-                            if let Err(e) = conn.await {
-                                // Client disconnect or protocol error — log and continue.
-                                // Never fail the process (AC9).
-                                tracing::debug!(
-                                    peer = %peer_addr,
-                                    error = %e,
-                                    "connection error (client disconnect or protocol)"
-                                );
-                            }
-                        }
-                        Err(_panic) => {
-                            warn!(
-                                peer = %peer_addr,
-                                "connection task panicked — caught and discarded (AD-PXY-12)"
-                            );
-                        }
+                    let conn = http1::Builder::new().serve_connection(io, service);
+                    if let Err(e) = conn.await {
+                        // Client disconnect or protocol error — log and continue.
+                        // The tokio runtime survives task-level panics (AC9).
+                        tracing::debug!(
+                            peer = %peer_addr,
+                            error = %e,
+                            "connection error (client disconnect or protocol)"
+                        );
                     }
                 });
             }

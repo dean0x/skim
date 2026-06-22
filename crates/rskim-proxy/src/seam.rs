@@ -319,13 +319,18 @@ impl TransformPipeline {
 
     /// Run all stages in order on the given body.
     ///
-    /// ## AD-PXY-07 — Per-stage gate only (no whole_request_check here)
+    /// ## AD-PXY-07 — Per-stage gate structurally enforced here
     ///
-    /// Each modifying stage routes through `guarded_transform` internally (the
-    /// per-stage never-inflate gate + sink rule). This method does NOT call
-    /// `whole_request_check` on the composed output — #304 owns that post-assembly
-    /// call (D3). Calling it here under an identity pipeline would be a PF-007
-    /// tautology (`out_len == in_len` always for the identity stage).
+    /// After each stage's `apply()` returns an `Outcome`, `run()` calls
+    /// `guarded_transform` on the stage output to enforce the never-inflate
+    /// invariant (design constraint 2 / lib.rs). This makes the invariant a
+    /// property of the SEAM, not of each individual stage's discipline. A stage
+    /// that returns inflated bytes (without calling `guarded_transform` internally)
+    /// will be caught here and fail-open to the pre-stage bytes.
+    ///
+    /// This does NOT call `whole_request_check` — that post-assembly call is #304's
+    /// responsibility (D3). The per-stage gate is the structural lock; whole_request_check
+    /// is the cross-stage assembly guard.
     ///
     /// ## Unknown provider bypass
     ///
@@ -339,6 +344,8 @@ impl TransformPipeline {
         ctx: &TransformContext<'_>,
         sink: &dyn DecisionSink,
     ) -> Outcome {
+        use rskim_contract::guardrail::guarded_transform;
+
         // AD-PXY-02: Unknown provider → bypass transform seam entirely.
         // The seam is skipped; the forward layer routes to default upstream or 502.
         if ctx.provider == ProxyProvider::Unknown {
@@ -356,36 +363,47 @@ impl TransformPipeline {
         // (i.e. the output of the previous stage). This is the "per-transform-call"
         // boundary described in AD-PXY-12.
         //
-        // Discriminating property: a panic in stage N causes stage N to produce
-        // passthrough bytes, and subsequent stages still run (on the unchanged
-        // bytes from stage N-1). If the entire `run()` call were wrapped in a
-        // single `catch_unwind`, a panic in stage N would discard stage 1..(N-1)
-        // outputs. Per-stage wrapping is more conservative.
+        // ## AC4 — per-stage never-inflate gate (structural enforcement)
+        //
+        // After each stage, `guarded_transform` enforces that the stage output
+        // is no larger than the stage input. A stage that bypasses `guarded_transform`
+        // internally will still be caught here. This makes the never-inflate invariant
+        // a property of the seam — not of each stage's voluntary compliance.
         let mut current = body;
         for stage in &self.stages {
-            // AC9 / AD-PXY-12 — per-stage panic containment (per-transform-call boundary).
-            //
-            // Each `stage.apply()` is wrapped in `catch_unwind` so a panicking stage
-            // falls back to byte-identical passthrough of the pre-stage bytes. The panic
-            // is absorbed here — it does NOT propagate to the caller or terminate the
-            // process. Remaining stages still run (on the unchanged pre-stage bytes).
-            //
-            // AssertUnwindSafe: stages are stateless per-request (AC11 / AD-PXY-06);
-            // shared state across calls is not permitted by the TransformStage contract.
-            let stage_ref: &dyn TransformStage = stage.as_ref();
-            // Clone before apply so we have pre-stage bytes for the fail-open path.
+            // Clone before apply so we have pre-stage bytes for:
+            // (a) the catch_unwind fail-open path, and
+            // (b) the guarded_transform input (required by its signature).
             let pre_stage = current.clone();
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+
+            // AC9 / AD-PXY-12 — per-stage panic containment.
+            // AssertUnwindSafe: stages are stateless per-request (AC11 / AD-PXY-06).
+            let stage_ref: &dyn TransformStage = stage.as_ref();
+            let apply_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 stage_ref.apply(&pre_stage, ctx, sink)
             }));
-            current = match result {
+
+            let stage_output = match apply_result {
                 Ok(outcome) => outcome.bytes,
                 Err(_panic) => {
                     // Stage panicked — fail-open to pre-stage bytes (AC9).
                     // Do not log here (tracing may be the panic source).
-                    pre_stage
+                    pre_stage.clone()
                 }
             };
+
+            // AC4 — structural never-inflate gate.
+            // If the stage returned MORE bytes than it received, guarded_transform
+            // rejects the inflation and returns a passthrough of pre_stage bytes.
+            // This catches stages that bypass guarded_transform internally.
+            let gated = guarded_transform(
+                pre_stage,
+                stage_output,
+                ctx.request_id,
+                stage.name(),
+                sink,
+            );
+            current = gated.bytes;
         }
 
         // The pipeline output is the final `current` bytes. Wrap in a passthrough
