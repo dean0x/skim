@@ -89,6 +89,9 @@ tokio = { version = "1.44", default-features = false }
 hyper = { version = "1.10", default-features = false }
 hyper-util = { version = "0.1", default-features = false }
 http-body-util = { version = "0.1" }
+# http-body 1.x — the core Body trait; transitive via hyper 1.x.
+# Pinned to 1.x matching hyper 1.10.
+http-body = { version = "1" }
 
 # TLS — rustls 0.23.x matches the existing lockfile entry (pulled in by ureq 3.3).
 # webpki-roots: hermetic root-cert bundle; no OS trust-store access (#346 tracks opt-in).

@@ -56,21 +56,23 @@
 //! (+ process-unique prefix). They are NEVER derived from request headers
 //! (no x-api-key echo / request-id forwarding from client headers).
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use hyper::body::{Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
-use tokio::time::timeout;
+use tokio::time::{Sleep, timeout};
 use tracing::{info, warn};
 
 /// Unified response body type: either a buffered error body (Full<Bytes>) or a
@@ -85,10 +87,119 @@ fn full_body(b: impl Into<Bytes>) -> ProxyBody {
         .boxed()
 }
 
-/// Wrap a streaming `Incoming` body into the unified `ProxyBody` type.
-fn streaming_body(b: Incoming) -> ProxyBody {
-    b.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
-        .boxed()
+// ============================================================================
+// IdleTimedBody — per-frame idle timeout for streaming upstream bodies (AC20)
+// ============================================================================
+
+/// A streaming body wrapper that enforces a per-frame idle timeout.
+///
+/// ## AD-PXY-20 — Mid-stream upstream stall (AC20 arm 2)
+///
+/// `hyper`'s upstream client returns a `Response<Incoming>` as soon as response
+/// headers arrive; the body frames are streamed lazily afterward. Without this
+/// wrapper, an upstream that sends headers + a partial body and then stalls the
+/// connection open (no TCP reset, no data) will hold the client connection open
+/// indefinitely.
+///
+/// `IdleTimedBody` wraps `Incoming` with a per-frame sleep that **resets** every
+/// time a frame is successfully yielded. If no frame arrives within the
+/// `idle_timeout` bound, the body stream is cleanly terminated (an error frame is
+/// returned) so the client receives a truncated-but-closed stream rather than
+/// hanging. This is fail-open: response headers have already been forwarded, so
+/// we cannot send a 5xx — ending the body stream is the correct recovery action.
+///
+/// The reset-per-frame behavior is load-bearing for SSE: a legitimate slow SSE
+/// stream that emits a frame every few seconds is NOT killed — only a gap
+/// LONGER than `idle_timeout` triggers termination (AC5 / AC20 / AD-PXY-20).
+///
+/// The idle bound reuses `config.upstream_timeout`. This bounds BOTH the
+/// time-to-headers phase (via `tokio::time::timeout` around `forward_request`)
+/// AND the inter-frame idle gap of the streaming body (via this wrapper).
+/// A single bound avoids introducing an empirically-baseless separate constant
+/// (ADR-003 / PF-005). If a separate, shorter body-idle bound is required in
+/// the future, it must be justified with documented evidence and cited here.
+struct IdleTimedBody {
+    inner: Incoming,
+    idle_timeout: Duration,
+    /// Per-frame sleep timer. Pinned because `Sleep` is `!Unpin`.
+    sleep: Pin<Box<Sleep>>,
+}
+
+impl IdleTimedBody {
+    fn new(inner: Incoming, idle_timeout: Duration) -> Self {
+        let sleep = Box::pin(tokio::time::sleep(idle_timeout));
+        Self {
+            inner,
+            idle_timeout,
+            sleep,
+        }
+    }
+}
+
+impl http_body::Body for IdleTimedBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        // Safety: we project to inner (Unpin via Pin::new) and sleep (already pinned).
+        // IdleTimedBody is never structurally pinned — projection is safe.
+        let this = self.as_mut().get_mut();
+
+        // Poll inner body first — if a frame is ready, reset the idle clock and return.
+        // Use Pin::new: Incoming is Unpin.
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                // Frame received — reset the idle sleep for the next inter-frame gap.
+                let deadline = tokio::time::Instant::now() + this.idle_timeout;
+                this.sleep.as_mut().reset(deadline);
+                return Poll::Ready(Some(Ok(frame)));
+            }
+            Poll::Ready(Some(Err(e))) => {
+                // Inner body error — propagate immediately.
+                return Poll::Ready(Some(Err(Box::new(e) as _)));
+            }
+            Poll::Ready(None) => {
+                // Body fully consumed — normal EOF.
+                return Poll::Ready(None);
+            }
+            Poll::Pending => {
+                // No frame yet — fall through to check the idle timer.
+            }
+        }
+
+        // No frame ready. Poll the idle sleep.
+        match this.sleep.as_mut().poll(cx) {
+            Poll::Ready(()) => {
+                // Idle timeout expired — no frame arrived within the bound.
+                // Terminate the body stream cleanly. The client observes a
+                // truncated-but-closed body rather than an indefinitely open socket.
+                // Never panic — return an error frame instead (AC18 / AD-PXY-20).
+                Poll::Ready(Some(Err(
+                    "upstream body idle timeout: mid-stream stall terminated (AC20)".into(),
+                )))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        false
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Wrap a streaming `Incoming` body with a per-frame idle timeout into the
+/// unified `ProxyBody` type.
+///
+/// See [`IdleTimedBody`] for the AC20 / AD-PXY-20 design rationale.
+fn streaming_body_with_idle_timeout(b: Incoming, idle_timeout: Duration) -> ProxyBody {
+    IdleTimedBody::new(b, idle_timeout).boxed()
 }
 
 use rskim_contract::log::DecisionSink;
@@ -437,8 +548,18 @@ async fn handle_request(
         }
     }
 
+    // AD-PXY-20 (AC20 arm 2): wrap the upstream body with a per-frame idle
+    // timeout so that a mid-stream upstream stall (headers delivered, then
+    // socket held open with no data) terminates cleanly within the bound.
+    // `config.upstream_timeout` bounds BOTH time-to-headers (the `timeout()`
+    // above) AND the inter-frame idle gap here. See [`IdleTimedBody`] for the
+    // full rationale and why reusing the same bound avoids an
+    // empirically-baseless constant (ADR-003 / PF-005).
     let relay_response = relay_builder
-        .body(streaming_body(resp_body))
+        .body(streaming_body_with_idle_timeout(
+            resp_body,
+            config.upstream_timeout,
+        ))
         .unwrap_or_else(|_| {
             json_response(
                 StatusCode::BAD_GATEWAY,

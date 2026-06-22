@@ -27,6 +27,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync"
 hyper = { workspace = true, features = ["http1", "server", "client"] }
 hyper-util = { workspace = true, features = ["tokio", "server", "client-legacy"] }
 http-body-util = { workspace = true }
+# http-body Body trait — used by IdleTimedBody (AC20 arm 2 / AD-PXY-20).
+http-body = { workspace = true }
 
 # TLS — rustls only, webpki-roots for hermetic certificate validation.
 # AD-PXY-04: single-static-binary + supply-chain stance matching ureq in the workspace.
@@ -81,9 +83,8 @@ trybuild = { workspace = true }
 # Criterion for proxy latency benchmarks (AC14/AC15).
 # async_tokio feature enables b.to_async(&rt) for tokio-backed async bench iterations.
 criterion = { workspace = true, features = ["async_tokio"] }
-# http-body trait for ChannelBody in wire integration tests (streaming fake upstream).
-# Transitive dep via hyper; pinned to 1.x matching hyper 1.10.
-http-body = "1"
+# http-body is now a regular [dependency] (IdleTimedBody uses it in production code).
+# No dev-dep entry needed — the workspace dep is inherited.
 # tracing-subscriber with Layer trait for AC13 capture layer in wire tests.
 tracing-subscriber = { workspace = true, features = ["json", "env-filter", "fmt", "registry"] }
 

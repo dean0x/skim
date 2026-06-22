@@ -24,7 +24,8 @@
 //! | AC12 (header diff wire) | `test_ac12_header_diff_allowed_list_only` |
 //! | AC13 (auth sentinel never in logs) | `test_ac13_auth_sentinel_never_in_logs` |
 //! | AC16 (readiness flip over-the-wire) | `test_ac16_readiness_flip_wire` |
-//! | AC20 (upstream timeout → 504) | `test_ac20_upstream_timeout_504` |
+//! | AC20 arm 1 (upstream timeout → 504) | `test_ac20_upstream_timeout_504` |
+//! | AC20 arm 2 (mid-stream stall → terminated stream) | `test_ac20_upstream_midstream_stall_terminates_cleanly` |
 //! | AC21 (client disconnect cancels upstream) | `test_ac21_client_disconnect_cancels_upstream` |
 //! | AC14 (regression guard can fail) | `test_ac14_regression_guard_can_fail` |
 //! | AC15 (zero failures: panicking/saturated) | `test_ac15_zero_failures_panicking_hook` / `test_ac15_zero_failures_saturated_channel` |
@@ -1570,6 +1571,127 @@ async fn test_ac23_graceful_shutdown_drains_and_exits() {
         refused,
         "AC23: after shutdown, new connections must be refused or timeout"
     );
+}
+
+// ============================================================================
+// AC20 arm 2 — Mid-stream upstream stall terminates cleanly within the bound
+// ============================================================================
+
+/// AC20 arm 2 (wire): upstream sends response headers + one body chunk, then
+/// holds the socket open indefinitely without sending more data (a true stall —
+/// NOT a TCP disconnect). The proxy MUST terminate the client stream cleanly
+/// within `upstream_timeout` rather than hanging indefinitely.
+///
+/// ## Why this test is discriminating (PF-007)
+///
+/// Without the [`IdleTimedBody`] wrapper in `server.rs`:
+/// - The body relay is `streaming_body(resp_body)` with no timeout.
+/// - The fake upstream holds the socket open → the proxy never reads EOF.
+/// - The client's read loop blocks indefinitely (the test hangs / times out at
+///   the wall-clock ceiling).
+///
+/// With the fix:
+/// - `streaming_body_with_idle_timeout` wraps the body with a per-frame sleep.
+/// - After no frame arrives for `upstream_timeout`, the sleep fires and the body
+///   terminates cleanly.
+/// - The client read loop observes EOF (or a transport error) and exits.
+/// - The assertion `elapsed < wall_clock_ceiling` passes.
+///
+/// ## Why reusing `upstream_timeout` is correct (ADR-003 / PF-005)
+///
+/// A separate body-idle bound would require an empirically-baseless constant.
+/// Reusing `upstream_timeout` (already justified in config.rs for time-to-headers)
+/// for the inter-frame idle gap avoids this. Both bounds use the same evidence.
+#[tokio::test]
+async fn test_ac20_upstream_midstream_stall_terminates_cleanly() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Fake upstream: accepts connection, sends HTTP response headers + one body
+    // chunk, then holds the socket open without sending more data or closing.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                // Send valid HTTP response headers + one small body chunk.
+                let partial = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n7\r\nhello!\n\r\n";
+                let _ = stream.write_all(partial).await;
+                // Flush to ensure the chunk is delivered to the proxy.
+                let _ = stream.flush().await;
+                // Now stall indefinitely: hold the socket open, send nothing.
+                // This simulates a mid-stream upstream stall (not a TCP disconnect).
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                drop(stream);
+            });
+        }
+    });
+
+    // Configure a short upstream_timeout so the test finishes fast.
+    // The idle bound reuses upstream_timeout (AD-PXY-20 / ADR-003).
+    let upstream_idle_timeout = Duration::from_millis(400);
+    let port = find_test_port().await;
+    let config = ProxyConfig::builder()
+        .port(port)
+        .upstream_default(format!("http://{upstream_addr}"))
+        .upstream_timeout(upstream_idle_timeout)
+        .build()
+        .expect("proxy config");
+    let proxy_addr = config.bind_addr();
+    let pipeline = TransformPipeline::identity();
+    let analytics = Arc::new(NoopAnalyticsHook);
+    let task = tokio::spawn(rskim_proxy::testing::run_server_async(
+        config, pipeline, analytics,
+    ));
+    let abort = task.abort_handle();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Connect via raw TCP so we can read byte-by-byte without a client that
+    // might hide the stall or buffer the incomplete response.
+    let mut tcp = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    let req = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: {proxy_addr}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+    );
+    tcp.write_all(req.as_bytes()).await.unwrap();
+
+    // Wall-clock ceiling: the test must complete well within this bound.
+    // The idle timeout is 400ms; we give 3× margin = 1200ms. Without the fix,
+    // the test would hang for ~120s (the upstream stall duration), far above.
+    let wall_clock_ceiling = Duration::from_millis(1200);
+    let t_start = Instant::now();
+
+    // Read until EOF. With the fix, the proxy terminates the body stream after
+    // the idle timeout, so we observe EOF within the wall-clock ceiling.
+    let result = tokio::time::timeout(wall_clock_ceiling, async {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = tcp.read(&mut tmp).await.unwrap_or(0);
+            if n == 0 {
+                break; // EOF — stream cleanly terminated
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        buf
+    })
+    .await;
+
+    let elapsed = t_start.elapsed();
+
+    assert!(
+        result.is_ok(),
+        "AC20 arm 2: mid-stream upstream stall must terminate the client stream within \
+         {wall_clock_ceiling:?} (not hang). elapsed={elapsed:?}"
+    );
+
+    // The client stream must have received something before the stall terminated
+    // (the proxy forwarded at least the headers). Confirm we got a non-empty response.
+    let response_bytes = result.unwrap_or_default();
+    assert!(
+        !response_bytes.is_empty(),
+        "AC20 arm 2: proxy must have forwarded at least the response headers before stall termination"
+    );
+
+    abort.abort();
 }
 
 // ============================================================================
