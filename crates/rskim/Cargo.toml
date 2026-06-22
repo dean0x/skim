@@ -2,6 +2,10 @@
 name = "rskim"
 version = "2.10.0"
 edition = "2024"
+# MSRV: cmd/search/build_lock.rs uses File::try_lock / TryLockError, stabilized
+# in Rust 1.89. Declared so older toolchains get a clear diagnostic, not a
+# confusing "method not found" error.
+rust-version = "1.89"
 authors = ["Skim Contributors"]
 license = "MIT"
 description = "The most intelligent context optimization engine for coding agents. Code-aware AST parsing, command rewriting, output compression."
