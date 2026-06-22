@@ -44,9 +44,11 @@
 //! 3. Process exits with code 0.
 //!
 //! Client-disconnect upstream cancel: when a client drops the connection
-//! mid-stream, the per-connection task observes the write error and cancels
-//! the upstream request via task drop (tokio cancellation). The upstream
-//! connection is closed within `config.client_disconnect_cancel` (500ms).
+//! mid-stream, the per-connection task observes the write error and the
+//! upstream request is cancelled implicitly via tokio task drop. In #303
+//! there is no explicit `timeout(client_disconnect_cancel, …)` wrapper; the
+//! 500ms `config.client_disconnect_cancel` bound is stored but not yet wired
+//! (wiring is a #304 enhancement per config.rs:189-194).
 //!
 //! ## Structured logging (AC13)
 //!
@@ -91,7 +93,7 @@ fn streaming_body(b: Incoming) -> ProxyBody {
 
 use crate::analytics::{AnalyticsHook, ProxyEvent};
 use crate::authmode::classify_auth;
-use crate::config::{DEFAULT_UPSTREAM_TIMEOUT_SECS, ProxyConfig};
+use crate::config::ProxyConfig;
 use crate::detect::{ProxyProvider, detect_provider};
 use crate::errors::ProxyError;
 use crate::forward::{ForwardError, UpstreamClient, forward_request, is_hop_by_hop};
@@ -335,8 +337,14 @@ async fn handle_request(
     let upstream_response = match forward_result {
         Err(_timeout) => {
             // Upstream did not respond within the configured timeout → 504 (AC20).
+            // Log the actual operative timeout from config (not the default const) so
+            // operators who override --upstream-timeout see the correct value.
             readiness.record_failure();
-            warn!(request_id = %request_id, timeout_secs = %DEFAULT_UPSTREAM_TIMEOUT_SECS, "upstream timeout (AC20)");
+            warn!(
+                request_id = %request_id,
+                timeout_secs = %config.upstream_timeout.as_secs(),
+                "upstream timeout (AC20)"
+            );
             return Ok(json_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 r#"{"error":"upstream timeout","code":"504"}"#,
@@ -352,12 +360,13 @@ async fn handle_request(
         }
         Ok(Err(ForwardError::Upstream(e))) => {
             // Connection refused, TCP reset, etc. → relay as 502 (AC10).
+            // Use serde_json to build the body so the upstream error string is
+            // correctly JSON-escaped even if it contains quotes, backslashes, or
+            // control characters (A03 — escape output for its context).
             readiness.record_failure();
             warn!(request_id = %request_id, error = %e, "upstream connection error (AC10)");
-            return Ok(json_response(
-                StatusCode::BAD_GATEWAY,
-                format!(r#"{{"error":"upstream error","detail":"{}"}}"#, e),
-            ));
+            let body = serde_json::json!({"error": "upstream error", "detail": e}).to_string();
+            return Ok(json_response(StatusCode::BAD_GATEWAY, body));
         }
         Ok(Ok(resp)) => resp,
     };

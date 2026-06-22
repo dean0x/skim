@@ -43,9 +43,9 @@
 //! changes to proxy internals do not re-link all other crates. NOTE: `rskim`
 //! currently depends on `rskim-proxy` unconditionally (not feature-gated), so
 //! hyper/tokio/rustls ARE compiled into every `skim` build and flow through release
-//! LTO. A `proxy` feature gate is a future cleanup (#todo). This follows the
-//! `rskim-search` precedent: depends on `rskim-core`/`rskim-contract`
-//! without changing their APIs.
+//! LTO. A `proxy` feature gate is tracked in #352 (ADR-004: real ticket, not a
+//! placeholder). This follows the `rskim-search` precedent: depends on
+//! `rskim-core`/`rskim-contract` without changing their APIs.
 //!
 //! ## Public API surface
 //!
@@ -137,8 +137,11 @@ use std::sync::Arc;
 ///
 /// # AD-PXY-01
 ///
-/// The `rskim_proxy` crate is a separate optional workspace member so that
-/// hyper/tokio/rustls compile cost is isolated from users who never run the proxy.
+/// The `rskim_proxy` crate is a separate workspace member to isolate
+/// incremental-rebuild churn from proxy-internal changes. NOTE: the
+/// `rskim` dependency is currently unconditional (not feature-gated), so
+/// hyper/tokio/rustls ARE compiled into every `skim` build. Feature-gating
+/// is tracked in #352.
 pub fn serve(config: config::ProxyConfig) -> Result<(), errors::ProxyError> {
     // Initialise structured JSON logging (AC13). Safe to call multiple times.
     logging::init_logging();

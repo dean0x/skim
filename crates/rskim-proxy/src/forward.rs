@@ -15,7 +15,9 @@
 //!    `connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`,
 //!    `te`, `trailer`, `transfer-encoding`, `upgrade`.
 //! 2. Rewrite `host` to the upstream authority (AC12 / AC13).
-//! 3. Pass `content-length` / `transfer-encoding` as required by hyper framing.
+//! 3. Drop `content-length`: hyper derives the correct framing value from the
+//!    actual body bytes (which may differ from the client's original after #304
+//!    transform-pipeline mutations; forwarding the original causes upstream hangs).
 //! 4. ALL other headers — including `authorization`, `x-api-key`, and any custom
 //!    headers — are forwarded byte-identical.
 //! 5. **`Via` is intentionally NOT added** (deviation from RFC 9110 §7.6.3).
@@ -207,9 +209,21 @@ pub async fn forward_request(
     let upstream_uri = build_upstream_uri(&req_parts.uri, upstream_url)
         .ok_or_else(|| ForwardError::BadUpstreamUrl(upstream_url.to_owned()))?;
 
-    // Rewrite headers: strip hop-by-hop, rewrite host.
+    // Rewrite headers: strip hop-by-hop, rewrite host, drop content-length.
     // Auth headers (authorization, x-api-key) are forwarded byte-identical.
     // (AD-PXY-15: no Via, no extra headers outside the allowed-list.)
+    //
+    // ## content-length must be dropped and re-derived from the actual body
+    //
+    // The client's original `content-length` is NOT framing for the actual body
+    // we forward (which may be the transform-pipeline output). Forwarding the
+    // original header verbatim when the body has been rewritten by a stage (#304)
+    // would produce an incorrect content-length: the upstream would wait for bytes
+    // that never arrive (HTTP framing error / upstream read hang).
+    //
+    // hyper's `Full<Bytes>` body type sets its own `content-length` from the
+    // actual byte count, so stripping the client's value here is the correct fix.
+    // `transfer-encoding` is already stripped as a hop-by-hop header.
     let mut new_headers = hyper::HeaderMap::new();
     for (name, value) in &req_parts.headers {
         if is_hop_by_hop(name.as_str()) {
@@ -218,6 +232,12 @@ pub async fn forward_request(
         }
         if name.as_str().eq_ignore_ascii_case("host") {
             // Rewrite host to the upstream authority below.
+            continue;
+        }
+        if name.as_str().eq_ignore_ascii_case("content-length") {
+            // Drop: hyper will derive the correct content-length from the body
+            // bytes after any transform-pipeline mutations. Forwarding the client's
+            // original value when the body has been rewritten causes framing errors.
             continue;
         }
         new_headers.insert(name.clone(), value.clone());
@@ -294,7 +314,8 @@ mod tests {
         }
     }
 
-    // AC12: non-hop-by-hop headers are NOT stripped.
+    // AC12: non-hop-by-hop headers that are forwarded byte-identical are NOT
+    // in the hop-by-hop list.
     #[test]
     fn test_non_hop_by_hop_not_stripped() {
         let headers = [
@@ -304,7 +325,6 @@ mod tests {
             "accept",
             "anthropic-version",
             "x-request-id",
-            "content-length",
         ];
         for header in &headers {
             assert!(
@@ -312,6 +332,20 @@ mod tests {
                 "should NOT strip content header: {header}"
             );
         }
+    }
+
+    // content-length is NOT a hop-by-hop header but IS stripped in forward_request
+    // so hyper can derive the correct framing from the actual (possibly rewritten) body.
+    // This test documents the forward.rs behavior: content-length is NOT in HOP_BY_HOP_HEADERS
+    // (it is handled explicitly, not via is_hop_by_hop).
+    #[test]
+    fn test_content_length_not_in_hop_by_hop_stripped_explicitly() {
+        assert!(
+            !is_hop_by_hop("content-length"),
+            "content-length is not classified as hop-by-hop (RFC 9110 §6.6.2); \
+             it is stripped in forward_request explicitly to allow hyper to derive \
+             the correct length from the actual forwarded body bytes"
+        );
     }
 
     // AC12: Via is NOT in the hop-by-hop list — it's intentionally not added.

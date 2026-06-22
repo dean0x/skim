@@ -15,8 +15,11 @@
 //!    fail — AC14 discriminating requirement, PF-007).
 //!
 //! The baseline is written to the criterion output directory on the first run.
-//! Subsequent runs compare against it.  The CI step uses `--baseline ci-baseline`
-//! to gate on the committed baseline (see `.github/workflows/ci.yml` Windows job).
+//! Subsequent runs compare against it locally.  NOTE: CI does NOT currently run
+//! `cargo bench` for this crate — the Windows CI job builds and tests only (see
+//! `.github/workflows/ci.yml`). The relative regression gate is enforced via
+//! `test_ac14_regression_guard_can_fail` in the wire integration test suite, which
+//! IS run in CI. Running the bench with `--baseline ci-baseline` is a local workflow.
 //!
 //! Absolute `<10ms` is recorded here as the **design goal only** (plan §3, D7),
 //! not the CI gate.  On developer hardware with a fast identity path, the

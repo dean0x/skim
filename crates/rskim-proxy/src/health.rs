@@ -16,8 +16,8 @@
 //!   process is running (AC16).
 //!
 //! Evidence (auto-resolved #6): K=3 / 10s window from DECISIONS-NEEDED.md.
-//! The 3s polling cadence in [`ReadinessWatchdog`] is an implementation detail;
-//! the observable contract is the K-and-window criterion.
+//! The on-demand staleness computation in [`ReadinessState::is_ready`] implements
+//! the K-and-window criterion; there is no background polling thread.
 //!
 //! ## Endpoints
 //!

@@ -1,8 +1,8 @@
 //! Proxy configuration: bind address, port, upstreams, and lifecycle bounds.
 //!
 //! [`ProxyConfig`] is the single validated configuration object consumed by
-//! [`crate::serve()`]. All values are parsed from CLI flags or `SKIM_PROXY_*`
-//! environment variables; no config file is consulted (modes-via-flags-only policy).
+//! [`crate::serve()`]. All values are parsed from CLI flags only; no config file
+//! or environment variables are consulted (modes-via-flags-only policy).
 //!
 //! ## AD-PXY-03 — Bind address and port policy
 //!

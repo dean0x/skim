@@ -32,8 +32,8 @@ use rskim_proxy::config::ProxyConfig;
 const CLEARTEXT_WARNING: &str = "WARNING: skim proxy is bound to a non-loopback address. \
      Auth material (API keys, bearer tokens) will be transmitted in cleartext \
      unless the client uses TLS. Only bind to non-loopback addresses in trusted \
-     network environments. Set SKIM_PROXY_BIND=127.0.0.1 or omit --bind to \
-     restrict to loopback.";
+     network environments. Omit --bind (or pass --bind 127.0.0.1) to restrict \
+     to loopback.";
 
 /// Run the `skim proxy` subcommand.
 ///
@@ -317,6 +317,12 @@ mod tests {
         assert!(
             CLEARTEXT_WARNING.contains("cleartext"),
             "cleartext warning must mention 'cleartext'"
+        );
+        // NEGATIVE (PF-007): warning must NOT reference SKIM_PROXY_* env vars —
+        // those are not implemented; mentioning them gives false remediation advice.
+        assert!(
+            !CLEARTEXT_WARNING.contains("SKIM_PROXY_BIND"),
+            "cleartext warning must not reference SKIM_PROXY_BIND (env var is not implemented)"
         );
     }
 

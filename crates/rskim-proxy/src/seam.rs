@@ -117,9 +117,11 @@ pub struct TransformContext<'a> {
 
     /// Caller-assigned request identifier (opaque correlator).
     ///
-    /// Sanitized via `rskim_contract::log::sanitize_request_id` before being
-    /// placed here. MUST NOT be derived from any request header that could carry
-    /// auth material (x-api-key echo proxy anti-pattern; #301 AC12 guard).
+    /// Callers are responsible for passing a provably safe ID (e.g. a monotonic
+    /// counter-derived string like `"px-{n}"`) that is never derived from any
+    /// request header that could carry auth material (x-api-key echo proxy
+    /// anti-pattern; #301 AC12 guard). [`rskim_contract::log::DecisionRecord`]
+    /// constructors re-sanitize the ID defensively via `sanitize_request_id`.
     pub request_id: &'a str,
 
     /// Read-only view over the request headers.
@@ -292,7 +294,7 @@ impl Contract for IdentityStageContractAdapter {
 ///
 /// This ticket ships only `IdentityStage`. Successors add their stage at the
 /// declared slot position using [`TransformPipeline::identity()`] as the baseline
-/// and [`TransformPipeline::with_stage`] to insert.
+/// and [`TransformPipeline::from_stages`] to compose the stage list.
 pub struct TransformPipeline {
     stages: Vec<Box<dyn TransformStage>>,
 }
