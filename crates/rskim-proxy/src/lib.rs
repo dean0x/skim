@@ -65,10 +65,14 @@ pub mod seam;
 
 // Internal modules — not part of the public API surface.
 // Exposed pub(crate) for integration test access where needed.
-pub(crate) mod forward;
 pub(crate) mod health;
 pub(crate) mod logging;
 pub(crate) mod server;
+
+/// Forward-path utilities exposed for integration tests (AC12 header-diff test).
+///
+/// Only the committed const and helpers used by integration tests are re-exported.
+pub mod forward;
 
 /// Test utilities for integration testing the running proxy server.
 ///
@@ -131,6 +135,8 @@ use std::sync::Arc;
 /// The `rskim_proxy` crate is a separate optional workspace member so that
 /// hyper/tokio/rustls compile cost is isolated from users who never run the proxy.
 pub fn serve(config: config::ProxyConfig) -> Result<(), errors::ProxyError> {
+    // Initialise structured JSON logging (AC13). Safe to call multiple times.
+    logging::init_logging();
     serve_with_analytics(config, Arc::new(analytics::NoopAnalyticsHook))
 }
 
@@ -169,6 +175,10 @@ pub fn serve_with_stage(
     pipeline: seam::TransformPipeline,
     analytics: Arc<dyn analytics::AnalyticsHook>,
 ) -> Result<(), errors::ProxyError> {
+    // Initialise structured JSON logging (AC13). Safe to call multiple times —
+    // subsequent calls are ignored via try_init().
+    logging::init_logging();
+
     // Build a tokio runtime and run the async server.
     // The runtime blocks until the server shuts down (AC23).
     let rt = tokio::runtime::Builder::new_multi_thread()

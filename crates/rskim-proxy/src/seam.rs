@@ -348,12 +348,44 @@ impl TransformPipeline {
         // Run stages in order. Each stage receives the output of the previous stage.
         // The first stage receives the original body; subsequent stages receive
         // the (possibly modified) output of the previous stage.
+        //
+        // ## AC9 / AD-PXY-12 — per-stage panic containment
+        //
+        // Each `stage.apply()` call is wrapped in `catch_unwind` so a panicking
+        // stage falls back to byte-identical passthrough of the CURRENT bytes
+        // (i.e. the output of the previous stage). This is the "per-transform-call"
+        // boundary described in AD-PXY-12.
+        //
+        // Discriminating property: a panic in stage N causes stage N to produce
+        // passthrough bytes, and subsequent stages still run (on the unchanged
+        // bytes from stage N-1). If the entire `run()` call were wrapped in a
+        // single `catch_unwind`, a panic in stage N would discard stage 1..(N-1)
+        // outputs. Per-stage wrapping is more conservative.
         let mut current = body;
         for stage in &self.stages {
-            let outcome = stage.apply(&current, ctx, sink);
-            // Always take the outcome bytes as the input to the next stage.
-            // If a stage fails open (passthrough), current bytes are unchanged.
-            current = outcome.bytes;
+            // AC9 / AD-PXY-12 — per-stage panic containment (per-transform-call boundary).
+            //
+            // Each `stage.apply()` is wrapped in `catch_unwind` so a panicking stage
+            // falls back to byte-identical passthrough of the pre-stage bytes. The panic
+            // is absorbed here — it does NOT propagate to the caller or terminate the
+            // process. Remaining stages still run (on the unchanged pre-stage bytes).
+            //
+            // AssertUnwindSafe: stages are stateless per-request (AC11 / AD-PXY-06);
+            // shared state across calls is not permitted by the TransformStage contract.
+            let stage_ref: &dyn TransformStage = stage.as_ref();
+            // Clone before apply so we have pre-stage bytes for the fail-open path.
+            let pre_stage = current.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                stage_ref.apply(&pre_stage, ctx, sink)
+            }));
+            current = match result {
+                Ok(outcome) => outcome.bytes,
+                Err(_panic) => {
+                    // Stage panicked — fail-open to pre-stage bytes (AC9).
+                    // Do not log here (tracing may be the panic source).
+                    pre_stage
+                }
+            };
         }
 
         // The pipeline output is the final `current` bytes. Wrap in a passthrough

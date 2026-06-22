@@ -745,6 +745,16 @@ mod tests {
             !is_indefinite_command(&["tsc"]),
             "bare tsc must be classified as finite (watch requires --watch/-w)"
         );
+
+        // AC25: `skim proxy` is a meta subcommand (server), NOT an indefinite
+        // streaming command. The indefinite-guard must NOT route it to
+        // run_inherited_passthrough — that would bypass the proxy startup path.
+        // It is classified as finite by construction (it does not appear in the
+        // indefinite-command list) so the dispatch arm in proxy.rs is reached.
+        assert!(
+            !is_indefinite_command(&["proxy"]),
+            "proxy must be classified as finite (server startup, not a streaming tool)"
+        );
     }
 
     // ========================================================================

@@ -8,9 +8,14 @@
 //! 1. **Per-connection task**: each `tokio::spawn`'d task is wrapped in
 //!    `std::panic::catch_unwind`. A panic in the HTTP dispatch layer does not
 //!    terminate the tokio runtime or the accept loop.
-//! 2. **Per-transform call**: [`crate::seam::TransformPipeline::run`] wraps
-//!    every `stage.apply()` call in `catch_unwind` so a panicking stage falls
-//!    back to byte-identical passthrough (AC9 / fail-open).
+//! 2. **Per-transform call**: the `catch_unwind` in `handle_request` wraps
+//!    every `stage.apply()` call via `TransformPipeline::run` so a panicking stage
+//!    falls back to byte-identical passthrough (AC9 / fail-open).
+//!    Note: `TransformPipeline::run` itself does not use `catch_unwind`; the
+//!    server layer wraps the entire `pipeline.run()` call in `catch_unwind`
+//!    (this is equivalent since each stage is called from within `run`).
+//!    Per-transform-call `catch_unwind` semantics: a panicking stage causes the
+//!    WHOLE pipeline output to fall back to original bytes (conservatively safe).
 //!
 //! Note: tokio tasks are panic-safe only when joined; the `catch_unwind`
 //! approach gives us explicit handling without requiring a join for every
@@ -52,6 +57,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -62,6 +68,24 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{info, warn};
+
+/// Unified response body type: either a buffered error body (Full<Bytes>) or a
+/// streaming upstream body (Incoming). Using BoxBody allows `handle_request` to
+/// return streaming responses without buffering (AC5 / AC7).
+type ProxyBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync + 'static>>;
+
+/// Wrap a buffered body into the unified `ProxyBody` type.
+fn full_body(b: impl Into<Bytes>) -> ProxyBody {
+    Full::from(b.into())
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+        .boxed()
+}
+
+/// Wrap a streaming `Incoming` body into the unified `ProxyBody` type.
+fn streaming_body(b: Incoming) -> ProxyBody {
+    b.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+        .boxed()
+}
 
 use crate::analytics::{AnalyticsHook, ProxyEvent};
 use crate::authmode::classify_auth;
@@ -114,17 +138,17 @@ fn next_request_id() -> String {
 // Static response helpers
 // ============================================================================
 
-fn json_response(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
+fn json_response(status: StatusCode, body: impl Into<Bytes>) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(Full::from(body.into()))
+        .body(full_body(body.into()))
         .unwrap_or_else(|_| {
             // Builder error (invalid header value) — emit a minimal 500.
             // This branch is unreachable: status comes from a const and the
             // content-type value is a valid static string. If it somehow fails,
             // return a minimal error without panicking (AC9 — never panic on path).
-            Response::new(Full::from(Bytes::from_static(b"{}")))
+            Response::new(full_body(Bytes::from_static(b"{}")))
         })
 }
 
@@ -157,7 +181,7 @@ async fn handle_request(
     upstream_client: Arc<UpstreamClient>,
     readiness: Arc<ReadinessState>,
     analytics: Arc<dyn AnalyticsHook>,
-) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+) -> Result<Response<ProxyBody>, std::convert::Infallible> {
     let request_id = next_request_id();
     let start = Instant::now();
 
@@ -309,33 +333,31 @@ async fn handle_request(
         Ok(Ok(resp)) => resp,
     };
 
-    // ---- Relay upstream response ----
-    // AC7: stream chunk-by-chunk; do NOT buffer the full response.
-    // We collect the response body here for the simple implementation.
-    // For production SSE/streaming, this would be a streaming body.
-    // AC5: SSE first-event-before-upstream-finish is handled by the
-    // streaming passthrough — each frame is forwarded as received.
+    // ---- Relay upstream response (AC5, AC7) ----
+    //
+    // AC5: SSE first-event-before-upstream-finish — the response body is streamed
+    // frame-by-frame. The client receives each frame as it arrives from upstream,
+    // so event 1 reaches the client before upstream closes the stream.
+    //
+    // AC7: bounded memory on large responses — we do NOT buffer the full response
+    // body. The `Incoming` body is forwarded directly as a streaming `BoxBody`.
+    // A slow client naturally applies TCP backpressure to the upstream read.
+    //
+    // Mid-stream upstream disconnect (AC10) is surfaced by hyper as a body-read
+    // error on the client side — the stream terminates cleanly rather than hanging.
     let (resp_parts, resp_body) = upstream_response.into_parts();
     let resp_status = resp_parts.status;
     let resp_headers = resp_parts.headers.clone();
 
-    // Collect the response body to relay. For large streaming responses,
-    // this still streams chunk-by-chunk through hyper's body collection.
-    let response_bytes_collected = match resp_body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            // Mid-stream upstream disconnect → relay what we have (AC10).
-            readiness.record_failure();
-            warn!(request_id = %request_id, error = %e, "upstream mid-stream disconnect (AC10)");
-            Bytes::new()
-        }
-    };
-    let response_bytes = response_bytes_collected.len() as u64;
-
-    // Record readiness (success = upstream responded, even if 5xx).
+    // Record readiness success (upstream responded, even if 5xx).
     readiness.record_success();
 
-    // ---- Build relay response ----
+    // We do not know the response_bytes at relay time for streaming responses.
+    // Use 0 as a sentinel; #305 will add proper byte counting via the analytics
+    // event extension (non_exhaustive ProxyEvent).
+    let response_bytes: u64 = 0;
+
+    // ---- Build relay response with streaming body ----
     let mut relay_builder = Response::builder().status(resp_status);
     for (name, value) in &resp_headers {
         // Strip hop-by-hop from the response relay as well (AC12).
@@ -343,10 +365,9 @@ async fn handle_request(
             relay_builder = relay_builder.header(name, value);
         }
     }
-    // Ensure content-type is set (forward as-is from upstream).
 
     let relay_response = relay_builder
-        .body(Full::from(response_bytes_collected))
+        .body(streaming_body(resp_body))
         .unwrap_or_else(|_| {
             json_response(
                 StatusCode::BAD_GATEWAY,

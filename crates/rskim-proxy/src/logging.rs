@@ -18,6 +18,34 @@
 //! this crate — rskim-contract bans clock usage because its transform path must
 //! be deterministic (invariant 5). The proxy is NOT under that constraint.
 
+use tracing_subscriber::{EnvFilter, fmt};
+
+/// Initialise a structured JSON tracing subscriber for the proxy process.
+///
+/// Reads log level from the `RUST_LOG` environment variable (default: `info`).
+/// Output is JSON-formatted to stderr. Call this once at proxy startup from
+/// `serve()` / `serve_with_analytics()` before the tokio runtime starts.
+///
+/// ## AC13 — auth material never logged
+///
+/// The subscriber emits the log level, timestamp, target, and message fields.
+/// Auth header VALUES are never passed to the tracing macros (the forwarding
+/// path only logs header names and request_id, never values). The redaction
+/// helpers [`redact_header_value`] / [`is_suppressed_header`] are available
+/// for call sites in #304 that log request metadata.
+///
+/// Safe to call multiple times — subsequent calls are ignored (global init is
+/// idempotent via `try_init()`).
+pub(crate) fn init_logging() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // try_init() returns Err if already initialised — ignore the error (idempotent).
+    let _ = fmt::Subscriber::builder()
+        .json()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 /// Redact-safe representation of a header value for logging.
 ///
 /// Returns a static sentinel `"[REDACTED]"` for sensitive header values so

@@ -61,7 +61,7 @@ thiserror = { workspace = true }
 
 # Structured JSON logging. tracing-subscriber initialised in logging.rs.
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
+tracing-subscriber = { workspace = true, features = ["json", "env-filter", "fmt"] }
 
 [dev-dependencies]
 # Conformance harness — dev-dep only per rskim-contract pattern.
@@ -74,6 +74,11 @@ trybuild = { workspace = true }
 # Criterion for proxy latency benchmarks (AC14/AC15).
 # async_tokio feature enables b.to_async(&rt) for tokio-backed async bench iterations.
 criterion = { workspace = true, features = ["async_tokio"] }
+# http-body trait for ChannelBody in wire integration tests (streaming fake upstream).
+# Transitive dep via hyper; pinned to 1.x matching hyper 1.10.
+http-body = "1"
+# tracing-subscriber with Layer trait for AC13 capture layer in wire tests.
+tracing-subscriber = { workspace = true, features = ["json", "env-filter", "fmt", "registry"] }
 
 [features]
 # Optional typed-view seam helper — #304 can enable when it calls ctx.parse_typed().
