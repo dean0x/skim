@@ -1786,21 +1786,21 @@ fn test_index_incremental_extraction_count_less_than_full_build() {
 // AC13 — Sidecar size bound, measured not guessed
 // ============================================================================
 
-/// AC13: The ast_index.skcache file size for a larger fixture must be within the
-/// measured ratio bound (skcache bytes / source bytes).  (applies ADR-003)
+/// AC13: The ast_index.skcache file size must be within the measured ratio bound
+/// (skcache bytes / source bytes).  (applies ADR-003)
 ///
-/// Binding gate: skcache_bytes < 3.0 × source_bytes on the in-tree Rust fixture.
-/// Measured ratio on tests/fixtures/rust/ (3 files, ~3.4 KB source): well below 1.0×
-/// on larger files; the AST index itself measured 1.23× source bytes per ADR-003.
-/// The skcache stores raw n-gram payloads PRE-scoring and carries per-entry format
-/// overhead (64-byte SHA key + 4-byte length prefix + 9-byte header) that dominates
-/// for small files.  3.0× is a generous regression margin — any implementation that
-/// exceeds 3× on a real fixture has bloated.  The eprintln records the actual ratio
-/// on each run so regressions are visible in CI output even when the gate passes.
+/// Binding gate: skcache_bytes < 3.0 × source_bytes. The ratio is only meaningful
+/// once per-file format overhead (64-byte SHA key + 4-byte length prefix + 9-byte
+/// header) is amortized, i.e. for sources >= 8 KiB. The in-tree rust fixtures total
+/// only ~3.4 KiB, so this test synthesizes an additional representative >= 8 KiB
+/// Rust source (see `synthetic_rust_source`) to push the measurement into the
+/// meaningful regime — otherwise the binding gate never ran on CI and only a loose
+/// absolute cap guarded skcache size.
 ///
-/// For very small fixtures (< 8 KiB source) per-file format overhead dominates
-/// the ratio and makes the measurement unreliable; an absolute cap is used instead
-/// for catastrophic-bloat detection only.
+/// The measured ratio on real Rust sources is well below 1.0× (the AST index itself
+/// measured 1.23× source bytes per ADR-003); 3.0× is a generous regression margin —
+/// any implementation that exceeds 3× has bloated. The eprintln records the actual
+/// ratio each run so regressions are visible in CI output even when the gate passes.
 #[test]
 fn test_index_skcache_size_within_measured_bound() {
     use super::super::types::IndexConfig;
@@ -1810,7 +1810,7 @@ fn test_index_skcache_size_within_measured_bound() {
     let fixtures_dir =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
 
-    let (project, source_dir_paths): (tempfile::TempDir, Vec<std::path::PathBuf>) =
+    let (project, mut source_dir_paths): (tempfile::TempDir, Vec<std::path::PathBuf>) =
         if fixtures_dir.exists() {
             // Copy rust fixtures to a fresh tempdir so we can measure their size.
             let tmp = tempfile::tempdir().unwrap();
@@ -1835,6 +1835,16 @@ fn test_index_skcache_size_within_measured_bound() {
                 .collect();
             (tmp, source_paths)
         };
+
+    // The in-tree rust fixtures total only ~3.4 KiB — below the 8 KiB floor at
+    // which the skcache/source ratio becomes meaningful — so without this the
+    // binding ratio gate never ran on CI and only a loose absolute cap guarded
+    // skcache size. Synthesize a representative >= 8 KiB Rust source so the
+    // measured ratio gate actually exercises. (testing review 2026-06-23;
+    // applies ADR-003 — measure the bound, don't skip past it.)
+    let synth_path = project.path().join("generated_ratio_fixture.rs");
+    fs::write(&synth_path, synthetic_rust_source()).unwrap();
+    source_dir_paths.push(synth_path);
 
     let cache = tempfile::tempdir().unwrap();
     let config = IndexConfig {
@@ -1873,32 +1883,56 @@ fn test_index_skcache_size_within_measured_bound() {
         result.file_count
     );
 
+    // Precondition: the synthesized fixture must put us in the >= 8 KiB regime
+    // where per-file format overhead is amortized and the ratio is meaningful.
+    // If this ever regresses, the binding gate below would be measuring noise.
+    assert!(
+        source_bytes >= 8 * 1024,
+        "AC13 precondition: source must exceed the 8 KiB ratio-gate floor for a \
+         meaningful measurement (got {source_bytes} bytes) — synthetic fixture missing?"
+    );
+
     // Binding gate: skcache must be < 3.0 × source_bytes.
-    // The measured ratio on real Rust fixtures is well below 1.0×; the AST index
-    // itself measured at 1.23× source bytes per ADR-003.  3.0× is a generous
+    // The measured ratio on real Rust sources is well below 1.0×; the AST index
+    // itself measured at 1.23× source bytes per ADR-003. 3.0× is a generous
     // regression bound that would only trip on catastrophic n-gram bloat.
-    //
-    // For small fixtures (< 8 KiB source) per-file format overhead (64-byte SHA
-    // key + bigram/trigram payloads) dominates the ratio — even tiny Rust files
-    // produce hundreds of AST n-grams, so skcache size is driven more by
-    // extraction yield than by source size.  The ratio is not meaningful below
-    // this threshold; use a flat cap for catastrophic-bloat detection instead.
-    // 64 KiB is catastrophically large for any realistic small test fixture set.
-    if source_bytes >= 8 * 1024 {
-        assert!(
-            ratio < 3.0,
-            "skcache ratio ({ratio:.3}×) must be < 3.0× source bytes (AC13 binding gate, applies ADR-003); \
-             skcache_bytes={skcache_bytes}, source_bytes={source_bytes}"
-        );
-    } else {
-        // Small fixture: use absolute cap for catastrophic-bloat detection only.
-        const MAX_SKCACHE_SMALL_FIXTURE: u64 = 64 * 1024; // 64 KiB
-        assert!(
-            skcache_bytes < MAX_SKCACHE_SMALL_FIXTURE,
-            "skcache ({skcache_bytes} bytes) must be < 64 KiB for a small fixture \
-             (AC13 catastrophic-bloat guard; source too small for ratio test); ratio={ratio:.3}×"
-        );
+    assert!(
+        ratio < 3.0,
+        "skcache ratio ({ratio:.3}×) must be < 3.0× source bytes (AC13 binding gate, applies ADR-003); \
+         skcache_bytes={skcache_bytes}, source_bytes={source_bytes}"
+    );
+}
+
+/// Generate a representative (~16 KiB) Rust source for the AC13 ratio gate.
+///
+/// The in-tree fixtures are too small (~3.4 KiB) to clear the 8 KiB floor at which
+/// the skcache/source ratio becomes meaningful, so the binding gate never exercised
+/// on CI. This emits normal-density Rust with varied control flow (so the AST n-gram
+/// spread mirrors real code rather than one repeated structure) well above 8 KiB.
+fn synthetic_rust_source() -> String {
+    let mut s = String::with_capacity(16 * 1024);
+    for i in 0..120 {
+        // Rotate the body shape so the n-gram yield is representative, not pathological.
+        match i % 4 {
+            0 => s.push_str(&format!(
+                "pub fn compute_{i}(x: i64, y: i64) -> i64 {{\n    let mut acc = x;\n    if y > {i} {{\n        acc += y * {i};\n    }} else {{\n        acc -= y;\n    }}\n    acc\n}}\n\n"
+            )),
+            1 => s.push_str(&format!(
+                "pub fn fold_{i}(items: &[i64]) -> i64 {{\n    let mut total = 0;\n    for it in items {{\n        total += it + {i};\n    }}\n    total\n}}\n\n"
+            )),
+            2 => s.push_str(&format!(
+                "pub fn classify_{i}(n: i64) -> &'static str {{\n    match n % 3 {{\n        0 => \"zero_{i}\",\n        1 => \"one\",\n        _ => \"other\",\n    }}\n}}\n\n"
+            )),
+            _ => s.push_str(&format!(
+                "pub struct Widget{i} {{\n    pub id: u64,\n    pub label: String,\n}}\n\nimpl Widget{i} {{\n    pub fn new(id: u64) -> Self {{\n        Self {{ id, label: String::new() }}\n    }}\n}}\n\n"
+            )),
+        }
     }
+    debug_assert!(
+        s.len() >= 8 * 1024,
+        "synthetic source must exceed the 8 KiB ratio-gate floor"
+    );
+    s
 }
 
 /// With `max_files=2`, the streaming pipeline indexes exactly 2 files.
