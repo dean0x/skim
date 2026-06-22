@@ -8,10 +8,16 @@
 //!
 //! 1. **Fail-open on every request path** — parse error, transform panic, analytics
 //!    failure, and sink-full all resolve to byte-identical forward + structured
-//!    warning. Never a proxy-originated 4xx/5xx on the forwarding path (except
-//!    the named carve-outs: 502 for unknown provider with no default upstream,
-//!    and 504 for upstream timeout). The connection cap uses bounded-accept TCP
-//!    backpressure (AD-PXY-13) — the proxy does NOT emit 503+Retry-After.
+//!    warning. Named proxy-originated status carve-outs:
+//!    - **400** for oversize body (body exceeds `max_body_bytes`) or client
+//!      read-error mid-send. Byte-identical streaming passthrough for oversize is
+//!      tracked in #304 (AC3); AC4/AC19b byte-identity tests exclude this path.
+//!    - **502** for Unknown provider with no default upstream (D8).
+//!    - **504** for upstream timeout (AC20).
+//!
+//!    All other forwarding-path failures resolve to byte-identical passthrough.
+//!    The connection cap uses bounded-accept TCP backpressure (AD-PXY-13) — the
+//!    proxy does NOT emit 503+Retry-After.
 //!
 //! 2. **Never-inflate** — the transform seam composes #301's `guarded_transform`
 //!    gate; output bytes ≤ input bytes per stage (invariant 2). The identity stage

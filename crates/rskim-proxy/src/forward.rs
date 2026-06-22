@@ -119,10 +119,15 @@ impl UpstreamClient {
 /// Determine if a header name is a RFC 9110 hop-by-hop header that must be
 /// stripped from the forwarded request.
 ///
-/// Case-insensitive. Called once per request header in the forward path.
+/// Case-insensitive. Called once per request header in the forward path and once
+/// per response header in the relay loop. Uses allocation-free comparison against
+/// the lowercase constant list — `hyper::HeaderName` is already lowercase-
+/// normalised, and for arbitrary input `eq_ignore_ascii_case` avoids the heap
+/// allocation that `to_ascii_lowercase()` would require.
 pub fn is_hop_by_hop(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    HOP_BY_HOP_HEADERS.contains(&lower.as_str())
+    HOP_BY_HOP_HEADERS
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
 }
 
 /// Build the upstream URI from the original request URI and the configured

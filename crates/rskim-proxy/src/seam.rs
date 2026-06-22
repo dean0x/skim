@@ -213,7 +213,8 @@ pub trait TransformStage: Send + Sync {
 /// sets `bytes == input` and produces a `DecisionRecord::passthrough` record.
 ///
 /// The identity stage is the default pipeline; #304 injects `BlockRouter` via
-/// `serve(config, stage)` without a breaking API change (D1 / AD-PXY-06).
+/// [`crate::serve_with_stage`]`(config, pipeline, analytics)` without a breaking
+/// API change (D1 / AD-PXY-06).
 ///
 /// ## AC19a — Conformance harness adapter
 ///
@@ -385,27 +386,42 @@ impl TransformPipeline {
                 stage_ref.apply(&pre_stage, ctx, sink)
             }));
 
-            let stage_output = match apply_result {
-                Ok(outcome) => outcome.bytes,
+            let (stage_output, panicked) = match apply_result {
+                Ok(outcome) => (outcome.bytes, false),
                 Err(_panic) => {
                     // Stage panicked — fail-open to pre-stage bytes (AC9).
                     // Do not log here (tracing may be the panic source).
-                    pre_stage.clone()
+                    (pre_stage.clone(), true)
                 }
             };
 
             // AC4 — structural never-inflate gate.
-            // If the stage returned MORE bytes than it received, guarded_transform
-            // rejects the inflation and returns a passthrough of pre_stage bytes.
-            // This catches stages that bypass guarded_transform internally.
-            let gated = guarded_transform(
-                pre_stage,
-                stage_output,
-                ctx.request_id,
-                stage.name(),
-                sink,
-            );
-            current = gated.bytes;
+            //
+            // Only call `guarded_transform` when the stage ACTUALLY changed bytes.
+            // For byte-identical outputs (identity stage, panic fail-open), we move
+            // `stage_output` forward directly. This preserves the passthrough
+            // invariant (a passthrough outcome is never mislabelled as modified) and
+            // avoids per-request allocation of a DecisionRecord + channel try_send for
+            // every identity request. guarded_transform is reserved for genuinely-
+            // modifying stages where the never-inflate gate is load-bearing.
+            if panicked || stage_output == pre_stage {
+                // Stage returned byte-identical output (or panicked to original).
+                // Move bytes forward without recording a spurious Modified record.
+                current = stage_output;
+            } else {
+                // Stage proposed a modification — run through the gate.
+                // guarded_transform enforces candidate_len <= input_len and records
+                // a Modified DecisionRecord; falls back to passthrough if the gate
+                // rejects inflation.
+                let gated = guarded_transform(
+                    pre_stage,
+                    stage_output,
+                    ctx.request_id,
+                    stage.name(),
+                    sink,
+                );
+                current = gated.bytes;
+            }
         }
 
         // The pipeline output is the final `current` bytes. Wrap in a passthrough

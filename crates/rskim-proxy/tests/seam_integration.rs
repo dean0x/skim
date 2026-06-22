@@ -66,10 +66,16 @@ mod ac4_inflating_stage_tests {
     /// AC4 (NEGATIVE / DISCRIMINATING): inflating stage routes through guarded_transform
     /// → the gate rejects the inflation → pipeline produces the ORIGINAL bytes.
     ///
-    /// Discriminator: replacing `guarded_transform` inside `InflatingStage::apply` with
-    /// a direct `Outcome::passthrough(candidate, …)` (bypassing the gate) would cause
-    /// the pipeline output to contain "INFLATION_SUFFIX" and fail this test — proving
-    /// `guarded_transform` is load-bearing.
+    /// Discriminator (corrected): the in-stage `guarded_transform` inside
+    /// `InflatingStage::apply` is NOT the sole load-bearing gate here — the pipeline
+    /// itself applies a structural per-stage gate after each `stage.apply()` call
+    /// (seam.rs, only for genuinely-modifying stages). Replacing the in-stage
+    /// `guarded_transform` with `Outcome::passthrough(candidate)` would still be
+    /// caught by the structural pipeline gate and the test would still pass.
+    /// The in-stage gate IS the idiomatic pattern for well-behaved stages, and this
+    /// test proves the PIPELINE output is correct (original bytes) regardless of which
+    /// gate layer catches the inflation. See AC4 arm-B wire test in wire_integration.rs
+    /// for the end-to-end proof that the gated bytes reach the upstream.
     #[test]
     fn test_ac4_inflating_stage_guardrail_forces_original_bytes() {
         let body = b"original body content".to_vec();
@@ -391,19 +397,32 @@ mod ac9_panicking_stage_tests {
         match result {
             Ok(outcome) => {
                 // AC9 outcome (a): pipeline caught the panic internally → original bytes.
+                // AD-PXY-12: `TransformPipeline::run` wraps each `stage.apply()` in
+                // `catch_unwind`, so panicking stages fall back to pre-stage bytes. This
+                // is the EXPECTED path; the pipeline contract guarantees it.
                 assert_eq!(
                     outcome.bytes.as_slice(),
                     original.as_slice(),
                     "AC9 internal catch: panicking stage must produce original bytes"
                 );
             }
-            Err(_) => {
-                // AC9 outcome (b): pipeline propagated the panic → server catch_unwind is
-                // the guard. The panic was caught here — the process did NOT exit. This is
-                // the documented production behavior (per-connection task isolation).
+            Err(_e) => {
+                // AC9 FAIL: the pipeline let the panic propagate past `run()`.
                 //
-                // We do NOT re-panic. The process is alive after this match arm.
-                // Full AC9 is tested at the server integration level (Steps 7-9).
+                // AD-PXY-12 says each stage.apply() is wrapped in catch_unwind INSIDE
+                // the pipeline loop. A panic that escapes `run()` means the per-stage
+                // catch_unwind was removed or broken — that is a regression, not an
+                // acceptable outcome. Panic propagation to the connection task is caught
+                // by tokio task isolation, but `run()` itself MUST absorb stage panics.
+                //
+                // This Err arm is discriminating: if catch_unwind is deleted from
+                // TransformPipeline::run, the pipeline would propagate the panic here
+                // and this assertion would fail the test (PF-007).
+                panic!(
+                    "AC9 REGRESSION: panicking stage escaped TransformPipeline::run — \
+                     the per-stage catch_unwind in the pipeline loop must catch this. \
+                     Deleting catch_unwind from seam.rs would produce this failure."
+                );
             }
         }
 

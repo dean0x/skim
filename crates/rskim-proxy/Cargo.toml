@@ -13,9 +13,14 @@ repository = "https://github.com/dean0x/skim"
 publish = false
 
 [dependencies]
-# Async runtime — full feature set for accept loops, signal handling, and
-# per-connection task supervision.
-tokio = { workspace = true, features = ["full"] }
+# Async runtime — explicit minimal feature set for accept loops, signal handling,
+# and per-connection task supervision. "full" is intentionally avoided to minimize
+# attack surface (dependencies Iron Law) — the proxy uses only: rt-multi-thread
+# (multi-threaded runtime), net (TcpListener/TcpStream), time (timeout/sleep),
+# sync (Semaphore/Mutex), io-util (AsyncRead/AsyncWrite), signal (SIGINT/SIGTERM),
+# and macros (tokio::select!/tokio::spawn). The fs and process features are NOT
+# used and are excluded. dev-deps may keep "full" for test ergonomics.
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "io-util", "signal", "macros"] }
 
 # HTTP/1.1 server and client. Low-level direct usage (no reqwest) keeps the
 # surface minimal and the supply-chain stance consistent (AD-PXY-04).
@@ -53,7 +58,9 @@ rskim-llm = { path = "../rskim-llm", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# Bounded non-blocking channel for fire-and-forget analytics (AC15 / AD-PXY-15).
+# Bounded non-blocking channel for fire-and-forget analytics (AC15 / AD-PXY-17).
+# AD-PXY-15 is the header-rewrite allowed-list decision (forward.rs); analytics
+# decisions are AD-PXY-17 (see analytics.rs).
 crossbeam-channel = { workspace = true }
 
 # Error types for construction / startup paths only. Never on the forwarding path.

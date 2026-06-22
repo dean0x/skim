@@ -12,8 +12,8 @@
 //! 2. **Per-transform call**: the `catch_unwind` in `handle_request` wraps
 //!    every `stage.apply()` call inside `TransformPipeline::run` so a panicking
 //!    stage falls back to byte-identical passthrough (AC9 / fail-open). The outer
-//!    `catch_unwind` around `pipeline.run()` in `handle_request` (server.rs:264)
-//!    catches any panic from the entire pipeline call as a second-level guard.
+//!    `catch_unwind` around `pipeline.run()` in `handle_request` catches any panic
+//!    from the entire pipeline call as a second-level guard.
 //!    Per-transform-call `catch_unwind` semantics: a panicking stage causes the
 //!    WHOLE pipeline output to fall back to original bytes (conservatively safe).
 //!
@@ -91,6 +91,8 @@ fn streaming_body(b: Incoming) -> ProxyBody {
         .boxed()
 }
 
+use rskim_contract::log::DecisionSink;
+
 use crate::analytics::{AnalyticsHook, ProxyEvent};
 use crate::authmode::classify_auth;
 use crate::config::ProxyConfig;
@@ -99,6 +101,28 @@ use crate::errors::ProxyError;
 use crate::forward::{ForwardError, UpstreamClient, forward_request, is_hop_by_hop};
 use crate::health::{ReadinessState, is_health_path, livez_response, readyz_response};
 use crate::seam::{HeaderView, TransformContext, TransformPipeline};
+
+// ============================================================================
+// NullSink — production decision sink for the identity pipeline
+// ============================================================================
+
+/// A no-op [`DecisionSink`] for the production forwarding path.
+///
+/// In #303 the transform pipeline is identity-only and no decision records are
+/// persisted. This sink discards all records with zero allocation — unlike
+/// [`rskim_contract::log::MockSink`] which accumulates records into a `Mutex<Vec>`,
+/// this type is the correct production sink.
+///
+/// #305 will wire a real persistent `ChannelDecisionSink` into `serve()` once
+/// the decision-record ledger lands.
+struct NullSink;
+
+impl DecisionSink for NullSink {
+    fn try_send(&self, _record: rskim_contract::log::DecisionRecord) -> Result<(), rskim_contract::log::SinkFull> {
+        // Intentional no-op. Zero allocation, zero blocking.
+        Ok(())
+    }
+}
 
 // ============================================================================
 // Connection cap (AD-PXY-13)
@@ -165,7 +189,8 @@ fn json_response(status: StatusCode, body: impl Into<Bytes>) -> Response<ProxyBo
 /// This function is called once per request within a connection task.
 /// It performs:
 /// 1. Health endpoint short-circuit (livez/readyz/health).
-/// 2. Request body buffering (up to max_body_bytes; oversize → passthrough).
+/// 2. Request body buffering (up to max_body_bytes; oversize or read-error → 400,
+///    named carve-out per lib.rs; byte-identical streaming passthrough tracked in #304).
 /// 3. Provider detection + auth classification.
 /// 4. Transform pipeline (identity in #303; #304 injects BlockRouter).
 /// 5. Header rewrite (hop-by-hop strip, host rewrite — no Via, AD-PXY-15).
@@ -230,30 +255,28 @@ async fn handle_request(
 
     // ---- Buffer body (up to max_body_bytes via Limited, AD-PXY-10) ----
     //
-    // http_body_util::Limited enforces the max_body_bytes cap. On LengthLimitError
-    // (body exceeded the cap) we fall through to a streaming passthrough of the
-    // ORIGINAL body (fail-open, AD-PXY-10: oversize requests stream through
-    // untransformed). Only the bounded prefix is needed for detection; the pipeline
-    // is bypassed for oversize bodies.
+    // http_body_util::Limited enforces the max_body_bytes cap.
     //
-    // On read error (client dropped the connection mid-send) we terminate cleanly
-    // without forwarding a fabricated empty body (a fabricated empty body would
-    // silently corrupt the upstream request — PF-002 / AC4 byte-identity invariant).
+    // Two distinct error cases:
+    //   (a) LengthLimitError (body exceeded the cap): the client sent a valid but
+    //       large body. AD-PXY-10 / AC3 require fail-open: return 400 in #303.
+    //       True streaming-passthrough (AC3 byte-identical forward for oversize) is
+    //       tracked in #304; that path requires streaming the original body through
+    //       the forward layer without buffering the full body first.
+    //   (b) Read/IO error (client dropped mid-send): the connection is already gone.
+    //       Returning any response is best-effort; we return 400 and close.
+    //
+    // Named carve-out (#303): proxy-originated 400 for oversize/read-error is an
+    // explicit carve-out on the lib.rs list (alongside 502/504). AC4/AC19b byte-
+    // identity tests exclude this path by construction (test bodies are tiny).
     use http_body_util::Limited;
     let limited = Limited::new(body, config.max_body_bytes);
     let body_bytes = match limited.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
-            // Distinguish oversize from read error.
-            // Limited::collect() returns Err when the body exceeds the cap.
-            // We log and fail-open by returning a 413 for oversize, or closing
-            // the connection on a read error.
-            //
-            // For this ticket we treat both as a forward-abort (not fabricate
-            // empty body). A genuinely oversize streaming path is deferred to
-            // #304 per ADR-001 (the streaming-through path requires the forward
-            // layer, not available in isolation here).
-            warn!(request_id = %request_id, error = %e, "failed to read request body (oversize or client disconnect) — aborting forward");
+            // Both LengthLimitError and IO errors surface here. In both cases we
+            // cannot safely fabricate or forward — return 400 and close.
+            warn!(request_id = %request_id, error = %e, "failed to read request body (oversize or client disconnect) — returning 400");
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
                 r#"{"error":"request body read error"}"#,
@@ -279,13 +302,10 @@ async fn handle_request(
     }
 
     // ---- Transform pipeline ----
-    // Bodies that exceed max_body_bytes are streamed through untransformed.
-    // (The body was already fully buffered above for the sniff — oversize
-    // streams are a forward-path concern; this ticket buffers for sniff only.)
     let header_view = HeaderView::new(&header_pairs);
     let ctx = TransformContext::new(provider.clone(), auth_mode, &request_id, &header_view);
 
-    let null_sink = rskim_contract::log::MockSink::new();
+    let null_sink = NullSink;
 
     // AC9: per-transform panic containment — catch_unwind around pipeline.run.
     // A panicking stage falls back to the original body bytes (fail-open).
@@ -396,10 +416,20 @@ async fn handle_request(
     let response_bytes: u64 = 0;
 
     // ---- Build relay response with streaming body ----
+    //
+    // Content-Length is dropped here for symmetry with the request-forward path
+    // (forward.rs drops it so hyper re-derives framing from the actual body).
+    // For #303 the response body is forwarded byte-identical, so the upstream
+    // content-length would be correct — but dropping it prevents a latent
+    // correctness hazard when #304 re-frames response bodies (compression changes
+    // byte counts, and an upstream content-length left in place would cause the
+    // client to hang waiting for bytes that never arrive). Mirror the request-path
+    // policy now rather than letting #304 inherit a silent framing trap.
     let mut relay_builder = Response::builder().status(resp_status);
     for (name, value) in &resp_headers {
         // Strip hop-by-hop from the response relay as well (AC12).
-        if !is_hop_by_hop(name.as_str()) {
+        // Also drop content-length so hyper re-derives framing from the actual body.
+        if !is_hop_by_hop(name.as_str()) && name != hyper::header::CONTENT_LENGTH {
             relay_builder = relay_builder.header(name, value);
         }
     }

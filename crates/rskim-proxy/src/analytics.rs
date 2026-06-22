@@ -82,9 +82,10 @@ impl ProxyEvent {
     ///
     /// External consumers use the `#[non_exhaustive]` struct literal with `..`.
     ///
-    /// Called by the request-completion path in #304 (block-router + forwarder).
-    /// Suppressed until #304 lands.
-    #[allow(dead_code)]
+    /// Called by the #303 request-completion path in `server.rs::handle_request`
+    /// exactly once per completed request (AC6). #305 extends [`ProxyEvent`] with
+    /// usage counters (token fields, turn-level attribution); the constructor
+    /// signature will remain backward-compatible.
     pub(crate) fn new(
         provider: ProxyProvider,
         request_bytes: u64,

@@ -126,9 +126,9 @@ pub const PORT_RANGE_MAX: u16 = 49000;
 
 /// Validated proxy configuration.
 ///
-/// Constructed by `cmd/proxy.rs` from CLI flags and `SKIM_PROXY_*` environment
-/// variables, then passed to [`crate::serve()`]. All values are validated at
-/// construction time — downstream code can trust them.
+/// Constructed by `cmd/proxy.rs` from CLI flags only (no env vars consulted;
+/// modes-via-flags-only policy). Passed to [`crate::serve()`]. All values are
+/// validated at construction time — downstream code can trust them.
 ///
 /// ## Non-exhaustive
 ///
