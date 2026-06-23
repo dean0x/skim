@@ -12,21 +12,30 @@
 //! The caller (BlockRouter, Phase 3) applies the never-inflate byte gate AFTER
 //! receiving the result — this engine does not apply the gate itself.
 //!
-//! # AD-011 — CRLF handling
+//! # AD-011 — CRLF ground truth (Phase 3 correction)
 //!
-//! rskim-core normalizes CRLF → LF internally (verified: `transform/truncate.rs`
-//! splits on `.lines()` which strips `\r`, then reassembles with `\n`). This
-//! means a CRLF code block will produce LF output, which is shorter by the count
-//! of `\r` bytes removed.
+//! **Verified ground truth:** rskim-core DOES normalize CRLF→LF in its transform
+//! output. The structure transform assembles output via `texts.join("\n")`
+//! (verified: `crates/rskim-core/src/transform/structure.rs:615`). Intermediate
+//! text collection also uses `.lines()` (which strips `\r`). The net result is
+//! that CRLF input produces LF-only output regardless of the adapter's own
+//! normalization.
 //!
-//! This shrinkage is transparent: the byte_gate sees `output_len < input_len`
-//! (passes). The output is deterministic and platform-independent (LF everywhere).
-//! The CRLF round-trip test in this module pins this behavior so any change to
-//! rskim-core's CRLF handling breaks the test immediately.
+//! This adapter ALSO normalizes CRLF→LF before calling `transform_with_quality`
+//! (via `Cow<str>` for zero-copy on LF-only input). This belt-and-suspenders
+//! measure ensures LF and CRLF input produce **identical** compressed output —
+//! determinism that would not hold if rskim-core's internal behavior changed to
+//! preserve `\r` in some future version.
 //!
-//! If byte-faithful CRLF round-trips were required (e.g., Windows .bat files),
-//! the caller could detect CRLF input and route through Passthrough instead.
-//! No such requirement exists today; we document the behavior here per AD-011.
+//! **Phase 2 handoff note correction:** the handoff document claimed "rskim-core
+//! does NOT normalize CRLF". That claim was incorrect. The verified path in
+//! structure.rs:615 (`texts.join("\n")`) demonstrates the opposite. This
+//! comment is the authoritative record per AD-011.
+//!
+//! Consequence: a CRLF code block produces LF-only output, which is shorter by
+//! the count of `\r` bytes removed. The byte_gate sees `output_len < input_len`
+//! (passes). The CRLF round-trip test in this module pins this behavior so any
+//! change to rskim-core's CRLF handling breaks the test immediately.
 
 use rskim_core::{Language, Mode, TransformConfig, transform_with_quality};
 
