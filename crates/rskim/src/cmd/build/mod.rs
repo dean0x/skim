@@ -210,14 +210,7 @@ pub(super) fn run_parsed_command(
             }
             crate::cmd::execution::SavingsDecision::Passthrough => {
                 // Emit raw verbatim (stdout+stderr combined, same as raw_cow).
-                let raw = raw_cow.as_ref();
-                if !raw.is_empty() {
-                    print!("{raw}");
-                    if !raw.ends_with('\n') {
-                        println!();
-                    }
-                }
-                "passthrough"
+                crate::cmd::execution::emit_raw_passthrough(raw_cow.as_ref())?
             }
         }
     } else {

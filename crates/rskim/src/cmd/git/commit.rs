@@ -67,8 +67,8 @@ pub(super) fn run_commit(
         show_stats,
         rec,
         output_format,
-        true, // combine_stderr: hook output and "nothing to commit" come from stderr
         label,
+        super::ParsedCommandOptions::combined(),
         parse_commit,
     )
 }

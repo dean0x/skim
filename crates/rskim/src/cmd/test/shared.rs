@@ -173,11 +173,7 @@ where
                 crate::cmd::execution::SavingsDecision::Passthrough => {
                     // Emit raw verbatim; drop the compressed summary.
                     // Record analytics under "passthrough" so the hint stays silent.
-                    print!("{raw_output}");
-                    if !raw_output.is_empty() && !raw_output.ends_with('\n') {
-                        println!();
-                    }
-                    effective_tier = "passthrough";
+                    effective_tier = crate::cmd::execution::emit_raw_passthrough(&raw_output)?;
                 }
             }
 
@@ -197,6 +193,13 @@ where
             //   - 0 parser failures (we have no structural data to say otherwise)
             //   - defer entirely to the process exit: 0 → SUCCESS, non-zero/signal → FAILURE
             // This matches the Full/Degraded arm's semantics when fail_count == 0.
+            //
+            // Known trade-off: a runner that FAILS but exits 0 AND produces unparseable
+            // output will be reported as SUCCESS via this arm.  This is intentional:
+            // the alternative (hardcoding FAILURE here) broke CI on PASSING suites that
+            // skim could not structurally parse — a far more common case.  A misbehaving
+            // runner that lies about its exit code is outside skim's control; the raw
+            // output is forwarded verbatim so the agent can inspect it directly.
             println!("{raw}");
             let _ = result.emit_markers(&mut io::stderr().lock());
             resolve_exit_code(0, exit_source)

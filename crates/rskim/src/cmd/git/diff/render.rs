@@ -323,7 +323,7 @@ fn render_with_unchanged_context(
     // Per-file monotonic cursor — prevents duplicate changed lines when two
     // adjacent changed nodes share a hunk.  See EmittedCursor for the full
     // explanation; scope is per-file so it resets across FileDiff boundaries.
-    let mut emitted_cur = EmittedCursor::default();
+    let mut cursor = EmittedCursor::default();
 
     for child in root.children(&mut walker) {
         let node_start = child.start_position().row + 1;
@@ -351,7 +351,7 @@ fn render_with_unchanged_context(
             // This node contains changes — render with full patch detail.
             // If it's a container, render parent header + changed children + context children.
             if is_container_node(&child) {
-                render_container_with_mode(output, &child, ctx, parser, &mut emitted_cur);
+                render_container_with_mode(output, &child, ctx, parser, &mut cursor);
             } else {
                 // Non-container changed node: render with patch
                 render_node_with_hunks(
@@ -361,7 +361,7 @@ fn render_with_unchanged_context(
                     ctx.hunks,
                     ctx.source_lines,
                     ctx.ln_width,
-                    &mut emitted_cur,
+                    &mut cursor,
                 );
             }
         } else {
@@ -381,7 +381,7 @@ fn render_with_unchanged_context(
 
 /// Render a container node (class/struct) with mode-aware child rendering.
 ///
-/// `emitted_cur` is the per-file monotonic cursor threaded from the caller
+/// `cursor` is the per-file monotonic cursor threaded from the caller
 /// (`render_with_unchanged_context`) to prevent duplicate changed lines when
 /// adjacent children share a hunk.
 fn render_container_with_mode(
@@ -389,7 +389,7 @@ fn render_container_with_mode(
     node: &tree_sitter::Node<'_>,
     ctx: &ModeRenderContext<'_>,
     parser: &mut rskim_core::Parser,
-    emitted_cur: &mut EmittedCursor,
+    cursor: &mut EmittedCursor,
 ) {
     let node_start = node.start_position().row + 1;
     let node_end = node.end_position().row + 1;
@@ -434,7 +434,7 @@ fn render_container_with_mode(
                 ctx.hunks,
                 ctx.source_lines,
                 ln_width,
-                emitted_cur,
+                cursor,
             );
         } else {
             render_unchanged_node(

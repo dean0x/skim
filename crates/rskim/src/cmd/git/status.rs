@@ -82,117 +82,21 @@ pub(super) fn run_status(
         None
     };
 
-    run_parsed_command_with_raw_override(
+    // C-7: pass the user's literal command output as the raw override so
+    // the net-savings guard compares against the right baseline.  The
+    // credential-scrub path in run_parsed_command (PF-024) covers this call.
+    super::run_parsed_command(
         &full_args,
         show_stats,
         rec,
         output_format,
         label,
-        user_raw_override,
+        super::ParsedCommandOptions {
+            combine_stderr: false,
+            raw_override: user_raw_override,
+        },
         parse_status,
     )
-}
-
-/// Variant of [`super::run_parsed_command`] that accepts an optional raw
-/// baseline override for the net-savings guard.
-///
-/// When `raw_override` is `Some`, the savings guard compares the compressed
-/// result against the override instead of the internal command's stdout.
-/// This is used by `run_status` to satisfy the C-7 requirement: the guard
-/// baseline must reflect what the **user's literal command** would have
-/// produced, not skim's internal substituted command.
-///
-/// When `raw_override` is `None`, behaviour is identical to
-/// [`super::run_parsed_command`].
-fn run_parsed_command_with_raw_override<F>(
-    subcmd_args: &[String],
-    show_stats: bool,
-    rec: crate::analytics::RecordingContext<'_>,
-    output_format: crate::cmd::OutputFormat,
-    label: String,
-    raw_override: Option<String>,
-    parser: F,
-) -> anyhow::Result<ExitCode>
-where
-    F: FnOnce(&str) -> GitResult,
-{
-    let runner = CommandRunner::new();
-    let arg_refs: Vec<&str> = subcmd_args.iter().map(String::as_str).collect();
-    let output = runner.run("git", &arg_refs)?;
-
-    if output.exit_code != Some(0) {
-        let scrubbed_stderr = super::shared::scrub_lines(&output.stderr);
-        if !scrubbed_stderr.is_empty() {
-            eprintln!("{scrubbed_stderr}");
-        }
-        let scrubbed_stdout = super::shared::scrub_lines(&output.stdout);
-        if !scrubbed_stdout.is_empty() {
-            println!("{scrubbed_stdout}");
-        }
-        let exit_code = output.exit_code;
-        super::finalize_git_output_passthrough(
-            scrubbed_stdout,
-            label,
-            show_stats,
-            rec.with_tier("passthrough"),
-            output.duration,
-        );
-        return Ok(super::map_exit_code(exit_code));
-    }
-
-    let raw: String = output.stdout;
-    let result = parser(&raw);
-    let parse_tier = result.parse_tier;
-
-    // The raw baseline for the savings guard: use the user's literal command
-    // output (C-7) when available, otherwise fall back to the porcelain stdout.
-    let guard_raw = raw_override.as_deref().unwrap_or(&raw);
-
-    let (result_str, effective_tier) = match output_format {
-        crate::cmd::OutputFormat::Json => {
-            let json = serde_json::to_string_pretty(&result)
-                .map_err(|e| anyhow::anyhow!("failed to serialize result: {e}"))?;
-            println!("{json}");
-            (json, parse_tier)
-        }
-        crate::cmd::OutputFormat::Text => {
-            let s = result.to_string();
-            let tier_str: Option<&'static str> = if parse_tier.is_some_and(|t| t == "passthrough") {
-                println!("{s}");
-                parse_tier
-            } else {
-                match crate::cmd::execution::savings_decision(guard_raw, &s) {
-                    crate::cmd::execution::SavingsDecision::Keep => {
-                        println!("{s}");
-                        parse_tier
-                    }
-                    crate::cmd::execution::SavingsDecision::Passthrough => {
-                        // Emit the user's raw output if we have it; otherwise
-                        // emit the porcelain raw.
-                        let emit_raw = raw_override.as_deref().unwrap_or(&raw);
-                        print!("{emit_raw}");
-                        if !emit_raw.is_empty() && !emit_raw.ends_with('\n') {
-                            println!();
-                        }
-                        Some("passthrough")
-                    }
-                }
-            };
-            (s, tier_str)
-        }
-    };
-
-    let analytics_raw = super::shared::scrub_lines(&raw);
-    super::finalize_git_output_owned(
-        analytics_raw,
-        result_str,
-        label,
-        show_stats,
-        rec.with_tier_opt(effective_tier),
-        output.duration,
-    );
-
-    Ok(ExitCode::SUCCESS)
 }
 
 /// Accumulated per-category file lists from a porcelain v2 status parse.
