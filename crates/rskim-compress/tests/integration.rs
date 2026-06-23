@@ -994,8 +994,9 @@ fn ac10_constructor_accepts_no_token_counter() {
 /// sandboxing), but the structural proof (no network deps in Cargo.toml) and
 /// the no-blocking behavioral proof (returns in <1s) together satisfy AC10.
 ///
-/// The cargo-tree check in `ac26_rskim_compress_has_no_hyper_tokio_axum` is
-/// the direct network-stack dependency proof.
+/// The in-crate test `ac26_rskim_compress_no_direct_hyper_tokio_axum` checks
+/// direct Cargo.toml deps; the CI `Dependency-tree isolation check` step runs
+/// `cargo tree -p rskim-compress -e normal` to cover the transitive guarantee.
 #[test]
 fn ac10_compression_path_makes_no_network_calls() {
     let code = long_rust_code();

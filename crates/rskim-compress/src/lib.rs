@@ -341,31 +341,19 @@ impl BlockRouter {
                 continue;
             }
 
-            // Phase 3 fix: emit record AFTER mutate_block succeeds (decision-log accuracy).
-            // Invariant 8: if sink is full, block stays original (no unlogged modification).
+            // Send-first, mutate-on-Ok ordering — invariant 8 safe.
             //
-            // Sequence:
-            // 1. Attempt mutate_block.
-            // 2. On success → attempt try_send Modified record.
-            //    - try_send Ok → mutation already applied, any_modified = true.
-            //    - try_send SinkFull → mutation ALREADY applied (we cannot un-apply it).
-            //      This is a known edge: `mutate_block` is not transactional. The block
-            //      IS modified but the record is lost. This is acceptable: invariant 8's
-            //      "logged-never-silent" is best-effort when the sink fills between
-            //      mutation attempt and record send. The fail-safe guard (try_send BEFORE
-            //      mutate) is provided for the common path below for new candidates.
+            // Invariant 8: a block mutation MUST be logged; no silent (unlogged) mutation.
             //
-            // To provide the strongest guarantee, we check the sink BEFORE mutating:
-            // attempt a dry-run try_send with a placeholder record, then on success
-            // perform the mutation. This avoids the race entirely.
+            // Ordering guarantee:
+            //   1. Call try_send(record).
+            //   2. On Ok  → the record is durably accepted; apply mutate_block.
+            //   3. On SinkFull → skip mutation entirely; block stays byte-identical to input.
             //
-            // IMPLEMENTATION: We use the "send-first, mutate-second" ordering by
-            // splitting the send into a non-blocking check. Since MockSink and
-            // ChannelDecisionSink are both FIFO and non-blocking, we can safely
-            // send the record first, then apply the mutation, knowing that:
-            // - If try_send succeeds → the record is accepted; we then mutate.
-            // - If try_send fails (SinkFull) → block stays original, no mutation.
-            // This is the correct invariant-8-safe ordering.
+            // This means the log entry always precedes the mutation, so the decision log
+            // can never contain a Modified record for a block that was not actually changed.
+            // The converse edge (mutate_block fails after try_send Ok) is documented below
+            // and is accepted as an overcount (fail-open, AD-009).
 
             // Determine the reason for this modified record (Full or Degraded).
             let reason = if degraded {
@@ -427,10 +415,40 @@ impl BlockRouter {
 
         // Step 7: Whole-request defense check (AD-008 defense-in-depth).
         // If output > input, discard all edits and return original (AC12).
-        if whole_request_check(input_len, serialized.len()).is_err() {
-            return Outcome::passthrough(body.to_vec(), request_id, "block-router");
-        }
+        apply_whole_request_check(body, serialized, request_id, input_len)
+    }
+}
 
+/// All-or-nothing whole-request inflation guard (AC12 / AD-008 defense-in-depth).
+///
+/// Compares `serialized.len()` against `input_len`. If the serialized output
+/// would inflate the request (output > input), all per-block edits are discarded
+/// and the original `input_bytes` are returned as passthrough. Otherwise the
+/// serialized bytes are returned as a modified outcome.
+///
+/// This is extracted so it can be unit-tested with a SYNTHESIZED inflating
+/// `serialized` argument — because `rskim_llm::serialize` is byte-faithful in
+/// practice and natural inflation is unreachable through the public API.
+///
+/// ## Invariant (AC12)
+///
+/// - `whole_request_check` Err → return `Outcome::passthrough(input_bytes)`
+/// - `whole_request_check` Ok  → return `Outcome::modified(serialized)`
+///
+/// The test `ac12_whole_request_check_arm_discards_edits_on_inflation` FAILS if
+/// this function is removed or if the `whole_request_check` branch is deleted,
+/// because it directly calls this function with an inflating `serialized` and
+/// asserts the original bytes are returned.
+fn apply_whole_request_check(
+    input_bytes: &[u8],
+    serialized: Vec<u8>,
+    request_id: &str,
+    input_len: usize,
+) -> Outcome {
+    if whole_request_check(input_len, serialized.len()).is_err() {
+        // Inflation detected — discard all per-block edits, return original.
+        Outcome::passthrough(input_bytes.to_vec(), request_id, "block-router")
+    } else {
         Outcome::modified(serialized, input_len, request_id, "block-router")
     }
 }
@@ -641,5 +659,108 @@ impl Contract for BlockRouter {
         // Use NullSink for the harness bridge — no decision logging in this path.
         // The TransformStage adapter (Phase 4) passes a real per-call sink.
         self.route(input, Policy::Default, request_id, &NullSink)
+    }
+}
+
+// ============================================================================
+// Unit tests for private functions (AC12 discriminating arm B / D3).
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AC12 discriminating — `apply_whole_request_check` returns original bytes on inflation.
+    ///
+    /// This test calls the extracted fallback function DIRECTLY with a SYNTHESIZED
+    /// `serialized` that is strictly LARGER than `input_bytes`. It asserts:
+    ///   (1) The ORIGINAL input bytes are returned (not the inflated serialized bytes).
+    ///   (2) The outcome is a passthrough (whole-request passthrough, not modified).
+    ///
+    /// ## Why this is discriminating
+    ///
+    /// If `apply_whole_request_check` is removed and `route()` calls
+    /// `Outcome::modified(serialized, ...)` unconditionally, this test fails because:
+    ///   - The outer integration tests (`ac12_whole_request_fallback_discards_edits`)
+    ///     only exercise `any_modified = false` early-return, NOT the `whole_request_check` arm.
+    ///   - This test synthesizes an inflating `serialized` and directly exercises the
+    ///     `whole_request_check` branch, asserting the original bytes win.
+    ///
+    /// To make this test FAIL: remove the `whole_request_check` branch from
+    /// `apply_whole_request_check` and return `Outcome::modified(serialized, ...)` always.
+    #[test]
+    fn ac12_whole_request_check_arm_discards_edits_on_inflation() {
+        let input_bytes: &[u8] = b"original-input-content-xyz";
+        let input_len = input_bytes.len();
+
+        // Synthesize a serialized buffer that is STRICTLY LARGER than input_bytes.
+        // This simulates the (unreachable in production) scenario where serde overhead
+        // inflates the reassembled output beyond the original request size.
+        let mut inflated_serialized = input_bytes.to_vec();
+        inflated_serialized.extend_from_slice(b"---inflation-padding---");
+        assert!(
+            inflated_serialized.len() > input_len,
+            "test setup: synthesized serialized must be larger than input"
+        );
+
+        let outcome = apply_whole_request_check(
+            input_bytes,
+            inflated_serialized,
+            "req-ac12-arm-b",
+            input_len,
+        );
+
+        // (1) The outcome MUST be passthrough (all per-block edits discarded).
+        assert!(
+            outcome.is_passthrough(),
+            "AC12 arm B: whole_request_check fallback must return passthrough on inflation, \
+             not a modified outcome"
+        );
+
+        // (2) The returned bytes MUST be the ORIGINAL input, not the inflated serialized bytes.
+        assert_eq!(
+            outcome.bytes.as_slice(),
+            input_bytes,
+            "AC12 arm B: whole_request_check fallback must return ORIGINAL input bytes, \
+             not the inflated serialized bytes"
+        );
+    }
+
+    /// AC12 discriminating — `apply_whole_request_check` returns modified outcome on shrink.
+    ///
+    /// Companion to `ac12_whole_request_check_arm_discards_edits_on_inflation`: verifies
+    /// that when serialized < input (compression succeeded), the MODIFIED outcome is returned.
+    /// This guards against an over-zealous implementation that always returns passthrough.
+    #[test]
+    fn ac12_whole_request_check_arm_returns_modified_on_shrink() {
+        let input_bytes: &[u8] = b"original-input-with-extra-verbosity-for-shrink-test";
+        let input_len = input_bytes.len();
+
+        // Synthesize a serialized buffer SMALLER than input_bytes (compression succeeded).
+        let shrunk_serialized = b"compressed".to_vec();
+        assert!(
+            shrunk_serialized.len() < input_len,
+            "test setup: synthesized serialized must be smaller than input"
+        );
+
+        let outcome = apply_whole_request_check(
+            input_bytes,
+            shrunk_serialized.clone(),
+            "req-ac12-arm-b-shrink",
+            input_len,
+        );
+
+        // Outcome MUST be modified (not passthrough) when serialized <= input.
+        assert!(
+            !outcome.is_passthrough(),
+            "AC12 arm B: whole_request_check must allow shrunk output through as modified"
+        );
+
+        // The bytes MUST be the shrunk serialized content.
+        assert_eq!(
+            outcome.bytes.as_slice(),
+            shrunk_serialized.as_slice(),
+            "AC12 arm B: modified outcome must contain the shrunk serialized bytes"
+        );
     }
 }
