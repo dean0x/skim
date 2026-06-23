@@ -248,7 +248,7 @@ pub(super) fn run_ast_standalone(
             }
             None => {
                 eprintln!(
-                    "skim search [warn]: AST result FileId({idx}) is out of manifest range \
+                    "skim search: AST result warning: FileId({idx}) is out of manifest range \
                      (manifest has {} files) — index may be out of sync; run `skim search --rebuild`",
                     sorted.len()
                 );

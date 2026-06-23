@@ -257,7 +257,7 @@ macro_rules! warn_skip {
     ($fmt:literal $(, $arg:expr)* $(,)?) => {{
         if crate::debug::is_debug_enabled() {
             eprintln!(
-                concat!("skim search temporal [debug]: ", $fmt, " — skipping temporal build"),
+                concat!("skim search [debug]: ", $fmt, " — skipping temporal build"),
                 $($arg)*
             );
         }
@@ -368,7 +368,7 @@ pub(super) fn rebuild_temporal(
         Ok(()) => {
             if crate::debug::is_debug_enabled() {
                 eprintln!(
-                    "skim search temporal [debug]: temporal.db updated ({} hotspot, {} risk, {} cochange rows, HEAD={}…)",
+                    "skim search [debug]: temporal.db updated ({} hotspot, {} risk, {} cochange rows, HEAD={}…)",
                     hotspot_rows.len(),
                     risk_rows.len(),
                     cochange_rows.len(),

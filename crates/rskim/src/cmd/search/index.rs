@@ -76,7 +76,7 @@ pub(super) fn run(
     let result = build_index(&config)?;
 
     eprintln!(
-        "skim search index: indexed {} files ({} skipped, {} field-map hits, \
+        "skim search: indexed {} files ({} skipped, {} field-map hits, \
          {} AST reused, {} AST re-extracted) in {:.1}s",
         result.file_count,
         result.skipped,
@@ -538,7 +538,7 @@ impl<'cfg> Pipeline<'cfg> {
             ) {
                 if debug_enabled {
                     eprintln!(
-                        "skim search index [debug]: add_file_classified failed for {:?}: {e}",
+                        "skim search [debug]: add_file_classified failed for {:?}: {e}",
                         pf.rel_path
                     );
                 }
@@ -600,7 +600,7 @@ impl<'cfg> Pipeline<'cfg> {
             let Some(next) = next_file_id.checked_add(1) else {
                 if debug_enabled {
                     eprintln!(
-                        "skim search index [debug]: next_file_id overflows u32; \
+                        "skim search [debug]: next_file_id overflows u32; \
                          flushing {} files and stopping",
                         next_file_id
                     );
@@ -794,7 +794,7 @@ fn run_classify(
         Err(e) => {
             if debug {
                 eprintln!(
-                    "skim search index [debug]: classify_source failed for {:?}: {e}",
+                    "skim search [debug]: classify_source failed for {:?}: {e}",
                     lang.as_str()
                 );
             }
@@ -833,7 +833,7 @@ fn derive_ast_entry(
         Err(e) => {
             if debug {
                 eprintln!(
-                    "skim search index [debug]: linearize_source failed for {:?}: {e}",
+                    "skim search [debug]: linearize_source failed for {:?}: {e}",
                     rel_path
                 );
             }
