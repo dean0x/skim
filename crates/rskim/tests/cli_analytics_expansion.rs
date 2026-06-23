@@ -108,14 +108,66 @@ fn test_show_stats_on_records_exactly_one_row() {
     );
 }
 
-// NOTE: A symmetric "without --show-stats records exactly one row" E2E test was
-// intentionally NOT added here. The default (no `--show-stats`) path records via
-// a fire-and-forget background thread that is not joined before the subprocess
-// exits, so observing the row count immediately after exit is inherently racy
-// (passes on fast hosts, flakes on slower CI with 0 rows). The no-double-record
-// contract is covered deterministically by `test_show_stats_on_records_exactly_one_row`
-// (synchronous --show-stats path) and the in-crate unit test
-// `test_expansion_stored_as_true_count_not_clamped` (direct `db.record`).
+// Corrected root cause for the WITHDRAWN `test_show_stats_off_records_exactly_one_row`
+// (commit 8325d45) and the #[ignore]'d regression test below.
+//
+// That test asserted a plain `skim <file>` (no --show-stats) records exactly one row; it
+// passed on macOS and flaked to 0 on Linux CI. The cause was NOT a fire-and-forget /
+// background-writer race: `record_with_counts` registers its thread in PENDING_THREADS and
+// `flush_pending()` (main.rs, after the file pipeline) joins it before the process exits, so
+// reading the DB after exit is deterministic. The real cause is PARSER-CACHE STATE: the
+// file-op path records only when token counts are already known, which — without
+// --show-stats — happens only on a cache HIT of an entry written by a prior --show-stats run
+// (process.rs `try_cached_result`). Tests share the default ~/.cache/skim, so macOS had a
+// warm `simple.ts` entry (recorded 1) while cold CI recorded 0.
+//
+// That cache-state dependency is a real, pre-existing analytics-loss bug (tracked in #359):
+// plain `skim <file>` — the common agent invocation — drops token-savings data on a cold or
+// plain-warmed cache. The DESIRED behavior is asserted by the #[ignore]'d regression test
+// below; remove #[ignore] when #359 is fixed. The no-double-record contract remains covered
+// deterministically by `test_show_stats_on_records_exactly_one_row` (synchronous
+// --show-stats path) and the unit test `test_expansion_stored_as_true_count_not_clamped`.
+
+/// Regression test for #359 (pre-existing analytics loss): a plain `skim <file>` (no
+/// `--show-stats`) SHOULD record exactly one token-savings row, independent of parser-cache
+/// state. It currently records ZERO because the file-op path records only when token counts
+/// are already computed — which, without `--show-stats`, happens only on a cache hit carrying
+/// counts from a prior `--show-stats` run. `--no-cache` removes all cache-state variance, so
+/// this is deterministic on every host: 0 today, 1 once #359 is fixed.
+///
+/// Determinism note: this is NOT the racy shape that flaked. `record_with_counts` registers
+/// its thread and `flush_pending()` joins it before exit, so the post-exit direct DB read is
+/// race-free. The DB is read with rusqlite directly — no `skim stats` subprocess, no sleep.
+#[test]
+#[ignore = "known pre-existing bug #359: plain file-op analytics is dropped unless the parser cache carries counts"]
+fn test_plain_file_op_should_record_analytics_no_cache() {
+    let db = NamedTempFile::new().unwrap();
+    let fixture = fixture_file();
+
+    // Plain run: NO --show-stats, --no-cache (eliminates parser-cache state entirely),
+    // analytics enabled. This mirrors the common agent invocation shape.
+    let status = std::process::Command::new(skim_bin())
+        .arg(fixture.as_os_str())
+        .arg("--no-cache")
+        .env("SKIM_ANALYTICS_DB", db.path().as_os_str())
+        .env_remove("SKIM_PASSTHROUGH") // ensure compression is active
+        .env_remove("SKIM_DISABLE_ANALYTICS") // analytics on
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("skim must run");
+    assert!(status.success(), "skim must exit 0");
+
+    // Direct, deterministic read (flush_pending joined the writer before exit).
+    let conn = rusqlite::Connection::open(db.path()).expect("must open analytics DB");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM token_savings", [], |r| r.get(0))
+        .unwrap_or(0); // table is absent when nothing was recorded
+    assert_eq!(
+        count, 1,
+        "a plain `skim <file>` should record exactly one analytics row regardless of cache \
+         state (currently records 0 — see #359)"
+    );
+}
 
 // ============================================================================
 // T11 (AC-N1 e2e) — expansion row: true count stored, tokens_saved = 0
