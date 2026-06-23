@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`skim search --weights lexical,ast,temporal`** — tune the `--blast-radius` composite
+  ranking; default `0.5,0.3,0.2`. Ratios only (not normalized; zero and non-sum-to-1 are
+  accepted, negative/NaN/inf rejected). On the `--blast-radius` path only the lexical and
+  temporal signals are active — the AST weight is inert until the full text+AST+temporal
+  compound dispatch lands (#339). (#200, #202)
+- **`skim search --blast-radius` union fusion** — co-change peers are now union-fused with
+  lexical hits via reciprocal-rank fusion: a file that only co-changes with the target
+  (no lexical match) now appears in results, scored by fused RRF rather than being dropped.
+  (#198, #200)
+- **Temporal DB auto-refresh on `skim search`** — after an index (re)build, the temporal
+  database is rebuilt when git `HEAD` has changed, keeping `--hot`/`--cold`/`--risky`/
+  `--blast-radius` current without a manual rebuild step. Non-fatal and debug-gated: a
+  temporal failure never fails the lexical search. (#289)
+- **Incremental AST n-gram cache** — the index reuses per-file AST structural entries
+  (`ast_index.skcache`) across builds for files whose content is unchanged, avoiding a
+  full AST re-parse on every rebuild. (#290)
+
+### Changed
+- **`skim search --ast` output format** — text rows now render the score as `[N]`
+  (previously `score: N`) and append a `:line` suffix plus a source snippet when the
+  matched pattern node is line-recovered; degraded (non-recovered) rows omit both. JSON
+  output gains optional `line` and `snippet` fields — additive, so existing consumers of
+  `path`/`score` are unaffected. (#201)
+
+### Added
 - **`rskim-tokens` crate (L3 Wave-1)** — Multi-provider token counting library (cl100k /
   o200k / Anthropic-offline / heuristic). Default build is HTTP-free; `net-anthropic` feature
   gates the API-backed counter. `skim`'s internal token counting now delegates here
