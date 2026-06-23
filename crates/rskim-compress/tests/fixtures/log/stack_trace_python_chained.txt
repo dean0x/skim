@@ -1,0 +1,19 @@
+ERROR: Operation failed
+Traceback (most recent call last):
+  File "/app/db.py", line 45, in query
+    cursor.execute(sql)
+  File "/app/db.py", line 102, in execute
+    return self._run(stmt)
+DatabaseError: connection timeout
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/app/api.py", line 30, in handle
+    db.query(q)
+  File "/app/api.py", line 55, in respond
+    return handle(req)
+  File "/app/main.py", line 10, in run
+    respond(request)
+ServiceError: failed to process request
+INFO: recovered

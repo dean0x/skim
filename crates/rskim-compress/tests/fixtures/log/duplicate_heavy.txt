@@ -1,0 +1,17 @@
+2024-01-15T10:00:00Z [INFO] processing item id=001
+2024-01-15T10:00:01Z [INFO] processing item id=002
+2024-01-15T10:00:02Z [INFO] processing item id=003
+2024-01-15T10:00:03Z [INFO] processing item id=004
+2024-01-15T10:00:04Z [INFO] processing item id=005
+2024-01-15T10:00:05Z [INFO] item processed successfully
+2024-01-15T10:00:06Z [INFO] item processed successfully
+2024-01-15T10:00:07Z [INFO] item processed successfully
+2024-01-15T10:00:08Z [INFO] item processed successfully
+2024-01-15T10:00:09Z [INFO] item processed successfully
+2024-01-15T10:00:10Z [ERROR] connection timeout: db:5432
+2024-01-15T10:00:11Z [ERROR] connection timeout: db:5432
+2024-01-15T10:00:12Z [ERROR] connection timeout: db:5432
+2024-01-15T10:00:13Z [WARN] retrying connection attempt=1
+2024-01-15T10:00:14Z [WARN] retrying connection attempt=2
+2024-01-15T10:00:15Z [WARN] retrying connection attempt=3
+2024-01-15T10:00:16Z [INFO] connection restored
