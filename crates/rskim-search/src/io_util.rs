@@ -14,8 +14,12 @@ use crate::Result;
 ///
 /// Strategy: `NamedTempFile::new_in` (temp file in the same directory as the
 /// target, avoiding cross-device rename) → `write_all` → `sync_all` (flush
-/// kernel page cache to durable storage) → set `0o644` permissions on Unix →
-/// `persist` (atomic rename).
+/// kernel page cache to durable storage) → set `0o600` (owner-only)
+/// permissions on Unix → `persist` (atomic rename).
+///
+/// `0o600` matches the temporal store (`temporal/storage.rs`) so every
+/// `.skim/` index artifact is owner-readable only; the index can embed paths
+/// and code structure, so it should not be world-readable on shared hosts.
 ///
 /// A reader that finds the target file present can therefore assume it is
 /// complete and durably written.  Without a subsequent directory fsync the
@@ -36,7 +40,7 @@ pub(crate) fn atomic_write(dir: &Path, path: &Path, data: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644))?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600))?;
     }
 
     tmp.persist(path).map_err(|e| e.error)?;
