@@ -64,19 +64,54 @@ fn format_text_returns_ok_for_empty_and_populated_slices() {
     let r = format_ast_text(&[], "x", "", &mut buf);
     assert!(r.is_ok(), "empty slice must return Ok");
 
+    // Populated (line-recovered) row must actually render its content, not just
+    // return Ok: path:line suffix, the 3-decimal score, and the snippet line.
     let results = vec![make_result_with_line("src/foo.rs", 2.5, 10, "  fn foo() {")];
     let mut buf2: Vec<u8> = Vec::new();
-    let r2 = format_ast_text(&results, "x", "", &mut buf2);
-    assert!(r2.is_ok(), "populated slice must return Ok");
+    format_ast_text(&results, "x", "", &mut buf2).expect("populated slice must return Ok");
+    let out = String::from_utf8(buf2).unwrap();
+    assert!(
+        out.contains("src/foo.rs:10"),
+        "text output must contain 'src/foo.rs:10'; got:\n{out}"
+    );
+    assert!(
+        out.contains("2.500"),
+        "text output must contain the 3-decimal score '2.500'; got:\n{out}"
+    );
+    assert!(
+        out.contains("fn foo()"),
+        "text output must contain the snippet; got:\n{out}"
+    );
 }
 
 #[test]
 fn format_json_returns_ok_for_empty_and_populated_slices() {
     let mut buf: Vec<u8> = Vec::new();
     assert!(format_ast_json(&[], "x", "", &mut buf).is_ok());
+
+    // Populated (degraded, no-line) row must serialize the envelope + the row's
+    // path/score, and OMIT line/snippet (the additive-key contract, AC-F4).
     let results = vec![make_result_no_line("src/bar.rs", 1.2)];
     let mut buf2: Vec<u8> = Vec::new();
-    assert!(format_ast_json(&results, "x", "", &mut buf2).is_ok());
+    format_ast_json(&results, "x", "", &mut buf2).expect("populated slice must return Ok");
+    let out = String::from_utf8(buf2).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&out).expect("must be valid JSON");
+    assert_eq!(v["mode"], "ast", "mode must be 'ast'");
+    assert_eq!(v["total"], 1, "total must reflect the single row");
+    let first = &v["results"][0];
+    assert_eq!(first["path"], "src/bar.rs", "path must round-trip");
+    assert!(
+        first["score"].is_number(),
+        "score must be present as a number"
+    );
+    assert!(
+        first.get("line").is_none(),
+        "degraded row: 'line' key must be ABSENT; got: {first}"
+    );
+    assert!(
+        first.get("snippet").is_none(),
+        "degraded row: 'snippet' key must be ABSENT; got: {first}"
+    );
 }
 
 // ============================================================================

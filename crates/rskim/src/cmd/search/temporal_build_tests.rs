@@ -1030,17 +1030,21 @@ fn e2e_rebuild_temporal_waits_for_same_lock() {
     let lock_holder = super::super::build_lock::acquire("e2e-holder-temporal", &cache_dir)
         .expect("must acquire lock");
 
-    // Channel: worker sends (is_ok, t_complete) after rebuild_temporal returns.
-    let (tx, rx) = mpsc::channel::<(bool, Instant)>();
+    // Channel: worker sends (is_ok, t_start, t_complete) after rebuild_temporal returns.
+    // t_start (the worker's first action) brackets the lower bound — the worker
+    // was alive and inside rebuild_temporal before the lock was released — and
+    // t_complete the upper bound, together proving it blocked on the lock.
+    let (tx, rx) = mpsc::channel::<(bool, Instant, Instant)>();
 
     let root_path = dir.path().to_path_buf();
     let cache_path = cache_dir.clone();
     let head_clone = head.clone();
     let worker = std::thread::spawn(move || {
+        let t_start = Instant::now();
         let now = current_epoch_secs();
         let result = rebuild_temporal(&root_path, &cache_path, &head_clone, now);
         let t_complete = Instant::now();
-        tx.send((result.is_ok(), t_complete)).ok();
+        tx.send((result.is_ok(), t_start, t_complete)).ok();
     });
 
     // Hold the lock for ~300 ms, then record t_release and drop.
@@ -1049,7 +1053,7 @@ fn e2e_rebuild_temporal_waits_for_same_lock() {
     drop(lock_holder);
 
     // Wait up to 30 s for the worker.
-    let (is_ok, t_complete) = rx
+    let (is_ok, t_start, t_complete) = rx
         .recv_timeout(Duration::from_secs(30))
         .expect("worker did not complete within 30 s");
 
@@ -1059,6 +1063,13 @@ fn e2e_rebuild_temporal_waits_for_same_lock() {
         is_ok,
         "rebuild_temporal must succeed after lock is released"
     );
+    // Lower bracket: the worker entered rebuild_temporal before the ~300 ms hold ended.
+    assert!(
+        t_start < t_release,
+        "worker must have entered rebuild_temporal BEFORE the lock was released \
+         (t_start={t_start:?}, t_release={t_release:?})"
+    );
+    // Upper bracket: it could not finish until the lock was released.
     assert!(
         t_complete >= t_release,
         "rebuild_temporal must complete AFTER the lock was released — \

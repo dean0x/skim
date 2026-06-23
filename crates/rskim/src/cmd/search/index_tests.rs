@@ -2386,13 +2386,18 @@ fn e2e_build_index_waits_for_lock() {
         cache_dir_override: Some(cache.path().to_path_buf()),
     };
 
-    // Channel: worker sends (is_ok, t_complete) after build_index returns.
-    let (tx, rx) = mpsc::channel::<(bool, Instant)>();
+    // Channel: worker sends (is_ok, t_start, t_complete) after build_index returns.
+    // t_start (the worker's first action) proves it was alive and inside
+    // build_index BEFORE the lock was released; t_complete proves it finished
+    // AFTER. Together they bracket the hold window, proving the worker blocked
+    // on the lock rather than racing in after release.
+    let (tx, rx) = mpsc::channel::<(bool, Instant, Instant)>();
 
     let worker = std::thread::spawn(move || {
+        let t_start = Instant::now();
         let result = build_index(&config);
         let t_complete = Instant::now();
-        tx.send((result.is_ok(), t_complete)).ok();
+        tx.send((result.is_ok(), t_start, t_complete)).ok();
     });
 
     // Hold the lock for ~300 ms, then record t_release and drop.
@@ -2401,13 +2406,20 @@ fn e2e_build_index_waits_for_lock() {
     drop(lock_holder);
 
     // Wait up to 30 s for the worker — build should proceed quickly once unlocked.
-    let (is_ok, t_complete) = rx
+    let (is_ok, t_start, t_complete) = rx
         .recv_timeout(Duration::from_secs(30))
         .expect("worker did not complete within 30 s");
 
     worker.join().expect("worker thread panicked");
 
     assert!(is_ok, "build_index must succeed after lock is released");
+    // Lower bracket: the worker entered build_index before the ~300 ms hold ended.
+    assert!(
+        t_start < t_release,
+        "worker must have entered build_index BEFORE the lock was released \
+         (t_start={t_start:?}, t_release={t_release:?})"
+    );
+    // Upper bracket: it could not finish until the lock was released.
     assert!(
         t_complete >= t_release,
         "build_index must complete AFTER the lock was released \
