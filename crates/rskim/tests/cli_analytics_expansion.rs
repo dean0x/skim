@@ -108,6 +108,40 @@ fn test_show_stats_on_records_exactly_one_row() {
     );
 }
 
+/// AC-F5: run `skim <file>` WITHOUT `--show-stats` against a temp DB.
+/// Assert exactly one analytics row is recorded (no double-record on the
+/// background re-tokenization path).
+///
+/// The default path (`try_record_command`) spawns a background thread to
+/// re-tokenize; it must record exactly once.  This is the symmetric counterpart
+/// to `test_show_stats_on_records_exactly_one_row` (AC-F4), completing the
+/// "WITH and WITHOUT --show-stats" pair described in the file header.
+#[test]
+fn test_show_stats_off_records_exactly_one_row() {
+    let db = NamedTempFile::new().unwrap();
+    let fixture = fixture_file();
+
+    // Run WITHOUT --show-stats; analytics enabled (no SKIM_DISABLE_ANALYTICS).
+    let status = std::process::Command::new(skim_bin())
+        .arg(fixture.as_os_str())
+        .env("SKIM_ANALYTICS_DB", db.path().as_os_str())
+        .env_remove("SKIM_PASSTHROUGH") // ensure compression is active
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("skim must run");
+    assert!(status.success(), "skim must exit 0 without --show-stats");
+
+    let stats = read_stats_json(&db);
+    let invocations = stats["summary"]["invocations"]
+        .as_u64()
+        .expect("summary.invocations must be a number");
+    assert_eq!(
+        invocations, 1,
+        "exactly one analytics row must be recorded without --show-stats (no double-record)"
+    );
+}
+
 // ============================================================================
 // T11 (AC-N1 e2e) — expansion row: true count stored, tokens_saved = 0
 // ============================================================================
@@ -119,8 +153,12 @@ fn test_show_stats_on_records_exactly_one_row() {
 ///   1. compressed_tokens is the TRUE value (greater than raw_tokens)
 ///   2. tokens_saved for the session is 0 (floored per-row CASE WHEN)
 ///
-/// This verifies the full pipeline: storage layer (no clamp) + query layer
-/// (CASE WHEN flooring) + JSON presentation.
+/// **Scope note**: This test covers the *query layer* (CASE WHEN flooring) and
+/// *JSON presentation* only.  The no-clamp write path (removal of the
+/// `.min(raw_tokens)` clamp in `analytics/mod.rs`) is covered separately by the
+/// in-crate unit test `test_expansion_stored_as_true_count_not_clamped`, which
+/// exercises `db.record(&record)` directly.  Seeding here via raw rusqlite INSERT
+/// deliberately bypasses the write path to test the read/query layer in isolation.
 #[test]
 fn test_expansion_row_stored_true_count_stats_shows_zero_saved() {
     let db = NamedTempFile::new().unwrap();

@@ -141,12 +141,16 @@ mod argv0_dispatch {
         );
 
         // (b) Net-savings guard: skim must not emit MORE bytes than raw.
-        // (Strictly: skim stdout len ≤ raw output len.)
-        let raw_len = raw_output.len();
-        let skim_len = skim_stdout.len();
+        // Trim trailing whitespace on both sides — a single trailing newline
+        // difference is not an expansion.  This matches the strict `<=` used in
+        // `cli_no_expansion_317.rs` (applies ADR-001).
+        let raw_trimmed = raw_output.trim_end();
+        let skim_trimmed = skim_stdout.trim_end();
+        let raw_len = raw_trimmed.len();
+        let skim_len = skim_trimmed.len();
         assert!(
-            skim_len <= raw_len + raw_len, // 2× slack for trailing newline normalisation
-            "wrapper dispatch must not expand output beyond 2× raw: \
+            skim_len <= raw_len,
+            "wrapper dispatch must not expand output vs raw (#317 invariant): \
              raw={raw_len}B skim={skim_len}B\n\
              skim_stdout={skim_stdout:?}"
         );
@@ -181,6 +185,138 @@ mod argv0_dispatch {
             "wrapper dispatch must propagate exit code 1 from stub grep; \
              stderr={}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // ========================================================================
+    // Test: --session-id stripping on the wrapper (argv0) surface
+    // ========================================================================
+
+    /// Verify that a stray `--session-id=<value>` injected by an older hook binary
+    /// is stripped on the wrapper dispatch surface — not forwarded to the underlying
+    /// tool (which would fail with "unrecognised option").
+    ///
+    /// This is the wrapper-surface counterpart to `cli_session_id_skew.rs`, which
+    /// covers the same strip on the hook/rewrite surface.  Both surfaces route
+    /// through `cmd::dispatch()` where `strip_session_id_flag` is the first action,
+    /// but the two dispatch front-ends are independent (argv[0] vs argv[0]="skim"),
+    /// so a test on one surface does not exercise the other.
+    ///
+    /// Assertions mirror `skew_grep_session_id_stripped` in `cli_session_id_skew.rs`:
+    /// - exit code ≠ 2 (no "unrecognised option" failure from grep)
+    /// - expected output is produced (grep found the pattern)
+    /// - `--session-id` does not appear in stdout
+    #[test]
+    fn argv0_grep_with_session_id_is_stripped() {
+        // Create a tiny file with a known line so grep succeeds.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.txt");
+        fs::write(&file, "hello world\n").unwrap();
+
+        // Build a stub grep that executes the real grep, ensuring the wrapper
+        // dispatch path finds a real grep rather than itself recursively.
+        // We rely on the real system grep here (same as cli_session_id_skew.rs does)
+        // since the PATH stripping inside skim prevents recursion.
+        let skim = skim_bin();
+        assert!(
+            skim.exists(),
+            "skim binary must exist at {}: run `cargo build` first",
+            skim.display()
+        );
+
+        // Invoke as argv[0]="grep" with an injected --session-id=<value> (equals form).
+        // Without strip_session_id_flag, real grep would reject --session-id with exit 2.
+        let output = std::process::Command::new(&skim)
+            .arg0("grep")
+            .args(["--session-id=skew-test", "hello", file.to_str().unwrap()])
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DEBUG")
+            .output()
+            .expect("skim binary must be spawnable");
+
+        // Exit code must NOT be 2 (grep's "unrecognised option" exit when the
+        // stray flag reaches it).  It must be 0 (found a match).
+        assert_ne!(
+            output.status.code(),
+            Some(2),
+            "argv[0]=grep with --session-id=skew-test must not exit 2 \
+             (strip_session_id_flag must fire on wrapper surface); \
+             stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "argv[0]=grep --session-id=skew-test hello <file> must exit 0 \
+             (grep found 'hello'); stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let skim_stdout = String::from_utf8_lossy(&output.stdout);
+
+        // grep output must contain the matched line.
+        assert!(
+            skim_stdout.contains("hello"),
+            "argv[0]=grep wrapper dispatch must produce grep output containing 'hello'; \
+             got: {skim_stdout:?}"
+        );
+
+        // --session-id must not appear in stdout (not forwarded to grep output).
+        assert!(
+            !skim_stdout.contains("--session-id"),
+            "argv[0]=grep wrapper dispatch must not leak --session-id into stdout; \
+             got: {skim_stdout:?}"
+        );
+    }
+
+    /// Space-separated form `--session-id skew-test` on the wrapper surface.
+    ///
+    /// Mirrors `skew_git_status_session_id_space_form_stripped` from
+    /// `cli_session_id_skew.rs` on the argv0 dispatch path.
+    #[test]
+    fn argv0_grep_with_session_id_space_form_is_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.txt");
+        fs::write(&file, "hello world\n").unwrap();
+
+        let skim = skim_bin();
+
+        // Space-separated: --session-id <value> (two separate argv entries).
+        let output = std::process::Command::new(&skim)
+            .arg0("grep")
+            .args(["--session-id", "skew-test", "hello", file.to_str().unwrap()])
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DEBUG")
+            .output()
+            .expect("skim binary must be spawnable");
+
+        assert_ne!(
+            output.status.code(),
+            Some(2),
+            "argv[0]=grep with space-form --session-id must not exit 2; \
+             stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "argv[0]=grep --session-id skew-test hello <file> must exit 0; \
+             stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let skim_stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            skim_stdout.contains("hello"),
+            "argv[0]=grep wrapper dispatch (space form) must produce grep output; \
+             got: {skim_stdout:?}"
+        );
+        assert!(
+            !skim_stdout.contains("--session-id"),
+            "argv[0]=grep wrapper dispatch (space form) must not leak --session-id; \
+             got: {skim_stdout:?}"
         );
     }
 

@@ -193,6 +193,101 @@ fn test_skim_git_status_short_compresses() {
         .stdout(predicate::str::is_empty().not());
 }
 
+/// C-7 byte-level guard: `skim git status -s` on a small hermetic dirty repo
+/// must NEVER emit MORE bytes than the raw `git status --short` output.
+///
+/// The C-7 logic re-runs the user's literal `git status --short` to use as the
+/// net-savings guard baseline, so that on a small repo skim emits the compact
+/// raw `--short` form rather than the expanded porcelain summary.  This test
+/// locks in that property end-to-end (applies ADR-001 / #317 invariant).
+///
+/// This is the status analogue of `cli_no_expansion_317.rs` for the -s/-short
+/// flag path.
+#[test]
+fn test_skim_git_status_short_never_expands_vs_raw() {
+    let (_dir, repo) = make_hermetic_dirty_repo();
+
+    // Capture raw `git status --short` output for the baseline.
+    let raw_output = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(&repo)
+        .output()
+        .expect("git must be available");
+    let raw_len = raw_output.stdout.len();
+
+    // Run `skim git status -s` against the same repo.
+    let skim_output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["git", "status", "-s"])
+        .current_dir(&repo)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim git status -s must not fail to spawn");
+
+    assert!(
+        skim_output.status.success(),
+        "skim git status -s must exit 0; stderr={}",
+        String::from_utf8_lossy(&skim_output.stderr)
+    );
+
+    let skim_len = skim_output.stdout.len();
+
+    // #317 / C-7 invariant: skim must NEVER emit more bytes than the raw
+    // `git status --short` baseline.  On a small repo the guard must fire and
+    // passthrough the compact raw form.
+    assert!(
+        skim_len <= raw_len,
+        "C-7: skim git status -s expanded output vs raw --short\n  \
+         raw={raw_len}B  skim={skim_len}B\n  \
+         skim stdout={:?}\n  \
+         raw stdout={:?}\n  \
+         The C-7 never-expand-vs-user-intent property failed.",
+        String::from_utf8_lossy(&skim_output.stdout),
+        String::from_utf8_lossy(&raw_output.stdout)
+    );
+}
+
+/// Same as above but using `--short` long-form flag alias.
+#[test]
+fn test_skim_git_status_short_longform_never_expands_vs_raw() {
+    let (_dir, repo) = make_hermetic_dirty_repo();
+
+    let raw_output = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(&repo)
+        .output()
+        .expect("git must be available");
+    let raw_len = raw_output.stdout.len();
+
+    let skim_output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["git", "status", "--short"])
+        .current_dir(&repo)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim git status --short must not fail to spawn");
+
+    assert!(
+        skim_output.status.success(),
+        "skim git status --short must exit 0; stderr={}",
+        String::from_utf8_lossy(&skim_output.stderr)
+    );
+
+    let skim_len = skim_output.stdout.len();
+
+    assert!(
+        skim_len <= raw_len,
+        "C-7: skim git status --short expanded output vs raw --short\n  \
+         raw={raw_len}B  skim={skim_len}B\n  \
+         skim stdout={:?}",
+        String::from_utf8_lossy(&skim_output.stdout)
+    );
+}
+
 // ============================================================================
 // Diff
 // ============================================================================
