@@ -2679,6 +2679,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "proptest",
+ "rskim-compress",
  "rskim-contract",
  "rskim-llm",
  "rustls",

@@ -87,6 +87,11 @@ criterion = { workspace = true, features = ["async_tokio"] }
 # No dev-dep entry needed — the workspace dep is inherited.
 # tracing-subscriber with Layer trait for AC13 capture layer in wire tests.
 tracing-subscriber = { workspace = true, features = ["json", "env-filter", "fmt", "registry"] }
+# rskim-compress: BlockRouter joint e2e tests (AC19 / #304 / Phase 4a).
+# This is a dev-dep ONLY — rskim-proxy's production code is compressor-agnostic (AC9).
+# rskim-compress does NOT depend on rskim-proxy (no cycle): it depends on
+# rskim-contract, rskim-core, rskim-llm only (verified: no hyper/tokio in its tree).
+rskim-compress = { path = "../rskim-compress" }
 
 [features]
 # Optional typed-view seam helper — #304 can enable when it calls ctx.parse_typed().
