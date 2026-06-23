@@ -9,6 +9,7 @@ members = [
     "crates/rskim-tokens",
     "crates/rskim-contract",
     "crates/rskim-llm",
+    "crates/rskim-compress",
 ]
 resolver = "2"
 

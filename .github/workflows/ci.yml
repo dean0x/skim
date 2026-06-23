@@ -176,6 +176,18 @@ jobs:
           fi
           echo "PASS: no HTTP/TLS in skim binary default build"
 
+          echo "=== rskim-compress transitive dep gate (AC26/AC9) ==="
+          # AC26: rskim-compress MUST NOT pull in hyper/tokio/axum/rskim-proxy directly
+          # or transitively. The in-crate test (ac26_rskim_compress_no_direct_hyper_tokio_axum)
+          # checks only direct [dependencies]; this step closes the transitive gap.
+          cargo tree -p rskim-compress -e normal 2>&1 | tee /tmp/rskim-compress-tree.txt
+          if grep -qE 'tokio|hyper|axum|rskim-proxy' /tmp/rskim-compress-tree.txt; then
+            echo "FAIL: forbidden transitive dependency (tokio/hyper/axum/rskim-proxy) found in rskim-compress"
+            grep -E 'tokio|hyper|axum|rskim-proxy' /tmp/rskim-compress-tree.txt || true
+            exit 1
+          fi
+          echo "PASS: no tokio/hyper/axum/rskim-proxy in rskim-compress (AC26/AC9)"
+
   fuzz-smoke:
     name: Fuzz Smoke (AC15, rskim-llm)
     runs-on: ubuntu-latest

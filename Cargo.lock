@@ -2562,6 +2562,7 @@ dependencies = [
  "quick-xml",
  "rayon",
  "regex",
+ "rskim-compress",
  "rskim-contract",
  "rskim-core",
  "rskim-proxy",
@@ -2597,6 +2598,21 @@ dependencies = [
  "tree-sitter-go",
  "tree-sitter-python",
  "tree-sitter-rust",
+]
+
+[[package]]
+name = "rskim-compress"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "proptest",
+ "regex",
+ "rskim-contract",
+ "rskim-core",
+ "rskim-llm",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -2663,6 +2679,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "proptest",
+ "rskim-compress",
  "rskim-contract",
  "rskim-llm",
  "rustls",
