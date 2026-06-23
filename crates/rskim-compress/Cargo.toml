@@ -34,3 +34,7 @@ todo = "warn"
 [lib]
 name = "rskim_compress"
 path = "src/lib.rs"
+
+[[bench]]
+name = "engine_bench"
+harness = false
