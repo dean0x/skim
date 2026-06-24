@@ -312,8 +312,52 @@ impl SearchLayer for NgramIndexReader {
         }
 
         let ngrams = extract_query_ngrams(&query.text);
+
+        // AD-355-7: Short-query fallback.
+        //
+        // Trigram extraction requires ≥3 bytes per token; single- and double-byte
+        // tokens (e.g. "fn", "if") produce zero trigrams.  In this case the ngram
+        // index cannot generate candidates, but the query is still meaningful.
+        //
+        // Rather than returning empty results, we emit all indexed files as
+        // score-0 candidates so that the Part A verify step
+        // (`resolve_paths_and_snippets_verified` in `cmd/search/query.rs`) can
+        // apply a literal substring filter and return only files that actually
+        // contain the query string.  This preserves correctness (verify is the
+        // AC2/AC3 correctness layer) while avoiding a silent empty result for
+        // short-but-valid search terms.
+        //
+        // The pool-limit widening in `query.rs` (LEXICAL_CANDIDATE_POOL_K × limit,
+        // floor 100) bounds the number of candidates fed to verify, keeping this
+        // path O(pool_limit × file_read) rather than O(total_files × file_read)
+        // for large corpora.
         if ngrams.is_empty() {
-            return Ok(Vec::new());
+            let limit = query.limit.unwrap_or(20);
+            let offset = query.offset.unwrap_or(0);
+            let file_count = self.header.file_count as usize;
+            // Emit all indexed file IDs (respecting file_filter and offset/limit)
+            // as score-0 candidates.  Verification in query.rs will filter these
+            // down to files that actually contain the literal query string.
+            let results = (0..file_count)
+                .filter(|&doc_id| {
+                    // Respect the blast-radius file_filter allowlist if present.
+                    query
+                        .file_filter
+                        .as_ref()
+                        .is_none_or(|f| f.contains(&FileId(doc_id as u32)))
+                })
+                .skip(offset)
+                .take(limit)
+                .map(|doc_id| SearchResult {
+                    file_id: FileId(doc_id as u32),
+                    score: 0.0,
+                    line_range: 0..0,
+                    match_positions: vec![],
+                    field: SearchField::Other,
+                    snippet: None,
+                })
+                .collect();
+            return Ok(results);
         }
 
         // Resolve scoring config: per-query override takes priority.

@@ -7,7 +7,10 @@ use std::fs;
 
 use tempfile::tempdir;
 
-use super::{SnippetOutcome, extract_context_window, extract_snippet, query_substring_present};
+use super::{
+    SnippetOutcome, extract_context_window, extract_snippet, extract_snippet_and_verify,
+    query_substring_present,
+};
 
 // ============================================================================
 // extract_context_window
@@ -257,6 +260,59 @@ fn test_query_substring_present_empty_query_vacuously_true() {
     assert!(
         query_substring_present("any content", ""),
         "empty query produces no tokens; all() over empty set is vacuously true"
+    );
+}
+
+// ============================================================================
+// extract_snippet_and_verify — AD-355-7 empty-positions path
+// ============================================================================
+
+/// AD-355-7 / PF-007: when match_positions is empty (short-query fallback from
+/// the reader), extract_snippet_and_verify must still read the file and run
+/// query_substring_present.  It returns Unavailable (no context window without a
+/// byte offset) but verified=true for files that contain the query.
+///
+/// Discriminating observable (PF-007): verified must be TRUE for a file that
+/// contains the query, so the caller includes it in results.  If the empty-
+/// positions early-exit were restored, verified would be false and the file would
+/// be silently dropped — the bug the AD-355-7 fix addresses.
+#[test]
+fn test_extract_snippet_and_verify_empty_positions_file_contains_query_ad355_7() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "fn foo() {}\n").unwrap();
+
+    // Empty positions — simulates the short-query (AD-355-7) fallback.
+    let (outcome, verified) = extract_snippet_and_verify(&root, "src/lib.rs", &[], None, "fn");
+
+    // File contains "fn" → verified must be true so the caller keeps it.
+    assert!(
+        verified,
+        "AD-355-7: file containing 'fn' with empty positions must be verified=true; got verified={verified}, outcome={outcome:?}"
+    );
+    // No snippet can be produced without a position.
+    assert!(
+        matches!(outcome, SnippetOutcome::Unavailable),
+        "AD-355-7: empty positions → SnippetOutcome::Unavailable; got {outcome:?}"
+    );
+}
+
+/// AD-355-7: when positions are empty and the file does NOT contain the query,
+/// verified must be false — the verify gate still filters out non-matching files.
+#[test]
+fn test_extract_snippet_and_verify_empty_positions_file_absent_query_ad355_7() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "struct Foo {}\n").unwrap();
+
+    let (_, verified) = extract_snippet_and_verify(&root, "src/lib.rs", &[], None, "fn");
+
+    // File does NOT contain "fn" → verified must be false.
+    assert!(
+        !verified,
+        "AD-355-7: file not containing 'fn' with empty positions must be verified=false"
     );
 }
 

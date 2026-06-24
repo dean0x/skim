@@ -257,6 +257,16 @@ pub fn extract_ngrams(text: &str) -> Vec<(Ngram, f32)> {
 ///
 /// Output is sorted by weight **descending** — highest-selectivity trigrams first.
 ///
+/// # Short-query behaviour (< 3 bytes)
+///
+/// Queries shorter than 3 bytes (e.g. `"fn"`, `"if"`) cannot produce any trigrams,
+/// so this function returns an empty `Vec`.  Callers that need to support short queries
+/// must handle the empty case themselves — typically by falling back to a full-scan
+/// candidate set that is then narrowed by a literal substring verify step.
+///
+/// The [`crate::index::reader::NgramIndexReader`] implements this fallback via AD-355-7
+/// in its `search()` method.
+///
 /// # Arguments
 ///
 /// * `query` — search query string.

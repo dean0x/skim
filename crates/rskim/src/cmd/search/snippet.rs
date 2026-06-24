@@ -232,9 +232,17 @@ pub(super) fn extract_snippet_and_verify(
     manifest_entry: Option<&ManifestEntry>,
     query: &str,
 ) -> (SnippetOutcome, bool) {
-    if match_positions.is_empty() {
-        return (SnippetOutcome::Unavailable, false);
-    }
+    // AD-355-7: empty match_positions is valid for short-query fallback candidates
+    // (1–2 byte queries that cannot produce trigrams).  In that case the ngram
+    // reader returns all indexed files with empty positions; we still need to read
+    // the file and run query_substring_present to decide whether to keep the result.
+    // We skip the early-return here and fall through to the I/O+verify path.
+    // For the normal (ngram-scored) path, positions are non-empty and the snippet
+    // extraction below will succeed as before.
+    //
+    // When positions ARE empty we return SnippetOutcome::Unavailable (no context
+    // window can be computed without a position), but verified may be true or false
+    // depending on whether the file contains the literal query string.
 
     let abs_path = root.join(rel_path);
 
@@ -274,6 +282,14 @@ pub(super) fn extract_snippet_and_verify(
 
     // Substring verification — pure, no I/O (AD-355-1 / AD-355-3).
     let verified = query_substring_present(text, query);
+
+    // AD-355-7: short-query fallback candidates arrive with no positions.  We
+    // cannot compute a meaningful snippet without a byte offset, so return
+    // Unavailable (snippet will be None in the result).  The `verified` flag
+    // still controls whether the candidate survives the relevance gate.
+    if match_positions.is_empty() {
+        return (SnippetOutcome::Unavailable, verified);
+    }
 
     let match_line = rskim_search::byte_offset_to_line(&content, match_positions[0].start) as u32;
     let line_range = rskim_search::compute_line_range(&content, match_positions);

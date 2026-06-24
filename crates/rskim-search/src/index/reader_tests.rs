@@ -100,6 +100,64 @@ fn test_search_empty_query_returns_empty() {
     assert!(results.is_empty(), "empty query should return no results");
 }
 
+/// AD-355-7 / PF-007: short-query fallback — a 2-byte query cannot produce trigrams,
+/// but the reader must still return all indexed files as score-0 candidates so the
+/// Part A verify step can apply a literal substring filter.
+///
+/// Discriminating observable (PF-007): the file containing the short term IS present
+/// in the raw candidate set (FileId(0)), and a file that does NOT contain the term
+/// is also returned so the verify step can distinguish them.  An empty set would hide
+/// the bug and a vacuous `!is_empty()` would pass even without the fix.
+#[test]
+fn test_search_short_query_returns_all_file_candidates_ad355_7() {
+    // File 0 contains "fn"; File 1 does not.
+    let (_dir, layer) = build_index_with(&[
+        (FileId(0), "fn main() {}", rskim_core::Language::Rust),
+        (FileId(1), "def run(): pass", rskim_core::Language::Python),
+    ]);
+    let mut q = SearchQuery::new("fn"); // 2-byte query — no trigrams possible
+    q.limit = Some(50);
+    let results = layer.search(&q).unwrap();
+
+    let file_ids: std::collections::HashSet<u32> = results.iter().map(|r| r.file_id.0).collect();
+
+    // Both files must be present — the caller (verify layer) decides who survives.
+    assert!(
+        file_ids.contains(&0),
+        "AD-355-7: FileId(0) containing 'fn' must appear as a candidate; got {file_ids:?}"
+    );
+    assert!(
+        file_ids.contains(&1),
+        "AD-355-7: FileId(1) must also appear so verify can filter; got {file_ids:?}"
+    );
+
+    // Score must be 0.0 — no BM25F scoring for short queries; ranking is deferred to verify.
+    for r in &results {
+        assert_eq!(
+            r.score, 0.0,
+            "AD-355-7: short-query candidates carry score 0.0, got {} for FileId({})",
+            r.score, r.file_id.0
+        );
+    }
+}
+
+/// A 1-byte query also returns all candidates (same AD-355-7 path as 2-byte).
+#[test]
+fn test_search_single_byte_query_returns_all_file_candidates() {
+    let (_dir, layer) = build_index_with(&[
+        (FileId(0), "abc", rskim_core::Language::Rust),
+        (FileId(1), "xyz", rskim_core::Language::Python),
+    ]);
+    let mut q = SearchQuery::new("a"); // 1-byte — no trigrams
+    q.limit = Some(50);
+    let results = layer.search(&q).unwrap();
+    let file_ids: std::collections::HashSet<u32> = results.iter().map(|r| r.file_id.0).collect();
+    assert!(
+        file_ids.contains(&0) && file_ids.contains(&1),
+        "single-byte query must return all candidates; got {file_ids:?}"
+    );
+}
+
 #[test]
 fn test_search_empty_index_returns_empty() {
     let (_dir, layer) = build_index_with(&[]);
