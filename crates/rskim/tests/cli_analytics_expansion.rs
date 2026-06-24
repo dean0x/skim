@@ -110,36 +110,33 @@ fn test_show_stats_on_records_exactly_one_row() {
     );
 }
 
-// Corrected root cause for the WITHDRAWN `test_show_stats_off_records_exactly_one_row`
-// (commit 8325d45) and the #[ignore]'d regression test below.
+// Root-cause context for `test_plain_file_op_should_record_analytics_no_cache` below.
 //
-// That test asserted a plain `skim <file>` (no --show-stats) records exactly one row; it
-// passed on macOS and flaked to 0 on Linux CI. The cause was NOT a fire-and-forget /
-// background-writer race: `record_with_counts` registers its thread in PENDING_THREADS and
-// `flush_pending()` (main.rs, after the file pipeline) joins it before the process exits, so
-// reading the DB after exit is deterministic. The real cause is PARSER-CACHE STATE: the
-// file-op path records only when token counts are already known, which — without
-// --show-stats — happens only on a cache HIT of an entry written by a prior --show-stats run
-// (process.rs `try_cached_result`). Tests share the default ~/.cache/skim, so macOS had a
-// warm `simple.ts` entry (recorded 1) while cold CI recorded 0.
+// An earlier version of this test was `#[ignore]`'d (see WITHDRAWN
+// `test_show_stats_off_records_exactly_one_row`, commit 8325d45): it asserted a plain
+// `skim <file>` records one row but flaked to 0 on Linux CI. The flake was caused by
+// PARSER-CACHE STATE, not a background-writer race: `record_with_counts` registers its
+// thread in PENDING_THREADS and `flush_pending()` joins it before process exit, so the
+// post-exit DB read is deterministic. The real cause was that the file-op path recorded
+// only when token counts were already cached — requiring a prior `--show-stats` run.
+// Tests share the default ~/.cache/skim, so macOS (warm cache) recorded 1 while cold CI
+// recorded 0.
 //
-// That cache-state dependency is a real, pre-existing analytics-loss bug (tracked in #359):
-// plain `skim <file>` — the common agent invocation — drops token-savings data on a cold or
-// plain-warmed cache. The DESIRED behavior is asserted by the #[ignore]'d regression test
-// below; remove #[ignore] when #359 is fixed. The no-double-record contract remains covered
-// deterministically by `test_show_stats_on_records_exactly_one_row` (synchronous
-// --show-stats path) and the unit test `test_expansion_stored_as_true_count_not_clamped`.
+// #359 (Phase A1) fixed the underlying analytics-loss bug by introducing a unified
+// `record_file_ops` path that records independent of cache state. The regression test
+// below was un-ignored once that fix landed and now runs as a standard (non-ignored) test.
+// The no-double-record contract is covered separately by
+// `test_show_stats_on_records_exactly_one_row` and the unit test
+// `test_expansion_stored_as_true_count_not_clamped`.
 
-/// Regression test for #359 (pre-existing analytics loss): a plain `skim <file>` (no
-/// `--show-stats`) SHOULD record exactly one token-savings row, independent of parser-cache
-/// state. It currently records ZERO because the file-op path records only when token counts
-/// are already computed — which, without `--show-stats`, happens only on a cache hit carrying
-/// counts from a prior `--show-stats` run. `--no-cache` removes all cache-state variance, so
-/// this is deterministic on every host: 0 today, 1 once #359 is fixed.
+/// Regression test for #359 analytics-loss fix (Phase A1): a plain `skim <file>` (no
+/// `--show-stats`) must record exactly one token-savings row, independent of parser-cache
+/// state. `--no-cache` eliminates all cache-state variance so the result is deterministic
+/// on every host.
 ///
-/// Determinism note: this is NOT the racy shape that flaked. `record_with_counts` registers
-/// its thread and `flush_pending()` joins it before exit, so the post-exit direct DB read is
-/// race-free. The DB is read with rusqlite directly — no `skim stats` subprocess, no sleep.
+/// Determinism note: `record_with_counts` registers its thread and `flush_pending()` joins
+/// it before exit, so the post-exit direct DB read is race-free. The DB is read with
+/// rusqlite directly — no `skim stats` subprocess, no sleep.
 #[test]
 fn test_plain_file_op_should_record_analytics_no_cache() {
     let db = NamedTempFile::new().unwrap();

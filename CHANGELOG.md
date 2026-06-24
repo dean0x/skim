@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default when explicitly set. Empty `SKIM_CACHE_DIR` is treated as unset (falls back to
   the platform default `~/.cache/skim`).
 
+- **Plain `skim <file>` now always records token-savings analytics (#359 Phase A)** —
+  Previously a plain `skim <file>` (and stdin, glob, and directory invocations) only
+  recorded analytics when token counts were already present in the parser cache from a
+  prior `--show-stats` run; cold-cache and plain-warmed-cache runs silently dropped all
+  data. The fix introduces a unified `record_file_ops` path that records token counts
+  independent of cache state, with the detected language attached to each row. Multi-file
+  invocations (glob, directory) now emit one analytics row per file instead of a single
+  aggregate.
+
 ### Added
 - **`rskim-tokens` crate (L3 Wave-1)** — Multi-provider token counting library (cl100k /
   o200k / Anthropic-offline / heuristic). Default build is HTTP-free; `net-anthropic` feature

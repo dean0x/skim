@@ -35,6 +35,61 @@ fn skim_with_ts_file(cache_dir: &std::path::Path) -> (Command, std::path::PathBu
     (cmd, file_path_owned)
 }
 
+/// B1: SKIM_CACHE_DIR alone causes analytics rows to land in `<cache_dir>/analytics.db`.
+///
+/// This is the primary behavior change from #359 Phase B: when `SKIM_CACHE_DIR` is set
+/// (and `SKIM_ANALYTICS_DB` is NOT set), the analytics DB is created under the overridden
+/// cache root rather than under `~/.cache/skim`. The test is hermetic: both the parser
+/// cache and the analytics DB are confined to an isolated TempDir.
+#[test]
+fn test_b1_skim_cache_dir_relocates_analytics_db() {
+    let cache_dir = TempDir::new().unwrap();
+
+    // Write a tiny Rust fixture into a separate TempDir so the file outlives the command.
+    let src_dir = TempDir::new().unwrap();
+    let file_path = src_dir.path().join("sample.rs");
+    fs::write(
+        &file_path,
+        "fn greet(name: &str) -> String { format!(\"Hello {name}\") }",
+    )
+    .unwrap();
+    // Keep src_dir alive for the duration of the test.
+
+    // Construct the command directly — NOT via common::skim() (which disables analytics)
+    // and NOT via skim_with_analytics() (which sets SKIM_ANALYTICS_DB, defeating the test).
+    // We need SKIM_CACHE_DIR to be the only override so the default analytics.db path
+    // resolves to <cache_dir>/analytics.db.
+    let mut cmd = assert_cmd::Command::cargo_bin("skim").unwrap();
+    cmd.env("SKIM_CACHE_DIR", cache_dir.path())
+        .env("NO_COLOR", "1")
+        .env_remove("SKIM_DISABLE_ANALYTICS") // analytics ON
+        .env_remove("SKIM_ANALYTICS_DB") // CRUCIAL: force the default-relocation path
+        .env_remove("SKIM_PASSTHROUGH"); // ensure compression is active
+
+    cmd.arg(&file_path).assert().success();
+
+    // The analytics DB must appear under the overridden cache root.
+    let expected_db = cache_dir.path().join("analytics.db");
+    assert!(
+        expected_db.exists(),
+        "B1: analytics.db must be created under SKIM_CACHE_DIR={} when SKIM_ANALYTICS_DB is \
+         not set, but the file was not found. Default ~/.cache/skim path may still be in use.",
+        cache_dir.path().display()
+    );
+
+    // Count token_savings rows — flush_pending() joins the background writer before process
+    // exit, so the row is present once assert_cmd returns. No sleep needed.
+    let conn = rusqlite::Connection::open(&expected_db).expect("must open analytics DB");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM token_savings", [], |r| r.get(0))
+        .unwrap_or(0);
+    assert!(
+        count >= 1,
+        "B1: at least one token_savings row must be recorded in <SKIM_CACHE_DIR>/analytics.db \
+         after a plain `skim <file>` run (got {count} rows)"
+    );
+}
+
 /// B2: SKIM_CACHE_DIR relocates parser-cache entries.
 ///
 /// After running skim with SKIM_CACHE_DIR=<dir>, JSON cache files must appear
