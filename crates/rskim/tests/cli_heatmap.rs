@@ -3,7 +3,6 @@
 //! Tests end-to-end CLI behavior for git history risk/coupling analysis.
 //! For tests that need a git repo, we create a TempDir and set up deterministic commits.
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::Path;
 use std::process::Command as StdCommand;

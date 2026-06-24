@@ -1,6 +1,5 @@
 //! Integration tests for `skim completions` subcommand (#63).
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use std::io::Write;

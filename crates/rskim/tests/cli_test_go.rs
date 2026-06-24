@@ -2,7 +2,6 @@
 //!
 //! v2.8.0: Flat dispatch — `skim go test` replaces `skim test go`.
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use std::process::Command as StdCommand;
 mod common;

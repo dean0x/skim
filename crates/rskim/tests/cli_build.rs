@@ -2,7 +2,6 @@
 //!
 //! v2.8.0: `skim build cargo` → `skim cargo build`
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 mod common;
 

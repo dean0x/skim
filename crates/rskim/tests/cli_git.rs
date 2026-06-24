@@ -4,7 +4,6 @@
 //! These tests run against the real skim repository (which is a git repo),
 //! so they exercise the actual git binary.
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 mod common;
 

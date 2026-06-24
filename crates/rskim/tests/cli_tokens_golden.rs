@@ -11,7 +11,6 @@
 //! Pinned against: tiktoken-rs 0.7.0 cl100k_base (workspace version).
 //! Source file: tests/fixtures/typescript/simple.ts
 
-use assert_cmd::Command;
 use std::path::PathBuf;
 mod common;
 

@@ -4,7 +4,6 @@
 //! standard prefix rewrites, env vars, cargo toolchain, compound commands,
 //! git skip-flags, suggest mode, stdin mode, and cat/head/tail handlers.
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 mod common;
 

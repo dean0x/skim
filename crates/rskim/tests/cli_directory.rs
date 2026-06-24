@@ -2,7 +2,8 @@
 //!
 //! Tests recursive directory processing with auto-detection
 
-use assert_cmd::Command;
+mod common;
+
 use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
@@ -206,8 +207,6 @@ fn test_directory_skips_symlinks() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
-
-        mod common;
 
         let _ = symlink(
             temp_dir.path().join("real.ts"),

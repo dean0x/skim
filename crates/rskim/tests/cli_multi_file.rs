@@ -5,7 +5,6 @@
 //! from glob patterns (tested in `cli_glob.rs`) even though the underlying
 //! dispatch overlaps.
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;

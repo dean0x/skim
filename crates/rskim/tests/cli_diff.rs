@@ -3,7 +3,6 @@
 //! Uses temporary git repos to test the full end-to-end flow:
 //! create repo -> add files -> commit -> modify -> run `skim git diff`.
 
-use assert_cmd::Command;
 use std::fs;
 use tempfile::TempDir;
 mod common;

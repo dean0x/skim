@@ -4,7 +4,6 @@
 //!
 //! Tests the end-to-end cargo test parser via the CLI binary.
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 mod common;
 

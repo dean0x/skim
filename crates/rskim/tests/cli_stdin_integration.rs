@@ -4,7 +4,6 @@
 //! These cover multi-flag combinations that weren't exercised by the
 //! existing test suite, plus F6/F13-stdin analytics tests from Phase A1 (#359).
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
