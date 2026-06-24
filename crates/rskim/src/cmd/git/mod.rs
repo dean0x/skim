@@ -344,6 +344,34 @@ pub(super) fn run_passthrough(
     Ok(map_exit_code(exit_code))
 }
 
+/// Options for [`run_parsed_command`] that bundle infrequently-varied flags.
+///
+/// Grouping these reduces the argument count to stay within Clippy's
+/// `too_many_arguments` limit while keeping all parameters documented together.
+#[derive(Default)]
+pub(super) struct ParsedCommandOptions {
+    /// When `true`, the parser receives `stderr + stdout` combined.  Git fetch
+    /// writes its output to stderr; set to `true` for fetch, `false` otherwise.
+    pub combine_stderr: bool,
+    /// When `Some`, the net-savings guard compares the compressed result against
+    /// this string instead of the internal command's stdout.  Satisfies C-7: the
+    /// baseline must reflect the **user's literal command** output, not skim's
+    /// internally substituted command.  Pass `None` for standard behaviour.
+    pub raw_override: Option<String>,
+}
+
+impl ParsedCommandOptions {
+    /// Combined-stderr options: parser receives `stderr + stdout`, no baseline override.
+    ///
+    /// Used by commit, fetch, and push — all write their primary output to stderr.
+    pub fn combined() -> Self {
+        Self {
+            combine_stderr: true,
+            raw_override: None,
+        }
+    }
+}
+
 /// Run a git command and parse its output with the given parser function.
 ///
 /// Callers are responsible for baking global flags into `subcmd_args` before
@@ -352,9 +380,7 @@ pub(super) fn run_passthrough(
 /// `label` is the analytics label string built by the caller from the user's
 /// **original** (pre-rewrite) args via [`build_analytics_label`].
 ///
-/// When `combine_stderr` is `true`, the parser receives `stderr + stdout`
-/// combined. Git fetch writes its output to stderr, so fetch uses `true`;
-/// all other subcommands use `false` (stdout only).
+/// See [`ParsedCommandOptions`] for `combine_stderr` and `raw_override` docs.
 ///
 /// # AD-GIT-14 (2026-04-11) — analytics recording on non-zero exit
 ///
@@ -369,13 +395,17 @@ pub(super) fn run_parsed_command<F>(
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
     output_format: OutputFormat,
-    combine_stderr: bool,
     label: String,
+    opts: ParsedCommandOptions,
     parser: F,
 ) -> anyhow::Result<ExitCode>
 where
     F: FnOnce(&str) -> GitResult,
 {
+    let ParsedCommandOptions {
+        combine_stderr,
+        raw_override,
+    } = opts;
     let runner = CommandRunner::new();
     let arg_refs: Vec<&str> = subcmd_args.iter().map(String::as_str).collect();
     let output = runner.run("git", &arg_refs)?;
@@ -420,17 +450,47 @@ where
     let result = parser(&raw);
     // Capture parse_tier before result is consumed by rendering.
     let parse_tier = result.parse_tier;
-    let result_str = match output_format {
+
+    // Serialize first without printing so the net-savings guard can decide.
+    //
+    // Exemptions:
+    // - JSON output: must never be rewritten to non-JSON.
+    // - Already-passthrough tier: `raw` IS the body; guard is a no-op.
+    //
+    // "raw" baseline = raw_override when supplied (C-7: guard against the user's
+    // literal command output), otherwise post-ANSI-strip `raw` (stdout or combined
+    // stderr+stdout).
+    let guard_raw: &str = raw_override.as_deref().unwrap_or(&raw);
+    let (result_str, effective_tier) = match output_format {
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize result: {e}"))?;
             println!("{json}");
-            json
+            (json, parse_tier)
         }
         OutputFormat::Text => {
             let s = result.to_string();
-            println!("{s}");
-            s
+            let tier_str: Option<&'static str> = if parse_tier.is_some_and(|t| t == "passthrough") {
+                // Already passthrough — skip guard, print as-is.
+                println!("{s}");
+                parse_tier
+            } else {
+                // Apply net-savings guard.
+                match crate::cmd::execution::savings_decision(guard_raw, &s) {
+                    crate::cmd::execution::SavingsDecision::Keep => {
+                        println!("{s}");
+                        parse_tier
+                    }
+                    crate::cmd::execution::SavingsDecision::Passthrough => {
+                        // Emit the user's raw output if available (C-7), otherwise
+                        // emit the internal command raw; record under "passthrough" tier.
+                        let emit_raw = raw_override.as_deref().unwrap_or(&raw);
+                        let tier = crate::cmd::execution::emit_raw_passthrough(emit_raw)?;
+                        Some(tier)
+                    }
+                }
+            };
+            (s, tier_str)
         }
     };
 
@@ -443,12 +503,13 @@ where
     // `label` is supplied by the caller from the user's original (pre-rewrite) args
     // so the analytics DB records the invocation as the user typed it.
     // `parse_tier` propagates the parser's tier annotation to the analytics DB (AD-GIT-12).
+    // When savings_decision flips to Passthrough, effective_tier overrides parse_tier.
     finalize_git_output_owned(
         analytics_raw,
         result_str,
         label,
         show_stats,
-        rec.with_tier_opt(parse_tier),
+        rec.with_tier_opt(effective_tier),
         output.duration,
     );
 

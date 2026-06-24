@@ -434,8 +434,17 @@ impl AnalyticsDb {
     /// Query aggregate summary.
     pub(crate) fn query_summary(&self, since: Option<i64>) -> anyhow::Result<AnalyticsSummary> {
         let (where_clause, params) = since_clause(since);
+        // Fifth column: per-row floored tokens_saved — consistent with
+        // query_by_command/query_by_lang/query_by_mode.  Rows where
+        // compressed_tokens > raw_tokens (expansion) contribute 0 to tokens_saved
+        // while their true counts remain in raw_tokens/compressed_tokens columns.
         let sql = format!(
-            "SELECT COUNT(*), COALESCE(SUM(raw_tokens), 0), COALESCE(SUM(compressed_tokens), 0), COALESCE(AVG(savings_pct), 0) FROM token_savings {where_clause}"
+            "SELECT COUNT(*), \
+             COALESCE(SUM(raw_tokens), 0), \
+             COALESCE(SUM(compressed_tokens), 0), \
+             COALESCE(AVG(savings_pct), 0), \
+             COALESCE(SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END), 0) \
+             FROM token_savings {where_clause}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let row = stmt.query_row(rusqlite::params_from_iter(params), |row| {
@@ -443,11 +452,13 @@ impl AnalyticsDb {
             let raw_tokens: i64 = row.get(1)?;
             let compressed_tokens: i64 = row.get(2)?;
             let avg_savings_pct: f64 = row.get(3)?;
+            let tokens_saved: i64 = row.get(4)?;
             Ok(AnalyticsSummary {
                 invocations,
                 raw_tokens: raw_tokens as u64,
                 compressed_tokens: compressed_tokens as u64,
-                tokens_saved: (raw_tokens - compressed_tokens).max(0) as u64,
+                // .max(0) is defensive; CASE WHEN already floors per-row.
+                tokens_saved: tokens_saved.max(0) as u64,
                 avg_savings_pct,
             })
         })?;
@@ -457,8 +468,13 @@ impl AnalyticsDb {
     /// Query daily breakdown.
     pub(crate) fn query_daily(&self, since: Option<i64>) -> anyhow::Result<Vec<DailyStats>> {
         let (where_clause, params) = since_clause(since);
+        // CASE WHEN flooring is consistent with query_by_command/lang/mode/session.
+        // Expansion rows (compressed_tokens > raw_tokens) contribute 0 to tokens_saved.
         let sql = format!(
-            "SELECT date(timestamp, 'unixepoch') as day, COUNT(*), COALESCE(SUM(raw_tokens - compressed_tokens), 0), COALESCE(AVG(savings_pct), 0) FROM token_savings {where_clause} GROUP BY day ORDER BY day DESC"
+            "SELECT date(timestamp, 'unixepoch') as day, COUNT(*), \
+             COALESCE(SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END), 0), \
+             COALESCE(AVG(savings_pct), 0) \
+             FROM token_savings {where_clause} GROUP BY day ORDER BY day DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
@@ -992,7 +1008,7 @@ fn record_fire_and_forget(
             command_type,
             original_cmd,
             raw_tokens,
-            compressed_tokens: comp_tokens.min(raw_tokens),
+            compressed_tokens: comp_tokens,
             savings_pct: savings_percentage(raw_tokens, comp_tokens),
             duration_ms: duration.as_millis() as u64,
             project_path,
@@ -1093,7 +1109,7 @@ pub(crate) fn try_record_command_with_counts(
             command_type: rec.command_type,
             original_cmd,
             raw_tokens,
-            compressed_tokens: compressed_tokens.min(raw_tokens),
+            compressed_tokens,
             savings_pct: savings_percentage(raw_tokens, compressed_tokens),
             duration_ms: duration.as_millis() as u64,
             project_path: cwd,
@@ -2097,5 +2113,158 @@ mod tests {
             config.session_id.is_none(),
             "session_id should be None when not provided"
         );
+    }
+
+    // ========================================================================
+    // Gross/faithful expansion accounting tests (AC-N1..N3, AC-A2)
+    // Part 3: compressed_tokens stored as TRUE count (no clamp); aggregates
+    // floor expansion rows' contribution to tokens_saved=0.
+    // ========================================================================
+
+    /// AC-N1 (T6) — record via record_with_counts with comp_tokens > raw_tokens;
+    /// read back and assert stored compressed_tokens equals the TRUE value (> raw),
+    /// NOT the old clamped value.
+    #[test]
+    fn test_expansion_stored_as_true_count_not_clamped() {
+        let (db, _tmp) = test_db();
+
+        let raw = 100usize;
+        let comp_expanded = 150usize; // expansion: comp > raw
+        let record = TokenSavingsRecord {
+            timestamp: 1711300000,
+            command_type: CommandType::Build,
+            original_cmd: "skim heatmap".to_string(),
+            raw_tokens: raw,
+            compressed_tokens: comp_expanded,
+            savings_pct: savings_percentage(raw, comp_expanded),
+            duration_ms: 20,
+            project_path: "/tmp/test".to_string(),
+            mode: None,
+            language: None,
+            parse_tier: None,
+            session_id: None,
+        };
+        db.record(&record).unwrap();
+
+        // Read back compressed_tokens directly from the DB.
+        let stored: i64 = db
+            .conn
+            .query_row("SELECT compressed_tokens FROM token_savings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            stored as usize, comp_expanded,
+            "compressed_tokens must be stored as true count ({}), not clamped to raw ({})",
+            comp_expanded, raw
+        );
+    }
+
+    /// AC-N2/N3 (T7) — seed: compressing row + tie row + one expansion row.
+    /// Assert query_summary, query_daily, and query_by_command all:
+    ///   • floor the expansion row's contribution to 0 in tokens_saved
+    ///   • agree on tokens_saved
+    ///   • non-expanding subset's tokens_saved matches pre-change formula
+    #[test]
+    fn test_aggregates_floor_expansion_row_to_zero() {
+        let (db, _tmp) = test_db();
+
+        // Row 1: compressing — 500 raw, 200 compressed → 300 saved
+        let mut r1 = sample_record();
+        r1.timestamp = 1711300000;
+        r1.raw_tokens = 500;
+        r1.compressed_tokens = 200;
+        r1.savings_pct = savings_percentage(500, 200);
+        r1.command_type = CommandType::Build;
+        db.record(&r1).unwrap();
+
+        // Row 2: tie — 300 raw, 300 compressed → 0 saved
+        let mut r2 = sample_record();
+        r2.timestamp = 1711300100;
+        r2.raw_tokens = 300;
+        r2.compressed_tokens = 300;
+        r2.savings_pct = savings_percentage(300, 300);
+        r2.command_type = CommandType::Build;
+        db.record(&r2).unwrap();
+
+        // Row 3: expansion — 100 raw, 180 compressed → 0 saved (floored)
+        let mut r3 = sample_record();
+        r3.timestamp = 1711300200;
+        r3.raw_tokens = 100;
+        r3.compressed_tokens = 180;
+        r3.savings_pct = savings_percentage(100, 180);
+        r3.command_type = CommandType::Build;
+        db.record(&r3).unwrap();
+
+        // Expected: only row 1 contributes to tokens_saved = 300.
+        let expected_tokens_saved = 300u64;
+
+        let summary = db.query_summary(None).unwrap();
+        assert_eq!(
+            summary.tokens_saved, expected_tokens_saved,
+            "query_summary: expansion row must contribute 0 to tokens_saved"
+        );
+        // True counts are preserved in raw_tokens/compressed_tokens.
+        assert_eq!(summary.raw_tokens, 500 + 300 + 100);
+        assert_eq!(summary.compressed_tokens, 200 + 300 + 180);
+
+        let daily = db.query_daily(None).unwrap();
+        assert_eq!(daily.len(), 1);
+        assert_eq!(
+            daily[0].tokens_saved, expected_tokens_saved,
+            "query_daily: expansion row must contribute 0 to tokens_saved"
+        );
+
+        let by_cmd = db.query_by_command(None).unwrap();
+        assert_eq!(by_cmd.len(), 1);
+        assert_eq!(
+            by_cmd[0].tokens_saved, expected_tokens_saved,
+            "query_by_command: expansion row must contribute 0 to tokens_saved"
+        );
+    }
+
+    /// AC-A2 (T8) — expansion-heavy dataset: every aggregate query returns
+    /// tokens_saved >= 0 and does not panic.
+    #[test]
+    fn test_expansion_heavy_dataset_nonnegative_tokens_saved() {
+        let (db, _tmp) = test_db();
+
+        // Seed 10 expansion rows and 2 compressing rows.
+        for i in 0..10u64 {
+            let r = TokenSavingsRecord {
+                timestamp: 1711300000 + i as i64,
+                command_type: CommandType::Lint,
+                original_cmd: format!("skim heatmap {i}"),
+                raw_tokens: 50,
+                compressed_tokens: 100, // expansion
+                savings_pct: 0.0,
+                duration_ms: 5,
+                project_path: "/tmp/test".to_string(),
+                mode: None,
+                language: None,
+                parse_tier: None,
+                session_id: None,
+            };
+            db.record(&r).unwrap();
+        }
+        // Two normal compressing rows so we can verify non-zero tokens_saved for those.
+        let mut r_good = sample_record();
+        r_good.command_type = CommandType::Lint;
+        r_good.raw_tokens = 1000;
+        r_good.compressed_tokens = 100;
+        r_good.savings_pct = savings_percentage(1000, 100);
+        r_good.timestamp = 1711310000;
+        db.record(&r_good).unwrap();
+        db.record(&r_good).unwrap();
+
+        let summary = db.query_summary(None).unwrap();
+        // tokens_saved is u64 — always non-negative by type; assert exact value.
+        // Only the two compressing rows contribute: 2 × (1000 - 100) = 1800.
+        assert_eq!(summary.tokens_saved, 1800);
+
+        // tokens_saved is u64 — non-negativity is guaranteed by the type.
+        // Call both queries to ensure they do not panic with expansion-heavy data.
+        db.query_daily(None).unwrap();
+        db.query_by_command(None).unwrap();
     }
 }

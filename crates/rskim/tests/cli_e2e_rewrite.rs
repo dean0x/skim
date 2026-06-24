@@ -2685,8 +2685,10 @@ fn fix_e_git_show_pipe_passes_through() {
 // "unexpected argument '--session-id'".
 // ============================================================================
 
-/// Hook-rewrite `cat <tmp.rs>` with a session_id, then EXECUTE the emitted
-/// command. It must exit 0 and produce output.
+/// Hook-rewrite `cat <tmp.rs>` with a session_id: the rewritten command must
+/// contain NO `--session-id` token (Fix #1.1 — session attribution is
+/// out-of-band via sidecar/env, never injected into the command text).
+/// The rewritten command must still execute successfully and produce output.
 #[test]
 fn test_hook_rewritten_cat_with_session_id_executes() {
     let dir = TempDir::new().unwrap();
@@ -2712,12 +2714,16 @@ fn test_hook_rewritten_cat_with_session_id_executes() {
     let rewritten = response["hookSpecificOutput"]["updatedInput"]["command"]
         .as_str()
         .expect("rewritten command present");
+
+    // Fix #1.1: session attribution flows via sidecar ancestry walk, never
+    // via --session-id flag injection.  The rewritten command text must be
+    // free of the flag so it can execute without "unrecognised option" errors.
     assert!(
-        rewritten.contains("--session-id=e2e-roundtrip-session"),
-        "session id must be injected: {rewritten}"
+        !rewritten.contains("--session-id"),
+        "rewritten command must NOT contain --session-id (attribution is out-of-band via sidecar): {rewritten}"
     );
 
-    // Execute the emitted tokens through the actual skim binary.
+    // The rewritten command must start with "skim" and execute successfully.
     // NOTE: split_whitespace is used for simplicity and relies on TempDir
     // producing a space-free path (standard on Linux/macOS /tmp). If the
     // temp dir ever introduces spaces, switch to a proper shell-word splitter.

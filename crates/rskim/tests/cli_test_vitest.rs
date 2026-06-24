@@ -116,13 +116,18 @@ fn test_skim_test_vitest_stdin_regex_fallback() {
 
 #[test]
 fn test_skim_test_vitest_stdin_passthrough() {
+    // Fix #3.1: passthrough with ExitSource::Stdin now returns exit 0.
+    // Unparseable stdin has no spawned process to report failure; resolve_exit_code
+    // defers to the process exit which is absent (0) for pure stdin paths.
+    // The verbatim raw content is still forwarded to stdout, and the [skim:notice]
+    // marker is still emitted to stderr via emit_markers.
     let input = "completely unparseable output";
 
     skim_cmd()
         .args(["--debug", "vitest", "run"])
         .write_stdin(input)
         .assert()
-        .failure()
+        .success()
         .stdout(predicate::str::contains("completely unparseable output"))
         .stderr(predicate::str::contains("[skim:notice]"));
 }

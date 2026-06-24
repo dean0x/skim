@@ -358,13 +358,18 @@ fn test_no_stderr_hint_on_success() {
 #[test]
 fn test_no_stderr_hint_on_passthrough() {
     // Unparseable input triggers tier 3 passthrough in vitest's own run().
-    // Vitest passthrough returns ExitCode::FAILURE but does not emit the hint
-    // because it bypasses run_parsed_command_with_mode entirely.
+    //
+    // Fix #3.1: passthrough with ExitSource::Stdin now returns exit 0 (no
+    // spawned process to report failure; resolve_exit_code defers to process
+    // exit, which is absent/0 for pure stdin paths).
+    //
+    // The hint-suppression invariant is UNCHANGED: vitest passthrough bypasses
+    // run_parsed_command_with_mode entirely, so the hint is never emitted here.
     skim_cmd()
         .args(["vitest", "run"])
         .write_stdin("completely unparseable garbage output that matches nothing\n")
         .assert()
-        .code(predicate::ne(0))
+        .code(0)
         .stderr(predicate::str::contains("[skim] compressed output").not());
 }
 

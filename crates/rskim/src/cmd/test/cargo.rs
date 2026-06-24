@@ -89,6 +89,7 @@ pub(crate) fn run(
             // errors, which fall through to the verbatim-combined tiers).
             expected_exit_codes: &[101],
             forward_stderr: false,
+            skip_net_savings_guard: false,
         },
         move |output| parse_impl(output, is_nextest),
         // Stdin fabricates exit 0 (#317 Addendum 2): derive a failure exit

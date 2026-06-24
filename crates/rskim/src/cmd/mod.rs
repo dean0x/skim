@@ -55,7 +55,7 @@ pub(crate) mod ux;
 mod dispatch;
 pub(crate) use dispatch::{dispatch, run_raw_passthrough};
 
-mod execution;
+pub(crate) mod execution;
 pub(crate) use execution::{
     OutputFormat, ParsedCommandConfig, RunContext, ToolRunConfig, combine_output,
     format_analytics_label, run_parsed_command_with_exit, run_parsed_command_with_mode, run_tool,

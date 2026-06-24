@@ -4,8 +4,7 @@ use std::process::ExitCode;
 
 use crate::cmd::extract_output_format;
 use crate::output::canonical::GitResult;
-
-use super::run_parsed_command;
+use crate::runner::CommandRunner;
 
 /// Returns `true` for flags that conflict with the `--porcelain=v2` flag the
 /// handler injects.  These are `-s`, `--short`, `--porcelain`, and any
@@ -19,12 +18,30 @@ fn is_conflicting_status_flag(s: &str) -> bool {
 /// Strips user-supplied format flags (`-s`, `--short`, `--porcelain`,
 /// `--porcelain=*`) before forwarding to git so they cannot conflict with the
 /// `--porcelain=v2` flag that the handler injects for structured parsing.
+///
+/// # C-7 / net-savings guard baseline
+///
+/// When the user typed a format-substituting flag like `--short` or `-s`, skim
+/// replaces it with `--porcelain=v2 --branch` internally.  Comparing the
+/// compressed output against the porcelain baseline would mask the expansion vs
+/// what the **user** would have seen.  To satisfy the "never expand" promise
+/// (#317) relative to the user's intent, we capture the user's literal command
+/// output and pass it as the `raw_override` to `run_parsed_command` when any
+/// substitution occurred.
+///
+/// On a large dirty repo the porcelain compression still wins — the guard is a
+/// genuine comparison, not a skip.  On a small repo the guard correctly falls
+/// through to raw `--short` output (~56 B) rather than emitting the expanded
+/// porcelain summary (~138 B).
 pub(super) fn run_status(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
+    // Detect whether the user supplied any format-substituting flags.
+    let has_conflicting = args.iter().any(|a| is_conflicting_status_flag(a.as_str()));
+
     // Strip conflicting format flags — handler injects --porcelain=v2 itself.
     let stripped_args: Vec<String> = args
         .iter()
@@ -44,13 +61,40 @@ pub(super) fn run_status(
 
     let label = super::build_analytics_label("status", args, show_stats, rec.enabled);
 
-    run_parsed_command(
+    // C-7: When the user's command was substituted, capture the raw output of
+    // the user's literal `git status <args>` so the net-savings guard compares
+    // against the right baseline.  This is NOT a skip — a large dirty repo
+    // where porcelain genuinely beats `--short` will still compress.
+    let user_raw_override: Option<String> = if has_conflicting {
+        let runner = CommandRunner::new();
+        let mut user_args: Vec<String> = global_flags.to_vec();
+        user_args.push("status".to_string());
+        user_args.extend_from_slice(args);
+        let arg_refs: Vec<&str> = user_args.iter().map(String::as_str).collect();
+        // Best-effort: if the user's command fails (e.g., not in a git repo),
+        // fall through to the normal porcelain baseline.
+        runner
+            .run("git", &arg_refs)
+            .ok()
+            .filter(|o| o.exit_code == Some(0))
+            .map(|o| crate::output::strip_ansi(&o.stdout))
+    } else {
+        None
+    };
+
+    // C-7: pass the user's literal command output as the raw override so
+    // the net-savings guard compares against the right baseline.  The
+    // credential-scrub path in run_parsed_command (PF-024) covers this call.
+    super::run_parsed_command(
         &full_args,
         show_stats,
         rec,
         output_format,
-        false,
         label,
+        super::ParsedCommandOptions {
+            combine_stderr: false,
+            raw_override: user_raw_override,
+        },
         parse_status,
     )
 }
@@ -542,6 +586,37 @@ mod tests {
             vec!["--branch", "--", "path/to/file"],
             "only conflicting flags must be stripped from mixed input"
         );
+    }
+
+    // ========================================================================
+    // C-7 / net-savings guard baseline — flag detection
+    // ========================================================================
+
+    /// `is_conflicting_status_flag` must return true for all flags that trigger
+    /// skim's substitution of `--porcelain=v2 --branch`, so that the guard uses
+    /// the user's literal command output as the "raw" baseline (C-7 requirement).
+    #[test]
+    fn test_conflicting_flag_detection_for_c7_baseline() {
+        // All substitution-triggering flags must be detected.
+        for flag in &[
+            "-s",
+            "--short",
+            "--porcelain",
+            "--porcelain=v1",
+            "--porcelain=v2",
+        ] {
+            assert!(
+                is_conflicting_status_flag(flag),
+                "{flag:?} must trigger C-7 raw-override path"
+            );
+        }
+        // Non-conflicting flags must NOT trigger the override.
+        for flag in &["--branch", "--untracked-files", "-u", "--", "HEAD"] {
+            assert!(
+                !is_conflicting_status_flag(flag),
+                "{flag:?} must NOT trigger C-7 raw-override path"
+            );
+        }
     }
 
     // ========================================================================
