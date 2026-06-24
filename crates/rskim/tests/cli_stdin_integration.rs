@@ -8,6 +8,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
+mod common;
 
 // ============================================================================
 // Stdin combination tests (exercises process_stdin)
@@ -17,8 +18,7 @@ use tempfile::TempDir;
 fn test_stdin_mode_and_stats_combined() {
     let input = "fn add(a: i32, b: i32) -> i32 { a + b }\nfn sub(x: i32, y: i32) -> i32 { x - y }";
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["-", "--lang=rust", "--mode=signatures", "--show-stats"])
         .write_stdin(input)
         .assert()
@@ -33,8 +33,7 @@ fn test_stdin_mode_and_stats_combined() {
 fn test_stdin_tokens_and_stats_combined() {
     let input = "fn add(a: i32, b: i32) -> i32 { a + b }";
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["-", "--lang=rust", "--tokens=50", "--show-stats"])
         .write_stdin(input)
         .assert()
@@ -48,8 +47,7 @@ fn test_stdin_tokens_and_stats_combined() {
 fn test_stdin_filename_tokens_mode() {
     let input = "def greet(name):\n    return f'Hello {name}'";
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args([
             "-",
             "--filename=app.py",
@@ -64,8 +62,7 @@ fn test_stdin_filename_tokens_mode() {
 
 #[test]
 fn test_stdin_empty_input() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["-", "--lang=typescript"])
         .write_stdin("")
         .assert()
@@ -76,8 +73,7 @@ fn test_stdin_empty_input() {
 #[test]
 fn test_stdin_incomplete_code() {
     // tree-sitter should handle incomplete code gracefully
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["-", "--lang=typescript"])
         .write_stdin("function incomplete() {")
         .assert()
@@ -87,8 +83,7 @@ fn test_stdin_incomplete_code() {
 
 #[test]
 fn test_stdin_binary_input_fails() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["-", "--lang=typescript"])
         .write_stdin(b"\x80\x81\x82\x00\xff" as &[u8])
         .assert()
@@ -100,8 +95,7 @@ fn test_stdin_binary_input_fails() {
 fn test_stdin_max_lines_and_stats() {
     let input = "fn a() { 1 }\nfn b() { 2 }\nfn c() { 3 }";
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["-", "--lang=rust", "--max-lines=2", "--show-stats"])
         .write_stdin(input)
         .assert()
@@ -125,8 +119,7 @@ fn test_single_file_tokens_and_stats() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["--tokens=100", "--show-stats"])
         .arg(&file)
         .assert()

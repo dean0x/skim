@@ -18,9 +18,10 @@ use predicates::prelude::*;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use tempfile::TempDir;
+mod common;
 
 fn skim_cmd() -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd
 }
@@ -1606,8 +1607,7 @@ fn fake_gh_on_path() -> (TempDir, String) {
 fn test_gh_handler_gate_fires_on_q_flag_passes_through_verbatim() {
     let (_bin_dir, new_path) = fake_gh_on_path();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env("PATH", &new_path)
         .args(["gh", "issue", "view", "93", "-q", ".body"])
@@ -1639,8 +1639,7 @@ fn test_gh_handler_gate_fires_on_q_flag_passes_through_verbatim() {
 fn test_gh_handler_gate_does_not_fire_without_steering_flag() {
     let (_bin_dir, new_path) = fake_gh_on_path();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env("PATH", &new_path)
         .args(["gh", "issue", "view", "93"])
@@ -1668,8 +1667,7 @@ fn test_gh_handler_gate_does_not_fire_without_steering_flag() {
 fn test_gh_handler_gate_fires_on_json_flag() {
     let (_bin_dir, new_path) = fake_gh_on_path();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env("PATH", &new_path)
         .args(["gh", "issue", "view", "93", "--json", "number,body"])
@@ -1696,8 +1694,7 @@ fn test_gh_handler_gate_fires_on_json_flag() {
 fn test_gh_handler_gate_api_json_does_not_passthrough() {
     let (_bin_dir, new_path) = fake_gh_on_path();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env("PATH", &new_path)
         .args(["gh", "api", "repos/o/r", "--json", "name"])

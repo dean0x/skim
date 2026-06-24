@@ -5,6 +5,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::process::Command as StdCommand;
+mod common;
 
 // ============================================================================
 // Help and basic routing
@@ -13,8 +14,7 @@ use std::process::Command as StdCommand;
 #[test]
 fn test_skim_go_help() {
     // v2.8.0: `skim go --help` — "test" is no longer a subcommand.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("go")
         .arg("--help")
         .assert()
@@ -60,8 +60,7 @@ func TestAdd(t *testing.T) {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .current_dir(dir.path())
         .arg("go")
         .arg("test")

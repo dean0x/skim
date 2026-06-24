@@ -9,6 +9,7 @@ use std::fs;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
+mod common;
 
 // ============================================================================
 // B1–B7: SKIM_CACHE_DIR relocation tests (Phase B — PF-002 fix)
@@ -29,9 +30,8 @@ fn skim_with_ts_file(cache_dir: &std::path::Path) -> (Command, std::path::PathBu
     let file_path_owned = file_path.clone();
     std::mem::forget(src_dir); // keep file alive for test duration
 
-    let mut cmd = Command::cargo_bin("skim").unwrap();
-    cmd.env("SKIM_CACHE_DIR", cache_dir.as_os_str())
-        .env("SKIM_DISABLE_ANALYTICS", "1"); // don't pollute real analytics DB
+    let mut cmd = common::skim();
+    cmd.env("SKIM_CACHE_DIR", cache_dir.as_os_str()); // analytics already OFF via common::skim()
     (cmd, file_path_owned)
 }
 
@@ -103,8 +103,7 @@ fn test_b4_skim_analytics_db_wins_over_cache_dir() {
 
     // Run skim stats (a subcommand that opens the analytics DB read-only)
     // with both vars set.  We use `skim stats` which opens the default DB.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["stats"])
         .env("SKIM_CACHE_DIR", cache_dir.path().as_os_str())
         .env("SKIM_ANALYTICS_DB", explicit_db.to_str().unwrap())
@@ -140,8 +139,7 @@ fn test_b5_default_cache_behavior_unchanged() {
     let file_path = src_dir.path().join("hello.ts");
     fs::write(&file_path, "const x: number = 1;").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .env_remove("SKIM_CACHE_DIR")
         .env_remove("SKIM_ANALYTICS_DB")
@@ -160,8 +158,7 @@ fn test_b7_empty_skim_cache_dir_does_not_error() {
     let file_path = src_dir.path().join("hello.ts");
     fs::write(&file_path, "const y: number = 2;").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .env("SKIM_CACHE_DIR", "")
         .env("SKIM_DISABLE_ANALYTICS", "1")
@@ -176,8 +173,7 @@ fn test_cache_basic_reuse() {
     fs::write(&file_path, "function test() { return 42; }").unwrap();
 
     // First run - should create cache
-    let output1 = Command::cargo_bin("skim")
-        .unwrap()
+    let output1 = common::skim()
         .arg(&file_path)
         .assert()
         .success()
@@ -186,8 +182,7 @@ fn test_cache_basic_reuse() {
         .clone();
 
     // Second run - should use cache (output should be identical)
-    let output2 = Command::cargo_bin("skim")
-        .unwrap()
+    let output2 = common::skim()
         .arg(&file_path)
         .assert()
         .success()
@@ -205,8 +200,7 @@ fn test_cache_invalidation_on_file_modification() {
     fs::write(&file_path, "function original() { return 1; }").unwrap();
 
     // First run - creates cache
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .assert()
         .success()
@@ -219,8 +213,7 @@ fn test_cache_invalidation_on_file_modification() {
     fs::write(&file_path, "function modified() { return 2; }").unwrap();
 
     // Second run - should detect mtime change and invalidate cache
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .assert()
         .success()
@@ -235,8 +228,7 @@ fn test_cache_different_modes() {
     fs::write(&file_path, "function test() { return 42; }").unwrap();
 
     // Run with structure mode
-    let structure_output = Command::cargo_bin("skim")
-        .unwrap()
+    let structure_output = common::skim()
         .arg(&file_path)
         .arg("--mode=structure")
         .assert()
@@ -246,8 +238,7 @@ fn test_cache_different_modes() {
         .clone();
 
     // Run with signatures mode (should produce different output, not use structure cache)
-    let signatures_output = Command::cargo_bin("skim")
-        .unwrap()
+    let signatures_output = common::skim()
         .arg(&file_path)
         .arg("--mode=signatures")
         .assert()
@@ -269,8 +260,7 @@ fn test_no_cache_flag() {
     fs::write(&file_path, "function test() { return 42; }").unwrap();
 
     // First run with --no-cache
-    let output1 = Command::cargo_bin("skim")
-        .unwrap()
+    let output1 = common::skim()
         .arg(&file_path)
         .arg("--no-cache")
         .assert()
@@ -280,8 +270,7 @@ fn test_no_cache_flag() {
         .clone();
 
     // Second run with --no-cache (should not use cache even if it exists)
-    let output2 = Command::cargo_bin("skim")
-        .unwrap()
+    let output2 = common::skim()
         .arg(&file_path)
         .arg("--no-cache")
         .assert()
@@ -294,11 +283,7 @@ fn test_no_cache_flag() {
     assert_eq!(output1, output2);
 
     // Third run without --no-cache should still work
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg(&file_path)
-        .assert()
-        .success();
+    common::skim().arg(&file_path).assert().success();
 }
 
 #[test]
@@ -308,26 +293,17 @@ fn test_clear_cache_command() {
     fs::write(&file_path, "function test() { return 42; }").unwrap();
 
     // Create cache by running normally
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg(&file_path)
-        .assert()
-        .success();
+    common::skim().arg(&file_path).assert().success();
 
     // Clear cache
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("--clear-cache")
         .assert()
         .success()
         .stdout(predicate::str::contains("Cache cleared successfully"));
 
     // Should still work after cache clear
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg(&file_path)
-        .assert()
-        .success();
+    common::skim().arg(&file_path).assert().success();
 }
 
 #[test]
@@ -339,8 +315,7 @@ fn test_cache_with_glob_patterns() {
     fs::write(temp_dir.path().join("file3.ts"), "function c() {}").unwrap();
 
     // First run with glob - creates cache for all files
-    let output1 = Command::cargo_bin("skim")
-        .unwrap()
+    let output1 = common::skim()
         .arg("*.ts")
         .current_dir(temp_dir.path())
         .assert()
@@ -350,8 +325,7 @@ fn test_cache_with_glob_patterns() {
         .clone();
 
     // Second run with glob - should use cache
-    let output2 = Command::cargo_bin("skim")
-        .unwrap()
+    let output2 = common::skim()
         .arg("*.ts")
         .current_dir(temp_dir.path())
         .assert()
@@ -370,8 +344,7 @@ fn test_cache_stores_token_counts() {
     fs::write(&file_path, "function test() { return 42; }").unwrap();
 
     // First run with --show-stats - should cache token counts
-    let stderr1 = Command::cargo_bin("skim")
-        .unwrap()
+    let stderr1 = common::skim()
         .arg(&file_path)
         .arg("--show-stats")
         .assert()
@@ -387,8 +360,7 @@ fn test_cache_stores_token_counts() {
     );
 
     // Second run with --show-stats - should use cached token counts
-    let stderr2 = Command::cargo_bin("skim")
-        .unwrap()
+    let stderr2 = common::skim()
         .arg(&file_path)
         .arg("--show-stats")
         .assert()
@@ -417,8 +389,7 @@ fn test_cache_with_explicit_language() {
     fs::write(&file_path, "function test() { return 42; }").unwrap();
 
     // First run with explicit language
-    let output1 = Command::cargo_bin("skim")
-        .unwrap()
+    let output1 = common::skim()
         .arg(&file_path)
         .arg("--language=typescript")
         .assert()
@@ -428,8 +399,7 @@ fn test_cache_with_explicit_language() {
         .clone();
 
     // Second run - should use cache
-    let output2 = Command::cargo_bin("skim")
-        .unwrap()
+    let output2 = common::skim()
         .arg(&file_path)
         .arg("--language=typescript")
         .assert()
@@ -448,8 +418,7 @@ fn test_no_cache_with_show_stats() {
     fs::write(&file_path, "function test() { return 42; }").unwrap();
 
     // Run with both --no-cache and --show-stats
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--no-cache")
         .arg("--show-stats")
@@ -467,15 +436,10 @@ fn test_cache_stats_computed_on_hit_when_missing() {
     fs::write(&file_path, "function test() { return 42; }").unwrap();
 
     // First run without --show-stats (caches without token counts)
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg(&file_path)
-        .assert()
-        .success();
+    common::skim().arg(&file_path).assert().success();
 
     // Second run with --show-stats (should compute tokens from cache hit)
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--show-stats")
         .assert()

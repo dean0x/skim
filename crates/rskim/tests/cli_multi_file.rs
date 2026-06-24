@@ -9,6 +9,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
+mod common;
 
 // ============================================================================
 // Happy path — multiple plain file arguments
@@ -25,8 +26,7 @@ fn test_multi_file_two_args_both_processed() {
     .unwrap();
     fs::write(temp.path().join("beta.ts"), "function beta() { return 2; }").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(temp.path().join("alpha.ts"))
         .arg(temp.path().join("beta.ts"))
         .assert()
@@ -47,8 +47,7 @@ fn test_multi_file_three_args() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(temp.path().join("one.ts"))
         .arg(temp.path().join("two.ts"))
         .arg(temp.path().join("three.ts"))
@@ -70,8 +69,7 @@ fn test_multi_file_mixed_languages() {
     .unwrap();
     fs::write(temp.path().join("script.py"), "def run():\n    pass\n").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(temp.path().join("main.rs"))
         .arg(temp.path().join("script.py"))
         .assert()
@@ -91,8 +89,7 @@ fn test_multi_file_shows_headers() {
     fs::write(temp.path().join("a.ts"), "function a() {}").unwrap();
     fs::write(temp.path().join("b.ts"), "function b() {}").unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg(temp.path().join("a.ts"))
         .arg(temp.path().join("b.ts"))
         .assert()
@@ -123,8 +120,7 @@ fn test_multi_file_no_header_flag() {
     fs::write(temp.path().join("b.ts"), "function b() {}").unwrap();
 
     // Headers use the format "// {path}" — assert none appear with --no-header
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(temp.path().join("a.ts"))
         .arg(temp.path().join("b.ts"))
         .arg("--no-header")
@@ -153,8 +149,7 @@ fn test_multi_file_signatures_mode_applied_to_all() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(temp.path().join("a.ts"))
         .arg(temp.path().join("b.ts"))
         .arg("--mode=signatures")
@@ -177,8 +172,7 @@ fn test_multi_file_nonexistent_file_warns_but_succeeds() {
 
     fs::write(temp.path().join("real.ts"), "function real() {}").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(temp.path().join("real.ts"))
         .arg(temp.path().join("ghost.ts")) // does not exist
         .assert()
@@ -192,8 +186,7 @@ fn test_multi_file_all_nonexistent_fails() {
     // When ALL specified files are missing, the command fails.
     let temp = TempDir::new().unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(temp.path().join("ghost1.ts"))
         .arg(temp.path().join("ghost2.ts"))
         .assert()
@@ -207,8 +200,7 @@ fn test_multi_file_stdin_mixed_fails() {
     let temp = TempDir::new().unwrap();
     fs::write(temp.path().join("file.ts"), "function f() {}").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg(temp.path().join("file.ts"))
         .assert()
@@ -224,8 +216,7 @@ fn test_multi_file_filename_flag_rejected() {
     fs::write(temp.path().join("file1.ts"), "function f1() {}").unwrap();
     fs::write(temp.path().join("file2.ts"), "function f2() {}").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("--filename=main.rs")
         .arg(temp.path().join("file1.ts"))
         .arg(temp.path().join("file2.ts"))
@@ -249,8 +240,7 @@ fn test_multi_file_mix_plain_and_glob() {
     // Pass explicit.ts as a plain arg and use a glob to match glob*.ts
     let glob_pattern = format!("{}/*.ts", temp.path().display());
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(temp.path().join("explicit.ts"))
         .arg(&glob_pattern)
         .assert()

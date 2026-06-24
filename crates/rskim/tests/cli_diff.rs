@@ -6,6 +6,7 @@
 use assert_cmd::Command;
 use std::fs;
 use tempfile::TempDir;
+mod common;
 
 /// Run a git command in the given directory, asserting it succeeds.
 ///
@@ -76,7 +77,7 @@ fn setup_repo_multi(files: &[(&str, &str)]) -> TempDir {
 
 /// Run `skim git diff` with additional args in the given directory.
 fn run_skim_diff(dir: &TempDir, extra_args: &[&str]) -> assert_cmd::assert::Assert {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.current_dir(dir.path());
     cmd.args(["git", "diff"]);
     cmd.args(extra_args);

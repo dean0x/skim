@@ -22,32 +22,28 @@
 //! from the child process env so the spawned skim performs real compression,
 //! matching the pattern in `cli_no_expansion_317.rs`.
 
-use assert_cmd::Command;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
+mod common;
 
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/// Return the path to the skim binary (built by cargo).
-fn skim_bin() -> std::path::PathBuf {
-    assert_cmd::cargo::cargo_bin("skim")
-}
 
 /// Read `skim stats --format json` output from an analytics DB file.
 fn read_stats_json(db: &NamedTempFile) -> serde_json::Value {
     // Give the background analytics thread time to flush.
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    // Use common::skim() (analytics OFF) to read stats from the isolated DB.
+    // SKIM_ANALYTICS_DB points at the temp file, SKIM_DISABLE_ANALYTICS is
+    // already set by common::skim() so this read-only stats call doesn't
+    // record new rows.
+    let output = common::skim()
         .arg("stats")
         .arg("--format")
         .arg("json")
         .env("SKIM_ANALYTICS_DB", db.path().as_os_str())
-        .env("SKIM_DISABLE_ANALYTICS", "1")
-        .env("NO_COLOR", "1")
         .output()
         .expect("skim stats must run");
 
@@ -87,7 +83,7 @@ fn test_show_stats_on_records_exactly_one_row() {
     let fixture = fixture_file();
 
     // Run WITH --show-stats; analytics enabled (no SKIM_DISABLE_ANALYTICS).
-    let status = std::process::Command::new(skim_bin())
+    let status = std::process::Command::new(common::skim_bin())
         .arg(fixture.as_os_str())
         .arg("--show-stats")
         .env("SKIM_ANALYTICS_DB", db.path().as_os_str())
@@ -146,7 +142,7 @@ fn test_plain_file_op_should_record_analytics_no_cache() {
 
     // Plain run: NO --show-stats, --no-cache (eliminates parser-cache state entirely),
     // analytics enabled. This mirrors the common agent invocation shape.
-    let status = std::process::Command::new(skim_bin())
+    let status = std::process::Command::new(common::skim_bin())
         .arg(fixture.as_os_str())
         .arg("--no-cache")
         .env("SKIM_ANALYTICS_DB", db.path().as_os_str())
@@ -192,8 +188,7 @@ fn test_expansion_row_stored_true_count_stats_shows_zero_saved() {
 
     // Step 1: run `skim stats` once to let skim open the DB and apply all schema
     // migrations (so the table has all expected columns including session_id).
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("stats")
         .env("SKIM_ANALYTICS_DB", db.path().as_os_str())
         .env("SKIM_DISABLE_ANALYTICS", "1")

@@ -6,6 +6,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+mod common;
 
 // ============================================================================
 // Real cargo test execution
@@ -16,8 +17,7 @@ fn test_skim_test_cargo_in_this_repo() {
     // Run `skim cargo test -p rskim-core` on skim's own repo.
     // This executes a real `cargo test` and parses the output.
     // We use -p rskim-core to limit scope and speed up the test.
-    let assert = Command::cargo_bin("skim")
-        .unwrap()
+    let assert = common::skim()
         .args(["cargo", "test", "-p", "rskim-core"])
         .env_remove("SKIM_PASSTHROUGH")
         .timeout(std::time::Duration::from_secs(120))
@@ -34,8 +34,7 @@ fn test_skim_test_cargo_in_this_repo() {
 #[test]
 fn test_skim_cargo_help() {
     // v2.8.0: `skim cargo --help` — "test" is no longer a subcommand.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["cargo", "--help"])
         .assert()
         .success()
@@ -62,8 +61,7 @@ fn test_skim_test_cargo_stdin_json() {
 {"type":"suite","event":"ok","passed":2,"failed":0,"ignored":0,"measured":0,"filtered_out":0,"exec_time":0.003}
 "#;
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["cargo", "test"])
         // Remove SKIM_PASSTHROUGH so compression is not bypassed inside the child process.
         .env_remove("SKIM_PASSTHROUGH")
@@ -85,8 +83,7 @@ fn test_skim_test_cargo_stdin_plain_text() {
         test test_five ... ok\n\n\
         test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["cargo", "test"])
         // Remove SKIM_PASSTHROUGH so compression is not bypassed inside the child process.
         .env_remove("SKIM_PASSTHROUGH")
@@ -111,8 +108,7 @@ fn test_skim_test_cargo_stdin_plain_text() {
 /// this subcommand. The help text confirms nextest is listed as supported.
 #[test]
 fn test_skim_cargo_nextest_is_listed_in_help_as_supported() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["cargo", "--help"])
         .assert()
         .success()
@@ -133,8 +129,7 @@ fn test_skim_cargo_nextest_is_listed_in_help_as_supported() {
 fn test_skim_cargo_nextest_output_piped_via_test_arm_passes_through() {
     let nextest_pass = include_str!("fixtures/cmd/test/cargo_nextest_pass.txt");
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["cargo", "test"])
         .write_stdin(nextest_pass)
         .assert()
@@ -157,8 +152,7 @@ fn test_skim_cargo_t_alias_stdin_json() {
 {"type":"suite","event":"ok","passed":1,"failed":0,"ignored":0,"measured":0,"filtered_out":0,"exec_time":0.001}
 "#;
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["cargo", "t"])
         // Remove SKIM_PASSTHROUGH so compression is not bypassed inside the child process.
         .env_remove("SKIM_PASSTHROUGH")
@@ -176,8 +170,7 @@ fn test_skim_cargo_t_alias_stdin_json() {
 /// Since the repo is already built, incremental compilation is fast.
 #[test]
 fn test_skim_cargo_b_alias_dispatches_to_build() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["cargo", "b"])
         // Must not produce an error about unknown subcommand
         .assert()
@@ -195,8 +188,7 @@ fn test_skim_cargo_b_alias_dispatches_to_build() {
 /// on stderr. This covers the `unknown` arm in `dispatch_cargo`.
 #[test]
 fn test_skim_cargo_unknown_subcommand_errors() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["cargo", "unknownthing"])
         .assert()
         .failure()
@@ -211,8 +203,7 @@ fn test_skim_cargo_unknown_subcommand_errors() {
 /// Covers the `unknown` arm in `dispatch_go`.
 #[test]
 fn test_skim_go_unknown_subcommand_errors() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["go", "unknownthing"])
         .assert()
         .failure()
@@ -223,8 +214,7 @@ fn test_skim_go_unknown_subcommand_errors() {
 /// Covers the `other` arm in `pkg::npm::run`.
 #[test]
 fn test_skim_npm_unknown_subcommand_errors() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["npm", "unknownthing"])
         .assert()
         .failure()
@@ -235,8 +225,7 @@ fn test_skim_npm_unknown_subcommand_errors() {
 /// Covers the `other` arm in `pkg::pnpm::run`.
 #[test]
 fn test_skim_pnpm_unknown_subcommand_errors() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["pnpm", "unknownthing"])
         .assert()
         .failure()
@@ -247,8 +236,7 @@ fn test_skim_pnpm_unknown_subcommand_errors() {
 /// Covers the `other` arm in `pkg::pip::run`.
 #[test]
 fn test_skim_pip_unknown_subcommand_errors() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["pip", "unknownthing"])
         .assert()
         .failure()

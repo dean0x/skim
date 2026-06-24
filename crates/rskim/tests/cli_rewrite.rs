@@ -6,6 +6,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+mod common;
 
 // ============================================================================
 // Standard rewrites
@@ -13,8 +14,7 @@ use predicates::prelude::*;
 
 #[test]
 fn test_rewrite_cargo_test_with_separator() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "cargo", "test", "--", "--nocapture"])
         .assert()
         .success()
@@ -25,8 +25,7 @@ fn test_rewrite_cargo_test_with_separator() {
 fn test_rewrite_ls_no_match() {
     // NOTE: bare `ls` now matches the catch-all rule (B.1) added in v2.5.1 and
     // IS rewritten to `skim ls` (v2.8.0 flat dispatch: was `skim file ls`).  Updated from the original no-match expectation.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "ls"])
         .assert()
         .success()
@@ -35,8 +34,7 @@ fn test_rewrite_ls_no_match() {
 
 #[test]
 fn test_rewrite_cargo_build() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "cargo", "build"])
         .assert()
         .success()
@@ -45,8 +43,7 @@ fn test_rewrite_cargo_build() {
 
 #[test]
 fn test_rewrite_go_test_with_path() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "go", "test", "./..."])
         .assert()
         .success()
@@ -55,8 +52,7 @@ fn test_rewrite_go_test_with_path() {
 
 #[test]
 fn test_rewrite_pytest_with_flag() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "pytest", "-v"])
         .assert()
         .success()
@@ -69,8 +65,7 @@ fn test_rewrite_pytest_with_flag() {
 
 #[test]
 fn test_rewrite_with_env_var() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "RUST_LOG=debug", "cargo", "test"])
         .assert()
         .success()
@@ -83,8 +78,7 @@ fn test_rewrite_with_env_var() {
 
 #[test]
 fn test_rewrite_cargo_toolchain_nightly() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "cargo", "+nightly", "test"])
         .assert()
         .success()
@@ -93,8 +87,7 @@ fn test_rewrite_cargo_toolchain_nightly() {
 
 #[test]
 fn test_rewrite_env_var_with_toolchain() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "RUST_LOG=debug", "cargo", "+nightly", "test"])
         .assert()
         .success()
@@ -110,8 +103,7 @@ fn test_rewrite_env_var_with_toolchain() {
 #[test]
 fn test_rewrite_compound_and_and() {
     // Both segments should be rewritten
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "cargo", "test", "&&", "cargo", "build"])
         .assert()
         .success()
@@ -123,8 +115,7 @@ fn test_rewrite_compound_and_and() {
 #[test]
 fn test_rewrite_compound_pipe_never_rewritten() {
     // #317 (user-approved): pipe expressions are never rewritten — exit 1.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("cargo test | head\n")
         .assert()
@@ -134,8 +125,7 @@ fn test_rewrite_compound_pipe_never_rewritten() {
 
 #[test]
 fn test_rewrite_compound_semicolon() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "cargo", "test", ";", "echo", "done"])
         .assert()
         .success()
@@ -147,8 +137,7 @@ fn test_rewrite_compound_semicolon() {
 #[test]
 fn test_rewrite_compound_bail_on_subshell() {
     // $( triggers bail — exit 1
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("$(command) && cargo test\n")
         .assert()
@@ -158,8 +147,7 @@ fn test_rewrite_compound_bail_on_subshell() {
 #[test]
 fn test_rewrite_compound_suggest_mode() {
     // Suggest mode should include compound: true for compound commands
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args([
             "rewrite",
             "--suggest",
@@ -182,8 +170,7 @@ fn test_rewrite_compound_suggest_mode() {
 #[test]
 fn test_rewrite_compound_or_or() {
     // || operator should work in integration tests
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("cargo test || echo fail\n")
         .assert()
@@ -196,8 +183,7 @@ fn test_rewrite_compound_or_or() {
 #[test]
 fn test_rewrite_compound_no_spaces_around_operator() {
     // Operators without surrounding spaces (e.g., cargo test&&cargo build)
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("cargo test&&cargo build\n")
         .assert()
@@ -210,8 +196,7 @@ fn test_rewrite_compound_no_spaces_around_operator() {
 #[test]
 fn test_rewrite_compound_escaped_quotes() {
     // Escaped double quotes inside a quoted string should not break splitting
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("echo \"say \\\"hello\\\"\" && cargo test\n")
         .assert()
@@ -223,8 +208,7 @@ fn test_rewrite_compound_escaped_quotes() {
 fn test_rewrite_compound_mixed_pipe_and_sequential() {
     // Mixed pipe + sequential: ANY top-level pipe makes the whole expression
     // pass through untouched (#317) — exit 1.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("cargo test && cargo build | head\n")
         .assert()
@@ -235,8 +219,7 @@ fn test_rewrite_compound_mixed_pipe_and_sequential() {
 #[test]
 fn test_rewrite_compound_bail_on_variable_expansion() {
     // ${ triggers bail — exit 1
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("${CARGO:-cargo} test && echo done\n")
         .assert()
@@ -249,8 +232,7 @@ fn test_rewrite_compound_bail_on_variable_expansion() {
 
 #[test]
 fn test_rewrite_redirect_stderr_to_stdout() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("cargo test 2>&1\n")
         .assert()
@@ -262,8 +244,7 @@ fn test_rewrite_redirect_stderr_to_stdout() {
 fn test_rewrite_redirect_stderr_to_stdout_pipe() {
     // #317: pipes never rewrite — redirects in the producer are preserved
     // implicitly because the ORIGINAL command runs unchanged.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("cargo test 2>&1 | head\n")
         .assert()
@@ -273,8 +254,7 @@ fn test_rewrite_redirect_stderr_to_stdout_pipe() {
 
 #[test]
 fn test_rewrite_redirect_stderr_to_stdout_compound() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("cargo test 2>&1 && cargo build\n")
         .assert()
@@ -286,8 +266,7 @@ fn test_rewrite_redirect_stderr_to_stdout_compound() {
 
 #[test]
 fn test_rewrite_redirect_stderr_to_devnull() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("cargo test 2>/dev/null\n")
         .assert()
@@ -297,8 +276,7 @@ fn test_rewrite_redirect_stderr_to_devnull() {
 
 #[test]
 fn test_rewrite_redirect_stdout_to_file() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("cargo test > output.txt\n")
         .assert()
@@ -308,8 +286,7 @@ fn test_rewrite_redirect_stdout_to_file() {
 
 #[test]
 fn test_rewrite_redirect_both_to_file() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("cargo test &> output.txt\n")
         .assert()
@@ -320,8 +297,7 @@ fn test_rewrite_redirect_both_to_file() {
 #[test]
 fn test_rewrite_redirect_git_with_skip_flags() {
     // Redirect must not trigger skip_if_flag_prefix (--porcelain, --stat, etc.)
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("git status 2>&1\n")
         .assert()
@@ -337,8 +313,7 @@ fn test_rewrite_redirect_git_with_skip_flags() {
 /// The log handler detects --format via user_has_flag and passthroughs to git.
 #[test]
 fn test_rewrite_git_log_format_rewrites() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "git", "log", "--format=%H"])
         .assert()
         .success()
@@ -347,8 +322,7 @@ fn test_rewrite_git_log_format_rewrites() {
 
 #[test]
 fn test_rewrite_git_status_success() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "git", "status"])
         .assert()
         .success()
@@ -359,8 +333,7 @@ fn test_rewrite_git_status_success() {
 /// The diff handler detects --stat via user_has_flag and passthroughs to git.
 #[test]
 fn test_rewrite_git_diff_stat_rewrites() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "git", "diff", "--stat"])
         .assert()
         .success()
@@ -370,8 +343,7 @@ fn test_rewrite_git_diff_stat_rewrites() {
 /// `git diff --staged` rewrites after engine strict-match fix (AD-RW-1).
 #[test]
 fn test_rewrite_git_diff_staged_rewrites() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "git", "diff", "--staged"])
         .assert()
         .success()
@@ -381,8 +353,7 @@ fn test_rewrite_git_diff_staged_rewrites() {
 /// `git diff --name-only` rewrites (AD-RW-4: --name-only removed from skip list).
 #[test]
 fn test_rewrite_git_diff_name_only_rewrites() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "git", "diff", "--name-only"])
         .assert()
         .success()
@@ -392,8 +363,7 @@ fn test_rewrite_git_diff_name_only_rewrites() {
 /// `git show HEAD` rewrites (new rule, AD-GIT-5).
 #[test]
 fn test_rewrite_git_show_rewrites() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "git", "show", "HEAD"])
         .assert()
         .success()
@@ -403,8 +373,7 @@ fn test_rewrite_git_show_rewrites() {
 /// `git show HEAD:src/main.rs` rewrites (new rule, AD-GIT-5).
 #[test]
 fn test_rewrite_git_show_file_content_rewrites() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "git", "show", "HEAD:src/main.rs"])
         .assert()
         .success()
@@ -414,8 +383,7 @@ fn test_rewrite_git_show_file_content_rewrites() {
 /// `git worktree list` is AlreadyCompact (AD-RW-2/AD-RW-3): exits 0 and prints original.
 #[test]
 fn test_rewrite_git_worktree_list_already_compact() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "git", "worktree", "list"])
         .assert()
         .success()
@@ -425,8 +393,7 @@ fn test_rewrite_git_worktree_list_already_compact() {
 /// `git worktree list --porcelain` is also AlreadyCompact (prefix match).
 #[test]
 fn test_rewrite_git_worktree_list_porcelain_already_compact() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "git", "worktree", "list", "--porcelain"])
         .assert()
         .success()
@@ -437,8 +404,7 @@ fn test_rewrite_git_worktree_list_porcelain_already_compact() {
 /// show segment is rewritten (AD-RW-2 compound behavior uses original try_rewrite_compound).
 #[test]
 fn test_rewrite_compound_worktree_list_and_git_show() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("git worktree list && git show HEAD\n")
         .assert()
@@ -452,8 +418,7 @@ fn test_rewrite_compound_worktree_list_and_git_show() {
 
 #[test]
 fn test_suggest_mode_match() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "--suggest", "cargo", "test"])
         .assert()
         .success()
@@ -465,8 +430,7 @@ fn test_suggest_mode_match() {
 fn test_suggest_mode_no_match() {
     // NOTE: bare `ls` now matches the catch-all rule (B.1, v2.5.1) — use `echo`
     // as a stable non-rewritable example.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "--suggest", "echo", "hello"])
         .assert()
         .success()
@@ -479,8 +443,7 @@ fn test_suggest_mode_no_match() {
 
 #[test]
 fn test_rewrite_stdin_cargo_test() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("cargo test\n")
         .assert()
@@ -494,8 +457,7 @@ fn test_rewrite_stdin_cargo_test() {
 
 #[test]
 fn test_rewrite_cat_code_file() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "cat", "src/main.rs"])
         .assert()
         .success()
@@ -504,8 +466,7 @@ fn test_rewrite_cat_code_file() {
 
 #[test]
 fn test_rewrite_cat_squeeze_blanks() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "cat", "-s", "file.ts"])
         .assert()
         .success()
@@ -514,8 +475,7 @@ fn test_rewrite_cat_squeeze_blanks() {
 
 #[test]
 fn test_rewrite_cat_line_numbers_rejected() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "cat", "-n", "file.ts"])
         .assert()
         .failure();
@@ -523,8 +483,7 @@ fn test_rewrite_cat_line_numbers_rejected() {
 
 #[test]
 fn test_rewrite_head_with_count() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "head", "-20", "file.ts"])
         .assert()
         .success()
@@ -534,8 +493,7 @@ fn test_rewrite_head_with_count() {
 
 #[test]
 fn test_rewrite_head_n_space() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "head", "-n", "50", "file.py"])
         .assert()
         .success()
@@ -545,8 +503,7 @@ fn test_rewrite_head_n_space() {
 
 #[test]
 fn test_rewrite_tail_with_count() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "tail", "-20", "file.rs"])
         .assert()
         .success()
@@ -556,8 +513,7 @@ fn test_rewrite_tail_with_count() {
 
 #[test]
 fn test_rewrite_tail_non_code_rejected() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "tail", "-20", "data.csv"])
         .assert()
         .failure();
@@ -565,8 +521,7 @@ fn test_rewrite_tail_non_code_rejected() {
 
 #[test]
 fn test_rewrite_cat_non_code_rejected() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "cat", "data.csv"])
         .assert()
         .failure();
@@ -578,8 +533,7 @@ fn test_rewrite_cat_non_code_rejected() {
 
 #[test]
 fn test_rewrite_nextest() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "cargo", "nextest", "run"])
         .assert()
         .success()
@@ -592,8 +546,7 @@ fn test_rewrite_nextest() {
 
 #[test]
 fn test_suggest_mode_stdin_match() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "--suggest"])
         .write_stdin("cargo test\n")
         .assert()
@@ -605,8 +558,7 @@ fn test_suggest_mode_stdin_match() {
 fn test_suggest_mode_stdin_no_match() {
     // NOTE: bare `ls` now matches the catch-all rule (B.1, v2.5.1) — use `echo`
     // as a stable non-rewritable example.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "--suggest"])
         .write_stdin("echo hello\n")
         .assert()
@@ -620,8 +572,7 @@ fn test_suggest_mode_stdin_no_match() {
 
 #[test]
 fn test_rewrite_help() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "--help"])
         .assert()
         .success()
@@ -631,8 +582,7 @@ fn test_rewrite_help() {
 
 #[test]
 fn test_rewrite_short_help() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "-h"])
         .assert()
         .success()
@@ -647,8 +597,7 @@ fn test_rewrite_short_help() {
 /// consumed by `head` and rewriting would break the pipeline.  (AD-RW-2)
 #[test]
 fn test_find_pipe_not_rewritten() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("find . -name foo | head\n")
         .assert()
@@ -658,8 +607,7 @@ fn test_find_pipe_not_rewritten() {
 /// `rg pattern | head` must NOT be rewritten on the pipe source. (AD-RW-2)
 #[test]
 fn test_rg_pipe_not_rewritten() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("rg pattern | head\n")
         .assert()
@@ -669,8 +617,7 @@ fn test_rg_pipe_not_rewritten() {
 /// Standalone `find . -name foo` (no pipe) SHOULD still be rewritten.
 #[test]
 fn test_find_standalone_rewritten() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("find . -name foo\n")
         .assert()
@@ -681,8 +628,7 @@ fn test_find_standalone_rewritten() {
 /// Standalone `rg pattern` (no pipe) SHOULD still be rewritten.
 #[test]
 fn test_rg_standalone_rewritten() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("rg pattern\n")
         .assert()
@@ -694,8 +640,7 @@ fn test_rg_standalone_rewritten() {
 /// Pipe-source exclusion only applies to `|`, not `||` or `&&`.
 #[test]
 fn test_find_or_chain_still_rewritten() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("find . || echo fail\n")
         .assert()
@@ -710,8 +655,7 @@ fn test_find_or_chain_still_rewritten() {
 /// `ls --help` must NOT be rewritten — informational invocations pass through.
 #[test]
 fn test_rewrite_ls_help_passthrough() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("ls --help\n")
         .assert()
@@ -721,8 +665,7 @@ fn test_rewrite_ls_help_passthrough() {
 /// `grep --version` must NOT be rewritten.
 #[test]
 fn test_rewrite_grep_version_passthrough() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("grep --version\n")
         .assert()
@@ -732,8 +675,7 @@ fn test_rewrite_grep_version_passthrough() {
 /// `ls | head` — catch-all ls rule is excluded on pipe source (AD-RW-2).
 #[test]
 fn test_rewrite_ls_pipe_excluded() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("rewrite")
         .write_stdin("ls | head\n")
         .assert()
@@ -745,8 +687,7 @@ fn test_rewrite_ls_pipe_excluded() {
 fn test_rewrite_ls_catch_all_matches() {
     // NOTE: bare `ls` matches the catch-all rule (B.1) added in v2.5.1 and
     // IS rewritten to `skim ls` when NOT on the source side of a pipe (v2.8.0 flat dispatch).
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "ls"])
         .assert()
         .success()

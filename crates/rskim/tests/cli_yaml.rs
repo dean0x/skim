@@ -6,6 +6,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
+mod common;
 
 // ============================================================================
 // Basic Structure Tests
@@ -25,8 +26,7 @@ active: true
     )
     .unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("structure")
@@ -68,8 +68,7 @@ fn test_yaml_nested_structure() {
     )
     .unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg(&file_path)
         .assert()
         .success()
@@ -119,8 +118,7 @@ metadata:
     )
     .unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg(&file_path)
         .assert()
         .success()
@@ -162,8 +160,7 @@ nested:
     fs::write(&file_path, yaml_content).unwrap();
 
     // Get output for each mode
-    let structure_output = Command::cargo_bin("skim")
-        .unwrap()
+    let structure_output = common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("structure")
@@ -173,8 +170,7 @@ nested:
         .stdout
         .clone();
 
-    let signatures_output = Command::cargo_bin("skim")
-        .unwrap()
+    let signatures_output = common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("signatures")
@@ -184,8 +180,7 @@ nested:
         .stdout
         .clone();
 
-    let types_output = Command::cargo_bin("skim")
-        .unwrap()
+    let types_output = common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("types")
@@ -195,8 +190,7 @@ nested:
         .stdout
         .clone();
 
-    let full_output = Command::cargo_bin("skim")
-        .unwrap()
+    let full_output = common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("full")
@@ -229,8 +223,7 @@ fn test_yaml_auto_detection_yaml_extension() {
     let file_path = temp_dir.path().join("config.yaml");
     fs::write(&file_path, "key: value").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .assert()
         .success()
@@ -244,8 +237,7 @@ fn test_yaml_auto_detection_yml_extension() {
     let file_path = temp_dir.path().join("config.yml");
     fs::write(&file_path, "key: value").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .assert()
         .success()
@@ -263,8 +255,7 @@ fn test_yaml_from_stdin() {
 value: 42
 "#;
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg("-")
         .arg("--language")
         .arg("yaml")
@@ -287,8 +278,7 @@ value: 42
 fn test_yaml_from_stdin_yml_alias() {
     let yaml_content = "key: value";
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--language")
         .arg("yml")
@@ -308,11 +298,7 @@ fn test_yaml_empty_file() {
     let file_path = temp_dir.path().join("empty.yaml");
     fs::write(&file_path, "").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg(&file_path)
-        .assert()
-        .success();
+    common::skim().arg(&file_path).assert().success();
 }
 
 #[test]
@@ -321,8 +307,7 @@ fn test_yaml_invalid_syntax() {
     let file_path = temp_dir.path().join("invalid.yaml");
     fs::write(&file_path, "invalid: [unclosed").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .assert()
         .failure()
@@ -347,8 +332,7 @@ tags:
     )
     .unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg(&file_path)
         .assert()
         .success()
@@ -418,8 +402,7 @@ spec:
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .assert()
         .success()
@@ -458,8 +441,7 @@ jobs:
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .assert()
         .success()
@@ -492,8 +474,7 @@ fn test_yaml_show_stats() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--show-stats")
         .assert()

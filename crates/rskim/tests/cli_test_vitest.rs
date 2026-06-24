@@ -5,6 +5,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::PathBuf;
+mod common;
 
 fn fixture_path(name: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -22,7 +23,7 @@ fn read_fixture(name: &str) -> String {
 }
 
 fn skim_cmd() -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd
 }
@@ -170,8 +171,7 @@ fn test_vitest_with_args_does_not_read_stdin() {
     //
     // The key assertion: stdout must NOT be empty. Skim spawns vitest run (which
     // is not installed), producing an error message on stdout.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env_remove("SKIM_DEBUG")
         .arg("vitest")
@@ -183,8 +183,7 @@ fn test_vitest_with_args_does_not_read_stdin() {
 
 #[test]
 fn test_jest_with_args_does_not_read_stdin() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env_remove("SKIM_DEBUG")
         .arg("jest")

@@ -13,6 +13,7 @@
 
 use assert_cmd::Command;
 use std::path::PathBuf;
+mod common;
 
 /// Path to the fixture file used to capture the golden.
 fn golden_fixture() -> PathBuf {
@@ -31,8 +32,7 @@ fn ac13_show_stats_exact_golden() {
     let fixture = golden_fixture();
     assert!(fixture.exists(), "Golden fixture must exist: {:?}", fixture);
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg(fixture.to_str().unwrap())
         .arg("--show-stats")
         .env_remove("SKIM_PASSTHROUGH")
