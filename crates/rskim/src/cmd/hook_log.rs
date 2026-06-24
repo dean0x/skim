@@ -37,11 +37,12 @@ impl CacheEnv {
 
     /// Resolve the skim cache directory using the injected override or
     /// platform default (`dirs::cache_dir()/skim`).
+    ///
+    /// Delegates to [`crate::cache::cache_root_from`] so that the resolution
+    /// convention is kept in a single place (fixes PF-002). Empty overrides are
+    /// treated as unset (hardening against `SKIM_CACHE_DIR=""`).
     pub fn resolve_cache_dir(&self) -> Option<std::path::PathBuf> {
-        if let Some(dir) = &self.cache_dir_override {
-            return Some(dir.clone());
-        }
-        dirs::cache_dir().map(|c| c.join("skim"))
+        crate::cache::cache_root_from(self.cache_dir_override.clone())
     }
 }
 

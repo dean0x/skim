@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Unified `SKIM_CACHE_DIR` resolution — honored by all cache subsystems (#359 Phase B)** —
+  Previously `SKIM_CACHE_DIR` was silently ignored by the parser cache and the default
+  `analytics.db` path (`cache::get_cache_dir` read only `dirs::cache_dir()`) while the
+  search index and hook log respected it. This caused partial relocation: some skim state
+  moved, some stayed under `~/.cache/skim` (PF-002).
+
+  The fix introduces a single source of truth:
+  - `cache::cache_root_from(override_dir)` — pure resolver (no I/O); filters empty paths.
+  - `cache::cache_root()` — reads `SKIM_CACHE_DIR` and delegates to `cache_root_from`.
+  - `cache::get_cache_dir()` now calls `cache_root()` before the mkdir/chmod block.
+  - `cmd::hook_log::CacheEnv::resolve_cache_dir()` now delegates to `cache::cache_root_from`
+    instead of its own inline resolver.
+
+  **Behavior change:** `SKIM_CACHE_DIR` now also relocates the default `analytics.db`
+  (previously it did not). `SKIM_ANALYTICS_DB` still takes precedence over the relocated
+  default when explicitly set. Empty `SKIM_CACHE_DIR` is treated as unset (falls back to
+  the platform default `~/.cache/skim`).
+
 ### Added
 - **`rskim-tokens` crate (L3 Wave-1)** — Multi-provider token counting library (cl100k /
   o200k / Anthropic-offline / heuristic). Default build is HTTP-free; `net-anthropic` feature

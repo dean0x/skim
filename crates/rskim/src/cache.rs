@@ -2,9 +2,15 @@
 //!
 //! ARCHITECTURE: Cache transformed results with mtime-based invalidation.
 //! - Cache key: SHA256(canonical_path + mtime_secs + mode)
-//! - Cache location: ~/.cache/skim/ (platform-specific)
+//! - Cache location: $SKIM_CACHE_DIR or ~/.cache/skim/ (platform-specific)
 //! - Invalidation: File mtime change or mode change
 //! - Storage format: JSON with metadata
+//!
+//! # Cache-directory resolution (PF-002 fix)
+//!
+//! All skim cache subsystems (parser cache, tee output, default analytics.db)
+//! resolve their root through [`cache_root`] / [`cache_root_from`] so that
+//! `SKIM_CACHE_DIR` reliably relocates ALL cache state.
 
 use anyhow::Result;
 use rskim_core::Mode;
@@ -15,6 +21,34 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::cascade::TruncationOptions;
+
+// ============================================================================
+// Single-source-of-truth cache-root resolvers (fixes PF-002)
+// ============================================================================
+
+/// Resolve the cache root from an explicit override or the platform default.
+///
+/// Convention (locked — avoids PF-002):
+/// - If `override_dir` is `Some(p)` and `p` is non-empty, use `p` as-is
+///   (caller's explicit override wins; we do NOT append `skim`).
+/// - An empty path is treated as unset (hardening against `SKIM_CACHE_DIR=""`).
+/// - Otherwise fall back to `dirs::cache_dir().join("skim")`.
+///
+/// This function is **pure** — it performs no I/O, no mkdir.
+pub(crate) fn cache_root_from(override_dir: Option<PathBuf>) -> Option<PathBuf> {
+    override_dir
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| dirs::cache_dir().map(|c| c.join("skim")))
+}
+
+/// Resolve the cache root from the process environment.
+///
+/// Reads `SKIM_CACHE_DIR`; delegates to [`cache_root_from`].
+/// This function is the single source of truth for cache-root resolution
+/// and must be kept in sync with `cmd::hook_log::CacheEnv::resolve_cache_dir`.
+pub(crate) fn cache_root() -> Option<PathBuf> {
+    cache_root_from(std::env::var_os("SKIM_CACHE_DIR").map(PathBuf::from))
+}
 
 /// Cache entry with metadata for validation.
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,12 +115,15 @@ pub(crate) struct CacheWriteParams<'a> {
     pub(crate) line_numbers: bool,
 }
 
-/// Returns the platform-specific cache directory (`~/.cache/skim/` on Linux/macOS),
-/// creating it with owner-only permissions if it does not yet exist.
+/// Returns the skim cache directory, creating it with owner-only permissions if it does not
+/// yet exist.
+///
+/// Honors `SKIM_CACHE_DIR` (via [`cache_root`]) so that ALL subsystems that call this
+/// function — parser cache, tee output, and the default analytics.db path — relocate
+/// consistently when the env var is set. Fixes PF-002.
 pub(crate) fn get_cache_dir() -> Result<PathBuf> {
-    let cache_dir = dirs::cache_dir()
-        .ok_or_else(|| anyhow::anyhow!("Failed to determine cache directory"))?
-        .join("skim");
+    let cache_dir =
+        cache_root().ok_or_else(|| anyhow::anyhow!("Failed to determine cache directory"))?;
 
     #[cfg(unix)]
     {
@@ -243,6 +280,103 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    // ========================================================================
+    // C2: single-source-of-truth contract
+    // cache::cache_root() and cmd::resolve_cache_dir() (which delegates to
+    // hook_log::CacheEnv::from_process().resolve_cache_dir()) must agree for
+    // the SAME env state (avoids PF-002 regression).
+    //
+    // Note: hook_log is a private module; we access it through the pub(crate)
+    // re-export cmd::resolve_cache_dir which already delegates to CacheEnv.
+    // ========================================================================
+
+    /// C2: Assert cache::cache_root() == cmd::resolve_cache_dir() for the same env
+    /// state, proving single-source-of-truth for cache-dir resolution (PF-002 guard).
+    ///
+    /// Uses #[serial_test::serial] to prevent env-var mutation races.
+    #[test]
+    #[serial_test::serial]
+    fn test_c2_cache_root_agrees_with_cmd_resolver_no_override() {
+        // Safety: serial ensures we are single-threaded when touching env vars.
+        // Unset SKIM_CACHE_DIR to test default resolution path.
+        // SAFETY: test-only, serial-gated.
+        unsafe { std::env::remove_var("SKIM_CACHE_DIR") };
+
+        let from_cache = cache_root();
+        // cmd::resolve_cache_dir() delegates to CacheEnv::from_process().resolve_cache_dir()
+        let from_cmd = crate::cmd::resolve_cache_dir();
+
+        assert_eq!(
+            from_cache, from_cmd,
+            "cache_root() and cmd::resolve_cache_dir() must agree \
+             (PF-002 regression guard — SKIM_CACHE_DIR unset)"
+        );
+    }
+
+    /// C2 override path: both resolvers agree when SKIM_CACHE_DIR is set.
+    #[test]
+    #[serial_test::serial]
+    fn test_c2_cache_root_agrees_with_cmd_resolver_with_override() {
+        // SAFETY: test-only, serial-gated.
+        unsafe { std::env::set_var("SKIM_CACHE_DIR", "/tmp/skim-test-cache-c2") };
+
+        let from_cache = cache_root();
+        // cmd::resolve_cache_dir() delegates to CacheEnv::from_process().resolve_cache_dir()
+        let from_cmd = crate::cmd::resolve_cache_dir();
+
+        // Restore before any assertion can fail.
+        unsafe { std::env::remove_var("SKIM_CACHE_DIR") };
+
+        assert_eq!(
+            from_cache, from_cmd,
+            "cache_root() and cmd::resolve_cache_dir() must agree \
+             (PF-002 regression guard — SKIM_CACHE_DIR set)"
+        );
+
+        // Also assert the expected resolved path.
+        assert_eq!(
+            from_cache,
+            Some(std::path::PathBuf::from("/tmp/skim-test-cache-c2")),
+            "SKIM_CACHE_DIR should be used as-is (no 'skim' suffix appended)"
+        );
+    }
+
+    /// B7: empty SKIM_CACHE_DIR is treated as unset — falls back to platform default.
+    #[test]
+    #[serial_test::serial]
+    fn test_b7_empty_skim_cache_dir_treated_as_unset() {
+        // SAFETY: test-only, serial-gated.
+        unsafe { std::env::set_var("SKIM_CACHE_DIR", "") };
+        let with_empty = cache_root();
+        unsafe { std::env::remove_var("SKIM_CACHE_DIR") };
+        let without = cache_root();
+
+        assert_eq!(
+            with_empty, without,
+            "Empty SKIM_CACHE_DIR must fall back to platform default (B7)"
+        );
+        // Both should resolve to the platform default (~/.cache/skim).
+        assert!(
+            with_empty.is_some(),
+            "Platform default must be available (dirs::cache_dir works)"
+        );
+    }
+
+    /// B5: neither SKIM_CACHE_DIR nor SKIM_ANALYTICS_DB set => default path unchanged.
+    #[test]
+    #[serial_test::serial]
+    fn test_b5_default_path_uses_platform_cache_dir() {
+        // SAFETY: test-only, serial-gated.
+        unsafe { std::env::remove_var("SKIM_CACHE_DIR") };
+
+        let root = cache_root();
+        let expected = dirs::cache_dir().map(|c| c.join("skim"));
+        assert_eq!(
+            root, expected,
+            "Default cache root must be ~/.cache/skim (B5)"
+        );
+    }
 
     #[test]
     fn test_cache_key_generation() {

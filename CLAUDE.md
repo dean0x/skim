@@ -97,7 +97,15 @@ skim intercepts a sub-agent's shell command through **two independent mechanisms
 - `SKIM_PASSTHROUGH=1` — bypass all compression (use when compressed output hides an error). Indefinite commands (`vite dev`, `jest --watch`, bare `skim vitest`) auto-pass-through live; use `skim vitest run` for a compressed one-shot.
 - `SKIM_DEBUG=1` (or `--debug`) — warnings/notices on stderr.
 - `SKIM_SESSION_ID` — analytics session attribution; priority sidecar > env > `--session-id` flag (flag is a forward-compat fallback only — the hook no longer injects it). Set it alongside the PATH export so sub-agents inherit it.
-- `SKIM_CACHE_DIR` / `SKIM_ANALYTICS_DB` — override the cache dir / analytics DB path.
+- `SKIM_CACHE_DIR` — relocates **all** skim cache state: parser cache (`.json` files),
+  tee output (`tee/`), and the **default** `analytics.db` location. An empty value is
+  treated as unset (falls back to `~/.cache/skim`). The path is used as-is (no `skim`
+  suffix is appended by the resolver).
+- `SKIM_ANALYTICS_DB` — overrides the analytics DB path directly; **takes precedence over
+  `SKIM_CACHE_DIR`** for the DB location. When `SKIM_ANALYTICS_DB` is set, the DB is
+  opened at that exact path regardless of `SKIM_CACHE_DIR`. To isolate all skim state
+  in a sandbox it is sufficient to set `SKIM_CACHE_DIR` alone (the default analytics.db
+  moves with it).
 - `SKIM_DISABLE_ANALYTICS=1` — disable recording. `SKIM_INPUT_COST_PER_MTOK` — $/MTok for cost estimates (default 3.0).
 - Session-provider overrides for `discover`/`learn`/`agents`: `SKIM_PROJECTS_DIR`, `SKIM_CODEX_SESSIONS_DIR`, `SKIM_COPILOT_DIR`, `SKIM_CURSOR_DB_PATH`, `SKIM_GEMINI_DIR`, `SKIM_CRUSH_DIR`.
 

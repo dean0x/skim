@@ -1,6 +1,7 @@
 //! CLI integration tests for caching functionality
 //!
-//! Tests cache creation, reuse, invalidation, and --no-cache flag
+//! Tests cache creation, reuse, invalidation, --no-cache flag,
+//! and SKIM_CACHE_DIR / SKIM_ANALYTICS_DB env var behavior (B1–B7, PF-002 fix).
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -8,6 +9,165 @@ use std::fs;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
+
+// ============================================================================
+// B1–B7: SKIM_CACHE_DIR relocation tests (Phase B — PF-002 fix)
+// ============================================================================
+
+/// Helper: build a basic skim invocation against a temp TypeScript file.
+fn skim_with_ts_file(cache_dir: &std::path::Path) -> (Command, std::path::PathBuf) {
+    let src_dir = TempDir::new().unwrap();
+    let file_path = src_dir.path().join("test.ts");
+    fs::write(
+        &file_path,
+        "function greet(name: string): string { return `Hello ${name}`; }",
+    )
+    .unwrap();
+
+    // Leak the TempDir so the file outlives the command; callers that need it can
+    // take ownership.  For path-only tests we just need the PathBuf.
+    let file_path_owned = file_path.clone();
+    std::mem::forget(src_dir); // keep file alive for test duration
+
+    let mut cmd = Command::cargo_bin("skim").unwrap();
+    cmd.env("SKIM_CACHE_DIR", cache_dir.as_os_str())
+        .env("SKIM_DISABLE_ANALYTICS", "1"); // don't pollute real analytics DB
+    (cmd, file_path_owned)
+}
+
+/// B2: SKIM_CACHE_DIR relocates parser-cache entries.
+///
+/// After running skim with SKIM_CACHE_DIR=<dir>, JSON cache files must appear
+/// directly under <dir> (not under ~/.cache/skim).
+#[test]
+fn test_b2_skim_cache_dir_relocates_parser_cache() {
+    let cache_dir = TempDir::new().unwrap();
+    let (mut cmd, file_path) = skim_with_ts_file(cache_dir.path());
+    cmd.arg(&file_path).assert().success();
+
+    // At least one .json cache file should land under <cache_dir>
+    let json_files: Vec<_> = fs::read_dir(cache_dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .collect();
+
+    assert!(
+        !json_files.is_empty(),
+        "B2: parser-cache .json files must land under SKIM_CACHE_DIR={}, found none. \
+         Default cache dir may be in use instead.",
+        cache_dir.path().display()
+    );
+}
+
+/// B3: SKIM_CACHE_DIR relocates tee output directory.
+///
+/// This is a structural test — we verify get_cache_dir() respects SKIM_CACHE_DIR
+/// by confirming that skim creates its cache structure under the override dir.
+/// (Tee files only appear on command failure, but the tee directory creation
+/// is gated through get_cache_dir, which now honors SKIM_CACHE_DIR.)
+#[test]
+fn test_b3_skim_cache_dir_relocates_tee_dir() {
+    let cache_dir = TempDir::new().unwrap();
+    let (mut cmd, file_path) = skim_with_ts_file(cache_dir.path());
+    cmd.arg(&file_path).assert().success();
+
+    // After a run, the cache root should exist under override dir
+    // (even if the tee subdir isn't created until a failure occurs)
+    assert!(
+        cache_dir.path().exists(),
+        "B3: SKIM_CACHE_DIR directory should exist after a skim run"
+    );
+
+    // The parser cache files demonstrate the root is the override dir,
+    // which means tee (which calls get_cache_dir() + /tee) also points there.
+    let entries: Vec<_> = fs::read_dir(cache_dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "B3: cache root must have entries under SKIM_CACHE_DIR (tee roots here)"
+    );
+}
+
+/// B4: SKIM_ANALYTICS_DB wins over SKIM_CACHE_DIR for the analytics DB path.
+///
+/// When both are set, the DB is created at SKIM_ANALYTICS_DB, NOT at
+/// <SKIM_CACHE_DIR>/analytics.db.
+#[test]
+fn test_b4_skim_analytics_db_wins_over_cache_dir() {
+    let cache_dir = TempDir::new().unwrap();
+    let analytics_dir = TempDir::new().unwrap();
+    let explicit_db = analytics_dir.path().join("my-analytics.db");
+
+    // Run skim stats (a subcommand that opens the analytics DB read-only)
+    // with both vars set.  We use `skim stats` which opens the default DB.
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["stats"])
+        .env("SKIM_CACHE_DIR", cache_dir.path().as_os_str())
+        .env("SKIM_ANALYTICS_DB", explicit_db.to_str().unwrap())
+        .assert()
+        .success();
+
+    // The DB must appear at the explicit path, NOT under <cache_dir>.
+    assert!(
+        explicit_db.exists(),
+        "B4: SKIM_ANALYTICS_DB must take precedence — db should exist at {}, \
+         not under SKIM_CACHE_DIR={}",
+        explicit_db.display(),
+        cache_dir.path().display()
+    );
+
+    let default_db = cache_dir.path().join("analytics.db");
+    assert!(
+        !default_db.exists(),
+        "B4: <SKIM_CACHE_DIR>/analytics.db must NOT be created when SKIM_ANALYTICS_DB is set, \
+         but found: {}",
+        default_db.display()
+    );
+}
+
+/// B5: Neither SKIM_CACHE_DIR nor SKIM_ANALYTICS_DB set => default path unchanged.
+///
+/// We can only verify the absence of regressions here (the default location is
+/// the real ~/.cache/skim which we must not corrupt).  We run skim normally and
+/// confirm it succeeds, trusting the unit tests in cache.rs for the path value.
+#[test]
+fn test_b5_default_cache_behavior_unchanged() {
+    let src_dir = TempDir::new().unwrap();
+    let file_path = src_dir.path().join("hello.ts");
+    fs::write(&file_path, "const x: number = 1;").unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg(&file_path)
+        .env_remove("SKIM_CACHE_DIR")
+        .env_remove("SKIM_ANALYTICS_DB")
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .assert()
+        .success();
+}
+
+/// B7: Empty SKIM_CACHE_DIR is treated as unset (falls back to default).
+///
+/// Verified at unit level in cache.rs; this integration test confirms the binary
+/// does not error out when SKIM_CACHE_DIR is set to an empty string.
+#[test]
+fn test_b7_empty_skim_cache_dir_does_not_error() {
+    let src_dir = TempDir::new().unwrap();
+    let file_path = src_dir.path().join("hello.ts");
+    fs::write(&file_path, "const y: number = 2;").unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg(&file_path)
+        .env("SKIM_CACHE_DIR", "")
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .assert()
+        .success();
+}
 
 #[test]
 fn test_cache_basic_reuse() {
