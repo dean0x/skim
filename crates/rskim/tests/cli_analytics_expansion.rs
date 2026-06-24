@@ -733,3 +733,291 @@ fn test_c3_stdout_byte_identical_analytics_on_vs_off() {
         "C3: stdout must be byte-identical regardless of analytics state"
     );
 }
+
+// ============================================================================
+// Phase A2 (#359) — per-file analytics rows for multi/glob/dir
+//
+// These tests verify that multi-file invocations emit N per-file rows (one per
+// successful file) instead of the single aggregate row emitted before A2.
+//
+// All tests use an isolated TempDir for the analytics DB.
+// ============================================================================
+
+/// Helper: count all rows in token_savings for a given DB path.
+/// Reuses the same signature as the F-series helper above; safe because Rust
+/// allows duplicate helper fns in different test files — they compile independently.
+fn count_rows_multi(db_path: &std::path::Path) -> i64 {
+    let conn = rusqlite::Connection::open(db_path).expect("must open analytics DB");
+    conn.query_row("SELECT COUNT(*) FROM token_savings", [], |r| r.get(0))
+        .unwrap_or(0)
+}
+
+/// Helper: query all language values recorded in token_savings.
+fn all_languages(db_path: &std::path::Path) -> Vec<Option<String>> {
+    let conn = rusqlite::Connection::open(db_path).expect("must open analytics DB");
+    let mut stmt = conn
+        .prepare("SELECT language FROM token_savings ORDER BY rowid")
+        .expect("prepare must succeed");
+    stmt.query_map([], |r| r.get::<_, Option<String>>(0))
+        .expect("query must succeed")
+        .filter_map(|r| r.ok())
+        .collect()
+}
+
+/// F7: `skim a.ts b.py c.rs` (no --show-stats) → exactly 3 rows, one per file;
+/// each row carries the correctly detected language for that file.
+#[test]
+fn test_f7_multi_explicit_files_per_file_rows() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("analytics.db");
+
+    let ts = ts_fixture();
+    let py = py_fixture();
+    let rs = rs_fixture();
+
+    let status = std::process::Command::new(common::skim_bin())
+        .arg(ts.as_os_str())
+        .arg(py.as_os_str())
+        .arg(rs.as_os_str())
+        .arg("--no-cache")
+        .env("SKIM_ANALYTICS_DB", &db_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("skim must run");
+    assert!(status.success(), "F7: 3-file run must exit 0");
+
+    let count = count_rows_multi(&db_path);
+    assert_eq!(
+        count, 3,
+        "F7: 3-file run must record exactly 3 rows (one per file)"
+    );
+
+    let langs = all_languages(&db_path);
+    let mut sorted_langs: Vec<_> = langs.into_iter().flatten().collect();
+    sorted_langs.sort();
+    assert_eq!(
+        sorted_langs,
+        vec!["python", "rust", "typescript"],
+        "F7: each row must carry the language for its own file"
+    );
+}
+
+/// F8-glob: `skim '*.ts'` against a dir with 2 .ts files → exactly 2 rows.
+#[test]
+fn test_f8_glob_per_file_rows() {
+    let file_dir = TempDir::new().unwrap();
+    // Create 2 TypeScript files in a temp dir
+    std::fs::write(
+        file_dir.path().join("alpha.ts"),
+        "function alpha(): number { return 1; }",
+    )
+    .unwrap();
+    std::fs::write(
+        file_dir.path().join("beta.ts"),
+        "function beta(): string { return 'x'; }",
+    )
+    .unwrap();
+
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("analytics.db");
+
+    let glob_pattern = format!("{}/*.ts", file_dir.path().display());
+
+    let status = std::process::Command::new(common::skim_bin())
+        .arg(&glob_pattern)
+        .arg("--no-cache")
+        .env("SKIM_ANALYTICS_DB", &db_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("skim glob must run");
+    assert!(status.success(), "F8-glob: glob run must exit 0");
+
+    let count = count_rows_multi(&db_path);
+    assert_eq!(
+        count, 2,
+        "F8-glob: 2-file glob must record exactly 2 rows (one per file, not 1 aggregate)"
+    );
+
+    let langs = all_languages(&db_path);
+    let non_null: Vec<_> = langs.into_iter().flatten().collect();
+    assert!(
+        non_null.iter().all(|l| l == "typescript"),
+        "F8-glob: all rows must have language='typescript', got: {non_null:?}"
+    );
+}
+
+/// F8-dir: `skim <dir>` containing 2 .py files → exactly 2 rows.
+#[test]
+fn test_f8_dir_per_file_rows() {
+    let file_dir = TempDir::new().unwrap();
+    std::fs::write(
+        file_dir.path().join("mod_a.py"),
+        "def func_a():\n    pass\n",
+    )
+    .unwrap();
+    std::fs::write(
+        file_dir.path().join("mod_b.py"),
+        "def func_b():\n    return 42\n",
+    )
+    .unwrap();
+
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("analytics.db");
+
+    let status = std::process::Command::new(common::skim_bin())
+        .arg(file_dir.path())
+        .arg("--no-cache")
+        .env("SKIM_ANALYTICS_DB", &db_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("skim dir must run");
+    assert!(status.success(), "F8-dir: dir run must exit 0");
+
+    let count = count_rows_multi(&db_path);
+    assert_eq!(
+        count, 2,
+        "F8-dir: 2-file directory must record exactly 2 rows (one per file)"
+    );
+
+    let langs = all_languages(&db_path);
+    let non_null: Vec<_> = langs.into_iter().flatten().collect();
+    assert!(
+        non_null.iter().all(|l| l == "python"),
+        "F8-dir: all rows must have language='python', got: {non_null:?}"
+    );
+}
+
+/// F9: `skim --show-stats a.ts b.py` → same N per-file rows as without --show-stats.
+/// Verifies that the counts=Known path (--show-stats) also emits N rows, not 1 aggregate.
+#[test]
+fn test_f9_show_stats_multi_per_file_rows() {
+    let ts = ts_fixture();
+    let py = py_fixture();
+
+    // Run without --show-stats (Tokenize path).
+    let db_plain = TempDir::new().unwrap();
+    let db_plain_path = db_plain.path().join("analytics.db");
+    std::process::Command::new(common::skim_bin())
+        .arg(ts.as_os_str())
+        .arg(py.as_os_str())
+        .arg("--no-cache")
+        .env("SKIM_ANALYTICS_DB", &db_plain_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("plain multi run must succeed");
+
+    // Run WITH --show-stats (Known path).
+    let db_stats = TempDir::new().unwrap();
+    let db_stats_path = db_stats.path().join("analytics.db");
+    std::process::Command::new(common::skim_bin())
+        .arg(ts.as_os_str())
+        .arg(py.as_os_str())
+        .arg("--no-cache")
+        .arg("--show-stats")
+        .env("SKIM_ANALYTICS_DB", &db_stats_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("--show-stats multi run must succeed");
+
+    let count_plain = count_rows_multi(&db_plain_path);
+    let count_stats = count_rows_multi(&db_stats_path);
+
+    assert_eq!(
+        count_plain, 2,
+        "F9: plain multi (2 files) must record 2 rows"
+    );
+    assert_eq!(
+        count_stats, 2,
+        "F9: --show-stats multi (2 files) must also record 2 rows (same as plain)"
+    );
+}
+
+/// F13-multi: SKIM_DISABLE_ANALYTICS=1 on a multi-file run → 0 rows.
+#[test]
+fn test_f13_multi_disable_analytics_no_rows() {
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("analytics.db");
+
+    let ts = ts_fixture();
+    let py = py_fixture();
+
+    // common::skim() sets SKIM_DISABLE_ANALYTICS=1
+    common::skim()
+        .arg(ts.as_os_str())
+        .arg(py.as_os_str())
+        .arg("--no-cache")
+        .env("SKIM_ANALYTICS_DB", &db_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .assert()
+        .success();
+
+    let count = count_rows_multi(&db_path);
+    assert_eq!(
+        count, 0,
+        "F13-multi: SKIM_DISABLE_ANALYTICS=1 must record 0 rows for multi-file run"
+    );
+}
+
+/// F14: robustness — one file deleted between transform and background re-read.
+/// With 3 files where 1 is deleted after skim runs, N-1 rows are expected (not crash).
+///
+/// This test verifies best-effort behaviour: deleted/changed files are silently skipped
+/// while sibling rows are still recorded.
+///
+/// Strategy: run 3 files, but delete 1 of the temp files BEFORE the skim invocation
+/// to ensure it fails during processing (will be an Err entry in results). We then
+/// verify: exit code unaffected (2 files succeed), and rows == 2 (skipped error).
+#[test]
+fn test_f14_missing_file_records_n_minus_1_rows() {
+    let file_dir = TempDir::new().unwrap();
+    let ts = ts_fixture();
+    let py = py_fixture();
+
+    // Third file: created then immediately removed (simulating a file that
+    // disappears before the background re-read — but in fact process_file will
+    // fail to read it too, meaning it is an Err result and not counted).
+    let ghost_path = file_dir.path().join("ghost.ts");
+    std::fs::write(&ghost_path, "function ghost() {}").unwrap();
+    std::fs::remove_file(&ghost_path).unwrap();
+
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("analytics.db");
+
+    // Run with 3 paths: 2 real fixtures + 1 ghost that doesn't exist.
+    // skim should succeed (exit 0) with 2 files processed and 1 warning on stderr.
+    let status = std::process::Command::new(common::skim_bin())
+        .arg(ts.as_os_str())
+        .arg(py.as_os_str())
+        .arg(&ghost_path) // will produce an Err in process_files
+        .arg("--no-cache")
+        .env("SKIM_ANALYTICS_DB", &db_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("skim must run");
+
+    // Exit code: process_files succeeds if at least 1 file succeeded.
+    assert!(
+        status.success(),
+        "F14: exit code must be 0 when at least 1 file succeeds"
+    );
+
+    // Ghost file is not found before process_file is even called (it's caught in
+    // process_explicit_files). So only 2 files (ts + py) make it to process_files.
+    let count = count_rows_multi(&db_path);
+    assert_eq!(
+        count, 2,
+        "F14: with 1 missing file, exactly 2 rows must be recorded (no crash, no aggregate)"
+    );
+}
