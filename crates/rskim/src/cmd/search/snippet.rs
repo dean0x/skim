@@ -100,6 +100,11 @@ pub(super) fn extract_context_window(
 /// - `SnippetOutcome::Ok(line, line_range, ctx)` on success.
 /// - `SnippetOutcome::Stale` when the file's mtime differs from manifest (changed since indexing).
 /// - `SnippetOutcome::Unavailable` when positions are empty, file is deleted/unreadable, or non-UTF8.
+///
+/// Production paths use [`extract_snippet_and_verify`] to read the file once
+/// and check substring membership simultaneously.  This fn is kept for testing
+/// the snippet-extraction logic in isolation.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn extract_snippet(
     root: &Path,
     rel_path: &str,
@@ -160,6 +165,132 @@ pub(super) fn extract_snippet(
         line_range,
         context: SnippetContext { lines: ctx_lines },
     }
+}
+
+// ============================================================================
+// Exact-match verification (AD-355-1)
+// ============================================================================
+
+/// Return `true` iff every whitespace-delimited token in `query` appears as
+/// a case-sensitive substring of `content`.
+///
+/// # Design (AD-355-1)
+///
+/// Exact-match verification lives here — not in the core reader — because:
+/// - The `NgramIndexReader` / `QueryEngine` pipeline has **no access to file
+///   content**; it operates only on byte-offset postings from the inverted index.
+/// - `extract_snippet` is the **only call site** where file bytes already exist
+///   at query time.  Verification piggy-backs on that existing read at zero
+///   additional I/O cost.
+/// - This makes the predicate a **candidate-then-verify** gate: the bigram index
+///   generates candidates cheaply; this fn drops non-matching ones.
+///
+/// # Match semantics (AD-355-3)
+///
+/// - **Case-sensitive**: code identifiers are case-sensitive; defaulting to
+///   case-sensitive prevents false positives (e.g. `Foo` matching `foo`).
+/// - **AND-of-whitespace-tokens**: a multi-word query `"foo bar"` requires both
+///   `"foo"` and `"bar"` to appear as substrings somewhere in the file.  This
+///   matches code-search ergonomics where users expect conjunctive multi-word
+///   queries.
+/// - **Single-token / sub-2-byte queries**: the bigram reader already returns an
+///   empty candidate set for queries shorter than 2 bytes
+///   (`extract_query_ngrams` returns `[]` for `len < 2`).  Verification of a
+///   sub-2-byte query over a non-empty candidate list is therefore moot in
+///   practice, but this fn handles it correctly: the token must appear as a
+///   substring.
+///
+/// This fn is pure (no I/O, no side effects) so it can be unit-tested in
+/// isolation — see `snippet_tests.rs`.
+pub(super) fn query_substring_present(content: &str, query: &str) -> bool {
+    // Split on whitespace; require every non-empty token to appear in content.
+    // An empty query (no tokens after splitting) is vacuously true — callers
+    // already short-circuit on empty queries before building the candidate list.
+    query
+        .split_whitespace()
+        .all(|token| content.contains(token))
+}
+
+/// Extract a snippet and simultaneously verify that `query` is present in the
+/// file content — reading the file exactly once (no second I/O).
+///
+/// Returns the normal [`SnippetOutcome`] PLUS a boolean:
+/// - `true`  — the file content passes `query_substring_present(text, query)`.
+/// - `false` — the file was not read (Stale / Unavailable) or the query is
+///   absent.  The caller should drop this candidate from the verified
+///   result set.
+///
+/// # Design (AD-355-1)
+///
+/// Verification is co-located with snippet extraction so the file bytes are
+/// read only once.  The `query_substring_present` fn is the pure predicate; this
+/// wrapper applies it at the single on-disk-read call site.
+pub(super) fn extract_snippet_and_verify(
+    root: &Path,
+    rel_path: &str,
+    match_positions: &[Range<usize>],
+    manifest_entry: Option<&ManifestEntry>,
+    query: &str,
+) -> (SnippetOutcome, bool) {
+    if match_positions.is_empty() {
+        return (SnippetOutcome::Unavailable, false);
+    }
+
+    let abs_path = root.join(rel_path);
+
+    // Single stat(2) call shared by both the mtime guard and the size guard below.
+    let meta = std::fs::metadata(&abs_path).ok();
+
+    // Mtime guard.
+    if let Some(stored_mtime) = manifest_entry.and_then(|e| e.mtime) {
+        let current_mtime = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        if current_mtime != Some(stored_mtime) {
+            // Stale: positions may be wrong; cannot verify. Drop from verified set.
+            return (SnippetOutcome::Stale, false);
+        }
+    }
+
+    // Size guard.
+    const MAX_SNIPPET_FILE_BYTES: u64 = 5 * 1024 * 1024;
+    let file_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    if file_size > MAX_SNIPPET_FILE_BYTES {
+        return (SnippetOutcome::Unavailable, false);
+    }
+
+    // Read file content — single I/O operation shared by snippet extraction
+    // and substring verification (AD-355-1: no second file read).
+    let content = match std::fs::read(&abs_path) {
+        Ok(c) => c,
+        Err(_) => return (SnippetOutcome::Unavailable, false),
+    };
+    let text = match std::str::from_utf8(&content) {
+        Ok(t) => t,
+        Err(_) => return (SnippetOutcome::Unavailable, false),
+    };
+
+    // Substring verification — pure, no I/O (AD-355-1 / AD-355-3).
+    let verified = query_substring_present(text, query);
+
+    let match_line = rskim_search::byte_offset_to_line(&content, match_positions[0].start) as u32;
+    let line_range = rskim_search::compute_line_range(&content, match_positions);
+    let ctx_lines = extract_context_window(text, match_line, DEFAULT_CONTEXT);
+
+    if ctx_lines.is_empty() {
+        return (SnippetOutcome::Unavailable, verified);
+    }
+
+    (
+        SnippetOutcome::Ok {
+            match_line,
+            line_range,
+            context: SnippetContext { lines: ctx_lines },
+        },
+        verified,
+    )
 }
 
 // ============================================================================

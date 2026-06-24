@@ -936,3 +936,234 @@ fn test_format_json_output_includes_temporal_annotations() {
         "risk_score must be ~0.70, got {rs}"
     );
 }
+
+// ============================================================================
+// #355 Part A — Exact-match verification (AC1 / AC2 / AC3)
+//
+// PF-007: every test asserts a discriminating observable, not just exit-0.
+// AC2: gibberish query → 0 results on ALL paths.
+// AC3: every returned result literally contains the query token(s).
+// AC1: an exact symbol query returns only files containing it.
+// ============================================================================
+
+/// AC2 — gibberish query produces 0 verified results on the pure-lexical path.
+///
+/// PF-007 (discriminating): asserts results.is_empty(), which would fail if
+/// the verification filter were removed (the bigram index would return
+/// incidental-overlap candidates for any query).
+#[test]
+fn test_ac2_gibberish_query_returns_zero_results_pure_lexical() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    // "xqzjvmblorp" is a provably absent gibberish string — no natural code
+    // contains it, so verification must drop all bigram-index candidates.
+    let config = make_config(&root, &cache_dir, "xqzjvmblorp");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AC2: verified result set must be empty for a query absent from all files.
+    // This would fail if verification were disabled (bigram-index noise would
+    // return false positives).
+    assert!(
+        output.results.is_empty(),
+        "AC2: gibberish query 'xqzjvmblorp' must return 0 verified results; \
+        got {} results: {:?}",
+        output.results.len(),
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+}
+
+/// AC2 (compound path) — gibberish query + AST filter → 0 verified results.
+///
+/// PF-007: exercises the compound (text+AST) code path with a fake AST score
+/// vector. Verifies that the compound path also drops non-matching candidates.
+#[test]
+fn test_ac2_gibberish_query_returns_zero_results_compound_path() {
+    use rskim_search::FileId;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    // Use a fake ast_scored vector (file 0 with score 1.0); the gibberish query
+    // means no file will pass substring verification regardless of AST score.
+    let config = QueryConfig {
+        text: "xqzjvmblorp".to_string(),
+        limit: 20,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: Some(vec![(FileId(0), 1.0)]),
+        composite_weights: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        output.results.is_empty(),
+        "AC2 (compound path): gibberish query must return 0 verified results; \
+        got {} results: {:?}",
+        output.results.len(),
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+}
+
+/// AC2 (blast-radius path) — gibberish query + blast-radius → 0 lexical-hit
+/// results in the verified set (co-change-only stubs may still appear, but no
+/// false-positive lexical hits).
+///
+/// PF-007: the discriminating check is that the lexical-hit branch (which has
+/// file content) returns 0 results for a query absent from all indexed files.
+#[test]
+fn test_ac2_gibberish_query_no_lexical_hits_blast_radius() {
+    use std::collections::HashSet;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    let mut allowed: HashSet<String> = HashSet::new();
+    allowed.insert("src/auth.rs".to_string());
+
+    let config = QueryConfig {
+        text: "xqzjvmblorp".to_string(),
+        limit: 20,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // No file contains "xqzjvmblorp" — no lexical-hit result should be present.
+    // Co-change-only stubs (no lexical content) are exempt from verification
+    // (UNION semantics, AC12), but they cannot appear here either because the
+    // bigram index returns no raw candidates for a gibberish query.
+    for r in &output.results {
+        assert_ne!(
+            r.field, "function_signature",
+            "AC2 (blast-radius): no lexical-field results expected for a gibberish query; \
+            found: {:?}",
+            r
+        );
+    }
+}
+
+/// AC3 — every returned result literally contains the query term (pure-lexical).
+///
+/// PF-007 (discriminating): reads the content of each returned file and asserts
+/// the query term is present as a literal substring.  This test would fail if
+/// verification were disabled (bigram-noise false positives would appear).
+#[test]
+fn test_ac3_every_result_contains_query_term_pure_lexical() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    // "authenticate" is a real term in src/auth.rs.
+    let config = make_config(&root, &cache_dir, "authenticate");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !output.results.is_empty(),
+        "AC3: 'authenticate' must find at least one result"
+    );
+
+    for r in &output.results {
+        let abs_path = root.join(&r.path);
+        let content = fs::read_to_string(&abs_path).unwrap_or_default();
+        assert!(
+            content.contains("authenticate"),
+            "AC3: result file '{}' must contain the literal query term 'authenticate'; \
+            file content: {content:?}",
+            r.path
+        );
+    }
+}
+
+/// AC1 — an exact symbol query returns ONLY files containing it; the defining
+/// file ranks at position 0 (the highest-ranked result).
+///
+/// PF-007 (discriminating): asserts (a) the definer is present and (b) every
+/// non-definer result is absent from the verified set when the symbol is unique.
+/// This would fail without the wider pool + verify-then-truncate invariant.
+#[test]
+fn test_ac1_exact_symbol_returns_only_containing_files_and_definer_is_first() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Controlled corpus: auth.rs defines `frbnqlwx_unique_symbol`; lib.rs does NOT.
+    // The symbol uses a nonsense prefix that can't appear in lib.rs accidentally.
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        src.join("auth.rs"),
+        "/// The authoritative definer.\npub fn frbnqlwx_unique_symbol(x: u32) -> u32 { x }\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("lib.rs"),
+        "pub struct Config { pub value: u32 }\nimpl Config { pub fn new(v: u32) -> Self { Self { value: v } } }\n",
+    )
+    .unwrap();
+
+    let config = make_config(&root, &cache_dir, "frbnqlwx_unique_symbol");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AC1(a): the definer file must be in results.
+    let has_definer = output.results.iter().any(|r| r.path == "src/auth.rs");
+    assert!(
+        has_definer,
+        "AC1: definer file 'src/auth.rs' must appear in results; got: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // AC1(b): no result may be a file that does NOT contain the symbol.
+    // lib.rs does not contain "frbnqlwx_unique_symbol" — it must be absent.
+    let has_lib = output.results.iter().any(|r| r.path == "src/lib.rs");
+    assert!(
+        !has_lib,
+        "AC1: 'src/lib.rs' does not contain 'frbnqlwx_unique_symbol' and must \
+        NOT appear in verified results (this would fail without verification)"
+    );
+
+    // AC1(c): definer is the top-ranked result.
+    let first_path = output
+        .results
+        .first()
+        .map(|r| r.path.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        first_path,
+        "src/auth.rs",
+        "AC1: definer 'src/auth.rs' must be results[0]; got {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // AC3 (inline): every returned result must contain the query term.
+    for r in &output.results {
+        let abs_path = root.join(&r.path);
+        let content = fs::read_to_string(&abs_path).unwrap_or_default();
+        assert!(
+            content.contains("frbnqlwx_unique_symbol"),
+            "AC3: every verified result must contain 'frbnqlwx_unique_symbol'; \
+            '{}' does not: {content:?}",
+            r.path
+        );
+    }
+}

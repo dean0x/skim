@@ -7,7 +7,7 @@ use std::fs;
 
 use tempfile::tempdir;
 
-use super::{SnippetOutcome, extract_context_window, extract_snippet};
+use super::{SnippetOutcome, extract_context_window, extract_snippet, query_substring_present};
 
 // ============================================================================
 // extract_context_window
@@ -180,5 +180,91 @@ fn test_extract_snippet_stale_mtime_returns_none() {
     assert!(
         matches!(result, SnippetOutcome::Stale),
         "stale mtime in manifest → Stale, got {result:?}"
+    );
+}
+
+// ============================================================================
+// query_substring_present — unit tests (PF-007: discriminating observables)
+// ============================================================================
+
+/// Single token: present in content → true.
+#[test]
+fn test_query_substring_present_single_token_found() {
+    // Discriminating: must return true precisely because "authenticate" is in content.
+    assert!(
+        query_substring_present(
+            "pub fn authenticate(token: &str) -> bool { !token.is_empty() }",
+            "authenticate"
+        ),
+        "should find 'authenticate' as a literal substring"
+    );
+}
+
+/// Single token: absent from content → false (AC2 — gibberish → not found).
+///
+/// PF-007: this test asserts the discriminating negative: a query provably
+/// absent from the content must return false, so that the caller drops the
+/// candidate from the verified result set.
+#[test]
+fn test_query_substring_present_single_token_absent() {
+    // "zqxfjklm" is a gibberish sequence that cannot appear in natural code.
+    assert!(
+        !query_substring_present(
+            "pub fn authenticate(token: &str) -> bool { !token.is_empty() }",
+            "zqxfjklm"
+        ),
+        "gibberish token must not be found (AC2 — verified result set excludes it)"
+    );
+}
+
+/// AND-of-tokens: all tokens present → true (AD-355-3 multi-term semantics).
+#[test]
+fn test_query_substring_present_multi_token_all_found() {
+    let content = "pub fn authenticate(token: &str) -> bool { !token.is_empty() }";
+    assert!(
+        query_substring_present(content, "authenticate token"),
+        "both 'authenticate' and 'token' are present — AND-of-tokens must be true"
+    );
+}
+
+/// AND-of-tokens: one token absent → false (AC2 for multi-term).
+///
+/// PF-007: removing the absent-token check would turn this test into a false
+/// positive — the test fails the moment OR-semantics are accidentally used.
+#[test]
+fn test_query_substring_present_multi_token_one_absent() {
+    let content = "pub fn authenticate(token: &str) -> bool { !token.is_empty() }";
+    assert!(
+        !query_substring_present(content, "authenticate zqxfjklm"),
+        "'zqxfjklm' is absent — AND requires ALL tokens; result must be false"
+    );
+}
+
+/// Case-sensitive: lowercase query does NOT match uppercase-only text (AD-355-3).
+#[test]
+fn test_query_substring_present_case_sensitive() {
+    assert!(
+        !query_substring_present("pub fn Authenticate() {}", "authenticate"),
+        "match is case-sensitive; 'authenticate' must not match 'Authenticate'"
+    );
+}
+
+/// Empty query (no tokens after splitting) → vacuously true.
+/// Callers short-circuit on empty queries before building candidates, so
+/// this edge case is harmless, but the fn must be well-defined.
+#[test]
+fn test_query_substring_present_empty_query_vacuously_true() {
+    assert!(
+        query_substring_present("any content", ""),
+        "empty query produces no tokens; all() over empty set is vacuously true"
+    );
+}
+
+/// Whitespace-only query → same as empty (no tokens).
+#[test]
+fn test_query_substring_present_whitespace_only_query() {
+    assert!(
+        query_substring_present("any content", "   "),
+        "whitespace-only query produces no tokens via split_whitespace; vacuously true"
     );
 }
