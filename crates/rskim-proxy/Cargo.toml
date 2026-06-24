@@ -1,0 +1,123 @@
+[package]
+name = "rskim-proxy"
+version = "0.1.0"
+edition = "2024"
+authors = ["Skim Contributors"]
+license = "MIT"
+description = "HTTP reverse proxy foundation for skim Layer 3: provider routing, SSE/chunked passthrough, stateless fail-open core"
+repository = "https://github.com/dean0x/skim"
+# AD-PXY-01: Separate optional crate, not a module in rskim. hyper/tokio/rustls are heavy
+# and introduce the first async runtime in the workspace. A separate crate isolates compile
+# cost from users who never run the proxy and from release LTO of the main binary.
+# Layer-3 naming convention: no l3- infix per Decision 2 / #309.
+publish = false
+
+[dependencies]
+# Async runtime — explicit minimal feature set for accept loops, signal handling,
+# and per-connection task supervision. "full" is intentionally avoided to minimize
+# attack surface (dependencies Iron Law) — the proxy uses only: rt-multi-thread
+# (multi-threaded runtime), net (TcpListener/TcpStream), time (timeout/sleep),
+# sync (Semaphore/Mutex), io-util (AsyncRead/AsyncWrite), signal (SIGINT/SIGTERM),
+# and macros (tokio::select!/tokio::spawn). The fs and process features are NOT
+# used and are excluded. dev-deps may keep "full" for test ergonomics.
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "io-util", "signal", "macros"] }
+
+# HTTP/1.1 server and client. Low-level direct usage (no reqwest) keeps the
+# surface minimal and the supply-chain stance consistent (AD-PXY-04).
+hyper = { workspace = true, features = ["http1", "server", "client"] }
+hyper-util = { workspace = true, features = ["tokio", "server", "client-legacy"] }
+http-body-util = { workspace = true }
+# http-body Body trait — used by IdleTimedBody (AC20 arm 2 / AD-PXY-20).
+http-body = { workspace = true }
+
+# TLS — rustls only, webpki-roots for hermetic certificate validation.
+# AD-PXY-04: single-static-binary + supply-chain stance matching ureq in the workspace.
+# OS trust-store option (rustls-native-certs) is a follow-up per #346.
+rustls = { workspace = true }
+hyper-rustls = { workspace = true, features = ["webpki-roots", "http1"] }
+tokio-rustls = { workspace = true }
+
+# Byte buffer type shared by hyper body handling (Forward/server.rs).
+bytes = { workspace = true }
+
+# WebPKI root certificate bundle for upstream TLS client (AD-PXY-04 / #346).
+webpki-roots = { workspace = true }
+
+# Note: in-flight connection tracking uses a simple inline RAII struct (Drop impl)
+# rather than scopeguard, which has a different macro interface than expected.
+
+# Safety substrate — seam composes #301's Outcome / guarded_transform.
+# AD-PXY-05: reuse Outcome (fail-open success variant) to avoid duplicating the
+# never-inflate + sink rule. harness feature gated to dev-deps only.
+rskim-contract = { path = "../rskim-contract" }
+
+# Optional typed-view helper for the seam context (lazy parse, see §3.1).
+# Forwarding MUST NOT be coupled to parse success — rskim-llm is optional.
+rskim-llm = { path = "../rskim-llm", optional = true }
+
+# Serialization — same workspace features (preserve_order + raw_value) required
+# for byte-faithful round-trips matching the rest of the workspace.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Bounded non-blocking channel for fire-and-forget analytics (AC15 / AD-PXY-17).
+# AD-PXY-15 is the header-rewrite allowed-list decision (forward.rs); analytics
+# decisions are AD-PXY-17 (see analytics.rs).
+crossbeam-channel = { workspace = true }
+
+# Error types for construction / startup paths only. Never on the forwarding path.
+thiserror = { workspace = true }
+
+# Structured JSON logging. tracing-subscriber initialised in logging.rs.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["json", "env-filter", "fmt"] }
+
+[dev-dependencies]
+# Conformance harness — dev-dep only per rskim-contract pattern.
+rskim-contract = { path = "../rskim-contract", features = ["harness"] }
+tokio = { workspace = true, features = ["full"] }
+proptest = { workspace = true }
+# Compile-fail tests for AC24 non_exhaustive enforcement.
+# Precedent: rskim-contract/tests/ac2_compile_fail.rs.
+trybuild = { workspace = true }
+# Criterion for proxy latency benchmarks (AC14/AC15).
+# async_tokio feature enables b.to_async(&rt) for tokio-backed async bench iterations.
+criterion = { workspace = true, features = ["async_tokio"] }
+# http-body is now a regular [dependency] (IdleTimedBody uses it in production code).
+# No dev-dep entry needed — the workspace dep is inherited.
+# tracing-subscriber with Layer trait for AC13 capture layer in wire tests.
+tracing-subscriber = { workspace = true, features = ["json", "env-filter", "fmt", "registry"] }
+
+[features]
+# Optional typed-view seam helper — #304 can enable when it calls ctx.parse_typed().
+typed-view = ["rskim-llm"]
+
+# Expose `testing` module (run_server_async helper) for integration test crates
+# that spin up a real proxy inside an existing tokio runtime.  Never enabled in
+# production builds.  dev-deps declare:
+#   rskim-proxy = { path = "../rskim-proxy", features = ["testing"] }
+testing = []
+
+[lints.clippy]
+# Deny panicking helpers on the forwarding path (AC18).
+# NOTE: Do NOT copy rskim-contract/clippy.toml here. The proxy legitimately uses
+# clocks (Instant::now for latency measurement, lifecycle timers) — rskim-contract
+# bans them because its transform path must be deterministic (invariant 5). The
+# proxy's server/forward paths are NOT under that constraint (AC18 verified).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+
+[lib]
+name = "rskim_proxy"
+path = "src/lib.rs"
+
+[[bench]]
+name = "proxy_latency_bench"
+path = "benches/proxy_latency_bench.rs"
+harness = false
+# The bench spins up a live proxy via rskim_proxy::testing::run_server_async,
+# which is gated behind #[cfg(any(test, feature = "testing"))].  Bench targets
+# are NOT compiled under the `test` cfg, so the feature must be declared here.
+required-features = ["testing"]

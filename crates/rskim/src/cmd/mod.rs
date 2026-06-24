@@ -40,6 +40,7 @@ mod learn;
 pub(crate) mod lint;
 mod log;
 mod pkg;
+mod proxy;
 mod rewrite;
 mod search;
 mod session;
