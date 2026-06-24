@@ -54,6 +54,18 @@ pub(crate) struct ProcessResult {
     ///
     /// `None` for cache hits (tier was not recorded at write time).
     pub(crate) parse_tier: Option<&'static str>,
+    /// Effective language used for transformation.
+    ///
+    /// Set in all three constructors (file, stdin, cache-hit) so the analytics
+    /// layer can record the correct language without re-detecting from path.
+    /// Priority mirrors the transform path: explicit_lang wins, else auto-detect.
+    pub(crate) language: Option<Language>,
+    /// Raw stdin buffer retained for background tokenization.
+    ///
+    /// `Some(buffer)` only from `process_stdin` when `!show_stats` (stdin
+    /// cannot be re-read; the buffer must be kept).  All other constructors
+    /// set this to `None` (files can be re-read from disk).
+    pub(crate) stdin_raw: Option<String>,
 }
 
 /// Determine the parse quality tier from the mode and whether the parser reported errors.
@@ -182,12 +194,19 @@ fn try_cached_result(
         (hit.original_tokens, hit.transformed_tokens)
     };
 
+    // Effective language for a cache hit: explicit override wins, else detect from path.
+    let cache_lang = options
+        .explicit_lang
+        .or_else(|| detect_language_from_path(path));
+
     Ok(Some(ProcessResult {
         output: hit.content,
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered: false,
         parse_tier: None, // tier was not recorded at cache-write time
+        language: cache_lang,
+        stdin_raw: None,
     }))
 }
 
@@ -398,12 +417,23 @@ pub(crate) fn process_stdin(
         (None, None)
     };
 
+    // Retain the raw buffer for analytics background tokenization only when
+    // counts are not already known (i.e. !show_stats). Stdin cannot be re-read,
+    // so the buffer must travel with the result.
+    let stdin_raw = if !options.show_stats {
+        Some(buffer)
+    } else {
+        None
+    };
+
     Ok(ProcessResult {
         output: final_output,
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered,
         parse_tier,
+        language: Some(language),
+        stdin_raw,
     })
 }
 
@@ -466,13 +496,29 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         });
     }
 
+    // Effective language for analytics: explicit override wins, else detect from path.
+    let effective_lang = options
+        .explicit_lang
+        .or_else(|| detect_language_from_path(path));
+
     Ok(ProcessResult {
         output: final_output,
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered,
         parse_tier,
+        language: effective_lang,
+        stdin_raw: None,
     })
+}
+
+/// Read a file and validate it doesn't exceed the maximum input size.
+///
+/// Public thin wrapper over `read_and_validate` for use by the background
+/// analytics re-read path (`analytics::RawSource::Reread`).  Reuses the
+/// 50 MB guard and naturally rejects TOCTOU-grown files.
+pub(crate) fn read_source(path: &std::path::Path) -> anyhow::Result<String> {
+    read_and_validate(path)
 }
 
 #[cfg(test)]

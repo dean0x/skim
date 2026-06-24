@@ -1,5 +1,5 @@
 //! Integration tests for gross/faithful expansion accounting and --show-stats
-//! analytics reuse (#317 / #350).
+//! analytics reuse (#317 / #350) and for Phase-A1 fix of analytics-loss bug #359.
 //!
 //! ## T10 (AC-F4/F5) — --show-stats records exactly one row with the same counts
 //!
@@ -15,6 +15,12 @@
 //! raw_tokens) inserted directly via rusqlite, then run `skim stats --format json`
 //! and assert the row shows true counts with saved = 0.
 //!
+//! ## F-series (Phase A1 / #359 fix) — plain file-op analytics
+//!
+//! Tests F1–F13 and C1/C3 assert the unified `record_file_ops` path introduced
+//! to fix the analytics-loss bug (PF-001): plain `skim <file>` now records
+//! exactly one row regardless of cache state.
+//!
 //! ## Note on SKIM_PASSTHROUGH
 //!
 //! The outer cargo/nextest process may set `SKIM_PASSTHROUGH=1` to prevent
@@ -23,7 +29,7 @@
 //! matching the pattern in `cli_no_expansion_317.rs`.
 
 use std::path::PathBuf;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 mod common;
 
 // ============================================================================
@@ -135,7 +141,6 @@ fn test_show_stats_on_records_exactly_one_row() {
 /// its thread and `flush_pending()` joins it before exit, so the post-exit direct DB read is
 /// race-free. The DB is read with rusqlite directly — no `skim stats` subprocess, no sleep.
 #[test]
-#[ignore = "known pre-existing bug #359: plain file-op analytics is dropped unless the parser cache carries counts"]
 fn test_plain_file_op_should_record_analytics_no_cache() {
     let db = NamedTempFile::new().unwrap();
     let fixture = fixture_file();
@@ -250,5 +255,481 @@ fn test_expansion_row_stored_true_count_stats_shows_zero_saved() {
     assert_eq!(
         day_saved, 0,
         "daily tokens_saved must be 0 for expansion-only day"
+    );
+}
+
+// ============================================================================
+// F-series: Phase A1 (#359) — plain file-op analytics (fixes PF-001)
+//
+// All tests below use an isolated TempDir for the analytics DB so they don't
+// pollute the developer's real ~/.cache/skim/analytics.db.
+// Direct rusqlite reads avoid subprocess sleep races.
+// ============================================================================
+
+/// Helper: open the analytics DB and count rows in token_savings.
+fn count_rows(db_path: &std::path::Path) -> i64 {
+    let conn = rusqlite::Connection::open(db_path).expect("must open analytics DB");
+    conn.query_row("SELECT COUNT(*) FROM token_savings", [], |r| r.get(0))
+        .unwrap_or(0) // table absent → 0
+}
+
+/// Helper: query a single row column from token_savings (assumes exactly 1 row).
+fn row_value<T: rusqlite::types::FromSql>(db_path: &std::path::Path, col: &str) -> T {
+    let conn = rusqlite::Connection::open(db_path).expect("must open analytics DB");
+    conn.query_row(
+        &format!("SELECT {col} FROM token_savings LIMIT 1"),
+        [],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|e| panic!("query {col}: {e}"))
+}
+
+/// Helper: TypeScript fixture path.
+fn ts_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/typescript/simple.ts")
+        .canonicalize()
+        .expect("typescript fixture must exist")
+}
+
+/// Helper: Python fixture path.
+fn py_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/python/simple.py")
+        .canonicalize()
+        .expect("python fixture must exist")
+}
+
+/// Helper: Rust fixture path.
+fn rs_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/rust/simple.rs")
+        .canonicalize()
+        .expect("rust fixture must exist")
+}
+
+/// F1: plain cold cache (--no-cache, no --show-stats) → exactly 1 row;
+/// command_type=File (stored as "file"); mode is set; language is detected.
+#[test]
+fn test_f1_plain_cold_cache_records_one_row() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("analytics.db");
+    let fixture = ts_fixture();
+
+    let status = std::process::Command::new(common::skim_bin())
+        .arg(fixture.as_os_str())
+        .arg("--no-cache")
+        .env("SKIM_ANALYTICS_DB", &db_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("skim must run");
+    assert!(status.success(), "skim must exit 0");
+
+    let count = count_rows(&db_path);
+    assert_eq!(
+        count, 1,
+        "F1: cold cache plain run must record exactly 1 row"
+    );
+
+    let cmd_type: String = row_value(&db_path, "command_type");
+    assert_eq!(cmd_type, "file", "F1: command_type must be 'file'");
+
+    let lang: Option<String> = row_value(&db_path, "language");
+    assert_eq!(
+        lang.as_deref(),
+        Some("typescript"),
+        "F1: language must be detected as 'typescript'"
+    );
+
+    let mode: Option<String> = row_value(&db_path, "mode");
+    assert!(mode.is_some(), "F1: mode must be set (not NULL)");
+}
+
+/// F2: warm-but-countless parser cache → second run records 1 row.
+///
+/// Warm the parser cache with a plain run (no --show-stats → cache written
+/// WITHOUT token counts).  A second plain run against the same warm cache
+/// must still record 1 row via background tokenization.
+#[test]
+fn test_f2_warm_countless_cache_records_one_row() {
+    // Isolate the parser cache so this test doesn't pollute ~/.cache/skim.
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("analytics.db");
+    let fixture = ts_fixture();
+
+    // First run: warm the parser cache WITHOUT token counts (no --show-stats).
+    // Analytics disabled so we don't count this row.
+    std::process::Command::new(common::skim_bin())
+        .arg(fixture.as_os_str())
+        .env("SKIM_CACHE_DIR", cache_dir.path())
+        .env_remove("SKIM_PASSTHROUGH")
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("first warm run must succeed");
+
+    // Second run: uses the warm cache (no --no-cache) with analytics enabled.
+    // The cache entry has no token counts → background tokenization must kick in.
+    let status = std::process::Command::new(common::skim_bin())
+        .arg(fixture.as_os_str())
+        .env("SKIM_CACHE_DIR", cache_dir.path())
+        .env("SKIM_ANALYTICS_DB", &db_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("second run must succeed");
+    assert!(status.success(), "F2: second run must exit 0");
+
+    let count = count_rows(&db_path);
+    assert_eq!(
+        count, 1,
+        "F2: warm-but-countless cache hit must still record 1 row via background tokenization"
+    );
+}
+
+/// F3: plain vs --show-stats record the SAME row count (both record 1, not 0 vs 1).
+#[test]
+fn test_f3_plain_and_show_stats_both_record_one_row() {
+    let fixture = ts_fixture();
+
+    // Plain run.
+    let db_plain = NamedTempFile::new().unwrap();
+    std::process::Command::new(common::skim_bin())
+        .arg(fixture.as_os_str())
+        .arg("--no-cache")
+        .env("SKIM_ANALYTICS_DB", db_plain.path())
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("plain run must succeed");
+
+    // --show-stats run.
+    let db_stats = NamedTempFile::new().unwrap();
+    std::process::Command::new(common::skim_bin())
+        .arg(fixture.as_os_str())
+        .arg("--no-cache")
+        .arg("--show-stats")
+        .env("SKIM_ANALYTICS_DB", db_stats.path())
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("--show-stats run must succeed");
+
+    let count_plain = count_rows(db_plain.path());
+    let count_stats = count_rows(db_stats.path());
+    assert_eq!(count_plain, 1, "F3: plain run must record 1 row");
+    assert_eq!(count_stats, 1, "F3: --show-stats run must record 1 row");
+}
+
+/// F4: --no-cache → 1 row.
+#[test]
+fn test_f4_no_cache_records_one_row() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("analytics.db");
+    let fixture = ts_fixture();
+
+    let status = std::process::Command::new(common::skim_bin())
+        .arg(fixture.as_os_str())
+        .arg("--no-cache")
+        .env("SKIM_ANALYTICS_DB", &db_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("skim must run");
+    assert!(status.success());
+
+    assert_eq!(count_rows(&db_path), 1, "F4: --no-cache must record 1 row");
+}
+
+/// F5: count-carrying cache hit (prior --show-stats warms counts) → 1 row, NO double-record.
+#[test]
+fn test_f5_count_carrying_cache_hit_no_double_record() {
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("analytics.db");
+    let fixture = ts_fixture();
+
+    // First run WITH --show-stats: writes token counts into the cache.
+    // Analytics pointing at a *different* scratch DB so we can count from a fresh start.
+    let db_warm = NamedTempFile::new().unwrap();
+    std::process::Command::new(common::skim_bin())
+        .arg(fixture.as_os_str())
+        .arg("--show-stats")
+        .env("SKIM_CACHE_DIR", cache_dir.path())
+        .env("SKIM_ANALYTICS_DB", db_warm.path())
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("warm run must succeed");
+
+    // Second run: cache hit with counts already present → Known path, 1 row, no re-read.
+    let status = std::process::Command::new(common::skim_bin())
+        .arg(fixture.as_os_str())
+        .env("SKIM_CACHE_DIR", cache_dir.path())
+        .env("SKIM_ANALYTICS_DB", &db_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("second run must succeed");
+    assert!(status.success(), "F5: second run must exit 0");
+
+    assert_eq!(
+        count_rows(&db_path),
+        1,
+        "F5: count-carrying cache hit must record exactly 1 row (no double-record)"
+    );
+}
+
+/// F10: language column reflects detected language (no --language flag).
+#[test]
+fn test_f10_language_detection_ts_py_rs() {
+    for (fixture, expected_lang) in &[
+        (ts_fixture(), "typescript"),
+        (py_fixture(), "python"),
+        (rs_fixture(), "rust"),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("analytics.db");
+
+        std::process::Command::new(common::skim_bin())
+            .arg(fixture.as_os_str())
+            .arg("--no-cache")
+            .env("SKIM_ANALYTICS_DB", &db_path)
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DISABLE_ANALYTICS")
+            .env("NO_COLOR", "1")
+            .status()
+            .expect("skim must run");
+
+        let lang: Option<String> = row_value(&db_path, "language");
+        assert_eq!(
+            lang.as_deref(),
+            Some(*expected_lang),
+            "F10: language for {:?} must be '{expected_lang}'",
+            fixture.file_name()
+        );
+    }
+}
+
+/// F10b: WITH --language override → language column reflects the override, not detected.
+#[test]
+fn test_f10_language_override_wins() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("analytics.db");
+    let fixture = ts_fixture(); // .ts file → would auto-detect as typescript
+
+    // Override with --language=rust
+    std::process::Command::new(common::skim_bin())
+        .arg(fixture.as_os_str())
+        .arg("--no-cache")
+        .arg("--language=rust")
+        .env("SKIM_ANALYTICS_DB", &db_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("skim must run");
+
+    let lang: Option<String> = row_value(&db_path, "language");
+    assert_eq!(
+        lang.as_deref(),
+        Some("rust"),
+        "F10b: --language override must win over auto-detection"
+    );
+}
+
+/// F11: empty file → 1 row, raw_tokens=0, savings_pct=0.0, exit 0, NO panic.
+#[test]
+fn test_f11_empty_fixture_records_zero_token_row() {
+    let file_dir = TempDir::new().unwrap();
+    let empty_file = file_dir.path().join("empty.ts");
+    std::fs::write(&empty_file, "").unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("analytics.db");
+
+    let status = std::process::Command::new(common::skim_bin())
+        .arg(&empty_file)
+        .arg("--no-cache")
+        .env("SKIM_ANALYTICS_DB", &db_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("skim must run");
+    assert!(status.success(), "F11: empty file must exit 0");
+
+    let count = count_rows(&db_path);
+    assert_eq!(count, 1, "F11: empty file must record exactly 1 row");
+
+    let raw: i64 = row_value(&db_path, "raw_tokens");
+    assert_eq!(raw, 0, "F11: raw_tokens must be 0 for empty file");
+
+    let savings: f64 = row_value(&db_path, "savings_pct");
+    assert_eq!(savings, 0.0, "F11: savings_pct must be 0.0 for empty file");
+}
+
+/// F12: guardrail-triggering fixture (compressed >= raw) → 1 row, savings_pct=0.0.
+///
+/// A very tiny file (few tokens) causes the guardrail to trigger (compressed >= raw).
+/// savings_percentage already clamps this to 0.0 — we verify no panic and 1 row.
+#[test]
+fn test_f12_guardrail_row_savings_pct_zero() {
+    // A single-token file whose "structure" output is >= the raw (trivially tiny).
+    let file_dir = TempDir::new().unwrap();
+    let tiny_file = file_dir.path().join("tiny.ts");
+    std::fs::write(&tiny_file, "x").unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("analytics.db");
+
+    let status = std::process::Command::new(common::skim_bin())
+        .arg(&tiny_file)
+        .arg("--no-cache")
+        .env("SKIM_ANALYTICS_DB", &db_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("skim must run");
+    assert!(status.success(), "F12: tiny file must exit 0");
+
+    let count = count_rows(&db_path);
+    assert_eq!(count, 1, "F12: guardrail case must record exactly 1 row");
+
+    let savings: f64 = row_value(&db_path, "savings_pct");
+    assert!(
+        savings >= 0.0,
+        "F12: savings_pct must be >= 0.0 (no negative savings)"
+    );
+}
+
+/// F13: SKIM_DISABLE_ANALYTICS=1 (set via common::skim()) → COUNT==0 for single file.
+#[test]
+fn test_f13_disable_analytics_no_rows_for_file() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("analytics.db");
+    let fixture = ts_fixture();
+
+    // common::skim() sets SKIM_DISABLE_ANALYTICS=1.
+    common::skim()
+        .arg(fixture.as_os_str())
+        .arg("--no-cache")
+        .env("SKIM_ANALYTICS_DB", &db_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .assert()
+        .success();
+
+    // Table may not even exist (analytics never opened DB).
+    let count = count_rows(&db_path);
+    assert_eq!(
+        count, 0,
+        "F13: SKIM_DISABLE_ANALYTICS=1 must record 0 rows for single file"
+    );
+}
+
+/// C1: token_savings schema columns are UNCHANGED vs expected set (schema stability).
+#[test]
+fn test_c1_schema_columns_unchanged() {
+    use std::collections::HashSet;
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("analytics.db");
+
+    // Open the DB via a skim stats run to trigger schema migrations.
+    common::skim()
+        .arg("stats")
+        .env("SKIM_ANALYTICS_DB", &db_path)
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env("NO_COLOR", "1")
+        .assert()
+        .success();
+
+    let conn = rusqlite::Connection::open(&db_path).expect("must open DB");
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(token_savings)")
+        .expect("PRAGMA must succeed");
+    let cols: HashSet<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let expected: HashSet<&str> = [
+        "id",
+        "timestamp",
+        "command_type",
+        "original_cmd",
+        "raw_tokens",
+        "compressed_tokens",
+        "savings_pct",
+        "duration_ms",
+        "project_path",
+        "mode",
+        "language",
+        "parse_tier",
+        "session_id",
+    ]
+    .iter()
+    .copied()
+    .collect();
+
+    for &col in &expected {
+        assert!(
+            cols.contains(col),
+            "C1: expected column '{col}' missing from token_savings"
+        );
+    }
+}
+
+/// C3: stdout is byte-identical whether analytics is enabled or disabled.
+///
+/// Enabling analytics recording must never alter what skim writes to stdout.
+/// Analytics happens AFTER stdout is flushed; the background thread has no
+/// effect on the output bytes.
+#[test]
+fn test_c3_stdout_byte_identical_analytics_on_vs_off() {
+    let fixture = ts_fixture();
+
+    // Run with analytics ON (isolated DB).
+    let db = NamedTempFile::new().unwrap();
+    let output_on = std::process::Command::new(common::skim_bin())
+        .arg(fixture.as_os_str())
+        .arg("--no-cache")
+        .env("SKIM_ANALYTICS_DB", db.path())
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("analytics-on run must succeed");
+    assert!(
+        output_on.status.success(),
+        "C3: analytics-on run must exit 0"
+    );
+
+    // Run with analytics OFF.
+    let output_off = common::skim()
+        .arg(fixture.as_os_str())
+        .arg("--no-cache")
+        .env_remove("SKIM_PASSTHROUGH")
+        .output()
+        .expect("analytics-off run must succeed");
+    assert!(
+        output_off.status.success(),
+        "C3: analytics-off run must exit 0"
+    );
+
+    assert_eq!(
+        output_on.stdout, output_off.stdout,
+        "C3: stdout must be byte-identical regardless of analytics state"
     );
 }

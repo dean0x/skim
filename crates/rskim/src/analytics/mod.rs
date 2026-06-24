@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use rayon::prelude::*;
 use rusqlite::Connection;
 use serde::Serialize;
 
@@ -1033,6 +1034,99 @@ pub(crate) fn record_with_counts(enabled: bool, record: TokenSavingsRecord) {
     }
     register_thread(std::thread::spawn(move || {
         persist_record(&record);
+    }));
+}
+
+// ============================================================================
+// File-op unified recorder (Phase A1 — fixes PF-001)
+// ============================================================================
+
+/// Source of the raw text for background tokenization.
+///
+/// - `Reread(path)`: single file — re-read from disk on the background thread.
+/// - `Inline(text)`: stdin — retain the buffer in-memory (stdin cannot be re-read).
+pub(crate) enum RawSource {
+    Reread(PathBuf),
+    Inline(String),
+}
+
+/// How token counts are obtained for a file-op row.
+pub(crate) enum FileCounts {
+    /// `--show-stats` or count-carrying cache hit: counts already computed, no re-work.
+    Known { raw: usize, compressed: usize },
+    /// Plain run / cold cache: tokenize raw + compressed off the main thread.
+    Tokenize { raw: RawSource, compressed: String },
+}
+
+/// Per-file data for a single analytics row.
+pub(crate) struct FileOpRow {
+    pub(crate) counts: FileCounts,
+    pub(crate) original_cmd: String,
+    pub(crate) language: Option<String>,
+    pub(crate) parse_tier: Option<String>,
+}
+
+/// Shared metadata common to all rows in a single file-op invocation.
+pub(crate) struct FileOpCommon {
+    pub(crate) mode: Option<String>,
+    pub(crate) project_path: String,
+    pub(crate) session_id: Option<String>,
+}
+
+/// Record file-op analytics for one or more files, off the main thread.
+///
+/// - Captures `project_path` from the main thread before the spawn.
+/// - Tokenizes in PARALLEL (rayon) when counts are not yet known.
+/// - Persists SERIALLY to avoid SQLite write contention.
+/// - Uses `register_thread` so `flush_pending()` joins before exit (fixes PF-001).
+///
+/// Returns immediately (non-blocking).  When `enabled` is false or `rows` is
+/// empty, returns without spawning any thread.
+pub(crate) fn record_file_ops(enabled: bool, rows: Vec<FileOpRow>, common: FileOpCommon) {
+    if !enabled || rows.is_empty() {
+        return;
+    }
+    register_thread(std::thread::spawn(move || {
+        let ts = now_unix_secs();
+        // Resolve counts in parallel; filter out rows where tokenization fails.
+        let records: Vec<TokenSavingsRecord> = rows
+            .into_par_iter()
+            .filter_map(|r| {
+                let (raw, comp) = match r.counts {
+                    FileCounts::Known { raw, compressed } => (raw, compressed),
+                    FileCounts::Tokenize { raw, compressed } => {
+                        let text = match raw {
+                            // Best-effort: skip row on read or UTF-8 error.
+                            // This also naturally rejects TOCTOU-grown files (size guard
+                            // in read_source rejects anything over the 50 MB limit).
+                            RawSource::Reread(p) => crate::process::read_source(&p).ok()?,
+                            RawSource::Inline(s) => s,
+                        };
+                        let raw_tok = tokens::count_tokens(&text).ok()?;
+                        let comp_tok = tokens::count_tokens(&compressed).ok()?;
+                        (raw_tok, comp_tok)
+                    }
+                };
+                Some(TokenSavingsRecord {
+                    timestamp: ts,
+                    command_type: CommandType::File,
+                    original_cmd: r.original_cmd,
+                    raw_tokens: raw,
+                    compressed_tokens: comp,
+                    savings_pct: savings_percentage(raw, comp),
+                    duration_ms: 0,
+                    project_path: common.project_path.clone(),
+                    mode: common.mode.clone(),
+                    language: r.language,
+                    parse_tier: r.parse_tier,
+                    session_id: common.session_id.clone(),
+                })
+            })
+            .collect();
+        // Persist serially to avoid SQLite write contention.
+        for rec in records {
+            persist_record(&rec);
+        }
     }));
 }
 

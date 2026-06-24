@@ -850,15 +850,25 @@ fn process_single_arg(
     process_options: process::ProcessOptions,
     multi_options: multi::MultiFileOptions,
 ) -> anyhow::Result<()> {
+    // Capture cwd on the main thread before any background threads are spawned.
+    // (std::env::current_dir is not safe to call from background threads in general.)
+    let cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .display()
+        .to_string();
+    let mode_str = format!("{:?}", Mode::from(args.mode)).to_lowercase();
+
     if file == "-" {
         let result = process::process_stdin(process_options, args.filename.as_deref())?;
         process::write_result_and_stats(&result, args.show_stats)?;
         record_file_analytics(
             analytics.enabled,
-            &result,
+            result,
             "skim -",
-            args,
+            mode_str,
             analytics.session_id.as_deref(),
+            cwd,
+            None, // stdin: no path to re-read
         );
         return Ok(());
     }
@@ -875,54 +885,81 @@ fn process_single_arg(
 
     let result = process::process_file(&path, process_options)?;
     process::write_result_and_stats(&result, args.show_stats)?;
+    let cmd = format!("skim {file}");
     record_file_analytics(
         analytics.enabled,
-        &result,
-        &format!("skim {file}"),
-        args,
+        result,
+        &cmd,
+        mode_str,
         analytics.session_id.as_deref(),
+        cwd,
+        Some(path), // file: re-read from disk in background
     );
     Ok(())
 }
 
 /// Record token analytics for file operations (single file or stdin).
+///
+/// Takes `result` by value so `output` and `stdin_raw` can be moved into the
+/// background thread without cloning.
+///
+/// `file_path` is `Some` for single-file ops (re-read on background thread) and
+/// `None` for stdin (buffer already captured in `result.stdin_raw`).
 fn record_file_analytics(
     enabled: bool,
-    result: &process::ProcessResult,
+    result: process::ProcessResult,
     cmd: &str,
-    args: &Args,
+    mode_str: String,
     session_id: Option<&str>,
+    cwd: String,
+    file_path: Option<PathBuf>,
 ) {
-    if !enabled {
-        return;
-    }
-    if let (Some(raw), Some(comp)) = (result.original_tokens, result.transformed_tokens) {
-        let cwd = std::env::current_dir()
-            .unwrap_or_default()
-            .display()
-            .to_string();
-        let lang = args
-            .language
-            .map(|l| format!("{:?}", Language::from(l)).to_lowercase());
-        let mode = format!("{:?}", Mode::from(args.mode)).to_lowercase();
-        analytics::record_with_counts(
-            true,
-            analytics::TokenSavingsRecord {
-                timestamp: analytics::now_unix_secs(),
-                command_type: analytics::CommandType::File,
-                original_cmd: cmd.to_string(),
-                raw_tokens: raw,
-                compressed_tokens: comp,
-                savings_pct: analytics::savings_percentage(raw, comp),
-                duration_ms: 0,
-                project_path: cwd,
-                mode: Some(mode),
-                language: lang,
-                parse_tier: result.parse_tier.map(str::to_string),
-                session_id: session_id.map(str::to_string),
+    // Determine counts variant: Known when both token counts are already computed
+    // (i.e. --show-stats ran, or a count-carrying cache hit); Tokenize otherwise.
+    let counts = match (result.original_tokens, result.transformed_tokens) {
+        (Some(raw), Some(comp)) => {
+            // AC F5: counts in hand — no re-read, no double work.
+            analytics::FileCounts::Known {
+                raw,
+                compressed: comp,
+            }
+        }
+        _ => match file_path {
+            Some(p) => analytics::FileCounts::Tokenize {
+                raw: analytics::RawSource::Reread(p),
+                compressed: result.output,
             },
-        );
-    }
+            None => {
+                // Stdin: inline buffer retained by process_stdin when !show_stats.
+                // If stdin_raw is None here it means show_stats was on and counts
+                // should have been Some — this branch is unreachable in practice,
+                // but we degrade gracefully: no row recorded.
+                let Some(buf) = result.stdin_raw else { return };
+                analytics::FileCounts::Tokenize {
+                    raw: analytics::RawSource::Inline(buf),
+                    compressed: result.output,
+                }
+            }
+        },
+    };
+
+    let language = result.language.map(|l| l.as_str().to_string());
+    let parse_tier = result.parse_tier.map(str::to_string);
+
+    analytics::record_file_ops(
+        enabled,
+        vec![analytics::FileOpRow {
+            counts,
+            original_cmd: cmd.to_string(),
+            language,
+            parse_tier,
+        }],
+        analytics::FileOpCommon {
+            mode: Some(mode_str),
+            project_path: cwd,
+            session_id: session_id.map(str::to_string),
+        },
+    );
 }
 
 #[cfg(test)]
