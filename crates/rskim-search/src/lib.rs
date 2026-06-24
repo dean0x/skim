@@ -9,7 +9,7 @@
 //!   from the node-frequency research corpus.
 //! - The `index` module provides on-disk persistence via memory-mapped files.
 //! - The `lexical` module implements BM25F scoring over per-field n-gram indexes.
-//! - The `ngram` module handles bigram extraction (pure, no I/O).
+//! - The `ngram` module handles trigram extraction (pure, no I/O; #355 Part B widened from bigram).
 //! - The `temporal` module parses git history via gix and computes risk scoring
 //!   (hotspot, bug-fix density) with exponential decay. The `temporal::storage`
 //!   sub-module persists temporal data to SQLite with WAL mode.
@@ -102,4 +102,4 @@ pub use types::{
     SearchField, SearchLayer, SearchQuery, SearchResult, TemporalFlags, TemporalMetadata,
     TemporalSource, byte_offset_to_line, compute_line_range,
 };
-pub use weights::{BIGRAM_WEIGHTS, DEFAULT_WEIGHT, bigram_weight};
+pub use weights::{DEFAULT_WEIGHT, TRIGRAM_WEIGHTS, bigram_weight};

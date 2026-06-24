@@ -103,6 +103,54 @@ fn test_v1_header_rejected_with_format_version_message() {
     );
 }
 
+/// Format v2 indexes must be rejected with an actionable 'please rebuild' message.
+///
+/// This validates the ADR-006 invariant: old-format indexes are rejected cleanly
+/// so the staleness check triggers a full rebuild, not corruption.
+#[test]
+fn test_v2_header_rejected_with_please_rebuild_message() {
+    // Construct a well-formed 62-byte header but with version = 2 (old format).
+    let h = SkidxHeader {
+        magic: *SKIDX_MAGIC,
+        version: 2, // old v2 format
+        ngram_count: 0,
+        file_count: 0,
+        postings_file_size: 0,
+        avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
+        checksum: 0,
+    };
+    let encoded = encode_header(&h);
+    // decode_header must NOT accept version 2 — FORMAT_VERSION is now 3.
+    let result = decode_header(&encoded);
+    assert!(result.is_err(), "v2 header must be rejected by v3 reader");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("please rebuild"),
+        "v2 rejection must include 'please rebuild': {err}"
+    );
+    assert!(
+        err.contains("format version") || err.contains("unsupported"),
+        "v2 rejection must mention format version: {err}"
+    );
+}
+
+/// Verify the v3 SkidxEntry size constant is 16 bytes.
+#[test]
+fn test_entry_size_is_16_bytes() {
+    assert_eq!(
+        SKIDX_ENTRY_SIZE, 16,
+        "v3 SkidxEntry must be 16 bytes (ngram_key widened to u32)"
+    );
+    let e = SkidxEntry {
+        ngram_key: 0x0066_6E20u32, // "fn " trigram
+        posting_offset: 0,
+        posting_length: 0,
+    };
+    let encoded = encode_entry(&e);
+    assert_eq!(encoded.len(), 16, "encoded entry must be exactly 16 bytes");
+}
+
 #[test]
 fn test_header_truncated() {
     let result = decode_header(&[0u8; 10]);
@@ -117,13 +165,14 @@ fn test_header_truncated() {
 
 #[test]
 fn test_entry_roundtrip() {
+    // v3: ngram_key is u32 (trigram: (b1<<16)|(b2<<8)|b3 = 0x68_65_6C = "hel")
     let e = SkidxEntry {
-        ngram_key: 0x6865, // "he"
+        ngram_key: 0x0068656C, // "hel" trigram
         posting_offset: 4096,
         posting_length: 27,
     };
     let encoded = encode_entry(&e);
-    assert_eq!(encoded.len(), SKIDX_ENTRY_SIZE);
+    assert_eq!(encoded.len(), SKIDX_ENTRY_SIZE, "v3 entry must be 16 bytes");
     let decoded = decode_entry(&encoded).unwrap();
     assert_eq!(decoded, e);
 }
@@ -208,10 +257,13 @@ fn test_file_meta_field_lengths_encode_decode() {
     assert_eq!(decoded.doc_length, total);
 }
 
-/// Verify the v2 header size constant matches actual encoded size.
+/// Verify the v3 header size constant matches actual encoded size (unchanged from v2).
 #[test]
 fn test_header_size_is_62_bytes() {
-    assert_eq!(SKIDX_HEADER_SIZE, 62, "v2 header must be 62 bytes");
+    assert_eq!(
+        SKIDX_HEADER_SIZE, 62,
+        "v3 header must be 62 bytes (unchanged from v2)"
+    );
     let h = SkidxHeader {
         magic: *SKIDX_MAGIC,
         version: FORMAT_VERSION,
@@ -226,10 +278,13 @@ fn test_header_size_is_62_bytes() {
     assert_eq!(encoded.len(), 62);
 }
 
-/// Verify the v2 FileMetaEntry size constant matches actual encoded size.
+/// Verify the FileMetaEntry size constant matches actual encoded size (unchanged from v2 → v3).
 #[test]
 fn test_file_meta_size_is_37_bytes() {
-    assert_eq!(FILE_META_SIZE, 37, "v2 FileMetaEntry must be 37 bytes");
+    assert_eq!(
+        FILE_META_SIZE, 37,
+        "v2/v3 FileMetaEntry must be 37 bytes (unchanged by #355)"
+    );
     let m = FileMetaEntry {
         lang_id: 0,
         doc_length: 0,
@@ -415,7 +470,7 @@ fn test_read_array_start_beyond_data_returns_err() {
 // Binary search
 // -----------------------------------------------------------------------
 
-fn make_entries(keys: &[u16]) -> Vec<u8> {
+fn make_entries(keys: &[u32]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(keys.len() * SKIDX_ENTRY_SIZE);
     for (i, &key) in keys.iter().enumerate() {
         let e = SkidxEntry {
@@ -430,34 +485,35 @@ fn make_entries(keys: &[u16]) -> Vec<u8> {
 
 #[test]
 fn test_lookup_ngram_found() {
-    let keys = &[0x0100u16, 0x0200, 0x0300, 0x0400];
+    // v3: u32 trigram keys.
+    let keys = &[0x0001_0000u32, 0x0002_0000, 0x0003_0000, 0x0004_0000];
     let data = make_entries(keys);
-    let result = lookup_ngram(&data, 0x0200).unwrap();
+    let result = lookup_ngram(&data, 0x0002_0000).unwrap();
     assert!(result.is_some());
     let entry = result.unwrap();
-    assert_eq!(entry.ngram_key, 0x0200);
+    assert_eq!(entry.ngram_key, 0x0002_0000);
     assert_eq!(entry.posting_offset, 100);
 }
 
 #[test]
 fn test_lookup_ngram_not_found() {
-    let keys = &[0x0100u16, 0x0300];
+    let keys = &[0x0001_0000u32, 0x0003_0000];
     let data = make_entries(keys);
-    let result = lookup_ngram(&data, 0x0200).unwrap();
+    let result = lookup_ngram(&data, 0x0002_0000).unwrap();
     assert!(result.is_none());
 }
 
 #[test]
 fn test_lookup_ngram_empty() {
-    let result = lookup_ngram(&[], 0x1234).unwrap();
+    let result = lookup_ngram(&[], 0x1234_5678u32).unwrap();
     assert!(result.is_none());
 }
 
 #[test]
 fn test_lookup_ngram_single_match() {
-    let data = make_entries(&[0xABCDu16]);
-    let result = lookup_ngram(&data, 0xABCD).unwrap();
-    assert_eq!(result.unwrap().ngram_key, 0xABCD);
+    let data = make_entries(&[0x00AB_CDEFu32]);
+    let result = lookup_ngram(&data, 0x00AB_CDEF).unwrap();
+    assert_eq!(result.unwrap().ngram_key, 0x00AB_CDEF);
 }
 
 #[test]

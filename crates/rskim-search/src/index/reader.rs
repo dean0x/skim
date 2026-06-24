@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! [SkidxHeader: 62 bytes]
-//! [SkidxEntry × ngram_count: 14 bytes each]
+//! [SkidxEntry × ngram_count: 16 bytes each]   ← v3: ngram_key widened to u32
 //! [FileMetaEntry × file_count: 37 bytes each]
 //! ```
 //!
@@ -244,7 +244,7 @@ impl NgramIndexReader {
     }
 
     /// Retrieve all posting entries for `ngram_key` from the mmap'd posting file.
-    fn lookup_postings(&self, ngram_key: u16) -> Result<Vec<super::format::PostingEntry>> {
+    fn lookup_postings(&self, ngram_key: u32) -> Result<Vec<super::format::PostingEntry>> {
         let entries_start = SKIDX_HEADER_SIZE;
         let entries_end = entries_start + (self.header.ngram_count as usize) * SKIDX_ENTRY_SIZE;
         let entries_data = &self.idx_mmap[entries_start..entries_end];
@@ -369,7 +369,7 @@ impl SearchLayer for NgramIndexReader {
                     tf_per_doc.entry(p.doc_id).or_insert([0.0; FIELD_COUNT])[field_idx] += 1.0;
                 }
                 let pos = p.position as usize;
-                pos_per_doc.entry(p.doc_id).or_default().push(pos..pos + 2);
+                pos_per_doc.entry(p.doc_id).or_default().push(pos..pos + 3);
             }
 
             // Second sub-pass: apply language filter, score, and transfer positions

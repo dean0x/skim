@@ -165,7 +165,7 @@ fn test_build_multiple_files() {
         .unwrap();
     let layer = builder.build().unwrap();
     let results = layer.search(&SearchQuery::new("main")).unwrap();
-    // All three files contain "ma" "ai" "in" bigrams
+    // All three files contain the trigrams for "main" (e.g. "mai" "ain")
     let file_ids: std::collections::HashSet<u32> = results.iter().map(|r| r.file_id.0).collect();
     assert!(
         file_ids.len() >= 3,
