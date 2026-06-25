@@ -35,9 +35,12 @@
 //! - `delta_doc_id`: delta from the previous `doc_id` in the posting list
 //!   (absolute for the first entry). Encoded as a little-endian base-128 varint.
 //! - `field_id`: 1 byte, unchanged from v3 (bounded by `FIELD_COUNT = 8`).
-//! - `delta_position`: delta from the previous `position` within the same document.
-//!   For the first occurrence in a new `doc_id`, `delta_position = position`
-//!   (absolute). Encoded as a little-endian base-128 varint.
+//! - `delta_position`: delta from the previous `position` within the same
+//!   `(doc_id, field_id)` run. The position accumulator resets to 0 whenever
+//!   `doc_id` OR `field_id` changes, so the first occurrence in a new `doc_id`
+//!   *or* a new `field_id` encodes `delta_position = position` (absolute). See
+//!   the "Position-delta reset" section on [`encode_postings_varint`]. Encoded
+//!   as a little-endian base-128 varint.
 //!
 //! Rationale: see `AD-LXPOST-1` comment at [`encode_postings_varint`].
 //!
