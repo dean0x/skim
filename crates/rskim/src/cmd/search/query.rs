@@ -736,13 +736,13 @@ fn temporal_annotation_tag(temporal: Option<&super::types::TemporalAnnotation>) 
     let Some(t) = temporal else {
         return String::new();
     };
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(hs) = t.hotspot_score {
-        parts.push(format!("hotspot: {hs:.3}"));
-    }
-    if let Some(rs) = t.risk_score {
-        parts.push(format!("risk: {rs:.3}"));
-    }
+    let parts: Vec<String> = [
+        t.hotspot_score.map(|hs| format!("hotspot: {hs:.3}")),
+        t.risk_score.map(|rs| format!("risk: {rs:.3}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     if parts.is_empty() {
         return String::new();
     }

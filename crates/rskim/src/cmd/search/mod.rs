@@ -947,6 +947,20 @@ mod tests {
         session_id: None,
     };
 
+    /// Locate the `skim` binary for subprocess-level tests.
+    ///
+    /// Returns `CARGO_BIN_EXE_skim` when set by cargo test; falls back to walking
+    /// up from `current_exe()` (deps/ → debug or release/).
+    fn skim_bin_path() -> String {
+        std::env::var("CARGO_BIN_EXE_skim").unwrap_or_else(|_| {
+            let mut p = std::env::current_exe().unwrap();
+            p.pop(); // deps/
+            p.pop(); // debug/ or release/
+            p.push("skim");
+            p.to_string_lossy().to_string()
+        })
+    }
+
     #[test]
     fn test_search_help_returns_success() {
         let result = run(&[], &TEST_ANALYTICS).unwrap();
@@ -1330,17 +1344,7 @@ mod tests {
     /// emits plain text instead of JSON, fails this test (#357 cycle-2 finding 4).
     #[test]
     fn test_hot_json_warning_content_on_non_git_dir() {
-        // Locate the binary to spawn.  `CARGO_BIN_EXE_skim` is set by cargo test.
-        let bin = std::env::var("CARGO_BIN_EXE_skim").unwrap_or_else(|_| {
-            // Fallback for environments where the env var isn't set.
-            let mut p = std::env::current_exe().unwrap();
-            // current_exe is something like .../deps/rskim-<hash>; walk up to target/
-            // then find the release or debug skim binary.
-            p.pop(); // deps/
-            p.pop(); // debug/ or release/
-            p.push("skim");
-            p.to_string_lossy().to_string()
-        });
+        let bin = skim_bin_path();
 
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().to_string_lossy().to_string();
@@ -1871,13 +1875,7 @@ mod tests {
     /// arm (#357 cycle-2 finding 5).
     #[test]
     fn test_hot_self_heal_renders_ranked_rows_not_degradation() {
-        let bin = std::env::var("CARGO_BIN_EXE_skim").unwrap_or_else(|_| {
-            let mut p = std::env::current_exe().unwrap();
-            p.pop(); // deps/
-            p.pop(); // debug/ or release/
-            p.push("skim");
-            p.to_string_lossy().to_string()
-        });
+        let bin = skim_bin_path();
 
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
@@ -1960,13 +1958,7 @@ mod tests {
     /// render ranked rows instead of emitting the degradation message (#357 BUG A).
     #[test]
     fn test_rebuild_then_hot_renders_ranked_rows_not_degradation() {
-        let bin = std::env::var("CARGO_BIN_EXE_skim").unwrap_or_else(|_| {
-            let mut p = std::env::current_exe().unwrap();
-            p.pop(); // deps/
-            p.pop(); // debug/ or release/
-            p.push("skim");
-            p.to_string_lossy().to_string()
-        });
+        let bin = skim_bin_path();
 
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
