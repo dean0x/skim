@@ -838,13 +838,13 @@ fn test_1000_file_benchmark() {
 /// modeled on ast_index_size_ratio (~1.23-1.3x measured, <2.2x guard,
 /// ast_index/store/reader_tests.rs:574-666) and issue #273.
 ///
-/// Measured lexical baseline (trigram, v3, 1000 diverse Rust modules, 4 fns
-/// each ~480 bytes): see eprintln! below -- recorded after first CI run.
-/// Guard ceiling: measured_baseline + 0.5x headroom (generous headroom
-/// because trigram posting lists are longer than bigram and the full delta+
-/// varint compression that would push this below 1x is tracked in #358
-/// Item 2 / #273). The test fails on a 2x bloat regression (discriminating
-/// per PF-007 -- a vacuous assert(>0) would pass even with 100x bloat).
+/// Measured lexical baseline (trigram, v4 delta+varint, 1000 diverse Rust
+/// modules, 4 fns each ~480 bytes): 3.53x (skidx=58 KB, skpost=3.5 MB,
+/// source=1055 KB). v3 uncompressed baseline was 9.04x; delta+varint
+/// compression (#358 Item 2) reduced postings ~61%.
+/// Guard ceiling: measured_baseline + 1.5x headroom = 5.0x (round number).
+/// The test fails on a genuine bloat regression (discriminating per PF-007
+/// -- a vacuous assert(>0) would pass even with 100x bloat).
 #[test]
 fn lexical_index_size_ratio() {
     use crate::test_corpus::gen_representative_rust_module;
@@ -898,39 +898,33 @@ fn lexical_index_size_ratio() {
          n_files={n_files}, fns_per_file={fns_per_file})"
     );
 
-    // Guard ceiling: measured trigram-v3 baseline + 1.0x headroom.
+    // Guard ceiling: measured trigram-v4 (delta+varint) baseline + 1.5x headroom.
     //
     // Rationale for the ceiling value:
-    //   - Measured v3 trigram baseline on this corpus (1000 diverse Rust modules,
-    //     4 fns/file, ~1055 KB source): 9.04x (skidx=58 KB, skpost=9.48 MB).
-    //     That is skpost at 9x source bytes because every byte participates in up
-    //     to 3 overlapping trigrams per field, producing dense per-occurrence
-    //     posting lists with no dedup.
+    //   - Measured v4 trigram baseline on this corpus (1000 diverse Rust modules,
+    //     4 fns/file, ~1055 KB source): 3.53x (skidx=58 KB, skpost=3.5 MB).
+    //     Delta+varint encoding (#358 Item 2) reduced posting bytes ~61% vs
+    //     v3 fixed-9-byte entries (which measured 9.04x on the same corpus).
     //   - Industry uncompressed code-search trigram indexes (Zoekt, Sourcegraph)
-    //     run 3-5x source bytes; the #174 <30% (0.30x) target has no empirical
-    //     origin and is structurally impossible for an uncompressed per-occurrence
-    //     index (see AD-LXSZ-1 comment above). ADR-003 replaces it.
-    //   - Ceiling = 9.04x measured + 1.0x headroom = 10.0x (round number).
-    //     Headroom absorbs minor corpus variation and indexing overhead growth
-    //     without allowing a genuine O(files^2) bloat regression to pass.
+    //     run 3-5x source bytes; v4 delta+varint brings skim below that range.
+    //     The #174 <30% (0.30x) target has no empirical origin and is
+    //     structurally impossible (see AD-LXSZ-1 comment above). ADR-003 replaces it.
+    //   - Ceiling = 3.53x measured + 1.5x headroom = 5.0x (round number).
+    //     Headroom absorbs minor corpus variation and overhead growth without
+    //     allowing a genuine O(files^2) bloat regression to pass.
     //   - A genuine posting-list explosion (e.g. dedup bug, accidental O(n^2)
-    //     growth) would push the ratio 2-5x above 9.04x and still fires.
-    //   - Update this constant after delta+varint compression lands (#358 Item 2).
+    //     growth) would push the ratio 2-5x above 3.53x and still fires.
     //
     // ADR-003: regression guard must be empirically grounded, not the
     // baseless 0.30x inherited from the original ticket text.
-    //
-    // On-disk compression (delta+varint) that would push ratio below 1x is
-    // tracked in #358 Item 2 / #273.
-    const LEXICAL_SIZE_RATIO_CEILING: f64 = 10.0;
+    const LEXICAL_SIZE_RATIO_CEILING: f64 = 5.0;
     assert!(
         ratio < LEXICAL_SIZE_RATIO_CEILING,
         "AD-LXSZ-1: lexical index size ratio {ratio:.4} exceeds the \
-         <{LEXICAL_SIZE_RATIO_CEILING}x bloat guard. \
+         <{LEXICAL_SIZE_RATIO_CEILING}x bloat guard (v4 delta+varint baseline 3.53x). \
          If ratio exceeded: check for O(files^2) posting growth, \
-         missing dedup, or unbounded trigram emission. \
-         index={total_index_bytes} bytes, source={total_source_bytes} bytes. \
-         (On-disk compression to push ratio below 1x is tracked in #358 Item 2 / #273.)"
+         missing dedup, unbounded trigram emission, or codec regression. \
+         index={total_index_bytes} bytes, source={total_source_bytes} bytes."
     );
 }
 

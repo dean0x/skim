@@ -12,9 +12,9 @@ use std::ops::Range;
 use std::path::PathBuf;
 
 use super::format::{
-    FILE_META_SIZE, FORMAT_VERSION, FileMetaEntry, POSTING_ENTRY_SIZE, PostingEntry,
-    SKIDX_ENTRY_SIZE, SKIDX_HEADER_SIZE, SKIDX_MAGIC, SkidxEntry, SkidxHeader, encode_entry,
-    encode_file_meta, encode_header, encode_posting, lang_to_id,
+    FILE_META_SIZE, FORMAT_VERSION, FileMetaEntry, PostingEntry, SKIDX_ENTRY_SIZE,
+    SKIDX_HEADER_SIZE, SKIDX_MAGIC, SkidxEntry, SkidxHeader, encode_entry, encode_file_meta,
+    encode_header, encode_postings_varint, lang_to_id,
 };
 use super::reader::NgramIndexReader;
 use crate::{
@@ -282,37 +282,44 @@ impl LayerBuilder for NgramIndexBuilder {
 impl NgramIndexBuilder {
     /// Serialise postings, entries, file metadata, and header into the two
     /// on-disk byte buffers: `(postings_buf, skidx_buf)`.
+    ///
+    /// # AD-LXPOST-1
+    ///
+    /// Postings are encoded using v4 delta+varint compression (see
+    /// [`encode_postings_varint`]).  Each posting list is sorted ascending by
+    /// `(doc_id, field_id, position)` before encoding so that delta-doc_id and
+    /// delta-position are always non-negative.
     fn serialize_index(
         &self,
         sorted_keys: &[u32],
         avg_doc_length: f32,
         avg_field_lengths: [f32; FIELD_COUNT],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        // Serialise posting lists and build the entry table.
-        let total_posting_bytes: usize = self
+        // Serialise posting lists using v4 variable-length (delta+varint) codec.
+        // Pre-size conservatively; varint-encoded entries are 3–11 bytes each
+        // (vs 9 bytes fixed), so we allocate at the uncompressed size as an
+        // upper bound and rely on Vec to shrink via into_boxed_slice if needed.
+        let estimated_capacity: usize = self
             .postings
             .values()
-            .map(|v| v.len() * POSTING_ENTRY_SIZE)
+            .map(|v| v.len() * 9) // conservative upper bound (uncompressed size)
             .fold(0usize, usize::saturating_add);
-        let mut postings_buf: Vec<u8> = Vec::with_capacity(total_posting_bytes);
+        let mut postings_buf: Vec<u8> = Vec::with_capacity(estimated_capacity);
         let mut entries: Vec<SkidxEntry> = Vec::with_capacity(sorted_keys.len());
 
         for key in sorted_keys {
             let list = &self.postings[key];
             let offset = postings_buf.len() as u64;
-            let byte_len = list.len().checked_mul(POSTING_ENTRY_SIZE).ok_or_else(|| {
-                SearchError::IndexCorrupted(format!(
-                    "posting list for key {key:#010x} overflows usize"
-                ))
-            })?;
+            // Encode this posting list with delta+varint (AD-LXPOST-1, FORMAT_VERSION v4).
+            // The list is already sorted by (doc_id, field_id, position) — the caller
+            // (build()) calls list.sort_unstable() before reach here.
+            encode_postings_varint(list, &mut postings_buf);
+            let byte_len = postings_buf.len() as u64 - offset;
             let length = u32::try_from(byte_len).map_err(|_| {
                 SearchError::IndexCorrupted(format!(
                     "posting list for key {key:#010x} exceeds u32::MAX bytes ({byte_len})"
                 ))
             })?;
-            for p in list {
-                postings_buf.extend_from_slice(&encode_posting(p));
-            }
             entries.push(SkidxEntry {
                 ngram_key: *key,
                 posting_offset: offset,

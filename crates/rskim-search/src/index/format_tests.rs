@@ -121,9 +121,9 @@ fn test_v2_header_rejected_with_please_rebuild_message() {
         checksum: 0,
     };
     let encoded = encode_header(&h);
-    // decode_header must NOT accept version 2 — FORMAT_VERSION is now 3.
+    // decode_header must NOT accept version 2 — FORMAT_VERSION is now 4.
     let result = decode_header(&encoded);
-    assert!(result.is_err(), "v2 header must be rejected by v3 reader");
+    assert!(result.is_err(), "v2 header must be rejected by v4 reader");
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("please rebuild"),
@@ -132,6 +132,43 @@ fn test_v2_header_rejected_with_please_rebuild_message() {
     assert!(
         err.contains("format version") || err.contains("unsupported"),
         "v2 rejection must mention format version: {err}"
+    );
+}
+
+/// Format v3 indexes must be rejected with an actionable 'please rebuild' message.
+///
+/// AC3 / ADR-006: After the v3→v4 format bump (#358 Item 2), the v4 reader
+/// must reject v3 indexes cleanly so the staleness check triggers a full
+/// rebuild — the old index is NOT corrupted, just incompatible.
+///
+/// PF-007 compliance: asserts BOTH discriminating substrings
+/// ("unsupported format version" AND "please rebuild") so the test fails if
+/// either message is missing, not just if decode_header() returns Ok(()).
+#[test]
+fn test_v3_header_rejected_with_please_rebuild_message() {
+    // Construct a well-formed 62-byte header but with version = 3 (pre-v4 format).
+    let h = SkidxHeader {
+        magic: *SKIDX_MAGIC,
+        version: 3, // old v3 format (pre-varint posting compression)
+        ngram_count: 0,
+        file_count: 0,
+        postings_file_size: 0,
+        avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
+        checksum: 0,
+    };
+    let encoded = encode_header(&h);
+    // decode_header must NOT accept version 3 — FORMAT_VERSION is now 4.
+    let result = decode_header(&encoded);
+    assert!(result.is_err(), "v3 header must be rejected by v4 reader");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("please rebuild"),
+        "v3 rejection must include 'please rebuild' (actionable per ADR-006): {err}"
+    );
+    assert!(
+        err.contains("format version") || err.contains("unsupported"),
+        "v3 rejection must mention 'format version' or 'unsupported': {err}"
     );
 }
 
@@ -563,4 +600,188 @@ fn test_bm25_zero_avg_doc_len_no_panic() {
     // avg_doc_len = 0 should not panic — treated as 1.0 internally
     let score = bm25_score(1.0, 2.0, 100, 0.0);
     assert!(score.is_finite(), "BM25 should return finite value");
+}
+
+// -----------------------------------------------------------------------
+// v4 varint codec (encode_varint / decode_varint)
+// -----------------------------------------------------------------------
+
+/// Varint round-trip for a range of representative u32 values.
+///
+/// AC4 precursor: verifies that the varint primitive round-trips correctly
+/// before testing the full posting codec built on top of it.
+#[test]
+fn test_varint_roundtrip_representative_values() {
+    let values: &[u32] = &[
+        0,
+        1,
+        127,
+        128,       // first 2-byte value
+        255,
+        16383,
+        16384,     // first 3-byte value
+        2097151,
+        2097152,   // first 4-byte value
+        268435455,
+        268435456, // first 5-byte value
+        u32::MAX,
+    ];
+    for &v in values {
+        let mut buf = Vec::new();
+        let written = encode_varint(v, &mut buf);
+        assert!((1..=5).contains(&written), "varint for {v} must be 1-5 bytes, got {written}");
+        let (decoded, consumed) = decode_varint(&buf, 0).unwrap();
+        assert_eq!(decoded, v, "varint round-trip failed for {v}");
+        assert_eq!(consumed, written, "consumed bytes mismatch for {v}");
+    }
+}
+
+/// decode_varint must return IndexCorrupted for a truncated input.
+#[test]
+fn test_varint_decode_truncated_returns_err() {
+    // A continuation byte (MSB set) with no following byte — truncated.
+    let buf = [0x80u8]; // says "more bytes follow" but none are present
+    let result = decode_varint(&buf, 0);
+    assert!(result.is_err(), "truncated varint must return Err");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("truncated"),
+        "error should mention truncated: {err}"
+    );
+}
+
+/// decode_varint must return IndexCorrupted for a 6-byte (overflow) varint.
+#[test]
+fn test_varint_decode_overflow_returns_err() {
+    // Six consecutive continuation bytes — exceeds the 5-byte u32 maximum.
+    let buf = [0x80u8, 0x80, 0x80, 0x80, 0x80, 0x00];
+    let result = decode_varint(&buf, 0);
+    assert!(result.is_err(), "6-byte varint must return Err (overflow)");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("overflow"),
+        "error should mention overflow: {err}"
+    );
+}
+
+/// encode_varint / decode_varint at a non-zero offset.
+#[test]
+fn test_varint_decode_at_offset() {
+    let mut buf = vec![0xFFu8, 0xFFu8]; // 2 bytes of prefix garbage
+    encode_varint(300, &mut buf); // 300 = 0x12C → 2-byte varint: [0xAC, 0x02]
+    let (val, n) = decode_varint(&buf, 2).unwrap();
+    assert_eq!(val, 300, "varint at offset 2 should decode to 300");
+    assert_eq!(n, 2, "300 encodes to 2 bytes");
+}
+
+// -----------------------------------------------------------------------
+// v4 posting codec (encode_postings_varint / decode_postings_varint)
+// AC4: byte-faithful round-trip across empty / single / multi-doc / max-gap
+// -----------------------------------------------------------------------
+
+/// Helper: encode a list of PostingEntry values and decode them back.
+fn posting_roundtrip(postings: &[PostingEntry]) -> Vec<PostingEntry> {
+    let mut buf = Vec::new();
+    encode_postings_varint(postings, &mut buf);
+    decode_postings_varint(&buf).unwrap()
+}
+
+/// AC4 — empty posting list round-trips cleanly to an empty Vec.
+#[test]
+fn test_posting_codec_empty_list() {
+    let result = posting_roundtrip(&[]);
+    assert!(result.is_empty(), "empty posting list should round-trip to empty");
+}
+
+/// AC4 — single-entry posting list round-trips exactly.
+#[test]
+fn test_posting_codec_single_entry() {
+    let p = PostingEntry {
+        doc_id: 42,
+        field_id: crate::SearchField::FunctionSignature.discriminant(),
+        position: 1024,
+    };
+    let decoded = posting_roundtrip(&[p]);
+    assert_eq!(decoded.len(), 1, "single-entry round-trip must return 1 entry");
+    assert_eq!(decoded[0], p, "single-entry must decode to exact input");
+}
+
+/// AC4 — multi-doc posting list with 3+ entries spanning multiple doc_ids.
+///
+/// This is the primary AC4 discriminating assertion: encodes a posting list
+/// with multiple distinct doc_ids, decodes it, and asserts exact
+/// (doc_id, field_id, position) tuple match for every entry.
+#[test]
+fn test_posting_codec_multi_doc_roundtrip() {
+    let postings = vec![
+        PostingEntry { doc_id: 0, field_id: crate::SearchField::TypeDefinition.discriminant(),     position: 0   },
+        PostingEntry { doc_id: 0, field_id: crate::SearchField::FunctionSignature.discriminant(),  position: 5   },
+        PostingEntry { doc_id: 1, field_id: crate::SearchField::Other.discriminant(),               position: 10  },
+        PostingEntry { doc_id: 3, field_id: crate::SearchField::TypeDefinition.discriminant(),     position: 100 },
+        PostingEntry { doc_id: 3, field_id: crate::SearchField::Other.discriminant(),               position: 200 },
+    ];
+    let decoded = posting_roundtrip(&postings);
+    assert_eq!(
+        decoded.len(),
+        postings.len(),
+        "multi-doc round-trip must preserve entry count"
+    );
+    for (i, (got, want)) in decoded.iter().zip(postings.iter()).enumerate() {
+        assert_eq!(
+            got, want,
+            "entry[{i}] mismatch: got {:?}, want {:?}",
+            got, want
+        );
+    }
+}
+
+/// AC4 — posting list with maximum doc_id gap (u32::MAX - 0 = u32::MAX).
+///
+/// Verifies that wrapping_add arithmetic in the decoder handles the largest
+/// possible delta without panicking or silently truncating.
+#[test]
+fn test_posting_codec_max_gap_docid() {
+    let postings = vec![
+        PostingEntry { doc_id: 0,          field_id: 0, position: 0 },
+        PostingEntry { doc_id: u32::MAX,   field_id: 0, position: 0 },
+    ];
+    let decoded = posting_roundtrip(&postings);
+    assert_eq!(decoded.len(), 2, "max-gap posting list must round-trip to 2 entries");
+    assert_eq!(decoded[0].doc_id, 0,        "first entry doc_id must be 0");
+    assert_eq!(decoded[1].doc_id, u32::MAX, "second entry doc_id must be u32::MAX");
+}
+
+/// AC4 — posting list with large position values.
+#[test]
+fn test_posting_codec_large_positions() {
+    let postings = vec![
+        PostingEntry { doc_id: 5, field_id: 0, position: 0         },
+        PostingEntry { doc_id: 5, field_id: 0, position: 1_000_000 },
+        PostingEntry { doc_id: 5, field_id: 0, position: u32::MAX  },
+    ];
+    let decoded = posting_roundtrip(&postings);
+    assert_eq!(decoded.len(), 3);
+    assert_eq!(decoded[0].position, 0);
+    assert_eq!(decoded[1].position, 1_000_000);
+    assert_eq!(decoded[2].position, u32::MAX);
+}
+
+/// decode_postings_varint must return IndexCorrupted for an invalid field_id.
+#[test]
+fn test_posting_codec_invalid_field_id_returns_err() {
+    let p = PostingEntry {
+        doc_id: 0,
+        field_id: 200, // invalid — not a valid SearchField discriminant
+        position: 0,
+    };
+    let mut buf = Vec::new();
+    encode_postings_varint(&[p], &mut buf);
+    // field_id=200 is stored verbatim; decoder must reject it.
+    let result = decode_postings_varint(&buf);
+    assert!(result.is_err(), "invalid field_id must cause decode error");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("field_id"),
+        "error should mention field_id: {err}"
+    );
 }

@@ -27,8 +27,8 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use super::format::{
-    FILE_META_SIZE, FileMetaEntry, POSTING_ENTRY_SIZE, SKIDX_ENTRY_SIZE, SKIDX_HEADER_SIZE,
-    SkidxHeader, compute_checksum, decode_file_meta, decode_header, decode_posting, idf_for_key,
+    FILE_META_SIZE, FileMetaEntry, SKIDX_ENTRY_SIZE, SKIDX_HEADER_SIZE, SkidxHeader,
+    compute_checksum, decode_file_meta, decode_header, decode_postings_varint, idf_for_key,
     lookup_ngram,
 };
 use crate::{
@@ -354,19 +354,14 @@ impl NgramIndexReader {
             )));
         }
 
-        if !length.is_multiple_of(POSTING_ENTRY_SIZE) {
-            return Err(SearchError::IndexCorrupted(format!(
-                "posting_length {length} not aligned to POSTING_ENTRY_SIZE {POSTING_ENTRY_SIZE}"
-            )));
-        }
+        // v4: posting list is variable-length encoded (delta+varint, AD-LXPOST-1).
+        // The old fixed-stride `is_multiple_of(POSTING_ENTRY_SIZE)` guard assumed
+        // 9-byte fixed entries and is removed here — it would incorrectly reject
+        // valid varint-encoded data whose byte count is not a multiple of 9.
+        // decode_postings_varint handles bounds-checking internally and returns
+        // IndexCorrupted for malformed entries.
         let data = &self.post_mmap[start..end];
-        let n = length / POSTING_ENTRY_SIZE;
-        let mut postings = Vec::with_capacity(n);
-        for i in 0..n {
-            let off = i * POSTING_ENTRY_SIZE;
-            postings.push(decode_posting(&data[off..off + POSTING_ENTRY_SIZE])?);
-        }
-        Ok(postings)
+        decode_postings_varint(data)
     }
 }
 
