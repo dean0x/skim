@@ -292,6 +292,19 @@ macro_rules! warn_skip {
 /// fails, the file may exist with no `META_GIT_HEAD` row (same partial-file risk
 /// as the non-empty path) — see inline comment on the `Err` arm.
 ///
+/// **Production reachability note**: a genuine zero-commit git repo has an
+/// *unborn branch* — `read_git_head` returns `None` because `resolve_symbolic_ref`
+/// finds no loose ref and no packed-refs entry.  With `current_head = None`, both
+/// the BUG-B self-heal gate (`if let Some(ref head) = current_head && …` in
+/// `staleness.rs`) and `try_rebuild_temporal_nonfatal` (early `let Some(head) =
+/// head else { return }`) short-circuit before this function is ever invoked with
+/// a `Some(head)`.  The no-rebuild-loop guarantee for zero-commit repos therefore
+/// derives from the `read_git_head = None` short-circuit, **not** from the
+/// empty-DB write.  The empty-DB code path is exercised only by the direct-call
+/// test (`rebuild_temporal_with_source` with a synthetic `fake_head`).  Both
+/// rationales are valid and complementary — the empty-DB write remains correct
+/// for any future call path that does supply a synthetic HEAD.
+///
 /// # Lookback semantics (O-C / ADR-003)
 ///
 /// A single full-history walk (`lookback_days = 0`) supplies all data:

@@ -355,8 +355,11 @@ fn init_git_repo(dir: &std::path::Path) {
 /// Create a real git repository with commits.
 ///
 /// Delegates to the canonical `staleness::create_real_git_repo` shared helper
-/// (see #357 cycle-2 findings 9/14). The `init_git_repo` helper is kept for
-/// tests that need an unborn repo (no commits).
+/// (see #357 cycle-2 findings 9/14). Named identically to the counterpart in
+/// staleness_tests.rs and mod.rs so a reader scanning the three test files sees
+/// the same shared helper rather than three apparently-distinct helpers (#357
+/// cycle-2 finding 3). The `init_git_repo` helper is kept for tests that need
+/// an unborn repo (no commits).
 fn create_real_git_repo(dir: &std::path::Path, commit_files: &[(&str, &[(&str, &str)])]) -> String {
     super::super::staleness::create_real_git_repo(dir, commit_files)
 }

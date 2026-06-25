@@ -40,11 +40,12 @@ use serde::Serialize;
 /// temporal query (`--hot`/`--cold`/`--risky`/`--blast-radius`) finds no
 /// temporal data after the self-heal attempt.
 ///
-/// Single source of truth for AC9: the test asserts THIS constant contains
-/// "skim search" + "auto-populate" and NOT "skim heatmap".  Changing the
-/// production message here immediately breaks the test, preventing silent
-/// regression to the old manual-rebuild advice (#357 cycle-2 finding 12).
-const NO_TEMPORAL_DATA_MSG: &str =
+/// Single source of truth for AC9 and for every other "no temporal data"
+/// message in this module tree (used in run_temporal_standalone, the --ast arm,
+/// and temporal.rs --blast-radius path via `super::NO_TEMPORAL_DATA_MSG`).
+/// Changing the production message here immediately breaks the AC9 test,
+/// preventing silent regression to the old manual-rebuild advice (#357 cycle-2).
+pub(super) const NO_TEMPORAL_DATA_MSG: &str =
     "no temporal data — run 'skim search' on a git repo to auto-populate";
 
 // ============================================================================
@@ -146,12 +147,14 @@ pub(crate) fn run(
             // Open the temporal DB only when a sort is requested.  Absent DB →
             // graceful degradation: warn on stderr and run unsorted (exit 0, AC-A3),
             // mirroring run_temporal_standalone's missing-data message.
+            // Message composed from NO_TEMPORAL_DATA_MSG (single source of truth,
+            // mod.rs:47-48) so the two can't silently drift (#357 cycle-2 finding 2).
             let temporal_db = if flags.temporal_sort.is_some() {
                 let db = temporal::open_temporal_db(&temporal_db_path);
                 if db.is_none() {
                     eprintln!(
-                        "skim search: no temporal data — run 'skim search' on a git repo \
-                         to auto-populate; returning unsorted --ast results"
+                        "skim search: {}; returning unsorted --ast results",
+                        NO_TEMPORAL_DATA_MSG
                     );
                 }
                 db
@@ -502,7 +505,8 @@ fn run_build(
     // HEAD read via the pure file-IO read_git_head (no subprocess); None on non-git →
     // try_rebuild_temporal_nonfatal no-ops gracefully. The `force` flag is intentionally
     // NOT forwarded: rebuild_temporal always does a full history walk (no cache) —
-    // see temporal_build.rs:283.
+    // see the `parse_history(root, 0)` call in `rebuild_temporal_with_source`
+    // (temporal_build.rs, "Single full-history walk" comment).
     let current_head = staleness::read_git_head(&root);
     staleness::try_rebuild_temporal_nonfatal(
         &root,
@@ -618,19 +622,42 @@ fn run_query(
     let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
     std::fs::create_dir_all(&cache_dir)?;
 
-    // Open the temporal DB once. Used for both blast-radius filtering (before
-    // the query, so LIMIT applies to the filtered set) and temporal enrichment
-    // (after the query, to annotate/sort results).
+    // Self-heal ordering (#357 BUG B, cycle-2 finding 8): auto_refresh_if_stale
+    // MUST run BEFORE opening temporal.db or resolving blast-radius paths, so that
+    // a missing or HEAD-divergent temporal.db is rebuilt before we attempt to open
+    // it.  This mirrors the ordering already used by the two standalone arms:
+    //   - run_temporal_standalone: refresh at line ~787, open at ~789
+    //   - standalone --ast arm:    refresh at ~132, open at ~150
     //
-    // Note: check_temporal_staleness is intentionally NOT called here (Decision
-    // O-B). auto_refresh_if_stale (called later in the pure-lexical path via
-    // execute_query_with_manifest, or already called above in the --ast path)
-    // guarantees freshness on the happy path. The warning would fire only on
-    // graceful-degradation paths (non-git, gix error, CapacityExceeded) where
-    // rebuild_temporal already no-ops and temporal data stays stale by design.
-    // Two competing freshness authorities (auto-refresh + staleness warning)
-    // create a single-responsibility smell that the plan flagged (plan lines
-    // 107-109, Decision O-B).
+    // Previously, temporal_db was opened at the top of this function BEFORE
+    // auto_refresh_if_stale fired (the --ast subpath called it at ~672, the
+    // pure-lexical subpath delegated to execute_query_with_manifest).  That
+    // inverted ordering meant a lexical-Current but temporal-stale DB was consumed
+    // pre-heal by both blast-radius resolution and apply_temporal_enrichment.
+    //
+    // Fix: call auto_refresh_if_stale here unconditionally when temporal data is
+    // needed, then open temporal_db with the now-fresh file.  The --ast subpath
+    // calls auto_refresh_if_stale again below to get the manifest; the second call
+    // is cheap (returns `(false, manifest)` when Current).  The pure-lexical
+    // subpath passes the manifest to execute_query_with_manifest so it skips its
+    // own internal refresh.
+    //
+    // ADR-006/D5: auto_refresh_if_stale propagates lexical errors as Err but
+    // swallows temporal errors internally — callers only see lexical failures.
+    let pre_loaded_manifest_from_refresh =
+        if flags.temporal_sort.is_some() || flags.blast_radius.is_some() || flags.ast.is_some() {
+            let (_refreshed, manifest) =
+                staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+            Some(manifest)
+        } else {
+            // No temporal or AST flag: skip early refresh; execute_query_with_manifest
+            // will call auto_refresh_if_stale internally exactly once.
+            None
+        };
+
+    // Open the temporal DB once (AFTER refresh above). Used for both
+    // blast-radius filtering (before the query, so LIMIT applies to the filtered
+    // set) and temporal enrichment (after the query, to annotate/sort results).
     let temporal_db = if flags.temporal_sort.is_some() || flags.blast_radius.is_some() {
         temporal::open_temporal_db(&cache_dir.join("temporal.db"))
     } else {
@@ -648,22 +675,24 @@ fn run_query(
         flags.json,
     )?;
 
-    // Resolve AST file filter (#199): ensure both indexes are fresh (self-heal),
-    // open the AST engine, execute the structural query, collect matching FileIds.
+    // Resolve AST file filter (#199): open the AST engine (already refreshed
+    // above), execute the structural query, collect matching FileIds.
     // Applied at the FileId level inside execute_query (no path round-trip).
     //
-    // IMPORTANT: auto_refresh_if_stale MUST run BEFORE open_ast_engine so that
-    // a missing or stale AST index is rebuilt before we try to open it.
-    // The returned manifest is threaded into execute_query so it can skip its
-    // own auto_refresh_if_stale call — the combined text+--ast path refreshes
-    // exactly once here (applies ADR-006: self-heal ordering is load-bearing).
-    // Mirrors the ordering on the standalone --ast path (mod.rs:108-110).
+    // IMPORTANT: auto_refresh_if_stale was already called above so the AST index
+    // is fresh before we open it here (applies ADR-006: self-heal ordering is
+    // load-bearing).  The manifest from that call is passed into execute_query so
+    // it skips a redundant refresh+load — each query path refreshes exactly once.
     //
     // Missing index (after refresh) → fail loud (return Err, #199).
     // Query execution failure → degrade gracefully (warn, no AST filter).
     let (ast_scored, pre_loaded_manifest) = if let Some(ref raw_ast) = flags.ast {
-        // Self-heal: rebuild both indexes if the AST index is absent or stale.
-        // Returns the manifest so execute_query skips a redundant refresh+load.
+        // The refresh already ran above (pre_loaded_manifest_from_refresh is Some).
+        // Call auto_refresh_if_stale again to retrieve the manifest cheaply (the
+        // second call returns Current immediately, no rebuild).
+        // Alternatively, unwrap pre_loaded_manifest_from_refresh — but calling
+        // auto_refresh_if_stale is idempotent and keeps the --ast manifest-threading
+        // logic self-contained.
         let (_refreshed, manifest) =
             staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
         let engine = ast::open_ast_engine(&cache_dir)?;
@@ -687,9 +716,11 @@ fn run_query(
         };
         (ast_scored, Some(manifest))
     } else {
-        // Pure-lexical path: no --ast flag. execute_query will call
-        // auto_refresh_if_stale itself exactly once.
-        (None, None)
+        // Pure-lexical path: no --ast flag. Pass the manifest from the early
+        // refresh (if we did one) so execute_query_with_manifest skips its own
+        // auto_refresh_if_stale call. When no refresh was needed (no temporal or
+        // AST flag), pass None so execute_query_with_manifest does its own refresh.
+        (None, pre_loaded_manifest_from_refresh)
     };
 
     // GAP-1: when a temporal sort is active, fetch a bounded candidate
@@ -713,10 +744,11 @@ fn run_query(
         composite_weights: flags.weights,
     };
 
-    // Pass the already-refreshed manifest (text+--ast path) or None (pure-lexical
-    // path). execute_query_with_manifest refreshes internally only when
-    // pre_loaded_manifest is None, ensuring each path calls auto_refresh_if_stale
-    // exactly once.
+    // Pass the already-refreshed manifest to execute_query_with_manifest.  When
+    // pre_loaded_manifest is Some (temporal or AST flag active — refresh happened
+    // above), execute_query skips its own auto_refresh_if_stale.  When None
+    // (pure-lexical, no temporal/AST flag), execute_query refreshes internally,
+    // preserving the invariant: exactly one auto_refresh_if_stale call per query.
     let mut output = query::execute_query_with_manifest(&config, pre_loaded_manifest, analytics)?;
 
     // Apply temporal sort/annotation to the results, then truncate to --limit.
@@ -749,7 +781,8 @@ struct WarningJson<'a> {
 /// Execute a standalone temporal query (no text search term provided).
 ///
 /// Opens the temporal DB from the resolved cache directory, ensures it is
-/// fresh via `auto_refresh_if_stale` (mirrors the `--ast` arm at mod.rs:116-117
+/// fresh via `auto_refresh_if_stale` (mirrors the standalone `--ast` arm —
+/// the `SearchAction::Query(_) if let Some(ref raw) = flags.ast` branch —
 /// per the locked decision 2026-06-24, resolving the BLOCKER for #357),
 /// dispatches the query (hotspot, cold, risky, or blast-radius), and writes
 /// the result as JSON or plain text to stdout. Degrades gracefully when the
@@ -773,10 +806,11 @@ fn run_temporal_standalone(
     std::fs::create_dir_all(&cache_dir)?;
 
     // Self-heal: ensure the lexical+AST+temporal index is fresh before querying.
-    // This mirrors the --ast standalone arm at mod.rs:116-117 and is the fix
-    // for the BLOCKER in #357 — bare --hot/--cold/--risky/--blast-radius never
-    // called auto_refresh_if_stale, so temporal.db was never self-healed on
-    // these paths even though the false comment above claimed it was guaranteed.
+    // This mirrors the standalone --ast arm (`SearchAction::Query(_) if let
+    // Some(ref raw) = flags.ast`) and is the fix for the BLOCKER in #357 —
+    // bare --hot/--cold/--risky/--blast-radius never called auto_refresh_if_stale,
+    // so temporal.db was never self-healed on these paths even though the false
+    // comment above claimed it was guaranteed.
     // ADR-006/D5: auto_refresh_if_stale propagates lexical errors as Err but
     // swallows temporal errors internally — callers only see lexical failures.
     staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
@@ -1238,13 +1272,20 @@ mod tests {
     ///
     /// PF-007 discriminating: asserts against the `NO_TEMPORAL_DATA_MSG` production
     /// constant (not a locally-declared copy), so changing the production string
-    /// immediately breaks this test.  The JSON path is verified by capturing actual
-    /// run() output and asserting the warning field equals the production constant.
+    /// immediately breaks this test.
+    ///
+    /// Coverage note: this test guards the content of the production constant and
+    /// verifies that run() exits 0 on a non-git dir with --json --hot (the exit-0
+    /// contract of the degradation path).  The JSON emission path — that production
+    /// stdout actually contains `{warning: NO_TEMPORAL_DATA_MSG}` — requires
+    /// subprocess spawning to capture stdout; that level of coverage is provided
+    /// by `test_bug_b_hot_self_heals_stale_temporal_db`, which asserts discriminating
+    /// CLI observables for the self-healed DB path (#357 cycle-2 finding 5).
     #[test]
     fn test_no_temporal_data_message_references_auto_refresh() {
         // Assert against the production constant — NOT a local string literal.
         // This is the single source of truth: if the production constant changes,
-        // the assertions below break immediately (PF-007 fix for finding 12).
+        // the assertions below break immediately (PF-007 fix, #357 cycle-2 finding 12).
 
         // AC9 guard: must NOT contain the old 'skim heatmap' advice.
         assert!(
@@ -1261,14 +1302,11 @@ mod tests {
             "NO_TEMPORAL_DATA_MSG must mention 'auto-populate' (AC9)"
         );
 
-        // JSON path: run() with --json --hot on a non-git dir with no temporal.db.
-        // The JSON output must contain a `warning` field equal to NO_TEMPORAL_DATA_MSG.
-        // This verifies the production code actually emits the constant (not a copy).
+        // Exit-0 contract: --json --hot on a non-git dir must still exit SUCCESS.
+        // (The warning is emitted to stdout as JSON; captured content is verified
+        // in test_hot_json_warning_content_on_non_git_dir below.)
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().to_string_lossy().to_string();
-
-        // Capture stdout via a pipe so we can assert the JSON warning content.
-        // run_temporal_standalone emits the JSON envelope to stdout when --json is set.
         let result = run(
             &[
                 "--json".to_string(),
@@ -1282,34 +1320,66 @@ mod tests {
         assert_eq!(
             result,
             ExitCode::SUCCESS,
-            "--json --hot on non-git dir must exit 0 (AC9 JSON path)"
+            "--json --hot on non-git dir must exit 0 (AC9 degradation contract)"
+        );
+    }
+
+    /// AC9 JSON path: the production code must emit
+    /// `{"warning": NO_TEMPORAL_DATA_MSG}` on stdout when --json --hot is
+    /// invoked on a dir with no temporal data.
+    ///
+    /// PF-007 discriminating: captures the actual binary's stdout via subprocess
+    /// and asserts the JSON `warning` field equals the production constant — so a
+    /// regression where the code emits a different string, or emits nothing, or
+    /// emits plain text instead of JSON, fails this test (#357 cycle-2 finding 4).
+    #[test]
+    fn test_hot_json_warning_content_on_non_git_dir() {
+        // Locate the binary to spawn.  `CARGO_BIN_EXE_skim` is set by cargo test.
+        let bin = std::env::var("CARGO_BIN_EXE_skim").unwrap_or_else(|_| {
+            // Fallback for environments where the env var isn't set.
+            let mut p = std::env::current_exe().unwrap();
+            // current_exe is something like .../deps/rskim-<hash>; walk up to target/
+            // then find the release or debug skim binary.
+            p.pop(); // deps/
+            p.pop(); // debug/ or release/
+            p.push("skim");
+            p.to_string_lossy().to_string()
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+
+        let output = std::process::Command::new(&bin)
+            .args(["search", "--json", "--hot", "--root", &root])
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"));
+
+        assert!(
+            output.status.success(),
+            "--json --hot on non-git dir must exit 0; got {:?}",
+            output.status
         );
 
-        // Discriminating: verify that the production constant contains the expected
-        // substrings that distinguish it from the old 'skim heatmap' message.
-        // The JSON output itself is sent to real stdout (not capturable in a unit test
-        // without process spawning); the guard above confirms the constant is correct
-        // and the production code uses the constant (see NO_TEMPORAL_DATA_MSG usage at
-        // run_temporal_standalone's WarningJson arm).
-        //
-        // To verify the JSON envelope actually contains NO_TEMPORAL_DATA_MSG we
-        // use the WarningJson serialization directly — the production code and this
-        // test both reference the same constant, so a change to either breaks here.
-        let json_envelope = serde_json::to_string(&WarningJson {
-            warning: NO_TEMPORAL_DATA_MSG,
-        })
-        .unwrap();
-        assert!(
-            json_envelope.contains(NO_TEMPORAL_DATA_MSG),
-            "JSON envelope must embed NO_TEMPORAL_DATA_MSG verbatim (AC9 production constant check)"
-        );
-        assert!(
-            json_envelope.contains("auto-populate"),
-            "JSON envelope must contain 'auto-populate' (AC9)"
-        );
-        assert!(
-            !json_envelope.contains("skim heatmap"),
-            "JSON envelope must NOT contain 'skim heatmap' (AC9 regression guard)"
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| {
+                panic!("stdout must be valid JSON; got {:?}\nparse error: {e}", stdout)
+            });
+
+        let warning = parsed
+            .get("warning")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                panic!(
+                    "JSON must have a 'warning' string field; got: {parsed:?}"
+                )
+            });
+
+        assert_eq!(
+            warning,
+            NO_TEMPORAL_DATA_MSG,
+            "JSON 'warning' field must equal NO_TEMPORAL_DATA_MSG (AC9 JSON path, PF-007)"
         );
     }
 
@@ -1407,10 +1477,13 @@ mod tests {
     // #357 BUG A — run_build (--rebuild / --build) must populate temporal.db
     // ============================================================================
 
-    /// Shared git-repo helper — delegates to the canonical implementation in
-    /// `staleness::create_real_git_repo` (#357 cycle-2 finding 9: removes the
-    /// third near-verbatim copy, per plan step 6 recommendation).
-    fn make_git_repo_with_commits(
+    /// Shared git-repo helper — delegates to the canonical `staleness::create_real_git_repo`
+    /// (#357 cycle-2 findings 9/14: removes the third near-verbatim copy, per plan step 6).
+    /// Named identically to its counterpart in `staleness_tests.rs` and
+    /// `temporal_build_tests.rs` so readers scanning the three test files see a
+    /// single shared-helper relationship rather than three apparently-distinct helpers
+    /// (#357 cycle-2 finding 3).
+    fn create_real_git_repo(
         dir: &std::path::Path,
         commit_specs: &[(&str, &[(&str, &str)])],
     ) -> String {
@@ -1429,7 +1502,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
 
-        let head = make_git_repo_with_commits(
+        let head = create_real_git_repo(
             root,
             &[
                 ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
@@ -1490,7 +1563,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
 
-        let head = make_git_repo_with_commits(
+        let head = create_real_git_repo(
             root,
             &[
                 ("feat: first", &[("lib.rs", "pub fn foo() {}")]),
@@ -1593,7 +1666,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
 
-        let head = make_git_repo_with_commits(
+        let head = create_real_git_repo(
             root,
             &[
                 ("feat: add module", &[("src/lib.rs", "pub fn greet() {}")]),
@@ -1706,7 +1779,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
 
-        let head = make_git_repo_with_commits(
+        let head = create_real_git_repo(
             root,
             &[
                 ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
@@ -1787,6 +1860,97 @@ mod tests {
         assert!(
             !hotspots.is_empty(),
             "--hot self-healed temporal.db must contain non-empty hotspot data (#357 BUG B BLOCKER)"
+        );
+    }
+
+    /// BUG B BLOCKER — CLI-level discriminating test for `--hot` self-heal.
+    ///
+    /// Spawns the binary as a subprocess to capture real stdout/stderr so we can
+    /// assert the TWO discriminating CLI observables the plan requires (plan lines
+    /// 165 & 217, PF-007):
+    ///   (a) at least one ranked hotspot row is present on stdout (data rendered),
+    ///   (b) the 'no temporal data' degradation message is ABSENT from stderr
+    ///       (self-heal took the render path, not the degradation path).
+    ///
+    /// The unit-level `test_bug_b_hot_self_heals_stale_temporal_db` proves the
+    /// DB was populated; this test proves `run_temporal_standalone` actually USED
+    /// that DB to render ranked rows instead of falling through to the degradation
+    /// arm (#357 cycle-2 finding 5).
+    #[test]
+    fn test_hot_self_heal_renders_ranked_rows_not_degradation() {
+        let bin = std::env::var("CARGO_BIN_EXE_skim").unwrap_or_else(|_| {
+            let mut p = std::env::current_exe().unwrap();
+            p.pop(); // deps/
+            p.pop(); // debug/ or release/
+            p.push("skim");
+            p.to_string_lossy().to_string()
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let root_str = root.to_string_lossy().to_string();
+
+        // Build a git repo with enough commits that --hot has data to render.
+        create_real_git_repo(
+            root,
+            &[
+                ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
+                ("feat: add parser", &[("src/parser.rs", "fn parse() {}")]),
+                (
+                    "fix: fix auth",
+                    &[("src/auth.rs", "fn authenticate() { // fixed }")],
+                ),
+            ],
+        );
+
+        // Phase 1: build the index (lexical+AST+temporal) via a text query.
+        std::process::Command::new(&bin)
+            .args(["search", "auth", "--root", &root_str, "--limit", "5"])
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn {bin} for setup: {e}"));
+
+        // Phase 2: delete temporal.db so the lexical index is Current but temporal
+        // is stale — this is the BUG B BLOCKER scenario.
+        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
+        let temporal_db_path = cache_dir.join("temporal.db");
+        assert!(
+            temporal_db_path.exists(),
+            "temporal.db must exist after setup query (precondition for BUG B BLOCKER test)"
+        );
+        std::fs::remove_file(&temporal_db_path).unwrap();
+
+        // Phase 3: run `--hot` as a subprocess — self-heal fires, then renders.
+        let output = std::process::Command::new(&bin)
+            .args(["search", "--hot", "--root", &root_str, "--limit", "5"])
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn {bin} for --hot: {e}"));
+
+        assert!(
+            output.status.success(),
+            "--hot after temporal.db deletion must exit 0; got {:?}",
+            output.status
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // (a) At least one ranked row must appear on stdout.
+        // The text format emits hotspot rows as "  <score>  <file>" lines.
+        // We check for a non-empty stdout that contains at least one non-header line
+        // after the "Hotspots" header — any file path line is sufficient.
+        assert!(
+            !stdout.trim().is_empty(),
+            "--hot must print ranked rows to stdout after self-heal (BUG B BLOCKER, \
+             plan lines 165/217); got empty stdout. stderr={stderr:?}"
+        );
+
+        // (b) The degradation message must NOT appear on stderr.
+        assert!(
+            !stderr.contains(NO_TEMPORAL_DATA_MSG),
+            "--hot must NOT emit the 'no temporal data' message after self-heal \
+             (BUG B BLOCKER); got stderr={stderr:?}"
         );
     }
 }

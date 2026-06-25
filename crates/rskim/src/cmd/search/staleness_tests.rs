@@ -695,12 +695,13 @@ fn test_auto_refresh_hook_temporal_failure_does_not_fail_lexical() {
 
 /// Shared helper: create a real git repo with commits.
 ///
-/// Delegates to the canonical `create_real_git_repo` helper promoted into
-/// `staleness.rs` so staleness_tests.rs, temporal_build_tests.rs, and mod.rs
-/// tests all share one implementation (avoids three-copy drift, #357 cycle-2
-/// findings 9/14). Kept as a thin alias here so existing call sites in this
-/// file require no further churn.
-fn create_real_git_repo_for_staleness(
+/// Delegates to the canonical `staleness::create_real_git_repo` helper so
+/// staleness_tests.rs, temporal_build_tests.rs, and mod.rs tests all share one
+/// implementation (avoids three-copy drift, #357 cycle-2 findings 9/14).
+/// Named identically to the counterpart in temporal_build_tests.rs and mod.rs
+/// so a reader scanning the three test files sees the same shared helper (#357
+/// cycle-2 finding 3).
+fn create_real_git_repo(
     dir: &std::path::Path,
     commit_files: &[(&str, &[(&str, &str)])],
 ) -> String {
@@ -725,7 +726,7 @@ fn test_auto_refresh_hook_populates_temporal_db_on_real_git_repo() {
     fs::create_dir_all(&cache_dir).unwrap();
 
     // Create a real git repo with a few commits so temporal data is non-trivial.
-    let head = create_real_git_repo_for_staleness(
+    let head = create_real_git_repo(
         dir.path(),
         &[
             ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
@@ -803,7 +804,7 @@ fn test_auto_refresh_temporal_success_does_not_affect_lexical_manifest() {
     let cache_dir = dir.path().join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
 
-    let head = create_real_git_repo_for_staleness(
+    let head = create_real_git_repo(
         dir.path(),
         &[
             ("feat: first", &[("lib.rs", "pub fn foo() {}")]),
@@ -917,7 +918,7 @@ fn test_bug_b_auto_refresh_self_heals_deleted_temporal_db() {
     fs::create_dir_all(&cache_dir).unwrap();
 
     // Create a real git repo with a few commits.
-    let head = create_real_git_repo_for_staleness(
+    let head = create_real_git_repo(
         dir.path(),
         &[
             ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
@@ -994,7 +995,7 @@ fn test_bug_b_auto_refresh_self_heals_head_divergent_temporal_db() {
     let cache_dir = dir.path().join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
 
-    let head = create_real_git_repo_for_staleness(
+    let head = create_real_git_repo(
         dir.path(),
         &[
             ("feat: add module", &[("src/lib.rs", "pub fn foo() {}")]),
@@ -1066,7 +1067,7 @@ fn test_bug_b_no_rebuild_loop_when_temporal_is_current() {
     let cache_dir = dir.path().join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
 
-    let _head = create_real_git_repo_for_staleness(
+    let _head = create_real_git_repo(
         dir.path(),
         &[
             ("feat: init", &[("src/lib.rs", "pub fn hello() {}")]),
@@ -1197,7 +1198,7 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
         fs::create_dir_all(&cache_dir).unwrap();
 
         // One commit makes HEAD readable.
-        create_real_git_repo_for_staleness(
+        create_real_git_repo(
             dir.path(),
             &[("init", &[("README", "hello")])],
         );
