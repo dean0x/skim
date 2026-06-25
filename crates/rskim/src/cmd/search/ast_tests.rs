@@ -2079,3 +2079,272 @@ fn text_ast_empty_ast_set_returns_empty_ac12() {
         output.total
     );
 }
+
+// ============================================================================
+// AC3 — blast∩AST compound completeness (#356)
+// ============================================================================
+
+/// Build a fixture with N qualifying files (both text+AST) and M lexical
+/// distractors.
+///
+/// Qualifying files (`src/target_NN.rs`): contain "nested" once AND a nested
+/// for-loop so both the text query ("nested") AND `rust-nested-loop` AST
+/// pattern match.
+///
+/// Distractor files (`src/noast_NN.rs`): contain "nested" 30 times but NO
+/// nested loops, so they score higher lexically but FAIL the AST filter.
+///
+/// Layout mirrors `make_project_with_lexical_cliff_fixture` but with N
+/// qualifying files instead of 1, enabling AC3 (blast∩AST completeness) tests
+/// where the qualifying set exceeds the old `limit * CANDIDATE_POOL_K = 4`
+/// cliff.
+fn make_project_with_blast_ast_cliff_fixture(n_qualifying: usize, n_distractors: usize) -> TempDir {
+    assert!(n_qualifying >= 1, "must have at least 1 qualifying file");
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Qualifying files: "nested" once + nested for-loop (match both text+AST).
+    for i in 1..=n_qualifying {
+        fs::write(
+            root.join(format!("src/target_{i:02}.rs")),
+            format!(
+                r#"
+// nested: qualifying file {i}
+fn work_{i}() {{
+    for a in 0..{i} {{
+        for b in 0..{i} {{
+            let _ = (a, b);
+        }}
+    }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    // Distractor files: "nested" 30× but NO nested loops — outrank qualifying
+    // files in unfiltered lexical scoring, yet fail the AST filter.
+    for i in 1..=n_distractors {
+        let body = "// nested\n".repeat(30);
+        fs::write(
+            root.join(format!("src/noast_{i:02}.rs")),
+            format!(
+                r#"
+{body}
+fn distractor_{i}() {{
+    println!("not a nested loop");
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fs::write(root.join("config.json"), r#"{"key": "value"}"#).unwrap();
+
+    dir
+}
+
+/// AC3 — blast∩AST compound completeness: `run_compound_query` with BOTH
+/// `ast_scored` and `blast_radius_paths` set must return the complete
+/// blast∩AST∩text intersection, not a `limit * K`-capped subset (#356).
+///
+/// # The second pool-cliff locus (plan AC3)
+///
+/// `run_compound_query` has TWO sub-paths:
+///
+/// 1. **No-blast** (`blast_file_ids = None`): `filter_set = ast_fid_set`.
+///    Covered by `text_ast_intersection_complete_below_pool_cliff_356`.
+///
+/// 2. **blast+AST** (`blast_file_ids = Some`): `filter_set = blast ∩ ast`.
+///    THIS test covers this sub-path — previously uncovered.
+///
+/// Pre-fix, BOTH sub-paths used `sq.limit = config.limit.saturating_mul(4)`
+/// with no `file_filter`.  At `--limit 1` pool = 4 and the 6 lexical
+/// distractors fill the pool, dropping all 6 qualifying files.  The test
+/// asserts `count >= 1` → FAILS with the old code.
+///
+/// Post-fix (AD-356-1/2): `filter_set = blast ∩ ast = {target_01..target_06}`,
+/// `sq.file_filter = Some(filter_set)`, `sq.limit = Some(6)`.  The reader
+/// scores only the 6 qualifying files → all match text → at `--limit 1`
+/// exactly 1 is returned from the complete set → test PASSES.
+///
+/// # Discriminating properties (PF-007)
+///
+/// - If `sq.limit = config.limit.saturating_mul(4)` were reintroduced on this
+///   sub-path (regression), the distractors would fill the pool at `--limit 1`
+///   and 0 qualifying files would be returned → `count >= 1` FAILS.
+/// - If the blast intersection were dropped (regression: `filter_set = ast_fid_set`
+///   ignoring blast), the distractor-filled pool would again prevent qualifying
+///   files from appearing at `--limit 1` in the no-file-filter case.
+/// - The `--limit N` assertion proves that ALL N qualifying files are accessible
+///   (full-set completeness), not just that the top-1 works.
+/// - The empty-blast∩AST sub-case asserts that a disjoint blast+AST set returns
+///   empty with no panic (correctness guard per plan AC12(b)).
+///
+/// # Why `blast_radius_paths` is passed directly (no TemporalDb in test)
+///
+/// `execute_query` accepts `blast_radius_paths: Some(HashSet<String>)` as
+/// pre-resolved repo-relative paths.  `mod.rs` uses `TemporalDb` to BUILD that
+/// set before calling `execute_query`; the test bypasses `mod.rs` and injects
+/// the paths directly — same production path, no test-only TemporalDb needed.
+/// This is intentional per the NO-FAKE-SOLUTIONS rule: the intersection logic
+/// in `run_compound_query` is independent of how the blast path set was built.
+#[test]
+fn text_ast_blast_intersection_complete_356() {
+    use std::collections::HashSet;
+
+    use super::super::query::execute_query;
+    use super::super::types::QueryConfig;
+
+    const N: usize = 6; // qualifying files (> old limit*4 = 4 at --limit 1)
+    const DISTRACTORS: usize = 6; // lexically-outranking files that fail AST
+
+    let project = make_project_with_blast_ast_cliff_fixture(N, DISTRACTORS);
+    let cache = tempfile::tempdir().unwrap();
+
+    build_project_index(project.path(), cache.path());
+
+    // -- Precondition: AST filter matches exactly the N qualifying files -------
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
+
+    assert_eq!(
+        ast_scored.len(),
+        N,
+        "AC3 precondition: rust-nested-loop must match exactly {N} qualifying files; \
+         got {} — check that target_NN.rs files have nested for-loops and \
+         noast_NN.rs files do not",
+        ast_scored.len()
+    );
+
+    // -- blast_radius_paths: the N qualifying files (injected directly) --------
+    //
+    // In production, mod.rs resolves these from TemporalDb::cochanges_for_file.
+    // Here we inject them as pre-resolved repo-relative paths — same code path
+    // in execute_query (paths_to_file_ids builds the FileId set from sorted_paths).
+    let blast_paths: HashSet<String> = (1..=N).map(|i| format!("src/target_{i:02}.rs")).collect();
+
+    // -- AC3(a) full-set at --limit N: all N qualifying files returned ---------
+    let full_config = QueryConfig {
+        text: "nested".to_string(),
+        limit: N,
+        json: false,
+        root: project.path().to_path_buf(),
+        cache_dir: cache.path().to_path_buf(),
+        blast_radius_paths: Some(blast_paths.clone()),
+        ast_scored: Some(ast_scored.clone()),
+        composite_weights: None,
+    };
+    let full_output = execute_query(&full_config, &TEST_ANALYTICS).unwrap();
+
+    assert_eq!(
+        full_output.results.len(),
+        N,
+        "AC3: --limit {N} with blast+AST must return all {N} qualifying files; \
+         got {} — if the count is 4, the blast sub-path is using limit*4 (pool-cliff \
+         regression on the blast+AST branch of run_compound_query)",
+        full_output.results.len()
+    );
+
+    // All returned paths must be qualifying target files (not distractors).
+    for r in &full_output.results {
+        assert!(
+            r.path.contains("target_"),
+            "AC3: result path must be a target_NN.rs file (not a distractor); got: {:?}. \
+             A distractor appearing here means the AST filter or blast intersection is \
+             not being applied correctly.",
+            r.path
+        );
+    }
+
+    // -- AC3(b) pool-cliff discriminator at --limit 1 -------------------------
+    //
+    // PRE-FIX (regression): sq.limit = 1.saturating_mul(4) = 4, NO file_filter.
+    // Pool = 4 candidates from the full corpus. The 6 distractor files each
+    // contain "nested" 30×, outranking the 6 qualifying files (1× each).
+    // The top-4 lexical hits are all distractors. None of the 6 qualifying
+    // files appear in the pool → blast∩AST intersection is empty → 0 results.
+    // THIS ASSERTION (count >= 1) WOULD FAIL against the pre-fix code.
+    //
+    // POST-FIX (AD-356-1/2): filter_set = blast∩ast = {target_01..target_06},
+    // sq.file_filter = Some(filter_set), sq.limit = Some(6).
+    // Reader scores only the 6 qualifying files → all match "nested" →
+    // intersect_and_rank returns 6 → take(1) yields 1 result. PASSES.
+    let limit1_config = QueryConfig {
+        text: "nested".to_string(),
+        limit: 1,
+        json: false,
+        root: project.path().to_path_buf(),
+        cache_dir: cache.path().to_path_buf(),
+        blast_radius_paths: Some(blast_paths.clone()),
+        ast_scored: Some(ast_scored.clone()),
+        composite_weights: None,
+    };
+    let limit1_output = execute_query(&limit1_config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !limit1_output.results.is_empty(),
+        "AC3 (pool-cliff DISCRIMINATING): --limit 1 with blast+AST returned 0 results. \
+         target_NN.rs files must appear even though distractors rank higher lexically. \
+         If count=0, the blast+AST sub-path of run_compound_query is using a pool cap \
+         (limit*K regression) instead of file_filter=blast∩ast (AD-356-1 regression).",
+    );
+
+    // The returned file must be a qualifying target file (not a distractor).
+    assert!(
+        limit1_output.results[0].path.contains("target_"),
+        "AC3: --limit 1 result must be a target_NN.rs file; got: {:?}. \
+         A distractor appearing here means the blast∩AST file_filter is not \
+         restricting the lexical engine to the qualifying set.",
+        limit1_output.results[0].path
+    );
+
+    // The result must be in the complete blast∩AST∩text set (full_output paths).
+    let full_paths: HashSet<&str> = full_output
+        .results
+        .iter()
+        .map(|r| r.path.as_str())
+        .collect();
+    assert!(
+        full_paths.contains(limit1_output.results[0].path.as_str()),
+        "AC3: --limit 1 result {:?} is not in the complete --limit {N} set {:?}. \
+         The result must be a member of the full blast∩AST∩text intersection.",
+        limit1_output.results[0].path,
+        full_paths
+    );
+
+    // -- AC3(c) empty blast∩AST: disjoint sets return empty, no panic ----------
+    //
+    // blast_radius_paths contains ONLY the noast files (distractors), which are
+    // NOT in ast_scored (they have no nested loops). filter_set = blast∩ast = {}.
+    // Expected: empty results, no panic (reader returns 0 docs for empty filter).
+    let disjoint_blast: HashSet<String> = (1..=DISTRACTORS)
+        .map(|i| format!("src/noast_{i:02}.rs"))
+        .collect();
+
+    let disjoint_config = QueryConfig {
+        text: "nested".to_string(),
+        limit: 10,
+        json: false,
+        root: project.path().to_path_buf(),
+        cache_dir: cache.path().to_path_buf(),
+        blast_radius_paths: Some(disjoint_blast),
+        ast_scored: Some(ast_scored),
+        composite_weights: None,
+    };
+    let disjoint_output = execute_query(&disjoint_config, &TEST_ANALYTICS)
+        .expect("AC3(c): execute_query must not error on disjoint blast∩AST set");
+
+    assert!(
+        disjoint_output.results.is_empty(),
+        "AC3(c): disjoint blast∩AST must return empty results (no panic); \
+         got {} results — the empty filter_set must cause the reader to score \
+         zero documents (per reader.rs file_filter semantics).",
+        disjoint_output.results.len()
+    );
+}

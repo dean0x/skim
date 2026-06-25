@@ -317,9 +317,12 @@ fn run_compound_query(
     blast_file_ids: Option<HashSet<FileId>>,
     ctx: QueryContext<'_>,
 ) -> anyhow::Result<QueryOutput> {
+    // Note: config.limit >= 1 is enforced by parse_limit_value (mod.rs) which
+    // rejects --limit 0 with a CLI error, so limit:0 is unreachable in production.
+    // The debug_assert below documents the invariant (not a runtime safety net).
     debug_assert!(
         config.limit >= 1,
-        "config.limit must be >= 1 (CLI guarantee)"
+        "config.limit must be >= 1 (CLI guarantee via parse_limit_value; see mod.rs)"
     );
 
     // Build the AST FileId set once for O(1) membership tests below.
@@ -358,6 +361,16 @@ fn run_compound_query(
             .collect(),
         None => ast_fid_set,
     };
+    // Disjoint blast∩AST: when blast and AST sets are non-empty but disjoint,
+    // filter_set is empty. sq.file_filter = Some(empty) causes the reader to
+    // score zero documents (reader.rs file_filter check excludes every doc), so
+    // the query correctly returns no results with no panic. This is intentional
+    // and relies on the reader's documented `file_filter` semantics — an empty
+    // allowlist means "no file is allowed". sq.limit = Some(0.max(1)) = Some(1)
+    // is harmless: no document passes the file_filter, so the reader's take(1)
+    // never fires. We document this explicitly rather than adding a redundant
+    // early-out, since the early-out at ast_fid_set.is_empty() above already
+    // handles the "no AST matches at all" degenerate case.
     let mut sq = SearchQuery::new(config.text.clone());
     sq.limit = Some(filter_set.len().max(1));
     sq.file_filter = Some(filter_set);
