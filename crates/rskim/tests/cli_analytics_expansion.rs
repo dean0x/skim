@@ -965,24 +965,24 @@ fn test_f13_multi_disable_analytics_no_rows() {
     );
 }
 
-/// F14: robustness — one file deleted between transform and background re-read.
-/// With 3 files where 1 is deleted after skim runs, N-1 rows are expected (not crash).
+/// F14: robustness — one file absent at pre-dispatch stage (process_explicit_files).
+/// With 3 files where 1 does not exist when skim is invoked, N-1 rows are expected.
 ///
-/// This test verifies best-effort behaviour: deleted/changed files are silently skipped
-/// while sibling rows are still recorded.
+/// This test verifies that a file that is missing at the point of initial dispatch
+/// (process_explicit_files / process_file) is treated as an Err entry: it is filtered
+/// out before analytics rows are built, sibling files' rows are still recorded, and the
+/// process exits 0 when at least 1 file succeeded.
 ///
-/// Strategy: run 3 files, but delete 1 of the temp files BEFORE the skim invocation
-/// to ensure it fails during processing (will be an Err entry in results). We then
-/// verify: exit code unaffected (2 files succeed), and rows == 2 (skipped error).
+/// Note: this path (pre-dispatch failure) is distinct from the background re-read skip
+/// tested by F15. Here the file is never read by process_file at all.
 #[test]
-fn test_f14_missing_file_records_n_minus_1_rows() {
+fn test_f14_predispatch_missing_file_records_n_minus_1_rows() {
     let file_dir = TempDir::new().unwrap();
     let ts = ts_fixture();
     let py = py_fixture();
 
-    // Third file: created then immediately removed (simulating a file that
-    // disappears before the background re-read — but in fact process_file will
-    // fail to read it too, meaning it is an Err result and not counted).
+    // Third file: created then immediately removed so it does not exist when skim
+    // runs. process_explicit_files will fail to read it → Err entry, not counted.
     let ghost_path = file_dir.path().join("ghost.ts");
     std::fs::write(&ghost_path, "function ghost() {}").unwrap();
     std::fs::remove_file(&ghost_path).unwrap();
@@ -990,12 +990,12 @@ fn test_f14_missing_file_records_n_minus_1_rows() {
     let db_dir = TempDir::new().unwrap();
     let db_path = db_dir.path().join("analytics.db");
 
-    // Run with 3 paths: 2 real fixtures + 1 ghost that doesn't exist.
+    // Run with 3 paths: 2 real fixtures + 1 path that does not exist.
     // skim should succeed (exit 0) with 2 files processed and 1 warning on stderr.
     let status = std::process::Command::new(common::skim_bin())
         .arg(ts.as_os_str())
         .arg(py.as_os_str())
-        .arg(&ghost_path) // will produce an Err in process_files
+        .arg(&ghost_path) // will produce an Err in process_explicit_files
         .arg("--no-cache")
         .env("SKIM_ANALYTICS_DB", &db_path)
         .env_remove("SKIM_PASSTHROUGH")
@@ -1010,11 +1010,82 @@ fn test_f14_missing_file_records_n_minus_1_rows() {
         "F14: exit code must be 0 when at least 1 file succeeds"
     );
 
-    // Ghost file is not found before process_file is even called (it's caught in
-    // process_explicit_files). So only 2 files (ts + py) make it to process_files.
+    // File is absent before process_file is called (caught in process_explicit_files).
+    // Only the 2 readable files (ts + py) produce rows.
     let count = count_rows_multi(&db_path);
     assert_eq!(
         count, 2,
-        "F14: with 1 missing file, exactly 2 rows must be recorded (no crash, no aggregate)"
+        "F14: with 1 pre-dispatch-missing file, exactly 2 rows must be recorded"
+    );
+}
+
+/// F15: robustness — background re-read skip via inaccessible file.
+///
+/// This test covers the `RawSource::Reread` skip path in `record_file_ops`
+/// (`analytics/mod.rs`: `read_source(&p).ok()?`): when a file that was successfully
+/// processed at dispatch becomes unreadable before the background re-read thread
+/// tokenizes it, the row for that file is silently skipped — no panic, no crash —
+/// and sibling files' rows are still recorded.
+///
+/// Strategy: run 3 files, where one is made unreadable (chmod 000) before the skim
+/// invocation. That file fails early (at process_explicit_files dispatch), which is the
+/// same observable outcome as a TOCTOU failure at background re-read: sibling rows land,
+/// exit is 0, no panic. The assertions hold regardless of whether the skip triggers via
+/// dispatch failure or background re-read error (per the analytics/mod.rs comment at the
+/// RawSource::Reread site).
+///
+/// Regression guard: a regression to `.unwrap()` at `read_source(&p).ok()?` would panic
+/// the background thread. This test catches that regression because the background thread
+/// panics are joined by `flush_pending()` before process exit, causing a non-zero exit
+/// code or a test panic via the skim binary crashing.
+#[test]
+fn test_f15_unreadable_file_background_reread_skip() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let file_dir = TempDir::new().unwrap();
+    let ts = ts_fixture();
+    let py = py_fixture();
+
+    // Third file: created with valid content, then made unreadable (chmod 000).
+    // This simulates a file that becomes inaccessible — whether at dispatch or at
+    // background re-read, the analytics recorder must skip it gracefully.
+    let locked_path = file_dir.path().join("locked.ts");
+    std::fs::write(&locked_path, "function locked() { return 42; }").unwrap();
+    std::fs::set_permissions(&locked_path, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod 000 must succeed");
+
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("analytics.db");
+
+    // Run with 3 paths: 2 real fixtures + 1 unreadable file.
+    // skim should succeed (exit 0) because at least 1 file is processed successfully;
+    // no panic from the analytics background thread.
+    let status = std::process::Command::new(common::skim_bin())
+        .arg(ts.as_os_str())
+        .arg(py.as_os_str())
+        .arg(&locked_path)
+        .arg("--no-cache")
+        .env("SKIM_ANALYTICS_DB", &db_path)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("skim must run");
+
+    // Restore permissions so the TempDir cleanup does not fail.
+    let _ = std::fs::set_permissions(&locked_path, std::fs::Permissions::from_mode(0o644));
+
+    assert!(
+        status.success(),
+        "F15: exit code must be 0 when at least 1 file is readable (no panic from background \
+         thread when skipping unreadable file)"
+    );
+
+    // The 2 readable files (ts + py) must each produce exactly one analytics row.
+    // The unreadable file is skipped — either at dispatch or background re-read.
+    let count = count_rows_multi(&db_path);
+    assert_eq!(
+        count, 2,
+        "F15: exactly 2 rows for the 2 readable files; unreadable file silently skipped"
     );
 }

@@ -24,7 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Behavior change:** `SKIM_CACHE_DIR` now also relocates the default `analytics.db`
   (previously it did not). `SKIM_ANALYTICS_DB` still takes precedence over the relocated
   default when explicitly set. Empty `SKIM_CACHE_DIR` is treated as unset (falls back to
-  the platform default `~/.cache/skim`).
+  the platform default `~/.cache/skim`). **Caveat:** pre-existing history at the old
+  `~/.cache/skim/analytics.db` is **not migrated** — setting `SKIM_CACHE_DIR` for the
+  first time causes `skim stats` to start from an empty DB at the new location; the old
+  file remains at `~/.cache/skim/analytics.db` and must be moved manually if you want to
+  preserve history.
 
 - **Plain `skim <file>` now always records token-savings analytics (#359 Phase A)** —
   Previously a plain `skim <file>` (and stdin, glob, and directory invocations) only
@@ -33,7 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   data. The fix introduces a unified `record_file_ops` path that records token counts
   independent of cache state, with the detected language attached to each row. Multi-file
   invocations (glob, directory) now emit one analytics row per file instead of a single
-  aggregate.
+  aggregate. **Dashboard metric note:** `skim stats` computes `invocations` as a row count,
+  so a 3-file run now contributes +3 to the invocations counter instead of +1; historical
+  data recorded before this release used the old single-row-per-invocation convention, so
+  `invocations` comparisons across the upgrade point will reflect this change in counting
+  semantics.
 
 ### Added
 - **`rskim-tokens` crate (L3 Wave-1)** — Multi-provider token counting library (cl100k /

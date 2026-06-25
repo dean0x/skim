@@ -41,7 +41,7 @@ Streaming output (stdout, zero-copy via &str slices where possible)
 `transform_source()` routes each language to its parser via the Strategy Pattern, avoiding special-case conditionals — each language encapsulates its own strategy.
 
 **Non-obvious behavior (gotchas):**
-- **Analytics:** token savings persist to `~/.cache/skim/analytics.db` (SQLite/WAL), recorded fire-and-forget on background threads. `--clear-cache` clears only the parser cache, NOT `analytics.db` — use `skim stats --clear` for that. The `AnalyticsStore` trait + `MockStore` make the stats dashboard testable without a real DB.
+- **Analytics:** token savings persist to `~/.cache/skim/analytics.db` (SQLite/WAL; default location — relocates with `SKIM_CACHE_DIR`, see Environment Variables), recorded fire-and-forget on background threads. `--clear-cache` clears only the parser cache, NOT `analytics.db` — use `skim stats --clear` for that. The `AnalyticsStore` trait + `MockStore` make the stats dashboard testable without a real DB.
 - **Search DB:** `rskim-search` stores hotspot/risk/co-change data in `<root>/.skim/search.db`. Migrations are forward-only via `PRAGMA user_version`; a DB written by a newer version errors rather than corrupting data.
 - **AST index:** the n-gram index (`ast_index.skidx` / `.skpost`) is format v2 — v1 files are rejected with "please rebuild" (`skim search index --rebuild`). Synthetic n-gram markers (IDs ≥ 64900) resolve to `None` in `vocab_resolve()`, keeping them isolated from real vocabulary.
 
@@ -100,7 +100,10 @@ skim intercepts a sub-agent's shell command through **two independent mechanisms
 - `SKIM_CACHE_DIR` — relocates **all** skim cache state: parser cache (`.json` files),
   tee output (`tee/`), and the **default** `analytics.db` location. An empty value is
   treated as unset (falls back to `~/.cache/skim`). The path is used as-is (no `skim`
-  suffix is appended by the resolver).
+  suffix is appended by the resolver). **Caveat:** pre-existing analytics history at the
+  old `~/.cache/skim/analytics.db` is **not migrated** — setting this variable for the
+  first time causes `skim stats` to start from an empty DB at the new location; move
+  the old file manually if you want to preserve history.
 - `SKIM_ANALYTICS_DB` — overrides the analytics DB path directly; **takes precedence over
   `SKIM_CACHE_DIR`** for the DB location. When `SKIM_ANALYTICS_DB` is set, the DB is
   opened at that exact path regardless of `SKIM_CACHE_DIR`. To isolate all skim state
