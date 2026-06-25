@@ -51,6 +51,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `path`/`score` are unaffected. (#201)
 
 ### Fixed
+- **`skim search --rebuild`/`--build` now populate `temporal.db`** (#357) — explicit
+  rebuilds previously produced only the lexical+AST index; temporal/co-change data
+  (`--hot`/`--cold`/`--risky`/`--blast-radius`) was silently unavailable until the
+  next auto-refresh cycle.  The rebuild path now calls `rebuild_temporal` after
+  `build_index`, producing a complete index in one step.
+- **`--hot`/`--cold`/`--risky`/`--blast-radius` self-heal a stale or missing `temporal.db`**
+  (#357) — when the lexical index was Current but `temporal.db` was absent or its stored
+  `META_GIT_HEAD` diverged from the current HEAD (e.g. post-upgrade, manual deletion, or
+  a first rebuild after the above fix landed), these flags silently returned degraded
+  output.  `auto_refresh_if_stale` now checks temporal staleness independently of lexical
+  staleness and self-heals before the early-return.  Extends the #289 temporal auto-refresh
+  to cover this previously-unguarded gap.  Non-fatal: a temporal failure never fails the
+  lexical search (ADR-006/D5).
 - **`skim search <text> --ast <pattern>` compound intersection no longer silently drops
   valid matches** (#356) — the old `CANDIDATE_POOL_K = 4` multiplier capped the lexical
   candidate pool at `limit * 4`, so files ranking beyond position `limit * 4` in the

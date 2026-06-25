@@ -282,6 +282,112 @@ pub(super) fn check_staleness(
 }
 
 // ============================================================================
+// Temporal staleness helper
+// ============================================================================
+
+/// Return `true` when `temporal.db` is missing or its stored `META_GIT_HEAD`
+/// does not match `current_head`.
+///
+/// `current_head` is the HEAD SHA already read by the caller (non-optional —
+/// callers must check `current_head.is_some()` BEFORE calling this helper; on
+/// non-git dirs the guard short-circuits before reaching this function).
+///
+/// # Performance (ADR-003)
+///
+/// Uses a minimal read-only SQLite open (no WAL pragma, no permission reset, no
+/// migrations) to read just the one `meta` row.  This avoids the full
+/// `TemporalDb::open` cost (WAL handshake + two metadata syscalls + migration
+/// version check) on the steady-state Current-path where the DB is checked but
+/// then immediately re-opened by the dispatch arm.  The caller is responsible
+/// for the full `TemporalDb::open` when it actually queries the DB.
+///
+/// # AD-TMP-2 / AD-TMP-3
+///
+/// AD-TMP-2: temporal.db staleness is INDEPENDENT of lexical staleness (#357
+/// BUG B). The lexical-Current early-return in `auto_refresh_if_stale` (below)
+/// skipped the temporal hook, so a missing or HEAD-divergent temporal.db stayed
+/// stale forever while the lexical index was current (post-upgrade, manual
+/// delete, or 2nd+ query after a temporal-less rebuild due to BUG A). This
+/// helper checks temporal.db's stored META_GIT_HEAD against the `current_head`
+/// already read at function entry in `auto_refresh_if_stale`. Self-heals the
+/// stuck-stale (deadbeef) case. Non-fatal by ADR-006/D5.
+///
+/// AD-TMP-3: production temporal staleness uses file-IO HEAD comparison here,
+/// not `check_temporal_staleness` from `temporal.rs` — that helper is
+/// `#[cfg(test)]`-only and uses a `git rev-parse` subprocess, which is
+/// inconsistent with this module's subprocess-free design. `current_head` is
+/// the single HEAD read already performed at `auto_refresh_if_stale` entry;
+/// passing it here avoids a second HEAD read and keeps one HEAD-reading
+/// authority per call.
+pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool {
+    let db_path = cache_dir.join("temporal.db");
+    if !db_path.exists() {
+        return true;
+    }
+    // Lightweight read-only open: no WAL pragma, no permission reset, no migrations.
+    // We only need to read one meta row; the full TemporalDb::open setup is
+    // deferred to the dispatch arm that actually queries the DB.
+    let stored_head: Option<String> = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()
+    .and_then(|conn| {
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            rusqlite::params![rskim_search::META_GIT_HEAD],
+            |row| row.get(0),
+        )
+        .ok()
+    });
+    match stored_head.as_deref() {
+        Some(stored) => stored != current_head,
+        // No stored HEAD row (e.g. empty-repo DB or migration gap): stale.
+        None => true,
+    }
+}
+
+/// Rebuild `temporal.db` non-fatally, swallowing any error per ADR-006/D5.
+///
+/// This is the single implementation of the D5 non-fatal-swallow contract that
+/// was previously duplicated in three structurally-divergent copies across
+/// `run_build` (mod.rs), the BUG-B self-heal (here), and the post-rebuild hook
+/// (below). Centralising it prevents the copies from drifting independently —
+/// a single edit here updates all three call sites.
+///
+/// # Contract (ADR-006/D5)
+///
+/// - `rebuild_temporal` is always called when `head` is `Some`.
+/// - If `rebuild_temporal` returns `Err`, the error is SWALLOWED (never propagated).
+/// - A debug-gated warning is emitted to stderr via `eprintln!` when the error
+///   is swallowed and `SKIM_DEBUG=1` / `--debug` is set.
+/// - Callers never see a temporal failure — only lexical/AST failures propagate.
+///
+/// # Parameters
+///
+/// - `root`: project root passed to `rebuild_temporal`.
+/// - `cache_dir`: cache directory containing `temporal.db`.
+/// - `head`: the git HEAD SHA to record; `None` skips the rebuild (non-git dir).
+/// - `debug_label`: short label for the debug message (e.g. `"self-heal"`,
+///   `"post-rebuild"`, `"--rebuild hook"`).
+pub(super) fn try_rebuild_temporal_nonfatal(
+    root: &Path,
+    cache_dir: &Path,
+    head: Option<&str>,
+    debug_label: &str,
+) {
+    use super::temporal_build::{current_epoch_secs, rebuild_temporal};
+
+    let Some(head) = head else { return };
+    if let Err(e) = rebuild_temporal(root, cache_dir, head, current_epoch_secs()) {
+        // Ignore temporal errors — they must not fail the lexical/AST query (ADR-006/D5).
+        if crate::debug::is_debug_enabled() {
+            eprintln!("skim search [debug]: temporal {debug_label} error (non-fatal): {e}");
+        }
+    }
+}
+
+// ============================================================================
 // Auto-refresh
 // ============================================================================
 
@@ -311,7 +417,6 @@ pub(super) fn auto_refresh_if_stale(
     _analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<(bool, FileManifest)> {
     use super::index::build_index;
-    use super::temporal_build::{current_epoch_secs, rebuild_temporal};
     use super::types::IndexConfig;
 
     // Read the current git HEAD once at function entry so rebuild_temporal can
@@ -326,6 +431,26 @@ pub(super) fn auto_refresh_if_stale(
             // Defensive fallback: should not happen (Current implies manifest loaded).
             FileManifest::new(root.to_path_buf(), cache_dir.to_path_buf())
         });
+
+        // AD-TMP-2: temporal.db has its own staleness gate, independent of
+        // lexical staleness (#357 BUG B). The lexical index is current, but
+        // temporal.db may be missing or HEAD-divergent (post-upgrade, manual
+        // delete, or 2nd+ query after a --rebuild that predated this fix).
+        // Check and self-heal here BEFORE the early return, so that a bare
+        // `skim search --hot` (routed via auto_refresh_if_stale) always has
+        // fresh temporal data when the lexical index is current.
+        // Non-fatal by ADR-006/D5: temporal failure must NOT fail the query.
+        //
+        // Guard ordering (#357 cycle-2 finding 19): `let Some(ref head)` is
+        // evaluated FIRST (short-circuits on non-git dirs where current_head=None
+        // BEFORE the temporal_db_is_stale() call, avoiding a wasted DB open).
+        // `temporal_db_is_stale` only runs when HEAD is readable.
+        if let Some(ref head) = current_head
+            && temporal_db_is_stale(cache_dir, head)
+        {
+            try_rebuild_temporal_nonfatal(root, cache_dir, Some(head), "self-heal");
+        }
+
         return Ok((false, manifest));
     }
 
@@ -383,19 +508,76 @@ pub(super) fn auto_refresh_if_stale(
     // or CapacityExceeded — a temporal failure MUST NOT fail the lexical refresh.
     //
     // `head` is the HEAD SHA read at function entry above. Passing `None` when
-    // the project is non-git: `rebuild_temporal` skips gracefully (parse_history
-    // returns an error on a non-git dir anyway).
-    if let Some(ref head) = current_head
-        && let Err(e) = rebuild_temporal(root, cache_dir, head, current_epoch_secs())
-    {
-        // Ignore temporal errors — they must not fail the lexical/AST refresh (D5).
-        if crate::debug::is_debug_enabled() {
-            eprintln!("skim search [debug]: temporal rebuild error (non-fatal): {e}");
-        }
-    }
+    // the project is non-git: try_rebuild_temporal_nonfatal no-ops gracefully.
+    try_rebuild_temporal_nonfatal(root, cache_dir, current_head.as_deref(), "post-rebuild");
     // ─────────────────────────────────────────────────────────────────────────
 
     Ok((true, manifest))
+}
+
+// ============================================================================
+// Shared test helpers (visible within cmd::search via pub(super))
+// ============================================================================
+
+/// Create a real git repository with commits.
+///
+/// Canonical shared helper used by `staleness_tests.rs`, `temporal_build_tests.rs`,
+/// and `mod.rs` test modules — eliminates the three near-verbatim copies that would
+/// otherwise drift independently (see #357 cycle-2 findings 9/14, and the plan's
+/// step 6 recommendation). `pub(super)` makes it accessible to all `#[cfg(test)]`
+/// users within `crate::cmd::search` via `super::staleness::create_real_git_repo`.
+///
+/// Returns the full 40-hex SHA of HEAD.
+#[cfg(test)]
+pub(super) fn create_real_git_repo(
+    dir: &std::path::Path,
+    commit_files: &[(&str, &[(&str, &str)])],
+) -> String {
+    use std::fs;
+    use std::process::Command;
+
+    Command::new("git")
+        .args(["init"])
+        .current_dir(dir)
+        .output()
+        .expect("git init");
+    Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(dir)
+        .output()
+        .expect("git config email");
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(dir)
+        .output()
+        .expect("git config name");
+
+    for (msg, files) in commit_files {
+        for (name, content) in *files {
+            let path = dir.join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create dir");
+            }
+            fs::write(&path, content).expect("write file");
+            Command::new("git")
+                .args(["add", name])
+                .current_dir(dir)
+                .output()
+                .expect("git add");
+        }
+        Command::new("git")
+            .args(["commit", "-m", msg])
+            .current_dir(dir)
+            .output()
+            .expect("git commit");
+    }
+
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .expect("git rev-parse HEAD");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 // ============================================================================

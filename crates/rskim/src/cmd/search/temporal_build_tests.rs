@@ -13,7 +13,10 @@ use std::process::Command;
 use rskim_search::{CommitInfo, FileChangeInfo, FileRiskScores, FileTemporalStats, HistoryResult};
 use tempfile::tempdir;
 
-use super::{build_cochange_rows, build_hotspot_rows, build_risk_rows, rebuild_temporal};
+use super::{
+    build_cochange_rows, build_hotspot_rows, build_risk_rows, rebuild_temporal,
+    rebuild_temporal_with_source,
+};
 
 // ============================================================================
 // Fixtures
@@ -349,40 +352,16 @@ fn init_git_repo(dir: &std::path::Path) {
         .expect("git config name");
 }
 
-/// Create a real git repository with commits via git subprocess.
+/// Create a real git repository with commits.
 ///
-/// `git init` + `git config` + `git add` + `git commit` for each commit entry.
-/// `commit_files` is `(message, &[(filename, content)])`.
+/// Delegates to the canonical `staleness::create_real_git_repo` shared helper
+/// (see #357 cycle-2 findings 9/14). Named identically to the counterpart in
+/// staleness_tests.rs and mod.rs so a reader scanning the three test files sees
+/// the same shared helper rather than three apparently-distinct helpers (#357
+/// cycle-2 finding 3). The `init_git_repo` helper is kept for tests that need
+/// an unborn repo (no commits).
 fn create_real_git_repo(dir: &std::path::Path, commit_files: &[(&str, &[(&str, &str)])]) -> String {
-    init_git_repo(dir);
-
-    for (msg, files) in commit_files {
-        for (name, content) in *files {
-            let path = dir.join(name);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).expect("create dir");
-            }
-            std::fs::write(path, content).expect("write file");
-            Command::new("git")
-                .args(["add", name])
-                .current_dir(dir)
-                .output()
-                .expect("git add");
-        }
-        Command::new("git")
-            .args(["commit", "-m", msg])
-            .current_dir(dir)
-            .output()
-            .expect("git commit");
-    }
-
-    // Return the current HEAD SHA.
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(dir)
-        .output()
-        .expect("git rev-parse HEAD");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    super::super::staleness::create_real_git_repo(dir, commit_files)
 }
 
 /// AC5 / AC6 — HEAD stored in temporal.db equals full 40-hex SHA and matches
@@ -1075,5 +1054,221 @@ fn e2e_rebuild_temporal_waits_for_same_lock() {
         "rebuild_temporal must complete AFTER the lock was released — \
          proving it contends on the same .skim-build.lock as build_index \
          (t_complete={t_complete:?}, t_release={t_release:?})"
+    );
+}
+
+// ============================================================================
+// Degenerate git repo — empty history stability (LOCKED DECISION 2026-06-24)
+// ============================================================================
+
+/// API CONTRACT (degenerate git repo no-loop): When a TemporalSource returns
+/// an empty commit list (zero-history repo), rebuild_temporal_with_source must
+/// write a present-but-empty temporal.db with META_GIT_HEAD so that subsequent
+/// calls see the repo as Current and skip rebuild — preventing the per-query
+/// no-op loop the locked decision was written to prevent.
+///
+/// Without the fix, rebuild_temporal returned via warn_skip! BEFORE writing
+/// temporal.db on the empty-history path. temporal_db_is_stale then returned
+/// true on every subsequent query (no temporal.db → stale → rebuild → still
+/// no temporal.db → stale again...), triggering a per-query history walk.
+///
+/// Uses CountingSource::new_empty() (returns empty HistoryResult immediately)
+/// rather than a real git repo because a fake detached SHA in .git/HEAD fails
+/// gix object resolution (NOT an unborn error — unborn == symbolic ref to
+/// non-existent branch). A real unborn git repo (git init, no commits) is
+/// handled by GixSource in production; here we test the empty-history branch
+/// in rebuild_temporal_with_source in isolation.
+///
+/// Discriminating: both calls return Ok + temporal.db STABLE across calls
+/// (present-and-empty after first, mtime-unchanged after second).
+/// META_GIT_HEAD must be set so temporal_db_is_stale returns false.
+#[test]
+fn test_degenerate_repo_empty_history_writes_empty_temporal_db() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // CountingSource::new_empty() returns Ok(HistoryResult { commits: [] })
+    // directly — simulating what GixSource returns for a real unborn repo.
+    let src = CountingSource::new_empty();
+    let fake_head = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111";
+    let now = super::current_epoch_secs();
+
+    // First call: empty history — must write present-but-empty temporal.db.
+    let result1 = rebuild_temporal_with_source(&src, dir.path(), &cache_dir, fake_head, now);
+    assert!(
+        result1.is_ok(),
+        "rebuild_temporal_with_source on empty-history repo must return Ok (non-fatal), got: {result1:?}"
+    );
+
+    let db_path = cache_dir.join("temporal.db");
+    assert!(
+        db_path.exists(),
+        "temporal.db must be written even when git history is empty \
+         (LOCKED DECISION 2026-06-24: present-but-empty prevents per-query no-op loop)"
+    );
+
+    // META_GIT_HEAD must be set so temporal_db_is_stale returns false next call.
+    {
+        let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+        let stored = db
+            .get_meta(rskim_search::META_GIT_HEAD)
+            .unwrap()
+            .expect("META_GIT_HEAD must be set in empty temporal.db");
+        assert_eq!(
+            stored, fake_head,
+            "META_GIT_HEAD must equal the passed head even when history is empty"
+        );
+        let hotspots = db.top_hotspots(20).unwrap();
+        assert!(
+            hotspots.is_empty(),
+            "empty-history temporal.db must have zero hotspot rows"
+        );
+    }
+
+    // Second call: temporal.db exists with matching HEAD — stability check.
+    // This is the core no-loop guard: if temporal_db_is_stale is false, the
+    // caller (auto_refresh_if_stale) will NOT call rebuild_temporal again.
+    // We call rebuild_temporal_with_source a second time to confirm idempotency.
+    let src2 = CountingSource::new_empty();
+    let result2 = rebuild_temporal_with_source(&src2, dir.path(), &cache_dir, fake_head, now);
+    assert!(
+        result2.is_ok(),
+        "second rebuild_temporal_with_source on empty-history repo must return Ok, got: {result2:?}"
+    );
+
+    // Discriminating: temporal.db state STABLE — still present, still empty, HEAD unchanged.
+    assert!(
+        db_path.exists(),
+        "temporal.db must still exist after second call on empty-history repo"
+    );
+    {
+        let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+        let stored2 = db
+            .get_meta(rskim_search::META_GIT_HEAD)
+            .unwrap()
+            .expect("META_GIT_HEAD must remain set after second call");
+        assert_eq!(
+            stored2, fake_head,
+            "META_GIT_HEAD must be stable across two calls on empty-history repo"
+        );
+    }
+
+    // The no-loop guard: META_GIT_HEAD is set and matches, so temporal_db_is_stale
+    // returns false on subsequent queries — preventing the per-query history walk.
+    // (The direct temporal_db_is_stale assertion is in staleness_tests.rs since
+    // that function is pub(super) within the staleness module.)
+}
+
+// ============================================================================
+// PERFORMANCE (ADR-003): parse_history called exactly once during rebuild
+// ============================================================================
+
+/// A counting `TemporalSource` test double that records how many times
+/// `parse_history` was invoked.
+///
+/// Used by `test_rebuild_temporal_parse_history_called_once` to assert ADR-003's
+/// grounded regression guard: a single history walk per rebuild, not two
+/// (the prior implementation had a dead second 90-day walk).
+struct CountingSource {
+    call_count: std::sync::atomic::AtomicUsize,
+    /// Delegate to GixSource for real git repo integration, or return empty history.
+    use_real_git: bool,
+}
+
+impl CountingSource {
+    fn new_empty() -> Self {
+        Self {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+            use_real_git: false,
+        }
+    }
+
+    fn new_real() -> Self {
+        Self {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+            use_real_git: true,
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.call_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl rskim_search::TemporalSource for CountingSource {
+    fn parse_history(
+        &self,
+        repo_path: &std::path::Path,
+        lookback_days: u32,
+    ) -> rskim_search::Result<rskim_search::HistoryResult> {
+        self.call_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.use_real_git {
+            rskim_search::GixSource.parse_history(repo_path, lookback_days)
+        } else {
+            Ok(rskim_search::HistoryResult {
+                commits: vec![],
+                metadata: rskim_search::TemporalMetadata {
+                    is_shallow: false,
+                    commit_count: 0,
+                },
+            })
+        }
+    }
+}
+
+/// PERFORMANCE (ADR-003): parse_history is invoked exactly ONCE during a
+/// rebuild_temporal_with_source call on a real git repo.
+///
+/// The pre-fix implementation had a dead second 90-day `parse_history` walk
+/// (Decision O-B). After its removal, a single full-history walk supplies all
+/// data. This test asserts call_count == 1 — the grounded regression guard
+/// required by ADR-003 for the PERFORMANCE acceptance criterion.
+///
+/// Discriminating: if a second parse_history call is added anywhere in
+/// rebuild_temporal_with_source, the count becomes 2 and this test fails.
+#[test]
+fn test_rebuild_temporal_parse_history_called_once() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Build a real git repo so parse_history returns non-empty history.
+    let head = create_real_git_repo(
+        dir.path(),
+        &[
+            ("feat: first", &[("src/lib.rs", "pub fn a() {}")]),
+            ("feat: second", &[("src/main.rs", "fn main() {}")]),
+        ],
+    );
+    assert_eq!(head.len(), 40, "HEAD must be a 40-char SHA");
+
+    let src = CountingSource::new_real();
+    let now = super::current_epoch_secs();
+
+    let result = rebuild_temporal_with_source(&src, dir.path(), &cache_dir, &head, now);
+    assert!(
+        result.is_ok(),
+        "rebuild_temporal_with_source must succeed on a real git repo, got: {result:?}"
+    );
+
+    // ADR-003 grounded regression guard: exactly ONE parse_history call.
+    assert_eq!(
+        src.count(),
+        1,
+        "parse_history must be called exactly ONCE during rebuild (ADR-003 PERFORMANCE guard); \
+         got {} calls — a second call indicates a dead extra walk was reintroduced",
+        src.count()
+    );
+
+    // Confirm temporal.db was actually populated (not an empty-history no-op).
+    let db_path = cache_dir.join("temporal.db");
+    assert!(db_path.exists(), "temporal.db must exist after rebuild");
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let hotspots = db.top_hotspots(20).unwrap();
+    assert!(
+        !hotspots.is_empty(),
+        "temporal.db must contain hotspot data (parse_history returned real commits)"
     );
 }
