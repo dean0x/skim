@@ -57,9 +57,8 @@ const CANDIDATE_POOL_FLOOR: usize = 100;
 ///
 /// Returns `limit.saturating_mul(k).max(CANDIDATE_POOL_FLOOR)`.
 ///
-/// This is the single place that enforces the floor policy; callers that
-/// intentionally omit the floor (compound path — see note above) call
-/// `limit.saturating_mul(k)` directly.
+/// Used by the pure-lexical and blast-radius paths; the compound text+AST
+/// path sizes its pool to the AST set directly (AD-356-1, see run_compound_query).
 #[inline]
 fn candidate_pool(limit: usize, k: usize) -> usize {
     limit.saturating_mul(k).max(CANDIDATE_POOL_FLOOR)
@@ -244,7 +243,7 @@ pub(super) fn execute_query_with_manifest(
     //
     // K=5, floor CANDIDATE_POOL_FLOOR: matches the temporal.rs resort_window() heuristic
     // so the two paths behave consistently.  This value has no measured corpus basis;
-    // calibrating K for large corpora is tracked in #356.
+    // calibrating K for large corpora is tracked in #290.
     //
     // AD-355-4: Dropping non-matching candidates is a relevance gate, NOT an output
     // elision/cap under #317 "compress-never-truncate".  It does not hide output that
@@ -318,25 +317,14 @@ fn run_compound_query(
     blast_file_ids: Option<HashSet<FileId>>,
     ctx: QueryContext<'_>,
 ) -> anyhow::Result<QueryOutput> {
-    // AD-356-1: The lexical candidate pool is the AST-matched FileId set itself,
-    // not `limit * K`. We restrict the lexical engine via `file_filter` (which it
-    // already honors during scoring, reader.rs) so `raw_lex` is exactly the
-    // AST ∩ lexical-present set. This makes the intersection complete by
-    // construction: no qualifying file can fall beyond a `limit * K` cliff (#356).
-    // We removed CANDIDATE_POOL_K (ADR-003: it was an ungrounded heuristic; the
-    // correct fix is to eliminate the cap, not retune it).
-    //
-    // AD-356-2: Size sq.limit to the candidate set, NOT None. The reader applies
-    // `limit = query.limit.unwrap_or(20)` (reader.rs), so `None` would silently
-    // re-cap at 20 and reintroduce #356 for AST sets > 20. `.max(1)` keeps the
-    // value valid; the empty-AST case is handled by an early return above.
-    let ast_fid_set: HashSet<FileId> = ast_scored_vec.iter().map(|&(fid, _)| fid).collect();
-    let mut sq = SearchQuery::new(config.text.clone());
     debug_assert!(config.limit >= 1, "config.limit must be >= 1 (CLI guarantee)");
 
+    // Build the AST FileId set once for O(1) membership tests below.
+    let ast_fid_set: HashSet<FileId> = ast_scored_vec.iter().map(|&(fid, _)| fid).collect();
+
     // Early-out: empty AST set → no intersection possible → return empty output.
-    // This is a correctness guard (AC12), not a performance optimization: an empty
-    // file_filter would cause the reader to score zero files regardless of sq.limit.
+    // Correctness guard (AC12): an empty file_filter causes the reader to score
+    // zero files regardless of sq.limit.
     if ast_fid_set.is_empty() {
         return Ok(QueryOutput {
             query: config.text.clone(),
@@ -347,25 +335,25 @@ fn run_compound_query(
         });
     }
 
-    // Apply blast-radius ∩ AST pre-filter when present (blast ∩ AST path).
-    // Without blast-radius, restrict to the full AST FileId set so the lexical
-    // engine scores only AST-matching files (AD-356-1).
-    if let Some(ref blast) = blast_file_ids {
-        // blast ∩ AST: O(blast) loop with O(1) membership test in ast_fid_set.
-        let intersection: HashSet<FileId> = blast
-            .iter()
-            .filter(|id| ast_fid_set.contains(*id))
-            .copied()
-            .collect();
-        // AD-356-2: size sq.limit to the candidate set.
-        sq.limit = Some(intersection.len().max(1));
-        sq.file_filter = Some(intersection);
-    } else {
-        // No blast-radius: lexical engine is restricted to the AST set.
-        // AD-356-2: size sq.limit to the AST set, never None (reader would re-cap at 20).
-        sq.limit = Some(ast_fid_set.len().max(1));
-        sq.file_filter = Some(ast_fid_set);
-    }
+    // Compute the lexical file_filter and pool size (AD-356-1 / AD-356-2).
+    //
+    // AD-356-1: restrict the lexical engine to the AST-matched FileId set so
+    // `raw_lex` is exactly AST ∩ lexical-present — no qualifying file can fall
+    // beyond a `limit * K` cliff. We removed CANDIDATE_POOL_K (ADR-003: the
+    // correct fix is to eliminate the cap, not retune it).
+    //
+    // AD-356-2: size sq.limit to the candidate set, NOT None. The reader's
+    // `unwrap_or(20)` default would silently re-cap at 20 and reintroduce #356
+    // for AST sets > 20. `.max(1)` keeps the value valid after the empty-set
+    // early return above.
+    let filter_set: HashSet<FileId> = match blast_file_ids {
+        // blast ∩ AST: O(blast) with O(1) membership test in ast_fid_set.
+        Some(ref blast) => blast.iter().filter(|id| ast_fid_set.contains(*id)).copied().collect(),
+        None => ast_fid_set,
+    };
+    let mut sq = SearchQuery::new(config.text.clone());
+    sq.limit = Some(filter_set.len().max(1));
+    sq.file_filter = Some(filter_set);
 
     let raw_lex = ctx.engine.search(&sq)?;
 
@@ -484,7 +472,7 @@ fn run_blast_radius_composite_query(
     // verification.  The worst-case file reads are O(K × limit) per query; on
     // the AD-355-7 short-query fallback the candidate set is still bounded to
     // Some(K × limit).max(100) before the verify step.  Calibrating K for large
-    // corpora is tracked in #356 (pool-K calibration).
+    // corpora is tracked in #290.
     const BLAST_CANDIDATE_POOL_K: usize = 10;
     let mut sq = SearchQuery::new(config.text.clone());
     sq.limit = Some(candidate_pool(config.limit, BLAST_CANDIDATE_POOL_K));
