@@ -740,7 +740,7 @@ struct WarningJson<'a> {
 /// Execute a standalone temporal query (no text search term provided).
 ///
 /// Opens the temporal DB from the resolved cache directory, ensures it is
-/// fresh via `auto_refresh_if_stale` (mirrors the `--ast` arm at mod.rs:108-109
+/// fresh via `auto_refresh_if_stale` (mirrors the `--ast` arm at mod.rs:116-117
 /// per the locked decision 2026-06-24, resolving the BLOCKER for #357),
 /// dispatches the query (hotspot, cold, risky, or blast-radius), and writes
 /// the result as JSON or plain text to stdout. Degrades gracefully when the
@@ -764,7 +764,7 @@ fn run_temporal_standalone(
     std::fs::create_dir_all(&cache_dir)?;
 
     // Self-heal: ensure the lexical+AST+temporal index is fresh before querying.
-    // This mirrors the --ast standalone arm at mod.rs:108-109 and is the fix
+    // This mirrors the --ast standalone arm at mod.rs:116-117 and is the fix
     // for the BLOCKER in #357 — bare --hot/--cold/--risky/--blast-radius never
     // called auto_refresh_if_stale, so temporal.db was never self-healed on
     // these paths even though the false comment above claimed it was guaranteed.
