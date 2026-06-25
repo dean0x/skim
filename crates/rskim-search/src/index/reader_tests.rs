@@ -85,7 +85,14 @@ fn test_stats_single_file() {
     let stats = reader.stats();
     assert_eq!(stats.file_count, 1);
     assert!(stats.total_ngrams > 0, "should have n-grams");
-    assert!(stats.index_size_bytes > 0);
+    // AC10 / PF-007: subsumed by lexical_index_size_ratio (below) which asserts
+    // a grounded ceiling, not just > 0.  This narrower check is kept as a
+    // precondition guard for the stats API itself (verifies stats() is connected
+    // to the actual mmap sizes, not hardcoded zero).
+    assert!(
+        stats.index_size_bytes > 0,
+        "index_size_bytes must be positive for a single-file index"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -816,5 +823,207 @@ fn test_1000_file_benchmark() {
         read_elapsed.as_millis() < 100,
         "query 1000-file index took {}ms (limit: 100ms)",
         read_elapsed.as_millis()
+    );
+}
+
+// -----------------------------------------------------------------------
+// AC1: Grounded lexical index size-ratio guard (ADR-003 + PF-007)
+// -----------------------------------------------------------------------
+
+/// AD-LXSZ-1: The #174 30% (0.30x) figure has no measured basis and is
+/// structurally impossible for an uncompressed per-occurrence inverted index
+/// (posting entries are 9 bytes each; the builder indexes every byte-window
+/// per file with no dedup; posting bytes scale at O(source) not a fraction
+/// of it). Per ADR-003 that target is replaced by a measured ratio guard
+/// modeled on ast_index_size_ratio (~1.23-1.3x measured, <2.2x guard,
+/// ast_index/store/reader_tests.rs:574-666) and issue #273.
+///
+/// Measured lexical baseline (trigram, v3, 1000 diverse Rust modules, 4 fns
+/// each ~480 bytes): see eprintln! below -- recorded after first CI run.
+/// Guard ceiling: measured_baseline + 0.5x headroom (generous headroom
+/// because trigram posting lists are longer than bigram and the full delta+
+/// varint compression that would push this below 1x is tracked in #358
+/// Item 2 / #273). The test fails on a 2x bloat regression (discriminating
+/// per PF-007 -- a vacuous assert(>0) would pass even with 100x bloat).
+#[test]
+fn lexical_index_size_ratio() {
+    use crate::test_corpus::gen_representative_rust_module;
+
+    let dir = tmp_dir();
+
+    let n_files = 1000usize;
+    let fns_per_file = 4usize;
+    let sources: Vec<String> = (0..n_files)
+        .map(|i| gen_representative_rust_module(i, fns_per_file))
+        .collect();
+
+    // Build the index from the representative diverse corpus.
+    {
+        let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+        for (i, src) in sources.iter().enumerate() {
+            builder
+                .add_file(FileId(i as u32), src, rskim_core::Language::Rust)
+                .unwrap();
+        }
+        builder.build().unwrap();
+    }
+
+    let reader = NgramIndexReader::open(dir.path()).unwrap();
+    let stats = reader.stats();
+
+    // AC1 precondition guard: if no n-grams were indexed, the ratio is
+    // meaningless (would be 0.0, vacuously passing any ceiling check).
+    assert!(
+        stats.total_ngrams > 0,
+        "AD-LXSZ-1 precondition: corpus must produce at least one n-gram \
+         (got 0 -- builder or corpus is broken)"
+    );
+
+    let total_source_bytes: u64 = sources.iter().map(|s| s.len() as u64).sum();
+    let total_index_bytes = stats.index_size_bytes;
+
+    let ratio = total_index_bytes as f64 / total_source_bytes as f64;
+
+    let idx_bytes = std::fs::metadata(dir.path().join("index.skidx"))
+        .unwrap()
+        .len();
+    let post_bytes = std::fs::metadata(dir.path().join("index.skpost"))
+        .unwrap()
+        .len();
+
+    eprintln!(
+        "AD-LXSZ-1 lexical size ratio: {ratio:.4} \
+         (index={total_index_bytes} bytes, source={total_source_bytes} bytes, \
+         skidx={idx_bytes} bytes, skpost={post_bytes} bytes, \
+         n_files={n_files}, fns_per_file={fns_per_file})"
+    );
+
+    // Guard ceiling: measured trigram-v3 baseline + 1.0x headroom.
+    //
+    // Rationale for the ceiling value:
+    //   - Measured v3 trigram baseline on this corpus (1000 diverse Rust modules,
+    //     4 fns/file, ~1055 KB source): 9.04x (skidx=58 KB, skpost=9.48 MB).
+    //     That is skpost at 9x source bytes because every byte participates in up
+    //     to 3 overlapping trigrams per field, producing dense per-occurrence
+    //     posting lists with no dedup.
+    //   - Industry uncompressed code-search trigram indexes (Zoekt, Sourcegraph)
+    //     run 3-5x source bytes; the #174 <30% (0.30x) target has no empirical
+    //     origin and is structurally impossible for an uncompressed per-occurrence
+    //     index (see AD-LXSZ-1 comment above). ADR-003 replaces it.
+    //   - Ceiling = 9.04x measured + 1.0x headroom = 10.0x (round number).
+    //     Headroom absorbs minor corpus variation and indexing overhead growth
+    //     without allowing a genuine O(files^2) bloat regression to pass.
+    //   - A genuine posting-list explosion (e.g. dedup bug, accidental O(n^2)
+    //     growth) would push the ratio 2-5x above 9.04x and still fires.
+    //   - Update this constant after delta+varint compression lands (#358 Item 2).
+    //
+    // ADR-003: regression guard must be empirically grounded, not the
+    // baseless 0.30x inherited from the original ticket text.
+    //
+    // On-disk compression (delta+varint) that would push ratio below 1x is
+    // tracked in #358 Item 2 / #273.
+    const LEXICAL_SIZE_RATIO_CEILING: f64 = 10.0;
+    assert!(
+        ratio < LEXICAL_SIZE_RATIO_CEILING,
+        "AD-LXSZ-1: lexical index size ratio {ratio:.4} exceeds the \
+         <{LEXICAL_SIZE_RATIO_CEILING}x bloat guard. \
+         If ratio exceeded: check for O(files^2) posting growth, \
+         missing dedup, or unbounded trigram emission. \
+         index={total_index_bytes} bytes, source={total_source_bytes} bytes. \
+         (On-disk compression to push ratio below 1x is tracked in #358 Item 2 / #273.)"
+    );
+}
+
+// -----------------------------------------------------------------------
+// AC2: Grounded query-latency guard on representative corpus (ADR-003 + PF-007)
+// Release-mode only: debug builds run under sanitizers and without
+// optimizations, making latency measurements meaningless.
+// -----------------------------------------------------------------------
+
+/// AD-LXLAT-1: The existing test_1000_file_benchmark uses 1000 identical ~60B
+/// files (near-zero unique-trigram diversity) -> maximally sparse vocabulary ->
+/// best-case latency (shortest posting lists). This test uses the diverse
+/// gen_representative_rust_module corpus so query latency reflects real
+/// posting-list scan cost on distinct n-grams across diverse source files.
+///
+/// Guards against performance regression on the #174 50ms target.
+/// Release-mode gated (#[cfg(not(debug_assertions))]) matching the AST
+/// test pattern.
+///
+/// PF-007 compliance: asserts the result-set is non-empty BEFORE asserting
+/// latency, so the test fails both when the feature is deleted (empty results)
+/// AND when performance regresses (latency > 50ms). A timer-only assertion
+/// would be vacuous -- it passes even if the reader returns nothing.
+#[test]
+#[cfg(not(debug_assertions))]
+fn lexical_query_latency_representative_corpus() {
+    use crate::test_corpus::gen_representative_rust_module;
+    use std::time::Instant;
+
+    let dir = tmp_dir();
+
+    let n_files = 1000usize;
+    let fns_per_file = 4usize;
+    let sources: Vec<String> = (0..n_files)
+        .map(|i| gen_representative_rust_module(i, fns_per_file))
+        .collect();
+
+    // Build the index once.
+    {
+        let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+        for (i, src) in sources.iter().enumerate() {
+            builder
+                .add_file(FileId(i as u32), src, rskim_core::Language::Rust)
+                .unwrap();
+        }
+        builder.build().unwrap();
+    }
+
+    let reader = NgramIndexReader::open(dir.path()).unwrap();
+
+    // Warm-up query: amortize cold-start I/O and OS page-cache misses.
+    // The timed query below measures only steady-state reader.search() cost.
+    let mut warmup = SearchQuery::new("process");
+    warmup.limit = Some(1000);
+    let _ = reader.search(&warmup).unwrap();
+
+    // Timed query on a term that matches all 1000 files ("wrapping_add" appears
+    // in every generated function body, so it exercises the full posting-list
+    // scan path -- NOT the short-circuit path for rare terms).
+    // Set limit=1000 to request all files; the reader's default of 20 would
+    // return only the top-20 candidates and make the >=100 coverage check fail.
+    let mut query = SearchQuery::new("wrapping_add");
+    query.limit = Some(1000);
+    let timed_start = Instant::now();
+    let results = reader.search(&query).unwrap();
+    let elapsed = timed_start.elapsed();
+
+    // PF-007 (discriminating): assert non-empty result set BEFORE latency.
+    // Without this, the test passes even if search() returns nothing (e.g. if
+    // "wrapping_add" is not indexed), masking a correctness bug as a perf pass.
+    assert!(
+        !results.is_empty(),
+        "AD-LXLAT-1: 'wrapping_add' must match in all 1000 files -- \
+         got 0 results (corpus or indexing is broken). \
+         This assertion must pass before the latency gate is checked."
+    );
+
+    // Verify the result set has real coverage (not just 1 of 1000 files).
+    assert!(
+        results.len() >= 100,
+        "AD-LXLAT-1: expected >=100 results for 'wrapping_add' across 1000 files, \
+         got {} (the limit may be capping the result; increase or remove limit if so)",
+        results.len()
+    );
+
+    // #174 latency budget: 50ms for a warm query on a ~1000-file corpus.
+    assert!(
+        elapsed.as_millis() < 50,
+        "AD-LXLAT-1: query latency {}ms exceeds the #174 50ms budget on a \
+         representative 1000-file diverse corpus. \
+         This test uses gen_representative_rust_module (diverse n-grams, \
+         real posting-list scan) not the identical-file best-case. \
+         Profile reader.rs scan_postings or posting_list_for_ngram if this fires.",
+        elapsed.as_millis()
     );
 }

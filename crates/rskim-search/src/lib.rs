@@ -31,6 +31,8 @@ pub(crate) mod io_util;
 pub mod lexical;
 pub mod ngram;
 pub mod temporal;
+#[cfg(test)]
+pub(crate) mod test_corpus;
 mod types;
 pub mod weights;
 
