@@ -103,7 +103,10 @@ pub(super) fn extract_context_window(
 ///
 /// Production paths use [`extract_snippet_and_verify`] to read the file once
 /// and check substring membership simultaneously.  This fn is kept for testing
-/// the snippet-extraction logic in isolation.
+/// the snippet-extraction logic in isolation.  It delegates to
+/// [`extract_snippet_and_verify`] with a sentinel query that is always present,
+/// so there is a single read/guard/decode path (no duplication of the stat/mtime/
+/// size/read pipeline).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn extract_snippet(
     root: &Path,
@@ -114,57 +117,14 @@ pub(super) fn extract_snippet(
     if match_positions.is_empty() {
         return SnippetOutcome::Unavailable;
     }
-
-    let abs_path = root.join(rel_path);
-
-    // Single stat(2) call shared by both the mtime guard and the size guard below.
-    let meta = std::fs::metadata(&abs_path).ok();
-
-    // Mtime guard: if the manifest recorded an mtime and it doesn't match
-    // the file's current mtime, the file has changed — positions are stale.
-    if let Some(stored_mtime) = manifest_entry.and_then(|e| e.mtime) {
-        let current_mtime = meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs());
-        if current_mtime != Some(stored_mtime) {
-            return SnippetOutcome::Stale;
-        }
-    }
-
-    // Size guard: reject files larger than 5 MB to match the index-build cap and
-    // bound peak memory when 20 results are resolved simultaneously.
-    const MAX_SNIPPET_FILE_BYTES: u64 = 5 * 1024 * 1024;
-    let file_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    if file_size > MAX_SNIPPET_FILE_BYTES {
-        return SnippetOutcome::Unavailable;
-    }
-
-    // Read file content.
-    let content = match std::fs::read(&abs_path) {
-        Ok(c) => c,
-        Err(_) => return SnippetOutcome::Unavailable,
-    };
-    let text = match std::str::from_utf8(&content) {
-        Ok(t) => t,
-        Err(_) => return SnippetOutcome::Unavailable,
-    };
-
-    let match_line = rskim_search::byte_offset_to_line(&content, match_positions[0].start) as u32;
-
-    let line_range = rskim_search::compute_line_range(&content, match_positions);
-
-    let ctx_lines = extract_context_window(text, match_line, DEFAULT_CONTEXT);
-    if ctx_lines.is_empty() {
-        return SnippetOutcome::Unavailable;
-    }
-
-    SnippetOutcome::Ok {
-        match_line,
-        line_range,
-        context: SnippetContext { lines: ctx_lines },
-    }
+    // Delegate to extract_snippet_and_verify with a sentinel query that is
+    // always present in any file content (empty string — no tokens → vacuously
+    // true), so the `verified` flag is always true and the outcome is the pure
+    // snippet result.  This eliminates the previous copy-paste of the
+    // stat/mtime/size/read/decode pipeline (Finding 10 / DRY fix).
+    let (outcome, _verified) =
+        extract_snippet_and_verify(root, rel_path, match_positions, manifest_entry, "");
+    outcome
 }
 
 // ============================================================================
@@ -203,8 +163,16 @@ pub(super) fn extract_snippet(
 /// isolation — see `snippet_tests.rs`.
 pub(super) fn query_substring_present(content: &str, query: &str) -> bool {
     // Split on whitespace; require every non-empty token to appear in content.
-    // An empty query (no tokens after splitting) is vacuously true — callers
-    // already short-circuit on empty queries before building the candidate list.
+    //
+    // When the token set is empty (empty query OR whitespace-only query),
+    // .all() returns vacuously true — callers must short-circuit on
+    // whitespace-only queries before reaching this function.  The CLI dispatch
+    // (mod.rs) trims and rejects whitespace-only queries so this path is only
+    // reached for genuinely empty strings (which are also short-circuited earlier
+    // in execute_query_with_manifest).  A whitespace-only query that somehow
+    // reaches here is treated as "no constraint" = true — this is a documented
+    // edge case, not a security-relevant path, because the caller guarantees
+    // the query has already passed the is_empty()/trim().is_empty() guards.
     query
         .split_whitespace()
         .all(|token| content.contains(token))

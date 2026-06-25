@@ -319,24 +319,40 @@ impl SearchLayer for NgramIndexReader {
         // tokens (e.g. "fn", "if") produce zero trigrams.  In this case the ngram
         // index cannot generate candidates, but the query is still meaningful.
         //
-        // Rather than returning empty results, we emit all indexed files as
-        // score-0 candidates so that the Part A verify step
+        // Rather than returning empty results, we emit indexed files as score-0
+        // candidates so that the Part A verify step
         // (`resolve_paths_and_snippets_verified` in `cmd/search/query.rs`) can
         // apply a literal substring filter and return only files that actually
         // contain the query string.  This preserves correctness (verify is the
         // AC2/AC3 correctness layer) while avoiding a silent empty result for
         // short-but-valid search terms.
         //
-        // The pool-limit widening in `query.rs` (LEXICAL_CANDIDATE_POOL_K × limit,
-        // floor 100) bounds the number of candidates fed to verify, keeping this
-        // path O(pool_limit × file_read) rather than O(total_files × file_read)
-        // for large corpora.
+        // Candidate bound — per-path:
+        //   • Pure-lexical path: `query.limit = Some(pool_limit)` where
+        //     `pool_limit = max(config.limit * LEXICAL_CANDIDATE_POOL_K, 100)` is set
+        //     in query.rs.  So `query.limit.unwrap_or(20)` resolves to pool_limit and
+        //     the candidate set is bounded to that many files (in file-id/insertion order,
+        //     NOT relevance order).
+        //   • Compound path: `query.limit = Some(config.limit * CANDIDATE_POOL_K)` (K=4).
+        //   • Blast-radius path: `query.limit = Some(config.limit * BLAST_CANDIDATE_POOL_K)`
+        //     (K=10); the reader now always sees a Some(N) cap on that path.
+        //
+        // NOTE: candidates are selected in raw file-id/insertion order BEFORE the verify
+        // step runs in query.rs (pre-verify truncation here, not post-verify).  This
+        // deviates from the AD-355-2 verify-then-truncate-LAST invariant: a file that
+        // contains the short query but has file_id >= pool_limit will be silently missed.
+        // This is an accepted trade-off for short (< 3 byte) queries — the pool_limit
+        // floor of 100 mitigates the issue on small to medium corpora; large-corpus
+        // short-query completeness is tracked in a follow-up.
+        //
+        // Security: no injection, no path traversal; only the user's own indexed files
+        // (bounded to the pool cap) are returned as score-0 candidates.
         if ngrams.is_empty() {
             let limit = query.limit.unwrap_or(20);
             let offset = query.offset.unwrap_or(0);
             let file_count = self.header.file_count as usize;
-            // Emit all indexed file IDs (respecting file_filter and offset/limit)
-            // as score-0 candidates.  Verification in query.rs will filter these
+            // Emit indexed file IDs (respecting file_filter and offset/limit)
+            // as score-0 candidates.  Verification in query.rs filters these
             // down to files that actually contain the literal query string.
             let results = (0..file_count)
                 .filter(|&doc_id| {

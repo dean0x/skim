@@ -510,25 +510,30 @@ fn run_on_files_too_few_qrels_returns_error() {
 //
 // PF-007: asserts a discriminating observable (P@1 == 1.0 for the definer),
 // not just exit-0 or non-empty results.  This test would fail the moment the
-// candidate-then-verify gate or the trigram IDF table regresses to near-uniform
-// scoring — which was the root cause of #355.
+// trigram IDF table regresses to near-uniform scoring — which was the root
+// cause of #355.
 //
 // Corpus design:
 //   - definer (file 0): defines `ZyntheticUniqueIdentifier` (the target symbol)
 //   - noise_a (file 1): mentions it once in a comment (incidental overlap)
-//   - noise_b (file 2): a large file with many distinct trigrams that overlap
-//     with the query bytes but does NOT contain the literal symbol string
+//   - noise_b (file 2): a large file of common Rust code — HashMap/fmt/struct
+//     patterns — with ZERO trigram overlap with "ZyntheticUniqueIdentifier".
 //
-// After indexing and querying:
-//   - Part A (verify gate): noise_b must be absent (no literal match)
-//   - Part B (IDF ranking): definer must be at results[0]
-//   - AC4 guard: P@1 == 1.0 for this labelled qrel
+// After indexing and querying via reader.search():
+//   - Part A (trigram exclusion): noise_b must be absent because it has no
+//     trigrams in common with the query — NOT because the verify gate dropped it.
+//     NOTE: reader.search() does NOT run the CLI verify gate.  The verify gate
+//     lives in the CLI layer (rskim::cmd::search::execute_query).  noise_b's
+//     absence here is due to zero trigram overlap, not verify filtering.
+//     Tests for the verify gate are in query_tests.rs (AC1/AC2/AC3).
+//   - Part B (IDF ranking): definer must be at results[0] because its BM25F
+//     score is higher — it contains the symbol more times than noise_a.
+//   - AC4 guard: P@1 == 1.0 for this labelled qrel.
 //
-// The corpus is toy-sized (3 files) — it is NOT a surrogate for AC1 (which
-// measures ranking on a full qrel set). AC4 guards specifically against
-// IDF-uniform regression where any 3-file corpus would produce rank-1 trivially
-// via the verify gate alone, exposing a broken weight table only on larger corpora.
-// A 3-file corpus is still the minimal guard for the AC4 acceptance criterion.
+// The corpus is toy-sized (3 files) — it is NOT a surrogate for full qrel
+// evaluation.  AC4 guards specifically against IDF-uniform regression where
+// all trigrams score DEFAULT_WEIGHT=1.0, making BM25F rank by TF/length alone.
+// A 3-file corpus is the minimal guard for the AC4 acceptance criterion.
 // ============================================================================
 
 #[test]
@@ -571,9 +576,11 @@ pub fn helper_function() -> u64 {
 }
 "#;
 
-    // File 2: pure noise — lots of overlapping trigrams from common Rust code,
-    //         but does NOT contain the literal string "ZyntheticUniqueIdentifier".
-    //         The verify gate must remove it from results entirely.
+    // File 2: pure noise — common Rust code (HashMap/fmt/Display/struct patterns)
+    //         with ZERO trigram overlap with "ZyntheticUniqueIdentifier".
+    //         This file is absent from results because the trigram index has no
+    //         matching trigrams, NOT because the verify gate dropped it.
+    //         (reader.search() does not run the verify gate — see note in block comment above.)
     let noise_b_content = r#"
 use std::collections::HashMap;
 use std::fmt;
@@ -634,10 +641,14 @@ impl fmt::Display for DataManager {
 
     // PF-007: assert discriminating observables, not just exit-0.
 
-    // AC4-a: noise_b must be ABSENT (it has no literal match — verify gate).
+    // AC4-a: noise_b must be ABSENT because it has zero trigram overlap with
+    // "ZyntheticUniqueIdentifier" — the trigram index never emits it as a candidate.
+    // This is NOT the verify gate: reader.search() does not call the verify layer;
+    // the verify gate test lives in query_tests.rs (test_ac1_verify_gate_drops_trigram_overlap_non_literal).
     assert!(
         !ranked.contains(&noise_b_id),
-        "AC4-a (PF-007): noise_b (no literal match) must be absent from results; got: {ranked:?}"
+        "AC4-a (PF-007): noise_b has zero trigram overlap with the query and must be absent \
+        from reader.search() results; got: {ranked:?}"
     );
 
     // AC4-b: definer must appear in results at all.

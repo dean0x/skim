@@ -477,7 +477,32 @@ pub struct IndexStats {
 /// Implementations are expected to be thread-safe (`Send + Sync`) so they can
 /// be shared across worker threads in parallel search pipelines.
 pub trait SearchLayer: Send + Sync {
-    /// Execute a search query and return ranked results.
+    /// Execute a search query and return ranked candidates.
+    ///
+    /// # Contract — candidates, not guaranteed matches
+    ///
+    /// The returned `Vec<SearchResult>` contains **scored candidates** from the
+    /// inverted index.  Each candidate has at least one n-gram overlap with the
+    /// query, **but is NOT guaranteed to contain the literal query string** — the
+    /// n-gram index is a fast candidate generator, not a substring filter.
+    ///
+    /// Consumers that require exact substring membership MUST apply a verification
+    /// step (e.g. `extract_snippet_and_verify` / `resolve_paths_and_snippets_verified`
+    /// in the CLI layer) after calling `search`.
+    ///
+    /// # Short-query semantic (AD-355-7)
+    ///
+    /// For queries shorter than 3 bytes, `extract_query_ngrams` returns an empty
+    /// n-gram set.  The `NgramIndexReader` implementation emits ALL indexed files
+    /// as score-0 candidates via a file-id-order fallback so that the CLI verify
+    /// layer can still apply a literal-substring filter.  This means:
+    /// - `query.limit` (or `unwrap_or(20)`) caps the fallback candidate set.
+    /// - Candidates are in file-id/insertion order (NOT relevance order); surviving
+    ///   files after verification are returned with score 0.0.
+    /// - On the blast-radius path `sq.limit = None`, so the fallback defaults to
+    ///   20 candidates — treat `None` as "small bounded set" on this path.
+    /// - Any future consumer of this trait must NOT assume `search()` returns matches;
+    ///   it returns candidates that require verification.
     ///
     /// # Errors
     /// Returns [`SearchError`] if the query is invalid or the index is corrupted.

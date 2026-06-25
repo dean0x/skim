@@ -6,8 +6,12 @@ use crate::types::{BigramWeight, TrigramWeight};
 
 /// Compute IDF using the smoothed formula: ln(N / (df + 1)) + 1.0
 ///
-/// Returns a value ≥ 1.0. Universal bigrams (df ≈ N) score near 1.0;
-/// rare bigrams (df = 1 in a large corpus) score near ln(N) + 1.
+/// Returns a value ≥ 1.0. Universal n-grams (df ≈ N) score near 1.0;
+/// rare n-grams (df = 1 in a large corpus) score near ln(N) + 1.
+///
+/// This function is shared by both the bigram weight-table path
+/// (`compute_weight_table`) and the trigram weight-table path
+/// (`compute_trigram_weight_table`); the "n-gram" terminology here covers both.
 ///
 /// # Panics (debug only)
 ///

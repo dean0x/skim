@@ -88,7 +88,13 @@ pub(crate) fn run(
         SearchAction::Stats => run_stats(flags.json, &flags.root_override),
         SearchAction::InstallHooks => run_install_hooks(&flags.root_override),
         SearchAction::RemoveHooks => run_remove_hooks(&flags.root_override),
-        SearchAction::Query(ref text) if !text.is_empty() => run_query(text, &flags, analytics),
+        // Reject whitespace-only queries at dispatch (defense-in-depth for Finding 1 / AC2):
+        // query_substring_present uses split_whitespace which yields no tokens for "  ",
+        // making the predicate vacuously true and letting the AD-355-7 all-files fallback
+        // emit up to 100 arbitrary indexed files for a content-free query. Trimming here
+        // prevents that path from being reached at all and gives a cleaner empty-result
+        // response consistent with what is_empty() returns for a zero-length query.
+        SearchAction::Query(ref text) if !text.trim().is_empty() => run_query(text.trim(), &flags, analytics),
         // Empty query + --ast → standalone AST dispatch.  This arm now also handles
         // --ast combined with a temporal sort (--hot/--cold/--risky) and/or
         // --blast-radius (the interim guard that blocked the combination was removed):

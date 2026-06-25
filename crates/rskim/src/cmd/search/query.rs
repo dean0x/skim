@@ -331,21 +331,23 @@ fn run_compound_query(
         CompositeWeights::default(),
     );
 
-    // Truncate to --limit BEFORE recompose (rank-then-truncate-LAST invariant, Amendment).
-    // Truncating here bounds the clone work in recompose_with_lexical to O(limit) rather
-    // than O(limit * CANDIDATE_POOL_K); without this, recompose clones every candidate
-    // and .take(limit) discards up to 3*limit clones immediately.
-    let ranked_limited: Vec<_> = ranked.into_iter().take(config.limit).collect();
-
     // Recompose: carry lexical SearchResult (snippet + line_range), replace score (AC11).
-    let recomposed = recompose_with_lexical(&ranked_limited, &raw_lex);
+    // NOTE: recompose_with_lexical operates on the FULL `ranked` list (limit×CANDIDATE_POOL_K
+    // entries), not a pre-truncated slice — this preserves the AD-355-2 verify-then-truncate-LAST
+    // invariant.  We MUST NOT truncate to config.limit here; if we did, and the top `limit`
+    // RRF slots were occupied by incidental-overlap junk, the real definer at slot limit+1
+    // would be dropped before verification could keep it and the junk is removed.
+    // Truncation happens LAST in resolve_paths_and_snippets_verified (after verification
+    // filters non-matching candidates), matching the pure-lexical and blast-radius paths.
+    let recomposed = recompose_with_lexical(&ranked, &raw_lex);
 
     // AC-F6: text+AST compound path → layers_matched = ["lexical","ast"] (stable order).
     //
-    // AD-355-2/AD-355-4: verify substring membership and truncate to --limit LAST.
-    // The compound path already pre-truncated `ranked_limited` to limit×CANDIDATE_POOL_K
-    // before recompose, so `recomposed` ≤ limit entries.  Verification may shrink it
-    // further; no second truncation needed here (count already ≤ limit after recompose).
+    // AD-355-2/AD-355-4: verify substring membership over the FULL recomposed list,
+    // then truncate to --limit LAST.  The candidate pool is limit×CANDIDATE_POOL_K (K=4),
+    // so recomposed has up to limit*4 entries.  Verification drops non-matching candidates
+    // (relevance gate, not a #317 cap); truncation to config.limit happens inside
+    // resolve_paths_and_snippets_verified as the final step.
     let results = resolve_paths_and_snippets_verified(
         &recomposed,
         ctx.sorted,
@@ -403,15 +405,33 @@ fn run_blast_radius_composite_query(
         .composite_weights
         .unwrap_or_else(CompositeWeights::with_six_signal_defaults);
 
-    // Step 1: fetch the FULL lexical ranked list WITHOUT a file_filter and WITHOUT
-    // a limit cap.  The UNION contract requires ranking the complete candidate set
-    // (all files that appear in *either* the lexical or temporal list) before
-    // truncation.  Applying a pre-limit here would silently drop co-change partners
-    // whose lexical rank exceeds the cap, violating the rank-then-truncate-LAST
-    // invariant (Cross-Plan Amendment, Intent Drift 3 fix).
+    // Step 1: fetch a WIDE lexical ranked list WITHOUT a file_filter.
+    //
+    // The UNION contract requires ranking the complete candidate set (all files
+    // that appear in *either* the lexical or temporal list) before truncation.
+    // Applying a bare `config.limit` pre-cap here would silently drop co-change
+    // partners whose lexical rank exceeds the cap, violating the rank-then-
+    // truncate-LAST invariant.
+    //
+    // However, setting `limit = None` on the normal BM25F path causes unbounded
+    // file reads in Step 6 (every lexical-hit file is read for verify + snippet).
+    // On the short-query fallback (AD-355-7) `unwrap_or(20)` in reader.rs caps
+    // the set; on the trigram path we apply a BLAST_CANDIDATE_POOL_K-multiple cap
+    // here to bound the number of files read while still providing a pool large
+    // enough that co-change partners beyond bare `limit` are not silently dropped.
+    //
+    // K=10: generous multiple of limit so RRF fusion still sees enough candidates
+    // for the co-change-UNION to work correctly even if many lexical hits fail
+    // verification.  The worst-case file reads are O(K × limit) rather than
+    // O(matching_corpus).  Calibrating K for large corpora is tracked in #356.
+    //
+    // For the short-query fallback (AD-355-7), sq.limit=None means reader.rs uses
+    // `unwrap_or(20)` — this path's bound is the reader's default, not K×limit.
+    // The `None` sentinel preserves the blast-radius unlimited-lexical contract for
+    // the short-query path while K×limit bounds the trigram-scored path.
+    const BLAST_CANDIDATE_POOL_K: usize = 10;
     let mut sq = SearchQuery::new(config.text.clone());
-    // No limit: we truncate AFTER fusion (Step 5). No file_filter: UNION mode.
-    sq.limit = None;
+    sq.limit = Some(config.limit.saturating_mul(BLAST_CANDIDATE_POOL_K).max(100));
     // No file_filter: UNION mode requires the full lexical ranked list.
     let raw_lex = ctx.engine.search(&sq)?;
 

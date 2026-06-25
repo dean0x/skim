@@ -143,12 +143,10 @@ pub fn extract_trigrams_from_corpus(files: &[SourceFile]) -> (HashMap<u32, u32>,
         breakdown
     };
 
-    let unique_bigrams = df_map.len(); // reusing field name; semantically = unique_trigrams
-
     let stats = CorpusStats {
         total_files: unique_file_count,
-        total_bigrams: total_trigrams,
-        unique_bigrams,
+        total_ngrams: total_trigrams,
+        unique_ngrams: df_map.len(),
         deduplicated_files: total_files_seen - unique_file_count,
         language_breakdown,
     };
@@ -175,7 +173,7 @@ pub fn extract_bigrams_from_corpus(files: &[SourceFile]) -> (HashMap<u16, u32>, 
     let mut lang_counts: HashMap<String, u32> = HashMap::new();
     let mut total_files_seen: u32 = 0;
     let mut unique_file_count: u32 = 0;
-    let mut total_bigrams: u64 = 0;
+    let mut total_ngrams: u64 = 0;
 
     for file in files {
         total_files_seen += 1;
@@ -190,7 +188,7 @@ pub fn extract_bigrams_from_corpus(files: &[SourceFile]) -> (HashMap<u16, u32>, 
         *lang_counts.entry(lang_str).or_default() += 1;
 
         let bigrams = extract_bigrams(&file.content);
-        total_bigrams += bigrams.len() as u64;
+        total_ngrams += bigrams.len() as u64;
         for bigram in bigrams {
             *df_map.entry(bigram).or_default() += 1;
         }
@@ -208,12 +206,10 @@ pub fn extract_bigrams_from_corpus(files: &[SourceFile]) -> (HashMap<u16, u32>, 
         breakdown
     };
 
-    let unique_bigrams = df_map.len();
-
     let stats = CorpusStats {
         total_files: unique_file_count,
-        total_bigrams,
-        unique_bigrams,
+        total_ngrams,
+        unique_ngrams: df_map.len(),
         deduplicated_files: total_files_seen - unique_file_count,
         language_breakdown,
     };

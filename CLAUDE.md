@@ -16,13 +16,16 @@ Cargo workspace, 8 crates:
 - `rskim-core` — pure transform library (parsing, modes; no I/O side effects)
 - `rskim` — CLI binary (`skim`): caching, analytics, command wrappers
 - `rskim-search` — code-search index (lexical n-gram, temporal, AST structural), stored in `<root>/.skim/search.db`
-- `rskim-research` — offline tooling that generates AST weight tables
+- `rskim-research` — offline tooling that generates both AST structural weight tables
+  AND the lexical trigram IDF weight table (see codegen notes below)
 - `rskim-bench` — benchmarks
 - `rskim-tokens` — offline + optional-network token counting (multi-provider; `net-anthropic` feature gates HTTP)
 - `rskim-contract` — byte-faithful contract / guardrail layer for transcript mutation
 - `rskim-llm` — LLM transcript parsing (OpenAI/Anthropic) + classifier
 
 `crates/rskim-search/src/ast_weights.rs` is **auto-generated — do not edit**. Regenerate via `rskim-research ast-run` then `ast-codegen`.
+
+`crates/rskim-search/src/weights.rs` is **auto-generated — do not edit**. It contains the lexical trigram IDF weight table (`TRIGRAM_WEIGHTS`, `lookup_weight`, `trigram_weight`). Regenerate via `rskim-research trigram-run` then `trigram-codegen`. The old `rskim-research codegen` subcommand (bigram-based) now writes to a separate `bigram_weights_legacy.rs` artifact and must NOT be used for the live trigram table.
 
 ## Architecture
 
