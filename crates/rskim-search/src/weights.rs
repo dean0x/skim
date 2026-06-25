@@ -68325,6 +68325,10 @@ mod tests {
     fn all_idf_values_are_positive() {
         // IDF values must be finite and positive — DEFAULT_WEIGHT fallback applies
         // only when a key is absent, not as a substitute for invalid stored weights.
-        assert!(TRIGRAM_WEIGHTS.iter().all(|&(_, idf)| idf > 0.0 && idf.is_finite()));
+        assert!(
+            TRIGRAM_WEIGHTS
+                .iter()
+                .all(|&(_, idf)| idf > 0.0 && idf.is_finite())
+        );
     }
 }

@@ -530,6 +530,11 @@ fn run_on_files_too_few_qrels_returns_error() {
 //     score is higher — it contains the symbol more times than noise_a.
 //   - AC4 guard: P@1 == 1.0 for this labelled qrel.
 //
+// This test measures the UNVERIFIED candidate layer (reader.search() only).
+// ac4_verified_path_p_at_1_guard (below) applies a content-presence filter
+// that mirrors the CLI verify gate and guards the verified-path ranking contract
+// (F12 / Finding 12 from cycle-3 review).
+//
 // The corpus is toy-sized (3 files) — it is NOT a surrogate for full qrel
 // evaluation.  AC4 guards specifically against IDF-uniform regression where
 // all trigrams score DEFAULT_WEIGHT=1.0, making BM25F rank by TF/length alone.
@@ -668,6 +673,171 @@ impl fmt::Display for DataManager {
         (p_at_1 - 1.0).abs() < f64::EPSILON,
         "AC4-c (PF-007): P@1 must be 1.0 — definer must rank first; got rank={}, results={ranked:?}",
         rank_of(&ranked, definer_id)
+    );
+}
+
+// ============================================================================
+// AC4 (#355, F12): Verified-path P@1 guard
+//
+// The ac4_precision_at_1_regression_guard test above calls reader.search()
+// directly, which is the UNVERIFIED candidate layer.  Per Finding 12, a guard
+// that only measures the unverified layer cannot detect regressions in the
+// verify-then-truncate CLI path.
+//
+// This companion test closes that gap: it applies a content-presence filter
+// to the candidate results (equivalent to the CLI verify gate's
+// query_substring_present predicate) and then asserts P@1 == 1.0 over the
+// verified result set.  The corpus is identical to ac4_precision_at_1_regression_guard
+// so both guards are always exercised together.
+//
+// The verify predicate used here (AND-of-whitespace-tokens substring check)
+// mirrors the production `query_substring_present` in snippet.rs (AD-355-3).
+// It is inlined because `query_substring_present` is a private symbol in the
+// rskim CLI crate, unreachable from rskim-bench.
+//
+// PF-007: if the verify gate is removed from the CLI layer (query.rs), the
+// production P@1 would differ from what this test measures; the companion
+// ac4_precision_at_1_regression_guard guards the unverified ranking layer, and
+// this test guards the verified-path contract.
+// ============================================================================
+
+/// Inline equivalent of `query_substring_present(content, query)` from snippet.rs.
+///
+/// Returns `true` iff every whitespace-delimited token in `query` appears as a
+/// case-sensitive substring of `content`.  Empty / whitespace-only query → false.
+fn verify_present(content: &str, query: &str) -> bool {
+    let mut tokens = query.split_whitespace().peekable();
+    if tokens.peek().is_none() {
+        return false;
+    }
+    tokens.all(|token| content.contains(token))
+}
+
+#[test]
+fn ac4_verified_path_p_at_1_guard() {
+    use rskim_bench::metrics::{precision_at_k, rank_of};
+    use rskim_search::{
+        FileId, LayerBuilder, NgramIndexBuilder, NgramIndexReader, SearchLayer, SearchQuery,
+    };
+    use std::collections::HashMap;
+
+    // Identical corpus to ac4_precision_at_1_regression_guard.
+    let definer_content = r#"
+/// ZyntheticUniqueIdentifier is the canonical implementation.
+/// It is defined here and only here.
+pub struct ZyntheticUniqueIdentifier {
+    pub value: u64,
+}
+
+impl ZyntheticUniqueIdentifier {
+    pub fn new(value: u64) -> Self {
+        Self { value }
+    }
+
+    pub fn display(&self) -> String {
+        format!("ZyntheticUniqueIdentifier({})", self.value)
+    }
+}
+"#;
+    let noise_a_content = r#"
+// We re-export ZyntheticUniqueIdentifier from the definer module.
+pub use definer::ZyntheticUniqueIdentifier;
+
+pub fn helper_function() -> u64 {
+    42
+}
+"#;
+    let noise_b_content = r#"
+use std::collections::HashMap;
+use std::fmt;
+
+pub struct DataManager {
+    items: HashMap<u64, String>,
+}
+
+impl DataManager {
+    pub fn new() -> Self {
+        Self { items: HashMap::new() }
+    }
+
+    pub fn insert(&mut self, key: u64, val: String) {
+        self.items.insert(key, val);
+    }
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let definer_id = FileId(0);
+    let noise_a_id = FileId(1);
+    let noise_b_id = FileId(2);
+
+    let file_contents: HashMap<FileId, &str> = [
+        (definer_id, definer_content),
+        (noise_a_id, noise_a_content),
+        (noise_b_id, noise_b_content),
+    ]
+    .into();
+
+    let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    builder
+        .add_file(definer_id, definer_content, rskim_core::Language::Rust)
+        .unwrap();
+    builder
+        .add_file(noise_a_id, noise_a_content, rskim_core::Language::Rust)
+        .unwrap();
+    builder
+        .add_file(noise_b_id, noise_b_content, rskim_core::Language::Rust)
+        .unwrap();
+    let _layer = builder.build().unwrap();
+
+    let reader = NgramIndexReader::open(dir.path()).unwrap();
+
+    let query_str = "ZyntheticUniqueIdentifier";
+    let mut query = SearchQuery::new(query_str);
+    query.limit = Some(20);
+
+    let raw_results = reader.search(&query).unwrap();
+
+    // Apply the verified-path filter: keep only candidates whose content passes
+    // the AND-of-tokens substring check (mirrors CLI query_substring_present).
+    // File IDs are 0-based, matching the insertion order above.
+    let verified_ranked: Vec<FileId> = raw_results
+        .iter()
+        .filter(|r| {
+            file_contents
+                .get(&r.file_id)
+                .map(|content| verify_present(content, query_str))
+                .unwrap_or(false)
+        })
+        .map(|r| r.file_id)
+        .collect();
+
+    // AC4-verified-a: definer must survive verification (contains the symbol).
+    assert!(
+        verified_ranked.contains(&definer_id),
+        "AC4-verified (F12/PF-007): definer must survive the verify gate; got: {verified_ranked:?}"
+    );
+
+    // AC4-verified-b: noise_b must NOT survive (its content does not contain
+    // the symbol — zero trigram overlap means it is absent from raw_results too,
+    // but we assert here to guard both the unverified and verified paths).
+    assert!(
+        !verified_ranked.contains(&noise_b_id),
+        "AC4-verified (F12/PF-007): noise_b must be absent after verification; \
+        got: {verified_ranked:?}"
+    );
+
+    // AC4-verified-c: P@1 == 1.0 over the VERIFIED result set.
+    //
+    // This is the core regression guard for the verified CLI path.  If the
+    // ranking or verify gate regresses (verify drops the definer, or ranking
+    // pushes noise_a above the definer), P@1 drops below 1.0.
+    let p_at_1 = precision_at_k(&verified_ranked, definer_id, 1);
+    assert!(
+        (p_at_1 - 1.0).abs() < f64::EPSILON,
+        "AC4-verified-c (F12/PF-007): verified P@1 must be 1.0 — definer must rank first \
+        in the verified result set; rank={}, verified_results={verified_ranked:?}",
+        rank_of(&verified_ranked, definer_id)
     );
 }
 

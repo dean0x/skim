@@ -1050,7 +1050,8 @@ fn test_ac2_verify_gate_drops_compound_lexical_hit_without_literal() {
         src.join("auth.rs"),
         "/// Authenticate a user by token.\n\
          pub fn authenticate_user(token: &str) -> bool { !token.is_empty() }\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     // lib.rs: contains "authenticate" and "user" as SEPARATE words — shares many
     // trigrams with "authenticate_user" — but NOT the literal "authenticate_user".
@@ -1061,7 +1062,8 @@ fn test_ac2_verify_gate_drops_compound_lexical_hit_without_literal() {
         "/// Authenticate the request.\n\
          pub fn check_user(id: u32) -> bool { id > 0 }\n\
          pub fn authenticate(token: &str) -> bool { !token.is_empty() }\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     // Build the index so FileId(0)=auth.rs, FileId(1)=lib.rs (sorted alphabetically).
     {
@@ -1176,11 +1178,22 @@ fn test_ac2_gibberish_query_no_lexical_hits_blast_radius() {
 /// AC2 (blast-radius short-query fallback) — a 2-byte query that reaches the
 /// AD-355-7 fallback on the blast-radius path exercises the verify gate.
 ///
-/// PF-007 (discriminating): the query "zz" shares no content with the test
-/// corpus files, so verify must drop all fallback candidates.  This test
-/// asserts 0 verified results even though the reader emits fallback candidates,
-/// explicitly covering the blast-radius short-query path that was previously
-/// unguarded (sq.limit=None → unwrap_or(20) in reader.rs).
+/// PF-007 (discriminating, F14): the corpus has one file that CONTAINS the 2-byte
+/// query "zz" (`match.rs`) and one that does NOT (`nomatch.rs`).  Both are in the
+/// blast-radius allowlist.  The test asserts by PATH MEMBERSHIP:
+///
+/// - `match.rs` (contains "zz") MUST appear in results — the gate's keep path.
+/// - `nomatch.rs` (does not contain "zz") MUST NOT appear — the gate's drop path.
+///
+/// This is a STRICT SUBSET check: if the verify gate is removed the non-matching
+/// file would survive the fallback and appear in results, failing the "absent"
+/// assertion.  If the keep path is broken the matching file would be dropped,
+/// failing the "present" assertion.  The test therefore fails in BOTH regression
+/// directions — making it a genuine guard per PF-007.
+///
+/// Previously the test used `r.snippet.is_none()` which cannot distinguish
+/// gate-on from gate-off (short-query candidates always have empty match_positions
+/// so `snippet` is always `None` regardless of the verify decision).
 #[test]
 fn test_ac2_short_query_fallback_blast_radius_exercises_verify_gate() {
     use std::collections::HashSet;
@@ -1190,20 +1203,31 @@ fn test_ac2_short_query_fallback_blast_radius_exercises_verify_gate() {
     let cache_dir = dir.path().join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
 
-    // Corpus where neither file contains "zz" (2-byte query that triggers AD-355-7).
+    // Corpus: match.rs CONTAINS "zz"; nomatch.rs does NOT.
+    // Both are in the blast-radius allowlist so both reach the verify gate.
     let src = root.join("src");
     fs::create_dir_all(&src).unwrap();
     fs::create_dir_all(root.join(".git")).unwrap();
     fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
-    fs::write(src.join("auth.rs"), "pub fn authenticate(token: &str) -> bool { !token.is_empty() }\n").unwrap();
-    fs::write(src.join("lib.rs"), "pub fn parse_config(s: &str) -> Option<String> { Some(s.to_string()) }\n").unwrap();
+    // "zz" appears in match.rs (the token we search for).
+    fs::write(
+        src.join("match.rs"),
+        "// contains the target token\npub fn check_zz(x: &str) -> bool { x.contains(\"zz\") }\n",
+    )
+    .unwrap();
+    // "zz" is absent from nomatch.rs.
+    fs::write(
+        src.join("nomatch.rs"),
+        "pub fn parse_config(s: &str) -> Option<String> { Some(s.to_string()) }\n",
+    )
+    .unwrap();
 
     let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string());
-    allowed.insert("src/lib.rs".to_string());
+    allowed.insert("src/match.rs".to_string());
+    allowed.insert("src/nomatch.rs".to_string());
 
     let config = QueryConfig {
-        text: "zz".to_string(), // 2 bytes → AD-355-7 fallback; "zz" absent from both files
+        text: "zz".to_string(), // 2 bytes → AD-355-7 fallback
         limit: 20,
         json: false,
         root: root.to_path_buf(),
@@ -1214,17 +1238,29 @@ fn test_ac2_short_query_fallback_blast_radius_exercises_verify_gate() {
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
-    // PF-007 discriminating: all candidates emitted by the AD-355-7 fallback must
-    // be dropped by verify because "zz" is absent from both files.
-    // A non-None snippet here would mean verify passed — false positive.
-    for r in &output.results {
-        assert!(
-            r.snippet.is_none(),
-            "AC2 (blast-radius short-query): 'zz' is absent from corpus; \
-            no verified lexical-hit result expected; found: {:?}",
-            r
-        );
-    }
+    // PF-007 DISCRIMINATING assertions — path-membership, not snippet presence:
+
+    // (1) The file that contains "zz" MUST be in results (verifies the keep path).
+    let has_match = output.results.iter().any(|r| r.path == "src/match.rs");
+    assert!(
+        has_match,
+        "AC2 (blast-radius short-query, keep path): 'src/match.rs' contains the literal \
+        'zz' and must appear in verified results after the AD-355-7 fallback; \
+        results: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // (2) The file that does NOT contain "zz" MUST NOT be in results (verifies the
+    //     drop path — this assertion fails if the verify gate is removed or bypassed).
+    let has_nomatch = output.results.iter().any(|r| r.path == "src/nomatch.rs");
+    assert!(
+        !has_nomatch,
+        "AC2 (blast-radius short-query, drop path): 'src/nomatch.rs' does NOT contain \
+        the literal 'zz' and must be dropped by the verify gate; found in results — \
+        verify gate is absent or broken on the blast-radius short-query path. \
+        Results: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
 }
 
 /// AC3 — every returned result literally contains the query term (pure-lexical).
@@ -1368,7 +1404,8 @@ fn test_ac1_verify_gate_drops_trigram_overlap_non_literal() {
         src.join("auth.rs"),
         "/// Authenticate a user by token.\n\
          pub fn authenticate_user(token: &str) -> bool { !token.is_empty() }\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     // lib.rs: contains the trigram-generating substrings "authenticate" and
     // "user" as SEPARATE words, generating many shared trigrams with
@@ -1379,7 +1416,8 @@ fn test_ac1_verify_gate_drops_trigram_overlap_non_literal() {
         "/// Authenticate the request.\n\
          pub fn check_user(id: u32) -> bool { id > 0 }\n\
          pub fn authenticate(token: &str) -> bool { !token.is_empty() }\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     let config = make_config(&root, &cache_dir, "authenticate_user");
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();

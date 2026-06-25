@@ -443,8 +443,8 @@ fn cmd_validate(json_path: Option<PathBuf>) -> anyhow::Result<()> {
 /// `MAX_FILE_SIZE` (100 KB) to retain larger data files that are representative
 /// of real-world corpora but would dominate IDF if they were much larger.
 const TRIGRAM_EXTENSIONS: &[&str] = &[
-    "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "h",
-    "hpp", "cs", "rb", "kt", "swift", "sql", "md",
+    "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "h", "hpp", "cs", "rb", "kt",
+    "swift", "sql", "md",
 ];
 const TRIGRAM_MAX_FILE_BYTES: u64 = 1_048_576; // 1 MB
 
@@ -458,26 +458,54 @@ fn walk_trigram_corpus(root: &std::path::Path) -> anyhow::Result<Vec<types::Sour
     let ext_set: std::collections::HashSet<&str> = TRIGRAM_EXTENSIONS.iter().copied().collect();
     let mut files: Vec<types::SourceFile> = Vec::new();
 
-    for result in ignore::WalkBuilder::new(root).follow_links(false).hidden(false).build() {
+    for result in ignore::WalkBuilder::new(root)
+        .follow_links(false)
+        .hidden(false)
+        .build()
+    {
         let entry = match result {
             Ok(e) => e,
-            Err(e) => { eprintln!("Warning: walk error: {e}"); continue; }
+            Err(e) => {
+                eprintln!("Warning: walk error: {e}");
+                continue;
+            }
         };
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) { continue; }
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
         let path = entry.path();
         // Skip common build/vendor directories.
         if path.components().any(|c| {
-            matches!(c.as_os_str().to_str(), Some("target") | Some("node_modules") | Some("vendor"))
-        }) { continue; }
+            matches!(
+                c.as_os_str().to_str(),
+                Some("target") | Some("node_modules") | Some("vendor")
+            )
+        }) {
+            continue;
+        }
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !ext_set.contains(ext) { continue; }
-        if path.metadata().map(|m| m.len() > TRIGRAM_MAX_FILE_BYTES).unwrap_or(false) { continue; }
+        if !ext_set.contains(ext) {
+            continue;
+        }
+        if path
+            .metadata()
+            .map(|m| m.len() > TRIGRAM_MAX_FILE_BYTES)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         match std::fs::read_to_string(path) {
             Ok(content) => {
-                let language = path.extension().and_then(|e| e.to_str())
+                let language = path
+                    .extension()
+                    .and_then(|e| e.to_str())
                     .and_then(rskim_core::Language::from_extension)
                     .unwrap_or(rskim_core::Language::Rust);
-                files.push(types::SourceFile { path: path.to_path_buf(), language, content });
+                files.push(types::SourceFile {
+                    path: path.to_path_buf(),
+                    language,
+                    content,
+                });
             }
             Err(e) => eprintln!("Warning: could not read {}: {e}", path.display()),
         }
@@ -504,7 +532,10 @@ fn cmd_trigram_run(
 
     let files = walk_trigram_corpus(&root)?;
 
-    eprintln!("Loaded {} source files. Extracting trigrams...", files.len());
+    eprintln!(
+        "Loaded {} source files. Extracting trigrams...",
+        files.len()
+    );
 
     if files.is_empty() {
         anyhow::bail!("No source files found under {}", root.display());
@@ -515,11 +546,15 @@ fn cmd_trigram_run(
 
     eprintln!(
         "Corpus: {} unique files, {} unique trigrams. Computing IDF...",
-        total_docs, df_map.len()
+        total_docs,
+        df_map.len()
     );
 
     let weights = idf::compute_trigram_weight_table(&df_map, total_docs, threshold);
-    eprintln!("Trigram weight table: {} entries (threshold={threshold}).", weights.len());
+    eprintln!(
+        "Trigram weight table: {} entries (threshold={threshold}).",
+        weights.len()
+    );
 
     let table = types::TrigramWeightTable {
         version: 1,
@@ -545,9 +580,8 @@ fn cmd_trigram_codegen(
         None => codegen::find_workspace_root().context("auto-detecting workspace root")?,
     };
 
-    let json_path = json_path.unwrap_or_else(|| {
-        workspace_root.join("crates/rskim-search/data/trigram_weights.json")
-    });
+    let json_path = json_path
+        .unwrap_or_else(|| workspace_root.join("crates/rskim-search/data/trigram_weights.json"));
 
     let output_path = workspace_root.join("crates/rskim-search/src/weights.rs");
 

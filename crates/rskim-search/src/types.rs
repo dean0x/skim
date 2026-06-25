@@ -487,26 +487,25 @@ pub trait SearchLayer: Send + Sync {
     /// n-gram index is a fast candidate generator, not a substring filter.
     ///
     /// Consumers that require exact substring membership MUST apply a verification
-    /// step (e.g. `extract_snippet_and_verify` / `resolve_paths_and_snippets_verified`
-    /// in the CLI layer) after calling `search`.
+    /// step after calling `search`.
+    ///
+    /// # Limit / offset semantics
+    ///
+    /// - When `query.limit` is `Some(n)`, the returned slice contains at most `n`
+    ///   candidates.  When `None`, the implementation may apply a default cap.
+    /// - When `query.offset` is `Some(k)`, the first `k` candidates (in rank order)
+    ///   are skipped.  When `None`, no candidates are skipped.
     ///
     /// # Short-query semantic (AD-355-7)
     ///
     /// For queries shorter than 3 bytes, `extract_query_ngrams` returns an empty
     /// n-gram set.  The `NgramIndexReader` implementation emits ALL indexed files
-    /// as score-0 candidates via a file-id-order fallback so that the CLI verify
-    /// layer can still apply a literal-substring filter.  This means:
-    /// - `query.limit` caps the fallback candidate set.  Every production path
-    ///   sets `sq.limit = Some(N)` before calling `search()`, so the reader's
-    ///   `unwrap_or(20)` default is **never reached** on any current code path.
-    ///   Caps per path:
-    ///   - Pure-lexical: `Some(max(config.limit * LEXICAL_CANDIDATE_POOL_K, 100))`.
-    ///   - Compound: `Some(config.limit * CANDIDATE_POOL_K)` (K=4).
-    ///   - Blast-radius: `Some(max(config.limit * BLAST_CANDIDATE_POOL_K, 100))`
-    ///     (K=10); the reader always sees `Some(N)` on this path — **not** `None`.
-    /// - Candidates are in file-id/insertion order (NOT relevance order); surviving
-    ///   files after verification are returned with score 0.0.
-    /// - Any future consumer of this trait must NOT assume `search()` returns matches;
+    /// as score-0 candidates via a file-id-order fallback so that verification
+    /// layers can apply a literal-substring filter.
+    ///
+    /// - Candidates from this path are in file-id/insertion order (NOT relevance
+    ///   order) and carry `score = 0.0` with empty `match_positions`.
+    /// - Any consumer of this trait **must NOT** assume `search()` returns matches;
     ///   it returns candidates that require verification.
     /// - Large-corpus short-query completeness (file_id >= pool_limit silently missed)
     ///   is tracked in #356 (pool-K calibration).

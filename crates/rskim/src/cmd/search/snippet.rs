@@ -104,9 +104,11 @@ pub(super) fn extract_context_window(
 /// Production paths use [`extract_snippet_and_verify`] to read the file once
 /// and check substring membership simultaneously.  This fn is kept for testing
 /// the snippet-extraction logic in isolation.  It delegates to
-/// [`extract_snippet_and_verify`] with a sentinel query that is always present,
-/// so there is a single read/guard/decode path (no duplication of the stat/mtime/
-/// size/read pipeline).
+/// [`extract_snippet_and_verify`] with an empty sentinel query whose verification
+/// result is discarded (`_verified` is unused here; see the inline note below
+/// re: the defense-in-depth change in `query_substring_present`).  There is a
+/// single read/guard/decode path (no duplication of the stat/mtime/size/read
+/// pipeline).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn extract_snippet(
     root: &Path,
@@ -257,16 +259,34 @@ pub(super) fn extract_snippet_and_verify(
     const MAX_VERIFY_SCAN_BYTES: usize = 5 * 1024 * 1024; // same bound as snippet limit
     let file_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     if file_size > MAX_SNIPPET_FILE_BYTES {
+        // Bounded verification read for large files.
+        //
+        // Fixes (F1/security + F6/performance): the previous code allocated a
+        // 5 MiB zero-filled buffer unconditionally and then overwrote it with a
+        // single `f.read(&mut buf)` call, which is permitted to return fewer bytes
+        // than requested — producing nondeterministic scan windows that can miss
+        // genuine matches.
+        //
+        // Instead:
+        // (a) Size the buffer to `min(file_size, MAX_VERIFY_SCAN_BYTES)` to avoid
+        //     the full 5 MiB alloc+memset for files just over the 5 MiB threshold.
+        // (b) Use `Read::take(...).read_to_end(&mut buf)` which drains the full
+        //     intended prefix (up to the cap) in a loop, giving deterministic
+        //     behaviour.
         use std::io::Read;
-        let mut buf = vec![0u8; MAX_VERIFY_SCAN_BYTES];
-        let n = std::fs::File::open(&abs_path)
+        let needed = (file_size as usize).min(MAX_VERIFY_SCAN_BYTES);
+        let mut buf = Vec::with_capacity(needed);
+        let ok = std::fs::File::open(&abs_path)
             .ok()
-            .and_then(|mut f| f.read(&mut buf).ok())
-            .unwrap_or(0);
-        let prefix = &buf[..n];
-        let verified = std::str::from_utf8(prefix)
-            .map(|text| query_substring_present(text, query))
-            .unwrap_or(false);
+            .and_then(|f| f.take(needed as u64).read_to_end(&mut buf).ok())
+            .is_some();
+        let verified = if ok {
+            std::str::from_utf8(&buf)
+                .map(|text| query_substring_present(text, query))
+                .unwrap_or(false)
+        } else {
+            false
+        };
         return (SnippetOutcome::Unavailable, verified);
     }
 

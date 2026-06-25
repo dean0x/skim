@@ -33,9 +33,16 @@ pub fn default_trigram_weights_json_path() -> anyhow::Result<PathBuf> {
 /// Returns an error if:
 /// - `json_path` cannot be read or parsed
 /// - The weight table is empty or version is 0
-/// - Any IDF value is non-positive
-/// - Any key is < 0x010000 (would be a bigram, not a trigram)
+/// - Any IDF value is non-positive or non-finite
 /// - Writing to `output_path` fails
+///
+/// Note: keys with b1 == 0 (NUL-leading trigrams from binary-adjacent source)
+/// are **not** rejected — the validation deliberately allows them because such
+/// bytes are valid in the trigram key space and the corpus may include files with
+/// NUL-prefixed byte sequences.  Only the original bigram keyspace (keys < 0x010000)
+/// was logically incompatible, but the v3 reader never interprets any key as a
+/// bigram — v2 indexes are rejected wholesale via `FORMAT_VERSION` — so the old
+/// rejection of b1 == 0 keys is a documentation artefact, not an enforced constraint.
 pub fn generate_weights_rs(json_path: &Path, output_path: &Path) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(json_path)
         .with_context(|| format!("reading {}", json_path.display()))?;
@@ -115,14 +122,8 @@ fn write_file_header(buf: &mut Vec<u8>, table: &TrigramWeightTable) -> anyhow::R
         "//! DO NOT EDIT MANUALLY — re-run `rskim-research trigram-run` + `trigram-codegen` to regenerate."
     )?;
     writeln!(buf, "//!")?;
-    writeln!(
-        buf,
-        "//! # AD-355-5 / PF-004"
-    )?;
-    writeln!(
-        buf,
-        "//!"
-    )?;
+    writeln!(buf, "//! # AD-355-5 / PF-004")?;
+    writeln!(buf, "//!")?;
     writeln!(
         buf,
         "//! Keys are `u32` trigrams: `(b1 << 16) | (b2 << 8) | b3`."
@@ -212,13 +213,13 @@ fn write_lookup_fns(buf: &mut Vec<u8>) -> anyhow::Result<()> {
         buf,
         "/// Key is `u32` (was `u16` before #355 Part B) to match the widened"
     )?;
-    writeln!(
-        buf,
-        "/// [`crate::ngram::Ngram`] key type."
-    )?;
+    writeln!(buf, "/// [`crate::ngram::Ngram`] key type.")?;
     writeln!(buf, "#[must_use]")?;
     writeln!(buf, "#[inline]")?;
-    writeln!(buf, "pub fn lookup_weight(key: u32, weights: &[(u32, f32)]) -> f32 {{")?;
+    writeln!(
+        buf,
+        "pub fn lookup_weight(key: u32, weights: &[(u32, f32)]) -> f32 {{"
+    )?;
     writeln!(buf, "    weights")?;
     writeln!(buf, "        .binary_search_by_key(&key, |&(k, _)| k)")?;
     writeln!(buf, "        .ok()")?;
@@ -267,10 +268,7 @@ fn write_generated_tests(buf: &mut Vec<u8>) -> anyhow::Result<()> {
     writeln!(buf)?;
     writeln!(buf, "    #[test]")?;
     writeln!(buf, "    fn no_duplicate_keys() {{")?;
-    writeln!(
-        buf,
-        "        assert!("
-    )?;
+    writeln!(buf, "        assert!(")?;
     writeln!(
         buf,
         "            TRIGRAM_WEIGHTS.windows(2).all(|w| w[0].0 != w[1].0),"

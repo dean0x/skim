@@ -467,9 +467,17 @@ pub fn intersect_and_rank(
 /// This function builds a second `HashMap<FileId, &SearchResult>` over
 /// `lexical_scored`.  [`intersect_and_rank`] already builds a
 /// `HashMap<FileId, rank>` over the same slice.  Across the public API boundary
-/// the two builds are necessary (each function is independently callable), but
-/// callers on the hot path should pass a pre-truncated `ranked` slice (bounded
-/// to `--limit`) so clone work is O(limit), not O(limit * pool_factor).
+/// the two builds are necessary (each function is independently callable).
+///
+/// **Caller contract** — the production path in `run_compound_query` intentionally
+/// passes the **full untruncated** `ranked` slice (up to `limit × CANDIDATE_POOL_K`
+/// entries) rather than a pre-truncated `limit`-element slice.  This is required by
+/// the AD-355-2 verify-then-truncate-LAST invariant: pre-truncating before
+/// verification could silently discard the real definer if it lands below the
+/// `limit`-th rank slot but above the `limit × K`-th slot.  The accepted cost is
+/// up to K×limit `SearchResult` clones rather than `limit` (bounded, one-time).
+/// A caller that verifies candidates itself (or does not need the verify-last
+/// guarantee) may pre-truncate for cheaper clone work.
 /// Consolidating the two maps into a shared data structure is tracked in #290.
 #[must_use]
 pub fn recompose_with_lexical(

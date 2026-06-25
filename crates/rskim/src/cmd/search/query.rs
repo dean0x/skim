@@ -326,7 +326,7 @@ fn run_compound_query(
     // already narrows candidates — no floor applied here (see COMPOUND_CANDIDATE_POOL_K
     // note at the top of this file).  A file that is in both AST and lexical sets but
     // ranks beyond position limit*4 in the unfiltered lexical ranking will be silently
-    // excluded.  Calibrating K for large corpora is tracked in #290.
+    // excluded.  Calibrating K for large corpora is tracked in #356 (pool-K calibration).
     //
     // Performance note (AD-355-2): `recompose_with_lexical` (below) does `(*lex).clone()`
     // per surviving entry and operates on the FULL `ranked` list (limit×K entries), NOT

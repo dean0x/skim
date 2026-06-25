@@ -33,5 +33,5 @@ pub(crate) mod lang_map;
 mod reader;
 
 pub use builder::NgramIndexBuilder;
-pub use reader::NgramIndexReader;
 pub(crate) use format::FORMAT_VERSION as LEXICAL_FORMAT_VERSION;
+pub use reader::NgramIndexReader;

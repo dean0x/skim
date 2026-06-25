@@ -66,7 +66,11 @@ pub fn encode_trigram(b1: u8, b2: u8, b3: u8) -> u32 {
 #[must_use]
 #[inline]
 pub fn decode_trigram(key: u32) -> (u8, u8, u8) {
-    (((key >> 16) & 0xFF) as u8, ((key >> 8) & 0xFF) as u8, (key & 0xFF) as u8)
+    (
+        ((key >> 16) & 0xFF) as u8,
+        ((key >> 8) & 0xFF) as u8,
+        (key & 0xFF) as u8,
+    )
 }
 
 /// Format a trigram for display.
