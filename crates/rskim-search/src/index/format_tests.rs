@@ -824,6 +824,71 @@ fn test_posting_codec_large_positions() {
     assert_eq!(decoded[2].position, u32::MAX);
 }
 
+/// AC4 / Finding 1+3 — cross-field position-decrease round-trip within the same doc.
+///
+/// Verifies that the encoder resets `prev_position` when `field_id` changes
+/// (even if `doc_id` is unchanged) so that the first position in field N+1
+/// does NOT produce a near-u32::MAX delta when it is lower than the last
+/// position of field N.
+///
+/// Example scenario: within doc 0, field TypeDefinition (=0) covers bytes
+/// 200..300 (position 250), then field Other (=7) covers bytes 0..200
+/// (position 10).  Sorted by (doc_id, field_id, position) the TypeDefinition
+/// entry (pos 250) comes before the Other entry (pos 10).  Without the
+/// field-boundary reset, the encoder would compute `10.wrapping_sub(250)` =
+/// 4294967056 and emit a 5-byte varint — worst case, defeating compression.
+/// With the fix, `prev_position` is reset to 0 on the field boundary so
+/// `delta_position = 10 - 0 = 10`, which encodes as a 1-byte varint.
+///
+/// PF-007 compliance: the assertion checks the exact decoded (doc_id, field_id,
+/// position) tuples, not just that decode returns Ok.  A round-trip that silently
+/// wraps-and-recovers would still pass without this exact-value check.
+#[test]
+fn test_posting_codec_cross_field_position_decrease_roundtrip() {
+    // doc_id = 0, field TypeDefinition (discriminant 0), high position (250)
+    // doc_id = 0, field Other (discriminant 7), lower position (10)
+    // Sorted by (doc_id, field_id, position):
+    //   (0, 0=TypeDefinition, 250) < (0, 7=Other, 10)
+    // field_id 0 < field_id 7, so TypeDefinition entry comes first despite
+    // having a higher byte position than the Other entry.
+    let td = crate::SearchField::TypeDefinition.discriminant(); // 0
+    let other = crate::SearchField::Other.discriminant(); // 7
+    let postings = vec![
+        PostingEntry {
+            doc_id: 0,
+            field_id: td,
+            position: 250,
+        },
+        PostingEntry {
+            doc_id: 0,
+            field_id: other,
+            position: 10,
+        },
+    ];
+    // Verify the input is sorted (as the builder would produce it).
+    assert!(
+        postings[0] < postings[1],
+        "test invariant: postings must be sorted ascending by (doc_id, field_id, position)"
+    );
+
+    let decoded = posting_roundtrip(&postings);
+    assert_eq!(
+        decoded.len(),
+        2,
+        "cross-field position-decrease must round-trip to 2 entries"
+    );
+    assert_eq!(
+        decoded[0],
+        postings[0],
+        "first entry (TypeDefinition, pos=250) must decode exactly"
+    );
+    assert_eq!(
+        decoded[1],
+        postings[1],
+        "second entry (Other, pos=10) must decode exactly after cross-field reset"
+    );
+}
+
 /// decode_postings_varint must return IndexCorrupted for an invalid field_id.
 #[test]
 fn test_posting_codec_invalid_field_id_returns_err() {

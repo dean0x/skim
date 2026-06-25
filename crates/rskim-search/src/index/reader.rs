@@ -144,8 +144,12 @@ impl NgramIndexReader {
     /// Read the lexical index format version from the first 6 bytes of `index.skidx`.
     ///
     /// Opens only 6 bytes (magic + version) — no mmap, no CRC, no full validation.
-    /// Used by `check_staleness` to detect a v2→v3 format mismatch and trigger a
-    /// rebuild before `NgramIndexReader::open` hard-errors on the version mismatch.
+    /// Used by `check_staleness` to detect a stale/below-current lexical
+    /// FORMAT_VERSION (currently v4) and trigger a rebuild before
+    /// `NgramIndexReader::open` hard-errors on the version mismatch.
+    /// For example, a v3 index on disk (pre-#358 delta+varint posting codec)
+    /// reads version=3 here, which is less than FORMAT_VERSION=4, so the
+    /// staleness check fires and a full rebuild is triggered.
     ///
     /// # Errors
     ///

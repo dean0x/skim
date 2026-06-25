@@ -16,6 +16,16 @@ use super::format::{
     SKIDX_HEADER_SIZE, SKIDX_MAGIC, SkidxEntry, SkidxHeader, encode_entry, encode_file_meta,
     encode_header, encode_postings_varint, lang_to_id,
 };
+
+/// Worst-case byte width of a single v4 variable-length posting entry.
+///
+/// A v4 entry is `[varint delta_doc_id][u8 field_id][varint delta_position]`.
+/// The maximum varint width is 5 bytes each (35-bit span for a u32), giving
+/// 5 + 1 + 5 = 11 bytes as the strict upper bound.  We use 9 — the v3
+/// uncompressed entry size — as a conservative but tighter upper bound for
+/// the pre-size capacity hint in [`NgramIndexBuilder::serialize_index`]:
+/// typical small deltas encode in 1–2 bytes, so 9 bytes is already generous.
+const VARINT_UPPER_BOUND_PER_ENTRY: usize = 9;
 use super::reader::NgramIndexReader;
 use crate::{
     FIELD_COUNT, FileId, LayerBuilder, Result, SearchError, SearchField, SearchLayer,
@@ -287,8 +297,9 @@ impl NgramIndexBuilder {
     ///
     /// Postings are encoded using v4 delta+varint compression (see
     /// [`encode_postings_varint`]).  Each posting list is sorted ascending by
-    /// `(doc_id, field_id, position)` before encoding so that delta-doc_id and
-    /// delta-position are always non-negative.
+    /// `(doc_id, field_id, position)` before encoding so that each
+    /// `delta_doc_id` and `delta_position` is a forward, non-wrapping step
+    /// within its `(doc_id, field_id)` run.
     fn serialize_index(
         &self,
         sorted_keys: &[u32],
@@ -296,13 +307,14 @@ impl NgramIndexBuilder {
         avg_field_lengths: [f32; FIELD_COUNT],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         // Serialise posting lists using v4 variable-length (delta+varint) codec.
-        // Pre-size conservatively; varint-encoded entries are 3–11 bytes each
-        // (vs 9 bytes fixed), so we allocate at the uncompressed size as an
-        // upper bound and rely on Vec to shrink via into_boxed_slice if needed.
+        // Pre-size conservatively: varint-encoded entries are 3–11 bytes each
+        // (vs 9 bytes fixed).  VARINT_UPPER_BOUND_PER_ENTRY (= 9) is the v3
+        // fixed-entry size used as a tighter upper bound than the strict 11-byte
+        // worst-case, matching the named-constant convention for on-disk sizes.
         let estimated_capacity: usize = self
             .postings
             .values()
-            .map(|v| v.len() * 9) // conservative upper bound (uncompressed size)
+            .map(|v| v.len() * VARINT_UPPER_BOUND_PER_ENTRY)
             .fold(0usize, usize::saturating_add);
         let mut postings_buf: Vec<u8> = Vec::with_capacity(estimated_capacity);
         let mut entries: Vec<SkidxEntry> = Vec::with_capacity(sorted_keys.len());

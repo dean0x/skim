@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### BREAKING
 
+- **`skim search` index format: v3 → v4 (posting lists now delta+varint compressed)** (#358) —
+  Posting entries changed from a fixed 9-byte layout to a variable-length delta+varint encoding
+  (`[varint delta_doc_id][u8 field_id][varint delta_position]`), reducing the lexical index size
+  by approximately 61% on a representative corpus (measured: 3.53x source ratio vs 9.04x before
+  compression).  Any existing `.skim/` index written by a prior version is silently stale; the
+  first query triggers an automatic rebuild (`auto_refresh_if_stale`).  To force an immediate
+  rebuild: `skim search index --rebuild`.
+
 - **`skim search` index format: v2 → v3 (n-gram key widened u16 → u32)** (#355) —
   The n-gram inverted-index key is now a 32-bit trigram `(b1<<16)|(b2<<8)|b3` instead
   of a 16-bit bigram `(b1<<8)|b2`.  Any existing `.skim/` index written by a prior

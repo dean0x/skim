@@ -466,8 +466,8 @@ pub(crate) fn decode_varint(data: &[u8], offset: usize) -> crate::Result<(u32, u
 ///
 /// Delta-encode `doc_id` (store delta from the previous `doc_id`; absolute for
 /// the first entry) and encode each delta as a little-endian base-128 varint.
-/// Within a doc, encode `position` deltas as varints.  `field_id` is 1 byte
-/// (unchanged; bounded by `FIELD_COUNT = 8`).
+/// Within each `(doc_id, field_id)` run, encode `position` deltas as varints.
+/// `field_id` is 1 byte (unchanged; bounded by `FIELD_COUNT = 8`).
 ///
 /// Layout per posting entry:
 /// ```text
@@ -480,18 +480,41 @@ pub(crate) fn decode_varint(data: &[u8], offset: usize) -> crate::Result<(u32, u
 /// Originating tracker: #273.  FORMAT_VERSION v3→v4 owned by #358 Item 2;
 /// v2→v3 owned by #355 Part B.
 ///
+/// Note: the sibling AST index (`crates/rskim-search/src/ast_index/store/`)
+/// deliberately retains the fixed 9-byte `POSTING_ENTRY_SIZE` codec per
+/// AD-LXPOST-1 (the AST posting list is small and latency-critical; the
+/// lexical posting list is the size driver). This divergence is intentional,
+/// not drift.
+///
 /// # Sorting requirement
 ///
 /// `postings` must be sorted ascending by `(doc_id, field_id, position)`.
 /// The caller (`builder.rs`) sorts each posting list before calling this
-/// function.
+/// function, ensuring positions are monotonically non-decreasing within each
+/// `(doc_id, field_id)` run so all `delta_position` values are non-negative.
+///
+/// # Position-delta reset
+///
+/// `prev_position` is reset to 0 whenever `doc_id` OR `field_id` changes.
+/// This ensures each `(doc_id, field_id)` run starts fresh, keeping
+/// `delta_position` non-negative (and therefore small / 1-byte varint)
+/// across field boundaries within the same document.
+///
+/// Without this reset, the first position in field N+1 would be encoded as a
+/// delta from the last position of field N — which can wrap to near-u32::MAX
+/// and always encodes to the maximum 5-byte varint, defeating compression.
 pub(crate) fn encode_postings_varint(postings: &[PostingEntry], buf: &mut Vec<u8>) {
     let mut prev_doc_id: u32 = 0;
+    let mut prev_field_id: u8 = 0;
     let mut prev_position: u32 = 0;
     for p in postings {
         let delta_doc_id = p.doc_id.wrapping_sub(prev_doc_id);
-        // When doc_id changes, reset the position delta accumulator.
-        if delta_doc_id != 0 {
+        // Reset the position accumulator when doc_id OR field_id changes so that
+        // delta_position is always a forward (non-wrapping) step within a
+        // (doc_id, field_id) run.  Without this reset, a field boundary within
+        // the same doc can produce a near-u32::MAX delta that always encodes as
+        // the maximum 5-byte varint — defeating the purpose of v4 compression.
+        if delta_doc_id != 0 || p.field_id != prev_field_id {
             prev_position = 0;
         }
         let delta_position = p.position.wrapping_sub(prev_position);
@@ -499,6 +522,7 @@ pub(crate) fn encode_postings_varint(postings: &[PostingEntry], buf: &mut Vec<u8
         buf.push(p.field_id);
         encode_varint(delta_position, buf);
         prev_doc_id = p.doc_id;
+        prev_field_id = p.field_id;
         prev_position = p.position;
     }
 }
@@ -515,6 +539,12 @@ pub(crate) fn encode_postings_varint(postings: &[PostingEntry], buf: &mut Vec<u8
 /// varint`), so the loop runs at most `data.len() / 3` times — bounded by
 /// the data size, not an external counter.
 ///
+/// # Capacity hint
+///
+/// `Vec::with_capacity(data.len() / 3)` pre-sizes the output using the upper
+/// bound implied by the minimum-bytes-per-entry guarantee, eliminating
+/// geometric reallocation on long posting lists in the query hot path.
+///
 /// # Errors
 ///
 /// Returns [`SearchError::IndexCorrupted`] if:
@@ -527,13 +557,20 @@ pub(crate) fn encode_postings_varint(postings: &[PostingEntry], buf: &mut Vec<u8
 /// inverse of the encoder's `wrapping_sub` (see [`encode_postings_varint`]).
 /// The round-trip is therefore lossless for every `u32` input — including the
 /// maximum `doc_id` gap (`0 → u32::MAX`, covered by
-/// `test_posting_codec_max_gap_docid`). Modular arithmetic cannot fail, so no
+/// `test_posting_codec_max_gap_docid`).  `prev_position` is reset to 0
+/// whenever `doc_id` OR `field_id` changes, mirroring the encoder's reset
+/// (see [`encode_postings_varint`]).  Modular arithmetic cannot fail, so no
 /// overflow error is raised; a corrupt blob yields wrong-but-bounded `u32`
 /// values (used only for scoring), never a panic or out-of-bounds access.
 pub(crate) fn decode_postings_varint(data: &[u8]) -> crate::Result<Vec<PostingEntry>> {
-    let mut postings = Vec::new();
+    // Pre-size with the upper bound: each entry is at least 3 bytes
+    // (1-byte varint + 1-byte field_id + 1-byte varint), so at most
+    // data.len() / 3 entries can be present. This eliminates geometric
+    // reallocation on long posting lists in the query hot path.
+    let mut postings = Vec::with_capacity(data.len() / 3);
     let mut offset = 0usize;
     let mut prev_doc_id: u32 = 0;
+    let mut prev_field_id: u8 = 0;
     let mut prev_position: u32 = 0;
 
     while offset < data.len() {
@@ -563,11 +600,12 @@ pub(crate) fn decode_postings_varint(data: &[u8]) -> crate::Result<Vec<PostingEn
         offset += m;
 
         // Reconstruct absolute doc_id and position.
-        // When doc_id changes, reset the position accumulator.
-        if delta_doc_id != 0 {
+        // Reset the position accumulator when doc_id OR field_id changes,
+        // mirroring the encoder's reset in encode_postings_varint.
+        let doc_id = prev_doc_id.wrapping_add(delta_doc_id);
+        if delta_doc_id != 0 || field_id != prev_field_id {
             prev_position = 0;
         }
-        let doc_id = prev_doc_id.wrapping_add(delta_doc_id);
         let position = prev_position.wrapping_add(delta_position);
 
         postings.push(PostingEntry {
@@ -577,6 +615,7 @@ pub(crate) fn decode_postings_varint(data: &[u8]) -> crate::Result<Vec<PostingEn
         });
 
         prev_doc_id = doc_id;
+        prev_field_id = field_id;
         prev_position = position;
     }
     Ok(postings)
