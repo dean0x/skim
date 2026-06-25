@@ -16,6 +16,11 @@ use super::format::{
     SKIDX_HEADER_SIZE, SKIDX_MAGIC, SkidxEntry, SkidxHeader, encode_entry, encode_file_meta,
     encode_header, encode_postings_varint, lang_to_id,
 };
+use super::reader::NgramIndexReader;
+use crate::{
+    FIELD_COUNT, FileId, LayerBuilder, Result, SearchError, SearchField, SearchLayer,
+    io_util::atomic_write,
+};
 
 /// Capacity-hint upper bound (bytes per posting entry) for the postings buffer
 /// in [`NgramIndexBuilder::serialize_index`].
@@ -31,11 +36,6 @@ use super::format::{
 /// Framing: this is a peak-memory/zero-realloc trade-off, NOT a "tight upper
 /// bound" — the v4 average is ~3.5 bytes/entry so 9 is ~2.5x over-estimated.
 const VARINT_UPPER_BOUND_PER_ENTRY: usize = 9;
-use super::reader::NgramIndexReader;
-use crate::{
-    FIELD_COUNT, FileId, LayerBuilder, Result, SearchError, SearchField, SearchLayer,
-    io_util::atomic_write,
-};
 
 // ============================================================================
 // Public builder struct

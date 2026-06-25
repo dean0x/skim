@@ -138,7 +138,7 @@ pub(crate) struct SkidxHeader {
     ///
     /// Indexed by [`crate::SearchField`] discriminant.
     pub avg_field_lengths: [f32; FIELD_COUNT],
-    /// CRC32 of the entry array + file-metadata array bytes.
+    /// CRC32 over `.skpost` + entry array + file-metadata array bytes (v4, #364).
     pub checksum: u32,
 }
 
@@ -167,12 +167,11 @@ pub(crate) struct SkidxEntry {
 
 /// One element in a posting list inside `.skpost`.
 ///
-/// Layout (9 bytes, all integers little-endian):
-/// ```text
-/// [0..4] doc_id    4 bytes
-/// [4]    field_id  1 byte
-/// [5..9] position  4 bytes
-/// ```
+/// This is the **in-memory** representation.  The **on-disk** encoding is
+/// variable-length (v4, AD-LXPOST-1): each entry is written as
+/// `[varint delta_doc_id][u8 field_id][varint delta_position]`
+/// via [`encode_postings_varint`] and decoded via [`decode_postings_varint`].
+/// The fixed-stride 9-byte layout present in v3 no longer applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PostingEntry {
     /// The document (file) this posting belongs to.
