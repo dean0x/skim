@@ -29,27 +29,25 @@ use super::staleness::auto_refresh_if_stale;
 use super::types::{QueryConfig, QueryOutput, ResolvedResult};
 
 // ============================================================================
-// Candidate-pool sizing (AD-355-2)
+// Candidate-pool sizing (AD-355-2, AD-356-1)
 // ============================================================================
 //
-// The three paths (pure-lexical, compound text+AST, blast-radius) each widen
+// The three paths (pure-lexical, compound text+AST, blast-radius) each size
 // their candidate pool before the verify-then-truncate-LAST step.  All three
 // pools are defined here in one place so the "how wide must the pre-verify pool
 // be" decision has a single reason to change.
 //
 // `candidate_pool(limit, k)` returns `max(limit * k, CANDIDATE_POOL_FLOOR)` so
 // every path uses the same floor policy.  Calibrating K per-path is tracked in
-// #356 (pool-K calibration) per ADR-003 (grounded measurements before changing).
+// #290 per ADR-003 (grounded measurements before changing).
 //
-// Current values — no measured corpus basis; #356 owns calibration:
+// Current values:
 //   LEXICAL_CANDIDATE_POOL_K = 5  (pure-lexical, with floor)
-//   COMPOUND_CANDIDATE_POOL_K = 4 (text+AST compound, no floor: intersection already narrows)
 //   BLAST_CANDIDATE_POOL_K   = 10 (blast-radius composite UNION, with floor)
 //
-// Note: COMPOUND_CANDIDATE_POOL_K intentionally has no floor here; the compound
-// path uses `saturating_mul` without `.max(floor)` because the intersection gate
-// already narrows candidates aggressively.  If this becomes a correctness concern
-// for small --limit values, add a floor in run_compound_query and update #356.
+// The compound text+AST path (run_compound_query) no longer uses a K multiplier.
+// AD-356-1: the lexical candidate pool is the AST-matched FileId set itself.
+// See run_compound_query for the full rationale.
 
 /// Shared floor for `candidate_pool`: every widened pool has at least this many
 /// slots so small `--limit` values do not starve the verify step.
@@ -152,21 +150,19 @@ pub(super) fn execute_query_with_manifest(
         .as_ref()
         .map(|allowed_paths| super::temporal::paths_to_file_ids(&sorted, allowed_paths));
 
-    // ── Compound text+AST path (#198) ─────────────────────────────────────────
+    // ── Compound text+AST path (#198, #356) ──────────────────────────────────
     //
-    // When `ast_scored` is Some, replace the old file_filter gate with true
-    // weighted-RRF composite intersection:
+    // When `ast_scored` is Some, run the compound text+AST intersection:
     //
-    //   1. Fetch a WIDER lexical candidate pool (limit * CANDIDATE_POOL_K) so
-    //      files that rank lower in pure-lexical order but higher in composite
-    //      order are not truncated before the blend sees them.
-    //      temporal.rs uses limit.saturating_mul(5) with a .max(100) floor;
-    //      the compound path uses K=4 (no floor) — a deliberately lighter pool
-    //      because the intersection gate already narrows the candidate set.
-    //   2. Optionally restrict lexical candidates by blast-radius (if set).
+    //   1. Restrict the lexical engine to the AST FileId set via file_filter
+    //      (AD-356-1) so `raw_lex` is exactly AST ∩ lexical-present.
+    //      Optionally intersect with blast-radius (if set).
+    //   2. Size sq.limit to the candidate set (AD-356-2) so the reader's own
+    //      .take(limit) does not truncate before intersect_and_rank sees the
+    //      complete pool.
     //   3. Run intersect_and_rank: HashMap join + weighted RRF fusion.
     //   4. Recompose: carry the lexical SearchResult (snippet + line_range)
-    //      with the composite RRF score replacing the raw lexical score (AC11).
+    //      with the composite RRF score replacing the raw lexical score.
     //   5. Truncate to --limit LAST (rank-then-truncate-LAST invariant).
     //
     // Structural refinement (depth-based via AstIndexReader) is not yet threaded
@@ -199,7 +195,7 @@ pub(super) fn execute_query_with_manifest(
     // file_filter (set-intersection) approach with UNION re-ranking via composite
     // weighted RRF:
     //
-    //   1. Fetch a WIDER lexical pool (limit * CANDIDATE_POOL_K) WITHOUT a
+    //   1. Fetch a WIDER lexical pool (limit * BLAST_CANDIDATE_POOL_K) WITHOUT a
     //      file_filter so text-only matches outside the co-change partner set
     //      are still present in the lexical ranked list.
     //   2. Build a temporal ranked list from the co-change partner set:
@@ -302,11 +298,12 @@ struct QueryContext<'a> {
     start: Instant,
 }
 
-/// Execute the compound text+AST query branch (#198).
+/// Execute the compound text+AST query branch (#198, #356).
 ///
-/// Fetches a wider lexical candidate pool, applies an optional blast-radius
-/// pre-filter, runs `intersect_and_rank` (HashMap join + weighted RRF fusion),
-/// recomposes the results with lexical snippets, and returns a [`QueryOutput`].
+/// Restricts the lexical engine to the AST-matched FileId set (AD-356-1),
+/// sizes `sq.limit` to the candidate set (AD-356-2), runs
+/// `intersect_and_rank` (HashMap join + weighted RRF fusion), recomposes the
+/// results with lexical snippets, and returns a [`QueryOutput`].
 ///
 /// Extracted from [`execute_query_with_manifest`] to give each path a
 /// single-responsibility scope and eliminate the duplicated `QueryOutput`
@@ -321,38 +318,54 @@ fn run_compound_query(
     blast_file_ids: Option<HashSet<FileId>>,
     ctx: QueryContext<'_>,
 ) -> anyhow::Result<QueryOutput> {
-    // Wider lexical pool before compound ranking (see module-level pool-sizing note).
-    // K=4: lighter than lexical (K=5) / blast (K=10) because the intersection gate
-    // already narrows candidates — no floor applied here (see COMPOUND_CANDIDATE_POOL_K
-    // note at the top of this file).  A file that is in both AST and lexical sets but
-    // ranks beyond position limit*4 in the unfiltered lexical ranking will be silently
-    // excluded.  Calibrating K for large corpora is tracked in #356 (pool-K calibration).
+    // AD-356-1: The lexical candidate pool is the AST-matched FileId set itself,
+    // not `limit * K`. We restrict the lexical engine via `file_filter` (which it
+    // already honors during scoring, reader.rs) so `raw_lex` is exactly the
+    // AST ∩ lexical-present set. This makes the intersection complete by
+    // construction: no qualifying file can fall beyond a `limit * K` cliff (#356).
+    // We removed CANDIDATE_POOL_K (ADR-003: it was an ungrounded heuristic; the
+    // correct fix is to eliminate the cap, not retune it).
     //
-    // Performance note (AD-355-2): `recompose_with_lexical` (below) does `(*lex).clone()`
-    // per surviving entry and operates on the FULL `ranked` list (limit×K entries), NOT
-    // a pre-truncated slice.  This is required to preserve the verify-then-truncate-LAST
-    // invariant: pre-truncation would drop the real definer before verification can keep
-    // it.  The accepted cost is up to K×limit `SearchResult` clones (each carrying a
-    // `Vec<Range<usize>>`) instead of `limit` — a bounded (4×) increase in clone work.
-    const CANDIDATE_POOL_K: usize = 4;
+    // AD-356-2: Size sq.limit to the candidate set, NOT None. The reader applies
+    // `limit = query.limit.unwrap_or(20)` (reader.rs), so `None` would silently
+    // re-cap at 20 and reintroduce #356 for AST sets > 20. `.max(1)` keeps the
+    // value valid; the empty-AST case is handled by an early return above.
+    let ast_fid_set: HashSet<FileId> = ast_scored_vec.iter().map(|&(fid, _)| fid).collect();
     let mut sq = SearchQuery::new(config.text.clone());
-    // saturating_mul: a hostile `--limit` near usize::MAX must not overflow.
-    sq.limit = Some(config.limit.saturating_mul(CANDIDATE_POOL_K));
+    debug_assert!(config.limit >= 1, "config.limit must be >= 1 (CLI guarantee)");
 
-    // Apply blast-radius pre-filter when present (blast ∩ AST path).
-    // Build a HashSet of AST FileIds once for O(1) membership tests — avoids
-    // the O(blast × ast) nested scan that a linear .any() scan would produce.
+    // Early-out: empty AST set → no intersection possible → return empty output.
+    // This is a correctness guard (AC12), not a performance optimization: an empty
+    // file_filter would cause the reader to score zero files regardless of sq.limit.
+    if ast_fid_set.is_empty() {
+        return Ok(QueryOutput {
+            query: config.text.clone(),
+            total: 0,
+            results: vec![],
+            duration_ms: ctx.start.elapsed().as_millis() as u64,
+            index_stats: Some(ctx.stats),
+        });
+    }
+
+    // Apply blast-radius ∩ AST pre-filter when present (blast ∩ AST path).
+    // Without blast-radius, restrict to the full AST FileId set so the lexical
+    // engine scores only AST-matching files (AD-356-1).
     if let Some(ref blast) = blast_file_ids {
-        let ast_fid_set: HashSet<FileId> = ast_scored_vec.iter().map(|&(fid, _)| fid).collect();
+        // blast ∩ AST: O(blast) loop with O(1) membership test in ast_fid_set.
         let intersection: HashSet<FileId> = blast
             .iter()
             .filter(|id| ast_fid_set.contains(*id))
             .copied()
             .collect();
+        // AD-356-2: size sq.limit to the candidate set.
+        sq.limit = Some(intersection.len().max(1));
         sq.file_filter = Some(intersection);
+    } else {
+        // No blast-radius: lexical engine is restricted to the AST set.
+        // AD-356-2: size sq.limit to the AST set, never None (reader would re-cap at 20).
+        sq.limit = Some(ast_fid_set.len().max(1));
+        sq.file_filter = Some(ast_fid_set);
     }
-    // (No else: without blast-radius, no lexical file_filter — the compound
-    // intersection acts as the filter, not the lexical engine's file_filter.)
 
     let raw_lex = ctx.engine.search(&sq)?;
 
@@ -372,23 +385,31 @@ fn run_compound_query(
         CompositeWeights::default(),
     );
 
-    // Recompose: carry lexical SearchResult (snippet + line_range), replace score (AC11).
-    // NOTE: recompose_with_lexical operates on the FULL `ranked` list (limit×CANDIDATE_POOL_K
-    // entries), not a pre-truncated slice — this preserves the AD-355-2 verify-then-truncate-LAST
-    // invariant.  We MUST NOT truncate to config.limit here; if we did, and the top `limit`
-    // RRF slots were occupied by incidental-overlap junk, the real definer at slot limit+1
-    // would be dropped before verification could keep it and the junk is removed.
-    // Truncation happens LAST in resolve_paths_and_snippets_verified (after verification
-    // filters non-matching candidates), matching the pure-lexical and blast-radius paths.
+    // Recompose: carry lexical SearchResult (snippet + line_range), replace score.
+    // NOTE: recompose_with_lexical operates on the FULL `ranked` list (AST-set sized,
+    // AD-356-1), not a pre-truncated slice — this preserves the AD-355-2
+    // verify-then-truncate-LAST invariant.  We MUST NOT truncate to config.limit here;
+    // if we did, and the top `limit` RRF slots were occupied by incidental-overlap junk,
+    // the real definer at slot limit+1 would be dropped before verification could keep
+    // it and the junk is removed.  Truncation happens LAST in
+    // resolve_paths_and_snippets_verified (after verification filters non-matching
+    // candidates), matching the pure-lexical and blast-radius paths.
     let recomposed = recompose_with_lexical(&ranked, &raw_lex);
 
     // AC-F6: text+AST compound path → layers_matched = ["lexical","ast"] (stable order).
     //
     // AD-355-2/AD-355-4: verify substring membership over the FULL recomposed list,
-    // then truncate to --limit LAST.  The candidate pool is limit×CANDIDATE_POOL_K (K=4),
-    // so recomposed has up to limit*4 entries.  Verification drops non-matching candidates
-    // (relevance gate, not a #317 cap); truncation to config.limit happens inside
-    // resolve_paths_and_snippets_verified as the final step.
+    // then truncate to --limit LAST.
+    //
+    // AD-356-3: No output::elision_marker here. The pool == the full AST∩lexical
+    // set (AD-356-1), so the only truncation is the user's --limit — honored
+    // display semantics, not a hidden performance cap. Emitting an elision notice
+    // would fire on every --limit < result_count, which is normal truncation, not
+    // elision. Compress-never-truncate (CLAUDE.md) is satisfied: no internal cap.
+    //
+    // Verification drops non-matching candidates (relevance gate, not a #317 cap);
+    // truncation to config.limit happens inside resolve_paths_and_snippets_verified
+    // as the final step.
     let results = resolve_paths_and_snippets_verified(
         &recomposed,
         ctx.sorted,

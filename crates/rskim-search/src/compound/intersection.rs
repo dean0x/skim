@@ -45,17 +45,18 @@
 //! baseless per ADR-003.  The omission is intentional and traceable to the amendment;
 //! #202 lifting it is the prerequisite for adding it.
 //!
-//! # Lexical candidate pool and completeness
+//! # Lexical candidate pool and completeness (#356)
 //!
-//! The production caller fetches a **wider** lexical pool of `limit * 4` candidates
-//! (no lexical `file_filter` on the text+AST path) and intersects with the full AST
-//! set.  A file that is in both AST and lexical sets but ranks beyond position
-//! `limit * 4` in the unfiltered lexical ranking will not appear in the output.
-//! The K=4 multiplier is a heuristic with no measured corpus basis; it is documented
-//! here for the #290 follow-up to calibrate.  This is an intentional trade-off: the
-//! old `file_filter` gate guaranteed completeness within the AST set but precluded
-//! composite ranking; the new wider-pool approach enables composite ranking at the
-//! cost of a bounded completeness gap.
+//! The production caller in `run_compound_query` (query.rs) restricts the lexical
+//! engine to the AST-matched FileId set via `file_filter` (AD-356-1) and sizes
+//! `sq.limit` to the candidate set (AD-356-2).  As a result `raw_lex` is exactly
+//! `AST ∩ lexical-present` — every file that satisfies both filters is visible to
+//! this function; no file can fall beyond a `limit * K` cliff.
+//!
+//! The intersection is therefore **complete by construction**: for a given text+AST
+//! query, every file that passes both the AST structural filter and the lexical
+//! trigram filter will appear in the output (subject only to the user's `--limit`
+//! truncation, which is honored display semantics, not an internal cap).
 //!
 //! # Extension points for #200
 //!
@@ -470,12 +471,12 @@ pub fn intersect_and_rank(
 /// the two builds are necessary (each function is independently callable).
 ///
 /// **Caller contract** — the production path in `run_compound_query` intentionally
-/// passes the **full untruncated** `ranked` slice (up to `limit × CANDIDATE_POOL_K`
-/// entries) rather than a pre-truncated `limit`-element slice.  This is required by
-/// the AD-355-2 verify-then-truncate-LAST invariant: pre-truncating before
-/// verification could silently discard the real definer if it lands below the
-/// `limit`-th rank slot but above the `limit × K`-th slot.  The accepted cost is
-/// up to K×limit `SearchResult` clones rather than `limit` (bounded, one-time).
+/// passes the **full untruncated** `ranked` slice (AST-set sized, AD-356-1) rather
+/// than a pre-truncated `limit`-element slice.  This is required by the AD-355-2
+/// verify-then-truncate-LAST invariant: pre-truncating before verification could
+/// silently discard the real definer if it lands below the `limit`-th rank slot.
+/// The accepted cost is AST-set-size `SearchResult` clones rather than `limit`
+/// (bounded by the corpus-bounded AST set, one-time).
 /// A caller that verifies candidates itself (or does not need the verify-last
 /// guarantee) may pre-truncate for cheaper clone work.
 /// Consolidating the two maps into a shared data structure is tracked in #290.
