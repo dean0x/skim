@@ -39,7 +39,7 @@ use super::types::{QueryConfig, QueryOutput, ResolvedResult};
 //
 // `candidate_pool(limit, k)` returns `max(limit * k, CANDIDATE_POOL_FLOOR)` so
 // every path uses the same floor policy.  Calibrating K per-path is tracked in
-// #290 per ADR-003 (grounded measurements before changing).
+// #361 per ADR-003 (grounded measurements before changing).
 //
 // Current values:
 //   LEXICAL_CANDIDATE_POOL_K = 5  (pure-lexical, with floor)
@@ -243,7 +243,7 @@ pub(super) fn execute_query_with_manifest(
     //
     // K=5, floor CANDIDATE_POOL_FLOOR: matches the temporal.rs resort_window() heuristic
     // so the two paths behave consistently.  This value has no measured corpus basis;
-    // calibrating K for large corpora is tracked in #290.
+    // calibrating K for large corpora is tracked in #361.
     //
     // AD-355-4: Dropping non-matching candidates is a relevance gate, NOT an output
     // elision/cap under #317 "compress-never-truncate".  It does not hide output that
@@ -317,7 +317,10 @@ fn run_compound_query(
     blast_file_ids: Option<HashSet<FileId>>,
     ctx: QueryContext<'_>,
 ) -> anyhow::Result<QueryOutput> {
-    debug_assert!(config.limit >= 1, "config.limit must be >= 1 (CLI guarantee)");
+    debug_assert!(
+        config.limit >= 1,
+        "config.limit must be >= 1 (CLI guarantee)"
+    );
 
     // Build the AST FileId set once for O(1) membership tests below.
     let ast_fid_set: HashSet<FileId> = ast_scored_vec.iter().map(|&(fid, _)| fid).collect();
@@ -348,7 +351,11 @@ fn run_compound_query(
     // early return above.
     let filter_set: HashSet<FileId> = match blast_file_ids {
         // blast ∩ AST: O(blast) with O(1) membership test in ast_fid_set.
-        Some(ref blast) => blast.iter().filter(|id| ast_fid_set.contains(*id)).copied().collect(),
+        Some(ref blast) => blast
+            .iter()
+            .filter(|id| ast_fid_set.contains(*id))
+            .copied()
+            .collect(),
         None => ast_fid_set,
     };
     let mut sq = SearchQuery::new(config.text.clone());
@@ -472,7 +479,7 @@ fn run_blast_radius_composite_query(
     // verification.  The worst-case file reads are O(K × limit) per query; on
     // the AD-355-7 short-query fallback the candidate set is still bounded to
     // Some(K × limit).max(100) before the verify step.  Calibrating K for large
-    // corpora is tracked in #290.
+    // corpora is tracked in #361.
     const BLAST_CANDIDATE_POOL_K: usize = 10;
     let mut sq = SearchQuery::new(config.text.clone());
     sq.limit = Some(candidate_pool(config.limit, BLAST_CANDIDATE_POOL_K));

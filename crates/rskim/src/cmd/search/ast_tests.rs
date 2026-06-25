@@ -1816,12 +1816,186 @@ fn text_ast_intersection_complete_below_pool_cliff_356() {
         limit1_output.results[0].path
     );
 
-    // -- AC13 (set property independent of ranking): same set at --limit 5 ------
-    // The compound path returns the SAME qualifying set regardless of --limit.
-    // At limit=5 with 1 qualifying file, the result must still be target.rs.
-    let limit5_config = QueryConfig {
+    // Note: AC13 (set property independent of ranking/limit) is covered by the
+    // `text_ast_ad356_2_limit_guard_25_files` test below, which uses N=25 qualifying
+    // files and drives at --limit {25, 10, 1}.  A --limit 5 assertion here with N=1
+    // qualifying file is non-discriminating (pre-fix code also returns 1 result at
+    // --limit 5 because pool=20 > corpus size), so it was removed to avoid overstating
+    // coverage.  See review finding #6 / PF-007.
+}
+
+// ============================================================================
+// AC8 — AD-356-2 limit-guard: sq.limit sized to the AST set, never None (#356)
+// ============================================================================
+
+/// Build a project with exactly N Rust files each containing both the text
+/// token 'nested' and a nested for-loop (so all N match the `rust-nested-loop`
+/// AST pattern AND the text query).
+///
+/// Used by `text_ast_ad356_2_limit_guard_25_files` to construct a 25-file
+/// fixture whose AST set exceeds the reader's `unwrap_or(20)` default.
+fn make_project_with_n_nested_loop_files(n: usize) -> TempDir {
+    assert!(n >= 1, "must have at least 1 file");
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    for i in 1..=n {
+        // Each file contains "nested" once AND a nested for-loop so both the
+        // text query ("nested") AND the rust-nested-loop AST pattern match.
+        fs::write(
+            root.join(format!("src/nested_{i:02}.rs")),
+            format!(
+                r#"
+// nested: qualifying file {i}
+fn work_{i}() {{
+    for a in 0..{i} {{
+        for b in 0..{i} {{
+            let _ = (a, b);
+        }}
+    }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fs::write(root.join("config.json"), r#"{"key": "value"}"#).unwrap();
+
+    dir
+}
+
+/// AC8 / AD-356-2 — sq.limit sized to the AST set, never None (#356).
+///
+/// This test is the dedicated discriminator for AD-356-2: the guarantee that
+/// `sq.limit = Some(filter_set.len().max(1))` rather than `None`.
+///
+/// # Why this test is needed (PF-007)
+///
+/// The reader in `reader.rs` applies `let limit = query.limit.unwrap_or(20)`.
+/// If `sq.limit` were `None` (or any constant ≤ 20), a 25-file AST set would
+/// be silently re-capped at 20 results — reintroducing #356 for large sets.
+///
+/// The existing `text_ast_intersection_complete_below_pool_cliff_356` test uses
+/// a 1-file AST set: with N=1 both `Some(1)` and `None` yield 1 result (1 ≤ 20),
+/// so reverting line 362 of query.rs to `sq.limit = None` would NOT fail that
+/// test.  That test is blind to the AD-356-2 half of the fix.
+///
+/// # What this test proves
+///
+/// - N=25 files ALL satisfy both the text query ("nested") and `rust-nested-loop`.
+/// - At `--limit 25` with `sq.limit = Some(25)`: reader scores all 25 → returns 25.
+/// - At `--limit 25` with `sq.limit = None` (regression): reader caps at 20 → only
+///   20 returned → `assert_eq!(results.len(), 25)` **FAILS**.
+///
+/// # AC13 (set property independent of ranking)
+///
+/// At `--limit 10` exactly 10 of the 25 qualifying files are returned (the top-10
+/// by RRF score), proving the set-completeness guarantee is rank-independent.
+/// At `--limit 1` exactly 1 qualifying file is returned.
+#[test]
+fn text_ast_ad356_2_limit_guard_25_files() {
+    use super::super::query::execute_query;
+    use super::super::types::QueryConfig;
+
+    const N: usize = 25;
+
+    let project = make_project_with_n_nested_loop_files(N);
+    let cache = tempfile::tempdir().unwrap();
+
+    build_project_index(project.path(), cache.path());
+
+    // -- Precondition: AST filter matches all N files ---------------------------
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
+
+    assert_eq!(
+        ast_scored.len(),
+        N,
+        "AD-356-2 precondition: rust-nested-loop must match all {N} nested-loop files; \
+         got {} — check that make_project_with_n_nested_loop_files generated valid Rust \
+         with nested for-loops",
+        ast_scored.len()
+    );
+
+    // -- AC8 (primary discriminating assertion): all N files returned at --limit N --
+    //
+    // Pre-fix (sq.limit = None): reader.rs `unwrap_or(20)` caps at 20.
+    // N=25 > 20 → only 20 returned → assert_eq FAILS (RED confirms AD-356-2 gap).
+    //
+    // Post-fix (sq.limit = Some(25)): reader scores all 25 → returns 25 → PASSES.
+    let full_config = QueryConfig {
         text: "nested".to_string(),
-        limit: 5,
+        limit: N,
+        json: false,
+        root: project.path().to_path_buf(),
+        cache_dir: cache.path().to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: Some(ast_scored.clone()),
+        composite_weights: None,
+    };
+    let full_output = execute_query(&full_config, &TEST_ANALYTICS).unwrap();
+
+    assert_eq!(
+        full_output.results.len(),
+        N,
+        "AC8 (AD-356-2 DISCRIMINATING): --limit {N} must return all {N} qualifying files. \
+         Got {} — if the count is 20, sq.limit was None (unwrap_or(20) re-cap regression). \
+         Reverting query.rs:362 to `sq.limit = None` would produce this failure.",
+        full_output.results.len()
+    );
+
+    // All returned paths must be the nested_NN.rs files (no spurious entries).
+    for r in &full_output.results {
+        assert!(
+            r.path.contains("nested_"),
+            "AC8: result path must be one of the nested_NN.rs files; got: {:?}",
+            r.path
+        );
+    }
+
+    // -- AC13 (set property): intermediate --limit returns a proper subset ----------
+    let mid_config = QueryConfig {
+        text: "nested".to_string(),
+        limit: 10,
+        json: false,
+        root: project.path().to_path_buf(),
+        cache_dir: cache.path().to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: Some(ast_scored.clone()),
+        composite_weights: None,
+    };
+    let mid_output = execute_query(&mid_config, &TEST_ANALYTICS).unwrap();
+
+    assert_eq!(
+        mid_output.results.len(),
+        10,
+        "AC13: --limit 10 must return exactly 10 of the {N} qualifying files; \
+         got {}",
+        mid_output.results.len()
+    );
+    // Each mid result must also appear in the full set (proper subset check).
+    let full_paths: std::collections::HashSet<&str> = full_output
+        .results
+        .iter()
+        .map(|r| r.path.as_str())
+        .collect();
+    for r in &mid_output.results {
+        assert!(
+            full_paths.contains(r.path.as_str()),
+            "AC13: path {:?} from --limit 10 is not in the full --limit {N} set — \
+             compound filter is inconsistent across limit values",
+            r.path
+        );
+    }
+
+    // -- AC13 continued: --limit 1 returns exactly 1 qualifying file ---------------
+    let limit1_config = QueryConfig {
+        text: "nested".to_string(),
+        limit: 1,
         json: false,
         root: project.path().to_path_buf(),
         cache_dir: cache.path().to_path_buf(),
@@ -1829,19 +2003,79 @@ fn text_ast_intersection_complete_below_pool_cliff_356() {
         ast_scored: Some(ast_scored),
         composite_weights: None,
     };
-    let limit5_output = execute_query(&limit5_config, &TEST_ANALYTICS).unwrap();
+    let limit1_output = execute_query(&limit1_config, &TEST_ANALYTICS).unwrap();
 
     assert_eq!(
-        limit5_output.results.len(),
+        limit1_output.results.len(),
         1,
-        "AC13: --limit 5 must still return exactly 1 qualifying file (target.rs); \
-         distractors must not appear in compound results since they lack the AST pattern; \
-         got {} results",
-        limit5_output.results.len()
+        "AC13: --limit 1 must return exactly 1 qualifying file; got {}",
+        limit1_output.results.len()
     );
     assert!(
-        limit5_output.results[0].path.contains("target.rs"),
-        "AC13: the single result at --limit 5 must be target.rs; got: {:?}",
-        limit5_output.results[0].path
+        limit1_output.results[0].path.contains("nested_"),
+        "AC13: --limit 1 result must be a nested_NN.rs file; got: {:?}",
+        limit1_output.results[0].path
+    );
+}
+
+// ============================================================================
+// AC12 — empty-AST early-out (#356)
+// ============================================================================
+
+/// AC12 — empty AST set returns empty QueryOutput, no panic, exit 0 (#356).
+///
+/// The early-out guard at `run_compound_query` (query.rs:331-339) handles the
+/// case where `ast_scored = Some(empty vec)`.  With an empty `file_filter` the
+/// reader scores zero files anyway, but the guard avoids the work and documents
+/// the intent.
+///
+/// # Discriminating property (PF-007)
+///
+/// This is a reachable production path: `mod.rs:639-644` dispatches into
+/// `run_compound_query` with `ast_scored = Some(vec![])` when the AST engine
+/// resolves zero hits for the given pattern.  The test exercises this control
+/// path directly by passing `ast_scored: Some(vec![])`.
+///
+/// If the early-out were deleted, behavior degrades safely (empty `file_filter`
+/// still returns nothing), so this test focuses on asserting the contract:
+/// no panic, no error, results empty.  Severity is low but the branch is new,
+/// reachable code with a distinct control path and zero coverage without this
+/// test.
+#[test]
+fn text_ast_empty_ast_set_returns_empty_ac12() {
+    use super::super::query::execute_query;
+    use super::super::types::QueryConfig;
+
+    let project = make_project_with_two_nested_loop_files();
+    let cache = tempfile::tempdir().unwrap();
+
+    build_project_index(project.path(), cache.path());
+
+    // Pass an explicitly empty AST scored vector — simulates a pattern that
+    // matches no files (e.g. `skim search "foo" --ast <pattern-that-matches-nothing>`).
+    let config = QueryConfig {
+        text: "nested".to_string(),
+        limit: 10,
+        json: false,
+        root: project.path().to_path_buf(),
+        cache_dir: cache.path().to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: Some(vec![]), // empty — the key input for AC12
+        composite_weights: None,
+    };
+
+    // Must not panic, must not error, must return empty results (exit 0 semantics).
+    let output = execute_query(&config, &TEST_ANALYTICS)
+        .expect("AC12: execute_query must not error on empty AST set");
+
+    assert!(
+        output.results.is_empty(),
+        "AC12: empty AST set must produce empty results; got {} results",
+        output.results.len()
+    );
+    assert_eq!(
+        output.total, 0,
+        "AC12: total must be 0 for empty AST set; got {}",
+        output.total
     );
 }

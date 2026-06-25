@@ -425,7 +425,10 @@ impl SearchLayer for NgramIndexReader {
         // Candidate bound — callers are expected to set `sq.limit = Some(N)`:
         //   Unset (None): `unwrap_or(20)` default.
         //   Pure-lexical: `Some(max(config.limit * LEXICAL_POOL_K, 100))` (query.rs).
-        //   Compound:     `Some(ast_set.len().max(1))` (AD-356-2, query.rs #356).
+        //   Compound:     `Some(filter_set.len().max(1))` (AD-356-2, query.rs #356).
+        //                 (`filter_set` is `blast ∩ ast` on the blast+AST sub-path,
+        //                  or the full AST set on the no-blast sub-path — it may be
+        //                  strictly smaller than the raw AST set.)
         //   Blast-radius: `Some(max(config.limit * BLAST_POOL_K, 100))` (K=10).
         //
         // NOTE: candidates are selected in raw file-id/insertion order BEFORE the
@@ -436,7 +439,7 @@ impl SearchLayer for NgramIndexReader {
         // this remains an accepted trade-off.
         //
         // Security: no injection, no path traversal; only the user's own indexed
-        // files (bounded to the pool cap) are returned as score-0 candidates.
+        // files (bounded to sq.limit / file_filter) are returned as score-0 candidates.
         if ngrams.is_empty() {
             return Ok(self.short_query_fallback(query, lang_filter));
         }
