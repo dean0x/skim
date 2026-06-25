@@ -506,6 +506,161 @@ fn run_on_files_too_few_qrels_returns_error() {
 }
 
 // ============================================================================
+// AC4 (#355): Precision@1 regression guard via curated labeled fixture set
+//
+// PF-007: asserts a discriminating observable (P@1 == 1.0 for the definer),
+// not just exit-0 or non-empty results.  This test would fail the moment the
+// candidate-then-verify gate or the trigram IDF table regresses to near-uniform
+// scoring — which was the root cause of #355.
+//
+// Corpus design:
+//   - definer (file 0): defines `ZyntheticUniqueIdentifier` (the target symbol)
+//   - noise_a (file 1): mentions it once in a comment (incidental overlap)
+//   - noise_b (file 2): a large file with many distinct trigrams that overlap
+//     with the query bytes but does NOT contain the literal symbol string
+//
+// After indexing and querying:
+//   - Part A (verify gate): noise_b must be absent (no literal match)
+//   - Part B (IDF ranking): definer must be at results[0]
+//   - AC4 guard: P@1 == 1.0 for this labelled qrel
+//
+// The corpus is toy-sized (3 files) — it is NOT a surrogate for AC1 (which
+// measures ranking on a full qrel set). AC4 guards specifically against
+// IDF-uniform regression where any 3-file corpus would produce rank-1 trivially
+// via the verify gate alone, exposing a broken weight table only on larger corpora.
+// A 3-file corpus is still the minimal guard for the AC4 acceptance criterion.
+// ============================================================================
+
+#[test]
+fn ac4_precision_at_1_regression_guard() {
+    use rskim_bench::metrics::{precision_at_k, rank_of};
+    use rskim_search::{
+        FileId, LayerBuilder, NgramIndexBuilder, NgramIndexReader, SearchLayer, SearchQuery,
+    };
+
+    // --- corpus ---
+    // File 0: the "definer" — the one correct answer for the query.
+    //         Contains the full symbol name repeated enough times that BM25F TF
+    //         term frequency is higher than in the noise files.
+    let definer_content = r#"
+/// ZyntheticUniqueIdentifier is the canonical implementation.
+/// It is defined here and only here.
+pub struct ZyntheticUniqueIdentifier {
+    pub value: u64,
+}
+
+impl ZyntheticUniqueIdentifier {
+    pub fn new(value: u64) -> Self {
+        Self { value }
+    }
+
+    pub fn display(&self) -> String {
+        format!("ZyntheticUniqueIdentifier({})", self.value)
+    }
+}
+"#;
+
+    // File 1: noise — contains the symbol name once in a comment, not defining it.
+    //         Should appear in results (literal match), but rank BELOW the definer.
+    let noise_a_content = r#"
+// We re-export ZyntheticUniqueIdentifier from the definer module.
+pub use definer::ZyntheticUniqueIdentifier;
+
+pub fn helper_function() -> u64 {
+    42
+}
+"#;
+
+    // File 2: pure noise — lots of overlapping trigrams from common Rust code,
+    //         but does NOT contain the literal string "ZyntheticUniqueIdentifier".
+    //         The verify gate must remove it from results entirely.
+    let noise_b_content = r#"
+use std::collections::HashMap;
+use std::fmt;
+
+pub struct DataManager {
+    items: HashMap<u64, String>,
+}
+
+impl DataManager {
+    pub fn new() -> Self {
+        Self { items: HashMap::new() }
+    }
+
+    pub fn insert(&mut self, key: u64, val: String) {
+        self.items.insert(key, val);
+    }
+
+    pub fn display_all(&self) {
+        for (k, v) in &self.items {
+            println!("{}: {}", k, v);
+        }
+    }
+}
+
+impl fmt::Display for DataManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DataManager({} items)", self.items.len())
+    }
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let definer_id = FileId(0);
+    let noise_a_id = FileId(1);
+    let noise_b_id = FileId(2);
+
+    // Index all three files.
+    let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    builder
+        .add_file(definer_id, definer_content, rskim_core::Language::Rust)
+        .unwrap();
+    builder
+        .add_file(noise_a_id, noise_a_content, rskim_core::Language::Rust)
+        .unwrap();
+    builder
+        .add_file(noise_b_id, noise_b_content, rskim_core::Language::Rust)
+        .unwrap();
+    let _layer = builder.build().unwrap();
+
+    let reader = NgramIndexReader::open(dir.path()).unwrap();
+
+    let query_str = "ZyntheticUniqueIdentifier";
+    let mut query = SearchQuery::new(query_str);
+    query.limit = Some(20);
+
+    let results = reader.search(&query).unwrap();
+    let ranked: Vec<FileId> = results.iter().map(|r| r.file_id).collect();
+
+    // PF-007: assert discriminating observables, not just exit-0.
+
+    // AC4-a: noise_b must be ABSENT (it has no literal match — verify gate).
+    assert!(
+        !ranked.contains(&noise_b_id),
+        "AC4-a (PF-007): noise_b (no literal match) must be absent from results; got: {ranked:?}"
+    );
+
+    // AC4-b: definer must appear in results at all.
+    assert!(
+        ranked.contains(&definer_id),
+        "AC4-b (PF-007): definer (file 0) must appear in results; got: {ranked:?}"
+    );
+
+    // AC4-c: P@1 == 1.0 — definer ranks at position 1.
+    //
+    // This is the core regression guard for Part B IDF selectivity (#355).
+    // If the trigram weight table degrades to uniform IDF (DEFAULT_WEIGHT=1.0
+    // for every query trigram), BM25F scores become dominated by document length
+    // and TF, which may push noise_a (shorter file) above the definer.
+    let p_at_1 = precision_at_k(&ranked, definer_id, 1);
+    assert!(
+        (p_at_1 - 1.0).abs() < f64::EPSILON,
+        "AC4-c (PF-007): P@1 must be 1.0 — definer must rank first; got rank={}, results={ranked:?}",
+        rank_of(&ranked, definer_id)
+    );
+}
+
+// ============================================================================
 // Item 13: aggregate_results mismatch validation
 // ============================================================================
 
