@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### BREAKING
+
+- **`skim search` index format: v2 → v3 (n-gram key widened u16 → u32)** (#355) —
+  The n-gram inverted-index key is now a 32-bit trigram `(b1<<16)|(b2<<8)|b3` instead
+  of a 16-bit bigram `(b1<<8)|b2`.  Any existing `.skim/` index written by a prior
+  version is silently stale; the first query triggers an automatic rebuild
+  (`auto_refresh_if_stale`).  To force an immediate rebuild: `skim search index --rebuild`.
+
 ### Added
 - **`skim search --weights lexical,ast,temporal`** — tune the `--blast-radius` composite
   ranking; default `0.5,0.3,0.2`. Ratios only (not normalized; zero and non-sum-to-1 are
@@ -26,6 +34,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full AST re-parse on every rebuild. (#290)
 
 ### Changed
+- **`skim search` lexical results are now filtered to files literally containing the query** (#355) —
+  Prior to this change the n-gram index returned candidates ranked by BM25F score, but no
+  literal-substring check was performed: a file could appear in results even if none of its
+  bytes contained the exact query string (false positives from bigram-overlap noise).  A
+  candidate-then-verify gate now reads each candidate file once and confirms the query string
+  is present as a literal substring before the result is emitted.  Files that pass the trigram
+  index but fail the literal check are silently dropped.  **Short queries (< 3 bytes)**:
+  queries too short to generate any trigrams now trigger an all-files fallback (AD-355-7);
+  the same verify gate applies, so only files literally containing the 1–2 byte query are
+  returned.  Scores for short-query results are 0.0 (no trigram ranking possible).
 - **`skim search --ast` output format** — text rows now render the score as `[N]`
   (previously `score: N`) and append a `:line` suffix plus a source snippet when the
   matched pattern node is line-recovered; degraded (non-recovered) rows omit both. JSON

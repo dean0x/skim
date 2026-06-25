@@ -477,7 +477,38 @@ pub struct IndexStats {
 /// Implementations are expected to be thread-safe (`Send + Sync`) so they can
 /// be shared across worker threads in parallel search pipelines.
 pub trait SearchLayer: Send + Sync {
-    /// Execute a search query and return ranked results.
+    /// Execute a search query and return ranked candidates.
+    ///
+    /// # Contract — candidates, not guaranteed matches
+    ///
+    /// The returned `Vec<SearchResult>` contains **scored candidates** from the
+    /// inverted index.  Each candidate has at least one n-gram overlap with the
+    /// query, **but is NOT guaranteed to contain the literal query string** — the
+    /// n-gram index is a fast candidate generator, not a substring filter.
+    ///
+    /// Consumers that require exact substring membership MUST apply a verification
+    /// step after calling `search`.
+    ///
+    /// # Limit / offset semantics
+    ///
+    /// - When `query.limit` is `Some(n)`, the returned slice contains at most `n`
+    ///   candidates.  When `None`, the implementation may apply a default cap.
+    /// - When `query.offset` is `Some(k)`, the first `k` candidates (in rank order)
+    ///   are skipped.  When `None`, no candidates are skipped.
+    ///
+    /// # Short-query semantic (AD-355-7)
+    ///
+    /// For queries shorter than 3 bytes, `extract_query_ngrams` returns an empty
+    /// n-gram set.  The `NgramIndexReader` implementation emits ALL indexed files
+    /// as score-0 candidates via a file-id-order fallback so that verification
+    /// layers can apply a literal-substring filter.
+    ///
+    /// - Candidates from this path are in file-id/insertion order (NOT relevance
+    ///   order) and carry `score = 0.0` with empty `match_positions`.
+    /// - Any consumer of this trait **must NOT** assume `search()` returns matches;
+    ///   it returns candidates that require verification.
+    /// - Large-corpus short-query completeness (file_id >= pool_limit silently missed)
+    ///   is tracked in #356 (pool-K calibration).
     ///
     /// # Errors
     /// Returns [`SearchError`] if the query is invalid or the index is corrupted.

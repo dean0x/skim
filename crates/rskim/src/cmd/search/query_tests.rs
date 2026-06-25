@@ -936,3 +936,509 @@ fn test_format_json_output_includes_temporal_annotations() {
         "risk_score must be ~0.70, got {rs}"
     );
 }
+
+// ============================================================================
+// #355 Part A — Exact-match verification (AC1 / AC2 / AC3)
+//
+// PF-007: every test asserts a discriminating observable, not just exit-0.
+// AC2: gibberish query → 0 results on ALL paths.
+// AC3: every returned result literally contains the query token(s).
+// AC1: an exact symbol query returns only files containing it.
+// ============================================================================
+
+/// AC2 — gibberish query produces 0 verified results on the pure-lexical path.
+///
+/// PF-007 (discriminating): asserts results.is_empty() for a query whose trigrams
+/// are absent from the index — so the reader returns 0 candidates and verification
+/// never runs.  This guards the trigram-miss path, not the verify gate.
+/// The discriminating coverage for the verify gate is in:
+///   - `test_ac1_verify_gate_drops_trigram_overlap_non_literal` (non-literal that shares trigrams)
+///   - `test_ac3_every_result_contains_query_term_pure_lexical` (content check per result)
+///   - `test_ac2_verify_gate_drops_compound_lexical_hit_without_literal` (compound path)
+#[test]
+fn test_ac2_gibberish_query_returns_zero_results_pure_lexical() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    // "xqzjvmblorp" is a provably absent gibberish string — its trigrams (e.g. "xqz",
+    // "qzj", "zjv"…) do not appear in any natural code file, so the trigram index
+    // returns 0 candidates before verification even runs.  The empty result here
+    // comes from zero trigram overlap, not from the verify gate.
+    let config = make_config(&root, &cache_dir, "xqzjvmblorp");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AC2: verified result set must be empty (trigram-miss path).
+    assert!(
+        output.results.is_empty(),
+        "AC2: gibberish query 'xqzjvmblorp' must return 0 results (no trigram overlap); \
+        got {} results: {:?}",
+        output.results.len(),
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+}
+
+/// AC2 (compound path, trigram-miss) — gibberish query + AST filter → 0 results.
+///
+/// NOTE: this test exercises the "no trigrams in index" path, NOT the verify gate.
+/// For the discriminating compound-path verify-gate test, see
+/// `test_ac2_verify_gate_drops_compound_lexical_hit_without_literal` below.
+#[test]
+fn test_ac2_gibberish_query_returns_zero_results_compound_path() {
+    use rskim_search::FileId;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    // Use a fake ast_scored vector (file 0 with score 1.0); the gibberish query
+    // has no trigram overlap with the corpus so raw_lex is empty; intersect_and_rank
+    // short-circuits to [] before the verify gate is even reached.
+    let config = QueryConfig {
+        text: "xqzjvmblorp".to_string(),
+        limit: 20,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: Some(vec![(FileId(0), 1.0)]),
+        composite_weights: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        output.results.is_empty(),
+        "AC2 (compound path, trigram-miss): gibberish query must return 0 results; \
+        got {} results: {:?}",
+        output.results.len(),
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+}
+
+/// AC2 (compound path, verify gate discriminating) — a file that the lexical index
+/// returns as a candidate AND the fake AST scored it highly, but does NOT contain
+/// the literal query, must be dropped by the verify gate.
+///
+/// PF-007 (discriminating): this test WOULD FAIL if the verify gate were removed
+/// from `resolve_paths_and_snippets_verified`.  "authenticate_user" shares trigrams
+/// with lib.rs (which contains "authenticate" and "user" as separate words), so the
+/// compound path's `raw_lex` includes lib.rs.  With a fake ast_scored entry for
+/// lib.rs, it survives `intersect_and_rank`.  Only the verify gate drops it.
+///
+/// This is the template from AC1 (pure-lexical verify gate) ported to the compound
+/// (text+AST) path — fixes PF-007 Finding 10.
+#[test]
+fn test_ac2_verify_gate_drops_compound_lexical_hit_without_literal() {
+    use rskim_search::FileId;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // auth.rs: contains the exact literal "authenticate_user".
+    fs::write(
+        src.join("auth.rs"),
+        "/// Authenticate a user by token.\n\
+         pub fn authenticate_user(token: &str) -> bool { !token.is_empty() }\n",
+    )
+    .unwrap();
+
+    // lib.rs: contains "authenticate" and "user" as SEPARATE words — shares many
+    // trigrams with "authenticate_user" — but NOT the literal "authenticate_user".
+    // The fake AST score gives lib.rs a higher-than-auth AST score so it will be
+    // in `raw_lex` AND in the intersection result; only the verify gate must drop it.
+    fs::write(
+        src.join("lib.rs"),
+        "/// Authenticate the request.\n\
+         pub fn check_user(id: u32) -> bool { id > 0 }\n\
+         pub fn authenticate(token: &str) -> bool { !token.is_empty() }\n",
+    )
+    .unwrap();
+
+    // Build the index so FileId(0)=auth.rs, FileId(1)=lib.rs (sorted alphabetically).
+    {
+        let build_config = QueryConfig {
+            text: "authenticate_user".to_string(),
+            limit: 20,
+            json: false,
+            root: root.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
+            blast_radius_paths: None,
+            ast_scored: None,
+            composite_weights: None,
+        };
+        // First run with no ast_scored builds the index (cold start).
+        let _ = execute_query(&build_config, &TEST_ANALYTICS).unwrap();
+    }
+
+    // Now run the compound path: give FileId(1)=lib.rs a HIGH AST score so it
+    // wins the intersection and survives into recompose.  The verify gate must
+    // drop it because "authenticate_user" is absent from lib.rs.
+    let config = QueryConfig {
+        text: "authenticate_user".to_string(),
+        limit: 20,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        // FileId(0)=auth.rs: low AST score; FileId(1)=lib.rs: high AST score.
+        // The fake AST order ensures lib.rs appears in the intersection with auth.rs.
+        ast_scored: Some(vec![(FileId(0), 0.5), (FileId(1), 2.0)]),
+        composite_weights: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // PF-007 (discriminating): lib.rs must NOT appear in verified results.
+    // It shares trigrams with "authenticate_user" and has a higher AST score,
+    // but the literal string is absent — the verify gate MUST drop it.
+    // Removing the verify gate from resolve_paths_and_snippets_verified would
+    // cause lib.rs to appear here, failing this assertion.
+    let has_lib = output.results.iter().any(|r| r.path.contains("lib.rs"));
+    assert!(
+        !has_lib,
+        "AC2 (compound verify gate): 'lib.rs' has trigram overlap AND a high AST score \
+        but does NOT contain the literal 'authenticate_user' — the verify gate must drop it. \
+        Found in results — verify gate is absent or broken on the compound path. \
+        Results: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // auth.rs MUST appear (it contains the literal).
+    let has_auth = output.results.iter().any(|r| r.path.contains("auth.rs"));
+    assert!(
+        has_auth,
+        "AC2 (compound verify gate): 'auth.rs' contains the literal 'authenticate_user' \
+        and must appear in compound results; got: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+}
+
+/// AC2 (blast-radius path) — gibberish query + blast-radius → 0 verified
+/// lexical-hit results; only co-change-only stubs (no snippet, field=co_change_partner)
+/// may appear.
+///
+/// PF-007: the discriminating check is that NO result carries a non-None snippet
+/// (which would mean the file was read and the verify gate passed).  "xqzjvmblorp"
+/// shares no trigrams with the corpus, so no file enters the lexical branch at all.
+/// This test pairs with test_ac2_short_query_fallback_blast_radius_exercises_verify_gate
+/// which uses a <3-byte query that DOES reach the reader's fallback and exercises the
+/// verify gate on the blast-radius path.
+#[test]
+fn test_ac2_gibberish_query_no_lexical_hits_blast_radius() {
+    use std::collections::HashSet;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    let mut allowed: HashSet<String> = HashSet::new();
+    allowed.insert("src/auth.rs".to_string());
+
+    let config = QueryConfig {
+        text: "xqzjvmblorp".to_string(),
+        limit: 20,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // PF-007 discriminating: no result may have a non-None snippet.
+    // A non-None snippet means the file was read AND query_substring_present
+    // returned true — which would require "xqzjvmblorp" to appear in a file.
+    // Any result with a snippet here is a false positive from the verify gate.
+    //
+    // Co-change-only stubs (field="co_change_partner", snippet=None) are
+    // exempt — they are returned by UNION semantics without lexical verification.
+    for r in &output.results {
+        assert!(
+            r.snippet.is_none(),
+            "AC2 (blast-radius): no result with a snippet expected for a gibberish query; \
+            a snippet means the verify gate passed — false positive; found: {:?}",
+            r
+        );
+    }
+}
+
+/// AC2 (blast-radius short-query fallback) — a 2-byte query that reaches the
+/// AD-355-7 fallback on the blast-radius path exercises the verify gate.
+///
+/// PF-007 (discriminating, F14): the corpus has one file that CONTAINS the 2-byte
+/// query "zz" (`match.rs`) and one that does NOT (`nomatch.rs`).  Both are in the
+/// blast-radius allowlist.  The test asserts by PATH MEMBERSHIP:
+///
+/// - `match.rs` (contains "zz") MUST appear in results — the gate's keep path.
+/// - `nomatch.rs` (does not contain "zz") MUST NOT appear — the gate's drop path.
+///
+/// This is a STRICT SUBSET check: if the verify gate is removed the non-matching
+/// file would survive the fallback and appear in results, failing the "absent"
+/// assertion.  If the keep path is broken the matching file would be dropped,
+/// failing the "present" assertion.  The test therefore fails in BOTH regression
+/// directions — making it a genuine guard per PF-007.
+///
+/// Previously the test used `r.snippet.is_none()` which cannot distinguish
+/// gate-on from gate-off (short-query candidates always have empty match_positions
+/// so `snippet` is always `None` regardless of the verify decision).
+#[test]
+fn test_ac2_short_query_fallback_blast_radius_exercises_verify_gate() {
+    use std::collections::HashSet;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Corpus: match.rs CONTAINS "zz"; nomatch.rs does NOT.
+    // Both are in the blast-radius allowlist so both reach the verify gate.
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    // "zz" appears in match.rs (the token we search for).
+    fs::write(
+        src.join("match.rs"),
+        "// contains the target token\npub fn check_zz(x: &str) -> bool { x.contains(\"zz\") }\n",
+    )
+    .unwrap();
+    // "zz" is absent from nomatch.rs.
+    fs::write(
+        src.join("nomatch.rs"),
+        "pub fn parse_config(s: &str) -> Option<String> { Some(s.to_string()) }\n",
+    )
+    .unwrap();
+
+    let mut allowed: HashSet<String> = HashSet::new();
+    allowed.insert("src/match.rs".to_string());
+    allowed.insert("src/nomatch.rs".to_string());
+
+    let config = QueryConfig {
+        text: "zz".to_string(), // 2 bytes → AD-355-7 fallback
+        limit: 20,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // PF-007 DISCRIMINATING assertions — path-membership, not snippet presence:
+
+    // (1) The file that contains "zz" MUST be in results (verifies the keep path).
+    let has_match = output.results.iter().any(|r| r.path == "src/match.rs");
+    assert!(
+        has_match,
+        "AC2 (blast-radius short-query, keep path): 'src/match.rs' contains the literal \
+        'zz' and must appear in verified results after the AD-355-7 fallback; \
+        results: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // (2) The file that does NOT contain "zz" MUST NOT be in results (verifies the
+    //     drop path — this assertion fails if the verify gate is removed or bypassed).
+    let has_nomatch = output.results.iter().any(|r| r.path == "src/nomatch.rs");
+    assert!(
+        !has_nomatch,
+        "AC2 (blast-radius short-query, drop path): 'src/nomatch.rs' does NOT contain \
+        the literal 'zz' and must be dropped by the verify gate; found in results — \
+        verify gate is absent or broken on the blast-radius short-query path. \
+        Results: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+}
+
+/// AC3 — every returned result literally contains the query term (pure-lexical).
+///
+/// PF-007 (discriminating): reads the content of each returned file and asserts
+/// the query term is present as a literal substring.  This test would fail if
+/// verification were disabled (bigram-noise false positives would appear).
+#[test]
+fn test_ac3_every_result_contains_query_term_pure_lexical() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    // "authenticate" is a real term in src/auth.rs.
+    let config = make_config(&root, &cache_dir, "authenticate");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !output.results.is_empty(),
+        "AC3: 'authenticate' must find at least one result"
+    );
+
+    for r in &output.results {
+        let abs_path = root.join(&r.path);
+        let content = fs::read_to_string(&abs_path).unwrap_or_default();
+        assert!(
+            content.contains("authenticate"),
+            "AC3: result file '{}' must contain the literal query term 'authenticate'; \
+            file content: {content:?}",
+            r.path
+        );
+    }
+}
+
+/// AC1 — an exact symbol query returns ONLY files containing it; the defining
+/// file ranks at position 0 (the highest-ranked result).
+///
+/// PF-007 (discriminating): asserts (a) the definer is present and (b) every
+/// non-definer result is absent from the verified set when the symbol is unique.
+/// This would fail without the wider pool + verify-then-truncate invariant.
+#[test]
+fn test_ac1_exact_symbol_returns_only_containing_files_and_definer_is_first() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Controlled corpus: auth.rs defines `frbnqlwx_unique_symbol`; lib.rs does NOT.
+    // The symbol uses a nonsense prefix that can't appear in lib.rs accidentally.
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        src.join("auth.rs"),
+        "/// The authoritative definer.\npub fn frbnqlwx_unique_symbol(x: u32) -> u32 { x }\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("lib.rs"),
+        "pub struct Config { pub value: u32 }\nimpl Config { pub fn new(v: u32) -> Self { Self { value: v } } }\n",
+    )
+    .unwrap();
+
+    let config = make_config(&root, &cache_dir, "frbnqlwx_unique_symbol");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AC1(a): the definer file must be in results.
+    let has_definer = output.results.iter().any(|r| r.path == "src/auth.rs");
+    assert!(
+        has_definer,
+        "AC1: definer file 'src/auth.rs' must appear in results; got: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // AC1(b): no result may be a file that does NOT contain the symbol.
+    // lib.rs does not contain "frbnqlwx_unique_symbol" — it must be absent.
+    let has_lib = output.results.iter().any(|r| r.path == "src/lib.rs");
+    assert!(
+        !has_lib,
+        "AC1: 'src/lib.rs' does not contain 'frbnqlwx_unique_symbol' and must \
+        NOT appear in verified results (this would fail without verification)"
+    );
+
+    // AC1(c): definer is the top-ranked result.
+    let first_path = output
+        .results
+        .first()
+        .map(|r| r.path.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        first_path,
+        "src/auth.rs",
+        "AC1: definer 'src/auth.rs' must be results[0]; got {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // AC3 (inline): every returned result must contain the query term.
+    for r in &output.results {
+        let abs_path = root.join(&r.path);
+        let content = fs::read_to_string(&abs_path).unwrap_or_default();
+        assert!(
+            content.contains("frbnqlwx_unique_symbol"),
+            "AC3: every verified result must contain 'frbnqlwx_unique_symbol'; \
+            '{}' does not: {content:?}",
+            r.path
+        );
+    }
+}
+
+/// AC1 (verify gate specifically exercised) — lib.rs shares trigrams with the
+/// query term but does NOT contain the literal string.
+///
+/// The original AC1 test uses a purely unique symbol with zero trigram overlap
+/// in lib.rs — so lib.rs is trivially absent from candidates.  This test
+/// specifically exercises the verify gate: lib.rs contains trigram-generating
+/// substrings that share individual trigrams with the target query token, but
+/// NOT the literal token.  Without the verify gate, lib.rs would be a false
+/// positive.  With the gate, only the definer file survives.
+///
+/// PF-007 (discriminating): this test WOULD FAIL if verify gate were removed,
+/// because the trigram index would return lib.rs as a candidate and it would
+/// appear in results without the gate dropping it.
+#[test]
+fn test_ac1_verify_gate_drops_trigram_overlap_non_literal() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // Query token: "authenticate_user".
+    // auth.rs: contains the exact literal "authenticate_user".
+    fs::write(
+        src.join("auth.rs"),
+        "/// Authenticate a user by token.\n\
+         pub fn authenticate_user(token: &str) -> bool { !token.is_empty() }\n",
+    )
+    .unwrap();
+
+    // lib.rs: contains the trigram-generating substrings "authenticate" and
+    // "user" as SEPARATE words, generating many shared trigrams with
+    // "authenticate_user", but the exact literal string "authenticate_user"
+    // is NOT present.  The verify gate must drop lib.rs.
+    fs::write(
+        src.join("lib.rs"),
+        "/// Authenticate the request.\n\
+         pub fn check_user(id: u32) -> bool { id > 0 }\n\
+         pub fn authenticate(token: &str) -> bool { !token.is_empty() }\n",
+    )
+    .unwrap();
+
+    let config = make_config(&root, &cache_dir, "authenticate_user");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AC1: definer must be present.
+    let has_auth = output.results.iter().any(|r| r.path == "src/auth.rs");
+    assert!(
+        has_auth,
+        "AC1 (verify gate): 'src/auth.rs' defines 'authenticate_user' and must appear; \
+        got: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // PF-007 (discriminating): lib.rs must NOT appear because although it shares
+    // trigrams with "authenticate_user", it does not contain the literal string.
+    // Without the verify gate, lib.rs would be a false positive.
+    let has_lib = output.results.iter().any(|r| r.path == "src/lib.rs");
+    assert!(
+        !has_lib,
+        "AC1 (verify gate): 'src/lib.rs' shares trigrams with 'authenticate_user' but \
+        does NOT contain the literal string — verify gate must drop it; \
+        found in results, which means verify gate is absent or broken"
+    );
+}

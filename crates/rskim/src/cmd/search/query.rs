@@ -7,8 +7,11 @@
 //! 3. Open `NgramIndexReader`, wrap in `QueryEngine`.
 //! 4. Execute the query, get `Vec<SearchResult>` with `FileId`s.
 //! 5. Load `FileManifest`, map `FileId → path` via `sorted_paths()`.
-//! 6. For each result, attempt `extract_snippet`.
-//! 7. Return `QueryOutput`.
+//! 6. For each result, verify substring membership + extract snippet (single read,
+//!    AD-355-1).
+//! 7. Truncate to `--limit` LAST — after verification drops non-matching candidates
+//!    (AD-355-2).
+//! 8. Return `QueryOutput`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -21,9 +24,48 @@ use rskim_search::{
 };
 
 use super::manifest::FileManifest;
-use super::snippet::{SnippetOutcome, extract_snippet};
+use super::snippet::{SnippetOutcome, extract_snippet_and_verify};
 use super::staleness::auto_refresh_if_stale;
 use super::types::{QueryConfig, QueryOutput, ResolvedResult};
+
+// ============================================================================
+// Candidate-pool sizing (AD-355-2)
+// ============================================================================
+//
+// The three paths (pure-lexical, compound text+AST, blast-radius) each widen
+// their candidate pool before the verify-then-truncate-LAST step.  All three
+// pools are defined here in one place so the "how wide must the pre-verify pool
+// be" decision has a single reason to change.
+//
+// `candidate_pool(limit, k)` returns `max(limit * k, CANDIDATE_POOL_FLOOR)` so
+// every path uses the same floor policy.  Calibrating K per-path is tracked in
+// #356 (pool-K calibration) per ADR-003 (grounded measurements before changing).
+//
+// Current values — no measured corpus basis; #356 owns calibration:
+//   LEXICAL_CANDIDATE_POOL_K = 5  (pure-lexical, with floor)
+//   COMPOUND_CANDIDATE_POOL_K = 4 (text+AST compound, no floor: intersection already narrows)
+//   BLAST_CANDIDATE_POOL_K   = 10 (blast-radius composite UNION, with floor)
+//
+// Note: COMPOUND_CANDIDATE_POOL_K intentionally has no floor here; the compound
+// path uses `saturating_mul` without `.max(floor)` because the intersection gate
+// already narrows candidates aggressively.  If this becomes a correctness concern
+// for small --limit values, add a floor in run_compound_query and update #356.
+
+/// Shared floor for `candidate_pool`: every widened pool has at least this many
+/// slots so small `--limit` values do not starve the verify step.
+const CANDIDATE_POOL_FLOOR: usize = 100;
+
+/// Compute the pre-verify candidate pool size for a given path K multiplier.
+///
+/// Returns `limit.saturating_mul(k).max(CANDIDATE_POOL_FLOOR)`.
+///
+/// This is the single place that enforces the floor policy; callers that
+/// intentionally omit the floor (compound path — see note above) call
+/// `limit.saturating_mul(k)` directly.
+#[inline]
+fn candidate_pool(limit: usize, k: usize) -> usize {
+    limit.saturating_mul(k).max(CANDIDATE_POOL_FLOOR)
+}
 
 // ============================================================================
 // Query execution
@@ -193,15 +235,45 @@ pub(super) fn execute_query_with_manifest(
     }
     // ── End composite UNION blast-radius path ─────────────────────────────────
 
-    // ── Pure-lexical path (no blast-radius, no AST — unchanged) ──────────────
+    // ── Pure-lexical path (no blast-radius, no AST) ──────────────────────────
+    //
+    // AD-355-2: The candidate pool is widened before verification and truncation.
+    //
+    // Without widening, the reader truncates to `--limit` BEFORE we can verify
+    // substring membership: the definer file may already have been discarded below
+    // incidental-overlap junk that happens to share a few trigrams.  By fetching
+    // LEXICAL_CANDIDATE_POOL_K × limit candidates first, we ensure verification
+    // acts as a true filter over the ranked list, not over an already-truncated
+    // stub.  After verification the result set is truncated to `--limit` LAST.
+    //
+    // K=5, floor CANDIDATE_POOL_FLOOR: matches the temporal.rs resort_window() heuristic
+    // so the two paths behave consistently.  This value has no measured corpus basis;
+    // calibrating K for large corpora is tracked in #356.
+    //
+    // AD-355-4: Dropping non-matching candidates is a relevance gate, NOT an output
+    // elision/cap under #317 "compress-never-truncate".  It does not hide output that
+    // the user would otherwise see; it removes candidates that do not satisfy the
+    // literal query.  No `elision_marker` is needed here.
+    const LEXICAL_CANDIDATE_POOL_K: usize = 5;
+    let pool_limit = candidate_pool(config.limit, LEXICAL_CANDIDATE_POOL_K);
     let mut sq = SearchQuery::new(config.text.clone());
-    sq.limit = Some(config.limit);
+    sq.limit = Some(pool_limit);
 
-    // Execute the search.
+    // Execute the search over the wider candidate pool.
     let raw_results = engine.search(&sq)?;
 
-    // Resolve and enrich results.
-    let results = resolve_paths_and_snippets(&raw_results, &sorted, root, &manifest, &[]);
+    // Resolve snippets, verify substring membership, then truncate to --limit LAST.
+    //
+    // AD-355-2 / AD-355-4: verify-then-truncate-LAST invariant.
+    let results = resolve_paths_and_snippets_verified(
+        &raw_results,
+        &sorted,
+        root,
+        &manifest,
+        &[],
+        &config.text,
+        config.limit,
+    );
 
     let total = results.len();
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -249,14 +321,19 @@ fn run_compound_query(
     blast_file_ids: Option<HashSet<FileId>>,
     ctx: QueryContext<'_>,
 ) -> anyhow::Result<QueryOutput> {
-    // Wider lexical pool before compound ranking.
-    // K=4: lighter than temporal.rs (K=5 with .max(100) floor) because the
-    // intersection gate already narrows candidates — no floor needed.
-    // NOTE: K=4 is a heuristic with no measured corpus basis; a file that is
-    // in both AST and lexical sets but ranks beyond position limit*4 in the
-    // unfiltered lexical ranking will be silently excluded.  This is the
-    // intentional trade-off (enables composite ranking vs old file_filter gate).
-    // Calibrating K for large corpora is tracked in #290.
+    // Wider lexical pool before compound ranking (see module-level pool-sizing note).
+    // K=4: lighter than lexical (K=5) / blast (K=10) because the intersection gate
+    // already narrows candidates — no floor applied here (see COMPOUND_CANDIDATE_POOL_K
+    // note at the top of this file).  A file that is in both AST and lexical sets but
+    // ranks beyond position limit*4 in the unfiltered lexical ranking will be silently
+    // excluded.  Calibrating K for large corpora is tracked in #356 (pool-K calibration).
+    //
+    // Performance note (AD-355-2): `recompose_with_lexical` (below) does `(*lex).clone()`
+    // per surviving entry and operates on the FULL `ranked` list (limit×K entries), NOT
+    // a pre-truncated slice.  This is required to preserve the verify-then-truncate-LAST
+    // invariant: pre-truncation would drop the real definer before verification can keep
+    // it.  The accepted cost is up to K×limit `SearchResult` clones (each carrying a
+    // `Vec<Range<usize>>`) instead of `limit` — a bounded (4×) increase in clone work.
     const CANDIDATE_POOL_K: usize = 4;
     let mut sq = SearchQuery::new(config.text.clone());
     // saturating_mul: a hostile `--limit` near usize::MAX must not overflow.
@@ -295,22 +372,31 @@ fn run_compound_query(
         CompositeWeights::default(),
     );
 
-    // Truncate to --limit BEFORE recompose (rank-then-truncate-LAST invariant, Amendment).
-    // Truncating here bounds the clone work in recompose_with_lexical to O(limit) rather
-    // than O(limit * CANDIDATE_POOL_K); without this, recompose clones every candidate
-    // and .take(limit) discards up to 3*limit clones immediately.
-    let ranked_limited: Vec<_> = ranked.into_iter().take(config.limit).collect();
-
     // Recompose: carry lexical SearchResult (snippet + line_range), replace score (AC11).
-    let recomposed = recompose_with_lexical(&ranked_limited, &raw_lex);
+    // NOTE: recompose_with_lexical operates on the FULL `ranked` list (limit×CANDIDATE_POOL_K
+    // entries), not a pre-truncated slice — this preserves the AD-355-2 verify-then-truncate-LAST
+    // invariant.  We MUST NOT truncate to config.limit here; if we did, and the top `limit`
+    // RRF slots were occupied by incidental-overlap junk, the real definer at slot limit+1
+    // would be dropped before verification could keep it and the junk is removed.
+    // Truncation happens LAST in resolve_paths_and_snippets_verified (after verification
+    // filters non-matching candidates), matching the pure-lexical and blast-radius paths.
+    let recomposed = recompose_with_lexical(&ranked, &raw_lex);
 
     // AC-F6: text+AST compound path → layers_matched = ["lexical","ast"] (stable order).
-    let results = resolve_paths_and_snippets(
+    //
+    // AD-355-2/AD-355-4: verify substring membership over the FULL recomposed list,
+    // then truncate to --limit LAST.  The candidate pool is limit×CANDIDATE_POOL_K (K=4),
+    // so recomposed has up to limit*4 entries.  Verification drops non-matching candidates
+    // (relevance gate, not a #317 cap); truncation to config.limit happens inside
+    // resolve_paths_and_snippets_verified as the final step.
+    let results = resolve_paths_and_snippets_verified(
         &recomposed,
         ctx.sorted,
         ctx.root,
         ctx.manifest,
         &["lexical", "ast"],
+        &config.text,
+        config.limit,
     );
     let total = results.len();
     let duration_ms = ctx.start.elapsed().as_millis() as u64;
@@ -360,15 +446,27 @@ fn run_blast_radius_composite_query(
         .composite_weights
         .unwrap_or_else(CompositeWeights::with_six_signal_defaults);
 
-    // Step 1: fetch the FULL lexical ranked list WITHOUT a file_filter and WITHOUT
-    // a limit cap.  The UNION contract requires ranking the complete candidate set
-    // (all files that appear in *either* the lexical or temporal list) before
-    // truncation.  Applying a pre-limit here would silently drop co-change partners
-    // whose lexical rank exceeds the cap, violating the rank-then-truncate-LAST
-    // invariant (Cross-Plan Amendment, Intent Drift 3 fix).
+    // Step 1: fetch a WIDE lexical ranked list WITHOUT a file_filter.
+    //
+    // The UNION contract requires ranking the complete candidate set (all files
+    // that appear in *either* the lexical or temporal list) before truncation.
+    // Applying a bare `config.limit` pre-cap here would silently drop co-change
+    // partners whose lexical rank exceeds the cap, violating the rank-then-
+    // truncate-LAST invariant.
+    //
+    // We set sq.limit = Some(K × limit).max(100) on EVERY path — trigram-scored
+    // and short-query fallback alike.  The reader's `unwrap_or(20)` default is
+    // never reached on this path because we always pass Some(N>=100).
+    //
+    // K=10: generous multiple of limit so RRF fusion still sees enough candidates
+    // for the co-change-UNION to work correctly even if many lexical hits fail
+    // verification.  The worst-case file reads are O(K × limit) per query; on
+    // the AD-355-7 short-query fallback the candidate set is still bounded to
+    // Some(K × limit).max(100) before the verify step.  Calibrating K for large
+    // corpora is tracked in #356 (pool-K calibration).
+    const BLAST_CANDIDATE_POOL_K: usize = 10;
     let mut sq = SearchQuery::new(config.text.clone());
-    // No limit: we truncate AFTER fusion (Step 5). No file_filter: UNION mode.
-    sq.limit = None;
+    sq.limit = Some(candidate_pool(config.limit, BLAST_CANDIDATE_POOL_K));
     // No file_filter: UNION mode requires the full lexical ranked list.
     let raw_lex = ctx.engine.search(&sq)?;
 
@@ -401,61 +499,87 @@ fn run_blast_radius_composite_query(
     ];
     let ranked = merge_layer_scores(layers);
 
-    // Step 5: truncate to --limit LAST (rank-then-truncate-LAST invariant).
-    let ranked_limited: Vec<_> = ranked.into_iter().take(config.limit).collect();
-
-    // Step 6: recompose results.
-    // For files present in the lexical pool: carry snippet + line_range from
-    // the lexical SearchResult, replace score with the composite RRF value.
-    // For co-change-only files (absent from lexical pool): produce a stub
-    // ResolvedResult with score = fused RRF score and no snippet.
+    // Step 5: rank the full UNION set, then apply verification + truncation LAST.
+    //
+    // AD-355-2: do NOT truncate before verification.  The UNION contract requires
+    // all candidates to be ranked before any are dropped.  After verification the
+    // count is capped at --limit.
+    //
+    // AD-355-4: dropping a lexical-hit candidate that fails substring verification
+    // is a relevance gate, not a #317 output cap.  No elision_marker needed.
     let lex_map: HashMap<FileId, &SearchResult> = raw_lex.iter().map(|r| (r.file_id, r)).collect();
 
-    let results: Vec<super::types::ResolvedResult> =
-        ranked_limited
-            .iter()
-            .filter_map(|&(fid, composite_score)| {
-                let path = ctx.sorted.get(fid.0 as usize)?;
-                let manifest_entry = ctx.manifest.lookup(path);
+    // Step 6: recompose results with verification for lexical-hit candidates.
+    //
+    // For files present in the lexical pool: read snippet + verify substring
+    // membership in a SINGLE file read via extract_snippet_and_verify (AD-355-1).
+    // Drop the candidate if verification fails.
+    //
+    // For co-change-only files (absent from lexical pool): no file content is
+    // available here; these are pure temporal results that the text query did not
+    // match — include them unconditionally (AC12, UNION mode).
+    let results: Vec<super::types::ResolvedResult> = ranked
+        .iter()
+        .filter_map(|&(fid, composite_score)| {
+            let path = ctx.sorted.get(fid.0 as usize)?;
+            let manifest_entry = ctx.manifest.lookup(path);
 
-                if let Some(&lex_result) = lex_map.get(&fid) {
-                    // File has a lexical hit: carry its snippet/line data.
-                    let mut r = lex_result.clone();
-                    r.score = composite_score;
-                    let (line_number, line_range, snippet, stale) = decode_snippet(
-                        extract_snippet(ctx.root, path, &r.match_positions, manifest_entry),
-                    );
-                    Some(super::types::ResolvedResult {
-                        path: path.to_string(),
-                        score: composite_score,
-                        field: r.field.name().to_string(),
-                        line_number,
-                        line_range,
-                        snippet,
-                        stale,
-                        match_positions: r.match_positions.clone(),
-                        temporal: None,
-                        layers_matched: vec![],
-                    })
-                } else {
-                    // Co-change-only file: no lexical hit → no snippet (AC12, UNION mode).
-                    // These files appear because their temporal rank contributes to the
-                    // fused score even though the text query did not match them.
-                    Some(super::types::ResolvedResult {
-                        path: path.to_string(),
-                        score: composite_score,
-                        field: "co_change_partner".to_string(),
-                        line_number: None,
-                        line_range: None,
-                        snippet: None,
-                        stale: false,
-                        match_positions: vec![],
-                        temporal: None,
-                        layers_matched: vec![],
-                    })
+            if let Some(&lex_result) = lex_map.get(&fid) {
+                // File has a lexical hit: verify and extract snippet in one read
+                // (AD-355-1 — no second I/O).
+                let mut r = lex_result.clone();
+                r.score = composite_score;
+
+                let (snippet_outcome, verified) = extract_snippet_and_verify(
+                    ctx.root,
+                    path,
+                    &r.match_positions,
+                    manifest_entry,
+                    &config.text,
+                );
+
+                // Drop lexical-hit candidates that do not contain the query.
+                // Stale files produce verified=false and are dropped — positions
+                // may be wrong and we cannot confirm content without re-reading.
+                if !verified {
+                    return None;
                 }
-            })
-            .collect();
+
+                let (line_number, line_range, snippet, stale) = decode_snippet(snippet_outcome);
+                Some(super::types::ResolvedResult {
+                    path: path.to_string(),
+                    score: composite_score,
+                    field: r.field.name().to_string(),
+                    line_number,
+                    line_range,
+                    snippet,
+                    stale,
+                    match_positions: r.match_positions.clone(),
+                    temporal: None,
+                    layers_matched: vec![],
+                })
+            } else {
+                // Co-change-only file: no lexical hit → no snippet (AC12, UNION mode).
+                // These files appear because their temporal rank contributes to the
+                // fused score even though the text query did not match them.
+                // No file content is read here; include unconditionally.
+                Some(super::types::ResolvedResult {
+                    path: path.to_string(),
+                    score: composite_score,
+                    field: "co_change_partner".to_string(),
+                    line_number: None,
+                    line_range: None,
+                    snippet: None,
+                    stale: false,
+                    match_positions: vec![],
+                    temporal: None,
+                    layers_matched: vec![],
+                })
+            }
+        })
+        // AD-355-2: truncate to --limit LAST — after verification, not before.
+        .take(config.limit)
+        .collect();
 
     let total = results.len();
     let duration_ms = ctx.start.elapsed().as_millis() as u64;
@@ -488,32 +612,49 @@ fn decode_snippet(
     }
 }
 
-/// Map `FileId`s to paths and extract snippets.
+/// Map `FileId`s to paths, extract snippets, **verify substring membership**,
+/// and truncate to `limit` — all in one pass with a single file read per result.
 ///
-/// `layers_matched` is the set of layers that contributed non-zero signal for
-/// every result on this path. For the pure-lexical path, pass `&[]` (empty →
-/// serialised as absent via `skip_serializing_if`). For the text+AST compound
-/// path, pass `&["lexical","ast"]` (AC-F6).
-fn resolve_paths_and_snippets(
+/// # Design (AD-355-1 / AD-355-2 / AD-355-3 / AD-355-4)
+///
+/// Candidate-then-verify: the caller fetches a **wider** candidate pool
+/// (`LEXICAL_CANDIDATE_POOL_K × limit`) so the definer file is not truncated
+/// before verification.  This fn then:
+///
+/// 1. Reads each file once via [`extract_snippet_and_verify`] — no second I/O.
+/// 2. Drops any candidate whose file content does not contain the literal query
+///    as an AND-of-whitespace-tokens (case-sensitive; see AD-355-3).
+/// 3. Truncates to `limit` LAST — after verification, not before (AD-355-2).
+///
+/// Dropping non-matching candidates is a **relevance gate**, not a #317 output
+/// cap.  No `elision_marker` is needed (AD-355-4).
+fn resolve_paths_and_snippets_verified(
     raw_results: &[SearchResult],
     sorted_paths: &[&str],
     root: &Path,
     manifest: &FileManifest,
     layers_matched: &[&'static str],
+    query: &str,
+    limit: usize,
 ) -> Vec<ResolvedResult> {
     raw_results
         .iter()
         .filter_map(|r| {
             let path = sorted_paths.get(r.file_id.0 as usize)?;
-
             let manifest_entry = manifest.lookup(path);
 
-            let (line_number, line_range, snippet, stale) = decode_snippet(extract_snippet(
-                root,
-                path,
-                &r.match_positions,
-                manifest_entry,
-            ));
+            // Read file once; verify and extract snippet in one call (AD-355-1).
+            let (outcome, verified) =
+                extract_snippet_and_verify(root, path, &r.match_positions, manifest_entry, query);
+
+            // Drop candidates that do not contain the literal query.
+            // Stale files produce verified=false and are also dropped — we
+            // cannot confirm their content matches without re-reading.
+            if !verified {
+                return None;
+            }
+
+            let (line_number, line_range, snippet, stale) = decode_snippet(outcome);
 
             Some(ResolvedResult {
                 path: path.to_string(),
@@ -528,6 +669,8 @@ fn resolve_paths_and_snippets(
                 layers_matched: layers_matched.to_vec(),
             })
         })
+        // AD-355-2: truncate LAST — after verification removes non-matching candidates.
+        .take(limit)
         .collect()
 }
 

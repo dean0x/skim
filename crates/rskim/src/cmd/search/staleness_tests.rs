@@ -52,6 +52,17 @@ fn write_ast_index_stub(cache_dir: &std::path::Path) {
     fs::write(cache_dir.join("ast_index.skidx"), b"SKAX\x02\x00").unwrap();
 }
 
+/// Write a minimal valid lexical index stub file in `cache_dir`.
+///
+/// `lexical_index_version` reads the first 6 bytes: magic `SKIX` + version u16 LE.
+/// Writing version 3 (the current FORMAT_VERSION) prevents the lexical self-heal
+/// from reporting `NoStoredHead` in unit tests that only want to exercise the
+/// HEAD-comparison or AST-self-heal logic paths (Finding 9, ADR-006, #355 cycle-2).
+fn write_lexical_index_stub(cache_dir: &std::path::Path) {
+    // b"SKIX" = magic (4 bytes), 0x03 0x00 = version 3 in little-endian.
+    fs::write(cache_dir.join("index.skidx"), b"SKIX\x03\x00").unwrap();
+}
+
 /// Write a manifest with the given git_head into `cache_dir`.
 fn write_manifest_with_head(
     root: &std::path::Path,
@@ -236,10 +247,10 @@ fn test_check_staleness_no_stored_head() {
     let sha = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111";
     create_fake_git_repo(dir.path(), &format!("{sha}\n"));
 
-    // Write manifest without git_head and create fake index file
+    // Write manifest without git_head and create a valid-format index stub.
     write_manifest_with_head(dir.path(), &cache_dir, None);
-    // Create a stub index file so NoIndex branch is not triggered
-    fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    // Valid lexical stub so the lexical self-heal does not short-circuit.
+    write_lexical_index_stub(&cache_dir);
 
     // Git HEAD is present but manifest has no stored HEAD → NoStoredHead
     let (result, _) = check_staleness(&cache_dir, dir.path());
@@ -257,8 +268,9 @@ fn test_check_staleness_current_when_heads_match() {
     create_fake_git_repo(dir.path(), &format!("{sha}\n"));
 
     write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
-    fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
-    // AST stub required so self-heal does not trigger before HEAD comparison.
+    // Valid lexical stub (v3 magic) so lexical self-heal does not short-circuit.
+    write_lexical_index_stub(&cache_dir);
+    // AST stub required so AST self-heal does not trigger before HEAD comparison.
     write_ast_index_stub(&cache_dir);
 
     let (result, _) = check_staleness(&cache_dir, dir.path());
@@ -277,8 +289,9 @@ fn test_check_staleness_head_changed() {
     create_fake_git_repo(dir.path(), &format!("{current_sha}\n"));
 
     write_manifest_with_head(dir.path(), &cache_dir, Some(stored_sha));
-    fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
-    // AST stub required so self-heal does not trigger before HEAD comparison.
+    // Valid lexical stub (v3 magic) so lexical self-heal does not short-circuit.
+    write_lexical_index_stub(&cache_dir);
+    // AST stub required so AST self-heal does not trigger before HEAD comparison.
     write_ast_index_stub(&cache_dir);
 
     let (result, _) = check_staleness(&cache_dir, dir.path());
@@ -297,8 +310,9 @@ fn test_check_staleness_non_git_project_is_current() {
     let cache_dir = dir.path().to_path_buf();
     // No .git directory — non-git project
     write_manifest_with_head(dir.path(), &cache_dir, None);
-    fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
-    // AST stub required so self-heal does not trigger before HEAD comparison.
+    // Valid lexical stub (v3 magic) so lexical self-heal does not short-circuit.
+    write_lexical_index_stub(&cache_dir);
+    // AST stub required so AST self-heal does not trigger before HEAD comparison.
     write_ast_index_stub(&cache_dir);
 
     // Non-git: stored HEAD = None, current HEAD = None → Current (no rebuild loop).
@@ -317,8 +331,9 @@ fn test_check_staleness_unreadable_git_is_current() {
 
     // Manifest records a HEAD (was a git repo at build time), but .git is absent now.
     write_manifest_with_head(dir.path(), &cache_dir, Some(stored_sha));
-    fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
-    // AST stub required so self-heal does not trigger before HEAD comparison.
+    // Valid lexical stub (v3 magic) so lexical self-heal does not short-circuit.
+    write_lexical_index_stub(&cache_dir);
+    // AST stub required so AST self-heal does not trigger before HEAD comparison.
     write_ast_index_stub(&cache_dir);
     // No .git directory — simulates git becoming unreadable.
 
@@ -338,7 +353,10 @@ fn test_check_staleness_git_appeared_triggers_rebuild() {
 
     // Manifest has no stored HEAD (was built as a non-git project), but now .git exists.
     write_manifest_with_head(dir.path(), &cache_dir, None);
-    fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    // Valid lexical stub (v3 magic) + valid AST stub so both self-heal checks pass,
+    // allowing the HEAD-comparison logic (None, Some) → NoStoredHead to fire.
+    write_lexical_index_stub(&cache_dir);
+    write_ast_index_stub(&cache_dir);
     create_fake_git_repo(dir.path(), &format!("{current_sha}\n"));
 
     // stored HEAD = None, current HEAD = Some → NoStoredHead (rebuild to record HEAD).
@@ -367,9 +385,11 @@ fn test_check_staleness_ast_stale_still_returns_manifest() {
     let sha = "aabb1122aabb1122aabb1122aabb1122aabb1122";
     create_fake_git_repo(dir.path(), &format!("{sha}\n"));
 
-    // Write a manifest with a real HEAD, plus a lexical index stub.
+    // Write a manifest with a real HEAD plus a valid lexical stub.
+    // A valid lexical stub is required so the lexical self-heal does NOT trigger;
+    // only the absent AST index should cause NoStoredHead here (AST self-heal).
     write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
-    fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    write_lexical_index_stub(&cache_dir);
     // Deliberately NO ast_index.skidx — simulates missing AST index.
 
     let (result, manifest) = check_staleness(&cache_dir, dir.path());
@@ -404,8 +424,9 @@ fn test_check_staleness_ast_below_version_still_returns_manifest() {
     let sha = "ccdd3344ccdd3344ccdd3344ccdd3344ccdd3344";
     create_fake_git_repo(dir.path(), &format!("{sha}\n"));
 
+    // Valid lexical stub so the lexical self-heal does not short-circuit the AST check.
     write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
-    fs::write(cache_dir.join("index.skidx"), b"stub").unwrap();
+    write_lexical_index_stub(&cache_dir);
     // Write a v1 AST stub (below current AST_INDEX_FORMAT_VERSION).
     let stub: [u8; 6] = [b'S', b'K', b'A', b'X', 1, 0];
     fs::write(cache_dir.join("ast_index.skidx"), stub).unwrap();
@@ -425,6 +446,52 @@ fn test_check_staleness_ast_below_version_still_returns_manifest() {
         manifest.unwrap().stored_git_head(),
         Some(sha),
         "--stats must show real HEAD when only the AST format version is outdated"
+    );
+}
+
+// ============================================================================
+// check_staleness — lexical self-heal (#355 Finding 9 / ADR-006)
+// ============================================================================
+
+/// When the lexical index has a below-FORMAT_VERSION magic (v2 = bigram),
+/// check_staleness must return NoStoredHead to trigger a full rebuild AND must
+/// still return the loaded manifest (so --stats shows the real git HEAD).
+///
+/// PF-007 discriminating: if the lexical version check were absent, a v2 lexical
+/// index with a matching HEAD would return Current instead of NoStoredHead, and the
+/// next query would get a hard error from NgramIndexReader::open.  This test fails
+/// the moment that check is removed.
+#[test]
+fn test_check_staleness_lexical_below_version_triggers_rebuild_returns_manifest() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().to_path_buf();
+    let sha = "eeff5566eeff5566eeff5566eeff5566eeff5566";
+    create_fake_git_repo(dir.path(), &format!("{sha}\n"));
+
+    write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
+    // Write a v2 lexical stub (bigram-era format, below current v3).
+    // magic = b"SKIX", version = 2 (LE u16).
+    fs::write(cache_dir.join("index.skidx"), b"SKIX\x02\x00").unwrap();
+    // Valid AST stub so AST self-heal does not co-trigger.
+    write_ast_index_stub(&cache_dir);
+
+    let (result, manifest) = check_staleness(&cache_dir, dir.path());
+
+    // Must report stale (lexical v2 < v3 → self-heal required).
+    assert!(
+        matches!(result, StalenessCheck::NoStoredHead),
+        "v2 lexical index must trigger NoStoredHead rebuild; got {result:?}"
+    );
+
+    // Manifest must be returned so --stats can show the real git HEAD.
+    assert!(
+        manifest.is_some(),
+        "check_staleness must return manifest even when lexical index is below version"
+    );
+    assert_eq!(
+        manifest.unwrap().stored_git_head(),
+        Some(sha),
+        "--stats must show real HEAD when only the lexical format version is outdated"
     );
 }
 

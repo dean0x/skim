@@ -37,8 +37,8 @@ use crate::{
 pub struct NgramIndexBuilder {
     /// Directory where `index.skidx` and `index.skpost` will be written.
     output_dir: PathBuf,
-    /// Accumulated postings: bigram key → list of (doc_id, field_id, position).
-    postings: HashMap<u16, Vec<PostingEntry>>,
+    /// Accumulated postings: trigram key → list of (doc_id, field_id, position).
+    postings: HashMap<u32, Vec<PostingEntry>>,
     /// Per-file metadata in insertion order (indexed by sequential file_index).
     file_meta: Vec<FileMetaEntry>,
     /// Guard against duplicate FileIds.
@@ -138,13 +138,16 @@ impl NgramIndexBuilder {
             field_lengths,
         });
 
-        // Scan every 2-byte window, resolving the field via a linearly advancing
-        // pointer through field_map.  Because positions increase monotonically and
-        // field_map is sorted ascending, a single forward scan is O(n + m) instead
-        // of the O(n log m) cost of calling binary search once per window.
+        // Scan every 3-byte window (trigram), resolving the field via a linearly
+        // advancing pointer through field_map.  Because positions increase
+        // monotonically and field_map is sorted ascending, a single forward scan
+        // is O(n + m) instead of O(n log m).
+        //
+        // AD-355-5 / PF-004: widen each byte to u32 before shift arithmetic to
+        // prevent u8 overflow: `u32::from(b) << k`, never `b << k`.
         let bytes = content.as_bytes();
         let mut range_idx = 0usize;
-        for (pos, window) in bytes.windows(2).enumerate() {
+        for (pos, window) in bytes.windows(3).enumerate() {
             // Advance past any ranges that have ended before `pos`.
             while range_idx < field_map.len() && field_map[range_idx].0.end <= pos {
                 range_idx += 1;
@@ -154,7 +157,9 @@ impl NgramIndexBuilder {
             } else {
                 SearchField::Other.discriminant()
             };
-            let key = (u16::from(window[0]) << 8) | u16::from(window[1]);
+            // PF-004: widen to u32 before shifting — never shift on a bare u8.
+            let key =
+                (u32::from(window[0]) << 16) | (u32::from(window[1]) << 8) | u32::from(window[2]);
             self.postings.entry(key).or_default().push(PostingEntry {
                 doc_id: id.0,
                 field_id,
@@ -255,7 +260,7 @@ impl LayerBuilder for NgramIndexBuilder {
         for list in self.postings.values_mut() {
             list.sort_unstable();
         }
-        let mut sorted_keys: Vec<u16> = self.postings.keys().copied().collect();
+        let mut sorted_keys: Vec<u32> = self.postings.keys().copied().collect();
         sorted_keys.sort_unstable();
 
         // Serialise everything into the two on-disk buffers.
@@ -279,7 +284,7 @@ impl NgramIndexBuilder {
     /// on-disk byte buffers: `(postings_buf, skidx_buf)`.
     fn serialize_index(
         &self,
-        sorted_keys: &[u16],
+        sorted_keys: &[u32],
         avg_doc_length: f32,
         avg_field_lengths: [f32; FIELD_COUNT],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -297,12 +302,12 @@ impl NgramIndexBuilder {
             let offset = postings_buf.len() as u64;
             let byte_len = list.len().checked_mul(POSTING_ENTRY_SIZE).ok_or_else(|| {
                 SearchError::IndexCorrupted(format!(
-                    "posting list for key {key:#06x} overflows usize"
+                    "posting list for key {key:#010x} overflows usize"
                 ))
             })?;
             let length = u32::try_from(byte_len).map_err(|_| {
                 SearchError::IndexCorrupted(format!(
-                    "posting list for key {key:#06x} exceeds u32::MAX bytes ({byte_len})"
+                    "posting list for key {key:#010x} exceeds u32::MAX bytes ({byte_len})"
                 ))
             })?;
             for p in list {

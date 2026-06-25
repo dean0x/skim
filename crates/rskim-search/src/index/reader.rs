@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! [SkidxHeader: 62 bytes]
-//! [SkidxEntry × ngram_count: 14 bytes each]
+//! [SkidxEntry × ngram_count: 16 bytes each]   ← v3: ngram_key widened to u32
 //! [FileMetaEntry × file_count: 37 bytes each]
 //! ```
 //!
@@ -141,6 +141,38 @@ impl NgramIndexReader {
         })
     }
 
+    /// Read the lexical index format version from the first 6 bytes of `index.skidx`.
+    ///
+    /// Opens only 6 bytes (magic + version) — no mmap, no CRC, no full validation.
+    /// Used by `check_staleness` to detect a v2→v3 format mismatch and trigger a
+    /// rebuild before `NgramIndexReader::open` hard-errors on the version mismatch.
+    ///
+    /// # Errors
+    ///
+    /// - [`SearchError::Io`] if the file cannot be opened.
+    /// - [`SearchError::IndexCorrupted`] if the file is too short or has bad magic.
+    pub fn lexical_index_version(dir: &Path) -> Result<u16> {
+        use std::io::Read;
+        let idx_path = dir.join("index.skidx");
+        let mut file = std::fs::File::open(&idx_path)?;
+        let mut buf = [0u8; 6];
+        file.read_exact(&mut buf).map_err(|_| {
+            SearchError::IndexCorrupted(
+                "lexical_index_version: index.skidx too short (need 6 bytes)".into(),
+            )
+        })?;
+        let magic = &buf[0..4];
+        if magic != super::format::SKIDX_MAGIC {
+            return Err(SearchError::IndexCorrupted(format!(
+                "lexical_index_version: bad magic: expected {:?}, got {:?}",
+                super::format::SKIDX_MAGIC,
+                magic
+            )));
+        }
+        let version = u16::from_le_bytes([buf[4], buf[5]]);
+        Ok(version)
+    }
+
     /// Open an existing index from `dir` with a custom BM25F configuration.
     ///
     /// Identical to [`NgramIndexReader::open`] except the provided `config`
@@ -188,6 +220,57 @@ impl NgramIndexReader {
                 ))
             })?;
         decode_file_meta(&self.idx_mmap[offset..end])
+    }
+
+    /// AD-355-7 short-query fallback: emit all indexed files as score-0 candidates.
+    ///
+    /// Called when `extract_query_ngrams` returns an empty set (queries shorter
+    /// than 3 bytes).  Respects `file_filter` (blast-radius allowlist) and
+    /// `lang_filter` (`--lang` constraint) so the two dispatch paths are
+    /// consistent (PF-006: never silently drop a documented flag on a sub-path).
+    ///
+    /// Returns candidates in file-id/insertion order; verification in the caller
+    /// (e.g. `resolve_paths_and_snippets_verified`) is the only correctness gate.
+    /// See the `SearchLayer::search` contract in `types.rs` for details.
+    fn short_query_fallback(
+        &self,
+        query: &SearchQuery,
+        lang_filter: Option<u8>,
+    ) -> Vec<SearchResult> {
+        let limit = query.limit.unwrap_or(20);
+        let offset = query.offset.unwrap_or(0);
+        let file_count = self.header.file_count as usize;
+
+        (0..file_count)
+            .filter(|&doc_id| {
+                // Respect the blast-radius file_filter allowlist if present.
+                if let Some(ref f) = query.file_filter
+                    && !f.contains(&FileId(doc_id as u32))
+                {
+                    return false;
+                }
+                // Respect the --lang filter if present (F15/PF-006).
+                // Use the existing file_meta_at helper for a clean, bounds-checked
+                // decode (avoids raw mmap arithmetic in the fallback path).
+                if let Some(lang_id) = lang_filter {
+                    match self.file_meta_at(doc_id as u32) {
+                        Ok(meta) if meta.lang_id == lang_id => {}
+                        _ => return false,
+                    }
+                }
+                true
+            })
+            .skip(offset)
+            .take(limit)
+            .map(|doc_id| SearchResult {
+                file_id: FileId(doc_id as u32),
+                score: 0.0,
+                line_range: 0..0,
+                match_positions: vec![],
+                field: SearchField::Other,
+                snippet: None,
+            })
+            .collect()
     }
 
     /// Score the candidates accumulated in `tf_per_doc` for a single ngram iteration.
@@ -244,7 +327,7 @@ impl NgramIndexReader {
     }
 
     /// Retrieve all posting entries for `ngram_key` from the mmap'd posting file.
-    fn lookup_postings(&self, ngram_key: u16) -> Result<Vec<super::format::PostingEntry>> {
+    fn lookup_postings(&self, ngram_key: u32) -> Result<Vec<super::format::PostingEntry>> {
         let entries_start = SKIDX_HEADER_SIZE;
         let entries_end = entries_start + (self.header.ngram_count as usize) * SKIDX_ENTRY_SIZE;
         let entries_data = &self.idx_mmap[entries_start..entries_end];
@@ -296,8 +379,8 @@ impl SearchLayer for NgramIndexReader {
     ///
     /// # Algorithm
     ///
-    /// 1. Extract query bigrams via [`extract_query_ngrams`] (sorted by weight desc).
-    /// 2. For each bigram, retrieve its posting list.
+    /// 1. Extract query trigrams via [`extract_query_ngrams`] (sorted by weight desc).
+    /// 2. For each trigram, retrieve its posting list.
     /// 3. Accumulate per-document, per-field term frequencies and match positions.
     /// 4. Apply language filter if `query.lang` is set.
     /// 5. Score each document with BM25F using per-field TF, field lengths, and
@@ -312,8 +395,49 @@ impl SearchLayer for NgramIndexReader {
         }
 
         let ngrams = extract_query_ngrams(&query.text);
+
+        // Language filter resolved up-front so it is available to BOTH the normal
+        // scored path AND the AD-355-7 short-query fallback below.
+        // Fix (F15): previously resolved after the `ngrams.is_empty()` guard, so the
+        // fallback silently ignored `query.lang` — `skim search "fn" --lang python`
+        // would emit non-Python score-0 candidates.  Moving the resolution here
+        // ensures both paths honour the language constraint (PF-006: never make a
+        // documented flag silently inert on a dispatch sub-path).
+        let lang_filter: Option<u8> = query.lang.map(super::format::lang_to_id);
+
+        // AD-355-7: Short-query fallback.
+        //
+        // Trigram extraction requires ≥3 bytes per token; single- and double-byte
+        // tokens (e.g. "fn", "if") produce zero trigrams.  In this case the ngram
+        // index cannot generate candidates, but the query is still meaningful.
+        //
+        // Rather than returning empty results, we emit indexed files as score-0
+        // candidates so that the caller's verify step can apply a literal substring
+        // filter and return only files that actually contain the query string.
+        //
+        // SRP note (AD-355-7): the returned score-0 candidates are meaningful ONLY
+        // if the caller applies a verification step.  The `NgramIndexReader` has no
+        // access to file content — it is a pure index reader.  Any consumer of this
+        // trait that trusts the short-query result list without verification will
+        // surface arbitrary non-matching files.  The verify-then-truncate obligation
+        // is documented in the `SearchLayer::search` contract (types.rs).
+        //
+        // Candidate bound — callers are expected to set `sq.limit = Some(N)`:
+        //   Unset (None): `unwrap_or(20)` default.
+        //   Pure-lexical: `Some(max(config.limit * LEXICAL_POOL_K, 100))` (query.rs).
+        //   Compound:     `Some(config.limit * CANDIDATE_POOL_K)` (K=4) (query.rs).
+        //   Blast-radius: `Some(max(config.limit * BLAST_POOL_K, 100))` (K=10).
+        //
+        // NOTE: candidates are selected in raw file-id/insertion order BEFORE the
+        // verify step runs.  This deviates from the AD-355-2 verify-then-truncate-LAST
+        // invariant: a file that contains the short query but has file_id >= pool_limit
+        // will be silently missed.  Accepted trade-off tracked in #356 (pool-K
+        // calibration).
+        //
+        // Security: no injection, no path traversal; only the user's own indexed
+        // files (bounded to the pool cap) are returned as score-0 candidates.
         if ngrams.is_empty() {
-            return Ok(Vec::new());
+            return Ok(self.short_query_fallback(query, lang_filter));
         }
 
         // Resolve scoring config: per-query override takes priority.
@@ -325,10 +449,6 @@ impl SearchLayer for NgramIndexReader {
             }
             None => &self.bm25f_config,
         };
-
-        // Language filter resolved up-front so we can skip scoring documents that
-        // won't pass the filter.
-        let lang_filter: Option<u8> = query.lang.map(super::format::lang_to_id);
 
         // doc_id → accumulated BM25F score.
         let mut doc_scores: HashMap<u32, f64> = HashMap::new();
@@ -369,7 +489,7 @@ impl SearchLayer for NgramIndexReader {
                     tf_per_doc.entry(p.doc_id).or_insert([0.0; FIELD_COUNT])[field_idx] += 1.0;
                 }
                 let pos = p.position as usize;
-                pos_per_doc.entry(p.doc_id).or_default().push(pos..pos + 2);
+                pos_per_doc.entry(p.doc_id).or_default().push(pos..pos + 3);
             }
 
             // Second sub-pass: apply language filter, score, and transfer positions

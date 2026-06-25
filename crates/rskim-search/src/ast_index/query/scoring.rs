@@ -81,6 +81,21 @@ pub(super) struct ScoringCtx {
 }
 
 impl ScoringCtx {
+    /// Create a new context with floor capacity and an optional meta cache.
+    ///
+    /// `with_cache` should be `true` when `total_ngrams > 1` (C1: cross-list
+    /// cache hits only occur with more than one n-gram; P1 #286).
+    pub(super) fn new(file_count: usize, with_cache: bool) -> Self {
+        let scores = FxHashMap::with_capacity_and_hasher(CAPACITY_FLOOR, Default::default());
+        let meta_cache = with_cache
+            .then(|| FxHashMap::with_capacity_and_hasher(CAPACITY_FLOOR, Default::default()));
+        Self {
+            scores,
+            meta_cache,
+            file_count,
+        }
+    }
+
     /// Accumulate BM25 scores for one set of postings.
     ///
     /// Reserves capacity before inserting (P3 invariant: reservation and

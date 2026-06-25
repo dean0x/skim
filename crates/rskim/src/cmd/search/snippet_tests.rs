@@ -7,7 +7,10 @@ use std::fs;
 
 use tempfile::tempdir;
 
-use super::{SnippetOutcome, extract_context_window, extract_snippet};
+use super::{
+    SnippetOutcome, extract_context_window, extract_snippet, extract_snippet_and_verify,
+    query_substring_present,
+};
 
 // ============================================================================
 // extract_context_window
@@ -180,5 +183,149 @@ fn test_extract_snippet_stale_mtime_returns_none() {
     assert!(
         matches!(result, SnippetOutcome::Stale),
         "stale mtime in manifest → Stale, got {result:?}"
+    );
+}
+
+// ============================================================================
+// query_substring_present — unit tests (PF-007: discriminating observables)
+// ============================================================================
+
+/// Single token: present in content → true.
+#[test]
+fn test_query_substring_present_single_token_found() {
+    // Discriminating: must return true precisely because "authenticate" is in content.
+    assert!(
+        query_substring_present(
+            "pub fn authenticate(token: &str) -> bool { !token.is_empty() }",
+            "authenticate"
+        ),
+        "should find 'authenticate' as a literal substring"
+    );
+}
+
+/// Single token: absent from content → false (AC2 — gibberish → not found).
+///
+/// PF-007: this test asserts the discriminating negative: a query provably
+/// absent from the content must return false, so that the caller drops the
+/// candidate from the verified result set.
+#[test]
+fn test_query_substring_present_single_token_absent() {
+    // "zqxfjklm" is a gibberish sequence that cannot appear in natural code.
+    assert!(
+        !query_substring_present(
+            "pub fn authenticate(token: &str) -> bool { !token.is_empty() }",
+            "zqxfjklm"
+        ),
+        "gibberish token must not be found (AC2 — verified result set excludes it)"
+    );
+}
+
+/// AND-of-tokens: all tokens present → true (AD-355-3 multi-term semantics).
+#[test]
+fn test_query_substring_present_multi_token_all_found() {
+    let content = "pub fn authenticate(token: &str) -> bool { !token.is_empty() }";
+    assert!(
+        query_substring_present(content, "authenticate token"),
+        "both 'authenticate' and 'token' are present — AND-of-tokens must be true"
+    );
+}
+
+/// AND-of-tokens: one token absent → false (AC2 for multi-term).
+///
+/// PF-007: removing the absent-token check would turn this test into a false
+/// positive — the test fails the moment OR-semantics are accidentally used.
+#[test]
+fn test_query_substring_present_multi_token_one_absent() {
+    let content = "pub fn authenticate(token: &str) -> bool { !token.is_empty() }";
+    assert!(
+        !query_substring_present(content, "authenticate zqxfjklm"),
+        "'zqxfjklm' is absent — AND requires ALL tokens; result must be false"
+    );
+}
+
+/// Case-sensitive: lowercase query does NOT match uppercase-only text (AD-355-3).
+#[test]
+fn test_query_substring_present_case_sensitive() {
+    assert!(
+        !query_substring_present("pub fn Authenticate() {}", "authenticate"),
+        "match is case-sensitive; 'authenticate' must not match 'Authenticate'"
+    );
+}
+
+/// Empty query (no tokens after splitting) → false (defense-in-depth, Finding 15).
+///
+/// Prior to #355 cycle-2, an empty query returned vacuously true (`.all()` over
+/// an empty iterator).  The defense-in-depth fix (Finding 15) makes the empty-
+/// token case explicit: an empty/whitespace-only query is treated as "not present"
+/// so that a future caller that skips the is_empty() guard cannot silently admit
+/// all candidates.  The CLI dispatch already rejects empty queries before calling
+/// this function, so the behavior change only affects edge cases in tests.
+#[test]
+fn test_query_substring_present_empty_query_returns_false() {
+    assert!(
+        !query_substring_present("any content", ""),
+        "empty query: no tokens → false (defense-in-depth, not vacuously true)"
+    );
+}
+
+// ============================================================================
+// extract_snippet_and_verify — AD-355-7 empty-positions path
+// ============================================================================
+
+/// AD-355-7 / PF-007: when match_positions is empty (short-query fallback from
+/// the reader), extract_snippet_and_verify must still read the file and run
+/// query_substring_present.  It returns Unavailable (no context window without a
+/// byte offset) but verified=true for files that contain the query.
+///
+/// Discriminating observable (PF-007): verified must be TRUE for a file that
+/// contains the query, so the caller includes it in results.  If the empty-
+/// positions early-exit were restored, verified would be false and the file would
+/// be silently dropped — the bug the AD-355-7 fix addresses.
+#[test]
+fn test_extract_snippet_and_verify_empty_positions_file_contains_query_ad355_7() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "fn foo() {}\n").unwrap();
+
+    // Empty positions — simulates the short-query (AD-355-7) fallback.
+    let (outcome, verified) = extract_snippet_and_verify(&root, "src/lib.rs", &[], None, "fn");
+
+    // File contains "fn" → verified must be true so the caller keeps it.
+    assert!(
+        verified,
+        "AD-355-7: file containing 'fn' with empty positions must be verified=true; got verified={verified}, outcome={outcome:?}"
+    );
+    // No snippet can be produced without a position.
+    assert!(
+        matches!(outcome, SnippetOutcome::Unavailable),
+        "AD-355-7: empty positions → SnippetOutcome::Unavailable; got {outcome:?}"
+    );
+}
+
+/// AD-355-7: when positions are empty and the file does NOT contain the query,
+/// verified must be false — the verify gate still filters out non-matching files.
+#[test]
+fn test_extract_snippet_and_verify_empty_positions_file_absent_query_ad355_7() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "struct Foo {}\n").unwrap();
+
+    let (_, verified) = extract_snippet_and_verify(&root, "src/lib.rs", &[], None, "fn");
+
+    // File does NOT contain "fn" → verified must be false.
+    assert!(
+        !verified,
+        "AD-355-7: file not containing 'fn' with empty positions must be verified=false"
+    );
+}
+
+/// Whitespace-only query → false (same defense-in-depth as empty query).
+#[test]
+fn test_query_substring_present_whitespace_only_query_returns_false() {
+    assert!(
+        !query_substring_present("any content", "   "),
+        "whitespace-only query: no tokens → false (defense-in-depth, Finding 15)"
     );
 }

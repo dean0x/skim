@@ -49,6 +49,115 @@ pub fn extract_bigrams(content: &str) -> HashSet<u16> {
     set
 }
 
+/// Encode three bytes into a `u32` trigram key.
+///
+/// The encoding is `(b1 << 16) | (b2 << 8) | b3`, matching the
+/// [`rskim_search::ngram::Ngram`] encoding.
+///
+/// PF-004: each byte is widened to `u32` before shifting to prevent intermediate
+/// overflow when the byte value is `> 0x00`.
+#[must_use]
+#[inline]
+pub fn encode_trigram(b1: u8, b2: u8, b3: u8) -> u32 {
+    (u32::from(b1) << 16) | (u32::from(b2) << 8) | u32::from(b3)
+}
+
+/// Decode a `u32` trigram key back into its three component bytes.
+#[must_use]
+#[inline]
+pub fn decode_trigram(key: u32) -> (u8, u8, u8) {
+    (
+        ((key >> 16) & 0xFF) as u8,
+        ((key >> 8) & 0xFF) as u8,
+        (key & 0xFF) as u8,
+    )
+}
+
+/// Format a trigram for display.
+///
+/// Printable ASCII bytes are shown as characters; non-printable bytes as `\xNN`.
+#[must_use]
+pub fn trigram_to_display(key: u32) -> String {
+    let (b1, b2, b3) = decode_trigram(key);
+    let fmt = |b: u8| -> String {
+        if b.is_ascii_graphic() || b == b' ' {
+            String::from(b as char)
+        } else {
+            format!("\\x{b:02X}")
+        }
+    };
+    format!("{}{}{}", fmt(b1), fmt(b2), fmt(b3))
+}
+
+/// Extract the set of unique byte-triple trigrams from `content`.
+///
+/// Returns an empty set for inputs with fewer than three bytes.
+#[must_use]
+pub fn extract_trigrams(content: &str) -> HashSet<u32> {
+    let bytes = content.as_bytes();
+    let mut set = HashSet::new();
+    for window in bytes.windows(3) {
+        set.insert(encode_trigram(window[0], window[1], window[2]));
+    }
+    set
+}
+
+/// Compute document-frequency counts for trigrams across the corpus,
+/// deduplicated by SHA-256.
+///
+/// Returns `(document_frequency_map, corpus_stats)` where the DF map maps each
+/// trigram `u32` key to the number of unique files that contain it.
+#[must_use]
+pub fn extract_trigrams_from_corpus(files: &[SourceFile]) -> (HashMap<u32, u32>, CorpusStats) {
+    let mut seen_hashes: HashSet<[u8; 32]> = HashSet::new();
+    let mut df_map: HashMap<u32, u32> = HashMap::new();
+    let mut lang_counts: HashMap<String, u32> = HashMap::new();
+    let mut total_files_seen: u32 = 0;
+    let mut unique_file_count: u32 = 0;
+    let mut total_trigrams: u64 = 0;
+
+    for file in files {
+        total_files_seen += 1;
+        let hash = content_hash(&file.content);
+        if !seen_hashes.insert(hash) {
+            // Duplicate content — skip.
+            continue;
+        }
+
+        unique_file_count += 1;
+        let lang_str = format!("{:?}", file.language);
+        *lang_counts.entry(lang_str).or_default() += 1;
+
+        let trigrams = extract_trigrams(&file.content);
+        total_trigrams += trigrams.len() as u64;
+        for trigram in trigrams {
+            *df_map.entry(trigram).or_default() += 1;
+        }
+    }
+
+    let language_breakdown = {
+        let mut breakdown: Vec<_> = lang_counts
+            .into_iter()
+            .map(|(language, file_count)| LanguageCount {
+                language,
+                file_count,
+            })
+            .collect();
+        breakdown.sort_by_key(|b| std::cmp::Reverse(b.file_count));
+        breakdown
+    };
+
+    let stats = CorpusStats {
+        total_files: unique_file_count,
+        total_ngrams: total_trigrams,
+        unique_ngrams: df_map.len(),
+        deduplicated_files: total_files_seen - unique_file_count,
+        language_breakdown,
+    };
+
+    (df_map, stats)
+}
+
 /// Compute SHA-256 of `content` for deduplication purposes.
 #[must_use]
 pub fn content_hash(content: &str) -> [u8; 32] {
@@ -68,7 +177,7 @@ pub fn extract_bigrams_from_corpus(files: &[SourceFile]) -> (HashMap<u16, u32>, 
     let mut lang_counts: HashMap<String, u32> = HashMap::new();
     let mut total_files_seen: u32 = 0;
     let mut unique_file_count: u32 = 0;
-    let mut total_bigrams: u64 = 0;
+    let mut total_ngrams: u64 = 0;
 
     for file in files {
         total_files_seen += 1;
@@ -83,7 +192,7 @@ pub fn extract_bigrams_from_corpus(files: &[SourceFile]) -> (HashMap<u16, u32>, 
         *lang_counts.entry(lang_str).or_default() += 1;
 
         let bigrams = extract_bigrams(&file.content);
-        total_bigrams += bigrams.len() as u64;
+        total_ngrams += bigrams.len() as u64;
         for bigram in bigrams {
             *df_map.entry(bigram).or_default() += 1;
         }
@@ -101,12 +210,10 @@ pub fn extract_bigrams_from_corpus(files: &[SourceFile]) -> (HashMap<u16, u32>, 
         breakdown
     };
 
-    let unique_bigrams = df_map.len();
-
     let stats = CorpusStats {
         total_files: unique_file_count,
-        total_bigrams,
-        unique_bigrams,
+        total_ngrams,
+        unique_ngrams: df_map.len(),
         deduplicated_files: total_files_seen - unique_file_count,
         language_breakdown,
     };

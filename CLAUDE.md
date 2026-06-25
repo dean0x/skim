@@ -16,13 +16,16 @@ Cargo workspace, 8 crates:
 - `rskim-core` — pure transform library (parsing, modes; no I/O side effects)
 - `rskim` — CLI binary (`skim`): caching, analytics, command wrappers
 - `rskim-search` — code-search index (lexical n-gram, temporal, AST structural), stored in `<root>/.skim/search.db`
-- `rskim-research` — offline tooling that generates AST weight tables
+- `rskim-research` — offline tooling that generates both AST structural weight tables
+  AND the lexical trigram IDF weight table (see codegen notes below)
 - `rskim-bench` — benchmarks
 - `rskim-tokens` — offline + optional-network token counting (multi-provider; `net-anthropic` feature gates HTTP)
 - `rskim-contract` — byte-faithful contract / guardrail layer for transcript mutation
 - `rskim-llm` — LLM transcript parsing (OpenAI/Anthropic) + classifier
 
 `crates/rskim-search/src/ast_weights.rs` is **auto-generated — do not edit**. Regenerate via `rskim-research ast-run` then `ast-codegen`.
+
+`crates/rskim-search/src/weights.rs` is **auto-generated — do not edit**. It contains the lexical trigram IDF weight table (`TRIGRAM_WEIGHTS`, `lookup_weight`, `trigram_weight`). Regenerate via `rskim-research trigram-run` then `trigram-codegen`. The old `rskim-research codegen` subcommand (bigram-based) now writes to a separate `bigram_weights_legacy.rs` artifact and must NOT be used for the live trigram table.
 
 ## Architecture
 
@@ -43,7 +46,8 @@ Streaming output (stdout, zero-copy via &str slices where possible)
 **Non-obvious behavior (gotchas):**
 - **Analytics:** token savings persist to `~/.cache/skim/analytics.db` (SQLite/WAL), recorded fire-and-forget on background threads. `--clear-cache` clears only the parser cache, NOT `analytics.db` — use `skim stats --clear` for that. The `AnalyticsStore` trait + `MockStore` make the stats dashboard testable without a real DB.
 - **Search DB:** `rskim-search` stores hotspot/risk/co-change data in `<root>/.skim/search.db`. Migrations are forward-only via `PRAGMA user_version`; a DB written by a newer version errors rather than corrupting data.
-- **AST index:** the n-gram index (`ast_index.skidx` / `.skpost`) is format v2 — v1 files are rejected with "please rebuild" (`skim search index --rebuild`). Synthetic n-gram markers (IDs ≥ 64900) resolve to `None` in `vocab_resolve()`, keeping them isolated from real vocabulary.
+- **Lexical n-gram index:** `index.skidx` / `index.skpost` is format v3 (trigram, u32 key — #355 Part B). This is DISTINCT from the AST structural index. A v2 lexical index (bigram, u16 key) triggers an automatic rebuild on the next query via `check_staleness` — no manual `--rebuild` needed for the v2→v3 upgrade. Short queries (< 3 bytes, e.g. `fn`, `if`) cannot produce trigrams and fall back to an all-files score-0 candidate set, which is filtered down to matching files by the Part A substring-verify gate (AD-355-7); this is correct behavior, not a bug.
+- **AST index:** the structural n-gram index (`ast_index.skidx` / `.skpost`) is format v2 — v1 files are rejected with "please rebuild" (`skim search index --rebuild`). Synthetic n-gram markers (IDs ≥ 64900) resolve to `None` in `vocab_resolve()`, keeping them isolated from real vocabulary.
 
 ## Commands
 

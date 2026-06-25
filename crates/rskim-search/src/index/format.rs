@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! [SkidxHeader: 62 bytes]
-//! [SkidxEntry × ngram_count: 14 bytes each]
+//! [SkidxEntry × ngram_count: 16 bytes each]   ← v3: ngram_key widened to u32
 //! [FileMetaEntry × file_count: 37 bytes each]
 //! ```
 //!
@@ -30,7 +30,7 @@
 pub(crate) use super::lang_map::lang_to_id;
 use crate::{
     FIELD_COUNT, SearchError, SearchField,
-    weights::{BIGRAM_WEIGHTS, lookup_weight},
+    weights::{TRIGRAM_WEIGHTS, lookup_weight},
 };
 
 /// Magic bytes at the start of every `.skidx` file.
@@ -40,13 +40,29 @@ pub(crate) const SKIDX_MAGIC: &[u8; 4] = b"SKIX";
 /// v1 → v2: `SkidxHeader` gained `avg_field_lengths: [f32; 8]` (+32 bytes),
 /// and `FileMetaEntry` gained `field_lengths: [u32; 8]` (+32 bytes).
 /// v1 indexes are rejected with a clear error message containing "format version".
-pub(crate) const FORMAT_VERSION: u16 = 2;
+///
+/// v2 → v3 (#355 Part B): `SkidxEntry.ngram_key` widened from `u16` to `u32`
+/// (bigram → trigram). `SKIDX_ENTRY_SIZE` grows from 14 → 16 bytes.
+/// `PostingEntry` is UNCHANGED. Old v2 indexes self-heal via the staleness check
+/// (the stale reader rejects the wrong version and triggers a full rebuild).
+/// `#358` owns v3 → v4 (posting codec / `PostingEntry` change).
+///
+/// # AD-355-6 (cross-reference)
+///
+/// This constant is the single source of truth for the format bump owned by #355.
+/// #358 sequences AFTER #355 and bumps v3 → v4 for posting compression — do not
+/// increment this constant in #358.
+pub(crate) const FORMAT_VERSION: u16 = 3;
 /// Size in bytes of [`SkidxHeader`] on disk.
 ///
 /// v1 was 30 bytes; v2 adds 32 bytes for `avg_field_lengths: [f32; 8]`.
+/// v3 header layout is unchanged from v2 (62 bytes).
 pub(crate) const SKIDX_HEADER_SIZE: usize = 62;
 /// Size in bytes of a single [`SkidxEntry`] on disk.
-pub(crate) const SKIDX_ENTRY_SIZE: usize = 14;
+///
+/// v2: 14 bytes (`ngram_key: u16` + `posting_offset: u64` + `posting_length: u32`).
+/// v3: 16 bytes (`ngram_key: u32` + `posting_offset: u64` + `posting_length: u32`).
+pub(crate) const SKIDX_ENTRY_SIZE: usize = 16;
 /// Size in bytes of a single [`PostingEntry`] on disk.
 pub(crate) const POSTING_ENTRY_SIZE: usize = 9;
 /// Size in bytes of a single [`FileMetaEntry`] on disk.
@@ -97,16 +113,21 @@ pub(crate) struct SkidxHeader {
 
 /// One entry in the sorted n-gram lookup table.
 ///
-/// Layout (14 bytes, all integers little-endian):
+/// Layout (16 bytes, all integers little-endian):
 /// ```text
-/// [0..2]  ngram_key       2 bytes
-/// [2..10] posting_offset  8 bytes
-/// [10..14] posting_length 4 bytes (number of bytes, not entries)
+/// [0..4]   ngram_key       4 bytes  (v3: widened from u16 to u32 — #355 Part B)
+/// [4..12]  posting_offset  8 bytes
+/// [12..16] posting_length  4 bytes (number of bytes, not entries)
 /// ```
+///
+/// # AD-355-6
+///
+/// `ngram_key` widened from `u16` (bigram, v2) to `u32` (trigram, v3) in #355 Part B.
+/// `PostingEntry` is UNCHANGED. #358 owns the next format bump (v3→v4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SkidxEntry {
-    /// The bigram key (`(b1 << 8) | b2`).
-    pub ngram_key: u16,
+    /// The trigram key (`(b1 << 16) | (b2 << 8) | b3`).
+    pub ngram_key: u32,
     /// Byte offset into `.skpost` where this n-gram's posting list begins.
     pub posting_offset: u64,
     /// Byte length of this n-gram's posting list in `.skpost`.
@@ -258,16 +279,21 @@ pub(crate) fn decode_header(data: &[u8]) -> crate::Result<SkidxHeader> {
     })
 }
 
-/// Encode a [`SkidxEntry`] into its 14-byte on-disk representation.
+/// Encode a [`SkidxEntry`] into its 16-byte on-disk representation.
+///
+/// # AD-355-6 / #355 Part B
+///
+/// `ngram_key` is 4 bytes (u32) in v3, up from 2 bytes (u16) in v2.
+/// Layout: `[0..4] ngram_key | [4..12] posting_offset | [12..16] posting_length`.
 pub(crate) fn encode_entry(e: &SkidxEntry) -> [u8; SKIDX_ENTRY_SIZE] {
     let mut buf = [0u8; SKIDX_ENTRY_SIZE];
-    buf[0..2].copy_from_slice(&e.ngram_key.to_le_bytes());
-    buf[2..10].copy_from_slice(&e.posting_offset.to_le_bytes());
-    buf[10..14].copy_from_slice(&e.posting_length.to_le_bytes());
+    buf[0..4].copy_from_slice(&e.ngram_key.to_le_bytes());
+    buf[4..12].copy_from_slice(&e.posting_offset.to_le_bytes());
+    buf[12..16].copy_from_slice(&e.posting_length.to_le_bytes());
     buf
 }
 
-/// Decode a [`SkidxEntry`] from a 14-byte slice.
+/// Decode a [`SkidxEntry`] from a 16-byte slice.
 ///
 /// # Errors
 ///
@@ -280,9 +306,9 @@ pub(crate) fn decode_entry(data: &[u8]) -> crate::Result<SkidxEntry> {
         )));
     }
     Ok(SkidxEntry {
-        ngram_key: u16::from_le_bytes(read_array(data, 0, "entry: ngram_key")?),
-        posting_offset: u64::from_le_bytes(read_array(data, 2, "entry: posting_offset")?),
-        posting_length: u32::from_le_bytes(read_array(data, 10, "entry: posting_length")?),
+        ngram_key: u32::from_le_bytes(read_array(data, 0, "entry: ngram_key")?),
+        posting_offset: u64::from_le_bytes(read_array(data, 4, "entry: posting_offset")?),
+        posting_length: u32::from_le_bytes(read_array(data, 12, "entry: posting_length")?),
     })
 }
 
@@ -377,7 +403,7 @@ pub(crate) fn decode_file_meta(data: &[u8]) -> crate::Result<FileMetaEntry> {
 /// [`SearchError::IndexCorrupted`] if the slice is malformed.
 pub(crate) fn lookup_ngram(
     entries_data: &[u8],
-    ngram_key: u16,
+    ngram_key: u32,
 ) -> crate::Result<Option<SkidxEntry>> {
     if !entries_data.len().is_multiple_of(SKIDX_ENTRY_SIZE) {
         return Err(SearchError::IndexCorrupted(format!(
@@ -392,7 +418,8 @@ pub(crate) fn lookup_ngram(
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         let offset = mid * SKIDX_ENTRY_SIZE;
-        let key = u16::from_le_bytes(read_array(entries_data, offset, "entries: key read")?);
+        // v3: ngram_key is 4 bytes (u32) at offset 0.
+        let key = u32::from_le_bytes(read_array(entries_data, offset, "entries: key read")?);
         match key.cmp(&ngram_key) {
             std::cmp::Ordering::Equal => {
                 return decode_entry(&entries_data[offset..offset + SKIDX_ENTRY_SIZE]).map(Some);
@@ -415,7 +442,7 @@ pub(crate) fn compute_checksum(data: &[u8]) -> u32 {
 /// Compute the BM25 contribution for a single term occurrence.
 ///
 /// `tf` — observed term frequency in this document.
-/// `idf` — inverse document frequency weight from the bigram table.
+/// `idf` — inverse document frequency weight from the trigram table.
 /// `doc_len` — byte length of the document.
 /// `avg_doc_len` — average byte length across the corpus.
 ///
@@ -439,13 +466,17 @@ pub(crate) fn bm25_score(tf: f32, idf: f32, doc_len: u32, avg_doc_len: f32) -> f
     idf * tf_norm
 }
 
-/// Compute IDF weight for a bigram key using the empirical weight table.
+/// Compute IDF weight for a trigram key using the empirical weight table.
 ///
-/// Falls back to the default weight for bigrams not present in the table.
+/// Falls back to the default weight for trigrams not present in the table.
+///
+/// # AD-355-5 / PF-004
+///
+/// Key is `u32` (widened from `u16` in #355 Part B) to match [`crate::ngram::Ngram`].
 #[must_use]
 #[inline]
-pub(crate) fn idf_for_key(key: u16) -> f32 {
-    lookup_weight(key, BIGRAM_WEIGHTS)
+pub(crate) fn idf_for_key(key: u32) -> f32 {
+    lookup_weight(key, TRIGRAM_WEIGHTS)
 }
 
 #[cfg(test)]
