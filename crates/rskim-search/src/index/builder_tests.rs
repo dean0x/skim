@@ -288,7 +288,7 @@ fn test_compute_field_lengths_multi_range_different_fields() {
 
 /// When the field_map leaves byte ranges uncovered, add_file_classified must
 /// still succeed. compute_field_lengths only sums ranges explicitly in the map;
-/// gap bytes are not added to Other in field_lengths (only the bigram scanning
+/// gap bytes are not added to Other in field_lengths (only the trigram scanning
 /// loop assigns Other postings for positions outside any mapped range).
 #[test]
 fn test_add_file_classified_partial_field_map_succeeds() {
@@ -314,7 +314,7 @@ fn test_add_file_classified_partial_field_map_succeeds() {
 
     // compute_field_lengths only sums ranges present in field_map. The 5-byte
     // FunctionSignature range is captured; the 15-byte gap is NOT added to Other
-    // in field_lengths (gap bytes get Other postings in the bigram loop, not here).
+    // in field_lengths (gap bytes get Other postings in the trigram loop, not here).
     let meta = &builder.file_meta[0];
     let sig_idx = crate::SearchField::FunctionSignature.discriminant() as usize;
     let other_idx = crate::SearchField::Other.discriminant() as usize;
