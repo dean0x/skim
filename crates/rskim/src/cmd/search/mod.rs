@@ -1358,23 +1358,20 @@ mod tests {
         );
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
-            .unwrap_or_else(|e| {
-                panic!("stdout must be valid JSON; got {:?}\nparse error: {e}", stdout)
-            });
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!(
+                "stdout must be valid JSON; got {:?}\nparse error: {e}",
+                stdout
+            )
+        });
 
         let warning = parsed
             .get("warning")
             .and_then(|v| v.as_str())
-            .unwrap_or_else(|| {
-                panic!(
-                    "JSON must have a 'warning' string field; got: {parsed:?}"
-                )
-            });
+            .unwrap_or_else(|| panic!("JSON must have a 'warning' string field; got: {parsed:?}"));
 
         assert_eq!(
-            warning,
-            NO_TEMPORAL_DATA_MSG,
+            warning, NO_TEMPORAL_DATA_MSG,
             "JSON 'warning' field must equal NO_TEMPORAL_DATA_MSG (AC9 JSON path, PF-007)"
         );
     }
