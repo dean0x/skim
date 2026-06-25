@@ -693,57 +693,18 @@ fn test_auto_refresh_hook_temporal_failure_does_not_fail_lexical() {
 // outside tests before this feature).
 // ============================================================================
 
-/// Create a real git repository with commits via git subprocess.
+/// Shared helper: create a real git repo with commits.
 ///
-/// Returns the full 40-hex SHA of HEAD.
+/// Delegates to the canonical `create_real_git_repo` helper promoted into
+/// `staleness.rs` so staleness_tests.rs, temporal_build_tests.rs, and mod.rs
+/// tests all share one implementation (avoids three-copy drift, #357 cycle-2
+/// findings 9/14). Kept as a thin alias here so existing call sites in this
+/// file require no further churn.
 fn create_real_git_repo_for_staleness(
     dir: &std::path::Path,
     commit_files: &[(&str, &[(&str, &str)])],
 ) -> String {
-    use std::process::Command;
-
-    Command::new("git")
-        .args(["init"])
-        .current_dir(dir)
-        .output()
-        .expect("git init");
-    Command::new("git")
-        .args(["config", "user.email", "test@example.com"])
-        .current_dir(dir)
-        .output()
-        .expect("git config email");
-    Command::new("git")
-        .args(["config", "user.name", "Test"])
-        .current_dir(dir)
-        .output()
-        .expect("git config name");
-
-    for (msg, files) in commit_files {
-        for (name, content) in *files {
-            let path = dir.join(name);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).expect("create dir");
-            }
-            fs::write(&path, content).expect("write file");
-            Command::new("git")
-                .args(["add", name])
-                .current_dir(dir)
-                .output()
-                .expect("git add");
-        }
-        Command::new("git")
-            .args(["commit", "-m", msg])
-            .current_dir(dir)
-            .output()
-            .expect("git commit");
-    }
-
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(dir)
-        .output()
-        .expect("git rev-parse HEAD");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    super::create_real_git_repo(dir, commit_files)
 }
 
 /// AC (hook wiring): auto_refresh_if_stale on a real git repo MUST populate
@@ -888,7 +849,7 @@ fn test_temporal_db_is_stale_when_absent() {
     let dir = tempdir().unwrap();
     // No temporal.db in dir — must report stale.
     assert!(
-        temporal_db_is_stale(dir.path(), Some("abc1234")),
+        temporal_db_is_stale(dir.path(), "abc1234"),
         "absent temporal.db must be reported stale"
     );
 }
@@ -907,7 +868,7 @@ fn test_temporal_db_is_not_stale_when_head_matches() {
     drop(db);
 
     assert!(
-        !temporal_db_is_stale(dir.path(), Some(head)),
+        !temporal_db_is_stale(dir.path(), head),
         "temporal.db with matching META_GIT_HEAD must NOT be stale"
     );
 }
@@ -931,7 +892,7 @@ fn test_temporal_db_is_stale_when_head_diverges() {
     drop(db);
 
     assert!(
-        temporal_db_is_stale(dir.path(), Some(real_head)),
+        temporal_db_is_stale(dir.path(), real_head),
         "temporal.db with diverged META_GIT_HEAD must be reported stale (deadbeef case)"
     );
 }
@@ -1153,98 +1114,133 @@ fn test_bug_b_no_rebuild_loop_when_temporal_is_current() {
 
 /// API CONTRACT (degenerate git repo no-loop, LOCKED DECISION 2026-06-24):
 ///
-/// On a freshly-initialized git repo (no commits, unborn branch), two
-/// consecutive auto_refresh-routed queries must BOTH return Ok/SUCCESS and
-/// temporal.db state must be STABLE across both calls (no flapping).
+/// Two sub-cases:
 ///
-/// Unborn-branch path: `read_git_head` returns `None` (refs/heads/<branch>
-/// doesn't exist yet). The BUG B gate guard `&& let Some(ref head) = current_head`
-/// prevents `rebuild_temporal` from being called. So temporal.db is never
-/// written — but that is STABLE (absent-absent). No per-query history walk
-/// occurs because the guard short-circuits before calling `rebuild_temporal`.
+/// **Case A — unborn branch (no commits, HEAD=None)**:
+/// `read_git_head` returns `None`; the guard `if let Some(ref head) = current_head`
+/// in auto_refresh_if_stale short-circuits before calling `rebuild_temporal`.
+/// temporal.db is never written — both-absent is the stable state.
 ///
-/// This is the correct behaviour: without a readable HEAD SHA, there is no
-/// stable key to write META_GIT_HEAD with. The end-to-end "present-but-empty
-/// temporal.db" write for an empty-history repo with a readable HEAD SHA is
-/// tested in temporal_build_tests.rs::test_degenerate_repo_empty_history_writes_empty_temporal_db.
+/// **Case B — one commit (HEAD readable)**:
+/// `rebuild_temporal` is called, writes a present-but-empty temporal.db (zero
+/// hotspot rows + META_GIT_HEAD set, LOCKED DECISION 2026-06-24). On the second
+/// call, `temporal_db_is_stale` reads META_GIT_HEAD == current HEAD → returns
+/// false → rebuild is SKIPPED. temporal.db mtime is STABLE: this is the
+/// discriminating observable the unborn-branch sub-case cannot provide.
 ///
-/// PF-007 discriminating: both calls return Ok + temporal.db state STABLE
-/// (absent-absent: no flapping, no error, no hang).
+/// PF-007 discriminating for Case B: mtime unchanged between two consecutive
+/// auto_refresh calls proves the no-rebuild-loop contract is enforced on the
+/// empty-history-but-readable-HEAD path.  Case A proves no error/hang on the
+/// unborn-branch path (#357 cycle-2 finding 13: strengthen the tautological
+/// both-absent assertion with a truly-discriminating second sub-case).
 #[test]
 fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
     use std::process::Command;
 
-    let dir = tempdir().unwrap();
-    let cache_dir = dir.path().join("cache");
-    fs::create_dir_all(&cache_dir).unwrap();
+    // ── Case A: unborn branch (no commits, HEAD = None) ──────────────────────
+    {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
 
-    // git init — HEAD points to refs/heads/main or master (unborn branch).
-    // No commits → read_git_head returns None.
-    Command::new("git")
-        .args(["init"])
-        .current_dir(dir.path())
-        .output()
-        .expect("git init");
-    Command::new("git")
-        .args(["config", "user.email", "test@example.com"])
-        .current_dir(dir.path())
-        .output()
-        .expect("git config email");
-    Command::new("git")
-        .args(["config", "user.name", "Test"])
-        .current_dir(dir.path())
-        .output()
-        .expect("git config name");
+        // git init — HEAD points to refs/heads/main or master (unborn branch).
+        // No commits → read_git_head returns None.
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git init");
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git config email");
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git config name");
 
-    // Verify read_git_head returns None for this unborn repo.
-    let head = super::read_git_head(dir.path());
-    // If git init uses a different default branch or the ref exists, skip gracefully.
-    // The key invariant is that auto_refresh does not error or hang.
-    let _ = head; // used implicitly below
+        // Build the lexical index (HEAD=None; manifest has no stored HEAD).
+        build_index_in(dir.path(), &cache_dir);
 
-    // Build the lexical index — no manifest HEAD since git HEAD is None/unborn.
-    build_index_in(dir.path(), &cache_dir);
+        let analytics = TEST_ANALYTICS;
 
-    let analytics = TEST_ANALYTICS;
+        let result1 = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics);
+        assert!(result1.is_ok(), "Case A: first call must return Ok");
+        let (refreshed1, _) = result1.unwrap();
+        assert!(!refreshed1, "Case A: lexical must not be rebuilt (Current)");
 
-    // First call: lexical is Current (just built, HEAD=None matches manifest HEAD=None).
-    let result1 = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics);
-    assert!(
-        result1.is_ok(),
-        "first auto_refresh_if_stale on empty-history git repo must return Ok"
-    );
-    let (refreshed1, _) = result1.unwrap();
-    // HEAD is None → check_staleness sees (None stored, None current) → Current.
-    assert!(
-        !refreshed1,
-        "lexical must NOT be rebuilt on first call (Current: no stored HEAD, no current HEAD)"
-    );
+        let temporal_db_path = cache_dir.join("temporal.db");
+        let exists_after_first = temporal_db_path.exists();
 
-    let temporal_db_path = cache_dir.join("temporal.db");
-    let exists_after_first = temporal_db_path.exists();
+        let result2 = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics);
+        assert!(result2.is_ok(), "Case A: second call must return Ok");
+        let (refreshed2, _) = result2.unwrap();
+        assert!(!refreshed2, "Case A: second call must not rebuild lexical");
 
-    // Second call: same state — must return Ok, must NOT error or hang.
-    let result2 = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics);
-    assert!(
-        result2.is_ok(),
-        "second auto_refresh_if_stale on empty-history git repo must return Ok"
-    );
-    let (refreshed2, _) = result2.unwrap();
-    assert!(
-        !refreshed2,
-        "second call must NOT rebuild lexical (Current)"
-    );
+        let exists_after_second = temporal_db_path.exists();
+        // Stability assertion: both-absent is the expected stable state.
+        assert_eq!(
+            exists_after_first, exists_after_second,
+            "Case A: temporal.db existence must be STABLE (no flapping on unborn repo)"
+        );
+    }
 
-    let exists_after_second = temporal_db_path.exists();
+    // ── Case B: one commit (HEAD readable) — discriminating no-loop assertion ─
+    // rebuild_temporal writes a present-but-empty temporal.db with META_GIT_HEAD.
+    // On the second auto_refresh call, temporal_db_is_stale reads META_GIT_HEAD ==
+    // current HEAD → false → temporal.db is NOT rewritten.  Verified via mtime.
+    {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
 
-    // STABLE: temporal.db existence must not flip (no flapping).
-    // Both-absent (current_head=None prevents rebuild) is the expected stable state.
-    assert_eq!(
-        exists_after_first, exists_after_second,
-        "temporal.db existence must be STABLE across two consecutive calls on empty-history repo \
-         (no flapping: exists_after_first={exists_after_first}, exists_after_second={exists_after_second}; \
-         API CONTRACT: degenerate git repo no-loop, LOCKED DECISION 2026-06-24)"
-    );
+        // One commit makes HEAD readable.
+        create_real_git_repo_for_staleness(
+            dir.path(),
+            &[("init", &[("README", "hello")])],
+        );
+
+        let analytics = TEST_ANALYTICS;
+
+        // First call: NoIndex → build lexical + write empty temporal.db.
+        let (refreshed1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+        assert!(refreshed1, "Case B: first call must build index (NoIndex)");
+
+        let temporal_db_path = cache_dir.join("temporal.db");
+        assert!(
+            temporal_db_path.exists(),
+            "Case B: temporal.db must be created on first call (LOCKED DECISION 2026-06-24)"
+        );
+
+        // Verify the DB has META_GIT_HEAD set (so the staleness gate sees Current).
+        let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
+        let stored_head = db
+            .get_meta(rskim_search::META_GIT_HEAD)
+            .unwrap();
+        assert!(
+            stored_head.is_some(),
+            "Case B: META_GIT_HEAD must be set in the empty temporal.db (no-loop key)"
+        );
+        drop(db);
+
+        // Capture mtime before the second call.
+        let mtime_before = fs::metadata(&temporal_db_path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Second call: both lexical and temporal are Current.
+        // MUST NOT rewrite temporal.db — mtime must be unchanged.
+        let (refreshed2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+        assert!(!refreshed2, "Case B: second call must not rebuild lexical (Current)");
+
+        let mtime_after = fs::metadata(&temporal_db_path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "Case B: temporal.db mtime must be UNCHANGED on second call \
+             (no-rebuild-loop on empty-history repo, LOCKED DECISION 2026-06-24)"
+        );
+    }
 }
 
 // ============================================================================

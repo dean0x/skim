@@ -352,40 +352,13 @@ fn init_git_repo(dir: &std::path::Path) {
         .expect("git config name");
 }
 
-/// Create a real git repository with commits via git subprocess.
+/// Create a real git repository with commits.
 ///
-/// `git init` + `git config` + `git add` + `git commit` for each commit entry.
-/// `commit_files` is `(message, &[(filename, content)])`.
+/// Delegates to the canonical `staleness::create_real_git_repo` shared helper
+/// (see #357 cycle-2 findings 9/14). The `init_git_repo` helper is kept for
+/// tests that need an unborn repo (no commits).
 fn create_real_git_repo(dir: &std::path::Path, commit_files: &[(&str, &[(&str, &str)])]) -> String {
-    init_git_repo(dir);
-
-    for (msg, files) in commit_files {
-        for (name, content) in *files {
-            let path = dir.join(name);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).expect("create dir");
-            }
-            std::fs::write(path, content).expect("write file");
-            Command::new("git")
-                .args(["add", name])
-                .current_dir(dir)
-                .output()
-                .expect("git add");
-        }
-        Command::new("git")
-            .args(["commit", "-m", msg])
-            .current_dir(dir)
-            .output()
-            .expect("git commit");
-    }
-
-    // Return the current HEAD SHA.
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(dir)
-        .output()
-        .expect("git rev-parse HEAD");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    super::super::staleness::create_real_git_repo(dir, commit_files)
 }
 
 /// AC5 / AC6 — HEAD stored in temporal.db equals full 40-hex SHA and matches

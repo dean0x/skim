@@ -278,6 +278,20 @@ macro_rules! warn_skip {
 /// build hook point" comment, after `FileManifest::load`) is correctly
 /// post-manifest — do not move it earlier.
 ///
+/// # Empty-history repos (LOCKED DECISION 2026-06-24)
+///
+/// When a git repo has zero commits (`parse_history` returns an empty commit
+/// list), this function acquires the build lock and writes a **present-but-empty**
+/// `temporal.db` containing only the `META_GIT_HEAD` row.  This prevents the
+/// per-query rebuild loop that would otherwise occur because `temporal_db_is_stale`
+/// returns `true` whenever `temporal.db` is absent — so without the file the
+/// next query would attempt another rebuild, fail the same way, and loop forever.
+/// The empty-DB invariant: `top_hotspots()` returns `[]`, but `get_meta(GIT_HEAD)`
+/// returns the HEAD SHA so the staleness gate sees `Current` on the next query.
+/// `TemporalDb::open` creates the file on disk before `sync` is called; if `sync`
+/// fails, the file may exist with no `META_GIT_HEAD` row (same partial-file risk
+/// as the non-empty path) — see inline comment on the `Err` arm.
+///
 /// # Lookback semantics (O-C / ADR-003)
 ///
 /// A single full-history walk (`lookback_days = 0`) supplies all data:
@@ -338,59 +352,52 @@ pub(super) fn rebuild_temporal_with_source(
         Err(e) => warn_skip!("parse_history failed: {}", e),
     };
 
+    // ── Score computation (pure, no I/O) ─────────────────────────────────────
+    // For empty-history repos (zero commits): all row slices are empty but we
+    // still fall through to the single lock+open+sync block below, which writes
+    // a present-but-empty temporal.db with META_GIT_HEAD set.
+    //
+    // LOCKED DECISION (2026-06-24, plan lines 14/146/349): a present-but-empty
+    // temporal.db prevents the per-query no-op rebuild loop — on the next query,
+    // temporal_db_is_stale reads META_GIT_HEAD and sees Current, so no rebuild.
+    //
+    // Falling through (rather than an early-return empty branch) also avoids
+    // duplicating the lock+open+sync block and eliminates the partial-file risk
+    // that the prior early-return had: if sync fails after TemporalDb::open
+    // creates the file, the file exists with no META_GIT_HEAD row, making
+    // temporal_db_is_stale return true on the next query → rebuild loop.
+    // The single sync path addresses this: if sync fails we warn+skip and the
+    // file may still exist headless, but this is the same risk that already
+    // exists on the non-empty path (pre-existing, not introduced here).
+    let (hotspot_rows, risk_rows, cochange_rows);
     if risk_history.commits.is_empty() {
-        // Empty-history repo (git init, no commits yet).
-        //
-        // LOCKED DECISION (2026-06-24, plan lines 14/146/349): write a
-        // present-but-empty temporal.db with META_GIT_HEAD so that subsequent
-        // queries see the repo as Current and skip rebuild — preventing the
-        // per-query no-op loop that would otherwise occur because
-        // temporal_db_is_stale returns true whenever temporal.db is absent.
-        // Non-fatal by ADR-006/D5: acquire lock and sync with empty row sets.
-        let _lock = super::build_lock::acquire("skim search", cache_dir)?;
-        let db_path = cache_dir.join("temporal.db");
-        let db = match TemporalDb::open(&db_path) {
-            Ok(d) => d,
-            Err(e) => warn_skip!("failed to open temporal.db (empty-repo): {}", e),
-        };
-        match db.sync(&[], &[], &[], head) {
-            Ok(()) => {
-                if crate::debug::is_debug_enabled() {
-                    eprintln!(
-                        "skim search [debug]: temporal.db initialized with empty rows (no commits), HEAD={}…",
-                        head.get(..8).unwrap_or(head),
-                    );
-                }
-            }
-            Err(e) => {
-                warn_skip!("sync failed (empty-repo): {}", e);
-            }
-        }
-        return Ok(());
+        hotspot_rows = vec![];
+        risk_rows = vec![];
+        cochange_rows = vec![];
+    } else {
+        // risk_scores: decay-weighted hotspot/fix_density from the full-history walk
+        // (O-C / ADR-003). Full history ensures decay weights span the commit
+        // lifetime rather than being capped at 90 days.
+        let risk_scores = rskim_search::compute_file_risk_scores(
+            &risk_history.commits,
+            now_epoch,
+            DEFAULT_HALF_LIFE_DAYS,
+        );
+        // temporal_stats: windowed counts (changes_30d/90d) PLUS lifetime totals
+        // (total_commits/fix_commits). The 30d/90d fields reflect commits inside
+        // the window relative to now_epoch (timestamp arithmetic, no walk cap).
+        let temporal_stats =
+            rskim_search::compute_file_temporal_stats(&risk_history.commits, now_epoch);
+        // cochange uses full history (lifetime co-change coupling).
+        cochange_rows = build_cochange_rows(&risk_history);
+        hotspot_rows = build_hotspot_rows(&risk_scores, &temporal_stats);
+        risk_rows = build_risk_rows(&risk_scores, &temporal_stats);
     }
 
-    // ── Score computation (pure, no I/O) ─────────────────────────────────────
-    // risk_scores: decay-weighted hotspot/fix_density from the full-history walk
-    // (O-C / ADR-003). Full history ensures decay weights span the commit
-    // lifetime rather than being capped at 90 days.
-    let risk_scores = rskim_search::compute_file_risk_scores(
-        &risk_history.commits,
-        now_epoch,
-        DEFAULT_HALF_LIFE_DAYS,
-    );
-    // temporal_stats: windowed counts (changes_30d/90d) PLUS lifetime totals
-    // (total_commits/fix_commits). The 30d/90d fields reflect commits inside
-    // the window relative to now_epoch (timestamp arithmetic, no walk cap).
-    let temporal_stats =
-        rskim_search::compute_file_temporal_stats(&risk_history.commits, now_epoch);
-    // cochange uses full history (lifetime co-change coupling).
-    let cochange_rows = build_cochange_rows(&risk_history);
-
-    // ── Row join ──────────────────────────────────────────────────────────────
-    let hotspot_rows = build_hotspot_rows(&risk_scores, &temporal_stats);
-    let risk_rows = build_risk_rows(&risk_scores, &temporal_stats);
-
     // ── Acquire lock (D4), then sync ─────────────────────────────────────────
+    // Single sync path for both the empty-history and non-empty cases:
+    // eliminates the duplicated lock+open+sync block and consolidates the
+    // partial-file-on-sync-failure risk in one location.
     // The lock serialises temporal writes against concurrent lexical builds.
     // Acquired AFTER compute (pure) to minimise lock hold time.
     // Delegates to `build_lock::acquire` — the SINGLE bounded implementation
