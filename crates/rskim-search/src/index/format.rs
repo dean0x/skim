@@ -19,7 +19,10 @@
 //! # Encoding
 //!
 //! All multi-byte integers are little-endian.  The header checksum covers
-//! the entry array and file-metadata array bytes (appended in that order).
+//! `postings_buf` + the entry array + the file-metadata array (in that order,
+//! matching builder.rs and the verification in reader.rs open()).  This means
+//! any bit-flip in `.skpost` is detected during `NgramIndexReader::open`
+//! before a query can run (#364).
 //!
 //! ## Posting codec (v4, AD-LXPOST-1)
 //!
@@ -93,13 +96,6 @@ pub(crate) const SKIDX_HEADER_SIZE: usize = 62;
 /// v2: 14 bytes (`ngram_key: u16` + `posting_offset: u64` + `posting_length: u32`).
 /// v3: 16 bytes (`ngram_key: u32` + `posting_offset: u64` + `posting_length: u32`).
 pub(crate) const SKIDX_ENTRY_SIZE: usize = 16;
-/// Size in bytes of a [`PostingEntry`] in the v3 fixed-width encoding.
-///
-/// **v4 note**: this constant is retained for test helpers that construct
-/// fixed-size posting blobs for v3-era tests.  It is NOT a valid decode
-/// stride in v4 — use [`decode_postings_varint`] instead.
-#[cfg(test)]
-pub(crate) const POSTING_ENTRY_SIZE: usize = 9;
 /// Size in bytes of a single [`FileMetaEntry`] on disk.
 ///
 /// v1 was 5 bytes; v2 adds 32 bytes for `field_lengths: [u32; 8]`.
@@ -347,51 +343,6 @@ pub(crate) fn decode_entry(data: &[u8]) -> crate::Result<SkidxEntry> {
     })
 }
 
-/// Encode a [`PostingEntry`] into its 9-byte on-disk representation.
-///
-/// **v4 note**: used only by test helpers that verify the old fixed encoding.
-/// Production code uses [`encode_postings_varint`] instead.
-#[cfg(test)]
-pub(crate) fn encode_posting(p: &PostingEntry) -> [u8; POSTING_ENTRY_SIZE] {
-    let mut buf = [0u8; POSTING_ENTRY_SIZE];
-    buf[0..4].copy_from_slice(&p.doc_id.to_le_bytes());
-    buf[4] = p.field_id;
-    buf[5..9].copy_from_slice(&p.position.to_le_bytes());
-    buf
-}
-
-/// Decode a [`PostingEntry`] from a 9-byte slice.
-///
-/// **v4 note**: used only by test helpers that verify the old fixed encoding.
-/// Production code uses [`decode_postings_varint`] instead.
-///
-/// # Errors
-///
-/// Returns [`SearchError::IndexCorrupted`] if the slice is too short or
-/// `field_id` is not a valid [`SearchField`] discriminant.
-#[cfg(test)]
-pub(crate) fn decode_posting(data: &[u8]) -> crate::Result<PostingEntry> {
-    if data.len() < POSTING_ENTRY_SIZE {
-        return Err(SearchError::IndexCorrupted(format!(
-            "posting truncated: need {POSTING_ENTRY_SIZE} bytes, got {}",
-            data.len()
-        )));
-    }
-    let doc_id = u32::from_le_bytes(read_array(data, 0, "posting: doc_id")?);
-    let field_id = data[4];
-    // Validate the field_id byte — bad data produces a recoverable error.
-    if SearchField::from_discriminant(field_id).is_none() {
-        return Err(SearchError::IndexCorrupted(format!(
-            "posting: invalid field_id {field_id}"
-        )));
-    }
-    Ok(PostingEntry {
-        doc_id,
-        field_id,
-        position: u32::from_le_bytes(read_array(data, 5, "posting: position")?),
-    })
-}
-
 // ============================================================================
 // v4 variable-length posting codec (delta + varint)
 // ============================================================================
@@ -481,11 +432,10 @@ pub(crate) fn decode_varint(data: &[u8], offset: usize) -> crate::Result<(u32, u
 /// v2→v3 owned by #355 Part B.
 ///
 /// Note: the sibling AST index (`crates/rskim-search/src/ast_index/store/`)
-/// deliberately retains the fixed 8-byte `POSTING_ENTRY_SIZE` codec per
-/// AD-LXPOST-1 (the AST posting entry is doc_id(4B)+position(4B) with no
-/// field_id byte; the AST posting list is small and latency-critical; the
-/// lexical posting list is the size driver). This divergence is intentional,
-/// not drift.
+/// deliberately retains its fixed 8-byte posting codec (doc_id 4B + position
+/// 4B, no field_id byte) per AD-LXPOST-1 — the AST posting list is small and
+/// latency-critical while the lexical posting list is the size driver.
+/// This divergence is intentional, not drift.
 ///
 /// # Sorting requirement
 ///
@@ -702,14 +652,6 @@ pub(crate) fn lookup_ngram(
         }
     }
     Ok(None)
-}
-
-/// Compute the CRC32 checksum of `data`.
-///
-/// The checksum in the header covers the entry array and file-metadata bytes
-/// appended together.
-pub(crate) fn compute_checksum(data: &[u8]) -> u32 {
-    crc32fast::hash(data)
 }
 
 /// Compute the BM25 contribution for a single term occurrence.

@@ -17,14 +17,19 @@ use super::format::{
     encode_header, encode_postings_varint, lang_to_id,
 };
 
-/// Worst-case byte width of a single v4 variable-length posting entry.
+/// Capacity-hint upper bound (bytes per posting entry) for the postings buffer
+/// in [`NgramIndexBuilder::serialize_index`].
 ///
 /// A v4 entry is `[varint delta_doc_id][u8 field_id][varint delta_position]`.
 /// The maximum varint width is 5 bytes each (35-bit span for a u32), giving
-/// 5 + 1 + 5 = 11 bytes as the strict upper bound.  We use 9 — the v3
-/// uncompressed entry size — as a conservative but tighter upper bound for
-/// the pre-size capacity hint in [`NgramIndexBuilder::serialize_index`]:
-/// typical small deltas encode in 1–2 bytes, so 9 bytes is already generous.
+/// 5 + 1 + 5 = 11 bytes as the strict upper bound.  We use 9 — the v3 fixed
+/// entry size — as a deliberate over-estimate (~2.5x the measured v4 average of
+/// ~3.5 bytes/entry on a diverse 1000-file corpus) to avoid reallocation during
+/// index build.  The buffer is dropped immediately after `atomic_write` so the
+/// extra RSS is build-time only and does not affect the query hot path.
+///
+/// Framing: this is a peak-memory/zero-realloc trade-off, NOT a "tight upper
+/// bound" — the v4 average is ~3.5 bytes/entry so 9 is ~2.5x over-estimated.
 const VARINT_UPPER_BOUND_PER_ENTRY: usize = 9;
 use super::reader::NgramIndexReader;
 use crate::{
@@ -307,10 +312,11 @@ impl NgramIndexBuilder {
         avg_field_lengths: [f32; FIELD_COUNT],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         // Serialise posting lists using v4 variable-length (delta+varint) codec.
-        // Pre-size conservatively: varint-encoded entries are 3–11 bytes each
-        // (vs 9 bytes fixed).  VARINT_UPPER_BOUND_PER_ENTRY (= 9) is the v3
-        // fixed-entry size used as a tighter upper bound than the strict 11-byte
-        // worst-case, matching the named-constant convention for on-disk sizes.
+        // Pre-size at VARINT_UPPER_BOUND_PER_ENTRY (= 9, the v3 fixed-entry size)
+        // per entry.  This is ~2.5x the measured v4 average of ~3.5 bytes/entry —
+        // a deliberate peak-memory/zero-realloc trade-off (see constant comment
+        // above).  The strict worst-case is 11 bytes/entry; 9 avoids that extra
+        // ~22% while still guaranteeing zero reallocations in practice.
         let estimated_capacity: usize = self
             .postings
             .values()
@@ -351,8 +357,20 @@ impl NgramIndexBuilder {
             entries_buf.extend_from_slice(&encode_entry(e));
         }
 
-        // CRC32 over entries + file metadata.
+        // CRC32 over postings + entries + file metadata (#364: integrity guard).
+        //
+        // v4 posting integrity: the old fixed-stride guard
+        // (is_multiple_of(POSTING_ENTRY_SIZE)) was removed because varint byte
+        // counts are not a multiple of 9.  Folding postings_buf into the CRC
+        // replaces that structural guard with a value-integrity check: a
+        // bit-flip inside a posting blob that would otherwise produce wrong-but-
+        // bounded (doc_id, position) values and silently mis-rank results is now
+        // detected in NgramIndexReader::open before any query can run.
+        //
+        // Ordering: postings first, then entries, then meta — must match the
+        // verification order in NgramIndexReader::open (reader.rs).
         let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&postings_buf);
         hasher.update(&entries_buf);
         hasher.update(&meta_buf);
         let checksum = hasher.finalize();

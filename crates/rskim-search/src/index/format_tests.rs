@@ -223,45 +223,6 @@ fn test_entry_truncated() {
 }
 
 // -----------------------------------------------------------------------
-// Posting roundtrip
-// -----------------------------------------------------------------------
-
-#[test]
-fn test_posting_roundtrip() {
-    let p = PostingEntry {
-        doc_id: 7,
-        field_id: crate::SearchField::FunctionSignature.discriminant(),
-        position: 1024,
-    };
-    let encoded = encode_posting(&p);
-    assert_eq!(encoded.len(), POSTING_ENTRY_SIZE);
-    let decoded = decode_posting(&encoded).unwrap();
-    assert_eq!(decoded, p);
-}
-
-#[test]
-fn test_posting_bad_field_id() {
-    let p = PostingEntry {
-        doc_id: 0,
-        field_id: 200, // invalid
-        position: 0,
-    };
-    let encoded = encode_posting(&p);
-    let result = decode_posting(&encoded);
-    assert!(result.is_err());
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("invalid field_id"), "unexpected error: {err}");
-}
-
-#[test]
-fn test_posting_truncated() {
-    let result = decode_posting(&[0u8; 3]);
-    assert!(result.is_err());
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("truncated"), "unexpected error: {err}");
-}
-
-// -----------------------------------------------------------------------
 // File meta roundtrip
 // -----------------------------------------------------------------------
 
@@ -840,9 +801,29 @@ fn test_posting_codec_large_positions() {
 /// With the fix, `prev_position` is reset to 0 on the field boundary so
 /// `delta_position = 10 - 0 = 10`, which encodes as a 1-byte varint.
 ///
-/// PF-007 compliance: the assertion checks the exact decoded (doc_id, field_id,
-/// position) tuples, not just that decode returns Ok.  A round-trip that silently
-/// wraps-and-recovers would still pass without this exact-value check.
+/// PF-007 compliance (primary + compression guard):
+/// 1. Exact decoded `(doc_id, field_id, position)` tuples are asserted — a
+///    round-trip that silently wraps-and-recovers would still pass otherwise.
+/// 2. Encoded buffer byte-length is asserted against the expected compact size
+///    (7 bytes for this input).  Removing the field-boundary reset from BOTH
+///    encoder and decoder keeps round-trip lossless but regresses the encoded
+///    size from 7 to 11 bytes (5-byte varint for delta 4294967046 instead of
+///    1-byte varint for delta 10), making this test fail the moment the
+///    compression feature is deleted or broken.
+///
+/// Expected encoding (with field-boundary reset):
+///   Entry 0 (doc=0, field=0=TypeDefinition, pos=250):
+///     [0x00]               1 byte  delta_doc_id=0
+///     [0x00]               1 byte  field_id=0
+///     [0xfa, 0x01]         2 bytes varint(250)
+///   Entry 1 (doc=0, field=7=Other, pos=10): prev_position reset to 0
+///     [0x00]               1 byte  delta_doc_id=0
+///     [0x07]               1 byte  field_id=7
+///     [0x0a]               1 byte  varint(10 - 0 = 10)
+///   Total: 7 bytes
+///
+/// Without reset, entry 1's varint(10 - 250 wrapping = 4294967056) = 5 bytes,
+/// giving 11 bytes total — 57% larger.
 #[test]
 fn test_posting_codec_cross_field_position_decrease_roundtrip() {
     // doc_id = 0, field TypeDefinition (discriminant 0), high position (250)
@@ -871,6 +852,20 @@ fn test_posting_codec_cross_field_position_decrease_roundtrip() {
         "test invariant: postings must be sorted ascending by (doc_id, field_id, position)"
     );
 
+    // Assert encoded buffer length (PF-007 compression guard): without the
+    // field-boundary prev_position reset the encoded size is 11 bytes (5-byte
+    // varint for the wrapping delta); with the reset it is 7 bytes.
+    // Removing or disabling the reset must fail this assertion.
+    let mut encoded_buf = Vec::new();
+    encode_postings_varint(&postings, &mut encoded_buf);
+    assert_eq!(
+        encoded_buf.len(),
+        7,
+        "encoded cross-field posting list must be 7 bytes (field-boundary \
+         prev_position reset keeps delta_position=10, 1-byte varint; without \
+         reset it would be 4294967056, 5-byte varint, total 11 bytes)"
+    );
+
     let decoded = posting_roundtrip(&postings);
     assert_eq!(
         decoded.len(),
@@ -878,13 +873,11 @@ fn test_posting_codec_cross_field_position_decrease_roundtrip() {
         "cross-field position-decrease must round-trip to 2 entries"
     );
     assert_eq!(
-        decoded[0],
-        postings[0],
+        decoded[0], postings[0],
         "first entry (TypeDefinition, pos=250) must decode exactly"
     );
     assert_eq!(
-        decoded[1],
-        postings[1],
+        decoded[1], postings[1],
         "second entry (Other, pos=10) must decode exactly after cross-field reset"
     );
 }

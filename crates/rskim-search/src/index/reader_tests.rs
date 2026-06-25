@@ -58,6 +58,53 @@ fn test_open_corrupt_index_fails() {
     }
 }
 
+/// #364 / Findings 1+4: a bit-flip in .skpost is detected at open() time via
+/// the CRC32 checksum that now covers postings + entries + metadata.
+///
+/// Build a real index (ensures the on-disk files have a valid header+checksum),
+/// flip one byte in index.skpost, then assert that NgramIndexReader::open
+/// returns Err with "checksum mismatch" (Design Constraint: "fail loud").
+///
+/// PF-007 compliance: the assertion checks the DISCRIMINATING error substring
+/// "checksum mismatch" so the test fails the moment the corruption-detection
+/// path is removed or the error message changes semantically.
+#[test]
+fn test_open_corrupt_skpost_detected() {
+    let dir = tmp_dir();
+    // Build a minimal real index so the CRC is computed over actual data.
+    {
+        let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+        builder
+            .add_file(
+                FileId(0),
+                "fn foo() { let x = 1; }",
+                rskim_core::Language::Rust,
+            )
+            .unwrap();
+        builder.build().unwrap();
+    }
+
+    // Flip the first byte of index.skpost to simulate a storage bit-flip.
+    let post_path = dir.path().join("index.skpost");
+    let mut data = std::fs::read(&post_path).unwrap();
+    assert!(!data.is_empty(), "skpost must be non-empty for this test");
+    data[0] ^= 0xFF;
+    std::fs::write(&post_path, &data).unwrap();
+
+    // open() must detect the corruption via CRC and fail loud.
+    let result = NgramIndexReader::open(dir.path());
+    assert!(
+        result.is_err(),
+        "corrupted .skpost must cause open() to fail"
+    );
+    // Use .err().unwrap() to extract the error without requiring T: Debug.
+    let err_str = format!("{}", result.err().unwrap());
+    assert!(
+        err_str.contains("checksum mismatch"),
+        "error must contain 'checksum mismatch' to confirm CRC detected the corruption: {err_str}"
+    );
+}
+
 // -----------------------------------------------------------------------
 // stats
 // -----------------------------------------------------------------------
@@ -850,7 +897,8 @@ fn test_1000_file_benchmark() {
 /// ast_index/store/reader_tests.rs:574-666) and issue #273.
 ///
 /// Measured lexical baseline (trigram, v4 delta+varint, 1000 diverse Rust
-/// modules, 4 fns each ~480 bytes, multi-field classified path): 3.53x.
+/// modules, 4 fns each ~1055 bytes (~1.05 MB total source), multi-field
+/// classified path): 3.53x.
 /// v3 uncompressed baseline was 9.04x; delta+varint compression (#358 Item 2)
 /// reduced postings ~61%.
 /// Guard ceiling: measured_baseline + 1.5x headroom = 5.0x (round number).
@@ -1262,6 +1310,9 @@ fn test_ac6_result_set_non_regression_v4_codec() {
          This guards against the #355 bigram-noise regression (#174). \
          Results: {:?}",
         gibberish_results.len(),
-        gibberish_results.iter().map(|r| r.file_id.0).collect::<Vec<_>>()
+        gibberish_results
+            .iter()
+            .map(|r| r.file_id.0)
+            .collect::<Vec<_>>()
     );
 }

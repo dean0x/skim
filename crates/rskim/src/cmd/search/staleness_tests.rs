@@ -56,14 +56,21 @@ fn write_ast_index_stub(cache_dir: &std::path::Path) {
 /// Write a minimal valid lexical index stub file in `cache_dir`.
 ///
 /// `lexical_index_version` reads the first 6 bytes: magic `SKIX` + version u16 LE.
-/// Writing the current FORMAT_VERSION (v4, #358 Item 2) prevents the lexical
-/// self-heal from reporting `NoStoredHead` in unit tests that only want to
-/// exercise the HEAD-comparison or AST-self-heal logic paths
+/// Writing the current FORMAT_VERSION prevents the lexical self-heal from
+/// reporting `NoStoredHead` in unit tests that only want to exercise the
+/// HEAD-comparison or AST-self-heal logic paths
 /// (Finding 9, ADR-006, #355 cycle-2, #358 Item 2).
+///
+/// The version bytes are derived from `rskim_search::LEXICAL_INDEX_FORMAT_VERSION`
+/// so this stub automatically tracks future FORMAT_VERSION bumps without requiring
+/// a manual edit (Finding 8 / #358 cycle-3: hardcoded literal bytes are a
+/// maintenance trap that silently exercises the self-heal path on the next bump).
 fn write_lexical_index_stub(cache_dir: &std::path::Path) {
-    // b"SKIX" = magic (4 bytes), 0x04 0x00 = version 4 in little-endian.
-    // Update this byte pair whenever FORMAT_VERSION increments (#358 Item 2 bumped v3→v4).
-    fs::write(cache_dir.join("index.skidx"), b"SKIX\x04\x00").unwrap();
+    let version_bytes = rskim_search::LEXICAL_INDEX_FORMAT_VERSION.to_le_bytes();
+    let mut stub = Vec::with_capacity(6);
+    stub.extend_from_slice(b"SKIX");
+    stub.extend_from_slice(&version_bytes);
+    fs::write(cache_dir.join("index.skidx"), &stub).unwrap();
 }
 
 /// Write a manifest with the given git_head into `cache_dir`.

@@ -69,14 +69,23 @@ const _: () = assert!(
 /// Current on-disk format version for the lexical n-gram index (`index.skidx` / `index.skpost`).
 ///
 /// Derives from `index::LEXICAL_FORMAT_VERSION` — the single source of truth.
-/// Used by `check_staleness` in the CLI to detect a v2→v3 format mismatch and
-/// trigger an automatic rebuild before `NgramIndexReader::open` hard-errors.
+/// Used by `check_staleness` in the CLI to detect a below-current format-version
+/// mismatch and trigger an automatic rebuild before `NgramIndexReader::open`
+/// hard-errors.
 ///
 /// v2 → v3 (#355 Part B): n-gram key widened from u16 (bigram) to u32 (trigram).
 /// A v2 index encounters a format version mismatch and `decode_header` emits an
 /// actionable "please rebuild the index" error (`skim search index --rebuild`).
-/// With this constant exported, `check_staleness` can detect the mismatch first
-/// and self-heal automatically on the next query (ADR-006, Finding 9 / #355).
+///
+/// v3 → v4 (#358 Item 2): posting codec changed from fixed 9-byte entries to
+/// variable-length delta+varint encoding (see `encode_postings_varint`). Old v3
+/// indexes self-heal via staleness detection: `check_staleness` compares the
+/// stored version against this constant and triggers a full rebuild when it is
+/// below the current value (ADR-006).
+///
+/// With this constant exported, `check_staleness` (staleness.rs) can detect the
+/// mismatch first and self-heal automatically on the next query (ADR-006,
+/// Finding 9 / #355 and #358).
 pub const LEXICAL_INDEX_FORMAT_VERSION: u16 = index::LEXICAL_FORMAT_VERSION;
 
 pub use cochange::{COUPLING_MAX_FILES, CochangeMatrixBuilder, CochangeMatrixReader};

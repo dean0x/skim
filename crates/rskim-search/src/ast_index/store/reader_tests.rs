@@ -549,7 +549,7 @@ fn gen_representative_rust_module(file_idx: usize, n_fns: usize) -> String {
 #[test]
 fn ast_index_size_ratio() {
     // Build an index from 1000 representative Rust modules (4 functions each,
-    // ~480 bytes/file → ~480 KB total source).  Each function has a real
+    // ~1055 bytes/file → ~1.05 MB total source).  Each function has a real
     // multi-statement body so the corpus is representative of real-world Rust.
     //
     // WHY THE ORIGINAL <5% (0.05×) BOUND WAS WRONG
