@@ -442,7 +442,7 @@ pub(crate) fn compute_checksum(data: &[u8]) -> u32 {
 /// Compute the BM25 contribution for a single term occurrence.
 ///
 /// `tf` — observed term frequency in this document.
-/// `idf` — inverse document frequency weight from the bigram table.
+/// `idf` — inverse document frequency weight from the trigram table.
 /// `doc_len` — byte length of the document.
 /// `avg_doc_len` — average byte length across the corpus.
 ///
