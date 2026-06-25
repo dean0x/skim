@@ -1775,8 +1775,14 @@ fn text_ast_intersection_complete_below_pool_cliff_356() {
     // -- AC1 (exact-set completeness): full qualifying set at --limit 50 ----------
     // At any large limit the fix and the old code both return target.rs; we use
     // this as the reference set.
-    let full_config =
-        make_query_config(project.path(), cache.path(), "nested", 50, Some(ast_scored.clone()), None);
+    let full_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        50,
+        Some(ast_scored.clone()),
+        None,
+    );
     let full_output = execute_query(&full_config, &TEST_ANALYTICS).unwrap();
 
     assert_eq!(
@@ -1801,8 +1807,14 @@ fn text_ast_intersection_complete_below_pool_cliff_356() {
     //
     // Post-fix (AD-356-1/2): file_filter = {target.rs FileId}, sq.limit = 1.
     // Reader scores only target.rs → it is returned.  count = 1, PASSES.
-    let limit1_config =
-        make_query_config(project.path(), cache.path(), "nested", 1, Some(ast_scored.clone()), None);
+    let limit1_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        1,
+        Some(ast_scored.clone()),
+        None,
+    );
     let limit1_output = execute_query(&limit1_config, &TEST_ANALYTICS).unwrap();
 
     // PRIMARY DISCRIMINATING ASSERTION (PF-007):
@@ -1934,8 +1946,14 @@ fn text_ast_ad356_2_limit_guard_25_files() {
     // N=25 > 20 → only 20 returned → assert_eq FAILS (RED confirms AD-356-2 gap).
     //
     // Post-fix (sq.limit = Some(25)): reader scores all 25 → returns 25 → PASSES.
-    let full_config =
-        make_query_config(project.path(), cache.path(), "nested", N, Some(ast_scored.clone()), None);
+    let full_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        N,
+        Some(ast_scored.clone()),
+        None,
+    );
     let full_output = execute_query(&full_config, &TEST_ANALYTICS).unwrap();
 
     assert_eq!(
@@ -1957,8 +1975,14 @@ fn text_ast_ad356_2_limit_guard_25_files() {
     }
 
     // -- AC13 (set property): intermediate --limit returns a proper subset ----------
-    let mid_config =
-        make_query_config(project.path(), cache.path(), "nested", 10, Some(ast_scored.clone()), None);
+    let mid_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        10,
+        Some(ast_scored.clone()),
+        None,
+    );
     let mid_output = execute_query(&mid_config, &TEST_ANALYTICS).unwrap();
 
     assert_eq!(
@@ -1984,8 +2008,14 @@ fn text_ast_ad356_2_limit_guard_25_files() {
     }
 
     // -- AC13 continued: --limit 1 returns exactly 1 qualifying file ---------------
-    let limit1_config =
-        make_query_config(project.path(), cache.path(), "nested", 1, Some(ast_scored), None);
+    let limit1_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        1,
+        Some(ast_scored),
+        None,
+    );
     let limit1_output = execute_query(&limit1_config, &TEST_ANALYTICS).unwrap();
 
     assert_eq!(
@@ -2036,8 +2066,14 @@ fn text_ast_empty_ast_set_returns_empty_ac12() {
     // Pass an explicitly empty AST scored vector — simulates a pattern that
     // matches no files (e.g. `skim search "foo" --ast <pattern-that-matches-nothing>`).
     // empty ast_scored vec is the key input for AC12.
-    let config =
-        make_query_config(project.path(), cache.path(), "nested", 10, Some(vec![]), None);
+    let config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        10,
+        Some(vec![]),
+        None,
+    );
 
     // Must not panic, must not error, must return empty results (exit 0 semantics).
     let output = execute_query(&config, &TEST_ANALYTICS)
