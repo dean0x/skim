@@ -1273,10 +1273,10 @@ mod tests {
     /// Coverage note: this test guards the content of the production constant and
     /// verifies that run() exits 0 on a non-git dir with --json --hot (the exit-0
     /// contract of the degradation path).  The JSON emission path — that production
-    /// stdout actually contains `{warning: NO_TEMPORAL_DATA_MSG}` — requires
+    /// stdout actually contains `{"warning": NO_TEMPORAL_DATA_MSG}` — requires
     /// subprocess spawning to capture stdout; that level of coverage is provided
-    /// by `test_bug_b_hot_self_heals_stale_temporal_db`, which asserts discriminating
-    /// CLI observables for the self-healed DB path (#357 cycle-2 finding 5).
+    /// by `test_hot_json_warning_content_on_non_git_dir` below, which spawns the
+    /// binary and asserts the parsed `warning` field equals the production constant.
     #[test]
     fn test_no_temporal_data_message_references_auto_refresh() {
         // Assert against the production constant — NOT a local string literal.
@@ -1944,6 +1944,90 @@ mod tests {
             !stderr.contains(NO_TEMPORAL_DATA_MSG),
             "--hot must NOT emit the 'no temporal data' message after self-heal \
              (BUG B BLOCKER); got stderr={stderr:?}"
+        );
+    }
+
+    /// BUG A BLOCKER — CLI-level discriminating test for `--rebuild` temporal population.
+    ///
+    /// Spawns the binary as a subprocess to drive the full CLI path, then spawns
+    /// it again for `--hot`.  Asserts the TWO discriminating CLI observables (PF-007):
+    ///   (a) at least one ranked hotspot row is present on stdout (temporal data populated),
+    ///   (b) the 'no temporal data' degradation message is ABSENT from stderr
+    ///       (--rebuild populated temporal.db; --hot rendered from it).
+    ///
+    /// The unit-level `test_rebuild_populates_temporal_db` proves temporal.db was
+    /// written; this test proves the CLI `--hot` command actually USES that DB to
+    /// render ranked rows instead of emitting the degradation message (#357 BUG A).
+    #[test]
+    fn test_rebuild_then_hot_renders_ranked_rows_not_degradation() {
+        let bin = std::env::var("CARGO_BIN_EXE_skim").unwrap_or_else(|_| {
+            let mut p = std::env::current_exe().unwrap();
+            p.pop(); // deps/
+            p.pop(); // debug/ or release/
+            p.push("skim");
+            p.to_string_lossy().to_string()
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let root_str = root.to_string_lossy().to_string();
+
+        // Build a git repo with enough commits that --hot has hotspot data to render.
+        create_real_git_repo(
+            root,
+            &[
+                ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
+                ("feat: add parser", &[("src/parser.rs", "fn parse() {}")]),
+                (
+                    "fix: fix auth",
+                    &[("src/auth.rs", "fn authenticate() { // fixed }")],
+                ),
+            ],
+        );
+
+        // Phase 1: build the index via `--rebuild` (this is the BUG A path).
+        // Pre-fix: --rebuild did NOT populate temporal.db.
+        // Post-fix: --rebuild calls try_rebuild_temporal_nonfatal (AD-TMP-1).
+        let rebuild_out = std::process::Command::new(&bin)
+            .args(["search", "--rebuild", "--root", &root_str])
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn {bin} for --rebuild: {e}"));
+        assert!(
+            rebuild_out.status.success(),
+            "--rebuild must exit 0; got {:?}; stderr={}",
+            rebuild_out.status,
+            String::from_utf8_lossy(&rebuild_out.stderr)
+        );
+
+        // Phase 2: run `--hot` as a subprocess — temporal.db was populated by --rebuild.
+        let output = std::process::Command::new(&bin)
+            .args(["search", "--hot", "--root", &root_str, "--limit", "5"])
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn {bin} for --hot: {e}"));
+
+        assert!(
+            output.status.success(),
+            "--hot after --rebuild must exit 0; got {:?}",
+            output.status
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // (a) At least one ranked row must appear on stdout (temporal data was populated).
+        assert!(
+            !stdout.trim().is_empty(),
+            "--hot must print ranked rows to stdout after --rebuild (BUG A BLOCKER, \
+             AD-TMP-1); got empty stdout. stderr={stderr:?}"
+        );
+
+        // (b) The degradation message must NOT appear on stderr.
+        assert!(
+            !stderr.contains(NO_TEMPORAL_DATA_MSG),
+            "--hot must NOT emit the 'no temporal data' message when --rebuild already \
+             populated temporal.db (BUG A BLOCKER); got stderr={stderr:?}"
         );
     }
 }
