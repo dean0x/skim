@@ -96,6 +96,53 @@ fn test_index_writes_manifest_sidecar() {
 }
 
 // ============================================================================
+// AC7 (#358) -- non-git tempdir: CLI run() succeeds and produces artifacts
+// ============================================================================
+
+/// AC7: `skim search index` on a plain non-git tempdir (no `.git`) must
+/// return ExitCode::SUCCESS and write both `index.skidx` and `index.skpost`
+/// into the cache directory.
+///
+/// This tests `index.rs::run()` -- the CLI entry point -- not just the lower-
+/// level `auto_refresh_if_stale` or `build_index` API. The staleness_tests.rs
+/// exercises the non-git path at the API level; this test covers the CLI-entry
+/// path end-to-end with artifact-existence assertions (AC7 plan spec).
+///
+/// Discriminating observable (PF-007): two assertions on concrete artifacts,
+/// not just exit-code. A pass without these assertions would be vacuous.
+#[test]
+fn test_ac7_non_git_tempdir_index_run_produces_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Deliberately NO .git directory -- exercises the non-git fallback path.
+    fs::write(root.join("main.rs"), "fn main() { println!(\"hello\"); }\n").unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+
+    let result = run(&index_args(root, cache.path()), &TEST_ANALYTICS)
+        .expect("run() on non-git dir must not return Err");
+
+    // AC7 (1/3): exit code must be SUCCESS -- no git requirement.
+    assert_eq!(
+        result,
+        ExitCode::SUCCESS,
+        "AC7: skim search index on a non-git tempdir must exit 0 (no git requirement)"
+    );
+
+    // AC7 (2/3): index.skidx must exist -- the n-gram vocabulary + file meta.
+    assert!(
+        find_file_with_ext(cache.path(), "skidx"),
+        "AC7: index.skidx must exist after indexing a non-git directory"
+    );
+
+    // AC7 (3/3): index.skpost must exist -- the posting lists.
+    assert!(
+        find_file_with_ext(cache.path(), "skpost"),
+        "AC7: index.skpost must exist after indexing a non-git directory"
+    );
+}
+
+// ============================================================================
 // Empty directory
 // ============================================================================
 
