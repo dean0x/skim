@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rskim_search::{
     COUPLING_MAX_FILES, CochangeRow, DEFAULT_HALF_LIFE_DAYS, GixSource, HistoryResult, HotspotRow,
-    MIN_COCHANGE_JACCARD, RiskRow, TemporalDb, TemporalSource,
+    MIN_COCHANGE_JACCARD, RiskRow, TemporalDb,
 };
 
 // ============================================================================
@@ -312,8 +312,21 @@ pub(super) fn rebuild_temporal(
     head: &str,
     now_epoch: u64,
 ) -> anyhow::Result<()> {
-    let src = GixSource;
+    rebuild_temporal_with_source(&GixSource, root, cache_dir, head, now_epoch)
+}
 
+/// Inner implementation of `rebuild_temporal` with an injectable `TemporalSource`.
+///
+/// Separated from `rebuild_temporal` so tests can supply a counting or fake
+/// source (ADR-003 PERFORMANCE criterion: assert parse_history call-count == 1).
+/// Production always uses `GixSource` via `rebuild_temporal`.
+pub(super) fn rebuild_temporal_with_source(
+    src: &dyn rskim_search::TemporalSource,
+    root: &Path,
+    cache_dir: &Path,
+    head: &str,
+    now_epoch: u64,
+) -> anyhow::Result<()> {
     // ── Single full-history walk ──────────────────────────────────────────────
     // One parse_history call supplies all data. The 30d/90d windowing for
     // changes_30d/changes_90d is done inside compute_file_temporal_stats via
@@ -326,7 +339,34 @@ pub(super) fn rebuild_temporal(
     };
 
     if risk_history.commits.is_empty() {
-        warn_skip!("no commits in history");
+        // Empty-history repo (git init, no commits yet).
+        //
+        // LOCKED DECISION (2026-06-24, plan lines 14/146/349): write a
+        // present-but-empty temporal.db with META_GIT_HEAD so that subsequent
+        // queries see the repo as Current and skip rebuild — preventing the
+        // per-query no-op loop that would otherwise occur because
+        // temporal_db_is_stale returns true whenever temporal.db is absent.
+        // Non-fatal by ADR-006/D5: acquire lock and sync with empty row sets.
+        let _lock = super::build_lock::acquire("skim search", cache_dir)?;
+        let db_path = cache_dir.join("temporal.db");
+        let db = match TemporalDb::open(&db_path) {
+            Ok(d) => d,
+            Err(e) => warn_skip!("failed to open temporal.db (empty-repo): {}", e),
+        };
+        match db.sync(&[], &[], &[], head) {
+            Ok(()) => {
+                if crate::debug::is_debug_enabled() {
+                    eprintln!(
+                        "skim search [debug]: temporal.db initialized with empty rows (no commits), HEAD={}…",
+                        head.get(..8).unwrap_or(head),
+                    );
+                }
+            }
+            Err(e) => {
+                warn_skip!("sync failed (empty-repo): {}", e);
+            }
+        }
+        return Ok(());
     }
 
     // ── Score computation (pure, no I/O) ─────────────────────────────────────
