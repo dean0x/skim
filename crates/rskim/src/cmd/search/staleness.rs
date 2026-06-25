@@ -282,6 +282,57 @@ pub(super) fn check_staleness(
 }
 
 // ============================================================================
+// Temporal staleness helper
+// ============================================================================
+
+/// Return `true` when `temporal.db` is missing or its stored `META_GIT_HEAD`
+/// does not match `current_head`.
+///
+/// Uses the same pure file-IO [`read_git_head`] approach as the rest of this
+/// module — no subprocess, no `git rev-parse`.
+///
+/// # AD-TMP-2 / AD-TMP-3
+///
+/// AD-TMP-2: temporal.db staleness is INDEPENDENT of lexical staleness (#357
+/// BUG B). The lexical-Current early-return in `auto_refresh_if_stale` (below)
+/// skipped the temporal hook, so a missing or HEAD-divergent temporal.db stayed
+/// stale forever while the lexical index was current (post-upgrade, manual
+/// delete, or 2nd+ query after a temporal-less rebuild due to BUG A). This
+/// helper checks temporal.db's stored META_GIT_HEAD against the `current_head`
+/// already read at function entry in `auto_refresh_if_stale`. Self-heals the
+/// stuck-stale (deadbeef) case. Non-fatal by ADR-006/D5.
+///
+/// AD-TMP-3: production temporal staleness uses file-IO HEAD comparison here,
+/// not `check_temporal_staleness` from `temporal.rs` — that helper is
+/// `#[cfg(test)]`-only and uses a `git rev-parse` subprocess, which is
+/// inconsistent with this module's subprocess-free design. The `current_head`
+/// parameter is the single HEAD read already performed at `auto_refresh_if_stale`
+/// entry; passing it here avoids a second HEAD read and keeps one HEAD-reading
+/// authority per call.
+///
+/// Returns `true` for `current_head = None` (non-git) — the caller handles the
+/// None case before calling `rebuild_temporal` so this effectively degrades to
+/// a no-op on non-git dirs via the caller's `if let Some(ref head)` guard.
+pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: Option<&str>) -> bool {
+    let db_path = cache_dir.join("temporal.db");
+    if !db_path.exists() {
+        return true;
+    }
+    // Compare temporal.db's stored META_GIT_HEAD against current_head.
+    let stored_head = rskim_search::TemporalDb::open(&db_path)
+        .ok()
+        .and_then(|db| db.get_meta(rskim_search::META_GIT_HEAD).ok().flatten());
+    match (stored_head.as_deref(), current_head) {
+        (Some(stored), Some(current)) => stored != current,
+        // temporal.db exists but has no META_GIT_HEAD → stale.
+        (None, _) => true,
+        // current_head is None (non-git): treat as stale so caller's
+        // `if let Some(ref head)` guard fires and no-ops via rebuild_temporal.
+        (_, None) => true,
+    }
+}
+
+// ============================================================================
 // Auto-refresh
 // ============================================================================
 
@@ -326,6 +377,23 @@ pub(super) fn auto_refresh_if_stale(
             // Defensive fallback: should not happen (Current implies manifest loaded).
             FileManifest::new(root.to_path_buf(), cache_dir.to_path_buf())
         });
+
+        // AD-TMP-2: temporal.db has its own staleness gate, independent of
+        // lexical staleness (#357 BUG B). The lexical index is current, but
+        // temporal.db may be missing or HEAD-divergent (post-upgrade, manual
+        // delete, or 2nd+ query after a --rebuild that predated this fix).
+        // Check and self-heal here BEFORE the early return, so that a bare
+        // `skim search --hot` (routed via auto_refresh_if_stale) always has
+        // fresh temporal data when the lexical index is current.
+        // Non-fatal by ADR-006/D5: temporal failure must NOT fail the query.
+        if temporal_db_is_stale(cache_dir, current_head.as_deref())
+            && let Some(ref head) = current_head
+            && let Err(e) = rebuild_temporal(root, cache_dir, head, current_epoch_secs())
+            && crate::debug::is_debug_enabled()
+        {
+            eprintln!("skim search [debug]: temporal self-heal error (non-fatal): {e}");
+        }
+
         return Ok((false, manifest));
     }
 

@@ -167,6 +167,7 @@ pub(crate) fn run(
                 &flags.root_override,
                 flags.temporal_sort,
                 flags.blast_radius.as_deref(),
+                analytics,
             )
         }
         SearchAction::Query(_) => {
@@ -464,10 +465,10 @@ fn run_build(
     let (root, cache_dir) = resolve_root_and_cache(root_override)?;
     std::fs::create_dir_all(&cache_dir)?;
     let config = types::IndexConfig {
-        root,
+        root: root.clone(),
         max_files: None,
         force,
-        cache_dir_override: Some(cache_dir),
+        cache_dir_override: Some(cache_dir.clone()),
     };
     let result = index::build_index(&config)?;
     eprintln!(
@@ -477,6 +478,30 @@ fn run_build(
         result.cache_hits,
         result.duration.as_secs_f64(),
     );
+
+    // AD-TMP-1: --rebuild/--build must produce a COMPLETE index (lexical + AST +
+    // temporal), matching user expectation that "rebuild" rebuilds everything (#357 BUG A).
+    // run_build goes through build_index directly, bypassing auto_refresh_if_stale where
+    // the only other temporal hook lives, so temporal must be populated here too.
+    // Non-fatal by ADR-006/D5: a temporal failure must NOT fail the explicit build.
+    // HEAD read via the pure file-IO read_git_head (no subprocess); None on non-git →
+    // rebuild_temporal no-ops gracefully. The `force` flag is intentionally NOT forwarded:
+    // rebuild_temporal always does a full history walk (no cache) — see temporal_build.rs:283.
+    let current_head = staleness::read_git_head(&root);
+    if let Some(ref head) = current_head
+        && let Err(e) = temporal_build::rebuild_temporal(
+            &root,
+            &cache_dir,
+            head,
+            temporal_build::current_epoch_secs(),
+        )
+    {
+        // Ignore temporal errors — they must not fail the lexical/AST build (ADR-006/D5).
+        if crate::debug::is_debug_enabled() {
+            eprintln!("skim search [debug]: temporal rebuild error (non-fatal): {e}");
+        }
+    }
+
     Ok(ExitCode::SUCCESS)
 }
 
@@ -714,18 +739,39 @@ struct WarningJson<'a> {
 
 /// Execute a standalone temporal query (no text search term provided).
 ///
-/// Opens the temporal DB from the resolved cache directory, checks for
-/// staleness, dispatches the query (hotspot, cold, risky, or blast-radius),
-/// and writes the result as JSON or plain text to stdout. Degrades gracefully
-/// when the temporal DB is absent — prints a warning and returns exit 0.
+/// Opens the temporal DB from the resolved cache directory, ensures it is
+/// fresh via `auto_refresh_if_stale` (mirrors the `--ast` arm at mod.rs:108-109
+/// per the locked decision 2026-06-24, resolving the BLOCKER for #357),
+/// dispatches the query (hotspot, cold, risky, or blast-radius), and writes
+/// the result as JSON or plain text to stdout. Degrades gracefully when the
+/// temporal DB is absent after self-heal — prints a warning and returns exit 0.
+///
+/// # False comment reconciled (mod.rs:737-740 in the old code)
+///
+/// The prior comment claimed "auto_refresh_if_stale guarantees freshness here"
+/// but the function NEVER called auto_refresh_if_stale, so temporal.db was
+/// never self-healed on the standalone --hot/--cold/--risky path.
+/// The call below fixes that gap (#357 BLOCKER).
 fn run_temporal_standalone(
     limit: usize,
     json: bool,
     root_override: &Option<PathBuf>,
     temporal_sort: Option<types::TemporalSort>,
     blast_radius: Option<&str>,
+    analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
     let (root, cache_dir) = resolve_root_and_cache(root_override)?;
+    std::fs::create_dir_all(&cache_dir)?;
+
+    // Self-heal: ensure the lexical+AST+temporal index is fresh before querying.
+    // This mirrors the --ast standalone arm at mod.rs:108-109 and is the fix
+    // for the BLOCKER in #357 — bare --hot/--cold/--risky/--blast-radius never
+    // called auto_refresh_if_stale, so temporal.db was never self-healed on
+    // these paths even though the false comment above claimed it was guaranteed.
+    // ADR-006/D5: auto_refresh_if_stale propagates lexical errors as Err but
+    // swallows temporal errors internally — callers only see lexical failures.
+    staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+
     let temporal_db_path = cache_dir.join("temporal.db");
 
     let Some(db) = temporal::open_temporal_db(&temporal_db_path) else {
@@ -741,11 +787,6 @@ fn run_temporal_standalone(
         }
         return Ok(ExitCode::SUCCESS);
     };
-
-    // Note: check_temporal_staleness is intentionally NOT called here (Decision
-    // O-B). auto_refresh_if_stale guarantees freshness on the happy path; the
-    // staleness warning would only fire on graceful-degradation paths where
-    // rebuild_temporal already no-ops. See run_query comment for full rationale.
 
     let output = temporal::query_standalone(temporal_sort, blast_radius, limit, &db, &root)?;
 
@@ -1328,6 +1369,425 @@ mod tests {
             "second line must be the 'Score' column header (no blank line after header), \
              got: {:?}",
             lines.get(1)
+        );
+    }
+
+    // ============================================================================
+    // #357 BUG A — run_build (--rebuild / --build) must populate temporal.db
+    // ============================================================================
+
+    /// Helper: create a real git repo and return the HEAD SHA.
+    fn make_git_repo_with_commits(
+        dir: &std::path::Path,
+        commit_specs: &[(&str, &[(&str, &str)])],
+    ) -> String {
+        use std::fs;
+        use std::process::Command;
+
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .expect("git init");
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir)
+            .output()
+            .expect("git config email");
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir)
+            .output()
+            .expect("git config name");
+
+        for (msg, files) in commit_specs {
+            for (name, content) in *files {
+                let path = dir.join(name);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).expect("create dir");
+                }
+                fs::write(&path, content).expect("write file");
+                Command::new("git")
+                    .args(["add", name])
+                    .current_dir(dir)
+                    .output()
+                    .expect("git add");
+            }
+            Command::new("git")
+                .args(["commit", "-m", msg])
+                .current_dir(dir)
+                .output()
+                .expect("git commit");
+        }
+
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .expect("git rev-parse HEAD");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// BUG A discriminating test: after `skim search --rebuild` on a git repo with
+    /// ≥2 commits, temporal.db MUST exist, contain non-empty hotspots, and
+    /// META_GIT_HEAD MUST equal the repo HEAD.
+    ///
+    /// PF-007: exit-0 alone is vacuous — this asserts the DISCRIMINATING observables
+    /// (non-empty hotspots + exact HEAD match) so the test fails the moment BUG A
+    /// returns (i.e. if the temporal hook were removed from run_build).
+    #[test]
+    fn test_rebuild_populates_temporal_db() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        let head = make_git_repo_with_commits(
+            root,
+            &[
+                ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
+                ("feat: add parser", &[("src/parser.rs", "fn parse() {}")]),
+                (
+                    "fix: fix auth bug",
+                    &[("src/auth.rs", "fn authenticate() { // fixed }")],
+                ),
+            ],
+        );
+        assert_eq!(head.len(), 40, "HEAD must be a 40-char SHA");
+
+        let root_str = root.to_string_lossy().to_string();
+        let result = run(
+            &["--rebuild".to_string(), "--root".to_string(), root_str],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(result, ExitCode::SUCCESS, "--rebuild must exit 0");
+
+        // Locate the cache dir (resolves to <root>/.skim/search/).
+        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
+        let temporal_db_path = cache_dir.join("temporal.db");
+
+        // Discriminating: temporal.db must exist.
+        assert!(
+            temporal_db_path.exists(),
+            "temporal.db must exist after --rebuild on a git repo (#357 BUG A)"
+        );
+
+        let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
+
+        // Discriminating: META_GIT_HEAD must equal the repo HEAD (exact match).
+        let stored_head = db
+            .get_meta(rskim_search::META_GIT_HEAD)
+            .unwrap()
+            .expect("META_GIT_HEAD must be set in temporal.db after --rebuild");
+        assert_eq!(
+            stored_head, head,
+            "META_GIT_HEAD in temporal.db must match the repo HEAD after --rebuild (#357 BUG A)"
+        );
+
+        // Discriminating: hotspots must be non-empty (data was actually indexed).
+        let hotspots = db.top_hotspots(20).unwrap();
+        assert!(
+            !hotspots.is_empty(),
+            "temporal.db must contain non-empty hotspot data after --rebuild (#357 BUG A)"
+        );
+    }
+
+    /// BUG A parity: `--build` (force=false) must populate temporal.db identically
+    /// to `--rebuild` (force=true) on a fresh git repo with no prior index.
+    ///
+    /// PF-007: asserts META_GIT_HEAD equality between --build and --rebuild runs
+    /// (both must have temporal data; comparing both to the same repo HEAD).
+    #[test]
+    fn test_build_populates_temporal_db_same_as_rebuild() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        let head = make_git_repo_with_commits(
+            root,
+            &[
+                ("feat: first", &[("lib.rs", "pub fn foo() {}")]),
+                ("feat: second", &[("main.rs", "fn main() {}")]),
+            ],
+        );
+        assert_eq!(head.len(), 40, "HEAD must be a 40-char SHA");
+
+        let root_str = root.to_string_lossy().to_string();
+        let result = run(
+            &["--build".to_string(), "--root".to_string(), root_str],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(result, ExitCode::SUCCESS, "--build must exit 0");
+
+        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
+        let temporal_db_path = cache_dir.join("temporal.db");
+
+        assert!(
+            temporal_db_path.exists(),
+            "temporal.db must exist after --build on a git repo (#357 BUG A parity)"
+        );
+
+        let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
+        let stored_head = db
+            .get_meta(rskim_search::META_GIT_HEAD)
+            .unwrap()
+            .expect("META_GIT_HEAD must be set in temporal.db after --build");
+        assert_eq!(
+            stored_head, head,
+            "META_GIT_HEAD in temporal.db must match the repo HEAD after --build (#357 BUG A)"
+        );
+
+        let hotspots = db.top_hotspots(20).unwrap();
+        assert!(
+            !hotspots.is_empty(),
+            "temporal.db must contain non-empty hotspot data after --build (#357 BUG A parity)"
+        );
+    }
+
+    /// BUG A NEGATIVE: `--rebuild` on a non-git directory must succeed (exit 0),
+    /// must NOT create temporal.db (no git history to index), and must create the
+    /// lexical index (build still succeeds for lexical+AST).
+    ///
+    /// PF-007 discriminating: assert SUCCESS && !temporal.db.exists() && index.skidx exists.
+    #[test]
+    fn test_rebuild_non_git_dir_succeeds_no_temporal_db() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        // Write at least one indexable file so build_index has something to do.
+        std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+
+        let root_str = root.to_string_lossy().to_string();
+        let result = run(
+            &["--rebuild".to_string(), "--root".to_string(), root_str],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "--rebuild on non-git dir must exit 0 (non-fatal temporal, ADR-006/D5)"
+        );
+
+        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
+
+        // Discriminating: no temporal.db (no git history).
+        let temporal_db_path = cache_dir.join("temporal.db");
+        assert!(
+            !temporal_db_path.exists(),
+            "temporal.db must NOT be created on a non-git dir (no history to walk)"
+        );
+
+        // Discriminating: lexical index must still exist (build succeeded for lexical).
+        let index_path = cache_dir.join("index.skidx");
+        assert!(
+            index_path.exists(),
+            "index.skidx must exist after --rebuild even when temporal fails on non-git dir"
+        );
+    }
+
+    // ============================================================================
+    // #357 BUG B — temporal.db self-heals when lexical is Current but temporal stale
+    // ============================================================================
+
+    /// BUG B discriminating: when the lexical index is Current but temporal.db is
+    /// deleted, a subsequent auto_refresh-routed query recreates temporal.db with
+    /// META_GIT_HEAD == current HEAD and non-empty hotspots.
+    ///
+    /// Drive via `run()` with a text query (routes through auto_refresh_if_stale),
+    /// not staleness::auto_refresh_if_stale directly — ensures the full dispatch
+    /// path self-heals (PF-007: assert recreation + exact HEAD match).
+    ///
+    /// This test FAILS on the pre-fix code because auto_refresh_if_stale returned
+    /// early on StalenessCheck::Current without checking temporal.db staleness.
+    #[test]
+    fn test_bug_b_temporal_db_self_heals_when_lexical_is_current() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        let head = make_git_repo_with_commits(
+            root,
+            &[
+                ("feat: add module", &[("src/lib.rs", "pub fn greet() {}")]),
+                (
+                    "fix: fix greet",
+                    &[("src/lib.rs", "pub fn greet() { // fixed }")],
+                ),
+            ],
+        );
+        assert_eq!(head.len(), 40, "HEAD must be a 40-char SHA");
+
+        let root_str = root.to_string_lossy().to_string();
+
+        // First query: builds lexical+AST+temporal (NoIndex → refresh).
+        run(
+            &[
+                "greet".to_string(),
+                "--root".to_string(),
+                root_str.clone(),
+                "--limit".to_string(),
+                "5".to_string(),
+            ],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+
+        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
+        let temporal_db_path = cache_dir.join("temporal.db");
+
+        // Confirm temporal.db was created by the first query.
+        assert!(
+            temporal_db_path.exists(),
+            "temporal.db must exist after first query (setup invariant for BUG B test)"
+        );
+
+        // Delete temporal.db — lexical stays Current (HEAD unchanged).
+        std::fs::remove_file(&temporal_db_path).unwrap();
+        assert!(
+            !temporal_db_path.exists(),
+            "temporal.db must be deleted (test setup)"
+        );
+
+        // Second query: lexical is Current (HEAD unchanged), but temporal.db is missing.
+        // BUG B fix: auto_refresh_if_stale must self-heal temporal.db on the Current branch.
+        let result = run(
+            &[
+                "greet".to_string(),
+                "--root".to_string(),
+                root_str,
+                "--limit".to_string(),
+                "5".to_string(),
+            ],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "second query must succeed after temporal.db deletion (#357 BUG B)"
+        );
+
+        // Discriminating: temporal.db must be recreated.
+        assert!(
+            temporal_db_path.exists(),
+            "temporal.db must be recreated by the second query when lexical is Current (#357 BUG B)"
+        );
+
+        let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
+
+        // Discriminating: META_GIT_HEAD must equal the current HEAD (not stale).
+        let stored_head = db
+            .get_meta(rskim_search::META_GIT_HEAD)
+            .unwrap()
+            .expect("META_GIT_HEAD must be set in recreated temporal.db");
+        assert_eq!(
+            stored_head, head,
+            "META_GIT_HEAD in recreated temporal.db must match the current repo HEAD (#357 BUG B)"
+        );
+
+        // Discriminating: hotspots must be non-empty.
+        let hotspots = db.top_hotspots(20).unwrap();
+        assert!(
+            !hotspots.is_empty(),
+            "recreated temporal.db must contain non-empty hotspot data (#357 BUG B)"
+        );
+    }
+
+    /// BUG B BLOCKER: `--hot` on a stale temporal.db (lexical Current) self-heals
+    /// and returns populated hotspot results.
+    ///
+    /// Per locked decision 2026-06-24: run_temporal_standalone is wired to
+    /// auto_refresh_if_stale so bare --hot self-heals a stale temporal.db.
+    ///
+    /// PF-007 discriminating: assert >=1 ranked hotspot row is printed (positive
+    /// presence) AND that the 'no temporal data' stderr message is NOT emitted.
+    /// This test would FAIL if temporal.db were missing and the pre-fix
+    /// run_temporal_standalone were called (it would just print a warning).
+    #[test]
+    fn test_bug_b_hot_self_heals_stale_temporal_db() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        let head = make_git_repo_with_commits(
+            root,
+            &[
+                ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
+                ("feat: add parser", &[("src/parser.rs", "fn parse() {}")]),
+                (
+                    "fix: fix auth",
+                    &[("src/auth.rs", "fn authenticate() { // fixed }")],
+                ),
+            ],
+        );
+        assert_eq!(head.len(), 40);
+
+        let root_str = root.to_string_lossy().to_string();
+
+        // Build index first (NoIndex → full build including temporal).
+        run(
+            &[
+                "auth".to_string(),
+                "--root".to_string(),
+                root_str.clone(),
+                "--limit".to_string(),
+                "5".to_string(),
+            ],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+
+        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
+        let temporal_db_path = cache_dir.join("temporal.db");
+
+        // Confirm temporal.db was created.
+        assert!(
+            temporal_db_path.exists(),
+            "temporal.db must exist after initial query (test setup for BUG B BLOCKER)"
+        );
+
+        // Delete temporal.db to simulate a stale/missing temporal.db while lexical is Current.
+        std::fs::remove_file(&temporal_db_path).unwrap();
+
+        // Run `--hot` on a stale temporal.db (lexical still Current).
+        // Pre-fix: would print 'no temporal data' warning and exit 0 with NO rows.
+        // Post-fix: auto_refresh_if_stale self-heals, --hot returns populated rows.
+        let result = run(
+            &[
+                "--hot".to_string(),
+                "--root".to_string(),
+                root_str.clone(),
+                "--limit".to_string(),
+                "5".to_string(),
+            ],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "--hot after temporal.db deletion must exit 0 (#357 BUG B BLOCKER)"
+        );
+
+        // Discriminating: temporal.db must be recreated by the self-heal.
+        assert!(
+            temporal_db_path.exists(),
+            "--hot must trigger temporal.db self-heal when lexical is Current (#357 BUG B BLOCKER)"
+        );
+
+        let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
+        let stored_head = db
+            .get_meta(rskim_search::META_GIT_HEAD)
+            .unwrap()
+            .expect("META_GIT_HEAD must be set after --hot self-heals temporal.db");
+        assert_eq!(
+            stored_head, head,
+            "META_GIT_HEAD must match repo HEAD after --hot self-heal (#357 BUG B BLOCKER)"
+        );
+
+        // Discriminating: hotspots must be non-empty (populated, not empty degradation).
+        let hotspots = db.top_hotspots(20).unwrap();
+        assert!(
+            !hotspots.is_empty(),
+            "--hot self-healed temporal.db must contain non-empty hotspot data (#357 BUG B BLOCKER)"
         );
     }
 }
