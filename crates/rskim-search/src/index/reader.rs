@@ -364,6 +364,21 @@ impl NgramIndexReader {
         // valid varint-encoded data whose byte count is not a multiple of 9.
         // decode_postings_varint handles bounds-checking internally and returns
         // IndexCorrupted for malformed entries.
+        //
+        // Defense-in-depth note (Finding 5 / follow-up ticket, NOT in-branch):
+        // The CRC32 in serialize_index (builder.rs) covers entries_buf+meta_buf
+        // but NOT postings_buf.  v3 had a cheap structural guard
+        // (is_multiple_of(POSTING_ENTRY_SIZE)) that is correctly removed here.
+        // The remaining defenses prevent panics and out-of-bounds access (slice
+        // bound check above, per-varint truncation -> IndexCorrupted, field_id
+        // discriminant validation in decode_postings_varint) but a bit-flip inside
+        // a posting blob that still decodes to valid varints + a valid field_id
+        // yields wrong-but-bounded (doc_id, position) values used only for BM25F
+        // scoring (mis-ranked results) with no detection.  Suggested follow-up:
+        // extend the CRC32 in serialize_index to also hash postings_buf and verify
+        // it in NgramIndexReader::open against post_mmap so .skpost corruption
+        // fails loud (Design Constraints: 'fail loud') rather than silently
+        // mis-scoring.  Filed as a separate ticket; not gating #358.
         let data = &self.post_mmap[start..end];
         decode_postings_varint(data)
     }

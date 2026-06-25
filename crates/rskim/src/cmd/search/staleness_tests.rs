@@ -498,6 +498,53 @@ fn test_check_staleness_lexical_below_version_triggers_rebuild_returns_manifest(
     );
 }
 
+/// Finding 8 / ADR-006: a v3 lexical stub (pre-varint-compression, the specific
+/// format version this ticket (#358 Item 2) upgrades from) must also trigger
+/// `NoStoredHead` so the staleness check self-heals via full rebuild.
+///
+/// The generic `v < LEXICAL_INDEX_FORMAT_VERSION` guard (staleness.rs)
+/// covers v3 (3 < 4) via the same code path as v2, so migration is functional;
+/// this test adds a v3-specific end-to-end regression case so the #358-owned
+/// v3→v4 boundary is directly guarded at the integration level (applies ADR-006
+/// self-heal intent; avoids PF-007 by asserting the exact `NoStoredHead`
+/// discriminating observable, not just exit-0).
+///
+/// PF-007 compliance: asserts `StalenessCheck::NoStoredHead` and that the
+/// manifest is returned (mirroring the sibling v2 test's exact assertions).
+#[test]
+fn test_check_staleness_lexical_v3_below_version_triggers_rebuild_returns_manifest() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().to_path_buf();
+    let sha = "aabb1122aabb1122aabb1122aabb1122aabb1122";
+    create_fake_git_repo(dir.path(), &format!("{sha}\n"));
+
+    write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
+    // Write a v3 lexical stub (pre-varint-compression format, below current v4).
+    // magic = b"SKIX", version = 3 (LE u16).
+    fs::write(cache_dir.join("index.skidx"), b"SKIX\x03\x00").unwrap();
+    // Valid AST stub so AST self-heal does not co-trigger.
+    write_ast_index_stub(&cache_dir);
+
+    let (result, manifest) = check_staleness(&cache_dir, dir.path());
+
+    // Must report stale (lexical v3 < v4 → self-heal required, same guard as v2).
+    assert!(
+        matches!(result, StalenessCheck::NoStoredHead),
+        "v3 lexical index must trigger NoStoredHead rebuild; got {result:?}"
+    );
+
+    // Manifest must be returned so --stats can show the real git HEAD.
+    assert!(
+        manifest.is_some(),
+        "check_staleness must return manifest even when lexical index is v3 (below v4)"
+    );
+    assert_eq!(
+        manifest.unwrap().stored_git_head(),
+        Some(sha),
+        "--stats must show real HEAD when only the lexical format is at v3 (below v4)"
+    );
+}
+
 // ============================================================================
 // auto_refresh_if_stale
 // ============================================================================

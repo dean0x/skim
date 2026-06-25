@@ -481,8 +481,9 @@ pub(crate) fn decode_varint(data: &[u8], offset: usize) -> crate::Result<(u32, u
 /// v2→v3 owned by #355 Part B.
 ///
 /// Note: the sibling AST index (`crates/rskim-search/src/ast_index/store/`)
-/// deliberately retains the fixed 9-byte `POSTING_ENTRY_SIZE` codec per
-/// AD-LXPOST-1 (the AST posting list is small and latency-critical; the
+/// deliberately retains the fixed 8-byte `POSTING_ENTRY_SIZE` codec per
+/// AD-LXPOST-1 (the AST posting entry is doc_id(4B)+position(4B) with no
+/// field_id byte; the AST posting list is small and latency-critical; the
 /// lexical posting list is the size driver). This divergence is intentional,
 /// not drift.
 ///

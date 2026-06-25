@@ -867,7 +867,7 @@ fn test_1000_file_benchmark() {
 /// Building with a real multi-field field_map makes this guard representative
 /// of the production on-disk size (ADR-003: grounded in the actual path).
 #[test]
-fn lexical_index_size_ratio() {
+fn test_lexical_index_size_ratio() {
     use crate::classify_source;
     use crate::test_corpus::gen_representative_rust_module;
 
@@ -941,9 +941,13 @@ fn lexical_index_size_ratio() {
     //     structurally impossible (see AD-LXSZ-1 comment above). ADR-003 replaces it.
     //   - Ceiling = 3.53x measured + 1.5x headroom = 5.0x (round number).
     //     Headroom absorbs minor corpus variation and overhead growth without
-    //     allowing a genuine O(files^2) bloat regression to pass.
-    //   - A genuine posting-list explosion (e.g. dedup bug, accidental O(n^2)
-    //     growth) would push the ratio 2-5x above 3.53x and still fires.
+    //     allowing a genuine bloat regression to pass.
+    //   - True sensitivity threshold: ~1.42x bloat (5.0 / 3.53).  The FIRST
+    //     regression that actually fires the assertion is ~1.42x above the
+    //     measured baseline (e.g. ratio ~4.9x from a partial-compression
+    //     regression would still PASS -- the gate is not a tight 2x guard).
+    //     A genuine posting-list explosion (full revert to v3 fixed-9-byte
+    //     encoding gives 9.04x >> 5.0x) definitively fires the gate (ADR-003).
     //
     // ADR-003: regression guard must be empirically grounded, not the
     // baseless 0.30x inherited from the original ticket text.
@@ -955,6 +959,30 @@ fn lexical_index_size_ratio() {
          If ratio exceeded: check for O(files^2) posting growth, \
          missing dedup, unbounded trigram emission, or codec regression. \
          index={total_index_bytes} bytes, source={total_source_bytes} bytes."
+    );
+
+    // Finding 6 / AC6 end-to-end: exercise the multi-field index through the
+    // production read path (mmap slice → lookup_postings → decode_postings_varint
+    // → BM25F scoring).  The v4 codec's field-boundary delta-reset
+    // (encode_postings_varint / decode_postings_varint: `prev_position = 0`
+    // on field_id change) is exercised here because the classified corpus has
+    // postings in multiple fields within the same doc.  An encode/decode
+    // asymmetry in the reset condition (e.g. dropping `|| field_id !=
+    // prev_field_id`) would corrupt positions for multi-field docs yet keep the
+    // size check above green — this query assertion catches that silent failure.
+    //
+    // "process" appears as a substring inside gen_representative_rust_module
+    // function bodies ("process_{i}" call sites); the reader must decode
+    // postings from the multi-field index and return >=1 matching file.
+    let mut query_for_decode_path = SearchQuery::new("process");
+    query_for_decode_path.limit = Some(100);
+    let search_results = reader.search(&query_for_decode_path).unwrap();
+    assert!(
+        !search_results.is_empty(),
+        "AD-LXSZ-1 / Finding 6: reader.search('process') on the multi-field classified \
+         corpus must return >=1 result.  An empty result set indicates that the v4 \
+         field-boundary decode path is broken (encode/decode asymmetry in \
+         prev_position reset, or corpus was not indexed)."
     );
 }
 
@@ -978,9 +1006,23 @@ fn lexical_index_size_ratio() {
 /// latency, so the test fails both when the feature is deleted (empty results)
 /// AND when performance regresses (latency > 50ms). A timer-only assertion
 /// would be vacuous -- it passes even if the reader returns nothing.
+///
+/// # Production-representative indexing path (Finding 3 / Finding 9)
+///
+/// This test builds the corpus via `add_file_classified` with a real field_map
+/// from `classify_source`, matching the sibling size test (`test_lexical_index_size_ratio`)
+/// and the production indexing path (`index.rs::run()`).  Using `add_file`
+/// (empty field_map, all bytes as `SearchField::Other`) was previously a
+/// grounding inconsistency: the size test's own doc-comment explicitly rejects
+/// that path as "non-representative" for a multi-field index.  For latency the
+/// single-field path is neutral-to-conservative (one long posting run vs.
+/// several shorter ones), so the 50ms budget is not loosened by the switch;
+/// the fix aligns representativeness claims with the actual build path so both
+/// guards are grounded on the same production-representative corpus (ADR-003).
 #[test]
 #[cfg(not(debug_assertions))]
-fn lexical_query_latency_representative_corpus() {
+fn test_lexical_query_latency_representative_corpus() {
+    use crate::classify_source;
     use crate::test_corpus::gen_representative_rust_module;
     use std::time::Instant;
 
@@ -992,12 +1034,15 @@ fn lexical_query_latency_representative_corpus() {
         .map(|i| gen_representative_rust_module(i, fns_per_file))
         .collect();
 
-    // Build the index once.
+    // Build the index once using the production-representative classified path.
+    // This aligns with the sibling size test and with index.rs::run() (ADR-003).
     {
         let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
         for (i, src) in sources.iter().enumerate() {
+            let lang = rskim_core::Language::Rust;
+            let field_map = classify_source(src, lang).unwrap_or_default();
             builder
-                .add_file(FileId(i as u32), src, rskim_core::Language::Rust)
+                .add_file_classified(FileId(i as u32), src, lang, &field_map)
                 .unwrap();
         }
         builder.build().unwrap();

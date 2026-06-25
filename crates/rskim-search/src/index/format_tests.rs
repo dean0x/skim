@@ -908,3 +908,40 @@ fn test_posting_codec_invalid_field_id_returns_err() {
         "error should mention field_id: {err}"
     );
 }
+
+/// Finding 4 (AC4 error-path gap): decode_postings_varint returns IndexCorrupted
+/// when a valid doc_id varint is decoded but no field_id byte follows
+/// ("truncated before field_id" branch in decode_postings_varint).
+///
+/// This is the posting-walker's distinct truncation branch that was not covered
+/// by the existing varint-primitive test (`test_varint_decode_truncated_returns_err`,
+/// which truncates INSIDE the varint, not AFTER it).  The production decode path
+/// used by `reader.rs::lookup_postings` calls `decode_postings_varint` directly;
+/// a corrupt or truncated `.skpost` slice that ends exactly after a doc_id varint
+/// hits this branch.
+///
+/// PF-007 compliance: asserts the discriminating error substring "field_id" OR
+/// "truncated" so the test fails the moment the branch is removed or the error
+/// message changes semantically.
+#[test]
+fn test_posting_codec_truncated_before_field_id_returns_err() {
+    // Manually construct a buffer that contains a valid 1-byte doc_id varint
+    // (value 0x01 = delta 1, MSB clear = terminal byte) followed by NO field_id
+    // byte.  This simulates a .skpost slice truncated mid-entry after the
+    // doc_id varint but before the field_id byte.
+    //
+    // Layout per entry: [varint delta_doc_id][u8 field_id][varint delta_position]
+    // We emit [0x01] and stop — the doc_id varint is complete (MSB=0, value=1)
+    // but field_id is absent, hitting the "truncated before field_id" branch.
+    let buf = vec![0x01u8]; // valid 1-byte varint (doc_id delta=1), no field_id follows
+    let result = decode_postings_varint(&buf);
+    assert!(
+        result.is_err(),
+        "truncated-before-field_id slice must return Err, got Ok"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("field_id") || err.contains("truncated"),
+        "error must mention 'field_id' or 'truncated': {err}"
+    );
+}
