@@ -312,7 +312,7 @@ impl NgramIndexBuilder {
             let offset = postings_buf.len() as u64;
             // Encode this posting list with delta+varint (AD-LXPOST-1, FORMAT_VERSION v4).
             // The list is already sorted by (doc_id, field_id, position) — the caller
-            // (build()) calls list.sort_unstable() before reach here.
+            // (build()) calls list.sort_unstable() before reaching here.
             encode_postings_varint(list, &mut postings_buf);
             let byte_len = postings_buf.len() as u64 - offset;
             let length = u32::try_from(byte_len).map_err(|_| {

@@ -528,6 +528,8 @@ pub(crate) fn decode_postings_varint(data: &[u8]) -> crate::Result<Vec<PostingEn
     let mut prev_position: u32 = 0;
 
     while offset < data.len() {
+        let entry_start = offset;
+
         // Decode delta_doc_id varint.
         let (delta_doc_id, n) = decode_varint(data, offset)?;
         offset += n;
@@ -535,15 +537,15 @@ pub(crate) fn decode_postings_varint(data: &[u8]) -> crate::Result<Vec<PostingEn
         // Decode field_id (1 byte).
         if offset >= data.len() {
             return Err(SearchError::IndexCorrupted(format!(
-                "posting at byte {}: truncated before field_id",
-                offset.saturating_sub(n)
+                "posting at byte {entry_start}: truncated before field_id",
             )));
         }
         let field_id = data[offset];
         offset += 1;
         if SearchField::from_discriminant(field_id).is_none() {
             return Err(SearchError::IndexCorrupted(format!(
-                "posting: invalid field_id {field_id} at byte {}", offset - 1
+                "posting: invalid field_id {field_id} at byte {}",
+                offset - 1
             )));
         }
 
