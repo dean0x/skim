@@ -14,5 +14,6 @@ pub mod codegen;
 pub mod config;
 pub mod extract;
 pub mod idf;
+pub mod trigram_codegen;
 pub mod types;
 pub mod validate;

@@ -102,4 +102,4 @@ pub use types::{
     SearchField, SearchLayer, SearchQuery, SearchResult, TemporalFlags, TemporalMetadata,
     TemporalSource, byte_offset_to_line, compute_line_range,
 };
-pub use weights::{DEFAULT_WEIGHT, TRIGRAM_WEIGHTS, bigram_weight};
+pub use weights::{DEFAULT_WEIGHT, TRIGRAM_WEIGHTS, lookup_weight, trigram_weight};

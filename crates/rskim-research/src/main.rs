@@ -11,8 +11,10 @@
 //! - `ast-run`: clone corpus repos, extract AST n-grams, compute IDF, write JSON
 //! - `ast-codegen`: read ast_weights.json, generate ast_weights.rs for rskim-search
 //! - `ast-validate`: read ast_weights.json, run AST validation report
+//! - `trigram-run`: scan a local directory, extract trigrams, compute IDF, write JSON
+//! - `trigram-codegen`: read trigram_weights.json, generate weights.rs for rskim-search
 
-use rskim_research::{clone, codegen, config, extract, idf, types, validate};
+use rskim_research::{clone, codegen, config, extract, idf, trigram_codegen, types, validate};
 
 use serde::Serialize;
 
@@ -71,6 +73,35 @@ enum Commands {
         /// Path to bigram_weights.json (defaults to crates/rskim-search/data/bigram_weights.json).
         #[arg(long)]
         json_path: Option<PathBuf>,
+    },
+
+    /// Scan a local directory tree, extract character trigrams, compute IDF weights, and write JSON.
+    ///
+    /// Unlike `run` (which clones external repos), `trigram-run` works on an already-present
+    /// source directory — suitable for generating weights from the workspace itself.
+    TrigramRun {
+        /// Root directory to scan for source files (defaults to cwd).
+        #[arg(long)]
+        source_dir: Option<PathBuf>,
+
+        /// Minimum IDF threshold — trigrams below this are excluded from the table.
+        #[arg(long, default_value = "1.5")]
+        threshold: f32,
+
+        /// Output path for trigram_weights.json.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Read trigram_weights.json and generate weights.rs for rskim-search.
+    TrigramCodegen {
+        /// Path to trigram_weights.json (defaults to crates/rskim-search/data/trigram_weights.json).
+        #[arg(long)]
+        json_path: Option<PathBuf>,
+
+        /// Override workspace root detection (auto-detected if omitted).
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
     },
 
     /// Clone corpus repos, extract AST bigrams/trigrams, compute IDF weights, and write JSON.
@@ -132,6 +163,17 @@ fn main() -> anyhow::Result<()> {
         } => cmd_codegen(json_path, workspace_root),
 
         Commands::Validate { json_path } => cmd_validate(json_path),
+
+        Commands::TrigramRun {
+            source_dir,
+            threshold,
+            output,
+        } => cmd_trigram_run(source_dir, threshold, output),
+
+        Commands::TrigramCodegen {
+            json_path,
+            workspace_root,
+        } => cmd_trigram_codegen(json_path, workspace_root),
 
         Commands::AstRun {
             corpus_dir,
@@ -373,6 +415,164 @@ fn cmd_validate(json_path: Option<PathBuf>) -> anyhow::Result<()> {
         validation.improvement_pct
     );
 
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trigram subcommand handlers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Walk `source_dir` recursively and collect all source files rskim-search
+/// can index, then extract trigrams and compute IDF weights.
+///
+/// Unlike `run` (which clones external repos over the network), this command
+/// works on a directory that already exists — suitable for generating a
+/// corpus-derived weight table from the workspace's own source files.
+fn cmd_trigram_run(
+    source_dir: Option<PathBuf>,
+    threshold: f32,
+    output: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let root = source_dir
+        .map(Ok)
+        .unwrap_or_else(|| std::env::current_dir().with_context(|| "getting current directory"))?;
+
+    eprintln!("Scanning source files under {} ...", root.display());
+
+    // Walk the directory tree using the `ignore` crate (honours .gitignore).
+    // Collect all files with known source-code extensions.
+    let extensions = [
+        "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "h",
+        "hpp", "cs", "rb", "kt", "swift", "sql", "md",
+    ];
+    let ext_set: std::collections::HashSet<&str> = extensions.iter().copied().collect();
+
+    let mut files: Vec<types::SourceFile> = Vec::new();
+
+    // Build a simple ignore-override that always skips target/node_modules/vendor.
+    for result in ignore::WalkBuilder::new(&root)
+        .follow_links(false)
+        .hidden(false) // include hidden files (but not hidden dirs via .gitignore)
+        .build()
+    {
+        let entry = match result {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Warning: walk error: {e}");
+                continue;
+            }
+        };
+
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+
+        let path = entry.path();
+
+        // Skip common build/vendor directories.
+        let skip = path.components().any(|c| {
+            matches!(c.as_os_str().to_str(), Some("target") | Some("node_modules") | Some("vendor"))
+        });
+        if skip {
+            continue;
+        }
+
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !ext_set.contains(ext) {
+            continue;
+        }
+
+        // Skip very large files (> 1 MB) — they dominate IDF unnaturally.
+        if let Ok(meta) = path.metadata()
+            && meta.len() > 1_048_576
+        {
+            continue;
+        }
+
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                // Detect language from extension for stats; content is what matters.
+                let language = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(rskim_core::Language::from_extension)
+                    .unwrap_or(rskim_core::Language::Rust);
+                files.push(types::SourceFile {
+                    path: path.to_path_buf(),
+                    language,
+                    content,
+                });
+            }
+            Err(e) => {
+                eprintln!("Warning: could not read {}: {e}", path.display());
+            }
+        }
+    }
+
+    eprintln!(
+        "Loaded {} source files. Extracting trigrams...",
+        files.len()
+    );
+
+    if files.is_empty() {
+        anyhow::bail!("No source files found under {}", root.display());
+    }
+
+    let (df_map, corpus_stats) = extract::extract_trigrams_from_corpus(&files);
+    let total_docs = corpus_stats.total_files;
+
+    eprintln!(
+        "Corpus: {} unique files, {} unique trigrams. Computing IDF...",
+        total_docs,
+        df_map.len()
+    );
+
+    let weights = idf::compute_trigram_weight_table(&df_map, total_docs, threshold);
+
+    eprintln!(
+        "Trigram weight table: {} entries (threshold={threshold}).",
+        weights.len()
+    );
+
+    let table = types::TrigramWeightTable {
+        version: 1,
+        generated_at: chrono_now(),
+        corpus_stats,
+        weights,
+    };
+
+    let output_path = output.unwrap_or_else(|| {
+        trigram_codegen::default_trigram_weights_json_path()
+            .unwrap_or_else(|_| PathBuf::from("trigram_weights.json"))
+    });
+
+    write_json_table(&table, output_path, "trigram weight table")
+}
+
+fn cmd_trigram_codegen(
+    json_path: Option<PathBuf>,
+    workspace_root: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let workspace_root = match workspace_root {
+        Some(p) => p,
+        None => codegen::find_workspace_root().context("auto-detecting workspace root")?,
+    };
+
+    let json_path = json_path.unwrap_or_else(|| {
+        workspace_root.join("crates/rskim-search/data/trigram_weights.json")
+    });
+
+    let output_path = workspace_root.join("crates/rskim-search/src/weights.rs");
+
+    eprintln!(
+        "Reading {} -> generating {}",
+        json_path.display(),
+        output_path.display()
+    );
+
+    trigram_codegen::generate_weights_rs(&json_path, &output_path)?;
+
+    eprintln!("Generated: {}", output_path.display());
     Ok(())
 }
 

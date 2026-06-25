@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::types::BigramWeight;
+use crate::types::{BigramWeight, TrigramWeight};
 
 /// Compute IDF using the smoothed formula: ln(N / (df + 1)) + 1.0
 ///
@@ -52,6 +52,38 @@ pub fn compute_weight_table(
 
     // Sort ascending by bigram key for binary-search lookups.
     weights.sort_by_key(|w| w.bigram);
+    weights
+}
+
+/// Build a trigram weight table from a document-frequency map.
+///
+/// Trigrams with IDF below `threshold` are excluded. The result is sorted
+/// by trigram key ascending (enabling binary search in `rskim-search`).
+///
+/// Returns an empty vec immediately if `total_docs == 0`.
+#[must_use]
+pub fn compute_trigram_weight_table(
+    df_map: &HashMap<u32, u32>,
+    total_docs: u32,
+    threshold: f32,
+) -> Vec<TrigramWeight> {
+    if total_docs == 0 {
+        return Vec::new();
+    }
+    let mut weights: Vec<TrigramWeight> = df_map
+        .iter()
+        .filter_map(|(&trigram, &df)| {
+            let idf = compute_idf(df, total_docs);
+            if idf >= threshold {
+                Some(TrigramWeight { trigram, idf })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Sort ascending by trigram key for binary-search lookups.
+    weights.sort_by_key(|w| w.trigram);
     weights
 }
 

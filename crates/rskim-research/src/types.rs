@@ -56,6 +56,29 @@ pub struct WeightTable {
     pub weights: Vec<BigramWeight>,
 }
 
+/// A single trigram with its IDF weight.
+///
+/// The trigram is encoded as a `u32` where:
+/// - bits 23-16 = first byte (b1)
+/// - bits 15-8  = second byte (b2)
+/// - bits 7-0   = third byte (b3)
+///
+/// This matches the `Ngram` encoding in `rskim-search`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrigramWeight {
+    pub trigram: u32,
+    pub idf: f32,
+}
+
+/// The full trigram weight table written to JSON and used for codegen.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrigramWeightTable {
+    pub version: u8,
+    pub generated_at: String,
+    pub corpus_stats: CorpusStats,
+    pub weights: Vec<TrigramWeight>,
+}
+
 /// Statistics from the SHA-256 deduplication pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeduplicationStats {
