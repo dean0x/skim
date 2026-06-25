@@ -17,13 +17,22 @@ use crate::types::{BigramWeight, TrigramWeight};
 ///
 /// Panics in debug builds if `total_docs == 0`, which would produce `NEG_INFINITY`.
 /// Callers must ensure the corpus is non-empty before invoking this function.
+///
+/// # PF-004 (widen before arithmetic)
+///
+/// `df` is widened to `u64` before adding 1 to avoid a wrapping overflow when
+/// `df == u32::MAX` (which would produce 0 as the denominator, yielding `+inf`).
+/// In practice `df` is bounded by the number of indexed files, so u32::MAX is
+/// unreachable — but the widen-before-arithmetic pattern is applied verbatim per
+/// PF-004 for correctness and consistency with the rest of the codebase.
 #[must_use]
 pub fn compute_idf(df: u32, total_docs: u32) -> f32 {
     debug_assert!(
         total_docs > 0,
         "total_docs must be > 0; got 0 — caller must guard against empty corpus"
     );
-    ((total_docs as f64) / ((df + 1) as f64)).ln() as f32 + 1.0
+    // PF-004: widen to u64 before adding 1 to prevent wrapping when df == u32::MAX.
+    ((total_docs as f64) / ((u64::from(df) + 1) as f64)).ln() as f32 + 1.0
 }
 
 /// Build the weight table from a document-frequency map.

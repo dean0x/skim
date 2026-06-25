@@ -252,14 +252,19 @@ fn test_query_substring_present_case_sensitive() {
     );
 }
 
-/// Empty query (no tokens after splitting) → vacuously true.
-/// Callers short-circuit on empty queries before building candidates, so
-/// this edge case is harmless, but the fn must be well-defined.
+/// Empty query (no tokens after splitting) → false (defense-in-depth, Finding 15).
+///
+/// Prior to #355 cycle-2, an empty query returned vacuously true (`.all()` over
+/// an empty iterator).  The defense-in-depth fix (Finding 15) makes the empty-
+/// token case explicit: an empty/whitespace-only query is treated as "not present"
+/// so that a future caller that skips the is_empty() guard cannot silently admit
+/// all candidates.  The CLI dispatch already rejects empty queries before calling
+/// this function, so the behavior change only affects edge cases in tests.
 #[test]
-fn test_query_substring_present_empty_query_vacuously_true() {
+fn test_query_substring_present_empty_query_returns_false() {
     assert!(
-        query_substring_present("any content", ""),
-        "empty query produces no tokens; all() over empty set is vacuously true"
+        !query_substring_present("any content", ""),
+        "empty query: no tokens → false (defense-in-depth, not vacuously true)"
     );
 }
 
@@ -316,11 +321,11 @@ fn test_extract_snippet_and_verify_empty_positions_file_absent_query_ad355_7() {
     );
 }
 
-/// Whitespace-only query → same as empty (no tokens).
+/// Whitespace-only query → false (same defense-in-depth as empty query).
 #[test]
-fn test_query_substring_present_whitespace_only_query() {
+fn test_query_substring_present_whitespace_only_query_returns_false() {
     assert!(
-        query_substring_present("any content", "   "),
-        "whitespace-only query produces no tokens via split_whitespace; vacuously true"
+        !query_substring_present("any content", "   "),
+        "whitespace-only query: no tokens → false (defense-in-depth, Finding 15)"
     );
 }

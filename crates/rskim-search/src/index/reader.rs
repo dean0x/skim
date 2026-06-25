@@ -141,6 +141,38 @@ impl NgramIndexReader {
         })
     }
 
+    /// Read the lexical index format version from the first 6 bytes of `index.skidx`.
+    ///
+    /// Opens only 6 bytes (magic + version) — no mmap, no CRC, no full validation.
+    /// Used by `check_staleness` to detect a v2→v3 format mismatch and trigger a
+    /// rebuild before `NgramIndexReader::open` hard-errors on the version mismatch.
+    ///
+    /// # Errors
+    ///
+    /// - [`SearchError::Io`] if the file cannot be opened.
+    /// - [`SearchError::IndexCorrupted`] if the file is too short or has bad magic.
+    pub fn lexical_index_version(dir: &Path) -> Result<u16> {
+        use std::io::Read;
+        let idx_path = dir.join("index.skidx");
+        let mut file = std::fs::File::open(&idx_path)?;
+        let mut buf = [0u8; 6];
+        file.read_exact(&mut buf).map_err(|_| {
+            SearchError::IndexCorrupted(
+                "lexical_index_version: index.skidx too short (need 6 bytes)".into(),
+            )
+        })?;
+        let magic = &buf[0..4];
+        if magic != super::format::SKIDX_MAGIC {
+            return Err(SearchError::IndexCorrupted(format!(
+                "lexical_index_version: bad magic: expected {:?}, got {:?}",
+                super::format::SKIDX_MAGIC,
+                magic
+            )));
+        }
+        let version = u16::from_le_bytes([buf[4], buf[5]]);
+        Ok(version)
+    }
+
     /// Open an existing index from `dir` with a custom BM25F configuration.
     ///
     /// Identical to [`NgramIndexReader::open`] except the provided `config`
@@ -343,7 +375,7 @@ impl SearchLayer for NgramIndexReader {
         // contains the short query but has file_id >= pool_limit will be silently missed.
         // This is an accepted trade-off for short (< 3 byte) queries — the pool_limit
         // floor of 100 mitigates the issue on small to medium corpora; large-corpus
-        // short-query completeness is tracked in a follow-up.
+        // short-query completeness is tracked in #356 (pool-K calibration).
         //
         // Security: no injection, no path traversal; only the user's own indexed files
         // (bounded to the pool cap) are returned as score-0 candidates.

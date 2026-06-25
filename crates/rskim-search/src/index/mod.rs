@@ -34,3 +34,4 @@ mod reader;
 
 pub use builder::NgramIndexBuilder;
 pub use reader::NgramIndexReader;
+pub(crate) use format::FORMAT_VERSION as LEXICAL_FORMAT_VERSION;

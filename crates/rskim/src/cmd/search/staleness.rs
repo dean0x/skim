@@ -195,6 +195,16 @@ fn is_hex_sha(s: &str) -> bool {
 /// The version check uses [`rskim_search::AstIndexReader::index_version`] which
 /// reads only the first 6 bytes of `ast_index.skidx` (magic + version) — cheap,
 /// no mmap, no CRC verification.
+///
+/// # Lexical self-heal (ADR-006, #355 Finding 9)
+///
+/// `#355` bumped the LEXICAL index FORMAT_VERSION v2→v3 (bigram→trigram).  Without
+/// this check, a user with an unchanged git HEAD and a v2 `index.skidx` would get a
+/// hard error from `NgramIndexReader::open` ("unsupported format version: 2; please
+/// rebuild the index") instead of an automatic rebuild.  This check reads only the
+/// first 6 bytes of `index.skidx` (same cheap approach as the AST version check) and
+/// reports `NoStoredHead` when the lexical version is below the current version so the
+/// next query self-heals via a full rebuild — matching the documented ADR-006 intent.
 pub(super) fn check_staleness(
     cache_dir: &Path,
     project_root: &Path,
@@ -204,6 +214,15 @@ pub(super) fn check_staleness(
     if !index_path.exists() {
         return (StalenessCheck::NoIndex, None);
     }
+
+    // Lexical self-heal: if the on-disk FORMAT_VERSION is older than the current
+    // version, return NoStoredHead to trigger a full rebuild so the user does not
+    // see a hard error from NgramIndexReader::open (ADR-006, #355 Finding 9).
+    // This is the exact mirror of the AST index_version check below.
+    let lexical_stale = match rskim_search::NgramIndexReader::lexical_index_version(cache_dir) {
+        Ok(v) => v < rskim_search::LEXICAL_INDEX_FORMAT_VERSION,
+        Err(_) => true, // Corrupt / unreadable → rebuild.
+    };
 
     // AST self-heal: if the lexical index exists but the AST index is absent
     // or has an old format version, report stale so both rebuild atomically.
@@ -225,8 +244,8 @@ pub(super) fn check_staleness(
         Err(_) => return (StalenessCheck::NoStoredHead, None),
     };
 
-    if ast_stale {
-        // AST index is absent or below the current format version.
+    if lexical_stale || ast_stale {
+        // Lexical or AST index is absent or below the current format version.
         // Return NoStoredHead to trigger a full rebuild, but carry the loaded
         // manifest so display consumers (e.g. `--stats`) still show the real HEAD.
         return (StalenessCheck::NoStoredHead, Some(manifest));

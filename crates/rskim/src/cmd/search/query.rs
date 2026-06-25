@@ -29,6 +29,45 @@ use super::staleness::auto_refresh_if_stale;
 use super::types::{QueryConfig, QueryOutput, ResolvedResult};
 
 // ============================================================================
+// Candidate-pool sizing (AD-355-2)
+// ============================================================================
+//
+// The three paths (pure-lexical, compound text+AST, blast-radius) each widen
+// their candidate pool before the verify-then-truncate-LAST step.  All three
+// pools are defined here in one place so the "how wide must the pre-verify pool
+// be" decision has a single reason to change.
+//
+// `candidate_pool(limit, k)` returns `max(limit * k, CANDIDATE_POOL_FLOOR)` so
+// every path uses the same floor policy.  Calibrating K per-path is tracked in
+// #356 (pool-K calibration) per ADR-003 (grounded measurements before changing).
+//
+// Current values — no measured corpus basis; #356 owns calibration:
+//   LEXICAL_CANDIDATE_POOL_K = 5  (pure-lexical, with floor)
+//   COMPOUND_CANDIDATE_POOL_K = 4 (text+AST compound, no floor: intersection already narrows)
+//   BLAST_CANDIDATE_POOL_K   = 10 (blast-radius composite UNION, with floor)
+//
+// Note: COMPOUND_CANDIDATE_POOL_K intentionally has no floor here; the compound
+// path uses `saturating_mul` without `.max(floor)` because the intersection gate
+// already narrows candidates aggressively.  If this becomes a correctness concern
+// for small --limit values, add a floor in run_compound_query and update #356.
+
+/// Shared floor for `candidate_pool`: every widened pool has at least this many
+/// slots so small `--limit` values do not starve the verify step.
+const CANDIDATE_POOL_FLOOR: usize = 100;
+
+/// Compute the pre-verify candidate pool size for a given path K multiplier.
+///
+/// Returns `limit.saturating_mul(k).max(CANDIDATE_POOL_FLOOR)`.
+///
+/// This is the single place that enforces the floor policy; callers that
+/// intentionally omit the floor (compound path — see note above) call
+/// `limit.saturating_mul(k)` directly.
+#[inline]
+fn candidate_pool(limit: usize, k: usize) -> usize {
+    limit.saturating_mul(k).max(CANDIDATE_POOL_FLOOR)
+}
+
+// ============================================================================
 // Query execution
 // ============================================================================
 
@@ -207,19 +246,16 @@ pub(super) fn execute_query_with_manifest(
     // acts as a true filter over the ranked list, not over an already-truncated
     // stub.  After verification the result set is truncated to `--limit` LAST.
     //
-    // K=5, floor 100: matches the temporal.rs resort_window() heuristic so the two
-    // paths behave consistently.  This value has no measured corpus basis; calibrating
-    // K for large corpora is tracked in #356.
+    // K=5, floor CANDIDATE_POOL_FLOOR: matches the temporal.rs resort_window() heuristic
+    // so the two paths behave consistently.  This value has no measured corpus basis;
+    // calibrating K for large corpora is tracked in #356.
     //
     // AD-355-4: Dropping non-matching candidates is a relevance gate, NOT an output
     // elision/cap under #317 "compress-never-truncate".  It does not hide output that
     // the user would otherwise see; it removes candidates that do not satisfy the
     // literal query.  No `elision_marker` is needed here.
     const LEXICAL_CANDIDATE_POOL_K: usize = 5;
-    let pool_limit = config
-        .limit
-        .saturating_mul(LEXICAL_CANDIDATE_POOL_K)
-        .max(100);
+    let pool_limit = candidate_pool(config.limit, LEXICAL_CANDIDATE_POOL_K);
     let mut sq = SearchQuery::new(config.text.clone());
     sq.limit = Some(pool_limit);
 
@@ -285,14 +321,19 @@ fn run_compound_query(
     blast_file_ids: Option<HashSet<FileId>>,
     ctx: QueryContext<'_>,
 ) -> anyhow::Result<QueryOutput> {
-    // Wider lexical pool before compound ranking.
-    // K=4: lighter than temporal.rs (K=5 with .max(100) floor) because the
-    // intersection gate already narrows candidates — no floor needed.
-    // NOTE: K=4 is a heuristic with no measured corpus basis; a file that is
-    // in both AST and lexical sets but ranks beyond position limit*4 in the
-    // unfiltered lexical ranking will be silently excluded.  This is the
-    // intentional trade-off (enables composite ranking vs old file_filter gate).
-    // Calibrating K for large corpora is tracked in #290.
+    // Wider lexical pool before compound ranking (see module-level pool-sizing note).
+    // K=4: lighter than lexical (K=5) / blast (K=10) because the intersection gate
+    // already narrows candidates — no floor applied here (see COMPOUND_CANDIDATE_POOL_K
+    // note at the top of this file).  A file that is in both AST and lexical sets but
+    // ranks beyond position limit*4 in the unfiltered lexical ranking will be silently
+    // excluded.  Calibrating K for large corpora is tracked in #290.
+    //
+    // Performance note (AD-355-2): `recompose_with_lexical` (below) does `(*lex).clone()`
+    // per surviving entry and operates on the FULL `ranked` list (limit×K entries), NOT
+    // a pre-truncated slice.  This is required to preserve the verify-then-truncate-LAST
+    // invariant: pre-truncation would drop the real definer before verification can keep
+    // it.  The accepted cost is up to K×limit `SearchResult` clones (each carrying a
+    // `Vec<Range<usize>>`) instead of `limit` — a bounded (4×) increase in clone work.
     const CANDIDATE_POOL_K: usize = 4;
     let mut sq = SearchQuery::new(config.text.clone());
     // saturating_mul: a hostile `--limit` near usize::MAX must not overflow.
@@ -413,25 +454,19 @@ fn run_blast_radius_composite_query(
     // partners whose lexical rank exceeds the cap, violating the rank-then-
     // truncate-LAST invariant.
     //
-    // However, setting `limit = None` on the normal BM25F path causes unbounded
-    // file reads in Step 6 (every lexical-hit file is read for verify + snippet).
-    // On the short-query fallback (AD-355-7) `unwrap_or(20)` in reader.rs caps
-    // the set; on the trigram path we apply a BLAST_CANDIDATE_POOL_K-multiple cap
-    // here to bound the number of files read while still providing a pool large
-    // enough that co-change partners beyond bare `limit` are not silently dropped.
+    // We set sq.limit = Some(K × limit).max(100) on EVERY path — trigram-scored
+    // and short-query fallback alike.  The reader's `unwrap_or(20)` default is
+    // never reached on this path because we always pass Some(N>=100).
     //
     // K=10: generous multiple of limit so RRF fusion still sees enough candidates
     // for the co-change-UNION to work correctly even if many lexical hits fail
-    // verification.  The worst-case file reads are O(K × limit) rather than
-    // O(matching_corpus).  Calibrating K for large corpora is tracked in #356.
-    //
-    // For the short-query fallback (AD-355-7), sq.limit=None means reader.rs uses
-    // `unwrap_or(20)` — this path's bound is the reader's default, not K×limit.
-    // The `None` sentinel preserves the blast-radius unlimited-lexical contract for
-    // the short-query path while K×limit bounds the trigram-scored path.
+    // verification.  The worst-case file reads are O(K × limit) per query; on
+    // the AD-355-7 short-query fallback the candidate set is still bounded to
+    // Some(K × limit).max(100) before the verify step.  Calibrating K for large
+    // corpora is tracked in #356 (pool-K calibration).
     const BLAST_CANDIDATE_POOL_K: usize = 10;
     let mut sq = SearchQuery::new(config.text.clone());
-    sq.limit = Some(config.limit.saturating_mul(BLAST_CANDIDATE_POOL_K).max(100));
+    sq.limit = Some(candidate_pool(config.limit, BLAST_CANDIDATE_POOL_K));
     // No file_filter: UNION mode requires the full lexical ranked list.
     let raw_lex = ctx.engine.search(&sq)?;
 

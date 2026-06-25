@@ -64,6 +64,19 @@ const _: () = assert!(
     "AST_INDEX_FORMAT_VERSION must equal ast_index::store::format::FORMAT_VERSION"
 );
 
+/// Current on-disk format version for the lexical n-gram index (`index.skidx` / `index.skpost`).
+///
+/// Derives from `index::LEXICAL_FORMAT_VERSION` — the single source of truth.
+/// Used by `check_staleness` in the CLI to detect a v2→v3 format mismatch and
+/// trigger an automatic rebuild before `NgramIndexReader::open` hard-errors.
+///
+/// v2 → v3 (#355 Part B): n-gram key widened from u16 (bigram) to u32 (trigram).
+/// A v2 index encounters a format version mismatch and `decode_header` emits an
+/// actionable "please rebuild the index" error (`skim search index --rebuild`).
+/// With this constant exported, `check_staleness` can detect the mismatch first
+/// and self-heal automatically on the next query (ADR-006, Finding 9 / #355).
+pub const LEXICAL_INDEX_FORMAT_VERSION: u16 = index::LEXICAL_FORMAT_VERSION;
+
 pub use cochange::{COUPLING_MAX_FILES, CochangeMatrixBuilder, CochangeMatrixReader};
 pub use compound::{
     CompositeWeights, RRF_K, WEIGHT_AST, WEIGHT_LEXICAL, intersect_and_rank, recompose_with_lexical,

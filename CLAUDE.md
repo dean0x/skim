@@ -46,7 +46,8 @@ Streaming output (stdout, zero-copy via &str slices where possible)
 **Non-obvious behavior (gotchas):**
 - **Analytics:** token savings persist to `~/.cache/skim/analytics.db` (SQLite/WAL), recorded fire-and-forget on background threads. `--clear-cache` clears only the parser cache, NOT `analytics.db` — use `skim stats --clear` for that. The `AnalyticsStore` trait + `MockStore` make the stats dashboard testable without a real DB.
 - **Search DB:** `rskim-search` stores hotspot/risk/co-change data in `<root>/.skim/search.db`. Migrations are forward-only via `PRAGMA user_version`; a DB written by a newer version errors rather than corrupting data.
-- **AST index:** the n-gram index (`ast_index.skidx` / `.skpost`) is format v2 — v1 files are rejected with "please rebuild" (`skim search index --rebuild`). Synthetic n-gram markers (IDs ≥ 64900) resolve to `None` in `vocab_resolve()`, keeping them isolated from real vocabulary.
+- **Lexical n-gram index:** `index.skidx` / `index.skpost` is format v3 (trigram, u32 key — #355 Part B). This is DISTINCT from the AST structural index. A v2 lexical index (bigram, u16 key) triggers an automatic rebuild on the next query via `check_staleness` — no manual `--rebuild` needed for the v2→v3 upgrade. Short queries (< 3 bytes, e.g. `fn`, `if`) cannot produce trigrams and fall back to an all-files score-0 candidate set, which is filtered down to matching files by the Part A substring-verify gate (AD-355-7); this is correct behavior, not a bug.
+- **AST index:** the structural n-gram index (`ast_index.skidx` / `.skpost`) is format v2 — v1 files are rejected with "please rebuild" (`skim search index --rebuild`). Synthetic n-gram markers (IDs ≥ 64900) resolve to `None` in `vocab_resolve()`, keeping them isolated from real vocabulary.
 
 ## Commands
 

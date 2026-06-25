@@ -180,6 +180,13 @@ fn test_single_file_roundtrip_finds_term() {
     let reader = NgramIndexReader::open(dir.path()).unwrap();
     let results = reader.search(&SearchQuery::new("main")).unwrap();
     assert!(!results.is_empty(), "should find 'main'");
+    // PF-007 (discriminating): assert rank and membership, not just !is_empty().
+    // The single file indexed must be FileId(0) and must be results[0].
+    assert_eq!(
+        results[0].file_id.0, 0,
+        "single-file index: the only file must rank first; got {:?}",
+        results[0].file_id
+    );
     assert!(results[0].score > 0.0, "score should be positive");
 }
 
@@ -214,6 +221,15 @@ fn test_multi_file_search_returns_correct_file_ids() {
         file_ids.contains(&0) && file_ids.contains(&1),
         "should find files 0 and 1, got {:?}",
         file_ids
+    );
+    // PF-007 (discriminating negative, plan §5): file 2 has "completely different
+    // content here" — zero trigram overlap with "unique_token_alpha" — and must be
+    // ABSENT from the raw candidate set.  Without this assertion the test passes
+    // even if the reader erroneously returns unrelated files.
+    assert!(
+        !file_ids.contains(&2),
+        "file 2 ('completely different content') shares no trigrams with \
+        'unique_token_alpha' and must be absent from raw results; got {file_ids:?}"
     );
 }
 

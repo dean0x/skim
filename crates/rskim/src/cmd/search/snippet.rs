@@ -117,10 +117,13 @@ pub(super) fn extract_snippet(
     if match_positions.is_empty() {
         return SnippetOutcome::Unavailable;
     }
-    // Delegate to extract_snippet_and_verify with a sentinel query that is
-    // always present in any file content (empty string — no tokens → vacuously
-    // true), so the `verified` flag is always true and the outcome is the pure
-    // snippet result.  This eliminates the previous copy-paste of the
+    // Delegate to extract_snippet_and_verify with an empty sentinel query.
+    // `_verified` is discarded — this function is only used for tests that
+    // exercise the snippet-extraction path in isolation, not the verify gate.
+    // The sentinel "" is safe here because `_verified` is unused: the defense-
+    // in-depth change in `query_substring_present` (Finding 15) means "" now
+    // returns false, but since this function ignores verified, behavior is
+    // unchanged.  This eliminates the previous copy-paste of the
     // stat/mtime/size/read/decode pipeline (Finding 10 / DRY fix).
     let (outcome, _verified) =
         extract_snippet_and_verify(root, rel_path, match_positions, manifest_entry, "");
@@ -164,18 +167,24 @@ pub(super) fn extract_snippet(
 pub(super) fn query_substring_present(content: &str, query: &str) -> bool {
     // Split on whitespace; require every non-empty token to appear in content.
     //
-    // When the token set is empty (empty query OR whitespace-only query),
-    // .all() returns vacuously true — callers must short-circuit on
-    // whitespace-only queries before reaching this function.  The CLI dispatch
-    // (mod.rs) trims and rejects whitespace-only queries so this path is only
-    // reached for genuinely empty strings (which are also short-circuited earlier
-    // in execute_query_with_manifest).  A whitespace-only query that somehow
-    // reaches here is treated as "no constraint" = true — this is a documented
-    // edge case, not a security-relevant path, because the caller guarantees
-    // the query has already passed the is_empty()/trim().is_empty() guards.
-    query
-        .split_whitespace()
-        .all(|token| content.contains(token))
+    // Defense-in-depth (Finding 15 / #355 cycle-2): if the token set is empty
+    // (empty query OR whitespace-only query), `.all()` would return vacuously true
+    // and let all candidates through.  To guard against a future caller that skips
+    // the is_empty()/trim() guards, we make the empty-token case explicit here:
+    // an empty/whitespace-only query is treated as "no match" (false).
+    //
+    // The CLI dispatch (mod.rs:97) already rejects whitespace-only queries before
+    // reaching this function, and execute_query_with_manifest short-circuits on
+    // empty queries.  This local guard is an additional safety net so the predicate's
+    // safety property is self-contained — removing a caller guard cannot silently
+    // re-open the bug.
+    let mut tokens = query.split_whitespace().peekable();
+    if tokens.peek().is_none() {
+        // Empty or whitespace-only query: treat as "not present" (no content
+        // matches a non-existent query term).
+        return false;
+    }
+    tokens.all(|token| content.contains(token))
 }
 
 /// Extract a snippet and simultaneously verify that `query` is present in the
@@ -230,10 +239,35 @@ pub(super) fn extract_snippet_and_verify(
     }
 
     // Size guard.
+    //
+    // Files exceeding MAX_SNIPPET_FILE_BYTES cannot produce a snippet (the context
+    // window would allocate the entire file).  However, we MUST NOT conflate
+    // "too large to snippet" with "failed verification" — a large UTF-8 source file
+    // that genuinely CONTAINS the query must survive as a snippet-less result
+    // (Finding 20 / #355 cycle-2).
+    //
+    // For large files we do a bounded verification read: read at most
+    // MAX_VERIFY_SCAN_BYTES of the file and run query_substring_present on that
+    // prefix.  This preserves pre-#355 behaviour (large files were returned
+    // snippet-less; verification is new but correct) while keeping the I/O
+    // cost bounded.  A query match that spans byte offset >MAX_VERIFY_SCAN_BYTES
+    // will produce a false negative (file dropped from results) — that is the
+    // accepted trade-off for files well beyond the size limit.
     const MAX_SNIPPET_FILE_BYTES: u64 = 5 * 1024 * 1024;
+    const MAX_VERIFY_SCAN_BYTES: usize = 5 * 1024 * 1024; // same bound as snippet limit
     let file_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     if file_size > MAX_SNIPPET_FILE_BYTES {
-        return (SnippetOutcome::Unavailable, false);
+        use std::io::Read;
+        let mut buf = vec![0u8; MAX_VERIFY_SCAN_BYTES];
+        let n = std::fs::File::open(&abs_path)
+            .ok()
+            .and_then(|mut f| f.read(&mut buf).ok())
+            .unwrap_or(0);
+        let prefix = &buf[..n];
+        let verified = std::str::from_utf8(prefix)
+            .map(|text| query_substring_present(text, query))
+            .unwrap_or(false);
+        return (SnippetOutcome::Unavailable, verified);
     }
 
     // Read file content — single I/O operation shared by snippet extraction
