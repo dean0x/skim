@@ -87,9 +87,8 @@ impl ScoringCtx {
     /// cache hits only occur with more than one n-gram; P1 #286).
     pub(super) fn new(file_count: usize, with_cache: bool) -> Self {
         let scores = FxHashMap::with_capacity_and_hasher(CAPACITY_FLOOR, Default::default());
-        let meta_cache = with_cache.then(|| {
-            FxHashMap::with_capacity_and_hasher(CAPACITY_FLOOR, Default::default())
-        });
+        let meta_cache = with_cache
+            .then(|| FxHashMap::with_capacity_and_hasher(CAPACITY_FLOOR, Default::default()));
         Self {
             scores,
             meta_cache,
