@@ -296,8 +296,8 @@ impl SearchLayer for NgramIndexReader {
     ///
     /// # Algorithm
     ///
-    /// 1. Extract query bigrams via [`extract_query_ngrams`] (sorted by weight desc).
-    /// 2. For each bigram, retrieve its posting list.
+    /// 1. Extract query trigrams via [`extract_query_ngrams`] (sorted by weight desc).
+    /// 2. For each trigram, retrieve its posting list.
     /// 3. Accumulate per-document, per-field term frequencies and match positions.
     /// 4. Apply language filter if `query.lang` is set.
     /// 5. Score each document with BM25F using per-field TF, field lengths, and

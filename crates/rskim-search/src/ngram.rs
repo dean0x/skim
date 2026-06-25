@@ -326,21 +326,12 @@ pub fn extract_query_ngrams_with_weights(query: &str, weights: &[(u32, f32)]) ->
     let mut selected: Vec<(Ngram, f32)> = Vec::new();
 
     for (ngram, w, pos) in candidates {
-        let p0 = covered[pos];
-        let p1 = covered[pos + 1];
-        let p2 = covered[pos + 2];
-        if !p0 || !p1 || !p2 {
-            if !covered[pos] {
-                covered[pos] = true;
-                uncovered_count -= 1;
-            }
-            if !covered[pos + 1] {
-                covered[pos + 1] = true;
-                uncovered_count -= 1;
-            }
-            if !covered[pos + 2] {
-                covered[pos + 2] = true;
-                uncovered_count -= 1;
+        if !covered[pos] || !covered[pos + 1] || !covered[pos + 2] {
+            for slot in &mut covered[pos..pos + 3] {
+                if !*slot {
+                    *slot = true;
+                    uncovered_count -= 1;
+                }
             }
             selected.push((ngram, w));
         }

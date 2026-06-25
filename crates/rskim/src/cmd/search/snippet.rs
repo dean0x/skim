@@ -182,7 +182,7 @@ pub(super) fn extract_snippet(
 /// - `extract_snippet` is the **only call site** where file bytes already exist
 ///   at query time.  Verification piggy-backs on that existing read at zero
 ///   additional I/O cost.
-/// - This makes the predicate a **candidate-then-verify** gate: the bigram index
+/// - This makes the predicate a **candidate-then-verify** gate: the trigram index
 ///   generates candidates cheaply; this fn drops non-matching ones.
 ///
 /// # Match semantics (AD-355-3)
@@ -193,12 +193,11 @@ pub(super) fn extract_snippet(
 ///   `"foo"` and `"bar"` to appear as substrings somewhere in the file.  This
 ///   matches code-search ergonomics where users expect conjunctive multi-word
 ///   queries.
-/// - **Single-token / sub-2-byte queries**: the bigram reader already returns an
-///   empty candidate set for queries shorter than 2 bytes
-///   (`extract_query_ngrams` returns `[]` for `len < 2`).  Verification of a
-///   sub-2-byte query over a non-empty candidate list is therefore moot in
-///   practice, but this fn handles it correctly: the token must appear as a
-///   substring.
+/// - **Short queries (< 3 bytes)**: the trigram reader returns all indexed files as
+///   score-0 candidates for queries shorter than 3 bytes (`extract_query_ngrams`
+///   returns `[]` for `len < 3`; see AD-355-7).  Verification is the only
+///   correctness gate in that path — this fn filters those candidates down to
+///   files that actually contain the literal query string.
 ///
 /// This fn is pure (no I/O, no side effects) so it can be unit-tested in
 /// isolation — see `snippet_tests.rs`.

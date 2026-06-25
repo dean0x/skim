@@ -202,7 +202,7 @@ pub(super) fn execute_query_with_manifest(
     //
     // Without widening, the reader truncates to `--limit` BEFORE we can verify
     // substring membership: the definer file may already have been discarded below
-    // incidental-overlap junk that happens to share a few bigrams.  By fetching
+    // incidental-overlap junk that happens to share a few trigrams.  By fetching
     // LEXICAL_CANDIDATE_POOL_K × limit candidates first, we ensure verification
     // acts as a true filter over the ranked list, not over an already-truncated
     // stub.  After verification the result set is truncated to `--limit` LAST.
