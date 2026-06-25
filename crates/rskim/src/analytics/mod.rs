@@ -23,10 +23,35 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use rayon::prelude::*;
 use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::tokens;
+
+// ============================================================================
+// Shared time constant
+// ============================================================================
+
+/// Seconds per day — replaces bare `86400` literals in prune logic and
+/// timestamp calculations (used here and in `cmd::hook_log`).
+pub(crate) const SECONDS_PER_DAY: u64 = 86_400;
+
+// ============================================================================
+// Tokenization caps (applies ADR-001)
+// ============================================================================
+
+/// Maximum byte length for background BPE tokenization.
+///
+/// Inputs above this threshold skip tokenization and use byte length as a proxy.
+/// Mirrors TOKEN_SIZE_CAP in `cmd::execution::savings_decision` (ADR-001).
+const TOKEN_SIZE_CAP: usize = 256 * 1024;
+
+/// Maximum non-whitespace run length before falling back to byte comparison.
+///
+/// cl100k BPE merge is O(n²) in run length; this bounds the per-word cost.
+/// Mirrors TOKEN_RUN_CAP in `cmd::execution::savings_decision` (ADR-001).
+const TOKEN_RUN_CAP: usize = 4 * 1024;
 
 // ============================================================================
 // Types
@@ -381,11 +406,15 @@ impl AnalyticsDb {
     }
 
     /// Open database at default location, or override with SKIM_ANALYTICS_DB env var.
+    ///
+    /// Empty or whitespace-only `SKIM_ANALYTICS_DB` is treated as unset and falls
+    /// back to the default path (mirrors the `SKIM_CACHE_DIR` hardening in
+    /// [`crate::cache::cache_root_from`]).  `SKIM_ANALYTICS_DB` takes precedence
+    /// over `SKIM_CACHE_DIR` when both are set.
     pub(crate) fn open_default() -> anyhow::Result<Self> {
-        let path = if let Ok(override_path) = std::env::var("SKIM_ANALYTICS_DB") {
-            PathBuf::from(override_path)
-        } else {
-            crate::cache::get_cache_dir()?.join("analytics.db")
+        let path = match std::env::var("SKIM_ANALYTICS_DB") {
+            Ok(s) if !s.trim().is_empty() => PathBuf::from(s),
+            _ => crate::cache::get_cache_dir()?.join("analytics.db"),
         };
         Self::open(&path)
     }
@@ -623,7 +652,7 @@ impl AnalyticsDb {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64
-            - (days as i64 * 86400);
+            - (days as i64 * SECONDS_PER_DAY as i64);
         let count = self
             .conn
             .execute("DELETE FROM token_savings WHERE timestamp < ?1", [cutoff])?;
@@ -647,7 +676,7 @@ impl AnalyticsDb {
             )
             .unwrap_or(0);
 
-        if now as i64 - last_prune > 86400 && self.prune_older_than(90).is_ok() {
+        if now as i64 - last_prune > SECONDS_PER_DAY as i64 && self.prune_older_than(90).is_ok() {
             let _ = self.conn.execute(
                 "INSERT OR REPLACE INTO analytics_meta (key, value) VALUES ('last_prune', ?1)",
                 [now as i64],
@@ -1033,6 +1062,132 @@ pub(crate) fn record_with_counts(enabled: bool, record: TokenSavingsRecord) {
     }
     register_thread(std::thread::spawn(move || {
         persist_record(&record);
+    }));
+}
+
+// ============================================================================
+// File-op unified recorder (Phase A1 — fixes PF-001)
+// ============================================================================
+
+/// Count tokens in `text` with ADR-001 size and run-length caps.
+///
+/// - If `text.len() > TOKEN_SIZE_CAP`: falls back to byte-length heuristic (`len / 4`).
+/// - If the longest non-whitespace run exceeds `TOKEN_RUN_CAP` (only checked when
+///   below the size cap): falls back to byte-length heuristic to avoid O(n²) BPE cost.
+/// - Otherwise: delegates to [`tokens::count_tokens`].
+///
+/// Using the byte heuristic for oversized inputs is consistent with the approach
+/// in `cmd::execution::savings_decision` (applies ADR-001): token accuracy matters
+/// most for small, typical source files which are always below the cap.
+fn count_tokens_bounded(text: &str) -> usize {
+    if text.len() > TOKEN_SIZE_CAP {
+        return text.len() / 4;
+    }
+    // Longest non-whitespace run check (O(n), bounded to ≤TOKEN_SIZE_CAP bytes).
+    let longest_run = text
+        .as_bytes()
+        .split(|b| b.is_ascii_whitespace())
+        .map(|run| run.len())
+        .max()
+        .unwrap_or(0);
+    if longest_run > TOKEN_RUN_CAP {
+        return text.len() / 4;
+    }
+    // Safe to tokenize: input is small and well-formed.
+    tokens::count_tokens(text).unwrap_or(text.len() / 4)
+}
+
+/// Source of the raw text for background tokenization.
+///
+/// - `Reread(path)`: single file — re-read from disk on the background thread.
+/// - `Inline(text)`: stdin — retain the buffer in-memory (stdin cannot be re-read).
+pub(crate) enum RawSource {
+    Reread(PathBuf),
+    Inline(String),
+}
+
+/// How token counts are obtained for a file-op row.
+pub(crate) enum FileCounts {
+    /// `--show-stats` or count-carrying cache hit: counts already computed, no re-work.
+    Known { raw: usize, compressed: usize },
+    /// Plain run / cold cache: tokenize raw + compressed off the main thread.
+    Tokenize { raw: RawSource, compressed: String },
+}
+
+/// Per-file data for a single analytics row.
+pub(crate) struct FileOpRow {
+    pub(crate) counts: FileCounts,
+    pub(crate) original_cmd: String,
+    pub(crate) language: Option<String>,
+    pub(crate) parse_tier: Option<String>,
+}
+
+/// Shared metadata common to all rows in a single file-op invocation.
+pub(crate) struct FileOpCommon {
+    pub(crate) mode: Option<String>,
+    pub(crate) project_path: String,
+    pub(crate) session_id: Option<String>,
+}
+
+/// Record file-op analytics for one or more files, off the main thread.
+///
+/// - Captures `project_path` from the main thread before the spawn.
+/// - Tokenizes in PARALLEL (rayon) when counts are not yet known.
+/// - Persists SERIALLY to avoid SQLite write contention.
+/// - Uses `register_thread` so `flush_pending()` joins before exit (fixes PF-001).
+///
+/// Returns immediately (non-blocking).  When `enabled` is false or `rows` is
+/// empty, returns without spawning any thread.
+pub(crate) fn record_file_ops(enabled: bool, rows: Vec<FileOpRow>, common: FileOpCommon) {
+    if !enabled || rows.is_empty() {
+        return;
+    }
+    register_thread(std::thread::spawn(move || {
+        let ts = now_unix_secs();
+        // Resolve counts in parallel; filter out rows where tokenization fails.
+        let records: Vec<TokenSavingsRecord> = rows
+            .into_par_iter()
+            .filter_map(|r| {
+                let (raw, comp) = match r.counts {
+                    FileCounts::Known { raw, compressed } => (raw, compressed),
+                    FileCounts::Tokenize { raw, compressed } => {
+                        let text = match raw {
+                            // Best-effort: skip row on read or UTF-8 error.
+                            // This also naturally rejects TOCTOU-grown files (size guard
+                            // in read_source rejects anything over the 50 MB limit).
+                            RawSource::Reread(p) => crate::process::read_source(&p).ok()?,
+                            RawSource::Inline(s) => s,
+                        };
+                        let raw_tok = count_tokens_bounded(&text);
+                        let comp_tok = count_tokens_bounded(&compressed);
+                        (raw_tok, comp_tok)
+                    }
+                };
+                Some(TokenSavingsRecord {
+                    timestamp: ts,
+                    command_type: CommandType::File,
+                    original_cmd: r.original_cmd,
+                    raw_tokens: raw,
+                    compressed_tokens: comp,
+                    savings_pct: savings_percentage(raw, comp),
+                    duration_ms: 0,
+                    project_path: common.project_path.clone(),
+                    mode: common.mode.clone(),
+                    language: r.language,
+                    parse_tier: r.parse_tier,
+                    session_id: common.session_id.clone(),
+                })
+            })
+            .collect();
+        // Open DB once for all rows; skip silently on open failure (mirrors persist_record).
+        if let Ok(db) = AnalyticsDb::open_default() {
+            for rec in &records {
+                let _ = db.record(rec);
+            }
+            if !records.is_empty() {
+                db.maybe_prune();
+            }
+        }
     }));
 }
 

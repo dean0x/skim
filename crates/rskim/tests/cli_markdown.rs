@@ -2,10 +2,10 @@
 //!
 //! Tests markdown header extraction with various modes.
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
+mod common;
 
 // ============================================================================
 // Structure Mode Tests (H1-H3)
@@ -44,8 +44,7 @@ This should also NOT appear.
     )
     .unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("structure")
@@ -89,8 +88,7 @@ fn test_markdown_structure_mode_auto_detect() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         // No --mode specified, should default to structure
         .assert()
@@ -128,8 +126,7 @@ Some body text that should not appear.
     )
     .unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("signatures")
@@ -172,8 +169,7 @@ fn test_markdown_types_mode() {
     )
     .unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("types")
@@ -214,8 +210,7 @@ More content.
     )
     .unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("structure")
@@ -259,8 +254,7 @@ Setext Style H2
     )
     .unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("signatures")
@@ -297,8 +291,7 @@ More body content.
 "#;
     fs::write(&file_path, content).unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("full")
@@ -320,11 +313,7 @@ fn test_markdown_empty_file() {
     let file_path = temp_dir.path().join("empty.md");
     fs::write(&file_path, "").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg(&file_path)
-        .assert()
-        .success();
+    common::skim().arg(&file_path).assert().success();
 }
 
 #[test]
@@ -333,8 +322,7 @@ fn test_markdown_no_headers() {
     let file_path = temp_dir.path().join("test.md");
     fs::write(&file_path, "Just some plain text without any headers.").unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("structure")
@@ -358,8 +346,7 @@ fn test_markdown_extension_variations() {
         let file_path = temp_dir.path().join(format!("test.{}", ext));
         fs::write(&file_path, "# Test Header").unwrap();
 
-        Command::cargo_bin("skim")
-            .unwrap()
+        common::skim()
             .arg(&file_path)
             .assert()
             .success()

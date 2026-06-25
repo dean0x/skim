@@ -2,11 +2,11 @@
 //!
 //! Tests the full CLI binary with real command-line arguments.
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use std::time::Instant;
 use tempfile::TempDir;
+mod common;
 
 // ============================================================================
 // Basic CLI Tests
@@ -14,8 +14,7 @@ use tempfile::TempDir;
 
 #[test]
 fn test_cli_version() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("--version")
         .assert()
         .success()
@@ -25,8 +24,7 @@ fn test_cli_version() {
 
 #[test]
 fn test_cli_help() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("--help")
         .assert()
         .success()
@@ -49,8 +47,7 @@ fn test_cli_structure_mode() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("structure")
@@ -71,8 +68,7 @@ fn test_cli_signatures_mode() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("signatures")
@@ -94,8 +90,7 @@ fn test_cli_types_mode() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("types")
@@ -112,8 +107,7 @@ fn test_cli_full_mode() {
     let content = "function add(a: number, b: number): number { return a + b; }";
     fs::write(&file_path, content).unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("full")
@@ -132,11 +126,7 @@ fn test_cli_auto_detect_typescript() {
     let file_path = temp_dir.path().join("test.ts");
     fs::write(&file_path, "function test() { }").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg(&file_path)
-        .assert()
-        .success();
+    common::skim().arg(&file_path).assert().success();
 }
 
 #[test]
@@ -145,11 +135,7 @@ fn test_cli_auto_detect_python() {
     let file_path = temp_dir.path().join("test.py");
     fs::write(&file_path, "def test(): pass").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg(&file_path)
-        .assert()
-        .success();
+    common::skim().arg(&file_path).assert().success();
 }
 
 #[test]
@@ -158,11 +144,7 @@ fn test_cli_auto_detect_rust() {
     let file_path = temp_dir.path().join("test.rs");
     fs::write(&file_path, "fn test() {}").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg(&file_path)
-        .assert()
-        .success();
+    common::skim().arg(&file_path).assert().success();
 }
 
 // ============================================================================
@@ -171,8 +153,7 @@ fn test_cli_auto_detect_rust() {
 
 #[test]
 fn test_cli_stdin_with_language() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--language")
         .arg("typescript")
@@ -184,8 +165,7 @@ fn test_cli_stdin_with_language() {
 
 #[test]
 fn test_cli_stdin_without_language_fails() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .write_stdin("function test() {}")
         .assert()
@@ -201,8 +181,7 @@ fn test_cli_stdin_without_language_fails() {
 
 #[test]
 fn test_cli_nonexistent_file() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("nonexistent.ts")
         .assert()
         .failure()
@@ -215,8 +194,7 @@ fn test_cli_unsupported_extension() {
     let file_path = temp_dir.path().join("test.xyz");
     fs::write(&file_path, "some code").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .assert()
         .failure()
@@ -229,8 +207,7 @@ fn test_cli_invalid_mode() {
     let file_path = temp_dir.path().join("test.ts");
     fs::write(&file_path, "function test() {}").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("invalid")
@@ -249,8 +226,7 @@ fn test_cli_all_languages_structure() {
     // TypeScript
     let ts_file = temp_dir.path().join("test.ts");
     fs::write(&ts_file, "function test() { return 42; }").unwrap();
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&ts_file)
         .assert()
         .success()
@@ -259,8 +235,7 @@ fn test_cli_all_languages_structure() {
     // Python
     let py_file = temp_dir.path().join("test.py");
     fs::write(&py_file, "def test():\n    return 42").unwrap();
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&py_file)
         .assert()
         .success()
@@ -269,8 +244,7 @@ fn test_cli_all_languages_structure() {
     // Rust
     let rs_file = temp_dir.path().join("test.rs");
     fs::write(&rs_file, "fn test() { 42 }").unwrap();
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&rs_file)
         .assert()
         .success()
@@ -279,8 +253,7 @@ fn test_cli_all_languages_structure() {
     // Go
     let go_file = temp_dir.path().join("test.go");
     fs::write(&go_file, "func test() int { return 42 }").unwrap();
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&go_file)
         .assert()
         .success()
@@ -289,8 +262,7 @@ fn test_cli_all_languages_structure() {
     // Java
     let java_file = temp_dir.path().join("Test.java");
     fs::write(&java_file, "class Test { int test() { return 42; } }").unwrap();
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&java_file)
         .assert()
         .success()
@@ -307,8 +279,7 @@ fn test_cli_empty_file() {
     let file_path = temp_dir.path().join("empty.ts");
     fs::write(&file_path, "").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .assert()
         .success()
@@ -321,8 +292,7 @@ fn test_cli_unicode_content() {
     let file_path = temp_dir.path().join("test.ts");
     fs::write(&file_path, "function greet() { return \"你好 🎉\"; }").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .assert()
         .success()
@@ -336,11 +306,7 @@ fn test_cli_malformed_syntax() {
     fs::write(&file_path, "function broken(() { { { {").unwrap();
 
     // tree-sitter is error-tolerant, should not crash
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg(&file_path)
-        .assert()
-        .success();
+    common::skim().arg(&file_path).assert().success();
 }
 
 // ============================================================================
@@ -354,8 +320,7 @@ fn test_cli_explicit_language_override() {
     fs::write(&file_path, "function test() { return 42; }").unwrap();
 
     // Force TypeScript parsing despite .txt extension
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--language")
         .arg("typescript")
@@ -378,8 +343,7 @@ fn test_cli_minimal_mode() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("minimal")
@@ -398,8 +362,7 @@ fn test_cli_minimal_mode() {
 
 #[test]
 fn test_cli_minimal_mode_stdin() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--language")
         .arg("typescript")
@@ -423,8 +386,7 @@ fn test_cli_minimal_mode_python_shebang() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("minimal")
@@ -440,8 +402,7 @@ fn test_cli_minimal_mode_python_shebang() {
 
 #[test]
 fn test_cli_minimal_mode_help_text() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("--help")
         .assert()
         .success()
@@ -454,8 +415,7 @@ fn test_cli_minimal_mode_help_text() {
 
 #[test]
 fn test_cli_lang_alias_stdin() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--lang=typescript")
         .write_stdin("function add(a: number, b: number): number { return a + b; }")
@@ -468,8 +428,7 @@ fn test_cli_lang_alias_stdin() {
 fn test_cli_lang_and_language_equivalent() {
     let input = "function greet(name: string): string { return `Hello ${name}`; }";
 
-    let lang_output = Command::cargo_bin("skim")
-        .unwrap()
+    let lang_output = common::skim()
         .arg("-")
         .arg("--lang=typescript")
         .write_stdin(input)
@@ -479,8 +438,7 @@ fn test_cli_lang_and_language_equivalent() {
         .stdout
         .clone();
 
-    let language_output = Command::cargo_bin("skim")
-        .unwrap()
+    let language_output = common::skim()
         .arg("-")
         .arg("--language=typescript")
         .write_stdin(input)
@@ -511,8 +469,7 @@ fn test_cli_lang_alias_with_file() {
     .unwrap();
 
     // --lang alias should work with file arguments, not just stdin
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--lang=typescript")
         .assert()
@@ -527,8 +484,7 @@ fn test_cli_lang_alias_with_file() {
 
 #[test]
 fn test_cli_filename_detects_rust() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--filename=main.rs")
         .write_stdin("fn hello() { println!(\"hi\"); }")
@@ -540,8 +496,7 @@ fn test_cli_filename_detects_rust() {
 
 #[test]
 fn test_cli_filename_detects_typescript() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--filename=app.ts")
         .write_stdin("function greet(name: string): string { return name; }")
@@ -552,8 +507,7 @@ fn test_cli_filename_detects_typescript() {
 
 #[test]
 fn test_cli_filename_detects_python() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--filename=script.py")
         .write_stdin("def hello():\n    return 42")
@@ -564,8 +518,7 @@ fn test_cli_filename_detects_python() {
 
 #[test]
 fn test_cli_filename_detects_go() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--filename=main.go")
         .write_stdin("func hello() int { return 42 }")
@@ -577,8 +530,7 @@ fn test_cli_filename_detects_go() {
 
 #[test]
 fn test_cli_filename_detects_java() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--filename=Main.java")
         .write_stdin("class Main { int hello() { return 42; } }")
@@ -590,8 +542,7 @@ fn test_cli_filename_detects_java() {
 
 #[test]
 fn test_cli_filename_detects_json() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--filename=config.json")
         .write_stdin(r#"{"name": "skim", "version": "1.0.0", "nested": {"key": "value"}}"#)
@@ -604,8 +555,7 @@ fn test_cli_filename_detects_json() {
 #[test]
 fn test_cli_filename_language_override() {
     // --language takes priority over --filename
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--language=python")
         .arg("--filename=main.rs")
@@ -617,8 +567,7 @@ fn test_cli_filename_language_override() {
 
 #[test]
 fn test_cli_filename_no_extension_fails() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--filename=Makefile")
         .write_stdin("all: build")
@@ -629,8 +578,7 @@ fn test_cli_filename_no_extension_fails() {
 
 #[test]
 fn test_cli_filename_unknown_ext_fails() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--filename=foo.xyz")
         .write_stdin("some content")
@@ -645,8 +593,7 @@ fn test_cli_filename_not_stdin_fails() {
     let file_path = temp_dir.path().join("test.ts");
     fs::write(&file_path, "function test() { }").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--filename=main.rs")
         .assert()
@@ -659,8 +606,7 @@ fn test_cli_filename_not_stdin_fails() {
 #[test]
 fn test_cli_filename_with_path_prefix() {
     // --filename with directory components should still detect language from extension
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--filename=src/lib/main.rs")
         .write_stdin("fn hello() { 42 }")
@@ -671,8 +617,7 @@ fn test_cli_filename_with_path_prefix() {
 
 #[test]
 fn test_cli_filename_with_mode() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--filename=app.ts")
         .arg("--mode=signatures")
@@ -713,8 +658,7 @@ impl Calculator {
 }
 "#;
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--filename=lib.rs")
         .arg("--mode=signatures")
@@ -750,8 +694,7 @@ fn test_cli_stdin_large_input_streaming() {
         ));
     }
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg("-")
         .arg("--language=typescript")
         .write_stdin(input)
@@ -803,8 +746,7 @@ fn test_cli_stdin_large_input_completes_within_time_bound() {
 
     let start = Instant::now();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--language=typescript")
         .write_stdin(input)
@@ -833,8 +775,7 @@ fn test_cli_pseudo_mode() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("pseudo")
@@ -858,8 +799,7 @@ fn test_cli_pseudo_mode_python() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("pseudo")
@@ -880,8 +820,7 @@ fn test_cli_pseudo_mode_rust() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--mode")
         .arg("pseudo")
@@ -893,8 +832,7 @@ fn test_cli_pseudo_mode_rust() {
 
 #[test]
 fn test_cli_pseudo_mode_stdin() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--lang=typescript")
         .arg("--mode=pseudo")

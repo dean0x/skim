@@ -1,10 +1,10 @@
 //! Integration tests for `skim completions` subcommand (#63).
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use std::io::Write;
 use tempfile::TempDir;
+mod common;
 
 // ============================================================================
 // Successful generation
@@ -12,8 +12,7 @@ use tempfile::TempDir;
 
 #[test]
 fn test_completions_bash_outputs_valid_script() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("completions")
         .arg("bash")
         .assert()
@@ -24,8 +23,7 @@ fn test_completions_bash_outputs_valid_script() {
 
 #[test]
 fn test_completions_zsh_outputs_valid_script() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("completions")
         .arg("zsh")
         .assert()
@@ -35,8 +33,7 @@ fn test_completions_zsh_outputs_valid_script() {
 
 #[test]
 fn test_completions_fish_outputs_valid_script() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("completions")
         .arg("fish")
         .assert()
@@ -51,8 +48,7 @@ fn test_completions_fish_outputs_valid_script() {
 
 #[test]
 fn test_completions_include_mode_values() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("completions")
         .arg("bash")
         .assert()
@@ -62,8 +58,7 @@ fn test_completions_include_mode_values() {
 
 #[test]
 fn test_completions_include_language_values() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("completions")
         .arg("bash")
         .assert()
@@ -73,8 +68,7 @@ fn test_completions_include_language_values() {
 
 #[test]
 fn test_completions_include_subcommand_names() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("completions")
         .arg("bash")
         .assert()
@@ -88,8 +82,7 @@ fn test_completions_include_subcommand_names() {
 
 #[test]
 fn test_completions_powershell_outputs_valid_script() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("completions")
         .arg("powershell")
         .assert()
@@ -99,8 +92,7 @@ fn test_completions_powershell_outputs_valid_script() {
 
 #[test]
 fn test_completions_elvish_outputs_valid_script() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("completions")
         .arg("elvish")
         .assert()
@@ -114,8 +106,7 @@ fn test_completions_elvish_outputs_valid_script() {
 
 #[test]
 fn test_completions_case_sensitive_rejects_uppercase() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("completions")
         .arg("BASH")
         .assert()
@@ -129,8 +120,7 @@ fn test_completions_case_sensitive_rejects_uppercase() {
 
 #[test]
 fn test_completions_extra_args_ignored() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("completions")
         .arg("bash")
         .arg("extra")
@@ -146,8 +136,7 @@ fn test_completions_extra_args_ignored() {
 
 #[test]
 fn test_completions_bash_syntax_valid() {
-    let completions_output = Command::cargo_bin("skim")
-        .unwrap()
+    let completions_output = common::skim()
         .arg("completions")
         .arg("bash")
         .output()
@@ -189,8 +178,7 @@ fn test_completions_subcommand_always_routes_to_subcommand() {
     // After the router fix, bare "completions" ALWAYS routes to the subcommand
     // even when a file named "completions" exists on disk.
     // To read such a file, users must use ./completions or the full path.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .current_dir(dir.path())
         .arg("completions")
         .arg("--help")
@@ -205,8 +193,7 @@ fn test_completions_subcommand_always_routes_to_subcommand() {
 
 #[test]
 fn test_completions_missing_shell_errors() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("completions")
         .assert()
         .failure()
@@ -215,8 +202,7 @@ fn test_completions_missing_shell_errors() {
 
 #[test]
 fn test_completions_invalid_shell_errors() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("completions")
         .arg("invalid_shell_name")
         .assert()
@@ -229,8 +215,7 @@ fn test_completions_invalid_shell_errors() {
 
 #[test]
 fn test_completions_help() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("completions")
         .arg("--help")
         .assert()
@@ -244,8 +229,7 @@ fn test_completions_help() {
 
 #[test]
 fn test_completions_include_file_tool_subcommands() {
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["completions", "bash"])
         .output()
         .unwrap();
@@ -262,8 +246,7 @@ fn test_completions_include_file_tool_subcommands() {
 
 #[test]
 fn test_completions_include_tool_subcommands() {
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["completions", "bash"])
         .output()
         .unwrap();
@@ -282,8 +265,7 @@ fn test_completions_include_tool_subcommands() {
 
 #[test]
 fn test_completions_include_log_flags() {
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["completions", "bash"])
         .output()
         .unwrap();

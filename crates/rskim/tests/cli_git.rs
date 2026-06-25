@@ -4,8 +4,8 @@
 //! These tests run against the real skim repository (which is a git repo),
 //! so they exercise the actual git binary.
 
-use assert_cmd::Command;
 use predicates::prelude::*;
+mod common;
 
 // ============================================================================
 // Helpers
@@ -79,8 +79,7 @@ fn make_hermetic_fetch_repo() -> (tempfile::TempDir, std::path::PathBuf) {
 
 #[test]
 fn test_skim_git_help() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["git", "--help"])
         .assert()
         .success()
@@ -92,8 +91,7 @@ fn test_skim_git_help() {
 
 #[test]
 fn test_skim_git_no_args_shows_help() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("git")
         .assert()
         .success()
@@ -109,8 +107,7 @@ fn test_skim_git_status_in_repo() {
     // Run against the skim repo itself — should succeed and produce output.
     // The net-savings guard may passthrough on small repos; we check that the
     // command exits 0 and produces content (either skim-format or raw git output).
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["git", "status"])
         .assert()
         .success()
@@ -166,8 +163,7 @@ fn test_skim_git_status_porcelain_compresses() {
     // IMPORTANT: the porcelain flag is stripped to avoid fabricating machine-readable
     // output; the raw porcelain lines appear in passthrough if the guard fires.
     let (_dir, repo) = make_hermetic_dirty_repo();
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["git", "status", "--porcelain"])
         .current_dir(&repo)
         .assert()
@@ -184,8 +180,7 @@ fn test_skim_git_status_short_compresses() {
     // changes the raw output is non-empty so the result (skim-format or raw
     // passthrough) is non-empty and the command exits 0.
     let (_dir, repo) = make_hermetic_dirty_repo();
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["git", "status", "-s"])
         .current_dir(&repo)
         .assert()
@@ -216,8 +211,7 @@ fn test_skim_git_status_short_never_expands_vs_raw() {
     let raw_len = raw_output.stdout.len();
 
     // Run `skim git status -s` against the same repo.
-    let skim_output = Command::cargo_bin("skim")
-        .unwrap()
+    let skim_output = common::skim()
         .args(["git", "status", "-s"])
         .current_dir(&repo)
         .env_remove("SKIM_PASSTHROUGH")
@@ -261,8 +255,7 @@ fn test_skim_git_status_short_longform_never_expands_vs_raw() {
         .expect("git must be available");
     let raw_len = raw_output.stdout.len();
 
-    let skim_output = Command::cargo_bin("skim")
-        .unwrap()
+    let skim_output = common::skim()
         .args(["git", "status", "--short"])
         .current_dir(&repo)
         .env_remove("SKIM_PASSTHROUGH")
@@ -295,17 +288,12 @@ fn test_skim_git_status_short_longform_never_expands_vs_raw() {
 #[test]
 fn test_skim_git_diff_in_repo() {
     // Clean repo has no diff — AST-aware pipeline outputs "No changes" to stderr
-    Command::cargo_bin("skim")
-        .unwrap()
-        .args(["git", "diff"])
-        .assert()
-        .success();
+    common::skim().args(["git", "diff"]).assert().success();
 }
 
 #[test]
 fn test_skim_git_diff_name_only_passthrough() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["git", "diff", "--name-only"])
         .assert()
         .success();
@@ -320,8 +308,7 @@ fn test_skim_git_log_in_repo() {
     // The handler runs and exits 0; on a small repo the net-savings guard may
     // passthrough rather than emitting the skim-format "log N commits" header.
     // We verify the command exits 0 and produces some output.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["git", "log"])
         .assert()
         .success()
@@ -331,8 +318,7 @@ fn test_skim_git_log_in_repo() {
 #[test]
 fn test_skim_git_log_with_limit() {
     // The guard may passthrough on small outputs; verify exits 0 with content.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["git", "log", "-n", "3"])
         .assert()
         .success()
@@ -343,8 +329,7 @@ fn test_skim_git_log_with_limit() {
 fn test_skim_git_log_oneline_compresses() {
     // --oneline is stripped by the handler; handler still runs and exits 0.
     // Net-savings guard may passthrough on small outputs.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["git", "log", "--oneline", "-n", "3"])
         .assert()
         .success()
@@ -373,8 +358,7 @@ fn test_skim_git_log_oneline_compresses() {
 #[test]
 fn test_skim_git_fetch_in_repo() {
     let (_dir, worker) = make_hermetic_fetch_repo();
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["git", "fetch"])
         .current_dir(&worker)
         .output()
@@ -402,8 +386,7 @@ fn test_skim_git_fetch_in_repo() {
 
 #[test]
 fn test_skim_git_unknown_subcommand() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["git", "unknown_subcmd"])
         .assert()
         .failure()
@@ -415,8 +398,7 @@ fn test_skim_git_log_contains_hashes() {
     // Log output must contain commit hashes (short 7-char hex).
     // On small outputs the net-savings guard may passthrough (no "log " prefix);
     // we verify the hash is present regardless of whether skim-format is used.
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["git", "log", "-n", "1"])
         .output()
         .unwrap();
@@ -444,8 +426,7 @@ fn test_skim_git_log_contains_hashes() {
 fn test_skim_git_show_help_listed_in_git_help() {
     // Match the exact subcommand row from print_help() in cmd/git/mod.rs so that
     // removing or renaming the "show" line causes this test to fail.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["git", "--help"])
         .assert()
         .success()
@@ -456,8 +437,7 @@ fn test_skim_git_show_help_listed_in_git_help() {
 
 #[test]
 fn test_skim_git_show_help_subcommand() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["git", "show", "--help"])
         .assert()
         .success()
@@ -483,8 +463,7 @@ fn test_skim_git_show_head_commit_mode() {
         .expect("git must be available");
     let raw_bytes = raw_output.stdout.len();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["git", "show", "HEAD"])
         .output()
         .unwrap();
@@ -541,8 +520,7 @@ fn test_skim_git_show_head_commit_mode() {
 #[test]
 fn test_skim_git_show_stat_passthrough() {
     // --stat triggers passthrough — git standard output format with no skim wrapping.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["git", "show", "--stat", "HEAD"])
         .assert()
         .success();
@@ -551,8 +529,7 @@ fn test_skim_git_show_stat_passthrough() {
 #[test]
 fn test_skim_git_show_unknown_subcommand_message() {
     // The "unknown git subcommand" error should now list "show" in the supported list.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["git", "totally_unknown_cmd_xyz"])
         .assert()
         .failure()
@@ -565,8 +542,7 @@ fn test_skim_git_show_file_content_json_rejected() {
     // code 2 (argument error) and print a clear error to stderr.
     // The error message must NOT embed the literal text "(exit code 2)"
     // since that would be self-contradictory if the code were ever changed.
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["git", "show", "HEAD:Cargo.toml", "--json"])
         .output()
         .unwrap();
@@ -601,8 +577,7 @@ fn test_skim_git_show_head_commit_mode_json() {
     //   1. Exit code 0.
     //   2. stdout parses as valid JSON with expected ShowCommitResult keys.
     //   3. stderr contains NO `[skim:guardrail]` marker.
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["git", "show", "HEAD", "--json"])
         .output()
         .unwrap();
@@ -662,8 +637,7 @@ fn test_skim_git_show_head_commit_mode_json() {
 fn test_skim_git_show_file_content_unsupported_ext_passthrough() {
     // MEDIUM-26: Tier-2 (unsupported extension) exercises passthrough_file_content.
     // Cargo.lock has no recognised language extension → Language::from_path returns None.
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["git", "show", "HEAD:Cargo.lock"])
         .output()
         .unwrap();
@@ -704,8 +678,7 @@ fn test_skim_git_show_file_content_unsupported_ext_passthrough() {
 /// is live in production, not merely at the transform layer.
 #[test]
 fn test_skim_git_show_file_content_pseudo_preserves_bodies() {
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args([
             "git",
             "show",
@@ -750,8 +723,7 @@ fn test_skim_git_dispatcher_routes_all_subcommands() {
     // ---- status ----
     // The handler runs and exits 0; the net-savings guard may passthrough on
     // small repos rather than emitting the skim "status " format header.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["git", "status"])
         .assert()
         .success()
@@ -759,8 +731,7 @@ fn test_skim_git_dispatcher_routes_all_subcommands() {
 
     // ---- log ----
     // The handler runs and exits 0; net-savings guard may passthrough on 1-commit output.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["git", "log", "-n", "1"])
         .assert()
         .success()
@@ -770,8 +741,7 @@ fn test_skim_git_dispatcher_routes_all_subcommands() {
     // The show handler (commit mode, --json) produces a JSON object —
     // passthrough would emit raw git format starting with "commit ".
     {
-        let output = Command::cargo_bin("skim")
-            .unwrap()
+        let output = common::skim()
             .args(["git", "show", "HEAD", "--json"])
             .output()
             .unwrap();
@@ -788,11 +758,7 @@ fn test_skim_git_dispatcher_routes_all_subcommands() {
     // `git diff` on a clean repo exits 0.  The diff handler's own help string
     // differs from native git output, but a minimal invocation only guarantees
     // exit 0 when there are no unstaged changes.
-    Command::cargo_bin("skim")
-        .unwrap()
-        .args(["git", "diff"])
-        .assert()
-        .success();
+    common::skim().args(["git", "diff"]).assert().success();
 
     // ---- fetch ----
     // `git fetch` when up-to-date writes progress to STDERR only, leaving
@@ -802,8 +768,7 @@ fn test_skim_git_dispatcher_routes_all_subcommands() {
     // stdout with "up to date" surfacing in stderr from the git process.
     {
         let (_dir, worker) = make_hermetic_fetch_repo();
-        let output = Command::cargo_bin("skim")
-            .unwrap()
+        let output = common::skim()
             .args(["git", "fetch"])
             .current_dir(&worker)
             .output()
@@ -864,8 +829,7 @@ fn test_git_show_preserves_commit_body() {
         .output()
         .expect("git commit");
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["git", "show", "HEAD"])
         .current_dir(path)
         .output()
@@ -911,8 +875,7 @@ fn test_git_show_preserves_commit_body() {
 /// non-zero, but stderr would have been empty).
 #[test]
 fn test_skim_git_show_invalid_ref_exits_nonzero() {
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["git", "show", "INVALID_REF_THAT_CANNOT_EXIST_XYZ_12345"])
         .output()
         .unwrap();
@@ -940,8 +903,7 @@ fn test_skim_git_show_invalid_ref_exits_nonzero() {
 /// that does not exist in HEAD exercises the same fix.
 #[test]
 fn test_skim_git_show_invalid_file_ref_exits_nonzero() {
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["git", "show", "HEAD:this_file_does_not_exist_xyz.rs"])
         .output()
         .unwrap();

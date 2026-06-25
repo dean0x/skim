@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Unified `SKIM_CACHE_DIR` resolution — honored by all cache subsystems (#359 Phase B)** —
+  Previously `SKIM_CACHE_DIR` was silently ignored by the parser cache and the default
+  `analytics.db` path (`cache::get_cache_dir` read only `dirs::cache_dir()`) while the
+  search index and hook log respected it. This caused partial relocation: some skim state
+  moved, some stayed under `~/.cache/skim` (PF-002).
+
+  The fix introduces a single source of truth:
+  - `cache::cache_root_from(override_dir)` — pure resolver (no I/O); filters empty paths.
+  - `cache::cache_root()` — reads `SKIM_CACHE_DIR` and delegates to `cache_root_from`.
+  - `cache::get_cache_dir()` now calls `cache_root()` before the mkdir/chmod block.
+  - `cmd::hook_log::CacheEnv::resolve_cache_dir()` now delegates to `cache::cache_root_from`
+    instead of its own inline resolver.
+
+  **Behavior change:** `SKIM_CACHE_DIR` now also relocates the default `analytics.db`
+  (previously it did not). `SKIM_ANALYTICS_DB` still takes precedence over the relocated
+  default when explicitly set. Empty `SKIM_CACHE_DIR` is treated as unset (falls back to
+  the platform default `~/.cache/skim`). **Caveat:** pre-existing history at the old
+  `~/.cache/skim/analytics.db` is **not migrated** — setting `SKIM_CACHE_DIR` for the
+  first time causes `skim stats` to start from an empty DB at the new location; the old
+  file remains at `~/.cache/skim/analytics.db` and must be moved manually if you want to
+  preserve history.
+
+- **Plain `skim <file>` now always records token-savings analytics (#359 Phase A)** —
+  Previously a plain `skim <file>` (and stdin, glob, and directory invocations) only
+  recorded analytics when token counts were already present in the parser cache from a
+  prior `--show-stats` run; cold-cache and plain-warmed-cache runs silently dropped all
+  data. The fix introduces a unified `record_file_ops` path that records token counts
+  independent of cache state, with the detected language attached to each row. Multi-file
+  invocations (glob, directory) now emit one analytics row per file instead of a single
+  aggregate. **Dashboard metric note:** `skim stats` computes `invocations` as a row count,
+  so a 3-file run now contributes +3 to the invocations counter instead of +1; historical
+  data recorded before this release used the old single-row-per-invocation convention, so
+  `invocations` comparisons across the upgrade point will reflect this change in counting
+  semantics.
+
 ### Added
 - **`rskim-tokens` crate (L3 Wave-1)** — Multi-provider token counting library (cl100k /
   o200k / Anthropic-offline / heuristic). Default build is HTTP-free; `net-anthropic` feature

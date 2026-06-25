@@ -34,6 +34,8 @@
 //!
 //! Unix-only: `arg0()` is defined on `std::os::unix::process::CommandExt`.
 
+mod common;
+
 #[cfg(unix)]
 mod argv0_dispatch {
     use std::fs;
