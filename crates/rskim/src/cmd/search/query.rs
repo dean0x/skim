@@ -657,6 +657,17 @@ fn decode_snippet(
 ///
 /// Dropping non-matching candidates is a **relevance gate**, not a #317 output
 /// cap.  No `elision_marker` is needed (AD-355-4).
+///
+/// # Fan-out bound (AD-355-2 / #361)
+///
+/// The worst-case file-read count equals `raw_results.len()`, which is bounded
+/// by the caller's `sq.limit` — itself bounded to:
+///   - Pure-lexical path:   `max(limit × LEXICAL_CANDIDATE_POOL_K, 100)` = `max(5N, 100)`.
+///   - Blast-radius path:   `max(limit × BLAST_CANDIDATE_POOL_K, 100)`  = `max(10N, 100)`.
+///   - Compound text+AST:   `|ast_set|` (exact AST match count; no K multiplier, AD-356-1).
+///
+/// The fan-out is therefore O(K × limit) file reads — bounded for any fixed K and
+/// user-supplied `--limit`.  Calibrating K for large corpora is tracked in #361.
 fn resolve_paths_and_snippets_verified(
     raw_results: &[SearchResult],
     sorted_paths: &[&str],

@@ -116,11 +116,12 @@ pub(super) fn extract_context_window(
 /// Production paths use [`extract_snippet_and_verify`] to read the file once
 /// and check substring membership simultaneously.  This fn is kept for testing
 /// the snippet-extraction logic in isolation.  It delegates to
-/// [`extract_snippet_and_verify`] with an empty sentinel query whose verification
-/// result is discarded (`_verified` is unused here; see the inline note below
-/// re: the defense-in-depth change in `query_substring_present`).  There is a
-/// single read/guard/decode path (no duplication of the stat/mtime/size/read
-/// pipeline).
+/// [`extract_snippet_and_verify`] with an empty sentinel query (`""`) whose
+/// verification result is discarded — the file is read exactly once through the
+/// shared stat/mtime/size/read/decode pipeline (no duplication; DRY, AD-355-1).
+/// The empty sentinel is safe because `_verified` is ignored: per
+/// `query_substring_present`, an empty query returns `false` (see types.rs unit
+/// tests), but since this fn discards the flag the behaviour is unchanged.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn extract_snippet(
     root: &Path,
@@ -134,11 +135,10 @@ pub(super) fn extract_snippet(
     // Delegate to extract_snippet_and_verify with an empty sentinel query.
     // `_verified` is discarded — this function is only used for tests that
     // exercise the snippet-extraction path in isolation, not the verify gate.
-    // The sentinel "" is safe here because `_verified` is unused: the defense-
-    // in-depth change in `query_substring_present` (Finding 15) means "" now
-    // returns false, but since this function ignores verified, behavior is
-    // unchanged.  This eliminates the previous copy-paste of the
-    // stat/mtime/size/read/decode pipeline (Finding 10 / DRY fix).
+    // The sentinel "" is safe because `_verified` is unused: per AD-355-1
+    // `query_substring_present("", _) == false`, but since this fn ignores the
+    // verified flag, that has no effect.  Single shared read/stat/decode path
+    // (AD-355-1: no second I/O, no copy-paste of the pipeline).
     let (outcome, _verified) =
         extract_snippet_and_verify(root, rel_path, match_positions, manifest_entry, "");
     outcome
@@ -237,7 +237,7 @@ pub(super) fn extract_snippet_and_verify(
     // window would allocate the entire file).  However, we MUST NOT conflate
     // "too large to snippet" with "failed verification" — a large UTF-8 source file
     // that genuinely CONTAINS the query must survive as a snippet-less result
-    // (Finding 20 / #355 cycle-2).
+    // (AD-355-4: large-file verify path, verified in #355 cycle-2).
     //
     // For large files we do a bounded verification read: read at most
     // MAX_VERIFY_SCAN_BYTES of the file and run query_substring_present on that

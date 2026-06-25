@@ -336,6 +336,93 @@ impl NgramIndexReader {
         Ok(())
     }
 
+    /// First sub-pass of the BM25F scoring loop: accumulate per-document, per-field
+    /// TF counts and match positions from `postings` into `tf_per_doc` and
+    /// `pos_per_doc`.
+    ///
+    /// Documents are skipped when:
+    /// - `doc_id >= self.header.file_count` (out-of-range; defensive guard).
+    /// - `query.file_filter` is set and the doc is not in the allowlist (blast-radius).
+    ///
+    /// The caller is responsible for calling `tf_per_doc.clear()` and
+    /// `pos_per_doc.clear()` before each ngram iteration to reuse the allocations.
+    fn accumulate_posting_tfs(
+        &self,
+        postings: &[super::format::PostingEntry],
+        file_filter: Option<&std::collections::HashSet<FileId>>,
+        tf_per_doc: &mut HashMap<u32, [f32; FIELD_COUNT]>,
+        pos_per_doc: &mut HashMap<u32, Vec<std::ops::Range<usize>>>,
+    ) {
+        for p in postings {
+            if p.doc_id >= self.header.file_count {
+                continue; // out-of-range doc_ids are never valid
+            }
+            if let Some(filter) = file_filter
+                && !filter.contains(&FileId(p.doc_id))
+            {
+                continue; // not in the blast-radius allowlist — skip early
+            }
+            let field_idx = p.field_id as usize;
+            if field_idx < FIELD_COUNT {
+                tf_per_doc.entry(p.doc_id).or_insert([0.0; FIELD_COUNT])[field_idx] += 1.0;
+            }
+            let pos = p.position as usize;
+            pos_per_doc.entry(p.doc_id).or_default().push(pos..pos + 3);
+        }
+    }
+
+    /// Final phase of scoring: apply defense-in-depth file_filter, sort by score,
+    /// apply offset/limit, and assemble [`SearchResult`] values.
+    ///
+    /// `doc_scores`, `doc_field_tfs`, and `doc_positions` are all consumed here.
+    fn collect_scored_results(
+        doc_scores: HashMap<u32, f64>,
+        doc_field_tfs: HashMap<u32, [f32; FIELD_COUNT]>,
+        mut doc_positions: HashMap<u32, Vec<std::ops::Range<usize>>>,
+        file_filter: Option<&std::collections::HashSet<FileId>>,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<SearchResult> {
+        // Defense-in-depth: re-apply file_filter before collecting scores.
+        // The first sub-pass already skips posting accumulation for non-allowlisted
+        // docs, so in practice this is a no-op.  It is kept to guard against future
+        // refactors that change the first-pass filtering logic.
+        let mut scored: Vec<(u32, f64)> = match file_filter {
+            Some(filter) => doc_scores
+                .into_iter()
+                .filter(|(doc_id, _)| filter.contains(&FileId(*doc_id)))
+                .collect(),
+            None => doc_scores.into_iter().collect(),
+        };
+        // Sort descending by score; tie-break ascending by FileId for determinism.
+        scored.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        scored
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(doc_id, score)| {
+                let positions = doc_positions.remove(&doc_id).unwrap_or_default();
+                let field = doc_field_tfs
+                    .get(&doc_id)
+                    .map(dominant_field)
+                    .unwrap_or(SearchField::Other);
+                SearchResult {
+                    file_id: FileId(doc_id),
+                    score,
+                    line_range: 0..0,
+                    match_positions: positions,
+                    field,
+                    snippet: None,
+                }
+            })
+            .collect()
+    }
+
     /// Retrieve all posting entries for `ngram_key` from the mmap'd posting file.
     fn lookup_postings(&self, ngram_key: u32) -> Result<Vec<super::format::PostingEntry>> {
         let entries_start = SKIDX_HEADER_SIZE;
@@ -457,50 +544,31 @@ impl SearchLayer for NgramIndexReader {
             None => &self.bm25f_config,
         };
 
-        // doc_id → accumulated BM25F score.
-        let mut doc_scores: HashMap<u32, f64> = HashMap::new();
-        // doc_id → per-field TF accumulators for dominant_field().
-        let mut doc_field_tfs: HashMap<u32, [f32; FIELD_COUNT]> = HashMap::new();
-        // doc_id → match positions (collected during the single posting pass).
-        let mut doc_positions: HashMap<u32, Vec<std::ops::Range<usize>>> = HashMap::new();
-        // Cache decoded FileMetaEntry per doc_id to avoid repeated mmap decoding.
-        let mut doc_meta_cache: HashMap<u32, FileMetaEntry> = HashMap::new();
-
-        // Reused across ngram iterations to avoid per-iteration allocation churn.
+        // Per-ngram accumulation buffers — reused across iterations to avoid churn.
         let mut tf_per_doc: HashMap<u32, [f32; FIELD_COUNT]> = HashMap::new();
         let mut pos_per_doc: HashMap<u32, Vec<std::ops::Range<usize>>> = HashMap::new();
+        // Persistent scoring state across all ngram iterations.
+        let mut doc_scores: HashMap<u32, f64> = HashMap::new();
+        let mut doc_field_tfs: HashMap<u32, [f32; FIELD_COUNT]> = HashMap::new();
+        let mut doc_positions: HashMap<u32, Vec<std::ops::Range<usize>>> = HashMap::new();
+        let mut doc_meta_cache: HashMap<u32, FileMetaEntry> = HashMap::new();
 
         for (ngram, _weight) in &ngrams {
             let postings = self.lookup_postings(ngram.key())?;
             let idf = f64::from(idf_for_key(ngram.key()));
 
-            // First sub-pass: accumulate per-field TF counts and candidate positions,
-            // skipping doc_ids that are out of range (never valid) or outside the
-            // file_filter allowlist.  Checking file_filter here avoids accumulating
-            // TF and positions for documents that will be discarded anyway — critical
-            // for blast-radius queries where the allowlist is a tiny fraction of the
-            // full index.
+            // Sub-pass 1: accumulate TF counts and match positions per doc.
+            // Blast-radius early-out and out-of-range guard are in the helper.
             tf_per_doc.clear();
             pos_per_doc.clear();
-            for p in &postings {
-                if p.doc_id >= self.header.file_count {
-                    continue; // out-of-range doc_ids are never valid
-                }
-                if let Some(ref filter) = query.file_filter
-                    && !filter.contains(&FileId(p.doc_id))
-                {
-                    continue; // not in the blast-radius allowlist — skip early
-                }
-                let field_idx = p.field_id as usize;
-                if field_idx < FIELD_COUNT {
-                    tf_per_doc.entry(p.doc_id).or_insert([0.0; FIELD_COUNT])[field_idx] += 1.0;
-                }
-                let pos = p.position as usize;
-                pos_per_doc.entry(p.doc_id).or_default().push(pos..pos + 3);
-            }
+            self.accumulate_posting_tfs(
+                &postings,
+                query.file_filter.as_ref(),
+                &mut tf_per_doc,
+                &mut pos_per_doc,
+            );
 
-            // Second sub-pass: apply language filter, score, and transfer positions
-            // only for documents that survive all filters.
+            // Sub-pass 2: apply lang filter, score, and transfer positions.
             self.score_ngram_postings(
                 idf,
                 &tf_per_doc,
@@ -514,53 +582,17 @@ impl SearchLayer for NgramIndexReader {
             )?;
         }
 
-        // Defense-in-depth: apply file_filter allowlist a second time before
-        // collecting scores.  The first sub-pass (above) already skips posting
-        // accumulation for non-allowlisted docs, so in practice this filter is a
-        // no-op.  It is kept here to guard against future refactors that change
-        // the first-pass filtering logic — any doc that somehow escaped the early
-        // guard is still excluded from the final result set.
-        let mut scored: Vec<(u32, f64)> = if let Some(ref filter) = query.file_filter {
-            doc_scores
-                .into_iter()
-                .filter(|(doc_id, _)| filter.contains(&FileId(*doc_id)))
-                .collect()
-        } else {
-            doc_scores.into_iter().collect()
-        };
-        // Sort descending by score; tie-break ascending by FileId for determinism.
-        // FileId tie-breaking already guarantees a total order so stable sort is not needed.
-        scored.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-
         let offset = query.offset.unwrap_or(0);
         let limit = query.limit.unwrap_or(20);
 
-        let results = scored
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(doc_id, score)| {
-                let positions = doc_positions.remove(&doc_id).unwrap_or_default();
-                let field = doc_field_tfs
-                    .get(&doc_id)
-                    .map(dominant_field)
-                    .unwrap_or(SearchField::Other);
-                SearchResult {
-                    file_id: FileId(doc_id),
-                    score,
-                    line_range: 0..0,
-                    match_positions: positions,
-                    field,
-                    snippet: None,
-                }
-            })
-            .collect();
-
-        Ok(results)
+        Ok(Self::collect_scored_results(
+            doc_scores,
+            doc_field_tfs,
+            doc_positions,
+            query.file_filter.as_ref(),
+            offset,
+            limit,
+        ))
     }
 
     fn name(&self) -> &str {

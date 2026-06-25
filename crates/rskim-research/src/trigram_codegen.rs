@@ -36,13 +36,11 @@ pub fn default_trigram_weights_json_path() -> anyhow::Result<PathBuf> {
 /// - Any IDF value is non-positive or non-finite
 /// - Writing to `output_path` fails
 ///
-/// Note: keys with b1 == 0 (NUL-leading trigrams from binary-adjacent source)
-/// are **not** rejected — the validation deliberately allows them because such
-/// bytes are valid in the trigram key space and the corpus may include files with
-/// NUL-prefixed byte sequences.  Only the original bigram keyspace (keys < 0x010000)
-/// was logically incompatible, but the v3 reader never interprets any key as a
-/// bigram — v2 indexes are rejected wholesale via `FORMAT_VERSION` — so the old
-/// rejection of b1 == 0 keys is a documentation artefact, not an enforced constraint.
+/// Note: keys with b1 == 0 (NUL-leading trigrams, `key < 0x010000`) are **not**
+/// rejected.  The v3/v4 reader accepts the full 24-bit key space; below-v3 indexes
+/// are rejected wholesale by `FORMAT_VERSION`, so there is no bigram vs. trigram
+/// ambiguity at the key level.  The corpus may legally include source with
+/// NUL-prefixed byte sequences (binary-adjacent files) that produce such keys.
 pub fn generate_weights_rs(json_path: &Path, output_path: &Path) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(json_path)
         .with_context(|| format!("reading {}", json_path.display()))?;
@@ -65,11 +63,9 @@ pub fn generate_weights_rs(json_path: &Path, output_path: &Path) -> anyhow::Resu
                 w.trigram
             );
         }
-        // Every genuine trigram key must have b1 != 0 when extracted from a real text
-        // corpus (the 3-byte key space starts at 0x010000 for b1=0x01).
-        // Keys == 0x00_??_?? come from text bytes starting with 0x00 (null bytes),
-        // which are valid but rare in source code.  We do NOT enforce b1 > 0 here
-        // because the corpus may include binary-adjacent source with null bytes.
+        // NUL-leading keys (b1 == 0x00, i.e. key < 0x010000) are intentionally
+        // allowed — see the function-level doc comment for the rationale.  The v3/v4
+        // reader accepts the full 24-bit key space; no bigram compatibility guard exists.
     }
 
     // Generate the Rust source.
