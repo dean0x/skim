@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 
 use super::manifest::FileManifest;
 
-
 // ============================================================================
 // Staleness outcome
 // ============================================================================
@@ -383,9 +382,7 @@ pub(super) fn try_rebuild_temporal_nonfatal(
     if let Err(e) = rebuild_temporal(root, cache_dir, head, current_epoch_secs()) {
         // Ignore temporal errors — they must not fail the lexical/AST query (ADR-006/D5).
         if crate::debug::is_debug_enabled() {
-            eprintln!(
-                "skim search [debug]: temporal {debug_label} error (non-fatal): {e}"
-            );
+            eprintln!("skim search [debug]: temporal {debug_label} error (non-fatal): {e}");
         }
     }
 }

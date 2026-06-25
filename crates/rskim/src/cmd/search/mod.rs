@@ -625,22 +625,19 @@ fn run_query(
     // Self-heal ordering (#357 BUG B, cycle-2 finding 8): auto_refresh_if_stale
     // MUST run BEFORE opening temporal.db or resolving blast-radius paths, so that
     // a missing or HEAD-divergent temporal.db is rebuilt before we attempt to open
-    // it.  This mirrors the ordering already used by the two standalone arms:
-    //   - run_temporal_standalone: refresh at line ~787, open at ~789
-    //   - standalone --ast arm:    refresh at ~132, open at ~150
+    // it.  This mirrors the ordering used by the two standalone arms:
+    //   - run_temporal_standalone: refresh first, then open_temporal_db
+    //   - standalone --ast arm:    refresh first, then open_temporal_db
     //
     // Previously, temporal_db was opened at the top of this function BEFORE
-    // auto_refresh_if_stale fired (the --ast subpath called it at ~672, the
-    // pure-lexical subpath delegated to execute_query_with_manifest).  That
-    // inverted ordering meant a lexical-Current but temporal-stale DB was consumed
-    // pre-heal by both blast-radius resolution and apply_temporal_enrichment.
+    // auto_refresh_if_stale fired, so a lexical-Current but temporal-stale DB was
+    // consumed pre-heal by both blast-radius resolution and apply_temporal_enrichment.
     //
     // Fix: call auto_refresh_if_stale here unconditionally when temporal data is
     // needed, then open temporal_db with the now-fresh file.  The --ast subpath
-    // calls auto_refresh_if_stale again below to get the manifest; the second call
-    // is cheap (returns `(false, manifest)` when Current).  The pure-lexical
-    // subpath passes the manifest to execute_query_with_manifest so it skips its
-    // own internal refresh.
+    // reuses the manifest returned here directly (no second auto_refresh call).
+    // The pure-lexical subpath passes the manifest to execute_query_with_manifest
+    // so it skips its own internal refresh.
     //
     // ADR-006/D5: auto_refresh_if_stale propagates lexical errors as Err but
     // swallows temporal errors internally — callers only see lexical failures.
@@ -687,14 +684,13 @@ fn run_query(
     // Missing index (after refresh) → fail loud (return Err, #199).
     // Query execution failure → degrade gracefully (warn, no AST filter).
     let (ast_scored, pre_loaded_manifest) = if let Some(ref raw_ast) = flags.ast {
-        // The refresh already ran above (pre_loaded_manifest_from_refresh is Some).
-        // Call auto_refresh_if_stale again to retrieve the manifest cheaply (the
-        // second call returns Current immediately, no rebuild).
-        // Alternatively, unwrap pre_loaded_manifest_from_refresh — but calling
-        // auto_refresh_if_stale is idempotent and keeps the --ast manifest-threading
-        // logic self-contained.
-        let (_refreshed, manifest) =
-            staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+        // The refresh already ran above: `pre_loaded_manifest_from_refresh` is always
+        // `Some` when `flags.ast.is_some()` (the early-refresh condition includes
+        // `|| flags.ast.is_some()`). Reuse that manifest directly rather than calling
+        // auto_refresh_if_stale a second time (the second call was idempotent but
+        // wasteful — it returned `(false, manifest)` immediately on Current).
+        let manifest = pre_loaded_manifest_from_refresh
+            .expect("manifest must be present when flags.ast is Some (invariant)");
         let engine = ast::open_ast_engine(&cache_dir)?;
         // Changed from #199 (lossy HashSet) to #198 (scored vec for RRF).
         // resolve_ast_scored returns Vec<(FileId, f64)> sorted FileId-ASC,

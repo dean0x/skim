@@ -701,10 +701,7 @@ fn test_auto_refresh_hook_temporal_failure_does_not_fail_lexical() {
 /// Named identically to the counterpart in temporal_build_tests.rs and mod.rs
 /// so a reader scanning the three test files sees the same shared helper (#357
 /// cycle-2 finding 3).
-fn create_real_git_repo(
-    dir: &std::path::Path,
-    commit_files: &[(&str, &[(&str, &str)])],
-) -> String {
+fn create_real_git_repo(dir: &std::path::Path, commit_files: &[(&str, &[(&str, &str)])]) -> String {
     super::create_real_git_repo(dir, commit_files)
 }
 
@@ -1198,10 +1195,7 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
         fs::create_dir_all(&cache_dir).unwrap();
 
         // One commit makes HEAD readable.
-        create_real_git_repo(
-            dir.path(),
-            &[("init", &[("README", "hello")])],
-        );
+        create_real_git_repo(dir.path(), &[("init", &[("README", "hello")])]);
 
         let analytics = TEST_ANALYTICS;
 
@@ -1217,9 +1211,7 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
 
         // Verify the DB has META_GIT_HEAD set (so the staleness gate sees Current).
         let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
-        let stored_head = db
-            .get_meta(rskim_search::META_GIT_HEAD)
-            .unwrap();
+        let stored_head = db.get_meta(rskim_search::META_GIT_HEAD).unwrap();
         assert!(
             stored_head.is_some(),
             "Case B: META_GIT_HEAD must be set in the empty temporal.db (no-loop key)"
@@ -1233,7 +1225,10 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
         // Second call: both lexical and temporal are Current.
         // MUST NOT rewrite temporal.db — mtime must be unchanged.
         let (refreshed2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
-        assert!(!refreshed2, "Case B: second call must not rebuild lexical (Current)");
+        assert!(
+            !refreshed2,
+            "Case B: second call must not rebuild lexical (Current)"
+        );
 
         let mtime_after = fs::metadata(&temporal_db_path).unwrap().modified().unwrap();
         assert_eq!(

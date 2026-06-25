@@ -221,7 +221,10 @@ pub(super) fn resolve_blast_radius_paths(
         // from run_temporal_standalone's message (#357 cycle-2 finding 2).
         // The constant lives in mod.rs (the parent module — `super::NO_TEMPORAL_DATA_MSG`)
         // and is the single source of truth for AC9 (no "skim heatmap" advice).
-        let msg = format!("no temporal data for --blast-radius — {}", super::NO_TEMPORAL_DATA_MSG);
+        let msg = format!(
+            "no temporal data for --blast-radius — {}",
+            super::NO_TEMPORAL_DATA_MSG
+        );
         if json {
             let envelope = serde_json::json!({ "warning": msg });
             eprintln!("{}", serde_json::to_string(&envelope)?);
