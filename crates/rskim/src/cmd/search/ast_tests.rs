@@ -204,6 +204,31 @@ where
     }
 }
 
+/// Build a [`QueryConfig`] for hermetic execute_query tests.
+///
+/// Defaults: `json = false`, `composite_weights = None`.
+/// All other fields are caller-supplied so each test is explicit about
+/// exactly what it varies.
+fn make_query_config(
+    root: &Path,
+    cache: &Path,
+    text: &str,
+    limit: usize,
+    ast_scored: Option<Vec<(rskim_search::FileId, f64)>>,
+    blast_radius_paths: Option<std::collections::HashSet<String>>,
+) -> super::super::types::QueryConfig {
+    super::super::types::QueryConfig {
+        text: text.to_string(),
+        limit,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache.to_path_buf(),
+        blast_radius_paths,
+        ast_scored,
+        composite_weights: None,
+    }
+}
+
 // ============================================================================
 // Group 1: Parse / validate (unit, no index)
 // ============================================================================
@@ -1727,7 +1752,6 @@ fn distractor_{i}() {{
 #[test]
 fn text_ast_intersection_complete_below_pool_cliff_356() {
     use super::super::query::execute_query;
-    use super::super::types::QueryConfig;
 
     let project = make_project_with_lexical_cliff_fixture();
     let cache = tempfile::tempdir().unwrap();
@@ -1751,16 +1775,8 @@ fn text_ast_intersection_complete_below_pool_cliff_356() {
     // -- AC1 (exact-set completeness): full qualifying set at --limit 50 ----------
     // At any large limit the fix and the old code both return target.rs; we use
     // this as the reference set.
-    let full_config = QueryConfig {
-        text: "nested".to_string(),
-        limit: 50,
-        json: false,
-        root: project.path().to_path_buf(),
-        cache_dir: cache.path().to_path_buf(),
-        blast_radius_paths: None,
-        ast_scored: Some(ast_scored.clone()),
-        composite_weights: None,
-    };
+    let full_config =
+        make_query_config(project.path(), cache.path(), "nested", 50, Some(ast_scored.clone()), None);
     let full_output = execute_query(&full_config, &TEST_ANALYTICS).unwrap();
 
     assert_eq!(
@@ -1785,16 +1801,8 @@ fn text_ast_intersection_complete_below_pool_cliff_356() {
     //
     // Post-fix (AD-356-1/2): file_filter = {target.rs FileId}, sq.limit = 1.
     // Reader scores only target.rs → it is returned.  count = 1, PASSES.
-    let limit1_config = QueryConfig {
-        text: "nested".to_string(),
-        limit: 1,
-        json: false,
-        root: project.path().to_path_buf(),
-        cache_dir: cache.path().to_path_buf(),
-        blast_radius_paths: None,
-        ast_scored: Some(ast_scored.clone()),
-        composite_weights: None,
-    };
+    let limit1_config =
+        make_query_config(project.path(), cache.path(), "nested", 1, Some(ast_scored.clone()), None);
     let limit1_output = execute_query(&limit1_config, &TEST_ANALYTICS).unwrap();
 
     // PRIMARY DISCRIMINATING ASSERTION (PF-007):
@@ -1899,7 +1907,6 @@ fn work_{i}() {{
 #[test]
 fn text_ast_ad356_2_limit_guard_25_files() {
     use super::super::query::execute_query;
-    use super::super::types::QueryConfig;
 
     const N: usize = 25;
 
@@ -1927,16 +1934,8 @@ fn text_ast_ad356_2_limit_guard_25_files() {
     // N=25 > 20 → only 20 returned → assert_eq FAILS (RED confirms AD-356-2 gap).
     //
     // Post-fix (sq.limit = Some(25)): reader scores all 25 → returns 25 → PASSES.
-    let full_config = QueryConfig {
-        text: "nested".to_string(),
-        limit: N,
-        json: false,
-        root: project.path().to_path_buf(),
-        cache_dir: cache.path().to_path_buf(),
-        blast_radius_paths: None,
-        ast_scored: Some(ast_scored.clone()),
-        composite_weights: None,
-    };
+    let full_config =
+        make_query_config(project.path(), cache.path(), "nested", N, Some(ast_scored.clone()), None);
     let full_output = execute_query(&full_config, &TEST_ANALYTICS).unwrap();
 
     assert_eq!(
@@ -1958,16 +1957,8 @@ fn text_ast_ad356_2_limit_guard_25_files() {
     }
 
     // -- AC13 (set property): intermediate --limit returns a proper subset ----------
-    let mid_config = QueryConfig {
-        text: "nested".to_string(),
-        limit: 10,
-        json: false,
-        root: project.path().to_path_buf(),
-        cache_dir: cache.path().to_path_buf(),
-        blast_radius_paths: None,
-        ast_scored: Some(ast_scored.clone()),
-        composite_weights: None,
-    };
+    let mid_config =
+        make_query_config(project.path(), cache.path(), "nested", 10, Some(ast_scored.clone()), None);
     let mid_output = execute_query(&mid_config, &TEST_ANALYTICS).unwrap();
 
     assert_eq!(
@@ -1993,16 +1984,8 @@ fn text_ast_ad356_2_limit_guard_25_files() {
     }
 
     // -- AC13 continued: --limit 1 returns exactly 1 qualifying file ---------------
-    let limit1_config = QueryConfig {
-        text: "nested".to_string(),
-        limit: 1,
-        json: false,
-        root: project.path().to_path_buf(),
-        cache_dir: cache.path().to_path_buf(),
-        blast_radius_paths: None,
-        ast_scored: Some(ast_scored),
-        composite_weights: None,
-    };
+    let limit1_config =
+        make_query_config(project.path(), cache.path(), "nested", 1, Some(ast_scored), None);
     let limit1_output = execute_query(&limit1_config, &TEST_ANALYTICS).unwrap();
 
     assert_eq!(
@@ -2044,7 +2027,6 @@ fn text_ast_ad356_2_limit_guard_25_files() {
 #[test]
 fn text_ast_empty_ast_set_returns_empty_ac12() {
     use super::super::query::execute_query;
-    use super::super::types::QueryConfig;
 
     let project = make_project_with_two_nested_loop_files();
     let cache = tempfile::tempdir().unwrap();
@@ -2053,16 +2035,9 @@ fn text_ast_empty_ast_set_returns_empty_ac12() {
 
     // Pass an explicitly empty AST scored vector — simulates a pattern that
     // matches no files (e.g. `skim search "foo" --ast <pattern-that-matches-nothing>`).
-    let config = QueryConfig {
-        text: "nested".to_string(),
-        limit: 10,
-        json: false,
-        root: project.path().to_path_buf(),
-        cache_dir: cache.path().to_path_buf(),
-        blast_radius_paths: None,
-        ast_scored: Some(vec![]), // empty — the key input for AC12
-        composite_weights: None,
-    };
+    // empty ast_scored vec is the key input for AC12.
+    let config =
+        make_query_config(project.path(), cache.path(), "nested", 10, Some(vec![]), None);
 
     // Must not panic, must not error, must return empty results (exit 0 semantics).
     let output = execute_query(&config, &TEST_ANALYTICS)
@@ -2199,7 +2174,6 @@ fn text_ast_blast_intersection_complete_356() {
     use std::collections::HashSet;
 
     use super::super::query::execute_query;
-    use super::super::types::QueryConfig;
 
     const N: usize = 6; // qualifying files (> old limit*4 = 4 at --limit 1)
     const DISTRACTORS: usize = 6; // lexically-outranking files that fail AST
@@ -2230,16 +2204,14 @@ fn text_ast_blast_intersection_complete_356() {
     let blast_paths: HashSet<String> = (1..=N).map(|i| format!("src/target_{i:02}.rs")).collect();
 
     // -- AC3(a) full-set at --limit N: all N qualifying files returned ---------
-    let full_config = QueryConfig {
-        text: "nested".to_string(),
-        limit: N,
-        json: false,
-        root: project.path().to_path_buf(),
-        cache_dir: cache.path().to_path_buf(),
-        blast_radius_paths: Some(blast_paths.clone()),
-        ast_scored: Some(ast_scored.clone()),
-        composite_weights: None,
-    };
+    let full_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        N,
+        Some(ast_scored.clone()),
+        Some(blast_paths.clone()),
+    );
     let full_output = execute_query(&full_config, &TEST_ANALYTICS).unwrap();
 
     assert_eq!(
@@ -2275,16 +2247,14 @@ fn text_ast_blast_intersection_complete_356() {
     // sq.file_filter = Some(filter_set), sq.limit = Some(6).
     // Reader scores only the 6 qualifying files → all match "nested" →
     // intersect_and_rank returns 6 → take(1) yields 1 result. PASSES.
-    let limit1_config = QueryConfig {
-        text: "nested".to_string(),
-        limit: 1,
-        json: false,
-        root: project.path().to_path_buf(),
-        cache_dir: cache.path().to_path_buf(),
-        blast_radius_paths: Some(blast_paths.clone()),
-        ast_scored: Some(ast_scored.clone()),
-        composite_weights: None,
-    };
+    let limit1_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        1,
+        Some(ast_scored.clone()),
+        Some(blast_paths.clone()),
+    );
     let limit1_output = execute_query(&limit1_config, &TEST_ANALYTICS).unwrap();
 
     assert!(
@@ -2327,16 +2297,14 @@ fn text_ast_blast_intersection_complete_356() {
         .map(|i| format!("src/noast_{i:02}.rs"))
         .collect();
 
-    let disjoint_config = QueryConfig {
-        text: "nested".to_string(),
-        limit: 10,
-        json: false,
-        root: project.path().to_path_buf(),
-        cache_dir: cache.path().to_path_buf(),
-        blast_radius_paths: Some(disjoint_blast),
-        ast_scored: Some(ast_scored),
-        composite_weights: None,
-    };
+    let disjoint_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        10,
+        Some(ast_scored),
+        Some(disjoint_blast),
+    );
     let disjoint_output = execute_query(&disjoint_config, &TEST_ANALYTICS)
         .expect("AC3(c): execute_query must not error on disjoint blast∩AST set");
 
