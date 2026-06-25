@@ -50,6 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output gains optional `line` and `snippet` fields — additive, so existing consumers of
   `path`/`score` are unaffected. (#201)
 
+### Fixed
+- **`skim search <text> --ast <pattern>` compound intersection no longer silently drops
+  valid matches** (#356) — the old `CANDIDATE_POOL_K = 4` multiplier capped the lexical
+  candidate pool at `limit * 4`, so files ranking beyond position `limit * 4` in the
+  unfiltered lexical list were invisible to the intersection even when they satisfied both
+  the text query and the AST pattern.  The lexical pool is now restricted to the exact
+  AST-matched file set (`file_filter = AST set`, `sq.limit = |AST set|`), making the
+  compound intersection complete by construction.  Part of the #198/#200 compound
+  text+AST path.
+
 ### Added
 - **`rskim-tokens` crate (L3 Wave-1)** — Multi-provider token counting library (cl100k /
   o200k / Anthropic-offline / heuristic). Default build is HTTP-free; `net-anthropic` feature

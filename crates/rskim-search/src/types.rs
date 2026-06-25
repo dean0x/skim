@@ -508,7 +508,8 @@ pub trait SearchLayer: Send + Sync {
     /// - Any consumer of this trait **must NOT** assume `search()` returns matches;
     ///   it returns candidates that require verification.
     /// - Large-corpus short-query completeness (file_id >= pool_limit silently missed)
-    ///   is tracked in #356 (pool-K calibration).
+    ///   is tracked in #361 (pool-K calibration). The compound text+AST path
+    ///   mitigates this by restricting `file_filter` to the AST set (#356).
     ///
     /// # Errors
     /// Returns [`SearchError`] if the query is invalid or the index is corrupted.
