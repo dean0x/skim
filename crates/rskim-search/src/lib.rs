@@ -124,6 +124,6 @@ pub use types::{
     CochangeStats, CommitInfo, FieldClassifier, FileChangeInfo, FileId, FileRiskScores,
     FileTemporalStats, HistoryResult, IndexStats, LayerBuilder, NodeInfo, Result, SearchError,
     SearchField, SearchLayer, SearchQuery, SearchResult, TemporalFlags, TemporalMetadata,
-    TemporalSource, byte_offset_to_line, compute_line_range,
+    TemporalSource, byte_offset_to_line, compute_line_range, query_substring_present,
 };
 pub use weights::{DEFAULT_WEIGHT, TRIGRAM_WEIGHTS, lookup_weight, trigram_weight};

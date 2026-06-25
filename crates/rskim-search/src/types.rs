@@ -487,7 +487,8 @@ pub trait SearchLayer: Send + Sync {
     /// n-gram index is a fast candidate generator, not a substring filter.
     ///
     /// Consumers that require exact substring membership MUST apply a verification
-    /// step after calling `search`.
+    /// step after calling `search`.  [`query_substring_present`] is the shared
+    /// predicate used by both the CLI layer and the bench harness.
     ///
     /// # Limit / offset semantics
     ///
@@ -496,7 +497,7 @@ pub trait SearchLayer: Send + Sync {
     /// - When `query.offset` is `Some(k)`, the first `k` candidates (in rank order)
     ///   are skipped.  When `None`, no candidates are skipped.
     ///
-    /// # Short-query semantic (AD-355-7)
+    /// # Short-query semantics (AD-355-7)
     ///
     /// For queries shorter than 3 bytes, `extract_query_ngrams` returns an empty
     /// n-gram set.  The `NgramIndexReader` implementation emits ALL indexed files
@@ -507,9 +508,8 @@ pub trait SearchLayer: Send + Sync {
     ///   order) and carry `score = 0.0` with empty `match_positions`.
     /// - Any consumer of this trait **must NOT** assume `search()` returns matches;
     ///   it returns candidates that require verification.
-    /// - Large-corpus short-query completeness (file_id >= pool_limit silently missed)
-    ///   is tracked in #361 (pool-K calibration). The compound text+AST path
-    ///   mitigates this by restricting `file_filter` to the AST set (#356).
+    /// - Caller-specified `limit` and `file_filter` are honoured on the fallback
+    ///   path on the same terms as the normal n-gram-scored path.
     ///
     /// # Errors
     /// Returns [`SearchError`] if the query is invalid or the index is corrupted.
@@ -591,6 +591,56 @@ pub struct NodeInfo {
 pub trait FieldClassifier: Send + Sync {
     /// Classify the given `node` within its `source` file.
     fn classify(&self, node: &NodeInfo, source: &str) -> SearchField;
+}
+
+// ============================================================================
+// Verification predicate
+// ============================================================================
+
+/// Return `true` iff every whitespace-delimited token in `query` appears as a
+/// case-sensitive substring somewhere in `content`.
+///
+/// # Purpose
+///
+/// This predicate is the **shared verification gate** used by both the rskim CLI
+/// layer (`rskim::cmd::search`) and the rskim-bench harness to determine whether
+/// a [`SearchLayer::search`] candidate actually contains the literal query string.
+///
+/// The n-gram index is a fast candidate generator — it surfaces files with at
+/// least one n-gram overlap with the query, but does NOT guarantee that the
+/// literal query string is present in the file.  This function is the substring
+/// filter that both:
+///
+/// 1. The CLI path (`resolve_paths_and_snippets_verified`) applies after calling
+///    `search()` to drop false-positive candidates before presenting results to
+///    the user.
+/// 2. The bench harness (`rskim-bench`) applies to the raw `reader.search()`
+///    output so that AC1/AC4 precision metrics are measured over the same
+///    verified candidate surface that users see, not the raw unverified output.
+///
+/// # Semantics
+///
+/// - **Multi-token queries** (e.g. `"foo bar"`) require ALL tokens to appear
+///   somewhere in the content (AND semantics).  Tokens are split on whitespace.
+/// - **Empty / whitespace-only query**: treated as "not present" (`false`).  An
+///   empty token set would vacuously satisfy `.all()` and let all candidates
+///   through; explicit handling prevents that.
+/// - **Case-sensitive**: matches are byte-exact.  This is intentional — code
+///   identifiers and symbol names are case-sensitive in all supported languages.
+///
+/// This fn is pure (no I/O, no side effects) and can be unit-tested in isolation.
+#[must_use]
+pub fn query_substring_present(content: &str, query: &str) -> bool {
+    // Split on whitespace; require every non-empty token to appear in content.
+    //
+    // Defense-in-depth: if the token set is empty (empty query OR whitespace-only
+    // query), `.all()` would return vacuously true and let all candidates through.
+    // An empty/whitespace-only query is treated as "no match" (false).
+    let mut tokens = query.split_whitespace().peekable();
+    if tokens.peek().is_none() {
+        return false;
+    }
+    tokens.all(|token| content.contains(token))
 }
 
 // ============================================================================
@@ -1249,5 +1299,84 @@ mod tests {
     fn test_line_range_adjacent_lines() {
         // offsets 0 (line 1) and 2 (line 2) on "a\nb\nc"
         assert_eq!(compute_line_range(b"a\nb\nc", &[0..1, 2..3]), 1..3);
+    }
+
+    // ========================================================================
+    // query_substring_present — unit tests (PF-007: discriminating observables)
+    // ========================================================================
+
+    /// Single token present in content → true.
+    /// Discriminating: would fail if the function returned vacuously true.
+    #[test]
+    fn test_query_substring_present_single_token_found() {
+        assert!(
+            query_substring_present("fn authenticate(token: &str) -> bool", "authenticate"),
+            "token present in content → true"
+        );
+    }
+
+    /// Single token absent from content → false.
+    /// Discriminating: guards against always-true implementation.
+    #[test]
+    fn test_query_substring_present_single_token_absent() {
+        assert!(
+            !query_substring_present("fn parse_config(s: &str) -> Option<String>", "authenticate"),
+            "token absent from content → false"
+        );
+    }
+
+    /// All tokens of a multi-word query present → true (AND semantics).
+    #[test]
+    fn test_query_substring_present_multi_token_all_found() {
+        let content = "pub fn authenticate(token: &str) -> bool { token.len() > 0 }";
+        assert!(
+            query_substring_present(content, "authenticate token"),
+            "all tokens present → true"
+        );
+    }
+
+    /// One token of a multi-word query absent → false.
+    /// Discriminating: would pass if OR semantics were used instead of AND.
+    #[test]
+    fn test_query_substring_present_multi_token_one_absent() {
+        let content = "pub fn authenticate(s: &str) -> bool { true }";
+        assert!(
+            !query_substring_present(content, "authenticate token"),
+            "one token absent → false (AND semantics required)"
+        );
+    }
+
+    /// Empty query → false (defense-in-depth: vacuous .all() guard).
+    /// Discriminating: without the empty-check, .all() on an empty iterator returns true.
+    #[test]
+    fn test_query_substring_present_empty_query_returns_false() {
+        assert!(
+            !query_substring_present("fn main() {}", ""),
+            "empty query must return false (vacuous-.all() guard)"
+        );
+    }
+
+    /// Whitespace-only query → false (same defense as empty query).
+    #[test]
+    fn test_query_substring_present_whitespace_query_returns_false() {
+        assert!(
+            !query_substring_present("fn main() {}", "   "),
+            "whitespace-only query must return false"
+        );
+    }
+
+    /// Case-sensitive: "Auth" does not match "auth".
+    /// Discriminating: would fail if case-insensitive matching were used.
+    #[test]
+    fn test_query_substring_present_case_sensitive() {
+        let content = "pub fn authenticate(s: &str) {}";
+        assert!(
+            !query_substring_present(content, "Authenticate"),
+            "match is case-sensitive; 'Authenticate' must not match 'authenticate'"
+        );
+        assert!(
+            query_substring_present(content, "authenticate"),
+            "exact-case 'authenticate' must match"
+        );
     }
 }

@@ -153,14 +153,12 @@ pub(super) fn extract_snippet(
 ///
 /// # Design (AD-355-1)
 ///
-/// Exact-match verification lives here — not in the core reader — because:
-/// - The `NgramIndexReader` / `QueryEngine` pipeline has **no access to file
-///   content**; it operates only on byte-offset postings from the inverted index.
-/// - `extract_snippet` is the **only call site** where file bytes already exist
-///   at query time.  Verification piggy-backs on that existing read at zero
-///   additional I/O cost.
-/// - This makes the predicate a **candidate-then-verify** gate: the trigram index
-///   generates candidates cheaply; this fn drops non-matching ones.
+/// This is a thin re-export of [`rskim_search::query_substring_present`], which
+/// is defined in `rskim-search/src/types.rs` so that the rskim-bench harness can
+/// use the **same predicate** to filter raw `reader.search()` output.  Both the
+/// CLI verify gate (`extract_snippet_and_verify`) and the bench AC1/AC4 guard
+/// measure over the identical verified surface — ensuring bench precision metrics
+/// reflect the same correctness criterion users see.
 ///
 /// # Match semantics (AD-355-3)
 ///
@@ -176,29 +174,10 @@ pub(super) fn extract_snippet(
 ///   correctness gate in that path — this fn filters those candidates down to
 ///   files that actually contain the literal query string.
 ///
-/// This fn is pure (no I/O, no side effects) so it can be unit-tested in
-/// isolation — see `snippet_tests.rs`.
+/// This fn is pure (no I/O, no side effects) — see `snippet_tests.rs` for
+/// unit tests and `rskim-search/src/types.rs` for the canonical definition.
 pub(super) fn query_substring_present(content: &str, query: &str) -> bool {
-    // Split on whitespace; require every non-empty token to appear in content.
-    //
-    // Defense-in-depth (Finding 15 / #355 cycle-2): if the token set is empty
-    // (empty query OR whitespace-only query), `.all()` would return vacuously true
-    // and let all candidates through.  To guard against a future caller that skips
-    // the is_empty()/trim() guards, we make the empty-token case explicit here:
-    // an empty/whitespace-only query is treated as "no match" (false).
-    //
-    // The CLI dispatch (mod.rs:97) already rejects whitespace-only queries before
-    // reaching this function, and execute_query_with_manifest short-circuits on
-    // empty queries.  This local guard is an additional safety net so the predicate's
-    // safety property is self-contained — removing a caller guard cannot silently
-    // re-open the bug.
-    let mut tokens = query.split_whitespace().peekable();
-    if tokens.peek().is_none() {
-        // Empty or whitespace-only query: treat as "not present" (no content
-        // matches a non-existent query term).
-        return false;
-    }
-    tokens.all(|token| content.contains(token))
+    rskim_search::query_substring_present(content, query)
 }
 
 /// Extract a snippet and simultaneously verify that `query` is present in the

@@ -685,15 +685,14 @@ impl fmt::Display for DataManager {
 // verify-then-truncate CLI path.
 //
 // This companion test closes that gap: it applies a content-presence filter
-// to the candidate results (equivalent to the CLI verify gate's
-// query_substring_present predicate) and then asserts P@1 == 1.0 over the
-// verified result set.  The corpus is identical to ac4_precision_at_1_regression_guard
-// so both guards are always exercised together.
+// to the candidate results using `rskim_search::query_substring_present` —
+// the SAME predicate used by the CLI verify gate (`extract_snippet_and_verify`
+// in snippet.rs).  Both the CLI and this bench guard now call the identical
+// function, eliminating the prior drift where an inline copy could diverge.
 //
-// The verify predicate used here (AND-of-whitespace-tokens substring check)
-// mirrors the production `query_substring_present` in snippet.rs (AD-355-3).
-// It is inlined because `query_substring_present` is a private symbol in the
-// rskim CLI crate, unreachable from rskim-bench.
+// The predicate lives in rskim_search::types so it is reachable from both the
+// rskim CLI crate and rskim-bench without a private-symbol workaround.  See
+// rskim-search/src/types.rs for its canonical definition.
 //
 // PF-007: if the verify gate is removed from the CLI layer (query.rs), the
 // production P@1 would differ from what this test measures; the companion
@@ -701,23 +700,12 @@ impl fmt::Display for DataManager {
 // this test guards the verified-path contract.
 // ============================================================================
 
-/// Inline equivalent of `query_substring_present(content, query)` from snippet.rs.
-///
-/// Returns `true` iff every whitespace-delimited token in `query` appears as a
-/// case-sensitive substring of `content`.  Empty / whitespace-only query → false.
-fn verify_present(content: &str, query: &str) -> bool {
-    let mut tokens = query.split_whitespace().peekable();
-    if tokens.peek().is_none() {
-        return false;
-    }
-    tokens.all(|token| content.contains(token))
-}
-
 #[test]
 fn ac4_verified_path_p_at_1_guard() {
     use rskim_bench::metrics::{precision_at_k, rank_of};
     use rskim_search::{
         FileId, LayerBuilder, NgramIndexBuilder, NgramIndexReader, SearchLayer, SearchQuery,
+        query_substring_present,
     };
     use std::collections::HashMap;
 
@@ -799,14 +787,16 @@ impl DataManager {
     let raw_results = reader.search(&query).unwrap();
 
     // Apply the verified-path filter: keep only candidates whose content passes
-    // the AND-of-tokens substring check (mirrors CLI query_substring_present).
+    // the AND-of-tokens substring check using the shared rskim_search predicate.
+    // This is the SAME function used by the CLI verify gate, so bench metrics
+    // measure the identical verified surface that users see (F1/Finding 1 fix).
     // File IDs are 0-based, matching the insertion order above.
     let verified_ranked: Vec<FileId> = raw_results
         .iter()
         .filter(|r| {
             file_contents
                 .get(&r.file_id)
-                .map(|content| verify_present(content, query_str))
+                .map(|content| query_substring_present(content, query_str))
                 .unwrap_or(false)
         })
         .map(|r| r.file_id)

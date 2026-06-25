@@ -324,6 +324,68 @@ fn test_lang_filter_restricts_results() {
     }
 }
 
+/// AD-355-7 / PF-007: short-query fallback MUST honour the lang filter.
+///
+/// A 2-byte query ("fn") cannot produce trigrams and takes the AD-355-7 fallback
+/// path (emit all indexed files as score-0 candidates).  When `query.lang` is
+/// set, the fallback must still apply the language filter — only files of the
+/// requested language must appear.
+///
+/// **Discriminating** (PF-007): the corpus has two files — Rust and Python.
+/// Both contain the short query "fn" somewhere in their content, so without
+/// the lang filter both would survive verification.  The test asserts:
+///
+/// 1. The Rust file (FileId 0) IS in the candidate set.
+/// 2. The Python file (FileId 1) is NOT in the candidate set.
+///
+/// If the lang filter is absent from the fallback path, the Python file
+/// would appear — failing assertion (2) and proving the flag is silently
+/// dropped on the short-query sub-path (PF-006 violation).
+#[test]
+fn test_short_query_fallback_honours_lang_filter_pf006() {
+    let dir = tmp_dir();
+    let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    // File 0 (Rust) — contains "fn" as a keyword.
+    builder
+        .add_file(FileId(0), "fn main() {}", rskim_core::Language::Rust)
+        .unwrap();
+    // File 1 (Python) — also contains "fn" as part of "define", not a keyword,
+    // but still a substring so verification would keep it if the lang filter fails.
+    builder
+        .add_file(
+            FileId(1),
+            "def fn_helper(): pass",
+            rskim_core::Language::Python,
+        )
+        .unwrap();
+    builder.build().unwrap();
+    let reader = NgramIndexReader::open(dir.path()).unwrap();
+
+    let mut query = SearchQuery::new("fn"); // 2 bytes → AD-355-7 fallback
+    query.lang = Some(rskim_core::Language::Rust);
+    query.limit = Some(50);
+
+    let results = reader.search(&query).unwrap();
+    let file_ids: std::collections::HashSet<u32> = results.iter().map(|r| r.file_id.0).collect();
+
+    // (1) Rust file must be in the candidate set.
+    assert!(
+        file_ids.contains(&0),
+        "AD-355-7 + lang filter: Rust FileId(0) must appear as a short-query candidate; \
+        got {file_ids:?}"
+    );
+
+    // (2) Python file must NOT appear — the lang filter must be active on the
+    //     fallback path.  If this assertion fails, the PF-006 violation is live:
+    //     the --lang flag is silently ignored on the AD-355-7 sub-path.
+    assert!(
+        !file_ids.contains(&1),
+        "AD-355-7 + lang filter (PF-006): Python FileId(1) must be excluded by the lang \
+        filter even on the short-query fallback path; found in candidates — lang filter \
+        is absent or broken on the fallback sub-path. Got {file_ids:?}"
+    );
+}
+
 // -----------------------------------------------------------------------
 // search — BM25 ranking
 // -----------------------------------------------------------------------
