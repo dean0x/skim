@@ -324,11 +324,9 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: Option<&str>)
         .and_then(|db| db.get_meta(rskim_search::META_GIT_HEAD).ok().flatten());
     match (stored_head.as_deref(), current_head) {
         (Some(stored), Some(current)) => stored != current,
-        // temporal.db exists but has no META_GIT_HEAD → stale.
-        (None, _) => true,
-        // current_head is None (non-git): treat as stale so caller's
-        // `if let Some(ref head)` guard fires and no-ops via rebuild_temporal.
-        (_, None) => true,
+        // Any other case (no stored HEAD, or non-git dir): stale.
+        // The caller's `if let Some(ref head)` guard handles the non-git no-op.
+        _ => true,
     }
 }
 

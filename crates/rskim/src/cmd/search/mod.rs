@@ -1404,7 +1404,7 @@ mod tests {
             for (name, content) in *files {
                 let path = dir.join(name);
                 if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).expect("create dir");
+                    fs::create_dir_all(parent).expect("create dir");
                 }
                 fs::write(&path, content).expect("write file");
                 Command::new("git")
