@@ -520,7 +520,16 @@ pub(crate) fn encode_postings_varint(postings: &[PostingEntry], buf: &mut Vec<u8
 /// Returns [`SearchError::IndexCorrupted`] if:
 /// - A varint is malformed (truncated, > 5 bytes)
 /// - `field_id` is not a valid [`SearchField`] discriminant
-/// - `doc_id` or `position` would overflow `u32` when deltas are applied
+///
+/// # Delta reconstruction
+///
+/// `doc_id` and `position` are reconstructed with `wrapping_add`, the exact
+/// inverse of the encoder's `wrapping_sub` (see [`encode_postings_varint`]).
+/// The round-trip is therefore lossless for every `u32` input — including the
+/// maximum `doc_id` gap (`0 → u32::MAX`, covered by
+/// `test_posting_codec_max_gap_docid`). Modular arithmetic cannot fail, so no
+/// overflow error is raised; a corrupt blob yields wrong-but-bounded `u32`
+/// values (used only for scoring), never a panic or out-of-bounds access.
 pub(crate) fn decode_postings_varint(data: &[u8]) -> crate::Result<Vec<PostingEntry>> {
     let mut postings = Vec::new();
     let mut offset = 0usize;

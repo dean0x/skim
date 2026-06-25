@@ -616,12 +616,12 @@ fn test_varint_roundtrip_representative_values() {
         0,
         1,
         127,
-        128,       // first 2-byte value
+        128, // first 2-byte value
         255,
         16383,
-        16384,     // first 3-byte value
+        16384, // first 3-byte value
         2097151,
-        2097152,   // first 4-byte value
+        2097152, // first 4-byte value
         268435455,
         268435456, // first 5-byte value
         u32::MAX,
@@ -629,7 +629,10 @@ fn test_varint_roundtrip_representative_values() {
     for &v in values {
         let mut buf = Vec::new();
         let written = encode_varint(v, &mut buf);
-        assert!((1..=5).contains(&written), "varint for {v} must be 1-5 bytes, got {written}");
+        assert!(
+            (1..=5).contains(&written),
+            "varint for {v} must be 1-5 bytes, got {written}"
+        );
         let (decoded, consumed) = decode_varint(&buf, 0).unwrap();
         assert_eq!(decoded, v, "varint round-trip failed for {v}");
         assert_eq!(consumed, written, "consumed bytes mismatch for {v}");
@@ -690,7 +693,10 @@ fn posting_roundtrip(postings: &[PostingEntry]) -> Vec<PostingEntry> {
 #[test]
 fn test_posting_codec_empty_list() {
     let result = posting_roundtrip(&[]);
-    assert!(result.is_empty(), "empty posting list should round-trip to empty");
+    assert!(
+        result.is_empty(),
+        "empty posting list should round-trip to empty"
+    );
 }
 
 /// AC4 — single-entry posting list round-trips exactly.
@@ -702,7 +708,11 @@ fn test_posting_codec_single_entry() {
         position: 1024,
     };
     let decoded = posting_roundtrip(&[p]);
-    assert_eq!(decoded.len(), 1, "single-entry round-trip must return 1 entry");
+    assert_eq!(
+        decoded.len(),
+        1,
+        "single-entry round-trip must return 1 entry"
+    );
     assert_eq!(decoded[0], p, "single-entry must decode to exact input");
 }
 
@@ -714,11 +724,31 @@ fn test_posting_codec_single_entry() {
 #[test]
 fn test_posting_codec_multi_doc_roundtrip() {
     let postings = vec![
-        PostingEntry { doc_id: 0, field_id: crate::SearchField::TypeDefinition.discriminant(),     position: 0   },
-        PostingEntry { doc_id: 0, field_id: crate::SearchField::FunctionSignature.discriminant(),  position: 5   },
-        PostingEntry { doc_id: 1, field_id: crate::SearchField::Other.discriminant(),               position: 10  },
-        PostingEntry { doc_id: 3, field_id: crate::SearchField::TypeDefinition.discriminant(),     position: 100 },
-        PostingEntry { doc_id: 3, field_id: crate::SearchField::Other.discriminant(),               position: 200 },
+        PostingEntry {
+            doc_id: 0,
+            field_id: crate::SearchField::TypeDefinition.discriminant(),
+            position: 0,
+        },
+        PostingEntry {
+            doc_id: 0,
+            field_id: crate::SearchField::FunctionSignature.discriminant(),
+            position: 5,
+        },
+        PostingEntry {
+            doc_id: 1,
+            field_id: crate::SearchField::Other.discriminant(),
+            position: 10,
+        },
+        PostingEntry {
+            doc_id: 3,
+            field_id: crate::SearchField::TypeDefinition.discriminant(),
+            position: 100,
+        },
+        PostingEntry {
+            doc_id: 3,
+            field_id: crate::SearchField::Other.discriminant(),
+            position: 200,
+        },
     ];
     let decoded = posting_roundtrip(&postings);
     assert_eq!(
@@ -742,22 +772,50 @@ fn test_posting_codec_multi_doc_roundtrip() {
 #[test]
 fn test_posting_codec_max_gap_docid() {
     let postings = vec![
-        PostingEntry { doc_id: 0,          field_id: 0, position: 0 },
-        PostingEntry { doc_id: u32::MAX,   field_id: 0, position: 0 },
+        PostingEntry {
+            doc_id: 0,
+            field_id: 0,
+            position: 0,
+        },
+        PostingEntry {
+            doc_id: u32::MAX,
+            field_id: 0,
+            position: 0,
+        },
     ];
     let decoded = posting_roundtrip(&postings);
-    assert_eq!(decoded.len(), 2, "max-gap posting list must round-trip to 2 entries");
-    assert_eq!(decoded[0].doc_id, 0,        "first entry doc_id must be 0");
-    assert_eq!(decoded[1].doc_id, u32::MAX, "second entry doc_id must be u32::MAX");
+    assert_eq!(
+        decoded.len(),
+        2,
+        "max-gap posting list must round-trip to 2 entries"
+    );
+    assert_eq!(decoded[0].doc_id, 0, "first entry doc_id must be 0");
+    assert_eq!(
+        decoded[1].doc_id,
+        u32::MAX,
+        "second entry doc_id must be u32::MAX"
+    );
 }
 
 /// AC4 — posting list with large position values.
 #[test]
 fn test_posting_codec_large_positions() {
     let postings = vec![
-        PostingEntry { doc_id: 5, field_id: 0, position: 0         },
-        PostingEntry { doc_id: 5, field_id: 0, position: 1_000_000 },
-        PostingEntry { doc_id: 5, field_id: 0, position: u32::MAX  },
+        PostingEntry {
+            doc_id: 5,
+            field_id: 0,
+            position: 0,
+        },
+        PostingEntry {
+            doc_id: 5,
+            field_id: 0,
+            position: 1_000_000,
+        },
+        PostingEntry {
+            doc_id: 5,
+            field_id: 0,
+            position: u32::MAX,
+        },
     ];
     let decoded = posting_roundtrip(&postings);
     assert_eq!(decoded.len(), 3);
