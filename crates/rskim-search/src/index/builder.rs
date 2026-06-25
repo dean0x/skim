@@ -30,11 +30,14 @@ use crate::{
 /// 5 + 1 + 5 = 11 bytes as the strict upper bound.  We use 9 — the v3 fixed
 /// entry size — as a deliberate over-estimate (~2.5x the measured v4 average of
 /// ~3.5 bytes/entry on a diverse 1000-file corpus) to avoid reallocation during
-/// index build.  The buffer is dropped immediately after `atomic_write` so the
-/// extra RSS is build-time only and does not affect the query hot path.
+/// index build.  After encoding, `postings_buf.shrink_to_fit()` releases the
+/// unused capacity before CRC computation and `atomic_write`, so peak RSS
+/// reflects the actual encoded size (~3.5 bytes/entry) rather than the
+/// upper-bound estimate (9 bytes/entry).  The buffer is build-time only.
 ///
-/// Framing: this is a peak-memory/zero-realloc trade-off, NOT a "tight upper
-/// bound" — the v4 average is ~3.5 bytes/entry so 9 is ~2.5x over-estimated.
+/// Framing: this is a zero-realloc-during-encode / peak-RSS trade-off.
+/// The excess capacity (~2.5x average) is held only for the duration of the
+/// encode loop; `shrink_to_fit` reclaims it immediately after.
 const VARINT_UPPER_BOUND_PER_ENTRY: usize = 9;
 
 // ============================================================================
@@ -344,6 +347,15 @@ impl NgramIndexBuilder {
                 posting_length: length,
             });
         }
+
+        // Release the over-allocated capacity before CRC and write.
+        // The initial reservation uses VARINT_UPPER_BOUND_PER_ENTRY = 9 bytes/entry
+        // (~2.5x the ~3.5 byte v4 average) to guarantee zero reallocations during
+        // encoding.  shrink_to_fit reclaims the unused portion so peak RSS during
+        // CRC computation and atomic_write reflects the actual encoded size, not
+        // the upper-bound estimate.  Build-time only — the buffer is dropped after
+        // atomic_write returns.
+        postings_buf.shrink_to_fit();
 
         // Serialise file metadata.
         let mut meta_buf: Vec<u8> = Vec::with_capacity(self.file_meta.len() * FILE_META_SIZE);
