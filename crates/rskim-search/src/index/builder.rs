@@ -12,15 +12,30 @@ use std::ops::Range;
 use std::path::PathBuf;
 
 use super::format::{
-    FILE_META_SIZE, FORMAT_VERSION, FileMetaEntry, POSTING_ENTRY_SIZE, PostingEntry,
-    SKIDX_ENTRY_SIZE, SKIDX_HEADER_SIZE, SKIDX_MAGIC, SkidxEntry, SkidxHeader, encode_entry,
-    encode_file_meta, encode_header, encode_posting, lang_to_id,
+    FILE_META_SIZE, FORMAT_VERSION, FileMetaEntry, PostingEntry, SKIDX_ENTRY_SIZE,
+    SKIDX_HEADER_SIZE, SKIDX_MAGIC, SkidxEntry, SkidxHeader, encode_entry, encode_file_meta,
+    encode_header, encode_postings_varint, lang_to_id,
 };
 use super::reader::NgramIndexReader;
 use crate::{
     FIELD_COUNT, FileId, LayerBuilder, Result, SearchError, SearchField, SearchLayer,
     io_util::atomic_write,
 };
+
+/// Capacity-hint upper bound (bytes per posting entry) for the postings buffer
+/// in [`NgramIndexBuilder::serialize_index`].
+///
+/// A v4 entry is `[varint delta_doc_id][u8 field_id][varint delta_position]`.
+/// The maximum varint width is 5 bytes each (35-bit span for a u32), giving
+/// 5 + 1 + 5 = 11 bytes as the strict upper bound.  We use 9 — the v3 fixed
+/// entry size — as a deliberate over-estimate (~2.5x the measured v4 average of
+/// ~3.5 bytes/entry on a diverse 1000-file corpus) to avoid reallocation during
+/// index build.  The buffer is dropped immediately after `atomic_write` so the
+/// extra RSS is build-time only and does not affect the query hot path.
+///
+/// Framing: this is a peak-memory/zero-realloc trade-off, NOT a "tight upper
+/// bound" — the v4 average is ~3.5 bytes/entry so 9 is ~2.5x over-estimated.
+const VARINT_UPPER_BOUND_PER_ENTRY: usize = 9;
 
 // ============================================================================
 // Public builder struct
@@ -282,37 +297,47 @@ impl LayerBuilder for NgramIndexBuilder {
 impl NgramIndexBuilder {
     /// Serialise postings, entries, file metadata, and header into the two
     /// on-disk byte buffers: `(postings_buf, skidx_buf)`.
+    ///
+    /// # AD-LXPOST-1
+    ///
+    /// Postings are encoded using v4 delta+varint compression (see
+    /// [`encode_postings_varint`]).  Each posting list is sorted ascending by
+    /// `(doc_id, field_id, position)` before encoding so that each
+    /// `delta_doc_id` and `delta_position` is a forward, non-wrapping step
+    /// within its `(doc_id, field_id)` run.
     fn serialize_index(
         &self,
         sorted_keys: &[u32],
         avg_doc_length: f32,
         avg_field_lengths: [f32; FIELD_COUNT],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        // Serialise posting lists and build the entry table.
-        let total_posting_bytes: usize = self
+        // Serialise posting lists using v4 variable-length (delta+varint) codec.
+        // Pre-size at VARINT_UPPER_BOUND_PER_ENTRY (= 9, the v3 fixed-entry size)
+        // per entry.  This is ~2.5x the measured v4 average of ~3.5 bytes/entry —
+        // a deliberate peak-memory/zero-realloc trade-off (see constant comment
+        // above).  The strict worst-case is 11 bytes/entry; 9 avoids that extra
+        // ~22% while still guaranteeing zero reallocations in practice.
+        let estimated_capacity: usize = self
             .postings
             .values()
-            .map(|v| v.len() * POSTING_ENTRY_SIZE)
+            .map(|v| v.len() * VARINT_UPPER_BOUND_PER_ENTRY)
             .fold(0usize, usize::saturating_add);
-        let mut postings_buf: Vec<u8> = Vec::with_capacity(total_posting_bytes);
+        let mut postings_buf: Vec<u8> = Vec::with_capacity(estimated_capacity);
         let mut entries: Vec<SkidxEntry> = Vec::with_capacity(sorted_keys.len());
 
         for key in sorted_keys {
             let list = &self.postings[key];
             let offset = postings_buf.len() as u64;
-            let byte_len = list.len().checked_mul(POSTING_ENTRY_SIZE).ok_or_else(|| {
-                SearchError::IndexCorrupted(format!(
-                    "posting list for key {key:#010x} overflows usize"
-                ))
-            })?;
+            // Encode this posting list with delta+varint (AD-LXPOST-1, FORMAT_VERSION v4).
+            // The list is already sorted by (doc_id, field_id, position) — the caller
+            // (build()) calls list.sort_unstable() before reaching here.
+            encode_postings_varint(list, &mut postings_buf);
+            let byte_len = postings_buf.len() as u64 - offset;
             let length = u32::try_from(byte_len).map_err(|_| {
                 SearchError::IndexCorrupted(format!(
                     "posting list for key {key:#010x} exceeds u32::MAX bytes ({byte_len})"
                 ))
             })?;
-            for p in list {
-                postings_buf.extend_from_slice(&encode_posting(p));
-            }
             entries.push(SkidxEntry {
                 ngram_key: *key,
                 posting_offset: offset,
@@ -332,8 +357,20 @@ impl NgramIndexBuilder {
             entries_buf.extend_from_slice(&encode_entry(e));
         }
 
-        // CRC32 over entries + file metadata.
+        // CRC32 over postings + entries + file metadata (#364: integrity guard).
+        //
+        // v4 posting integrity: the old fixed-stride guard
+        // (is_multiple_of(POSTING_ENTRY_SIZE)) was removed because varint byte
+        // counts are not a multiple of 9.  Folding postings_buf into the CRC
+        // replaces that structural guard with a value-integrity check: a
+        // bit-flip inside a posting blob that would otherwise produce wrong-but-
+        // bounded (doc_id, position) values and silently mis-rank results is now
+        // detected in NgramIndexReader::open before any query can run.
+        //
+        // Ordering: postings first, then entries, then meta — must match the
+        // verification order in NgramIndexReader::open (reader.rs).
         let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&postings_buf);
         hasher.update(&entries_buf);
         hasher.update(&meta_buf);
         let checksum = hasher.finalize();

@@ -27,9 +27,8 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use super::format::{
-    FILE_META_SIZE, FileMetaEntry, POSTING_ENTRY_SIZE, SKIDX_ENTRY_SIZE, SKIDX_HEADER_SIZE,
-    SkidxHeader, compute_checksum, decode_file_meta, decode_header, decode_posting, idf_for_key,
-    lookup_ngram,
+    FILE_META_SIZE, FileMetaEntry, SKIDX_ENTRY_SIZE, SKIDX_HEADER_SIZE, SkidxHeader,
+    decode_file_meta, decode_header, decode_postings_varint, idf_for_key, lookup_ngram,
 };
 use crate::{
     FileId, IndexStats, Result, SearchError, SearchField, SearchLayer, SearchQuery, SearchResult,
@@ -122,13 +121,20 @@ impl NgramIndexReader {
             )));
         }
 
-        // Verify CRC32 checksum over entries + file metadata.  The slice is
-        // contiguous in the mmap so no copy is needed.
-        let payload = &idx_mmap[SKIDX_HEADER_SIZE..expected_idx_size];
-        let actual_checksum = compute_checksum(payload);
+        // Verify CRC32 checksum over postings + entries + file metadata (#364).
+        //
+        // Ordering matches builder.rs: postings first, then entries+meta.
+        // This catches bit-flips in the .skpost blob that would otherwise
+        // yield wrong-but-bounded (doc_id, position) values and silently
+        // mis-rank results (Design Constraint: "fail loud", ADR-006).
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&post_mmap);
+        hasher.update(&idx_mmap[SKIDX_HEADER_SIZE..expected_idx_size]);
+        let actual_checksum = hasher.finalize();
         if actual_checksum != header.checksum {
             return Err(SearchError::IndexCorrupted(format!(
-                "checksum mismatch: expected {:#010x}, got {:#010x}",
+                "checksum mismatch: expected {:#010x}, got {:#010x}. \
+                 The index may be corrupt; rebuild with `skim search index --rebuild`.",
                 header.checksum, actual_checksum
             )));
         }
@@ -144,8 +150,12 @@ impl NgramIndexReader {
     /// Read the lexical index format version from the first 6 bytes of `index.skidx`.
     ///
     /// Opens only 6 bytes (magic + version) — no mmap, no CRC, no full validation.
-    /// Used by `check_staleness` to detect a v2→v3 format mismatch and trigger a
-    /// rebuild before `NgramIndexReader::open` hard-errors on the version mismatch.
+    /// Used by `check_staleness` to detect a stale/below-current lexical
+    /// FORMAT_VERSION (currently v4) and trigger a rebuild before
+    /// `NgramIndexReader::open` hard-errors on the version mismatch.
+    /// For example, a v3 index on disk (pre-#358 delta+varint posting codec)
+    /// reads version=3 here, which is less than FORMAT_VERSION=4, so the
+    /// staleness check fires and a full rebuild is triggered.
     ///
     /// # Errors
     ///
@@ -354,19 +364,12 @@ impl NgramIndexReader {
             )));
         }
 
-        if !length.is_multiple_of(POSTING_ENTRY_SIZE) {
-            return Err(SearchError::IndexCorrupted(format!(
-                "posting_length {length} not aligned to POSTING_ENTRY_SIZE {POSTING_ENTRY_SIZE}"
-            )));
-        }
+        // v4: posting list is variable-length encoded (delta+varint, AD-LXPOST-1).
+        // The old fixed-stride guard (is_multiple_of 9) assumed 9-byte fixed entries
+        // and is removed — varint byte counts are not a multiple of 9.
+        // CRC32 integrity over the full .skpost blob is verified in open() (#364).
         let data = &self.post_mmap[start..end];
-        let n = length / POSTING_ENTRY_SIZE;
-        let mut postings = Vec::with_capacity(n);
-        for i in 0..n {
-            let off = i * POSTING_ENTRY_SIZE;
-            postings.push(decode_posting(&data[off..off + POSTING_ENTRY_SIZE])?);
-        }
-        Ok(postings)
+        decode_postings_varint(data)
     }
 }
 

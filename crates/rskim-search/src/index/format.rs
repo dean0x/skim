@@ -13,19 +13,44 @@
 //! ## `index.skpost`
 //!
 //! ```text
-//! [PostingEntry ... concatenated posting lists]
+//! [PostingEntry ... concatenated posting lists]   ← v4: variable-length (delta+varint)
 //! ```
 //!
 //! # Encoding
 //!
 //! All multi-byte integers are little-endian.  The header checksum covers
-//! the entry array and file-metadata array bytes (appended in that order).
+//! `postings_buf` + the entry array + the file-metadata array (in that order,
+//! matching builder.rs and the verification in reader.rs open()).  This means
+//! any bit-flip in `.skpost` is detected during `NgramIndexReader::open`
+//! before a query can run (#364).
+//!
+//! ## Posting codec (v4, AD-LXPOST-1)
+//!
+//! Each posting entry in `.skpost` is variable-length:
+//!
+//! ```text
+//! [varint delta_doc_id][u8 field_id][varint delta_position]
+//! ```
+//!
+//! - `delta_doc_id`: delta from the previous `doc_id` in the posting list
+//!   (absolute for the first entry). Encoded as a little-endian base-128 varint.
+//! - `field_id`: 1 byte, unchanged from v3 (bounded by `FIELD_COUNT = 8`).
+//! - `delta_position`: delta from the previous `position` within the same
+//!   `(doc_id, field_id)` run. The position accumulator resets to 0 whenever
+//!   `doc_id` OR `field_id` changes, so the first occurrence in a new `doc_id`
+//!   *or* a new `field_id` encodes `delta_position = position` (absolute). See
+//!   the "Position-delta reset" section on [`encode_postings_varint`]. Encoded
+//!   as a little-endian base-128 varint.
+//!
+//! Rationale: see `AD-LXPOST-1` comment at [`encode_postings_varint`].
 //!
 //! # Invariants upheld by this module
 //!
 //! - **No `std::fs` or `std::io::Write`** — every function operates on `&[u8]`
 //!   or returns owned byte arrays.  All I/O happens in `builder.rs`/`reader.rs`.
 //! - **No `unwrap()` / `expect()` / `panic!()`** outside `#[cfg(test)]`.
+//! - **Decode loop is bounded**: `decode_postings_varint` terminates after at
+//!   most `data.len()` iterations (each varint consumes ≥1 byte).
 
 pub(crate) use super::lang_map::lang_to_id;
 use crate::{
@@ -43,16 +68,27 @@ pub(crate) const SKIDX_MAGIC: &[u8; 4] = b"SKIX";
 ///
 /// v2 → v3 (#355 Part B): `SkidxEntry.ngram_key` widened from `u16` to `u32`
 /// (bigram → trigram). `SKIDX_ENTRY_SIZE` grows from 14 → 16 bytes.
-/// `PostingEntry` is UNCHANGED. Old v2 indexes self-heal via the staleness check
-/// (the stale reader rejects the wrong version and triggers a full rebuild).
-/// `#358` owns v3 → v4 (posting codec / `PostingEntry` change).
+/// `PostingEntry` is UNCHANGED in v3. Old v2 indexes self-heal via the staleness
+/// check (the stale reader rejects the wrong version and triggers a full rebuild).
 ///
-/// # AD-355-6 (cross-reference)
+/// v3 → v4 (#358 Item 2):
 ///
-/// This constant is the single source of truth for the format bump owned by #355.
-/// #358 sequences AFTER #355 and bumps v3 → v4 for posting compression — do not
-/// increment this constant in #358.
-pub(crate) const FORMAT_VERSION: u16 = 3;
+/// # AD-LXFMT-3
+///
+/// `PostingEntry` encoding changed from fixed 9-byte to variable-length
+/// delta+varint. The `.skpost` blob is no longer a flat array of fixed-size
+/// structs; instead each entry is `[varint delta_doc_id][u8 field_id][varint
+/// delta_position]`. See [`encode_postings_varint`] and
+/// [`decode_postings_varint`].
+///
+/// Sequential bumps (#355 merges first, then #358):
+/// - v2 → v3: owned by #355 Part B (trigram key widen, `SkidxEntry` change)
+/// - v3 → v4: owned by #358 Item 2 (posting codec / `PostingEntry` change)
+///
+/// Old v3 indexes self-heal: `decode_header` rejects version ≠ 4 with
+/// "unsupported format version … please rebuild" so the staleness check
+/// triggers a full rebuild on first query after upgrade.
+pub(crate) const FORMAT_VERSION: u16 = 4;
 /// Size in bytes of [`SkidxHeader`] on disk.
 ///
 /// v1 was 30 bytes; v2 adds 32 bytes for `avg_field_lengths: [f32; 8]`.
@@ -63,8 +99,6 @@ pub(crate) const SKIDX_HEADER_SIZE: usize = 62;
 /// v2: 14 bytes (`ngram_key: u16` + `posting_offset: u64` + `posting_length: u32`).
 /// v3: 16 bytes (`ngram_key: u32` + `posting_offset: u64` + `posting_length: u32`).
 pub(crate) const SKIDX_ENTRY_SIZE: usize = 16;
-/// Size in bytes of a single [`PostingEntry`] on disk.
-pub(crate) const POSTING_ENTRY_SIZE: usize = 9;
 /// Size in bytes of a single [`FileMetaEntry`] on disk.
 ///
 /// v1 was 5 bytes; v2 adds 32 bytes for `field_lengths: [u32; 8]`.
@@ -107,7 +141,7 @@ pub(crate) struct SkidxHeader {
     ///
     /// Indexed by [`crate::SearchField`] discriminant.
     pub avg_field_lengths: [f32; FIELD_COUNT],
-    /// CRC32 of the entry array + file-metadata array bytes.
+    /// CRC32 over `.skpost` + entry array + file-metadata array bytes (v4, #364).
     pub checksum: u32,
 }
 
@@ -136,12 +170,11 @@ pub(crate) struct SkidxEntry {
 
 /// One element in a posting list inside `.skpost`.
 ///
-/// Layout (9 bytes, all integers little-endian):
-/// ```text
-/// [0..4] doc_id    4 bytes
-/// [4]    field_id  1 byte
-/// [5..9] position  4 bytes
-/// ```
+/// This is the **in-memory** representation.  The **on-disk** encoding is
+/// variable-length (v4, AD-LXPOST-1): each entry is written as
+/// `[varint delta_doc_id][u8 field_id][varint delta_position]`
+/// via [`encode_postings_varint`] and decoded via [`decode_postings_varint`].
+/// The fixed-stride 9-byte layout present in v3 no longer applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PostingEntry {
     /// The document (file) this posting belongs to.
@@ -312,41 +345,233 @@ pub(crate) fn decode_entry(data: &[u8]) -> crate::Result<SkidxEntry> {
     })
 }
 
-/// Encode a [`PostingEntry`] into its 9-byte on-disk representation.
-pub(crate) fn encode_posting(p: &PostingEntry) -> [u8; POSTING_ENTRY_SIZE] {
-    let mut buf = [0u8; POSTING_ENTRY_SIZE];
-    buf[0..4].copy_from_slice(&p.doc_id.to_le_bytes());
-    buf[4] = p.field_id;
-    buf[5..9].copy_from_slice(&p.position.to_le_bytes());
-    buf
+// ============================================================================
+// v4 variable-length posting codec (delta + varint)
+// ============================================================================
+
+/// Encode a `u32` value as a little-endian base-128 varint into `buf`.
+///
+/// Returns the number of bytes written (1–5).
+///
+/// # Encoding
+///
+/// Each byte carries 7 payload bits.  The MSB (`0x80`) is set on all bytes
+/// except the last, which signals "more bytes follow".  Smallest values (0–127)
+/// encode to 1 byte; largest `u32` values encode to 5 bytes.
+pub(crate) fn encode_varint(mut value: u32, buf: &mut Vec<u8>) -> usize {
+    let start = buf.len();
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            buf.push(byte); // final byte: MSB clear
+            break;
+        }
+        buf.push(byte | 0x80); // continuation byte: MSB set
+    }
+    buf.len() - start
 }
 
-/// Decode a [`PostingEntry`] from a 9-byte slice.
+/// Decode a little-endian base-128 varint from `data` at `offset`.
+///
+/// Returns `(value, bytes_consumed)` or [`SearchError::IndexCorrupted`] if
+/// the slice is too short or the varint exceeds 5 bytes (which would overflow
+/// a `u32`).
+///
+/// # Decode-loop bound
+///
+/// The loop runs at most 5 iterations (5 × 7 = 35 bits < 32 bits needed).
+/// On the 5th iteration the continuation bit must be clear; if it is set the
+/// varint is malformed and the function returns `IndexCorrupted`.
+pub(crate) fn decode_varint(data: &[u8], offset: usize) -> crate::Result<(u32, usize)> {
+    let mut value: u32 = 0;
+    let mut shift = 0u32;
+    let mut pos = offset;
+    // A u32 varint spans at most 5 bytes (ceil(32/7) = 5).
+    // We cap the loop at 5 to keep it bounded (reliability.md: every loop has
+    // a fixed upper bound).
+    for _ in 0..5usize {
+        if pos >= data.len() {
+            return Err(SearchError::IndexCorrupted(format!(
+                "varint at offset {offset}: truncated (need more bytes, got {})",
+                data.len().saturating_sub(offset)
+            )));
+        }
+        let byte = data[pos];
+        pos += 1;
+        // PF-004: widen to u32 before shifting to prevent u8 overflow.
+        value |= (u32::from(byte) & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            // Final byte — continuation bit clear.
+            return Ok((value, pos - offset));
+        }
+        shift += 7;
+    }
+    // If we reach here all 5 bytes had the continuation bit set — overflow.
+    Err(SearchError::IndexCorrupted(format!(
+        "varint at offset {offset}: overflow (more than 5 bytes / 35 bits for u32)"
+    )))
+}
+
+/// Encode a posting list into `buf` using v4 delta+varint encoding.
+///
+/// # AD-LXPOST-1
+///
+/// Delta-encode `doc_id` (store delta from the previous `doc_id`; absolute for
+/// the first entry) and encode each delta as a little-endian base-128 varint.
+/// Within each `(doc_id, field_id)` run, encode `position` deltas as varints.
+/// `field_id` is 1 byte (unchanged; bounded by `FIELD_COUNT = 8`).
+///
+/// Layout per posting entry:
+/// ```text
+/// [varint delta_doc_id][u8 field_id][varint delta_position]
+/// ```
+///
+/// Chosen as the least invasive approach to the reader hot path (sequential
+/// decode, low latency regression risk). Roaring/PForDelta revisited only if
+/// the measured post-compression ratio still misses the grounded target.
+/// Originating tracker: #273.  FORMAT_VERSION v3→v4 owned by #358 Item 2;
+/// v2→v3 owned by #355 Part B.
+///
+/// Note: the sibling AST index (`crates/rskim-search/src/ast_index/store/`)
+/// deliberately retains its fixed 8-byte posting codec (doc_id 4B + position
+/// 4B, no field_id byte) per AD-LXPOST-1 — the AST posting list is small and
+/// latency-critical while the lexical posting list is the size driver.
+/// This divergence is intentional, not drift.
+///
+/// # Sorting requirement
+///
+/// `postings` must be sorted ascending by `(doc_id, field_id, position)`.
+/// The caller (`builder.rs`) sorts each posting list before calling this
+/// function, ensuring positions are monotonically non-decreasing within each
+/// `(doc_id, field_id)` run so all `delta_position` values are non-negative.
+///
+/// # Position-delta reset
+///
+/// `prev_position` is reset to 0 whenever `doc_id` OR `field_id` changes.
+/// This ensures each `(doc_id, field_id)` run starts fresh, keeping
+/// `delta_position` non-negative (and therefore small / 1-byte varint)
+/// across field boundaries within the same document.
+///
+/// Without this reset, the first position in field N+1 would be encoded as a
+/// delta from the last position of field N — which can wrap to near-u32::MAX
+/// and always encodes to the maximum 5-byte varint, defeating compression.
+pub(crate) fn encode_postings_varint(postings: &[PostingEntry], buf: &mut Vec<u8>) {
+    let mut prev_doc_id: u32 = 0;
+    let mut prev_field_id: u8 = 0;
+    let mut prev_position: u32 = 0;
+    for p in postings {
+        let delta_doc_id = p.doc_id.wrapping_sub(prev_doc_id);
+        // Reset the position accumulator when doc_id OR field_id changes so that
+        // delta_position is always a forward (non-wrapping) step within a
+        // (doc_id, field_id) run.  Without this reset, a field boundary within
+        // the same doc can produce a near-u32::MAX delta that always encodes as
+        // the maximum 5-byte varint — defeating the purpose of v4 compression.
+        if delta_doc_id != 0 || p.field_id != prev_field_id {
+            prev_position = 0;
+        }
+        let delta_position = p.position.wrapping_sub(prev_position);
+        encode_varint(delta_doc_id, buf);
+        buf.push(p.field_id);
+        encode_varint(delta_position, buf);
+        prev_doc_id = p.doc_id;
+        prev_field_id = p.field_id;
+        prev_position = p.position;
+    }
+}
+
+/// Decode a v4 variable-length posting list from `data`.
+///
+/// Returns the decoded [`PostingEntry`] values in the original sort order
+/// (ascending by `(doc_id, field_id, position)`).
+///
+/// # Bounded decode loop
+///
+/// The outer loop terminates when `offset >= data.len()`.  Each iteration
+/// consumes at least 3 bytes (`1-byte varint + 1-byte field_id + 1-byte
+/// varint`), so the loop runs at most `data.len() / 3` times — bounded by
+/// the data size, not an external counter.
+///
+/// # Capacity hint
+///
+/// `Vec::with_capacity(data.len() / 3)` pre-sizes the output using the upper
+/// bound implied by the minimum-bytes-per-entry guarantee, eliminating
+/// geometric reallocation on long posting lists in the query hot path.
 ///
 /// # Errors
 ///
-/// Returns [`SearchError::IndexCorrupted`] if the slice is too short or
-/// `field_id` is not a valid [`SearchField`] discriminant.
-pub(crate) fn decode_posting(data: &[u8]) -> crate::Result<PostingEntry> {
-    if data.len() < POSTING_ENTRY_SIZE {
-        return Err(SearchError::IndexCorrupted(format!(
-            "posting truncated: need {POSTING_ENTRY_SIZE} bytes, got {}",
-            data.len()
-        )));
+/// Returns [`SearchError::IndexCorrupted`] if:
+/// - A varint is malformed (truncated, > 5 bytes)
+/// - `field_id` is not a valid [`SearchField`] discriminant
+///
+/// # Delta reconstruction
+///
+/// `doc_id` and `position` are reconstructed with `wrapping_add`, the exact
+/// inverse of the encoder's `wrapping_sub` (see [`encode_postings_varint`]).
+/// The round-trip is therefore lossless for every `u32` input — including the
+/// maximum `doc_id` gap (`0 → u32::MAX`, covered by
+/// `test_posting_codec_max_gap_docid`).  `prev_position` is reset to 0
+/// whenever `doc_id` OR `field_id` changes, mirroring the encoder's reset
+/// (see [`encode_postings_varint`]).  Modular arithmetic cannot fail, so no
+/// overflow error is raised; a corrupt blob yields wrong-but-bounded `u32`
+/// values (used only for scoring), never a panic or out-of-bounds access.
+pub(crate) fn decode_postings_varint(data: &[u8]) -> crate::Result<Vec<PostingEntry>> {
+    // Pre-size with the upper bound: each entry is at least 3 bytes
+    // (1-byte varint + 1-byte field_id + 1-byte varint), so at most
+    // data.len() / 3 entries can be present. This eliminates geometric
+    // reallocation on long posting lists in the query hot path.
+    let mut postings = Vec::with_capacity(data.len() / 3);
+    let mut offset = 0usize;
+    let mut prev_doc_id: u32 = 0;
+    let mut prev_field_id: u8 = 0;
+    let mut prev_position: u32 = 0;
+
+    while offset < data.len() {
+        let entry_start = offset;
+
+        // Decode delta_doc_id varint.
+        let (delta_doc_id, n) = decode_varint(data, offset)?;
+        offset += n;
+
+        // Decode field_id (1 byte).
+        if offset >= data.len() {
+            return Err(SearchError::IndexCorrupted(format!(
+                "posting at byte {entry_start}: truncated before field_id",
+            )));
+        }
+        let field_id = data[offset];
+        offset += 1;
+        if SearchField::from_discriminant(field_id).is_none() {
+            return Err(SearchError::IndexCorrupted(format!(
+                "posting: invalid field_id {field_id} at byte {}",
+                offset - 1
+            )));
+        }
+
+        // Decode delta_position varint.
+        let (delta_position, m) = decode_varint(data, offset)?;
+        offset += m;
+
+        // Reconstruct absolute doc_id and position.
+        // Reset the position accumulator when doc_id OR field_id changes,
+        // mirroring the encoder's reset in encode_postings_varint.
+        let doc_id = prev_doc_id.wrapping_add(delta_doc_id);
+        if delta_doc_id != 0 || field_id != prev_field_id {
+            prev_position = 0;
+        }
+        let position = prev_position.wrapping_add(delta_position);
+
+        postings.push(PostingEntry {
+            doc_id,
+            field_id,
+            position,
+        });
+
+        prev_doc_id = doc_id;
+        prev_field_id = field_id;
+        prev_position = position;
     }
-    let doc_id = u32::from_le_bytes(read_array(data, 0, "posting: doc_id")?);
-    let field_id = data[4];
-    // Validate the field_id byte — bad data produces a recoverable error.
-    if SearchField::from_discriminant(field_id).is_none() {
-        return Err(SearchError::IndexCorrupted(format!(
-            "posting: invalid field_id {field_id}"
-        )));
-    }
-    Ok(PostingEntry {
-        doc_id,
-        field_id,
-        position: u32::from_le_bytes(read_array(data, 5, "posting: position")?),
-    })
+    Ok(postings)
 }
 
 /// Encode a [`FileMetaEntry`] into its 37-byte on-disk representation.
@@ -429,14 +654,6 @@ pub(crate) fn lookup_ngram(
         }
     }
     Ok(None)
-}
-
-/// Compute the CRC32 checksum of `data`.
-///
-/// The checksum in the header covers the entry array and file-metadata bytes
-/// appended together.
-pub(crate) fn compute_checksum(data: &[u8]) -> u32 {
-    crc32fast::hash(data)
 }
 
 /// Compute the BM25 contribution for a single term occurrence.
