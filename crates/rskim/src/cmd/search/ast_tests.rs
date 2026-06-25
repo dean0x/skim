@@ -2328,7 +2328,11 @@ fn text_ast_blast_intersection_complete_356() {
     //
     // blast_radius_paths contains ONLY the noast files (distractors), which are
     // NOT in ast_scored (they have no nested loops). filter_set = blast∩ast = {}.
-    // Expected: empty results, no panic (reader returns 0 docs for empty filter).
+    // Expected: empty results, no panic.
+    //
+    // The filter_set.is_empty() early-out in run_compound_query (query.rs #356)
+    // now handles this case explicitly rather than relying on the reader returning
+    // 0 docs for an empty file_filter — both produce empty results.
     let disjoint_blast: HashSet<String> = (1..=DISTRACTORS)
         .map(|i| format!("src/noast_{i:02}.rs"))
         .collect();
@@ -2347,8 +2351,172 @@ fn text_ast_blast_intersection_complete_356() {
     assert!(
         disjoint_output.results.is_empty(),
         "AC3(c): disjoint blast∩AST must return empty results (no panic); \
-         got {} results — the empty filter_set must cause the reader to score \
-         zero documents (per reader.rs file_filter semantics).",
+         got {} results — the filter_set.is_empty() early-out in run_compound_query \
+         must return an empty QueryOutput for a disjoint blast∩AST intersection (#356).",
         disjoint_output.results.len()
     );
+}
+
+// ============================================================================
+// AC3 — blast∩AST strict-subset discriminating test (#356, PF-007)
+// ============================================================================
+
+/// AC3 — blast+AST filtered set is a STRICT SUBSET of AST-only set (#356).
+///
+/// # What this tests
+///
+/// `run_compound_query` has two sub-paths:
+///
+/// 1. **No-blast** (`blast_file_ids = None`): `filter_set = ast_fid_set`.
+/// 2. **blast+AST** (`blast_file_ids = Some`): `filter_set = blast ∩ ast`.
+///
+/// The existing tests (`text_ast_blast_intersection_complete_356`) verify that
+/// sub-path 2 returns the complete blast∩AST∩text set.  That test uses a blast
+/// set that equals the AST set, so it does NOT verify that restricting the blast
+/// set actually REDUCES the result count relative to the no-blast path.
+///
+/// This test closes that gap by using a blast set that is a STRICT SUBSET of the
+/// AST-matching files:
+///
+/// - No-blast run: all N qualifying files (target_01..target_N) are returned.
+/// - Blast+AST run: blast covers only the first M < N qualifying files.
+///   `filter_set = blast ∩ ast = {target_01..target_M}` → only M results.
+///
+/// # Discriminating property (PF-007)
+///
+/// The strict-subset assertion `blast_count < full_count` would FAIL in two
+/// regression scenarios:
+///
+/// - If the blast intersection is dropped (`filter_set = ast_fid_set` always):
+///   both runs return N files → `blast_count == full_count` → assertion fails.
+/// - If `sq.file_filter` is not set: the reader scores unrestricted files and
+///   may return distractors; the target-path membership check would also fail.
+///
+/// This is the missing discriminating guard that every prior blast+AST test
+/// lacked — per the wave-4 review (#356 surviving finding, testing category).
+#[test]
+fn text_ast_blast_subset_is_strict_subset_of_ast_only_356() {
+    use std::collections::HashSet;
+
+    use super::super::query::execute_query;
+
+    // 4 qualifying files (text+AST), 2 distractors (text only, no AST).
+    // Blast set covers only the FIRST 2 of the 4 qualifying files.
+    const N_QUALIFYING: usize = 4;
+    const N_BLAST: usize = 2; // blast covers only a strict subset of qualifying
+    const N_DISTRACTORS: usize = 2;
+
+    let project = make_project_with_blast_ast_cliff_fixture(N_QUALIFYING, N_DISTRACTORS);
+    let cache = tempfile::tempdir().unwrap();
+
+    build_project_index(project.path(), cache.path());
+
+    // Resolve the real AST scores (covers all N_QUALIFYING target files).
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
+
+    assert_eq!(
+        ast_scored.len(),
+        N_QUALIFYING,
+        "Precondition: rust-nested-loop must match exactly {N_QUALIFYING} qualifying files; \
+         got {} — check that target_NN.rs files have nested for-loops",
+        ast_scored.len()
+    );
+
+    // -- Run 1: AST-only (no blast) — full qualifying set ----------------------
+    let no_blast_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        N_QUALIFYING,
+        Some(ast_scored.clone()),
+        None, // no blast filter
+    );
+    let no_blast_output = execute_query(&no_blast_config, &TEST_ANALYTICS).unwrap();
+
+    let full_count = no_blast_output.results.len();
+    assert_eq!(
+        full_count, N_QUALIFYING,
+        "AC3 precondition (no-blast): must return all {N_QUALIFYING} qualifying files; \
+         got {full_count}"
+    );
+
+    // -- Run 2: blast+AST — blast covers only the first N_BLAST qualifying files --
+    //
+    // blast_radius_paths is a strict subset of the AST-matching files.
+    // filter_set = blast ∩ ast = {target_01..target_N_BLAST}.
+    // The reader is restricted to only those N_BLAST files → only N_BLAST results.
+    let blast_paths: HashSet<String> = (1..=N_BLAST)
+        .map(|i| format!("src/target_{i:02}.rs"))
+        .collect();
+
+    let blast_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        N_QUALIFYING, // high limit — truncation is NOT the cause of the difference
+        Some(ast_scored),
+        Some(blast_paths.clone()),
+    );
+    let blast_output = execute_query(&blast_config, &TEST_ANALYTICS).unwrap();
+
+    let blast_count = blast_output.results.len();
+
+    // PF-007 DISCRIMINATING ASSERTION 1: strict subset — filtered < unfiltered.
+    //
+    // If the blast intersection logic in run_compound_query is dropped or broken
+    // (filter_set reverts to ast_fid_set), blast_count == full_count and this
+    // assertion FAILS — verifying the blast filter is actually applied.
+    assert!(
+        blast_count < full_count,
+        "AC3 (strict-subset DISCRIMINATING): blast+AST count ({blast_count}) must be \
+         STRICTLY LESS THAN the AST-only count ({full_count}). \
+         If they are equal, the blast intersection in run_compound_query is not \
+         restricting the result set — regression of AD-356-1 (#356 blast+AST sub-path)."
+    );
+
+    // PF-007 DISCRIMINATING ASSERTION 2: exact count matches blast set size.
+    //
+    // The blast set covers exactly N_BLAST qualifying files.  After filter_set
+    // = blast ∩ ast and text verification, all N_BLAST must be returned.
+    assert_eq!(
+        blast_count, N_BLAST,
+        "AC3 (blast subset count): blast+AST run must return exactly {N_BLAST} files \
+         (blast ∩ AST ∩ text); got {blast_count}"
+    );
+
+    // PF-007 DISCRIMINATING ASSERTION 3: every result is in the blast set.
+    //
+    // No distractor or out-of-blast qualifying file may appear in the filtered
+    // results — confirms the file_filter is applied, not just the count.
+    for r in &blast_output.results {
+        assert!(
+            blast_paths.contains(&r.path),
+            "AC3 (blast subset membership): result path {:?} is not in the blast set {:?}. \
+             Only blast-set files must appear when blast+AST is active — a non-blast \
+             file here means file_filter is not being applied in run_compound_query.",
+            r.path,
+            blast_paths
+        );
+    }
+
+    // PF-007 DISCRIMINATING ASSERTION 4: every blast result is in the full set.
+    //
+    // blast results must be a subset of the no-blast results (they come from the
+    // same AST∩text intersection, just restricted to the blast set).
+    let full_paths: HashSet<&str> = no_blast_output
+        .results
+        .iter()
+        .map(|r| r.path.as_str())
+        .collect();
+    for r in &blast_output.results {
+        assert!(
+            full_paths.contains(r.path.as_str()),
+            "AC3 (blast subset ⊆ full): result {:?} from the blast+AST run is not \
+             in the AST-only full result set {:?}. Blast results must be a subset of \
+             the unfiltered AST results.",
+            r.path,
+            full_paths
+        );
+    }
 }

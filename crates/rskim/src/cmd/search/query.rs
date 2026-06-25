@@ -350,8 +350,9 @@ fn run_compound_query(
     //
     // AD-356-2: size sq.limit to the candidate set, NOT None. The reader's
     // `unwrap_or(20)` default would silently re-cap at 20 and reintroduce #356
-    // for AST sets > 20. `.max(1)` keeps the value valid after the empty-set
-    // early return above.
+    // for AST sets > 20. filter_set.len() >= 1 is guaranteed by the two early-out
+    // guards above (ast_fid_set.is_empty() and filter_set.is_empty()), so no
+    // .max(1) is needed here.
     let filter_set: HashSet<FileId> = match blast_file_ids {
         // blast ∩ AST: O(blast) with O(1) membership test in ast_fid_set.
         Some(ref blast) => blast
@@ -361,18 +362,24 @@ fn run_compound_query(
             .collect(),
         None => ast_fid_set,
     };
-    // Disjoint blast∩AST: when blast and AST sets are non-empty but disjoint,
-    // filter_set is empty. sq.file_filter = Some(empty) causes the reader to
-    // score zero documents (reader.rs file_filter check excludes every doc), so
-    // the query correctly returns no results with no panic. This is intentional
-    // and relies on the reader's documented `file_filter` semantics — an empty
-    // allowlist means "no file is allowed". sq.limit = Some(0.max(1)) = Some(1)
-    // is harmless: no document passes the file_filter, so the reader's take(1)
-    // never fires. We document this explicitly rather than adding a redundant
-    // early-out, since the early-out at ast_fid_set.is_empty() above already
-    // handles the "no AST matches at all" degenerate case.
+    // Disjoint blast∩AST early-out: blast and AST sets are non-empty but share
+    // no files.  Symmetric with the ast_fid_set.is_empty() guard above — both
+    // guards prevent unnecessary reader/intersect work and make the intent
+    // explicit rather than relying on reader side-effect semantics (#356, ADR-003).
+    if filter_set.is_empty() {
+        return Ok(QueryOutput {
+            query: config.text.clone(),
+            total: 0,
+            results: vec![],
+            duration_ms: ctx.start.elapsed().as_millis() as u64,
+            index_stats: Some(ctx.stats),
+        });
+    }
+    // AD-356-2: size sq.limit to the candidate set.  filter_set.len() >= 1 is
+    // guaranteed by the early-out above, so .max(1) is now a compile-time
+    // no-op kept for clarity.
     let mut sq = SearchQuery::new(config.text.clone());
-    sq.limit = Some(filter_set.len().max(1));
+    sq.limit = Some(filter_set.len());
     sq.file_filter = Some(filter_set);
 
     let raw_lex = ctx.engine.search(&sq)?;
