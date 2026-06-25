@@ -76,7 +76,6 @@ impl Ngram {
     #[must_use]
     #[inline]
     pub fn from_bytes(b1: u8, b2: u8, b3: u8) -> Self {
-        // PF-004: u32::from(b) before <<, never b << n on u8.
         Self((u32::from(b1) << 16) | (u32::from(b2) << 8) | u32::from(b3))
     }
 

@@ -20,6 +20,18 @@ use super::types::{SnippetContext, SnippetLine};
 /// Default number of context lines above and below the match.
 pub(super) const DEFAULT_CONTEXT: u32 = 3;
 
+/// Files larger than this byte limit are not fully read for snippet extraction;
+/// instead only the first `MAX_VERIFY_SCAN_BYTES` are read for verification.
+const MAX_SNIPPET_FILE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Maximum bytes to read when verifying a large file (> `MAX_SNIPPET_FILE_BYTES`).
+///
+/// Matches `MAX_SNIPPET_FILE_BYTES` so the two bounds are consistently defined
+/// in one place.  A genuine query match starting after this offset will produce
+/// a false-negative verification — accepted trade-off documented in the function
+/// body.
+const MAX_VERIFY_SCAN_BYTES: usize = 5 * 1024 * 1024;
+
 /// Outcome of attempting to extract a snippet.
 #[derive(Debug)]
 pub(super) enum SnippetOutcome {
@@ -255,8 +267,6 @@ pub(super) fn extract_snippet_and_verify(
     // cost bounded.  A query match that spans byte offset >MAX_VERIFY_SCAN_BYTES
     // will produce a false negative (file dropped from results) — that is the
     // accepted trade-off for files well beyond the size limit.
-    const MAX_SNIPPET_FILE_BYTES: u64 = 5 * 1024 * 1024;
-    const MAX_VERIFY_SCAN_BYTES: usize = 5 * 1024 * 1024; // same bound as snippet limit
     let file_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     if file_size > MAX_SNIPPET_FILE_BYTES {
         // Bounded verification read for large files.

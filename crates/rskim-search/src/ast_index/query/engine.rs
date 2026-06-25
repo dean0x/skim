@@ -11,11 +11,10 @@ use std::cmp::Ordering;
 use std::path::Path;
 
 use rskim_core::Language;
-use rustc_hash::FxHashMap;
 
 use super::adapter::AstPostingSource;
 use super::parse::{AstQuery, parse_ast_query};
-use super::scoring::{CAPACITY_FLOOR, ScoringCtx};
+use super::scoring::ScoringCtx;
 use crate::{
     FileId, Result, SearchError,
     ast_index::{
@@ -112,20 +111,7 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
         // Per-call meta cache: skip for single-n-gram queries (C1: at most one posting
         // per doc_id per list, so cross-list cache hits only occur when total_ngrams > 1).
         // P1 (#286): value type is LiteMeta (5 bytes) not AstFileMetaEntry (15 bytes).
-        let meta_cache = if total_ngrams > 1 {
-            Some(FxHashMap::with_capacity_and_hasher(
-                CAPACITY_FLOOR,
-                Default::default(),
-            ))
-        } else {
-            None
-        };
-
-        let mut ctx = ScoringCtx {
-            scores: FxHashMap::with_capacity_and_hasher(CAPACITY_FLOOR, Default::default()),
-            meta_cache,
-            file_count,
-        };
+        let mut ctx = ScoringCtx::new(file_count, total_ngrams > 1);
 
         for entry in &bigrams {
             let postings = self.reader.lookup_bigram(entry.ngram)?;
