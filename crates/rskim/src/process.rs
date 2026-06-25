@@ -211,7 +211,26 @@ fn try_cached_result(
 }
 
 /// Read a file and validate it doesn't exceed the maximum input size.
+///
+/// Performs a pre-read metadata check to bail early before allocating memory,
+/// which prevents a transient peak of `num_cpus × file_size` when this function
+/// is called in parallel (e.g., via `into_par_iter` in the analytics recorder).
+/// The post-read length check is retained for TOCTOU safety (the file may grow
+/// between the stat and the read).
 fn read_and_validate(path: &Path) -> anyhow::Result<String> {
+    // Pre-read size guard: bail before allocating if the file is already over the limit.
+    // This is a best-effort check; a file that is exactly at the limit may pass here
+    // but fail the post-read check below if it grows between the stat and the read.
+    if let Ok(meta) = fs::metadata(path)
+        && meta.len() as usize > MAX_INPUT_SIZE
+    {
+        anyhow::bail!(
+            "File too large: {} bytes exceeds maximum of {} bytes ({}MB)",
+            meta.len(),
+            MAX_INPUT_SIZE,
+            MAX_INPUT_SIZE / 1024 / 1024
+        );
+    }
     let contents = fs::read_to_string(path)?;
     if contents.len() > MAX_INPUT_SIZE {
         anyhow::bail!(
@@ -420,6 +439,21 @@ pub(crate) fn process_stdin(
     // Retain the raw buffer for analytics background tokenization only when
     // counts are not already known (i.e. !show_stats). Stdin cannot be re-read,
     // so the buffer must travel with the result.
+    //
+    // Invariant: stdin_raw is Some iff !show_stats; orig_tokens/trans_tokens are
+    // Some iff show_stats (when the tokenizer is available). These two conditions
+    // are mutually exclusive by construction: show_stats drives count_token_pair
+    // above, and its negation drives stdin_raw here.
+    //
+    // The assert pins the always-guaranteed half: if we are NOT running show_stats,
+    // counts must be None (we never computed them). The reverse (show_stats → Some)
+    // is best-effort and depends on the tokenizer succeeding, so is not asserted.
+    debug_assert!(
+        options.show_stats || orig_tokens.is_none(),
+        "BUG(process_stdin): show_stats=false but orig_tokens is Some — \
+         token counts must not be present when show_stats is false \
+         (stdin_raw invariant violated)"
+    );
     let stdin_raw = if !options.show_stats {
         Some(buffer)
     } else {

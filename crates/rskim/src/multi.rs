@@ -333,7 +333,7 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
             session_id: options.session_id.clone(),
         };
 
-        crate::analytics::record_file_ops(true, rows, common);
+        crate::analytics::record_file_ops(options.analytics_enabled, rows, common);
     }
 
     Ok(())

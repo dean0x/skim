@@ -29,25 +29,48 @@ use crate::cascade::TruncationOptions;
 /// Resolve the cache root from an explicit override or the platform default.
 ///
 /// Convention (locked — avoids PF-002):
-/// - If `override_dir` is `Some(p)` and `p` is non-empty, use `p` as-is
-///   (caller's explicit override wins; we do NOT append `skim`).
-/// - An empty path is treated as unset (hardening against `SKIM_CACHE_DIR=""`).
+/// - If `override_dir` is `Some(p)` and `p` is non-empty (and not whitespace-only
+///   UTF-8), use `p` as-is (caller's explicit override wins; we do NOT append `skim`).
+/// - An empty or whitespace-only UTF-8 path is treated as unset.
+///   Non-UTF8 `OsStr` paths are never trimmed — they are valid and used as-is.
 /// - Otherwise fall back to `dirs::cache_dir().join("skim")`.
 ///
 /// This function is **pure** — it performs no I/O, no mkdir.
 pub(crate) fn cache_root_from(override_dir: Option<PathBuf>) -> Option<PathBuf> {
     override_dir
-        .filter(|p| !p.as_os_str().is_empty())
+        .filter(|p| {
+            if p.as_os_str().is_empty() {
+                return false;
+            }
+            // For valid UTF-8 paths, treat whitespace-only values as unset.
+            // Non-UTF-8 paths are preserved unchanged (they are valid filesystem paths).
+            match p.to_str() {
+                Some(s) => !s.trim().is_empty(),
+                None => true, // non-UTF8: valid path, do not reject
+            }
+        })
         .or_else(|| dirs::cache_dir().map(|c| c.join("skim")))
+}
+
+/// Read `SKIM_CACHE_DIR` from the process environment as a `PathBuf`, if set.
+///
+/// Single env-read entry point shared by [`cache_root`] and
+/// [`crate::cmd::hook_log::CacheEnv::from_process`] so the variable name is
+/// only referenced in one place (avoids PF-002 drift).
+pub(crate) fn read_cache_dir_env() -> Option<PathBuf> {
+    std::env::var_os("SKIM_CACHE_DIR").map(PathBuf::from)
 }
 
 /// Resolve the cache root from the process environment.
 ///
-/// Reads `SKIM_CACHE_DIR`; delegates to [`cache_root_from`].
-/// This function is the single source of truth for cache-root resolution
-/// and must be kept in sync with `cmd::hook_log::CacheEnv::resolve_cache_dir`.
+/// Reads `SKIM_CACHE_DIR` via [`read_cache_dir_env`] and delegates to
+/// [`cache_root_from`].
+///
+/// Single source of truth: `cmd::hook_log::CacheEnv::resolve_cache_dir` delegates
+/// to [`cache_root_from`] directly, so the two resolvers cannot drift — there is
+/// no "keep in sync" obligation (avoids PF-002).
 pub(crate) fn cache_root() -> Option<PathBuf> {
-    cache_root_from(std::env::var_os("SKIM_CACHE_DIR").map(PathBuf::from))
+    cache_root_from(read_cache_dir_env())
 }
 
 /// Cache entry with metadata for validation.

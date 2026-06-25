@@ -29,9 +29,12 @@ pub(crate) struct CacheEnv {
 
 impl CacheEnv {
     /// Build from the process environment (`SKIM_CACHE_DIR`).
+    ///
+    /// Uses [`crate::cache::read_cache_dir_env`] as the single env-read entry
+    /// point so the variable name is only referenced in one place (avoids PF-002).
     pub fn from_process() -> Self {
         Self {
-            cache_dir_override: std::env::var_os("SKIM_CACHE_DIR").map(std::path::PathBuf::from),
+            cache_dir_override: crate::cache::read_cache_dir_env(),
         }
     }
 
@@ -119,8 +122,8 @@ fn timestamp_string() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let days = secs / 86400;
-    let day_secs = secs % 86400;
+    let days = secs / crate::analytics::SECONDS_PER_DAY;
+    let day_secs = secs % crate::analytics::SECONDS_PER_DAY;
     let (year, month, day) = days_to_date(days);
     let hour = day_secs / 3600;
     let minute = (day_secs % 3600) / 60;
