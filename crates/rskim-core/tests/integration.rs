@@ -2757,10 +2757,10 @@ fn test_typescript_pseudo() {
         "type annotations should be stripped"
     );
 
-    // Should strip export keyword
+    // `export` is now preserved as API surface (A4 contract)
     assert!(
-        !result.contains("export "),
-        "export keyword should be stripped"
+        result.contains("export "),
+        "export must be preserved as API surface"
     );
 
     // Should preserve function names and logic
@@ -2824,10 +2824,10 @@ fn test_rust_pseudo() {
     let source = include_str!("../../../tests/fixtures/rust/simple.rs");
     let result = transform(source, Language::Rust, Mode::Pseudo).unwrap();
 
-    // Should strip visibility modifiers
+    // `pub` is now preserved as API surface in pseudo mode (A4 contract)
     assert!(
-        !result.contains("pub fn"),
-        "pub modifier should be stripped from functions"
+        result.contains("pub fn"),
+        "pub must be preserved as API surface"
     );
 
     // Should preserve function names and logic
@@ -2842,14 +2842,14 @@ fn test_java_pseudo() {
     let source = include_str!("../../../tests/fixtures/java/Simple.java");
     let result = transform(source, Language::Java, Mode::Pseudo).unwrap();
 
-    // Should strip visibility modifiers
+    // Access modifiers (public/private) are preserved as API surface (A4 contract)
     assert!(
-        !result.contains("public class"),
-        "public modifier should be stripped"
+        result.contains("public class"),
+        "public must be preserved as API surface"
     );
     assert!(
-        !result.contains("private int"),
-        "private modifier should be stripped"
+        result.contains("private "),
+        "private must be preserved as API surface"
     );
 
     // Should preserve class name and methods
@@ -2875,14 +2875,10 @@ fn test_cpp_pseudo() {
     let source = include_str!("../../../tests/fixtures/cpp/simple.cpp");
     let result = transform(source, Language::Cpp, Mode::Pseudo).unwrap();
 
-    // Should strip access specifiers
+    // C++ access specifiers (public:/private:) are preserved as API surface (A4 contract)
     assert!(
-        !result.contains("public:"),
-        "access specifier should be stripped"
-    );
-    assert!(
-        !result.contains("private:"),
-        "access specifier should be stripped"
+        result.contains("public:"),
+        "access specifier must be preserved as API surface"
     );
 
     // Should preserve class structure
@@ -2940,7 +2936,11 @@ fn test_pseudo_with_config() {
     let config = TransformConfig::with_mode(Mode::Pseudo);
     let source = "export function add(a: number, b: number): number { return a + b; }";
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
-    assert!(!result.contains("export"), "export stripped via config API");
+    // `export` is now preserved as API surface (A4 contract)
+    assert!(
+        result.contains("export"),
+        "export preserved as API surface via config API"
+    );
     assert!(
         !result.contains(": number"),
         "type annotations stripped via config API"
@@ -2949,11 +2949,12 @@ fn test_pseudo_with_config() {
 
 #[test]
 fn test_pseudo_auto_detection() {
+    // `pub` is now preserved as API surface in pseudo mode (A4 contract)
     let source = "pub fn hello() -> String { \"world\".to_string() }\n";
     let result = transform_auto(source, Path::new("test.rs"), Mode::Pseudo).unwrap();
     assert!(
-        !result.contains("pub "),
-        "visibility stripped via auto-detection"
+        result.contains("pub "),
+        "visibility preserved as API surface via auto-detection"
     );
     assert!(result.contains("fn hello"), "function preserved");
 }

@@ -589,6 +589,16 @@ pub(crate) fn extract_markdown_headers_with_spans(
         }
     }
 
+    // Sort headers into document order (ascending source start line).
+    // The LIFO visit_stack produces children in reverse sibling order, so without
+    // this sort siblings appear reversed in output.  Stable sort ensures that
+    // setext headings (which share a start line with their underline) remain in
+    // insertion order when source lines are equal (in practice, distinct headers
+    // always have distinct start lines).
+    // A1 invariant: output is now in document order; texts/spans/source_line_map
+    // are all derived from the sorted slice so they remain consistent.
+    headers.sort_by_key(|h| h.2);
+
     // Build text, spans, and source line map
     let mut spans = Vec::with_capacity(headers.len());
     let mut source_line_map: Vec<usize> = Vec::new();
@@ -933,8 +943,7 @@ mod markdown_line_map_tests {
     }
 
     /// Headers at non-contiguous source lines: the returned line map must
-    /// contain actual 1-indexed source line numbers, NOT sequential output
-    /// positions (1, 2, 3, ...).
+    /// contain actual 1-indexed source line numbers in document order.
     ///
     /// Source (9 lines + trailing newline):
     ///   1: "# Title"
@@ -947,14 +956,12 @@ mod markdown_line_map_tests {
     ///   8: ""
     ///   9: "### Sub"
     ///
-    /// The function uses a DFS stack that pops children in reverse order, so
-    /// headers are collected as [### Sub (line 9), ## Section (line 5), # Title (line 1)].
-    /// The line map is therefore [9, 5, 1] — all values are true source line numbers,
-    /// and none equals the sequential output positions 1, 2, 3.
+    /// After the document-order sort, the line map is [1, 5, 9].
     ///
     /// KEY: each map[i] must equal the source row of that header node (tree-sitter
-    /// `node.start_position().row + 1`). A broken implementation that uses
-    /// sequential output positions would yield [1, 2, 3] and fail here.
+    /// `node.start_position().row + 1`) AND they must ascend (document order).
+    /// A broken sequential-output-position implementation would yield [1, 2, 3]
+    /// (no entry would equal 5 or 9).
     #[test]
     fn test_markdown_line_map_non_contiguous_headers() {
         let source = "# Title\n\nSome text.\n\n## Section\n\nMore text.\n\n### Sub\n";
@@ -968,13 +975,11 @@ mod markdown_line_map_tests {
         );
 
         // All three values must be real source lines (1, 5, 9), not positions (1, 2, 3).
-        // The DFS stack reversal means they appear in reverse order [9, 5, 1].
-        let mut sorted = line_map.clone();
-        sorted.sort_unstable();
+        // After the document-order sort, the line map is already ascending [1, 5, 9].
         assert_eq!(
-            sorted,
+            line_map,
             vec![1, 5, 9],
-            "line map must contain source lines {{1, 5, 9}}, got {:?}",
+            "line map must be [1, 5, 9] in document order, got {:?}",
             line_map
         );
 
@@ -999,11 +1004,10 @@ mod markdown_line_map_tests {
     }
 
     /// Source with headers on consecutive lines (no interleaved prose).
-    /// Because the DFS stack reverses child order, the map is [3, 2, 1] —
-    /// this still confirms real source lines, not sequential output positions
-    /// (which would also be [1, 2, 3], indistinguishable from correct forward order).
+    /// After the document-order sort, the map must be [1, 2, 3] — ascending
+    /// source lines, matching visual top-to-bottom reading order.
     ///
-    /// The key invariant: map[0] = 3 (source line of ### H3), not 1.
+    /// The key invariant: map[0] == 1 (# H1 is first), map[2] == 3 (### H3 is last).
     #[test]
     fn test_markdown_line_map_consecutive_headers() {
         let source = "# H1\n## H2\n### H3\n";
@@ -1011,13 +1015,11 @@ mod markdown_line_map_tests {
 
         assert_eq!(line_map.len(), 3, "expected 3 headers, got {:?}", line_map);
 
-        // DFS stack reversal: first popped is ### H3 (source line 3).
-        // A sequential-output-position implementation would give map[0] == 1.
-        // The real source-line implementation gives map[0] == 3.
+        // Document order: # H1 (source line 1) must come first.
         assert_eq!(
-            line_map[0], 3,
-            "### H3 is at source line 3 and is collected first (DFS stack reversal), \
-             got line_map[0] = {}. A sequential-index implementation would give 1 here.",
+            line_map[0], 1,
+            "# H1 is at source line 1 and must be first after document-order sort, \
+             got line_map[0] = {}",
             line_map[0]
         );
         assert_eq!(
@@ -1026,10 +1028,80 @@ mod markdown_line_map_tests {
             line_map[1]
         );
         assert_eq!(
-            line_map[2], 1,
-            "# H1 is at source line 1, got {}",
+            line_map[2], 3,
+            "### H3 is at source line 3, got {}",
             line_map[2]
         );
+    }
+
+    /// Headers in document (top-to-bottom) order: the extracted text must list
+    /// headings top-to-bottom so that `--mode=structure` output reads naturally.
+    ///
+    /// This is the primary regression test for the LIFO stack bug: before the
+    /// document-order sort, siblings were emitted in reverse order so the last
+    /// sibling appeared first in the output.
+    #[test]
+    fn test_markdown_headers_document_order() {
+        // Five sibling headings in ascending source order.
+        let source = "# Alpha\n## Beta\n## Gamma\n### Delta\n## Epsilon\n";
+        let mut parser = crate::Parser::new(Language::Markdown).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let (text, _spans, line_map) =
+            extract_markdown_headers_with_spans(source, &tree, 1, 6).unwrap();
+
+        // All headings must appear in the text
+        assert!(text.contains("Alpha"), "Alpha missing from output: {text}");
+        assert!(text.contains("Beta"), "Beta missing from output: {text}");
+        assert!(text.contains("Gamma"), "Gamma missing from output: {text}");
+        assert!(text.contains("Delta"), "Delta missing from output: {text}");
+        assert!(
+            text.contains("Epsilon"),
+            "Epsilon missing from output: {text}"
+        );
+
+        // Headings must appear in document order (Alpha before Beta, Beta before Gamma, etc.)
+        let pos_alpha = text.find("Alpha").unwrap();
+        let pos_beta = text.find("Beta").unwrap();
+        let pos_gamma = text.find("Gamma").unwrap();
+        let pos_delta = text.find("Delta").unwrap();
+        let pos_epsilon = text.find("Epsilon").unwrap();
+
+        assert!(
+            pos_alpha < pos_beta,
+            "Alpha (pos {pos_alpha}) must precede Beta (pos {pos_beta}) in: {text}"
+        );
+        assert!(
+            pos_beta < pos_gamma,
+            "Beta (pos {pos_beta}) must precede Gamma (pos {pos_gamma}) in: {text}"
+        );
+        assert!(
+            pos_gamma < pos_delta,
+            "Gamma (pos {pos_gamma}) must precede Delta (pos {pos_delta}) in: {text}"
+        );
+        assert!(
+            pos_delta < pos_epsilon,
+            "Delta (pos {pos_delta}) must precede Epsilon (pos {pos_epsilon}) in: {text}"
+        );
+
+        // Line map must strictly ascend (document order invariant)
+        assert_eq!(
+            line_map.len(),
+            5,
+            "expected 5 entries in line_map: {:?}",
+            line_map
+        );
+        for i in 1..line_map.len() {
+            assert!(
+                line_map[i] > line_map[i - 1],
+                "line_map must be strictly ascending but line_map[{}]={} >= line_map[{}]={}, \
+                 full map: {:?}",
+                i,
+                line_map[i],
+                i - 1,
+                line_map[i - 1],
+                line_map
+            );
+        }
     }
 
     /// A markdown document with a single header deep in the file must map to

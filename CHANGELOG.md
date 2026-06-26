@@ -8,6 +8,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Markdown headings appear in reverse order in structure/signatures output** — The
+  `extract_markdown_headers_with_spans` function collected headings via a depth-first
+  visit stack (LIFO) which emitted sibling headings in reverse source order; a document
+  with `# A`, `## B`, `## C` produced `C → B → A` output. The fix adds a single
+  ascending sort on `source_start_line` before the texts/spans/line-map pipeline, so
+  headings are always emitted top-to-bottom regardless of tree traversal order.
+
+- **`cargo nextest run` dropped the `run` subcommand token in rewrites** — The rewrite
+  rule for `cargo nextest run` was `rewrite_to: &["skim", "cargo", "nextest"]`,
+  silently dropping `run`. This caused the dispatch layer to receive `nextest` without
+  `run`, fell through to the wrong handler, and also triggered a fragile
+  `args.iter().any(|a| a == "nextest")` sniff in the cargo test driver that
+  occasionally mis-identified standard `cargo test` runs. Three-layer fix: (a) preserve
+  `run` in the rewrite rule; (b) replace the sniff with an explicit
+  `runner_args.first() == Some("nextest")` check threaded from the dispatcher (A2
+  contract); (c) correct the test-failure output path — nextest writes its entire report
+  (including the summary) to *stderr*, leaving stdout empty, so its failures must be
+  forwarded raw rather than routed into skim's stdout-keyed compress path (which would
+  emit nothing — the net-savings guard baselines against the empty stdout — or
+  mis-count, since the embedded per-process libtest line reports a single binary, not
+  the whole run). nextest's test-failure exit `100` (distinct from libtest's `101`) is
+  therefore deliberately *not* added to the compressible-exit set; every non-zero
+  nextest exit forwards the full, accurate report verbatim. (#317 compress-never-truncate)
+
+- **Pseudo mode stripped visibility/export modifiers, losing API surface** — Pseudo mode
+  is intended to remove syntactic noise while preserving code semantics. Visibility
+  modifiers (`pub`, `export`, `public`, `private`, `protected`, `internal`,
+  `fileprivate`, `open` in Swift) are API surface — they affect what callers can see —
+  not noise. Removing them silently changed the semantics an LLM reads. The fix removes
+  visibility keywords and node kinds from all per-language `PseudoRules` strip lists.
+  Non-visibility structural modifiers (`static`, `final`, `abstract`, `virtual`,
+  `override`, `sealed`, Kotlin `open`/`data`) remain stripped as before. C++ access
+  specifiers (`public:`, `private:`) are similarly preserved. (A4 contract)
+
+- **`ls -la` output double-counted `.`/`..` entries and emitted a redundant header** —
+  `try_parse_ls_long` matched the permission-line regex against `.` and `..` dotdir
+  entries, inflating the dir count by 2. It also prepended a `"LS: N entries …"`
+  summary line before the file list; `FileResult::render` then emitted a second `ls N`
+  header, producing two headers in the rendered output. Fixes: skip `.` and `..` before
+  counting (trimming the trailing `/` added by `-F`/`-p` before the name comparison);
+  remove the prepended summary entry; fold the dir/file breakdown into the footer so it
+  reads `"… — D dirs, F files"` when entries are elided or `"D dirs, F files"` when all
+  fit. Empty directories (only `total`/`.`/`..` lines) return a well-formed `Full`
+  result with 0 entries rather than `None`, preventing Tier-2 from mis-tokenising those
+  lines.
+
 - **Unified `SKIM_CACHE_DIR` resolution — honored by all cache subsystems (#359 Phase B)** —
   Previously `SKIM_CACHE_DIR` was silently ignored by the parser cache and the default
   `analytics.db` path (`cache::get_cache_dir` read only `dirs::cache_dir()`) while the

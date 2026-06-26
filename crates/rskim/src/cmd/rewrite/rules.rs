@@ -31,7 +31,10 @@ const TEST_RULES: &[RewriteRule] = &[
     // cargo (longest prefix first)
     RewriteRule {
         prefix: &["cargo", "nextest", "run"],
-        rewrite_to: &["skim", "cargo", "nextest"],
+        // Preserve "run" so the dispatch layer receives "nextest run …" intact.
+        // Without "run", dispatch_cargo would route bare "nextest" which executes
+        // `cargo test nextest …` (bogus) instead of `cargo nextest run …` (#317 byte-faithful).
+        rewrite_to: &["skim", "cargo", "nextest", "run"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
         skip_if_middle_contains_eq: false,

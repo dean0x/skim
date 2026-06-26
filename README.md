@@ -240,7 +240,7 @@ Skim offers six modes with different levels of aggressiveness:
 
 ```bash
 skim file.ts --mode structure   # Default
-skim file.ts --mode pseudo      # Pseudocode (strips types, visibility, decorators)
+skim file.ts --mode pseudo      # Pseudocode (strips types & decorators; preserves visibility)
 skim file.ts --mode signatures  # More aggressive
 skim file.ts --mode types       # Most aggressive
 skim file.ts --mode full        # No transformation

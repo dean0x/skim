@@ -271,6 +271,36 @@ Setext Style H2
     assert!(stdout.contains("## ATX Style H2"));
     assert!(stdout.contains("### ATX Style H3"));
     assert!(stdout.contains("Setext Style H2"));
+
+    // Document-order: mixed setext+ATX headings must appear in source order.
+    // FIX 1 sorts headers by source_start_line before the output pipeline, so
+    // setext and ATX headings interleave correctly. We assert on heading TEXT
+    // positions in the output string — not on setext `-n` line numbers, which
+    // have a known pre-existing offset quirk unrelated to ordering.
+    let h1_pos = stdout.find("ATX Style H1").expect("ATX Style H1 not found");
+    let h2_pos = stdout.find("ATX Style H2").expect("ATX Style H2 not found");
+    let h3_pos = stdout.find("ATX Style H3").expect("ATX Style H3 not found");
+    let setext_h2_pos = stdout
+        .find("Setext Style H2")
+        .expect("Setext Style H2 not found");
+    assert!(
+        h1_pos < h2_pos,
+        "setext H1 (ATX Style H1) must precede ATX H2 in output (positions {} vs {})",
+        h1_pos,
+        h2_pos
+    );
+    assert!(
+        h2_pos < h3_pos,
+        "ATX H2 must precede ATX H3 in output (positions {} vs {})",
+        h2_pos,
+        h3_pos
+    );
+    assert!(
+        h3_pos < setext_h2_pos,
+        "ATX H3 must precede setext H2 in output (positions {} vs {})",
+        h3_pos,
+        setext_h2_pos
+    );
 }
 
 // ============================================================================
@@ -301,6 +331,69 @@ More body content.
         .stdout(predicate::str::contains("Body content here"))
         .stdout(predicate::str::contains("## Section"))
         .stdout(predicate::str::contains("More body content"));
+}
+
+// ============================================================================
+// Document Order (Fix 1 — heading sort regression guard)
+// ============================================================================
+
+/// Headings must appear in document (top-to-bottom) order in the output.
+///
+/// Before the document-order sort fix, the LIFO DFS stack emitted siblings
+/// in reverse order, so `## Beta` appeared before `## Alpha`.  This test
+/// is the regression guard: it verifies that the structure-mode and
+/// signatures-mode outputs list headings in ascending source-line order.
+#[test]
+fn test_markdown_headings_in_document_order() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("order.md");
+    fs::write(
+        &file_path,
+        "# Section Alpha\n\nSome content.\n\n## Sub Beta\n\nMore content.\n\n## Sub Gamma\n\nFinal.\n",
+    )
+    .unwrap();
+
+    for mode in &["structure", "signatures", "types"] {
+        let output = common::skim()
+            .arg(&file_path)
+            .arg("--mode")
+            .arg(mode)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let stdout = String::from_utf8(output).unwrap();
+
+        // All three headings must be present
+        assert!(
+            stdout.contains("Alpha"),
+            "[{mode}] Alpha heading missing from output: {stdout}"
+        );
+        assert!(
+            stdout.contains("Beta"),
+            "[{mode}] Beta heading missing from output: {stdout}"
+        );
+        assert!(
+            stdout.contains("Gamma"),
+            "[{mode}] Gamma heading missing from output: {stdout}"
+        );
+
+        // Alpha (line 1) must appear before Beta (line 5) and Gamma (line 9)
+        let pos_alpha = stdout.find("Alpha").expect("Alpha must be present");
+        let pos_beta = stdout.find("Beta").expect("Beta must be present");
+        let pos_gamma = stdout.find("Gamma").expect("Gamma must be present");
+
+        assert!(
+            pos_alpha < pos_beta,
+            "[{mode}] Alpha (pos {pos_alpha}) must precede Beta (pos {pos_beta})"
+        );
+        assert!(
+            pos_beta < pos_gamma,
+            "[{mode}] Beta (pos {pos_beta}) must precede Gamma (pos {pos_gamma})"
+        );
+    }
 }
 
 // ============================================================================

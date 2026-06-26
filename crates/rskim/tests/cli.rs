@@ -785,8 +785,8 @@ fn test_cli_pseudo_mode() {
         .stdout(predicate::str::contains("return a + b"))
         // Type annotations should be stripped
         .stdout(predicate::str::contains(": number").not())
-        // Export should be stripped
-        .stdout(predicate::str::contains("export").not());
+        // `export` is preserved as API surface (A4 contract)
+        .stdout(predicate::str::contains("export"));
 }
 
 #[test]
@@ -827,7 +827,8 @@ fn test_cli_pseudo_mode_rust() {
         .assert()
         .success()
         .stdout(predicate::str::contains("fn hello"))
-        .stdout(predicate::str::contains("pub fn").not());
+        // `pub` is preserved as API surface (A4 contract)
+        .stdout(predicate::str::contains("pub fn"));
 }
 
 #[test]
@@ -840,5 +841,6 @@ fn test_cli_pseudo_mode_stdin() {
         .assert()
         .success()
         .stdout(predicate::str::contains("x = 42"))
-        .stdout(predicate::str::contains("export").not());
+        // `export` is preserved as API surface (A4 contract)
+        .stdout(predicate::str::contains("export"));
 }
