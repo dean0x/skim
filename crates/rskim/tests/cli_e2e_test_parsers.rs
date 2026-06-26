@@ -58,10 +58,10 @@ fn test_cargo_tier1_json_fail_structured_output() {
 // Cargo: Tier 1 (nextest) via stdin
 // ============================================================================
 // NOTE: When piping nextest output via stdin (no args), `is_nextest` is false
-// because the cargo parser checks args for "nextest". Without the nextest flag,
-// the nextest text format falls through to passthrough (no JSON suite events,
-// no `test result:` regex match). This is a known limitation of stdin-piped
-// nextest output.
+// because the dispatch checks whether the first runner arg is "nextest" (A2).
+// Without the nextest flag, the nextest text format falls through to passthrough
+// (no JSON suite events, no `test result:` regex match). This is a known
+// limitation of stdin-piped nextest output.
 
 #[test]
 fn test_cargo_nextest_pass_passthrough_via_stdin() {

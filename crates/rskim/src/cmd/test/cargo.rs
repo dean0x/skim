@@ -44,22 +44,41 @@ static RE_CARGO_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
 static RE_FAILURE_BLOCK_HEADER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^---- (.+?) (?:stdout|stderr) ----$").expect("valid regex"));
 
-/// Run `skim cargo test [args...]`.
+/// Build the cargo command arguments for a test run.
+///
+/// For nextest, the args already lead with `"nextest run …"` so no prefix is
+/// needed.  For standard cargo test, `"test"` is prepended so the final
+/// command is `cargo test [args…]`.
+///
+/// This is a pure helper extracted from `run()` to make nextest routing
+/// unit-testable without spawning a process.  A2 contract: the `is_nextest`
+/// flag is threaded explicitly from the dispatcher — never sniffed from args.
+pub(crate) fn build_cargo_args(args: &[String], is_nextest: bool) -> Vec<String> {
+    let mut cmd = if is_nextest {
+        Vec::new()
+    } else {
+        vec!["test".to_string()]
+    };
+    cmd.extend(args.iter().cloned());
+    cmd
+}
+
+/// Run `skim cargo test [args...]` or `skim cargo nextest run [args...]`.
 ///
 /// Builds the cargo command, executes it, and parses the output using
 /// three-tier degradation. For nextest, skips JSON injection entirely.
 /// For standard cargo test, injects `--message-format=json` to get build
 /// artifact JSON on stdout (test results still come as plain text).
+///
+/// `is_nextest` is threaded explicitly from `dispatch_cargo` via `test::run`;
+/// the old `args.iter().any(|a| a == "nextest")` sniff is gone (A2 contract).
 pub(crate) fn run(
     args: &[String],
+    is_nextest: bool,
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
-    let is_nextest = args.iter().any(|a| a == "nextest");
-
-    // Build command args: start with "test", append all user args
-    let mut cmd_args: Vec<String> = vec!["test".to_string()];
-    cmd_args.extend(args.iter().cloned());
+    let mut cmd_args = build_cargo_args(args, is_nextest);
 
     // For standard cargo test (not nextest), inject --message-format=json
     // to suppress human-formatted build progress on stdout. This makes the
@@ -73,6 +92,13 @@ pub(crate) fn run(
     // test parsers: stdin must be piped AND no user args provided.
     let use_stdin = should_read_stdin(args);
 
+    // Exit codes that indicate "tests failed" rather than "program error":
+    // - libtest (cargo test): 101
+    // - cargo-nextest:        100
+    // The correct code must be used so skim compresses the summary instead
+    // of raw-forwarding on test-failure exits.
+    let expected_exit_codes: &[i32] = if is_nextest { &[100] } else { &[101] };
+
     run_parsed_command_with_exit(
         ParsedCommandConfig {
             program: "cargo",
@@ -85,9 +111,7 @@ pub(crate) fn run(
             family: "test",
             skip_ansi_strip: false,
             rec,
-            // 101 = libtest's exit code for test failures (also compile
-            // errors, which fall through to the verbatim-combined tiers).
-            expected_exit_codes: &[101],
+            expected_exit_codes,
             forward_stderr: false,
             skip_net_savings_guard: false,
         },
@@ -1125,6 +1149,60 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
         assert!(
             !result.entries.is_empty(),
             "Tier-1 entries must not be empty after Tier-2 changes"
+        );
+    }
+
+    // ========================================================================
+    // build_cargo_args (A2 contract — pure helper, no process spawning)
+    // ========================================================================
+
+    #[test]
+    fn test_build_cargo_args_nextest_no_test_prefix() {
+        // For nextest, args already lead with "nextest run …" — no "test" prefix.
+        let args = vec![
+            "nextest".to_string(),
+            "run".to_string(),
+            "-p".to_string(),
+            "x".to_string(),
+        ];
+        let result = build_cargo_args(&args, true);
+        assert_eq!(
+            result,
+            vec!["nextest", "run", "-p", "x"],
+            "nextest must not prepend 'test'"
+        );
+    }
+
+    #[test]
+    fn test_build_cargo_args_standard_prepends_test() {
+        // For standard cargo test, "test" is prepended.
+        let args = vec!["-p".to_string(), "x".to_string()];
+        let result = build_cargo_args(&args, false);
+        assert_eq!(
+            result,
+            vec!["test", "-p", "x"],
+            "standard cargo test must prepend 'test'"
+        );
+    }
+
+    #[test]
+    fn test_build_cargo_args_nextest_empty_args() {
+        // Edge case: bare "skim cargo nextest" → cargo gets no sub-command →
+        // nextest's own error message (visible, not blank — #317 fail-loud).
+        let args: Vec<String> = vec![];
+        let result = build_cargo_args(&args, true);
+        assert!(result.is_empty(), "empty nextest args must stay empty");
+    }
+
+    #[test]
+    fn test_build_cargo_args_standard_empty_args() {
+        // Edge case: bare "skim cargo test" → cargo test with no filter.
+        let args: Vec<String> = vec![];
+        let result = build_cargo_args(&args, false);
+        assert_eq!(
+            result,
+            vec!["test"],
+            "empty standard args must just be 'test'"
         );
     }
 }

@@ -58,7 +58,14 @@ pub(crate) fn run(
     };
 
     match runner {
-        "cargo" => cargo::run(runner_args, show_stats, rec),
+        "cargo" => {
+            // Thread is_nextest explicitly from the structural position of the
+            // first runner arg rather than sniffing anywhere in the arg list.
+            // This replaces the fragile `args.iter().any(|a| a == "nextest")`
+            // heuristic that misfired on `cargo test --test nextest` (A2 contract).
+            let is_nextest = runner_args.first().map(|s| s.as_str()) == Some("nextest");
+            cargo::run(runner_args, is_nextest, show_stats, rec)
+        }
         "cypress" => cypress::run(runner_args, show_stats, rec),
         "dotnet" => dotnet::run(runner_args, show_stats, rec),
         "go" => go::run(runner_args, show_stats, rec),

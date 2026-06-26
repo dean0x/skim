@@ -148,6 +148,43 @@ fn test_rewrite_tsc_bare_with_args() {
         .stdout(predicate::str::contains("skim tsc --noEmit --watch"));
 }
 
+/// `cargo nextest run` must be rewritten with `run` preserved (F2a / #317 byte-faithful).
+///
+/// The old rule dropped `run`, producing `skim cargo nextest`, which then executed
+/// `cargo test nextest …` — a bogus command that matched ~5 tests by name.
+#[test]
+fn test_rewrite_cargo_nextest_run_preserves_run() {
+    skim_cmd()
+        .args([
+            "rewrite", "cargo", "nextest", "run", "-p", "rskim", "--bins",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "skim cargo nextest run -p rskim --bins",
+        ));
+}
+
+/// Verify that the rule is still triggered when only the `cargo nextest run` prefix
+/// matches — flags after `run` must be forwarded verbatim (byte-faithful).
+#[test]
+fn test_rewrite_cargo_nextest_run_flags_forwarded() {
+    skim_cmd()
+        .args([
+            "rewrite",
+            "cargo",
+            "nextest",
+            "run",
+            "--no-fail-fast",
+            "--test-threads=4",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "skim cargo nextest run --no-fail-fast --test-threads=4",
+        ));
+}
+
 #[test]
 fn test_rewrite_cargo_clippy() {
     skim_cmd()
