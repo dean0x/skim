@@ -23,8 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   occasionally mis-identified standard `cargo test` runs. Three-layer fix: (a) preserve
   `run` in the rewrite rule; (b) replace the sniff with an explicit
   `runner_args.first() == Some("nextest")` check threaded from the dispatcher (A2
-  contract); (c) fix expected exit code — nextest exits `100` on test failure, not `101`
-  (libtest convention).
+  contract); (c) correct the test-failure output path — nextest writes its entire report
+  (including the summary) to *stderr*, leaving stdout empty, so its failures must be
+  forwarded raw rather than routed into skim's stdout-keyed compress path (which would
+  emit nothing — the net-savings guard baselines against the empty stdout — or
+  mis-count, since the embedded per-process libtest line reports a single binary, not
+  the whole run). nextest's test-failure exit `100` (distinct from libtest's `101`) is
+  therefore deliberately *not* added to the compressible-exit set; every non-zero
+  nextest exit forwards the full, accurate report verbatim. (#317 compress-never-truncate)
 
 - **Pseudo mode stripped visibility/export modifiers, losing API surface** — Pseudo mode
   is intended to remove syntactic noise while preserving code semantics. Visibility

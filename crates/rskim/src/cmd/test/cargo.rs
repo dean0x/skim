@@ -63,6 +63,29 @@ pub(crate) fn build_cargo_args(args: &[String], is_nextest: bool) -> Vec<String>
     cmd
 }
 
+/// Exit codes the cargo handler treats as "tests failed" (compressible) rather
+/// than "program error" (forward raw).
+///
+/// - Standard `cargo test` (libtest): **101**. libtest writes its results to
+///   stdout — exactly where the parser and the net-savings guard operate — so a
+///   failure compresses cleanly.
+/// - `cargo nextest`: **none**. nextest writes its ENTIRE report (summary
+///   included) to *stderr*, leaving stdout empty. Routing a nextest failure
+///   (exit 100) into the compress path would either blank it (the net-savings
+///   guard baselines against the empty stdout, so any compressed body looks
+///   "bigger than raw" and falls back to the empty stdout) or mis-summarise it
+///   (the embedded per-process libtest line counts a single test binary, not the
+///   whole run, so passes are undercounted). Declaring no expected codes makes
+///   every non-zero nextest exit forward raw — the full, accurate report reaches
+///   stderr, never blanked or mis-counted. (#317 compress-never-truncate; the
+///   ADR-001 net-savings guard stays intact for the exit-0 passthrough path.)
+///
+/// Pure helper extracted from `run()` so the contract is unit-testable without
+/// spawning cargo (which the nextest path always does — it cannot use stdin).
+pub(crate) fn cargo_expected_exit_codes(is_nextest: bool) -> &'static [i32] {
+    if is_nextest { &[] } else { &[101] }
+}
+
 /// Run `skim cargo test [args...]` or `skim cargo nextest run [args...]`.
 ///
 /// Builds the cargo command, executes it, and parses the output using
@@ -92,12 +115,10 @@ pub(crate) fn run(
     // test parsers: stdin must be piped AND no user args provided.
     let use_stdin = should_read_stdin(args);
 
-    // Exit codes that indicate "tests failed" rather than "program error":
-    // - libtest (cargo test): 101
-    // - cargo-nextest:        100
-    // The correct code must be used so skim compresses the summary instead
-    // of raw-forwarding on test-failure exits.
-    let expected_exit_codes: &[i32] = if is_nextest { &[100] } else { &[101] };
+    // Which non-zero exits mean "tests failed" (compress) vs "program error"
+    // (forward raw). nextest writes to stderr, so its failures must forward raw
+    // rather than blank/mis-summarise — see `cargo_expected_exit_codes`.
+    let expected_exit_codes = cargo_expected_exit_codes(is_nextest);
 
     run_parsed_command_with_exit(
         ParsedCommandConfig {
@@ -1203,6 +1224,33 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
             result,
             vec!["test"],
             "empty standard args must just be 'test'"
+        );
+    }
+
+    // ========================================================================
+    // cargo_expected_exit_codes (nextest-writes-to-stderr contract)
+    // ========================================================================
+
+    #[test]
+    fn test_expected_exit_codes_standard_is_101() {
+        // libtest writes results to stdout; 101 = "tests failed" → compress.
+        assert_eq!(
+            cargo_expected_exit_codes(false),
+            &[101],
+            "standard cargo test must treat 101 as a compressible test failure"
+        );
+    }
+
+    #[test]
+    fn test_expected_exit_codes_nextest_is_empty() {
+        // nextest writes its whole report (including exit-100 failures) to stderr,
+        // so NO exit may be routed into the stdout-keyed compress path — that path
+        // blanks (empty-stdout net-savings baseline) or mis-counts (per-process
+        // embedded libtest summary). Every non-zero nextest exit must forward raw.
+        assert!(
+            cargo_expected_exit_codes(true).is_empty(),
+            "nextest must declare no expected failure codes so failures forward raw \
+             (full, accurate report on stderr) instead of being blanked or mis-summarised"
         );
     }
 }
