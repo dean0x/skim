@@ -232,11 +232,24 @@ fn test_kotlin_minimal_strips_regular_comments() {
 // ============================================================================
 
 #[test]
-fn test_kotlin_pseudo_strips_visibility() {
+fn test_kotlin_pseudo_preserves_visibility() {
+    // Access modifiers (public/private/protected/internal) convey API surface —
+    // preserved in pseudo mode (A4 contract).
     let result = transform(SIMPLE_KT, Language::Kotlin, Mode::Pseudo).unwrap();
     assert!(
-        !result.contains("private "),
-        "private modifier should be stripped, got:\n{result}"
+        result.contains("private "),
+        "private modifier must be preserved as API surface, got:\n{result}"
+    );
+}
+
+#[test]
+fn test_kotlin_pseudo_still_strips_open() {
+    // Kotlin `open` is an inheritance modifier (not visibility) — still stripped.
+    let source = "open class Base {\n    open fun method() {}\n}\n";
+    let result = transform(source, Language::Kotlin, Mode::Pseudo).unwrap();
+    assert!(
+        !result.contains("open "),
+        "Kotlin open (inheritance modifier) must still be stripped, got:\n{result}"
     );
 }
 

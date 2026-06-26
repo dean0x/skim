@@ -183,11 +183,13 @@ fn test_ruby_pseudo_preserves_logic() {
 }
 
 #[test]
-fn test_ruby_pseudo_strips_visibility() {
+fn test_ruby_pseudo_preserves_visibility() {
+    // Access modifiers (private/protected/public) convey API surface —
+    // preserved in pseudo mode (A4 contract).
     let result = transform(SIMPLE_RB, Language::Ruby, Mode::Pseudo).unwrap();
     assert!(
-        !result.contains("private"),
-        "private modifier should be stripped in pseudo mode, got:\n{result}"
+        result.contains("private"),
+        "private modifier must be preserved as API surface, got:\n{result}"
     );
 }
 
