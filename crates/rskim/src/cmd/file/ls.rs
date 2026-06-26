@@ -148,10 +148,14 @@ fn try_parse_ls_long(stdout: &str) -> Option<FileResult> {
         }
         saw_long_line = true;
 
-        // Skip `.` and `..` dotdir entries.  The name is the last whitespace-separated
-        // token; trim a trailing `/` first (added by `-F`/`-p` flags).
+        // Skip `.` and `..` dotdir entries.  For symlink rows (`name -> target`),
+        // split on " -> " first so we compare the NAME, not the target — a symlink
+        // named `cur -> .` must not be dropped because its target happens to be `.`.
+        // Trailing `/` (from `-F`/`-p` flags) is trimmed before the comparison.
+        let name_part = line.split(" -> ").next().unwrap_or(line);
         if matches!(
-            line.split_whitespace()
+            name_part
+                .split_whitespace()
                 .last()
                 .map(|s| s.trim_end_matches('/')),
             Some(".") | Some("..")
@@ -304,7 +308,7 @@ fn try_parse_tree_text(stdout: &str) -> Option<FileResult> {
     for line in stdout.lines().take(MAX_INPUT_LINES) {
         if let Some((dirs, files)) = parse_tree_summary_line(line) {
             total_count = dirs + files;
-            summary = Some(format!("{dirs} directories, {files} files"));
+            summary = Some(format!("{dirs} dirs, {files} files"));
             continue;
         }
         if !RE_TREE_ENTRY.is_match(line) {
@@ -481,6 +485,41 @@ drwxr-xr-x  3 user group  96 Jan 01 ../\n\
         let result = try_parse_ls_long(input).expect("must parse with -F suffix");
         // Only file.txt counted; ./ and ../ excluded
         assert_eq!(result.total_count, 1, "dotdirs with -F suffix excluded");
+    }
+
+    /// Regression: a symlink whose target is `.` or `..` must NOT be dropped from
+    /// counts.  The old code used `split_whitespace().last()` which returned the
+    /// TARGET for symlink rows (`name -> target`), so `cur -> .` was silently
+    /// treated as a dotdir entry and excluded.  The fix splits on ` -> ` first.
+    #[test]
+    fn test_tier1_ls_la_symlink_not_misrouted_as_dotdir() {
+        let input = "total 8\n\
+drwxr-xr-x  2 user group  64 Jan 01 .\n\
+drwxr-xr-x  3 user group  96 Jan 01 ..\n\
+lrwxrwxrwx  1 user group   1 Jan 01 cur -> .\n\
+lrwxrwxrwx  1 user group   2 Jan 01 parent -> ..\n\
+-rw-r--r--  1 user group 100 Jan 01 file.txt\n\
+drwxr-xr-x  2 user group  64 Jan 01 subdir\n";
+        let result = try_parse_ls_long(input).expect("must parse");
+        // 4 real entries: cur, parent, file.txt, subdir
+        // `.` and `..` are genuine dotdirs and must be skipped;
+        // `cur -> .` and `parent -> ..` are symlinks whose NAMES are not `.`/`..`
+        // and must be counted.
+        assert_eq!(
+            result.total_count, 4,
+            "symlinks with dotdir targets must be counted, not dropped; got {}",
+            result.total_count
+        );
+        let rendered = format!("{result}");
+        // cur and parent start with 'l' (symlink), counted as files; subdir is a dir
+        assert!(
+            rendered.contains("1 dirs"),
+            "must count 1 dir (subdir), got: {rendered}"
+        );
+        assert!(
+            rendered.contains("3 files"),
+            "must count 3 files (cur, parent, file.txt), got: {rendered}"
+        );
     }
 
     #[test]
