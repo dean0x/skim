@@ -137,21 +137,26 @@ fn try_parse_ls_long(stdout: &str) -> Option<FileResult> {
     let mut files = 0usize;
     let mut entries: Vec<String> = Vec::with_capacity(MAX_DISPLAY_ENTRIES);
     let mut line_count = 0usize;
+    // Set when any permission-regex line is seen (including . and ..).
+    // Distinguishes "not ls -la output" (return None) from "empty dir whose
+    // only entries were . and .." (return Full with 0 real entries).
+    let mut saw_long_line = false;
 
     for line in stdout.lines().take(MAX_INPUT_LINES) {
         if !RE_LS_LONG.is_match(line) {
             continue;
         }
+        saw_long_line = true;
 
         // Skip `.` and `..` dotdir entries.  The name is the last whitespace-separated
         // token; trim a trailing `/` first (added by `-F`/`-p` flags).
-        match line
-            .split_whitespace()
-            .last()
-            .map(|s| s.trim_end_matches('/'))
-        {
-            Some(".") | Some("..") => continue,
-            _ => {}
+        if matches!(
+            line.split_whitespace()
+                .last()
+                .map(|s| s.trim_end_matches('/')),
+            Some(".") | Some("..")
+        ) {
+            continue;
         }
 
         line_count += 1;
@@ -165,17 +170,9 @@ fn try_parse_ls_long(stdout: &str) -> Option<FileResult> {
         }
     }
 
-    // Empty dir after skipping dotdirs: return a well-formed Full result (0 entries,
-    // "0 dirs, 0 files" footer) instead of None.  Returning None would fall through
-    // to Tier-2 which mis-tokenises `total`/`.`/`..` lines.
-    // Note: we can only reach here if at least one line matched RE_LS_LONG (including
-    // the dotdir lines we skipped), so we need to check whether the original output
-    // had any matching lines at all before declaring it empty.
-    let has_long_lines = stdout
-        .lines()
-        .take(MAX_INPUT_LINES)
-        .any(|l| RE_LS_LONG.is_match(l));
-    if !has_long_lines {
+    // Empty dir (only . and .. entries): return Full with 0 real entries rather
+    // than None so Tier-2 doesn't mis-tokenise `total`/`.`/`..` lines.
+    if !saw_long_line {
         return None;
     }
 

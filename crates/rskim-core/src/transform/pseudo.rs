@@ -1,8 +1,10 @@
 //! Pseudo mode transformation — strips syntactic noise while preserving logic flow.
 //!
-//! ARCHITECTURE: Removes type annotations, visibility modifiers, decorators, semicolons,
-//! and other syntactic noise to produce pseudocode-like output. Uses the same
-//! collect-ranges-then-remove pattern as minimal.rs.
+//! ARCHITECTURE: Removes type annotations, decorators, semicolons, and other
+//! syntactic noise to produce pseudocode-like output.  Visibility modifiers
+//! (pub/export/access modifiers) are intentionally preserved — they convey API
+//! surface information.  Uses the same collect-ranges-then-remove pattern as
+//! minimal.rs.
 //!
 //! Token reduction target: 30-50%
 
