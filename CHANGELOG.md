@@ -54,7 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result with 0 entries rather than `None`, preventing Tier-2 from mis-tokenising those
   lines.
 
-### Fixed
 - **Unified `SKIM_CACHE_DIR` resolution — honored by all cache subsystems (#359 Phase B)** —
   Previously `SKIM_CACHE_DIR` was silently ignored by the parser cache and the default
   `analytics.db` path (`cache::get_cache_dir` read only `dirs::cache_dir()`) while the

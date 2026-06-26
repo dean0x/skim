@@ -1228,6 +1228,49 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
     }
 
     // ========================================================================
+    // F2c regression guard — `cargo test --test nextest` must not misroute
+    // ========================================================================
+
+    #[test]
+    fn test_cargo_test_dash_test_nextest_is_not_nextest_path() {
+        // Regression guard (F2c / A2 contract): `cargo test --test nextest` must
+        // NOT be detected as a nextest invocation.
+        //
+        // Dispatch path:
+        //   dispatch_cargo(["test", "--test", "nextest"]) strips "test" via
+        //   prepend_without and calls test::run(["cargo", "--test", "nextest"]).
+        //   Inside test::run, split_first() yields runner_name="cargo" and
+        //   runner_args=["--test", "nextest"].  The is_nextest check is:
+        //     runner_args.first() == Some("nextest")
+        //   which evaluates to Some("--test") == Some("nextest") → false. ✓
+        //
+        // This test drives build_cargo_args with the args that cargo::run
+        // receives (["--test", "nextest"], is_nextest=false) and asserts both
+        // that is_nextest is correctly false AND that the final argv is
+        // ["test", "--test", "nextest"] (standard cargo test, not nextest path).
+        let runner_args = vec!["--test".to_string(), "nextest".to_string()];
+
+        // Replicate the is_nextest detection from test::run.
+        let is_nextest = runner_args.first().map(|s| s.as_str()) == Some("nextest");
+        assert!(
+            !is_nextest,
+            "cargo test --test nextest: runner_args.first() is \"--test\", not \
+             \"nextest\" — must NOT be detected as nextest (F2c regression guard)"
+        );
+
+        // Contract: build_cargo_args must yield ["test", "--test", "nextest"]
+        // (standard cargo test), not ["--test", "nextest"] (dropped test prefix)
+        // and not the nextest no-prepend path.
+        let argv = build_cargo_args(&runner_args, is_nextest);
+        assert_eq!(
+            argv,
+            vec!["test", "--test", "nextest"],
+            "cargo test --test nextest must build argv [\"test\", \"--test\", \"nextest\"]; \
+             got {argv:?}"
+        );
+    }
+
+    // ========================================================================
     // cargo_expected_exit_codes (nextest-writes-to-stderr contract)
     // ========================================================================
 

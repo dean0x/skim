@@ -323,7 +323,7 @@ fn test_markdown_headings_in_document_order() {
     )
     .unwrap();
 
-    for mode in &["structure", "signatures"] {
+    for mode in &["structure", "signatures", "types"] {
         let output = common::skim()
             .arg(&file_path)
             .arg("--mode")
