@@ -59,12 +59,17 @@ pub(crate) fn run(
 
     match runner {
         "cargo" => {
-            // Thread is_nextest explicitly from the structural position of the
-            // first runner arg rather than sniffing anywhere in the arg list.
-            // This replaces the fragile `args.iter().any(|a| a == "nextest")`
-            // heuristic that misfired on `cargo test --test nextest` (A2 contract).
-            let is_nextest = runner_args.first().map(|s| s.as_str()) == Some("nextest");
-            cargo::run(runner_args, is_nextest, show_stats, rec)
+            // UNREACHABLE via production dispatch: since the A1 fix,
+            // `dispatch_cargo` routes the "test" and "nextest" arms directly to
+            // `cargo::run` with is_nextest threaded from the dispatch arm — never
+            // re-derived from args position.  This unreachable guard surfaces any
+            // accidental regression where a new call-site bypasses dispatch_cargo.
+            // (A2 contract: is_nextest is threaded from the dispatcher, never
+            // sniffed from args.)
+            unreachable!(
+                "cargo runner is dispatched directly via dispatch_cargo → cargo::run \
+                 (A1 fix); reaching this arm means a new call-site bypassed dispatch_cargo"
+            )
         }
         "cypress" => cypress::run(runner_args, show_stats, rec),
         "dotnet" => dotnet::run(runner_args, show_stats, rec),

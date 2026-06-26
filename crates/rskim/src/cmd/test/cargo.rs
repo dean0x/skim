@@ -52,7 +52,9 @@ static RE_FAILURE_BLOCK_HEADER: LazyLock<Regex> =
 ///
 /// This is a pure helper extracted from `run()` to make nextest routing
 /// unit-testable without spawning a process.  A2 contract: the `is_nextest`
-/// flag is threaded explicitly from the dispatcher — never sniffed from args.
+/// flag is threaded explicitly from `dispatch_cargo` — never sniffed from args.
+/// `dispatch_cargo`'s "test" arm always passes `false`; its "nextest" arm
+/// always passes `true`; no positional-first-arg re-derivation occurs.
 pub(crate) fn build_cargo_args(args: &[String], is_nextest: bool) -> Vec<String> {
     let mut cmd = if is_nextest {
         Vec::new()
@@ -93,8 +95,11 @@ pub(crate) fn cargo_expected_exit_codes(is_nextest: bool) -> &'static [i32] {
 /// For standard cargo test, injects `--message-format=json` to get build
 /// artifact JSON on stdout (test results still come as plain text).
 ///
-/// `is_nextest` is threaded explicitly from `dispatch_cargo` via `test::run`;
-/// the old `args.iter().any(|a| a == "nextest")` sniff is gone (A2 contract).
+/// `is_nextest` is threaded explicitly from `dispatch_cargo` directly — the
+/// "test" and "nextest" dispatch arms call this function without going through
+/// `test::run`.  The old positional-first-arg sniff (`runner_args.first()==
+/// Some("nextest")`) is gone: it misfired when "nextest" was a bare test-name
+/// filter (`cargo test nextest`), not the nextest subcommand (A1/A2 contract).
 pub(crate) fn run(
     args: &[String],
     is_nextest: bool,
@@ -1234,39 +1239,46 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
     #[test]
     fn test_cargo_test_dash_test_nextest_is_not_nextest_path() {
         // Regression guard (F2c / A2 contract): `cargo test --test nextest` must
-        // NOT be detected as a nextest invocation.
+        // NOT be treated as a nextest invocation.
         //
-        // Dispatch path:
-        //   dispatch_cargo(["test", "--test", "nextest"]) strips "test" via
-        //   prepend_without and calls test::run(["cargo", "--test", "nextest"]).
-        //   Inside test::run, split_first() yields runner_name="cargo" and
-        //   runner_args=["--test", "nextest"].  The is_nextest check is:
-        //     runner_args.first() == Some("nextest")
-        //   which evaluates to Some("--test") == Some("nextest") → false. ✓
-        //
-        // This test drives build_cargo_args with the args that cargo::run
-        // receives (["--test", "nextest"], is_nextest=false) and asserts both
-        // that is_nextest is correctly false AND that the final argv is
-        // ["test", "--test", "nextest"] (standard cargo test, not nextest path).
+        // After the A1 fix, `dispatch_cargo`'s "test" arm always threads
+        // is_nextest=false directly into cargo::run — no positional-arg sniff
+        // occurs. This test calls build_cargo_args with is_nextest=false (the
+        // value dispatch always sends) and asserts the correct standard-test argv.
         let runner_args = vec!["--test".to_string(), "nextest".to_string()];
-
-        // Replicate the is_nextest detection from test::run.
-        let is_nextest = runner_args.first().map(|s| s.as_str()) == Some("nextest");
-        assert!(
-            !is_nextest,
-            "cargo test --test nextest: runner_args.first() is \"--test\", not \
-             \"nextest\" — must NOT be detected as nextest (F2c regression guard)"
-        );
-
-        // Contract: build_cargo_args must yield ["test", "--test", "nextest"]
-        // (standard cargo test), not ["--test", "nextest"] (dropped test prefix)
-        // and not the nextest no-prepend path.
+        // is_nextest is threaded from dispatch_cargo "test" arm — never re-derived.
+        let is_nextest = false;
         let argv = build_cargo_args(&runner_args, is_nextest);
         assert_eq!(
             argv,
             vec!["test", "--test", "nextest"],
             "cargo test --test nextest must build argv [\"test\", \"--test\", \"nextest\"]; \
              got {argv:?}"
+        );
+    }
+
+    #[test]
+    fn test_cargo_test_nextest_bare_positional_no_misroute() {
+        // Regression guard (A1): `cargo test nextest` (bare positional test-name
+        // filter, a valid cargo test invocation) must NOT misroute to the nextest
+        // path just because the filter token happens to equal "nextest".
+        //
+        // dispatch_cargo receives args=["test","nextest"], strips "test" at idx=0,
+        // and calls cargo::run(["nextest"], is_nextest=false, ...) directly — never
+        // re-derives is_nextest from runner_args.first().  This test drives the
+        // real production helper (build_cargo_args) with those exact inputs and
+        // asserts the final cargo argv is ["test","nextest"], not ["nextest"]
+        // (which would misroute to `cargo nextest`).
+        let runner_args = vec!["nextest".to_string()];
+        // is_nextest=false: dispatch_cargo "test" arm always threads this value.
+        let is_nextest = false;
+        let argv = build_cargo_args(&runner_args, is_nextest);
+        assert_eq!(
+            argv,
+            vec!["test", "nextest"],
+            "cargo test nextest: bare-positional filter must build cargo argv \
+             [\"test\",\"nextest\"] (standard test), not [\"nextest\"] \
+             (misrouted to cargo nextest); got {argv:?}"
         );
     }
 

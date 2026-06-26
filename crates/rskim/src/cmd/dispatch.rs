@@ -97,6 +97,23 @@ fn prepend_without(tool: &str, args: &[String], skip_idx: usize) -> Vec<String> 
     v
 }
 
+/// Build a `Vec<String>` with the element at `skip_idx` removed and **no** tool
+/// prepended.  Used by the cargo `test` dispatch arm to strip the `test`
+/// subcommand token before handing the remaining args to `cargo::run`, which
+/// re-adds `test` itself via `build_cargo_args`.
+fn without_index(args: &[String], skip_idx: usize) -> Vec<String> {
+    assert!(
+        skip_idx < args.len(),
+        "skip_idx {skip_idx} out of bounds for args len {}",
+        args.len()
+    );
+    args.iter()
+        .enumerate()
+        .filter(|(i, _)| *i != skip_idx)
+        .map(|(_, s)| s.clone())
+        .collect()
+}
+
 /// Shared scaffolding for multi-category dispatchers (`cargo`, `go`, …).
 ///
 /// Handles flag interleaving: `skim cargo --show-stats test` works because
@@ -350,6 +367,25 @@ fn print_go_help() {
 // ============================================================================
 
 /// Route `skim cargo <subcmd> [args...]` to the correct category handler.
+/// Shared tail for cargo's `test` / `nextest` dispatch arms: split off
+/// `--show-stats`, build the test recording context, and run the cargo test
+/// handler with `is_nextest` threaded explicitly from the calling arm — never
+/// re-derived from arg position (A1 fix; see PF-003).
+fn run_cargo_tests(
+    args: &[String],
+    is_nextest: bool,
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
+    let (filtered, show_stats) = super::extract_show_stats(args);
+    let rec = crate::analytics::RecordingContext {
+        enabled: analytics.enabled,
+        command_type: crate::analytics::CommandType::Test,
+        parse_tier: None,
+        session_id: analytics.session_id.as_deref(),
+    };
+    test::cargo::run(&filtered, is_nextest, show_stats, rec)
+}
+
 fn dispatch_cargo(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
@@ -375,10 +411,18 @@ fn dispatch_cargo(
     // All subcommands use their own name consistently — there is no legacy "cargo"
     // alias for "build" any more.
     match subcmd {
-        "test" | "t" => test::run(&prepend_without("cargo", args, idx), analytics),
-        // nextest: keep the "nextest" token — the test handler uses it to select
-        // the nextest parse path instead of the plain cargo-test path.
-        "nextest" => test::run(&prepend("cargo", args), analytics),
+        "test" | "t" => {
+            // Standard cargo test — drop the "test" subcmd token, then thread
+            // is_nextest=false from the dispatch arm (never re-derived from arg
+            // position).  Without explicit threading, `cargo test nextest` (a bare
+            // test-name filter) looks identical to `cargo nextest run` once the
+            // "test" token is stripped — runner_args.first()=="nextest" in both —
+            // causing a misroute (A1 fix, avoids PF-003 false-green on the
+            // standard-test path).
+            run_cargo_tests(&without_index(args, idx), false, analytics)
+        }
+        // cargo nextest — keep all tokens (incl. "nextest"); is_nextest=true.
+        "nextest" => run_cargo_tests(args, true, analytics),
         "build" | "b" => build::run(&prepend_without("build", args, idx), analytics),
         "check" | "c" => build::run(&prepend_without("check", args, idx), analytics),
         "fmt" => build::run(&prepend_without("fmt", args, idx), analytics),
