@@ -126,6 +126,10 @@
 //! - #323 — cross-OS CI matrix (consumes this crate's harness).
 //! - #325 — L2 guardrail migration follow-up (tracked, not done here).
 //! - #328 — conformance-harness registration for `rskim-llm`.
+//! - #342 — `DecisionRecord.reason` + token fields: shared schema coordination
+//!   between #301 (this crate, schema owner) and #305 (persistence), per ADR-004.
+//!   Adds [`log::OutcomeReason`] enum and `reason`/`tokens_in`/`tokens_out` fields
+//!   to [`log::DecisionRecord`], unblocking #304's full 5→3 reason mapping.
 
 #![deny(missing_docs)]
 
@@ -144,7 +148,7 @@ pub mod harness;
 
 pub use contract::{Contract, Outcome};
 pub use error::ContractError;
-pub use log::{ChannelDecisionSink, DecisionRecord, DecisionSink, SinkFull};
+pub use log::{ChannelDecisionSink, DecisionRecord, DecisionSink, OutcomeReason, SinkFull};
 
 /// Crate-level `Result` alias for construction/configuration errors.
 ///
