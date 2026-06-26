@@ -271,6 +271,36 @@ Setext Style H2
     assert!(stdout.contains("## ATX Style H2"));
     assert!(stdout.contains("### ATX Style H3"));
     assert!(stdout.contains("Setext Style H2"));
+
+    // Document-order: mixed setext+ATX headings must appear in source order.
+    // FIX 1 sorts headers by source_start_line before the output pipeline, so
+    // setext and ATX headings interleave correctly. We assert on heading TEXT
+    // positions in the output string — not on setext `-n` line numbers, which
+    // have a known pre-existing offset quirk unrelated to ordering.
+    let h1_pos = stdout.find("ATX Style H1").expect("ATX Style H1 not found");
+    let h2_pos = stdout.find("ATX Style H2").expect("ATX Style H2 not found");
+    let h3_pos = stdout.find("ATX Style H3").expect("ATX Style H3 not found");
+    let setext_h2_pos = stdout
+        .find("Setext Style H2")
+        .expect("Setext Style H2 not found");
+    assert!(
+        h1_pos < h2_pos,
+        "setext H1 (ATX Style H1) must precede ATX H2 in output (positions {} vs {})",
+        h1_pos,
+        h2_pos
+    );
+    assert!(
+        h2_pos < h3_pos,
+        "ATX H2 must precede ATX H3 in output (positions {} vs {})",
+        h2_pos,
+        h3_pos
+    );
+    assert!(
+        h3_pos < setext_h2_pos,
+        "ATX H3 must precede setext H2 in output (positions {} vs {})",
+        h3_pos,
+        setext_h2_pos
+    );
 }
 
 // ============================================================================

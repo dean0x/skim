@@ -975,13 +975,11 @@ mod markdown_line_map_tests {
         );
 
         // All three values must be real source lines (1, 5, 9), not positions (1, 2, 3).
-        // The DFS stack reversal means they appear in reverse order [9, 5, 1].
-        let mut sorted = line_map.clone();
-        sorted.sort_unstable();
+        // After the document-order sort, the line map is already ascending [1, 5, 9].
         assert_eq!(
-            sorted,
+            line_map,
             vec![1, 5, 9],
-            "line map must contain source lines {{1, 5, 9}}, got {:?}",
+            "line map must be [1, 5, 9] in document order, got {:?}",
             line_map
         );
 

@@ -58,7 +58,7 @@ fn consume_trailing_whitespace(source: &[u8], end: usize) -> usize {
 fn is_inline_modifier_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "lifetime" | "mutable_specifier" | "visibility_modifier" | "readonly" | "abstract"
+        "lifetime" | "mutable_specifier" | "readonly" | "abstract"
     )
 }
 
@@ -140,6 +140,8 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
         },
         Language::C => PseudoRules {
             strip_kinds: &[],
+            // C has no OOP access modifiers; `static`/`extern` are linkage specifiers —
+            // intentionally treated as noise (not preserved as API surface).
             strip_keywords: &["static", "extern", "const", "volatile"],
             strip_semicolons: true,
             strip_self_param: false,
@@ -426,9 +428,9 @@ fn collect_noise_ranges(
         let start = node.start_byte();
         let end = node.end_byte();
         let adjusted_start = adjust_type_start(ctx.language, kind, ctx.source_bytes, start);
-        // Consume trailing whitespace only for inline modifiers (lifetime, mut, visibility,
-        // etc.) where the space separates the modifier from the next token. Do NOT consume
-        // for type annotations — their trailing space may belong to assignment syntax
+        // Consume trailing whitespace only for inline modifiers (lifetime, mut, readonly,
+        // abstract, etc.) where the space separates the modifier from the next token. Do NOT
+        // consume for type annotations — their trailing space may belong to assignment syntax
         // (e.g., `: number = 42` → `= 42` needs the space before `=`).
         let end = if is_inline_modifier_kind(kind) {
             consume_trailing_whitespace(ctx.source_bytes, end)
@@ -1221,7 +1223,6 @@ mod tests {
     fn test_is_inline_modifier_kind_positives() {
         assert!(is_inline_modifier_kind("lifetime"));
         assert!(is_inline_modifier_kind("mutable_specifier"));
-        assert!(is_inline_modifier_kind("visibility_modifier"));
         assert!(is_inline_modifier_kind("readonly"));
         assert!(is_inline_modifier_kind("abstract"));
     }
