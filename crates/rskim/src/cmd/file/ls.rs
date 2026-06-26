@@ -120,6 +120,18 @@ fn parse_ls(output: &CommandOutput) -> ParseResult<FileResult> {
 }
 
 /// Tier 1: long-form `ls -la` output — detect permissions, count dirs vs files.
+///
+/// Skips `.` and `..` dotdir entries so they are excluded from counts and from
+/// the display list.  `-F`/`-p` append a trailing `/` to directory names; names
+/// are trimmed before the dot-dir comparison.
+///
+/// Dir/file counts are folded into the FOOTER rather than a prepended summary
+/// entry, eliminating the duplicate `ls N` + `LS: N entries` double-header that
+/// appeared on large directories (A3 contract: FileResult public shape unchanged).
+///
+/// Empty dirs (only `total`/`.`/`..` lines): returns a Full result with 0 entries
+/// rather than None, preventing Tier-2 from mis-tokenising the `total`/`.`/`..`
+/// lines as plain filenames.
 fn try_parse_ls_long(stdout: &str) -> Option<FileResult> {
     let mut dirs = 0usize;
     let mut files = 0usize;
@@ -130,6 +142,18 @@ fn try_parse_ls_long(stdout: &str) -> Option<FileResult> {
         if !RE_LS_LONG.is_match(line) {
             continue;
         }
+
+        // Skip `.` and `..` dotdir entries.  The name is the last whitespace-separated
+        // token; trim a trailing `/` first (added by `-F`/`-p` flags).
+        match line
+            .split_whitespace()
+            .last()
+            .map(|s| s.trim_end_matches('/'))
+        {
+            Some(".") | Some("..") => continue,
+            _ => {}
+        }
+
         line_count += 1;
         if line.starts_with('d') {
             dirs += 1;
@@ -141,23 +165,35 @@ fn try_parse_ls_long(stdout: &str) -> Option<FileResult> {
         }
     }
 
-    if line_count == 0 {
+    // Empty dir after skipping dotdirs: return a well-formed Full result (0 entries,
+    // "0 dirs, 0 files" footer) instead of None.  Returning None would fall through
+    // to Tier-2 which mis-tokenises `total`/`.`/`..` lines.
+    // Note: we can only reach here if at least one line matched RE_LS_LONG (including
+    // the dotdir lines we skipped), so we need to check whether the original output
+    // had any matching lines at all before declaring it empty.
+    let has_long_lines = stdout
+        .lines()
+        .take(MAX_INPUT_LINES)
+        .any(|l| RE_LS_LONG.is_match(l));
+    if !has_long_lines {
         return None;
     }
 
     let shown_count = entries.len();
-    let footer = crate::output::elision_marker(shown_count, line_count, "entries");
 
-    let summary_entry = format!("LS: {line_count} entries ({dirs} dirs, {files} files)");
-    // Prepend summary as first entry
-    let mut all_entries = vec![summary_entry];
-    all_entries.extend(entries);
+    // Build footer: fold the dir/file breakdown into the elision marker (if any),
+    // or emit just "D dirs, F files" when everything fits.
+    let breakdown = format!("{dirs} dirs, {files} files");
+    let footer = match crate::output::elision_marker(shown_count, line_count, "entries") {
+        Some(elision) => Some(format!("{elision} — {breakdown}")),
+        None => Some(breakdown),
+    };
 
     Some(FileResult::new(
         "ls".to_string(),
         line_count,
         shown_count,
-        all_entries,
+        entries,
         footer,
     ))
 }
@@ -365,10 +401,107 @@ mod tests {
         let result = try_parse_ls_long(&input);
         assert!(result.is_some(), "Expected Tier 1 ls -la parse to succeed");
         let result = result.unwrap();
-        assert!(result.total_count > 0);
-        // Summary entry should be present
+        // The fixture has 10 permission-matching lines (`.`, `..` + 8 entries).
+        // After dotdir exclusion, total_count == 8 (2 dirs + 6 files).
+        assert_eq!(result.total_count, 8, "dotdirs excluded from count");
         let rendered = format!("{result}");
-        assert!(rendered.contains("dirs") || rendered.contains("files"));
+        // Footer must contain dir/file breakdown
+        assert!(
+            rendered.contains("dirs") && rendered.contains("files"),
+            "footer must include dir/file breakdown, got: {rendered}"
+        );
+        // The rendered output must NOT start with "LS: " (no double header)
+        assert!(
+            !rendered.contains("LS: "),
+            "no double header (LS: summary entry removed), got: {rendered}"
+        );
+        // The first line must be "ls N" (the FileResult header)
+        let first_line = rendered.lines().next().unwrap_or("");
+        assert!(
+            first_line.starts_with("ls "),
+            "first line must be 'ls N' header, got: {first_line}"
+        );
+    }
+
+    #[test]
+    fn test_tier1_ls_la_excludes_dotdirs() {
+        // Regression test: ./ and ../ (from -F/-p) must be excluded from counts.
+        let input = "total 8\n\
+drwxr-xr-x  2 user group  64 Jan 01 .//\n\
+drwxr-xr-x  3 user group  96 Jan 01 ../\n\
+-rw-r--r--  1 user group 100 Jan 01 file1.txt\n\
+-rw-r--r--  1 user group 200 Jan 01 file2.txt\n\
+drwxr-xr-x  2 user group  64 Jan 01 subdir/\n";
+        // Note: the fixture uses names ending in / (the -F/-p suffix)
+        let fixed_input = "total 8\n\
+drwxr-xr-x  2 user group  64 Jan 01 .\n\
+drwxr-xr-x  3 user group  96 Jan 01 ..\n\
+-rw-r--r--  1 user group 100 Jan 01 file1.txt\n\
+-rw-r--r--  1 user group 200 Jan 01 file2.txt\n\
+drwxr-xr-x  2 user group  64 Jan 01 subdir\n";
+        let result = try_parse_ls_long(fixed_input).expect("must parse");
+        // 3 real entries (file1.txt, file2.txt, subdir); . and .. excluded
+        assert_eq!(
+            result.total_count, 3,
+            "dotdirs excluded: got {}",
+            result.total_count
+        );
+        let rendered = format!("{result}");
+        assert!(
+            rendered.contains("1 dirs"),
+            "must count 1 dir (subdir), got: {rendered}"
+        );
+        assert!(
+            rendered.contains("2 files"),
+            "must count 2 files, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_tier1_ls_la_excludes_dotdirs_with_f_suffix() {
+        // -F/-p appends '/' to directories; trim before comparing names.
+        let input = "total 8\n\
+drwxr-xr-x  2 user group  64 Jan 01 ./\n\
+drwxr-xr-x  3 user group  96 Jan 01 ../\n\
+-rw-r--r--  1 user group 100 Jan 01 file.txt\n";
+        let result = try_parse_ls_long(input).expect("must parse with -F suffix");
+        // Only file.txt counted; ./ and ../ excluded
+        assert_eq!(result.total_count, 1, "dotdirs with -F suffix excluded");
+    }
+
+    #[test]
+    fn test_tier1_ls_la_empty_dir() {
+        // An empty directory shows only total + . + .. lines.
+        // Must return a Full result (not None) to prevent Tier-2 mis-tokenising.
+        let input = "total 0\n\
+drwxr-xr-x  2 user group  64 Jan 01 .\n\
+drwxr-xr-x  3 user group  96 Jan 01 ..\n";
+        let result = try_parse_ls_long(input).expect("empty dir must return Full result");
+        assert_eq!(result.total_count, 0, "empty dir has 0 real entries");
+        let rendered = format!("{result}");
+        assert!(
+            rendered.contains("0 dirs") && rendered.contains("0 files"),
+            "empty dir footer must say '0 dirs, 0 files', got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_tier1_ls_la_no_double_header() {
+        // The FileResult render emits "ls N" as the first line; we must NOT
+        // prepend an additional "LS: N entries …" entry (double header bug).
+        let input = load_fixture("file", "ls_la.txt");
+        let result = try_parse_ls_long(&input).expect("must parse");
+        let rendered = format!("{result}");
+        // Count occurrences of lines starting with "ls"
+        let ls_header_count = rendered.lines().filter(|l| l.starts_with("ls ")).count();
+        assert_eq!(
+            ls_header_count, 1,
+            "exactly one 'ls N' header, got {ls_header_count} in: {rendered}"
+        );
+        assert!(
+            !rendered.contains("LS: "),
+            "old double header 'LS: ' must not appear, got: {rendered}"
+        );
     }
 
     #[test]
