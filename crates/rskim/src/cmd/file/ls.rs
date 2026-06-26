@@ -455,6 +455,23 @@ drwxr-xr-x  2 user group  64 Jan 01 subdir\n";
             rendered.contains("2 files"),
             "must count 2 files, got: {rendered}"
         );
+        // Also verify the -F/-p slash-suffix form (including the .// edge case) gives
+        // the same counts — trim_end_matches('/') must collapse .// → . → skipped.
+        let result_f = try_parse_ls_long(input).expect("must parse -F suffix form");
+        assert_eq!(
+            result_f.total_count, 3,
+            "dotdirs excluded with -F suffix (.//): got {}",
+            result_f.total_count
+        );
+        let rendered_f = format!("{result_f}");
+        assert!(
+            rendered_f.contains("1 dirs"),
+            "must count 1 dir (subdir/) with -F suffix, got: {rendered_f}"
+        );
+        assert!(
+            rendered_f.contains("2 files"),
+            "must count 2 files with -F suffix, got: {rendered_f}"
+        );
     }
 
     #[test]
