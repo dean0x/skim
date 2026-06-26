@@ -364,7 +364,7 @@ enum ModeArg {
     Types,
     Full,
     Minimal,
-    /// Pseudo mode — strips syntactic noise (types, visibility, decorators) while preserving logic
+    /// Pseudo mode — strips syntactic noise (types, decorators) while preserving logic and visibility
     Pseudo,
 }
 
@@ -782,7 +782,7 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
     if args.files.is_empty() {
         anyhow::bail!(
             "FILE argument is required\n\
-             Usage: skim <FILE|DIR|GLOB> [--mode structure|signatures|types|full]\n\
+             Usage: skim <FILE|DIR|GLOB> [--mode structure|signatures|types|full|minimal|pseudo]\n\
              Use 'skim --help' for more information."
         );
     }
