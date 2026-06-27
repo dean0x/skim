@@ -2,10 +2,10 @@
 //!
 //! Tests multi-file processing with glob patterns
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
+mod common;
 
 #[test]
 fn test_glob_single_pattern() {
@@ -28,8 +28,7 @@ fn test_glob_single_pattern() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("*.ts")
         .current_dir(temp_dir.path())
         .assert()
@@ -46,8 +45,7 @@ fn test_glob_with_headers() {
     fs::write(temp_dir.path().join("a.ts"), "function a() {}").unwrap();
     fs::write(temp_dir.path().join("b.ts"), "function b() {}").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("*.ts")
         .current_dir(temp_dir.path())
         .assert()
@@ -63,8 +61,7 @@ fn test_glob_no_header_flag() {
     fs::write(temp_dir.path().join("a.ts"), "function a() {}").unwrap();
     fs::write(temp_dir.path().join("b.ts"), "function b() {}").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("*.ts")
         .arg("--no-header")
         .current_dir(temp_dir.path())
@@ -88,8 +85,7 @@ fn test_glob_recursive_pattern() {
 
     // Note: On some systems, glob patterns might not work recursively without proper shell expansion
     // This test validates the basic glob functionality
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("src/*.ts")
         .current_dir(temp_dir.path())
         .assert()
@@ -103,8 +99,7 @@ fn test_glob_no_matches() {
 
     fs::write(temp_dir.path().join("file.js"), "function test() {}").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("*.ts")
         .current_dir(temp_dir.path())
         .assert()
@@ -119,8 +114,7 @@ fn test_glob_absolute_path_accepted() {
     // to return results in a test environment, so we just verify the error is
     // "No files found" (pattern evaluated, no match) rather than a validation
     // rejection.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("/nonexistent_skim_test_dir/*.conf")
         .assert()
         .failure()
@@ -129,8 +123,7 @@ fn test_glob_absolute_path_accepted() {
 
 #[test]
 fn test_glob_parent_traversal_rejected() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("../*.ts")
         .assert()
         .failure()
@@ -146,8 +139,7 @@ fn test_glob_with_jobs_flag() {
     fs::write(temp_dir.path().join("b.ts"), "function b() {}").unwrap();
     fs::write(temp_dir.path().join("c.ts"), "function c() {}").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("*.ts")
         .arg("--jobs")
         .arg("2")
@@ -164,8 +156,7 @@ fn test_glob_jobs_too_high() {
     let temp_dir = TempDir::new().unwrap();
     fs::write(temp_dir.path().join("a.ts"), "function a() {}").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("*.ts")
         .arg("--jobs")
         .arg("200")
@@ -186,8 +177,7 @@ fn test_glob_brace_expansion() {
 
     // Brace expansion is handled by skim's glob engine (not the shell),
     // so we test that *.{js,ts} matches both .js and .ts but not .py.
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg("*.{js,ts}")
         .arg("--no-header")
         .current_dir(temp_dir.path())
@@ -241,8 +231,7 @@ fn test_glob_respects_gitignore() {
     )
     .unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg("**/*.ts")
         .current_dir(temp_dir.path())
         .arg("--no-header")
@@ -278,8 +267,7 @@ fn test_glob_no_ignore_includes_gitignored() {
     )
     .unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg("**/*.ts")
         .arg("--no-ignore")
         .arg("--no-header")
@@ -308,8 +296,7 @@ fn test_glob_skips_hidden_files() {
     fs::write(temp_dir.path().join("visible.ts"), "function visible() {}").unwrap();
     fs::write(temp_dir.path().join(".hidden.ts"), "function hidden() {}").unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg("*.ts")
         .arg("--no-header")
         .current_dir(temp_dir.path())
@@ -345,8 +332,7 @@ fn test_glob_respects_file_pattern_gitignore() {
     // only matches the extension, not substrings
     fs::write(temp_dir.path().join("logger.ts"), "function logger() {}").unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg("*.*")
         .arg("--no-header")
         .current_dir(temp_dir.path())
@@ -380,8 +366,7 @@ fn test_glob_no_ignore_hint_in_error() {
     fs::write(temp_dir.path().join(".gitignore"), "*.ts\n").unwrap();
     fs::write(temp_dir.path().join("only.ts"), "function only() {}").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("*.ts")
         .current_dir(temp_dir.path())
         .assert()

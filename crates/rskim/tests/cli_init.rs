@@ -8,13 +8,14 @@ use predicates::prelude::*;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
+mod common;
 
 // ============================================================================
 // Helper: build an isolated `skim init` command with CLAUDE_CONFIG_DIR override
 // ============================================================================
 
 fn skim_init_cmd(config_dir: &std::path::Path) -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.arg("init")
         .env("CLAUDE_CONFIG_DIR", config_dir.as_os_str());
     cmd
@@ -349,8 +350,7 @@ fn test_init_project_mode() {
     fs::create_dir_all(&project_dir).unwrap();
     fs::create_dir_all(&claude_config).unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("init")
         .args(["--project", "--yes"])
         .env("CLAUDE_CONFIG_DIR", claude_config.as_os_str())
@@ -398,8 +398,7 @@ fn test_init_project_yes() {
     fs::create_dir_all(&project_dir).unwrap();
     fs::create_dir_all(&claude_config).unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("init")
         .args(["--project", "--yes"])
         .env("CLAUDE_CONFIG_DIR", claude_config.as_os_str())
@@ -609,8 +608,7 @@ fn hook_payload(command: &str) -> String {
 
 #[test]
 fn test_hook_cargo_test_match() {
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["rewrite", "--hook"])
         .env_remove("SKIM_PASSTHROUGH")
         .write_stdin(hook_payload("cargo test"))
@@ -631,8 +629,7 @@ fn test_hook_cargo_test_match() {
 
 #[test]
 fn test_hook_no_match_empty_output() {
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["rewrite", "--hook"])
         .write_stdin(hook_payload("echo hello"))
         .assert()
@@ -647,8 +644,7 @@ fn test_hook_no_match_empty_output() {
 
 #[test]
 fn test_hook_already_rewritten_passthrough() {
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["rewrite", "--hook"])
         .write_stdin(hook_payload("skim cargo test"))
         .assert()
@@ -663,8 +659,7 @@ fn test_hook_already_rewritten_passthrough() {
 
 #[test]
 fn test_hook_no_permission_decision() {
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["rewrite", "--hook"])
         .write_stdin(hook_payload("cargo test"))
         .assert()
@@ -679,8 +674,7 @@ fn test_hook_no_permission_decision() {
 
 #[test]
 fn test_hook_malformed_json_exits_zero() {
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["rewrite", "--hook"])
         .write_stdin("not json at all")
         .assert()
@@ -703,8 +697,7 @@ fn test_hook_missing_command_field() {
     })
     .to_string();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["rewrite", "--hook"])
         .write_stdin(payload)
         .assert()
@@ -724,8 +717,7 @@ fn test_hook_missing_command_field() {
 #[test]
 fn test_hook_compound_command_rewrite() {
     // Send a compound command (&&) through hook mode — first segment should be rewritten
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["rewrite", "--hook"])
         .env_remove("SKIM_PASSTHROUGH")
         .write_stdin(hook_payload("cargo test && cargo clippy"))
@@ -752,8 +744,7 @@ fn test_hook_compound_command_rewrite() {
 #[test]
 fn test_hook_pipe_command_passthrough() {
     // Pipe command where neither segment matches a rewrite rule — empty output
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["rewrite", "--hook"])
         .write_stdin(hook_payload("echo hello | grep world"))
         .assert()
@@ -777,8 +768,7 @@ fn test_hook_version_mismatch_warning() {
 
     // Set SKIM_HOOK_VERSION to a value that differs from the compiled version.
     // The warning now goes to hook.log (NEVER stderr -- GRANITE #361 Bug 3).
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["rewrite", "--hook"])
         .env_remove("SKIM_PASSTHROUGH")
         .env("SKIM_HOOK_VERSION", "0.0.1")
@@ -824,8 +814,7 @@ fn test_hook_version_mismatch_warning() {
 
 #[test]
 fn test_init_help() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["init", "--help"])
         .assert()
         .success()
@@ -839,8 +828,7 @@ fn test_init_help() {
 
 #[test]
 fn test_rewrite_hook_help() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "--help"])
         .assert()
         .success()
@@ -860,8 +848,7 @@ fn test_init_creates_guidance() {
     // so we test via project mode which creates CLAUDE.md in CWD)
     let project_dir = TempDir::new().unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("init")
         .args(["--project", "--yes"])
         .env("CLAUDE_CONFIG_DIR", config.as_os_str())
@@ -895,8 +882,7 @@ fn test_init_no_guidance_flag() {
     let dir = TempDir::new().unwrap();
     let project_dir = TempDir::new().unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("init")
         .args(["--project", "--yes", "--no-guidance"])
         .env("CLAUDE_CONFIG_DIR", dir.path().as_os_str())
@@ -919,8 +905,7 @@ fn test_init_uninstall_removes_guidance() {
     let project_dir = TempDir::new().unwrap();
 
     // First install with guidance
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("init")
         .args(["--project", "--yes"])
         .env("CLAUDE_CONFIG_DIR", config.as_os_str())
@@ -933,8 +918,7 @@ fn test_init_uninstall_removes_guidance() {
     assert!(claude_md.exists(), "CLAUDE.md should exist after install");
 
     // Then uninstall
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("init")
         .args(["--project", "--uninstall", "--yes"])
         .env("CLAUDE_CONFIG_DIR", config.as_os_str())
@@ -962,8 +946,7 @@ fn test_init_guidance_idempotent() {
 
     // Install twice
     for _ in 0..2 {
-        Command::cargo_bin("skim")
-            .unwrap()
+        common::skim()
             .arg("init")
             .args(["--project", "--yes"])
             .env("CLAUDE_CONFIG_DIR", config.as_os_str())
@@ -990,8 +973,7 @@ fn test_init_dry_run_shows_guidance() {
     let config = dir.path();
     let project_dir = TempDir::new().unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("init")
         .args(["--project", "--yes", "--dry-run"])
         .env("CLAUDE_CONFIG_DIR", config.as_os_str())
@@ -1010,8 +992,7 @@ fn test_init_cursor_creates_mdc() {
     let config_dir = TempDir::new().unwrap();
     let project_dir = TempDir::new().unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("init")
         .args(["--project", "--yes", "--agent", "cursor"])
         .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
@@ -1044,8 +1025,7 @@ fn test_init_cursor_uninstall_deletes_mdc() {
     let project_dir = TempDir::new().unwrap();
 
     // Install
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("init")
         .args(["--project", "--yes", "--agent", "cursor"])
         .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
@@ -1057,8 +1037,7 @@ fn test_init_cursor_uninstall_deletes_mdc() {
     assert!(mdc.exists(), "skim.mdc should exist after install");
 
     // Uninstall
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("init")
         .args(["--project", "--uninstall", "--yes", "--agent", "cursor"])
         .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
@@ -1083,8 +1062,7 @@ fn test_init_cursor_cleans_legacy_cursorrules() {
     .unwrap();
 
     // Install Cursor (should create .mdc AND clean legacy .cursorrules)
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("init")
         .args(["--project", "--yes", "--agent", "cursor"])
         .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
@@ -1121,8 +1099,7 @@ fn test_init_cursor_cleans_legacy_cursorrules() {
 #[test]
 fn test_init_help_mentions_agent_flag() {
     // init --help should document the --agent flag for multi-agent support
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["init", "--help"])
         .assert()
         .success()
@@ -1132,8 +1109,7 @@ fn test_init_help_mentions_agent_flag() {
 #[test]
 fn test_rewrite_help_mentions_agent_flag() {
     // rewrite --help should mention the --agent flag
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["rewrite", "--help"])
         .assert()
         .success()
@@ -1154,8 +1130,7 @@ fn test_init_guidance_upgrade_updates_stale_version() {
     let project_dir = TempDir::new().unwrap();
 
     // Step 1: fresh install — creates guidance at the current version
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("init")
         .args(["--project", "--yes"])
         .env("CLAUDE_CONFIG_DIR", config.as_os_str())
@@ -1194,8 +1169,7 @@ fn test_init_guidance_upgrade_updates_stale_version() {
     );
 
     // Step 3: re-run init --yes — should NOT say "Already up to date"
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg("init")
         .args(["--project", "--yes"])
         .env("CLAUDE_CONFIG_DIR", config.as_os_str())
@@ -1270,8 +1244,7 @@ fn test_init_multi_agent_auto_detect_installs_claude_and_gemini() {
     // no home-directory writes occur during the test.
     let project_dir = TempDir::new().unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["init", "--project", "--yes", "--no-guidance"])
         .env("CLAUDE_CONFIG_DIR", &claude_path)
         .env("GEMINI_CONFIG_DIR", &gemini_path)
@@ -1337,8 +1310,7 @@ fn test_init_multi_agent_auto_detect_uninstalls_claude_and_gemini() {
     let project_dir = TempDir::new().unwrap();
 
     // Step 1: install both agents
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["init", "--project", "--yes", "--no-guidance"])
         .env("CLAUDE_CONFIG_DIR", &claude_path)
         .env("GEMINI_CONFIG_DIR", &gemini_path)
@@ -1359,8 +1331,7 @@ fn test_init_multi_agent_auto_detect_uninstalls_claude_and_gemini() {
     );
 
     // Step 2: uninstall both agents without specifying --agent
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["init", "--project", "--uninstall", "--yes", "--force"])
         .env("CLAUDE_CONFIG_DIR", &claude_path)
         .env("GEMINI_CONFIG_DIR", &gemini_path)

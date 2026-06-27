@@ -54,6 +54,18 @@ pub(crate) struct ProcessResult {
     ///
     /// `None` for cache hits (tier was not recorded at write time).
     pub(crate) parse_tier: Option<&'static str>,
+    /// Effective language used for transformation.
+    ///
+    /// Set in all three constructors (file, stdin, cache-hit) so the analytics
+    /// layer can record the correct language without re-detecting from path.
+    /// Priority mirrors the transform path: explicit_lang wins, else auto-detect.
+    pub(crate) language: Option<Language>,
+    /// Raw stdin buffer retained for background tokenization.
+    ///
+    /// `Some(buffer)` only from `process_stdin` when `!show_stats` (stdin
+    /// cannot be re-read; the buffer must be kept).  All other constructors
+    /// set this to `None` (files can be re-read from disk).
+    pub(crate) stdin_raw: Option<String>,
 }
 
 /// Determine the parse quality tier from the mode and whether the parser reported errors.
@@ -182,17 +194,43 @@ fn try_cached_result(
         (hit.original_tokens, hit.transformed_tokens)
     };
 
+    // Effective language for a cache hit: explicit override wins, else detect from path.
+    let cache_lang = options
+        .explicit_lang
+        .or_else(|| detect_language_from_path(path));
+
     Ok(Some(ProcessResult {
         output: hit.content,
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered: false,
         parse_tier: None, // tier was not recorded at cache-write time
+        language: cache_lang,
+        stdin_raw: None,
     }))
 }
 
 /// Read a file and validate it doesn't exceed the maximum input size.
+///
+/// Performs a pre-read metadata check to bail early before allocating memory,
+/// which prevents a transient peak of `num_cpus × file_size` when this function
+/// is called in parallel (e.g., via `into_par_iter` in the analytics recorder).
+/// The post-read length check is retained for TOCTOU safety (the file may grow
+/// between the stat and the read).
 fn read_and_validate(path: &Path) -> anyhow::Result<String> {
+    // Pre-read size guard: bail before allocating if the file is already over the limit.
+    // This is a best-effort check; a file that is exactly at the limit may pass here
+    // but fail the post-read check below if it grows between the stat and the read.
+    if let Ok(meta) = fs::metadata(path)
+        && meta.len() as usize > MAX_INPUT_SIZE
+    {
+        anyhow::bail!(
+            "File too large: {} bytes exceeds maximum of {} bytes ({}MB)",
+            meta.len(),
+            MAX_INPUT_SIZE,
+            MAX_INPUT_SIZE / 1024 / 1024
+        );
+    }
     let contents = fs::read_to_string(path)?;
     if contents.len() > MAX_INPUT_SIZE {
         anyhow::bail!(
@@ -398,12 +436,38 @@ pub(crate) fn process_stdin(
         (None, None)
     };
 
+    // Retain the raw buffer for analytics background tokenization only when
+    // counts are not already known (i.e. !show_stats). Stdin cannot be re-read,
+    // so the buffer must travel with the result.
+    //
+    // Invariant: stdin_raw is Some iff !show_stats; orig_tokens/trans_tokens are
+    // Some iff show_stats (when the tokenizer is available). These two conditions
+    // are mutually exclusive by construction: show_stats drives count_token_pair
+    // above, and its negation drives stdin_raw here.
+    //
+    // The assert pins the always-guaranteed half: if we are NOT running show_stats,
+    // counts must be None (we never computed them). The reverse (show_stats → Some)
+    // is best-effort and depends on the tokenizer succeeding, so is not asserted.
+    debug_assert!(
+        options.show_stats || orig_tokens.is_none(),
+        "BUG(process_stdin): show_stats=false but orig_tokens is Some — \
+         token counts must not be present when show_stats is false \
+         (stdin_raw invariant violated)"
+    );
+    let stdin_raw = if !options.show_stats {
+        Some(buffer)
+    } else {
+        None
+    };
+
     Ok(ProcessResult {
         output: final_output,
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered,
         parse_tier,
+        language: Some(language),
+        stdin_raw,
     })
 }
 
@@ -466,13 +530,29 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         });
     }
 
+    // Effective language for analytics: explicit override wins, else detect from path.
+    let effective_lang = options
+        .explicit_lang
+        .or_else(|| detect_language_from_path(path));
+
     Ok(ProcessResult {
         output: final_output,
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered,
         parse_tier,
+        language: effective_lang,
+        stdin_raw: None,
     })
+}
+
+/// Read a file and validate it doesn't exceed the maximum input size.
+///
+/// Public thin wrapper over `read_and_validate` for use by the background
+/// analytics re-read path (`analytics::RawSource::Reread`).  Reuses the
+/// 50 MB guard and naturally rejects TOCTOU-grown files.
+pub(crate) fn read_source(path: &std::path::Path) -> anyhow::Result<String> {
+    read_and_validate(path)
 }
 
 #[cfg(test)]

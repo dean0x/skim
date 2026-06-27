@@ -85,8 +85,8 @@ pub(super) fn run_push(
         show_stats,
         rec,
         output_format,
-        true, // combine_stderr: push writes to stderr
         label,
+        super::ParsedCommandOptions::combined(),
         parse_push,
     )
 }

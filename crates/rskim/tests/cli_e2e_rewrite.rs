@@ -18,9 +18,10 @@ use predicates::prelude::*;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use tempfile::TempDir;
+mod common;
 
 fn skim_cmd() -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd
 }
@@ -145,6 +146,43 @@ fn test_rewrite_tsc_bare_with_args() {
         .assert()
         .success()
         .stdout(predicate::str::contains("skim tsc --noEmit --watch"));
+}
+
+/// `cargo nextest run` must be rewritten with `run` preserved (F2a / #317 byte-faithful).
+///
+/// The old rule dropped `run`, producing `skim cargo nextest`, which then executed
+/// `cargo test nextest …` — a bogus command that matched ~5 tests by name.
+#[test]
+fn test_rewrite_cargo_nextest_run_preserves_run() {
+    skim_cmd()
+        .args([
+            "rewrite", "cargo", "nextest", "run", "-p", "rskim", "--bins",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "skim cargo nextest run -p rskim --bins",
+        ));
+}
+
+/// Verify that the rule is still triggered when only the `cargo nextest run` prefix
+/// matches — flags after `run` must be forwarded verbatim (byte-faithful).
+#[test]
+fn test_rewrite_cargo_nextest_run_flags_forwarded() {
+    skim_cmd()
+        .args([
+            "rewrite",
+            "cargo",
+            "nextest",
+            "run",
+            "--no-fail-fast",
+            "--test-threads=4",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "skim cargo nextest run --no-fail-fast --test-threads=4",
+        ));
 }
 
 #[test]
@@ -1606,8 +1644,7 @@ fn fake_gh_on_path() -> (TempDir, String) {
 fn test_gh_handler_gate_fires_on_q_flag_passes_through_verbatim() {
     let (_bin_dir, new_path) = fake_gh_on_path();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env("PATH", &new_path)
         .args(["gh", "issue", "view", "93", "-q", ".body"])
@@ -1639,8 +1676,7 @@ fn test_gh_handler_gate_fires_on_q_flag_passes_through_verbatim() {
 fn test_gh_handler_gate_does_not_fire_without_steering_flag() {
     let (_bin_dir, new_path) = fake_gh_on_path();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env("PATH", &new_path)
         .args(["gh", "issue", "view", "93"])
@@ -1668,8 +1704,7 @@ fn test_gh_handler_gate_does_not_fire_without_steering_flag() {
 fn test_gh_handler_gate_fires_on_json_flag() {
     let (_bin_dir, new_path) = fake_gh_on_path();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env("PATH", &new_path)
         .args(["gh", "issue", "view", "93", "--json", "number,body"])
@@ -1696,8 +1731,7 @@ fn test_gh_handler_gate_fires_on_json_flag() {
 fn test_gh_handler_gate_api_json_does_not_passthrough() {
     let (_bin_dir, new_path) = fake_gh_on_path();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env("PATH", &new_path)
         .args(["gh", "api", "repos/o/r", "--json", "name"])
@@ -2685,8 +2719,10 @@ fn fix_e_git_show_pipe_passes_through() {
 // "unexpected argument '--session-id'".
 // ============================================================================
 
-/// Hook-rewrite `cat <tmp.rs>` with a session_id, then EXECUTE the emitted
-/// command. It must exit 0 and produce output.
+/// Hook-rewrite `cat <tmp.rs>` with a session_id: the rewritten command must
+/// contain NO `--session-id` token (Fix #1.1 — session attribution is
+/// out-of-band via sidecar/env, never injected into the command text).
+/// The rewritten command must still execute successfully and produce output.
 #[test]
 fn test_hook_rewritten_cat_with_session_id_executes() {
     let dir = TempDir::new().unwrap();
@@ -2712,12 +2748,16 @@ fn test_hook_rewritten_cat_with_session_id_executes() {
     let rewritten = response["hookSpecificOutput"]["updatedInput"]["command"]
         .as_str()
         .expect("rewritten command present");
+
+    // Fix #1.1: session attribution flows via sidecar ancestry walk, never
+    // via --session-id flag injection.  The rewritten command text must be
+    // free of the flag so it can execute without "unrecognised option" errors.
     assert!(
-        rewritten.contains("--session-id=e2e-roundtrip-session"),
-        "session id must be injected: {rewritten}"
+        !rewritten.contains("--session-id"),
+        "rewritten command must NOT contain --session-id (attribution is out-of-band via sidecar): {rewritten}"
     );
 
-    // Execute the emitted tokens through the actual skim binary.
+    // The rewritten command must start with "skim" and execute successfully.
     // NOTE: split_whitespace is used for simplicity and relies on TempDir
     // producing a space-free path (standard on Linux/macOS /tmp). If the
     // temp dir ever introduces spaces, switch to a proper shell-word splitter.

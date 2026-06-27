@@ -23,9 +23,10 @@ use std::fs;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+mod common;
 
 fn skim_cmd() -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd.env_remove("SKIM_DEBUG");
     cmd
@@ -138,12 +139,16 @@ fn test_exit_code_vitest_fail_json() {
 
 #[test]
 fn test_exit_code_vitest_passthrough_garbage() {
-    // Vitest passthrough always returns ExitCode::FAILURE
+    // Vitest passthrough with unparseable stdin and no real process: exit 0.
+    //
+    // Fix #3.1: the passthrough path calls resolve_exit_code(0, ExitSource::Stdin).
+    // There is no spawned process to report failure; a passing suite that skim
+    // merely could not parse must not be reported as failed to downstream CI.
     skim_cmd()
         .args(["vitest", "run"])
         .write_stdin("completely unparseable garbage text\n")
         .assert()
-        .code(predicate::ne(0));
+        .code(0);
 }
 
 // ============================================================================

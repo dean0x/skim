@@ -1,8 +1,10 @@
 //! Pseudo mode transformation — strips syntactic noise while preserving logic flow.
 //!
-//! ARCHITECTURE: Removes type annotations, visibility modifiers, decorators, semicolons,
-//! and other syntactic noise to produce pseudocode-like output. Uses the same
-//! collect-ranges-then-remove pattern as minimal.rs.
+//! ARCHITECTURE: Removes type annotations, decorators, semicolons, and other
+//! syntactic noise to produce pseudocode-like output.  Visibility modifiers
+//! (pub/export/access modifiers) are intentionally preserved — they convey API
+//! surface information.  Uses the same collect-ranges-then-remove pattern as
+//! minimal.rs.
 //!
 //! Token reduction target: 30-50%
 
@@ -56,7 +58,7 @@ fn consume_trailing_whitespace(source: &[u8], end: usize) -> usize {
 fn is_inline_modifier_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "lifetime" | "mutable_specifier" | "visibility_modifier" | "readonly" | "abstract"
+        "lifetime" | "mutable_specifier" | "readonly" | "abstract"
     )
 }
 
@@ -83,13 +85,15 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
                 "readonly",
                 "abstract",
             ],
-            strip_keywords: &["export"],
+            // `export` is structural API/re-export information — preserved (A4 contract).
+            strip_keywords: &[],
             strip_semicolons: true,
             strip_self_param: false,
         },
         Language::JavaScript => PseudoRules {
             strip_kinds: &["decorator"],
-            strip_keywords: &["export"],
+            // `export` is structural API/re-export information — preserved (A4 contract).
+            strip_keywords: &[],
             strip_semicolons: true,
             strip_self_param: false,
         },
@@ -101,7 +105,9 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
         },
         Language::Rust => PseudoRules {
             strip_kinds: &[
-                "visibility_modifier",
+                // "visibility_modifier" intentionally NOT listed — pub/pub(crate)/pub(super)
+                // convey API surface and re-export intent; preserving them matches the
+                // decision to keep visibility in pseudo output (A4 contract).
                 "lifetime",
                 "type_parameters",
                 "where_clause",
@@ -126,19 +132,16 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
                 "type_parameters",
                 "throws",
             ],
-            strip_keywords: &[
-                "public",
-                "private",
-                "protected",
-                "static",
-                "final",
-                "abstract",
-            ],
+            // Access modifiers (public/private/protected) preserved — API surface (A4).
+            // Non-visibility modifiers (static/final/abstract) still stripped as noise.
+            strip_keywords: &["static", "final", "abstract"],
             strip_semicolons: true,
             strip_self_param: false,
         },
         Language::C => PseudoRules {
             strip_kinds: &[],
+            // C has no OOP access modifiers; `static`/`extern` are linkage specifiers —
+            // intentionally treated as noise (not preserved as API surface).
             strip_keywords: &["static", "extern", "const", "volatile"],
             strip_semicolons: true,
             strip_self_param: false,
@@ -156,15 +159,10 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
         },
         Language::CSharp => PseudoRules {
             strip_kinds: &["attribute_list", "type_parameter_list"],
+            // Access modifiers (public/private/protected/internal) preserved (A4).
+            // Non-visibility modifiers still stripped as noise.
             strip_keywords: &[
-                "public",
-                "private",
-                "protected",
-                "internal",
-                "static",
-                "virtual",
-                "override",
-                "sealed",
+                "static", "virtual", "override", "sealed",
                 "abstract",
                 // NOTE: `async` intentionally NOT stripped — it changes calling semantics
             ],
@@ -173,21 +171,18 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
         },
         Language::Ruby => PseudoRules {
             strip_kinds: &[],
-            strip_keywords: &["private", "protected", "public"],
+            // Access modifiers (private/protected/public) preserved (A4).
+            strip_keywords: &[],
             strip_semicolons: false,
             strip_self_param: false,
         },
         Language::Kotlin => PseudoRules {
             strip_kinds: &["type_parameters", "annotation"],
+            // Access modifiers (public/private/protected/internal) preserved (A4).
+            // `open` is an inheritance modifier (not visibility) — still stripped as noise.
+            // `data`/`sealed`/`override`/`abstract` are non-visibility — still stripped.
             strip_keywords: &[
-                "public",
-                "private",
-                "protected",
-                "internal",
-                "open",
-                "data",
-                "sealed",
-                "override",
+                "open", "data", "sealed", "override",
                 "abstract",
                 // NOTE: `suspend` intentionally NOT stripped — it changes calling semantics
             ],
@@ -196,14 +191,11 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
         },
         Language::Swift => PseudoRules {
             strip_kinds: &["attribute", "type_parameters"],
+            // All Swift visibility modifiers (public/private/internal/fileprivate/open)
+            // preserved (A4).  Note: Swift `open` is a visibility level (unlike Kotlin).
+            // Non-visibility modifiers (static/override/final) still stripped.
             strip_keywords: &[
-                "public",
-                "private",
-                "internal",
-                "fileprivate",
-                "open",
-                "static",
-                "override",
+                "static", "override",
                 "final",
                 // NOTE: `class` intentionally NOT stripped — it introduces class declarations,
                 // and in tree-sitter-swift the keyword is a leaf node in both class declarations
@@ -379,15 +371,11 @@ fn handle_language_special_cases(node: Node, ctx: &mut NoiseWalkContext<'_>) -> 
             None // Continue recursion — function children (params, body) still need processing
         }
         Language::Cpp if kind == "access_specifier" => {
-            // `public:` is two siblings: access_specifier + `:`
-            let start = node.start_byte();
-            let colon_end = node
-                .next_sibling()
-                .filter(|s| s.kind() == ":")
-                .map_or(node.end_byte(), |s| s.end_byte());
-            let end = consume_trailing_whitespace(ctx.source_bytes, colon_end);
-            ctx.ranges.push((start, end));
-            Some(Ok(())) // Skip recursion
+            // Access specifiers (`public:`, `private:`, `protected:`) are visibility
+            // markers that convey API surface.  They are preserved in pseudo mode (A4).
+            // Return None so the normal recursion path processes children instead of
+            // accumulating a removal range.
+            None
         }
         Language::Cpp if kind == "template_parameter_list" => {
             // `template<typename T>` is two siblings: `template` keyword + parameter list
@@ -440,9 +428,9 @@ fn collect_noise_ranges(
         let start = node.start_byte();
         let end = node.end_byte();
         let adjusted_start = adjust_type_start(ctx.language, kind, ctx.source_bytes, start);
-        // Consume trailing whitespace only for inline modifiers (lifetime, mut, visibility,
-        // etc.) where the space separates the modifier from the next token. Do NOT consume
-        // for type annotations — their trailing space may belong to assignment syntax
+        // Consume trailing whitespace only for inline modifiers (lifetime, mut, readonly,
+        // abstract, etc.) where the space separates the modifier from the next token. Do NOT
+        // consume for type annotations — their trailing space may belong to assignment syntax
         // (e.g., `: number = 42` → `= 42` needs the space before `=`).
         let end = if is_inline_modifier_kind(kind) {
             consume_trailing_whitespace(ctx.source_bytes, end)
@@ -656,17 +644,18 @@ mod tests {
     }
 
     #[test]
-    fn test_typescript_pseudo_strips_export() {
+    fn test_typescript_pseudo_preserves_export() {
+        // `export` is API-surface information — preserved in pseudo mode (A4 contract).
         let source =
             "export function greet(name: string): string {\n    return `Hello, ${name}!`;\n}\n";
         let result = transform(source, Language::TypeScript);
         assert!(
-            !result.contains("export"),
-            "export keyword should be stripped"
+            result.contains("export"),
+            "export keyword must be preserved as API surface, got: {result}"
         );
         assert!(
             result.contains("function greet(name)"),
-            "function signature preserved without types"
+            "function signature preserved without types, got: {result}"
         );
     }
 
@@ -697,13 +686,23 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_javascript_pseudo_strips_export_and_semicolons() {
+    fn test_javascript_pseudo_preserves_export_strips_semicolons() {
+        // `export` is API-surface information — preserved (A4); semicolons still stripped.
         let source = "export function add(x, y) {\n    return x + y;\n}\n";
         let result = transform(source, Language::JavaScript);
-        assert!(!result.contains("export"), "export should be stripped");
-        assert!(result.contains("function add(x, y)"), "function preserved");
-        // Semicolons are stripped
-        assert!(result.contains("return x + y"), "logic preserved");
+        assert!(
+            result.contains("export"),
+            "export must be preserved as API surface, got: {result}"
+        );
+        assert!(
+            result.contains("function add(x, y)"),
+            "function preserved, got: {result}"
+        );
+        // Semicolons are still stripped
+        assert!(
+            result.contains("return x + y"),
+            "logic preserved, got: {result}"
+        );
     }
 
     // ========================================================================
@@ -755,14 +754,18 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_rust_pseudo_strips_visibility() {
+    fn test_rust_pseudo_preserves_visibility() {
+        // `pub` and `pub(crate)` convey API surface — preserved in pseudo mode (A4).
         let source = "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
         let result = transform(source, Language::Rust);
         assert!(
-            !result.contains("pub "),
-            "visibility modifier should be stripped"
+            result.contains("pub "),
+            "visibility modifier must be preserved as API surface, got: {result}"
         );
-        assert!(result.contains("fn add"), "function preserved");
+        assert!(
+            result.contains("fn add"),
+            "function preserved, got: {result}"
+        );
     }
 
     #[test]
@@ -813,19 +816,47 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_java_pseudo_strips_visibility() {
+    fn test_java_pseudo_preserves_visibility() {
+        // Access modifiers (public/private/protected) convey API surface — preserved (A4).
+        // Non-visibility modifiers (static/final/abstract) are still stripped.
         let source = "public class Simple {\n    private int value;\n    public int add(int a, int b) {\n        return a + b;\n    }\n}\n";
         let result = transform(source, Language::Java);
         assert!(
-            !result.contains("public "),
-            "public modifier should be stripped"
+            result.contains("public "),
+            "public modifier must be preserved as API surface, got: {result}"
         );
         assert!(
-            !result.contains("private "),
-            "private modifier should be stripped"
+            result.contains("private "),
+            "private modifier must be preserved as API surface, got: {result}"
         );
-        assert!(result.contains("class Simple"), "class preserved");
-        assert!(result.contains("int add(int a, int b)"), "method preserved");
+        assert!(
+            result.contains("class Simple"),
+            "class preserved, got: {result}"
+        );
+        assert!(
+            result.contains("int add(int a, int b)"),
+            "method preserved, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_java_pseudo_still_strips_static_final() {
+        // Non-visibility modifiers must still be stripped (A4 contract: only visibility preserved).
+        let source = "public class Simple {\n    public static final int MAX = 100;\n    public int add(int a, int b) {\n        return a + b;\n    }\n}\n";
+        let result = transform(source, Language::Java);
+        assert!(
+            !result.contains("static "),
+            "static must still be stripped, got: {result}"
+        );
+        assert!(
+            !result.contains("final "),
+            "final must still be stripped, got: {result}"
+        );
+        // visibility preserved
+        assert!(
+            result.contains("public "),
+            "public must still be present, got: {result}"
+        );
     }
 
     #[test]
@@ -865,16 +896,18 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_cpp_pseudo_strips_access_specifiers() {
+    fn test_cpp_pseudo_preserves_access_specifiers() {
+        // C++ access specifiers (public:/private:/protected:) convey API surface
+        // and are preserved in pseudo mode (A4 contract).
         let source = "class Foo {\npublic:\n    int bar();\nprivate:\n    int baz_;\n};\n";
         let result = transform(source, Language::Cpp);
         assert!(
-            !result.contains("public:"),
-            "access specifier should be stripped"
+            result.contains("public:"),
+            "public: access specifier must be preserved, got: {result}"
         );
         assert!(
-            !result.contains("private:"),
-            "access specifier should be stripped"
+            result.contains("private:"),
+            "private: access specifier must be preserved, got: {result}"
         );
     }
 
@@ -1009,17 +1042,19 @@ mod tests {
     }
 
     #[test]
-    fn test_cpp_pseudo_no_orphaned_colon() {
-        // BUG 2: C++ access specifier stripping left orphaned `:`
+    fn test_cpp_pseudo_access_specifiers_preserved_no_orphaned_colon() {
+        // C++ access specifiers (public:/private:) are now preserved as-is (A4).
+        // The old orphaned-colon guard is no longer needed because we no longer strip
+        // access specifiers; the full `public:` token remains intact.
         let source = "class Foo {\npublic:\n    int bar();\nprivate:\n    int baz_;\n};\n";
         let result = transform(source, Language::Cpp);
         assert!(
-            !result.contains("public"),
-            "access specifier keyword should be stripped, got: {result}"
+            result.contains("public:"),
+            "public: must be preserved intact (no orphaned colon), got: {result}"
         );
         assert!(
             !result.lines().any(|l| l.trim() == ":"),
-            "orphaned colon should not remain, got: {result}"
+            "no orphaned colon lines must exist, got: {result}"
         );
         assert!(
             result.contains("int bar()"),
@@ -1074,7 +1109,9 @@ mod tests {
 
     #[test]
     fn test_typescript_pseudo_no_leading_space() {
-        // BUG 5: Stripping `export` left leading space on next token
+        // BUG 5 (historical): Stripping `export` used to leave a leading space.
+        // Now `export` is preserved (A4), so output starts with "export function …"
+        // — no leading space in either case.  The no-leading-space invariant holds.
         let source = "export function add(a: number, b: number): number {\n    return a + b;\n}\n";
         let result = transform(source, Language::TypeScript);
         assert!(
@@ -1083,13 +1120,14 @@ mod tests {
         );
         assert!(
             result.contains("function add(a, b)"),
-            "function signature clean after export removal, got: {result}"
+            "function signature clean (type annotations stripped), got: {result}"
         );
     }
 
     #[test]
     fn test_java_pseudo_no_leading_spaces() {
-        // BUG 5: Stripping `public static final` left leading spaces
+        // BUG 5 (historical): Stripping `static final` must not leave leading spaces.
+        // `public`/`private` are now preserved (A4); `static`/`final` are still stripped.
         let source = "public class Simple {\n    private int value;\n    public static final int MAX = 100;\n    public int add(int a, int b) {\n        return a + b;\n    }\n}\n";
         let result = transform(source, Language::Java);
         assert!(
@@ -1185,7 +1223,6 @@ mod tests {
     fn test_is_inline_modifier_kind_positives() {
         assert!(is_inline_modifier_kind("lifetime"));
         assert!(is_inline_modifier_kind("mutable_specifier"));
-        assert!(is_inline_modifier_kind("visibility_modifier"));
         assert!(is_inline_modifier_kind("readonly"));
         assert!(is_inline_modifier_kind("abstract"));
     }
@@ -1248,13 +1285,14 @@ mod tests {
     #[test]
     fn test_rust_special_case_continues_recursion_into_body() {
         // Rust function_item returns None (continue recursion), so children like
-        // visibility_modifier and mutable_specifier inside params should still be stripped
+        // mutable_specifier inside params should still be stripped.
+        // visibility_modifier (pub) is now PRESERVED as API surface (A4 contract).
         let source =
             "pub fn update(&mut self, value: i32) -> bool {\n    self.val = value;\n    true\n}\n";
         let result = transform(source, Language::Rust);
         assert!(
-            !result.contains("pub "),
-            "pub should be stripped via child recursion, got: {result}"
+            result.contains("pub "),
+            "pub must be preserved as API surface (A4), got: {result}"
         );
         assert!(
             !result.contains("mut "),
@@ -1271,22 +1309,22 @@ mod tests {
     }
 
     #[test]
-    fn test_cpp_access_specifier_skips_recursion() {
-        // C++ access_specifier returns Some(Ok(())) — the entire `public:` is removed
-        // and no recursion into children occurs
+    fn test_cpp_access_specifier_preserved_with_members() {
+        // C++ access specifiers (public:, protected:) are now preserved as API surface (A4).
+        // Children (member declarations) are also preserved via normal recursion.
         let source = "class Widget {\npublic:\n    void draw();\nprotected:\n    int x_;\n};\n";
         let result = transform(source, Language::Cpp);
         assert!(
-            !result.contains("public"),
-            "public access specifier fully stripped, got: {result}"
+            result.contains("public:"),
+            "public: access specifier must be preserved, got: {result}"
         );
         assert!(
-            !result.contains("protected"),
-            "protected access specifier fully stripped, got: {result}"
+            result.contains("protected:"),
+            "protected: access specifier must be preserved, got: {result}"
         );
         assert!(
             !result.lines().any(|l| l.trim() == ":"),
-            "no orphaned colons, got: {result}"
+            "no orphaned colons (specifiers appear intact with colon), got: {result}"
         );
         assert!(
             result.contains("void draw()"),

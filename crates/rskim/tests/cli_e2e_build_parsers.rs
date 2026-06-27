@@ -13,9 +13,10 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::process::Command as StdCommand;
 use tempfile::TempDir;
+mod common;
 
 fn skim_cmd() -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd.env_remove("SKIM_DEBUG");
     cmd
@@ -98,17 +99,31 @@ fn test_build_make_real_execution_success() {
     // (test_build_cargo_success_exit_code) executes a real build; this test
     // mirrors that pattern for make.
     //
-    // A trivial Makefile with a silent no-op recipe produces empty
-    // stdout+stderr and exits 0. The make parser's empty-output early return
-    // fires, yielding ParseResult::Full(success=true), which renders as
-    // "OK warnings: 0 errors: 0" on stdout.
+    // The Makefile emits enough build-like output that the make parser's
+    // compressed "OK warnings: 0 errors: 0" is strictly smaller (fewer tokens)
+    // than the raw output, so the net-savings guard keeps the compressed form.
+    // This preserves the "build handler summarises success" test intent.
     if StdCommand::new("make").arg("--version").output().is_err() {
         eprintln!("skipping: make not installed");
         return;
     }
 
     let dir = TempDir::new().expect("failed to create temp dir");
-    std::fs::write(dir.path().join("Makefile"), "all:\n\t@:\n").expect("failed to write Makefile");
+    // Emit multi-line build output so the compressed summary is strictly smaller
+    // than the raw lines. The make parser classifies lines like "gcc …" or
+    // "Compiling …" as build steps and strips them; the guard then keeps the
+    // compressed "OK warnings: 0 errors: 0" form.
+    let makefile = concat!(
+        "all:\n",
+        "\t@echo 'gcc -O2 -c src/foo.c -o build/foo.o'\n",
+        "\t@echo 'gcc -O2 -c src/bar.c -o build/bar.o'\n",
+        "\t@echo 'gcc -O2 -c src/baz.c -o build/baz.o'\n",
+        "\t@echo 'gcc -O2 -c src/qux.c -o build/qux.o'\n",
+        "\t@echo 'gcc -O2 -c src/quux.c -o build/quux.o'\n",
+        "\t@echo 'gcc build/foo.o build/bar.o build/baz.o build/qux.o build/quux.o -o myapp'\n",
+        "\t@echo 'Build complete.'\n",
+    );
+    std::fs::write(dir.path().join("Makefile"), makefile).expect("failed to write Makefile");
 
     skim_cmd()
         .args(["make", "all"])

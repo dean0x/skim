@@ -42,8 +42,8 @@ pub(super) fn run_fetch(
         show_stats,
         rec,
         output_format,
-        true,
         label,
+        super::ParsedCommandOptions::combined(),
         parse_fetch,
     )
 }

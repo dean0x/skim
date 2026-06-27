@@ -48,8 +48,8 @@ pub(super) fn run_log(
         show_stats,
         rec,
         output_format,
-        false,
         label,
+        super::ParsedCommandOptions::default(),
         parse_log,
     )
 }

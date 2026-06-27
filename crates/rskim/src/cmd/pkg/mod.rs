@@ -132,6 +132,7 @@ where
             // Threaded from the construction site so every caller is explicit
             // and auditable (#317).
             forward_stderr: config.forward_stderr,
+            skip_net_savings_guard: false,
         },
         |output| parse_fn(output),
     )

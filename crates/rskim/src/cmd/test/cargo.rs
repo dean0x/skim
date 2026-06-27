@@ -44,22 +44,69 @@ static RE_CARGO_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
 static RE_FAILURE_BLOCK_HEADER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^---- (.+?) (?:stdout|stderr) ----$").expect("valid regex"));
 
-/// Run `skim cargo test [args...]`.
+/// Build the cargo command arguments for a test run.
+///
+/// For nextest, the args already lead with `"nextest run …"` so no prefix is
+/// needed.  For standard cargo test, `"test"` is prepended so the final
+/// command is `cargo test [args…]`.
+///
+/// This is a pure helper extracted from `run()` to make nextest routing
+/// unit-testable without spawning a process.  A2 contract: the `is_nextest`
+/// flag is threaded explicitly from `dispatch_cargo` — never sniffed from args.
+/// `dispatch_cargo`'s "test" arm always passes `false`; its "nextest" arm
+/// always passes `true`; no positional-first-arg re-derivation occurs.
+pub(crate) fn build_cargo_args(args: &[String], is_nextest: bool) -> Vec<String> {
+    let mut cmd = if is_nextest {
+        Vec::new()
+    } else {
+        vec!["test".to_string()]
+    };
+    cmd.extend(args.iter().cloned());
+    cmd
+}
+
+/// Exit codes the cargo handler treats as "tests failed" (compressible) rather
+/// than "program error" (forward raw).
+///
+/// - Standard `cargo test` (libtest): **101**. libtest writes its results to
+///   stdout — exactly where the parser and the net-savings guard operate — so a
+///   failure compresses cleanly.
+/// - `cargo nextest`: **none**. nextest writes its ENTIRE report (summary
+///   included) to *stderr*, leaving stdout empty. Routing a nextest failure
+///   (exit 100) into the compress path would either blank it (the net-savings
+///   guard baselines against the empty stdout, so any compressed body looks
+///   "bigger than raw" and falls back to the empty stdout) or mis-summarise it
+///   (the embedded per-process libtest line counts a single test binary, not the
+///   whole run, so passes are undercounted). Declaring no expected codes makes
+///   every non-zero nextest exit forward raw — the full, accurate report reaches
+///   stderr, never blanked or mis-counted. (#317 compress-never-truncate; the
+///   ADR-001 net-savings guard stays intact for the exit-0 passthrough path.)
+///
+/// Pure helper extracted from `run()` so the contract is unit-testable without
+/// spawning cargo (which the nextest path always does — it cannot use stdin).
+pub(crate) fn cargo_expected_exit_codes(is_nextest: bool) -> &'static [i32] {
+    if is_nextest { &[] } else { &[101] }
+}
+
+/// Run `skim cargo test [args...]` or `skim cargo nextest run [args...]`.
 ///
 /// Builds the cargo command, executes it, and parses the output using
 /// three-tier degradation. For nextest, skips JSON injection entirely.
 /// For standard cargo test, injects `--message-format=json` to get build
 /// artifact JSON on stdout (test results still come as plain text).
+///
+/// `is_nextest` is threaded explicitly from `dispatch_cargo` directly — the
+/// "test" and "nextest" dispatch arms call this function without going through
+/// `test::run`.  The old positional-first-arg sniff (`runner_args.first()==
+/// Some("nextest")`) is gone: it misfired when "nextest" was a bare test-name
+/// filter (`cargo test nextest`), not the nextest subcommand (A1/A2 contract).
 pub(crate) fn run(
     args: &[String],
+    is_nextest: bool,
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
-    let is_nextest = args.iter().any(|a| a == "nextest");
-
-    // Build command args: start with "test", append all user args
-    let mut cmd_args: Vec<String> = vec!["test".to_string()];
-    cmd_args.extend(args.iter().cloned());
+    let mut cmd_args = build_cargo_args(args, is_nextest);
 
     // For standard cargo test (not nextest), inject --message-format=json
     // to suppress human-formatted build progress on stdout. This makes the
@@ -73,6 +120,11 @@ pub(crate) fn run(
     // test parsers: stdin must be piped AND no user args provided.
     let use_stdin = should_read_stdin(args);
 
+    // Which non-zero exits mean "tests failed" (compress) vs "program error"
+    // (forward raw). nextest writes to stderr, so its failures must forward raw
+    // rather than blank/mis-summarise — see `cargo_expected_exit_codes`.
+    let expected_exit_codes = cargo_expected_exit_codes(is_nextest);
+
     run_parsed_command_with_exit(
         ParsedCommandConfig {
             program: "cargo",
@@ -85,10 +137,9 @@ pub(crate) fn run(
             family: "test",
             skip_ansi_strip: false,
             rec,
-            // 101 = libtest's exit code for test failures (also compile
-            // errors, which fall through to the verbatim-combined tiers).
-            expected_exit_codes: &[101],
+            expected_exit_codes,
             forward_stderr: false,
+            skip_net_savings_guard: false,
         },
         move |output| parse_impl(output, is_nextest),
         // Stdin fabricates exit 0 (#317 Addendum 2): derive a failure exit
@@ -1124,6 +1175,137 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
         assert!(
             !result.entries.is_empty(),
             "Tier-1 entries must not be empty after Tier-2 changes"
+        );
+    }
+
+    // ========================================================================
+    // build_cargo_args (A2 contract — pure helper, no process spawning)
+    // ========================================================================
+
+    #[test]
+    fn test_build_cargo_args_nextest_no_test_prefix() {
+        // For nextest, args already lead with "nextest run …" — no "test" prefix.
+        let args = vec![
+            "nextest".to_string(),
+            "run".to_string(),
+            "-p".to_string(),
+            "x".to_string(),
+        ];
+        let result = build_cargo_args(&args, true);
+        assert_eq!(
+            result,
+            vec!["nextest", "run", "-p", "x"],
+            "nextest must not prepend 'test'"
+        );
+    }
+
+    #[test]
+    fn test_build_cargo_args_standard_prepends_test() {
+        // For standard cargo test, "test" is prepended.
+        let args = vec!["-p".to_string(), "x".to_string()];
+        let result = build_cargo_args(&args, false);
+        assert_eq!(
+            result,
+            vec!["test", "-p", "x"],
+            "standard cargo test must prepend 'test'"
+        );
+    }
+
+    #[test]
+    fn test_build_cargo_args_nextest_empty_args() {
+        // Edge case: bare "skim cargo nextest" → cargo gets no sub-command →
+        // nextest's own error message (visible, not blank — #317 fail-loud).
+        let args: Vec<String> = vec![];
+        let result = build_cargo_args(&args, true);
+        assert!(result.is_empty(), "empty nextest args must stay empty");
+    }
+
+    #[test]
+    fn test_build_cargo_args_standard_empty_args() {
+        // Edge case: bare "skim cargo test" → cargo test with no filter.
+        let args: Vec<String> = vec![];
+        let result = build_cargo_args(&args, false);
+        assert_eq!(
+            result,
+            vec!["test"],
+            "empty standard args must just be 'test'"
+        );
+    }
+
+    // ========================================================================
+    // F2c regression guard — `cargo test --test nextest` must not misroute
+    // ========================================================================
+
+    #[test]
+    fn test_cargo_test_dash_test_nextest_is_not_nextest_path() {
+        // Regression guard (F2c / A2 contract): `cargo test --test nextest` must
+        // NOT be treated as a nextest invocation.
+        //
+        // After the A1 fix, `dispatch_cargo`'s "test" arm always threads
+        // is_nextest=false directly into cargo::run — no positional-arg sniff
+        // occurs. This test calls build_cargo_args with is_nextest=false (the
+        // value dispatch always sends) and asserts the correct standard-test argv.
+        let runner_args = vec!["--test".to_string(), "nextest".to_string()];
+        // is_nextest is threaded from dispatch_cargo "test" arm — never re-derived.
+        let is_nextest = false;
+        let argv = build_cargo_args(&runner_args, is_nextest);
+        assert_eq!(
+            argv,
+            vec!["test", "--test", "nextest"],
+            "cargo test --test nextest must build argv [\"test\", \"--test\", \"nextest\"]; \
+             got {argv:?}"
+        );
+    }
+
+    #[test]
+    fn test_cargo_test_nextest_bare_positional_no_misroute() {
+        // Regression guard (A1): `cargo test nextest` (bare positional test-name
+        // filter, a valid cargo test invocation) must NOT misroute to the nextest
+        // path just because the filter token happens to equal "nextest".
+        //
+        // dispatch_cargo receives args=["test","nextest"], strips "test" at idx=0,
+        // and calls cargo::run(["nextest"], is_nextest=false, ...) directly — never
+        // re-derives is_nextest from runner_args.first().  This test drives the
+        // real production helper (build_cargo_args) with those exact inputs and
+        // asserts the final cargo argv is ["test","nextest"], not ["nextest"]
+        // (which would misroute to `cargo nextest`).
+        let runner_args = vec!["nextest".to_string()];
+        // is_nextest=false: dispatch_cargo "test" arm always threads this value.
+        let is_nextest = false;
+        let argv = build_cargo_args(&runner_args, is_nextest);
+        assert_eq!(
+            argv,
+            vec!["test", "nextest"],
+            "cargo test nextest: bare-positional filter must build cargo argv \
+             [\"test\",\"nextest\"] (standard test), not [\"nextest\"] \
+             (misrouted to cargo nextest); got {argv:?}"
+        );
+    }
+
+    // ========================================================================
+    // cargo_expected_exit_codes (nextest-writes-to-stderr contract)
+    // ========================================================================
+
+    #[test]
+    fn test_expected_exit_codes_standard_is_101() {
+        // libtest writes results to stdout; 101 = "tests failed" → compress.
+        assert_eq!(
+            cargo_expected_exit_codes(false),
+            &[101],
+            "standard cargo test must treat 101 as a compressible test failure"
+        );
+    }
+
+    #[test]
+    fn test_expected_exit_codes_nextest_is_empty() {
+        // nextest writes its whole report (including exit-100 failures) to stderr,
+        // so NO exit may be routed into the stdout-keyed compress path — that path
+        // blanks (empty-stdout net-savings baseline) or mis-counts (per-process
+        // embedded libtest summary). Every non-zero nextest exit must forward raw.
+        assert!(
+            cargo_expected_exit_codes(true).is_empty(),
+            "nextest must declare no expected failure codes so failures forward raw \
+             (full, accurate report on stderr) instead of being blanked or mis-summarised"
         );
     }
 }
