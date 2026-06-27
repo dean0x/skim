@@ -427,9 +427,20 @@ mod argv0_dispatch {
     /// `grep N` header and a `M file(s)` footer — no `GREP:` or `matches in`.
     #[test]
     fn argv0_grep_wrapper_single_header_and_footer() {
-        // Stub grep that emits multi-file `file:line:content` output.
-        let raw_output = "src/a.rs:1:fn main() {}\nsrc/b.rs:5:fn run() {}\n";
-        let stub_dir = make_stub_dir("grep", raw_output, 0);
+        // Stub grep emitting two files with MANY matches each. The input must be
+        // large enough that the grouped/compressed form (each filename printed
+        // once) is strictly smaller than raw — otherwise the ADR-001 net-savings
+        // guard correctly falls back to raw passthrough and emits no skim
+        // header/footer. A 2-line input trips that guard; 2 files × 20 matches
+        // compresses, so the D1 header/footer is exercised on the wrapper surface.
+        let mut raw_output = String::new();
+        for i in 1..=20 {
+            raw_output.push_str(&format!("src/a.rs:{i}:fn item{i}() {{}}\n"));
+        }
+        for i in 1..=20 {
+            raw_output.push_str(&format!("src/b.rs:{i}:fn other{i}() {{}}\n"));
+        }
+        let stub_dir = make_stub_dir("grep", &raw_output, 0);
         let path = prepend_path(stub_dir.path());
 
         let skim = skim_bin();
