@@ -2830,9 +2830,12 @@ fn test_hook_redirect_reorder_hazard_is_never_rewritten() {
         .stdout(predicate::str::is_empty());
 }
 
-/// Safe redirect order (`>log 2>&1`) still rewrites — append preserves it.
+/// D2 (#370): `cargo test >log.txt 2>&1` redirects stdout to a file — the
+/// hook must bail (success + empty stdout) so skim does not interpose.
+/// Mirrors `test_hook_redirect_reorder_hazard_is_never_rewritten` above.
+/// Hook bail contract: `.success()` + `stdout(is_empty())`.
 #[test]
-fn test_hook_safe_redirect_order_still_rewrites() {
+fn test_hook_stdout_redirect_bails() {
     let input = serde_json::json!({
         "tool_input": {
             "command": "cargo test >log.txt 2>&1"
@@ -2843,7 +2846,7 @@ fn test_hook_safe_redirect_order_still_rewrites() {
         .write_stdin(serde_json::to_string(&input).unwrap())
         .assert()
         .success()
-        .stdout(predicate::str::contains(">log.txt 2>&1"));
+        .stdout(predicate::str::is_empty());
 }
 
 // ============================================================================

@@ -273,24 +273,52 @@ fn test_rewrite_redirect_stderr_to_devnull() {
         .stdout(predicate::str::contains("skim cargo test 2>/dev/null"));
 }
 
+/// D2 (#370): stdout redirected to a file must bail — skim would interpose and
+/// the file would contain skim's summary instead of the tool's raw bytes.
+/// CLI bail contract: `.failure()` + empty stdout.
 #[test]
 fn test_rewrite_redirect_stdout_to_file() {
     common::skim()
         .arg("rewrite")
         .write_stdin("cargo test > output.txt\n")
         .assert()
-        .success()
-        .stdout(predicate::str::contains("skim cargo test > output.txt"));
+        .failure()
+        .stdout(predicate::str::is_empty());
 }
 
+/// D2 (#370): `&>` (both-streams redirect) to a file must also bail.
+/// CLI bail contract: `.failure()` + empty stdout.
 #[test]
 fn test_rewrite_redirect_both_to_file() {
     common::skim()
         .arg("rewrite")
         .write_stdin("cargo test &> output.txt\n")
         .assert()
-        .success()
-        .stdout(predicate::str::contains("skim cargo test &> output.txt"));
+        .failure()
+        .stdout(predicate::str::is_empty());
+}
+
+/// D2 (#370): `> out.json` (gh api redirect) must bail. Verifies the
+/// motivating bug from the issue.
+#[test]
+fn test_rewrite_redirect_stdout_json_file() {
+    common::skim()
+        .arg("rewrite")
+        .write_stdin("gh api repos/o/r/x > out.json\n")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty());
+}
+
+/// D2 (#370): `>> out.json` (append redirect) must also bail.
+#[test]
+fn test_rewrite_redirect_stdout_json_append() {
+    common::skim()
+        .arg("rewrite")
+        .write_stdin("gh api repos/o/r/x >> out.json\n")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty());
 }
 
 #[test]
