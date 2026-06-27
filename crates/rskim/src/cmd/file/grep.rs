@@ -417,16 +417,45 @@ mod tests {
         assert!(!rendered.contains("more files"), "no elision footer");
     }
 
+    /// D1 (#370): single file → header `grep 1`, footer `1 file`.
+    /// No `GREP:` prefix, no `matches in` double-header.
     #[test]
-    fn test_summary_line_present() {
+    fn test_file_count_footer_singular() {
         let input = "src/a.rs:1:hello world\n";
         let result = parse_multi(input).unwrap();
         let rendered = format!("{result}");
         assert!(
             rendered.contains("grep "),
-            "Should contain grep summary, got: {rendered}"
+            "canonical header must contain tool name: {rendered}"
         );
-        assert!(rendered.contains("matches in"));
+        assert!(
+            !rendered.contains("matches in"),
+            "must not contain double-header 'matches in': {rendered}"
+        );
+        assert!(
+            !rendered.contains("GREP:"),
+            "must not contain 'GREP:' prefix: {rendered}"
+        );
+        assert!(
+            rendered.trim_end().ends_with("1 file"),
+            "footer must be '1 file' (singular): {rendered}"
+        );
+    }
+
+    /// D1 (#370): two files → header `grep N`, footer `2 files`.
+    #[test]
+    fn test_file_count_footer_plural() {
+        let input = "src/a.rs:1:hello\nsrc/b.rs:2:world\n";
+        let result = parse_multi(input).unwrap();
+        let rendered = format!("{result}");
+        assert!(
+            !rendered.contains("matches in"),
+            "must not contain double-header: {rendered}"
+        );
+        assert!(
+            rendered.trim_end().ends_with("2 files"),
+            "footer must be '2 files' (plural): {rendered}"
+        );
     }
 
     #[test]
@@ -598,7 +627,24 @@ mod tests {
             rendered.contains("<stdin>"),
             "zero operands => stdin is the honest label: {rendered}"
         );
-        assert!(rendered.contains("3 matches"), "{rendered}");
+        // D1 (#370): count lives in the canonical `grep N` header now; old
+        // `"N matches in M files"` summary was removed.
+        assert!(
+            rendered.contains("grep 3"),
+            "count in canonical header: {rendered}"
+        );
+        assert!(
+            !rendered.contains("matches in"),
+            "must not contain old summary: {rendered}"
+        );
+        assert!(
+            !rendered.contains("GREP:"),
+            "must not contain old GREP: prefix: {rendered}"
+        );
+        assert!(
+            rendered.trim_end().ends_with("1 file"),
+            "footer must show '1 file' (not contains — avoid false match on 'N files'): {rendered}"
+        );
     }
 
     #[test]

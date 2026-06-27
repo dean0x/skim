@@ -293,4 +293,44 @@ mod tests {
             "Non-JSON input should return None from Tier 1"
         );
     }
+
+    /// D1 (#370): rg text tier — single file → footer `1 file`, no `RG:` prefix.
+    #[test]
+    fn test_file_count_footer_singular_rg() {
+        let input = "src/a.rs:1:hello world\n";
+        let result = try_parse_regex(input).unwrap();
+        let rendered = format!("{result}");
+        assert!(
+            rendered.contains("rg "),
+            "canonical header must contain tool name: {rendered}"
+        );
+        assert!(
+            !rendered.contains("RG:"),
+            "must not contain 'RG:' prefix: {rendered}"
+        );
+        assert!(
+            !rendered.contains("matches in"),
+            "must not contain double-header 'matches in': {rendered}"
+        );
+        assert!(
+            rendered.trim_end().ends_with("1 file"),
+            "footer must be '1 file' (singular): {rendered}"
+        );
+    }
+
+    /// D1 (#370): rg text tier — two files → footer `2 files`.
+    #[test]
+    fn test_file_count_footer_plural_rg() {
+        let input = "src/a.rs:1:hello\nsrc/b.rs:2:world\n";
+        let result = try_parse_regex(input).unwrap();
+        let rendered = format!("{result}");
+        assert!(
+            !rendered.contains("matches in"),
+            "must not contain double-header: {rendered}"
+        );
+        assert!(
+            rendered.trim_end().ends_with("2 files"),
+            "footer must be '2 files' (plural): {rendered}"
+        );
+    }
 }
