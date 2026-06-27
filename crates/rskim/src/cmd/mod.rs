@@ -53,7 +53,7 @@ pub(crate) mod ux;
 // ============================================================================
 
 mod dispatch;
-pub(crate) use dispatch::{dispatch, run_raw_passthrough};
+pub(crate) use dispatch::{dispatch, run_inherited_passthrough, run_raw_passthrough};
 
 pub(crate) mod execution;
 pub(crate) use execution::{

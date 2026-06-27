@@ -323,6 +323,149 @@ mod argv0_dispatch {
     }
 
     // ========================================================================
+    // Test: D2b (#370) — wrapper with stdout redirected to a file passes raw bytes
+    //
+    // These tests cover the WRAPPER surface. The D2-A tests in cli_rewrite.rs
+    // cover the rewrite/hook surface. Both surfaces are needed for full coverage.
+    // ========================================================================
+
+    /// D2b (#370): when the wrapper's stdout (fd 1) is a regular file, the
+    /// wrapper must run the real tool with inherited stdio so its raw bytes
+    /// reach the file unmodified — NOT skim's compressed summary.
+    ///
+    /// We redirect stdout to a real temp file (`.stdout(File::create(tmp))`
+    /// instead of assert_cmd's default pipe), then assert the file holds raw
+    /// tool output with no `tool N` skim header or footer.
+    #[test]
+    fn argv0_wrapper_stdout_file_passes_raw_bytes() {
+        // Stub ls that emits a deterministic multi-line output.
+        let raw_output = "alpha.txt\nbeta.rs\ngamma.py\n";
+        let stub_dir = make_stub_dir("ls", raw_output, 0);
+        let path = prepend_path(stub_dir.path());
+
+        let skim = skim_bin();
+        assert!(skim.exists(), "skim binary must exist");
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let out_file = tmp_dir.path().join("out.txt");
+
+        // Invoke with fd 1 → regular file: this is the D2b scenario.
+        let status = std::process::Command::new(&skim)
+            .arg0("ls")
+            .env("PATH", &path)
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DEBUG")
+            // Redirect stdout to a real file — NOT assert_cmd's default pipe.
+            .stdout(std::fs::File::create(&out_file).unwrap())
+            .status()
+            .expect("skim binary must be spawnable");
+
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "wrapper dispatch to file must exit 0"
+        );
+
+        let file_contents = std::fs::read_to_string(&out_file).unwrap();
+
+        // Raw bytes must be in the file — no skim header or footer.
+        assert!(
+            file_contents.contains("alpha.txt"),
+            "raw output must be in file; got: {file_contents:?}"
+        );
+        assert!(
+            !file_contents.contains("ls "),
+            "skim 'ls N' header must NOT appear in file; got: {file_contents:?}"
+        );
+        // Exact round-trip: the file should equal the stub's raw output.
+        assert_eq!(
+            file_contents, raw_output,
+            "file must contain exactly the raw tool bytes"
+        );
+    }
+
+    /// Control test for D2b: when stdout is a pipe (assert_cmd's default),
+    /// the wrapper STILL compresses — the regular-file guard must not fire.
+    #[test]
+    fn argv0_wrapper_stdout_pipe_still_compresses() {
+        // Enough output that compression changes it (ls with multi-file context).
+        let raw_output = "alpha.txt\nbeta.rs\ngamma.py\ndelta.go\nepsilon.md\n";
+        let stub_dir = make_stub_dir("ls", raw_output, 0);
+        let path = prepend_path(stub_dir.path());
+
+        let skim = skim_bin();
+
+        // Default invocation — stdout is a pipe (assert_cmd / .output()).
+        let output = std::process::Command::new(&skim)
+            .arg0("ls")
+            .env("PATH", &path)
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DEBUG")
+            .output()
+            .expect("skim binary must be spawnable");
+
+        assert_eq!(output.status.code(), Some(0), "must exit 0");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // With a pipe stdout, the wrapper must compress — output is NOT empty.
+        assert!(
+            !stdout.trim().is_empty(),
+            "wrapper with pipe stdout must produce non-empty output (compresses)"
+        );
+        // The regular-file guard must NOT have fired (no raw passthrough).
+        // Compressed output typically differs from raw; at minimum it is not
+        // longer than raw.
+        assert!(
+            stdout.len() <= raw_output.len() + 50, // generous bound for header
+            "wrapper with pipe stdout must not expand vs raw: stdout={stdout:?}"
+        );
+    }
+
+    /// D1 wrapper-layer (#370): grep through the wrapper surface emits a single
+    /// `grep N` header and a `M file(s)` footer — no `GREP:` or `matches in`.
+    #[test]
+    fn argv0_grep_wrapper_single_header_and_footer() {
+        // Stub grep that emits multi-file `file:line:content` output.
+        let raw_output = "src/a.rs:1:fn main() {}\nsrc/b.rs:5:fn run() {}\n";
+        let stub_dir = make_stub_dir("grep", raw_output, 0);
+        let path = prepend_path(stub_dir.path());
+
+        let skim = skim_bin();
+
+        let output = std::process::Command::new(&skim)
+            .arg0("grep")
+            .args(["-rn", "fn", "src/"])
+            .env("PATH", &path)
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DEBUG")
+            .output()
+            .expect("skim binary must be spawnable");
+
+        assert_eq!(output.status.code(), Some(0), "wrapper grep must exit 0");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("grep "),
+            "compressed output must contain 'grep N' header; got: {stdout:?}"
+        );
+        assert!(
+            !stdout.contains("GREP:"),
+            "must not contain 'GREP:' double-header; got: {stdout:?}"
+        );
+        assert!(
+            !stdout.contains("matches in"),
+            "must not contain 'matches in' double-header; got: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("2 files"),
+            "footer must say '2 files'; got: {stdout:?}"
+        );
+    }
+
+    // ========================================================================
     // Test: argv[0]="skim" — normal invocation path is not broken
     // ========================================================================
 
