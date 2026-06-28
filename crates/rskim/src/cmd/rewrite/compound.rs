@@ -101,32 +101,48 @@ pub(super) fn rewrite_would_corrupt(cmd: &str) -> bool {
 /// `>` inside single or double quotes is ignored (no over-bail). Maximally
 /// strict: catches spaced/glued/append/fd-prefixed forms, `&>file`, `>&FILE`,
 /// and glued-middle `foo>out`. Skips `2>`/`2>>` (stderr — stdout still reaches
-/// the agent) and fd-dups (`>&1`, `>&2`, `1>&2`, `>&-`).
+/// the agent) and fd-dups (`>&1`, `>&2`, `>&-`, `1>&2`).
 ///
 /// CHECK ORDER (source-fd before target) is load-bearing.
 fn stdout_redirected_to_file(cmd: &str) -> bool {
-    let chars: Vec<char> = cmd.chars().collect();
-    let len = chars.len();
+    // Byte-indexed scanner: avoids a Vec<char> heap allocation on the rewrite
+    // hot path. All operator characters (`>`, `'`, `"`, `\`, `2`, `&`, `-`,
+    // ASCII digits, space) are single-byte ASCII; multibyte UTF-8 bytes (≥ 0x80)
+    // can never equal them, so they fall through the `i += 1` arm unchanged.
+    //
+    // Quote state uses plain bools (not QuoteState<>) because the escape rule
+    // `!in_single && b == b'\\'` maps directly to bash semantics in a single
+    // expression, and the two-bool invariant (at most one true at a time) is
+    // maintained by the `!in_double` / `!in_single` guards on every transition.
+    let bytes = cmd.as_bytes();
+    let len = bytes.len();
     let mut i = 0usize;
     let mut in_single = false;
     let mut in_double = false;
 
     while i < len {
-        let ch = chars[i];
+        let ch = bytes[i];
 
-        // Escape inside double quotes: skip both chars (e.g., `\"`).
-        if in_double && ch == '\\' {
+        // Backslash escapes the next char when outside single quotes (bash
+        // semantics). This handles two cases:
+        //   Unquoted:      `\'` → next `'` is literal, never toggles in_single.
+        //   Double-quoted: `\"` → next `"` is literal, never toggles in_double.
+        //   Single-quoted: `\` is literal (no escape inside `'` in bash).
+        // Without this, a balanced `\' ... \'` pair would trick the scanner into
+        // treating the region as single-quoted and miss a real `>` between them
+        // (avoids PF-004 false-negative / re-opens #370).
+        if !in_single && ch == b'\\' {
             i += 2;
             continue;
         }
 
         // Quote state transitions (only while not inside the other quote type).
-        if ch == '\'' && !in_double {
+        if ch == b'\'' && !in_double {
             in_single = !in_single;
             i += 1;
             continue;
         }
-        if ch == '"' && !in_single {
+        if ch == b'"' && !in_single {
             in_double = !in_double;
             i += 1;
             continue;
@@ -138,7 +154,7 @@ fn stdout_redirected_to_file(cmd: &str) -> bool {
             continue;
         }
 
-        if ch != '>' {
+        if ch != b'>' {
             i += 1;
             continue;
         }
@@ -149,12 +165,12 @@ fn stdout_redirected_to_file(cmd: &str) -> bool {
         // Stderr-only (`2>`) iff the previous char is a STANDALONE '2'
         // (preceded by whitespace or start-of-string).
         let is_stderr_only =
-            i > 0 && chars[i - 1] == '2' && (i < 2 || chars[i - 2].is_whitespace());
+            i > 0 && bytes[i - 1] == b'2' && (i < 2 || bytes[i - 2].is_ascii_whitespace());
 
         if is_stderr_only {
             // Skip this `>` and an optional second `>` (the `2>>` append form).
             i += 1;
-            if i < len && chars[i] == '>' {
+            if i < len && bytes[i] == b'>' {
                 i += 1;
             }
             continue;
@@ -163,19 +179,32 @@ fn stdout_redirected_to_file(cmd: &str) -> bool {
         // Stdout (or both streams) is the source — examine the target.
         let mut j = i + 1;
         // Consume optional second `>` (append form `>>`).
-        if j < len && chars[j] == '>' {
+        if j < len && bytes[j] == b'>' {
             j += 1;
         }
         // Skip spaces between `>` and target.
-        while j < len && chars[j] == ' ' {
+        while j < len && bytes[j] == b' ' {
             j += 1;
         }
-        // fd-dup: `>&<digit>` or `>&-` — NOT a file redirect; skip.
-        if j < len && chars[j] == '&' {
+        // fd-dup: `>&<digits>` or `>&-` — NOT a file redirect; skip.
+        // bash treats `>&word` as fd-dup ONLY when `word` is entirely ASCII
+        // digits or exactly `-`; `>&2x` redirects both streams to file `2x` and
+        // must bail. Scan to the end of the token and verify every byte.
+        if j < len && bytes[j] == b'&' {
             let k = j + 1;
-            if k < len && (chars[k].is_ascii_digit() || chars[k] == '-') {
-                i = k + 1;
-                continue;
+            if k < len && (bytes[k].is_ascii_digit() || bytes[k] == b'-') {
+                // Advance m to the first whitespace or end-of-string after k.
+                let mut m = k + 1;
+                while m < len && !bytes[m].is_ascii_whitespace() {
+                    m += 1;
+                }
+                // The whole post-& target must be either exactly `-` or all digits.
+                let is_fd_dup = (bytes[k] == b'-' && m == k + 1)
+                    || bytes[k..m].iter().all(|b| b.is_ascii_digit());
+                if is_fd_dup {
+                    i = m;
+                    continue;
+                }
             }
         }
         // Anything else is a file target — bail.
@@ -823,6 +852,37 @@ mod tests {
         assert!(rewrite_would_corrupt("curl https://x >&file"), ">&file");
         assert!(rewrite_would_corrupt("echo foo>out"), "glued foo>out");
         assert!(rewrite_would_corrupt("a > f && b"), "compound with > f");
+
+        // Security fix (Issue 1a): backslash-escaped single quote outside quotes
+        // (`\'`) must NOT open a quoting context. A `>` between two `\'` pairs was
+        // previously invisible to the scanner, letting skim corrupt the redirect
+        // target (avoids PF-004 false-negative).
+        assert!(
+            rewrite_would_corrupt(r"grep x\' file > out z\'z"),
+            r"backslash-escaped \' must not hide a stdout redirect"
+        );
+
+        // Security fix (Issue 1b): `>&<digit>filename` is a redirect to a file
+        // whose name starts with a digit, NOT an fd-dup. Only `>&<all-digits>`
+        // (e.g. `>&2`) or `>&-` are fd-dups; `>&2x` redirects both streams to
+        // file `2x` (avoids PF-004 false-negative).
+        assert!(
+            rewrite_would_corrupt("cmd >&2x"),
+            ">&2x redirects both streams to file 2x, not an fd-dup"
+        );
+
+        // Compound: stderr-append (`2>>`) skipped, then stdout redirect must bail.
+        assert!(
+            rewrite_would_corrupt("cmd 2>>a >b"),
+            "2>>a >b — skip 2>> then bail on >b"
+        );
+
+        // Non-standalone `2` before `>` — the digit is part of a longer token so
+        // it is NOT the stderr source prefix; `>` is a stdout redirect.
+        assert!(
+            rewrite_would_corrupt("cmd foo2>out"),
+            "foo2>out — 2 not standalone, so > is a stdout redirect"
+        );
     }
 
     /// No-bail companion for stdout_redirected_to_file: stderr-only forms and
@@ -838,6 +898,7 @@ mod tests {
         assert!(!rewrite_would_corrupt("cargo test >&1"), ">&1 fd-dup");
         assert!(!rewrite_would_corrupt("cargo test >&2"), ">&2 fd-dup");
         assert!(!rewrite_would_corrupt("cargo test 1>&2"), "1>&2 fd-dup");
+        assert!(!rewrite_would_corrupt("cmd >&-"), ">&- close-fd dup");
         assert!(!rewrite_would_corrupt("cargo test | jq ."), "pipe — no >");
         // quoted `>` inside double quotes must not over-bail
         assert!(
