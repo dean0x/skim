@@ -193,10 +193,11 @@ pub(super) fn try_parse_file_line_content(
 /// elision footer. `shown_count == total_count` so the canonical header
 /// renders as `tool N` (no truncation ratio; Fix F). (#317)
 ///
-/// The file count is folded into the FOOTER (e.g. `"1 file"` / `"3 files"`)
-/// with correct pluralization, mirroring ls FIX 5. No `TOOL: N matches in M
-/// files` summary is prepended — the canonical `tool N` header already renders
-/// separately (output/canonical.rs). (#370, #317)
+/// The file count is folded into the FOOTER instead of a prepended
+/// `TOOL: N matches in M files` double-header (the no-double-header pattern
+/// from ls FIX 5). Pluralization ("1 file" / "3 files") follows the
+/// `diff.rs` footer idiom — ls/tree intentionally do not pluralize their
+/// `N dirs, M files` breakdown. (#370, #317)
 ///
 /// `tool` — binary name (e.g. `"grep"`, `"rg"`).
 /// `total_matches` — total match count across all files.

@@ -712,14 +712,29 @@ fn is_regular_file_stdout(meta: std::io::Result<std::fs::Metadata>) -> bool {
 /// reach the file unmodified (#370, #317). Pipes/ttys are not regular files
 /// and fall through to normal compression (skim's core use case).
 ///
+/// **Shared invariant (cross-surface):** "stdout redirected to a regular file
+/// must receive the tool's raw bytes, never a skim summary." This invariant is
+/// enforced by two independent mechanisms — one per interception surface —
+/// because each surface observes the redirect at a different stage:
+/// - **Wrapper surface (here, runtime):** `fstat(fd 1)` after the shell has
+///   already consumed `>` and opened the file; no `>` token remains in argv.
+/// - **Rewrite surface (static):** `stdout_redirected_to_file` in
+///   `cmd/rewrite/compound.rs` — syntactic `>` scan before the command runs.
+///
+/// Keep the two detectors in lockstep. If you widen or narrow the detection
+/// semantics here, audit `stdout_redirected_to_file` for the same forms
+/// (`>f`, `>>f`, `1>f`, `&>f`, `&>>f`).
+///
 /// Non-Unix: always returns `false` (compression proceeds normally).
 #[cfg(unix)]
 fn stdout_is_regular_file() -> bool {
     use std::mem::ManuallyDrop;
     use std::os::unix::io::FromRawFd;
     // Borrow fd 1 via a ManuallyDrop wrapper so the destructor never closes it.
-    // SAFETY: fd 1 is always valid at this point in main(); ManuallyDrop
-    // guarantees the File is never dropped (fd not closed).
+    // SAFETY: ManuallyDrop suppresses File's Drop, so fd 1 is never closed
+    // (no double-close). If fd 1 is invalid (e.g. the process was started with
+    // stdout closed), f.metadata() returns Err; is_regular_file_stdout falls
+    // back to false and normal compression proceeds.
     let f = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
     is_regular_file_stdout(f.metadata())
 }
@@ -781,6 +796,11 @@ fn main() -> ExitCode {
         // redirected fd 1 to the file before exec-ing us. Run the real tool
         // with inherited stdio so its raw bytes reach the file unmodified (#317).
         // Pipes/ttys are not regular files → still compress (normal path).
+        // Guard is scoped to this wrapper-dispatch branch only. The Subcommand
+        // and FileOperation branches below are intentionally NOT guarded:
+        // `skim file.ts > out.txt` and `skim grep … > out.txt` are explicit skim
+        // invocations where the user wants skim's output saved — hoisting this
+        // guard above detect_argv0_dispatch() would break that workflow.
         if stdout_is_regular_file() {
             Ok(cmd::run_inherited_passthrough(&name, &args))
         } else {
