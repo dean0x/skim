@@ -80,6 +80,7 @@ fn make_config(root: &std::path::Path, cache_dir: &std::path::Path, text: &str) 
     QueryConfig {
         text: text.to_string(),
         limit: 20,
+        offset: None,
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
@@ -420,6 +421,7 @@ fn test_execute_query_blast_radius_includes_only_allowed_paths() {
     let config = QueryConfig {
         text: "authenticate".to_string(),
         limit: 20,
+        offset: None,
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
@@ -464,6 +466,7 @@ fn test_execute_query_blast_radius_target_file_is_included() {
     let config = QueryConfig {
         text: "authenticate".to_string(),
         limit: 20,
+        offset: None,
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
@@ -516,6 +519,7 @@ fn test_ac12_union_includes_cochange_only_file_absent_from_lexical() {
     let config = QueryConfig {
         text: "zqjxblip_check".to_string(),
         limit: 20,
+        offset: None,
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
@@ -580,6 +584,7 @@ fn test_ac13_union_no_duplicate_file_ids_and_correct_cardinality() {
     let config = QueryConfig {
         text: "zqjxblip_check".to_string(),
         limit: 20,
+        offset: None,
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
@@ -651,6 +656,7 @@ fn test_ac13_limit_applied_after_fusion_rank_then_limit() {
     let config = QueryConfig {
         text: "zqjxblip_check".to_string(),
         limit: 1,
+        offset: None,
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
@@ -695,6 +701,7 @@ fn test_ac14_cochange_only_result_carries_fused_rrf_score() {
     let config = QueryConfig {
         text: "zqjxblip_check".to_string(),
         limit: 20,
+        offset: None,
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
@@ -1001,6 +1008,7 @@ fn test_ac2_gibberish_query_returns_zero_results_compound_path() {
     let config = QueryConfig {
         text: "xqzjvmblorp".to_string(),
         limit: 20,
+        offset: None,
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
@@ -1070,6 +1078,7 @@ fn test_ac2_verify_gate_drops_compound_lexical_hit_without_literal() {
         let build_config = QueryConfig {
             text: "authenticate_user".to_string(),
             limit: 20,
+            offset: None,
             json: false,
             root: root.to_path_buf(),
             cache_dir: cache_dir.to_path_buf(),
@@ -1087,6 +1096,7 @@ fn test_ac2_verify_gate_drops_compound_lexical_hit_without_literal() {
     let config = QueryConfig {
         text: "authenticate_user".to_string(),
         limit: 20,
+        offset: None,
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
@@ -1149,6 +1159,7 @@ fn test_ac2_gibberish_query_no_lexical_hits_blast_radius() {
     let config = QueryConfig {
         text: "xqzjvmblorp".to_string(),
         limit: 20,
+        offset: None,
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
@@ -1229,6 +1240,7 @@ fn test_ac2_short_query_fallback_blast_radius_exercises_verify_gate() {
     let config = QueryConfig {
         text: "zz".to_string(), // 2 bytes → AD-355-7 fallback
         limit: 20,
+        offset: None,
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),

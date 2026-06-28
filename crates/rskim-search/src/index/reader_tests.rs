@@ -607,6 +607,17 @@ fn test_ac1_type_definition_ranks_above_string_literal() {
 }
 
 /// AC2: Field boosts are configurable — a query with reversed boosts reverses ranking.
+///
+/// # AD-372-1 note
+///
+/// `bm25f_config` is a BM25F UNION-path parameter.  Single-token queries (≥3 bytes)
+/// now route to `search_exact_intersection` (AD-372-1) which ranks by
+/// occurrence-count / token-density (AD-372-6), NOT BM25F.  Configurable BM25F
+/// field boosts therefore only apply to MULTI-WORD queries (the UNION path).
+///
+/// This test uses a two-word query "SearchTarget struct" to remain on the UNION
+/// path where `bm25f_config` is effective.  A single-token query "SearchTarget"
+/// would route to the intersection path and ignore `bm25f_config`.
 #[test]
 fn test_ac2_configurable_boosts_reverse_ranking() {
     use crate::SearchField;
@@ -616,7 +627,7 @@ fn test_ac2_configurable_boosts_reverse_ranking() {
     let dir = tmp_dir();
     let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
 
-    // File 0: term in TypeDefinition (discriminant 0, default boost 5.0)
+    // File 0: both terms in TypeDefinition (discriminant 0, default boost 5.0).
     let type_content = "struct SearchTarget { }";
     let tl = type_content.len();
     builder
@@ -628,8 +639,8 @@ fn test_ac2_configurable_boosts_reverse_ranking() {
         )
         .unwrap();
 
-    // File 1: term in StringLiteral (discriminant 6, default boost 0.5)
-    let str_content = "let s = \"SearchTarget value\";";
+    // File 1: both terms in StringLiteral (discriminant 6, default boost 0.5).
+    let str_content = "let s = \"SearchTarget struct value\";";
     let sl = str_content.len();
     builder
         .add_file_classified(
@@ -643,8 +654,9 @@ fn test_ac2_configurable_boosts_reverse_ranking() {
     builder.build().unwrap();
     let reader = NgramIndexReader::open(dir.path()).unwrap();
 
+    // Two-word query stays on the BM25F UNION path (AD-372-1: multi-word → UNION).
     // Default boosts: TypeDefinition=5.0 > StringLiteral=0.5 → file 0 ranks first.
-    let default_results = reader.search(&SearchQuery::new("SearchTarget")).unwrap();
+    let default_results = reader.search(&SearchQuery::new("SearchTarget struct")).unwrap();
     assert!(default_results.len() >= 2);
     assert_eq!(
         default_results[0].file_id.0, 0,
@@ -655,7 +667,7 @@ fn test_ac2_configurable_boosts_reverse_ranking() {
     let mut reversed_config = BM25FConfig::default();
     reversed_config.field_boosts[0] = 0.5; // TypeDefinition
     reversed_config.field_boosts[6] = 5.0; // StringLiteral
-    let mut query = SearchQuery::new("SearchTarget");
+    let mut query = SearchQuery::new("SearchTarget struct");
     query.bm25f_config = Some(reversed_config);
     let reversed_results = reader.search(&query).unwrap();
     assert!(reversed_results.len() >= 2);
@@ -729,13 +741,22 @@ fn test_ac4_scoring_deterministic() {
 
 /// Verify that open_with_config() applies the provided BM25FConfig correctly,
 /// producing different scores than the default config.
+///
+/// # AD-372-1 note
+///
+/// `bm25f_config` (including k1) only affects the BM25F UNION path, which is
+/// used for multi-word queries.  Single-token queries (≥3 bytes) route to
+/// `search_exact_intersection` (AD-372-1) and rank by raw occurrence count
+/// (AD-372-6) — k1 is irrelevant there.
+///
+/// This test uses a two-word query "main count" to remain on the UNION path.
 #[test]
 fn test_open_with_config_stores_config() {
     use crate::lexical::BM25FConfig;
 
     let dir = tmp_dir();
     let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
-    // Repeat "main" several times so tf_weighted is large enough that changing
+    // Repeat both terms many times so tf_weighted is large enough that changing
     // k1 from 1.2 (default) to 2.0 produces a measurable score difference.
     // BM25F saturation formula: IDF * tf_weighted / (tf_weighted + k1)
     builder
@@ -755,8 +776,9 @@ fn test_open_with_config_stores_config() {
     }; // higher k1 → lower saturation → lower score
     let custom_reader = NgramIndexReader::open_with_config(dir.path(), custom_config).unwrap();
 
-    let default_results = default_reader.search(&SearchQuery::new("main")).unwrap();
-    let custom_results = custom_reader.search(&SearchQuery::new("main")).unwrap();
+    // Two-word query → BM25F UNION path (AD-372-1: only single-token → intersection).
+    let default_results = default_reader.search(&SearchQuery::new("main count")).unwrap();
+    let custom_results = custom_reader.search(&SearchQuery::new("main count")).unwrap();
 
     // Both configs must find the document.
     assert!(
@@ -870,17 +892,28 @@ fn test_open_with_config_rejects_invalid_config() {
 }
 
 /// search() must reject a per-query BM25FConfig with invalid parameters.
+///
+/// # AD-372-1 note
+///
+/// `bm25f_config` is validated on the BM25F UNION path only.  Single-token
+/// queries (≥3 bytes) bypass BM25F entirely (AD-372-1: `search_exact_intersection`).
+/// This test uses a two-word query "fn main" to stay on the UNION path where
+/// per-query BM25FConfig validation fires.
 #[test]
 fn test_search_rejects_invalid_per_query_config() {
     use crate::lexical::BM25FConfig;
 
-    let (_dir, layer) =
-        build_index_with(&[(FileId(0), "fn main() {}", rskim_core::Language::Rust)]);
+    let (_dir, layer) = build_index_with(&[(
+        FileId(0),
+        "fn main() { println!(\"hello\"); }",
+        rskim_core::Language::Rust,
+    )]);
 
     let mut bad_config = BM25FConfig::default();
     bad_config.field_b[0] = 1.5; // invalid: must be in [0.0, 1.0]
 
-    let mut query = SearchQuery::new("main");
+    // Two-word query → BM25F UNION path → bm25f_config validation fires.
+    let mut query = SearchQuery::new("fn main");
     query.bm25f_config = Some(bad_config);
 
     let result = layer.search(&query);
@@ -1377,4 +1410,718 @@ fn test_ac6_result_set_non_regression_v4_codec() {
             .map(|r| r.file_id.0)
             .collect::<Vec<_>>()
     );
+}
+
+// =============================================================================
+// #372 — AND-intersection exact-symbol mode tests
+// =============================================================================
+//
+// These tests are structured per the #372 Test Plan and Acceptance Criteria.
+// Every test includes a discriminating negative assertion (PF-007): the test
+// fails both when the feature is deleted AND when precision regresses.
+
+/// Helper: build a real `NgramIndexReader` (not the boxed `SearchLayer` trait)
+/// so we can call inherent methods like `intersect_posting_doc_ids`.
+fn build_reader_with(
+    files: &[(FileId, &str, rskim_core::Language)],
+) -> (tempfile::TempDir, NgramIndexReader) {
+    let dir = tmp_dir();
+    let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    for (id, content, lang) in files {
+        builder.add_file(*id, content, *lang).unwrap();
+    }
+    builder.build().unwrap();
+    let reader = NgramIndexReader::open(dir.path()).unwrap();
+    (dir, reader)
+}
+
+/// Helper: ground-truth substring scan over `files`.
+/// Returns all FileIds whose content contains `token`.
+fn ground_truth_file_ids(files: &[(FileId, &str, rskim_core::Language)], token: &str) -> std::collections::HashSet<u32> {
+    files
+        .iter()
+        .filter(|(_, content, _)| content.contains(token))
+        .map(|(id, _, _)| id.0)
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AC #1: Headline recall — large/sparse definer + incidental-overlap junk
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AD-372-1 / AC #1 / PF-007: single-token exact-symbol recall.
+///
+/// A large definer file (file 0) contains one occurrence of a long unique token.
+/// 120 junk files each share ONE or TWO trigrams of the token but NOT the whole
+/// token.  `search` with default limit must return EXACTLY the set of files that
+/// actually contain the literal token — equal to the grep ground truth.
+///
+/// Discriminating negative (PF-007):
+/// - Definer MUST be present → fails if intersection drops true matches.
+/// - Junk files MUST be absent → fails if UNION+take was kept (no AND fix).
+/// - If `search_exact_intersection` is deleted and the old UNION path is used,
+///   junk files (which share a few trigrams) would survive `take(limit*5)`
+///   and the `assert!(!file_ids.contains(junk_id))` check would fire.
+#[test]
+fn test_ac1_headline_recall_large_sparse_definer() {
+    use crate::types::query_substring_present;
+
+    let token = "decode_postings_varint";
+
+    // File 0: long filler (to simulate a large file) plus ONE occurrence of the token.
+    let long_filler: String = "some filler content xyz ".repeat(200);
+    let definer_content = format!("{long_filler} {token} and more filler content abc");
+
+    // Files 1..=120: each contains a short phrase that shares a few trigrams
+    // of the token ("dec", "ode", "pos") but NOT the full literal token.
+    let mut files: Vec<(FileId, String, rskim_core::Language)> = vec![
+        (FileId(0), definer_content, rskim_core::Language::Rust),
+    ];
+    let junk_phrases = ["dec_isions", "pos_ition", "node_ops", "cod_ex_ample"];
+    for i in 1u32..=120 {
+        let phrase = junk_phrases[(i as usize - 1) % junk_phrases.len()];
+        files.push((FileId(i), format!("some code with {phrase} and other stuff x{i}"), rskim_core::Language::Rust));
+    }
+    // Files 121, 122: control files that contain the full literal token.
+    files.push((FileId(121), format!("pub fn {token}(data: &[u8]) -> Vec<u8> {{ vec![] }}"), rskim_core::Language::Rust));
+    files.push((FileId(122), format!("// This module uses {token} for encoding."), rskim_core::Language::Rust));
+
+    let files_str: Vec<(FileId, &str, rskim_core::Language)> = files
+        .iter()
+        .map(|(id, s, l)| (*id, s.as_str(), *l))
+        .collect();
+
+    let (_dir, layer) = build_index_with(&files_str);
+
+    // Ground truth: files that actually contain the literal token.
+    let ground_truth = ground_truth_file_ids(&files_str, token);
+    assert_eq!(
+        ground_truth,
+        std::collections::HashSet::from([0, 121, 122]),
+        "setup: ground truth must be {{0, 121, 122}}"
+    );
+
+    // Test with default limit (None).
+    let result_default = layer.search(&SearchQuery::new(token)).unwrap();
+    let ids_default: std::collections::HashSet<u32> = result_default.iter().map(|r| r.file_id.0).collect();
+
+    // Must match ground truth exactly.
+    assert_eq!(
+        ids_default, ground_truth,
+        "AC#1: exact-symbol path must return exactly the ground-truth set at default limit; \
+         got {ids_default:?}, want {ground_truth:?}"
+    );
+
+    // PF-007 discriminating negative: junk files must be absent.
+    for i in 1u32..=120 {
+        assert!(
+            !ids_default.contains(&i),
+            "AC#1: junk file FileId({i}) shares only 1-2 trigrams with the token and must be absent; \
+             found it in results — UNION+take was not replaced with AND-intersection (AD-372-1)"
+        );
+    }
+
+    // Test with explicit large limit (should produce the same set).
+    let mut ql = SearchQuery::new(token);
+    ql.limit = Some(500);
+    let result_large = layer.search(&ql).unwrap();
+    let ids_large: std::collections::HashSet<u32> = result_large.iter().map(|r| r.file_id.0).collect();
+    assert_eq!(
+        ids_large, ground_truth,
+        "AC#2 (limit independence): result set at limit=500 must equal ground truth; \
+         got {ids_large:?}"
+    );
+
+    // Verify each result actually contains the token (precision).
+    for r in &result_default {
+        let content = files[r.file_id.0 as usize].1.as_str();
+        assert!(
+            query_substring_present(content, token),
+            "AC#3 precision: FileId({}) in results but content does not contain the token",
+            r.file_id.0
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AC #3: Precision — gibberish query returns empty
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// PF-007: a gibberish query that has trigrams but no file contains the full
+/// literal must return an empty Vec.  Fails if the intersection is replaced
+/// by UNION (some files would share individual trigrams with the gibberish).
+#[test]
+fn test_ac3_precision_gibberish_single_token_returns_empty() {
+    let (_dir, layer) = build_index_with(&[
+        (FileId(0), "fn foo() { let x = 1; }", rskim_core::Language::Rust),
+        (FileId(1), "pub fn bar(a: u32) -> u32 { a + 1 }", rskim_core::Language::Rust),
+    ]);
+
+    let results = layer.search(&SearchQuery::new("zxqwvbnmkjhgfdsa12345")).unwrap();
+    assert!(
+        results.is_empty(),
+        "AC#3: gibberish query with unique trigrams must return empty intersection; got {} results",
+        results.len()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AC #4: Intersection strictly narrows vs UNION (PF-007 both directions)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AD-372-1 / AC #4 / PF-007: both directions tested.
+///
+/// Setup: N junk files each share exactly ONE trigram with the query;
+/// M files contain the full literal token.
+///
+/// Asserts:
+/// 1. Result count ≤ M (strictly less than N+M) — intersection narrows.
+/// 2. All M literal-token files are present (recall).
+/// 3. Junk files are absent — asserts via INDIVIDUAL checks (PF-007).
+#[test]
+fn test_ac4_intersection_strictly_narrows_vs_union() {
+    // Token with 4 distinct trigrams: "foo_bar"
+    let token = "foo_bar";
+    // Build 10 junk files, each containing exactly one of the token's trigrams.
+    // "foo", "oo_", "o_b", "_ba", "bar" — pick "foo" and "_ba" for the junk.
+    let files: Vec<(FileId, &str, rskim_core::Language)> = vec![
+        // Junk files: contain one trigram substring but NOT the full token.
+        (FileId(0), "foo xyz only", rskim_core::Language::Rust),   // contains "foo" but not "foo_bar"
+        (FileId(1), "xyz_bar_only", rskim_core::Language::Rust),   // contains "_bar" but not "foo_bar"
+        (FileId(2), "some foo other", rskim_core::Language::Rust),  // "foo"
+        (FileId(3), "xbar no prefix", rskim_core::Language::Rust),  // "bar"
+        // Files that contain the full token:
+        (FileId(4), "let x = foo_bar()", rskim_core::Language::Rust),
+        (FileId(5), "pub fn foo_bar() {}", rskim_core::Language::Rust),
+    ];
+
+    let (_dir, layer) = build_index_with(&files);
+
+    let ground_truth = ground_truth_file_ids(&files, token);
+    assert_eq!(
+        ground_truth,
+        std::collections::HashSet::from([4, 5]),
+        "setup: only files 4 and 5 contain the full token"
+    );
+
+    let results = layer.search(&SearchQuery::new(token)).unwrap();
+    let ids: std::collections::HashSet<u32> = results.iter().map(|r| r.file_id.0).collect();
+
+    // All literal-token files must be present (recall direction, PF-007).
+    assert!(
+        ids.contains(&4),
+        "AC#4 recall: FileId(4) contains '{token}' and must be in results"
+    );
+    assert!(
+        ids.contains(&5),
+        "AC#4 recall: FileId(5) contains '{token}' and must be in results"
+    );
+
+    // Junk files must be absent (precision / narrowing direction, PF-007).
+    for junk_id in [0, 1, 2, 3] {
+        assert!(
+            !ids.contains(&junk_id),
+            "AC#4 narrowing: FileId({junk_id}) shares only one trigram and must be absent from \
+             the AND-intersection; found it — the UNION path was not replaced (AD-372-1)"
+        );
+    }
+
+    // Result count must be <= M (the literal-token file count), strictly less than N+M.
+    assert!(
+        ids.len() <= ground_truth.len(),
+        "AC#4: result count {} must be <= ground-truth count {} (intersection narrows)",
+        ids.len(), ground_truth.len()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AC #5: doc_id dedup in intersection
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AD-372-2 / AC #5: a token appearing many times in one file produces posting
+/// lists with many same-doc_id entries.  `search` must return each file exactly
+/// once (no duplicate SearchResult).
+#[test]
+fn test_ac5_doc_id_dedup_in_intersection() {
+    // File 0: token appears 50 times in a single line.
+    let token = "my_func_name";
+    let file0: String = format!("{token} ").repeat(50);
+
+    let (_dir, layer) = build_index_with(&[
+        (FileId(0), &file0, rskim_core::Language::Rust),
+        (FileId(1), &format!("single occurrence of {token} here"), rskim_core::Language::Rust),
+    ]);
+
+    let mut q = SearchQuery::new(token);
+    q.limit = Some(100);
+    let results = layer.search(&q).unwrap();
+
+    let ids: Vec<u32> = results.iter().map(|r| r.file_id.0).collect();
+
+    // No duplicate file_ids.
+    let id_set: std::collections::HashSet<u32> = ids.iter().copied().collect();
+    assert_eq!(
+        ids.len(), id_set.len(),
+        "AC#5: no duplicate FileIds in results; got duplicates: {ids:?}"
+    );
+
+    // Both files must appear exactly once.
+    assert!(id_set.contains(&0), "AC#5: FileId(0) with 50 occurrences must appear once");
+    assert!(id_set.contains(&1), "AC#5: FileId(1) with 1 occurrence must appear once");
+
+    // PF-007 negative: neither file_id appears twice.
+    assert_eq!(
+        ids.iter().filter(|&&id| id == 0).count(), 1,
+        "AC#5: FileId(0) must appear exactly once"
+    );
+    assert_eq!(
+        ids.iter().filter(|&&id| id == 1).count(), 1,
+        "AC#5: FileId(1) must appear exactly once"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AC #7: Branch dispatch — 1-2 byte token routes to short fallback
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AD-372-1 / AD-372-4 / AC #7: a query shorter than 3 bytes must route to
+/// `short_query_fallback`, NOT `search_exact_intersection` (which would receive
+/// empty trigrams and return []).
+///
+/// Discriminating (PF-007): the test builds > CANDIDATE_POOL_FLOOR files so that
+/// if the old `.take(limit)` pre-truncation were still in `short_query_fallback`,
+/// files with file_id >= limit would be missing.  The `fn` query matches all
+/// files, so the result count must equal the number of files containing `fn`.
+#[test]
+fn test_ac7_branch_dispatch_short_token_routes_to_fallback() {
+    // Build 110 files: files 0..=109 each contain "fn".
+    // file_id >= 100 would be silently dropped by the old take(limit) with limit=100.
+    let files: Vec<(FileId, String, rskim_core::Language)> = (0u32..110)
+        .map(|i| (FileId(i), format!("pub fn process_{i}() {{ }}", i = i), rskim_core::Language::Rust))
+        .collect();
+    let files_str: Vec<(FileId, &str, rskim_core::Language)> = files
+        .iter()
+        .map(|(id, s, l)| (*id, s.as_str(), *l))
+        .collect();
+
+    let (_dir, layer) = build_index_with(&files_str);
+
+    // "fn" is 2 bytes → routes to short_query_fallback (no trigrams possible).
+    // short_query_fallback must return the FULL filtered set (AD-372-4).
+    let q = SearchQuery::new("fn");
+    // No limit: short_query_fallback returns all indexed files; verify is done by caller.
+    let results = layer.search(&q).unwrap();
+    let ids: std::collections::HashSet<u32> = results.iter().map(|r| r.file_id.0).collect();
+
+    // All 110 files must appear in the candidate set (no internal take).
+    for i in 0u32..110 {
+        assert!(
+            ids.contains(&i),
+            "AC#7 / AD-372-4: FileId({i}) must appear in short_query_fallback result set; \
+             missing — the old .take(limit) pre-truncation was not removed (AD-372-4)"
+        );
+    }
+
+    // All results must have score 0.0 (short-query path, no BM25F).
+    for r in &results {
+        assert_eq!(
+            r.score, 0.0,
+            "AC#7: short-query candidates must carry score 0.0; got {} for FileId({})",
+            r.score, r.file_id.0
+        );
+    }
+
+    // PF-007 negative: verify that a 3-byte token does NOT go through the fallback.
+    // Search for "fun" (3 bytes) — should return scored results (score > 0.0 if present).
+    // This confirms the branch dispatch is based on trigram extraction, not string length.
+    let results3 = layer.search(&SearchQuery::new("fun")).unwrap();
+    // "fun" doesn't appear in the fixture, so results should be empty from the intersection.
+    // The key property: results for "fun" do NOT have score 0.0 mixed in with 110 candidates.
+    // This is satisfied if "fun" returns an empty set (OR a non-fallback scored set).
+    // We check that the 3-byte query path was taken (no 110 score-0 candidates).
+    assert!(
+        results3.len() < 110 || results3.iter().any(|r| r.score > 0.0),
+        "AC#7 dispatch: a 3-byte query must NOT route to the short_query_fallback (no 110 score-0 candidates)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AC #9: Multi-word UNION path preserved (branch boundary)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AD-372-1 / AC #9: two-token queries must continue to use the BM25F UNION path.
+/// A file containing both tokens (in different trigram neighborhoods) must be found.
+/// A strict AND-intersection of ALL query trigrams would split across the whitespace
+/// boundary and never find that file.
+#[test]
+fn test_ac9_multi_word_union_path_preserved() {
+    // Token "alpha" appears in files 0 and 1.
+    // Token "gamma" appears in files 0 and 2.
+    // File 0 contains BOTH tokens — the two-token query must find it.
+    let (_dir, layer) = build_index_with(&[
+        (FileId(0), "the alpha component and the gamma factor", rskim_core::Language::Rust),
+        (FileId(1), "only alpha here without the second token", rskim_core::Language::Rust),
+        (FileId(2), "only gamma here without the first token", rskim_core::Language::Rust),
+    ]);
+
+    // Two-token query: is_single_token returns false → UNION path.
+    let mut q = SearchQuery::new("alpha gamma");
+    q.limit = Some(50);
+    let results = layer.search(&q).unwrap();
+    let ids: std::collections::HashSet<u32> = results.iter().map(|r| r.file_id.0).collect();
+
+    // File 0 (both tokens present) MUST appear.
+    assert!(
+        ids.contains(&0),
+        "AC#9: file containing both 'alpha' and 'gamma' must appear in UNION results"
+    );
+
+    // PF-007 negative: if the test deleted the UNION path and used only
+    // AND-intersection of all 10 query trigrams, file 0 might be missed
+    // because the query's bigrams span the whitespace boundary.
+    // The `contains(&0)` assertion above catches this.
+
+    // Confirm that scores are non-zero (BM25F scored, not score-0 fallback).
+    assert!(
+        results.iter().any(|r| r.score > 0.0),
+        "AC#9: multi-word query must produce BM25F-scored results (score > 0.0), not score-0 fallback"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AC #8: v4 format compatibility — no rebuild required (non-regression)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AC #8: a v4 index built by the current builder must be queryable with the
+/// new single-token exact path WITHOUT `--rebuild`.  FORMAT_VERSION must be 4.
+/// The existing `test_ac6_result_set_non_regression_v4_codec` test is the
+/// companion guard; this test focuses on the #372 exact-symbol path.
+#[test]
+fn test_ac8_v4_format_compat_exact_symbol_no_rebuild() {
+    use crate::index::format::FORMAT_VERSION;
+
+    let token = "exact_symbol_token";
+    let dir = tmp_dir();
+
+    // Build a v4 index.
+    {
+        let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+        builder.add_file(
+            FileId(0),
+            &format!("pub fn {token}() -> u32 {{ 42 }}"),
+            rskim_core::Language::Rust,
+        ).unwrap();
+        builder.add_file(
+            FileId(1),
+            "unrelated content xyz",
+            rskim_core::Language::Rust,
+        ).unwrap();
+        builder.build().unwrap();
+    }
+
+    // Verify the on-disk format version is still v4 (unchanged by #372).
+    let version = NgramIndexReader::lexical_index_version(dir.path()).unwrap();
+    assert_eq!(
+        version, FORMAT_VERSION,
+        "AC#8: format version must be {} (v4 unchanged by #372); got {version}",
+        FORMAT_VERSION
+    );
+
+    // Open and query WITHOUT rebuilding.
+    let reader = NgramIndexReader::open(dir.path()).unwrap();
+    let results = reader.search(&SearchQuery::new(token)).unwrap();
+    let ids: std::collections::HashSet<u32> = results.iter().map(|r| r.file_id.0).collect();
+
+    // The exact-symbol path must find the file containing the token.
+    assert!(
+        ids.contains(&0),
+        "AC#8: v4 index queried with exact-symbol path must find FileId(0); no rebuild needed"
+    );
+
+    // Unrelated file must be absent (precision).
+    assert!(
+        !ids.contains(&1),
+        "AC#8: FileId(1) (unrelated) must be absent from exact-symbol results"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AC #11 (reader level): Offset semantics on exact path
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AD-372-3 / AC #11 reader-level: `search` with `offset=Some(1)` on a
+/// deterministic 3-file ranked intersection must skip the top-ranked file and
+/// start at rank 2.
+///
+/// Ranking key: occurrence-count / token-density (AD-372-6, length-norm-free).
+/// File 0: token appears 5 times in a very short file → highest density → rank 1.
+/// File 1: token appears 3 times in a medium file → rank 2.
+/// File 2: token appears 1 time in a long file → rank 3.
+#[test]
+fn test_ac11_offset_semantics_exact_path_reader_level() {
+    let token = "my_offset_token";
+    let filler = "x ".repeat(50);
+
+    // File 0: 5 occurrences, short file → highest density.
+    let file0 = format!("{token} {token} {token} {token} {token}");
+    // File 1: 3 occurrences, medium file.
+    let file1 = format!("{filler} {token} {token} {token} more content");
+    // File 2: 1 occurrence, very long file → lowest density.
+    let filler_long = "y ".repeat(500);
+    let file2 = format!("{filler_long} {token} end");
+
+    let (_dir, layer) = build_index_with(&[
+        (FileId(0), &file0, rskim_core::Language::Rust),
+        (FileId(1), &file1, rskim_core::Language::Rust),
+        (FileId(2), &file2, rskim_core::Language::Rust),
+    ]);
+
+    // First: get all results in rank order (no offset) to establish the ground order.
+    let mut q_all = SearchQuery::new(token);
+    q_all.limit = Some(10);
+    let all_results = layer.search(&q_all).unwrap();
+
+    let all_ids: Vec<u32> = all_results.iter().map(|r| r.file_id.0).collect();
+    assert_eq!(
+        all_ids.len(), 3,
+        "AC#11 setup: must find all 3 files; got {all_ids:?}"
+    );
+
+    // With offset=1: must skip the rank-1 file and start at rank 2.
+    let mut q_off = SearchQuery::new(token);
+    q_off.limit = Some(10);
+    q_off.offset = Some(1);
+    let offset_results = layer.search(&q_off).unwrap();
+
+    let offset_ids: Vec<u32> = offset_results.iter().map(|r| r.file_id.0).collect();
+
+    // The offset result must be exactly the all_ids slice from index 1 onward.
+    assert_eq!(
+        offset_ids,
+        all_ids[1..].to_vec(),
+        "AC#11: offset=1 must skip rank-1 file {}, got {offset_ids:?}; want {:?}",
+        all_ids[0], &all_ids[1..]
+    );
+
+    // PF-007: the rank-1 file must NOT appear in the offset result.
+    let rank1_id = all_ids[0];
+    assert!(
+        !offset_ids.contains(&rank1_id),
+        "AC#11: rank-1 file FileId({rank1_id}) must be skipped with offset=1"
+    );
+
+    // PF-007: offset result must be non-empty (2 remaining files).
+    assert_eq!(
+        offset_ids.len(), 2,
+        "AC#11: offset=1 over 3 results must leave 2 results; got {}",
+        offset_ids.len()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AC #16 / AD-372-6: Determinism of exact path result order
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AD-372-6 / AC #16: two consecutive `search()` calls for the same query
+/// must return identical file_id ordering (sorted by occurrence-count /
+/// token-density key, FileId tie-break for determinism).
+#[test]
+fn test_ac16_determinism_exact_path() {
+    let token = "deterministic_token";
+    // Build multiple files with varying occurrence counts.
+    let (_dir, layer) = build_index_with(&[
+        (FileId(0), &format!("{token} {token} {token} short"), rskim_core::Language::Rust),
+        (FileId(1), &format!("{token} medium length content here and more"), rskim_core::Language::Rust),
+        (FileId(2), &format!("{token} very long content with lots of other words to dilute density yyy zzz aaa bbb ccc ddd eee fff ggg hhh"), rskim_core::Language::Rust),
+    ]);
+
+    let mut q = SearchQuery::new(token);
+    q.limit = Some(50);
+
+    let r1 = layer.search(&q).unwrap();
+    let r2 = layer.search(&q).unwrap();
+
+    let ids1: Vec<u32> = r1.iter().map(|r| r.file_id.0).collect();
+    let ids2: Vec<u32> = r2.iter().map(|r| r.file_id.0).collect();
+
+    assert_eq!(
+        ids1, ids2,
+        "AC#16: consecutive identical queries must produce identical file_id ordering; \
+         got {ids1:?} vs {ids2:?}"
+    );
+
+    // PF-007 negative: must have at least 2 results (otherwise no ordering to check).
+    assert!(
+        ids1.len() >= 2,
+        "AC#16 setup: must return >= 2 results for a meaningful determinism check"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AC #6 (predicate): Punctuation-joined symbol (canonical code-search case)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AD-372-5 / AC predicate: punctuation-joined tokens like "foo::bar" contain
+/// no whitespace → `is_single_token` returns true → AND-intersection is used.
+/// Files containing only "foo" or only "bar" must be absent; files with the
+/// full "foo::bar" must be present.
+#[test]
+fn test_punctuation_joined_symbol_exact_intersection() {
+    use crate::ngram::is_single_token;
+
+    let token = "foo::bar";
+
+    // Verify predicate first.
+    assert!(
+        is_single_token(token),
+        "is_single_token('foo::bar') must be true (no whitespace)"
+    );
+
+    let (_dir, layer) = build_index_with(&[
+        (FileId(0), "let x = foo::bar::new();", rskim_core::Language::Rust), // full token
+        (FileId(1), "use foo::other_thing;", rskim_core::Language::Rust),    // "foo" but not "foo::bar"
+        (FileId(2), "fn bar() {}", rskim_core::Language::Rust),              // "bar" but not "foo::bar"
+        (FileId(3), "pub use foo::bar; // import", rskim_core::Language::Rust), // full token
+    ]);
+
+    let results = layer.search(&SearchQuery::new(token)).unwrap();
+    let ids: std::collections::HashSet<u32> = results.iter().map(|r| r.file_id.0).collect();
+
+    // Files 0 and 3 contain "foo::bar" → must be present.
+    assert!(ids.contains(&0), "FileId(0) contains 'foo::bar' and must be in results");
+    assert!(ids.contains(&3), "FileId(3) contains 'foo::bar' and must be in results");
+
+    // Files 1 and 2 contain only partial matches → must be absent.
+    assert!(
+        !ids.contains(&1),
+        "FileId(1) contains only 'foo' (not 'foo::bar') and must be absent from AND-intersection"
+    );
+    assert!(
+        !ids.contains(&2),
+        "FileId(2) contains only 'bar' (not 'foo::bar') and must be absent from AND-intersection"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AD-372-6: Bench-surface ranking — large-file definer within TOP_K
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AD-372-6 / PF-007: the raw occurrence-count ranking key (length-norm-free, NOT BM25F)
+/// must rank a large-file definer with 3 occurrences ABOVE small files with 1 occurrence.
+///
+/// This emulates the rskim-bench harness (`harness.rs:148-155`) which calls
+/// `reader.search(limit=Some(TOP_K))` WITHOUT a verify step — rank order alone
+/// determines which results are returned.
+///
+/// AD-372-6 ranking key = raw occurrence count (NOT BM25F, NOT occurrence/total_tokens).
+/// - BM25F: divides by field_len → large files are penalized → large-file definer buried.
+/// - occurrence/total_tokens: reintroduces length normalization (small files win on density).
+/// - Raw occurrence count (AD-372-6): a file with 3 occurrences ranks above 1 occurrence,
+///   regardless of file size.
+///
+/// The test MUST FAIL if the ranking reverts to BM25F or a density-divided key.
+///
+/// Discriminating (PF-007): we assert the large-file definer ranks #1 (3 occurrences)
+/// over small junk files (1 occurrence each).
+#[test]
+fn test_ac_bench_surface_ranking_large_definer_within_top_k() {
+    let token = "large_definer_fn";
+    const TOP_K: usize = 5;
+
+    // File 0 (LARGE definer): the unique token appears 3 times amid ~960 bytes of filler.
+    // Under BM25F this file would rank low because field_len is large.
+    // Under raw occurrence-count ranking (AD-372-6) it ranks #1 (3 > 1 for small files).
+    let filler = "filler_word ".repeat(80); // ~960 bytes
+    let large_definer = format!("{filler} {token} middle {token} end {token}");
+
+    // Files 1..=3 (small dense): each contains the token once in a tiny snippet.
+    let small1 = format!("fn {token}() {{ 42 }}");
+    let small2 = format!("pub use crate::{token};");
+    let small3 = format!("// {token} defined elsewhere");
+
+    let (_dir, reader) = build_reader_with(&[
+        (FileId(0), &large_definer, rskim_core::Language::Rust),
+        (FileId(1), &small1, rskim_core::Language::Rust),
+        (FileId(2), &small2, rskim_core::Language::Rust),
+        (FileId(3), &small3, rskim_core::Language::Rust),
+    ]);
+
+    // Emulate bench harness: limit=Some(TOP_K), NO verify step.
+    let mut q = SearchQuery::new(token);
+    q.limit = Some(TOP_K);
+    let results = reader.search(&q).unwrap();
+
+    let ids: Vec<u32> = results.iter().map(|r| r.file_id.0).collect();
+
+    // The large definer (3 occurrences) must rank #1.
+    // AD-372-6: raw occurrence count → 3 > 1 → FileId(0) ranks above FileIds(1,2,3).
+    // Under BM25F, FileId(0) would score lower than small files due to field_len division.
+    assert!(
+        ids.contains(&0),
+        "AD-372-6: large-file definer (FileId 0, 3 occurrences) must appear in TOP_K={TOP_K} \
+         results under the length-norm-free ranking key; got {ids:?}. \
+         If this fails, the ranking key reverted to BM25F (divides by field_len) — AD-372-6 violated."
+    );
+
+    // PF-007 negative: if a BM25F key (divides by field_len) were used, FileId(0)
+    // might be buried below the small files.  The assert above catches that.
+    // Additionally verify rank-1 is FileId(0) (highest occurrence count / density).
+    if !ids.is_empty() {
+        assert_eq!(
+            ids[0], 0,
+            "AD-372-6: FileId(0) with 3 occurrences must rank #1 under occurrence-count/density key; \
+             got rank-1 = FileId({}). BM25F would bury the large file — AD-372-6 prevents that.",
+            ids[0]
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AD-372-4: short_query_fallback no longer pre-truncates (AC #14)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AD-372-4 / AC #14: `short_query_fallback` returns the FULL filtered candidate set.
+/// Build > CANDIDATE_POOL_FLOOR files; verify that files with file_id >=
+/// CANDIDATE_POOL_FLOOR appear in the candidate set (no internal take).
+///
+/// PF-007: the test explicitly checks file IDs above the old internal cap.
+/// If the old `.take(limit)` with `limit=query.limit.unwrap_or(20)` were re-added,
+/// files with file_id >= 20 would disappear from the result, failing the assertion.
+#[test]
+fn test_ac14_short_query_fallback_returns_full_set() {
+    // Build 120 files, each containing "fn" (a 2-byte token → short_query_fallback).
+    let files: Vec<(FileId, String, rskim_core::Language)> = (0u32..120)
+        .map(|i| (FileId(i), format!("fn process_{i}() {{ }}", i = i), rskim_core::Language::Rust))
+        .collect();
+    let files_str: Vec<(FileId, &str, rskim_core::Language)> = files
+        .iter()
+        .map(|(id, s, l)| (*id, s.as_str(), *l))
+        .collect();
+
+    let (_dir, layer) = build_index_with(&files_str);
+
+    // "fn" → 2 bytes → short_query_fallback → full set returned.
+    // No limit set on the query: the fallback returns all 120 files.
+    let results = layer.search(&SearchQuery::new("fn")).unwrap();
+    let ids: std::collections::HashSet<u32> = results.iter().map(|r| r.file_id.0).collect();
+
+    // All 120 files must appear (no pre-truncation).
+    assert_eq!(
+        ids.len(), 120,
+        "AC#14 / AD-372-4: short_query_fallback must return all 120 files; \
+         got {} — the old .take(limit) pre-truncation was not removed",
+        ids.len()
+    );
+
+    // Specifically check files with file_id >= 100 (above the old CANDIDATE_POOL_FLOOR).
+    for i in 100u32..120 {
+        assert!(
+            ids.contains(&i),
+            "AC#14: FileId({i}) (>= CANDIDATE_POOL_FLOOR=100) must appear in short_query_fallback; \
+             missing — old .take(limit) truncation still active (AD-372-4)"
+        );
+    }
+
+    // PF-007 negative: if ANY of the 120 files is missing, the assertion above fires.
+    // If the test is vacuous (no files contain "fn"), the ids.len()==120 check fires.
 }

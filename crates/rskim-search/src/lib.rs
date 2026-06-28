@@ -110,7 +110,7 @@ pub use lexical::{
 };
 pub use ngram::{
     BORDER_MULTIPLIER, Ngram, extract_ngrams, extract_ngrams_with_weights, extract_query_ngrams,
-    extract_query_ngrams_with_weights,
+    extract_query_ngrams_with_weights, is_single_token,
 };
 pub use temporal::storage::{
     CochangeRow, HotspotRow, META_GIT_HEAD, META_LAST_UPDATED, MIN_COCHANGE_JACCARD, RiskRow,

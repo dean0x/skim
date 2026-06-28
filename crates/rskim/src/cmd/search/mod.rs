@@ -732,6 +732,7 @@ fn run_query(
     let config = types::QueryConfig {
         text: text.to_string(),
         limit: query_limit,
+        offset: None, // AD-372-3: offset not yet wired to CLI flags; None = no pagination
         json: flags.json,
         root,
         cache_dir,

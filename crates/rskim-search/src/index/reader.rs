@@ -33,7 +33,7 @@ use super::format::{
 use crate::{
     FileId, IndexStats, Result, SearchError, SearchField, SearchLayer, SearchQuery, SearchResult,
     lexical::{BM25FConfig, FIELD_COUNT, bm25f_score, dominant_field},
-    ngram::extract_query_ngrams,
+    ngram::{Ngram, extract_query_ngrams, is_single_token},
 };
 
 // ============================================================================
@@ -232,23 +232,40 @@ impl NgramIndexReader {
         decode_file_meta(&self.idx_mmap[offset..end])
     }
 
-    /// AD-355-7 short-query fallback: emit all indexed files as score-0 candidates.
+    /// AD-355-7 / AD-372-4 short-query fallback: emit ALL indexed files as
+    /// score-0 candidates (no internal truncation).
     ///
     /// Called when `extract_query_ngrams` returns an empty set (queries shorter
-    /// than 3 bytes).  Respects `file_filter` (blast-radius allowlist) and
-    /// `lang_filter` (`--lang` constraint) so the two dispatch paths are
-    /// consistent (PF-006: never silently drop a documented flag on a sub-path).
+    /// than 3 bytes, e.g. `"fn"`, `"if"`).  Respects `file_filter`
+    /// (blast-radius allowlist) and `lang_filter` (`--lang` constraint) so the
+    /// two dispatch paths are consistent (PF-006: never silently drop a
+    /// documented flag on a sub-path).
     ///
-    /// Returns candidates in file-id/insertion order; verification in the caller
-    /// (e.g. `resolve_paths_and_snippets_verified`) is the only correctness gate.
-    /// See the `SearchLayer::search` contract in `types.rs` for details.
+    /// # AD-372-4: Full filtered set, no internal pre-truncation
+    ///
+    /// The previous implementation applied `.skip(offset).take(limit)` **before**
+    /// the caller's verification step, causing files with `file_id >= pool_limit`
+    /// to be silently dropped even when they contained the query token.  This
+    /// violated the AD-355-2 verify-then-truncate-LAST invariant.
+    ///
+    /// This method now returns the **complete** filtered candidate set (all files
+    /// that pass `file_filter` + `lang_filter`).  The caller
+    /// (`resolve_paths_and_snippets_verified`) is the **only** truncation gate —
+    /// it applies offset and limit AFTER verification (ADR-001).
+    ///
+    /// Performance note: this incurs O(file_count) file reads on the verify pass.
+    /// A concrete measured SLA (AC #15a) bounds this: `"fn"` over 5,000 indexed
+    /// files must complete within 2,000 ms wall-clock (release profile).  If
+    /// measurement shows a problem on larger corpora, a K-cap on verify fan-out
+    /// is the documented follow-up (not part of #372).
+    ///
+    /// Security: no injection, no path traversal; only the user's own indexed
+    /// files (bounded by `file_filter`) are returned as score-0 candidates.
     fn short_query_fallback(
         &self,
         query: &SearchQuery,
         lang_filter: Option<u8>,
     ) -> Vec<SearchResult> {
-        let limit = query.limit.unwrap_or(20);
-        let offset = query.offset.unwrap_or(0);
         let file_count = self.header.file_count as usize;
 
         (0..file_count)
@@ -270,8 +287,8 @@ impl NgramIndexReader {
                 }
                 true
             })
-            .skip(offset)
-            .take(limit)
+            // AD-372-4: NO .skip/.take here — the full filtered set is returned.
+            // Offset + limit are applied by the caller AFTER verification.
             .map(|doc_id| SearchResult {
                 file_id: FileId(doc_id as u32),
                 score: 0.0,
@@ -371,6 +388,263 @@ impl NgramIndexReader {
         }
     }
 
+    /// AND-intersection of posting lists: returns the sorted, deduplicated set of
+    /// `doc_id`s that appear in **every** query trigram's posting list.
+    ///
+    /// # AD-372-2: Smallest-posting-list-first galloping intersection
+    ///
+    /// Intersection is computed by sorting the per-trigram doc_id sets by length
+    /// (ascending) and then sweeping the smallest set against each larger set in
+    /// turn.  Only doc_ids present in every set survive.  Bound: `O(min_list_len
+    /// × n_trigrams)` — bounded by the smallest posting list length regardless of
+    /// corpus size.  No allocation per candidate beyond the `Vec` result.
+    ///
+    /// The superset invariant (correctness guarantee): a file that contains the
+    /// literal query token contains all of the token's contiguous trigrams.
+    /// Therefore the AND-intersection of the query's trigram posting lists is a
+    /// **superset** of the verified result set — every verified file is in the
+    /// intersection, never dropped by the intersection.
+    ///
+    /// # Deduplication
+    ///
+    /// `decode_postings_varint` returns one `PostingEntry` per
+    /// `(doc_id, field_id, position)` tuple.  A single document can appear many
+    /// times in one posting list (once per occurrence).  Each list is first reduced
+    /// to its sorted-unique `doc_id` set in a single linear pass (adjacent-distinct,
+    /// because posting lists are already `doc_id`-major sorted).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(SearchError::IndexCorrupted)` if any posting list fails to decode.
+    fn intersect_posting_doc_ids(&self, ngrams: &[(Ngram, f32)]) -> Result<Vec<u32>> {
+        if ngrams.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build per-trigram sorted-unique doc_id sets.
+        // Posting lists are already doc_id-major sorted; one linear pass suffices
+        // for adjacent-dedup.
+        let mut per_ngram_doc_ids: Vec<Vec<u32>> = Vec::with_capacity(ngrams.len());
+        for (ngram, _weight) in ngrams {
+            let postings = self.lookup_postings(ngram.key())?;
+            let mut doc_ids: Vec<u32> = Vec::with_capacity(postings.len());
+            let mut last: Option<u32> = None;
+            for p in &postings {
+                if last != Some(p.doc_id) {
+                    doc_ids.push(p.doc_id);
+                    last = Some(p.doc_id);
+                }
+            }
+            // If any trigram has an empty posting list, the intersection is empty.
+            if doc_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            per_ngram_doc_ids.push(doc_ids);
+        }
+
+        // Sort by list length ascending so we sweep the smallest set first
+        // (AD-372-2: smallest-posting-list-first for minimum work).
+        per_ngram_doc_ids.sort_unstable_by_key(|v| v.len());
+
+        // Start with the smallest set, then intersect with each remaining set.
+        let mut intersection: Vec<u32> = per_ngram_doc_ids[0].clone();
+
+        for other in &per_ngram_doc_ids[1..] {
+            // Linear merge of two sorted slices — O(n + m) per pair.
+            let mut result: Vec<u32> = Vec::new();
+            let mut i = 0usize;
+            let mut j = 0usize;
+            while i < intersection.len() && j < other.len() {
+                match intersection[i].cmp(&other[j]) {
+                    std::cmp::Ordering::Equal => {
+                        result.push(intersection[i]);
+                        i += 1;
+                        j += 1;
+                    }
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                }
+            }
+            intersection = result;
+            if intersection.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+
+        Ok(intersection)
+    }
+
+    /// Exact-symbol search: AND-intersection of query trigram posting lists,
+    /// followed by occurrence-count / token-density ranking (length-norm-free).
+    ///
+    /// # AD-372-1: Query-shape dispatch — exact-symbol mode
+    ///
+    /// This method is called when `is_single_token(query.text)` is `true` and
+    /// `extract_query_ngrams` produced a non-empty set.  It generates candidates
+    /// via AND-intersection (grep-exact, limit/size-independent), then ranks by
+    /// an occurrence-count / token-density key (AD-372-6) so large-file definers
+    /// are not buried by BM25F length-normalization.
+    ///
+    /// The intersection is returned in its entirety (no `take` before verify):
+    /// the caller (`resolve_paths_and_snippets_verified`) is the only truncation
+    /// gate (AD-355-2).  When `query.limit` is `Some(n)`, offset+limit are
+    /// applied AFTER ranking.
+    ///
+    /// # Correctness invariant (AD-372-2)
+    ///
+    /// A file that contains the literal query token contains every contiguous
+    /// trigram of that token.  Therefore the AND-intersection of the query's
+    /// trigram posting lists is a **superset** of the verified result set: every
+    /// verified file is in the intersection; no true match can be dropped.
+    ///
+    /// # match_positions (RESOLVED Decision 2: ALL intersected trigrams)
+    ///
+    /// Positions are collected from **all** intersected trigrams for each
+    /// surviving document (not just the highest-weight trigram).  This preserves
+    /// byte-identical snippet behavior relative to the UNION path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(SearchError::IndexCorrupted)` if any posting list fails to
+    /// decode.
+    fn search_exact_intersection(
+        &self,
+        query: &SearchQuery,
+        ngrams: &[(Ngram, f32)],
+        lang_filter: Option<u8>,
+    ) -> Result<Vec<SearchResult>> {
+        // Step 1: AND-intersection of posting lists → surviving doc_ids.
+        let intersected_ids = self.intersect_posting_doc_ids(ngrams)?;
+        if intersected_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Step 2: For each surviving doc_id, gather occurrence count (for
+        // ranking) and match positions (for snippets) from ALL intersected
+        // trigrams.  Also apply lang_filter and file_filter.
+        //
+        // Build a lookup set of surviving doc_ids for O(1) membership tests.
+        let id_set: std::collections::HashSet<u32> = intersected_ids.iter().copied().collect();
+
+        // Per-doc occurrence count (sum of TFs across all query trigrams).
+        let mut doc_occurrence_count: HashMap<u32, usize> = HashMap::new();
+        let mut doc_positions: HashMap<u32, Vec<std::ops::Range<usize>>> = HashMap::new();
+        let mut doc_meta_cache: HashMap<u32, FileMetaEntry> = HashMap::new();
+        let mut doc_field: HashMap<u32, [f32; FIELD_COUNT]> = HashMap::new();
+
+        for (ngram, _weight) in ngrams {
+            let postings = self.lookup_postings(ngram.key())?;
+            for p in &postings {
+                if !id_set.contains(&p.doc_id) {
+                    continue; // not in intersection
+                }
+                // Apply file_filter (blast-radius allowlist) if set.
+                if let Some(ref f) = query.file_filter
+                    && !f.contains(&FileId(p.doc_id))
+                {
+                    continue;
+                }
+                // Resolve and cache file metadata; apply lang_filter.
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    doc_meta_cache.entry(p.doc_id)
+                {
+                    let meta = self.file_meta_at(p.doc_id)?;
+                    e.insert(meta);
+                }
+                let meta = &doc_meta_cache[&p.doc_id];
+                if lang_filter.is_some_and(|required| meta.lang_id != required) {
+                    continue;
+                }
+
+                // Accumulate occurrence count (TF) across all query trigrams.
+                *doc_occurrence_count.entry(p.doc_id).or_default() += 1;
+
+                // Collect positions from ALL intersected trigrams (RESOLVED
+                // Decision 2) so snippets are byte-identical to the UNION path.
+                let pos = p.position as usize;
+                doc_positions
+                    .entry(p.doc_id)
+                    .or_default()
+                    .push(pos..pos + 3);
+
+                // Accumulate field TF for dominant-field determination.
+                let field_idx = p.field_id as usize;
+                if field_idx < FIELD_COUNT {
+                    doc_field.entry(p.doc_id).or_insert([0.0; FIELD_COUNT])[field_idx] += 1.0;
+                }
+            }
+        }
+
+        // Step 3: Build ranked result list.
+        //
+        // AD-372-6: Ranking key = raw occurrence_count (length-norm-free, NOT BM25F).
+        //
+        // BM25F divides TF by field_length, which buried large-file definers
+        // (the root bug: a file with 3 occurrences of "UserService" in a 500-line
+        // module scored LOWER than a tiny stub with 1 occurrence because BM25F's
+        // field-length normalization term divided by the large module's byte count).
+        //
+        // The fix: use the raw occurrence count directly.  A file with 10 occurrences
+        // of the token ranks higher than a file with 1 occurrence regardless of file
+        // size.  This is "length-norm-free" in the sense that large files are not
+        // penalized for being large — only raw occurrence frequency matters.
+        //
+        // Why NOT occurrence/total_tokens?  That would reintroduce a density bias
+        // that penalizes long files (a file with 3/83 = 0.036 density ranks BELOW
+        // a tiny file with 1/5 = 0.20 density), recreating the length-normalization
+        // problem we are eliminating.  Raw count is the correct signal.
+        //
+        // Tie-break: ascending FileId for determinism (mirrors collect_scored_results).
+        //
+        // Note: docs that were excluded by file_filter or lang_filter above will
+        // have no entry in doc_occurrence_count and are omitted here.
+        let mut scored: Vec<(u32, f64)> = doc_occurrence_count
+            .into_iter()
+            .map(|(doc_id, occ)| {
+                // AD-372-6: length-norm-free ranking key = raw occurrence count.
+                // Do NOT divide by total_tokens — that reintroduces length normalization
+                // and would penalize large files with many occurrences relative to tiny
+                // files with a single dense occurrence (recreating the root bug).
+                let score = occ as f64;
+                (doc_id, score)
+            })
+            .collect();
+
+        // Sort: descending score, ascending FileId for tie-break (determinism).
+        scored.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        // Step 4: Apply offset + limit LAST (AD-355-2 / AD-372-3).
+        // When query.limit is None the full intersection is returned to the caller,
+        // which applies its own truncation after verification.
+        let offset = query.offset.unwrap_or(0);
+        let ranked: Box<dyn Iterator<Item = (u32, f64)>> = if let Some(lim) = query.limit {
+            Box::new(scored.into_iter().skip(offset).take(lim))
+        } else {
+            Box::new(scored.into_iter().skip(offset))
+        };
+
+        let results: Vec<SearchResult> = ranked
+            .map(|(doc_id, score)| {
+                let positions = doc_positions.remove(&doc_id).unwrap_or_default();
+                let field = doc_field.get(&doc_id).map(dominant_field).unwrap_or(SearchField::Other);
+                SearchResult {
+                    file_id: FileId(doc_id),
+                    score,
+                    line_range: 0..0,
+                    match_positions: positions,
+                    field,
+                    snippet: None,
+                }
+            })
+            .collect();
+
+        Ok(results)
+    }
+
     /// Final phase of scoring: apply defense-in-depth file_filter, sort by score,
     /// apply offset/limit, and assemble [`SearchResult`] values.
     ///
@@ -465,20 +739,49 @@ impl NgramIndexReader {
 // ============================================================================
 
 impl SearchLayer for NgramIndexReader {
-    /// Execute a BM25F-scored n-gram search.
+    /// Execute a scored n-gram search, dispatching on query shape.
     ///
-    /// # Algorithm
+    /// # AD-372-1: Two-mode dispatch
     ///
-    /// 1. Extract query trigrams via [`extract_query_ngrams`] (sorted by weight desc).
-    /// 2. For each trigram, retrieve its posting list.
-    /// 3. Accumulate per-document, per-field term frequencies and match positions.
-    /// 4. Apply language filter if `query.lang` is set.
-    /// 5. Score each document with BM25F using per-field TF, field lengths, and
-    ///    average field lengths from the header.
-    /// 6. Sort descending by score with [`FileId`] tie-breaking for determinism.
-    /// 7. Apply offset/limit (default: 0/20).
-    /// 8. Return [`SearchResult`] values with `field` from [`dominant_field`],
-    ///    `line_range: 0..0`, and `snippet: None` (deferred to a later wave).
+    /// The branch order is:
+    ///
+    /// 1. **Empty query guard** — return immediately with an empty result.
+    /// 2. **Extract query trigrams** — if the set is empty (query < 3 bytes),
+    ///    route to `short_query_fallback` (AD-355-7 / AD-372-4).
+    /// 3. **`is_single_token` branch** — a single contiguous token (≥ 3 bytes,
+    ///    no interior whitespace) routes to `search_exact_intersection`, which
+    ///    generates candidates via AND-intersection (grep-exact, limit/size-
+    ///    independent) and ranks by an occurrence-count / token-density key
+    ///    (AD-372-6, length-norm-free).
+    /// 4. **Multi-word / default** — the existing BM25F UNION loop; untouched.
+    ///
+    /// The `is_single_token` check is placed AFTER the `ngrams.is_empty()` guard
+    /// so that a 1-2 byte token (e.g. `"fn"`) always enters the short-query
+    /// fallback regardless of what `is_single_token` would say about the trimmed
+    /// form.  This ensures a 1-2 byte single token never enters the intersection
+    /// path with zero trigrams.
+    ///
+    /// # Short-query semantics (AD-355-7 / AD-372-4)
+    ///
+    /// `short_query_fallback` now returns the **full** filtered candidate set (no
+    /// internal `.take`); the caller's verify-then-truncate-LAST step is the only
+    /// gate (ADR-001).
+    ///
+    /// # Exact-symbol semantics (AD-372-1 / AD-372-6)
+    ///
+    /// `search_exact_intersection` applies offset + limit after ranking —
+    /// callers on the pure-lexical path must set `sq.limit = None` so the
+    /// complete intersection is forwarded to `resolve_paths_and_snippets_verified`
+    /// (AD-372-3).
+    ///
+    /// # Multi-word / UNION semantics (unchanged)
+    ///
+    /// The BM25F UNION loop is byte-identical to the pre-#372 implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::IndexCorrupted`] if any posting list fails to
+    /// decode.
     fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>> {
         if query.text.is_empty() {
             return Ok(Vec::new());
@@ -486,54 +789,47 @@ impl SearchLayer for NgramIndexReader {
 
         let ngrams = extract_query_ngrams(&query.text);
 
-        // Language filter resolved up-front so it is available to BOTH the normal
-        // scored path AND the AD-355-7 short-query fallback below.
-        // Fix (F15): previously resolved after the `ngrams.is_empty()` guard, so the
-        // fallback silently ignored `query.lang` — `skim search "fn" --lang python`
-        // would emit non-Python score-0 candidates.  Moving the resolution here
-        // ensures both paths honour the language constraint (PF-006: never make a
-        // documented flag silently inert on a dispatch sub-path).
+        // Language filter resolved up-front so it is available to ALL dispatch
+        // paths (short-query fallback, exact-intersection, and UNION loop).
+        // Fix (F15): previously resolved after the `ngrams.is_empty()` guard,
+        // so the fallback silently ignored `query.lang`.  Moving resolution here
+        // ensures all paths honour the language constraint (PF-006).
         let lang_filter: Option<u8> = query.lang.map(super::format::lang_to_id);
 
-        // AD-355-7: Short-query fallback.
+        // AD-355-7 / AD-372-4: Short-query fallback.
         //
-        // Trigram extraction requires ≥3 bytes per token; single- and double-byte
-        // tokens (e.g. "fn", "if") produce zero trigrams.  In this case the ngram
-        // index cannot generate candidates, but the query is still meaningful.
+        // Trigram extraction requires ≥3 bytes; single- and double-byte tokens
+        // produce zero trigrams.  Emit ALL indexed files (filtered by
+        // file_filter + lang_filter) as score-0 candidates so the caller's
+        // verify step can apply a literal substring filter.
         //
-        // Rather than returning empty results, we emit indexed files as score-0
-        // candidates so that the caller's verify step can apply a literal substring
-        // filter and return only files that actually contain the query string.
-        //
-        // SRP note (AD-355-7): the returned score-0 candidates are meaningful ONLY
-        // if the caller applies a verification step.  The `NgramIndexReader` has no
-        // access to file content — it is a pure index reader.  Any consumer of this
-        // trait that trusts the short-query result list without verification will
-        // surface arbitrary non-matching files.  The verify-then-truncate obligation
-        // is documented in the `SearchLayer::search` contract (types.rs).
-        //
-        // Candidate bound — callers are expected to set `sq.limit = Some(N)`:
-        //   Unset (None): `unwrap_or(20)` default.
-        //   Pure-lexical: `Some(max(config.limit * LEXICAL_CANDIDATE_POOL_K, 100))` (query.rs).
-        //   Compound:     `Some(filter_set.len().max(1))` (AD-356-2, query.rs #356).
-        //                 (`filter_set` is `blast ∩ ast` on the blast+AST sub-path,
-        //                  or the full AST set on the no-blast sub-path — it may be
-        //                  strictly smaller than the raw AST set.)
-        //   Blast-radius: `Some(max(config.limit * BLAST_CANDIDATE_POOL_K, 100))` (K=10).
-        //
-        // NOTE: candidates are selected in raw file-id/insertion order BEFORE the
-        // verify step runs.  This deviates from the AD-355-2 verify-then-truncate-LAST
-        // invariant: a file that contains the short query but has file_id >= pool_limit
-        // will be silently missed.  For the compound path this is mitigated by the
-        // file_filter restricting scoring to the AST set (AD-356-1); for other paths
-        // this remains an accepted trade-off (pool-K calibration tracked in #361).
-        //
-        // Security: no injection, no path traversal; only the user's own indexed
-        // files (bounded to sq.limit / file_filter) are returned as score-0 candidates.
+        // AD-372-4: the returned set has NO internal pre-truncation.
+        // Offset + limit are applied by the caller AFTER verification.
+        // Callers must not set `sq.limit` on this path — they will get the
+        // full filtered set regardless.
         if ngrams.is_empty() {
             return Ok(self.short_query_fallback(query, lang_filter));
         }
 
+        // AD-372-1: single-token exact-symbol mode.
+        //
+        // A single contiguous token (≥3 bytes, no interior whitespace) enters
+        // the AND-intersection path.  The intersection is grep-exact and
+        // limit/size-independent: every verified file is guaranteed to be in
+        // the candidate set (superset invariant, AD-372-2).  Ranked by
+        // occurrence-count / token-density (length-norm-free, AD-372-6) so
+        // large-file definers are not buried by BM25F field-length normalization.
+        //
+        // This check is placed AFTER `ngrams.is_empty()` (above) so that a
+        // 1-2 byte token always enters the short-query fallback regardless of
+        // `is_single_token`'s answer.  A 1-byte query like "a" has
+        // is_single_token=false (< 3 bytes), so this guard is redundant for
+        // that case, but the ordering makes the invariant explicit.
+        if is_single_token(&query.text) {
+            return self.search_exact_intersection(query, &ngrams, lang_filter);
+        }
+
+        // Multi-word / default: BM25F UNION path (unchanged from pre-#372).
         // Resolve scoring config: per-query override takes priority.
         // Validate at the trust boundary so invalid params are rejected early.
         let scoring_config: &BM25FConfig = match &query.bm25f_config {
