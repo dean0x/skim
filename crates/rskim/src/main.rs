@@ -691,6 +691,59 @@ fn strip_skim_wrappers_from_path() {
     }
 }
 
+// ============================================================================
+// D2b (#370): stdout-is-regular-file predicate for wrapper passthrough
+// ============================================================================
+
+/// Testable seam: return `true` when the `io::Result<Metadata>` describes a
+/// regular file. Used by [`stdout_is_regular_file`] so the check can be unit-
+/// tested with synthetic metadata without touching real file descriptors.
+#[cfg(unix)]
+fn is_regular_file_stdout(meta: std::io::Result<std::fs::Metadata>) -> bool {
+    meta.map(|m| m.is_file()).unwrap_or(false)
+}
+
+/// Return `true` when the process's stdout (fd 1) is a regular file.
+///
+/// When a PATH-wrapper invocation is `~/.skim/bin/gh api … > out.json`, the
+/// shell sets fd 1 → the file BEFORE exec-ing the wrapper. No `>` appears in
+/// argv, so the rewrite-engine guard (D2-A) cannot catch it. Detecting the fd
+/// directly and running the real tool with inherited stdio ensures raw bytes
+/// reach the file unmodified (#370, #317). Pipes/ttys are not regular files
+/// and fall through to normal compression (skim's core use case).
+///
+/// **Shared invariant (cross-surface):** "stdout redirected to a regular file
+/// must receive the tool's raw bytes, never a skim summary." This invariant is
+/// enforced by two independent mechanisms — one per interception surface —
+/// because each surface observes the redirect at a different stage:
+/// - **Wrapper surface (here, runtime):** `fstat(fd 1)` after the shell has
+///   already consumed `>` and opened the file; no `>` token remains in argv.
+/// - **Rewrite surface (static):** `stdout_redirected_to_file` in
+///   `cmd/rewrite/compound.rs` — syntactic `>` scan before the command runs.
+///
+/// Keep the two detectors in lockstep. If you widen or narrow the detection
+/// semantics here, audit `stdout_redirected_to_file` for the same forms
+/// (`>f`, `>>f`, `1>f`, `&>f`, `&>>f`).
+///
+/// Non-Unix: always returns `false` (compression proceeds normally).
+#[cfg(unix)]
+fn stdout_is_regular_file() -> bool {
+    use std::mem::ManuallyDrop;
+    use std::os::unix::io::FromRawFd;
+    // Borrow fd 1 via a ManuallyDrop wrapper so the destructor never closes it.
+    // SAFETY: ManuallyDrop suppresses File's Drop, so fd 1 is never closed
+    // (no double-close). If fd 1 is invalid (e.g. the process was started with
+    // stdout closed), f.metadata() returns Err; is_regular_file_stdout falls
+    // back to false and normal compression proceeds.
+    let f = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+    is_regular_file_stdout(f.metadata())
+}
+
+#[cfg(not(unix))]
+fn stdout_is_regular_file() -> bool {
+    false
+}
+
 fn main() -> ExitCode {
     // Strip ~/.skim/bin from PATH FIRST — before any thread is spawned.
     // This prevents infinite recursion when invoked as a symlink (PF-003).
@@ -739,7 +792,20 @@ fn main() -> ExitCode {
     // parsing and route directly to the appropriate handler. PATH stripping
     // above ensures the handler won't find the symlink again (no recursion).
     let result: anyhow::Result<ExitCode> = if let Some((name, args)) = detect_argv0_dispatch() {
-        cmd::dispatch(&name, &args, &analytics)
+        // D2b (#370): when stdout is a regular file the shell has already
+        // redirected fd 1 to the file before exec-ing us. Run the real tool
+        // with inherited stdio so its raw bytes reach the file unmodified (#317).
+        // Pipes/ttys are not regular files → still compress (normal path).
+        // Guard is scoped to this wrapper-dispatch branch only. The Subcommand
+        // and FileOperation branches below are intentionally NOT guarded:
+        // `skim file.ts > out.txt` and `skim grep … > out.txt` are explicit skim
+        // invocations where the user wants skim's output saved — hoisting this
+        // guard above detect_argv0_dispatch() would break that workflow.
+        if stdout_is_regular_file() {
+            Ok(cmd::run_inherited_passthrough(&name, &args))
+        } else {
+            cmd::dispatch(&name, &args, &analytics)
+        }
     } else {
         match resolve_invocation() {
             Invocation::FileOperation => run_file_operation(&analytics).map(|()| ExitCode::SUCCESS),
@@ -965,6 +1031,43 @@ fn record_file_analytics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // D2b (#370): is_regular_file_stdout unit tests
+    // ========================================================================
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_regular_file_stdout_true_for_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let meta = tmp.as_file().metadata();
+        assert!(
+            is_regular_file_stdout(meta),
+            "metadata from a regular file must return true"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_regular_file_stdout_false_for_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = std::fs::metadata(tmp.path());
+        assert!(
+            !is_regular_file_stdout(meta),
+            "metadata from a directory must return false"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_regular_file_stdout_false_for_err() {
+        let meta: std::io::Result<std::fs::Metadata> =
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(
+            !is_regular_file_stdout(meta),
+            "Err metadata must return false (defensive)"
+        );
+    }
 
     // ========================================================================
     // validate_bounded_arg unit tests (B3)

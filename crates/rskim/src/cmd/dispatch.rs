@@ -171,9 +171,10 @@ pub(crate) fn spawn_status_to_code(status: std::io::Result<std::process::ExitSta
 /// Run a daemon or streaming command with fully inherited stdio.
 ///
 /// Used for commands detected by [`rewrite::indefinite::is_indefinite_command`]
-/// in the direct / PATH-wrapper dispatch path. Unlike [`run_raw_passthrough`]
-/// (which captures stdout/stderr and re-prints them), this helper lets the child
-/// share the parent's file descriptors directly:
+/// in the direct / PATH-wrapper dispatch path, and for the D2b stdout-to-file
+/// passthrough guard in the argv[0] wrapper branch (#370). Unlike
+/// [`run_raw_passthrough`] (which captures stdout/stderr and re-prints them),
+/// this helper lets the child share the parent's file descriptors directly:
 ///
 /// - **stdin** is inherited — interactive prompts and `Ctrl-C` work.
 /// - **stdout / stderr** are inherited — live output streams to the terminal.
@@ -209,7 +210,7 @@ pub(crate) fn spawn_status_to_code(status: std::io::Result<std::process::ExitSta
 ///
 /// Diagnostics live here in the caller; the pure mapping is in
 /// [`spawn_status_to_code`], which is unit-tested independently.
-fn run_inherited_passthrough(program: &str, args: &[String]) -> ExitCode {
+pub(crate) fn run_inherited_passthrough(program: &str, args: &[String]) -> ExitCode {
     let result = Command::new(program).args(args).status();
     if let Err(ref e) = result {
         if e.kind() == std::io::ErrorKind::NotFound {

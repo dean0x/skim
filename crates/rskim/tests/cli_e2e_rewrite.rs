@@ -2830,9 +2830,12 @@ fn test_hook_redirect_reorder_hazard_is_never_rewritten() {
         .stdout(predicate::str::is_empty());
 }
 
-/// Safe redirect order (`>log 2>&1`) still rewrites — append preserves it.
+/// D2 (#370): `cargo test >log.txt 2>&1` redirects stdout to a file — the
+/// hook must bail (success + empty stdout) so skim does not interpose.
+/// Mirrors `test_hook_redirect_reorder_hazard_is_never_rewritten` above.
+/// Hook bail contract: `.success()` + `stdout(is_empty())`.
 #[test]
-fn test_hook_safe_redirect_order_still_rewrites() {
+fn test_hook_stdout_redirect_bails() {
     let input = serde_json::json!({
         "tool_input": {
             "command": "cargo test >log.txt 2>&1"
@@ -2843,7 +2846,52 @@ fn test_hook_safe_redirect_order_still_rewrites() {
         .write_stdin(serde_json::to_string(&input).unwrap())
         .assert()
         .success()
-        .stdout(predicate::str::contains(">log.txt 2>&1"));
+        .stdout(predicate::str::is_empty());
+}
+
+// ============================================================================
+// D2 (#370) — hook-surface bail: newly-fixed false-negative cases
+//
+// Hook bail contract: .success() + empty stdout (avoids PF-004).
+// CLI bail equivalents in cli_rewrite.rs.
+// Wrapper surface coverage in cli_wrapper_argv0.rs.
+// ============================================================================
+
+/// D2 (#370) false-negative fix 1b hook path: `>&2x` is a redirect to file
+/// `2x` (not an fd-dup — only `>&<all-digits>` and `>&-` qualify).
+/// Hook bail contract: `.success()` + empty stdout (avoids PF-004).
+#[test]
+fn test_hook_redirect_fd2x_bails() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "cmd >&2x"
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// D2 (#370) false-negative fix 1a hook path: a backslash-escaped single
+/// quote (`\'`) outside quotes must not open a quoting context; the `>`
+/// between two `\'` markers is a real stdout redirect that must bail.
+/// Hook bail contract: `.success()` + empty stdout (avoids PF-004).
+#[test]
+fn test_hook_redirect_backslash_desync_bails() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "grep x\\' file > out z\\'z"
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
 }
 
 // ============================================================================

@@ -193,6 +193,12 @@ pub(super) fn try_parse_file_line_content(
 /// elision footer. `shown_count == total_count` so the canonical header
 /// renders as `tool N` (no truncation ratio; Fix F). (#317)
 ///
+/// The file count is folded into the FOOTER instead of a prepended
+/// `TOOL: N matches in M files` double-header (the no-double-header pattern
+/// from ls FIX 5). Pluralization ("1 file" / "3 files") follows the
+/// `diff.rs` footer idiom — ls/tree intentionally do not pluralize their
+/// `N dirs, M files` breakdown. (#370, #317)
+///
 /// `tool` — binary name (e.g. `"grep"`, `"rg"`).
 /// `total_matches` — total match count across all files.
 /// `file_matches` — map from file path to formatted match lines.
@@ -209,23 +215,28 @@ pub(super) fn build_file_result(
         return None;
     }
 
-    let summary = format!(
-        "{}: {total_matches} matches in {file_count} files",
-        tool.to_uppercase()
-    );
-    let mut all_entries = vec![summary];
+    // No summary prepend — the `tool N` canonical header renders separately.
+    // Fold the file count into the footer with correct pluralization. (#370)
+    let mut all_entries: Vec<String> = Vec::new();
     for (file, matches) in &file_matches {
         all_entries.push(file.clone());
         all_entries.extend(matches.iter().cloned());
     }
     all_entries.extend(extra_entries);
 
+    let footer = (file_count > 0).then(|| {
+        format!(
+            "{file_count} file{}",
+            if file_count == 1 { "" } else { "s" }
+        )
+    });
+
     Some(FileResult::new(
         tool.to_string(),
         total_matches,
         total_matches,
         all_entries,
-        None,
+        footer,
     ))
 }
 
