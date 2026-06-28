@@ -598,16 +598,10 @@ impl NgramIndexReader {
         //
         // Note: docs that were excluded by file_filter or lang_filter above will
         // have no entry in doc_occurrence_count and are omitted here.
+        // AD-372-6: length-norm-free ranking key = raw occurrence count.
         let mut scored: Vec<(u32, f64)> = doc_occurrence_count
             .into_iter()
-            .map(|(doc_id, occ)| {
-                // AD-372-6: length-norm-free ranking key = raw occurrence count.
-                // Do NOT divide by total_tokens — that reintroduces length normalization
-                // and would penalize large files with many occurrences relative to tiny
-                // files with a single dense occurrence (recreating the root bug).
-                let score = occ as f64;
-                (doc_id, score)
-            })
+            .map(|(doc_id, occ)| (doc_id, occ as f64))
             .collect();
 
         // Sort: descending score, ascending FileId for tie-break (determinism).
@@ -621,13 +615,12 @@ impl NgramIndexReader {
         // When query.limit is None the full intersection is returned to the caller,
         // which applies its own truncation after verification.
         let offset = query.offset.unwrap_or(0);
-        let ranked: Box<dyn Iterator<Item = (u32, f64)>> = if let Some(lim) = query.limit {
-            Box::new(scored.into_iter().skip(offset).take(lim))
-        } else {
-            Box::new(scored.into_iter().skip(offset))
-        };
+        let limit = query.limit.unwrap_or(usize::MAX);
 
-        let results: Vec<SearchResult> = ranked
+        let results: Vec<SearchResult> = scored
+            .into_iter()
+            .skip(offset)
+            .take(limit)
             .map(|(doc_id, score)| {
                 let positions = doc_positions.remove(&doc_id).unwrap_or_default();
                 let field = doc_field.get(&doc_id).map(dominant_field).unwrap_or(SearchField::Other);

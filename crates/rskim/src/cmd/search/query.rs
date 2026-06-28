@@ -253,8 +253,9 @@ pub(super) fn execute_query_with_manifest(
     // output elision/cap under #317 "compress-never-truncate".  No
     // `elision_marker` is needed.
     const LEXICAL_CANDIDATE_POOL_K: usize = 5;
+    let exact_symbol = is_single_token(&config.text);
 
-    let raw_results = if is_single_token(&config.text) {
+    let raw_results = if exact_symbol {
         // AD-372-3: exact-symbol mode — no K-pool widening; reader returns the
         // full intersection ordered by occurrence-count density (AD-372-6).
         // sq.limit = None so the reader forwards the entire ranked intersection
@@ -277,7 +278,7 @@ pub(super) fn execute_query_with_manifest(
     // For the exact-symbol path the reader already applied offset; for the UNION
     // path offset is applied here by passing it to resolve_paths_and_snippets_verified.
     // Both paths converge on the same verify-then-truncate-LAST call.
-    let effective_offset = if is_single_token(&config.text) {
+    let effective_offset = if exact_symbol {
         // Offset was already applied inside the reader (search_exact_intersection
         // does skip(offset).take(limit) when limit=None/Some).  Do not re-apply.
         0
@@ -289,10 +290,12 @@ pub(super) fn execute_query_with_manifest(
         &sorted,
         root,
         &manifest,
-        &[],
-        &config.text,
-        config.limit,
-        effective_offset,
+        SnippetVerifyParams {
+            query: &config.text,
+            layers_matched: &[],
+            limit: config.limit,
+            offset: effective_offset,
+        },
     );
 
     let total = results.len();
@@ -455,10 +458,12 @@ fn run_compound_query(
         ctx.sorted,
         ctx.root,
         ctx.manifest,
-        &["lexical", "ast"],
-        &config.text,
-        config.limit,
-        0, // compound path: offset handled by RRF recomposition, not by this fn
+        SnippetVerifyParams {
+            query: &config.text,
+            layers_matched: &["lexical", "ast"],
+            limit: config.limit,
+            offset: 0, // compound path: offset handled by RRF recomposition, not by this fn
+        },
     );
     let total = results.len();
     let duration_ms = ctx.start.elapsed().as_millis() as u64;
@@ -674,6 +679,22 @@ fn decode_snippet(
     }
 }
 
+/// Output-shaping parameters for [`resolve_paths_and_snippets_verified`].
+///
+/// Groups the query string, layer attribution, and pagination fields so the
+/// function signature stays within the seven-argument Clippy limit.
+struct SnippetVerifyParams<'a> {
+    /// The literal query text used for AND-token verification (AD-355-3).
+    query: &'a str,
+    /// Layer names that contributed signal to these results (e.g. `["lexical"]`
+    /// or `["lexical", "ast"]`).  Forwarded verbatim into each [`ResolvedResult`].
+    layers_matched: &'a [&'static str],
+    /// Maximum results to return (applied LAST, after verification).
+    limit: usize,
+    /// Number of verified results to skip before collecting (AD-372-3).
+    offset: usize,
+}
+
 /// Map `FileId`s to paths, extract snippets, **verify substring membership**,
 /// and truncate to `limit` — all in one pass with a single file read per result.
 ///
@@ -706,11 +727,9 @@ fn resolve_paths_and_snippets_verified(
     sorted_paths: &[&str],
     root: &Path,
     manifest: &FileManifest,
-    layers_matched: &[&'static str],
-    query: &str,
-    limit: usize,
-    offset: usize,
+    params: SnippetVerifyParams<'_>,
 ) -> Vec<ResolvedResult> {
+    let SnippetVerifyParams { query, layers_matched, limit, offset } = params;
     raw_results
         .iter()
         .filter_map(|r| {

@@ -455,28 +455,6 @@ fn is_single_token_predicate_matrix() {
         !is_single_token("alpha gamma"),
         "is_single_token('alpha gamma') must be false: two space-separated tokens"
     );
-
-    // Discriminating guard: if is_single_token always returned false this would
-    // catch it; if it always returned true the FALSE cases above would catch it.
-    let true_count = ["foo", "foo::bar", "  foo  ", "decode_postings_varint"]
-        .iter()
-        .filter(|q| is_single_token(q))
-        .count();
-    assert_eq!(
-        true_count, 4,
-        "all 4 TRUE cases must be true; got {true_count}/4 — \
-         a blanket false implementation would fail here"
-    );
-
-    let false_count = ["foo bar", "fn", "if", "a\tb", "", "  ", "ab", "alpha gamma"]
-        .iter()
-        .filter(|q| !is_single_token(q))
-        .count();
-    assert_eq!(
-        false_count, 8,
-        "all 8 FALSE cases must be false; got {false_count}/8 — \
-         a blanket true implementation would fail here"
-    );
 }
 
 #[test]
