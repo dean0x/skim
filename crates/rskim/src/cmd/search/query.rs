@@ -729,7 +729,12 @@ fn resolve_paths_and_snippets_verified(
     manifest: &FileManifest,
     params: SnippetVerifyParams<'_>,
 ) -> Vec<ResolvedResult> {
-    let SnippetVerifyParams { query, layers_matched, limit, offset } = params;
+    let SnippetVerifyParams {
+        query,
+        layers_matched,
+        limit,
+        offset,
+    } = params;
     raw_results
         .iter()
         .filter_map(|r| {

@@ -545,8 +545,7 @@ impl NgramIndexReader {
                     continue;
                 }
                 // Resolve and cache file metadata; apply lang_filter.
-                if let std::collections::hash_map::Entry::Vacant(e) =
-                    doc_meta_cache.entry(p.doc_id)
+                if let std::collections::hash_map::Entry::Vacant(e) = doc_meta_cache.entry(p.doc_id)
                 {
                     let meta = self.file_meta_at(p.doc_id)?;
                     e.insert(meta);
@@ -623,7 +622,10 @@ impl NgramIndexReader {
             .take(limit)
             .map(|(doc_id, score)| {
                 let positions = doc_positions.remove(&doc_id).unwrap_or_default();
-                let field = doc_field.get(&doc_id).map(dominant_field).unwrap_or(SearchField::Other);
+                let field = doc_field
+                    .get(&doc_id)
+                    .map(dominant_field)
+                    .unwrap_or(SearchField::Other);
                 SearchResult {
                     file_id: FileId(doc_id),
                     score,
