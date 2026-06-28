@@ -387,18 +387,40 @@ mod argv0_dispatch {
 
     /// Control test for D2b: when stdout is a pipe (assert_cmd's default),
     /// the wrapper STILL compresses — the regular-file guard must not fire.
+    ///
+    /// Uses a grep stub large enough that the compressed grouped-by-file form
+    /// is strictly smaller than raw (ADR-001 net-savings guard passes), so the
+    /// canonical `grep N` header appears in the output.  Raw passthrough (i.e.
+    /// the file guard erroneously fired on a pipe) would emit raw
+    /// `file:line:content` lines with no `grep ` header — that fails this
+    /// assertion and catches the regression this test guards.
+    ///
+    /// Both this test and `argv0_wrapper_stdout_file_passes_raw_bytes` are
+    /// required for full D2b coverage (avoids PF-004 false-negative):
+    ///   - file  → raw bytes (no skim header) — the guard fires
+    ///   - pipe  → compressed (skim `grep N` header present) — the guard must NOT fire
     #[test]
     fn argv0_wrapper_stdout_pipe_still_compresses() {
-        // Enough output that compression changes it (ls with multi-file context).
-        let raw_output = "alpha.txt\nbeta.rs\ngamma.py\ndelta.go\nepsilon.md\n";
-        let stub_dir = make_stub_dir("ls", raw_output, 0);
+        // 2 files × 20 matches: compressed grouped form is strictly smaller
+        // than raw so the ADR-001 net-savings guard passes and the `grep N`
+        // header is emitted.  A tiny ls input trips the net-savings fallback
+        // (raw passthrough); this grep input does not (applies ADR-001).
+        let mut raw_output = String::new();
+        for i in 1..=20 {
+            raw_output.push_str(&format!("src/a.rs:{i}:fn item{i}() {{}}\n"));
+        }
+        for i in 1..=20 {
+            raw_output.push_str(&format!("src/b.rs:{i}:fn other{i}() {{}}\n"));
+        }
+        let stub_dir = make_stub_dir("grep", &raw_output, 0);
         let path = prepend_path(stub_dir.path());
 
         let skim = skim_bin();
 
-        // Default invocation — stdout is a pipe (assert_cmd / .output()).
+        // Default invocation — stdout is a pipe (.output()), NOT a regular file.
         let output = std::process::Command::new(&skim)
-            .arg0("ls")
+            .arg0("grep")
+            .args(["-rn", "fn", "src/"])
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
             .env_remove("SKIM_PASSTHROUGH")
@@ -409,17 +431,14 @@ mod argv0_dispatch {
         assert_eq!(output.status.code(), Some(0), "must exit 0");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // With a pipe stdout, the wrapper must compress — output is NOT empty.
+        // Compressed output must contain the `grep N` skim header.
+        // Raw passthrough would emit `src/a.rs:1:fn item1() {}` lines with NO
+        // `grep ` header — this assertion fails if the file guard erroneously
+        // fired on a pipe (applies ADR-001, avoids PF-004).
         assert!(
-            !stdout.trim().is_empty(),
-            "wrapper with pipe stdout must produce non-empty output (compresses)"
-        );
-        // The regular-file guard must NOT have fired (no raw passthrough).
-        // Compressed output typically differs from raw; at minimum it is not
-        // longer than raw.
-        assert!(
-            stdout.len() <= raw_output.len() + 50, // generous bound for header
-            "wrapper with pipe stdout must not expand vs raw: stdout={stdout:?}"
+            stdout.contains("grep "),
+            "pipe stdout must contain 'grep N' skim header (compressed, guard did not fire); \
+             got: {stdout:?}"
         );
     }
 

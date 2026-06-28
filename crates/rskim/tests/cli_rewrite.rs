@@ -321,6 +321,49 @@ fn test_rewrite_redirect_stdout_json_append() {
         .stdout(predicate::str::is_empty());
 }
 
+// ============================================================================
+// D2 (#370) — false-negative bail cases (applies PF-004)
+//
+// INVARIANT (both surfaces): stdout → regular file ⇒ raw tool bytes, not a
+// skim summary.  Enforced by two independent detectors (avoids PF-002 drift):
+//   Rewrite surface: stdout_redirected_to_file() in compound.rs — CLI bails
+//     with exit 1 + empty stdout (this section + hook equivalents in
+//     cli_e2e_rewrite.rs: test_hook_redirect_fd2x_bails,
+//     test_hook_redirect_backslash_desync_bails).
+//   Wrapper surface: stdout_is_regular_file() in main.rs — passes raw bytes
+//     through; tested in cli_wrapper_argv0.rs
+//     (argv0_wrapper_stdout_file_passes_raw_bytes and
+//     argv0_wrapper_stdout_pipe_still_compresses).
+// ============================================================================
+
+/// D2 (#370) false-negative fix 1b: `>&2x` routes both streams to file `2x`
+/// — NOT an fd-dup.  Only `>&<all-digits>` (e.g. `>&2`) and `>&-` are fd-dups;
+/// `>&2x` has a non-digit suffix and is a file redirect that must bail.
+/// CLI bail contract: exit 1 + empty stdout (avoids PF-004 false-negative).
+#[test]
+fn test_rewrite_redirect_fd_dup_with_trailing_char_bails() {
+    common::skim()
+        .arg("rewrite")
+        .write_stdin("cmd >&2x\n")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty());
+}
+
+/// D2 (#370) false-negative fix 1a: a backslash-escaped single quote (`\'`)
+/// outside quotes must not open a quoting context; the `>` appearing between
+/// two `\'` markers is a real stdout redirect and must bail.
+/// CLI bail contract: exit 1 + empty stdout (avoids PF-004 false-negative).
+#[test]
+fn test_rewrite_redirect_backslash_desync_bails() {
+    common::skim()
+        .arg("rewrite")
+        .write_stdin("grep x\\' file > out z\\'z\n")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty());
+}
+
 #[test]
 fn test_rewrite_redirect_git_with_skip_flags() {
     // Redirect must not trigger skip_if_flag_prefix (--porcelain, --stat, etc.)

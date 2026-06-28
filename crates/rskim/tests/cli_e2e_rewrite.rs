@@ -2850,6 +2850,51 @@ fn test_hook_stdout_redirect_bails() {
 }
 
 // ============================================================================
+// D2 (#370) — hook-surface bail: newly-fixed false-negative cases
+//
+// Hook bail contract: .success() + empty stdout (avoids PF-004).
+// CLI bail equivalents in cli_rewrite.rs.
+// Wrapper surface coverage in cli_wrapper_argv0.rs.
+// ============================================================================
+
+/// D2 (#370) false-negative fix 1b hook path: `>&2x` is a redirect to file
+/// `2x` (not an fd-dup — only `>&<all-digits>` and `>&-` qualify).
+/// Hook bail contract: `.success()` + empty stdout (avoids PF-004).
+#[test]
+fn test_hook_redirect_fd2x_bails() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "cmd >&2x"
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// D2 (#370) false-negative fix 1a hook path: a backslash-escaped single
+/// quote (`\'`) outside quotes must not open a quoting context; the `>`
+/// between two `\'` markers is a real stdout redirect that must bail.
+/// Hook bail contract: `.success()` + empty stdout (avoids PF-004).
+#[test]
+fn test_hook_redirect_backslash_desync_bails() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "grep x\\' file > out z\\'z"
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+// ============================================================================
 // Fix C — CLI path: interior newline must pass through (AC-C1 / AC-C2 / AC-C3)
 //
 // The hook path already bails on interior newlines (via command_needs_passthrough
