@@ -396,7 +396,16 @@ fn a2_bigram_matches_adjacency_only_file() {
     );
 }
 
-// --- A3: OR-union ranking — both-clause file outscores one-clause ---
+// --- A3: AND-intersect — multi-n-gram query keeps only files in EVERY posting list ---
+//
+// AD-374-1: `search_ast` now uses CandidateMode::AndIntersect.
+//
+// Fixture: bigram1 appears in files 0+1; bigram2 appears only in file 0.
+// AND-intersect result: ONLY file 0 (appears in both lists).
+// This is a deliberate semantic change from the old OR-union behavior.
+//
+// The OR-union BM25F scoring property ("file with both n-grams scores higher")
+// is preserved at the `score_ngram_set` layer and tested via A3b below.
 
 #[test]
 fn a3_union_ranking_both_clauses_scores_higher() {
@@ -458,13 +467,85 @@ fn a3_union_ranking_both_clauses_scores_higher() {
     let q = AstQuery::Containment(set);
     let results = engine.search_ast(&q).unwrap();
 
-    assert_eq!(results.len(), 2);
-    // Find scores by FileId (results are FileId-asc)
+    // AD-374-1 (AND-intersect): file 1 is NOT in bigram2's posting list →
+    // AND-intersect removes it. Only file 0 (in BOTH lists) survives.
+    // Pre-#374 (OR-union) this was 2; now it is correctly 1.
+    assert_eq!(
+        results.len(),
+        1,
+        "AND-intersect: only file 0 (in both posting lists) should survive; \
+         file 1 (bigram1 only) must be excluded. Got {} results: {results:?}",
+        results.len()
+    );
+    assert_eq!(
+        results[0].0,
+        FileId(0),
+        "AND-intersect: the surviving file must be FileId(0)"
+    );
+}
+
+/// A3b — OR-union scoring: a file matching both n-grams scores higher than one
+/// matching only one when evaluated over the BM25F layer (OR-union path).
+///
+/// `run_ngram_set_with_capacity` preserves OR-union semantics for the P3 capacity
+/// tests and for this scoring-property test.  The production `search_ast` path uses
+/// AND-intersect (AD-374-1); this test isolates the scoring layer.
+///
+/// Renamed from the original A3 test body; the discriminating property (PF-007) is:
+/// reverting `score_ngram_set` to ignore multi-hit files makes `score0 ≤ score1`.
+#[test]
+fn a3b_or_union_scoring_both_clauses_scores_higher() {
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let expr_id = vocab_lookup("expression_statement").unwrap();
+
+    let bigram1 = AstBigram::encode(fn_id, block_id);
+    let bigram2 = AstBigram::encode(block_id, expr_id);
+
+    let source = FakePostingSource::default()
+        .with_file(0, Language::Rust, 50)
+        .with_file(1, Language::Rust, 50)
+        .with_bigram(
+            bigram1.key(),
+            vec![
+                AstPosting { doc_id: 0, count: 2 },
+                AstPosting { doc_id: 1, count: 2 },
+            ],
+        )
+        .with_bigram(
+            bigram2.key(),
+            vec![AstPosting { doc_id: 0, count: 1 }],
+        )
+        .with_avg_node_count(50.0);
+
+    let engine = AstQueryEngine::new(source);
+
+    let set = AstNgramSet {
+        bigrams: {
+            let mut v = vec![
+                AstBigramEntry { ngram: bigram1, weight: DEFAULT_AST_WEIGHT, count: 1 },
+                AstBigramEntry { ngram: bigram2, weight: DEFAULT_AST_WEIGHT, count: 1 },
+            ];
+            v.sort_unstable_by_key(|e| e.ngram.key());
+            v
+        },
+        trigrams: vec![],
+    };
+
+    // OR-union path: both files appear (no AND-intersect filter).
+    let (results, _cap) = engine.run_ngram_set_with_capacity(&set, None).unwrap();
+    assert_eq!(
+        results.len(),
+        2,
+        "A3b OR-union: both files must appear in the scoring layer (before AND-intersect)"
+    );
+
     let score0 = results.iter().find(|(f, _)| *f == FileId(0)).unwrap().1;
     let score1 = results.iter().find(|(f, _)| *f == FileId(1)).unwrap().1;
     assert!(
         score0 > score1,
-        "file with both n-grams should score higher: {score0} vs {score1}"
+        "A3b OR-union: file 0 (both n-grams) must score higher than file 1 (bigram1 only): \
+         {score0} vs {score1}"
     );
 }
 
@@ -1730,15 +1811,20 @@ fn ac6_selective_query_returns_exact_posting_count_multi_ngram() {
         },
     ];
     bigram_entries.sort_unstable_by_key(|e| e.ngram.key());
-    let q_multi = AstQuery::Containment(AstNgramSet {
+    let multi_set = AstNgramSet {
         bigrams: bigram_entries,
         trigrams: vec![],
-    });
-    let multi_results = engine.search_ast(&q_multi).unwrap();
+    };
+
+    // P3 path: OR-union via run_ngram_set_with_capacity (preserves legacy scoring
+    // behavior for capacity tests — AD-374-1 note: search_ast uses AND-intersect
+    // since #374, but P3 is a scoring-layer property tested here via the OR-union path).
+    let (multi_results, _) = engine.run_ngram_set_with_capacity(&multi_set, None).unwrap();
     assert_eq!(
         multi_results.len(),
         100,
-        "multi-ngram must return all 100 files (union)"
+        "multi-ngram OR-union (P3 path) must return all 100 files; \
+         files 5–99 are in the broad list but NOT the selective list"
     );
 
     // Discriminating: files 0–4 must score strictly higher than files 5–99
@@ -1759,6 +1845,20 @@ fn ac6_selective_query_returns_exact_posting_count_multi_ngram() {
         score_0 > score_5,
         "selective-match files must outscore broad-only files: score_0={score_0}, score_5={score_5}"
     );
+
+    // AND-intersect guard (AD-374-1): search_ast with 2 lists → only files 0–4
+    // (in BOTH lists) survive.
+    let q_multi_and = AstQuery::Containment(multi_set);
+    let and_results = engine.search_ast(&q_multi_and).unwrap();
+    assert_eq!(
+        and_results.len(),
+        5,
+        "AND-intersect (search_ast, AD-374-1) must return only 5 files (files 0–4 in both lists); \
+         files 5–99 are in broad-only and are correctly excluded"
+    );
+    for (fid, _) in &and_results {
+        assert!(fid.0 < 5, "AND-intersect result must be FileId in [0,5), got: {fid}");
+    }
 }
 
 // ---- AC7: P3 empty-first-ngram does not under-size -------------------------
@@ -1814,13 +1914,17 @@ fn ac7_empty_first_ngram_large_second_returns_correct_results() {
         bigrams: bigram_entries,
         trigrams: vec![],
     };
-    let q = AstQuery::Containment(set);
-    let results = engine.search_ast(&q).unwrap();
+
+    // P3 path (OR-union via run_ngram_set_with_capacity): all 200 files must appear
+    // despite the empty first n-gram — AD-374-1 note: search_ast uses AND-intersect
+    // since #374; the P3 reserve() property is a scoring-layer concern tested here
+    // via the OR-union path which score_ngram_set drives directly.
+    let (results, _) = engine.run_ngram_set_with_capacity(&set, None).unwrap();
 
     assert_eq!(
         results.len(),
         200,
-        "all 200 files must appear despite empty first n-gram (AC7)"
+        "all 200 files must appear despite empty first n-gram (AC7 P3 OR-union path)"
     );
     for (_, s) in &results {
         assert!(*s > 0.0, "all scores must be positive");
@@ -1831,8 +1935,8 @@ fn ac7_empty_first_ngram_large_second_returns_correct_results() {
     // that the empty-first-list path executes the large-list reserve() correctly
     // and that no scoring was corrupted by a grow-from-zero realloc.
     // Compute the expected score directly (single-n-gram reference path).
-    let ref_q = AstQuery::Containment(make_bigram_set(large_bigram, 1));
-    let ref_results = engine.search_ast(&ref_q).unwrap();
+    let ref_set = make_bigram_set(large_bigram, 1);
+    let (ref_results, _) = engine.run_ngram_set_with_capacity(&ref_set, None).unwrap();
     assert_eq!(
         ref_results.len(),
         200,
@@ -1847,6 +1951,17 @@ fn ac7_empty_first_ngram_large_second_returns_correct_results() {
             "score mismatch for {fid_multi}: multi={s_multi}, ref={s_ref} (empty n-gram must contribute nothing)"
         );
     }
+
+    // AND-intersect guard (AD-374-1): search_ast with empty_bigram in the set →
+    // intersection is empty (empty ∩ large = empty) → 0 results.
+    let q_and = AstQuery::Containment(set);
+    let and_results = engine.search_ast(&q_and).unwrap();
+    assert_eq!(
+        and_results.len(),
+        0,
+        "AND-intersect (search_ast, AD-374-1): empty-bigram list intersected with large list = 0 results; \
+         any file in the empty list is vacuously absent from the intersection"
+    );
 }
 
 // ---- AC8: P2 scalar IDF cache score-equivalence (avoids PF-005) ------------

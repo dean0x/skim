@@ -29,7 +29,7 @@ use rskim_search::{all_patterns, parse_ast_query};
 // #201: enriched row type + formatters from rskim-search.
 // pub(super) re-exports so test module (ast_tests.rs) can call them as super::.
 pub(super) use rskim_search::AstResult;
-use rskim_search::recover_line;
+use rskim_search::{pattern_occurs_in_file, recover_line};
 pub(super) use rskim_search::{format_ast_json, format_ast_text};
 
 use super::types::TemporalSort;
@@ -200,29 +200,46 @@ pub(super) fn run_ast_standalone(
 
     let engine = open_ast_engine(cache_dir)?;
 
+    // AD-374-1: search_ast now uses AND-intersect candidate set so raw_results
+    // contains only files that appear in EVERY posting list of the pattern.
     let raw_results = engine
         .search_ast(&query)
         .map_err(|e| anyhow::anyhow!("AST query failed: {e}"))?;
 
     // Hoist sorted_paths() once — reused for the blast-radius membership check
-    // (fid.0 as usize) and the path-resolution step below.
+    // (fid.0 as usize), the verify gate, and the path-resolution step below.
     let sorted = manifest.sorted_paths();
 
-    // A temporal sort defers truncation: take a bounded window (limit*5 ≥ 100) so
-    // the re-sort can promote a temporally-hot file that ranks beyond `limit` in
-    // raw FileId/AST order (AC-F4). Without a sort, take exactly `limit` — the
-    // non-temporal base case is byte-identical to before (GAP-2 carve-out, AC-A1).
+    // AD-374-3 / AD-355-2: verify-then-truncate-LAST with a candidate pool.
+    //
+    // Because the Part B gate (pattern_occurs_in_file) can DROP candidates,
+    // taking exactly `limit` before the gate would under-fill results. We fetch
+    // `LEXICAL_CANDIDATE_POOL_K × limit` candidates (the AST candidate pool),
+    // gate them, then truncate to `limit` LAST — mirroring the lexical
+    // verify-then-truncate-LAST architecture (AD-355-2).
+    //
+    // With AND-intersect upstream (AD-374-1) the pool is already small, so K=5
+    // is adequate. The K value has no measured corpus basis and is tracked under
+    // #361 per ADR-003.
+    //
+    // Temporal path: the temporal resort also needs a wider window so hot files
+    // beyond raw rank `limit` can be promoted (AC-F4 temporal contract). We take
+    // the MAX of the temporal window and the verify pool so both constraints are met.
     let temporal_active = temporal_sort.is_some() && temporal_db.is_some();
-    let window = if temporal_active {
+    let temporal_window = if temporal_active {
         super::temporal::resort_window(limit)
     } else {
         limit
     };
+    // AD-374-3: AST candidate pool — reuse LEXICAL_CANDIDATE_POOL_K from query.rs
+    // (pub(super)) as the single definition. No AST-local fork.
+    let ast_pool = super::query::candidate_pool(limit, super::query::LEXICAL_CANDIDATE_POOL_K);
+    let window = temporal_window.max(ast_pool);
 
     // Intersect AST results with blast-radius FileIds (when set), then take the
-    // working window. The filter runs BEFORE truncation so the window reflects the
-    // filtered set size (avoids PF-006 silent feature-drop).
-    let windowed: Vec<_> = raw_results
+    // working window (pool). The filter runs BEFORE truncation so the window reflects
+    // the filtered set size (avoids PF-006 silent feature-drop).
+    let pooled: Vec<_> = raw_results
         .into_iter()
         .filter(|(fid, _)| {
             blast_file_ids
@@ -232,27 +249,63 @@ pub(super) fn run_ast_standalone(
         .take(window)
         .collect();
 
-    // Resolve FileIds → repo-relative paths (no re-parse yet). Warn on out-of-range
-    // FileIds (avoids PF-002 silent-drop; applies ADR-006 counterpart on the read side).
-    let mut resolved: Vec<AstResult> = Vec::with_capacity(windowed.len());
-    for (fid, score) in &windowed {
+    // AD-374-2: Structural verify gate — drop candidates that do NOT contain the
+    // pattern's declared ancestor relationship in their real CST.
+    //
+    // `pattern_occurs_in_file` re-parses each file and confirms the ancestor chain
+    // (parent→child for bigrams; grandparent→parent→child for trigrams) via real
+    // `node.parent()` calls — NOT the pre-order-predecessor approximation used by
+    // `recover_line`. This is the correctness backstop that eliminates unrelated-
+    // subtree false positives that AND-intersect alone would keep.
+    //
+    // AD-374-5: Non-tree-sitter files (JSON/TOML/YAML, node_count=0) return false
+    // from `pattern_occurs_in_file` and are dropped here.
+    //
+    // AD-374-4: Dropping candidates that fail the gate is a RELEVANCE filter, not
+    // a #317 output cap. No `output::elision_marker` is required (mirrors AD-355-4).
+    //
+    // AC-10 / AD-373 dependency note: FileId → path resolution via `sorted.get(fid.0)`
+    // is sound only because #373 aligned FileId assignment order with BTreeMap
+    // resolution order. The gate assumes this alignment; without it the wrong file
+    // would be re-parsed (ADR-006 read-side desync).
+    let verified_pool: Vec<_> = pooled
+        .into_iter()
+        .filter(|(fid, _)| {
+            let idx = fid.0 as usize;
+            match sorted.get(idx) {
+                Some(rel_path) => {
+                    let abs_path = root.join(rel_path);
+                    let stored_mtime = manifest.lookup(rel_path).and_then(|e| e.mtime);
+                    pattern_occurs_in_file(&abs_path, &query, stored_mtime)
+                }
+                None => {
+                    // Out-of-range FileId — warn and drop (ADR-006 counterpart).
+                    eprintln!(
+                        "skim search: AST verify gate warning: FileId({idx}) is out of \
+                         manifest range (manifest has {} files) — index may be out of sync; \
+                         run `skim search --rebuild`",
+                        sorted.len()
+                    );
+                    false
+                }
+            }
+        })
+        .collect();
+
+    // Resolve FileIds → repo-relative paths from the verified pool.
+    let mut resolved: Vec<AstResult> = Vec::with_capacity(verified_pool.len());
+    for (fid, score) in &verified_pool {
         let idx = fid.0 as usize;
-        match sorted.get(idx) {
-            Some(rel_path) => {
-                resolved.push(AstResult::ast_only(
-                    rel_path.to_string(),
-                    *score,
-                    None,
-                    None,
-                ));
-            }
-            None => {
-                eprintln!(
-                    "skim search: AST result warning: FileId({idx}) is out of manifest range \
-                     (manifest has {} files) — index may be out of sync; run `skim search --rebuild`",
-                    sorted.len()
-                );
-            }
+        // Safety: all verified_pool entries have valid sorted.get(idx) — the
+        // gate above already dropped out-of-range FileIds. Use get() with a
+        // defensive fallback to avoid panicking on an edge case.
+        if let Some(rel_path) = sorted.get(idx) {
+            resolved.push(AstResult::ast_only(
+                rel_path.to_string(),
+                *score,
+                None,
+                None,
+            ));
         }
     }
 
@@ -264,12 +317,22 @@ pub(super) fn run_ast_standalone(
     if let (Some(sort), Some(db)) = (temporal_sort, temporal_db) {
         super::temporal::enrich_ast_results(&mut resolved, sort, db);
         resolved.truncate(limit);
+    } else {
+        // AD-374-3 / AD-355-2: truncate-LAST. Without a temporal re-sort, the
+        // verified pool is already in raw FileId/AST order — truncate to `limit`
+        // here so the caller receives exactly `min(limit, verified_count)` results.
+        resolved.truncate(limit);
     }
 
     // Re-parse the final (≤ `limit`) set to recover a representative line + snippet.
-    // Re-parse runs strictly AFTER truncation (AC-API3, #201: at most `limit` files);
-    // each per-file recover_line call is bounded by the 100 KiB size guard.
-    // fail-soft: recover_line returns None on any error → degraded row (AC-F2).
+    // Re-parse runs strictly AFTER truncation (AC-API3, AC-8 #374, #201: at most
+    // `limit` files); each per-file recover_line call is bounded by the 100 KiB
+    // size guard.
+    //
+    // AD-374-7: recover_line is LINE-RECOVERY ONLY. Emit/drop decisions are made
+    // by the verify gate above. A file that passes the gate but whose representative
+    // line cannot be recovered still emits as a degraded row (path present, no :line
+    // or snippet). recover_line returning None MUST NOT drop a gate-passed file.
     for r in &mut resolved {
         let abs_path = root.join(&r.path);
         // Recover the stored mtime from the manifest for the stale guard.

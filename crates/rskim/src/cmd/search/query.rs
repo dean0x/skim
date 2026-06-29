@@ -53,14 +53,27 @@ use super::types::{QueryConfig, QueryOutput, ResolvedResult};
 /// slots so small `--limit` values do not starve the verify step.
 const CANDIDATE_POOL_FLOOR: usize = 100;
 
+/// Pool multiplier K for pure-lexical and AST standalone candidate pools.
+///
+/// AD-374-3: promoted to `pub(super)` module level so `ast.rs` can reuse this
+/// constant for the AST verify gate pool — single definition, no divergent
+/// AST-local fork (see #361 and ADR-003). Value = 5; unmeasured heuristic,
+/// tracked under #361 per ADR-003.
+pub(super) const LEXICAL_CANDIDATE_POOL_K: usize = 5;
+
 /// Compute the pre-verify candidate pool size for a given path K multiplier.
 ///
 /// Returns `limit.saturating_mul(k).max(CANDIDATE_POOL_FLOOR)`.
 ///
-/// Used by the pure-lexical and blast-radius paths; the compound text+AST
-/// path sizes its pool to the AST set directly (AD-356-1, see run_compound_query).
+/// Used by the pure-lexical, blast-radius, and AST standalone paths.
+/// The compound text+AST path sizes its pool to the AST set directly (AD-356-1,
+/// see run_compound_query).
+///
+/// AD-374-3: promoted to `pub(super)` so `ast.rs` (sibling module) can reuse the
+/// same definition instead of forking a second divergent AST-local pool heuristic.
+/// Single definition avoids the exact divergence #361 warns about.
 #[inline]
-fn candidate_pool(limit: usize, k: usize) -> usize {
+pub(super) fn candidate_pool(limit: usize, k: usize) -> usize {
     limit.saturating_mul(k).max(CANDIDATE_POOL_FLOOR)
 }
 
@@ -252,7 +265,10 @@ pub(super) fn execute_query_with_manifest(
     // AD-355-4: Dropping non-matching candidates is a relevance gate, NOT an
     // output elision/cap under #317 "compress-never-truncate".  No
     // `elision_marker` is needed.
-    const LEXICAL_CANDIDATE_POOL_K: usize = 5;
+    // AD-374-3: the pool K constant is now at module level (pub(super)) so the
+    // AST standalone path in ast.rs can reuse it without a divergent fork. The
+    // local shadow below shadows the module constant with the same value — both
+    // are 5, ensuring the pure-lexical path behavior is unchanged.
     let exact_symbol = is_single_token(&config.text);
 
     let raw_results = if exact_symbol {

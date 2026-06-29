@@ -170,6 +170,229 @@ pub fn recover_line(
     None
 }
 
+/// Verify that a source file's CST contains at least one node whose **real
+/// ancestor chain** matches the pattern's resolved n-grams.
+///
+/// This is the structural verify gate (Part B) for the AND-intersect→verify→
+/// truncate-LAST architecture (AD-374-2).  Unlike [`recover_line`], which uses
+/// the pre-order predecessor as a bigram approximation, this function walks the
+/// CST and for each node checks its **real parent chain** via `node.parent()`:
+///
+/// - **Bigram** `(P, C)`: node is kind `C` and `node.parent()` is kind `P`.
+/// - **Trigram** `(GP, P, C)`: node is kind `C`, `node.parent()` is kind `P`,
+///   and `node.parent().parent()` is kind `GP`.
+///
+/// This is intentionally STRICT (AD-374-6, OD-374-3 resolved → STRICT): the
+/// gate does NOT reproduce the indexer's ERROR/MISSING-node depth-jump gap-fill
+/// (`extract.rs`).  The purpose of the gate is precision — files containing the
+/// correct ancestor relationship, not approximations.  An ERROR-node edge that
+/// the indexer accepted via gap-fill will NOT survive the strict gate; this is
+/// correct behavior.  PF-004 governs the index BUILD's u16 depth arithmetic in
+/// `extract.rs`; this gate only compares node KINDS (no depth values) so PF-004
+/// does NOT apply here.
+///
+/// ## AD-374-5: Non-tree-sitter / zero-kind files drop
+///
+/// Files whose language has no tree-sitter grammar (JSON/TOML/YAML), or patterns
+/// that resolve to an empty match table, return `false` (never panic).  This
+/// removes `Cargo.toml`/`.json` from structural results.
+///
+/// ## AD-374-7: `recover_line` remains line-recovery only
+///
+/// After the gate, surviving files still call [`recover_line`] for `:line`.  Its
+/// fail-soft `None` no longer leaks false positives because non-matching files
+/// were already dropped here.
+///
+/// ## Return value
+///
+/// - `true`  — at least one node in the CST matches the declared ancestor relationship.
+/// - `false` — returned (never panics) for: non-tree-sitter language, empty resolved
+///   match table, file > [`MAX_REPARSE_FILE_BYTES`], mtime mismatch vs
+///   `manifest_mtime`, unreadable/non-UTF8 file, parse failure, no matching ancestor
+///   edge.
+///
+/// ## AD-374-4: Relevance gate, not a #317 output cap
+///
+/// Dropping candidates that fail this gate is a relevance filter; it does not hide
+/// output the user would otherwise legitimately see, so no `output::elision_marker`
+/// is required.  Mirrors AD-355-4 on the lexical path.
+pub fn pattern_occurs_in_file(
+    file_path: &Path,
+    query: &AstQuery,
+    manifest_mtime: Option<u64>,
+) -> bool {
+    // Guard: file must exist and be readable as metadata.
+    let Ok(meta) = std::fs::metadata(file_path) else {
+        return false;
+    };
+
+    // Mtime guard: if the manifest recorded an mtime and it doesn't match,
+    // the file has changed since indexing — drop (conservative; mirrors recover_line).
+    if let Some(stored_mtime) = manifest_mtime {
+        let current_mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        if current_mtime != Some(stored_mtime) {
+            return false;
+        }
+    }
+
+    // Size guard: must be within the re-parse cap (AD-374-5).
+    if meta.len() > MAX_REPARSE_FILE_BYTES {
+        return false;
+    }
+
+    // Detect language from extension; non-tree-sitter langs drop (AD-374-5).
+    let Some(lang) = Language::from_path(file_path) else {
+        return false;
+    };
+
+    // Only tree-sitter languages can be re-parsed; non-tree-sitter langs drop
+    // (AD-374-5: JSON/TOML/YAML have no grammar → Parser::new returns Err).
+    let Ok(mut parser) = Parser::new(lang) else {
+        return false;
+    };
+
+    // Read and parse the file.
+    let Ok(content) = std::fs::read(file_path) else {
+        return false;
+    };
+    let Ok(source) = std::str::from_utf8(&content) else {
+        return false;
+    };
+    let Ok(tree) = parser.parse(source) else {
+        return false;
+    };
+
+    // Resolve the query into an ancestor-correct match table (AD-374-6).
+    // AD-374-5: an empty match table means the pattern has no resolvable kinds
+    // in this grammar → drop.
+    let ancestor_table = AncestorMatchTable::build(query);
+    if ancestor_table.is_empty() {
+        return false;
+    }
+
+    // Walk the CST in pre-order and check each node's REAL parent chain.
+    let walk_config = AstWalkConfig::default();
+    let iter = AstWalkIter::new(tree.walk(), walk_config);
+
+    for walk_node in iter {
+        let node = walk_node.node;
+
+        // Map tree-sitter kind string → global vocabulary NodeKindId.
+        let Some(child_id) = vocab_lookup(node.kind()) else {
+            continue;
+        };
+
+        // Check bigrams (P, C): node is C, node.parent() is P.
+        if let Some(parent_node) = node.parent() {
+            let Some(parent_id) = vocab_lookup(parent_node.kind()) else {
+                // Parent kind not in vocab — cannot match any bigram/trigram.
+                continue;
+            };
+
+            // Bigram check: (parent_id, child_id).
+            if ancestor_table.bigrams.contains(&(parent_id, child_id)) {
+                return true;
+            }
+
+            // Trigram check (GP, P, C): parent.parent() is GP.
+            // AD-374-6 / OD-374-3 (STRICT): require full grandparent→parent→child
+            // ancestor chain via real node.parent(), not an approximation.
+            if !ancestor_table.trigram_children.is_empty()
+                && let Some(gp_node) = parent_node.parent()
+            {
+                let Some(gp_id) = vocab_lookup(gp_node.kind()) else {
+                    continue;
+                };
+                if ancestor_table
+                    .trigrams
+                    .contains(&(gp_id, parent_id, child_id))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Precomputed lookup table for ancestor-correct CST matching (AD-374-6).
+///
+/// Unlike [`MatchTable`] (which uses the pre-order predecessor as a bigram
+/// approximation), this table is used by [`pattern_occurs_in_file`] and stores
+/// the complete ancestor relationship for strict verification:
+///
+/// - `bigrams`: set of `(parent_id, child_id)` pairs — checked via real
+///   `node.parent()`.
+/// - `trigrams`: set of `(gp_id, parent_id, child_id)` triples — checked via
+///   real `node.parent().parent()` (OD-374-3 resolved → STRICT).
+/// - `trigram_children`: set of child-ids for any trigram — used as a fast
+///   pre-check before evaluating the full triple.
+///
+/// **Divergence from `MatchTable` is intentional** (AD-374-6): do NOT simplify
+/// these two tables into one — `MatchTable` serves line-recovery (approximate
+/// pre-order context) while `AncestorMatchTable` serves the verify gate (exact
+/// ancestor chain).
+struct AncestorMatchTable {
+    bigrams: HashSet<(NodeKindId, NodeKindId)>,
+    trigrams: HashSet<(NodeKindId, NodeKindId, NodeKindId)>,
+    /// Fast pre-check: set of child-ids that appear in any trigram.
+    /// Avoids evaluating the full grandparent chain when `child_id` is not in
+    /// any trigram at all.
+    trigram_children: HashSet<NodeKindId>,
+}
+
+impl AncestorMatchTable {
+    /// Resolve `query` into the strict ancestor lookup table.
+    fn build(query: &AstQuery) -> Self {
+        let mut bigrams = HashSet::new();
+        let mut trigrams = HashSet::new();
+        let mut trigram_children = HashSet::new();
+
+        match query {
+            AstQuery::Pattern(pattern) => {
+                for bigram in pattern.resolved_bigrams() {
+                    let (parent, child) = bigram.decode();
+                    bigrams.insert((parent, child));
+                }
+                for trigram in pattern.resolved_trigrams() {
+                    let (gp, parent, child) = trigram.decode();
+                    trigrams.insert((gp, parent, child));
+                    trigram_children.insert(child);
+                }
+            }
+            AstQuery::Containment(ngram_set) => {
+                for entry in &ngram_set.bigrams {
+                    let (parent, child) = entry.ngram.decode();
+                    bigrams.insert((parent, child));
+                }
+                for entry in &ngram_set.trigrams {
+                    let (gp, parent, child) = entry.ngram.decode();
+                    trigrams.insert((gp, parent, child));
+                    trigram_children.insert(child);
+                }
+            }
+            // SingleNode is rejected at the CLI boundary; empty table → false (AD-374-5).
+            AstQuery::SingleNode(_) => {}
+        }
+
+        Self {
+            bigrams,
+            trigrams,
+            trigram_children,
+        }
+    }
+
+    /// `true` when the query resolved to no matchable kinds in this grammar.
+    fn is_empty(&self) -> bool {
+        self.bigrams.is_empty() && self.trigrams.is_empty()
+    }
+}
+
 /// Precomputed O(1) lookup table for the CST walk.
 ///
 /// Resolving a query's bigrams/trigrams is loop-invariant, so we resolve once
