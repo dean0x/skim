@@ -2617,14 +2617,7 @@ fn test_manifest_v2_triggers_auto_rebuild_to_v3_on_next_query() {
     let manifest_path = cache.path().join("index.skfiles");
     let content = fs::read_to_string(&manifest_path).expect("manifest must exist after build");
     // Replace `"version":3` with `"version":2` in the header (first JSONL line).
-    let mut lines: Vec<&str> = content.lines().collect();
-    assert!(
-        !lines.is_empty(),
-        "manifest must have at least a header line"
-    );
-    let v2_header = lines[0].replace("\"version\":3", "\"version\":2");
-    lines[0] = Box::leak(v2_header.into_boxed_str());
-    let v2_content = lines.join("\n") + "\n";
+    let v2_content = content.replacen("\"version\":3", "\"version\":2", 1);
     fs::write(&manifest_path, &v2_content).expect("must be able to rewrite manifest");
 
     // Verify the overwrite took effect.

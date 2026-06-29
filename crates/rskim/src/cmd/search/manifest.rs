@@ -406,7 +406,7 @@ impl FileManifest {
         let header_json = serde_json::to_string(&header)?;
         writeln!(buf, "{header_json}")?;
 
-        // Write entries in sorted order (BTreeMap guarantees alphabetical iteration).
+        // Write entries in byte-wise string order (BTreeMap guarantees this automatically).
         for entry in self.entries.values() {
             let entry_json = serde_json::to_string(entry)?;
             writeln!(buf, "{entry_json}")?;
