@@ -265,10 +265,10 @@ pub(super) fn execute_query_with_manifest(
     // AD-355-4: Dropping non-matching candidates is a relevance gate, NOT an
     // output elision/cap under #317 "compress-never-truncate".  No
     // `elision_marker` is needed.
-    // AD-374-3: the pool K constant is now at module level (pub(super)) so the
-    // AST standalone path in ast.rs can reuse it without a divergent fork. The
-    // local shadow below shadows the module constant with the same value — both
-    // are 5, ensuring the pure-lexical path behavior is unchanged.
+    // AD-374-3: the pool K constant lives at module level (pub(super)) so the AST
+    // standalone path in ast.rs can reuse it without a divergent fork. The
+    // multi-word path below references that module constant directly (no local
+    // shadow); the value is unchanged (5), so pure-lexical behavior is identical.
     let exact_symbol = is_single_token(&config.text);
 
     let raw_results = if exact_symbol {

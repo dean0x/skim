@@ -113,6 +113,14 @@ pub(super) fn validate_ast_pattern(raw: &str) -> anyhow::Result<AstQuery> {
 /// discarded).  Now returns the full scored vec so `intersect_and_rank` can
 /// build the AST rank map from actual scores.
 ///
+/// **#374 scope note:** this compound-path entry applies Part A (AND-intersect,
+/// inside `search_ast`) but NOT the Part B structural verify gate
+/// (`pattern_occurs_in_file`) that `run_ast_standalone` applies. The compound
+/// results are subsequently intersected with the lexical text set, so structural
+/// false positives are bounded by the text match; extending the gate to this path
+/// is a deliberate out-of-scope follow-up for #374 (would change ranking inputs and
+/// needs its own tests).
+///
 /// # Errors
 ///
 /// Returns `Err` when the pattern is invalid or the query fails.

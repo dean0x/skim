@@ -2626,8 +2626,8 @@ fn run_ast_standalone_resolves_nested_dir_corpus_correctly() {
 //
 // These tests cover the acceptance criteria from ticket #374:
 //   AC1  — zero-n-gram data files excluded
-//   AC2  — AND-intersect vs OR-union (engine level) → see reparse_tests.rs (AC6)
-//   AC3  — verify gate drops unrelated subtrees (integration)
+//   AC2  — AND-intersect vs OR-union (engine level) → see query_tests.rs (a3/a3b/P3)
+//   AC3  — verify gate drops unrelated subtrees → NOT YET COVERED (see note below)
 //   AC4  — true positives survive the gate
 //   AC5  — verify-then-truncate-LAST
 //   AC8  — recover_line stays line-recovery only (degraded row emitted, not dropped)
@@ -2636,8 +2636,18 @@ fn run_ast_standalone_resolves_nested_dir_corpus_correctly() {
 //   AC11 — no elision marker when gate produces empty results
 //   AC12 — O(pool) bound guard (constant reuse guard)
 //
-// AC2 / AC6 / AC7 engine-level AND-intersect tests are in reparse_tests.rs.
+// AC2 / AC7 engine-level AND-intersect tests live in `ast_index/query_tests.rs`
+// (a3_*, a3b_*, P3 group). The `pattern_occurs_in_file` gate UNIT tests (AC6) live
+// in `compound/reparse_tests.rs`.
 // AC13 (entry-point agreement) is covered by the engine unit tests + run_ast_standalone path.
+//
+// AC3 COVERAGE GAP (#374 follow-up): no test yet exercises the discriminating
+// "unrelated-subtree" case — a file where BOTH of a pattern's n-gram kinds are
+// PRESENT but NOT in a real parent→child / grandparent ancestor chain. That case
+// is the only one where the strict gate (Part B) diverges from AND-intersect
+// (Part A); every current gate test turns on kind PRESENCE, not the ancestor
+// relationship. A grammar-faithful fixture must be confirmed against the actual
+// tree-sitter CST shape before it can assert non-vacuously (PF-007).
 
 /// Create a project for #374 tests: one Rust file with genuine nested loops,
 /// one with no nested loops, one JSON, one Cargo.toml.

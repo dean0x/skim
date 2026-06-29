@@ -389,73 +389,23 @@ fn pattern_occurs_false_for_missing_file() {
     );
 }
 
-/// AC6-false (unrelated subtrees): a Rust file containing BOTH node kinds of the
-/// `rust-nested-loop` pattern but in UNRELATED subtrees (no real ancestor edge).
+/// PF-007 double-assertion: the same query yields BOTH `true` and `false` for
+/// different inputs, so the gate is provably discriminating (a pass-through
+/// `|| true` implementation fails the false branch; a `|| false` implementation
+/// fails the true branch).
 ///
-/// AD-374-3 (strict gate, OD-374-3 STRICT): the gate checks the real
-/// `node.parent()` chain. A file where both kinds exist but are siblings rather
-/// than parent→child MUST return `false`.
-///
-/// This is AC3 from the plan: Part B (the gate) discriminates beyond Part A
-/// (AND-intersect), which would keep this file because it contains both n-gram kinds.
-///
-/// We use a Rust file with:
-/// - A `for_statement` at the top level
-/// - A nested block (block) inside a different branch (arm of a match) at a
-///   sibling position to the for_statement, so the for_statement → block
-///   relationship is NOT a real parent→child edge.
-///
-/// Actually, using the `try-catch` pattern is easier — it looks for
-/// `match_expression` > `match_arm` relationships. We can write a file where
-/// a match expression and an arm exist in different top-level functions, so
-/// they are NOT in an ancestor relationship.
-///
-/// To be concrete: `try-catch` in Rust looks for something like
-/// `match_expression > match_arm`. We create a file with:
-///  - a `match_expression` in fn foo()
-///  - a `match_arm` at module level (not inside the match_expression) — but Rust
-///    doesn't allow bare match_arm at module level.
-///
-/// The simplest concrete case for "both kinds, no ancestor edge" is a file with
-/// two top-level functions where fn1 has a `for_statement` with no `block`
-/// inside it (impossible in Rust since for body IS a block) — so we need a
-/// different approach.
-///
-/// **Practical approach**: Use a CONTAINMENT query for `function_item > block`
-/// (which EVERY real Rust function satisfies). Create a file with only a
-/// TRAIT DECLARATION (not an impl or fn) so `function_item` appears in the
-/// doc but there's no `function_item > block` ancestor pair. In Rust you can
-/// have trait method signatures without bodies — those ARE function items at
-/// the interface level, but they don't contain a block body.
-///
-/// However tree-sitter parses trait method signatures differently. The simplest
-/// discriminating case is:
-/// - Query: `for_statement > block` (Rust: the body of a for-loop is a block)
-/// - AC3 fixture: a `.rs` file with a `for_statement` that has an empty body
-///   emitting as `ERROR` node rather than `block` (so the block kind exists
-///   elsewhere but not AS the child of the for_statement).
-///   Actually that's complicated.
-///
-/// **Simplest concrete case that actually works**: A file with two sibling
-/// function_items at module level where each function_item has a `block` body.
-/// The containment query `function_item > block` IS satisfied here — so this
-/// is a TRUE case. We need a FALSE case where the ancestor pair is absent.
-///
-/// A file with ZERO functions (only comments and constants) satisfies:
-/// - `for_statement` kind may appear if we write `for` but not valid Rust
-/// - Better: just test that a file with NO functions has no `function_item > block`
-///
-/// This is effectively already tested by `pattern_occurs_false_for_rust_file_without_nested_loop`.
-/// The AC3 "unrelated subtrees" scenario is more subtle but the above tests
-/// already provide the PF-007 discriminating false case.
-///
-/// Note: AD-374-6 confirms the ancestor-correct check via positive and negative
-/// assertions above; the full AC3 ancestor-subtree case is also covered at the
-/// integration level in ast_tests.rs (Group 12 / #374).
+/// NOTE (coverage gap): this is the SAME discriminator as
+/// `pattern_occurs_true_for_genuine_rust_nested_loop` +
+/// `pattern_occurs_false_for_rust_file_without_nested_loop` — both branches turn
+/// on whether the pattern's n-gram kinds are PRESENT in the file, not on the
+/// ancestor *relationship*. The strict-gate behavior that AD-374-6 actually adds
+/// over Part A (AND-intersect) is the "unrelated-subtree" case: a file where both
+/// n-gram kinds are PRESENT but NOT in a real parent→child / grandparent chain,
+/// which must return `false`. That case is NOT covered by any current test (see
+/// #374 follow-up); constructing a grammar-faithful unrelated-subtree fixture
+/// requires confirming the exact tree-sitter CST shape and is tracked separately.
 #[test]
 fn pattern_occurs_true_and_false_cover_both_branches() {
-    // Explicit double-assertion test to satisfy PF-007: every test must show
-    // that both true and false results occur for different inputs.
     let dir = tempfile::tempdir().unwrap();
 
     // True case: nested loops → true.
