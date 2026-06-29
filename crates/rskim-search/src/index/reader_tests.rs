@@ -1853,7 +1853,6 @@ fn test_ac5_corruption_error_on_exact_symbol_path() {
         "AC#5: error must identify corruption (contain 'checksum mismatch', 'corrupt', \
          or 'CRC'); got: {err_str}"
     );
-
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
