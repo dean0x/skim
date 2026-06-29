@@ -222,6 +222,12 @@ struct Flags {
     action: SearchAction,
     json: bool,
     limit: usize,
+    /// Pagination offset: skip this many verified results before collecting.
+    ///
+    /// Applied AFTER verification on the pure-lexical exact-symbol path
+    /// (RESOLVED Decision 3 / AC#11): `rank → verify → skip offset → take limit`.
+    /// `None` (the default) is equivalent to offset 0.
+    offset: Option<u64>,
     root_override: Option<PathBuf>,
     /// Sort mode for temporal queries — mutually exclusive.
     temporal_sort: Option<types::TemporalSort>,
@@ -362,6 +368,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut action_flag: Option<SearchAction> = None;
     let mut json = false;
     let mut limit: usize = 20;
+    let mut offset: Option<u64> = None;
     let mut root_override: Option<PathBuf> = None;
     let mut query_parts: Vec<String> = Vec::new();
     let mut temporal_sort: Option<types::TemporalSort> = None;
@@ -386,6 +393,19 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                 // `-n` has no equals form so the "--limit=" prefix never fires for it.
                 let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--limit")?;
                 limit = parse_limit_value(&raw)?;
+                if consumed {
+                    i += 1;
+                }
+            }
+            s if s == "--offset" || s.starts_with("--offset=") => {
+                // Pagination offset: skip N verified results before collecting.
+                // Applied AFTER verification (RESOLVED Decision 3 / AC#11).
+                // Space-separated (`--offset 5`) and equals (`--offset=5`) both accepted.
+                let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--offset")?;
+                let parsed = raw
+                    .parse::<u64>()
+                    .map_err(|_| anyhow::anyhow!("--offset value must be a non-negative integer, got {:?}", raw))?;
+                offset = Some(parsed);
                 if consumed {
                     i += 1;
                 }
@@ -430,8 +450,8 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
             s if s.starts_with("--") => {
                 anyhow::bail!(
                     "unrecognised flag {:?}. Valid flags: --build, --rebuild, --update, \
-                     --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --root, \
-                     --ast, --hot, --cold, --risky, --blast-radius, --weights",
+                     --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --offset, \
+                     --root, --ast, --hot, --cold, --risky, --blast-radius, --weights",
                     s
                 );
             }
@@ -447,6 +467,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
         action,
         json,
         limit,
+        offset,
         root_override,
         temporal_sort,
         blast_radius,
@@ -732,7 +753,13 @@ fn run_query(
     let config = types::QueryConfig {
         text: text.to_string(),
         limit: query_limit,
-        offset: None, // AD-372-3: offset not yet wired to CLI flags; None = no pagination
+        // AD-372-3 / RESOLVED Decision 3: offset is applied AFTER verification in
+        // resolve_paths_and_snippets_verified (rank → verify → skip offset → take limit).
+        // On the exact-symbol path query.rs sets sq.offset=None so the reader returns
+        // the full ranked intersection; effective_offset from config.offset is then
+        // passed to the post-verify skip.  On the multi-word path offset is also
+        // applied post-verify (same code path).
+        offset: flags.offset,
         json: flags.json,
         root,
         cache_dir,
@@ -863,6 +890,7 @@ Options:
   --remove-hooks   Remove skim git hooks
   --json           Output results as JSON
   --limit N        Maximum results to return (default: 20)
+  --offset N       Skip N verified results (pagination; default: 0)
   --root PATH      Override project root (default: walk up to .git)
   -h, --help       Print this help message
 
@@ -1053,6 +1081,39 @@ mod tests {
     fn test_parse_flags_json() {
         let flags = parse_flags(&["--json".to_string()]).unwrap();
         assert!(flags.json);
+    }
+
+    #[test]
+    fn test_parse_flags_offset_space() {
+        let flags = parse_flags(&["--offset".to_string(), "5".to_string()]).unwrap();
+        assert_eq!(flags.offset, Some(5));
+    }
+
+    #[test]
+    fn test_parse_flags_offset_equals() {
+        let flags = parse_flags(&["--offset=10".to_string()]).unwrap();
+        assert_eq!(flags.offset, Some(10));
+    }
+
+    #[test]
+    fn test_parse_flags_offset_zero() {
+        let flags = parse_flags(&["--offset".to_string(), "0".to_string()]).unwrap();
+        assert_eq!(flags.offset, Some(0));
+    }
+
+    #[test]
+    fn test_parse_flags_offset_default_is_none() {
+        let flags = parse_flags(&["--limit".to_string(), "5".to_string()]).unwrap();
+        assert_eq!(flags.offset, None, "offset must default to None when not supplied");
+    }
+
+    #[test]
+    fn test_parse_flags_offset_invalid_is_error() {
+        let err = parse_flags(&["--offset".to_string(), "abc".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("--offset"),
+            "error message must mention '--offset'; got: {err}"
+        );
     }
 
     #[test]

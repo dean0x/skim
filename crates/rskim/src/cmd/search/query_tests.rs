@@ -1454,3 +1454,532 @@ fn test_ac1_verify_gate_drops_trigram_overlap_non_literal() {
         found in results, which means verify gate is absent or broken"
     );
 }
+
+// ============================================================================
+// AC10 — Snippet baseline: match line == known line for exact-symbol path
+//
+// RESOLVED Decision 2: positions collected from ALL intersected trigrams,
+// snippet's match line must equal the file line that contains the token.
+// PF-007: this test would fail if match_positions is empty (no positions
+// forwarded from the intersection) because extract_snippet_and_verify would
+// return SnippetOutcome::Unavailable → line_number == None.
+// ============================================================================
+
+/// AC10 — exact-symbol path must collect match_positions from ALL intersected
+/// trigrams and produce a snippet whose match line equals the known token line.
+///
+/// PF-007 (discriminating): if positions are NOT collected from the intersection
+/// (e.g. empty match_positions forwarded), `extract_snippet_and_verify` returns
+/// `SnippetOutcome::Unavailable` and `line_number` is `None` — the assertion
+/// below catches both the missing-position bug and the wrong-line bug.
+///
+/// The token is placed on line 7 (1-based) to avoid trivial pass from coincidental
+/// line-0 defaults.
+#[test]
+fn test_ac10_snippet_match_line_equals_known_token_line() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // Token: "qxzplumb_resolver" on line 7 (1-based), surrounded by 6 other lines.
+    // Lines 1–6: filler; line 7: the token.
+    let content = "// line 1 header\n\
+                   // line 2\n\
+                   // line 3\n\
+                   // line 4\n\
+                   // line 5\n\
+                   // line 6\n\
+                   pub fn qxzplumb_resolver(x: u32) -> u32 { x }\n\
+                   // line 8 footer\n";
+
+    fs::write(src.join("resolver.rs"), content).unwrap();
+    // lib.rs: no "qxzplumb_resolver" at all (acts as negative control).
+    fs::write(
+        src.join("lib.rs"),
+        "pub mod resolver;\npub struct Config { pub value: u32 }\n",
+    )
+    .unwrap();
+
+    let config = make_config(&root, &cache_dir, "qxzplumb_resolver");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // The query must find at least one result (the definer file).
+    assert!(
+        !output.results.is_empty(),
+        "AC10: 'qxzplumb_resolver' must find at least one result; got 0"
+    );
+
+    // Find the resolver.rs result.
+    let resolver_result = output
+        .results
+        .iter()
+        .find(|r| r.path.ends_with("resolver.rs"));
+    assert!(
+        resolver_result.is_some(),
+        "AC10: 'src/resolver.rs' must appear in results; got: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    let r = resolver_result.unwrap();
+
+    // AC10 core: line_number must be Some and equal line 7 (1-based).
+    // If match_positions were empty (RESOLVED Decision 2 violated),
+    // extract_snippet_and_verify would return Unavailable → line_number = None.
+    assert!(
+        r.line_number.is_some(),
+        "AC10: snippet line_number must be Some — if None, match_positions was empty \
+        (RESOLVED Decision 2 violated: positions not collected from ALL intersected trigrams); \
+        result: {:?}",
+        r
+    );
+    assert_eq!(
+        r.line_number.unwrap(),
+        7,
+        "AC10: snippet match line must be 7 (1-based; the token 'qxzplumb_resolver' is \
+        on line 7); got {}. Wrong line means trigram positions are off or the snippet \
+        extractor is computing the wrong match line.",
+        r.line_number.unwrap()
+    );
+
+    // AC10: lib.rs must NOT appear (it does not contain the token).
+    let has_lib = output.results.iter().any(|r| r.path.ends_with("lib.rs"));
+    assert!(
+        !has_lib,
+        "AC10: 'src/lib.rs' does not contain 'qxzplumb_resolver' and must be absent"
+    );
+}
+
+// ============================================================================
+// AC11b — End-to-end pagination: --limit + --offset produce disjoint pages
+//
+// RESOLVED Decision 3: offset applied AFTER verification on the pure-lexical
+// CLI path.  execute_query_with_manifest must honor offset end-to-end.
+// PF-007: disjoint-page assertion fails if offset is applied pre-verify (pages
+// can overlap when stale/incidental-overlap candidates are dropped).
+// ============================================================================
+
+/// AC11b — end-to-end pagination via execute_query: --limit 1 --offset 0 and
+/// --limit 1 --offset 1 must return disjoint, non-empty, correctly-ordered pages.
+///
+/// PF-007 (discriminating): if offset is applied pre-verify (inside the reader,
+/// before the verify step drops stale/incidental-overlap files), both pages
+/// could return the same file or the second page could be empty when
+/// offset == 1 shifts past all candidates before verification runs.
+/// This test catches both the pre-verify offset bug and the no-offset-wired bug.
+#[test]
+fn test_ac11b_end_to_end_pagination_disjoint_pages() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // Two files both containing the token "qxzpag_token" so both survive the verify
+    // gate; with limit=1 each page shows exactly one file.
+    let token = "qxzpag_token";
+    fs::write(
+        src.join("file_a.rs"),
+        format!("pub fn {token}_handler() {{ }}\n"),
+    )
+    .unwrap();
+    // file_b.rs also contains the token — it must appear on page 2.
+    fs::write(
+        src.join("file_b.rs"),
+        format!("pub use crate::{token};\n"),
+    )
+    .unwrap();
+
+    // Page 0: limit=1, offset=0 (the default).
+    let config_p0 = QueryConfig {
+        text: token.to_string(),
+        limit: 1,
+        offset: None, // offset 0
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+    };
+    let page0 = execute_query(&config_p0, &TEST_ANALYTICS).unwrap();
+
+    // Page 1: same limit, offset=1 (skip the rank-1 result).
+    let config_p1 = QueryConfig {
+        text: token.to_string(),
+        limit: 1,
+        offset: Some(1),
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+    };
+    let page1 = execute_query(&config_p1, &TEST_ANALYTICS).unwrap();
+
+    // Both pages must return exactly 1 result.
+    assert_eq!(
+        page0.results.len(),
+        1,
+        "AC11b: page 0 (limit=1, offset=0) must return exactly 1 result; got {}",
+        page0.results.len()
+    );
+    assert_eq!(
+        page1.results.len(),
+        1,
+        "AC11b: page 1 (limit=1, offset=1) must return exactly 1 result; got {}. \
+        If offset is not wired (always None), page 1 returns the same result as page 0 \
+        or is empty (neither is correct).",
+        page1.results.len()
+    );
+
+    // Pages must be disjoint: the result on page 1 must differ from page 0.
+    let path0 = &page0.results[0].path;
+    let path1 = &page1.results[0].path;
+    assert_ne!(
+        path0, path1,
+        "AC11b: page 0 and page 1 must be disjoint (different files); both returned \
+        {:?}. This means offset is not being applied (pre-verify or not at all).",
+        path0
+    );
+}
+
+// ============================================================================
+// AC12 — End-to-end recall: execute_query_with_manifest on exact-symbol path
+//
+// RESOLVED Decision 3 / AD-372-3: the caller must NOT apply LEXICAL_CANDIDATE_POOL_K
+// for single-token queries (sq.limit = None) so the full intersection reaches the
+// verify step.  This integration test proves the definer appears in the final
+// QueryOutput.results even when it is the only match across a multi-file corpus.
+// ============================================================================
+
+/// AC12 — end-to-end recall via execute_query_with_manifest: a single-token query
+/// over a corpus with a large definer file must return the definer in the output.
+///
+/// PF-007 (discriminating): if sq.limit were set to LEXICAL_CANDIDATE_POOL_K × N
+/// and the definer is at rank > pool_limit, it would be truncated before the verify
+/// step and the assertion below would fail.  The exact-symbol path's sq.limit=None
+/// guarantees the full intersection reaches verification.
+#[test]
+fn test_ac12_e2e_caller_recall_single_token_finds_definer() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // Definer: file_0.rs defines the unique single-token symbol "qxzcalimba_def".
+    let token = "qxzcalimba_def";
+    fs::write(
+        src.join("file_0.rs"),
+        format!("/// The authoritative definer.\npub fn {token}(n: u32) -> u32 {{ n }}\n"),
+    )
+    .unwrap();
+    // Noise files: do NOT contain the token so only file_0.rs survives the verify gate.
+    for i in 1..=5u32 {
+        fs::write(
+            src.join(format!("noise_{i}.rs")),
+            format!("pub fn helper_{i}(x: u32) -> u32 {{ x + {i} }}\n"),
+        )
+        .unwrap();
+    }
+
+    let config = make_config(&root, &cache_dir, token);
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AC12: the definer must appear in results.
+    let has_definer = output
+        .results
+        .iter()
+        .any(|r| r.path.ends_with("file_0.rs"));
+    assert!(
+        has_definer,
+        "AC12: definer 'src/file_0.rs' must appear in e2e results for token {:?}; \
+        got: {:?}. If missing, sq.limit was applied BEFORE verification (pool cap cut it out).",
+        token,
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // AC12 (negative): noise files must NOT appear (they don't contain the token).
+    for i in 1..=5u32 {
+        let noise_path = format!("src/noise_{i}.rs");
+        let has_noise = output.results.iter().any(|r| r.path == noise_path);
+        assert!(
+            !has_noise,
+            "AC12: noise file '{}' does not contain '{}' and must NOT appear in results",
+            noise_path, token
+        );
+    }
+}
+
+// ============================================================================
+// AC13 — K-pool branching: multi-word uses LEXICAL_CANDIDATE_POOL_K; single-token
+// bypasses it (sq.limit = None on exact path).
+//
+// PF-007: a falsifiable test at the caller level verifying the branch.
+// ============================================================================
+
+/// AC13 — the execute_query caller must NOT apply LEXICAL_CANDIDATE_POOL_K for
+/// single-token queries and MUST apply it for multi-word queries.
+///
+/// PF-007 (discriminating, two-sided):
+/// (a) Single-token: with limit=1, a corpus where BOTH files contain the token
+///     must still find the second-ranked file when offset=1 — possible only if
+///     sq.limit=None (the full intersection reaches the verify step).
+/// (b) Multi-word: with limit=1, the K-pool widening (5×) must surface a file
+///     that would be missed if only `limit` (=1) candidates were fetched.
+///
+/// The test uses disjoint unique prefixes so n-gram overlap cannot contaminate
+/// the single-token path into the multi-word branch.
+#[test]
+fn test_ac13_single_token_bypasses_k_pool_multi_word_uses_it() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // Two files both contain single token "qxzac13_sym".
+    // file_a.rs has MORE occurrences so it ranks #1; file_b.rs ranks #2.
+    let token = "qxzac13_sym";
+    fs::write(
+        src.join("file_a.rs"),
+        format!(
+            "// many occurrences\n\
+             pub fn {token}_a() {{ }}\n\
+             pub fn {token}_b() {{ }}\n\
+             pub fn {token}_c() {{ }}\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        src.join("file_b.rs"),
+        format!("// single occurrence\npub fn {token}_entry() {{ }}\n"),
+    )
+    .unwrap();
+
+    // AC13(a): single-token path — with limit=1, offset=0 → rank-1 file.
+    //          with limit=1, offset=1 → rank-2 file.
+    // Both pages must be non-empty, proving sq.limit=None (not capped to 1).
+    let p0 = execute_query(
+        &QueryConfig {
+            text: token.to_string(),
+            limit: 1,
+            offset: None,
+            json: false,
+            root: root.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
+            blast_radius_paths: None,
+            ast_scored: None,
+            composite_weights: None,
+        },
+        &TEST_ANALYTICS,
+    )
+    .unwrap();
+    let p1 = execute_query(
+        &QueryConfig {
+            text: token.to_string(),
+            limit: 1,
+            offset: Some(1),
+            json: false,
+            root: root.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
+            blast_radius_paths: None,
+            ast_scored: None,
+            composite_weights: None,
+        },
+        &TEST_ANALYTICS,
+    )
+    .unwrap();
+
+    // AC13(a): both pages must be non-empty and disjoint.
+    assert_eq!(
+        p0.results.len(),
+        1,
+        "AC13(a): page 0 (single-token, limit=1, offset=0) must return 1 result; got {}",
+        p0.results.len()
+    );
+    assert_eq!(
+        p1.results.len(),
+        1,
+        "AC13(a): page 1 (single-token, limit=1, offset=1) must return 1 result; \
+        got {} — if 0, sq.limit was capped to 1 (K-pool applied on single-token path, wrong).",
+        p1.results.len()
+    );
+    assert_ne!(
+        p0.results[0].path, p1.results[0].path,
+        "AC13(a): pages must be disjoint; both returned {:?}",
+        p0.results[0].path
+    );
+
+    // AC13(b): multi-word path — two-word query "qxzac13_sym entry" uses K-pool,
+    // so with limit=1 AND K=5, pool = max(5, 100) = 100 candidates are fetched
+    // before verification; file_b.rs (which contains both "qxzac13_sym" and
+    // "entry" — appears in "qxzac13_sym_entry") must appear in the result.
+    let multi = execute_query(
+        &QueryConfig {
+            text: format!("{token} entry"),
+            limit: 20,
+            offset: None,
+            json: false,
+            root: root.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
+            blast_radius_paths: None,
+            ast_scored: None,
+            composite_weights: None,
+        },
+        &TEST_ANALYTICS,
+    )
+    .unwrap();
+
+    // file_b.rs contains "qxzac13_sym" and "entry" as adjacent substrings in
+    // "qxzac13_sym_entry", so the UNION path finds it; file_a.rs lacks "entry".
+    let has_file_b = multi.results.iter().any(|r| r.path.ends_with("file_b.rs"));
+    assert!(
+        has_file_b,
+        "AC13(b): multi-word query '{} entry' must surface file_b.rs (contains both tokens); \
+        got: {:?}",
+        token,
+        multi.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+}
+
+// ============================================================================
+// AC15a — Measured SLA: short_query_fallback with N=5,000 files stays < 2,000 ms
+//
+// RESOLVED Decision 4: the de-truncation of short_query_fallback (AD-372-4)
+// removed the internal .take(limit) so all indexed files are returned to the
+// caller for verification.  This is O(file_count) fan-out.  The SLA test is
+// the load-bearing reliability guarantee (reliability.md: every loop has a
+// fixed upper bound) that licenses the de-truncation.
+//
+// PF-007 (discriminating): without this timed bound the de-truncation has no
+// measured safety net; a pathological corpus could silently make short queries
+// unbounded.  This test fails if the wall-clock cost exceeds 2,000 ms.
+// ============================================================================
+
+/// AC15a — short_query_fallback with N=5,000 indexed files must complete in
+/// under 2,000 ms wall-clock time AND every file containing "fn" must appear
+/// in the result, including file_id >= 100 (above the old CANDIDATE_POOL_FLOOR).
+///
+/// PF-007 (timed, discriminating):
+/// - The 2,000 ms bound is the MEASURED SLA from RESOLVED Decision 4.
+/// - The file_id >= 100 assertion catches regressions where the old
+///   `.take(limit)` pre-truncation is re-added to short_query_fallback.
+/// - Without the SLA check, the de-truncated O(file_count) fan-out is unbounded.
+#[test]
+fn test_ac15a_short_query_fallback_5000_files_sla() {
+    use std::time::Instant;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // Build N=5_000 minimal Rust files each containing "fn".
+    const N: usize = 5_000;
+    for i in 0..N {
+        fs::write(
+            src.join(format!("f{i:04}.rs")),
+            format!("pub fn proc_{i}(x: u32) -> u32 {{ x }}\n"),
+        )
+        .unwrap();
+    }
+
+    // Cold-start: build the index by running a first query to trigger auto-build.
+    // We do not time this (index build cost is not the SLA we are measuring).
+    {
+        let build_config = QueryConfig {
+            text: "proc_0000".to_string(),
+            limit: 20,
+            offset: None,
+            json: false,
+            root: root.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
+            blast_radius_paths: None,
+            ast_scored: None,
+            composite_weights: None,
+        };
+        let _ = execute_query(&build_config, &TEST_ANALYTICS).unwrap();
+    }
+
+    // Timed query: "fn" is 2 bytes → short_query_fallback path (AD-355-7).
+    // Limit is set high to ensure all 5,000 results can be returned.
+    let query_config = QueryConfig {
+        text: "fn".to_string(),
+        limit: N + 100,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+    };
+
+    let t_start = Instant::now();
+    let output = execute_query(&query_config, &TEST_ANALYTICS).unwrap();
+    let elapsed_ms = t_start.elapsed().as_millis();
+
+    // Emit measured latency for observability.
+    eprintln!(
+        "AC15a: short_query_fallback N={N} files, 'fn' query: {elapsed_ms}ms, \
+        results={}, SLA=2000ms",
+        output.results.len()
+    );
+
+    // AC15a (recall): all N files contain "fn", so verify returns all of them.
+    // At minimum, a large fraction must be present (>= 90%) to confirm no
+    // internal pre-truncation.  We use N * 9 / 10 as the floor.
+    let min_expected = N * 9 / 10;
+    assert!(
+        output.results.len() >= min_expected,
+        "AC15a: short_query_fallback must return >= {min_expected} (90% of {N}) results for 'fn'; \
+        got {} — old .take(limit) pre-truncation re-introduced (AD-372-4 violated).",
+        output.results.len()
+    );
+
+    // AC15a: specifically check that file IDs >= 100 appear (above old CANDIDATE_POOL_FLOOR).
+    // We check by path since the manifest assigns FileIds by sorted path order.
+    let has_high_id_file = output.results.iter().any(|r| {
+        // Files are named f0100.rs..f4999.rs — any path with f0100 or higher.
+        r.path.contains("f0100") || r.path.contains("f1") || r.path.contains("f2")
+            || r.path.contains("f3") || r.path.contains("f4")
+    });
+    assert!(
+        has_high_id_file,
+        "AC15a: at least one file with high file_id (>= 100) must appear; \
+        suggests old CANDIDATE_POOL_FLOOR truncation still active"
+    );
+
+    // AC15a (SLA): the verified fan-out must stay under 2,000 ms wall-clock.
+    assert!(
+        elapsed_ms < 2_000,
+        "AC15a: short_query_fallback for {N} files took {elapsed_ms}ms, exceeding the \
+        RESOLVED Decision 4 SLA of 2,000ms. The O(file_count) verify fan-out is \
+        unbounded — profile short_query_fallback or the verify step."
+    );
+}

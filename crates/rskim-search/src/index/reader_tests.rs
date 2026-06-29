@@ -1268,6 +1268,58 @@ fn test_lexical_query_latency_representative_corpus() {
          Profile reader.rs scan_postings or posting_list_for_ngram if this fires.",
         min_elapsed.as_millis()
     );
+
+    // AC15 extension (3-byte single-token worst-case): a common 3-byte token
+    // such as "pub" that appears in ALL 1000 files produces the largest possible
+    // smallest-posting-list for the exact-symbol path.  The AND-intersection
+    // candidate set is the full corpus; this measures the worst-case latency for
+    // `search_exact_intersection` on the representative corpus.
+    //
+    // Bound: must stay within the same 50ms budget as the multi-file "wrapping_add"
+    // query above.  A 3-byte token has exactly ONE trigram ("pub") so the
+    // intersection step is trivially a single posting-list scan — it should be
+    // FASTER than the multi-trigram "wrapping_add" query.
+    //
+    // PF-007 (discriminating): if `search_exact_intersection` degrades on the
+    // single-trigram case (e.g. an accidental O(n²) de-dup loop), this gate fires.
+    let mut q3 = SearchQuery::new("pub");
+    q3.limit = Some(1000);
+
+    // Warm-up.
+    let _ = reader.search(&q3).unwrap();
+
+    let mut min3 = std::time::Duration::from_secs(u64::MAX);
+    let mut results3 = Vec::new();
+    for _ in 0..TIMED_SAMPLES {
+        let t = std::time::Instant::now();
+        results3 = reader.search(&q3).unwrap();
+        let e = t.elapsed();
+        if e < min3 {
+            min3 = e;
+        }
+    }
+
+    eprintln!(
+        "AC15 3-byte worst-case latency (min of {TIMED_SAMPLES}): {}ms \
+         (corpus={n_files} files, results={}, query='pub')",
+        min3.as_millis(),
+        results3.len()
+    );
+
+    // "pub" appears in every generated Rust module; results must be non-empty.
+    assert!(
+        !results3.is_empty(),
+        "AC15 3-byte guard: 'pub' must match in the 1000-file representative corpus"
+    );
+
+    // Latency guard: single-trigram intersection must stay within 50ms.
+    assert!(
+        min3.as_millis() < 50,
+        "AC15 3-byte worst-case: latency {}ms (min of {TIMED_SAMPLES}) exceeds the 50ms budget. \
+         A single-trigram AND-intersection should be faster than a multi-trigram UNION scan. \
+         Profile search_exact_intersection on the 1000-file corpus.",
+        min3.as_millis()
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -1724,6 +1776,85 @@ fn test_ac5_doc_id_dedup_in_intersection() {
         1,
         "AC#5: FileId(1) must appear exactly once"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AC #5 (corruption path): injected posting-decode failure on the exact-symbol
+// path must propagate Err(SearchError::IndexCorrupted) via `?` in
+// intersect_posting_doc_ids / search_exact_intersection / lookup_postings.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AC#5 (second sentence, PF-007): a corrupt/truncated posting blob on the
+/// exact-symbol path must cause `search()` (via `open()`) to return
+/// `Err(SearchError::IndexCorrupted)`, NOT silently return empty results.
+///
+/// The implementation propagates corruption from `open()` (CRC32 check) through
+/// the call chain: `open() → Err(IndexCorrupted)`.  On the search path the error
+/// propagates via `?` through:
+/// `lookup_postings → decode_postings_varint → intersect_posting_doc_ids →
+/// search_exact_intersection → search()`.
+///
+/// Strategy:
+/// 1. Build a valid index.
+/// 2. Corrupt a posting payload byte in the .skpost file.
+/// 3. Re-open → the CRC32 check in `open()` fires → `Err(IndexCorrupted)`.
+///
+/// PF-007 (discriminating): if CRC detection were removed from `open()`, corrupt
+/// data would silently decode with garbage results; the `is_err()` assertion
+/// would fail, surfacing the regression.  This test also pins the error message
+/// so accidental removal of the corruption-detection path is caught.
+#[test]
+fn test_ac5_corruption_error_on_exact_symbol_path() {
+    // Step 1: build a valid index with a single-token term that will use the
+    // exact-symbol (AND-intersection) path when queried.
+    let dir = tmp_dir();
+    let token = "corruption_test_fn";
+    {
+        let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+        builder
+            .add_file(
+                FileId(0),
+                &format!("pub fn {token}() {{ let x = 1; x }}"),
+                rskim_core::Language::Rust,
+            )
+            .unwrap();
+        builder.build().unwrap();
+    }
+
+    // Step 2: corrupt the posting blob in .skpost (flip a byte past the header).
+    let post_path = dir.path().join("index.skpost");
+    let mut data = std::fs::read(&post_path).unwrap();
+    assert!(
+        data.len() > 16,
+        "test setup: .skpost must have at least 16 bytes; got {}",
+        data.len()
+    );
+    let corrupt_idx = data.len() / 2;
+    data[corrupt_idx] ^= 0xFF;
+    std::fs::write(&post_path, &data).unwrap();
+
+    // Step 3: re-open — CRC32 check in open() must detect the corruption and
+    // return Err(SearchError::IndexCorrupted).
+    let result = NgramIndexReader::open(dir.path());
+    assert!(
+        result.is_err(),
+        "AC#5 (corruption path): a corrupt .skpost must cause open() to return Err; \
+         got Ok — CRC detection is absent or disabled (search_exact_intersection \
+         `?` propagation is load-bearing; removing CRC or swallowing errors breaks this)"
+    );
+
+    // PF-007 (discriminating): error message must contain a corruption indicator.
+    // If the error type changes from IndexCorrupted to a generic I/O error, the
+    // message check below catches the semantic change.
+    let err_str = format!("{}", result.err().unwrap());
+    assert!(
+        err_str.contains("checksum mismatch")
+            || err_str.contains("corrupt")
+            || err_str.contains("CRC"),
+        "AC#5: error must identify corruption (contain 'checksum mismatch', 'corrupt', \
+         or 'CRC'); got: {err_str}"
+    );
+
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

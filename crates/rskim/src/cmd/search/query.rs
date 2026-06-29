@@ -256,13 +256,19 @@ pub(super) fn execute_query_with_manifest(
     let exact_symbol = is_single_token(&config.text);
 
     let raw_results = if exact_symbol {
-        // AD-372-3: exact-symbol mode — no K-pool widening; reader returns the
-        // full intersection ordered by occurrence-count density (AD-372-6).
-        // sq.limit = None so the reader forwards the entire ranked intersection
-        // (offset is threaded through the reader via query.offset).
+        // AD-372-3 / RESOLVED Decision 3: exact-symbol mode.
+        // sq.limit = None: reader returns the FULL ranked intersection so that the
+        // post-verify skip (below) operates on the verified set, not the pre-verify
+        // intersection.  Applying offset inside the reader (pre-verify) would shift
+        // page boundaries when stale/incidental-overlap files are removed by the
+        // verify step — page-2 could silently omit a file that was at rank-1 after
+        // verification.  Setting sq.offset = None (reader default) keeps the full
+        // ranked intersection intact for the post-verify pagination below.
         let mut sq = SearchQuery::new(config.text.clone());
         sq.limit = None;
-        sq.offset = config.offset.map(|o| o as usize);
+        // sq.offset is intentionally left as None (== reader default 0): offset is
+        // applied AFTER verification in resolve_paths_and_snippets_verified below,
+        // matching RESOLVED Decision 3 and the multi-word path contract.
         engine.search(&sq)?
     } else {
         // Multi-word / default: widen pool via LEXICAL_CANDIDATE_POOL_K (AD-355-2).
@@ -274,17 +280,11 @@ pub(super) fn execute_query_with_manifest(
 
     // Resolve snippets, verify substring membership, then truncate to --limit LAST.
     //
-    // AD-355-2 / AD-355-4 / AD-372-3: verify-then-truncate-LAST invariant.
-    // For the exact-symbol path the reader already applied offset; for the UNION
-    // path offset is applied here by passing it to resolve_paths_and_snippets_verified.
-    // Both paths converge on the same verify-then-truncate-LAST call.
-    let effective_offset = if exact_symbol {
-        // Offset was already applied inside the reader (search_exact_intersection
-        // does skip(offset).take(limit) when limit=None/Some).  Do not re-apply.
-        0
-    } else {
-        config.offset.unwrap_or(0) as usize
-    };
+    // AD-355-2 / AD-355-4 / AD-372-3 / RESOLVED Decision 3:
+    // verify-then-truncate-LAST invariant.  Offset is applied HERE (post-verify)
+    // on BOTH the exact-symbol and multi-word paths so that page boundaries are
+    // consistent regardless of how many pre-verify candidates are dropped.
+    let effective_offset = config.offset.unwrap_or(0) as usize;
     let results = resolve_paths_and_snippets_verified(
         &raw_results,
         &sorted,
