@@ -55,6 +55,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ast_index.skcache`) across builds for files whose content is unchanged, avoiding a
   full AST re-parse on every rebuild. (#290)
 
+### Removed
+- **`skim search index` legacy positional subcommand** (#375) — the bareword `index`
+  as a leading positional to `skim search` was removed.  `skim search index` now
+  runs a **lexical query** for the word "index" (exit 0, returns matching files) rather
+  than building the index.  Builds go exclusively through the flag surface:
+  `skim search --build` (incremental), `skim search --rebuild` (full rebuild from
+  scratch), and `skim search --update` (refresh if stale).  A cold `skim search index`
+  on a fresh project auto-builds the index before running the query (existing
+  self-heal behavior — no change needed).  Historical `skim search index --rebuild`
+  calls in previous release notes refer to past release behavior and are unchanged.
+
 ### Changed
 - **`skim search` single-token queries now use AND-intersection + raw occurrence-count ranking** (#372) —
   Prior to this change, all lexical queries used a BM25F UNION pool: candidates ranked by BM25F score,

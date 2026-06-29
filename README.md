@@ -105,7 +105,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - `--json` for machine-readable output, `--path` to scope to a subdirectory
 
 ### Code Search (`skim search`)
-- **n-gram index** — build an AST-aware search index with `skim search index` (incremental SHA-256 cache, 50K file cap, `--force` for full rebuild)
+- **n-gram index** — build an AST-aware search index with `skim search --build` (incremental SHA-256 cache, 50K file cap; use `skim search --rebuild` for a full rebuild from scratch)
 - **Temporal sort flags** — rank results by git history signals: `--hot` (hotspot score), `--cold` (least-changed first), `--risky` (fix-commit density)
 - **Blast-radius filter** — `--blast-radius FILE` pre-filters candidates to files that historically co-change with FILE, then applies sort flags within that set
 - **AST structural search** — `--ast <pattern>` filters to files containing a named structural pattern (e.g. `try-catch`, `nested-loop`, `god-function`) or a containment query (e.g. `--ast "for_statement > await_expression"`); composable with a text query, `--hot`/`--cold`/`--risky` temporal sort flags, `--blast-radius`, `--limit`, and `--json`; degrades gracefully when heatmap data is absent (warns to stderr, returns unsorted, exit 0). Limitation: single-node queries (no `>` separator) are rejected (#283, unigram index not yet built)
