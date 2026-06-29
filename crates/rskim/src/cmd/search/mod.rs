@@ -1065,7 +1065,6 @@ mod tests {
     /// "layered n-gram BM25F") — the stdout assertion would fail.
     #[test]
     fn test_index_help_token_prints_parent_help() {
-        use std::io::Write as _;
         // Capture stdout by redirecting inside the test.  The easiest approach is to
         // drive the subprocess surface (via skim_bin_path) so stdout is truly captured.
         // The in-process `run()` call prints to stdout directly, so we use the binary.
@@ -1095,7 +1094,6 @@ mod tests {
             !stdout.contains("Build or update the search index for the current project."),
             "`skim search index --help` must NOT print IndexCli help; got stdout:\n{stdout}"
         );
-        let _ = std::io::stderr().flush();
     }
 
     /// AC8 (#375): bareword 'index' is parsed as a query term, not a build action.
