@@ -398,7 +398,7 @@ fn a2_bigram_matches_adjacency_only_file() {
 
 // --- A3: AND-intersect — multi-n-gram query keeps only files in EVERY posting list ---
 //
-// AD-374-1: `search_ast` now uses CandidateMode::AndIntersect.
+// AD-374-1: `search_ast` uses AND-intersect (run_ngram_set with no mode param).
 //
 // Fixture: bigram1 appears in files 0+1; bigram2 appears only in file 0.
 // AND-intersect result: ONLY file 0 (appears in both lists).

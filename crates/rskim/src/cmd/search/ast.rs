@@ -309,20 +309,15 @@ pub(super) fn run_ast_standalone(
         }
     }
 
-    // Temporal enrichment + re-sort, THEN truncate to `limit` (truncate after the
-    // sort so the top-`limit` by temporal score survive — AC-F4). Enrichment
-    // performs at most `window` per-file DB lookups (AC-P1). When the temporal
-    // DB is absent (temporal_db == None) results stay in raw AST order, unannotated
-    // (graceful degradation — AC-A3; the warning is emitted by the caller).
+    // Temporal enrichment + re-sort before the truncate-LAST step (AC-F4).
+    // When absent, results stay in raw AST order (graceful degradation — AC-A3).
     if let (Some(sort), Some(db)) = (temporal_sort, temporal_db) {
         super::temporal::enrich_ast_results(&mut resolved, sort, db);
-        resolved.truncate(limit);
-    } else {
-        // AD-374-3 / AD-355-2: truncate-LAST. Without a temporal re-sort, the
-        // verified pool is already in raw FileId/AST order — truncate to `limit`
-        // here so the caller receives exactly `min(limit, verified_count)` results.
-        resolved.truncate(limit);
     }
+    // AD-374-3 / AD-355-2: truncate-LAST — after any temporal re-sort so the
+    // top-`limit` by temporal score survive; in the non-temporal path this is
+    // the only truncation (min(limit, verified_count) results).
+    resolved.truncate(limit);
 
     // Re-parse the final (≤ `limit`) set to recover a representative line + snippet.
     // Re-parse runs strictly AFTER truncation (AC-API3, AC-8 #374, #201: at most

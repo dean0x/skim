@@ -26,22 +26,6 @@ use crate::{
     types::{SearchField, SearchLayer, SearchQuery, SearchResult},
 };
 
-/// Controls whether `run_ngram_set` performs AND-intersection (file must appear
-/// in every posting list) or the legacy OR-union (file in any posting list).
-///
-/// AD-374-1: AND-intersect replaces OR-union for all AST entry points so that a
-/// file is a candidate iff it contains every resolved n-gram of the pattern.
-/// Single-n-gram patterns trivially reduce to the prior union (one list →
-/// intersection == that list == old union; no regression).
-///
-/// `run_ngram_set_with_capacity` (test hook) uses `score_ngram_set` directly,
-/// bypassing this enum, so it preserves OR-union semantics for capacity tests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum CandidateMode {
-    /// AD-374-1 (production default): file must appear in ALL posting lists.
-    AndIntersect,
-}
-
 /// AST structural pattern query engine. Immutable; `&self`-only; `Send + Sync`.
 ///
 /// Use [`AstQueryEngine::new`] for DI (tests, Wave 4) or
@@ -71,7 +55,7 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
     /// - [`SearchError::IndexCorrupted`] on corrupt backing index.
     pub fn search_ast(&self, q: &AstQuery) -> Result<Vec<(FileId, f64)>> {
         let set = ast_query_to_ngram_set(q)?;
-        self.run_ngram_set(set.as_ref(), None, CandidateMode::AndIntersect)
+        self.run_ngram_set(set.as_ref(), None)
     }
 
     /// Inner scoring loop for both `search_ast` (no lang filter) and the
@@ -82,18 +66,12 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
     /// `search_ast` always passes `None` (Wave-4 merge-join contract: results
     /// are UNFILTERED, see AC12).
     ///
-    /// `mode` — controls AND-intersection vs OR-union candidate semantics.
-    /// AD-374-1: all callers use AND-intersect semantics.
-    ///
-    /// The `_mode` parameter is retained for API clarity (documents the intent);
-    /// only `CandidateMode::AndIntersect` exists. `run_ngram_set_with_capacity`
-    /// bypasses this function entirely when OR-union is needed (test hook for
-    /// P3 capacity tests).
+    /// AD-374-1: all callers use AND-intersect semantics. `run_ngram_set_with_capacity`
+    /// bypasses this function to preserve OR-union semantics for the P3 capacity tests.
     pub(super) fn run_ngram_set(
         &self,
         set: &AstNgramSet,
         lang_filter: Option<Language>,
-        _mode: CandidateMode,
     ) -> Result<Vec<(FileId, f64)>> {
         let ctx = self.score_ngram_set(set, lang_filter)?;
         let mut out = ctx.into_sorted_vec();
@@ -308,11 +286,9 @@ impl SearchLayer for AstQueryEngine<AstIndexReader> {
         let ast_q = parse_ast_query(raw.trim())?;
         let ngram_set = ast_query_to_ngram_set(&ast_q)?;
 
-        // AD-374-1: AND-intersect mode so SearchLayer::search agrees with search_ast
-        // on "what constitutes an AST match" (AC13: all three entry points must
-        // return the identical FileId set for the same pattern).
-        let mut hits =
-            self.run_ngram_set(ngram_set.as_ref(), query.lang, CandidateMode::AndIntersect)?;
+        // AD-374-1: AND-intersect — both entry points agree on "what constitutes an
+        // AST match" (AC13: all three entry points return the identical FileId set).
+        let mut hits = self.run_ngram_set(ngram_set.as_ref(), query.lang)?;
         // hits is FileId-ASC from run_ngram_set; lang filter already applied.
 
         // Apply file_filter allowlist (no I/O).
