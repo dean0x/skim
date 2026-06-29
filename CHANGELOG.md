@@ -24,13 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by approximately 61% on a representative corpus (measured: 3.53x source ratio vs 9.04x before
   compression).  Any existing `.skim/` index written by a prior version is silently stale; the
   first query triggers an automatic rebuild (`auto_refresh_if_stale`).  To force an immediate
-  rebuild: `skim search index --rebuild`.
+  rebuild: `skim search --rebuild`.
 
 - **`skim search` index format: v2 → v3 (n-gram key widened u16 → u32)** (#355) —
   The n-gram inverted-index key is now a 32-bit trigram `(b1<<16)|(b2<<8)|b3` instead
   of a 16-bit bigram `(b1<<8)|b2`.  Any existing `.skim/` index written by a prior
   version is silently stale; the first query triggers an automatic rebuild
-  (`auto_refresh_if_stale`).  To force an immediate rebuild: `skim search index --rebuild`.
+  (`auto_refresh_if_stale`).  To force an immediate rebuild: `skim search --rebuild`.
 
 ### Added
 - **`skim search --offset N`** — skip `N` verified results before collecting `--limit` results,
