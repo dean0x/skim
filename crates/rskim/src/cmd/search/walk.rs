@@ -35,8 +35,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// # Why this function exists (AD-373-2)
 ///
 /// AD-373-2: the byte string used to ORDER FileIds (walk) and the byte strings
-/// STORED as the manifest key (`consume`:615) and LOOKED UP for the lexical cache
-/// (`consume`:737) must all be produced by this one function. Any divergence
+/// STORED as the manifest key (index.rs `consume`, `path_key` for `new_manifest.insert`)
+/// and LOOKED UP for the lexical cache (index.rs `read_and_classify`, `path_key` for
+/// `manifest.lookup`) must all be produced by this one function. Any divergence
 /// reintroduces the #373 ordering skew (notably the `\\` → `/` normalization
 /// on Windows).
 ///
@@ -463,8 +464,8 @@ pub(super) fn walk_metadata(
     // BTreeMap<String> uses for key ordering. PathBuf::cmp is component-aware
     // and diverges from str::cmp on nested dirs (foo/bar.rs vs foo.rs), which
     // mis-resolved FileId→path (#373). normalize_rel_path produces the exact
-    // byte string stored as the manifest key (index.rs:615) so assignment order
-    // and resolution order are byte-identical.
+    // byte string stored as the manifest key (index.rs `consume`) so assignment
+    // order and resolution order are byte-identical.
     entries.sort_by_key(|a| normalize_rel_path(&a.rel_path));
 
     Ok((entries, skipped))

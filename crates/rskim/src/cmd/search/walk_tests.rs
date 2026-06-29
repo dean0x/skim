@@ -708,10 +708,4 @@ fn test_normalize_rel_path_collision_two_forms_of_same_path() {
         "normalize_rel_path('./foo') must be './foo' (no leading-dot strip — \
          that is temporal.rs's domain, not this helper's)"
     );
-    // Confirm no fs calls: both results are trivially consistent across
-    // runs (pure string transform; deterministic).
-    assert_eq!(
-        key_a, key_a.clone(),
-        "normalize_rel_path must be pure/deterministic (AC-10)"
-    );
 }
