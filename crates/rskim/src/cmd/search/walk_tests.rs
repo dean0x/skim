@@ -660,7 +660,11 @@ fn test_walk_metadata_flat_corpus_order_unchanged() {
     let root = root.canonicalize().unwrap();
     let (entries, _) = walk_metadata(&root, 50_000).unwrap();
 
-    assert_eq!(entries.len(), 3, "all 3 flat source files must be collected");
+    assert_eq!(
+        entries.len(),
+        3,
+        "all 3 flat source files must be collected"
+    );
 
     // For a flat corpus, byte order and PathBuf order are identical.
     let keys: Vec<String> = entries

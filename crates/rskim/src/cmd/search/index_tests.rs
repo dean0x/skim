@@ -2497,9 +2497,9 @@ fn e2e_build_index_waits_for_lock() {
 fn test_index_nested_dir_fileid_roundtrip() {
     use super::super::manifest::FileManifest;
     use super::super::query::execute_query;
+    use super::super::types::IndexConfig;
     use super::super::types::QueryConfig;
     use super::build_index;
-    use super::super::types::IndexConfig;
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -2524,8 +2524,7 @@ fn test_index_nested_dir_fileid_roundtrip() {
     build_index(&config).expect("build must succeed");
 
     // Verify manifest has 4 entries.
-    let manifest =
-        FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
+    let manifest = FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
     assert_eq!(manifest.entry_count(), 4, "must index all 4 files");
 
     // AC-2 round-trip: sorted_paths[i] must correspond to walk's FileId(i).
@@ -2593,8 +2592,8 @@ fn test_index_nested_dir_fileid_roundtrip() {
 fn test_manifest_v2_triggers_auto_rebuild_to_v3_on_next_query() {
     use super::super::manifest::FileManifest;
     use super::super::query::execute_query;
-    use super::super::types::QueryConfig;
     use super::super::types::IndexConfig;
+    use super::super::types::QueryConfig;
     use super::build_index;
 
     // 1. Build a fresh index (produces FORMAT_VERSION=3 manifest).
@@ -2619,7 +2618,10 @@ fn test_manifest_v2_triggers_auto_rebuild_to_v3_on_next_query() {
     let content = fs::read_to_string(&manifest_path).expect("manifest must exist after build");
     // Replace `"version":3` with `"version":2` in the header (first JSONL line).
     let mut lines: Vec<&str> = content.lines().collect();
-    assert!(!lines.is_empty(), "manifest must have at least a header line");
+    assert!(
+        !lines.is_empty(),
+        "manifest must have at least a header line"
+    );
     let v2_header = lines[0].replace("\"version\":3", "\"version\":2");
     lines[0] = Box::leak(v2_header.into_boxed_str());
     let v2_content = lines.join("\n") + "\n";
@@ -2668,8 +2670,8 @@ fn test_manifest_v2_triggers_auto_rebuild_to_v3_on_next_query() {
     // 5. Steady-state: run a second query against the freshly-built v3 manifest.
     //    Must NOT trigger another rebuild (no spurious rebuild loop).
     let mtime_before = fs::metadata(&manifest_path).unwrap().modified().unwrap();
-    let _output2 = execute_query(&q, &TEST_ANALYTICS)
-        .expect("second query against v3 manifest must succeed");
+    let _output2 =
+        execute_query(&q, &TEST_ANALYTICS).expect("second query against v3 manifest must succeed");
     let mtime_after = fs::metadata(&manifest_path).unwrap().modified().unwrap();
     assert_eq!(
         mtime_before, mtime_after,
@@ -2680,7 +2682,8 @@ fn test_manifest_v2_triggers_auto_rebuild_to_v3_on_next_query() {
 
     // Static: confirm FORMAT_VERSION constant is 3.
     assert_eq!(
-        FileManifest::FORMAT_VERSION, 3,
+        FileManifest::FORMAT_VERSION,
+        3,
         "manifest::FORMAT_VERSION must be 3 after #373 (AD-373-3). \
          If this fails, the constant was not bumped."
     );

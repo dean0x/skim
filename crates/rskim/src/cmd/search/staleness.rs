@@ -238,14 +238,22 @@ pub(super) fn check_staleness(
         }
     };
 
+    // Manifest self-heal: if the on-disk manifest has an old FORMAT_VERSION,
+    // report stale to trigger a rebuild (AD-373-3). This handles manifest
+    // version upgrades (e.g., 2→3 after the FileId ordering fix).
+    let manifest_stale = match FileManifest::version_matches(cache_dir) {
+        Ok(matches) => !matches,
+        Err(_) => true, // Unreadable → rebuild.
+    };
+
     let manifest = match FileManifest::load(project_root.to_path_buf(), cache_dir.to_path_buf()) {
         Ok(m) => m,
         // Cannot load the manifest — treat as no stored HEAD.
         Err(_) => return (StalenessCheck::NoStoredHead, None),
     };
 
-    if lexical_stale || ast_stale {
-        // Lexical or AST index is absent or below the current format version.
+    if lexical_stale || ast_stale || manifest_stale {
+        // Lexical, AST, or manifest index is absent or below the current format version.
         // Return NoStoredHead to trigger a full rebuild, but carry the loaded
         // manifest so display consumers (e.g. `--stats`) still show the real HEAD.
         return (StalenessCheck::NoStoredHead, Some(manifest));

@@ -37,8 +37,8 @@ use super::manifest::{FileManifest, ManifestEntry, decode_field_map, encode_fiel
 use super::staleness::read_git_head;
 use super::types::{IndexConfig, IndexResult, ProcessedFile, SkipReason, WalkEntry};
 use super::walk::{
-    ReadOutcome, discover_project_root, is_minified, normalize_rel_path, open_and_read,
-    sha256_hex, walk_metadata,
+    ReadOutcome, discover_project_root, is_minified, normalize_rel_path, open_and_read, sha256_hex,
+    walk_metadata,
 };
 
 // ============================================================================

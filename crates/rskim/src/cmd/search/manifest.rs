@@ -28,7 +28,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, BufWriter, Write as IoWrite};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
@@ -258,6 +258,54 @@ impl FileManifest {
             entries,
             git_head: header.git_head,
         })
+    }
+
+    /// Check if an on-disk manifest file exists and has the current FORMAT_VERSION.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the manifest exists and version matches.
+    /// - `Ok(false)` if the manifest exists but version is stale.
+    /// - `Err(...)` if the manifest cannot be read (for compatibility with other
+    ///   version checks, treat as "should rebuild").
+    ///
+    /// This is used by `check_staleness` to detect the AD-373-3 version bump
+    /// (FORMAT_VERSION 2→3) without loading the entire manifest into memory.
+    pub(super) fn version_matches(cache_dir: &Path) -> anyhow::Result<bool> {
+        let manifest_path = cache_dir.join(Self::MANIFEST_FILENAME);
+
+        let file = match std::fs::File::open(&manifest_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // No manifest file — treat as matching (cold start).
+                return Ok(true);
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("failed to open manifest: {}", manifest_path.display())
+                });
+            }
+        };
+
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+
+        let header_line = match lines.next() {
+            Some(Ok(line)) => line,
+            _ => {
+                // Unreadable or empty file — treat as matching (will be overwritten).
+                return Ok(true);
+            }
+        };
+
+        let header: ManifestHeader = match serde_json::from_str(&header_line) {
+            Ok(h) => h,
+            Err(_) => {
+                // Unparseable header — treat as matching (will be overwritten).
+                return Ok(true);
+            }
+        };
+
+        Ok(header.version == Self::FORMAT_VERSION)
     }
 
     // -----------------------------------------------------------------------

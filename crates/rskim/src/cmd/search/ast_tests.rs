@@ -2566,8 +2566,7 @@ fn run_ast_standalone_resolves_nested_dir_corpus_correctly() {
 
     build_project_index(root, cache.path());
 
-    let manifest =
-        FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
+    let manifest = FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
 
     let mut out: Vec<u8> = Vec::new();
     let result = super::run_ast_standalone(
