@@ -108,7 +108,8 @@ pub(super) struct FileManifest {
     cache_dir: PathBuf,
     /// Entries keyed by `ManifestEntry::path`, stored in sorted order via
     /// [`BTreeMap`] so that [`Self::sorted_paths`] and [`Self::save`] never
-    /// need to sort the keys — iteration order is alphabetical by construction.
+    /// need to sort the keys — iteration order is byte-wise string order by
+    /// construction (the FileId↔path ordering contract; see [`Self::sorted_paths`]).
     entries: BTreeMap<String, ManifestEntry>,
     /// Git HEAD SHA stored when the manifest was last written.
     ///
