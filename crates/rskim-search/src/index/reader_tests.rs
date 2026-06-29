@@ -1479,7 +1479,7 @@ fn test_ac6_result_set_non_regression_v4_codec() {
 // fails both when the feature is deleted AND when precision regresses.
 
 /// Helper: build a real `NgramIndexReader` (not the boxed `SearchLayer` trait)
-/// so we can call inherent methods like `intersect_posting_doc_ids`.
+/// so we can call inherent methods like `search_exact_intersection`.
 fn build_reader_with(
     files: &[(FileId, &str, rskim_core::Language)],
 ) -> (tempfile::TempDir, NgramIndexReader) {
@@ -1781,7 +1781,7 @@ fn test_ac5_doc_id_dedup_in_intersection() {
 // ─────────────────────────────────────────────────────────────────────────────
 // AC #5 (corruption path): injected posting-decode failure on the exact-symbol
 // path must propagate Err(SearchError::IndexCorrupted) via `?` in
-// intersect_posting_doc_ids / search_exact_intersection / lookup_postings.
+// search_exact_intersection / lookup_postings.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// AC#5 (second sentence, PF-007): a corrupt/truncated posting blob on the
