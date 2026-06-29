@@ -23,6 +23,31 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+// ============================================================================
+// Path normalization (shared between walk and consume)
+// ============================================================================
+
+/// Normalize a repo-relative `Path` to the canonical manifest key string.
+///
+/// Produces the same byte string that the manifest `BTreeMap<String>` stores as
+/// its key: `to_string_lossy()` followed by `\\` → `/` replacement.
+///
+/// # Why this function exists (AD-373-2)
+///
+/// AD-373-2: the byte string used to ORDER FileIds (walk) and the byte strings
+/// STORED as the manifest key (index.rs `consume`, `path_key` for `new_manifest.insert`)
+/// and LOOKED UP for the lexical cache (index.rs `read_and_classify`, `path_key` for
+/// `manifest.lookup`) must all be produced by this one function. Any divergence
+/// reintroduces the #373 ordering skew (notably the `\\` → `/` normalization
+/// on Windows).
+///
+/// Note: `temporal::normalize_blast_radius_path` is intentionally NOT consolidated
+/// here — it carries an extra `strip_prefix("./")` step that serves a different
+/// contract. Leave it in place (see the `#373 scope` NOTE in `temporal.rs`).
+pub(super) fn normalize_rel_path(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
 use anyhow::Context as _;
 use ignore::{WalkBuilder, WalkState};
 use rskim_core::Language;
@@ -284,8 +309,10 @@ pub(super) fn walk_and_read(
     // increments it).
     files.truncate(max_files);
 
-    // Sort after parallel collection for deterministic output.
-    files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    // AD-373-1 (ref): Sort by the same byte-wise normalized-string order as
+    // `walk_metadata` / the manifest BTreeMap<String> so this test-only walker
+    // and the production walker assign FileIds in the identical order.
+    files.sort_by_key(|a| normalize_rel_path(&a.rel_path));
 
     Ok((files, skipped))
 }
@@ -362,14 +389,23 @@ fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> MetaOutcome
 
 /// Walk `root` recursively, collecting file metadata without reading content.
 ///
-/// Returns a sorted (lexicographic by `rel_path`) list of [`WalkEntry`]s and
-/// collected [`SkipReason`]s.  Content reading is deferred to the streaming
-/// producer in the index pipeline.
+/// Returns a sorted list of [`WalkEntry`]s and collected [`SkipReason`]s.
+/// Content reading is deferred to the streaming producer in the index pipeline.
 ///
 /// # Ordering
 ///
-/// Entries are sorted by `rel_path` after parallel collection, giving
-/// deterministic FileId assignment in the consumer.
+/// Entries are sorted by [`normalize_rel_path`] (byte-wise `str` comparison of
+/// the normalized rel-path string) after parallel collection, giving
+/// deterministic FileId assignment in the consumer.  The sort key is
+/// byte-identical to the manifest `BTreeMap<String>` key, so `FileId(n)` in the
+/// walk corresponds to `sorted_paths()[n]` in the manifest — the invariant that
+/// all five FileId consumers depend on.
+///
+/// AD-373-1: FileId assignment MUST use the same byte-wise order as the manifest
+/// `BTreeMap<String>` resolution side (`sorted_paths`). `PathBuf::cmp` is
+/// component-aware and diverges from `str::cmp` on nested dirs (`foo/bar.rs`
+/// vs `foo.rs`), which mis-resolved `FileId`→path (#373). Sort by the
+/// normalized String key under `str` ordering.
 ///
 /// # Errors
 ///
@@ -424,8 +460,13 @@ pub(super) fn walk_metadata(
     // atomic counter.
     entries.truncate(max_files);
 
-    // Sort for deterministic FileId assignment in the consumer.
-    entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    // AD-373-1: Sort by the byte-wise normalized-string order that the manifest
+    // BTreeMap<String> uses for key ordering. PathBuf::cmp is component-aware
+    // and diverges from str::cmp on nested dirs (foo/bar.rs vs foo.rs), which
+    // mis-resolved FileId→path (#373). normalize_rel_path produces the exact
+    // byte string stored as the manifest key (index.rs `consume`) so assignment
+    // order and resolution order are byte-identical.
+    entries.sort_by_key(|a| normalize_rel_path(&a.rel_path));
 
     Ok((entries, skipped))
 }

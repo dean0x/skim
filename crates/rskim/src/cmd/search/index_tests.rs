@@ -2473,3 +2473,211 @@ fn e2e_build_index_waits_for_lock() {
          (t_complete={t_complete:?}, t_release={t_release:?})"
     );
 }
+
+// ============================================================================
+// #373: FileId↔path ordering skew (AC-2/AC-3/AC-7)
+// ============================================================================
+
+/// AC-2 / AC-3 (end-to-end build→resolve round-trip over nested dirs).
+///
+/// Build an index over a corpus where `PathBuf::cmp` and `str::cmp` diverge:
+/// `foo.rs`, `foo/bar.rs`, `foobar.rs`, `a/b/c.rs`.  Each file contains a
+/// unique sentinel token.  For each file, run a lexical query for its unique
+/// token and assert the result path matches the expected file — not a sibling.
+///
+/// AC-3 (lexical consumer): specifically verify that a token unique to
+/// `foo/bar.rs` returns `foo/bar.rs` and NOT `foo.rs`.  Pre-fix the verify
+/// gate (AD-355-7) would drop the mis-resolved candidate as a false positive,
+/// producing a silent recall loss; post-fix it returns the correct file.
+///
+/// PF-007: every assertion has a distinct negative counterpart — if the fix
+/// were reverted, at least one assertion would fail (the nested-dir files'
+/// result paths would resolve to the wrong sibling).
+#[test]
+fn test_index_nested_dir_fileid_roundtrip() {
+    use super::super::manifest::FileManifest;
+    use super::super::query::execute_query;
+    use super::super::types::IndexConfig;
+    use super::super::types::QueryConfig;
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("foo")).unwrap();
+    fs::create_dir_all(root.join("a/b")).unwrap();
+
+    // Each file has a unique sentinel token.
+    fs::write(root.join("foo.rs"), "fn sentinel_foo_root() {}\n").unwrap();
+    fs::write(root.join("foo/bar.rs"), "fn sentinel_foo_bar() {}\n").unwrap();
+    fs::write(root.join("foobar.rs"), "fn sentinel_foobar() {}\n").unwrap();
+    fs::write(root.join("a/b/c.rs"), "fn sentinel_abc() {}\n").unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    build_index(&config).expect("build must succeed");
+
+    // Verify manifest has 4 entries.
+    let manifest = FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
+    assert_eq!(manifest.entry_count(), 4, "must index all 4 files");
+
+    // AC-2 round-trip: sorted_paths[i] must correspond to walk's FileId(i).
+    // Check by querying each unique token and asserting the result path.
+    let cases: &[(&str, &str)] = &[
+        ("sentinel_foo_root", "foo.rs"),
+        ("sentinel_foo_bar", "foo/bar.rs"),
+        ("sentinel_foobar", "foobar.rs"),
+        ("sentinel_abc", "a/b/c.rs"),
+    ];
+
+    for (token, expected_suffix) in cases {
+        let q = QueryConfig {
+            text: token.to_string(),
+            limit: 5,
+            offset: None,
+            json: false,
+            root: root.to_path_buf(),
+            cache_dir: cache.path().to_path_buf(),
+            blast_radius_paths: None,
+            ast_scored: None,
+            composite_weights: None,
+        };
+        let output = execute_query(&q, &TEST_ANALYTICS)
+            .unwrap_or_else(|e| panic!("query for {token:?} failed: {e}"));
+
+        assert!(
+            !output.results.is_empty(),
+            "query for {token:?} must return at least one result (recall; \
+             pre-fix the verify gate would silently drop the mis-resolved candidate)"
+        );
+        let first_path = &output.results[0].path;
+        assert!(
+            first_path.ends_with(expected_suffix),
+            "query for {token:?}: expected result ending with {expected_suffix:?} \
+             but got {first_path:?}. Pre-fix: FileId was assigned in PathBuf order \
+             but resolved in BTreeMap byte order, so nested-dir files resolved to \
+             the wrong path (AC-2 / AD-373-1 regression)."
+        );
+        // Negative: the first result must NOT be a sibling (the wrong file).
+        // For foo/bar.rs: pre-fix returned foo.rs.
+        if *expected_suffix == "foo/bar.rs" {
+            assert!(
+                !first_path.ends_with("foo.rs") || first_path.ends_with("foo/bar.rs"),
+                "AC-3 (lexical consumer): foo/bar.rs query must NOT return foo.rs as the \
+                 top result. Pre-fix: FileId skew would map foo/bar.rs's FileId to foo.rs. \
+                 If this fires, AD-373-1 was reverted."
+            );
+        }
+    }
+}
+
+/// AC-7 / AC-11: Manifest FORMAT_VERSION 2 → 3 — a hand-written v2 manifest
+/// is detected stale on the next query and rebuilt automatically (correctness-
+/// on-upgrade, no manual --rebuild needed).  A freshly-built v3 manifest is
+/// NOT re-treated as stale on a second query (no spurious rebuild loop).
+///
+/// PF-007: two negative assertions — (i) reverting the FORMAT_VERSION to 2
+/// would make the v2 fixture survive the staleness check and FAIL the "was
+/// rebuilt" assertion below; (ii) returning a rebuild on every v3 query would
+/// FAIL the "no spurious rebuild on v3" assertion.
+///
+/// Cites AD-373-3.
+#[test]
+fn test_manifest_v2_triggers_auto_rebuild_to_v3_on_next_query() {
+    use super::super::manifest::FileManifest;
+    use super::super::query::execute_query;
+    use super::super::types::IndexConfig;
+    use super::super::types::QueryConfig;
+    use super::build_index;
+
+    // 1. Build a fresh index (produces FORMAT_VERSION=3 manifest).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("check.rs"), "fn probe() { let x = 1; }\n").unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    build_index(&config).expect("initial build must succeed");
+
+    // 2. Overwrite the manifest header's version field with v2 (simulate
+    //    a pre-fix on-disk state).
+    let manifest_path = cache.path().join("index.skfiles");
+    let content = fs::read_to_string(&manifest_path).expect("manifest must exist after build");
+    // Replace `"version":3` with `"version":2` in the header (first JSONL line).
+    let v2_content = content.replacen("\"version\":3", "\"version\":2", 1);
+    fs::write(&manifest_path, &v2_content).expect("must be able to rewrite manifest");
+
+    // Verify the overwrite took effect.
+    let raw = fs::read_to_string(&manifest_path).unwrap();
+    assert!(
+        raw.contains("\"version\":2"),
+        "manifest header must now say version 2 (simulating pre-fix on-disk state)"
+    );
+
+    // 3. Run a query. The staleness path detects VERSION_MISMATCH (2 ≠ 3) and
+    //    rebuilds automatically — no manual --rebuild.
+    let q = QueryConfig {
+        text: "probe".to_string(),
+        limit: 5,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache.path().to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+    };
+    let output = execute_query(&q, &TEST_ANALYTICS)
+        .expect("query against v2 manifest must succeed (auto-rebuild)");
+
+    // After auto-rebuild the query must find our function.
+    assert!(
+        !output.results.is_empty(),
+        "AC-7/AC-11: after auto-rebuild from v2→v3, query for 'probe' must find results. \
+         If this fails, the staleness path did not trigger (FORMAT_VERSION 2 was accepted \
+         as current — version was not bumped to 3, reverting AD-373-3)."
+    );
+
+    // 4. Verify the manifest on disk is now v3.
+    let rebuilt = fs::read_to_string(&manifest_path).unwrap();
+    assert!(
+        rebuilt.contains("\"version\":3"),
+        "AC-7/AC-11: after auto-rebuild, the on-disk manifest must be at FORMAT_VERSION 3. \
+         Got: {:?}",
+        &rebuilt[..rebuilt.find('\n').unwrap_or(rebuilt.len())]
+    );
+
+    // 5. Steady-state: run a second query against the freshly-built v3 manifest.
+    //    Must NOT trigger another rebuild (no spurious rebuild loop).
+    let mtime_before = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+    let _output2 =
+        execute_query(&q, &TEST_ANALYTICS).expect("second query against v3 manifest must succeed");
+    let mtime_after = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime_before, mtime_after,
+        "AC-7 steady-state: a v3 manifest must NOT be rebuilt on a second query \
+         (no spurious rebuild loop). mtime changed, suggesting the manifest was \
+         rewritten — FORMAT_VERSION check is not working correctly."
+    );
+
+    // Static: confirm FORMAT_VERSION constant is 3.
+    assert_eq!(
+        FileManifest::FORMAT_VERSION,
+        3,
+        "manifest::FORMAT_VERSION must be 3 after #373 (AD-373-3). \
+         If this fails, the constant was not bumped."
+    );
+}
