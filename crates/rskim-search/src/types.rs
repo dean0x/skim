@@ -497,19 +497,37 @@ pub trait SearchLayer: Send + Sync {
     /// - When `query.offset` is `Some(k)`, the first `k` candidates (in rank order)
     ///   are skipped.  When `None`, no candidates are skipped.
     ///
-    /// # Short-query semantics (AD-355-7)
+    /// # Two-mode dispatch (AD-372-1)
+    ///
+    /// The `NgramIndexReader` implementation dispatches on query shape after
+    /// extracting trigrams:
+    ///
+    /// 1. **Short-query fallback** (< 3 bytes → zero trigrams, AD-355-7 / AD-372-4):
+    ///    emits the FULL filtered candidate set as score-0 entries (no internal
+    ///    `take`); the caller's verify-then-truncate-LAST step is the only gate.
+    ///
+    /// 2. **Exact-symbol mode** (single contiguous token, ≥ 3 bytes, no interior
+    ///    whitespace — detected by [`crate::ngram::is_single_token`]):
+    ///    generates candidates via AND-intersection of the query trigrams'
+    ///    posting lists (grep-exact, limit/size-independent).  Ranked by
+    ///    raw occurrence-count (length-norm-free, AD-372-6) so
+    ///    large-file definers are not buried by BM25F field-length normalization.
+    ///    Callers on the pure-lexical path MUST set `query.limit = None` so the
+    ///    complete intersection is forwarded to the verify-then-truncate-LAST
+    ///    step (AD-372-3).
+    ///
+    /// 3. **Multi-word / UNION mode** (two or more whitespace tokens): the
+    ///    existing BM25F UNION loop with `collect_scored_results`, unchanged from
+    ///    pre-#372.
+    ///
+    /// # Short-query semantics (AD-355-7 / AD-372-4)
     ///
     /// For queries shorter than 3 bytes, `extract_query_ngrams` returns an empty
     /// n-gram set.  The `NgramIndexReader` implementation emits ALL indexed files
-    /// as score-0 candidates via a file-id-order fallback so that verification
-    /// layers can apply a literal-substring filter.
-    ///
-    /// - Candidates from this path are in file-id/insertion order (NOT relevance
-    ///   order) and carry `score = 0.0` with empty `match_positions`.
-    /// - Any consumer of this trait **must NOT** assume `search()` returns matches;
-    ///   it returns candidates that require verification.
-    /// - Caller-specified `limit` and `file_filter` are honoured on the fallback
-    ///   path on the same terms as the normal n-gram-scored path.
+    /// (filtered by `file_filter` + `lang_filter`) as score-0 candidates with
+    /// **no internal pre-truncation**.  Caller-specified `limit`, `file_filter`,
+    /// and `lang_filter` are honoured; offset+limit are applied by the caller
+    /// AFTER verification.
     ///
     /// # Errors
     /// Returns [`SearchError`] if the query is invalid or the index is corrupted.

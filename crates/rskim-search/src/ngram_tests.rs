@@ -392,6 +392,90 @@ fn extract_ngrams_uses_production_weights() {
     }
 }
 
+// ── Cycle 6: is_single_token predicate matrix (AC #6, AD-372-5) ──────────
+
+/// AC #6 / AD-372-5: `is_single_token` is the single source of truth for
+/// exact-symbol mode.  Every entry in the predicate matrix must be asserted
+/// individually (PF-007: discriminating, not vacuous).
+///
+/// Negative assertions ensure the test fails if `is_single_token` were
+/// changed to always return `true` or always return `false`.
+#[test]
+fn is_single_token_predicate_matrix() {
+    use super::is_single_token;
+
+    // ── TRUE cases ──────────────────────────────────────────────────────────
+    assert!(
+        is_single_token("foo"),
+        "is_single_token('foo') must be true: non-empty, >= 3 bytes, single token"
+    );
+    assert!(
+        is_single_token("foo::bar"),
+        "is_single_token('foo::bar') must be true: punctuation-joined, no whitespace"
+    );
+    assert!(
+        is_single_token("  foo  "),
+        "is_single_token('  foo  ') must be true: leading/trailing whitespace stripped"
+    );
+    assert!(
+        is_single_token("decode_postings_varint"),
+        "is_single_token('decode_postings_varint') must be true: real symbol name"
+    );
+
+    // ── FALSE cases ─────────────────────────────────────────────────────────
+    assert!(
+        !is_single_token("foo bar"),
+        "is_single_token('foo bar') must be false: interior space → two tokens"
+    );
+    assert!(
+        !is_single_token("fn"),
+        "is_single_token('fn') must be false: < 3 bytes"
+    );
+    assert!(
+        !is_single_token("if"),
+        "is_single_token('if') must be false: < 3 bytes"
+    );
+    assert!(
+        !is_single_token("a\tb"),
+        "is_single_token('a\\tb') must be false: interior tab → two tokens"
+    );
+    assert!(
+        !is_single_token(""),
+        "is_single_token('') must be false: empty string"
+    );
+    assert!(
+        !is_single_token("  "),
+        "is_single_token('  ') must be false: whitespace-only string"
+    );
+    assert!(
+        !is_single_token("ab"),
+        "is_single_token('ab') must be false: < 3 bytes"
+    );
+    assert!(
+        !is_single_token("alpha gamma"),
+        "is_single_token('alpha gamma') must be false: two space-separated tokens"
+    );
+
+    // ── Multibyte / UTF-8 boundary ───────────────────────────────────────────
+    //
+    // `is_single_token` uses `trimmed.len()` which is BYTE length (not char count).
+    // This pins the byte-length contract (consistent with the byte-based trigram index):
+    // a codepoint that encodes to >= 3 bytes is classified as a single token,
+    // while a codepoint that encodes to < 3 bytes is not.
+    //
+    // Positive: a 3-byte UTF-8 codepoint (e.g. U+4E2D, '中', 3 bytes) satisfies
+    //   the >= 3 byte requirement and contains no whitespace → true.
+    // Negative: a 2-byte UTF-8 codepoint (e.g. U+00E9, 'é', 2 bytes) is < 3 bytes → false.
+    assert!(
+        is_single_token("中"), // U+4E2D: 3 UTF-8 bytes, no whitespace
+        "is_single_token('中') must be true: single codepoint, 3 UTF-8 bytes >= 3 (byte-len contract)"
+    );
+    assert!(
+        !is_single_token("é"), // U+00E9: 2 UTF-8 bytes < 3
+        "is_single_token('é') must be false: single codepoint, 2 UTF-8 bytes < 3 (byte-len contract)"
+    );
+}
+
 #[test]
 fn extract_query_ngrams_uses_production_weights() {
     let result = extract_query_ngrams("fn main()");

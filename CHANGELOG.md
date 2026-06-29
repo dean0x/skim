@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`auto_refresh_if_stale`).  To force an immediate rebuild: `skim search index --rebuild`.
 
 ### Added
+- **`skim search --offset N`** — skip `N` verified results before collecting `--limit` results,
+  enabling pagination across all query paths (pure-lexical, compound text+`--ast`,
+  `--blast-radius`, and temporal).  The offset is applied AFTER the verify gate so page
+  boundaries are stable even when stale/incidental-overlap candidates are dropped.
+  Default: 0 (no skip). (#372)
 - **`skim search --weights lexical,ast,temporal`** — tune the `--blast-radius` composite
   ranking; default `0.5,0.3,0.2`. Ratios only (not normalized; zero and non-sum-to-1 are
   accepted, negative/NaN/inf rejected). On the `--blast-radius` path only the lexical and
@@ -42,6 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full AST re-parse on every rebuild. (#290)
 
 ### Changed
+- **`skim search` single-token queries now use AND-intersection + raw occurrence-count ranking** (#372) —
+  Prior to this change, all lexical queries used a BM25F UNION pool: candidates ranked by BM25F score,
+  which divides term-frequency by field length, penalising large files.  For single contiguous tokens
+  (≥ 3 bytes, no interior whitespace — the common identifier search), the engine now:
+  (1) AND-intersects the query's trigram posting lists (grep-exact, corpus-size-independent recall),
+  (2) ranks surviving files by raw occurrence count (length-norm-free, AD-372-6) so large-file definers
+  with multiple references are not buried by small stubs that have 1 occurrence in a tiny file.
+  BM25F UNION is unchanged for multi-word queries.  The verify gate (literal substring membership)
+  is preserved on both paths.  Result ordering for single-token queries may change after upgrade.
 - **`skim search` lexical results are now filtered to files literally containing the query** (#355) —
   Prior to this change the n-gram index returned candidates ranked by BM25F score, but no
   literal-substring check was performed: a file could appear in results even if none of its

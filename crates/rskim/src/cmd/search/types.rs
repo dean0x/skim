@@ -91,6 +91,11 @@ pub(super) struct QueryConfig {
     pub text: String,
     /// Maximum number of results to return (default: 20).
     pub limit: usize,
+    /// Number of results to skip before returning (for pagination).
+    ///
+    /// `None` means no offset (equivalent to 0). Used on the pure-lexical exact-symbol
+    /// path (AD-372-3) and threaded through to `resolve_paths_and_snippets_verified`.
+    pub offset: Option<usize>,
     /// When `true`, output JSON instead of human-readable text.
     pub json: bool,
     /// Project root (absolute path).

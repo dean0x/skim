@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use rskim_search::{
     CompositeWeights, FileId, IndexStats, NgramIndexReader, QueryEngine, SearchLayer, SearchQuery,
-    SearchResult, StructuralMetrics, intersect_and_rank, merge_layer_scores,
+    SearchResult, StructuralMetrics, intersect_and_rank, is_single_token, merge_layer_scores,
     recompose_with_lexical,
 };
 
@@ -232,42 +232,70 @@ pub(super) fn execute_query_with_manifest(
 
     // ── Pure-lexical path (no blast-radius, no AST) ──────────────────────────
     //
-    // AD-355-2: The candidate pool is widened before verification and truncation.
+    // AD-372-3 / AD-355-2: Two sub-paths depending on query shape.
     //
-    // Without widening, the reader truncates to `--limit` BEFORE we can verify
-    // substring membership: the definer file may already have been discarded below
-    // incidental-overlap junk that happens to share a few trigrams.  By fetching
-    // LEXICAL_CANDIDATE_POOL_K × limit candidates first, we ensure verification
-    // acts as a true filter over the ranked list, not over an already-truncated
-    // stub.  After verification the result set is truncated to `--limit` LAST.
+    // **Exact-symbol path** (`is_single_token` == true, ≥3 bytes):
+    //   The reader's `search_exact_intersection` generates an AND-intersection
+    //   candidate set that is grep-exact and limit/size-independent: every file
+    //   containing the literal token is in the candidate set regardless of file
+    //   size or pool size.  `sq.limit = None` (no LEXICAL_CANDIDATE_POOL_K
+    //   widening) so the complete intersection reaches
+    //   `resolve_paths_and_snippets_verified`.  The reader still ranks the
+    //   intersection internally (AD-372-6: raw occurrence-count,
+    //   length-norm-free), and offset is applied after ranking.
     //
-    // K=5, floor CANDIDATE_POOL_FLOOR: matches the temporal.rs resort_window() heuristic
-    // so the two paths behave consistently.  This value has no measured corpus basis;
-    // calibrating K for large corpora is tracked in #361.
+    // **Multi-word / default path** (`is_single_token` == false):
+    //   The existing UNION/BM25F path still uses LEXICAL_CANDIDATE_POOL_K×limit
+    //   widening (AD-355-2) because BM25F rank is approximate and the definer
+    //   file may appear past rank N in the UNION ordering.
     //
-    // AD-355-4: Dropping non-matching candidates is a relevance gate, NOT an output
-    // elision/cap under #317 "compress-never-truncate".  It does not hide output that
-    // the user would otherwise see; it removes candidates that do not satisfy the
-    // literal query.  No `elision_marker` is needed here.
+    // AD-355-4: Dropping non-matching candidates is a relevance gate, NOT an
+    // output elision/cap under #317 "compress-never-truncate".  No
+    // `elision_marker` is needed.
     const LEXICAL_CANDIDATE_POOL_K: usize = 5;
-    let pool_limit = candidate_pool(config.limit, LEXICAL_CANDIDATE_POOL_K);
-    let mut sq = SearchQuery::new(config.text.clone());
-    sq.limit = Some(pool_limit);
+    let exact_symbol = is_single_token(&config.text);
 
-    // Execute the search over the wider candidate pool.
-    let raw_results = engine.search(&sq)?;
+    let raw_results = if exact_symbol {
+        // AD-372-3 / RESOLVED Decision 3: exact-symbol mode.
+        // sq.limit = None: reader returns the FULL ranked intersection so that the
+        // post-verify skip (below) operates on the verified set, not the pre-verify
+        // intersection.  Applying offset inside the reader (pre-verify) would shift
+        // page boundaries when stale/incidental-overlap files are removed by the
+        // verify step — page-2 could silently omit a file that was at rank-1 after
+        // verification.  Setting sq.offset = None (reader default) keeps the full
+        // ranked intersection intact for the post-verify pagination below.
+        let mut sq = SearchQuery::new(config.text.clone());
+        sq.limit = None;
+        // sq.offset is intentionally left as None (== reader default 0): offset is
+        // applied AFTER verification in resolve_paths_and_snippets_verified below,
+        // matching RESOLVED Decision 3 and the multi-word path contract.
+        engine.search(&sq)?
+    } else {
+        // Multi-word / default: widen pool via LEXICAL_CANDIDATE_POOL_K (AD-355-2).
+        let pool_limit = candidate_pool(config.limit, LEXICAL_CANDIDATE_POOL_K);
+        let mut sq = SearchQuery::new(config.text.clone());
+        sq.limit = Some(pool_limit);
+        engine.search(&sq)?
+    };
 
     // Resolve snippets, verify substring membership, then truncate to --limit LAST.
     //
-    // AD-355-2 / AD-355-4: verify-then-truncate-LAST invariant.
+    // AD-355-2 / AD-355-4 / AD-372-3 / RESOLVED Decision 3:
+    // verify-then-truncate-LAST invariant.  Offset is applied HERE (post-verify)
+    // on BOTH the exact-symbol and multi-word paths so that page boundaries are
+    // consistent regardless of how many pre-verify candidates are dropped.
+    let effective_offset = config.offset.unwrap_or(0);
     let results = resolve_paths_and_snippets_verified(
         &raw_results,
         &sorted,
         root,
         &manifest,
-        &[],
-        &config.text,
-        config.limit,
+        SnippetVerifyParams {
+            query: &config.text,
+            layers_matched: &[],
+            limit: config.limit,
+            offset: effective_offset,
+        },
     );
 
     let total = results.len();
@@ -425,14 +453,22 @@ fn run_compound_query(
     // Verification drops non-matching candidates (relevance gate, not a #317 cap);
     // truncation to config.limit happens inside resolve_paths_and_snippets_verified
     // as the final step.
+    // AD-372-3 / PF-006: thread config.offset into the compound path so that
+    // `skim search "foo" --ast try-catch --offset 10` paginates correctly.
+    // The RRF recomposition does NOT apply offset; pagination is handled here,
+    // post-verify, as on the pure-lexical path.
+    let effective_offset = config.offset.unwrap_or(0);
     let results = resolve_paths_and_snippets_verified(
         &recomposed,
         ctx.sorted,
         ctx.root,
         ctx.manifest,
-        &["lexical", "ast"],
-        &config.text,
-        config.limit,
+        SnippetVerifyParams {
+            query: &config.text,
+            layers_matched: &["lexical", "ast"],
+            limit: config.limit,
+            offset: effective_offset,
+        },
     );
     let total = results.len();
     let duration_ms = ctx.start.elapsed().as_millis() as u64;
@@ -554,6 +590,11 @@ fn run_blast_radius_composite_query(
     // For co-change-only files (absent from lexical pool): no file content is
     // available here; these are pure temporal results that the text query did not
     // match — include them unconditionally (AC12, UNION mode).
+    // AD-372-3 / PF-006: thread config.offset into the blast-radius path so that
+    // `skim search "foo" --blast-radius src/x.rs --offset 10` paginates correctly.
+    // Applied post-verify (`.skip` before `.take`), consistent with the pure-lexical
+    // and compound paths.
+    let effective_offset = config.offset.unwrap_or(0);
     let results: Vec<super::types::ResolvedResult> = ranked
         .iter()
         .filter_map(|&(fid, composite_score)| {
@@ -613,7 +654,9 @@ fn run_blast_radius_composite_query(
                 })
             }
         })
-        // AD-355-2: truncate to --limit LAST — after verification, not before.
+        // AD-355-2 / AD-372-3: apply offset then truncate LAST — after verification
+        // removes non-matching candidates (consistent with pure-lexical path).
+        .skip(effective_offset)
         .take(config.limit)
         .collect();
 
@@ -648,6 +691,22 @@ fn decode_snippet(
     }
 }
 
+/// Output-shaping parameters for [`resolve_paths_and_snippets_verified`].
+///
+/// Groups the query string, layer attribution, and pagination fields so the
+/// function signature stays within the seven-argument Clippy limit.
+struct SnippetVerifyParams<'a> {
+    /// The literal query text used for AND-token verification (AD-355-3).
+    query: &'a str,
+    /// Layer names that contributed signal to these results (e.g. `["lexical"]`
+    /// or `["lexical", "ast"]`).  Forwarded verbatim into each [`ResolvedResult`].
+    layers_matched: &'a [&'static str],
+    /// Maximum results to return (applied LAST, after verification).
+    limit: usize,
+    /// Number of verified results to skip before collecting (AD-372-3).
+    offset: usize,
+}
+
 /// Map `FileId`s to paths, extract snippets, **verify substring membership**,
 /// and truncate to `limit` — all in one pass with a single file read per result.
 ///
@@ -669,9 +728,12 @@ fn decode_snippet(
 ///
 /// The worst-case file-read count equals `raw_results.len()`, which is bounded
 /// by the caller's `sq.limit` — itself bounded to:
-///   - Pure-lexical path:   `max(limit × LEXICAL_CANDIDATE_POOL_K, 100)` = `max(5N, 100)`.
-///   - Blast-radius path:   `max(limit × BLAST_CANDIDATE_POOL_K, 100)`  = `max(10N, 100)`.
-///   - Compound text+AST:   `|ast_set|` (exact AST match count; no K multiplier, AD-356-1).
+///   - Pure-lexical exact-symbol path: `|intersection|` (AND of query trigram posting
+///     lists; `sq.limit = None` so the full intersection reaches verify). Bounded by
+///     posting list sizes, not corpus size (AD-372-2 superset invariant).
+///   - Pure-lexical multi-word path:   `max(limit × LEXICAL_CANDIDATE_POOL_K, 100)` = `max(5N, 100)`.
+///   - Blast-radius path:              `max(limit × BLAST_CANDIDATE_POOL_K, 100)`  = `max(10N, 100)`.
+///   - Compound text+AST:              `|ast_set|` (exact AST match count; no K multiplier, AD-356-1).
 ///
 /// The fan-out is therefore O(K × limit) file reads — bounded for any fixed K and
 /// user-supplied `--limit`.  Calibrating K for large corpora is tracked in #361.
@@ -680,10 +742,14 @@ fn resolve_paths_and_snippets_verified(
     sorted_paths: &[&str],
     root: &Path,
     manifest: &FileManifest,
-    layers_matched: &[&'static str],
-    query: &str,
-    limit: usize,
+    params: SnippetVerifyParams<'_>,
 ) -> Vec<ResolvedResult> {
+    let SnippetVerifyParams {
+        query,
+        layers_matched,
+        limit,
+        offset,
+    } = params;
     raw_results
         .iter()
         .filter_map(|r| {
@@ -716,7 +782,9 @@ fn resolve_paths_and_snippets_verified(
                 layers_matched: layers_matched.to_vec(),
             })
         })
-        // AD-355-2: truncate LAST — after verification removes non-matching candidates.
+        // AD-355-2 / AD-372-3: apply offset then truncate LAST — after verification
+        // removes non-matching candidates.
+        .skip(offset)
         .take(limit)
         .collect()
 }

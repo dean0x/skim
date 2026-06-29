@@ -220,6 +220,7 @@ fn make_query_config(
     super::super::types::QueryConfig {
         text: text.to_string(),
         limit,
+        offset: None,
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache.to_path_buf(),
@@ -807,6 +808,7 @@ fn intersection_disjoint_text_and_ast_returns_empty_exit_0() {
             let config = QueryConfig {
                 text: "xyzzy_impossible_token".to_string(),
                 limit: 20,
+                offset: None,
                 json: true,
                 root: project.path().to_path_buf(),
                 cache_dir: cache_dir.clone(),
@@ -1083,6 +1085,7 @@ fn text_ast_intersection_preserves_lexical_snippets() {
     let config = QueryConfig {
         text: "nested".to_string(),
         limit: 20,
+        offset: None,
         json: false,
         root: project.path().to_path_buf(),
         cache_dir: cache.path().to_path_buf(),
@@ -1148,6 +1151,7 @@ fn text_ast_combined_is_strict_subset_of_lexical_ac1() {
     let lex_config = QueryConfig {
         text: "fn".to_string(),
         limit: 50,
+        offset: None,
         json: false,
         root: project.path().to_path_buf(),
         cache_dir: cache.path().to_path_buf(),
@@ -1184,6 +1188,7 @@ fn text_ast_combined_is_strict_subset_of_lexical_ac1() {
     let compound_config = QueryConfig {
         text: "fn".to_string(),
         limit: 50,
+        offset: None,
         json: false,
         root: project.path().to_path_buf(),
         cache_dir: cache.path().to_path_buf(),

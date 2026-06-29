@@ -354,6 +354,45 @@ pub fn extract_query_ngrams(query: &str) -> Vec<(Ngram, f32)> {
     extract_query_ngrams_with_weights(query, TRIGRAM_WEIGHTS)
 }
 
+// ============================================================================
+// Query-shape predicate (AD-372-5)
+// ============================================================================
+
+/// Return `true` iff `query` is an exact-symbol query — a single contiguous
+/// token that is non-empty, at least 3 bytes, and contains no interior ASCII
+/// whitespace.
+///
+/// # AD-372-5: Single source of truth for "exact-symbol mode"
+///
+/// Both [`crate::index::reader::NgramIndexReader::search`] (which branches on
+/// query shape) and `rskim::cmd::search::query` (which decides whether to bypass
+/// `LEXICAL_CANDIDATE_POOL_K`) consult this predicate.  Keeping the definition
+/// in one place prevents the two layers from diverging.
+///
+/// **Semantics:** `query.trim()` must be non-empty, `>= 3` bytes, and satisfy
+/// `split_whitespace().count() == 1`.  Leading/trailing whitespace is ignored;
+/// interior whitespace (space, tab, or any ASCII whitespace byte) causes the
+/// predicate to return `false` and routes the query to the BM25F UNION path.
+///
+/// # Examples
+///
+/// ```rust
+/// use rskim_search::ngram::is_single_token;
+/// assert!(is_single_token("foo"));
+/// assert!(is_single_token("foo::bar"));
+/// assert!(is_single_token("  foo  "));
+/// assert!(!is_single_token("foo bar"));
+/// assert!(!is_single_token("fn"));
+/// assert!(!is_single_token("a\tb"));
+/// assert!(!is_single_token(""));
+/// ```
+#[must_use]
+pub fn is_single_token(query: &str) -> bool {
+    // AD-372-5: non-empty after trim, >= 3 bytes, exactly one whitespace-token.
+    let trimmed = query.trim();
+    trimmed.len() >= 3 && trimmed.split_whitespace().count() == 1
+}
+
 #[cfg(test)]
 #[path = "ngram_tests.rs"]
 mod tests;
