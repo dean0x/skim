@@ -127,7 +127,25 @@ impl FileManifest {
     /// Existing v1 indexes must be re-indexed because field classifications have
     /// changed: previously all bytes were Other; now structural elements receive
     /// TypeDefinition, SymbolName, StringLiteral, etc.
-    pub const FORMAT_VERSION: u32 = 2;
+    ///
+    /// v2 → v3: Fix FileId↔path ordering skew (#373). The on-disk JSONL byte
+    /// layout is unchanged, but the walk-side FileId assignment order now uses
+    /// byte-wise comparison of `normalize_rel_path` (same order as this manifest's
+    /// `BTreeMap<String>` key iteration) instead of `PathBuf::cmp` (component-
+    /// aware, diverges on nested dirs). A pre-existing v2 manifest could have
+    /// been built with the old, skewed ordering → it would silently serve wrong
+    /// files even if otherwise fresh (unchanged git HEAD / mtimes). Bumping to v3
+    /// makes the existing FORMAT_VERSION-mismatch staleness path detect every v2
+    /// manifest as stale and rebuild it once on the next query — correctness-on-
+    /// upgrade with no manual `--rebuild` required (AD-373-3).
+    ///
+    /// AD-373-3: bumped 2→3 for #373. The FileId↔path skew fix is in-memory-only
+    /// (serialized layout unchanged), so an otherwise-fresh v2 index would keep
+    /// serving skewed FileIds (wrong files) with no self-heal. The version bump
+    /// forces a one-time automatic rebuild on the next query via the existing
+    /// FORMAT_VERSION-mismatch staleness path = correctness-on-upgrade. Behavior
+    /// of THIS ticket per ADR-004 (not a #NEW placeholder).
+    pub const FORMAT_VERSION: u32 = 3;
 
     // -----------------------------------------------------------------------
     // Constructors
@@ -263,17 +281,25 @@ impl FileManifest {
         self.entries.get(path)
     }
 
-    /// Return entry paths sorted alphabetically.
+    /// Return entry paths sorted in byte-wise string order.
     ///
     /// # Invariant
     ///
-    /// The index build pipeline walks files in sorted order and assigns
-    /// `FileId`s sequentially (0, 1, 2, …) in the consumer loop.
-    /// Therefore `sorted_paths()[n]` is the path for `FileId(n)`.  Query
-    /// result resolution depends on this invariant — do not change the sort
-    /// order without also updating the index builder.
+    /// The index build pipeline sorts walk entries by `walk::normalize_rel_path`
+    /// (byte-wise `str` comparison of the normalized rel-path) and assigns
+    /// `FileId`s sequentially (0, 1, 2, …) in the consumer loop.  Because
+    /// `normalize_rel_path` produces exactly the key string stored in this
+    /// `BTreeMap<String>`, `BTreeMap` iteration order is byte-identical to the
+    /// walk's FileId-assignment order — so `sorted_paths()[n]` is the path for
+    /// `FileId(n)` by construction.
     ///
-    /// Because `entries` is a [`BTreeMap`], keys are always in alphabetical
+    /// AD-373-1: FileId assignment uses the same byte-wise normalized-String
+    /// order as this `BTreeMap<String>` resolution side.  `PathBuf::cmp` is
+    /// component-aware and diverges from `str::cmp` on nested dirs (`foo/bar.rs`
+    /// vs `foo.rs`), causing `FileId`→path mis-resolution (#373) — fixed by
+    /// sorting the walk with `normalize_rel_path` instead.
+    ///
+    /// Because `entries` is a [`BTreeMap`], keys are always in byte-wise string
     /// order — iteration is O(n) with no additional allocation or sort.
     pub(super) fn sorted_paths(&self) -> Vec<&str> {
         self.entries.keys().map(String::as_str).collect()

@@ -37,7 +37,8 @@ use super::manifest::{FileManifest, ManifestEntry, decode_field_map, encode_fiel
 use super::staleness::read_git_head;
 use super::types::{IndexConfig, IndexResult, ProcessedFile, SkipReason, WalkEntry};
 use super::walk::{
-    ReadOutcome, discover_project_root, is_minified, open_and_read, sha256_hex, walk_metadata,
+    ReadOutcome, discover_project_root, is_minified, normalize_rel_path, open_and_read,
+    sha256_hex, walk_metadata,
 };
 
 // ============================================================================
@@ -328,14 +329,19 @@ impl<'cfg> Pipeline<'cfg> {
         // and the next query self-heals. (applies ADR-006)
         //
         // Why the comparison holds for realistic projects: `manifest_count` is the
-        // number of unique BTreeMap keys (normalized rel-path strings), and
-        // `file_count` is the number of successful `add_file_classified` calls.
-        // They agree when every successfully-indexed file has a distinct normalized
-        // path key — the invariant upheld by `walk_metadata`'s sorted, deduped
-        // output. A mismatch would require two walk entries to normalize to the
-        // same path key, which cannot happen on case-sensitive file-systems and is
-        // a data-corruption signal on case-insensitive ones; hence this guard is
-        // intentionally defensive rather than a common-case check.
+        // number of unique BTreeMap keys (normalized rel-path strings produced by
+        // normalize_rel_path), and `file_count` is the number of successful
+        // `add_file_classified` calls. They agree when every successfully-indexed
+        // file has a distinct normalized path key — the invariant upheld by
+        // `walk_metadata`'s sort (AD-373-1: byte-wise normalized-string order,
+        // matching the manifest BTreeMap<String> resolution side exactly).
+        // Dedup is implicit in BTreeMap::insert (last writer wins); the walker
+        // does NOT dedup entries — a duplicate walk entry would silently collapse
+        // to one BTreeMap key, causing manifest_count < file_count and triggering
+        // this guard. A mismatch would require two walk entries to normalize to the
+        // same path key, which cannot happen on case-sensitive file-systems (two
+        // distinct paths ⇒ two distinct keys) and is a data-corruption signal on
+        // case-insensitive ones; hence this guard is intentionally defensive.
         let manifest_count = new_manifest.entry_count();
         if manifest_count != file_count as usize {
             return Err(anyhow::anyhow!(
@@ -612,7 +618,9 @@ impl<'cfg> Pipeline<'cfg> {
                 cache_hits = cache_hits.saturating_add(1);
             }
 
-            let path_key = pf.rel_path.to_string_lossy().replace('\\', "/");
+            // AD-373-2 (ref): use normalize_rel_path so the manifest key is
+            // byte-identical to the walk sort key (walk.rs). Single source of truth.
+            let path_key = normalize_rel_path(&pf.rel_path);
             new_manifest.insert(ManifestEntry {
                 path: path_key,
                 sha256: pf.sha256,
@@ -734,7 +742,9 @@ fn read_and_classify(
     let sha = sha256_hex(content.as_bytes());
 
     // Lexical 2-tier SHA cache: SHA match → hit, mismatch/--force → miss.
-    let path_key = entry.rel_path.to_string_lossy().replace('\\', "/");
+    // AD-373-2 (ref): use normalize_rel_path so the lookup key is byte-identical
+    // to the manifest key and the walk sort key. Single source of truth.
+    let path_key = normalize_rel_path(&entry.rel_path);
 
     let (field_map, cache_hit) = if !force
         && let Some(cached) = manifest.lookup(&path_key)

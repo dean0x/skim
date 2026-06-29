@@ -2525,3 +2525,98 @@ fn text_ast_blast_subset_is_strict_subset_of_ast_only_356() {
         );
     }
 }
+
+// ============================================================================
+// Group 12: #373 FileId↔path ordering skew — standalone --ast discriminating
+// repro (AC-1)
+// ============================================================================
+
+/// AC-1 / AD-373-1: Discriminating repro for standalone --ast over a corpus
+/// where PathBuf::cmp and str::cmp diverge.
+///
+/// Corpus:
+/// - `foo.rs`       = `let x = 1;`     (no function_item)
+/// - `foo/bar.rs`   = `fn only() {...}` (exactly ONE function_item)
+/// - `foobar.rs`    = `const Z: i32 = 3;` (no function_item)
+///
+/// `run_ast_standalone("function_item > block", ...)` MUST return `foo/bar.rs`
+/// and MUST NOT return `foo.rs` or `foobar.rs`.
+///
+/// Pre-fix: FileId(0) was assigned to `foo/bar.rs` (PathBuf component order)
+/// but resolved to `foo.rs` (BTreeMap byte order), so the output contained
+/// `foo.rs` (wrong file) — this test FAILS on the pre-fix code.
+///
+/// PF-007: the negative assertions (MUST NOT contain `foo.rs` / `foobar.rs`)
+/// ensure this test would fail if AD-373-1 were reverted.
+#[test]
+fn run_ast_standalone_resolves_nested_dir_corpus_correctly() {
+    use super::super::manifest::FileManifest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("foo")).unwrap();
+
+    // Only foo/bar.rs has a function_item.
+    fs::write(root.join("foo.rs"), "let x = 1;\n").unwrap();
+    fs::write(root.join("foo/bar.rs"), "fn only() { let y = 2; }\n").unwrap();
+    fs::write(root.join("foobar.rs"), "const Z: i32 = 3;\n").unwrap();
+
+    build_project_index(root, cache.path());
+
+    let manifest =
+        FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let mut out: Vec<u8> = Vec::new();
+    let result = super::run_ast_standalone(
+        "function_item > block",
+        40,
+        false, // text output
+        cache.path(),
+        &manifest,
+        None, // no --blast-radius
+        None, // no temporal sort
+        None, // no temporal DB
+        root,
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(
+        result,
+        std::process::ExitCode::SUCCESS,
+        "AC-1: standalone --ast over nested-dir corpus must exit SUCCESS"
+    );
+
+    let text = String::from_utf8(out).unwrap();
+
+    // POSITIVE: the ONLY file with function_item must appear.
+    assert!(
+        text.contains("foo/bar.rs") || text.contains("foo") && text.contains("bar.rs"),
+        "AC-1 POSITIVE: output must contain 'foo/bar.rs' (the only file with a function_item). \
+         Pre-fix: FileId skew caused foo.rs to be returned instead. Got:\n{text}"
+    );
+
+    // NEGATIVE 1 (PF-007): foo.rs has no function_item → must NOT appear.
+    // Pre-fix: foo.rs was returned because FileId(0) resolved to it (skew).
+    // We check that `foo.rs` does not appear as a standalone path
+    // (not as part of `foo/bar.rs`).
+    let foo_rs_standalone = text
+        .lines()
+        .any(|l| l.trim() == "foo.rs" || l.ends_with("/foo.rs") || l.ends_with("  foo.rs"));
+    assert!(
+        !foo_rs_standalone,
+        "AC-1 NEGATIVE: output must NOT return foo.rs (no function_item). \
+         Pre-fix: the FileId skew mapped foo/bar.rs's FileId to foo.rs. \
+         Reverting AD-373-1 makes this fail. Got:\n{text}"
+    );
+
+    // NEGATIVE 2: foobar.rs has no function_item → must NOT appear.
+    let foobar_in_text = text.lines().any(|l| l.contains("foobar.rs"));
+    assert!(
+        !foobar_in_text,
+        "AC-1 NEGATIVE: output must NOT return foobar.rs (no function_item). Got:\n{text}"
+    );
+}

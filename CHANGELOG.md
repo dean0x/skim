@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### BREAKING
 
+- **`skim search` manifest format: v2 → v3 (FileId↔path ordering skew fix)** (#373) —
+  Standalone `--ast` queries and all other FileId consumers (lexical, blast-radius, temporal)
+  could return the wrong files whenever the project contained nested directories (e.g.
+  `foo/bar.rs` and `foo.rs`), because FileIds were assigned in `PathBuf` component order
+  but resolved in `BTreeMap<String>` byte order.  The fix aligns both sides to byte-wise
+  string order.  The manifest on-disk JSONL layout is unchanged; the version bump forces a
+  one-time automatic rebuild on the first query after upgrade so no pre-existing index
+  silently serves wrong files.  No manual `--rebuild` needed.
+
 - **`skim search` index format: v3 → v4 (posting lists now delta+varint compressed)** (#358) —
   Posting entries changed from a fixed 9-byte layout to a variable-length delta+varint encoding
   (`[varint delta_doc_id][u8 field_id][varint delta_position]`), reducing the lexical index size
