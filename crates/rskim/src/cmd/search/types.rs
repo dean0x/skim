@@ -95,7 +95,7 @@ pub(super) struct QueryConfig {
     ///
     /// `None` means no offset (equivalent to 0). Used on the pure-lexical exact-symbol
     /// path (AD-372-3) and threaded through to `resolve_paths_and_snippets_verified`.
-    pub offset: Option<u64>,
+    pub offset: Option<usize>,
     /// When `true`, output JSON instead of human-readable text.
     pub json: bool,
     /// Project root (absolute path).

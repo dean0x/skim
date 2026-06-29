@@ -1791,8 +1791,7 @@ fn test_ac5_doc_id_dedup_in_intersection() {
 /// The implementation propagates corruption from `open()` (CRC32 check) through
 /// the call chain: `open() → Err(IndexCorrupted)`.  On the search path the error
 /// propagates via `?` through:
-/// `lookup_postings → decode_postings_varint → intersect_posting_doc_ids →
-/// search_exact_intersection → search()`.
+/// `lookup_postings → decode_postings_varint → search_exact_intersection → search()`.
 ///
 /// Strategy:
 /// 1. Build a valid index.

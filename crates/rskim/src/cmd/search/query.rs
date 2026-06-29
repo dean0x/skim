@@ -284,7 +284,7 @@ pub(super) fn execute_query_with_manifest(
     // verify-then-truncate-LAST invariant.  Offset is applied HERE (post-verify)
     // on BOTH the exact-symbol and multi-word paths so that page boundaries are
     // consistent regardless of how many pre-verify candidates are dropped.
-    let effective_offset = config.offset.unwrap_or(0) as usize;
+    let effective_offset = config.offset.unwrap_or(0);
     let results = resolve_paths_and_snippets_verified(
         &raw_results,
         &sorted,
@@ -457,7 +457,7 @@ fn run_compound_query(
     // `skim search "foo" --ast try-catch --offset 10` paginates correctly.
     // The RRF recomposition does NOT apply offset; pagination is handled here,
     // post-verify, as on the pure-lexical path.
-    let effective_offset = config.offset.unwrap_or(0) as usize;
+    let effective_offset = config.offset.unwrap_or(0);
     let results = resolve_paths_and_snippets_verified(
         &recomposed,
         ctx.sorted,
@@ -594,7 +594,7 @@ fn run_blast_radius_composite_query(
     // `skim search "foo" --blast-radius src/x.rs --offset 10` paginates correctly.
     // Applied post-verify (`.skip` before `.take`), consistent with the pure-lexical
     // and compound paths.
-    let effective_offset = config.offset.unwrap_or(0) as usize;
+    let effective_offset = config.offset.unwrap_or(0);
     let results: Vec<super::types::ResolvedResult> = ranked
         .iter()
         .filter_map(|&(fid, composite_score)| {
@@ -728,9 +728,12 @@ struct SnippetVerifyParams<'a> {
 ///
 /// The worst-case file-read count equals `raw_results.len()`, which is bounded
 /// by the caller's `sq.limit` — itself bounded to:
-///   - Pure-lexical path:   `max(limit × LEXICAL_CANDIDATE_POOL_K, 100)` = `max(5N, 100)`.
-///   - Blast-radius path:   `max(limit × BLAST_CANDIDATE_POOL_K, 100)`  = `max(10N, 100)`.
-///   - Compound text+AST:   `|ast_set|` (exact AST match count; no K multiplier, AD-356-1).
+///   - Pure-lexical exact-symbol path: `|intersection|` (AND of query trigram posting
+///     lists; `sq.limit = None` so the full intersection reaches verify). Bounded by
+///     posting list sizes, not corpus size (AD-372-2 superset invariant).
+///   - Pure-lexical multi-word path:   `max(limit × LEXICAL_CANDIDATE_POOL_K, 100)` = `max(5N, 100)`.
+///   - Blast-radius path:              `max(limit × BLAST_CANDIDATE_POOL_K, 100)`  = `max(10N, 100)`.
+///   - Compound text+AST:              `|ast_set|` (exact AST match count; no K multiplier, AD-356-1).
 ///
 /// The fan-out is therefore O(K × limit) file reads — bounded for any fixed K and
 /// user-supplied `--limit`.  Calibrating K for large corpora is tracked in #361.

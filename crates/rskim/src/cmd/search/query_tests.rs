@@ -1896,26 +1896,20 @@ fn test_ac13_single_token_bypasses_k_pool_multi_word_uses_it() {
 // unbounded.  This test fails if the wall-clock cost exceeds 2,000 ms.
 // ============================================================================
 
-/// AC15a — short_query_fallback with N=5,000 indexed files must complete in
-/// under 2,000 ms wall-clock time AND every file containing "fn" must appear
-/// in the result, including file_id >= 100 (above the old CANDIDATE_POOL_FLOOR).
+/// AC15a — short_query_fallback recall guard: every file containing "fn" in a
+/// 5,000-file corpus must appear in the result, including files with high
+/// sequential IDs (above the old CANDIDATE_POOL_FLOOR of 100).
 ///
-/// PF-007 (timed, discriminating):
-/// - The 2,000 ms bound is the MEASURED SLA from RESOLVED Decision 4.
-/// - The file_id >= 100 assertion catches regressions where the old
-///   `.take(limit)` pre-truncation is re-added to short_query_fallback.
-/// - Without the SLA check, the de-truncated O(file_count) fan-out is unbounded.
+/// Runs unconditionally in both debug and release builds so the de-truncation
+/// contract (AD-372-4) is always guarded.  The companion SLA test below
+/// (`test_ac15a_sla`) is release-only (wall-clock assertions need release timings).
 ///
-/// The wall-clock assertion is gated with `#[cfg(not(debug_assertions))]` so the
-/// 2,000 ms bound only applies in release builds (same discipline as the sibling
-/// `test_lexical_query_latency_representative_corpus` in reader_tests.rs which
-/// uses the same gate).  Under debug the file-count recall check still runs,
-/// preserving the regression guard for the de-truncation contract.
+/// PF-007 (discriminating): if the old `.take(limit)` pre-truncation is
+/// re-added to `short_query_fallback`, files with sorted file_id >= limit will
+/// disappear from the result set and `output.results.len() < min_expected` will
+/// fire, catching the regression in every `cargo test` run, not just release.
 #[test]
-#[cfg(not(debug_assertions))]
-fn test_ac15a_short_query_fallback_5000_files_sla() {
-    use std::time::Instant;
-
+fn test_ac15a_short_query_fallback_5000_files_recall() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let cache_dir = dir.path().join("cache");
@@ -1936,8 +1930,7 @@ fn test_ac15a_short_query_fallback_5000_files_sla() {
         .unwrap();
     }
 
-    // Cold-start: build the index by running a first query to trigger auto-build.
-    // We do not time this (index build cost is not the SLA we are measuring).
+    // Cold-start: build the index.
     {
         let build_config = QueryConfig {
             text: "proc_0000".to_string(),
@@ -1953,8 +1946,96 @@ fn test_ac15a_short_query_fallback_5000_files_sla() {
         let _ = execute_query(&build_config, &TEST_ANALYTICS).unwrap();
     }
 
-    // Timed query: "fn" is 2 bytes → short_query_fallback path (AD-355-7).
+    // "fn" is 2 bytes → short_query_fallback path (AD-355-7).
     // Limit is set high to ensure all 5,000 results can be returned.
+    let query_config = QueryConfig {
+        text: "fn".to_string(),
+        limit: N + 100,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+    };
+
+    let output = execute_query(&query_config, &TEST_ANALYTICS).unwrap();
+
+    // AC15a (recall): all N files contain "fn", so verify returns all of them.
+    // At minimum 90% must be present — confirms no internal pre-truncation.
+    let min_expected = N * 9 / 10;
+    assert!(
+        output.results.len() >= min_expected,
+        "AC15a: short_query_fallback must return >= {min_expected} (90% of {N}) results for 'fn'; \
+        got {} — old .take(limit) pre-truncation re-introduced (AD-372-4 violated).",
+        output.results.len()
+    );
+
+    // AC15a: a specific known high-id file (f4999.rs) must appear, confirming
+    // files beyond the old CANDIDATE_POOL_FLOOR=100 are not silently dropped.
+    let has_high_id_file = output.results.iter().any(|r| r.path.contains("f4999.rs"));
+    assert!(
+        has_high_id_file,
+        "AC15a: f4999.rs must appear in results; \
+        suggests old CANDIDATE_POOL_FLOOR truncation still active (AD-372-4 violated)"
+    );
+}
+
+/// AC15a — short_query_fallback SLA: N=5,000 indexed files, "fn" query must
+/// complete in under 2,000 ms wall-clock (release profile).
+///
+/// Gated `#[cfg(not(debug_assertions))]` because:
+/// - Debug builds are ~4–10× slower; the 2,000 ms SLA is calibrated for release.
+/// - The recall contract (de-truncation correctness) is guarded by the
+///   unconditional `test_ac15a_short_query_fallback_5000_files_recall` above.
+///
+/// PF-007 (discriminating): without this timed bound the de-truncated O(file_count)
+/// fan-out has no measured safety net; a pathological corpus could silently make
+/// short queries unbounded.
+#[test]
+#[cfg(not(debug_assertions))]
+fn test_ac15a_short_query_fallback_5000_files_sla() {
+    use std::time::Instant;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    const N: usize = 5_000;
+    for i in 0..N {
+        fs::write(
+            src.join(format!("f{i:04}.rs")),
+            format!("pub fn proc_{i}(x: u32) -> u32 {{ x }}\n"),
+        )
+        .unwrap();
+    }
+
+    // Cold-start: build the index.
+    {
+        let _ = execute_query(
+            &QueryConfig {
+                text: "proc_0000".to_string(),
+                limit: 20,
+                offset: None,
+                json: false,
+                root: root.to_path_buf(),
+                cache_dir: cache_dir.to_path_buf(),
+                blast_radius_paths: None,
+                ast_scored: None,
+                composite_weights: None,
+            },
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+    }
+
     let query_config = QueryConfig {
         text: "fn".to_string(),
         limit: N + 100,
@@ -1971,35 +2052,10 @@ fn test_ac15a_short_query_fallback_5000_files_sla() {
     let output = execute_query(&query_config, &TEST_ANALYTICS).unwrap();
     let elapsed_ms = t_start.elapsed().as_millis();
 
-    // Emit measured latency for observability.
     eprintln!(
-        "AC15a: short_query_fallback N={N} files, 'fn' query: {elapsed_ms}ms, \
+        "AC15a SLA: short_query_fallback N={N} files, 'fn' query: {elapsed_ms}ms, \
         results={}, SLA=2000ms",
         output.results.len()
-    );
-
-    // AC15a (recall): all N files contain "fn", so verify returns all of them.
-    // At minimum, a large fraction must be present (>= 90%) to confirm no
-    // internal pre-truncation.  We use N * 9 / 10 as the floor.
-    let min_expected = N * 9 / 10;
-    assert!(
-        output.results.len() >= min_expected,
-        "AC15a: short_query_fallback must return >= {min_expected} (90% of {N}) results for 'fn'; \
-        got {} — old .take(limit) pre-truncation re-introduced (AD-372-4 violated).",
-        output.results.len()
-    );
-
-    // AC15a: specifically check that file IDs >= 100 appear (above old CANDIDATE_POOL_FLOOR).
-    // We check by path since the manifest assigns FileIds by sorted path order.
-    let has_high_id_file = output.results.iter().any(|r| {
-        // Files are named f0100.rs..f4999.rs — any path with f0100 or higher.
-        r.path.contains("f0100") || r.path.contains("f1") || r.path.contains("f2")
-            || r.path.contains("f3") || r.path.contains("f4")
-    });
-    assert!(
-        has_high_id_file,
-        "AC15a: at least one file with high file_id (>= 100) must appear; \
-        suggests old CANDIDATE_POOL_FLOOR truncation still active"
     );
 
     // AC15a (SLA): the verified fan-out must stay under 2,000 ms wall-clock.
