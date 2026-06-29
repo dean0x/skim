@@ -467,11 +467,11 @@ fn is_single_token_predicate_matrix() {
     //   the >= 3 byte requirement and contains no whitespace → true.
     // Negative: a 2-byte UTF-8 codepoint (e.g. U+00E9, 'é', 2 bytes) is < 3 bytes → false.
     assert!(
-        is_single_token("中"),           // U+4E2D: 3 UTF-8 bytes, no whitespace
+        is_single_token("中"), // U+4E2D: 3 UTF-8 bytes, no whitespace
         "is_single_token('中') must be true: single codepoint, 3 UTF-8 bytes >= 3 (byte-len contract)"
     );
     assert!(
-        !is_single_token("é"),           // U+00E9: 2 UTF-8 bytes < 3
+        !is_single_token("é"), // U+00E9: 2 UTF-8 bytes < 3
         "is_single_token('é') must be false: single codepoint, 2 UTF-8 bytes < 3 (byte-len contract)"
     );
 }

@@ -267,8 +267,12 @@ fn parse_limit_value(raw: &str) -> anyhow::Result<usize> {
 /// Typed as `usize` to match `limit` and `SearchQuery::offset`, eliminating the
 /// `as usize` casts that `u64` required at all consumption sites.
 fn parse_offset_value(raw: &str) -> anyhow::Result<usize> {
-    raw.parse::<usize>()
-        .map_err(|_| anyhow::anyhow!("--offset value must be a non-negative integer, got {:?}", raw))
+    raw.parse::<usize>().map_err(|_| {
+        anyhow::anyhow!(
+            "--offset value must be a non-negative integer, got {:?}",
+            raw
+        )
+    })
 }
 
 /// Parse a temporal flag arm (`--hot`, `--cold`, `--risky`, `--blast-radius`).
@@ -772,7 +776,11 @@ fn run_query(
         // is applied ONCE post-temporal-sort (in the drain below), never inside
         // execute_query_with_manifest.  Pass None here so the pre-sort verify step
         // does not consume the offset; the correct single application is the drain.
-        offset: if flags.temporal_sort.is_some() { None } else { flags.offset },
+        offset: if flags.temporal_sort.is_some() {
+            None
+        } else {
+            flags.offset
+        },
         json: flags.json,
         root,
         cache_dir,
@@ -799,7 +807,9 @@ fn run_query(
         temporal::apply_temporal_enrichment(&mut output.results, sort, db)?;
         let effective_offset = flags.offset.unwrap_or(0);
         if effective_offset > 0 {
-            output.results.drain(..effective_offset.min(output.results.len()));
+            output
+                .results
+                .drain(..effective_offset.min(output.results.len()));
         }
         output.results.truncate(flags.limit);
         output.total = output.results.len();
@@ -1124,7 +1134,10 @@ mod tests {
     #[test]
     fn test_parse_flags_offset_default_is_none() {
         let flags = parse_flags(&["--limit".to_string(), "5".to_string()]).unwrap();
-        assert_eq!(flags.offset, None, "offset must default to None when not supplied");
+        assert_eq!(
+            flags.offset, None,
+            "offset must default to None when not supplied"
+        );
     }
 
     #[test]
@@ -1183,8 +1196,7 @@ mod tests {
             flags.offset
         };
         assert_eq!(
-            config_offset,
-            None,
+            config_offset, None,
             "QueryConfig.offset must be None when temporal_sort is active (double-offset guard)"
         );
     }

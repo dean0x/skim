@@ -1593,11 +1593,7 @@ fn test_ac11b_end_to_end_pagination_disjoint_pages() {
     )
     .unwrap();
     // file_b.rs also contains the token — it must appear on page 2.
-    fs::write(
-        src.join("file_b.rs"),
-        format!("pub use crate::{token};\n"),
-    )
-    .unwrap();
+    fs::write(src.join("file_b.rs"), format!("pub use crate::{token};\n")).unwrap();
 
     // Page 0: limit=1, offset=0 (the default).
     let config_p0 = QueryConfig {
@@ -1702,10 +1698,7 @@ fn test_ac12_e2e_caller_recall_single_token_finds_definer() {
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
     // AC12: the definer must appear in results.
-    let has_definer = output
-        .results
-        .iter()
-        .any(|r| r.path.ends_with("file_0.rs"));
+    let has_definer = output.results.iter().any(|r| r.path.ends_with("file_0.rs"));
     assert!(
         has_definer,
         "AC12: definer 'src/file_0.rs' must appear in e2e results for token {:?}; \

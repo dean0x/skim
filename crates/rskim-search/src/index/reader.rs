@@ -659,7 +659,13 @@ impl NgramIndexReader {
             None => doc_scores.into_iter().collect(),
         };
 
-        sort_and_assemble_results(&mut scored, &mut doc_positions, &doc_field_tfs, offset, limit)
+        sort_and_assemble_results(
+            &mut scored,
+            &mut doc_positions,
+            &doc_field_tfs,
+            offset,
+            limit,
+        )
     }
 
     /// Retrieve all posting entries for `ngram_key` from the mmap'd posting file.
