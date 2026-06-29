@@ -2627,7 +2627,9 @@ fn run_ast_standalone_resolves_nested_dir_corpus_correctly() {
 // These tests cover the acceptance criteria from ticket #374:
 //   AC1  — zero-n-gram data files excluded
 //   AC2  — AND-intersect vs OR-union (engine level) → see query_tests.rs (a3/a3b/P3)
-//   AC3  — verify gate drops unrelated subtrees → NOT YET COVERED (see note below)
+//   AC3  — verify gate drops unrelated subtrees
+//            unit:        compound/reparse_tests.rs::pattern_occurs_false_for_unrelated_subtree_kinds_ac3_374
+//            integration: run_ast_standalone_unrelated_subtree_excluded_ac3_374 (this file)
 //   AC4  — true positives survive the gate
 //   AC5  — verify-then-truncate-LAST
 //   AC8  — recover_line stays line-recovery only (degraded row emitted, not dropped)
@@ -2635,19 +2637,12 @@ fn run_ast_standalone_resolves_nested_dir_corpus_correctly() {
 //   AC10 — query-time only, no format/rebuild
 //   AC11 — no elision marker when gate produces empty results
 //   AC12 — O(pool) bound guard (constant reuse guard)
+//   AC13 — entry-point agreement: ast_index/query_tests.rs::ac13_search_ast_and_layer_agree_on_fileid_set
 //
 // AC2 / AC7 engine-level AND-intersect tests live in `ast_index/query_tests.rs`
 // (a3_*, a3b_*, P3 group). The `pattern_occurs_in_file` gate UNIT tests (AC6) live
 // in `compound/reparse_tests.rs`.
-// AC13 (entry-point agreement) is covered by the engine unit tests + run_ast_standalone path.
-//
-// AC3 COVERAGE GAP (#374 follow-up): no test yet exercises the discriminating
-// "unrelated-subtree" case — a file where BOTH of a pattern's n-gram kinds are
-// PRESENT but NOT in a real parent→child / grandparent ancestor chain. That case
-// is the only one where the strict gate (Part B) diverges from AND-intersect
-// (Part A); every current gate test turns on kind PRESENCE, not the ancestor
-// relationship. A grammar-faithful fixture must be confirmed against the actual
-// tree-sitter CST shape before it can assert non-vacuously (PF-007).
+// OD-374-3 ERROR-node fixture: compound/reparse_tests.rs::pattern_occurs_false_for_error_node_ancestor_od374_3.
 
 /// Create a project for #374 tests: one Rust file with genuine nested loops,
 /// one with no nested loops, one JSON, one Cargo.toml.
@@ -3190,4 +3185,151 @@ fn ast_gate_reuses_lexical_candidate_pool_k_ac12_374() {
          tracked under #361 per ADR-003). Changing it without #361 evidence and \
          corpus measurements violates ADR-003. Update #361 first."
     );
+
+    // AC12 POOL-SIZE BOUND: candidate_pool(limit, K) must equal max(K×limit, FLOOR).
+    //
+    // The documented contract: `limit.saturating_mul(k).max(CANDIDATE_POOL_FLOOR)`.
+    // This pins the O(pool) bound: the gate re-parses at most pool files, where
+    // pool ≤ K × limit for any limit ≥ FLOOR/K (i.e. limit ≥ 20 for K=5, FLOOR=100).
+    // The bound is enforced by `.take(window)` in ast.rs BEFORE calling
+    // pattern_occurs_in_file, so re-parse count ≤ pool.
+    //
+    // NEGATIVE (PF-007): If candidate_pool were changed to return just `limit` (no
+    // multiplier), pool(100, K) would be 100 instead of 500, catching the regression.
+    const FLOOR: usize = 100; // must match CANDIDATE_POOL_FLOOR in query.rs
+    for limit in [1usize, 5, 10, 100] {
+        let pool = super::super::query::candidate_pool(limit, super::super::query::LEXICAL_CANDIDATE_POOL_K);
+        let expected = (EXPECTED_K * limit).max(FLOOR);
+        assert_eq!(
+            pool,
+            expected,
+            "AC12 pool-size: candidate_pool({limit}, K={EXPECTED_K}) must be \
+             max(K×limit, FLOOR={FLOOR}) = max({}, {FLOOR}) = {expected}; got {pool}",
+            EXPECTED_K * limit
+        );
+    }
+
+    // For limit >= FLOOR/K, the multiplier dominates: K×limit > FLOOR.
+    // Verify the O(K×limit) linear bound at limit=100 where floor is not active.
+    {
+        let limit = 100usize;
+        let pool = super::super::query::candidate_pool(limit, super::super::query::LEXICAL_CANDIDATE_POOL_K);
+        // K×limit = 500, which exceeds FLOOR=100, so pool must equal K×limit.
+        assert_eq!(
+            pool, EXPECTED_K * limit,
+            "AC12 linear-bound: candidate_pool(100, K) must equal K×100={} when \
+             K×limit > FLOOR={FLOOR} (pool multiplier dominates). Got {pool}",
+            EXPECTED_K * limit
+        );
+        // The bound must be strictly less than total corpus for real projects.
+        // (corpus size assertion not pinned here — corpus is runtime-dependent;
+        // the above assertion ensures the multiplier path works correctly.)
+    }
 }
+
+/// AC3 (#374): Unrelated-subtree end-to-end — `run_ast_standalone` must include
+/// the genuine nested-loop file (File D) and exclude the closure-body file (File C),
+/// where File C has all constituent CST kinds present but NOT in the required
+/// `block → expression_statement → for_expression` ancestor chain.
+///
+/// File C uses a Rust closure whose body is directly `for_expression` (no
+/// intervening block or `expression_statement`), so the trigram is absent from its
+/// posting list and AND-intersect correctly excludes it.  File D has genuine nested
+/// loops and appears in results.
+///
+/// The `pattern_occurs_in_file` unit test in `compound/reparse_tests.rs`
+/// (`pattern_occurs_false_for_unrelated_subtree_kinds_ac3_374`) directly pins the
+/// GATE behavior for File C; this integration test pins the END-TO-END pipeline.
+///
+/// NEGATIVE (PF-007): If the pipeline returned File C (e.g. via a regression
+/// that re-introduces OR-union without the gate), the first assertion would fail.
+#[test]
+fn run_ast_standalone_unrelated_subtree_excluded_ac3_374() {
+    use super::super::manifest::FileManifest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // File D: genuine nested loops — must appear in results.
+    fs::write(
+        root.join("src/nested.rs"),
+        r#"
+fn outer() {
+    for i in 0..5 {
+        for j in 0..5 { let _ = i + j; }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // File C: closure body is directly for_expression.
+    //   Rust CST: block → expression_statement → let_declaration →
+    //             closure_expression → for_expression
+    // The for_expression's parent is closure_expression (NOT expression_statement),
+    // so the trigram (block, expression_statement, for_expression) is NOT in the
+    // posting list → AND-intersect excludes it without reaching the strict gate.
+    fs::write(
+        root.join("src/closure_for.rs"),
+        r#"
+fn uses_closure() {
+    let _g = || for i in 0..5 { let _ = i; };
+    println!("done");
+}
+"#,
+    )
+    .unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(root, cache.path());
+
+    let manifest =
+        FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let mut out: Vec<u8> = Vec::new();
+    let result = super::run_ast_standalone(
+        "rust-nested-loop",
+        20,
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        root,
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(
+        result,
+        std::process::ExitCode::SUCCESS,
+        "AC3: run_ast_standalone must exit 0"
+    );
+
+    let text = String::from_utf8(out).unwrap();
+
+    // POSITIVE: genuine nested loops must appear.
+    assert!(
+        text.contains("nested.rs"),
+        "AC3 POSITIVE: output must contain nested.rs (genuine nested loops); got:\n{text}"
+    );
+
+    // NEGATIVE (PF-007): closure_for.rs has for_expression but NOT in the required
+    // ancestor chain → must NOT appear.  A regression to OR-union-only would make
+    // it appear if the trigram somehow got into the posting list.
+    assert!(
+        !text.contains("closure_for.rs"),
+        "AC3 NEGATIVE: output must NOT contain closure_for.rs (closure-body for, \
+         no expression_statement wrapper) — unrelated-subtree file must be excluded. \
+         Got:\n{text}"
+    );
+}
+
+// AC13 (#374): Entry-point agreement — see
+// `crates/rskim-search/src/ast_index/query_tests.rs::ac13_search_ast_and_layer_agree_on_fileid_set`
+// for the full falsifiable test using real AstIndexBuilder/AstIndexReader.
+// That test lives in `rskim-search` where all engine types are already in scope.

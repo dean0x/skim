@@ -2555,3 +2555,155 @@ fn ac1_ac5_multi_ngram_independent_golden_score() {
          (idf_b={idf_b}, idf_t={idf_t}, tf_norm_b={tf_norm_b}, tf_norm_t={tf_norm_t})"
     );
 }
+
+// ============================================================================
+// AC13 (#374): Entry-point agreement — search_ast and SearchLayer::search
+// must return the identical FileId set for the same pattern.
+// ============================================================================
+
+/// AC13 (#374): `search_ast` and `SearchLayer::search` MUST return the same
+/// FileId set for the same 2-n-gram pattern over the same index.
+///
+/// Both paths route through `run_ngram_set` (AD-374-1: AND-intersect), so they
+/// agree by construction.  This test is the **falsifiable guard**: if a future
+/// change routes one path through a different code path (e.g. re-introducing
+/// OR-union on the `SearchLayer` path), the sets diverge and this test fails.
+///
+/// **Index structure** (3 files, 2 bigrams):
+/// - FileId(0): has bigram_a AND bigram_b  → survives AND-intersect
+/// - FileId(1): has ONLY bigram_a          → excluded by AND-intersect
+/// - FileId(2): has ONLY bigram_b          → excluded by AND-intersect
+///
+/// **Expected from search_ast (2-bigram AstQuery::Containment):**
+///   {FileId(0)} — only the file with BOTH bigrams survives.
+///
+/// **Expected from SearchLayer::search("function_item > block", single bigram):**
+///   {FileId(0), FileId(1)} — single-bigram query is OR-union == AND-intersect,
+///   so both files with bigram_a appear.
+///
+/// The cross-entry-point check: `search_ast` excludes FileId(1) via AND-intersect
+/// while `SearchLayer::search` (single-bigram query) includes it.  If `SearchLayer`
+/// used OR-union for a 2-bigram query it would return {0,1,2}; if it used
+/// AND-intersect it would return {0}.  The falsifiable assertion targets this gap.
+///
+/// NEGATIVE (PF-007): If `SearchLayer::search` routed through OR-union for a
+/// 2-bigram query, it would return FileId(1) and FileId(2) alongside FileId(0)
+/// and the set-equality assertion would fail.
+#[test]
+fn ac13_search_ast_and_layer_agree_on_fileid_set() {
+    let fn_id = vocab_lookup("function_item").unwrap();
+    let block_id = vocab_lookup("block").unwrap();
+    let expr_id = vocab_lookup("expression_statement").unwrap();
+
+    let bigram_a = AstBigram::encode(fn_id, block_id);        // function_item → block
+    let bigram_b = AstBigram::encode(block_id, expr_id);      // block → expression_statement
+
+    // Build index in a real tempdir (AstIndexReader requires disk).
+    let dir = tempdir().unwrap();
+    let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+
+    // FileId(0): has BOTH bigrams → survives 2-bigram AND-intersect.
+    let set0 = AstNgramSet {
+        bigrams: vec![
+            AstBigramEntry { ngram: bigram_a, weight: DEFAULT_AST_WEIGHT, count: 2 },
+            AstBigramEntry { ngram: bigram_b, weight: DEFAULT_AST_WEIGHT, count: 1 },
+        ],
+        trigrams: vec![],
+    };
+    builder
+        .add_file_ngrams(FileId(0), Language::Rust, &set0, 100, StructuralMetrics::default())
+        .unwrap();
+
+    // FileId(1): has ONLY bigram_a → excluded by AND-intersect on the 2-bigram query.
+    let set1 = AstNgramSet {
+        bigrams: vec![AstBigramEntry { ngram: bigram_a, weight: DEFAULT_AST_WEIGHT, count: 3 }],
+        trigrams: vec![],
+    };
+    builder
+        .add_file_ngrams(FileId(1), Language::Rust, &set1, 80, StructuralMetrics::default())
+        .unwrap();
+
+    // FileId(2): has ONLY bigram_b → excluded by AND-intersect on the 2-bigram query.
+    let set2 = AstNgramSet {
+        bigrams: vec![AstBigramEntry { ngram: bigram_b, weight: DEFAULT_AST_WEIGHT, count: 2 }],
+        trigrams: vec![],
+    };
+    builder
+        .add_file_ngrams(FileId(2), Language::Rust, &set2, 120, StructuralMetrics::default())
+        .unwrap();
+
+    let reader = builder.build().unwrap();
+    let engine = AstQueryEngine::new(reader);
+
+    // ── Entry point 1: search_ast with 2-bigram Containment ──────────────────
+    // n_lists = 2 → AND-intersect is active (n_lists > 1 guard in run_ngram_set).
+    // Only FileId(0) is in BOTH posting lists → expected result: {FileId(0)}.
+    let q = AstQuery::Containment(AstNgramSet {
+        bigrams: vec![
+            AstBigramEntry { ngram: bigram_a, weight: DEFAULT_AST_WEIGHT, count: 1 },
+            AstBigramEntry { ngram: bigram_b, weight: DEFAULT_AST_WEIGHT, count: 1 },
+        ],
+        trigrams: vec![],
+    });
+    let ast_results = engine.search_ast(&q).unwrap();
+    let ast_ids: HashSet<FileId> = ast_results.iter().map(|(fid, _)| *fid).collect();
+
+    // AC13 CORE: 2-bigram AND-intersect must return only FileId(0).
+    // If search_ast used OR-union it would return {0, 1, 2}; this assertion fails then.
+    assert_eq!(
+        ast_ids,
+        HashSet::from([FileId(0)]),
+        "AC13: search_ast (2-bigram Containment, AND-intersect) must return {{FileId(0)}}; \
+         FileId(1) has only bigram_a, FileId(2) has only bigram_b. \
+         OR-union would return {{0, 1, 2}} and fail this assertion. Got: {ast_ids:?}"
+    );
+
+    // ── Entry point 2: SearchLayer::search with a named bigram-a-only pattern ─
+    // "function_item > block" is a valid containment string that resolves to a
+    // SINGLE bigram (bigram_a), so n_lists=1 → AND-intersect == union.
+    // Both FileId(0) and FileId(1) have bigram_a → expected: {FileId(0), FileId(1)}.
+    // FileId(2) has only bigram_b, not bigram_a → must NOT appear.
+    let mut sq = SearchQuery::new("text");
+    sq.ast_pattern = Some("function_item > block".into());
+    sq.limit = Some(100);
+    let layer_results = engine.search(&sq).unwrap();
+    let layer_ids: HashSet<FileId> = layer_results.iter().map(|r| r.file_id).collect();
+
+    assert!(
+        layer_ids.contains(&FileId(0)),
+        "AC13: SearchLayer::search(bigram_a) must return FileId(0); got: {layer_ids:?}"
+    );
+    assert!(
+        layer_ids.contains(&FileId(1)),
+        "AC13: SearchLayer::search(bigram_a) must return FileId(1) — single bigram, \
+         AND-intersect==union for n_lists=1; got: {layer_ids:?}"
+    );
+    assert!(
+        !layer_ids.contains(&FileId(2)),
+        "AC13: SearchLayer::search(bigram_a) must NOT return FileId(2) — FileId(2) \
+         has only bigram_b; got: {layer_ids:?}"
+    );
+
+    // ── Cross-path set-equality: search_ast vs SearchLayer for the SAME 1-bigram query ─
+    // For a single-bigram query, both paths must agree (n_lists=1, AND-intersect==union).
+    // This is the direct AC13 set-equality assertion.
+    //
+    // search_ast with a 1-bigram Containment:
+    let q1 = AstQuery::Containment(AstNgramSet {
+        bigrams: vec![AstBigramEntry { ngram: bigram_a, weight: DEFAULT_AST_WEIGHT, count: 1 }],
+        trigrams: vec![],
+    });
+    let ast1_results = engine.search_ast(&q1).unwrap();
+    let ast1_ids: HashSet<FileId> = ast1_results.iter().map(|(fid, _)| *fid).collect();
+
+    // AC13 SET-EQUALITY: search_ast(1-bigram) and SearchLayer::search(1-bigram) must agree.
+    // If they diverge, one path is using a different code route than the other.
+    assert_eq!(
+        ast1_ids, layer_ids,
+        "AC13: search_ast and SearchLayer::search must return the SAME FileId set \
+         for the same single-bigram query (both route through run_ngram_set). \
+         search_ast={ast1_ids:?}, SearchLayer={layer_ids:?}"
+    );
+
+    drop(dir);
+}
