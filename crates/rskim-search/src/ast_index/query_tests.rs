@@ -508,13 +508,22 @@ fn a3b_or_union_scoring_both_clauses_scores_higher() {
         .with_bigram(
             bigram1.key(),
             vec![
-                AstPosting { doc_id: 0, count: 2 },
-                AstPosting { doc_id: 1, count: 2 },
+                AstPosting {
+                    doc_id: 0,
+                    count: 2,
+                },
+                AstPosting {
+                    doc_id: 1,
+                    count: 2,
+                },
             ],
         )
         .with_bigram(
             bigram2.key(),
-            vec![AstPosting { doc_id: 0, count: 1 }],
+            vec![AstPosting {
+                doc_id: 0,
+                count: 1,
+            }],
         )
         .with_avg_node_count(50.0);
 
@@ -523,8 +532,16 @@ fn a3b_or_union_scoring_both_clauses_scores_higher() {
     let set = AstNgramSet {
         bigrams: {
             let mut v = vec![
-                AstBigramEntry { ngram: bigram1, weight: DEFAULT_AST_WEIGHT, count: 1 },
-                AstBigramEntry { ngram: bigram2, weight: DEFAULT_AST_WEIGHT, count: 1 },
+                AstBigramEntry {
+                    ngram: bigram1,
+                    weight: DEFAULT_AST_WEIGHT,
+                    count: 1,
+                },
+                AstBigramEntry {
+                    ngram: bigram2,
+                    weight: DEFAULT_AST_WEIGHT,
+                    count: 1,
+                },
             ];
             v.sort_unstable_by_key(|e| e.ngram.key());
             v
@@ -1819,7 +1836,9 @@ fn ac6_selective_query_returns_exact_posting_count_multi_ngram() {
     // P3 path: OR-union via run_ngram_set_with_capacity (preserves legacy scoring
     // behavior for capacity tests — AD-374-1 note: search_ast uses AND-intersect
     // since #374, but P3 is a scoring-layer property tested here via the OR-union path).
-    let (multi_results, _) = engine.run_ngram_set_with_capacity(&multi_set, None).unwrap();
+    let (multi_results, _) = engine
+        .run_ngram_set_with_capacity(&multi_set, None)
+        .unwrap();
     assert_eq!(
         multi_results.len(),
         100,
@@ -1857,7 +1876,10 @@ fn ac6_selective_query_returns_exact_posting_count_multi_ngram() {
          files 5–99 are in broad-only and are correctly excluded"
     );
     for (fid, _) in &and_results {
-        assert!(fid.0 < 5, "AND-intersect result must be FileId in [0,5), got: {fid}");
+        assert!(
+            fid.0 < 5,
+            "AND-intersect result must be FileId in [0,5), got: {fid}"
+        );
     }
 }
 
@@ -2595,8 +2617,8 @@ fn ac13_search_ast_and_layer_agree_on_fileid_set() {
     let block_id = vocab_lookup("block").unwrap();
     let expr_id = vocab_lookup("expression_statement").unwrap();
 
-    let bigram_a = AstBigram::encode(fn_id, block_id);        // function_item → block
-    let bigram_b = AstBigram::encode(block_id, expr_id);      // block → expression_statement
+    let bigram_a = AstBigram::encode(fn_id, block_id); // function_item → block
+    let bigram_b = AstBigram::encode(block_id, expr_id); // block → expression_statement
 
     // Build index in a real tempdir (AstIndexReader requires disk).
     let dir = tempdir().unwrap();
@@ -2605,31 +2627,65 @@ fn ac13_search_ast_and_layer_agree_on_fileid_set() {
     // FileId(0): has BOTH bigrams → survives 2-bigram AND-intersect.
     let set0 = AstNgramSet {
         bigrams: vec![
-            AstBigramEntry { ngram: bigram_a, weight: DEFAULT_AST_WEIGHT, count: 2 },
-            AstBigramEntry { ngram: bigram_b, weight: DEFAULT_AST_WEIGHT, count: 1 },
+            AstBigramEntry {
+                ngram: bigram_a,
+                weight: DEFAULT_AST_WEIGHT,
+                count: 2,
+            },
+            AstBigramEntry {
+                ngram: bigram_b,
+                weight: DEFAULT_AST_WEIGHT,
+                count: 1,
+            },
         ],
         trigrams: vec![],
     };
     builder
-        .add_file_ngrams(FileId(0), Language::Rust, &set0, 100, StructuralMetrics::default())
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &set0,
+            100,
+            StructuralMetrics::default(),
+        )
         .unwrap();
 
     // FileId(1): has ONLY bigram_a → excluded by AND-intersect on the 2-bigram query.
     let set1 = AstNgramSet {
-        bigrams: vec![AstBigramEntry { ngram: bigram_a, weight: DEFAULT_AST_WEIGHT, count: 3 }],
+        bigrams: vec![AstBigramEntry {
+            ngram: bigram_a,
+            weight: DEFAULT_AST_WEIGHT,
+            count: 3,
+        }],
         trigrams: vec![],
     };
     builder
-        .add_file_ngrams(FileId(1), Language::Rust, &set1, 80, StructuralMetrics::default())
+        .add_file_ngrams(
+            FileId(1),
+            Language::Rust,
+            &set1,
+            80,
+            StructuralMetrics::default(),
+        )
         .unwrap();
 
     // FileId(2): has ONLY bigram_b → excluded by AND-intersect on the 2-bigram query.
     let set2 = AstNgramSet {
-        bigrams: vec![AstBigramEntry { ngram: bigram_b, weight: DEFAULT_AST_WEIGHT, count: 2 }],
+        bigrams: vec![AstBigramEntry {
+            ngram: bigram_b,
+            weight: DEFAULT_AST_WEIGHT,
+            count: 2,
+        }],
         trigrams: vec![],
     };
     builder
-        .add_file_ngrams(FileId(2), Language::Rust, &set2, 120, StructuralMetrics::default())
+        .add_file_ngrams(
+            FileId(2),
+            Language::Rust,
+            &set2,
+            120,
+            StructuralMetrics::default(),
+        )
         .unwrap();
 
     let reader = builder.build().unwrap();
@@ -2640,8 +2696,16 @@ fn ac13_search_ast_and_layer_agree_on_fileid_set() {
     // Only FileId(0) is in BOTH posting lists → expected result: {FileId(0)}.
     let q = AstQuery::Containment(AstNgramSet {
         bigrams: vec![
-            AstBigramEntry { ngram: bigram_a, weight: DEFAULT_AST_WEIGHT, count: 1 },
-            AstBigramEntry { ngram: bigram_b, weight: DEFAULT_AST_WEIGHT, count: 1 },
+            AstBigramEntry {
+                ngram: bigram_a,
+                weight: DEFAULT_AST_WEIGHT,
+                count: 1,
+            },
+            AstBigramEntry {
+                ngram: bigram_b,
+                weight: DEFAULT_AST_WEIGHT,
+                count: 1,
+            },
         ],
         trigrams: vec![],
     });
@@ -2690,7 +2754,11 @@ fn ac13_search_ast_and_layer_agree_on_fileid_set() {
     //
     // search_ast with a 1-bigram Containment:
     let q1 = AstQuery::Containment(AstNgramSet {
-        bigrams: vec![AstBigramEntry { ngram: bigram_a, weight: DEFAULT_AST_WEIGHT, count: 1 }],
+        bigrams: vec![AstBigramEntry {
+            ngram: bigram_a,
+            weight: DEFAULT_AST_WEIGHT,
+            count: 1,
+        }],
         trigrams: vec![],
     });
     let ast1_results = engine.search_ast(&q1).unwrap();

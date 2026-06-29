@@ -29,8 +29,8 @@ use rskim_search::{all_patterns, parse_ast_query};
 // #201: enriched row type + formatters from rskim-search.
 // pub(super) re-exports so test module (ast_tests.rs) can call them as super::.
 pub(super) use rskim_search::AstResult;
-use rskim_search::{pattern_occurs_in_file, recover_line};
 pub(super) use rskim_search::{format_ast_json, format_ast_text};
+use rskim_search::{pattern_occurs_in_file, recover_line};
 
 use super::types::TemporalSort;
 

@@ -165,7 +165,10 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
 
             result = Some(match result.take() {
                 None => list_set,
-                Some(prev) => prev.into_iter().filter(|id| list_set.contains(id)).collect(),
+                Some(prev) => prev
+                    .into_iter()
+                    .filter(|id| list_set.contains(id))
+                    .collect(),
             });
         }
 

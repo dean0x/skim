@@ -3123,8 +3123,7 @@ fn run_ast_standalone_empty_gate_no_elision_marker_ac11_374() {
     let cache = tempfile::tempdir().unwrap();
     build_project_index(root, cache.path());
 
-    let manifest =
-        FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
+    let manifest = FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
 
     let mut out: Vec<u8> = Vec::new();
     let result = super::run_ast_standalone(
@@ -3198,7 +3197,10 @@ fn ast_gate_reuses_lexical_candidate_pool_k_ac12_374() {
     // multiplier), pool(100, K) would be 100 instead of 500, catching the regression.
     const FLOOR: usize = 100; // must match CANDIDATE_POOL_FLOOR in query.rs
     for limit in [1usize, 5, 10, 100] {
-        let pool = super::super::query::candidate_pool(limit, super::super::query::LEXICAL_CANDIDATE_POOL_K);
+        let pool = super::super::query::candidate_pool(
+            limit,
+            super::super::query::LEXICAL_CANDIDATE_POOL_K,
+        );
         let expected = (EXPECTED_K * limit).max(FLOOR);
         assert_eq!(
             pool,
@@ -3213,10 +3215,14 @@ fn ast_gate_reuses_lexical_candidate_pool_k_ac12_374() {
     // Verify the O(K×limit) linear bound at limit=100 where floor is not active.
     {
         let limit = 100usize;
-        let pool = super::super::query::candidate_pool(limit, super::super::query::LEXICAL_CANDIDATE_POOL_K);
+        let pool = super::super::query::candidate_pool(
+            limit,
+            super::super::query::LEXICAL_CANDIDATE_POOL_K,
+        );
         // K×limit = 500, which exceeds FLOOR=100, so pool must equal K×limit.
         assert_eq!(
-            pool, EXPECTED_K * limit,
+            pool,
+            EXPECTED_K * limit,
             "AC12 linear-bound: candidate_pool(100, K) must equal K×100={} when \
              K×limit > FLOOR={FLOOR} (pool multiplier dominates). Got {pool}",
             EXPECTED_K * limit
@@ -3286,8 +3292,7 @@ fn uses_closure() {
     let cache = tempfile::tempdir().unwrap();
     build_project_index(root, cache.path());
 
-    let manifest =
-        FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
+    let manifest = FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
 
     let mut out: Vec<u8> = Vec::new();
     let result = super::run_ast_standalone(
