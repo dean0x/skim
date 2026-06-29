@@ -115,10 +115,11 @@ pub(super) fn normalize_blast_radius_path(
     //
     // NOTE (#373 scope): this extra `strip_prefix("./")` step is intentional and
     // is NOT consolidated into `walk::normalize_rel_path`.  That helper only
-    // covers the manifest-key/assignment/cache-lookup triple (walk sort key,
-    // index.rs:615, index.rs:737); it does not carry the `./` strip.  Combining
-    // the two would change `--blast-radius ./foo/bar.rs` lookup behavior and
-    // widen the regression blast-radius beyond #373's narrow scope.
+    // covers the manifest-key/assignment/cache-lookup triple (the walk sort key
+    // plus the `path_key` bindings in `index.rs` `consume`/`read_and_classify`);
+    // it does not carry the `./` strip.  Combining the two would change
+    // `--blast-radius ./foo/bar.rs` lookup behavior and widen the regression
+    // blast-radius beyond #373's narrow scope.
     let normalized = rel.strip_prefix("./").unwrap_or(&rel).to_string();
 
     Ok(normalized)

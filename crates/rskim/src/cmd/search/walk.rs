@@ -41,9 +41,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// reintroduces the #373 ordering skew (notably the `\\` → `/` normalization
 /// on Windows).
 ///
-/// Note: `temporal::normalize_path_for_lookup` is intentionally NOT consolidated
+/// Note: `temporal::normalize_blast_radius_path` is intentionally NOT consolidated
 /// here — it carries an extra `strip_prefix("./")` step that serves a different
-/// contract. Leave it in place (see temporal.rs:112).
+/// contract. Leave it in place (see the `#373 scope` NOTE in `temporal.rs`).
 pub(super) fn normalize_rel_path(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }

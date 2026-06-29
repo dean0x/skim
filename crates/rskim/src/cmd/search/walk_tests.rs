@@ -672,40 +672,38 @@ fn test_walk_metadata_flat_corpus_order_unchanged() {
     assert_eq!(keys[2], "src/c.rs");
 }
 
-/// AC-9 / ADR-006 / Windows-skew: two rel_paths that normalize to the same
-/// manifest key (e.g., `foo` and `./foo`) produce a manifest_count < file_count,
-/// which triggers the commit-boundary abort guard.  This test drives
-/// `normalize_rel_path` directly to confirm the collision: the sort would assign
-/// two different FileIds to the same string key, and BTreeMap::insert silently
-/// drops the second — the guard catches this.
+/// AC-10 / ADR-003: pin the pure-string contract of `normalize_rel_path`.
+/// The helper only folds `\\`→`/`; it performs NO filesystem-style canonicalization
+/// (no leading-`./` strip, no `..` collapse). This test asserts that contract
+/// directly on two literal inputs (`foo` and `./foo`) — it does NOT build an index
+/// or exercise the commit-boundary guard.
 ///
-/// Platform-agnostic: `foo` and `./foo` collide on every OS (not Windows-only).
-///
-/// PF-007: negative assertion — if normalize_rel_path no longer collapses these,
-/// the test fails, alerting that the guard may be bypassed.
+/// Why it matters for #373: every FileId-ordering consumer (walk sort key, the
+/// manifest `BTreeMap<String>` key, the lexical cache lookup) routes through this
+/// one helper, so its byte-for-byte output IS the FileId↔path contract. The
+/// related collision/abort behavior (two entries → one BTreeMap key →
+/// manifest_count != file_count → abort) lives in `index.rs::run` and is covered
+/// by the `test_adr006_*` build-level tests, not here.
 #[test]
 fn test_normalize_rel_path_collision_two_forms_of_same_path() {
     use std::path::Path;
 
-    // `foo` and `./foo` normalize to the same manifest key (`foo`).
+    // `foo` is already the canonical manifest key form.
     let key_a = normalize_rel_path(Path::new("foo"));
+    // `./foo` is NOT collapsed to `foo`: `normalize_rel_path` only folds `\\`→`/`,
+    // it does not strip a leading `./` (that is `temporal::normalize_blast_radius_path`'s
+    // job). So the two forms produce DISTINCT keys here — the helper does pure
+    // string work with no filesystem normalization (AC-10 / ADR-003).
     let key_b = normalize_rel_path(Path::new("./foo"));
 
-    // Both must equal `foo` (the canonical manifest key form).
     assert_eq!(key_a, "foo", "normalize_rel_path('foo') must be 'foo'");
-    // `./foo` → `./foo` (the function does NOT strip leading `./` —
-    // that is temporal.rs:112's job).  On a real filesystem these two paths
-    // cannot coexist as distinct walk entries, so in practice the guard fires
-    // only on path-normalization edge cases (e.g. a miscomputed rel_path
-    // starting with `./`).  The important thing the test proves is that the
-    // helper is pure string work (no fs calls — AC-10 / ADR-003).
-    //
-    // For a true collision test at the build level (guard fires → Err) the
-    // integration harness is `test_index_build_aborts_on_duplicate_normalized_key`
-    // in index_tests.rs.
+    // The commit-boundary guard in `index.rs::run` (manifest_count != file_count)
+    // is what catches two walk entries collapsing to one BTreeMap key; on a real
+    // filesystem `foo` and `./foo` cannot coexist as distinct walk entries, so
+    // this unit test only pins the helper's pure-string contract, not the guard.
     assert_eq!(
         key_b, "./foo",
         "normalize_rel_path('./foo') must be './foo' (no leading-dot strip — \
-         that is temporal.rs's domain, not this helper's)"
+         that is temporal::normalize_blast_radius_path's domain, not this helper's)"
     );
 }
