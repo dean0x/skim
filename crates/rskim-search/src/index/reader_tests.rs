@@ -612,7 +612,7 @@ fn test_ac1_type_definition_ranks_above_string_literal() {
 ///
 /// `bm25f_config` is a BM25F UNION-path parameter.  Single-token queries (≥3 bytes)
 /// now route to `search_exact_intersection` (AD-372-1) which ranks by
-/// occurrence-count / token-density (AD-372-6), NOT BM25F.  Configurable BM25F
+/// raw occurrence-count (AD-372-6, length-norm-free), NOT BM25F.  Configurable BM25F
 /// field boosts therefore only apply to MULTI-WORD queries (the UNION path).
 ///
 /// This test uses a two-word query "SearchTarget struct" to remain on the UNION
@@ -2052,20 +2052,20 @@ fn test_ac8_v4_format_compat_exact_symbol_no_rebuild() {
 /// deterministic 3-file ranked intersection must skip the top-ranked file and
 /// start at rank 2.
 ///
-/// Ranking key: occurrence-count / token-density (AD-372-6, length-norm-free).
-/// File 0: token appears 5 times in a very short file → highest density → rank 1.
-/// File 1: token appears 3 times in a medium file → rank 2.
-/// File 2: token appears 1 time in a long file → rank 3.
+/// Ranking key: raw occurrence-count (AD-372-6, length-norm-free).
+/// File 0: token appears 5 times → highest raw count → rank 1.
+/// File 1: token appears 3 times → rank 2.
+/// File 2: token appears 1 time → rank 3.
 #[test]
 fn test_ac11_offset_semantics_exact_path_reader_level() {
     let token = "my_offset_token";
     let filler = "x ".repeat(50);
 
-    // File 0: 5 occurrences, short file → highest density.
+    // File 0: 5 occurrences → highest raw count → rank 1.
     let file0 = format!("{token} {token} {token} {token} {token}");
-    // File 1: 3 occurrences, medium file.
+    // File 1: 3 occurrences → rank 2.
     let file1 = format!("{filler} {token} {token} {token} more content");
-    // File 2: 1 occurrence, very long file → lowest density.
+    // File 2: 1 occurrence → lowest raw count → rank 3.
     let filler_long = "y ".repeat(500);
     let file2 = format!("{filler_long} {token} end");
 
@@ -2125,8 +2125,8 @@ fn test_ac11_offset_semantics_exact_path_reader_level() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// AD-372-6 / AC #16: two consecutive `search()` calls for the same query
-/// must return identical file_id ordering (sorted by occurrence-count /
-/// token-density key, FileId tie-break for determinism).
+/// must return identical file_id ordering (sorted by raw occurrence-count,
+/// AD-372-6, FileId tie-break for determinism).
 #[test]
 fn test_ac16_determinism_exact_path() {
     let token = "deterministic_token";
@@ -2145,7 +2145,7 @@ fn test_ac16_determinism_exact_path() {
         (
             FileId(2),
             &format!(
-                "{token} very long content with lots of other words to dilute density yyy zzz aaa bbb ccc ddd eee fff ggg hhh"
+                "{token} very long content with lots of other words yyy zzz aaa bbb ccc ddd eee fff ggg hhh"
             ),
             rskim_core::Language::Rust,
         ),
@@ -2299,11 +2299,11 @@ fn test_ac_bench_surface_ranking_large_definer_within_top_k() {
 
     // PF-007 negative: if a BM25F key (divides by field_len) were used, FileId(0)
     // might be buried below the small files.  The assert above catches that.
-    // Additionally verify rank-1 is FileId(0) (highest occurrence count / density).
+    // Additionally verify rank-1 is FileId(0) (highest raw occurrence count, AD-372-6).
     if !ids.is_empty() {
         assert_eq!(
             ids[0], 0,
-            "AD-372-6: FileId(0) with 3 occurrences must rank #1 under occurrence-count/density key; \
+            "AD-372-6: FileId(0) with 3 occurrences must rank #1 under raw occurrence-count key; \
              got rank-1 = FileId({}). BM25F would bury the large file — AD-372-6 prevents that.",
             ids[0]
         );

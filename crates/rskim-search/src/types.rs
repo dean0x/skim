@@ -510,7 +510,7 @@ pub trait SearchLayer: Send + Sync {
     ///    whitespace — detected by [`crate::ngram::is_single_token`]):
     ///    generates candidates via AND-intersection of the query trigrams'
     ///    posting lists (grep-exact, limit/size-independent).  Ranked by
-    ///    occurrence-count / token-density (length-norm-free, AD-372-6) so
+    ///    raw occurrence-count (length-norm-free, AD-372-6) so
     ///    large-file definers are not buried by BM25F field-length normalization.
     ///    Callers on the pure-lexical path MUST set `query.limit = None` so the
     ///    complete intersection is forwarded to the verify-then-truncate-LAST

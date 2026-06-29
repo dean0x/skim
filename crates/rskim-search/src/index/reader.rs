@@ -37,6 +37,56 @@ use crate::{
 };
 
 // ============================================================================
+// Shared sort-and-assemble helper
+// ============================================================================
+
+/// Sort `scored` by descending score (ascending `doc_id` tie-break), then
+/// assemble [`SearchResult`] values after applying `offset` + `limit`.
+///
+/// Used by both `search_exact_intersection` (raw occurrence-count ranking,
+/// AD-372-6) and `collect_scored_results` (BM25F UNION path) so the two
+/// ranking tails stay in sync when the `SearchResult` shape or tie-break
+/// rule changes.
+///
+/// Extracted to eliminate the duplication that existed between the two paths
+/// (identical sort comparator + identical result-assembly tail).
+fn sort_and_assemble_results(
+    scored: &mut Vec<(u32, f64)>,
+    doc_positions: &mut HashMap<u32, Vec<std::ops::Range<usize>>>,
+    doc_field_tfs: &HashMap<u32, [f32; FIELD_COUNT]>,
+    offset: usize,
+    limit: usize,
+) -> Vec<SearchResult> {
+    // Sort: descending score, ascending FileId for tie-break (determinism).
+    scored.sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    scored
+        .drain(..)
+        .skip(offset)
+        .take(limit)
+        .map(|(doc_id, score)| {
+            let positions = doc_positions.remove(&doc_id).unwrap_or_default();
+            let field = doc_field_tfs
+                .get(&doc_id)
+                .map(dominant_field)
+                .unwrap_or(SearchField::Other);
+            SearchResult {
+                file_id: FileId(doc_id),
+                score,
+                line_range: 0..0,
+                match_positions: positions,
+                field,
+                snippet: None,
+            }
+        })
+        .collect()
+}
+
+// ============================================================================
 // Reader struct
 // ============================================================================
 
@@ -416,6 +466,10 @@ impl NgramIndexReader {
     /// # Errors
     ///
     /// Returns `Err(SearchError::IndexCorrupted)` if any posting list fails to decode.
+    // Retained for future unit-test calls that whitebox-test the intersection step.
+    // `search_exact_intersection` inlines the intersection to decode each posting list
+    // only once (halving decode+alloc work on the hot path, see #372).
+    #[allow(dead_code)]
     fn intersect_posting_doc_ids(&self, ngrams: &[(Ngram, f32)]) -> Result<Vec<u32>> {
         if ngrams.is_empty() {
             return Ok(Vec::new());
@@ -475,14 +529,14 @@ impl NgramIndexReader {
     }
 
     /// Exact-symbol search: AND-intersection of query trigram posting lists,
-    /// followed by occurrence-count / token-density ranking (length-norm-free).
+    /// followed by raw occurrence-count ranking (length-norm-free, AD-372-6).
     ///
     /// # AD-372-1: Query-shape dispatch — exact-symbol mode
     ///
     /// This method is called when `is_single_token(query.text)` is `true` and
     /// `extract_query_ngrams` produced a non-empty set.  It generates candidates
     /// via AND-intersection (grep-exact, limit/size-independent), then ranks by
-    /// an occurrence-count / token-density key (AD-372-6) so large-file definers
+    /// raw occurrence-count (AD-372-6, length-norm-free) so large-file definers
     /// are not buried by BM25F length-normalization.
     ///
     /// The intersection is returned in its entirety (no `take` before verify):
@@ -514,17 +568,78 @@ impl NgramIndexReader {
         lang_filter: Option<u8>,
     ) -> Result<Vec<SearchResult>> {
         // Step 1: AND-intersection of posting lists → surviving doc_ids.
-        let intersected_ids = self.intersect_posting_doc_ids(ngrams)?;
-        if intersected_ids.is_empty() {
+        //
+        // Decode each trigram's posting list ONCE here and pass the decoded
+        // `Vec<Vec<PostingEntry>>` directly into Step 2.  This eliminates the
+        // double-decode that existed when Step 1 called `intersect_posting_doc_ids`
+        // (which decoded via `lookup_postings`) and Step 2 called `lookup_postings`
+        // again for the same trigrams — 2× decode+alloc per query on the hot path.
+        if ngrams.is_empty() {
             return Ok(Vec::new());
         }
+
+        // Build per-trigram sorted-unique doc_id sets (same as intersect_posting_doc_ids,
+        // but also retaining the full decoded posting vecs for Step 2).
+        let mut per_ngram_postings: Vec<Vec<super::format::PostingEntry>> =
+            Vec::with_capacity(ngrams.len());
+        let mut per_ngram_doc_ids: Vec<Vec<u32>> = Vec::with_capacity(ngrams.len());
+
+        for (ngram, _weight) in ngrams {
+            let postings = self.lookup_postings(ngram.key())?;
+            let mut doc_ids: Vec<u32> = Vec::with_capacity(postings.len());
+            let mut last: Option<u32> = None;
+            for p in &postings {
+                if last != Some(p.doc_id) {
+                    doc_ids.push(p.doc_id);
+                    last = Some(p.doc_id);
+                }
+            }
+            // If any trigram has an empty posting list, the intersection is empty.
+            if doc_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            per_ngram_postings.push(postings);
+            per_ngram_doc_ids.push(doc_ids);
+        }
+
+        // Sort both vecs together by doc_id list length (smallest-first, AD-372-2).
+        // We sort indices so both vecs stay aligned.
+        let mut order: Vec<usize> = (0..per_ngram_doc_ids.len()).collect();
+        order.sort_unstable_by_key(|&i| per_ngram_doc_ids[i].len());
+
+        // Compute intersection using the sorted order.
+        let mut intersection: Vec<u32> = per_ngram_doc_ids[order[0]].clone();
+        for &idx in &order[1..] {
+            let other = &per_ngram_doc_ids[idx];
+            let mut result: Vec<u32> = Vec::new();
+            let mut i = 0usize;
+            let mut j = 0usize;
+            while i < intersection.len() && j < other.len() {
+                match intersection[i].cmp(&other[j]) {
+                    std::cmp::Ordering::Equal => {
+                        result.push(intersection[i]);
+                        i += 1;
+                        j += 1;
+                    }
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                }
+            }
+            intersection = result;
+            if intersection.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+
+        // `intersection` is a sorted Vec<u32> — use binary_search for O(log n)
+        // membership tests below, avoiding the O(n) HashSet construction + rehash.
 
         // Step 2: For each surviving doc_id, gather occurrence count (for
         // ranking) and match positions (for snippets) from ALL intersected
         // trigrams.  Also apply lang_filter and file_filter.
         //
-        // Build a lookup set of surviving doc_ids for O(1) membership tests.
-        let id_set: std::collections::HashSet<u32> = intersected_ids.iter().copied().collect();
+        // Reuse the already-decoded `per_ngram_postings` from Step 1 — no
+        // second `lookup_postings` call needed (halves decode+alloc work).
 
         // Per-doc occurrence count (sum of TFs across all query trigrams).
         let mut doc_occurrence_count: HashMap<u32, usize> = HashMap::new();
@@ -532,10 +647,10 @@ impl NgramIndexReader {
         let mut doc_meta_cache: HashMap<u32, FileMetaEntry> = HashMap::new();
         let mut doc_field: HashMap<u32, [f32; FIELD_COUNT]> = HashMap::new();
 
-        for (ngram, _weight) in ngrams {
-            let postings = self.lookup_postings(ngram.key())?;
-            for p in &postings {
-                if !id_set.contains(&p.doc_id) {
+        for postings in &per_ngram_postings {
+            for p in postings {
+                // Binary search on the sorted intersection vec — no HashSet needed.
+                if intersection.binary_search(&p.doc_id).is_err() {
                     continue; // not in intersection
                 }
                 // Apply file_filter (blast-radius allowlist) if set.
@@ -593,51 +708,21 @@ impl NgramIndexReader {
         // a tiny file with 1/5 = 0.20 density), recreating the length-normalization
         // problem we are eliminating.  Raw count is the correct signal.
         //
-        // Tie-break: ascending FileId for determinism (mirrors collect_scored_results).
-        //
         // Note: docs that were excluded by file_filter or lang_filter above will
         // have no entry in doc_occurrence_count and are omitted here.
-        // AD-372-6: length-norm-free ranking key = raw occurrence count.
         let mut scored: Vec<(u32, f64)> = doc_occurrence_count
             .into_iter()
             .map(|(doc_id, occ)| (doc_id, occ as f64))
             .collect();
 
-        // Sort: descending score, ascending FileId for tie-break (determinism).
-        scored.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-
-        // Step 4: Apply offset + limit LAST (AD-355-2 / AD-372-3).
-        // When query.limit is None the full intersection is returned to the caller,
-        // which applies its own truncation after verification.
-        let offset = query.offset.unwrap_or(0);
-        let limit = query.limit.unwrap_or(usize::MAX);
-
-        let results: Vec<SearchResult> = scored
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(doc_id, score)| {
-                let positions = doc_positions.remove(&doc_id).unwrap_or_default();
-                let field = doc_field
-                    .get(&doc_id)
-                    .map(dominant_field)
-                    .unwrap_or(SearchField::Other);
-                SearchResult {
-                    file_id: FileId(doc_id),
-                    score,
-                    line_range: 0..0,
-                    match_positions: positions,
-                    field,
-                    snippet: None,
-                }
-            })
-            .collect();
-
-        Ok(results)
+        // Step 4: Sort + assemble via shared helper (mirrors collect_scored_results).
+        Ok(sort_and_assemble_results(
+            &mut scored,
+            &mut doc_positions,
+            &doc_field,
+            query.offset.unwrap_or(0),
+            query.limit.unwrap_or(usize::MAX),
+        ))
     }
 
     /// Final phase of scoring: apply defense-in-depth file_filter, sort by score,
@@ -663,33 +748,8 @@ impl NgramIndexReader {
                 .collect(),
             None => doc_scores.into_iter().collect(),
         };
-        // Sort descending by score; tie-break ascending by FileId for determinism.
-        scored.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
 
-        scored
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(doc_id, score)| {
-                let positions = doc_positions.remove(&doc_id).unwrap_or_default();
-                let field = doc_field_tfs
-                    .get(&doc_id)
-                    .map(dominant_field)
-                    .unwrap_or(SearchField::Other);
-                SearchResult {
-                    file_id: FileId(doc_id),
-                    score,
-                    line_range: 0..0,
-                    match_positions: positions,
-                    field,
-                    snippet: None,
-                }
-            })
-            .collect()
+        sort_and_assemble_results(&mut scored, &mut doc_positions, &doc_field_tfs, offset, limit)
     }
 
     /// Retrieve all posting entries for `ngram_key` from the mmap'd posting file.
@@ -746,7 +806,7 @@ impl SearchLayer for NgramIndexReader {
     /// 3. **`is_single_token` branch** — a single contiguous token (≥ 3 bytes,
     ///    no interior whitespace) routes to `search_exact_intersection`, which
     ///    generates candidates via AND-intersection (grep-exact, limit/size-
-    ///    independent) and ranks by an occurrence-count / token-density key
+    ///    independent) and ranks by raw occurrence-count
     ///    (AD-372-6, length-norm-free).
     /// 4. **Multi-word / default** — the existing BM25F UNION loop; untouched.
     ///
@@ -812,7 +872,7 @@ impl SearchLayer for NgramIndexReader {
         // the AND-intersection path.  The intersection is grep-exact and
         // limit/size-independent: every verified file is guaranteed to be in
         // the candidate set (superset invariant, AD-372-2).  Ranked by
-        // occurrence-count / token-density (length-norm-free, AD-372-6) so
+        // raw occurrence-count (length-norm-free, AD-372-6) so
         // large-file definers are not buried by BM25F field-length normalization.
         //
         // This check is placed AFTER `ngrams.is_empty()` (above) so that a

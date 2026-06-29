@@ -260,6 +260,15 @@ fn parse_limit_value(raw: &str) -> anyhow::Result<usize> {
     Ok(parsed)
 }
 
+/// Parse and validate a `--offset` value string.
+///
+/// Accepts any non-negative integer (`u64`). Returns an error for non-numeric
+/// values. Parallel to `parse_limit_value` so both flag arms read identically.
+fn parse_offset_value(raw: &str) -> anyhow::Result<u64> {
+    raw.parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("--offset value must be a non-negative integer, got {:?}", raw))
+}
+
 /// Parse a temporal flag arm (`--hot`, `--cold`, `--risky`, `--blast-radius`).
 ///
 /// Returns `Ok(true)` when the flag consumed an extra token (i.e. the space-
@@ -402,10 +411,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                 // Applied AFTER verification (RESOLVED Decision 3 / AC#11).
                 // Space-separated (`--offset 5`) and equals (`--offset=5`) both accepted.
                 let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--offset")?;
-                let parsed = raw
-                    .parse::<u64>()
-                    .map_err(|_| anyhow::anyhow!("--offset value must be a non-negative integer, got {:?}", raw))?;
-                offset = Some(parsed);
+                offset = Some(parse_offset_value(&raw)?);
                 if consumed {
                     i += 1;
                 }
@@ -775,12 +781,17 @@ fn run_query(
     // preserving the invariant: exactly one auto_refresh_if_stale call per query.
     let mut output = query::execute_query_with_manifest(&config, pre_loaded_manifest, analytics)?;
 
-    // Apply temporal sort/annotation to the results, then truncate to --limit.
-    // Truncating AFTER the re-sort (not via the engine's LIMIT) is the GAP-1
+    // Apply temporal sort/annotation to the results, then apply offset + truncate to --limit.
+    // Applying offset+limit AFTER the re-sort (not via the engine's LIMIT) is the GAP-1
     // invariant: the top-`limit` BY TEMPORAL SCORE survive, not the top-`limit`
     // by lexical relevance re-ordered.
+    // AD-372-3 / PF-006: thread config.offset so `--offset` works on the temporal path too.
     if let (Some(sort), Some(db)) = (flags.temporal_sort, &temporal_db) {
         temporal::apply_temporal_enrichment(&mut output.results, sort, db)?;
+        let effective_offset = flags.offset.map(|o| o as usize).unwrap_or(0);
+        if effective_offset > 0 {
+            output.results.drain(..effective_offset.min(output.results.len()));
+        }
         output.results.truncate(flags.limit);
         output.total = output.results.len();
     }

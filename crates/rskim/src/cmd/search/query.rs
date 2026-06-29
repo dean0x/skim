@@ -241,7 +241,7 @@ pub(super) fn execute_query_with_manifest(
     //   size or pool size.  `sq.limit = None` (no LEXICAL_CANDIDATE_POOL_K
     //   widening) so the complete intersection reaches
     //   `resolve_paths_and_snippets_verified`.  The reader still ranks the
-    //   intersection internally (AD-372-6: occurrence-count / token-density,
+    //   intersection internally (AD-372-6: raw occurrence-count,
     //   length-norm-free), and offset is applied after ranking.
     //
     // **Multi-word / default path** (`is_single_token` == false):
@@ -453,6 +453,11 @@ fn run_compound_query(
     // Verification drops non-matching candidates (relevance gate, not a #317 cap);
     // truncation to config.limit happens inside resolve_paths_and_snippets_verified
     // as the final step.
+    // AD-372-3 / PF-006: thread config.offset into the compound path so that
+    // `skim search "foo" --ast try-catch --offset 10` paginates correctly.
+    // The RRF recomposition does NOT apply offset; pagination is handled here,
+    // post-verify, as on the pure-lexical path.
+    let effective_offset = config.offset.unwrap_or(0) as usize;
     let results = resolve_paths_and_snippets_verified(
         &recomposed,
         ctx.sorted,
@@ -462,7 +467,7 @@ fn run_compound_query(
             query: &config.text,
             layers_matched: &["lexical", "ast"],
             limit: config.limit,
-            offset: 0, // compound path: offset handled by RRF recomposition, not by this fn
+            offset: effective_offset,
         },
     );
     let total = results.len();
@@ -585,6 +590,11 @@ fn run_blast_radius_composite_query(
     // For co-change-only files (absent from lexical pool): no file content is
     // available here; these are pure temporal results that the text query did not
     // match — include them unconditionally (AC12, UNION mode).
+    // AD-372-3 / PF-006: thread config.offset into the blast-radius path so that
+    // `skim search "foo" --blast-radius src/x.rs --offset 10` paginates correctly.
+    // Applied post-verify (`.skip` before `.take`), consistent with the pure-lexical
+    // and compound paths.
+    let effective_offset = config.offset.unwrap_or(0) as usize;
     let results: Vec<super::types::ResolvedResult> = ranked
         .iter()
         .filter_map(|&(fid, composite_score)| {
@@ -644,7 +654,9 @@ fn run_blast_radius_composite_query(
                 })
             }
         })
-        // AD-355-2: truncate to --limit LAST — after verification, not before.
+        // AD-355-2 / AD-372-3: apply offset then truncate LAST — after verification
+        // removes non-matching candidates (consistent with pure-lexical path).
+        .skip(effective_offset)
         .take(config.limit)
         .collect();
 
