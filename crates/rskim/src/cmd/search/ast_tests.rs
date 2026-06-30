@@ -3338,3 +3338,347 @@ fn uses_closure() {
 // `crates/rskim-search/src/ast_index/query_tests.rs::ac13_search_ast_and_layer_agree_on_fileid_set`
 // for the full falsifiable test using real AstIndexBuilder/AstIndexReader.
 // That test lives in `rskim-search` where all engine types are already in scope.
+
+// ============================================================================
+// Group 12: #377 — compound text+--ast path honors --weights (AD-377-1)
+// ============================================================================
+//
+// Before #377, run_compound_query hardcoded `CompositeWeights::default()` and
+// silently ignored caller-supplied `--weights` on the text+--ast path (the
+// ticket's "byte-identical output" bug). These tests drive the real compound
+// path (execute_query with ast_scored = Some) and assert the fix (PF-007: each
+// fails if the fix is reverted).
+
+/// AC2 (NEGATIVE, byte-identity): on the compound path, `composite_weights = None`
+/// MUST produce results byte-identical to `Some(parse_weights_flag("0.5,0.3,0.2"))`
+/// (the default profile). Back-compat guard for AD-377-1.
+#[test]
+fn compound_none_weights_byte_identical_to_explicit_default_ac2() {
+    use super::super::query::execute_query;
+
+    let project = make_project_with_two_nested_loop_files();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
+    assert!(
+        ast_scored.len() >= 2,
+        "AC2 setup: rust-nested-loop must match alpha.rs + beta.rs (>=2 files), got {}",
+        ast_scored.len()
+    );
+
+    let mut base = make_query_config(
+        project.path(),
+        cache.path(),
+        "fn",
+        50,
+        Some(ast_scored.clone()),
+        None,
+    );
+    base.composite_weights = None;
+    let out_none = execute_query(&base, &TEST_ANALYTICS).unwrap();
+
+    let mut explicit = make_query_config(
+        project.path(),
+        cache.path(),
+        "fn",
+        50,
+        Some(ast_scored),
+        None,
+    );
+    explicit.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0.5,0.3,0.2").unwrap());
+    let out_default = execute_query(&explicit, &TEST_ANALYTICS).unwrap();
+
+    let pn: Vec<(&str, f64)> = out_none
+        .results
+        .iter()
+        .map(|r| (r.path.as_str(), r.score))
+        .collect();
+    let pd: Vec<(&str, f64)> = out_default
+        .results
+        .iter()
+        .map(|r| (r.path.as_str(), r.score))
+        .collect();
+    assert_eq!(
+        pn, pd,
+        "AC2: compound `None` weights must be byte-identical to explicit Some(0.5,0.3,0.2)"
+    );
+}
+
+/// AC5 (contract, POSITIVE): `--weights 0,0,0` on the compound path returns the
+/// FULL non-empty intersection, every score == 0.0, diverging intentionally from
+/// the blast path (which returns empty). This ALSO falsifies the AD-377-1 bug:
+/// under the old hardcoded `CompositeWeights::default()` (0.5,0.3,0.2) the scores
+/// would be non-zero, so the `score == 0.0` assertion would fail.
+#[test]
+fn compound_zero_weights_returns_full_intersection_at_zero_ac5() {
+    use super::super::query::execute_query;
+
+    let project = make_project_with_two_nested_loop_files();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
+    assert!(
+        ast_scored.len() >= 2,
+        "AC5 setup: rust-nested-loop must match >=2 files, got {}",
+        ast_scored.len()
+    );
+
+    // Reference run (default weights) to size the expected intersection cardinality.
+    let ref_cfg = make_query_config(
+        project.path(),
+        cache.path(),
+        "fn",
+        50,
+        Some(ast_scored.clone()),
+        None,
+    );
+    let ref_out = execute_query(&ref_cfg, &TEST_ANALYTICS).unwrap();
+    assert!(
+        !ref_out.results.is_empty(),
+        "AC5 setup: default-weights compound run must return a non-empty intersection"
+    );
+
+    let mut zero_cfg = make_query_config(
+        project.path(),
+        cache.path(),
+        "fn",
+        50,
+        Some(ast_scored),
+        None,
+    );
+    zero_cfg.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0,0,0").unwrap());
+    let zero_out = execute_query(&zero_cfg, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !zero_out.results.is_empty(),
+        "AC5: --weights 0,0,0 on compound path must return a NON-EMPTY intersection \
+         (diverges from blast path's empty result)"
+    );
+    assert_eq!(
+        zero_out.results.len(),
+        ref_out.results.len(),
+        "AC5: zero-weights must return the FULL intersection (same cardinality as default)"
+    );
+    for r in &zero_out.results {
+        assert_eq!(
+            r.score, 0.0,
+            "AC5/AD-377-1: every score under --weights 0,0,0 must be exactly 0.0 — a non-zero \
+             score proves --weights is being ignored and the default 0.5,0.3,0.2 is still hardcoded \
+             (got {} for {})",
+            r.score, r.path
+        );
+    }
+}
+
+/// Fixture for the AC1/AC4 ordering-flip tests: two files that BOTH match
+/// `rust-nested-loop` AND contain the token `needle`, but with a deliberate
+/// lexical skew so the lexical ranking is unambiguous.
+///
+/// - `src/aaa.rs` — tiny file, `needle` repeated several times → lexically DOMINANT.
+/// - `src/bbb.rs` — large filler body, `needle` once → lexically WEAK.
+///
+/// `aaa` sorts before `bbb`, so `FileId(aaa) < FileId(bbb)`. The tests assign the
+/// AST-layer score so `bbb` is AST-DOMINANT. With those opposite rankings, shifting
+/// the lexical:ast weight ratio flips the top result (AC1).
+fn make_project_two_ast_files_lexical_skew() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // aaa: tiny, many `needle` occurrences → high BM25F (short doc, high TF).
+    fs::write(
+        root.join("src/aaa.rs"),
+        r#"
+fn aaa() {
+    // needle needle needle needle needle needle
+    for i in 0..2 {
+        for j in 0..2 {
+            let _ = (i, j);
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // bbb: large filler body, exactly one `needle` → low BM25F (long doc, low TF).
+    let filler = "    // padding line to lengthen the document and depress term frequency\n"
+        .repeat(40);
+    fs::write(
+        root.join("src/bbb.rs"),
+        format!(
+            r#"
+fn bbb() {{
+    // needle
+{filler}
+    for x in 0..2 {{
+        for y in 0..2 {{
+            let _ = (x, y);
+        }}
+    }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+
+    fs::write(root.join("config.json"), r#"{"key": "value"}"#).unwrap();
+    dir
+}
+
+/// Resolve a single repo-relative path to its `FileId` via the manifest.
+/// Panics if the path is not present (a test-setup bug).
+fn file_id_for(project: &Path, cache: &Path, rel_path: &str) -> rskim_search::FileId {
+    use super::super::manifest::FileManifest;
+    let manifest =
+        FileManifest::load(project.to_path_buf(), cache.to_path_buf()).expect("manifest must load");
+    let sorted = manifest.sorted_paths();
+    let mut allowed = std::collections::HashSet::new();
+    allowed.insert(rel_path.to_string());
+    let ids = super::super::temporal::paths_to_file_ids(&sorted, &allowed);
+    assert_eq!(
+        ids.len(),
+        1,
+        "expected exactly one FileId for {rel_path:?}, got {ids:?} (indexed: {sorted:?})"
+    );
+    *ids.iter().next().unwrap()
+}
+
+/// Build the asymmetric AST-scored vector for the skew fixture: `bbb` (AST-dominant)
+/// gets the higher score, `aaa` the lower; sorted FileId-ASC per the frozen contract.
+fn skew_ast_scored(project: &Path, cache: &Path) -> Vec<(rskim_search::FileId, f64)> {
+    let fid_aaa = file_id_for(project, cache, "src/aaa.rs");
+    let fid_bbb = file_id_for(project, cache, "src/bbb.rs");
+    assert!(
+        fid_aaa.0 < fid_bbb.0,
+        "fixture invariant: aaa must sort before bbb (got {fid_aaa:?} / {fid_bbb:?})"
+    );
+    // aaa lower AST score, bbb higher AST score → AST rank: bbb=1, aaa=2.
+    // Sorted FileId-ASC (aaa first) as intersect_and_rank requires.
+    vec![(fid_aaa, 1.0), (fid_bbb, 9.0)]
+}
+
+/// AC1 (Functionality, POSITIVE): the compound text+--ast path honors the
+/// lexical:ast ratio — the TOP result MUST flip between lexical-heavy (0.9,0.1,0.0)
+/// and ast-heavy (0.1,0.9,0.0) weights. Falsifies the AD-377-1 bug: under the old
+/// hardcoded default the top result would be identical for both weightings.
+#[test]
+fn compound_top_result_flips_with_weights_ac1() {
+    use super::super::query::execute_query;
+
+    let project = make_project_two_ast_files_lexical_skew();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let ast_scored = skew_ast_scored(project.path(), cache.path());
+
+    let mut lex_heavy = make_query_config(
+        project.path(),
+        cache.path(),
+        "needle",
+        10,
+        Some(ast_scored.clone()),
+        None,
+    );
+    lex_heavy.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0.9,0.1,0.0").unwrap());
+    let out_lex = execute_query(&lex_heavy, &TEST_ANALYTICS).unwrap();
+
+    let mut ast_heavy = make_query_config(
+        project.path(),
+        cache.path(),
+        "needle",
+        10,
+        Some(ast_scored),
+        None,
+    );
+    ast_heavy.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0.1,0.9,0.0").unwrap());
+    let out_ast = execute_query(&ast_heavy, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !out_lex.results.is_empty() && !out_ast.results.is_empty(),
+        "AC1 setup: both weightings must return a non-empty intersection (lex={}, ast={})",
+        out_lex.results.len(),
+        out_ast.results.len()
+    );
+    let top_lex = out_lex.results[0].path.as_str();
+    let top_ast = out_ast.results[0].path.as_str();
+    assert_ne!(
+        top_lex, top_ast,
+        "AC1: top result MUST flip when the lexical:ast ratio shifts (got {top_lex} both times) — \
+         proves --weights is honored on the compound path"
+    );
+    assert_eq!(
+        top_lex, "src/aaa.rs",
+        "AC1: under lexical-heavy weights the lexically-dominant file (aaa) must rank first"
+    );
+    assert_eq!(
+        top_ast, "src/bbb.rs",
+        "AC1: under ast-heavy weights the AST-dominant file (bbb) must rank first"
+    );
+}
+
+/// AC4 (Functionality, POSITIVE): the text+--ast+--blast-radius triple-flag path
+/// honors the lexical:ast ratio exactly as AC1. The blast set allows BOTH files so
+/// the intersection is unchanged; the flip is driven purely by the weight ratio.
+#[test]
+fn compound_with_blast_top_result_flips_with_weights_ac4() {
+    use super::super::query::execute_query;
+
+    let project = make_project_two_ast_files_lexical_skew();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let ast_scored = skew_ast_scored(project.path(), cache.path());
+
+    // Blast set allows both AST files → blast∩AST == AST (intersection unchanged).
+    let blast: std::collections::HashSet<String> =
+        ["src/aaa.rs".to_string(), "src/bbb.rs".to_string()]
+            .into_iter()
+            .collect();
+
+    let mut lex_heavy = make_query_config(
+        project.path(),
+        cache.path(),
+        "needle",
+        10,
+        Some(ast_scored.clone()),
+        Some(blast.clone()),
+    );
+    lex_heavy.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0.9,0.1,0.0").unwrap());
+    let out_lex = execute_query(&lex_heavy, &TEST_ANALYTICS).unwrap();
+
+    let mut ast_heavy = make_query_config(
+        project.path(),
+        cache.path(),
+        "needle",
+        10,
+        Some(ast_scored),
+        Some(blast),
+    );
+    ast_heavy.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0.1,0.9,0.0").unwrap());
+    let out_ast = execute_query(&ast_heavy, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !out_lex.results.is_empty() && !out_ast.results.is_empty(),
+        "AC4 setup: both weightings must return a non-empty blast∩AST intersection"
+    );
+    let top_lex = out_lex.results[0].path.as_str();
+    let top_ast = out_ast.results[0].path.as_str();
+    assert_ne!(
+        top_lex, top_ast,
+        "AC4: top result MUST flip on the text+--ast+--blast path when the lexical:ast ratio shifts"
+    );
+    assert_eq!(top_lex, "src/aaa.rs", "AC4: lexical-heavy → aaa first");
+    assert_eq!(top_ast, "src/bbb.rs", "AC4: ast-heavy → bbb first");
+}

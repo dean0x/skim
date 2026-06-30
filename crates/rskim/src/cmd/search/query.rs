@@ -78,6 +78,91 @@ pub(super) fn candidate_pool(limit: usize, k: usize) -> usize {
 }
 
 // ============================================================================
+// Inert-`--weights` notice (#377, AD-377-2)
+// ============================================================================
+
+/// Notice emitted when `--weights` is supplied to a path that ignores the WHOLE
+/// flag (#377, PF-006: a documented flag must never be *silently* inert).
+///
+/// Fires on the pure-lexical, standalone-`--ast`, temporal-only and
+/// blast-radius-only paths — none of which run a weighted RRF, so no component
+/// of `--weights` affects the result. The wording is deliberately unconditional
+/// ("had no effect") because on these paths that is literally true.
+///
+/// **Single source of truth (PF-008).** Both `execute_query_with_manifest`
+/// (pure-lexical) and the two standalone dispatch arms in `mod.rs` (standalone
+/// `--ast`, temporal-only/blast-only) emit *this exact string* via
+/// [`weights_inert_notice`], so AC7 and AC8 assert the identical substring and
+/// the sites cannot silently drift. It names *both* composite paths so it stays
+/// in sync with `print_help` (AC10 / PF-008 doc-drift guard).
+pub(super) const WEIGHTS_FULLY_INERT_NOTICE: &str = "skim search: note: --weights only tunes ranking on the --blast-radius and \
+     text+--ast composite paths; the supplied --weights had no effect on this query.";
+
+/// Notice emitted on the compound text+`--ast` (± `--blast-radius`) path when the
+/// user supplied a NON-ZERO temporal weight (#377, AD-377-2).
+///
+/// On this path `intersect_and_rank` fuses ONLY the lexical and ast rank terms,
+/// so the lexical and ast weights *did* affect ranking — only the temporal
+/// component was inert. The blocking-review fix (#377): the message must NOT
+/// claim the whole flag "had no effect" here (that is factually wrong on the
+/// compound path); it scopes the inert claim to the temporal component alone.
+pub(super) const WEIGHTS_TEMPORAL_INERT_NOTICE: &str = "skim search: note: the temporal component of --weights had no effect — on a \
+     text+--ast query only the lexical and ast weights tune ranking (the AST \
+     intersection fuses no temporal signal). The lexical and ast weights were applied.";
+
+/// Decide whether (and which) inert-`--weights` notice should fire for the chosen
+/// path. Returns `Some(notice)` when the user supplied `--weights` *and* at least
+/// one supplied component is inert on the path selected by
+/// `(has_text, has_ast, has_blast)`; otherwise `None`.
+///
+/// This is the pure, side-effect-free decision seam (AD-377-2): callers turn a
+/// `Some` into a guarded `eprintln!`. Keeping the policy here (not inline at the
+/// `eprintln!`) lets unit tests in both `query_tests.rs` and `ast_tests.rs`
+/// assert the matrix directly without capturing process stderr.
+///
+/// # Inert-layer matrix (AD-377-2)
+///
+/// | Path                                          | Honored layers         | verdict                                       |
+/// |-----------------------------------------------|------------------------|-----------------------------------------------|
+/// | text + `--ast` (± blast)                      | lexical, ast           | temporal-inert notice iff `temporal != 0.0`   |
+/// | text + `--blast-radius` (no `--ast`)          | lexical, ast, temporal | never inert (all 3 active) → `None`           |
+/// | pure-lexical / standalone-AST / temporal-only | none                   | fully-inert notice (any weights)              |
+///
+/// The temporal component is genuinely unused by `intersect_and_rank` (it fuses
+/// only `weights.lexical` + `weights.ast`), so on every compound `--ast` path a
+/// non-zero `temporal` is a no-op — hence the `temporal != 0.0` predicate rather
+/// than a blanket notice (AC3/AC4a fire; AC5's `0,0,0` and AC4's `*,*,0.0` stay
+/// quiet because no temporal contribution was requested).
+#[must_use]
+pub(super) fn weights_inert_notice(
+    weights: Option<rskim_search::CompositeWeights6>,
+    has_text: bool,
+    has_ast: bool,
+    has_blast: bool,
+) -> Option<&'static str> {
+    // No flag supplied → nothing to warn about (AC2 back-compat: `None` is silent).
+    let weights = weights?;
+
+    if has_text && has_ast {
+        // Compound text+--ast path (with or without --blast-radius): lexical+ast
+        // are honored by intersect_and_rank; temporal is inert.  Only warn when
+        // the user actually asked for a temporal contribution (temporal != 0.0),
+        // and scope the notice to the temporal component (blocking-review fix #2).
+        return (weights.temporal != 0.0).then_some(WEIGHTS_TEMPORAL_INERT_NOTICE);
+    }
+
+    if has_text && has_blast {
+        // Blast-radius composite path (no --ast): all three layers are honored by
+        // run_blast_radius_composite_query → nothing is inert.
+        return None;
+    }
+
+    // Everything else — pure-lexical, standalone --ast, temporal-only,
+    // blast-radius-only — runs no weighted RRF, so the whole flag is inert.
+    Some(WEIGHTS_FULLY_INERT_NOTICE)
+}
+
+// ============================================================================
 // Query execution
 // ============================================================================
 
@@ -129,6 +214,24 @@ pub(super) fn execute_query_with_manifest(
             duration_ms: start.elapsed().as_millis() as u64,
             index_stats: None,
         });
+    }
+
+    // AD-377-2 / PF-006: warn (once, on stderr) when `--weights` was supplied to a
+    // path that ignores some or all of it.  This entry point handles the
+    // pure-lexical, text+--ast, and text+--blast-radius dispatch below; the two
+    // standalone arms in mod.rs (standalone --ast, temporal-only/blast-only) emit
+    // the *same* fully-inert notice via the same helper.  Always stderr — never
+    // touches stdout — so JSON output stays byte-identical and parseable (AC9).
+    // Guarded eprintln! off the hot path (AC12).  `has_text` is true here (the
+    // empty-query short-circuit above already returned), so only the text+--ast
+    // and text+--blast shapes can suppress/scope the notice.
+    if let Some(notice) = weights_inert_notice(
+        config.composite_weights,
+        /* has_text */ true,
+        config.ast_scored.is_some(),
+        config.blast_radius_paths.is_some(),
+    ) {
+        eprintln!("{notice}");
     }
 
     let cache_dir = &config.cache_dir;
@@ -436,12 +539,30 @@ fn run_compound_query(
     // are placeholders deferred to #290.  As a result every entry's depth_key
     // is 0.0 and the AST decorate-sort reduces to pure ast_score-DESC order.
     // The shipped Wave 4a ranking is lexical-rank + AST-score-rank RRF only.
+    //
+    // AD-377-1 / PF-006: honor caller-supplied `--weights` on the compound
+    // text+--ast path, identical to the blast path (run_blast_radius_composite_query).
+    // Before #377 this hardcoded `CompositeWeights::default()`, silently ignoring
+    // `--weights` here while accepting it without error — exactly the silent-inert
+    // bug #377 fixes.  Only `lexical` + `ast` are consumed by intersect_and_rank;
+    // a supplied non-zero `temporal` is still inert (the user is told via the
+    // temporal-scoped notice in execute_query_with_manifest, AD-377-2).
+    //
+    // AD-377-4: `--weights 0,0,0` is a deliberate "no ranking signal" request on
+    // this path — intersect_and_rank then scores every intersected file 0.0 and the
+    // FileId-ASC tiebreaker orders them, so the compound path returns the FULL
+    // intersection at score 0.0 (AC5).  This DIVERGES intentionally from the blast
+    // path, where all-zero weights collapse the RRF UNION to an empty result; the
+    // divergence is documented at both sites and merge_layer_scores is left unchanged.
+    let composite_weights = config
+        .composite_weights
+        .unwrap_or_else(CompositeWeights::with_six_signal_defaults);
     let ranked = intersect_and_rank(
         &raw_lex,
         ast_scored_vec,
         |_: FileId| -> Option<StructuralMetrics> { None }, // structural seam — placeholder until #290
         0.0_f32,                                           // avg_max_depth — placeholder until #290
-        CompositeWeights::default(),
+        composite_weights,
     );
 
     // Recompose: carry lexical SearchResult (snippet + line_range), replace score.
