@@ -5,7 +5,7 @@
 //! All I/O lives here (this module). Business logic is split across:
 //! - `types` — shared configuration and result types
 //! - `walk` — project-root discovery and file traversal
-//! - `manifest` — JSONL sidecar for incremental build caching
+//! - `manifest` — binary (v4) sidecar for incremental build caching
 //! - `index` — full pipeline orchestration (invoked via `--build`/`--rebuild`)
 //! - `query` — query execution and result formatting
 //! - `snippet` — source context extraction
@@ -136,6 +136,21 @@ pub(crate) fn run(
         // Ordered BEFORE the temporal-only arm so `--ast --hot` lands here (the AST
         // filter is honoured), never silently in run_temporal_standalone (R1/GAP-6).
         SearchAction::Query(_) if let Some(ref raw) = flags.ast => {
+            // AD-377-2 / PF-006: standalone --ast (empty text) runs no weighted RRF,
+            // so any supplied --weights is wholly inert.  Emit the SAME fully-inert
+            // notice as the execute_query_with_manifest paths via the single shared
+            // helper/const (PF-008) so AC8 asserts an identical substring.  `has_text`
+            // is false on this arm (a non-empty query routes to run_query above),
+            // `has_ast` true.  stderr only — stdout (incl. --json) stays byte-identical
+            // (AC9).
+            if let Some(notice) = query::weights_inert_notice(
+                flags.weights,
+                /* has_text */ false,
+                /* has_ast */ true,
+                flags.blast_radius.is_some(),
+            ) {
+                eprintln!("{notice}");
+            }
             let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
             std::fs::create_dir_all(&cache_dir)?;
             // ADR-006: refresh BOTH indexes before opening either engine.
@@ -189,6 +204,24 @@ pub(crate) fn run(
         }
         // Empty query with temporal flags (no --ast) → standalone temporal dispatch.
         SearchAction::Query(_) if flags.temporal_sort.is_some() || flags.blast_radius.is_some() => {
+            // AD-377-2 / PF-006 (blocking-review fix #1): the temporal-only and
+            // blast-radius-only standalone paths (e.g. `--hot --weights x,y,z`,
+            // `--blast-radius FILE --weights x,y,z` with NO text and NO --ast) run
+            // no weighted RRF — `run_temporal_standalone` ranks purely by hotspot /
+            // bug-fix / co-change score and never consumes `--weights`.  Without
+            // this guard the flag was silently ignored on exactly the path this
+            // ticket exists to fix.  `has_text` and `has_ast` are both false on this
+            // arm (a non-empty query routes to run_query, --ast to the arm above), so
+            // weights_inert_notice returns the SAME fully-inert notice (PF-008).
+            // stderr only — JSON stdout stays byte-identical (AC9).
+            if let Some(notice) = query::weights_inert_notice(
+                flags.weights,
+                /* has_text */ false,
+                /* has_ast */ false,
+                flags.blast_radius.is_some(),
+            ) {
+                eprintln!("{notice}");
+            }
             run_temporal_standalone(
                 flags.limit,
                 flags.json,
@@ -249,10 +282,17 @@ struct Flags {
     /// `--ast try-catch` and equals form `--ast=try-catch` are both accepted.
     /// Whitespace-only values are rejected in `parse_flags`.
     ast: Option<String>,
-    /// Composite RRF weights for the blast-radius UNION ranking path (#200).
+    /// Composite RRF weights for the weighted-ranking query paths (#200, #377).
     ///
     /// Parsed from `--weights lexical,ast,temporal` and validated at flag-parse
     /// time.  `None` → use `CompositeWeights6::with_six_signal_defaults()` (0.5, 0.3, 0.2).
+    ///
+    /// AD-377-1/AD-377-3: honored on BOTH composite paths — the `--blast-radius`
+    /// UNION ranking (all 3 weights) AND the text+`--ast` intersection ranking
+    /// (lexical + ast only; the temporal weight is inert whenever `--ast` is
+    /// present because the AST intersection fuses only lexical+ast).  On every
+    /// other path (pure-lexical, standalone `--ast`, temporal-only, blast-only)
+    /// the flag is inert and a one-line stderr notice fires (AD-377-2, PF-006).
     weights: Option<rskim_search::CompositeWeights6>,
 }
 
@@ -585,18 +625,44 @@ fn run_update(
 fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode> {
     let (root, cache_dir) = resolve_root_and_cache(root_override)?;
 
+    // AD-381-1: surface the resolved search cache directory so the (otherwise
+    // hidden) on-disk location is discoverable from `--stats` alone. Computed
+    // once here and reused by both the no-index early-return and the populated
+    // branch below, in both text and JSON modes.
+    let cache_dir_display = cache_dir.display().to_string();
+
     let index_path = cache_dir.join("index.skidx");
     if !index_path.exists() {
         if json {
-            println!("{{\"error\": \"no index found\"}}");
+            // AC7: single parseable object retaining `error`, plus `cache_dir`
+            // (the "where would it go?" path). Exit FAILURE is unchanged.
+            let no_index = serde_json::json!({
+                "error": "no index found",
+                "cache_dir": cache_dir_display,
+            });
+            println!("{}", serde_json::to_string(&no_index)?);
         } else {
+            // AC5: print the resolved cache-dir path even with no index, in
+            // addition to the existing guidance. Exit FAILURE is unchanged.
             eprintln!("skim search: no index found — run `skim search --build` first");
+            eprintln!("  cache dir     : {cache_dir_display}");
         }
         return Ok(ExitCode::FAILURE);
     }
 
     let reader = rskim_search::NgramIndexReader::open(&cache_dir)?;
     let stats = reader.stats();
+
+    // AD-380-4 (#380): the lexical-only `index_size_bytes` (skidx+skpost from the
+    // reader) historically undercounted the TRUE on-disk footprint by ~23 MB —
+    // it omitted the manifest, AST index/cache, and temporal DB. Compute the real
+    // total here by summing metadata().len() over the fixed set of index
+    // artifacts (AC-6). `index_size_bytes` is intentionally left unchanged so the
+    // lexical-only figure remains available (AC-7).
+    let total_on_disk = total_on_disk_bytes(&cache_dir);
+    // AD-380-5: temporal.db scales with git history, not source size, so report it
+    // as its own line/key — it is included in the total but distinguished here.
+    let temporal_db_bytes = artifact_len(&cache_dir, "temporal.db");
 
     // check_staleness returns the loaded manifest as part of its work.
     // Reuse it here instead of loading the manifest a second time.
@@ -607,20 +673,30 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
 
     let mut out = BufWriter::new(std::io::stdout());
     if json {
+        // AC6: additive `cache_dir` key; all pre-existing keys retained unchanged.
+        // AD-380-4/5: additive `total_on_disk_bytes` (true footprint) and
+        // `temporal_db_bytes` keys; `index_size_bytes` (lexical-only) unchanged.
         let extended = serde_json::json!({
             "file_count": stats.file_count,
             "total_ngrams": stats.total_ngrams,
             "index_size_bytes": stats.index_size_bytes,
+            "total_on_disk_bytes": total_on_disk,
+            "temporal_db_bytes": temporal_db_bytes,
             "last_updated": stats.last_updated,
             "git_head": git_head,
             "staleness": staleness_status.to_string(),
+            "cache_dir": cache_dir_display,
         });
         writeln!(out, "{}", serde_json::to_string_pretty(&extended)?)?;
     } else {
         writeln!(out, "skim search index stats:")?;
         writeln!(out, "  files indexed : {}", stats.file_count)?;
         writeln!(out, "  total n-grams : {}", stats.total_ngrams)?;
-        writeln!(out, "  index size    : {} bytes", stats.index_size_bytes)?;
+        writeln!(out, "  index size    : {} bytes (lexical)", stats.index_size_bytes)?;
+        // AD-380-4: the TRUE total over all on-disk artifacts.
+        writeln!(out, "  total on disk : {total_on_disk} bytes")?;
+        // AD-380-5: temporal DB reported separately (scales with git history).
+        writeln!(out, "  temporal db   : {temporal_db_bytes} bytes")?;
         if let Some(ts) = stats.last_updated {
             writeln!(out, "  last updated  : {ts}")?;
         }
@@ -630,9 +706,50 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
             git_head.as_deref().unwrap_or("(none)")
         )?;
         writeln!(out, "  staleness     : {staleness_status}")?;
+        // AC4: resolved cache dir, in addition to the lines above.
+        writeln!(out, "  cache dir     : {cache_dir_display}")?;
     }
     out.flush()?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The fixed set of on-disk index artifacts summed by [`total_on_disk_bytes`].
+///
+/// AD-380-4 (#380 / AC-6, AC-7): a FIXED, known filename list — `--stats` MUST
+/// NOT recursively walk the cache directory. Each artifact is stat'd via
+/// `metadata().len()` and a missing one counts as 0 bytes (fail-soft, AC-7).
+/// Adding a new index artifact means extending this list (one source of truth).
+const ON_DISK_ARTIFACTS: [&str; 7] = [
+    "index.skidx",        // lexical n-gram index
+    "index.skpost",       // lexical posting lists
+    "index.skfiles",      // binary file manifest (this ticket)
+    "ast_index.skidx",    // AST n-gram index header + metadata
+    "ast_index.skpost",   // AST posting lists
+    "ast_index.skcache",  // AST extraction cache
+    "temporal.db",        // hotspot / risk / co-change SQLite DB
+];
+
+/// Return the byte length of one artifact in `cache_dir`, or 0 when it is absent
+/// or unreadable (fail-soft, AC-7).
+fn artifact_len(cache_dir: &std::path::Path, name: &str) -> u64 {
+    std::fs::metadata(cache_dir.join(name))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// Sum the on-disk byte size of every present index artifact in `cache_dir`.
+///
+/// AD-380-4 (#380): reports the TRUE on-disk footprint of the search index. The
+/// previous `--stats` "index size" line reported only the lexical skidx+skpost
+/// pair, undercounting the real footprint. This iterates a FIXED filename list
+/// via `metadata()` (O(1), no directory walk, AC-7) and treats a missing
+/// artifact as 0 bytes so partial indexes (e.g. a lexical-only build before AST
+/// or temporal ran) report exactly the sum of the files that exist (AC-7).
+fn total_on_disk_bytes(cache_dir: &std::path::Path) -> u64 {
+    ON_DISK_ARTIFACTS
+        .iter()
+        .map(|name| artifact_len(cache_dir, name))
+        .sum()
 }
 
 // ============================================================================
@@ -910,12 +1027,14 @@ fn run_temporal_standalone(
 // Help text
 // ============================================================================
 
-fn print_help() {
-    // AD-375-3: the `index` subcommand line was removed with #375 (avoids PF-008).
-    // `skim search index` now runs a QUERY for the word "index"; builds go through
-    // --build / --rebuild / --update (already documented in Options below).
-    println!(
-        "\
+/// Full `skim search` help text.
+///
+/// Extracted to a `const` (from the old inline `println!` literal) so AC10 can
+/// assert its contents as a falsifiable unit test (PF-008 doc-drift guard): the
+/// test verifies the `--weights` section names *both* composite paths and the
+/// temporal-inert-on-`--ast` rule, and that the obsolete "Only active on the
+/// `--blast-radius` composite ranking path" wording is gone.
+pub(super) const SEARCH_HELP_TEXT: &str = "\
 Usage: skim search [OPTIONS] [QUERY]
 
 Search code using layered n-gram BM25F indexing.
@@ -972,18 +1091,28 @@ Temporal flag composition:
   --hot and --cold/--risky are mutually exclusive (pick one sort mode).
   --blast-radius is composable with any sort mode and with text queries.
 
-Composite ranking options (#200):
-  --weights L,A,T      Tune the --blast-radius composite RRF ranking.
-                       Exactly 3 comma-separated ratio values: lexical, ast, temporal.
+Composite ranking options (#200, #377):
+  --weights L,A,T      Tune composite RRF ranking. Exactly 3 comma-separated ratio
+                       values: lexical, ast, temporal.
                        Default: 0.5,0.3,0.2
                        Values are ratios only — NOT normalized; zero and non-sum-to-1
                        are allowed. Negative, NaN, and inf are rejected.
-                       Only active on the --blast-radius composite ranking path;
-                       the 3 extended signals (import_graph, dir_proximity,
+                       Active on TWO composite paths:
+                         - --blast-radius (no --ast): all three weights apply
+                           (lexical + ast + temporal).
+                         - text + --ast (the intersection path): lexical and ast
+                           apply. The temporal weight is INERT whenever --ast is
+                           present, since the AST intersection fuses only the
+                           lexical and ast signals.
+                       On any other query (pure-lexical, standalone --ast,
+                       --hot/--cold/--risky-only, --blast-radius-only) --weights is
+                       inert; supplying it there prints a one-line notice to stderr
+                       (#377).
+                       The 3 extended signals (import_graph, dir_proximity,
                        structural_coupling) are fixed at 0.0 until measured.
 
   Example: --weights 0.8,0.1,0.1  (lexical-heavy)
-           --weights 0.2,0.2,0.6  (temporal-heavy)
+           --weights 0.2,0.2,0.6  (temporal-heavy; needs --blast-radius, no --ast)
 
 General examples:
   skim search \"authenticate\"                Search for 'authenticate'
@@ -998,8 +1127,14 @@ General examples:
   skim search --risky                       Top risky files (standalone)
   skim search --blast-radius src/auth.rs    Co-change partners of auth.rs
   skim search \"auth\" --hot                  Text results sorted by hotspot
-  skim search \"auth\" --blast-radius src/auth.rs  Text within co-change partners"
-    );
+  skim search \"auth\" --blast-radius src/auth.rs  Text within co-change partners";
+
+fn print_help() {
+    // AD-375-3: the `index` subcommand line was removed with #375 (avoids PF-008).
+    // `skim search index` now runs a QUERY for the word "index"; builds go through
+    // --build / --rebuild / --update (already documented in Options above).
+    // Body lives in SEARCH_HELP_TEXT so AC10 can assert it without driving the CLI.
+    println!("{SEARCH_HELP_TEXT}");
 }
 
 // ============================================================================
@@ -1030,6 +1165,74 @@ mod tests {
             p.push("skim");
             p.to_string_lossy().to_string()
         })
+    }
+
+    // ========================================================================
+    // --stats total-on-disk size (#380, AC-6 / AC-7)
+    // ========================================================================
+
+    /// AC-7 (#380): with ONLY the three lexical files present, the reported total
+    /// equals EXACTLY their summed sizes (falsifiable) — missing artifacts count
+    /// as 0, no error.
+    #[test]
+    fn test_total_on_disk_lexical_only_sums_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+
+        std::fs::write(cache_dir.join("index.skidx"), vec![0u8; 100]).unwrap();
+        std::fs::write(cache_dir.join("index.skpost"), vec![0u8; 250]).unwrap();
+        std::fs::write(cache_dir.join("index.skfiles"), vec![0u8; 30]).unwrap();
+        // No AST/temporal artifacts present.
+
+        let total = total_on_disk_bytes(cache_dir);
+        assert_eq!(
+            total, 380,
+            "total must equal the sum of the three present files (100+250+30), missing=0 (AC-7)"
+        );
+    }
+
+    /// AC-6 (#380): when AST and temporal artifacts also exist, the total includes
+    /// them — it MUST NOT report lexical-only.
+    #[test]
+    fn test_total_on_disk_includes_all_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+
+        let sizes = [
+            ("index.skidx", 10u64),
+            ("index.skpost", 20),
+            ("index.skfiles", 5),
+            ("ast_index.skidx", 7),
+            ("ast_index.skpost", 11),
+            ("ast_index.skcache", 13),
+            ("temporal.db", 100),
+        ];
+        for (name, n) in &sizes {
+            std::fs::write(cache_dir.join(name), vec![0u8; *n as usize]).unwrap();
+        }
+        let expected: u64 = sizes.iter().map(|(_, n)| n).sum();
+        let lexical_only: u64 = 10 + 20 + 5;
+
+        let total = total_on_disk_bytes(cache_dir);
+        assert_eq!(total, expected, "total must sum all 7 artifacts (AC-6)");
+        assert!(
+            total > lexical_only,
+            "total ({total}) must exceed lexical-only ({lexical_only}) when AST+temporal exist (AC-6 negative)"
+        );
+    }
+
+    /// AC-7 (#380): an empty cache dir (no artifacts) reports 0, never an error.
+    #[test]
+    fn test_total_on_disk_empty_dir_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(total_on_disk_bytes(dir.path()), 0, "no artifacts → 0 bytes (AC-7)");
+    }
+
+    /// AC-7 (#380): `artifact_len` fail-soft — a missing file is 0 bytes.
+    #[test]
+    fn test_artifact_len_missing_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(artifact_len(dir.path(), "temporal.db"), 0);
     }
 
     #[test]
@@ -2232,6 +2435,188 @@ mod tests {
             !stderr.contains(NO_TEMPORAL_DATA_MSG),
             "--hot must NOT emit the 'no temporal data' message when --rebuild already \
              populated temporal.db (BUG A BLOCKER); got stderr={stderr:?}"
+        );
+    }
+
+    // ========================================================================
+    // #377 — inert-`--weights` notice at the CLI surface
+    // ========================================================================
+
+    /// AC6 (#377, API contract, NEGATIVE): invalid `--weights` MUST error at
+    /// parse time on EVERY query shape — pure-lexical, text+--ast, and standalone
+    /// --ast. Validation happens in `parse_flags` BEFORE any path dispatch, so the
+    /// inert-weights path can never mask a validation error. A valid 3-tuple parses.
+    #[test]
+    fn test_parse_flags_invalid_weights_errors_on_every_path_ac6() {
+        let s = |x: &str| x.to_string();
+        // Path-shaping suffixes: pure-lexical (text only), text+--ast, standalone --ast.
+        let shapes: [Vec<String>; 3] = [
+            vec![s("token")],
+            vec![s("token"), s("--ast"), s("try-catch")],
+            vec![s("--ast"), s("try-catch")],
+        ];
+        // Each invalid weights string must be rejected regardless of path shape.
+        for bad in ["nan,0,0", "-1,0,0", "inf,0,0", "0.5,0.3"] {
+            for shape in &shapes {
+                let mut args = vec![s("--weights"), s(bad)];
+                args.extend(shape.iter().cloned());
+                assert!(
+                    parse_flags(&args).is_err(),
+                    "AC6: invalid --weights {bad:?} must error at parse time for args {args:?}"
+                );
+            }
+        }
+        // Control: a valid 3-tuple parses on each shape.
+        for shape in &shapes {
+            let mut args = vec![s("--weights"), s("0.8,0.1,0.1")];
+            args.extend(shape.iter().cloned());
+            let flags = parse_flags(&args).unwrap_or_else(|e| {
+                panic!("AC6 control: valid --weights must parse for args {args:?}: {e}")
+            });
+            assert!(
+                flags.weights.is_some(),
+                "AC6 control: valid --weights must populate flags.weights for args {args:?}"
+            );
+        }
+    }
+
+    /// Blocking-review fix #1 (CLI): the temporal-standalone dispatch arm
+    /// (`--hot`/`--cold`/`--risky`/`--blast-radius` with NO text and NO --ast) must
+    /// emit the fully-inert `--weights` notice on stderr — it previously called
+    /// `run_temporal_standalone` and silently ignored the flag, the exact bug this
+    /// ticket fixes. Driven as a subprocess so real stderr is captured.
+    ///
+    /// Discriminating (PF-007): the test FAILS if the dispatch-arm guard is removed
+    /// (no notice on stderr). Both `--hot --weights` and `--blast-radius --weights`
+    /// are covered.
+    #[test]
+    fn test_temporal_standalone_weights_emits_inert_notice_ac7_fix1() {
+        let bin = skim_bin_path();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let root_str = root.to_string_lossy().to_string();
+
+        // A git repo with commits so temporal data exists (the arm runs, not an error path).
+        create_real_git_repo(
+            root,
+            &[
+                ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
+                ("feat: add parser", &[("src/parser.rs", "fn parse() {}")]),
+                (
+                    "fix: fix auth",
+                    &[("src/auth.rs", "fn authenticate() { // fixed }")],
+                ),
+            ],
+        );
+
+        // (1) --hot --weights (temporal-only standalone): notice on stderr, exit 0.
+        let hot = std::process::Command::new(&bin)
+            .args(["search", "--hot", "--weights", "0.5,0.3,0.2", "--root", &root_str])
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"));
+        assert!(
+            hot.status.success(),
+            "--hot --weights must exit 0; stderr={}",
+            String::from_utf8_lossy(&hot.stderr)
+        );
+        let hot_stderr = String::from_utf8_lossy(&hot.stderr);
+        assert!(
+            hot_stderr.contains("note: --weights"),
+            "fix #1: `--hot --weights` MUST emit the inert-weights notice on stderr (the temporal \
+             standalone arm previously ignored --weights silently); got stderr={hot_stderr:?}"
+        );
+
+        // (2) --blast-radius --weights (blast-only standalone): same notice on stderr.
+        let blast = std::process::Command::new(&bin)
+            .args([
+                "search", "--blast-radius", "src/auth.rs", "--weights", "0.5,0.3,0.2", "--root",
+                &root_str,
+            ])
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"));
+        assert!(
+            blast.status.success(),
+            "--blast-radius --weights must exit 0; stderr={}",
+            String::from_utf8_lossy(&blast.stderr)
+        );
+        let blast_stderr = String::from_utf8_lossy(&blast.stderr);
+        assert!(
+            blast_stderr.contains("note: --weights"),
+            "fix #1: `--blast-radius --weights` (no text/--ast) MUST emit the inert-weights notice \
+             on stderr; got stderr={blast_stderr:?}"
+        );
+    }
+
+    /// AC9 (API contract / JSON purity, NEGATIVE): the inert-weights notice MUST go
+    /// to stderr even in --json mode; stdout MUST be valid JSON byte-identical to
+    /// the no-weights run. Driven via standalone `--ast --json --weights` (wholly
+    /// inert) so the fully-inert notice fires while stdout stays pure JSON.
+    #[test]
+    fn test_inert_weights_notice_json_purity_ac9() {
+        let bin = skim_bin_path();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let root_str = root.to_string_lossy().to_string();
+
+        // One file with a nested loop so `--ast rust-nested-loop` matches.
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join("src/loops.rs"),
+            "fn f() { for i in 0..3 { for j in 0..3 { let _ = (i, j); } } }",
+        )
+        .unwrap();
+
+        let run_json = |extra: &[&str]| {
+            let mut args = vec!["search", "--ast", "rust-nested-loop", "--json"];
+            args.extend_from_slice(extra);
+            args.extend_from_slice(&["--root", &root_str]);
+            std::process::Command::new(&bin)
+                .args(&args)
+                .env("SKIM_DISABLE_ANALYTICS", "1")
+                .output()
+                .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"))
+        };
+
+        let base = run_json(&[]);
+        assert!(
+            base.status.success(),
+            "baseline --ast --json must exit 0; stderr={}",
+            String::from_utf8_lossy(&base.stderr)
+        );
+        let base_stdout = String::from_utf8_lossy(&base.stdout).to_string();
+        serde_json::from_str::<serde_json::Value>(base_stdout.trim()).unwrap_or_else(|e| {
+            panic!("AC9: baseline stdout must be valid JSON: {e}\n{base_stdout}")
+        });
+
+        let weighted = run_json(&["--weights", "0.8,0.1,0.1"]);
+        assert!(
+            weighted.status.success(),
+            "--ast --json --weights must exit 0; stderr={}",
+            String::from_utf8_lossy(&weighted.stderr)
+        );
+        let weighted_stdout = String::from_utf8_lossy(&weighted.stdout).to_string();
+        let weighted_stderr = String::from_utf8_lossy(&weighted.stderr);
+
+        // (1) stdout must STILL be valid JSON.
+        serde_json::from_str::<serde_json::Value>(weighted_stdout.trim()).unwrap_or_else(|e| {
+            panic!("AC9: --weights stdout must remain valid JSON: {e}\n{weighted_stdout}")
+        });
+        // (2) stdout must be byte-identical to the no-weights run.
+        assert_eq!(
+            weighted_stdout, base_stdout,
+            "AC9: --weights must NOT change stdout — the inert notice goes to stderr only"
+        );
+        // (3) the notice MUST appear on stderr but NOT in stdout JSON.
+        assert!(
+            weighted_stderr.contains("note: --weights"),
+            "AC9: the inert-weights notice must appear on stderr; got stderr={weighted_stderr:?}"
+        );
+        assert!(
+            !weighted_stdout.contains("note: --weights"),
+            "AC9: the inert-weights notice must NOT leak into stdout JSON"
         );
     }
 }

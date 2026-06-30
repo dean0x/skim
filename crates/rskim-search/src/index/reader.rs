@@ -171,22 +171,47 @@ impl NgramIndexReader {
             )));
         }
 
-        // Verify CRC32 checksum over postings + entries + file metadata (#364).
+        // Verify CRC32 checksum over postings + entries + file metadata (#364),
+        // unless a validity marker proves byte-identity to a prior verified open
+        // (#376, AD-376-1).  The full-blob CRC32 is a fixed per-open cost that
+        // scales with `.skpost` size; the marker moves it off the per-query hot
+        // path while preserving the ADR-006 desync guard on any marker miss.
         //
         // Ordering matches builder.rs: postings first, then entries+meta.
         // This catches bit-flips in the .skpost blob that would otherwise
         // yield wrong-but-bounded (doc_id, position) values and silently
         // mis-rank results (Design Constraint: "fail loud", ADR-006).
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&post_mmap);
-        hasher.update(&idx_mmap[SKIDX_HEADER_SIZE..expected_idx_size]);
-        let actual_checksum = hasher.finalize();
-        if actual_checksum != header.checksum {
-            return Err(SearchError::IndexCorrupted(format!(
-                "checksum mismatch: expected {:#010x}, got {:#010x}. \
-                 The index may be corrupt; rebuild with `skim search index --rebuild`.",
-                header.checksum, actual_checksum
-            )));
+        let marker_path = dir.join("index.skverify");
+        let current_sig =
+            crate::validity::current_signature(&idx_path, &post_path, header.checksum);
+
+        // Fast path (AC1): an on-disk marker whose (len, mtime, header.checksum)
+        // signature equals the freshly-stat'd files licenses skipping the full
+        // CRC32.  TRUST BOUNDARY (AD-376-2, accepted): a byte-flip that preserves
+        // len AND mtime AND header.checksum is served unverified; the full CRC
+        // remains the corruption guard on any marker miss.
+        let marker_hit = match (&current_sig, crate::validity::read_marker(&marker_path)) {
+            (Some(cur), Some(disk)) => disk == *cur,
+            _ => false,
+        };
+
+        if !marker_hit {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&post_mmap);
+            hasher.update(&idx_mmap[SKIDX_HEADER_SIZE..expected_idx_size]);
+            let actual_checksum = hasher.finalize();
+            if actual_checksum != header.checksum {
+                return Err(SearchError::IndexCorrupted(format!(
+                    "checksum mismatch: expected {:#010x}, got {:#010x}. \
+                     The index may be corrupt; rebuild with `skim search index --rebuild`.",
+                    header.checksum, actual_checksum
+                )));
+            }
+            // Full verify succeeded: stamp a fresh marker so the next open skips
+            // the CRC32 (AC6: a failed write must not fail open()).
+            if let Some(sig) = current_sig {
+                crate::validity::write_marker_best_effort(dir, &marker_path, &sig);
+            }
         }
 
         Ok(Self {

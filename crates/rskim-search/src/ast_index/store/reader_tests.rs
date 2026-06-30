@@ -1129,3 +1129,229 @@ fn ac2_decode_helpers_agree_on_known_buffer() {
     assert_eq!(lang_id, 11, "expected Rust lang_id=11");
     assert_eq!(node_count, 42, "expected node_count=42");
 }
+
+// ===========================================================================
+// #376 — validity-marker caching for the AST reader (AD-376-5, AC11)
+// ===========================================================================
+//
+// The dual lexical+AST index is one coherent unit (ADR-006), so the AST reader
+// carries the SAME marker fast path as the lexical reader. These are the AC1 /
+// AC2 / AC5 / AC6 / AC8 analogues for `AstIndexReader::open`. NOTE: the AST CRC
+// covers the `.skidx` PAYLOAD (bytes [HEADER_SIZE..]); the marker also stats
+// `.skpost`. So payload corruption is induced on `ast_index.skidx` at byte
+// HEADER_SIZE (the first payload byte — never the checksum field at [44..48]).
+
+/// Build a one-file AST index (one bigram) directly into `dir`.
+fn build_marker_ast_index(dir: &std::path::Path) {
+    let bigram_key: u32 = 0x0001_0002;
+    let mut builder = AstIndexBuilder::new(dir.to_path_buf()).unwrap();
+    let set = make_bigram_set(bigram_key, 4);
+    builder
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &set,
+            42,
+            StructuralMetrics::default(),
+        )
+        .unwrap();
+    builder.build().unwrap();
+}
+
+/// AC8 (AST): build() stamps ast_index.skverify, and a following open succeeds.
+#[test]
+fn ac8_ast_build_stamps_validity_marker() {
+    let dir = tempdir().unwrap();
+    build_marker_ast_index(dir.path());
+    assert!(
+        dir.path().join("ast_index.skverify").exists(),
+        "AC8/AST: build() must stamp ast_index.skverify"
+    );
+    assert!(
+        AstIndexReader::open(dir.path()).is_ok(),
+        "AC8/AST: open() of freshly-built uncorrupted AST index must succeed"
+    );
+}
+
+/// AC1 (AST): a payload byte of ast_index.skidx flipped WITHOUT changing length,
+/// WITH mtime held, and WITHOUT touching the checksum field MUST still open Ok —
+/// the full CRC32 is provably skipped (the AST latency-floor regression sentinel).
+#[test]
+fn ac1_ast_fast_path_skips_crc_on_held_mtime_byteflip() {
+    let dir = tempdir().unwrap();
+    build_marker_ast_index(dir.path());
+
+    let idx_path = dir.path().join("ast_index.skidx");
+    let original_mtime =
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&idx_path).unwrap());
+
+    let mut idx = std::fs::read(&idx_path).unwrap();
+    assert!(
+        idx.len() > HEADER_SIZE,
+        "AST skidx must have payload bytes for this test"
+    );
+    let len_before = idx.len();
+    // Flip the first payload byte; leave the checksum field [44..48] untouched.
+    idx[HEADER_SIZE] ^= 0xFF;
+    std::fs::write(&idx_path, &idx).unwrap();
+    assert_eq!(
+        std::fs::metadata(&idx_path).unwrap().len() as usize,
+        len_before,
+        "precondition: byte-flip must not change skidx length"
+    );
+    filetime::set_file_mtime(&idx_path, original_mtime).unwrap();
+
+    assert!(
+        AstIndexReader::open(dir.path()).is_ok(),
+        "AC1/AST: held-mtime payload byte-flip must be served via the fast path \
+         (full CRC32 skipped) — the optimization was deleted"
+    );
+}
+
+/// AC2 (AST): corrupt the payload AND bump skidx mtime → marker miss → full
+/// CRC32 catches it with 'checksum mismatch'.
+#[test]
+fn ac2_ast_marker_miss_on_mtime_bump_reverifies() {
+    let dir = tempdir().unwrap();
+    build_marker_ast_index(dir.path());
+
+    let idx_path = dir.path().join("ast_index.skidx");
+    let mut idx = std::fs::read(&idx_path).unwrap();
+    idx[HEADER_SIZE] ^= 0xFF;
+    std::fs::write(&idx_path, &idx).unwrap();
+    let bumped = filetime::FileTime::from_unix_time(32_500_000_000, 0);
+    filetime::set_file_mtime(&idx_path, bumped).unwrap();
+
+    let err = AstIndexReader::open(dir.path())
+        .err()
+        .expect("AC2/AST: mtime-bumped corruption must fail open()");
+    assert!(
+        format!("{err}").contains("checksum mismatch"),
+        "AC2/AST: marker-miss must re-verify and report 'checksum mismatch': {err}"
+    );
+}
+
+/// AC2 (AST, marker-absent): deleting ast_index.skverify forces a full CRC32.
+#[test]
+fn ac2_ast_marker_absent_reverifies() {
+    let dir = tempdir().unwrap();
+    build_marker_ast_index(dir.path());
+    std::fs::remove_file(dir.path().join("ast_index.skverify")).unwrap();
+
+    let idx_path = dir.path().join("ast_index.skidx");
+    let mut idx = std::fs::read(&idx_path).unwrap();
+    idx[HEADER_SIZE] ^= 0xFF;
+    std::fs::write(&idx_path, &idx).unwrap();
+
+    let err = AstIndexReader::open(dir.path())
+        .err()
+        .expect("AC2/AST: corruption with absent marker must fail open()");
+    assert!(
+        format!("{err}").contains("checksum mismatch"),
+        "AC2/AST: marker-absent must fall through to full CRC32: {err}"
+    );
+}
+
+/// AC6 (AST): a truncated / garbage / zero-length marker over an uncorrupted
+/// index MUST still open Ok (fall through to full CRC32).
+#[test]
+fn ac6_ast_bad_marker_falls_through_to_full_crc() {
+    for bad in [&b""[..], &b"x"[..], &b"truncated-not-52-bytes"[..]] {
+        let dir = tempdir().unwrap();
+        build_marker_ast_index(dir.path());
+        std::fs::write(dir.path().join("ast_index.skverify"), bad).unwrap();
+        assert!(
+            AstIndexReader::open(dir.path()).is_ok(),
+            "AC6/AST: bad marker ({} bytes) must fall through and open Ok",
+            bad.len()
+        );
+    }
+}
+
+/// AC5 (AST): rebuild with DIFFERENT content (a) opens reflecting new content,
+/// and (b) the stale marker must not serve corrupted post-rebuild bytes.
+#[test]
+fn ac5_ast_rebuild_invalidates_stale_marker() {
+    let dir = tempdir().unwrap();
+    build_marker_ast_index(dir.path());
+    let first_len = std::fs::metadata(dir.path().join("ast_index.skidx"))
+        .unwrap()
+        .len();
+
+    // Rebuild with DIFFERENT content: add a trigram so the skidx layout grows.
+    {
+        let bigram_key: u32 = 0x0001_0002;
+        let trigram_key: u64 = 0x0001_0002_0003;
+        let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+        let mut set = make_bigram_set(bigram_key, 7);
+        set.trigrams.push(AstTrigramEntry {
+            ngram: AstTrigram(trigram_key),
+            weight: DEFAULT_AST_WEIGHT,
+            count: 3,
+        });
+        builder
+            .add_file_ngrams(
+                FileId(0),
+                Language::Rust,
+                &set,
+                90,
+                StructuralMetrics::default(),
+            )
+            .unwrap();
+        builder.build().unwrap();
+    }
+    let second_len = std::fs::metadata(dir.path().join("ast_index.skidx"))
+        .unwrap()
+        .len();
+    assert_ne!(
+        first_len, second_len,
+        "precondition: rebuild must change skidx size"
+    );
+
+    // (a) New content opens Ok.
+    assert!(
+        AstIndexReader::open(dir.path()).is_ok(),
+        "AC5(a)/AST: rebuilt index must open Ok reflecting new content"
+    );
+
+    // (b) Corrupt post-rebuild skidx payload + bump mtime → caught by full CRC.
+    let idx_path = dir.path().join("ast_index.skidx");
+    let mut idx = std::fs::read(&idx_path).unwrap();
+    idx[HEADER_SIZE] ^= 0xFF;
+    std::fs::write(&idx_path, &idx).unwrap();
+    let bumped = filetime::FileTime::from_unix_time(32_500_000_000, 0);
+    filetime::set_file_mtime(&idx_path, bumped).unwrap();
+
+    let err = AstIndexReader::open(dir.path())
+        .err()
+        .expect("AC5(b)/AST: post-rebuild corruption must fail open()");
+    assert!(
+        format!("{err}").contains("checksum mismatch"),
+        "AC5(b)/AST: stale marker must not serve corrupted post-rebuild bytes: {err}"
+    );
+}
+
+/// AC3 (AST): lookup results identical between a cold open (marker absent → full
+/// CRC) and the marker-fast open the cold open re-stamps.
+#[test]
+fn ac3_ast_lookup_identical_cold_vs_fast() {
+    let dir = tempdir().unwrap();
+    build_marker_ast_index(dir.path());
+    let bigram_key: u32 = 0x0001_0002;
+
+    std::fs::remove_file(dir.path().join("ast_index.skverify")).unwrap();
+    let reader_cold = AstIndexReader::open(dir.path()).unwrap();
+    let cold = reader_cold.lookup_bigram(AstBigram(bigram_key)).unwrap();
+
+    assert!(
+        dir.path().join("ast_index.skverify").exists(),
+        "AST cold open must re-stamp the marker"
+    );
+    let reader_fast = AstIndexReader::open(dir.path()).unwrap();
+    let fast = reader_fast.lookup_bigram(AstBigram(bigram_key)).unwrap();
+
+    assert_eq!(
+        cold, fast,
+        "AC3/AST: bigram lookups must be identical between cold and fast opens"
+    );
+}

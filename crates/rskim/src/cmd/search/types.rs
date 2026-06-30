@@ -123,13 +123,22 @@ pub(super) struct QueryConfig {
     /// `None` means "no AST filter" — pure-lexical path (all existing callers
     /// compile unchanged because they initialize this field explicitly).
     pub ast_scored: Option<Vec<(rskim_search::FileId, f64)>>,
-    /// Optional composite weights for the UNION blast-radius re-ranking path (#200).
+    /// Optional composite weights for the weighted-ranking query paths (#200, #377).
     ///
-    /// When `Some`, the blast-radius path uses N-signal weighted RRF (UNION mode)
-    /// instead of the legacy filter-then-rank approach.  The lexical and temporal
-    /// signals are weighted according to these values.
+    /// When `Some`, the weighted RRF paths use these ratios instead of the default
+    /// six-signal profile.  AD-377-1/AD-377-3 — applied on BOTH composite paths:
+    /// - `--blast-radius` UNION re-ranking (`run_blast_radius_composite_query`):
+    ///   lexical + ast + temporal all weighted.
+    /// - text+`--ast` intersection (`run_compound_query`): lexical + ast weighted;
+    ///   the temporal weight is INERT here because `intersect_and_rank` fuses only
+    ///   the lexical and ast rank terms.  Supplying a non-zero temporal weight on a
+    ///   `--ast` path triggers the temporal-scoped inert-weights stderr notice
+    ///   (AD-377-2).
     ///
-    /// `None` → use `CompositeWeights6::default()` when composite ranking is active.
+    /// `None` → use `CompositeWeights6::with_six_signal_defaults()` when composite
+    /// ranking is active.  AD-377-4: on the compound path `Some(0,0,0)` is a valid
+    /// "no ranking signal" request that returns the full intersection at score 0.0
+    /// (FileId-ASC), diverging intentionally from the blast path's empty result.
     pub composite_weights: Option<rskim_search::CompositeWeights6>,
 }
 
@@ -299,6 +308,12 @@ pub(super) struct WalkEntry {
     ///
     /// `None` when the platform does not expose mtime or the syscall fails.
     pub mtime: Option<u64>,
+    /// File size in bytes captured from the walker's metadata.
+    ///
+    /// `None` when the platform does not expose size or the syscall fails.
+    /// Recorded in the manifest (AD-379-2) so working-tree staleness can compare
+    /// both mtime AND size against the current on-disk file.
+    pub size: Option<u64>,
 }
 
 /// A fully processed file ready for indexing, produced by the streaming producer.
@@ -317,6 +332,8 @@ pub(super) struct ProcessedFile {
     pub sha256: String,
     /// File modification time forwarded from [`WalkEntry`].
     pub mtime: Option<u64>,
+    /// File size in bytes forwarded from [`WalkEntry`] (AD-379-2).
+    pub size: Option<u64>,
     /// Pre-computed or cache-reused field map.
     pub field_map: Vec<(Range<usize>, SearchField)>,
     /// `true` when field_map was reused from the manifest cache (no classify call).

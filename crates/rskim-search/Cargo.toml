@@ -34,6 +34,11 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# DEV-ONLY (AD-376-2): the validity-marker AC1 tests must hold a file's mtime
+# identical across two opens after flipping a content byte. `filetime` is the
+# standard tool for setting mtime in tests; production code uses std only
+# (`Metadata::modified`).
+filetime = { workspace = true }
 
 [[bench]]
 name = "linearize_bench"

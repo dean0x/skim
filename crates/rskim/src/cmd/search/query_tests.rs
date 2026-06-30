@@ -2059,3 +2059,201 @@ fn test_ac15a_short_query_fallback_5000_files_sla() {
         unbounded — profile short_query_fallback or the verify step."
     );
 }
+
+// ============================================================================
+// #377 — inert-`--weights` notice decision matrix + help-text + wording
+// ============================================================================
+//
+// These tests cover the pure decision seam `weights_inert_notice` (the single
+// source of truth shared by execute_query_with_manifest and the two standalone
+// dispatch arms in mod.rs) and the wording correctness fix from the blocking
+// review. All assertions are falsifiable (PF-007): each fails if the #377
+// behavior is reverted.
+
+/// Helper: build VALID weights from an "l,a,t" string (panics on parse error,
+/// which is a test-author bug, not production input).
+fn weights(s: &str) -> rskim_search::CompositeWeights6 {
+    rskim_search::CompositeWeights6::parse_weights_flag(s).unwrap()
+}
+
+/// AC2 (NEGATIVE): no `--weights` supplied (`None`) is silent on every path shape.
+#[test]
+fn ac2_weights_inert_notice_none_is_silent_on_all_paths() {
+    use super::weights_inert_notice as notice;
+    // (has_text, has_ast, has_blast) — exhaustive 2^3 shapes, all with None.
+    for &(t, a, b) in &[
+        (true, true, true),
+        (true, true, false),
+        (true, false, true),
+        (true, false, false),
+        (false, true, true),
+        (false, true, false),
+        (false, false, true),
+        (false, false, false),
+    ] {
+        assert!(
+            notice(None, t, a, b).is_none(),
+            "AC2: None weights must never emit a notice (t={t}, a={a}, b={b})"
+        );
+    }
+}
+
+/// AC7 (POSITIVE): VALID `--weights` on the pure-lexical path is wholly inert →
+/// the FULLY-inert notice fires.
+#[test]
+fn ac7_weights_inert_notice_pure_lexical_fires_fully_inert() {
+    use super::weights_inert_notice as notice;
+    let n = notice(Some(weights("0.8,0.1,0.1")), true, false, false);
+    assert_eq!(
+        n,
+        Some(super::WEIGHTS_FULLY_INERT_NOTICE),
+        "AC7: --weights on pure-lexical (text, no --ast, no --blast) must emit the fully-inert notice"
+    );
+}
+
+/// AC8 (POSITIVE): VALID `--weights` on the standalone --ast path (no text) is
+/// wholly inert → the SAME fully-inert notice fires (single shared constant, PF-008).
+#[test]
+fn ac8_weights_inert_notice_standalone_ast_fires_same_constant() {
+    use super::weights_inert_notice as notice;
+    let lexical = notice(Some(weights("0.8,0.1,0.1")), true, false, false);
+    let standalone_ast = notice(Some(weights("0.8,0.1,0.1")), false, true, false);
+    assert_eq!(
+        standalone_ast,
+        Some(super::WEIGHTS_FULLY_INERT_NOTICE),
+        "AC8: --weights on standalone --ast (no text) must emit the fully-inert notice"
+    );
+    assert_eq!(
+        standalone_ast, lexical,
+        "AC8: standalone --ast and pure-lexical must emit the IDENTICAL notice constant (PF-008)"
+    );
+}
+
+/// Blocking-review fix #1 coverage: the temporal-only and blast-only standalone
+/// shapes (no text, no --ast) are wholly inert and emit the SAME fully-inert
+/// notice as pure-lexical / standalone-AST. This is the decision-seam half of the
+/// mod.rs dispatch-arm fix (the CLI half is asserted in mod.rs subprocess tests).
+#[test]
+fn weights_inert_notice_temporal_and_blast_only_fire_fully_inert() {
+    use super::weights_inert_notice as notice;
+    // temporal-only: --hot/--cold/--risky with no text, no --ast, no --blast.
+    assert_eq!(
+        notice(Some(weights("0.5,0.3,0.2")), false, false, false),
+        Some(super::WEIGHTS_FULLY_INERT_NOTICE),
+        "temporal-only standalone (--hot --weights) must emit the fully-inert notice (#377 fix #1)"
+    );
+    // blast-radius-only: --blast-radius FILE with no text and no --ast.
+    assert_eq!(
+        notice(Some(weights("0.5,0.3,0.2")), false, false, true),
+        Some(super::WEIGHTS_FULLY_INERT_NOTICE),
+        "blast-only standalone (--blast-radius --weights, no text/--ast) must emit the \
+         fully-inert notice (#377 fix #1)"
+    );
+}
+
+/// AC3 / AC4a (POSITIVE): on a compound text+--ast path the temporal weight is
+/// inert, so a NON-ZERO temporal weight fires the TEMPORAL-scoped notice — but a
+/// zero temporal weight does not (no temporal contribution was requested).
+#[test]
+fn ac3_ac4a_weights_inert_notice_compound_temporal_predicate() {
+    use super::weights_inert_notice as notice;
+    // temporal != 0.0 → temporal-scoped notice (AC3 uses 0.5,0.3,9.9; AC4a uses 0,0,0.9).
+    assert_eq!(
+        notice(Some(weights("0.5,0.3,9.9")), true, true, false),
+        Some(super::WEIGHTS_TEMPORAL_INERT_NOTICE),
+        "AC3: non-zero temporal on text+--ast must emit the temporal-inert notice"
+    );
+    assert_eq!(
+        notice(Some(weights("0.0,0.0,0.9")), true, true, false),
+        Some(super::WEIGHTS_TEMPORAL_INERT_NOTICE),
+        "AC4a: 0,0,0.9 on text+--ast must emit the temporal-inert notice"
+    );
+    // temporal == 0.0 → silent (AC1/AC4 weightings carry temporal 0.0).
+    assert!(
+        notice(Some(weights("0.9,0.1,0.0")), true, true, false).is_none(),
+        "AC1/AC4: zero temporal on text+--ast requests no temporal signal → no notice"
+    );
+    assert!(
+        notice(Some(weights("0.1,0.9,0.0")), true, true, false).is_none(),
+        "AC1/AC4: zero temporal on text+--ast requests no temporal signal → no notice"
+    );
+    // Same rule with --blast-radius ALSO present (text+--ast+--blast triple).
+    assert_eq!(
+        notice(Some(weights("0.0,0.0,0.9")), true, true, true),
+        Some(super::WEIGHTS_TEMPORAL_INERT_NOTICE),
+        "AC4a: 0,0,0.9 on text+--ast+--blast must still emit the temporal-inert notice"
+    );
+}
+
+/// AC4a counterpart (POSITIVE): the blast-radius composite path (text, no --ast)
+/// honors ALL THREE weights → never inert, never a notice.
+#[test]
+fn weights_inert_notice_blast_without_ast_is_silent() {
+    use super::weights_inert_notice as notice;
+    for s in ["0.9,0.1,0.0", "0.1,0.9,0.0", "0.0,0.0,0.9", "0.5,0.3,0.2"] {
+        assert!(
+            notice(Some(weights(s)), true, false, true).is_none(),
+            "blast-radius composite (text, no --ast) honors all 3 weights → no notice (weights={s})"
+        );
+    }
+}
+
+/// Blocking-review fix #2 (wording correctness): the two notices MUST be distinct,
+/// and the compound (temporal-scoped) notice MUST NOT claim the whole flag "had no
+/// effect on this query" — that wording is factually wrong on the text+--ast path
+/// where lexical+ast weights DID tune ranking. The fully-inert notice (pure-lexical
+/// etc.) MAY say so because there it is true.
+#[test]
+fn weights_notices_are_distinct_and_compound_wording_is_accurate() {
+    assert_ne!(
+        super::WEIGHTS_FULLY_INERT_NOTICE,
+        super::WEIGHTS_TEMPORAL_INERT_NOTICE,
+        "the fully-inert and temporal-inert notices must be distinct strings (review fix #2)"
+    );
+    // The compound notice must scope the inert claim to the temporal component.
+    assert!(
+        super::WEIGHTS_TEMPORAL_INERT_NOTICE.contains("temporal"),
+        "the compound notice must name the temporal component as the inert one"
+    );
+    // It must NOT use the unconditional 'had no effect on this query' wording.
+    assert!(
+        !super::WEIGHTS_TEMPORAL_INERT_NOTICE.contains("had no effect on this query"),
+        "the compound notice must NOT claim the whole --weights flag had no effect (review fix #2): \
+         lexical+ast weights DID tune ranking on the text+--ast path"
+    );
+    // It must affirm that lexical+ast WERE applied (the accurate part).
+    assert!(
+        super::WEIGHTS_TEMPORAL_INERT_NOTICE.contains("lexical")
+            && super::WEIGHTS_TEMPORAL_INERT_NOTICE.contains("ast"),
+        "the compound notice must state lexical+ast weights were applied"
+    );
+}
+
+// ---- AC10: help text reflects BOTH composite paths + temporal-inert rule ----
+
+/// AC10 (Documentation, NEGATIVE): `print_help` body (SEARCH_HELP_TEXT) must NOT
+/// claim weights are blast-radius-only, MUST reference the text+--ast path, and
+/// MUST state the temporal weight is inert whenever --ast is present (PF-008).
+#[test]
+fn ac10_help_text_reflects_both_composite_paths_and_temporal_inert() {
+    let help = crate::cmd::search::SEARCH_HELP_TEXT;
+
+    assert!(
+        !help.contains("Only active on the --blast-radius composite ranking path"),
+        "AC10: obsolete blast-radius-only wording must be gone from --weights help"
+    );
+    assert!(
+        help.contains("--blast-radius"),
+        "AC10: --weights help must still mention the --blast-radius composite path"
+    );
+    assert!(
+        help.contains("--ast"),
+        "AC10: --weights help must reference the text+--ast composite path"
+    );
+    // Temporal-inert-whenever-`--ast`-present, stated explicitly.
+    assert!(
+        help.contains("temporal weight is INERT whenever --ast"),
+        "AC10: --weights help must explicitly state the temporal weight is inert whenever --ast \
+         is present"
+    );
+}
