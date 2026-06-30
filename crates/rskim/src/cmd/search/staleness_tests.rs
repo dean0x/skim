@@ -553,6 +553,131 @@ fn test_check_staleness_lexical_v3_below_version_triggers_rebuild_returns_manife
 }
 
 // ============================================================================
+// check_staleness — manifest binary self-heal (#380, AD-380-2 / AC-4)
+// ============================================================================
+
+/// Write a v3 JSONL `index.skfiles` (the immediate-predecessor format #373
+/// produced) directly into `cache_dir`, bypassing the binary writer. Starts with
+/// `{`, never the SKFM magic, so `version_matches` reports a mismatch.
+fn write_v3_jsonl_manifest(
+    root: &std::path::Path,
+    cache_dir: &std::path::Path,
+    git_head: Option<&str>,
+) {
+    use std::io::Write as _;
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let path = cache_dir.join("index.skfiles");
+    let mut f = fs::File::create(&path).unwrap();
+    let header = serde_json::json!({
+        "version": 3,
+        "root": canonical.to_string_lossy(),
+        "git_head": git_head,
+    });
+    writeln!(f, "{header}").unwrap();
+    let entry = serde_json::json!({
+        "path": "src/lib.rs",
+        "sha256": "a".repeat(64),
+        "lang": "rust",
+        "field_map": [[0, 10, 0]],
+        "mtime": 1_700_000_000u64,
+        "size": 42u64,
+    });
+    writeln!(f, "{entry}").unwrap();
+}
+
+/// AC-4 (#380), GIT root: a v3 JSONL `index.skfiles` with otherwise-current
+/// lexical + AST stubs and a matching git HEAD MUST trigger a full rebuild
+/// (`NoStoredHead`) — the binary 3→4 bump is detected via `version_matches`
+/// even though the git HEAD is unchanged.
+///
+/// PF-007 discriminating: without the `manifest_stale` gate, a v3 JSONL manifest
+/// with a matching HEAD would (after the binary loader cold-starts it) reach the
+/// HEAD compare and could mis-report; the version gate forces `NoStoredHead`.
+#[test]
+fn test_check_staleness_manifest_v3_jsonl_triggers_rebuild_git_root() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().to_path_buf();
+    let sha = "ccdd3344ccdd3344ccdd3344ccdd3344ccdd3344";
+    create_fake_git_repo(dir.path(), &format!("{sha}\n"));
+
+    // Current lexical + AST stubs so ONLY the manifest version is stale.
+    write_lexical_index_stub(&cache_dir);
+    write_ast_index_stub(&cache_dir);
+    // v3 JSONL manifest (no SKFM magic).
+    write_v3_jsonl_manifest(dir.path(), &cache_dir, Some(sha));
+
+    // version_matches must report the v3 JSONL manifest as below-current.
+    assert!(
+        !crate::cmd::search::manifest::FileManifest::version_matches(&cache_dir).unwrap(),
+        "v3 JSONL manifest must NOT be accepted as current (AC-4 negative)"
+    );
+
+    let (result, _manifest) = check_staleness(&cache_dir, dir.path());
+    assert!(
+        matches!(result, StalenessCheck::NoStoredHead),
+        "v3 JSONL manifest must trigger NoStoredHead rebuild on a git root; got {result:?}"
+    );
+}
+
+/// AC-4 (#380), NON-GIT root: the manifest version self-heal MUST fire
+/// independent of git HEAD state — a v3 JSONL manifest under a non-git root
+/// (no `.git`) still triggers a rebuild. `check_staleness` must detect the
+/// below-current FORMAT_VERSION before reaching any HEAD comparison.
+#[test]
+fn test_check_staleness_manifest_v3_jsonl_triggers_rebuild_non_git_root() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().to_path_buf();
+    // Deliberately NO .git — non-git root.
+
+    write_lexical_index_stub(&cache_dir);
+    write_ast_index_stub(&cache_dir);
+    write_v3_jsonl_manifest(dir.path(), &cache_dir, None);
+
+    assert!(
+        !crate::cmd::search::manifest::FileManifest::version_matches(&cache_dir).unwrap(),
+        "v3 JSONL manifest must NOT be accepted as current on a non-git root (AC-4)"
+    );
+
+    let (result, _manifest) = check_staleness(&cache_dir, dir.path());
+    assert!(
+        matches!(result, StalenessCheck::NoStoredHead),
+        "v3 JSONL manifest must trigger NoStoredHead rebuild independent of git HEAD \
+         (non-git root); got {result:?}"
+    );
+}
+
+/// AC-4 (#380): a CURRENT binary (v4) manifest with current lexical + AST stubs
+/// and a matching HEAD must NOT be flagged stale by the manifest gate — the
+/// self-heal must be specific to below-current versions (no false rebuild loop).
+#[test]
+fn test_check_staleness_binary_v4_manifest_is_current() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().to_path_buf();
+    let sha = "11aa22bb11aa22bb11aa22bb11aa22bb11aa22bb";
+    create_fake_git_repo(dir.path(), &format!("{sha}\n"));
+
+    write_lexical_index_stub(&cache_dir);
+    write_ast_index_stub(&cache_dir);
+    // Current binary manifest via the real writer.
+    write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
+
+    assert!(
+        crate::cmd::search::manifest::FileManifest::version_matches(&cache_dir).unwrap(),
+        "current binary (v4) manifest must be accepted as current (AC-4)"
+    );
+
+    let (result, _manifest) = check_staleness(&cache_dir, dir.path());
+    // The manifest written by `write_manifest_with_head` is empty (no entries),
+    // and the project root has only `.git` (ignored), so the working-tree scan is
+    // clean → the verdict is `Current`. Crucially it is NOT `NoStoredHead`: the
+    // manifest-version gate must not false-trigger on a current v4 manifest.
+    assert!(
+        !matches!(result, StalenessCheck::NoStoredHead),
+        "current v4 manifest must not trigger the version self-heal; got {result:?}"
+    );
+}
+
+// ============================================================================
 // auto_refresh_if_stale
 // ============================================================================
 

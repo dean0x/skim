@@ -5,7 +5,7 @@
 //! All I/O lives here (this module). Business logic is split across:
 //! - `types` — shared configuration and result types
 //! - `walk` — project-root discovery and file traversal
-//! - `manifest` — JSONL sidecar for incremental build caching
+//! - `manifest` — binary (v4) sidecar for incremental build caching
 //! - `index` — full pipeline orchestration (invoked via `--build`/`--rebuild`)
 //! - `query` — query execution and result formatting
 //! - `snippet` — source context extraction
@@ -613,6 +613,17 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
     let reader = rskim_search::NgramIndexReader::open(&cache_dir)?;
     let stats = reader.stats();
 
+    // AD-380-4 (#380): the lexical-only `index_size_bytes` (skidx+skpost from the
+    // reader) historically undercounted the TRUE on-disk footprint by ~23 MB —
+    // it omitted the manifest, AST index/cache, and temporal DB. Compute the real
+    // total here by summing metadata().len() over the fixed set of index
+    // artifacts (AC-6). `index_size_bytes` is intentionally left unchanged so the
+    // lexical-only figure remains available (AC-7).
+    let total_on_disk = total_on_disk_bytes(&cache_dir);
+    // AD-380-5: temporal.db scales with git history, not source size, so report it
+    // as its own line/key — it is included in the total but distinguished here.
+    let temporal_db_bytes = artifact_len(&cache_dir, "temporal.db");
+
     // check_staleness returns the loaded manifest as part of its work.
     // Reuse it here instead of loading the manifest a second time.
     let (staleness_status, loaded_manifest) = staleness::check_staleness(&cache_dir, &root);
@@ -623,10 +634,14 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
     let mut out = BufWriter::new(std::io::stdout());
     if json {
         // AC6: additive `cache_dir` key; all pre-existing keys retained unchanged.
+        // AD-380-4/5: additive `total_on_disk_bytes` (true footprint) and
+        // `temporal_db_bytes` keys; `index_size_bytes` (lexical-only) unchanged.
         let extended = serde_json::json!({
             "file_count": stats.file_count,
             "total_ngrams": stats.total_ngrams,
             "index_size_bytes": stats.index_size_bytes,
+            "total_on_disk_bytes": total_on_disk,
+            "temporal_db_bytes": temporal_db_bytes,
             "last_updated": stats.last_updated,
             "git_head": git_head,
             "staleness": staleness_status.to_string(),
@@ -637,7 +652,11 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         writeln!(out, "skim search index stats:")?;
         writeln!(out, "  files indexed : {}", stats.file_count)?;
         writeln!(out, "  total n-grams : {}", stats.total_ngrams)?;
-        writeln!(out, "  index size    : {} bytes", stats.index_size_bytes)?;
+        writeln!(out, "  index size    : {} bytes (lexical)", stats.index_size_bytes)?;
+        // AD-380-4: the TRUE total over all on-disk artifacts.
+        writeln!(out, "  total on disk : {total_on_disk} bytes")?;
+        // AD-380-5: temporal DB reported separately (scales with git history).
+        writeln!(out, "  temporal db   : {temporal_db_bytes} bytes")?;
         if let Some(ts) = stats.last_updated {
             writeln!(out, "  last updated  : {ts}")?;
         }
@@ -652,6 +671,45 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
     }
     out.flush()?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The fixed set of on-disk index artifacts summed by [`total_on_disk_bytes`].
+///
+/// AD-380-4 (#380 / AC-6, AC-7): a FIXED, known filename list — `--stats` MUST
+/// NOT recursively walk the cache directory. Each artifact is stat'd via
+/// `metadata().len()` and a missing one counts as 0 bytes (fail-soft, AC-7).
+/// Adding a new index artifact means extending this list (one source of truth).
+const ON_DISK_ARTIFACTS: [&str; 7] = [
+    "index.skidx",        // lexical n-gram index
+    "index.skpost",       // lexical posting lists
+    "index.skfiles",      // binary file manifest (this ticket)
+    "ast_index.skidx",    // AST n-gram index header + metadata
+    "ast_index.skpost",   // AST posting lists
+    "ast_index.skcache",  // AST extraction cache
+    "temporal.db",        // hotspot / risk / co-change SQLite DB
+];
+
+/// Return the byte length of one artifact in `cache_dir`, or 0 when it is absent
+/// or unreadable (fail-soft, AC-7).
+fn artifact_len(cache_dir: &std::path::Path, name: &str) -> u64 {
+    std::fs::metadata(cache_dir.join(name))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// Sum the on-disk byte size of every present index artifact in `cache_dir`.
+///
+/// AD-380-4 (#380): reports the TRUE on-disk footprint of the search index. The
+/// previous `--stats` "index size" line reported only the lexical skidx+skpost
+/// pair, undercounting the real footprint. This iterates a FIXED filename list
+/// via `metadata()` (O(1), no directory walk, AC-7) and treats a missing
+/// artifact as 0 bytes so partial indexes (e.g. a lexical-only build before AST
+/// or temporal ran) report exactly the sum of the files that exist (AC-7).
+fn total_on_disk_bytes(cache_dir: &std::path::Path) -> u64 {
+    ON_DISK_ARTIFACTS
+        .iter()
+        .map(|name| artifact_len(cache_dir, name))
+        .sum()
 }
 
 // ============================================================================
@@ -1049,6 +1107,74 @@ mod tests {
             p.push("skim");
             p.to_string_lossy().to_string()
         })
+    }
+
+    // ========================================================================
+    // --stats total-on-disk size (#380, AC-6 / AC-7)
+    // ========================================================================
+
+    /// AC-7 (#380): with ONLY the three lexical files present, the reported total
+    /// equals EXACTLY their summed sizes (falsifiable) — missing artifacts count
+    /// as 0, no error.
+    #[test]
+    fn test_total_on_disk_lexical_only_sums_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+
+        std::fs::write(cache_dir.join("index.skidx"), vec![0u8; 100]).unwrap();
+        std::fs::write(cache_dir.join("index.skpost"), vec![0u8; 250]).unwrap();
+        std::fs::write(cache_dir.join("index.skfiles"), vec![0u8; 30]).unwrap();
+        // No AST/temporal artifacts present.
+
+        let total = total_on_disk_bytes(cache_dir);
+        assert_eq!(
+            total, 380,
+            "total must equal the sum of the three present files (100+250+30), missing=0 (AC-7)"
+        );
+    }
+
+    /// AC-6 (#380): when AST and temporal artifacts also exist, the total includes
+    /// them — it MUST NOT report lexical-only.
+    #[test]
+    fn test_total_on_disk_includes_all_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+
+        let sizes = [
+            ("index.skidx", 10u64),
+            ("index.skpost", 20),
+            ("index.skfiles", 5),
+            ("ast_index.skidx", 7),
+            ("ast_index.skpost", 11),
+            ("ast_index.skcache", 13),
+            ("temporal.db", 100),
+        ];
+        for (name, n) in &sizes {
+            std::fs::write(cache_dir.join(name), vec![0u8; *n as usize]).unwrap();
+        }
+        let expected: u64 = sizes.iter().map(|(_, n)| n).sum();
+        let lexical_only: u64 = 10 + 20 + 5;
+
+        let total = total_on_disk_bytes(cache_dir);
+        assert_eq!(total, expected, "total must sum all 7 artifacts (AC-6)");
+        assert!(
+            total > lexical_only,
+            "total ({total}) must exceed lexical-only ({lexical_only}) when AST+temporal exist (AC-6 negative)"
+        );
+    }
+
+    /// AC-7 (#380): an empty cache dir (no artifacts) reports 0, never an error.
+    #[test]
+    fn test_total_on_disk_empty_dir_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(total_on_disk_bytes(dir.path()), 0, "no artifacts → 0 bytes (AC-7)");
+    }
+
+    /// AC-7 (#380): `artifact_len` fail-soft — a missing file is 0 bytes.
+    #[test]
+    fn test_artifact_len_missing_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(artifact_len(dir.path(), "temporal.db"), 0);
     }
 
     #[test]
