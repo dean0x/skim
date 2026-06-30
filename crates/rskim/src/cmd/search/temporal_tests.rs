@@ -615,6 +615,84 @@ fn enrichment_risky_sorts_by_density_desc() {
     );
 }
 
+/// AC8 (#378, combined-query propagation on the REAL Wilson compute path):
+/// `<text> --risky` re-sort MUST propagate the volume-weighted small-sample-
+/// below-large ordering through `apply_temporal_enrichment` → `annotate_risks`
+/// → `risk_for_file`.
+///
+/// Unlike `enrichment_risky_sorts_by_density_desc` (which hard-codes
+/// risk_score=0.9/0.1 and so cannot detect a dropped-Wilson regression), this
+/// stores risk_scores COMPUTED by `rskim_search::risk_score_wilson_decay` over
+/// raw (fix_commits, total_commits) and asserts the ACTUAL Wilson ordering: a
+/// tiny 1-fix/1-commit file (bare ratio 1.0) sorts BELOW a 50-fix/50-commit
+/// file. If volume-weighting were reverted to the bare ratio, both would score
+/// 1.0, the saturated tiny-sample file would tie/precede the large one, and this
+/// assertion would break.
+#[test]
+fn enrichment_risky_real_wilson_small_sample_below_large() {
+    let (_db_dir, db) = temp_db();
+
+    // Equal decay-weighted fix proportion (both all-fix → 1.0): the ONLY thing
+    // that separates them is the Wilson volume term over the raw counts.
+    let decay = 1.0;
+    let tiny_score = rskim_search::risk_score_wilson_decay(decay, 1, 1);
+    let large_score = rskim_search::risk_score_wilson_decay(decay, 50, 50);
+
+    // Guard the premise so a future helper change cannot silently make this test
+    // vacuous: the persisted scores MUST actually differ in the right direction.
+    assert!(
+        tiny_score < large_score,
+        "premise: Wilson(1,1) score ({tiny_score:.4}) must be < Wilson(50,50) \
+         score ({large_score:.4}) — bare ratio would make both 1.0"
+    );
+
+    db.store_risks(&[
+        RiskRow {
+            file_path: "tiny_saturated.rs".to_string(),
+            risk_score: tiny_score, // computed, not hard-coded
+            total_commits: 1,
+            fix_commits: 1,
+            fix_density: 1.0, // raw ratio shown in Fix%
+        },
+        RiskRow {
+            file_path: "high_volume.rs".to_string(),
+            risk_score: large_score, // computed, not hard-coded
+            total_commits: 50,
+            fix_commits: 50,
+            fix_density: 1.0,
+        },
+    ])
+    .unwrap();
+
+    // `<text> --risky` combined path: text results re-sorted by risk enrichment.
+    // Give the tiny file the HIGHER lexical score so that, if risk ordering were
+    // broken, insertion/lexical order would wrongly keep it first.
+    let mut results = vec![
+        make_result("tiny_saturated.rs", 99.0),
+        make_result("high_volume.rs", 1.0),
+    ];
+
+    apply_temporal_enrichment(&mut results, TemporalSort::Risky, &db).unwrap();
+
+    // The high-volume file MUST sort first despite its lower lexical score,
+    // because the REAL Wilson-computed risk_score read back via risk_for_file is
+    // higher (50/50 ≈ 0.93 > 1/1 ≈ 0.21).
+    assert_eq!(
+        results[0].path, "high_volume.rs",
+        "AC8: real Wilson risk_score must rank 50/50 above the saturated 1/1 file"
+    );
+    assert_eq!(results[1].path, "tiny_saturated.rs");
+
+    // The annotation MUST carry the persisted (computed) Wilson score, proving
+    // the value propagated unchanged through annotate_risks / risk_for_file.
+    let top_risk = results[0].temporal.as_ref().unwrap().risk_score.unwrap();
+    assert!(
+        (top_risk - large_score).abs() < 1e-9,
+        "annotated risk_score ({top_risk:.6}) must equal the persisted Wilson value \
+         ({large_score:.6})"
+    );
+}
+
 #[test]
 fn enrichment_missing_files_sort_last() {
     let (_db_dir, db) = temp_db();

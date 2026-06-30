@@ -673,6 +673,87 @@ fn top_risks_empty_returns_empty() {
 }
 
 // ============================================================================
+// #378 AC10 / AD-378-4: top_risks deterministic tie-break
+// ============================================================================
+
+/// AC10: rows with EQUAL risk_score are ordered by total_commits DESC.
+///
+/// Falsifiable: the higher-total_commits row MUST sort first even though both
+/// share an identical risk_score.
+#[test]
+fn top_risks_tie_break_by_total_commits_desc() {
+    let (_dir, db) = temp_db();
+    db.store_risks(&[
+        RiskRow {
+            file_path: "low_volume.rs".to_string(),
+            risk_score: 0.5,
+            total_commits: 3,
+            fix_commits: 1,
+            fix_density: 0.33,
+        },
+        RiskRow {
+            file_path: "high_volume.rs".to_string(),
+            risk_score: 0.5, // identical risk_score
+            total_commits: 40,
+            fix_commits: 12,
+            fix_density: 0.30,
+        },
+    ])
+    .unwrap();
+
+    let results = db.top_risks(10).unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0].file_path, "high_volume.rs",
+        "on equal risk_score, higher total_commits (40) must sort first (AC10)"
+    );
+    assert_eq!(results[1].file_path, "low_volume.rs");
+}
+
+/// AC10: rows with EQUAL risk_score AND total_commits are ordered by file_path
+/// ASC (lexicographic), and ordering is stable across repeated calls.
+#[test]
+fn top_risks_tie_break_by_path_asc_and_stable() {
+    let (_dir, db) = temp_db();
+    // Insert in non-sorted order to prove the ORDER BY (not insertion order) wins.
+    db.store_risks(&[
+        RiskRow {
+            file_path: "zebra.rs".to_string(),
+            risk_score: 0.21,
+            total_commits: 1,
+            fix_commits: 1,
+            fix_density: 1.0,
+        },
+        RiskRow {
+            file_path: "alpha.rs".to_string(),
+            risk_score: 0.21, // identical risk_score
+            total_commits: 1, // identical total_commits
+            fix_commits: 1,
+            fix_density: 1.0,
+        },
+        RiskRow {
+            file_path: "mango.rs".to_string(),
+            risk_score: 0.21,
+            total_commits: 1,
+            fix_commits: 1,
+            fix_density: 1.0,
+        },
+    ])
+    .unwrap();
+
+    let expected = ["alpha.rs", "mango.rs", "zebra.rs"];
+    // Stability: identical ordering across multiple calls.
+    for _ in 0..3 {
+        let results = db.top_risks(10).unwrap();
+        let paths: Vec<&str> = results.iter().map(|r| r.file_path.as_str()).collect();
+        assert_eq!(
+            paths, expected,
+            "equal (risk_score,total_commits) ties must order by file_path ASC, stably (AC10)"
+        );
+    }
+}
+
+// ============================================================================
 // Group 9: Regression — UNION ALL indexed cochange query (storage_ops:156)
 // ============================================================================
 
