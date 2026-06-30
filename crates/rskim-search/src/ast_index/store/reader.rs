@@ -192,13 +192,38 @@ impl AstIndexReader {
         // ── CRC32 validation ─────────────────────────────────────────────────
         // The checksum covers idx_mmap[HEADER_SIZE..expected_idx_size],
         // the contiguous post-header payload (bigrams + trigrams + file_meta).
-        let payload = &idx_mmap[HEADER_SIZE..expected_idx_size];
-        let actual_checksum = compute_checksum(payload);
-        if actual_checksum != header.checksum {
-            return Err(SearchError::IndexCorrupted(format!(
-                "checksum mismatch: expected {:#010x}, got {:#010x}",
-                header.checksum, actual_checksum
-            )));
+        //
+        // The dual lexical+AST index is one coherent unit (ADR-006), so this
+        // reader carries the SAME validity-marker fast path as the lexical
+        // reader (#376, AD-376-5): a marker proving byte-identity to a prior
+        // verified open moves the full CRC32 off the --ast per-query hot path.
+        // On any marker miss the full CRC32 still runs (corruption guard).
+        let marker_path = dir.join("ast_index.skverify");
+        let current_sig =
+            crate::validity::current_signature(&idx_path, &post_path, header.checksum);
+
+        // Fast path (AC1 analogue): marker (len, mtime, header.checksum) match
+        // licenses skipping the CRC32.  TRUST BOUNDARY (AD-376-2, accepted): a
+        // byte-flip preserving len+mtime+header.checksum is served unverified.
+        let marker_hit = match (&current_sig, crate::validity::read_marker(&marker_path)) {
+            (Some(cur), Some(disk)) => disk == *cur,
+            _ => false,
+        };
+
+        if !marker_hit {
+            let payload = &idx_mmap[HEADER_SIZE..expected_idx_size];
+            let actual_checksum = compute_checksum(payload);
+            if actual_checksum != header.checksum {
+                return Err(SearchError::IndexCorrupted(format!(
+                    "checksum mismatch: expected {:#010x}, got {:#010x}",
+                    header.checksum, actual_checksum
+                )));
+            }
+            // Full verify succeeded: stamp a fresh marker for the next open
+            // (AC6: a failed write must not fail open()).
+            if let Some(sig) = current_sig {
+                crate::validity::write_marker_best_effort(dir, &marker_path, &sig);
+            }
         }
 
         // ── Postings mmap ────────────────────────────────────────────────────

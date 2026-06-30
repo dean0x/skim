@@ -34,6 +34,7 @@ pub mod temporal;
 #[cfg(test)]
 pub(crate) mod test_corpus;
 mod types;
+pub(crate) mod validity;
 pub mod weights;
 
 pub use ast_index::{
