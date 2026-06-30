@@ -119,7 +119,7 @@ pub use temporal::storage::{
 };
 pub use temporal::{
     DEFAULT_HALF_LIFE_DAYS, GixSource, compute_file_risk_scores, compute_file_temporal_stats,
-    decay_weight, is_fix_commit,
+    decay_weight, is_fix_commit, risk_score_wilson_decay, wilson_lower_bound,
 };
 pub use types::{
     CochangeStats, CommitInfo, FieldClassifier, FileChangeInfo, FileId, FileRiskScores,

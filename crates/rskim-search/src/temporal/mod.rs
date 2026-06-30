@@ -17,6 +17,7 @@ pub mod storage;
 pub use git_parser::GixSource;
 pub use scoring::{
     DEFAULT_HALF_LIFE_DAYS, compute_file_risk_scores, compute_file_temporal_stats, decay_weight,
+    risk_score_wilson_decay, wilson_lower_bound,
 };
 
 use regex::Regex;
