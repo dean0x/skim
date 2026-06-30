@@ -6,7 +6,7 @@
 //! - `types` — shared configuration and result types
 //! - `walk` — project-root discovery and file traversal
 //! - `manifest` — JSONL sidecar for incremental build caching
-//! - `index` — full pipeline orchestration (`skim search index`)
+//! - `index` — full pipeline orchestration (invoked via `--build`/`--rebuild`)
 //! - `query` — query execution and result formatting
 //! - `snippet` — source context extraction
 //! - `staleness` — git HEAD comparison and auto-refresh
@@ -55,8 +55,7 @@ pub(super) const NO_TEMPORAL_DATA_MSG: &str =
 /// Run the `skim search` subcommand.
 ///
 /// Dispatches to:
-/// - `skim search index [OPTIONS]` — build or update the search index
-/// - `skim search --build` — build incrementally (alias for index)
+/// - `skim search --build` — build the index incrementally
 /// - `skim search --rebuild` — force full rebuild
 /// - `skim search --update` — auto-refresh if stale
 /// - `skim search --stats [--json]` — print index statistics
@@ -64,16 +63,27 @@ pub(super) const NO_TEMPORAL_DATA_MSG: &str =
 /// - `skim search --remove-hooks` — remove git hooks
 /// - `skim search [--json] [--limit N] <QUERY>` — search
 /// - No args / `--help` / `-h` — print help
+///
+/// # AD-375-1 — The `index` positional was removed (#375, avoids PF-006).
+///
+/// Prior to this change, a leading bareword `index` was intercepted and routed
+/// to the index builder, making `skim search "index"` unsearchable regardless of
+/// quoting (the shell strips quotes before argv dispatch). The word "index" appears
+/// 193+ times in this repo, so it is a valid and useful query term.
+///
+/// The positional intercept shadowed the query path with a confusing error
+/// (`unexpected argument '--limit' found`) whenever a user combined `skim search
+/// index` with any query flag — the textbook PF-006 shape: a dispatch arm that
+/// diverts an advertised/expected input to a different code path.
+///
+/// Builds now go exclusively through `--build` / `--rebuild` / `--update`, which
+/// were already the recommended surface. A cold `skim search index` auto-builds
+/// the index (via `auto_refresh_if_stale`) and then returns lexical results for
+/// the word "index".
 pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    // `skim search index [OPTIONS]` — legacy subcommand path.
-    if args.first().is_some_and(|a| a == "index") {
-        let rest = &args[1..];
-        return index::run(rest, analytics);
-    }
-
     // No args or --help/-h → print help
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
@@ -901,6 +911,9 @@ fn run_temporal_standalone(
 // ============================================================================
 
 fn print_help() {
+    // AD-375-3: the `index` subcommand line was removed with #375 (avoids PF-008).
+    // `skim search index` now runs a QUERY for the word "index"; builds go through
+    // --build / --rebuild / --update (already documented in Options below).
     println!(
         "\
 Usage: skim search [OPTIONS] [QUERY]
@@ -909,7 +922,6 @@ Search code using layered n-gram BM25F indexing.
 
 Subcommands / modes:
   (none)           Print this help message
-  index            Build or update the search index (legacy)
 
 Options:
   --build          Build the index incrementally (auto-build on first query)
@@ -1038,17 +1050,70 @@ mod tests {
         assert_eq!(result, ExitCode::SUCCESS);
     }
 
-    /// Regression: `skim search index --help` must dispatch to index help,
-    /// not the parent search help. The parent help check must not intercept
-    /// flags intended for a known subcommand.
+    /// AC6 (#375): `skim search index --help` now prints PARENT search help and
+    /// exits 0.  After removing the `index` positional intercept (AD-375-1, avoids
+    /// PF-006), the `--help` short-circuit at the top of `run()` fires before any
+    /// query dispatch, printing the parent help and returning SUCCESS.
+    ///
+    /// The deleted predecessor test (`test_index_help_dispatches_to_index_not_parent`)
+    /// asserted the opposite: that the positional intercept routes `index --help` to
+    /// `index::run` (which printed IndexCli help).  That premise is gone.
+    ///
+    /// Discriminating assertion (PF-007): `index --help` must exit SUCCESS AND the
+    /// parent-help marker "layered n-gram BM25F" must be present.  If the intercept
+    /// were restored, `index::run` would print IndexCli help (which does NOT contain
+    /// "layered n-gram BM25F") — the stdout assertion would fail.
     #[test]
-    fn test_index_help_dispatches_to_index_not_parent() {
-        let result = run(
-            &["index".to_string(), "--help".to_string()],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(result, ExitCode::SUCCESS);
+    fn test_index_help_token_prints_parent_help() {
+        // Capture stdout by redirecting inside the test.  The easiest approach is to
+        // drive the subprocess surface (via skim_bin_path) so stdout is truly captured.
+        // The in-process `run()` call prints to stdout directly, so we use the binary.
+        let output = std::process::Command::new(skim_bin_path())
+            .args(["search", "index", "--help"])
+            .output()
+            .expect("skim binary must be invocable in test");
+
+        assert!(
+            output.status.success(),
+            "`skim search index --help` must exit 0; got: {:?}",
+            output.status
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Parent-only marker: present in mod.rs print_help but absent from IndexCli
+        // clap help (IndexCli about = "Build or update the search index for the
+        // current project.", no BM25F or n-gram language).
+        assert!(
+            stdout.contains("layered n-gram BM25F"),
+            "`skim search index --help` must print PARENT search help (containing \
+             'layered n-gram BM25F'), not IndexCli help; got stdout:\n{stdout}"
+        );
+        // Confirm IndexCli's about string is NOT present (proves parent help, not
+        // index-builder help, was rendered).
+        assert!(
+            !stdout.contains("Build or update the search index for the current project."),
+            "`skim search index --help` must NOT print IndexCli help; got stdout:\n{stdout}"
+        );
+    }
+
+    /// AC8 (#375): bareword 'index' is parsed as a query term, not a build action.
+    ///
+    /// Verifies that after removing the positional intercept (AD-375-1), `index`
+    /// in argv is accumulated into `query_parts` and dispatched as
+    /// `SearchAction::Query("index")`.  This is the parse_flags-layer discriminator:
+    /// if the intercept were restored the intercept fires before parse_flags and
+    /// this arm is unreachable via run() — but here we call parse_flags directly to
+    /// assert the dispatch-mapping invariant.
+    #[test]
+    fn test_bareword_index_is_parsed_as_query() {
+        let flags = parse_flags(&["index".to_string()]).unwrap();
+        // Discriminating assertion (PF-007): must be a Query action, not Build.
+        // If parse_flags somehow mapped "index" to SearchAction::Build, this fails.
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("index".to_string()),
+            "bareword 'index' must be accumulated into a query, not routed to the builder"
+        );
     }
 
     // ============================================================================

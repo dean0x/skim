@@ -45,7 +45,7 @@ use super::walk::{
 // Public entry point
 // ============================================================================
 
-/// Run the `skim search index` subcommand.
+/// Run the index builder.
 ///
 /// Accepted flags:
 /// - `--root=<PATH>` or `--root <PATH>` — explicit project root (default: cwd)
@@ -53,11 +53,33 @@ use super::walk::{
 /// - `--max-files=<N>` — override the 50,000 file cap (must be ≥ 1)
 /// - `-h` / `--help` — print help text and exit
 ///
+/// # AD-375-2 — `index::run` / `IndexCli` are retained, not deleted (applies ADR-001).
+///
+/// As of #375, `skim search index` as a positional subcommand was removed —
+/// `index` is now treated as a query term, not a build trigger.  This function
+/// is therefore no longer reachable from the `search::run` dispatcher.  It is
+/// intentionally kept because:
+///
+/// 1. **`index_tests.rs` calls it directly** (`use super::run`) — deleting this
+///    function or `IndexCli` would fail to compile the 37 builder tests.
+/// 2. **`run_build`** (in `mod.rs`) delegates to `build_index()` (defined below),
+///    which is the same build pipeline — `index::run` is the test seam for that
+///    pipeline.
+///
+/// Do NOT delete this function or `IndexCli` as "dead code" — it is the primary
+/// test entry point for the build pipeline.
+///
 /// # Errors
 ///
 /// Returns `Err` only for fatal I/O failures. User-facing errors (unsupported
 /// languages, too-large files) are counted and reported to stderr but do not
 /// cause a non-zero exit code.
+// AD-375-2: clippy's dead_code lint fires here because the only non-test caller
+// (the `search::run` positional intercept) was removed by #375.  The function is
+// live from `index_tests.rs` (`use super::run`) but that is a #[cfg(test)] module,
+// which clippy-with-dead_code does not count as a live caller.  We suppress rather
+// than delete (see the rustdoc above).
+#[allow(dead_code)]
 pub(super) fn run(
     args: &[String],
     _analytics: &crate::analytics::AnalyticsConfig,
@@ -121,6 +143,9 @@ struct IndexCli {
 }
 
 impl IndexCli {
+    // AD-375-2: same suppression as `run` above — used by index_tests.rs via
+    // IndexCli::try_parse_from + into_config, invisible to dead_code lint.
+    #[allow(dead_code)]
     fn into_config(self) -> anyhow::Result<IndexConfig> {
         let effective_root = match self.root {
             Some(r) => r.canonicalize().unwrap_or(r),

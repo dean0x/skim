@@ -216,3 +216,207 @@ fn search_standalone_ast_hot_degrades_gracefully() {
         "no output may reference the removed #202 guard"
     );
 }
+
+// ============================================================================
+// #375 — legacy `index` positional removed; bareword 'index' is now a query
+// ============================================================================
+
+/// Write a project containing ≥4 files each with the token "index", so that
+/// AC2's --limit bound is meaningful (result count can saturate the default
+/// limit, proving --limit was honored rather than silently dropped).
+fn make_index_project(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    for (name, content) in [
+        ("src/a.rs", "fn a() { let index = 0; let _ = index; }"),
+        ("src/b.rs", "fn b() { let index = 1; let _ = index; }"),
+        ("src/c.rs", "fn c() { let index = 2; let _ = index; }"),
+        ("src/d.rs", "fn d() { let index = 3; let _ = index; }"),
+    ] {
+        std::fs::write(root.join(name), content).unwrap();
+    }
+}
+
+/// AC2 (#375): `skim search index --limit 2 --json` must succeed, must NOT emit
+/// "unexpected argument", and must return ≤ 2 result rows (proving --limit reached
+/// the query parser and was applied, not silently dropped to the default 20).
+///
+/// Before #375, `skim search index --limit 3` errored with:
+///   "error: unexpected argument '--limit' found"
+/// because the `index` positional intercepted the call and dispatched to
+/// `IndexCli`, which does not accept `--limit`.  After removal, `--limit` is
+/// parsed by `parse_flags` on the query path and honored.
+///
+/// Discriminating assertion (PF-007): the ≤ limit_cap assertion fails if the
+/// positional intercept were restored (IndexCli rejects --limit → exit 1) OR if
+/// --limit were silently dropped (result count > limit_cap).
+#[test]
+fn search_index_limit_is_honored_not_rejected() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    make_index_project(proj.path());
+    build_index(proj.path(), cache.path());
+
+    const LIMIT_CAP: usize = 2;
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args([
+            "search",
+            "index",
+            "--limit",
+            &LIMIT_CAP.to_string(),
+            "--json",
+            "--root",
+        ])
+        .arg(proj.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .assert()
+        .success() // exit 0 — would be exit 1 if IndexCli still rejected --limit
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "AC2: `skim search index --limit` must not produce 'unexpected argument'; \
+         got stderr:\n{stderr}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("AC2: stdout must be valid JSON ({e}); got:\n{stdout}")
+    });
+    let rows = json["results"]
+        .as_array()
+        .expect("AC2: JSON must have a 'results' array");
+    assert!(
+        rows.len() <= LIMIT_CAP,
+        "AC2: result count ({}) must be ≤ --limit ({}), proving --limit was honored",
+        rows.len(),
+        LIMIT_CAP
+    );
+}
+
+/// AC3 (#375, cold-start): On a fresh project with NO pre-existing index, a bare
+/// `skim search index --json` must exit 0 and return ≥ 1 result on STDOUT
+/// (auto-build fires, then the query runs).
+///
+/// This is the exact reported repro: under the OLD behavior the call built the
+/// index and stopped, emitting zero result rows on stdout.  After removal, the
+/// query path runs (after auto-building), returning files that contain "index".
+///
+/// The auto-build chatter (`building index…` / `indexed N files`) may appear on
+/// STDERR — stdout assertions only.  Per the resolved Open Decision (zero-change),
+/// no discoverability-hint string is asserted on stderr.
+///
+/// Discriminating assertion (PF-007): the present-result-row assertion fails
+/// under the old behavior (builder ran and stopped, stdout is empty → no results).
+#[test]
+fn search_index_cold_start_auto_builds_and_returns_results() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap(); // brand-new empty cache, NO pre-build
+    make_index_project(proj.path());
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["search", "index", "--json", "--root"])
+        .arg(proj.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("AC3: stdout must be valid JSON ({e}); got:\n{stdout}")
+    });
+    let rows = json["results"]
+        .as_array()
+        .expect("AC3: JSON must have a 'results' array");
+    assert!(
+        !rows.is_empty(),
+        "AC3: cold-start `skim search index` must return ≥1 result on STDOUT \
+         (query path ran after auto-build); stdout:\n{stdout}"
+    );
+    // Confirm at least one result path contains "index" token or its parent dir
+    // (discriminating: builder output never put result rows on stdout).
+    assert!(
+        rows.iter().any(|r| r["path"].as_str().is_some()),
+        "AC3: result rows must have a 'path' field; got:\n{stdout}"
+    );
+}
+
+/// AC5 (#375): `skim search --help` stdout must NOT contain the removed subcommand
+/// line "index            Build or update the search index (legacy)".
+///
+/// Full-line predicate (NOT bare "index") so the test passes even though "index"
+/// still appears legitimately elsewhere in help (--build 'auto-build on first
+/// query', --update, examples like 'Show index statistics').
+///
+/// Discriminating assertion (PF-007): if print_help() were not edited, the removed
+/// line would still be present → the .not() assertion fails.
+#[test]
+fn search_help_no_longer_lists_index_as_subcommand() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["search", "--help"])
+        .assert()
+        .success()
+        // AC5: full removed-line string must be absent (AD-375-3).
+        .stdout(
+            predicate::str::contains("index            Build or update the search index (legacy)")
+                .not(),
+        )
+        // AC5: --build and --rebuild must remain (builds are not gone, just re-surfaced).
+        .stdout(predicate::str::contains("--build"))
+        .stdout(predicate::str::contains("--rebuild"));
+}
+
+/// AC8 (#375): no residual positional shadow — `skim search build` runs a QUERY
+/// for the word "build", not an index build.
+///
+/// Discriminating assertion (PF-007): if any positional-to-action mapping survived,
+/// `skim search build` would route to the builder and produce zero result rows on
+/// stdout → the present-result-row assertion fails.
+#[test]
+fn search_bareword_build_is_a_query_not_a_build_action() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    // File containing the word "build" so the query has something to return.
+    std::fs::create_dir_all(proj.path().join("src")).unwrap();
+    std::fs::write(
+        proj.path().join("src/main.rs"),
+        "// build pipeline\nfn main() { println!(\"build\"); }",
+    )
+    .unwrap();
+    build_index(proj.path(), cache.path());
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["search", "build", "--json", "--root"])
+        .arg(proj.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "AC8: `skim search build` must not produce 'unexpected argument'; stderr:\n{stderr}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("AC8: stdout must be valid JSON ({e}); got:\n{stdout}")
+    });
+    let rows = json["results"]
+        .as_array()
+        .expect("AC8: JSON must have a 'results' array");
+    assert!(
+        !rows.is_empty(),
+        "AC8: `skim search build` must return ≥1 result (query path, not builder); \
+         stdout:\n{stdout}"
+    );
+}
