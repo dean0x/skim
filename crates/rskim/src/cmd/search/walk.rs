@@ -355,17 +355,21 @@ fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> MetaOutcome
         }
     };
 
-    // Capture metadata once; use it for both the size pre-screen and mtime
-    // extraction so the walker never calls entry.metadata() twice per file.
+    // Capture metadata once; use it for the size pre-screen, the recorded
+    // size (AD-379-2), and mtime extraction so the walker never calls
+    // entry.metadata() twice per file.
     let meta_opt = entry.metadata().ok();
-    if let Some(ref meta) = meta_opt {
-        let size = meta.len();
-        if size > MAX_FILE_BYTES {
-            return MetaOutcome::Skip(SkipReason::TooLarge {
-                path: abs_path.to_path_buf(),
-                size,
-            });
-        }
+    // Recorded size in bytes (AD-379-2): persisted in the manifest so the
+    // working-tree staleness scan can compare size as a second freshness hint
+    // alongside mtime. `None` when the platform/syscall does not expose it.
+    let size = meta_opt.as_ref().map(std::fs::Metadata::len);
+    if let Some(len) = size
+        && len > MAX_FILE_BYTES
+    {
+        return MetaOutcome::Skip(SkipReason::TooLarge {
+            path: abs_path.to_path_buf(),
+            size: len,
+        });
     }
 
     let mtime = meta_opt.and_then(|m| {
@@ -384,6 +388,7 @@ fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> MetaOutcome
         rel_path,
         lang,
         mtime,
+        size,
     })
 }
 

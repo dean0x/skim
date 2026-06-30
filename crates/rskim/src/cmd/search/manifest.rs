@@ -75,6 +75,21 @@ pub(super) struct ManifestEntry {
     /// deserialize with `mtime: None`.
     #[serde(default)]
     pub mtime: Option<u64>,
+    /// File size in bytes when the manifest was written.
+    ///
+    /// AD-379-2: working-tree staleness compares BOTH mtime AND size against the
+    /// current on-disk file. mtime is second-resolution on many filesystems, so a
+    /// same-second edit can leave mtime unchanged; size is the second freshness
+    /// hint that closes that gap (an edit that changes the byte length is detected
+    /// even when mtime is preserved). A same-size, same-second swap remains
+    /// deliberately undetectable without SHA — off the hot path by design (AC9).
+    ///
+    /// `serde(default)` ensures backward compatibility: pre-#379 manifests without
+    /// this field deserialize with `size: None`. A `None` here forces a stale
+    /// verdict on the next working-tree scan so the field is repopulated by the
+    /// one-time rebuild (AC10) — no FORMAT_VERSION bump required.
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 // ============================================================================
@@ -328,6 +343,20 @@ impl FileManifest {
     /// Returns `None` if the file has not been indexed before.
     pub(super) fn lookup(&self, path: &str) -> Option<&ManifestEntry> {
         self.entries.get(path)
+    }
+
+    /// Iterate `(path, mtime, size)` freshness tuples for every indexed file.
+    ///
+    /// Used by the working-tree staleness scan (AD-379-2) to compare the
+    /// recorded mtime AND size of each indexed file against the current
+    /// on-disk metadata. Iteration is in byte-wise key order (BTreeMap), so the
+    /// caller observes paths in the same order as [`Self::sorted_paths`].
+    pub(super) fn freshness_entries(
+        &self,
+    ) -> impl Iterator<Item = (&str, Option<u64>, Option<u64>)> {
+        self.entries
+            .values()
+            .map(|e| (e.path.as_str(), e.mtime, e.size))
     }
 
     /// Return entry paths sorted in byte-wise string order.

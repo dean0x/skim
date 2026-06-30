@@ -847,6 +847,7 @@ fn test_adr006_desync_aborts_before_manifest_save() {
         content: "fn main() {}\n".to_string(),
         sha256: "a".repeat(64),
         mtime: None,
+        size: None,
         field_map: vec![],
         cache_hit: false,
         ast_cached: None,
@@ -946,6 +947,7 @@ fn test_adr006_self_heal_after_abort() {
         content: "fn main() {}\n".to_string(),
         sha256: "a".repeat(64),
         mtime: None,
+        size: None,
         field_map: vec![],
         cache_hit: false,
         ast_cached: None,
@@ -2351,6 +2353,7 @@ fn test_ac7_cached_zero_count_entry_aborts_via_desync() {
         content: "fn main() {}\n".to_string(),
         sha256: poisoned_sha,
         mtime: None,
+        size: None,
         field_map: vec![],
         cache_hit: false,
         ast_cached: Some(poison_ast), // <— injected via the cache-hit path

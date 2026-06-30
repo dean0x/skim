@@ -27,6 +27,7 @@ fn sample_entry(path: &str, sha256: &str) -> ManifestEntry {
         lang: "rust".to_string(),
         field_map: encode_field_map(&sample_field_map()),
         mtime: None,
+        size: None,
     }
 }
 
@@ -78,6 +79,7 @@ fn test_manifest_roundtrip_multiple_entries() {
             lang: "rust".to_string(),
             field_map: encode_field_map(&sample_field_map()),
             mtime: None,
+            size: None,
         })
         .collect();
 
@@ -332,6 +334,7 @@ fn test_mtime_persisted_in_manifest() {
         lang: "rust".to_string(),
         field_map: vec![],
         mtime: Some(mtime_value),
+        size: None,
     };
 
     let mut manifest = FileManifest::new(root.clone(), cache_dir.clone());
@@ -452,6 +455,7 @@ fn test_sorted_paths_invariant() {
             lang: "rust".to_string(),
             field_map: vec![],
             mtime: None,
+            size: None,
         });
     }
 

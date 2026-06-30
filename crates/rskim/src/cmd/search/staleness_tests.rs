@@ -1296,12 +1296,505 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
 }
 
 // ============================================================================
+// #379 — Working-tree staleness (uncommitted edits with unchanged git HEAD)
+// ============================================================================
+//
+// These tests exercise the metadata-scan staleness path added in #379. The scan
+// runs ONLY after the cheap HEAD compare yields a Current-equivalent verdict
+// (AD-379-5), compares each indexed file's mtime AND size against the manifest
+// (AD-379-2), and triggers a FULL rebuild (AD-379-4) on any change/add/remove.
+
+/// Helper: read the indexed file set (normalized rel-paths) from the manifest.
+fn manifest_paths(root: &std::path::Path, cache_dir: &std::path::Path) -> Vec<String> {
+    use crate::cmd::search::manifest::FileManifest;
+    let m = FileManifest::load(root.to_path_buf(), cache_dir.to_path_buf()).unwrap();
+    m.sorted_paths().iter().map(|s| s.to_string()).collect()
+}
+
+/// Helper: restore a file's mtime to a fixed second-resolution value via filetime,
+/// modeling the "same-second edit" boundary (AC9 / AC9a / AD-379-2).
+fn set_mtime_secs(path: &std::path::Path, secs: i64) {
+    let ft = filetime::FileTime::from_unix_time(secs, 0);
+    filetime::set_file_mtime(path, ft).unwrap();
+}
+
+/// AC4 (API contract): an in-place edit to a tracked file (HEAD unchanged) makes
+/// `check_staleness` return `WorkingTreeChanged` with EXACT counts
+/// `{ changed: 1, added: 0, removed: 0 }`, AND it MUST still return `Some(manifest)`
+/// so `--stats` can display the real HEAD.
+///
+/// Discriminating: a single edited file produces exactly `changed == 1`.
+#[test]
+fn test_check_staleness_working_tree_changed_exact_counts() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // One commit so HEAD is readable and stable across the edit.
+    create_real_git_repo(dir.path(), &[("init", &[("src/lib.rs", "fn alpha() {}\n")])]);
+    build_index_in(dir.path(), &cache_dir);
+
+    // Edit in place WITHOUT committing — HEAD stays the same.
+    fs::write(dir.path().join("src/lib.rs"), "fn alpha_edited_longer() {}\n").unwrap();
+
+    let (result, manifest) = check_staleness(&cache_dir, dir.path());
+    match result {
+        StalenessCheck::WorkingTreeChanged {
+            changed,
+            added,
+            removed,
+        } => {
+            assert_eq!(changed, 1, "exactly one file edited");
+            assert_eq!(added, 0, "no files added");
+            assert_eq!(removed, 0, "no files removed");
+        }
+        other => panic!("expected WorkingTreeChanged, got {other:?}"),
+    }
+    assert!(
+        manifest.is_some(),
+        "WorkingTreeChanged MUST carry the loaded manifest for --stats (AC4)"
+    );
+}
+
+/// AC1 / AC5 (behavior contract): editing a tracked file triggers ONE rebuild via
+/// `auto_refresh_if_stale` (refreshed == true), and the post-edit manifest reflects
+/// the new file set. Forbids exit-0-only assertions (PF-007): we assert refreshed
+/// AND that the rebuilt manifest re-indexed the edited path.
+#[test]
+fn test_auto_refresh_rebuilds_on_working_tree_edit() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    create_real_git_repo(
+        dir.path(),
+        &[("init", &[("src/lib.rs", "fn original_token() {}\n")])],
+    );
+    build_index_in(dir.path(), &cache_dir);
+
+    // Capture the manifest mtime so we can prove exactly one rebuild happened.
+    let manifest_path = cache_dir.join("index.skfiles");
+    let mtime_before = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // In-place edit (HEAD unchanged) introducing a new token, longer than before.
+    fs::write(
+        dir.path().join("src/lib.rs"),
+        "fn original_token() {}\nfn brand_new_marker() {}\n",
+    )
+    .unwrap();
+
+    let analytics = TEST_ANALYTICS;
+    let (refreshed, manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+
+    assert!(refreshed, "in-place edit must trigger a rebuild (AC1/AC5)");
+    // Manifest was rewritten exactly once (mtime advanced).
+    let mtime_after = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+    assert_ne!(
+        mtime_before, mtime_after,
+        "manifest must be rewritten by the rebuild (single build side-effect)"
+    );
+    // The edited file is still indexed (the manifest reflects post-edit state).
+    assert!(
+        manifest.lookup("src/lib.rs").is_some(),
+        "rebuilt manifest must include the edited file"
+    );
+}
+
+/// AC2: a NEW tracked file (non-dotfile, not gitignored) appears in the indexed
+/// set on the next query. Discriminating: pre-fix the file is absent until HEAD
+/// moves — here HEAD never moves, so only the working-tree scan can surface it.
+#[test]
+fn test_auto_refresh_indexes_new_working_tree_file() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    create_real_git_repo(dir.path(), &[("init", &[("src/a.rs", "fn a() {}\n")])]);
+    build_index_in(dir.path(), &cache_dir);
+
+    // Add a brand-new source file WITHOUT committing.
+    fs::write(dir.path().join("src/b.rs"), "fn b() {}\n").unwrap();
+
+    let analytics = TEST_ANALYTICS;
+    let (refreshed, _manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    assert!(refreshed, "a new working-tree file must trigger a rebuild (AC2)");
+
+    let paths = manifest_paths(dir.path(), &cache_dir);
+    assert!(
+        paths.iter().any(|p| p == "src/b.rs"),
+        "new file src/b.rs must be indexed after refresh; got {paths:?}"
+    );
+}
+
+/// AC3: a DELETED tracked file disappears from the indexed set; a rename
+/// (delete A + add B in the same window) reflects both A's absence and B's
+/// presence. Discriminating: pre-fix the deleted path is still returned.
+#[test]
+fn test_auto_refresh_reflects_delete_and_rename() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    create_real_git_repo(
+        dir.path(),
+        &[(
+            "init",
+            &[("src/old.rs", "fn renamed_me() {}\n"), ("src/keep.rs", "fn keep() {}\n")],
+        )],
+    );
+    build_index_in(dir.path(), &cache_dir);
+
+    // Rename old.rs -> new.rs (delete + add) WITHOUT committing.
+    fs::remove_file(dir.path().join("src/old.rs")).unwrap();
+    fs::write(dir.path().join("src/new.rs"), "fn renamed_me() {}\n").unwrap();
+
+    let analytics = TEST_ANALYTICS;
+    let (refreshed, _manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    assert!(refreshed, "delete+add must trigger a rebuild (AC3)");
+
+    let paths = manifest_paths(dir.path(), &cache_dir);
+    assert!(
+        !paths.iter().any(|p| p == "src/old.rs"),
+        "deleted src/old.rs must be gone after refresh; got {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p == "src/new.rs"),
+        "added src/new.rs must be present after refresh; got {paths:?}"
+    );
+}
+
+/// AC7 (negative regression): on a CLEAN tree, calling `auto_refresh_if_stale`
+/// twice returns `refreshed == false` every time AND index.skfiles mtime is
+/// unchanged across calls. Guards the clean-tree false-positive regression.
+#[test]
+fn test_auto_refresh_clean_tree_no_rebuild_idempotent() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    create_real_git_repo(dir.path(), &[("init", &[("src/lib.rs", "fn clean() {}\n")])]);
+    build_index_in(dir.path(), &cache_dir);
+
+    let manifest_path = cache_dir.join("index.skfiles");
+    let mtime0 = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let analytics = TEST_ANALYTICS;
+    let (r1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (r2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+
+    assert!(!r1, "clean tree: first call must not rebuild (AC7)");
+    assert!(!r2, "clean tree: second call must not rebuild (AC7)");
+
+    let mtime_final = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime0, mtime_final,
+        "clean tree: index.skfiles mtime must be unchanged across calls (AC7)"
+    );
+}
+
+/// AC8 (short-circuit): the working-tree scan MUST NOT run on the HeadChanged
+/// branch. A HEAD-changed repo WITH a working-tree edit returns HeadChanged
+/// (NOT WorkingTreeChanged), proving the scan is gated behind a Current HEAD.
+#[test]
+fn test_check_staleness_head_changed_short_circuits_working_tree_scan() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    create_real_git_repo(dir.path(), &[("init", &[("src/lib.rs", "fn a() {}\n")])]);
+    build_index_in(dir.path(), &cache_dir);
+
+    // Edit the working tree AND advance HEAD to a different SHA.
+    fs::write(dir.path().join("src/lib.rs"), "fn a_changed_more() {}\n").unwrap();
+    let git_dir = dir.path().join(".git");
+    fs::write(
+        git_dir.join("HEAD"),
+        "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222\n",
+    )
+    .unwrap();
+
+    let (result, _) = check_staleness(&cache_dir, dir.path());
+    assert!(
+        matches!(result, StalenessCheck::HeadChanged { .. }),
+        "HEAD-changed must short-circuit before the working-tree scan (AC8), got {result:?}"
+    );
+}
+
+/// AC9 (pinned boundary): a content edit that preserves BOTH mtime AND size
+/// (same-length byte swap with mtime restored via filetime) MUST NOT reindex.
+///
+/// AD-379-2: a same-size + same-second swap is deliberately undetectable without
+/// SHA, kept off the hot path. This is an intentional, documented boundary.
+#[test]
+fn test_auto_refresh_same_mtime_and_size_does_not_reindex() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let file_rel = "src/lib.rs";
+    let original = "fn aaaa() {}\n"; // fixed length
+    create_real_git_repo(dir.path(), &[("init", &[(file_rel, original)])]);
+
+    // Pin the file mtime to a fixed second BEFORE building so the manifest records it.
+    let abs = dir.path().join(file_rel);
+    set_mtime_secs(&abs, 1_700_000_000);
+    build_index_in(dir.path(), &cache_dir);
+
+    // Same-length byte swap (size identical), then restore the exact same mtime.
+    let swapped = "fn bbbb() {}\n"; // same byte length as `original`
+    assert_eq!(swapped.len(), original.len(), "swap must preserve size");
+    fs::write(&abs, swapped).unwrap();
+    set_mtime_secs(&abs, 1_700_000_000);
+
+    let analytics = TEST_ANALYTICS;
+    let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    assert!(
+        !refreshed,
+        "same-size + same-second swap must NOT reindex (AD-379-2 pinned boundary, AC9)"
+    );
+}
+
+/// AC9a (size closes the same-second hole): an edit that changes the file SIZE
+/// but preserves second-resolution mtime (restored via filetime) MUST trigger a
+/// rebuild. Discriminating against Open Decision 2: an mtime-only comparator
+/// would return false here and miss the edit.
+#[test]
+fn test_auto_refresh_size_change_with_preserved_mtime_reindexes() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let file_rel = "src/lib.rs";
+    let original = "fn short() {}\n";
+    create_real_git_repo(dir.path(), &[("init", &[(file_rel, original)])]);
+
+    let abs = dir.path().join(file_rel);
+    set_mtime_secs(&abs, 1_700_000_000);
+    build_index_in(dir.path(), &cache_dir);
+
+    // Edit that CHANGES the size, then restore the SAME second-resolution mtime.
+    let longer = "fn short() {}\nfn size_growth_marker() {}\n";
+    assert_ne!(longer.len(), original.len(), "edit must change size");
+    fs::write(&abs, longer).unwrap();
+    set_mtime_secs(&abs, 1_700_000_000);
+
+    let analytics = TEST_ANALYTICS;
+    let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    assert!(
+        refreshed,
+        "size change with preserved mtime MUST reindex (size comparison, AC9a)"
+    );
+
+    // Post-edit manifest carries a populated size for the file.
+    use crate::cmd::search::manifest::FileManifest;
+    let m = FileManifest::load(dir.path().to_path_buf(), cache_dir.to_path_buf()).unwrap();
+    assert!(
+        m.lookup(file_rel).and_then(|e| e.size).is_some(),
+        "rebuilt manifest must carry a populated size (AC9a)"
+    );
+}
+
+/// AC12: a NON-git directory (no .git) with an indexed file MUST trigger a
+/// rebuild on the next query when the working tree changes. Discriminating:
+/// pre-fix the `(None, None)` branch returned Current unconditionally (AD-379-3).
+#[test]
+fn test_auto_refresh_non_git_working_tree_change_reindexes() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Non-git project (no .git). Write a source file and build.
+    fs::write(dir.path().join("lib.rs"), "fn ng_original() {}\n").unwrap();
+    build_index_in(dir.path(), &cache_dir);
+
+    // Edit the file (size grows) — no git involved.
+    fs::write(dir.path().join("lib.rs"), "fn ng_original() {}\nfn ng_added() {}\n").unwrap();
+
+    let analytics = TEST_ANALYTICS;
+    let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    assert!(
+        refreshed,
+        "non-git working-tree change MUST reindex (AD-379-3, AC12)"
+    );
+}
+
+/// AC13: manifest has a stored HEAD but `read_git_head` returns None (corrupt
+/// .git/HEAD). A working-tree edit MUST trigger a rebuild. Discriminating:
+/// pre-fix the `(Some, None)` branch returned Current unconditionally (AD-379-6).
+#[test]
+fn test_auto_refresh_corrupt_head_with_working_tree_change_reindexes() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Real repo so the manifest records a stored HEAD at build time.
+    create_real_git_repo(dir.path(), &[("init", &[("src/lib.rs", "fn ch_original() {}\n")])]);
+    build_index_in(dir.path(), &cache_dir);
+
+    // Corrupt HEAD so read_git_head returns None (not a valid ref or SHA).
+    let git_dir = dir.path().join(".git");
+    fs::write(git_dir.join("HEAD"), "garbage-not-a-ref\n").unwrap();
+    assert!(
+        read_git_head(dir.path()).is_none(),
+        "corrupt HEAD must make read_git_head return None (test precondition)"
+    );
+
+    // Edit the working tree (size grows).
+    fs::write(
+        dir.path().join("src/lib.rs"),
+        "fn ch_original() {}\nfn ch_added() {}\n",
+    )
+    .unwrap();
+
+    let analytics = TEST_ANALYTICS;
+    let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    assert!(
+        refreshed,
+        "corrupt-HEAD + working-tree edit MUST reindex (AD-379-6, AC13)"
+    );
+}
+
+/// AC14 (stampede collapse): two sequential `auto_refresh_if_stale` calls after a
+/// single edit — the first rebuilds, the second observes the now-refreshed index
+/// and returns `refreshed == false` WITHOUT a second build. Exactly one rebuild
+/// side-effect across the pair (asserted via a single manifest mtime change).
+#[test]
+fn test_auto_refresh_working_tree_change_single_rebuild_across_pair() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    create_real_git_repo(dir.path(), &[("init", &[("src/lib.rs", "fn s() {}\n")])]);
+    build_index_in(dir.path(), &cache_dir);
+
+    fs::write(dir.path().join("src/lib.rs"), "fn s() {}\nfn second_marker() {}\n").unwrap();
+
+    let manifest_path = cache_dir.join("index.skfiles");
+    let analytics = TEST_ANALYTICS;
+
+    // First call rebuilds.
+    let (r1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    assert!(r1, "first call must rebuild on the edit (AC14)");
+    let mtime_after_first = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Second call: index is now Current (manifest carries fresh mtime+size).
+    let (r2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    assert!(
+        !r2,
+        "second call must NOT rebuild — index already refreshed (AC14 / AD-379-8)"
+    );
+    let mtime_after_second = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime_after_first, mtime_after_second,
+        "exactly one rebuild across the pair (manifest mtime stable after 2nd call, AC14)"
+    );
+}
+
+/// AC10 (no version bump / forward-compat): a pre-#379 manifest whose entries
+/// have `mtime: None` and `size: None` (serde default) MUST load, and the first
+/// query MUST trigger one rebuild that repopulates mtime AND size — WITHOUT a
+/// FORMAT_VERSION bump (header stays version 3 here).
+#[test]
+fn test_auto_refresh_pre_379_manifest_self_heals_populates_mtime_size() {
+    use crate::cmd::search::manifest::{FileManifest, ManifestEntry};
+
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Build a real index so lexical/AST stubs + git HEAD are valid and Current.
+    create_real_git_repo(dir.path(), &[("init", &[("src/lib.rs", "fn p() {}\n")])]);
+    build_index_in(dir.path(), &cache_dir);
+
+    // Rewrite the manifest to model a pre-#379 build: same paths but mtime/size None.
+    // Keep the stored HEAD so the HEAD compare yields Current (only the scan can fire).
+    let head = read_git_head(dir.path());
+    let loaded = FileManifest::load(dir.path().to_path_buf(), cache_dir.to_path_buf()).unwrap();
+    let paths: Vec<String> = loaded.sorted_paths().iter().map(|s| s.to_string()).collect();
+    let mut downgraded = FileManifest::new(dir.path().to_path_buf(), cache_dir.to_path_buf());
+    downgraded.set_git_head(head);
+    for p in &paths {
+        let e = loaded.lookup(p).unwrap();
+        downgraded.insert(ManifestEntry {
+            path: e.path.clone(),
+            sha256: e.sha256.clone(),
+            lang: e.lang.clone(),
+            field_map: e.field_map.clone(),
+            mtime: None, // pre-#379: absent
+            size: None,  // pre-#379: absent
+        });
+    }
+    downgraded.save().unwrap();
+
+    // First query: the None mtime/size forces a changed verdict → one rebuild.
+    let analytics = TEST_ANALYTICS;
+    let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    assert!(
+        refreshed,
+        "pre-#379 manifest (mtime/size None) must self-heal via one rebuild (AC10)"
+    );
+
+    // The rewritten manifest now carries populated mtime AND size.
+    let healed = FileManifest::load(dir.path().to_path_buf(), cache_dir.to_path_buf()).unwrap();
+    let entry = healed.lookup("src/lib.rs").expect("file must still be indexed");
+    assert!(entry.mtime.is_some(), "rebuild must populate mtime (AC10)");
+    assert!(entry.size.is_some(), "rebuild must populate size (AC10)");
+}
+
+/// AC16 (at-cap determinism): two `walk_metadata` invocations over the same tree
+/// at a small injected cap MUST return byte-identical ordered path sets (the
+/// sort-before-truncate guarantee, AD-379-7). Without it, truncated sets could
+/// differ run-to-run and oscillate the staleness verdict into a rebuild loop.
+#[test]
+fn test_walk_metadata_at_cap_is_deterministic() {
+    use crate::cmd::search::walk::{normalize_rel_path, walk_metadata};
+
+    let dir = tempdir().unwrap();
+    // Create more files than the injected cap so truncation actually engages.
+    for i in 0..20 {
+        fs::write(dir.path().join(format!("f{i:02}.rs")), "fn x() {}\n").unwrap();
+    }
+
+    let cap = 5usize;
+    let (a, _) = walk_metadata(dir.path(), cap).unwrap();
+    let (b, _) = walk_metadata(dir.path(), cap).unwrap();
+
+    let a_paths: Vec<String> = a.iter().map(|e| normalize_rel_path(&e.rel_path)).collect();
+    let b_paths: Vec<String> = b.iter().map(|e| normalize_rel_path(&e.rel_path)).collect();
+
+    assert!(a_paths.len() <= cap, "walk must respect the cap");
+    assert_eq!(
+        a_paths, b_paths,
+        "at-cap path sets must be byte-identical across runs (sort-before-truncate, AD-379-7/AC16)"
+    );
+}
+
+// ============================================================================
 // Display impl for StalenessCheck
 // ============================================================================
 
 #[test]
 fn test_display_current() {
     assert_eq!(StalenessCheck::Current.to_string(), "current");
+}
+
+/// #379: the WorkingTreeChanged Display surfaces the exact `--stats` phrasing
+/// required by AC6 (text + JSON both render via this Display).
+#[test]
+fn test_display_working_tree_changed() {
+    let s = StalenessCheck::WorkingTreeChanged {
+        changed: 2,
+        added: 1,
+        removed: 3,
+    }
+    .to_string();
+    assert_eq!(
+        s,
+        "stale (working tree changed: 2 modified, 1 added, 3 removed)"
+    );
 }
 
 #[test]

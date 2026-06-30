@@ -31,6 +31,18 @@ pub(super) enum StalenessCheck {
     NoStoredHead,
     /// No index file found — treat as a cold start.
     NoIndex,
+    /// Git HEAD is unchanged (or absent) but the working tree has uncommitted
+    /// edits, additions, or deletions relative to the manifest (#379).
+    ///
+    /// Detected by a metadata-only scan (mtime + size) that runs ONLY after the
+    /// cheap HEAD compare yields a Current-equivalent verdict (AD-379-5). The
+    /// aggregate counts drive the `--stats` display and the rebuild log; no
+    /// per-file path diff is retained (AD-379-9).
+    WorkingTreeChanged {
+        changed: usize,
+        added: usize,
+        removed: usize,
+    },
 }
 
 impl std::fmt::Display for StalenessCheck {
@@ -45,6 +57,14 @@ impl std::fmt::Display for StalenessCheck {
             ),
             StalenessCheck::NoStoredHead => write!(f, "stale (no HEAD recorded)"),
             StalenessCheck::NoIndex => write!(f, "no index"),
+            StalenessCheck::WorkingTreeChanged {
+                changed,
+                added,
+                removed,
+            } => write!(
+                f,
+                "stale (working tree changed: {changed} modified, {added} added, {removed} removed)",
+            ),
         }
     }
 }
@@ -162,6 +182,120 @@ fn is_hex_sha(s: &str) -> bool {
 }
 
 // ============================================================================
+// Working-tree staleness scan (#379)
+// ============================================================================
+
+/// Aggregate working-tree change counts produced by [`scan_working_tree`].
+///
+/// AD-379-9: only aggregate counts are retained, never a per-file path-set diff
+/// (detailed per-path logging is a separate `--verbose` follow-up ticket).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WorkingTreeDelta {
+    /// Indexed files whose on-disk mtime OR size differs from the manifest.
+    pub changed: usize,
+    /// Files present on disk (under the builder's ignore config) but absent
+    /// from the manifest.
+    pub added: usize,
+    /// Files recorded in the manifest but no longer present on disk.
+    pub removed: usize,
+}
+
+impl WorkingTreeDelta {
+    /// `true` when the working tree differs from the manifest in any dimension.
+    pub fn is_dirty(self) -> bool {
+        self.changed != 0 || self.added != 0 || self.removed != 0
+    }
+}
+
+/// Scan the working tree under `root` and compare each indexed file's metadata
+/// (mtime AND size) against the `manifest`.
+///
+/// Runs a metadata-only walk via [`super::walk::walk_metadata`] (AD-379-1: the
+/// SAME ignore-config walk the rebuild uses, so the scanned file set is exactly
+/// what a rebuild would index — no subprocess, no `git status` parsing). For
+/// each walked file the normalized rel-path is the manifest key
+/// ([`super::walk::normalize_rel_path`]); the comparison classifies it as:
+///
+/// - **added** — path not present in the manifest.
+/// - **changed** — path present but mtime OR size differs (AD-379-2: size closes
+///   the same-second-edit gap; a manifest entry with `mtime: None` or
+///   `size: None`, e.g. a pre-#379 manifest, is treated as changed so the field
+///   is repopulated on the rebuild, AC10).
+///
+/// Manifest paths not seen during the walk are counted as **removed**.
+///
+/// # Performance (AC15 / ADR-003)
+///
+/// Metadata/stat only — zero file content reads and zero SHA. A clean tree
+/// yields a `WorkingTreeDelta` with all-zero counts (`is_dirty() == false`).
+///
+/// # Errors
+///
+/// Propagates only fatal walker-setup errors from `walk_metadata`. Per-file
+/// metadata errors are absorbed by the walker (collected as skip reasons that
+/// are not consulted here).
+fn scan_working_tree(
+    root: &Path,
+    manifest: &FileManifest,
+    max_files: usize,
+) -> anyhow::Result<WorkingTreeDelta> {
+    use std::collections::HashMap;
+
+    use super::walk::{normalize_rel_path, walk_metadata};
+
+    // Metadata-only walk under the builder's ignore config (AD-379-1).
+    let (entries, _skipped) = walk_metadata(root, max_files)?;
+
+    // Index the manifest by normalized rel-path → (mtime, size). The key is
+    // already normalized (it is the stored manifest key), so no re-normalization.
+    let mut manifest_index: HashMap<&str, (Option<u64>, Option<u64>)> = HashMap::new();
+    for (path, mtime, size) in manifest.freshness_entries() {
+        manifest_index.insert(path, (mtime, size));
+    }
+    // Track which manifest paths we observe on disk so the remainder are deletions.
+    let mut seen: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(manifest_index.len());
+
+    let mut changed = 0usize;
+    let mut added = 0usize;
+
+    for entry in &entries {
+        let key = normalize_rel_path(&entry.rel_path);
+        // Single lookup: get_key_value yields the stored &str key so `seen`
+        // borrows the manifest (not the freshly-allocated `key` String).
+        match manifest_index.get_key_value(key.as_str()) {
+            None => added += 1,
+            Some((stored_key, &(m_mtime, m_size))) => {
+                seen.insert(stored_key);
+                // AD-379-2: an indexed file is changed when EITHER mtime or size
+                // differs. A `None` stored hint (pre-#379 manifest) forces the
+                // changed verdict so the field is repopulated on the rebuild (AC10).
+                let mtime_differs = match m_mtime {
+                    Some(stored) => entry.mtime != Some(stored),
+                    None => true,
+                };
+                let size_differs = match m_size {
+                    Some(stored) => entry.size != Some(stored),
+                    None => true,
+                };
+                if mtime_differs || size_differs {
+                    changed += 1;
+                }
+            }
+        }
+    }
+
+    // Removed = manifest entries never observed during the walk.
+    let removed = manifest_index.len() - seen.len();
+
+    Ok(WorkingTreeDelta {
+        changed,
+        added,
+        removed,
+    })
+}
+
+// ============================================================================
 // Staleness check
 // ============================================================================
 
@@ -264,19 +398,45 @@ pub(super) fn check_staleness(
     // Read current HEAD.
     let current = read_git_head(project_root);
 
+    // AD-379-5: the working-tree scan runs ONLY after the cheap HEAD compare
+    // yields a Current-equivalent verdict — never on NoIndex/NoStoredHead/
+    // HeadChanged (AC8). On those stale branches a rebuild already happens, so
+    // scanning would be redundant work. `current_or_working_tree` upgrades a
+    // would-be `Current` outcome to `WorkingTreeChanged` when the metadata scan
+    // finds ≥1 uncommitted change/add/remove (AD-379-3: this also covers the
+    // non-git `(None, None)` branch and AD-379-6: the git-unreadable
+    // `(Some, None)` branch — both reach it).
+    let current_or_working_tree = |manifest: &FileManifest| -> StalenessCheck {
+        // Use the SAME cap the builder uses so the scanned file set matches a
+        // rebuild's set exactly (AD-379-1).
+        let max_files = super::types::IndexConfig::DEFAULT_MAX_FILES;
+        match scan_working_tree(project_root, manifest, max_files) {
+            Ok(delta) if delta.is_dirty() => StalenessCheck::WorkingTreeChanged {
+                changed: delta.changed,
+                added: delta.added,
+                removed: delta.removed,
+            },
+            // Clean tree, or scan failed (degrade to Current — a scan failure
+            // must not falsely force a rebuild; the next query retries).
+            _ => StalenessCheck::Current,
+        }
+    };
+
     let outcome = match (stored.as_deref(), current.as_deref()) {
-        // Non-git project (both None): nothing can have changed.
-        (None, None) => StalenessCheck::Current,
+        // Non-git project (both None): no commit can have changed, but the
+        // working tree still can — scan it (AD-379-3).
+        (None, None) => current_or_working_tree(&manifest),
         // Git repo appeared since last build — rebuild to record HEAD.
         (None, Some(_)) => StalenessCheck::NoStoredHead,
         // Git is unreadable (worktree detached, submodule, fs error).
-        // Stored HEAD exists so the project was a git repo at build time;
-        // assume the index is still valid rather than triggering a rebuild.
-        (Some(_), None) => StalenessCheck::Current,
-        // Both present — compare.
+        // Stored HEAD exists so the project was a git repo at build time; trust
+        // is broken, so scan the working tree and rebuild on any edit to recover
+        // (AD-379-6) rather than serving a possibly-stale index unconditionally.
+        (Some(_), None) => current_or_working_tree(&manifest),
+        // Both present — compare HEADs first, then the working tree on a match.
         (Some(s), Some(c)) => {
             if s == c {
-                StalenessCheck::Current
+                current_or_working_tree(&manifest)
             } else {
                 StalenessCheck::HeadChanged {
                     stored: s.to_string(),
@@ -424,7 +584,7 @@ pub(super) fn auto_refresh_if_stale(
     cache_dir: &Path,
     _analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<(bool, FileManifest)> {
-    use super::index::build_index;
+    use super::index::{build_index, build_index_rechecked};
     use super::types::IndexConfig;
 
     // Read the current git HEAD once at function entry so rebuild_temporal can
@@ -470,6 +630,14 @@ pub(super) fn auto_refresh_if_stale(
         cache_dir_override: Some(cache_dir.to_path_buf()),
     };
 
+    // Tracks whether a pipeline build actually ran. Every arm below rebuilds
+    // unconditionally EXCEPT WorkingTreeChanged, which may skip the rebuild when
+    // a concurrent peer already refreshed the index (AD-379-8). When the build is
+    // skipped we must report `refreshed == false` and skip the post-rebuild
+    // temporal hook (nothing was rebuilt), so the steady-state no-op contract
+    // (AC7/AC14) holds.
+    let did_build: bool;
+
     match staleness {
         StalenessCheck::Current => unreachable!(),
         StalenessCheck::NoIndex => {
@@ -480,6 +648,7 @@ pub(super) fn auto_refresh_if_stale(
                 result.file_count,
                 result.duration.as_secs_f64()
             );
+            did_build = true;
         }
         StalenessCheck::HeadChanged { stored, current } => {
             if crate::debug::is_debug_enabled() {
@@ -492,6 +661,7 @@ pub(super) fn auto_refresh_if_stale(
                 eprintln!("skim search: index stale (HEAD changed), refreshing…");
             }
             build_index(&config)?;
+            did_build = true;
         }
         StalenessCheck::NoStoredHead => {
             // Manifest exists but no HEAD recorded — could be an old build or
@@ -499,7 +669,40 @@ pub(super) fn auto_refresh_if_stale(
             // Rebuild to get a fresh manifest with HEAD stored.
             eprintln!("skim search: refreshing index (no HEAD recorded)…");
             build_index(&config)?;
+            did_build = true;
         }
+        StalenessCheck::WorkingTreeChanged {
+            changed,
+            added,
+            removed,
+        } => {
+            // Uncommitted working-tree edits with an unchanged git HEAD (#379).
+            // AD-379-4: a FULL rebuild (not a per-file incremental writer) so the
+            // FileId↔sorted_paths alignment invariant is preserved (ADR-006).
+            // AD-379-8: build_index_rechecked re-checks staleness AFTER acquiring
+            // the build lock and SKIPS the rebuild when a concurrent peer already
+            // refreshed the index — collapsing a rebuild stampede to one build.
+            eprintln!(
+                "skim search: index stale (working tree changed: \
+                 {changed} modified, {added} added, {removed} removed), refreshing…"
+            );
+            let built = build_index_rechecked(&config, || {
+                // Re-evaluate staleness under the lock: skip the rebuild unless the
+                // working tree is STILL dirty (a peer may have already rebuilt).
+                matches!(
+                    check_staleness(cache_dir, root).0,
+                    StalenessCheck::WorkingTreeChanged { .. }
+                )
+            })?;
+            did_build = built.is_some();
+        }
+    }
+
+    // If the rebuild was skipped because a peer already refreshed (AD-379-8),
+    // the index is now Current: return without re-running the temporal hook.
+    if !did_build {
+        let manifest = FileManifest::load(root.to_path_buf(), cache_dir.to_path_buf())?;
+        return Ok((false, manifest));
     }
 
     // After a rebuild, load the freshly written manifest for the caller.
