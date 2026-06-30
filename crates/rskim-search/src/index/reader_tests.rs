@@ -2364,3 +2364,244 @@ fn test_ac14_short_query_fallback_returns_full_set() {
     // PF-007 negative: if ANY of the 120 files is missing, the assertion above fires.
     // If the test is vacuous (no files contain "fn"), the ids.len()==120 check fires.
 }
+
+// ===========================================================================
+// #376 — validity-marker caching (AD-376-1..5)
+// ===========================================================================
+//
+// These tests pin the lexical-reader half of the validity-marker fix. The AST
+// reader has parallel tests in ast_index/store/reader_tests.rs.
+
+/// Build a minimal real lexical index in `dir`.
+fn build_marker_index(dir: &Path) {
+    let mut builder = NgramIndexBuilder::new(dir.to_path_buf()).unwrap();
+    builder
+        .add_file(
+            FileId(0),
+            "fn alpha() { let beta = gamma_delta(); }",
+            rskim_core::Language::Rust,
+        )
+        .unwrap();
+    builder.build().unwrap();
+}
+
+/// AC8: build() must leave index.skverify on disk, and an immediately-following
+/// open() of the uncorrupted index must succeed.
+#[test]
+fn ac8_build_stamps_validity_marker() {
+    let dir = tmp_dir();
+    build_marker_index(dir.path());
+    assert!(
+        dir.path().join("index.skverify").exists(),
+        "AC8: build() must stamp index.skverify"
+    );
+    assert!(
+        NgramIndexReader::open(dir.path()).is_ok(),
+        "AC8: open() of freshly-built uncorrupted index must succeed"
+    );
+}
+
+/// AC1 + AC10 (TRUST-BOUNDARY PIN): a single byte of index.skpost flipped
+/// WITHOUT changing byte-length, WITH mtime held identical to the marker, and
+/// WITHOUT touching the header.checksum field, MUST still open Ok — the full
+/// CRC32 is provably skipped on the fast path. This fails the moment the
+/// optimization is deleted, and is the deterministic regression sentinel
+/// standing in for a (banned, ADR-003) wall-clock latency assertion.
+#[test]
+fn ac1_fast_path_skips_crc_on_held_mtime_byteflip() {
+    let dir = tmp_dir();
+    build_marker_index(dir.path());
+
+    let post_path = dir.path().join("index.skpost");
+    // Capture the marker-anchored mtime BEFORE mutating the file.
+    let original_mtime = filetime::FileTime::from_last_modification_time(
+        &std::fs::metadata(&post_path).unwrap(),
+    );
+
+    // Flip a byte WITHOUT changing length, leaving index.skidx (and thus the
+    // header.checksum field) untouched.
+    let mut data = std::fs::read(&post_path).unwrap();
+    assert!(!data.is_empty(), "skpost must be non-empty for this test");
+    let len_before = data.len();
+    data[0] ^= 0xFF;
+    std::fs::write(&post_path, &data).unwrap();
+    assert_eq!(
+        std::fs::metadata(&post_path).unwrap().len() as usize,
+        len_before,
+        "precondition: byte-flip must not change skpost length"
+    );
+
+    // Restore the mtime so the marker signature still matches (the only way the
+    // accepted trust boundary is exercised).
+    filetime::set_file_mtime(&post_path, original_mtime).unwrap();
+
+    // open() MUST skip the full CRC32 and return Ok despite the corrupted byte.
+    // NgramIndexReader is not Debug, so assert on .is_ok() (and surface any
+    // error message via .err()) rather than formatting the reader itself.
+    let result = NgramIndexReader::open(dir.path());
+    assert!(
+        result.is_ok(),
+        "AC1/PF-007: held-mtime byte-flip must be served via the fast path \
+         (full CRC32 skipped) — the optimization was deleted. err={:?}",
+        result.err().map(|e| e.to_string())
+    );
+}
+
+/// AC2: when index.skpost is corrupted AND its mtime is bumped, the marker no
+/// longer matches, so the full CRC32 runs and open() MUST return
+/// Err(IndexCorrupted) with "checksum mismatch".
+#[test]
+fn ac2_marker_miss_on_mtime_bump_reverifies() {
+    let dir = tmp_dir();
+    build_marker_index(dir.path());
+
+    let post_path = dir.path().join("index.skpost");
+    let mut data = std::fs::read(&post_path).unwrap();
+    data[0] ^= 0xFF;
+    std::fs::write(&post_path, &data).unwrap();
+    // Bump mtime well past the marker's recorded value → marker miss.
+    let bumped = filetime::FileTime::from_unix_time(32_500_000_000, 0); // year ~3000
+    filetime::set_file_mtime(&post_path, bumped).unwrap();
+
+    let err = NgramIndexReader::open(dir.path())
+        .err()
+        .expect("AC2: mtime-bumped corruption must fail open()");
+    assert!(
+        format!("{err}").contains("checksum mismatch"),
+        "AC2: marker-miss must re-verify and report 'checksum mismatch': {err}"
+    );
+}
+
+/// AC2 (marker-absent variant): deleting index.skverify forces a marker miss,
+/// so a corrupted skpost is caught by the full CRC32.
+#[test]
+fn ac2_marker_absent_reverifies() {
+    let dir = tmp_dir();
+    build_marker_index(dir.path());
+
+    std::fs::remove_file(dir.path().join("index.skverify")).unwrap();
+
+    let post_path = dir.path().join("index.skpost");
+    let mut data = std::fs::read(&post_path).unwrap();
+    data[0] ^= 0xFF;
+    std::fs::write(&post_path, &data).unwrap();
+
+    let err = NgramIndexReader::open(dir.path())
+        .err()
+        .expect("AC2: corruption with absent marker must fail open()");
+    assert!(
+        format!("{err}").contains("checksum mismatch"),
+        "AC2: marker-absent must fall through to full CRC32: {err}"
+    );
+}
+
+/// AC6: an uncorrupted index whose marker is truncated / garbage / zero-length
+/// MUST still open Ok (fall through to full CRC32), never erroring because of
+/// the bad derived cache.
+#[test]
+fn ac6_bad_marker_falls_through_to_full_crc() {
+    for bad in [&b""[..], &b"x"[..], &b"truncated-not-52-bytes"[..]] {
+        let dir = tmp_dir();
+        build_marker_index(dir.path());
+        // Overwrite the marker with a malformed payload; index files untouched.
+        std::fs::write(dir.path().join("index.skverify"), bad).unwrap();
+        assert!(
+            NgramIndexReader::open(dir.path()).is_ok(),
+            "AC6: bad marker ({} bytes) must fall through to full CRC and open Ok",
+            bad.len()
+        );
+    }
+}
+
+/// AC5: rebuilding with DIFFERENT content (a) opens successfully reflecting new
+/// content, and (b) the stale marker must NOT cause new bytes to be served
+/// unverified — corrupting the post-rebuild skpost MUST still be caught.
+#[test]
+fn ac5_rebuild_invalidates_stale_marker() {
+    let dir = tmp_dir();
+    // First build: small content.
+    build_marker_index(dir.path());
+    let first_len = std::fs::metadata(dir.path().join("index.skpost"))
+        .unwrap()
+        .len();
+
+    // Rebuild in place with DIFFERENT, larger content.
+    {
+        let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+        builder
+            .add_file(
+                FileId(0),
+                "fn epsilon_zeta_eta() { theta(); iota(); kappa(); lambda(); }",
+                rskim_core::Language::Rust,
+            )
+            .unwrap();
+        builder.build().unwrap();
+    }
+    let second_len = std::fs::metadata(dir.path().join("index.skpost"))
+        .unwrap()
+        .len();
+    assert_ne!(
+        first_len, second_len,
+        "precondition: rebuild must change skpost size so the test is meaningful"
+    );
+
+    // (a) New content opens successfully.
+    assert!(
+        NgramIndexReader::open(dir.path()).is_ok(),
+        "AC5(a): rebuilt index must open Ok reflecting new content"
+    );
+
+    // (b) Corrupt the post-rebuild skpost; the (re-stamped) marker is for the
+    // NEW bytes, so flipping a byte (changing content, bumping mtime via the
+    // write) must be caught by the full CRC32.
+    let post_path = dir.path().join("index.skpost");
+    let mut data = std::fs::read(&post_path).unwrap();
+    data[0] ^= 0xFF;
+    std::fs::write(&post_path, &data).unwrap();
+    let bumped = filetime::FileTime::from_unix_time(32_500_000_000, 0);
+    filetime::set_file_mtime(&post_path, bumped).unwrap();
+
+    let err = NgramIndexReader::open(dir.path())
+        .err()
+        .expect("AC5(b): post-rebuild corruption must fail open()");
+    assert!(
+        format!("{err}").contains("checksum mismatch"),
+        "AC5(b): stale marker must not serve corrupted post-rebuild bytes: {err}"
+    );
+}
+
+/// AC3: same query over a built index returns byte-identical ranked results on
+/// the cold open (marker miss → full CRC) and the marker-fast open (marker hit).
+#[test]
+fn ac3_query_results_identical_cold_vs_fast() {
+    let dir = tmp_dir();
+    build_marker_index(dir.path());
+
+    // Cold open with NO marker (delete it) → full CRC path.
+    std::fs::remove_file(dir.path().join("index.skverify")).unwrap();
+    let reader_cold = NgramIndexReader::open(dir.path()).unwrap();
+    let cold: Vec<(u32, f64)> = reader_cold
+        .search(&SearchQuery::new("gamma_delta"))
+        .unwrap()
+        .iter()
+        .map(|r| (r.file_id.0, r.score))
+        .collect();
+
+    // The cold open re-stamped the marker; a second open now hits the fast path.
+    assert!(
+        dir.path().join("index.skverify").exists(),
+        "cold open must re-stamp the marker"
+    );
+    let reader_fast = NgramIndexReader::open(dir.path()).unwrap();
+    let fast: Vec<(u32, f64)> = reader_fast
+        .search(&SearchQuery::new("gamma_delta"))
+        .unwrap()
+        .iter()
+        .map(|r| (r.file_id.0, r.score))
+        .collect();
+
+    assert_eq!(
+        cold, fast,
+        "AC3: ranked results must be byte-identical between cold and fast opens"
+    );
+}

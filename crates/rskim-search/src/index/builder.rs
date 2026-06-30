@@ -288,10 +288,20 @@ impl LayerBuilder for NgramIndexBuilder {
         let post_path = self.output_dir.join("index.skpost");
         let idx_path = self.output_dir.join("index.skidx");
 
+        // Invalidate any prior validity marker BEFORE writing fresh files
+        // (#376, AD-376-4).  The (len, mtime, checksum) signature already
+        // self-invalidates on rewrite, but unlinking defensively means a
+        // partial or aborted rebuild can never leave a stale marker that would
+        // validate the wrong bytes on the next open.
+        crate::validity::unlink_marker_best_effort(&self.output_dir.join("index.skverify"));
+
         // Atomic writes: .skpost first, .skidx second (commit point).
         atomic_write(&self.output_dir, &post_path, &postings_buf)?;
         atomic_write(&self.output_dir, &idx_path, &skidx_buf)?;
 
+        // Verify-back open re-validates the freshly-written bytes and stamps a
+        // new index.skverify (AD-376-3 / AC8) so the first post-build query
+        // skips the redundant full CRC32.
         let reader = NgramIndexReader::open(&self.output_dir)?;
         Ok(Box::new(reader))
     }
