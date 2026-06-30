@@ -175,6 +175,7 @@ fn test_extract_snippet_stale_mtime_returns_none() {
         lang: "rust".to_string(),
         field_map: encode_field_map(&[]),
         mtime: Some(stale_mtime),
+        size: None,
     };
 
     let result = extract_snippet(&root, "src/mod.rs", &[0..2], Some(&entry));

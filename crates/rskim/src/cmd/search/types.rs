@@ -299,6 +299,12 @@ pub(super) struct WalkEntry {
     ///
     /// `None` when the platform does not expose mtime or the syscall fails.
     pub mtime: Option<u64>,
+    /// File size in bytes captured from the walker's metadata.
+    ///
+    /// `None` when the platform does not expose size or the syscall fails.
+    /// Recorded in the manifest (AD-379-2) so working-tree staleness can compare
+    /// both mtime AND size against the current on-disk file.
+    pub size: Option<u64>,
 }
 
 /// A fully processed file ready for indexing, produced by the streaming producer.
@@ -317,6 +323,8 @@ pub(super) struct ProcessedFile {
     pub sha256: String,
     /// File modification time forwarded from [`WalkEntry`].
     pub mtime: Option<u64>,
+    /// File size in bytes forwarded from [`WalkEntry`] (AD-379-2).
+    pub size: Option<u64>,
     /// Pre-computed or cache-reused field map.
     pub field_map: Vec<(Range<usize>, SearchField)>,
     /// `true` when field_map was reused from the manifest cache (no classify call).

@@ -206,6 +206,44 @@ pub(super) fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     pipeline.run()
 }
 
+/// Build the index, but re-check staleness AFTER acquiring the build lock and
+/// SKIP the pipeline if `still_stale()` returns `false` (AD-379-8).
+///
+/// # Stampede collapse
+///
+/// Several concurrent `skim search` processes that all observe a dirty working
+/// tree will queue on the advisory build lock. Without this re-check each would
+/// rebuild in turn (a thundering herd). Here the FIRST waiter to acquire the
+/// lock rebuilds; every subsequent waiter, upon acquiring the lock, calls
+/// `still_stale()` — which re-runs the cheap staleness check against the
+/// now-refreshed manifest — observes a Current index, and returns `Ok(None)`
+/// WITHOUT running a second pipeline. This collapses N rebuilds into one.
+///
+/// The predicate is evaluated INSIDE the lock (after acquisition, before the
+/// pipeline) so the re-check observes the committed state of any peer that
+/// rebuilt before us. Acquiring the lock here and delegating to `pipeline.run()`
+/// (which does NOT re-acquire) keeps a single lock hold for the whole critical
+/// section — re-entering `build_index` would self-block on the advisory lock.
+///
+/// Returns `Ok(Some(result))` when a build ran, `Ok(None)` when it was skipped
+/// because a peer already refreshed the index.
+pub(super) fn build_index_rechecked(
+    config: &IndexConfig,
+    still_stale: impl FnOnce() -> bool,
+) -> anyhow::Result<Option<IndexResult>> {
+    let pipeline = Pipeline::new(config)?;
+
+    // Single lock hold for the whole critical section (re-check + build).
+    let _lock = super::build_lock::acquire("skim search index", &pipeline.cache_dir)?;
+
+    // Post-lock re-check (AD-379-8): a peer may have rebuilt while we waited.
+    if !still_stale() {
+        return Ok(None);
+    }
+
+    pipeline.run().map(Some)
+}
+
 /// Orchestrates the index build pipeline as discrete, testable stages.
 ///
 /// `run()` implements a bounded-channel streaming design:
@@ -652,6 +690,7 @@ impl<'cfg> Pipeline<'cfg> {
                 lang: pf.lang.as_str().to_string(),
                 field_map: encode_field_map(&pf.field_map),
                 mtime: pf.mtime,
+                size: pf.size,
             });
             // `pf.content` dropped here — memory released immediately.
         }
@@ -794,6 +833,7 @@ fn read_and_classify(
         content,
         sha256: sha,
         mtime: entry.mtime,
+        size: entry.size,
         field_map,
         cache_hit,
         ast_cached,
