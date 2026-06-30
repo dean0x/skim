@@ -10,6 +10,8 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::path::Path;
 
+use rustc_hash::FxHashSet;
+
 use rskim_core::Language;
 
 use super::adapter::AstPostingSource;
@@ -18,7 +20,7 @@ use super::scoring::ScoringCtx;
 use crate::{
     FileId, Result, SearchError,
     ast_index::{
-        AstBigramEntry, AstIndexReader, AstNgramSet, AstTrigramEntry, ast_bigram_idf,
+        AstBigramEntry, AstIndexReader, AstNgramSet, AstPosting, AstTrigramEntry, ast_bigram_idf,
         ast_trigram_idf,
     },
     types::{SearchField, SearchLayer, SearchQuery, SearchResult},
@@ -42,8 +44,11 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
     /// Execute a structural query; returns `(FileId, score)` sorted **ascending
     /// by FileId**, unique, all scores > 0. Wave-4 merge-join contract.
     ///
-    /// OR-union BM25: every file with ≥1 matching n-gram is a candidate.
-    /// `score = Σ idf · (tf_norm / (tf_norm + k1))`.
+    /// AD-374-1: AND-intersect candidate set — a file is a candidate iff it
+    /// appears in every resolved posting list. Single-n-gram patterns reduce to
+    /// the prior union (one list → intersection == that list → no regression).
+    /// Score is still BM25 over the surviving set: `score = Σ idf · (tf_norm /
+    /// (tf_norm + k1))`.
     ///
     /// # Errors
     /// - [`SearchError::InvalidQuery`] for [`AstQuery::SingleNode`] (→ #283).
@@ -60,18 +65,114 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
     /// map to `L` are skipped before insertion into `scores`.  The public
     /// `search_ast` always passes `None` (Wave-4 merge-join contract: results
     /// are UNFILTERED, see AC12).
+    ///
+    /// AD-374-1: all callers use AND-intersect semantics. `run_ngram_set_with_capacity`
+    /// bypasses this function to preserve OR-union semantics for the P3 capacity tests.
     pub(super) fn run_ngram_set(
         &self,
         set: &AstNgramSet,
         lang_filter: Option<Language>,
     ) -> Result<Vec<(FileId, f64)>> {
         let ctx = self.score_ngram_set(set, lang_filter)?;
-        let out = ctx.into_sorted_vec();
+        let mut out = ctx.into_sorted_vec();
+
+        // AD-374-1: AND-intersect post-filter.
+        //
+        // After BM25 accumulation `out` is still OR-union (score > 0 iff ≥1 list
+        // contributed). We additionally require that each surviving file appears in
+        // EVERY resolved posting list.
+        //
+        // Implementation: collect the doc-id set from each list independently, then
+        // intersect with `out`. A file must be in all `n_lists` sets.
+        //
+        // Single-n-gram query (n_lists == 1): the intersection of one set is that
+        // set itself, so no candidate is dropped — byte-identical to the old union.
+        let n_lists = candidate_list_count(set);
+        if n_lists > 1 {
+            let intersection_set = self.build_intersection_set(set, lang_filter)?;
+            out.retain(|(fid, _)| intersection_set.contains(&fid.0));
+        }
+        // n_lists == 0 or 1 → retain all (identity / trivial case).
 
         // B2: unique (FxHashMap), all > 0 (BM25 with C4: count>=1 → tf>0 → score>0),
         // sorted FileId-ASC (Wave-4 contract).
         debug_assert!(out.iter().all(|(_, s)| *s > 0.0), "all scores must be > 0");
         Ok(out)
+    }
+
+    /// Build the doc-id intersection set across all resolved posting lists in `set`.
+    ///
+    /// Returns the set of doc-ids that appear in EVERY posting list (bigrams +
+    /// trigrams). Used by `run_ngram_set` for AND-intersect mode (AD-374-1).
+    ///
+    /// Lang-filter is applied consistently: a file whose lang doesn't match is
+    /// excluded from each individual list's doc-id set, so it cannot be in the
+    /// intersection.
+    fn build_intersection_set(
+        &self,
+        set: &AstNgramSet,
+        lang_filter: Option<Language>,
+    ) -> Result<FxHashSet<u32>> {
+        use crate::index::lang_map::lang_from_id;
+
+        // Collect all posting lists in order (bigrams first, then trigrams) after
+        // dedup (mirrors score_ngram_set's dedup to avoid double-counting the same
+        // list twice in the intersection).
+        let mut bigrams: Vec<&AstBigramEntry> = set.bigrams.iter().collect();
+        bigrams.dedup_by_key(|e| e.ngram.key());
+        let mut trigrams: Vec<&AstTrigramEntry> = set.trigrams.iter().collect();
+        trigrams.dedup_by_key(|e| e.ngram.key());
+
+        // Fetch all posting lists up front to avoid interleaving `self.reader`
+        // borrows with `result` mutation (borrow-checker constraint: the closure
+        // pattern would capture `self` as an immutable borrow AND `result` as a
+        // mutable borrow, conflicting with the `?` call inside the loop).
+        let mut all_lists: Vec<Vec<AstPosting>> =
+            Vec::with_capacity(bigrams.len() + trigrams.len());
+        for entry in &bigrams {
+            all_lists.push(self.reader.lookup_bigram(entry.ngram)?);
+        }
+        for entry in &trigrams {
+            all_lists.push(self.reader.lookup_trigram(entry.ngram)?);
+        }
+
+        // Seed with None meaning "not yet seeded"; after the first list `result` is
+        // the first list's doc-id set; subsequent lists narrow it further.
+        let mut result: Option<FxHashSet<u32>> = None;
+
+        for postings in all_lists {
+            // Collect doc-ids from this list (respecting lang_filter).
+            let list_set: FxHashSet<u32> = postings
+                .iter()
+                .filter(|p| {
+                    // Apply the same lang filter as score_postings for consistency
+                    // (mirrors ScoringCtx::score_postings P4 #286 lang-filter logic).
+                    if let Some(req_lang) = lang_filter {
+                        // file_lang_and_node_count may fail (corrupt index); treat
+                        // failures as lang mismatch (conservative: exclude from
+                        // intersection rather than panic or unwrap).
+                        if let Ok((lang_id, _)) = self.reader.file_lang_and_node_count(p.doc_id) {
+                            lang_from_id(lang_id) == Some(req_lang)
+                        } else {
+                            false
+                        }
+                    } else {
+                        true
+                    }
+                })
+                .map(|p| p.doc_id)
+                .collect();
+
+            result = Some(match result.take() {
+                None => list_set,
+                Some(prev) => prev
+                    .into_iter()
+                    .filter(|id| list_set.contains(id))
+                    .collect(),
+            });
+        }
+
+        Ok(result.unwrap_or_default())
     }
 
     /// Build and populate a [`ScoringCtx`] for `set` + `lang_filter`.
@@ -188,6 +289,8 @@ impl SearchLayer for AstQueryEngine<AstIndexReader> {
         let ast_q = parse_ast_query(raw.trim())?;
         let ngram_set = ast_query_to_ngram_set(&ast_q)?;
 
+        // AD-374-1: AND-intersect — both entry points agree on "what constitutes an
+        // AST match" (AC13: all three entry points return the identical FileId set).
         let mut hits = self.run_ngram_set(ngram_set.as_ref(), query.lang)?;
         // hits is FileId-ASC from run_ngram_set; lang filter already applied.
 
@@ -237,10 +340,27 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
         set: &AstNgramSet,
         lang_filter: Option<Language>,
     ) -> Result<(Vec<(FileId, f64)>, usize)> {
+        // Preserve legacy OR-union semantics for the P3 capacity tests: the
+        // capacity assertions in AC6/AC7 count the OR-union pre-filter set, not the
+        // AND-intersect survivor set, and we must not break those existing tests.
         let ctx = self.score_ngram_set(set, lang_filter)?;
         let cap = ctx.scores_capacity();
         Ok((ctx.into_sorted_vec(), cap))
     }
+}
+
+/// Count the total number of distinct posting lists that `set` resolves to,
+/// after dedup (same dedup as `score_ngram_set`).
+///
+/// Used by `run_ngram_set` to decide whether AND-intersection is meaningful:
+/// - 0 or 1 list: intersection == that list (or empty), so no filter is needed.
+/// - ≥2 lists: AND-intersect may remove candidates not in every list.
+fn candidate_list_count(set: &AstNgramSet) -> usize {
+    let mut bigrams: Vec<&AstBigramEntry> = set.bigrams.iter().collect();
+    bigrams.dedup_by_key(|e| e.ngram.key());
+    let mut trigrams: Vec<&AstTrigramEntry> = set.trigrams.iter().collect();
+    trigrams.dedup_by_key(|e| e.ngram.key());
+    bigrams.len() + trigrams.len()
 }
 
 /// Resolve an [`AstQuery`] to its [`AstNgramSet`], returning a borrowed or

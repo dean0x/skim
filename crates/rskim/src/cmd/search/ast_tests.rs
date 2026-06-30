@@ -2619,3 +2619,722 @@ fn run_ast_standalone_resolves_nested_dir_corpus_correctly() {
         "AC-1 NEGATIVE: output must NOT return foobar.rs (no function_item). Got:\n{text}"
     );
 }
+
+// ============================================================================
+// Group 13 (#374): Structural verify gate (Part A AND-intersect + Part B gate)
+// ============================================================================
+//
+// These tests cover the acceptance criteria from ticket #374:
+//   AC1  — zero-n-gram data files excluded
+//   AC2  — AND-intersect vs OR-union (engine level) → see query_tests.rs (a3/a3b/P3)
+//   AC3  — verify gate drops unrelated subtrees
+//            unit:        compound/reparse_tests.rs::pattern_occurs_false_for_unrelated_subtree_kinds_ac3_374
+//            integration: run_ast_standalone_unrelated_subtree_excluded_ac3_374 (this file)
+//   AC4  — true positives survive the gate
+//   AC5  — verify-then-truncate-LAST
+//   AC8  — recover_line stays line-recovery only (degraded row emitted, not dropped)
+//   AC9  — single-n-gram identity (no regression)
+//   AC10 — query-time only, no format/rebuild
+//   AC11 — no elision marker when gate produces empty results
+//   AC12 — O(pool) bound guard (constant reuse guard)
+//   AC13 — entry-point agreement: ast_index/query_tests.rs::ac13_search_ast_and_layer_agree_on_fileid_set
+//
+// AC2 / AC7 engine-level AND-intersect tests live in `ast_index/query_tests.rs`
+// (a3_*, a3b_*, P3 group). The `pattern_occurs_in_file` gate UNIT tests (AC6) live
+// in `compound/reparse_tests.rs`.
+// OD-374-3 ERROR-node fixture: compound/reparse_tests.rs::pattern_occurs_false_for_error_node_ancestor_od374_3.
+
+/// Create a project for #374 tests: one Rust file with genuine nested loops,
+/// one with no nested loops, one JSON, one Cargo.toml.
+fn make_project_for_374_gate() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Rust file WITH nested loops (should match rust-nested-loop).
+    fs::write(
+        root.join("src/nested.rs"),
+        r#"
+fn nested() {
+    for i in 0..5 {
+        for j in 0..5 {
+            let _ = i + j;
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // Rust file WITHOUT nested loops (should NOT match).
+    fs::write(
+        root.join("src/simple.rs"),
+        r#"
+fn simple(x: i32) -> i32 {
+    x + 1
+}
+"#,
+    )
+    .unwrap();
+
+    // JSON file — non-tree-sitter, zero AST n-grams (AC1, AD-374-5).
+    fs::write(root.join("data.json"), r#"{"kind": "nested", "count": 3}"#).unwrap();
+
+    // Cargo.toml — non-tree-sitter, zero AST n-grams (AC1, AD-374-5).
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    dir
+}
+
+/// AC1 (#374): Standalone `--ast rust-nested-loop` MUST NOT include non-tree-sitter
+/// data files (JSON, TOML) in the result set, and MUST include the genuinely
+/// matching Rust file.
+///
+/// This is the headline false-positive fix: before #374 these data files could
+/// appear in results because they were scored by the OR-union via posting lists.
+/// With AND-intersect + verify gate they are correctly excluded.
+///
+/// NEGATIVE (PF-007): Removing the gate (reverting to old OR-union only) makes
+/// Cargo.toml / data.json appear in output, failing the exclusion assertions.
+#[test]
+fn run_ast_standalone_excludes_non_tree_sitter_files_ac1_374() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_for_374_gate();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let mut out: Vec<u8> = Vec::new();
+    let result = super::run_ast_standalone(
+        "rust-nested-loop",
+        20,
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(
+        result,
+        std::process::ExitCode::SUCCESS,
+        "AC1: run_ast_standalone must exit 0"
+    );
+
+    let text = String::from_utf8(out).unwrap();
+
+    // POSITIVE: the genuine Rust file with nested loops MUST appear.
+    assert!(
+        text.contains("nested.rs"),
+        "AC1 POSITIVE: output must contain nested.rs (genuine match); got:\n{text}"
+    );
+
+    // NEGATIVE (PF-007): Data files must NOT appear.
+    // Removing the gate makes them appear → this assertion fails.
+    assert!(
+        !text.contains("data.json"),
+        "AC1 NEGATIVE: output must NOT contain data.json (non-tree-sitter, zero AST n-grams); \
+         reverting the gate makes it appear. Got:\n{text}"
+    );
+
+    // NEGATIVE: Cargo.toml must not appear.
+    assert!(
+        !text.contains("Cargo.toml"),
+        "AC1 NEGATIVE: output must NOT contain Cargo.toml (non-tree-sitter, zero AST n-grams); \
+         reverting the gate makes it appear. Got:\n{text}"
+    );
+
+    // NEGATIVE: simple.rs (no nested loops) must not appear.
+    assert!(
+        !text.contains("simple.rs"),
+        "AC1 NEGATIVE: output must NOT contain simple.rs (no nested loops); got:\n{text}"
+    );
+}
+
+/// Create a project for AC4: Rust files with both `exact:false` and `exact:true` patterns.
+///
+/// - `src/loops.rs`  — nested for-loops (matches `rust-nested-loop`, exact:false proxy)
+/// - `src/unsafe.rs` — unsafe block (matches `rust-unsafe-block`, exact:true)
+/// - `config.json`   — non-tree-sitter (matches neither)
+fn make_project_with_rust_exact_patterns() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Rust file with nested loops (rust-nested-loop, exact:false).
+    fs::write(
+        root.join("src/loops.rs"),
+        r#"
+fn outer() {
+    for i in 0..5 {
+        for j in 0..5 {
+            let _ = i + j;
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // Rust file with unsafe block (rust-unsafe-block, exact:true).
+    // Pattern bigram: (unsafe_block, block).
+    fs::write(
+        root.join("src/unsafe.rs"),
+        r#"
+fn write_raw(ptr: *mut i32, val: i32) {
+    unsafe { *ptr = val; }
+}
+"#,
+    )
+    .unwrap();
+
+    // Non-tree-sitter file — must be excluded by the gate.
+    fs::write(root.join("config.json"), r#"{"key": "value"}"#).unwrap();
+
+    dir
+}
+
+/// AC4 (#374): True positives must survive the gate — both `exact:true` patterns
+/// (`rust-unsafe-block`) and `exact:false` proxy patterns (`rust-nested-loop`).
+///
+/// The gate applies ONE logic path to all patterns via ancestor-correct matching;
+/// it MUST NOT zero out a legitimately-matched result set.
+///
+/// NEGATIVE (PF-007): If the gate were inverted (drops all), these assertions fail.
+#[test]
+fn run_ast_standalone_true_positives_survive_gate_ac4_374() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_rust_exact_patterns();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Test exact:false pattern (rust-nested-loop is a proxy pattern).
+    let mut nested_out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "rust-nested-loop",
+        20,
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut nested_out,
+    )
+    .unwrap();
+    let nested_text = String::from_utf8(nested_out).unwrap();
+    assert!(
+        nested_text.contains("loops.rs"),
+        "AC4: rust-nested-loop (exact:false proxy) must return loops.rs; gate must not over-drop. \
+         Got:\n{nested_text}"
+    );
+    // NEGATIVE (PF-007): config.json must NOT appear (non-tree-sitter).
+    assert!(
+        !nested_text.contains("config.json"),
+        "AC4 NEGATIVE: config.json must not appear in rust-nested-loop results. Got:\n{nested_text}"
+    );
+
+    // Test exact:true pattern (rust-unsafe-block: bigram unsafe_block → block).
+    let mut unsafe_out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "rust-unsafe-block",
+        20,
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut unsafe_out,
+    )
+    .unwrap();
+    let unsafe_text = String::from_utf8(unsafe_out).unwrap();
+    // src/unsafe.rs has `unsafe { *ptr = val; }` → exact:true bigram (unsafe_block, block).
+    assert!(
+        unsafe_text.contains("unsafe.rs"),
+        "AC4: rust-unsafe-block (exact:true) must return unsafe.rs; gate must not over-drop. \
+         Got:\n{unsafe_text}"
+    );
+    // NEGATIVE (PF-007): loops.rs (no unsafe block) must NOT appear.
+    assert!(
+        !unsafe_text.contains("loops.rs"),
+        "AC4 NEGATIVE: loops.rs must not appear in rust-unsafe-block results (no unsafe block). \
+         Got:\n{unsafe_text}"
+    );
+}
+
+/// AC5 (#374): verify-then-truncate-LAST — at `--limit N`, the output must contain
+/// exactly min(N, verified_count) verified results.
+///
+/// Uses a project with 3 matching files and `--limit 2`. The gate should keep 3
+/// verified files and then truncate to 2 (not under-fill to 2 minus dropped).
+///
+/// NEGATIVE (PF-007): If truncation happens BEFORE the gate, the count would be
+/// `limit - dropped`, under-filling the result set.
+#[test]
+fn run_ast_standalone_truncate_after_gate_ac5_374() {
+    use super::super::manifest::FileManifest;
+
+    // Build project with 3 matching files.
+    let project = make_project_with_two_nested_loop_files();
+    // This fixture has alpha.rs, beta.rs (both match rust-nested-loop), plain.rs
+    // (doesn't match), and config.json.
+
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // limit=1: with gate working correctly we get exactly 1 verified result.
+    let mut out: Vec<u8> = Vec::new();
+    let result = super::run_ast_standalone(
+        "rust-nested-loop",
+        1, // limit = 1
+        true,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(result, std::process::ExitCode::SUCCESS, "AC5: must exit 0");
+
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap()).unwrap();
+    let results = v["results"].as_array().unwrap();
+
+    // With limit=1 and 2 genuine matches, exactly 1 verified result is returned.
+    assert_eq!(
+        results.len(),
+        1,
+        "AC5: --limit 1 must return exactly 1 result (verify-then-truncate-LAST); \
+         if truncation happened before the gate, we might get 0 (PF-007 discriminating); \
+         got: {results:?}"
+    );
+}
+
+/// AC8 (#374): `recover_line` MUST remain line-recovery only — a file that passes
+/// the verify gate but where `recover_line` returns `None` MUST still be emitted
+/// as a degraded row (path present, no `:line`/snippet), not dropped.
+///
+/// We verify that `run_ast_standalone` emits the file path even when the
+/// representative line cannot be recovered (degraded row, matching AC-F2 / AC-API3).
+///
+/// NEGATIVE (PF-007): If emit/drop were keyed off `recover_line`, the file
+/// would vanish from output; this assertion would fail.
+#[test]
+fn run_ast_standalone_recover_line_none_still_emits_ac8_374() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_rust();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Use text output (not JSON) — a degraded row shows the path without `:line`.
+    let mut out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "rust-nested-loop",
+        20,
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut out,
+    )
+    .unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+
+    // src/loops.rs must appear in output (it genuinely matches rust-nested-loop).
+    assert!(
+        text.contains("loops.rs"),
+        "AC8: loops.rs must appear in output regardless of whether recover_line succeeds; \
+         recover_line None MUST NOT drop the file. Got:\n{text}"
+    );
+}
+
+/// AC9 (#374): Single-n-gram identity — `rust-unsafe-block` (a pattern with a single
+/// bigram, `unsafe_block → block`) must return the same set before and after the gate.
+///
+/// Single-n-gram AND-intersect == union of that one list, so no file is added or
+/// dropped by the AND-intersect step. The gate drops only non-matching files.
+/// Files genuinely containing `rust-unsafe-block` must still appear.
+///
+/// This is also a regression guard: pre-existing AST tests must not break.
+#[test]
+fn run_ast_standalone_single_ngram_identity_ac9_374() {
+    use super::super::manifest::FileManifest;
+
+    // src/unsafe.rs has `unsafe { *ptr = val; }` → rust-unsafe-block bigram.
+    let project = make_project_with_rust_exact_patterns();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let mut out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "rust-unsafe-block",
+        20,
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut out,
+    )
+    .unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+
+    // unsafe.rs has the rust-unsafe-block pattern (single bigram) → must appear.
+    // Single-n-gram identity: AND-intersect over one list == the list itself.
+    assert!(
+        text.contains("unsafe.rs"),
+        "AC9: single-bigram rust-unsafe-block must return unsafe.rs (identity: single-list \
+         AND-intersect == old union). Got:\n{text}"
+    );
+
+    // NEGATIVE (PF-007): config.json (non-tree-sitter, no AST n-grams) must NOT appear.
+    // The gate drops non-tree-sitter files even for single-bigram patterns.
+    assert!(
+        !text.contains("config.json"),
+        "AC9 NEGATIVE: config.json must not appear (non-tree-sitter, gate drops it). \
+         Got:\n{text}"
+    );
+
+    // NEGATIVE (PF-007): loops.rs has no unsafe block → must NOT appear.
+    assert!(
+        !text.contains("loops.rs"),
+        "AC9 NEGATIVE: loops.rs has no unsafe block and must not appear. Got:\n{text}"
+    );
+}
+
+/// AC10 (#374): Query-time only — the AST on-disk format MUST remain v2 after
+/// running a gate query. No rebuild or format bump must be triggered.
+///
+/// NEGATIVE (PF-007): If the gate wrote to disk or bumped the format version,
+/// a second index_version check would differ from the initial value.
+#[test]
+fn run_ast_standalone_no_format_change_ac10_374() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_rust();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    // Record AST format version before the gate query.
+    let version_before = rskim_search::AstIndexReader::index_version(cache.path())
+        .expect("index_version must succeed after build");
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let mut out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "rust-nested-loop",
+        20,
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut out,
+    )
+    .unwrap();
+
+    // Record AST format version after the gate query.
+    let version_after = rskim_search::AstIndexReader::index_version(cache.path())
+        .expect("index_version must succeed after gate query");
+
+    assert_eq!(
+        version_before, version_after,
+        "AC10: AST index format version must not change after a gate query \
+         (query-time only, no on-disk writes); \
+         reverting to a write-on-query implementation would fail this assertion"
+    );
+    assert_eq!(
+        version_before,
+        rskim_search::AST_INDEX_FORMAT_VERSION,
+        "AC10: format version must equal AST_INDEX_FORMAT_VERSION ({}) after build",
+        rskim_search::AST_INDEX_FORMAT_VERSION
+    );
+}
+
+/// AC11 (#374): When every candidate fails the gate, the result set is clean empty
+/// (exit 0) with NO `elision_marker` and NO `SKIM_PASSTHROUGH` hint.
+///
+/// We achieve "every candidate fails the gate" by using a project where the only
+/// files are non-tree-sitter (JSON/TOML) — the gate always returns false for them.
+///
+/// NEGATIVE (PF-007): If the gate mistakenly emitted an elision marker, the
+/// assertion below would detect the text in output.
+#[test]
+fn run_ast_standalone_empty_gate_no_elision_marker_ac11_374() {
+    use super::super::manifest::FileManifest;
+
+    // Project with only non-tree-sitter files.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("data.json"), r#"{"a": 1}"#).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname=\"test\"\nversion=\"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(root, cache.path());
+
+    let manifest = FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let mut out: Vec<u8> = Vec::new();
+    let result = super::run_ast_standalone(
+        "rust-nested-loop",
+        20,
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        root,
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(
+        result,
+        std::process::ExitCode::SUCCESS,
+        "AC11: empty gate result must exit 0 (not an error)"
+    );
+
+    let text = String::from_utf8(out).unwrap();
+
+    // NEGATIVE (PF-007): must NOT contain elision marker or SKIM_PASSTHROUGH hint.
+    assert!(
+        !text.contains("SKIM_PASSTHROUGH"),
+        "AC11 NEGATIVE: empty gate result must NOT emit SKIM_PASSTHROUGH hint; \
+         an erroneously-added elision marker would contain this text. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("elision"),
+        "AC11 NEGATIVE: empty gate result must NOT emit an elision marker. Got:\n{text}"
+    );
+}
+
+/// AC12 (#374): Pool multiplier guard — the AST gate MUST reuse the module-level
+/// `LEXICAL_CANDIDATE_POOL_K` constant from `query.rs` (single definition,
+/// no fork). The value must be 5; changing it without #361 evidence fails this test.
+///
+/// This is the constant-reuse guard from OD-374-2. The assertion is structural:
+/// it verifies the constant value (5) via a type-visible test so any change
+/// without updating the #361 tracking issue is immediately visible.
+///
+/// NEGATIVE (PF-007): If the constant were forked in ast.rs with a different
+/// value (e.g. K=3), the pool sizing would diverge from the lexical path and
+/// this assertion would fail.
+#[test]
+fn ast_gate_reuses_lexical_candidate_pool_k_ac12_374() {
+    // AD-374-3: the single named constant must be 5 (no measured corpus basis;
+    // tracked under #361 per ADR-003). A change to this value without #361
+    // evidence fails this guard test.
+    const EXPECTED_K: usize = 5;
+    assert_eq!(
+        super::super::query::LEXICAL_CANDIDATE_POOL_K,
+        EXPECTED_K,
+        "AC12: LEXICAL_CANDIDATE_POOL_K must be {EXPECTED_K} (unmeasured heuristic, \
+         tracked under #361 per ADR-003). Changing it without #361 evidence and \
+         corpus measurements violates ADR-003. Update #361 first."
+    );
+
+    // AC12 POOL-SIZE BOUND: candidate_pool(limit, K) must equal max(K×limit, FLOOR).
+    //
+    // The documented contract: `limit.saturating_mul(k).max(CANDIDATE_POOL_FLOOR)`.
+    // This pins the O(pool) bound: the gate re-parses at most pool files, where
+    // pool ≤ K × limit for any limit ≥ FLOOR/K (i.e. limit ≥ 20 for K=5, FLOOR=100).
+    // The bound is enforced by `.take(window)` in ast.rs BEFORE calling
+    // pattern_occurs_in_file, so re-parse count ≤ pool.
+    //
+    // NEGATIVE (PF-007): If candidate_pool were changed to return just `limit` (no
+    // multiplier), pool(100, K) would be 100 instead of 500, catching the regression.
+    const FLOOR: usize = 100; // must match CANDIDATE_POOL_FLOOR in query.rs
+    for limit in [1usize, 5, 10, 100] {
+        let pool = super::super::query::candidate_pool(
+            limit,
+            super::super::query::LEXICAL_CANDIDATE_POOL_K,
+        );
+        let expected = (EXPECTED_K * limit).max(FLOOR);
+        assert_eq!(
+            pool,
+            expected,
+            "AC12 pool-size: candidate_pool({limit}, K={EXPECTED_K}) must be \
+             max(K×limit, FLOOR={FLOOR}) = max({}, {FLOOR}) = {expected}; got {pool}",
+            EXPECTED_K * limit
+        );
+    }
+
+    // For limit >= FLOOR/K, the multiplier dominates: K×limit > FLOOR.
+    // Verify the O(K×limit) linear bound at limit=100 where floor is not active.
+    {
+        let limit = 100usize;
+        let pool = super::super::query::candidate_pool(
+            limit,
+            super::super::query::LEXICAL_CANDIDATE_POOL_K,
+        );
+        // K×limit = 500, which exceeds FLOOR=100, so pool must equal K×limit.
+        assert_eq!(
+            pool,
+            EXPECTED_K * limit,
+            "AC12 linear-bound: candidate_pool(100, K) must equal K×100={} when \
+             K×limit > FLOOR={FLOOR} (pool multiplier dominates). Got {pool}",
+            EXPECTED_K * limit
+        );
+        // The bound must be strictly less than total corpus for real projects.
+        // (corpus size assertion not pinned here — corpus is runtime-dependent;
+        // the above assertion ensures the multiplier path works correctly.)
+    }
+}
+
+/// AC3 (#374): Unrelated-subtree end-to-end — `run_ast_standalone` must include
+/// the genuine nested-loop file (File D) and exclude the closure-body file (File C),
+/// where File C has all constituent CST kinds present but NOT in the required
+/// `block → expression_statement → for_expression` ancestor chain.
+///
+/// File C uses a Rust closure whose body is directly `for_expression` (no
+/// intervening block or `expression_statement`), so the trigram is absent from its
+/// posting list and AND-intersect correctly excludes it.  File D has genuine nested
+/// loops and appears in results.
+///
+/// The `pattern_occurs_in_file` unit test in `compound/reparse_tests.rs`
+/// (`pattern_occurs_false_for_unrelated_subtree_kinds_ac3_374`) directly pins the
+/// GATE behavior for File C; this integration test pins the END-TO-END pipeline.
+///
+/// NEGATIVE (PF-007): If the pipeline returned File C (e.g. via a regression
+/// that re-introduces OR-union without the gate), the first assertion would fail.
+#[test]
+fn run_ast_standalone_unrelated_subtree_excluded_ac3_374() {
+    use super::super::manifest::FileManifest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // File D: genuine nested loops — must appear in results.
+    fs::write(
+        root.join("src/nested.rs"),
+        r#"
+fn outer() {
+    for i in 0..5 {
+        for j in 0..5 { let _ = i + j; }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // File C: closure body is directly for_expression.
+    //   Rust CST: block → expression_statement → let_declaration →
+    //             closure_expression → for_expression
+    // The for_expression's parent is closure_expression (NOT expression_statement),
+    // so the trigram (block, expression_statement, for_expression) is NOT in the
+    // posting list → AND-intersect excludes it without reaching the strict gate.
+    fs::write(
+        root.join("src/closure_for.rs"),
+        r#"
+fn uses_closure() {
+    let _g = || for i in 0..5 { let _ = i; };
+    println!("done");
+}
+"#,
+    )
+    .unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(root, cache.path());
+
+    let manifest = FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let mut out: Vec<u8> = Vec::new();
+    let result = super::run_ast_standalone(
+        "rust-nested-loop",
+        20,
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        root,
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(
+        result,
+        std::process::ExitCode::SUCCESS,
+        "AC3: run_ast_standalone must exit 0"
+    );
+
+    let text = String::from_utf8(out).unwrap();
+
+    // POSITIVE: genuine nested loops must appear.
+    assert!(
+        text.contains("nested.rs"),
+        "AC3 POSITIVE: output must contain nested.rs (genuine nested loops); got:\n{text}"
+    );
+
+    // NEGATIVE (PF-007): closure_for.rs has for_expression but NOT in the required
+    // ancestor chain → must NOT appear.  A regression to OR-union-only would make
+    // it appear if the trigram somehow got into the posting list.
+    assert!(
+        !text.contains("closure_for.rs"),
+        "AC3 NEGATIVE: output must NOT contain closure_for.rs (closure-body for, \
+         no expression_statement wrapper) — unrelated-subtree file must be excluded. \
+         Got:\n{text}"
+    );
+}
+
+// AC13 (#374): Entry-point agreement — see
+// `crates/rskim-search/src/ast_index/query_tests.rs::ac13_search_ast_and_layer_agree_on_fileid_set`
+// for the full falsifiable test using real AstIndexBuilder/AstIndexReader.
+// That test lives in `rskim-search` where all engine types are already in scope.

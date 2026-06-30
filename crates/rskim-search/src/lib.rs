@@ -101,7 +101,7 @@ pub use compound::{
 // #201: enriched result row type, formatters, and line-span re-parse.
 pub use compound::{
     AstResult, MAX_REPARSE_FILE_BYTES, TemporalAnnotation, format_ast_json, format_ast_text,
-    recover_line,
+    pattern_occurs_in_file, recover_line,
 };
 pub use index::{NgramIndexBuilder, NgramIndexReader};
 pub use lexical::{
