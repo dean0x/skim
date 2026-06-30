@@ -14,6 +14,13 @@ path = "src/main.rs"
 
 [dependencies]
 rskim-core = { version = "2.10.0", path = "../rskim-core" }
+# rskim-compress: hosts compress_log + BlockRouter (R1/R2 per #304).
+# AC26: rskim-compress is publish=false and must not add regex to rskim-core.
+rskim-compress = { path = "../rskim-compress" }
+# rskim-proxy: CLI proxy subcommand host. rskim-contract: BlockRouterStage adapter
+# uses Outcome / DecisionRecord / DecisionSink types (#304 Phase 4a).
+rskim-contract = { path = "../rskim-contract" }
+rskim-proxy = { path = "../rskim-proxy" }
 rskim-search = { path = "../rskim-search" }
 # Delegates token counting to the multi-provider library (AC13, AC15).
 # Do NOT enable "net-anthropic" here — default build must remain HTTP-free (AC9).

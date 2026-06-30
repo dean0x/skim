@@ -69,6 +69,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "pnpm",        // package manager
     "prettier",    // linter
     "printenv",    // file operations
+    "proxy",       // meta: skim Layer-3 HTTP reverse proxy (#303)
     "ps",          // file operations
     "psql",        // database
     "pytest",      // test runner
@@ -121,6 +122,7 @@ pub(crate) const META_SUBCOMMANDS: &[&str] = &[
     "init",
     "learn",
     "log",
+    "proxy", // meta: skim Layer-3 HTTP reverse proxy (server, not a tool to intercept)
     "rewrite",
     "search",
     "stats",

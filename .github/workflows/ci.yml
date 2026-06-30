@@ -176,6 +176,18 @@ jobs:
           fi
           echo "PASS: no HTTP/TLS in skim binary default build"
 
+          echo "=== rskim-compress transitive dep gate (AC26/AC9) ==="
+          # AC26: rskim-compress MUST NOT pull in hyper/tokio/axum/rskim-proxy directly
+          # or transitively. The in-crate test (ac26_rskim_compress_no_direct_hyper_tokio_axum)
+          # checks only direct [dependencies]; this step closes the transitive gap.
+          cargo tree -p rskim-compress -e normal 2>&1 | tee /tmp/rskim-compress-tree.txt
+          if grep -qE 'tokio|hyper|axum|rskim-proxy' /tmp/rskim-compress-tree.txt; then
+            echo "FAIL: forbidden transitive dependency (tokio/hyper/axum/rskim-proxy) found in rskim-compress"
+            grep -E 'tokio|hyper|axum|rskim-proxy' /tmp/rskim-compress-tree.txt || true
+            exit 1
+          fi
+          echo "PASS: no tokio/hyper/axum/rskim-proxy in rskim-compress (AC26/AC9)"
+
   fuzz-smoke:
     name: Fuzz Smoke (AC15, rskim-llm)
     runs-on: ubuntu-latest
@@ -243,3 +255,74 @@ jobs:
         run: |
           ./target/release/skim --version
           echo "fn main() {}" | ./target/release/skim - --language=rust
+
+  # Scoped Windows proxy integration job (#303 AC17).
+  #
+  # This job builds -p rskim-proxy and runs its integration suite on
+  # windows-latest to validate:
+  #   - The chosen default port (41322) is not in a Windows reserved/excluded
+  #     range (AD-PXY-03 / D8 — explicitly not 8787, which is PRISM's port and
+  #     Windows-reserved on some configs).
+  #   - SSE passthrough, chunked passthrough, and >100KB body forwarding work
+  #     on Windows (confirmed via the conformance_and_determinism integration
+  #     tests, which drive real TCP through the proxy).
+  #
+  # Cross-OS matrix (macos-latest + general Windows crate matrix) is owned by
+  # #323 (see ci.yml:49-50).  This job is a NARROWLY SCOPED proxy-only addition
+  # that cross-links to #323 to avoid duplication.  #323 will subsume this job
+  # when the general matrix lands.
+  #
+  # Port 41322 was chosen in the range 41000–49000 (Windows-bindable, not in
+  # the Windows Dynamic/Ephemeral range 49152–65535, not in IANA registered
+  # ranges).  Verified via netsh interface ipv4 show excludedportrange protocol=tcp
+  # on a standard Windows Server 2022 image.
+  proxy-windows:
+    name: Proxy Windows Integration (AC17, #303)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-proxy-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-proxy-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-proxy-${{ hashFiles('**/Cargo.lock') }}
+
+      # AC17: build rskim-proxy only (scoped per PF-010 — no --workspace in agents).
+      # The `testing` feature is required for integration tests (run_server_async helper).
+      - name: Build rskim-proxy (Windows)
+        run: cargo build -p rskim-proxy --features testing
+
+      # AC17: run the proxy integration suite.
+      # Includes conformance_and_determinism tests which exercise:
+      # - TCP bind on port 41322 (default) or ephemeral (proxy handle).
+      # - SSE/chunked passthrough via the fake upstream echo server.
+      # - >100KB body forwarding (bench body pattern in integration tests).
+      # - AC19b on-the-wire byte-identity over ALL_CORPUS.
+      # - AC11 statelessness/determinism (16 concurrent + restart).
+      #
+      # Uses --all-targets (includes benches compiled as tests) and scoped to -p rskim-proxy (PF-010).
+      # Cross-link #323: the general Windows matrix (rskim-core, rskim-llm, etc.)
+      # is owned by #323 and will supersede this scoped job when it lands.
+      - name: Clippy rskim-proxy (Windows, PF-009)
+        run: cargo clippy -p rskim-proxy --all-targets --features testing -- -D warnings
+
+      - name: Test rskim-proxy integration suite (Windows)
+        run: cargo test -p rskim-proxy --all-targets --features testing
+        env:
+          RUST_TEST_THREADS: "4"
