@@ -2684,3 +2684,103 @@ fn test_manifest_v2_triggers_auto_rebuild_to_v3_on_next_query() {
          If this fails, the constant was not bumped."
     );
 }
+
+// ============================================================================
+// #381 — index-location resolver: canonicalize-fallback normalization
+// (AC8 determinism, AC9 non-existent-root equivalence, AC13 pure-lexical algo)
+// ============================================================================
+
+use std::path::PathBuf;
+
+/// AC8: `resolve_search_cache_dir` is deterministic — the same input yields the
+/// same path across repeated calls.
+#[test]
+fn test_ac8_resolve_search_cache_dir_is_deterministic() {
+    let root = Path::new("/no/such/deterministic/root");
+    let a = super::resolve_search_cache_dir(root).unwrap();
+    let b = super::resolve_search_cache_dir(root).unwrap();
+    assert_eq!(
+        a, b,
+        "AC8: resolve_search_cache_dir must be deterministic for a fixed input"
+    );
+}
+
+/// AC8: for an EXISTING on-disk root the resolved path equals
+/// `base.join("search").join(sha256_hex(canonical.to_string_lossy())[..16])`,
+/// where `canonical = root.canonicalize()`.
+#[test]
+fn test_ac8_existing_root_uses_canonicalized_sha256() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    let resolved = super::resolve_search_cache_dir(root).unwrap();
+
+    // Recompute the expected tail independently from the canonicalized root,
+    // reusing the same hashing helper that resolve_search_cache_dir uses.
+    let canonical = root.canonicalize().unwrap();
+    let expected_hash = super::project_root_hash(&canonical);
+
+    // The final two components must be `search/<hash>`.
+    let tail: PathBuf = {
+        let comps: Vec<_> = resolved.iter().collect();
+        comps[comps.len().saturating_sub(2)..].iter().collect()
+    };
+    assert_eq!(
+        tail,
+        PathBuf::from("search").join(&expected_hash),
+        "AC8: existing-root path tail must be search/<sha256(canonical)[..16]>"
+    );
+}
+
+/// AC9: for a NON-existent root, trailing-slash and `.`-segment spellings map to
+/// the SAME cache dir (pure-lexical fallback; no filesystem I/O for a missing
+/// root since canonicalize fails and we normalize lexically).
+#[test]
+fn test_ac9_nonexistent_root_spellings_collapse() {
+    let plain = super::resolve_search_cache_dir(Path::new("/no/such/root")).unwrap();
+    let trailing = super::resolve_search_cache_dir(Path::new("/no/such/root/")).unwrap();
+    let dotseg = super::resolve_search_cache_dir(Path::new("/no/such/./root")).unwrap();
+
+    assert_eq!(
+        plain, trailing,
+        "AC9: trailing-slash spelling of a non-existent root must collapse to the same dir"
+    );
+    assert_eq!(
+        plain, dotseg,
+        "AC9: dot-segment spelling of a non-existent root must collapse to the same dir"
+    );
+}
+
+/// AC13: the pure-lexical helper collapses `.` segments and trailing separators
+/// for relative non-existent inputs (collides on ANY OS).
+#[test]
+fn test_ac13_canonical_or_normalized_collapses_dot_and_trailing() {
+    // These relative paths do not exist on disk, so canonicalize() fails and the
+    // pure-lexical fallback runs.
+    assert_eq!(
+        super::canonical_or_normalized(Path::new("./skim_381_foo")),
+        super::canonical_or_normalized(Path::new("skim_381_foo")),
+        "AC13: leading ./ must normalize away"
+    );
+    assert_eq!(
+        super::canonical_or_normalized(Path::new("skim_381_foo/")),
+        super::canonical_or_normalized(Path::new("skim_381_foo")),
+        "AC13: trailing separator must normalize away"
+    );
+    assert_eq!(
+        super::canonical_or_normalized(Path::new("skim_381_foo/./skim_381_bar")),
+        super::canonical_or_normalized(Path::new("skim_381_foo/skim_381_bar")),
+        "AC13: interior /./ must normalize away"
+    );
+}
+
+/// AC13 (NEGATIVE bound): `..` MUST NOT be resolved — divergent `..` spellings of
+/// a non-existent root stay distinct.
+#[test]
+fn test_ac13_parentdir_is_not_resolved() {
+    assert_ne!(
+        super::canonical_or_normalized(Path::new("skim_381_foo/../skim_381_bar")),
+        super::canonical_or_normalized(Path::new("skim_381_bar")),
+        "AC13 NEGATIVE: `..` must be preserved verbatim, not resolved"
+    );
+}

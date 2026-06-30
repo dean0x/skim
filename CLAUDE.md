@@ -15,7 +15,7 @@ User-facing install/usage lives in `README.md`; release mechanics in `CHANGELOG.
 Cargo workspace, 8 crates:
 - `rskim-core` — pure transform library (parsing, modes; no I/O side effects)
 - `rskim` — CLI binary (`skim`): caching, analytics, command wrappers
-- `rskim-search` — code-search index (lexical n-gram, temporal, AST structural), stored in `<root>/.skim/search.db`
+- `rskim-search` — code-search index (lexical n-gram, temporal, AST structural). All artifacts live under the OS cache dir, NOT the project root: base = `$SKIM_CACHE_DIR` if set, else the platform cache dir (`~/Library/Caches/skim` on macOS, `~/.cache/skim` on Linux), with the per-root subpath `search/<sha256(canonical_root)[..16]>/`. That dir holds the SQLite temporal DB (`temporal.db`) plus the lexical/AST index artifacts (`index.skidx`, `index.skpost`, `index.skfiles`, `ast_index.*`)
 - `rskim-research` — offline tooling that generates both AST structural weight tables
   AND the lexical trigram IDF weight table (see codegen notes below)
 - `rskim-bench` — benchmarks
@@ -45,7 +45,7 @@ Streaming output (stdout, zero-copy via &str slices where possible)
 
 **Non-obvious behavior (gotchas):**
 - **Analytics:** token savings persist to `~/.cache/skim/analytics.db` (SQLite/WAL; default location — relocates with `SKIM_CACHE_DIR`, see Environment Variables), recorded fire-and-forget on background threads. `--clear-cache` clears only the parser cache, NOT `analytics.db` — use `skim stats --clear` for that. The `AnalyticsStore` trait + `MockStore` make the stats dashboard testable without a real DB.
-- **Search DB:** `rskim-search` stores hotspot/risk/co-change data in `<root>/.skim/search.db`. Migrations are forward-only via `PRAGMA user_version`; a DB written by a newer version errors rather than corrupting data.
+- **Search DB:** `rskim-search` stores hotspot/risk/co-change data in the SQLite file `temporal.db`, located in the per-root search cache dir (`<cache_base>/search/<sha256(canonical_root)[..16]>/` — see the `rskim-search` crate note above for `<cache_base>`), NOT under the project root. Migrations on `temporal.db` are forward-only via `PRAGMA user_version`; a DB written by a newer version errors rather than corrupting data. (The only `.skim`-named artifact in the search path is the advisory build lock `.skim-build.lock`, which also lives inside that cache dir — never in the project root.)
 - **Lexical n-gram index:** `index.skidx` / `index.skpost` is format v4 (trigram, u32 key from #355 Part B + delta+varint variable-length posting codec from #358 Item 2). This is DISTINCT from the AST structural index. Both v2 (bigram, u16 key) and v3 (trigram, u32 key, fixed 9-byte postings) lexical indexes trigger an automatic rebuild on the next query via `check_staleness` — no manual `--rebuild` needed for either upgrade. Short queries (< 3 bytes, e.g. `fn`, `if`) cannot produce trigrams and fall back to an all-files score-0 candidate set, which is filtered down to matching files by the Part A substring-verify gate (AD-355-7); this is correct behavior, not a bug. AD-372-4: `short_query_fallback` returns the **full** filtered candidate set with NO internal `.skip/.take` — offset+limit are applied by the caller AFTER verification (the only truncation gate).
 - **AST index:** the structural n-gram index (`ast_index.skidx` / `.skpost`) is format v2 — v1 files are rejected with "please rebuild" (`skim search --rebuild`). Synthetic n-gram markers (IDs ≥ 64900) resolve to `None` in `vocab_resolve()`, keeping them isolated from real vocabulary.
 

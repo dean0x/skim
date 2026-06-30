@@ -585,12 +585,27 @@ fn run_update(
 fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode> {
     let (root, cache_dir) = resolve_root_and_cache(root_override)?;
 
+    // AD-381-1: surface the resolved search cache directory so the (otherwise
+    // hidden) on-disk location is discoverable from `--stats` alone. Computed
+    // once here and reused by both the no-index early-return and the populated
+    // branch below, in both text and JSON modes.
+    let cache_dir_display = cache_dir.display().to_string();
+
     let index_path = cache_dir.join("index.skidx");
     if !index_path.exists() {
         if json {
-            println!("{{\"error\": \"no index found\"}}");
+            // AC7: single parseable object retaining `error`, plus `cache_dir`
+            // (the "where would it go?" path). Exit FAILURE is unchanged.
+            let no_index = serde_json::json!({
+                "error": "no index found",
+                "cache_dir": cache_dir_display,
+            });
+            println!("{}", serde_json::to_string(&no_index)?);
         } else {
+            // AC5: print the resolved cache-dir path even with no index, in
+            // addition to the existing guidance. Exit FAILURE is unchanged.
             eprintln!("skim search: no index found — run `skim search --build` first");
+            eprintln!("  cache dir     : {cache_dir_display}");
         }
         return Ok(ExitCode::FAILURE);
     }
@@ -607,6 +622,7 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
 
     let mut out = BufWriter::new(std::io::stdout());
     if json {
+        // AC6: additive `cache_dir` key; all pre-existing keys retained unchanged.
         let extended = serde_json::json!({
             "file_count": stats.file_count,
             "total_ngrams": stats.total_ngrams,
@@ -614,6 +630,7 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
             "last_updated": stats.last_updated,
             "git_head": git_head,
             "staleness": staleness_status.to_string(),
+            "cache_dir": cache_dir_display,
         });
         writeln!(out, "{}", serde_json::to_string_pretty(&extended)?)?;
     } else {
@@ -630,6 +647,8 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
             git_head.as_deref().unwrap_or("(none)")
         )?;
         writeln!(out, "  staleness     : {staleness_status}")?;
+        // AC4: resolved cache dir, in addition to the lines above.
+        writeln!(out, "  cache dir     : {cache_dir_display}")?;
     }
     out.flush()?;
     Ok(ExitCode::SUCCESS)
