@@ -933,16 +933,70 @@ fn derive_ast_entry(
 ///
 /// Path: `{base_cache}/search/{sha256(canonical_root)[..16]}/`
 ///
-/// The base cache dir is resolved via `SKIM_CACHE_DIR` (if set) or
-/// `~/.cache/skim/`.
+/// The base cache dir is resolved via `SKIM_CACHE_DIR` (if set) or the platform
+/// cache dir (`~/Library/Caches/skim` on macOS, `~/.cache/skim` on Linux).
+///
+/// For an existing on-disk root the path component is the truncated SHA-256 of
+/// `root.canonicalize()`. For a NON-existent root (canonicalize fails) the path
+/// is hashed from a pure-lexical normalization (see [`canonical_or_normalized`])
+/// so that trailing-slash / `.`-segment spellings of the same missing root map
+/// to a single index directory (AD-381-2).
 pub(super) fn resolve_search_cache_dir(root: &Path) -> anyhow::Result<PathBuf> {
     let base = crate::cmd::resolve_cache_dir()
         .ok_or_else(|| anyhow::anyhow!("failed to resolve skim cache directory"))?;
 
-    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canonical = canonical_or_normalized(root);
     let hash = project_root_hash(&canonical);
 
     Ok(base.join("search").join(hash))
+}
+
+/// Canonicalize `root`, falling back to a pure-lexical normalization when the
+/// path does not exist on disk.
+///
+/// On the success path this is exactly `root.canonicalize()` — no extra work
+/// for the common (existing-root) case. Only when `canonicalize()` errors (the
+/// cold, non-existent-root branch) do we normalize lexically so that equivalent
+/// spellings of the same missing root collapse to one directory.
+///
+/// The fallback normalization is **pure-lexical and side-effect-free**
+/// (AD-381-N): it walks [`Path::components`], dropping `CurDir` (`.`) segments
+/// and any trailing separator, with **no `..` resolution and no filesystem
+/// calls**. This keeps the result deterministic and cross-platform (provable
+/// without Windows CI).
+///
+/// Accepted trade-off: because `..` is NOT resolved, divergent `..` spellings of
+/// a non-existent root (e.g. `foo/../bar` vs `bar`) deliberately remain distinct
+/// — resolving them would require filesystem I/O on a path that does not exist.
+/// Revisit only if a concrete duplicate-dir case for `..` is observed.
+fn canonical_or_normalized(root: &Path) -> PathBuf {
+    match root.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) => lexically_normalize(root),
+    }
+}
+
+/// Pure-lexical path normalization: strip trailing separators and collapse `.`
+/// (current-dir) segments, WITHOUT resolving `..` and WITHOUT any syscalls.
+///
+/// Used only on the canonicalize-error (non-existent-root) path so that
+/// `foo`, `foo/`, `./foo`, and `foo/./bar` vs `foo/bar` map to identical
+/// `PathBuf`s. `..` segments are preserved verbatim (`Component::ParentDir`),
+/// so `foo/../bar` stays distinct from `bar` by design (AD-381-N).
+fn lexically_normalize(root: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut normalized = PathBuf::new();
+    for component in root.components() {
+        match component {
+            // Drop `.` segments — they are semantically inert.
+            Component::CurDir => {}
+            // Preserve everything else verbatim. `Path::components` already
+            // collapses repeated and trailing separators, so re-pushing these
+            // components yields a canonical-form spelling without `..` resolution.
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// Compute a 16-char hex prefix of the SHA-256 of the canonical project root path.
