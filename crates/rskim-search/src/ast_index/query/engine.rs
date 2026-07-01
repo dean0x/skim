@@ -34,6 +34,22 @@ pub struct AstQueryEngine<R: AstPostingSource = AstIndexReader> {
     pub(super) reader: R,
 }
 
+/// Deduped n-gram entries paired with their already-fetched posting lists.
+///
+/// Built once by [`AstQueryEngine::fetch_postings`] and shared by both the
+/// scoring loop (`score_ngram_set`) and the AND-intersect builder
+/// (`build_intersection_set`) so that a multi-n-gram AST query reads each
+/// posting list from the index exactly once instead of twice (#391).
+///
+/// `bigram_postings`/`trigram_postings` are parallel to `bigrams`/`trigrams`
+/// (same index refers to the same n-gram's entry and postings).
+pub(super) struct FetchedPostings<'a> {
+    bigrams: Vec<&'a AstBigramEntry>,
+    bigram_postings: Vec<Vec<AstPosting>>,
+    trigrams: Vec<&'a AstTrigramEntry>,
+    trigram_postings: Vec<Vec<AstPosting>>,
+}
+
 impl<R: AstPostingSource> AstQueryEngine<R> {
     /// Wrap any [`AstPostingSource`].
     #[must_use]
@@ -68,12 +84,17 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
     ///
     /// AD-374-1: all callers use AND-intersect semantics. `run_ngram_set_with_capacity`
     /// bypasses this function to preserve OR-union semantics for the P3 capacity tests.
+    ///
+    /// #391: posting lists are fetched exactly once (via `fetch_postings`,
+    /// inside `score_ngram_set`) and the same fetched lists are reused for the
+    /// AND-intersect below — previously `build_intersection_set` re-fetched
+    /// every list a second time.
     pub(super) fn run_ngram_set(
         &self,
         set: &AstNgramSet,
         lang_filter: Option<Language>,
     ) -> Result<Vec<(FileId, f64)>> {
-        let ctx = self.score_ngram_set(set, lang_filter)?;
+        let (ctx, fetched) = self.score_ngram_set(set, lang_filter)?;
         let mut out = ctx.into_sorted_vec();
 
         // AD-374-1: AND-intersect post-filter.
@@ -87,9 +108,9 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
         //
         // Single-n-gram query (n_lists == 1): the intersection of one set is that
         // set itself, so no candidate is dropped — byte-identical to the old union.
-        let n_lists = candidate_list_count(set);
+        let n_lists = fetched.bigram_postings.len() + fetched.trigram_postings.len();
         if n_lists > 1 {
-            let intersection_set = self.build_intersection_set(set, lang_filter)?;
+            let intersection_set = self.build_intersection_set(&fetched, lang_filter);
             out.retain(|(fid, _)| intersection_set.contains(&fid.0));
         }
         // n_lists == 0 or 1 → retain all (identity / trivial case).
@@ -100,7 +121,7 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
         Ok(out)
     }
 
-    /// Build the doc-id intersection set across all resolved posting lists in `set`.
+    /// Build the doc-id intersection set across all already-fetched posting lists.
     ///
     /// Returns the set of doc-ids that appear in EVERY posting list (bigrams +
     /// trigrams). Used by `run_ngram_set` for AND-intersect mode (AD-374-1).
@@ -108,39 +129,27 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
     /// Lang-filter is applied consistently: a file whose lang doesn't match is
     /// excluded from each individual list's doc-id set, so it cannot be in the
     /// intersection.
+    ///
+    /// #391: `fetched` was already read from the index once by
+    /// `fetch_postings` (via `score_ngram_set`) — this function performs no
+    /// I/O of its own, so it is no longer fallible.
     fn build_intersection_set(
         &self,
-        set: &AstNgramSet,
+        fetched: &FetchedPostings<'_>,
         lang_filter: Option<Language>,
-    ) -> Result<FxHashSet<u32>> {
+    ) -> FxHashSet<u32> {
         use crate::index::lang_map::lang_from_id;
-
-        // Collect all posting lists in order (bigrams first, then trigrams) after
-        // dedup (mirrors score_ngram_set's dedup to avoid double-counting the same
-        // list twice in the intersection).
-        let mut bigrams: Vec<&AstBigramEntry> = set.bigrams.iter().collect();
-        bigrams.dedup_by_key(|e| e.ngram.key());
-        let mut trigrams: Vec<&AstTrigramEntry> = set.trigrams.iter().collect();
-        trigrams.dedup_by_key(|e| e.ngram.key());
-
-        // Fetch all posting lists up front to avoid interleaving `self.reader`
-        // borrows with `result` mutation (borrow-checker constraint: the closure
-        // pattern would capture `self` as an immutable borrow AND `result` as a
-        // mutable borrow, conflicting with the `?` call inside the loop).
-        let mut all_lists: Vec<Vec<AstPosting>> =
-            Vec::with_capacity(bigrams.len() + trigrams.len());
-        for entry in &bigrams {
-            all_lists.push(self.reader.lookup_bigram(entry.ngram)?);
-        }
-        for entry in &trigrams {
-            all_lists.push(self.reader.lookup_trigram(entry.ngram)?);
-        }
 
         // Seed with None meaning "not yet seeded"; after the first list `result` is
         // the first list's doc-id set; subsequent lists narrow it further.
         let mut result: Option<FxHashSet<u32>> = None;
 
-        for postings in all_lists {
+        // Iterate bigram lists then trigram lists (same order fetch_postings used).
+        for postings in fetched
+            .bigram_postings
+            .iter()
+            .chain(fetched.trigram_postings.iter())
+        {
             // Collect doc-ids from this list (respecting lang_filter).
             let list_set: FxHashSet<u32> = postings
                 .iter()
@@ -172,20 +181,18 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
             });
         }
 
-        Ok(result.unwrap_or_default())
+        result.unwrap_or_default()
     }
 
-    /// Build and populate a [`ScoringCtx`] for `set` + `lang_filter`.
+    /// Dedup `set`'s bigram/trigram entries and fetch each posting list from
+    /// the index exactly once (#391).
     ///
-    /// Shared by `run_ngram_set` (production) and `run_ngram_set_with_capacity`
-    /// (test-only capacity hook) to eliminate duplicated dedup + scoring loop code.
-    pub(super) fn score_ngram_set(
-        &self,
-        set: &AstNgramSet,
-        lang_filter: Option<Language>,
-    ) -> Result<ScoringCtx> {
-        let avg = f64::from(self.reader.avg_node_count());
-
+    /// Both `score_ngram_set` (scoring) and `build_intersection_set`
+    /// (AND-intersect) need the same resolved posting lists; before #391 they
+    /// each fetched independently, so every list in a multi-n-gram AST query
+    /// was read from the index twice per `run_ngram_set` call. This is the
+    /// single fetch site both now share.
+    fn fetch_postings<'a>(&self, set: &'a AstNgramSet) -> Result<FetchedPostings<'a>> {
         // Gap-fix #6: dedup by key (entries are sorted; O(n); prevents double-scoring dups).
         let mut bigrams: Vec<&AstBigramEntry> = set.bigrams.iter().collect();
         bigrams.dedup_by_key(|e| e.ngram.key());
@@ -202,7 +209,39 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
                 .all(|w| w[0].ngram.key() != w[1].ngram.key())
         );
 
-        let total_ngrams = bigrams.len() + trigrams.len();
+        let mut bigram_postings = Vec::with_capacity(bigrams.len());
+        for entry in &bigrams {
+            bigram_postings.push(self.reader.lookup_bigram(entry.ngram)?);
+        }
+        let mut trigram_postings = Vec::with_capacity(trigrams.len());
+        for entry in &trigrams {
+            trigram_postings.push(self.reader.lookup_trigram(entry.ngram)?);
+        }
+
+        Ok(FetchedPostings {
+            bigrams,
+            bigram_postings,
+            trigrams,
+            trigram_postings,
+        })
+    }
+
+    /// Fetch postings once (`fetch_postings`, #391) and build a populated
+    /// [`ScoringCtx`] for `set` + `lang_filter`.
+    ///
+    /// Shared by `run_ngram_set` (production — reuses the returned
+    /// [`FetchedPostings`] for AND-intersect, so nothing is fetched twice) and
+    /// `run_ngram_set_with_capacity` (test-only capacity hook, which discards
+    /// the fetched postings) so the dedup + fetch + scoring loop code lives in
+    /// one place.
+    pub(super) fn score_ngram_set<'a>(
+        &self,
+        set: &'a AstNgramSet,
+        lang_filter: Option<Language>,
+    ) -> Result<(ScoringCtx, FetchedPostings<'a>)> {
+        let avg = f64::from(self.reader.avg_node_count());
+        let fetched = self.fetch_postings(set)?;
+        let total_ngrams = fetched.bigrams.len() + fetched.trigrams.len();
 
         // P3 (#286): posting-driven capacity — start at CAPACITY_FLOOR, reserve(n) per
         // posting list. Avoids over-allocating file_count() for selective queries (AC6)
@@ -214,22 +253,20 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
         // P1 (#286): value type is LiteMeta (5 bytes) not AstFileMetaEntry (15 bytes).
         let mut ctx = ScoringCtx::new(file_count, total_ngrams > 1);
 
-        for entry in &bigrams {
-            let postings = self.reader.lookup_bigram(entry.ngram)?;
-            ctx.score_postings(&postings, &self.reader, avg, lang_filter, |lang| {
+        for (entry, postings) in fetched.bigrams.iter().zip(fetched.bigram_postings.iter()) {
+            ctx.score_postings(postings, &self.reader, avg, lang_filter, |lang| {
                 f64::from(ast_bigram_idf(lang, entry.ngram))
             })?;
         }
-        for entry in &trigrams {
-            let postings = self.reader.lookup_trigram(entry.ngram)?;
+        for (entry, postings) in fetched.trigrams.iter().zip(fetched.trigram_postings.iter()) {
             // DEFERRED (Wave 4): minimal-covering-set to remove trigram/sub-bigram
             // double-counting (#198). For now, contributions are additive.
-            ctx.score_postings(&postings, &self.reader, avg, lang_filter, |lang| {
+            ctx.score_postings(postings, &self.reader, avg, lang_filter, |lang| {
                 f64::from(ast_trigram_idf(lang, entry.ngram))
             })?;
         }
 
-        Ok(ctx)
+        Ok((ctx, fetched))
     }
 }
 
@@ -343,24 +380,10 @@ impl<R: AstPostingSource> AstQueryEngine<R> {
         // Preserve legacy OR-union semantics for the P3 capacity tests: the
         // capacity assertions in AC6/AC7 count the OR-union pre-filter set, not the
         // AND-intersect survivor set, and we must not break those existing tests.
-        let ctx = self.score_ngram_set(set, lang_filter)?;
+        let (ctx, _fetched) = self.score_ngram_set(set, lang_filter)?;
         let cap = ctx.scores_capacity();
         Ok((ctx.into_sorted_vec(), cap))
     }
-}
-
-/// Count the total number of distinct posting lists that `set` resolves to,
-/// after dedup (same dedup as `score_ngram_set`).
-///
-/// Used by `run_ngram_set` to decide whether AND-intersection is meaningful:
-/// - 0 or 1 list: intersection == that list (or empty), so no filter is needed.
-/// - ≥2 lists: AND-intersect may remove candidates not in every list.
-fn candidate_list_count(set: &AstNgramSet) -> usize {
-    let mut bigrams: Vec<&AstBigramEntry> = set.bigrams.iter().collect();
-    bigrams.dedup_by_key(|e| e.ngram.key());
-    let mut trigrams: Vec<&AstTrigramEntry> = set.trigrams.iter().collect();
-    trigrams.dedup_by_key(|e| e.ngram.key());
-    bigrams.len() + trigrams.len()
 }
 
 /// Resolve an [`AstQuery`] to its [`AstNgramSet`], returning a borrowed or
