@@ -426,6 +426,112 @@ fn standalone_blast_radius_with_risky_sorts_by_risk() {
     }
 }
 
+/// AC8 analogue (#378/#389, combined-query propagation on the REAL Wilson
+/// compute path for `--blast-radius FILE --risky`):
+///
+/// `standalone_blast_radius_with_risky_sorts_by_risk` above exercises this
+/// re-sort path (`query_standalone` → `resort_partners_by_temporal` →
+/// `risk_for_file`) with hard-coded risk_score = 0.9/0.1 — like the
+/// non-Wilson `enrichment_risky_sorts_by_density_desc` — so it cannot detect a
+/// dropped-Wilson regression. This test stores risk_scores COMPUTED by
+/// `rskim_search::risk_score_wilson_decay` over raw (fix_commits,
+/// total_commits), mirroring `enrichment_risky_real_wilson_small_sample_below_large`
+/// (AC8) but through the blast-radius re-sort path instead of
+/// `apply_temporal_enrichment`: a tiny 1-fix/1-commit partner (bare ratio 1.0)
+/// must sort BELOW a 50-fix/50-commit partner. If volume-weighting were
+/// reverted to the bare ratio, both would score 1.0 and the saturated
+/// tiny-sample partner would tie/precede the large one.
+#[test]
+fn standalone_blast_radius_risky_real_wilson_small_sample_below_large() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/auth.rs"), "").unwrap();
+
+    let (_db_dir, db) = temp_db();
+
+    // Equal decay-weighted fix proportion (both all-fix -> 1.0): the ONLY
+    // thing that separates them is the Wilson volume term over raw counts.
+    let decay = 1.0;
+    let tiny_score = rskim_search::risk_score_wilson_decay(decay, 1, 1);
+    let large_score = rskim_search::risk_score_wilson_decay(decay, 50, 50);
+
+    // Guard the premise so a future helper change cannot silently make this
+    // test vacuous: the persisted scores MUST actually differ in the right
+    // direction.
+    assert!(
+        tiny_score < large_score,
+        "premise: Wilson(1,1) score ({tiny_score:.4}) must be < Wilson(50,50) \
+         score ({large_score:.4}) — bare ratio would make both 1.0"
+    );
+
+    // Give the tiny-sample partner the HIGHER Jaccard co-change strength so
+    // that, if risk ordering were broken, co-change insertion order would
+    // wrongly keep it first.
+    db.store_cochanges(&[
+        CochangeRow {
+            file_a: "src/auth.rs".to_string(),
+            file_b: "src/tiny_saturated.rs".to_string(),
+            count: 10,
+            jaccard: 0.9,
+        },
+        CochangeRow {
+            file_a: "src/auth.rs".to_string(),
+            file_b: "src/high_volume.rs".to_string(),
+            count: 3,
+            jaccard: 0.3,
+        },
+    ])
+    .unwrap();
+    db.store_risks(&[
+        RiskRow {
+            file_path: "src/tiny_saturated.rs".to_string(),
+            risk_score: tiny_score, // computed, not hard-coded
+            total_commits: 1,
+            fix_commits: 1,
+            fix_density: 1.0, // raw ratio shown in Fix%
+        },
+        RiskRow {
+            file_path: "src/high_volume.rs".to_string(),
+            risk_score: large_score, // computed, not hard-coded
+            total_commits: 50,
+            fix_commits: 50,
+            fix_density: 1.0,
+        },
+    ])
+    .unwrap();
+
+    let output = query_standalone(
+        Some(TemporalSort::Risky),
+        Some("src/auth.rs"),
+        10,
+        &db,
+        &root,
+    )
+    .unwrap();
+    match output {
+        TemporalQueryOutput::Cochanges { partners, .. } => {
+            assert_eq!(partners.len(), 2);
+            let first_partner = if partners[0].file_a == "src/auth.rs" {
+                &partners[0].file_b
+            } else {
+                &partners[0].file_a
+            };
+            // The high-volume partner MUST sort first despite its lower
+            // Jaccard co-change strength, because the REAL Wilson-computed
+            // risk_score read back via risk_for_file is higher
+            // (50/50 ≈ 0.93 > 1/1 ≈ 0.21).
+            assert_eq!(
+                first_partner, "src/high_volume.rs",
+                "AC8/#389: real Wilson risk_score must rank the 50/50 partner above the \
+                 saturated 1/1 partner through the --blast-radius --risky re-sort path \
+                 (premise: tiny={tiny_score:.4} < large={large_score:.4})"
+            );
+        }
+        other => panic!("expected Cochanges, got {other:?}"),
+    }
+}
+
 #[test]
 fn standalone_limit_caps_results() {
     let dir = TempDir::new().unwrap();
