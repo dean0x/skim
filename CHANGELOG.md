@@ -89,6 +89,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `invocations` comparisons across the upgrade point will reflect this change in counting
   semantics.
 
+- **Oversized files now degrade to a lossless raw passthrough instead of erroring** — Files
+  exceeding the AST node cap or line cap previously aborted with "Too many AST nodes / Possible
+  malicious input". They now fall back to a full byte-faithful raw pass-through (signalled via a
+  typed `ComplexityLimit`), so agents always see content rather than an error. `--max-lines` and
+  `--last-lines` are honored, so a head-style request still yields the requested window. AST depth
+  caps (guarding against unbounded recursion) remain hard errors.
+
+- **`skim search index` no longer shadows the search term "index"** — Previously `skim search index`
+  always triggered an index build, making the literal term "index" unsearchable. The dispatch now
+  routes to the build path only when trailing args fit the build grammar (`--force`, `--root`,
+  `--max-files`, `--index-dir`); with any query flag or extra positional terms it searches for the
+  literal string "index". `skim search -- index` forces a search via the POSIX `--` escape. Bare
+  `skim search index` (no extra args) still triggers a build (backward-compatible).
+
+- **`skim grep`/`rg` now group matches by file at any match volume** — Small result sets
+  previously fell back to raw `file:line:content` output instead of the grouped-by-file layout.
+  Grouping is now applied consistently regardless of match count.
+
 ### Added
 - **`rskim-tokens` crate (L3 Wave-1)** — Multi-provider token counting library (cl100k /
   o200k / Anthropic-offline / heuristic). Default build is HTTP-free; `net-anthropic` feature
