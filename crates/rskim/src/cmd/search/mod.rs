@@ -34,26 +34,65 @@ use serde::Serialize;
 // Public entry point
 // ============================================================================
 
+/// Decide whether a leading `index` token starts the index-BUILD subcommand
+/// rather than a search for the literal term "index".
+///
+/// `rest` is everything after `index`. It is a build invocation only when every
+/// token belongs to the index-build grammar:
+/// - `--force`, `--help`, `-h` — valueless flags
+/// - `--root`, `--max-files`, `--index-dir` — each consumes the next token
+/// - the `--flag=value` forms of the above
+///
+/// Any other token (another flag like `--limit`/`--json`/`--hot`, or a
+/// positional search term) means the user is searching for "index", so we
+/// return `false` and let the caller fall through to the query path. An empty
+/// `rest` (bare `skim search index`) stays a build for backward compatibility.
+fn index_args_are_build(rest: &[String]) -> bool {
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--force" | "--help" | "-h" => {}
+            "--root" | "--max-files" | "--index-dir" => i += 1, // value is the next token
+            s if s.starts_with("--root=")
+                || s.starts_with("--max-files=")
+                || s.starts_with("--index-dir=") => {}
+            // Unknown flag or positional → this is a search for "index".
+            _ => return false,
+        }
+        i += 1;
+    }
+    true
+}
+
 /// Run the `skim search` subcommand.
 ///
 /// Dispatches to:
-/// - `skim search index [OPTIONS]` — build or update the search index
+/// - `skim search index [build-opts]` — build or update the search index
 /// - `skim search --build` — build incrementally (alias for index)
 /// - `skim search --rebuild` — force full rebuild
 /// - `skim search --update` — auto-refresh if stale
 /// - `skim search --stats [--json]` — print index statistics
 /// - `skim search --install-hooks` — install git hooks
 /// - `skim search --remove-hooks` — remove git hooks
-/// - `skim search [--json] [--limit N] <QUERY>` — search
+/// - `skim search [--json] [--limit N] <QUERY>` — search (`--` forces the rest
+///   to be query terms, e.g. `skim search -- index` searches for "index")
 /// - No args / `--help` / `-h` — print help
 pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    // `skim search index [OPTIONS]` — legacy subcommand path.
-    if args.first().is_some_and(|a| a == "index") {
-        let rest = &args[1..];
-        return index::run(rest, analytics);
+    // `skim search index [build-opts]` — legacy index-BUILD subcommand.
+    //
+    // Only treat a leading `index` as the build trigger when the trailing args
+    // fit the build grammar (--root/--force/--max-files/--index-dir, --help).
+    // Otherwise `index` is a search TERM — e.g. `skim search index --limit 5` or
+    // `skim search index out of bounds` — and we fall through to the query path
+    // so the common English word "index" is searchable instead of being shadowed
+    // by the subcommand (and so `--limit` no longer errors). The unambiguous
+    // forms remain: `skim search --build`/`--rebuild` to build, `skim search --
+    // index` to force a literal search.
+    if args.first().is_some_and(|a| a == "index") && index_args_are_build(&args[1..]) {
+        return index::run(&args[1..], analytics);
     }
 
     // No args or --help/-h → print help
@@ -327,8 +366,18 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut ast: Option<String> = None;
 
     let mut i = 0;
+    let mut positional_only = false;
     while i < args.len() {
+        // After a POSIX `--`, every remaining token is a positional query term.
+        // This is the unambiguous way to search for words that collide with a
+        // flag or subcommand name (e.g. `skim search -- index`).
+        if positional_only {
+            query_parts.push(args[i].clone());
+            i += 1;
+            continue;
+        }
         match args[i].as_str() {
+            "--" => positional_only = true,
             "--build" => action_flag = Some(SearchAction::Build),
             "--rebuild" => action_flag = Some(SearchAction::Rebuild),
             "--update" => action_flag = Some(SearchAction::Update),
@@ -711,7 +760,11 @@ Search code using layered n-gram BM25F indexing.
 
 Subcommands / modes:
   (none)           Print this help message
-  index            Build or update the search index (legacy)
+  index            Build or update the search index (legacy; prefer --build).
+                   Only treated as the build subcommand when followed by build
+                   options (--force/--root/--max-files) or nothing. With a query
+                   flag or extra terms (e.g. `search index --limit 5`) it is a
+                   search for the word \"index\". Use `search -- index` to force it.
 
 Options:
   --build          Build the index incrementally (auto-build on first query)
@@ -756,6 +809,8 @@ Temporal flag composition:
 
 General examples:
   skim search \"authenticate\"                Search for 'authenticate'
+  skim search -- index                      Search for the literal word 'index'
+  skim search index --limit 5               Search 'index' (not the subcommand)
   skim search --limit 5 \"parse_url\"         Return at most 5 results
   skim search --json \"UserService\"          JSON output
   skim search --build                       Build the search index
@@ -816,6 +871,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, ExitCode::SUCCESS);
+    }
+
+    // ============================================================================
+    // `index` build-vs-search disambiguation
+    // ============================================================================
+
+    fn v(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn index_args_are_build_recognizes_build_grammar() {
+        // Bare `index` and pure build-option forms are builds.
+        assert!(index_args_are_build(&v(&[])));
+        assert!(index_args_are_build(&v(&["--force"])));
+        assert!(index_args_are_build(&v(&["--root", "/tmp/x"])));
+        assert!(index_args_are_build(&v(&["--root=/tmp/x"])));
+        assert!(index_args_are_build(&v(&["--max-files", "100", "--force"])));
+        assert!(index_args_are_build(&v(&["--help"])));
+    }
+
+    #[test]
+    fn index_args_are_build_rejects_search_forms() {
+        // A query flag or an extra positional means "search for the word index".
+        assert!(!index_args_are_build(&v(&["--limit", "5"])));
+        assert!(!index_args_are_build(&v(&["--json"])));
+        assert!(!index_args_are_build(&v(&["--hot"])));
+        assert!(!index_args_are_build(&v(&["out", "of", "bounds"])));
+        assert!(!index_args_are_build(&v(&["--force", "--limit", "5"])));
+    }
+
+    /// The reported bug: `skim search index --limit 5` errored with
+    /// "unexpected argument --limit". It must now search for the word "index".
+    #[test]
+    fn index_with_query_flag_is_a_search_not_a_build() {
+        let flags = parse_flags(&v(&["index", "--limit", "5"])).unwrap();
+        assert_eq!(flags.action, SearchAction::Query("index".to_string()));
+        assert_eq!(flags.limit, 5);
+    }
+
+    /// `skim search -- index` is the unambiguous "search the literal word index"
+    /// form: the `--` terminator forces every following token to be a query term.
+    #[test]
+    fn double_dash_forces_literal_query() {
+        let flags = parse_flags(&v(&["--", "index"])).unwrap();
+        assert_eq!(flags.action, SearchAction::Query("index".to_string()));
+
+        // `--` also shields flag-like words from being parsed as flags.
+        let flags = parse_flags(&v(&["--", "index", "--limit"])).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("index --limit".to_string())
+        );
+    }
+
+    /// Multi-term queries that begin with `index` stay intact (no subcommand steal).
+    #[test]
+    fn index_followed_by_terms_is_a_multi_word_query() {
+        let flags = parse_flags(&v(&["index", "out", "of", "bounds"])).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("index out of bounds".to_string())
+        );
     }
 
     // ============================================================================
