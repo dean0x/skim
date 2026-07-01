@@ -3682,3 +3682,76 @@ fn compound_with_blast_top_result_flips_with_weights_ac4() {
     assert_eq!(top_lex, "src/aaa.rs", "AC4: lexical-heavy → aaa first");
     assert_eq!(top_ast, "src/bbb.rs", "AC4: ast-heavy → bbb first");
 }
+
+/// AC3 (#388, DIRECT byte-identity): on the text+--ast compound path, two
+/// invocations that differ ONLY in the temporal (3rd) weight component MUST
+/// produce byte-identical result sets. The compound path never applies a
+/// temporal sort (no `--hot`/`--cold`/`--risky`), so the temporal weight is
+/// inert there (AD-377-1) — a change to it must never move a result.
+///
+/// Before this test, AC3 was proven only INDIRECTLY: the notice-fires tests
+/// (`ac3_ac4a_weights_inert_notice_compound_temporal_predicate` in
+/// query_tests.rs) confirm a *warning* is emitted, and AC5
+/// (`compound_zero_weights_returns_full_intersection_at_zero_ac5` above)
+/// zeroes ALL three weights at once. Neither directly compares two REAL
+/// `execute_query` runs that vary only the temporal component. This test
+/// closes that gap: it falsifies a regression where the 3rd weight leaks into
+/// the compound ranking (e.g. an accidental temporal re-sort or a composite
+/// formula that no longer drops the temporal term on this path).
+#[test]
+fn compound_temporal_weight_inert_byte_identical_ac3() {
+    use super::super::query::execute_query;
+
+    let project = make_project_with_two_nested_loop_files();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
+    assert!(
+        ast_scored.len() >= 2,
+        "AC3 setup: rust-nested-loop must match alpha.rs + beta.rs (>=2 files), got {}",
+        ast_scored.len()
+    );
+
+    let mut low_temporal = make_query_config(
+        project.path(),
+        cache.path(),
+        "fn",
+        50,
+        Some(ast_scored.clone()),
+        None,
+    );
+    low_temporal.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0.5,0.3,0.2").unwrap());
+    let out_low = execute_query(&low_temporal, &TEST_ANALYTICS).unwrap();
+
+    let mut high_temporal =
+        make_query_config(project.path(), cache.path(), "fn", 50, Some(ast_scored), None);
+    high_temporal.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0.5,0.3,9.9").unwrap());
+    let out_high = execute_query(&high_temporal, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !out_low.results.is_empty(),
+        "AC3 setup: compound run must return a non-empty intersection"
+    );
+
+    let low: Vec<(&str, f64)> = out_low
+        .results
+        .iter()
+        .map(|r| (r.path.as_str(), r.score))
+        .collect();
+    let high: Vec<(&str, f64)> = out_high
+        .results
+        .iter()
+        .map(|r| (r.path.as_str(), r.score))
+        .collect();
+    assert_eq!(
+        low, high,
+        "AC3: on the text+--ast compound path, --weights 0.5,0.3,0.2 and 0.5,0.3,9.9 \
+         (differing ONLY in the inert temporal weight) must produce byte-identical \
+         result sets — a difference here proves the temporal weight leaked into the \
+         compound ranking despite there being no temporal sort on this path"
+    );
+}
