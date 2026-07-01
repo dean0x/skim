@@ -1018,9 +1018,13 @@ mod tests {
         // much slower fixture.)
         for mode in [Mode::Minimal, Mode::Pseudo] {
             let config = TransformConfig::with_mode(mode);
-            let (output, _has_errors, _map) = Language::Python
-                .transform_source_with_line_map(&source, &config)
-                .unwrap_or_else(|e| panic!("{mode:?} must degrade to passthrough, got error: {e}"));
+            let result = Language::Python.transform_source_with_line_map(&source, &config);
+            assert!(
+                result.is_ok(),
+                "{mode:?} must degrade to passthrough, got error: {:?}",
+                result.as_ref().err()
+            );
+            let (output, _has_errors, _map) = result.unwrap();
             // Passthrough is lossless: the raw source is returned verbatim.
             assert_eq!(
                 output, source,
