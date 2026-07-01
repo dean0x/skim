@@ -109,22 +109,166 @@ fn test_grep_single_file_attributed_and_complete() {
     let content: String = (1..=10).map(|i| format!("needle {i}\n")).collect();
     fs::write(&file, content).unwrap();
 
-    // The net-savings guard may passthrough small inputs rather than compressing.
-    // skim-format: includes "10 matches" summary and file-path attribution.
-    // raw form: grep -n outputs "LINE:content" without per-file summary for single-file.
-    // We verify: exit 0, all 10 needle lines present, no "<stdin>", no "showing" truncation.
+    // grep now groups-by-file ALWAYS (skip_net_savings_guard), so the output is
+    // deterministic regardless of match volume: canonical `grep N` header, the
+    // attributed file path, every match, no `<stdin>` mislabel, no truncation.
     let mut assert = skim_cmd()
         .args(["grep", "-n", "needle", file.to_str().unwrap()])
         .assert()
         .code(0)
         .stdout(predicate::str::contains("<stdin>").not())
         .stdout(predicate::str::contains("showing").not())
-        // skim-format adds "10 matches"; raw grep just has match lines — accept both
-        .stdout(predicate::str::contains("10 matches").or(predicate::str::contains("needle 10")));
-    // Every match line must be present in both raw and skim-format output — no per-file cap.
+        // Deterministic grouped header (was a volume-dependent flip before #issues-4/5).
+        .stdout(predicate::str::contains("grep 10"));
+    // Every match line must be present — no per-file cap.
     for i in 1..=10 {
         assert = assert.stdout(predicate::str::contains(format!("needle {i}")));
     }
+}
+
+/// Issues #4/#5: a SMALL multi-file grep must use the SAME grouped shape as a
+/// large one. Before the fix the net-savings guard flipped small result sets
+/// back to raw `file:line:content`, so the same `grep -n` produced two different
+/// formats depending on match volume. Now grep groups consistently.
+#[test]
+fn test_grep_small_multifile_groups_consistently() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    fs::write(&a, "alpha MARK one\nplain\n").unwrap();
+    fs::write(&b, "plain\nbeta MARK two\n").unwrap();
+
+    skim_cmd()
+        .args([
+            "grep",
+            "-n",
+            "MARK",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+        ])
+        .assert()
+        .code(0)
+        // Canonical grouped header + footer (grouped even though only 2 matches).
+        .stdout(predicate::str::contains("grep 2"))
+        .stdout(predicate::str::contains("2 files"))
+        // Both files appear as group headers and both matches are present.
+        .stdout(predicate::str::contains("a.txt"))
+        .stdout(predicate::str::contains("b.txt"))
+        .stdout(predicate::str::contains("alpha MARK one"))
+        .stdout(predicate::str::contains("beta MARK two"))
+        // Grouped form uses indented `:line:` entries, not raw `file:line:content`.
+        .stdout(predicate::str::contains(":1: alpha MARK one"));
+}
+
+// ============================================================================
+// rg: small multi-file match set must group consistently (issues #4/#5 — rg half)
+// ============================================================================
+
+/// B1: Issues #4/#5 (rg sibling): a SMALL multi-file rg must use the SAME grouped
+/// shape as a large one. This guards the `skip_net_savings_guard = true` flip in
+/// `rg.rs::CONFIG`: all existing rg unit tests call the renderer directly and never
+/// reach `execution.rs`'s guard branch, so reverting the flag would leave the rg
+/// test suite green while re-introducing the volume-dependent shape flip.
+///
+/// Gated on rg availability — skips gracefully when ripgrep is not installed. applies ADR-001.
+#[test]
+fn test_rg_small_multifile_groups_consistently() {
+    if std::process::Command::new("rg")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping test_rg_small_multifile_groups_consistently: rg not installed");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    fs::write(&a, "alpha MARK one\nplain\n").unwrap();
+    fs::write(&b, "plain\nbeta MARK two\n").unwrap();
+
+    skim_cmd()
+        .args(["rg", "-n", "MARK", a.to_str().unwrap(), b.to_str().unwrap()])
+        .assert()
+        .code(0)
+        // Canonical grouped header + footer (grouped even though only 2 matches).
+        .stdout(predicate::str::contains("rg 2"))
+        .stdout(predicate::str::contains("2 files"))
+        // Both files appear as group headers and both matches are present.
+        .stdout(predicate::str::contains("a.txt"))
+        .stdout(predicate::str::contains("b.txt"))
+        .stdout(predicate::str::contains("alpha MARK one"))
+        .stdout(predicate::str::contains("beta MARK two"))
+        // Grouped form uses indented `:line:` entries, not raw `file:line:content`.
+        .stdout(predicate::str::contains(":1: alpha MARK one"));
+}
+
+// ============================================================================
+// Over-cap file with --max-lines: exit 0 and bounded output (B4)
+// ============================================================================
+
+/// B4: `skim file --mode=pseudo --max-lines N` on a Rust source that overflows
+/// the AST node cap (MAX_AST_NODES = 100,000) must return exit 0 and at most
+/// ~N lines — never an error exit code.
+///
+/// Library-level tests in rskim-core cover the transform result. This test pins
+/// the CLI exit-disposition: the correct exit code and bounded stdout must survive
+/// any future wiring change between the dispatcher's degrade-to-passthrough path
+/// and the CLI layer.
+#[test]
+fn test_over_cap_rs_file_with_max_lines_exits_0_and_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("generated.rs");
+
+    // Generate a Rust file that exceeds MAX_AST_NODES (100,000).
+    // Strategy mirrors over_cap_python_source in rskim-core/src/types.rs:
+    // ~40+ AST nodes per `let` statement × 4500 statements ≈ 180,000 > cap.
+    let mut content = String::from("fn generated() {\n");
+    for i in 0usize..4500 {
+        content.push_str("    let _ = ");
+        for j in 0..20usize {
+            if j > 0 {
+                content.push_str(" + ");
+            }
+            content.push_str(&(i * 20 + j).to_string());
+        }
+        content.push_str(";\n");
+    }
+    content.push_str("}\n");
+    fs::write(&file, &content).unwrap();
+
+    const MAX_LINES: usize = 40;
+    let max_lines_str = MAX_LINES.to_string();
+    let output = skim_cmd()
+        .arg(file.to_str().unwrap())
+        .arg("--mode=pseudo")
+        .arg("--max-lines")
+        .arg(&max_lines_str)
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "over-cap Rust file with --max-lines must exit 0 (degrade to passthrough); \
+         got: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout_str = String::from_utf8(output.stdout).unwrap();
+    let line_count = stdout_str.lines().count();
+    // Small slack: the windowed passthrough may emit slightly fewer or more lines
+    // than exactly MAX_LINES depending on trailing newline handling. +2 is generous
+    // but bounded — a 4500-line passthrough would fail this immediately.
+    assert!(
+        line_count <= MAX_LINES + 2,
+        "stdout must be bounded to ~{MAX_LINES} lines after degrade, got {line_count} lines\n\
+         first 5 lines:\n{}",
+        stdout_str.lines().take(5).collect::<Vec<_>>().join("\n"),
+    );
 }
 
 // ============================================================================

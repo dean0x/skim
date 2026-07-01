@@ -177,12 +177,17 @@ pub fn transform_with_quality(
     language.transform_source(source, config)
 }
 
-/// Transform source code and return content, parse quality flag, and source line map.
+/// Transform source code and return content, parse quality flag, source line map, and degraded flag.
 ///
 /// Like `transform_with_quality` but also returns a source line map when
 /// `config.line_numbers` is true. The source line map maps each output line index
 /// (0-based) to its 1-indexed source line number. A value of `0` in the map
 /// indicates an omission/truncation marker with no line number annotation.
+///
+/// The `degraded` flag is `true` when a structural safety cap was exceeded and
+/// the transform fell back to raw passthrough (e.g. an oversized file that exceeds
+/// the AST node cap or serde key-count cap). Callers should emit a diagnostic
+/// under `SKIM_DEBUG=1` and record the tier as "degraded", not "full".
 ///
 /// When `config.line_numbers` is false, `source_line_map` is `None`.
 ///
@@ -210,7 +215,7 @@ pub fn transform_with_quality(
 /// use rskim_core::{transform_with_line_map, Language, Mode, TransformConfig};
 ///
 /// let config = TransformConfig::with_mode(Mode::Full).with_line_numbers(true);
-/// let (content, has_errors, line_map) =
+/// let (content, has_errors, line_map, _degraded) =
 ///     transform_with_line_map("fn main() {}\nfn foo() {}", Language::Rust, &config)?;
 /// let map = line_map.unwrap();
 /// assert_eq!(map[0], 1); // First output line → source line 1
@@ -221,7 +226,7 @@ pub fn transform_with_line_map(
     source: &str,
     language: Language,
     config: &TransformConfig,
-) -> Result<(String, bool, Option<Vec<usize>>)> {
+) -> Result<(String, bool, Option<Vec<usize>>, bool)> {
     language.transform_source_with_line_map(source, config)
 }
 

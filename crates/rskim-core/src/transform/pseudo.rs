@@ -405,13 +405,16 @@ fn collect_noise_ranges(
         )));
     }
 
-    // SECURITY: Prevent memory exhaustion from excessive nodes
+    // AST node count over the cap: typically a legitimate but very large generated
+    // file, not an attack. Signal a complexity limit so the dispatcher degrades to
+    // a lossless raw passthrough instead of failing the command. (#317)
     *ctx.node_count += 1;
     if *ctx.node_count > MAX_AST_NODES {
-        return Err(SkimError::ParseError(format!(
-            "Too many AST nodes: {} (max: {}). Possible malicious input.",
-            *ctx.node_count, MAX_AST_NODES
-        )));
+        return Err(SkimError::ComplexityLimit {
+            what: "AST nodes",
+            count: *ctx.node_count,
+            max: MAX_AST_NODES,
+        });
     }
 
     let kind = node.kind();
@@ -958,16 +961,14 @@ mod tests {
         let tree = parser.parse(&source).unwrap();
         let config = TransformConfig::with_mode(Mode::Pseudo);
 
+        // The transform itself still enforces the cap; the *dispatcher* is what
+        // degrades a ComplexityLimit to passthrough (see types.rs). This direct
+        // call therefore surfaces the typed cap error.
         let result = transform_pseudo(&source, &tree, Language::Python, &config);
+        let err = result.expect_err("Expected error when exceeding MAX_AST_NODES");
         assert!(
-            result.is_err(),
-            "Expected error when exceeding MAX_AST_NODES"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Too many AST nodes"),
-            "Expected 'Too many AST nodes' error, got: {}",
-            err_msg
+            err.is_complexity_limit(),
+            "Expected a ComplexityLimit error, got: {err}"
         );
     }
 

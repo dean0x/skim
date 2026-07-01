@@ -79,11 +79,14 @@ pub(crate) fn transform_yaml(source: &str) -> Result<String> {
             let structure = extract_structure(&value, 0, &mut key_count)?;
 
             total_key_count += key_count;
+            // Key count over the cap: a legitimate but very large multi-document YAML file.
+            // Signal a complexity limit so the dispatcher degrades to lossless raw passthrough. (#317)
             if total_key_count > MAX_YAML_KEYS {
-                return Err(SkimError::ParseError(format!(
-                    "YAML key count exceeded: {} (max: {}). Possible malicious input.",
-                    total_key_count, MAX_YAML_KEYS
-                )));
+                return Err(SkimError::ComplexityLimit {
+                    what: "YAML keys",
+                    count: total_key_count,
+                    max: MAX_YAML_KEYS,
+                });
             }
 
             if !structure.is_empty() {
@@ -190,13 +193,16 @@ fn extract_mapping_structure(
         return Ok("{}".to_string());
     }
 
-    // SECURITY: Track total keys across all mappings to prevent memory exhaustion
+    // Key count over the cap: a legitimate but very large YAML file (e.g. a
+    // Kubernetes manifest or helm values file). Signal a complexity limit so
+    // the dispatcher degrades to lossless raw passthrough instead of failing. (#317)
     *key_count += map.len();
     if *key_count > MAX_YAML_KEYS {
-        return Err(SkimError::ParseError(format!(
-            "YAML key count exceeded: {} (max: {}). Possible malicious input.",
-            key_count, MAX_YAML_KEYS
-        )));
+        return Err(SkimError::ComplexityLimit {
+            what: "YAML keys",
+            count: *key_count,
+            max: MAX_YAML_KEYS,
+        });
     }
 
     let indent = "  ".repeat(depth);
@@ -489,7 +495,8 @@ development:
 
     #[test]
     fn test_key_count_limit() {
-        // SECURITY TEST: Ensure YAML with >10,000 keys is rejected
+        // LIMIT TEST: Ensure YAML with >10,000 keys produces a ComplexityLimit error
+        // (which the dispatcher catches and degrades to passthrough; transform_yaml itself still Errs).
         let mut yaml = String::new();
         for i in 0..10_001 {
             yaml.push_str(&format!("key_{}: {}\n", i, i));
@@ -502,8 +509,8 @@ development:
             .expect_err("Expected error for key count limit")
             .to_string();
         assert!(
-            err.contains("key count exceeded"),
-            "Error message should mention key count limit, got: {}",
+            err.contains("exceeded safety cap"),
+            "Error message should mention safety cap, got: {}",
             err
         );
     }
