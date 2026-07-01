@@ -3726,8 +3726,14 @@ fn compound_temporal_weight_inert_byte_identical_ac3() {
         Some(rskim_search::CompositeWeights6::parse_weights_flag("0.5,0.3,0.2").unwrap());
     let out_low = execute_query(&low_temporal, &TEST_ANALYTICS).unwrap();
 
-    let mut high_temporal =
-        make_query_config(project.path(), cache.path(), "fn", 50, Some(ast_scored), None);
+    let mut high_temporal = make_query_config(
+        project.path(),
+        cache.path(),
+        "fn",
+        50,
+        Some(ast_scored),
+        None,
+    );
     high_temporal.composite_weights =
         Some(rskim_search::CompositeWeights6::parse_weights_flag("0.5,0.3,9.9").unwrap());
     let out_high = execute_query(&high_temporal, &TEST_ANALYTICS).unwrap();

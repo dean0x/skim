@@ -177,9 +177,7 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> ClassifyOutcome<Read
     let lang = match Language::from_path(abs_path) {
         Some(l) => l,
         None => {
-            return ClassifyOutcome::Skip(SkipReason::UnsupportedLanguage(
-                abs_path.to_path_buf(),
-            ));
+            return ClassifyOutcome::Skip(SkipReason::UnsupportedLanguage(abs_path.to_path_buf()));
         }
     };
 
@@ -296,9 +294,7 @@ fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> ClassifyOut
     let lang = match Language::from_path(abs_path) {
         Some(l) => l,
         None => {
-            return ClassifyOutcome::Skip(SkipReason::UnsupportedLanguage(
-                abs_path.to_path_buf(),
-            ));
+            return ClassifyOutcome::Skip(SkipReason::UnsupportedLanguage(abs_path.to_path_buf()));
         }
     };
 
@@ -513,10 +509,9 @@ where
     C: Fn(&ignore::DirEntry, &Path) -> ClassifyOutcome<T> + Copy + Send,
     K: Fn(&T) -> String + Copy + Send,
 {
-    let heap: Arc<Mutex<BinaryHeap<KeyedEntry<T>>>> =
-        Arc::new(Mutex::new(BinaryHeap::with_capacity(
-            max_files.min(4096).saturating_add(1),
-        )));
+    let heap: Arc<Mutex<BinaryHeap<KeyedEntry<T>>>> = Arc::new(Mutex::new(
+        BinaryHeap::with_capacity(max_files.min(4096).saturating_add(1)),
+    ));
     let skipped = Arc::new(Mutex::new(Vec::<SkipReason>::with_capacity(256)));
     let total_seen = Arc::new(AtomicUsize::new(0));
     let root_buf = root.to_path_buf();
@@ -538,9 +533,7 @@ where
     });
 
     let heap = Arc::try_unwrap(heap)
-        .map_err(|_| {
-            anyhow::anyhow!("heap Arc still has multiple owners after walker completion")
-        })?
+        .map_err(|_| anyhow::anyhow!("heap Arc still has multiple owners after walker completion"))?
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
     let mut skipped = Arc::try_unwrap(skipped)
