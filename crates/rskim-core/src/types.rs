@@ -262,7 +262,22 @@ impl Language {
         let parse_errors = tree.root_node().has_error();
 
         let (result, line_map) =
-            crate::transform::transform_tree_with_line_map(source, &tree, self, config)?;
+            match crate::transform::transform_tree_with_line_map(source, &tree, self, config) {
+                Ok(v) => v,
+                // A structural safety cap overflowed — a legitimate but very large
+                // file (e.g. a machine-generated weight table) that we cannot
+                // compress without exceeding the cap. Rather than failing the
+                // command, degrade to a lossless raw passthrough (honoring
+                // max_lines/last_lines so a `head`-style request still yields a
+                // window, not the whole file). (#317: compress, never truncate;
+                // if we can't compress, cleanly passthrough.) The passthrough
+                // branch handles its own truncation and returns early, so the
+                // last_lines post-processing below is correctly bypassed.
+                Err(e) if e.is_complexity_limit() => {
+                    return self.transform_passthrough_with_line_map(source, config);
+                }
+                Err(e) => return Err(e),
+            };
 
         // Apply last_lines truncation as a post-processing step
         let (result, line_map) = if let Some(n) = config.last_lines {
@@ -778,6 +793,22 @@ pub enum SkimError {
     #[error("Failed to parse source code: {0}")]
     ParseError(String),
 
+    /// A structural safety cap was exceeded (AST node / signature / type-def /
+    /// markdown-header count). The input is legitimate but too large to compress,
+    /// so the transform dispatcher degrades to a lossless raw passthrough rather
+    /// than failing the command. (#317 — compress, never truncate; if we can't
+    /// compress, cleanly passthrough.) Distinct from [`ParseError`] (genuine
+    /// failure) and the depth caps (kept as hard `ParseError`s because deep
+    /// nesting beyond the limit signals pathological/malicious input, not size).
+    ///
+    /// [`ParseError`]: SkimError::ParseError
+    #[error("{what} exceeded safety cap: {count} (max: {max})")]
+    ComplexityLimit {
+        what: &'static str,
+        count: usize,
+        max: usize,
+    },
+
     /// tree-sitter language loading error
     #[error("Tree-sitter language error: {0}")]
     TreeSitterError(#[from] tree_sitter::LanguageError),
@@ -799,6 +830,18 @@ pub enum SkimError {
     /// UTF-8 conversion error
     #[error("UTF-8 error: {0}")]
     Utf8Error(#[from] std::str::Utf8Error),
+}
+
+impl SkimError {
+    /// Returns `true` for [`SkimError::ComplexityLimit`] — a structural
+    /// safety-cap overflow the transform dispatcher degrades to raw passthrough
+    /// instead of surfacing as a command failure. Callers outside the dispatcher
+    /// (e.g. the CLI) can use this to distinguish "too big to compress" (degrade)
+    /// from a genuine parse failure (report).
+    #[must_use]
+    pub fn is_complexity_limit(&self) -> bool {
+        matches!(self, SkimError::ComplexityLimit { .. })
+    }
 }
 
 /// Result type alias for Skim operations
@@ -941,6 +984,66 @@ mod tests {
 
         assert_eq!(config.mode, Mode::Structure);
         assert_eq!(config.max_lines, Some(50));
+    }
+
+    /// A file that overflows the AST node cap must NOT fail the command: the
+    /// dispatcher degrades to a lossless raw passthrough. (#317 — graceful
+    /// degradation for legitimately large generated files like weight tables.)
+    fn over_cap_python_source() -> String {
+        // ~25 AST nodes/line × 4500 lines > MAX_AST_NODES (100,000). Mirrors the
+        // generator in transform::minimal's cap test.
+        let mut source = String::new();
+        for _ in 0..4500 {
+            source.push_str("x = ");
+            for j in 0..20 {
+                if j > 0 {
+                    source.push_str(" + ");
+                }
+                source.push_str(&j.to_string());
+            }
+            source.push('\n');
+        }
+        source
+    }
+
+    #[test]
+    fn over_cap_file_degrades_to_passthrough_not_error() {
+        let source = over_cap_python_source();
+        // Minimal and Pseudo count EVERY AST node, so this bodyless source
+        // overflows the node cap in both — the reported scenario (the `head`
+        // rewrite uses `--mode=pseudo`). Both must degrade rather than erroring.
+        // (Structure/Signatures/Types count body-replacements/signatures/type-
+        // defs and reach the SAME dispatcher degrade-point on overflow; they are
+        // not exercised here because triggering their caps needs a far larger,
+        // much slower fixture.)
+        for mode in [Mode::Minimal, Mode::Pseudo] {
+            let config = TransformConfig::with_mode(mode);
+            let (output, _has_errors, _map) = Language::Python
+                .transform_source_with_line_map(&source, &config)
+                .unwrap_or_else(|e| panic!("{mode:?} must degrade to passthrough, got error: {e}"));
+            // Passthrough is lossless: the raw source is returned verbatim.
+            assert_eq!(
+                output, source,
+                "{mode:?} degradation must return the raw source verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn over_cap_file_with_max_lines_yields_a_window_not_whole_file() {
+        // The `head -N file` rewrite (`skim file --mode=pseudo --max-lines N`)
+        // must still yield a small window when the file overflows the cap —
+        // never the entire 4500-line file.
+        let source = over_cap_python_source();
+        let config = TransformConfig::with_mode(Mode::Pseudo).with_max_lines(40);
+        let (output, _has_errors, _map) = Language::Python
+            .transform_source_with_line_map(&source, &config)
+            .expect("over-cap file with max_lines must degrade, not error");
+        assert!(
+            output.lines().count() <= 41,
+            "max_lines=40 passthrough must window the file (got {} lines)",
+            output.lines().count()
+        );
     }
 
     #[test]

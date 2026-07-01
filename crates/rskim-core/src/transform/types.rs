@@ -99,13 +99,15 @@ pub(crate) fn transform_types_with_spans_and_line_map(
         0,
     )?;
 
-    // Check type definition count limit
+    // Type-def count over the cap: a legitimate but very large file, not an
+    // attack. Signal a complexity limit so the dispatcher degrades to a lossless
+    // raw passthrough instead of failing the command. (#317)
     if type_defs.len() > MAX_TYPE_DEFS {
-        return Err(SkimError::ParseError(format!(
-            "Too many type definitions: {} (max: {}). Possible malicious input.",
-            type_defs.len(),
-            MAX_TYPE_DEFS
-        )));
+        return Err(SkimError::ComplexityLimit {
+            what: "type definitions",
+            count: type_defs.len(),
+            max: MAX_TYPE_DEFS,
+        });
     }
 
     // Build text, spans, and source line map

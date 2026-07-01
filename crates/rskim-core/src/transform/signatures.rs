@@ -98,13 +98,15 @@ pub(crate) fn transform_signatures_with_spans_and_line_map(
         0,
     )?;
 
-    // Check signature count limit
+    // Signature count over the cap: a legitimate but very large file, not an
+    // attack. Signal a complexity limit so the dispatcher degrades to a lossless
+    // raw passthrough instead of failing the command. (#317)
     if signatures.len() > MAX_SIGNATURES {
-        return Err(SkimError::ParseError(format!(
-            "Too many signatures: {} (max: {}). Possible malicious input.",
-            signatures.len(),
-            MAX_SIGNATURES
-        )));
+        return Err(SkimError::ComplexityLimit {
+            what: "signatures",
+            count: signatures.len(),
+            max: MAX_SIGNATURES,
+        });
     }
 
     // Build text, spans, and source line map

@@ -96,13 +96,16 @@ pub(crate) fn transform_structure_with_spans_and_line_map(
     let mut replacements: HashMap<(usize, usize), &'static str> = HashMap::new();
     collect_body_replacements(tree.root_node(), &node_types, &mut replacements, 0)?;
 
-    // Check node count limit to prevent memory exhaustion
+    // Node count over the cap: typically a legitimate but very large file (e.g.
+    // a machine-generated weight table), not an attack. Signal a complexity
+    // limit so the dispatcher degrades to a lossless raw passthrough instead of
+    // failing the command. (#317)
     if replacements.len() > MAX_AST_NODES {
-        return Err(SkimError::ParseError(format!(
-            "Too many AST nodes: {} (max: {}). Possible malicious input.",
-            replacements.len(),
-            MAX_AST_NODES
-        )));
+        return Err(SkimError::ComplexityLimit {
+            what: "AST nodes",
+            count: replacements.len(),
+            max: MAX_AST_NODES,
+        });
     }
 
     // Build output by replacing bodies, tracking byte offset changes
@@ -526,11 +529,11 @@ pub(crate) fn extract_markdown_headers_with_spans(
         }
 
         if headers.len() > MAX_MARKDOWN_HEADERS {
-            return Err(SkimError::ParseError(format!(
-                "Too many markdown headers: {} (max: {}). Possible malicious input.",
-                headers.len(),
-                MAX_MARKDOWN_HEADERS
-            )));
+            return Err(SkimError::ComplexityLimit {
+                what: "markdown headers",
+                count: headers.len(),
+                max: MAX_MARKDOWN_HEADERS,
+            });
         }
 
         let node_type = node.kind();
