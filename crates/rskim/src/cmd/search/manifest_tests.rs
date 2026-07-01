@@ -389,7 +389,8 @@ fn test_stale_v3_jsonl_manifest_triggers_cold_start() {
     // Write a v3 JSONL manifest (the format #373 produced). Starts with `{`,
     // never the SKFM magic.
     let mut f = std::fs::File::create(&path).unwrap();
-    let header = serde_json::json!({"version": 3, "root": root.to_string_lossy(), "git_head": null});
+    let header =
+        serde_json::json!({"version": 3, "root": root.to_string_lossy(), "git_head": null});
     writeln!(f, "{header}").unwrap();
     let entry_json = serde_json::json!({
         "path": "src/old.rs",
@@ -562,7 +563,11 @@ fn test_field_map_large_offset_roundtrip_byte_identical() {
 
     // End offset 70000 > u16::MAX (65535).
     let big_field_map = vec![
-        (0usize, 100usize, SearchField::FunctionSignature.discriminant()),
+        (
+            0usize,
+            100usize,
+            SearchField::FunctionSignature.discriminant(),
+        ),
         (100, 70_000, SearchField::FunctionBody.discriminant()),
     ];
     let entry = ManifestEntry {
@@ -606,7 +611,11 @@ fn test_saved_manifest_is_not_jsonl() {
 
     let bytes = fs::read(cache_dir.join("index.skfiles")).unwrap();
     // Must start with the SKFM magic.
-    assert_eq!(&bytes[0..4], b"SKFM", "binary manifest must start with SKFM magic");
+    assert_eq!(
+        &bytes[0..4],
+        b"SKFM",
+        "binary manifest must start with SKFM magic"
+    );
     // Must NOT contain the JSON-array delimiter the JSONL field_map produced.
     let needle = b"],[";
     assert!(
@@ -634,7 +643,10 @@ fn test_binary_header_layout() {
     assert_eq!(version, FileManifest::FORMAT_VERSION);
     assert_eq!(version, 4, "FORMAT_VERSION must be 4 (AC-2)");
     let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    assert_eq!(count, 2, "entry count must be encoded as u32 in the header (AC-2)");
+    assert_eq!(
+        count, 2,
+        "entry count must be encoded as u32 in the header (AC-2)"
+    );
 }
 
 /// AC-2 (#380): load() returns Ok(empty) when the magic is absent.
@@ -645,7 +657,11 @@ fn test_load_absent_magic_returns_empty() {
     let cache_dir = root.clone();
 
     // Plausible length but wrong magic.
-    fs::write(cache_dir.join("index.skfiles"), b"XXXX\x04\x00\x00\x00\x00\x00\x00\x00").unwrap();
+    fs::write(
+        cache_dir.join("index.skfiles"),
+        b"XXXX\x04\x00\x00\x00\x00\x00\x00\x00",
+    )
+    .unwrap();
     let manifest = FileManifest::load(root, cache_dir).unwrap();
     assert_eq!(manifest.entry_count(), 0, "absent magic → Ok(empty) (AC-2)");
 }
@@ -789,8 +805,16 @@ fn test_full_entry_set_roundtrip_byte_identical() {
     let loaded = FileManifest::load(root, cache_dir).unwrap();
     assert_eq!(loaded.stored_git_head(), Some("c".repeat(40).as_str()));
     for e in &entries {
-        assert_eq!(loaded.lookup(&e.path), Some(e), "entry {} must round-trip", e.path);
+        assert_eq!(
+            loaded.lookup(&e.path),
+            Some(e),
+            "entry {} must round-trip",
+            e.path
+        );
     }
     // Sorted order (FileId↔path contract) preserved.
-    assert_eq!(loaded.sorted_paths(), vec!["README.md", "src/a.rs", "src/z.ts"]);
+    assert_eq!(
+        loaded.sorted_paths(),
+        vec!["README.md", "src/a.rs", "src/z.ts"]
+    );
 }

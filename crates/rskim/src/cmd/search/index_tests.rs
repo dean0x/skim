@@ -211,7 +211,11 @@ fn test_manifest_size_grounded_ceiling() {
     );
 
     // Sanity: the file is genuinely binary (SKFM magic), not JSONL.
-    assert_eq!(&raw[0..4], b"SKFM", "size guard must measure the binary manifest");
+    assert_eq!(
+        &raw[0..4],
+        b"SKFM",
+        "size guard must measure the binary manifest"
+    );
 }
 
 // ============================================================================
@@ -2699,26 +2703,33 @@ fn test_index_nested_dir_fileid_roundtrip() {
     }
 }
 
-/// AC-7 / AC-11: Manifest FORMAT_VERSION 2 → 3 — a hand-written v2 manifest
-/// is detected stale on the next query and rebuilt automatically (correctness-
-/// on-upgrade, no manual --rebuild needed).  A freshly-built v3 manifest is
-/// NOT re-treated as stale on a second query (no spurious rebuild loop).
+/// AC-7 / AC-11: an old-FORMAT_VERSION manifest is detected stale on the next
+/// query and rebuilt automatically (correctness-on-upgrade, no manual --rebuild
+/// needed).  A freshly-built current-version manifest is NOT re-treated as stale
+/// on a second query (no spurious rebuild loop).
 ///
-/// PF-007: two negative assertions — (i) reverting the FORMAT_VERSION to 2
-/// would make the v2 fixture survive the staleness check and FAIL the "was
-/// rebuilt" assertion below; (ii) returning a rebuild on every v3 query would
-/// FAIL the "no spurious rebuild on v3" assertion.
+/// #380 binarized the manifest (JSONL → compact binary, FORMAT_VERSION bumped to
+/// 4). This test drives the same `version_matches` / `manifest_stale` self-heal
+/// path against the binary format: it patches the on-disk header's little-endian
+/// `version` field (bytes 4..8) to an OLD version int while leaving the `SKFM`
+/// magic intact, so `version_matches` returns false (magic OK, version mismatch)
+/// and the staleness path rebuilds.
+///
+/// PF-007: two negative assertions — (i) accepting the old-version fixture as
+/// current would make it survive the staleness check and FAIL the "was rebuilt"
+/// assertion below; (ii) returning a rebuild on every current-version query
+/// would FAIL the "no spurious rebuild" assertion.
 ///
 /// Cites AD-373-3.
 #[test]
-fn test_manifest_v2_triggers_auto_rebuild_to_v3_on_next_query() {
+fn test_manifest_old_version_triggers_auto_rebuild_on_next_query() {
     use super::super::manifest::FileManifest;
     use super::super::query::execute_query;
     use super::super::types::IndexConfig;
     use super::super::types::QueryConfig;
     use super::build_index;
 
-    // 1. Build a fresh index (produces FORMAT_VERSION=3 manifest).
+    // 1. Build a fresh index (produces a current-FORMAT_VERSION binary manifest).
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let cache = tempfile::tempdir().unwrap();
@@ -2734,23 +2745,34 @@ fn test_manifest_v2_triggers_auto_rebuild_to_v3_on_next_query() {
     };
     build_index(&config).expect("initial build must succeed");
 
-    // 2. Overwrite the manifest header's version field with v2 (simulate
-    //    a pre-fix on-disk state).
+    // 2. Downgrade the on-disk manifest header's version field to an OLD int,
+    //    keeping the SKFM magic intact so the header still parses (binary v4
+    //    layout: 4 bytes magic "SKFM", then a little-endian u32 version). This
+    //    simulates a pre-#380/#373 on-disk manifest that `version_matches` must
+    //    reject as stale.
     let manifest_path = cache.path().join("index.skfiles");
-    let content = fs::read_to_string(&manifest_path).expect("manifest must exist after build");
-    // Replace `"version":3` with `"version":2` in the header (first JSONL line).
-    let v2_content = content.replacen("\"version\":3", "\"version\":2", 1);
-    fs::write(&manifest_path, &v2_content).expect("must be able to rewrite manifest");
-
-    // Verify the overwrite took effect.
-    let raw = fs::read_to_string(&manifest_path).unwrap();
+    let mut bytes = fs::read(&manifest_path).expect("manifest must exist after build");
     assert!(
-        raw.contains("\"version\":2"),
-        "manifest header must now say version 2 (simulating pre-fix on-disk state)"
+        bytes.len() >= 8 && &bytes[0..4] == b"SKFM",
+        "fresh manifest must be the binary SKFM format (got {} bytes, magic {:?})",
+        bytes.len(),
+        &bytes[0..bytes.len().min(4)]
+    );
+    let old_version: u32 = FileManifest::FORMAT_VERSION - 1;
+    bytes[4..8].copy_from_slice(&old_version.to_le_bytes());
+    fs::write(&manifest_path, &bytes).expect("must be able to rewrite manifest");
+
+    // Verify the downgrade took effect (header now reports the old version).
+    let raw = fs::read(&manifest_path).unwrap();
+    let on_disk_version = u32::from_le_bytes(raw[4..8].try_into().unwrap());
+    assert_eq!(
+        on_disk_version, old_version,
+        "manifest header must now report the old version (simulating a pre-#380 on-disk state)"
     );
 
-    // 3. Run a query. The staleness path detects VERSION_MISMATCH (2 ≠ 3) and
-    //    rebuilds automatically — no manual --rebuild.
+    // 3. Run a query. The staleness path detects the version mismatch via
+    //    `version_matches` (magic OK, version < FORMAT_VERSION) and rebuilds
+    //    automatically — no manual --rebuild.
     let q = QueryConfig {
         text: "probe".to_string(),
         limit: 5,
@@ -2763,44 +2785,45 @@ fn test_manifest_v2_triggers_auto_rebuild_to_v3_on_next_query() {
         composite_weights: None,
     };
     let output = execute_query(&q, &TEST_ANALYTICS)
-        .expect("query against v2 manifest must succeed (auto-rebuild)");
+        .expect("query against old-version manifest must succeed (auto-rebuild)");
 
     // After auto-rebuild the query must find our function.
     assert!(
         !output.results.is_empty(),
-        "AC-7/AC-11: after auto-rebuild from v2→v3, query for 'probe' must find results. \
-         If this fails, the staleness path did not trigger (FORMAT_VERSION 2 was accepted \
-         as current — version was not bumped to 3, reverting AD-373-3)."
+        "AC-7/AC-11: after auto-rebuild from an old manifest version, query for 'probe' must \
+         find results. If this fails, the staleness path did not trigger (the old FORMAT_VERSION \
+         was accepted as current — reverting AD-373-3 / the #380 version bump)."
     );
 
-    // 4. Verify the manifest on disk is now v3.
-    let rebuilt = fs::read_to_string(&manifest_path).unwrap();
-    assert!(
-        rebuilt.contains("\"version\":3"),
-        "AC-7/AC-11: after auto-rebuild, the on-disk manifest must be at FORMAT_VERSION 3. \
-         Got: {:?}",
-        &rebuilt[..rebuilt.find('\n').unwrap_or(rebuilt.len())]
+    // 4. Verify the manifest on disk is now the current FORMAT_VERSION.
+    let rebuilt = fs::read(&manifest_path).unwrap();
+    let rebuilt_version = u32::from_le_bytes(rebuilt[4..8].try_into().unwrap());
+    assert_eq!(
+        rebuilt_version,
+        FileManifest::FORMAT_VERSION,
+        "AC-7/AC-11: after auto-rebuild, the on-disk manifest must be at the current \
+         FORMAT_VERSION. Got version {rebuilt_version}."
     );
 
-    // 5. Steady-state: run a second query against the freshly-built v3 manifest.
+    // 5. Steady-state: run a second query against the freshly-built manifest.
     //    Must NOT trigger another rebuild (no spurious rebuild loop).
     let mtime_before = fs::metadata(&manifest_path).unwrap().modified().unwrap();
-    let _output2 =
-        execute_query(&q, &TEST_ANALYTICS).expect("second query against v3 manifest must succeed");
+    let _output2 = execute_query(&q, &TEST_ANALYTICS)
+        .expect("second query against current-version manifest must succeed");
     let mtime_after = fs::metadata(&manifest_path).unwrap().modified().unwrap();
     assert_eq!(
         mtime_before, mtime_after,
-        "AC-7 steady-state: a v3 manifest must NOT be rebuilt on a second query \
-         (no spurious rebuild loop). mtime changed, suggesting the manifest was \
-         rewritten — FORMAT_VERSION check is not working correctly."
+        "AC-7 steady-state: a current-version manifest must NOT be rebuilt on a second query \
+         (no spurious rebuild loop). mtime changed, suggesting the manifest was rewritten — \
+         the FORMAT_VERSION check is not working correctly."
     );
 
-    // Static: confirm FORMAT_VERSION constant is 3.
+    // Static: confirm FORMAT_VERSION constant matches the #380 binary format.
     assert_eq!(
         FileManifest::FORMAT_VERSION,
-        3,
-        "manifest::FORMAT_VERSION must be 3 after #373 (AD-373-3). \
-         If this fails, the constant was not bumped."
+        4,
+        "manifest::FORMAT_VERSION must be 4 after #380 (binary manifest). \
+         If this fails, the constant was changed without updating this test."
     );
 }
 

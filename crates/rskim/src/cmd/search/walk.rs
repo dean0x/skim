@@ -304,15 +304,18 @@ pub(super) fn walk_and_read(
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
 
-    // Parallel threads may over-collect beyond max_files due to TOCTOU on the
-    // atomic counter (multiple threads may pass the cap check before any of them
-    // increments it).
-    files.truncate(max_files);
-
     // AD-373-1 (ref): Sort by the same byte-wise normalized-string order as
     // `walk_metadata` / the manifest BTreeMap<String> so this test-only walker
     // and the production walker assign FileIds in the identical order.
+    //
+    // AD-379-7: sort BEFORE truncating so the retained subset at the cap is the
+    // deterministic byte-key-smallest `max_files` entries. Parallel threads
+    // collect in a non-deterministic order and may over-collect beyond
+    // max_files (TOCTOU on the atomic counter: multiple threads pass the cap
+    // check before any increments it), so truncating first would keep an
+    // arbitrary run-to-run subset.
     files.sort_by_key(|a| normalize_rel_path(&a.rel_path));
+    files.truncate(max_files);
 
     Ok((files, skipped))
 }
@@ -461,17 +464,21 @@ pub(super) fn walk_metadata(
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
 
-    // Parallel threads may over-collect beyond max_files due to TOCTOU on the
-    // atomic counter.
-    entries.truncate(max_files);
-
     // AD-373-1: Sort by the byte-wise normalized-string order that the manifest
     // BTreeMap<String> uses for key ordering. PathBuf::cmp is component-aware
     // and diverges from str::cmp on nested dirs (foo/bar.rs vs foo.rs), which
     // mis-resolved FileId→path (#373). normalize_rel_path produces the exact
     // byte string stored as the manifest key (index.rs `consume`) so assignment
     // order and resolution order are byte-identical.
+    //
+    // AD-379-7: sort BEFORE truncating to the cap. The parallel walker collects
+    // entries in a non-deterministic order (and may over-collect beyond
+    // max_files due to TOCTOU on the atomic counter), so truncating first would
+    // keep an arbitrary subset that oscillates run-to-run and flip-flops the
+    // staleness verdict into a rebuild loop. Sorting first makes the retained
+    // subset the deterministic byte-key-smallest `max_files` entries every run.
     entries.sort_by_key(|a| normalize_rel_path(&a.rel_path));
+    entries.truncate(max_files);
 
     Ok((entries, skipped))
 }

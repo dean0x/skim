@@ -692,7 +692,11 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         writeln!(out, "skim search index stats:")?;
         writeln!(out, "  files indexed : {}", stats.file_count)?;
         writeln!(out, "  total n-grams : {}", stats.total_ngrams)?;
-        writeln!(out, "  index size    : {} bytes (lexical)", stats.index_size_bytes)?;
+        writeln!(
+            out,
+            "  index size    : {} bytes (lexical)",
+            stats.index_size_bytes
+        )?;
         // AD-380-4: the TRUE total over all on-disk artifacts.
         writeln!(out, "  total on disk : {total_on_disk} bytes")?;
         // AD-380-5: temporal DB reported separately (scales with git history).
@@ -720,13 +724,13 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
 /// `metadata().len()` and a missing one counts as 0 bytes (fail-soft, AC-7).
 /// Adding a new index artifact means extending this list (one source of truth).
 const ON_DISK_ARTIFACTS: [&str; 7] = [
-    "index.skidx",        // lexical n-gram index
-    "index.skpost",       // lexical posting lists
-    "index.skfiles",      // binary file manifest (this ticket)
-    "ast_index.skidx",    // AST n-gram index header + metadata
-    "ast_index.skpost",   // AST posting lists
-    "ast_index.skcache",  // AST extraction cache
-    "temporal.db",        // hotspot / risk / co-change SQLite DB
+    "index.skidx",       // lexical n-gram index
+    "index.skpost",      // lexical posting lists
+    "index.skfiles",     // binary file manifest (this ticket)
+    "ast_index.skidx",   // AST n-gram index header + metadata
+    "ast_index.skpost",  // AST posting lists
+    "ast_index.skcache", // AST extraction cache
+    "temporal.db",       // hotspot / risk / co-change SQLite DB
 ];
 
 /// Return the byte length of one artifact in `cache_dir`, or 0 when it is absent
@@ -1225,7 +1229,11 @@ mod tests {
     #[test]
     fn test_total_on_disk_empty_dir_is_zero() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(total_on_disk_bytes(dir.path()), 0, "no artifacts → 0 bytes (AC-7)");
+        assert_eq!(
+            total_on_disk_bytes(dir.path()),
+            0,
+            "no artifacts → 0 bytes (AC-7)"
+        );
     }
 
     /// AC-7 (#380): `artifact_len` fail-soft — a missing file is 0 bytes.
@@ -2511,7 +2519,14 @@ mod tests {
 
         // (1) --hot --weights (temporal-only standalone): notice on stderr, exit 0.
         let hot = std::process::Command::new(&bin)
-            .args(["search", "--hot", "--weights", "0.5,0.3,0.2", "--root", &root_str])
+            .args([
+                "search",
+                "--hot",
+                "--weights",
+                "0.5,0.3,0.2",
+                "--root",
+                &root_str,
+            ])
             .env("SKIM_DISABLE_ANALYTICS", "1")
             .output()
             .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"));
@@ -2530,7 +2545,12 @@ mod tests {
         // (2) --blast-radius --weights (blast-only standalone): same notice on stderr.
         let blast = std::process::Command::new(&bin)
             .args([
-                "search", "--blast-radius", "src/auth.rs", "--weights", "0.5,0.3,0.2", "--root",
+                "search",
+                "--blast-radius",
+                "src/auth.rs",
+                "--weights",
+                "0.5,0.3,0.2",
+                "--root",
                 &root_str,
             ])
             .env("SKIM_DISABLE_ANALYTICS", "1")

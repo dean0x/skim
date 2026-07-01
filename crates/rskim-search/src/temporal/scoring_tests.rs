@@ -977,7 +977,11 @@ fn backtest_before_commits(t_cutoff: u64) -> Vec<CommitInfo> {
     for hot in ["hot_core_a.rs", "hot_core_b.rs", "hot_core_c.rs"] {
         for k in 0..50u64 {
             // 40 of 50 commits are fixes; vary the day so timestamps are distinct.
-            let msg = if k < 40 { "fix: recurring bug" } else { "add: feature" };
+            let msg = if k < 40 {
+                "fix: recurring bug"
+            } else {
+                "add: feature"
+            };
             commits.push(before(1 + (k % 60), msg, &[hot]));
         }
     }
@@ -985,7 +989,11 @@ fn backtest_before_commits(t_cutoff: u64) -> Vec<CommitInfo> {
     // --- NOISE: high-volume low-fix files (bare ratio ≈ 0.1, never fixed after T) ---
     for cold in ["stable_x.rs", "stable_y.rs"] {
         for k in 0..40u64 {
-            let msg = if k < 4 { "fix: rare" } else { "refactor: cleanup" };
+            let msg = if k < 4 {
+                "fix: rare"
+            } else {
+                "refactor: cleanup"
+            };
             commits.push(before(2 + (k % 50), msg, &[cold]));
         }
     }
@@ -1062,9 +1070,17 @@ fn risk_score_wilson_decay_beats_bare_ratio_on_backtest() {
     // ---- Phase 2: label each file by a fix-commit AFTER T (held-out) ----
     // Only the genuinely fix-prone "hot_core_*" files receive future fixes.
     let after_commits = [
-        make_commit(t_cutoff + DAY, "fix: regression after release", &["hot_core_a.rs"]),
+        make_commit(
+            t_cutoff + DAY,
+            "fix: regression after release",
+            &["hot_core_a.rs"],
+        ),
         make_commit(t_cutoff + 2 * DAY, "fix: edge case", &["hot_core_b.rs"]),
-        make_commit(t_cutoff + 3 * DAY, "fix: crash on startup", &["hot_core_c.rs"]),
+        make_commit(
+            t_cutoff + 3 * DAY,
+            "fix: crash on startup",
+            &["hot_core_c.rs"],
+        ),
     ];
     let mut future_fixed: HashSet<String> = HashSet::new();
     for c in &after_commits {

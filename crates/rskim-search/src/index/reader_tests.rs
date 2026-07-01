@@ -2414,9 +2414,8 @@ fn ac1_fast_path_skips_crc_on_held_mtime_byteflip() {
 
     let post_path = dir.path().join("index.skpost");
     // Capture the marker-anchored mtime BEFORE mutating the file.
-    let original_mtime = filetime::FileTime::from_last_modification_time(
-        &std::fs::metadata(&post_path).unwrap(),
-    );
+    let original_mtime =
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&post_path).unwrap());
 
     // Flip a byte WITHOUT changing length, leaving index.skidx (and thus the
     // header.checksum field) untouched.

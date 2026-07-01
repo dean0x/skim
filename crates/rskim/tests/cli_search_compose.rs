@@ -282,9 +282,8 @@ fn search_index_limit_is_honored_not_rejected() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("AC2: stdout must be valid JSON ({e}); got:\n{stdout}")
-    });
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("AC2: stdout must be valid JSON ({e}); got:\n{stdout}"));
     let rows = json["results"]
         .as_array()
         .expect("AC2: JSON must have a 'results' array");
@@ -327,9 +326,8 @@ fn search_index_cold_start_auto_builds_and_returns_results() {
         .clone();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("AC3: stdout must be valid JSON ({e}); got:\n{stdout}")
-    });
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("AC3: stdout must be valid JSON ({e}); got:\n{stdout}"));
     let rows = json["results"]
         .as_array()
         .expect("AC3: JSON must have a 'results' array");
@@ -408,9 +406,8 @@ fn search_bareword_build_is_a_query_not_a_build_action() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("AC8: stdout must be valid JSON ({e}); got:\n{stdout}")
-    });
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("AC8: stdout must be valid JSON ({e}); got:\n{stdout}"));
     let rows = json["results"]
         .as_array()
         .expect("AC8: JSON must have a 'results' array");

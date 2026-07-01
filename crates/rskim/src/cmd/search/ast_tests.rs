@@ -3509,8 +3509,8 @@ fn aaa() {
     .unwrap();
 
     // bbb: large filler body, exactly one `needle` → low BM25F (long doc, low TF).
-    let filler = "    // padding line to lengthen the document and depress term frequency\n"
-        .repeat(40);
+    let filler =
+        "    // padding line to lengthen the document and depress term frequency\n".repeat(40);
     fs::write(
         root.join("src/bbb.rs"),
         format!(

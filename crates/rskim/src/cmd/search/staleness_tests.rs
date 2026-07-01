@@ -1456,11 +1456,18 @@ fn test_check_staleness_working_tree_changed_exact_counts() {
     fs::create_dir_all(&cache_dir).unwrap();
 
     // One commit so HEAD is readable and stable across the edit.
-    create_real_git_repo(dir.path(), &[("init", &[("src/lib.rs", "fn alpha() {}\n")])]);
+    create_real_git_repo(
+        dir.path(),
+        &[("init", &[("src/lib.rs", "fn alpha() {}\n")])],
+    );
     build_index_in(dir.path(), &cache_dir);
 
     // Edit in place WITHOUT committing — HEAD stays the same.
-    fs::write(dir.path().join("src/lib.rs"), "fn alpha_edited_longer() {}\n").unwrap();
+    fs::write(
+        dir.path().join("src/lib.rs"),
+        "fn alpha_edited_longer() {}\n",
+    )
+    .unwrap();
 
     let (result, manifest) = check_staleness(&cache_dir, dir.path());
     match result {
@@ -1543,7 +1550,10 @@ fn test_auto_refresh_indexes_new_working_tree_file() {
 
     let analytics = TEST_ANALYTICS;
     let (refreshed, _manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
-    assert!(refreshed, "a new working-tree file must trigger a rebuild (AC2)");
+    assert!(
+        refreshed,
+        "a new working-tree file must trigger a rebuild (AC2)"
+    );
 
     let paths = manifest_paths(dir.path(), &cache_dir);
     assert!(
@@ -1565,7 +1575,10 @@ fn test_auto_refresh_reflects_delete_and_rename() {
         dir.path(),
         &[(
             "init",
-            &[("src/old.rs", "fn renamed_me() {}\n"), ("src/keep.rs", "fn keep() {}\n")],
+            &[
+                ("src/old.rs", "fn renamed_me() {}\n"),
+                ("src/keep.rs", "fn keep() {}\n"),
+            ],
         )],
     );
     build_index_in(dir.path(), &cache_dir);
@@ -1598,7 +1611,10 @@ fn test_auto_refresh_clean_tree_no_rebuild_idempotent() {
     let cache_dir = dir.path().join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
 
-    create_real_git_repo(dir.path(), &[("init", &[("src/lib.rs", "fn clean() {}\n")])]);
+    create_real_git_repo(
+        dir.path(),
+        &[("init", &[("src/lib.rs", "fn clean() {}\n")])],
+    );
     build_index_in(dir.path(), &cache_dir);
 
     let manifest_path = cache_dir.join("index.skfiles");
@@ -1735,7 +1751,11 @@ fn test_auto_refresh_non_git_working_tree_change_reindexes() {
     build_index_in(dir.path(), &cache_dir);
 
     // Edit the file (size grows) — no git involved.
-    fs::write(dir.path().join("lib.rs"), "fn ng_original() {}\nfn ng_added() {}\n").unwrap();
+    fs::write(
+        dir.path().join("lib.rs"),
+        "fn ng_original() {}\nfn ng_added() {}\n",
+    )
+    .unwrap();
 
     let analytics = TEST_ANALYTICS;
     let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
@@ -1755,7 +1775,10 @@ fn test_auto_refresh_corrupt_head_with_working_tree_change_reindexes() {
     fs::create_dir_all(&cache_dir).unwrap();
 
     // Real repo so the manifest records a stored HEAD at build time.
-    create_real_git_repo(dir.path(), &[("init", &[("src/lib.rs", "fn ch_original() {}\n")])]);
+    create_real_git_repo(
+        dir.path(),
+        &[("init", &[("src/lib.rs", "fn ch_original() {}\n")])],
+    );
     build_index_in(dir.path(), &cache_dir);
 
     // Corrupt HEAD so read_git_head returns None (not a valid ref or SHA).
@@ -1794,7 +1817,11 @@ fn test_auto_refresh_working_tree_change_single_rebuild_across_pair() {
     create_real_git_repo(dir.path(), &[("init", &[("src/lib.rs", "fn s() {}\n")])]);
     build_index_in(dir.path(), &cache_dir);
 
-    fs::write(dir.path().join("src/lib.rs"), "fn s() {}\nfn second_marker() {}\n").unwrap();
+    fs::write(
+        dir.path().join("src/lib.rs"),
+        "fn s() {}\nfn second_marker() {}\n",
+    )
+    .unwrap();
 
     let manifest_path = cache_dir.join("index.skfiles");
     let analytics = TEST_ANALYTICS;
@@ -1838,7 +1865,11 @@ fn test_auto_refresh_pre_379_manifest_self_heals_populates_mtime_size() {
     // Keep the stored HEAD so the HEAD compare yields Current (only the scan can fire).
     let head = read_git_head(dir.path());
     let loaded = FileManifest::load(dir.path().to_path_buf(), cache_dir.to_path_buf()).unwrap();
-    let paths: Vec<String> = loaded.sorted_paths().iter().map(|s| s.to_string()).collect();
+    let paths: Vec<String> = loaded
+        .sorted_paths()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let mut downgraded = FileManifest::new(dir.path().to_path_buf(), cache_dir.to_path_buf());
     downgraded.set_git_head(head);
     for p in &paths {
@@ -1864,7 +1895,9 @@ fn test_auto_refresh_pre_379_manifest_self_heals_populates_mtime_size() {
 
     // The rewritten manifest now carries populated mtime AND size.
     let healed = FileManifest::load(dir.path().to_path_buf(), cache_dir.to_path_buf()).unwrap();
-    let entry = healed.lookup("src/lib.rs").expect("file must still be indexed");
+    let entry = healed
+        .lookup("src/lib.rs")
+        .expect("file must still be indexed");
     assert!(entry.mtime.is_some(), "rebuild must populate mtime (AC10)");
     assert!(entry.size.is_some(), "rebuild must populate size (AC10)");
 }
