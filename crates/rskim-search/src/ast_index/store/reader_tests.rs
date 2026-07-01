@@ -1223,8 +1223,7 @@ fn ac2_ast_marker_miss_on_mtime_bump_reverifies() {
     filetime::set_file_mtime(&idx_path, bumped).unwrap();
 
     let err = AstIndexReader::open(dir.path())
-        .err()
-        .expect("AC2/AST: mtime-bumped corruption must fail open()");
+        .expect_err("AC2/AST: mtime-bumped corruption must fail open()");
     assert!(
         format!("{err}").contains("checksum mismatch"),
         "AC2/AST: marker-miss must re-verify and report 'checksum mismatch': {err}"
@@ -1244,8 +1243,7 @@ fn ac2_ast_marker_absent_reverifies() {
     std::fs::write(&idx_path, &idx).unwrap();
 
     let err = AstIndexReader::open(dir.path())
-        .err()
-        .expect("AC2/AST: corruption with absent marker must fail open()");
+        .expect_err("AC2/AST: corruption with absent marker must fail open()");
     assert!(
         format!("{err}").contains("checksum mismatch"),
         "AC2/AST: marker-absent must fall through to full CRC32: {err}"
@@ -1323,8 +1321,7 @@ fn ac5_ast_rebuild_invalidates_stale_marker() {
     filetime::set_file_mtime(&idx_path, bumped).unwrap();
 
     let err = AstIndexReader::open(dir.path())
-        .err()
-        .expect("AC5(b)/AST: post-rebuild corruption must fail open()");
+        .expect_err("AC5(b)/AST: post-rebuild corruption must fail open()");
     assert!(
         format!("{err}").contains("checksum mismatch"),
         "AC5(b)/AST: stale marker must not serve corrupted post-rebuild bytes: {err}"

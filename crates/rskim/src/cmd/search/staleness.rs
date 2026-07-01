@@ -636,9 +636,7 @@ pub(super) fn auto_refresh_if_stale(
     // skipped we must report `refreshed == false` and skip the post-rebuild
     // temporal hook (nothing was rebuilt), so the steady-state no-op contract
     // (AC7/AC14) holds.
-    let did_build: bool;
-
-    match staleness {
+    let did_build: bool = match staleness {
         StalenessCheck::Current => unreachable!(),
         StalenessCheck::NoIndex => {
             eprintln!("skim search: building index…");
@@ -648,7 +646,7 @@ pub(super) fn auto_refresh_if_stale(
                 result.file_count,
                 result.duration.as_secs_f64()
             );
-            did_build = true;
+            true
         }
         StalenessCheck::HeadChanged { stored, current } => {
             if crate::debug::is_debug_enabled() {
@@ -661,7 +659,7 @@ pub(super) fn auto_refresh_if_stale(
                 eprintln!("skim search: index stale (HEAD changed), refreshing…");
             }
             build_index(&config)?;
-            did_build = true;
+            true
         }
         StalenessCheck::NoStoredHead => {
             // Manifest exists but no HEAD recorded — could be an old build or
@@ -669,7 +667,7 @@ pub(super) fn auto_refresh_if_stale(
             // Rebuild to get a fresh manifest with HEAD stored.
             eprintln!("skim search: refreshing index (no HEAD recorded)…");
             build_index(&config)?;
-            did_build = true;
+            true
         }
         StalenessCheck::WorkingTreeChanged {
             changed,
@@ -694,9 +692,9 @@ pub(super) fn auto_refresh_if_stale(
                     StalenessCheck::WorkingTreeChanged { .. }
                 )
             })?;
-            did_build = built.is_some();
+            built.is_some()
         }
-    }
+    };
 
     // If the rebuild was skipped because a peer already refreshed (AD-379-8),
     // the index is now Current: return without re-running the temporal hook.
