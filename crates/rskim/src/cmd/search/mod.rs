@@ -34,6 +34,16 @@ use serde::Serialize;
 // Public entry point
 // ============================================================================
 
+/// Returns the number of args before the first POSIX `--` terminator.
+///
+/// After `--`, every token is a literal query term, not a flag. Only
+/// `args[..pre_double_dash_len(args)]` should be tested for `--help` / `-h`
+/// so that `skim search -- --help` searches for the literal word `--help`
+/// instead of printing help — consistent with how `parse_flags` treats `--`.
+fn pre_double_dash_len(args: &[String]) -> usize {
+    args.iter().position(|a| a == "--").unwrap_or(args.len())
+}
+
 /// Decide whether a leading `index` token starts the index-BUILD subcommand
 /// rather than a search for the literal term "index".
 ///
@@ -95,8 +105,16 @@ pub(crate) fn run(
         return index::run(&args[1..], analytics);
     }
 
-    // No args or --help/-h → print help
-    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+    // No args or --help/-h → print help.
+    // Only scan args *before* the first `--` terminator: after `--`, every token
+    // is a literal query term (the documented escape hatch for flag-like words),
+    // so `skim search -- --help` must search for "--help", not print help.
+    let scan_end = pre_double_dash_len(args);
+    if args.is_empty()
+        || args[..scan_end]
+            .iter()
+            .any(|a| matches!(a.as_str(), "--help" | "-h"))
+    {
         print_help();
         return Ok(ExitCode::SUCCESS);
     }
@@ -934,6 +952,86 @@ mod tests {
             flags.action,
             SearchAction::Query("index out of bounds".to_string())
         );
+    }
+
+    /// B2: `--` must shield `--help` and `-h` from the early-return help scan in
+    /// `run()`. Before this fix, `run()` scanned ALL args unconditionally, so
+    /// `skim search -- --help` printed help instead of searching for "--help".
+    ///
+    /// Tests `pre_double_dash_len` (the helper that determines the scan boundary)
+    /// directly, then confirms `parse_flags` treats `--help` after `--` as a query
+    /// term, and that `run()` still honors bare `--help` as the help flag.
+    #[test]
+    fn double_dash_shields_help_from_early_scan() {
+        // pre_double_dash_len returns the index of the first `--`, or args.len()
+        // when no `--` is present.
+        assert_eq!(pre_double_dash_len(&v(&[])), 0);
+        assert_eq!(pre_double_dash_len(&v(&["--help"])), 1); // no `--`, full length
+        assert_eq!(pre_double_dash_len(&v(&["--", "--help"])), 0); // `--` at index 0
+        assert_eq!(pre_double_dash_len(&v(&["foo", "--", "--help"])), 1); // `--` at index 1
+
+        // parse_flags confirms: `-- --help` is a literal query term, not the help flag.
+        let flags = parse_flags(&v(&["--", "--help"])).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("--help".to_string()),
+            "`--help` after `--` must be a query term, not the help flag"
+        );
+        let flags2 = parse_flags(&v(&["--", "-h"])).unwrap();
+        assert_eq!(
+            flags2.action,
+            SearchAction::Query("-h".to_string()),
+            "`-h` after `--` must be a query term, not the help flag"
+        );
+
+        // run() still dispatches bare --help to the help path (no regression).
+        let result = run(&["--help".to_string()], &TEST_ANALYTICS).unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "bare --help must still print help and return SUCCESS"
+        );
+    }
+
+    /// B3: Drift guard for the build-grammar alignment between `index_args_are_build`
+    /// (mod.rs) and clap `IndexCli` (index.rs).
+    ///
+    /// These two definitions are only coupled by convention — no compile-time link
+    /// enforces agreement. If a flag is added to `IndexCli` but not mirrored into
+    /// `index_args_are_build`, `skim search index --new-flag` silently falls through
+    /// to the query path — the exact silent-misrouting bug this PR fixed.
+    ///
+    /// When you add a flag to `IndexCli`, update `index_args_are_build` AND this test.
+    /// `IndexCli` flags: `--root`, `--force`, `--max-files`, `--index-dir` (hidden).
+    #[test]
+    fn index_args_are_build_mirrors_index_cli_flags() {
+        // Equals forms for value flags (supplements the space-form coverage in the
+        // basic grammar test, which covers `--root /x`, `--max-files 100 --force`).
+        assert!(
+            index_args_are_build(&v(&["--max-files=1000"])),
+            "--max-files=N equals form must be recognized as build grammar"
+        );
+        // --index-dir is a hidden IndexCli flag for internal/test use; it must be
+        // recognized in both forms so `skim search index --index-dir /path` routes
+        // to the build path rather than falling through to query.
+        assert!(
+            index_args_are_build(&v(&["--index-dir", "/tmp/cache"])),
+            "--index-dir <path> must be recognized as build grammar"
+        );
+        assert!(
+            index_args_are_build(&v(&["--index-dir=/tmp/cache"])),
+            "--index-dir=<path> must be recognized as build grammar"
+        );
+        // Combined: mirrors a realistic multi-flag build invocation.
+        assert!(index_args_are_build(&v(&[
+            "--force",
+            "--root",
+            "/tmp/project",
+            "--max-files",
+            "5000",
+            "--index-dir",
+            "/tmp/custom-cache",
+        ])));
     }
 
     // ============================================================================

@@ -80,7 +80,9 @@ pub(crate) fn collect_removable_comments(
         )));
     }
 
-    // SECURITY: Prevent memory exhaustion from excessive nodes
+    // AST node count over the cap: typically a legitimate but very large generated
+    // file, not an attack. Signal a complexity limit so the dispatcher degrades to
+    // a lossless raw passthrough instead of failing the command. (#317)
     *ctx.node_count += 1;
     if *ctx.node_count > MAX_AST_NODES {
         return Err(SkimError::ComplexityLimit {

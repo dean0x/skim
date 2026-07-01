@@ -660,8 +660,12 @@ fn test_json_token_reduction() {
 }
 
 #[test]
-fn test_json_large_keys_security() {
-    // SECURITY TEST: Ensure JSON with >10,000 keys is rejected
+fn test_json_large_keys_degrades_to_passthrough() {
+    // A legitimate but very large JSON (package-lock.json, an OpenAPI or i18n
+    // bundle) can exceed MAX_JSON_KEYS. Rather than failing the command, skim
+    // degrades to a lossless raw passthrough — the same policy applied to oversized
+    // tree-sitter files (#385). Safe because input size is already bounded by
+    // MAX_INPUT_SIZE before parsing, and the passthrough is a bounded copy.
     let mut json = String::from("{");
     for i in 0..10_001 {
         if i > 0 {
@@ -671,14 +675,11 @@ fn test_json_large_keys_security() {
     }
     json.push('}');
 
-    let result = transform(&json, Language::Json, Mode::Structure);
-
-    assert!(result.is_err(), "Expected error for excessive keys");
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("key count exceeded"),
-        "Error message should mention key count limit, got: {}",
-        err_msg
+    let output = transform(&json, Language::Json, Mode::Structure)
+        .expect("large-key JSON should degrade to passthrough, not error");
+    assert_eq!(
+        output, json,
+        "degraded output must be the lossless raw source verbatim"
     );
 }
 
@@ -1000,21 +1001,21 @@ fn test_detect_language_yaml() {
 }
 
 #[test]
-fn test_yaml_large_keys_security() {
-    // SECURITY TEST: Ensure YAML with >10,000 keys is rejected
+fn test_yaml_large_keys_degrades_to_passthrough() {
+    // A legitimate but very large YAML can exceed MAX_YAML_KEYS. Rather than failing
+    // the command, skim degrades to a lossless raw passthrough — the same policy
+    // applied to oversized tree-sitter files (#385). Safe because input size is
+    // already bounded by MAX_INPUT_SIZE before parsing.
     let mut yaml = String::new();
     for i in 0..10_001 {
         yaml.push_str(&format!("key_{}: {}\n", i, i));
     }
 
-    let result = transform(&yaml, Language::Yaml, Mode::Structure);
-
-    assert!(result.is_err(), "Expected error for excessive keys");
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("key count exceeded"),
-        "Error message should mention key count limit, got: {}",
-        err_msg
+    let output = transform(&yaml, Language::Yaml, Mode::Structure)
+        .expect("large-key YAML should degrade to passthrough, not error");
+    assert_eq!(
+        output, yaml,
+        "degraded output must be the lossless raw source verbatim"
     );
 }
 

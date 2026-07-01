@@ -68,15 +68,15 @@ pub(crate) struct ProcessResult {
     pub(crate) stdin_raw: Option<String>,
 }
 
-/// Determine the parse quality tier from the mode and whether the parser reported errors.
+/// Determine the parse quality tier from the mode, parse-error flag, and degraded flag.
 ///
 /// - "passthrough" — Mode::Full; no transformation was applied
-/// - "degraded"    — tree-sitter reported syntax errors
-/// - "full"        — clean parse, no syntax errors
-pub(crate) fn parse_tier_from(mode: Mode, has_errors: bool) -> &'static str {
+/// - "degraded" — tree-sitter reported syntax errors, OR a structural safety cap was exceeded and the output was degraded to raw passthrough
+/// - "full" — clean parse, no syntax errors, and no cap-triggered degradation
+pub(crate) fn parse_tier_from(mode: Mode, has_errors: bool, degraded: bool) -> &'static str {
     if mode == Mode::Full {
         "passthrough"
-    } else if has_errors {
+    } else if has_errors || degraded {
         "degraded"
     } else {
         "full"
@@ -246,10 +246,16 @@ fn read_and_validate(path: &Path) -> anyhow::Result<String> {
 /// Transform file contents, trying auto-detection first and falling back to
 /// `explicit_lang` when provided.
 ///
-/// Returns `(transformed_output, mode_used, has_errors, source_line_map)` where:
+/// Output tuple of [`run_transform`]:
+/// `(transformed_output, mode_used, has_errors, source_line_map, degraded)`.
+type RunTransformOutput = (String, Mode, bool, Option<Vec<usize>>, bool);
+
+/// Returns `(transformed_output, mode_used, has_errors, source_line_map, degraded)` where:
 /// - `has_errors` reflects whether the parser encountered syntax errors
 /// - `source_line_map` is `Some(map)` when `options.line_numbers` is true and the
 ///   transform produced a meaningful source line map; `None` otherwise
+/// - `degraded` is `true` when a structural safety cap was exceeded and the output
+///   was degraded to raw passthrough
 ///
 /// For cascade paths (token_budget is set) `has_errors` is always `false` and
 /// line numbers are applied after mode selection.
@@ -257,7 +263,7 @@ fn run_transform(
     contents: &str,
     path: &Path,
     options: &ProcessOptions,
-) -> anyhow::Result<(String, Mode, bool, Option<Vec<usize>>)> {
+) -> anyhow::Result<RunTransformOutput> {
     let explicit_lang = options.explicit_lang;
     // Non-line-number transform closure (used for cascade mode selection)
     let transform_file = |config: &TransformConfig| -> anyhow::Result<Option<String>> {
@@ -298,14 +304,14 @@ fn run_transform(
             // Use the re-run output directly as the final output (avoids double transform).
             let (final_output, line_map) = if options.line_numbers {
                 let config = cascade::build_config_with_opts(mode, &options.trunc, true);
-                let (rerun_output, _has_errors, map) =
+                let (rerun_output, _has_errors, map, _degraded) =
                     transform_with_line_map(contents, language, &config)?;
                 (rerun_output, map)
             } else {
                 (output, None)
             };
 
-            Ok((final_output, mode, false, line_map))
+            Ok((final_output, mode, false, line_map, false)) // cascade path: degraded signal N/A
         }
         None => {
             let language = explicit_lang.or_else(|| detect_language_from_path(path));
@@ -317,9 +323,9 @@ fn run_transform(
                     &options.trunc,
                     options.line_numbers,
                 );
-                let (output, has_errors, line_map) =
+                let (output, has_errors, line_map, degraded) =
                     transform_with_line_map(contents, lang, &config)?;
-                Ok((output, options.mode, has_errors, line_map))
+                Ok((output, options.mode, has_errors, line_map, degraded))
             } else {
                 // Language detection failed — try auto-detect via path extension.
                 // Can't get line map without a known language.
@@ -327,7 +333,7 @@ fn run_transform(
                 let output = transform_file(&config)?.ok_or_else(|| {
                     anyhow::anyhow!("Language detection failed and no --language specified")
                 })?;
-                Ok((output, options.mode, false, None))
+                Ok((output, options.mode, false, None, false))
             }
         }
     }
@@ -376,7 +382,10 @@ pub(crate) fn process_stdin(
         }
     })?;
 
-    let (transformed, stdin_has_errors, stdin_line_map) = match options.trunc.token_budget {
+    let (transformed, stdin_has_errors, stdin_line_map, stdin_degraded) = match options
+        .trunc
+        .token_budget
+    {
         Some(budget) => {
             // AC-10: Cascade mode selection without line numbers, then re-run with line numbers
             let (output, mode) = cascade::cascade_for_token_budget(
@@ -389,24 +398,39 @@ pub(crate) fn process_stdin(
             // Use the re-run output directly as the final output (avoids double transform).
             let (cascade_output, line_map) = if options.line_numbers {
                 let config = cascade::build_config_with_opts(mode, &options.trunc, true);
-                let (rerun, _errs, map) = transform_with_line_map(&buffer, language, &config)?;
+                let (rerun, _errs, map, _degraded) =
+                    transform_with_line_map(&buffer, language, &config)?;
                 (rerun, map)
             } else {
                 (output, None)
             };
-            (cascade_output, false, line_map)
+            (cascade_output, false, line_map, false) // cascade path: degraded signal N/A
         }
         None => {
             let config =
                 cascade::build_config_with_opts(options.mode, &options.trunc, options.line_numbers);
-            let (output, has_errors, line_map) =
+            let (output, has_errors, line_map, degraded) =
                 transform_with_line_map(&buffer, language, &config)?;
-            (output, has_errors, line_map)
+            (output, has_errors, line_map, degraded)
         }
     };
 
+    // Emit notice when SKIM_DEBUG=1 and the transform degraded to passthrough due to a
+    // structural safety cap. The notice goes to stderr to avoid polluting stdout output.
+    if stdin_degraded && std::env::var("SKIM_DEBUG").as_deref() == Ok("1") {
+        eprintln!(
+            "[skim] notice: file too large to compress in {:?} mode \
+             (structural cap exceeded) — degraded to passthrough",
+            options.mode
+        );
+    }
+
     // Determine parse quality tier before guardrail.
-    let parse_tier = Some(parse_tier_from(options.mode, stdin_has_errors));
+    let parse_tier = Some(parse_tier_from(
+        options.mode,
+        stdin_has_errors,
+        stdin_degraded,
+    ));
 
     // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
     // Same protection as process_file; token counting happens after so stats reflect
@@ -478,11 +502,22 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     }
 
     let contents = read_and_validate(path)?;
-    let (result, mode_used, has_errors, line_map) = run_transform(&contents, path, &options)?;
+    let (result, mode_used, has_errors, line_map, degraded) =
+        run_transform(&contents, path, &options)?;
+
+    // Emit notice when SKIM_DEBUG=1 and the transform degraded to passthrough due to a
+    // structural safety cap. The notice goes to stderr to avoid polluting stdout output.
+    if degraded && std::env::var("SKIM_DEBUG").as_deref() == Ok("1") {
+        eprintln!(
+            "[skim] notice: file too large to compress in {:?} mode \
+             (structural cap exceeded) — degraded to passthrough",
+            options.mode
+        );
+    }
 
     // Determine parse quality tier before guardrail (guardrail may swap output,
     // but the parse tier reflects the transformation, not the final selection).
-    let parse_tier = Some(parse_tier_from(options.mode, has_errors));
+    let parse_tier = Some(parse_tier_from(options.mode, has_errors, degraded));
 
     // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
     // Token counting happens AFTER this decision so stats reflect the final output.
@@ -622,22 +657,33 @@ mod tests {
 
     #[test]
     fn test_parse_tier_passthrough() {
-        assert_eq!(parse_tier_from(Mode::Full, false), "passthrough");
-        assert_eq!(parse_tier_from(Mode::Full, true), "passthrough");
+        assert_eq!(parse_tier_from(Mode::Full, false, false), "passthrough");
+        assert_eq!(parse_tier_from(Mode::Full, true, false), "passthrough");
+        // degraded is irrelevant for Full mode (always "passthrough")
+        assert_eq!(parse_tier_from(Mode::Full, false, true), "passthrough");
     }
 
     #[test]
     fn test_parse_tier_degraded() {
-        assert_eq!(parse_tier_from(Mode::Structure, true), "degraded");
-        assert_eq!(parse_tier_from(Mode::Signatures, true), "degraded");
-        assert_eq!(parse_tier_from(Mode::Minimal, true), "degraded");
+        assert_eq!(parse_tier_from(Mode::Structure, true, false), "degraded");
+        assert_eq!(parse_tier_from(Mode::Signatures, true, false), "degraded");
+        assert_eq!(parse_tier_from(Mode::Minimal, true, false), "degraded");
     }
 
     #[test]
     fn test_parse_tier_full() {
-        assert_eq!(parse_tier_from(Mode::Structure, false), "full");
-        assert_eq!(parse_tier_from(Mode::Signatures, false), "full");
-        assert_eq!(parse_tier_from(Mode::Types, false), "full");
+        assert_eq!(parse_tier_from(Mode::Structure, false, false), "full");
+        assert_eq!(parse_tier_from(Mode::Signatures, false, false), "full");
+        assert_eq!(parse_tier_from(Mode::Types, false, false), "full");
+    }
+
+    #[test]
+    fn test_parse_tier_complexity_limited() {
+        // A file degraded via ComplexityLimit (oversized) must report "degraded",
+        // not "full", so analytics and callers are not misled. (#A7 tier-mislabel fix)
+        assert_eq!(parse_tier_from(Mode::Structure, false, true), "degraded");
+        assert_eq!(parse_tier_from(Mode::Pseudo, false, true), "degraded");
+        assert_eq!(parse_tier_from(Mode::Minimal, false, true), "degraded");
     }
 
     // ========================================================================

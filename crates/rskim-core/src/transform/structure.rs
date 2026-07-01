@@ -528,6 +528,8 @@ pub(crate) fn extract_markdown_headers_with_spans(
             )));
         }
 
+        // Markdown-header count over the cap: a legitimate but very large document.
+        // Signal a complexity limit so the dispatcher degrades to passthrough. (#317)
         if headers.len() > MAX_MARKDOWN_HEADERS {
             return Err(SkimError::ComplexityLimit {
                 what: "markdown headers",

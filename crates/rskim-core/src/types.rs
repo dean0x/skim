@@ -211,17 +211,21 @@ impl Language {
         source: &str,
         config: &TransformConfig,
     ) -> Result<(String, bool)> {
-        let (content, has_errors, _line_map) =
+        let (content, has_errors, _line_map, _degraded) =
             self.transform_source_with_line_map(source, config)?;
         Ok((content, has_errors))
     }
 
-    /// Transform source code, returning `(content, has_errors, source_line_map)`.
+    /// Transform source code, returning `(content, has_errors, source_line_map, degraded)`.
     ///
     /// Extended version of `transform_source` that also returns a source line map
     /// when `config.line_numbers` is true. The source line map maps each output
     /// line index (0-based) to its 1-indexed source line number; value `0` indicates
     /// an omission/truncation marker with no line number annotation.
+    ///
+    /// The `degraded` flag is `true` when a structural safety cap was exceeded and
+    /// the transform fell back to raw passthrough. Callers may use this to emit
+    /// diagnostics (e.g. under `SKIM_DEBUG=1`) or to record the correct parse quality tier.
     ///
     /// When `config.line_numbers` is false, `source_line_map` is `None`.
     ///
@@ -235,7 +239,7 @@ impl Language {
         self,
         source: &str,
         config: &TransformConfig,
-    ) -> Result<(String, bool, Option<Vec<usize>>)> {
+    ) -> Result<(String, bool, Option<Vec<usize>>, bool)> {
         debug_assert!(
             !(config.max_lines.is_some() && config.last_lines.is_some()),
             "max_lines and last_lines are mutually exclusive"
@@ -248,12 +252,24 @@ impl Language {
                 && (self.is_serde_based() || self == Self::Markdown));
 
         if is_passthrough {
-            return self.transform_passthrough_with_line_map(source, config);
+            let (content, has_errors, line_map) =
+                self.transform_passthrough_with_line_map(source, config)?;
+            return Ok((content, has_errors, line_map, false)); // expected passthrough, not degraded
         }
 
         // Serde-based non-full modes: restructured output, no meaningful source line map.
+        // A key-count cap overflow (ComplexityLimit) degrades to passthrough, mirroring the
+        // tree-sitter path. (#317: compress, never truncate; if we can't compress, passthrough.)
         if self.is_serde_based() {
-            return self.transform_serde_with_line_map(source, config);
+            return match self.transform_serde_with_line_map(source, config) {
+                Err(e) if e.is_complexity_limit() => {
+                    let (content, _has_errors, line_map) =
+                        self.transform_passthrough_with_line_map(source, config)?;
+                    Ok((content, false, line_map, true)) // degraded: key-count cap hit
+                }
+                Ok((content, has_errors, line_map)) => Ok((content, has_errors, line_map, false)),
+                Err(e) => Err(e),
+            };
         }
 
         // Tree-sitter path (all non-serde languages in Structure/Signatures/Types/Minimal/Pseudo)
@@ -274,7 +290,9 @@ impl Language {
                 // branch handles its own truncation and returns early, so the
                 // last_lines post-processing below is correctly bypassed.
                 Err(e) if e.is_complexity_limit() => {
-                    return self.transform_passthrough_with_line_map(source, config);
+                    let (content, _has_errors, line_map) =
+                        self.transform_passthrough_with_line_map(source, config)?;
+                    return Ok((content, false, line_map, true)); // degraded: AST cap hit
                 }
                 Err(e) => return Err(e),
             };
@@ -296,7 +314,7 @@ impl Language {
             (result, line_map)
         };
 
-        Ok((result, parse_errors, line_map))
+        Ok((result, parse_errors, line_map, false)) // normal tree-sitter transform, not degraded
     }
 
     /// Passthrough branch of `transform_source_with_line_map`.
@@ -313,8 +331,6 @@ impl Language {
         source: &str,
         config: &TransformConfig,
     ) -> Result<(String, bool, Option<Vec<usize>>)> {
-        let text = source.to_string();
-
         if let Some(n) = config.last_lines {
             // ARCHITECTURE: For passthrough (identity transform), build the source
             // line map directly from arithmetic instead of using
@@ -329,8 +345,8 @@ impl Language {
             // Marker line gets source_line = 0 (no annotation).
             // Content line i (0-indexed within content) gets source_line:
             //   source_line_count - n_content + 1 + i  (1-indexed)
-            let source_line_count = text.lines().count();
-            let truncated = crate::transform::truncate::simple_last_line_truncate(&text, self, n)?;
+            let source_line_count = source.lines().count();
+            let truncated = crate::transform::truncate::simple_last_line_truncate(source, self, n)?;
             let line_map = if config.line_numbers {
                 if source_line_count <= n {
                     // No truncation occurred: identity map
@@ -359,7 +375,7 @@ impl Language {
         // apply it here as a simple line truncation.
         if let Some(max_lines) = config.max_lines {
             let truncated =
-                crate::transform::truncate::simple_line_truncate(&text, self, max_lines)?;
+                crate::transform::truncate::simple_line_truncate(source, self, max_lines)?;
             let line_map = if config.line_numbers {
                 // After simple_line_truncate the output is a prefix of the source
                 // (with an optional trailing truncation marker). Build the map by
@@ -375,12 +391,12 @@ impl Language {
         let line_map = if config.line_numbers {
             // Full mode (passthrough): identity map
             // For serde-based Minimal/Pseudo passthrough: also identity (source is output)
-            let n = text.lines().count();
+            let n = source.lines().count();
             Some((1..=n).collect::<Vec<usize>>())
         } else {
             None
         };
-        Ok((text, false, line_map))
+        Ok((source.to_string(), false, line_map))
     }
 
     /// Serde branch of `transform_source_with_line_map`.
@@ -783,6 +799,11 @@ impl TransformResult {
 /// ARCHITECTURE: Using thiserror for ergonomic error handling.
 /// All library functions return Result<T, SkimError>.
 /// NO panics allowed in library code (enforced by clippy lints).
+///
+/// This enum is `#[non_exhaustive]` — new variants may be added in minor versions
+/// without a semver-breaking change (matches sibling crates rskim-tokens, rskim-llm,
+/// rskim-contract, and rskim-search).
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum SkimError {
     /// Language could not be detected from file path
@@ -920,7 +941,8 @@ impl Parser {
     /// (JSON, YAML, TOML), use [`transform_with_config`](crate::transform_with_config) directly.
     ///
     /// # Errors
-    /// Returns `SkimError::ParseError` if parsing fails.
+    /// Returns `SkimError::ParseError` if parsing fails, or
+    /// `SkimError::ComplexityLimit` if a structural safety cap is exceeded.
     pub fn transform(&mut self, source: &str, config: &TransformConfig) -> Result<String> {
         let tree = self.parse(source)?;
         crate::transform::transform_tree(source, &tree, self.language, config)
@@ -1024,7 +1046,8 @@ mod tests {
                 "{mode:?} must degrade to passthrough, got error: {:?}",
                 result.as_ref().err()
             );
-            let (output, _has_errors, _map) = result.unwrap();
+            let (output, _has_errors, _map, degraded) = result.unwrap();
+            assert!(degraded, "{mode:?} degradation must set degraded=true");
             // Passthrough is lossless: the raw source is returned verbatim.
             assert_eq!(
                 output, source,
@@ -1040,7 +1063,7 @@ mod tests {
         // never the entire 4500-line file.
         let source = over_cap_python_source();
         let config = TransformConfig::with_mode(Mode::Pseudo).with_max_lines(40);
-        let (output, _has_errors, _map) = Language::Python
+        let (output, _has_errors, _map, _degraded) = Language::Python
             .transform_source_with_line_map(&source, &config)
             .expect("over-cap file with max_lines must degrade, not error");
         assert!(
@@ -1194,6 +1217,69 @@ mod tests {
         // Second call reuses the same parser instance
         let result2 = parser.transform(source, &config).unwrap();
         assert_eq!(result, result2);
+    }
+
+    // ========================================================================
+    // A5: ComplexityLimit discriminator tests (guard against widening the degrade path)
+    // ========================================================================
+
+    #[test]
+    fn complexity_limit_is_complexity_limit_returns_true() {
+        assert!(
+            SkimError::ComplexityLimit {
+                what: "AST nodes",
+                count: 100_001,
+                max: 100_000,
+            }
+            .is_complexity_limit(),
+            "ComplexityLimit variant must return true from is_complexity_limit()"
+        );
+    }
+
+    #[test]
+    fn parse_error_is_complexity_limit_returns_false() {
+        assert!(
+            !SkimError::ParseError("x".into()).is_complexity_limit(),
+            "ParseError must NOT return true from is_complexity_limit() — \
+             depth-cap ParseErrors must never be swallowed into the degrade path"
+        );
+    }
+
+    // ========================================================================
+    // A3(c): Serde key-count cap degrades to passthrough, not Err
+    // ========================================================================
+
+    /// A JSON document exceeding MAX_JSON_KEYS (10,000) must degrade to lossless
+    /// raw passthrough through the serde dispatch path in `transform_source_with_line_map`,
+    /// not fail the command. (applies ADR-001 net-savings guard; adheres to #317
+    /// compress-never-truncate by falling back cleanly to raw output.)
+    #[test]
+    fn serde_key_count_exceeded_degrades_to_passthrough_not_error() {
+        // Build a JSON object with 10,001 keys, exceeding MAX_JSON_KEYS.
+        let mut json = String::from("{");
+        for i in 0..10_001_usize {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!("\"k{}\": {}", i, i));
+        }
+        json.push('}');
+
+        // Structure mode routes JSON through transform_serde_with_line_map,
+        // where the ComplexityLimit is caught and degraded to passthrough.
+        let config = TransformConfig::with_mode(Mode::Structure);
+        let result = Language::Json.transform_source_with_line_map(&json, &config);
+        assert!(
+            result.is_ok(),
+            "JSON exceeding MAX_JSON_KEYS must degrade to Ok passthrough, got error: {:?}",
+            result.as_ref().err()
+        );
+        let (output, _has_errors, _map, degraded) = result.unwrap();
+        assert!(degraded, "oversized JSON degrade must set degraded=true");
+        assert_eq!(
+            output, json,
+            "degraded serde path must return raw source verbatim"
+        );
     }
 
     #[test]
