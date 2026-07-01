@@ -25,7 +25,10 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::FileOps,
     expected_exit_codes: &[1],
     forward_stderr: true,
-    skip_net_savings_guard: false,
+    // Group-by-file ALWAYS — same rationale as grep (see grep.rs CONFIG): keep a
+    // single predictable output shape instead of letting the net-savings guard
+    // flip small result sets back to raw `file:line:content`.
+    skip_net_savings_guard: true,
 };
 
 /// Run `skim rg [args...]`.

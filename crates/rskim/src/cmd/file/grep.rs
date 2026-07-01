@@ -32,7 +32,18 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::FileOps,
     expected_exit_codes: &[1],
     forward_stderr: true,
-    skip_net_savings_guard: false,
+    // Group-by-file ALWAYS, regardless of result size. The net-savings guard
+    // would flip small result sets back to the raw `file:line:content` format,
+    // so the SAME `grep -n` produced two different shapes depending on match
+    // volume — the cross-invocation inconsistency agents flagged. Skipping the
+    // guard makes the grouped format the single, predictable output. The cost is
+    // that tiny greps may render a few bytes larger than raw; that trade-off is
+    // an accepted, deliberate relaxation of the never-larger-than-raw guard for
+    // grep/rg (not the byte-faithful #317 *content* guarantee — every matching
+    // line is still emitted exactly once). Passthrough cases (-c/-l/-L,
+    // unparseable output, over the line-bound) are unaffected: parse returns the
+    // passthrough tier and the guard branch is skipped regardless of this flag.
+    skip_net_savings_guard: true,
 };
 
 /// Run `skim grep [args...]`.

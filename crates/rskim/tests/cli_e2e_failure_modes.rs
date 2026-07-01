@@ -109,22 +109,55 @@ fn test_grep_single_file_attributed_and_complete() {
     let content: String = (1..=10).map(|i| format!("needle {i}\n")).collect();
     fs::write(&file, content).unwrap();
 
-    // The net-savings guard may passthrough small inputs rather than compressing.
-    // skim-format: includes "10 matches" summary and file-path attribution.
-    // raw form: grep -n outputs "LINE:content" without per-file summary for single-file.
-    // We verify: exit 0, all 10 needle lines present, no "<stdin>", no "showing" truncation.
+    // grep now groups-by-file ALWAYS (skip_net_savings_guard), so the output is
+    // deterministic regardless of match volume: canonical `grep N` header, the
+    // attributed file path, every match, no `<stdin>` mislabel, no truncation.
     let mut assert = skim_cmd()
         .args(["grep", "-n", "needle", file.to_str().unwrap()])
         .assert()
         .code(0)
         .stdout(predicate::str::contains("<stdin>").not())
         .stdout(predicate::str::contains("showing").not())
-        // skim-format adds "10 matches"; raw grep just has match lines — accept both
-        .stdout(predicate::str::contains("10 matches").or(predicate::str::contains("needle 10")));
-    // Every match line must be present in both raw and skim-format output — no per-file cap.
+        // Deterministic grouped header (was a volume-dependent flip before #issues-4/5).
+        .stdout(predicate::str::contains("grep 10"));
+    // Every match line must be present — no per-file cap.
     for i in 1..=10 {
         assert = assert.stdout(predicate::str::contains(format!("needle {i}")));
     }
+}
+
+/// Issues #4/#5: a SMALL multi-file grep must use the SAME grouped shape as a
+/// large one. Before the fix the net-savings guard flipped small result sets
+/// back to raw `file:line:content`, so the same `grep -n` produced two different
+/// formats depending on match volume. Now grep groups consistently.
+#[test]
+fn test_grep_small_multifile_groups_consistently() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    fs::write(&a, "alpha MARK one\nplain\n").unwrap();
+    fs::write(&b, "plain\nbeta MARK two\n").unwrap();
+
+    skim_cmd()
+        .args([
+            "grep",
+            "-n",
+            "MARK",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+        ])
+        .assert()
+        .code(0)
+        // Canonical grouped header + footer (grouped even though only 2 matches).
+        .stdout(predicate::str::contains("grep 2"))
+        .stdout(predicate::str::contains("2 files"))
+        // Both files appear as group headers and both matches are present.
+        .stdout(predicate::str::contains("a.txt"))
+        .stdout(predicate::str::contains("b.txt"))
+        .stdout(predicate::str::contains("alpha MARK one"))
+        .stdout(predicate::str::contains("beta MARK two"))
+        // Grouped form uses indented `:line:` entries, not raw `file:line:content`.
+        .stdout(predicate::str::contains(":1: alpha MARK one"));
 }
 
 // ============================================================================
