@@ -2593,7 +2593,7 @@ fn run_ast_standalone_resolves_nested_dir_corpus_correctly() {
 
     // POSITIVE: the ONLY file with function_item must appear.
     assert!(
-        text.contains("foo/bar.rs") || text.contains("foo") && text.contains("bar.rs"),
+        text.contains("foo/bar.rs"),
         "AC-1 POSITIVE: output must contain 'foo/bar.rs' (the only file with a function_item). \
          Pre-fix: FileId skew caused foo.rs to be returned instead. Got:\n{text}"
     );
