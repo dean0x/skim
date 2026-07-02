@@ -1985,10 +1985,11 @@ fn test_ac9_multi_word_union_path_preserved() {
 // AC #8: v4 format compatibility — no rebuild required (non-regression)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// AC #8: a v4 index built by the current builder must be queryable with the
-/// new single-token exact path WITHOUT `--rebuild`.  FORMAT_VERSION must be 4.
-/// The existing `test_ac6_result_set_non_regression_v4_codec` test is the
-/// companion guard; this test focuses on the #372 exact-symbol path.
+/// AC #8: an index built by the current builder must be queryable with the
+/// new single-token exact path WITHOUT `--rebuild`.  FORMAT_VERSION must be 5
+/// (v4→v5, #392 / #380 Phase 2).  The existing
+/// `test_ac6_result_set_non_regression_v4_codec` test is the companion guard;
+/// this test focuses on the #372 exact-symbol path.
 #[test]
 fn test_ac8_v4_format_compat_exact_symbol_no_rebuild() {
     use crate::index::format::FORMAT_VERSION;
@@ -1996,7 +1997,7 @@ fn test_ac8_v4_format_compat_exact_symbol_no_rebuild() {
     let token = "exact_symbol_token";
     let dir = tmp_dir();
 
-    // Build a v4 index.
+    // Build a v5 index.
     {
         let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
         builder
@@ -2016,11 +2017,12 @@ fn test_ac8_v4_format_compat_exact_symbol_no_rebuild() {
         builder.build().unwrap();
     }
 
-    // Verify the on-disk format version is still v4 (unchanged by #372).
+    // Verify the on-disk format version is unchanged by #372 (still equals
+    // FORMAT_VERSION, currently v5).
     let version = NgramIndexReader::lexical_index_version(dir.path()).unwrap();
     assert_eq!(
         version, FORMAT_VERSION,
-        "AC#8: format version must be {} (v4 unchanged by #372); got {version}",
+        "AC#8: format version must be {} (unchanged by #372); got {version}",
         FORMAT_VERSION
     );
 

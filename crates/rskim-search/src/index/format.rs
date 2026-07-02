@@ -13,7 +13,7 @@
 //! ## `index.skpost`
 //!
 //! ```text
-//! [PostingEntry ... concatenated posting lists]   ← v4: variable-length (delta+varint)
+//! [PostingEntry ... concatenated posting lists]   ← v5: variable-length (delta+varint)
 //! ```
 //!
 //! # Encoding
@@ -24,12 +24,12 @@
 //! any bit-flip in `.skpost` is detected during `NgramIndexReader::open`
 //! before a query can run (#364).
 //!
-//! ## Posting codec (v4, AD-LXPOST-1)
+//! ## Posting codec (v5, AD-LXPOST-1 / AD-LXFMT-4)
 //!
 //! Each posting entry in `.skpost` is variable-length:
 //!
 //! ```text
-//! [varint delta_doc_id][u8 field_id][varint delta_position]
+//! [varint delta_doc_id][u8 field_id][varint delta_position][varint delta_token_position]
 //! ```
 //!
 //! - `delta_doc_id`: delta from the previous `doc_id` in the posting list
@@ -40,6 +40,10 @@
 //!   `doc_id` OR `field_id` changes, so the first occurrence in a new `doc_id`
 //!   *or* a new `field_id` encodes `delta_position = position` (absolute). See
 //!   the "Position-delta reset" section on [`encode_postings_varint`]. Encoded
+//!   as a little-endian base-128 varint.
+//! - `delta_token_position`: delta from the previous `token_position` within
+//!   the same `(doc_id, field_id)` run (v5, AD-LXFMT-4). Reset in lockstep
+//!   with `delta_position` on the same `(doc_id, field_id)` boundary. Encoded
 //!   as a little-endian base-128 varint.
 //!
 //! Rationale: see `AD-LXPOST-1` comment at [`encode_postings_varint`].
@@ -85,10 +89,21 @@ pub(crate) const SKIDX_MAGIC: &[u8; 4] = b"SKIX";
 /// - v2 → v3: owned by #355 Part B (trigram key widen, `SkidxEntry` change)
 /// - v3 → v4: owned by #358 Item 2 (posting codec / `PostingEntry` change)
 ///
-/// Old v3 indexes self-heal: `decode_header` rejects version ≠ 4 with
+/// Old v3 indexes self-heal: `decode_header` rejects version ≠ 5 with
 /// "unsupported format version … please rebuild" so the staleness check
 /// triggers a full rebuild on first query after upgrade.
-pub(crate) const FORMAT_VERSION: u16 = 4;
+///
+/// v4 → v5 (#392 / #380 Phase 2):
+///
+/// # AD-LXFMT-4
+///
+/// `PostingEntry` gains a `token_position: u32` field (the word-token ordinal
+/// of the trigram's first byte) to support word/token-distance phrase / --near
+/// search. On disk it is appended as a 4th tail varint per entry:
+/// `[varint delta_doc_id][u8 field_id][varint delta_position][varint delta_token_position]`.
+/// The 3-field v4 prefix is byte-identical, so snippet/field_id logic is
+/// unchanged. Old v4 indexes self-heal: `decode_header` rejects version ≠ 5.
+pub(crate) const FORMAT_VERSION: u16 = 5;
 /// Size in bytes of [`SkidxHeader`] on disk.
 ///
 /// v1 was 30 bytes; v2 adds 32 bytes for `avg_field_lengths: [f32; 8]`.
@@ -171,10 +186,14 @@ pub(crate) struct SkidxEntry {
 /// One element in a posting list inside `.skpost`.
 ///
 /// This is the **in-memory** representation.  The **on-disk** encoding is
-/// variable-length (v4, AD-LXPOST-1): each entry is written as
-/// `[varint delta_doc_id][u8 field_id][varint delta_position]`
+/// variable-length (v5, AD-LXPOST-1 / AD-LXFMT-4): each entry is written as
+/// `[varint delta_doc_id][u8 field_id][varint delta_position][varint delta_token_position]`
 /// via [`encode_postings_varint`] and decoded via [`decode_postings_varint`].
-/// The fixed-stride 9-byte layout present in v3 no longer applies.
+/// The fixed-stride 9-byte layout present in v3 no longer applies. The derived
+/// `Ord` orders by `(doc_id, field_id, position, token_position)`; since
+/// `token_position` is a pure function of `position` within a document, it
+/// never actually changes the sort outcome — `builder.rs`'s `sort_unstable()`
+/// behavior is unaffected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PostingEntry {
     /// The document (file) this posting belongs to.
@@ -183,6 +202,10 @@ pub(crate) struct PostingEntry {
     pub field_id: u8,
     /// Byte position within the document.
     pub position: u32,
+    /// Word-token ordinal of the trigram's first byte (v5). Additive coordinate
+    /// for word/token-distance phrase / --near search; `position` (byte offset)
+    /// is retained for snippets.
+    pub token_position: u32,
 }
 
 /// Per-file metadata stored in the tail of `.skidx`.
@@ -413,7 +436,7 @@ pub(crate) fn decode_varint(data: &[u8], offset: usize) -> crate::Result<(u32, u
     )))
 }
 
-/// Encode a posting list into `buf` using v4 delta+varint encoding.
+/// Encode a posting list into `buf` using v5 delta+varint encoding.
 ///
 /// # AD-LXPOST-1
 ///
@@ -422,16 +445,22 @@ pub(crate) fn decode_varint(data: &[u8], offset: usize) -> crate::Result<(u32, u
 /// Within each `(doc_id, field_id)` run, encode `position` deltas as varints.
 /// `field_id` is 1 byte (unchanged; bounded by `FIELD_COUNT = 8`).
 ///
+/// # AD-LXFMT-4 (v5)
+///
+/// A 4th tail varint, `delta_token_position`, is appended per entry to carry
+/// `PostingEntry::token_position`. It resets in lockstep with `delta_position`
+/// — see "Position-delta reset" below.
+///
 /// Layout per posting entry:
 /// ```text
-/// [varint delta_doc_id][u8 field_id][varint delta_position]
+/// [varint delta_doc_id][u8 field_id][varint delta_position][varint delta_token_position]
 /// ```
 ///
 /// Chosen as the least invasive approach to the reader hot path (sequential
 /// decode, low latency regression risk). Roaring/PForDelta revisited only if
 /// the measured post-compression ratio still misses the grounded target.
-/// Originating tracker: #273.  FORMAT_VERSION v3→v4 owned by #358 Item 2;
-/// v2→v3 owned by #355 Part B.
+/// Originating tracker: #273.  FORMAT_VERSION v4→v5 owned by #392 / #380
+/// Phase 2; v3→v4 owned by #358 Item 2; v2→v3 owned by #355 Part B.
 ///
 /// Note: the sibling AST index (`crates/rskim-search/src/ast_index/store/`)
 /// deliberately retains its fixed 8-byte posting codec (doc_id 4B + position
@@ -448,39 +477,44 @@ pub(crate) fn decode_varint(data: &[u8], offset: usize) -> crate::Result<(u32, u
 ///
 /// # Position-delta reset
 ///
-/// `prev_position` is reset to 0 whenever `doc_id` OR `field_id` changes.
-/// This ensures each `(doc_id, field_id)` run starts fresh, keeping
-/// `delta_position` non-negative (and therefore small / 1-byte varint)
-/// across field boundaries within the same document.
+/// `prev_position` AND `prev_token_position` are both reset to 0 whenever
+/// `doc_id` OR `field_id` changes. This ensures each `(doc_id, field_id)` run
+/// starts fresh, keeping `delta_position` and `delta_token_position`
+/// non-negative (and therefore small / 1-byte varint) across field boundaries
+/// within the same document.
 ///
-/// Without this reset, the first position in field N+1 would be encoded as a
-/// delta from the last position of field N — which can wrap to near-u32::MAX
-/// and always encodes to the maximum 5-byte varint, defeating compression.
+/// Without this reset, the first position (or token_position) in field N+1
+/// would be encoded as a delta from the last value of field N — which can
+/// wrap to near-u32::MAX and always encodes to the maximum 5-byte varint,
+/// defeating compression.
 pub(crate) fn encode_postings_varint(postings: &[PostingEntry], buf: &mut Vec<u8>) {
     let mut prev_doc_id: u32 = 0;
     let mut prev_field_id: u8 = 0;
     let mut prev_position: u32 = 0;
+    let mut prev_token_position: u32 = 0;
     for p in postings {
         let delta_doc_id = p.doc_id.wrapping_sub(prev_doc_id);
-        // Reset the position accumulator when doc_id OR field_id changes so that
-        // delta_position is always a forward (non-wrapping) step within a
-        // (doc_id, field_id) run.  Without this reset, a field boundary within
-        // the same doc can produce a near-u32::MAX delta that always encodes as
-        // the maximum 5-byte varint — defeating the purpose of v4 compression.
+        // Reset position AND token_position accumulators together when doc_id OR
+        // field_id changes, so both deltas stay forward (non-wrapping) within a
+        // (doc_id, field_id) run.
         if delta_doc_id != 0 || p.field_id != prev_field_id {
             prev_position = 0;
+            prev_token_position = 0;
         }
         let delta_position = p.position.wrapping_sub(prev_position);
+        let delta_token_position = p.token_position.wrapping_sub(prev_token_position);
         encode_varint(delta_doc_id, buf);
         buf.push(p.field_id);
         encode_varint(delta_position, buf);
+        encode_varint(delta_token_position, buf);
         prev_doc_id = p.doc_id;
         prev_field_id = p.field_id;
         prev_position = p.position;
+        prev_token_position = p.token_position;
     }
 }
 
-/// Decode a v4 variable-length posting list from `data`.
+/// Decode a v5 variable-length posting list from `data`.
 ///
 /// Returns the decoded [`PostingEntry`] values in the original sort order
 /// (ascending by `(doc_id, field_id, position)`).
@@ -488,13 +522,13 @@ pub(crate) fn encode_postings_varint(postings: &[PostingEntry], buf: &mut Vec<u8
 /// # Bounded decode loop
 ///
 /// The outer loop terminates when `offset >= data.len()`.  Each iteration
-/// consumes at least 3 bytes (`1-byte varint + 1-byte field_id + 1-byte
-/// varint`), so the loop runs at most `data.len() / 3` times — bounded by
-/// the data size, not an external counter.
+/// consumes at least 4 bytes (`1-byte varint + 1-byte field_id + 1-byte
+/// varint + 1-byte varint`), so the loop runs at most `data.len() / 4` times
+/// — bounded by the data size, not an external counter.
 ///
 /// # Capacity hint
 ///
-/// `Vec::with_capacity(data.len() / 3)` pre-sizes the output using the upper
+/// `Vec::with_capacity(data.len() / 4)` pre-sizes the output using the upper
 /// bound implied by the minimum-bytes-per-entry guarantee, eliminating
 /// geometric reallocation on long posting lists in the query hot path.
 ///
@@ -506,25 +540,26 @@ pub(crate) fn encode_postings_varint(postings: &[PostingEntry], buf: &mut Vec<u8
 ///
 /// # Delta reconstruction
 ///
-/// `doc_id` and `position` are reconstructed with `wrapping_add`, the exact
-/// inverse of the encoder's `wrapping_sub` (see [`encode_postings_varint`]).
-/// The round-trip is therefore lossless for every `u32` input — including the
-/// maximum `doc_id` gap (`0 → u32::MAX`, covered by
-/// `test_posting_codec_max_gap_docid`).  `prev_position` is reset to 0
-/// whenever `doc_id` OR `field_id` changes, mirroring the encoder's reset
-/// (see [`encode_postings_varint`]).  Modular arithmetic cannot fail, so no
-/// overflow error is raised; a corrupt blob yields wrong-but-bounded `u32`
-/// values (used only for scoring), never a panic or out-of-bounds access.
+/// `doc_id`, `position`, and `token_position` are reconstructed with
+/// `wrapping_add`, the exact inverse of the encoder's `wrapping_sub` (see
+/// [`encode_postings_varint`]). The round-trip is therefore lossless for
+/// every `u32` input — including the maximum `doc_id` gap (`0 → u32::MAX`,
+/// covered by `test_posting_codec_max_gap_docid`).  `prev_position` and
+/// `prev_token_position` are both reset to 0 whenever `doc_id` OR `field_id`
+/// changes, mirroring the encoder's reset (see [`encode_postings_varint`]).
+/// Modular arithmetic cannot fail, so no overflow error is raised; a corrupt
+/// blob yields wrong-but-bounded `u32` values (used only for scoring), never
+/// a panic or out-of-bounds access.
 pub(crate) fn decode_postings_varint(data: &[u8]) -> crate::Result<Vec<PostingEntry>> {
-    // Pre-size with the upper bound: each entry is at least 3 bytes
-    // (1-byte varint + 1-byte field_id + 1-byte varint), so at most
-    // data.len() / 3 entries can be present. This eliminates geometric
-    // reallocation on long posting lists in the query hot path.
-    let mut postings = Vec::with_capacity(data.len() / 3);
+    // Pre-size with the upper bound: each v5 entry is at least 4 bytes
+    // (1-byte varint + 1-byte field_id + 1-byte varint + 1-byte varint),
+    // so at most data.len() / 4 entries can be present.
+    let mut postings = Vec::with_capacity(data.len() / 4);
     let mut offset = 0usize;
     let mut prev_doc_id: u32 = 0;
     let mut prev_field_id: u8 = 0;
     let mut prev_position: u32 = 0;
+    let mut prev_token_position: u32 = 0;
 
     while offset < data.len() {
         let entry_start = offset;
@@ -552,24 +587,32 @@ pub(crate) fn decode_postings_varint(data: &[u8]) -> crate::Result<Vec<PostingEn
         let (delta_position, m) = decode_varint(data, offset)?;
         offset += m;
 
-        // Reconstruct absolute doc_id and position.
-        // Reset the position accumulator when doc_id OR field_id changes,
-        // mirroring the encoder's reset in encode_postings_varint.
+        // Decode delta_token_position varint (v5).
+        let (delta_token_position, t) = decode_varint(data, offset)?;
+        offset += t;
+
+        // Reconstruct absolute doc_id, position, token_position.
+        // Reset position AND token_position accumulators when doc_id OR field_id
+        // changes, mirroring the encoder.
         let doc_id = prev_doc_id.wrapping_add(delta_doc_id);
         if delta_doc_id != 0 || field_id != prev_field_id {
             prev_position = 0;
+            prev_token_position = 0;
         }
         let position = prev_position.wrapping_add(delta_position);
+        let token_position = prev_token_position.wrapping_add(delta_token_position);
 
         postings.push(PostingEntry {
             doc_id,
             field_id,
             position,
+            token_position,
         });
 
         prev_doc_id = doc_id;
         prev_field_id = field_id;
         prev_position = position;
+        prev_token_position = token_position;
     }
     Ok(postings)
 }
