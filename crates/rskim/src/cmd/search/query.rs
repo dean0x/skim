@@ -373,9 +373,13 @@ pub(super) fn execute_query_with_manifest(
     // multi-word path below references that module constant directly (no local
     // shadow); the value is unchanged (5), so pure-lexical behavior is identical.
     let exact_symbol = is_single_token(&config.text);
+    // v5 positional search (#392 / #380 Phase 2): --phrase / --near queries need
+    // the FULL ranked candidate set for the same verify-then-truncate-LAST reason
+    // as the exact-symbol path (AD-372-3), so they share its branch below.
+    let positional = config.phrase || config.near.is_some();
 
-    let raw_results = if exact_symbol {
-        // AD-372-3 / RESOLVED Decision 3: exact-symbol mode.
+    let raw_results = if exact_symbol || positional {
+        // AD-372-3 / RESOLVED Decision 3 (extended to the positional path, #392):
         // sq.limit = None: reader returns the FULL ranked intersection so that the
         // post-verify skip (below) operates on the verified set, not the pre-verify
         // intersection.  Applying offset inside the reader (pre-verify) would shift
@@ -388,12 +392,18 @@ pub(super) fn execute_query_with_manifest(
         // sq.offset is intentionally left as None (== reader default 0): offset is
         // applied AFTER verification in resolve_paths_and_snippets_verified below,
         // matching RESOLVED Decision 3 and the multi-word path contract.
+        sq.phrase = config.phrase;
+        sq.near = config.near;
         engine.search(&sq)?
     } else {
         // Multi-word / default: widen pool via LEXICAL_CANDIDATE_POOL_K (AD-355-2).
+        // phrase/near are false/None here by construction (positional is false);
+        // forwarded for clarity/symmetry with the branch above.
         let pool_limit = candidate_pool(config.limit, LEXICAL_CANDIDATE_POOL_K);
         let mut sq = SearchQuery::new(config.text.clone());
         sq.limit = Some(pool_limit);
+        sq.phrase = config.phrase;
+        sq.near = config.near;
         engine.search(&sq)?
     };
 

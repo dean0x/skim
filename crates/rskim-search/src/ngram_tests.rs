@@ -514,3 +514,85 @@ fn extract_ngrams_1000_line_file_under_1ms() {
         elapsed.as_millis()
     );
 }
+
+// ── Cycle 7: extract_query_positional_tokens (v5, #392 / #380 Phase 2) ──────
+
+/// Two 3+ byte words each get their deduped within-word trigrams, in query order.
+#[test]
+fn positional_tokens_alpha_beta_have_expected_trigrams() {
+    let tokens = extract_query_positional_tokens("alpha beta");
+    assert_eq!(tokens.len(), 2, "expected 2 word-tokens, got {tokens:?}");
+
+    assert_eq!(tokens[0].token_off, 0, "'alpha' must be token_off 0");
+    assert_eq!(tokens[1].token_off, 1, "'beta' must be token_off 1");
+
+    let tok0_keys: std::collections::HashSet<u32> =
+        tokens[0].trigrams.iter().map(|n| n.key()).collect();
+    let expected0: std::collections::HashSet<u32> = [
+        Ngram::from_bytes(b'a', b'l', b'p').key(),
+        Ngram::from_bytes(b'l', b'p', b'h').key(),
+        Ngram::from_bytes(b'p', b'h', b'a').key(),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        tok0_keys, expected0,
+        "'alpha' within-word trigrams must be exactly {{alp,lph,pha}}, got {:?}",
+        tokens[0].trigrams
+    );
+
+    let tok1_keys: std::collections::HashSet<u32> =
+        tokens[1].trigrams.iter().map(|n| n.key()).collect();
+    let expected1: std::collections::HashSet<u32> = [
+        Ngram::from_bytes(b'b', b'e', b't').key(),
+        Ngram::from_bytes(b'e', b't', b'a').key(),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        tok1_keys, expected1,
+        "'beta' within-word trigrams must be exactly {{bet,eta}}, got {:?}",
+        tokens[1].trigrams
+    );
+}
+
+/// A word shorter than 3 bytes cannot form a within-word trigram — its
+/// `trigrams` list must be empty (documented limitation), while a sibling
+/// word of sufficient length still gets its trigrams. Discriminating
+/// (PF-007): fails if short words wrongly inherit cross-word trigrams.
+#[test]
+fn positional_tokens_short_word_has_empty_trigrams() {
+    let tokens = extract_query_positional_tokens("a beta");
+    assert_eq!(tokens.len(), 2, "expected 2 word-tokens, got {tokens:?}");
+    assert!(
+        tokens[0].trigrams.is_empty(),
+        "'a' (< 3 bytes) must yield an empty trigram list, got {:?}",
+        tokens[0].trigrams
+    );
+    assert!(
+        !tokens[1].trigrams.is_empty(),
+        "'beta' (>= 3 bytes) must yield a non-empty trigram list"
+    );
+}
+
+/// Punctuation (`::`) is a separator, not a word byte — `"foo::bar"` splits
+/// into two word-tokens, matching the indexer's `word_token_indices` tokenizer.
+#[test]
+fn positional_tokens_punctuation_separates_words() {
+    let tokens = extract_query_positional_tokens("foo::bar");
+    assert_eq!(
+        tokens.len(),
+        2,
+        "'foo::bar' must split into 2 word-tokens on '::', got {tokens:?}"
+    );
+    assert_eq!(tokens[0].token_off, 0, "'foo' must be token_off 0");
+    assert_eq!(tokens[1].token_off, 1, "'bar' must be token_off 1");
+    assert!(!tokens[0].trigrams.is_empty(), "'foo' must have trigrams");
+    assert!(!tokens[1].trigrams.is_empty(), "'bar' must have trigrams");
+}
+
+/// Empty query yields an empty token vec (no panic, vacuous but well-defined).
+#[test]
+fn positional_tokens_empty_query_returns_empty_vec() {
+    assert!(extract_query_positional_tokens("").is_empty());
+}

@@ -2606,3 +2606,95 @@ fn ac3_query_results_identical_cold_vs_fast() {
         "AC3: ranked results must be byte-identical between cold and fast opens"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v5 positional search — pure helper unit tests (#392 / #380 Phase 2)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These tests exercise the PURE free functions (`count_phrase_alignments`,
+// `near_match`, `intersect_sorted_u32`) directly — no index-building needed.
+// They encode the falsifiable phrase/near distance logic. End-to-end
+// index-building tests for `search_positional` (AC-P2-1..4) belong to D2-C
+// and are intentionally NOT duplicated here.
+
+#[test]
+fn count_phrase_alignments_adjacent_ordered_matches() {
+    assert_eq!(count_phrase_alignments(&[vec![5], vec![6]]), 1);
+}
+
+#[test]
+fn count_phrase_alignments_gap_not_contiguous() {
+    assert_eq!(count_phrase_alignments(&[vec![5], vec![7]]), 0);
+}
+
+/// AC-P2-2 falsifiable case: reversed order (word 1 appears BEFORE word 0 in
+/// the doc) must NOT count as a phrase match — phrase requires ordered adjacency.
+#[test]
+fn count_phrase_alignments_reversed_order_does_not_match() {
+    assert_eq!(
+        count_phrase_alignments(&[vec![6], vec![5]]),
+        0,
+        "AC-P2-2: reversed word order must not count as a phrase alignment"
+    );
+}
+
+#[test]
+fn count_phrase_alignments_counts_multiple_occurrences() {
+    assert_eq!(count_phrase_alignments(&[vec![5, 10], vec![6, 11]]), 2);
+}
+
+#[test]
+fn count_phrase_alignments_absent_word_returns_zero() {
+    assert_eq!(count_phrase_alignments(&[vec![5], vec![]]), 0);
+}
+
+#[test]
+fn near_match_within_window_is_true() {
+    assert!(near_match(&[vec![5], vec![7]], 3));
+}
+
+#[test]
+fn near_match_beyond_window_is_false() {
+    assert!(!near_match(&[vec![5], vec![7]], 1), "gap of 2 exceeds n=1");
+}
+
+#[test]
+fn near_match_wide_gap_beyond_window_is_false() {
+    assert!(!near_match(&[vec![5], vec![12]], 3));
+}
+
+#[test]
+fn near_match_wide_gap_within_larger_window_is_true() {
+    assert!(near_match(&[vec![5], vec![12]], 8));
+}
+
+/// Unordered proximity: reversed positions (word 0 appears AFTER word 1 in the
+/// doc) must still match — --near has no ordering requirement.
+#[test]
+fn near_match_is_symmetric_regardless_of_order() {
+    assert!(
+        near_match(&[vec![12], vec![5]], 8),
+        "--near must be unordered: reversed positions within the window must match"
+    );
+}
+
+#[test]
+fn near_match_single_word_is_trivially_true() {
+    assert!(near_match(&[vec![5]], 0));
+}
+
+#[test]
+fn intersect_sorted_u32_returns_common_elements() {
+    assert_eq!(intersect_sorted_u32(&[1, 3, 5, 7], &[3, 5, 9]), vec![3, 5]);
+}
+
+#[test]
+fn intersect_sorted_u32_disjoint_returns_empty() {
+    assert!(intersect_sorted_u32(&[1, 2, 3], &[4, 5, 6]).is_empty());
+}
+
+#[test]
+fn intersect_sorted_u32_empty_operand_returns_empty() {
+    assert!(intersect_sorted_u32(&[], &[1, 2, 3]).is_empty());
+    assert!(intersect_sorted_u32(&[1, 2, 3], &[]).is_empty());
+}

@@ -366,6 +366,13 @@ pub struct SearchQuery {
     /// Not serialized — applied at query construction time in the CLI layer.
     #[serde(skip)]
     pub file_filter: Option<std::collections::HashSet<FileId>>,
+
+    /// v5 positional search: require contiguous, ordered phrase match.
+    #[serde(default)]
+    pub phrase: bool,
+    /// v5 positional search: max word-token distance for `--near N` (unordered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near: Option<u32>,
 }
 
 impl SearchQuery {
@@ -381,6 +388,8 @@ impl SearchQuery {
             offset: None,
             bm25f_config: None,
             file_filter: None,
+            phrase: false,
+            near: None,
         }
     }
 }
@@ -839,6 +848,8 @@ mod tests {
             offset: Some(5),
             bm25f_config: None,
             file_filter: None,
+            phrase: false,
+            near: None,
         };
         assert_eq!(q.text, "find_me");
         assert_eq!(q.lang, Some(rskim_core::Language::Rust));

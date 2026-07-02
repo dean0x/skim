@@ -294,6 +294,10 @@ struct Flags {
     /// other path (pure-lexical, standalone `--ast`, temporal-only, blast-only)
     /// the flag is inert and a one-line stderr notice fires (AD-377-2, PF-006).
     weights: Option<rskim_search::CompositeWeights6>,
+    /// v5 positional search: require contiguous, ordered phrase match (`--phrase`).
+    phrase: bool,
+    /// v5 positional search: max word-token distance for `--near N` (unordered).
+    near: Option<u32>,
 }
 
 /// Parse and validate a `--limit` value string.
@@ -323,6 +327,12 @@ fn parse_offset_value(raw: &str) -> anyhow::Result<usize> {
             raw
         )
     })
+}
+
+/// Parse and validate a `--near` value string as a non-negative word-token distance.
+fn parse_near_value(raw: &str) -> anyhow::Result<u32> {
+    raw.parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("--near value must be a non-negative integer, got {raw:?}"))
 }
 
 /// Parse a temporal flag arm (`--hot`, `--cold`, `--risky`, `--blast-radius`).
@@ -440,6 +450,8 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut blast_radius: Option<String> = None;
     let mut ast: Option<String> = None;
     let mut weights: Option<rskim_search::CompositeWeights6> = None;
+    let mut phrase = false;
+    let mut near: Option<u32> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -509,11 +521,25 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                     i += 1;
                 }
             }
+            // v5 positional search (#392 / #380 Phase 2). Shell strips quotes, so
+            // `skim search "alpha beta"` and `skim search alpha beta` both arrive as
+            // text "alpha beta"; `--phrase` is the explicit contiguous-match signal.
+            // If BOTH `--phrase` and `--near` are given, phrase wins (stricter) —
+            // `search_positional` checks `query.phrase` first.
+            "--phrase" => phrase = true,
+            s if s == "--near" || s.starts_with("--near=") => {
+                let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--near")?;
+                near = Some(parse_near_value(&raw)?);
+                if consumed {
+                    i += 1;
+                }
+            }
             s if s.starts_with("--") => {
                 anyhow::bail!(
                     "unrecognised flag {:?}. Valid flags: --build, --rebuild, --update, \
                      --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --offset, \
-                     --root, --ast, --hot, --cold, --risky, --blast-radius, --weights",
+                     --root, --ast, --hot, --cold, --risky, --blast-radius, --weights, \
+                     --phrase, --near",
                     s
                 );
             }
@@ -535,6 +561,8 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
         blast_radius,
         ast,
         weights,
+        phrase,
+        near,
     })
 }
 
@@ -918,6 +946,8 @@ fn run_query(
         blast_radius_paths,
         ast_scored,
         composite_weights: flags.weights,
+        phrase: flags.phrase,
+        near: flags.near,
     };
 
     // Pass the already-refreshed manifest to execute_query_with_manifest.  When

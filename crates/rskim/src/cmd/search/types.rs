@@ -140,6 +140,10 @@ pub(super) struct QueryConfig {
     /// "no ranking signal" request that returns the full intersection at score 0.0
     /// (FileId-ASC), diverging intentionally from the blast path's empty result.
     pub composite_weights: Option<rskim_search::CompositeWeights6>,
+    /// v5 positional: require contiguous ordered phrase (`--phrase`).
+    pub phrase: bool,
+    /// v5 positional: max word-token distance (`--near N`).
+    pub near: Option<u32>,
 }
 
 /// A search result with the file path resolved and snippet extracted.

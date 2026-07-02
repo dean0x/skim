@@ -2673,6 +2673,8 @@ fn test_index_nested_dir_fileid_roundtrip() {
             blast_radius_paths: None,
             ast_scored: None,
             composite_weights: None,
+            phrase: false,
+            near: None,
         };
         let output = execute_query(&q, &TEST_ANALYTICS)
             .unwrap_or_else(|e| panic!("query for {token:?} failed: {e}"));
@@ -2783,6 +2785,8 @@ fn test_manifest_old_version_triggers_auto_rebuild_on_next_query() {
         blast_radius_paths: None,
         ast_scored: None,
         composite_weights: None,
+        phrase: false,
+        near: None,
     };
     let output = execute_query(&q, &TEST_ANALYTICS)
         .expect("query against old-version manifest must succeed (auto-rebuild)");

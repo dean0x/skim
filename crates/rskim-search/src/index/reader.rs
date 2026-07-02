@@ -27,13 +27,13 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use super::format::{
-    FILE_META_SIZE, FileMetaEntry, SKIDX_ENTRY_SIZE, SKIDX_HEADER_SIZE, SkidxHeader,
+    FILE_META_SIZE, FileMetaEntry, PostingEntry, SKIDX_ENTRY_SIZE, SKIDX_HEADER_SIZE, SkidxHeader,
     decode_file_meta, decode_header, decode_postings_varint, idf_for_key, lookup_ngram,
 };
 use crate::{
     FileId, IndexStats, Result, SearchError, SearchField, SearchLayer, SearchQuery, SearchResult,
     lexical::{BM25FConfig, FIELD_COUNT, bm25f_score, dominant_field},
-    ngram::{Ngram, extract_query_ngrams, is_single_token},
+    ngram::{Ngram, extract_query_ngrams, extract_query_positional_tokens, is_single_token},
 };
 
 // ============================================================================
@@ -84,6 +84,99 @@ fn sort_and_assemble_results(
             }
         })
         .collect()
+}
+
+// ============================================================================
+// Positional search helpers (v5, #392 / #380 Phase 2)
+// ============================================================================
+//
+// Pure, free functions (no I/O) so they can be unit-tested directly without
+// building an index. Used by `NgramIndexReader::search_positional`.
+
+/// Intersection of two ascending-sorted, deduped u32 slices.
+fn intersect_sorted_u32(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    out
+}
+
+/// Count phrase alignments: query word k must sit at doc token `base + k`
+/// (contiguous, ordered). `d[k]` = sorted-unique doc token positions for word k.
+/// Returns the number of valid `base` values (0 ⇒ no phrase match).
+fn count_phrase_alignments(d: &[Vec<u32>]) -> usize {
+    if d.is_empty() || d.iter().any(Vec::is_empty) {
+        return 0;
+    }
+    let mut count = 0usize;
+    for &base in &d[0] {
+        let mut ok = true;
+        for (k, dk) in d.iter().enumerate().skip(1) {
+            match base.checked_add(k as u32) {
+                Some(want) if dk.binary_search(&want).is_ok() => {}
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// True iff there is an assignment of one doc token per query word whose span
+/// (max − min) ≤ `n` (unordered proximity). `d[k]` = sorted-unique doc token
+/// positions for word k. Sliding window over the merged sorted positions.
+fn near_match(d: &[Vec<u32>], n: u32) -> bool {
+    let k = d.len();
+    if k == 0 || d.iter().any(Vec::is_empty) {
+        return false;
+    }
+    if k == 1 {
+        return true;
+    }
+    let mut merged: Vec<(u32, usize)> = Vec::new();
+    for (tid, dk) in d.iter().enumerate() {
+        for &p in dk {
+            merged.push((p, tid));
+        }
+    }
+    merged.sort_unstable();
+    let mut counts = vec![0usize; k];
+    let mut have = 0usize;
+    let mut left = 0usize;
+    for right in 0..merged.len() {
+        let tid = merged[right].1;
+        if counts[tid] == 0 {
+            have += 1;
+        }
+        counts[tid] += 1;
+        while have == k {
+            if merged[right].0 - merged[left].0 <= n {
+                return true;
+            }
+            let ltid = merged[left].1;
+            counts[ltid] -= 1;
+            if counts[ltid] == 0 {
+                have -= 1;
+            }
+            left += 1;
+        }
+    }
+    false
 }
 
 // ============================================================================
@@ -660,6 +753,155 @@ impl NgramIndexReader {
         ))
     }
 
+    /// v5 positional search: phrase (contiguous, ordered) or `--near N` (within N
+    /// word-tokens, unordered) over the `token_position` coordinate.
+    ///
+    /// Models `search_exact_intersection` Step 1 (AND-intersect within-word
+    /// trigram posting lists by doc_id), then filters surviving docs by the
+    /// word-token-distance constraint. Ranked by alignment count. Truncation is
+    /// applied LAST by the caller (sq.limit = None on this path).
+    fn search_positional(
+        &self,
+        query: &SearchQuery,
+        lang_filter: Option<u8>,
+    ) -> Result<Vec<SearchResult>> {
+        let qtokens = extract_query_positional_tokens(&query.text);
+        // Need ≥1 word, and EVERY word must be locatable (≥3 bytes ⇒ has trigrams).
+        // A <3-byte word cannot be positioned; bail to empty (documented limitation).
+        if qtokens.is_empty() || qtokens.iter().any(|t| t.trigrams.is_empty()) {
+            return Ok(Vec::new());
+        }
+
+        // Decode each distinct trigram's posting list ONCE.
+        let mut tri_postings: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
+        for t in &qtokens {
+            for g in &t.trigrams {
+                if let std::collections::hash_map::Entry::Vacant(e) = tri_postings.entry(g.key()) {
+                    e.insert(self.lookup_postings(g.key())?);
+                }
+            }
+        }
+
+        // doc_id AND-intersection across ALL within-word trigrams (every query
+        // word must be present). Build per-trigram sorted-unique doc_id lists.
+        let mut doc_id_lists: Vec<Vec<u32>> = Vec::with_capacity(tri_postings.len());
+        for postings in tri_postings.values() {
+            let mut ids: Vec<u32> = Vec::with_capacity(postings.len());
+            let mut last: Option<u32> = None;
+            for p in postings {
+                if last != Some(p.doc_id) {
+                    ids.push(p.doc_id);
+                    last = Some(p.doc_id);
+                }
+            }
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            doc_id_lists.push(ids);
+        }
+        doc_id_lists.sort_unstable_by_key(Vec::len); // smallest-first (AD-372-2)
+        let mut intersection = doc_id_lists[0].clone();
+        for other in &doc_id_lists[1..] {
+            intersection = intersect_sorted_u32(&intersection, other);
+            if intersection.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+
+        let want_phrase = query.phrase;
+        let near_n = query.near;
+
+        let mut scored: Vec<(u32, f64)> = Vec::new();
+        let mut doc_positions: HashMap<u32, Vec<std::ops::Range<usize>>> = HashMap::new();
+        let mut doc_field: HashMap<u32, [f32; FIELD_COUNT]> = HashMap::new();
+        let mut doc_meta_cache: HashMap<u32, FileMetaEntry> = HashMap::new();
+
+        for &doc_id in &intersection {
+            // file_filter (blast-radius) + lang_filter.
+            if let Some(ref f) = query.file_filter
+                && !f.contains(&FileId(doc_id))
+            {
+                continue;
+            }
+            if let std::collections::hash_map::Entry::Vacant(e) = doc_meta_cache.entry(doc_id) {
+                let meta = self.file_meta_at(doc_id)?;
+                e.insert(meta);
+            }
+            let meta = &doc_meta_cache[&doc_id];
+            if lang_filter.is_some_and(|req| meta.lang_id != req) {
+                continue;
+            }
+
+            // Per query word: D_k = ∩ over its trigrams of {token_position at doc}.
+            // Also collect byte positions (union) for snippets + field TF.
+            let mut d: Vec<Vec<u32>> = Vec::with_capacity(qtokens.len());
+            let mut byte_positions: Vec<std::ops::Range<usize>> = Vec::new();
+            let mut field_tf = [0.0f32; FIELD_COUNT];
+            let mut reject = false;
+            for t in &qtokens {
+                let mut acc: Option<Vec<u32>> = None;
+                for g in &t.trigrams {
+                    let postings = &tri_postings[&g.key()];
+                    // token_position set for this trigram at this doc.
+                    let mut set: Vec<u32> = Vec::new();
+                    let lo = postings.partition_point(|p| p.doc_id < doc_id);
+                    let mut i = lo;
+                    while i < postings.len() && postings[i].doc_id == doc_id {
+                        let p = &postings[i];
+                        set.push(p.token_position);
+                        let bp = p.position as usize;
+                        byte_positions.push(bp..bp + 3);
+                        let fi = p.field_id as usize;
+                        if fi < FIELD_COUNT {
+                            field_tf[fi] += 1.0;
+                        }
+                        i += 1;
+                    }
+                    set.sort_unstable();
+                    set.dedup();
+                    acc = Some(match acc {
+                        None => set,
+                        Some(prev) => intersect_sorted_u32(&prev, &set),
+                    });
+                    if acc.as_ref().is_some_and(Vec::is_empty) {
+                        break;
+                    }
+                }
+                let dk = acc.unwrap_or_default();
+                if dk.is_empty() {
+                    reject = true;
+                    break;
+                }
+                d.push(dk);
+            }
+            if reject {
+                continue;
+            }
+
+            let alignments = if want_phrase {
+                count_phrase_alignments(&d)
+            } else {
+                let n = near_n.unwrap_or(0);
+                usize::from(near_match(&d, n))
+            };
+            if alignments == 0 {
+                continue;
+            }
+
+            scored.push((doc_id, alignments as f64));
+            doc_positions.insert(doc_id, byte_positions);
+            doc_field.insert(doc_id, field_tf);
+        }
+
+        Ok(sort_and_assemble_results(
+            &mut scored,
+            &mut doc_positions,
+            &doc_field,
+            query.offset.unwrap_or(0),
+            query.limit.unwrap_or(usize::MAX),
+        ))
+    }
+
     /// Final phase of scoring: apply defense-in-depth file_filter, sort by score,
     /// apply offset/limit, and assemble [`SearchResult`] values.
     ///
@@ -805,6 +1047,13 @@ impl SearchLayer for NgramIndexReader {
         // full filtered set regardless.
         if ngrams.is_empty() {
             return Ok(self.short_query_fallback(query, lang_filter));
+        }
+
+        // v5 positional search (phrase / --near) — must precede is_single_token so a
+        // single-token --phrase query still routes here. Degenerate <3-byte queries were
+        // already handled by the ngrams.is_empty() guard above (short_query_fallback).
+        if query.phrase || query.near.is_some() {
+            return self.search_positional(query, lang_filter);
         }
 
         // AD-372-1: single-token exact-symbol mode.

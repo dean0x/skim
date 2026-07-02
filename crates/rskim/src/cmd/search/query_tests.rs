@@ -87,6 +87,8 @@ fn make_config(root: &std::path::Path, cache_dir: &std::path::Path, text: &str) 
         blast_radius_paths: None,
         ast_scored: None,
         composite_weights: None,
+        phrase: false,
+        near: None,
     }
 }
 
@@ -428,6 +430,8 @@ fn test_execute_query_blast_radius_includes_only_allowed_paths() {
         blast_radius_paths: Some(allowed),
         ast_scored: None,
         composite_weights: None,
+        phrase: false,
+        near: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -473,6 +477,8 @@ fn test_execute_query_blast_radius_target_file_is_included() {
         blast_radius_paths: Some(allowed),
         ast_scored: None,
         composite_weights: None,
+        phrase: false,
+        near: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -526,6 +532,8 @@ fn test_ac12_union_includes_cochange_only_file_absent_from_lexical() {
         blast_radius_paths: Some(allowed),
         ast_scored: None,
         composite_weights: None,
+        phrase: false,
+        near: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -591,6 +599,8 @@ fn test_ac13_union_no_duplicate_file_ids_and_correct_cardinality() {
         blast_radius_paths: Some(allowed),
         ast_scored: None,
         composite_weights: None,
+        phrase: false,
+        near: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -663,6 +673,8 @@ fn test_ac13_limit_applied_after_fusion_rank_then_limit() {
         blast_radius_paths: Some(allowed),
         ast_scored: None,
         composite_weights: None,
+        phrase: false,
+        near: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -708,6 +720,8 @@ fn test_ac14_cochange_only_result_carries_fused_rrf_score() {
         blast_radius_paths: Some(allowed),
         ast_scored: None,
         composite_weights: None,
+        phrase: false,
+        near: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -1015,6 +1029,8 @@ fn test_ac2_gibberish_query_returns_zero_results_compound_path() {
         blast_radius_paths: None,
         ast_scored: Some(vec![(FileId(0), 1.0)]),
         composite_weights: None,
+        phrase: false,
+        near: None,
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
@@ -1085,6 +1101,8 @@ fn test_ac2_verify_gate_drops_compound_lexical_hit_without_literal() {
             blast_radius_paths: None,
             ast_scored: None,
             composite_weights: None,
+            phrase: false,
+            near: None,
         };
         // First run with no ast_scored builds the index (cold start).
         let _ = execute_query(&build_config, &TEST_ANALYTICS).unwrap();
@@ -1105,6 +1123,8 @@ fn test_ac2_verify_gate_drops_compound_lexical_hit_without_literal() {
         // The fake AST order ensures lib.rs appears in the intersection with auth.rs.
         ast_scored: Some(vec![(FileId(0), 0.5), (FileId(1), 2.0)]),
         composite_weights: None,
+        phrase: false,
+        near: None,
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
@@ -1166,6 +1186,8 @@ fn test_ac2_gibberish_query_no_lexical_hits_blast_radius() {
         blast_radius_paths: Some(allowed),
         ast_scored: None,
         composite_weights: None,
+        phrase: false,
+        near: None,
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
@@ -1247,6 +1269,8 @@ fn test_ac2_short_query_fallback_blast_radius_exercises_verify_gate() {
         blast_radius_paths: Some(allowed),
         ast_scored: None,
         composite_weights: None,
+        phrase: false,
+        near: None,
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
@@ -1606,6 +1630,8 @@ fn test_ac11b_end_to_end_pagination_disjoint_pages() {
         blast_radius_paths: None,
         ast_scored: None,
         composite_weights: None,
+        phrase: false,
+        near: None,
     };
     let page0 = execute_query(&config_p0, &TEST_ANALYTICS).unwrap();
 
@@ -1620,6 +1646,8 @@ fn test_ac11b_end_to_end_pagination_disjoint_pages() {
         blast_radius_paths: None,
         ast_scored: None,
         composite_weights: None,
+        phrase: false,
+        near: None,
     };
     let page1 = execute_query(&config_p1, &TEST_ANALYTICS).unwrap();
 
@@ -1783,6 +1811,8 @@ fn test_ac13_single_token_bypasses_k_pool_multi_word_uses_it() {
             blast_radius_paths: None,
             ast_scored: None,
             composite_weights: None,
+            phrase: false,
+            near: None,
         },
         &TEST_ANALYTICS,
     )
@@ -1798,6 +1828,8 @@ fn test_ac13_single_token_bypasses_k_pool_multi_word_uses_it() {
             blast_radius_paths: None,
             ast_scored: None,
             composite_weights: None,
+            phrase: false,
+            near: None,
         },
         &TEST_ANALYTICS,
     )
@@ -1848,6 +1880,8 @@ fn test_ac13_single_token_bypasses_k_pool_multi_word_uses_it() {
             blast_radius_paths: None,
             ast_scored: None,
             composite_weights: None,
+            phrase: false,
+            near: None,
         },
         &TEST_ANALYTICS,
     )
@@ -1935,6 +1969,8 @@ fn test_ac15a_short_query_fallback_5000_files_recall() {
             blast_radius_paths: None,
             ast_scored: None,
             composite_weights: None,
+            phrase: false,
+            near: None,
         };
         let _ = execute_query(&build_config, &TEST_ANALYTICS).unwrap();
     }
@@ -1951,6 +1987,8 @@ fn test_ac15a_short_query_fallback_5000_files_recall() {
         blast_radius_paths: None,
         ast_scored: None,
         composite_weights: None,
+        phrase: false,
+        near: None,
     };
 
     let output = execute_query(&query_config, &TEST_ANALYTICS).unwrap();
@@ -2023,6 +2061,8 @@ fn test_ac15a_short_query_fallback_5000_files_sla() {
                 blast_radius_paths: None,
                 ast_scored: None,
                 composite_weights: None,
+                phrase: false,
+                near: None,
             },
             &TEST_ANALYTICS,
         )
@@ -2039,6 +2079,8 @@ fn test_ac15a_short_query_fallback_5000_files_sla() {
         blast_radius_paths: None,
         ast_scored: None,
         composite_weights: None,
+        phrase: false,
+        near: None,
     };
 
     let t_start = Instant::now();
