@@ -479,7 +479,7 @@ fn test_check_staleness_lexical_below_version_triggers_rebuild_returns_manifest(
     create_fake_git_repo(dir.path(), &format!("{sha}\n"));
 
     write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
-    // Write a v2 lexical stub (bigram-era format, below current v4).
+    // Write a v2 lexical stub (bigram-era format, below current v5).
     // magic = b"SKIX", version = 2 (LE u16).
     fs::write(cache_dir.join("index.skidx"), b"SKIX\x02\x00").unwrap();
     // Valid AST stub so AST self-heal does not co-trigger.
@@ -487,7 +487,7 @@ fn test_check_staleness_lexical_below_version_triggers_rebuild_returns_manifest(
 
     let (result, manifest) = check_staleness(&cache_dir, dir.path());
 
-    // Must report stale (lexical v2 < v4 → self-heal required).
+    // Must report stale (lexical v2 < v5 → self-heal required).
     assert!(
         matches!(result, StalenessCheck::NoStoredHead),
         "v2 lexical index must trigger NoStoredHead rebuild; got {result:?}"
@@ -526,7 +526,7 @@ fn test_check_staleness_lexical_v3_below_version_triggers_rebuild_returns_manife
     create_fake_git_repo(dir.path(), &format!("{sha}\n"));
 
     write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
-    // Write a v3 lexical stub (pre-varint-compression format, below current v4).
+    // Write a v3 lexical stub (pre-varint-compression format, below current v5).
     // magic = b"SKIX", version = 3 (LE u16).
     fs::write(cache_dir.join("index.skidx"), b"SKIX\x03\x00").unwrap();
     // Valid AST stub so AST self-heal does not co-trigger.
@@ -534,7 +534,7 @@ fn test_check_staleness_lexical_v3_below_version_triggers_rebuild_returns_manife
 
     let (result, manifest) = check_staleness(&cache_dir, dir.path());
 
-    // Must report stale (lexical v3 < v4 → self-heal required, same guard as v2).
+    // Must report stale (lexical v3 < v5 → self-heal required, same guard as v2).
     assert!(
         matches!(result, StalenessCheck::NoStoredHead),
         "v3 lexical index must trigger NoStoredHead rebuild; got {result:?}"
@@ -549,6 +549,42 @@ fn test_check_staleness_lexical_v3_below_version_triggers_rebuild_returns_manife
         manifest.unwrap().stored_git_head(),
         Some(sha),
         "--stats must show real HEAD when only the lexical format is at v3 (below v4)"
+    );
+}
+
+/// AC-P2-3 / #392: a v4 lexical stub (pre-token_position format, the version this
+/// #392/#380-Phase-2 change upgrades FROM) must trigger `NoStoredHead` so the
+/// staleness check self-heals via full rebuild under the v5 binary — the generic
+/// `v < LEXICAL_INDEX_FORMAT_VERSION` guard (staleness.rs), same code path as v2/v3.
+///
+/// PF-007: asserts the exact `NoStoredHead` observable + manifest returned.
+#[test]
+fn test_check_staleness_lexical_v4_below_version_triggers_rebuild_returns_manifest() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().to_path_buf();
+    let sha = "ccdd3344ccdd3344ccdd3344ccdd3344ccdd3344";
+    create_fake_git_repo(dir.path(), &format!("{sha}\n"));
+
+    write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
+    // Write a v4 lexical stub (pre-token_position format, below current v5).
+    // magic = b"SKIX", version = 4 (LE u16).
+    fs::write(cache_dir.join("index.skidx"), b"SKIX\x04\x00").unwrap();
+    write_ast_index_stub(&cache_dir);
+
+    let (result, manifest) = check_staleness(&cache_dir, dir.path());
+
+    assert!(
+        matches!(result, StalenessCheck::NoStoredHead),
+        "v4 lexical index must trigger NoStoredHead rebuild under v5 binary; got {result:?}"
+    );
+    assert!(
+        manifest.is_some(),
+        "check_staleness must return manifest even when lexical index is below version"
+    );
+    assert_eq!(
+        manifest.unwrap().stored_git_head(),
+        Some(sha),
+        "--stats must show real HEAD when only the lexical format version is outdated"
     );
 }
 

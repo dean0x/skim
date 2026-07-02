@@ -1077,7 +1077,8 @@ fn test_lexical_index_size_ratio() {
          n_files={n_files}, fns_per_file={fns_per_file})"
     );
 
-    // Guard ceiling: measured trigram-v4 (delta+varint) baseline + 1.5x headroom.
+    // Guard ceiling: v4 delta+varint baseline + estimated v5 token_position
+    // overhead + headroom.
     //
     // Rationale for the ceiling value:
     //   - Measured v4 trigram baseline on this corpus (1000 diverse Rust modules,
@@ -1088,15 +1089,22 @@ fn test_lexical_index_size_ratio() {
     //     run 3-5x source bytes; v4 delta+varint brings skim below that range.
     //     The #174 <30% (0.30x) target has no empirical origin and is
     //     structurally impossible (see AD-LXSZ-1 comment above). ADR-003 replaces it.
-    //   - Ceiling = 3.53x measured + 1.5x headroom = 5.0x (round number).
-    //     Headroom absorbs minor corpus variation and overhead growth without
-    //     allowing a genuine bloat regression to pass.
-    //   - True sensitivity threshold: ~1.42x bloat (5.0 / 3.53).  The FIRST
-    //     regression that actually fires the assertion is ~1.42x above the
-    //     measured baseline (e.g. ratio ~4.9x from a partial-compression
-    //     regression would still PASS -- the gate is not a tight 2x guard).
+    //   - v5 (#392, token_position added): each posting gains a 4th varint
+    //     (delta_token_position), almost always 0 or 1 → ~1 extra byte/entry over
+    //     the v4 ~3.5 B/entry average, i.e. an estimated v5 ratio ~4.4x
+    //     (v4 3.53x baseline × ~4.5/3.5). CI on a009a2c empirically CONFIRMS the v5
+    //     index stays < 5.0x on this fixed corpus. Headroom is now ~1.13x (tighter
+    //     than v4's 1.42x) but the corpus is deterministic, so the guard is stable;
+    //     a full-revert 9x posting explosion still fires it decisively.
+    //     (To re-ground to the exact v5 ratio: set this ceiling low, push, and read
+    //     the printed ratio from the CI failure message — not done here to avoid a
+    //     throwaway red CI run.)
+    //   - True sensitivity threshold: ~1.13x bloat (5.0 / ~4.4 estimated v5
+    //     baseline).  The FIRST regression that actually fires the assertion is
+    //     ~1.13x above the estimated v5 baseline (tighter than v4's ~1.42x
+    //     margin, since token_position adds bytes without raising the ceiling).
     //     A genuine posting-list explosion (full revert to v3 fixed-9-byte
-    //     encoding gives 9.04x >> 5.0x) definitively fires the gate (ADR-003).
+    //     encoding gives 9.04x >> 5.0x) still definitively fires the gate (ADR-003).
     //
     // ADR-003: regression guard must be empirically grounded, not the
     // baseless 0.30x inherited from the original ticket text.
@@ -1104,7 +1112,8 @@ fn test_lexical_index_size_ratio() {
     assert!(
         ratio < LEXICAL_SIZE_RATIO_CEILING,
         "AD-LXSZ-1: lexical index size ratio {ratio:.4} exceeds the \
-         <{LEXICAL_SIZE_RATIO_CEILING}x bloat guard (v4 delta+varint baseline 3.53x). \
+         <{LEXICAL_SIZE_RATIO_CEILING}x bloat guard (v5 token_position baseline ~4.4x, \
+         CI-confirmed < 5.0x). \
          If ratio exceeded: check for O(files^2) posting growth, \
          missing dedup, unbounded trigram emission, or codec regression. \
          index={total_index_bytes} bytes, source={total_source_bytes} bytes."
@@ -2697,4 +2706,145 @@ fn intersect_sorted_u32_disjoint_returns_empty() {
 fn intersect_sorted_u32_empty_operand_returns_empty() {
     assert!(intersect_sorted_u32(&[], &[1, 2, 3]).is_empty());
     assert!(intersect_sorted_u32(&[1, 2, 3], &[]).is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AC-P2 (#392 / #380 Phase 2): positional phrase / --near end-to-end
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AC-P2-1 (positive) + AC-P2-2 (negative, falsifiable): `--phrase "alpha beta"`
+/// matches only files where the two words are CONTIGUOUS and ORDERED. Reversed,
+/// non-adjacent, and single-term files must be rejected. This test FAILS if the
+/// positional filter is reverted to bag-of-trigrams (order/adjacency ignored).
+#[test]
+fn test_ac_p2_phrase_positive_and_negative() {
+    let files = vec![
+        (
+            FileId(0),
+            "let result = alpha beta gamma",
+            rskim_core::Language::Rust,
+        ), // adjacent, ordered
+        (
+            FileId(1),
+            "beta alpha reversed here now",
+            rskim_core::Language::Rust,
+        ), // reversed
+        (
+            FileId(2),
+            "alpha then some other words then beta",
+            rskim_core::Language::Rust,
+        ), // non-adjacent
+        (
+            FileId(3),
+            "just alpha alone without it",
+            rskim_core::Language::Rust,
+        ), // only alpha
+    ];
+    let (_dir, layer) = build_index_with(&files);
+    let mut q = SearchQuery::new("alpha beta");
+    q.phrase = true;
+    let ids: std::collections::HashSet<u32> = layer
+        .search(&q)
+        .unwrap()
+        .iter()
+        .map(|r| r.file_id.0)
+        .collect();
+    assert!(
+        ids.contains(&0),
+        "AC-P2-1: --phrase 'alpha beta' must match file 0 (words adjacent, ordered); got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&1),
+        "AC-P2-2: --phrase must NOT match file 1 (reversed 'beta alpha'); got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&2),
+        "AC-P2-2: --phrase must NOT match file 2 (non-adjacent); got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&3),
+        "AC-P2-2: --phrase must NOT match file 3 (single term 'alpha' only); got {ids:?}"
+    );
+}
+
+/// AC-P2-2 (--near): `--near N` accepts word-token distance ≤ N, rejects > N.
+#[test]
+fn test_ac_p2_near_within_and_beyond_window() {
+    let files = vec![
+        (FileId(0), "alpha beta", rskim_core::Language::Rust), // distance 1
+        (FileId(1), "alpha one two beta", rskim_core::Language::Rust), // distance 3
+        (
+            FileId(2),
+            "alpha a b c d e f beta",
+            rskim_core::Language::Rust,
+        ), // distance 7
+    ];
+    let (_dir, layer) = build_index_with(&files);
+
+    let mut q3 = SearchQuery::new("alpha beta");
+    q3.near = Some(3);
+    let ids3: std::collections::HashSet<u32> = layer
+        .search(&q3)
+        .unwrap()
+        .iter()
+        .map(|r| r.file_id.0)
+        .collect();
+    assert!(
+        ids3.contains(&0),
+        "--near 3: distance-1 file must match; got {ids3:?}"
+    );
+    assert!(
+        ids3.contains(&1),
+        "--near 3: distance-3 file must match; got {ids3:?}"
+    );
+    assert!(
+        !ids3.contains(&2),
+        "--near 3: distance-7 file must NOT match; got {ids3:?}"
+    );
+
+    let mut q8 = SearchQuery::new("alpha beta");
+    q8.near = Some(8);
+    let ids8: std::collections::HashSet<u32> = layer
+        .search(&q8)
+        .unwrap()
+        .iter()
+        .map(|r| r.file_id.0)
+        .collect();
+    assert!(
+        ids8.contains(&2),
+        "--near 8: distance-7 file must now match; got {ids8:?}"
+    );
+}
+
+/// AC-P2-3 (no regression): a plain (non-phrase/non-near) query returns identical
+/// results whether or not the positional fields are default — the positional
+/// branch must not fire. Sanity: the same corpus queried without --phrase returns
+/// the reversed/non-adjacent files too (proving the phrase filter is what excluded them).
+#[test]
+fn test_ac_p2_no_regression_plain_query_unaffected() {
+    let files = vec![
+        (
+            FileId(0),
+            "let result = alpha beta gamma",
+            rskim_core::Language::Rust,
+        ),
+        (
+            FileId(1),
+            "beta alpha reversed here now",
+            rskim_core::Language::Rust,
+        ),
+    ];
+    let (_dir, layer) = build_index_with(&files);
+    // Plain single-token query is unaffected by phrase/near (both default).
+    let plain = SearchQuery::new("alpha");
+    let ids: std::collections::HashSet<u32> = layer
+        .search(&plain)
+        .unwrap()
+        .iter()
+        .map(|r| r.file_id.0)
+        .collect();
+    assert!(
+        ids.contains(&0) && ids.contains(&1),
+        "AC-P2-3: plain query 'alpha' must return BOTH files (positional branch must not fire); got {ids:?}"
+    );
 }
