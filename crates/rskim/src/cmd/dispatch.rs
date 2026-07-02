@@ -13,6 +13,60 @@ use super::{
 };
 
 // ============================================================================
+// Defense-in-depth: strip stray --session-id from subcommand args
+// ============================================================================
+
+/// Remove any `--session-id=…` or `--session-id <value>` token(s) from an
+/// argument slice so a stray flag injected by an old hook never reaches the
+/// underlying tool.
+///
+/// Two forms are stripped:
+/// - `--session-id=VALUE`  — the equals form (produced by the now-removed
+///   `inject_session_id_into_parts` in hook.rs).
+/// - `--session-id VALUE`  — the space-separated form (forward-compat guard).
+///
+/// This is the forward-compat / backward-compat safety net (#1.1 / spec §4):
+/// the hook no longer injects the flag, but an OLD hook talking to this binary
+/// might still inject it. Without this filter the stray flag would be forwarded
+/// to the underlying tool (e.g. `git`, `grep`) which would fail with
+/// "unrecognised option --session-id".
+///
+/// The function is allocation-free when no `--session-id` token is present
+/// (returns `None`). Callers use the original slice unchanged in that case.
+pub(crate) fn strip_session_id_flag(args: &[String]) -> Option<Vec<String>> {
+    // Fast-path: if no arg contains "--session-id" there is nothing to strip.
+    if !args.iter().any(|a| a.contains("--session-id")) {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg.starts_with("--session-id=") {
+            // Equals form: single token, skip it.
+            i += 1;
+        } else if arg == "--session-id" {
+            // Space-separated form: skip this token AND the next (the value).
+            i += 1;
+            if i < args.len() {
+                i += 1; // skip the value token
+            }
+        } else {
+            out.push(arg.clone());
+            i += 1;
+        }
+    }
+
+    // Return Some only when we actually removed at least one token.
+    if out.len() < args.len() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+// ============================================================================
 // Private argument helpers
 // ============================================================================
 
@@ -41,6 +95,23 @@ fn prepend_without(tool: &str, args: &[String], skip_idx: usize) -> Vec<String> 
             .map(|(_, s)| s.clone()),
     );
     v
+}
+
+/// Build a `Vec<String>` with the element at `skip_idx` removed and **no** tool
+/// prepended.  Used by the cargo `test` dispatch arm to strip the `test`
+/// subcommand token before handing the remaining args to `cargo::run`, which
+/// re-adds `test` itself via `build_cargo_args`.
+fn without_index(args: &[String], skip_idx: usize) -> Vec<String> {
+    assert!(
+        skip_idx < args.len(),
+        "skip_idx {skip_idx} out of bounds for args len {}",
+        args.len()
+    );
+    args.iter()
+        .enumerate()
+        .filter(|(i, _)| *i != skip_idx)
+        .map(|(_, s)| s.clone())
+        .collect()
 }
 
 /// Shared scaffolding for multi-category dispatchers (`cargo`, `go`, …).
@@ -296,6 +367,25 @@ fn print_go_help() {
 // ============================================================================
 
 /// Route `skim cargo <subcmd> [args...]` to the correct category handler.
+/// Shared tail for cargo's `test` / `nextest` dispatch arms: split off
+/// `--show-stats`, build the test recording context, and run the cargo test
+/// handler with `is_nextest` threaded explicitly from the calling arm — never
+/// re-derived from arg position (A1 fix; see PF-003).
+fn run_cargo_tests(
+    args: &[String],
+    is_nextest: bool,
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
+    let (filtered, show_stats) = super::extract_show_stats(args);
+    let rec = crate::analytics::RecordingContext {
+        enabled: analytics.enabled,
+        command_type: crate::analytics::CommandType::Test,
+        parse_tier: None,
+        session_id: analytics.session_id.as_deref(),
+    };
+    test::cargo::run(&filtered, is_nextest, show_stats, rec)
+}
+
 fn dispatch_cargo(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
@@ -321,10 +411,18 @@ fn dispatch_cargo(
     // All subcommands use their own name consistently — there is no legacy "cargo"
     // alias for "build" any more.
     match subcmd {
-        "test" | "t" => test::run(&prepend_without("cargo", args, idx), analytics),
-        // nextest: keep the "nextest" token — the test handler uses it to select
-        // the nextest parse path instead of the plain cargo-test path.
-        "nextest" => test::run(&prepend("cargo", args), analytics),
+        "test" | "t" => {
+            // Standard cargo test — drop the "test" subcmd token, then thread
+            // is_nextest=false from the dispatch arm (never re-derived from arg
+            // position).  Without explicit threading, `cargo test nextest` (a bare
+            // test-name filter) looks identical to `cargo nextest run` once the
+            // "test" token is stripped — runner_args.first()=="nextest" in both —
+            // causing a misroute (A1 fix, avoids PF-003 false-green on the
+            // standard-test path).
+            run_cargo_tests(&without_index(args, idx), false, analytics)
+        }
+        // cargo nextest — keep all tokens (incl. "nextest"); is_nextest=true.
+        "nextest" => run_cargo_tests(args, true, analytics),
         "build" | "b" => build::run(&prepend_without("build", args, idx), analytics),
         "check" | "c" => build::run(&prepend_without("check", args, idx), analytics),
         "fmt" => build::run(&prepend_without("fmt", args, idx), analytics),
@@ -444,6 +542,18 @@ pub(crate) fn dispatch(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
+    // Defense-in-depth (#1.1): strip any stray --session-id flag before routing.
+    // The hook no longer injects this flag, but an OLD hook might. Without
+    // stripping, the flag would reach the underlying tool and cause "unrecognised
+    // option" failures. This is a forward-compat / backward-compat safety net.
+    let stripped;
+    let args = if let Some(clean) = strip_session_id_flag(args) {
+        stripped = clean;
+        &stripped
+    } else {
+        args
+    };
+
     // Daemon / streaming guard (ADR-008 Part C).
     //
     // Commands like `vite`, `npm run dev`, `jest --watch` run indefinitely;
@@ -531,6 +641,87 @@ pub(crate) fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // strip_session_id_flag: defense-in-depth (#1.1 / spec §4)
+    //
+    // A stray --session-id flag must never reach the underlying tool.
+    // These tests exercise the WRAPPER and DISPATCH surfaces (not the rewrite
+    // surface — the hook no longer injects the flag, but an old hook might).
+    // ========================================================================
+
+    fn sv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// No --session-id present → returns None (allocation-free fast-path).
+    #[test]
+    fn test_strip_session_id_flag_noop_when_absent() {
+        let args = sv(&["status", "--short"]);
+        assert!(
+            strip_session_id_flag(&args).is_none(),
+            "no --session-id means None (no allocation)"
+        );
+    }
+
+    /// Equals form `--session-id=foo` is stripped and the value is consumed.
+    #[test]
+    fn test_strip_session_id_flag_equals_form() {
+        let args = sv(&["--session-id=abc-123", "status", "--short"]);
+        let result = strip_session_id_flag(&args).expect("must strip equals form");
+        assert_eq!(result, sv(&["status", "--short"]));
+        assert!(
+            !result.iter().any(|a| a.contains("--session-id")),
+            "stripped result must not contain --session-id"
+        );
+    }
+
+    /// Space-separated form `--session-id foo` strips both the flag and its value.
+    #[test]
+    fn test_strip_session_id_flag_space_form() {
+        let args = sv(&["status", "--session-id", "abc-123", "--short"]);
+        let result = strip_session_id_flag(&args).expect("must strip space-separated form");
+        assert_eq!(result, sv(&["status", "--short"]));
+    }
+
+    /// Space-separated form at the end of args (value is last token).
+    #[test]
+    fn test_strip_session_id_flag_space_form_at_end() {
+        let args = sv(&["status", "--session-id", "abc-123"]);
+        let result = strip_session_id_flag(&args).expect("must strip");
+        assert_eq!(result, sv(&["status"]));
+    }
+
+    /// Bare `--session-id` with no following value: only the flag token is removed.
+    #[test]
+    fn test_strip_session_id_flag_space_form_no_value() {
+        // Trailing --session-id with no value token.
+        let args = sv(&["status", "--session-id"]);
+        let result = strip_session_id_flag(&args).expect("must strip");
+        assert_eq!(result, sv(&["status"]));
+    }
+
+    /// Multiple occurrences are all stripped.
+    #[test]
+    fn test_strip_session_id_flag_multiple_occurrences() {
+        let args = sv(&["--session-id=a", "status", "--session-id=b"]);
+        let result = strip_session_id_flag(&args).expect("must strip");
+        assert_eq!(result, sv(&["status"]));
+    }
+
+    /// Other flags and positionals are preserved exactly.
+    #[test]
+    fn test_strip_session_id_flag_preserves_other_args() {
+        let args = sv(&["--session-id=x", "diff", "--stat", "HEAD~1"]);
+        let result = strip_session_id_flag(&args).expect("must strip");
+        assert_eq!(result, sv(&["diff", "--stat", "HEAD~1"]));
+    }
+
+    /// Empty arg slice: returns None (nothing to strip, nothing to allocate).
+    #[test]
+    fn test_strip_session_id_flag_empty_args() {
+        assert!(strip_session_id_flag(&[]).is_none());
+    }
 
     // ========================================================================
     // extract_subcmd tests

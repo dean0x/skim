@@ -25,20 +25,22 @@ use crate::{
 /// Capacity-hint upper bound (bytes per posting entry) for the postings buffer
 /// in [`NgramIndexBuilder::serialize_index`].
 ///
-/// A v4 entry is `[varint delta_doc_id][u8 field_id][varint delta_position]`.
-/// The maximum varint width is 5 bytes each (35-bit span for a u32), giving
-/// 5 + 1 + 5 = 11 bytes as the strict upper bound.  We use 9 — the v3 fixed
-/// entry size — as a deliberate over-estimate (~2.5x the measured v4 average of
-/// ~3.5 bytes/entry on a diverse 1000-file corpus) to avoid reallocation during
-/// index build.  After encoding, `postings_buf.shrink_to_fit()` releases the
-/// unused capacity before CRC computation and `atomic_write`, so peak RSS
-/// reflects the actual encoded size (~3.5 bytes/entry) rather than the
-/// upper-bound estimate (9 bytes/entry).  The buffer is build-time only.
+/// A v5 entry is `[varint delta_doc_id][u8 field_id][varint delta_position]
+/// [varint delta_token_position]`.  The maximum varint width is 5 bytes each
+/// (35-bit span for a u32), giving 5 + 1 + 5 + 5 = 16 bytes as the strict
+/// upper bound.  We use 12 as a deliberate over-estimate (~2.7x the measured
+/// v5 average of ~4.5 bytes/entry on a diverse 1000-file corpus — token
+/// deltas are almost always 0 or 1, so they typically add just ~1 byte/entry
+/// over the v4 average) to avoid reallocation during index build.  After
+/// encoding, `postings_buf.shrink_to_fit()` releases the unused capacity
+/// before CRC computation and `atomic_write`, so peak RSS reflects the
+/// actual encoded size (~4.5 bytes/entry) rather than the upper-bound
+/// estimate (12 bytes/entry).  The buffer is build-time only.
 ///
 /// Framing: this is a zero-realloc-during-encode / peak-RSS trade-off.
-/// The excess capacity (~2.5x average) is held only for the duration of the
+/// The excess capacity (~2.7x average) is held only for the duration of the
 /// encode loop; `shrink_to_fit` reclaims it immediately after.
-const VARINT_UPPER_BOUND_PER_ENTRY: usize = 9;
+const VARINT_UPPER_BOUND_PER_ENTRY: usize = 12;
 
 // ============================================================================
 // Public builder struct
@@ -164,6 +166,8 @@ impl NgramIndexBuilder {
         // AD-355-5 / PF-004: widen each byte to u32 before shift arithmetic to
         // prevent u8 overflow: `u32::from(b) << k`, never `b << k`.
         let bytes = content.as_bytes();
+        let token_of_byte = crate::lexical::word_token_indices(content);
+        debug_assert_eq!(token_of_byte.len(), content.len());
         let mut range_idx = 0usize;
         for (pos, window) in bytes.windows(3).enumerate() {
             // Advance past any ranges that have ended before `pos`.
@@ -175,6 +179,7 @@ impl NgramIndexBuilder {
             } else {
                 SearchField::Other.discriminant()
             };
+            let token_position = token_of_byte[pos];
             // PF-004: widen to u32 before shifting — never shift on a bare u8.
             let key =
                 (u32::from(window[0]) << 16) | (u32::from(window[1]) << 8) | u32::from(window[2]);
@@ -182,6 +187,7 @@ impl NgramIndexBuilder {
                 doc_id: id.0,
                 field_id,
                 position: pos as u32,
+                token_position,
             });
         }
 
@@ -288,10 +294,20 @@ impl LayerBuilder for NgramIndexBuilder {
         let post_path = self.output_dir.join("index.skpost");
         let idx_path = self.output_dir.join("index.skidx");
 
+        // Invalidate any prior validity marker BEFORE writing fresh files
+        // (#376, AD-376-4).  The (len, mtime, checksum) signature already
+        // self-invalidates on rewrite, but unlinking defensively means a
+        // partial or aborted rebuild can never leave a stale marker that would
+        // validate the wrong bytes on the next open.
+        crate::validity::unlink_marker_best_effort(&self.output_dir.join("index.skverify"));
+
         // Atomic writes: .skpost first, .skidx second (commit point).
         atomic_write(&self.output_dir, &post_path, &postings_buf)?;
         atomic_write(&self.output_dir, &idx_path, &skidx_buf)?;
 
+        // Verify-back open re-validates the freshly-written bytes and stamps a
+        // new index.skverify (AD-376-3 / AC8) so the first post-build query
+        // skips the redundant full CRC32.
         let reader = NgramIndexReader::open(&self.output_dir)?;
         Ok(Box::new(reader))
     }
@@ -303,7 +319,7 @@ impl NgramIndexBuilder {
     ///
     /// # AD-LXPOST-1
     ///
-    /// Postings are encoded using v4 delta+varint compression (see
+    /// Postings are encoded using v5 delta+varint compression (see
     /// [`encode_postings_varint`]).  Each posting list is sorted ascending by
     /// `(doc_id, field_id, position)` before encoding so that each
     /// `delta_doc_id` and `delta_position` is a forward, non-wrapping step
@@ -314,12 +330,12 @@ impl NgramIndexBuilder {
         avg_doc_length: f32,
         avg_field_lengths: [f32; FIELD_COUNT],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        // Serialise posting lists using v4 variable-length (delta+varint) codec.
-        // Pre-size at VARINT_UPPER_BOUND_PER_ENTRY (= 9, the v3 fixed-entry size)
-        // per entry.  This is ~2.5x the measured v4 average of ~3.5 bytes/entry —
-        // a deliberate peak-memory/zero-realloc trade-off (see constant comment
-        // above).  The strict worst-case is 11 bytes/entry; 9 avoids that extra
-        // ~22% while still guaranteeing zero reallocations in practice.
+        // Serialise posting lists using v5 variable-length (delta+varint) codec.
+        // Pre-size at VARINT_UPPER_BOUND_PER_ENTRY (= 12) per entry.  This is
+        // ~2.7x the measured v5 average of ~4.5 bytes/entry — a deliberate
+        // peak-memory/zero-realloc trade-off (see constant comment above).  The
+        // strict worst-case is 16 bytes/entry; 12 avoids that extra headroom
+        // while still guaranteeing zero reallocations in practice.
         let estimated_capacity: usize = self
             .postings
             .values()
@@ -331,7 +347,7 @@ impl NgramIndexBuilder {
         for key in sorted_keys {
             let list = &self.postings[key];
             let offset = postings_buf.len() as u64;
-            // Encode this posting list with delta+varint (AD-LXPOST-1, FORMAT_VERSION v4).
+            // Encode this posting list with delta+varint (AD-LXPOST-1, FORMAT_VERSION v5).
             // The list is already sorted by (doc_id, field_id, position) — the caller
             // (build()) calls list.sort_unstable() before reaching here.
             encode_postings_varint(list, &mut postings_buf);

@@ -364,8 +364,9 @@ mod tests {
 
     #[test]
     fn test_cargo_nextest_run() {
+        // "run" must be preserved so the dispatch layer receives "nextest run …" intact (FIX 2).
         let result = try_rewrite(&["cargo", "nextest", "run"]).unwrap();
-        assert_eq!(result.tokens, vec!["skim", "cargo", "nextest"]);
+        assert_eq!(result.tokens, vec!["skim", "cargo", "nextest", "run"]);
     }
 
     #[test]

@@ -252,6 +252,17 @@ impl TemporalDb {
     ///
     /// Returns an empty `Vec` when the table is empty.
     ///
+    /// # Deterministic tie-break (AD-378-4)
+    ///
+    /// Volume-weighting (Wilson lower bound, #378) reduces but does not eliminate
+    /// exact ties — e.g. all `1-fix/1-commit` files share the same Wilson score.
+    /// Rows with equal `risk_score` are therefore ordered by `total_commits`
+    /// **descending** (a higher-evidence file wins) and then `file_path`
+    /// **ascending** (lexicographic) as a final stable key. This makes standalone
+    /// `--risky` ordering deterministic across rebuilds and consistent with the
+    /// combined-query paths that already break ties by path. This is a query-time
+    /// ORDER BY change only — NOT a schema change (AC7).
+    ///
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
@@ -261,7 +272,7 @@ impl TemporalDb {
             .conn
             .prepare_cached(
                 "SELECT file_path, risk_score, total_commits, fix_commits, fix_density \
-                 FROM risk ORDER BY risk_score DESC LIMIT ?1",
+                 FROM risk ORDER BY risk_score DESC, total_commits DESC, file_path ASC LIMIT ?1",
             )
             .map_err(db_err)?;
         let rows = stmt

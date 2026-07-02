@@ -8,7 +8,7 @@ Skim offers six transformation modes, each with different levels of aggressivene
 |------------|-----------------|------------------------------------------|-----------------------------|
 | Full       | 0%              | Everything (original source)             | Nothing                     |
 | Minimal    | 15-30%          | All code, doc comments                   | Non-doc comments            |
-| Pseudo     | 30-50%          | Logic flow, names, values                | Types, visibility, decorators, semicolons |
+| Pseudo     | 30-50%          | Logic flow, names, values, visibility    | Types, decorators, semicolons             |
 | Structure  | 70-80%          | Signatures, types, classes, imports      | Function bodies             |
 | Signatures | 85-92%          | Only callable signatures                 | Everything else             |
 | Types      | 90-95%          | Only type definitions                    | All code                    |
@@ -257,7 +257,7 @@ skim file.ts --mode full
 
 **Token reduction: 30-50%**
 
-Pseudo mode strips syntactic noise (type annotations, visibility modifiers, decorators, semicolons) while preserving all logic flow. The result reads like pseudocode: you can follow the program's behavior without the ceremony of a statically-typed language.
+Pseudo mode strips syntactic noise (type annotations, decorators, semicolons) while preserving all logic flow and visibility modifiers. The result reads like pseudocode: you can follow the program's behavior without the ceremony of a statically-typed language.
 
 ### What's Preserved
 
@@ -266,12 +266,13 @@ Pseudo mode strips syntactic noise (type annotations, visibility modifiers, deco
 - Class and struct definitions (names and structure)
 - String literals and values
 - Import statements
+- Visibility and export modifiers (`pub`, `export`, `public`, `private`, `protected`, `internal`, `fileprivate`, Swift `open`)
 
 ### What's Removed
 
 - Type annotations (`: number`, `: int`, `-> str`)
 - Type parameters and generics (`<T>`, `<'a>`)
-- Visibility modifiers (`pub`, `public`, `private`, `protected`, `static`, `final`)
+- Non-visibility keyword modifiers (`static`, `final`, `abstract`, Kotlin `open`)
 - Decorators and attributes (`@Override`, `#[derive(Debug)]`)
 - Statement-terminating semicolons (preserves for-loop semicolons)
 - Language-specific noise (lifetimes, where clauses, mutable specifiers)
@@ -299,8 +300,8 @@ export function processUser(id: string, options: ProcessOptions): Promise<User> 
 
 **Output:**
 ```
-function processUser(id, options) {
-    user = await db.find(id)
+export function processUser(id, options) {
+    const user = await db.find(id)
     if (!user) throw new NotFoundError()
     return transform(user, options)
 }
@@ -325,14 +326,14 @@ def calculate(x, y):
 
 | Language   | What's Stripped                                                                 |
 |------------|--------------------------------------------------------------------------------|
-| TypeScript | Type annotations, type params, decorators, `export`, `readonly`, `abstract`, `;` |
-| JavaScript | Decorators, `export`, `;`                                                      |
+| TypeScript | Type annotations, type params, decorators, `readonly`, `abstract`, `;`         |
+| JavaScript | Decorators, `;`                                                                 |
 | Python     | Type annotations, return types, decorators, `self`/`cls` first param           |
-| Rust       | Visibility, lifetimes, type params, where clauses, attributes, `mut`, `;`      |
+| Rust       | Lifetimes, type params, where clauses, attributes, `mut`, `;`                  |
 | Go         | Conservative (no stripping) — Go types are integral to understanding           |
-| Java       | Visibility modifiers, annotations, type params, `throws`, `;`                  |
+| Java       | Annotations, type params, `throws`, `;`                                        |
 | C          | `static`/`extern`/`const`/`volatile`, `;`                                      |
-| C++        | Access specifiers, template params, `virtual`/`override`/`final`/`noexcept`, `;` |
+| C++        | Template params, `virtual`/`override`/`final`/`noexcept`, `;`                  |
 
 ### Use Cases
 

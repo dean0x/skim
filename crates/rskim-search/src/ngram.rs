@@ -354,6 +354,101 @@ pub fn extract_query_ngrams(query: &str) -> Vec<(Ngram, f32)> {
     extract_query_ngrams_with_weights(query, TRIGRAM_WEIGHTS)
 }
 
+// ============================================================================
+// Query-shape predicate (AD-372-5)
+// ============================================================================
+
+/// Return `true` iff `query` is an exact-symbol query — a single contiguous
+/// token that is non-empty, at least 3 bytes, and contains no interior ASCII
+/// whitespace.
+///
+/// # AD-372-5: Single source of truth for "exact-symbol mode"
+///
+/// Both [`crate::index::reader::NgramIndexReader::search`] (which branches on
+/// query shape) and `rskim::cmd::search::query` (which decides whether to bypass
+/// `LEXICAL_CANDIDATE_POOL_K`) consult this predicate.  Keeping the definition
+/// in one place prevents the two layers from diverging.
+///
+/// **Semantics:** `query.trim()` must be non-empty, `>= 3` bytes, and satisfy
+/// `split_whitespace().count() == 1`.  Leading/trailing whitespace is ignored;
+/// interior whitespace (space, tab, or any ASCII whitespace byte) causes the
+/// predicate to return `false` and routes the query to the BM25F UNION path.
+///
+/// # Examples
+///
+/// ```rust
+/// use rskim_search::ngram::is_single_token;
+/// assert!(is_single_token("foo"));
+/// assert!(is_single_token("foo::bar"));
+/// assert!(is_single_token("  foo  "));
+/// assert!(!is_single_token("foo bar"));
+/// assert!(!is_single_token("fn"));
+/// assert!(!is_single_token("a\tb"));
+/// assert!(!is_single_token(""));
+/// ```
+#[must_use]
+pub fn is_single_token(query: &str) -> bool {
+    // AD-372-5: non-empty after trim, >= 3 bytes, exactly one whitespace-token.
+    let trimmed = query.trim();
+    trimmed.len() >= 3 && trimmed.split_whitespace().count() == 1
+}
+
+// ============================================================================
+// Query positional tokens (v5, #392 / #380 Phase 2)
+// ============================================================================
+
+/// A query word-token and its within-word trigrams (v5 positional search, #392).
+///
+/// `token_off` is the word's ordinal from [`crate::lexical::word_token_indices`]
+/// (0-based, contiguous in query order). `trigrams` are the DEDUPED trigrams that
+/// lie ENTIRELY within the word (all three bytes share this word); a word < 3
+/// bytes yields an empty `trigrams` (it cannot be located positionally).
+#[derive(Debug, Clone)]
+pub struct QueryToken {
+    pub token_off: u32,
+    pub trigrams: Vec<Ngram>,
+}
+
+/// Split `query` into word tokens (`[A-Za-z0-9_]+` maximal runs) and, for each,
+/// collect its within-word trigrams (deduped by key). Words < 3 bytes yield an
+/// empty trigram list. Returned in query order; `tokens[k].token_off == k`.
+///
+/// Cross-word/border trigrams are intentionally EXCLUDED so that `--near`
+/// (non-adjacent) matches are not forced into adjacency.
+#[must_use]
+pub fn extract_query_positional_tokens(query: &str) -> Vec<QueryToken> {
+    let bytes = query.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let tok_of_byte = crate::lexical::word_token_indices(query);
+    let mut tokens: Vec<QueryToken> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !is_word(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_word(bytes[i]) {
+            i += 1;
+        }
+        let end = i; // exclusive
+        let token_off = tok_of_byte[start];
+        let mut trigrams: Vec<Ngram> = Vec::new();
+        if end - start >= 3 {
+            for j in start..=(end - 3) {
+                trigrams.push(Ngram::from_bytes(bytes[j], bytes[j + 1], bytes[j + 2]));
+            }
+            trigrams.sort_unstable_by_key(|n| n.key());
+            trigrams.dedup_by_key(|n| n.key());
+        }
+        tokens.push(QueryToken {
+            token_off,
+            trigrams,
+        });
+    }
+    tokens
+}
+
 #[cfg(test)]
 #[path = "ngram_tests.rs"]
 mod tests;

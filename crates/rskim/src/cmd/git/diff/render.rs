@@ -19,6 +19,38 @@ thread_local! {
     static PARSERS: RefCell<HashMap<Language, rskim_core::Parser>> = RefCell::new(HashMap::new());
 }
 
+/// Per-file monotonic emitted-line cursor for changed-line de-duplication.
+///
+/// When two adjacent `ChangedNodeRange` items share one hunk (e.g. a
+/// doc-comment edit immediately followed by a signature edit, both covered by
+/// one `@@` block), `render_node_with_hunks` is called for each range and each
+/// call re-walks the shared hunk via `emit_hunk_patch_lines_clipped`.  The
+/// shared changed lines would be emitted twice — once per range call.
+///
+/// This cursor is created **per-file** inside `render_changed_only` and
+/// `render_with_unchanged_context`, ensuring line numbers restart correctly
+/// when a new file is rendered.  It is threaded as `&mut` into
+/// `render_node_with_hunks` and from there into `emit_hunk_patch_lines_clipped`.
+///
+/// **Skip rule:**
+/// - `+` / context line: skip when `patch_new_line <= cursor.last_new`.
+/// - `-` line: skip when `patch_old_line <= cursor.last_old`
+///   (`-` lines don't advance `new_line`, so they need the old-line axis).
+/// - After emitting, update BOTH cursor fields.
+///
+/// **Scope:** never shared across files — `FileDiff` line numbers restart
+/// from 1 per file, so a shared global cursor would incorrectly skip lines
+/// in files 2, 3, … whose line numbers fall below the previous file's cursor.
+#[derive(Debug, Default, Clone, Copy)]
+struct EmittedCursor {
+    /// Last new-file line number emitted (`+` or context ` ` line).
+    /// Skip any `+`/context patch line whose `patch_new_line <= last_new`.
+    last_new: usize,
+    /// Last old-file line number emitted (`-` line).
+    /// Skip any `-` patch line whose `patch_old_line <= last_old`.
+    last_old: usize,
+}
+
 /// Compute the minimum column width needed to display any line number in `hunks`.
 ///
 /// Returns at least 1 so empty diffs still produce a consistent format.
@@ -211,6 +243,11 @@ fn render_changed_only(
         }
     }
 
+    // Per-file monotonic cursor — prevents duplicate changed lines when two
+    // adjacent ranges share one hunk.  Created here (per-file) so it resets
+    // correctly for each FileDiff without leaking across file boundaries.
+    let mut cursor = EmittedCursor::default();
+
     for (idx, range) in changed_ranges.iter().enumerate() {
         // Emit parent header if this is a nested node
         if let Some(ref ctx) = range.parent_context
@@ -250,6 +287,7 @@ fn render_changed_only(
                 hunks,
                 source_lines,
                 ln_width,
+                &mut cursor,
             );
         }
 
@@ -280,9 +318,14 @@ fn render_with_unchanged_context(
     parser: &mut rskim_core::Parser,
 ) {
     let root = tree.root_node();
-    let mut cursor = root.walk();
+    let mut walker = root.walk();
 
-    for child in root.children(&mut cursor) {
+    // Per-file monotonic cursor — prevents duplicate changed lines when two
+    // adjacent changed nodes share a hunk.  See EmittedCursor for the full
+    // explanation; scope is per-file so it resets across FileDiff boundaries.
+    let mut cursor = EmittedCursor::default();
+
+    for child in root.children(&mut walker) {
         let node_start = child.start_position().row + 1;
         let node_end = child.end_position().row + 1;
 
@@ -308,7 +351,7 @@ fn render_with_unchanged_context(
             // This node contains changes — render with full patch detail.
             // If it's a container, render parent header + changed children + context children.
             if is_container_node(&child) {
-                render_container_with_mode(output, &child, ctx, parser);
+                render_container_with_mode(output, &child, ctx, parser, &mut cursor);
             } else {
                 // Non-container changed node: render with patch
                 render_node_with_hunks(
@@ -318,6 +361,7 @@ fn render_with_unchanged_context(
                     ctx.hunks,
                     ctx.source_lines,
                     ctx.ln_width,
+                    &mut cursor,
                 );
             }
         } else {
@@ -336,11 +380,16 @@ fn render_with_unchanged_context(
 }
 
 /// Render a container node (class/struct) with mode-aware child rendering.
+///
+/// `cursor` is the per-file monotonic cursor threaded from the caller
+/// (`render_with_unchanged_context`) to prevent duplicate changed lines when
+/// adjacent children share a hunk.
 fn render_container_with_mode(
     output: &mut String,
     node: &tree_sitter::Node<'_>,
     ctx: &ModeRenderContext<'_>,
     parser: &mut rskim_core::Parser,
+    cursor: &mut EmittedCursor,
 ) {
     let node_start = node.start_position().row + 1;
     let node_end = node.end_position().row + 1;
@@ -385,6 +434,7 @@ fn render_container_with_mode(
                 ctx.hunks,
                 ctx.source_lines,
                 ln_width,
+                cursor,
             );
         } else {
             render_unchanged_node(
@@ -478,6 +528,15 @@ fn render_unchanged_node(
 ///   hasn't yet reached `node_start`.
 /// - Stop after `node_end`: break once `patch_new_line > node_end`.
 ///
+/// De-duplication (`cursor`): when two adjacent changed ranges share a hunk,
+/// this function is called once per range.  The second call starts with the
+/// same `hunk.new_start` / `hunk.old_start` and would re-emit lines already
+/// output by the first call.  The cursor (`&mut EmittedCursor`) prevents that:
+/// - `+` / ` ` (context) line: skip when `patch_new_line <= cursor.last_new`.
+/// - `-` line: skip when `patch_old_line <= cursor.last_old`.
+///
+/// Both axes are updated after each emission.
+///
 /// Returns the final `patch_new_line` value so the caller can advance
 /// `current_new_line` past the lines consumed by this hunk.
 fn emit_hunk_patch_lines_clipped(
@@ -486,6 +545,7 @@ fn emit_hunk_patch_lines_clipped(
     node_start: usize,
     node_end: usize,
     ln_width: usize,
+    cursor: &mut EmittedCursor,
 ) -> usize {
     let mut patch_new_line = hunk.new_start;
     let mut patch_old_line = hunk.old_start;
@@ -511,8 +571,31 @@ fn emit_hunk_patch_lines_clipped(
             continue;
         }
 
+        // De-duplication: skip lines already emitted by a prior range call.
+        // `+` / context lines are identified by the new-file axis; `-` lines
+        // (which do not advance new_line) by the old-file axis.
+        let already_emitted = match patch_line.as_bytes().first() {
+            Some(b'-') => patch_old_line <= cursor.last_old,
+            _ => patch_new_line <= cursor.last_new,
+        };
+        if already_emitted {
+            patch_new_line += new_delta;
+            patch_old_line += old_delta;
+            continue;
+        }
+
         let (nd, od) =
             emit_patch_line(output, patch_line, patch_new_line, patch_old_line, ln_width);
+
+        // Update the emitted cursor after each emit so subsequent calls in the
+        // same file skip the lines we just wrote.
+        if nd > 0 {
+            cursor.last_new = cursor.last_new.max(patch_new_line);
+        }
+        if od > 0 {
+            cursor.last_old = cursor.last_old.max(patch_old_line);
+        }
+
         patch_new_line += nd;
         patch_old_line += od;
     }
@@ -528,6 +611,10 @@ fn emit_hunk_patch_lines_clipped(
 /// - ` ` (context) lines use the new-file line number; both counters advance.
 /// - `\` (no-newline marker) has no line number.
 /// - Unchanged source lines between hunks use the new-file line number.
+///
+/// `cursor` is a per-file monotonic cursor that prevents duplicate changed-line
+/// output when two adjacent ranges share a hunk.  Created once per file by the
+/// caller and threaded here; updated via `emit_hunk_patch_lines_clipped`.
 fn render_node_with_hunks(
     output: &mut String,
     node_start: usize,
@@ -535,6 +622,7 @@ fn render_node_with_hunks(
     hunks: &[DiffHunk<'_>],
     source_lines: &[&str],
     ln_width: usize,
+    cursor: &mut EmittedCursor,
 ) {
     // Hunks are sorted by new_start (they come from git's sequential output).
     // Use partition_point to skip hunks that end before node_start, then
@@ -572,7 +660,7 @@ fn render_node_with_hunks(
         // correctly advances past pre-node lines when the hunk begins before
         // node_start.
         current_new_line =
-            emit_hunk_patch_lines_clipped(output, hunk, node_start, node_end, ln_width);
+            emit_hunk_patch_lines_clipped(output, hunk, node_start, node_end, ln_width, cursor);
     }
 
     // Output remaining unchanged source lines to end of node
@@ -1323,6 +1411,335 @@ mod tests {
         assert!(
             x_bool_pos > c_bool_pos,
             "x: boolean must appear after c: boolean (class Bar comes after interface Foo):\n{output}"
+        );
+    }
+
+    // ========================================================================
+    // Changed-line de-duplication tests (#6.1)
+    //
+    // Root cause: when two adjacent ChangedNodeRange items share one hunk
+    // (the hunk spans both nodes), render_node_with_hunks was called once per
+    // range and each call re-emitted the shared changed lines — producing each
+    // `+`/`-` line twice.
+    //
+    // Fix: per-file EmittedCursor threaded through render_node_with_hunks and
+    // emit_hunk_patch_lines_clipped.  Changed lines are emitted exactly once.
+    // ========================================================================
+
+    /// Two adjacent changed ranges share one hunk (doc-comment edit + signature edit).
+    /// Each `+`/`-` line must appear exactly once; context lines intact.
+    ///
+    /// This is the canonical reproduction shape from Phase 0:
+    ///   hunk covers lines 3-6; range A is [3,4], range B is [5,6].
+    #[test]
+    fn test_dedup_adjacent_ranges_sharing_one_hunk() {
+        // Source (new file after patch):
+        //   line 1: unchanged preamble
+        //   line 2: unchanged preamble
+        //   line 3: /** doc comment */ (changed — part of range A)
+        //   line 4: /** end doc */      (changed — part of range A)
+        //   line 5: fn compute(       (changed — part of range B)
+        //   line 6: ) -> u64 {        (changed — part of range B)
+        //   line 7: }
+        let source_lines: Vec<&str> = vec![
+            "// unchanged preamble",
+            "// unchanged preamble 2",
+            "/// doc comment",
+            "/// end doc",
+            "fn compute(",
+            ") -> u64 {",
+            "}",
+        ];
+
+        // One hunk that spans both ranges (lines 3-6 in the new file).
+        // The old file had two lines replaced (3→1 doc, 5→5 fn).
+        let hunks = vec![DiffHunk {
+            old_start: 3,
+            old_count: 4,
+            new_start: 3,
+            new_count: 4,
+            patch_lines: vec![
+                "-/// old doc comment",
+                "-/// old end doc",
+                "+/// doc comment",
+                "+/// end doc",
+                "-fn compute_old(",
+                "-) -> u32 {",
+                "+fn compute(",
+                "+) -> u64 {",
+            ],
+        }];
+
+        // Two adjacent ranges sharing the hunk.
+        let changed_ranges = vec![
+            super::super::types::ChangedNodeRange {
+                start: 3,
+                end: 4,
+                parent_context: None,
+            },
+            super::super::types::ChangedNodeRange {
+                start: 5,
+                end: 6,
+                parent_context: None,
+            },
+        ];
+
+        let mut output = String::new();
+        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+
+        // Each ADDED (+) changed line must appear exactly once.
+        // Count lines starting with `+` that contain the target content.
+        // (Removed `-` lines may also contain "doc comment" etc. — filter by prefix.)
+        let added_doc_count = output
+            .lines()
+            .filter(|l| l.starts_with('+') && l.contains("doc comment"))
+            .count();
+        assert_eq!(
+            added_doc_count, 1,
+            "added 'doc comment' line must appear exactly once; got {added_doc_count}:\n{output}"
+        );
+
+        let added_doc_end_count = output
+            .lines()
+            .filter(|l| l.starts_with('+') && l.contains("end doc"))
+            .count();
+        assert_eq!(
+            added_doc_end_count, 1,
+            "added 'end doc' line must appear exactly once; got {added_doc_end_count}:\n{output}"
+        );
+
+        let added_fn_count = output
+            .lines()
+            .filter(|l| l.starts_with('+') && l.contains("fn compute("))
+            .count();
+        assert_eq!(
+            added_fn_count, 1,
+            "added 'fn compute(' must appear exactly once; got {added_fn_count}:\n{output}"
+        );
+
+        let added_ret_count = output
+            .lines()
+            .filter(|l| l.starts_with('+') && l.contains(") -> u64 {"))
+            .count();
+        assert_eq!(
+            added_ret_count, 1,
+            "added ') -> u64 {{' must appear exactly once; got {added_ret_count}:\n{output}"
+        );
+    }
+
+    /// Nested-container variant: two children inside the same parent container
+    /// share one hunk.  Each changed line must be emitted exactly once.
+    #[test]
+    fn test_dedup_two_children_in_same_container_share_hunk() {
+        // class Foo {           ← line 1 (parent header)
+        //   fn a(&self) {}     ← line 2 (changed — child A)
+        //   fn b(&self) {}     ← line 3 (changed — child B)
+        // }                    ← line 4 (parent close)
+        let source_lines: Vec<&str> =
+            vec!["class Foo {", "  fn a(&self) {}", "  fn b(&self) {}", "}"];
+
+        // Single hunk covering lines 2 and 3 (both children).
+        let hunks = vec![DiffHunk {
+            old_start: 2,
+            old_count: 2,
+            new_start: 2,
+            new_count: 2,
+            patch_lines: vec![
+                "-  fn a(&self) -> i32 {}",
+                "+  fn a(&self) {}",
+                "-  fn b(&self) -> i32 {}",
+                "+  fn b(&self) {}",
+            ],
+        }];
+
+        // Two child ranges inside the same parent container (lines 1-4).
+        let changed_ranges = vec![
+            super::super::types::ChangedNodeRange {
+                start: 2,
+                end: 2,
+                parent_context: Some(super::super::types::ParentContext {
+                    header_line: 1,
+                    close_line: 4,
+                }),
+            },
+            super::super::types::ChangedNodeRange {
+                start: 3,
+                end: 3,
+                parent_context: Some(super::super::types::ParentContext {
+                    header_line: 1,
+                    close_line: 4,
+                }),
+            },
+        ];
+
+        let mut output = String::new();
+        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+
+        // Container header appears once.
+        let header_count = output.lines().filter(|l| l.contains("class Foo {")).count();
+        assert_eq!(
+            header_count, 1,
+            "class Foo header must appear once; got {header_count}:\n{output}"
+        );
+
+        // Each ADDED (+) changed child line appears exactly once.
+        // Count only added lines to distinguish from removed variants.
+        let fn_a_count = output
+            .lines()
+            .filter(|l| l.starts_with('+') && l.contains("fn a("))
+            .count();
+        assert_eq!(
+            fn_a_count, 1,
+            "added 'fn a' must appear exactly once; got {fn_a_count}:\n{output}"
+        );
+
+        let fn_b_count = output
+            .lines()
+            .filter(|l| l.starts_with('+') && l.contains("fn b("))
+            .count();
+        assert_eq!(
+            fn_b_count, 1,
+            "added 'fn b' must appear exactly once; got {fn_b_count}:\n{output}"
+        );
+    }
+
+    /// Pure-deletion hunk (all `-`, no `+` lines): removed lines deduplicate correctly.
+    ///
+    /// `-` lines are tracked on the old-line axis (`cursor.last_old`).
+    /// A second range call covering the same old lines must NOT re-emit them.
+    #[test]
+    fn test_dedup_pure_deletion_hunk() {
+        // Source (new file — the deleted lines are gone):
+        //   line 1: fn keep()
+        //   line 2: fn also_keep()
+        let source_lines: Vec<&str> = vec!["fn keep()", "fn also_keep()"];
+
+        // Pure-deletion hunk: removes two old lines at old positions 1-2,
+        // new_count == 0 so new_start stays at 1 (or 0, per git convention).
+        // We use new_start = 1 to ensure the skip-before-node-start logic
+        // does not interfere with the dedup check.
+        let hunks = vec![DiffHunk {
+            old_start: 1,
+            old_count: 2,
+            new_start: 1,
+            new_count: 0,
+            patch_lines: vec!["-fn deleted_a()", "-fn deleted_b()"],
+        }];
+
+        // Two adjacent ranges that both "include" the deleted lines
+        // (deletion hunk straddles their boundary).
+        let changed_ranges = vec![
+            super::super::types::ChangedNodeRange {
+                start: 1,
+                end: 1,
+                parent_context: None,
+            },
+            super::super::types::ChangedNodeRange {
+                start: 2,
+                end: 2,
+                parent_context: None,
+            },
+        ];
+
+        let mut output = String::new();
+        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+
+        // Each deleted line must appear at most once.
+        let del_a_count = output.lines().filter(|l| l.contains("deleted_a")).count();
+        assert!(
+            del_a_count <= 1,
+            "fn deleted_a must appear at most once; got {del_a_count}:\n{output}"
+        );
+
+        let del_b_count = output.lines().filter(|l| l.contains("deleted_b")).count();
+        assert!(
+            del_b_count <= 1,
+            "fn deleted_b must appear at most once; got {del_b_count}:\n{output}"
+        );
+    }
+
+    /// Non-overlapping multi-node diff: each node has its OWN hunk.
+    /// The dedup cursor must NOT suppress legitimate changed lines from independent nodes.
+    ///
+    /// Note: render_changed_only (default mode) does NOT emit unchanged context lines
+    /// between independent changed ranges — only lines within each range's
+    /// [effective_start, effective_end] bounds are rendered.  So `fn beta()` (between
+    /// range 1 and range 3) does NOT appear in the output; this is correct behaviour.
+    /// The test validates that changed lines from BOTH ranges appear, proving the cursor
+    /// does not incorrectly suppress lines from the second independent range.
+    #[test]
+    fn test_dedup_non_overlapping_ranges_each_emitted_once() {
+        // Two independent ranges with their own hunks (no shared lines).
+        let source_lines: Vec<&str> = vec![
+            "fn alpha()",
+            "fn beta()", // unchanged — NOT rendered in default mode
+            "fn gamma()",
+            "fn delta()",
+        ];
+
+        let hunks = vec![
+            DiffHunk {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                patch_lines: vec!["-fn alpha_old()", "+fn alpha()"],
+            },
+            DiffHunk {
+                old_start: 3,
+                old_count: 1,
+                new_start: 3,
+                new_count: 1,
+                patch_lines: vec!["-fn gamma_old()", "+fn gamma()"],
+            },
+        ];
+
+        let changed_ranges = vec![
+            super::super::types::ChangedNodeRange {
+                start: 1,
+                end: 1,
+                parent_context: None,
+            },
+            super::super::types::ChangedNodeRange {
+                start: 3,
+                end: 3,
+                parent_context: None,
+            },
+        ];
+
+        let mut output = String::new();
+        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+
+        // Both changed lines must appear exactly once (not suppressed by cursor).
+        let alpha_count = output.lines().filter(|l| l.contains("fn alpha()")).count();
+        assert_eq!(
+            alpha_count, 1,
+            "fn alpha must appear exactly once; got {alpha_count}:\n{output}"
+        );
+
+        let gamma_count = output.lines().filter(|l| l.contains("fn gamma()")).count();
+        assert_eq!(
+            gamma_count, 1,
+            "fn gamma must appear exactly once; got {gamma_count}:\n{output}"
+        );
+
+        // Verify that old (removed) lines from each hunk are NOT duplicated.
+        let alpha_old_count = output
+            .lines()
+            .filter(|l| l.contains("fn alpha_old"))
+            .count();
+        assert!(
+            alpha_old_count <= 1,
+            "fn alpha_old must appear at most once; got {alpha_old_count}:\n{output}"
+        );
+
+        let gamma_old_count = output
+            .lines()
+            .filter(|l| l.contains("fn gamma_old"))
+            .count();
+        assert!(
+            gamma_old_count <= 1,
+            "fn gamma_old must appear at most once; got {gamma_old_count}:\n{output}"
         );
     }
 }

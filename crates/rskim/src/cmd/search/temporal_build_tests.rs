@@ -232,15 +232,23 @@ fn test_join_hotspot_row_field_mapping() {
     assert_eq!(row.changes_90d, 5, "changes_90d from FileTemporalStats");
 }
 
-/// AC11: Joint presence — verify risk row field mapping.
+/// AC11 / AC12 (#378): Joint presence — verify risk row field mapping.
+///
+/// `risk_score` MUST equal the COMPUTED volume-weighted helper output
+/// `risk_score_wilson_decay(decay_fix_factor, fix_commits, total_commits)`, NOT
+/// the old bare decay-weighted ratio (0.375). This test MUST FAIL against the
+/// pre-#378 `risk_score == 0.375` behavior. `fix_density` stays the raw ratio
+/// 3/8 (AD-378-3 two-field separation: risk_score != fix_density).
 #[test]
 fn test_join_risk_row_field_mapping() {
+    // decay_fix_factor (decay-weighted fix proportion) = 3/8.
+    let decay_fix_factor = 0.375;
     let mut risk_scores: HashMap<String, FileRiskScores> = HashMap::new();
     risk_scores.insert(
         "p.rs".to_string(),
         FileRiskScores {
             hotspot: 0.7,
-            fix_density: 0.375, // 3/8
+            fix_density: decay_fix_factor, // 3/8
         },
     );
 
@@ -260,15 +268,29 @@ fn test_join_risk_row_field_mapping() {
     let row = risk_rows.into_iter().next().unwrap();
 
     assert_eq!(row.file_path, "p.rs");
+    // risk_score == COMPUTED helper output (decay × Wilson-LB over raw 3/8), NOT 0.375.
+    let expected_risk = rskim_search::risk_score_wilson_decay(decay_fix_factor, 3, 8);
     assert!(
-        (row.risk_score - 0.375).abs() < 1e-9,
-        "risk_score must equal fix_density (0.375)"
+        (row.risk_score - expected_risk).abs() < 1e-9,
+        "risk_score must equal risk_score_wilson_decay(0.375, 3, 8) = {expected_risk:.6}, \
+         got {:.6}",
+        row.risk_score
+    );
+    // Falsifiability (AC12): the new score MUST differ from the old bare-ratio 0.375.
+    assert!(
+        (row.risk_score - 0.375).abs() > 1e-9,
+        "risk_score must NOT be the old bare decay-weighted ratio 0.375 (#378 volume weighting)"
     );
     assert_eq!(row.total_commits, 8, "total_commits from FileTemporalStats");
     assert_eq!(row.fix_commits, 3, "fix_commits from FileTemporalStats");
+    // AD-378-3: fix_density stays the raw ratio and is distinct from risk_score.
     assert!(
         (row.fix_density - 0.375).abs() < 1e-9,
-        "fix_density from FileRiskScores"
+        "fix_density must remain the raw ratio 3/8 (shown in Fix%)"
+    );
+    assert!(
+        (row.fix_density - row.risk_score).abs() > 1e-9,
+        "AD-378-3: risk_score and fix_density MUST be unequal (two-field separation)"
     );
 }
 
@@ -796,11 +818,17 @@ fn test_risk_row_fix_density_is_raw_ratio() {
         expected_raw,
         row.fix_density
     );
-    // risk_score must still be the decay-weighted fix_density for ranking.
+    // risk_score must be the #378 volume-weighted value: decay_fix_factor (0.9) ×
+    // Wilson-LB over the RAW counts (2/8) — NOT the bare decay-weighted 0.9.
+    let expected_risk = rskim_search::risk_score_wilson_decay(0.9, 2, 8);
     assert!(
-        (row.risk_score - 0.9).abs() < 1e-9,
-        "risk_score must be decay-weighted fix_density (0.9 from FileRiskScores), got {:.4}",
+        (row.risk_score - expected_risk).abs() < 1e-9,
+        "risk_score must be risk_score_wilson_decay(0.9, 2, 8) = {expected_risk:.6}, got {:.6}",
         row.risk_score
+    );
+    assert!(
+        (row.risk_score - 0.9).abs() > 1e-9,
+        "risk_score must NOT be the old bare decay-weighted 0.9 (#378 volume weighting)"
     );
 }
 

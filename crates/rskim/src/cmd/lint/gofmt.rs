@@ -33,6 +33,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::Lint,
     expected_exit_codes: &[],
     forward_stderr: false,
+    skip_net_savings_guard: false,
 };
 
 /// AD-LINT-21 (2026-04-15) — `.+` captures paths with spaces. Strips `.orig` suffix.

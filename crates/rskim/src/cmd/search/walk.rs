@@ -1,10 +1,17 @@
 //! Project-root discovery and recursive file walking for the index builder.
 //!
-//! # File cap
+//! # File cap (deterministic top-K selection — #379)
 //!
-//! `walk_metadata` (production) and `walk_and_read` (tests) stop after
-//! `max_files` files have been accepted. Skipped files (unsupported language,
-//! too large, non-UTF8) do not count toward the cap.
+//! `walk_metadata` (production) and `walk_and_read` (tests) always visit the
+//! COMPLETE tree, then retain only the `max_files` entries with the smallest
+//! `normalize_rel_path` keys (ascending `str` order) — see
+//! [`collect_bounded_topk`]. This is an order-invariant SET function ("the K
+//! smallest keys over the complete walked set"), so results are
+//! byte-identical across runs regardless of parallel-walk thread scheduling.
+//! A prior implementation terminated the walk early (`WalkState::Quit`) once
+//! a shared atomic counter reached `max_files`, which made retained-set
+//! MEMBERSHIP (not just order) depend on thread scheduling. Skipped files
+//! (unsupported language, too large, non-UTF8) do not count toward the cap.
 //!
 //! # Skip conditions (in order checked)
 //!
@@ -14,14 +21,40 @@
 //! | File too large | > 5 MB (`metadata.len()`) |
 //! | Non-UTF8 | `read_to_string()` returns `Err` |
 //! | Minified | avg line > 500 bytes in first 8 KB (tree-sitter langs only) |
-//! | Cap reached | `max_files` exceeded |
+//! | Cap reached | total accepted entries exceed `max_files` (reporting only — computed AFTER the complete walk; never terminates it) |
 
+use std::collections::BinaryHeap;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+// ============================================================================
+// Path normalization (shared between walk and consume)
+// ============================================================================
+
+/// Normalize a repo-relative `Path` to the canonical manifest key string.
+///
+/// Produces the same byte string that the manifest `BTreeMap<String>` stores as
+/// its key: `to_string_lossy()` followed by `\\` → `/` replacement.
+///
+/// # Why this function exists (AD-373-2)
+///
+/// AD-373-2: the byte string used to ORDER FileIds (walk) and the byte strings
+/// STORED as the manifest key (index.rs `consume`, `path_key` for `new_manifest.insert`)
+/// and LOOKED UP for the lexical cache (index.rs `read_and_classify`, `path_key` for
+/// `manifest.lookup`) must all be produced by this one function. Any divergence
+/// reintroduces the #373 ordering skew (notably the `\\` → `/` normalization
+/// on Windows).
+///
+/// Note: `temporal::normalize_blast_radius_path` is intentionally NOT consolidated
+/// here — it carries an extra `strip_prefix("./")` step that serves a different
+/// contract. Leave it in place (see the `#373 scope` NOTE in `temporal.rs`).
+pub(super) fn normalize_rel_path(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
 
 use anyhow::Context as _;
 use ignore::{WalkBuilder, WalkState};
@@ -121,35 +154,21 @@ pub(super) fn discover_project_root(start: &Path) -> anyhow::Result<PathBuf> {
 // File walking (batch) — retained for tests; streaming pipeline uses walk_metadata
 // ============================================================================
 
-/// Outcome of classifying a single [`ignore::DirEntry`].
-///
-/// `Transparent` covers non-file entries (directories, symlinks) that should be
-/// silently skipped without recording a reason.
-#[cfg(test)]
-enum EntryOutcome {
-    /// Entry is a readable source file ready to be added to the index.
-    Accept(ReadFile),
-    /// Entry should be skipped with a recorded reason.
-    Skip(SkipReason),
-    /// Entry is not a regular file; skip silently.
-    Transparent,
-}
-
-/// Classify a single directory entry into an [`EntryOutcome`].
+/// Classify a single directory entry into a [`ClassifyOutcome`] of [`ReadFile`].
 ///
 /// Handles language detection, size pre-screening (via cached `DirEntry`
-/// metadata), file reading, and minification detection.  The caller is
-/// responsible for the file-count cap and for guarding the `skipped` vector
-/// length against [`MAX_SKIP_REASONS`].
+/// metadata), file reading, and minification detection.  The caller
+/// ([`collect_bounded_topk`]) is responsible for the bounded top-K cap and
+/// for guarding the `skipped` vector length against [`MAX_SKIP_REASONS`].
 #[cfg(test)]
-fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
+fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> ClassifyOutcome<ReadFile> {
     // Only process regular files.
     let file_type = match entry.file_type() {
         Some(ft) => ft,
-        None => return EntryOutcome::Transparent,
+        None => return ClassifyOutcome::Transparent,
     };
     if !file_type.is_file() {
-        return EntryOutcome::Transparent;
+        return ClassifyOutcome::Transparent;
     }
 
     let abs_path = entry.path();
@@ -157,7 +176,9 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
     // --- Unsupported language ---
     let lang = match Language::from_path(abs_path) {
         Some(l) => l,
-        None => return EntryOutcome::Skip(SkipReason::UnsupportedLanguage(abs_path.to_path_buf())),
+        None => {
+            return ClassifyOutcome::Skip(SkipReason::UnsupportedLanguage(abs_path.to_path_buf()));
+        }
     };
 
     // --- Fast size pre-screen using DirEntry cached metadata ---
@@ -166,7 +187,7 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
     if let Ok(meta) = entry.metadata() {
         let size = meta.len();
         if size > MAX_FILE_BYTES {
-            return EntryOutcome::Skip(SkipReason::TooLarge {
+            return ClassifyOutcome::Skip(SkipReason::TooLarge {
                 path: abs_path.to_path_buf(),
                 size,
             });
@@ -180,17 +201,17 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
     let content = match open_and_read(abs_path) {
         ReadOutcome::Content(c) => c,
         ReadOutcome::NonUtf8 => {
-            return EntryOutcome::Skip(SkipReason::NonUtf8(abs_path.to_path_buf()));
+            return ClassifyOutcome::Skip(SkipReason::NonUtf8(abs_path.to_path_buf()));
         }
         ReadOutcome::TooLarge(size) => {
             // File grew past the limit between the pre-screen and open.
-            return EntryOutcome::Skip(SkipReason::TooLarge {
+            return ClassifyOutcome::Skip(SkipReason::TooLarge {
                 path: abs_path.to_path_buf(),
                 size,
             });
         }
         ReadOutcome::Io(e) => {
-            return EntryOutcome::Skip(SkipReason::ReadError {
+            return ClassifyOutcome::Skip(SkipReason::ReadError {
                 path: abs_path.to_path_buf(),
                 error: e.to_string(),
             });
@@ -201,7 +222,7 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
     // Serde-based languages (JSON, YAML, TOML) produce long lines by design;
     // skip the minification check for them.
     if !lang.is_serde_based() && is_minified(&content) {
-        return EntryOutcome::Skip(SkipReason::Minified(abs_path.to_path_buf()));
+        return ClassifyOutcome::Skip(SkipReason::Minified(abs_path.to_path_buf()));
     }
 
     let mtime = mtime_secs(entry);
@@ -210,7 +231,7 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
         .unwrap_or(abs_path)
         .to_path_buf();
 
-    EntryOutcome::Accept(ReadFile {
+    ClassifyOutcome::Accept(ReadFile {
         rel_path,
         lang,
         content,
@@ -224,10 +245,16 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
 /// Retained for use in tests. The production streaming pipeline uses
 /// [`walk_metadata`] + per-file reading in the producer thread.
 ///
-/// # Ordering
+/// # Ordering and at-cap determinism (#379)
 ///
-/// Files are returned in lexicographic path order (sorted after parallel
-/// collection for deterministic output).
+/// Delegates to [`collect_bounded_topk`], shared with [`walk_metadata`]: the
+/// COMPLETE tree is visited, then the `max_files` entries with the smallest
+/// [`normalize_rel_path`] keys are retained, sorted ascending. This is an
+/// order-invariant SET function, so results are byte-identical across runs
+/// regardless of parallel-walk thread scheduling — including at the cap,
+/// where a prior sort-AFTER-early-terminate approach could not guarantee
+/// determinism because early termination made retained-set membership
+/// itself race-dependent before the sort ever ran (AD-379-7 successor).
 ///
 /// # Errors
 ///
@@ -238,84 +265,27 @@ pub(super) fn walk_and_read(
     root: &Path,
     max_files: usize,
 ) -> anyhow::Result<(Vec<ReadFile>, Vec<SkipReason>)> {
-    let files = Arc::new(Mutex::new(Vec::with_capacity(max_files.min(4096))));
-    let skipped = Arc::new(Mutex::new(Vec::<SkipReason>::with_capacity(256)));
-    let file_count = Arc::new(AtomicUsize::new(0));
-    let cap_reached = Arc::new(AtomicBool::new(false));
-    let root_buf = root.to_path_buf();
-
     let mut builder = WalkBuilder::new(root);
     configure_builder(&mut builder);
 
-    builder.build_parallel().run(|| {
-        let files = Arc::clone(&files);
-        let skipped = Arc::clone(&skipped);
-        let file_count = Arc::clone(&file_count);
-        let cap_reached = Arc::clone(&cap_reached);
-        let root = root_buf.clone();
-        Box::new(move |entry_result| {
-            handle_entry(
-                entry_result,
-                &files,
-                &skipped,
-                &file_count,
-                &cap_reached,
-                max_files,
-                &root,
-            )
-        })
-    });
-
-    let mut files = Arc::try_unwrap(files)
-        .map_err(|_| {
-            anyhow::anyhow!("files Arc still has multiple owners after walker completion")
-        })?
-        .into_inner()
-        .unwrap_or_else(|e| e.into_inner());
-    let skipped = Arc::try_unwrap(skipped)
-        .map_err(|_| {
-            anyhow::anyhow!("skipped Arc still has multiple owners after walker completion")
-        })?
-        .into_inner()
-        .unwrap_or_else(|e| e.into_inner());
-
-    // Parallel threads may over-collect beyond max_files due to TOCTOU on the
-    // atomic counter (multiple threads may pass the cap check before any of them
-    // increments it).
-    files.truncate(max_files);
-
-    // Sort after parallel collection for deterministic output.
-    files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-
-    Ok((files, skipped))
+    collect_bounded_topk(builder, max_files, root, classify_entry, read_file_key)
 }
 
 // ============================================================================
 // Metadata-only walk (streaming pipeline)
 // ============================================================================
 
-/// Outcome of classifying a single [`ignore::DirEntry`] without reading content.
-///
-/// Used by [`walk_metadata`] / [`classify_entry_metadata`] which perform language
-/// detection and fast size pre-screening only.  Content reading is deferred to
-/// the streaming producer.
-enum MetaOutcome {
-    Accept(WalkEntry),
-    Skip(SkipReason),
-    Transparent,
-}
-
 /// Classify a single directory entry without reading its content.
 ///
 /// Checks: file type, language detection, fast size pre-screen (DirEntry
 /// metadata).  No I/O beyond the metadata already cached by the walker.
-fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> MetaOutcome {
+fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> ClassifyOutcome<WalkEntry> {
     let file_type = match entry.file_type() {
         Some(ft) => ft,
-        None => return MetaOutcome::Transparent,
+        None => return ClassifyOutcome::Transparent,
     };
     if !file_type.is_file() {
-        return MetaOutcome::Transparent;
+        return ClassifyOutcome::Transparent;
     }
 
     let abs_path = entry.path();
@@ -324,21 +294,25 @@ fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> MetaOutcome
     let lang = match Language::from_path(abs_path) {
         Some(l) => l,
         None => {
-            return MetaOutcome::Skip(SkipReason::UnsupportedLanguage(abs_path.to_path_buf()));
+            return ClassifyOutcome::Skip(SkipReason::UnsupportedLanguage(abs_path.to_path_buf()));
         }
     };
 
-    // Capture metadata once; use it for both the size pre-screen and mtime
-    // extraction so the walker never calls entry.metadata() twice per file.
+    // Capture metadata once; use it for the size pre-screen, the recorded
+    // size (AD-379-2), and mtime extraction so the walker never calls
+    // entry.metadata() twice per file.
     let meta_opt = entry.metadata().ok();
-    if let Some(ref meta) = meta_opt {
-        let size = meta.len();
-        if size > MAX_FILE_BYTES {
-            return MetaOutcome::Skip(SkipReason::TooLarge {
-                path: abs_path.to_path_buf(),
-                size,
-            });
-        }
+    // Recorded size in bytes (AD-379-2): persisted in the manifest so the
+    // working-tree staleness scan can compare size as a second freshness hint
+    // alongside mtime. `None` when the platform/syscall does not expose it.
+    let size = meta_opt.as_ref().map(std::fs::Metadata::len);
+    if let Some(len) = size
+        && len > MAX_FILE_BYTES
+    {
+        return ClassifyOutcome::Skip(SkipReason::TooLarge {
+            path: abs_path.to_path_buf(),
+            size: len,
+        });
     }
 
     let mtime = meta_opt.and_then(|m| {
@@ -352,24 +326,43 @@ fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> MetaOutcome
         .unwrap_or(abs_path)
         .to_path_buf();
 
-    MetaOutcome::Accept(WalkEntry {
+    ClassifyOutcome::Accept(WalkEntry {
         abs_path: abs_path.to_path_buf(),
         rel_path,
         lang,
         mtime,
+        size,
     })
 }
 
 /// Walk `root` recursively, collecting file metadata without reading content.
 ///
-/// Returns a sorted (lexicographic by `rel_path`) list of [`WalkEntry`]s and
-/// collected [`SkipReason`]s.  Content reading is deferred to the streaming
-/// producer in the index pipeline.
+/// Returns a sorted list of [`WalkEntry`]s and collected [`SkipReason`]s.
+/// Content reading is deferred to the streaming producer in the index pipeline.
 ///
-/// # Ordering
+/// # Ordering and at-cap determinism (#379)
 ///
-/// Entries are sorted by `rel_path` after parallel collection, giving
-/// deterministic FileId assignment in the consumer.
+/// Delegates to [`collect_bounded_topk`] (shared with the test-only
+/// [`walk_and_read`]): the COMPLETE tree is visited, then the `max_files`
+/// entries with the smallest [`normalize_rel_path`] keys are retained, sorted
+/// ascending (byte-wise `str` comparison). This gives deterministic FileId
+/// assignment in the consumer — the sort key is byte-identical to the
+/// manifest `BTreeMap<String>` key, so `FileId(n)` in the walk corresponds to
+/// `sorted_paths()[n]` in the manifest, the invariant all five FileId
+/// consumers depend on (applies ADR-006 / AD-379-4).
+///
+/// Selection is also an order-invariant SET function of the complete walked
+/// set: retained membership at the cap depends only on each entry's key,
+/// never on parallel-walk thread scheduling. The prior implementation sorted
+/// AFTER an early `WalkState::Quit` terminated the walk at the cap, which
+/// could not guarantee this because early termination made membership itself
+/// race-dependent before the sort ever ran (the #379 bug this fixes).
+///
+/// AD-373-1: FileId assignment MUST use the same byte-wise order as the manifest
+/// `BTreeMap<String>` resolution side (`sorted_paths`). `PathBuf::cmp` is
+/// component-aware and diverges from `str::cmp` on nested dirs (`foo/bar.rs`
+/// vs `foo.rs`), which mis-resolved `FileId`→path (#373). Sort by the
+/// normalized String key under `str` ordering.
 ///
 /// # Errors
 ///
@@ -379,114 +372,254 @@ pub(super) fn walk_metadata(
     root: &Path,
     max_files: usize,
 ) -> anyhow::Result<(Vec<WalkEntry>, Vec<SkipReason>)> {
-    let entries = Arc::new(Mutex::new(Vec::with_capacity(max_files.min(4096))));
-    let skipped = Arc::new(Mutex::new(Vec::<SkipReason>::with_capacity(256)));
-    let entry_count = Arc::new(AtomicUsize::new(0));
-    let cap_reached = Arc::new(AtomicBool::new(false));
-    let root_buf = root.to_path_buf();
-
     let mut builder = WalkBuilder::new(root);
     configure_builder(&mut builder);
 
+    collect_bounded_topk(
+        builder,
+        max_files,
+        root,
+        classify_entry_metadata,
+        walk_entry_key,
+    )
+}
+
+// ============================================================================
+// Bounded top-K collection (shared — #379 at-cap determinism fix)
+// ============================================================================
+
+/// Outcome of classifying a single [`ignore::DirEntry`], generic over the
+/// accepted-entry type `T`.
+///
+/// `T` is [`WalkEntry`] for the metadata-only production walk
+/// ([`classify_entry_metadata`]) or [`ReadFile`] for the test-only
+/// content-reading walk ([`classify_entry`]). `Transparent` covers non-file
+/// entries (directories, symlinks) that should be silently skipped without
+/// recording a reason.
+enum ClassifyOutcome<T> {
+    /// Entry is a readable source file ready to be added to the index.
+    Accept(T),
+    /// Entry should be skipped with a recorded reason.
+    Skip(SkipReason),
+    /// Entry is not a regular file; skip silently.
+    Transparent,
+}
+
+/// An accepted entry paired with its precomputed [`normalize_rel_path`] sort key.
+///
+/// `Ord`/`PartialOrd` compare ONLY `key`, in natural ascending `str` order
+/// (the field is stored rather than recomputed on every heap comparison).
+/// [`BinaryHeap`] is a MAX-heap, so `heap.pop()` removes the entry with the
+/// LARGEST key — exactly the one to evict to retain the smallest `max_files`
+/// keys.
+///
+/// This is the core of the #379 at-cap determinism fix: selection is "the
+/// `max_files` smallest keys over the complete walked set" (an
+/// order-invariant SET function), never "the first `max_files` visited"
+/// (which depended on parallel-walk thread scheduling).
+struct KeyedEntry<T> {
+    key: String,
+    entry: T,
+}
+
+impl<T> KeyedEntry<T> {
+    fn new(key: String, entry: T) -> Self {
+        Self { key, entry }
+    }
+}
+
+impl<T> PartialEq for KeyedEntry<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl<T> Eq for KeyedEntry<T> {}
+
+impl<T> PartialOrd for KeyedEntry<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Ord for KeyedEntry<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+/// Shared mutable state for one [`collect_bounded_topk`] parallel walk.
+///
+/// Grouped into a struct (rather than four separate parameters) so
+/// [`handle_bounded_entry`] stays under Clippy's `too_many_arguments`
+/// threshold; the fields are always used together as one logical unit — the
+/// in-progress bounded top-K collector state.
+struct BoundedCollector<'a, T> {
+    heap: &'a Mutex<BinaryHeap<KeyedEntry<T>>>,
+    skipped: &'a Mutex<Vec<SkipReason>>,
+    /// Count of every accepted entry seen so far, INCLUDING ones later
+    /// evicted from the heap. Used only for the post-walk reporting-only
+    /// [`SkipReason::CapReached`] signal — never consulted to decide
+    /// [`WalkState::Continue`] vs `Quit` (the walk always continues).
+    total_seen: &'a AtomicUsize,
+    max_files: usize,
+}
+
+/// Walk `root` in parallel via `builder`, classify each entry with
+/// `classify`, and retain only the `max_files` entries with the smallest
+/// `key_of` keys.
+///
+/// Shared by [`walk_metadata`] (production) and [`walk_and_read`] (test-only):
+/// both were previously hand-copied instances of the same cap-during-walk
+/// race, where a shared atomic counter triggered `WalkState::Quit` once
+/// `max_files` was reached, terminating the ENTIRE parallel walk. That made
+/// outcome MEMBERSHIP — not just order — depend on thread scheduling: the
+/// prior sort-before-truncate fix (#379/AD-379-7) sorted a set whose
+/// membership was already race-dependent, which cannot restore determinism.
+/// Consolidating both walkers onto this one function means the
+/// deterministic-selection guarantee now lives in exactly one place.
+///
+/// # Determinism
+///
+/// The walk always visits the COMPLETE tree — [`handle_bounded_entry`]
+/// unconditionally returns [`WalkState::Continue`] regardless of the cap —
+/// so retained membership is a pure function of each entry's `key_of` value,
+/// never of visitation order or thread scheduling.
+///
+/// # Memory bound
+///
+/// Resident memory stays O(max_files) by construction: the heap evicts its
+/// largest key whenever it grows past `max_files` (never an unbounded
+/// collect-then-truncate).
+///
+/// # Errors
+///
+/// Returns `Err` only if the shared state `Arc`s still have outstanding
+/// clones after the parallel walk completes — a walker-internal invariant
+/// violation, not a per-file error.
+fn collect_bounded_topk<T, C, K>(
+    builder: WalkBuilder,
+    max_files: usize,
+    root: &Path,
+    classify: C,
+    key_of: K,
+) -> anyhow::Result<(Vec<T>, Vec<SkipReason>)>
+where
+    T: Send,
+    C: Fn(&ignore::DirEntry, &Path) -> ClassifyOutcome<T> + Copy + Send,
+    K: Fn(&T) -> String + Copy + Send,
+{
+    let heap: Arc<Mutex<BinaryHeap<KeyedEntry<T>>>> = Arc::new(Mutex::new(
+        BinaryHeap::with_capacity(max_files.min(4096).saturating_add(1)),
+    ));
+    let skipped = Arc::new(Mutex::new(Vec::<SkipReason>::with_capacity(256)));
+    let total_seen = Arc::new(AtomicUsize::new(0));
+    let root_buf = root.to_path_buf();
+
     builder.build_parallel().run(|| {
-        let entries = Arc::clone(&entries);
+        let heap = Arc::clone(&heap);
         let skipped = Arc::clone(&skipped);
-        let entry_count = Arc::clone(&entry_count);
-        let cap_reached = Arc::clone(&cap_reached);
+        let total_seen = Arc::clone(&total_seen);
         let root = root_buf.clone();
         Box::new(move |entry_result| {
-            handle_metadata_entry(
-                entry_result,
-                &entries,
-                &skipped,
-                &entry_count,
-                &cap_reached,
+            let collector = BoundedCollector {
+                heap: &heap,
+                skipped: &skipped,
+                total_seen: &total_seen,
                 max_files,
-                &root,
-            )
+            };
+            handle_bounded_entry(entry_result, &collector, &root, classify, key_of)
         })
     });
 
-    let mut entries = Arc::try_unwrap(entries)
-        .map_err(|_| {
-            anyhow::anyhow!("entries Arc still has multiple owners after walker completion")
-        })?
+    let heap = Arc::try_unwrap(heap)
+        .map_err(|_| anyhow::anyhow!("heap Arc still has multiple owners after walker completion"))?
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
-    let skipped = Arc::try_unwrap(skipped)
+    let mut skipped = Arc::try_unwrap(skipped)
         .map_err(|_| {
             anyhow::anyhow!("skipped Arc still has multiple owners after walker completion")
         })?
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
 
-    // Parallel threads may over-collect beyond max_files due to TOCTOU on the
-    // atomic counter.
-    entries.truncate(max_files);
+    // Reporting-only cap signal (AD-379-7 successor): derived from a
+    // total-seen counter AFTER the complete walk, so it can NEVER control
+    // termination. `total_seen` counts every accepted entry, including ones
+    // later evicted from the heap; if it exceeds max_files, the cap was in
+    // effect.
+    let seen = total_seen.load(Ordering::Relaxed);
+    if seen > max_files && skipped.len() < MAX_SKIP_REASONS {
+        skipped.push(SkipReason::CapReached);
+    }
 
-    // Sort for deterministic FileId assignment in the consumer.
-    entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    // Drain the heap and sort ascending by key: the K smallest keys over the
+    // complete walked set, deterministic regardless of walk/thread-scheduling
+    // order (fix for #379).
+    let mut sorted: Vec<KeyedEntry<T>> = heap.into_vec();
+    sorted.sort_by(|a, b| a.key.cmp(&b.key));
+    let entries: Vec<T> = sorted.into_iter().map(|k| k.entry).collect();
+    debug_assert!(entries.len() <= max_files);
 
     Ok((entries, skipped))
 }
 
-// ============================================================================
-// Walker entry handlers
-// ============================================================================
-
-/// Process a single walker entry result for the metadata-only walk.
+/// Process a single walker entry result against the shared bounded top-K
+/// state.
 ///
-/// Extracted from the [`walk_metadata`] `build_parallel` closure to reduce
-/// nesting depth and enable independent unit testing.  The parallel walker API
-/// requires a `Box<dyn FnMut(…) -> WalkState>` closure; this function holds
-/// all the logic so the closure is a thin delegation layer.
+/// Generic over the accepted-entry type `T` so [`walk_metadata`]
+/// (`T = WalkEntry`) and [`walk_and_read`] (`T = ReadFile`) share one
+/// implementation of the deterministic at-cap selection (#379 fix).
 ///
-/// Mirrors [`handle_entry`] (the equivalent helper for [`walk_and_read`]).
+/// # Determinism (fix for #379)
+///
+/// Always returns [`WalkState::Continue`] — the walk must visit the COMPLETE
+/// tree. The pre-fix code returned `WalkState::Quit` once a shared atomic
+/// counter reached `max_files`, terminating the whole parallel walk and
+/// making retained-set MEMBERSHIP depend on thread-scheduling order.
 ///
 /// # Mutex poisoning
 ///
 /// All `.lock()` calls use `unwrap_or_else(|e| e.into_inner())` so that a
 /// panic in one parallel thread does not cascade-abort the remaining threads
 /// via a poisoned-lock panic.
-fn handle_metadata_entry(
+fn handle_bounded_entry<T, C, K>(
     entry_result: Result<ignore::DirEntry, ignore::Error>,
-    entries: &Mutex<Vec<WalkEntry>>,
-    skipped: &Mutex<Vec<SkipReason>>,
-    entry_count: &AtomicUsize,
-    cap_reached: &AtomicBool,
-    max_files: usize,
+    collector: &BoundedCollector<'_, T>,
     root: &Path,
-) -> WalkState {
-    if entry_count.load(Ordering::Relaxed) >= max_files {
-        if !cap_reached.swap(true, Ordering::Relaxed) {
-            let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.len() < MAX_SKIP_REASONS {
-                guard.push(SkipReason::CapReached);
-            }
-        }
-        return WalkState::Quit;
-    }
-
+    classify: C,
+    key_of: K,
+) -> WalkState
+where
+    C: Fn(&ignore::DirEntry, &Path) -> ClassifyOutcome<T>,
+    K: Fn(&T) -> String,
+{
     match entry_result {
-        Ok(entry) => match classify_entry_metadata(&entry, root) {
-            MetaOutcome::Accept(we) => {
-                entry_count.fetch_add(1, Ordering::Relaxed);
-                entries.lock().unwrap_or_else(|e| e.into_inner()).push(we);
+        Ok(entry) => match classify(&entry, root) {
+            ClassifyOutcome::Accept(item) => {
+                collector.total_seen.fetch_add(1, Ordering::Relaxed);
+                let key = key_of(&item);
+                let mut guard = collector.heap.lock().unwrap_or_else(|e| e.into_inner());
+                guard.push(KeyedEntry::new(key, item));
+                if guard.len() > collector.max_files {
+                    guard.pop();
+                }
+                debug_assert!(guard.len() <= collector.max_files);
             }
-            MetaOutcome::Skip(reason) => {
-                let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
+            ClassifyOutcome::Skip(reason) => {
+                let mut guard = collector.skipped.lock().unwrap_or_else(|e| e.into_inner());
                 if guard.len() < MAX_SKIP_REASONS {
                     guard.push(reason);
                 }
             }
-            MetaOutcome::Transparent => {}
+            ClassifyOutcome::Transparent => {}
         },
         Err(err) => {
             let path = match &err {
                 ignore::Error::WithPath { path, .. } => path.clone(),
                 _ => PathBuf::new(),
             };
-            let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = collector.skipped.lock().unwrap_or_else(|e| e.into_inner());
             if guard.len() < MAX_SKIP_REASONS {
                 guard.push(SkipReason::ReadError {
                     path,
@@ -498,68 +631,15 @@ fn handle_metadata_entry(
     WalkState::Continue
 }
 
-/// Process a single walker entry result and update shared state.
-///
-/// Extracted from the `build_parallel` closure to reduce nesting depth and
-/// enable independent unit testing.  The parallel walker API requires a
-/// `Box<dyn FnMut(…) -> WalkState>` closure; this function holds all the
-/// logic so the closure is a thin delegation layer.
-///
-/// # Mutex poisoning
-///
-/// All `.lock()` calls use `unwrap_or_else(|e| e.into_inner())` so that a
-/// panic in one parallel thread does not cascade-abort the remaining threads
-/// via a poisoned-lock panic.
+/// Compute the [`normalize_rel_path`] sort key for a [`WalkEntry`].
+fn walk_entry_key(e: &WalkEntry) -> String {
+    normalize_rel_path(&e.rel_path)
+}
+
+/// Compute the [`normalize_rel_path`] sort key for a [`ReadFile`].
 #[cfg(test)]
-fn handle_entry(
-    entry_result: Result<ignore::DirEntry, ignore::Error>,
-    files: &Mutex<Vec<ReadFile>>,
-    skipped: &Mutex<Vec<SkipReason>>,
-    file_count: &AtomicUsize,
-    cap_reached: &AtomicBool,
-    max_files: usize,
-    root: &Path,
-) -> WalkState {
-    if file_count.load(Ordering::Relaxed) >= max_files {
-        if !cap_reached.swap(true, Ordering::Relaxed) {
-            let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.len() < MAX_SKIP_REASONS {
-                guard.push(SkipReason::CapReached);
-            }
-        }
-        return WalkState::Quit;
-    }
-
-    match entry_result {
-        Ok(entry) => match classify_entry(&entry, root) {
-            EntryOutcome::Accept(file) => {
-                file_count.fetch_add(1, Ordering::Relaxed);
-                files.lock().unwrap_or_else(|e| e.into_inner()).push(file);
-            }
-            EntryOutcome::Skip(reason) => {
-                let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
-                if guard.len() < MAX_SKIP_REASONS {
-                    guard.push(reason);
-                }
-            }
-            EntryOutcome::Transparent => {}
-        },
-        Err(err) => {
-            let path = match &err {
-                ignore::Error::WithPath { path, .. } => path.clone(),
-                _ => PathBuf::new(),
-            };
-            let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.len() < MAX_SKIP_REASONS {
-                guard.push(SkipReason::ReadError {
-                    path,
-                    error: err.to_string(),
-                });
-            }
-        }
-    }
-
-    WalkState::Continue
+fn read_file_key(e: &ReadFile) -> String {
+    normalize_rel_path(&e.rel_path)
 }
 
 // ============================================================================

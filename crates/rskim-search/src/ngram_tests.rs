@@ -392,6 +392,90 @@ fn extract_ngrams_uses_production_weights() {
     }
 }
 
+// ── Cycle 6: is_single_token predicate matrix (AC #6, AD-372-5) ──────────
+
+/// AC #6 / AD-372-5: `is_single_token` is the single source of truth for
+/// exact-symbol mode.  Every entry in the predicate matrix must be asserted
+/// individually (PF-007: discriminating, not vacuous).
+///
+/// Negative assertions ensure the test fails if `is_single_token` were
+/// changed to always return `true` or always return `false`.
+#[test]
+fn is_single_token_predicate_matrix() {
+    use super::is_single_token;
+
+    // ── TRUE cases ──────────────────────────────────────────────────────────
+    assert!(
+        is_single_token("foo"),
+        "is_single_token('foo') must be true: non-empty, >= 3 bytes, single token"
+    );
+    assert!(
+        is_single_token("foo::bar"),
+        "is_single_token('foo::bar') must be true: punctuation-joined, no whitespace"
+    );
+    assert!(
+        is_single_token("  foo  "),
+        "is_single_token('  foo  ') must be true: leading/trailing whitespace stripped"
+    );
+    assert!(
+        is_single_token("decode_postings_varint"),
+        "is_single_token('decode_postings_varint') must be true: real symbol name"
+    );
+
+    // ── FALSE cases ─────────────────────────────────────────────────────────
+    assert!(
+        !is_single_token("foo bar"),
+        "is_single_token('foo bar') must be false: interior space → two tokens"
+    );
+    assert!(
+        !is_single_token("fn"),
+        "is_single_token('fn') must be false: < 3 bytes"
+    );
+    assert!(
+        !is_single_token("if"),
+        "is_single_token('if') must be false: < 3 bytes"
+    );
+    assert!(
+        !is_single_token("a\tb"),
+        "is_single_token('a\\tb') must be false: interior tab → two tokens"
+    );
+    assert!(
+        !is_single_token(""),
+        "is_single_token('') must be false: empty string"
+    );
+    assert!(
+        !is_single_token("  "),
+        "is_single_token('  ') must be false: whitespace-only string"
+    );
+    assert!(
+        !is_single_token("ab"),
+        "is_single_token('ab') must be false: < 3 bytes"
+    );
+    assert!(
+        !is_single_token("alpha gamma"),
+        "is_single_token('alpha gamma') must be false: two space-separated tokens"
+    );
+
+    // ── Multibyte / UTF-8 boundary ───────────────────────────────────────────
+    //
+    // `is_single_token` uses `trimmed.len()` which is BYTE length (not char count).
+    // This pins the byte-length contract (consistent with the byte-based trigram index):
+    // a codepoint that encodes to >= 3 bytes is classified as a single token,
+    // while a codepoint that encodes to < 3 bytes is not.
+    //
+    // Positive: a 3-byte UTF-8 codepoint (e.g. U+4E2D, '中', 3 bytes) satisfies
+    //   the >= 3 byte requirement and contains no whitespace → true.
+    // Negative: a 2-byte UTF-8 codepoint (e.g. U+00E9, 'é', 2 bytes) is < 3 bytes → false.
+    assert!(
+        is_single_token("中"), // U+4E2D: 3 UTF-8 bytes, no whitespace
+        "is_single_token('中') must be true: single codepoint, 3 UTF-8 bytes >= 3 (byte-len contract)"
+    );
+    assert!(
+        !is_single_token("é"), // U+00E9: 2 UTF-8 bytes < 3
+        "is_single_token('é') must be false: single codepoint, 2 UTF-8 bytes < 3 (byte-len contract)"
+    );
+}
+
 #[test]
 fn extract_query_ngrams_uses_production_weights() {
     let result = extract_query_ngrams("fn main()");
@@ -429,4 +513,86 @@ fn extract_ngrams_1000_line_file_under_1ms() {
         "extract_ngrams on ~60KB took {}ms in debug mode (must be < 500ms)",
         elapsed.as_millis()
     );
+}
+
+// ── Cycle 7: extract_query_positional_tokens (v5, #392 / #380 Phase 2) ──────
+
+/// Two 3+ byte words each get their deduped within-word trigrams, in query order.
+#[test]
+fn positional_tokens_alpha_beta_have_expected_trigrams() {
+    let tokens = extract_query_positional_tokens("alpha beta");
+    assert_eq!(tokens.len(), 2, "expected 2 word-tokens, got {tokens:?}");
+
+    assert_eq!(tokens[0].token_off, 0, "'alpha' must be token_off 0");
+    assert_eq!(tokens[1].token_off, 1, "'beta' must be token_off 1");
+
+    let tok0_keys: std::collections::HashSet<u32> =
+        tokens[0].trigrams.iter().map(|n| n.key()).collect();
+    let expected0: std::collections::HashSet<u32> = [
+        Ngram::from_bytes(b'a', b'l', b'p').key(),
+        Ngram::from_bytes(b'l', b'p', b'h').key(),
+        Ngram::from_bytes(b'p', b'h', b'a').key(),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        tok0_keys, expected0,
+        "'alpha' within-word trigrams must be exactly {{alp,lph,pha}}, got {:?}",
+        tokens[0].trigrams
+    );
+
+    let tok1_keys: std::collections::HashSet<u32> =
+        tokens[1].trigrams.iter().map(|n| n.key()).collect();
+    let expected1: std::collections::HashSet<u32> = [
+        Ngram::from_bytes(b'b', b'e', b't').key(),
+        Ngram::from_bytes(b'e', b't', b'a').key(),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        tok1_keys, expected1,
+        "'beta' within-word trigrams must be exactly {{bet,eta}}, got {:?}",
+        tokens[1].trigrams
+    );
+}
+
+/// A word shorter than 3 bytes cannot form a within-word trigram — its
+/// `trigrams` list must be empty (documented limitation), while a sibling
+/// word of sufficient length still gets its trigrams. Discriminating
+/// (PF-007): fails if short words wrongly inherit cross-word trigrams.
+#[test]
+fn positional_tokens_short_word_has_empty_trigrams() {
+    let tokens = extract_query_positional_tokens("a beta");
+    assert_eq!(tokens.len(), 2, "expected 2 word-tokens, got {tokens:?}");
+    assert!(
+        tokens[0].trigrams.is_empty(),
+        "'a' (< 3 bytes) must yield an empty trigram list, got {:?}",
+        tokens[0].trigrams
+    );
+    assert!(
+        !tokens[1].trigrams.is_empty(),
+        "'beta' (>= 3 bytes) must yield a non-empty trigram list"
+    );
+}
+
+/// Punctuation (`::`) is a separator, not a word byte — `"foo::bar"` splits
+/// into two word-tokens, matching the indexer's `word_token_indices` tokenizer.
+#[test]
+fn positional_tokens_punctuation_separates_words() {
+    let tokens = extract_query_positional_tokens("foo::bar");
+    assert_eq!(
+        tokens.len(),
+        2,
+        "'foo::bar' must split into 2 word-tokens on '::', got {tokens:?}"
+    );
+    assert_eq!(tokens[0].token_off, 0, "'foo' must be token_off 0");
+    assert_eq!(tokens[1].token_off, 1, "'bar' must be token_off 1");
+    assert!(!tokens[0].trigrams.is_empty(), "'foo' must have trigrams");
+    assert!(!tokens[1].trigrams.is_empty(), "'bar' must have trigrams");
+}
+
+/// Empty query yields an empty token vec (no panic, vacuous but well-defined).
+#[test]
+fn positional_tokens_empty_query_returns_empty_vec() {
+    assert!(extract_query_positional_tokens("").is_empty());
 }

@@ -32,6 +32,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::Infra,
     expected_exit_codes: &[],
     forward_stderr: false,
+    skip_net_savings_guard: false,
 };
 
 /// Global kubectl flags that accept a value in the following token.

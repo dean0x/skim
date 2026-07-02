@@ -205,11 +205,22 @@ pub(super) fn build_hotspot_rows(
 ///
 /// Same union-of-keys strategy as [`build_hotspot_rows`] (AC11 contract).
 ///
-/// - `risk_score` = `FileRiskScores.fix_density` (decay-weighted, used for
-///   ranking by `ORDER BY risk_score DESC`).
+/// - `risk_score` = volume-weighted bug-fix risk (#378):
+///   [`rskim_search::risk_score_wilson_decay`]`(decay_fix_factor, fix_commits,
+///   total_commits)` = `decay_fix_factor * WilsonLB(fix_commits, total_commits)`.
+///   `decay_fix_factor` is `FileRiskScores.fix_density` — the **decay-weighted
+///   fix proportion** (`Σ decay·is_fix / Σ decay`), in which the decay weight
+///   largely cancels (it is `1.0` for an all-fix file, recency only shifts it
+///   when fix and non-fix commits differ in age), NOT a pure recency term. The
+///   Wilson lower bound is read from the **raw** lifetime counts and is the
+///   factor that fixes the saturation bug: it suppresses tiny samples (a
+///   1-fix/1-commit file, whose `decay_fix_factor` is also `1.0`) below a
+///   50-fix/50-commit file, which the old bare decay-weighted ratio did not.
+///   Used for ranking by `ORDER BY risk_score DESC`.
 /// - `fix_density` = raw `fix_commits / total_commits` from [`FileTemporalStats`]
 ///   (matches the schema docs in storage_types.rs: "ratio of fix commits to
-///   total commits" — shown in the `Fix%` column of `--risky`).
+///   total commits" — shown in the `Fix%` column of `--risky`). Intentionally
+///   distinct from `risk_score` (AD-378-3 two-field separation).
 /// - `total_commits` and `fix_commits` = lifetime counts from [`FileTemporalStats`]
 ///   (computed over the full-history walk, not the 90-day window — O-C / ADR-003).
 pub(super) fn build_risk_rows(
@@ -219,13 +230,17 @@ pub(super) fn build_risk_rows(
     union_paths(risk_scores, temporal_stats)
         .into_iter()
         .map(|path| {
-            let decay_fix_density = risk_scores.get(path).map(|r| r.fix_density).unwrap_or(0.0);
+            // decay_fix_factor = decay-weighted fix proportion (Σ decay·is_fix / Σ decay).
+            // The decay weight largely cancels (==1.0 for an all-fix file); this is the
+            // #378 decay term, NOT a pure recency weight — see risk_score_wilson_decay docs.
+            let decay_fix_factor = risk_scores.get(path).map(|r| r.fix_density).unwrap_or(0.0);
             let (total_commits, fix_commits) = temporal_stats
                 .get(path)
                 .map(|s| (s.total_commits, s.fix_commits))
                 .unwrap_or((0, 0));
             // raw_fix_density = fix_commits / total_commits (per storage_types.rs schema).
-            // Distinct from decay_fix_density (which is decay-weighted and used as risk_score).
+            // Distinct from both risk_score (volume-weighted) and decay_fix_factor
+            // (decay-weighted) — AD-378-3 two-field separation.
             let raw_fix_density = if total_commits > 0 {
                 f64::from(fix_commits) / f64::from(total_commits)
             } else {
@@ -233,8 +248,14 @@ pub(super) fn build_risk_rows(
             };
             RiskRow {
                 file_path: path.to_string(),
-                // risk_score = decay-weighted fix density for ranking (ORDER BY risk_score DESC).
-                risk_score: decay_fix_density,
+                // risk_score = decay-weighted-fix-proportion × Wilson-LB volume weighting
+                // (#378, AD-378-1). Wilson reads the RAW (fix_commits, total_commits) so
+                // tiny samples no longer saturate at 1.0 (the #378 ranking bug).
+                risk_score: rskim_search::risk_score_wilson_decay(
+                    decay_fix_factor,
+                    fix_commits,
+                    total_commits,
+                ),
                 total_commits,
                 fix_commits,
                 // fix_density = raw ratio (shown in Fix% column; matches schema contract).

@@ -49,6 +49,7 @@ const CONFIG_DIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::Infra,
     expected_exit_codes: &[],
     forward_stderr: false,
+    skip_net_savings_guard: false,
 };
 
 const CONFIG_NSLOOKUP: ToolRunConfig<'static> = ToolRunConfig {
@@ -62,6 +63,7 @@ const CONFIG_NSLOOKUP: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::Infra,
     expected_exit_codes: &[],
     forward_stderr: false,
+    skip_net_savings_guard: false,
 };
 
 // ============================================================================

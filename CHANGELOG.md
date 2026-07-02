@@ -9,21 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### BREAKING
 
+- **`skim search` manifest format: v2 → v3 (FileId↔path ordering skew fix)** (#373) —
+  Standalone `--ast` queries and all other FileId consumers (lexical, blast-radius, temporal)
+  could return the wrong files whenever the project contained nested directories (e.g.
+  `foo/bar.rs` and `foo.rs`), because FileIds were assigned in `PathBuf` component order
+  but resolved in `BTreeMap<String>` byte order.  The fix aligns both sides to byte-wise
+  string order.  The manifest on-disk JSONL layout is unchanged; the version bump forces a
+  one-time automatic rebuild on the first query after upgrade so no pre-existing index
+  silently serves wrong files.  No manual `--rebuild` needed.
+
 - **`skim search` index format: v3 → v4 (posting lists now delta+varint compressed)** (#358) —
   Posting entries changed from a fixed 9-byte layout to a variable-length delta+varint encoding
   (`[varint delta_doc_id][u8 field_id][varint delta_position]`), reducing the lexical index size
   by approximately 61% on a representative corpus (measured: 3.53x source ratio vs 9.04x before
   compression).  Any existing `.skim/` index written by a prior version is silently stale; the
   first query triggers an automatic rebuild (`auto_refresh_if_stale`).  To force an immediate
-  rebuild: `skim search index --rebuild`.
+  rebuild: `skim search --rebuild`.
 
 - **`skim search` index format: v2 → v3 (n-gram key widened u16 → u32)** (#355) —
   The n-gram inverted-index key is now a 32-bit trigram `(b1<<16)|(b2<<8)|b3` instead
   of a 16-bit bigram `(b1<<8)|b2`.  Any existing `.skim/` index written by a prior
   version is silently stale; the first query triggers an automatic rebuild
-  (`auto_refresh_if_stale`).  To force an immediate rebuild: `skim search index --rebuild`.
+  (`auto_refresh_if_stale`).  To force an immediate rebuild: `skim search --rebuild`.
 
 ### Added
+- **`skim search --offset N`** — skip `N` verified results before collecting `--limit` results,
+  enabling pagination across all query paths (pure-lexical, compound text+`--ast`,
+  `--blast-radius`, and temporal).  The offset is applied AFTER the verify gate so page
+  boundaries are stable even when stale/incidental-overlap candidates are dropped.
+  Default: 0 (no skip). (#372)
 - **`skim search --weights lexical,ast,temporal`** — tune the `--blast-radius` composite
   ranking; default `0.5,0.3,0.2`. Ratios only (not normalized; zero and non-sum-to-1 are
   accepted, negative/NaN/inf rejected). On the `--blast-radius` path only the lexical and
@@ -41,7 +55,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ast_index.skcache`) across builds for files whose content is unchanged, avoiding a
   full AST re-parse on every rebuild. (#290)
 
+### Removed
+- **`skim search index` legacy positional subcommand** (#375) — the bareword `index`
+  as a leading positional to `skim search` was removed.  `skim search index` now
+  runs a **lexical query** for the word "index" (exit 0, returns matching files) rather
+  than building the index.  Builds go exclusively through the flag surface:
+  `skim search --build` (incremental), `skim search --rebuild` (full rebuild from
+  scratch), and `skim search --update` (refresh if stale).  A cold `skim search index`
+  on a fresh project auto-builds the index before running the query (existing
+  self-heal behavior — no change needed).  Historical `skim search index --rebuild`
+  calls in previous release notes refer to past release behavior and are unchanged.
+
 ### Changed
+- **`skim search` single-token queries now use AND-intersection + raw occurrence-count ranking** (#372) —
+  Prior to this change, all lexical queries used a BM25F UNION pool: candidates ranked by BM25F score,
+  which divides term-frequency by field length, penalising large files.  For single contiguous tokens
+  (≥ 3 bytes, no interior whitespace — the common identifier search), the engine now:
+  (1) AND-intersects the query's trigram posting lists (grep-exact, corpus-size-independent recall),
+  (2) ranks surviving files by raw occurrence count (length-norm-free, AD-372-6) so large-file definers
+  with multiple references are not buried by small stubs that have 1 occurrence in a tiny file.
+  BM25F UNION is unchanged for multi-word queries.  The verify gate (literal substring membership)
+  is preserved on both paths.  Result ordering for single-token queries may change after upgrade.
 - **`skim search` lexical results are now filtered to files literally containing the query** (#355) —
   Prior to this change the n-gram index returned candidates ranked by BM25F score, but no
   literal-substring check was performed: a file could appear in results even if none of its
@@ -81,6 +115,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compound intersection complete by construction.  Part of the #198/#200 compound
   text+AST path.
 
+- **Markdown headings appear in reverse order in structure/signatures output** — The
+  `extract_markdown_headers_with_spans` function collected headings via a depth-first
+  visit stack (LIFO) which emitted sibling headings in reverse source order; a document
+  with `# A`, `## B`, `## C` produced `C → B → A` output. The fix adds a single
+  ascending sort on `source_start_line` before the texts/spans/line-map pipeline, so
+  headings are always emitted top-to-bottom regardless of tree traversal order.
+
+- **`cargo nextest run` dropped the `run` subcommand token in rewrites** — The rewrite
+  rule for `cargo nextest run` was `rewrite_to: &["skim", "cargo", "nextest"]`,
+  silently dropping `run`. This caused the dispatch layer to receive `nextest` without
+  `run`, fell through to the wrong handler, and also triggered a fragile
+  `args.iter().any(|a| a == "nextest")` sniff in the cargo test driver that
+  occasionally mis-identified standard `cargo test` runs. Three-layer fix: (a) preserve
+  `run` in the rewrite rule; (b) replace the sniff with an explicit
+  `runner_args.first() == Some("nextest")` check threaded from the dispatcher (A2
+  contract); (c) correct the test-failure output path — nextest writes its entire report
+  (including the summary) to *stderr*, leaving stdout empty, so its failures must be
+  forwarded raw rather than routed into skim's stdout-keyed compress path (which would
+  emit nothing — the net-savings guard baselines against the empty stdout — or
+  mis-count, since the embedded per-process libtest line reports a single binary, not
+  the whole run). nextest's test-failure exit `100` (distinct from libtest's `101`) is
+  therefore deliberately *not* added to the compressible-exit set; every non-zero
+  nextest exit forwards the full, accurate report verbatim. (#317 compress-never-truncate)
+
+- **Pseudo mode stripped visibility/export modifiers, losing API surface** — Pseudo mode
+  is intended to remove syntactic noise while preserving code semantics. Visibility
+  modifiers (`pub`, `export`, `public`, `private`, `protected`, `internal`,
+  `fileprivate`, `open` in Swift) are API surface — they affect what callers can see —
+  not noise. Removing them silently changed the semantics an LLM reads. The fix removes
+  visibility keywords and node kinds from all per-language `PseudoRules` strip lists.
+  Non-visibility structural modifiers (`static`, `final`, `abstract`, `virtual`,
+  `override`, `sealed`, Kotlin `open`/`data`) remain stripped as before. C++ access
+  specifiers (`public:`, `private:`) are similarly preserved. (A4 contract)
+
+- **`ls -la` output double-counted `.`/`..` entries and emitted a redundant header** —
+  `try_parse_ls_long` matched the permission-line regex against `.` and `..` dotdir
+  entries, inflating the dir count by 2. It also prepended a `"LS: N entries …"`
+  summary line before the file list; `FileResult::render` then emitted a second `ls N`
+  header, producing two headers in the rendered output. Fixes: skip `.` and `..` before
+  counting (trimming the trailing `/` added by `-F`/`-p` before the name comparison);
+  remove the prepended summary entry; fold the dir/file breakdown into the footer so it
+  reads `"… — D dirs, F files"` when entries are elided or `"D dirs, F files"` when all
+  fit. Empty directories (only `total`/`.`/`..` lines) return a well-formed `Full`
+  result with 0 entries rather than `None`, preventing Tier-2 from mis-tokenising those
+  lines.
+
+- **Unified `SKIM_CACHE_DIR` resolution — honored by all cache subsystems (#359 Phase B)** —
+  Previously `SKIM_CACHE_DIR` was silently ignored by the parser cache and the default
+  `analytics.db` path (`cache::get_cache_dir` read only `dirs::cache_dir()`) while the
+  search index and hook log respected it. This caused partial relocation: some skim state
+  moved, some stayed under `~/.cache/skim` (PF-002).
+
+  The fix introduces a single source of truth:
+  - `cache::cache_root_from(override_dir)` — pure resolver (no I/O); filters empty paths.
+  - `cache::cache_root()` — reads `SKIM_CACHE_DIR` and delegates to `cache_root_from`.
+  - `cache::get_cache_dir()` now calls `cache_root()` before the mkdir/chmod block.
+  - `cmd::hook_log::CacheEnv::resolve_cache_dir()` now delegates to `cache::cache_root_from`
+    instead of its own inline resolver.
+
+  **Behavior change:** `SKIM_CACHE_DIR` now also relocates the default `analytics.db`
+  (previously it did not). `SKIM_ANALYTICS_DB` still takes precedence over the relocated
+  default when explicitly set. Empty `SKIM_CACHE_DIR` is treated as unset (falls back to
+  the platform default `~/.cache/skim`). **Caveat:** pre-existing history at the old
+  `~/.cache/skim/analytics.db` is **not migrated** — setting `SKIM_CACHE_DIR` for the
+  first time causes `skim stats` to start from an empty DB at the new location; the old
+  file remains at `~/.cache/skim/analytics.db` and must be moved manually if you want to
+  preserve history.
+
+- **Plain `skim <file>` now always records token-savings analytics (#359 Phase A)** —
+  Previously a plain `skim <file>` (and stdin, glob, and directory invocations) only
+  recorded analytics when token counts were already present in the parser cache from a
+  prior `--show-stats` run; cold-cache and plain-warmed-cache runs silently dropped all
+  data. The fix introduces a unified `record_file_ops` path that records token counts
+  independent of cache state, with the detected language attached to each row. Multi-file
+  invocations (glob, directory) now emit one analytics row per file instead of a single
+  aggregate. **Dashboard metric note:** `skim stats` computes `invocations` as a row count,
+  so a 3-file run now contributes +3 to the invocations counter instead of +1; historical
+  data recorded before this release used the old single-row-per-invocation convention, so
+  `invocations` comparisons across the upgrade point will reflect this change in counting
+  semantics.
+
 ### Added
 - **`rskim-tokens` crate (L3 Wave-1)** — Multi-provider token counting library (cl100k /
   o200k / Anthropic-offline / heuristic). Default build is HTTP-free; `net-anthropic` feature
@@ -116,8 +231,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gh api` and `gh run watch` are exempt from the `--json` steering check at the
   handler gate (matching the rewrite skip-list); only `--jq`/`-q`/`--template`/`-t`
   trigger passthrough for those subcommands.
+- **Test-runner exit-code fidelity** (#350) — A passing suite whose output skim cannot
+  parse now exits 0 instead of 1. Previously `resolve_exit_code` treated an unparseable
+  exit-0 result as a failure (exit 1); it now propagates the child's zero exit code
+  verbatim. Genuine non-zero exits from failing suites are preserved unchanged on all paths.
+- **Git diff changed-line de-duplication** (#350) — Lines appearing in a hunk covered by
+  adjacent diff ranges are now emitted exactly once. A per-`FileDiff` `EmittedCursor` tracks
+  the last-written position; overlapping ranges advance the cursor rather than re-emitting
+  the shared lines. No change to diff output for non-overlapping hunks.
 
 ### Changed
+- **Session-id attribution priority inverted: sidecar > env > flag** (#350) — The hook no longer
+  injects `--session-id` into rewritten commands; flag injection caused hard failures
+  (`"unexpected argument --session-id"`) on older binaries. Attribution now resolves in order:
+  sidecar (written out-of-band by the hook; found via ancestry walk) → `SKIM_SESSION_ID` env var
+  (wrapper-surface attribution; export alongside `PATH`) → `--session-id=VALUE` flag
+  (forward-compat fallback; honoured so old hooks that still inject the flag are not lost).
+- **Net-savings guard token-decision cap raised 64 KiB → 256 KiB; new 4 KiB longest-run guard
+  for degenerate inputs** (#317 / #350) — The cap controlling when `savings_decision` falls
+  back from exact token counts to fast byte comparison is raised from 64 KiB to 256 KiB,
+  improving token-accurate decisions for moderately large outputs.  A complementary
+  longest-run guard is added: when either string contains a non-whitespace run exceeding
+  4 KiB (and both strings are below the size cap), the function falls back to byte comparison
+  to avoid O(n²) BPE merge cost on minified JS / base64 / binary-as-text single-line inputs.
+  Real line-oriented shell output never triggers the run guard; the "never expand" safety
+  invariant is unchanged on all paths.
+- **Analytics stores true (gross) compressed-token counts on expansion rows** (#317 / #350) —
+  Previously `compressed_tokens` was clamped to `raw_tokens` when the output expanded.  It is
+  now stored as the true value.  The `tokens_saved` aggregate (in `query_summary`, `query_daily`,
+  and all other aggregate queries) is floored per-row to 0 via `CASE WHEN`, consistent with
+  existing `query_by_command` / `query_by_language` / `query_by_mode` / `query_by_session`
+  behavior.  Row-level `raw_tokens` / `compressed_tokens` now carry true gross counts, allowing
+  accurate expansion-rate analysis.  **Note:** rows written before this change remain clamped
+  (mixed historical data); this is acceptable for cumulative analytics — no migration is needed.
+- **`--show-stats` token counts reused for analytics recording** (#317 / #350) — When
+  `--show-stats` is active, the token counts already computed for the stats display are reused
+  to record the analytics row via `try_record_command_with_counts`, avoiding redundant
+  background re-tokenization.  The common path (no `--show-stats`) is unchanged.
 - **`serde_json` `preserve_order` feature enabled workspace-wide — key ordering changes** — (#302)
   Enabling `preserve_order` switches `serde_json::Map` from `BTreeMap` (alphabetical) to
   `IndexMap` (declaration/insertion order) for every crate in the workspace. Visible effects:

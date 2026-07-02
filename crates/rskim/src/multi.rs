@@ -279,33 +279,61 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
         );
     }
 
-    // Record analytics for multi-file operations
-    if options.analytics_enabled && total_original_tokens > 0 {
+    // Record per-file analytics rows (Phase A2 — fixes PF-001 for multi/glob/dir).
+    //
+    // Capture project_path and common fields on the MAIN thread before any
+    // background spawn. Consume `results` by value so output Strings MOVE into
+    // the rows without cloning.
+    //
+    // Behaviour change (intentional): N per-file rows are emitted for BOTH plain
+    // and --show-stats, replacing the single aggregate row.  Err entries (files
+    // that failed to process) are skipped — they already produced stderr output.
+    if options.analytics_enabled {
         let cwd = std::env::current_dir()
             .unwrap_or_default()
             .display()
             .to_string();
         let mode = format!("{:?}", options.process.mode).to_lowercase();
-        crate::analytics::record_with_counts(
-            true,
-            crate::analytics::TokenSavingsRecord {
-                timestamp: crate::analytics::now_unix_secs(),
-                command_type: crate::analytics::CommandType::File,
-                original_cmd: format!("skim [multi: {} files]", success_count),
-                raw_tokens: total_original_tokens,
-                compressed_tokens: total_transformed_tokens,
-                savings_pct: crate::analytics::savings_percentage(
-                    total_original_tokens,
-                    total_transformed_tokens,
-                ),
-                duration_ms: 0,
-                project_path: cwd,
-                mode: Some(mode),
-                language: None, // mixed languages
-                parse_tier: None,
-                session_id: options.session_id.clone(),
-            },
-        );
+
+        let rows: Vec<crate::analytics::FileOpRow> = results
+            .into_iter()
+            .filter_map(|(path, result)| {
+                let pr = result.ok()?; // skip Err entries
+                let counts = match (pr.original_tokens, pr.transformed_tokens) {
+                    (Some(raw), Some(comp)) => {
+                        // --show-stats (or count-carrying cache hit): counts already known.
+                        crate::analytics::FileCounts::Known {
+                            raw,
+                            compressed: comp,
+                        }
+                    }
+                    _ => {
+                        // Plain run / cold cache: tokenize off the main thread.
+                        // F14: if the file is deleted/changed between here and the
+                        // background re-read, read_source returns Err → row silently
+                        // skipped; sibling rows still recorded.
+                        crate::analytics::FileCounts::Tokenize {
+                            raw: crate::analytics::RawSource::Reread(path.clone()),
+                            compressed: pr.output,
+                        }
+                    }
+                };
+                Some(crate::analytics::FileOpRow {
+                    counts,
+                    original_cmd: format!("skim {}", path.display()),
+                    language: pr.language.map(|l| l.as_str().to_string()),
+                    parse_tier: pr.parse_tier.map(str::to_string),
+                })
+            })
+            .collect();
+
+        let common = crate::analytics::FileOpCommon {
+            mode: Some(mode),
+            project_path: cwd,
+            session_id: options.session_id.clone(),
+        };
+
+        crate::analytics::record_file_ops(options.analytics_enabled, rows, common);
     }
 
     Ok(())

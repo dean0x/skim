@@ -25,6 +25,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::FileOps,
     expected_exit_codes: &[1],
     forward_stderr: true,
+    skip_net_savings_guard: false,
 };
 
 /// Run `skim rg [args...]`.

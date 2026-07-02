@@ -495,10 +495,16 @@ impl AstIndexBuilder {
         let post_path = self.output_dir.join("ast_index.skpost");
         let idx_path = self.output_dir.join("ast_index.skidx");
 
+        // Invalidate any prior validity marker BEFORE writing fresh files
+        // (#376, AD-376-4 / AD-376-5).  Defensive unlink so a partial or
+        // aborted rebuild cannot leave a stale marker validating wrong bytes.
+        crate::validity::unlink_marker_best_effort(&self.output_dir.join("ast_index.skverify"));
+
         // Atomic writes: .skpost first, .skidx second (commit point).
         atomic_write(&self.output_dir, &post_path, &postings_buf)?;
         atomic_write(&self.output_dir, &idx_path, &skidx_buf)?;
 
+        // Verify-back open re-validates and stamps ast_index.skverify (AC8).
         AstIndexReader::open(&self.output_dir)
     }
 

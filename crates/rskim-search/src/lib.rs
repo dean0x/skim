@@ -34,6 +34,7 @@ pub mod temporal;
 #[cfg(test)]
 pub(crate) mod test_corpus;
 mod types;
+pub(crate) mod validity;
 pub mod weights;
 
 pub use ast_index::{
@@ -83,6 +84,11 @@ const _: () = assert!(
 /// stored version against this constant and triggers a full rebuild when it is
 /// below the current value (ADR-006).
 ///
+/// v4 → v5 (#392 / #380 Phase 2): `PostingEntry` gains a `token_position: u32`
+/// field (word-token ordinal) to support word/token-distance phrase / --near
+/// search — an additive 4th tail varint per posting; the byte `position`
+/// field is retained for snippets. Old v4 indexes self-heal the same way.
+///
 /// With this constant exported, `check_staleness` (staleness.rs) can detect the
 /// mismatch first and self-heal automatically on the next query (ADR-006,
 /// Finding 9 / #355 and #358).
@@ -101,7 +107,7 @@ pub use compound::{
 // #201: enriched result row type, formatters, and line-span re-parse.
 pub use compound::{
     AstResult, MAX_REPARSE_FILE_BYTES, TemporalAnnotation, format_ast_json, format_ast_text,
-    recover_line,
+    pattern_occurs_in_file, recover_line,
 };
 pub use index::{NgramIndexBuilder, NgramIndexReader};
 pub use lexical::{
@@ -110,7 +116,7 @@ pub use lexical::{
 };
 pub use ngram::{
     BORDER_MULTIPLIER, Ngram, extract_ngrams, extract_ngrams_with_weights, extract_query_ngrams,
-    extract_query_ngrams_with_weights,
+    extract_query_ngrams_with_weights, is_single_token,
 };
 pub use temporal::storage::{
     CochangeRow, HotspotRow, META_GIT_HEAD, META_LAST_UPDATED, MIN_COCHANGE_JACCARD, RiskRow,
@@ -118,7 +124,7 @@ pub use temporal::storage::{
 };
 pub use temporal::{
     DEFAULT_HALF_LIFE_DAYS, GixSource, compute_file_risk_scores, compute_file_temporal_stats,
-    decay_weight, is_fix_commit,
+    decay_weight, is_fix_commit, risk_score_wilson_decay, wilson_lower_bound,
 };
 pub use types::{
     CochangeStats, CommitInfo, FieldClassifier, FileChangeInfo, FileId, FileRiskScores,

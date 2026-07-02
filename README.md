@@ -105,13 +105,14 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - `--json` for machine-readable output, `--path` to scope to a subdirectory
 
 ### Code Search (`skim search`)
-- **n-gram index** — build an AST-aware search index with `skim search index` (incremental SHA-256 cache, 50K file cap, `--force` for full rebuild)
+- **n-gram index** — build an AST-aware search index with `skim search --build` (incremental SHA-256 cache, 50K file cap; use `skim search --rebuild` for a full rebuild from scratch)
 - **Temporal sort flags** — rank results by git history signals: `--hot` (hotspot score), `--cold` (least-changed first), `--risky` (fix-commit density)
 - **Blast-radius filter** — `--blast-radius FILE` pre-filters candidates to files that historically co-change with FILE, then applies sort flags within that set
 - **AST structural search** — `--ast <pattern>` filters to files containing a named structural pattern (e.g. `try-catch`, `nested-loop`, `god-function`) or a containment query (e.g. `--ast "for_statement > await_expression"`); composable with a text query, `--hot`/`--cold`/`--risky` temporal sort flags, `--blast-radius`, `--limit`, and `--json`; degrades gracefully when heatmap data is absent (warns to stderr, returns unsorted, exit 0). Limitation: single-node queries (no `>` separator) are rejected (#283, unigram index not yet built)
 - **Composite ranking** — `--weights lexical,ast,temporal` (default `0.5,0.3,0.2`) tunes the `--blast-radius` composite RRF ranking (#200); values are ratios only (not normalized), zero and non-sum-to-1 are allowed, negative/NaN/inf are rejected. On the `--blast-radius` path only the `lexical` and `temporal` weights currently affect ranking (a lexical ∪ co-change fusion); the `ast` weight is parsed and validated but inert here until the full text+AST+temporal compound dispatch lands (#339)
 - Composable: `skim search "parse config" --risky --blast-radius src/config.rs` finds risky matches near a file's co-change cluster
-- `--json` for structured output, `--limit N` to cap results, `--root` for explicit project root
+- `--json` for structured output, `--limit N` to cap results, `--offset N` for pagination (skip N verified results), `--root` for explicit project root
+- **Index location** — the search index and its SQLite database live under the OS cache directory, **not** in your project root. The base is `$SKIM_CACHE_DIR` when set, otherwise the platform cache dir (`~/Library/Caches/skim` on macOS, `~/.cache/skim` on Linux); within it the per-root subpath is `search/<sha256(canonical_root)[..16]>/`. That directory holds the temporal SQLite database `temporal.db` plus the lexical/AST index artifacts (`index.skidx`, `index.skpost`, `index.skfiles`, `ast_index.*`). Run `skim search --stats` to print the resolved path for the current project (it is shown even before an index is built).
 
 ### Intelligence
 - `skim discover` scans agent session history for optimization opportunities
@@ -241,7 +242,7 @@ Skim offers six modes with different levels of aggressiveness:
 
 ```bash
 skim file.ts --mode structure   # Default
-skim file.ts --mode pseudo      # Pseudocode (strips types, visibility, decorators)
+skim file.ts --mode pseudo      # Pseudocode (strips types & decorators; preserves visibility)
 skim file.ts --mode signatures  # More aggressive
 skim file.ts --mode types       # Most aggressive
 skim file.ts --mode full        # No transformation

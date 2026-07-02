@@ -34,6 +34,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::Db,
     expected_exit_codes: &[],
     forward_stderr: true,
+    skip_net_savings_guard: false,
 };
 
 /// Matches the psql row-count footer: `(N rows)` or `(1 row)`.

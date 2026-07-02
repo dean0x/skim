@@ -37,14 +37,15 @@ use super::manifest::{FileManifest, ManifestEntry, decode_field_map, encode_fiel
 use super::staleness::read_git_head;
 use super::types::{IndexConfig, IndexResult, ProcessedFile, SkipReason, WalkEntry};
 use super::walk::{
-    ReadOutcome, discover_project_root, is_minified, open_and_read, sha256_hex, walk_metadata,
+    ReadOutcome, discover_project_root, is_minified, normalize_rel_path, open_and_read, sha256_hex,
+    walk_metadata,
 };
 
 // ============================================================================
 // Public entry point
 // ============================================================================
 
-/// Run the `skim search index` subcommand.
+/// Run the index builder.
 ///
 /// Accepted flags:
 /// - `--root=<PATH>` or `--root <PATH>` — explicit project root (default: cwd)
@@ -52,11 +53,33 @@ use super::walk::{
 /// - `--max-files=<N>` — override the 50,000 file cap (must be ≥ 1)
 /// - `-h` / `--help` — print help text and exit
 ///
+/// # AD-375-2 — `index::run` / `IndexCli` are retained, not deleted (applies ADR-001).
+///
+/// As of #375, `skim search index` as a positional subcommand was removed —
+/// `index` is now treated as a query term, not a build trigger.  This function
+/// is therefore no longer reachable from the `search::run` dispatcher.  It is
+/// intentionally kept because:
+///
+/// 1. **`index_tests.rs` calls it directly** (`use super::run`) — deleting this
+///    function or `IndexCli` would fail to compile the 37 builder tests.
+/// 2. **`run_build`** (in `mod.rs`) delegates to `build_index()` (defined below),
+///    which is the same build pipeline — `index::run` is the test seam for that
+///    pipeline.
+///
+/// Do NOT delete this function or `IndexCli` as "dead code" — it is the primary
+/// test entry point for the build pipeline.
+///
 /// # Errors
 ///
 /// Returns `Err` only for fatal I/O failures. User-facing errors (unsupported
 /// languages, too-large files) are counted and reported to stderr but do not
 /// cause a non-zero exit code.
+// AD-375-2: clippy's dead_code lint fires here because the only non-test caller
+// (the `search::run` positional intercept) was removed by #375.  The function is
+// live from `index_tests.rs` (`use super::run`) but that is a #[cfg(test)] module,
+// which clippy-with-dead_code does not count as a live caller.  We suppress rather
+// than delete (see the rustdoc above).
+#[allow(dead_code)]
 pub(super) fn run(
     args: &[String],
     _analytics: &crate::analytics::AnalyticsConfig,
@@ -120,6 +143,9 @@ struct IndexCli {
 }
 
 impl IndexCli {
+    // AD-375-2: same suppression as `run` above — used by index_tests.rs via
+    // IndexCli::try_parse_from + into_config, invisible to dead_code lint.
+    #[allow(dead_code)]
     fn into_config(self) -> anyhow::Result<IndexConfig> {
         let effective_root = match self.root {
             Some(r) => r.canonicalize().unwrap_or(r),
@@ -178,6 +204,44 @@ pub(super) fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     let _lock = super::build_lock::acquire("skim search index", &pipeline.cache_dir)?;
 
     pipeline.run()
+}
+
+/// Build the index, but re-check staleness AFTER acquiring the build lock and
+/// SKIP the pipeline if `still_stale()` returns `false` (AD-379-8).
+///
+/// # Stampede collapse
+///
+/// Several concurrent `skim search` processes that all observe a dirty working
+/// tree will queue on the advisory build lock. Without this re-check each would
+/// rebuild in turn (a thundering herd). Here the FIRST waiter to acquire the
+/// lock rebuilds; every subsequent waiter, upon acquiring the lock, calls
+/// `still_stale()` — which re-runs the cheap staleness check against the
+/// now-refreshed manifest — observes a Current index, and returns `Ok(None)`
+/// WITHOUT running a second pipeline. This collapses N rebuilds into one.
+///
+/// The predicate is evaluated INSIDE the lock (after acquisition, before the
+/// pipeline) so the re-check observes the committed state of any peer that
+/// rebuilt before us. Acquiring the lock here and delegating to `pipeline.run()`
+/// (which does NOT re-acquire) keeps a single lock hold for the whole critical
+/// section — re-entering `build_index` would self-block on the advisory lock.
+///
+/// Returns `Ok(Some(result))` when a build ran, `Ok(None)` when it was skipped
+/// because a peer already refreshed the index.
+pub(super) fn build_index_rechecked(
+    config: &IndexConfig,
+    still_stale: impl FnOnce() -> bool,
+) -> anyhow::Result<Option<IndexResult>> {
+    let pipeline = Pipeline::new(config)?;
+
+    // Single lock hold for the whole critical section (re-check + build).
+    let _lock = super::build_lock::acquire("skim search index", &pipeline.cache_dir)?;
+
+    // Post-lock re-check (AD-379-8): a peer may have rebuilt while we waited.
+    if !still_stale() {
+        return Ok(None);
+    }
+
+    pipeline.run().map(Some)
 }
 
 /// Orchestrates the index build pipeline as discrete, testable stages.
@@ -328,14 +392,19 @@ impl<'cfg> Pipeline<'cfg> {
         // and the next query self-heals. (applies ADR-006)
         //
         // Why the comparison holds for realistic projects: `manifest_count` is the
-        // number of unique BTreeMap keys (normalized rel-path strings), and
-        // `file_count` is the number of successful `add_file_classified` calls.
-        // They agree when every successfully-indexed file has a distinct normalized
-        // path key — the invariant upheld by `walk_metadata`'s sorted, deduped
-        // output. A mismatch would require two walk entries to normalize to the
-        // same path key, which cannot happen on case-sensitive file-systems and is
-        // a data-corruption signal on case-insensitive ones; hence this guard is
-        // intentionally defensive rather than a common-case check.
+        // number of unique BTreeMap keys (normalized rel-path strings produced by
+        // normalize_rel_path), and `file_count` is the number of successful
+        // `add_file_classified` calls. They agree when every successfully-indexed
+        // file has a distinct normalized path key — the invariant upheld by
+        // `walk_metadata`'s sort (AD-373-1: byte-wise normalized-string order,
+        // matching the manifest BTreeMap<String> resolution side exactly).
+        // Dedup is implicit in BTreeMap::insert (last writer wins); the walker
+        // does NOT dedup entries — a duplicate walk entry would silently collapse
+        // to one BTreeMap key, causing manifest_count < file_count and triggering
+        // this guard. A mismatch would require two walk entries to normalize to the
+        // same path key, which cannot happen on case-sensitive file-systems (two
+        // distinct paths ⇒ two distinct keys) and is a data-corruption signal on
+        // case-insensitive ones; hence this guard is intentionally defensive.
         let manifest_count = new_manifest.entry_count();
         if manifest_count != file_count as usize {
             return Err(anyhow::anyhow!(
@@ -612,13 +681,16 @@ impl<'cfg> Pipeline<'cfg> {
                 cache_hits = cache_hits.saturating_add(1);
             }
 
-            let path_key = pf.rel_path.to_string_lossy().replace('\\', "/");
+            // AD-373-2 (ref): use normalize_rel_path so the manifest key is
+            // byte-identical to the walk sort key (walk.rs). Single source of truth.
+            let path_key = normalize_rel_path(&pf.rel_path);
             new_manifest.insert(ManifestEntry {
                 path: path_key,
                 sha256: pf.sha256,
                 lang: pf.lang.as_str().to_string(),
                 field_map: encode_field_map(&pf.field_map),
                 mtime: pf.mtime,
+                size: pf.size,
             });
             // `pf.content` dropped here — memory released immediately.
         }
@@ -734,7 +806,9 @@ fn read_and_classify(
     let sha = sha256_hex(content.as_bytes());
 
     // Lexical 2-tier SHA cache: SHA match → hit, mismatch/--force → miss.
-    let path_key = entry.rel_path.to_string_lossy().replace('\\', "/");
+    // AD-373-2 (ref): use normalize_rel_path so the lookup key is byte-identical
+    // to the manifest key and the walk sort key. Single source of truth.
+    let path_key = normalize_rel_path(&entry.rel_path);
 
     let (field_map, cache_hit) = if !force
         && let Some(cached) = manifest.lookup(&path_key)
@@ -759,6 +833,7 @@ fn read_and_classify(
         content,
         sha256: sha,
         mtime: entry.mtime,
+        size: entry.size,
         field_map,
         cache_hit,
         ast_cached,
@@ -858,16 +933,70 @@ fn derive_ast_entry(
 ///
 /// Path: `{base_cache}/search/{sha256(canonical_root)[..16]}/`
 ///
-/// The base cache dir is resolved via `SKIM_CACHE_DIR` (if set) or
-/// `~/.cache/skim/`.
+/// The base cache dir is resolved via `SKIM_CACHE_DIR` (if set) or the platform
+/// cache dir (`~/Library/Caches/skim` on macOS, `~/.cache/skim` on Linux).
+///
+/// For an existing on-disk root the path component is the truncated SHA-256 of
+/// `root.canonicalize()`. For a NON-existent root (canonicalize fails) the path
+/// is hashed from a pure-lexical normalization (see [`canonical_or_normalized`])
+/// so that trailing-slash / `.`-segment spellings of the same missing root map
+/// to a single index directory (AD-381-2).
 pub(super) fn resolve_search_cache_dir(root: &Path) -> anyhow::Result<PathBuf> {
     let base = crate::cmd::resolve_cache_dir()
         .ok_or_else(|| anyhow::anyhow!("failed to resolve skim cache directory"))?;
 
-    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canonical = canonical_or_normalized(root);
     let hash = project_root_hash(&canonical);
 
     Ok(base.join("search").join(hash))
+}
+
+/// Canonicalize `root`, falling back to a pure-lexical normalization when the
+/// path does not exist on disk.
+///
+/// On the success path this is exactly `root.canonicalize()` — no extra work
+/// for the common (existing-root) case. Only when `canonicalize()` errors (the
+/// cold, non-existent-root branch) do we normalize lexically so that equivalent
+/// spellings of the same missing root collapse to one directory.
+///
+/// The fallback normalization is **pure-lexical and side-effect-free**
+/// (AD-381-N): it walks [`Path::components`], dropping `CurDir` (`.`) segments
+/// and any trailing separator, with **no `..` resolution and no filesystem
+/// calls**. This keeps the result deterministic and cross-platform (provable
+/// without Windows CI).
+///
+/// Accepted trade-off: because `..` is NOT resolved, divergent `..` spellings of
+/// a non-existent root (e.g. `foo/../bar` vs `bar`) deliberately remain distinct
+/// — resolving them would require filesystem I/O on a path that does not exist.
+/// Revisit only if a concrete duplicate-dir case for `..` is observed.
+fn canonical_or_normalized(root: &Path) -> PathBuf {
+    match root.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) => lexically_normalize(root),
+    }
+}
+
+/// Pure-lexical path normalization: strip trailing separators and collapse `.`
+/// (current-dir) segments, WITHOUT resolving `..` and WITHOUT any syscalls.
+///
+/// Used only on the canonicalize-error (non-existent-root) path so that
+/// `foo`, `foo/`, `./foo`, and `foo/./bar` vs `foo/bar` map to identical
+/// `PathBuf`s. `..` segments are preserved verbatim (`Component::ParentDir`),
+/// so `foo/../bar` stays distinct from `bar` by design (AD-381-N).
+fn lexically_normalize(root: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut normalized = PathBuf::new();
+    for component in root.components() {
+        match component {
+            // Drop `.` segments — they are semantically inert.
+            Component::CurDir => {}
+            // Preserve everything else verbatim. `Path::components` already
+            // collapses repeated and trailing separators, so re-pushing these
+            // components yields a canonical-form spelling without `..` resolution.
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// Compute a 16-char hex prefix of the SHA-256 of the canonical project root path.

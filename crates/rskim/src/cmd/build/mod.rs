@@ -186,21 +186,45 @@ pub(super) fn run_parsed_command(
     // Emit markers to stderr (warnings, notices)
     let _ = result.emit_markers(&mut std::io::stderr().lock());
 
-    // Print the result content to stdout
-    let content = result.content();
-    if !content.is_empty() {
-        println!("{content}");
-    }
-
-    // Combine stdout+stderr for stats and analytics.
+    // Combine stdout+stderr for stats, analytics, and the net-savings guard.
+    // "raw" for build = stdout + stderr (both carry diagnostic content).
     // Hold as Cow to avoid an unconditional String clone: Borrowed when stderr
     // is empty (fast path), Owned only when both streams are non-empty.
     let raw_cow = super::combine_output(&output);
 
+    // Net-savings guard (Cluster C / #317):
+    // Build handlers always emit text (no --json path through this function).
+    // Skip the guard when the tier is already "passthrough" (raw IS the body).
+    //
+    // "raw" baseline = combine_output (stdout+stderr) to match what the user
+    // would see if skim were bypassed entirely.
+    let content = result.content();
+    let tier_name = result.tier_name();
+    let effective_tier = if tier_name != "passthrough" {
+        match crate::cmd::execution::savings_decision(raw_cow.as_ref(), content) {
+            crate::cmd::execution::SavingsDecision::Keep => {
+                if !content.is_empty() {
+                    println!("{content}");
+                }
+                tier_name
+            }
+            crate::cmd::execution::SavingsDecision::Passthrough => {
+                // Emit raw verbatim (stdout+stderr combined, same as raw_cow).
+                crate::cmd::execution::emit_raw_passthrough(raw_cow.as_ref())?
+            }
+        }
+    } else {
+        // Already passthrough — print as-is and skip guard.
+        if !content.is_empty() {
+            println!("{content}");
+        }
+        tier_name
+    };
+
     // Report token stats if requested. count_token_pair takes &str so we
     // borrow through the Cow without forcing an allocation.
     if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(raw_cow.as_ref(), result.content());
+        let (orig, comp) = crate::process::count_token_pair(raw_cow.as_ref(), content);
         crate::process::report_token_stats(orig, comp, "");
     }
 
@@ -223,12 +247,13 @@ pub(super) fn run_parsed_command(
     };
 
     // Record analytics (fire-and-forget, non-blocking).
+    // Use effective_tier (may be "passthrough" if the net-savings guard fired).
     // try_record_command takes ownership, so convert to String here — the
     // single call site where ownership is actually required.
     crate::analytics::try_record_command(
-        rec.with_tier(result.tier_name()),
+        rec.with_tier(effective_tier),
         raw_cow.into_owned(),
-        result.content().to_string(),
+        content.to_string(),
         super::format_analytics_label("build", program, &args.join(" ")),
         output.duration,
     );

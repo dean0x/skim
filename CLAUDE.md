@@ -15,7 +15,7 @@ User-facing install/usage lives in `README.md`; release mechanics in `CHANGELOG.
 Cargo workspace, 8 crates:
 - `rskim-core` — pure transform library (parsing, modes; no I/O side effects)
 - `rskim` — CLI binary (`skim`): caching, analytics, command wrappers
-- `rskim-search` — code-search index (lexical n-gram, temporal, AST structural), stored in `<root>/.skim/search.db`
+- `rskim-search` — code-search index (lexical n-gram, temporal, AST structural). All artifacts live under the OS cache dir, NOT the project root: base = `$SKIM_CACHE_DIR` if set, else the platform cache dir (`~/Library/Caches/skim` on macOS, `~/.cache/skim` on Linux), with the per-root subpath `search/<sha256(canonical_root)[..16]>/`. That dir holds the SQLite temporal DB (`temporal.db`) plus the lexical/AST index artifacts (`index.skidx`, `index.skpost`, `index.skfiles`, `ast_index.*`)
 - `rskim-research` — offline tooling that generates both AST structural weight tables
   AND the lexical trigram IDF weight table (see codegen notes below)
 - `rskim-bench` — benchmarks
@@ -44,10 +44,10 @@ Streaming output (stdout, zero-copy via &str slices where possible)
 `transform_source()` routes each language to its parser via the Strategy Pattern, avoiding special-case conditionals — each language encapsulates its own strategy.
 
 **Non-obvious behavior (gotchas):**
-- **Analytics:** token savings persist to `~/.cache/skim/analytics.db` (SQLite/WAL), recorded fire-and-forget on background threads. `--clear-cache` clears only the parser cache, NOT `analytics.db` — use `skim stats --clear` for that. The `AnalyticsStore` trait + `MockStore` make the stats dashboard testable without a real DB.
-- **Search DB:** `rskim-search` stores hotspot/risk/co-change data in `<root>/.skim/search.db`. Migrations are forward-only via `PRAGMA user_version`; a DB written by a newer version errors rather than corrupting data.
-- **Lexical n-gram index:** `index.skidx` / `index.skpost` is format v4 (trigram, u32 key from #355 Part B + delta+varint variable-length posting codec from #358 Item 2). This is DISTINCT from the AST structural index. Both v2 (bigram, u16 key) and v3 (trigram, u32 key, fixed 9-byte postings) lexical indexes trigger an automatic rebuild on the next query via `check_staleness` — no manual `--rebuild` needed for either upgrade. Short queries (< 3 bytes, e.g. `fn`, `if`) cannot produce trigrams and fall back to an all-files score-0 candidate set, which is filtered down to matching files by the Part A substring-verify gate (AD-355-7); this is correct behavior, not a bug.
-- **AST index:** the structural n-gram index (`ast_index.skidx` / `.skpost`) is format v2 — v1 files are rejected with "please rebuild" (`skim search index --rebuild`). Synthetic n-gram markers (IDs ≥ 64900) resolve to `None` in `vocab_resolve()`, keeping them isolated from real vocabulary.
+- **Analytics:** token savings persist to `~/.cache/skim/analytics.db` (SQLite/WAL; default location — relocates with `SKIM_CACHE_DIR`, see Environment Variables), recorded fire-and-forget on background threads. `--clear-cache` clears only the parser cache, NOT `analytics.db` — use `skim stats --clear` for that. The `AnalyticsStore` trait + `MockStore` make the stats dashboard testable without a real DB.
+- **Search DB:** `rskim-search` stores hotspot/risk/co-change data in the SQLite file `temporal.db`, located in the per-root search cache dir (`<cache_base>/search/<sha256(canonical_root)[..16]>/` — see the `rskim-search` crate note above for `<cache_base>`), NOT under the project root. Migrations on `temporal.db` are forward-only via `PRAGMA user_version`; a DB written by a newer version errors rather than corrupting data. (The only `.skim`-named artifact in the search path is the advisory build lock `.skim-build.lock`, which also lives inside that cache dir — never in the project root.)
+- **Lexical n-gram index:** `index.skidx` / `index.skpost` is format v4 (trigram, u32 key from #355 Part B + delta+varint variable-length posting codec from #358 Item 2). This is DISTINCT from the AST structural index. Both v2 (bigram, u16 key) and v3 (trigram, u32 key, fixed 9-byte postings) lexical indexes trigger an automatic rebuild on the next query via `check_staleness` — no manual `--rebuild` needed for either upgrade. Short queries (< 3 bytes, e.g. `fn`, `if`) cannot produce trigrams and fall back to an all-files score-0 candidate set, which is filtered down to matching files by the Part A substring-verify gate (AD-355-7); this is correct behavior, not a bug. AD-372-4: `short_query_fallback` returns the **full** filtered candidate set with NO internal `.skip/.take` — offset+limit are applied by the caller AFTER verification (the only truncation gate).
+- **AST index:** the structural n-gram index (`ast_index.skidx` / `.skpost`) is format v2 — v1 files are rejected with "please rebuild" (`skim search --rebuild`). Synthetic n-gram markers (IDs ≥ 64900) resolve to `None` in `vocab_resolve()`, keeping them isolated from real vocabulary.
 
 ## Commands
 
@@ -80,7 +80,7 @@ Modes are set via `--mode` only (no config file): `structure` (default), `signat
 
 Most subcommands wrap a dev tool (cargo, git, npm, pytest, eslint, docker, psql, grep, …) and compress its output — run `skim --help` for the full catalog. The ones with non-obvious behavior:
 
-- `search` — n-gram code search over a project index. Build/update: `skim search index` (`--rebuild`, `--force`, `--root`, `--max-files`). Query: `skim search <text>` (`--limit`, `--json`, `--stats`). Temporal sort/filter: `--hot`/`--cold` (hotspot score), `--risky` (fix-risk), `--blast-radius FILE` (co-change peers). Structural: `--ast <pattern>` — a named pattern (`try-catch`, `nested-loop`, `god-function`, …) or containment query (`for_statement > block`); composable with a text query, `--hot`/`--cold`/`--risky`, `--blast-radius`, `--limit`, and `--json`; degrades gracefully when heatmap data is absent (warns to stderr, returns unsorted, exit 0). Limitation: single-node queries (no `>` separator) are rejected (#283, unigram index not yet built). Composite ranking: `--weights lexical,ast,temporal` (default `0.5,0.3,0.2`, ratios only — not normalized, zero and non-sum-to-1 allowed, negative/NaN/inf rejected) tunes the `--blast-radius` RRF ranking (#200).
+- `search` — n-gram code search over a project index. Build/update: `skim search --build` (incremental), `skim search --rebuild` (full), `skim search --update` (refresh if stale); all accept `--root`. (The `index` positional subcommand was removed in #375 — `skim search index` is now a query for the word "index".) Query: `skim search <text>` (`--limit`, `--json`, `--stats`). Temporal sort/filter: `--hot`/`--cold` (hotspot score), `--risky` (fix-risk), `--blast-radius FILE` (co-change peers). Structural: `--ast <pattern>` — a named pattern (`try-catch`, `nested-loop`, `god-function`, …) or containment query (`for_statement > block`); composable with a text query, `--hot`/`--cold`/`--risky`, `--blast-radius`, `--limit`, and `--json`; degrades gracefully when heatmap data is absent (warns to stderr, returns unsorted, exit 0). Limitation: single-node queries (no `>` separator) are rejected (#283, unigram index not yet built). Composite ranking: `--weights lexical,ast,temporal` (default `0.5,0.3,0.2`, ratios only — not normalized, zero and non-sum-to-1 allowed, negative/NaN/inf rejected) tunes the `--blast-radius` RRF ranking (#200).
 - `heatmap` — git-history risk/coupling analysis: churn, co-change, stability, fix-after-touch (`--json`, `--since`, `--window`, `--path`, `--insights`).
 - `init` — install skim as an agent hook (Claude/Cursor/Codex/Gemini/Copilot/Crush); `--wrappers` adds PATH wrappers for sub-agent interception.
 - `stats` — token analytics dashboard (`--since`, `--format json`, `--verbose`, `--clear`).
@@ -100,8 +100,19 @@ skim intercepts a sub-agent's shell command through **two independent mechanisms
 
 - `SKIM_PASSTHROUGH=1` — bypass all compression (use when compressed output hides an error). Indefinite commands (`vite dev`, `jest --watch`, bare `skim vitest`) auto-pass-through live; use `skim vitest run` for a compressed one-shot.
 - `SKIM_DEBUG=1` (or `--debug`) — warnings/notices on stderr.
-- `SKIM_SESSION_ID` — analytics session attribution; priority `--session-id` > sidecar > env > none. Set it alongside the PATH export so sub-agents inherit it.
-- `SKIM_CACHE_DIR` / `SKIM_ANALYTICS_DB` — override the cache dir / analytics DB path.
+- `SKIM_SESSION_ID` — analytics session attribution; priority sidecar > env > `--session-id` flag (flag is a forward-compat fallback only — the hook no longer injects it). Set it alongside the PATH export so sub-agents inherit it.
+- `SKIM_CACHE_DIR` — relocates **all** skim cache state: parser cache (`.json` files),
+  tee output (`tee/`), and the **default** `analytics.db` location. An empty value is
+  treated as unset (falls back to `~/.cache/skim`). The path is used as-is (no `skim`
+  suffix is appended by the resolver). **Caveat:** pre-existing analytics history at the
+  old `~/.cache/skim/analytics.db` is **not migrated** — setting this variable for the
+  first time causes `skim stats` to start from an empty DB at the new location; move
+  the old file manually if you want to preserve history.
+- `SKIM_ANALYTICS_DB` — overrides the analytics DB path directly; **takes precedence over
+  `SKIM_CACHE_DIR`** for the DB location. When `SKIM_ANALYTICS_DB` is set, the DB is
+  opened at that exact path regardless of `SKIM_CACHE_DIR`. To isolate all skim state
+  in a sandbox it is sufficient to set `SKIM_CACHE_DIR` alone (the default analytics.db
+  moves with it).
 - `SKIM_DISABLE_ANALYTICS=1` — disable recording. `SKIM_INPUT_COST_PER_MTOK` — $/MTok for cost estimates (default 3.0).
 - Session-provider overrides for `discover`/`learn`/`agents`: `SKIM_PROJECTS_DIR`, `SKIM_CODEX_SESSIONS_DIR`, `SKIM_COPILOT_DIR`, `SKIM_CURSOR_DB_PATH`, `SKIM_GEMINI_DIR`, `SKIM_CRUSH_DIR`.
 
