@@ -295,9 +295,8 @@ fn scan_working_tree(
                         // Path is present in the skip-set.
                         // OD-395-5: None-hint → treat as unchanged (loop killed even without mtime/size).
                         let mtime_unchanged =
-                            s_mtime.map_or(true, |stored| entry.mtime == Some(stored));
-                        let size_unchanged =
-                            s_size.map_or(true, |stored| entry.size == Some(stored));
+                            s_mtime.is_none_or(|stored| entry.mtime == Some(stored));
+                        let size_unchanged = s_size.is_none_or(|stored| entry.size == Some(stored));
                         // AD-395-5: unchanged skip → neither added nor changed (loop-killer).
                         // Changed skip → one rebuild so the file isn't frozen in skip state.
                         if !mtime_unchanged || !size_unchanged {
