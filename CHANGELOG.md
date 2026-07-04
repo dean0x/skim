@@ -7,7 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Bash / shell language support** — Full tree-sitter-bash grammar integration
+  (`Language::Bash`). Structure mode strips `function_definition` bodies to `{...}`
+  while preserving function names and all top-level commands/variable assignments.
+  Zero-function scripts (pure top-level commands like deploy.sh) render meaningfully:
+  all commands and variable assignments are visible. Shebang auto-detection recognises
+  `#!/bin/bash`, `#!/bin/sh`, `#!/usr/bin/env bash`, and the `env -S` form; supports
+  `dash`, `zsh`, `ksh`, `mksh`, `fish` dialects. CRLF-tolerant (`\r\n` shebangs work).
+  Also detects shebangs for `python`, `node`, and `ruby` on extensionless files.
+  `--language bash` (alias `sh`) available for explicit override. Unknown-extension
+  files with an unrecognised shebang degrade to lossless passthrough (ADR-002) with a
+  `SKIM_DEBUG=1` notice; all 6 modes have explicit Bash arms.
+
 ### Fixed
+- **`git diff` output could exceed raw size** — The default diff renderer walked the
+  full AST node body for each hunk, emitting 2–5× the raw patch size for large files.
+  Replaced with a hunk-scoped path (`render_default_scoped`) that emits only the
+  container breadcrumb header plus the hunk's own changed lines, so output is ≤ raw in
+  all cases. Orphan hunks (changed lines outside all AST node ranges, e.g. EOF
+  deletions or between-function additions) render as raw patch lines so no content is
+  silently dropped. An ADR-001 guardrail is wired into `run_diff` (text output) so a
+  net-expansion is never forwarded.
+
+- **`mypy` produced blank output on a clean run when injecting `--output json`** —
+  mypy writes nothing to stdout in JSON mode when there are zero issues. Agents
+  received empty output instead of "Success: …". A new `synthesize_success_line`
+  knob on `ToolRunConfig` emits a configured line when exit code is 0 and compressed
+  output is empty. mypy is configured with `synthesize_success_line = "mypy OK 0
+  issues"` and `injected_format_flag = "--output"`. Synthesis is suppressed when the
+  user already supplied `--output` themselves. A companion `injected_format_flag`
+  field prevents prepare_args from injecting the format flag twice.
+
+- **`ls -R` and multi-path `ls` lost per-directory section structure** — `try_parse_ls_long`
+  was a flat single-pass parser that ignored `"dir:"` section headers from `ls -R` and
+  multi-path invocations. Empty directories silently vanished (only `total`/`.`/`..`
+  lines were present). Fix dispatches to a sectioned parser when the output contains
+  section headers, rendering each section with its label header. Empty directories now
+  produce a labelled section with 0 entries rather than disappearing.
+
+- **grep/rg stripped semantically significant leading whitespace from matched content** —
+  `.trim()` was applied to match content in three extraction sites
+  (`try_parse_single_target` for grep, `try_parse_file_line_content` for the shared
+  file:line:content parser, and `extract_match_fields` in the rg JSON tier). This was
+  destructive for Python (indented function defs), YAML, and any language where leading
+  spaces carry meaning. Fixed by switching to `trim_end()` — trailing whitespace is
+  still removed, leading whitespace is preserved. Both the rewrite-hook and PATH-wrapper
+  surfaces share these handlers and benefit from the fix.
+
+- **Hook scripts used a bare `skim` exec that silently ran the wrong binary after
+  `skim` was updated or reinstalled** — Generated hook scripts now embed `SKIM_HOOK_BINARY`
+  (the canonicalized absolute install-time path) and `SKIM_HOOK_COMMIT` (short git SHA)
+  at generation time via a `build.rs` compile-time constant. At runtime the hook
+  executes via the pinned binary with a PATH fallback. `hook_is_current()` now checks
+  for the `SKIM_HOOK_BINARY` export — hooks generated before this fix are treated as
+  stale and `skim init` will prompt to reinstall. A version-mismatch helper warns when
+  the running binary differs from the pinned binary SHA.
+
 - **Markdown headings appear in reverse order in structure/signatures output** — The
   `extract_markdown_headers_with_spans` function collected headings via a depth-first
   visit stack (LIFO) which emitted sibling headings in reverse source order; a document

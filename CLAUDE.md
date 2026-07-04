@@ -30,7 +30,7 @@ Cargo workspace, 8 crates:
 Parser Manager (language detection)
   ↓
 Language::transform_source()          ← Strategy Pattern dispatcher
-  ├─ tree-sitter  (14 code langs: TS/JS/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Kotlin/Swift/Markdown)
+  ├─ tree-sitter  (15 code langs: TS/JS/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Kotlin/Swift/Bash/Markdown)
   └─ serde-based  (JSON/YAML/TOML — data formats, not code)
   ↓
 Transformation Layer (modes: structure / signatures / types / minimal / pseudo / full)

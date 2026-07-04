@@ -50,7 +50,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 ## Features
 
 ### Code Skimming (the original, still unmatched)
-- **17 languages** including TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, SQL, Kotlin, Swift, Markdown, JSON, YAML, TOML
+- **18 languages** including TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, SQL, Kotlin, Swift, Bash, Markdown, JSON, YAML, TOML
 - **6 transformation modes** from full to minimal to pseudo to structure to signatures to types (15-95% reduction)
 - **14.6ms** for 3,000-line files. **48x faster** on cache hits
 - **Token budget cascading** that automatically selects the most aggressive mode fitting your budget
@@ -271,6 +271,7 @@ skim file.ts --mode full        # No transformation
 | SQL        | ✅     | `.sql`             | DDL/DML via tree-sitter-sequel  |
 | Kotlin     | ✅     | `.kt`, `.kts`      | Data classes, coroutines, sealed classes |
 | Swift      | ✅     | `.swift`           | Protocols, generics, SwiftUI structs |
+| Bash       | ✅     | `.sh`, `.bash`     | Functions + shebang auto-detect; also `#!/bin/sh`, `zsh`, `ksh` |
 
 ## Examples
 
@@ -580,8 +581,8 @@ cargo bench
 
 **Current**: v2.10.0 — Stable
 
-✅ **Core — Code Reading (17 languages):**
-- TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Markdown/JSON/YAML/TOML
+✅ **Core — Code Reading (18 languages):**
+- TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Kotlin/Swift/Bash/Markdown/JSON/YAML/TOML
 - 5 transformation modes: structure, signatures, types, minimal, full
 - Token budget (`--tokens N`), max lines (`--max-lines N`), last lines (`--last-lines N`)
 - Multi-file glob support, parallel processing, caching (40-50x speedup)
