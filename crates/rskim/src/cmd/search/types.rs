@@ -144,6 +144,14 @@ pub(super) struct QueryConfig {
     pub phrase: bool,
     /// v5 positional: max word-token distance (`--near N`).
     pub near: Option<u32>,
+    /// Optional language filter for `--lang <name>` (e.g. `--lang rust`).
+    ///
+    /// When `Some`, only files of this language are returned.  Threaded into
+    /// every [`rskim_search::SearchQuery`] construction site in `query.rs` so
+    /// the reader's `lang_filter` path is exercised on ALL search paths
+    /// (exact-symbol, BM25F UNION, positional phrase/near, compound AST, and
+    /// blast-radius).  `None` means no language restriction (all files).
+    pub lang: Option<rskim_core::Language>,
 }
 
 /// A search result with the file path resolved and snippet extracted.

@@ -298,6 +298,11 @@ struct Flags {
     phrase: bool,
     /// v5 positional search: max word-token distance for `--near N` (unordered).
     near: Option<u32>,
+    /// Language filter from `--lang <name>` (e.g. `--lang rust`, `--lang py`).
+    ///
+    /// Accepts both language names (`rust`, `python`, `typescript`) and file
+    /// extensions (`rs`, `py`, `ts`).  `None` means no language restriction.
+    lang: Option<rskim_core::Language>,
 }
 
 /// Parse and validate a `--limit` value string.
@@ -349,6 +354,44 @@ fn parse_near_value(raw: &str) -> anyhow::Result<u32> {
         );
     }
     Ok(n)
+}
+
+/// Parse a `--lang` value into a [`rskim_core::Language`].
+///
+/// Accepts both file extensions (`rs`, `py`, `ts`) and language display names
+/// (`rust`, `python`, `typescript`); case-insensitive.  Returns an actionable
+/// error listing accepted values when the input is unrecognised.
+fn parse_lang_value(raw: &str) -> anyhow::Result<rskim_core::Language> {
+    use rskim_core::Language;
+    // Try file extension first so callers can pass "rs", "py", etc.
+    if let Some(lang) = Language::from_extension(raw) {
+        return Ok(lang);
+    }
+    match raw.to_ascii_lowercase().as_str() {
+        "rust" => Ok(Language::Rust),
+        "python" => Ok(Language::Python),
+        "typescript" => Ok(Language::TypeScript),
+        "javascript" => Ok(Language::JavaScript),
+        "go" => Ok(Language::Go),
+        "java" => Ok(Language::Java),
+        "markdown" => Ok(Language::Markdown),
+        "c" => Ok(Language::C),
+        "cpp" | "c++" => Ok(Language::Cpp),
+        "csharp" | "c#" => Ok(Language::CSharp),
+        "ruby" => Ok(Language::Ruby),
+        "sql" => Ok(Language::Sql),
+        "kotlin" => Ok(Language::Kotlin),
+        "swift" => Ok(Language::Swift),
+        "json" => Ok(Language::Json),
+        "yaml" => Ok(Language::Yaml),
+        "toml" => Ok(Language::Toml),
+        _ => Err(anyhow::anyhow!(
+            "--lang: unknown language {:?}; accepted names: rust, python, typescript, \
+             javascript, go, java, markdown, c, cpp, csharp, ruby, sql, kotlin, swift, \
+             json, yaml, toml — or file extensions: rs, py, ts, js, md, c, cpp, cs, rb, kt",
+            raw
+        )),
+    }
 }
 
 /// Parse a temporal flag arm (`--hot`, `--cold`, `--risky`, `--blast-radius`).
@@ -468,6 +511,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut weights: Option<rskim_search::CompositeWeights6> = None;
     let mut phrase = false;
     let mut near: Option<u32> = None;
+    let mut lang: Option<rskim_core::Language> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -550,12 +594,22 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                     i += 1;
                 }
             }
+            s if s == "--lang" || s.starts_with("--lang=") => {
+                // Language filter: restrict results to files of a given language.
+                // Accepts display names ("rust", "python") and extensions ("rs", "py").
+                // D17 / AC16: honored on all search paths (positional + fallback + lexical).
+                let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--lang")?;
+                lang = Some(parse_lang_value(&raw)?);
+                if consumed {
+                    i += 1;
+                }
+            }
             s if s.starts_with("--") => {
                 anyhow::bail!(
                     "unrecognised flag {:?}. Valid flags: --build, --rebuild, --update, \
                      --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --offset, \
                      --root, --ast, --hot, --cold, --risky, --blast-radius, --weights, \
-                     --phrase, --near",
+                     --phrase, --near, --lang",
                     s
                 );
             }
@@ -579,6 +633,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
         weights,
         phrase,
         near,
+        lang,
     })
 }
 
@@ -964,6 +1019,7 @@ fn run_query(
         composite_weights: flags.weights,
         phrase: flags.phrase,
         near: flags.near,
+        lang: flags.lang,
     };
 
     // Pass the already-refreshed manifest to execute_query_with_manifest.  When

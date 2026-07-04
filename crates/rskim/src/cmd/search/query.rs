@@ -413,6 +413,7 @@ pub(super) fn execute_query_with_manifest(
         // matching RESOLVED Decision 3 and the multi-word path contract.
         sq.phrase = config.phrase;
         sq.near = config.near;
+        sq.lang = config.lang; // D17 / AC16: --lang honored on positional + exact paths
         engine.search(&sq)?
     } else {
         // Multi-word / default: widen pool via LEXICAL_CANDIDATE_POOL_K (AD-355-2).
@@ -423,6 +424,7 @@ pub(super) fn execute_query_with_manifest(
         sq.limit = Some(pool_limit);
         sq.phrase = config.phrase;
         sq.near = config.near;
+        sq.lang = config.lang; // D17 / AC16: --lang honored on BM25F UNION path
         engine.search(&sq)?
     };
 
@@ -567,6 +569,7 @@ fn run_compound_query(
     sq.file_filter = Some(filter_set);
     sq.phrase = config.phrase;
     sq.near = config.near;
+    sq.lang = config.lang; // D17 / AC16: --lang honored on compound AST path
 
     let raw_lex = ctx.engine.search(&sq)?;
 
@@ -731,6 +734,7 @@ fn run_blast_radius_composite_query(
     // reader's search_positional path is exercised (not just BM25F recall).
     sq.phrase = config.phrase;
     sq.near = config.near;
+    sq.lang = config.lang; // D17 / AC16: --lang honored on blast-radius path
     // No file_filter: UNION mode requires the full lexical ranked list.
     let raw_lex = ctx.engine.search(&sq)?;
     // AD-393-12: select the verify predicate for the blast path.

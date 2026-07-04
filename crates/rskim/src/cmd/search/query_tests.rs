@@ -89,6 +89,7 @@ fn make_config(root: &std::path::Path, cache_dir: &std::path::Path, text: &str) 
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     }
 }
 
@@ -432,6 +433,7 @@ fn test_execute_query_blast_radius_includes_only_allowed_paths() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -479,6 +481,7 @@ fn test_execute_query_blast_radius_target_file_is_included() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -534,6 +537,7 @@ fn test_ac12_union_includes_cochange_only_file_absent_from_lexical() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -601,6 +605,7 @@ fn test_ac13_union_no_duplicate_file_ids_and_correct_cardinality() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -675,6 +680,7 @@ fn test_ac13_limit_applied_after_fusion_rank_then_limit() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -722,6 +728,7 @@ fn test_ac14_cochange_only_result_carries_fused_rrf_score() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -1031,6 +1038,7 @@ fn test_ac2_gibberish_query_returns_zero_results_compound_path() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
@@ -1103,6 +1111,7 @@ fn test_ac2_verify_gate_drops_compound_lexical_hit_without_literal() {
             composite_weights: None,
             phrase: false,
             near: None,
+            lang: None,
         };
         // First run with no ast_scored builds the index (cold start).
         let _ = execute_query(&build_config, &TEST_ANALYTICS).unwrap();
@@ -1125,6 +1134,7 @@ fn test_ac2_verify_gate_drops_compound_lexical_hit_without_literal() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
@@ -1188,6 +1198,7 @@ fn test_ac2_gibberish_query_no_lexical_hits_blast_radius() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
@@ -1271,6 +1282,7 @@ fn test_ac2_short_query_fallback_blast_radius_exercises_verify_gate() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
@@ -1632,6 +1644,7 @@ fn test_ac11b_end_to_end_pagination_disjoint_pages() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
     let page0 = execute_query(&config_p0, &TEST_ANALYTICS).unwrap();
 
@@ -1648,6 +1661,7 @@ fn test_ac11b_end_to_end_pagination_disjoint_pages() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
     let page1 = execute_query(&config_p1, &TEST_ANALYTICS).unwrap();
 
@@ -1813,6 +1827,7 @@ fn test_ac13_single_token_bypasses_k_pool_multi_word_uses_it() {
             composite_weights: None,
             phrase: false,
             near: None,
+            lang: None,
         },
         &TEST_ANALYTICS,
     )
@@ -1830,6 +1845,7 @@ fn test_ac13_single_token_bypasses_k_pool_multi_word_uses_it() {
             composite_weights: None,
             phrase: false,
             near: None,
+            lang: None,
         },
         &TEST_ANALYTICS,
     )
@@ -1882,6 +1898,7 @@ fn test_ac13_single_token_bypasses_k_pool_multi_word_uses_it() {
             composite_weights: None,
             phrase: false,
             near: None,
+            lang: None,
         },
         &TEST_ANALYTICS,
     )
@@ -1971,6 +1988,7 @@ fn test_ac15a_short_query_fallback_5000_files_recall() {
             composite_weights: None,
             phrase: false,
             near: None,
+            lang: None,
         };
         let _ = execute_query(&build_config, &TEST_ANALYTICS).unwrap();
     }
@@ -1989,6 +2007,7 @@ fn test_ac15a_short_query_fallback_5000_files_recall() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let output = execute_query(&query_config, &TEST_ANALYTICS).unwrap();
@@ -2063,6 +2082,7 @@ fn test_ac15a_short_query_fallback_5000_files_sla() {
                 composite_weights: None,
                 phrase: false,
                 near: None,
+                lang: None,
             },
             &TEST_ANALYTICS,
         )
@@ -2081,6 +2101,7 @@ fn test_ac15a_short_query_fallback_5000_files_sla() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let t_start = Instant::now();
