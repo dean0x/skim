@@ -2626,14 +2626,18 @@ fn ac3_query_results_identical_cold_vs_fast() {
 // index-building tests for `search_positional` (AC-P2-1..4) belong to D2-C
 // and are intentionally NOT duplicated here.
 
+/// AD-393-2: count_phrase_alignments takes offsets to support gap-aware
+/// alignment (short words dropped from the positioned set leave their ordinal
+/// gap in the offset deltas). For plain adjacent words offsets = [0, 1, ...].
 #[test]
 fn count_phrase_alignments_adjacent_ordered_matches() {
-    assert_eq!(count_phrase_alignments(&[vec![5], vec![6]]), 1);
+    assert_eq!(count_phrase_alignments(&[vec![5], vec![6]], &[0, 1]), 1);
 }
 
 #[test]
 fn count_phrase_alignments_gap_not_contiguous() {
-    assert_eq!(count_phrase_alignments(&[vec![5], vec![7]]), 0);
+    // offsets [0,1]: expect d[1] at base+1=6, but doc has 7 → no match.
+    assert_eq!(count_phrase_alignments(&[vec![5], vec![7]], &[0, 1]), 0);
 }
 
 /// AC-P2-2 falsifiable case: reversed order (word 1 appears BEFORE word 0 in
@@ -2641,7 +2645,7 @@ fn count_phrase_alignments_gap_not_contiguous() {
 #[test]
 fn count_phrase_alignments_reversed_order_does_not_match() {
     assert_eq!(
-        count_phrase_alignments(&[vec![6], vec![5]]),
+        count_phrase_alignments(&[vec![6], vec![5]], &[0, 1]),
         0,
         "AC-P2-2: reversed word order must not count as a phrase alignment"
     );
@@ -2649,12 +2653,36 @@ fn count_phrase_alignments_reversed_order_does_not_match() {
 
 #[test]
 fn count_phrase_alignments_counts_multiple_occurrences() {
-    assert_eq!(count_phrase_alignments(&[vec![5, 10], vec![6, 11]]), 2);
+    assert_eq!(
+        count_phrase_alignments(&[vec![5, 10], vec![6, 11]], &[0, 1]),
+        2
+    );
 }
 
 #[test]
 fn count_phrase_alignments_absent_word_returns_zero() {
-    assert_eq!(count_phrase_alignments(&[vec![5], vec![]]), 0);
+    assert_eq!(count_phrase_alignments(&[vec![5], vec![]], &[0, 1]), 0);
+}
+
+/// AD-393-2: gap-aware alignment — when a short word is dropped from the
+/// positioned set, the ordinal gap is preserved in the offsets vector.
+/// E.g. `"human the loop"` with `"the"` short → positioned = [human(0), loop(2)],
+/// offsets = [0, 2]. Doc positions: human=5, loop=7 → 5+2=7 ✓ → 1 alignment.
+/// With contiguous offsets [0,1]: 5+1=6 ≠ 7 → 0 alignments (fails without fix).
+#[test]
+fn count_phrase_alignments_gap_aware_short_word_dropped() {
+    // offset delta = 2 (one short word sits at ordinal 1, skipped from positioned).
+    assert_eq!(
+        count_phrase_alignments(&[vec![5], vec![7]], &[0, 2]),
+        1,
+        "AD-393-2: gap of 2 ordinals (one dropped short word) must produce 1 alignment"
+    );
+    // Sanity: contiguous offsets [0,1] must NOT match the same positions.
+    assert_eq!(
+        count_phrase_alignments(&[vec![5], vec![7]], &[0, 1]),
+        0,
+        "AD-393-2: offsets [0,1] must not match positions 5,7 (gap=2)"
+    );
 }
 
 #[test]

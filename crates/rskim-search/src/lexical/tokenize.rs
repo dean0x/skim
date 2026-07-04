@@ -4,13 +4,30 @@
 //! belongs to, so the indexer can attach a token ordinal to each posting
 //! (v5, #392 / #380 Phase 2).
 
+/// Single source of truth for the word-byte definition used throughout the search stack.
+///
+/// Returns `true` for ASCII alphanumeric characters and `_`; `false` for everything
+/// else (punctuation, whitespace, and any non-ASCII byte).  Non-ASCII bytes are
+/// treated as separators — a v1 tradeoff that under-tokenizes multi-byte text but
+/// is byte-consistent and cannot panic.
+///
+/// **Invariant (D10 / AD-393-3):** every tokenizer in the search stack —
+/// `word_token_indices` (indexer/reader), `collect_word_spans` (CLI predicate),
+/// and `extract_query_positional_tokens` (n-gram query builder) — MUST use this
+/// single function as its word-boundary test.  Sharing one definition makes a
+/// future rule change (e.g. adding `$` or Unicode word chars) automatically
+/// propagate to all sites, preventing the silent-empty / false-positive divergence
+/// class that #393 was introduced to fix.
+#[inline]
+pub(crate) fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 /// Map every byte of `source` to the ordinal of the word-token it belongs to.
 ///
-/// A "word byte" is ASCII `[A-Za-z0-9_]`; each maximal run of word bytes is one
-/// token. Separator (non-word) bytes inherit the ordinal of the preceding word
-/// (0 before the first word). Non-ASCII bytes are treated as separators — a v1
-/// tradeoff that under-tokenizes multi-byte text but is byte-consistent and
-/// cannot panic.
+/// A "word byte" is `is_word_byte(b)` (ASCII `[A-Za-z0-9_]`); each maximal run
+/// of word bytes is one token.  Separator (non-word) bytes inherit the ordinal
+/// of the preceding word (0 before the first word).
 ///
 /// # Invariants
 /// - `out.len() == source.len()`
@@ -25,7 +42,7 @@ pub(crate) fn word_token_indices(source: &str) -> Vec<u32> {
     let mut in_word = false;
     let mut seen_word = false;
     for &b in bytes {
-        let is_word = b.is_ascii_alphanumeric() || b == b'_';
+        let is_word = is_word_byte(b);
         if is_word {
             if !in_word {
                 // Entering a new word run. The first word is token 0; every

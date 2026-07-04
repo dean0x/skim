@@ -151,6 +151,17 @@ pub(crate) fn run(
             ) {
                 eprintln!("{notice}");
             }
+            // PF-006: --lang is only honored when a text query is present (the lexical
+            // reader applies lang_filter at query time). On the standalone --ast path
+            // there is no text query, so --lang is inert — emit a notice rather than
+            // silently ignoring it. Use --ast with a text query to combine both filters.
+            if flags.lang.is_some() {
+                eprintln!(
+                    "skim search: note: --lang has no effect on standalone --ast queries \
+                     (no text term); to filter by language, add a text query: \
+                     `skim search TERM --ast PATTERN --lang LANG`."
+                );
+            }
             let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
             std::fs::create_dir_all(&cache_dir)?;
             // ADR-006: refresh BOTH indexes before opening either engine.
@@ -221,6 +232,17 @@ pub(crate) fn run(
                 flags.blast_radius.is_some(),
             ) {
                 eprintln!("{notice}");
+            }
+            // PF-006: --lang is only honored on text-query paths (lexical reader
+            // applies lang_filter at query time). Standalone temporal queries
+            // (--hot/--cold/--risky/--blast-radius with no text) have no lexical
+            // layer, so --lang is inert — emit a notice rather than silently ignoring it.
+            if flags.lang.is_some() {
+                eprintln!(
+                    "skim search: note: --lang has no effect on standalone temporal queries \
+                     (no text term); to filter by language, add a text query: \
+                     `skim search TERM --hot --lang LANG`."
+                );
             }
             run_temporal_standalone(
                 flags.limit,
@@ -298,6 +320,11 @@ struct Flags {
     phrase: bool,
     /// v5 positional search: max word-token distance for `--near N` (unordered).
     near: Option<u32>,
+    /// Language filter from `--lang <name>` (e.g. `--lang rust`, `--lang py`).
+    ///
+    /// Accepts both language names (`rust`, `python`, `typescript`) and file
+    /// extensions (`rs`, `py`, `ts`).  `None` means no language restriction.
+    lang: Option<rskim_core::Language>,
 }
 
 /// Parse and validate a `--limit` value string.
@@ -329,10 +356,64 @@ fn parse_offset_value(raw: &str) -> anyhow::Result<usize> {
     })
 }
 
-/// Parse and validate a `--near` value string as a non-negative word-token distance.
+/// Parse and validate a `--near` value string as a positive word-token distance.
+///
+/// AD-393-9: `--near 0` is rejected with an actionable error because a span of
+/// zero word-tokens is only satisfied by a single-word query (trivially true) or
+/// an exact-adjacent match with no gap — both cases are better expressed as
+/// `--phrase` (exact adjacent) or a bare term search.  Zero is structurally
+/// allowed by the `u32` type but semantically meaningless for proximity search,
+/// so we reject it early with a clear message rather than silently producing
+/// unexpected results.
 fn parse_near_value(raw: &str) -> anyhow::Result<u32> {
-    raw.parse::<u32>()
-        .map_err(|_| anyhow::anyhow!("--near value must be a non-negative integer, got {raw:?}"))
+    let n = raw
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("--near value must be a positive integer, got {raw:?}"))?;
+    if n == 0 {
+        anyhow::bail!(
+            "--near span must be > 0 for multiple words; \
+             use --phrase for exact adjacent matching"
+        );
+    }
+    Ok(n)
+}
+
+/// Parse a `--lang` value into a [`rskim_core::Language`].
+///
+/// Accepts both file extensions (`rs`, `py`, `ts`) and language display names
+/// (`rust`, `python`, `typescript`); case-insensitive.  Returns an actionable
+/// error listing accepted values when the input is unrecognised.
+fn parse_lang_value(raw: &str) -> anyhow::Result<rskim_core::Language> {
+    use rskim_core::Language;
+    // Normalize to lowercase once so both the extension lookup and the name
+    // match arm are case-insensitive.  Without this `--lang RS` (uppercase
+    // extension) was rejected while `--lang rs` succeeded — an inconsistency
+    // that surprised users.  Language::from_extension is case-sensitive, so
+    // we must lower before calling it.
+    let raw_lower = raw.to_ascii_lowercase();
+    // Try file extension first so callers can pass "rs", "py", etc.
+    if let Some(lang) = Language::from_extension(&raw_lower) {
+        return Ok(lang);
+    }
+    // Names that from_extension does not handle (no matching file extension).
+    // Everything else ("go", "java", "c", "cpp", "sql", "swift", "json", "yaml",
+    // "toml", "markdown") is already returned above via from_extension.
+    match raw_lower.as_str() {
+        "rust" => Ok(Language::Rust),
+        "python" => Ok(Language::Python),
+        "typescript" => Ok(Language::TypeScript),
+        "javascript" => Ok(Language::JavaScript),
+        "c++" => Ok(Language::Cpp),
+        "csharp" | "c#" => Ok(Language::CSharp),
+        "ruby" => Ok(Language::Ruby),
+        "kotlin" => Ok(Language::Kotlin),
+        _ => Err(anyhow::anyhow!(
+            "--lang: unknown language {:?}; accepted names: rust, python, typescript, \
+             javascript, go, java, markdown, c, cpp, csharp, ruby, sql, kotlin, swift, \
+             json, yaml, toml — or file extensions: rs, py, ts, js, md, c, cpp, cs, rb, kt",
+            raw
+        )),
+    }
 }
 
 /// Parse a temporal flag arm (`--hot`, `--cold`, `--risky`, `--blast-radius`).
@@ -452,6 +533,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut weights: Option<rskim_search::CompositeWeights6> = None;
     let mut phrase = false;
     let mut near: Option<u32> = None;
+    let mut lang: Option<rskim_core::Language> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -534,12 +616,22 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                     i += 1;
                 }
             }
+            s if s == "--lang" || s.starts_with("--lang=") => {
+                // Language filter: restrict results to files of a given language.
+                // Accepts display names ("rust", "python") and extensions ("rs", "py").
+                // D17 / AC16: honored on all search paths (positional + fallback + lexical).
+                let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--lang")?;
+                lang = Some(parse_lang_value(&raw)?);
+                if consumed {
+                    i += 1;
+                }
+            }
             s if s.starts_with("--") => {
                 anyhow::bail!(
                     "unrecognised flag {:?}. Valid flags: --build, --rebuild, --update, \
                      --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --offset, \
                      --root, --ast, --hot, --cold, --risky, --blast-radius, --weights, \
-                     --phrase, --near",
+                     --phrase, --near, --lang",
                     s
                 );
             }
@@ -563,6 +655,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
         weights,
         phrase,
         near,
+        lang,
     })
 }
 
@@ -948,6 +1041,7 @@ fn run_query(
         composite_weights: flags.weights,
         phrase: flags.phrase,
         near: flags.near,
+        lang: flags.lang,
     };
 
     // Pass the already-refreshed manifest to execute_query_with_manifest.  When

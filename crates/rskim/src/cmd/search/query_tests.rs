@@ -89,6 +89,7 @@ fn make_config(root: &std::path::Path, cache_dir: &std::path::Path, text: &str) 
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     }
 }
 
@@ -432,6 +433,7 @@ fn test_execute_query_blast_radius_includes_only_allowed_paths() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -479,6 +481,7 @@ fn test_execute_query_blast_radius_target_file_is_included() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -534,6 +537,7 @@ fn test_ac12_union_includes_cochange_only_file_absent_from_lexical() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -601,6 +605,7 @@ fn test_ac13_union_no_duplicate_file_ids_and_correct_cardinality() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -675,6 +680,7 @@ fn test_ac13_limit_applied_after_fusion_rank_then_limit() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -722,6 +728,7 @@ fn test_ac14_cochange_only_result_carries_fused_rrf_score() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -753,6 +760,80 @@ fn test_ac14_cochange_only_result_carries_fused_rrf_score() {
     }
     // Note: if src/lib.rs is not in results, AC12 would have caught it first.
     // This test is complementary to AC12 and focuses on the score field contract.
+}
+
+// ============================================================================
+// AD-393-12: positional co-change-only peer gate
+//
+// In positional mode (phrase: true or near: Some(_)), co-change-only files
+// (those present in blast_radius_paths but absent from the lexical result set)
+// MUST be dropped unconditionally.  Any file that truly contains the phrase is
+// reachable via the lexical path; the co-change-only path adds no recall in
+// positional mode and risks including wrong-language peers (D17/AC16 violation).
+//
+// This test injects blast_radius_paths containing a co-change-only file (lib.rs,
+// which does NOT contain the query phrase) and asserts it is EXCLUDED.  The
+// lexically-matching file (auth.rs, which DOES contain the phrase) must appear.
+// ============================================================================
+
+#[test]
+fn test_positional_cochange_only_peer_is_dropped() {
+    use std::collections::HashSet;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // auth.rs: contains "zqjxblip_check" as an exact word token.
+    // lib.rs: does NOT contain "zqjxblip_check" — pure co-change-only partner.
+    create_union_test_project(&root);
+
+    let mut allowed: HashSet<String> = HashSet::new();
+    allowed.insert("src/auth.rs".to_string()); // lexical hit + phrase match
+    allowed.insert("src/lib.rs".to_string()); // co-change-only: does NOT contain phrase
+
+    let config = QueryConfig {
+        text: "zqjxblip_check".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+        // Positional mode: the `else if positional { return None; }` gate activates.
+        phrase: true,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
+
+    // AD-393-12 POSITIVE: auth.rs has a lexical hit AND passes phrase
+    // verification (word token "zqjxblip_check" present) → must appear.
+    let has_auth = output.results.iter().any(|r| r.path == "src/auth.rs");
+    assert!(
+        has_auth,
+        "AD-393-12: positional lexical-hit file (src/auth.rs) must appear in results; \
+         got {:?}",
+        paths
+    );
+
+    // AD-393-12 NEGATIVE (discriminating): lib.rs is co-change-only in positional
+    // mode and must be DROPPED by the `else if positional { return None; }` gate.
+    // Under the old "read-and-verify" implementation, lib.rs would be included if
+    // it happened to contain the phrase; under the new unconditional-drop it is
+    // always excluded, preventing the --lang bypass class of false positives.
+    let has_lib = output.results.iter().any(|r| r.path == "src/lib.rs");
+    assert!(
+        !has_lib,
+        "AD-393-12: co-change-only file (src/lib.rs) MUST be dropped in positional mode; \
+         got {:?}",
+        paths
+    );
 }
 
 // ============================================================================
@@ -1031,6 +1112,7 @@ fn test_ac2_gibberish_query_returns_zero_results_compound_path() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
@@ -1103,6 +1185,7 @@ fn test_ac2_verify_gate_drops_compound_lexical_hit_without_literal() {
             composite_weights: None,
             phrase: false,
             near: None,
+            lang: None,
         };
         // First run with no ast_scored builds the index (cold start).
         let _ = execute_query(&build_config, &TEST_ANALYTICS).unwrap();
@@ -1125,6 +1208,7 @@ fn test_ac2_verify_gate_drops_compound_lexical_hit_without_literal() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
@@ -1188,6 +1272,7 @@ fn test_ac2_gibberish_query_no_lexical_hits_blast_radius() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
@@ -1271,6 +1356,7 @@ fn test_ac2_short_query_fallback_blast_radius_exercises_verify_gate() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
@@ -1632,6 +1718,7 @@ fn test_ac11b_end_to_end_pagination_disjoint_pages() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
     let page0 = execute_query(&config_p0, &TEST_ANALYTICS).unwrap();
 
@@ -1648,6 +1735,7 @@ fn test_ac11b_end_to_end_pagination_disjoint_pages() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
     let page1 = execute_query(&config_p1, &TEST_ANALYTICS).unwrap();
 
@@ -1813,6 +1901,7 @@ fn test_ac13_single_token_bypasses_k_pool_multi_word_uses_it() {
             composite_weights: None,
             phrase: false,
             near: None,
+            lang: None,
         },
         &TEST_ANALYTICS,
     )
@@ -1830,6 +1919,7 @@ fn test_ac13_single_token_bypasses_k_pool_multi_word_uses_it() {
             composite_weights: None,
             phrase: false,
             near: None,
+            lang: None,
         },
         &TEST_ANALYTICS,
     )
@@ -1882,6 +1972,7 @@ fn test_ac13_single_token_bypasses_k_pool_multi_word_uses_it() {
             composite_weights: None,
             phrase: false,
             near: None,
+            lang: None,
         },
         &TEST_ANALYTICS,
     )
@@ -1971,6 +2062,7 @@ fn test_ac15a_short_query_fallback_5000_files_recall() {
             composite_weights: None,
             phrase: false,
             near: None,
+            lang: None,
         };
         let _ = execute_query(&build_config, &TEST_ANALYTICS).unwrap();
     }
@@ -1989,6 +2081,7 @@ fn test_ac15a_short_query_fallback_5000_files_recall() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let output = execute_query(&query_config, &TEST_ANALYTICS).unwrap();
@@ -2063,6 +2156,7 @@ fn test_ac15a_short_query_fallback_5000_files_sla() {
                 composite_weights: None,
                 phrase: false,
                 near: None,
+                lang: None,
             },
             &TEST_ANALYTICS,
         )
@@ -2081,6 +2175,7 @@ fn test_ac15a_short_query_fallback_5000_files_sla() {
         composite_weights: None,
         phrase: false,
         near: None,
+        lang: None,
     };
 
     let t_start = Instant::now();

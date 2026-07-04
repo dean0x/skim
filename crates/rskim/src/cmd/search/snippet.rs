@@ -32,6 +32,29 @@ const MAX_SNIPPET_FILE_BYTES: u64 = 5 * 1024 * 1024;
 /// body.
 const MAX_VERIFY_SCAN_BYTES: usize = 5 * 1024 * 1024;
 
+/// How to verify a candidate file (AD-393-5).
+///
+/// The reader is a recall-oriented candidate generator; the CLI predicate is the
+/// correctness authority (AD-393-1). `VerifyMode` threads the correct predicate
+/// through the single file-read in `extract_snippet_and_verify` so no second I/O
+/// is needed.
+///
+/// - `Substring`: the pre-#393 default — any whitespace-delimited token must
+///   appear as a substring of the file content.
+/// - `Phrase`: all query words must appear in exact contiguous order as word-tokens
+///   (uses `rskim_search::phrase_tokens_present`).
+/// - `Near(n)`: all query words must appear within `n` word-token positions of each
+///   other, in any order (uses `rskim_search::near_tokens_present`).
+#[derive(Debug, Clone, Copy)]
+pub(super) enum VerifyMode {
+    /// Substring (trigram-intersection) verification — default pre-#393 mode.
+    Substring,
+    /// Exact phrase: words in contiguous order, no gaps (AD-393-3).
+    Phrase,
+    /// Proximity: all words within `n` word-token positions (AD-393-4).
+    Near(u32),
+}
+
 /// Outcome of attempting to extract a snippet.
 #[derive(Debug)]
 pub(super) enum SnippetOutcome {
@@ -139,8 +162,14 @@ pub(super) fn extract_snippet(
     // `query_substring_present("", _) == false`, but since this fn ignores the
     // verified flag, that has no effect.  Single shared read/stat/decode path
     // (AD-355-1: no second I/O, no copy-paste of the pipeline).
-    let (outcome, _verified) =
-        extract_snippet_and_verify(root, rel_path, match_positions, manifest_entry, "");
+    let (outcome, _verified) = extract_snippet_and_verify(
+        root,
+        rel_path,
+        match_positions,
+        manifest_entry,
+        "",
+        VerifyMode::Substring,
+    );
     outcome
 }
 
@@ -184,34 +213,40 @@ pub(super) fn query_substring_present(content: &str, query: &str) -> bool {
 /// file content — reading the file exactly once (no second I/O).
 ///
 /// Returns the normal [`SnippetOutcome`] PLUS a boolean:
-/// - `true`  — the file content passes `query_substring_present(text, query)`.
-/// - `false` — the file was not read (Stale / Unavailable) or the query is
-///   absent.  The caller should drop this candidate from the verified
-///   result set.
+/// - `true`  — the file content passes the predicate selected by `verify_mode`.
+/// - `false` — the file was not read (Stale / Unavailable) or the predicate
+///   failed.  The caller should drop this candidate from the verified result set.
 ///
-/// # Design (AD-355-1)
+/// # Design (AD-355-1 / AD-393-5)
 ///
 /// Verification is co-located with snippet extraction so the file bytes are
-/// read only once.  The `query_substring_present` fn is the pure predicate; this
-/// wrapper applies it at the single on-disk-read call site.
+/// read only once. `verify_mode` selects the correctness predicate:
+/// - `Substring` → `query_substring_present` (pre-#393 default)
+/// - `Phrase`    → `rskim_search::phrase_tokens_present` (exact ordered tokens)
+/// - `Near(n)`   → `rskim_search::near_tokens_present` (within n word-token positions)
+///
+/// In Phrase/Near mode, if the predicate returns `Some(range)`, the snippet
+/// is re-anchored to the first byte of `range` instead of `match_positions[0].start`
+/// (AD-393-6: trigram-containment positions are approximate; predicate-returned
+/// range is exact).
 pub(super) fn extract_snippet_and_verify(
     root: &Path,
     rel_path: &str,
     match_positions: &[Range<usize>],
     manifest_entry: Option<&ManifestEntry>,
     query: &str,
+    verify_mode: VerifyMode,
 ) -> (SnippetOutcome, bool) {
     // AD-355-7: empty match_positions is valid for short-query fallback candidates
     // (1–2 byte queries that cannot produce trigrams).  In that case the ngram
     // reader returns all indexed files with empty positions; we still need to read
-    // the file and run query_substring_present to decide whether to keep the result.
+    // the file and run the predicate to decide whether to keep the result.
     // We skip the early-return here and fall through to the I/O+verify path.
     // For the normal (ngram-scored) path, positions are non-empty and the snippet
     // extraction below will succeed as before.
     //
-    // When positions ARE empty we return SnippetOutcome::Unavailable (no context
-    // window can be computed without a position), but verified may be true or false
-    // depending on whether the file contains the literal query string.
+    // D13 (AD-393-1): the same applies for Phrase/Near with all-short words
+    // (search_positional short_query_fallback also emits empty positions).
 
     let abs_path = root.join(rel_path);
 
@@ -240,12 +275,12 @@ pub(super) fn extract_snippet_and_verify(
     // (AD-355-4: large-file verify path, verified in #355 cycle-2).
     //
     // For large files we do a bounded verification read: read at most
-    // MAX_VERIFY_SCAN_BYTES of the file and run query_substring_present on that
-    // prefix.  This preserves pre-#355 behaviour (large files were returned
-    // snippet-less; verification is new but correct) while keeping the I/O
-    // cost bounded.  A query match that spans byte offset >MAX_VERIFY_SCAN_BYTES
-    // will produce a false negative (file dropped from results) — that is the
-    // accepted trade-off for files well beyond the size limit.
+    // MAX_VERIFY_SCAN_BYTES of the file and run the predicate on that prefix.
+    // This preserves pre-#355 behaviour (large files were returned snippet-less;
+    // verification is new but correct) while keeping the I/O cost bounded.  A
+    // query match that spans byte offset >MAX_VERIFY_SCAN_BYTES will produce a
+    // false negative (file dropped from results) — accepted trade-off documented
+    // here (AD-393-10: same bounded-scan applies to Phrase/Near predicates).
     let file_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     if file_size > MAX_SNIPPET_FILE_BYTES {
         // Bounded verification read for large files.
@@ -269,9 +304,10 @@ pub(super) fn extract_snippet_and_verify(
             .ok()
             .and_then(|f| f.take(needed as u64).read_to_end(&mut buf).ok())
             .is_some();
+        // AD-393-10: dispatch the correct predicate for large-file bounded scan.
         let verified = if ok {
             std::str::from_utf8(&buf)
-                .map(|text| query_substring_present(text, query))
+                .map(|text| run_verify_predicate(text, query, &verify_mode))
                 .unwrap_or(false)
         } else {
             false
@@ -280,7 +316,7 @@ pub(super) fn extract_snippet_and_verify(
     }
 
     // Read file content — single I/O operation shared by snippet extraction
-    // and substring verification (AD-355-1: no second file read).
+    // and verification (AD-355-1: no second file read).
     let content = match std::fs::read(&abs_path) {
         Ok(c) => c,
         Err(_) => return (SnippetOutcome::Unavailable, false),
@@ -290,19 +326,41 @@ pub(super) fn extract_snippet_and_verify(
         Err(_) => return (SnippetOutcome::Unavailable, false),
     };
 
-    // Substring verification — pure, no I/O (AD-355-1 / AD-355-3).
-    let verified = query_substring_present(text, query);
+    // AD-393-5: Dispatch the correct predicate and capture the anchor range
+    // for Phrase/Near re-anchoring (AD-393-6).
+    let (verified, anchor_range): (bool, Option<Range<usize>>) =
+        run_verify_predicate_with_range(text, query, &verify_mode);
 
-    // AD-355-7: short-query fallback candidates arrive with no positions.  We
-    // cannot compute a meaningful snippet without a byte offset, so return
-    // Unavailable (snippet will be None in the result).  The `verified` flag
-    // still controls whether the candidate survives the relevance gate.
-    if match_positions.is_empty() {
+    // AD-355-7 / D13: short-query fallback candidates (and all-short Phrase/Near
+    // fallback) arrive with empty positions. Cannot compute a meaningful snippet
+    // without a byte offset; return Unavailable. `verified` still gates inclusion.
+    if match_positions.is_empty() && anchor_range.is_none() {
         return (SnippetOutcome::Unavailable, verified);
     }
 
-    let match_line = rskim_search::byte_offset_to_line(&content, match_positions[0].start) as u32;
-    let line_range = rskim_search::compute_line_range(&content, match_positions);
+    // AD-393-6: In Phrase/Near mode, re-anchor the snippet from the predicate's
+    // returned exact occurrence range, not the approximate trigram-containment
+    // `match_positions[0].start`. For Substring mode (anchor_range=None) or when
+    // positions are available, fall back to match_positions[0].start.
+    let anchor_start = anchor_range
+        .as_ref()
+        .map(|r| r.start)
+        .or_else(|| match_positions.first().map(|r| r.start));
+
+    let Some(anchor_start) = anchor_start else {
+        // Neither predicate range nor match_positions — can't place a snippet.
+        return (SnippetOutcome::Unavailable, verified);
+    };
+
+    let match_line = rskim_search::byte_offset_to_line(&content, anchor_start) as u32;
+
+    let line_range = if let Some(ref ar) = anchor_range {
+        // AD-393-6: compute line_range from the exact predicate occurrence range.
+        rskim_search::compute_line_range(&content, std::slice::from_ref(ar))
+    } else {
+        rskim_search::compute_line_range(&content, match_positions)
+    };
+
     let ctx_lines = extract_context_window(text, match_line, DEFAULT_CONTEXT);
 
     if ctx_lines.is_empty() {
@@ -317,6 +375,39 @@ pub(super) fn extract_snippet_and_verify(
         },
         verified,
     )
+}
+
+// ============================================================================
+// Internal predicate helpers (AD-393-5)
+// ============================================================================
+
+/// Run the verify predicate for `mode` and return a `bool`. Used by the
+/// large-file bounded-scan path where re-anchoring is not needed (no snippet).
+fn run_verify_predicate(text: &str, query: &str, mode: &VerifyMode) -> bool {
+    run_verify_predicate_with_range(text, query, mode).0
+}
+
+/// Run the verify predicate and return `(verified, anchor_range)`.
+///
+/// For `Phrase` / `Near`, the anchor range is the exact byte span of the match
+/// returned by the predicate — used to re-anchor the snippet (AD-393-6).
+/// For `Substring` the range is always `None` (no position information available).
+fn run_verify_predicate_with_range(
+    text: &str,
+    query: &str,
+    mode: &VerifyMode,
+) -> (bool, Option<Range<usize>>) {
+    match mode {
+        VerifyMode::Substring => (query_substring_present(text, query), None),
+        VerifyMode::Phrase => {
+            let opt = rskim_search::phrase_tokens_present(text, query);
+            (opt.is_some(), opt)
+        }
+        VerifyMode::Near(n) => {
+            let opt = rskim_search::near_tokens_present(text, query, *n);
+            (opt.is_some(), opt)
+        }
+    }
 }
 
 // ============================================================================

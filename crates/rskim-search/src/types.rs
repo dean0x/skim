@@ -671,6 +671,257 @@ pub fn query_substring_present(content: &str, query: &str) -> bool {
 }
 
 // ============================================================================
+// Token-exact positional predicates (#393)
+// ============================================================================
+
+/// Collect the byte spans (start..end, exclusive end) of each maximal ASCII
+/// word run (`[A-Za-z0-9_]+`) in `s`.
+///
+/// # AD-393-3 / AD-393-4 (D10): Query tokenization parity
+///
+/// Uses `crate::lexical::is_word_byte` — the single shared word-boundary
+/// predicate — so that this function, `word_token_indices` (indexer/reader),
+/// and `extract_query_positional_tokens` (n-gram builder) all tokenize
+/// identically.  A change to any one site will automatically propagate to the
+/// others, preventing the silent-empty / false-positive divergence class that
+/// #393 was introduced to fix.
+///
+/// Punctuation and non-ASCII bytes are separators — `foo::bar` yields
+/// `[foo, bar]` exactly as the indexer does.
+///
+/// Returns an empty `Vec` for empty or whitespace-only input.
+fn collect_word_spans(s: &str) -> Vec<(usize, usize)> {
+    let bytes = s.as_bytes();
+    // Pre-size with a fraction of the byte length to avoid growth-from-zero on the
+    // hot verify path (AC15: up to MAX_VERIFY_SCAN_BYTES content per candidate).
+    // Mirrors the `word_token_indices` indexer which uses `with_capacity(bytes.len())`.
+    // A fraction of 8 assumes ~8-byte average token+separator width (reliability rule:
+    // prefer pre-sized collections).
+    let mut spans = Vec::with_capacity(bytes.len() / 8 + 1);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if crate::lexical::is_word_byte(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && crate::lexical::is_word_byte(bytes[i]) {
+                i += 1;
+            }
+            spans.push((start, i));
+        } else {
+            i += 1;
+        }
+    }
+    spans
+}
+
+/// AD-393-3: Token-exact phrase predicate. Tokenizes doc content with the SAME
+/// `word_token_indices` semantics as the indexer (see `collect_word_spans`) and
+/// requires each doc token to EQUAL the query word at consecutive ordinals —
+/// killing the trigram-containment/superstring false positive
+/// (`encode` ≠ `encode_length`).
+///
+/// Returns the byte-range of the first verified occurrence (from the first matched
+/// token's start byte to the last matched token's end byte) for snippet re-anchor
+/// in [`crate::cmd::search::snippet`]; `None` when the phrase is absent.
+///
+/// # Semantics
+///
+/// - **Case-sensitive byte-exact**: consistent with `query_substring_present`
+///   (AD-355-3).
+/// - **Query tokenization via `collect_word_spans`** (D10): punctuation and
+///   non-ASCII bytes are separators in both content and query, so
+///   `--phrase 'foo bar'` and `--phrase 'foo::bar'` yield identical results
+///   against content `foo::bar()`.
+/// - **Consecutive ordinals required**: content token at ordinal K must equal
+///   query word 0, content token K+1 must equal query word 1, etc.  Non-word
+///   bytes between tokens (parentheses, colons, spaces) do not break a phrase.
+/// - **Empty / whitespace-only query**: returns `None` (defense-in-depth).
+///
+/// This function is pure (no I/O, no side effects). It is the single correctness
+/// authority for `--phrase` at the CLI gate.
+#[must_use]
+pub fn phrase_tokens_present(content: &str, query: &str) -> Option<Range<usize>> {
+    let q_words = collect_word_spans(query);
+    if q_words.is_empty() {
+        return None; // empty/whitespace-only query
+    }
+    let c_words = collect_word_spans(content);
+    let k = q_words.len();
+    if c_words.len() < k {
+        return None; // content has fewer words than query
+    }
+
+    // For each starting position i in the content word list, check whether the
+    // next k content words are byte-equal to the k query words (in order).
+    // Content words at positions i, i+1, …, i+k-1 have consecutive token
+    // ordinals (0-indexed), so consecutive ordinal alignment is implicit.
+    for i in 0..=(c_words.len() - k) {
+        let mut ok = true;
+        for j in 0..k {
+            let (cs, ce) = c_words[i + j];
+            let (qs, qe) = q_words[j];
+            if content[cs..ce] != query[qs..qe] {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            let byte_start = c_words[i].0;
+            let byte_end = c_words[i + k - 1].1;
+            return Some(byte_start..byte_end);
+        }
+    }
+    None
+}
+
+/// AD-393-4: Token-exact proximity predicate. Requires an assignment of one
+/// **exact** (byte-equal, case-sensitive) doc token per query word with ordinal
+/// span `(max − min) ≤ n`, matching `near_match`'s span definition.
+///
+/// Returns the anchor byte-range (leftmost to rightmost matched token) of the
+/// first valid window (full leftmost-to-rightmost span, ≤ n tokens apart),
+/// or `None` when no such assignment exists.
+///
+/// Note: the returned span covers the full distance from the leftmost to the
+/// rightmost matched token in the window (not the minimal possible sub-span).
+/// For example, `near_tokens_present("a a b", "a b", 2)` returns the range
+/// covering the full `a a b` span (the window whose right-end qualified first),
+/// not the minimal `a b` sub-span. This is intentional — the span drives snippet
+/// re-anchoring (AD-393-6), where the wider window is more useful.
+///
+/// # Semantics
+///
+/// - **Query tokenization via `collect_word_spans`** (D10): same as reader.
+/// - **Distinct doc-token positions** (D11): duplicate query words (e.g.
+///   `--near 3 'foo foo'`) require two DISTINCT content token ordinals. If the
+///   content has only one occurrence of `foo`, `near_tokens_present` returns
+///   `None`. Enforced by counting how many times each query word appears in the
+///   current window and requiring `window_count(w) ≥ query_count(w)` for all `w`.
+/// - **Unordered**: unlike `phrase_tokens_present`, the matched tokens need not
+///   appear in query order — only within span `n`.
+/// - **Short words fully supported**: works for words < 3 bytes since no trigrams
+///   are involved — pure byte-equality over word runs.
+/// - **Empty / whitespace-only query**: returns `None`.
+///
+/// This function is pure (no I/O, no side effects). It is the single correctness
+/// authority for `--near` at the CLI gate.
+#[must_use]
+pub fn near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<usize>> {
+    let q_words = collect_word_spans(query);
+    if q_words.is_empty() {
+        return None; // empty/whitespace-only query
+    }
+    let c_words = collect_word_spans(content);
+    if c_words.is_empty() {
+        return None;
+    }
+
+    let n = n as usize;
+
+    use std::collections::HashMap;
+
+    // Build q_counts: for each unique query word, how many times it must appear
+    // in a valid window (handles D11 distinct-position rule for duplicates).
+    let mut q_counts: HashMap<&str, usize> = HashMap::new();
+    for &(qs, qe) in &q_words {
+        *q_counts.entry(&query[qs..qe]).or_insert(0) += 1;
+    }
+    let num_unique = q_counts.len();
+
+    // Single-pass early-out + relevant-word collection.
+    //
+    // Previous code walked c_words (num_unique + 1) times: once per unique query
+    // word for the early-out totals, then once more to build `relevant`.  We
+    // combine both goals in one O(content_words) pass:
+    //   • accumulate per-word occurrence totals while filtering relevant words
+    //   • apply the early-out check once after the pass (O(num_unique))
+    //
+    // This is most impactful on the all-short --near fallback path, where
+    // short_query_fallback makes every file a candidate and each is fully scanned.
+    let mut totals: HashMap<&str, usize> = HashMap::new();
+    // Pre-size to c_words.len() (upper bound — at most every content word is
+    // relevant). Avoids growth-from-zero on the all-short --near fallback path
+    // where every file in the corpus is a candidate (reliability rule: prefer
+    // pre-sized collections, AC15 hot-path guard).
+    let mut relevant = Vec::with_capacity(c_words.len());
+    for (ci, &(cs, ce)) in c_words.iter().enumerate() {
+        let cw = &content[cs..ce];
+        if q_counts.contains_key(cw) {
+            *totals.entry(cw).or_insert(0) += 1;
+            relevant.push((ci, cw));
+        }
+    }
+
+    // Early-out: if any query word doesn't appear enough times in content,
+    // no valid assignment is possible.
+    for (&qw, &qc) in &q_counts {
+        if totals.get(qw).copied().unwrap_or(0) < qc {
+            return None;
+        }
+    }
+
+    // Sliding window over relevant content words.
+    // win_counts[w] = how many times word w appears in the current window.
+    // `have` = number of unique query words where win_counts[w] >= q_counts[w].
+    let mut win_counts: HashMap<&str, usize> = HashMap::new();
+    let mut have = 0usize;
+    let mut left = 0usize;
+
+    for right in 0..relevant.len() {
+        let (right_ord, right_word) = relevant[right];
+        let prev = win_counts.get(right_word).copied().unwrap_or(0);
+        let need = q_counts[right_word];
+        *win_counts.entry(right_word).or_insert(0) += 1;
+        if prev + 1 == need {
+            have += 1; // this query word is now fully covered in the window
+        }
+
+        // Shrink window from the left while the ordinal span exceeds n.
+        // Ordinal span = content index of right element − content index of left element.
+        while left <= right {
+            let (left_ord, _) = relevant[left];
+            if right_ord - left_ord > n {
+                let (_, left_word) = relevant[left];
+                // left_word was inserted during the right-scan above (via
+                // `.entry().or_insert(0) += 1`). It must be present; `if let`
+                // is used here to satisfy `-D clippy::expect_used / unwrap_used`
+                // while documenting the always-Some invariant.
+                let lc = win_counts.get(left_word).copied().unwrap_or(0);
+                if let Some(cnt) = win_counts.get_mut(left_word) {
+                    *cnt -= 1;
+                }
+                // Decrement `have` ONLY on the covered→under-covered transition,
+                // i.e. when the pre-removal count was EXACTLY the required
+                // multiplicity (`lc == need`). This mirrors the add-path guard
+                // `prev + 1 == need`. The prior condition `lc - 1 < need` also
+                // fired for an already-under-covered duplicate word (`lc < need`),
+                // which both dropped valid matches (false negative for repeated
+                // query words such as `--near N 'a a a'`) and could UNDERFLOW
+                // `have` (usize) when two under-covered duplicates were evicted in
+                // a single shrink — a debug panic / release wrap.
+                let left_need = q_counts.get(left_word).copied().unwrap_or(0);
+                if lc == left_need {
+                    have -= 1; // this word is no longer fully covered
+                }
+                left += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Check: window covers all unique query words with required multiplicity?
+        if have == num_unique {
+            // Return byte range: from the leftmost to rightmost matched word.
+            // These are the content word positions at the window boundaries.
+            let (left_ord, _) = relevant[left];
+            let byte_start = c_words[left_ord].0;
+            let byte_end = c_words[right_ord].1;
+            return Some(byte_start..byte_end);
+        }
+    }
+    None
+}
+
+// ============================================================================
 // Error Types
 // ============================================================================
 
@@ -1407,5 +1658,77 @@ mod tests {
             query_substring_present(content, "authenticate"),
             "exact-case 'authenticate' must match"
         );
+    }
+
+    /// D10 / AD-393-3: `collect_word_spans` and `word_token_indices` MUST produce
+    /// identical token boundaries — they both use `is_word_byte` as their single
+    /// shared word-boundary predicate.
+    ///
+    /// This test sweeps a corpus covering: plain words, separator punctuation (`::`),
+    /// underscores, digits, leading/trailing separators, non-ASCII bytes, and mixed
+    /// content.  For each input it asserts that the word *strings* extracted by
+    /// `collect_word_spans` exactly agree with the word *strings* extracted by
+    /// slicing `word_token_indices` ordinals — proving byte-for-byte token parity.
+    ///
+    /// A future change to the word-byte rule in either function (e.g. adding `-` or
+    /// Unicode word chars) without updating the other would fail this test before
+    /// any index-build or CLI-query could silently diverge.
+    #[test]
+    fn collect_word_spans_agrees_with_word_token_indices() {
+        let corpus: &[&str] = &[
+            "foo::bar",
+            "encode_varint",
+            "let x = 42;",
+            "fn main() {}",
+            "  leading spaces",
+            "trailing spaces  ",
+            "caf\u{00e9}bar", // non-ASCII separator between ASCII words
+            "",
+            "   ",
+            "a b c",
+            "abc123_def",
+            ":: :: ::",
+            "foo",
+            "x",
+            "a1_b2_c3",
+        ];
+
+        for &s in corpus {
+            // Derive word strings from collect_word_spans.
+            let spans = collect_word_spans(s);
+            let from_spans: Vec<&str> = spans.iter().map(|&(st, en)| &s[st..en]).collect();
+
+            // Derive word strings from word_token_indices by grouping bytes by ordinal.
+            let indices = crate::lexical::word_token_indices(s);
+            let bytes = s.as_bytes();
+            let mut from_indices: Vec<&str> = Vec::new();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if crate::lexical::is_word_byte(bytes[i]) {
+                    let start = i;
+                    while i < bytes.len() && crate::lexical::is_word_byte(bytes[i]) {
+                        i += 1;
+                    }
+                    // The indices produced by word_token_indices must be monotone
+                    // within this word run.
+                    let span_indices = &indices[start..i];
+                    let same_token = span_indices.windows(2).all(|w| w[0] == w[1]);
+                    assert!(
+                        same_token,
+                        "word_token_indices must be constant within a word run for {:?}; got {:?}",
+                        s, span_indices
+                    );
+                    from_indices.push(&s[start..i]);
+                } else {
+                    i += 1;
+                }
+            }
+
+            assert_eq!(
+                from_spans, from_indices,
+                "D10 parity failure for input {:?}: collect_word_spans={from_spans:?}, word_token_indices={from_indices:?}",
+                s
+            );
+        }
     }
 }

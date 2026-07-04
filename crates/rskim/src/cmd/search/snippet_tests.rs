@@ -8,8 +8,8 @@ use std::fs;
 use tempfile::tempdir;
 
 use super::{
-    SnippetOutcome, extract_context_window, extract_snippet, extract_snippet_and_verify,
-    query_substring_present,
+    SnippetOutcome, VerifyMode, extract_context_window, extract_snippet,
+    extract_snippet_and_verify, query_substring_present,
 };
 
 // ============================================================================
@@ -290,7 +290,8 @@ fn test_extract_snippet_and_verify_empty_positions_file_contains_query_ad355_7()
     fs::write(root.join("src/lib.rs"), "fn foo() {}\n").unwrap();
 
     // Empty positions — simulates the short-query (AD-355-7) fallback.
-    let (outcome, verified) = extract_snippet_and_verify(&root, "src/lib.rs", &[], None, "fn");
+    let (outcome, verified) =
+        extract_snippet_and_verify(&root, "src/lib.rs", &[], None, "fn", VerifyMode::Substring);
 
     // File contains "fn" → verified must be true so the caller keeps it.
     assert!(
@@ -313,7 +314,8 @@ fn test_extract_snippet_and_verify_empty_positions_file_absent_query_ad355_7() {
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "struct Foo {}\n").unwrap();
 
-    let (_, verified) = extract_snippet_and_verify(&root, "src/lib.rs", &[], None, "fn");
+    let (_, verified) =
+        extract_snippet_and_verify(&root, "src/lib.rs", &[], None, "fn", VerifyMode::Substring);
 
     // File does NOT contain "fn" → verified must be false.
     assert!(
@@ -328,5 +330,197 @@ fn test_query_substring_present_whitespace_only_query_returns_false() {
     assert!(
         !query_substring_present("any content", "   "),
         "whitespace-only query: no tokens → false (defense-in-depth, Finding 15)"
+    );
+}
+
+// ============================================================================
+// extract_snippet_and_verify — Phrase / Near verify paths (AD-393-10)
+// ============================================================================
+
+/// AD-393-10 / AC15: `extract_snippet_and_verify` with `VerifyMode::Phrase`
+/// must return `verified=true` when the file contains the exact phrase as
+/// adjacent word tokens, and `verified=false` when it contains only a
+/// trigram-containment false positive.
+///
+/// This test directly covers the Phrase predicate dispatch path in
+/// `run_verify_predicate_with_range` and the re-anchor logic (AD-393-6).
+/// It is the unit-level complement to the CLI integration test
+/// `cli_ac15_phrase_exits_zero_with_correct_results`.
+///
+/// Note: this test uses files well under MAX_SNIPPET_FILE_BYTES so it exercises
+/// the NORMAL full-read branch (not the bounded-scan branch). The bounded-scan
+/// path (`file_size > MAX_SNIPPET_FILE_BYTES`) is covered separately by
+/// `extract_snippet_and_verify_large_file_bounded_scan_ac15`.
+///
+/// PF-007: each assertion is discriminating — the pass/fail outcome depends on
+/// whether the phrase is present as exact word tokens, not merely as trigrams.
+#[test]
+fn extract_snippet_and_verify_phrase_mode_verifies() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // File A: contains the exact phrase "encode varint" as adjacent word tokens.
+    let content_match = "fn process() {\n    let v = encode varint(x);\n}\n";
+    fs::write(root.join("src/match.rs"), content_match).unwrap();
+
+    // File B: trigram-containment false positive — same trigrams but NO exact
+    // phrase (encode_length and varint_writer are single tokens).
+    let content_fp = "fn process() {\n    let v = encode_length varint_writer(x);\n}\n";
+    fs::write(root.join("src/fp.rs"), content_fp).unwrap();
+
+    // Phrase verify: match.rs must be verified (exact phrase present).
+    let (_, verified_match) = extract_snippet_and_verify(
+        &root,
+        "src/match.rs",
+        &[32..32], // approximate position — re-anchor uses predicate range
+        None,
+        "encode varint",
+        VerifyMode::Phrase,
+    );
+    assert!(
+        verified_match,
+        "AD-393-10: file containing exact phrase must be verified=true with VerifyMode::Phrase"
+    );
+
+    // Phrase verify: fp.rs must NOT be verified (superstring false positive).
+    let (_, verified_fp) = extract_snippet_and_verify(
+        &root,
+        "src/fp.rs",
+        &[32..32],
+        None,
+        "encode varint",
+        VerifyMode::Phrase,
+    );
+    assert!(
+        !verified_fp,
+        "AD-393-10: superstring file must be verified=false with VerifyMode::Phrase \
+         (trigram-containment false positive must be rejected)"
+    );
+}
+
+/// AD-393-10 / Near path: `extract_snippet_and_verify` with `VerifyMode::Near(n)`
+/// must return `verified=true` when the query words are within n word-token
+/// positions and `verified=false` when they are farther apart.
+///
+/// Guards the Near predicate dispatch path in `run_verify_predicate_with_range`.
+#[test]
+fn extract_snippet_and_verify_near_mode_verifies() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // "encode" and "varint" appear within 2 word-token positions.
+    fs::write(root.join("src/near.rs"), "fn f() { encode some varint; }\n").unwrap();
+    // "encode" and "varint" are more than 2 positions apart.
+    fs::write(root.join("src/far.rs"), "fn f() { encode a b c varint; }\n").unwrap();
+
+    let (_, v_near) = extract_snippet_and_verify(
+        &root,
+        "src/near.rs",
+        &[10..10],
+        None,
+        "encode varint",
+        VerifyMode::Near(2),
+    );
+    assert!(
+        v_near,
+        "AD-393-10: words within n=2 positions must be verified=true with VerifyMode::Near(2)"
+    );
+
+    let (_, v_far) = extract_snippet_and_verify(
+        &root,
+        "src/far.rs",
+        &[10..10],
+        None,
+        "encode varint",
+        VerifyMode::Near(2),
+    );
+    assert!(
+        !v_far,
+        "AD-393-10: words beyond n=2 positions must be verified=false with VerifyMode::Near(2)"
+    );
+}
+
+/// AD-393-10 / AC15: large-file bounded-scan path — `VerifyMode::Phrase` and
+/// `VerifyMode::Near` must return `verified=false` when the file exceeds
+/// `MAX_SNIPPET_FILE_BYTES` and the only occurrence of the phrase/words sits
+/// beyond `MAX_VERIFY_SCAN_BYTES` (the scan cap).
+///
+/// This test exercises the `file_size > MAX_SNIPPET_FILE_BYTES` branch in
+/// `extract_snippet_and_verify` (snippet.rs:285) by creating a sparse file via
+/// `seek-past-end + write` so the OS reports the full size in metadata without
+/// allocating the intermediate bytes. The "hole" reads as zero bytes, which
+/// contain no word tokens matching the query — giving a clean, fast, and
+/// discriminating negative result.
+///
+/// PF-007 discriminating observable: the test DEPENDS on the bounded scan cap —
+/// if the cap were removed and the full file were scanned, the phrase would be
+/// found and `verified` would flip to `true`, causing the assertion to fail.
+/// This is the guard that ensures the `.take(needed as u64)` cap in snippet.rs
+/// remains load-bearing.
+///
+/// Note: no assertion is made on SnippetOutcome because the large-file branch
+/// always returns `SnippetOutcome::Unavailable` (by design — snippeting a 5MB+
+/// file would allocate the entire contents).
+#[test]
+fn extract_snippet_and_verify_large_file_bounded_scan_ac15() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // MAX_SNIPPET_FILE_BYTES = 5 * 1024 * 1024 (5 MiB). We create a sparse file
+    // whose reported size is 5 MiB + 200 bytes by seeking to that offset and
+    // writing the needle. The leading 5 MiB "hole" reads as zero bytes and
+    // contains no word tokens, so the bounded scan (which only reads the first
+    // MIN(file_size, MAX_VERIFY_SCAN_BYTES) = 5 MiB bytes) will not find the phrase.
+    const FIVE_MIB: u64 = 5 * 1024 * 1024;
+    let file_path = root.join("src/large.rs");
+    {
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        // Seek PAST the 5 MiB mark so the file's reported size exceeds
+        // MAX_SNIPPET_FILE_BYTES, then write the needle only at this offset.
+        f.seek(SeekFrom::Start(FIVE_MIB + 200)).unwrap();
+        f.write_all(b"encode varint").unwrap();
+        f.flush().unwrap();
+    }
+
+    // Sanity-check: file size must exceed FIVE_MIB so the large-file branch fires.
+    let reported_size = std::fs::metadata(&file_path).unwrap().len();
+    assert!(
+        reported_size > FIVE_MIB,
+        "test setup: sparse file must report size > 5 MiB; got {reported_size}"
+    );
+
+    // Phrase mode: the needle sits beyond the scan cap → verified=false (dropped).
+    let (_, verified_phrase) = extract_snippet_and_verify(
+        &root,
+        "src/large.rs",
+        &[], // no approximate positions — large-file path ignores them
+        None,
+        "encode varint",
+        VerifyMode::Phrase,
+    );
+    assert!(
+        !verified_phrase,
+        "AC15: large file with phrase only beyond MAX_VERIFY_SCAN_BYTES must be \
+         verified=false with VerifyMode::Phrase (bounded-scan cap enforced)"
+    );
+
+    // Near mode: same file, same expectation.
+    let (_, verified_near) = extract_snippet_and_verify(
+        &root,
+        "src/large.rs",
+        &[],
+        None,
+        "encode varint",
+        VerifyMode::Near(5),
+    );
+    assert!(
+        !verified_near,
+        "AC15: large file with words only beyond MAX_VERIFY_SCAN_BYTES must be \
+         verified=false with VerifyMode::Near(5) (bounded-scan cap enforced)"
     );
 }
