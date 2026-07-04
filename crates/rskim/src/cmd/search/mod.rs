@@ -363,11 +363,17 @@ fn parse_near_value(raw: &str) -> anyhow::Result<u32> {
 /// error listing accepted values when the input is unrecognised.
 fn parse_lang_value(raw: &str) -> anyhow::Result<rskim_core::Language> {
     use rskim_core::Language;
+    // Normalize to lowercase once so both the extension lookup and the name
+    // match arm are case-insensitive.  Without this `--lang RS` (uppercase
+    // extension) was rejected while `--lang rs` succeeded — an inconsistency
+    // that surprised users.  Language::from_extension is case-sensitive, so
+    // we must lower before calling it.
+    let raw_lower = raw.to_ascii_lowercase();
     // Try file extension first so callers can pass "rs", "py", etc.
-    if let Some(lang) = Language::from_extension(raw) {
+    if let Some(lang) = Language::from_extension(&raw_lower) {
         return Ok(lang);
     }
-    match raw.to_ascii_lowercase().as_str() {
+    match raw_lower.as_str() {
         "rust" => Ok(Language::Rust),
         "python" => Ok(Language::Python),
         "typescript" => Ok(Language::TypeScript),

@@ -763,6 +763,80 @@ fn test_ac14_cochange_only_result_carries_fused_rrf_score() {
 }
 
 // ============================================================================
+// AD-393-12: positional co-change-only peer gate
+//
+// In positional mode (phrase: true or near: Some(_)), co-change-only files
+// (those present in blast_radius_paths but absent from the lexical result set)
+// MUST be dropped unconditionally.  Any file that truly contains the phrase is
+// reachable via the lexical path; the co-change-only path adds no recall in
+// positional mode and risks including wrong-language peers (D17/AC16 violation).
+//
+// This test injects blast_radius_paths containing a co-change-only file (lib.rs,
+// which does NOT contain the query phrase) and asserts it is EXCLUDED.  The
+// lexically-matching file (auth.rs, which DOES contain the phrase) must appear.
+// ============================================================================
+
+#[test]
+fn test_positional_cochange_only_peer_is_dropped() {
+    use std::collections::HashSet;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // auth.rs: contains "zqjxblip_check" as an exact word token.
+    // lib.rs: does NOT contain "zqjxblip_check" — pure co-change-only partner.
+    create_union_test_project(&root);
+
+    let mut allowed: HashSet<String> = HashSet::new();
+    allowed.insert("src/auth.rs".to_string()); // lexical hit + phrase match
+    allowed.insert("src/lib.rs".to_string()); // co-change-only: does NOT contain phrase
+
+    let config = QueryConfig {
+        text: "zqjxblip_check".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+        // Positional mode: the `else if positional { return None; }` gate activates.
+        phrase: true,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
+
+    // AD-393-12 POSITIVE: auth.rs has a lexical hit AND passes phrase
+    // verification (word token "zqjxblip_check" present) → must appear.
+    let has_auth = output.results.iter().any(|r| r.path == "src/auth.rs");
+    assert!(
+        has_auth,
+        "AD-393-12: positional lexical-hit file (src/auth.rs) must appear in results; \
+         got {:?}",
+        paths
+    );
+
+    // AD-393-12 NEGATIVE (discriminating): lib.rs is co-change-only in positional
+    // mode and must be DROPPED by the `else if positional { return None; }` gate.
+    // Under the old "read-and-verify" implementation, lib.rs would be included if
+    // it happened to contain the phrase; under the new unconditional-drop it is
+    // always excluded, preventing the --lang bypass class of false positives.
+    let has_lib = output.results.iter().any(|r| r.path == "src/lib.rs");
+    assert!(
+        !has_lib,
+        "AD-393-12: co-change-only file (src/lib.rs) MUST be dropped in positional mode; \
+         got {:?}",
+        paths
+    );
+}
+
+// ============================================================================
 // format_json_output
 // ============================================================================
 

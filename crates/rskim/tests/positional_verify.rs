@@ -241,16 +241,39 @@ fn near_trigram_false_positive_is_rejected_ac2() {
 // ─── word-boundary parity ─────────────────────────────────────────────────────
 
 /// D10: collect_word_spans boundary rule must match word_token_indices.
-/// Non-ASCII characters are treated as word separators.
+/// Non-ASCII characters (e.g. é = U+00E9, bytes 0xC3 0xA9) are word SEPARATORS,
+/// not word bytes.  The test must make the pass/fail outcome depend on whether
+/// é actually splits the surrounding bytes into two tokens.
+///
+/// Discriminating design:
+/// - Content `"caf\u{00e9}bar"` (bytes: c,a,f,0xC3,0xA9,b,a,r) — if é is a
+///   separator, this tokenises to ["caf", "bar"]; if é were a word byte it
+///   would be one combined token.
+/// - Query `"caf bar"` (two tokens ["caf", "bar"]) → Some only when é splits.
+/// - Complement: `"cafbar"` (one token "cafbar") must NOT match query "caf bar"
+///   (two tokens) — proving that the split is caused by the é separator, not
+///   by some generic run-boundary coincidence.
 #[test]
 fn phrase_non_ascii_treated_as_separator() {
-    // "café" splits at é boundary: "caf" then "e" — but the content has `caf`
-    // as a word and `encode` as another word. The query `caf encode` should
-    // only match if they appear as consecutive WORD tokens.
-    let result = phrase_tokens_present("caf\u{00e9} encode varint", "encode varint");
+    // POSITIVE: é between two ASCII runs causes them to be separate tokens.
+    // If é were a word byte, "caf\u{00e9}bar" would be one token; the two-token
+    // query "caf bar" would then NOT match → this assertion would fail.
+    let split = phrase_tokens_present("caf\u{00e9}bar", "caf bar");
     assert!(
-        result.is_some(),
-        "D10: word boundary after non-ASCII — 'encode varint' still matches as adjacent tokens"
+        split.is_some(),
+        "D10: non-ASCII byte (é=0xC3,0xA9) must act as a separator; \
+         'caf' and 'bar' must be distinct tokens and 'caf bar' must match \
+         'caf\u{00e9}bar'"
+    );
+
+    // COMPLEMENT (discriminating): if the é were absent ("cafbar" is one token)
+    // then "caf bar" (two tokens) must NOT match.  This confirms that the
+    // separator behaviour — not some other coincidence — is what allows the
+    // match above.
+    let no_split = phrase_tokens_present("cafbar", "caf bar");
+    assert!(
+        no_split.is_none(),
+        "D10: complement — 'cafbar' is one token; two-token query 'caf bar' must NOT match"
     );
 }
 
@@ -843,16 +866,19 @@ fn cli_ac11_phrase_ast_composition() {
 /// AC13: non-positional single-token and multi-word queries must return the
 /// correct result sets (VerifyMode::Substring threading is behavior-neutral).
 /// This guards that the new VerifyMode dispatch does not break the existing
-/// lexical path.
+/// lexical path, including the BM25F candidate-pool branch exercised by
+/// multi-word queries (the `else` branch in execute_query).
 #[test]
 fn cli_ac13_nonpositional_no_regression() {
     let proj = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
 
-    // authenticate.rs contains "authenticate"; other.rs does not.
+    // authenticate.rs: contains "authenticate" AND "impl Iterator".
+    // other.rs: contains "login" only — no "authenticate", no "Iterator".
+    // iter.rs:  contains "impl Iterator" but NOT "authenticate".
     fs::write(
         proj.path().join("authenticate.rs"),
-        "fn authenticate(user: &str) -> bool { true }\n",
+        "fn authenticate(user: &str) -> bool { true }\nimpl Iterator for Auth {}\n",
     )
     .unwrap();
     fs::write(
@@ -860,9 +886,14 @@ fn cli_ac13_nonpositional_no_regression() {
         "fn login(user: &str) -> bool { false }\n",
     )
     .unwrap();
+    fs::write(
+        proj.path().join("iter.rs"),
+        "pub struct Iter;\nimpl Iterator for Iter { fn next(&mut self) -> Option<()> { None } }\n",
+    )
+    .unwrap();
     build_index(proj.path(), cache.path());
 
-    // Single-token query.
+    // Single-token query: exercises the pure-lexical path.
     let j1 = search_json(proj.path(), cache.path(), &["authenticate"]);
     let got1 = paths(&j1);
     assert!(
@@ -874,12 +905,31 @@ fn cli_ac13_nonpositional_no_regression() {
         "AC13: 'authenticate' must NOT find other.rs; got {got1:?}"
     );
 
-    // Run the same query again — result set must be identical (deterministic).
+    // Determinism check — result set must be identical on repeat.
     let j2 = search_json(proj.path(), cache.path(), &["authenticate"]);
     assert_eq!(
         paths(&j1),
         paths(&j2),
         "AC13: repeated identical query must return the same result set (no non-determinism)"
+    );
+
+    // Multi-word non-positional query "impl Iterator": exercises the BM25F
+    // candidate-pool branch (the `else` arm in execute_query / search that
+    // newly threads VerifyMode::Substring).  Both authenticate.rs and iter.rs
+    // must be found; other.rs must not.
+    let j3 = search_json(proj.path(), cache.path(), &["impl Iterator"]);
+    let got3 = paths(&j3);
+    assert!(
+        got3.contains("authenticate.rs"),
+        "AC13: multi-word 'impl Iterator' must find authenticate.rs (contains both words); got {got3:?}"
+    );
+    assert!(
+        got3.contains("iter.rs"),
+        "AC13: multi-word 'impl Iterator' must find iter.rs (contains both words); got {got3:?}"
+    );
+    assert!(
+        !got3.contains("other.rs"),
+        "AC13: multi-word 'impl Iterator' must NOT find other.rs (contains neither word); got {got3:?}"
     );
 }
 
@@ -889,8 +939,9 @@ fn cli_ac13_nonpositional_no_regression() {
 /// valid JSON, and includes only files containing the token-exact phrase.
 ///
 /// Full AC15 (5,000-file corpus + >5MB oversized-needle file) is omitted from
-/// local CI because creating a >5MB file in a test is prohibitively slow.  The
-/// bounded-scan predicate path (AD-393-10) is covered by snippet_tests.rs.
+/// local CI because creating a >5MB file in a test is prohibitively slow.
+/// The bounded-scan predicate path (AD-393-10) is covered by the unit test
+/// `extract_snippet_and_verify_phrase_mode_verifies` in snippet_tests.rs.
 #[test]
 fn cli_ac15_phrase_exits_zero_with_correct_results() {
     let proj = tempfile::tempdir().unwrap();
@@ -929,39 +980,63 @@ fn cli_ac15_phrase_exits_zero_with_correct_results() {
 // ── AC16: --lang filter on positional + all-short fallback ───────────────────
 
 /// AC16: `--phrase ... --lang rust` must exclude non-Rust files even when they
-/// contain the token-exact phrase.  Tested on both the positional path (long
-/// words) and implicitly the short-word fallback (both 'in' and 'the' are <3 bytes).
+/// contain the token-exact phrase.  Tested on two sub-cases:
+/// 1. Long-word phrase ("in the loop"): "the" (3 bytes) and "loop" (4 bytes) are
+///    positionable; "in" (2 bytes) is short but the query is NOT all-short.
+///    This exercises the positional path where at least one positionable word exists.
+/// 2. All-short phrase ("fn of"): BOTH words are <3 bytes so every word is below
+///    the trigram threshold — the engine falls through to `short_query_fallback`,
+///    which applies lang filtering at a different site.  This exercises the
+///    all-short fallback + --lang composition (D17 / AC16 explicit requirement).
 #[test]
 fn cli_ac16_lang_filter_on_positional_and_fallback() {
     let proj = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
 
-    // a.rs (Rust): contains the phrase.
-    fs::write(proj.path().join("a.rs"), "// in the loop\n").unwrap();
-    // a.py (Python): same phrase but different language.
-    fs::write(proj.path().join("a.py"), "# in the loop\n").unwrap();
+    // a.rs (Rust): contains both test phrases.
+    fs::write(proj.path().join("a.rs"), "// in the loop\nfn of() {}\n").unwrap();
+    // a.py (Python): same phrases, different language.
+    fs::write(proj.path().join("a.py"), "# in the loop\n# fn of\n").unwrap();
     build_index(proj.path(), cache.path());
 
-    // With --lang rust: only a.rs should appear.
-    let json = search_json(
+    // Sub-case 1: long-word phrase, positional path, --lang rust.
+    // ("the" = 3 bytes → positionable; "in" = 2 bytes → short but not all-short.)
+    let json1 = search_json(
         proj.path(),
         cache.path(),
         &["--phrase", "in the loop", "--lang", "rust"],
     );
-    let got = paths(&json);
-
+    let got1 = paths(&json1);
     assert!(
-        got.contains("a.rs"),
-        "AC16: --lang rust must include a.rs; got {got:?}"
+        got1.contains("a.rs"),
+        "AC16 sub-case 1: --lang rust must include a.rs (positional path); got {got1:?}"
     );
     assert!(
-        !got.contains("a.py"),
-        "AC16: --lang rust must EXCLUDE a.py; got {got:?}"
+        !got1.contains("a.py"),
+        "AC16 sub-case 1: --lang rust must EXCLUDE a.py (positional path); got {got1:?}"
     );
     assert_eq!(
-        got,
+        got1,
         HashSet::from(["a.rs".to_string()]),
-        "AC16: result must be EXACTLY {{a.rs}}; got {got:?}"
+        "AC16 sub-case 1: result must be EXACTLY {{a.rs}}; got {got1:?}"
+    );
+
+    // Sub-case 2: all-short phrase ("fn" = 2 bytes, "of" = 2 bytes — both below
+    // the 3-byte trigram threshold).  The engine takes the short_query_fallback
+    // path, which must still honour --lang.
+    let json2 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "fn of", "--lang", "rust"],
+    );
+    let got2 = paths(&json2);
+    assert!(
+        got2.contains("a.rs"),
+        "AC16 sub-case 2: --lang rust must include a.rs (all-short fallback); got {got2:?}"
+    );
+    assert!(
+        !got2.contains("a.py"),
+        "AC16 sub-case 2: --lang rust must EXCLUDE a.py (all-short fallback); got {got2:?}"
     );
 }
 
@@ -1016,6 +1091,19 @@ fn cli_ac17_blast_radius_control_exits_zero() {
         &["--phrase", "encode varint", "--blast-radius", "target.rs"],
     );
     let got_pos = paths(&json_pos);
+
+    // PF-007: discriminating positive assertion — peer.rs MUST appear.
+    // Without temporal data the lexical UNION layer still yields peer.rs (it
+    // contains the exact phrase "encode varint" as adjacent word tokens), and
+    // it passes Phrase verification.  An empty result set would satisfy only
+    // the superstring.rs exclusion assertion below, hiding a fully-broken path.
+    assert!(
+        got_pos.contains("peer.rs"),
+        "AC17 control: peer.rs (contains exact phrase 'encode varint') must be PRESENT \
+         in --phrase + --blast-radius results; got {got_pos:?}"
+    );
+
+    // Exclusion assertion: superstring false positive must not appear.
     assert!(
         !got_pos.contains("superstring.rs"),
         "AC17 control: superstring.rs must be excluded from --phrase + --blast-radius; got {got_pos:?}"

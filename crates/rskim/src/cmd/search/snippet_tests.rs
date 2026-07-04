@@ -332,3 +332,108 @@ fn test_query_substring_present_whitespace_only_query_returns_false() {
         "whitespace-only query: no tokens → false (defense-in-depth, Finding 15)"
     );
 }
+
+// ============================================================================
+// extract_snippet_and_verify — Phrase / Near verify paths (AD-393-10)
+// ============================================================================
+
+/// AD-393-10 / AC15: `extract_snippet_and_verify` with `VerifyMode::Phrase`
+/// must return `verified=true` when the file contains the exact phrase as
+/// adjacent word tokens, and `verified=false` when it contains only a
+/// trigram-containment false positive.
+///
+/// This test directly covers the Phrase predicate dispatch path in
+/// `run_verify_predicate_with_range` and the re-anchor logic (AD-393-6).
+/// It is the unit-level complement to the CLI integration test
+/// `cli_ac15_phrase_exits_zero_with_correct_results` and covers the
+/// bounded-scan path for small files (same code path, file < MAX_SNIPPET_FILE_BYTES).
+///
+/// PF-007: each assertion is discriminating — the pass/fail outcome depends on
+/// whether the phrase is present as exact word tokens, not merely as trigrams.
+#[test]
+fn extract_snippet_and_verify_phrase_mode_verifies() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // File A: contains the exact phrase "encode varint" as adjacent word tokens.
+    let content_match = "fn process() {\n    let v = encode varint(x);\n}\n";
+    fs::write(root.join("src/match.rs"), content_match).unwrap();
+
+    // File B: trigram-containment false positive — same trigrams but NO exact
+    // phrase (encode_length and varint_writer are single tokens).
+    let content_fp = "fn process() {\n    let v = encode_length varint_writer(x);\n}\n";
+    fs::write(root.join("src/fp.rs"), content_fp).unwrap();
+
+    // Phrase verify: match.rs must be verified (exact phrase present).
+    let (_, verified_match) = extract_snippet_and_verify(
+        &root,
+        "src/match.rs",
+        &[32..32], // approximate position — re-anchor uses predicate range
+        None,
+        "encode varint",
+        VerifyMode::Phrase,
+    );
+    assert!(
+        verified_match,
+        "AD-393-10: file containing exact phrase must be verified=true with VerifyMode::Phrase"
+    );
+
+    // Phrase verify: fp.rs must NOT be verified (superstring false positive).
+    let (_, verified_fp) = extract_snippet_and_verify(
+        &root,
+        "src/fp.rs",
+        &[32..32],
+        None,
+        "encode varint",
+        VerifyMode::Phrase,
+    );
+    assert!(
+        !verified_fp,
+        "AD-393-10: superstring file must be verified=false with VerifyMode::Phrase \
+         (trigram-containment false positive must be rejected)"
+    );
+}
+
+/// AD-393-10 / Near path: `extract_snippet_and_verify` with `VerifyMode::Near(n)`
+/// must return `verified=true` when the query words are within n word-token
+/// positions and `verified=false` when they are farther apart.
+///
+/// Guards the Near predicate dispatch path in `run_verify_predicate_with_range`.
+#[test]
+fn extract_snippet_and_verify_near_mode_verifies() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // "encode" and "varint" appear within 2 word-token positions.
+    fs::write(root.join("src/near.rs"), "fn f() { encode some varint; }\n").unwrap();
+    // "encode" and "varint" are more than 2 positions apart.
+    fs::write(root.join("src/far.rs"), "fn f() { encode a b c varint; }\n").unwrap();
+
+    let (_, v_near) = extract_snippet_and_verify(
+        &root,
+        "src/near.rs",
+        &[10..10],
+        None,
+        "encode varint",
+        VerifyMode::Near(2),
+    );
+    assert!(
+        v_near,
+        "AD-393-10: words within n=2 positions must be verified=true with VerifyMode::Near(2)"
+    );
+
+    let (_, v_far) = extract_snippet_and_verify(
+        &root,
+        "src/far.rs",
+        &[10..10],
+        None,
+        "encode varint",
+        VerifyMode::Near(2),
+    );
+    assert!(
+        !v_far,
+        "AD-393-10: words beyond n=2 positions must be verified=false with VerifyMode::Near(2)"
+    );
+}

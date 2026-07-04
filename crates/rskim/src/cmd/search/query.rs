@@ -838,33 +838,27 @@ fn run_blast_radius_composite_query(
                 })
             } else if positional {
                 // AD-393-12: co-change peer gate — in positional mode (--phrase/--near),
-                // co-change-only files are NOT accepted unconditionally.  We read and
-                // apply the positional predicate; only include if verified.  This
-                // prevents blast-radius returning files that co-changed with the target
-                // but do NOT contain the requested phrase/proximity pattern.
-                let (_, verified) = extract_snippet_and_verify(
-                    ctx.root,
-                    path,
-                    &[], // no match_positions for co-change-only: predicate uses text scan
-                    manifest_entry,
-                    &config.text,
-                    blast_verify_mode.clone(),
-                );
-                if !verified {
-                    return None;
-                }
-                Some(super::types::ResolvedResult {
-                    path: path.to_string(),
-                    score: composite_score,
-                    field: "co_change_partner".to_string(),
-                    line_number: None,
-                    line_range: None,
-                    snippet: None,
-                    stale: false,
-                    match_positions: vec![],
-                    temporal: None,
-                    layers_matched: vec![],
-                })
+                // co-change-only files (absent from the lang-filtered raw_lex pool) are
+                // dropped unconditionally.
+                //
+                // Why this is safe and correct:
+                //   • raw_lex is built with sq.lang = config.lang, so any file that
+                //     truly contains the phrase AND matches the lang filter is already
+                //     in the lexical pool and handled by the first branch above.
+                //   • A co-change-only peer that contains the phrase but has a wrong
+                //     language would be a false positive violating --lang semantics.
+                //   • A co-change-only peer that does NOT contain the phrase must be
+                //     excluded by the token-exact predicate regardless.
+                //   • Therefore any file that should appear in a positional result set
+                //     is reachable via the lexical path; the co-change-only path adds
+                //     no recall in positional mode.
+                //
+                // Prior implementation read the file and ran the predicate, but because
+                // the --lang filter is not applied at the manifest-lookup level, a wrong-
+                // language peer that happened to contain the phrase would be included,
+                // violating D17 / AC16.  The unconditional drop is both simpler and
+                // correct (AD-393-12; review finding medium/architecture 2026-07-04).
+                None
             } else {
                 // Co-change-only file: no lexical hit → no snippet (AC12, UNION mode).
                 // These files appear because their temporal rank contributes to the

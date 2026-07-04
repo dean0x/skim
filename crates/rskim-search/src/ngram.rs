@@ -418,17 +418,18 @@ pub struct QueryToken {
 #[must_use]
 pub fn extract_query_positional_tokens(query: &str) -> Vec<QueryToken> {
     let bytes = query.as_bytes();
-    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    // D10 / AD-393-3: use the shared is_word_byte predicate for boundary detection,
+    // keeping this site in sync with word_token_indices and collect_word_spans.
     let tok_of_byte = crate::lexical::word_token_indices(query);
     let mut tokens: Vec<QueryToken> = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
-        if !is_word(bytes[i]) {
+        if !crate::lexical::is_word_byte(bytes[i]) {
             i += 1;
             continue;
         }
         let start = i;
-        while i < bytes.len() && is_word(bytes[i]) {
+        while i < bytes.len() && crate::lexical::is_word_byte(bytes[i]) {
             i += 1;
         }
         let end = i; // exclusive
