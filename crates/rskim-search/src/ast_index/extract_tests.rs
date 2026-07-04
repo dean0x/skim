@@ -8,7 +8,7 @@
 use rskim_core::Language;
 
 use super::*;
-use crate::ast_index::structural::BUCKET_LABEL_BASE;
+use crate::ast_index::structural::is_synthetic_id;
 use crate::ast_index::{AstBigram, AstTrigram, DEFAULT_AST_WEIGHT, linearize_source, vocab_lookup};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -21,9 +21,15 @@ fn unit_trigram_weight(_: AstTrigram) -> f32 {
     1.0
 }
 
-/// Build a `LinearNode` with given kind_id and depth.
+/// Build a `LinearNode` with given kind_id and depth. `start_line`/`start_byte`
+/// (AD-394-6) default to 0 — these structural tests only assert on n-gram keys
+/// and metrics, never on recovered line/byte positions.
 fn node(kind_id: u16, depth: u16) -> LinearNode {
-    LinearNode { kind_id, depth }
+    LinearNode {
+        kind_id,
+        depth,
+        ..Default::default()
+    }
 }
 
 /// Collect bigram keys from a result set for membership assertions.
@@ -697,9 +703,8 @@ fn trigram_count_accumulates_for_repeated_triple() {
 // This test runs both functions on the same input (a multi-node tree that
 // exercises gap-fill, siblings, and depth nesting) and asserts that the real
 // bigrams and trigrams match exactly after filtering out all synthetic markers
-// (parent or child ID >= BUCKET_LABEL_BASE = 64900).
+// via `is_synthetic_id` (AD-394-3: parent or child ID >= BUCKET_LABEL_BASE = 64900).
 //
-// Filtering: a bigram is synthetic when parent >= 64900 OR child >= 64900.
 // Trigrams cannot be synthetic (synthetic IDs never appear in trigram slots).
 
 #[test]
@@ -721,7 +726,7 @@ fn metrics_path_real_ngrams_match_weights_path() {
 
     let is_real_bigram = |e: &AstBigramEntry| {
         let (parent, child) = e.ngram.decode();
-        parent < BUCKET_LABEL_BASE && child < BUCKET_LABEL_BASE
+        !is_synthetic_id(parent) && !is_synthetic_id(child)
     };
 
     let mut weights_bigram_keys: Vec<u32> = weights_result
@@ -786,7 +791,7 @@ fn metrics_path_u16_max_depth_no_panic_max_depth_recorded() {
 
     let is_real_bigram = |e: &AstBigramEntry| {
         let (parent, child) = e.ngram.decode();
-        parent < BUCKET_LABEL_BASE && child < BUCKET_LABEL_BASE
+        !is_synthetic_id(parent) && !is_synthetic_id(child)
     };
     let real_bigrams: Vec<_> = result
         .bigrams

@@ -70,6 +70,61 @@ fn f5_bucket_label_range_is_safe() {
 }
 
 // ============================================================================
+// AC4 (#394): is_synthetic_id threshold + vocab_len <= BUCKET_LABEL_BASE invariant
+//
+// PF-007 discriminating: every synthetic ID must return true, every real vocab
+// ID must return false. A `|| true` stub fails the false branch; a `|| false`
+// stub fails the true branch.
+// ============================================================================
+
+#[test]
+fn ac4_394_is_synthetic_id_true_for_all_synthetic_parent_ids() {
+    assert!(is_synthetic_id(EMPTY_BODY), "EMPTY_BODY must be synthetic");
+    assert!(is_synthetic_id(DEEP_NODE), "DEEP_NODE must be synthetic");
+    assert!(is_synthetic_id(LARGE_BODY), "LARGE_BODY must be synthetic");
+    assert!(
+        is_synthetic_id(MANY_PARAMS),
+        "MANY_PARAMS must be synthetic"
+    );
+}
+
+#[test]
+fn ac4_394_is_synthetic_id_true_for_bucket_labels_0_to_2() {
+    for i in 0..=2 {
+        let id = bucket_label(i);
+        assert!(
+            is_synthetic_id(id),
+            "bucket_label({i})={id} must be synthetic"
+        );
+    }
+}
+
+#[test]
+fn ac4_394_is_synthetic_id_false_for_real_vocab_ids() {
+    use crate::ast_index::vocab_lookup;
+    for kind in ["try_statement", "catch_clause", "function_item", "block"] {
+        if let Some(id) = vocab_lookup(kind) {
+            assert!(
+                !is_synthetic_id(id),
+                "real vocab kind {kind:?} (id={id}) must NOT be synthetic"
+            );
+        }
+    }
+}
+
+#[test]
+fn ac4_394_vocab_len_stays_below_bucket_label_base() {
+    use crate::ast_index::vocab_len;
+    assert!(
+        vocab_len() <= BUCKET_LABEL_BASE as usize,
+        "vocab_len() ({}) must stay <= BUCKET_LABEL_BASE ({}) — otherwise real \
+         vocabulary IDs could collide with the synthetic ID space",
+        vocab_len(),
+        BUCKET_LABEL_BASE
+    );
+}
+
+// ============================================================================
 // F2: Central counting rule — is_counted_child
 // ============================================================================
 
@@ -165,18 +220,22 @@ fn f1_max_depth_tracks_maximum() {
         LinearNode {
             kind_id: 1,
             depth: 0,
+            ..Default::default()
         },
         LinearNode {
             kind_id: 1,
             depth: 1,
+            ..Default::default()
         },
         LinearNode {
             kind_id: 1,
             depth: 2,
+            ..Default::default()
         },
         LinearNode {
             kind_id: 1,
             depth: 3,
+            ..Default::default()
         },
     ];
     let (_, m) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
@@ -190,10 +249,12 @@ fn f1_max_depth_handles_depth_jump() {
         LinearNode {
             kind_id: 1,
             depth: 0,
+            ..Default::default()
         },
         LinearNode {
             kind_id: 1,
             depth: 5,
+            ..Default::default()
         }, // jump by 5
     ];
     let (_, m) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
@@ -214,6 +275,7 @@ fn f1_branch_count_increments_for_branch_kinds() {
         .map(|(i, &kid)| LinearNode {
             kind_id: kid,
             depth: i as u16,
+            ..Default::default()
         })
         .collect();
 
@@ -255,16 +317,19 @@ fn f1_max_block_stmts_counts_body_children() {
         LinearNode {
             kind_id: fn_id,
             depth: 0,
+            ..Default::default()
         },
         LinearNode {
             kind_id: block_id,
             depth: 1,
+            ..Default::default()
         },
     ];
     for _ in 0..7 {
         nodes.push(LinearNode {
             kind_id: stmt_id,
             depth: 2,
+            ..Default::default()
         });
     }
 
@@ -300,16 +365,19 @@ fn f1_max_params_counts_parameter_list_children() {
         LinearNode {
             kind_id: fn_id,
             depth: 0,
+            ..Default::default()
         },
         LinearNode {
             kind_id: params_id,
             depth: 1,
+            ..Default::default()
         },
     ];
     for _ in 0..3 {
         nodes.push(LinearNode {
             kind_id: param_node_id,
             depth: 2,
+            ..Default::default()
         });
     }
 
@@ -352,16 +420,19 @@ fn f3_body_stmt_buckets_emit_cumulatively() {
             LinearNode {
                 kind_id: fn_id,
                 depth: 0,
+                ..Default::default()
             },
             LinearNode {
                 kind_id: block_id,
                 depth: 1,
+                ..Default::default()
             },
         ];
         for _ in 0..n_stmts {
             v.push(LinearNode {
                 kind_id: expr_id,
                 depth: 2,
+                ..Default::default()
             });
         }
         v
@@ -438,7 +509,11 @@ fn f3_depth_buckets_emit_cumulatively() {
     // A node at depth 8 must emit bucket_label(0), bucket_label(1), bucket_label(2)
     let make_nodes_at_depth = |d: u16| -> Vec<LinearNode> {
         (0..=d)
-            .map(|depth| LinearNode { kind_id: 1, depth })
+            .map(|depth| LinearNode {
+                kind_id: 1,
+                depth,
+                ..Default::default()
+            })
             .collect()
     };
 
@@ -496,10 +571,12 @@ fn f3_param_buckets_emit_cumulatively() {
             LinearNode {
                 kind_id: fn_id,
                 depth: 0,
+                ..Default::default()
             },
             LinearNode {
                 kind_id: params_id,
                 depth: 1,
+                ..Default::default()
             },
         ];
         for _ in 0..n_params {
@@ -510,6 +587,7 @@ fn f3_param_buckets_emit_cumulatively() {
                     1
                 },
                 depth: 2,
+                ..Default::default()
             });
         }
         v
@@ -589,15 +667,18 @@ fn f4_empty_body_keyed_on_enclosing_kind() {
         LinearNode {
             kind_id: catch_id,
             depth: 0,
+            ..Default::default()
         },
         LinearNode {
             kind_id: block_id,
             depth: 1,
+            ..Default::default()
         },
         // punctuation at depth 2 (should NOT count as a statement)
         LinearNode {
             kind_id: 0,
             depth: 2,
+            ..Default::default()
         },
     ];
 
@@ -606,15 +687,18 @@ fn f4_empty_body_keyed_on_enclosing_kind() {
         LinearNode {
             kind_id: fn_id,
             depth: 0,
+            ..Default::default()
         },
         LinearNode {
             kind_id: block_id,
             depth: 1,
+            ..Default::default()
         },
         // punctuation at depth 2
         LinearNode {
             kind_id: 0,
             depth: 2,
+            ..Default::default()
         },
     ];
 
@@ -666,18 +750,22 @@ fn f2_punctuation_only_body_is_empty() {
         LinearNode {
             kind_id: fn_id,
             depth: 0,
+            ..Default::default()
         },
         LinearNode {
             kind_id: block_id,
             depth: 1,
+            ..Default::default()
         },
         LinearNode {
             kind_id: 0,
             depth: 2,
+            ..Default::default()
         }, // punctuation
         LinearNode {
             kind_id: 0,
             depth: 2,
+            ..Default::default()
         }, // punctuation
     ];
     let (set, _) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
@@ -710,14 +798,17 @@ fn f2_comment_only_body_is_empty() {
         LinearNode {
             kind_id: fn_id,
             depth: 0,
+            ..Default::default()
         },
         LinearNode {
             kind_id: block_id,
             depth: 1,
+            ..Default::default()
         },
         LinearNode {
             kind_id: comment_id,
             depth: 2,
+            ..Default::default()
         },
     ];
     let (set, _) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
@@ -749,14 +840,17 @@ fn f2_one_real_statement_body_is_not_empty() {
         LinearNode {
             kind_id: fn_id,
             depth: 0,
+            ..Default::default()
         },
         LinearNode {
             kind_id: block_id,
             depth: 1,
+            ..Default::default()
         },
         LinearNode {
             kind_id: stmt_id,
             depth: 2,
+            ..Default::default()
         }, // one real statement
     ];
     let (set, _) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);

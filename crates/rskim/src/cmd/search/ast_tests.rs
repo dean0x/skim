@@ -3771,3 +3771,628 @@ fn compound_temporal_weight_inert_byte_identical_ac3() {
          compound ranking despite there being no temporal sort on this path"
     );
 }
+
+// ============================================================================
+// #394: Standalone --ast returned zero results for all 5 synthetic-marker
+// patterns (god-function, deep-nesting, empty-function, empty-catch,
+// excessive-params). Root cause: `vocab_lookup` never yields a synthetic ID
+// (>= BUCKET_LABEL_BASE), so the real-CST ancestor walk in
+// `pattern_occurs_in_file` was structurally unsatisfiable for them. Fixed via
+// extraction-reuse (AD-394-1/AD-394-2). AC numbers below match the design
+// plan (.devflow/docs/design/wave4-p0/2026-07-04_0930/394-ast-synthetic-markers-plan.md).
+// ============================================================================
+
+/// Ground-truth representative line for each of the 5 synthetic patterns'
+/// exhibiting fixture file (AC10, AC13). Established via empirical dogfood
+/// verification against the built release binary — NOT eyeballed (ADR-003:
+/// grounded, not assumed). Each matches the AD-394-5 per-pattern rule:
+/// god-function/empty-function -> enclosing function line; empty-catch ->
+/// enclosing catch_clause line; excessive-params -> parameter-list's own
+/// line (coincides with the signature line here); deep-nesting -> first node
+/// crossing CST depth >= 4.
+const GOD_FUNCTION_LINE: u32 = 2; // `fn big() {`
+const DEEP_NESTING_LINE: u32 = 3; // `    if true {`
+const EMPTY_FUNCTION_LINE: u32 = 2; // `fn todo_later() {`
+const EMPTY_CATCH_LINE: u32 = 4; // `} catch (e) {`
+const EXCESSIVE_PARAMS_LINE: u32 = 2; // `fn many(a: i32, ...) -> i32 {`
+
+/// Build a project fixture with one exhibiting file per synthetic-marker
+/// pattern (AC1 positives) PLUS its negative twin (AC3). Mirrors the #374
+/// `make_project_for_374_gate` convention: `.git` root + `src/` files. Each
+/// positive fixture places its target construct at a KNOWN line matching the
+/// `*_LINE` constants above (empirically verified, not assumed).
+fn make_project_with_394_synthetic_patterns() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // ── Positives (AC1) ──────────────────────────────────────────────────────
+
+    // god-function: LARGE_BODY -> bucket_label(1), needs >= 20 body statements
+    // (BODY_STMT_EDGES[1] = 20). 20 let-statements — matches the GOLD-verified
+    // catalog example in patterns.rs (reformatted onto known lines).
+    fs::write(
+        root.join("src/god_fn.rs"),
+        "\nfn big() {\n    \
+         let a=1; let b=2; let c=3; let d=4; let e=5; let f=6; let g=7;\n    \
+         let h=8; let i=9; let j=10; let k=11; let l=12; let m=13; let n=14;\n    \
+         let o=15; let p=16; let q=17; let r=18; let s=19; let t=20;\n}\n",
+    )
+    .unwrap();
+
+    // deep-nesting: DEEP_NODE -> bucket_label(0), needs a node at CST depth >= 4.
+    fs::write(
+        root.join("src/deep.rs"),
+        "\nfn a() {\n    if true {\n        for _ in 0..1 {\n            \
+         if true {\n                do_work();\n            }\n        }\n    }\n}\n",
+    )
+    .unwrap();
+
+    // empty-function: EMPTY_BODY -> function_item, zero counted children in body.
+    fs::write(root.join("src/empty_fn.rs"), "\nfn todo_later() {\n}\n").unwrap();
+
+    // excessive-params: MANY_PARAMS -> bucket_label(0), needs >= 5 params
+    // (PARAM_EDGES[0] = 5).
+    fs::write(
+        root.join("src/many_params.rs"),
+        "\nfn many(a: i32, b: i32, c: i32, d: i32, e: i32) -> i32 {\n    \
+         a + b + c + d + e\n}\n",
+    )
+    .unwrap();
+
+    // empty-catch: EMPTY_BODY -> catch_clause, zero counted children in catch body.
+    fs::write(
+        root.join("src/empty_catch.ts"),
+        "\ntry {\n    f();\n} catch (e) {\n}\n",
+    )
+    .unwrap();
+
+    // ── Negative twins (AC3) — each crosses some but not all thresholds, or
+    // has none of the relevant marker; empirically dogfood-verified to NOT
+    // match its corresponding pattern. ──────────────────────────────────────
+
+    // 19 body statements: crosses BODY_STMT_EDGES[0]=10 but NOT [1]=20.
+    fs::write(
+        root.join("src/not_god_fn.rs"),
+        "fn nineteen() {\n    \
+         let a=1; let b=2; let c=3; let d=4; let e=5; let f=6; let g=7;\n    \
+         let h=8; let i=9; let j=10; let k=11; let l=12; let m=13; let n=14;\n    \
+         let o=15; let p=16; let q=17; let r=18; let s=19;\n}\n",
+    )
+    .unwrap();
+
+    // 4 params: below PARAM_EDGES[0]=5.
+    fs::write(
+        root.join("src/not_many_params.rs"),
+        "fn four(a: i32, b: i32, c: i32, d: i32) -> i32 {\n    a + b + c + d\n}\n",
+    )
+    .unwrap();
+
+    // Non-empty catch body.
+    fs::write(
+        root.join("src/not_empty_catch.ts"),
+        "try {\n    f();\n} catch (e) {\n    log(e);\n}\n",
+    )
+    .unwrap();
+
+    // Non-empty function body.
+    fs::write(
+        root.join("src/not_empty_fn.rs"),
+        "fn f() {\n    let x = 1;\n}\n",
+    )
+    .unwrap();
+
+    // Trivial top-level-only fixture — empirically dogfood-verified (via a
+    // real index build + `--ast deep-nesting` query) to have CST max_depth < 4.
+    // AC3 requires this be confirmed empirically, NOT by counting braces —
+    // depth is 0-indexed CST depth and even simple code can reach depth 4.
+    fs::write(root.join("src/not_deep.rs"), "struct S;\n").unwrap();
+
+    dir
+}
+
+/// AC1 (#394): standalone `--ast <pattern>` returns a NON-EMPTY result set
+/// whose text output CONTAINS the exhibiting file's exact path, for ALL FIVE
+/// synthetic-marker patterns. Before the fix, standalone `--ast` returned
+/// zero results for every one of these 5 patterns.
+///
+/// NEGATIVE (PF-007): if the fix regressed to always-empty, every iteration
+/// of this loop fails.
+#[test]
+fn run_ast_standalone_all_five_synthetic_patterns_positive_ac1_394() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_394_synthetic_patterns();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let cases: [(&str, &str); 5] = [
+        ("god-function", "god_fn.rs"),
+        ("deep-nesting", "deep.rs"),
+        ("empty-function", "empty_fn.rs"),
+        ("empty-catch", "empty_catch.ts"),
+        ("excessive-params", "many_params.rs"),
+    ];
+
+    for (pattern, exhibiting_file) in cases {
+        let mut out: Vec<u8> = Vec::new();
+        let result = super::run_ast_standalone(
+            pattern,
+            20,
+            false,
+            cache.path(),
+            &manifest,
+            None,
+            None,
+            None,
+            project.path(),
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            std::process::ExitCode::SUCCESS,
+            "AC1 (#394): --ast {pattern} must exit 0"
+        );
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(exhibiting_file),
+            "AC1 (#394): --ast {pattern} must return a NON-EMPTY result set \
+             containing {exhibiting_file}; got:\n{text}"
+        );
+    }
+}
+
+/// AC2 (#394): the exhibiting file returned by standalone `--ast <p>` is ALSO
+/// returned by the compound path `<text> --ast <p>`, for ALL FIVE synthetic
+/// patterns (membership assertion — ranking/windowing may differ between the
+/// two paths, so list-identity is NOT asserted).
+#[test]
+fn run_ast_standalone_matches_compound_for_all_five_synthetic_patterns_ac2_394() {
+    use super::super::manifest::FileManifest;
+    use super::super::query::execute_query;
+
+    let project = make_project_with_394_synthetic_patterns();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // (pattern, exhibiting file, unique text term selecting that file)
+    let cases: [(&str, &str, &str); 5] = [
+        ("god-function", "god_fn.rs", "big"),
+        ("deep-nesting", "deep.rs", "do_work"),
+        ("empty-function", "empty_fn.rs", "todo_later"),
+        ("empty-catch", "empty_catch.ts", "catch"),
+        ("excessive-params", "many_params.rs", "many"),
+    ];
+
+    for (pattern, exhibiting_file, term) in cases {
+        // Standalone.
+        let mut standalone_out: Vec<u8> = Vec::new();
+        super::run_ast_standalone(
+            pattern,
+            20,
+            false,
+            cache.path(),
+            &manifest,
+            None,
+            None,
+            None,
+            project.path(),
+            &mut standalone_out,
+        )
+        .unwrap();
+        let standalone_text = String::from_utf8(standalone_out).unwrap();
+        assert!(
+            standalone_text.contains(exhibiting_file),
+            "AC2 (#394): standalone --ast {pattern} must contain {exhibiting_file}; \
+             got:\n{standalone_text}"
+        );
+
+        // Compound: text term + --ast.
+        let engine = super::open_ast_engine(cache.path()).unwrap();
+        let ast_scored = super::resolve_ast_scored(&engine, pattern).unwrap();
+        let config = make_query_config(
+            project.path(),
+            cache.path(),
+            term,
+            20,
+            Some(ast_scored),
+            None,
+        );
+        let compound_out = execute_query(&config, &TEST_ANALYTICS).unwrap();
+        let found = compound_out
+            .results
+            .iter()
+            .any(|r| r.path.contains(exhibiting_file));
+        assert!(
+            found,
+            "AC2 (#394): compound '{term} --ast {pattern}' must ALSO return \
+             {exhibiting_file}; got paths: {:?}",
+            compound_out
+                .results
+                .iter()
+                .map(|r| &r.path)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// AC3 (#394): `pattern_occurs_in_file` returns FALSE for each synthetic
+/// pattern's negative twin — proves the gate discriminates rather than
+/// always-true. Uses direct file calls (no index build needed).
+///
+/// NEGATIVE (PF-007): an always-true stub (e.g. "any synthetic-containing
+/// pattern passes unconditionally") would fail every assertion below.
+#[test]
+fn pattern_occurs_in_file_false_for_all_five_synthetic_negative_twins_ac3_394() {
+    let project = make_project_with_394_synthetic_patterns();
+
+    let cases: [(&str, &str); 5] = [
+        ("god-function", "src/not_god_fn.rs"),
+        ("deep-nesting", "src/not_deep.rs"),
+        ("empty-function", "src/not_empty_fn.rs"),
+        ("empty-catch", "src/not_empty_catch.ts"),
+        ("excessive-params", "src/not_many_params.rs"),
+    ];
+
+    for (pattern, rel_path) in cases {
+        let query = rskim_search::parse_ast_query(pattern).unwrap();
+        let path = project.path().join(rel_path);
+        assert!(
+            !rskim_search::pattern_occurs_in_file(&path, &query, None),
+            "AC3 (#394): {pattern}'s negative twin ({rel_path}) must NOT match \
+             (gate must discriminate, not always-true)"
+        );
+    }
+
+    // POSITIVE control (PF-007 double-assertion): the SAME gate call returns
+    // true for the corresponding exhibiting file, proving it is not
+    // always-false either.
+    let positive_cases: [(&str, &str); 5] = [
+        ("god-function", "src/god_fn.rs"),
+        ("deep-nesting", "src/deep.rs"),
+        ("empty-function", "src/empty_fn.rs"),
+        ("empty-catch", "src/empty_catch.ts"),
+        ("excessive-params", "src/many_params.rs"),
+    ];
+    for (pattern, rel_path) in positive_cases {
+        let query = rskim_search::parse_ast_query(pattern).unwrap();
+        let path = project.path().join(rel_path);
+        assert!(
+            rskim_search::pattern_occurs_in_file(&path, &query, None),
+            "AC3 (#394) control: {pattern}'s exhibiting file ({rel_path}) must match"
+        );
+    }
+}
+
+/// AC7 (#394), parse-level half: a containment query written with
+/// synthetic-marker names is REJECTED at parse with `InvalidQuery` — synthetic
+/// names are not real vocabulary kinds, so `vocab_lookup` fails for them in
+/// `parse_bigram`. Only named `AstQuery::Pattern` queries can ever route
+/// synthetic (the `AncestorMatchTable::contains_synthetic_id`-false half of
+/// AC7 is covered in `reparse_tests.rs`, which has direct access to the
+/// private table).
+#[test]
+fn synthetic_marker_names_rejected_in_containment_query_ac7_394() {
+    let result = rskim_search::parse_ast_query("__deep_node__ > __deep_node_b4__");
+    assert!(
+        result.is_err(),
+        "AC7 (#394): a containment query using synthetic-marker names must be \
+         rejected at parse (InvalidQuery), not silently accepted; got: {result:?}"
+    );
+}
+
+/// AC8 (#394), CRITICAL invariant: no pattern in the catalog mixes a
+/// synthetic-containing n-gram (any resolved component >= BUCKET_LABEL_BASE)
+/// with a real n-gram (all components < BUCKET_LABEL_BASE). This is the
+/// safety assumption that makes AD-394-2's WHOLE-PATTERN routing sound; if it
+/// is ever violated, extraction-reuse would silently loosen a real pattern's
+/// gate too (see AD-394-2 / OD-394-2).
+///
+/// This test MUST fail fast if the invariant is ever violated (R4 mitigation).
+#[test]
+fn no_catalog_pattern_mixes_real_and_synthetic_ngrams_ac8_394() {
+    use rskim_search::is_synthetic_id;
+
+    for pattern in rskim_search::all_patterns() {
+        let query = rskim_search::parse_ast_query(pattern.name)
+            .unwrap_or_else(|e| panic!("pattern {:?} must parse: {e}", pattern.name));
+        let rskim_search::AstQuery::Pattern(p) = &query else {
+            panic!(
+                "catalog pattern {:?} must parse to AstQuery::Pattern",
+                pattern.name
+            );
+        };
+
+        let mut has_synthetic = false;
+        let mut has_real = false;
+        for bigram in p.resolved_bigrams() {
+            let (parent, child) = bigram.decode();
+            if is_synthetic_id(parent) || is_synthetic_id(child) {
+                has_synthetic = true;
+            } else {
+                has_real = true;
+            }
+        }
+        for trigram in p.resolved_trigrams() {
+            let (gp, parent, child) = trigram.decode();
+            if is_synthetic_id(gp) || is_synthetic_id(parent) || is_synthetic_id(child) {
+                has_synthetic = true;
+            } else {
+                has_real = true;
+            }
+        }
+
+        assert!(
+            !(has_synthetic && has_real),
+            "AC8 (#394) CRITICAL: pattern {:?} mixes synthetic AND real n-grams — \
+             this violates the whole-pattern routing invariant (AD-394-2/OD-394-2); \
+             a per-n-gram routing redesign or pattern split is required",
+            pattern.name
+        );
+    }
+}
+
+/// AC9 (#394): catalog-driven regression guard over ALL 29 patterns (moved
+/// here from `reparse_tests.rs` for LOCAL execution — `all_patterns`,
+/// `parse_ast_query`, and `pattern_occurs_in_file` are all pub-exported). For
+/// every pattern, writing its GOLD-verified `example` to a tempfile with the
+/// matching extension and calling `pattern_occurs_in_file` must return `true`
+/// — this is the guard that would have caught #394 at introduction (the 5
+/// synthetic patterns would have failed this assertion before the fix).
+#[test]
+fn catalog_driven_pattern_occurs_true_for_every_pattern_example_ac9_394() {
+    fn extension_for(lang: rskim_core::Language) -> &'static str {
+        match lang {
+            rskim_core::Language::Rust => "rs",
+            rskim_core::Language::TypeScript => "ts",
+            rskim_core::Language::Python => "py",
+            rskim_core::Language::Go => "go",
+            rskim_core::Language::Java => "java",
+            rskim_core::Language::Ruby => "rb",
+            other => panic!(
+                "AC9 (#394): pattern catalog example_lang {other:?} has no \
+                 extension mapping in this test — add one (load-bearing \
+                 symmetry with Language::from_path)"
+            ),
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+
+    for pattern in rskim_search::all_patterns() {
+        let ext = extension_for(pattern.example_lang);
+        let path = dir
+            .path()
+            .join(format!("{}.{ext}", pattern.name.replace('-', "_")));
+        fs::write(&path, pattern.example).unwrap();
+
+        let query = rskim_search::parse_ast_query(pattern.name)
+            .unwrap_or_else(|e| panic!("pattern {:?} must parse: {e}", pattern.name));
+
+        assert!(
+            rskim_search::pattern_occurs_in_file(&path, &query, None),
+            "AC9 (#394): catalog pattern {:?}'s GOLD-verified example must satisfy \
+             pattern_occurs_in_file (this is the guard that would have caught #394 \
+             — all 5 synthetic patterns failed this before the fix)",
+            pattern.name
+        );
+    }
+}
+
+/// AC10 (#394): synthetic-pattern rows carry a non-null `line` in `--json`
+/// output, equal to the ground-truth representative line (AD-394-5), for ALL
+/// FIVE patterns. PF-007 discriminating: asserts the VALUE, not just presence
+/// or exit 0 — a stub emitting `"line": null` or an arbitrary line fails this.
+#[test]
+fn run_ast_standalone_json_line_matches_ground_truth_for_all_five_ac10_394() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_394_synthetic_patterns();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let cases: [(&str, &str, u32); 5] = [
+        ("god-function", "god_fn.rs", GOD_FUNCTION_LINE),
+        ("deep-nesting", "deep.rs", DEEP_NESTING_LINE),
+        ("empty-function", "empty_fn.rs", EMPTY_FUNCTION_LINE),
+        ("empty-catch", "empty_catch.ts", EMPTY_CATCH_LINE),
+        ("excessive-params", "many_params.rs", EXCESSIVE_PARAMS_LINE),
+    ];
+
+    for (pattern, exhibiting_file, expected_line) in cases {
+        let mut out: Vec<u8> = Vec::new();
+        super::run_ast_standalone(
+            pattern,
+            20,
+            true, // json
+            cache.path(),
+            &manifest,
+            None,
+            None,
+            None,
+            project.path(),
+            &mut out,
+        )
+        .unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
+            .unwrap_or_else(|e| panic!("AC10 (#394): --ast {pattern} --json must parse: {e}"));
+        let results = v["results"].as_array().unwrap();
+        // `path` is repo-relative (e.g. "src/god_fn.rs"), so match by substring
+        // against the bare filename — consistent with AC1/AC2's `.contains()`.
+        let entry = results
+            .iter()
+            .find(|r| {
+                r["path"]
+                    .as_str()
+                    .is_some_and(|p| p.contains(exhibiting_file))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "AC10 (#394): --ast {pattern} --json must contain {exhibiting_file}; got: {v}"
+                )
+            });
+
+        let line = entry["line"].as_u64();
+        assert_eq!(
+            line,
+            Some(u64::from(expected_line)),
+            "AC10 (#394): --ast {pattern}'s {exhibiting_file} JSON `line` must equal \
+             the ground-truth representative line {expected_line} (NOT null, NOT \
+             an arbitrary value); got: {:?}",
+            entry["line"]
+        );
+        assert!(
+            entry["snippet"].as_str().is_some_and(|s| !s.is_empty()),
+            "AC10 (#394): --ast {pattern}'s {exhibiting_file} must carry a non-empty \
+             snippet; got: {:?}",
+            entry["snippet"]
+        );
+    }
+}
+
+/// AC13 (#394): per-pattern representative-line rule at the `recover_line`
+/// API level (direct calls, no index needed) — for each of the 5 synthetic
+/// patterns, `recover_line` returns `Some((line, range))` with `line` equal
+/// to the AD-394-5 ground-truth node line and a non-empty `range`.
+///
+/// Each of these 5 assertions FAILS before the fix (`recover_line` returns
+/// `None` for every synthetic pattern pre-#394), proving the new branch.
+///
+/// NEGATIVE control: a REAL pattern (`rust-nested-loop`) still recovers via
+/// the unchanged `MatchTable` walk on an unrelated fixture — proving the
+/// synthetic branch did not alter real-pattern line recovery.
+#[test]
+fn recover_line_matches_ground_truth_for_all_five_synthetic_patterns_ac13_394() {
+    let project = make_project_with_394_synthetic_patterns();
+
+    let cases: [(&str, &str, u32); 5] = [
+        ("god-function", "src/god_fn.rs", GOD_FUNCTION_LINE),
+        ("deep-nesting", "src/deep.rs", DEEP_NESTING_LINE),
+        ("empty-function", "src/empty_fn.rs", EMPTY_FUNCTION_LINE),
+        ("empty-catch", "src/empty_catch.ts", EMPTY_CATCH_LINE),
+        (
+            "excessive-params",
+            "src/many_params.rs",
+            EXCESSIVE_PARAMS_LINE,
+        ),
+    ];
+
+    for (pattern, rel_path, expected_line) in cases {
+        let query = rskim_search::parse_ast_query(pattern).unwrap();
+        let path = project.path().join(rel_path);
+        let result = rskim_search::recover_line(&path, &query, None);
+
+        let (line, range) = result.unwrap_or_else(|| {
+            panic!(
+                "AC13 (#394): recover_line({pattern}) on {rel_path} must return \
+                 Some((line, range)), not None (this is the pre-fix behavior for \
+                 every synthetic pattern)"
+            )
+        });
+        assert_eq!(
+            line, expected_line,
+            "AC13 (#394): recover_line({pattern}) on {rel_path} must report line \
+             {expected_line} (AD-394-5 ground truth); got {line}"
+        );
+        assert!(
+            !range.is_empty(),
+            "AC13 (#394): recover_line({pattern}) on {rel_path} must return a \
+             non-empty byte range so the snippet renders; got {range:?}"
+        );
+    }
+
+    // Determinism (AC-F3): repeated calls on the same file yield the same result.
+    let query = rskim_search::parse_ast_query("god-function").unwrap();
+    let path = project.path().join("src/god_fn.rs");
+    let r1 = rskim_search::recover_line(&path, &query, None);
+    let r2 = rskim_search::recover_line(&path, &query, None);
+    assert_eq!(
+        r1, r2,
+        "AC13 (#394) / AC-F3: recover_line must be deterministic for synthetic patterns"
+    );
+
+    // NEGATIVE control: a REAL pattern's line recovery is unchanged — uses the
+    // existing #374 nested-loop fixture convention (rust-nested-loop always
+    // has SOME resolvable trigram in Rust).
+    let real_dir = tempfile::tempdir().unwrap();
+    let real_path = real_dir.path().join("loops.rs");
+    fs::write(
+        &real_path,
+        "\nfn nested() {\n    for i in 0..10 {\n        for j in 0..10 {\n            \
+         println!(\"{i} {j}\");\n        }\n    }\n}\n",
+    )
+    .unwrap();
+    let real_query = rskim_search::parse_ast_query("rust-nested-loop").unwrap();
+    let real_result = rskim_search::recover_line(&real_path, &real_query, None);
+    assert!(
+        real_result.is_some(),
+        "AC13 (#394) control: a REAL pattern (rust-nested-loop) must still \
+         recover a line via the unchanged MatchTable walk; got None"
+    );
+}
+
+/// AC12 (#394): synthetic-pattern queries are query-time only — the AST
+/// on-disk FORMAT_VERSION does not change across consecutive queries, and no
+/// self-heal/rebuild fires on the second query.
+#[test]
+fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_394_synthetic_patterns();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let version_before = rskim_search::AstIndexReader::index_version(cache.path())
+        .expect("index_version must succeed after build");
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Query the SAME synthetic pattern twice.
+    for _ in 0..2 {
+        let mut out: Vec<u8> = Vec::new();
+        super::run_ast_standalone(
+            "god-function",
+            20,
+            false,
+            cache.path(),
+            &manifest,
+            None,
+            None,
+            None,
+            project.path(),
+            &mut out,
+        )
+        .unwrap();
+    }
+
+    let version_after = rskim_search::AstIndexReader::index_version(cache.path())
+        .expect("index_version must succeed after synthetic gate queries");
+
+    assert_eq!(
+        version_before, version_after,
+        "AC12 (#394): FORMAT_VERSION must not change across synthetic-pattern \
+         queries (read-side / query-time only fix, no persisted format touch)"
+    );
+    assert_eq!(
+        version_before,
+        rskim_search::AST_INDEX_FORMAT_VERSION,
+        "AC12 (#394): format version must equal AST_INDEX_FORMAT_VERSION ({})",
+        rskim_search::AST_INDEX_FORMAT_VERSION
+    );
+}

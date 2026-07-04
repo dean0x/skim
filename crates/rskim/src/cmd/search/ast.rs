@@ -266,6 +266,17 @@ pub(super) fn run_ast_standalone(
     // `recover_line`. This is the correctness backstop that eliminates unrelated-
     // subtree false positives that AND-intersect alone would keep.
     //
+    // AD-394-4 (#394): the 5 synthetic-marker patterns (god-function,
+    // deep-nesting, empty-function, empty-catch, excessive-params) now pass
+    // through this SAME `pattern_occurs_in_file` call via an internal
+    // extraction-reuse branch (`compound::reparse`, AD-394-1/AD-394-2) — before
+    // #394 they always failed the gate (a synthetic ID can never appear in a
+    // real `node.parent()` chain), so standalone `--ast <synthetic-pattern>`
+    // returned zero results for all 5 while the compound path (which skips this
+    // gate, see below) returned matches — a standalone/compound contradiction
+    // (avoids PF-006). This call site is otherwise UNCHANGED; the routing is
+    // internal to `pattern_occurs_in_file`.
+    //
     // AD-374-5: Non-tree-sitter files (JSON/TOML/YAML, node_count=0) return false
     // from `pattern_occurs_in_file` and are dropped here.
     //
@@ -336,6 +347,13 @@ pub(super) fn run_ast_standalone(
     // by the verify gate above. A file that passes the gate but whose representative
     // line cannot be recovered still emits as a degraded row (path present, no :line
     // or snippet). recover_line returning None MUST NOT drop a gate-passed file.
+    //
+    // Updated for #394 (OD-394-1, AD-394-5): `recover_line` is now
+    // synthetic-aware, so a gate-passed synthetic-pattern row (god-function,
+    // deep-nesting, empty-function, empty-catch, excessive-params) recovers a
+    // REAL `:line`/snippet here too, instead of degrading to a path-only row.
+    // This call site itself is unchanged — the synthetic branch is internal to
+    // `recover_line`.
     for r in &mut resolved {
         let abs_path = root.join(&r.path);
         // Recover the stored mtime from the manifest for the stale guard.

@@ -70,9 +70,20 @@ const MAX_FILE_SIZE_LARGE: usize = 1024 * 1024;
 /// to resolve the string. A `kind_id` of `0` (sentinel) means the grammar
 /// kind was not found in the vocabulary (unknown kind).
 ///
-/// `depth` is the 0-indexed traversal depth from the root. Parent–child
+/// `depth` is the 0-indexed depth from the root. Parent–child
 /// relationships are recoverable: a node's parent is the nearest preceding
 /// node with `depth == self.depth - 1`.
+///
+/// # AD-394-6: `start_line`/`start_byte` are transient, never persisted
+///
+/// Added for OD-394-1 (synthetic-marker line recovery): `start_line` (1-indexed)
+/// and `start_byte` carry the node's source position so `extract.rs` can record
+/// a representative position per emitted synthetic marker in the SAME traversal
+/// that emits it (ADR-006 — one pass, no second detection re-implementation).
+/// `LinearNode` is a transient in-memory intermediate — only n-gram postings and
+/// per-file `StructuralMetrics` are ever serialized (`store/builder.rs`,
+/// `store/format.rs FORMAT_VERSION=2`) — so this addition does NOT change the
+/// on-disk format, bump `FORMAT_VERSION`, or trigger a rebuild/self-heal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LinearNode {
     /// Vocabulary ID into `NODE_KIND_VOCABULARY`. `0` is the sentinel for
@@ -80,6 +91,10 @@ pub struct LinearNode {
     pub kind_id: NodeKindId,
     /// 0-indexed depth from the tree root (root node is depth 0).
     pub depth: u16,
+    /// 1-indexed source line the node starts on (AD-394-6). Transient/unpersisted.
+    pub start_line: u32,
+    /// Byte offset the node starts at (AD-394-6). Transient/unpersisted.
+    pub start_byte: u32,
 }
 
 /// Result of linearizing a single source file.
@@ -269,9 +284,18 @@ fn linearize_tree(tree: &tree_sitter::Tree, lang_map: &[Option<u16>]) -> Lineari
         // saturating_cast is the correct pattern for converting u32 → u16.
         #[allow(clippy::cast_possible_truncation)]
         let depth = item.depth.min(u32::from(u16::MAX)) as u16;
+        // AD-394-6 / PF-004: widen usize → u32 BEFORE saturating_add(1) for
+        // 1-indexing — mirrors reparse.rs's recover_line row→line conversion.
+        // No u16 depth arithmetic is introduced here (PF-004 is about depth
+        // comparisons; this is an independent source-position field).
+        let row = item.node.start_position().row;
+        let start_line = u32::try_from(row).unwrap_or(u32::MAX).saturating_add(1);
+        let start_byte = u32::try_from(item.node.start_byte()).unwrap_or(u32::MAX);
         nodes.push(LinearNode {
             kind_id: vocab_id,
             depth,
+            start_line,
+            start_byte,
         });
     }
 

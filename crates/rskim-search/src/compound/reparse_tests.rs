@@ -583,3 +583,309 @@ fn pattern_occurs_true_and_false_cover_both_branches() {
         "PF-007 double-assertion: no_loop.rs must return false (no for_expression at all)"
     );
 }
+
+// ============================================================================
+// #394: Synthetic-marker patterns — standalone --ast returned zero results for
+// all 5 (god-function, deep-nesting, empty-function, empty-catch,
+// excessive-params) because `vocab_lookup` never yields a synthetic ID, making
+// the strict ancestor walk structurally unsatisfiable. Fixed via
+// extraction-reuse (AD-394-1/AD-394-2). Ground-truth lines below were
+// established via empirical dogfood verification against the release binary
+// (ADR-003), not eyeballed.
+// ============================================================================
+
+/// AC1 (#394) unit-level, all 5: `pattern_occurs_in_file` returns `true` for
+/// each synthetic pattern's exhibiting fixture. Each assertion FAILS before
+/// the fix (the strict walk can never match a synthetic ID).
+#[test]
+fn pattern_occurs_true_for_all_five_synthetic_patterns_ac1_394() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let god_fn = write_fixture(
+        &dir,
+        "god_fn.rs",
+        "\nfn big() {\n    \
+         let a=1; let b=2; let c=3; let d=4; let e=5; let f=6; let g=7;\n    \
+         let h=8; let i=9; let j=10; let k=11; let l=12; let m=13; let n=14;\n    \
+         let o=15; let p=16; let q=17; let r=18; let s=19; let t=20;\n}\n",
+    );
+    let deep = write_fixture(
+        &dir,
+        "deep.rs",
+        "\nfn a() {\n    if true {\n        for _ in 0..1 {\n            \
+         if true {\n                do_work();\n            }\n        }\n    }\n}\n",
+    );
+    let empty_fn = write_fixture(&dir, "empty_fn.rs", "\nfn todo_later() {\n}\n");
+    let empty_catch = write_fixture(
+        &dir,
+        "empty_catch.ts",
+        "\ntry {\n    f();\n} catch (e) {\n}\n",
+    );
+    let many_params = write_fixture(
+        &dir,
+        "many_params.rs",
+        "\nfn many(a: i32, b: i32, c: i32, d: i32, e: i32) -> i32 {\n    \
+         a + b + c + d + e\n}\n",
+    );
+
+    let cases = [
+        ("god-function", god_fn),
+        ("deep-nesting", deep),
+        ("empty-function", empty_fn),
+        ("empty-catch", empty_catch),
+        ("excessive-params", many_params),
+    ];
+
+    for (pattern, path) in cases {
+        let query = parse_ast_query(pattern).unwrap();
+        assert!(
+            pattern_occurs_in_file(&path, &query, None),
+            "AC1 (#394): {pattern} must return true for its exhibiting fixture \
+             ({path:?}) — fails before the fix (strict walk can never match a \
+             synthetic ID)"
+        );
+    }
+}
+
+/// AC3 (#394), all 5: `pattern_occurs_in_file` returns `false` for each
+/// synthetic pattern's negative twin — proves the extraction-reuse gate
+/// discriminates rather than always-true.
+#[test]
+fn pattern_occurs_false_for_all_five_synthetic_negative_twins_ac3_394() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let not_god_fn = write_fixture(
+        &dir,
+        "not_god_fn.rs",
+        "fn nineteen() {\n    \
+         let a=1; let b=2; let c=3; let d=4; let e=5; let f=6; let g=7;\n    \
+         let h=8; let i=9; let j=10; let k=11; let l=12; let m=13; let n=14;\n    \
+         let o=15; let p=16; let q=17; let r=18; let s=19;\n}\n",
+    );
+    // Empirically dogfood-verified (release binary --ast deep-nesting query)
+    // to have CST max_depth < 4 — a trivial top-level-only fixture, NOT
+    // eyeballed/brace-counted (AC3 requires empirical confirmation).
+    let not_deep = write_fixture(&dir, "not_deep.rs", "struct S;\n");
+    let not_empty_fn = write_fixture(&dir, "not_empty_fn.rs", "fn f() {\n    let x = 1;\n}\n");
+    let not_empty_catch = write_fixture(
+        &dir,
+        "not_empty_catch.ts",
+        "try {\n    f();\n} catch (e) {\n    log(e);\n}\n",
+    );
+    let not_many_params = write_fixture(
+        &dir,
+        "not_many_params.rs",
+        "fn four(a: i32, b: i32, c: i32, d: i32) -> i32 {\n    a + b + c + d\n}\n",
+    );
+
+    let cases = [
+        ("god-function", not_god_fn),
+        ("deep-nesting", not_deep),
+        ("empty-function", not_empty_fn),
+        ("empty-catch", not_empty_catch),
+        ("excessive-params", not_many_params),
+    ];
+
+    for (pattern, path) in cases {
+        let query = parse_ast_query(pattern).unwrap();
+        assert!(
+            !pattern_occurs_in_file(&path, &query, None),
+            "AC3 (#394): {pattern}'s negative twin ({path:?}) must return false \
+             (gate must discriminate, not always-true)"
+        );
+    }
+}
+
+/// AC6 (#394): fail-soft guards on the SYNTHETIC branch — a synthetic pattern
+/// (god-function) must return `false` (never panic) for the same degraded
+/// inputs the real branch already guards against: non-tree-sitter file, file
+/// over the size guard, and mtime mismatch.
+#[test]
+fn pattern_occurs_false_for_synthetic_pattern_on_degraded_inputs_ac6_394() {
+    use super::MAX_REPARSE_FILE_BYTES;
+
+    let dir = tempfile::tempdir().unwrap();
+    let query = parse_ast_query("god-function").unwrap();
+
+    // Non-tree-sitter language.
+    let json_path = write_fixture(&dir, "config.json", r#"{"key": "value"}"#);
+    assert!(
+        !pattern_occurs_in_file(&json_path, &query, None),
+        "AC6 (#394): synthetic pattern must return false for a non-tree-sitter \
+         file (JSON), not panic"
+    );
+
+    // Oversized file.
+    let huge_path = dir.path().join("huge.rs");
+    std::fs::write(
+        &huge_path,
+        "x".repeat((MAX_REPARSE_FILE_BYTES + 1) as usize).as_bytes(),
+    )
+    .unwrap();
+    assert!(
+        !pattern_occurs_in_file(&huge_path, &query, None),
+        "AC6 (#394): synthetic pattern must return false for a file over the \
+         size guard, not panic"
+    );
+
+    // Mtime mismatch.
+    let mtime_path = write_fixture(&dir, "big.rs", "fn big() { let a = 1; }\n");
+    assert!(
+        !pattern_occurs_in_file(&mtime_path, &query, Some(1)),
+        "AC6 (#394): synthetic pattern must return false on mtime mismatch \
+         (stored=1, ancient epoch), not panic"
+    );
+
+    // Missing file.
+    assert!(
+        !pattern_occurs_in_file(Path::new("/nonexistent/path/god_fn.rs"), &query, None),
+        "AC6 (#394): synthetic pattern must return false for a nonexistent \
+         file, not panic"
+    );
+}
+
+/// AC7 (#394): `contains_synthetic_id` is `false` for a containment query
+/// (`AstQuery::Containment` can never carry a synthetic component — the
+/// parser rejects synthetic-marker names before a `Containment` value can be
+/// constructed) and `true` for a synthetic-marker `AstQuery::Pattern`.
+#[test]
+fn contains_synthetic_id_false_for_containment_true_for_synthetic_pattern_ac7_394() {
+    // Containment query — real node kinds only.
+    let containment_query = parse_ast_query("for_statement > block").unwrap();
+    let containment_table = super::AncestorMatchTable::build(&containment_query);
+    assert!(
+        !containment_table.contains_synthetic_id(),
+        "AC7 (#394): a containment query must never route synthetic \
+         (contains_synthetic_id must be false)"
+    );
+
+    // Synthetic-marker pattern.
+    let synthetic_query = parse_ast_query("god-function").unwrap();
+    let synthetic_table = super::AncestorMatchTable::build(&synthetic_query);
+    assert!(
+        synthetic_table.contains_synthetic_id(),
+        "AC7 (#394) control: god-function must route synthetic \
+         (contains_synthetic_id must be true)"
+    );
+
+    // Real-node pattern (control) — must NOT route synthetic either.
+    let real_query = parse_ast_query("try-catch").unwrap();
+    let real_table = super::AncestorMatchTable::build(&real_query);
+    assert!(
+        !real_table.contains_synthetic_id(),
+        "AC7 (#394) control: a real-node pattern (try-catch) must NOT route \
+         synthetic"
+    );
+
+    // Synthetic-marker name is rejected at parse for containment queries —
+    // so a Containment value carrying a synthetic component can never even
+    // be constructed.
+    let rejected = parse_ast_query("__deep_node__ > __deep_node_b4__");
+    assert!(
+        rejected.is_err(),
+        "AC7 (#394): containment query using synthetic-marker names must be \
+         rejected at parse"
+    );
+}
+
+/// AC13 (#394), all 5: `recover_line` returns `Some((line, range))` with
+/// `line` equal to the AD-394-5 ground-truth node line, for each synthetic
+/// pattern. Each assertion FAILS before the fix (`recover_line` returns
+/// `None` for every synthetic pattern pre-#394).
+#[test]
+fn recover_line_matches_ground_truth_for_all_five_synthetic_patterns_ac13_394() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let god_fn = write_fixture(
+        &dir,
+        "god_fn.rs",
+        "\nfn big() {\n    \
+         let a=1; let b=2; let c=3; let d=4; let e=5; let f=6; let g=7;\n    \
+         let h=8; let i=9; let j=10; let k=11; let l=12; let m=13; let n=14;\n    \
+         let o=15; let p=16; let q=17; let r=18; let s=19; let t=20;\n}\n",
+    );
+    let deep = write_fixture(
+        &dir,
+        "deep.rs",
+        "\nfn a() {\n    if true {\n        for _ in 0..1 {\n            \
+         if true {\n                do_work();\n            }\n        }\n    }\n}\n",
+    );
+    let empty_fn = write_fixture(&dir, "empty_fn.rs", "\nfn todo_later() {\n}\n");
+    let empty_catch = write_fixture(
+        &dir,
+        "empty_catch.ts",
+        "\ntry {\n    f();\n} catch (e) {\n}\n",
+    );
+    let many_params = write_fixture(
+        &dir,
+        "many_params.rs",
+        "\nfn many(a: i32, b: i32, c: i32, d: i32, e: i32) -> i32 {\n    \
+         a + b + c + d + e\n}\n",
+    );
+
+    // (pattern, fixture path, ground-truth 1-indexed line — AD-394-5 rule)
+    let cases: [(&str, std::path::PathBuf, u32); 5] = [
+        ("god-function", god_fn, 2),          // `fn big() {` — enclosing function
+        ("deep-nesting", deep, 3),            // `    if true {` — first depth>=4 node
+        ("empty-function", empty_fn, 2),      // `fn todo_later() {` — function_item
+        ("empty-catch", empty_catch, 4),      // `} catch (e) {` — catch_clause
+        ("excessive-params", many_params, 2), // `fn many(...)` — param-list's own line
+    ];
+
+    for (pattern, path, expected_line) in cases {
+        let query = parse_ast_query(pattern).unwrap();
+        let result = recover_line(&path, &query, None);
+        assert!(
+            result.is_some(),
+            "AC13 (#394): recover_line({pattern}) must return Some((line, range)), \
+             not None — this is the pre-fix behavior for every synthetic pattern"
+        );
+        let (line, range) = result.unwrap();
+        assert_eq!(
+            line, expected_line,
+            "AC13 (#394): recover_line({pattern}) must report line {expected_line} \
+             (AD-394-5 ground truth); got {line}"
+        );
+        assert!(
+            !range.is_empty(),
+            "AC13 (#394): recover_line({pattern}) must return a non-empty byte \
+             range; got {range:?}"
+        );
+    }
+}
+
+/// AC13 (#394) fail-soft: `recover_line`'s synthetic branch degrades to `None`
+/// on the same inputs the real branch already guards against.
+#[test]
+fn recover_line_none_for_synthetic_pattern_on_degraded_inputs_ac13_394() {
+    use super::MAX_REPARSE_FILE_BYTES;
+
+    let dir = tempfile::tempdir().unwrap();
+    let query = parse_ast_query("god-function").unwrap();
+
+    let json_path = write_fixture(&dir, "config.json", r#"{"key": "value"}"#);
+    assert!(
+        recover_line(&json_path, &query, None).is_none(),
+        "AC13 (#394): synthetic pattern recover_line must return None for a \
+         non-tree-sitter file (JSON)"
+    );
+
+    let huge_path = dir.path().join("huge.rs");
+    std::fs::write(
+        &huge_path,
+        "x".repeat((MAX_REPARSE_FILE_BYTES + 1) as usize).as_bytes(),
+    )
+    .unwrap();
+    assert!(
+        recover_line(&huge_path, &query, None).is_none(),
+        "AC13 (#394): synthetic pattern recover_line must return None for a \
+         file over the size guard"
+    );
+
+    let mtime_path = write_fixture(&dir, "big.rs", "fn big() { let a = 1; }\n");
+    assert!(
+        recover_line(&mtime_path, &query, Some(1)).is_none(),
+        "AC13 (#394): synthetic pattern recover_line must return None on mtime \
+         mismatch"
+    );
+}

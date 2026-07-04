@@ -292,8 +292,62 @@ pub fn extract_ast_ngrams_with_metrics(
     nodes: &[LinearNode],
     lang: Language,
 ) -> (AstNgramSet, StructuralMetrics) {
+    match run_extraction(nodes, lang) {
+        Some(state) => state.into_ngram_set(),
+        None => (AstNgramSet::default(), StructuralMetrics::default()),
+    }
+}
+
+/// Extract structural n-grams, per-file metrics, AND a representative source
+/// position per emitted synthetic marker — in the SAME single pass as
+/// [`extract_ast_ngrams_with_metrics`] (AD-394-6, OD-394-1).
+///
+/// `recover_line`'s synthetic branch (AD-394-5, `compound::reparse`) calls this
+/// to recover a representative `:line` for a matched synthetic-marker AST
+/// pattern (god-function, deep-nesting, empty-function, empty-catch,
+/// excessive-params), reusing the exact traversal that emitted the marker
+/// instead of re-implementing detection on a second CST walk (ADR-006 — the
+/// indexer is the single source of truth).
+///
+/// [`extract_ast_ngrams_with_metrics`]'s 2-tuple signature is preserved
+/// unchanged for its 4 existing callers (and the GOLD pattern-catalog test) —
+/// both functions share the SAME [`run_extraction`] traversal; this wrapper
+/// simply keeps the synthetic-marker position side table instead of dropping
+/// it, so there is zero risk of the two entry points drifting apart.
+///
+/// # Returns
+///
+/// `(AstNgramSet, StructuralMetrics, synthetic_lines)` where `synthetic_lines`
+/// maps each emitted synthetic [`AstBigram`] to its representative
+/// `(1-indexed line, start byte)`, recorded per AD-394-5's per-pattern rule.
+/// The MIN line wins on repeat emission within a file (deterministic — AC-F3:
+/// identical file + pattern always yields the same result).
+#[must_use]
+pub fn extract_ast_ngrams_with_lines(
+    nodes: &[LinearNode],
+    lang: Language,
+) -> (
+    AstNgramSet,
+    StructuralMetrics,
+    HashMap<AstBigram, (u32, u32)>,
+) {
+    match run_extraction(nodes, lang) {
+        Some(state) => state.into_ngram_set_with_lines(),
+        None => (
+            AstNgramSet::default(),
+            StructuralMetrics::default(),
+            HashMap::new(),
+        ),
+    }
+}
+
+/// Shared single-pass traversal used by both [`extract_ast_ngrams_with_metrics`]
+/// and [`extract_ast_ngrams_with_lines`] (ADR-006: one implementation, no
+/// drift between the membership-only and lines-preserving entry points).
+/// Returns `None` for empty input; callers substitute the empty defaults.
+fn run_extraction(nodes: &[LinearNode], lang: Language) -> Option<ExtractState> {
     if nodes.is_empty() {
-        return (AstNgramSet::default(), StructuralMetrics::default());
+        return None;
     }
 
     let max_depth = nodes.iter().map(|n| n.depth).max().unwrap_or(0);
@@ -304,7 +358,7 @@ pub fn extract_ast_ngrams_with_metrics(
         let d = usize::from(node.depth);
 
         state.update_max_depth(node.depth);
-        state.emit_depth_buckets(node.depth);
+        state.emit_depth_buckets(node.depth, node.start_line, node.start_byte);
 
         // ── Gap-fill (PF-004 safe: widen to u32) ────────────────────────────
         // When a depth jump > +1 occurs, null ancestor slots AND child_counts
@@ -332,7 +386,7 @@ pub fn extract_ast_ngrams_with_metrics(
 
         state.update_branch_count(node.kind_id);
         state.emit_real_ngrams(node, lang);
-        state.record_node(d, node.kind_id);
+        state.record_node(d, node.kind_id, node.start_line, node.start_byte);
 
         prev_depth = Some(node.depth);
     }
@@ -345,7 +399,7 @@ pub fn extract_ast_ngrams_with_metrics(
         state.close_open_subtrees(0, p);
     }
 
-    state.into_ngram_set()
+    Some(state)
 }
 
 // ============================================================================
@@ -376,8 +430,25 @@ struct ExtractState {
     /// `close_depth` can read the enclosing-parent kind after a sibling
     /// overwrites the `ancestors` slot to `None`.
     depth_kind: Vec<NodeKindId>,
+    /// AD-394-6: mirrors `depth_kind` — the 1-indexed source line of the node
+    /// last recorded at each depth. Deliberately NOT nulled by gap-fill (same
+    /// rationale as `depth_kind`): `close_depth` reads `depth_line[depth_idx-1]`
+    /// for the enclosing construct's representative line even after a sibling
+    /// has invalidated `ancestors` at that slot.
+    depth_line: Vec<u32>,
+    /// AD-394-6: mirrors `depth_line` — the start byte of the node last
+    /// recorded at each depth.
+    depth_byte: Vec<u32>,
     bigram_map: HashMap<AstBigram, (f32, u32)>,
     trigram_map: HashMap<AstTrigram, (f32, u32)>,
+    /// AD-394-5 / AD-394-6: representative `(1-indexed line, start byte)` per
+    /// emitted synthetic bigram, recorded at the SAME emission site that adds
+    /// the marker to `bigram_map` — so `recover_line`'s synthetic branch never
+    /// needs a second, drift-prone detection pass (ADR-006). Keyed by the
+    /// encoded `AstBigram`: synthetic markers are always bigrams (no synthetic
+    /// trigram is ever emitted by this module). MIN line wins on repeat
+    /// emission within a file (AC-F3 determinism: topmost occurrence).
+    synthetic_lines: HashMap<AstBigram, (u32, u32)>,
     metrics: StructuralMetrics,
 }
 
@@ -389,8 +460,11 @@ impl ExtractState {
             ancestors: vec![None; table_len],
             child_counts: vec![0u32; table_len],
             depth_kind: vec![0u16; table_len],
+            depth_line: vec![0u32; table_len],
+            depth_byte: vec![0u32; table_len],
             bigram_map: HashMap::with_capacity(cap),
             trigram_map: HashMap::with_capacity(cap),
+            synthetic_lines: HashMap::new(),
             metrics: StructuralMetrics::default(),
         }
     }
@@ -403,13 +477,23 @@ impl ExtractState {
 
     /// Emit cumulative `DEEP_NODE → bucket_label(i)` synthetics for every
     /// depth bucket edge crossed by `depth`.
+    ///
+    /// AD-394-5: the representative position for a DEEP_NODE marker is the
+    /// CURRENT node's own `(line, byte)` — the first node whose depth crosses
+    /// the edge. `line`/`byte` are passed in explicitly (not read from
+    /// `depth_line`/`depth_byte`) because this runs BEFORE `record_node` for
+    /// this node, so the depth-indexed arrays still hold the previous
+    /// occupant's position at this point in the loop.
     #[inline]
-    fn emit_depth_buckets(&mut self, depth: u16) {
+    fn emit_depth_buckets(&mut self, depth: u16, line: u32, byte: u32) {
         emit_bucket_crossings(
             &mut self.bigram_map,
+            &mut self.synthetic_lines,
             DEEP_NODE,
             &DEPTH_EDGES,
             u32::from(depth),
+            line,
+            byte,
         );
     }
 
@@ -465,14 +549,20 @@ impl ExtractState {
         let close_start = usize::from(node_depth);
         let close_end = usize::from(prev_depth);
         if close_end >= close_start {
+            let tables = DepthTables {
+                kind: &self.depth_kind,
+                line: &self.depth_line,
+                byte: &self.depth_byte,
+            };
             for depth_to_close in (close_start..=close_end).rev() {
                 if self.ancestors[depth_to_close].is_some() {
                     close_depth(
                         depth_to_close,
                         &self.child_counts,
-                        &self.depth_kind,
+                        tables,
                         &mut self.metrics,
                         &mut self.bigram_map,
+                        &mut self.synthetic_lines,
                     );
                 }
             }
@@ -536,20 +626,42 @@ impl ExtractState {
         }
     }
 
-    /// Record `node.kind_id` in the ancestor table at `depth d` and reset
-    /// `child_counts[d]` to zero (this node's children have not been seen yet).
+    /// Record `node.kind_id`/position in the ancestor table at depth `d` and
+    /// reset `child_counts[d]` to zero (this node's children have not been
+    /// seen yet). `line`/`byte` populate `depth_line`/`depth_byte` (AD-394-6).
     ///
     /// Sentinel nodes (`kind_id == 0`) ARE recorded here to preserve correct
     /// depth positions for their descendants. Suppression happens at emit time.
     #[inline]
-    fn record_node(&mut self, d: usize, kind_id: NodeKindId) {
+    fn record_node(&mut self, d: usize, kind_id: NodeKindId, line: u32, byte: u32) {
         self.ancestors[d] = Some(kind_id);
         self.depth_kind[d] = kind_id;
+        self.depth_line[d] = line;
+        self.depth_byte[d] = byte;
         self.child_counts[d] = 0;
     }
 
-    /// Consume the state and return the sorted `(AstNgramSet, StructuralMetrics)`.
+    /// Consume the state and return the sorted `(AstNgramSet, StructuralMetrics)`,
+    /// discarding the synthetic-marker position side table. Used by
+    /// [`extract_ast_ngrams_with_metrics`] — its 4 existing callers need
+    /// membership/metrics only, never positions.
     fn into_ngram_set(self) -> (AstNgramSet, StructuralMetrics) {
+        let (set, metrics, _lines) = self.into_ngram_set_with_lines();
+        (set, metrics)
+    }
+
+    /// AD-394-6: consume the state and return the sorted
+    /// `(AstNgramSet, StructuralMetrics, synthetic_lines)` — the
+    /// lines-preserving form used by [`extract_ast_ngrams_with_lines`]. Shares
+    /// the exact sort logic with [`Self::into_ngram_set`] (which delegates
+    /// here), so there is only one implementation to maintain.
+    fn into_ngram_set_with_lines(
+        self,
+    ) -> (
+        AstNgramSet,
+        StructuralMetrics,
+        HashMap<AstBigram, (u32, u32)>,
+    ) {
         let mut bigrams: Vec<AstBigramEntry> = self
             .bigram_map
             .into_iter()
@@ -572,7 +684,11 @@ impl ExtractState {
             .collect();
         trigrams.sort_unstable_by_key(|e| e.ngram.key());
 
-        (AstNgramSet { bigrams, trigrams }, self.metrics)
+        (
+            AstNgramSet { bigrams, trigrams },
+            self.metrics,
+            self.synthetic_lines,
+        )
     }
 }
 
@@ -583,33 +699,63 @@ impl ExtractState {
 /// Emit a synthetic bigram `(parent → child)` with `DEFAULT_AST_WEIGHT` and
 /// `count = 1` into `bigram_map`, incrementing the count when the key is
 /// already present (saturating).
+///
+/// AD-394-5 / AD-394-6: also records `(line, byte)` into `synthetic_lines`,
+/// keeping the MIN line per key (topmost occurrence in the file) so
+/// `recover_line`'s synthetic branch has a deterministic representative
+/// position (AC-F3).
 #[inline]
 fn emit_synthetic(
     bigram_map: &mut HashMap<AstBigram, (f32, u32)>,
+    synthetic_lines: &mut HashMap<AstBigram, (u32, u32)>,
     parent: NodeKindId,
     child: NodeKindId,
+    line: u32,
+    byte: u32,
 ) {
     use crate::ast_index::DEFAULT_AST_WEIGHT;
     let key = AstBigram::encode(parent, child);
     let entry = bigram_map.entry(key).or_insert((DEFAULT_AST_WEIGHT, 0));
     entry.1 = entry.1.saturating_add(1);
+
+    synthetic_lines
+        .entry(key)
+        .and_modify(|(existing_line, existing_byte)| {
+            if line < *existing_line {
+                *existing_line = line;
+                *existing_byte = byte;
+            }
+        })
+        .or_insert((line, byte));
 }
 
 /// Emit cumulative bucket crossings: for each `(i, edge)` in `edges` where
 /// `value >= edge`, emit `parent → bucket_label(i)` into `bigram_map`.
 ///
 /// Used by depth-bucket, large-body, and many-params emission — all three share
-/// the same cumulative threshold pattern.
+/// the same cumulative threshold pattern. `line`/`byte` are the representative
+/// position recorded for every bucket crossed (AD-394-5: callers pass a
+/// different position source per marker — see call sites).
 #[inline]
 fn emit_bucket_crossings(
     bigram_map: &mut HashMap<AstBigram, (f32, u32)>,
+    synthetic_lines: &mut HashMap<AstBigram, (u32, u32)>,
     parent: NodeKindId,
     edges: &[u32],
     value: u32,
+    line: u32,
+    byte: u32,
 ) {
     for (i, &edge) in edges.iter().enumerate() {
         if value >= edge {
-            emit_synthetic(bigram_map, parent, bucket_label(i));
+            emit_synthetic(
+                bigram_map,
+                synthetic_lines,
+                parent,
+                bucket_label(i),
+                line,
+                byte,
+            );
         }
     }
 }
@@ -617,6 +763,19 @@ fn emit_bucket_crossings(
 // ============================================================================
 // close_depth — emit synthetic markers when a depth slot's subtree closes
 // ============================================================================
+
+/// Depth-indexed lookup tables consumed by [`close_depth`] — `kind`, and the
+/// AD-394-6 `line`/`byte` position, all indexed by the SAME depth and always
+/// read together. Grouped into one `Copy` struct (of borrows) so `close_depth`
+/// takes one cohesive parameter instead of three always-together slices
+/// (keeps the function under clippy's `too_many_arguments` threshold without
+/// an `#[allow]`).
+#[derive(Clone, Copy)]
+struct DepthTables<'a> {
+    kind: &'a [NodeKindId],
+    line: &'a [u32],
+    byte: &'a [u32],
+}
 
 /// Close a depth slot: emit synthetic markers for the node at `depth_idx`
 /// based on its accumulated `child_counts` and kind.
@@ -627,28 +786,45 @@ fn emit_bucket_crossings(
 fn close_depth(
     depth_idx: usize,
     child_counts: &[u32],
-    depth_kind: &[NodeKindId],
+    tables: DepthTables<'_>,
     metrics: &mut StructuralMetrics,
     bigram_map: &mut HashMap<AstBigram, (f32, u32)>,
+    synthetic_lines: &mut HashMap<AstBigram, (u32, u32)>,
 ) {
-    let kind_id = depth_kind[depth_idx];
+    let kind_id = tables.kind[depth_idx];
     if kind_id == 0 {
         return; // sentinel — not a real construct, skip
     }
 
     // Compute enclosing_id once: the parent of this slot (depth_idx - 1).
     // Both BODY and PARAM_LIST branches need it; computing it here removes
-    // the duplicated `depth_idx > 0` guard and `depth_kind[depth_idx - 1]`
+    // the duplicated `depth_idx > 0` guard and `tables.kind[depth_idx - 1]`
     // lookup that previously appeared in two separate inner blocks.
     let enclosing_id: Option<NodeKindId> = depth_idx
         .checked_sub(1)
-        .map(|pd| depth_kind[pd])
+        .map(|pd| tables.kind[pd])
         .filter(|&id| id != 0);
+    // AD-394-5: the enclosing construct's representative `(line, byte)` —
+    // read alongside `enclosing_id` from the same parent slot. Only consumed
+    // when `enclosing_id` is `Some` (in which case `checked_sub(1)` succeeded
+    // too), so the `(0, 0)` fallback below is never actually read.
+    let (enclosing_line, enclosing_byte) = depth_idx
+        .checked_sub(1)
+        .map(|pd| (tables.line[pd], tables.byte[pd]))
+        .unwrap_or((0, 0));
 
     let count = child_counts[depth_idx];
 
     if BODY_KIND_IDS.contains(&kind_id) {
-        emit_empty_or_large_body(count, enclosing_id, metrics, bigram_map);
+        emit_empty_or_large_body(
+            count,
+            enclosing_id,
+            enclosing_line,
+            enclosing_byte,
+            metrics,
+            bigram_map,
+            synthetic_lines,
+        );
     }
 
     // ── MANY_PARAMS emission ──────────────────────────────────────────────────
@@ -656,7 +832,18 @@ fn close_depth(
         // PF-004: saturating cast — count can be up to DEFAULT_MAX_NODES (100K) > u16::MAX
         let count_u16 = count.min(u32::from(u16::MAX)) as u16;
         metrics.max_params = metrics.max_params.max(count_u16);
-        emit_bucket_crossings(bigram_map, MANY_PARAMS, &PARAM_EDGES, count);
+        // AD-394-5: excessive-params' representative line is the PARAM-LIST
+        // node's OWN position (depth_idx) — its start coincides with the
+        // function signature line — NOT the enclosing function.
+        emit_bucket_crossings(
+            bigram_map,
+            synthetic_lines,
+            MANY_PARAMS,
+            &PARAM_EDGES,
+            count,
+            tables.line[depth_idx],
+            tables.byte[depth_idx],
+        );
     }
 }
 
@@ -668,16 +855,31 @@ fn close_depth(
 /// - `LARGE_BODY → bucket_label(i)` fires cumulatively when the enclosing
 ///   construct is a function/method kind and `count` crosses a bucket edge.
 ///   Updates `metrics.max_block_stmts` (PF-004 saturating cast).
+///
+/// AD-394-5: both markers are keyed on `enclosing_id`, so their representative
+/// position is the ENCLOSING construct's `(enclosing_line, enclosing_byte)` —
+/// e.g. the `catch_clause`/`function_item` line, not the (anonymous) body
+/// block's own line.
 fn emit_empty_or_large_body(
     count: u32,
     enclosing_id: Option<NodeKindId>,
+    enclosing_line: u32,
+    enclosing_byte: u32,
     metrics: &mut StructuralMetrics,
     bigram_map: &mut HashMap<AstBigram, (f32, u32)>,
+    synthetic_lines: &mut HashMap<AstBigram, (u32, u32)>,
 ) {
     if count == 0
         && let Some(enc) = enclosing_id
     {
-        emit_synthetic(bigram_map, EMPTY_BODY, enc);
+        emit_synthetic(
+            bigram_map,
+            synthetic_lines,
+            EMPTY_BODY,
+            enc,
+            enclosing_line,
+            enclosing_byte,
+        );
     }
 
     if let Some(enc) = enclosing_id
@@ -686,7 +888,15 @@ fn emit_empty_or_large_body(
         // PF-004: saturating cast — count can be up to DEFAULT_MAX_NODES (100K) > u16::MAX
         let count_u16 = count.min(u32::from(u16::MAX)) as u16;
         metrics.max_block_stmts = metrics.max_block_stmts.max(count_u16);
-        emit_bucket_crossings(bigram_map, LARGE_BODY, &BODY_STMT_EDGES, count);
+        emit_bucket_crossings(
+            bigram_map,
+            synthetic_lines,
+            LARGE_BODY,
+            &BODY_STMT_EDGES,
+            count,
+            enclosing_line,
+            enclosing_byte,
+        );
     }
 }
 
