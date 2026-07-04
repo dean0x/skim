@@ -532,7 +532,7 @@ impl<'cfg> Pipeline<'cfg> {
     /// Stage 2b: spawn the producer thread.
     ///
     /// AD-395-2: The single-threaded producer accumulates a bounded typed
-    /// `SkipReason` display sample plus a `(path,mtime,size,reason_disc)`
+    /// `SkipReason` display sample plus a `(path,mtime,size,reason:PersistedSkipReason)`
     /// skip-set and returns them via `JoinHandle<ProducerSkips>` — no `Mutex`
     /// needed because the producer is single-threaded.  The skip-set only
     /// contains DETERMINISTIC content-skips (Minified / NonUtf8 / TooLarge);
@@ -586,7 +586,7 @@ impl<'cfg> Pipeline<'cfg> {
                                     path: rel_path,
                                     mtime: entry.mtime,
                                     size: entry.size,
-                                    reason_disc: disc,
+                                    reason: disc,
                                 });
                             }
                         }
@@ -921,19 +921,47 @@ fn to_u32_capped(n: usize) -> u32 {
 /// Merge walk-phase skips and producer-phase skips into a bounded,
 /// stable-key-sorted sample suitable for display (AD-395-6 / PF-012).
 ///
-/// Sorting is by path string (ascending), with `CapReached` entries last.
+/// Sort order: content-skips (Minified / NonUtf8 / TooLarge, priority 0) sort
+/// before UnsupportedLanguage (priority 1), ReadError (priority 2), and
+/// CapReached (priority 3, last).  Within the same priority tier, entries are
+/// sorted by path string (ascending).
+///
+/// Content-skips get the lowest priority value so they float to the top of the
+/// displayed sample.  Without this ordering, a repo with many unsupported
+/// extensions would push the Minified-bundle notice (the primary diagnostic
+/// this feature was built to surface — AD-395-6 / AC4) past the `cap` cutoff
+/// in `format_skip_sample`, burying it in the "...and N more" tail.
+///
 /// The merged vec is truncated to `MAX_SKIP_REASONS` before returning.
 pub(super) fn build_skip_sample(
     walk_skips: Vec<SkipReason>,
     producer_skips: Vec<SkipReason>,
 ) -> Vec<SkipReason> {
+    /// Display priority: lower value = shown earlier in the sample.
+    fn display_priority(r: &SkipReason) -> u8 {
+        match r {
+            // Content-skips are the primary diagnostic — surface them first.
+            SkipReason::Minified { .. } | SkipReason::NonUtf8(_) | SkipReason::TooLarge { .. } => 0,
+            SkipReason::UnsupportedLanguage(_) => 1,
+            SkipReason::ReadError { .. } => 2,
+            SkipReason::CapReached => 3,
+        }
+    }
+
     let mut merged: Vec<SkipReason> = walk_skips.into_iter().chain(producer_skips).collect();
-    // Stable sort: path-string ascending, CapReached (None key) last.
-    merged.sort_by(|a, b| match (a.sort_key(), b.sort_key()) {
-        (Some(pa), Some(pb)) => pa.cmp(pb),
-        (None, None) => std::cmp::Ordering::Equal,
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
+    // Primary: display priority (content-skips first). Secondary: path ascending.
+    // CapReached has no path (sort_key → None) so it always sorts last within its tier.
+    merged.sort_by(|a, b| {
+        let pri_cmp = display_priority(a).cmp(&display_priority(b));
+        if pri_cmp != std::cmp::Ordering::Equal {
+            return pri_cmp;
+        }
+        match (a.sort_key(), b.sort_key()) {
+            (Some(pa), Some(pb)) => pa.cmp(pb),
+            (None, None) => std::cmp::Ordering::Equal,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+        }
     });
     merged.truncate(MAX_SKIP_REASONS);
     merged

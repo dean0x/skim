@@ -932,7 +932,7 @@ fn test_v5_manifest_truncated_at_skip_count_rejects_whole() {
 /// over MAX_MANIFEST_ENTRIES causes load() to reject-whole (AD-395-4).
 #[test]
 fn test_ac10_v5_manifest_round_trip_and_skip_isolation() {
-    use super::super::types::SkippedEntry;
+    use super::super::types::{PersistedSkipReason, SkippedEntry};
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
@@ -947,13 +947,13 @@ fn test_ac10_v5_manifest_round_trip_and_skip_isolation() {
         path: "bundle.js".to_string(),
         mtime: Some(1_700_000_000),
         size: Some(70_000),
-        reason_disc: 1, // Minified
+        reason: PersistedSkipReason::Minified,
     };
     let skip2 = SkippedEntry {
         path: "icon.bin".to_string(),
         mtime: None,
         size: None,
-        reason_disc: 2, // NonUtf8
+        reason: PersistedSkipReason::NonUtf8,
     };
     manifest.insert_skip(skip1.clone());
     manifest.insert_skip(skip2.clone());
@@ -981,11 +981,11 @@ fn test_ac10_v5_manifest_round_trip_and_skip_isolation() {
     assert_eq!(skip_vec[0].path, "bundle.js");
     assert_eq!(skip_vec[0].mtime, Some(1_700_000_000));
     assert_eq!(skip_vec[0].size, Some(70_000));
-    assert_eq!(skip_vec[0].reason_disc, 1);
+    assert_eq!(skip_vec[0].reason, PersistedSkipReason::Minified);
     assert_eq!(skip_vec[1].path, "icon.bin");
     assert_eq!(skip_vec[1].mtime, None);
     assert_eq!(skip_vec[1].size, None);
-    assert_eq!(skip_vec[1].reason_disc, 2);
+    assert_eq!(skip_vec[1].reason, PersistedSkipReason::NonUtf8);
 
     // AC10: forged skip_count > MAX_MANIFEST_ENTRIES must reject-whole.
     //

@@ -355,19 +355,73 @@ impl SkipReason {
         }
     }
 
-    /// Discriminant byte for binary persistence in the manifest skip section.
+    /// Discriminant for binary persistence in the manifest skip section.
     ///
     /// Only DETERMINISTIC skips (Minified / NonUtf8 / TooLarge) are persisted;
     /// ReadError and UnsupportedLanguage fall through un-persisted (OD-395-4).
     /// `None` means this skip reason is NOT persisted.
-    pub(super) fn persist_discriminant(&self) -> Option<u8> {
+    pub(super) fn persist_discriminant(&self) -> Option<PersistedSkipReason> {
         match self {
-            SkipReason::Minified { .. } => Some(1),
-            SkipReason::NonUtf8(_) => Some(2),
-            SkipReason::TooLarge { .. } => Some(3),
+            SkipReason::Minified { .. } => Some(PersistedSkipReason::Minified),
+            SkipReason::NonUtf8(_) => Some(PersistedSkipReason::NonUtf8),
+            SkipReason::TooLarge { .. } => Some(PersistedSkipReason::TooLarge),
             SkipReason::ReadError { .. }
             | SkipReason::UnsupportedLanguage(_)
             | SkipReason::CapReached => None,
+        }
+    }
+}
+
+// ============================================================================
+// Persisted skip reason (manifest v5 wire format)
+// ============================================================================
+
+/// The set of skip reasons that are durably persisted in the v5 manifest skip
+/// section (AD-395-4 / OD-395-4).
+///
+/// Only DETERMINISTIC reasons are persisted.  `ReadError` and
+/// `UnsupportedLanguage` are intentionally absent — they must NOT be persisted
+/// because a transiently-unreadable or temporarily-unsupported file would
+/// otherwise be excluded from recall until its mtime/size changes.
+///
+/// `to_u8` / `from_u8` are the single source of truth for the on-disk wire
+/// format; `decode_skip_entry` in manifest.rs calls `from_u8` and propagates
+/// `None` as a manifest-reject (AD-380-3 / AC-5), catching corrupt/forged bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum PersistedSkipReason {
+    Minified = 1,
+    NonUtf8 = 2,
+    TooLarge = 3,
+}
+
+impl PersistedSkipReason {
+    /// Encode to the one-byte manifest wire format.
+    pub(super) fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode from the one-byte manifest wire format.
+    ///
+    /// Returns `None` for any byte outside the known domain `{1, 2, 3}` so
+    /// that `decode_skip_entry` can reject corrupt or forged manifests at the
+    /// boundary (AD-380-3 / AC-5).  Adding a new variant requires extending
+    /// this match — the exhaustive check prevents silent omissions.
+    pub(super) fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Minified),
+            2 => Some(Self::NonUtf8),
+            3 => Some(Self::TooLarge),
+            _ => None,
+        }
+    }
+
+    /// Human-readable label used by `--stats` text and JSON output.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Minified => "minified",
+            Self::NonUtf8 => "non_utf8",
+            Self::TooLarge => "too_large",
         }
     }
 }
@@ -380,7 +434,7 @@ impl SkipReason {
 ///
 /// Only DETERMINISTIC skips (Minified / NonUtf8 / TooLarge) are stored here;
 /// transient ReadErrors fall through un-persisted (OD-395-4). The persisted
-/// `(path, mtime, size, reason_disc)` tuple is used by `scan_working_tree` to
+/// `(path, mtime, size, reason)` tuple is used by `scan_working_tree` to
 /// reconcile walked files against the skip-set without re-reading content
 /// (AD-395-5 loop-killer; respects AD-379/AC15 metadata-only invariant).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,21 +447,16 @@ pub(super) struct SkippedEntry {
     /// File size in bytes at skip time. `None` when the platform does not
     /// expose size.
     pub size: Option<u64>,
-    /// Discriminant byte identifying the skip reason for `--stats` display.
-    /// 1 = Minified, 2 = NonUtf8, 3 = TooLarge (matches `persist_discriminant`).
-    pub reason_disc: u8,
+    /// Typed skip reason.  Use [`PersistedSkipReason`] methods for wire
+    /// encoding and label output instead of matching on raw integers.
+    pub reason: PersistedSkipReason,
 }
 
 impl SkippedEntry {
-    /// Reconstruct the reason label for `--stats --json` output from the stored
-    /// discriminant.
+    /// Reason label for `--stats` text and JSON output, delegated to
+    /// [`PersistedSkipReason::label`] — single source of truth.
     pub(super) fn reason_label(&self) -> &'static str {
-        match self.reason_disc {
-            1 => "minified",
-            2 => "non_utf8",
-            3 => "too_large",
-            _ => "unknown",
-        }
+        self.reason.label()
     }
 }
 

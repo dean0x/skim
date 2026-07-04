@@ -42,7 +42,7 @@
 //!     4 bytes : path_len (u32) + path bytes
 //!     1 byte  : mtime_present (0/1) [+ 8 bytes u64 when present]
 //!     1 byte  : size_present  (0/1) [+ 8 bytes u64 when present]
-//!     1 byte  : reason_disc (u8: 1=Minified, 2=NonUtf8, 3=TooLarge)
+//!     1 byte  : reason (PersistedSkipReason::to_u8: 1=Minified, 2=NonUtf8, 3=TooLarge)
 //! ```
 //!
 //! An empty or missing file is treated as a cold-start (no cache hits).
@@ -77,7 +77,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use tempfile::NamedTempFile;
 
-use super::types::SkippedEntry;
+use super::types::{PersistedSkipReason, SkippedEntry};
 
 // ============================================================================
 // On-disk types
@@ -223,23 +223,28 @@ fn encode_skip_entry(buf: &mut Vec<u8>, entry: &SkippedEntry) {
     write_lp_bytes(buf, entry.path.as_bytes());
     write_opt_u64(buf, entry.mtime);
     write_opt_u64(buf, entry.size);
-    buf.push(entry.reason_disc);
+    // Single source of truth for the wire byte — no raw literal here.
+    buf.push(entry.reason.to_u8());
 }
 
 /// Decode a single skip entry from the cursor (AD-395-4).
 ///
-/// Returns `None` on any truncation or structural corruption — caller rejects
-/// the whole manifest (AD-380-3 / AC-5).
+/// Returns `None` on any truncation, structural corruption, or unknown reason
+/// discriminant — the caller rejects the whole manifest (AD-380-3 / AC-5).
+/// Using `PersistedSkipReason::from_u8` here means a corrupt/forged byte
+/// triggers a manifest-reject rather than silently degrading to "unknown".
 fn decode_skip_entry(cur: &mut Cursor<'_>) -> Option<SkippedEntry> {
     let path = cur.read_lp_string()?;
     let mtime = cur.read_opt_u64()?;
     let size = cur.read_opt_u64()?;
-    let reason_disc = cur.read_u8()?;
+    let reason_byte = cur.read_u8()?;
+    // Reject unknown discriminants at the boundary (make illegal states unrepresentable).
+    let reason = PersistedSkipReason::from_u8(reason_byte)?;
     Some(SkippedEntry {
         path,
         mtime,
         size,
-        reason_disc,
+        reason,
     })
 }
 

@@ -748,11 +748,21 @@ pub(super) fn open_and_read(path: &Path) -> ReadOutcome {
 ///    INDEXED.  Only genuine single-line bundles (one giant line across the
 ///    whole probe) pass.
 ///
-/// When both signals hold, `avg_line_bytes` is computed and returned in
-/// `Some` so the skip message can print the measured average (e.g.
-/// `"avg line 1176 > 500 bytes"`).  With `newline_count <= 1` in an 8 KiB
-/// probe the average always exceeds `MINIFY_AVG_LINE_BYTES` (500) by
-/// construction — the metric simply supplies the number for the message.
+/// When both signals hold, `avg_line_bytes` is computed over the **whole
+/// file** (not just the probe) and returned in `Some` so the skip message can
+/// print a meaningful number (e.g. `"avg line 70000 > 500 bytes"` for a
+/// 70 KB bundle, rather than the degenerate `"avg line 8192"` that a
+/// probe-only average would produce).
+///
+/// The whole-file average introduces a third, implicit gate: if the file has
+/// enough newlines after the single-line probe region that the full average
+/// falls at or below `MINIFY_AVG_LINE_BYTES` (500), the function returns
+/// `None` and the file is **indexed** rather than skipped.  This affects
+/// so-called "blob-then-code" residuals — files whose first 8 KiB is a
+/// single long line but whose remainder has many normal lines.  That behaviour
+/// is correct and intentional (recall-positive), but it diverges from the
+/// plan's OD-395-2 note that such files would be "dropped wholesale (now
+/// NAMED)"; readers of OD-395-2 should treat those files as indexed.
 pub(super) fn minified_metric(content: &str) -> Option<usize> {
     // Signal 1: size gate (AD-395-1).
     if content.len() < MINIFY_MIN_BYTES {

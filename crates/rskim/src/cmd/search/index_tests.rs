@@ -3255,7 +3255,7 @@ fn test_ac8_changed_skip_triggers_one_rebuild() {
 #[test]
 fn test_ac9_none_hint_skip_not_readded() {
     use super::super::manifest::FileManifest;
-    use super::super::types::SkippedEntry;
+    use super::super::types::{PersistedSkipReason, SkippedEntry};
 
     // Root: only bundle.js (no main.rs — unindexed files would count as "added").
     let root_dir = tempfile::tempdir().unwrap();
@@ -3273,7 +3273,7 @@ fn test_ac9_none_hint_skip_not_readded() {
         path: "bundle.js".to_string(),
         mtime: None,
         size: None,
-        reason_disc: 1, // Minified
+        reason: PersistedSkipReason::Minified,
     });
 
     let root_canon = root.canonicalize().unwrap();
@@ -3726,8 +3726,25 @@ fn test_ac4_run_build_stderr_names_skipped_bundle() {
     // Genuine >= 64 KiB single-line bundle — must appear in stderr skip sample.
     fs::write(root.join("bundle.js"), "x".repeat(70_000)).unwrap();
 
-    // Locate the skim binary (set by cargo test via CARGO_BIN_EXE_skim, or fall
-    // back to walking up from the test executable location).
+    // Locate the skim binary.
+    //
+    // CARGO_BIN_EXE_<name> is populated by Cargo ONLY for integration tests
+    // compiled from the `tests/` directory; it is never set for in-source unit
+    // tests (this file is compiled into the binary crate's test binary, not an
+    // integration test crate).  The `unwrap_or_else` branch is therefore always
+    // taken in practice.
+    //
+    // The fallback walks up from `current_exe()`:
+    //   target/<profile>/deps/rskim-<hash>  →  pop "deps/"  →  pop "<profile>/"
+    //   →  push "skim"
+    // This assumes a freshly-built binary exists at `target/<profile>/skim`.
+    //
+    // PRECONDITION: invoke this test via `cargo test -p rskim --bins` (or
+    // `--all-targets`), which builds the `skim` binary alongside the test
+    // binary.  A runner that builds only test binaries (e.g. `cargo test --lib`)
+    // may leave a stale or absent `skim` at the expected path, causing this test
+    // to exercise wrong/old code.  The assertion on "minified (avg line " fails
+    // loud in that case rather than false-passing.
     let bin = std::env::var("CARGO_BIN_EXE_skim").unwrap_or_else(|_| {
         let mut p = std::env::current_exe().unwrap();
         p.pop(); // deps/

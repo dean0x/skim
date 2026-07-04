@@ -784,6 +784,87 @@ fn test_minified_metric_two_signal_gate() {
         minified_metric(&multiline).is_none(),
         ">= 64 KiB multi-line string must return None (fails single-line signal — INDEXED)"
     );
+
+    // (f) >= 64 KiB with EXACTLY ONE newline in the 8 KiB probe: newline_count == 1
+    // satisfies the `<= 1` boundary and must still be classified as minified.
+    // This pins the `<= 1` semantic: a regression narrowing the check to `== 0`
+    // (reading "single-line" as "zero newlines") would make this case return None
+    // and would be caught here.
+    let mut one_newline_in_probe = "z".repeat(4_000);
+    one_newline_in_probe.push('\n'); // exactly one newline inside the 8 KiB probe
+    one_newline_in_probe.push_str(&"z".repeat(70_000));
+    assert!(
+        one_newline_in_probe.len() >= MINIFY_MIN_BYTES,
+        "one-newline fixture must be >= MINIFY_MIN_BYTES"
+    );
+    assert!(
+        minified_metric(&one_newline_in_probe).is_some(),
+        ">= 64 KiB file with exactly one newline in the probe must return Some \
+         (newline_count == 1 satisfies the <= 1 boundary — still minified)"
+    );
+}
+
+/// OD-395-4: persist_discriminant must return None for non-deterministic skip
+/// reasons so they are never durably excluded from the manifest skip-set.
+///
+/// If a future refactor caused ReadError to return Some(_), a transiently-
+/// unreadable file would be persisted and durably excluded until its mtime/size
+/// changed — silently reintroducing the drop bug.  This test guards that path.
+#[test]
+fn test_persist_discriminant_non_deterministic_returns_none() {
+    use super::super::types::SkipReason;
+    use std::path::PathBuf;
+
+    // ReadError is transient — must NOT be persisted.
+    assert!(
+        SkipReason::ReadError {
+            path: PathBuf::from("a.rs"),
+            error: "io error".to_string(),
+        }
+        .persist_discriminant()
+        .is_none(),
+        "ReadError::persist_discriminant must return None (OD-395-4)"
+    );
+
+    // UnsupportedLanguage depends on configured language support — must NOT be persisted.
+    assert!(
+        SkipReason::UnsupportedLanguage(PathBuf::from("a.xyz"))
+            .persist_discriminant()
+            .is_none(),
+        "UnsupportedLanguage::persist_discriminant must return None (OD-395-4)"
+    );
+
+    // CapReached is a sampling artifact, not a content property — must NOT be persisted.
+    assert!(
+        SkipReason::CapReached.persist_discriminant().is_none(),
+        "CapReached::persist_discriminant must return None"
+    );
+
+    // Positive: deterministic reasons MUST be persisted.
+    assert!(
+        SkipReason::Minified {
+            path: PathBuf::from("bundle.js"),
+            avg_line_bytes: 1_200,
+        }
+        .persist_discriminant()
+        .is_some(),
+        "Minified::persist_discriminant must return Some"
+    );
+    assert!(
+        SkipReason::NonUtf8(PathBuf::from("icon.bin"))
+            .persist_discriminant()
+            .is_some(),
+        "NonUtf8::persist_discriminant must return Some"
+    );
+    assert!(
+        SkipReason::TooLarge {
+            path: PathBuf::from("dump.log"),
+            size: 200_000_000,
+        }
+        .persist_discriminant()
+        .is_some(),
+        "TooLarge::persist_discriminant must return Some"
+    );
 }
 
 /// AC1 negative: a small long-line file that was previously dropped is now indexed.

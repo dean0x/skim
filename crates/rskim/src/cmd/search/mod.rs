@@ -783,43 +783,50 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         return Ok(ExitCode::FAILURE);
     }
 
-    let reader = rskim_search::NgramIndexReader::open(&cache_dir)?;
-    let stats = reader.stats();
-
-    // AD-380-4 (#380): the lexical-only `index_size_bytes` (skidx+skpost from the
-    // reader) historically undercounted the TRUE on-disk footprint by ~23 MB —
-    // it omitted the manifest, AST index/cache, and temporal DB. Compute the real
-    // total here by summing metadata().len() over the fixed set of index
-    // artifacts (AC-6). `index_size_bytes` is intentionally left unchanged so the
-    // lexical-only figure remains available (AC-7).
-    let total_on_disk = total_on_disk_bytes(&cache_dir);
-    // AD-380-5: temporal.db scales with git history, not source size, so report it
-    // as its own line/key — it is included in the total but distinguished here.
-    let temporal_db_bytes = artifact_len(&cache_dir, "temporal.db");
-
-    // check_staleness returns the loaded manifest as part of its work.
-    // Reuse it here instead of loading the manifest a second time.
-    let (staleness_status, loaded_manifest) = staleness::check_staleness(&cache_dir, &root);
-    let git_head = loaded_manifest
-        .as_ref()
-        .and_then(|m| m.stored_git_head().map(str::to_string));
-
-    // AD-395-6: load skip section from the manifest for --stats display.
-    // All pre-existing keys are unchanged; `skipped` / `skipped_by_reason`
-    // are purely additive (AC11 back-compat).
-    let skip_entries: Vec<_> = loaded_manifest
-        .as_ref()
-        .map(|m| m.skipped().collect::<Vec<_>>())
-        .unwrap_or_default();
-
     let mut out = BufWriter::new(std::io::stdout());
     if json {
         // AC6/AC11: shared JSON construction via build_stats_json (same code path
         // as the test helper) — ensures AC11 back-compat tests guard production.
         // AD-395-6: `skipped` array and `skipped_by_reason` are additive keys.
+        //
+        // Gather-once: build_stats_json opens the reader, checks staleness, and
+        // loads skip entries internally.  We do NOT pre-compute those values here
+        // — doing so would run a second NgramIndexReader::open and a second
+        // check_staleness (full working-tree metadata walk) before immediately
+        // discarding the results.
         let extended = build_stats_json(&cache_dir, &root)?;
         writeln!(out, "{}", serde_json::to_string_pretty(&extended)?)?;
     } else {
+        // Text mode: gather stats once here (not needed by the JSON path above).
+        let reader = rskim_search::NgramIndexReader::open(&cache_dir)?;
+        let stats = reader.stats();
+
+        // AD-380-4 (#380): the lexical-only `index_size_bytes` (skidx+skpost from
+        // the reader) historically undercounted the TRUE on-disk footprint by
+        // ~23 MB — it omitted the manifest, AST index/cache, and temporal DB.
+        // Compute the real total here by summing metadata().len() over the fixed
+        // set of index artifacts (AC-6). `index_size_bytes` is intentionally left
+        // unchanged so the lexical-only figure remains available (AC-7).
+        let total_on_disk = total_on_disk_bytes(&cache_dir);
+        // AD-380-5: temporal.db scales with git history, not source size, so
+        // report it as its own line — it is included in the total but distinguished.
+        let temporal_db_bytes = artifact_len(&cache_dir, "temporal.db");
+
+        // check_staleness returns the loaded manifest as part of its work.
+        // Reuse it here instead of loading the manifest a second time.
+        let (staleness_status, loaded_manifest) = staleness::check_staleness(&cache_dir, &root);
+        let git_head = loaded_manifest
+            .as_ref()
+            .and_then(|m| m.stored_git_head().map(str::to_string));
+
+        // AD-395-6: load skip section from the manifest for --stats display.
+        // All pre-existing keys are unchanged; `skipped` / `skipped_by_reason`
+        // are purely additive (AC11 back-compat).
+        let skip_entries: Vec<_> = loaded_manifest
+            .as_ref()
+            .map(|m| m.skipped().collect::<Vec<_>>())
+            .unwrap_or_default();
+
         writeln!(out, "skim search index stats:")?;
         writeln!(out, "  files indexed : {}", stats.file_count)?;
         writeln!(out, "  total n-grams : {}", stats.total_ngrams)?;
@@ -1342,6 +1349,12 @@ pub(super) fn build_stats_json(
     for e in &skip_entries {
         *skipped_by_reason.entry(e.reason_label()).or_insert(0) += 1;
     }
+    // NOTE for JSON consumers: `skipped` and `skipped_by_reason` reflect only
+    // PERSISTED content-skips (Minified / NonUtf8 / TooLarge — OD-395-4).
+    // They do NOT include UnsupportedLanguage or ReadError skips, which are
+    // counted in the `run_build` headline ("N skipped") but not persisted.
+    // A repo with 50 unsupported files + 1 minified bundle therefore shows
+    // `"skipped": [<minified entry>]` here vs. "51 skipped" at build time.
     Ok(serde_json::json!({
         "file_count": stats.file_count,
         "total_ngrams": stats.total_ngrams,
