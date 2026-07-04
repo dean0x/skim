@@ -325,7 +325,12 @@ fn check_hook_version_mismatch(agent: AgentKind) {
 
     let compiled_version = env!("CARGO_PKG_VERSION");
     if hook_version == compiled_version {
-        return; // versions match
+        // Versions match — but check whether the binary has been rebuilt in-place
+        // (same version, different commit).  This can happen during development when
+        // `cargo build` produces a new binary at the same path without bumping the
+        // version number.
+        check_hook_binary_mismatch(agent);
+        return;
     }
 
     let agent_name = agent.cli_name();
@@ -341,6 +346,65 @@ fn check_hook_version_mismatch(agent: AgentKind) {
         crate::cmd::hook_log::log_hook_warning(&format!(
             "version mismatch: hook script v{hook_version}, binary v{compiled_version} (run `skim init --yes` to update)"
         ));
+    }
+}
+
+/// F6: Check whether the binary path or commit embedded in the hook script has
+/// drifted from the running binary.
+///
+/// Compares `SKIM_HOOK_BINARY` (embedded at install time) against
+/// `current_exe()`, and `SKIM_HOOK_COMMIT` against the compiled-in
+/// `SKIM_GIT_COMMIT`.  A mismatch means the hook is running a different binary
+/// than the one that installed the hook (e.g. the user upgraded skim but hasn't
+/// run `skim init` yet, or the binary path moved).
+///
+/// Both warnings are rate-limited per-agent to once per day, logged to
+/// hook.log only — NEVER to stderr.
+fn check_hook_binary_mismatch(agent: AgentKind) {
+    let agent_name = agent.cli_name();
+    let cache_dir = match crate::cmd::resolve_cache_dir() {
+        Some(d) => d,
+        None => return,
+    };
+
+    // Check binary path mismatch (SKIM_HOOK_BINARY vs current_exe).
+    if let Ok(hook_binary) = std::env::var("SKIM_HOOK_BINARY")
+        && !hook_binary.is_empty()
+    {
+        let current = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let hook_canonical = std::fs::canonicalize(&hook_binary)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| hook_binary.clone());
+
+        if !current.is_empty() && current != hook_canonical {
+            let stamp = cache_dir.join(format!(".hook-binary-warned-{agent_name}"));
+            if should_warn_today(&stamp) {
+                crate::cmd::hook_log::log_hook_warning(&format!(
+                    "binary path mismatch: hook was installed from {hook_binary}, \
+                     running from {current} (run `skim init --yes` to update)"
+                ));
+            }
+        }
+    }
+
+    // Check commit mismatch (SKIM_HOOK_COMMIT vs compiled-in SKIM_GIT_COMMIT).
+    if let Ok(hook_commit) = std::env::var("SKIM_HOOK_COMMIT") {
+        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
+        if !hook_commit.is_empty()
+            && compiled_commit != "unknown"
+            && hook_commit != compiled_commit
+        {
+            let stamp = cache_dir.join(format!(".hook-commit-warned-{agent_name}"));
+            if should_warn_today(&stamp) {
+                crate::cmd::hook_log::log_hook_warning(&format!(
+                    "binary rebuilt in-place: hook commit {hook_commit}, \
+                     running commit {compiled_commit} (run `skim init --yes` to update)"
+                ));
+            }
+        }
     }
 }
 

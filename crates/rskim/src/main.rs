@@ -180,9 +180,17 @@ const MAX_TOKEN_BUDGET: usize = 10_000_000;
 ///
 /// Transform source code by stripping implementation details while
 /// preserving structure, signatures, and types.
+/// Version string: "X.Y.Z (shortsha)" — or "X.Y.Z (unknown)" for tarball builds.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("SKIM_GIT_COMMIT"),
+    ")"
+);
+
 #[derive(Parser, Debug)]
 #[command(name = "skim")]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = VERSION, about, long_about = None)]
 #[command(after_help = "EXAMPLES:\n  \
     skim file.ts                             Read TypeScript with structure mode (cached)\n  \
     skim file.py --mode signatures           Extract Python signatures\n  \

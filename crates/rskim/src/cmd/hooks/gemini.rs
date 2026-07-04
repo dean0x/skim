@@ -39,8 +39,8 @@ impl HookProtocol for GeminiCliHook {
         })
     }
 
-    fn generate_script(&self, version: &str) -> String {
-        super::generate_hook_script(version, "gemini")
+    fn generate_script(&self, version: &str, binary_path: &str) -> String {
+        super::generate_hook_script(version, "gemini", binary_path)
     }
 
     // -------------------------------------------------------------------------
@@ -125,21 +125,27 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_generate_script_bare_command() {
-        let script = hook().generate_script("1.2.3");
+    fn test_gemini_generate_script_pinned_binary() {
+        let script = hook().generate_script("1.2.3", "/usr/local/bin/skim");
+        // Pinned exec via variable.
+        assert!(
+            script.contains("exec \"$_SKIM_BIN\" rewrite --hook"),
+            "script must exec via pinned binary, got: {script}"
+        );
+        // PATH fallback present.
         assert!(
             script.contains("exec skim rewrite --hook"),
-            "script must use bare skim command, got: {script}"
+            "script must have PATH fallback, got: {script}"
         );
         assert!(
-            !script.contains("\"/usr/local/bin/skim\""),
-            "script must NOT contain hardcoded binary path, got: {script}"
+            script.contains("export SKIM_HOOK_BINARY="),
+            "script must export SKIM_HOOK_BINARY, got: {script}"
         );
     }
 
     #[test]
     fn test_gemini_generate_script_has_version() {
-        let script = hook().generate_script("0.9.0");
+        let script = hook().generate_script("0.9.0", "/usr/local/bin/skim");
         assert!(
             script.contains("SKIM_HOOK_VERSION=\"0.9.0\""),
             "script must export SKIM_HOOK_VERSION, got: {script}"
@@ -175,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_gemini_generate_script_has_agent_flag() {
-        let script = hook().generate_script("1.0.0");
+        let script = hook().generate_script("1.0.0", "/usr/local/bin/skim");
         assert!(
             script.contains("--agent gemini"),
             "script must pass --agent gemini flag, got: {script}"
@@ -184,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_gemini_generate_script_has_shebang() {
-        let script = hook().generate_script("1.0.0");
+        let script = hook().generate_script("1.0.0", "/usr/local/bin/skim");
         assert!(
             script.starts_with("#!/usr/bin/env bash"),
             "script must start with bash shebang, got: {script}"
