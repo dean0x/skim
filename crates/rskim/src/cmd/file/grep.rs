@@ -304,7 +304,7 @@ fn try_parse_single_target(text: &str, label: &str, line_numbers: bool) -> Optio
         }
         let formatted = if line_numbers {
             match RE_LINENO_CONTENT.captures(line) {
-                Some(caps) => format!("  :{}: {}", &caps[1], caps[2].trim()),
+                Some(caps) => format!("  :{}: {}", &caps[1], caps[2].trim_end()),
                 None => format!("  {line}"),
             }
         } else {
@@ -669,6 +669,26 @@ mod tests {
             result.is_passthrough(),
             "unattributable lines must passthrough, got {}",
             result.tier_name()
+        );
+    }
+
+    /// R7: single-target path must preserve leading whitespace.
+    /// Leading spaces are semantically significant in Python, YAML, etc.
+    /// `.trim()` was stripping them, breaking indented definitions.
+    #[test]
+    fn test_r7_single_target_preserves_leading_indent() {
+        let grep_args = GrepArgs::scan(&args(&["-n", "def", "test.py"]));
+        let output = make_output("5:    def __init__(self):\n8:        pass\n");
+        let result = parse_impl(&output, &grep_args);
+        assert!(result.is_full());
+        let rendered = result.content().to_string();
+        assert!(
+            rendered.contains("    def __init__"),
+            "leading 4-space indent must be preserved (R7): {rendered}"
+        );
+        assert!(
+            rendered.contains("        pass"),
+            "8-space indent must be preserved (R7): {rendered}"
         );
     }
 
