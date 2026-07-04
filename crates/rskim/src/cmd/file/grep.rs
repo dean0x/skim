@@ -44,6 +44,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     // unparseable output, over the line-bound) are unaffected: parse returns the
     // passthrough tier and the guard branch is skipped regardless of this flag.
     skip_net_savings_guard: true,
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 /// Run `skim grep [args...]`.

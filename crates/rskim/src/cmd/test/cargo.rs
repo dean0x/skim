@@ -140,6 +140,7 @@ pub(crate) fn run(
             expected_exit_codes,
             forward_stderr: false,
             skip_net_savings_guard: false,
+            synthesize_success_line: None,
         },
         move |output| parse_impl(output, is_nextest),
         // Stdin fabricates exit 0 (#317 Addendum 2): derive a failure exit

@@ -102,6 +102,7 @@ pub(super) fn run_script(
             expected_exit_codes: &[1],
             forward_stderr: false,
             skip_net_savings_guard: false,
+            synthesize_success_line: None,
         },
         move |output: &CommandOutput| parse_npm_output(output, tool),
     )

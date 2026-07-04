@@ -30,6 +30,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     expected_exit_codes: &[2],
     forward_stderr: false,
     skip_net_savings_guard: false,
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 /// `file.swift:line:col: warning: message (rule_id)`

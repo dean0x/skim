@@ -133,6 +133,7 @@ where
             // and auditable (#317).
             forward_stderr: config.forward_stderr,
             skip_net_savings_guard: false,
+            synthesize_success_line: None,
         },
         |output| parse_fn(output),
     )

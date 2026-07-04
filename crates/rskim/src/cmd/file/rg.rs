@@ -29,6 +29,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     // single predictable output shape instead of letting the net-savings guard
     // flip small result sets back to raw `file:line:content`.
     skip_net_savings_guard: true,
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 /// Run `skim rg [args...]`.
