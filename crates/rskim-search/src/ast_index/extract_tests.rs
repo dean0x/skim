@@ -5,6 +5,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::HashSet;
+
 use rskim_core::Language;
 
 use super::*;
@@ -35,6 +37,21 @@ fn node(kind_id: u16, depth: u16) -> LinearNode {
 /// Collect bigram keys from a result set for membership assertions.
 fn bigram_keys(set: &AstNgramSet) -> Vec<u32> {
     set.bigrams.iter().map(|e| e.ngram.key()).collect()
+}
+
+/// Collect the u32 keys of all SYNTHETIC bigrams in `set` (i.e., those whose
+/// parent or child ID satisfies `is_synthetic_id`). Used by B_S1 parity tests
+/// to build the "expected present" set from `extract_ast_ngrams_with_metrics`
+/// before asserting that `synthetic_key_present` agrees.
+fn synthetic_bigram_key_set(set: &AstNgramSet) -> HashSet<u32> {
+    set.bigrams
+        .iter()
+        .filter(|e| {
+            let (p, c) = e.ngram.decode();
+            is_synthetic_id(p) || is_synthetic_id(c)
+        })
+        .map(|e| e.ngram.key())
+        .collect()
 }
 
 // ── F1: Empty input ───────────────────────────────────────────────────────────
@@ -1043,15 +1060,7 @@ fn synthetic_key_present_agrees_with_extract_ast_ngrams_with_metrics_bs1() {
     let (emitted, _metrics) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
 
     // Collect synthetic bigram keys from the full extraction path.
-    let emitted_synthetic_keys: std::collections::HashSet<u32> = emitted
-        .bigrams
-        .iter()
-        .filter(|e| {
-            let (p, c) = e.ngram.decode();
-            is_synthetic_id(p) || is_synthetic_id(c)
-        })
-        .map(|e| e.ngram.key())
-        .collect();
+    let emitted_synthetic_keys = synthetic_bigram_key_set(&emitted);
 
     // ── PRESENT case ─────────────────────────────────────────────────────────
     // bucket_label(0) corresponds to DEPTH_EDGES[0] = 4; must be in emitted set.
@@ -1122,15 +1131,7 @@ fn synthetic_key_present_agrees_with_extract_ast_ngrams_for_empty_body_bs1_close
 
     let (emitted, _metrics) = extract_ast_ngrams_with_metrics(&nodes_empty, Language::Rust);
 
-    let emitted_synthetic_keys: std::collections::HashSet<u32> = emitted
-        .bigrams
-        .iter()
-        .filter(|e| {
-            let (p, c) = e.ngram.decode();
-            is_synthetic_id(p) || is_synthetic_id(c)
-        })
-        .map(|e| e.ngram.key())
-        .collect();
+    let emitted_synthetic_keys = synthetic_bigram_key_set(&emitted);
 
     // B_S1 close-path precondition: full path must emit the target bigram.
     let present_target = AstBigram::encode(EMPTY_BODY, fn_item_id);
@@ -1160,15 +1161,7 @@ fn synthetic_key_present_agrees_with_extract_ast_ngrams_for_empty_body_bs1_close
 
     let (emitted_ne, _) = extract_ast_ngrams_with_metrics(&nodes_non_empty, Language::Rust);
 
-    let emitted_ne_synthetic_keys: std::collections::HashSet<u32> = emitted_ne
-        .bigrams
-        .iter()
-        .filter(|e| {
-            let (p, c) = e.ngram.decode();
-            is_synthetic_id(p) || is_synthetic_id(c)
-        })
-        .map(|e| e.ngram.key())
-        .collect();
+    let emitted_ne_synthetic_keys = synthetic_bigram_key_set(&emitted_ne);
 
     assert!(
         !emitted_ne_synthetic_keys.contains(&present_target.key()),
