@@ -25,7 +25,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use rskim_search::{AstIndexReader, AstQuery, AstQueryEngine, FileId, TemporalDb};
-use rskim_search::{all_patterns, parse_ast_query};
+use rskim_search::{all_patterns, is_synthetic_id, parse_ast_query};
 // #201: enriched row type + formatters from rskim-search.
 // pub(super) re-exports so test module (ast_tests.rs) can call them as super::.
 pub(super) use rskim_search::AstResult;
@@ -239,9 +239,28 @@ pub(super) fn run_ast_standalone(
     } else {
         limit
     };
-    // AD-374-3: AST candidate pool — reuse LEXICAL_CANDIDATE_POOL_K from query.rs
-    // (pub(super)) as the single definition. No AST-local fork.
-    let ast_pool = super::query::candidate_pool(limit, super::query::LEXICAL_CANDIDATE_POOL_K);
+    // AD-374-3 / AC11 (#419): AST candidate pool.
+    //
+    // Real-node patterns: reuse LEXICAL_CANDIDATE_POOL_K from query.rs (K=5,
+    // floor=100) — the same over-fetch logic as the lexical path, needed because
+    // the strict ancestor-walk gate can drop a significant fraction of candidates
+    // for patterns with many structural false positives.
+    //
+    // Synthetic-marker patterns (god-function, deep-nesting, empty-function,
+    // empty-catch, excessive-params): the extraction-reuse verify gate
+    // (`synthetic_key_present`) has near-zero drop rate — the AST index correctly
+    // identifies which files contain the marker, so a K=5 pool and a 100-file
+    // floor are pure overhead. For these, size the pool to exactly `limit` (with
+    // a floor of 1 to avoid an empty pool when limit=0).
+    //
+    // This is the companion to the `synthetic_key_present` early-exit fix in
+    // `compound/reparse.rs` — together they reduce measured `--ast deep-nesting`
+    // latency from ~6.9s to within AC11's <500ms target.
+    let ast_pool = if ast_query_is_synthetic(&query) {
+        limit.max(1)
+    } else {
+        super::query::candidate_pool(limit, super::query::LEXICAL_CANDIDATE_POOL_K)
+    };
     let window = temporal_window.max(ast_pool);
 
     // Intersect AST results with blast-radius FileIds (when set), then take the
@@ -405,6 +424,28 @@ fn read_line_at(abs_path: &Path, line_1indexed: u32, max_bytes: u64) -> Option<S
 // ============================================================================
 // Pattern metadata lookup
 // ============================================================================
+
+/// AC11 / AD-374-3 (#419): returns `true` when every resolved bigram in `query`
+/// is a synthetic-marker pattern (at least one component ID >= `BUCKET_LABEL_BASE`).
+///
+/// Only [`AstQuery::Pattern`] with synthetic-marker resolved bigrams reaches
+/// this path — [`AstQuery::Containment`] and [`AstQuery::SingleNode`] do not
+/// reference synthetic IDs (the parser rejects them at the CLI boundary), so
+/// this function returns `false` for those variants.
+///
+/// Used to gate the candidate pool size: synthetic patterns have a near-zero
+/// verify drop rate (the early-exit `synthetic_key_present` gate is essentially
+/// a membership check of what the index already indexed), so a K=5 multiplier
+/// and a 100-file floor are unnecessary overhead for them.
+fn ast_query_is_synthetic(query: &AstQuery) -> bool {
+    match query {
+        AstQuery::Pattern(p) => p.resolved_bigrams().iter().any(|bg| {
+            let (parent, child) = bg.decode();
+            is_synthetic_id(parent) || is_synthetic_id(child)
+        }),
+        AstQuery::Containment(_) | AstQuery::SingleNode(_) => false,
+    }
+}
 
 /// Look up human-readable metadata for a pattern name.
 ///

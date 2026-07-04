@@ -4396,3 +4396,55 @@ fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
         rskim_search::AST_INDEX_FORMAT_VERSION
     );
 }
+
+/// AC11 (#394 / #419): `ast_query_is_synthetic` correctly classifies queries.
+///
+/// - All 5 synthetic-marker patterns (`god-function`, `deep-nesting`,
+///   `empty-function`, `empty-catch`, `excessive-params`) → `true`.
+/// - All non-synthetic named patterns (`try-catch`, `rust-nested-loop`,
+///   `god-class`) → `false`.
+/// - `AstQuery::Containment` (which never carries a synthetic ID — rejected at
+///   parse time) → `false`.
+///
+/// This is a unit test for the pool-sizing helper introduced in the AC11 fix:
+/// the synthetic pool uses `limit.max(1)` instead of `max(K×limit, 100)`.
+#[test]
+fn ast_query_is_synthetic_classifies_correctly_ac11_394() {
+    // Synthetic patterns — must return true.
+    for pattern in [
+        "god-function",
+        "deep-nesting",
+        "empty-function",
+        "empty-catch",
+        "excessive-params",
+    ] {
+        let query = rskim_search::parse_ast_query(pattern)
+            .unwrap_or_else(|e| panic!("AC11 (#394): {pattern} must parse: {e}"));
+        assert!(
+            super::ast_query_is_synthetic(&query),
+            "AC11 (#394): ast_query_is_synthetic({pattern}) must return true — \
+             this is a synthetic-marker pattern; got false"
+        );
+    }
+
+    // Real-node patterns — must return false.
+    for pattern in ["try-catch", "rust-nested-loop", "god-class"] {
+        let query = rskim_search::parse_ast_query(pattern)
+            .unwrap_or_else(|e| panic!("AC11 (#394): {pattern} must parse: {e}"));
+        assert!(
+            !super::ast_query_is_synthetic(&query),
+            "AC11 (#394): ast_query_is_synthetic({pattern}) must return false — \
+             this is a real-node pattern; got true"
+        );
+    }
+
+    // Containment query (A > B) — must return false (containment never carries
+    // a synthetic ID; the parser rejects synthetic-marker names in containment
+    // position).
+    let containment = rskim_search::parse_ast_query("function_item > block")
+        .unwrap_or_else(|e| panic!("AC11 (#394): containment query must parse: {e}"));
+    assert!(
+        !super::ast_query_is_synthetic(&containment),
+        "AC11 (#394): ast_query_is_synthetic for a containment query must return false"
+    );
+}

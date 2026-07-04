@@ -45,7 +45,7 @@ pub use ast_index::{
     PatternCategory, StructuralMetrics, all_patterns, ast_bigram_idf, ast_trigram_idf,
     extract_ast_ngrams, extract_ast_ngrams_with_lines, extract_ast_ngrams_with_metrics,
     extract_ast_ngrams_with_weights, is_synthetic_id, linearize_source, lookup_pattern,
-    parse_ast_query, vocab_len, vocab_lookup, vocab_resolve,
+    parse_ast_query, synthetic_key_present, vocab_len, vocab_lookup, vocab_resolve,
 };
 
 /// Current on-disk format version for the AST index (`ast_index.skidx`).

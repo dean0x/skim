@@ -900,6 +900,126 @@ fn emit_empty_or_large_body(
     }
 }
 
+/// Verify that a single synthetic-marker bigram key is emitted by the SAME
+/// extraction logic as [`extract_ast_ngrams_with_metrics`], exiting the traversal
+/// as soon as the key is confirmed present in the node stream.
+///
+/// # Purpose (#419 — AC11 fix)
+///
+/// This is the fast-path verification gate for synthetic-marker patterns in
+/// [`crate::compound::pattern_occurs_in_file`].  The full
+/// [`extract_ast_ngrams_with_metrics`] path ran the complete O(n) traversal
+/// before checking membership, causing `--ast deep-nesting` to take ~6.9s
+/// (measured on skim's own repo at `CANDIDATE_POOL_FLOOR=100`).  This function
+/// exits immediately when `target` is found — for `deep-nesting` (DEEP_NODE →
+/// bucket_label(0)) that fires at the first node whose CST depth is >= 4,
+/// typically within the first few hundred of the total node list.
+///
+/// # ADR-006 compliance (single source of truth)
+///
+/// This function uses the SAME [`ExtractState`] state machine and the SAME
+/// helper methods (`emit_depth_buckets`, `close_open_subtrees`, `fill_depth_gap`,
+/// `update_child_count`, `record_node`) as [`run_extraction`] — the same bucket
+/// edges, the same kind-ID tables, the same emission conditions.  It therefore
+/// cannot drift from the indexer: a change to any emission threshold automatically
+/// affects both this function and [`extract_ast_ngrams_with_metrics`].
+///
+/// **Differences from [`run_extraction`]:**
+/// - Returns `bool` instead of `Option<ExtractState>` (verify, not collect).
+/// - Skips `update_branch_count` and `emit_real_ngrams` — branch metrics and
+///   real AST n-grams are irrelevant for a synthetic-only presence check.  Real
+///   n-grams cannot collide with a synthetic `target` (target component IDs are
+///   `>= BUCKET_LABEL_BASE`, outside the real vocabulary range), so omitting
+///   them has zero impact on correctness.
+/// - Returns `true` the moment `target` is present in `bigram_map`; never
+///   processes more of the node stream than necessary.
+///
+/// # Contract
+///
+/// `target` MUST be a synthetic bigram (at least one component ID >=
+/// `BUCKET_LABEL_BASE`).  Callers must not pass a real-vocabulary bigram — the
+/// function cannot distinguish one from an absent synthetic key because
+/// `emit_real_ngrams` is skipped.
+///
+/// # Returns
+///
+/// `true` iff the traversal emits `target` at least once; `false` if the full
+/// node stream is exhausted without emitting it.
+#[must_use]
+pub fn synthetic_key_present(nodes: &[LinearNode], lang: Language, target: AstBigram) -> bool {
+    // Unused parameter: `lang` is accepted for API symmetry with
+    // `extract_ast_ngrams_with_metrics` so callers don't need a separate
+    // branch; it would be needed here if `emit_real_ngrams` were called.
+    let _ = lang;
+
+    if nodes.is_empty() {
+        return false;
+    }
+
+    let max_depth = nodes.iter().map(|n| n.depth).max().unwrap_or(0);
+    let mut state = ExtractState::new(max_depth, nodes.len());
+    let mut prev_depth: Option<u16> = None;
+
+    for node in nodes {
+        let d = usize::from(node.depth);
+
+        // ── Depth-bucket markers (DEEP_NODE → bucket_label(i)) ──────────────
+        // Emitted for every node at depth >= DEPTH_EDGES[i]. Check immediately
+        // after emission — the early exit for deep-nesting fires here on the
+        // first node whose CST depth reaches the bucket threshold.
+        state.emit_depth_buckets(node.depth, node.start_line, node.start_byte);
+        if state.bigram_map.contains_key(&target) {
+            return true;
+        }
+
+        // ── Gap-fill (PF-004: widen to u32, identical to run_extraction) ────
+        if let Some(p) = prev_depth
+            && u32::from(node.depth) > u32::from(p) + 1
+        {
+            state.fill_depth_gap(p, d);
+        }
+
+        // ── Child-count accounting ───────────────────────────────────────────
+        // Needed for correct LARGE_BODY / EMPTY_BODY / MANY_PARAMS emission
+        // inside close_open_subtrees below.
+        state.update_child_count(d, node.kind_id);
+
+        // ── Subtree-close markers (LARGE_BODY, EMPTY_BODY, MANY_PARAMS) ─────
+        // Emitted in close_depth when a body/param-list node's children are
+        // fully accumulated. Check immediately after — early exit for
+        // god-function, empty-function/catch, and excessive-params fires here.
+        if let Some(p) = prev_depth {
+            state.close_open_subtrees(node.depth, p);
+            if state.bigram_map.contains_key(&target) {
+                return true;
+            }
+        }
+
+        // NOTE: `update_branch_count` and `emit_real_ngrams` intentionally
+        // omitted — branch metrics and real AST n-grams are not needed for a
+        // synthetic-only presence check. The synthetic `target` can never be
+        // inserted by `emit_real_ngrams` because its component IDs are >=
+        // BUCKET_LABEL_BASE, which is above the real vocabulary range.
+
+        // Record this node in the ancestor table (required for correct
+        // depth_kind / depth_line / depth_byte reads inside close_depth).
+        state.record_node(d, node.kind_id, node.start_line, node.start_byte);
+
+        prev_depth = Some(node.depth);
+    }
+
+    // ── Close any still-open depths at end of stream ─────────────────────────
+    // Mirrors run_extraction's end-of-stream close (close_open_subtrees(0, p)).
+    if let Some(p) = prev_depth {
+        state.close_open_subtrees(0, p);
+        if state.bigram_map.contains_key(&target) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Extract structural n-grams using the production per-language IDF tables.
 ///
 /// Convenience wrapper over [`extract_ast_ngrams_with_weights`]. Falls back to

@@ -59,7 +59,7 @@ pub use ast_cache::{
 pub use extract::{
     AstBigramEntry, AstNgramSet, AstTrigramEntry, extract_ast_ngrams,
     extract_ast_ngrams_with_lines, extract_ast_ngrams_with_metrics,
-    extract_ast_ngrams_with_weights,
+    extract_ast_ngrams_with_weights, synthetic_key_present,
 };
 pub use linearize::{LinearNode, LinearizeResult, linearize_source};
 pub use ngram::{

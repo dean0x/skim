@@ -43,8 +43,8 @@ use rskim_core::{AstWalkConfig, AstWalkIter, Language, Parser};
 
 use crate::ast_index::structural::is_synthetic_id;
 use crate::ast_index::{
-    AstBigram, AstNgramSet, AstQuery, AstTrigram, NodeKindId, extract_ast_ngrams_with_lines,
-    extract_ast_ngrams_with_metrics, linearize_source, vocab_lookup,
+    AstBigram, AstQuery, NodeKindId, extract_ast_ngrams_with_lines, linearize_source,
+    synthetic_key_present, vocab_lookup,
 };
 
 /// Maximum file size for re-parse operations.
@@ -274,13 +274,15 @@ fn recover_synthetic_line(
 /// `node.parent()` kind in this walk — never yields a synthetic ID (#394's
 /// root cause: standalone `--ast` returned zero results for all 5).  Before
 /// reaching this walk, [`AncestorMatchTable::contains_synthetic_id`] routes any
-/// such pattern to a SEPARATE branch that re-runs the index-time pipeline
-/// (`linearize_source` + `extract_ast_ngrams_with_metrics`) and confirms every
-/// resolved n-gram KEY is present in the emitted set (reuses the indexer as the
-/// single source of truth — applies ADR-006).  Real-node patterns are NOT
-/// routed through extraction-reuse (AD-394-2) — collapsing the two branches
-/// would loosen the 24 real patterns to the indexer's gap-fill tolerance,
-/// regressing AD-374-6 precision.
+/// such pattern to a SEPARATE branch that re-runs the index-time pipeline via
+/// `linearize_source` + [`synthetic_key_present`] (an early-exit variant of
+/// `extract_ast_ngrams_with_metrics` that returns as soon as the target synthetic
+/// bigram is confirmed present — AC11 / #419 fix) and confirms every resolved
+/// n-gram KEY is emitted (reuses the indexer's SAME emission logic as the single
+/// source of truth — applies ADR-006).  Real-node patterns are NOT routed through
+/// extraction-reuse (AD-394-2) — collapsing the two branches would loosen the 24
+/// real patterns to the indexer's gap-fill tolerance, regressing AD-374-6
+/// precision.
 ///
 /// ## AD-374-5: Non-tree-sitter / zero-kind files drop
 ///
@@ -362,34 +364,32 @@ pub fn pattern_occurs_in_file(
     // node patterns keep the strict ancestor walk below. Do NOT collapse the
     // two branches — see AD-394-2 for why real patterns must not be loosened.
     if ancestor_table.contains_synthetic_id() {
-        // AD-394-1: verify by re-running the index-time pipeline and confirming
-        // every resolved n-gram KEY is present in the emitted AstNgramSet.
-        // `linearize_source` parses internally, so no separate `Parser::new`
-        // is needed on this branch (AD-374-5 guards — size/non-tree-sitter —
-        // are already inherited from the shared guards above; linearize_source's
-        // own internal size/language guards degrade to an empty result rather
-        // than ever firing here).
+        // AD-394-1 / #419 (AC11 fix): verify by re-running the index-time pipeline
+        // via `linearize_source` + `synthetic_key_present`. The latter uses the SAME
+        // ExtractState emission logic as `extract_ast_ngrams_with_metrics` (ADR-006)
+        // but exits as soon as the target bigram key is confirmed present — for
+        // deep-nesting (DEEP_NODE → bucket_label(0)) this fires at the first node at
+        // depth >= 4, dramatically faster than a full O(n) traversal.
+        //
+        // AC8 invariant: mixed (synthetic + real) patterns are rejected at the catalog
+        // level, so all bigrams in ancestor_table are synthetic when we reach this
+        // branch. The trigrams set is empty for all 5 current synthetic patterns.
+        //
+        // `linearize_source` parses internally; no separate `Parser::new` is needed.
+        // AD-374-5 size/language guards are inherited from the shared guards above;
+        // linearize_source's own internal guards degrade to an empty result (never
+        // fire redundantly here).
         let Ok(result) = linearize_source(source, lang) else {
             return false;
         };
-        // CRITICAL (AD-394-1): destructure the tuple return —
-        // extract_ast_ngrams_with_metrics returns (AstNgramSet, StructuralMetrics),
-        // not just the ngram set.
-        //
-        // KNOWN PERF CHARACTERISTIC (#419, measured on skim's own repo): this
-        // branch is markedly heavier per-candidate than the real-node walk
-        // below (full per-file metrics recomputation vs. a bounded ancestor
-        // walk), and for a low-selectivity marker like deep-nesting (common
-        // in real code) the candidate pool fills to CANDIDATE_POOL_FLOOR
-        // (query.rs) regardless of --limit. Dogfooding showed `--ast
-        // deep-nesting` at ~6.9s vs. `--ast try-catch` at ~26ms on this
-        // repo — correctness is unaffected, but this misses the design
-        // plan's AC11 (<500ms, same order of magnitude as the real gate).
-        // A lighter-weight early-exit presence check is tracked in #419 —
-        // not fixed here to avoid an under-designed change to the shared
-        // extraction path.
-        let (emitted, _metrics) = extract_ast_ngrams_with_metrics(&result.nodes, lang);
-        return ancestor_table.all_ngrams_present_in(&emitted);
+        // Check every synthetic bigram via early-exit. AC8 guarantees all bigrams are
+        // synthetic here (no real IDs mixed in), so no filter is needed.
+        return ancestor_table
+            .bigrams
+            .iter()
+            .all(|&(p, c)| synthetic_key_present(&result.nodes, lang, AstBigram::encode(p, c)));
+        // Trigrams: all current synthetic patterns are zero-trigram; ancestor_table.trigrams
+        // is empty, so the bigram check above is the complete verification.
     }
 
     // Real-node branch (AD-394-2, unchanged): only tree-sitter languages can be
@@ -539,25 +539,6 @@ impl AncestorMatchTable {
                 .trigrams
                 .iter()
                 .any(|&(gp, p, c)| is_synthetic_id(gp) || is_synthetic_id(p) || is_synthetic_id(c))
-    }
-
-    /// AD-394-1: re-encode this table's decoded bigrams/trigrams and check
-    /// that EVERY one is present as a KEY in `set` (weights/counts ignored) —
-    /// the extraction-reuse verify check for synthetic-marker patterns. `set`
-    /// is sorted by key ascending (guaranteed by [`AstNgramSet`]'s producer),
-    /// so each lookup is `O(log n)` via binary search.
-    ///
-    /// An empty `self.trigrams` (true for all 5 synthetic marker patterns
-    /// today — they are single-bigram/zero-trigram) makes the trigram
-    /// conjunct vacuously `true`.
-    fn all_ngrams_present_in(&self, set: &AstNgramSet) -> bool {
-        self.bigrams.iter().all(|&(p, c)| {
-            let key = AstBigram::encode(p, c);
-            set.bigrams.binary_search_by_key(&key, |e| e.ngram).is_ok()
-        }) && self.trigrams.iter().all(|&(gp, p, c)| {
-            let key = AstTrigram::encode(gp, p, c);
-            set.trigrams.binary_search_by_key(&key, |e| e.ngram).is_ok()
-        })
     }
 }
 
