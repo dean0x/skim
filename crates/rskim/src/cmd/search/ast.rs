@@ -25,7 +25,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use rskim_search::{AstIndexReader, AstQuery, AstQueryEngine, FileId, TemporalDb};
-use rskim_search::{all_patterns, parse_ast_query};
+use rskim_search::{all_patterns, is_synthetic_id, parse_ast_query};
 // #201: enriched row type + formatters from rskim-search.
 // pub(super) re-exports so test module (ast_tests.rs) can call them as super::.
 pub(super) use rskim_search::AstResult;
@@ -239,9 +239,28 @@ pub(super) fn run_ast_standalone(
     } else {
         limit
     };
-    // AD-374-3: AST candidate pool — reuse LEXICAL_CANDIDATE_POOL_K from query.rs
-    // (pub(super)) as the single definition. No AST-local fork.
-    let ast_pool = super::query::candidate_pool(limit, super::query::LEXICAL_CANDIDATE_POOL_K);
+    // AD-374-3 / AC11 (#419): AST candidate pool.
+    //
+    // Real-node patterns: reuse LEXICAL_CANDIDATE_POOL_K from query.rs (K=5,
+    // floor=100) — the same over-fetch logic as the lexical path, needed because
+    // the strict ancestor-walk gate can drop a significant fraction of candidates
+    // for patterns with many structural false positives.
+    //
+    // Synthetic-marker patterns (god-function, deep-nesting, empty-function,
+    // empty-catch, excessive-params): the extraction-reuse verify gate
+    // (`synthetic_key_present`) has near-zero drop rate — the AST index correctly
+    // identifies which files contain the marker, so a K=5 pool and a 100-file
+    // floor are pure overhead. For these, size the pool to exactly `limit` (with
+    // a floor of 1 to avoid an empty pool when limit=0).
+    //
+    // This is the companion to the `synthetic_key_present` early-exit fix in
+    // `compound/reparse.rs` — together they reduce measured `--ast deep-nesting`
+    // latency from ~6.9s to within AC11's <500ms target.
+    let ast_pool = if ast_query_is_synthetic(&query) {
+        limit.max(1)
+    } else {
+        super::query::candidate_pool(limit, super::query::LEXICAL_CANDIDATE_POOL_K)
+    };
     let window = temporal_window.max(ast_pool);
 
     // Intersect AST results with blast-radius FileIds (when set), then take the
@@ -265,6 +284,17 @@ pub(super) fn run_ast_standalone(
     // `node.parent()` calls — NOT the pre-order-predecessor approximation used by
     // `recover_line`. This is the correctness backstop that eliminates unrelated-
     // subtree false positives that AND-intersect alone would keep.
+    //
+    // AD-394-4 (#394): the 5 synthetic-marker patterns (god-function,
+    // deep-nesting, empty-function, empty-catch, excessive-params) now pass
+    // through this SAME `pattern_occurs_in_file` call via an internal
+    // extraction-reuse branch (`compound::reparse`, AD-394-1/AD-394-2) — before
+    // #394 they always failed the gate (a synthetic ID can never appear in a
+    // real `node.parent()` chain), so standalone `--ast <synthetic-pattern>`
+    // returned zero results for all 5 while the compound path (which skips this
+    // gate, see below) returned matches — a standalone/compound contradiction
+    // (avoids PF-006). This call site is otherwise UNCHANGED; the routing is
+    // internal to `pattern_occurs_in_file`.
     //
     // AD-374-5: Non-tree-sitter files (JSON/TOML/YAML, node_count=0) return false
     // from `pattern_occurs_in_file` and are dropped here.
@@ -336,6 +366,13 @@ pub(super) fn run_ast_standalone(
     // by the verify gate above. A file that passes the gate but whose representative
     // line cannot be recovered still emits as a degraded row (path present, no :line
     // or snippet). recover_line returning None MUST NOT drop a gate-passed file.
+    //
+    // Updated for #394 (OD-394-1, AD-394-5): `recover_line` is now
+    // synthetic-aware, so a gate-passed synthetic-pattern row (god-function,
+    // deep-nesting, empty-function, empty-catch, excessive-params) recovers a
+    // REAL `:line`/snippet here too, instead of degrading to a path-only row.
+    // This call site itself is unchanged — the synthetic branch is internal to
+    // `recover_line`.
     for r in &mut resolved {
         let abs_path = root.join(&r.path);
         // Recover the stored mtime from the manifest for the stale guard.
@@ -387,6 +424,45 @@ fn read_line_at(abs_path: &Path, line_1indexed: u32, max_bytes: u64) -> Option<S
 // ============================================================================
 // Pattern metadata lookup
 // ============================================================================
+
+/// AC11 / AD-374-3 (#419): returns `true` when any (at least one) resolved bigram
+/// in `query` has a synthetic-marker component ID (`>= BUCKET_LABEL_BASE`).
+///
+/// Only [`AstQuery::Pattern`] with synthetic-marker resolved bigrams reaches
+/// this path — [`AstQuery::Containment`] and [`AstQuery::SingleNode`] do not
+/// reference synthetic IDs (the parser rejects them at the CLI boundary), so
+/// this function returns `false` for those variants.
+///
+/// Used to gate the candidate pool size: synthetic patterns have a near-zero
+/// verify drop rate (the early-exit `synthetic_key_present` gate is essentially
+/// a membership check of what the index already indexed), so a K=5 multiplier
+/// and a 100-file floor are unnecessary overhead for them.
+///
+/// # Design note — intentionally bigrams-only (pool sizing, not routing)
+///
+/// This function inspects `resolved_bigrams()` only. It does NOT delegate to
+/// `compound::reparse::query_contains_synthetic_id` (which also checks trigrams
+/// and handles the Containment variant). This is safe because:
+///
+/// - Its sole use is pool sizing, not routing. A false 'not synthetic' causes
+///   over-provisioning (always correct); a false 'synthetic' under-provisions
+///   (still correct — the verify gate is the source of truth for correctness).
+/// - All 5 current synthetic patterns are single-bigram/zero-trigram (OD-394-2),
+///   so this predicate and `query_contains_synthetic_id` agree for every live
+///   pattern.
+///
+/// If a future synthetic-trigram pattern is added, this function conservatively
+/// classifies it as 'not synthetic', causing over-provisioning. That is the
+/// correct failure mode for a pool-sizing heuristic.
+fn ast_query_is_synthetic(query: &AstQuery) -> bool {
+    match query {
+        AstQuery::Pattern(p) => p.resolved_bigrams().iter().any(|bg| {
+            let (parent, child) = bg.decode();
+            is_synthetic_id(parent) || is_synthetic_id(child)
+        }),
+        AstQuery::Containment(_) | AstQuery::SingleNode(_) => false,
+    }
+}
 
 /// Look up human-readable metadata for a pattern name.
 ///

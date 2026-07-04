@@ -35,13 +35,17 @@
 //! since indexing, the mtime will differ and the caller's stale guard will degrade
 //! to file-level output before this function is called.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 
 use rskim_core::{AstWalkConfig, AstWalkIter, Language, Parser};
 
-use crate::ast_index::{AstQuery, NodeKindId, vocab_lookup};
+use crate::ast_index::structural::is_synthetic_id;
+use crate::ast_index::{
+    AstBigram, AstQuery, NodeKindId, extract_ast_ngrams_with_lines, linearize_source,
+    synthetic_key_present, vocab_lookup,
+};
 
 /// Maximum file size for re-parse operations.
 ///
@@ -52,10 +56,28 @@ pub const MAX_REPARSE_FILE_BYTES: u64 = 100 * 1024;
 
 /// Recover the representative line for a matched AST pattern in a source file.
 ///
-/// Walks the file's CST in **pre-order** and returns the 1-indexed line number
-/// and byte range of the **first** node whose kind matches any of the pattern's
-/// resolved bigrams or trigrams (parent→child / grandparent→parent→child
-/// relationships).
+/// For a REAL-node pattern, walks the file's CST in **pre-order** and returns
+/// the 1-indexed line number and byte range of the **first** node whose kind
+/// matches any of the pattern's resolved bigrams or trigrams (parent→child /
+/// grandparent→parent→child relationships).
+///
+/// ## AD-394-5: Synthetic-marker patterns (OD-394-1 — recover now)
+///
+/// The 5 synthetic-marker patterns (god-function, deep-nesting, empty-function,
+/// empty-catch, excessive-params) can never match the pre-order walk above —
+/// `vocab_lookup` never yields a synthetic ID, so the walk's bigram/trigram
+/// comparison is structurally unsatisfiable for them. These are routed
+/// (`query_contains_synthetic_id`, the SAME predicate the verify gate uses) to
+/// a separate branch that re-runs the index-time extraction pipeline
+/// (`extract_ast_ngrams_with_lines`) and reads back the representative
+/// `(line, byte)` position it recorded for the emitted marker — the marker and
+/// its line come from ONE pass (ADR-006), not a second, drift-prone detection
+/// re-implementation. Per-pattern representative-line rule: report the
+/// 1-indexed start line of the node the marker's condition is measured on,
+/// resolving up to the enclosing named construct for anonymous body/param
+/// blocks — god-function → enclosing function; empty-function →
+/// `function_item`; empty-catch → `catch_clause`; excessive-params →
+/// parameter-list; deep-nesting → first node crossing depth ≥ 4.
 ///
 /// ## Return value
 ///
@@ -68,6 +90,9 @@ pub const MAX_REPARSE_FILE_BYTES: u64 = 100 * 1024;
 ///
 /// Pre-order tree-sitter traversal is deterministic for unchanged source. The
 /// same file + same pattern always yields the same `(line, byte_range)` tuple.
+/// The synthetic branch is equally deterministic: the MIN line per marker key
+/// is recorded (topmost occurrence), so identical input always yields the same
+/// result.
 ///
 /// ## Bounded work (AC-API3)
 ///
@@ -76,8 +101,8 @@ pub const MAX_REPARSE_FILE_BYTES: u64 = 100 * 1024;
 ///
 /// ## Deferred precision
 ///
-/// Only the first matching node is returned. All-occurrences line precision is
-/// tracked in #338.
+/// Only the first (real-node branch) or topmost (synthetic branch) matching
+/// node is returned. All-occurrences line precision is tracked in #338.
 pub fn recover_line(
     file_path: &Path,
     query: &AstQuery,
@@ -107,13 +132,30 @@ pub fn recover_line(
     // Detect language from extension.
     let lang = Language::from_path(file_path)?;
 
+    // Read the file — shared by both branches below.
+    let content = std::fs::read(file_path).ok()?;
+    let source = std::str::from_utf8(&content).ok()?;
+
+    // AD-394-5: synthetic-marker patterns cannot be recovered by the
+    // pre-order-predecessor `MatchTable` walk below (`vocab_lookup` never
+    // yields a synthetic ID, so `match_table.matches` can never fire for
+    // them — they would always degrade to `None`, rendering a path-only row).
+    // Route them instead through the SAME extraction pass that emits the
+    // marker (`extract_ast_ngrams_with_lines`), reading back the representative
+    // position it recorded (ADR-006: one pass produces both the marker and its
+    // line — no second, drift-prone detection re-implementation). Routed by
+    // the SAME predicate as the verify gate (`query_contains_synthetic_id`) —
+    // one routing rule, no divergence.
+    if query_contains_synthetic_id(query) {
+        let result = linearize_source(source, lang).ok()?;
+        let (_emitted, _metrics, synthetic_lines) =
+            extract_ast_ngrams_with_lines(&result.nodes, lang);
+        return recover_synthetic_line(query, &synthetic_lines);
+    }
+
     // Only tree-sitter languages can be re-parsed; non-tree-sitter langs degrade.
     // We check by attempting Parser::new — if the language has no grammar, it returns Err.
     let mut parser = Parser::new(lang).ok()?;
-
-    // Read the file.
-    let content = std::fs::read(file_path).ok()?;
-    let source = std::str::from_utf8(&content).ok()?;
 
     // Parse.
     let tree = parser.parse(source).ok()?;
@@ -170,6 +212,38 @@ pub fn recover_line(
     None
 }
 
+/// AD-394-5: resolve `query`'s resolved synthetic bigram key(s) against the
+/// `synthetic_lines` side table produced by [`extract_ast_ngrams_with_lines`],
+/// and return the MIN `(line, byte)` across every key that is present.
+///
+/// Only [`AstQuery::Pattern`] can ever reach this function with a non-empty
+/// key set: [`query_contains_synthetic_id`] is `false` for
+/// [`AstQuery::Containment`] (the parser rejects synthetic-marker names in a
+/// containment query — AC7) and for [`AstQuery::SingleNode`], so those
+/// variants are handled defensively (empty key list → `None`) but are
+/// unreachable in practice.
+///
+/// Deterministic (AC-F3): `synthetic_lines` already stores the MIN line per
+/// key (recorded at emission time), so taking the min across the (today,
+/// always single) resolved key is a deterministic function of the file.
+fn recover_synthetic_line(
+    query: &AstQuery,
+    synthetic_lines: &HashMap<AstBigram, (u32, u32)>,
+) -> Option<(u32, Range<usize>)> {
+    let keys: Vec<AstBigram> = match query {
+        AstQuery::Pattern(pattern) => pattern.resolved_bigrams(),
+        AstQuery::Containment(ngram_set) => ngram_set.bigrams.iter().map(|e| e.ngram).collect(),
+        AstQuery::SingleNode(_) => Vec::new(),
+    };
+
+    let (line, byte) = keys
+        .into_iter()
+        .filter_map(|key| synthetic_lines.get(&key).copied())
+        .min_by_key(|&(line, _)| line)?;
+
+    Some((line, (byte as usize)..(byte as usize + 1)))
+}
+
 /// Verify that a source file's CST contains at least one node whose **real
 /// ancestor chain** matches the pattern's resolved n-grams.
 ///
@@ -190,6 +264,25 @@ pub fn recover_line(
 /// correct behavior.  PF-004 governs the index BUILD's u16 depth arithmetic in
 /// `extract.rs`; this gate only compares node KINDS (no depth values) so PF-004
 /// does NOT apply here.
+///
+/// ## AD-394-1 / AD-394-2: Synthetic-marker patterns route through extraction-reuse
+///
+/// The strict walk above is structurally unsatisfiable for the 5 synthetic-marker
+/// patterns (god-function, deep-nesting, empty-function, empty-catch,
+/// excessive-params): their resolved n-grams contain a synthetic ID
+/// (`>= BUCKET_LABEL_BASE`), and `vocab_lookup` — which resolves every real
+/// `node.parent()` kind in this walk — never yields a synthetic ID (#394's
+/// root cause: standalone `--ast` returned zero results for all 5).  Before
+/// reaching this walk, [`AncestorMatchTable::contains_synthetic_id`] routes any
+/// such pattern to a SEPARATE branch that re-runs the index-time pipeline via
+/// `linearize_source` + [`synthetic_key_present`] (an early-exit variant of
+/// `extract_ast_ngrams_with_metrics` that returns as soon as the target synthetic
+/// bigram is confirmed present — AC11 / #419 fix) and confirms every resolved
+/// n-gram KEY is emitted (reuses the indexer's SAME emission logic as the single
+/// source of truth — applies ADR-006).  Real-node patterns are NOT routed through
+/// extraction-reuse (AD-394-2) — collapsing the two branches would loosen the 24
+/// real patterns to the indexer's gap-fill tolerance, regressing AD-374-6
+/// precision.
 ///
 /// ## AD-374-5: Non-tree-sitter / zero-kind files drop
 ///
@@ -221,6 +314,15 @@ pub fn pattern_occurs_in_file(
     query: &AstQuery,
     manifest_mtime: Option<u64>,
 ) -> bool {
+    // Resolve the query into an ancestor-correct match table FIRST (AD-374-6).
+    // Building the table is pure and file-independent, so an empty table
+    // (pattern has no resolvable kinds in this process's vocabulary) short-
+    // circuits before any filesystem I/O (AD-374-5).
+    let ancestor_table = AncestorMatchTable::build(query);
+    if ancestor_table.is_empty() {
+        return false;
+    }
+
     // Guard: file must exist and be readable as metadata.
     let Ok(meta) = std::fs::metadata(file_path) else {
         return false;
@@ -249,30 +351,82 @@ pub fn pattern_occurs_in_file(
         return false;
     };
 
-    // Only tree-sitter languages can be re-parsed; non-tree-sitter langs drop
-    // (AD-374-5: JSON/TOML/YAML have no grammar → Parser::new returns Err).
-    let Ok(mut parser) = Parser::new(lang) else {
-        return false;
-    };
-
-    // Read and parse the file.
+    // Read the file — shared by both branches below.
     let Ok(content) = std::fs::read(file_path) else {
         return false;
     };
     let Ok(source) = std::str::from_utf8(&content) else {
         return false;
     };
+
+    // AD-394-1 / AD-394-2: route synthetic-marker patterns (any resolved
+    // n-gram component >= BUCKET_LABEL_BASE) through extraction-reuse; real-
+    // node patterns keep the strict ancestor walk below. Do NOT collapse the
+    // two branches — see AD-394-2 for why real patterns must not be loosened.
+    if ancestor_table.contains_synthetic_id() {
+        // AD-394-1 / #419 (AC11 fix): verify by re-running the index-time pipeline
+        // via `linearize_source` + `synthetic_key_present`. The latter uses the SAME
+        // ExtractState emission logic as `extract_ast_ngrams_with_metrics` (ADR-006)
+        // but exits as soon as the target bigram key is confirmed present — for
+        // deep-nesting (DEEP_NODE → bucket_label(0)) this fires at the first node at
+        // depth >= 4, dramatically faster than a full O(n) traversal.
+        //
+        // AC8 invariant: mixed (synthetic + real) patterns are rejected at the catalog
+        // level, so all bigrams in ancestor_table are synthetic when we reach this
+        // branch. The trigrams set is empty for all 5 current synthetic patterns.
+        //
+        // `linearize_source` parses internally; no separate `Parser::new` is needed.
+        // AD-374-5 size/language guards are inherited from the shared guards above;
+        // linearize_source's own internal guards degrade to an empty result (never
+        // fire redundantly here).
+        //
+        // AD-394-1 load-bearing invariant: all 5 current synthetic patterns are
+        // single-bigram / zero-trigram (see plan §2 item 3 and Auto-Resolved OD-394-2).
+        // `contains_synthetic_id` checks BOTH bigrams and trigrams, so a future
+        // synthetic-trigram-only pattern would route here while the `bigrams.iter().all()`
+        // check below would miss the trigrams (silently vacuously-true if bigrams is
+        // empty). This debug_assert fires loudly in that case rather than silently
+        // passing every candidate — assert-invariants-in-production (reliability rule).
+        debug_assert!(
+            ancestor_table.trigrams.is_empty() && !ancestor_table.bigrams.is_empty(),
+            "synthetic verify branch expects zero trigrams and at least one bigram; \
+             got {} bigrams, {} trigrams — a future synthetic-trigram pattern \
+             needs explicit trigram verification here",
+            ancestor_table.bigrams.len(),
+            ancestor_table.trigrams.len()
+        );
+        // Production guard (reliability rule — assert-invariants-in-production):
+        // `debug_assert!` above is elided in release builds, so explicitly gate
+        // the vacuous-true hazard here. If bigrams is somehow empty (e.g. a
+        // future synthetic-trigram-only pattern routed here via
+        // `contains_synthetic_id`), `.all()` over an empty iterator returns
+        // `true` and every pooled candidate would silently "pass" the gate.
+        // Returning false is the safe failure mode — no verified match.
+        if ancestor_table.bigrams.is_empty() {
+            return false;
+        }
+        let Ok(result) = linearize_source(source, lang) else {
+            return false;
+        };
+        // Check every synthetic bigram via early-exit. AC8 guarantees all bigrams are
+        // synthetic here (no real IDs mixed in), so no filter is needed.
+        return ancestor_table
+            .bigrams
+            .iter()
+            .all(|&(p, c)| synthetic_key_present(&result.nodes, lang, AstBigram::encode(p, c)));
+        // Trigrams: all current synthetic patterns are zero-trigram; ancestor_table.trigrams
+        // is empty, so the bigram check above is the complete verification.
+    }
+
+    // Real-node branch (AD-394-2, unchanged): only tree-sitter languages can be
+    // re-parsed; non-tree-sitter langs drop (AD-374-5: JSON/TOML/YAML have no
+    // grammar → Parser::new returns Err).
+    let Ok(mut parser) = Parser::new(lang) else {
+        return false;
+    };
     let Ok(tree) = parser.parse(source) else {
         return false;
     };
-
-    // Resolve the query into an ancestor-correct match table (AD-374-6).
-    // AD-374-5: an empty match table means the pattern has no resolvable kinds
-    // in this grammar → drop.
-    let ancestor_table = AncestorMatchTable::build(query);
-    if ancestor_table.is_empty() {
-        return false;
-    }
 
     // Walk the CST in pre-order and check each node's REAL parent chain.
     let walk_config = AstWalkConfig::default();
@@ -391,6 +545,37 @@ impl AncestorMatchTable {
     fn is_empty(&self) -> bool {
         self.bigrams.is_empty() && self.trigrams.is_empty()
     }
+
+    /// AD-394-1 / AD-394-2: `true` iff any resolved bigram/trigram component is
+    /// a synthetic marker ID (`is_synthetic_id`, i.e. `>= BUCKET_LABEL_BASE`).
+    ///
+    /// Routes the pattern to the extraction-reuse verify branch in
+    /// [`pattern_occurs_in_file`] instead of the strict ancestor walk: a
+    /// synthetic ID can never appear as a real `node.parent()` chain member
+    /// (`vocab_lookup` never yields one), so the strict walk is structurally
+    /// unsatisfiable for these patterns. Real-node patterns (this returns
+    /// `false`) keep the strict walk unchanged (AD-394-2 — do not collapse the
+    /// two branches; this preserves AD-374-6 precision for the 24 real
+    /// patterns).
+    fn contains_synthetic_id(&self) -> bool {
+        self.bigrams
+            .iter()
+            .any(|&(p, c)| is_synthetic_id(p) || is_synthetic_id(c))
+            || self
+                .trigrams
+                .iter()
+                .any(|&(gp, p, c)| is_synthetic_id(gp) || is_synthetic_id(p) || is_synthetic_id(c))
+    }
+}
+
+/// AD-394-1 / AD-394-5: shared routing predicate used by BOTH the verify gate
+/// (`pattern_occurs_in_file`) and `recover_line` to decide whether `query`
+/// routes through extraction-reuse — one routing rule, no divergence between
+/// the two call sites. Delegates to [`AncestorMatchTable::contains_synthetic_id`]
+/// so there is a single implementation of "does this query touch a synthetic
+/// marker ID" (built from [`is_synthetic_id`]).
+fn query_contains_synthetic_id(query: &AstQuery) -> bool {
+    AncestorMatchTable::build(query).contains_synthetic_id()
 }
 
 /// Precomputed O(1) lookup table for the CST walk.

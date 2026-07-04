@@ -56,11 +56,70 @@ fn linear_node_is_copy() {
     let n = LinearNode {
         kind_id: 42,
         depth: 3,
+        start_line: 7,
+        start_byte: 100,
     };
     let copy = n;
     assert_eq!(copy.kind_id, 42);
     assert_eq!(copy.depth, 3);
     assert_eq!(n.kind_id, 42); // using n after assignment proves Copy
+}
+
+// ── AD-394-6: start_line / start_byte population ─────────────────────────────
+
+#[test]
+fn linear_node_default_has_zero_line_and_byte() {
+    let n = LinearNode::default();
+    assert_eq!(n.start_line, 0);
+    assert_eq!(n.start_byte, 0);
+}
+
+#[test]
+fn start_line_is_one_indexed_and_monotonic_in_pre_order() {
+    // "fn main() {}" — root starts at line 1 (1-indexed), byte 0.
+    let result = parse_and_linearize("fn main() {}", Language::Rust);
+    let root = &result.nodes[0];
+    assert_eq!(
+        root.start_line, 1,
+        "root node must start on 1-indexed line 1; got {}",
+        root.start_line
+    );
+    assert_eq!(
+        root.start_byte, 0,
+        "root node must start at byte 0; got {}",
+        root.start_byte
+    );
+
+    // Pre-order traversal visits nodes in ascending start-byte order, so
+    // start_byte must be non-decreasing across the sequence.
+    for pair in result.nodes.windows(2) {
+        assert!(
+            pair[0].start_byte <= pair[1].start_byte,
+            "pre-order start_byte must be non-decreasing: {} then {}",
+            pair[0].start_byte,
+            pair[1].start_byte
+        );
+    }
+}
+
+#[test]
+fn start_line_advances_for_nodes_on_later_lines() {
+    let source = "fn a() {}\nfn b() {}\nfn c() {}\n";
+    let result = parse_and_linearize(source, Language::Rust);
+    // At least one node must be recorded on each of lines 1, 2, and 3 —
+    // proves start_line is actually populated from the real source position,
+    // not left at the zero default.
+    for expected_line in [1u32, 2, 3] {
+        assert!(
+            result.nodes.iter().any(|n| n.start_line == expected_line),
+            "expected at least one node on line {expected_line}; lines seen: {:?}",
+            result
+                .nodes
+                .iter()
+                .map(|n| n.start_line)
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 #[test]
