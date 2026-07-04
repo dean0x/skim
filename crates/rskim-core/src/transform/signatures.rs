@@ -303,6 +303,11 @@ fn get_signature_node_types(language: Language) -> Option<SignatureNodeTypes> {
             // deinit_declaration omitted: has no parameters/signature to extract
             extra_function_kinds: &["init_declaration"],
         }),
+        Language::Bash => Some(SignatureNodeTypes {
+            function: "function_definition",
+            method: "function_definition",
+            extra_function_kinds: &[],
+        }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }
 }

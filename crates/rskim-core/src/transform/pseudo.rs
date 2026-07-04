@@ -212,8 +212,16 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
             strip_semicolons: true,
             strip_self_param: false,
         },
+        Language::Bash => PseudoRules {
+            // Shell scripts have no type annotations or decorators to strip;
+            // semicolons are meaningful in bash (e.g. `if ...; then`)
+            strip_kinds: &[],
+            strip_keywords: &[],
+            strip_semicolons: false,
+            strip_self_param: false,
+        },
         // Serde languages and Markdown are handled as passthrough before reaching here
-        _ => PseudoRules {
+        Language::Markdown | Language::Json | Language::Yaml | Language::Toml => PseudoRules {
             strip_kinds: &[],
             strip_keywords: &[],
             strip_semicolons: false,

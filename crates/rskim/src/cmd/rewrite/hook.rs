@@ -393,9 +393,7 @@ fn check_hook_binary_mismatch(agent: AgentKind) {
     // Check commit mismatch (SKIM_HOOK_COMMIT vs compiled-in SKIM_GIT_COMMIT).
     if let Ok(hook_commit) = std::env::var("SKIM_HOOK_COMMIT") {
         let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
-        if !hook_commit.is_empty()
-            && compiled_commit != "unknown"
-            && hook_commit != compiled_commit
+        if !hook_commit.is_empty() && compiled_commit != "unknown" && hook_commit != compiled_commit
         {
             let stamp = cache_dir.join(format!(".hook-commit-warned-{agent_name}"));
             if should_warn_today(&stamp) {

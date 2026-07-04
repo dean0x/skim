@@ -582,8 +582,7 @@ mod tests {
 
     #[test]
     fn test_generate_hook_script_path_with_spaces() {
-        let script =
-            generate_hook_script("2.0.0", "claude", "/path/with spaces/skim");
+        let script = generate_hook_script("2.0.0", "claude", "/path/with spaces/skim");
         // Single-quoted path must appear in the script.
         assert!(
             script.contains("'/path/with spaces/skim'"),

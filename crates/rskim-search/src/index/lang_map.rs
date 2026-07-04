@@ -37,6 +37,7 @@ pub(crate) fn lang_to_id(lang: rskim_core::Language) -> u8 {
         rskim_core::Language::Toml => 14,
         rskim_core::Language::TypeScript => 15,
         rskim_core::Language::Yaml => 16,
+        rskim_core::Language::Bash => 17,
     }
 }
 

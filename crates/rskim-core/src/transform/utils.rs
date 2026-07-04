@@ -77,6 +77,7 @@ fn get_body_node_kinds(language: Language) -> &'static [&'static str] {
         Language::Sql => &[], // SQL has no function bodies
         Language::Kotlin => &["function_body", "block"],
         Language::Swift => &["function_body"],
+        Language::Bash => &["compound_statement"], // bash function body: name() { ... }
         Language::Markdown | Language::Json | Language::Yaml | Language::Toml => &[],
     }
 }
@@ -280,7 +281,7 @@ pub(crate) fn get_comment_prefix(language: Language) -> &'static str {
         | Language::CSharp
         | Language::Kotlin
         | Language::Swift => "//",
-        Language::Python | Language::Ruby => "#",
+        Language::Python | Language::Ruby | Language::Bash => "#",
         Language::Sql => "--",
         Language::Markdown => "<!--",
         Language::Json => "//", // JSON has no comments; // is JSONC-compatible
@@ -474,6 +475,7 @@ mod tests {
         assert_eq!(get_comment_prefix(Language::Json), "//");
         assert_eq!(get_comment_prefix(Language::Yaml), "#");
         assert_eq!(get_comment_prefix(Language::Toml), "#");
+        assert_eq!(get_comment_prefix(Language::Bash), "#");
     }
 
     #[test]
@@ -495,5 +497,6 @@ mod tests {
         assert_eq!(get_comment_suffix(Language::Json), "");
         assert_eq!(get_comment_suffix(Language::Yaml), "");
         assert_eq!(get_comment_suffix(Language::Toml), "");
+        assert_eq!(get_comment_suffix(Language::Bash), "");
     }
 }

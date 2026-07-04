@@ -165,13 +165,16 @@ fn test_cli_stdin_with_language() {
 
 #[test]
 fn test_cli_stdin_without_language_fails() {
+    // Non-shebang input without --language should fail.
+    // Since we now also support shebang auto-detection, the error message
+    // mentions all three options: --language, --filename, or a shebang line.
     common::skim()
         .arg("-")
         .write_stdin("function test() {}")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "requires --language or --filename",
+            "reading from stdin requires --language",
         ));
 }
 
@@ -190,6 +193,9 @@ fn test_cli_nonexistent_file() {
 
 #[test]
 fn test_cli_unsupported_extension() {
+    // ADR-002: unknown extensions degrade to lossless passthrough (exit 0).
+    // The original error-on-unknown behavior was replaced by graceful degradation.
+    // SKIM_DEBUG=1 emits a notice; without it, the output is the file contents.
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test.xyz");
     fs::write(&file_path, "some code").unwrap();
@@ -197,8 +203,8 @@ fn test_cli_unsupported_extension() {
     common::skim()
         .arg(&file_path)
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("Unsupported language"));
+        .success()
+        .stdout(predicate::str::contains("some code"));
 }
 
 #[test]

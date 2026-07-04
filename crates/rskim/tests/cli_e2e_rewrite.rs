@@ -3000,7 +3000,7 @@ fn cat_hook_payload(cmd: &str) -> String {
 
 /// Guard 1a: `cat -A file.ts` — `-A` flag bails out (show-all, not content).
 #[test]
-fn test_cat_guard_flag_A_no_rewrite_in_hook_mode() {
+fn test_cat_guard_flag_show_all_no_rewrite_in_hook_mode() {
     skim_cmd()
         .args(["rewrite", "--hook"])
         .write_stdin(cat_hook_payload("cat -A file.ts"))
@@ -3086,7 +3086,7 @@ fn test_cat_guard_unsupported_extension_no_rewrite_in_hook_mode() {
 /// The flag guard fires first, so even a glob pattern with an unsupported
 /// extension produces no rewrite.
 #[test]
-fn test_cat_guard_flag_A_with_glob_no_rewrite_in_hook_mode() {
+fn test_cat_guard_flag_show_all_with_glob_no_rewrite_in_hook_mode() {
     skim_cmd()
         .args(["rewrite", "--hook"])
         .write_stdin(cat_hook_payload("cat -A *.mds"))

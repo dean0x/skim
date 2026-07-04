@@ -327,15 +327,84 @@ fn run_transform(
                     transform_with_line_map(contents, lang, &config)?;
                 Ok((output, options.mode, has_errors, line_map, degraded))
             } else {
-                // Language detection failed — try auto-detect via path extension.
-                // Can't get line map without a known language.
-                let config = cascade::build_config(options.mode, &options.trunc);
-                let output = transform_file(&config)?.ok_or_else(|| {
-                    anyhow::anyhow!("Language detection failed and no --language specified")
-                })?;
-                Ok((output, options.mode, false, None, false))
+                // Language detection failed from extension — try shebang.
+                let shebang_lang = contents.lines().next().and_then(Language::from_shebang);
+
+                if let Some(lang) = shebang_lang {
+                    let config = cascade::build_config_with_opts(
+                        options.mode,
+                        &options.trunc,
+                        options.line_numbers,
+                    );
+                    let (output, has_errors, line_map, degraded) =
+                        transform_with_line_map(contents, lang, &config)?;
+                    return Ok((output, options.mode, has_errors, line_map, degraded));
+                }
+
+                // No language detectable — degrade to lossless passthrough (ADR-002).
+                // The SKIM_DEBUG notice is emitted by process_file after run_transform
+                // returns, not here, to avoid duplicate notices when called from
+                // process_file (which also checks degraded and emits one notice).
+                let output = passthrough_with_truncation(
+                    contents,
+                    options.trunc.max_lines,
+                    options.trunc.last_lines,
+                );
+                Ok((output, options.mode, false, None, true)) // degraded=true
             }
         }
+    }
+}
+
+/// Apply optional line-count truncation for unknown-language passthrough.
+///
+/// Used when language detection fails and we fall back to a lossless raw
+/// passthrough (ADR-002). Uses `#` as the elision-marker prefix — the most
+/// neutral choice for shell/config files (the primary use case for
+/// extension-less files). Honours `max_lines` and `last_lines` with exact
+/// omission counts and a `SKIM_PASSTHROUGH=1` hint, matching ADR-001
+/// elision-marker semantics.
+fn passthrough_with_truncation(
+    text: &str,
+    max_lines: Option<usize>,
+    last_lines: Option<usize>,
+) -> String {
+    if let Some(n) = max_lines {
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.len() <= n {
+            return text.to_string();
+        }
+        let keep = n.saturating_sub(1);
+        let omitted = lines.len() - n + 1;
+        let marker =
+            format!("# ... ({omitted} lines truncated; use SKIM_PASSTHROUGH=1 to see all)");
+        let mut out = lines[..keep].join("\n");
+        out.push('\n');
+        out.push_str(&marker);
+        if text.ends_with('\n') {
+            out.push('\n');
+        }
+        out
+    } else if let Some(n) = last_lines {
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.len() <= n {
+            return text.to_string();
+        }
+        let keep = n.saturating_sub(1);
+        let omitted = lines.len() - n + 1;
+        let marker = format!("# ... ({omitted} lines above)");
+        let tail: Vec<&str> = lines[lines.len() - keep..].to_vec();
+        let mut out = marker;
+        if keep > 0 {
+            out.push('\n');
+            out.push_str(&tail.join("\n"));
+        }
+        if text.ends_with('\n') {
+            out.push('\n');
+        }
+        out
+    } else {
+        text.to_string()
     }
 }
 
@@ -364,18 +433,28 @@ pub(crate) fn process_stdin(
 
     let filename_lang = filename_hint.and_then(|f| Language::from_path(Path::new(f)));
 
-    let language = options.explicit_lang.or(filename_lang).ok_or_else(|| {
+    // Shebang detection: if no language from explicit flag or filename extension,
+    // sniff the first line of the stdin buffer.
+    let shebang_lang = if options.explicit_lang.is_none() && filename_lang.is_none() {
+        buffer.lines().next().and_then(Language::from_shebang)
+    } else {
+        None
+    };
+
+    let language_or_none = options.explicit_lang.or(filename_lang).or(shebang_lang);
+
+    let language = language_or_none.ok_or_else(|| {
         if let Some(fname) = filename_hint {
             anyhow::anyhow!(
                 "Language detection failed: unrecognized filename '{}'\n\
-                 Supported extensions: .ts, .tsx, .js, .jsx, .cjs, .mjs, .py, .rs, .go, .java, .c, .h, .cpp, .hpp, .cxx, .cc, .md, .json, .yaml, .yml, .toml\n\
+                 Supported extensions: .ts, .tsx, .js, .jsx, .cjs, .mjs, .py, .rs, .go, .java, .c, .h, .cpp, .hpp, .cxx, .cc, .md, .json, .yaml, .yml, .toml, .sh, .bash\n\
                  Hint: use --language to specify the language explicitly\n\
                  Example: cat file | skim - --language=typescript",
                 fname
             )
         } else {
             anyhow::anyhow!(
-                "Language detection failed: reading from stdin requires --language or --filename\n\
+                "Language detection failed: reading from stdin requires --language, --filename, or a shebang line\n\
                  Example: cat file.ts | skim - --language=typescript\n\
                  Example: git show HEAD:main.rs | skim - --filename=main.rs"
             )
@@ -505,14 +584,30 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     let (result, mode_used, has_errors, line_map, degraded) =
         run_transform(&contents, path, &options)?;
 
-    // Emit notice when SKIM_DEBUG=1 and the transform degraded to passthrough due to a
-    // structural safety cap. The notice goes to stderr to avoid polluting stdout output.
+    // Emit notice when SKIM_DEBUG=1 and the transform degraded to passthrough.
+    // Two distinct degrade reasons: unknown language (no extension/shebang match)
+    // or file too large to compress (structural safety cap exceeded).
     if degraded && std::env::var("SKIM_DEBUG").as_deref() == Ok("1") {
-        eprintln!(
-            "[skim] notice: file too large to compress in {:?} mode \
-             (structural cap exceeded) — degraded to passthrough",
-            options.mode
-        );
+        let lang_detected = options.explicit_lang.is_some()
+            || detect_language_from_path(path).is_some()
+            || contents
+                .lines()
+                .next()
+                .and_then(Language::from_shebang)
+                .is_some();
+        if lang_detected {
+            eprintln!(
+                "[skim] notice: file too large to compress in {:?} mode \
+                 (structural cap exceeded) — degraded to passthrough",
+                options.mode
+            );
+        } else {
+            eprintln!(
+                "[skim] notice: unknown language for '{}' — degraded to lossless passthrough. \
+                 Use --language to specify, or SKIM_PASSTHROUGH=1 to bypass.",
+                path.display()
+            );
+        }
     }
 
     // Determine parse quality tier before guardrail (guardrail may swap output,
@@ -565,10 +660,12 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         });
     }
 
-    // Effective language for analytics: explicit override wins, else detect from path.
+    // Effective language for analytics: explicit override wins, else detect from path,
+    // then shebang. For unknown-language passthrough the language is None (zero-savings row).
     let effective_lang = options
         .explicit_lang
-        .or_else(|| detect_language_from_path(path));
+        .or_else(|| detect_language_from_path(path))
+        .or_else(|| contents.lines().next().and_then(Language::from_shebang));
 
     Ok(ProcessResult {
         output: final_output,

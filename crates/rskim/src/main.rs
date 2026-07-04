@@ -419,6 +419,8 @@ enum LanguageArg {
     #[value(alias = "kt")]
     Kotlin,
     Swift,
+    #[value(alias = "sh")]
+    Bash,
 }
 
 impl From<LanguageArg> for Language {
@@ -441,6 +443,7 @@ impl From<LanguageArg> for Language {
             LanguageArg::Sql => Language::Sql,
             LanguageArg::Kotlin => Language::Kotlin,
             LanguageArg::Swift => Language::Swift,
+            LanguageArg::Bash => Language::Bash,
         }
     }
 }
@@ -825,7 +828,19 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {e:#}");
-            ExitCode::FAILURE
+            // Map known SkimError variants to documented exit codes:
+            //   exit 2 — parse error (grammar/syntax failure)
+            //   exit 3 — unsupported language / detection failure
+            //   exit 1 — all other errors (I/O, config, etc.)
+            if let Some(skim_err) = e.downcast_ref::<rskim_core::SkimError>() {
+                match skim_err {
+                    rskim_core::SkimError::ParseError(_) => ExitCode::from(2),
+                    rskim_core::SkimError::UnsupportedLanguage(_) => ExitCode::from(3),
+                    _ => ExitCode::FAILURE,
+                }
+            } else {
+                ExitCode::FAILURE
+            }
         }
     };
 

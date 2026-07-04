@@ -400,6 +400,16 @@ fn get_type_node_types(language: Language) -> Option<TypeNodeTypes> {
             class_decl: "class_declaration",
             struct_def: "",
         }),
+        // ARCHITECTURE: Bash has no type system. Types mode returns empty output
+        // (all fields empty → no nodes match → empty result). This is correct:
+        // asking for "types only" from a shell script yields nothing.
+        Language::Bash => Some(TypeNodeTypes {
+            type_alias: "",
+            interface: "",
+            enum_def: "",
+            class_decl: "",
+            struct_def: "",
+        }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }
 }
