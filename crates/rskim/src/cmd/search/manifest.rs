@@ -9,12 +9,13 @@
 //!
 //! # Format (AD-380-1, #380)
 //!
-//! As of FORMAT_VERSION 4 the manifest is a compact **binary** file with a
+//! As of FORMAT_VERSION 5 the manifest is a compact **binary** file with a
 //! self-describing header, mirroring `ast_index.skcache`
 //! (`crates/rskim-search/src/ast_index/ast_cache.rs`). The previous v2/v3 format
 //! was a JSONL stream; binarizing removes the dominant on-disk cost of the index
 //! sidecar (a ~13 MB JSONL field-map on large repos) and the 1-byte-per-posting
-//! ASCII overhead (#380 / #174 re-baseline).
+//! ASCII overhead (#380 / #174 re-baseline).  v5 appends a skipped-entries
+//! section for the scan-reconciliation loop-killer (AD-395-4/5).
 //!
 //! File layout (all integers little-endian):
 //!
@@ -35,6 +36,13 @@
 //!     field_map_count × (u32 start, u32 end, u8 discriminant)
 //!     1 byte  : mtime_present (0/1) [+ 8 bytes u64 when present]
 //!     1 byte  : size_present  (0/1) [+ 8 bytes u64 when present]
+//!   ── v5 addition ──
+//!   4 bytes : skip_count (u32)
+//!   skip_count × skip_entry:
+//!     4 bytes : path_len (u32) + path bytes
+//!     1 byte  : mtime_present (0/1) [+ 8 bytes u64 when present]
+//!     1 byte  : size_present  (0/1) [+ 8 bytes u64 when present]
+//!     1 byte  : reason (PersistedSkipReason::to_u8: 1=Minified, 2=NonUtf8, 3=TooLarge)
 //! ```
 //!
 //! An empty or missing file is treated as a cold-start (no cache hits).
@@ -68,6 +76,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use tempfile::NamedTempFile;
+
+use super::types::{PersistedSkipReason, SkippedEntry};
 
 // ============================================================================
 // On-disk types
@@ -135,7 +145,11 @@ const FILE_HEADER_BYTES: usize = 4 + 4 + 4;
 /// millions of entries. 60 000 files far exceeds any realistic monorepo. The
 /// decoder rejects BEFORE allocating when the declared count exceeds this cap
 /// (AD-380-3 / AC-3).
-const MAX_MANIFEST_ENTRIES: usize = 60_000;
+///
+/// Exported `pub(super)` so `index.rs` can apply the same cap to the producer
+/// skip-set (AD-395-2): skip_set.len() <= max_files since every skip was an
+/// accepted WalkEntry, but we still share the single cap constant.
+pub(super) const MAX_MANIFEST_ENTRIES: usize = 60_000;
 
 /// Maximum manifest file size accepted before reading into memory.
 ///
@@ -202,6 +216,36 @@ fn encode_entry(buf: &mut Vec<u8>, entry: &ManifestEntry) {
 
     write_opt_u64(buf, entry.mtime);
     write_opt_u64(buf, entry.size);
+}
+
+/// Encode a single skip entry into `buf` (AD-395-4).
+fn encode_skip_entry(buf: &mut Vec<u8>, entry: &SkippedEntry) {
+    write_lp_bytes(buf, entry.path.as_bytes());
+    write_opt_u64(buf, entry.mtime);
+    write_opt_u64(buf, entry.size);
+    // Single source of truth for the wire byte — no raw literal here.
+    buf.push(entry.reason.to_u8());
+}
+
+/// Decode a single skip entry from the cursor (AD-395-4).
+///
+/// Returns `None` on any truncation, structural corruption, or unknown reason
+/// discriminant — the caller rejects the whole manifest (AD-380-3 / AC-5).
+/// Using `PersistedSkipReason::from_u8` here means a corrupt/forged byte
+/// triggers a manifest-reject rather than silently degrading to "unknown".
+fn decode_skip_entry(cur: &mut Cursor<'_>) -> Option<SkippedEntry> {
+    let path = cur.read_lp_string()?;
+    let mtime = cur.read_opt_u64()?;
+    let size = cur.read_opt_u64()?;
+    let reason_byte = cur.read_u8()?;
+    // Reject unknown discriminants at the boundary (make illegal states unrepresentable).
+    let reason = PersistedSkipReason::from_u8(reason_byte)?;
+    Some(SkippedEntry {
+        path,
+        mtime,
+        size,
+        reason,
+    })
 }
 
 /// Cursor-based reader over the manifest body. Every read is bounds-checked and
@@ -364,6 +408,13 @@ pub(super) struct FileManifest {
     /// Set via [`Self::set_git_head`], persisted by [`Self::save`], and
     /// recovered by [`Self::stored_git_head`] after a [`Self::load`].
     git_head: Option<String>,
+    /// Content-skipped entries persisted for scan reconciliation (AD-395-4).
+    ///
+    /// Stored in a SEPARATE `BTreeMap` from `entries` so that
+    /// `sorted_paths()` / `entry_count()` / the FileId↔path invariant stay
+    /// byte-identical to v4.  Only DETERMINISTIC skips (Minified / NonUtf8 /
+    /// TooLarge) are present; transient ReadErrors are NOT persisted (OD-395-4).
+    skipped_entries: BTreeMap<String, SkippedEntry>,
 }
 
 impl FileManifest {
@@ -394,7 +445,15 @@ impl FileManifest {
     /// non-git roots (AC-4). The bump is monotonic 2→3→4 (ADR-006); #373 owns
     /// 2→3 and #380 owns 3→4. Behavior of THIS ticket per ADR-004 (not a #NEW
     /// placeholder).
-    pub const FORMAT_VERSION: u32 = 4;
+    ///
+    /// v4 → v5: AD-395-3: Append a skipped-entries section after the indexed
+    /// entries. This monotonic bump rides the existing cold-start self-heal
+    /// (ADR-006) to force ONE rebuild that re-scans previously over-dropped
+    /// small long-line files AND introduces the persisted skipped-entries section
+    /// that ends the infinite refresh loop for files that remain legitimately
+    /// content-skipped (AD-395-4/5). A v4 manifest triggers NoStoredHead →
+    /// exactly one full rebuild with no manual `--rebuild`. #395 owns 4→5.
+    pub const FORMAT_VERSION: u32 = 5;
 
     // -----------------------------------------------------------------------
     // Constructors
@@ -407,6 +466,7 @@ impl FileManifest {
             cache_dir,
             entries: BTreeMap::new(),
             git_head: None,
+            skipped_entries: BTreeMap::new(),
         }
     }
 
@@ -416,7 +476,7 @@ impl FileManifest {
     /// reject WHOLE, never partial):
     /// - The file does not exist.
     /// - The file exceeds `MAX_MANIFEST_FILE_BYTES`.
-    /// - The magic is absent (e.g. an old JSONL manifest), version != 4, or the
+    /// - The magic is absent (e.g. an old JSONL manifest), version != 5, or the
     ///   declared entry count exceeds `MAX_MANIFEST_ENTRIES`.
     /// - The header's `root` does not match the canonical `project_root`.
     /// - The body is truncated or any entry is structurally corrupt.
@@ -492,27 +552,61 @@ impl FileManifest {
             }
         }
 
+        // AD-395-4: decode the v5 skipped-entries section. Any truncation or a
+        // forged skip_count over MAX_MANIFEST_ENTRIES → reject-whole (AC10).
+        let mut skipped_entries = BTreeMap::new();
+        if let Some(skip_count_raw) = cur.read_u32() {
+            let skip_count = skip_count_raw as usize;
+            // AD-395-4: reject-whole BEFORE allocating on a forged skip_count.
+            if skip_count > MAX_MANIFEST_ENTRIES {
+                return Ok(Self::new(project_root, cache_dir));
+            }
+            for _ in 0..skip_count {
+                match decode_skip_entry(&mut cur) {
+                    Some(entry) => {
+                        skipped_entries.insert(entry.path.clone(), entry);
+                    }
+                    None => {
+                        // Truncated skip section → cold-start (reject whole).
+                        return Ok(Self::new(project_root, cache_dir));
+                    }
+                }
+            }
+        }
+        // Truncation note: a genuine v4 manifest NEVER reaches this code — decode_header
+        // rejects any version != FORMAT_VERSION (5) before the entry loop runs (the
+        // ADR-006 version gate triggers a cold-start rebuild, not this fallback).
+        // The only way `read_u32()` returns `None` here is a TRUNCATED v5 file where
+        // all indexed entries are intact but the 4-byte skip_count is missing or partial.
+        // Treat that as reject-whole for codec consistency (AD-380-3): the skip section
+        // is advisory for display/staleness only, but a partially-written manifest can
+        // signal a crashed write; better to cold-start than silently serve stale data.
+        else {
+            return Ok(Self::new(project_root, cache_dir));
+        }
+
         Ok(Self {
             project_root,
             cache_dir,
             entries,
             git_head: header.git_head,
+            skipped_entries,
         })
     }
 
     /// Check if an on-disk manifest file exists and has the current FORMAT_VERSION.
     ///
     /// Returns:
-    /// - `Ok(true)` if the manifest exists and version matches (current binary v4).
-    /// - `Ok(false)` if the manifest exists but is stale (old JSONL v2/v3 — no
-    ///   binary magic, or a different version int).
+    /// - `Ok(true)` if the manifest exists and version matches (current binary v5).
+    /// - `Ok(false)` if the manifest exists but is stale (v4 binary, old JSONL
+    ///   v2/v3 — no binary magic, or a different version int).
     /// - `Ok(true)` if no manifest file exists (cold start; the `NoIndex` path
     ///   handles the missing-index case separately).
     ///
     /// This is the AD-380-2 / AC-4 self-heal hook used by `check_staleness`. It
     /// reads only the fixed 12-byte header (magic + version + count) — no body
     /// parse, no whole-file read. It is independent of git HEAD state, so the
-    /// v3→v4 rebuild fires for BOTH git AND non-git roots (AC-4).
+    /// v4→v5 rebuild fires for BOTH git AND non-git roots (AC-4, AD-395-3).
     pub(super) fn version_matches(cache_dir: &Path) -> anyhow::Result<bool> {
         let manifest_path = cache_dir.join(Self::MANIFEST_FILENAME);
 
@@ -545,6 +639,16 @@ impl FileManifest {
         self.entries.insert(key, entry);
     }
 
+    /// Insert a content-skipped entry into the v5 skip section (AD-395-4).
+    ///
+    /// Only DETERMINISTIC skips (Minified / NonUtf8 / TooLarge) should be
+    /// passed here; transient ReadErrors must NOT be persisted (OD-395-4).
+    /// Skip entries live in a SEPARATE map from `entries` so `entry_count()`
+    /// and the FileId↔path invariant are unaffected (AD-395-2).
+    pub(super) fn insert_skip(&mut self, entry: SkippedEntry) {
+        self.skipped_entries.insert(entry.path.clone(), entry);
+    }
+
     // -----------------------------------------------------------------------
     // Query
     // -----------------------------------------------------------------------
@@ -568,6 +672,24 @@ impl FileManifest {
         self.entries
             .values()
             .map(|e| (e.path.as_str(), e.mtime, e.size))
+    }
+
+    /// Iterate `(path, mtime, size)` tuples for every persisted skip entry.
+    ///
+    /// Used by `scan_working_tree` to build the skip-index for reconciliation
+    /// (AD-395-5): a walked file whose path matches a persisted skip with
+    /// unchanged mtime+size is neither added nor changed.
+    pub(super) fn skip_freshness_entries(
+        &self,
+    ) -> impl Iterator<Item = (&str, Option<u64>, Option<u64>)> {
+        self.skipped_entries
+            .values()
+            .map(|e| (e.path.as_str(), e.mtime, e.size))
+    }
+
+    /// Iterate all persisted skip entries (for `--stats` display, AD-395-6).
+    pub(super) fn skipped(&self) -> impl Iterator<Item = &SkippedEntry> {
+        self.skipped_entries.values()
     }
 
     /// Return entry paths sorted in byte-wise string order.
@@ -646,6 +768,16 @@ impl FileManifest {
 
         for entry in self.entries.values() {
             encode_entry(&mut buf, entry);
+        }
+
+        // AD-395-4: append the v5 skipped-entries section.
+        // `saturating` cast: skip_count > u32::MAX would be clamped to u32::MAX;
+        // the decoder rejects anything over MAX_MANIFEST_ENTRIES, so this is
+        // defence-in-depth only (in practice skip_count << MAX_MANIFEST_ENTRIES).
+        let skip_count = u32::try_from(self.skipped_entries.len()).unwrap_or(u32::MAX);
+        buf.extend_from_slice(&skip_count.to_le_bytes());
+        for entry in self.skipped_entries.values() {
+            encode_skip_entry(&mut buf, entry);
         }
 
         buf

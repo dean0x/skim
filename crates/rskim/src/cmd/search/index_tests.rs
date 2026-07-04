@@ -850,7 +850,10 @@ fn test_streaming_produces_same_result() {
     assert_eq!(result.cache_hits, 0, "cold start must have zero cache hits");
 }
 
-/// A minified JS file in the project appears in the skipped count.
+/// A minified JS file (>= 64 KiB, single line) appears in the skipped count.
+///
+/// AD-395-1: the size gate now requires content.len() >= MINIFY_MIN_BYTES (64 KiB).
+/// Bumped from 10_000 to 70_000 bytes so the fixture passes both signals (R1).
 #[test]
 fn test_streaming_skipped_includes_minified() {
     use super::super::types::IndexConfig;
@@ -861,8 +864,8 @@ fn test_streaming_skipped_includes_minified() {
     fs::create_dir_all(root.join(".git")).unwrap();
     // Normal source file.
     fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
-    // Minified JS (single long line, no newlines).
-    fs::write(root.join("bundle.js"), "x".repeat(10_000)).unwrap();
+    // Minified JS (single long line, >= 64 KiB, no newlines — both signals).
+    fs::write(root.join("bundle.js"), "x".repeat(70_000)).unwrap();
     let cache = tempfile::tempdir().unwrap();
 
     let config = IndexConfig {
@@ -2824,11 +2827,12 @@ fn test_manifest_old_version_triggers_auto_rebuild_on_next_query() {
          the FORMAT_VERSION check is not working correctly."
     );
 
-    // Static: confirm FORMAT_VERSION constant matches the #380 binary format.
+    // Static: confirm FORMAT_VERSION constant matches the current binary format.
+    // #395 bumped this from 4 → 5 (persisted skip section, AD-395-3).
     assert_eq!(
         FileManifest::FORMAT_VERSION,
-        4,
-        "manifest::FORMAT_VERSION must be 4 after #380 (binary manifest). \
+        5,
+        "manifest::FORMAT_VERSION must be 5 after #395 (persisted skip section). \
          If this fails, the constant was changed without updating this test."
     );
 }
@@ -2930,5 +2934,845 @@ fn test_ac13_parentdir_is_not_resolved() {
         super::canonical_or_normalized(Path::new("skim_381_foo/../skim_381_bar")),
         super::canonical_or_normalized(Path::new("skim_381_bar")),
         "AC13 NEGATIVE: `..` must be preserved verbatim, not resolved"
+    );
+}
+
+// ============================================================================
+// #395: long-line drop + silent skip + stale loop tests
+// ============================================================================
+
+/// AC5 — format_skip_sample truncation + deterministic stable order (PF-012).
+///
+/// cap=2 over 5 reasons → 2 rendered lines + "...and 3 more".
+/// Two invocations with shuffled input produce byte-identical output (PF-012).
+#[test]
+fn test_ac5_format_skip_sample_truncation_and_stable_order() {
+    use super::super::types::SkipReason;
+    use super::build_skip_sample;
+    use super::format_skip_sample;
+    use std::path::PathBuf;
+
+    // Build 5 distinct skip reasons with known path keys.
+    let reasons: Vec<SkipReason> = vec![
+        SkipReason::Minified {
+            path: PathBuf::from("c.js"),
+            avg_line_bytes: 800,
+        },
+        SkipReason::NonUtf8(PathBuf::from("a.bin")),
+        SkipReason::TooLarge {
+            path: PathBuf::from("b.dat"),
+            size: 6_000_000,
+        },
+        SkipReason::ReadError {
+            path: PathBuf::from("d.rs"),
+            error: "permission denied".into(),
+        },
+        SkipReason::CapReached,
+    ];
+
+    // Build sample (sort + merge step) then format with cap=2.
+    // Pass sample.len() as `total` (no hidden additional skips in this unit test).
+    let sample = build_skip_sample(reasons.clone(), vec![]);
+    let out = format_skip_sample(&sample, 2, sample.len());
+
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "cap=2 over 5 reasons must produce 2 rendered lines + 1 summary"
+    );
+    assert!(
+        lines[2].starts_with("...and 3 more"),
+        "last line must be '...and 3 more', got: {:?}",
+        lines[2]
+    );
+
+    // Stable order: sort by path string ascending, CapReached last.
+    // The first shown path must be "a.bin" (smallest key).
+    assert!(
+        lines[0].contains("a.bin"),
+        "first shown reason must have path 'a.bin' (smallest key), got: {:?}",
+        lines[0]
+    );
+
+    // Idempotency: shuffled input → byte-identical output.
+    let reasons_shuffled: Vec<SkipReason> = vec![
+        SkipReason::CapReached,
+        SkipReason::TooLarge {
+            path: PathBuf::from("b.dat"),
+            size: 6_000_000,
+        },
+        SkipReason::NonUtf8(PathBuf::from("a.bin")),
+        SkipReason::ReadError {
+            path: PathBuf::from("d.rs"),
+            error: "permission denied".into(),
+        },
+        SkipReason::Minified {
+            path: PathBuf::from("c.js"),
+            avg_line_bytes: 800,
+        },
+    ];
+    let sample2 = build_skip_sample(reasons_shuffled, vec![]);
+    let out2 = format_skip_sample(&sample2, 2, sample2.len());
+    assert_eq!(
+        out, out2,
+        "shuffled input must produce byte-identical output (PF-012 determinism)"
+    );
+}
+
+/// AC4 (partial) — a genuine >= 64 KiB bundle is skipped AND appears in the
+/// skip_sample with the Minified reason and a named message.
+#[test]
+fn test_ac4_bundle_skipped_and_named_in_sample() {
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    // A normal indexed file.
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    // Genuine bundle: single line, >= 64 KiB.
+    fs::write(root.join("bundle.js"), "x".repeat(70_000)).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    let result = build_index(&config).expect("build must succeed");
+
+    assert!(result.skipped >= 1, "bundle must appear in skipped count");
+    assert_eq!(result.file_count, 1, "only main.rs indexed");
+
+    // The skip_sample must contain a Minified entry for bundle.js.
+    let named = result.skip_sample.iter().any(|r| {
+        matches!(
+            r,
+            super::super::types::SkipReason::Minified { path, avg_line_bytes }
+            if path.ends_with("bundle.js") && *avg_line_bytes > 500
+        )
+    });
+    assert!(
+        named,
+        "skip_sample must contain Minified for bundle.js with avg > 500, got: {:?}",
+        result.skip_sample
+    );
+
+    // Display must contain "minified (avg line " and "bundle.js".
+    let display_str = result
+        .skip_sample
+        .iter()
+        .map(|r| r.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        display_str.contains("minified (avg line "),
+        "display must contain 'minified (avg line ', got: {display_str:?}"
+    );
+    assert!(
+        display_str.contains("bundle.js"),
+        "display must contain 'bundle.js', got: {display_str:?}"
+    );
+}
+
+/// AC7 (stale loop killed) + AC9 (None/None hint) — after building an index
+/// with a content-skipped bundle, scan_working_tree must report Current on
+/// two consecutive calls with no edits.
+#[test]
+fn test_ac7_stale_loop_killed_after_build() {
+    use super::super::manifest::FileManifest;
+    use super::super::staleness::check_staleness;
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    // Write some git HEAD so check_staleness reads HEAD correctly.
+    fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    // Normal indexed file.
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    // Genuine bundle: single line, >= 64 KiB.
+    fs::write(root.join("bundle.js"), "x".repeat(70_000)).unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    let cache_dir = cache.path().to_path_buf();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache_dir.clone()),
+    };
+    build_index(&config).expect("first build must succeed");
+
+    // Load the v5 manifest and check that the bundle is in the skip section.
+    let manifest = FileManifest::load(root.to_path_buf(), cache_dir.clone()).unwrap();
+    let skip_paths: Vec<_> = manifest
+        .skip_freshness_entries()
+        .map(|(p, _, _)| p.to_string())
+        .collect();
+    assert!(
+        skip_paths.iter().any(|p| p.ends_with("bundle.js")),
+        "bundle.js must be in the manifest skip section, got: {skip_paths:?}"
+    );
+
+    // AC7: two consecutive check_staleness calls with no edits must both return Current.
+    let (staleness1, _) = check_staleness(&cache_dir, root);
+    let (staleness2, _) = check_staleness(&cache_dir, root);
+
+    assert!(
+        matches!(staleness1, super::super::staleness::StalenessCheck::Current),
+        "first staleness check must return Current (no rebuild), got: {staleness1:?}"
+    );
+    assert!(
+        matches!(staleness2, super::super::staleness::StalenessCheck::Current),
+        "second staleness check must return Current (loop killed), got: {staleness2:?}"
+    );
+}
+
+/// AC8 — changed skip triggers exactly one rebuild.
+#[test]
+fn test_ac8_changed_skip_triggers_one_rebuild() {
+    use super::super::staleness::check_staleness;
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    // Write a bundle that triggers a Minified skip.
+    let bundle_path = root.join("bundle.js");
+    fs::write(&bundle_path, "x".repeat(70_000)).unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    let cache_dir = cache.path().to_path_buf();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache_dir.clone()),
+    };
+    build_index(&config).expect("first build");
+
+    // Confirm clean after build.
+    let (s1, _) = check_staleness(&cache_dir, root);
+    assert!(
+        matches!(s1, super::super::staleness::StalenessCheck::Current),
+        "after first build must be Current"
+    );
+
+    // Mutate the bundle so its size differs (changed skip).
+    fs::write(&bundle_path, "y".repeat(71_000)).unwrap();
+
+    // The scan must now report WorkingTreeChanged (dirty).
+    let (s2, _) = check_staleness(&cache_dir, root);
+    assert!(
+        matches!(
+            s2,
+            super::super::staleness::StalenessCheck::WorkingTreeChanged { .. }
+        ),
+        "after bundle size change must be WorkingTreeChanged, got: {s2:?}"
+    );
+
+    // Rebuild.
+    build_index(&config).expect("second build");
+
+    // After rebuild, must be Current again (no loop).
+    let (s3, _) = check_staleness(&cache_dir, root);
+    assert!(
+        matches!(s3, super::super::staleness::StalenessCheck::Current),
+        "after second build must be Current again, got: {s3:?}"
+    );
+
+    // AC8 positive follow-through: overwrite the bundle with a small valid file
+    // (< 64 KiB, indexable) containing a unique token.  After one rebuild the
+    // token must be retrievable — the formerly-skipped file now appears in results.
+    // A subsequent scan must be Current (no loop, only one rebuild needed).
+    let unique_token = "SKAC8PREV395";
+    fs::write(
+        &bundle_path,
+        format!("fn prev_bundle() {{ /* {unique_token} */ }}\n"),
+    )
+    .unwrap();
+
+    // One more scan: the bundle changed from minified-to-indexable → dirty.
+    let (s4, _) = check_staleness(&cache_dir, root);
+    assert!(
+        matches!(
+            s4,
+            super::super::staleness::StalenessCheck::WorkingTreeChanged { .. }
+        ),
+        "after replacing bundle with valid file must be WorkingTreeChanged, got: {s4:?}"
+    );
+
+    // Rebuild picks up the now-indexable file.
+    build_index(&config).expect("third build (prev→indexable)");
+
+    // The unique token must now appear in query results.
+    let token_out = super::super::query::execute_query(
+        &super::super::types::QueryConfig {
+            text: unique_token.to_string(),
+            limit: 5,
+            offset: None,
+            json: false,
+            root: root.to_path_buf(),
+            cache_dir: cache_dir.clone(),
+            blast_radius_paths: None,
+            ast_scored: None,
+            composite_weights: None,
+            phrase: false,
+            near: None,
+            lang: None,
+        },
+        &TEST_ANALYTICS,
+    )
+    .expect("query after prev-bundle → indexable must succeed");
+    assert!(
+        !token_out.results.is_empty(),
+        "AC8 positive follow-through: '{unique_token}' must be found after formerly-skipped \
+         bundle becomes a valid indexable file; got zero results"
+    );
+
+    // No loop: next scan after the rebuild is Current.
+    let (s5, _) = check_staleness(&cache_dir, root);
+    assert!(
+        matches!(s5, super::super::staleness::StalenessCheck::Current),
+        "AC8 positive follow-through: scan after rebuild must be Current (no loop), got: {s5:?}"
+    );
+}
+
+/// AC9 — None/None hint skip is reconciled by path presence (not re-flagged as added).
+///
+/// Uses a separate cache_dir so the stub index files don't pollute the walked root,
+/// and only places `bundle.js` in the root (no other untracked files).
+#[test]
+fn test_ac9_none_hint_skip_not_readded() {
+    use super::super::manifest::FileManifest;
+    use super::super::types::{PersistedSkipReason, SkippedEntry};
+
+    // Root: only bundle.js (no main.rs — unindexed files would count as "added").
+    let root_dir = tempfile::tempdir().unwrap();
+    let root = root_dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("bundle.js"), "x".repeat(70_000)).unwrap();
+
+    // Use a SEPARATE cache dir so manifest.save() doesn't put files under root.
+    let cache_tmp = tempfile::tempdir().unwrap();
+    let cache_dir = cache_tmp.path().to_path_buf();
+
+    // Build a manifest with a None/None skip entry for bundle.js (OD-395-5).
+    let mut manifest = FileManifest::new(root.to_path_buf(), cache_dir.clone());
+    manifest.insert_skip(SkippedEntry {
+        path: "bundle.js".to_string(),
+        mtime: None,
+        size: None,
+        reason: PersistedSkipReason::Minified,
+    });
+
+    let root_canon = root.canonicalize().unwrap();
+    // scan_working_tree_test_hook takes the in-memory manifest directly —
+    // no need to save it first.  The walker under root finds only bundle.js
+    // (the .git dir is ignored); the skip_index matches it by path presence
+    // (None/None hint), so added must be 0 (AD-395-5, OD-395-5).
+    let delta =
+        super::super::staleness::scan_working_tree_test_hook(&root_canon, &manifest, 50_000);
+    assert!(delta.is_ok(), "scan_working_tree must not fail");
+    let delta = delta.unwrap();
+    assert_eq!(
+        delta.added, 0,
+        "AC9: None/None hint skip must NOT count as added, got added={}",
+        delta.added
+    );
+    assert_eq!(
+        delta.changed, 0,
+        "AC9: None/None hint skip must NOT count as changed, got changed={}",
+        delta.changed
+    );
+}
+
+/// AC2 (#395) — recall CLI: a 1.4 KB single-long-line `.py` file is indexed
+/// and the query returns it at `line_number == Some(1)` on BOTH the text and
+/// `--json` surfaces (rg / git-grep parity).
+///
+/// Discriminating guard (PF-007): pre-fix the file was classified as minified
+/// (single long line, `newline_count == 0` in probe) and skipped; querying for
+/// NEEDLE_LONGLINE returned zero results at exit 0.  Post-fix the two-signal
+/// gate requires `content.len() >= MINIFY_MIN_BYTES (64 KiB)` AND a single-
+/// line probe — both fail for this 1.4 KB file so it is indexed.  Reverting
+/// AD-395-1 would make `output.results` empty and fail this test.
+#[test]
+fn test_ac2_longline_recall_query_and_json_surface() {
+    use super::super::query::{execute_query, format_json_output};
+    use super::super::types::{IndexConfig, QueryConfig};
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    // 1.4 KB, single line: "A"*700 + " NEEDLE_LONGLINE " + "B"*700
+    // Pre-fix: classified as minified (one line, no newlines) → skipped → zero results.
+    // Post-fix: size gate fails (1 418 B < MINIFY_MIN_BYTES 65 536 B) → INDEXED.
+    let longline: String = "A".repeat(700) + " NEEDLE_LONGLINE " + &"B".repeat(700);
+    assert!(
+        longline.len() < 65_536,
+        "fixture must be below MINIFY_MIN_BYTES to exercise the size-gate recall fix"
+    );
+    fs::write(root.join("longline.py"), &longline).unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    build_index(&config).expect("build must succeed");
+
+    // Text surface.
+    let q = QueryConfig {
+        text: "NEEDLE_LONGLINE".to_string(),
+        limit: 5,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache.path().to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let output =
+        execute_query(&q, &TEST_ANALYTICS).expect("query for NEEDLE_LONGLINE must succeed");
+
+    // Non-empty: pre-fix this would be empty (file was wrongly skipped) —
+    // the primary discriminating guard.
+    assert!(
+        !output.results.is_empty(),
+        "AC2: 'NEEDLE_LONGLINE' query must return at least one result \
+         (pre-fix: zero — file was classified minified and skipped by the walk layer)"
+    );
+    let first = &output.results[0];
+    assert!(
+        first.path.ends_with("longline.py"),
+        "AC2: first result must be longline.py, got: {:?}",
+        first.path
+    );
+    // line_number == Some(1): the match is on the only line of the file.
+    assert_eq!(
+        first.line_number,
+        Some(1),
+        "AC2: line_number must be Some(1) — the match is on the single line; \
+         got: {:?}",
+        first.line_number
+    );
+
+    // --json surface: serialize the QueryOutput and verify line_number in the
+    // JSON envelope (AC2 requires BOTH text and --json surfaces).
+    let mut json_buf: Vec<u8> = Vec::new();
+    format_json_output(&output, &mut json_buf).expect("format_json_output must succeed");
+    let json_val: serde_json::Value =
+        serde_json::from_slice(&json_buf).expect("JSON output must parse");
+
+    let json_line = json_val["results"][0]["line_number"].as_u64();
+    assert_eq!(
+        json_line,
+        Some(1),
+        "AC2 (--json surface): results[0].line_number must be 1 in the JSON envelope; \
+         got: {:?}",
+        json_val["results"][0]["line_number"]
+    );
+}
+
+/// AC3 (#395) — mixed short+long file: both the short-line needle and the
+/// long-line needle are returned by query, each anchored at its correct line number.
+///
+/// The file is well below 64 KiB, so the two-signal size gate prevents any
+/// minified classification regardless of individual line length.  This guards
+/// against a regression where a file with SOME long lines is wrongly dropped —
+/// pre-fix the whole file was skipped and both needles returned zero results.
+///
+/// Token-selection constraint: the two tokens must have fully disjoint trigram
+/// sets so the snippet engine cannot conflate them.  We use:
+///   - `BRAVO2INDEX` (trigrams: BRA RAV AVO VO2 O2I 2IN IND NDE DEX) — line 2
+///   - `DELTA5QUERY` (trigrams: DEL ELT LTA TA5 A5Q 5QU QUE UER ERY) — line 5
+///
+/// Zero shared trigrams → the n-gram scorer assigns each token exclusively to
+/// its own line.
+#[test]
+fn test_ac3_mixed_shortlong_recall_both_needles() {
+    use super::super::query::execute_query;
+    use super::super::types::{IndexConfig, QueryConfig};
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+
+    // mixed.py layout (tokens are trigram-disjoint; see doc comment above):
+    //   line 1: "def foo():"
+    //   line 2: "    pass  # BRAVO2INDEX"   ← short line (needle here)
+    //   line 3: "def bar():"
+    //   line 4: "    pass"
+    //   line 5: "# " + "x"*600 + "  DELTA5QUERY  " + "y"*20  ← long line (needle here)
+    //
+    // Total ≈ 700 B — well below MINIFY_MIN_BYTES (65 536 B), so the two-signal
+    // gate does NOT classify this as minified; the file is fully indexed.
+    let long_part = format!("# {}  DELTA5QUERY  {}", "x".repeat(600), "y".repeat(20));
+    let content =
+        format!("def foo():\n    pass  # BRAVO2INDEX\ndef bar():\n    pass\n{long_part}\n");
+    assert!(
+        content.len() < 65_536,
+        "fixture must be below MINIFY_MIN_BYTES so the size gate keeps it indexed"
+    );
+    fs::write(root.join("mixed.py"), &content).unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    build_index(&config).expect("build must succeed");
+
+    // Helper: run a query and return the full output.
+    let do_query = |text: &str| {
+        execute_query(
+            &QueryConfig {
+                text: text.to_string(),
+                limit: 5,
+                offset: None,
+                json: false,
+                root: root.to_path_buf(),
+                cache_dir: cache.path().to_path_buf(),
+                blast_radius_paths: None,
+                ast_scored: None,
+                composite_weights: None,
+                phrase: false,
+                near: None,
+                lang: None,
+            },
+            &TEST_ANALYTICS,
+        )
+        .unwrap_or_else(|e| panic!("query for {:?} failed: {e}", text))
+    };
+
+    // BRAVO2INDEX is on line 2 of mixed.py (short line).
+    let out_short = do_query("BRAVO2INDEX");
+    assert!(
+        !out_short.results.is_empty(),
+        "AC3: 'BRAVO2INDEX' query must return a result \
+         (pre-fix: zero — whole file was dropped because of the long line on line 5)"
+    );
+    let short_res = &out_short.results[0];
+    assert!(
+        short_res.path.ends_with("mixed.py"),
+        "AC3: BRAVO2INDEX must resolve to mixed.py, got: {:?}",
+        short_res.path
+    );
+    assert_eq!(
+        short_res.line_number,
+        Some(2),
+        "AC3: BRAVO2INDEX is on line 2 of mixed.py; got line_number={:?}",
+        short_res.line_number
+    );
+
+    // DELTA5QUERY is on line 5 of mixed.py (long line, 620+ chars).
+    let out_long = do_query("DELTA5QUERY");
+    assert!(
+        !out_long.results.is_empty(),
+        "AC3: 'DELTA5QUERY' query must return a result \
+         (pre-fix: zero — whole file was dropped because of this long line)"
+    );
+    let long_res = &out_long.results[0];
+    assert!(
+        long_res.path.ends_with("mixed.py"),
+        "AC3: DELTA5QUERY must resolve to mixed.py, got: {:?}",
+        long_res.path
+    );
+    assert_eq!(
+        long_res.line_number,
+        Some(5),
+        "AC3: DELTA5QUERY is on line 5 of mixed.py; got line_number={:?}",
+        long_res.line_number
+    );
+}
+
+/// AC4 (#395) remaining — `--stats --json` lists the bundle under `skipped`
+/// with reason `"minified"`, `skipped_by_reason.minified >= 1`, and a token
+/// drawn exclusively from the bundle returns zero query results.
+///
+/// The base AC4 assertion (IndexResult.skipped>=1 + named sample) is covered by
+/// `test_ac4_bundle_skipped_and_named_in_sample`.  This test covers the JSON
+/// output surface and the zero-results control query (completing AC4 / PF-007).
+#[test]
+fn test_ac4_stats_json_and_bundle_zero_results() {
+    use super::super::query::execute_query;
+    use super::super::types::{IndexConfig, QueryConfig};
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    // Normal indexed file.
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    // Genuine >= 64 KiB single-line bundle with a unique token (SKBNDL395) that
+    // is absent from main.rs — ensures the zero-results query is discriminating.
+    // 9 bytes * 8 000 = 72 000 B > MINIFY_MIN_BYTES; no newlines → both signals.
+    fs::write(root.join("bundle.js"), "SKBNDL395".repeat(8_000)).unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    build_index(&config).expect("build must succeed");
+
+    // (a) Bundle-only token → zero results (bundle is not indexed).
+    let out_bundle = execute_query(
+        &QueryConfig {
+            text: "SKBNDL395".to_string(),
+            limit: 5,
+            offset: None,
+            json: false,
+            root: root.to_path_buf(),
+            cache_dir: cache.path().to_path_buf(),
+            blast_radius_paths: None,
+            ast_scored: None,
+            composite_weights: None,
+            phrase: false,
+            near: None,
+            lang: None,
+        },
+        &TEST_ANALYTICS,
+    )
+    .expect("bundle-token query must succeed");
+    assert!(
+        out_bundle.results.is_empty(),
+        "AC4: a token drawn only from the bundle must return zero results \
+         (bundle.js is content-skipped, not indexed); got: {:?}",
+        out_bundle
+            .results
+            .iter()
+            .map(|r| &r.path)
+            .collect::<Vec<_>>()
+    );
+
+    // (b) --stats --json must list bundle.js under `skipped` with reason "minified"
+    //     and `skipped_by_reason.minified >= 1`.
+    let stats_json = super::super::stats_json_for_test(cache.path(), root)
+        .expect("stats_json_for_test must succeed");
+
+    let skipped_arr = stats_json["skipped"]
+        .as_array()
+        .expect("AC4: --stats JSON must have a 'skipped' array key");
+    assert!(
+        !skipped_arr.is_empty(),
+        "AC4: 'skipped' array must be non-empty (bundle.js was content-skipped)"
+    );
+    let has_minified_bundle = skipped_arr.iter().any(|entry| {
+        entry["reason"].as_str() == Some("minified")
+            && entry["path"]
+                .as_str()
+                .is_some_and(|p| p.contains("bundle.js"))
+    });
+    assert!(
+        has_minified_bundle,
+        "AC4: 'skipped' array must contain an entry with reason='minified' and path \
+         containing 'bundle.js'; got: {skipped_arr:?}"
+    );
+    let minified_count = stats_json["skipped_by_reason"]["minified"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        minified_count >= 1,
+        "AC4: skipped_by_reason.minified must be >= 1; got {minified_count}"
+    );
+}
+
+/// AC11 (#395) — additive `--stats --json` back-compat: all nine pre-existing
+/// keys survive with unchanged types; `skipped`/`skipped_by_reason` are purely
+/// additive; the envelope parses as a single JSON object (PF-007 discriminating).
+///
+/// NEGATIVE: if any pre-existing key were renamed, retyped, or removed, this
+/// test fails.  The nine-key superset assertion (not an exact-set assertion)
+/// allows future additive keys without breaking the test, while preventing
+/// removal of any existing key.
+#[test]
+fn test_ac11_stats_json_back_compat_keys() {
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    build_index(&config).expect("build must succeed");
+
+    let stats_json = super::super::stats_json_for_test(cache.path(), root)
+        .expect("stats_json_for_test must succeed");
+
+    // The nine pre-existing keys that must survive #395 unchanged (AC11).
+    // This list was fixed before #395; extending it requires deliberate confirmation here.
+    const PRE_EXISTING_KEYS: &[&str] = &[
+        "file_count",
+        "total_ngrams",
+        "index_size_bytes",
+        "total_on_disk_bytes",
+        "temporal_db_bytes",
+        "last_updated",
+        "git_head",
+        "staleness",
+        "cache_dir",
+    ];
+    for key in PRE_EXISTING_KEYS {
+        assert!(
+            stats_json.get(*key).is_some(),
+            "AC11: pre-existing key '{key}' must be present in --stats --json \
+             (back-compat regression: key was removed or renamed)"
+        );
+    }
+
+    // Type invariants for keys with stable types (PF-007 discriminating).
+    assert!(
+        stats_json["file_count"].is_number(),
+        "AC11: file_count must be a number; got: {:?}",
+        stats_json["file_count"]
+    );
+    assert!(
+        stats_json["total_ngrams"].is_number(),
+        "AC11: total_ngrams must be a number; got: {:?}",
+        stats_json["total_ngrams"]
+    );
+    assert!(
+        stats_json["index_size_bytes"].is_number(),
+        "AC11: index_size_bytes must be a number; got: {:?}",
+        stats_json["index_size_bytes"]
+    );
+    assert!(
+        stats_json["total_on_disk_bytes"].is_number(),
+        "AC11: total_on_disk_bytes must be a number; got: {:?}",
+        stats_json["total_on_disk_bytes"]
+    );
+    assert!(
+        stats_json["staleness"].is_string(),
+        "AC11: staleness must be a string; got: {:?}",
+        stats_json["staleness"]
+    );
+    assert!(
+        stats_json["cache_dir"].is_string(),
+        "AC11: cache_dir must be a string; got: {:?}",
+        stats_json["cache_dir"]
+    );
+
+    // Additive keys must be PRESENT alongside the nine pre-existing ones —
+    // not replacing them (AC11 additive invariant).
+    assert!(
+        stats_json["skipped"].is_array(),
+        "AC11: additive key 'skipped' must be an array; got: {:?}",
+        stats_json["skipped"]
+    );
+    assert!(
+        stats_json["skipped_by_reason"].is_object(),
+        "AC11: additive key 'skipped_by_reason' must be an object; got: {:?}",
+        stats_json["skipped_by_reason"]
+    );
+
+    // The envelope itself must be a single JSON object.
+    assert!(
+        stats_json.is_object(),
+        "AC11: --stats --json output must be a single JSON object; got: {:?}",
+        stats_json
+    );
+}
+
+/// AC4 stderr glue — `run_build` actually emits the named skip sample to stderr.
+///
+/// The individual components (skip_sample, format_skip_sample) are unit-tested
+/// in `test_ac4_bundle_skipped_and_named_in_sample` and `test_ac5_*`. This test
+/// verifies the production wiring in `run_build` — the `eprintln!` call, the
+/// empty-guard, and the cap=10 argument — by capturing stderr from the binary
+/// (subprocess-level, CARGO_BIN_EXE_skim).  A regression that drops the
+/// `eprintln!` or inverts the empty-guard would not be caught by the component
+/// tests; this test catches it.
+#[test]
+fn test_ac4_run_build_stderr_names_skipped_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    // Genuine >= 64 KiB single-line bundle — must appear in stderr skip sample.
+    fs::write(root.join("bundle.js"), "x".repeat(70_000)).unwrap();
+
+    // Locate the skim binary.
+    //
+    // CARGO_BIN_EXE_<name> is populated by Cargo ONLY for integration tests
+    // compiled from the `tests/` directory; it is never set for in-source unit
+    // tests (this file is compiled into the binary crate's test binary, not an
+    // integration test crate).  The `unwrap_or_else` branch is therefore always
+    // taken in practice.
+    //
+    // The fallback walks up from `current_exe()`:
+    //   target/<profile>/deps/rskim-<hash>  →  pop "deps/"  →  pop "<profile>/"
+    //   →  push "skim"
+    // This assumes a freshly-built binary exists at `target/<profile>/skim`.
+    //
+    // PRECONDITION: invoke this test via `cargo test -p rskim --bins` (or
+    // `--all-targets`), which builds the `skim` binary alongside the test
+    // binary.  A runner that builds only test binaries (e.g. `cargo test --lib`)
+    // may leave a stale or absent `skim` at the expected path, causing this test
+    // to exercise wrong/old code.  The assertion on "minified (avg line " fails
+    // loud in that case rather than false-passing.
+    let bin = std::env::var("CARGO_BIN_EXE_skim").unwrap_or_else(|_| {
+        let mut p = std::env::current_exe().unwrap();
+        p.pop(); // deps/
+        p.pop(); // debug/ or release/
+        p.push("skim");
+        p.to_string_lossy().to_string()
+    });
+
+    let output = std::process::Command::new(&bin)
+        .args(["search", "--build", "--root"])
+        .arg(root)
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim search --build subprocess must not fail to launch");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "AC4 stderr: skim search --build must exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("minified (avg line "),
+        "AC4 stderr: run_build must emit 'minified (avg line ' for the skipped bundle; \
+         got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("bundle.js"),
+        "AC4 stderr: run_build must name 'bundle.js' in the skip sample; got: {stderr:?}"
     );
 }

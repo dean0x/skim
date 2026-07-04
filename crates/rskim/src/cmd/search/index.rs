@@ -23,8 +23,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use clap::Parser;
@@ -35,10 +33,12 @@ use rskim_search::{
 
 use super::manifest::{FileManifest, ManifestEntry, decode_field_map, encode_field_map};
 use super::staleness::read_git_head;
-use super::types::{IndexConfig, IndexResult, ProcessedFile, SkipReason, WalkEntry};
+use super::types::{
+    IndexConfig, IndexResult, ProcessedFile, ProducerSkips, SkipReason, SkippedEntry, WalkEntry,
+};
 use super::walk::{
-    ReadOutcome, discover_project_root, is_minified, normalize_rel_path, open_and_read, sha256_hex,
-    walk_metadata,
+    MAX_SKIP_REASONS, ReadOutcome, discover_project_root, minified_metric, normalize_rel_path,
+    open_and_read, sha256_hex, walk_metadata,
 };
 
 // ============================================================================
@@ -305,10 +305,12 @@ impl<'cfg> Pipeline<'cfg> {
         let debug_enabled = crate::debug::is_debug_enabled();
 
         // Stage 1: Metadata-only walk (no content reading).
-        let (walk_entries, walk_skip_count) = self.walk()?;
+        let (walk_entries, walk_skips) = self.walk()?;
 
         if walk_entries.is_empty() {
-            return self.flush_empty(walk_skip_count);
+            let walk_skip_count = walk_skips.len();
+            let skip_sample = build_skip_sample(walk_skips, vec![]);
+            return self.flush_empty(walk_skip_count, skip_sample);
         }
 
         // Stage 2: Load the manifest and the AST cache for incremental builds,
@@ -323,7 +325,7 @@ impl<'cfg> Pipeline<'cfg> {
         } else {
             AstNgramCache::load(&self.cache_dir)
         };
-        let (producer_handle, rx, producer_skips) = Self::spawn_producer(
+        let (producer_handle, rx) = Self::spawn_producer(
             walk_entries,
             manifest,
             ast_cache,
@@ -360,7 +362,10 @@ impl<'cfg> Pipeline<'cfg> {
 
         // Always join the producer first so a worker-thread panic is surfaced
         // regardless of whether consume succeeded or aborted (ADR-006 desync).
-        producer_handle.join().map_err(|e| {
+        // AD-395-2: `JoinHandle<ProducerSkips>` — the join establishes the
+        // happens-before edge that makes the producer's local Vecs safe to read
+        // here (replaces the prior `Arc<AtomicU32>` load comment).
+        let producer_skips = producer_handle.join().map_err(|e| {
             anyhow::anyhow!(
                 "producer thread panicked: {:?}",
                 e.downcast_ref::<String>()
@@ -391,6 +396,10 @@ impl<'cfg> Pipeline<'cfg> {
         // the consume loop. Abort before any write so the old manifest survives
         // and the next query self-heals. (applies ADR-006)
         //
+        // AD-395-2: skip inserts do NOT touch `new_manifest.entries` so the
+        // manifest_count == file_count guard and the FileId↔sorted_paths invariant
+        // are preserved — skips live in the separate `skipped_entries` map.
+        //
         // Why the comparison holds for realistic projects: `manifest_count` is the
         // number of unique BTreeMap keys (normalized rel-path strings produced by
         // normalize_rel_path), and `file_count` is the number of successful
@@ -414,6 +423,12 @@ impl<'cfg> Pipeline<'cfg> {
             ));
         }
 
+        // Insert content-skip entries into the manifest skip section BEFORE
+        // save() — they live in a SEPARATE map (see AD-395-2/4 comment above).
+        for skip_entry in &producer_skips.skip_set {
+            new_manifest.insert_skip(skip_entry.clone());
+        }
+
         let _layer = builder.build()?;
         ast_builder
             .build()
@@ -435,15 +450,18 @@ impl<'cfg> Pipeline<'cfg> {
         new_manifest.set_git_head(read_git_head(&self.config.root));
         new_manifest.save()?;
 
-        // `producer_handle.join()` above is the happens-before edge: the atomic
-        // load below is only valid after join() returns. Moving this load before
-        // the join would make `producer_skips` racy.
-        let total_skipped =
-            to_u32_capped(walk_skip_count).saturating_add(producer_skips.load(Ordering::Relaxed));
+        // Merge walk-phase skips + producer sample, sort by stable key, truncate
+        // to MAX_SKIP_REASONS (AD-395-2 / AD-395-6 / PF-012).
+        // Use the exact uncapped producer counter (not sample.len()) so the
+        // headline skip number and "...and N more" are always the true total.
+        let total_skipped = to_u32_capped(walk_skips.len())
+            .saturating_add(to_u32_capped(producer_skips.skipped_total));
+        let skip_sample = build_skip_sample(walk_skips, producer_skips.sample);
 
         Ok(IndexResult {
             file_count,
             skipped: total_skipped,
+            skip_sample,
             cache_hits,
             ast_cache_hits,
             ast_reextracted,
@@ -451,10 +469,13 @@ impl<'cfg> Pipeline<'cfg> {
         })
     }
 
-    /// Stage 1: walk the project root and return `(entries, skip_count)`.
-    fn walk(&self) -> anyhow::Result<(Vec<WalkEntry>, usize)> {
+    /// Stage 1: walk the project root and return `(entries, walk_skips)`.
+    ///
+    /// Returns the FULL walk skip `Vec` (not reduced to `.len()`) so `run()`
+    /// can merge it into the producer sample (AD-395-2).
+    fn walk(&self) -> anyhow::Result<(Vec<WalkEntry>, Vec<SkipReason>)> {
         let (entries, skips) = walk_metadata(&self.config.root, self.config.effective_max_files())?;
-        Ok((entries, skips.len()))
+        Ok((entries, skips))
     }
 
     /// Stage 2a: load or create the [`FileManifest`] based on `--force`.
@@ -477,7 +498,11 @@ impl<'cfg> Pipeline<'cfg> {
     /// `NoIndex` on every query).  Writing an empty skcache preserves the
     /// "self-pruning, rebuilt from scratch each build" invariant — without it, a
     /// stale skcache from a prior non-empty build would persist on disk.
-    fn flush_empty(self, walk_skip_count: usize) -> anyhow::Result<IndexResult> {
+    fn flush_empty(
+        self,
+        walk_skip_count: usize,
+        skip_sample: Vec<SkipReason>,
+    ) -> anyhow::Result<IndexResult> {
         let builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
         let _layer = builder.build()?;
         // Build an empty AST index so self-heal doesn't trigger immediately.
@@ -496,6 +521,7 @@ impl<'cfg> Pipeline<'cfg> {
         Ok(IndexResult {
             file_count: 0,
             skipped: to_u32_capped(walk_skip_count),
+            skip_sample,
             cache_hits: 0,
             ast_cache_hits: 0,
             ast_reextracted: 0,
@@ -505,8 +531,12 @@ impl<'cfg> Pipeline<'cfg> {
 
     /// Stage 2b: spawn the producer thread.
     ///
-    /// Returns a join handle, the receiving end of the bounded channel, and a
-    /// shared skip counter that the producer increments on read/classify errors.
+    /// AD-395-2: The single-threaded producer accumulates a bounded typed
+    /// `SkipReason` display sample plus a `(path,mtime,size,reason:PersistedSkipReason)`
+    /// skip-set and returns them via `JoinHandle<ProducerSkips>` — no `Mutex`
+    /// needed because the producer is single-threaded.  The skip-set only
+    /// contains DETERMINISTIC content-skips (Minified / NonUtf8 / TooLarge);
+    /// `ReadError` is included in the display sample but NOT persisted (OD-395-4).
     ///
     /// `ast_cache` is moved into the producer thread and consulted for each
     /// file: a SHA match in the cache attaches the cached payload to the
@@ -518,17 +548,21 @@ impl<'cfg> Pipeline<'cfg> {
         force: bool,
         debug_enabled: bool,
     ) -> (
-        std::thread::JoinHandle<()>,
+        std::thread::JoinHandle<ProducerSkips>,
         crossbeam_channel::Receiver<ProcessedFile>,
-        Arc<AtomicU32>,
     ) {
         let (tx, rx) = crossbeam_channel::bounded::<ProcessedFile>(CHANNEL_CAPACITY);
-        let producer_skips = Arc::new(AtomicU32::new(0));
-        let skips = Arc::clone(&producer_skips);
 
-        // `walk_entries`, `manifest`, and `ast_cache` are moved into the producer
-        // thread.  All three must be `Send`; the compiler enforces this.
+        // AD-395-2: single-threaded producer — accumulate locally, no Arc/Mutex.
         let handle = std::thread::spawn(move || {
+            let mut sample: Vec<SkipReason> = Vec::new();
+            let mut skip_set: Vec<SkippedEntry> = Vec::new();
+            // AD-395-2: exact, uncapped count of every producer-phase skip.
+            // Independent of `sample` (which is capped at MAX_SKIP_REASONS)
+            // so that IndexResult.skipped and "...and N more" always report
+            // the true total, even in large monorepos with >10 000 skips.
+            let mut skipped_total: usize = 0;
+
             for entry in &walk_entries {
                 match read_and_classify(entry, &manifest, &ast_cache, force, debug_enabled) {
                     Ok(pf) => {
@@ -538,15 +572,42 @@ impl<'cfg> Pipeline<'cfg> {
                             break;
                         }
                     }
-                    Err(_reason) => {
-                        skips.fetch_add(1, Ordering::Relaxed);
+                    Err(reason) => {
+                        // Count every skip exactly (uncapped) before any sample logic.
+                        skipped_total += 1;
+                        // Collect a DETERMINISTIC skip entry for manifest persistence
+                        // (AD-395-2 / OD-395-4): only Minified, NonUtf8, TooLarge.
+                        if let Some(disc) = reason.persist_discriminant() {
+                            // skip_set is naturally <= max_files (every entry was an
+                            // accepted WalkEntry), so MAX_MANIFEST_ENTRIES is the bound.
+                            if skip_set.len() < super::manifest::MAX_MANIFEST_ENTRIES {
+                                let rel_path = normalize_rel_path(&entry.rel_path);
+                                skip_set.push(SkippedEntry {
+                                    path: rel_path,
+                                    mtime: entry.mtime,
+                                    size: entry.size,
+                                    reason: disc,
+                                });
+                            }
+                        }
+                        // Add to display sample (bounded; CapReached once cap hit).
+                        if sample.len() < MAX_SKIP_REASONS {
+                            sample.push(reason);
+                        } else if !matches!(sample.last(), Some(SkipReason::CapReached)) {
+                            sample.push(SkipReason::CapReached);
+                        }
                     }
                 }
             }
             // `tx` dropped here closes the channel, signalling EOF to consumer.
+            ProducerSkips {
+                skipped_total,
+                sample,
+                skip_set,
+            }
         });
 
-        (handle, rx, producer_skips)
+        (handle, rx)
     }
 
     /// Stage 3: consume [`ProcessedFile`]s from `rx`, index each one in BOTH
@@ -796,8 +857,13 @@ fn read_and_classify(
     };
 
     // Minification check (tree-sitter languages only).
-    if !entry.lang.is_serde_based() && is_minified(&content) {
-        return Err(SkipReason::Minified(entry.abs_path.clone()));
+    if !entry.lang.is_serde_based()
+        && let Some(avg_line_bytes) = minified_metric(&content)
+    {
+        return Err(SkipReason::Minified {
+            path: entry.abs_path.clone(),
+            avg_line_bytes,
+        });
     }
 
     // Always compute SHA — it is the correctness guarantee for both the
@@ -850,6 +916,78 @@ fn read_and_classify(
 /// approximate values for display when the file count exceeds 4 billion.
 fn to_u32_capped(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Merge walk-phase skips and producer-phase skips into a bounded,
+/// stable-key-sorted sample suitable for display (AD-395-6 / PF-012).
+///
+/// Sort order: content-skips (Minified / NonUtf8 / TooLarge, priority 0) sort
+/// before UnsupportedLanguage (priority 1), ReadError (priority 2), and
+/// CapReached (priority 3, last).  Within the same priority tier, entries are
+/// sorted by path string (ascending).
+///
+/// Content-skips get the lowest priority value so they float to the top of the
+/// displayed sample.  Without this ordering, a repo with many unsupported
+/// extensions would push the Minified-bundle notice (the primary diagnostic
+/// this feature was built to surface — AD-395-6 / AC4) past the `cap` cutoff
+/// in `format_skip_sample`, burying it in the "...and N more" tail.
+///
+/// The merged vec is truncated to `MAX_SKIP_REASONS` before returning.
+pub(super) fn build_skip_sample(
+    walk_skips: Vec<SkipReason>,
+    producer_skips: Vec<SkipReason>,
+) -> Vec<SkipReason> {
+    /// Display priority: lower value = shown earlier in the sample.
+    fn display_priority(r: &SkipReason) -> u8 {
+        match r {
+            // Content-skips are the primary diagnostic — surface them first.
+            SkipReason::Minified { .. } | SkipReason::NonUtf8(_) | SkipReason::TooLarge { .. } => 0,
+            SkipReason::UnsupportedLanguage(_) => 1,
+            SkipReason::ReadError { .. } => 2,
+            SkipReason::CapReached => 3,
+        }
+    }
+
+    let mut merged: Vec<SkipReason> = walk_skips.into_iter().chain(producer_skips).collect();
+    // Primary: display priority (content-skips first). Secondary: path ascending.
+    // CapReached has no path (sort_key → None) so it always sorts last within its tier.
+    merged.sort_by(|a, b| {
+        let pri_cmp = display_priority(a).cmp(&display_priority(b));
+        if pri_cmp != std::cmp::Ordering::Equal {
+            return pri_cmp;
+        }
+        match (a.sort_key(), b.sort_key()) {
+            (Some(pa), Some(pb)) => pa.cmp(pb),
+            (None, None) => std::cmp::Ordering::Equal,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+        }
+    });
+    merged.truncate(MAX_SKIP_REASONS);
+    merged
+}
+
+/// Format a bounded skip sample for stderr display (AD-395-6).
+///
+/// Returns a string with up to `cap` rendered reason lines followed by
+/// `"...and N more"` when the `total` exceeds the number shown.  Order is
+/// preserved (callers pass a pre-sorted slice).
+///
+/// `total` is the TRUE total skip count (≥ `reasons.len()`).  In production
+/// callers pass `result.skipped as usize` so the "and N more" figure reflects
+/// the uncapped count from the exact `ProducerSkips.skipped_total` counter
+/// (AD-395-2).  In unit-tests that exercise the formatting only, passing
+/// `reasons.len()` is correct (no hidden additional skips).
+///
+/// Exposed `pub(super)` for unit-testing (AC5 / PF-007 — no test-file-
+/// generation, pure function).
+pub(super) fn format_skip_sample(reasons: &[SkipReason], cap: usize, total: usize) -> String {
+    let shown = reasons.len().min(cap);
+    let mut lines: Vec<String> = reasons[..shown].iter().map(|r| r.to_string()).collect();
+    if total > shown {
+        lines.push(format!("...and {} more", total - shown));
+    }
+    lines.join("\n")
 }
 
 /// Call `classify_source` and return the field_map.

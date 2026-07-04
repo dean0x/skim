@@ -5,7 +5,7 @@
 //! All I/O lives here (this module). Business logic is split across:
 //! - `types` — shared configuration and result types
 //! - `walk` — project-root discovery and file traversal
-//! - `manifest` — binary (v4) sidecar for incremental build caching
+//! - `manifest` — binary (v5) sidecar for incremental build caching
 //! - `index` — full pipeline orchestration (invoked via `--build`/`--rebuild`)
 //! - `query` — query execution and result formatting
 //! - `snippet` — source context extraction
@@ -701,6 +701,18 @@ fn run_build(
         result.duration.as_secs_f64(),
     );
 
+    // AD-395-6: emit the bounded, stable-key-sorted skip sample to stderr so
+    // previously-silent skips are observable (PF-012 determinism: sample is
+    // sorted by path string ascending, CapReached last, from build_skip_sample).
+    if !result.skip_sample.is_empty() {
+        // Show up to 10 named skip reasons; remainder surfaced as "...and N more".
+        // Pass result.skipped (the exact uncapped total) so N reflects the true
+        // remainder, not just the bounded sample length (AD-395-2).
+        let sample_display =
+            index::format_skip_sample(&result.skip_sample, 10, result.skipped as usize);
+        eprintln!("{sample_display}");
+    }
+
     // AD-TMP-1: --rebuild/--build must produce a COMPLETE index (lexical + AST +
     // temporal), matching user expectation that "rebuild" rebuilds everything (#357 BUG A).
     // run_build goes through build_index directly, bypassing auto_refresh_if_stale where
@@ -771,45 +783,50 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         return Ok(ExitCode::FAILURE);
     }
 
-    let reader = rskim_search::NgramIndexReader::open(&cache_dir)?;
-    let stats = reader.stats();
-
-    // AD-380-4 (#380): the lexical-only `index_size_bytes` (skidx+skpost from the
-    // reader) historically undercounted the TRUE on-disk footprint by ~23 MB —
-    // it omitted the manifest, AST index/cache, and temporal DB. Compute the real
-    // total here by summing metadata().len() over the fixed set of index
-    // artifacts (AC-6). `index_size_bytes` is intentionally left unchanged so the
-    // lexical-only figure remains available (AC-7).
-    let total_on_disk = total_on_disk_bytes(&cache_dir);
-    // AD-380-5: temporal.db scales with git history, not source size, so report it
-    // as its own line/key — it is included in the total but distinguished here.
-    let temporal_db_bytes = artifact_len(&cache_dir, "temporal.db");
-
-    // check_staleness returns the loaded manifest as part of its work.
-    // Reuse it here instead of loading the manifest a second time.
-    let (staleness_status, loaded_manifest) = staleness::check_staleness(&cache_dir, &root);
-    let git_head = loaded_manifest
-        .as_ref()
-        .and_then(|m| m.stored_git_head().map(str::to_string));
-
     let mut out = BufWriter::new(std::io::stdout());
     if json {
-        // AC6: additive `cache_dir` key; all pre-existing keys retained unchanged.
-        // AD-380-4/5: additive `total_on_disk_bytes` (true footprint) and
-        // `temporal_db_bytes` keys; `index_size_bytes` (lexical-only) unchanged.
-        let extended = serde_json::json!({
-            "file_count": stats.file_count,
-            "total_ngrams": stats.total_ngrams,
-            "index_size_bytes": stats.index_size_bytes,
-            "total_on_disk_bytes": total_on_disk,
-            "temporal_db_bytes": temporal_db_bytes,
-            "last_updated": stats.last_updated,
-            "git_head": git_head,
-            "staleness": staleness_status.to_string(),
-            "cache_dir": cache_dir_display,
-        });
+        // AC6/AC11: shared JSON construction via build_stats_json (same code path
+        // as the test helper) — ensures AC11 back-compat tests guard production.
+        // AD-395-6: `skipped` array and `skipped_by_reason` are additive keys.
+        //
+        // Gather-once: build_stats_json opens the reader, checks staleness, and
+        // loads skip entries internally.  We do NOT pre-compute those values here
+        // — doing so would run a second NgramIndexReader::open and a second
+        // check_staleness (full working-tree metadata walk) before immediately
+        // discarding the results.
+        let extended = build_stats_json(&cache_dir, &root)?;
         writeln!(out, "{}", serde_json::to_string_pretty(&extended)?)?;
     } else {
+        // Text mode: gather stats once here (not needed by the JSON path above).
+        let reader = rskim_search::NgramIndexReader::open(&cache_dir)?;
+        let stats = reader.stats();
+
+        // AD-380-4 (#380): the lexical-only `index_size_bytes` (skidx+skpost from
+        // the reader) historically undercounted the TRUE on-disk footprint by
+        // ~23 MB — it omitted the manifest, AST index/cache, and temporal DB.
+        // Compute the real total here by summing metadata().len() over the fixed
+        // set of index artifacts (AC-6). `index_size_bytes` is intentionally left
+        // unchanged so the lexical-only figure remains available (AC-7).
+        let total_on_disk = total_on_disk_bytes(&cache_dir);
+        // AD-380-5: temporal.db scales with git history, not source size, so
+        // report it as its own line — it is included in the total but distinguished.
+        let temporal_db_bytes = artifact_len(&cache_dir, "temporal.db");
+
+        // check_staleness returns the loaded manifest as part of its work.
+        // Reuse it here instead of loading the manifest a second time.
+        let (staleness_status, loaded_manifest) = staleness::check_staleness(&cache_dir, &root);
+        let git_head = loaded_manifest
+            .as_ref()
+            .and_then(|m| m.stored_git_head().map(str::to_string));
+
+        // AD-395-6: load skip section from the manifest for --stats display.
+        // All pre-existing keys are unchanged; `skipped` / `skipped_by_reason`
+        // are purely additive (AC11 back-compat).
+        let skip_entries: Vec<_> = loaded_manifest
+            .as_ref()
+            .map(|m| m.skipped().collect::<Vec<_>>())
+            .unwrap_or_default();
+
         writeln!(out, "skim search index stats:")?;
         writeln!(out, "  files indexed : {}", stats.file_count)?;
         writeln!(out, "  total n-grams : {}", stats.total_ngrams)?;
@@ -833,6 +850,23 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         writeln!(out, "  staleness     : {staleness_status}")?;
         // AC4: resolved cache dir, in addition to the lines above.
         writeln!(out, "  cache dir     : {cache_dir_display}")?;
+        // AD-395-6: skip counts by reason (text mode).
+        // PF-012: use BTreeMap so reason keys iterate in stable sorted order.
+        if !skip_entries.is_empty() {
+            let mut by_reason: std::collections::BTreeMap<&str, u64> =
+                std::collections::BTreeMap::new();
+            for e in &skip_entries {
+                *by_reason.entry(e.reason_label()).or_insert(0) += 1;
+            }
+            writeln!(
+                out,
+                "  skipped       : {} (content-skipped files)",
+                skip_entries.len()
+            )?;
+            for (reason, count) in &by_reason {
+                writeln!(out, "    {reason}: {count}")?;
+            }
+        }
     }
     out.flush()?;
     Ok(ExitCode::SUCCESS)
@@ -1263,6 +1297,94 @@ fn print_help() {
     // --build / --rebuild / --update (already documented in Options above).
     // Body lives in SEARCH_HELP_TEXT so AC10 can assert it without driving the CLI.
     println!("{SEARCH_HELP_TEXT}");
+}
+
+// ============================================================================
+// Shared JSON stats builder
+// ============================================================================
+
+/// Build the `--stats --json` value used by both [`run_stats`] and the test helper.
+///
+/// Shared so that AC11 back-compat tests guard the actual production code path
+/// rather than a hand-duplicated reimplementation.  `run_stats` calls this in its
+/// JSON branch; `stats_json_for_test` delegates to it directly.
+///
+/// AD-395-6: `skipped` / `skipped_by_reason` are additive keys; all nine pre-existing
+/// keys are unchanged (AC11 back-compat).  `skipped_by_reason` uses `BTreeMap` for
+/// byte-stable key order consistent with the text-mode path (PF-012).
+pub(super) fn build_stats_json(
+    cache_dir: &std::path::Path,
+    root: &std::path::Path,
+) -> anyhow::Result<serde_json::Value> {
+    let index_path = cache_dir.join("index.skidx");
+    if !index_path.exists() {
+        return Ok(serde_json::json!({ "error": "no index found" }));
+    }
+    let reader = rskim_search::NgramIndexReader::open(cache_dir)?;
+    let stats = reader.stats();
+    let total_on_disk = total_on_disk_bytes(cache_dir);
+    let temporal_db_bytes = artifact_len(cache_dir, "temporal.db");
+    let (staleness_status, loaded_manifest) = staleness::check_staleness(cache_dir, root);
+    let git_head = loaded_manifest
+        .as_ref()
+        .and_then(|m| m.stored_git_head().map(str::to_string));
+    let skip_entries: Vec<_> = loaded_manifest
+        .as_ref()
+        .map(|m| m.skipped().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let skipped_arr: Vec<serde_json::Value> = skip_entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "path": e.path,
+                "reason": e.reason_label(),
+            })
+        })
+        .collect();
+    // PF-012: BTreeMap gives deterministic (sorted) key order in JSON output,
+    // consistent with the alphabetical sort used in the text-mode path.
+    let mut skipped_by_reason: std::collections::BTreeMap<&str, u64> =
+        std::collections::BTreeMap::new();
+    for e in &skip_entries {
+        *skipped_by_reason.entry(e.reason_label()).or_insert(0) += 1;
+    }
+    // NOTE for JSON consumers: `skipped` and `skipped_by_reason` reflect only
+    // PERSISTED content-skips (Minified / NonUtf8 / TooLarge — OD-395-4).
+    // They do NOT include UnsupportedLanguage or ReadError skips, which are
+    // counted in the `run_build` headline ("N skipped") but not persisted.
+    // A repo with 50 unsupported files + 1 minified bundle therefore shows
+    // `"skipped": [<minified entry>]` here vs. "51 skipped" at build time.
+    Ok(serde_json::json!({
+        "file_count": stats.file_count,
+        "total_ngrams": stats.total_ngrams,
+        "index_size_bytes": stats.index_size_bytes,
+        "total_on_disk_bytes": total_on_disk,
+        "temporal_db_bytes": temporal_db_bytes,
+        "last_updated": stats.last_updated,
+        "git_head": git_head,
+        "staleness": staleness_status.to_string(),
+        "cache_dir": cache_dir.display().to_string(),
+        "skipped": skipped_arr,
+        "skipped_by_reason": skipped_by_reason,
+    }))
+}
+
+// ============================================================================
+// Test helpers (cfg(test) only — not compiled into production builds)
+// ============================================================================
+
+/// Delegate to [`build_stats_json`] so AC4/AC11 tests cover the production
+/// code path rather than a hand-duplicated reimplementation.
+///
+/// Used by `index_tests.rs` for:
+/// - AC4 (#395): assert `skipped` array / `skipped_by_reason` JSON fields.
+/// - AC11 (#395): assert all nine pre-existing keys survive with unchanged types.
+#[cfg(test)]
+pub(crate) fn stats_json_for_test(
+    cache_dir: &std::path::Path,
+    root: &std::path::Path,
+) -> anyhow::Result<serde_json::Value> {
+    build_stats_json(cache_dir, root)
 }
 
 // ============================================================================
