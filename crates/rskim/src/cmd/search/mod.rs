@@ -395,24 +395,18 @@ fn parse_lang_value(raw: &str) -> anyhow::Result<rskim_core::Language> {
     if let Some(lang) = Language::from_extension(&raw_lower) {
         return Ok(lang);
     }
+    // Names that from_extension does not handle (no matching file extension).
+    // Everything else ("go", "java", "c", "cpp", "sql", "swift", "json", "yaml",
+    // "toml", "markdown") is already returned above via from_extension.
     match raw_lower.as_str() {
         "rust" => Ok(Language::Rust),
         "python" => Ok(Language::Python),
         "typescript" => Ok(Language::TypeScript),
         "javascript" => Ok(Language::JavaScript),
-        "go" => Ok(Language::Go),
-        "java" => Ok(Language::Java),
-        "markdown" => Ok(Language::Markdown),
-        "c" => Ok(Language::C),
-        "cpp" | "c++" => Ok(Language::Cpp),
+        "c++" => Ok(Language::Cpp),
         "csharp" | "c#" => Ok(Language::CSharp),
         "ruby" => Ok(Language::Ruby),
-        "sql" => Ok(Language::Sql),
         "kotlin" => Ok(Language::Kotlin),
-        "swift" => Ok(Language::Swift),
-        "json" => Ok(Language::Json),
-        "yaml" => Ok(Language::Yaml),
-        "toml" => Ok(Language::Toml),
         _ => Err(anyhow::anyhow!(
             "--lang: unknown language {:?}; accepted names: rust, python, typescript, \
              javascript, go, java, markdown, c, cpp, csharp, ruby, sql, kotlin, swift, \

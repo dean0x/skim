@@ -813,7 +813,7 @@ fn run_blast_radius_composite_query(
                     &r.match_positions,
                     manifest_entry,
                     &config.text,
-                    blast_verify_mode.clone(),
+                    blast_verify_mode,
                 );
 
                 // Drop lexical-hit candidates that do not pass the predicate.
@@ -999,7 +999,7 @@ fn resolve_paths_and_snippets_verified(
                 &r.match_positions,
                 manifest_entry,
                 query,
-                verify_mode.clone(),
+                verify_mode,
             );
 
             // Drop candidates that do not pass the predicate.

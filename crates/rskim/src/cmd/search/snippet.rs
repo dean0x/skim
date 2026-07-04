@@ -45,7 +45,7 @@ const MAX_VERIFY_SCAN_BYTES: usize = 5 * 1024 * 1024;
 ///   (uses `rskim_search::phrase_tokens_present`).
 /// - `Near(n)`: all query words must appear within `n` word-token positions of each
 ///   other, in any order (uses `rskim_search::near_tokens_present`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(super) enum VerifyMode {
     /// Substring (trigram-intersection) verification — default pre-#393 mode.
     Substring,

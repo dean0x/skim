@@ -817,9 +817,11 @@ pub fn near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<u
 
     let n = n as usize;
 
+    use std::collections::HashMap;
+
     // Build q_counts: for each unique query word, how many times it must appear
     // in a valid window (handles D11 distinct-position rule for duplicates).
-    let mut q_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut q_counts: HashMap<&str, usize> = HashMap::new();
     for &(qs, qe) in &q_words {
         *q_counts.entry(&query[qs..qe]).or_insert(0) += 1;
     }
@@ -835,7 +837,7 @@ pub fn near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<u
     //
     // This is most impactful on the all-short --near fallback path, where
     // short_query_fallback makes every file a candidate and each is fully scanned.
-    let mut totals: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut totals: HashMap<&str, usize> = HashMap::new();
     // Pre-size to c_words.len() (upper bound — at most every content word is
     // relevant). Avoids growth-from-zero on the all-short --near fallback path
     // where every file in the corpus is a candidate (reliability rule: prefer
@@ -860,7 +862,7 @@ pub fn near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<u
     // Sliding window over relevant content words.
     // win_counts[w] = how many times word w appears in the current window.
     // `have` = number of unique query words where win_counts[w] >= q_counts[w].
-    let mut win_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut win_counts: HashMap<&str, usize> = HashMap::new();
     let mut have = 0usize;
     let mut left = 0usize;
 
