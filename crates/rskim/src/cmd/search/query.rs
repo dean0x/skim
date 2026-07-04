@@ -163,6 +163,25 @@ pub(super) fn weights_inert_notice(
 }
 
 // ============================================================================
+// Verify-mode selection (AD-393-5)
+// ============================================================================
+
+/// Select the [`VerifyMode`] for a query from `--phrase` / `--near` flags.
+///
+/// Called on every query path (pure-lexical, compound text+AST, blast-radius).
+/// Single definition prevents the three call sites from drifting apart if a new
+/// `VerifyMode` variant is added.
+fn verify_mode_for(phrase: bool, near: Option<u32>) -> VerifyMode {
+    if phrase {
+        VerifyMode::Phrase
+    } else if let Some(n) = near {
+        VerifyMode::Near(n)
+    } else {
+        VerifyMode::Substring
+    }
+}
+
+// ============================================================================
 // Query execution
 // ============================================================================
 
@@ -417,13 +436,6 @@ pub(super) fn execute_query_with_manifest(
     // AD-393-5: select the predicate based on mode. Phrase/Near eliminate
     // trigram-containment false positives at the CLI gate (the reader is recall-
     // oriented, not the correctness authority — AD-393-1).
-    let verify_mode = if config.phrase {
-        VerifyMode::Phrase
-    } else if let Some(n) = config.near {
-        VerifyMode::Near(n)
-    } else {
-        VerifyMode::Substring
-    };
     let effective_offset = config.offset.unwrap_or(0);
     let results = resolve_paths_and_snippets_verified(
         &raw_results,
@@ -435,7 +447,7 @@ pub(super) fn execute_query_with_manifest(
             layers_matched: &[],
             limit: config.limit,
             offset: effective_offset,
-            verify_mode,
+            verify_mode: verify_mode_for(config.phrase, config.near),
         },
     );
 
@@ -624,13 +636,6 @@ fn run_compound_query(
     // AD-393-7: same VerifyMode as the pure-lexical path so that phrase/near
     // correctness carries through the compound text+--ast dispatch.
     let effective_offset = config.offset.unwrap_or(0);
-    let verify_mode = if config.phrase {
-        VerifyMode::Phrase
-    } else if let Some(n) = config.near {
-        VerifyMode::Near(n)
-    } else {
-        VerifyMode::Substring
-    };
     let results = resolve_paths_and_snippets_verified(
         &recomposed,
         ctx.sorted,
@@ -641,7 +646,7 @@ fn run_compound_query(
             layers_matched: &["lexical", "ast"],
             limit: config.limit,
             offset: effective_offset,
-            verify_mode,
+            verify_mode: verify_mode_for(config.phrase, config.near),
         },
     );
     let total = results.len();
@@ -729,13 +734,7 @@ fn run_blast_radius_composite_query(
     // No file_filter: UNION mode requires the full lexical ranked list.
     let raw_lex = ctx.engine.search(&sq)?;
     // AD-393-12: select the verify predicate for the blast path.
-    let blast_verify_mode = if config.phrase {
-        VerifyMode::Phrase
-    } else if let Some(n) = config.near {
-        VerifyMode::Near(n)
-    } else {
-        VerifyMode::Substring
-    };
+    let blast_verify_mode = verify_mode_for(config.phrase, config.near);
 
     // Step 2: build the temporal ranked list from blast_paths.
     // Each co-change partner path → FileId (via sorted_paths index).

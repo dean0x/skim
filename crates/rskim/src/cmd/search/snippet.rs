@@ -384,11 +384,7 @@ pub(super) fn extract_snippet_and_verify(
 /// Run the verify predicate for `mode` and return a `bool`. Used by the
 /// large-file bounded-scan path where re-anchoring is not needed (no snippet).
 fn run_verify_predicate(text: &str, query: &str, mode: &VerifyMode) -> bool {
-    match mode {
-        VerifyMode::Substring => query_substring_present(text, query),
-        VerifyMode::Phrase => rskim_search::phrase_tokens_present(text, query).is_some(),
-        VerifyMode::Near(n) => rskim_search::near_tokens_present(text, query, *n).is_some(),
-    }
+    run_verify_predicate_with_range(text, query, mode).0
 }
 
 /// Run the verify predicate and return `(verified, anchor_range)`.
