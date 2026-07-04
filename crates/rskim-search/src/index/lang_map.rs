@@ -67,6 +67,7 @@ pub(crate) fn lang_from_id(id: u8) -> Option<rskim_core::Language> {
         14 => Some(rskim_core::Language::Toml),
         15 => Some(rskim_core::Language::TypeScript),
         16 => Some(rskim_core::Language::Yaml),
+        17 => Some(rskim_core::Language::Bash),
         _ => None,
     }
 }
