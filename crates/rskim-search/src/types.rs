@@ -863,7 +863,17 @@ pub fn near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<u
                 if let Some(cnt) = win_counts.get_mut(left_word) {
                     *cnt -= 1;
                 }
-                if lc > 0 && lc - 1 < q_counts.get(left_word).copied().unwrap_or(0) {
+                // Decrement `have` ONLY on the covered→under-covered transition,
+                // i.e. when the pre-removal count was EXACTLY the required
+                // multiplicity (`lc == need`). This mirrors the add-path guard
+                // `prev + 1 == need`. The prior condition `lc - 1 < need` also
+                // fired for an already-under-covered duplicate word (`lc < need`),
+                // which both dropped valid matches (false negative for repeated
+                // query words such as `--near N 'a a a'`) and could UNDERFLOW
+                // `have` (usize) when two under-covered duplicates were evicted in
+                // a single shrink — a debug panic / release wrap.
+                let left_need = q_counts.get(left_word).copied().unwrap_or(0);
+                if lc == left_need {
                     have -= 1; // this word is no longer fully covered
                 }
                 left += 1;

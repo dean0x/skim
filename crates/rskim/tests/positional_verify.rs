@@ -201,6 +201,25 @@ fn near_duplicate_query_words_require_distinct_positions_d11() {
     );
 }
 
+/// D11 (regression): a query word repeated 3× must still match when the content
+/// holds three distinct occurrences within the window, even if EARLIER
+/// occurrences sit outside the span and get evicted during window shrink.
+///
+/// Guards the `near_tokens_present` `have`-bookkeeping bug: the shrink evicts
+/// `a@0` then `a@1` in one step; the asymmetric decrement guard over-counted the
+/// eviction, underflowing `have` (usize) — a debug panic / release false-negative.
+/// `a@6 a@7 a@8` are three distinct `a` within span 2 (≤ n), so the answer is Some.
+#[test]
+fn near_triplicate_query_word_with_evicted_early_occurrences_d11() {
+    // Word tokens: a(0) a(1) q(2) q(3) q(4) q(5) a(6) a(7) a(8).
+    let result = near_tokens_present("a a q q q q a a a", "a a a", 2);
+    assert!(
+        result.is_some(),
+        "D11: three distinct 'a' within n=2 (ordinals 6,7,8) must match 'a a a'; \
+         a None here means the window bookkeeping dropped the valid late window"
+    );
+}
+
 /// AC2: near predicate rejects the trigram-containment false positive.
 /// `encode_length varint_writer` must NOT match `encode varint` under near.
 #[test]
