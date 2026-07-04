@@ -418,6 +418,14 @@ impl SkippedEntry {
 /// Aggregates collected by the producer thread and returned via `JoinHandle`
 /// (single-threaded producer needs no Mutex — AD-395-2).
 pub(super) struct ProducerSkips {
+    /// Exact, uncapped count of every producer-phase skip (AD-395-2).
+    ///
+    /// Incremented once per `Err(reason)` in the producer loop, independent
+    /// of `sample` (which is capped at `MAX_SKIP_REASONS`).  Use this for
+    /// `IndexResult.skipped` and the "...and N more" arithmetic so that a
+    /// repo with >10 000 content-skipped files still reports the true total
+    /// rather than the bounded sample length.
+    pub skipped_total: usize,
     /// Bounded display sample (capped at `MAX_SKIP_REASONS` from walk.rs).
     pub sample: Vec<SkipReason>,
     /// Full set of DETERMINISTIC content-skips for manifest persistence.

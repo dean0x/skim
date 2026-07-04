@@ -452,8 +452,10 @@ impl<'cfg> Pipeline<'cfg> {
 
         // Merge walk-phase skips + producer sample, sort by stable key, truncate
         // to MAX_SKIP_REASONS (AD-395-2 / AD-395-6 / PF-012).
+        // Use the exact uncapped producer counter (not sample.len()) so the
+        // headline skip number and "...and N more" are always the true total.
         let total_skipped = to_u32_capped(walk_skips.len())
-            .saturating_add(to_u32_capped(producer_skips.sample.len()));
+            .saturating_add(to_u32_capped(producer_skips.skipped_total));
         let skip_sample = build_skip_sample(walk_skips, producer_skips.sample);
 
         Ok(IndexResult {
@@ -555,6 +557,11 @@ impl<'cfg> Pipeline<'cfg> {
         let handle = std::thread::spawn(move || {
             let mut sample: Vec<SkipReason> = Vec::new();
             let mut skip_set: Vec<SkippedEntry> = Vec::new();
+            // AD-395-2: exact, uncapped count of every producer-phase skip.
+            // Independent of `sample` (which is capped at MAX_SKIP_REASONS)
+            // so that IndexResult.skipped and "...and N more" always report
+            // the true total, even in large monorepos with >10 000 skips.
+            let mut skipped_total: usize = 0;
 
             for entry in &walk_entries {
                 match read_and_classify(entry, &manifest, &ast_cache, force, debug_enabled) {
@@ -566,6 +573,8 @@ impl<'cfg> Pipeline<'cfg> {
                         }
                     }
                     Err(reason) => {
+                        // Count every skip exactly (uncapped) before any sample logic.
+                        skipped_total += 1;
                         // Collect a DETERMINISTIC skip entry for manifest persistence
                         // (AD-395-2 / OD-395-4): only Minified, NonUtf8, TooLarge.
                         if let Some(disc) = reason.persist_discriminant() {
@@ -591,7 +600,11 @@ impl<'cfg> Pipeline<'cfg> {
                 }
             }
             // `tx` dropped here closes the channel, signalling EOF to consumer.
-            ProducerSkips { sample, skip_set }
+            ProducerSkips {
+                skipped_total,
+                sample,
+                skip_set,
+            }
         });
 
         (handle, rx)
@@ -929,16 +942,22 @@ pub(super) fn build_skip_sample(
 /// Format a bounded skip sample for stderr display (AD-395-6).
 ///
 /// Returns a string with up to `cap` rendered reason lines followed by
-/// `"...and N more"` when the sample exceeds the cap.  Order is preserved
-/// (callers pass a pre-sorted slice).
+/// `"...and N more"` when the `total` exceeds the number shown.  Order is
+/// preserved (callers pass a pre-sorted slice).
+///
+/// `total` is the TRUE total skip count (≥ `reasons.len()`).  In production
+/// callers pass `result.skipped as usize` so the "and N more" figure reflects
+/// the uncapped count from the exact `ProducerSkips.skipped_total` counter
+/// (AD-395-2).  In unit-tests that exercise the formatting only, passing
+/// `reasons.len()` is correct (no hidden additional skips).
 ///
 /// Exposed `pub(super)` for unit-testing (AC5 / PF-007 — no test-file-
 /// generation, pure function).
-pub(super) fn format_skip_sample(reasons: &[SkipReason], cap: usize) -> String {
+pub(super) fn format_skip_sample(reasons: &[SkipReason], cap: usize, total: usize) -> String {
     let shown = reasons.len().min(cap);
     let mut lines: Vec<String> = reasons[..shown].iter().map(|r| r.to_string()).collect();
-    if reasons.len() > cap {
-        lines.push(format!("...and {} more", reasons.len() - cap));
+    if total > shown {
+        lines.push(format!("...and {} more", total - shown));
     }
     lines.join("\n")
 }

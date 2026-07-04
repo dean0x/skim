@@ -2971,8 +2971,9 @@ fn test_ac5_format_skip_sample_truncation_and_stable_order() {
     ];
 
     // Build sample (sort + merge step) then format with cap=2.
+    // Pass sample.len() as `total` (no hidden additional skips in this unit test).
     let sample = build_skip_sample(reasons.clone(), vec![]);
-    let out = format_skip_sample(&sample, 2);
+    let out = format_skip_sample(&sample, 2, sample.len());
 
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(
@@ -3012,7 +3013,7 @@ fn test_ac5_format_skip_sample_truncation_and_stable_order() {
         },
     ];
     let sample2 = build_skip_sample(reasons_shuffled, vec![]);
-    let out2 = format_skip_sample(&sample2, 2);
+    let out2 = format_skip_sample(&sample2, 2, sample2.len());
     assert_eq!(
         out, out2,
         "shuffled input must produce byte-identical output (PF-012 determinism)"
@@ -3189,6 +3190,62 @@ fn test_ac8_changed_skip_triggers_one_rebuild() {
         matches!(s3, super::super::staleness::StalenessCheck::Current),
         "after second build must be Current again, got: {s3:?}"
     );
+
+    // AC8 positive follow-through: overwrite the bundle with a small valid file
+    // (< 64 KiB, indexable) containing a unique token.  After one rebuild the
+    // token must be retrievable — the formerly-skipped file now appears in results.
+    // A subsequent scan must be Current (no loop, only one rebuild needed).
+    let unique_token = "SKAC8PREV395";
+    fs::write(
+        &bundle_path,
+        format!("fn prev_bundle() {{ /* {unique_token} */ }}\n"),
+    )
+    .unwrap();
+
+    // One more scan: the bundle changed from minified-to-indexable → dirty.
+    let (s4, _) = check_staleness(&cache_dir, root);
+    assert!(
+        matches!(
+            s4,
+            super::super::staleness::StalenessCheck::WorkingTreeChanged { .. }
+        ),
+        "after replacing bundle with valid file must be WorkingTreeChanged, got: {s4:?}"
+    );
+
+    // Rebuild picks up the now-indexable file.
+    build_index(&config).expect("third build (prev→indexable)");
+
+    // The unique token must now appear in query results.
+    let token_out = super::super::query::execute_query(
+        &super::super::types::QueryConfig {
+            text: unique_token.to_string(),
+            limit: 5,
+            offset: None,
+            json: false,
+            root: root.to_path_buf(),
+            cache_dir: cache_dir.clone(),
+            blast_radius_paths: None,
+            ast_scored: None,
+            composite_weights: None,
+            phrase: false,
+            near: None,
+            lang: None,
+        },
+        &TEST_ANALYTICS,
+    )
+    .expect("query after prev-bundle → indexable must succeed");
+    assert!(
+        !token_out.results.is_empty(),
+        "AC8 positive follow-through: '{unique_token}' must be found after formerly-skipped \
+         bundle becomes a valid indexable file; got zero results"
+    );
+
+    // No loop: next scan after the rebuild is Current.
+    let (s5, _) = check_staleness(&cache_dir, root);
+    assert!(
+        matches!(s5, super::super::staleness::StalenessCheck::Current),
+        "AC8 positive follow-through: scan after rebuild must be Current (no loop), got: {s5:?}"
+    );
 }
 
 /// AC9 — None/None hint skip is reconciled by path presence (not re-flagged as added).
@@ -3348,6 +3405,7 @@ fn test_ac2_longline_recall_query_and_json_surface() {
 /// sets so the snippet engine cannot conflate them.  We use:
 ///   - `BRAVO2INDEX` (trigrams: BRA RAV AVO VO2 O2I 2IN IND NDE DEX) — line 2
 ///   - `DELTA5QUERY` (trigrams: DEL ELT LTA TA5 A5Q 5QU QUE UER ERY) — line 5
+///
 /// Zero shared trigrams → the n-gram scorer assigns each token exclusively to
 /// its own line.
 #[test]
@@ -3645,5 +3703,59 @@ fn test_ac11_stats_json_back_compat_keys() {
         stats_json.is_object(),
         "AC11: --stats --json output must be a single JSON object; got: {:?}",
         stats_json
+    );
+}
+
+/// AC4 stderr glue — `run_build` actually emits the named skip sample to stderr.
+///
+/// The individual components (skip_sample, format_skip_sample) are unit-tested
+/// in `test_ac4_bundle_skipped_and_named_in_sample` and `test_ac5_*`. This test
+/// verifies the production wiring in `run_build` — the `eprintln!` call, the
+/// empty-guard, and the cap=10 argument — by capturing stderr from the binary
+/// (subprocess-level, CARGO_BIN_EXE_skim).  A regression that drops the
+/// `eprintln!` or inverts the empty-guard would not be caught by the component
+/// tests; this test catches it.
+#[test]
+fn test_ac4_run_build_stderr_names_skipped_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    // Genuine >= 64 KiB single-line bundle — must appear in stderr skip sample.
+    fs::write(root.join("bundle.js"), "x".repeat(70_000)).unwrap();
+
+    // Locate the skim binary (set by cargo test via CARGO_BIN_EXE_skim, or fall
+    // back to walking up from the test executable location).
+    let bin = std::env::var("CARGO_BIN_EXE_skim").unwrap_or_else(|_| {
+        let mut p = std::env::current_exe().unwrap();
+        p.pop(); // deps/
+        p.pop(); // debug/ or release/
+        p.push("skim");
+        p.to_string_lossy().to_string()
+    });
+
+    let output = std::process::Command::new(&bin)
+        .args(["search", "--build", "--root"])
+        .arg(root)
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim search --build subprocess must not fail to launch");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "AC4 stderr: skim search --build must exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("minified (avg line "),
+        "AC4 stderr: run_build must emit 'minified (avg line ' for the skipped bundle; \
+         got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("bundle.js"),
+        "AC4 stderr: run_build must name 'bundle.js' in the skip sample; got: {stderr:?}"
     );
 }

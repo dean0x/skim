@@ -769,13 +769,20 @@ pub(super) fn minified_metric(content: &str) -> Option<usize> {
         return None;
     }
 
-    // Both signals hold → compute avg_line_bytes for the skip message.
-    // With newline_count <= 1, avg_line_bytes is either probe.len() (0 newlines)
-    // or probe.len() (≈ 8192, 1 newline) — always > MINIFY_AVG_LINE_BYTES (500).
-    let avg_line_bytes = probe
-        .len()
-        .checked_div(newline_count)
-        .unwrap_or(probe.len());
+    // Both signals hold → compute the TRUE average line length over the WHOLE
+    // file for the skip message (AD-395-1 / AD-395-6 observability).
+    //
+    // Using `probe.len() / newline_count` produces a degenerate constant
+    // (always 8192 when newline_count ∈ {0, 1}, probe_len == 8192), which
+    // hides the actual file size in the "avg line N > 500 bytes" notice.
+    // A genuine single-line bundle (e.g. 70 KB of `"x".repeat(70_000)`)
+    // should display "avg line 70000 > 500 bytes", not "avg line 8192".
+    //
+    // Counting over the full content is safe here: we are already past both
+    // gate checks (size ≥ 64 KiB and probe is single-line) and are about to
+    // skip the file anyway, so a linear scan is not on the hot path.
+    let full_newlines = content.bytes().filter(|&b| b == b'\n').count();
+    let avg_line_bytes = content.len() / (full_newlines + 1);
 
     if avg_line_bytes > MINIFY_AVG_LINE_BYTES {
         Some(avg_line_bytes)

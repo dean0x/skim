@@ -706,7 +706,10 @@ fn run_build(
     // sorted by path string ascending, CapReached last, from build_skip_sample).
     if !result.skip_sample.is_empty() {
         // Show up to 10 named skip reasons; remainder surfaced as "...and N more".
-        let sample_display = index::format_skip_sample(&result.skip_sample, 10);
+        // Pass result.skipped (the exact uncapped total) so N reflects the true
+        // remainder, not just the bounded sample length (AD-395-2).
+        let sample_display =
+            index::format_skip_sample(&result.skip_sample, 10, result.skipped as usize);
         eprintln!("{sample_display}");
     }
 
@@ -811,37 +814,10 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
 
     let mut out = BufWriter::new(std::io::stdout());
     if json {
-        // AC6: additive `cache_dir` key; all pre-existing keys retained unchanged.
-        // AD-380-4/5: additive `total_on_disk_bytes` (true footprint) and
-        // `temporal_db_bytes` keys; `index_size_bytes` (lexical-only) unchanged.
-        // AD-395-6: additive `skipped` array and `skipped_by_reason` object.
-        let skipped_arr: Vec<serde_json::Value> = skip_entries
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "path": e.path,
-                    "reason": e.reason_label(),
-                })
-            })
-            .collect();
-        let mut skipped_by_reason: std::collections::HashMap<&str, u64> =
-            std::collections::HashMap::new();
-        for e in &skip_entries {
-            *skipped_by_reason.entry(e.reason_label()).or_insert(0) += 1;
-        }
-        let extended = serde_json::json!({
-            "file_count": stats.file_count,
-            "total_ngrams": stats.total_ngrams,
-            "index_size_bytes": stats.index_size_bytes,
-            "total_on_disk_bytes": total_on_disk,
-            "temporal_db_bytes": temporal_db_bytes,
-            "last_updated": stats.last_updated,
-            "git_head": git_head,
-            "staleness": staleness_status.to_string(),
-            "cache_dir": cache_dir_display,
-            "skipped": skipped_arr,
-            "skipped_by_reason": skipped_by_reason,
-        });
+        // AC6/AC11: shared JSON construction via build_stats_json (same code path
+        // as the test helper) — ensures AC11 back-compat tests guard production.
+        // AD-395-6: `skipped` array and `skipped_by_reason` are additive keys.
+        let extended = build_stats_json(&cache_dir, &root)?;
         writeln!(out, "{}", serde_json::to_string_pretty(&extended)?)?;
     } else {
         writeln!(out, "skim search index stats:")?;
@@ -868,9 +844,10 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         // AC4: resolved cache dir, in addition to the lines above.
         writeln!(out, "  cache dir     : {cache_dir_display}")?;
         // AD-395-6: skip counts by reason (text mode).
+        // PF-012: use BTreeMap so reason keys iterate in stable sorted order.
         if !skip_entries.is_empty() {
-            let mut by_reason: std::collections::HashMap<&str, u64> =
-                std::collections::HashMap::new();
+            let mut by_reason: std::collections::BTreeMap<&str, u64> =
+                std::collections::BTreeMap::new();
             for e in &skip_entries {
                 *by_reason.entry(e.reason_label()).or_insert(0) += 1;
             }
@@ -879,9 +856,7 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
                 "  skipped       : {} (content-skipped files)",
                 skip_entries.len()
             )?;
-            let mut reasons: Vec<_> = by_reason.iter().collect();
-            reasons.sort_by_key(|(k, _)| *k);
-            for (reason, count) in reasons {
+            for (reason, count) in &by_reason {
                 writeln!(out, "    {reason}: {count}")?;
             }
         }
@@ -1318,22 +1293,20 @@ fn print_help() {
 }
 
 // ============================================================================
-// Test helpers (cfg(test) only — not compiled into production builds)
+// ============================================================================
+// Shared JSON stats builder
 // ============================================================================
 
-/// Produce the same JSON object that `run_stats(json=true, ...)` would emit to
-/// stdout, returned as a `serde_json::Value` so tests can assert individual
-/// fields without driving the binary subprocess.
+/// Build the `--stats --json` value used by both [`run_stats`] and the test helper.
 ///
-/// Accepts explicit `cache_dir` and `root` so callers bypass `resolve_root_and_cache`.
-/// The logic mirrors the JSON branch of `run_stats` exactly; any divergence is a
-/// bug in this helper.
+/// Shared so that AC11 back-compat tests guard the actual production code path
+/// rather than a hand-duplicated reimplementation.  `run_stats` calls this in its
+/// JSON branch; `stats_json_for_test` delegates to it directly.
 ///
-/// Used by `index_tests.rs` for:
-/// - AC4 (#395): assert `skipped` array / `skipped_by_reason` JSON fields.
-/// - AC11 (#395): assert all nine pre-existing keys survive with unchanged types.
-#[cfg(test)]
-pub(crate) fn stats_json_for_test(
+/// AD-395-6: `skipped` / `skipped_by_reason` are additive keys; all nine pre-existing
+/// keys are unchanged (AC11 back-compat).  `skipped_by_reason` uses `BTreeMap` for
+/// byte-stable key order consistent with the text-mode path (PF-012).
+pub(super) fn build_stats_json(
     cache_dir: &std::path::Path,
     root: &std::path::Path,
 ) -> anyhow::Result<serde_json::Value> {
@@ -1362,8 +1335,10 @@ pub(crate) fn stats_json_for_test(
             })
         })
         .collect();
-    let mut skipped_by_reason: std::collections::HashMap<&str, u64> =
-        std::collections::HashMap::new();
+    // PF-012: BTreeMap gives deterministic (sorted) key order in JSON output,
+    // consistent with the alphabetical sort used in the text-mode path.
+    let mut skipped_by_reason: std::collections::BTreeMap<&str, u64> =
+        std::collections::BTreeMap::new();
     for e in &skip_entries {
         *skipped_by_reason.entry(e.reason_label()).or_insert(0) += 1;
     }
@@ -1380,6 +1355,24 @@ pub(crate) fn stats_json_for_test(
         "skipped": skipped_arr,
         "skipped_by_reason": skipped_by_reason,
     }))
+}
+
+// ============================================================================
+// Test helpers (cfg(test) only — not compiled into production builds)
+// ============================================================================
+
+/// Delegate to [`build_stats_json`] so AC4/AC11 tests cover the production
+/// code path rather than a hand-duplicated reimplementation.
+///
+/// Used by `index_tests.rs` for:
+/// - AC4 (#395): assert `skipped` array / `skipped_by_reason` JSON fields.
+/// - AC11 (#395): assert all nine pre-existing keys survive with unchanged types.
+#[cfg(test)]
+pub(crate) fn stats_json_for_test(
+    cache_dir: &std::path::Path,
+    root: &std::path::Path,
+) -> anyhow::Result<serde_json::Value> {
+    build_stats_json(cache_dir, root)
 }
 
 // ============================================================================

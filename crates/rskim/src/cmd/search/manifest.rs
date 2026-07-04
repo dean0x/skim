@@ -568,8 +568,17 @@ impl FileManifest {
                 }
             }
         }
-        // If the buffer ended without a skip_count (v4 body), skipped_entries
-        // stays empty — no error, gradual upgrade path for the self-heal.
+        // Truncation note: a genuine v4 manifest NEVER reaches this code — decode_header
+        // rejects any version != FORMAT_VERSION (5) before the entry loop runs (the
+        // ADR-006 version gate triggers a cold-start rebuild, not this fallback).
+        // The only way `read_u32()` returns `None` here is a TRUNCATED v5 file where
+        // all indexed entries are intact but the 4-byte skip_count is missing or partial.
+        // Treat that as reject-whole for codec consistency (AD-380-3): the skip section
+        // is advisory for display/staleness only, but a partially-written manifest can
+        // signal a crashed write; better to cold-start than silently serve stale data.
+        else {
+            return Ok(Self::new(project_root, cache_dir));
+        }
 
         Ok(Self {
             project_root,

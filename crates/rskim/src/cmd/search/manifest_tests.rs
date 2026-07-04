@@ -892,6 +892,41 @@ fn test_ac6_version_matches_rejects_v4() {
     );
 }
 
+/// Truncated-v5 manifest (skip_count missing) rejects whole — codec consistency (AD-380-3).
+///
+/// The `else` branch in `FileManifest::load` now cold-starts when `read_u32()` for
+/// the skip_count returns `None` (buffer ended exactly at the skip section boundary).
+/// This is a v5-only scenario: v4 manifests are rejected by `decode_header` before
+/// reaching this code.
+#[test]
+fn test_v5_manifest_truncated_at_skip_count_rejects_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+
+    // Build a manifest with 1 indexed entry and 0 skip entries; save it.
+    let mut manifest = FileManifest::new(root.clone(), cache_dir.clone());
+    manifest.insert(sample_entry("src/valid.rs", &"v".repeat(64)));
+    manifest.save().unwrap();
+
+    // The last 4 bytes are the skip_count (u32 LE = 0). Strip them to simulate
+    // a write that was killed after entries but before the skip section.
+    let mut bytes = fs::read(cache_dir.join("index.skfiles")).unwrap();
+    assert!(bytes.len() >= 4, "manifest must be at least 4 bytes");
+    let truncated_len = bytes.len() - 4;
+    bytes.truncate(truncated_len);
+    fs::write(cache_dir.join("index.skfiles"), &bytes).unwrap();
+
+    // Load must cold-start (reject whole) — not silently accept with empty skips.
+    let loaded = FileManifest::load(root, cache_dir).unwrap();
+    assert_eq!(
+        loaded.entry_count(),
+        0,
+        "v5 manifest truncated exactly at the skip_count boundary must reject-whole \
+         (entry_count == 0), not silently accept the indexed entries (AD-380-3)"
+    );
+}
+
 /// AC10 — v5 manifest round-trip: skip entries survive encode/load, are
 /// excluded from sorted_paths() and entry_count(), and a forged skip_count
 /// over MAX_MANIFEST_ENTRIES causes load() to reject-whole (AD-395-4).
@@ -953,12 +988,20 @@ fn test_ac10_v5_manifest_round_trip_and_skip_isolation() {
     assert_eq!(skip_vec[1].reason_disc, 2);
 
     // AC10: forged skip_count > MAX_MANIFEST_ENTRIES must reject-whole.
-    // Strategy: save a 0-entry manifest (known layout), then overwrite the
-    // last 4 bytes (skip_count) with u32::MAX to trigger reject-whole.
-    let empty_manifest = FileManifest::new(root.clone(), cache_dir.clone());
-    empty_manifest.save().unwrap();
+    //
+    // Strategy: save a manifest WITH >= 1 real indexed entry and 0 skip entries,
+    // then overwrite the last 4 bytes (the skip_count) with u32::MAX.
+    // Asserting entry_count() == 0 on the result is the DISCRIMINATING check:
+    // a correct reject-whole discards the valid indexed entries too, whereas a
+    // reject-PART regression (drop only the corrupt skip section while keeping
+    // entries) would leave entry_count() > 0 and the assertion would catch it.
+    // This mirrors the forged-ENTRY-count tests at lines 232/265 above.
+    let mut one_entry_manifest = FileManifest::new(root.clone(), cache_dir.clone());
+    one_entry_manifest.insert(sample_entry("src/real.rs", &"r".repeat(64)));
+    // No skip entries: the last 4 bytes of the encoded buffer are skip_count = 0.
+    one_entry_manifest.save().unwrap();
     let mut forged = fs::read(cache_dir.join("index.skfiles")).unwrap();
-    // The last 4 bytes are the skip_count (0 in an empty manifest). Overwrite with MAX.
+    // Overwrite the trailing skip_count (u32 LE) with u32::MAX.
     let len = forged.len();
     forged[len - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
     fs::write(cache_dir.join("index.skfiles"), &forged).unwrap();
@@ -966,7 +1009,8 @@ fn test_ac10_v5_manifest_round_trip_and_skip_isolation() {
     assert_eq!(
         rejected.entry_count(),
         0,
-        "forged skip_count > MAX_MANIFEST_ENTRIES must reject-whole (cold start)"
+        "forged skip_count > MAX_MANIFEST_ENTRIES must reject-whole — \
+         the 1 indexed entry must also be discarded (cold start)"
     );
     assert_eq!(
         rejected.skipped().count(),
