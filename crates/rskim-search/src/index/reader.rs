@@ -111,10 +111,39 @@ fn intersect_sorted_u32(a: &[u32], b: &[u32]) -> Vec<u32> {
     out
 }
 
-/// Count phrase alignments: query word k must sit at doc token `base + k`
-/// (contiguous, ordered). `d[k]` = sorted-unique doc token positions for word k.
+/// AD-393-2: Gap-aware phrase alignment via `token_off` deltas.
+///
+/// Query word `k` must sit at doc token `base + offsets[k]` (not `base + k`),
+/// so short words dropped from the positionable set leave their ordinal gap
+/// intact. For example, if the query is `fn <x> main` and `fn` is short
+/// (dropped), the positionable words are `<x>` and `main` at offsets `[0, 2]` —
+/// the alignment checks `<x>` at `base + 0` and `main` at `base + 2`.
+///
+/// `d[k]` = sorted-unique doc token positions for positionable word k.
+/// `offsets[k]` = the positionable word's query ordinal delta from the first
+/// positionable word; `offsets[0]` must always be `0`.
+///
 /// Returns the number of valid `base` values (0 ⇒ no phrase match).
-fn count_phrase_alignments(d: &[Vec<u32>]) -> usize {
+///
+/// AD-393-11: debug_assert invariants on the `offsets` parameter.
+/// The returned COUNT is a recall-oriented candidate-rank proxy, not an exact
+/// occurrence count — a future reader must not mistake it for precision.
+fn count_phrase_alignments(d: &[Vec<u32>], offsets: &[u32]) -> usize {
+    debug_assert!(
+        offsets.len() == d.len(),
+        "AD-393-11: offsets.len() ({}) must equal d.len() ({})",
+        offsets.len(),
+        d.len()
+    );
+    debug_assert!(
+        offsets.is_empty() || offsets[0] == 0,
+        "AD-393-11: offsets[0] must be 0"
+    );
+    debug_assert!(
+        offsets.windows(2).all(|w| w[1] > w[0]),
+        "AD-393-11: offsets must be strictly ascending"
+    );
+
     if d.is_empty() || d.iter().any(Vec::is_empty) {
         return 0;
     }
@@ -122,7 +151,7 @@ fn count_phrase_alignments(d: &[Vec<u32>]) -> usize {
     for &base in &d[0] {
         let mut ok = true;
         for (k, dk) in d.iter().enumerate().skip(1) {
-            match base.checked_add(k as u32) {
+            match base.checked_add(offsets[k]) {
                 Some(want) if dk.binary_search(&want).is_ok() => {}
                 _ => {
                     ok = false;
@@ -760,21 +789,59 @@ impl NgramIndexReader {
     /// trigram posting lists by doc_id), then filters surviving docs by the
     /// word-token-distance constraint. Ranked by alignment count. Truncation is
     /// applied LAST by the caller (sq.limit = None on this path).
+    /// AD-393-1: Reader is a recall-oriented candidate generator, not the
+    /// correctness authority. It partitions query tokens into positionable
+    /// (>=3-byte, has trigrams) and short (<3-byte, no trigrams); intersects and
+    /// aligns over positionable words ONLY. When NO word is positionable it reuses
+    /// `short_query_fallback` (mirrors AD-355-7 / AD-372-4). The CLI token-exact
+    /// predicate (`phrase_tokens_present` / `near_tokens_present`) checks short
+    /// words and exactness. Recall-preserving because trigram-containment positions
+    /// are a superset of exact-token positions.
+    ///
+    /// PF-006: the all-short fallback keys on `positioned.is_empty()`, never a
+    /// sibling-flag-absent guard; phrase/near dispatch matches the primary flag
+    /// unconditionally. `--lang` is honored on all paths (D17, AC16 guard).
     fn search_positional(
         &self,
         query: &SearchQuery,
         lang_filter: Option<u8>,
     ) -> Result<Vec<SearchResult>> {
         let qtokens = extract_query_positional_tokens(&query.text);
-        // Need ≥1 word, and EVERY word must be locatable (≥3 bytes ⇒ has trigrams).
-        // A <3-byte word cannot be positioned; bail to empty (documented limitation).
-        if qtokens.is_empty() || qtokens.iter().any(|t| t.trigrams.is_empty()) {
+        if qtokens.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Decode each distinct trigram's posting list ONCE.
+        // AD-393-1: Partition into positionable (>=3-byte, has trigrams) and
+        // short tokens. Only positionable words contribute to the trigram
+        // intersection; short words are handled by the CLI token-exact predicate.
+        let positioned: Vec<&crate::ngram::QueryToken> =
+            qtokens.iter().filter(|t| !t.trigrams.is_empty()).collect();
+
+        // AD-393-8: If NO positionable words exist (all query words are <3 bytes,
+        // e.g. `--near 2 'in of'`), emit a named stderr notice and fall back to
+        // short_query_fallback (all filtered files, score-0). Results are
+        // token-exact-correct — the CLI predicate verifies them; erroring would
+        // reject a valid query. Bounded by the same short-query-fallback SLA.
+        if positioned.is_empty() {
+            eprintln!(
+                "skim search: note: all query words are <3 bytes (e.g., \"fn\", \"in\"); \
+                 falling back to full-file scan — O(file_count) token-exact verify fan-out; \
+                 results are token-exact-correct (bounded by short-query-fallback SLA)."
+            );
+            return Ok(self.short_query_fallback(query, lang_filter));
+        }
+
+        // AD-393-2: Build the ordinal-delta offsets for gap-aware phrase alignment.
+        // offsets[k] = positioned[k].token_off - positioned[0].token_off, so that
+        // a short word dropped between two long words leaves its ordinal gap intact.
+        // E.g. `human in the loop` with `in` short → positioned = [human(0), the(2), loop(3)],
+        // offsets = [0, 2, 3].
+        let base_off = positioned[0].token_off;
+        let offsets: Vec<u32> = positioned.iter().map(|t| t.token_off - base_off).collect();
+
+        // Decode each distinct trigram's posting list ONCE (only for positioned words).
         let mut tri_postings: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
-        for t in &qtokens {
+        for t in &positioned {
             for g in &t.trigrams {
                 if let std::collections::hash_map::Entry::Vacant(e) = tri_postings.entry(g.key()) {
                     e.insert(self.lookup_postings(g.key())?);
@@ -782,8 +849,8 @@ impl NgramIndexReader {
             }
         }
 
-        // doc_id AND-intersection across ALL within-word trigrams (every query
-        // word must be present). Build per-trigram sorted-unique doc_id lists.
+        // doc_id AND-intersection across ALL within-word trigrams of positioned words.
+        // Build per-trigram sorted-unique doc_id lists.
         let mut doc_id_lists: Vec<Vec<u32>> = Vec::with_capacity(tri_postings.len());
         for postings in tri_postings.values() {
             let mut ids: Vec<u32> = Vec::with_capacity(postings.len());
@@ -817,7 +884,7 @@ impl NgramIndexReader {
         let mut doc_meta_cache: HashMap<u32, FileMetaEntry> = HashMap::new();
 
         for &doc_id in &intersection {
-            // file_filter (blast-radius) + lang_filter.
+            // file_filter (blast-radius) + lang_filter (AD-393-1 D17: --lang honored).
             if let Some(ref f) = query.file_filter
                 && !f.contains(&FileId(doc_id))
             {
@@ -832,13 +899,13 @@ impl NgramIndexReader {
                 continue;
             }
 
-            // Per query word: D_k = ∩ over its trigrams of {token_position at doc}.
+            // Per positioned query word: D_k = ∩ over its trigrams of {token_position}.
             // Also collect byte positions (union) for snippets + field TF.
-            let mut d: Vec<Vec<u32>> = Vec::with_capacity(qtokens.len());
+            let mut d: Vec<Vec<u32>> = Vec::with_capacity(positioned.len());
             let mut byte_positions: Vec<std::ops::Range<usize>> = Vec::new();
             let mut field_tf = [0.0f32; FIELD_COUNT];
             let mut reject = false;
-            for t in &qtokens {
+            for t in &positioned {
                 let mut acc: Option<Vec<u32>> = None;
                 for g in &t.trigrams {
                     let postings = &tri_postings[&g.key()];
@@ -878,8 +945,10 @@ impl NgramIndexReader {
                 continue;
             }
 
+            // AD-393-2: use gap-aware count_phrase_alignments with offsets so that
+            // dropped short words leave their ordinal gap intact in the alignment check.
             let alignments = if want_phrase {
-                count_phrase_alignments(&d)
+                count_phrase_alignments(&d, &offsets)
             } else {
                 let n = near_n.unwrap_or(0);
                 usize::from(near_match(&d, n))

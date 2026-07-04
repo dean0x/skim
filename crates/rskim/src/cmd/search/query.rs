@@ -24,7 +24,7 @@ use rskim_search::{
 };
 
 use super::manifest::FileManifest;
-use super::snippet::{SnippetOutcome, extract_snippet_and_verify};
+use super::snippet::{SnippetOutcome, VerifyMode, extract_snippet_and_verify};
 use super::staleness::auto_refresh_if_stale;
 use super::types::{QueryConfig, QueryOutput, ResolvedResult};
 
@@ -407,12 +407,23 @@ pub(super) fn execute_query_with_manifest(
         engine.search(&sq)?
     };
 
-    // Resolve snippets, verify substring membership, then truncate to --limit LAST.
+    // Resolve snippets, verify with the correct predicate, then truncate to --limit LAST.
     //
     // AD-355-2 / AD-355-4 / AD-372-3 / RESOLVED Decision 3:
     // verify-then-truncate-LAST invariant.  Offset is applied HERE (post-verify)
     // on BOTH the exact-symbol and multi-word paths so that page boundaries are
     // consistent regardless of how many pre-verify candidates are dropped.
+    //
+    // AD-393-5: select the predicate based on mode. Phrase/Near eliminate
+    // trigram-containment false positives at the CLI gate (the reader is recall-
+    // oriented, not the correctness authority — AD-393-1).
+    let verify_mode = if config.phrase {
+        VerifyMode::Phrase
+    } else if let Some(n) = config.near {
+        VerifyMode::Near(n)
+    } else {
+        VerifyMode::Substring
+    };
     let effective_offset = config.offset.unwrap_or(0);
     let results = resolve_paths_and_snippets_verified(
         &raw_results,
@@ -424,6 +435,7 @@ pub(super) fn execute_query_with_manifest(
             layers_matched: &[],
             limit: config.limit,
             offset: effective_offset,
+            verify_mode,
         },
     );
 
@@ -535,9 +547,14 @@ fn run_compound_query(
     // AD-356-2: size sq.limit to the candidate set.  filter_set.len() >= 1 is
     // guaranteed by the early-out above, so .max(1) is now a compile-time
     // no-op kept for clarity.
+    // AD-393-7: thread phrase/near through the compound-AST path so that
+    // `skim search "fn main" --ast nested-loop --phrase` correctly narrows
+    // the AST candidate set using positional alignment (not just BM25F recall).
     let mut sq = SearchQuery::new(config.text.clone());
     sq.limit = Some(filter_set.len());
     sq.file_filter = Some(filter_set);
+    sq.phrase = config.phrase;
+    sq.near = config.near;
 
     let raw_lex = ctx.engine.search(&sq)?;
 
@@ -604,7 +621,16 @@ fn run_compound_query(
     // `skim search "foo" --ast try-catch --offset 10` paginates correctly.
     // The RRF recomposition does NOT apply offset; pagination is handled here,
     // post-verify, as on the pure-lexical path.
+    // AD-393-7: same VerifyMode as the pure-lexical path so that phrase/near
+    // correctness carries through the compound text+--ast dispatch.
     let effective_offset = config.offset.unwrap_or(0);
+    let verify_mode = if config.phrase {
+        VerifyMode::Phrase
+    } else if let Some(n) = config.near {
+        VerifyMode::Near(n)
+    } else {
+        VerifyMode::Substring
+    };
     let results = resolve_paths_and_snippets_verified(
         &recomposed,
         ctx.sorted,
@@ -615,6 +641,7 @@ fn run_compound_query(
             layers_matched: &["lexical", "ast"],
             limit: config.limit,
             offset: effective_offset,
+            verify_mode,
         },
     );
     let total = results.len();
@@ -683,11 +710,32 @@ fn run_blast_radius_composite_query(
     // the AD-355-7 short-query fallback the candidate set is still bounded to
     // Some(K × limit).max(100) before the verify step.  Calibrating K for large
     // corpora is tracked in #361.
+    // AD-393-12: in positional mode (--phrase / --near), use sq.limit = None to
+    // get the full ranked intersection (same as the pure-lexical exact-symbol path)
+    // so the verify step operates on all phrase/near-aligned candidates.  In the
+    // default (substring) mode keep the K×limit widened pool.
+    let positional = config.phrase || config.near.is_some();
     const BLAST_CANDIDATE_POOL_K: usize = 10;
     let mut sq = SearchQuery::new(config.text.clone());
-    sq.limit = Some(candidate_pool(config.limit, BLAST_CANDIDATE_POOL_K));
+    sq.limit = if positional {
+        None // full intersection for phrase/near — verify-then-truncate-LAST (AD-393-12)
+    } else {
+        Some(candidate_pool(config.limit, BLAST_CANDIDATE_POOL_K))
+    };
+    // AD-393-12: thread phrase/near through the blast-radius SearchQuery so the
+    // reader's search_positional path is exercised (not just BM25F recall).
+    sq.phrase = config.phrase;
+    sq.near = config.near;
     // No file_filter: UNION mode requires the full lexical ranked list.
     let raw_lex = ctx.engine.search(&sq)?;
+    // AD-393-12: select the verify predicate for the blast path.
+    let blast_verify_mode = if config.phrase {
+        VerifyMode::Phrase
+    } else if let Some(n) = config.near {
+        VerifyMode::Near(n)
+    } else {
+        VerifyMode::Substring
+    };
 
     // Step 2: build the temporal ranked list from blast_paths.
     // Each co-change partner path → FileId (via sorted_paths index).
@@ -751,6 +799,8 @@ fn run_blast_radius_composite_query(
             if let Some(&lex_result) = lex_map.get(&fid) {
                 // File has a lexical hit: verify and extract snippet in one read
                 // (AD-355-1 — no second I/O).
+                // AD-393-12: use blast_verify_mode (Phrase/Near/Substring) so
+                // trigram-containment false positives are eliminated on this path too.
                 let mut r = lex_result.clone();
                 r.score = composite_score;
 
@@ -760,9 +810,10 @@ fn run_blast_radius_composite_query(
                     &r.match_positions,
                     manifest_entry,
                     &config.text,
+                    blast_verify_mode.clone(),
                 );
 
-                // Drop lexical-hit candidates that do not contain the query.
+                // Drop lexical-hit candidates that do not pass the predicate.
                 // Stale files produce verified=false and are dropped — positions
                 // may be wrong and we cannot confirm content without re-reading.
                 if !verified {
@@ -782,11 +833,40 @@ fn run_blast_radius_composite_query(
                     temporal: None,
                     layers_matched: vec![],
                 })
+            } else if positional {
+                // AD-393-12: co-change peer gate — in positional mode (--phrase/--near),
+                // co-change-only files are NOT accepted unconditionally.  We read and
+                // apply the positional predicate; only include if verified.  This
+                // prevents blast-radius returning files that co-changed with the target
+                // but do NOT contain the requested phrase/proximity pattern.
+                let (_, verified) = extract_snippet_and_verify(
+                    ctx.root,
+                    path,
+                    &[], // no match_positions for co-change-only: predicate uses text scan
+                    manifest_entry,
+                    &config.text,
+                    blast_verify_mode.clone(),
+                );
+                if !verified {
+                    return None;
+                }
+                Some(super::types::ResolvedResult {
+                    path: path.to_string(),
+                    score: composite_score,
+                    field: "co_change_partner".to_string(),
+                    line_number: None,
+                    line_range: None,
+                    snippet: None,
+                    stale: false,
+                    match_positions: vec![],
+                    temporal: None,
+                    layers_matched: vec![],
+                })
             } else {
                 // Co-change-only file: no lexical hit → no snippet (AC12, UNION mode).
                 // These files appear because their temporal rank contributes to the
                 // fused score even though the text query did not match them.
-                // No file content is read here; include unconditionally.
+                // No file content is read here; include unconditionally (substring mode).
                 Some(super::types::ResolvedResult {
                     path: path.to_string(),
                     score: composite_score,
@@ -840,8 +920,8 @@ fn decode_snippet(
 
 /// Output-shaping parameters for [`resolve_paths_and_snippets_verified`].
 ///
-/// Groups the query string, layer attribution, and pagination fields so the
-/// function signature stays within the seven-argument Clippy limit.
+/// Groups the query string, layer attribution, pagination, and verify-mode fields
+/// so the function signature stays within the seven-argument Clippy limit.
 struct SnippetVerifyParams<'a> {
     /// The literal query text used for AND-token verification (AD-355-3).
     query: &'a str,
@@ -852,6 +932,15 @@ struct SnippetVerifyParams<'a> {
     limit: usize,
     /// Number of verified results to skip before collecting (AD-372-3).
     offset: usize,
+    /// Predicate to apply for correctness verification (AD-393-5).
+    ///
+    /// - `Substring`: pre-#393 default — each whitespace token must appear as a
+    ///   substring.
+    /// - `Phrase` / `Near(n)`: token-exact phrase or proximity predicate
+    ///   (`phrase_tokens_present` / `near_tokens_present`).  Eliminates
+    ///   trigram-containment false positives, e.g. `encode_length varint_writer`
+    ///   must NOT match when the query is `encode varint`.
+    verify_mode: VerifyMode,
 }
 
 /// Map `FileId`s to paths, extract snippets, **verify substring membership**,
@@ -896,6 +985,7 @@ fn resolve_paths_and_snippets_verified(
         layers_matched,
         limit,
         offset,
+        verify_mode,
     } = params;
     raw_results
         .iter()
@@ -903,11 +993,19 @@ fn resolve_paths_and_snippets_verified(
             let path = sorted_paths.get(r.file_id.0 as usize)?;
             let manifest_entry = manifest.lookup(path);
 
-            // Read file once; verify and extract snippet in one call (AD-355-1).
-            let (outcome, verified) =
-                extract_snippet_and_verify(root, path, &r.match_positions, manifest_entry, query);
+            // Read file once; verify with the correct predicate and extract snippet
+            // in one call (AD-355-1 / AD-393-5). verify_mode selects:
+            // Substring (pre-#393 default), Phrase (exact token order), or Near(n).
+            let (outcome, verified) = extract_snippet_and_verify(
+                root,
+                path,
+                &r.match_positions,
+                manifest_entry,
+                query,
+                verify_mode.clone(),
+            );
 
-            // Drop candidates that do not contain the literal query.
+            // Drop candidates that do not pass the predicate.
             // Stale files produce verified=false and are also dropped — we
             // cannot confirm their content matches without re-reading.
             if !verified {

@@ -329,10 +329,26 @@ fn parse_offset_value(raw: &str) -> anyhow::Result<usize> {
     })
 }
 
-/// Parse and validate a `--near` value string as a non-negative word-token distance.
+/// Parse and validate a `--near` value string as a positive word-token distance.
+///
+/// AD-393-9: `--near 0` is rejected with an actionable error because a span of
+/// zero word-tokens is only satisfied by a single-word query (trivially true) or
+/// an exact-adjacent match with no gap — both cases are better expressed as
+/// `--phrase` (exact adjacent) or a bare term search.  Zero is structurally
+/// allowed by the `u32` type but semantically meaningless for proximity search,
+/// so we reject it early with a clear message rather than silently producing
+/// unexpected results.
 fn parse_near_value(raw: &str) -> anyhow::Result<u32> {
-    raw.parse::<u32>()
-        .map_err(|_| anyhow::anyhow!("--near value must be a non-negative integer, got {raw:?}"))
+    let n = raw
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("--near value must be a positive integer, got {raw:?}"))?;
+    if n == 0 {
+        anyhow::bail!(
+            "--near span must be > 0 for multiple words; \
+             use --phrase for exact adjacent matching"
+        );
+    }
+    Ok(n)
 }
 
 /// Parse a temporal flag arm (`--hot`, `--cold`, `--risky`, `--blast-radius`).

@@ -8,8 +8,8 @@ use std::fs;
 use tempfile::tempdir;
 
 use super::{
-    SnippetOutcome, extract_context_window, extract_snippet, extract_snippet_and_verify,
-    query_substring_present,
+    SnippetOutcome, VerifyMode, extract_context_window, extract_snippet,
+    extract_snippet_and_verify, query_substring_present,
 };
 
 // ============================================================================
@@ -290,7 +290,8 @@ fn test_extract_snippet_and_verify_empty_positions_file_contains_query_ad355_7()
     fs::write(root.join("src/lib.rs"), "fn foo() {}\n").unwrap();
 
     // Empty positions — simulates the short-query (AD-355-7) fallback.
-    let (outcome, verified) = extract_snippet_and_verify(&root, "src/lib.rs", &[], None, "fn");
+    let (outcome, verified) =
+        extract_snippet_and_verify(&root, "src/lib.rs", &[], None, "fn", VerifyMode::Substring);
 
     // File contains "fn" → verified must be true so the caller keeps it.
     assert!(
@@ -313,7 +314,8 @@ fn test_extract_snippet_and_verify_empty_positions_file_absent_query_ad355_7() {
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "struct Foo {}\n").unwrap();
 
-    let (_, verified) = extract_snippet_and_verify(&root, "src/lib.rs", &[], None, "fn");
+    let (_, verified) =
+        extract_snippet_and_verify(&root, "src/lib.rs", &[], None, "fn", VerifyMode::Substring);
 
     // File does NOT contain "fn" → verified must be false.
     assert!(
