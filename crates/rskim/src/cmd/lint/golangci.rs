@@ -30,6 +30,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     expected_exit_codes: &[1],
     forward_stderr: false,
     skip_net_savings_guard: false,
+    // golangci-lint exits 0 silently on a clean codebase; passthrough preserves raw output.
     synthesize_success_line: None,
     injected_format_flag: None,
 };

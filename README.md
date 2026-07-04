@@ -1,8 +1,8 @@
 # Skim: The Most Intelligent Context Optimization Engine for Coding Agents
 
-> **Code skimming. Command rewriting. Test, build, and git output compression. Codebase heatmap. Token budget cascading.** 17 languages. 14ms for 3,000 lines. Built in Rust.
+> **Code skimming. Command rewriting. Test, build, and git output compression. Codebase heatmap. Token budget cascading.** 18 languages. 14ms for 3,000 lines. Built in Rust.
 
-Other tools filter terminal noise. Skim understands your code. It parses ASTs across 17 languages, strips implementation while preserving architecture, then optimizes every other type of context your agent consumes: test output, build errors, git diffs, raw commands, and codebase heatmaps. 14ms for 3,000 lines. 48x faster on cache hits.
+Other tools filter terminal noise. Skim understands your code. It parses ASTs across 18 languages, strips implementation while preserving architecture, then optimizes every other type of context your agent consumes: test output, build errors, git diffs, raw commands, and codebase heatmaps. 14ms for 3,000 lines. 48x faster on cache hits.
 
 [![Website](https://img.shields.io/badge/Website-skim-e87040)](https://dean0x.github.io/x/skim/)
 [![CI](https://github.com/dean0x/skim/actions/workflows/ci.yml/badge.svg)](https://github.com/dean0x/skim/actions/workflows/ci.yml)
@@ -632,7 +632,7 @@ Comprehensive guides for all aspects of Skim:
 
 | Tool | Role | What It Does |
 |------|------|-------------|
-| **Skim** | Context Optimization | Code-aware AST parsing across 17 languages, command rewriting, test/build/git output compression |
+| **Skim** | Context Optimization | Code-aware AST parsing across 18 languages, command rewriting, test/build/git output compression |
 | **[DevFlow](https://github.com/dean0x/devflow)** | Quality Orchestration | 18 parallel reviewers, working memory, self-learning, composable plugin system |
 | **[Autobeat](https://github.com/dean0x/autobeat)** | Agent Orchestration | Autonomous orchestration. Eval loops, multi-agent pipelines, DAG dependencies, crash-proof persistence |
 

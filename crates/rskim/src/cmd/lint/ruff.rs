@@ -37,6 +37,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     expected_exit_codes: &[1],
     forward_stderr: false,
     skip_net_savings_guard: false,
+    // ruff check exits 0 silently on a clean run; raw output is empty and
+    // passthrough preserves it — consistent with ruff's native behaviour.
     synthesize_success_line: None,
     injected_format_flag: None,
 };

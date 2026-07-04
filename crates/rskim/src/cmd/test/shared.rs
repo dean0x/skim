@@ -66,6 +66,10 @@ where
 ///
 /// Used by [`run_test_runner`] to spawn the test process. Each field controls
 /// a specific aspect of how the command is launched.
+///
+/// Note: this struct deliberately omits a `synthesize_success_line` field.
+/// `go test` and `dotnet test` always emit structured output on success (JSON
+/// counters / TRX summary), so there is no blank-output-on-success gap to fill.
 pub(super) struct TestRunnerConfig<'a> {
     /// The binary name to invoke (e.g. `"vitest"`, `"swift"`, `"dotnet"`).
     pub program: &'a str,

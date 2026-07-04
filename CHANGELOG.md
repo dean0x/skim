@@ -64,6 +64,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stale and `skim init` will prompt to reinstall. A version-mismatch helper warns when
   the running binary differs from the pinned binary SHA.
 
+- **Manually repointing a pinned hook script's binary path triggers an integrity warning**
+  — This is expected behaviour. The hook-script integrity check (`hook_is_current()`)
+  verifies the embedded `SKIM_HOOK_BINARY` path against the running binary; editing the
+  path by hand (or symlinking to a different skim build) is treated as "tampered" and
+  `skim init` prompts to reinstall. Use `skim init --force` to regenerate a clean script
+  pointed at the current install location.
+
+- **`--version` now prints `x.y.z (<shortsha>)`** — The version output includes the short
+  git SHA of the build commit (compiled in via `build.rs`). This makes it straightforward
+  to identify which exact commit a running binary was built from, which is useful when
+  debugging hook-version mismatches reported by `hook_is_current()`.
+
 - **Markdown headings appear in reverse order in structure/signatures output** — The
   `extract_markdown_headers_with_spans` function collected headings via a depth-first
   visit stack (LIFO) which emitted sibling headings in reverse source order; a document
