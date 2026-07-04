@@ -290,25 +290,17 @@ fn scan_working_tree(
                 // AD-395-5: if the file is a persisted skip with unchanged
                 // mtime+size, treat it as neither added nor changed (loop-killer).
                 // OD-395-5: None/None hint → match by path presence alone.
-                match skip_index.get_key_value(key.as_str()) {
-                    Some((_, &(s_mtime, s_size))) => {
+                match skip_index.get(key.as_str()) {
+                    Some(&(s_mtime, s_size)) => {
                         // Path is present in the skip-set.
-                        let mtime_unchanged = match s_mtime {
-                            Some(stored) => entry.mtime == Some(stored),
-                            // None-hint → unchanged per OD-395-5.
-                            None => true,
-                        };
-                        let size_unchanged = match s_size {
-                            Some(stored) => entry.size == Some(stored),
-                            // None-hint → unchanged per OD-395-5.
-                            None => true,
-                        };
-                        if mtime_unchanged && size_unchanged {
-                            // Unchanged skip → neither added nor changed.
-                            // The loop is killed here (AD-395-5).
-                        } else {
-                            // Skip metadata changed → treat as changed so this
-                            // formerly-skipped file gets one rebuild.
+                        // OD-395-5: None-hint → treat as unchanged (loop killed even without mtime/size).
+                        let mtime_unchanged =
+                            s_mtime.map_or(true, |stored| entry.mtime == Some(stored));
+                        let size_unchanged =
+                            s_size.map_or(true, |stored| entry.size == Some(stored));
+                        // AD-395-5: unchanged skip → neither added nor changed (loop-killer).
+                        // Changed skip → one rebuild so the file isn't frozen in skip state.
+                        if !mtime_unchanged || !size_unchanged {
                             changed += 1;
                         }
                     }

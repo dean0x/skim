@@ -1300,7 +1300,6 @@ fn print_help() {
 }
 
 // ============================================================================
-// ============================================================================
 // Shared JSON stats builder
 // ============================================================================
 
@@ -1324,7 +1323,7 @@ pub(super) fn build_stats_json(
     let reader = rskim_search::NgramIndexReader::open(cache_dir)?;
     let stats = reader.stats();
     let total_on_disk = total_on_disk_bytes(cache_dir);
-    let temporal_db_bytes_val = artifact_len(cache_dir, "temporal.db");
+    let temporal_db_bytes = artifact_len(cache_dir, "temporal.db");
     let (staleness_status, loaded_manifest) = staleness::check_staleness(cache_dir, root);
     let git_head = loaded_manifest
         .as_ref()
@@ -1360,7 +1359,7 @@ pub(super) fn build_stats_json(
         "total_ngrams": stats.total_ngrams,
         "index_size_bytes": stats.index_size_bytes,
         "total_on_disk_bytes": total_on_disk,
-        "temporal_db_bytes": temporal_db_bytes_val,
+        "temporal_db_bytes": temporal_db_bytes,
         "last_updated": stats.last_updated,
         "git_head": git_head,
         "staleness": staleness_status.to_string(),
