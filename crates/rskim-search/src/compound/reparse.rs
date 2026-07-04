@@ -395,6 +395,16 @@ pub fn pattern_occurs_in_file(
             ancestor_table.bigrams.len(),
             ancestor_table.trigrams.len()
         );
+        // Production guard (reliability rule — assert-invariants-in-production):
+        // `debug_assert!` above is elided in release builds, so explicitly gate
+        // the vacuous-true hazard here. If bigrams is somehow empty (e.g. a
+        // future synthetic-trigram-only pattern routed here via
+        // `contains_synthetic_id`), `.all()` over an empty iterator returns
+        // `true` and every pooled candidate would silently "pass" the gate.
+        // Returning false is the safe failure mode — no verified match.
+        if ancestor_table.bigrams.is_empty() {
+            return false;
+        }
         let Ok(result) = linearize_source(source, lang) else {
             return false;
         };

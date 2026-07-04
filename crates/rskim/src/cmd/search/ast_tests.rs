@@ -3843,9 +3843,13 @@ fn make_project_with_394_synthetic_patterns() -> TempDir {
     .unwrap();
 
     // empty-catch: EMPTY_BODY -> catch_clause, zero counted children in catch body.
+    // Uses a unique function name (`empty_catch_fn`) in the try body so AC2 can
+    // select this file with a term that does NOT appear in not_empty_catch.ts
+    // (which calls `f()` instead). Line numbers are unchanged: the `} catch (e) {`
+    // clause remains on line 4 (EMPTY_CATCH_LINE = 4).
     fs::write(
         root.join("src/empty_catch.ts"),
-        "\ntry {\n    f();\n} catch (e) {\n}\n",
+        "\ntry {\n    empty_catch_fn();\n} catch (e) {\n}\n",
     )
     .unwrap();
 
@@ -3915,15 +3919,26 @@ fn run_ast_standalone_all_five_synthetic_patterns_positive_ac1_394() {
     // accidentally match the negative twin — e.g. "god_fn.rs" is a substring
     // of "not_god_fn.rs", but "src/god_fn.rs" is NOT a substring of
     // "src/not_god_fn.rs" (reviewer finding: latent weak assertion).
-    let cases: [(&str, &str); 5] = [
-        ("god-function", "src/god_fn.rs"),
-        ("deep-nesting", "src/deep.rs"),
-        ("empty-function", "src/empty_fn.rs"),
-        ("empty-catch", "src/empty_catch.ts"),
-        ("excessive-params", "src/many_params.rs"),
+    //
+    // (exhibiting_file, negative_twin) — plan §8B requires BOTH are asserted
+    // (positive: exhibiting IS present; negative: twin is ABSENT).
+    let cases: [(&str, &str, &str); 5] = [
+        ("god-function", "src/god_fn.rs", "src/not_god_fn.rs"),
+        ("deep-nesting", "src/deep.rs", "src/not_deep.rs"),
+        ("empty-function", "src/empty_fn.rs", "src/not_empty_fn.rs"),
+        (
+            "empty-catch",
+            "src/empty_catch.ts",
+            "src/not_empty_catch.ts",
+        ),
+        (
+            "excessive-params",
+            "src/many_params.rs",
+            "src/not_many_params.rs",
+        ),
     ];
 
-    for (pattern, exhibiting_file) in cases {
+    for (pattern, exhibiting_file, negative_twin) in cases {
         let mut out: Vec<u8> = Vec::new();
         let result = super::run_ast_standalone(
             pattern,
@@ -3951,6 +3966,14 @@ fn run_ast_standalone_all_five_synthetic_patterns_positive_ac1_394() {
             "AC1 (#394): --ast {pattern} must return a NON-EMPTY result set \
              containing {exhibiting_file}; got:\n{text}"
         );
+        // plan §8B: negative twin must be ABSENT (the AND-intersect candidate set
+        // excludes it because it lacks the marker bigram, but this end-to-end
+        // assertion makes the full standalone pipeline coverage explicit).
+        assert!(
+            !text.contains(negative_twin),
+            "AC1 (#394): --ast {pattern} must NOT return the negative twin \
+             {negative_twin} (it lacks the synthetic marker bigram); got:\n{text}"
+        );
     }
 }
 
@@ -3974,12 +3997,15 @@ fn run_ast_standalone_matches_compound_for_all_five_synthetic_patterns_ac2_394()
     // their negative twins (e.g. "god_fn.rs" ⊆ "not_god_fn.rs"), so a result
     // that accidentally contained only the twin would pass a bare-filename
     // check. "src/god_fn.rs" is NOT a substring of "src/not_god_fn.rs".
-    // (pattern, exhibiting file with src/ prefix, unique text term selecting that file)
+    // (pattern, exhibiting file with src/ prefix, text term unique to that fixture file)
+    // Note: "catch" was previously used for empty-catch but also appears in
+    // not_empty_catch.ts. The fixture now uses `empty_catch_fn()` in the try
+    // body, making "empty_catch_fn" genuinely unique to src/empty_catch.ts.
     let cases: [(&str, &str, &str); 5] = [
         ("god-function", "src/god_fn.rs", "big"),
         ("deep-nesting", "src/deep.rs", "do_work"),
         ("empty-function", "src/empty_fn.rs", "todo_later"),
-        ("empty-catch", "src/empty_catch.ts", "catch"),
+        ("empty-catch", "src/empty_catch.ts", "empty_catch_fn"),
         ("excessive-params", "src/many_params.rs", "many"),
     ];
 
@@ -4240,19 +4266,44 @@ fn run_ast_standalone_json_line_matches_ground_truth_for_all_five_ac10_394() {
     // Use full relative paths (src/<file>) — bare filenames are substrings of
     // their negative twins and would not discriminate if the twin appeared in
     // the result set. "src/god_fn.rs" is NOT a substring of "src/not_god_fn.rs".
-    let cases: [(&str, &str, u32); 5] = [
-        ("god-function", "src/god_fn.rs", GOD_FUNCTION_LINE),
-        ("deep-nesting", "src/deep.rs", DEEP_NESTING_LINE),
-        ("empty-function", "src/empty_fn.rs", EMPTY_FUNCTION_LINE),
-        ("empty-catch", "src/empty_catch.ts", EMPTY_CATCH_LINE),
+    //
+    // (exhibiting_file, negative_twin, expected_line) — plan §8B: assert
+    // exhibiting IS present AND negative twin IS ABSENT (end-to-end pipeline
+    // coverage of the full standalone path dropping a non-match).
+    let cases: [(&str, &str, &str, u32); 5] = [
+        (
+            "god-function",
+            "src/god_fn.rs",
+            "src/not_god_fn.rs",
+            GOD_FUNCTION_LINE,
+        ),
+        (
+            "deep-nesting",
+            "src/deep.rs",
+            "src/not_deep.rs",
+            DEEP_NESTING_LINE,
+        ),
+        (
+            "empty-function",
+            "src/empty_fn.rs",
+            "src/not_empty_fn.rs",
+            EMPTY_FUNCTION_LINE,
+        ),
+        (
+            "empty-catch",
+            "src/empty_catch.ts",
+            "src/not_empty_catch.ts",
+            EMPTY_CATCH_LINE,
+        ),
         (
             "excessive-params",
             "src/many_params.rs",
+            "src/not_many_params.rs",
             EXCESSIVE_PARAMS_LINE,
         ),
     ];
 
-    for (pattern, exhibiting_file, expected_line) in cases {
+    for (pattern, exhibiting_file, negative_twin, expected_line) in cases {
         let mut out: Vec<u8> = Vec::new();
         super::run_ast_standalone(
             pattern,
@@ -4268,9 +4319,20 @@ fn run_ast_standalone_json_line_matches_ground_truth_for_all_five_ac10_394() {
         )
         .unwrap();
 
-        let v: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
+        let json_text = String::from_utf8(out).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json_text)
             .unwrap_or_else(|e| panic!("AC10 (#394): --ast {pattern} --json must parse: {e}"));
         let results = v["results"].as_array().unwrap();
+
+        // Negative twin must not appear (plan §8B).
+        assert!(
+            results.iter().all(|r| !r["path"]
+                .as_str()
+                .is_some_and(|p| p.contains(negative_twin))),
+            "AC10 (#394): --ast {pattern} --json must NOT contain the negative twin \
+             {negative_twin}; got: {v}"
+        );
+
         // `path` is repo-relative (e.g. "src/god_fn.rs"), so match by substring
         // against the bare filename — consistent with AC1/AC2's `.contains()`.
         let entry = results
@@ -4402,14 +4464,19 @@ fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
     build_project_index(project.path(), cache.path());
 
     // Pin the format version: the fix must NOT change FORMAT_VERSION.
+    //
+    // Pinned to the literal 2 (not `AST_INDEX_FORMAT_VERSION`) so that a future
+    // version bump fails this locally-runnable test, not only the CI-only lib
+    // test `format_tests.rs::a1_format_version_is_2`. Reading version_before
+    // from the just-written index and comparing to the constant would produce a
+    // tautological `X == X` that cannot detect a bump (reviewer finding).
     let version_before = rskim_search::AstIndexReader::index_version(cache.path())
         .expect("index_version must succeed after build");
     assert_eq!(
-        version_before,
-        rskim_search::AST_INDEX_FORMAT_VERSION,
-        "AC12 (#394): format version must equal AST_INDEX_FORMAT_VERSION ({}); \
-         the synthetic-pattern fix is read-side only and must not bump the format",
-        rskim_search::AST_INDEX_FORMAT_VERSION
+        version_before, 2u16,
+        "AC12 (#394): AST index format version must be exactly 2 (literal pin). \
+         If this fails, FORMAT_VERSION was bumped — check \
+         rskim_search::AST_INDEX_FORMAT_VERSION and update this pin deliberately"
     );
 
     // Capture the index file mtime BEFORE the queries — this is the

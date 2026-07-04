@@ -437,6 +437,23 @@ fn read_line_at(abs_path: &Path, line_1indexed: u32, max_bytes: u64) -> Option<S
 /// verify drop rate (the early-exit `synthetic_key_present` gate is essentially
 /// a membership check of what the index already indexed), so a K=5 multiplier
 /// and a 100-file floor are unnecessary overhead for them.
+///
+/// # Design note — intentionally bigrams-only (pool sizing, not routing)
+///
+/// This function inspects `resolved_bigrams()` only. It does NOT delegate to
+/// `compound::reparse::query_contains_synthetic_id` (which also checks trigrams
+/// and handles the Containment variant). This is safe because:
+///
+/// - Its sole use is pool sizing, not routing. A false 'not synthetic' causes
+///   over-provisioning (always correct); a false 'synthetic' under-provisions
+///   (still correct — the verify gate is the source of truth for correctness).
+/// - All 5 current synthetic patterns are single-bigram/zero-trigram (OD-394-2),
+///   so this predicate and `query_contains_synthetic_id` agree for every live
+///   pattern.
+///
+/// If a future synthetic-trigram pattern is added, this function conservatively
+/// classifies it as 'not synthetic', causing over-provisioning. That is the
+/// correct failure mode for a pool-sizing heuristic.
 fn ast_query_is_synthetic(query: &AstQuery) -> bool {
     match query {
         AstQuery::Pattern(p) => p.resolved_bigrams().iter().any(|bg| {
