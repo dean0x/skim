@@ -66,6 +66,98 @@ const CONFIG_TREE: ToolRunConfig<'static> = ToolRunConfig {
 static RE_LS_LONG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[dl\-][rwxsStT\-]{9}").unwrap());
 
+// ============================================================================
+// ls: multi-section support (R5)
+// ============================================================================
+
+/// True if `line` is an `ls -R` or multi-path section header (e.g. `"./dir:"`, `"/path:"`).
+///
+/// A section header:
+/// - ends with `:`
+/// - is non-empty
+/// - does NOT match the permission-line regex (so long-form entries with colon-
+///   suffixed names are not misidentified)
+/// - does NOT start with `"total "` (the disk-usage preamble)
+pub(crate) fn is_ls_section_header(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && trimmed.ends_with(':')
+        && !RE_LS_LONG.is_match(trimmed)
+        && !trimmed.starts_with("total ")
+}
+
+/// Accumulated data for one directory section in multi-dir `ls -la` output.
+struct LsSection {
+    /// Directory path label (the header line with the trailing `:` removed).
+    label: String,
+    /// Real entry lines (long-form, dotdirs excluded, capped at MAX_DISPLAY_ENTRIES).
+    entries: Vec<String>,
+    /// Total real entries before the per-section cap.
+    total_entries: usize,
+    /// Directories counted in this section.
+    dirs: usize,
+    /// Files/symlinks/other counted in this section.
+    files: usize,
+    /// True if at least one permission-regex line was seen (confirms `ls -la` format).
+    has_long_lines: bool,
+}
+
+/// Split `ls -la` stdout into per-directory sections.
+///
+/// Returns one `LsSection` per section header found.  Lines before the first
+/// header are discarded (they cannot be attributed to a directory).
+fn parse_ls_long_sections(stdout: &str) -> Vec<LsSection> {
+    let mut sections: Vec<LsSection> = Vec::new();
+
+    for line in stdout.lines().take(MAX_INPUT_LINES) {
+        if is_ls_section_header(line) {
+            // Start a new section.
+            sections.push(LsSection {
+                label: line.trim_end_matches(':').to_string(),
+                entries: Vec::new(),
+                total_entries: 0,
+                dirs: 0,
+                files: 0,
+                has_long_lines: false,
+            });
+            continue;
+        }
+
+        let Some(sec) = sections.last_mut() else {
+            continue; // line before first header — discard
+        };
+
+        if !RE_LS_LONG.is_match(line) {
+            continue; // total N, blank lines, etc.
+        }
+        sec.has_long_lines = true;
+
+        // Skip `.` and `..` dotdir entries (same logic as try_parse_ls_long_flat).
+        let name_part = line.split(" -> ").next().unwrap_or(line);
+        if matches!(
+            name_part
+                .split_whitespace()
+                .last()
+                .map(|s| s.trim_end_matches('/')),
+            Some(".") | Some("..")
+        ) {
+            continue;
+        }
+
+        sec.total_entries += 1;
+        if line.starts_with('d') {
+            sec.dirs += 1;
+        } else {
+            sec.files += 1;
+        }
+        if sec.entries.len() < MAX_DISPLAY_ENTRIES {
+            sec.entries.push(line.to_string());
+        }
+    }
+
+    sections
+}
+
 /// Matches tree summary line: `N directories, M files`
 static RE_TREE_SUMMARY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\d+) director(?:y|ies),\s*(\d+) files?").unwrap());
@@ -123,7 +215,86 @@ fn parse_ls(output: &CommandOutput) -> ParseResult<FileResult> {
     ParseResult::Passthrough(output.stdout.clone())
 }
 
-/// Tier 1: long-form `ls -la` output — detect permissions, count dirs vs files.
+/// Tier 1 dispatcher: routes to flat or sectioned parser based on output shape.
+///
+/// Multi-section output (`ls -R` / multi-path) contains `dir:` header lines;
+/// single-directory output does not.  The dispatching is a one-pass scan so
+/// the fast path (single dir, no header) adds only O(N) overhead.
+fn try_parse_ls_long(stdout: &str) -> Option<FileResult> {
+    let has_sections = stdout
+        .lines()
+        .take(MAX_INPUT_LINES)
+        .any(is_ls_section_header);
+    if has_sections {
+        try_parse_ls_long_sectioned(stdout)
+    } else {
+        try_parse_ls_long_flat(stdout)
+    }
+}
+
+/// Tier 1 (multi-section): `ls -laR` or `ls -la dir1/ dir2/` with section headers.
+///
+/// Each directory gets its own labeled section in the output.  Empty directories
+/// render as `  (empty)` rather than being silently dropped, so agents always see
+/// all directories that were listed (R5 — "never emptier than raw").
+///
+/// Per-section cap: MAX_DISPLAY_ENTRIES entries per section, with an elision
+/// marker when the cap is hit (ADR-001 — compress, never truncate).
+fn try_parse_ls_long_sectioned(stdout: &str) -> Option<FileResult> {
+    let sections = parse_ls_long_sections(stdout);
+
+    // Require at least one section with long-form lines to confirm this is `ls -la` output.
+    if sections.is_empty() || !sections.iter().any(|s| s.has_long_lines) {
+        return None;
+    }
+
+    let mut total_dirs = 0usize;
+    let mut total_files = 0usize;
+    let mut total_real = 0usize;
+    let mut shown_real = 0usize;
+    let mut all_entries: Vec<String> = Vec::new();
+
+    for sec in &sections {
+        // Section header — stored without leading space; FileResult::render adds one.
+        all_entries.push(format!("{}:", sec.label));
+
+        if sec.total_entries == 0 {
+            // Empty directory: show placeholder instead of silence.
+            all_entries.push("  (empty)".to_string());
+        } else {
+            for e in &sec.entries {
+                all_entries.push(format!("  {e}"));
+            }
+            // Elision marker for this section if cap was reached (ADR-001).
+            if let Some(elision) =
+                crate::output::elision_marker(sec.entries.len(), sec.total_entries, "entries")
+            {
+                all_entries.push(format!("  {elision}"));
+            }
+        }
+
+        total_dirs += sec.dirs;
+        total_files += sec.files;
+        total_real += sec.total_entries;
+        shown_real += sec.entries.len();
+    }
+
+    let breakdown = format!("{total_dirs} dirs, {total_files} files");
+    let footer = match crate::output::elision_marker(shown_real, total_real, "entries") {
+        Some(elision) => Some(format!("{elision} — {breakdown}")),
+        None => Some(breakdown),
+    };
+
+    Some(FileResult::new(
+        "ls".to_string(),
+        total_real,
+        shown_real,
+        all_entries,
+        footer,
+    ))
+}
+
+/// Tier 1 (flat): long-form `ls -la` output — detect permissions, count dirs vs files.
 ///
 /// Skips `.` and `..` dotdir entries so they are excluded from counts and from
 /// the display list.  `-F`/`-p` append a trailing `/` to directory names; names
@@ -136,7 +307,7 @@ fn parse_ls(output: &CommandOutput) -> ParseResult<FileResult> {
 /// Empty dirs (only `total`/`.`/`..` lines): returns a Full result with 0 entries
 /// rather than None, preventing Tier-2 from mis-tokenising the `total`/`.`/`..`
 /// lines as plain filenames.
-fn try_parse_ls_long(stdout: &str) -> Option<FileResult> {
+fn try_parse_ls_long_flat(stdout: &str) -> Option<FileResult> {
     let mut dirs = 0usize;
     let mut files = 0usize;
     let mut entries: Vec<String> = Vec::with_capacity(MAX_DISPLAY_ENTRIES);
@@ -399,6 +570,115 @@ fn count_tree_depth(line: &str) -> usize {
 mod tests {
     use super::*;
     use crate::cmd::test_utils::{load_fixture, make_output};
+
+    /// R5: Multi-dir `ls -laR` output must produce per-directory sections.
+    #[test]
+    fn test_r5_sectioned_ls_la_produces_sections() {
+        let input = "./dir1:\n\
+total 8\n\
+drwxr-xr-x  2 user group  64 Jan 01 .\n\
+drwxr-xr-x  3 user group  96 Jan 01 ..\n\
+-rw-r--r--  1 user group 100 Jan 01 file.txt\n\
+\n\
+./dir2:\n\
+total 0\n\
+drwxr-xr-x  2 user group  64 Jan 01 .\n\
+drwxr-xr-x  3 user group  96 Jan 01 ..\n";
+        let result = try_parse_ls_long(input).expect("must parse multi-dir output");
+        let rendered = format!("{result}");
+        assert!(
+            rendered.contains("./dir1:"),
+            "must contain dir1 section header: {rendered}"
+        );
+        assert!(
+            rendered.contains("./dir2:"),
+            "must contain dir2 section header: {rendered}"
+        );
+        // dir2 is empty — must not silently vanish
+        assert!(
+            rendered.contains("(empty)"),
+            "empty dir must render as '(empty)': {rendered}"
+        );
+        assert!(
+            rendered.contains("file.txt"),
+            "file.txt must appear in dir1 section: {rendered}"
+        );
+    }
+
+    /// R5: `is_ls_section_header` detects `dir:` lines correctly.
+    #[test]
+    fn test_r5_is_ls_section_header() {
+        assert!(is_ls_section_header("./dir1:"), "must detect ./dir:");
+        assert!(
+            is_ls_section_header("/path/to/dir:"),
+            "must detect absolute path:"
+        );
+        assert!(is_ls_section_header("subdir:"), "must detect simple name:");
+        // Long-form permission line must NOT be detected as header
+        assert!(
+            !is_ls_section_header("drwxr-xr-x  2 user group  64 Jan 01 ."),
+            "long-form line must not be a section header"
+        );
+        assert!(
+            !is_ls_section_header("total 8"),
+            "total line must not be a section header"
+        );
+        assert!(
+            !is_ls_section_header(""),
+            "empty line must not be a section header"
+        );
+    }
+
+    /// R5: Single-dir output routes to the flat parser (no section headers in output).
+    #[test]
+    fn test_r5_single_dir_flat_parse_unchanged() {
+        let input = "total 8\n\
+drwxr-xr-x  2 user group  64 Jan 01 .\n\
+drwxr-xr-x  3 user group  96 Jan 01 ..\n\
+-rw-r--r--  1 user group 100 Jan 01 file.txt\n";
+        let result = try_parse_ls_long(input).expect("must parse single-dir output");
+        let rendered = format!("{result}");
+        // No section headers — flat parse
+        assert!(
+            !rendered.contains("total"),
+            "total line must not appear in output: {rendered}"
+        );
+        assert!(
+            rendered.contains("file.txt"),
+            "file must appear in flat output: {rendered}"
+        );
+        // Must not show "(empty)" for a non-empty dir
+        assert!(
+            !rendered.contains("(empty)"),
+            "non-empty dir must not show (empty): {rendered}"
+        );
+    }
+
+    /// R5: Empty dir in multi-dir output must be visible as `(empty)`, not silently dropped.
+    #[test]
+    fn test_r5_all_empty_sections_visible() {
+        let input = "./dir1:\n\
+total 0\n\
+drwxr-xr-x  2 user group  64 Jan 01 .\n\
+drwxr-xr-x  3 user group  96 Jan 01 ..\n\
+\n\
+./dir2:\n\
+total 0\n\
+drwxr-xr-x  2 user group  64 Jan 01 .\n\
+drwxr-xr-x  3 user group  96 Jan 01 ..\n";
+        let result = try_parse_ls_long(input).expect("must parse all-empty multi-dir output");
+        let rendered = format!("{result}");
+        assert!(
+            rendered.contains("./dir1:"),
+            "dir1 must appear even if empty: {rendered}"
+        );
+        assert!(
+            rendered.contains("./dir2:"),
+            "dir2 must appear even if empty: {rendered}"
+        );
+        let empty_count = rendered.matches("(empty)").count();
+        assert_eq!(empty_count, 2, "both dirs must show (empty): {rendered}");
+    }
 
     #[test]
     fn test_tier1_ls_la() {
