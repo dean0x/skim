@@ -139,7 +139,7 @@ fn phrase_single_word_exact_token_boundary() {
 #[test]
 fn near_within_window_returns_some_ac6() {
     // "encode" and "varint" are 2 word tokens apart (gap=2 when counting ordinals).
-    let result = near_tokens_present("fn encode_fn some varint bytes", "encode varint", 3);
+    let result = near_tokens_present("fn encode some varint bytes", "encode varint", 3);
     assert!(
         result.is_some(),
         "AC6: 'encode'...'varint' within n=3 must return Some"
