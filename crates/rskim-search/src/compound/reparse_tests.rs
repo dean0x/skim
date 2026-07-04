@@ -742,6 +742,22 @@ fn pattern_occurs_false_for_synthetic_pattern_on_degraded_inputs_ac6_394() {
         "AC6 (#394): synthetic pattern must return false for a nonexistent \
          file, not panic"
     );
+
+    // Non-UTF8 content: the shared `std::str::from_utf8` guard at
+    // `pattern_occurs_in_file` runs BEFORE the synthetic/real branch split
+    // (both branches share the read+decode path), so non-UTF8 bytes return
+    // `false` without panicking on EITHER branch. AC6 explicitly lists this
+    // as a required fail-soft case for both branches; only the synthetic branch
+    // test is here (the real branch is covered by `pattern_occurs_false_for_*`
+    // tests). This assert ensures a future refactor that relocates the guard
+    // into only one branch cannot silently regress the other.
+    let non_utf8_path = dir.path().join("non_utf8.rs");
+    std::fs::write(&non_utf8_path, b"\xff\xfe let x = 1;\n").unwrap();
+    assert!(
+        !pattern_occurs_in_file(&non_utf8_path, &query, None),
+        "AC6 (#394): synthetic pattern must return false for a non-UTF8 file \
+         (shared UTF-8 guard must fire before either branch; must not panic)"
+    );
 }
 
 /// AC7 (#394): `contains_synthetic_id` is `false` for a containment query

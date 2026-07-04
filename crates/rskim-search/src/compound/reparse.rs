@@ -379,6 +379,22 @@ pub fn pattern_occurs_in_file(
         // AD-374-5 size/language guards are inherited from the shared guards above;
         // linearize_source's own internal guards degrade to an empty result (never
         // fire redundantly here).
+        //
+        // AD-394-1 load-bearing invariant: all 5 current synthetic patterns are
+        // single-bigram / zero-trigram (see plan §2 item 3 and Auto-Resolved OD-394-2).
+        // `contains_synthetic_id` checks BOTH bigrams and trigrams, so a future
+        // synthetic-trigram-only pattern would route here while the `bigrams.iter().all()`
+        // check below would miss the trigrams (silently vacuously-true if bigrams is
+        // empty). This debug_assert fires loudly in that case rather than silently
+        // passing every candidate — assert-invariants-in-production (reliability rule).
+        debug_assert!(
+            ancestor_table.trigrams.is_empty() && !ancestor_table.bigrams.is_empty(),
+            "synthetic verify branch expects zero trigrams and at least one bigram; \
+             got {} bigrams, {} trigrams — a future synthetic-trigram pattern \
+             needs explicit trigram verification here",
+            ancestor_table.bigrams.len(),
+            ancestor_table.trigrams.len()
+        );
         let Ok(result) = linearize_source(source, lang) else {
             return false;
         };

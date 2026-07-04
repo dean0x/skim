@@ -1007,3 +1007,79 @@ fn weight_set_once_count_accumulates() {
         "count must equal number of occurrences (accumulates independently of weight)"
     );
 }
+
+// ── B_S1: synthetic_key_present parity with extract_ast_ngrams_with_metrics ──
+//
+// `synthetic_key_present` (AC11 / #419) is a hand-optimized early-exit variant
+// of the `run_extraction` traversal loop. This test pins the equivalence:
+// for any synthetic bigram key, `synthetic_key_present` must agree with whether
+// `extract_ast_ngrams_with_metrics` emits that key in its bigrams set.
+//
+// This is the analogue of `metrics_path_real_ngrams_match_weights_path` (B_M1)
+// for the third traversal path — without it a future reorder in `run_extraction`
+// not mirrored in `synthetic_key_present` would pass CI while silently breaking
+// the ADR-006 single-source-of-truth guarantee.
+//
+// Covers two scenarios:
+// - PRESENT: DEEP_NODE → bucket_label(0) is emitted by a depth-4 node stream
+//   and `synthetic_key_present` must return `true`.
+// - ABSENT: DEEP_NODE → bucket_label(1) requires depth >= 6, so a depth-4
+//   stream must yield `false` from both paths.
+
+#[test]
+fn synthetic_key_present_agrees_with_extract_ast_ngrams_with_metrics_bs1() {
+    use crate::ast_index::structural::{DEEP_NODE, bucket_label};
+
+    // A node stream that exercises depth 4 (DEPTH_EDGES[0] = 4) but not depth 6.
+    // Kind IDs are well below BUCKET_LABEL_BASE — real vocab range.
+    let nodes = [
+        node(10, 0), // root
+        node(20, 1), // depth 1
+        node(30, 2), // depth 2
+        node(40, 3), // depth 3
+        node(50, 4), // depth 4 → triggers DEEP_NODE → bucket_label(0)
+    ];
+
+    let (emitted, _metrics) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
+
+    // Collect synthetic bigram keys from the full extraction path.
+    let emitted_synthetic_keys: std::collections::HashSet<u32> = emitted
+        .bigrams
+        .iter()
+        .filter(|e| {
+            let (p, c) = e.ngram.decode();
+            is_synthetic_id(p) || is_synthetic_id(c)
+        })
+        .map(|e| e.ngram.key())
+        .collect();
+
+    // ── PRESENT case ─────────────────────────────────────────────────────────
+    // bucket_label(0) corresponds to DEPTH_EDGES[0] = 4; must be in emitted set.
+    let present_target = AstBigram::encode(DEEP_NODE, bucket_label(0));
+
+    assert!(
+        emitted_synthetic_keys.contains(&present_target.key()),
+        "extract_ast_ngrams_with_metrics must emit DEEP_NODE→bucket_label(0) \
+         for a depth-4 node stream (parity guard precondition)"
+    );
+    assert!(
+        super::synthetic_key_present(&nodes, Language::Rust, present_target),
+        "synthetic_key_present must return true for DEEP_NODE→bucket_label(0) \
+         on a depth-4 stream — parity with extract_ast_ngrams_with_metrics (B_S1)"
+    );
+
+    // ── ABSENT case ───────────────────────────────────────────────────────────
+    // bucket_label(1) corresponds to DEPTH_EDGES[1] = 6; NOT reached by depth 4.
+    let absent_target = AstBigram::encode(DEEP_NODE, bucket_label(1));
+
+    assert!(
+        !emitted_synthetic_keys.contains(&absent_target.key()),
+        "extract_ast_ngrams_with_metrics must NOT emit DEEP_NODE→bucket_label(1) \
+         for a depth-4 stream (requires depth >= 6; parity guard precondition)"
+    );
+    assert!(
+        !super::synthetic_key_present(&nodes, Language::Rust, absent_target),
+        "synthetic_key_present must return false for DEEP_NODE→bucket_label(1) \
+         on a depth-4 stream — parity with extract_ast_ngrams_with_metrics (B_S1)"
+    );
+}

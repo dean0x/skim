@@ -3911,12 +3911,16 @@ fn run_ast_standalone_all_five_synthetic_patterns_positive_ac1_394() {
     let manifest =
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
 
+    // Use the full relative paths (src/<file>) so the assertion cannot
+    // accidentally match the negative twin — e.g. "god_fn.rs" is a substring
+    // of "not_god_fn.rs", but "src/god_fn.rs" is NOT a substring of
+    // "src/not_god_fn.rs" (reviewer finding: latent weak assertion).
     let cases: [(&str, &str); 5] = [
-        ("god-function", "god_fn.rs"),
-        ("deep-nesting", "deep.rs"),
-        ("empty-function", "empty_fn.rs"),
-        ("empty-catch", "empty_catch.ts"),
-        ("excessive-params", "many_params.rs"),
+        ("god-function", "src/god_fn.rs"),
+        ("deep-nesting", "src/deep.rs"),
+        ("empty-function", "src/empty_fn.rs"),
+        ("empty-catch", "src/empty_catch.ts"),
+        ("excessive-params", "src/many_params.rs"),
     ];
 
     for (pattern, exhibiting_file) in cases {
@@ -3966,13 +3970,17 @@ fn run_ast_standalone_matches_compound_for_all_five_synthetic_patterns_ac2_394()
     let manifest =
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
 
-    // (pattern, exhibiting file, unique text term selecting that file)
+    // Use full relative paths (src/<file>) — bare filenames are substrings of
+    // their negative twins (e.g. "god_fn.rs" ⊆ "not_god_fn.rs"), so a result
+    // that accidentally contained only the twin would pass a bare-filename
+    // check. "src/god_fn.rs" is NOT a substring of "src/not_god_fn.rs".
+    // (pattern, exhibiting file with src/ prefix, unique text term selecting that file)
     let cases: [(&str, &str, &str); 5] = [
-        ("god-function", "god_fn.rs", "big"),
-        ("deep-nesting", "deep.rs", "do_work"),
-        ("empty-function", "empty_fn.rs", "todo_later"),
-        ("empty-catch", "empty_catch.ts", "catch"),
-        ("excessive-params", "many_params.rs", "many"),
+        ("god-function", "src/god_fn.rs", "big"),
+        ("deep-nesting", "src/deep.rs", "do_work"),
+        ("empty-function", "src/empty_fn.rs", "todo_later"),
+        ("empty-catch", "src/empty_catch.ts", "catch"),
+        ("excessive-params", "src/many_params.rs", "many"),
     ];
 
     for (pattern, exhibiting_file, term) in cases {
@@ -4044,6 +4052,30 @@ fn pattern_occurs_in_file_false_for_all_five_synthetic_negative_twins_ac3_394() 
         ("empty-catch", "src/not_empty_catch.ts"),
         ("excessive-params", "src/not_many_params.rs"),
     ];
+
+    // AC3 requires the not_deep.rs twin to be empirically verified to have
+    // CST max_depth < 4 via linearize_source — NOT by counting braces (depth
+    // is 0-indexed CST depth and even simple code can reach depth 4). Plan §8A
+    // explicitly states the Coder must confirm this in-test, not in a comment.
+    {
+        let not_deep_path = project.path().join("src/not_deep.rs");
+        let not_deep_src = fs::read_to_string(&not_deep_path).unwrap();
+        let not_deep_result =
+            rskim_search::linearize_source(&not_deep_src, rskim_core::Language::Rust)
+                .expect("linearize_source must succeed on not_deep.rs");
+        let max_depth = not_deep_result
+            .nodes
+            .iter()
+            .map(|n| n.depth)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_depth < 4,
+            "AC3 (#394): not_deep.rs ('struct S;') must have CST max_depth < 4 \
+             (0-indexed); got {max_depth} — depth is 0-indexed and non-obvious, \
+             hence this in-test empirical check per plan §8A"
+        );
+    }
 
     for (pattern, rel_path) in cases {
         let query = rskim_search::parse_ast_query(pattern).unwrap();
@@ -4205,12 +4237,19 @@ fn run_ast_standalone_json_line_matches_ground_truth_for_all_five_ac10_394() {
     let manifest =
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
 
+    // Use full relative paths (src/<file>) — bare filenames are substrings of
+    // their negative twins and would not discriminate if the twin appeared in
+    // the result set. "src/god_fn.rs" is NOT a substring of "src/not_god_fn.rs".
     let cases: [(&str, &str, u32); 5] = [
-        ("god-function", "god_fn.rs", GOD_FUNCTION_LINE),
-        ("deep-nesting", "deep.rs", DEEP_NESTING_LINE),
-        ("empty-function", "empty_fn.rs", EMPTY_FUNCTION_LINE),
-        ("empty-catch", "empty_catch.ts", EMPTY_CATCH_LINE),
-        ("excessive-params", "many_params.rs", EXCESSIVE_PARAMS_LINE),
+        ("god-function", "src/god_fn.rs", GOD_FUNCTION_LINE),
+        ("deep-nesting", "src/deep.rs", DEEP_NESTING_LINE),
+        ("empty-function", "src/empty_fn.rs", EMPTY_FUNCTION_LINE),
+        ("empty-catch", "src/empty_catch.ts", EMPTY_CATCH_LINE),
+        (
+            "excessive-params",
+            "src/many_params.rs",
+            EXCESSIVE_PARAMS_LINE,
+        ),
     ];
 
     for (pattern, exhibiting_file, expected_line) in cases {
@@ -4346,9 +4385,14 @@ fn recover_line_matches_ground_truth_for_all_five_synthetic_patterns_ac13_394() 
     );
 }
 
-/// AC12 (#394): synthetic-pattern queries are query-time only — the AST
-/// on-disk FORMAT_VERSION does not change across consecutive queries, and no
-/// self-heal/rebuild fires on the second query.
+/// AC12 (#394): synthetic-pattern queries are query-time only — the AST index
+/// file is not rewritten across consecutive queries, and the on-disk
+/// FORMAT_VERSION remains at its initial value (2).
+///
+/// The no-rebuild assertion uses `ast_index.skidx` mtime, NOT version equality:
+/// a staleness-triggered rebuild re-writes the index at the SAME FORMAT_VERSION
+/// (2), so `version_before == version_after` would be true whether or not a
+/// rebuild fired — the mtime is the discriminating observable (reviewer finding).
 #[test]
 fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
     use super::super::manifest::FileManifest;
@@ -4357,13 +4401,31 @@ fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
     let cache = tempfile::tempdir().unwrap();
     build_project_index(project.path(), cache.path());
 
+    // Pin the format version: the fix must NOT change FORMAT_VERSION.
     let version_before = rskim_search::AstIndexReader::index_version(cache.path())
         .expect("index_version must succeed after build");
+    assert_eq!(
+        version_before,
+        rskim_search::AST_INDEX_FORMAT_VERSION,
+        "AC12 (#394): format version must equal AST_INDEX_FORMAT_VERSION ({}); \
+         the synthetic-pattern fix is read-side only and must not bump the format",
+        rskim_search::AST_INDEX_FORMAT_VERSION
+    );
+
+    // Capture the index file mtime BEFORE the queries — this is the
+    // discriminating observable for "no rebuild fired" (version equality alone
+    // cannot distinguish a rebuild from a no-op because rebuilds write the same
+    // FORMAT_VERSION=2).
+    let idx_path = cache.path().join("ast_index.skidx");
+    let mtime_before = std::fs::metadata(&idx_path)
+        .expect("ast_index.skidx must exist after build")
+        .modified()
+        .expect("mtime must be available for no-rebuild assertion");
 
     let manifest =
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
 
-    // Query the SAME synthetic pattern twice.
+    // Query the SAME synthetic pattern twice — no staleness rebuild should fire.
     for _ in 0..2 {
         let mut out: Vec<u8> = Vec::new();
         super::run_ast_standalone(
@@ -4381,19 +4443,16 @@ fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
         .unwrap();
     }
 
-    let version_after = rskim_search::AstIndexReader::index_version(cache.path())
-        .expect("index_version must succeed after synthetic gate queries");
-
+    // Assert the index file was NOT rewritten (mtime unchanged = no rebuild).
+    let mtime_after = std::fs::metadata(&idx_path)
+        .expect("ast_index.skidx must exist after synthetic queries")
+        .modified()
+        .expect("mtime must be available after synthetic queries");
     assert_eq!(
-        version_before, version_after,
-        "AC12 (#394): FORMAT_VERSION must not change across synthetic-pattern \
-         queries (read-side / query-time only fix, no persisted format touch)"
-    );
-    assert_eq!(
-        version_before,
-        rskim_search::AST_INDEX_FORMAT_VERSION,
-        "AC12 (#394): format version must equal AST_INDEX_FORMAT_VERSION ({})",
-        rskim_search::AST_INDEX_FORMAT_VERSION
+        mtime_before, mtime_after,
+        "AC12 (#394): ast_index.skidx mtime must not change across synthetic-pattern \
+         queries — a changed mtime means a staleness rebuild fired, which must not \
+         happen for a read-side / query-time-only fix"
     );
 }
 
@@ -4402,7 +4461,7 @@ fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
 /// - All 5 synthetic-marker patterns (`god-function`, `deep-nesting`,
 ///   `empty-function`, `empty-catch`, `excessive-params`) → `true`.
 /// - All non-synthetic named patterns (`try-catch`, `rust-nested-loop`,
-///   `god-class`) → `false`.
+///   `nested-loop`) → `false`.
 /// - `AstQuery::Containment` (which never carries a synthetic ID — rejected at
 ///   parse time) → `false`.
 ///
@@ -4428,7 +4487,7 @@ fn ast_query_is_synthetic_classifies_correctly_ac11_394() {
     }
 
     // Real-node patterns — must return false.
-    for pattern in ["try-catch", "rust-nested-loop", "god-class"] {
+    for pattern in ["try-catch", "rust-nested-loop", "nested-loop"] {
         let query = rskim_search::parse_ast_query(pattern)
             .unwrap_or_else(|e| panic!("AC11 (#394): {pattern} must parse: {e}"));
         assert!(

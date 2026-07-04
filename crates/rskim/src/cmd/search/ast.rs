@@ -425,8 +425,8 @@ fn read_line_at(abs_path: &Path, line_1indexed: u32, max_bytes: u64) -> Option<S
 // Pattern metadata lookup
 // ============================================================================
 
-/// AC11 / AD-374-3 (#419): returns `true` when every resolved bigram in `query`
-/// is a synthetic-marker pattern (at least one component ID >= `BUCKET_LABEL_BASE`).
+/// AC11 / AD-374-3 (#419): returns `true` when any (at least one) resolved bigram
+/// in `query` has a synthetic-marker component ID (`>= BUCKET_LABEL_BASE`).
 ///
 /// Only [`AstQuery::Pattern`] with synthetic-marker resolved bigrams reaches
 /// this path — [`AstQuery::Containment`] and [`AstQuery::SingleNode`] do not
