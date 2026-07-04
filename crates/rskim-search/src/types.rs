@@ -692,7 +692,12 @@ pub fn query_substring_present(content: &str, query: &str) -> bool {
 /// Returns an empty `Vec` for empty or whitespace-only input.
 fn collect_word_spans(s: &str) -> Vec<(usize, usize)> {
     let bytes = s.as_bytes();
-    let mut spans = Vec::new();
+    // Pre-size with a fraction of the byte length to avoid growth-from-zero on the
+    // hot verify path (AC15: up to MAX_VERIFY_SCAN_BYTES content per candidate).
+    // Mirrors the `word_token_indices` indexer which uses `with_capacity(bytes.len())`.
+    // A fraction of 8 assumes ~8-byte average token+separator width (reliability rule:
+    // prefer pre-sized collections).
+    let mut spans = Vec::with_capacity(bytes.len() / 8 + 1);
     let mut i = 0usize;
     while i < bytes.len() {
         if crate::lexical::is_word_byte(bytes[i]) {
@@ -773,7 +778,15 @@ pub fn phrase_tokens_present(content: &str, query: &str) -> Option<Range<usize>>
 /// span `(max − min) ≤ n`, matching `near_match`'s span definition.
 ///
 /// Returns the anchor byte-range (leftmost to rightmost matched token) of the
-/// first minimal valid window, or `None` when no such assignment exists.
+/// first valid window (full leftmost-to-rightmost span, ≤ n tokens apart),
+/// or `None` when no such assignment exists.
+///
+/// Note: the returned span covers the full distance from the leftmost to the
+/// rightmost matched token in the window (not the minimal possible sub-span).
+/// For example, `near_tokens_present("a a b", "a b", 2)` returns the range
+/// covering the full `a a b` span (the window whose right-end qualified first),
+/// not the minimal `a b` sub-span. This is intentional — the span drives snippet
+/// re-anchoring (AD-393-6), where the wider window is more useful.
 ///
 /// # Semantics
 ///
@@ -823,19 +836,18 @@ pub fn near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<u
     // This is most impactful on the all-short --near fallback path, where
     // short_query_fallback makes every file a candidate and each is fully scanned.
     let mut totals: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    let relevant: Vec<(usize, &str)> = c_words
-        .iter()
-        .enumerate()
-        .filter_map(|(ci, &(cs, ce))| {
-            let cw = &content[cs..ce];
-            if q_counts.contains_key(cw) {
-                *totals.entry(cw).or_insert(0) += 1;
-                Some((ci, cw))
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Pre-size to c_words.len() (upper bound — at most every content word is
+    // relevant). Avoids growth-from-zero on the all-short --near fallback path
+    // where every file in the corpus is a candidate (reliability rule: prefer
+    // pre-sized collections, AC15 hot-path guard).
+    let mut relevant = Vec::with_capacity(c_words.len());
+    for (ci, &(cs, ce)) in c_words.iter().enumerate() {
+        let cw = &content[cs..ce];
+        if q_counts.contains_key(cw) {
+            *totals.entry(cw).or_insert(0) += 1;
+            relevant.push((ci, cw));
+        }
+    }
 
     // Early-out: if any query word doesn't appear enough times in content,
     // no valid assignment is possible.

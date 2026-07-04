@@ -151,6 +151,17 @@ pub(crate) fn run(
             ) {
                 eprintln!("{notice}");
             }
+            // PF-006: --lang is only honored when a text query is present (the lexical
+            // reader applies lang_filter at query time). On the standalone --ast path
+            // there is no text query, so --lang is inert — emit a notice rather than
+            // silently ignoring it. Use --ast with a text query to combine both filters.
+            if flags.lang.is_some() {
+                eprintln!(
+                    "skim search: note: --lang has no effect on standalone --ast queries \
+                     (no text term); to filter by language, add a text query: \
+                     `skim search TERM --ast PATTERN --lang LANG`."
+                );
+            }
             let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
             std::fs::create_dir_all(&cache_dir)?;
             // ADR-006: refresh BOTH indexes before opening either engine.
@@ -221,6 +232,17 @@ pub(crate) fn run(
                 flags.blast_radius.is_some(),
             ) {
                 eprintln!("{notice}");
+            }
+            // PF-006: --lang is only honored on text-query paths (lexical reader
+            // applies lang_filter at query time). Standalone temporal queries
+            // (--hot/--cold/--risky/--blast-radius with no text) have no lexical
+            // layer, so --lang is inert — emit a notice rather than silently ignoring it.
+            if flags.lang.is_some() {
+                eprintln!(
+                    "skim search: note: --lang has no effect on standalone temporal queries \
+                     (no text term); to filter by language, add a text query: \
+                     `skim search TERM --hot --lang LANG`."
+                );
             }
             run_temporal_standalone(
                 flags.limit,

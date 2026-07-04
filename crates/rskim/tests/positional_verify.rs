@@ -82,17 +82,24 @@ fn phrase_gap_not_matched() {
     );
 }
 
-/// AC3: phrase match returns a byte range with the correct start byte.
+/// AC3: phrase match returns a byte range covering the exact matched phrase.
 #[test]
 fn phrase_returns_correct_byte_range_ac3() {
-    let content = "hello world foo bar";
-    // "foo bar" starts at byte 12
+    let content = "hello world foo bar baz";
+    // "foo bar" is at bytes 12..19 in this string.
     let result = phrase_tokens_present(content, "foo bar");
     let range = result.expect("AC3: 'foo bar' must match");
+    // Validate BOTH start and end — `range.end` drives compute_line_range re-anchoring
+    // (AD-393-3/D9); pinning it prevents a regression where end points past the match.
+    // Previously only range.start was checked (the slice-to-end assertion passed
+    // incidentally because "foo bar" was the last token pair — adding trailing text
+    // would break it despite a correct range).
     assert_eq!(
-        &content[range.start..],
+        &content[range.clone()],
         "foo bar",
-        "AC3: range.start must point to the first character of the match"
+        "AC3: range must point to the exact span of 'foo bar' (start={}, end={})",
+        range.start,
+        range.end,
     );
 }
 
@@ -137,6 +144,27 @@ fn phrase_single_word_exact_token_boundary() {
     assert!(
         matched.is_some(),
         "AC5: 'fn' must match as a standalone word token"
+    );
+}
+
+/// AC14: `phrase_tokens_present` is case-sensitive byte-exact (AD-355-3).
+///
+/// A future `.to_lowercase()` normalization would make both assertions pass
+/// when they should differ — this test is the discriminating guard.
+#[test]
+fn phrase_case_sensitive_ac14() {
+    // Wrong case → no match.
+    let wrong_case = phrase_tokens_present("fn Encode varint foo", "encode varint");
+    assert!(
+        wrong_case.is_none(),
+        "AC14: 'Encode varint' must NOT match query 'encode varint' (case-sensitive)"
+    );
+
+    // Exact case → match.
+    let exact_case = phrase_tokens_present("fn encode varint foo", "encode varint");
+    assert!(
+        exact_case.is_some(),
+        "AC14: 'encode varint' must match query 'encode varint' (case-sensitive)"
     );
 }
 
@@ -235,6 +263,27 @@ fn near_trigram_false_positive_is_rejected_ac2() {
     assert!(
         result.is_none(),
         "AC2: 'encode varint' near must NOT match 'encode_length varint_writer'"
+    );
+}
+
+/// AC14: `near_tokens_present` is case-sensitive byte-exact (AD-355-3).
+///
+/// A future `.to_lowercase()` normalization would make both assertions pass
+/// when they should differ — this test is the discriminating guard.
+#[test]
+fn near_case_sensitive_ac14() {
+    // Wrong case → no match.
+    let wrong_case = near_tokens_present("fn Encode some varint foo", "encode varint", 3);
+    assert!(
+        wrong_case.is_none(),
+        "AC14: 'Encode ... varint' must NOT match query 'encode varint' (case-sensitive)"
+    );
+
+    // Exact case → match.
+    let exact_case = near_tokens_present("fn encode some varint foo", "encode varint", 3);
+    assert!(
+        exact_case.is_some(),
+        "AC14: 'encode ... varint' must match query 'encode varint' (case-sensitive)"
     );
 }
 

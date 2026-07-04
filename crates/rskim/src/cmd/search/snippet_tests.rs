@@ -345,8 +345,12 @@ fn test_query_substring_present_whitespace_only_query_returns_false() {
 /// This test directly covers the Phrase predicate dispatch path in
 /// `run_verify_predicate_with_range` and the re-anchor logic (AD-393-6).
 /// It is the unit-level complement to the CLI integration test
-/// `cli_ac15_phrase_exits_zero_with_correct_results` and covers the
-/// bounded-scan path for small files (same code path, file < MAX_SNIPPET_FILE_BYTES).
+/// `cli_ac15_phrase_exits_zero_with_correct_results`.
+///
+/// Note: this test uses files well under MAX_SNIPPET_FILE_BYTES so it exercises
+/// the NORMAL full-read branch (not the bounded-scan branch). The bounded-scan
+/// path (`file_size > MAX_SNIPPET_FILE_BYTES`) is covered separately by
+/// `extract_snippet_and_verify_large_file_bounded_scan_ac15`.
 ///
 /// PF-007: each assertion is discriminating — the pass/fail outcome depends on
 /// whether the phrase is present as exact word tokens, not merely as trigrams.
@@ -435,5 +439,88 @@ fn extract_snippet_and_verify_near_mode_verifies() {
     assert!(
         !v_far,
         "AD-393-10: words beyond n=2 positions must be verified=false with VerifyMode::Near(2)"
+    );
+}
+
+/// AD-393-10 / AC15: large-file bounded-scan path — `VerifyMode::Phrase` and
+/// `VerifyMode::Near` must return `verified=false` when the file exceeds
+/// `MAX_SNIPPET_FILE_BYTES` and the only occurrence of the phrase/words sits
+/// beyond `MAX_VERIFY_SCAN_BYTES` (the scan cap).
+///
+/// This test exercises the `file_size > MAX_SNIPPET_FILE_BYTES` branch in
+/// `extract_snippet_and_verify` (snippet.rs:285) by creating a sparse file via
+/// `seek-past-end + write` so the OS reports the full size in metadata without
+/// allocating the intermediate bytes. The "hole" reads as zero bytes, which
+/// contain no word tokens matching the query — giving a clean, fast, and
+/// discriminating negative result.
+///
+/// PF-007 discriminating observable: the test DEPENDS on the bounded scan cap —
+/// if the cap were removed and the full file were scanned, the phrase would be
+/// found and `verified` would flip to `true`, causing the assertion to fail.
+/// This is the guard that ensures the `.take(needed as u64)` cap in snippet.rs
+/// remains load-bearing.
+///
+/// Note: no assertion is made on SnippetOutcome because the large-file branch
+/// always returns `SnippetOutcome::Unavailable` (by design — snippeting a 5MB+
+/// file would allocate the entire contents).
+#[test]
+fn extract_snippet_and_verify_large_file_bounded_scan_ac15() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // MAX_SNIPPET_FILE_BYTES = 5 * 1024 * 1024 (5 MiB). We create a sparse file
+    // whose reported size is 5 MiB + 200 bytes by seeking to that offset and
+    // writing the needle. The leading 5 MiB "hole" reads as zero bytes and
+    // contains no word tokens, so the bounded scan (which only reads the first
+    // MIN(file_size, MAX_VERIFY_SCAN_BYTES) = 5 MiB bytes) will not find the phrase.
+    const FIVE_MIB: u64 = 5 * 1024 * 1024;
+    let file_path = root.join("src/large.rs");
+    {
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        // Seek PAST the 5 MiB mark so the file's reported size exceeds
+        // MAX_SNIPPET_FILE_BYTES, then write the needle only at this offset.
+        f.seek(SeekFrom::Start(FIVE_MIB + 200)).unwrap();
+        f.write_all(b"encode varint").unwrap();
+        f.flush().unwrap();
+    }
+
+    // Sanity-check: file size must exceed FIVE_MIB so the large-file branch fires.
+    let reported_size = std::fs::metadata(&file_path).unwrap().len();
+    assert!(
+        reported_size > FIVE_MIB,
+        "test setup: sparse file must report size > 5 MiB; got {reported_size}"
+    );
+
+    // Phrase mode: the needle sits beyond the scan cap → verified=false (dropped).
+    let (_, verified_phrase) = extract_snippet_and_verify(
+        &root,
+        "src/large.rs",
+        &[], // no approximate positions — large-file path ignores them
+        None,
+        "encode varint",
+        VerifyMode::Phrase,
+    );
+    assert!(
+        !verified_phrase,
+        "AC15: large file with phrase only beyond MAX_VERIFY_SCAN_BYTES must be \
+         verified=false with VerifyMode::Phrase (bounded-scan cap enforced)"
+    );
+
+    // Near mode: same file, same expectation.
+    let (_, verified_near) = extract_snippet_and_verify(
+        &root,
+        "src/large.rs",
+        &[],
+        None,
+        "encode varint",
+        VerifyMode::Near(5),
+    );
+    assert!(
+        !verified_near,
+        "AC15: large file with words only beyond MAX_VERIFY_SCAN_BYTES must be \
+         verified=false with VerifyMode::Near(5) (bounded-scan cap enforced)"
     );
 }

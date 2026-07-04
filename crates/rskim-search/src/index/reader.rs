@@ -818,16 +818,26 @@ impl NgramIndexReader {
             qtokens.iter().filter(|t| !t.trigrams.is_empty()).collect();
 
         // AD-393-8: If NO positionable words exist (all query words are <3 bytes,
-        // e.g. `--near 2 'in of'`), emit a named stderr notice and fall back to
-        // short_query_fallback (all filtered files, score-0). Results are
-        // token-exact-correct — the CLI predicate verifies them; erroring would
-        // reject a valid query. Bounded by the same short-query-fallback SLA.
+        // e.g. `--near 2 'in of'`), fall back to short_query_fallback (all filtered
+        // files, score-0). Results are token-exact-correct — the CLI predicate
+        // verifies them; erroring would reject a valid query. Bounded by the same
+        // short-query-fallback SLA.
+        //
+        // Notice is gated behind SKIM_DEBUG (the documented convention for informational
+        // per-query notices, per CLAUDE.md) so library consumers (programmatic callers,
+        // tests) are not flooded with per-call stderr output. The CLI will see the notice
+        // when SKIM_DEBUG=1; silent behaviour is correct for non-debug consumers.
+        // (AD-393-8 / OD-CHAL-1: original unconditional eprintln was a low-severity
+        // layering issue; this change preserves the notice for debug while isolating
+        // library stderr from production use.)
         if positioned.is_empty() {
-            eprintln!(
-                "skim search: note: all query words are <3 bytes (e.g., \"fn\", \"in\"); \
-                 falling back to full-file scan — O(file_count) token-exact verify fan-out; \
-                 results are token-exact-correct (bounded by short-query-fallback SLA)."
-            );
+            if std::env::var_os("SKIM_DEBUG").is_some() {
+                eprintln!(
+                    "skim search: note: all query words are <3 bytes (e.g., \"fn\", \"in\"); \
+                     falling back to full-file scan — O(file_count) token-exact verify fan-out; \
+                     results are token-exact-correct (bounded by short-query-fallback SLA)."
+                );
+            }
             return Ok(self.short_query_fallback(query, lang_filter));
         }
 
