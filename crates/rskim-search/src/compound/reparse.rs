@@ -236,17 +236,12 @@ fn recover_synthetic_line(
         AstQuery::SingleNode(_) => Vec::new(),
     };
 
-    let mut best: Option<(u32, u32)> = None;
-    for key in keys {
-        if let Some(&(line, byte)) = synthetic_lines.get(&key) {
-            best = Some(match best {
-                Some((best_line, best_byte)) if best_line <= line => (best_line, best_byte),
-                _ => (line, byte),
-            });
-        }
-    }
+    let (line, byte) = keys
+        .into_iter()
+        .filter_map(|key| synthetic_lines.get(&key).copied())
+        .min_by_key(|&(line, _)| line)?;
 
-    best.map(|(line, byte)| (line, (byte as usize)..(byte as usize + 1)))
+    Some((line, (byte as usize)..(byte as usize + 1)))
 }
 
 /// Verify that a source file's CST contains at least one node whose **real
