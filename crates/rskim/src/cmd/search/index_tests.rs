@@ -3239,3 +3239,411 @@ fn test_ac9_none_hint_skip_not_readded() {
         delta.changed
     );
 }
+
+/// AC2 (#395) — recall CLI: a 1.4 KB single-long-line `.py` file is indexed
+/// and the query returns it at `line_number == Some(1)` on BOTH the text and
+/// `--json` surfaces (rg / git-grep parity).
+///
+/// Discriminating guard (PF-007): pre-fix the file was classified as minified
+/// (single long line, `newline_count == 0` in probe) and skipped; querying for
+/// NEEDLE_LONGLINE returned zero results at exit 0.  Post-fix the two-signal
+/// gate requires `content.len() >= MINIFY_MIN_BYTES (64 KiB)` AND a single-
+/// line probe — both fail for this 1.4 KB file so it is indexed.  Reverting
+/// AD-395-1 would make `output.results` empty and fail this test.
+#[test]
+fn test_ac2_longline_recall_query_and_json_surface() {
+    use super::super::query::{execute_query, format_json_output};
+    use super::super::types::{IndexConfig, QueryConfig};
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    // 1.4 KB, single line: "A"*700 + " NEEDLE_LONGLINE " + "B"*700
+    // Pre-fix: classified as minified (one line, no newlines) → skipped → zero results.
+    // Post-fix: size gate fails (1 418 B < MINIFY_MIN_BYTES 65 536 B) → INDEXED.
+    let longline: String = "A".repeat(700) + " NEEDLE_LONGLINE " + &"B".repeat(700);
+    assert!(
+        longline.len() < 65_536,
+        "fixture must be below MINIFY_MIN_BYTES to exercise the size-gate recall fix"
+    );
+    fs::write(root.join("longline.py"), &longline).unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    build_index(&config).expect("build must succeed");
+
+    // Text surface.
+    let q = QueryConfig {
+        text: "NEEDLE_LONGLINE".to_string(),
+        limit: 5,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache.path().to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let output =
+        execute_query(&q, &TEST_ANALYTICS).expect("query for NEEDLE_LONGLINE must succeed");
+
+    // Non-empty: pre-fix this would be empty (file was wrongly skipped) —
+    // the primary discriminating guard.
+    assert!(
+        !output.results.is_empty(),
+        "AC2: 'NEEDLE_LONGLINE' query must return at least one result \
+         (pre-fix: zero — file was classified minified and skipped by the walk layer)"
+    );
+    let first = &output.results[0];
+    assert!(
+        first.path.ends_with("longline.py"),
+        "AC2: first result must be longline.py, got: {:?}",
+        first.path
+    );
+    // line_number == Some(1): the match is on the only line of the file.
+    assert_eq!(
+        first.line_number,
+        Some(1),
+        "AC2: line_number must be Some(1) — the match is on the single line; \
+         got: {:?}",
+        first.line_number
+    );
+
+    // --json surface: serialize the QueryOutput and verify line_number in the
+    // JSON envelope (AC2 requires BOTH text and --json surfaces).
+    let mut json_buf: Vec<u8> = Vec::new();
+    format_json_output(&output, &mut json_buf).expect("format_json_output must succeed");
+    let json_val: serde_json::Value =
+        serde_json::from_slice(&json_buf).expect("JSON output must parse");
+
+    let json_line = json_val["results"][0]["line_number"].as_u64();
+    assert_eq!(
+        json_line,
+        Some(1),
+        "AC2 (--json surface): results[0].line_number must be 1 in the JSON envelope; \
+         got: {:?}",
+        json_val["results"][0]["line_number"]
+    );
+}
+
+/// AC3 (#395) — mixed short+long file: both the short-line needle and the
+/// long-line needle are returned by query, each anchored at its correct line number.
+///
+/// The file is well below 64 KiB, so the two-signal size gate prevents any
+/// minified classification regardless of individual line length.  This guards
+/// against a regression where a file with SOME long lines is wrongly dropped —
+/// pre-fix the whole file was skipped and both needles returned zero results.
+///
+/// Token-selection constraint: the two tokens must have fully disjoint trigram
+/// sets so the snippet engine cannot conflate them.  We use:
+///   - `BRAVO2INDEX` (trigrams: BRA RAV AVO VO2 O2I 2IN IND NDE DEX) — line 2
+///   - `DELTA5QUERY` (trigrams: DEL ELT LTA TA5 A5Q 5QU QUE UER ERY) — line 5
+/// Zero shared trigrams → the n-gram scorer assigns each token exclusively to
+/// its own line.
+#[test]
+fn test_ac3_mixed_shortlong_recall_both_needles() {
+    use super::super::query::execute_query;
+    use super::super::types::{IndexConfig, QueryConfig};
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+
+    // mixed.py layout (tokens are trigram-disjoint; see doc comment above):
+    //   line 1: "def foo():"
+    //   line 2: "    pass  # BRAVO2INDEX"   ← short line (needle here)
+    //   line 3: "def bar():"
+    //   line 4: "    pass"
+    //   line 5: "# " + "x"*600 + "  DELTA5QUERY  " + "y"*20  ← long line (needle here)
+    //
+    // Total ≈ 700 B — well below MINIFY_MIN_BYTES (65 536 B), so the two-signal
+    // gate does NOT classify this as minified; the file is fully indexed.
+    let long_part = format!("# {}  DELTA5QUERY  {}", "x".repeat(600), "y".repeat(20));
+    let content =
+        format!("def foo():\n    pass  # BRAVO2INDEX\ndef bar():\n    pass\n{long_part}\n");
+    assert!(
+        content.len() < 65_536,
+        "fixture must be below MINIFY_MIN_BYTES so the size gate keeps it indexed"
+    );
+    fs::write(root.join("mixed.py"), &content).unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    build_index(&config).expect("build must succeed");
+
+    // Helper: run a query and return the full output.
+    let do_query = |text: &str| {
+        execute_query(
+            &QueryConfig {
+                text: text.to_string(),
+                limit: 5,
+                offset: None,
+                json: false,
+                root: root.to_path_buf(),
+                cache_dir: cache.path().to_path_buf(),
+                blast_radius_paths: None,
+                ast_scored: None,
+                composite_weights: None,
+                phrase: false,
+                near: None,
+                lang: None,
+            },
+            &TEST_ANALYTICS,
+        )
+        .unwrap_or_else(|e| panic!("query for {:?} failed: {e}", text))
+    };
+
+    // BRAVO2INDEX is on line 2 of mixed.py (short line).
+    let out_short = do_query("BRAVO2INDEX");
+    assert!(
+        !out_short.results.is_empty(),
+        "AC3: 'BRAVO2INDEX' query must return a result \
+         (pre-fix: zero — whole file was dropped because of the long line on line 5)"
+    );
+    let short_res = &out_short.results[0];
+    assert!(
+        short_res.path.ends_with("mixed.py"),
+        "AC3: BRAVO2INDEX must resolve to mixed.py, got: {:?}",
+        short_res.path
+    );
+    assert_eq!(
+        short_res.line_number,
+        Some(2),
+        "AC3: BRAVO2INDEX is on line 2 of mixed.py; got line_number={:?}",
+        short_res.line_number
+    );
+
+    // DELTA5QUERY is on line 5 of mixed.py (long line, 620+ chars).
+    let out_long = do_query("DELTA5QUERY");
+    assert!(
+        !out_long.results.is_empty(),
+        "AC3: 'DELTA5QUERY' query must return a result \
+         (pre-fix: zero — whole file was dropped because of this long line)"
+    );
+    let long_res = &out_long.results[0];
+    assert!(
+        long_res.path.ends_with("mixed.py"),
+        "AC3: DELTA5QUERY must resolve to mixed.py, got: {:?}",
+        long_res.path
+    );
+    assert_eq!(
+        long_res.line_number,
+        Some(5),
+        "AC3: DELTA5QUERY is on line 5 of mixed.py; got line_number={:?}",
+        long_res.line_number
+    );
+}
+
+/// AC4 (#395) remaining — `--stats --json` lists the bundle under `skipped`
+/// with reason `"minified"`, `skipped_by_reason.minified >= 1`, and a token
+/// drawn exclusively from the bundle returns zero query results.
+///
+/// The base AC4 assertion (IndexResult.skipped>=1 + named sample) is covered by
+/// `test_ac4_bundle_skipped_and_named_in_sample`.  This test covers the JSON
+/// output surface and the zero-results control query (completing AC4 / PF-007).
+#[test]
+fn test_ac4_stats_json_and_bundle_zero_results() {
+    use super::super::query::execute_query;
+    use super::super::types::{IndexConfig, QueryConfig};
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    // Normal indexed file.
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    // Genuine >= 64 KiB single-line bundle with a unique token (SKBNDL395) that
+    // is absent from main.rs — ensures the zero-results query is discriminating.
+    // 9 bytes * 8 000 = 72 000 B > MINIFY_MIN_BYTES; no newlines → both signals.
+    fs::write(root.join("bundle.js"), "SKBNDL395".repeat(8_000)).unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    build_index(&config).expect("build must succeed");
+
+    // (a) Bundle-only token → zero results (bundle is not indexed).
+    let out_bundle = execute_query(
+        &QueryConfig {
+            text: "SKBNDL395".to_string(),
+            limit: 5,
+            offset: None,
+            json: false,
+            root: root.to_path_buf(),
+            cache_dir: cache.path().to_path_buf(),
+            blast_radius_paths: None,
+            ast_scored: None,
+            composite_weights: None,
+            phrase: false,
+            near: None,
+            lang: None,
+        },
+        &TEST_ANALYTICS,
+    )
+    .expect("bundle-token query must succeed");
+    assert!(
+        out_bundle.results.is_empty(),
+        "AC4: a token drawn only from the bundle must return zero results \
+         (bundle.js is content-skipped, not indexed); got: {:?}",
+        out_bundle
+            .results
+            .iter()
+            .map(|r| &r.path)
+            .collect::<Vec<_>>()
+    );
+
+    // (b) --stats --json must list bundle.js under `skipped` with reason "minified"
+    //     and `skipped_by_reason.minified >= 1`.
+    let stats_json = super::super::stats_json_for_test(cache.path(), root)
+        .expect("stats_json_for_test must succeed");
+
+    let skipped_arr = stats_json["skipped"]
+        .as_array()
+        .expect("AC4: --stats JSON must have a 'skipped' array key");
+    assert!(
+        !skipped_arr.is_empty(),
+        "AC4: 'skipped' array must be non-empty (bundle.js was content-skipped)"
+    );
+    let has_minified_bundle = skipped_arr.iter().any(|entry| {
+        entry["reason"].as_str() == Some("minified")
+            && entry["path"]
+                .as_str()
+                .is_some_and(|p| p.contains("bundle.js"))
+    });
+    assert!(
+        has_minified_bundle,
+        "AC4: 'skipped' array must contain an entry with reason='minified' and path \
+         containing 'bundle.js'; got: {skipped_arr:?}"
+    );
+    let minified_count = stats_json["skipped_by_reason"]["minified"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        minified_count >= 1,
+        "AC4: skipped_by_reason.minified must be >= 1; got {minified_count}"
+    );
+}
+
+/// AC11 (#395) — additive `--stats --json` back-compat: all nine pre-existing
+/// keys survive with unchanged types; `skipped`/`skipped_by_reason` are purely
+/// additive; the envelope parses as a single JSON object (PF-007 discriminating).
+///
+/// NEGATIVE: if any pre-existing key were renamed, retyped, or removed, this
+/// test fails.  The nine-key superset assertion (not an exact-set assertion)
+/// allows future additive keys without breaking the test, while preventing
+/// removal of any existing key.
+#[test]
+fn test_ac11_stats_json_back_compat_keys() {
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    build_index(&config).expect("build must succeed");
+
+    let stats_json = super::super::stats_json_for_test(cache.path(), root)
+        .expect("stats_json_for_test must succeed");
+
+    // The nine pre-existing keys that must survive #395 unchanged (AC11).
+    // This list was fixed before #395; extending it requires deliberate confirmation here.
+    const PRE_EXISTING_KEYS: &[&str] = &[
+        "file_count",
+        "total_ngrams",
+        "index_size_bytes",
+        "total_on_disk_bytes",
+        "temporal_db_bytes",
+        "last_updated",
+        "git_head",
+        "staleness",
+        "cache_dir",
+    ];
+    for key in PRE_EXISTING_KEYS {
+        assert!(
+            stats_json.get(*key).is_some(),
+            "AC11: pre-existing key '{key}' must be present in --stats --json \
+             (back-compat regression: key was removed or renamed)"
+        );
+    }
+
+    // Type invariants for keys with stable types (PF-007 discriminating).
+    assert!(
+        stats_json["file_count"].is_number(),
+        "AC11: file_count must be a number; got: {:?}",
+        stats_json["file_count"]
+    );
+    assert!(
+        stats_json["total_ngrams"].is_number(),
+        "AC11: total_ngrams must be a number; got: {:?}",
+        stats_json["total_ngrams"]
+    );
+    assert!(
+        stats_json["index_size_bytes"].is_number(),
+        "AC11: index_size_bytes must be a number; got: {:?}",
+        stats_json["index_size_bytes"]
+    );
+    assert!(
+        stats_json["total_on_disk_bytes"].is_number(),
+        "AC11: total_on_disk_bytes must be a number; got: {:?}",
+        stats_json["total_on_disk_bytes"]
+    );
+    assert!(
+        stats_json["staleness"].is_string(),
+        "AC11: staleness must be a string; got: {:?}",
+        stats_json["staleness"]
+    );
+    assert!(
+        stats_json["cache_dir"].is_string(),
+        "AC11: cache_dir must be a string; got: {:?}",
+        stats_json["cache_dir"]
+    );
+
+    // Additive keys must be PRESENT alongside the nine pre-existing ones —
+    // not replacing them (AC11 additive invariant).
+    assert!(
+        stats_json["skipped"].is_array(),
+        "AC11: additive key 'skipped' must be an array; got: {:?}",
+        stats_json["skipped"]
+    );
+    assert!(
+        stats_json["skipped_by_reason"].is_object(),
+        "AC11: additive key 'skipped_by_reason' must be an object; got: {:?}",
+        stats_json["skipped_by_reason"]
+    );
+
+    // The envelope itself must be a single JSON object.
+    assert!(
+        stats_json.is_object(),
+        "AC11: --stats --json output must be a single JSON object; got: {:?}",
+        stats_json
+    );
+}

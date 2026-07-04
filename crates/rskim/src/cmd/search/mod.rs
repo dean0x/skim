@@ -1318,6 +1318,71 @@ fn print_help() {
 }
 
 // ============================================================================
+// Test helpers (cfg(test) only — not compiled into production builds)
+// ============================================================================
+
+/// Produce the same JSON object that `run_stats(json=true, ...)` would emit to
+/// stdout, returned as a `serde_json::Value` so tests can assert individual
+/// fields without driving the binary subprocess.
+///
+/// Accepts explicit `cache_dir` and `root` so callers bypass `resolve_root_and_cache`.
+/// The logic mirrors the JSON branch of `run_stats` exactly; any divergence is a
+/// bug in this helper.
+///
+/// Used by `index_tests.rs` for:
+/// - AC4 (#395): assert `skipped` array / `skipped_by_reason` JSON fields.
+/// - AC11 (#395): assert all nine pre-existing keys survive with unchanged types.
+#[cfg(test)]
+pub(crate) fn stats_json_for_test(
+    cache_dir: &std::path::Path,
+    root: &std::path::Path,
+) -> anyhow::Result<serde_json::Value> {
+    let index_path = cache_dir.join("index.skidx");
+    if !index_path.exists() {
+        return Ok(serde_json::json!({ "error": "no index found" }));
+    }
+    let reader = rskim_search::NgramIndexReader::open(cache_dir)?;
+    let stats = reader.stats();
+    let total_on_disk = total_on_disk_bytes(cache_dir);
+    let temporal_db_bytes_val = artifact_len(cache_dir, "temporal.db");
+    let (staleness_status, loaded_manifest) = staleness::check_staleness(cache_dir, root);
+    let git_head = loaded_manifest
+        .as_ref()
+        .and_then(|m| m.stored_git_head().map(str::to_string));
+    let skip_entries: Vec<_> = loaded_manifest
+        .as_ref()
+        .map(|m| m.skipped().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let skipped_arr: Vec<serde_json::Value> = skip_entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "path": e.path,
+                "reason": e.reason_label(),
+            })
+        })
+        .collect();
+    let mut skipped_by_reason: std::collections::HashMap<&str, u64> =
+        std::collections::HashMap::new();
+    for e in &skip_entries {
+        *skipped_by_reason.entry(e.reason_label()).or_insert(0) += 1;
+    }
+    Ok(serde_json::json!({
+        "file_count": stats.file_count,
+        "total_ngrams": stats.total_ngrams,
+        "index_size_bytes": stats.index_size_bytes,
+        "total_on_disk_bytes": total_on_disk,
+        "temporal_db_bytes": temporal_db_bytes_val,
+        "last_updated": stats.last_updated,
+        "git_head": git_head,
+        "staleness": staleness_status.to_string(),
+        "cache_dir": cache_dir.display().to_string(),
+        "skipped": skipped_arr,
+        "skipped_by_reason": skipped_by_reason,
+    }))
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
