@@ -380,17 +380,19 @@ fn test_walk_too_large_skip_reason_contains_path_and_size() {
 
 #[test]
 fn test_walk_skips_minified_js_file() {
-    // is_minified() fires when average bytes-per-line in the first 8 KB exceeds
-    // 500.  A single-line .js file with 10 000 bytes has no newlines at all,
-    // so the average is 8192 (the full probe length) — well above the threshold.
-    // The file must NOT appear in the walk results.
+    // AD-395-1: minified_metric requires BOTH signals:
+    //   (1) content.len() >= MINIFY_MIN_BYTES (= 64 KiB)
+    //   (2) first 8 KiB probe has newline_count <= 1
+    // A single-line .js file with 70 000 bytes (> 64 KiB) satisfies both.
+    // Pre-fix used 10 000 bytes — bumped here because 10 KB fails the size
+    // gate and is now INDEXED (the ticket repro fix; R1 mitigation).
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
 
     fs::create_dir_all(root.join(".git")).unwrap();
 
-    // Write a "minified" JS file: one very long line, no newlines.
-    let content = "x".repeat(10_000);
+    // Write a genuine minified JS file: one very long line, >= 64 KiB, no newlines.
+    let content = "x".repeat(70_000);
     fs::write(root.join("bundle.js"), &content).unwrap();
 
     // Write a normal JS file alongside it to confirm the walker still works.
@@ -417,7 +419,7 @@ fn test_walk_skips_minified_js_file() {
     let has_minified = skipped.iter().any(|r| {
         matches!(
             r,
-            super::super::types::SkipReason::Minified(path)
+            super::super::types::SkipReason::Minified { path, .. }
             if path.ends_with("bundle.js")
         )
     });
@@ -709,5 +711,116 @@ fn test_normalize_rel_path_collision_two_forms_of_same_path() {
         key_b, "./foo",
         "normalize_rel_path('./foo') must be './foo' (no leading-dot strip — \
          that is temporal::normalize_blast_radius_path's domain, not this helper's)"
+    );
+}
+
+// ============================================================================
+// AC1 — minified_metric predicate + two-signal gate (#395)
+// ============================================================================
+
+/// AC1 (predicate, two-signal, AD-395-1): minified_metric returns None for the
+/// 1.4 KB ticket repro (fails size gate), Some for a >= 64 KiB single-line
+/// string (both signals), and None for a >= 64 KiB multi-line string (fails the
+/// single-line signal). Also asserts MINIFY_MIN_BYTES == 8 * MINIFY_PROBE_BYTES.
+#[test]
+fn test_minified_metric_two_signal_gate() {
+    use super::super::walk::{MINIFY_MIN_BYTES, minified_metric};
+
+    // Compile-time guard: must equal 8 × 8192 = 65_536.
+    assert_eq!(
+        MINIFY_MIN_BYTES,
+        8 * 8192,
+        "MINIFY_MIN_BYTES must equal 8 * MINIFY_PROBE_BYTES (= 65_536)"
+    );
+
+    // (a) Ticket repro: "A"*700 + " NEEDLE_LONGLINE " + "B"*700 ≈ 1.4 KB.
+    // Fails signal 1 (size gate) → None.
+    let repro: String = "A".repeat(700) + " NEEDLE_LONGLINE " + &"B".repeat(700);
+    assert!(
+        repro.len() < MINIFY_MIN_BYTES,
+        "repro must be < MINIFY_MIN_BYTES for this test to be meaningful"
+    );
+    assert!(
+        minified_metric(&repro).is_none(),
+        "1.4 KB single-line string must return None (fails size gate)"
+    );
+
+    // (b) 70 KB single-line: both signals → Some(avg > 500).
+    let big_single_line: String = "x".repeat(70_000);
+    let metric = minified_metric(&big_single_line);
+    assert!(
+        metric.is_some(),
+        "70 KB single-line string must return Some(avg)"
+    );
+    assert!(
+        metric.unwrap() > 500,
+        "avg_line_bytes must exceed 500, got {:?}",
+        metric
+    );
+
+    // (c) 65_535 bytes single-line: one byte below size gate → None.
+    let just_below: String = "x".repeat(65_535);
+    assert!(
+        minified_metric(&just_below).is_none(),
+        "65_535-byte string must return None (fails size gate by 1 byte)"
+    );
+
+    // (d) 65_537 bytes single-line: one byte above size gate → Some.
+    let just_above: String = "x".repeat(65_537);
+    assert!(
+        minified_metric(&just_above).is_some(),
+        "65_537-byte string must return Some (passes both signals)"
+    );
+
+    // (e) >= 64 KiB but multi-line probe (newline_count > 1 in first 8 KiB):
+    // a 120 KB file made of 200 lines × 600 bytes each has ~13 newlines in the
+    // first 8 KiB probe — fails the single-line signal → None (indexed).
+    let multiline: String = ("y".repeat(600) + "\n").repeat(200);
+    assert!(
+        multiline.len() >= MINIFY_MIN_BYTES,
+        "multiline fixture must be >= MINIFY_MIN_BYTES"
+    );
+    assert!(
+        minified_metric(&multiline).is_none(),
+        ">= 64 KiB multi-line string must return None (fails single-line signal — INDEXED)"
+    );
+}
+
+/// AC1 negative: a small long-line file that was previously dropped is now indexed.
+#[test]
+fn test_small_long_line_file_is_indexed() {
+    use super::super::walk::walk_and_read;
+    use std::fs;
+    use std::path::PathBuf;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+
+    // Write the ticket repro: single long line, ~1.4 KB, a Python file.
+    let content: String = "A".repeat(700) + " NEEDLE_LONGLINE " + &"B".repeat(700);
+    fs::write(root.join("longline.py"), &content).unwrap();
+
+    let root_canonical = root.canonicalize().unwrap();
+    let (files, skipped) = walk_and_read(&root_canonical, 50_000).unwrap();
+    let paths: Vec<PathBuf> = files.iter().map(|f| f.rel_path.clone()).collect();
+
+    // POSITIVE: the small long-line file must be indexed (pre-fix: was skipped).
+    assert!(
+        paths.iter().any(|p| p.ends_with("longline.py")),
+        "small 1.4 KB long-line file must be INDEXED, paths: {paths:?}"
+    );
+
+    // NEGATIVE: it must NOT appear in the skip list.
+    let was_skipped = skipped.iter().any(|r| {
+        matches!(
+            r,
+            super::super::types::SkipReason::Minified { path, .. }
+            if path.ends_with("longline.py")
+        )
+    });
+    assert!(
+        !was_skipped,
+        "small long-line file must NOT be in the minified skip list"
     );
 }

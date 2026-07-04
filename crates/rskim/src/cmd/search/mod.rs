@@ -701,6 +701,15 @@ fn run_build(
         result.duration.as_secs_f64(),
     );
 
+    // AD-395-6: emit the bounded, stable-key-sorted skip sample to stderr so
+    // previously-silent skips are observable (PF-012 determinism: sample is
+    // sorted by path string ascending, CapReached last, from build_skip_sample).
+    if !result.skip_sample.is_empty() {
+        // Show up to 10 named skip reasons; remainder surfaced as "...and N more".
+        let sample_display = index::format_skip_sample(&result.skip_sample, 10);
+        eprintln!("{sample_display}");
+    }
+
     // AD-TMP-1: --rebuild/--build must produce a COMPLETE index (lexical + AST +
     // temporal), matching user expectation that "rebuild" rebuilds everything (#357 BUG A).
     // run_build goes through build_index directly, bypassing auto_refresh_if_stale where
@@ -792,11 +801,34 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         .as_ref()
         .and_then(|m| m.stored_git_head().map(str::to_string));
 
+    // AD-395-6: load skip section from the manifest for --stats display.
+    // All pre-existing keys are unchanged; `skipped` / `skipped_by_reason`
+    // are purely additive (AC11 back-compat).
+    let skip_entries: Vec<_> = loaded_manifest
+        .as_ref()
+        .map(|m| m.skipped().collect::<Vec<_>>())
+        .unwrap_or_default();
+
     let mut out = BufWriter::new(std::io::stdout());
     if json {
         // AC6: additive `cache_dir` key; all pre-existing keys retained unchanged.
         // AD-380-4/5: additive `total_on_disk_bytes` (true footprint) and
         // `temporal_db_bytes` keys; `index_size_bytes` (lexical-only) unchanged.
+        // AD-395-6: additive `skipped` array and `skipped_by_reason` object.
+        let skipped_arr: Vec<serde_json::Value> = skip_entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "path": e.path,
+                    "reason": e.reason_label(),
+                })
+            })
+            .collect();
+        let mut skipped_by_reason: std::collections::HashMap<&str, u64> =
+            std::collections::HashMap::new();
+        for e in &skip_entries {
+            *skipped_by_reason.entry(e.reason_label()).or_insert(0) += 1;
+        }
         let extended = serde_json::json!({
             "file_count": stats.file_count,
             "total_ngrams": stats.total_ngrams,
@@ -807,6 +839,8 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
             "git_head": git_head,
             "staleness": staleness_status.to_string(),
             "cache_dir": cache_dir_display,
+            "skipped": skipped_arr,
+            "skipped_by_reason": skipped_by_reason,
         });
         writeln!(out, "{}", serde_json::to_string_pretty(&extended)?)?;
     } else {
@@ -833,6 +867,24 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         writeln!(out, "  staleness     : {staleness_status}")?;
         // AC4: resolved cache dir, in addition to the lines above.
         writeln!(out, "  cache dir     : {cache_dir_display}")?;
+        // AD-395-6: skip counts by reason (text mode).
+        if !skip_entries.is_empty() {
+            let mut by_reason: std::collections::HashMap<&str, u64> =
+                std::collections::HashMap::new();
+            for e in &skip_entries {
+                *by_reason.entry(e.reason_label()).or_insert(0) += 1;
+            }
+            writeln!(
+                out,
+                "  skipped       : {} (content-skipped files)",
+                skip_entries.len()
+            )?;
+            let mut reasons: Vec<_> = by_reason.iter().collect();
+            reasons.sort_by_key(|(k, _)| *k);
+            for (reason, count) in reasons {
+                writeln!(out, "    {reason}: {count}")?;
+            }
+        }
     }
     out.flush()?;
     Ok(ExitCode::SUCCESS)

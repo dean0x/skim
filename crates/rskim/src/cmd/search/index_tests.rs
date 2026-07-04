@@ -850,7 +850,10 @@ fn test_streaming_produces_same_result() {
     assert_eq!(result.cache_hits, 0, "cold start must have zero cache hits");
 }
 
-/// A minified JS file in the project appears in the skipped count.
+/// A minified JS file (>= 64 KiB, single line) appears in the skipped count.
+///
+/// AD-395-1: the size gate now requires content.len() >= MINIFY_MIN_BYTES (64 KiB).
+/// Bumped from 10_000 to 70_000 bytes so the fixture passes both signals (R1).
 #[test]
 fn test_streaming_skipped_includes_minified() {
     use super::super::types::IndexConfig;
@@ -861,8 +864,8 @@ fn test_streaming_skipped_includes_minified() {
     fs::create_dir_all(root.join(".git")).unwrap();
     // Normal source file.
     fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
-    // Minified JS (single long line, no newlines).
-    fs::write(root.join("bundle.js"), "x".repeat(10_000)).unwrap();
+    // Minified JS (single long line, >= 64 KiB, no newlines — both signals).
+    fs::write(root.join("bundle.js"), "x".repeat(70_000)).unwrap();
     let cache = tempfile::tempdir().unwrap();
 
     let config = IndexConfig {
@@ -2824,11 +2827,12 @@ fn test_manifest_old_version_triggers_auto_rebuild_on_next_query() {
          the FORMAT_VERSION check is not working correctly."
     );
 
-    // Static: confirm FORMAT_VERSION constant matches the #380 binary format.
+    // Static: confirm FORMAT_VERSION constant matches the current binary format.
+    // #395 bumped this from 4 → 5 (persisted skip section, AD-395-3).
     assert_eq!(
         FileManifest::FORMAT_VERSION,
-        4,
-        "manifest::FORMAT_VERSION must be 4 after #380 (binary manifest). \
+        5,
+        "manifest::FORMAT_VERSION must be 5 after #395 (persisted skip section). \
          If this fails, the constant was changed without updating this test."
     );
 }
@@ -2930,5 +2934,308 @@ fn test_ac13_parentdir_is_not_resolved() {
         super::canonical_or_normalized(Path::new("skim_381_foo/../skim_381_bar")),
         super::canonical_or_normalized(Path::new("skim_381_bar")),
         "AC13 NEGATIVE: `..` must be preserved verbatim, not resolved"
+    );
+}
+
+// ============================================================================
+// #395: long-line drop + silent skip + stale loop tests
+// ============================================================================
+
+/// AC5 — format_skip_sample truncation + deterministic stable order (PF-012).
+///
+/// cap=2 over 5 reasons → 2 rendered lines + "...and 3 more".
+/// Two invocations with shuffled input produce byte-identical output (PF-012).
+#[test]
+fn test_ac5_format_skip_sample_truncation_and_stable_order() {
+    use super::super::types::SkipReason;
+    use super::build_skip_sample;
+    use super::format_skip_sample;
+    use std::path::PathBuf;
+
+    // Build 5 distinct skip reasons with known path keys.
+    let reasons: Vec<SkipReason> = vec![
+        SkipReason::Minified {
+            path: PathBuf::from("c.js"),
+            avg_line_bytes: 800,
+        },
+        SkipReason::NonUtf8(PathBuf::from("a.bin")),
+        SkipReason::TooLarge {
+            path: PathBuf::from("b.dat"),
+            size: 6_000_000,
+        },
+        SkipReason::ReadError {
+            path: PathBuf::from("d.rs"),
+            error: "permission denied".into(),
+        },
+        SkipReason::CapReached,
+    ];
+
+    // Build sample (sort + merge step) then format with cap=2.
+    let sample = build_skip_sample(reasons.clone(), vec![]);
+    let out = format_skip_sample(&sample, 2);
+
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "cap=2 over 5 reasons must produce 2 rendered lines + 1 summary"
+    );
+    assert!(
+        lines[2].starts_with("...and 3 more"),
+        "last line must be '...and 3 more', got: {:?}",
+        lines[2]
+    );
+
+    // Stable order: sort by path string ascending, CapReached last.
+    // The first shown path must be "a.bin" (smallest key).
+    assert!(
+        lines[0].contains("a.bin"),
+        "first shown reason must have path 'a.bin' (smallest key), got: {:?}",
+        lines[0]
+    );
+
+    // Idempotency: shuffled input → byte-identical output.
+    let reasons_shuffled: Vec<SkipReason> = vec![
+        SkipReason::CapReached,
+        SkipReason::TooLarge {
+            path: PathBuf::from("b.dat"),
+            size: 6_000_000,
+        },
+        SkipReason::NonUtf8(PathBuf::from("a.bin")),
+        SkipReason::ReadError {
+            path: PathBuf::from("d.rs"),
+            error: "permission denied".into(),
+        },
+        SkipReason::Minified {
+            path: PathBuf::from("c.js"),
+            avg_line_bytes: 800,
+        },
+    ];
+    let sample2 = build_skip_sample(reasons_shuffled, vec![]);
+    let out2 = format_skip_sample(&sample2, 2);
+    assert_eq!(
+        out, out2,
+        "shuffled input must produce byte-identical output (PF-012 determinism)"
+    );
+}
+
+/// AC4 (partial) — a genuine >= 64 KiB bundle is skipped AND appears in the
+/// skip_sample with the Minified reason and a named message.
+#[test]
+fn test_ac4_bundle_skipped_and_named_in_sample() {
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    // A normal indexed file.
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    // Genuine bundle: single line, >= 64 KiB.
+    fs::write(root.join("bundle.js"), "x".repeat(70_000)).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    let result = build_index(&config).expect("build must succeed");
+
+    assert!(result.skipped >= 1, "bundle must appear in skipped count");
+    assert_eq!(result.file_count, 1, "only main.rs indexed");
+
+    // The skip_sample must contain a Minified entry for bundle.js.
+    let named = result.skip_sample.iter().any(|r| {
+        matches!(
+            r,
+            super::super::types::SkipReason::Minified { path, avg_line_bytes }
+            if path.ends_with("bundle.js") && *avg_line_bytes > 500
+        )
+    });
+    assert!(
+        named,
+        "skip_sample must contain Minified for bundle.js with avg > 500, got: {:?}",
+        result.skip_sample
+    );
+
+    // Display must contain "minified (avg line " and "bundle.js".
+    let display_str = result
+        .skip_sample
+        .iter()
+        .map(|r| r.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        display_str.contains("minified (avg line "),
+        "display must contain 'minified (avg line ', got: {display_str:?}"
+    );
+    assert!(
+        display_str.contains("bundle.js"),
+        "display must contain 'bundle.js', got: {display_str:?}"
+    );
+}
+
+/// AC7 (stale loop killed) + AC9 (None/None hint) — after building an index
+/// with a content-skipped bundle, scan_working_tree must report Current on
+/// two consecutive calls with no edits.
+#[test]
+fn test_ac7_stale_loop_killed_after_build() {
+    use super::super::manifest::FileManifest;
+    use super::super::staleness::check_staleness;
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    // Write some git HEAD so check_staleness reads HEAD correctly.
+    fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    // Normal indexed file.
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    // Genuine bundle: single line, >= 64 KiB.
+    fs::write(root.join("bundle.js"), "x".repeat(70_000)).unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    let cache_dir = cache.path().to_path_buf();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache_dir.clone()),
+    };
+    build_index(&config).expect("first build must succeed");
+
+    // Load the v5 manifest and check that the bundle is in the skip section.
+    let manifest = FileManifest::load(root.to_path_buf(), cache_dir.clone()).unwrap();
+    let skip_paths: Vec<_> = manifest
+        .skip_freshness_entries()
+        .map(|(p, _, _)| p.to_string())
+        .collect();
+    assert!(
+        skip_paths.iter().any(|p| p.ends_with("bundle.js")),
+        "bundle.js must be in the manifest skip section, got: {skip_paths:?}"
+    );
+
+    // AC7: two consecutive check_staleness calls with no edits must both return Current.
+    let (staleness1, _) = check_staleness(&cache_dir, root);
+    let (staleness2, _) = check_staleness(&cache_dir, root);
+
+    assert!(
+        matches!(staleness1, super::super::staleness::StalenessCheck::Current),
+        "first staleness check must return Current (no rebuild), got: {staleness1:?}"
+    );
+    assert!(
+        matches!(staleness2, super::super::staleness::StalenessCheck::Current),
+        "second staleness check must return Current (loop killed), got: {staleness2:?}"
+    );
+}
+
+/// AC8 — changed skip triggers exactly one rebuild.
+#[test]
+fn test_ac8_changed_skip_triggers_one_rebuild() {
+    use super::super::staleness::check_staleness;
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    // Write a bundle that triggers a Minified skip.
+    let bundle_path = root.join("bundle.js");
+    fs::write(&bundle_path, "x".repeat(70_000)).unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    let cache_dir = cache.path().to_path_buf();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache_dir.clone()),
+    };
+    build_index(&config).expect("first build");
+
+    // Confirm clean after build.
+    let (s1, _) = check_staleness(&cache_dir, root);
+    assert!(
+        matches!(s1, super::super::staleness::StalenessCheck::Current),
+        "after first build must be Current"
+    );
+
+    // Mutate the bundle so its size differs (changed skip).
+    fs::write(&bundle_path, "y".repeat(71_000)).unwrap();
+
+    // The scan must now report WorkingTreeChanged (dirty).
+    let (s2, _) = check_staleness(&cache_dir, root);
+    assert!(
+        matches!(
+            s2,
+            super::super::staleness::StalenessCheck::WorkingTreeChanged { .. }
+        ),
+        "after bundle size change must be WorkingTreeChanged, got: {s2:?}"
+    );
+
+    // Rebuild.
+    build_index(&config).expect("second build");
+
+    // After rebuild, must be Current again (no loop).
+    let (s3, _) = check_staleness(&cache_dir, root);
+    assert!(
+        matches!(s3, super::super::staleness::StalenessCheck::Current),
+        "after second build must be Current again, got: {s3:?}"
+    );
+}
+
+/// AC9 — None/None hint skip is reconciled by path presence (not re-flagged as added).
+///
+/// Uses a separate cache_dir so the stub index files don't pollute the walked root,
+/// and only places `bundle.js` in the root (no other untracked files).
+#[test]
+fn test_ac9_none_hint_skip_not_readded() {
+    use super::super::manifest::FileManifest;
+    use super::super::types::SkippedEntry;
+
+    // Root: only bundle.js (no main.rs — unindexed files would count as "added").
+    let root_dir = tempfile::tempdir().unwrap();
+    let root = root_dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("bundle.js"), "x".repeat(70_000)).unwrap();
+
+    // Use a SEPARATE cache dir so manifest.save() doesn't put files under root.
+    let cache_tmp = tempfile::tempdir().unwrap();
+    let cache_dir = cache_tmp.path().to_path_buf();
+
+    // Build a manifest with a None/None skip entry for bundle.js (OD-395-5).
+    let mut manifest = FileManifest::new(root.to_path_buf(), cache_dir.clone());
+    manifest.insert_skip(SkippedEntry {
+        path: "bundle.js".to_string(),
+        mtime: None,
+        size: None,
+        reason_disc: 1, // Minified
+    });
+
+    let root_canon = root.canonicalize().unwrap();
+    // scan_working_tree_test_hook takes the in-memory manifest directly —
+    // no need to save it first.  The walker under root finds only bundle.js
+    // (the .git dir is ignored); the skip_index matches it by path presence
+    // (None/None hint), so added must be 0 (AD-395-5, OD-395-5).
+    let delta =
+        super::super::staleness::scan_working_tree_test_hook(&root_canon, &manifest, 50_000);
+    assert!(delta.is_ok(), "scan_working_tree must not fail");
+    let delta = delta.unwrap();
+    assert_eq!(
+        delta.added, 0,
+        "AC9: None/None hint skip must NOT count as added, got added={}",
+        delta.added
+    );
+    assert_eq!(
+        delta.changed, 0,
+        "AC9: None/None hint skip must NOT count as changed, got changed={}",
+        delta.changed
     );
 }

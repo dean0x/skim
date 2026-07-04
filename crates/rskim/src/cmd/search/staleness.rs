@@ -216,13 +216,19 @@ impl WorkingTreeDelta {
 /// each walked file the normalized rel-path is the manifest key
 /// ([`super::walk::normalize_rel_path`]); the comparison classifies it as:
 ///
-/// - **added** — path not present in the manifest.
-/// - **changed** — path present but mtime OR size differs (AD-379-2: size closes
-///   the same-second-edit gap; a manifest entry with `mtime: None` or
-///   `size: None`, e.g. a pre-#379 manifest, is treated as changed so the field
-///   is repopulated on the rebuild, AC10).
+/// - **added** — path not present in the indexed-entry map AND not present in
+///   the persisted skip set (genuinely new file). AD-395-5: a file present in
+///   the skip set with unchanged mtime+size is treated as **neither added nor
+///   changed** — this is the real fix for the infinite refresh loop (#395).
+/// - **changed** — path present in the indexed-entry map but mtime OR size
+///   differs (AD-379-2: size closes the same-second-edit gap; a `None` stored
+///   hint forces the changed verdict so the field is repopulated on rebuild);
+///   OR path present in the skip set but mtime or size differs (changed skip →
+///   exactly one rebuild, then stable again).
 ///
 /// Manifest paths not seen during the walk are counted as **removed**.
+/// OD-395-5: a None/None-hint skip is reconciled by path presence alone — the
+/// loop is killed even where the filesystem exposes no mtime/size hints.
 ///
 /// # Performance (AC15 / ADR-003)
 ///
@@ -252,6 +258,21 @@ fn scan_working_tree(
     for (path, mtime, size) in manifest.freshness_entries() {
         manifest_index.insert(path, (mtime, size));
     }
+
+    // AD-395-5: Build a skip-index from the persisted content-skip set.
+    // A walked file whose path matches a persisted skip with unchanged mtime+size
+    // is counted as NEITHER added NOR changed — the real fix for the infinite
+    // refresh loop that a FORMAT_VERSION bump alone does NOT resolve.
+    //
+    // OD-395-5: a None/None-hint skip is matched by PATH PRESENCE alone (the
+    // loop is killed even where the filesystem exposes neither hint), intentionally
+    // diverging from the indexed-entry `None → changed` semantics.  A changed skip
+    // (mtime or size differs) counts as `changed` → exactly one rebuild.
+    let mut skip_index: HashMap<&str, (Option<u64>, Option<u64>)> = HashMap::new();
+    for (path, mtime, size) in manifest.skip_freshness_entries() {
+        skip_index.insert(path, (mtime, size));
+    }
+
     // Track which manifest paths we observe on disk so the remainder are deletions.
     let mut seen: std::collections::HashSet<&str> =
         std::collections::HashSet::with_capacity(manifest_index.len());
@@ -264,7 +285,39 @@ fn scan_working_tree(
         // Single lookup: get_key_value yields the stored &str key so `seen`
         // borrows the manifest (not the freshly-allocated `key` String).
         match manifest_index.get_key_value(key.as_str()) {
-            None => added += 1,
+            None => {
+                // Not in the indexed-entry map. Check the skip-index.
+                // AD-395-5: if the file is a persisted skip with unchanged
+                // mtime+size, treat it as neither added nor changed (loop-killer).
+                // OD-395-5: None/None hint → match by path presence alone.
+                match skip_index.get_key_value(key.as_str()) {
+                    Some((_, &(s_mtime, s_size))) => {
+                        // Path is present in the skip-set.
+                        let mtime_unchanged = match s_mtime {
+                            Some(stored) => entry.mtime == Some(stored),
+                            // None-hint → unchanged per OD-395-5.
+                            None => true,
+                        };
+                        let size_unchanged = match s_size {
+                            Some(stored) => entry.size == Some(stored),
+                            // None-hint → unchanged per OD-395-5.
+                            None => true,
+                        };
+                        if mtime_unchanged && size_unchanged {
+                            // Unchanged skip → neither added nor changed.
+                            // The loop is killed here (AD-395-5).
+                        } else {
+                            // Skip metadata changed → treat as changed so this
+                            // formerly-skipped file gets one rebuild.
+                            changed += 1;
+                        }
+                    }
+                    None => {
+                        // Not in either map → genuinely new file.
+                        added += 1;
+                    }
+                }
+            }
             Some((stored_key, &(m_mtime, m_size))) => {
                 seen.insert(stored_key);
                 // AD-379-2: an indexed file is changed when EITHER mtime or size
@@ -286,6 +339,8 @@ fn scan_working_tree(
     }
 
     // Removed = manifest entries never observed during the walk.
+    // Note: skip entries are tracked separately and a vanished skip needs no
+    // rebuild (it is simply gone), so removed_count is unchanged (AD-395-5).
     let removed = manifest_index.len() - seen.len();
 
     Ok(WorkingTreeDelta {
@@ -787,6 +842,20 @@ pub(super) fn create_real_git_repo(
         .output()
         .expect("git rev-parse HEAD");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Test-only re-export of `scan_working_tree` for AC9 / AC7 integration tests
+/// that construct manifest state directly rather than going through `build_index`.
+///
+/// `pub(super)` makes it accessible from sibling test modules
+/// (`index_tests.rs`, `staleness_tests.rs`) via `super::staleness::...`.
+#[cfg(test)]
+pub(super) fn scan_working_tree_test_hook(
+    root: &std::path::Path,
+    manifest: &super::manifest::FileManifest,
+    max_files: usize,
+) -> anyhow::Result<WorkingTreeDelta> {
+    scan_working_tree(root, manifest, max_files)
 }
 
 // ============================================================================

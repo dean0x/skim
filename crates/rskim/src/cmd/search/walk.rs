@@ -86,17 +86,31 @@ const MINIFY_PROBE_BYTES: usize = 8192;
 /// Average line length (bytes) above which a file is considered minified.
 const MINIFY_AVG_LINE_BYTES: usize = 500;
 
+/// Minimum total file size required before the minification heuristic fires.
+///
+/// AD-395-1: The two-signal minified gate requires BOTH (1) content.len() >=
+/// MINIFY_MIN_BYTES AND (2) the first MINIFY_PROBE_BYTES probe is effectively
+/// single-line (newline_count <= 1).  Defined as 8 × MINIFY_PROBE_BYTES (= 64
+/// KiB) so the threshold is grounded in the existing probe-window constant
+/// rather than an arbitrary number (applies ADR-003).  Genuine bundles
+/// (100s KiB–MBs) remain caught; small generated / data-in-code files
+/// (single-digit KiB, including the 1.4 KiB ticket repro) are indexed.
+pub(super) const MINIFY_MIN_BYTES: usize = 8 * MINIFY_PROBE_BYTES; // 65_536
+
 /// Maximum number of ancestors to traverse when looking for a `.git` root.
 /// 256 ancestors is far beyond any real filesystem depth.
 const MAX_ANCESTORS: usize = 256;
 
-/// Maximum number of skip reasons collected during a walk.
+/// Maximum number of skip reasons collected during a walk or producer phase.
 ///
 /// Large monorepos may encounter millions of unsupported files.  Collecting an
 /// unbounded path list wastes memory; callers only need a representative sample
 /// for diagnostics.  Once the cap is hit, [`SkipReason::CapReached`] entries
 /// are still appended so the caller knows truncation occurred.
-const MAX_SKIP_REASONS: usize = 10_000;
+///
+/// Exported `pub(super)` so `index.rs` can reuse the same cap for the merged
+/// producer skip sample (AD-395-2).
+pub(super) const MAX_SKIP_REASONS: usize = 10_000;
 
 // ============================================================================
 // Typed read outcome
@@ -221,8 +235,13 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> ClassifyOutcome<Read
     // --- Minification check (tree-sitter languages only) ---
     // Serde-based languages (JSON, YAML, TOML) produce long lines by design;
     // skip the minification check for them.
-    if !lang.is_serde_based() && is_minified(&content) {
-        return ClassifyOutcome::Skip(SkipReason::Minified(abs_path.to_path_buf()));
+    if !lang.is_serde_based()
+        && let Some(avg_line_bytes) = minified_metric(&content)
+    {
+        return ClassifyOutcome::Skip(SkipReason::Minified {
+            path: abs_path.to_path_buf(),
+            avg_line_bytes,
+        });
     }
 
     let mtime = mtime_secs(entry);
@@ -716,20 +735,53 @@ pub(super) fn open_and_read(path: &Path) -> ReadOutcome {
     }
 }
 
-/// Returns `true` if the content appears minified.
+/// Two-signal minified gate: returns `Some(avg_line_bytes)` when content is
+/// classified as minified, `None` when it should be indexed.
 ///
-/// Minification heuristic: probe the first [`MINIFY_PROBE_BYTES`] bytes. If
-/// they contain no newlines, or the average bytes-per-line exceeds
-/// [`MINIFY_AVG_LINE_BYTES`], the file is considered minified.
-pub(super) fn is_minified(content: &str) -> bool {
+/// AD-395-1: A file is minified only when BOTH signals hold:
+/// 1. **Size gate** — `content.len() >= MINIFY_MIN_BYTES` (= 64 KiB).
+///    Small single-long-line files (data-in-code, generated, long-path/prose,
+///    the 1.4 KiB ticket repro) fail this gate and are INDEXED.
+/// 2. **Single-line signal** — the first `MINIFY_PROBE_BYTES` probe has
+///    `newline_count <= 1`.  Large multi-line files that merely contain some
+///    long lines (e.g. 200 × 600-byte lines) also fail this signal and are
+///    INDEXED.  Only genuine single-line bundles (one giant line across the
+///    whole probe) pass.
+///
+/// When both signals hold, `avg_line_bytes` is computed and returned in
+/// `Some` so the skip message can print the measured average (e.g.
+/// `"avg line 1176 > 500 bytes"`).  With `newline_count <= 1` in an 8 KiB
+/// probe the average always exceeds `MINIFY_AVG_LINE_BYTES` (500) by
+/// construction — the metric simply supplies the number for the message.
+pub(super) fn minified_metric(content: &str) -> Option<usize> {
+    // Signal 1: size gate (AD-395-1).
+    if content.len() < MINIFY_MIN_BYTES {
+        return None;
+    }
+
     let probe_len = content.len().min(MINIFY_PROBE_BYTES);
     // probe_len <= content.len(), so the slice is always in-bounds.
     let probe = &content.as_bytes()[..probe_len];
     let newline_count = probe.iter().filter(|&&b| b == b'\n').count();
-    if newline_count == 0 {
-        return probe.len() > MINIFY_AVG_LINE_BYTES;
+
+    // Signal 2: effectively single-line probe (AD-395-1).
+    if newline_count > 1 {
+        return None;
     }
-    probe.len() / newline_count > MINIFY_AVG_LINE_BYTES
+
+    // Both signals hold → compute avg_line_bytes for the skip message.
+    // With newline_count <= 1, avg_line_bytes is either probe.len() (0 newlines)
+    // or probe.len() (≈ 8192, 1 newline) — always > MINIFY_AVG_LINE_BYTES (500).
+    let avg_line_bytes = probe
+        .len()
+        .checked_div(newline_count)
+        .unwrap_or(probe.len());
+
+    if avg_line_bytes > MINIFY_AVG_LINE_BYTES {
+        Some(avg_line_bytes)
+    } else {
+        None
+    }
 }
 
 /// Compute the SHA-256 of `data` and return it as a 64-character lowercase hex string.

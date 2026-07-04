@@ -641,7 +641,7 @@ fn test_binary_header_layout() {
     assert_eq!(&bytes[0..4], b"SKFM");
     let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
     assert_eq!(version, FileManifest::FORMAT_VERSION);
-    assert_eq!(version, 4, "FORMAT_VERSION must be 4 (AC-2)");
+    assert_eq!(version, 5, "FORMAT_VERSION must be 5 (AD-395-3 / AC6)");
     let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     assert_eq!(
         count, 2,
@@ -685,7 +685,7 @@ fn test_load_wrong_version_returns_empty() {
     fs::write(cache_dir.join("index.skfiles"), &buf).unwrap();
 
     let manifest = FileManifest::load(root, cache_dir).unwrap();
-    assert_eq!(manifest.entry_count(), 0, "version != 4 → Ok(empty) (AC-2)");
+    assert_eq!(manifest.entry_count(), 0, "version != 5 → Ok(empty) (AC-2)");
 }
 
 /// AC-2 / AC-5 (#380): load() returns Ok(empty) when the body is truncated below
@@ -816,5 +816,161 @@ fn test_full_entry_set_roundtrip_byte_identical() {
     assert_eq!(
         loaded.sorted_paths(),
         vec!["README.md", "src/a.rs", "src/z.ts"]
+    );
+}
+
+// ============================================================================
+// #395 — FORMAT_VERSION 5 + skip section tests
+// ============================================================================
+
+/// AC6 (partial): FORMAT_VERSION must equal 5. version_matches returns false
+/// for a v4 header and true for a v5 header (the self-heal trigger, AD-395-3).
+#[test]
+fn test_ac6_format_version_5_and_version_matches() {
+    // Compile-time check: constant must be 5.
+    assert_eq!(
+        FileManifest::FORMAT_VERSION,
+        5,
+        "FORMAT_VERSION must be 5 (AD-395-3 / AC6)"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path();
+
+    // Build the root bytes from the canonical path.
+    let root_str = dir.path().to_string_lossy();
+    let root_bytes = root_str.as_bytes();
+
+    // Forge a v4 SKFM header.
+    let mut v4_buf: Vec<u8> = Vec::new();
+    v4_buf.extend_from_slice(b"SKFM");
+    v4_buf.extend_from_slice(&4u32.to_le_bytes()); // version 4
+    v4_buf.extend_from_slice(&0u32.to_le_bytes()); // entry_count
+    v4_buf.extend_from_slice(&u32::try_from(root_bytes.len()).unwrap().to_le_bytes());
+    v4_buf.extend_from_slice(root_bytes);
+    v4_buf.push(0u8); // git_head absent
+    v4_buf.extend_from_slice(&0u32.to_le_bytes()); // skip_count = 0 (v5 appended)
+    fs::write(cache_dir.join("index.skfiles"), &v4_buf).unwrap();
+    assert!(
+        !FileManifest::version_matches(cache_dir).unwrap(),
+        "v4 header must return false (triggers self-heal rebuild, AD-395-3)"
+    );
+
+    // Forge a v5 SKFM header.
+    let mut v5_buf: Vec<u8> = Vec::new();
+    v5_buf.extend_from_slice(b"SKFM");
+    v5_buf.extend_from_slice(&5u32.to_le_bytes()); // version 5
+    v5_buf.extend_from_slice(&0u32.to_le_bytes()); // entry_count
+    v5_buf.extend_from_slice(&u32::try_from(root_bytes.len()).unwrap().to_le_bytes());
+    v5_buf.extend_from_slice(root_bytes);
+    v5_buf.push(0u8); // git_head absent
+    v5_buf.extend_from_slice(&0u32.to_le_bytes()); // skip_count = 0
+    fs::write(cache_dir.join("index.skfiles"), &v5_buf).unwrap();
+    assert!(
+        FileManifest::version_matches(cache_dir).unwrap(),
+        "v5 header must return true (current version)"
+    );
+}
+
+/// AC6 NEGATIVE: version_matches must not return true for version 4.
+#[test]
+fn test_ac6_version_matches_rejects_v4() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path();
+
+    // Minimal v4 header.
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"SKFM");
+    buf.extend_from_slice(&4u32.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // No root — that's fine for version_matches which only reads 12 bytes.
+    fs::write(cache_dir.join("index.skfiles"), &buf).unwrap();
+
+    assert!(
+        !FileManifest::version_matches(cache_dir).unwrap(),
+        "version 4 must return false (AD-395-3 negative)"
+    );
+}
+
+/// AC10 — v5 manifest round-trip: skip entries survive encode/load, are
+/// excluded from sorted_paths() and entry_count(), and a forged skip_count
+/// over MAX_MANIFEST_ENTRIES causes load() to reject-whole (AD-395-4).
+#[test]
+fn test_ac10_v5_manifest_round_trip_and_skip_isolation() {
+    use super::super::types::SkippedEntry;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+
+    // Build a manifest with 2 indexed entries + 2 skip entries.
+    let mut manifest = FileManifest::new(root.clone(), cache_dir.clone());
+    manifest.insert(sample_entry("a.rs", &"a".repeat(64)));
+    manifest.insert(sample_entry("b.rs", &"b".repeat(64)));
+
+    let skip1 = SkippedEntry {
+        path: "bundle.js".to_string(),
+        mtime: Some(1_700_000_000),
+        size: Some(70_000),
+        reason_disc: 1, // Minified
+    };
+    let skip2 = SkippedEntry {
+        path: "icon.bin".to_string(),
+        mtime: None,
+        size: None,
+        reason_disc: 2, // NonUtf8
+    };
+    manifest.insert_skip(skip1.clone());
+    manifest.insert_skip(skip2.clone());
+    manifest.save().unwrap();
+
+    // Load and verify.
+    let loaded = FileManifest::load(root.clone(), cache_dir.clone()).unwrap();
+
+    // AC10: skip entries excluded from sorted_paths / entry_count.
+    assert_eq!(
+        loaded.entry_count(),
+        2,
+        "skip entries must NOT count toward entry_count"
+    );
+    assert_eq!(
+        loaded.sorted_paths(),
+        vec!["a.rs", "b.rs"],
+        "skip entries must NOT appear in sorted_paths"
+    );
+
+    // AC10: skip entries round-trip with full fidelity.
+    let skip_vec: Vec<&SkippedEntry> = loaded.skipped().collect();
+    assert_eq!(skip_vec.len(), 2, "must round-trip 2 skip entries");
+    // BTreeMap iterates in key order: "bundle.js" < "icon.bin".
+    assert_eq!(skip_vec[0].path, "bundle.js");
+    assert_eq!(skip_vec[0].mtime, Some(1_700_000_000));
+    assert_eq!(skip_vec[0].size, Some(70_000));
+    assert_eq!(skip_vec[0].reason_disc, 1);
+    assert_eq!(skip_vec[1].path, "icon.bin");
+    assert_eq!(skip_vec[1].mtime, None);
+    assert_eq!(skip_vec[1].size, None);
+    assert_eq!(skip_vec[1].reason_disc, 2);
+
+    // AC10: forged skip_count > MAX_MANIFEST_ENTRIES must reject-whole.
+    // Strategy: save a 0-entry manifest (known layout), then overwrite the
+    // last 4 bytes (skip_count) with u32::MAX to trigger reject-whole.
+    let empty_manifest = FileManifest::new(root.clone(), cache_dir.clone());
+    empty_manifest.save().unwrap();
+    let mut forged = fs::read(cache_dir.join("index.skfiles")).unwrap();
+    // The last 4 bytes are the skip_count (0 in an empty manifest). Overwrite with MAX.
+    let len = forged.len();
+    forged[len - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
+    fs::write(cache_dir.join("index.skfiles"), &forged).unwrap();
+    let rejected = FileManifest::load(root.clone(), cache_dir.clone()).unwrap();
+    assert_eq!(
+        rejected.entry_count(),
+        0,
+        "forged skip_count > MAX_MANIFEST_ENTRIES must reject-whole (cold start)"
+    );
+    assert_eq!(
+        rejected.skipped().count(),
+        0,
+        "rejected manifest must have no skip entries"
     );
 }

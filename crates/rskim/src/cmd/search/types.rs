@@ -258,12 +258,16 @@ impl IndexConfig {
 // ============================================================================
 
 /// Summary statistics produced after an index build completes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) struct IndexResult {
     /// Number of files successfully indexed.
     pub file_count: u32,
     /// Number of files skipped (unsupported, too large, non-UTF8, etc.).
     pub skipped: u32,
+    /// Bounded, stable-key-sorted sample of skip reasons for display
+    /// (AD-395-6 / PF-012).  Capped at `MAX_SKIP_REASONS`; sorted by path
+    /// string ascending with `CapReached` last.
+    pub skip_sample: Vec<SkipReason>,
     /// Number of files whose field_map was reused from the manifest cache
     /// (lexical cache hits).
     pub cache_hits: u32,
@@ -282,22 +286,146 @@ pub(super) struct IndexResult {
 // ============================================================================
 
 /// Why a file was excluded from the index.
-#[derive(Debug)]
-#[allow(dead_code)] // Fields are for diagnostic/debug output via {:?}
+///
+/// The `Display` impl produces a short user-facing one-liner suitable for the
+/// stderr sample emitted by `run_build` (AD-395-6).
+#[derive(Debug, Clone)]
 pub(super) enum SkipReason {
     /// File is larger than the 5 MB threshold.
     TooLarge { path: PathBuf, size: u64 },
     /// File content is not valid UTF-8.
     NonUtf8(PathBuf),
-    /// File appears to be minified (average line length > 500 bytes
-    /// in the first 8 KB, tree-sitter languages only).
-    Minified(PathBuf),
+    /// File appears to be minified (both signals required — see AD-395-1):
+    /// content.len() >= 64 KiB AND the first 8 KiB probe is effectively
+    /// single-line (newline_count <= 1).  Carries the measured avg line bytes
+    /// for the user-facing message.
+    Minified {
+        path: PathBuf,
+        avg_line_bytes: usize,
+    },
     /// No supported [`rskim_core::Language`] maps to this file's extension.
     UnsupportedLanguage(PathBuf),
     /// I/O error while reading the file.
     ReadError { path: PathBuf, error: String },
     /// File cap reached — no further files will be indexed.
     CapReached,
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkipReason::Minified {
+                path,
+                avg_line_bytes,
+            } => write!(
+                f,
+                "skipped {}: minified (avg line {avg_line_bytes} > 500 bytes)",
+                path.display()
+            ),
+            SkipReason::NonUtf8(path) => {
+                write!(f, "skipped {}: not valid UTF-8", path.display())
+            }
+            SkipReason::TooLarge { path, size } => {
+                write!(f, "skipped {}: too large ({size} bytes)", path.display())
+            }
+            SkipReason::ReadError { path, error } => {
+                write!(f, "skipped {}: read error: {error}", path.display())
+            }
+            SkipReason::UnsupportedLanguage(path) => {
+                write!(f, "skipped {}: unsupported language", path.display())
+            }
+            SkipReason::CapReached => write!(f, "file cap reached"),
+        }
+    }
+}
+
+impl SkipReason {
+    /// Returns the path associated with this skip reason, if any.
+    ///
+    /// Used for stable-key sorting of the skip sample (AD-395-6 / PF-012).
+    /// `CapReached` has no path and sorts last.
+    pub(super) fn sort_key(&self) -> Option<&std::path::Path> {
+        match self {
+            SkipReason::Minified { path, .. }
+            | SkipReason::NonUtf8(path)
+            | SkipReason::TooLarge { path, .. }
+            | SkipReason::ReadError { path, .. }
+            | SkipReason::UnsupportedLanguage(path) => Some(path.as_path()),
+            SkipReason::CapReached => None,
+        }
+    }
+
+    /// Discriminant byte for binary persistence in the manifest skip section.
+    ///
+    /// Only DETERMINISTIC skips (Minified / NonUtf8 / TooLarge) are persisted;
+    /// ReadError and UnsupportedLanguage fall through un-persisted (OD-395-4).
+    /// `None` means this skip reason is NOT persisted.
+    pub(super) fn persist_discriminant(&self) -> Option<u8> {
+        match self {
+            SkipReason::Minified { .. } => Some(1),
+            SkipReason::NonUtf8(_) => Some(2),
+            SkipReason::TooLarge { .. } => Some(3),
+            SkipReason::ReadError { .. }
+            | SkipReason::UnsupportedLanguage(_)
+            | SkipReason::CapReached => None,
+        }
+    }
+}
+
+// ============================================================================
+// Persisted skip entry (manifest v5)
+// ============================================================================
+
+/// A content-skipped file persisted in the v5 manifest skip section (AD-395-4).
+///
+/// Only DETERMINISTIC skips (Minified / NonUtf8 / TooLarge) are stored here;
+/// transient ReadErrors fall through un-persisted (OD-395-4). The persisted
+/// `(path, mtime, size, reason_disc)` tuple is used by `scan_working_tree` to
+/// reconcile walked files against the skip-set without re-reading content
+/// (AD-395-5 loop-killer; respects AD-379/AC15 metadata-only invariant).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SkippedEntry {
+    /// Repo-relative normalized path (same normalization as manifest keys).
+    pub path: String,
+    /// File modification time at skip time. `None` when the platform does not
+    /// expose mtime.
+    pub mtime: Option<u64>,
+    /// File size in bytes at skip time. `None` when the platform does not
+    /// expose size.
+    pub size: Option<u64>,
+    /// Discriminant byte identifying the skip reason for `--stats` display.
+    /// 1 = Minified, 2 = NonUtf8, 3 = TooLarge (matches `persist_discriminant`).
+    pub reason_disc: u8,
+}
+
+impl SkippedEntry {
+    /// Reconstruct the reason label for `--stats --json` output from the stored
+    /// discriminant.
+    pub(super) fn reason_label(&self) -> &'static str {
+        match self.reason_disc {
+            1 => "minified",
+            2 => "non_utf8",
+            3 => "too_large",
+            _ => "unknown",
+        }
+    }
+}
+
+// ============================================================================
+// Producer skip aggregate returned via JoinHandle (AD-395-2)
+// ============================================================================
+
+/// Aggregates collected by the producer thread and returned via `JoinHandle`
+/// (single-threaded producer needs no Mutex — AD-395-2).
+pub(super) struct ProducerSkips {
+    /// Bounded display sample (capped at `MAX_SKIP_REASONS` from walk.rs).
+    pub sample: Vec<SkipReason>,
+    /// Full set of DETERMINISTIC content-skips for manifest persistence.
+    ///
+    /// Only Minified / NonUtf8 / TooLarge entries appear here (OD-395-4).
+    /// Capped at `MAX_MANIFEST_ENTRIES` (naturally <= max_files since every
+    /// skip was a previously accepted WalkEntry).
+    pub skip_set: Vec<SkippedEntry>,
 }
 
 // ============================================================================
