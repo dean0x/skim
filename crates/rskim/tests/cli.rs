@@ -164,18 +164,16 @@ fn test_cli_stdin_with_language() {
 }
 
 #[test]
-fn test_cli_stdin_without_language_fails() {
-    // Non-shebang input without --language should fail.
-    // Since we now also support shebang auto-detection, the error message
-    // mentions all three options: --language, --filename, or a shebang line.
+fn test_cli_stdin_without_language_passes_through() {
+    // ADR-002: shebang-less stdin without --language degrades to lossless passthrough
+    // (exit 0), consistent with the file path behaviour for unknown extensions.
+    // The input content is emitted verbatim (non-UTF-8 stdin still fails).
     common::skim()
         .arg("-")
         .write_stdin("function test() {}")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "reading from stdin requires --language",
-        ));
+        .success()
+        .stdout(predicate::str::contains("function test() {}"));
 }
 
 // ============================================================================

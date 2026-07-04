@@ -443,23 +443,48 @@ pub(crate) fn process_stdin(
 
     let language_or_none = options.explicit_lang.or(filename_lang).or(shebang_lang);
 
-    let language = language_or_none.ok_or_else(|| {
+    // ADR-002: when no language is detectable for plain stdin (no --language,
+    // no --filename, no shebang), degrade to a lossless passthrough rather than
+    // erroring — consistent with the file path behaviour in run_transform.
+    // --filename with an unrecognised extension is still an error: the user
+    // gave an explicit hint that skim cannot honour.
+    if language_or_none.is_none() {
         if let Some(fname) = filename_hint {
-            anyhow::anyhow!(
+            // Explicit --filename with unknown extension → hard error.
+            anyhow::bail!(
                 "Language detection failed: unrecognized filename '{}'\n\
                  Supported extensions: .ts, .tsx, .js, .jsx, .cjs, .mjs, .py, .rs, .go, .java, .c, .h, .cpp, .hpp, .cxx, .cc, .md, .json, .yaml, .yml, .toml, .sh, .bash\n\
                  Hint: use --language to specify the language explicitly\n\
                  Example: cat file | skim - --language=typescript",
                 fname
-            )
-        } else {
-            anyhow::anyhow!(
-                "Language detection failed: reading from stdin requires --language, --filename, or a shebang line\n\
-                 Example: cat file.ts | skim - --language=typescript\n\
-                 Example: git show HEAD:main.rs | skim - --filename=main.rs"
-            )
+            );
         }
-    })?;
+        // No --filename, no --language, no shebang — degrade to lossless passthrough.
+        if std::env::var("SKIM_DEBUG").as_deref() == Ok("1") {
+            eprintln!(
+                "[skim] notice: unknown language for stdin — degraded to lossless passthrough. \
+                 Use --language to specify, or SKIM_PASSTHROUGH=1 to bypass."
+            );
+        }
+        let output =
+            passthrough_with_truncation(&buffer, options.trunc.max_lines, options.trunc.last_lines);
+        let stdin_raw = if !options.show_stats {
+            Some(buffer)
+        } else {
+            None
+        };
+        return Ok(ProcessResult {
+            output,
+            original_tokens: None,
+            transformed_tokens: None,
+            guardrail_triggered: false,
+            parse_tier: Some("passthrough"),
+            language: None,
+            stdin_raw,
+        });
+    }
+
+    let language = language_or_none.expect("language_or_none is Some — checked above");
 
     let (transformed, stdin_has_errors, stdin_line_map, stdin_degraded) = match options
         .trunc
