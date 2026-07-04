@@ -5,7 +5,7 @@
 //! All I/O lives here (this module). Business logic is split across:
 //! - `types` — shared configuration and result types
 //! - `walk` — project-root discovery and file traversal
-//! - `manifest` — binary (v4) sidecar for incremental build caching
+//! - `manifest` — binary (v5) sidecar for incremental build caching
 //! - `index` — full pipeline orchestration (invoked via `--build`/`--rebuild`)
 //! - `query` — query execution and result formatting
 //! - `snippet` — source context extraction

@@ -935,21 +935,12 @@ pub(super) fn build_skip_sample(
 /// Exposed `pub(super)` for unit-testing (AC5 / PF-007 — no test-file-
 /// generation, pure function).
 pub(super) fn format_skip_sample(reasons: &[SkipReason], cap: usize) -> String {
-    let mut out = String::new();
     let shown = reasons.len().min(cap);
-    for reason in &reasons[..shown] {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&reason.to_string());
-    }
+    let mut lines: Vec<String> = reasons[..shown].iter().map(|r| r.to_string()).collect();
     if reasons.len() > cap {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&format!("...and {} more", reasons.len() - cap));
+        lines.push(format!("...and {} more", reasons.len() - cap));
     }
-    out
+    lines.join("\n")
 }
 
 /// Call `classify_source` and return the field_map.
