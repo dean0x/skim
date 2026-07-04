@@ -208,7 +208,11 @@ fn try_ast_render(
         };
         render_with_unchanged_context(&mut output, &tree, &ctx, parser);
     } else {
-        render_changed_only(
+        // Default mode: hunk-scoped render — breadcrumb + hunk lines only.
+        // This replaces the old render_changed_only → render_node_with_hunks path
+        // that emitted the ENTIRE enclosing node body, producing 2-5x bloat vs raw
+        // for small changes inside large functions (ADR-001).
+        render_default_scoped(
             &mut output,
             &changed_ranges,
             &file_diff.hunks,
@@ -220,10 +224,15 @@ fn try_ast_render(
     Some(output)
 }
 
-/// Render only changed nodes (default mode).
+/// Render only changed nodes (full-node-body mode — used by tests only).
+///
+/// This function is kept for tests that validate the de-duplication cursor
+/// (`EmittedCursor`) and per-container header/close-brace logic in isolation.
+/// Production code uses `render_default_scoped` (hunk-scoped, ADR-001 safe).
 ///
 /// For nested nodes (inside a class/struct), emits the parent declaration
 /// header line before the changed child node.
+#[cfg(test)]
 fn render_changed_only(
     output: &mut String,
     changed_ranges: &[ChangedNodeRange],
@@ -299,6 +308,104 @@ fn render_changed_only(
             if is_last && let Some(line) = source_lines.get(ctx.close_line - 1) {
                 let _ = writeln!(output, " {:>ln_width$} {line}", ctx.close_line);
             }
+        }
+    }
+}
+
+/// Render default mode with hunk-scoped output (ADR-001 compliance, #R2).
+///
+/// For each changed AST node, emits:
+///   1. A breadcrumb — the container's header line only (one line per unique container).
+///   2. The overlapping hunk patch lines, clipped to the node's boundary via
+///      `emit_hunk_patch_lines_clipped` (which already includes git's ±3 context).
+///
+/// Orphan hunks — hunks whose changed lines fall outside ALL top-level AST nodes
+/// (EOF deletions, additions between functions, trailing blanks) — are rendered as
+/// raw hunk lines so no content is silently dropped.
+///
+/// Output size is bounded to ≈ raw because we emit ONLY the hunk lines (which ARE
+/// the raw content for those regions) plus one breadcrumb per changed container.
+/// This prevents the 2-5× bloat of the old `render_changed_only` path that emitted
+/// the entire enclosing node body via `render_node_with_hunks`.
+///
+/// De-duplication is handled by the per-file `EmittedCursor` — two adjacent ranges
+/// sharing one hunk still emit each changed line exactly once.
+fn render_default_scoped(
+    output: &mut String,
+    changed_ranges: &[ChangedNodeRange],
+    hunks: &[DiffHunk<'_>],
+    source_lines: &[&str],
+    ln_width: usize,
+) {
+    // Track which hunks are attributed to at least one changed-node range.
+    // Unattributed hunks are orphans and rendered separately.
+    let mut hunk_attributed = vec![false; hunks.len()];
+
+    // Per-unique-container deduplication for breadcrumbs.
+    let mut emitted_breadcrumbs: HashSet<usize> = HashSet::new();
+
+    // Per-file monotonic cursor — prevents duplicate changed lines when two
+    // adjacent ranges share one hunk (same semantics as render_changed_only).
+    let mut cursor = EmittedCursor::default();
+
+    for range in changed_ranges {
+        // Locate the window of hunks that overlap this node range using the
+        // same partition_point logic as render_node_with_hunks.
+        let first =
+            hunks.partition_point(|h| h.new_start + h.new_count.saturating_sub(1) < range.start);
+        let relevant_indices: Vec<usize> = hunks[first..]
+            .iter()
+            .enumerate()
+            .take_while(|(_, h)| h.new_start <= range.end)
+            .map(|(i, _)| first + i)
+            .collect();
+
+        if relevant_indices.is_empty() {
+            continue; // No overlapping hunk — nothing to emit for this range
+        }
+
+        // Breadcrumb: container header line only.
+        // For nested nodes (methods inside a class/struct/impl) use the
+        // parent's header line; for top-level nodes use the node's own
+        // first line.  Emitted at most once per unique header line.
+        let breadcrumb_line = range
+            .parent_context
+            .as_ref()
+            .map_or(range.start, |p| p.header_line);
+        if emitted_breadcrumbs.insert(breadcrumb_line)
+            && let Some(line) = source_lines.get(breadcrumb_line - 1)
+        {
+            let _ = writeln!(output, " {:>ln_width$} {line}", breadcrumb_line);
+        }
+
+        // Emit hunk patch lines clipped to this node's boundary.
+        for &hunk_idx in &relevant_indices {
+            hunk_attributed[hunk_idx] = true;
+            emit_hunk_patch_lines_clipped(
+                output,
+                &hunks[hunk_idx],
+                range.start,
+                range.end,
+                ln_width,
+                &mut cursor,
+            );
+        }
+    }
+
+    // Orphan hunks: hunks whose changed lines fall outside all AST nodes.
+    // Render as raw hunk lines so no content is silently dropped (execution plan
+    // point 3: "ORPHAN HUNKS MUST RENDER").  Typical cases: EOF deletions,
+    // additions between top-level functions, trailing blank-line changes.
+    for (hunk_idx, hunk) in hunks.iter().enumerate() {
+        if hunk_attributed[hunk_idx] {
+            continue;
+        }
+        let mut cur_new = hunk.new_start;
+        let mut cur_old = hunk.old_start;
+        for line in &hunk.patch_lines {
+            let (nd, od) = emit_patch_line(output, line, cur_new, cur_old, ln_width);
+            cur_new += nd;
+            cur_old += od;
         }
     }
 }
@@ -1658,8 +1765,239 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // render_default_scoped unit tests (F1 — hunk-scoped ADR-001 rendering)
+    // ========================================================================
+
+    /// Default mode: a small change inside a large node emits breadcrumb + hunk
+    /// lines only — NOT the entire node body.  This is the core AC-F1.2 check:
+    /// the old render_changed_only → render_node_with_hunks path would emit every
+    /// source line from node_start to node_end; the new path emits only the
+    /// breadcrumb + patch lines.
+    #[test]
+    fn test_render_default_scoped_breadcrumb_and_hunk_only_not_full_body() {
+        // A 10-line "function" with a change at line 5.
+        // The hunk covers only lines 4-6.  The old path would emit lines 1-10;
+        // the new path emits only the breadcrumb (line 1) + hunk lines (4-6).
+        let source_lines: Vec<&str> = vec![
+            "fn big_function() {", // line 1 — breadcrumb
+            "    let a = 1;",      // line 2
+            "    let b = 2;",      // line 3
+            "    let c = 3;",      // line 4 (context in hunk)
+            "    let d = 4;",      // line 5 (changed)
+            "    let e = 5;",      // line 6 (context in hunk)
+            "    let f = 6;",      // line 7
+            "    let g = 7;",      // line 8
+            "    let h = 8;",      // line 9
+            "}",                   // line 10
+        ];
+
+        // Hunk: changes line 5 (one line), with one context line above and below.
+        let hunks = vec![DiffHunk {
+            old_start: 4,
+            old_count: 3,
+            new_start: 4,
+            new_count: 3,
+            patch_lines: vec![
+                " let c = 3;",
+                "-    let d = 4;",
+                "+    let d = 99;",
+                " let e = 5;",
+            ],
+        }];
+
+        // Single range covering the whole function (lines 1-10).
+        let changed_ranges = vec![super::super::types::ChangedNodeRange {
+            start: 1,
+            end: 10,
+            parent_context: None,
+        }];
+
+        let mut output = String::new();
+        render_default_scoped(&mut output, &changed_ranges, &hunks, &source_lines, 2);
+
+        // Breadcrumb must appear.
+        assert!(
+            output.contains("big_function"),
+            "breadcrumb line must appear in output:\n{output}"
+        );
+
+        // Changed line must appear.
+        assert!(
+            output.contains("let d = 99;"),
+            "changed line must appear in output:\n{output}"
+        );
+
+        // Lines outside the hunk window must NOT appear (no full-body bloat).
+        assert!(
+            !output.contains("let g = 7;"),
+            "line 8 (outside hunk) must NOT appear — no full-body emission:\n{output}"
+        );
+        assert!(
+            !output.contains("let h = 8;"),
+            "line 9 (outside hunk) must NOT appear — no full-body emission:\n{output}"
+        );
+
+        // Output must be shorter than a full 10-line node body.
+        let line_count = output.lines().count();
+        assert!(
+            line_count < 10,
+            "hunk-scoped output ({line_count} lines) must be shorter than full 10-line node body:\n{output}"
+        );
+    }
+
+    /// Orphan hunk (EOF deletion): a hunk whose changed lines fall outside all
+    /// AST node ranges must be rendered as raw hunk lines (AC-F1.3 / plan point 3).
+    ///
+    /// Without this, the old path silently dropped orphan hunks, making skim output
+    /// smaller than raw in a way that the ADR-001 guardrail could never catch (the
+    /// guardrail only fires when skim > raw, not when content is silently omitted).
+    #[test]
+    fn test_render_default_scoped_orphan_eof_deletion_rendered() {
+        // Source (new file after deletion): just the function, trailing blank removed.
+        let source_lines: Vec<&str> = vec!["fn foo() {}", ""];
+
+        // Orphan hunk: removes a trailing blank line at old line 3.
+        // new_start = 3, new_count = 0 (pure deletion past end of file).
+        let hunks = vec![DiffHunk {
+            old_start: 3,
+            old_count: 1,
+            new_start: 3,
+            new_count: 0,
+            patch_lines: vec!["-"], // deleted blank line
+        }];
+
+        // No changed ranges — the deletion at old line 3 has no AST node.
+        let changed_ranges: Vec<super::super::types::ChangedNodeRange> = vec![];
+
+        let mut output = String::new();
+        render_default_scoped(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+
+        // The orphan deletion line must appear in the output.
+        assert!(
+            !output.is_empty(),
+            "EOF deletion orphan hunk must not be silently dropped:\n'{output}'"
+        );
+        // The deleted blank line marker must appear.
+        assert!(
+            output.contains('-'),
+            "orphan deletion line must contain '-' prefix:\n{output}"
+        );
+    }
+
+    /// Multiple hunks in one node → ONE breadcrumb, all hunks emitted.
+    /// This is the line-doubling regression guard (AC-F1.3).
+    #[test]
+    fn test_render_default_scoped_multiple_hunks_one_breadcrumb() {
+        // A class with three methods; two hunks changing methods 1 and 3.
+        let source_lines: Vec<&str> = vec![
+            "class MyClass {",    // line 1 (breadcrumb for all children)
+            "  fn method_a() {}", // line 2 (changed by hunk 1)
+            "  fn method_b() {}", // line 3
+            "  fn method_c() {}", // line 4 (changed by hunk 2)
+            "}",                  // line 5
+        ];
+
+        let hunks = vec![
+            DiffHunk {
+                old_start: 2,
+                old_count: 1,
+                new_start: 2,
+                new_count: 1,
+                patch_lines: vec!["-  fn method_a() {}", "+  fn method_a() -> u32 {}"],
+            },
+            DiffHunk {
+                old_start: 4,
+                old_count: 1,
+                new_start: 4,
+                new_count: 1,
+                patch_lines: vec!["-  fn method_c() {}", "+  fn method_c() -> u32 {}"],
+            },
+        ];
+
+        // Two child ranges, same parent container (lines 1-5).
+        let changed_ranges = vec![
+            super::super::types::ChangedNodeRange {
+                start: 2,
+                end: 2,
+                parent_context: Some(super::super::types::ParentContext {
+                    header_line: 1,
+                    close_line: 5,
+                }),
+            },
+            super::super::types::ChangedNodeRange {
+                start: 4,
+                end: 4,
+                parent_context: Some(super::super::types::ParentContext {
+                    header_line: 1,
+                    close_line: 5,
+                }),
+            },
+        ];
+
+        let mut output = String::new();
+        render_default_scoped(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+
+        // Breadcrumb must appear exactly once.
+        let breadcrumb_count = output.lines().filter(|l| l.contains("MyClass {")).count();
+        assert_eq!(
+            breadcrumb_count, 1,
+            "container breadcrumb must appear exactly once; got {breadcrumb_count}:\n{output}"
+        );
+
+        // Both changed methods must appear in output.
+        assert!(
+            output.contains("method_a() -> u32"),
+            "first hunk change must appear:\n{output}"
+        );
+        assert!(
+            output.contains("method_c() -> u32"),
+            "second hunk change must appear:\n{output}"
+        );
+    }
+
+    /// No-newline marker (`\ No newline at end of file`) survives round-trip.
+    /// This is the AC-F1.3 edge case for special patch lines.
+    #[test]
+    fn test_render_default_scoped_no_newline_marker_preserved() {
+        let source_lines: Vec<&str> = vec!["fn foo() {}", "    return 1;"];
+
+        let hunks = vec![DiffHunk {
+            old_start: 2,
+            old_count: 1,
+            new_start: 2,
+            new_count: 1,
+            patch_lines: vec![
+                "-    return 1;",
+                r"\ No newline at end of file",
+                "+    return 42;",
+                r"\ No newline at end of file",
+            ],
+        }];
+
+        let changed_ranges = vec![super::super::types::ChangedNodeRange {
+            start: 1,
+            end: 2,
+            parent_context: None,
+        }];
+
+        let mut output = String::new();
+        render_default_scoped(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+
+        // The no-newline markers must appear verbatim.
+        assert!(
+            output.contains("No newline at end of file"),
+            "no-newline marker must be preserved:\n{output}"
+        );
+
+        // The changed content must also appear.
+        assert!(
+            output.contains("return 42;"),
+            "changed content must appear:\n{output}"
+        );
+    }
+
     /// Non-overlapping multi-node diff: each node has its OWN hunk.
-    /// The dedup cursor must NOT suppress legitimate changed lines from independent nodes.
     ///
     /// Note: render_changed_only (default mode) does NOT emit unchanged context lines
     /// between independent changed ranges — only lines within each range's
