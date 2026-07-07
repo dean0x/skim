@@ -577,7 +577,9 @@ fn test_cli_filename_no_extension_fails() {
         .write_stdin("all: build")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unrecognized filename 'Makefile'"));
+        .stderr(predicate::str::contains(
+            "Unsupported language for file: Makefile",
+        ));
 }
 
 #[test]
@@ -588,7 +590,9 @@ fn test_cli_filename_unknown_ext_fails() {
         .write_stdin("some content")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unrecognized filename 'foo.xyz'"));
+        .stderr(predicate::str::contains(
+            "Unsupported language for file: foo.xyz",
+        ));
 }
 
 #[test]
