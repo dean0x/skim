@@ -141,6 +141,10 @@ mod tests {
             script.contains("export SKIM_HOOK_BINARY="),
             "script must export SKIM_HOOK_BINARY, got: {script}"
         );
+        assert!(
+            script.contains("export SKIM_HOOK_COMMIT="),
+            "script must export SKIM_HOOK_COMMIT, got: {script}"
+        );
     }
 
     #[test]

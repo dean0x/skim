@@ -233,9 +233,10 @@ fn test_bash_structure_heredoc_strips_body() {
 #[test]
 fn test_bash_structure_crlf_full_file() {
     // AC-F4.2: a file whose EVERY line ends with \r\n (not just the shebang) must
-    // still produce valid structure output.  The fixture crlf_dialect.sh carries the
-    // CRLF name but ships with LF bytes (git normalisation); this in-code test is the
-    // authoritative end-to-end coverage for the full-file CRLF path.
+    // still produce valid structure output.  The fixture crlf_dialect.sh ships real
+    // CRLF bytes (protected by .gitattributes -text, so git does not normalise them);
+    // this in-code test is the authoritative end-to-end coverage for the full-file
+    // CRLF path.
     let crlf = "#!/bin/bash\r\nfunction hello_crlf() {\r\n  echo hi\r\n}\r\nhello_crlf\r\n";
     let out = transform(crlf, Language::Bash, Mode::Structure).unwrap();
     // Structure mode should preserve the function name.
@@ -311,10 +312,10 @@ fn test_bash_signatures_mode() {
 fn test_bash_types_mode_empty_for_no_types() {
     // Bash has no type system — types mode returns empty
     let result = transform(FUNCTIONS_SH, Language::Bash, Mode::Types).unwrap();
-    // Types mode for bash should be empty or minimal (no type system)
+    // Types mode for bash must be empty — bash has no type system.
     assert!(
-        result.trim().is_empty() || result.len() < FUNCTIONS_SH.len(),
-        "Types mode should produce minimal output for bash (no type system), got:\n{result}"
+        result.trim().is_empty(),
+        "Types mode should produce empty output for bash (no type system), got:\n{result}"
     );
 }
 

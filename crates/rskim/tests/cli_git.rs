@@ -1070,6 +1070,21 @@ fn test_skim_git_diff_text_never_expands_vs_raw() {
         String::from_utf8_lossy(&skim_output.stdout),
         String::from_utf8_lossy(&raw_output.stdout),
     );
+
+    // ADR-003 invariant: size-only assertions are omission-blind.
+    // Assert that the actual changed lines are present in skim's output — proving
+    // that compression did not silently drop any changed content.
+    let skim_stdout = String::from_utf8_lossy(&skim_output.stdout);
+    assert!(
+        skim_stdout.contains("x * 3"),
+        "F1/ADR-003: changed body line 'x * 3' must appear in skim diff output; \
+         got stdout={skim_stdout:?}"
+    );
+    assert!(
+        skim_stdout.contains("modified_helper"),
+        "F1/ADR-003: changed body line 'modified_helper' must appear in skim diff output; \
+         got stdout={skim_stdout:?}"
+    );
 }
 
 /// F1/orphan-hunk: changes between top-level AST nodes must appear in output.
