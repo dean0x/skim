@@ -70,6 +70,26 @@ static RE_LS_LONG: LazyLock<Regex> =
 // ls: multi-section support (R5)
 // ============================================================================
 
+/// Core predicate for section-header detection, called at three sites with
+/// slightly different guard requirements.
+///
+/// Always checks: `trimmed.ends_with(':')` and `!trimmed.starts_with("total ")`.
+///
+/// Optional guards (flags encode each site's exact current semantics):
+/// - `require_perm_check`: also require `!RE_LS_LONG.is_match(trimmed)` — needed at
+///   long-form sites where a permission line could end with `:`.
+/// - `require_non_empty`: also require `!trimmed.is_empty()`.
+fn looks_like_section_header(
+    trimmed: &str,
+    require_perm_check: bool,
+    require_non_empty: bool,
+) -> bool {
+    trimmed.ends_with(':')
+        && (!require_non_empty || !trimmed.is_empty())
+        && (!require_perm_check || !RE_LS_LONG.is_match(trimmed))
+        && !trimmed.starts_with("total ")
+}
+
 /// True if `line` is an `ls -R` or multi-path section header (e.g. `"./dir:"`, `"/path:"`).
 ///
 /// A section header:
@@ -79,11 +99,7 @@ static RE_LS_LONG: LazyLock<Regex> =
 ///   suffixed names are not misidentified)
 /// - does NOT start with `"total "` (the disk-usage preamble)
 pub(crate) fn is_ls_section_header(line: &str) -> bool {
-    let trimmed = line.trim();
-    !trimmed.is_empty()
-        && trimmed.ends_with(':')
-        && !RE_LS_LONG.is_match(trimmed)
-        && !trimmed.starts_with("total ")
+    looks_like_section_header(line.trim(), true, true)
 }
 
 /// Accumulated data for one directory section in multi-dir `ls -la` output.
@@ -100,6 +116,44 @@ struct LsSection {
     files: usize,
     /// True if at least one permission-regex line was seen (confirms `ls -la` format).
     has_long_lines: bool,
+}
+
+/// Processes one line of long-form `ls -la` output into `sec`.
+///
+/// Sets `sec.has_long_lines` when a permission-regex line is seen — including `.`/`..`
+/// entries — so callers can distinguish "not ls -la format" from "empty dir whose only
+/// entries were dotdirs".  Dotdir entries are not added to counts or the display list.
+/// Non-permission lines (`total N`, blank lines, etc.) are silently skipped.
+fn accumulate_long_entry(sec: &mut LsSection, line: &str) {
+    if !RE_LS_LONG.is_match(line) {
+        return;
+    }
+    sec.has_long_lines = true;
+
+    // Skip `.` and `..` dotdir entries.  For symlink rows (`name -> target`),
+    // split on " -> " first so we compare the NAME, not the target — a symlink
+    // named `cur -> .` must not be dropped because its target happens to be `.`.
+    // Trailing `/` (from `-F`/`-p` flags) is trimmed before the comparison.
+    let name_part = line.split(" -> ").next().unwrap_or(line);
+    if matches!(
+        name_part
+            .split_whitespace()
+            .last()
+            .map(|s| s.trim_end_matches('/')),
+        Some(".") | Some("..")
+    ) {
+        return;
+    }
+
+    sec.total_entries += 1;
+    if line.starts_with('d') {
+        sec.dirs += 1;
+    } else {
+        sec.files += 1;
+    }
+    if sec.entries.len() < MAX_DISPLAY_ENTRIES {
+        sec.entries.push(line.to_string());
+    }
 }
 
 /// Split `ls -la` stdout into per-directory sections.
@@ -150,32 +204,7 @@ fn parse_ls_long_sections(stdout: &str) -> Vec<LsSection> {
             &mut leading
         };
 
-        if !RE_LS_LONG.is_match(line) {
-            continue; // total N, blank lines, etc.
-        }
-        sec.has_long_lines = true;
-
-        // Skip `.` and `..` dotdir entries (same logic as try_parse_ls_long_flat).
-        let name_part = line.split(" -> ").next().unwrap_or(line);
-        if matches!(
-            name_part
-                .split_whitespace()
-                .last()
-                .map(|s| s.trim_end_matches('/')),
-            Some(".") | Some("..")
-        ) {
-            continue;
-        }
-
-        sec.total_entries += 1;
-        if line.starts_with('d') {
-            sec.dirs += 1;
-        } else {
-            sec.files += 1;
-        }
-        if sec.entries.len() < MAX_DISPLAY_ENTRIES {
-            sec.entries.push(line.to_string());
-        }
+        accumulate_long_entry(sec, line);
     }
 
     // Prepend the unlabeled leading section if it captured any real entries.
@@ -350,68 +379,40 @@ fn try_parse_ls_long_sectioned(stdout: &str) -> Option<FileResult> {
 /// rather than None, preventing Tier-2 from mis-tokenising the `total`/`.`/`..`
 /// lines as plain filenames.
 fn try_parse_ls_long_flat(stdout: &str) -> Option<FileResult> {
-    let mut dirs = 0usize;
-    let mut files = 0usize;
-    let mut entries: Vec<String> = Vec::with_capacity(MAX_DISPLAY_ENTRIES);
-    let mut line_count = 0usize;
-    // Set when any permission-regex line is seen (including . and ..).
-    // Distinguishes "not ls -la output" (return None) from "empty dir whose
-    // only entries were . and .." (return Full with 0 real entries).
-    let mut saw_long_line = false;
+    let mut sec = LsSection {
+        label: String::new(),
+        entries: Vec::with_capacity(MAX_DISPLAY_ENTRIES),
+        total_entries: 0,
+        dirs: 0,
+        files: 0,
+        has_long_lines: false,
+    };
 
     for line in stdout.lines().take(MAX_INPUT_LINES) {
-        if !RE_LS_LONG.is_match(line) {
-            continue;
-        }
-        saw_long_line = true;
-
-        // Skip `.` and `..` dotdir entries.  For symlink rows (`name -> target`),
-        // split on " -> " first so we compare the NAME, not the target — a symlink
-        // named `cur -> .` must not be dropped because its target happens to be `.`.
-        // Trailing `/` (from `-F`/`-p` flags) is trimmed before the comparison.
-        let name_part = line.split(" -> ").next().unwrap_or(line);
-        if matches!(
-            name_part
-                .split_whitespace()
-                .last()
-                .map(|s| s.trim_end_matches('/')),
-            Some(".") | Some("..")
-        ) {
-            continue;
-        }
-
-        line_count += 1;
-        if line.starts_with('d') {
-            dirs += 1;
-        } else {
-            files += 1;
-        }
-        if entries.len() < MAX_DISPLAY_ENTRIES {
-            entries.push(line.to_string());
-        }
+        accumulate_long_entry(&mut sec, line);
     }
 
     // Empty dir (only . and .. entries): return Full with 0 real entries rather
     // than None so Tier-2 doesn't mis-tokenise `total`/`.`/`..` lines.
-    if !saw_long_line {
+    if !sec.has_long_lines {
         return None;
     }
 
-    let shown_count = entries.len();
+    let shown_count = sec.entries.len();
 
     // Build footer: fold the dir/file breakdown into the elision marker (if any),
     // or emit just "D dirs, F files" when everything fits.
-    let breakdown = format!("{dirs} dirs, {files} files");
-    let footer = match crate::output::elision_marker(shown_count, line_count, "entries") {
+    let breakdown = format!("{} dirs, {} files", sec.dirs, sec.files);
+    let footer = match crate::output::elision_marker(shown_count, sec.total_entries, "entries") {
         Some(elision) => Some(format!("{elision} — {breakdown}")),
         None => Some(breakdown),
     };
 
     Some(FileResult::new(
         "ls".to_string(),
-        line_count,
+        sec.total_entries,
         shown_count,
-        entries,
+        sec.entries,
         footer,
     ))
 }
@@ -448,10 +449,7 @@ fn try_parse_ls_plain(stdout: &str) -> Option<FileResult> {
         .iter()
         .filter(|b| {
             b.first()
-                .map(|l| {
-                    let t = l.trim();
-                    t.ends_with(':') && !t.is_empty() && !t.starts_with("total ")
-                })
+                .map(|l| looks_like_section_header(l.trim(), false, true))
                 .unwrap_or(false)
         })
         .count();
@@ -511,7 +509,7 @@ fn try_parse_ls_plain_sectioned(blocks: &[Vec<&str>]) -> Option<FileResult> {
         };
 
         let first_trimmed = first_line.trim();
-        if first_trimmed.ends_with(':') && !first_trimmed.starts_with("total ") {
+        if looks_like_section_header(first_trimmed, false, false) {
             // Named block: label header then filenames.
             all_entries.push(first_trimmed.to_string());
             let mut section_total = 0usize;
