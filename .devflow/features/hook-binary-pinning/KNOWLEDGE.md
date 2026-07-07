@@ -5,7 +5,7 @@ description: "Use when modifying hook script generation, adding new agents, chan
 category: domain-knowledge
 directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/rewrite]
 created: 2026-07-04
-updated: 2026-07-04
+updated: 2026-07-07
 ---
 
 # Agent Hook Install, Binary Pinning & Handshake
@@ -112,7 +112,7 @@ Two comparisons:
 Both comparisons:
 - Skip if the env var is not set (backward compat: old scripts don't export these)
 - Skip `SKIM_HOOK_COMMIT` comparison if either side is `"unknown"` (tarball builds)
-- Rate-limited via per-agent daily stamp files in the cache dir: `.hook-binary-warned-{agent}`, `.hook-commit-warned-{agent}`
+- Rate-limited via `warn_once_daily(cache_dir, kind, agent_name, msg)` — the single shared helper that constructs `.hook-{kind}-warned-{agent}` stamp files; each warning kind (`"binary"`, `"commit"`) fires independently once per day via its own stamp. `check_hook_version_mismatch` uses the same helper with kind `"version"` before delegating to this function.
 - Log to `hook.log` **ONLY** — never stderr (hard zero-stderr invariant, GRANITE #361 Bug 3)
 
 Manually re-pointing an installed hook to a different path trips the binary-path check. This is by design. The correct remediation is `skim init --uninstall --force && skim init`: `--force` bypasses the tamper-guard on uninstall (the SHA-256 sidecar mismatches because the file bytes changed), then plain `skim init` installs a fresh clean script. Note: `--force` is an uninstall-only flag and has no effect on the install path; `--yes` is also uninstall-only (skips the interactive confirmation prompt) and does not trigger regeneration on its own.
@@ -168,7 +168,12 @@ Binary paths are embedded via `shell_single_quote()`:
 - Path with spaces: `/path/with spaces/skim` → `'/path/with spaces/skim'`
 - Path with embedded `'`: `/path/with'quote` → `'/path/with'\''quote'`
 
-`generate_hook_script` asserts that `version` and `agent_cli_name` contain only alphanumeric + `.`/`-` chars (panics if not). Binary paths go through `shell_single_quote` and are safe for any content.
+`generate_hook_script` asserts three parameters before embedding them unquoted in the script:
+- `version`: alphanumeric + `.`/`-` chars only
+- `agent_cli_name`: alphanumeric + `-` chars only
+- `git_commit`: strictly ascii-alphanumeric only (accepts hex SHAs and `"unknown"`)
+
+All three `assert!` calls fire at `skim init` time — before any user hook file is written. Binary paths go through `shell_single_quote` and are safe for any content.
 
 ### Atomic Hook Script Write
 
@@ -206,7 +211,7 @@ Cursor used to be incorrectly written to `settings.json` using the Claude Code P
 
 **The integrity check skips non-ClaudeCode agents**: `check_hook_integrity` is called only for `AgentKind::ClaudeCode` (see the `if agent_kind == AgentKind::ClaudeCode` guard in `run_hook_mode`). The TODO comment acknowledges this should be extended to Cursor/Gemini/Copilot once their install paths are validated.
 
-**`SKIM_HOOK_COMMIT` has no quotes**: `export SKIM_HOOK_COMMIT={git_commit}` — no surrounding quotes in the generated script. This is safe because `git rev-parse --short HEAD` produces only hexadecimal characters, and `"unknown"` contains no shell-special characters. But any future format change to this field must verify shell safety.
+**`SKIM_HOOK_COMMIT` has no quotes**: `export SKIM_HOOK_COMMIT={git_commit}` — no surrounding quotes in the generated script. This is safe because `git rev-parse --short HEAD` produces only hexadecimal characters, and `"unknown"` contains no shell-special characters. `generate_hook_script` now enforces this with a defense-in-depth `assert!` (ascii-alphanumeric only) that fires at `skim init` time, mirroring the existing `version` and `agent_cli_name` asserts. Any future format change to `SKIM_GIT_COMMIT` (e.g., adding a prefix like `commit-`) must widen the predicate in `generate_hook_script` before deploying.
 
 **Pre-fetched contents optimization**: `detect_state` reads the hook script once into `hook_script_contents` and passes it as `prefetched_contents` to `extract_hook_version_from_entry`. Callers passing `None` to that function will trigger a second `fs::read_to_string` — not a bug but a performance consideration in tight paths.
 
@@ -219,7 +224,7 @@ Cursor used to be incorrectly written to `settings.json` using the Claude Code P
 - `crates/rskim/src/cmd/hooks/mod.rs` — `generate_hook_script()`, `shell_single_quote()`, `HookProtocol` trait, `HookSupport` enum, shared `parse_tool_input_command()` and `upsert_hook_versioned()`
 - `crates/rskim/src/cmd/init/state.rs` — `detect_state()`, `uses_pinned_binary()`, `DetectedState`, `hook_is_current()`
 - `crates/rskim/src/cmd/init/install.rs` — `is_hook_script_current()`, `create_hook_script()`, `atomic_write_executable()`, `migrate_cursor_legacy_settings()`
-- `crates/rskim/src/cmd/rewrite/hook.rs` — `run_hook_mode()`, `check_hook_binary_mismatch()`, `check_hook_version_mismatch()`, `check_hook_integrity()`, `should_warn_today()`
+- `crates/rskim/src/cmd/rewrite/hook.rs` — `run_hook_mode()`, `check_hook_binary_mismatch()`, `check_hook_version_mismatch()`, `check_hook_integrity()`, `warn_once_daily()`, `should_warn_today()`
 - `crates/rskim/src/cmd/hooks/codex.rs` — `CodexCliHook` (AwarenessOnly reference implementation)
 - `crates/rskim/src/cmd/init/wrappers.rs` — `install_wrappers_in()`, `uninstall_wrappers_in()`, stem-only rule
 - `crates/rskim/build.rs` — `SKIM_GIT_COMMIT` build-time injection via `git rev-parse --short HEAD`
@@ -227,7 +232,7 @@ Cursor used to be incorrectly written to `settings.json` using the Claude Code P
 ## Related
 
 - D3 (batch decision): `SKIM_GIT_COMMIT` embedded via `build.rs` `option_env!`; `"unknown"` for tarball builds; `--version` prints `x.y.z (<shortsha>)`; hook scripts pin the absolute shell-quoted canonicalized generating-binary path with PATH fallback; handshake/mismatch signals go to `hook.log` ONLY (hard zero-stderr invariant, #361 Bug 3); manual repointing trips the integrity "tampered" check by design
-- ADR-001/ADR-002 (DECISIONS_CONTEXT index)
+- ADR-004 (hook install pins absolute binary path + handshake): decision that mandated the pinned-binary format and daily-rate-limited warn-only signaling in hook mode
 - PF-004 (rewrite-engine fidelity): connects to the two-surfaces distinction — rewrite-engine properties (flag preservation, corruption-bail, pipe-source passthrough) do not apply to the wrapper surface
 - Feature: `analytics` — session_id flows from hook JSON via sidecar, not via rewritten command flags (#1.1)
 - Source: `crates/rskim/src/cmd/integrity/` — `compute_file_hash()` and `write_hash_manifest()` used in SHA-256 sidecar generation
