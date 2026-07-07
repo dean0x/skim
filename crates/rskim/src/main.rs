@@ -180,9 +180,17 @@ const MAX_TOKEN_BUDGET: usize = 10_000_000;
 ///
 /// Transform source code by stripping implementation details while
 /// preserving structure, signatures, and types.
+/// Version string: "X.Y.Z (shortsha)" — or "X.Y.Z (unknown)" for tarball builds.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("SKIM_GIT_COMMIT"),
+    ")"
+);
+
 #[derive(Parser, Debug)]
 #[command(name = "skim")]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = VERSION, about, long_about = None)]
 #[command(after_help = "EXAMPLES:\n  \
     skim file.ts                             Read TypeScript with structure mode (cached)\n  \
     skim file.py --mode signatures           Extract Python signatures\n  \
@@ -227,10 +235,10 @@ struct Args {
     #[arg(help = "Transformation mode: structure, signatures, types, full, minimal, or pseudo")]
     mode: ModeArg,
 
-    /// Override language detection (required for stdin unless --filename is given)
+    /// Override language detection; stdin without this flag, --filename, or a shebang degrades to lossless passthrough (exit 0)
     #[arg(short, long, alias = "lang", value_enum)]
     #[arg(
-        help = "Programming language: typescript, javascript, python, rust, go, java, c, cpp, csharp, ruby, sql, kotlin, swift, markdown, json, yaml, toml (or use --filename for auto-detection from stdin)"
+        help = "Programming language: typescript, javascript, python, rust, go, java, c, cpp, csharp, ruby, sql, kotlin, swift, bash, markdown, json, yaml, toml (or use --filename for auto-detection from stdin)"
     )]
     language: Option<LanguageArg>,
 
@@ -411,6 +419,8 @@ enum LanguageArg {
     #[value(alias = "kt")]
     Kotlin,
     Swift,
+    #[value(alias = "sh")]
+    Bash,
 }
 
 impl From<LanguageArg> for Language {
@@ -433,6 +443,7 @@ impl From<LanguageArg> for Language {
             LanguageArg::Sql => Language::Sql,
             LanguageArg::Kotlin => Language::Kotlin,
             LanguageArg::Swift => Language::Swift,
+            LanguageArg::Bash => Language::Bash,
         }
     }
 }
@@ -817,7 +828,19 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {e:#}");
-            ExitCode::FAILURE
+            // Map known SkimError variants to documented exit codes:
+            //   exit 2 — parse error (grammar/syntax failure)
+            //   exit 3 — unsupported language / detection failure
+            //   exit 1 — all other errors (I/O, config, etc.)
+            if let Some(skim_err) = e.downcast_ref::<rskim_core::SkimError>() {
+                match skim_err {
+                    rskim_core::SkimError::ParseError(_) => ExitCode::from(2),
+                    rskim_core::SkimError::UnsupportedLanguage(_) => ExitCode::from(3),
+                    _ => ExitCode::FAILURE,
+                }
+            } else {
+                ExitCode::FAILURE
+            }
         }
     };
 

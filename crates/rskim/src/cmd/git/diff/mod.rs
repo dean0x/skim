@@ -227,14 +227,11 @@ fn render_and_format<'a>(
             json
         }
         OutputFormat::Text => {
-            // No guardrail: `git diff` is an enhancement command, not compression.
-            // The AST-aware renderer adds structural context (full container
-            // boundaries, line numbers) that will almost always produce more lines
-            // than the raw unified diff ±3-line context window. That is the
-            // intended behaviour — more context for the agent, not less.
-            let s = result.into_rendered();
-            print!("{s}");
-            s
+            // Text: return without printing here.
+            // run_diff applies the ADR-001 guardrail after the file_diffs borrow
+            // ends, then prints the final output (which may be raw if guardrail
+            // fires) and records what was actually printed.
+            result.into_rendered()
         }
     };
 
@@ -363,14 +360,47 @@ pub(super) fn run_diff(
         )?
     }; // file_diffs dropped here, raw_diff is free to move
 
-    // Both `raw_diff` and `result_str` are owned here; use the owned variant to
-    // move them directly without cloning (handles stats + analytics in one call).
+    // ADR-001 guardrail (applies ADR-001: compress, never truncate).
+    // Clone raw only when telemetry is needed (--show-stats or analytics enabled).
+    // For JSON output, render_and_format already printed; guardrail is skipped.
+    let raw_for_record = if show_stats || rec.enabled {
+        raw_diff.clone()
+    } else {
+        String::new()
+    };
+
+    let (final_str, tier) = match output_format {
+        OutputFormat::Text => {
+            // Apply the net-savings guardrail: if hunk-scoped output is still
+            // larger than the raw unified diff (e.g., many breadcrumbs), emit raw.
+            // `apply_to_stderr` consumes raw_diff here.
+            let outcome = crate::output::guardrail::apply_to_stderr(raw_diff, result_str)?;
+            let triggered = outcome.was_triggered();
+            let s = outcome.into_output();
+            print!("{s}");
+            (
+                s,
+                if triggered {
+                    "passthrough"
+                } else {
+                    "compressed"
+                },
+            )
+        }
+        OutputFormat::Json => {
+            // JSON was already printed inside render_and_format; raw_diff is no
+            // longer needed.  Analytics uses raw_for_record (clone taken above).
+            drop(raw_diff);
+            (result_str, "full")
+        }
+    };
+
     finalize_git_output_owned(
-        raw_diff,
-        result_str,
+        raw_for_record,
+        final_str,
         label,
         show_stats,
-        rec.with_tier("full"),
+        rec.with_tier(tier),
         duration,
     );
 

@@ -36,6 +36,7 @@ pub enum Language {
     Sql,
     Kotlin,
     Swift,
+    Bash,
 }
 
 impl Language {
@@ -48,6 +49,7 @@ impl Language {
     ///
     /// assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
     /// assert_eq!(Language::from_extension("py"), Some(Language::Python));
+    /// assert_eq!(Language::from_extension("sh"), Some(Language::Bash));
     /// assert_eq!(Language::from_extension("unknown"), None);
     /// ```
     pub fn from_extension(ext: &str) -> Option<Self> {
@@ -72,6 +74,74 @@ impl Language {
             "sql" => Some(Self::Sql),
             "kt" | "kts" => Some(Self::Kotlin),
             "swift" => Some(Self::Swift),
+            "sh" | "bash" => Some(Self::Bash),
+            _ => None,
+        }
+    }
+
+    /// Detect language from a shebang line (first line of a file).
+    ///
+    /// Handles the common forms:
+    /// - `#!/bin/bash`, `#!/bin/sh`, `#!/usr/bin/env bash`
+    /// - `#!/usr/bin/env -S bash -x` (env with flags)
+    /// - CRLF-tolerant (trailing `\r` stripped)
+    ///
+    /// Only called for unknown-extension files; the known-extension hot path
+    /// is unaffected (startup <10ms guarantee preserved).
+    ///
+    /// # Examples
+    /// ```
+    /// use rskim_core::Language;
+    ///
+    /// assert_eq!(Language::from_shebang("#!/bin/bash"), Some(Language::Bash));
+    /// assert_eq!(Language::from_shebang("#!/usr/bin/env python3"), Some(Language::Python));
+    /// assert_eq!(Language::from_shebang("#!/usr/bin/env node"), Some(Language::JavaScript));
+    /// assert_eq!(Language::from_shebang("# plain comment"), None);
+    /// ```
+    pub fn from_shebang(first_line: &str) -> Option<Self> {
+        // CRLF-tolerant: strip trailing \r before processing
+        let line = first_line.trim_end_matches('\r');
+        let after_shebang = line.strip_prefix("#!")?;
+
+        // Tokenise the interpreter line. Example forms:
+        //   /bin/bash
+        //   /usr/bin/env bash
+        //   /usr/bin/env -S bash -x
+        let words: Vec<&str> = after_shebang.split_whitespace().collect();
+        if words.is_empty() {
+            return None;
+        }
+
+        let interpreter = if std::path::Path::new(words[0])
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n == "env")
+            .unwrap_or(false)
+        {
+            // env: skip option-like words (starting with '-'), take first non-option arg
+            words
+                .iter()
+                .skip(1)
+                .find(|w| !w.starts_with('-'))
+                .copied()
+                .unwrap_or("")
+        } else {
+            // Direct interpreter path: use basename
+            std::path::Path::new(words[0])
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+        };
+
+        // Normalise: strip any trailing version digits so python3.12 → python3 → python
+        // and bash-5.1 → bash
+        let base = interpreter.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+
+        match base {
+            "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh" | "fish" => Some(Self::Bash),
+            "python" => Some(Self::Python),
+            "node" | "nodejs" => Some(Self::JavaScript),
+            "ruby" => Some(Self::Ruby),
             _ => None,
         }
     }
@@ -118,6 +188,7 @@ impl Language {
             Self::Sql => "SQL",
             Self::Kotlin => "Kotlin",
             Self::Swift => "Swift",
+            Self::Bash => "Bash",
         }
     }
 
@@ -145,6 +216,7 @@ impl Language {
             Self::Sql => "sql",
             Self::Kotlin => "kotlin",
             Self::Swift => "swift",
+            Self::Bash => "bash",
         }
     }
 
@@ -179,6 +251,7 @@ impl Language {
             Self::Sql => Some(tree_sitter_sequel::LANGUAGE.into()),
             Self::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
             Self::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
+            Self::Bash => Some(tree_sitter_bash::LANGUAGE.into()),
         }
     }
 

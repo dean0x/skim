@@ -42,6 +42,9 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     expected_exit_codes: &[1],
     forward_stderr: false,
     skip_net_savings_guard: false,
+    // biome always prints a status summary (e.g. "Checked N file(s)") — not silent on success.
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 /// AD-LINT-21 (2026-04-15) — `.+` captures paths with spaces.

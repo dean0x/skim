@@ -2974,3 +2974,123 @@ fn cli_rewrite_no_newline_still_rewrites() {
         .success()
         .stdout(predicate::str::contains("skim grep -rn x dir"));
 }
+
+// ============================================================================
+// F7: cat guard hook-mode regression tests (PF-004)
+//
+// The cat handler has two guards in handlers.rs:
+//   1. Flag bail (lines 73-87): flags -A, -v, -e, -t, -n, -b all indicate
+//      non-pure-content display modes — the rewrite is suppressed because
+//      skim cat would produce different output from raw `cat`.
+//   2. Non-code-extension bail (line ~90): files with unsupported extensions
+//      (e.g., .mds, .txt) are not skim-readable — the rewrite is suppressed.
+//
+// In hook mode, a suppressed rewrite produces empty stdout (exit 0).  These
+// tests pin the guards against accidental removal so any regression is caught
+// immediately at the E2E layer.
+// ============================================================================
+
+/// Helper: build a JSON hook payload for a cat command in hook mode.
+fn cat_hook_payload(cmd: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "tool_input": { "command": cmd }
+    }))
+    .unwrap()
+}
+
+/// Guard 1a: `cat -A file.ts` — `-A` flag bails out (show-all, not content).
+#[test]
+fn test_cat_guard_flag_show_all_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat -A file.ts"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Guard 1b: `cat -v file.ts` — `-v` flag bails out (show-nonprinting).
+#[test]
+fn test_cat_guard_flag_v_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat -v file.ts"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Guard 1c: `cat -e file.ts` — `-e` flag bails out (show-ends + nonprinting).
+#[test]
+fn test_cat_guard_flag_e_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat -e file.ts"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Guard 1d: `cat -t file.ts` — `-t` flag bails out (show-tabs + nonprinting).
+#[test]
+fn test_cat_guard_flag_t_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat -t file.ts"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Guard 1e: `cat -n file.ts` — `-n` flag bails out (number all lines).
+///
+/// Skim does not reproduce line-number formatting; rewriting would change
+/// semantics.  This guard ensures the command is passed through unchanged.
+#[test]
+fn test_cat_guard_flag_n_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat -n file.ts"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Guard 1f: `cat -b file.ts` — `-b` flag bails out (number non-blank lines).
+#[test]
+fn test_cat_guard_flag_b_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat -b file.ts"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Guard 2a: `cat file.mds` — `.mds` is not a supported skim extension.
+///
+/// The non-code-extension bail prevents skim from being called on unrecognized
+/// file types where it would either error or produce meaningless output.
+#[test]
+fn test_cat_guard_unsupported_extension_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat file.mds"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Guard 2b: `cat -A *.mds` — flag bail takes precedence over glob / extension.
+///
+/// The flag guard fires first, so even a glob pattern with an unsupported
+/// extension produces no rewrite.
+#[test]
+fn test_cat_guard_flag_show_all_with_glob_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat -A *.mds"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}

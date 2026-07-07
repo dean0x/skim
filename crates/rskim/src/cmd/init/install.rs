@@ -469,17 +469,18 @@ fn find_git_root_from_cwd() -> Option<std::path::PathBuf> {
 // ============================================================================
 
 /// Return `true` when the script at `script_path` already contains the
-/// expected version marker *and* a bare `exec skim …` invocation, meaning the
-/// file is already up to date and can be skipped.
+/// expected version marker *and* exports `SKIM_HOOK_BINARY` (the pinned binary
+/// format introduced in F6), meaning the file is already up to date and can be
+/// skipped.
+///
+/// Old scripts that only have a bare `exec skim …` line (pre-F6) are treated as
+/// stale: they lack the pinned-binary exports and must be regenerated.
 fn is_hook_script_current(script_path: &std::path::Path, version: &str) -> bool {
     let Ok(contents) = std::fs::read_to_string(script_path) else {
         return false;
     };
     let version_line = format!("# skim-hook v{version}");
-    let has_bare_cmd = contents
-        .lines()
-        .any(|l| l.trim_start().starts_with("exec skim "));
-    contents.contains(&version_line) && has_bare_cmd
+    contents.contains(&version_line) && super::script_has_pinned_marker(&contents)
 }
 
 fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
@@ -523,12 +524,21 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
         println!("  {} Created: {}", check_mark(true), script_path.display());
     }
 
+    // Canonicalize the current binary path for embedding in the hook script.
+    // Falls back gracefully: canonicalize → current_exe → empty string.
+    // The path is single-quoted inside generate_hook_script, so spaces are safe.
+    let binary_path = std::env::current_exe()
+        .and_then(|p| std::fs::canonicalize(&p).or(Ok(p)))
+        .unwrap_or_default();
+    let binary_path_str = binary_path.to_string_lossy();
+
     // Delegate to the shared generator in hooks/mod.rs so install.rs and per-agent
     // HookProtocol impls always produce identical scripts. generate_hook_script
     // validates that version and agent_cli_name are shell-safe and panics if not —
     // both values are &'static str from AgentKind::cli_name() and
     // compile-time CARGO_PKG_VERSION, so this is safe.
-    let script_content = generate_hook_script(&state.skim_version, state.agent_cli_name);
+    let script_content =
+        generate_hook_script(&state.skim_version, state.agent_cli_name, &binary_path_str);
 
     atomic_write_executable(&hooks_dir, &script_path, &script_content)?;
 
@@ -803,15 +813,35 @@ mod tests {
     // ---- is_hook_script_current ----
 
     #[test]
-    fn test_is_hook_script_current_matching_version_and_bare_exec_returns_true() {
+    fn test_is_hook_script_current_pinned_format_returns_true() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("skim-rewrite.sh");
-        let content = "#!/bin/sh\n# skim-hook v1.2.3\nexec skim rewrite --hook \"$@\"\n";
+        // New F6 pinned format: version comment + SKIM_HOOK_BINARY export.
+        let content = "#!/bin/sh\n# skim-hook v1.2.3\n\
+                       export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
+                       export SKIM_HOOK_COMMIT=abc1234\n\
+                       _SKIM_BIN='/usr/local/bin/skim'\n\
+                       if [ -x \"$_SKIM_BIN\" ]; then exec \"$_SKIM_BIN\" rewrite --hook --agent claude-code; fi\n\
+                       exec skim rewrite --hook --agent claude-code\n";
         std::fs::write(&path, content).unwrap();
 
         assert!(
             is_hook_script_current(&path, "1.2.3"),
-            "matching version + bare exec line must return true"
+            "matching version + SKIM_HOOK_BINARY export must return true"
+        );
+    }
+
+    #[test]
+    fn test_is_hook_script_current_old_bare_exec_returns_false() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("skim-rewrite.sh");
+        // Pre-F6 bare-exec format is stale — no SKIM_HOOK_BINARY export.
+        let content = "#!/bin/sh\n# skim-hook v1.2.3\nexec skim rewrite --hook \"$@\"\n";
+        std::fs::write(&path, content).unwrap();
+
+        assert!(
+            !is_hook_script_current(&path, "1.2.3"),
+            "old bare-exec format (no SKIM_HOOK_BINARY) must return false even when version matches"
         );
     }
 
@@ -819,8 +849,10 @@ mod tests {
     fn test_is_hook_script_current_wrong_version_returns_false() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("skim-rewrite.sh");
-        // Script has v1.0.0 but we check for v2.0.0
-        let content = "#!/bin/sh\n# skim-hook v1.0.0\nexec skim rewrite --hook \"$@\"\n";
+        // Script has v1.0.0 with new pinned format but we check for v2.0.0
+        let content = "#!/bin/sh\n# skim-hook v1.0.0\n\
+                       export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
+                       exec skim rewrite --hook\n";
         std::fs::write(&path, content).unwrap();
 
         assert!(
@@ -841,16 +873,16 @@ mod tests {
     }
 
     #[test]
-    fn test_is_hook_script_current_missing_bare_exec_returns_false() {
+    fn test_is_hook_script_current_missing_pinned_binary_returns_false() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("skim-rewrite.sh");
-        // Version matches but no bare `exec skim ` line
+        // Version matches but no SKIM_HOOK_BINARY export at all
         let content = "#!/bin/sh\n# skim-hook v1.2.3\nskim rewrite --hook \"$@\"\n";
         std::fs::write(&path, content).unwrap();
 
         assert!(
             !is_hook_script_current(&path, "1.2.3"),
-            "missing bare exec line must return false even when version matches"
+            "missing SKIM_HOOK_BINARY export must return false even when version matches"
         );
     }
 
@@ -1151,7 +1183,7 @@ mod tests {
             settings_exists: false,
             hook_installed: false,
             hook_version: None,
-            hook_uses_bare_command: false,
+            hook_uses_pinned_binary: false,
             dual_scope_warning: None,
             existing_hooks: vec![],
             agent_cli_name,

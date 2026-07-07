@@ -67,5 +67,16 @@ crates/rskim-search/data/
 librust_out.rlib
 package-lock.json
 
-# Devflow runtime data (local by default; remove to share via git)
-.devflow/
+
+# Devflow runtime data — local by default (memory, dream, docs, decisions, locks).
+# Exception: feature knowledge bases under .devflow/features/ are shared via git —
+# index.md and every {slug}/KNOWLEDGE.md are tracked and committed; everything else
+# under .devflow/features/ stays local. To stop sharing, re-add `.devflow/features/`
+# to your own .gitignore.
+.devflow/*
+!.devflow/features/
+.devflow/features/*
+!.devflow/features/index.md
+!.devflow/features/*/
+.devflow/features/*/*
+!.devflow/features/*/KNOWLEDGE.md

@@ -127,7 +127,8 @@ pub(crate) fn is_comment_node(kind: &str, language: Language) -> bool {
         | Language::Cpp
         | Language::CSharp
         | Language::Ruby
-        | Language::Sql => kind == "comment",
+        | Language::Sql
+        | Language::Bash => kind == "comment",
         Language::Rust | Language::Java | Language::Kotlin => {
             kind == "line_comment" || kind == "block_comment"
         }
@@ -213,6 +214,10 @@ fn is_doc_comment(node: Node, source: &str, language: Language) -> bool {
         }
         Language::Sql => {
             // SQL `--` comments have no doc comment convention
+            false
+        }
+        Language::Bash => {
+            // Bash `#` comments have no doc comment convention
             false
         }
         // Markdown, JSON, YAML, TOML don't reach here

@@ -18,8 +18,8 @@ pub(super) struct DetectedState {
     pub(super) settings_exists: bool,
     pub(super) hook_installed: bool,
     pub(super) hook_version: Option<String>,
-    /// Whether the hook script uses bare `skim` (PATH-resolved) vs hardcoded binary path.
-    pub(super) hook_uses_bare_command: bool,
+    /// Whether the hook script uses the pinned binary format (exports `SKIM_HOOK_BINARY`).
+    pub(super) hook_uses_pinned_binary: bool,
     /// If installing to one scope and the other scope also has a hook
     pub(super) dual_scope_warning: Option<String>,
     /// Existing non-skim hooks for the agent's tool matcher (plugin collision detection)
@@ -30,9 +30,9 @@ pub(super) struct DetectedState {
 
 impl DetectedState {
     /// Returns `true` when the installed hook is at the current version and
-    /// already uses the bare `skim` command format (no reinstall needed).
+    /// already uses the pinned binary format (no reinstall needed).
     pub(super) fn hook_is_current(&self) -> bool {
-        self.hook_version.as_deref() == Some(&self.skim_version) && self.hook_uses_bare_command
+        self.hook_version.as_deref() == Some(&self.skim_version) && self.hook_uses_pinned_binary
     }
 }
 
@@ -85,10 +85,10 @@ pub(super) fn detect_state(
     // Dual-scope check (B5)
     let dual_scope_warning = check_dual_scope(flags, agent)?;
 
-    // Reuse the already-read hook script contents for bare-command detection.
-    let hook_uses_bare_command = hook_script_contents
+    // Reuse the already-read hook script contents for pinned-binary detection.
+    let hook_uses_pinned_binary = hook_script_contents
         .as_deref()
-        .map(uses_bare_command)
+        .map(uses_pinned_binary)
         .unwrap_or(false);
 
     Ok(DetectedState {
@@ -99,31 +99,29 @@ pub(super) fn detect_state(
         settings_exists,
         hook_installed,
         hook_version,
-        hook_uses_bare_command,
+        hook_uses_pinned_binary,
         dual_scope_warning,
         existing_hooks,
         agent_cli_name: agent.cli_name(),
     })
 }
 
-/// Returns `true` when `contents` of a hook script use the bare `skim` command
-/// (PATH-resolved) rather than a hardcoded binary path.
+/// Returns `true` when `contents` of a hook script use the pinned binary format:
+/// exports `SKIM_HOOK_BINARY` which is the install-time canonical path.
 ///
-/// Anchors to line-start (after optional leading whitespace) to avoid
-/// false-positives from comment lines that mention `exec skim `.
-fn uses_bare_command(contents: &str) -> bool {
-    contents
-        .lines()
-        .any(|l| l.trim_start().starts_with("exec skim "))
+/// Old hook scripts that only have bare `exec skim` (no `SKIM_HOOK_BINARY`) are
+/// considered stale and cause a reinstall so they gain the pinned-binary format.
+fn uses_pinned_binary(contents: &str) -> bool {
+    super::script_has_pinned_marker(contents)
 }
 
 /// Check if the hook script at `config_dir/hooks/HOOK_SCRIPT_NAME` uses the
-/// bare `skim` command.  Used by tests that drive detection with a temp dir.
+/// pinned binary format.  Used by tests that drive detection with a temp dir.
 #[cfg(test)]
-fn hook_script_uses_bare_command(config_dir: &Path) -> bool {
+fn hook_script_uses_pinned_binary(config_dir: &Path) -> bool {
     let script_path = config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
     std::fs::read_to_string(&script_path)
-        .map(|c| uses_bare_command(&c))
+        .map(|c| uses_pinned_binary(&c))
         .unwrap_or(false)
 }
 
@@ -354,7 +352,30 @@ mod tests {
     use crate::cmd::hooks::cursor::CursorHook;
 
     #[test]
-    fn test_hook_script_uses_bare_command_new_format() {
+    fn test_hook_script_uses_pinned_binary_true_for_new_format() {
+        // New F6 format: exports SKIM_HOOK_BINARY → pinned.
+        let dir = tempfile::TempDir::new().unwrap();
+        let hooks_dir = dir.path().join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            hooks_dir.join(HOOK_SCRIPT_NAME),
+            "#!/usr/bin/env bash\n\
+             export SKIM_HOOK_VERSION=\"2.5.1\"\n\
+             export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
+             export SKIM_HOOK_COMMIT=abc1234\n\
+             _SKIM_BIN='/usr/local/bin/skim'\n\
+             if [ -x \"$_SKIM_BIN\" ]; then\n\
+               exec \"$_SKIM_BIN\" rewrite --hook --agent claude-code\n\
+             fi\n\
+             exec skim rewrite --hook --agent claude-code\n",
+        )
+        .unwrap();
+        assert!(hook_script_uses_pinned_binary(dir.path()));
+    }
+
+    #[test]
+    fn test_hook_script_uses_pinned_binary_false_for_bare_command() {
+        // Old "bare skim" format (pre-F6) is stale → not pinned.
         let dir = tempfile::TempDir::new().unwrap();
         let hooks_dir = dir.path().join("hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
@@ -363,11 +384,12 @@ mod tests {
             "#!/usr/bin/env bash\nexport SKIM_HOOK_VERSION=\"2.5.1\"\nexec skim rewrite --hook\n",
         )
         .unwrap();
-        assert!(hook_script_uses_bare_command(dir.path()));
+        assert!(!hook_script_uses_pinned_binary(dir.path()));
     }
 
     #[test]
-    fn test_hook_script_uses_bare_command_old_format() {
+    fn test_hook_script_uses_pinned_binary_false_for_old_absolute_path() {
+        // Oldest format (hardcoded absolute path, no SKIM_HOOK_BINARY export) → not pinned.
         let dir = tempfile::TempDir::new().unwrap();
         let hooks_dir = dir.path().join("hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
@@ -376,13 +398,13 @@ mod tests {
             "#!/usr/bin/env bash\nexec \"/usr/local/bin/skim\" rewrite --hook\n",
         )
         .unwrap();
-        assert!(!hook_script_uses_bare_command(dir.path()));
+        assert!(!hook_script_uses_pinned_binary(dir.path()));
     }
 
     #[test]
-    fn test_hook_script_uses_bare_command_missing() {
+    fn test_hook_script_uses_pinned_binary_false_when_missing() {
         let dir = tempfile::TempDir::new().unwrap();
-        assert!(!hook_script_uses_bare_command(dir.path()));
+        assert!(!hook_script_uses_pinned_binary(dir.path()));
     }
 
     #[test]

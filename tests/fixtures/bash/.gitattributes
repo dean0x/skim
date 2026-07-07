@@ -1,0 +1,4 @@
+# Prevent git from normalising the line endings in this fixture.
+# crlf_dialect.sh intentionally uses CRLF (\r\n) throughout to test
+# the full-file CRLF transform path (AC-F4.2).
+crlf_dialect.sh -text

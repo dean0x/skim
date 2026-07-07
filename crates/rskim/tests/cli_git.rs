@@ -923,3 +923,261 @@ fn test_skim_git_show_invalid_file_ref_exits_nonzero() {
         "skim git show HEAD:<missing-file> must emit git's error on stderr; got empty stderr"
     );
 }
+
+// ============================================================================
+// F1 — hunk-scoped diff render + ADR-001 guardrail (R2)
+// ============================================================================
+
+/// Create a hermetic git repo with a committed Rust file and an unstaged change
+/// inside a function body.
+///
+/// Exercises the AST-aware diff path where the changed line falls inside a
+/// function node, triggering `render_default_scoped`.
+///
+/// Returns the temp dir (caller must keep alive) and the repo path.
+fn make_hermetic_rust_diff_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir must succeed");
+    let path = dir.path().to_path_buf();
+
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&path)
+        .output()
+        .expect("git init");
+    for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+        std::process::Command::new("git")
+            .args(["config", k, v])
+            .current_dir(&path)
+            .output()
+            .expect("git config");
+    }
+
+    // Commit a Rust file with two functions.
+    let initial = "fn compute(x: i32) -> i32 {\n    x * 2\n}\n\nfn helper() -> &'static str {\n    \"original\"\n}\n";
+    std::fs::write(path.join("lib.rs"), initial).expect("write lib.rs");
+    std::process::Command::new("git")
+        .args(["add", "lib.rs"])
+        .current_dir(&path)
+        .output()
+        .expect("git add");
+    std::process::Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(&path)
+        .output()
+        .expect("git commit");
+
+    // Modify both function bodies so the diff hunks fall inside AST nodes.
+    let modified = "fn compute(x: i32) -> i32 {\n    x * 3\n}\n\nfn helper() -> &'static str {\n    \"modified_helper\"\n}\n";
+    std::fs::write(path.join("lib.rs"), modified).expect("write modified lib.rs");
+
+    (dir, path)
+}
+
+/// Create a hermetic repo where the uncommitted change is BETWEEN two functions
+/// (a module-level constant added in the gap) — triggering the orphan-hunk path.
+///
+/// Returns the temp dir (caller must keep alive) and the repo path.
+fn make_hermetic_orphan_hunk_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir must succeed");
+    let path = dir.path().to_path_buf();
+
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&path)
+        .output()
+        .expect("git init");
+    for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+        std::process::Command::new("git")
+            .args(["config", k, v])
+            .current_dir(&path)
+            .output()
+            .expect("git config");
+    }
+
+    // Initial: two functions with no content between them.
+    let initial = "fn alpha() -> i32 {\n    1\n}\n\nfn beta() -> i32 {\n    2\n}\n";
+    std::fs::write(path.join("lib.rs"), initial).expect("write lib.rs");
+    std::process::Command::new("git")
+        .args(["add", "lib.rs"])
+        .current_dir(&path)
+        .output()
+        .expect("git add");
+    std::process::Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(&path)
+        .output()
+        .expect("git commit");
+
+    // Add a constant between the two functions — this line is between two
+    // top-level function nodes so the hunk is an orphan (no AST node covers it).
+    let modified = "fn alpha() -> i32 {\n    1\n}\n\n/// Orphan constant between functions\nconst ORPHAN_MARKER: i32 = 99;\n\nfn beta() -> i32 {\n    2\n}\n";
+    std::fs::write(path.join("lib.rs"), modified).expect("write modified lib.rs");
+
+    (dir, path)
+}
+
+/// F1/ADR-001: `skim git diff` (Text mode) must never emit more bytes than the
+/// raw `git diff` on a hermetic repo with a Rust function-body change.
+///
+/// The hunk-scoped renderer (`render_default_scoped`) emits only breadcrumb +
+/// hunk patch lines. The ADR-001 guardrail wired into `run_diff` catches the
+/// remaining edge case where even the breadcrumb-only form exceeds raw.
+///
+/// Applies ADR-001 (compress, never truncate).
+#[test]
+fn test_skim_git_diff_text_never_expands_vs_raw() {
+    let (_dir, repo) = make_hermetic_rust_diff_repo();
+
+    // Capture raw `git diff` for byte-count comparison.
+    let raw_output = std::process::Command::new("git")
+        .arg("diff")
+        .current_dir(&repo)
+        .output()
+        .expect("git must be available");
+    let raw_len = raw_output.stdout.len();
+
+    // `skim git diff` — Text mode (no --json).
+    let skim_output = common::skim()
+        .args(["git", "diff"])
+        .current_dir(&repo)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim git diff must not fail to spawn");
+
+    assert!(
+        skim_output.status.success(),
+        "skim git diff must exit 0; stderr={}",
+        String::from_utf8_lossy(&skim_output.stderr)
+    );
+
+    let skim_len = skim_output.stdout.len();
+
+    // Output must be non-empty — diff must be visible.
+    assert!(
+        skim_len > 0,
+        "skim git diff must produce output; got empty stdout"
+    );
+
+    // ADR-001 invariant: skim must NEVER emit more bytes than the raw diff.
+    assert!(
+        skim_len <= raw_len,
+        "F1/ADR-001: skim git diff expanded output vs raw\n  \
+         raw={raw_len}B  skim={skim_len}B\n  \
+         skim stdout={:?}\n  \
+         raw stdout={:?}",
+        String::from_utf8_lossy(&skim_output.stdout),
+        String::from_utf8_lossy(&raw_output.stdout),
+    );
+
+    // ADR-003 invariant: size-only assertions are omission-blind.
+    // Assert that the actual changed lines are present in skim's output — proving
+    // that compression did not silently drop any changed content.
+    let skim_stdout = String::from_utf8_lossy(&skim_output.stdout);
+    assert!(
+        skim_stdout.contains("x * 3"),
+        "F1/ADR-003: changed body line 'x * 3' must appear in skim diff output; \
+         got stdout={skim_stdout:?}"
+    );
+    assert!(
+        skim_stdout.contains("modified_helper"),
+        "F1/ADR-003: changed body line 'modified_helper' must appear in skim diff output; \
+         got stdout={skim_stdout:?}"
+    );
+}
+
+/// F1/orphan-hunk: changes between top-level AST nodes must appear in output.
+///
+/// When a diff hunk's changed lines fall outside all detected AST node ranges
+/// (e.g. a module-level constant added between two functions), `render_default_scoped`
+/// renders those hunks as raw patch lines via the orphan fallback.
+///
+/// This test verifies that the orphan hunk content is not silently dropped.
+#[test]
+fn test_skim_git_diff_orphan_hunk_is_visible() {
+    let (_dir, repo) = make_hermetic_orphan_hunk_repo();
+
+    let skim_output = common::skim()
+        .args(["git", "diff"])
+        .current_dir(&repo)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim git diff must not fail to spawn");
+
+    assert!(
+        skim_output.status.success(),
+        "skim git diff must exit 0; stderr={}",
+        String::from_utf8_lossy(&skim_output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&skim_output.stdout);
+
+    // The orphan constant added between functions must appear in the output.
+    // If orphan hunks were silently dropped this assertion would fail.
+    assert!(
+        stdout.contains("ORPHAN_MARKER"),
+        "F1/orphan: orphan hunk content must be visible in skim diff output; \
+         got stdout={stdout:?}"
+    );
+}
+
+/// F1/argv0: `git diff` via the skim argv0 wrapper surface must not expand output.
+///
+/// The PATH-wrapper dispatch surface (argv0="git") routes to the same diff handler
+/// as the hook/rewrite surface but through a different front-end dispatch.
+/// Both surfaces share the hunk-scoped renderer and ADR-001 guardrail.
+///
+/// This test exercises the wrapper front-end independently of the hook surface.
+#[cfg(unix)]
+#[test]
+fn test_skim_git_diff_argv0_surface_does_not_expand() {
+    use std::os::unix::process::CommandExt as _;
+
+    let (_dir, repo) = make_hermetic_rust_diff_repo();
+
+    // Capture raw `git diff` for byte-count comparison.
+    let raw_output = std::process::Command::new("git")
+        .arg("diff")
+        .current_dir(&repo)
+        .output()
+        .expect("git must be available");
+    let raw_len = raw_output.stdout.len();
+
+    let skim = common::skim_bin();
+    assert!(
+        skim.exists(),
+        "skim binary must exist at {}: run `cargo build` first",
+        skim.display()
+    );
+
+    // Invoke as argv0="git" — exercises the wrapper dispatch path.
+    let skim_output = std::process::Command::new(&skim)
+        .arg0("git")
+        .arg("diff")
+        .current_dir(&repo)
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .output()
+        .expect("skim binary must be spawnable");
+
+    assert!(
+        skim_output.status.success(),
+        "argv0=git diff must exit 0; stderr={}",
+        String::from_utf8_lossy(&skim_output.stderr)
+    );
+
+    let skim_len = skim_output.stdout.len();
+
+    // ADR-001 invariant on the wrapper surface.
+    assert!(
+        skim_len <= raw_len,
+        "F1/argv0: skim argv0=git diff expanded output vs raw\n  \
+         raw={raw_len}B  skim={skim_len}B\n  \
+         skim stdout={:?}",
+        String::from_utf8_lossy(&skim_output.stdout),
+    );
+}

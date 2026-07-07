@@ -29,6 +29,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     // single predictable output shape instead of letting the net-savings guard
     // flip small result sets back to raw `file:line:content`.
     skip_net_savings_guard: true,
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 /// Run `skim rg [args...]`.
@@ -100,7 +102,7 @@ fn extract_match_fields(obj: &serde_json::Value) -> Option<(String, String)> {
         .and_then(|l| l.get("text"))
         .and_then(|t| t.as_str())
         .unwrap_or("")
-        .trim()
+        .trim_end()
         .to_string();
     Some((file_path, format!("  :{lineno}: {text}")))
 }
@@ -294,6 +296,21 @@ mod tests {
         assert!(
             result.is_none(),
             "Non-JSON input should return None from Tier 1"
+        );
+    }
+
+    /// R7: JSON tier must preserve leading whitespace.
+    #[test]
+    fn test_r7_json_tier_preserves_leading_indent() {
+        let input = concat!(
+            r#"{"type":"match","data":{"path":{"text":"src/mod.py"},"line_number":5,"lines":{"text":"    def __init__(self):"}}}"#,
+            "\n"
+        );
+        let result = try_parse_json(input).unwrap();
+        let rendered = format!("{result}");
+        assert!(
+            rendered.contains("    def __init__"),
+            "leading indent must be preserved in rg JSON tier (R7): {rendered}"
         );
     }
 

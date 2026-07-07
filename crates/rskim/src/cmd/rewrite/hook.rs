@@ -267,6 +267,26 @@ pub(super) fn should_warn_today(stamp_path: &std::path::Path) -> bool {
     true
 }
 
+/// Emit a rate-limited warning to hook.log at most once per day per agent per kind.
+///
+/// `kind` is the stamp discriminator (e.g. "version", "binary", "commit") — it
+/// determines the stamp filename `.hook-{kind}-warned-{agent_name}` so that each
+/// warning category fires independently once per day.
+///
+/// All output goes to hook.log via `log_hook_warning` — NEVER to stderr
+/// (zero-stderr invariant in hook mode, #361 Bug 3).
+pub(super) fn warn_once_daily(
+    cache_dir: &std::path::Path,
+    kind: &str,
+    agent_name: &str,
+    msg: &str,
+) {
+    let stamp = cache_dir.join(format!(".hook-{kind}-warned-{agent_name}"));
+    if should_warn_today(&stamp) {
+        crate::cmd::hook_log::log_hook_warning(msg);
+    }
+}
+
 /// #57: Check hook script integrity.
 ///
 /// Uses SHA-256 hash verification. Warnings go to log file only (NEVER
@@ -325,22 +345,91 @@ fn check_hook_version_mismatch(agent: AgentKind) {
 
     let compiled_version = env!("CARGO_PKG_VERSION");
     if hook_version == compiled_version {
-        return; // versions match
+        // Versions match — but check whether the binary has been rebuilt in-place
+        // (same version, different commit).  This can happen during development when
+        // `cargo build` produces a new binary at the same path without bumping the
+        // version number.
+        check_hook_binary_mismatch(agent);
+        return;
     }
 
     let agent_name = agent.cli_name();
 
     // Rate limit: per-agent, warn at most once per day
-    let stamp_path = match crate::cmd::resolve_cache_dir() {
-        Some(dir) => dir.join(format!(".hook-version-warned-{agent_name}")),
+    let cache_dir = match crate::cmd::resolve_cache_dir() {
+        Some(d) => d,
         None => return,
     };
 
-    if should_warn_today(&stamp_path) {
-        // Emit warning to hook log (NEVER stderr -- GRANITE #361 Bug 3)
-        crate::cmd::hook_log::log_hook_warning(&format!(
+    // Emit warning to hook log (NEVER stderr -- GRANITE #361 Bug 3)
+    warn_once_daily(
+        &cache_dir,
+        "version",
+        agent_name,
+        &format!(
             "version mismatch: hook script v{hook_version}, binary v{compiled_version} (run `skim init --yes` to update)"
-        ));
+        ),
+    );
+}
+
+/// F6: Check whether the binary path or commit embedded in the hook script has
+/// drifted from the running binary.
+///
+/// Compares `SKIM_HOOK_BINARY` (embedded at install time) against
+/// `current_exe()`, and `SKIM_HOOK_COMMIT` against the compiled-in
+/// `SKIM_GIT_COMMIT`.  A mismatch means the hook is running a different binary
+/// than the one that installed the hook (e.g. the user upgraded skim but hasn't
+/// run `skim init` yet, or the binary path moved).
+///
+/// Both warnings are rate-limited per-agent to once per day, logged to
+/// hook.log only — NEVER to stderr.
+fn check_hook_binary_mismatch(agent: AgentKind) {
+    let agent_name = agent.cli_name();
+    let cache_dir = match crate::cmd::resolve_cache_dir() {
+        Some(d) => d,
+        None => return,
+    };
+
+    // Check binary path mismatch (SKIM_HOOK_BINARY vs current_exe).
+    if let Ok(hook_binary) = std::env::var("SKIM_HOOK_BINARY")
+        && !hook_binary.is_empty()
+    {
+        let current = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let hook_canonical = std::fs::canonicalize(&hook_binary)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| hook_binary.clone());
+
+        if !current.is_empty() && current != hook_canonical {
+            warn_once_daily(
+                &cache_dir,
+                "binary",
+                agent_name,
+                &format!(
+                    "binary path mismatch: hook was installed from {hook_binary}, \
+                     running from {current} (run `skim init --yes` to update)"
+                ),
+            );
+        }
+    }
+
+    // Check commit mismatch (SKIM_HOOK_COMMIT vs compiled-in SKIM_GIT_COMMIT).
+    if let Ok(hook_commit) = std::env::var("SKIM_HOOK_COMMIT") {
+        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
+        if !hook_commit.is_empty() && compiled_commit != "unknown" && hook_commit != compiled_commit
+        {
+            warn_once_daily(
+                &cache_dir,
+                "commit",
+                agent_name,
+                &format!(
+                    "binary rebuilt in-place: hook commit {hook_commit}, \
+                     running commit {compiled_commit} (run `skim init --yes` to update)"
+                ),
+            );
+        }
     }
 }
 
@@ -509,6 +598,43 @@ mod tests {
         assert!(
             !should_warn_today(&stamp),
             "second call same day should not warn"
+        );
+    }
+
+    // ========================================================================
+    // warn_once_daily — kind-stamped rate-limit helper
+    // ========================================================================
+
+    #[test]
+    fn test_warn_once_daily_creates_kind_stamped_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // First call: stamp must be created with the correct kind-qualified name.
+        warn_once_daily(dir.path(), "version", "claude-code", "test message");
+        let stamp = dir.path().join(".hook-version-warned-claude-code");
+        assert!(
+            stamp.exists(),
+            "warn_once_daily must create .hook-{{kind}}-warned-{{agent}} stamp"
+        );
+        // Second call same day: stamp already written for today, so suppressed.
+        assert!(
+            !should_warn_today(&stamp),
+            "stamp must suppress a repeat warn_once_daily call on the same day"
+        );
+    }
+
+    #[test]
+    fn test_warn_once_daily_distinct_kinds_use_distinct_stamps() {
+        let dir = tempfile::TempDir::new().unwrap();
+        warn_once_daily(dir.path(), "binary", "claude-code", "binary msg");
+        warn_once_daily(dir.path(), "commit", "claude-code", "commit msg");
+        // Each kind produces its own stamp file — they must be independent.
+        assert!(
+            dir.path().join(".hook-binary-warned-claude-code").exists(),
+            "binary kind must have its own stamp"
+        );
+        assert!(
+            dir.path().join(".hook-commit-warned-claude-code").exists(),
+            "commit kind must have its own stamp"
         );
     }
 

@@ -7,7 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **Exit-code remap: parse errors → 2, unsupported language → 3** — Scripts that
+  branched on a specific non-zero exit code (not just `!= 0`) may need updating.
+  See **Changed** below for full details.
+- **Unknown-extension files now degrade to lossless passthrough (exit 0)** —
+  Files with an unrecognised extension or unrecognised shebang previously produced
+  a non-zero exit; they now fall back to byte-faithful passthrough (exit 0,
+  applies ADR-002). Scripts that relied on a non-zero exit to detect unrecognised
+  input must instead inspect the output. See **Fixed** below for full details.
+- **`skim -` (stdin) without a language hint now exits 0** — Bare stdin with no
+  `--language` flag, no `--filename` hint, and no recognisable shebang previously
+  errored (non-zero). It now degrades to lossless passthrough (exit 0,
+  applies ADR-002). See **Fixed** below for full details.
+
+### Added
+- **Bash / shell language support** — Full tree-sitter-bash grammar integration
+  (`Language::Bash`). Structure mode strips `function_definition` bodies to `{...}`
+  while preserving function names and all top-level commands/variable assignments.
+  Zero-function scripts (pure top-level commands like deploy.sh) render meaningfully:
+  all commands and variable assignments are visible. Shebang auto-detection recognises
+  `#!/bin/bash`, `#!/bin/sh`, `#!/usr/bin/env bash`, and the `env -S` form; supports
+  `dash`, `zsh`, `ksh`, `mksh`, `fish` dialects. CRLF-tolerant (`\r\n` shebangs work).
+  Also detects shebangs for `python`, `node`, and `ruby` on extensionless files.
+  `--language bash` (alias `sh`) available for explicit override. Unknown-extension
+  files with an unrecognised shebang degrade to lossless passthrough (ADR-002) with a
+  `SKIM_DEBUG=1` notice; all 6 modes have explicit Bash arms.
+
 ### Fixed
+- **`git diff` output could exceed raw size** — The default diff renderer walked the
+  full AST node body for each hunk, emitting 2–5× the raw patch size for large files.
+  Replaced with a hunk-scoped path (`render_default_scoped`) that emits only the
+  container breadcrumb header plus the hunk's own changed lines, so output is ≤ raw in
+  all cases. Orphan hunks (changed lines outside all AST node ranges, e.g. EOF
+  deletions or between-function additions) render as raw patch lines so no content is
+  silently dropped. An ADR-001 guardrail is wired into `run_diff` (text output) so a
+  net-expansion is never forwarded.
+
+- **`mypy` produced blank output on a clean run when injecting `--output json`** —
+  mypy writes nothing to stdout in JSON mode when there are zero issues. Agents
+  received empty output instead of "Success: …". A new `synthesize_success_line`
+  knob on `ToolRunConfig` emits a configured line when exit code is 0 and compressed
+  output is empty. mypy is configured with `synthesize_success_line = "mypy OK 0
+  issues"` and `injected_format_flag = "--output"`. Synthesis is suppressed when the
+  user already supplied `--output` themselves. A companion `injected_format_flag`
+  field prevents prepare_args from injecting the format flag twice.
+
+- **`ls -R` and multi-path `ls` lost per-directory section structure** — `try_parse_ls_long`
+  was a flat single-pass parser that ignored `"dir:"` section headers from `ls -R` and
+  multi-path invocations. Empty directories silently vanished (only `total`/`.`/`..`
+  lines were present). Fix dispatches to a sectioned parser when the output contains
+  section headers, rendering each section with its label header. Empty directories now
+  produce a labelled section with 0 entries rather than disappearing.
+
+- **grep/rg stripped semantically significant leading whitespace from matched content** —
+  `.trim()` was applied to match content in three extraction sites
+  (`try_parse_single_target` for grep, `try_parse_file_line_content` for the shared
+  file:line:content parser, and `extract_match_fields` in the rg JSON tier). This was
+  destructive for Python (indented function defs), YAML, and any language where leading
+  spaces carry meaning. Fixed by switching to `trim_end()` — trailing whitespace is
+  still removed, leading whitespace is preserved. Both the rewrite-hook and PATH-wrapper
+  surfaces share these handlers and benefit from the fix.
+
+- **Hook scripts used a bare `skim` exec that silently ran the wrong binary after
+  `skim` was updated or reinstalled** — Generated hook scripts now embed `SKIM_HOOK_BINARY`
+  (the canonicalized absolute install-time path) and `SKIM_HOOK_COMMIT` (short git SHA)
+  at generation time via a `build.rs` compile-time constant. At runtime the hook
+  executes via the pinned binary with a PATH fallback. `hook_is_current()` now checks
+  for the `SKIM_HOOK_BINARY` export — hooks generated before this fix are treated as
+  stale and `skim init` will prompt to reinstall. A version-mismatch helper warns when
+  the running binary differs from the pinned binary SHA.
+
+- **Manually repointing a pinned hook script's binary path triggers an integrity warning**
+  — This is expected behaviour. Editing the script bytes by hand changes its SHA-256
+  checksum, so the run-time integrity check (`check_hook_integrity`) reports the script
+  as "tampered"; a repointed `SKIM_HOOK_BINARY` path also trips the binary-path check
+  (`check_hook_binary_mismatch`). Both checks fire at hook run time — the install-time
+  currency predicate (`hook_is_current`) is not involved and never yields "tampered".
+  Run `skim init --uninstall --force` to remove the modified script (the `--force`
+  flag bypasses the tamper guard on uninstall), then `skim init` to regenerate a
+  clean script pointed at the current install location (applies ADR-004).
+
+- **`--version` now prints `x.y.z (<shortsha>)`** — The version output includes the short
+  git SHA of the build commit (compiled in via `build.rs`). This makes it straightforward
+  to identify which exact commit a running binary was built from, which is useful when
+  debugging hook-version mismatches reported by `hook_is_current()`.
+
 - **Markdown headings appear in reverse order in structure/signatures output** — The
   `extract_markdown_headers_with_spans` function collected headings via a depth-first
   visit stack (LIFO) which emitted sibling headings in reverse source order; a document
@@ -96,6 +182,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--last-lines` are honored, so a head-style request still yields the requested window. AST depth
   caps (guarding against unbounded recursion) remain hard errors.
 
+- **`skim -` (stdin) without a language hint now degrades to lossless passthrough (exit 0)
+  instead of erroring** — Previously, piping content to skim with no `--language` flag,
+  no `--filename` hint, and no recognisable shebang produced an error and exited non-zero.
+  stdin now falls back to a full byte-faithful passthrough consistent with the file-path
+  degrade policy. Shebang auto-detection (`#!/usr/bin/env python3`, `#!/bin/bash`, etc.)
+  still applies before the passthrough decision — only plain content with no detectable
+  language degrades. Use `--language` for reliable transformation when the language cannot
+  be inferred (applies ADR-002).
+
 - **`skim search index` no longer shadows the search term "index"** — Previously `skim search index`
   always triggered an index build, making the literal term "index" unsearchable. The dispatch now
   routes to the build path only when trailing args fit the build grammar (`--force`, `--root`,
@@ -152,6 +247,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the shared lines. No change to diff output for non-overlapping hunks.
 
 ### Changed
+- **Exit codes refined: parse errors → 2, unsupported language → 3** — Previously all
+  `skim` errors that prevented transformation exited 1. The CLI now maps known failure
+  classes to distinct codes: exit 2 for grammar/syntax parse failures
+  (`SkimError::ParseError`), exit 3 for unrecognised language when a `--filename`
+  hint carries an extension skim does not recognise (`SkimError::UnsupportedLanguage`).
+  Exit 1 is preserved for all other errors (I/O, config, etc.). Shebang-only or
+  extension-based detection failures degrade to lossless passthrough (exit 0) rather
+  than exiting 3; exit 3 fires only when a `--filename` hint carries an extension skim
+  does not recognise. Scripts that tested for `exit != 0` are unaffected; scripts that branched on
+  the exact exit code may need updating.
 - **Session-id attribution priority inverted: sidecar > env > flag** (#350) — The hook no longer
   injects `--session-id` into rewritten commands; flag injection caused hard failures
   (`"unexpected argument --session-id"`) on older binaries. Attribution now resolves in order:

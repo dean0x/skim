@@ -1,8 +1,8 @@
 # Skim: The Most Intelligent Context Optimization Engine for Coding Agents
 
-> **Code skimming. Command rewriting. Test, build, and git output compression. Codebase heatmap. Token budget cascading.** 17 languages. 14ms for 3,000 lines. Built in Rust.
+> **Code skimming. Command rewriting. Test, build, and git output compression. Codebase heatmap. Token budget cascading.** 18 languages. 14ms for 3,000 lines. Built in Rust.
 
-Other tools filter terminal noise. Skim understands your code. It parses ASTs across 17 languages, strips implementation while preserving architecture, then optimizes every other type of context your agent consumes: test output, build errors, git diffs, raw commands, and codebase heatmaps. 14ms for 3,000 lines. 48x faster on cache hits.
+Other tools filter terminal noise. Skim understands your code. It parses ASTs across 18 languages, strips implementation while preserving architecture, then optimizes every other type of context your agent consumes: test output, build errors, git diffs, raw commands, and codebase heatmaps. 14ms for 3,000 lines. 48x faster on cache hits.
 
 [![Website](https://img.shields.io/badge/Website-skim-e87040)](https://dean0x.github.io/x/skim/)
 [![CI](https://github.com/dean0x/skim/actions/workflows/ci.yml/badge.svg)](https://github.com/dean0x/skim/actions/workflows/ci.yml)
@@ -50,7 +50,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 ## Features
 
 ### Code Skimming (the original, still unmatched)
-- **17 languages** including TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, SQL, Kotlin, Swift, Markdown, JSON, YAML, TOML
+- **18 languages** including TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, SQL, Kotlin, Swift, Bash, Markdown, JSON, YAML, TOML
 - **6 transformation modes** from full to minimal to pseudo to structure to signatures to types (15-95% reduction)
 - **14.6ms** for 3,000-line files. **48x faster** on cache hits
 - **Token budget cascading** that automatically selects the most aggressive mode fitting your budget
@@ -185,7 +185,7 @@ skim README.md --mode structure
 # Pipe to other tools
 skim src/app.ts | bat -l typescript
 
-# Read from stdin (REQUIRES --language flag)
+# Read from stdin (--language recommended; shebang auto-detected, else lossless passthrough)
 cat app.ts | skim - --language=typescript
 
 # Override language detection for unusual file extensions
@@ -212,12 +212,12 @@ skim 'src/**/*.ts'             # Glob pattern
 # With options
 skim file.ts --mode signatures  # Different mode
 skim src/ --jobs 8             # Parallel processing
-skim - --language typescript   # Stdin (requires --language)
+skim - --language typescript   # Stdin (recommended; shebang auto-detected)
 ```
 
 **Common options:**
 - `-m, --mode` - Transformation mode: `structure` (default), `signatures`, `types`, `full`, `minimal`, `pseudo`
-- `-l, --language` - Override auto-detection (required for stdin only)
+- `-l, --language` - Override auto-detection (recommended for stdin; else shebang is tried, then lossless passthrough)
 - `-j, --jobs` - Parallel processing threads (default: CPU cores)
 - `--no-cache` - Disable caching
 - `--show-stats` - Show token reduction stats
@@ -271,6 +271,7 @@ skim file.ts --mode full        # No transformation
 | SQL        | ✅     | `.sql`             | DDL/DML via tree-sitter-sequel  |
 | Kotlin     | ✅     | `.kt`, `.kts`      | Data classes, coroutines, sealed classes |
 | Swift      | ✅     | `.swift`           | Protocols, generics, SwiftUI structs |
+| Bash       | ✅     | `.sh`, `.bash`     | Functions + shebang auto-detect; also `#!/bin/sh`, `zsh`, `ksh` |
 
 ## Examples
 
@@ -580,9 +581,9 @@ cargo bench
 
 **Current**: v2.10.0 — Stable
 
-✅ **Core — Code Reading (17 languages):**
-- TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Markdown/JSON/YAML/TOML
-- 5 transformation modes: structure, signatures, types, minimal, full
+✅ **Core — Code Reading (18 languages):**
+- TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Kotlin/Swift/Bash/Markdown/JSON/YAML/TOML
+- 6 transformation modes: structure, signatures, types, minimal, pseudo, full
 - Token budget (`--tokens N`), max lines (`--max-lines N`), last lines (`--last-lines N`)
 - Multi-file glob support, parallel processing, caching (40-50x speedup)
 
@@ -631,7 +632,7 @@ Comprehensive guides for all aspects of Skim:
 
 | Tool | Role | What It Does |
 |------|------|-------------|
-| **Skim** | Context Optimization | Code-aware AST parsing across 17 languages, command rewriting, test/build/git output compression |
+| **Skim** | Context Optimization | Code-aware AST parsing across 18 languages, command rewriting, test/build/git output compression |
 | **[DevFlow](https://github.com/dean0x/devflow)** | Quality Orchestration | 18 parallel reviewers, working memory, self-learning, composable plugin system |
 | **[Autobeat](https://github.com/dean0x/autobeat)** | Agent Orchestration | Autonomous orchestration. Eval loops, multi-agent pipelines, DAG dependencies, crash-proof persistence |
 

@@ -74,6 +74,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     expected_exit_codes: &[],
     forward_stderr: false,
     skip_net_savings_guard: true,
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 // ============================================================================

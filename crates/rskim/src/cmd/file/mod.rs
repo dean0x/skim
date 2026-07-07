@@ -159,7 +159,7 @@ pub(super) fn try_parse_file_line_content(
         if let Some(caps) = RE_FILE_LINE_CONTENT.captures(line) {
             let file = caps[1].to_string();
             let lineno = &caps[2];
-            let content = caps[3].trim();
+            let content = caps[3].trim_end();
             total_matches += 1;
             file_matches
                 .entry(file)
@@ -246,6 +246,22 @@ pub(super) fn build_file_result(
 
 #[cfg(test)]
 mod tests {
+    /// R7: file:line:content path must preserve leading whitespace.
+    #[test]
+    fn test_r7_file_line_content_preserves_leading_indent() {
+        let input = "src/mod.py:5:    def __init__(self):\nsrc/mod.py:8:        pass\n";
+        let result = super::try_parse_file_line_content("grep", input, None).unwrap();
+        let rendered = format!("{result}");
+        assert!(
+            rendered.contains("    def __init__"),
+            "leading 4-space indent must be preserved in file:line:content output (R7): {rendered}"
+        );
+        assert!(
+            rendered.contains("        pass"),
+            "8-space indent must be preserved (R7): {rendered}"
+        );
+    }
+
     #[test]
     fn test_sanitize_for_display_clean_input() {
         assert_eq!(crate::cmd::sanitize_for_display("find"), "find");

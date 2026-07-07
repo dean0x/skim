@@ -332,6 +332,22 @@ pub(crate) struct ParsedCommandConfig<'a> {
     ///
     /// Default: `false` (guard enabled).
     pub skip_net_savings_guard: bool,
+    /// Success line to emit when the tool exits 0 and output is empty (R3).
+    ///
+    /// Some tools (e.g. `mypy`) produce empty stdout on a clean run when skim
+    /// injects a machine-readable format flag (e.g. `--output json`).  Without
+    /// synthesis the agent receives blank output — "never emptier than raw" is
+    /// violated because `mypy` without skim prints a human-readable success line.
+    ///
+    /// When `Some(line)` AND `exit_code == 0` AND `compressed.is_empty()`, skim
+    /// emits `line` followed by a newline.
+    ///
+    /// `run_tool` sets this to `None` when the user supplied the format flag
+    /// themselves (so skim's format injection did not run and any empty output
+    /// is the user's own choice).
+    ///
+    /// Default: `None`.
+    pub synthesize_success_line: Option<&'a str>,
 }
 
 /// How a child process's exit status should steer output handling. (#317)
@@ -648,6 +664,7 @@ where
         expected_exit_codes,
         forward_stderr,
         skip_net_savings_guard,
+        synthesize_success_line,
     } = config;
 
     let Some(output) = obtain_output(program, args, env_overrides, install_hint, use_stdin)? else {
@@ -727,7 +744,7 @@ where
     // "raw" baseline for this sink = post-ANSI-strip stdout (`output.stdout`).
     // This is the correct baseline because ANSI stripping is already applied
     // above; the user's terminal would see the same stripped bytes.
-    let (compressed, effective_tier) = if output_format == OutputFormat::Text
+    let (mut compressed, effective_tier) = if output_format == OutputFormat::Text
         && tier_name != "passthrough"
         && !skip_net_savings_guard
     {
@@ -751,6 +768,26 @@ where
         let s = render_output(&result, output_format)?;
         (s, tier_name)
     };
+
+    // R3 — "never emptier than raw": when skim injected a format flag that
+    // makes stdout empty on success (e.g. mypy --output json on a clean run),
+    // synthesize a human-readable success line so the agent is never left
+    // with a silent blank output.
+    //
+    // Synthesis fires only when all three conditions hold:
+    //   1. The tool exited 0 (code == 0).
+    //   2. Nothing was written to stdout yet (compressed.trim().is_empty()).
+    //   3. A synthesize_success_line is configured for this tool.
+    //
+    // `run_tool` pre-suppresses synthesis when the user already had the
+    // injected format flag, so this branch is unreachable in that case.
+    if let Some(line) =
+        should_synthesize_success(code, compressed.trim().is_empty(), synthesize_success_line)
+    {
+        let synthesized = format!("{line}\n");
+        write_to_stdout(&synthesized)?;
+        compressed = synthesized;
+    }
 
     if let Some(err_text) = stderr_to_forward {
         let mut err = io::stderr().lock();
@@ -845,6 +882,49 @@ pub(crate) struct ToolRunConfig<'a> {
     /// Skip the net-savings guard.
     /// See [`ParsedCommandConfig::skip_net_savings_guard`]. (#317)
     pub skip_net_savings_guard: bool,
+    /// Success line to synthesize when skim injects a format flag that produces
+    /// empty stdout on a clean run (R3).
+    ///
+    /// Set to `Some(line)` only for tools where skim injects a flag (listed in
+    /// `injected_format_flag`) that causes stdout to be empty on exit 0.
+    /// `run_tool` suppresses synthesis automatically when the user supplied the
+    /// flag themselves — set the companion `injected_format_flag` to enable that
+    /// suppression.  See [`ParsedCommandConfig::synthesize_success_line`].
+    ///
+    /// Default: `None` (no synthesis).
+    pub synthesize_success_line: Option<&'a str>,
+    /// The format flag that `prepare_args` injects (e.g. `"--output"`, `"--json"`).
+    ///
+    /// Used in `run_tool` to detect whether the user already supplied this flag.
+    /// When the user had it, `synthesize_success_line` is suppressed — the empty
+    /// output is their own choice, not a skim-induced hole.
+    ///
+    /// `None` means this tool has no format-flag injection; synthesis (if any) is
+    /// always active.
+    ///
+    /// Default: `None`.
+    pub injected_format_flag: Option<&'a str>,
+}
+
+/// Returns the line to synthesize when skim's format-flag injection caused
+/// empty stdout on a successful run (R3 — "never emptier than raw").
+///
+/// # Conditions (all must hold)
+/// - `exit_code == 0` — only synthesize on success; errors produce their own output.
+/// - `compressed_is_empty` — there is actually nothing to show.
+/// - `synthesize_line.is_some()` — the tool is configured for synthesis.
+///
+/// This is a pure helper so it can be unit-tested independently of I/O.
+fn should_synthesize_success(
+    exit_code: i32,
+    compressed_is_empty: bool,
+    synthesize_line: Option<&str>,
+) -> Option<&str> {
+    if exit_code == 0 && compressed_is_empty {
+        synthesize_line
+    } else {
+        None
+    }
 }
 
 /// Execute a tool, parse its output, and emit the result.
@@ -869,6 +949,22 @@ pub(crate) fn run_tool<T>(
 where
     T: AsRef<str> + serde::Serialize,
 {
+    // Determine synthesis eligibility BEFORE prepare_args mutates the arg list.
+    // If the user already had the injected format flag, they own the output
+    // format and any empty result is their own choice — do not synthesize.
+    let effective_success_line = match (config.synthesize_success_line, config.injected_format_flag)
+    {
+        (Some(line), Some(flag)) => {
+            if crate::cmd::user_has_flag(args, &[flag]) {
+                None // user had the flag → synthesis suppressed
+            } else {
+                Some(line)
+            }
+        }
+        (Some(line), None) => Some(line), // no injection guard — always synthesize
+        (None, _) => None,
+    };
+
     let mut cmd_args = args.to_vec();
     prepare_args(&mut cmd_args);
     let use_stdin = should_read_stdin(args);
@@ -892,6 +988,7 @@ where
             expected_exit_codes: config.expected_exit_codes,
             forward_stderr: config.forward_stderr,
             skip_net_savings_guard: config.skip_net_savings_guard,
+            synthesize_success_line: effective_success_line,
         },
         parse_fn,
     )
@@ -904,6 +1001,49 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // should_synthesize_success tests (R3)
+    // ========================================================================
+
+    /// R3: exit 0 + empty + configured → synthesis fires.
+    #[test]
+    fn test_r3_synthesize_fires_on_success_empty() {
+        let line = should_synthesize_success(0, true, Some("mypy OK 0 issues"));
+        assert_eq!(line, Some("mypy OK 0 issues"));
+    }
+
+    /// R3: exit 1 + empty + configured → no synthesis (non-zero exit has its own output).
+    #[test]
+    fn test_r3_no_synthesize_on_failure() {
+        let line = should_synthesize_success(1, true, Some("mypy OK 0 issues"));
+        assert_eq!(line, None);
+    }
+
+    /// R3: exit 0 + non-empty + configured → no synthesis (tool produced output).
+    #[test]
+    fn test_r3_no_synthesize_when_output_present() {
+        let line = should_synthesize_success(0, false, Some("mypy OK 0 issues"));
+        assert_eq!(line, None);
+    }
+
+    /// R3: exit 0 + empty + None → no synthesis (tool not configured for synthesis).
+    #[test]
+    fn test_r3_no_synthesize_when_not_configured() {
+        let line = should_synthesize_success(0, true, None);
+        assert_eq!(line, None);
+    }
+
+    /// R3: exit 0 + whitespace-only output counts as empty for synthesis.
+    #[test]
+    fn test_r3_whitespace_only_counts_as_empty() {
+        // Whitespace-only compressed is what you get from Passthrough("") after render.
+        // should_synthesize_success itself takes a bool; callers pass
+        // `compressed.trim().is_empty()`, so whitespace → true.
+        let line =
+            should_synthesize_success(0, "   \n".trim().is_empty(), Some("mypy OK 0 issues"));
+        assert_eq!(line, Some("mypy OK 0 issues"));
+    }
 
     // ========================================================================
     // classify_exit tests (#317)

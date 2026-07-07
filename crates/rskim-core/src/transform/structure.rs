@@ -409,6 +409,15 @@ fn get_node_types_for_language(language: Language) -> Option<NodeTypes> {
             method: "function_declaration", // Swift methods are also function_declaration
             extra_function_kinds: &["init_declaration", "deinit_declaration"],
         }),
+        // ARCHITECTURE: Bash structure mode strips function bodies, keeping the
+        // function_definition signature plus ALL top-level commands/assignments
+        // verbatim (they have no body to strip). A zero-function deploy.sh therefore
+        // renders its full content, not an empty output.
+        Language::Bash => Some(NodeTypes {
+            function: "function_definition",
+            method: "function_definition",
+            extra_function_kinds: &[],
+        }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }
 }
