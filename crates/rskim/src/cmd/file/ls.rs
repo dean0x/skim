@@ -70,22 +70,15 @@ static RE_LS_LONG: LazyLock<Regex> =
 // ls: multi-section support (R5)
 // ============================================================================
 
-/// Core predicate for section-header detection, called at three sites with
-/// slightly different guard requirements.
+/// Core predicate for section-header detection, called at three sites.
 ///
 /// Always checks: `trimmed.ends_with(':')` and `!trimmed.starts_with("total ")`.
 ///
-/// Optional guards (flags encode each site's exact current semantics):
+/// Optional guard:
 /// - `require_perm_check`: also require `!RE_LS_LONG.is_match(trimmed)` — needed at
 ///   long-form sites where a permission line could end with `:`.
-/// - `require_non_empty`: also require `!trimmed.is_empty()`.
-fn looks_like_section_header(
-    trimmed: &str,
-    require_perm_check: bool,
-    require_non_empty: bool,
-) -> bool {
+fn looks_like_section_header(trimmed: &str, require_perm_check: bool) -> bool {
     trimmed.ends_with(':')
-        && (!require_non_empty || !trimmed.is_empty())
         && (!require_perm_check || !RE_LS_LONG.is_match(trimmed))
         && !trimmed.starts_with("total ")
 }
@@ -99,7 +92,7 @@ fn looks_like_section_header(
 ///   suffixed names are not misidentified)
 /// - does NOT start with `"total "` (the disk-usage preamble)
 pub(crate) fn is_ls_section_header(line: &str) -> bool {
-    looks_like_section_header(line.trim(), true, true)
+    looks_like_section_header(line.trim(), true)
 }
 
 /// Accumulated data for one directory section in multi-dir `ls -la` output.
@@ -449,7 +442,7 @@ fn try_parse_ls_plain(stdout: &str) -> Option<FileResult> {
         .iter()
         .filter(|b| {
             b.first()
-                .map(|l| looks_like_section_header(l.trim(), false, true))
+                .map(|l| looks_like_section_header(l.trim(), false))
                 .unwrap_or(false)
         })
         .count();
@@ -509,7 +502,7 @@ fn try_parse_ls_plain_sectioned(blocks: &[Vec<&str>]) -> Option<FileResult> {
         };
 
         let first_trimmed = first_line.trim();
-        if looks_like_section_header(first_trimmed, false, false) {
+        if looks_like_section_header(first_trimmed, false) {
             // Named block: label header then filenames.
             all_entries.push(first_trimmed.to_string());
             let mut section_total = 0usize;
