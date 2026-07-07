@@ -1,7 +1,7 @@
 ---
 feature: hook-binary-pinning
 name: Agent Hook Install, Binary Pinning & Handshake
-description: "Use when modifying hook script generation, adding new agents, changing the hook script format, debugging version-skew or wrong-clone warnings, working on install/reinstall logic, or touching wrapper symlink management. Keywords: hook install, binary pinning, SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, generate_hook_script, is_hook_script_current, uses_pinned_binary, AwarenessOnly, codex, wrapper symlinks."
+description: "Use when modifying hook script generation, adding new agents, changing the hook script format, debugging version-skew or wrong-clone warnings, working on install/reinstall logic, or touching wrapper symlink management. Keywords: hook install, binary pinning, SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, generate_hook_script, is_hook_script_current, uses_pinned_binary, script_has_pinned_marker, AwarenessOnly, codex, wrapper symlinks."
 category: domain-knowledge
 directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/rewrite]
 created: 2026-07-04
@@ -49,7 +49,7 @@ exec skim rewrite --hook --agent {agent_cli_name}                 # PATH fallbac
 Critical details verified in `test_generate_hook_script_structure`:
 - `SKIM_HOOK_BINARY` is exported (for mismatch detection in hook mode)
 - `_SKIM_BIN` is set using single-quoting via `shell_single_quote()` (handles spaces: `'/path/with spaces/skim'`; handles embedded quotes via `'\''`)
-- `SKIM_HOOK_COMMIT` comes from `option_env!("SKIM_GIT_COMMIT")` which is set by `build.rs`; falls back to literal `unknown` for tarball builds — **no quotes** around the value
+- `SKIM_HOOK_COMMIT` comes from `option_env!("SKIM_GIT_COMMIT")` which is set by `build.rs`; falls back to literal `unknown` for tarball builds — **no quotes** around the value. The per-agent `generate_script` tests for claude, copilot, crush, cursor, and gemini now each assert the script contains `export SKIM_HOOK_COMMIT=` (parity — previously only the claude test did).
 - The script does **NOT** export or prepend to PATH (removed: wrapper dir has no `skim` binary, so prepending it was dead code that immediately got stripped by `strip_skim_wrappers_from_path()`)
 - The PATH fallback line (`exec skim rewrite ...`) is a safety net when the pinned binary has been removed or is no longer executable
 
@@ -57,25 +57,28 @@ Critical details verified in `test_generate_hook_script_structure`:
 
 `build.rs` runs `git rev-parse --short HEAD`, sets `SKIM_GIT_COMMIT` env var at compile time, and triggers rebuild on `.git/HEAD` or `.git/refs` changes. The hook script embeds this as `SKIM_HOOK_COMMIT`. The `--version` output also uses it: `"X.Y.Z (shortsha)"` or `"X.Y.Z (unknown)"`.
 
-### The Two Currency Predicates — MUST Be Updated in Lockstep
+### The Two Currency Predicates — One Shared Pinned-Marker Helper
 
-Two separate predicates determine whether an existing hook script is stale. They live in different files and check slightly different things. **If you change the hook script format, you must update both.**
-
-**`uses_pinned_binary` (`init/state.rs`, line 114)**:
-Checks whether a script uses the F6 pinned binary format. Used during state detection to populate `DetectedState::hook_uses_pinned_binary`.
+Two separate predicates determine whether an existing hook script is stale. They live in different files and gate different decisions, but they now share a **single source of truth** for the pinned-binary marker scan: `script_has_pinned_marker` in `init/mod.rs`. This is a structural hardening (PR #421 cycle 2) of what used to be two hand-duplicated inline scans.
 
 ```rust
-fn uses_pinned_binary(contents: &str) -> bool {
-    // Returns true when the script exports SKIM_HOOK_BINARY — the F6 marker.
-    // Old "bare exec skim" scripts (pre-F6) do not have this line → stale.
+// init/mod.rs — the ONE place the "has SKIM_HOOK_BINARY export" scan lives.
+pub(super) fn script_has_pinned_marker(contents: &str) -> bool {
     contents
         .lines()
         .any(|l| l.trim_start().starts_with("export SKIM_HOOK_BINARY="))
 }
 ```
 
-**`is_hook_script_current` (`init/install.rs`, line 478)**:
-Checked during `create_hook_script()` to decide if the existing script can be skipped. Requires BOTH the version marker AND the pinned binary export.
+**`uses_pinned_binary` (`init/state.rs`, line 114)** — used during state detection to populate `DetectedState::hook_uses_pinned_binary`. It is now a thin delegate to the shared helper:
+
+```rust
+fn uses_pinned_binary(contents: &str) -> bool {
+    super::script_has_pinned_marker(contents)
+}
+```
+
+**`is_hook_script_current` (`init/install.rs`, line 478)** — checked during `create_hook_script()` to decide if the existing script can be skipped. It ANDs its own **independent** version-line check with the shared marker scan:
 
 ```rust
 fn is_hook_script_current(script_path: &Path, version: &str) -> bool {
@@ -83,23 +86,24 @@ fn is_hook_script_current(script_path: &Path, version: &str) -> bool {
         return false;
     };
     let version_line = format!("# skim-hook v{version}");
-    // Both conditions must hold — a same-version pre-F6 script still returns false.
-    let has_pinned = contents
-        .lines()
-        .any(|l| l.trim_start().starts_with("export SKIM_HOOK_BINARY="));
-    contents.contains(&version_line) && has_pinned
+    // Version comment must match AND the shared pinned-marker scan must pass.
+    contents.contains(&version_line) && super::script_has_pinned_marker(&contents)
 }
 ```
 
-**Why both must change together**: if you add a new required line to the script (e.g., `export SKIM_HOOK_SHA256=`) and update `is_hook_script_current` to require it, you must also update `uses_pinned_binary` — otherwise `DetectedState::hook_uses_pinned_binary` will stay `true` for scripts missing the new line, and `DetectedState::hook_is_current()` will skip regeneration.
+**Why the shared helper matters**: previously each predicate inlined an identical `lines().any(|l| l.trim_start().starts_with("export SKIM_HOOK_BINARY="))` scan. Renaming the marker env var required editing two copies in lockstep, and forgetting one would silently desync `DetectedState::hook_uses_pinned_binary` from the reinstall idempotence check. The shared `script_has_pinned_marker` **structurally prevents** that drift — the marker scan is defined once and both predicates call it, so a future marker change updates both at once.
 
-`DetectedState::hook_is_current()` combines both:
+Note that `is_hook_script_current`'s version-line check (`contents.contains(&version_line)`) is still its **own** concern — it is NOT part of the shared helper. So a same-version pre-F6 script (matching version comment, no pinned marker) still correctly returns false, and a script that has the pinned marker but the wrong version comment also returns false.
+
+`DetectedState::hook_is_current()` combines version + pinned format:
 ```rust
 pub(super) fn hook_is_current(&self) -> bool {
     // Version must match AND script must be in the pinned-binary format.
     self.hook_version.as_deref() == Some(&self.skim_version) && self.hook_uses_pinned_binary
 }
 ```
+
+The lockstep hazard now only re-emerges if someone adds a **new** required line to the script format and wraps a **new** predicate around it — see the Anti-Patterns section.
 
 ### `check_hook_binary_mismatch` — Same-Version Divergent Build Detection
 
@@ -195,7 +199,7 @@ Cursor used to be incorrectly written to `settings.json` using the Claude Code P
 
 ## Anti-Patterns
 
-**Updating `is_hook_script_current` without updating `uses_pinned_binary`**: the install path checks `is_hook_script_current` to decide whether to regenerate, but `DetectedState::hook_is_current()` (which gate-keeps the whole install flow) uses `hook_uses_pinned_binary` (derived from `uses_pinned_binary`). An inconsistency makes reinstall silently skip stale scripts.
+**Adding a new required script line but wiring it into only one currency predicate**: the pinned-marker scan itself is now a single shared helper (`script_has_pinned_marker` in `init/mod.rs`), so changing the `SKIM_HOOK_BINARY` marker updates both `uses_pinned_binary` and `is_hook_script_current` automatically. The lockstep hazard survives one level up: if you add a **new** required line to the format (e.g. `export SKIM_HOOK_SHA256=`) and gate `is_hook_script_current` on it (install-path regeneration) without also teaching state detection about it (`uses_pinned_binary` / `hook_uses_pinned_binary`, the gate behind `DetectedState::hook_is_current()`), reinstall will silently skip stale scripts — `hook_is_current()` returns true while the install path would have regenerated. Fold any new required-line check into the shared helper, or add the new predicate to **both** surfaces.
 
 **Emitting anything to stderr in hook mode**: hook invocations forward stdin/stdout to the agent. Anything on stderr surfaces to the user as noise or triggers agent error handling. All hook-mode diagnostics (version mismatch, path mismatch, integrity failure) go to `hook.log` via `log_hook_warning`. This is the zero-stderr invariant (GRANITE #361 Bug 3).
 
@@ -221,9 +225,10 @@ Cursor used to be incorrectly written to `settings.json` using the Claude Code P
 
 ## Key Files
 
+- `crates/rskim/src/cmd/init/mod.rs` — `run()` init dispatch, `command()` clap definition, and `script_has_pinned_marker()` (the single source of truth for the `SKIM_HOOK_BINARY` marker scan, shared by both currency predicates)
 - `crates/rskim/src/cmd/hooks/mod.rs` — `generate_hook_script()`, `shell_single_quote()`, `HookProtocol` trait, `HookSupport` enum, shared `parse_tool_input_command()` and `upsert_hook_versioned()`
-- `crates/rskim/src/cmd/init/state.rs` — `detect_state()`, `uses_pinned_binary()`, `DetectedState`, `hook_is_current()`
-- `crates/rskim/src/cmd/init/install.rs` — `is_hook_script_current()`, `create_hook_script()`, `atomic_write_executable()`, `migrate_cursor_legacy_settings()`
+- `crates/rskim/src/cmd/init/state.rs` — `detect_state()`, `uses_pinned_binary()` (delegates to `script_has_pinned_marker`), `DetectedState`, `hook_is_current()`
+- `crates/rskim/src/cmd/init/install.rs` — `is_hook_script_current()` (version check + `script_has_pinned_marker`), `create_hook_script()`, `atomic_write_executable()`, `migrate_cursor_legacy_settings()`
 - `crates/rskim/src/cmd/rewrite/hook.rs` — `run_hook_mode()`, `check_hook_binary_mismatch()`, `check_hook_version_mismatch()`, `check_hook_integrity()`, `warn_once_daily()`, `should_warn_today()`
 - `crates/rskim/src/cmd/hooks/codex.rs` — `CodexCliHook` (AwarenessOnly reference implementation)
 - `crates/rskim/src/cmd/init/wrappers.rs` — `install_wrappers_in()`, `uninstall_wrappers_in()`, stem-only rule
@@ -237,3 +242,5 @@ Cursor used to be incorrectly written to `settings.json` using the Claude Code P
 - Feature: `analytics` — session_id flows from hook JSON via sidecar, not via rewritten command flags (#1.1)
 - Source: `crates/rskim/src/cmd/integrity/` — `compute_file_hash()` and `write_hash_manifest()` used in SHA-256 sidecar generation
 - Source: `crates/rskim/src/cmd/hook_log.rs` — `log_hook_warning()` (the only permitted diagnostic channel in hook mode)
+</content>
+</invoke>
