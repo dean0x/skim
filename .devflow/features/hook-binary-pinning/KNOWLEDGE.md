@@ -115,7 +115,7 @@ Both comparisons:
 - Rate-limited via per-agent daily stamp files in the cache dir: `.hook-binary-warned-{agent}`, `.hook-commit-warned-{agent}`
 - Log to `hook.log` **ONLY** — never stderr (hard zero-stderr invariant, GRANITE #361 Bug 3)
 
-Manually re-pointing an installed hook to a different path trips the binary-path check. This is by design: `skim init --yes` is the correct remediation.
+Manually re-pointing an installed hook to a different path trips the binary-path check. This is by design. The correct remediation is `skim init --uninstall --force && skim init`: `--force` bypasses the tamper-guard on uninstall (the SHA-256 sidecar mismatches because the file bytes changed), then plain `skim init` installs a fresh clean script. Note: `--force` is an uninstall-only flag and has no effect on the install path; `--yes` is also uninstall-only (skips the interactive confirmation prompt) and does not trigger regeneration on its own.
 
 ### SHA-256 Sidecar Regeneration Order
 

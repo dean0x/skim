@@ -188,6 +188,69 @@ fn test_bash_structure_fixtures_parse() {
 }
 
 // ============================================================================
+// Heredoc structure assertions (AC-F4.1: function names visible, bodies stripped)
+// ============================================================================
+
+#[test]
+fn test_bash_structure_heredoc_strips_body() {
+    // AC-F4.1: structure mode must surface function names from heredoc_case.sh
+    // and must NOT include heredoc body content (which lives inside function bodies
+    // and is therefore stripped along with the rest of the body).
+    //
+    // Fixture function names: write_default_config, install_deps, wait_for_port
+    // Heredoc body content:   "log_level = info", "max_connections = 100"
+    let result = transform(HEREDOC_SH, Language::Bash, Mode::Structure).unwrap();
+
+    // Function names must be visible in structure output.
+    assert!(
+        result.contains("write_default_config"),
+        "structure mode should preserve 'write_default_config', got:\n{result}"
+    );
+    assert!(
+        result.contains("install_deps"),
+        "structure mode should preserve 'install_deps', got:\n{result}"
+    );
+    assert!(
+        result.contains("wait_for_port"),
+        "structure mode should preserve 'wait_for_port', got:\n{result}"
+    );
+
+    // Heredoc body lines must be stripped (they are inside the function body).
+    assert!(
+        !result.contains("log_level = info"),
+        "heredoc body 'log_level = info' should not appear in structure output, got:\n{result}"
+    );
+    assert!(
+        !result.contains("max_connections = 100"),
+        "heredoc body 'max_connections = 100' should not appear in structure output, got:\n{result}"
+    );
+}
+
+// ============================================================================
+// CRLF full-file transform (AC-F4.2: end-to-end, not just shebang line)
+// ============================================================================
+
+#[test]
+fn test_bash_structure_crlf_full_file() {
+    // AC-F4.2: a file whose EVERY line ends with \r\n (not just the shebang) must
+    // still produce valid structure output.  The fixture crlf_dialect.sh carries the
+    // CRLF name but ships with LF bytes (git normalisation); this in-code test is the
+    // authoritative end-to-end coverage for the full-file CRLF path.
+    let crlf = "#!/bin/bash\r\nfunction hello_crlf() {\r\n  echo hi\r\n}\r\nhello_crlf\r\n";
+    let out = transform(crlf, Language::Bash, Mode::Structure).unwrap();
+    // Structure mode should preserve the function name.
+    assert!(
+        out.contains("hello_crlf"),
+        "structure mode should preserve function name from CRLF input, got:\n{out}"
+    );
+    // Output must be non-empty.
+    assert!(
+        !out.trim().is_empty(),
+        "CRLF input should produce non-empty structure output"
+    );
+}
+
+// ============================================================================
 // Full mode (AC-F4.6: full == source bytes)
 // ============================================================================
 

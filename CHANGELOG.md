@@ -65,11 +65,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the running binary differs from the pinned binary SHA.
 
 - **Manually repointing a pinned hook script's binary path triggers an integrity warning**
-  — This is expected behaviour. The hook-script integrity check (`hook_is_current()`)
-  verifies the embedded `SKIM_HOOK_BINARY` path against the running binary; editing the
-  path by hand (or symlinking to a different skim build) is treated as "tampered" and
-  `skim init` prompts to reinstall. Use `skim init --force` to regenerate a clean script
-  pointed at the current install location.
+  — This is expected behaviour. Editing the script bytes by hand changes its SHA-256
+  checksum, so the run-time integrity check (`check_hook_integrity`) reports the script
+  as "tampered"; a repointed `SKIM_HOOK_BINARY` path also trips the binary-path check
+  (`check_hook_binary_mismatch`). Both checks fire at hook run time — the install-time
+  currency predicate (`hook_is_current`) is not involved and never yields "tampered".
+  Run `skim init --uninstall --force` to remove the modified script (the `--force`
+  flag bypasses the tamper guard on uninstall), then `skim init` to regenerate a
+  clean script pointed at the current install location (applies ADR-004).
 
 - **`--version` now prints `x.y.z (<shortsha>)`** — The version output includes the short
   git SHA of the build commit (compiled in via `build.rs`). This makes it straightforward
@@ -164,6 +167,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--last-lines` are honored, so a head-style request still yields the requested window. AST depth
   caps (guarding against unbounded recursion) remain hard errors.
 
+- **`skim -` (stdin) without a language hint now degrades to lossless passthrough (exit 0)
+  instead of erroring** — Previously, piping content to skim with no `--language` flag,
+  no `--filename` hint, and no recognisable shebang produced an error and exited non-zero.
+  stdin now falls back to a full byte-faithful passthrough consistent with the file-path
+  degrade policy. Shebang auto-detection (`#!/usr/bin/env python3`, `#!/bin/bash`, etc.)
+  still applies before the passthrough decision — only plain content with no detectable
+  language degrades. Use `--language` for reliable transformation when the language cannot
+  be inferred (applies ADR-002).
+
 - **`skim search index` no longer shadows the search term "index"** — Previously `skim search index`
   always triggered an index build, making the literal term "index" unsearchable. The dispatch now
   routes to the build path only when trailing args fit the build grammar (`--force`, `--root`,
@@ -220,6 +232,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the shared lines. No change to diff output for non-overlapping hunks.
 
 ### Changed
+- **Exit codes refined: parse errors → 2, unsupported language → 3** — Previously all
+  `skim` errors that prevented transformation exited 1. The CLI now maps known failure
+  classes to distinct codes: exit 2 for grammar/syntax parse failures
+  (`SkimError::ParseError`), exit 3 for unrecognised language when an explicit
+  `--language` flag was provided (`SkimError::UnsupportedLanguage`). Exit 1 is
+  preserved for all other errors (I/O, config, etc.). Shebang-only or
+  extension-based detection failures degrade to lossless passthrough (exit 0) rather
+  than exiting 3; exit 3 fires only on explicit `--language` values that skim does not
+  support. Scripts that tested for `exit != 0` are unaffected; scripts that branched on
+  the exact exit code may need updating.
 - **Session-id attribution priority inverted: sidecar > env > flag** (#350) — The hook no longer
   injects `--session-id` into rewritten commands; flag injection caused hard failures
   (`"unexpected argument --session-id"`) on older binaries. Attribution now resolves in order:

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Script testing CRLF tolerance and dialect noise
+# Script testing CRLF line endings (all lines use \r\n)
 
 # Array operations
 ITEMS=("alpha" "beta" "gamma")

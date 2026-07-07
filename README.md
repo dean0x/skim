@@ -185,7 +185,7 @@ skim README.md --mode structure
 # Pipe to other tools
 skim src/app.ts | bat -l typescript
 
-# Read from stdin (REQUIRES --language flag)
+# Read from stdin (--language recommended; shebang auto-detected, else lossless passthrough)
 cat app.ts | skim - --language=typescript
 
 # Override language detection for unusual file extensions
@@ -212,12 +212,12 @@ skim 'src/**/*.ts'             # Glob pattern
 # With options
 skim file.ts --mode signatures  # Different mode
 skim src/ --jobs 8             # Parallel processing
-skim - --language typescript   # Stdin (requires --language)
+skim - --language typescript   # Stdin (recommended; shebang auto-detected)
 ```
 
 **Common options:**
 - `-m, --mode` - Transformation mode: `structure` (default), `signatures`, `types`, `full`, `minimal`, `pseudo`
-- `-l, --language` - Override auto-detection (required for stdin only)
+- `-l, --language` - Override auto-detection (recommended for stdin; else shebang is tried, then lossless passthrough)
 - `-j, --jobs` - Parallel processing threads (default: CPU cores)
 - `--no-cache` - Disable caching
 - `--show-stats` - Show token reduction stats
@@ -583,7 +583,7 @@ cargo bench
 
 ✅ **Core — Code Reading (18 languages):**
 - TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Kotlin/Swift/Bash/Markdown/JSON/YAML/TOML
-- 5 transformation modes: structure, signatures, types, minimal, full
+- 6 transformation modes: structure, signatures, types, minimal, pseudo, full
 - Token budget (`--tokens N`), max lines (`--max-lines N`), last lines (`--last-lines N`)
 - Multi-file glob support, parallel processing, caching (40-50x speedup)
 
