@@ -466,6 +466,14 @@ pub(crate) fn generate_hook_script(
         "agent_cli_name contains unsafe characters for shell interpolation: {agent_cli_name}"
     );
     let git_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
+    // Defense-in-depth: git_commit is embedded unquoted in the script, so it must be
+    // shell-safe. Hex SHAs (0-9, a-f) and "unknown" are both strictly alphanumeric.
+    // This assert fires at install time (skim init) if the build system ever embeds
+    // an unexpected format — catching the hazard before it reaches a user's hook file.
+    assert!(
+        git_commit.bytes().all(|b| b.is_ascii_alphanumeric()),
+        "git_commit contains unsafe characters for shell interpolation: {git_commit}"
+    );
     let quoted = shell_single_quote(binary_path);
     format!(
         "#!/usr/bin/env bash\n\
@@ -624,6 +632,36 @@ mod tests {
     #[should_panic(expected = "agent_cli_name contains unsafe characters")]
     fn test_generate_hook_script_rejects_unsafe_agent_name() {
         generate_hook_script("1.0.0", "agent;rm -rf /", "/usr/local/bin/skim");
+    }
+
+    /// git_commit is embedded UNQUOTED in the hook script, so the safety predicate
+    /// (ascii-alphanumeric only) must accept valid values and reject dangerous ones.
+    ///
+    /// Note: `git_commit` is a compile-time constant from `option_env!`, so it cannot
+    /// be passed as a parameter to trigger the assert via `#[should_panic]`. This test
+    /// instead validates the predicate directly to pin the contract.
+    #[test]
+    fn test_git_commit_safety_predicate() {
+        // Valid: git short SHAs (hex) and the "unknown" fallback
+        for valid in [
+            "a9aa3e1",
+            "abc123def456",
+            "unknown",
+            "deadbeef",
+            "0123456789abcdef",
+        ] {
+            assert!(
+                valid.bytes().all(|b| b.is_ascii_alphanumeric()),
+                "'{valid}' should be safe for shell interpolation (alphanumeric only)"
+            );
+        }
+        // Invalid: shell special chars that would break `export SKIM_HOOK_COMMIT=<value>`
+        for invalid in ["abc$def", "sha;evil", "a b", "abc\n", "abc`whoami`"] {
+            assert!(
+                !invalid.bytes().all(|b| b.is_ascii_alphanumeric()),
+                "'{invalid}' should be caught by the safety predicate"
+            );
+        }
     }
 
     // ========================================================================
