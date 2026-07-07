@@ -112,9 +112,7 @@ pub(super) fn detect_state(
 /// Old hook scripts that only have bare `exec skim` (no `SKIM_HOOK_BINARY`) are
 /// considered stale and cause a reinstall so they gain the pinned-binary format.
 fn uses_pinned_binary(contents: &str) -> bool {
-    contents
-        .lines()
-        .any(|l| l.trim_start().starts_with("export SKIM_HOOK_BINARY="))
+    super::script_has_pinned_marker(contents)
 }
 
 /// Check if the hook script at `config_dir/hooks/HOOK_SCRIPT_NAME` uses the

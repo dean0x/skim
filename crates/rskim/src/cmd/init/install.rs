@@ -480,10 +480,7 @@ fn is_hook_script_current(script_path: &std::path::Path, version: &str) -> bool 
         return false;
     };
     let version_line = format!("# skim-hook v{version}");
-    let has_pinned = contents
-        .lines()
-        .any(|l| l.trim_start().starts_with("export SKIM_HOOK_BINARY="));
-    contents.contains(&version_line) && has_pinned
+    contents.contains(&version_line) && super::script_has_pinned_marker(&contents)
 }
 
 fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {

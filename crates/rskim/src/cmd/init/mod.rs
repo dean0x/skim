@@ -63,6 +63,18 @@ pub(crate) fn run(
     run_install(&flags)
 }
 
+/// Returns `true` when hook script `contents` exports `SKIM_HOOK_BINARY`,
+/// indicating the F6 pinned-binary format.
+///
+/// This is the single source of truth for the "has pinned binary marker" scan,
+/// shared by `uses_pinned_binary` (state detection) and `is_hook_script_current`
+/// (reinstall idempotence check) so that a format change updates both in lockstep.
+pub(super) fn script_has_pinned_marker(contents: &str) -> bool {
+    contents
+        .lines()
+        .any(|l| l.trim_start().starts_with("export SKIM_HOOK_BINARY="))
+}
+
 /// Build the clap `Command` definition for shell completions.
 pub(super) fn command() -> clap::Command {
     clap::Command::new("init")
