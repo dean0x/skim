@@ -319,17 +319,26 @@ fn render_changed_only(
 ///   2. The overlapping hunk patch lines, clipped to the node's boundary via
 ///      `emit_hunk_patch_lines_clipped` (which already includes git's ±3 context).
 ///
-/// Orphan hunks — hunks whose changed lines fall outside ALL top-level AST nodes
-/// (EOF deletions, additions between functions, trailing blanks) — are rendered as
-/// raw hunk lines so no content is silently dropped.
+/// Orphan content — patch lines that fall outside ALL changed AST node ranges
+/// (EOF deletions, additions between functions, trailing/inter-node blanks) — is
+/// rendered by a second pass so no content is silently dropped (#317, ADR-003).
+/// Attribution is tracked at LINE granularity, not per-hunk: a single hunk that
+/// both edits inside a node AND deletes lines just past that node's closing brace
+/// has the in-node lines emitted by the range loop and the out-of-node lines
+/// emitted by the orphan pass. A per-hunk "attributed" boolean would mark such a
+/// hunk done after clipping and drop its trailing deletions — a silent OMISSION
+/// the ADR-001 net-savings guardrail cannot catch, because that guard fires only
+/// on OVER-emission (skim larger than raw), never on UNDER-emission.
 ///
 /// Output size is bounded to ≈ raw because we emit ONLY the hunk lines (which ARE
 /// the raw content for those regions) plus one breadcrumb per changed container.
 /// This prevents the 2-5× bloat of the old `render_changed_only` path that emitted
 /// the entire enclosing node body via `render_node_with_hunks`.
 ///
-/// De-duplication is handled by the per-file `EmittedCursor` — two adjacent ranges
-/// sharing one hunk still emit each changed line exactly once.
+/// De-duplication within the range loop is handled by the per-file `EmittedCursor`
+/// — two adjacent ranges sharing one hunk still emit each changed line exactly
+/// once. The orphan pass de-duplicates against the range loop by new-file line
+/// membership in the recorded clip windows (see below), not the cursor.
 fn render_default_scoped(
     output: &mut String,
     changed_ranges: &[ChangedNodeRange],
@@ -337,9 +346,18 @@ fn render_default_scoped(
     source_lines: &[&str],
     ln_width: usize,
 ) {
-    // Track which hunks are attributed to at least one changed-node range.
-    // Unattributed hunks are orphans and rendered separately.
-    let mut hunk_attributed = vec![false; hunks.len()];
+    // Per-hunk record of the node-range clip windows applied during the range
+    // loop. An EMPTY entry means the hunk overlapped no changed node (a fully
+    // orphan hunk). A NON-empty entry means the hunk was clipped to one or more
+    // node ranges — but any lines OUTSIDE those windows (EOF/trailing deletions,
+    // blanks between nodes) were NOT emitted and must still be rendered below.
+    //
+    // This is LINE-granular attribution. A single per-hunk boolean (the prior
+    // design) marked the whole hunk "done" once any node clipped it, silently
+    // dropping its out-of-node changed lines — a #317 compress-never-truncate
+    // violation the ADR-001 size guardrail cannot catch (it fires only on
+    // OVER-emission, never UNDER-emission; see ADR-003).
+    let mut hunk_clips: Vec<Vec<(usize, usize)>> = vec![Vec::new(); hunks.len()];
 
     // Per-unique-container deduplication for breadcrumbs.
     let mut emitted_breadcrumbs: HashSet<usize> = HashSet::new();
@@ -368,19 +386,29 @@ fn render_default_scoped(
         // For nested nodes (methods inside a class/struct/impl) use the
         // parent's header line; for top-level nodes use the node's own
         // first line.  Emitted at most once per unique header line.
+        //
+        // `breadcrumb_line` is always >= 1: it comes from
+        // `child.start_position().row + 1` (tree-sitter rows are 0-indexed)
+        // so `checked_sub(1)` returning None is unreachable on any real AST.
+        // Guard with checked_sub rather than a bare `- 1` so a synthetic or
+        // zero value skips the breadcrumb silently instead of panicking in
+        // debug builds.
         let breadcrumb_line = range
             .parent_context
             .as_ref()
             .map_or(range.start, |p| p.header_line);
         if emitted_breadcrumbs.insert(breadcrumb_line)
-            && let Some(line) = source_lines.get(breadcrumb_line - 1)
+            && let Some(idx) = breadcrumb_line.checked_sub(1)
+            && let Some(line) = source_lines.get(idx)
         {
             let _ = writeln!(output, " {:>ln_width$} {line}", breadcrumb_line);
         }
 
-        // Emit hunk patch lines clipped to this node's boundary.
+        // Emit hunk patch lines clipped to this node's boundary, recording the
+        // clip window so the orphan pass can tell in-node lines (already emitted
+        // here) from out-of-node lines (still to render).
         for &hunk_idx in &relevant_indices {
-            hunk_attributed[hunk_idx] = true;
+            hunk_clips[hunk_idx].push((range.start, range.end));
             emit_hunk_patch_lines_clipped(
                 output,
                 &hunks[hunk_idx],
@@ -392,18 +420,36 @@ fn render_default_scoped(
         }
     }
 
-    // Orphan hunks: hunks whose changed lines fall outside all AST nodes.
-    // Render as raw hunk lines so no content is silently dropped (execution plan
-    // point 3: "ORPHAN HUNKS MUST RENDER").  Typical cases: EOF deletions,
-    // additions between top-level functions, trailing blank-line changes.
+    // Line-granular orphan pass: emit every patch line NOT covered by any node
+    // clip window for its hunk, so no changed line is silently dropped (#317,
+    // ADR-003). Two cases collapse into one walk:
+    //   * fully orphan hunk (clips empty)     → every line emitted (raw), as the
+    //     old orphan-hunk loop did (EOF deletions, additions between functions).
+    //   * partially clipped hunk (clips set)  → only the OUT-of-node lines
+    //     (trailing/EOF deletions, inter-node blanks) are emitted; the in-node
+    //     lines were already written by the range loop above and are skipped.
+    //
+    // A line is "in node" iff its new-file line position falls within any clip
+    // window for this hunk, mirroring `emit_hunk_patch_lines_clipped`'s
+    // `[node_start, node_end]` clip (which skips `patch_new_line < node_start`
+    // and breaks at `patch_new_line > node_end`). This new-file-membership test
+    // is provably equivalent to "was emitted by the range loop" and — unlike a
+    // shared monotonic cursor — is immune to cross-hunk false-skips when a
+    // partially-clipped hunk precedes a later attributed hunk in the same file.
     for (hunk_idx, hunk) in hunks.iter().enumerate() {
-        if hunk_attributed[hunk_idx] {
-            continue;
-        }
+        let clips = &hunk_clips[hunk_idx];
         let mut cur_new = hunk.new_start;
         let mut cur_old = hunk.old_start;
         for line in &hunk.patch_lines {
-            let (nd, od) = emit_patch_line(output, line, cur_new, cur_old, ln_width);
+            let in_node = clips
+                .iter()
+                .any(|&(start, end)| (start..=end).contains(&cur_new));
+            let (nd, od) = if in_node {
+                // Already emitted by the range loop — advance counters only.
+                patch_line_deltas(line)
+            } else {
+                emit_patch_line(output, line, cur_new, cur_old, ln_width)
+            };
             cur_new += nd;
             cur_old += od;
         }
@@ -776,6 +822,21 @@ fn render_node_with_hunks(
             let _ = writeln!(output, " {:>ln_width$} {line}", current_new_line);
         }
         current_new_line += 1;
+    }
+}
+
+/// Line-number deltas for a patch line WITHOUT emitting it.
+///
+/// Mirrors `emit_patch_line`'s counter advancement exactly: `+` → (1, 0),
+/// `-` → (0, 1), ` ` (context) → (1, 1), and `\` (no-newline marker) or any
+/// other prefix → (0, 0). Used by `render_default_scoped`'s orphan pass to
+/// advance past lines already emitted by the range loop without re-emitting them.
+fn patch_line_deltas(patch_line: &str) -> (usize, usize) {
+    match patch_line.as_bytes().first() {
+        Some(b'+') => (1, 0),
+        Some(b'-') => (0, 1),
+        Some(b' ') => (1, 1),
+        _ => (0, 0),
     }
 }
 
@@ -1684,6 +1745,80 @@ mod tests {
         assert!(
             output.contains('-'),
             "orphan deletion line must contain '-' prefix:\n{output}"
+        );
+    }
+
+    /// Regression (#317 / ADR-003): edit-inside-last-node + trailing deletions
+    /// past the node's closing brace, in ONE hunk, must NOT drop the deletions.
+    ///
+    /// The prior per-hunk `hunk_attributed` boolean marked the whole hunk done
+    /// after clipping the patch to `fn a`'s `[1,3]` boundary, so the orphan loop
+    /// skipped it and the two blank-line deletions at old lines 4-5 (OUTSIDE
+    /// every AST node) vanished from the output. The ADR-001 net-savings guard
+    /// cannot catch this — it fires only on OVER-emission, never UNDER-emission.
+    #[test]
+    fn test_render_default_scoped_trailing_deletion_in_shared_hunk_not_dropped() {
+        // New file after patch:
+        //   line 1: fn a() {
+        //   line 2:     return 42;   (edited — was `return 0;`)
+        //   line 3: }
+        //   line 4: fn b() {}
+        // Old file had two blank lines between `}` (old line 3) and `fn b`
+        // (old line 6); they are deleted in the SAME hunk that edits line 2.
+        let source_lines: Vec<&str> = vec!["fn a() {", "    return 42;", "}", "fn b() {}"];
+
+        let hunks = vec![DiffHunk {
+            old_start: 1,
+            old_count: 6,
+            new_start: 1,
+            new_count: 4,
+            patch_lines: vec![
+                " fn a() {",
+                "-    return 0;",
+                "+    return 42;",
+                " }",
+                "-", // deleted blank (old line 4) — OUTSIDE fn a's [1,3]
+                "-", // deleted blank (old line 5) — OUTSIDE fn a's [1,3]
+                " fn b() {}",
+            ],
+        }];
+
+        // Only `fn a` (new lines 1-3) is a changed node. The two blank-line
+        // deletions map (via build_changed_lines) to new-file position 4, which
+        // matches no AST node → orphan lines inside an otherwise-attributed hunk.
+        let changed_ranges = vec![super::super::types::ChangedNodeRange {
+            start: 1,
+            end: 3,
+            parent_context: None,
+        }];
+
+        let mut output = String::new();
+        render_default_scoped(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+
+        // The edited in-node line must appear (attributed emission).
+        assert!(
+            output.contains("return 42;"),
+            "edited in-node line must appear:\n{output}"
+        );
+
+        // Every `-` line from the raw hunk must survive: the edited-line deletion
+        // PLUS both trailing blank-line deletions = 3 removed lines. The old code
+        // dropped the two trailing ones (only 1 `-` line survived).
+        let removed_lines = output.lines().filter(|l| l.starts_with('-')).count();
+        assert!(
+            removed_lines >= 3,
+            "expected the in-node deletion + 2 trailing blank deletions (>=3 '-' lines); \
+             got {removed_lines}:\n{output}"
+        );
+
+        // The trailing deletions carry old-file line numbers 4 and 5.
+        assert!(
+            output.contains("-4"),
+            "trailing blank deletion at old line 4 must appear:\n{output}"
+        );
+        assert!(
+            output.contains("-5"),
+            "trailing blank deletion at old line 5 must appear:\n{output}"
         );
     }
 
