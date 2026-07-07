@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **Exit-code remap: parse errors → 2, unsupported language → 3** — Scripts that
+  branched on a specific non-zero exit code (not just `!= 0`) may need updating.
+  See **Changed** below for full details.
+- **Unknown-extension files now degrade to lossless passthrough (exit 0)** —
+  Files with an unrecognised extension or unrecognised shebang previously produced
+  a non-zero exit; they now fall back to byte-faithful passthrough (exit 0,
+  applies ADR-002). Scripts that relied on a non-zero exit to detect unrecognised
+  input must instead inspect the output. See **Fixed** below for full details.
+- **`skim -` (stdin) without a language hint now exits 0** — Bare stdin with no
+  `--language` flag, no `--filename` hint, and no recognisable shebang previously
+  errored (non-zero). It now degrades to lossless passthrough (exit 0,
+  applies ADR-002). See **Fixed** below for full details.
+
 ### Added
 - **Bash / shell language support** — Full tree-sitter-bash grammar integration
   (`Language::Bash`). Structure mode strips `function_definition` bodies to `{...}`
@@ -235,12 +250,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Exit codes refined: parse errors → 2, unsupported language → 3** — Previously all
   `skim` errors that prevented transformation exited 1. The CLI now maps known failure
   classes to distinct codes: exit 2 for grammar/syntax parse failures
-  (`SkimError::ParseError`), exit 3 for unrecognised language when an explicit
-  `--language` flag was provided (`SkimError::UnsupportedLanguage`). Exit 1 is
-  preserved for all other errors (I/O, config, etc.). Shebang-only or
+  (`SkimError::ParseError`), exit 3 for unrecognised language when a `--filename`
+  hint carries an extension skim does not recognise (`SkimError::UnsupportedLanguage`).
+  Exit 1 is preserved for all other errors (I/O, config, etc.). Shebang-only or
   extension-based detection failures degrade to lossless passthrough (exit 0) rather
-  than exiting 3; exit 3 fires only on explicit `--language` values that skim does not
-  support. Scripts that tested for `exit != 0` are unaffected; scripts that branched on
+  than exiting 3; exit 3 fires only when a `--filename` hint carries an extension skim
+  does not recognise. Scripts that tested for `exit != 0` are unaffected; scripts that branched on
   the exact exit code may need updating.
 - **Session-id attribution priority inverted: sidecar > env > flag** (#350) — The hook no longer
   injects `--session-id` into rewritten commands; flag injection caused hard failures

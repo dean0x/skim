@@ -235,7 +235,7 @@ struct Args {
     #[arg(help = "Transformation mode: structure, signatures, types, full, minimal, or pseudo")]
     mode: ModeArg,
 
-    /// Override language detection (required for stdin unless --filename is given)
+    /// Override language detection; stdin without this flag, --filename, or a shebang degrades to lossless passthrough (exit 0)
     #[arg(short, long, alias = "lang", value_enum)]
     #[arg(
         help = "Programming language: typescript, javascript, python, rust, go, java, c, cpp, csharp, ruby, sql, kotlin, swift, bash, markdown, json, yaml, toml (or use --filename for auto-detection from stdin)"
