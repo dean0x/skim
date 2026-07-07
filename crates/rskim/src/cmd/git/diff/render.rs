@@ -369,8 +369,9 @@ fn render_default_scoped(
     for range in changed_ranges {
         // Locate the window of hunks that overlap this node range using the
         // same partition_point logic as render_node_with_hunks.
-        let first =
-            hunks.partition_point(|h| h.new_start + h.new_count.saturating_sub(1) < range.start);
+        let first = hunks.partition_point(|h| {
+            h.new_start.saturating_add(h.new_count.saturating_sub(1)) < range.start
+        });
         let relevant_indices: Vec<usize> = hunks[first..]
             .iter()
             .enumerate()
@@ -780,7 +781,9 @@ fn render_node_with_hunks(
     // Hunks are sorted by new_start (they come from git's sequential output).
     // Use partition_point to skip hunks that end before node_start, then
     // take_while to stop once the hunk starts after node_end — O(log H + matches).
-    let first = hunks.partition_point(|h| h.new_start + h.new_count.saturating_sub(1) < node_start);
+    let first = hunks.partition_point(|h| {
+        h.new_start.saturating_add(h.new_count.saturating_sub(1)) < node_start
+    });
     let relevant_hunks: Vec<&DiffHunk<'_>> = hunks[first..]
         .iter()
         .take_while(|h| h.new_start <= node_end)
