@@ -96,6 +96,7 @@ pub(crate) fn is_ls_section_header(line: &str) -> bool {
 }
 
 /// Accumulated data for one directory section in multi-dir `ls -la` output.
+#[derive(Default)]
 struct LsSection {
     /// Directory path label (the header line with the trailing `:` removed).
     label: String,
@@ -160,14 +161,8 @@ fn accumulate_long_entry(sec: &mut LsSection, line: &str) {
 fn parse_ls_long_sections(stdout: &str) -> Vec<LsSection> {
     // Synthetic leading section for long-form lines before the first dir header.
     // It is prepended only if it accumulates at least one real entry.
-    let mut leading: LsSection = LsSection {
-        label: String::new(), // empty = unlabeled
-        entries: Vec::new(),
-        total_entries: 0,
-        dirs: 0,
-        files: 0,
-        has_long_lines: false,
-    };
+    // Empty label (default) signals "unlabeled" in the renderer.
+    let mut leading: LsSection = LsSection::default();
     let mut sections: Vec<LsSection> = Vec::new();
     // True once we have seen the first section header.
     let mut in_named_section = false;
@@ -178,11 +173,7 @@ fn parse_ls_long_sections(stdout: &str) -> Vec<LsSection> {
             in_named_section = true;
             sections.push(LsSection {
                 label: line.trim_end_matches(':').to_string(),
-                entries: Vec::new(),
-                total_entries: 0,
-                dirs: 0,
-                files: 0,
-                has_long_lines: false,
+                ..Default::default()
             });
             continue;
         }
@@ -373,12 +364,8 @@ fn try_parse_ls_long_sectioned(stdout: &str) -> Option<FileResult> {
 /// lines as plain filenames.
 fn try_parse_ls_long_flat(stdout: &str) -> Option<FileResult> {
     let mut sec = LsSection {
-        label: String::new(),
-        entries: Vec::with_capacity(MAX_DISPLAY_ENTRIES),
-        total_entries: 0,
-        dirs: 0,
-        files: 0,
-        has_long_lines: false,
+        entries: Vec::with_capacity(MAX_DISPLAY_ENTRIES), // capacity hint kept explicit
+        ..Default::default()
     };
 
     for line in stdout.lines().take(MAX_INPUT_LINES) {
