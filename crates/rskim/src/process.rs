@@ -512,9 +512,10 @@ pub(crate) fn process_stdin(
     // ADR-002: when no language is detectable for plain stdin (no --language,
     // no --filename, no shebang), degrade to a lossless passthrough rather than
     // erroring — consistent with the file path behaviour in run_transform.
-    // --filename with an unrecognised extension is still an error: the user
-    // gave an explicit hint that skim cannot honour.
-    if language_or_none.is_none() {
+    // --filename with an unrecognised extension is still an error unless a shebang
+    // in the stdin content provides a recognised language override: the user gave
+    // an explicit hint that skim cannot honour without a shebang fallback.
+    let Some(language) = language_or_none else {
         if let Some(fname) = filename_hint {
             // Explicit --filename with unknown extension → hard error (exit 3).
             // Returning SkimError::UnsupportedLanguage lets the exit-code map in
@@ -528,9 +529,7 @@ pub(crate) fn process_stdin(
         }
         // No --filename, no --language, no shebang — degrade to lossless passthrough.
         return Ok(stdin_passthrough_result(buffer, &options));
-    }
-
-    let language = language_or_none.expect("language_or_none is Some — checked above");
+    };
 
     let (transformed, stdin_has_errors, stdin_line_map, stdin_degraded) = match options
         .trunc
