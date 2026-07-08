@@ -1,11 +1,11 @@
 ---
 feature: hook-binary-pinning
 name: Agent Hook Install, Binary Pinning & Handshake
-description: "Use when modifying hook script generation, adding new agents, changing the hook script format, debugging version-skew or wrong-clone warnings, working on install/reinstall logic, or touching wrapper symlink management. Keywords: hook install, binary pinning, SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, generate_hook_script, is_hook_script_current, uses_pinned_binary, script_has_pinned_marker, AwarenessOnly, codex, wrapper symlinks."
+description: "Use when modifying hook script generation, adding new agents, changing the hook script format, debugging version-skew or wrong-clone warnings, working on install/reinstall logic, touching wrapper symlink management, or editing guidance_content() / the Command wrapping section. Keywords: hook install, binary pinning, SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, generate_hook_script, is_hook_script_current, uses_pinned_binary, script_has_pinned_marker, AwarenessOnly, codex, wrapper symlinks, guidance_content, guidance_content_mdc, Command wrapping, ADR-005."
 category: domain-knowledge
 directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/rewrite]
 created: 2026-07-04
-updated: 2026-07-07
+updated: 2026-07-08
 ---
 
 # Agent Hook Install, Binary Pinning & Handshake
@@ -161,7 +161,7 @@ detect_state()
                   → patch_settings() → inject_guidance()
 ```
 
-The `detect_state` reads the hook script once and reuses the content for both version extraction and pinned-binary detection (`hook_script_contents` is passed as `prefetched_contents` to `extract_hook_version_from_entry`), avoiding duplicate `fs::read_to_string` calls.
+The `detect_state` reads the hook script once into `hook_script_contents` and passes it as `prefetched_contents` to `extract_hook_version_from_entry`. Callers passing `None` to that function will trigger a second `fs::read_to_string` — not a bug but a performance consideration in tight paths.
 
 ## Technical Implementation Patterns
 
@@ -197,6 +197,21 @@ Cursor used to be incorrectly written to `settings.json` using the Claude Code P
 
 `MAX_SETTINGS_SIZE` (10 MiB) caps how large a settings.json will be read. Files larger are treated as non-existent to prevent OOM from maliciously crafted configs, especially in `--project` mode where the config is under repository control. `read_settings_json` returns `None` for oversized or unparseable files.
 
+### Guidance Template (guidance_content)
+
+`guidance_content(version)` in `init/helpers.rs` generates the Markdown block injected by `inject_guidance()` into every agent's instruction file between `<!-- skim-start v{ver} -->` and `<!-- skim-end -->` markers. The function is the single source of truth for what agents read about skim; `guidance_content_mdc(version)` wraps the identical body in Cursor `.mdc` YAML frontmatter, so **a single edit to `guidance_content` propagates to both outputs**.
+
+**The "### Command wrapping" section** (inserted between "### What skim does" and "### When to use skim") is USER-APPROVED VERBATIM copy. Its wording is fixed by the user and should not be paraphrased casually — future edits require explicit user approval. The section exists to pre-empt agent confusion when the rewrite hook substitutes `skim ls` for `ls`: agents need to know this is intended behavior, not an error, and that they should flag garbled output to the user rather than silently working around it (applies ADR-005).
+
+**Brace-free body constraint**: because the body is interpolated inside `format!(r#"…"#)`, literal `{` and `}` characters in the template text would be misinterpreted as format arguments and cause a compile error. All guidance prose must remain brace-free. (Note: the code fences inside the Quick Reference block use backticks, not braces, so they are unaffected.)
+
+**Test enforcement** (`test_guidance_content_has_version_markers` in `helpers.rs`): the test asserts BOTH positive and negative invariants:
+
+- Positive: `content.contains("### Command wrapping")`, `content.contains("wrap supported shell commands")`, `content.contains("flag it to the user")`
+- Negative: `!content.contains("SKIM_PASSTHROUGH")` — per ADR-005, documenting the escape hatch causes agents to bypass compression by default; they learn about it from stderr hints on compressed non-zero exits instead. `!content.contains("rskim")` — the binary name in guidance must stay `skim`, not the crate name.
+
+**Version-gated rollout** (applies ADR-004): `inject_guidance()` uses the `<!-- skim-start v{ver} -->` marker to detect whether the installed guidance is stale. Fresh installs receive the new content immediately. Existing installs on older versions will receive the updated guidance on their next `skim init` run (triggered by a version bump + re-pin). There is no mechanism to force-push guidance without a version change or manual reinstall.
+
 ## Anti-Patterns
 
 **Adding a new required script line but wiring it into only one currency predicate**: the pinned-marker scan itself is now a single shared helper (`script_has_pinned_marker` in `init/mod.rs`), so changing the `SKIM_HOOK_BINARY` marker updates both `uses_pinned_binary` and `is_hook_script_current` automatically. The lockstep hazard survives one level up: if you add a **new** required line to the format (e.g. `export SKIM_HOOK_SHA256=`) and gate `is_hook_script_current` on it (install-path regeneration) without also teaching state detection about it (`uses_pinned_binary` / `hook_uses_pinned_binary`, the gate behind `DetectedState::hook_is_current()`), reinstall will silently skip stale scripts — `hook_is_current()` returns true while the install path would have regenerated. Fold any new required-line check into the shared helper, or add the new predicate to **both** surfaces.
@@ -206,6 +221,8 @@ Cursor used to be incorrectly written to `settings.json` using the Claude Code P
 **Treating both dispatch surfaces as equivalent for rewrite tests**: the rewrite engine surface (stdin JSON → `try_rewrite()` → JSON response) and the wrapper surface (argv0 dispatch) share per-tool handlers but have completely different front-ends. A test that drives `--hook` mode does not exercise the wrapper path. Flag preservation, corruption-bail, and pipe-source passthrough are rewrite-engine-only properties; output-fidelity (`stdout_is_regular_file`) exists on both surfaces via distinct mechanisms.
 
 **Calling `exec skim ...` without a PATH fallback check in the script**: the `_SKIM_BIN` variable is checked with `[ -x "$_SKIM_BIN" ]` before exec. This ensures the pinned exec is only attempted when the file is actually executable, avoiding confusing "not found" vs "permission denied" errors.
+
+**Adding `SKIM_PASSTHROUGH` to the guidance template**: this is an anti-pattern documented in ADR-005 and enforced by a negative test assert. Agents that learn about `SKIM_PASSTHROUGH` tend to use it as a default bypass rather than an emergency escape hatch, defeating compression entirely. The guidance deliberately omits it; agents encounter it only through stderr hints on compressed non-zero exits.
 
 **Adding a `skim` symlink to `~/.skim/bin/`**: the wrapper dir contains tool-name symlinks (git, npm, grep, ...) pointing to the skim binary, NOT a `skim` symlink. The PATH fallback in the hook script (`exec skim ...`) needs to resolve via the real PATH, not the wrapper dir, because `strip_skim_wrappers_from_path()` strips `~/.skim/bin` first — so prepending the wrapper dir before `exec skim` would find nothing and was removed.
 
@@ -223,9 +240,12 @@ Cursor used to be incorrectly written to `settings.json` using the Claude Code P
 
 **Codex tests assert NO script and NO handshake**: tests for CodexCliHook verify that `generate_script` returns `""` and `install()` returns `script_path: None`. Any test that checks for non-empty hook output for Codex is wrong by design.
 
+**Guidance body must be brace-free**: any `{` or `}` in the `guidance_content` body string will be interpreted as a format argument by `format!(r#"…"#)` and cause a compile error. The negative test assert for `SKIM_PASSTHROUGH` (and the absence of `rskim`) is in `test_guidance_content_has_version_markers` — breaking those asserts is a deliberate guardrail, not an oversight.
+
 ## Key Files
 
 - `crates/rskim/src/cmd/init/mod.rs` — `run()` init dispatch, `command()` clap definition, and `script_has_pinned_marker()` (the single source of truth for the `SKIM_HOOK_BINARY` marker scan, shared by both currency predicates)
+- `crates/rskim/src/cmd/init/helpers.rs` — `guidance_content()`, `guidance_content_mdc()`, `atomic_write_settings()`, `load_or_create_settings()`, `confirm_proceed()`; the guidance template lives here with its positive/negative test assertions
 - `crates/rskim/src/cmd/hooks/mod.rs` — `generate_hook_script()`, `shell_single_quote()`, `HookProtocol` trait, `HookSupport` enum, shared `parse_tool_input_command()` and `upsert_hook_versioned()`
 - `crates/rskim/src/cmd/init/state.rs` — `detect_state()`, `uses_pinned_binary()` (delegates to `script_has_pinned_marker`), `DetectedState`, `hook_is_current()`
 - `crates/rskim/src/cmd/init/install.rs` — `is_hook_script_current()` (version check + `script_has_pinned_marker`), `create_hook_script()`, `atomic_write_executable()`, `migrate_cursor_legacy_settings()`
@@ -237,10 +257,10 @@ Cursor used to be incorrectly written to `settings.json` using the Claude Code P
 ## Related
 
 - D3 (batch decision): `SKIM_GIT_COMMIT` embedded via `build.rs` `option_env!`; `"unknown"` for tarball builds; `--version` prints `x.y.z (<shortsha>)`; hook scripts pin the absolute shell-quoted canonicalized generating-binary path with PATH fallback; handshake/mismatch signals go to `hook.log` ONLY (hard zero-stderr invariant, #361 Bug 3); manual repointing trips the integrity "tampered" check by design
-- ADR-004 (hook install pins absolute binary path + handshake): decision that mandated the pinned-binary format and daily-rate-limited warn-only signaling in hook mode
+- ADR-004 (hook install pins absolute binary path + handshake): decision that mandated the pinned-binary format and daily-rate-limited warn-only signaling in hook mode; also gates guidance rollout — stale installs get updated content on the next version-bump re-pin
+- ADR-005 (guidance framed as calibrated trust): prohibits documenting `SKIM_PASSTHROUGH` in the guidance template; enforced by `!content.contains("SKIM_PASSTHROUGH")` negative assert in `test_guidance_content_has_version_markers`; `!content.contains("rskim")` is a corollary assertion in the same test
+- PF-006 (strip_ansi destroys tabs — gh/diff skip_ansi_strip fix): shipped in the same session as the "### Command wrapping" guidance addition; covers wrapper configs (`gh/mod.rs`, diff) that live outside this KB's directories; relevant because `guidance_content` explains command wrapping behavior that these wrappers implement
 - PF-004 (rewrite-engine fidelity): connects to the two-surfaces distinction — rewrite-engine properties (flag preservation, corruption-bail, pipe-source passthrough) do not apply to the wrapper surface
 - Feature: `analytics` — session_id flows from hook JSON via sidecar, not via rewritten command flags (#1.1)
 - Source: `crates/rskim/src/cmd/integrity/` — `compute_file_hash()` and `write_hash_manifest()` used in SHA-256 sidecar generation
 - Source: `crates/rskim/src/cmd/hook_log.rs` — `log_hook_warning()` (the only permitted diagnostic channel in hook mode)
-</content>
-</invoke>
