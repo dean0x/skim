@@ -69,9 +69,14 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     env_overrides: &[],
     install_hint: "Install gh: https://cli.github.com/",
     family: "infra",
-    skip_ansi_strip: false,
+    // `gh pr checks` emits TAB-separated output and no ANSI when piped;
+    // `strip_ansi_escapes` drops `\t`, destroying the `RE_GH_CHECK_TAB`
+    // separators before the parser can see them. Mirror the DB/DNS precedent.
+    skip_ansi_strip: true,
     command_type: CommandType::Infra,
-    expected_exit_codes: &[],
+    // gh exits 8 for pending/failing checks — a result the parser compresses,
+    // not an error. Without this, exit 8 is raw-forwarded before parsing.
+    expected_exit_codes: &[8],
     forward_stderr: false,
     skip_net_savings_guard: true,
     synthesize_success_line: None,
@@ -273,6 +278,38 @@ mod tests {
     use super::load_gh_fixture as load_fixture;
     use super::*;
     use crate::cmd::test_utils::{make_output, make_output_full};
+
+    // --- config-lock tests ---
+    //
+    // These pin CONFIG fields that are easy to accidentally regress.
+    //
+    // skip_ansi_strip MUST be true: `gh pr checks` emits TAB-separated output
+    // and `strip_ansi_escapes` drops `\t`, destroying the `RE_GH_CHECK_TAB`
+    // separators before the parser can see them.
+    //
+    // expected_exit_codes MUST include 8: gh exits 8 for pending/failing checks
+    // — a result the parser compresses, not an error. Without &[8], exit 8 is
+    // classified as UnexpectedFailure and raw-forwarded before parsing.
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn test_config_skip_ansi_strip_is_true() {
+        assert!(
+            CONFIG.skip_ansi_strip,
+            "gh CONFIG.skip_ansi_strip must be true — \
+             strip_ansi_escapes drops \\t, destroying RE_GH_CHECK_TAB separators"
+        );
+    }
+
+    #[test]
+    fn test_config_expected_exit_codes_includes_8() {
+        assert_eq!(
+            CONFIG.expected_exit_codes,
+            &[8],
+            "gh CONFIG.expected_exit_codes must be &[8] — \
+             gh exits 8 for pending/failing checks (a parseable result, not an error)"
+        );
+    }
 
     // --- extract_comments ---
 

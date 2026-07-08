@@ -31,7 +31,10 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     env_overrides: &[],
     install_hint: "diff is typically pre-installed on Unix systems",
     family: "file",
-    skip_ansi_strip: false,
+    // standalone `diff -u` emits `--- path\t<mtime>` headers and the parser
+    // splits on `\t` (see `try_parse_standalone_unified`); diff emits no ANSI.
+    // `strip_ansi_escapes` drops `\t`, fusing path and mtime before parsing.
+    skip_ansi_strip: true,
     command_type: CommandType::FileOps,
     expected_exit_codes: &[1],
     forward_stderr: true,
@@ -237,6 +240,23 @@ fn build_file_result(file_stats: Vec<FileStat>) -> Option<FileResult> {
 mod tests {
     use super::*;
     use crate::cmd::test_utils::{load_fixture, make_output_full};
+
+    // --- config-lock tests ---
+    //
+    // skip_ansi_strip MUST be true: standalone `diff -u` emits
+    // `--- path\t<mtime>` headers and the parser splits on `\t` (line 158/167).
+    // `strip_ansi_escapes` would drop the `\t`, fusing path and timestamp
+    // into a single token before the parser sees it. diff emits no ANSI.
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn test_config_skip_ansi_strip_is_true() {
+        assert!(
+            CONFIG.skip_ansi_strip,
+            "diff CONFIG.skip_ansi_strip must be true — \
+             strip_ansi_escapes drops \\t, gluing path to mtime in --- headers"
+        );
+    }
 
     // ---- prepare_args tests ----
 
