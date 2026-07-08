@@ -29,17 +29,8 @@ mod common;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-/// Path to the built skim binary.
-fn skim_bin() -> std::path::PathBuf {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_skim") {
-        return std::path::PathBuf::from(path);
-    }
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set");
-    let mut p = std::path::PathBuf::from(manifest_dir);
-    p.pop(); // crates/rskim → crates
-    p.pop(); // crates → workspace root
-    p.join("target").join("debug").join("skim")
-}
+const GH_PR_CHECKS_TEXT: &str = include_str!("fixtures/cmd/infra/gh_pr_checks_text.txt");
+const DIFF_UNIFIED_TEXT: &str = include_str!("fixtures/cmd/file/diff_unified.txt");
 
 /// Create a stub directory with a script named `name` that prints `stdout`
 /// and exits with `code`.  Returns the TempDir (must stay alive for PATH use).
@@ -63,19 +54,6 @@ fn prepend_path(extra_dir: &std::path::Path) -> String {
     )
 }
 
-/// Load a fixture file relative to `tests/fixtures/cmd/<subdir>/<name>`.
-fn load_fixture(subdir: &str, name: &str) -> String {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set");
-    let path = std::path::PathBuf::from(manifest_dir)
-        .join("tests")
-        .join("fixtures")
-        .join("cmd")
-        .join(subdir)
-        .join(name);
-    fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("Failed to read fixture {}: {e}", path.display()))
-}
-
 // ============================================================================
 // gh pr checks — exit 0
 // ============================================================================
@@ -90,10 +68,9 @@ fn load_fixture(subdir: &str, name: &str) -> String {
 /// (proving fields were correctly separated, not fused).
 #[test]
 fn test_gh_pr_checks_exit0_compressed_summary() {
-    let fixture = load_fixture("infra", "gh_pr_checks_text.txt");
-    let stub_dir = make_stub("gh", &fixture, 0);
+    let stub_dir = make_stub("gh", GH_PR_CHECKS_TEXT, 0);
     let path = prepend_path(stub_dir.path());
-    let skim = skim_bin();
+    let skim = common::skim_bin();
 
     let out = std::process::Command::new(&skim)
         .args(["gh", "pr", "checks", "421"])
@@ -139,10 +116,9 @@ fn test_gh_pr_checks_exit0_compressed_summary() {
 /// "CI / lint", and the failure URL "https://" (AD-INFRA-15).
 #[test]
 fn test_gh_pr_checks_exit8_summary_and_exit_code() {
-    let fixture = load_fixture("infra", "gh_pr_checks_text.txt");
-    let stub_dir = make_stub("gh", &fixture, 8);
+    let stub_dir = make_stub("gh", GH_PR_CHECKS_TEXT, 8);
     let path = prepend_path(stub_dir.path());
-    let skim = skim_bin();
+    let skim = common::skim_bin();
 
     let out = std::process::Command::new(&skim)
         .args(["gh", "pr", "checks", "421"])
@@ -190,10 +166,9 @@ fn test_gh_pr_checks_exit8_summary_and_exit_code() {
 /// path reference, and does NOT contain the glued form "src/main.rs2026".
 #[test]
 fn test_diff_tab_header_path_not_glued() {
-    let fixture = load_fixture("file", "diff_unified.txt");
-    let stub_dir = make_stub("diff", &fixture, 1);
+    let stub_dir = make_stub("diff", DIFF_UNIFIED_TEXT, 1);
     let path = prepend_path(stub_dir.path());
-    let skim = skim_bin();
+    let skim = common::skim_bin();
 
     let out = std::process::Command::new(&skim)
         .args(["diff", "a/src/main.rs", "b/src/main.rs"])
