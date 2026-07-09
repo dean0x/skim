@@ -60,11 +60,13 @@ pub(super) enum VerifyMode {
 pub(super) enum SnippetOutcome {
     /// Successfully extracted a snippet.
     ///
-    /// - `match_line`: 1-indexed line number of the **first** match position
+    /// - `match_line`: 1-indexed line number of the content-derived anchor
     ///   (as `u32` for display formatting).
-    /// - `line_range`: 1-indexed exclusive-end range spanning **all** match
-    ///   positions (may differ from `match_line` when the first position is not
-    ///   the minimum-line position across all positions).
+    /// - `line_range`: for Substring / Phrase / Near paths with a content-derived
+    ///   anchor (AD-396-1 / AD-393-6), this is the single anchor line
+    ///   `{match_line, match_line+1}` — not a multi-position span.
+    ///   For the `extract_snippet` test-sentinel path (empty query), this falls
+    ///   back to the span of all `match_positions` for backwards-compat.
     /// - `context`: surrounding source lines.
     Ok {
         match_line: u32,
@@ -205,6 +207,7 @@ pub(super) fn extract_snippet(
 ///
 /// This fn is pure (no I/O, no side effects) — see `snippet_tests.rs` for
 /// unit tests and `rskim-search/src/types.rs` for the canonical definition.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn query_substring_present(content: &str, query: &str) -> bool {
     rskim_search::query_substring_present(content, query)
 }
@@ -217,18 +220,29 @@ pub(super) fn query_substring_present(content: &str, query: &str) -> bool {
 /// - `false` — the file was not read (Stale / Unavailable) or the predicate
 ///   failed.  The caller should drop this candidate from the verified result set.
 ///
-/// # Design (AD-355-1 / AD-393-5)
+/// # Design (AD-355-1 / AD-393-5 / AD-396-1)
 ///
 /// Verification is co-located with snippet extraction so the file bytes are
 /// read only once. `verify_mode` selects the correctness predicate:
-/// - `Substring` → `query_substring_present` (pre-#393 default)
+/// - `Substring` → `rskim_search::substring_first_anchor` (AD-396-1: content-
+///   derived anchor replacing the prior trigram-position fallback; returns both
+///   the verified flag and the anchor range for re-anchoring, AD-393-6)
 /// - `Phrase`    → `rskim_search::phrase_tokens_present` (exact ordered tokens)
 /// - `Near(n)`   → `rskim_search::near_tokens_present` (within n word-token positions)
 ///
-/// In Phrase/Near mode, if the predicate returns `Some(range)`, the snippet
-/// is re-anchored to the first byte of `range` instead of `match_positions[0].start`
-/// (AD-393-6: trigram-containment positions are approximate; predicate-returned
-/// range is exact).
+/// For Phrase/Near/Substring, if the predicate returns `Some(range)`, the snippet
+/// is re-anchored to `range.start` instead of the approximate trigram-containment
+/// `match_positions[0].start` (AD-393-6 / AD-396-1).
+///
+/// # AD-396-2 — Tiered anchor-selection rule (Substring path)
+///
+/// The Substring anchor is computed by `rskim_search::substring_first_anchor`,
+/// which implements a two-tier policy:
+/// - **Tier 1**: earliest line containing ALL query tokens simultaneously
+///   (grep-AND parity, strongest semantic anchor for agent consumers).
+/// - **Tier 2** (no Tier-1 line): first occurrence of the RAREST token
+///   (highest max-trigram IDF weight from `TRIGRAM_WEIGHTS`; tie-breaks:
+///   longest token, then earliest occurrence).
 pub(super) fn extract_snippet_and_verify(
     root: &Path,
     rel_path: &str,
@@ -326,10 +340,24 @@ pub(super) fn extract_snippet_and_verify(
         Err(_) => return (SnippetOutcome::Unavailable, false),
     };
 
-    // AD-393-5: Dispatch the correct predicate and capture the anchor range
-    // for Phrase/Near re-anchoring (AD-393-6).
+    // AD-393-5 / AD-396-1: Dispatch the correct predicate and capture the
+    // anchor range for re-anchoring (AD-393-6 / AD-396-2).
     let (verified, anchor_range): (bool, Option<Range<usize>>) =
         run_verify_predicate_with_range(text, query, &verify_mode);
+
+    // AD-396-5: Short-query Substring scope boundary.
+    // For Substring mode with empty match_positions (the <3-byte fallback,
+    // AD-355-7 / AD-372-4), null out anchor_range so the guard below returns
+    // Unavailable.  This preserves current short-query behaviour (verified but
+    // snippet-less) while `verified` still gates inclusion.  Only the Substring
+    // path is affected — Phrase/Near short-word fallback keeps its predicate
+    // anchor to avoid a #393 regression.
+    let anchor_range = if matches!(verify_mode, VerifyMode::Substring) && match_positions.is_empty()
+    {
+        None
+    } else {
+        anchor_range
+    };
 
     // AD-355-7 / D13: short-query fallback candidates (and all-short Phrase/Near
     // fallback) arrive with empty positions. Cannot compute a meaningful snippet
@@ -338,10 +366,15 @@ pub(super) fn extract_snippet_and_verify(
         return (SnippetOutcome::Unavailable, verified);
     }
 
-    // AD-393-6: In Phrase/Near mode, re-anchor the snippet from the predicate's
-    // returned exact occurrence range, not the approximate trigram-containment
-    // `match_positions[0].start`. For Substring mode (anchor_range=None) or when
-    // positions are available, fall back to match_positions[0].start.
+    // AD-393-6 / AD-396-1: Re-anchor the snippet from the predicate's returned
+    // exact occurrence range. For all verify modes (Substring via AD-396-1,
+    // Phrase/Near via AD-393-6), anchor_range now carries the content-derived
+    // anchor; match_positions is the fallback only when anchor_range is None.
+    //
+    // NOTE: The CLI no longer treats reader-emitted trigram positions
+    // (match_positions) as query-match locations for anchoring.  They remain
+    // reader-internal ranking/TF signals only.  Anchor provenance is now always
+    // content-derived (file bytes already read once, AD-355-1).
     let anchor_start = anchor_range
         .as_ref()
         .map(|r| r.start)
@@ -354,8 +387,27 @@ pub(super) fn extract_snippet_and_verify(
 
     let match_line = rskim_search::byte_offset_to_line(&content, anchor_start) as u32;
 
+    // AD-396-6: dev-time invariant — when verified, the anchor line must contain
+    // ≥1 query token.  The `!verified` guard excludes the empty-sentinel path in
+    // `extract_snippet` (query="", verified=false) and any future non-verified
+    // anchoring.  Compiled out of --release; the test suite is the production
+    // correctness gate (ADR-007 / PF-007), not this assert alone.
+    debug_assert!(
+        !verified || query.split_whitespace().next().is_none() || {
+            let idx = (match_line as usize).saturating_sub(1);
+            let anchor_line = text.lines().nth(idx).unwrap_or("");
+            query
+                .split_whitespace()
+                .any(|tok| anchor_line.contains(tok))
+        },
+        "AD-396-6: anchor line {} contains no query token from {:?}",
+        match_line,
+        query
+    );
+
     let line_range = if let Some(ref ar) = anchor_range {
-        // AD-393-6: compute line_range from the exact predicate occurrence range.
+        // AD-393-6 / AD-396-2: compute line_range from the content-derived anchor
+        // range — single anchor line {n, n+1} (AD-393-6 precedent).
         rskim_search::compute_line_range(&content, std::slice::from_ref(ar))
     } else {
         rskim_search::compute_line_range(&content, match_positions)
@@ -389,16 +441,27 @@ fn run_verify_predicate(text: &str, query: &str, mode: &VerifyMode) -> bool {
 
 /// Run the verify predicate and return `(verified, anchor_range)`.
 ///
-/// For `Phrase` / `Near`, the anchor range is the exact byte span of the match
-/// returned by the predicate — used to re-anchor the snippet (AD-393-6).
-/// For `Substring` the range is always `None` (no position information available).
+/// For all modes, the anchor range is the content-derived byte span of the first
+/// match — used to re-anchor the snippet (AD-393-6 / AD-396-1):
+/// - `Substring` → `rskim_search::substring_first_anchor` (AD-396-1): returns
+///   the content-derived anchor for the tiered policy (AD-396-2); `is_some()`
+///   is logically equivalent to `query_substring_present` (AD-396-3).
+/// - `Phrase`    → `rskim_search::phrase_tokens_present` (exact ordered tokens).
+/// - `Near(n)`   → `rskim_search::near_tokens_present` (within n positions).
 fn run_verify_predicate_with_range(
     text: &str,
     query: &str,
     mode: &VerifyMode,
 ) -> (bool, Option<Range<usize>>) {
     match mode {
-        VerifyMode::Substring => (query_substring_present(text, query), None),
+        VerifyMode::Substring => {
+            // AD-396-1: content-derived anchor for Substring path.
+            // AD-396-2: tiered anchor-selection rule — see substring_first_anchor
+            // in rskim-search/src/types.rs for the full Tier 1 / Tier 2 policy.
+            // AD-396-3: is_some() == query_substring_present() (equivalence gate).
+            let anchor = rskim_search::substring_first_anchor(text, query);
+            (anchor.is_some(), anchor)
+        }
         VerifyMode::Phrase => {
             let opt = rskim_search::phrase_tokens_present(text, query);
             (opt.is_some(), opt)

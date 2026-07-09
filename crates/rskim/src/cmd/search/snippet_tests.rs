@@ -442,6 +442,221 @@ fn extract_snippet_and_verify_near_mode_verifies() {
     );
 }
 
+// ============================================================================
+// AD-396: Substring anchor correctness (AC1/AC2/AC5/AC6/AC10)
+// ============================================================================
+
+/// AC2 / AC5 — Decoy-prefix fixture: an "encode_header" line ABOVE an
+/// "encode_varint" line must NOT be the anchor.
+///
+/// This is the exact repro shape from the bug report: the trigram reader emits
+/// a position for "encode_header" (which shares trigrams with "encode_varint"),
+/// causing the old code to anchor on the wrong line. After #396, the anchor is
+/// content-derived and must land on the true "encode_varint" line.
+///
+/// PF-007: the discriminating observable is `match_line` (and `is_match=true`
+/// on that line), not just exit-0.
+#[test]
+fn test_anchor_does_not_land_on_decoy_line_ac2() {
+    use super::extract_snippet_and_verify;
+    use std::fs;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Decoy on line 1, true match on line 2.
+    // Old code anchored on line 1 (encode_header), new code must anchor on line 2.
+    let content = "fn encode_header(buf: &[u8]) {}\nfn encode_varint(n: u64) -> u64 { n }\n";
+    fs::write(root.join("src/codec.rs"), content).unwrap();
+
+    // Simulate a match_positions pointing at the DECOY byte (offset 3 = 'e' in
+    // "encode_header" on line 1) — the old anchor bug.
+    let decoy_pos = vec![3usize..8]; // "encod" within encode_header
+    let (outcome, verified) = extract_snippet_and_verify(
+        &root,
+        "src/codec.rs",
+        &decoy_pos,
+        None,
+        "encode_varint",
+        super::VerifyMode::Substring,
+    );
+
+    assert!(
+        verified,
+        "AC2: encode_varint is present → verified must be true; got {verified}"
+    );
+
+    let super::SnippetOutcome::Ok {
+        match_line,
+        line_range,
+        context: ctx,
+    } = outcome
+    else {
+        panic!("expected SnippetOutcome::Ok; got {outcome:?}");
+    };
+
+    // AC2: must NOT anchor on decoy line 1 (encode_header).
+    assert_ne!(
+        match_line, 1,
+        "AC2: anchor must NOT be on the decoy line 1 (encode_header); got match_line={match_line}"
+    );
+    // AC2: must anchor on the true match line 2 (encode_varint).
+    assert_eq!(
+        match_line, 2,
+        "AC2: anchor must be on line 2 (encode_varint); got match_line={match_line}"
+    );
+
+    // AC5: the is_match=true snippet line must agree with match_line.
+    let is_match_line = ctx.lines.iter().find(|l| l.is_match).map(|l| l.line_number);
+    assert_eq!(
+        is_match_line,
+        Some(2),
+        "AC5: is_match=true snippet line must be line 2; got {is_match_line:?}"
+    );
+    // AC5: the marked snippet line must contain encode_varint.
+    let marked_content = ctx
+        .lines
+        .iter()
+        .find(|l| l.is_match)
+        .map(|l| l.content.as_str())
+        .unwrap_or("");
+    assert!(
+        marked_content.contains("encode_varint"),
+        "AC5: is_match line must contain encode_varint; got {marked_content:?}"
+    );
+
+    // AC6: line_range must be the single anchor line {{n, n+1}}.
+    assert_eq!(
+        line_range,
+        2..3,
+        "AC6: line_range must be single anchor line {{2, 3}}; got {line_range:?}"
+    );
+}
+
+/// AC10 (negative): a <3-byte query ("fn") with empty match_positions must
+/// return `verified` based on content BUT `SnippetOutcome::Unavailable`
+/// (snippet-less, no anchor), preserving the pre-#396 short-query behaviour.
+///
+/// PF-007: discriminating — if the AD-396-5 guard were removed, a file
+/// containing "fn" with a content-derived anchor would receive a snippet,
+/// breaking the AC10 invariant.
+#[test]
+fn test_short_query_substring_remains_snippet_less_ac10() {
+    use super::extract_snippet_and_verify;
+    use std::fs;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "fn foo() {}\nfn bar() {}\n").unwrap();
+
+    // Empty positions simulates the AD-355-7 short-query fallback (< 3 bytes).
+    let (outcome, verified) = extract_snippet_and_verify(
+        &root,
+        "src/lib.rs",
+        &[], // empty positions — short-query fallback
+        None,
+        "fn", // 2-byte query, shorter than trigram threshold
+        super::VerifyMode::Substring,
+    );
+
+    // verified must reflect content (file has "fn").
+    assert!(
+        verified,
+        "AC10: file containing 'fn' must have verified=true even for short-query fallback"
+    );
+    // AD-396-5: snippet must NOT be produced (Unavailable).
+    assert!(
+        matches!(outcome, super::SnippetOutcome::Unavailable),
+        "AC10: short-query with empty positions must return Unavailable; got {outcome:?}"
+    );
+}
+
+/// AC10 guard-boundary (positive): a 3-byte single-token query with non-empty
+/// positions MUST receive a correct anchor (not snippet-less).
+///
+/// PF-007: discriminating — confirms the AD-396-5 null-anchor guard does NOT
+/// fire for normal (≥3-byte, non-empty-positions) queries.
+#[test]
+fn test_three_byte_query_gets_anchor_ac10_boundary() {
+    use super::extract_snippet_and_verify;
+    use std::fs;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+    // "foo" is a 3-byte token that exists on line 2.
+    fs::write(root.join("src/lib.rs"), "header line\nfoo function here\n").unwrap();
+
+    // Non-empty positions (normal path, not short-query fallback).
+    // The actual byte offset of "foo" in the content is 12 (after "header line\n").
+    let positions = vec![12usize..15];
+    let (outcome, verified) = extract_snippet_and_verify(
+        &root,
+        "src/lib.rs",
+        &positions,
+        None,
+        "foo", // 3-byte query — above the trigram threshold
+        super::VerifyMode::Substring,
+    );
+
+    assert!(
+        verified,
+        "AC10-boundary: 3-byte query in content → verified=true"
+    );
+    assert!(
+        matches!(outcome, super::SnippetOutcome::Ok { match_line: 2, .. }),
+        "AC10-boundary: 3-byte query must produce Ok with anchor on line 2; got {outcome:?}"
+    );
+}
+
+/// AD-396-3 / AC8 proxy: a file containing only the FIRST of two query tokens
+/// must NOT be returned as verified for a two-token query (no verify-gate widening).
+///
+/// This is the E2E proxy for the unit-level AD-396-3 equivalence test
+/// (which lives in rskim-search/src/types.rs and may not run locally due to
+/// the lib-test-hang caveat). The observable here is verified=false.
+///
+/// PF-007: the discriminating observable is verified=false (gate not widened).
+/// If substring_first_anchor returned Some when only the first token is present,
+/// verified would be true and false-positives would enter the result set.
+#[test]
+fn test_two_token_query_first_only_present_not_verified_ac8() {
+    use super::extract_snippet_and_verify;
+    use std::fs;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+    // File contains "encode_varint" but NOT "check_staleness".
+    fs::write(
+        root.join("src/codec.rs"),
+        "fn encode_varint(n: u64) -> u64 { n }\n",
+    )
+    .unwrap();
+
+    let positions = vec![3usize..16]; // approximate positions
+    let (_, verified) = extract_snippet_and_verify(
+        &root,
+        "src/codec.rs",
+        &positions,
+        None,
+        "encode_varint check_staleness", // second token absent
+        super::VerifyMode::Substring,
+    );
+
+    assert!(
+        !verified,
+        "AC8: file missing 'check_staleness' must NOT be verified for 2-token query; \
+         got verified=true (would widen the verify gate)"
+    );
+}
+
 /// AD-393-10 / AC15: large-file bounded-scan path — `VerifyMode::Phrase` and
 /// `VerifyMode::Near` must return `verified=false` when the file exceeds
 /// `MAX_SNIPPET_FILE_BYTES` and the only occurrence of the phrase/words sits

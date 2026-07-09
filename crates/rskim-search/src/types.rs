@@ -670,6 +670,149 @@ pub fn query_substring_present(content: &str, query: &str) -> bool {
     tokens.all(|token| content.contains(token))
 }
 
+/// Compute a content-derived anchor byte range for a lexical search result.
+///
+/// Returns the byte range whose `.start` is passed to `byte_offset_to_line` to
+/// produce the `line_number` shown in `--json` and text output.  When `None`
+/// the caller falls back to an empty/snippet-less result.
+///
+/// # AD-396-2 — Tiered anchor-selection rule
+///
+/// **Single-token queries:** returns the first (lowest byte offset) occurrence
+/// of the token in `content`.  Single-token anchor behaviour is unchanged from
+/// pre-#396 and satisfies AC20.
+///
+/// **Multi-token queries — Tier 1 (preferred):** scan lines and return the
+/// byte offset on the EARLIEST line that simultaneously contains ALL
+/// whitespace-delimited query tokens as substrings.  Matches `git grep -e
+/// tok1 --and -e tok2` semantics; the reported `line_number` is the strongest
+/// possible anchor for agent consumers piping `path:line` into file reads.
+///
+/// **Multi-token queries — Tier 2 (fallback, no Tier-1 line exists):** anchor
+/// on the first occurrence of the RAREST (most-selective) token.  Selectivity
+/// is approximated by the MAX trigram IDF weight from the token's byte windows
+/// (`TRIGRAM_WEIGHTS` / `lookup_weight` — pure in-memory, zero I/O).
+/// Tie-breaks (deterministic, AC18): highest selectivity wins; ties broken by
+/// longest token; further ties by earliest (lowest byte offset) occurrence.
+/// Tokens shorter than 3 bytes receive `DEFAULT_WEIGHT` (1.0) since they
+/// cannot produce trigrams.
+///
+/// # AD-396-3 — Verify-gate equivalence (load-bearing, not cosmetic)
+///
+/// `substring_first_anchor(c, q).is_some()` MUST equal
+/// `query_substring_present(c, q)` for ALL inputs:
+/// - Empty / whitespace-only query → `None` / `false`.
+/// - Multi-token AND: `Some(_)` ONLY when EVERY token is present.
+///   Returning `Some` when only the first token is found would WIDEN the CLI
+///   verify gate and silently admit false-positive candidates (ADR-007).
+/// - Case-sensitive byte-exact (AC12).
+///
+/// # AD-396-4 — Bounded, allocation-free scan
+///
+/// One `str::find` per token per line (Tier 1) or one `str::find` per token
+/// total (Tier 2) — the same cost as `query_substring_present`. No unbounded
+/// collection of occurrence positions.
+///
+/// # Reported line semantics (coordinate with #397 / #423)
+///
+/// The returned range's `.start` byte is passed to `byte_offset_to_line` to
+/// produce a 1-indexed line number (start line of the match).  `line_range`
+/// at the call site is the single anchor line `{n, n+1}` (AD-393-6).
+#[must_use]
+pub fn substring_first_anchor(content: &str, query: &str) -> Option<Range<usize>> {
+    // AD-396-3: empty / whitespace-only → None
+    // (equivalence with query_substring_present's vacuous-.all() guard).
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+
+    // AND-of-tokens pre-check — return None when ANY token is absent.
+    // This keeps is_some() == query_substring_present() (AD-396-3 load-bearing):
+    // returning Some when only the first token is present would widen the gate.
+    if !tokens.iter().all(|t| content.contains(t)) {
+        return None;
+    }
+
+    // ── Single-token fast path (AC20: behaviour unchanged) ───────────────────
+    if tokens.len() == 1 {
+        let token = tokens[0];
+        // Safe: AND-check above confirmed presence.
+        let start = content.find(token)?;
+        return Some(start..start + token.len());
+    }
+
+    // ── Multi-token: Tier 1 — earliest line with ALL tokens (AD-396-2 §T1) ──
+    // AD-396-2: tiered anchor-selection rule.
+    // Scan lines (split on '\n'; handles CRLF since byte_offset_to_line counts
+    // '\n' bytes and str::find is byte-exact within the line slice).
+    let mut byte_offset: usize = 0;
+    for line in content.split('\n') {
+        if tokens.iter().all(|t| line.contains(t)) {
+            // Earliest token start on this line → anchor byte (AD-396-4: one
+            // find per token, no occurrence collection).
+            let first_in_line = tokens
+                .iter()
+                .filter_map(|t| line.find(t))
+                .min()
+                .unwrap_or(0); // all() guarantees at least one find() succeeds
+            let global_start = byte_offset + first_in_line;
+            // Return a 1-byte range; only .start is consumed by the caller.
+            return Some(global_start..global_start + 1);
+        }
+        // Advance past line bytes + the '\n' separator.
+        byte_offset += line.len() + 1;
+    }
+
+    // ── Multi-token: Tier 2 — rarest-token fallback (AD-396-2 §T2) ──────────
+    // AD-396-2: tiered anchor-selection rule — Tier 2 anchor.
+    // Select the token with the highest max-trigram IDF weight (most selective);
+    // tie-break by length then earliest occurrence (AC18: deterministic).
+    let rarest = tokens.iter().copied().max_by(|a, b| {
+        let sel_a = token_max_trigram_weight(a);
+        let sel_b = token_max_trigram_weight(b);
+        // Higher selectivity wins; ties → longer token wins;
+        // further ties → earliest (lower) occurrence wins.
+        // In max_by, "Greater" = keep left; reverse-compare positions so
+        // lower pos_a produces Greater (i.e. a wins when pos_a < pos_b).
+        sel_a
+            .partial_cmp(&sel_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.len().cmp(&b.len()))
+            .then_with(|| {
+                let pos_a = content.find(a).unwrap_or(usize::MAX);
+                let pos_b = content.find(b).unwrap_or(usize::MAX);
+                pos_b.cmp(&pos_a) // reverse: lower pos → Greater → a wins
+            })
+    })?;
+
+    // AND-check above confirmed presence; find() here cannot fail.
+    let start = content.find(rarest)?;
+    Some(start..start + rarest.len())
+}
+
+/// Approximate the selectivity of `token` using the MAX trigram IDF weight of
+/// its byte windows (`TRIGRAM_WEIGHTS` table, pure in-memory, AD-396-2 §T2).
+///
+/// - Tokens with `len < 3` cannot produce trigrams → `DEFAULT_WEIGHT` (1.0),
+///   the least-selective value, so they always lose Tier-2 tie-breaks.
+/// - `max` rather than mean: one very rare trigram makes the whole token
+///   highly selective — the correct signal for rarest-token anchor selection.
+#[inline]
+fn token_max_trigram_weight(token: &str) -> f32 {
+    let bytes = token.as_bytes();
+    if bytes.len() < 3 {
+        return crate::weights::DEFAULT_WEIGHT;
+    }
+    bytes
+        .windows(3)
+        .map(|w| {
+            let key = (u32::from(w[0]) << 16) | (u32::from(w[1]) << 8) | u32::from(w[2]);
+            crate::weights::lookup_weight(key, crate::weights::TRIGRAM_WEIGHTS)
+        })
+        .fold(f32::NEG_INFINITY, f32::max)
+}
+
 // ============================================================================
 // Token-exact positional predicates (#393)
 // ============================================================================
@@ -1729,6 +1872,297 @@ mod tests {
                 "D10 parity failure for input {:?}: collect_word_spans={from_spans:?}, word_token_indices={from_indices:?}",
                 s
             );
+        }
+    }
+
+    // ========================================================================
+    // substring_first_anchor — unit tests (AD-396-2/3/4, PF-007)
+    // ========================================================================
+
+    /// AD-396-3: Equivalence battery — is_some() must equal query_substring_present
+    /// for every (content, query) pair in the battery.
+    ///
+    /// PF-007: the discriminating observable is the comparison result, not exit 0.
+    /// A bug that makes substring_first_anchor return Some when the second token is
+    /// absent would widen the verify gate — this test catches that regression.
+    #[test]
+    fn anchor_equivalence_with_query_substring_present_ad396_3() {
+        let cases: &[(&str, &str)] = &[
+            // Empty and whitespace-only queries → false / None
+            ("any content here", ""),
+            ("any content here", "   "),
+            ("any content here", "\t\n"),
+            // Single token present
+            ("fn encode_varint(n: u64) {}", "encode_varint"),
+            // Single token absent
+            ("fn encode_length(n: u64) {}", "encode_varint"),
+            // Multi-token all present
+            ("fn encode_varint(n: u64) {}", "encode_varint n"),
+            // Multi-token: first present, second absent — must NOT return Some
+            ("fn encode_varint(n: u64) {}", "encode_varint zqxfjklm"),
+            // Multi-token: second present, first absent
+            ("fn zqxfjklm(n: u64) {}", "encode_varint zqxfjklm"),
+            // Case mismatch: ENCODE_VARINT vs encode_varint
+            ("fn encode_varint(n: u64) {}", "ENCODE_VARINT"),
+            // Tokens on different lines — still AND-present in content
+            (
+                "fn encode_varint() {}\nfn check_staleness() {}",
+                "encode_varint check_staleness",
+            ),
+            // UTF-8 multi-byte token
+            ("fn caf\u{00e9}bar() {}", "caf\u{00e9}bar"),
+            // CRLF content
+            ("line1\r\nfn encode_varint() {}\r\n", "encode_varint"),
+        ];
+
+        for &(content, query) in cases {
+            let anchor_some = substring_first_anchor(content, query).is_some();
+            let substr_true = query_substring_present(content, query);
+            assert_eq!(
+                anchor_some, substr_true,
+                "AD-396-3 equivalence failure for content={content:?} query={query:?}: \
+                 anchor.is_some()={anchor_some} != query_substring_present={substr_true}"
+            );
+        }
+    }
+
+    /// Single-token: anchor must be the FIRST occurrence in the file (AC1/AC20).
+    #[test]
+    fn anchor_single_token_first_occurrence_ac1() {
+        let content =
+            "header line\nfn encode_varint(n: u64) -> u64 { n }\nfn encode_varint_v2() {}\n";
+        let anchor = substring_first_anchor(content, "encode_varint");
+        assert!(anchor.is_some(), "single token present → Some");
+        let start = anchor.unwrap().start;
+        // Content starts with "header line\n" (12 bytes), then "fn encode_varint..."
+        // "encode_varint" first appears at offset 15 (after "fn " on line 2).
+        let first_occurrence = content.find("encode_varint").unwrap();
+        assert_eq!(
+            start, first_occurrence,
+            "anchor.start must be the FIRST occurrence of the token"
+        );
+        // Line number from anchor must be line 2.
+        let line = byte_offset_to_line(content.as_bytes(), start);
+        assert_eq!(line, 2, "encode_varint is on line 2");
+    }
+
+    /// Multi-token Tier 1: earliest line with ALL tokens wins (AC16).
+    ///
+    /// PF-007: the discriminating observable is the anchor line number.
+    /// Without Tier 1, the anchor would land on the first occurrence of any
+    /// single token (which may be a different line than the all-tokens line).
+    #[test]
+    fn anchor_multi_token_tier1_earliest_all_tokens_line_ac16() {
+        // Line 1 (offset 0): contains only "tok_a"
+        // Line 2: contains only "tok_b"
+        // Line 3: contains BOTH "tok_a" and "tok_b" — the Tier 1 winner
+        // Line 4: contains both again (later → not chosen)
+        let content = "tok_a is here\ntok_b is here\ntok_a and tok_b together\ntok_a tok_b again\n";
+        let anchor = substring_first_anchor(content, "tok_a tok_b");
+        assert!(anchor.is_some(), "both tokens present → Some");
+        let line = byte_offset_to_line(content.as_bytes(), anchor.unwrap().start);
+        assert_eq!(
+            line, 3,
+            "Tier 1: earliest all-tokens line is line 3 (AC16); \
+             anchor landed on line {line} instead"
+        );
+        // Verify anchor line actually contains BOTH tokens (ADR-007 invariant).
+        let anchor_line_text = content.lines().nth(line - 1).unwrap_or("");
+        assert!(
+            anchor_line_text.contains("tok_a") && anchor_line_text.contains("tok_b"),
+            "anchor line must contain both tokens; got: {anchor_line_text:?}"
+        );
+    }
+
+    /// Multi-token Tier 2: when no single line has all tokens, anchor on rarest
+    /// token (highest IDF + longest + earliest, AC17).
+    ///
+    /// PF-007: the discriminating observable is WHICH line is chosen.
+    ///
+    /// Setup: tokens on separate lines (no Tier-1 line exists).
+    /// "ab" (2 bytes, no trigrams → DEFAULT_WEIGHT) vs
+    /// "zqxjvwb_unique_long" (19 bytes, unusual trigrams → DEFAULT_WEIGHT or
+    /// higher; either way longer wins the tie-break).
+    /// "zqxjvwb_unique_long" is not a substring of any line that has "ab" and
+    /// vice-versa, so Tier 2 must fire.
+    #[test]
+    fn anchor_multi_token_tier2_rarest_token_fallback_ac17() {
+        // Line 1: "ab" only.
+        // Line 2: "zqxjvwb_unique_long" only (much longer, so wins length tie-break).
+        // "ab" does NOT appear in "zqxjvwb_unique_long", so no Tier-1 line exists.
+        let content = "line_with_ab_only_here\nline_with_zqxjvwb_unique_long_only\n";
+        let query = "ab zqxjvwb_unique_long";
+
+        // Verify Tier 1 really doesn't fire: no line has both tokens.
+        let no_tier1 = content
+            .split('\n')
+            .all(|line| !(line.contains("ab") && line.contains("zqxjvwb_unique_long")));
+        assert!(no_tier1, "test setup: no line should contain both tokens");
+
+        let anchor = substring_first_anchor(content, query);
+        assert!(anchor.is_some(), "both tokens present → Some");
+
+        let start = anchor.unwrap().start;
+        let line = byte_offset_to_line(content.as_bytes(), start);
+        let anchor_line = content.lines().nth(line - 1).unwrap_or("");
+
+        // ADR-007: anchor line must contain ≥1 token.
+        let has_token = query
+            .split_whitespace()
+            .any(|tok| anchor_line.contains(tok));
+        assert!(
+            has_token,
+            "ADR-007: Tier 2 anchor line {line} must contain ≥1 query token; \
+             got anchor_line={anchor_line:?}"
+        );
+
+        // Tier 2 tie-break: length. "zqxjvwb_unique_long" (19 chars) > "ab" (2 chars).
+        // Both receive DEFAULT_WEIGHT (neither has trigrams in real corpus), so
+        // length wins. Anchor must be on line 2 (zqxjvwb_unique_long's line).
+        assert!(
+            anchor_line.contains("zqxjvwb_unique_long"),
+            "Tier 2 length tie-break: longer token wins → anchor on line 2 \
+             (zqxjvwb_unique_long); got line {line}: {anchor_line:?}"
+        );
+    }
+
+    /// Multi-token decoy: a shared-trigram prefix line above a true token line
+    /// must not be anchored (the classic reported repro shape).
+    ///
+    /// This is the direct unit analog of the encode_varint repro (AC2).
+    #[test]
+    fn anchor_decoy_prefix_does_not_anchor_ac2_repro() {
+        // Line 1: "encode_header" — shares trigrams with "encode_varint" but is
+        //   a distinct identifier (the "decoy" line in the original repro).
+        // Line 2: "encode_varint" — the true match line.
+        let content = "fn encode_header(buf: &[u8]) {}\nfn encode_varint(n: u64) -> u64 { n }\n";
+        let anchor = substring_first_anchor(content, "encode_varint");
+        assert!(anchor.is_some(), "encode_varint is present → Some");
+        let line = byte_offset_to_line(content.as_bytes(), anchor.unwrap().start);
+        assert_ne!(
+            line, 1,
+            "anchor must NOT be on the decoy line (encode_header)"
+        );
+        assert_eq!(line, 2, "anchor must be on the true encode_varint line");
+        let anchor_line = content.lines().nth(line - 1).unwrap_or("");
+        assert!(
+            anchor_line.contains("encode_varint"),
+            "anchor line must contain encode_varint; got: {anchor_line:?}"
+        );
+    }
+
+    /// Case sensitivity negative (AC12): upper-case query must NOT match lower-case content.
+    #[test]
+    fn anchor_case_sensitive_negative_ac12() {
+        let content = "fn encode_varint(n: u64) {}\n";
+        let anchor = substring_first_anchor(content, "ENCODE_VARINT");
+        assert!(
+            anchor.is_none(),
+            "case-sensitive: ENCODE_VARINT must not match encode_varint"
+        );
+    }
+
+    /// Empty / whitespace-only query → None (AC15 / AD-396-3 guard).
+    #[test]
+    fn anchor_empty_query_returns_none() {
+        assert!(
+            substring_first_anchor("fn main() {}", "").is_none(),
+            "empty query → None"
+        );
+        assert!(
+            substring_first_anchor("fn main() {}", "   ").is_none(),
+            "whitespace-only query → None"
+        );
+    }
+
+    /// Determinism: when token appears on multiple lines, FIRST (lowest) line wins
+    /// on every call (AC13/AC18).
+    #[test]
+    fn anchor_determinism_first_occurrence_ac13_ac18() {
+        let content = "fn encode_varint(a: u8) {}\nfn encode_varint(b: u16) {}\nfn encode_varint(c: u32) {}\n";
+        let line1 = byte_offset_to_line(
+            content.as_bytes(),
+            substring_first_anchor(content, "encode_varint")
+                .unwrap()
+                .start,
+        );
+        let line2 = byte_offset_to_line(
+            content.as_bytes(),
+            substring_first_anchor(content, "encode_varint")
+                .unwrap()
+                .start,
+        );
+        let line3 = byte_offset_to_line(
+            content.as_bytes(),
+            substring_first_anchor(content, "encode_varint")
+                .unwrap()
+                .start,
+        );
+        assert_eq!(line1, 1, "first call: first occurrence is line 1");
+        assert_eq!(line2, 1, "second call: still line 1 (deterministic)");
+        assert_eq!(line3, 1, "third call: still line 1 (deterministic)");
+    }
+
+    /// CRLF content: byte_offset_to_line counts only \\n, so CRLF files work
+    /// correctly (AC15 no-panic + correct line number).
+    #[test]
+    fn anchor_crlf_content_correct_line_ac15() {
+        // CRLF content: "line1\r\nfn encode_varint() {}\r\n"
+        let content = "line1\r\nfn encode_varint() {}\r\n";
+        let anchor = substring_first_anchor(content, "encode_varint");
+        assert!(
+            anchor.is_some(),
+            "encode_varint present in CRLF content → Some"
+        );
+        let line = byte_offset_to_line(content.as_bytes(), anchor.unwrap().start);
+        assert_eq!(line, 2, "encode_varint is on line 2 in CRLF content");
+    }
+
+    /// Short query (< 3 bytes, e.g. "fn") — anchor still works for the
+    /// 3-byte guard-boundary check (the snippet-less guard is in snippet.rs,
+    /// not here; this unit test verifies that substring_first_anchor itself
+    /// returns a valid anchor for sub-3-byte queries when the content matches).
+    #[test]
+    fn anchor_short_query_returns_anchor_when_present() {
+        let content = "fn main() {}\n";
+        let anchor = substring_first_anchor(content, "fn");
+        // "fn" is present → Some (equivalence with query_substring_present).
+        assert!(
+            anchor.is_some(),
+            "2-byte 'fn' present in content → Some (snippet-less guard is in snippet.rs)"
+        );
+        // Verify the anchor line contains "fn".
+        let start = anchor.unwrap().start;
+        let line = byte_offset_to_line(content.as_bytes(), start);
+        let anchor_line = content.lines().nth(line - 1).unwrap_or("");
+        assert!(anchor_line.contains("fn"), "anchor line must contain 'fn'");
+    }
+
+    /// ADR-007 zero-token invariant: for every case where Some is returned,
+    /// the anchor line contains ≥1 query token (discriminating PF-007 check).
+    #[test]
+    fn anchor_adur007_anchor_line_always_contains_token() {
+        let cases: &[(&str, &str)] = &[
+            ("fn encode_varint(n: u64) {}", "encode_varint"),
+            ("fn check_staleness() {}", "check_staleness"),
+            ("fn transform_source() {}", "transform_source"),
+            ("fn foo() {}\nfn encode_varint() {}", "encode_varint"),
+            ("tok_a here\ntok_b there", "tok_a tok_b"),
+            ("fn foo() {}\nfn bar() {}", "fn bar"),
+        ];
+        for &(content, query) in cases {
+            if let Some(anchor) = substring_first_anchor(content, query) {
+                let line = byte_offset_to_line(content.as_bytes(), anchor.start);
+                let anchor_line = content.lines().nth(line - 1).unwrap_or("");
+                let has_token = query
+                    .split_whitespace()
+                    .any(|tok| anchor_line.contains(tok));
+                assert!(
+                    has_token,
+                    "ADR-007: anchor line {line} must contain ≥1 query token \
+                     for query={query:?}; got anchor_line={anchor_line:?}"
+                );
+            }
         }
     }
 }
