@@ -7,9 +7,10 @@ use std::fs;
 
 use tempfile::tempdir;
 
+use rskim_search::query_substring_present;
+
 use super::{
-    SnippetOutcome, VerifyMode, extract_context_window, extract_snippet,
-    extract_snippet_and_verify, query_substring_present,
+    SnippetOutcome, VerifyMode, extract_context_window, extract_snippet, extract_snippet_and_verify,
 };
 
 // ============================================================================

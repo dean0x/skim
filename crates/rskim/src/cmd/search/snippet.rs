@@ -179,39 +179,6 @@ pub(super) fn extract_snippet(
 // Exact-match verification (AD-355-1)
 // ============================================================================
 
-/// Return `true` iff every whitespace-delimited token in `query` appears as
-/// a case-sensitive substring of `content`.
-///
-/// # Design (AD-355-1)
-///
-/// This is a thin re-export of [`rskim_search::query_substring_present`], which
-/// is defined in `rskim-search/src/types.rs` so that the rskim-bench harness can
-/// use the **same predicate** to filter raw `reader.search()` output.  Both the
-/// CLI verify gate (`extract_snippet_and_verify`) and the bench AC1/AC4 guard
-/// measure over the identical verified surface — ensuring bench precision metrics
-/// reflect the same correctness criterion users see.
-///
-/// # Match semantics (AD-355-3)
-///
-/// - **Case-sensitive**: code identifiers are case-sensitive; defaulting to
-///   case-sensitive prevents false positives (e.g. `Foo` matching `foo`).
-/// - **AND-of-whitespace-tokens**: a multi-word query `"foo bar"` requires both
-///   `"foo"` and `"bar"` to appear as substrings somewhere in the file.  This
-///   matches code-search ergonomics where users expect conjunctive multi-word
-///   queries.
-/// - **Short queries (< 3 bytes)**: the trigram reader returns all indexed files as
-///   score-0 candidates for queries shorter than 3 bytes (`extract_query_ngrams`
-///   returns `[]` for `len < 3`; see AD-355-7).  Verification is the only
-///   correctness gate in that path — this fn filters those candidates down to
-///   files that actually contain the literal query string.
-///
-/// This fn is pure (no I/O, no side effects) — see `snippet_tests.rs` for
-/// unit tests and `rskim-search/src/types.rs` for the canonical definition.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn query_substring_present(content: &str, query: &str) -> bool {
-    rskim_search::query_substring_present(content, query)
-}
-
 /// Extract a snippet and simultaneously verify that `query` is present in the
 /// file content — reading the file exactly once (no second I/O).
 ///
@@ -436,8 +403,17 @@ pub(super) fn extract_snippet_and_verify(
 
 /// Run the verify predicate for `mode` and return a `bool`. Used by the
 /// large-file bounded-scan path where re-anchoring is not needed (no snippet).
+///
+/// For `Substring`, calls `rskim_search::query_substring_present` directly
+/// (single-pass boolean) rather than the full `substring_first_anchor` which
+/// computes a tiered anchor only to have it discarded by the large-file caller.
+/// For `Phrase`/`Near`, delegates to `run_verify_predicate_with_range` (they are
+/// already single-pass and share the same code path as the snippet branch).
 fn run_verify_predicate(text: &str, query: &str, mode: &VerifyMode) -> bool {
-    run_verify_predicate_with_range(text, query, mode).0
+    match mode {
+        VerifyMode::Substring => rskim_search::query_substring_present(text, query),
+        _ => run_verify_predicate_with_range(text, query, mode).0,
+    }
 }
 
 /// Run the verify predicate and return `(verified, anchor_range)`.
