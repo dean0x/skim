@@ -427,24 +427,12 @@ fn run_verify_predicate_with_range(
     query: &str,
     mode: &VerifyMode,
 ) -> (bool, Option<Range<usize>>) {
-    match mode {
-        VerifyMode::Substring => {
-            // AD-396-1: content-derived anchor for Substring path.
-            // AD-396-2: tiered anchor-selection rule — see substring_first_anchor
-            // in rskim-search/src/types.rs for the full Tier 1 / Tier 2 policy.
-            // AD-396-3: is_some() == query_substring_present() (equivalence gate).
-            let anchor = rskim_search::substring_first_anchor(text, query);
-            (anchor.is_some(), anchor)
-        }
-        VerifyMode::Phrase => {
-            let opt = rskim_search::phrase_tokens_present(text, query);
-            (opt.is_some(), opt)
-        }
-        VerifyMode::Near(n) => {
-            let opt = rskim_search::near_tokens_present(text, query, *n);
-            (opt.is_some(), opt)
-        }
-    }
+    let opt = match mode {
+        VerifyMode::Substring => rskim_search::substring_first_anchor(text, query),
+        VerifyMode::Phrase => rskim_search::phrase_tokens_present(text, query),
+        VerifyMode::Near(n) => rskim_search::near_tokens_present(text, query, *n),
+    };
+    (opt.is_some(), opt)
 }
 
 // ============================================================================
