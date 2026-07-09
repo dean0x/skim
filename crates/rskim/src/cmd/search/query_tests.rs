@@ -2394,3 +2394,390 @@ fn ac10_help_text_reflects_both_composite_paths_and_temporal_inert() {
          is present"
     );
 }
+
+// ============================================================================
+// AD-396 anchor-trust: E2E ground-truth tests (ADR-007 / AC1 / AC2 / AC6 /
+// AC7 / AC19)
+// ============================================================================
+
+/// Create a controlled "decoy + true-match" project for anchor tests.
+///
+/// - `auth.rs`: line 1 = comment with "authentic" (decoy — shares trigrams with
+///   "authentic_fn" but is NOT the full token); line 2 = true match.
+/// - `lib.rs`: unrelated content (controls recall baseline).
+fn create_anchor_trust_project(root: &std::path::Path) {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // auth.rs: decoy on line 1, true token on line 2.
+    // The "// authentic prefix" comment shares the "auth" / "authent" trigrams
+    // with "authentic_fn" — the pre-#396 bug would anchor on line 1 when the
+    // trigram reader returned a position inside the comment.
+    fs::write(
+        src.join("auth.rs"),
+        "// authentic prefix comment\npub fn authentic_fn(s: &str) -> bool { !s.is_empty() }\n",
+    )
+    .unwrap();
+
+    // multi.rs: for multi-token queries (AC16/AC17).
+    // Tier 1 line: line 3 has BOTH "alfa_token" and "beta_token".
+    fs::write(
+        src.join("multi.rs"),
+        "// alfa_token comment\n// beta_token comment\nfn alfa_token_beta_token() {}\n",
+    )
+    .unwrap();
+
+    // lib.rs: no "authentic_fn", no "alfa_token"/"beta_token".
+    fs::write(src.join("lib.rs"), "pub mod auth;\npub mod multi;\n").unwrap();
+}
+
+/// Build config for anchor-trust tests.
+fn make_anchor_config(
+    root: &std::path::Path,
+    cache_dir: &std::path::Path,
+    text: &str,
+) -> QueryConfig {
+    QueryConfig {
+        text: text.to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    }
+}
+
+/// AC1 / AC2 / AC19 — ADR-007 anchor-trust ground truth: every result's
+/// `line_number` must reference a line containing the query token.
+///
+/// PF-007: the discriminating observable is that the file's actual line N
+/// contains the token — not just that line_number is Some or exit-0.
+///
+/// The corpus has a "decoy" comment line (shared trigrams) above the true
+/// match line.  Pre-#396 the anchor landed on the comment; post-#396 it
+/// must land on the true match line.
+#[test]
+fn test_anchor_line_contains_query_token_ac1_ac2_ac19() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_anchor_trust_project(&root);
+
+    let config = make_anchor_config(&root, &cache_dir, "authentic_fn");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // Must find at least one result.
+    assert!(
+        !output.results.is_empty(),
+        "AC1: 'authentic_fn' must be found in the corpus"
+    );
+
+    // ADR-007 / AC19: for every result with Some(line_number), the file's
+    // actual line must contain the query token.
+    for r in &output.results {
+        if let Some(ln) = r.line_number {
+            let file_content = fs::read_to_string(root.join(&r.path)).unwrap_or_default();
+            let anchor_line_text = file_content
+                .lines()
+                .nth((ln as usize).saturating_sub(1))
+                .unwrap_or("");
+            assert!(
+                anchor_line_text.contains("authentic_fn"),
+                "AC1/AC19: result path={} line_number={ln} must contain 'authentic_fn'; \
+                 got line text: {anchor_line_text:?}",
+                r.path
+            );
+        }
+    }
+}
+
+/// AC6 / AC5 — JSON contract: `line_range` must be the single anchor line
+/// `{{n, n+1}}` and must agree with `line_number`.
+///
+/// PF-007: the discriminating observable is the exact `line_range.end` value.
+/// With pre-#396 multi-trigram positions, line_range spanned from the first
+/// to the last trigram position (could be a wide span); post-#396 it is the
+/// single anchor line {{n, n+1}}.
+///
+/// Precondition (PF-007): assert results are non-empty before entering the
+/// per-result loop — an empty result set would make every iteration vacuous
+/// and let a broken index or verify gate silently pass the test.
+#[test]
+fn test_anchor_line_range_is_single_line_ac6() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_anchor_trust_project(&root);
+
+    let config = make_anchor_config(&root, &cache_dir, "authentic_fn");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // PF-007 precondition: an empty result set makes the loop body vacuous.
+    // auth.rs contains "authentic_fn" on line 2; if results are empty the
+    // index or verify gate is broken and the AC6 contract goes untested.
+    assert!(
+        !output.results.is_empty(),
+        "AC6 precondition: query 'authentic_fn' must produce ≥1 result; \
+         corpus has auth.rs with the literal on line 2 — empty result set \
+         means the verify gate or index is broken. Got 0 results."
+    );
+
+    for r in &output.results {
+        if let (Some(ln), Some(lr)) = (r.line_number, r.line_range.clone()) {
+            assert_eq!(
+                lr,
+                (ln as usize)..(ln as usize + 1),
+                "AC6: line_range must be single anchor line {{n, n+1}} for line_number={ln}; \
+                 got line_range={lr:?}"
+            );
+        }
+    }
+}
+
+/// AC7 — Recall and ranking unchanged: the fix must NOT drop any file that
+/// was returned before (the anchor change affects line_number/snippet only,
+/// not which files are returned).
+///
+/// PF-007: the discriminating observable is the COMPLETE ordered path set and
+/// total count, not merely the presence of auth.rs. The corpus contains three
+/// files (auth.rs, lib.rs, multi.rs); only auth.rs contains "authentic_fn".
+/// A regression that reorders results, changes count, or adds spurious files
+/// would not be caught by a presence-only assertion.
+#[test]
+fn test_anchor_fix_does_not_drop_results_ac7() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_anchor_trust_project(&root);
+
+    let config = make_anchor_config(&root, &cache_dir, "authentic_fn");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
+
+    // AC7 / PF-007: assert the COMPLETE path set and count.
+    // Corpus: auth.rs (contains "authentic_fn"), lib.rs ("pub mod auth/multi"),
+    // multi.rs ("alfa_token_beta_token"). Only auth.rs contains the literal.
+    // Any regression that drops auth.rs, adds a spurious file, or changes
+    // the count will fail this assertion.
+    assert_eq!(
+        paths,
+        vec!["src/auth.rs"],
+        "AC7: result set must be exactly ['src/auth.rs'] (count=1); \
+         lib.rs and multi.rs do NOT contain 'authentic_fn' and must not appear. \
+         A drop, spurious addition, or reorder regression will fail here. \
+         Got: {paths:?}"
+    );
+}
+
+/// AC16 — Multi-token Tier 1: earliest line containing ALL tokens wins.
+///
+/// PF-007: the discriminating observable is line_number == 3 (the "alfa_token
+/// and beta_token" line), not line 1 (alfa_token-only) or line 2 (beta_token-only).
+#[test]
+fn test_multi_token_tier1_earliest_all_tokens_line_ac16() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_anchor_trust_project(&root);
+
+    // "alfa_token beta_token" — multi.rs has them on separate lines (1, 2) and
+    // on the same line at line 3 (in the function name "alfa_token_beta_token").
+    // Note: "alfa_token_beta_token" contains "alfa_token" (substr) and
+    // "beta_token" (substr) on the same line → Tier 1 fires.
+    let config = make_anchor_config(&root, &cache_dir, "alfa_token beta_token");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // PF-007 (non-vacuous): assert multi.rs IS in results before checking anchor.
+    // multi.rs contains "alfa_token" and "beta_token" (as separate lines 1–2 and
+    // combined in "alfa_token_beta_token" on line 3); it must survive the verify gate.
+    // A regression that drops multi.rs or nulls its anchor passes vacuously under the
+    // old `if let` guard — the unconditional assert below prevents that.
+    let multi_result = output.results.iter().find(|r| r.path.contains("multi.rs"));
+    assert!(
+        multi_result.is_some(),
+        "AC16 (PF-007): multi.rs must be in results for query 'alfa_token beta_token'; \
+         it contains both tokens and must survive the verify gate. \
+         Got results: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+    let r = multi_result.unwrap();
+
+    // AC16 / AD-396-2 Tier 1: the EARLIEST line containing ALL tokens is line 3.
+    // Line 1 = "// alfa_token comment" (alfa_token only).
+    // Line 2 = "// beta_token comment" (beta_token only).
+    // Line 3 = "fn alfa_token_beta_token() {}" — contains BOTH as substrings.
+    // Tier 1 fires on line 3 (first line satisfying the AND condition).
+    assert_eq!(
+        r.line_number,
+        Some(3),
+        "AC16/Tier-1 (PF-007): line_number must be 3 ('fn alfa_token_beta_token()' — \
+         earliest line with BOTH tokens); got {:?}. \
+         Line 1 has only 'alfa_token'; line 2 has only 'beta_token'.",
+        r.line_number
+    );
+
+    // ADR-007 ground truth: read the actual anchor line and confirm ≥1 token.
+    let file_content = fs::read_to_string(root.join(&r.path)).unwrap_or_default();
+    let anchor_line = file_content
+        .lines()
+        .nth(2) // line 3 is 0-indexed as 2
+        .unwrap_or("");
+    assert!(
+        anchor_line.contains("alfa_token") || anchor_line.contains("beta_token"),
+        "AC16/ADR-007: anchor line 3 must contain ≥1 query token; got: {anchor_line:?}"
+    );
+}
+
+/// Compound `--ast <pattern> <text>` path — TEXT anchor trust (ADR-007 / Cross-Plan Amendment).
+///
+/// When `ast_scored` is `Some` (the compound text+AST path), the TEXT anchor
+/// must point to a line that CONTAINS the query token, not to the decoy line
+/// above it.  This test was mandated by the Cross-Plan Amendment which pulls
+/// the compound text anchor explicitly in-scope for #396.
+///
+/// PF-007: the discriminating observable is `line_number == 2` (true match),
+/// not `1` (decoy).
+///
+/// Corpus (from `create_anchor_trust_project`):
+/// - auth.rs line 1 = "// authentic prefix comment"  (decoy — shares trigrams)
+/// - auth.rs line 2 = "pub fn authentic_fn(s: &str) -> bool { !s.is_empty() }"
+///
+/// auth.rs is sorted first among {auth.rs, lib.rs, multi.rs} → FileId(0).
+/// Giving it a non-zero AST score puts it through the compound
+/// intersect+RRF path, which must still re-anchor via
+/// `substring_first_anchor` to line 2.
+#[test]
+fn test_compound_ast_path_text_anchor_trust_adr007() {
+    use rskim_search::FileId;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_anchor_trust_project(&root);
+
+    // Cold-start: build the index with a pure-lexical query first so FileIds
+    // are assigned deterministically (auth.rs=0, lib.rs=1, multi.rs=2).
+    {
+        let build_config = make_anchor_config(&root, &cache_dir, "authentic_fn");
+        let _ = execute_query(&build_config, &TEST_ANALYTICS).unwrap();
+    }
+
+    // Compound path: auth.rs (FileId 0) receives an AST score of 1.0 so it
+    // enters the intersect_and_rank step alongside the lexical hit.
+    let config = QueryConfig {
+        text: "authentic_fn".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: Some(vec![(FileId(0), 1.0)]),
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // auth.rs must be in results (it contains the literal "authentic_fn").
+    let auth_result = output.results.iter().find(|r| r.path.contains("auth.rs"));
+    assert!(
+        auth_result.is_some(),
+        "compound anchor trust (ADR-007): auth.rs must be in results for \
+         query 'authentic_fn' on the compound path; got: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+    let r = auth_result.unwrap();
+
+    // ADR-007 / PF-007: anchor must be line 2 (true match), NOT line 1 (decoy).
+    // Pre-#396, the compound path could carry a trigram-position anchor pointing
+    // at the decoy comment; post-#396 it must use substring_first_anchor.
+    assert_eq!(
+        r.line_number,
+        Some(2),
+        "compound anchor trust (ADR-007): line_number must be 2 \
+         ('pub fn authentic_fn(...)'); got {:?}. \
+         Decoy is on line 1 ('// authentic prefix comment'). \
+         A regression in the compound path's re-anchoring would land on line 1.",
+        r.line_number
+    );
+
+    // ADR-007 ground truth: confirm the actual file line contains the token.
+    let file_content = fs::read_to_string(root.join(&r.path)).unwrap_or_default();
+    let anchor_line = file_content
+        .lines()
+        .nth(1) // line 2 is 0-indexed as 1
+        .unwrap_or("");
+    assert!(
+        anchor_line.contains("authentic_fn"),
+        "compound anchor trust (ADR-007): anchor line 2 must contain 'authentic_fn'; \
+         got: {anchor_line:?}"
+    );
+}
+
+/// AC4 — `match_positions` field must be absent from JSON output.
+///
+/// PF-007: the discriminating observable is the absent key — if serde(skip) is
+/// accidentally removed, the key would appear and this test would catch it.
+#[test]
+fn test_match_positions_absent_from_json_output_ac4() {
+    use crate::cmd::search::types::{ResolvedResult, SnippetContext, SnippetLine};
+
+    let result = ResolvedResult {
+        path: "src/auth.rs".to_string(),
+        score: 5.0,
+        field: "function_signature".to_string(),
+        line_number: Some(2),
+        line_range: Some(2..3),
+        snippet: Some(SnippetContext {
+            lines: vec![SnippetLine {
+                line_number: 2,
+                content: "pub fn authentic_fn()".to_string(),
+                is_match: true,
+            }],
+        }),
+        stale: false,
+        match_positions: vec![0..5, 10..15], // populated — must NOT appear in JSON
+        temporal: None,
+        layers_matched: vec![],
+    };
+
+    let value = serde_json::to_value(&result).expect("ResolvedResult must serialize");
+
+    // AC4: match_positions must be absent (field is #[serde(skip)]).
+    assert!(
+        value.get("match_positions").is_none(),
+        "AC4: match_positions must be absent from JSON; got: {:?}",
+        value.get("match_positions")
+    );
+
+    // AC4: line_number must be an integer.
+    assert_eq!(
+        value["line_number"], 2,
+        "AC4: line_number must be the integer 2"
+    );
+    // AC6: line_range must be {{start:2, end:3}}.
+    assert_eq!(
+        value["line_range"]["start"], 2,
+        "AC6: line_range.start must be 2"
+    );
+    assert_eq!(
+        value["line_range"]["end"], 3,
+        "AC6: line_range.end must be 3 (single-anchor-line)"
+    );
+}

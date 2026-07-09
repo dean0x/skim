@@ -670,6 +670,149 @@ pub fn query_substring_present(content: &str, query: &str) -> bool {
     tokens.all(|token| content.contains(token))
 }
 
+/// Compute a content-derived anchor byte range for a lexical search result.
+///
+/// Returns the byte range whose `.start` is passed to `byte_offset_to_line` to
+/// produce the `line_number` shown in `--json` and text output.  When `None`
+/// the caller falls back to an empty/snippet-less result.
+///
+/// # AD-396-2 — Tiered anchor-selection rule
+///
+/// **Single-token queries:** returns the first (lowest byte offset) occurrence
+/// of the token in `content`.  Single-token anchor behaviour is unchanged from
+/// pre-#396 and satisfies AC20.
+///
+/// **Multi-token queries — Tier 1 (preferred):** scan lines and return the
+/// byte offset on the EARLIEST line that simultaneously contains ALL
+/// whitespace-delimited query tokens as substrings.  Matches `git grep -e
+/// tok1 --and -e tok2` semantics; the reported `line_number` is the strongest
+/// possible anchor for agent consumers piping `path:line` into file reads.
+///
+/// **Multi-token queries — Tier 2 (fallback, no Tier-1 line exists):** anchor
+/// on the first occurrence of the RAREST (most-selective) token.  Selectivity
+/// is approximated by the MAX trigram IDF weight from the token's byte windows
+/// (`TRIGRAM_WEIGHTS` / `lookup_weight` — pure in-memory, zero I/O).
+/// Tie-breaks (deterministic, AC18): highest selectivity wins; ties broken by
+/// longest token; further ties by earliest (lowest byte offset) occurrence.
+/// Tokens shorter than 3 bytes receive `DEFAULT_WEIGHT` (1.0) since they
+/// cannot produce trigrams.
+///
+/// # AD-396-3 — Verify-gate equivalence (load-bearing, not cosmetic)
+///
+/// `substring_first_anchor(c, q).is_some()` MUST equal
+/// `query_substring_present(c, q)` for ALL inputs:
+/// - Empty / whitespace-only query → `None` / `false`.
+/// - Multi-token AND: `Some(_)` ONLY when EVERY token is present.
+///   Returning `Some` when only the first token is found would WIDEN the CLI
+///   verify gate and silently admit false-positive candidates (ADR-007).
+/// - Case-sensitive byte-exact (AC12).
+///
+/// # AD-396-4 — Bounded, allocation-free scan
+///
+/// One `str::find` per token per line (Tier 1) or one `str::find` per token
+/// total (Tier 2) — the same cost as `query_substring_present`. No unbounded
+/// collection of occurrence positions.
+///
+/// # Reported line semantics (coordinate with #397 / #423)
+///
+/// The returned range's `.start` byte is passed to `byte_offset_to_line` to
+/// produce a 1-indexed line number (start line of the match).  `line_range`
+/// at the call site is the single anchor line `{n, n+1}` (AD-393-6).
+#[must_use]
+pub fn substring_first_anchor(content: &str, query: &str) -> Option<Range<usize>> {
+    // AD-396-3: empty / whitespace-only → None
+    // (equivalence with query_substring_present's vacuous-.all() guard).
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+
+    // AND-of-tokens pre-check — return None when ANY token is absent.
+    // This keeps is_some() == query_substring_present() (AD-396-3 load-bearing):
+    // returning Some when only the first token is present would widen the gate.
+    if !tokens.iter().all(|t| content.contains(t)) {
+        return None;
+    }
+
+    // ── Single-token fast path (AC20: behaviour unchanged) ───────────────────
+    if tokens.len() == 1 {
+        let token = tokens[0];
+        // Safe: AND-check above confirmed presence.
+        let start = content.find(token)?;
+        return Some(start..start + token.len());
+    }
+
+    // ── Multi-token: Tier 1 — earliest line with ALL tokens (AD-396-2 §T1) ──
+    // Scan lines (split on '\n'; handles CRLF since byte_offset_to_line counts
+    // '\n' bytes and str::find is byte-exact within the line slice).
+    let mut byte_offset: usize = 0;
+    for line in content.split('\n') {
+        if tokens.iter().all(|t| line.contains(t)) {
+            // Earliest token start on this line → anchor byte (AD-396-4: one
+            // find per token, no occurrence collection).
+            let first_in_line = tokens
+                .iter()
+                .filter_map(|t| line.find(t))
+                .min()
+                .unwrap_or(0); // all() guarantees at least one find() succeeds
+            let global_start = byte_offset + first_in_line;
+            // Return a 1-byte range; only .start is consumed by the caller.
+            return Some(global_start..global_start + 1);
+        }
+        // Advance past line bytes + the '\n' separator.
+        byte_offset += line.len() + 1;
+    }
+
+    // ── Multi-token: Tier 2 — rarest-token fallback (AD-396-2 §T2) ──────────
+    // Select the token with the highest max-trigram IDF weight (most selective);
+    // tie-break by length then earliest occurrence (AC18: deterministic).
+    let rarest = tokens.iter().copied().max_by(|a, b| {
+        let sel_a = token_max_trigram_weight(a);
+        let sel_b = token_max_trigram_weight(b);
+        // Higher selectivity wins; ties → longer token wins;
+        // further ties → earliest (lower) occurrence wins.
+        // In max_by, "Greater" = keep left; reverse-compare positions so
+        // lower pos_a produces Greater (i.e. a wins when pos_a < pos_b).
+        sel_a
+            .partial_cmp(&sel_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.len().cmp(&b.len()))
+            .then_with(|| {
+                let pos_a = content.find(a).unwrap_or(usize::MAX);
+                let pos_b = content.find(b).unwrap_or(usize::MAX);
+                pos_b.cmp(&pos_a) // reverse: lower pos → Greater → a wins
+            })
+    })?;
+
+    // AND-check above confirmed presence; find() here cannot fail.
+    let start = content.find(rarest)?;
+    Some(start..start + rarest.len())
+}
+
+/// Approximate the selectivity of `token` using the MAX trigram IDF weight of
+/// its byte windows (`TRIGRAM_WEIGHTS` table, pure in-memory, AD-396-2 §T2).
+///
+/// - Tokens with `len < 3` cannot produce trigrams → `DEFAULT_WEIGHT` (1.0),
+///   the least-selective value, so they always lose Tier-2 tie-breaks.
+/// - `max` rather than mean: one very rare trigram makes the whole token
+///   highly selective — the correct signal for rarest-token anchor selection.
+#[inline]
+fn token_max_trigram_weight(token: &str) -> f32 {
+    let bytes = token.as_bytes();
+    if bytes.len() < 3 {
+        return crate::weights::DEFAULT_WEIGHT;
+    }
+    bytes
+        .windows(3)
+        .map(|w| {
+            // Reuse the canonical trigram encoder (single source of truth,
+            // PF-004-safe u32 widening) rather than re-inlining the shift.
+            let key = crate::ngram::Ngram::from_bytes(w[0], w[1], w[2]).key();
+            crate::weights::lookup_weight(key, crate::weights::TRIGRAM_WEIGHTS)
+        })
+        .fold(f32::NEG_INFINITY, f32::max)
+}
+
 // ============================================================================
 // Token-exact positional predicates (#393)
 // ============================================================================
@@ -1731,4 +1874,12 @@ mod tests {
             );
         }
     }
+
+    // Anchor unit tests (AD-396-2/3/4, PF-007) for substring_first_anchor,
+    // byte_offset_to_line, and query_substring_present live in
+    // crates/rskim/src/cmd/search/snippet_tests.rs (mod anchor_unit_tests).
+    // Those functions are public rskim_search exports; the tests run in the rskim
+    // binary test suite, which does not exhibit the dyld startup hang that affects
+    // the rskim-search lib test binary on this machine (see memory note
+    // rskim-search-testbinary-startup-hang for root cause).
 }

@@ -190,6 +190,14 @@ pub(super) struct ResolvedResult {
     /// `true` when the file has changed since indexing (mtime mismatch or deleted).
     pub stale: bool,
     /// Byte-position ranges within the file content where query terms appear.
+    ///
+    /// **Reader-internal — do not use for anchoring (AD-396-7 / #422).**
+    /// These are trigram byte positions emitted by the index reader as ranking /
+    /// TF signals; they are NOT guaranteed to coincide with full query-token
+    /// occurrences.  `line_number` and `line_range` are derived from
+    /// `rskim_search::substring_first_anchor` (content-derived, AD-396-1) and
+    /// are the authoritative anchor source.  A future #422 pass will populate
+    /// this field with semantically-true reader-level positions.
     #[serde(skip)]
     pub match_positions: Vec<Range<usize>>,
     /// Optional temporal data for this file, populated when temporal flags are active.
