@@ -2507,6 +2507,10 @@ fn test_anchor_line_contains_query_token_ac1_ac2_ac19() {
 /// With pre-#396 multi-trigram positions, line_range spanned from the first
 /// to the last trigram position (could be a wide span); post-#396 it is the
 /// single anchor line {{n, n+1}}.
+///
+/// Precondition (PF-007): assert results are non-empty before entering the
+/// per-result loop — an empty result set would make every iteration vacuous
+/// and let a broken index or verify gate silently pass the test.
 #[test]
 fn test_anchor_line_range_is_single_line_ac6() {
     let dir = tempdir().unwrap();
@@ -2517,6 +2521,16 @@ fn test_anchor_line_range_is_single_line_ac6() {
 
     let config = make_anchor_config(&root, &cache_dir, "authentic_fn");
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // PF-007 precondition: an empty result set makes the loop body vacuous.
+    // auth.rs contains "authentic_fn" on line 2; if results are empty the
+    // index or verify gate is broken and the AC6 contract goes untested.
+    assert!(
+        !output.results.is_empty(),
+        "AC6 precondition: query 'authentic_fn' must produce ≥1 result; \
+         corpus has auth.rs with the literal on line 2 — empty result set \
+         means the verify gate or index is broken. Got 0 results."
+    );
 
     for r in &output.results {
         if let (Some(ln), Some(lr)) = (r.line_number, r.line_range.clone()) {
@@ -2534,8 +2548,11 @@ fn test_anchor_line_range_is_single_line_ac6() {
 /// was returned before (the anchor change affects line_number/snippet only,
 /// not which files are returned).
 ///
-/// PF-007: the discriminating observable is the result path set.
-/// We verify that "auth.rs" is returned (the file containing "authentic_fn").
+/// PF-007: the discriminating observable is the COMPLETE ordered path set and
+/// total count, not merely the presence of auth.rs. The corpus contains three
+/// files (auth.rs, lib.rs, multi.rs); only auth.rs contains "authentic_fn".
+/// A regression that reorders results, changes count, or adds spurious files
+/// would not be caught by a presence-only assertion.
 #[test]
 fn test_anchor_fix_does_not_drop_results_ac7() {
     let dir = tempdir().unwrap();
@@ -2548,9 +2565,19 @@ fn test_anchor_fix_does_not_drop_results_ac7() {
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
     let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
-    assert!(
-        paths.iter().any(|p| p.contains("auth.rs")),
-        "AC7: auth.rs must be in results; got: {paths:?}"
+
+    // AC7 / PF-007: assert the COMPLETE path set and count.
+    // Corpus: auth.rs (contains "authentic_fn"), lib.rs ("pub mod auth/multi"),
+    // multi.rs ("alfa_token_beta_token"). Only auth.rs contains the literal.
+    // Any regression that drops auth.rs, adds a spurious file, or changes
+    // the count will fail this assertion.
+    assert_eq!(
+        paths,
+        vec!["src/auth.rs"],
+        "AC7: result set must be exactly ['src/auth.rs'] (count=1); \
+         lib.rs and multi.rs do NOT contain 'authentic_fn' and must not appear. \
+         A drop, spurious addition, or reorder regression will fail here. \
+         Got: {paths:?}"
     );
 }
 
@@ -2573,40 +2600,134 @@ fn test_multi_token_tier1_earliest_all_tokens_line_ac16() {
     let config = make_anchor_config(&root, &cache_dir, "alfa_token beta_token");
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
-    // Find the multi.rs result.
+    // PF-007 (non-vacuous): assert multi.rs IS in results before checking anchor.
+    // multi.rs contains "alfa_token" and "beta_token" (as separate lines 1–2 and
+    // combined in "alfa_token_beta_token" on line 3); it must survive the verify gate.
+    // A regression that drops multi.rs or nulls its anchor passes vacuously under the
+    // old `if let` guard — the unconditional assert below prevents that.
     let multi_result = output.results.iter().find(|r| r.path.contains("multi.rs"));
-    if let Some(r) = multi_result
-        && let Some(ln) = r.line_number
+    assert!(
+        multi_result.is_some(),
+        "AC16 (PF-007): multi.rs must be in results for query 'alfa_token beta_token'; \
+         it contains both tokens and must survive the verify gate. \
+         Got results: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+    let r = multi_result.unwrap();
+
+    // AC16 / AD-396-2 Tier 1: the EARLIEST line containing ALL tokens is line 3.
+    // Line 1 = "// alfa_token comment" (alfa_token only).
+    // Line 2 = "// beta_token comment" (beta_token only).
+    // Line 3 = "fn alfa_token_beta_token() {}" — contains BOTH as substrings.
+    // Tier 1 fires on line 3 (first line satisfying the AND condition).
+    assert_eq!(
+        r.line_number,
+        Some(3),
+        "AC16/Tier-1 (PF-007): line_number must be 3 ('fn alfa_token_beta_token()' — \
+         earliest line with BOTH tokens); got {:?}. \
+         Line 1 has only 'alfa_token'; line 2 has only 'beta_token'.",
+        r.line_number
+    );
+
+    // ADR-007 ground truth: read the actual anchor line and confirm ≥1 token.
+    let file_content = fs::read_to_string(root.join(&r.path)).unwrap_or_default();
+    let anchor_line = file_content
+        .lines()
+        .nth(2) // line 3 is 0-indexed as 2
+        .unwrap_or("");
+    assert!(
+        anchor_line.contains("alfa_token") || anchor_line.contains("beta_token"),
+        "AC16/ADR-007: anchor line 3 must contain ≥1 query token; got: {anchor_line:?}"
+    );
+}
+
+/// Compound `--ast <pattern> <text>` path — TEXT anchor trust (ADR-007 / Cross-Plan Amendment).
+///
+/// When `ast_scored` is `Some` (the compound text+AST path), the TEXT anchor
+/// must point to a line that CONTAINS the query token, not to the decoy line
+/// above it.  This test was mandated by the Cross-Plan Amendment which pulls
+/// the compound text anchor explicitly in-scope for #396.
+///
+/// PF-007: the discriminating observable is `line_number == 2` (true match),
+/// not `1` (decoy).
+///
+/// Corpus (from `create_anchor_trust_project`):
+/// - auth.rs line 1 = "// authentic prefix comment"  (decoy — shares trigrams)
+/// - auth.rs line 2 = "pub fn authentic_fn(s: &str) -> bool { !s.is_empty() }"
+///
+/// auth.rs is sorted first among {auth.rs, lib.rs, multi.rs} → FileId(0).
+/// Giving it a non-zero AST score puts it through the compound
+/// intersect+RRF path, which must still re-anchor via
+/// `substring_first_anchor` to line 2.
+#[test]
+fn test_compound_ast_path_text_anchor_trust_adr007() {
+    use rskim_search::FileId;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_anchor_trust_project(&root);
+
+    // Cold-start: build the index with a pure-lexical query first so FileIds
+    // are assigned deterministically (auth.rs=0, lib.rs=1, multi.rs=2).
     {
-        // Read the anchor line.
-        let file_content = fs::read_to_string(root.join(&r.path)).unwrap_or_default();
-        let anchor_line = file_content
-            .lines()
-            .nth((ln as usize).saturating_sub(1))
-            .unwrap_or("");
-        // ADR-007: anchor line must contain ≥1 token.
-        let has_any_token =
-            anchor_line.contains("alfa_token") || anchor_line.contains("beta_token");
-        assert!(
-            has_any_token,
-            "AC16/ADR-007: anchor line {ln} must contain ≥1 query token; \
-             got: {anchor_line:?}"
-        );
-        // Tier 1: if any line has BOTH tokens, that line must be chosen.
-        // Line 3 "fn alfa_token_beta_token() {}" has both as substrings.
-        // Lines 1 ("// alfa_token comment") and 2 ("// beta_token comment")
-        // have only one each. So Tier 1 anchors on line 3.
-        assert_ne!(
-            ln, 1,
-            "AC16: anchor must NOT be line 1 (alfa_token-only); got ln={ln}"
-        );
-        assert_ne!(
-            ln, 2,
-            "AC16: anchor must NOT be line 2 (beta_token-only); got ln={ln}"
-        );
+        let build_config = make_anchor_config(&root, &cache_dir, "authentic_fn");
+        let _ = execute_query(&build_config, &TEST_ANALYTICS).unwrap();
     }
-    // If multi.rs is not in results (possible if both tokens don't occur together
-    // in the index), the AC16 check is implicitly satisfied (no wrong anchor).
+
+    // Compound path: auth.rs (FileId 0) receives an AST score of 1.0 so it
+    // enters the intersect_and_rank step alongside the lexical hit.
+    let config = QueryConfig {
+        text: "authentic_fn".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: Some(vec![(FileId(0), 1.0)]),
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // auth.rs must be in results (it contains the literal "authentic_fn").
+    let auth_result = output.results.iter().find(|r| r.path.contains("auth.rs"));
+    assert!(
+        auth_result.is_some(),
+        "compound anchor trust (ADR-007): auth.rs must be in results for \
+         query 'authentic_fn' on the compound path; got: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+    let r = auth_result.unwrap();
+
+    // ADR-007 / PF-007: anchor must be line 2 (true match), NOT line 1 (decoy).
+    // Pre-#396, the compound path could carry a trigram-position anchor pointing
+    // at the decoy comment; post-#396 it must use substring_first_anchor.
+    assert_eq!(
+        r.line_number,
+        Some(2),
+        "compound anchor trust (ADR-007): line_number must be 2 \
+         ('pub fn authentic_fn(...)'); got {:?}. \
+         Decoy is on line 1 ('// authentic prefix comment'). \
+         A regression in the compound path's re-anchoring would land on line 1.",
+        r.line_number
+    );
+
+    // ADR-007 ground truth: confirm the actual file line contains the token.
+    let file_content = fs::read_to_string(root.join(&r.path)).unwrap_or_default();
+    let anchor_line = file_content
+        .lines()
+        .nth(1) // line 2 is 0-indexed as 1
+        .unwrap_or("");
+    assert!(
+        anchor_line.contains("authentic_fn"),
+        "compound anchor trust (ADR-007): anchor line 2 must contain 'authentic_fn'; \
+         got: {anchor_line:?}"
+    );
 }
 
 /// AC4 — `match_positions` field must be absent from JSON output.
