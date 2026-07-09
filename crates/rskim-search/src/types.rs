@@ -1978,15 +1978,16 @@ mod tests {
     /// PF-007: the discriminating observable is WHICH line is chosen.
     ///
     /// Setup: tokens on separate lines (no Tier-1 line exists).
-    /// "ab" (2 bytes, no trigrams → DEFAULT_WEIGHT) vs
-    /// "zqxjvwb_unique_long" (19 bytes, unusual trigrams → DEFAULT_WEIGHT or
-    /// higher; either way longer wins the tie-break).
-    /// "zqxjvwb_unique_long" is not a substring of any line that has "ab" and
-    /// vice-versa, so Tier 2 must fire.
+    /// "ab" (2 bytes, len<3 → cannot produce trigrams → DEFAULT_WEIGHT) vs
+    /// "zqxjvwb_unique_long" (19 bytes, ≥3 bytes → produces trigrams; those
+    /// trigrams may or may not appear in TRIGRAM_WEIGHTS with IDF > DEFAULT_WEIGHT).
+    /// Whether selectivity or length is the deciding Tier-2 factor depends on
+    /// TRIGRAM_WEIGHTS at the time; either way "zqxjvwb_unique_long" wins.
+    /// The test asserts the ADR-007-visible outcome: anchor line contains ≥1 token.
     #[test]
     fn anchor_multi_token_tier2_rarest_token_fallback_ac17() {
         // Line 1: "ab" only.
-        // Line 2: "zqxjvwb_unique_long" only (much longer, so wins length tie-break).
+        // Line 2: "zqxjvwb_unique_long" only.
         // "ab" does NOT appear in "zqxjvwb_unique_long", so no Tier-1 line exists.
         let content = "line_with_ab_only_here\nline_with_zqxjvwb_unique_long_only\n";
         let query = "ab zqxjvwb_unique_long";
@@ -2014,13 +2015,134 @@ mod tests {
              got anchor_line={anchor_line:?}"
         );
 
-        // Tier 2 tie-break: length. "zqxjvwb_unique_long" (19 chars) > "ab" (2 chars).
-        // Both receive DEFAULT_WEIGHT (neither has trigrams in real corpus), so
-        // length wins. Anchor must be on line 2 (zqxjvwb_unique_long's line).
+        // "zqxjvwb_unique_long" wins: "ab" (len<3) has no trigrams → DEFAULT_WEIGHT.
+        // "zqxjvwb_unique_long" (len 19, ≥3 bytes) produces trigrams; if any appear
+        // in TRIGRAM_WEIGHTS with weight > DEFAULT_WEIGHT, selectivity decides; if
+        // none appear in the table, length (19 > 2) decides. Either way it wins.
         assert!(
             anchor_line.contains("zqxjvwb_unique_long"),
-            "Tier 2 length tie-break: longer token wins → anchor on line 2 \
-             (zqxjvwb_unique_long); got line {line}: {anchor_line:?}"
+            "Tier 2: 'zqxjvwb_unique_long' wins (selectivity or length) → anchor on line 2; \
+             got line {line}: {anchor_line:?}"
+        );
+    }
+
+    /// Tier 2 length tie-break: when selectivity is equal, the LONGER token wins
+    /// (exercises `.then_with(|| a.len().cmp(&b.len()))`, AC17).
+    ///
+    /// Both "mn" (len 2) and "q" (len 1) are shorter than 3 bytes and therefore
+    /// cannot produce trigrams — both receive DEFAULT_WEIGHT (provably equal).
+    /// The selectivity comparison is a no-op; the length comparison decides:
+    /// "mn" (len 2) > "q" (len 1) → anchor on "mn"'s line.
+    ///
+    /// PF-007: the discriminating observable is WHICH line is chosen.
+    #[test]
+    fn anchor_tier2_length_tiebreak_ac17() {
+        // Line 1: "q" only  (len 1, DEFAULT_WEIGHT — no trigrams).
+        // Line 2: "mn" only (len 2, DEFAULT_WEIGHT — no trigrams).
+        // No line has both → Tier 2 fires.
+        let content = "line_has_q_here\nline_has_mn_here\n";
+        let query = "q mn";
+
+        // Guard: verify no Tier-1 line (no line contains both tokens).
+        let no_tier1 = content
+            .split('\n')
+            .all(|line| !(line.contains("q") && line.contains("mn")));
+        assert!(no_tier1, "test setup: no line should contain both tokens");
+
+        // Guard: both tokens must be <3 bytes so they provably receive DEFAULT_WEIGHT.
+        assert!(
+            "q".len() < 3 && "mn".len() < 3,
+            "test setup: both tokens must be <3 bytes to guarantee equal selectivity"
+        );
+
+        let anchor = substring_first_anchor(content, query);
+        assert!(anchor.is_some(), "both tokens present → Some");
+
+        let start = anchor.unwrap().start;
+        let line = byte_offset_to_line(content.as_bytes(), start);
+        let anchor_line = content.lines().nth(line - 1).unwrap_or("");
+
+        // ADR-007: anchor line must contain ≥1 token.
+        let has_token = query
+            .split_whitespace()
+            .any(|tok| anchor_line.contains(tok));
+        assert!(
+            has_token,
+            "ADR-007: anchor line {line} must contain ≥1 query token; got {anchor_line:?}"
+        );
+
+        // Length tie-break: "mn" (len 2) > "q" (len 1) → anchor on "mn"'s line (line 2).
+        assert_eq!(
+            line, 2,
+            "Tier 2 length tie-break: 'mn' (len 2) > 'q' (len 1) → anchor must be \
+             on line 2; got line {line}: {anchor_line:?}"
+        );
+        assert!(
+            anchor_line.contains("mn"),
+            "anchor line must contain the winning token 'mn'; got {anchor_line:?}"
+        );
+    }
+
+    /// Tier 2 position (earliest-occurrence) tie-break: when selectivity AND
+    /// length are equal, the token with the EARLIEST byte position wins
+    /// (exercises `.then_with(|| pos_b.cmp(&pos_a))`, AC17).
+    ///
+    /// Both "ab" (len 2) and "cd" (len 2) are shorter than 3 bytes — both receive
+    /// DEFAULT_WEIGHT (provably equal). Equal length. The position comparison
+    /// `pos_b.cmp(&pos_a)` (reversed so lower pos wins) decides: "ab" appears
+    /// before "cd" → "ab" wins → anchor on line 1.
+    ///
+    /// PF-007: the discriminating observable is WHICH line is chosen.
+    #[test]
+    fn anchor_tier2_position_tiebreak_ac17() {
+        // Line 1: "ab" only (earliest; len 2, DEFAULT_WEIGHT).
+        // Line 2: "cd" only (later;   len 2, DEFAULT_WEIGHT).
+        // No line has both → Tier 2 fires.
+        let content = "line_with_ab_only\nline_with_cd_only\n";
+        let query = "ab cd";
+
+        // Guard: verify no Tier-1 line.
+        let no_tier1 = content
+            .split('\n')
+            .all(|line| !(line.contains("ab") && line.contains("cd")));
+        assert!(no_tier1, "test setup: no line should contain both tokens");
+
+        // Guard: both tokens <3 bytes (equal DEFAULT_WEIGHT) AND equal length.
+        assert_eq!(
+            "ab".len(),
+            "cd".len(),
+            "test setup: tokens must have equal length"
+        );
+        assert!(
+            "ab".len() < 3,
+            "test setup: both tokens must be <3 bytes to guarantee equal selectivity"
+        );
+
+        let anchor = substring_first_anchor(content, query);
+        assert!(anchor.is_some(), "both tokens present → Some");
+
+        let start = anchor.unwrap().start;
+        let line = byte_offset_to_line(content.as_bytes(), start);
+        let anchor_line = content.lines().nth(line - 1).unwrap_or("");
+
+        // ADR-007: anchor line must contain ≥1 token.
+        let has_token = query
+            .split_whitespace()
+            .any(|tok| anchor_line.contains(tok));
+        assert!(
+            has_token,
+            "ADR-007: anchor line {line} must contain ≥1 query token; got {anchor_line:?}"
+        );
+
+        // Position tie-break: "ab" (pos ~9) appears before "cd" (pos ~27) → line 1 wins.
+        assert_eq!(
+            line, 1,
+            "Tier 2 position tie-break: 'ab' (earliest) wins → anchor must be on line 1; \
+             got line {line}: {anchor_line:?}"
+        );
+        assert!(
+            anchor_line.contains("ab"),
+            "anchor line must contain the earliest token 'ab'; got {anchor_line:?}"
         );
     }
 
@@ -2074,7 +2196,7 @@ mod tests {
     }
 
     /// Determinism: when token appears on multiple lines, FIRST (lowest) line wins
-    /// on every call (AC13/AC18).
+    /// on every call (AC13/AC18 — single-token path).
     #[test]
     fn anchor_determinism_first_occurrence_ac13_ac18() {
         let content = "fn encode_varint(a: u8) {}\nfn encode_varint(b: u16) {}\nfn encode_varint(c: u32) {}\n";
@@ -2099,6 +2221,53 @@ mod tests {
         assert_eq!(line1, 1, "first call: first occurrence is line 1");
         assert_eq!(line2, 1, "second call: still line 1 (deterministic)");
         assert_eq!(line3, 1, "third call: still line 1 (deterministic)");
+    }
+
+    /// AC18: multi-token determinism — identical anchor byte across repeated calls
+    /// exercising the full Tier-2 selectivity + length + position ranking path.
+    ///
+    /// The existing `anchor_determinism_first_occurrence_ac13_ac18` only exercises
+    /// the single-token fast path. This test confirms that Tier-2 tie-break
+    /// resolution is also stable: three independent calls on the same
+    /// (content, query) pair return the same byte range every time.
+    #[test]
+    fn anchor_multi_token_determinism_tier2_ac18() {
+        // Tier-2 setup: no line has both tokens → Tier 2 fires on every call.
+        // Both "ab" (len 2, DEFAULT_WEIGHT) and "cd" (len 2, DEFAULT_WEIGHT):
+        // equal selectivity, equal length → position tie-break → "ab" wins.
+        let content = "line_with_ab_only\nline_with_cd_only\n";
+        let query = "ab cd";
+
+        let run1 = substring_first_anchor(content, query);
+        let run2 = substring_first_anchor(content, query);
+        let run3 = substring_first_anchor(content, query);
+
+        assert!(run1.is_some(), "run 1: both tokens present → Some");
+
+        let start1 = run1.as_ref().unwrap().start;
+        let start2 = run2.as_ref().unwrap().start;
+        let start3 = run3.as_ref().unwrap().start;
+
+        assert_eq!(
+            start1, start2,
+            "AC18 multi-token: run 1 and run 2 must agree"
+        );
+        assert_eq!(
+            start1, start3,
+            "AC18 multi-token: run 1 and run 3 must agree"
+        );
+
+        // ADR-007: stable anchor line contains ≥1 token.
+        let line = byte_offset_to_line(content.as_bytes(), start1);
+        let anchor_line = content.lines().nth(line - 1).unwrap_or("");
+        let has_token = query
+            .split_whitespace()
+            .any(|tok| anchor_line.contains(tok));
+        assert!(
+            has_token,
+            "AC18: deterministic anchor line {line} must contain ≥1 token; \
+             got {anchor_line:?}"
+        );
     }
 
     /// CRLF content: byte_offset_to_line counts only \\n, so CRLF files work
