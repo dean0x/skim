@@ -805,7 +805,9 @@ fn token_max_trigram_weight(token: &str) -> f32 {
     bytes
         .windows(3)
         .map(|w| {
-            let key = (u32::from(w[0]) << 16) | (u32::from(w[1]) << 8) | u32::from(w[2]);
+            // Reuse the canonical trigram encoder (single source of truth,
+            // PF-004-safe u32 widening) rather than re-inlining the shift.
+            let key = crate::ngram::Ngram::from_bytes(w[0], w[1], w[2]).key();
             crate::weights::lookup_weight(key, crate::weights::TRIGRAM_WEIGHTS)
         })
         .fold(f32::NEG_INFINITY, f32::max)
