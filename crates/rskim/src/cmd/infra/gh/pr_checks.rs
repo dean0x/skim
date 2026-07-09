@@ -37,8 +37,8 @@
 //! Format: `"{status} ({duration}) — {url}"` for failing checks with a URL.
 //! For checks without a URL (JSON tier), the URL field is omitted.
 
-use crate::output::ParseResult;
 use crate::output::canonical::{InfraItem, InfraResult};
+use crate::output::{ParseResult, strip_ansi};
 use crate::runner::CommandOutput;
 
 use super::{MAX_JSON_BYTES, RE_GH_CHECK_SYMBOL, RE_GH_CHECK_TAB, three_tier_parse};
@@ -190,7 +190,7 @@ pub(super) fn try_parse_checks_text(text: &str) -> Option<InfraResult> {
                 // strip_ansi is safe on the already-split name field: the tab
                 // delimiter has already been consumed by the regex, so the name
                 // value itself cannot contain a meaningful tab — no PF-006 risk.
-                name: crate::output::strip_ansi(caps[1].trim()),
+                name: strip_ansi(caps[1].trim()),
                 status: caps[2].trim().to_lowercase(),
                 duration: non_empty_capture(caps.get(3)),
                 url: non_empty_capture(caps.get(4)),
@@ -210,7 +210,7 @@ pub(super) fn try_parse_checks_text(text: &str) -> Option<InfraResult> {
             parsed.push(ParsedCheck {
                 // strip_ansi is safe on the already-split name field: check
                 // names don't contain tabs (tab is the column delimiter).
-                name: crate::output::strip_ansi(caps[2].trim()),
+                name: strip_ansi(caps[2].trim()),
                 status: status.to_string(),
                 duration: non_empty_capture(caps.get(3)),
                 url: non_empty_capture(caps.get(4)),

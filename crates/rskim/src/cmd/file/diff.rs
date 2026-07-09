@@ -18,8 +18,8 @@
 
 use std::process::ExitCode;
 
-use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
+use crate::output::{ParseResult, strip_ansi};
 use crate::runner::CommandOutput;
 
 use super::MAX_DISPLAY_ENTRIES;
@@ -162,7 +162,7 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
             // strip_ansi is safe on the already-split field: the tab has been
             // consumed by split('\t'), and file paths don't contain tabs — no
             // PF-006 risk of tab destruction on an already-delimited field.
-            let path = crate::output::strip_ansi(rest.split('\t').next().unwrap_or(rest).trim());
+            let path = strip_ansi(rest.split('\t').next().unwrap_or(rest).trim());
             state.current_path = Some(path);
             continue;
         }
@@ -171,8 +171,8 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
         if let Some(rest) = line.strip_prefix("+++ ") {
             // If the old path was /dev/null, use the new path
             if state.current_path.as_deref() == Some("/dev/null") {
-                let path =
-                    crate::output::strip_ansi(rest.split('\t').next().unwrap_or(rest).trim());
+                // Same as --- case: split('\t') already consumed the tab; PF-006 safe.
+                let path = strip_ansi(rest.split('\t').next().unwrap_or(rest).trim());
                 state.current_path = Some(path);
             }
             continue;

@@ -539,7 +539,7 @@ mod tests {
         };
         assert!(
             s.contains("issue view"),
-            "expected \'issue view\' in rendered output; got: {s}"
+            "expected 'issue view' in rendered output; got: {s}"
         );
     }
 
