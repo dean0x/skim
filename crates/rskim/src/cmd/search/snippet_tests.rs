@@ -740,3 +740,105 @@ fn extract_snippet_and_verify_large_file_bounded_scan_ac15() {
          verified=false with VerifyMode::Near(5) (bounded-scan cap enforced)"
     );
 }
+
+/// AC16 — large-file bounded-scan with `VerifyMode::Substring`.
+///
+/// Exercises the `run_verify_predicate` Substring arm (snippet.rs:409-413) on
+/// the large-file path — the arm that was previously unreachable from any
+/// integration test.  Two discriminating sub-cases (PF-007):
+///
+/// **(a) Needle within the scan cap → `verified=true`.**
+/// The file is created by writing the needle at byte offset 0 and then
+/// extending the file past `MAX_SNIPPET_FILE_BYTES` via a sparse seek+write,
+/// so the large-file branch fires.  The bounded scan reads the first 5 MiB,
+/// which includes the needle → `query_substring_present` returns `true`.
+/// If the Substring arm were broken or missing, `verified` would flip to
+/// `false` and the assertion would catch it.
+///
+/// **(b) Needle beyond the scan cap → `verified=false`.**
+/// The needle is written at `FIVE_MIB + 200`, past the `MAX_VERIFY_SCAN_BYTES`
+/// cut-off.  The bounded scan reads the first 5 MiB (null bytes from the
+/// sparse hole) and cannot find the needle → `verified=false`.
+/// If the scan cap were removed, `verified` would flip to `true` and the
+/// assertion would catch it.  Parallel to the AC15 Phrase/Near negative cases.
+#[test]
+fn extract_snippet_and_verify_large_file_substring_ac16() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    const FIVE_MIB: u64 = 5 * 1024 * 1024;
+
+    // ── (a) Needle within the scan cap ──────────────────────────────────────
+    {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::create_dir_all(root.join("src")).unwrap();
+
+        // Write the needle at byte 0, then extend the file past
+        // MAX_SNIPPET_FILE_BYTES (sparse seek+write) so the large-file branch
+        // fires.
+        let file_path = root.join("src/large_within.rs");
+        {
+            let mut f = std::fs::File::create(&file_path).unwrap();
+            f.write_all(b"encode_varint\n").unwrap();
+            f.seek(SeekFrom::Start(FIVE_MIB + 200)).unwrap();
+            f.write_all(b"\n").unwrap();
+            f.flush().unwrap();
+        }
+        let reported_size = std::fs::metadata(&file_path).unwrap().len();
+        assert!(
+            reported_size > FIVE_MIB,
+            "AC16a test setup: file must exceed 5 MiB; got {reported_size}"
+        );
+
+        let (_, verified) = extract_snippet_and_verify(
+            &root,
+            "src/large_within.rs",
+            &[],
+            None,
+            "encode_varint",
+            VerifyMode::Substring,
+        );
+        assert!(
+            verified,
+            "AC16a: large file with needle within the scan cap must be \
+             verified=true with VerifyMode::Substring \
+             (run_verify_predicate Substring arm must return true)"
+        );
+    }
+
+    // ── (b) Needle beyond the scan cap ──────────────────────────────────────
+    {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::create_dir_all(root.join("src")).unwrap();
+
+        // Sparse file: seek past 5 MiB, write needle there — identical
+        // construction to AC15.
+        let file_path = root.join("src/large_beyond.rs");
+        {
+            let mut f = std::fs::File::create(&file_path).unwrap();
+            f.seek(SeekFrom::Start(FIVE_MIB + 200)).unwrap();
+            f.write_all(b"encode_varint").unwrap();
+            f.flush().unwrap();
+        }
+        let reported_size = std::fs::metadata(&file_path).unwrap().len();
+        assert!(
+            reported_size > FIVE_MIB,
+            "AC16b test setup: sparse file must report size > 5 MiB; got {reported_size}"
+        );
+
+        let (_, verified) = extract_snippet_and_verify(
+            &root,
+            "src/large_beyond.rs",
+            &[],
+            None,
+            "encode_varint",
+            VerifyMode::Substring,
+        );
+        assert!(
+            !verified,
+            "AC16b: large file with needle only beyond MAX_VERIFY_SCAN_BYTES must be \
+             verified=false with VerifyMode::Substring (bounded-scan cap enforced)"
+        );
+    }
+}
