@@ -337,11 +337,8 @@ pub(super) fn extract_snippet_and_verify(
     // exact occurrence range. For all verify modes (Substring via AD-396-1,
     // Phrase/Near via AD-393-6), anchor_range now carries the content-derived
     // anchor; match_positions is the fallback only when anchor_range is None.
-    //
-    // NOTE: The CLI no longer treats reader-emitted trigram positions
-    // (match_positions) as query-match locations for anchoring.  They remain
-    // reader-internal ranking/TF signals only.  Anchor provenance is now always
-    // content-derived (file bytes already read once, AD-355-1).
+    // match_positions are reader-internal ranking/TF signals; anchor provenance
+    // is content-derived — file bytes already read once (AD-355-1).
     let anchor_start = anchor_range
         .as_ref()
         .map(|r| r.start)
