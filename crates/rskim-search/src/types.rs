@@ -743,7 +743,6 @@ pub fn substring_first_anchor(content: &str, query: &str) -> Option<Range<usize>
     }
 
     // ── Multi-token: Tier 1 — earliest line with ALL tokens (AD-396-2 §T1) ──
-    // AD-396-2: tiered anchor-selection rule.
     // Scan lines (split on '\n'; handles CRLF since byte_offset_to_line counts
     // '\n' bytes and str::find is byte-exact within the line slice).
     let mut byte_offset: usize = 0;
@@ -765,7 +764,6 @@ pub fn substring_first_anchor(content: &str, query: &str) -> Option<Range<usize>
     }
 
     // ── Multi-token: Tier 2 — rarest-token fallback (AD-396-2 §T2) ──────────
-    // AD-396-2: tiered anchor-selection rule — Tier 2 anchor.
     // Select the token with the highest max-trigram IDF weight (most selective);
     // tie-break by length then earliest occurrence (AC18: deterministic).
     let rarest = tokens.iter().copied().max_by(|a, b| {

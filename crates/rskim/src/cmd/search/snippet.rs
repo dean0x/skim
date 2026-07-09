@@ -388,12 +388,13 @@ pub(super) fn extract_snippet_and_verify(
     let match_line = rskim_search::byte_offset_to_line(&content, anchor_start) as u32;
 
     // AD-396-6: dev-time invariant — when verified, the anchor line must contain
-    // ≥1 query token.  The `!verified` guard excludes the empty-sentinel path in
-    // `extract_snippet` (query="", verified=false) and any future non-verified
-    // anchoring.  Compiled out of --release; the test suite is the production
-    // correctness gate (ADR-007 / PF-007), not this assert alone.
+    // ≥1 query token. `!verified` short-circuits for the extract_snippet sentinel
+    // (query="", verified=false) and any non-verified path. When verified=true,
+    // all three predicates return None/false for empty queries, so the inner block
+    // is always reached and the ADR-007 invariant is checked. Compiled out of
+    // --release; the test suite is the production correctness gate (PF-007).
     debug_assert!(
-        !verified || query.split_whitespace().next().is_none() || {
+        !verified || {
             let idx = (match_line as usize).saturating_sub(1);
             let anchor_line = text.lines().nth(idx).unwrap_or("");
             query
