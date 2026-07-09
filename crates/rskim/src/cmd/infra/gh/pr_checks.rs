@@ -37,8 +37,8 @@
 //! Format: `"{status} ({duration}) — {url}"` for failing checks with a URL.
 //! For checks without a URL (JSON tier), the URL field is omitted.
 
-use crate::output::ParseResult;
 use crate::output::canonical::{InfraItem, InfraResult};
+use crate::output::{ParseResult, strip_ansi};
 use crate::runner::CommandOutput;
 
 use super::{MAX_JSON_BYTES, RE_GH_CHECK_SYMBOL, RE_GH_CHECK_TAB, three_tier_parse};
@@ -187,7 +187,10 @@ pub(super) fn try_parse_checks_text(text: &str) -> Option<InfraResult> {
         // Try tab format: name\tstatus\tduration\turl
         if let Some(caps) = RE_GH_CHECK_TAB.captures(line) {
             parsed.push(ParsedCheck {
-                name: caps[1].trim().to_string(),
+                // strip_ansi is safe on the already-split name field: the tab
+                // delimiter has already been consumed by the regex, so the name
+                // value itself cannot contain a meaningful tab — no PF-006 risk.
+                name: strip_ansi(caps[1].trim()),
                 status: caps[2].trim().to_lowercase(),
                 duration: non_empty_capture(caps.get(3)),
                 url: non_empty_capture(caps.get(4)),
@@ -205,7 +208,9 @@ pub(super) fn try_parse_checks_text(text: &str) -> Option<InfraResult> {
                 _ => "unknown",
             };
             parsed.push(ParsedCheck {
-                name: caps[2].trim().to_string(),
+                // strip_ansi is safe on the already-split name field: check
+                // names don't contain tabs (tab is the column delimiter).
+                name: strip_ansi(caps[2].trim()),
                 status: status.to_string(),
                 duration: non_empty_capture(caps.get(3)),
                 url: non_empty_capture(caps.get(4)),
@@ -449,6 +454,55 @@ mod tests {
             "Passing check must not include URL: {}",
             build_item.value
         );
+    }
+
+    /// ANSI escape sequences in a tab-format check name must be stripped from
+    /// the re-emitted label.  With `skip_ansi_strip:true` on gh's CONFIG, ANSI
+    /// bytes reach the parser raw; this test pins the defense-in-depth behaviour
+    /// on the already-split `name` field (avoids PF-006 — strip_ansi is safe here
+    /// because the tab delimiter has already been consumed by `RE_GH_CHECK_TAB`).
+    #[test]
+    fn test_ansi_in_check_name_is_stripped() {
+        let input = "\x1b[32mCI / build\x1b[0m\tpass\t2m30s\thttps://example.com/build";
+        let result = try_parse_checks_text(input);
+        assert!(
+            result.is_some(),
+            "must parse tab-format line with ANSI in name"
+        );
+        let rendered = result.unwrap().as_ref().to_string();
+        assert!(
+            rendered.contains("CI / build"),
+            "check name must appear without ESC codes; got: {rendered}"
+        );
+        assert!(
+            !rendered.contains('\x1b'),
+            "rendered output must not contain ESC bytes; got: {rendered}"
+        );
+    }
+
+    /// Verifies that adding ANSI defence does not regress the PR's core fix:
+    /// a genuine tab-separated line still parses correctly (the tab delimiter
+    /// must NOT be destroyed by the per-field strip_ansi call).
+    #[test]
+    fn test_tab_delimiter_survives_strip_ansi_on_name_field() {
+        // Two entries: one with ANSI in the name, one clean.
+        // Both need a non-empty URL field: the regex requires 4 tab-separated
+        // fields and `.trim()` would drop a trailing bare tab.
+        let input = "\x1b[32mCI / lint\x1b[0m\tfail\t1m05s\thttps://example.com/lint\n\
+                     CI / build\tpass\t2m30s\thttps://example.com/build";
+        let result = try_parse_checks_text(input);
+        assert!(result.is_some(), "both entries must parse");
+        let result = result.unwrap();
+        assert_eq!(
+            result.items.len(),
+            2,
+            "both tab-separated entries must be captured"
+        );
+        assert_eq!(
+            result.items[0].label, "CI / lint",
+            "ANSI-laden name stripped correctly"
+        );
+        assert_eq!(result.items[1].label, "CI / build", "clean name unchanged");
     }
 
     /// Symbol-format failing checks must also include URL.

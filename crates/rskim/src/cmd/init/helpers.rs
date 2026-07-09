@@ -164,6 +164,19 @@ definitions — while stripping implementation details and body content.
 It works on code files (functions/classes) and prose files (headings/sections).
 Use `-n` / `--line-numbers` to enrich the output with original source line numbers.
 
+### Command wrapping
+
+The rewrite hook may also wrap supported shell commands (`ls`, `grep`,
+`git diff`, `gh`, test runners, ...) as `skim <tool>`: the same command
+runs with the same arguments and exit code, and skim compresses its
+output. Seeing `skim ls` run in place of `ls` is expected behavior, not
+an error.
+
+Compression condenses how results are presented — it does not change
+what the command did. If compressed output ever looks incomplete,
+garbled, or inconsistent with what you expected, flag it to the user
+rather than silently working around it.
+
 ### When to use skim
 
 **General principle:** Use skim when structure is sufficient for your task.
@@ -363,6 +376,20 @@ mod tests {
         // SKIM_PASSTHROUGH is NOT documented in guidance — agents learn about it
         // from stderr hints emitted on compressed non-zero exits (shared.rs, mod.rs).
         assert!(!content.contains("SKIM_PASSTHROUGH"));
+        // Command wrapping section explains that the rewrite hook may wrap
+        // supported tools and that agents should flag garbled output to the user.
+        assert!(
+            content.contains("### Command wrapping"),
+            "Guidance must contain '### Command wrapping' section"
+        );
+        assert!(
+            content.contains("wrap supported shell commands"),
+            "Guidance must explain which commands the hook may wrap"
+        );
+        assert!(
+            content.contains("flag it to the user"),
+            "Guidance must instruct agents to flag garbled compressed output"
+        );
         // No rskim mention in guidance body
         assert!(!content.contains("rskim"));
         // Heatmap section present with key content

@@ -57,7 +57,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - **Parallel processing** with multi-file globs via rayon
 
 ### Command Rewriting (`skim init`)
-- PreToolUse hook rewrites `cat`, `head`, `tail`, `cargo test`, `vitest`, `git diff` into skim equivalents
+- PreToolUse hook rewrites `ls`, `grep`, `gh`, `cargo test`, `vitest`, `git diff` into skim equivalents
 - Two-layer rule system with declarative prefix-swap and custom argument handlers
 - One command installs the hook for automatic, invisible context savings
 - Round-trip safe: commands with pipes, newlines, heredocs, or command substitution are never rewritten

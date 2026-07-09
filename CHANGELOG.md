@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   applies ADR-002). See **Fixed** below for full details.
 
 ### Added
+- **Agent guidance documents command wrapping** — The guidance injected by `skim init`
+  now includes a "Command wrapping" section explaining that the rewrite hook may run
+  supported commands as `skim <tool>` (same arguments, same exit code, compressed
+  output). Agents are instructed to flag garbled or incomplete compressed output to the
+  user rather than silently working around it. Existing installs pick up the new section
+  on the next version bump + re-pin (per ADR-004; binary-side fixes below are effective
+  immediately after rebuild).
 - **Bash / shell language support** — Full tree-sitter-bash grammar integration
   (`Language::Bash`). Structure mode strips `function_definition` bodies to `{...}`
   while preserving function names and all top-level commands/variable assignments.
@@ -36,6 +43,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SKIM_DEBUG=1` notice; all 6 modes have explicit Bash arms.
 
 ### Fixed
+- **`skim gh pr checks` tabs destroyed by ANSI-strip + exit-8 raw-forwarded before
+  parse** — `gh pr checks` emits TAB-separated output but gh's `ToolRunConfig` had
+  `skip_ansi_strip: false`, so `strip_ansi_escapes` dropped `\t` before
+  `RE_GH_CHECK_TAB` could match, causing fall-through to Passthrough. Independently,
+  `expected_exit_codes: &[]` classified gh's exit 8 (pending/failing checks) as
+  `UnexpectedFailure`, raw-forwarding the output before parsing. Fixed: set
+  `skip_ansi_strip: true` (gh emits no ANSI when piped) and `expected_exit_codes:
+  &[8]`. Exit 8 is still propagated so callers see the true check state. Blast
+  radius: CONFIG is shared by all `run_tool` gh routes; `gh run watch` is unaffected
+  (streaming path). A hypothetical gh exit-8 from a non-checks route falls to
+  Tier-3 passthrough with exit code preserved.
+
+- **`skim diff` tab-split header fused path to mtime** — `diff -u` emits
+  `--- path\t<mtime>` headers and `try_parse_standalone_unified` splits on `\t` to
+  extract the path. With `skip_ansi_strip: false`, the tab was dropped by
+  `strip_ansi_escapes`, fusing path and timestamp into a single token. Fixed:
+  set `skip_ansi_strip: true` (diff emits no ANSI). The ADR-001 net-savings guard
+  is undisturbed.
+
 - **`git diff` output could exceed raw size** — The default diff renderer walked the
   full AST node body for each hunk, emitting 2–5× the raw patch size for large files.
   Replaced with a hunk-scoped path (`render_default_scoped`) that emits only the

@@ -18,8 +18,8 @@
 
 use std::process::ExitCode;
 
-use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
+use crate::output::{ParseResult, strip_ansi};
 use crate::runner::CommandOutput;
 
 use super::MAX_DISPLAY_ENTRIES;
@@ -31,7 +31,10 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     env_overrides: &[],
     install_hint: "diff is typically pre-installed on Unix systems",
     family: "file",
-    skip_ansi_strip: false,
+    // standalone `diff -u` emits `--- path\t<mtime>` headers and the parser
+    // splits on `\t` (see `try_parse_standalone_unified`); diff emits no ANSI.
+    // `strip_ansi_escapes` drops `\t`, fusing path and mtime before parsing.
+    skip_ansi_strip: true,
     command_type: CommandType::FileOps,
     expected_exit_codes: &[1],
     forward_stderr: true,
@@ -154,8 +157,12 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
         // the `a/` prefix in `---` / `+++` lines.
         if let Some(rest) = line.strip_prefix("--- ") {
             state.flush_current();
-            // Extract path (strip optional tab+timestamp suffix)
-            let path = rest.split('\t').next().unwrap_or(rest).trim().to_string();
+            // Extract path (strip optional tab+timestamp suffix), then strip any
+            // ANSI escape sequences from the path before re-emitting it.
+            // strip_ansi is safe on the already-split field: the tab has been
+            // consumed by split('\t'), and file paths don't contain tabs — no
+            // PF-006 risk of tab destruction on an already-delimited field.
+            let path = strip_ansi(rest.split('\t').next().unwrap_or(rest).trim());
             state.current_path = Some(path);
             continue;
         }
@@ -164,7 +171,8 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
         if let Some(rest) = line.strip_prefix("+++ ") {
             // If the old path was /dev/null, use the new path
             if state.current_path.as_deref() == Some("/dev/null") {
-                let path = rest.split('\t').next().unwrap_or(rest).trim().to_string();
+                // Same as --- case: split('\t') already consumed the tab; PF-006 safe.
+                let path = strip_ansi(rest.split('\t').next().unwrap_or(rest).trim());
                 state.current_path = Some(path);
             }
             continue;
@@ -237,6 +245,24 @@ fn build_file_result(file_stats: Vec<FileStat>) -> Option<FileResult> {
 mod tests {
     use super::*;
     use crate::cmd::test_utils::{load_fixture, make_output_full};
+
+    // --- config-lock tests ---
+    //
+    // skip_ansi_strip MUST be true: standalone `diff -u` emits
+    // `--- path\t<mtime>` headers and the parser splits on `\t`
+    // (see `try_parse_standalone_unified` — the `--- `/`+++ ` header handlers).
+    // `strip_ansi_escapes` would drop the `\t`, fusing path and timestamp
+    // into a single token before the parser sees it. diff emits no ANSI.
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn test_config_skip_ansi_strip_is_true() {
+        assert!(
+            CONFIG.skip_ansi_strip,
+            "diff CONFIG.skip_ansi_strip must be true — \
+             strip_ansi_escapes drops \\t, gluing path to mtime in --- headers"
+        );
+    }
 
     // ---- prepare_args tests ----
 
@@ -344,6 +370,59 @@ mod tests {
             result.is_passthrough(),
             "Empty output on error should be passthrough, got {}",
             result.tier_name()
+        );
+    }
+
+    /// ANSI escape sequences in a diff path header must be stripped from the
+    /// re-emitted entry.  With `skip_ansi_strip:true` on diff's CONFIG, ANSI
+    /// bytes reach the parser raw; this pins the defence-in-depth behaviour on
+    /// the already-split `path` field (avoids PF-006 — strip_ansi is safe here
+    /// because the `\t` delimiter has already been consumed by `split('\t')`).
+    #[test]
+    fn test_ansi_in_diff_path_is_stripped() {
+        let input = "--- \x1b[1ma/src/main.rs\x1b[0m\t2026-05-01 10:00:00.000000000 +0000\n\
+                     +++ b/src/main.rs\t2026-05-01 10:05:00.000000000 +0000\n\
+                     @@ -1,1 +1,1 @@\n\
+                     -old\n\
+                     +new\n";
+        let result = try_parse_standalone_unified(input);
+        assert!(
+            result.is_some(),
+            "must parse unified diff with ANSI in path"
+        );
+        let result = result.unwrap();
+        assert!(
+            result.entries[0].contains("a/src/main.rs"),
+            "path must appear without ESC codes; got: {}",
+            result.entries[0]
+        );
+        assert!(
+            !result.entries[0].contains('\x1b'),
+            "entry must not contain ESC bytes; got: {}",
+            result.entries[0]
+        );
+    }
+
+    /// Verifies that adding ANSI defence does not regress the PR's core fix:
+    /// a genuine `--- path\t<mtime>` header still splits correctly on `\t`
+    /// (the tab delimiter must NOT be destroyed by the per-field strip_ansi call).
+    #[test]
+    fn test_tab_delimiter_survives_strip_ansi_on_path_field() {
+        // Header with clean path — confirms the split still works after the
+        // strip_ansi wrapping even when no ESC codes are present.
+        let input = "--- a/src/lib.rs\t2026-05-01 10:00:00.000000000 +0000\n\
+                     +++ b/src/lib.rs\t2026-05-01 10:05:00.000000000 +0000\n\
+                     @@ -1,1 +1,1 @@\n\
+                     -old\n\
+                     +new\n";
+        let result = try_parse_standalone_unified(input);
+        assert!(result.is_some(), "must parse clean unified diff");
+        let result = result.unwrap();
+        // Path must be the clean "a/src/lib.rs", not fused with the mtime
+        assert_eq!(
+            result.entries[0], "a/src/lib.rs: +1, -1",
+            "path must not be fused with mtime; got: {}",
+            result.entries[0]
         );
     }
 
