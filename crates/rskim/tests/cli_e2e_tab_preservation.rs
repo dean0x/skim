@@ -187,11 +187,11 @@ fn test_diff_tab_header_path_not_glued() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        stdout.contains("src/main.rs"),
-        "parsed entry must contain file path 'src/main.rs'; got: {stdout}"
+        stdout.contains("a/src/main.rs:"),
+        "path renders as clean field — tab must survive and split path from mtime; got: {stdout}"
     );
     assert!(
-        !stdout.contains("src/main.rs2026"),
-        "path must NOT be glued to mtime — tab must survive ANSI-strip; got: {stdout}"
+        !stdout.contains("main.rs2026") && !stdout.contains("main.rs 2026"),
+        "path must not be fused with mtime; got: {stdout}"
     );
 }

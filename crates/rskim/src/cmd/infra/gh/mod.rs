@@ -302,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_expected_exit_codes_includes_8() {
+    fn test_config_expected_exit_codes_is_exactly_8() {
         assert_eq!(
             CONFIG.expected_exit_codes,
             &[8],
@@ -513,6 +513,33 @@ mod tests {
             result.is_passthrough(),
             "Expected Passthrough for malformed JSON, got {}",
             result.tier_name()
+        );
+    }
+
+    /// `gh CONFIG.skip_ansi_strip: true` covers ALL gh subcommands, not only
+    /// `pr checks`.  Verify that `gh issue view` (a second subcommand) produces a
+    /// Full parse through `parse_impl_with_auto_detect` — i.e., the JSON routing
+    /// gate and issue-view field extraction do not regress under the shared
+    /// `skip_ansi_strip:true` setting.  Note: `gh` JSON API responses are always
+    /// clean (no ANSI) when piped; what matters for this subcommand is that the
+    /// pipeline does not break when ANSI stripping is disabled globally.
+    #[test]
+    fn test_issue_view_skip_ansi_strip_does_not_break_json_parse() {
+        let input = load_fixture("gh_issue_view.json");
+        let output = make_output(&input);
+        let result = parse_impl_with_auto_detect(&output);
+        assert!(
+            result.is_full(),
+            "issue view JSON must produce Full under skip_ansi_strip:true; got {}",
+            result.tier_name()
+        );
+        let s = match &result {
+            ParseResult::Full(r) => r.as_ref().to_string(),
+            _ => unreachable!(),
+        };
+        assert!(
+            s.contains("issue view"),
+            "expected \'issue view\' in rendered output; got: {s}"
         );
     }
 
