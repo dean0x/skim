@@ -106,9 +106,10 @@ pub use compound::{
     dir_proximity_score, merge_composite, merge_layer_scores, structural_coupling_score,
 };
 // #201: enriched result row type, formatters, and line-span re-parse.
+// #397: find_first_strict_match — single strict-ancestor predicate for both gate and anchor.
 pub use compound::{
-    AstResult, MAX_REPARSE_FILE_BYTES, TemporalAnnotation, format_ast_json, format_ast_text,
-    pattern_occurs_in_file, recover_line,
+    AstResult, MAX_REPARSE_FILE_BYTES, TemporalAnnotation, find_first_strict_match,
+    format_ast_json, format_ast_text, pattern_occurs_in_file, recover_line,
 };
 pub use index::{NgramIndexBuilder, NgramIndexReader};
 pub use lexical::{

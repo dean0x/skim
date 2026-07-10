@@ -39,7 +39,9 @@ pub use intersection::{
 pub use merge::{merge_composite, merge_layer_scores};
 pub use output::{AstResult, TemporalAnnotation, format_ast_json, format_ast_text};
 pub use proximity::dir_proximity_score;
-pub use reparse::{MAX_REPARSE_FILE_BYTES, pattern_occurs_in_file, recover_line};
+pub use reparse::{
+    MAX_REPARSE_FILE_BYTES, find_first_strict_match, pattern_occurs_in_file, recover_line,
+};
 pub use weights::{
     CompositeWeights6, WEIGHT6_AST, WEIGHT6_DIR_PROXIMITY, WEIGHT6_IMPORT_GRAPH, WEIGHT6_LEXICAL,
     WEIGHT6_STRUCTURAL_COUPLING, WEIGHT6_TEMPORAL,

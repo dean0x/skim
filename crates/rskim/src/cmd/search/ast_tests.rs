@@ -2647,7 +2647,8 @@ fn run_ast_standalone_resolves_nested_dir_corpus_correctly() {
 //            integration: run_ast_standalone_unrelated_subtree_excluded_ac3_374 (this file)
 //   AC4  — true positives survive the gate
 //   AC5  — verify-then-truncate-LAST
-//   AC8  — recover_line stays line-recovery only (degraded row emitted, not dropped)
+//   AC8  — real-node rows always carry :line (AD-397-4); no degraded/path-only state
+//            (#397: find_first_strict_match is gate+anchor; run_ast_standalone_real_node_result_always_carries_line_ac3_ac8_397)
 //   AC9  — single-n-gram identity (no regression)
 //   AC10 — query-time only, no format/rebuild
 //   AC11 — no elision marker when gate produces empty results
@@ -2953,17 +2954,22 @@ fn run_ast_standalone_truncate_after_gate_ac5_374() {
     );
 }
 
-/// AC8 (#374): `recover_line` MUST remain line-recovery only — a file that passes
-/// the verify gate but where `recover_line` returns `None` MUST still be emitted
-/// as a degraded row (path present, no `:line`/snippet), not dropped.
+/// AC3 / AC8 (#397): Every real-node result row ALWAYS carries `:line` (AD-397-4).
 ///
-/// We verify that `run_ast_standalone` emits the file path even when the
-/// representative line cannot be recovered (degraded row, matching AC-F2 / AC-API3).
+/// After #397, `find_first_strict_match` is both the gate AND the anchor — so every
+/// file that passes the verify gate for a real-node pattern has an anchor by
+/// construction. There is no longer a "gate-passed but line-unknown" state for
+/// real-node patterns.
 ///
-/// NEGATIVE (PF-007): If emit/drop were keyed off `recover_line`, the file
-/// would vanish from output; this assertion would fail.
+/// This test replaces the old `run_ast_standalone_recover_line_none_still_emits_ac8_374`,
+/// whose premise ("gate-passed file may emit as degraded row") is no longer possible
+/// for real-node patterns after #397.
+///
+/// PF-007 discriminating: a pre-#397 implementation (two separate calls: gate then
+/// recover_line) would emit "loops.rs  [score]" (no colon-number) when recover_line
+/// returns None. This assertion requires "loops.rs:" (with colon + number).
 #[test]
-fn run_ast_standalone_recover_line_none_still_emits_ac8_374() {
+fn run_ast_standalone_real_node_result_always_carries_line_ac3_ac8_397() {
     use super::super::manifest::FileManifest;
 
     let project = make_project_with_rust();
@@ -2973,7 +2979,9 @@ fn run_ast_standalone_recover_line_none_still_emits_ac8_374() {
     let manifest =
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
 
-    // Use text output (not JSON) — a degraded row shows the path without `:line`.
+    // Text output: a row with `:line` looks like "  src/loops.rs:3  [score]  pattern".
+    // A degraded row (no line) looks like "  src/loops.rs  [score]  pattern".
+    // We verify the row contains the colon-number suffix (AD-397-4).
     let mut out: Vec<u8> = Vec::new();
     super::run_ast_standalone(
         "rust-nested-loop",
@@ -2991,12 +2999,80 @@ fn run_ast_standalone_recover_line_none_still_emits_ac8_374() {
 
     let text = String::from_utf8(out).unwrap();
 
-    // src/loops.rs must appear in output (it genuinely matches rust-nested-loop).
+    // loops.rs matches rust-nested-loop — must appear in output.
     assert!(
         text.contains("loops.rs"),
-        "AC8: loops.rs must appear in output regardless of whether recover_line succeeds; \
-         recover_line None MUST NOT drop the file. Got:\n{text}"
+        "AC3/AC8: loops.rs must appear in output; got:\n{text}"
     );
+
+    // AC3 (#397): the row MUST have a `:line` suffix — "loops.rs:" followed by a digit.
+    // A pre-#397 implementation would emit "loops.rs  [score]" (no colon) when
+    // recover_line returned None, failing this assertion.
+    assert!(
+        text.contains("loops.rs:"),
+        "AC3 (#397, AD-397-4): real-node result must carry ':line' (format 'path:N  [score]'); \
+         got text without 'loops.rs:' — indicates the anchor was not attached.\n\
+         Got:\n{text}"
+    );
+}
+
+/// AC4 (#397): JSON output for a real-node pattern has integer `line` >= 1 on
+/// every result object. No result object may omit the `line` key (AD-397-4).
+///
+/// PF-007 discriminating: a pre-#397 implementation emits results without `line`
+/// when recover_line returns None. This assertion fails for those results.
+#[test]
+fn run_ast_standalone_json_results_all_carry_integer_line_ac4_397() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_rust();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let mut out: Vec<u8> = Vec::new();
+    let exit = super::run_ast_standalone(
+        "rust-nested-loop",
+        20,
+        true, // JSON
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(exit, std::process::ExitCode::SUCCESS);
+
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap()).unwrap();
+    let results = v["results"].as_array().unwrap();
+
+    // At least one result must exist (loops.rs matches rust-nested-loop).
+    assert!(
+        !results.is_empty(),
+        "AC4: must have at least one result for rust-nested-loop; got 0"
+    );
+
+    for (i, r) in results.iter().enumerate() {
+        let line = r.get("line");
+        assert!(
+            line.is_some(),
+            "AC4 (#397, AD-397-4): result[{i}] ({:?}) must have a 'line' key; \
+             got no 'line' key — indicates anchor was not attached by find_first_strict_match",
+            r["path"]
+        );
+        let line_val = line.unwrap().as_u64().unwrap_or(0);
+        assert!(
+            line_val >= 1,
+            "AC4 (#397): result[{i}] ({:?}) line must be >= 1 (1-indexed); got: {line_val}",
+            r["path"]
+        );
+    }
 }
 
 /// AC9 (#374): Single-n-gram identity — `rust-unsafe-block` (a pattern with a single
@@ -4379,9 +4455,10 @@ fn run_ast_standalone_json_line_matches_ground_truth_for_all_five_ac10_394() {
 /// Each of these 5 assertions FAILS before the fix (`recover_line` returns
 /// `None` for every synthetic pattern pre-#394), proving the new branch.
 ///
-/// NEGATIVE control: a REAL pattern (`rust-nested-loop`) still recovers via
-/// the unchanged `MatchTable` walk on an unrelated fixture — proving the
-/// synthetic branch did not alter real-pattern line recovery.
+/// NEGATIVE control: a REAL pattern (`rust-nested-loop`) routes through
+/// `find_first_strict_match` (#397) — `recover_line` is now synthetic-only
+/// (AD-397-3) and returns `None` for real-node patterns. The control confirms
+/// the real-node anchor path is unaffected by the synthetic-pattern branch.
 #[test]
 fn recover_line_matches_ground_truth_for_all_five_synthetic_patterns_ac13_394() {
     let project = make_project_with_394_synthetic_patterns();
@@ -4432,9 +4509,10 @@ fn recover_line_matches_ground_truth_for_all_five_synthetic_patterns_ac13_394() 
         "AC13 (#394) / AC-F3: recover_line must be deterministic for synthetic patterns"
     );
 
-    // NEGATIVE control: a REAL pattern's line recovery is unchanged — uses the
-    // existing #374 nested-loop fixture convention (rust-nested-loop always
-    // has SOME resolvable trigram in Rust).
+    // NEGATIVE control: a REAL pattern routes through find_first_strict_match
+    // (#397). recover_line is now synthetic-only (AD-397-3) and returns None
+    // immediately for rust-nested-loop; the real-node anchor comes from
+    // find_first_strict_match instead.
     let real_dir = tempfile::tempdir().unwrap();
     let real_path = real_dir.path().join("loops.rs");
     fs::write(
@@ -4444,11 +4522,12 @@ fn recover_line_matches_ground_truth_for_all_five_synthetic_patterns_ac13_394() 
     )
     .unwrap();
     let real_query = rskim_search::parse_ast_query("rust-nested-loop").unwrap();
-    let real_result = rskim_search::recover_line(&real_path, &real_query, None);
+    let real_result = rskim_search::find_first_strict_match(&real_path, &real_query, None);
     assert!(
         real_result.is_some(),
-        "AC13 (#394) control: a REAL pattern (rust-nested-loop) must still \
-         recover a line via the unchanged MatchTable walk; got None"
+        "AC13 (#394) control: a REAL pattern (rust-nested-loop) must return Some \
+         from find_first_strict_match for a file with nested loops (#397 anchor path); \
+         got None"
     );
 }
 

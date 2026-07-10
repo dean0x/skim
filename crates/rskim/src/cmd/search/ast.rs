@@ -7,8 +7,9 @@
 //! - Resolve a `--ast` pattern to scored `Vec<(FileId, f64)>` for compound RRF ranking (#198).
 //! - Standalone AST query dispatch (`--ast` only, no text query).
 //! - Output formatters: text and JSON for AST-only results (delegates to `rskim_search::compound::output`).
-//! - Line-span re-parse: after limit is applied, re-parse each matched file to
-//!   recover a representative line number and snippet (AC-F1, #201).
+//! - Line anchor: for real-node patterns, gate + anchor run atomically before
+//!   truncation (AD-397-4, #397); for synthetic patterns, anchor is recovered
+//!   post-truncation via `recover_line` (AC-F1, #201).
 //!
 //! # Relationship to temporal.rs
 //!
@@ -29,8 +30,24 @@ use rskim_search::{all_patterns, is_synthetic_id, parse_ast_query};
 // #201: enriched row type + formatters from rskim-search.
 // pub(super) re-exports so test module (ast_tests.rs) can call them as super::.
 pub(super) use rskim_search::AstResult;
+use rskim_search::{find_first_strict_match, pattern_occurs_in_file, recover_line};
 pub(super) use rskim_search::{format_ast_json, format_ast_text};
-use rskim_search::{pattern_occurs_in_file, recover_line};
+
+// ============================================================================
+// Local type aliases
+// ============================================================================
+
+/// Anchor returned by `find_first_strict_match` for a real-node AST match:
+/// `(line_number, byte_range_in_file, snippet_text)`.
+type AnchorHit = (u32, std::ops::Range<usize>, String);
+
+/// One entry in the verified candidate pool before FileId→path resolution:
+/// `(file_id, score, optional_anchor)`.
+///
+/// `None` anchor ⇒ synthetic-marker match (anchor computed post-truncation by
+/// `recover_line`).  `Some` anchor ⇒ real-node match with cached first-match
+/// position (AD-397-4).
+type VerifiedEntry = (FileId, f64, Option<AnchorHit>);
 
 use super::types::TemporalSort;
 
@@ -169,16 +186,29 @@ pub(super) fn resolve_ast_scored(
 /// 4. truncate to `limit` — AFTER the re-sort (AC-F4), so the top-`limit` by
 ///    temporal score survive rather than the top-`limit` by raw order.
 ///
-/// # Line-span re-parse (#201)
+/// # Gate + line-anchor (#397 — real-node patterns)
 ///
-/// AFTER truncation, each surviving file is re-parsed to recover a representative
-/// line number. Re-parse uses `rskim_search::recover_line` (see
-/// `compound/reparse.rs`) which:
-/// - Is bounded to at most `limit` files (AC-API3) — re-parse runs post-truncation.
-/// - Fails-soft to `None` on grammar miss, size guard, mtime mismatch (AC-F2).
-/// - Returns a 1-indexed line; never 0 (AC-F4 NEGATIVE).
+/// For **real-node patterns**, the verify gate and the line anchor are now ONE
+/// atomic operation via `rskim_search::find_first_strict_match` (AD-397-1/4):
 ///
-/// The snippet is extracted by reading the specific line from the file content.
+/// - Gate + anchor: `find_first_strict_match` re-parses the file with the
+///   strict `node.parent()` ancestor walk (AD-374-6) and returns
+///   `Some((line, byte_range, snippet))` on the FIRST matching node, or `None`
+///   (file dropped — not emitted line-less). This eliminates the TOCTOU race
+///   between the gate parse and a separate snippet read.
+/// - Bounded: the gate runs over the candidate pool (pre-truncation, AD-374-3).
+///   The anchor is cached in the pool tuple and survives temporal sort/truncation.
+/// - Every emitted row ALWAYS carries `:line` (AD-397-4 supersedes AD-374-7):
+///   `None` from `find_first_strict_match` means "gate failed" → file dropped,
+///   never emitted as a bare path-only row.
+///
+/// # Line-span recovery (#394 — synthetic patterns)
+///
+/// For **synthetic-marker patterns** (god-function, deep-nesting, empty-function,
+/// empty-catch, excessive-params), the two-function flow is preserved unchanged:
+/// `pattern_occurs_in_file` (AND-semantics gate, early-exit #419 fix) runs at
+/// gate time, and `recover_line` (extraction-reuse recovery, AD-394-5) runs
+/// post-truncation. The anchor is bounded to at most `limit` files (AC-API3).
 ///
 /// # Errors
 ///
@@ -217,6 +247,7 @@ pub(super) fn run_ast_standalone(
     // Hoist sorted_paths() once — reused for the blast-radius membership check
     // (fid.0 as usize), the verify gate, and the path-resolution step below.
     let sorted = manifest.sorted_paths();
+    let is_synthetic = ast_query_is_synthetic(&query);
 
     // AD-374-3 / AD-355-2: verify-then-truncate-LAST with a candidate pool.
     //
@@ -256,7 +287,7 @@ pub(super) fn run_ast_standalone(
     // This is the companion to the `synthetic_key_present` early-exit fix in
     // `compound/reparse.rs` — together they reduce measured `--ast deep-nesting`
     // latency from ~6.9s to within AC11's <500ms target.
-    let ast_pool = if ast_query_is_synthetic(&query) {
+    let ast_pool = if is_synthetic {
         limit.max(1)
     } else {
         super::query::candidate_pool(limit, super::query::LEXICAL_CANDIDATE_POOL_K)
@@ -276,46 +307,34 @@ pub(super) fn run_ast_standalone(
         .take(window)
         .collect();
 
-    // AD-374-2: Structural verify gate — drop candidates that do NOT contain the
-    // pattern's declared ancestor relationship in their real CST.
+    // AD-374-2 / AD-397-4: Structural verify gate + anchor — combined for real-node,
+    // separate for synthetic.
     //
-    // `pattern_occurs_in_file` re-parses each file and confirms the ancestor chain
-    // (parent→child for bigrams; grandparent→parent→child for trigrams) via real
-    // `node.parent()` calls — NOT the pre-order-predecessor approximation used by
-    // `recover_line`. This is the correctness backstop that eliminates unrelated-
-    // subtree false positives that AND-intersect alone would keep.
+    // REAL-NODE patterns: `find_first_strict_match` (AD-397-1) replaces the
+    // separate `pattern_occurs_in_file` + `recover_line` calls. A single strict
+    // `node.parent()` ancestor walk (AD-374-6) both gates the file AND returns
+    // the first-match `(line, byte_range, snippet)` atomically (no TOCTOU).
+    // `None` → file dropped; `Some(anchor)` → file kept + anchor cached in the
+    // pool entry, surviving temporal sort/truncation. Every emitted real-node
+    // row ALWAYS carries `:line` (AD-397-4 supersedes AD-374-7).
     //
-    // AD-394-4 (#394): the 5 synthetic-marker patterns (god-function,
-    // deep-nesting, empty-function, empty-catch, excessive-params) now pass
-    // through this SAME `pattern_occurs_in_file` call via an internal
-    // extraction-reuse branch (`compound::reparse`, AD-394-1/AD-394-2) — before
-    // #394 they always failed the gate (a synthetic ID can never appear in a
-    // real `node.parent()` chain), so standalone `--ast <synthetic-pattern>`
-    // returned zero results for all 5 while the compound path (which skips this
-    // gate, see below) returned matches — a standalone/compound contradiction
-    // (avoids PF-006). This call site is otherwise UNCHANGED; the routing is
-    // internal to `pattern_occurs_in_file`.
-    //
-    // AD-374-5: Non-tree-sitter files (JSON/TOML/YAML, node_count=0) return false
-    // from `pattern_occurs_in_file` and are dropped here.
-    //
-    // AD-374-4: Dropping candidates that fail the gate is a RELEVANCE filter, not
-    // a #317 output cap. No `output::elision_marker` is required (mirrors AD-355-4).
+    // SYNTHETIC patterns: unchanged two-function flow (AD-394-1/AD-394-2).
+    // `pattern_occurs_in_file` uses `synthetic_key_present` with AND-semantics
+    // and early-exit (#419). `recover_line` runs post-truncation (≤ limit files).
     //
     // AC-10 / AD-373 dependency note: FileId → path resolution via `sorted.get(fid.0)`
     // is sound only because #373 aligned FileId assignment order with BTreeMap
-    // resolution order. The gate assumes this alignment; without it the wrong file
-    // would be re-parsed (ADR-006 read-side desync).
-    let verified_pool: Vec<_> = pooled
+    // resolution order. Without this alignment the wrong file would be re-parsed.
+    //
+    // AD-374-5: Non-tree-sitter files (JSON/TOML/YAML) return None/false and
+    // are dropped here. AD-374-4: dropping is a relevance filter, not a #317
+    // output cap; no `output::elision_marker` is required.
+    let verified_pool: Vec<VerifiedEntry> = pooled
         .into_iter()
-        .filter(|(fid, _)| {
+        .filter_map(|(fid, score)| {
             let idx = fid.0 as usize;
-            match sorted.get(idx) {
-                Some(rel_path) => {
-                    let abs_path = root.join(rel_path);
-                    let stored_mtime = manifest.lookup(rel_path).and_then(|e| e.mtime);
-                    pattern_occurs_in_file(&abs_path, &query, stored_mtime)
-                }
+            let rel_path = match sorted.get(idx) {
+                Some(p) => p,
                 None => {
                     // Out-of-range FileId — warn and drop (ADR-006 counterpart).
                     eprintln!(
@@ -324,25 +343,57 @@ pub(super) fn run_ast_standalone(
                          run `skim search --rebuild`",
                         sorted.len()
                     );
-                    false
+                    return None;
                 }
+            };
+            let abs_path = root.join(rel_path);
+            let stored_mtime = manifest.lookup(rel_path).and_then(|e| e.mtime);
+
+            if is_synthetic {
+                // Synthetic: two-function flow (AND-semantics gate, AC-10/#419 preserved).
+                // `then_some` (eager) not `then` (lazy): the tuple is a trivial
+                // value, so a closure is unnecessary (clippy::unnecessary_lazy_evaluations).
+                pattern_occurs_in_file(&abs_path, &query, stored_mtime)
+                    .then_some((fid, score, None))
+            } else {
+                // Real-node: find_first_strict_match (gate + anchor in one pass).
+                find_first_strict_match(&abs_path, &query, stored_mtime)
+                    .map(|anchor| (fid, score, Some(anchor)))
             }
         })
         .collect();
 
-    // Resolve FileIds → repo-relative paths from the verified pool.
+    // Resolve FileIds → repo-relative paths. For real-node patterns, populate
+    // line/snippet from the cached anchor (no post-truncation re-parse needed).
     let mut resolved: Vec<AstResult> = Vec::with_capacity(verified_pool.len());
-    for (fid, score) in &verified_pool {
+    for (fid, score, anchor) in &verified_pool {
         let idx = fid.0 as usize;
         // Safety: all verified_pool entries have valid sorted.get(idx) — the
         // gate above already dropped out-of-range FileIds. Use get() with a
         // defensive fallback to avoid panicking on an edge case.
         if let Some(rel_path) = sorted.get(idx) {
+            let (line, snippet) = if let Some((ln, byte_range, text)) = anchor {
+                // Real-node: anchor from find_first_strict_match (AD-397-4).
+                // Suppress snippet when byte_range is empty (defensive; matched
+                // real nodes always have non-empty ranges, but zero-width
+                // MISSING/ERROR nodes are theoretically possible).
+                (
+                    Some(*ln),
+                    if byte_range.is_empty() {
+                        None
+                    } else {
+                        Some(text.clone())
+                    },
+                )
+            } else {
+                // Synthetic: line/snippet populated post-truncation by recover_line.
+                (None, None)
+            };
             resolved.push(AstResult::ast_only(
                 rel_path.to_string(),
                 *score,
-                None,
-                None,
+                line,
+                snippet,
             ));
         }
     }
@@ -357,32 +408,24 @@ pub(super) fn run_ast_standalone(
     // the only truncation (min(limit, verified_count) results).
     resolved.truncate(limit);
 
-    // Re-parse the final (≤ `limit`) set to recover a representative line + snippet.
-    // Re-parse runs strictly AFTER truncation (AC-API3, AC-8 #374, #201: at most
-    // `limit` files); each per-file recover_line call is bounded by the 100 KiB
-    // size guard.
+    // AD-397-4: Real-node patterns: line/snippet already set from the
+    // find_first_strict_match anchor (gate + anchor in one pass, cached in the
+    // pool entry through temporal sort/truncation). No post-truncation re-parse
+    // is needed.
     //
-    // AD-374-7: recover_line is LINE-RECOVERY ONLY. Emit/drop decisions are made
-    // by the verify gate above. A file that passes the gate but whose representative
-    // line cannot be recovered still emits as a degraded row (path present, no :line
-    // or snippet). recover_line returning None MUST NOT drop a gate-passed file.
-    //
-    // Updated for #394 (OD-394-1, AD-394-5): `recover_line` is now
-    // synthetic-aware, so a gate-passed synthetic-pattern row (god-function,
-    // deep-nesting, empty-function, empty-catch, excessive-params) recovers a
-    // REAL `:line`/snippet here too, instead of degrading to a path-only row.
-    // This call site itself is unchanged — the synthetic branch is internal to
-    // `recover_line`.
-    for r in &mut resolved {
-        let abs_path = root.join(&r.path);
-        // Recover the stored mtime from the manifest for the stale guard.
-        let stored_mtime = manifest.lookup(&r.path).and_then(|e| e.mtime);
-        if let Some((ln, byte_range)) = recover_line(&abs_path, &query, stored_mtime) {
-            // Extract the single representative line as snippet text; suppress when
-            // the byte range is empty (parse artifact).
-            let snip = read_line_at(&abs_path, ln, rskim_search::MAX_REPARSE_FILE_BYTES);
-            r.line = Some(ln);
-            r.snippet = if byte_range.is_empty() { None } else { snip };
+    // Synthetic patterns (#394, AD-394-5): recover_line runs post-truncation
+    // (≤ limit files, AC-API3), unchanged from #394.
+    if is_synthetic {
+        for r in &mut resolved {
+            let abs_path = root.join(&r.path);
+            let stored_mtime = manifest.lookup(&r.path).and_then(|e| e.mtime);
+            if let Some((ln, byte_range)) = recover_line(&abs_path, &query, stored_mtime) {
+                // Extract the single representative line as snippet text; suppress
+                // when the byte range is empty (synthetic recovery artifact).
+                let snip = read_line_at(&abs_path, ln, rskim_search::MAX_REPARSE_FILE_BYTES);
+                r.line = Some(ln);
+                r.snippet = if byte_range.is_empty() { None } else { snip };
+            }
         }
     }
 
@@ -438,22 +481,30 @@ fn read_line_at(abs_path: &Path, line_1indexed: u32, max_bytes: u64) -> Option<S
 /// a membership check of what the index already indexed), so a K=5 multiplier
 /// and a 100-file floor are unnecessary overhead for them.
 ///
-/// # Design note — intentionally bigrams-only (pool sizing, not routing)
+/// # Design note — intentionally bigrams-only
 ///
 /// This function inspects `resolved_bigrams()` only. It does NOT delegate to
 /// `compound::reparse::query_contains_synthetic_id` (which also checks trigrams
-/// and handles the Containment variant). This is safe because:
+/// and handles the Containment variant). Its correctness rests on the predicate
+/// being EXACT for every shipping pattern — NOT on either misclassification
+/// direction being harmless:
 ///
-/// - Its sole use is pool sizing, not routing. A false 'not synthetic' causes
-///   over-provisioning (always correct); a false 'synthetic' under-provisions
-///   (still correct — the verify gate is the source of truth for correctness).
-/// - All 5 current synthetic patterns are single-bigram/zero-trigram (OD-394-2),
-///   so this predicate and `query_contains_synthetic_id` agree for every live
-///   pattern.
+/// - It gates ROUTING as well as pool sizing (#397): real-node patterns route to
+///   `find_first_strict_match`; synthetic patterns route to `pattern_occurs_in_file`
+///   plus the post-truncation `recover_line`. In the routing use a misclassification
+///   is NOT harmless — a genuinely-synthetic query classified 'not synthetic' would
+///   route to `find_first_strict_match`, which returns `None` for synthetic IDs, and
+///   the file would be DROPPED (recall loss, an ADR-007 violation).
+/// - It is exact for every live pattern: all 24 real-node patterns carry no
+///   synthetic ID in any n-gram (→ `false`), and all 5 synthetic patterns are
+///   single-bigram/zero-trigram (OD-394-2) (→ `true`). So it agrees with
+///   `query_contains_synthetic_id` for every shipping pattern.
 ///
-/// If a future synthetic-trigram pattern is added, this function conservatively
-/// classifies it as 'not synthetic', causing over-provisioning. That is the
-/// correct failure mode for a pool-sizing heuristic.
+/// A future synthetic-TRIGRAM pattern would defeat this bigrams-only check
+/// (misclassified 'not synthetic'). Such a pattern is unsupported today and is
+/// already rejected by the production guard in `pattern_occurs_in_file`'s
+/// synthetic branch; adding one requires updating this predicate together with
+/// that guard.
 fn ast_query_is_synthetic(query: &AstQuery) -> bool {
     match query {
         AstQuery::Pattern(p) => p.resolved_bigrams().iter().any(|bg| {
