@@ -4,11 +4,25 @@
 //! Tests use inline source (tempfile fixtures).
 //!
 //! AC1/AC9 coverage: `find_first_strict_match` returns Some with line ≥ 1 for a
-//! genuine match (AC-F2/AC-F3 ground truth).
+//! genuine match (AC-F2/AC-F3 ground truth). GROUND TRUTH unit:
+//! `find_first_strict_match_skips_wrong_parent_and_anchors_correct_parent_ac1_ac9`
+//! asserts the exact expected line for a two-function fixture where the FIRST
+//! pre-order call_expression has the wrong parent (let_declaration) and the SECOND
+//! has the correct parent (block) — the exact #397 defect scenario.
 //! AC2 coverage: bigram-with-anonymous-token (unsafe_block > block) — the old
 //! MatchTable pre-order predecessor approximation broke on the `unsafe` keyword
-//! between parent and child; strict `node.parent()` walk fixes it.
+//! between parent and child; strict `node.parent()` walk fixes it. Both
+//! `unsafe_block` and `block` are confirmed vocabulary members so `Some` is
+//! asserted unconditionally (no `if let` guard — the pre-fix None IS the defect).
+//! AC5 coverage: JS `function_declaration > statement_block > call_expression`
+//! and `... > return_statement` on fixtures where the nodes are NOT direct
+//! block children → `None`. Positive control ensures the gate is non-vacuous.
+//! AC6 variant-B coverage: file with tree-sitter ERROR region + clean strict
+//! match elsewhere → `Some` anchored in the clean section (not the error region).
 //! AC7 coverage: determinism — same file + same pattern → same result on 3 calls.
+//! Uses `rust-nested-loop` on a nested-loop fixture that always returns `Some`
+//! (the pre-fix test used `try-catch` on a Rust file, which always returned
+//! `None` because TypeScript kinds are absent from Rust CSTs — vacuous, PF-007).
 //! AC8 coverage: degraded inputs (missing, non-UTF8, oversized, JSON, stale mtime)
 //! → `None` from `find_first_strict_match`.
 //! AC14 coverage: `find_first_strict_match` returns line ≥ 1 (never 0).
@@ -118,6 +132,75 @@ fn find_first_strict_match_rust_nested_loop_returns_none_for_no_loop() {
     );
 }
 
+/// AC1/AC9 GROUND TRUTH (#397): the exact defect — wrong-parent node is skipped,
+/// correct-parent node is anchored.
+///
+/// Two-function fixture (plan §Test Plan AC1/AC9):
+/// - `fn a()` has `let x = compute();`: `call_expression` parent = `let_declaration`
+///   (WRONG for `block > call_expression`).
+/// - `fn b()` has `finish(y)` as a tail expression: `call_expression` parent =
+///   `block`, grandparent = `function_item` (CORRECT).
+///
+/// Query: `function_item > block > call_expression` (trigram; all three kinds
+/// confirmed in vocabulary via ast_weights.rs).
+///
+/// AC9 NEGATIVE: anchor MUST NOT land on `compute()` at line 1 (wrong parent).
+/// AC1 POSITIVE: anchor MUST land on `finish(y)` at line 2 (correct parent).
+///
+/// Pre-fix, the old MatchTable pre-order-predecessor approximation would anchor
+/// on `compute()` (first in pre-order, approximate parent check passed).
+/// The strict `node.parent()` walk (AD-397-2) skips it because `compute()`'s
+/// real parent is `let_declaration`, not `block`.
+///
+/// PF-007 discriminating: exact expected line (2) asserted, not just `is_some()`.
+#[test]
+fn find_first_strict_match_skips_wrong_parent_and_anchors_correct_parent_ac1_ac9() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Line 1: fn a() — `compute()` has parent let_declaration (WRONG, must be skipped).
+    // Line 2: fn b() — `finish(y)` is a tail expression (no `;`), parent = block (CORRECT).
+    let content = "fn a() { let x = compute(); }\nfn b() { finish(y) }\n";
+    let path = write_fixture(&dir, "two_fns.rs", content);
+
+    // Trigram: call_expression whose parent = block AND grandparent = function_item.
+    let query = parse_ast_query("function_item > block > call_expression").unwrap();
+
+    let result = find_first_strict_match(&path, &query, None);
+
+    // AC1 POSITIVE: must return Some — fn b() has a tail call_expression whose
+    // real parent is block and grandparent is function_item.
+    assert!(
+        result.is_some(),
+        "AC1/AC9: must return Some — fn b()'s tail call 'finish(y)' has real parent \
+         'block' and grandparent 'function_item'; got None"
+    );
+    let (line, byte_range, snippet) = result.unwrap();
+
+    // AC1 POSITIVE — exact line (PF-007): anchor must be line 2 (fn b / finish(y)).
+    // If this returns line 1, the wrong-parent bug regressed.
+    assert_eq!(
+        line, 2,
+        "AC1/AC9: anchor must be line 2 (fn b's tail call 'finish(y)'), \
+         NOT line 1 (fn a's 'compute()' whose real parent is let_declaration). \
+         Pre-fix MatchTable approximation returned the wrong line; got: {line}"
+    );
+
+    // AC9 NEGATIVE: snippet must contain 'finish', not 'compute'.
+    assert!(
+        snippet.contains("finish"),
+        "AC1/AC9: snippet must contain 'finish' (fn b's tail call); got: {snippet:?}"
+    );
+    assert!(
+        !snippet.contains("compute"),
+        "AC9 NEGATIVE: snippet must NOT contain 'compute' \
+         (fn a's let-binding call has the wrong parent — must be skipped); got: {snippet:?}"
+    );
+    assert!(
+        !byte_range.is_empty(),
+        "AC1: byte_range must not be empty for the matched call_expression"
+    );
+}
+
 // ============================================================================
 // AC2 (#397): bigram with anonymous-token parent
 // ============================================================================
@@ -133,42 +216,70 @@ fn find_first_strict_match_rust_nested_loop_returns_none_for_no_loop() {
 /// walk (AD-397-2) is immune to this because it uses tree-sitter's real parent
 /// pointer, which is always `unsafe_block` regardless of intervening tokens.
 ///
-/// PF-007 discriminating: a negative twin (safe block, no `unsafe`) must return
-/// `None` for the same query.
+/// Both `unsafe_block` and `block` are confirmed members of the shared AST
+/// vocabulary (ast_weights.rs), so `Some` is asserted UNCONDITIONALLY — the
+/// `if let Some` guard has been removed. A `None` return is the exact pre-#397
+/// MatchTable failure mode; guarding behind `if let` would let a regression
+/// pass silently (PF-007).
+///
+/// PF-007 discriminating: positive asserts `Some((line == 2, non-empty range))`;
+/// negative asserts `None` unconditionally.
 #[test]
 fn find_first_strict_match_unsafe_block_anchors_correctly_ac2() {
     let dir = tempfile::tempdir().unwrap();
 
     // Positive: file with an unsafe block.
+    //
+    // Content layout (1-indexed):
+    //   Line 1: fn f() {
+    //   Line 2:     unsafe {        ← `block` node opens here (row 1 → line 2)
+    //   Line 3:         *std::ptr::null::<i32>();
+    //   Line 4:     }
+    //   Line 5: }
     let unsafe_content = "fn f() {\n    unsafe {\n        *std::ptr::null::<i32>();\n    }\n}\n";
     let unsafe_path = write_fixture(&dir, "unsafe_code.rs", unsafe_content);
     let query = parse_ast_query("unsafe_block > block").unwrap();
 
+    // Unconditionally assert Some: "unsafe_block" and "block" are confirmed in the
+    // shared vocabulary (ast_weights.rs), so parse_ast_query succeeds and a match
+    // must be found. A None return here is the pre-fix MatchTable failure mode —
+    // the exact defect AC2 exists to prevent (PF-007).
     let result = find_first_strict_match(&unsafe_path, &query, None);
-    // If "unsafe_block" and "block" are in the shared vocabulary, this must return Some.
-    // The key assertion (PF-007): no panic, and if Some then line >= 1.
-    if let Some((line, byte_range, _snippet)) = result {
-        assert!(
-            line >= 1,
-            "AC2: unsafe_block > block anchor line must be >= 1; got: {line}"
-        );
-        assert!(
-            byte_range.end <= unsafe_content.len(),
-            "AC2: byte_range.end must be within file length"
-        );
-    }
-    // We don't unconditionally assert Some because vocab resolution depends on whether
-    // tree-sitter-rust's "unsafe_block" and "block" kinds are in the shared IDF table.
-    // The critical correctness guarantee is no panic + no wrong-line answer.
+    assert!(
+        result.is_some(),
+        "AC2: unsafe_block > block must return Some for a file with an unsafe block \
+         (both kinds confirmed in vocabulary); None is the pre-#397 MatchTable failure \
+         mode — if this fails, the anonymous-token bug regressed"
+    );
+    let (line, byte_range, _snippet) = result.unwrap();
 
-    // Negative twin: safe block only (no unsafe keyword) → None.
+    // The `block` child starts at `{` on the same line as the `unsafe` keyword
+    // (row 1, 1-indexed line 2: "    unsafe {").
+    assert_eq!(
+        line, 2,
+        "AC2: anchor must be line 2 (the `block` child's opening brace in `unsafe {{ ... }}`); \
+         got {line}"
+    );
+    assert!(
+        !byte_range.is_empty(),
+        "AC2: byte_range must not be empty for the matched `block` node"
+    );
+    assert!(
+        byte_range.end <= unsafe_content.len(),
+        "AC2: byte_range.end ({}) must be within file length ({})",
+        byte_range.end,
+        unsafe_content.len()
+    );
+
+    // Negative twin: safe block only (no unsafe keyword) → unconditionally None.
     let safe_content = "fn g() {\n    let x = 1;\n}\n";
     let safe_path = write_fixture(&dir, "safe_code.rs", safe_content);
     let safe_result = find_first_strict_match(&safe_path, &query, None);
-    // No panic regardless of outcome.
-    if let Some((line, _, _)) = safe_result {
-        assert!(line >= 1, "AC2 negative: if Some, line must be >= 1");
-    }
+    assert!(
+        safe_result.is_none(),
+        "AC2 negative: a file with no unsafe block must return None for \
+         `unsafe_block > block`; got: {safe_result:?}"
+    );
 }
 
 // ============================================================================
@@ -178,19 +289,36 @@ fn find_first_strict_match_unsafe_block_anchors_correctly_ac2() {
 /// AC7: `find_first_strict_match` is deterministic — same file + same pattern
 /// → same `(line, byte_range, snippet)` on 3 consecutive calls.
 ///
-/// PF-007 discriminating: a non-deterministic implementation (e.g. HashSet
-/// iteration order) would return different values across calls.
+/// Uses `rust-nested-loop` on a nested-loop fixture that ALWAYS returns `Some`.
+/// The pre-fix test used `try-catch` on a Rust file, which ALWAYS returned `None`
+/// because `try-catch` resolves to TypeScript kinds (`try_statement`,
+/// `catch_clause`) that are absent from Rust CSTs. `None == None` is vacuous —
+/// a pass-through returning `None` on every call was indistinguishable from a
+/// correct implementation (PF-007).
+///
+/// PF-007 discriminating: `r1.is_some()` is asserted before the equality checks,
+/// so a non-deterministic implementation returning different `Some` values on
+/// each call fails `r1 == r2`; an always-`None` stub fails `r1.is_some()`.
 #[test]
 fn find_first_strict_match_same_result_on_repeated_calls_ac7() {
     let dir = tempfile::tempdir().unwrap();
-    let content = "fn example() {\n    match std::io::stdin().read_line(&mut String::new()) {\n        Ok(_) => {}\n        Err(e) => eprintln!(\"{e}\"),\n    }\n}\n";
-    let path = write_fixture(&dir, "error.rs", content);
-    let query = parse_ast_query("try-catch").unwrap();
+    // Nested-loop fixture: rust-nested-loop (block > expression_statement >
+    // for_expression) will always return Some for this content.
+    let content =
+        "fn outer() {\n    for i in 0..3 {\n        for j in 0..3 { let _ = i + j; }\n    }\n}\n";
+    let path = write_fixture(&dir, "nested.rs", content);
+    let query = parse_ast_query("rust-nested-loop").unwrap();
 
     let r1 = find_first_strict_match(&path, &query, None);
     let r2 = find_first_strict_match(&path, &query, None);
     let r3 = find_first_strict_match(&path, &query, None);
 
+    // Guard: if r1 is None the equality checks below are vacuous (PF-007).
+    assert!(
+        r1.is_some(),
+        "AC7 guard: rust-nested-loop must return Some for a nested-loop fixture \
+         (pre-condition for the determinism check)"
+    );
     assert_eq!(
         r1, r2,
         "AC7: find_first_strict_match must be deterministic (run 1 == run 2)"
@@ -198,6 +326,161 @@ fn find_first_strict_match_same_result_on_repeated_calls_ac7() {
     assert_eq!(
         r2, r3,
         "AC7: find_first_strict_match must be deterministic (run 2 == run 3)"
+    );
+}
+
+// ============================================================================
+// AC5 (#397): Strict gate preserved — indirect containment returns None
+// ============================================================================
+
+/// AC5 (#397): `find_first_strict_match` returns `None` for JS containment
+/// queries where the queried node is NOT a direct child of the surrounding block.
+///
+/// Two negative cases:
+/// 1. `function_declaration > statement_block > call_expression` — JS wraps every
+///    bare call in `expression_statement`, so `call_expression`'s real parent is
+///    `expression_statement`, not `statement_block`. Direct-child check fails.
+/// 2. `function_declaration > statement_block > return_statement` with the return
+///    nested inside an `if` body — the `return_statement`'s real parent is the
+///    if body's `statement_block` and grandparent is `if_statement`, not
+///    `function_declaration`. Chain check fails.
+///
+/// Positive control (PF-007): the same return-statement query returns `Some` for
+/// a function with a DIRECT `return` (parent = function body's `statement_block`,
+/// grandparent = `function_declaration`). This proves the gate discriminates
+/// rather than being an always-None stub.
+///
+/// This guards AD-374-6: the anchor path must never re-introduce an approximate
+/// match (indirect containment) that the gate forbids.
+#[test]
+fn find_first_strict_match_returns_none_for_js_indirect_containment_ac5() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // JS fixture: call wrapped in expression_statement (lines 1-6);
+    // return nested inside if body (not a direct child of the function's block).
+    //
+    //   Line 1: function processData(x) {
+    //   Line 2:     bar(x);          ← call_expression parent = expression_statement
+    //   Line 3:     if (x > 0) {
+    //   Line 4:         return x;    ← return_statement grandparent = if_statement
+    //   Line 5:     }
+    //   Line 6: }
+    let wrapped_content =
+        "function processData(x) {\n    bar(x);\n    if (x > 0) {\n        return x;\n    }\n}\n";
+    let wrapped_path = write_fixture(&dir, "wrapped.js", wrapped_content);
+
+    // AC5 NEGATIVE — call_expression: real parent is expression_statement (not
+    // statement_block), so `function_declaration > statement_block > call_expression`
+    // must return None. A loose approximate gate would return Some here.
+    let call_query =
+        parse_ast_query("function_declaration > statement_block > call_expression").unwrap();
+    let call_result = find_first_strict_match(&wrapped_path, &call_query, None);
+    assert!(
+        call_result.is_none(),
+        "AC5 (call): `function_declaration > statement_block > call_expression` must \
+         return None for JS — call_expression is wrapped in expression_statement, not a \
+         direct block child; strict gate must reject this indirect containment; \
+         got: {call_result:?}"
+    );
+
+    // AC5 NEGATIVE — return_statement: return is inside an if body; grandparent =
+    // if_statement, not function_declaration. Must return None.
+    let ret_query =
+        parse_ast_query("function_declaration > statement_block > return_statement").unwrap();
+    let nested_ret_result = find_first_strict_match(&wrapped_path, &ret_query, None);
+    assert!(
+        nested_ret_result.is_none(),
+        "AC5 (return, nested): `function_declaration > statement_block > return_statement` \
+         must return None when return is inside an if body — real grandparent is \
+         if_statement, not function_declaration; got: {nested_ret_result:?}"
+    );
+
+    // POSITIVE CONTROL (PF-007): same return query returns Some for a direct return.
+    // `return 1;` is a direct child of the function body's statement_block.
+    //   function_declaration → statement_block → return_statement  (direct chain ✓)
+    let direct_content = "function foo() {\n    return 1;\n}\n";
+    let direct_path = write_fixture(&dir, "direct.js", direct_content);
+    let direct_result = find_first_strict_match(&direct_path, &ret_query, None);
+    assert!(
+        direct_result.is_some(),
+        "AC5 positive control: `function_declaration > statement_block > return_statement` \
+         must return Some for a function with a direct return statement; \
+         got None — gate must not be an always-None stub"
+    );
+    if let Some((line, _, _)) = direct_result {
+        assert!(
+            line >= 1,
+            "AC5 positive control: returned line must be >= 1 (1-indexed); got {line}"
+        );
+    }
+}
+
+// ============================================================================
+// AC6 variant-B (#397): ERROR region present — clean match still returned
+// ============================================================================
+
+/// AC6 variant-B (#397): `find_first_strict_match` returns `Some` anchored at
+/// the CLEAN strict match in a file that also contains a tree-sitter ERROR
+/// region — ERROR-ancestor nodes are skipped (`vocab_lookup("ERROR") → None`),
+/// and the clean structural match elsewhere is returned.
+///
+/// Fixture: two functions.
+/// `fn bad()` contains `@@@@;` — invalid Rust syntax that tree-sitter parses as
+/// an ERROR node inside the function body. No `for_expression` is present in
+/// `fn bad()`, so even full error recovery cannot produce a `rust-nested-loop`
+/// match there.
+/// `fn good()` is syntactically valid with a nested for-loop.
+///
+/// Expected: `Some` with `line > 1` (anchored in `fn good()`, NOT in `fn bad()`
+/// at line 1).
+///
+/// PF-007 discriminating:
+/// - `is_some()` fails if ERROR nodes prevent recovery of `fn good()`.
+/// - `line > 1` fails if an ERROR-region node is incorrectly anchored.
+/// - `snippet.contains("for")` fails if the anchor is not a for-loop line.
+#[test]
+fn find_first_strict_match_clean_match_found_despite_error_region_ac6b() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Content layout:
+    //   Line 1: fn bad() { @@@@; }   ← ERROR node; no for-loops
+    //   Line 2: fn good() {
+    //   Line 3:     for i in 0..3 {  ← first for_expression in pre-order (MATCH)
+    //   Line 4:         for j in 0..3 { let _ = i; }
+    //   Line 5:     }
+    //   Line 6: }
+    let content = "fn bad() { @@@@; }\nfn good() {\n    for i in 0..3 {\n        for j in 0..3 { let _ = i; }\n    }\n}\n";
+    let path = write_fixture(&dir, "with_error.rs", content);
+    let query = parse_ast_query("rust-nested-loop").unwrap();
+
+    let result = find_first_strict_match(&path, &query, None);
+
+    // AC6 variant-B POSITIVE: a clean match must be found despite the ERROR region.
+    // Tree-sitter error recovery is local; `fn good()` is parsed independently of
+    // `fn bad()`'s error. If this returns None, error recovery failed unexpectedly.
+    assert!(
+        result.is_some(),
+        "AC6 variant-B: must return Some for a file with an ERROR region followed by \
+         a clean nested loop — tree-sitter error recovery is local so fn good() must \
+         be parseable independently of fn bad()'s error; got None"
+    );
+
+    let (line, _byte_range, snippet) = result.unwrap();
+
+    // AC6 variant-B NEGATIVE: anchor must NOT be in fn bad()'s ERROR region (line 1).
+    // If this fails, an ERROR-ancestor node was incorrectly treated as a match.
+    assert!(
+        line > 1,
+        "AC6 variant-B: anchor line must NOT be in the ERROR region \
+         (fn bad is on line 1); got line {line} — strict walk must skip \
+         ERROR-ancestor nodes (vocab_lookup('ERROR') → None)"
+    );
+
+    // AC6 variant-B POSITIVE: anchor must be a for-loop line from fn good().
+    assert!(
+        snippet.contains("for"),
+        "AC6 variant-B: anchor snippet must be a for-loop line from fn good(); \
+         got: {snippet:?}"
     );
 }
 
