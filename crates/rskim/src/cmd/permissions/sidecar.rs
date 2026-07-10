@@ -22,10 +22,6 @@
 //! loud [`SidecarError`] with an actionable message — the sidecar is NEVER
 //! silently ignored.
 
-// All public items in this module are substrate APIs consumed by later
-// subtasks (PermissionsProtocol writers). Suppress dead_code until wired in.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -44,8 +40,6 @@ use crate::cmd::init::MAX_SETTINGS_SIZE;
 ///
 /// All fields are `pub(crate)` so callers can construct and inspect values
 /// directly without accessor boilerplate — this is a plain data struct.
-// Consumers live in later subtasks (PermissionsProtocol writers).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PermissionSidecar {
     /// Schema version (currently `1`). Forward-only migrations bump this.
