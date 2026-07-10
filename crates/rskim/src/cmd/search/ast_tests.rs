@@ -2647,7 +2647,8 @@ fn run_ast_standalone_resolves_nested_dir_corpus_correctly() {
 //            integration: run_ast_standalone_unrelated_subtree_excluded_ac3_374 (this file)
 //   AC4  — true positives survive the gate
 //   AC5  — verify-then-truncate-LAST
-//   AC8  — recover_line stays line-recovery only (degraded row emitted, not dropped)
+//   AC8  — real-node rows always carry :line (AD-397-4); no degraded/path-only state
+//            (#397: find_first_strict_match is gate+anchor; run_ast_standalone_real_node_result_always_carries_line_ac3_ac8_397)
 //   AC9  — single-n-gram identity (no regression)
 //   AC10 — query-time only, no format/rebuild
 //   AC11 — no elision marker when gate produces empty results
@@ -4454,9 +4455,10 @@ fn run_ast_standalone_json_line_matches_ground_truth_for_all_five_ac10_394() {
 /// Each of these 5 assertions FAILS before the fix (`recover_line` returns
 /// `None` for every synthetic pattern pre-#394), proving the new branch.
 ///
-/// NEGATIVE control: a REAL pattern (`rust-nested-loop`) still recovers via
-/// the unchanged `MatchTable` walk on an unrelated fixture — proving the
-/// synthetic branch did not alter real-pattern line recovery.
+/// NEGATIVE control: a REAL pattern (`rust-nested-loop`) routes through
+/// `find_first_strict_match` (#397) — `recover_line` is now synthetic-only
+/// (AD-397-3) and returns `None` for real-node patterns. The control confirms
+/// the real-node anchor path is unaffected by the synthetic-pattern branch.
 #[test]
 fn recover_line_matches_ground_truth_for_all_five_synthetic_patterns_ac13_394() {
     let project = make_project_with_394_synthetic_patterns();
@@ -4507,9 +4509,10 @@ fn recover_line_matches_ground_truth_for_all_five_synthetic_patterns_ac13_394() 
         "AC13 (#394) / AC-F3: recover_line must be deterministic for synthetic patterns"
     );
 
-    // NEGATIVE control: a REAL pattern's line recovery is unchanged — uses the
-    // existing #374 nested-loop fixture convention (rust-nested-loop always
-    // has SOME resolvable trigram in Rust).
+    // NEGATIVE control: a REAL pattern routes through find_first_strict_match
+    // (#397). recover_line is now synthetic-only (AD-397-3) and returns None
+    // immediately for rust-nested-loop; the real-node anchor comes from
+    // find_first_strict_match instead.
     let real_dir = tempfile::tempdir().unwrap();
     let real_path = real_dir.path().join("loops.rs");
     fs::write(
@@ -4519,11 +4522,12 @@ fn recover_line_matches_ground_truth_for_all_five_synthetic_patterns_ac13_394() 
     )
     .unwrap();
     let real_query = rskim_search::parse_ast_query("rust-nested-loop").unwrap();
-    let real_result = rskim_search::recover_line(&real_path, &real_query, None);
+    let real_result = rskim_search::find_first_strict_match(&real_path, &real_query, None);
     assert!(
         real_result.is_some(),
-        "AC13 (#394) control: a REAL pattern (rust-nested-loop) must still \
-         recover a line via the unchanged MatchTable walk; got None"
+        "AC13 (#394) control: a REAL pattern (rust-nested-loop) must return Some \
+         from find_first_strict_match for a file with nested loops (#397 anchor path); \
+         got None"
     );
 }
 
