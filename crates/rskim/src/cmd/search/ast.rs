@@ -351,11 +351,7 @@ pub(super) fn run_ast_standalone(
 
             if is_synthetic {
                 // Synthetic: two-function flow (AND-semantics gate, AC-10/#419 preserved).
-                if pattern_occurs_in_file(&abs_path, &query, stored_mtime) {
-                    Some((fid, score, None))
-                } else {
-                    None
-                }
+                pattern_occurs_in_file(&abs_path, &query, stored_mtime).then(|| (fid, score, None))
             } else {
                 // Real-node: find_first_strict_match (gate + anchor in one pass).
                 find_first_strict_match(&abs_path, &query, stored_mtime)

@@ -182,45 +182,46 @@ pub fn find_first_strict_match(
         let Some(child_id) = vocab_lookup(node.kind()) else {
             continue;
         };
+        let Some(parent_node) = node.parent() else {
+            continue;
+        };
+        let Some(parent_id) = vocab_lookup(parent_node.kind()) else {
+            // Parent kind not in vocab — cannot match any bigram/trigram.
+            continue;
+        };
 
-        if let Some(parent_node) = node.parent() {
-            let Some(parent_id) = vocab_lookup(parent_node.kind()) else {
-                // Parent kind not in vocab — cannot match any bigram/trigram.
+        // Bigram check: (parent_id, child_id).
+        if ancestor_table.bigrams.contains(&(parent_id, child_id)) {
+            return Some(anchor_from_node(
+                node.start_position().row,
+                node.byte_range(),
+                source,
+            ));
+        }
+
+        // Trigram check (GP, P, C): parent.parent() is GP.
+        // AD-374-6 / OD-374-3 (STRICT): require full grandparent→parent→child
+        // ancestor chain via real node.parent(), not an approximation.
+        // `trigram_children` fast-path: only walk to the grandparent when this
+        // node's kind can actually be a trigram child — every trigram's child
+        // is inserted into the set in `build`, so a miss here means no trigram
+        // `(_, _, child_id)` exists and the gp lookup would be wasted work.
+        if ancestor_table.trigram_children.contains(&child_id) {
+            let Some(gp_node) = parent_node.parent() else {
                 continue;
             };
-
-            // Bigram check: (parent_id, child_id).
-            if ancestor_table.bigrams.contains(&(parent_id, child_id)) {
+            let Some(gp_id) = vocab_lookup(gp_node.kind()) else {
+                continue;
+            };
+            if ancestor_table
+                .trigrams
+                .contains(&(gp_id, parent_id, child_id))
+            {
                 return Some(anchor_from_node(
                     node.start_position().row,
                     node.byte_range(),
                     source,
                 ));
-            }
-
-            // Trigram check (GP, P, C): parent.parent() is GP.
-            // AD-374-6 / OD-374-3 (STRICT): require full grandparent→parent→child
-            // ancestor chain via real node.parent(), not an approximation.
-            // `trigram_children` fast-path: only walk to the grandparent when this
-            // node's kind can actually be a trigram child — every trigram's child
-            // is inserted into the set in `build`, so a miss here means no trigram
-            // `(_, _, child_id)` exists and the gp lookup would be wasted work.
-            if ancestor_table.trigram_children.contains(&child_id)
-                && let Some(gp_node) = parent_node.parent()
-            {
-                let Some(gp_id) = vocab_lookup(gp_node.kind()) else {
-                    continue;
-                };
-                if ancestor_table
-                    .trigrams
-                    .contains(&(gp_id, parent_id, child_id))
-                {
-                    return Some(anchor_from_node(
-                        node.start_position().row,
-                        node.byte_range(),
-                        source,
-                    ));
-                }
             }
         }
     }
@@ -538,12 +539,12 @@ pub fn pattern_occurs_in_file(
 /// - `trigram_children`: set of child-ids for any trigram — used as a fast
 ///   pre-check before evaluating the full triple.
 pub(super) struct AncestorMatchTable {
-    pub(super) bigrams: HashSet<(NodeKindId, NodeKindId)>,
-    pub(super) trigrams: HashSet<(NodeKindId, NodeKindId, NodeKindId)>,
+    bigrams: HashSet<(NodeKindId, NodeKindId)>,
+    trigrams: HashSet<(NodeKindId, NodeKindId, NodeKindId)>,
     /// Fast pre-check: set of child-ids that appear in any trigram.
     /// Avoids evaluating the full grandparent chain when `child_id` is not in
     /// any trigram at all.
-    pub(super) trigram_children: HashSet<NodeKindId>,
+    trigram_children: HashSet<NodeKindId>,
 }
 
 impl AncestorMatchTable {
