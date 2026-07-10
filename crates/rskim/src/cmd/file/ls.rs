@@ -32,6 +32,58 @@ use crate::cmd::{ToolRunConfig, run_tool};
 /// preventing unbounded allocation on pathological or adversarial responses.
 const MAX_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
+// ============================================================================
+// ls: arg parsing
+// ============================================================================
+
+/// Parsed ls flags for fidelity-aware dotdir filtering.
+///
+/// One-pass argv scan: captures only the flags that affect dotdir retention.
+/// Everything else is forwarded unchanged to the real `ls` binary.
+#[derive(Default)]
+struct LsArgs {
+    /// `true` when the user passed `-a` / `--all`: GNU semantics include `.` and `..`.
+    ///
+    /// `-A` / `--almost-all` shows dotfiles but NOT `.` / `..` → remains `false`.
+    include_dotdirs: bool,
+}
+
+impl LsArgs {
+    /// Scan argv for dotdir-retention flags.
+    ///
+    /// Semantics (GNU ls compatible):
+    /// - `-a` or `--all` → `include_dotdirs = true`
+    /// - `-A` or `--almost-all` → `include_dotdirs = false`
+    /// - Bundled short flags (`-la`, `-alh`, etc.) — each char processed left-to-right
+    /// - Last-wins across args and within a cluster: `-aA` → `false`; `-Aa` → `true`
+    /// - Scanning stops at `--`
+    fn scan(args: &[String]) -> Self {
+        let mut include_dotdirs = false;
+        for arg in args {
+            let s = arg.as_str();
+            if s == "--" {
+                break;
+            }
+            match s {
+                "-a" | "--all" => include_dotdirs = true,
+                "-A" | "--almost-all" => include_dotdirs = false,
+                _ if s.starts_with('-') && !s.starts_with("--") => {
+                    // Short flag cluster: scan each char left-to-right (last-wins).
+                    for c in s[1..].chars() {
+                        match c {
+                            'a' => include_dotdirs = true,
+                            'A' => include_dotdirs = false,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        LsArgs { include_dotdirs }
+    }
+}
+
 const CONFIG_LS: ToolRunConfig<'static> = ToolRunConfig {
     program: "ls",
     env_overrides: &[],
@@ -100,7 +152,7 @@ pub(crate) fn is_ls_section_header(line: &str) -> bool {
 struct LsSection {
     /// Directory path label (the header line with the trailing `:` removed).
     label: String,
-    /// Real entry lines (long-form, dotdirs excluded, capped at MAX_DISPLAY_ENTRIES).
+    /// Real entry lines (long-form, dotdirs excluded unless `include_dotdirs`, capped at MAX_DISPLAY_ENTRIES).
     entries: Vec<String>,
     /// Total real entries before the per-section cap.
     total_entries: usize,
@@ -116,26 +168,29 @@ struct LsSection {
 ///
 /// Sets `sec.has_long_lines` when a permission-regex line is seen — including `.`/`..`
 /// entries — so callers can distinguish "not ls -la format" from "empty dir whose only
-/// entries were dotdirs".  Dotdir entries are not added to counts or the display list.
+/// entries were dotdirs".  Dotdir entries are excluded from counts and the display list
+/// unless `include_dotdirs` is `true` (i.e. the user passed `-a` / `--all`).
 /// Non-permission lines (`total N`, blank lines, etc.) are silently skipped.
-fn accumulate_long_entry(sec: &mut LsSection, line: &str) {
+fn accumulate_long_entry(sec: &mut LsSection, line: &str, include_dotdirs: bool) {
     if !RE_LS_LONG.is_match(line) {
         return;
     }
     sec.has_long_lines = true;
 
-    // Skip `.` and `..` dotdir entries.  For symlink rows (`name -> target`),
+    // Detect `.` and `..` dotdir entries.  For symlink rows (`name -> target`),
     // split on " -> " first so we compare the NAME, not the target — a symlink
     // named `cur -> .` must not be dropped because its target happens to be `.`.
     // Trailing `/` (from `-F`/`-p` flags) is trimmed before the comparison.
     let name_part = line.split(" -> ").next().unwrap_or(line);
-    if matches!(
+    let is_dotdir = matches!(
         name_part
             .split_whitespace()
             .last()
             .map(|s| s.trim_end_matches('/')),
         Some(".") | Some("..")
-    ) {
+    );
+    // #317 fidelity: only drop dotdirs when the user did NOT pass -a/--all.
+    if is_dotdir && !include_dotdirs {
         return;
     }
 
@@ -158,7 +213,7 @@ fn accumulate_long_entry(sec: &mut LsSection, line: &str) {
 /// raw).  `ls -la file dir/` places individual file entries before the first
 /// `dir:` header; discarding those lines violated the never-emptier-than-raw
 /// invariant.
-fn parse_ls_long_sections(stdout: &str) -> Vec<LsSection> {
+fn parse_ls_long_sections(stdout: &str, include_dotdirs: bool) -> Vec<LsSection> {
     // Synthetic leading section for long-form lines before the first dir header.
     // It is prepended only if it accumulates at least one real entry.
     // Empty label (default) signals "unlabeled" in the renderer.
@@ -188,7 +243,7 @@ fn parse_ls_long_sections(stdout: &str) -> Vec<LsSection> {
             &mut leading
         };
 
-        accumulate_long_entry(sec, line);
+        accumulate_long_entry(sec, line, include_dotdirs);
     }
 
     // Prepend the unlabeled leading section if it captured any real entries.
@@ -218,7 +273,16 @@ pub(crate) fn run(
 ) -> anyhow::Result<std::process::ExitCode> {
     match tool_name {
         "tree" => run_tool(CONFIG_TREE, args, ctx, prepare_tree_args, parse_tree),
-        _ => run_tool(CONFIG_LS, args, ctx, |_| {}, parse_ls),
+        _ => {
+            let ls_args = LsArgs::scan(args);
+            run_tool(
+                CONFIG_LS,
+                args,
+                ctx,
+                |_| {},
+                move |output| parse_ls(output, &ls_args),
+            )
+        }
     }
 }
 
@@ -237,16 +301,16 @@ fn prepare_tree_args(cmd_args: &mut Vec<String>) {
 // ls: parse
 // ============================================================================
 
-fn parse_ls(output: &CommandOutput) -> ParseResult<FileResult> {
+fn parse_ls(output: &CommandOutput, ls_args: &LsArgs) -> ParseResult<FileResult> {
     if output.stdout.trim().is_empty() {
         return ParseResult::Passthrough(output.stdout.clone());
     }
 
-    if let Some(result) = try_parse_ls_long(&output.stdout) {
+    if let Some(result) = try_parse_ls_long(&output.stdout, ls_args.include_dotdirs) {
         return ParseResult::Full(result);
     }
 
-    if let Some(result) = try_parse_ls_plain(&output.stdout) {
+    if let Some(result) = try_parse_ls_plain(&output.stdout, ls_args.include_dotdirs) {
         return ParseResult::Degraded(
             result,
             vec!["ls: structured parse failed, using plain text".to_string()],
@@ -261,15 +325,15 @@ fn parse_ls(output: &CommandOutput) -> ParseResult<FileResult> {
 /// Multi-section output (`ls -R` / multi-path) contains `dir:` header lines;
 /// single-directory output does not.  The dispatching is a one-pass scan so
 /// the fast path (single dir, no header) adds only O(N) overhead.
-fn try_parse_ls_long(stdout: &str) -> Option<FileResult> {
+fn try_parse_ls_long(stdout: &str, include_dotdirs: bool) -> Option<FileResult> {
     let has_sections = stdout
         .lines()
         .take(MAX_INPUT_LINES)
         .any(is_ls_section_header);
     if has_sections {
-        try_parse_ls_long_sectioned(stdout)
+        try_parse_ls_long_sectioned(stdout, include_dotdirs)
     } else {
-        try_parse_ls_long_flat(stdout)
+        try_parse_ls_long_flat(stdout, include_dotdirs)
     }
 }
 
@@ -281,8 +345,8 @@ fn try_parse_ls_long(stdout: &str) -> Option<FileResult> {
 ///
 /// Per-section cap: MAX_DISPLAY_ENTRIES entries per section, with an elision
 /// marker when the cap is hit (ADR-001 — compress, never truncate).
-fn try_parse_ls_long_sectioned(stdout: &str) -> Option<FileResult> {
-    let sections = parse_ls_long_sections(stdout);
+fn try_parse_ls_long_sectioned(stdout: &str, include_dotdirs: bool) -> Option<FileResult> {
+    let sections = parse_ls_long_sections(stdout, include_dotdirs);
 
     // Require at least one section with long-form lines to confirm this is `ls -la` output.
     if sections.is_empty() || !sections.iter().any(|s| s.has_long_lines) {
@@ -351,9 +415,9 @@ fn try_parse_ls_long_sectioned(stdout: &str) -> Option<FileResult> {
 
 /// Tier 1 (flat): long-form `ls -la` output — detect permissions, count dirs vs files.
 ///
-/// Skips `.` and `..` dotdir entries so they are excluded from counts and from
-/// the display list.  `-F`/`-p` append a trailing `/` to directory names; names
-/// are trimmed before the dot-dir comparison.
+/// Skips `.` and `..` dotdir entries unless `include_dotdirs` is `true`
+/// (i.e. the user passed `-a` / `--all`).  `-F`/`-p` append a trailing `/`
+/// to directory names; names are trimmed before the dot-dir comparison.
 ///
 /// Dir/file counts are folded into the FOOTER rather than a prepended summary
 /// entry, eliminating the duplicate `ls N` + `LS: N entries` double-header that
@@ -362,14 +426,14 @@ fn try_parse_ls_long_sectioned(stdout: &str) -> Option<FileResult> {
 /// Empty dirs (only `total`/`.`/`..` lines): returns a Full result with 0 entries
 /// rather than None, preventing Tier-2 from mis-tokenising the `total`/`.`/`..`
 /// lines as plain filenames.
-fn try_parse_ls_long_flat(stdout: &str) -> Option<FileResult> {
+fn try_parse_ls_long_flat(stdout: &str, include_dotdirs: bool) -> Option<FileResult> {
     let mut sec = LsSection {
         entries: Vec::with_capacity(MAX_DISPLAY_ENTRIES), // capacity hint kept explicit
         ..Default::default()
     };
 
     for line in stdout.lines().take(MAX_INPUT_LINES) {
-        accumulate_long_entry(&mut sec, line);
+        accumulate_long_entry(&mut sec, line, include_dotdirs);
     }
 
     // Empty dir (only . and .. entries): return Full with 0 real entries rather
@@ -404,7 +468,10 @@ fn try_parse_ls_long_flat(stdout: &str) -> Option<FileResult> {
 /// rendered under its label header.  The ≥2-block threshold disambiguates a
 /// literal `foo:` filename (which produces a single block, not sectioned) from
 /// a genuine multi-directory listing.
-fn try_parse_ls_plain(stdout: &str) -> Option<FileResult> {
+///
+/// `include_dotdirs` mirrors the long-form tier: `.` and `..` tokens are
+/// filtered out unless the user passed `-a` / `--all` (#317 fidelity parity).
+fn try_parse_ls_plain(stdout: &str, include_dotdirs: bool) -> Option<FileResult> {
     // Split into blank-line-separated blocks (bounded by MAX_INPUT_LINES total).
     let lines: Vec<&str> = stdout.lines().take(MAX_INPUT_LINES).collect();
 
@@ -436,7 +503,7 @@ fn try_parse_ls_plain(stdout: &str) -> Option<FileResult> {
 
     // Tier-2 section mode: ≥2 blocks with header-shaped first lines.
     if header_block_count >= 2 {
-        return try_parse_ls_plain_sectioned(&blocks);
+        return try_parse_ls_plain_sectioned(&blocks, include_dotdirs);
     }
 
     // Flat mode: count all non-empty names.
@@ -448,6 +515,11 @@ fn try_parse_ls_plain(stdout: &str) -> Option<FileResult> {
             let trimmed = line.trim();
             // Plain ls can output multiple names per line (space-separated)
             for name in trimmed.split_whitespace() {
+                // #317 fidelity parity: filter dotdirs in plain mode too,
+                // mirroring the long-form tier.
+                if !include_dotdirs && (name == "." || name == "..") {
+                    continue;
+                }
                 total_count += 1;
                 if entries.len() < MAX_DISPLAY_ENTRIES {
                     entries.push(name.to_string());
@@ -477,7 +549,9 @@ fn try_parse_ls_plain(stdout: &str) -> Option<FileResult> {
 /// Called when ≥2 blank-line-separated blocks start with a `name:` header line.
 /// Renders each block under its label, analogous to the long-format sectioned
 /// renderer but without permission lines (just filenames).
-fn try_parse_ls_plain_sectioned(blocks: &[Vec<&str>]) -> Option<FileResult> {
+///
+/// `include_dotdirs` filters `.` and `..` tokens for parity with the long-form tier.
+fn try_parse_ls_plain_sectioned(blocks: &[Vec<&str>], include_dotdirs: bool) -> Option<FileResult> {
     let mut total_count = 0usize;
     let mut shown_count = 0usize;
     let mut all_entries: Vec<String> = Vec::new();
@@ -496,6 +570,9 @@ fn try_parse_ls_plain_sectioned(blocks: &[Vec<&str>]) -> Option<FileResult> {
             let mut section_shown = 0usize;
             for &line in iter {
                 for name in line.split_whitespace() {
+                    if !include_dotdirs && (name == "." || name == "..") {
+                        continue;
+                    }
                     section_total += 1;
                     if section_shown < MAX_DISPLAY_ENTRIES {
                         all_entries.push(format!("  {name}"));
@@ -516,6 +593,9 @@ fn try_parse_ls_plain_sectioned(blocks: &[Vec<&str>]) -> Option<FileResult> {
             // Block without a header: render as-is (unlabeled entries).
             for &line in std::iter::once(&first_line).chain(iter) {
                 for name in line.split_whitespace() {
+                    if !include_dotdirs && (name == "." || name == "..") {
+                        continue;
+                    }
                     total_count += 1;
                     if shown_count < MAX_DISPLAY_ENTRIES {
                         all_entries.push(name.to_string());
@@ -715,7 +795,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n\
 total 0\n\
 drwxr-xr-x  2 user group  64 Jan 01 .\n\
 drwxr-xr-x  3 user group  96 Jan 01 ..\n";
-        let result = try_parse_ls_long(input).expect("must parse multi-dir output");
+        let result = try_parse_ls_long(input, false).expect("must parse multi-dir output");
         let rendered = format!("{result}");
         assert!(
             rendered.contains("./dir1:"),
@@ -767,7 +847,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n";
 drwxr-xr-x  2 user group  64 Jan 01 .\n\
 drwxr-xr-x  3 user group  96 Jan 01 ..\n\
 -rw-r--r--  1 user group 100 Jan 01 file.txt\n";
-        let result = try_parse_ls_long(input).expect("must parse single-dir output");
+        let result = try_parse_ls_long(input, false).expect("must parse single-dir output");
         let rendered = format!("{result}");
         // No section headers — flat parse
         assert!(
@@ -797,7 +877,8 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n\
 total 0\n\
 drwxr-xr-x  2 user group  64 Jan 01 .\n\
 drwxr-xr-x  3 user group  96 Jan 01 ..\n";
-        let result = try_parse_ls_long(input).expect("must parse all-empty multi-dir output");
+        let result =
+            try_parse_ls_long(input, false).expect("must parse all-empty multi-dir output");
         let rendered = format!("{result}");
         assert!(
             rendered.contains("./dir1:"),
@@ -814,7 +895,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n";
     #[test]
     fn test_tier1_ls_la() {
         let input = load_fixture("file", "ls_la.txt");
-        let result = try_parse_ls_long(&input);
+        let result = try_parse_ls_long(&input, false);
         assert!(result.is_some(), "Expected Tier 1 ls -la parse to succeed");
         let result = result.unwrap();
         // The fixture has 10 permission-matching lines (`.`, `..` + 8 entries).
@@ -855,7 +936,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n\
 -rw-r--r--  1 user group 100 Jan 01 file1.txt\n\
 -rw-r--r--  1 user group 200 Jan 01 file2.txt\n\
 drwxr-xr-x  2 user group  64 Jan 01 subdir\n";
-        let result = try_parse_ls_long(fixed_input).expect("must parse");
+        let result = try_parse_ls_long(fixed_input, false).expect("must parse");
         // 3 real entries (file1.txt, file2.txt, subdir); . and .. excluded
         assert_eq!(
             result.total_count, 3,
@@ -873,7 +954,7 @@ drwxr-xr-x  2 user group  64 Jan 01 subdir\n";
         );
         // Also verify the -F/-p slash-suffix form (including the .// edge case) gives
         // the same counts — trim_end_matches('/') must collapse .// → . → skipped.
-        let result_f = try_parse_ls_long(input).expect("must parse -F suffix form");
+        let result_f = try_parse_ls_long(input, false).expect("must parse -F suffix form");
         assert_eq!(
             result_f.total_count, 3,
             "dotdirs excluded with -F suffix (.//): got {}",
@@ -897,7 +978,7 @@ drwxr-xr-x  2 user group  64 Jan 01 subdir\n";
 drwxr-xr-x  2 user group  64 Jan 01 ./\n\
 drwxr-xr-x  3 user group  96 Jan 01 ../\n\
 -rw-r--r--  1 user group 100 Jan 01 file.txt\n";
-        let result = try_parse_ls_long(input).expect("must parse with -F suffix");
+        let result = try_parse_ls_long(input, false).expect("must parse with -F suffix");
         // Only file.txt counted; ./ and ../ excluded
         assert_eq!(result.total_count, 1, "dotdirs with -F suffix excluded");
     }
@@ -915,7 +996,7 @@ lrwxrwxrwx  1 user group   1 Jan 01 cur -> .\n\
 lrwxrwxrwx  1 user group   2 Jan 01 parent -> ..\n\
 -rw-r--r--  1 user group 100 Jan 01 file.txt\n\
 drwxr-xr-x  2 user group  64 Jan 01 subdir\n";
-        let result = try_parse_ls_long(input).expect("must parse");
+        let result = try_parse_ls_long(input, false).expect("must parse");
         // 4 real entries: cur, parent, file.txt, subdir
         // `.` and `..` are genuine dotdirs and must be skipped;
         // `cur -> .` and `parent -> ..` are symlinks whose NAMES are not `.`/`..`
@@ -944,7 +1025,7 @@ drwxr-xr-x  2 user group  64 Jan 01 subdir\n";
         let input = "total 0\n\
 drwxr-xr-x  2 user group  64 Jan 01 .\n\
 drwxr-xr-x  3 user group  96 Jan 01 ..\n";
-        let result = try_parse_ls_long(input).expect("empty dir must return Full result");
+        let result = try_parse_ls_long(input, false).expect("empty dir must return Full result");
         assert_eq!(result.total_count, 0, "empty dir has 0 real entries");
         let rendered = format!("{result}");
         assert!(
@@ -958,7 +1039,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n";
         // The FileResult render emits "ls N" as the first line; we must NOT
         // prepend an additional "LS: N entries …" entry (double header bug).
         let input = load_fixture("file", "ls_la.txt");
-        let result = try_parse_ls_long(&input).expect("must parse");
+        let result = try_parse_ls_long(&input, false).expect("must parse");
         let rendered = format!("{result}");
         // Count occurrences of lines starting with "ls"
         let ls_header_count = rendered.lines().filter(|l| l.starts_with("ls ")).count();
@@ -975,7 +1056,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n";
     #[test]
     fn test_tier2_ls_basic() {
         let input = load_fixture("file", "ls_basic.txt");
-        let result = try_parse_ls_plain(&input);
+        let result = try_parse_ls_plain(&input, false);
         assert!(
             result.is_some(),
             "Expected Tier 2 ls plain parse to succeed"
@@ -988,7 +1069,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n";
     fn test_parse_ls_impl_long_form_is_full() {
         let input = load_fixture("file", "ls_la.txt");
         let output = make_output(&input);
-        let result = parse_ls(&output);
+        let result = parse_ls(&output, &LsArgs::default());
         assert!(
             result.is_full(),
             "ls -la output should be Full tier, got {}",
@@ -1000,7 +1081,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n";
     fn test_parse_ls_impl_plain_is_degraded() {
         let input = load_fixture("file", "ls_basic.txt");
         let output = make_output(&input);
-        let result = parse_ls(&output);
+        let result = parse_ls(&output, &LsArgs::default());
         // Plain ls doesn't match long form, falls to Tier 2
         assert!(
             result.is_degraded() || result.is_full(),
@@ -1056,7 +1137,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n";
     #[test]
     fn test_empty_output_passthrough() {
         let output = make_output("");
-        let ls_result = parse_ls(&output);
+        let ls_result = parse_ls(&output, &LsArgs::default());
         assert!(
             ls_result.is_passthrough(),
             "Empty ls output should be Passthrough"
@@ -1140,7 +1221,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n";
                      drwxr-xr-x  2 user group  64 Jan 01 .\n\
                      drwxr-xr-x  3 user group  96 Jan 01 ..\n\
                      -rw-r--r--  1 user group 100 Jan 01 dir_file.txt\n";
-        let result = try_parse_ls_long(input).expect("must parse file+dir output");
+        let result = try_parse_ls_long(input, false).expect("must parse file+dir output");
         let rendered = format!("{result}");
         assert!(
             rendered.contains("single_file.txt"),
@@ -1168,7 +1249,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n";
                      drwxr-xr-x  2 user group  64 Jan 01 .\n\
                      drwxr-xr-x  3 user group  96 Jan 01 ..\n\
                      -rw-r--r--  1 user group 200 Jan 01 dir_file.txt\n";
-        let result = try_parse_ls_long(input).expect("must parse");
+        let result = try_parse_ls_long(input, false).expect("must parse");
         // 1 leading + 1 dir entry = 2 total real entries
         assert_eq!(
             result.total_count, 2,
@@ -1197,7 +1278,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n";
     fn test_f3_plain_ls_r_sections() {
         // Simulates plain `ls -R` output (no -l flag).
         let input = "./dir1:\nfile_a.txt\nfile_b.txt\n\n./dir2:\nfile_c.txt\n";
-        let result = try_parse_ls_plain(input).expect("must parse plain ls -R output");
+        let result = try_parse_ls_plain(input, false).expect("must parse plain ls -R output");
         let rendered = format!("{result}");
         assert!(
             rendered.contains("./dir1:"),
@@ -1221,7 +1302,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n";
     #[test]
     fn test_f3_plain_multi_dir_sections() {
         let input = "d1:\nalpha.txt\nbeta.txt\n\nd2:\ngamma.txt\n";
-        let result = try_parse_ls_plain(input).expect("must parse plain ls d1 d2 output");
+        let result = try_parse_ls_plain(input, false).expect("must parse plain ls d1 d2 output");
         let rendered = format!("{result}");
         assert!(
             rendered.contains("d1:"),
@@ -1248,7 +1329,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n";
     fn test_f3_literal_foo_colon_not_sectioned() {
         // Single block: only one `name:` shaped line → flat, not sectioned.
         let input = "foo:\nbar.txt\nbaz.txt\n";
-        let result = try_parse_ls_plain(input).expect("must parse single-block output");
+        let result = try_parse_ls_plain(input, false).expect("must parse single-block output");
         let rendered = format!("{result}");
         // In flat mode the items are counted as file names; "foo:" itself is one name.
         // The important invariant is that this does NOT produce a labeled-section header
@@ -1275,6 +1356,252 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n";
         assert!(
             footer.contains("deeper entries hidden"),
             "Footer must mention hidden entries when depth cap is hit: {footer}"
+        );
+    }
+
+    // ========================================================================
+    // LsArgs::scan unit tests
+    // ========================================================================
+
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_ls_args_scan_bare_a_flag() {
+        let a = LsArgs::scan(&args(&["-a"]));
+        assert!(a.include_dotdirs, "-a must set include_dotdirs");
+    }
+
+    #[test]
+    fn test_ls_args_scan_long_all() {
+        let a = LsArgs::scan(&args(&["--all"]));
+        assert!(a.include_dotdirs, "--all must set include_dotdirs");
+    }
+
+    #[test]
+    fn test_ls_args_scan_big_a_alone_excluded() {
+        let a = LsArgs::scan(&args(&["-A"]));
+        assert!(!a.include_dotdirs, "-A must NOT set include_dotdirs");
+    }
+
+    #[test]
+    fn test_ls_args_scan_almost_all_excluded() {
+        let a = LsArgs::scan(&args(&["--almost-all"]));
+        assert!(
+            !a.include_dotdirs,
+            "--almost-all must NOT set include_dotdirs"
+        );
+    }
+
+    #[test]
+    fn test_ls_args_scan_bundled_la() {
+        let a = LsArgs::scan(&args(&["-la"]));
+        assert!(a.include_dotdirs, "-la (bundled) must set include_dotdirs");
+    }
+
+    #[test]
+    fn test_ls_args_scan_bundled_alh() {
+        let a = LsArgs::scan(&args(&["-alh"]));
+        assert!(a.include_dotdirs, "-alh (bundled) must set include_dotdirs");
+    }
+
+    #[test]
+    fn test_ls_args_scan_cluster_a_then_big_a_excluded() {
+        // Within a cluster, A comes after a → last-wins → excluded.
+        let a = LsArgs::scan(&args(&["-aA"]));
+        assert!(
+            !a.include_dotdirs,
+            "-aA: last char A wins, must NOT include dotdirs"
+        );
+    }
+
+    #[test]
+    fn test_ls_args_scan_cluster_big_a_then_a_included() {
+        // Within a cluster, a comes after A → last-wins → included.
+        let a = LsArgs::scan(&args(&["-Aa"]));
+        assert!(
+            a.include_dotdirs,
+            "-Aa: last char a wins, must include dotdirs"
+        );
+    }
+
+    #[test]
+    fn test_ls_args_scan_no_flags_excluded() {
+        let a = LsArgs::scan(&args(&["somedir"]));
+        assert!(!a.include_dotdirs, "no flags: must NOT include dotdirs");
+    }
+
+    #[test]
+    fn test_ls_args_scan_a_with_unrelated_flags() {
+        let a = LsArgs::scan(&args(&["-lh", "-a", "somedir"]));
+        assert!(
+            a.include_dotdirs,
+            "-a with unrelated flags must set include_dotdirs"
+        );
+    }
+
+    #[test]
+    fn test_ls_args_scan_separate_a_then_big_a_excluded() {
+        // Across separate args, last-wins: -A follows -a → excluded.
+        let a = LsArgs::scan(&args(&["-a", "-A"]));
+        assert!(
+            !a.include_dotdirs,
+            "-a then -A: last wins, must NOT include dotdirs"
+        );
+    }
+
+    #[test]
+    fn test_ls_args_scan_separate_big_a_then_a_included() {
+        // Across separate args, last-wins: -a follows -A → included.
+        let a = LsArgs::scan(&args(&["-A", "-a"]));
+        assert!(
+            a.include_dotdirs,
+            "-A then -a: last wins, must include dotdirs"
+        );
+    }
+
+    #[test]
+    fn test_ls_args_scan_stops_at_double_dash() {
+        // -- terminates flag scanning; -a after -- must NOT be seen.
+        let a = LsArgs::scan(&args(&["--", "-a"]));
+        assert!(
+            !a.include_dotdirs,
+            "-- stops flag scan; -a after -- must not be seen"
+        );
+    }
+
+    // ========================================================================
+    // Five pinned dotdir tests — rewritten for -a / include_dotdirs semantics
+    // (#317 fidelity: wrappers must not show less than the raw tool)
+    // ========================================================================
+
+    /// With `-a`, fixture has 10 permission lines (. + .. + 8 real).
+    /// All must be counted (was 8 without -a).
+    #[test]
+    fn test_tier1_ls_la_a_flag_includes_dotdirs() {
+        let input = load_fixture("file", "ls_la.txt");
+        let result = try_parse_ls_long(&input, true).expect("must parse with include_dotdirs=true");
+        // 2 dotdirs (. and ..) + 8 real = 10 total.
+        assert_eq!(
+            result.total_count, 10,
+            "with -a: dotdirs included, count must be 10; got {}",
+            result.total_count
+        );
+        let rendered = format!("{result}");
+        // . and .. start with 'd'; dirs becomes 4 (. .. src tests), files 6.
+        assert!(
+            rendered.contains("4 dirs"),
+            "with -a: must count 4 dirs (. .. src tests), got: {rendered}"
+        );
+        assert!(
+            rendered.contains("6 files"),
+            "with -a: must count 6 files, got: {rendered}"
+        );
+    }
+
+    /// With `-a`, `.` and `..` entries are retained in the count.
+    /// No-flag baseline (count=3) unchanged; with -a count becomes 5.
+    #[test]
+    fn test_tier1_ls_la_excludes_dotdirs_a_flag_includes() {
+        let input = "total 8\n\
+drwxr-xr-x  2 user group  64 Jan 01 .\n\
+drwxr-xr-x  3 user group  96 Jan 01 ..\n\
+-rw-r--r--  1 user group 100 Jan 01 file1.txt\n\
+-rw-r--r--  1 user group 200 Jan 01 file2.txt\n\
+drwxr-xr-x  2 user group  64 Jan 01 subdir\n";
+        let result = try_parse_ls_long(input, true).expect("must parse with include_dotdirs=true");
+        // 2 dotdirs + 3 real = 5 total.
+        assert_eq!(
+            result.total_count, 5,
+            "with -a: dotdirs counted, got {}",
+            result.total_count
+        );
+        let rendered = format!("{result}");
+        // . + .. + subdir = 3 dirs; file1.txt + file2.txt = 2 files.
+        assert!(
+            rendered.contains("3 dirs"),
+            "with -a: must count 3 dirs, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("2 files"),
+            "with -a: must count 2 files, got: {rendered}"
+        );
+    }
+
+    /// With `-a`, empty dir shows 2 entries (`.` and `..`). Was 0 without -a.
+    #[test]
+    fn test_tier1_ls_la_empty_dir_a_flag_shows_dotdirs() {
+        let input = "total 0\n\
+drwxr-xr-x  2 user group  64 Jan 01 .\n\
+drwxr-xr-x  3 user group  96 Jan 01 ..\n";
+        let result =
+            try_parse_ls_long(input, true).expect("must return Full with include_dotdirs=true");
+        // Both . and .. are now counted: 2 entries.
+        assert_eq!(
+            result.total_count, 2,
+            "with -a: empty dir yields 2 dotdir entries; got {}",
+            result.total_count
+        );
+        let rendered = format!("{result}");
+        // Both . and .. start with 'd' → 2 dirs, 0 files.
+        assert!(
+            rendered.contains("2 dirs") && rendered.contains("0 files"),
+            "with -a: empty dir footer must say '2 dirs, 0 files', got: {rendered}"
+        );
+    }
+
+    /// With `-a`, symlink guard PURPOSE preserved: symlinks whose TARGETS are
+    /// `.`/`..` must still NOT be misclassified as dotdirs.  `.` and `..`
+    /// themselves are NOW included in the count (include_dotdirs=true).
+    #[test]
+    fn test_tier1_ls_la_symlink_not_misrouted_a_flag() {
+        let input = "total 8\n\
+drwxr-xr-x  2 user group  64 Jan 01 .\n\
+drwxr-xr-x  3 user group  96 Jan 01 ..\n\
+lrwxrwxrwx  1 user group   1 Jan 01 cur -> .\n\
+lrwxrwxrwx  1 user group   2 Jan 01 parent -> ..\n\
+-rw-r--r--  1 user group 100 Jan 01 file.txt\n\
+drwxr-xr-x  2 user group  64 Jan 01 subdir\n";
+        let result = try_parse_ls_long(input, true).expect("must parse");
+        // With -a: all 6 entries counted (. .. cur parent file.txt subdir).
+        assert_eq!(
+            result.total_count, 6,
+            "with -a: all 6 entries counted; got {}",
+            result.total_count
+        );
+        let rendered = format!("{result}");
+        // . + .. + subdir = 3 dirs; cur + parent + file.txt = 3 files.
+        assert!(
+            rendered.contains("3 dirs"),
+            "with -a: must count 3 dirs (. .. subdir), got: {rendered}"
+        );
+        assert!(
+            rendered.contains("3 files"),
+            "with -a: must count 3 files (cur parent file.txt), got: {rendered}"
+        );
+    }
+
+    /// With `-a`, -F/-p slash-suffix dotdirs are also retained. Was 1 without -a.
+    #[test]
+    fn test_tier1_ls_la_f_suffix_dotdirs_a_flag_included() {
+        let input = "total 8\n\
+drwxr-xr-x  2 user group  64 Jan 01 ./\n\
+drwxr-xr-x  3 user group  96 Jan 01 ../\n\
+-rw-r--r--  1 user group 100 Jan 01 file.txt\n";
+        let result =
+            try_parse_ls_long(input, true).expect("must parse -F suffix with include_dotdirs=true");
+        // ./  and ../ count as dotdirs; with -a all 3 entries retained.
+        assert_eq!(
+            result.total_count, 3,
+            "with -a: ./ and ../ included, count=3; got {}",
+            result.total_count
+        );
+        let rendered = format!("{result}");
+        // ./ and ../ start with 'd' → 2 dirs, 1 file.
+        assert!(
+            rendered.contains("2 dirs") && rendered.contains("1 files"),
+            "with -a: footer must say '2 dirs, 1 files', got: {rendered}"
         );
     }
 }
