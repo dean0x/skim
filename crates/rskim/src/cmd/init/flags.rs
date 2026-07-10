@@ -117,6 +117,12 @@ impl DetectionEnv {
     /// or `~/.config/Cursor` (Linux). The `is_dir()` branch in
     /// `AgentKind::config_dir` handles the macOS vs. Linux detection at runtime.
     ///
+    /// **Cursor is IDE-only** (WS2B decision): skim integrates with Cursor via
+    /// the IDE hook + `.mdc` guidance rules only. The Cursor CLI has no
+    /// rewrite-capable hook event, so no permissions file is seeded for Cursor.
+    /// Config-dir resolution still runs (for hook/guidance install), but the
+    /// permissions factory returns `None` for [`AgentKind::Cursor`].
+    ///
     /// This is the single authoritative config-dir resolver. All install,
     /// uninstall, and detection code paths MUST call this — not read env vars
     /// independently (avoids the PF-002 split-resolver hazard).

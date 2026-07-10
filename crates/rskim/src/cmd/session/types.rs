@@ -103,6 +103,12 @@ impl AgentKind {
 
     /// The dot-directory name (e.g., ".claude", ".gemini").
     /// Single source of truth for all agent directory names.
+    ///
+    /// For [`AgentKind::Cursor`], this returns `".cursor"`, which is the
+    /// *project-scope* directory only (e.g., `.cursor/rules/` in a project root).
+    /// Cursor's *global* config lives at `~/Library/Application Support/Cursor`
+    /// (macOS) or `~/.config/Cursor` (Linux) — never under `~/.cursor`. See
+    /// [`AgentKind::config_dir`] for the global path resolution.
     pub(crate) fn dot_dir_name(&self) -> &'static str {
         match self {
             AgentKind::ClaudeCode => ".claude",
@@ -115,9 +121,31 @@ impl AgentKind {
     }
 
     /// Global config directory (home-relative).
-    /// Does NOT handle env var overrides — callers add those.
-    /// Note: Cursor uses runtime `is_dir()` for macOS vs Linux detection,
-    /// matching existing behavior in agents.rs and init/helpers.rs.
+    ///
+    /// Does NOT handle env var overrides — callers (`DetectionEnv::resolve`) add
+    /// those via `CURSOR_CONFIG_DIR` / `CLAUDE_CONFIG_DIR` / etc.
+    ///
+    /// # Cursor — IDE-only integration (WS2B decision)
+    ///
+    /// skim integrates with Cursor exclusively via the Cursor IDE's PreToolUse-style
+    /// hook event and `.mdc` guidance rules. The Cursor CLI has no rewrite-capable
+    /// hook event, so skim cannot intercept commands run through `cursor` in a
+    /// terminal session. As a result, no permissions file is seeded for Cursor (the
+    /// permissions factory returns `None` for this variant).
+    ///
+    /// **Global config directories** (what this method selects at runtime):
+    /// - **macOS (winning path)**: `~/Library/Application Support/Cursor` —
+    ///   checked first via `is_dir()`; used when the directory exists.
+    /// - **Linux/other (losing path / fallback)**: `~/.config/Cursor` — used when
+    ///   the macOS App Support path is absent, whether because the machine is not
+    ///   macOS, Cursor IDE is not yet installed, or the directory was removed.
+    ///   This fallback is acceptable: `~/.config/Cursor` is the canonical global
+    ///   config location on Linux, and returning it even when the directory does
+    ///   not yet exist lets the installer create it in the right place.
+    ///
+    /// **`~/.cursor` is project-scope only** — it is the value returned by
+    /// [`dot_dir_name`] and is used for CWD-relative paths (e.g., `.cursor/rules/`).
+    /// It is never used as the global config root.
     pub(crate) fn config_dir(&self, home: &Path) -> PathBuf {
         match self {
             AgentKind::Cursor => {
@@ -555,6 +583,10 @@ mod tests {
     #[test]
     fn test_agent_kind_dot_dir_name() {
         assert_eq!(AgentKind::ClaudeCode.dot_dir_name(), ".claude");
+        // Cursor's dot_dir_name is ".cursor" — the *project-scope* directory
+        // (e.g., .cursor/rules/ inside a project). The global config dir lives at
+        // ~/Library/Application Support/Cursor (macOS) or ~/.config/Cursor (Linux);
+        // those are returned by config_dir(), not here.
         assert_eq!(AgentKind::Cursor.dot_dir_name(), ".cursor");
         assert_eq!(AgentKind::GeminiCli.dot_dir_name(), ".gemini");
         assert_eq!(AgentKind::CopilotCli.dot_dir_name(), ".github");
@@ -591,7 +623,12 @@ mod tests {
 
     #[test]
     fn test_agent_kind_config_dir_cursor_linux_fallback() {
-        // With a fake home, macOS path won't exist → falls back to Linux path
+        // Winning path: ~/Library/Application Support/Cursor (macOS) — selected by
+        // is_dir() when the directory exists on a real macOS machine with Cursor IDE.
+        // Losing path / fallback: ~/.config/Cursor — selected in all other cases:
+        //   Linux systems, macOS without Cursor installed, or a fake/test home dir.
+        // With a fake home, the macOS App Support path never exists, so the fallback
+        // is always returned here. This is the correct Linux global config location.
         let home = PathBuf::from("/fake/home");
         assert_eq!(
             AgentKind::Cursor.config_dir(&home),
