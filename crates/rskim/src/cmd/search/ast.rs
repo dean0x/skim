@@ -351,7 +351,10 @@ pub(super) fn run_ast_standalone(
 
             if is_synthetic {
                 // Synthetic: two-function flow (AND-semantics gate, AC-10/#419 preserved).
-                pattern_occurs_in_file(&abs_path, &query, stored_mtime).then(|| (fid, score, None))
+                // `then_some` (eager) not `then` (lazy): the tuple is a trivial
+                // value, so a closure is unnecessary (clippy::unnecessary_lazy_evaluations).
+                pattern_occurs_in_file(&abs_path, &query, stored_mtime)
+                    .then_some((fid, score, None))
             } else {
                 // Real-node: find_first_strict_match (gate + anchor in one pass).
                 find_first_strict_match(&abs_path, &query, stored_mtime)
