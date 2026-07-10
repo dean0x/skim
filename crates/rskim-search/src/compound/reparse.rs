@@ -11,8 +11,9 @@
 //! # Design (post-#397)
 //!
 //! - **Single strict-ancestor predicate for gate and anchor (AD-397-1).**
-//!   [`find_first_strict_match`] is the sole implementation of "does this file
-//!   contain the queried structure, and if so, which line?". Both the verify
+//!   [`find_first_strict_match`] is the sole gate+anchor implementation for
+//!   real-node patterns ("does this file contain the queried structure, and if
+//!   so, which line?"). Both the verify
 //!   gate and the line anchor read from the same function call, so they can
 //!   never disagree (ADR-007 anchor-trust satisfied by construction).
 //! - **Real-node-only unify (AD-397-2).** The bug (wrong anchor lines,
@@ -88,7 +89,7 @@ pub const MAX_REPARSE_FILE_BYTES: u64 = 100 * 1024;
 ///   Never 0.
 /// - `byte_range` is the child node's byte span within the file.
 /// - `snippet` is the text of the matched line, extracted from the already-
-///   loaded source (AD-397-TOCTOU: atomic read+parse, no second file access).
+///   loaded source (Decision 9, DECISIONS-NEEDED.md: atomic read+parse, no second file access).
 ///
 /// ## AD-397-1: Single strict-ancestor predicate
 ///
@@ -158,7 +159,7 @@ pub fn find_first_strict_match(
     let (lang, content) = read_guarded(file_path, manifest_mtime)?;
     // UTF-8 decode: source is shared by the tree-sitter parse below and the
     // snippet extraction at match time (atomic, no second file access —
-    // AD-397-TOCTOU).
+    // Decision 9, DECISIONS-NEEDED.md).
     let source = std::str::from_utf8(&content).ok()?;
 
     // Tree-sitter parse; non-tree-sitter languages fail here and return None.
