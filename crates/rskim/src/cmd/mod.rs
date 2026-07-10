@@ -39,6 +39,7 @@ mod integrity;
 mod learn;
 pub(crate) mod lint;
 mod log;
+mod permissions;
 mod pkg;
 mod rewrite;
 mod search;

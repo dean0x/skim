@@ -132,18 +132,22 @@ fn print_completion_message(agent_name: &str) {
 }
 
 pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
+    let det_env = DetectionEnv::from_process();
     if let Some(agent) = resolve_single_agent(flags) {
         // Explicit --agent: single-agent mode
-        run_install_single(flags, agent)
+        run_install_single(flags, agent, &det_env)
     } else {
         // No --agent: auto-detect all installed agents
-        run_install_auto_detect(flags)
+        run_install_auto_detect(flags, &det_env)
     }
 }
 
 /// Install skim for all detected agents when no explicit `--agent` was given.
-fn run_install_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
-    let agents = detect_installed_agents(&DetectionEnv::from_process());
+fn run_install_auto_detect(
+    flags: &InitFlags,
+    det_env: &DetectionEnv,
+) -> anyhow::Result<std::process::ExitCode> {
+    let agents = detect_installed_agents(det_env);
     if agents.is_empty() {
         eprintln!(
             "No supported agents found. Install one of: Claude Code, Cursor, Gemini CLI, \
@@ -160,7 +164,7 @@ fn run_install_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::Ex
             agent: Some(agents[0]),
             ..*flags
         };
-        return run_install_single(&agent_flags, agents[0]);
+        return run_install_single(&agent_flags, agents[0], det_env);
     }
 
     let mut any_failed = false;
@@ -169,7 +173,7 @@ fn run_install_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::Ex
             agent: Some(agent),
             ..*flags
         };
-        match run_install_single(&agent_flags, agent) {
+        match run_install_single(&agent_flags, agent, det_env) {
             Ok(code) if code == std::process::ExitCode::SUCCESS => {}
             Ok(code) => {
                 any_failed = true;
@@ -197,9 +201,10 @@ fn run_install_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::Ex
 fn run_install_single(
     flags: &InitFlags,
     agent: AgentKind,
+    det_env: &DetectionEnv,
 ) -> anyhow::Result<std::process::ExitCode> {
     let env = InstructionEnv::from_process();
-    let state = detect_state(flags, agent)?;
+    let state = detect_state(flags, agent, det_env)?;
 
     verify_agent_installed(&state, agent, flags)?;
     print_install_header(agent.display_name());

@@ -5,7 +5,7 @@ use super::flags::{
 };
 use super::helpers::{
     HOOK_SCRIPT_NAME, atomic_write_settings, check_mark, confirm_proceed, load_or_create_settings,
-    resolve_config_dir_for_agent, resolve_real_settings_path,
+    resolve_real_settings_path,
 };
 use super::state::{has_skim_hook_entry, read_settings_json};
 use crate::cmd::hooks::protocol_for_agent;
@@ -34,15 +34,19 @@ fn remove_skim_from_settings(settings: &mut serde_json::Value, event_key: &str) 
 }
 
 pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
+    let det_env = DetectionEnv::from_process();
     if resolve_single_agent(flags).is_none() {
-        return run_uninstall_auto_detect(flags);
+        return run_uninstall_auto_detect(flags, &det_env);
     }
-    run_uninstall_single(flags)
+    run_uninstall_single(flags, &det_env)
 }
 
 /// Uninstall skim from all detected agents when no explicit `--agent` was given.
-fn run_uninstall_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
-    let agents = detect_installed_agents(&DetectionEnv::from_process());
+fn run_uninstall_auto_detect(
+    flags: &InitFlags,
+    det_env: &DetectionEnv,
+) -> anyhow::Result<std::process::ExitCode> {
+    let agents = detect_installed_agents(det_env);
     if agents.is_empty() {
         println!("  No supported agents found. Nothing to uninstall.");
         return Ok(std::process::ExitCode::SUCCESS);
@@ -55,7 +59,7 @@ fn run_uninstall_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::
             agent: Some(agents[0]),
             ..*flags
         };
-        return run_uninstall_for_agent(&agent_flags, agents[0]);
+        return run_uninstall_for_agent(&agent_flags, agents[0], det_env);
     }
 
     let mut any_failed = false;
@@ -64,7 +68,7 @@ fn run_uninstall_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::
             agent: Some(agent),
             ..*flags
         };
-        match run_uninstall_for_agent(&agent_flags, agent) {
+        match run_uninstall_for_agent(&agent_flags, agent, det_env) {
             Ok(code) if code == std::process::ExitCode::SUCCESS => {}
             Ok(code) => {
                 any_failed = true;
@@ -89,17 +93,21 @@ fn run_uninstall_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::
 }
 
 /// Uninstall skim for a single explicit agent (dispatched by `run_uninstall`).
-fn run_uninstall_single(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
-    let agent = resolve_agent(flags, &DetectionEnv::from_process());
-    run_uninstall_for_agent(flags, agent)
+fn run_uninstall_single(
+    flags: &InitFlags,
+    det_env: &DetectionEnv,
+) -> anyhow::Result<std::process::ExitCode> {
+    let agent = resolve_agent(flags, det_env);
+    run_uninstall_for_agent(flags, agent, det_env)
 }
 
 fn run_uninstall_for_agent(
     flags: &InitFlags,
     agent: crate::cmd::session::AgentKind,
+    det_env: &DetectionEnv,
 ) -> anyhow::Result<std::process::ExitCode> {
     let protocol = protocol_for_agent(agent);
-    let config_dir = resolve_config_dir_for_agent(flags.project, agent)?;
+    let config_dir = det_env.resolve(agent, flags.project)?;
     let settings_path = config_dir.join(protocol.config_filename());
     let hook_script_path = config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
 

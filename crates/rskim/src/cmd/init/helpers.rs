@@ -11,40 +11,6 @@ use std::path::{Path, PathBuf};
 pub(super) const HOOK_SCRIPT_NAME: &str = "skim-rewrite.sh";
 pub(super) const SETTINGS_BACKUP: &str = "settings.json.bak";
 
-// ============================================================================
-// Config directory resolution (B6)
-// ============================================================================
-
-/// Resolve the config directory for a specific agent.
-///
-/// For Claude Code: `CLAUDE_CONFIG_DIR` env > `~/.claude/` (or `.claude/` with --project)
-/// For Cursor: `~/.cursor/` (macOS: `~/Library/Application Support/Cursor/`)
-/// For Gemini: `~/.gemini/`
-/// For Copilot: `~/.github/`
-/// For others: falls back to `~/.{agent_cli_name}/`
-pub(crate) fn resolve_config_dir_for_agent(
-    project: bool,
-    agent: crate::cmd::session::AgentKind,
-) -> anyhow::Result<PathBuf> {
-    use crate::cmd::session::AgentKind;
-
-    if project {
-        return Ok(std::env::current_dir()?.join(agent.dot_dir_name()));
-    }
-
-    // Check agent-specific env override
-    if agent == AgentKind::ClaudeCode
-        && let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
-    {
-        return Ok(PathBuf::from(dir));
-    }
-
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-
-    Ok(agent.config_dir(&home))
-}
-
 /// Resolve a symlink to its absolute target path.
 ///
 /// `read_link()` can return relative paths. This helper joins the relative

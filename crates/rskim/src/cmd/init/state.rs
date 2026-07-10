@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use super::flags::InitFlags;
-use super::helpers::{HOOK_SCRIPT_NAME, resolve_config_dir_for_agent};
+use super::flags::{DetectionEnv, InitFlags};
+use super::helpers::HOOK_SCRIPT_NAME;
 use crate::cmd::hooks::{HookProtocol, protocol_for_agent};
 
 /// Maximum settings.json size we'll read (10 MB). Anything larger is almost
@@ -39,10 +39,11 @@ impl DetectedState {
 pub(super) fn detect_state(
     flags: &InitFlags,
     agent: crate::cmd::session::AgentKind,
+    env: &DetectionEnv,
 ) -> anyhow::Result<DetectedState> {
     let skim_binary = std::env::current_exe()?;
     let skim_version = env!("CARGO_PKG_VERSION").to_string();
-    let config_dir = resolve_config_dir_for_agent(flags.project, agent)?;
+    let config_dir = env.resolve(agent, flags.project)?;
     let protocol = protocol_for_agent(agent);
     let settings_path = config_dir.join(protocol.config_filename());
     let settings_exists = settings_path.exists();
@@ -83,7 +84,7 @@ pub(super) fn detect_state(
     );
 
     // Dual-scope check (B5)
-    let dual_scope_warning = check_dual_scope(flags, agent)?;
+    let dual_scope_warning = check_dual_scope(flags, agent, env)?;
 
     // Reuse the already-read hook script contents for pinned-binary detection.
     let hook_uses_pinned_binary = hook_script_contents
@@ -191,13 +192,14 @@ fn scan_existing_hooks(
 pub(super) fn check_dual_scope(
     flags: &InitFlags,
     agent: crate::cmd::session::AgentKind,
+    env: &DetectionEnv,
 ) -> anyhow::Result<Option<String>> {
     let other_dir = if flags.project {
         // Installing project-level, check global
-        resolve_config_dir_for_agent(false, agent)?
+        env.resolve(agent, false)?
     } else {
         // Installing global, check project
-        match resolve_config_dir_for_agent(true, agent) {
+        match env.resolve(agent, true) {
             Ok(dir) => dir,
             Err(_) => return Ok(None),
         }

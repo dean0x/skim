@@ -38,7 +38,8 @@ pub(super) fn resolve_single_agent(flags: &InitFlags) -> Option<AgentKind> {
     flags.agent
 }
 
-/// Injected environment values for [`detect_installed_agents`].
+/// Injected environment values for [`detect_installed_agents`] and config-dir
+/// resolution on both the detection path and the install/uninstall write path.
 ///
 /// Created once at the CLI boundary and threaded to callers, eliminating
 /// per-call env-var reads and enabling race-free unit testing. Mirrors the
@@ -46,21 +47,23 @@ pub(super) fn resolve_single_agent(flags: &InitFlags) -> Option<AgentKind> {
 ///
 /// ARCHITECTURE: `from_process()` reads env exactly once at the system
 /// boundary. Test code constructs this struct directly with controlled paths.
+/// `resolve()` is the single source of truth for config-dir resolution (applies
+/// PF-002: one resolver, not two independent paths).
 #[derive(Debug, Default)]
-pub(super) struct DetectionEnv {
-    pub(super) home_dir: Option<std::path::PathBuf>,
+pub(crate) struct DetectionEnv {
+    pub(crate) home_dir: Option<std::path::PathBuf>,
     /// `CLAUDE_CONFIG_DIR` override
-    pub(super) claude_config_dir: Option<std::path::PathBuf>,
+    pub(crate) claude_config_dir: Option<std::path::PathBuf>,
     /// `CURSOR_CONFIG_DIR` override
-    pub(super) cursor_config_dir: Option<std::path::PathBuf>,
+    pub(crate) cursor_config_dir: Option<std::path::PathBuf>,
     /// `GEMINI_CONFIG_DIR` override
-    pub(super) gemini_config_dir: Option<std::path::PathBuf>,
+    pub(crate) gemini_config_dir: Option<std::path::PathBuf>,
     /// `COPILOT_CONFIG_DIR` override
-    pub(super) copilot_config_dir: Option<std::path::PathBuf>,
+    pub(crate) copilot_config_dir: Option<std::path::PathBuf>,
     /// `CODEX_CONFIG_DIR` override
-    pub(super) codex_config_dir: Option<std::path::PathBuf>,
+    pub(crate) codex_config_dir: Option<std::path::PathBuf>,
     /// `CRUSH_CONFIG_DIR` override
-    pub(super) crush_config_dir: Option<std::path::PathBuf>,
+    pub(crate) crush_config_dir: Option<std::path::PathBuf>,
 }
 
 impl DetectionEnv {
@@ -68,7 +71,7 @@ impl DetectionEnv {
     ///
     /// Call this in `main`-adjacent code, then thread the struct down to
     /// callers — never call from within library functions.
-    pub(super) fn from_process() -> Self {
+    pub(crate) fn from_process() -> Self {
         let read = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);
         Self {
             home_dir: dirs::home_dir(),
@@ -95,6 +98,48 @@ impl DetectionEnv {
             AgentKind::CodexCli => self.codex_config_dir.as_deref(),
             AgentKind::Crush => self.crush_config_dir.as_deref(),
         }
+    }
+
+    /// Resolve the config directory for `agent` with the following precedence:
+    ///
+    /// 1. `--project` flag → CWD-relative `.<agent-dir>/` (e.g., `.claude/`).
+    /// 2. Per-agent env override (`CLAUDE_CONFIG_DIR`, `CURSOR_CONFIG_DIR`, …)
+    ///    → that path verbatim.
+    /// 3. Home-directory default via [`AgentKind::config_dir`], which handles
+    ///    platform-specific paths:
+    ///    - **Cursor (macOS)**: `~/Library/Application Support/Cursor` when
+    ///      that directory exists at runtime (global config, not project scope).
+    ///    - **Cursor (Linux/other)**: `~/.config/Cursor`.
+    ///    - **All others**: `~/<dot_dir_name>` (e.g., `~/.claude`).
+    ///
+    /// Note: `~/.cursor` is the *project-scope* dot-directory; Cursor's
+    /// *global* config lives under `Library/Application Support/Cursor` (macOS)
+    /// or `~/.config/Cursor` (Linux). The `is_dir()` branch in
+    /// `AgentKind::config_dir` handles the macOS vs. Linux detection at runtime.
+    ///
+    /// This is the single authoritative config-dir resolver. All install,
+    /// uninstall, and detection code paths MUST call this — not read env vars
+    /// independently (avoids the PF-002 split-resolver hazard).
+    pub(crate) fn resolve(
+        &self,
+        agent: AgentKind,
+        project: bool,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        if project {
+            return Ok(std::env::current_dir()?.join(agent.dot_dir_name()));
+        }
+
+        // Per-agent env override: honored for ALL agents (not just ClaudeCode).
+        if let Some(override_path) = self.override_for(agent) {
+            return Ok(override_path.to_path_buf());
+        }
+
+        // Home-directory default (includes Cursor macOS/Linux is_dir() branch).
+        let home = self
+            .home_dir
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+        Ok(agent.config_dir(home))
     }
 }
 
@@ -552,6 +597,151 @@ mod tests {
         assert!(
             err.contains("mutually exclusive"),
             "error must mention mutual exclusion: {err}"
+        );
+    }
+
+    // ---- DetectionEnv::resolve ----
+
+    /// Per-agent env override must be honored for EVERY agent when project=false.
+    /// This covers the CRITICAL OUTCOME: env overrides honored on the WRITE path.
+    #[test]
+    fn test_resolve_override_honored_for_claude() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: Some(std::path::PathBuf::from("/home/user")),
+            claude_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::ClaudeCode, false).unwrap();
+        assert_eq!(result, tmp.path(), "CLAUDE_CONFIG_DIR override must win");
+    }
+
+    #[test]
+    fn test_resolve_override_honored_for_cursor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: Some(std::path::PathBuf::from("/home/user")),
+            cursor_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::Cursor, false).unwrap();
+        assert_eq!(result, tmp.path(), "CURSOR_CONFIG_DIR override must win");
+    }
+
+    #[test]
+    fn test_resolve_override_honored_for_gemini() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: Some(std::path::PathBuf::from("/home/user")),
+            gemini_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::GeminiCli, false).unwrap();
+        assert_eq!(result, tmp.path(), "GEMINI_CONFIG_DIR override must win");
+    }
+
+    #[test]
+    fn test_resolve_override_honored_for_copilot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: Some(std::path::PathBuf::from("/home/user")),
+            copilot_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::CopilotCli, false).unwrap();
+        assert_eq!(result, tmp.path(), "COPILOT_CONFIG_DIR override must win");
+    }
+
+    #[test]
+    fn test_resolve_override_honored_for_codex() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: Some(std::path::PathBuf::from("/home/user")),
+            codex_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::CodexCli, false).unwrap();
+        assert_eq!(result, tmp.path(), "CODEX_CONFIG_DIR override must win");
+    }
+
+    #[test]
+    fn test_resolve_override_honored_for_crush() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: Some(std::path::PathBuf::from("/home/user")),
+            crush_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::Crush, false).unwrap();
+        assert_eq!(result, tmp.path(), "CRUSH_CONFIG_DIR override must win");
+    }
+
+    /// project=true must resolve to CWD/<dot_dir_name>, ignoring env overrides.
+    #[test]
+    fn test_resolve_project_mode_ignores_env_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: Some(std::path::PathBuf::from("/home/user")),
+            claude_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::ClaudeCode, true).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            result,
+            cwd.join(".claude"),
+            "project mode must use CWD/.claude"
+        );
+    }
+
+    /// Home-dir fallback when no override: resolve returns agent.config_dir(home).
+    #[test]
+    fn test_resolve_home_dir_fallback_no_override() {
+        let home = std::path::PathBuf::from("/home/testuser");
+        let env = DetectionEnv {
+            home_dir: Some(home.clone()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::ClaudeCode, false).unwrap();
+        assert_eq!(
+            result,
+            home.join(".claude"),
+            "fallback must be home/.claude"
+        );
+    }
+
+    #[test]
+    fn test_resolve_no_home_dir_returns_error() {
+        let env = DetectionEnv {
+            home_dir: None,
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::ClaudeCode, false);
+        assert!(
+            result.is_err(),
+            "missing home dir without override must error"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("home directory"),
+            "error must mention home directory"
+        );
+    }
+
+    /// Env override takes precedence over home_dir for ALL agents — a None home
+    /// dir must not cause an error when an override is set.
+    #[test]
+    fn test_resolve_override_wins_over_missing_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: None,
+            gemini_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::GeminiCli, false).unwrap();
+        assert_eq!(
+            result,
+            tmp.path(),
+            "env override must win even when home_dir is None"
         );
     }
 }
