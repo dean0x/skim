@@ -36,9 +36,12 @@
 //!   - Language has no tree-sitter grammar (JSON/YAML/TOML etc.).
 //!   - Pattern's node kinds are absent in the file's grammar.
 //!   - File's extension does not map to a known language.
-//! - **Bounded.** Callers must apply `--limit` BEFORE calling this function.
-//!   This file itself is a pure function with no knowledge of limit; the bound
-//!   is enforced by the caller (AC-API3).
+//! - **Bounded.** For real-node patterns, [`find_first_strict_match`] — the
+//!   primary gate and anchor — runs over the **candidate pool** (pre-truncation;
+//!   the pool size is `max(5 * limit, 100)` — AD-374-3). Only the synthetic-
+//!   marker recovery path ([`recover_line`]) is bounded to ≤ `--limit` files
+//!   (post-truncation, AC-API3). The `--limit` cap is applied by the caller
+//!   after the gate completes; this module never applies it itself.
 //!
 //! ## Semantic contract (shared with #396)
 //!
@@ -150,33 +153,12 @@ pub fn find_first_strict_match(
         return None;
     }
 
-    // Guard: file must exist and be readable as metadata.
-    let meta = std::fs::metadata(file_path).ok()?;
-
-    // Mtime guard: if the manifest recorded an mtime and it doesn't match,
-    // the file has changed since indexing — positions may be stale → drop.
-    if let Some(stored_mtime) = manifest_mtime {
-        let current_mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs());
-        if current_mtime != Some(stored_mtime) {
-            return None;
-        }
-    }
-
-    // Size guard: must be within the re-parse cap.
-    if meta.len() > MAX_REPARSE_FILE_BYTES {
-        return None;
-    }
-
-    // Detect language from extension; non-tree-sitter langs drop.
-    let lang = Language::from_path(file_path)?;
-
-    // Read the file once — source is shared by the tree-sitter parse below
-    // and the snippet extraction at match time (atomic, no second read).
-    let content = std::fs::read(file_path).ok()?;
+    // I/O guards: metadata → mtime → size → language → read (single owner via
+    // read_guarded; cannot drift across the three re-parse entry points).
+    let (lang, content) = read_guarded(file_path, manifest_mtime)?;
+    // UTF-8 decode: source is shared by the tree-sitter parse below and the
+    // snippet extraction at match time (atomic, no second file access —
+    // AD-397-TOCTOU).
     let source = std::str::from_utf8(&content).ok()?;
 
     // Tree-sitter parse; non-tree-sitter languages fail here and return None.
@@ -306,32 +288,9 @@ pub fn recover_line(
         return None;
     }
 
-    // Guard: file must exist and be readable as metadata.
-    let meta = std::fs::metadata(file_path).ok()?;
-
-    // Mtime guard: if the manifest recorded an mtime and it doesn't match,
-    // the file has changed since indexing — positions may be stale → degrade.
-    if let Some(stored_mtime) = manifest_mtime {
-        let current_mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs());
-        if current_mtime != Some(stored_mtime) {
-            return None;
-        }
-    }
-
-    // Size guard: must be within the re-parse cap.
-    if meta.len() > MAX_REPARSE_FILE_BYTES {
-        return None;
-    }
-
-    // Detect language from extension.
-    let lang = Language::from_path(file_path)?;
-
-    // Read the file — shared by both branches below.
-    let content = std::fs::read(file_path).ok()?;
+    // I/O guards: metadata → mtime → size → language → read (single owner via
+    // read_guarded; cannot drift across the three re-parse entry points).
+    let (lang, content) = read_guarded(file_path, manifest_mtime)?;
     let source = std::str::from_utf8(&content).ok()?;
 
     // AD-394-5: Synthetic-marker patterns cannot be recovered by a strict
@@ -343,6 +302,49 @@ pub fn recover_line(
     let result = linearize_source(source, lang).ok()?;
     let (_emitted, _metrics, synthetic_lines) = extract_ast_ngrams_with_lines(&result.nodes, lang);
     recover_synthetic_line(query, &synthetic_lines)
+}
+
+/// Shared I/O guard prologue for all re-parse entry points.
+///
+/// Consolidates the five-step precondition that every re-parse call site must
+/// satisfy before touching tree-sitter — `fs::metadata` existence, mtime
+/// staleness guard, `MAX_REPARSE_FILE_BYTES` size cap, `Language::from_path`
+/// detection, and `fs::read` — into a single owner so the precondition cannot
+/// drift across call sites (DRY / single-source-of-truth).
+///
+/// Returns `None` on any guard failure. Option-returning callers short-circuit
+/// with `?`; the bool-returning synthetic branch in `pattern_occurs_in_file`
+/// uses `let Some(...) else { return false }`. UTF-8 decoding is left to each
+/// caller because it requires borrowing the returned `Vec<u8>`.
+///
+/// ## Guard order (cheapest-first, avoids unnecessary I/O)
+///
+/// 1. `fs::metadata` — fails fast for missing / unreadable paths.
+/// 2. Mtime guard — no read needed for stale files.
+/// 3. Size guard — no read needed for oversized files.
+/// 4. `Language::from_path` — rejects non-tree-sitter languages before reading.
+/// 5. `fs::read` — only after all guards pass.
+fn read_guarded(path: &Path, manifest_mtime: Option<u64>) -> Option<(Language, Vec<u8>)> {
+    let meta = std::fs::metadata(path).ok()?;
+
+    if let Some(stored_mtime) = manifest_mtime {
+        let current_mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        if current_mtime != Some(stored_mtime) {
+            return None;
+        }
+    }
+
+    if meta.len() > MAX_REPARSE_FILE_BYTES {
+        return None;
+    }
+
+    let lang = Language::from_path(path)?;
+    let content = std::fs::read(path).ok()?;
+    Some((lang, content))
 }
 
 /// AD-394-5: resolve `query`'s resolved synthetic bigram key(s) against the
@@ -450,35 +452,9 @@ pub fn pattern_occurs_in_file(
         // Guards run here (not inside find_first_strict_match) because this
         // branch does NOT delegate to find_first_strict_match.
 
-        // Guard: file must exist and be readable as metadata.
-        let Ok(meta) = std::fs::metadata(file_path) else {
-            return false;
-        };
-
-        // Mtime guard.
-        if let Some(stored_mtime) = manifest_mtime {
-            let current_mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs());
-            if current_mtime != Some(stored_mtime) {
-                return false;
-            }
-        }
-
-        // Size guard (AD-374-5).
-        if meta.len() > MAX_REPARSE_FILE_BYTES {
-            return false;
-        }
-
-        // Detect language; non-tree-sitter langs drop (AD-374-5).
-        let Some(lang) = Language::from_path(file_path) else {
-            return false;
-        };
-
-        // Read the file.
-        let Ok(content) = std::fs::read(file_path) else {
+        // I/O guards: metadata → mtime → size → language → read (single owner
+        // via read_guarded; cannot drift across the three re-parse entry points).
+        let Some((lang, content)) = read_guarded(file_path, manifest_mtime) else {
             return false;
         };
         let Ok(source) = std::str::from_utf8(&content) else {

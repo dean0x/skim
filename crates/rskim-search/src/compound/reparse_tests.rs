@@ -81,6 +81,24 @@ fn find_first_strict_match_rust_nested_loop_returns_some_with_anchor_ac1_ac9() {
         !snippet.is_empty(),
         "AC1: snippet must not be empty for a matched node; got: {snippet:?}"
     );
+    // Decision 9 (DECISIONS-NEEDED.md): snippet is the matched line's TEXT
+    // extracted atomically from the same source buffer (no TOCTOU). Verify it
+    // equals the actual text of `line` (1-indexed) — an off-by-one between the
+    // 0-indexed `row` used in `source.lines().nth(row)` and the 1-indexed `line`
+    // returned would produce a snippet from the wrong line and fail this assertion.
+    let expected_snippet = content.lines().nth((line - 1) as usize).unwrap_or("");
+    assert_eq!(
+        snippet.as_str(),
+        expected_snippet,
+        "AC1 (Decision 9): snippet must equal the text of anchor line {line}; \
+         expected {expected_snippet:?}, got {snippet:?}"
+    );
+    // The matched node is a for_expression; its line must contain "for".
+    assert!(
+        snippet.contains("for"),
+        "AC1 (Decision 9): snippet at line {line} must contain 'for' (for_expression \
+         node is a for-loop); got: {snippet:?}"
+    );
 }
 
 /// Negative twin: a file without nested loops must return `None`.
