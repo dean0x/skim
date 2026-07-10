@@ -31,6 +31,10 @@ use install::run_install;
 use uninstall::run_uninstall;
 
 pub(crate) use flags::DetectionEnv;
+pub(crate) use flags::PermissionsTier;
+pub(crate) use helpers::atomic_write_settings;
+pub(crate) use helpers::backup_settings_file;
+pub(crate) use helpers::load_or_create_settings;
 pub(crate) use state::MAX_SETTINGS_SIZE;
 pub(crate) use state::has_skim_hook_entry;
 
@@ -141,5 +145,32 @@ pub(super) fn command() -> clap::Command {
                 .action(clap::ArgAction::SetTrue)
                 .conflicts_with("wrappers")
                 .help("Skip PATH wrapper installation (skip interactive prompt)"),
+        )
+        .arg(
+            clap::Arg::new("permissions")
+                .long("permissions")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("no-permissions")
+                .conflicts_with("project")
+                .help(
+                    "Seed agent-native allow-list entries for skim read-only tools \
+                     (user-scope only; incompatible with --project)",
+                ),
+        )
+        .arg(
+            clap::Arg::new("no-permissions")
+                .long("no-permissions")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("permissions")
+                .help("Skip seeding agent permission entries"),
+        )
+        .arg(
+            clap::Arg::new("permissions-tier")
+                .long("permissions-tier")
+                .value_name("TIER")
+                .help(
+                    "Which tier of permissions to seed: seed (default), mirror, blanket. \
+                     Effective only when --permissions is set.",
+                ),
         )
 }

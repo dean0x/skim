@@ -52,7 +52,10 @@ pub(super) fn resolve_real_settings_path(path: &Path) -> anyhow::Result<PathBuf>
 /// Read and parse a settings.json file, creating an empty object for missing or empty files.
 ///
 /// Rejects files larger than [`super::state::MAX_SETTINGS_SIZE`] to prevent OOM.
-pub(super) fn load_or_create_settings(path: &Path) -> anyhow::Result<serde_json::Value> {
+///
+/// `pub(crate)` so that the permissions writers (cmd/permissions/claude.rs) can
+/// reuse this helper without duplicating the size-cap logic.
+pub(crate) fn load_or_create_settings(path: &Path) -> anyhow::Result<serde_json::Value> {
     if !path.exists() {
         return Ok(serde_json::Value::Object(serde_json::Map::new()));
     }
@@ -88,7 +91,10 @@ pub(super) fn load_or_create_settings(path: &Path) -> anyhow::Result<serde_json:
 /// On Unix, the temporary file is created with mode 0o600 (owner read/write only)
 /// before the rename, so the settings file is never world-readable — regardless
 /// of the process umask.
-pub(super) fn atomic_write_settings(
+///
+/// `pub(crate)` so that the permissions writers (cmd/permissions/claude.rs) can
+/// reuse this helper without duplicating the atomic-write logic.
+pub(crate) fn atomic_write_settings(
     settings: &serde_json::Value,
     path: &Path,
 ) -> anyhow::Result<()> {
@@ -222,6 +228,31 @@ pub(super) fn guidance_content_mdc(version: &str) -> String {
 }
 
 // ============================================================================
+// Settings backup helper (pub(crate) so permissions writers can reuse it)
+// ============================================================================
+
+/// Back up a settings file before first modification.
+///
+/// Creates `{config_dir}/settings.json.bak` — a byte-for-byte copy of
+/// `real_path`. Rejects paths that became symlinks after resolution (TOCTOU
+/// guard: a symlink appearing here after `resolve_real_settings_path()` ran
+/// indicates a race or tamper attempt).
+///
+/// Used by the Claude permissions writer before modifying `settings.json`.
+pub(crate) fn backup_settings_file(config_dir: &Path, real_path: &Path) -> anyhow::Result<()> {
+    if real_path.is_symlink() {
+        anyhow::bail!(
+            "settings path became a symlink after resolution: {}\n\
+             hint: this may indicate a symlink race; please verify the path manually",
+            real_path.display()
+        );
+    }
+    let backup_path = config_dir.join(SETTINGS_BACKUP);
+    std::fs::copy(real_path, &backup_path)?;
+    Ok(())
+}
+
+// ============================================================================
 // Interactive prompt helpers
 // ============================================================================
 
@@ -262,6 +293,90 @@ fn confirm_proceed_raw() -> anyhow::Result<bool> {
         println!();
     }
     Ok(confirmed)
+}
+
+/// Gate agent-permission seeding on explicit human consent at a TTY.
+///
+/// # Security contract
+///
+/// TTY-gating is the **primary defense** against prompt-injected agent
+/// self-grant: if stdin is not an interactive terminal (CI, piped input,
+/// sub-agent invocation), this function refuses immediately and returns
+/// `false` — no I/O, no prompt, no grant.
+///
+/// Residual pty risk: a malicious agent that already controls the pty can
+/// simulate keystrokes. This attack requires prior execution compromise, which
+/// is outside the install-time threat model. Defense-in-depth controls (sidecar
+/// manifests, per-tool scope) limit blast radius.
+///
+/// # Bypass prohibition
+///
+/// The `--yes` flag is for hook uninstall confirmation only. It does NOT bypass
+/// this function — callers (Subtask 7) invoke `confirm_grant` unconditionally
+/// whenever permissions are requested. Do NOT add a flag parameter that skips
+/// the TTY check.
+///
+/// # Return value
+///
+/// Returns `true` only when stdin is an interactive TTY **and** the user
+/// explicitly types `y` or `yes` (case-insensitive). Returns `false` for:
+/// - Non-TTY stdin (CI, pipes, agent invocations).
+/// - Empty input (default is deny).
+/// - Anything other than `y` / `yes`.
+/// - EOF before a response.
+/// - Any I/O error.
+///
+/// # Arguments
+///
+/// - `agent_label` — human-readable agent name for the prompt (e.g. "Claude Code").
+/// - `config_file` — exact path of the file that will be modified.
+/// - `entries` — each entry that will be added, printed verbatim.
+// Consumers arrive in Subtask 7; allow dead_code until then.
+#[allow(dead_code)]
+pub(crate) fn confirm_grant(agent_label: &str, config_file: &Path, entries: &[String]) -> bool {
+    use std::io::{BufRead, IsTerminal, Read, Write};
+
+    // Non-TTY: refuse immediately without printing anything.
+    // This is the non-negotiable first gate — no prompt on pipes or sub-agents.
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+
+    // Print the consent prompt.
+    println!();
+    println!(
+        "skim wants to add allow-list entries to: {}",
+        config_file.display()
+    );
+    println!("  Agent:  {agent_label}");
+    println!("  Entries to add ({} total):", entries.len());
+    for entry in entries {
+        println!("    {entry}");
+    }
+    println!();
+    println!("These entries grant skim read-only tool permissions at install time.");
+    println!("skim never modifies permissions at runtime — only `skim init` does.");
+    println!();
+
+    print!("Grant these permissions? [y/N] ");
+    if std::io::stdout().flush().is_err() {
+        return false;
+    }
+
+    let mut input = String::new();
+    // Read at most 64 bytes — a valid answer is always short.
+    let n = match std::io::BufReader::new(std::io::stdin().lock().take(64)).read_line(&mut input) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+
+    // EOF on a TTY (n == 0) → deny.
+    if n == 0 {
+        return false;
+    }
+
+    let trimmed = input.trim().to_ascii_lowercase();
+    trimmed == "y" || trimmed == "yes"
 }
 
 /// Colored status mark re-exported for the `init` module namespace.
@@ -375,6 +490,62 @@ mod tests {
         assert!(content.contains("description:"));
         assert!(content.contains("<!-- skim-start v2.1.0 -->"));
         assert!(content.contains("<!-- skim-end -->"));
+    }
+
+    // ---- confirm_grant — non-TTY refusal ----
+
+    /// The test harness stdin is never a TTY, so confirm_grant must return false
+    /// immediately without blocking on a read.
+    #[test]
+    fn test_confirm_grant_refuses_non_tty() {
+        // In a test harness stdin is not a TTY. confirm_grant must return false
+        // without blocking. We pass nonsense entries — they must not be written
+        // to anything because the function exits before any output or read.
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_file = dir.path().join("settings.json");
+        let entries = vec!["Bash(skim df:*)".to_string()];
+        let result = confirm_grant("Claude Code", &config_file, &entries);
+        assert!(
+            !result,
+            "confirm_grant must return false in a non-TTY context"
+        );
+    }
+
+    /// Multiple calls must all refuse consistently — confirm_grant must not
+    /// change state or block on repeated invocations in a non-TTY context.
+    #[test]
+    fn test_confirm_grant_non_tty_is_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_file = dir.path().join("settings.json");
+        let entries = vec![
+            "Bash(skim grep:*)".to_string(),
+            "Bash(skim ls:*)".to_string(),
+        ];
+        for _ in 0..3 {
+            assert!(
+                !confirm_grant("Claude Code", &config_file, &entries),
+                "confirm_grant must consistently return false in non-TTY context"
+            );
+        }
+    }
+
+    // ---- backup_settings_file ----
+
+    #[test]
+    fn test_backup_settings_file_creates_backup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = dir.path().join("settings.json");
+        std::fs::write(&settings, b"{\"key\":\"value\"}").unwrap();
+
+        backup_settings_file(dir.path(), &settings).unwrap();
+
+        let backup = dir.path().join(SETTINGS_BACKUP);
+        assert!(backup.exists(), "backup file must be created");
+        let backup_bytes = std::fs::read(&backup).unwrap();
+        assert_eq!(
+            backup_bytes, b"{\"key\":\"value\"}",
+            "backup must be a byte-exact copy"
+        );
     }
 
     #[test]

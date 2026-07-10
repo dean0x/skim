@@ -2,6 +2,43 @@
 
 use crate::cmd::session::AgentKind;
 
+/// Which scope of tool permissions to seed during `skim init --permissions`.
+///
+/// The tier controls which (and how many) allowlist entries are written to the
+/// agent's permission config file. Subtask 7 implements the full tier-dispatch
+/// logic; this enum is defined here because it appears in `InitFlags` which must
+/// stay `Copy`.
+///
+/// Default is `Seed` — the narrowest, safest tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PermissionsTier {
+    /// Narrowest set: only the 8 read-only tools that skim wraps.
+    /// These are arg-safe — `Bash(skim <tool>:*)` entries do NOT bound wrapped
+    /// tool arguments, so only genuinely read-only tools are included.
+    #[default]
+    Seed,
+    /// Mirror the agent's existing allow-list entries (not yet wired; Subtask 7).
+    Mirror,
+    /// Blanket grant (requires double-confirmation; not yet wired; Subtask 7).
+    Blanket,
+}
+
+impl PermissionsTier {
+    /// Parse from the `--permissions-tier` CLI value.
+    pub(super) fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "seed" => Ok(PermissionsTier::Seed),
+            "mirror" => Ok(PermissionsTier::Mirror),
+            "blanket" => Ok(PermissionsTier::Blanket),
+            other => anyhow::bail!(
+                "invalid --permissions-tier value: '{}'\n\
+                 Valid values: seed, mirror, blanket",
+                other
+            ),
+        }
+    }
+}
+
 /// Parsed command-line flags for the init subcommand.
 ///
 /// All fields are `Copy`-friendly primitive types so that the multi-agent
@@ -28,6 +65,25 @@ pub(super) struct InitFlags {
     /// `Some(false)` — `--no-wrappers` flag: skip wrappers.
     /// `None` — neither flag: prompt interactively (or default to false in non-TTY).
     pub(super) wrappers: Option<bool>,
+    /// Whether to seed agent-native allow-list entries for skim's read-only tools.
+    ///
+    /// `Some(true)` — `--permissions` flag: seed entries.
+    /// `Some(false)` — `--no-permissions` flag: skip seeding.
+    /// `None` — neither flag: follow default (no seeding unless explicitly requested).
+    ///
+    /// CONSTRAINT: mutually exclusive with `--project` — permissions seeding is
+    /// user-scope only. Project settings are repository-controlled and must not
+    /// receive auto-generated allowlist entries.
+    // Consumed by the init execution path (Subtask 7); suppress until callers land.
+    #[allow(dead_code)]
+    pub(super) permissions: Option<bool>,
+    /// Which tier of permissions to seed when `permissions == Some(true)`.
+    ///
+    /// Default: `PermissionsTier::Seed` (narrowest — only the 8 read-only tools).
+    /// Set via `--permissions-tier seed|mirror|blanket`.
+    // Consumed by the init execution path (Subtask 7); suppress until callers land.
+    #[allow(dead_code)]
+    pub(super) permissions_tier: PermissionsTier,
 }
 
 /// Resolve a single explicit agent from flags, or `None` for auto-detect mode.
@@ -230,10 +286,31 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
     let mut no_guidance = false;
     let mut agent: Option<AgentKind> = None;
     let mut wrappers: Option<bool> = None;
+    let mut permissions: Option<bool> = None;
+    let mut permissions_tier = PermissionsTier::default();
 
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
+        let arg = args[i].as_str();
+        // Handle --permissions-tier=<value> (inline =) and --permissions-tier <value> (space-separated).
+        if arg == "--permissions-tier" {
+            i += 1;
+            if i >= args.len() {
+                anyhow::bail!(
+                    "missing value for --permissions-tier\n\
+                     Valid values: seed, mirror, blanket"
+                );
+            }
+            permissions_tier = PermissionsTier::parse(args[i].as_str())?;
+            i += 1;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--permissions-tier=") {
+            permissions_tier = PermissionsTier::parse(val)?;
+            i += 1;
+            continue;
+        }
+        match arg {
             "--global" => { /* default, no-op */ }
             "--project" => project = true,
             "--yes" | "-y" => yes = true,
@@ -258,6 +335,24 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
                     );
                 }
                 wrappers = Some(false);
+            }
+            "--permissions" => {
+                if permissions == Some(false) {
+                    anyhow::bail!(
+                        "--permissions and --no-permissions are mutually exclusive\n\
+                         Use one or the other, not both."
+                    );
+                }
+                permissions = Some(true);
+            }
+            "--no-permissions" => {
+                if permissions == Some(true) {
+                    anyhow::bail!(
+                        "--permissions and --no-permissions are mutually exclusive\n\
+                         Use one or the other, not both."
+                    );
+                }
+                permissions = Some(false);
             }
             "--agent" => {
                 i += 1;
@@ -293,6 +388,16 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
         i += 1;
     }
 
+    // Cross-flag conflict: --permissions + --project is an error.
+    // Permissions seeding is user-scope only; project settings are repository-controlled.
+    if permissions == Some(true) && project {
+        anyhow::bail!(
+            "--permissions and --project are mutually exclusive: \
+             permissions seeding is user-scope only; \
+             --project settings are repository-controlled"
+        );
+    }
+
     Ok(InitFlags {
         project,
         yes,
@@ -302,6 +407,8 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
         no_guidance,
         agent,
         wrappers,
+        permissions,
+        permissions_tier,
     })
 }
 
@@ -408,6 +515,8 @@ mod tests {
             no_guidance: false,
             agent: Some(AgentKind::Cursor),
             wrappers: None,
+            permissions: None,
+            permissions_tier: PermissionsTier::Seed,
         };
         assert_eq!(resolve_single_agent(&flags), Some(AgentKind::Cursor));
     }
@@ -423,6 +532,8 @@ mod tests {
             no_guidance: false,
             agent: None,
             wrappers: None,
+            permissions: None,
+            permissions_tier: PermissionsTier::Seed,
         };
         assert_eq!(resolve_single_agent(&flags), None);
     }
@@ -512,6 +623,8 @@ mod tests {
             no_guidance: false,
             agent: Some(AgentKind::Cursor),
             wrappers: None,
+            permissions: None,
+            permissions_tier: PermissionsTier::Seed,
         };
         // env is unused when agent is explicit; default env is fine
         assert_eq!(
@@ -534,6 +647,8 @@ mod tests {
             no_guidance: false,
             agent: None,
             wrappers: None,
+            permissions: None,
+            permissions_tier: PermissionsTier::Seed,
         };
         let env = DetectionEnv {
             home_dir: Some(std::path::PathBuf::from(
@@ -730,6 +845,157 @@ mod tests {
         assert!(
             result.unwrap_err().to_string().contains("home directory"),
             "error must mention home directory"
+        );
+    }
+
+    // ---- --permissions / --no-permissions ----
+
+    #[test]
+    fn test_parse_flags_permissions_true() {
+        let flags = parse_flags(&["--permissions".to_string()]).unwrap();
+        assert_eq!(
+            flags.permissions,
+            Some(true),
+            "--permissions must set Some(true)"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_no_permissions_false() {
+        let flags = parse_flags(&["--no-permissions".to_string()]).unwrap();
+        assert_eq!(
+            flags.permissions,
+            Some(false),
+            "--no-permissions must set Some(false)"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_absent_is_none() {
+        let flags = parse_flags(&["--yes".to_string()]).unwrap();
+        assert_eq!(
+            flags.permissions, None,
+            "absent --permissions flag must yield None"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_and_no_permissions_conflict() {
+        let result = parse_flags(&["--permissions".to_string(), "--no-permissions".to_string()]);
+        assert!(
+            result.is_err(),
+            "--permissions and --no-permissions must conflict"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "error must mention mutual exclusion: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_no_permissions_then_permissions_conflict() {
+        let result = parse_flags(&["--no-permissions".to_string(), "--permissions".to_string()]);
+        assert!(
+            result.is_err(),
+            "--no-permissions followed by --permissions must conflict"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "error must mention mutual exclusion: {err}"
+        );
+    }
+
+    // ---- --permissions-tier ----
+
+    #[test]
+    fn test_parse_flags_permissions_tier_default_is_seed() {
+        let flags = parse_flags(&["--yes".to_string()]).unwrap();
+        assert_eq!(
+            flags.permissions_tier,
+            PermissionsTier::Seed,
+            "default tier must be Seed"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_tier_seed() {
+        let flags = parse_flags(&["--permissions-tier".to_string(), "seed".to_string()]).unwrap();
+        assert_eq!(flags.permissions_tier, PermissionsTier::Seed);
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_tier_mirror() {
+        let flags = parse_flags(&["--permissions-tier".to_string(), "mirror".to_string()]).unwrap();
+        assert_eq!(flags.permissions_tier, PermissionsTier::Mirror);
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_tier_blanket() {
+        let flags =
+            parse_flags(&["--permissions-tier".to_string(), "blanket".to_string()]).unwrap();
+        assert_eq!(flags.permissions_tier, PermissionsTier::Blanket);
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_tier_inline_equals() {
+        let flags = parse_flags(&["--permissions-tier=mirror".to_string()]).unwrap();
+        assert_eq!(flags.permissions_tier, PermissionsTier::Mirror);
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_tier_invalid_value_errors() {
+        let result = parse_flags(&["--permissions-tier".to_string(), "unknown".to_string()]);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("invalid --permissions-tier value"),
+            "error must name the invalid value: {err}"
+        );
+        assert!(
+            err.contains("seed") && err.contains("mirror") && err.contains("blanket"),
+            "error must list valid values: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_tier_missing_value_errors() {
+        let result = parse_flags(&["--permissions-tier".to_string()]);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("missing value"),
+            "error must mention missing value: {err}"
+        );
+    }
+
+    // ---- --permissions + --project conflict ----
+
+    #[test]
+    fn test_parse_flags_permissions_and_project_conflict() {
+        let result = parse_flags(&["--permissions".to_string(), "--project".to_string()]);
+        assert!(result.is_err(), "--permissions and --project must conflict");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("--permissions") && err.contains("--project"),
+            "error must name both flags: {err}"
+        );
+        assert!(
+            err.contains("user-scope") || err.contains("repository-controlled"),
+            "error must explain the scope constraint: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_no_permissions_with_project_is_ok() {
+        // --no-permissions with --project is fine — the conflict only applies
+        // to --permissions (seeding), not to --no-permissions (explicit opt-out).
+        let result = parse_flags(&["--no-permissions".to_string(), "--project".to_string()]);
+        assert!(
+            result.is_ok(),
+            "--no-permissions + --project should not conflict: {:?}",
+            result
         );
     }
 
