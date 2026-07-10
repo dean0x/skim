@@ -7,8 +7,9 @@
 //! - Resolve a `--ast` pattern to scored `Vec<(FileId, f64)>` for compound RRF ranking (#198).
 //! - Standalone AST query dispatch (`--ast` only, no text query).
 //! - Output formatters: text and JSON for AST-only results (delegates to `rskim_search::compound::output`).
-//! - Line-span re-parse: after limit is applied, re-parse each matched file to
-//!   recover a representative line number and snippet (AC-F1, #201).
+//! - Line anchor: for real-node patterns, gate + anchor run atomically before
+//!   truncation (AD-397-4, #397); for synthetic patterns, anchor is recovered
+//!   post-truncation via `recover_line` (AC-F1, #201).
 //!
 //! # Relationship to temporal.rs
 //!
@@ -246,6 +247,7 @@ pub(super) fn run_ast_standalone(
     // Hoist sorted_paths() once — reused for the blast-radius membership check
     // (fid.0 as usize), the verify gate, and the path-resolution step below.
     let sorted = manifest.sorted_paths();
+    let is_synthetic = ast_query_is_synthetic(&query);
 
     // AD-374-3 / AD-355-2: verify-then-truncate-LAST with a candidate pool.
     //
@@ -262,9 +264,6 @@ pub(super) fn run_ast_standalone(
     // Temporal path: the temporal resort also needs a wider window so hot files
     // beyond raw rank `limit` can be promoted (AC-F4 temporal contract). We take
     // the MAX of the temporal window and the verify pool so both constraints are met.
-    // Determine once if the query is synthetic (used for pool sizing and gate routing).
-    let is_synthetic = ast_query_is_synthetic(&query);
-
     let temporal_active = temporal_sort.is_some() && temporal_db.is_some();
     let temporal_window = if temporal_active {
         super::temporal::resort_window(limit)
