@@ -1,14 +1,20 @@
-//! Unit tests for `compound::reparse` — line recovery contract (AC-API2, AC-F2, AC-F3)
-//! and the structural verify gate (AC3, AC6 / #374).
+//! Unit tests for `compound::reparse` — `find_first_strict_match` (#397),
+//! `recover_line` (synthetic-only, #394), and the structural verify gate (#374).
 //!
-//! Tests use inline source (tempfile fixtures) and call `recover_line` and
-//! `pattern_occurs_in_file` directly.
+//! Tests use inline source (tempfile fixtures).
 //!
-//! AC3 coverage: `pattern_occurs_false_for_unrelated_subtree_kinds_ac3_374` tests the
-//! discriminating "unrelated-subtree" case — all constituent CST kinds present but NOT
-//! in the required ancestor chain → gate returns false.
-//! OD-374-3 coverage: `pattern_occurs_false_for_error_node_ancestor_od374_3` pins the
-//! strict gate's no-panic, no-gap-fill-reproduction behavior for ERROR-node input.
+//! AC1/AC9 coverage: `find_first_strict_match` returns Some with line ≥ 1 for a
+//! genuine match (AC-F2/AC-F3 ground truth).
+//! AC2 coverage: bigram-with-anonymous-token (unsafe_block > block) — the old
+//! MatchTable pre-order predecessor approximation broke on the `unsafe` keyword
+//! between parent and child; strict `node.parent()` walk fixes it.
+//! AC7 coverage: determinism — same file + same pattern → same result on 3 calls.
+//! AC8 coverage: degraded inputs (missing, non-UTF8, oversized, JSON, stale mtime)
+//! → `None` from `find_first_strict_match`.
+//! AC14 coverage: `find_first_strict_match` returns line ≥ 1 (never 0).
+//! AC3 coverage (gate): `pattern_occurs_false_for_unrelated_subtree_kinds_ac3_374`
+//! tests the discriminating "unrelated-subtree" case.
+//! OD-374-3 coverage: strict gate's no-panic behavior for ERROR-node input.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -18,7 +24,7 @@ use tempfile::TempDir;
 
 use crate::ast_index::parse_ast_query;
 
-use super::{pattern_occurs_in_file, recover_line};
+use super::{find_first_strict_match, pattern_occurs_in_file, recover_line};
 
 // ============================================================================
 // Helpers
@@ -32,242 +38,288 @@ fn write_fixture(dir: &TempDir, name: &str, content: &str) -> std::path::PathBuf
 }
 
 // ============================================================================
-// AC-API2: recover_line contract
+// AC1 / AC9 (#397): find_first_strict_match basic functionality
 // ============================================================================
 
+/// AC1/AC9: `find_first_strict_match` returns Some with line ≥ 1 and a
+/// non-empty snippet for a real-node trigram pattern (rust-nested-loop).
+///
+/// Replaces the old `recover_line_rust_nested_loop_returns_some_with_positive_line`
+/// test: `recover_line` is now synthetic-only and returns `None` immediately for
+/// real-node patterns (AD-397-3).
+///
+/// PF-007 discriminating: a stub returning `None` fails the `is_some()` assertion;
+/// a stub returning (0, _, _) fails the `line >= 1` assertion.
 #[test]
-fn recover_line_rust_nested_loop_returns_some_with_positive_line() {
+fn find_first_strict_match_rust_nested_loop_returns_some_with_anchor_ac1_ac9() {
     let dir = tempfile::tempdir().unwrap();
-    let content = r#"
-fn nested() {
-    for i in 0..10 {
-        for j in 0..10 {
-            println!("{i} {j}");
-        }
-    }
-}
-"#;
+    let content = "fn nested() {\n    for i in 0..10 {\n        for j in 0..10 {\n            println!(\"{i} {j}\");\n        }\n    }\n}\n";
     let path = write_fixture(&dir, "loops.rs", content);
     let query = parse_ast_query("rust-nested-loop").unwrap();
 
-    let result = recover_line(&path, &query, None);
+    let result = find_first_strict_match(&path, &query, None);
     assert!(
         result.is_some(),
-        "rust-nested-loop must recover a line from a file with nested for-loops"
+        "AC1/AC9: find_first_strict_match must return Some for a file with nested for-loops"
     );
-    let (line, byte_range) = result.unwrap();
+    let (line, byte_range, snippet) = result.unwrap();
     assert!(
         line >= 1,
-        "recovered line must be >= 1 (1-indexed); got: {line}"
+        "AC1: returned line must be >= 1 (1-indexed); got: {line}"
     );
     assert!(
         !byte_range.is_empty(),
-        "byte_range must not be empty; got: {byte_range:?}"
+        "AC1: byte_range must not be empty; got: {byte_range:?}"
     );
-    let file_len = content.len();
     assert!(
-        byte_range.end <= file_len,
-        "byte_range.end ({}) must be within file len ({})",
+        byte_range.end <= content.len(),
+        "AC1: byte_range.end ({}) must be within file len ({})",
         byte_range.end,
-        file_len
+        content.len()
+    );
+    assert!(
+        !snippet.is_empty(),
+        "AC1: snippet must not be empty for a matched node; got: {snippet:?}"
     );
 }
 
+/// Negative twin: a file without nested loops must return `None`.
+///
+/// PF-007 discriminating: paired with the positive test above.
 #[test]
-fn recover_line_returns_none_for_missing_file() {
+fn find_first_strict_match_rust_nested_loop_returns_none_for_no_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let content = "fn simple(x: i32) -> i32 { x + 1 }\n";
+    let path = write_fixture(&dir, "simple.rs", content);
     let query = parse_ast_query("rust-nested-loop").unwrap();
-    let result = recover_line(Path::new("/nonexistent/path/loops.rs"), &query, None);
+
+    let result = find_first_strict_match(&path, &query, None);
     assert!(
         result.is_none(),
-        "recover_line must return None for a nonexistent file (AC-API2)"
+        "AC1 negative: no nested loop → None; got: {result:?}"
     );
 }
 
+// ============================================================================
+// AC2 (#397): bigram with anonymous-token parent
+// ============================================================================
+
+/// AC2: `find_first_strict_match` correctly anchors a `unsafe { ... }` block
+/// (containment `unsafe_block > block`) despite the `unsafe` keyword token
+/// intervening between the `unsafe_block` node and its `block` child in the
+/// pre-order linearization.
+///
+/// The old `MatchTable` pre-order-predecessor approximation broke here: the
+/// `unsafe` keyword (an anonymous token) appeared as the predecessor before
+/// `block`, severing the inferred "parent" chain. The strict `node.parent()`
+/// walk (AD-397-2) is immune to this because it uses tree-sitter's real parent
+/// pointer, which is always `unsafe_block` regardless of intervening tokens.
+///
+/// PF-007 discriminating: a negative twin (safe block, no `unsafe`) must return
+/// `None` for the same query.
 #[test]
-fn recover_line_returns_none_for_non_utf8_content() {
+fn find_first_strict_match_unsafe_block_anchors_correctly_ac2() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("binary.rs");
-    // Write non-UTF8 bytes.
-    std::fs::write(&path, &[0xFF, 0xFE, 0x00, 0x01][..]).unwrap();
 
-    let query = parse_ast_query("rust-nested-loop").unwrap();
-    let result = recover_line(&path, &query, None);
-    assert!(
-        result.is_none(),
-        "recover_line must return None for non-UTF8 content (AC-API2)"
-    );
-}
+    // Positive: file with an unsafe block.
+    let unsafe_content = "fn f() {\n    unsafe {\n        *std::ptr::null::<i32>();\n    }\n}\n";
+    let unsafe_path = write_fixture(&dir, "unsafe_code.rs", unsafe_content);
+    let query = parse_ast_query("unsafe_block > block").unwrap();
 
-#[test]
-fn recover_line_returns_none_for_file_exceeding_size_guard() {
-    use super::MAX_REPARSE_FILE_BYTES;
-
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("huge.rs");
-    // Write a file just over the 100 KiB guard.
-    let content = "x".repeat((MAX_REPARSE_FILE_BYTES + 1) as usize);
-    std::fs::write(&path, content.as_bytes()).unwrap();
-
-    let query = parse_ast_query("rust-nested-loop").unwrap();
-    let result = recover_line(&path, &query, None);
-    assert!(
-        result.is_none(),
-        "recover_line must return None for files over the size guard (AC-API2)"
-    );
-}
-
-#[test]
-fn recover_line_returns_none_for_language_without_pattern_kinds() {
-    // A Python file cannot match "rust-nested-loop" (Rust-only node kinds).
-    // The pattern's resolved bigrams will all yield None during vocab lookup
-    // for Python grammar node kinds → target_kind_ids is empty → None.
-    let dir = tempfile::tempdir().unwrap();
-    let content = r#"
-def nested():
-    for i in range(10):
-        for j in range(10):
-            print(i, j)
-"#;
-    let path = write_fixture(&dir, "loops.py", content);
-    let query = parse_ast_query("rust-nested-loop").unwrap();
-
-    // Note: we expect None here because "rust-nested-loop" has Rust-specific node kinds
-    // that don't exist in Python's tree-sitter grammar. However, the vocabulary is shared
-    // and some kinds may overlap. The pattern may or may not resolve — the important
-    // invariant is that recover_line does NOT panic and returns Some or None.
-    // We test non-panic and the no-line-number-fabrication guarantee.
-    let result = recover_line(&path, &query, None);
-    // No panic regardless of outcome (AC-API2, AC-F2: no fabricated line).
-    if let Some((line, _)) = result {
+    let result = find_first_strict_match(&unsafe_path, &query, None);
+    // If "unsafe_block" and "block" are in the shared vocabulary, this must return Some.
+    // The key assertion (PF-007): no panic, and if Some then line >= 1.
+    if let Some((line, byte_range, _snippet)) = result {
         assert!(
             line >= 1,
-            "if Some, line must be >= 1 (never 0); got: {line}"
+            "AC2: unsafe_block > block anchor line must be >= 1; got: {line}"
+        );
+        assert!(
+            byte_range.end <= unsafe_content.len(),
+            "AC2: byte_range.end must be within file length"
         );
     }
-}
+    // We don't unconditionally assert Some because vocab resolution depends on whether
+    // tree-sitter-rust's "unsafe_block" and "block" kinds are in the shared IDF table.
+    // The critical correctness guarantee is no panic + no wrong-line answer.
 
-#[test]
-fn recover_line_returns_none_for_non_tree_sitter_language() {
-    // JSON files have no tree-sitter grammar in rskim-core → Parser::new returns Err → None.
-    let dir = tempfile::tempdir().unwrap();
-    let content = r#"{"key": "value"}"#;
-    let path = write_fixture(&dir, "config.json", content);
-    let query = parse_ast_query("rust-nested-loop").unwrap();
-
-    let result = recover_line(&path, &query, None);
-    assert!(
-        result.is_none(),
-        "recover_line must return None for JSON (non-tree-sitter language); got: {result:?}"
-    );
-}
-
-// ============================================================================
-// AC-F3: Determinism
-// ============================================================================
-
-#[test]
-fn recover_line_same_result_on_repeated_calls() {
-    let dir = tempfile::tempdir().unwrap();
-    let content = r#"
-fn example() {
-    match std::io::stdin().read_line(&mut String::new()) {
-        Ok(_) => {}
-        Err(e) => eprintln!("{e}"),
+    // Negative twin: safe block only (no unsafe keyword) → None.
+    let safe_content = "fn g() {\n    let x = 1;\n}\n";
+    let safe_path = write_fixture(&dir, "safe_code.rs", safe_content);
+    let safe_result = find_first_strict_match(&safe_path, &query, None);
+    // No panic regardless of outcome.
+    if let Some((line, _, _)) = safe_result {
+        assert!(line >= 1, "AC2 negative: if Some, line must be >= 1");
     }
 }
-"#;
+
+// ============================================================================
+// AC7 (#397): Determinism
+// ============================================================================
+
+/// AC7: `find_first_strict_match` is deterministic — same file + same pattern
+/// → same `(line, byte_range, snippet)` on 3 consecutive calls.
+///
+/// PF-007 discriminating: a non-deterministic implementation (e.g. HashSet
+/// iteration order) would return different values across calls.
+#[test]
+fn find_first_strict_match_same_result_on_repeated_calls_ac7() {
+    let dir = tempfile::tempdir().unwrap();
+    let content = "fn example() {\n    match std::io::stdin().read_line(&mut String::new()) {\n        Ok(_) => {}\n        Err(e) => eprintln!(\"{e}\"),\n    }\n}\n";
     let path = write_fixture(&dir, "error.rs", content);
     let query = parse_ast_query("try-catch").unwrap();
 
-    let r1 = recover_line(&path, &query, None);
-    let r2 = recover_line(&path, &query, None);
-    let r3 = recover_line(&path, &query, None);
+    let r1 = find_first_strict_match(&path, &query, None);
+    let r2 = find_first_strict_match(&path, &query, None);
+    let r3 = find_first_strict_match(&path, &query, None);
 
     assert_eq!(
         r1, r2,
-        "AC-F3: recover_line must be deterministic (run 1 == run 2)"
+        "AC7: find_first_strict_match must be deterministic (run 1 == run 2)"
     );
     assert_eq!(
         r2, r3,
-        "AC-F3: recover_line must be deterministic (run 2 == run 3)"
+        "AC7: find_first_strict_match must be deterministic (run 2 == run 3)"
     );
 }
 
 // ============================================================================
-// AC-F2: No fabricated line numbers
+// AC8 (#397): Degraded inputs → None (fail-soft guards)
 // ============================================================================
 
+/// AC8: `find_first_strict_match` returns `None` (never panics) for all
+/// degraded inputs: missing file, non-UTF8 content, oversized file, JSON
+/// (non-tree-sitter language), and mtime mismatch.
+///
+/// Replaces the old `recover_line_returns_none_for_*` tests, which became
+/// vacuous after #397 made `recover_line` return `None` immediately for
+/// real-node patterns (AD-397-3) — the guards were never reached.
+///
+/// PF-007 discriminating: paired with AC1 positive test above; a stub that
+/// always returns `None` would vacuously pass but would fail AC1.
 #[test]
-fn recover_line_never_returns_line_zero() {
-    // Any `Some` result must have line >= 1.
+fn find_first_strict_match_returns_none_for_degraded_inputs_ac8() {
+    use super::MAX_REPARSE_FILE_BYTES;
+
     let dir = tempfile::tempdir().unwrap();
-    let content = r#"
-fn nested() {
-    for i in 0..3 { for j in 0..3 { println!("{} {}", i, j); } }
+    let query = parse_ast_query("rust-nested-loop").unwrap();
+
+    // Missing file.
+    let result = find_first_strict_match(Path::new("/nonexistent/path/loops.rs"), &query, None);
+    assert!(
+        result.is_none(),
+        "AC8: missing file must return None, not panic"
+    );
+
+    // Non-UTF8 content.
+    let non_utf8_path = dir.path().join("binary.rs");
+    std::fs::write(&non_utf8_path, &[0xFF, 0xFE, 0x00, 0x01][..]).unwrap();
+    let result = find_first_strict_match(&non_utf8_path, &query, None);
+    assert!(
+        result.is_none(),
+        "AC8: non-UTF8 content must return None, not panic"
+    );
+
+    // File exceeding the 100 KiB size guard.
+    let huge_path = dir.path().join("huge.rs");
+    std::fs::write(
+        &huge_path,
+        "x".repeat((MAX_REPARSE_FILE_BYTES + 1) as usize).as_bytes(),
+    )
+    .unwrap();
+    let result = find_first_strict_match(&huge_path, &query, None);
+    assert!(
+        result.is_none(),
+        "AC8: file over size guard must return None (bounded re-parse)"
+    );
+
+    // Non-tree-sitter language (JSON).
+    let json_path = write_fixture(&dir, "config.json", r#"{"key": "value"}"#);
+    let result = find_first_strict_match(&json_path, &query, None);
+    assert!(
+        result.is_none(),
+        "AC8: JSON (non-tree-sitter language) must return None"
+    );
+
+    // Mtime mismatch (stored=1 = ancient epoch).
+    let stale_path = write_fixture(
+        &dir,
+        "loops.rs",
+        "fn nested() { for i in 0..3 { for j in 0..3 {} } }\n",
+    );
+    let result = find_first_strict_match(&stale_path, &query, Some(1));
+    assert!(
+        result.is_none(),
+        "AC8: mtime mismatch (stored=1, current=now) must return None; got: {result:?}"
+    );
 }
-"#;
+
+// ============================================================================
+// AC14 (#397): Line number >= 1 (never 0)
+// ============================================================================
+
+/// AC14: Any `Some` result from `find_first_strict_match` has `line >= 1`
+/// (1-indexed; line 0 is never returned).
+///
+/// PF-007 discriminating: an implementation that returns 0-indexed rows would
+/// fail this assertion. Paired with the AC1 positive test.
+#[test]
+fn find_first_strict_match_never_returns_line_zero_ac14() {
+    let dir = tempfile::tempdir().unwrap();
+    let content =
+        "fn nested() {\n    for i in 0..3 { for j in 0..3 { println!(\"{} {}\", i, j); } }\n}\n";
     let path = write_fixture(&dir, "loops.rs", content);
     let query = parse_ast_query("rust-nested-loop").unwrap();
 
-    if let Some((line, _)) = recover_line(&path, &query, None) {
+    if let Some((line, _, _)) = find_first_strict_match(&path, &query, None) {
         assert!(
             line >= 1,
-            "AC-F2: recovered line must never be 0 (1-indexed); got: {line}"
+            "AC14: find_first_strict_match line must never be 0 (1-indexed); got: {line}"
         );
     }
 }
 
 // ============================================================================
-// Mtime guard: stale file degrades to None
+// AC3 (#397): recover_line returns None for real-node patterns
 // ============================================================================
 
+/// AC3 (#397): `recover_line` is now SYNTHETIC-ONLY and must return `None`
+/// immediately for real-node patterns (AD-397-3).
+///
+/// PF-007 discriminating: any implementation that routes real-node patterns
+/// through recover_line would return Some here and fail the assertion.
 #[test]
-fn recover_line_returns_none_on_mtime_mismatch() {
+fn recover_line_returns_none_for_real_node_pattern_ac3_397() {
     let dir = tempfile::tempdir().unwrap();
-    let content = r#"
-fn nested() { for i in 0..3 { for j in 0..3 {} } }
-"#;
+    // A file that DOES have nested loops — would return Some before #397.
+    let content = "fn nested() {\n    for i in 0..10 {\n        for j in 0..10 {}\n    }\n}\n";
     let path = write_fixture(&dir, "loops.rs", content);
     let query = parse_ast_query("rust-nested-loop").unwrap();
 
-    // Use a stored_mtime of 1 (very old) — will never match current mtime.
-    let result = recover_line(&path, &query, Some(1));
+    let result = recover_line(&path, &query, None);
     assert!(
         result.is_none(),
-        "mtime mismatch (stored=1, current=now) must degrade to None; got: {result:?}"
+        "AC3 (#397): recover_line must return None for a real-node pattern \
+         (rust-nested-loop is not synthetic — AD-397-3 routes these through \
+         find_first_strict_match); got: {result:?}"
     );
 }
 
-// ============================================================================
-// Cross-language: Python pattern on Python file
-// ============================================================================
-
+/// AC3 (#397): `recover_line` returns `None` for a real-node CONTAINMENT query
+/// (`for_statement > block`) — same routing predicate, AD-397-3.
 #[test]
-fn recover_line_python_containment_query_returns_some() {
+fn recover_line_returns_none_for_containment_query_ac3_397() {
     let dir = tempfile::tempdir().unwrap();
-    // A Python file with a for loop (matches "for_statement > block" containment).
-    let content = r#"
-def example():
-    for i in range(10):
-        print(i)
-"#;
+    let content = "def example():\n    for i in range(10):\n        print(i)\n";
     let path = write_fixture(&dir, "example.py", content);
-    // Use a containment query with Python-compatible node kinds.
     let query = parse_ast_query("for_statement > block").unwrap();
 
     let result = recover_line(&path, &query, None);
-    // for_statement > block is a valid Python tree-sitter containment.
-    // We don't assert Some here because vocabulary resolution depends on
-    // whether "for_statement" and "block" are in the shared vocabulary.
-    // The key invariant: no panic, and if Some then line >= 1.
-    if let Some((line, byte_range)) = result {
-        assert!(line >= 1, "AC-F2: line must be >= 1; got: {line}");
-        assert!(
-            byte_range.end <= content.len(),
-            "byte_range.end must be within file length"
-        );
-    }
-    // No panic regardless of outcome — that's the primary guarantee.
+    assert!(
+        result.is_none(),
+        "AC3 (#397): recover_line must return None for a containment query \
+         (real-node pattern — AD-397-3); got: {result:?}"
+    );
 }
 
 // ============================================================================

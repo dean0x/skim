@@ -482,22 +482,30 @@ fn read_line_at(abs_path: &Path, line_1indexed: u32, max_bytes: u64) -> Option<S
 /// a membership check of what the index already indexed), so a K=5 multiplier
 /// and a 100-file floor are unnecessary overhead for them.
 ///
-/// # Design note — intentionally bigrams-only (pool sizing, not routing)
+/// # Design note — intentionally bigrams-only
 ///
 /// This function inspects `resolved_bigrams()` only. It does NOT delegate to
 /// `compound::reparse::query_contains_synthetic_id` (which also checks trigrams
-/// and handles the Containment variant). This is safe because:
+/// and handles the Containment variant). Its correctness rests on the predicate
+/// being EXACT for every shipping pattern — NOT on either misclassification
+/// direction being harmless:
 ///
-/// - Its sole use is pool sizing, not routing. A false 'not synthetic' causes
-///   over-provisioning (always correct); a false 'synthetic' under-provisions
-///   (still correct — the verify gate is the source of truth for correctness).
-/// - All 5 current synthetic patterns are single-bigram/zero-trigram (OD-394-2),
-///   so this predicate and `query_contains_synthetic_id` agree for every live
-///   pattern.
+/// - It gates ROUTING as well as pool sizing (#397): real-node patterns route to
+///   `find_first_strict_match`; synthetic patterns route to `pattern_occurs_in_file`
+///   plus the post-truncation `recover_line`. In the routing use a misclassification
+///   is NOT harmless — a genuinely-synthetic query classified 'not synthetic' would
+///   route to `find_first_strict_match`, which returns `None` for synthetic IDs, and
+///   the file would be DROPPED (recall loss, an ADR-007 violation).
+/// - It is exact for every live pattern: all 24 real-node patterns carry no
+///   synthetic ID in any n-gram (→ `false`), and all 5 synthetic patterns are
+///   single-bigram/zero-trigram (OD-394-2) (→ `true`). So it agrees with
+///   `query_contains_synthetic_id` for every shipping pattern.
 ///
-/// If a future synthetic-trigram pattern is added, this function conservatively
-/// classifies it as 'not synthetic', causing over-provisioning. That is the
-/// correct failure mode for a pool-sizing heuristic.
+/// A future synthetic-TRIGRAM pattern would defeat this bigrams-only check
+/// (misclassified 'not synthetic'). Such a pattern is unsupported today and is
+/// already rejected by the production guard in `pattern_occurs_in_file`'s
+/// synthetic branch; adding one requires updating this predicate together with
+/// that guard.
 fn ast_query_is_synthetic(query: &AstQuery) -> bool {
     match query {
         AstQuery::Pattern(p) => p.resolved_bigrams().iter().any(|bg| {
