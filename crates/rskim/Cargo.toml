@@ -1,6 +1,6 @@
 [package]
 name = "rskim"
-version = "2.10.0"
+version = "2.11.0"
 edition = "2024"
 authors = ["Skim Contributors"]
 license = "MIT"
@@ -13,7 +13,7 @@ name = "skim"
 path = "src/main.rs"
 
 [dependencies]
-rskim-core = { version = "2.10.0", path = "../rskim-core" }
+rskim-core = { version = "2.11.0", path = "../rskim-core" }
 rskim-search = { path = "../rskim-search" }
 # Delegates token counting to the multi-provider library (AC13, AC15).
 # Do NOT enable "net-anthropic" here — default build must remain HTTP-free (AC9).

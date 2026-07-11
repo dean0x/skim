@@ -149,6 +149,13 @@ what the command did. If compressed output ever looks incomplete,
 garbled, or inconsistent with what you expected, flag it to the user
 rather than silently working around it.
 
+At install time the user may have approved a small allowlist of
+these skim-wrapped commands, so some run without asking again while
+others still prompt for approval — both are intended.
+Do not change permission or allowlist settings yourself to avoid a
+prompt. If a wrapped command is denied when you did not expect it,
+surface the denial to the user rather than working around it.
+
 ### When to use skim
 
 **General principle:** Use skim when structure is sufficient for your task.
@@ -468,6 +475,11 @@ mod tests {
         assert!(
             content.contains("flag it to the user"),
             "Guidance must instruct agents to flag garbled compressed output"
+        );
+        // Permissions-awareness: agents must not change permission/allowlist settings
+        assert!(
+            content.contains("Do not change permission or allowlist settings"),
+            "Guidance must instruct agents not to change permission or allowlist settings"
         );
         // No rskim mention in guidance body
         assert!(!content.contains("rskim"));
