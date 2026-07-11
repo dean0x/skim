@@ -83,15 +83,16 @@ impl PermissionsProtocol for ClaudePermissions {
         // Navigate to permissions.allow, erroring loudly if type is wrong.
         let allow_array = get_or_create_allow_array(&mut settings, &config_path)?;
 
-        // Collect already-present entries for dedup.
-        let existing: Vec<String> = allow_array
+        // Collect already-present entries for dedup (HashSet for O(1) membership — consistent
+        // with is_current() which uses the same idiom).
+        let existing: HashSet<String> = allow_array
             .iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
 
         let mut entries_added: Vec<String> = Vec::new();
         for entry in entries {
-            if !existing.contains(entry) {
+            if !existing.contains(entry.as_str()) {
                 allow_array.push(serde_json::Value::String(entry.clone()));
                 entries_added.push(entry.clone());
             }
@@ -162,11 +163,11 @@ impl PermissionsProtocol for ClaudePermissions {
 
         // Remove only entries that are BOTH in the sidecar AND byte-equal present.
         let mut entries_removed: Vec<String> = Vec::new();
-        let seeded: HashSet<&String> = sidecar.entries.iter().collect();
+        let seeded: HashSet<&str> = sidecar.entries.iter().map(String::as_str).collect();
 
         allow_array.retain(|v| {
             let s = v.as_str().unwrap_or("");
-            if seeded.contains(&s.to_string()) {
+            if seeded.contains(s) {
                 entries_removed.push(s.to_string());
                 false // remove from array
             } else {
@@ -253,6 +254,20 @@ pub(crate) struct MirrorProposal {
 /// - No `*` or regex-ish chars inside the inner content (outside the trailing `:*`)
 ///
 /// Rejected: `Bash(*)`, any wildcard/regex shape, non-Bash rules, malformed parens.
+///
+/// ## Seed-tier exclusions are intentionally NOT enforced here
+///
+/// The seed tier excludes certain tools for arg-safety reasons (`find`, `env`,
+/// `printenv`, `ps`, `dig`, `nslookup`): `Bash(skim <tool>:*)` entries do not
+/// bound the wrapped tool's arguments, so only tools whose full argument space is
+/// read-only safe may be seeded (ADR-006 / exclusions-for-cause).
+///
+/// The **mirror tier** does not apply those exclusions because it never expands the
+/// trust envelope: it only mirrors a `Bash(<tool>:*)` entry the user has already
+/// granted. The user already allowed the base tool; adding `Bash(skim <tool>:*)`
+/// alongside it does not grant any new capability — it merely extends the
+/// existing grant to the skim-wrapped form. Enforcing the seed exclusions on the
+/// mirror path would silently drop valid user grants with no benefit.
 fn is_valid_mirror_source(entry: &str) -> bool {
     // Must start with `Bash(` and end with `:*)`
     let inner = match entry
@@ -451,10 +466,10 @@ pub(crate) fn seed_mirrors(
 
     // Re-run semantics: remove previously recorded mirrors first.
     if !prev_mirrors.is_empty() {
-        let prev_set: HashSet<&String> = prev_mirrors.iter().collect();
+        let prev_set: HashSet<&str> = prev_mirrors.iter().map(String::as_str).collect();
         allow_array.retain(|v| {
             let s = v.as_str().unwrap_or("");
-            !prev_set.contains(&s.to_string())
+            !prev_set.contains(s)
         });
     }
 

@@ -172,9 +172,10 @@ fn permissions_blocks_fast_path(
 ///
 /// Calls `confirm_grant` at most once (the single consent resolution point).
 ///
-/// Returns `Ok(true)` when the user consented (or when nothing new will be written).
+/// Returns `Ok(true)` when the user consented.
 /// Returns `Ok(false)` when consent was not obtained: non-TTY, explicit opt-out,
-/// user declined, or no writer exists for this agent.
+/// user declined, no writer exists for this agent, empty mirror proposals, or
+/// Copilot seeding is impossible (not inside a git repository).
 fn resolve_permissions_consent(
     flags: &InitFlags,
     agent: AgentKind,
@@ -208,6 +209,18 @@ fn resolve_permissions_consent(
         return Ok(false);
     }
 
+    // I-25: Copilot permissions seeding requires a git repository (the seed()
+    // implementation calls find_git_root_from_cwd() internally). Pre-check here,
+    // before any computation or prompt, so consent is never taken for an impossible
+    // seed and the install completes fully even outside a git repo.
+    if agent == AgentKind::CopilotCli && find_git_root_from_cwd().is_none() {
+        println!(
+            "  skim: Copilot permissions seeding skipped \u{2014} not inside a git repository; \
+             re-run `skim init --agent copilot --permissions` from your project root."
+        );
+        return Ok(false);
+    }
+
     // Blanket tier + Codex: hard error (Codex is unsandboxed; blanket is too broad).
     if agent == AgentKind::CodexCli && flags.permissions_tier == PermissionsTier::Blanket {
         anyhow::bail!(
@@ -222,8 +235,8 @@ fn resolve_permissions_consent(
         PermissionsTier::Mirror if agent == AgentKind::ClaudeCode => {
             let proposals = crate::cmd::permissions::claude::propose_mirrors(perm_dir)?;
             if proposals.is_empty() {
-                // No eligible source entries to mirror — treat as already current.
-                return Ok(true);
+                println!("  No existing allow-list entries eligible to mirror; nothing to seed.");
+                return Ok(false);
             }
             // Display entries with a `[mutating tool]` annotation for user clarity.
             // The annotation is display-only: actual writes use `p.mirror` verbatim.
@@ -971,33 +984,38 @@ fn is_copilot_skim_entry(entry: &serde_json::Value) -> bool {
 /// Cleans up empty event-key arrays and the empty `"hooks"` object afterwards.
 /// Returns `true` if any entries were removed.
 fn remove_copilot_skim_from_settings(settings: &mut serde_json::Value) -> bool {
+    fn hooks_array<'a>(s: &'a serde_json::Value, key: &str) -> Option<&'a [serde_json::Value]> {
+        s.get("hooks")
+            .and_then(|h| h.get(key))
+            .and_then(|v| v.as_array())
+            .map(|v| v.as_slice())
+    }
+    fn hooks_array_mut<'a>(
+        s: &'a mut serde_json::Value,
+        key: &str,
+    ) -> Option<&'a mut Vec<serde_json::Value>> {
+        s.get_mut("hooks")
+            .and_then(|h| h.get_mut(key))
+            .and_then(|v| v.as_array_mut())
+    }
+
     let mut changed = false;
     for event_key in ["preToolUse", "PreToolUse"] {
         // Two-pass: read-only pass to detect, then mutable pass to remove.
         // This avoids simultaneous mutable + immutable borrow of the same value.
-        let has_skim = settings
-            .get("hooks")
-            .and_then(|h| h.get(event_key))
-            .and_then(|v| v.as_array())
-            .is_some_and(|arr| arr.iter().any(is_copilot_skim_entry));
-        if !has_skim {
+        if !hooks_array(settings, event_key)
+            .is_some_and(|arr| arr.iter().any(is_copilot_skim_entry))
+        {
             continue;
         }
         changed = true;
-        if let Some(arr) = settings
-            .get_mut("hooks")
-            .and_then(|h| h.get_mut(event_key))
-            .and_then(|v| v.as_array_mut())
-        {
+        if let Some(arr) = hooks_array_mut(settings, event_key) {
             arr.retain(|e| !is_copilot_skim_entry(e));
         }
         // Clean up empty event-key array.
-        let is_empty = settings
-            .get("hooks")
-            .and_then(|h| h.get(event_key))
-            .and_then(|v| v.as_array())
-            .is_some_and(|a| a.is_empty());
-        if is_empty && let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        if hooks_array(settings, event_key).is_some_and(|a| a.is_empty())
+            && let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut())
+        {
             hooks.remove(event_key);
         }
     }

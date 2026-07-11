@@ -146,6 +146,8 @@ impl PermissionsProtocol for CopilotPermissions {
         })?;
         let sidecar = PermissionSidecar {
             version: 1,
+            // tier is hardcoded to "seed": Mirror requests produce the same seed-set for
+            // this agent.
             tier: "seed".to_string(),
             entries: entries.to_vec(),
             source_mirrors: std::collections::HashMap::new(),
@@ -194,12 +196,13 @@ impl PermissionsProtocol for CopilotPermissions {
             None => return Ok(RemoveOutcome::NothingToRemove),
         };
 
-        let seeded: std::collections::HashSet<&String> = sidecar.entries.iter().collect();
+        let seeded: std::collections::HashSet<&str> =
+            sidecar.entries.iter().map(String::as_str).collect();
         let mut entries_removed: Vec<String> = Vec::new();
 
         allow_array.retain(|v| {
             let s = v.as_str().unwrap_or("");
-            if seeded.contains(&s.to_string()) {
+            if seeded.contains(s) {
                 entries_removed.push(s.to_string());
                 false
             } else {
@@ -258,14 +261,13 @@ impl PermissionsProtocol for CopilotPermissions {
 // Internal helpers
 // ============================================================================
 
-/// Walk up from `cwd` looking for a directory that contains `.git`.
+/// Walk up from `start` looking for a directory that contains `.git`.
 ///
 /// Returns `None` when no `.git` is found within 64 ancestors.
 /// Bounded at 64: realistic nesting is ≤ 20 levels; the cap limits stat calls
 /// on slow/network filesystems while covering all real-world cases.
-fn find_git_root_from_cwd() -> Option<std::path::PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    let mut current = cwd.as_path();
+fn find_git_root_from(start: &Path) -> Option<std::path::PathBuf> {
+    let mut current = start;
     for _ in 0..64 {
         if current.join(".git").exists() {
             return Some(current.to_path_buf());
@@ -273,6 +275,14 @@ fn find_git_root_from_cwd() -> Option<std::path::PathBuf> {
         current = current.parent()?;
     }
     None
+}
+
+/// Walk up from `cwd` looking for a directory that contains `.git`.
+///
+/// Thin wrapper around [`find_git_root_from`] for production use.
+fn find_git_root_from_cwd() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    find_git_root_from(&cwd)
 }
 
 /// Load the permissions-config.json top-level object, or return an empty map.
@@ -381,11 +391,229 @@ mod tests {
         assert!(result.is_err(), "corrupt sidecar must return Err");
     }
 
-    // ---- find_git_root: returns None when no .git ----
+    // ---- seed: happy path ----
+
+    #[test]
+    fn test_seed_creates_permissions_config_with_allow_array() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let entries = seeded_entries(p.as_ref());
+
+        let outcome = p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+        assert!(
+            matches!(outcome, SeedOutcome::Added { .. }),
+            "first seed must report Added"
+        );
+
+        let config_path = dir.path().join("permissions-config.json");
+        assert!(
+            config_path.exists(),
+            "permissions-config.json must be created"
+        );
+
+        // Compute the expected project key the same way production code does it.
+        let project_key = find_git_root_from_cwd()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let map: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = map[&project_key]["allow"].as_array().unwrap();
+        let allow_strings: Vec<&str> = allow.iter().filter_map(|v| v.as_str()).collect();
+        for entry in &entries {
+            assert!(
+                allow_strings.contains(&entry.as_str()),
+                "allow array must contain entry: {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_seed_writes_sidecar_with_config_hash() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let entries = seeded_entries(p.as_ref());
+
+        p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+
+        let sidecar_path = dir.path().join("skim-permissions.json");
+        assert!(sidecar_path.exists(), "sidecar must be created");
+        let sidecar = load_sidecar(&sidecar_path).unwrap();
+        assert_eq!(
+            sidecar.entries, entries,
+            "sidecar must record all seeded entries"
+        );
+        assert!(
+            !sidecar.config_hash.is_empty(),
+            "sidecar must record a non-empty config_hash"
+        );
+    }
+
+    #[test]
+    fn test_seed_idempotent_returns_already_current() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let entries = seeded_entries(p.as_ref());
+
+        p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+        let second = p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+        assert!(
+            matches!(second, SeedOutcome::AlreadyCurrent),
+            "second seed must return AlreadyCurrent"
+        );
+    }
+
+    // ---- remove_seeded: happy path ----
+
+    #[test]
+    fn test_remove_seeded_removes_seeded_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let entries = seeded_entries(p.as_ref());
+
+        p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+
+        let outcome = p.remove_seeded(dir.path()).unwrap();
+        assert!(
+            matches!(outcome, RemoveOutcome::Removed { .. }),
+            "remove_seeded must report Removed"
+        );
+
+        // Allow array for the current project key must be empty after removal.
+        let config_path = dir.path().join("permissions-config.json");
+        let project_key = find_git_root_from_cwd()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let map: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow_after = map
+            .get(&project_key)
+            .and_then(|v| v.get("allow"))
+            .and_then(|a| a.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(
+            allow_after, 0,
+            "allow array must be empty after removing all seeded entries"
+        );
+
+        // Sidecar must be deleted.
+        assert!(
+            !dir.path().join("skim-permissions.json").exists(),
+            "sidecar must be deleted after successful remove_seeded"
+        );
+    }
+
+    // ---- per-project-key isolation ----
+
+    #[test]
+    fn test_seed_and_remove_do_not_affect_other_project_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let entries = seeded_entries(p.as_ref());
+
+        // Pre-populate config with an unrelated project key before seeding.
+        let unrelated_key = "/some/unrelated/project";
+        let unrelated_entries = vec![
+            "Bash(skim df:*)".to_string(),
+            "Bash(custom-tool:*)".to_string(),
+        ];
+        let initial_map = serde_json::json!({
+            unrelated_key: { "allow": &unrelated_entries }
+        });
+        let config_path = dir.path().join("permissions-config.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&initial_map).unwrap(),
+        )
+        .unwrap();
+
+        // Seed under the current project key.
+        let seed_outcome = p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+        assert!(
+            matches!(seed_outcome, SeedOutcome::Added { .. }),
+            "seed must add entries: {:?}",
+            seed_outcome
+        );
+
+        // Assert the unrelated key is intact after seed.
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let map: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow_after_seed: Vec<String> = map[unrelated_key]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            allow_after_seed, unrelated_entries,
+            "seed must not touch the unrelated project key"
+        );
+
+        // Remove seeded entries.
+        let remove_outcome = p.remove_seeded(dir.path()).unwrap();
+        assert!(
+            matches!(remove_outcome, RemoveOutcome::Removed { .. }),
+            "remove_seeded must succeed: {:?}",
+            remove_outcome
+        );
+
+        // Assert the unrelated key is still intact after remove.
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let map: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow_after_remove: Vec<String> = map[unrelated_key]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            allow_after_remove, unrelated_entries,
+            "remove_seeded must not touch the unrelated project key"
+        );
+    }
+
+    // ---- find_git_root: injectable start-path tests (I-16) ----
+
+    #[test]
+    fn test_find_git_root_from_finds_git_in_ancestor() {
+        // Arrange: tempdir with a nested subdir and a .git marker at the root level.
+        let dir = tempfile::TempDir::new().unwrap();
+        let git_marker = dir.path().join(".git");
+        std::fs::create_dir_all(&git_marker).unwrap();
+        let nested = dir.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        // Act: start from the nested subdir — should walk up and find .git at the root.
+        let found = find_git_root_from(&nested);
+
+        assert_eq!(
+            found,
+            Some(dir.path().to_path_buf()),
+            "must find .git at the ancestor root"
+        );
+    }
+
+    #[test]
+    fn test_find_git_root_from_returns_none_without_git() {
+        // Arrange: pure tempdir with no .git at any level in the tree.
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let found = find_git_root_from(dir.path());
+        assert!(
+            found.is_none(),
+            "must return None when no .git exists in the tree"
+        );
+    }
+
+    // ---- find_git_root: ambient test (cwd wrapper) ----
 
     #[test]
     fn test_find_git_root_returns_some_in_git_repo() {
-        // The test suite runs inside the skim-issues repo, so this should find a .git.
+        // The test suite runs inside the skim-issues repo, so find_git_root_from_cwd()
+        // (which delegates to find_git_root_from) should find a .git.
         let root = find_git_root_from_cwd();
         assert!(root.is_some(), "test suite should run inside a git repo");
     }

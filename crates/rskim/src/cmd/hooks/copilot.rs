@@ -43,11 +43,19 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use super::{HookInput, HookProtocol, HookSupport};
 use crate::cmd::session::AgentKind;
 
 /// Filename of the skim-owned hook registration for Copilot CLI.
 const SKIM_JSON_NAME: &str = "skim.json";
+
+/// Maximum number of hook-registration files enumerated per directory scan.
+/// Bounds the directory walk against adversarial or corrupt hook directories;
+/// matches the cap in `HookProtocol::scan_other_hooks`.
+const MAX_HOOK_FILES: usize = 50;
 
 /// Copilot CLI hook implementation (preToolUse hooks, deny-with-suggestion).
 pub(crate) struct CopilotCliHook;
@@ -195,7 +203,7 @@ impl HookProtocol for CopilotCliHook {
 // Copilot hook-file helpers
 // ============================================================================
 
-/// Write `hooks/skim.json` under `hook_config_dir`.
+/// Atomically write `hooks/skim.json` under `hook_config_dir`.
 ///
 /// The file envelope is:
 /// ```json
@@ -203,9 +211,10 @@ impl HookProtocol for CopilotCliHook {
 /// ```
 /// `script_path` is embedded in the `"bash"` field of the command entry.
 /// The hooks directory is created if it does not exist.
-/// Write order: the `.json` file itself (atomic: tmp + rename is done by
-/// `serde_json::to_string_pretty` + `std::fs::write`; no separate tmp step
-/// because this file is not the hook script — its content is idempotent).
+///
+/// Uses a `.tmp`-sibling write + rename (crash-safe), the same idiom used by
+/// `atomic_write_settings` and `write_sidecar`. On Unix the temporary file is
+/// created with mode `0o600` (owner read/write only) before the rename.
 pub(crate) fn write_copilot_skim_json(
     hook_config_dir: &Path,
     script_path: &str,
@@ -222,13 +231,31 @@ pub(crate) fn write_copilot_skim_json(
         }
     });
     let content = serde_json::to_string_pretty(&json)?;
-    std::fs::write(&skim_json_path, content)?;
+    let tmp_path = skim_json_path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, format!("{content}\n"))?;
+    #[cfg(unix)]
+    {
+        let perms = std::fs::Permissions::from_mode(0o600);
+        if let Err(e) = std::fs::set_permissions(&tmp_path, perms) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+    }
+    std::fs::rename(&tmp_path, &skim_json_path)?;
     Ok(())
 }
 
 /// Returns `true` when `skim_json` exists and contains a skim command entry
 /// under `hooks.preToolUse`.
 fn copilot_skim_json_has_entry(skim_json: &Path) -> bool {
+    use crate::cmd::init::MAX_SETTINGS_SIZE;
+    // Reject oversized files — a valid skim.json is always small.
+    if std::fs::metadata(skim_json)
+        .map(|m| m.len() > MAX_SETTINGS_SIZE)
+        .unwrap_or(true)
+    {
+        return false;
+    }
     let Ok(contents) = std::fs::read_to_string(skim_json) else {
         return false;
     };
@@ -244,18 +271,26 @@ fn copilot_skim_json_has_entry(skim_json: &Path) -> bool {
 /// Enumerate other `*.json` files in `hook_config_dir/hooks/` (i.e. everything
 /// except `skim.json`) and return the `"bash"` command strings found within.
 fn scan_copilot_foreign_hooks(hook_config_dir: &Path) -> Vec<String> {
+    use crate::cmd::init::MAX_SETTINGS_SIZE;
     let hooks_dir = hook_config_dir.join("hooks");
     let Ok(read_dir) = std::fs::read_dir(&hooks_dir) else {
         return Vec::new();
     };
     let mut other = Vec::new();
-    for entry in read_dir.flatten() {
+    for entry in read_dir.flatten().take(MAX_HOOK_FILES) {
         let path = entry.path();
         // Only *.json files that are not our own skim.json.
         if path.extension() != Some(OsStr::new("json")) {
             continue;
         }
         if path.file_name() == Some(OsStr::new(SKIM_JSON_NAME)) {
+            continue;
+        }
+        // Reject oversized files before reading — a valid hook file is small.
+        if std::fs::metadata(&path)
+            .map(|m| m.len() > MAX_SETTINGS_SIZE)
+            .unwrap_or(true)
+        {
             continue;
         }
         let Ok(contents) = std::fs::read_to_string(&path) else {
@@ -545,12 +580,13 @@ mod tests {
             serde_json::to_string_pretty(&config).unwrap(),
         )
         .unwrap();
-        // Legacy settings.json detection still works (backward compat; Subtask 6 migration).
+        // Legacy settings.json detection still works (backward compat; migration support).
         assert!(hook().detect_hook(dir.path()));
     }
 
     // ========================================================================
-    // Subtask 5: hook_config_dir seam tests
+    // hook_config_dir seam — global install redirects to ~/.copilot;
+    // project scope and env override suppress the redirect
     // ========================================================================
 
     #[test]
@@ -604,7 +640,8 @@ mod tests {
     }
 
     // ========================================================================
-    // Subtask 5: write_copilot_skim_json / detect_hook_registration tests
+    // write_copilot_skim_json and detect_hook_registration —
+    // envelope shape, idempotent detect, and remove lifecycle
     // ========================================================================
 
     /// install writes hooks/skim.json with version=1 envelope and a single
@@ -693,8 +730,48 @@ mod tests {
     }
 
     // ========================================================================
-    // Subtask 5: scan_foreign_hooks tests
+    // scan_foreign_hooks — foreign hook detection, entry cap, and size guard
     // ========================================================================
+
+    /// copilot_skim_json_has_entry returns false for an oversized skim.json.
+    #[test]
+    fn test_copilot_skim_json_has_entry_oversized_returns_false() {
+        use crate::cmd::init::MAX_SETTINGS_SIZE;
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::TempDir::new().unwrap();
+        let hooks_dir = dir.path().join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let skim_json = hooks_dir.join("skim.json");
+        // Sparse write: seek past the cap so metadata reports an oversized file
+        // without allocating 10 MiB on disk.
+        let mut f = std::fs::File::create(&skim_json).unwrap();
+        f.seek(SeekFrom::Start(MAX_SETTINGS_SIZE + 1)).unwrap();
+        f.write_all(b"\n").unwrap();
+        assert!(
+            !copilot_skim_json_has_entry(&skim_json),
+            "oversized skim.json must return false (size guard prevents unbounded read)"
+        );
+    }
+
+    /// scan_copilot_foreign_hooks silently skips oversized foreign hook files.
+    #[test]
+    fn test_scan_copilot_foreign_hooks_skips_oversized() {
+        use crate::cmd::init::MAX_SETTINGS_SIZE;
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::TempDir::new().unwrap();
+        let hooks_dir = dir.path().join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        // An oversized foreign hook file — must be skipped, not read.
+        let foreign = hooks_dir.join("other-tool.json");
+        let mut f = std::fs::File::create(&foreign).unwrap();
+        f.seek(SeekFrom::Start(MAX_SETTINGS_SIZE + 1)).unwrap();
+        f.write_all(b"\n").unwrap();
+        let others = scan_copilot_foreign_hooks(dir.path());
+        assert!(
+            others.is_empty(),
+            "oversized foreign hook file must be skipped (size guard)"
+        );
+    }
 
     /// scan_foreign_hooks: foreign *.json in hooks dir is detected.
     #[test]
