@@ -164,26 +164,6 @@ fn test_permissions_dry_run_enumerates_8_claude_entries() {
     );
 }
 
-/// The 8 canonical seeded entries for Claude must be exactly the expected set.
-///
-/// This test calls the `seeded_entries` helper directly via the binary's
-/// `--dry-run` output to verify the live-code set. We use the binary output
-/// rather than the unit test to catch wiring regressions.
-///
-/// Since the non-TTY path skips permissions consent, we verify the entry count
-/// via the unit tests in `cmd/permissions/mod.rs` (see `test_claude_seeded_entries_exact_8`).
-/// This integration test just confirms the command succeeds.
-#[test]
-fn test_permissions_dry_run_succeeds() {
-    let tmp = TempDir::new().unwrap();
-
-    common::skim()
-        .args(["init", "--agent", "claude", "--permissions", "--dry-run"])
-        .env("CLAUDE_CONFIG_DIR", tmp.path())
-        .assert()
-        .success();
-}
-
 // ============================================================================
 // F2/F3 — explicit --permissions refused on non-TTY must print a loud notice
 // ============================================================================
@@ -364,6 +344,125 @@ fn contract_read_only_subcommands_absent_from_rewrite_dispatch() {
 // ============================================================================
 // Codex exclusion from auto-detect permissions fan-out
 // ============================================================================
+
+// ============================================================================
+// Mirror tier: empty mirror proposals must not prompt and must print a notice
+// ============================================================================
+
+/// `skim init --agent claude --permissions --permissions-tier mirror` with no
+/// existing allow-list entries: must exit 0, print the "nothing to seed" notice,
+/// and write nothing.
+///
+/// Pins I-24: the empty-mirror path (a) does not prompt `confirm_grant`,
+/// (b) writes no sidecar and no config change, and (c) prints a notice instead
+/// of silently returning `Ok(true)` (fabricated consent).
+#[test]
+fn test_permissions_mirror_empty_proposals_no_prompt_no_write() {
+    let tmp = TempDir::new().unwrap(); // empty dir — no allow-list entries to mirror
+
+    let out = common::skim()
+        .args([
+            "init",
+            "--agent",
+            "claude",
+            "--permissions",
+            "--permissions-tier",
+            "mirror",
+        ])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .output()
+        .expect("skim must run");
+
+    assert!(
+        out.status.success(),
+        "must exit 0 when no entries to mirror"
+    );
+
+    // (b) No sidecar must be written.
+    assert!(
+        !tmp.path().join("skim-permissions.json").exists(),
+        "skim-permissions.json must NOT be written when mirror proposals are empty"
+    );
+
+    // (b) No permissions entries in settings.json.
+    let settings_path = tmp.path().join("settings.json");
+    if settings_path.exists() {
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let has_skim = content
+            .get("permissions")
+            .and_then(|p| p.get("allow"))
+            .and_then(|a| a.as_array())
+            .is_some_and(|arr| {
+                arr.iter()
+                    .any(|e| e.as_str().is_some_and(|s| s.starts_with("Bash(skim ")))
+            });
+        assert!(
+            !has_skim,
+            "settings.json must not contain Bash(skim \u{2026}) entries on empty mirror"
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // (c) The "nothing to seed" notice must appear.
+    assert!(
+        stdout.contains("No existing allow-list entries eligible to mirror"),
+        "must print 'nothing to seed' notice, got:\n{stdout}"
+    );
+}
+
+// ============================================================================
+// Copilot non-git directory: permissions skip with loud notice (I-25)
+// ============================================================================
+
+/// `skim init --agent copilot --permissions --no-guidance` from a non-git CWD:
+/// must exit 0 (install completes fully), print a skip notice, and write no sidecar.
+///
+/// Pins I-25: the git-root pre-check fires before `confirm_grant` so consent
+/// is never taken for an impossible seed and no partial install state is left
+/// (the hook + settings registration still complete).
+#[test]
+fn test_permissions_copilot_non_git_skip() {
+    let copilot_cfg = TempDir::new().unwrap();
+    let non_git_dir = TempDir::new().unwrap(); // not inside any git repository
+
+    let out = common::skim()
+        .args([
+            "init",
+            "--agent",
+            "copilot",
+            "--permissions",
+            "--no-guidance",
+        ])
+        .env("COPILOT_CONFIG_DIR", copilot_cfg.path())
+        .current_dir(non_git_dir.path())
+        .output()
+        .expect("skim must run");
+
+    assert!(
+        out.status.success(),
+        "install must complete successfully outside a git repo"
+    );
+
+    // No sidecar written.
+    assert!(
+        !copilot_cfg.path().join("skim-permissions.json").exists(),
+        "skim-permissions.json must NOT be written outside a git repo"
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // The skip notice must appear.
+    assert!(
+        stdout.contains("Copilot permissions seeding skipped"),
+        "skip notice must appear when not in a git repo, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("git repository"),
+        "skip notice must mention git repository, got:\n{stdout}"
+    );
+}
 
 /// In auto-detect mode (`skim init --permissions` without `--agent`), Codex CLI
 /// must be excluded from the permissions fan-out even when Codex is detected.

@@ -80,11 +80,13 @@ fn test_copilot_uninstall_corrupt_sidecar_loud_notice_non_fatal() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // A loud notice must appear on stderr (exact wording may vary).
+    // A loud notice must appear on stderr. The exact phrase comes from
+    // `cmd/init/uninstall.rs` line ~270:
+    //   eprintln!("  Notice: could not remove seeded permissions (sidecar issue): {e}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("Notice") || stderr.contains("notice") || stderr.contains("sidecar"),
-        "uninstall must print a loud notice about the corrupt sidecar, got stderr:\n{stderr}"
+        stderr.contains("could not remove seeded permissions"),
+        "uninstall must print the corrupt-sidecar remediation notice, got stderr:\n{stderr}"
     );
 }
 
