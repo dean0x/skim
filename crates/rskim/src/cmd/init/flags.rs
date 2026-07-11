@@ -145,7 +145,7 @@ impl DetectionEnv {
     /// Single enumeration point for the agent → override-field mapping.
     /// `any_override` and the filter match in [`detect_installed_agents`]
     /// both delegate here so that adding a new agent only requires one edit.
-    pub(super) fn override_for(&self, agent: AgentKind) -> Option<&std::path::Path> {
+    pub(crate) fn override_for(&self, agent: AgentKind) -> Option<&std::path::Path> {
         match agent {
             AgentKind::ClaudeCode => self.claude_config_dir.as_deref(),
             AgentKind::Cursor => self.cursor_config_dir.as_deref(),

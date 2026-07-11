@@ -115,7 +115,7 @@ fn print_dual_scope_warning(warning: &str) {
 fn print_install_summary(state: &DetectedState) {
     println!("  Summary:");
     if !state.hook_installed || !state.hook_is_current() {
-        let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+        let hook_script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
         println!("    * Create hook script: {}", hook_script_path.display());
         println!(
             "    * Patch settings: {} (add PreToolUse hook)",
@@ -489,7 +489,7 @@ fn is_hook_script_current(script_path: &std::path::Path, version: &str) -> bool 
 }
 
 fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
-    let hooks_dir = state.config_dir.join("hooks");
+    let hooks_dir = state.hook_config_dir.join("hooks");
     let script_path = hooks_dir.join(HOOK_SCRIPT_NAME);
 
     // Create hooks directory if needed
@@ -550,7 +550,7 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
     // Compute and store SHA-256 hash for integrity verification (#57)
     if let Ok(hash) = crate::cmd::integrity::compute_file_hash(&script_path) {
         let _ = crate::cmd::integrity::write_hash_manifest(
-            &state.config_dir,
+            &state.hook_config_dir,
             state.agent_cli_name,
             HOOK_SCRIPT_NAME,
             &hash,
@@ -698,6 +698,23 @@ fn backup_settings(
 }
 
 fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
+    let agent = agent_from_state(state)?;
+    let protocol = protocol_for_agent(agent);
+    let hook_script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+
+    // Agents that store hook registration in a dedicated file (e.g. Copilot CLI
+    // uses ~/.copilot/hooks/skim.json) bypass the settings.json write entirely.
+    if protocol.uses_dedicated_hook_file() {
+        protocol.install_hook_registration(
+            &state.hook_config_dir,
+            &hook_script_path.display().to_string(),
+        )?;
+        println!("  {} Registered hook in hooks/skim.json", check_mark(true),);
+        return Ok(());
+    }
+
+    // settings.json path — all other agents.
+
     // Ensure config dir exists
     if !state.config_dir.exists() {
         std::fs::create_dir_all(&state.config_dir)?;
@@ -718,9 +735,6 @@ fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
     }
 
     // Upsert hook entry via the agent-specific protocol (correct event key and format)
-    let agent = agent_from_state(state)?;
-    let protocol = protocol_for_agent(agent);
-    let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
     protocol.upsert_hook(&mut settings, &hook_script_path.display().to_string())?;
 
     atomic_write_settings(&settings, &real_path)?;
@@ -762,7 +776,7 @@ pub(super) fn print_dry_run_actions(
     global: bool,
     env: &InstructionEnv,
 ) -> anyhow::Result<()> {
-    let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+    let hook_script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
 
     println!("  [dry-run] Would create: {}", hook_script_path.display());
     if state.settings_exists {
@@ -1184,6 +1198,7 @@ mod tests {
             skim_binary: std::path::PathBuf::from("/usr/bin/skim"),
             skim_version: "1.0.0".to_string(),
             config_dir: std::path::PathBuf::from("/tmp"),
+            hook_config_dir: std::path::PathBuf::from("/tmp"),
             settings_path: std::path::PathBuf::from("/tmp/settings.json"),
             settings_exists: false,
             hook_installed: false,

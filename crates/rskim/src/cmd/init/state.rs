@@ -14,6 +14,11 @@ pub(super) struct DetectedState {
     pub(super) skim_binary: PathBuf,
     pub(super) skim_version: String,
     pub(super) config_dir: PathBuf,
+    /// Where hook artifacts (script, SHA sidecar, hook registration) live.
+    ///
+    /// Equals `config_dir` for all agents except Copilot CLI, which routes hook
+    /// artifacts to `~/.copilot/` via `HookProtocol::hook_config_dir`.
+    pub(super) hook_config_dir: PathBuf,
     pub(super) settings_path: PathBuf,
     pub(super) settings_exists: bool,
     pub(super) hook_installed: bool,
@@ -45,43 +50,65 @@ pub(super) fn detect_state(
     let skim_version = env!("CARGO_PKG_VERSION").to_string();
     let config_dir = env.resolve(agent, flags.project)?;
     let protocol = protocol_for_agent(agent);
+
+    // Compute the hook artifact directory via the protocol seam.
+    // For all agents except Copilot CLI this equals config_dir (passthrough).
+    // For Copilot CLI it redirects to ~/.copilot (or $COPILOT_CONFIG_DIR).
+    let hook_config_dir = protocol.hook_config_dir(
+        &config_dir,
+        flags.project,
+        env.override_for(agent).is_some(),
+    );
+
     let settings_path = config_dir.join(protocol.config_filename());
     let settings_exists = settings_path.exists();
 
     // Read the hook script once so both version extraction and bare-command detection
     // can reuse the same contents rather than making two separate fs::read_to_string calls.
     let hook_script_contents =
-        std::fs::read_to_string(config_dir.join("hooks").join(HOOK_SCRIPT_NAME)).ok();
+        std::fs::read_to_string(hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME)).ok();
 
     let mut hook_installed = false;
     let mut hook_version = None;
+    let existing_hooks;
 
-    let parsed_settings = read_settings_json(&settings_path);
-    if let Some(ref json) = parsed_settings
-        && let Some(arr) = json
-            .get("hooks")
-            .and_then(|h| h.get(protocol.hook_event_key()))
-            .and_then(|v| v.as_array())
-    {
-        for entry in arr {
-            if protocol.is_skim_entry(entry) {
-                hook_installed = true;
-                hook_version = extract_hook_version_from_entry(
-                    entry,
-                    &config_dir,
-                    hook_script_contents.as_deref(),
-                );
+    if protocol.uses_dedicated_hook_file() {
+        // Copilot-style: detect from hooks/skim.json, not settings.json.
+        hook_installed = protocol.detect_hook_registration(&hook_config_dir);
+        if hook_installed {
+            // Version always comes from the script file (same for all agents).
+            hook_version = hook_script_contents
+                .as_deref()
+                .and_then(parse_version_from_script);
+        }
+        existing_hooks = protocol.scan_foreign_hooks(&hook_config_dir);
+    } else {
+        // settings.json-style: existing detection code (behaviorally unchanged).
+        let parsed_settings = read_settings_json(&settings_path);
+        if let Some(ref json) = parsed_settings
+            && let Some(arr) = json
+                .get("hooks")
+                .and_then(|h| h.get(protocol.hook_event_key()))
+                .and_then(|v| v.as_array())
+        {
+            for entry in arr {
+                if protocol.is_skim_entry(entry) {
+                    hook_installed = true;
+                    hook_version = extract_hook_version_from_entry(
+                        entry,
+                        &hook_config_dir,
+                        hook_script_contents.as_deref(),
+                    );
+                }
             }
         }
+        existing_hooks = scan_existing_hooks(
+            parsed_settings.as_ref(),
+            protocol.hook_event_key(),
+            protocol.tool_matcher(),
+            protocol.as_ref(),
+        );
     }
-
-    // Scan for existing non-skim hooks (plugin collision detection)
-    let existing_hooks = scan_existing_hooks(
-        parsed_settings.as_ref(),
-        protocol.hook_event_key(),
-        protocol.tool_matcher(),
-        protocol.as_ref(),
-    );
 
     // Dual-scope check (B5)
     let dual_scope_warning = check_dual_scope(flags, agent, env)?;
@@ -96,6 +123,7 @@ pub(super) fn detect_state(
         skim_binary,
         skim_version,
         config_dir,
+        hook_config_dir,
         settings_path,
         settings_exists,
         hook_installed,

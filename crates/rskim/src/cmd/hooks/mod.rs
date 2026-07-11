@@ -9,14 +9,19 @@
 //! Claude Code `settings.json` / `hooks.PreToolUse` format. Agents that use a
 //! different on-disk format override the relevant methods:
 //!
-//! | Agent       | Config file   | Event key    | Matcher           |
-//! |-------------|---------------|--------------|-------------------|
-//! | Claude Code | settings.json | PreToolUse   | Bash              |
-//! | Cursor      | hooks.json    | preToolUse   | Shell             |
-//! | Gemini CLI  | settings.json | BeforeTool   | run_shell_command |
-//! | Copilot CLI | settings.json | preToolUse   | bash              |
-//! | Crush       | crush.json    | PreToolUse   | Bash              |
-//! | Codex CLI   | (none)        | (none)       | (none)            |
+//! | Agent       | Config file          | Event key    | Matcher           | Hook artifacts dir |
+//! |-------------|----------------------|--------------|-------------------|--------------------|
+//! | Claude Code | settings.json        | PreToolUse   | Bash              | ~/.claude          |
+//! | Cursor      | hooks.json           | preToolUse   | Shell             | ~/.config/Cursor   |
+//! | Gemini CLI  | settings.json        | BeforeTool   | run_shell_command | ~/.gemini          |
+//! | Copilot CLI | hooks/skim.json      | preToolUse   | bash              | ~/.copilot         |
+//! | Crush       | crush.json           | PreToolUse   | Bash              | ~/.crush           |
+//! | Codex CLI   | (none)               | (none)       | (none)            | (none)             |
+//!
+//! **Copilot CLI** is special: hook artifacts (script, sidecar, `skim.json`) live
+//! under `~/.copilot/hooks/` while the agent's settings/rules remain at `~/.github/`.
+//! `dot_dir_name()` stays `".github"` for the rules-dir and project instructions;
+//! only `hook_config_dir()` redirects to `~/.copilot`.
 
 pub(crate) mod claude;
 pub(crate) mod codex;
@@ -92,6 +97,98 @@ pub(crate) trait HookProtocol {
 
     #[allow(dead_code)] // Used in tests only
     fn generate_script(&self, version: &str, binary_path: &str) -> String;
+
+    // -------------------------------------------------------------------------
+    // Hook artifact location seam
+    //
+    // `hook_config_dir` is the single point of indirection that decouples where
+    // hook scripts, SHA sidecars, and registration files (settings entry or
+    // skim.json) live from the agent's main config directory (`config_dir`).
+    // All call sites that derive hook artifact paths must route through this seam.
+    // -------------------------------------------------------------------------
+
+    /// Directory where hook artifacts (script, SHA sidecar, hook registration)
+    /// live for this agent.
+    ///
+    /// For all agents except Copilot CLI this equals `resolved_config_dir`
+    /// unchanged (passthrough default).
+    ///
+    /// Copilot CLI overrides to `~/.copilot` so that hook artifacts are stored
+    /// separately from the `~/.github` settings/rules dir.  Two conditions force
+    /// the override off so callers always stay sandboxable:
+    ///
+    /// - `project_scope = true` → caller requested a cwd-relative install; keep
+    ///   the path within the project tree.
+    /// - `has_override = true` → a `<AGENT>_CONFIG_DIR` env var is in effect;
+    ///   the caller-supplied path was explicitly chosen and must be honored.
+    #[allow(dead_code)]
+    fn hook_config_dir(
+        &self,
+        resolved_config_dir: &std::path::Path,
+        _project_scope: bool,
+        _has_override: bool,
+    ) -> std::path::PathBuf {
+        resolved_config_dir.to_path_buf()
+    }
+
+    /// Whether hook registration lives in a dedicated file inside the hooks
+    /// directory (`hooks/skim.json`) rather than as an entry in the agent's
+    /// main settings file.
+    ///
+    /// Default: `false` (Claude Code, Gemini CLI, Cursor, Crush — all use
+    /// settings.json / hooks.json / crush.json entries).
+    /// Copilot CLI override: `true` (uses `hook_config_dir/hooks/skim.json`).
+    #[allow(dead_code)]
+    fn uses_dedicated_hook_file(&self) -> bool {
+        false
+    }
+
+    /// Detect whether the skim hook is registered via the dedicated hook-file
+    /// mechanism.
+    ///
+    /// Called only when `uses_dedicated_hook_file()` is `true`.
+    /// Default: always `false` (settings.json agents use `detect_hook` instead).
+    /// Copilot CLI override: `true` when `hooks/skim.json` contains a skim entry.
+    #[allow(dead_code)]
+    fn detect_hook_registration(&self, _hook_config_dir: &std::path::Path) -> bool {
+        false
+    }
+
+    /// Write the hook registration to its agent-specific location.
+    ///
+    /// For settings.json-based agents: no-op; `patch_settings` in `install.rs`
+    /// handles the write (returns `Ok(false)`).
+    /// Copilot CLI: writes `hooks/skim.json` with the versioned envelope and
+    /// returns `Ok(true)`.
+    #[allow(dead_code)]
+    fn install_hook_registration(
+        &self,
+        _hook_config_dir: &std::path::Path,
+        _script_path: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Remove the hook registration from its agent-specific location.
+    ///
+    /// For settings.json-based agents: no-op, returns `Ok(false)`.
+    /// Copilot CLI: deletes `hooks/skim.json`, returns `Ok(true)` on success.
+    #[allow(dead_code)]
+    fn remove_hook_registration(&self, _hook_config_dir: &std::path::Path) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Scan for non-skim hooks at the agent-specific hook location.
+    ///
+    /// Default: delegates to `scan_other_hooks(hook_config_dir)` which reads
+    /// the settings.json / hooks.json / crush.json file.
+    /// Copilot CLI override: enumerates `*.json` files in
+    /// `hook_config_dir/hooks/`, returning command strings from any file that
+    /// is not `skim.json`.
+    #[allow(dead_code)]
+    fn scan_foreign_hooks(&self, hook_config_dir: &std::path::Path) -> Vec<String> {
+        self.scan_other_hooks(hook_config_dir)
+    }
 
     // -------------------------------------------------------------------------
     // Config lifecycle methods
