@@ -20,17 +20,25 @@
 //! ```
 //! Foreign hooks are other `*.json` files in the same `hooks/` directory.
 //!
-//! ## Response format (Subtask 6 note)
+//! ## Response format
 //!
-//! `format_response` uses deny-with-suggestion until Copilot ships a working
-//! `allow` + `modifiedArgs` path (v1.0.24+). `modifiedArgs` changes are Subtask 6.
+//! On rewrite, `format_response` returns:
+//! ```json
+//! { "modifiedArgs": { "command": "<rewritten command>" } }
+//! ```
+//! No `permissionDecision` field is emitted — skim never self-approves.
+//! Copilot CLI joins Claude Code in the no-verb column: a permission verb is
+//! only emitted where the host protocol forces a decision field (Gemini, Crush,
+//! Cursor). `modifiedArgs` is respected by Copilot CLI >= v1.0.24; older CLIs
+//! silently ignore it (inert passthrough — not a breakage).
 //!
-//! ARCHITECTURE NOTE: Copilot's `allow` + `updatedInput` is currently broken.
-//! Only `deny` works reliably. We use deny-with-suggestion: the deny reason
-//! contains the optimized command for the user to accept manually.
+//! ## Legacy migration
 //!
-//! UPGRADE PATH: When Copilot ships working `allow` + `updatedInput`,
-//! change `format_response` only (one-file change).
+//! Earlier versions of skim wrote Copilot hook artifacts to `~/.github/hooks/`
+//! (the config dir) rather than `~/.copilot/hooks/` (the dedicated hook dir).
+//! `migrate_copilot_legacy` cleans up those artifacts during install. The new
+//! artifacts are written and verified FIRST; legacy removal is guard-gated and
+//! individually non-fatal.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -58,12 +66,14 @@ impl HookProtocol for CopilotCliHook {
     }
 
     fn format_response(&self, rewritten_command: &str) -> serde_json::Value {
-        // Deny-with-suggestion: Copilot's `allow` + `updatedInput` is broken.
-        // When `allow` ships, change this to:
-        //   { "permissionDecision": "allow", "updatedInput": { "command": rewritten_command } }
+        // modifiedArgs response: echo the tool-arguments shape with only the command rewritten.
+        // No permissionDecision field — skim never self-approves (no-verb column: only emit
+        // a permission verb where the host protocol forces a decision field, never voluntarily).
+        // Respected by Copilot CLI >= v1.0.24; older CLIs silently ignore it (inert passthrough).
         serde_json::json!({
-            "permissionDecision": "deny",
-            "reason": format!("Use optimized command: {}", rewritten_command)
+            "modifiedArgs": {
+                "command": rewritten_command
+            }
         })
     }
 
@@ -149,12 +159,15 @@ impl HookProtocol for CopilotCliHook {
     /// Copilot CLI config entry uses `"bash"` field (not `"command"`) and
     /// `"timeoutSec"` (not `"timeout"`).
     ///
-    /// Format: `{ "type": "command", "bash": "<path>", "matcher": "bash", "timeoutSec": 5 }`
+    /// Format: `{ "type": "command", "bash": "<path>", "timeoutSec": 5 }`
+    ///
+    /// Note: the `matcher` field is intentionally omitted — it is not in the
+    /// documented Copilot CLI hook schema and an unrecognised field risks the
+    /// entire hooks file being rejected. Conservative posture: documented fields only.
     fn build_config_entry(&self, hook_script_path: &str) -> serde_json::Value {
         serde_json::json!({
             "type": "command",
             "bash": hook_script_path,
-            "matcher": self.tool_matcher(),
             "timeoutSec": self.hook_timeout()
         })
     }
@@ -314,40 +327,39 @@ mod tests {
     }
 
     #[test]
-    fn test_copilot_format_response_is_deny() {
-        let response = hook().format_response("skim cargo test");
-        assert_eq!(response["permissionDecision"], "deny");
-    }
-
-    #[test]
-    fn test_copilot_format_response_includes_command_in_reason() {
-        let response = hook().format_response("skim cargo test");
-        let reason = response["reason"].as_str().unwrap();
-        assert!(
-            reason.contains("skim cargo test"),
-            "reason should contain the rewritten command, got: {reason}"
-        );
-        assert!(
-            reason.starts_with("Use optimized command:"),
-            "reason should start with prefix, got: {reason}"
+    fn test_copilot_format_response_returns_modified_args() {
+        let response = hook().format_response("skim cargo test --all");
+        // Must return modifiedArgs with the rewritten command
+        assert_eq!(
+            response["modifiedArgs"]["command"], "skim cargo test --all",
+            "modifiedArgs.command must equal the rewritten command"
         );
     }
 
     #[test]
-    fn test_copilot_format_response_no_allow() {
+    fn test_copilot_format_response_no_reason_field() {
         let response = hook().format_response("skim cargo test");
-        // Must be "deny", never "allow" (Copilot's allow is broken)
-        assert_ne!(
-            response["permissionDecision"].as_str().unwrap(),
-            "allow",
-            "permissionDecision must be 'deny' until Copilot fixes 'allow'"
+        // No reason field — modifiedArgs response is terse
+        assert!(
+            response.get("reason").is_none(),
+            "format_response must not include a reason field"
+        );
+    }
+
+    #[test]
+    fn test_copilot_format_response_no_permission_decision() {
+        // skim never self-approves — no permissionDecision in the response
+        let response = hook().format_response("skim cargo test");
+        assert!(
+            response.get("permissionDecision").is_none(),
+            "Copilot response must NOT include permissionDecision (no-verb column)"
         );
     }
 
     #[test]
     fn test_copilot_format_response_no_hook_specific_output() {
         let response = hook().format_response("skim cargo test");
-        // Copilot uses deny-with-suggestion, not hookSpecificOutput
+        // Copilot uses modifiedArgs, not hookSpecificOutput
         assert!(
             response.get("hookSpecificOutput").is_none(),
             "copilot should not use hookSpecificOutput"
@@ -416,15 +428,26 @@ mod tests {
 
     #[test]
     fn test_copilot_build_config_entry_uses_bash_field() {
-        let entry = hook().build_config_entry("/home/user/.github/hooks/skim-rewrite.sh");
+        let entry = hook().build_config_entry("/home/user/.copilot/hooks/skim-rewrite.sh");
         // Must use "bash" field, not "command"
         assert_eq!(
-            entry["bash"], "/home/user/.github/hooks/skim-rewrite.sh",
+            entry["bash"], "/home/user/.copilot/hooks/skim-rewrite.sh",
             "Copilot entries must use 'bash' field"
         );
         assert!(
             entry.get("command").is_none(),
             "Copilot entries must NOT use 'command' field"
+        );
+    }
+
+    #[test]
+    fn test_copilot_build_config_entry_no_matcher_field() {
+        // `matcher` is not in the documented Copilot CLI hook schema.
+        // An unknown field risks the whole skim.json being rejected — omit it.
+        let entry = hook().build_config_entry("/path/skim-rewrite.sh");
+        assert!(
+            entry.get("matcher").is_none(),
+            "build_config_entry must NOT include 'matcher' (undocumented field risks file rejection)"
         );
     }
 
@@ -625,6 +648,11 @@ mod tests {
         assert!(
             entry.get("command").is_none(),
             "entry must NOT use command field (Copilot uses bash)"
+        );
+        // matcher is not in the documented schema — absence guards against file rejection.
+        assert!(
+            entry.get("matcher").is_none(),
+            "entry must NOT include matcher (undocumented field risks file rejection)"
         );
     }
 

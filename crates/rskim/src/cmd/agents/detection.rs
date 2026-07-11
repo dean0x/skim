@@ -25,7 +25,7 @@ fn detect_agent(kind: AgentKind, home: Option<&Path>) -> AgentStatus {
         AgentKind::Cursor => detect_cursor(home),
         AgentKind::CodexCli => detect_codex_cli(home),
         AgentKind::GeminiCli => detect_gemini_cli(home),
-        AgentKind::CopilotCli => detect_copilot_cli(),
+        AgentKind::CopilotCli => detect_copilot_cli(home),
         AgentKind::Crush => detect_crush(),
     }
 }
@@ -186,29 +186,36 @@ fn detect_gemini_cli(home: Option<&Path>) -> AgentStatus {
     }
 }
 
-/// Maximum number of directory entries to scan in `detect_copilot_cli`
-/// to prevent unbounded I/O on adversarial `.github/hooks/` directories.
-const MAX_COPILOT_HOOK_ENTRIES: usize = 50;
-
-fn detect_copilot_cli() -> AgentStatus {
-    // Copilot CLI uses .github/hooks/ for hook configuration
-    let hooks_dir = AgentKind::CopilotCli.project_dir().join("hooks");
-    let detected = hooks_dir.is_dir();
+fn detect_copilot_cli(home: Option<&Path>) -> AgentStatus {
+    // Copilot CLI stores configuration under ~/.copilot/ (the hook artifact location
+    // used since skim v2.11.0). Detection keys off this directory, not ~/.github/hooks/.
+    let copilot_dir = home.map(|h| h.join(".copilot"));
+    let detected = copilot_dir.as_ref().is_some_and(|p| p.is_dir());
 
     let sessions = None; // Copilot CLI sessions are cloud-managed
 
+    // Hook registration: skim writes a dedicated ~/.copilot/hooks/skim.json.
+    // Check for that file directly rather than scanning all *.json files.
     let hooks = if detected {
-        let has_skim_hook = std::fs::read_dir(hooks_dir).ok().is_some_and(|entries| {
-            entries.flatten().take(MAX_COPILOT_HOOK_ENTRIES).any(|e| {
-                let path = e.path();
-                path.extension().is_some_and(|ext| ext == "json")
-                    && std::fs::metadata(&path)
-                        .ok()
-                        .is_some_and(|m| m.len() <= MAX_SETTINGS_SIZE)
-                    && std::fs::read_to_string(&path)
-                        .ok()
-                        .is_some_and(|c| c.contains("skim"))
-            })
+        let skim_json = copilot_dir
+            .as_ref()
+            .map(|p| p.join("hooks").join("skim.json"));
+        let has_skim_hook = skim_json.as_ref().is_some_and(|p| {
+            p.is_file()
+                && read_settings_guarded(p).is_some_and(|v| {
+                    // Envelope: {"version":1,"hooks":{"preToolUse":[...]}}
+                    // Entry: {"type":"command","bash":"<path>/skim-rewrite.sh",...}
+                    v.get("hooks")
+                        .and_then(|h| h.get("preToolUse"))
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|arr| {
+                            arr.iter().any(|e| {
+                                e.get("bash")
+                                    .and_then(|b| b.as_str())
+                                    .is_some_and(|s| s.contains("skim-rewrite"))
+                            })
+                        })
+                })
         });
         if has_skim_hook {
             HookStatus::Installed {
@@ -393,6 +400,80 @@ fn detect_pretooluse_hook(config_dir: Option<&Path>) -> HookStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- detect_copilot_cli ----
+
+    #[test]
+    fn test_detect_copilot_cli_detected_by_copilot_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path();
+        std::fs::create_dir_all(home.join(".copilot")).unwrap();
+
+        let status = detect_copilot_cli(Some(home));
+        assert!(
+            status.detected,
+            "~/.copilot/ dir must trigger Copilot CLI detection"
+        );
+        assert!(
+            matches!(status.hooks, HookStatus::NotInstalled),
+            "no skim.json yet → hook must be NotInstalled"
+        );
+    }
+
+    #[test]
+    fn test_detect_copilot_cli_not_detected_by_github_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path();
+        // Create ~/.github/hooks/ but NOT ~/.copilot/
+        std::fs::create_dir_all(home.join(".github").join("hooks")).unwrap();
+
+        let status = detect_copilot_cli(Some(home));
+        assert!(
+            !status.detected,
+            "~/.github/hooks/ alone must NOT trigger Copilot CLI detection after re-point"
+        );
+    }
+
+    #[test]
+    fn test_detect_copilot_cli_hook_installed_when_skim_json_present() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path();
+        let copilot_hooks = home.join(".copilot").join("hooks");
+        std::fs::create_dir_all(&copilot_hooks).unwrap();
+
+        let skim_json = serde_json::json!({
+            "version": 1,
+            "hooks": {
+                "preToolUse": [{
+                    "type": "command",
+                    "bash": copilot_hooks.join("skim-rewrite.sh").display().to_string(),
+                    "timeoutSec": 5
+                }]
+            }
+        });
+        std::fs::write(
+            copilot_hooks.join("skim.json"),
+            serde_json::to_string_pretty(&skim_json).unwrap(),
+        )
+        .unwrap();
+
+        let status = detect_copilot_cli(Some(home));
+        assert!(status.detected, "~/.copilot must be detected");
+        assert!(
+            matches!(status.hooks, HookStatus::Installed { .. }),
+            "must report Installed when skim.json has a skim entry"
+        );
+    }
+
+    #[test]
+    fn test_detect_copilot_cli_hook_not_installed_when_no_home() {
+        let status = detect_copilot_cli(None);
+        assert!(!status.detected, "must not detect when home is None");
+        assert!(
+            matches!(status.hooks, HookStatus::NotInstalled),
+            "must be NotInstalled when home is None"
+        );
+    }
 
     #[test]
     fn test_detect_all_agents_returns_all_kinds() {

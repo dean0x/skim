@@ -320,6 +320,14 @@ fn execute_install(
     // B8: Patch settings.json (or hooks.json for Cursor)
     patch_settings(state)?;
 
+    // Legacy migration: if this is Copilot CLI, remove stale skim artifacts from
+    // ~/.github/ AFTER new artifacts have been written to ~/.copilot/.
+    // state.config_dir  = ~/.github (rules dir; legacy hook location)
+    // state.hook_config_dir = ~/.copilot (new hook artifact location)
+    if let Some(AgentKind::CopilotCli) = AgentKind::from_str(state.agent_cli_name) {
+        migrate_copilot_legacy(&state.config_dir, &state.hook_config_dir)?;
+    }
+
     // Inject guidance into agent instruction file
     if !no_guidance {
         inject_guidance(agent_from_state(state)?, global, env)?;
@@ -658,6 +666,178 @@ fn migrate_cursor_legacy_settings(config_dir: &std::path::Path) -> anyhow::Resul
             check_mark(true)
         );
     }
+
+    Ok(())
+}
+
+// ============================================================================
+// Legacy Copilot CLI migration
+// ============================================================================
+
+/// Returns `true` when `entry` is a Copilot CLI skim hook entry (uses the `bash` field).
+///
+/// Equivalent to `CopilotCliHook::is_skim_entry` but defined here to keep the migration
+/// helper self-contained and avoid importing the protocol.
+fn is_copilot_skim_entry(entry: &serde_json::Value) -> bool {
+    entry
+        .get("bash")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s.contains("skim-rewrite"))
+}
+
+/// Remove all Copilot-format skim entries from `settings` (in-place).
+///
+/// Handles both `"preToolUse"` and `"PreToolUse"` event keys.
+/// Cleans up empty event-key arrays and the empty `"hooks"` object afterwards.
+/// Returns `true` if any entries were removed.
+fn remove_copilot_skim_from_settings(settings: &mut serde_json::Value) -> bool {
+    let mut changed = false;
+    for event_key in ["preToolUse", "PreToolUse"] {
+        // Two-pass: read-only pass to detect, then mutable pass to remove.
+        // This avoids simultaneous mutable + immutable borrow of the same value.
+        let has_skim = settings
+            .get("hooks")
+            .and_then(|h| h.get(event_key))
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| arr.iter().any(is_copilot_skim_entry));
+        if !has_skim {
+            continue;
+        }
+        changed = true;
+        if let Some(arr) = settings
+            .get_mut("hooks")
+            .and_then(|h| h.get_mut(event_key))
+            .and_then(|v| v.as_array_mut())
+        {
+            arr.retain(|e| !is_copilot_skim_entry(e));
+        }
+        // Clean up empty event-key array.
+        let is_empty = settings
+            .get("hooks")
+            .and_then(|h| h.get(event_key))
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| a.is_empty());
+        if is_empty && let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+            hooks.remove(event_key);
+        }
+    }
+    // Clean up empty hooks object.
+    let hooks_empty = settings
+        .get("hooks")
+        .and_then(|v| v.as_object())
+        .is_some_and(|h| h.is_empty());
+    if hooks_empty {
+        settings.as_object_mut().map(|o| o.remove("hooks"));
+    }
+    changed
+}
+
+/// Returns `true` when the parsed `.bak` value is "skim-shaped":
+/// it contains a Copilot-format skim entry, indicating skim wrote this backup.
+fn copilot_bak_is_skim_shaped(v: &serde_json::Value) -> bool {
+    v.get("hooks")
+        .and_then(|h| h.get("preToolUse").or_else(|| h.get("PreToolUse")))
+        .and_then(|arr| arr.as_array())
+        .is_some_and(|entries| entries.iter().any(is_copilot_skim_entry))
+}
+
+/// Returns `true` when `script_path` is safe to delete (skim-owned, unmodified).
+///
+/// Tries SHA-256 verification via the sidecar first (exact-match required).
+/// Falls back to checking for the `# skim-hook v` marker header when no sidecar
+/// exists (backward compat for installs that predate the sidecar feature).
+/// Returns `false` on any doubt (hash mismatch, read error, marker absent).
+fn legacy_script_is_skim_owned(
+    config_dir: &std::path::Path,
+    script_path: &std::path::Path,
+) -> bool {
+    let has_sidecar = crate::cmd::integrity::read_hash_manifest(config_dir, "copilot").is_some();
+    if has_sidecar {
+        matches!(
+            crate::cmd::integrity::verify_script_integrity(config_dir, "copilot", script_path),
+            Ok(true)
+        )
+    } else {
+        std::fs::read_to_string(script_path)
+            .ok()
+            .is_some_and(|c| c.contains("# skim-hook v"))
+    }
+}
+
+/// Migrate legacy Copilot CLI skim artifacts from `legacy_config_dir` (`~/.github`) to
+/// `new_hook_config_dir` (`~/.copilot`), removing each stale artifact under an independent
+/// conservative guard.
+///
+/// # Ordering guarantee
+///
+/// This function MUST be called AFTER all new artifacts have been written at
+/// `new_hook_config_dir`. If `hooks/skim-rewrite.sh` or `hooks/skim.json` are absent the
+/// function returns immediately without touching anything at the legacy location.
+///
+/// # Per-artifact removal guards (each independent)
+///
+/// 1. `settings.json` — skim `bash` entries removed surgically; all other keys preserved.
+/// 2. `settings.json.bak` — deleted only when the backup is skim-shaped (contains a skim
+///    `preToolUse` entry), indicating skim's own backup step created it.
+/// 3. `hooks/skim-rewrite.sh` — deleted only when SHA-verified (sidecar exists + hash
+///    matches) or, with no sidecar, when the script contains the `# skim-hook v` marker.
+/// 4. `hooks/skim-copilot.sha256` — always deleted (skim-owned metadata, no user content).
+/// 5. `hooks/` directory — `rmdir` (silent no-op when non-empty or missing; user files survive).
+fn migrate_copilot_legacy(
+    legacy_config_dir: &std::path::Path,
+    new_hook_config_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    // Ordering guard: new artifacts must already exist before we touch the legacy location.
+    let new_script = new_hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+    let new_skim_json = new_hook_config_dir.join("hooks").join("skim.json");
+    if !new_script.exists() || !new_skim_json.exists() {
+        return Ok(());
+    }
+
+    // ---- 1. settings.json: surgical skim entry removal ----
+    let settings_path = legacy_config_dir.join("settings.json");
+    if settings_path.is_file()
+        && let Some(mut settings) = read_settings_json(&settings_path)
+        && remove_copilot_skim_from_settings(&mut settings)
+        && let Ok(real_path) = resolve_real_settings_path(&settings_path)
+    {
+        // Non-fatal: new artifacts are already in place; stale entry is harmless.
+        let _ = atomic_write_settings(&settings, &real_path);
+        println!(
+            "  {} Cleaned legacy Copilot skim entry from {}",
+            check_mark(true),
+            settings_path.display()
+        );
+    }
+
+    // ---- 2. settings.json.bak: delete only if skim-shaped ----
+    let bak_path = legacy_config_dir.join(SETTINGS_BACKUP);
+    if bak_path.is_file() {
+        let is_skim = read_settings_json(&bak_path)
+            .as_ref()
+            .is_some_and(copilot_bak_is_skim_shaped);
+        if is_skim {
+            let _ = std::fs::remove_file(&bak_path);
+            println!(
+                "  {} Removed skim-owned legacy Copilot settings backup",
+                check_mark(true)
+            );
+        }
+    }
+
+    // ---- 3. hooks/skim-rewrite.sh: delete when hash-verified or marker-present ----
+    let legacy_hooks_dir = legacy_config_dir.join("hooks");
+    let legacy_script = legacy_hooks_dir.join(HOOK_SCRIPT_NAME);
+    if legacy_script.is_file() && legacy_script_is_skim_owned(legacy_config_dir, &legacy_script) {
+        let _ = std::fs::remove_file(&legacy_script);
+        println!("  {} Removed legacy Copilot hook script", check_mark(true));
+    }
+
+    // ---- 4. skim-copilot.sha256 sidecar: always remove (skim-owned metadata) ----
+    let _ = crate::cmd::integrity::remove_hash_manifest(legacy_config_dir, "copilot");
+
+    // ---- 5. hooks/ dir: rmdir — silent no-op when non-empty or missing ----
+    let _ = std::fs::remove_dir(&legacy_hooks_dir);
 
     Ok(())
 }
@@ -1248,5 +1428,256 @@ mod tests {
             result.is_ok(),
             "maybe_install_wrappers(Some(false), _) must return Ok without touching the filesystem"
         );
+    }
+
+    // ---- Legacy Copilot CLI migration ----
+
+    /// Populate the new hook artifact location with the minimum files needed to
+    /// satisfy `migrate_copilot_legacy`'s ordering guard.
+    fn setup_new_copilot_artifacts(new_dir: &tempfile::TempDir) {
+        let new_hooks = new_dir.path().join("hooks");
+        std::fs::create_dir_all(&new_hooks).unwrap();
+        std::fs::write(
+            new_hooks.join(HOOK_SCRIPT_NAME),
+            "#!/bin/sh\n# skim-hook v9.9.9\nexec skim rewrite --hook --agent copilot\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new_hooks.join("skim.json"),
+            r#"{"version":1,"hooks":{"preToolUse":[{"type":"command","bash":"/tmp/skim-rewrite.sh"}]}}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_migrate_copilot_legacy_no_op_when_new_artifacts_missing() {
+        // Ordering guard: if new artifacts are absent, legacy location must not be touched.
+        let legacy_dir = tempfile::TempDir::new().unwrap();
+        let new_dir = tempfile::TempDir::new().unwrap();
+        // Do NOT call setup_new_copilot_artifacts — ordering guard must fire.
+
+        let legacy_hooks = legacy_dir.path().join("hooks");
+        std::fs::create_dir_all(&legacy_hooks).unwrap();
+        let settings = serde_json::json!({
+            "hooks": {
+                "preToolUse": [{"bash": legacy_hooks.join(HOOK_SCRIPT_NAME).display().to_string()}]
+            }
+        });
+        let settings_path = legacy_dir.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        super::migrate_copilot_legacy(legacy_dir.path(), new_dir.path()).unwrap();
+
+        // settings.json must be unchanged (still has the skim entry)
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(
+            on_disk["hooks"]["preToolUse"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "settings.json must not be touched when new artifacts are absent"
+        );
+    }
+
+    #[test]
+    fn test_migrate_copilot_legacy_removes_settings_skim_entry() {
+        let legacy_dir = tempfile::TempDir::new().unwrap();
+        let new_dir = tempfile::TempDir::new().unwrap();
+        setup_new_copilot_artifacts(&new_dir);
+
+        // Create legacy settings.json with a Copilot-format skim entry and user content.
+        let legacy_hooks = legacy_dir.path().join("hooks");
+        std::fs::create_dir_all(&legacy_hooks).unwrap();
+        let settings = serde_json::json!({
+            "hooks": {
+                "preToolUse": [
+                    {"bash": legacy_hooks.join(HOOK_SCRIPT_NAME).display().to_string(), "type": "command"}
+                ]
+            },
+            "user_key": "must_be_preserved"
+        });
+        let settings_path = legacy_dir.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        super::migrate_copilot_legacy(legacy_dir.path(), new_dir.path()).unwrap();
+
+        let result: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        // skim entry must be gone
+        assert!(
+            result.get("hooks").is_none()
+                || result["hooks"].get("preToolUse").is_none()
+                || result["hooks"]["preToolUse"]
+                    .as_array()
+                    .is_some_and(|a| a.is_empty()),
+            "skim preToolUse entry must be removed from settings.json"
+        );
+        // user content must survive
+        assert_eq!(
+            result.get("user_key").and_then(|v| v.as_str()),
+            Some("must_be_preserved"),
+            "non-skim keys must be preserved in settings.json"
+        );
+    }
+
+    #[test]
+    fn test_migrate_copilot_legacy_removes_sidecar_always() {
+        let legacy_dir = tempfile::TempDir::new().unwrap();
+        let new_dir = tempfile::TempDir::new().unwrap();
+        setup_new_copilot_artifacts(&new_dir);
+
+        let legacy_hooks = legacy_dir.path().join("hooks");
+        std::fs::create_dir_all(&legacy_hooks).unwrap();
+        let sidecar = legacy_hooks.join("skim-copilot.sha256");
+        std::fs::write(&sidecar, "sha256:abc123  skim-rewrite.sh\n").unwrap();
+
+        super::migrate_copilot_legacy(legacy_dir.path(), new_dir.path()).unwrap();
+        assert!(!sidecar.exists(), "SHA sidecar must always be removed");
+    }
+
+    #[test]
+    fn test_migrate_copilot_legacy_removes_script_when_hash_verified() {
+        let legacy_dir = tempfile::TempDir::new().unwrap();
+        let new_dir = tempfile::TempDir::new().unwrap();
+        setup_new_copilot_artifacts(&new_dir);
+
+        let legacy_hooks = legacy_dir.path().join("hooks");
+        std::fs::create_dir_all(&legacy_hooks).unwrap();
+        let legacy_script = legacy_hooks.join(HOOK_SCRIPT_NAME);
+        std::fs::write(
+            &legacy_script,
+            "#!/bin/sh\n# skim-hook v1.0.0\nexec skim rewrite --hook --agent copilot\n",
+        )
+        .unwrap();
+        let hash = crate::cmd::integrity::compute_file_hash(&legacy_script).unwrap();
+        crate::cmd::integrity::write_hash_manifest(
+            legacy_dir.path(),
+            "copilot",
+            HOOK_SCRIPT_NAME,
+            &hash,
+        )
+        .unwrap();
+
+        super::migrate_copilot_legacy(legacy_dir.path(), new_dir.path()).unwrap();
+        assert!(
+            !legacy_script.exists(),
+            "SHA-verified legacy script must be removed"
+        );
+    }
+
+    #[test]
+    fn test_migrate_copilot_legacy_preserves_tampered_script() {
+        let legacy_dir = tempfile::TempDir::new().unwrap();
+        let new_dir = tempfile::TempDir::new().unwrap();
+        setup_new_copilot_artifacts(&new_dir);
+
+        let legacy_hooks = legacy_dir.path().join("hooks");
+        std::fs::create_dir_all(&legacy_hooks).unwrap();
+        let legacy_script = legacy_hooks.join(HOOK_SCRIPT_NAME);
+        let original = "#!/bin/sh\n# skim-hook v1.0.0\nexec skim rewrite --hook\n";
+        std::fs::write(&legacy_script, original).unwrap();
+        // Write hash for the original content, then tamper.
+        let hash = crate::cmd::integrity::compute_file_hash(&legacy_script).unwrap();
+        crate::cmd::integrity::write_hash_manifest(
+            legacy_dir.path(),
+            "copilot",
+            HOOK_SCRIPT_NAME,
+            &hash,
+        )
+        .unwrap();
+        std::fs::write(&legacy_script, "#!/bin/sh\necho INJECTED\n").unwrap();
+
+        super::migrate_copilot_legacy(legacy_dir.path(), new_dir.path()).unwrap();
+        assert!(
+            legacy_script.exists(),
+            "tampered legacy script must be preserved (hash mismatch = user modification)"
+        );
+    }
+
+    #[test]
+    fn test_migrate_copilot_legacy_removes_script_by_marker_fallback() {
+        // No sidecar: fall back to the `# skim-hook v` marker header.
+        let legacy_dir = tempfile::TempDir::new().unwrap();
+        let new_dir = tempfile::TempDir::new().unwrap();
+        setup_new_copilot_artifacts(&new_dir);
+
+        let legacy_hooks = legacy_dir.path().join("hooks");
+        std::fs::create_dir_all(&legacy_hooks).unwrap();
+        let legacy_script = legacy_hooks.join(HOOK_SCRIPT_NAME);
+        std::fs::write(
+            &legacy_script,
+            "#!/bin/sh\n# skim-hook v1.0.0\nexec skim rewrite --hook --agent copilot\n",
+        )
+        .unwrap();
+        // No sidecar written.
+
+        super::migrate_copilot_legacy(legacy_dir.path(), new_dir.path()).unwrap();
+        assert!(
+            !legacy_script.exists(),
+            "marker-identified script (no sidecar) must be removed via fallback"
+        );
+    }
+
+    #[test]
+    fn test_migrate_copilot_legacy_deletes_bak_if_skim_shaped() {
+        let legacy_dir = tempfile::TempDir::new().unwrap();
+        let new_dir = tempfile::TempDir::new().unwrap();
+        setup_new_copilot_artifacts(&new_dir);
+
+        let bak = serde_json::json!({
+            "hooks": {
+                "preToolUse": [
+                    {"bash": "/home/.github/hooks/skim-rewrite.sh", "type": "command"}
+                ]
+            }
+        });
+        let bak_path = legacy_dir.path().join(SETTINGS_BACKUP);
+        std::fs::write(&bak_path, serde_json::to_string_pretty(&bak).unwrap()).unwrap();
+
+        super::migrate_copilot_legacy(legacy_dir.path(), new_dir.path()).unwrap();
+        assert!(
+            !bak_path.exists(),
+            "skim-shaped .bak (contains skim preToolUse entry) must be deleted"
+        );
+    }
+
+    #[test]
+    fn test_migrate_copilot_legacy_preserves_bak_if_not_skim_shaped() {
+        let legacy_dir = tempfile::TempDir::new().unwrap();
+        let new_dir = tempfile::TempDir::new().unwrap();
+        setup_new_copilot_artifacts(&new_dir);
+
+        // .bak contains only user settings — no skim entry.
+        let bak = serde_json::json!({"copilot": {"editor": "neovim"}});
+        let bak_path = legacy_dir.path().join(SETTINGS_BACKUP);
+        std::fs::write(&bak_path, serde_json::to_string_pretty(&bak).unwrap()).unwrap();
+
+        super::migrate_copilot_legacy(legacy_dir.path(), new_dir.path()).unwrap();
+        assert!(
+            bak_path.exists(),
+            "non-skim-shaped .bak (user settings only) must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_migrate_copilot_legacy_idempotent() {
+        // Two consecutive calls must both succeed without errors.
+        let legacy_dir = tempfile::TempDir::new().unwrap();
+        let new_dir = tempfile::TempDir::new().unwrap();
+        setup_new_copilot_artifacts(&new_dir);
+
+        // No legacy artifacts — first and second call are both no-ops.
+        super::migrate_copilot_legacy(legacy_dir.path(), new_dir.path())
+            .expect("first call must not error");
+        super::migrate_copilot_legacy(legacy_dir.path(), new_dir.path())
+            .expect("second call (idempotent) must not error");
     }
 }

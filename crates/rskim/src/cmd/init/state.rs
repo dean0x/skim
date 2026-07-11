@@ -217,6 +217,20 @@ fn scan_existing_hooks(
     other_hooks
 }
 
+/// Check whether a skim hook is installed in the opposite scope (global vs project)
+/// and return a warning string if so.
+///
+/// # Copilot CLI
+///
+/// This function reads `<config_dir>/settings.json` for the hook event key, which is
+/// the Claude Code / Gemini / Cursor format. For Copilot CLI, `config_dir` resolves
+/// to `~/.github/` and the event key is `preToolUse`. Since skim v2.11.0, Copilot
+/// hook registration is written to `~/.copilot/hooks/skim.json` (not to
+/// `~/.github/settings.json`), so this function **never fires for Copilot CLI** —
+/// `has_hook` will always be `false` because the settings file skim no longer writes.
+/// This is intentionally conservative: the warning is suppressed rather than
+/// producing a false positive. A Copilot-aware dual-scope check can be added if
+/// needed in a future subtask.
 pub(super) fn check_dual_scope(
     flags: &InitFlags,
     agent: crate::cmd::session::AgentKind,
@@ -543,7 +557,15 @@ mod tests {
 
     #[test]
     fn test_scan_existing_hooks_copilot_format() {
-        // Copilot CLI format: non-skim entry uses top-level "bash" field
+        // Copilot CLI format: non-skim entry uses top-level "bash" field.
+        //
+        // NOTE: the `/home/.github/hooks/skim-rewrite.sh` path is INTENTIONAL.
+        // `scan_existing_hooks` is called from the settings.json path in `detect_state`,
+        // which is only reached for agents that do NOT use a dedicated hook file. For
+        // Copilot CLI (which uses `hooks/skim.json`), this code path is bypassed.
+        // The `~/.github` literal here preserves the migration-window recognition behavior:
+        // `is_skim_entry` must continue to recognise legacy entries written to settings.json
+        // by older skim versions, so that `migrate_copilot_legacy` can surgically remove them.
         let settings = serde_json::json!({
             "hooks": {
                 "preToolUse": [
@@ -566,7 +588,10 @@ mod tests {
 
     #[test]
     fn test_scan_existing_hooks_copilot_skim_entry_excluded() {
-        // Copilot skim entry should be excluded from collision results
+        // Copilot skim entry should be excluded from collision results.
+        //
+        // NOTE: `~/.github/hooks/skim-rewrite.sh` path is INTENTIONAL — same
+        // migration-window rationale as `test_scan_existing_hooks_copilot_format` above.
         let settings = serde_json::json!({
             "hooks": {
                 "preToolUse": [{

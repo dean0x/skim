@@ -9,19 +9,23 @@
 //! Claude Code `settings.json` / `hooks.PreToolUse` format. Agents that use a
 //! different on-disk format override the relevant methods:
 //!
-//! | Agent       | Config file          | Event key    | Matcher           | Hook artifacts dir |
-//! |-------------|----------------------|--------------|-------------------|--------------------|
-//! | Claude Code | settings.json        | PreToolUse   | Bash              | ~/.claude          |
-//! | Cursor      | hooks.json           | preToolUse   | Shell             | ~/.config/Cursor   |
-//! | Gemini CLI  | settings.json        | BeforeTool   | run_shell_command | ~/.gemini          |
-//! | Copilot CLI | hooks/skim.json      | preToolUse   | bash              | ~/.copilot         |
-//! | Crush       | crush.json           | PreToolUse   | Bash              | ~/.crush           |
-//! | Codex CLI   | (none)               | (none)       | (none)            | (none)             |
+//! | Agent       | Config file          | Event key    | Matcher           | Hook artifacts dir | Response strategy     |
+//! |-------------|----------------------|--------------|-------------------|--------------------|-----------------------|
+//! | Claude Code | settings.json        | PreToolUse   | Bash              | ~/.claude          | hookSpecificOutput    |
+//! | Cursor      | hooks.json           | preToolUse   | Shell             | ~/.config/Cursor   | permission: allow     |
+//! | Gemini CLI  | settings.json        | BeforeTool   | run_shell_command | ~/.gemini          | decision: allow       |
+//! | Copilot CLI | hooks/skim.json      | preToolUse   | bash (detect only)| ~/.copilot         | modifiedArgs (no verb)|
+//! | Crush       | crush.json           | PreToolUse   | Bash              | ~/.crush           | permission: allow     |
+//! | Codex CLI   | (none)               | (none)       | (none)            | (none)             | AwarenessOnly         |
 //!
 //! **Copilot CLI** is special: hook artifacts (script, sidecar, `skim.json`) live
 //! under `~/.copilot/hooks/` while the agent's settings/rules remain at `~/.github/`.
 //! `dot_dir_name()` stays `".github"` for the rules-dir and project instructions;
 //! only `hook_config_dir()` redirects to `~/.copilot`.
+//!
+//! **No-verb doctrine**: skim emits a permission verb (`allow`/`deny`) only where the
+//! host protocol forces a decision field. Claude Code and Copilot CLI are in the
+//! no-verb column — they receive `modifiedArgs` or `hookSpecificOutput` only.
 
 pub(crate) mod claude;
 pub(crate) mod codex;

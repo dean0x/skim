@@ -467,7 +467,8 @@ fn test_rewrite_hook_agent_gemini_no_match_passthrough() {
 
 #[test]
 fn test_rewrite_hook_agent_copilot_match() {
-    // Copilot uses deny-with-suggestion response format
+    // Copilot uses modifiedArgs response format (no-verb column: no permissionDecision).
+    // Respected by Copilot CLI >= v1.0.24; older CLIs silently ignore it (inert passthrough).
     let input = serde_json::json!({
         "tool_input": {
             "command": "cargo test"
@@ -482,13 +483,22 @@ fn test_rewrite_hook_agent_copilot_match() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(
-        json["permissionDecision"], "deny",
-        "Copilot response should have permissionDecision=deny"
-    );
+    // modifiedArgs.command must contain the rewritten command
     assert!(
-        json["reason"].as_str().unwrap().contains("skim cargo test"),
-        "Copilot deny reason should contain rewritten command"
+        json["modifiedArgs"]["command"]
+            .as_str()
+            .is_some_and(|c| c.contains("skim cargo test")),
+        "Copilot response must have modifiedArgs.command with the rewritten command; got: {json}"
+    );
+    // No permissionDecision — skim never self-approves for Copilot
+    assert!(
+        json.get("permissionDecision").is_none(),
+        "Copilot response must NOT include permissionDecision (no-verb column)"
+    );
+    // No reason field — modifiedArgs response is terse
+    assert!(
+        json.get("reason").is_none(),
+        "Copilot response must NOT include a reason field"
     );
 }
 
