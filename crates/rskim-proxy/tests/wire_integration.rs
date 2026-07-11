@@ -36,7 +36,6 @@
 
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -101,49 +100,41 @@ impl http_body::Body for ChannelBody {
 // Test helpers shared across all wire tests
 // ============================================================================
 
-/// Find a free port within 41000-49000 (D8/AD-PXY-03 test subrange).
-/// Allocate a unique ephemeral port for this process by asking the OS.
+/// Bind to an OS-assigned ephemeral port and return the listener.
 ///
-/// Binds to port 0 (OS assigns a free port), reads the assigned port, closes
-/// the listener, and returns the port. The returned port is immediately
-/// available for the next bind — there is a tiny TOCTOU race window, but since
-/// `NEXT_PORT` is process-global and monotonically increasing we never hand out
-/// the same port twice within the same test run, eliminating inter-test races.
+/// Uses `TcpListener::bind("127.0.0.1:0")`: the OS assigns a free port and
+/// guarantees uniqueness across concurrent callers — even across separate
+/// nextest processes (each test runs in its own process under nextest, so a
+/// process-global counter resets to the same starting value in every process
+/// and causes TOCTOU collisions at `-j 4`). With bind-to-0 each call gets a
+/// distinct OS-assigned port; inter-test collisions are impossible.
 ///
-/// Using a global counter avoids the "probe-then-bind" pattern that races when
-/// tests run in parallel (j>1): two tests could both probe the same port as
-/// free, then both try to bind it and one fails.
-static NEXT_PORT: AtomicU16 = AtomicU16::new(42000);
-
-async fn find_test_port() -> u16 {
-    // Try successive ports from our process-global counter.
-    // Upper range 42000-47999 avoids conformance_and_determinism.rs (41100-41900).
-    for _ in 0..6000_u16 {
-        let port = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
-        if port > 47999 {
-            panic!("exhausted test port range 42000-47999");
-        }
-        // Verify the port is actually bindable (may be blocked by OS or other processes).
-        if TcpListener::bind(format!("127.0.0.1:{port}")).await.is_ok() {
-            return port;
-        }
-    }
-    panic!("no free port in 42000-47999 test subrange");
+/// The caller passes the returned listener directly to
+/// `rskim_proxy::testing::run_server_with_listener` to start the proxy —
+/// no second bind occurs, so the race window is zero.
+async fn bind_test_listener() -> TcpListener {
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to OS-assigned ephemeral port")
 }
 
 /// Start the proxy with the given upstream URL and return a handle + the proxy addr.
+///
+/// Binds the proxy listener via [`bind_test_listener`] (OS port 0) so each
+/// concurrent test gets a guaranteed-unique port. The listener is handed
+/// directly to `run_server_with_listener` — no second bind, zero TOCTOU race.
 async fn start_proxy(upstream_url: &str) -> (tokio::task::AbortHandle, SocketAddr) {
-    let port = find_test_port().await;
+    let listener = bind_test_listener().await;
+    let proxy_addr = listener.local_addr().expect("listener local_addr");
     let config = ProxyConfig::builder()
-        .port(port)
+        .port(41001) // placeholder — run_server_with_listener ignores config.bind_addr
         .upstream_default(upstream_url)
         .build()
         .expect("proxy config");
-    let proxy_addr = config.bind_addr();
     let pipeline = TransformPipeline::identity();
     let analytics = Arc::new(NoopAnalyticsHook);
-    let task = tokio::spawn(rskim_proxy::testing::run_server_async(
-        config, pipeline, analytics,
+    let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+        listener, config, pipeline, analytics,
     ));
     let abort = task.abort_handle();
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -151,20 +142,22 @@ async fn start_proxy(upstream_url: &str) -> (tokio::task::AbortHandle, SocketAdd
 }
 
 /// Start the proxy with a custom analytics hook.
+///
+/// See [`start_proxy`] for port-allocation strategy.
 async fn start_proxy_with_analytics(
     upstream_url: &str,
     analytics: Arc<dyn AnalyticsHook>,
 ) -> (tokio::task::AbortHandle, SocketAddr) {
-    let port = find_test_port().await;
+    let listener = bind_test_listener().await;
+    let proxy_addr = listener.local_addr().expect("listener local_addr");
     let config = ProxyConfig::builder()
-        .port(port)
+        .port(41001) // placeholder — run_server_with_listener ignores config.bind_addr
         .upstream_default(upstream_url)
         .build()
         .expect("proxy config");
-    let proxy_addr = config.bind_addr();
     let pipeline = TransformPipeline::identity();
-    let task = tokio::spawn(rskim_proxy::testing::run_server_async(
-        config, pipeline, analytics,
+    let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+        listener, config, pipeline, analytics,
     ));
     let abort = task.abort_handle();
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -322,18 +315,18 @@ async fn test_ac1_nonloopback_bind_emits_config_warning() {
 /// AC3 (wire, negative): Unknown provider + no default upstream → 502.
 #[tokio::test]
 async fn test_ac3_wire_unknown_no_default_502() {
-    // Find a free port for the proxy (no upstream configured for this test).
-    let port = find_test_port().await;
+    // Bind a unique OS-assigned port for this test.
+    let listener = bind_test_listener().await;
+    let proxy_addr = listener.local_addr().expect("listener local_addr");
     let config = ProxyConfig::builder()
-        .port(port)
+        .port(41001) // placeholder — run_server_with_listener ignores config.bind_addr
         // No upstream_default — Unknown provider requests must 502.
         .build()
         .expect("proxy config");
-    let proxy_addr = config.bind_addr();
     let pipeline = TransformPipeline::identity();
     let analytics = Arc::new(NoopAnalyticsHook);
-    let task = tokio::spawn(rskim_proxy::testing::run_server_async(
-        config, pipeline, analytics,
+    let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+        listener, config, pipeline, analytics,
     ));
     let abort = task.abort_handle();
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -747,19 +740,19 @@ impl rskim_proxy::seam::TransformStage for PanicStage {
 async fn test_ac9_new_connection_after_panicking_stage() {
     let upstream = FakeUpstream::start_echo().await;
 
-    let port = find_test_port().await;
+    let listener = bind_test_listener().await;
+    let proxy_addr = listener.local_addr().expect("listener local_addr");
     let config = ProxyConfig::builder()
-        .port(port)
+        .port(41001) // placeholder — run_server_with_listener ignores config.bind_addr
         .upstream_default(upstream.url())
         .build()
         .expect("proxy config");
-    let proxy_addr = config.bind_addr();
 
     // Inject a panicking stage.
     let pipeline = TransformPipeline::from_stages(vec![Box::new(PanicStage)]);
     let analytics = Arc::new(NoopAnalyticsHook);
-    let task = tokio::spawn(rskim_proxy::testing::run_server_async(
-        config, pipeline, analytics,
+    let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+        listener, config, pipeline, analytics,
     ));
     let abort = task.abort_handle();
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -863,19 +856,19 @@ impl rskim_proxy::seam::TransformStage for InflatingWireStage {
 async fn test_ac4_arm_b_inflating_stage_wire_forwards_original_bytes() {
     let upstream = FakeUpstream::start_echo().await;
 
-    let port = find_test_port().await;
+    let listener = bind_test_listener().await;
+    let proxy_addr = listener.local_addr().expect("listener local_addr");
     let config = ProxyConfig::builder()
-        .port(port)
+        .port(41001) // placeholder — run_server_with_listener ignores config.bind_addr
         .upstream_default(upstream.url())
         .build()
         .expect("proxy config");
-    let proxy_addr = config.bind_addr();
 
     // Inject the inflating stage — the gate must reject the inflation.
     let pipeline = TransformPipeline::from_stages(vec![Box::new(InflatingWireStage)]);
     let analytics = Arc::new(NoopAnalyticsHook);
-    let task = tokio::spawn(rskim_proxy::testing::run_server_async(
-        config, pipeline, analytics,
+    let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+        listener, config, pipeline, analytics,
     ));
     let abort = task.abort_handle();
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -1337,18 +1330,18 @@ async fn test_ac20_upstream_timeout_504() {
     });
 
     // Set a very short upstream_timeout (2s) so the test runs fast.
-    let port = find_test_port().await;
+    let listener = bind_test_listener().await;
+    let proxy_addr = listener.local_addr().expect("listener local_addr");
     let config = ProxyConfig::builder()
-        .port(port)
+        .port(41001) // placeholder — run_server_with_listener ignores config.bind_addr
         .upstream_default(format!("http://{upstream_addr}"))
         .upstream_timeout(Duration::from_secs(2))
         .build()
         .expect("proxy config");
-    let proxy_addr = config.bind_addr();
     let pipeline = TransformPipeline::identity();
     let analytics = Arc::new(NoopAnalyticsHook);
-    let task = tokio::spawn(rskim_proxy::testing::run_server_async(
-        config, pipeline, analytics,
+    let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+        listener, config, pipeline, analytics,
     ));
     let abort = task.abort_handle();
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -1496,17 +1489,17 @@ async fn test_ac22_connection_cap_bounded_accept() {
     // Send DEFAULT_CONNECTION_CAP connections and verify none are rejected/dropped.
     // This is a smoke test for the connection cap behavior.
 
-    let port = find_test_port().await;
+    let listener = bind_test_listener().await;
+    let proxy_addr = listener.local_addr().expect("listener local_addr");
     let config = ProxyConfig::builder()
-        .port(port)
+        .port(41001) // placeholder — run_server_with_listener ignores config.bind_addr
         .upstream_default(&upstream_url)
         .build()
         .expect("proxy config");
-    let proxy_addr = config.bind_addr();
     let pipeline = TransformPipeline::identity();
     let analytics = Arc::new(NoopAnalyticsHook);
-    let task = tokio::spawn(rskim_proxy::testing::run_server_async(
-        config, pipeline, analytics,
+    let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+        listener, config, pipeline, analytics,
     ));
     let abort = task.abort_handle();
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -1629,18 +1622,18 @@ async fn test_ac20_upstream_midstream_stall_terminates_cleanly() {
     // Configure a short upstream_timeout so the test finishes fast.
     // The idle bound reuses upstream_timeout (AD-PXY-20 / ADR-003).
     let upstream_idle_timeout = Duration::from_millis(400);
-    let port = find_test_port().await;
+    let listener = bind_test_listener().await;
+    let proxy_addr = listener.local_addr().expect("listener local_addr");
     let config = ProxyConfig::builder()
-        .port(port)
+        .port(41001) // placeholder — run_server_with_listener ignores config.bind_addr
         .upstream_default(format!("http://{upstream_addr}"))
         .upstream_timeout(upstream_idle_timeout)
         .build()
         .expect("proxy config");
-    let proxy_addr = config.bind_addr();
     let pipeline = TransformPipeline::identity();
     let analytics = Arc::new(NoopAnalyticsHook);
-    let task = tokio::spawn(rskim_proxy::testing::run_server_async(
-        config, pipeline, analytics,
+    let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+        listener, config, pipeline, analytics,
     ));
     let abort = task.abort_handle();
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -1771,16 +1764,17 @@ async fn test_ac14_regression_guard_can_fail() {
     let baseline_mean_us: u64 = baseline_times.iter().sum::<u64>() / N as u64;
 
     // --- Slowed arm: noop hook, slowed-identity pipeline (50ms sleep per stage) ---
-    let slowed_port = find_test_port().await;
+    let slowed_listener = bind_test_listener().await;
+    let slowed_addr = slowed_listener.local_addr().expect("slowed listener local_addr");
     let slowed_config = ProxyConfig::builder()
-        .port(slowed_port)
+        .port(41001) // placeholder — run_server_with_listener ignores config.bind_addr
         .upstream_default(&upstream_url)
         .build()
         .expect("proxy config");
-    let slowed_addr = slowed_config.bind_addr();
     let slowed_pipeline =
         rskim_proxy::seam::TransformPipeline::from_stages(vec![Box::new(SlowedIdentityStage)]);
-    let slowed_task = tokio::spawn(rskim_proxy::testing::run_server_async(
+    let slowed_task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+        slowed_listener,
         slowed_config,
         slowed_pipeline,
         Arc::new(NoopAnalyticsHook),
@@ -1841,14 +1835,15 @@ async fn test_ac15_zero_failures_panicking_hook() {
     const N: usize = 10;
 
     let upstream = FakeUpstream::start_echo().await;
-    let port = find_test_port().await;
+    let listener = bind_test_listener().await;
+    let proxy_addr = listener.local_addr().expect("listener local_addr");
     let config = ProxyConfig::builder()
-        .port(port)
+        .port(41001) // placeholder — run_server_with_listener ignores config.bind_addr
         .upstream_default(upstream.url())
         .build()
         .expect("proxy config");
-    let proxy_addr = config.bind_addr();
-    let task = tokio::spawn(rskim_proxy::testing::run_server_async(
+    let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+        listener,
         config,
         rskim_proxy::seam::TransformPipeline::identity(),
         Arc::new(PanickingHook),
@@ -1884,13 +1879,13 @@ async fn test_ac15_zero_failures_saturated_channel() {
     const N: usize = 10;
 
     let upstream = FakeUpstream::start_echo().await;
-    let port = find_test_port().await;
+    let listener = bind_test_listener().await;
+    let proxy_addr = listener.local_addr().expect("listener local_addr");
     let config = ProxyConfig::builder()
-        .port(port)
+        .port(41001) // placeholder — run_server_with_listener ignores config.bind_addr
         .upstream_default(upstream.url())
         .build()
         .expect("proxy config");
-    let proxy_addr = config.bind_addr();
 
     // Capacity=1, no consumer — channel fills immediately; subsequent events drop.
     let (hook, rx) = ChannelAnalyticsHook::new(1);
@@ -1898,7 +1893,8 @@ async fn test_ac15_zero_failures_saturated_channel() {
     // We deliberately never read from it to saturate the channel.
     std::mem::forget(rx);
 
-    let task = tokio::spawn(rskim_proxy::testing::run_server_async(
+    let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+        listener,
         config,
         rskim_proxy::seam::TransformPipeline::identity(),
         Arc::new(hook),

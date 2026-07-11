@@ -606,48 +606,22 @@ impl ShutdownFlag {
 // Server start
 // ============================================================================
 
-/// Start the HTTP proxy server.
+/// Inner accept loop shared by `run_server` and `run_server_with_listener`.
 ///
-/// Binds to `config.bind_addr`, accepts connections (bounded by
-/// [`DEFAULT_CONNECTION_CAP`]), and handles requests via [`handle_request`].
+/// Accepts connections on an already-bound `listener` until a SIGINT/SIGTERM
+/// is received, then drains in-flight connections for up to
+/// `config.graceful_drain` before returning.
 ///
-/// Blocks until SIGINT/SIGTERM is received. On signal:
-/// 1. Stops accepting new connections.
-/// 2. Waits for in-flight connections to drain (up to `config.graceful_drain`).
-/// 3. Returns `Ok(())`.
-///
-/// ## AC23 — Graceful shutdown
-///
-/// The drain window is `config.graceful_drain` (5s, evidence in config.rs).
-/// In-flight streams are given this window; new connections are refused after
-/// the signal is received.
-///
-/// ## AC22 — Connection cap
-///
-/// A `Semaphore` with [`DEFAULT_CONNECTION_CAP`] permits enforces the cap.
-/// When all permits are held, `accept()` blocks (TCP backpressure — AD-PXY-13).
-pub async fn run_server(
-    config: ProxyConfig,
-    pipeline: TransformPipeline,
+/// All public API is on the callers (`run_server` / `run_server_with_listener`);
+/// this function is an implementation detail and not part of the stable API.
+async fn serve_listener(
+    listener: TcpListener,
+    config: Arc<ProxyConfig>,
+    pipeline: Arc<TransformPipeline>,
     analytics: Arc<dyn AnalyticsHook>,
+    upstream_client: Arc<UpstreamClient>,
+    readiness: Arc<ReadinessState>,
 ) -> Result<(), ProxyError> {
-    let bind_addr = config.bind_addr;
-    let config = Arc::new(config);
-    let pipeline = Arc::new(pipeline);
-    let readiness = ReadinessState::new();
-    let upstream_client =
-        Arc::new(UpstreamClient::new().map_err(|e| ProxyError::TlsConfig(e.to_string()))?);
-
-    // Bind the listener.
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .map_err(|e| ProxyError::BindFailed {
-            addr: bind_addr.to_string(),
-            source: e,
-        })?;
-
-    info!(addr = %bind_addr, "proxy listening");
-
     // Connection-cap semaphore (AD-PXY-13 bounded-accept).
     let connection_cap = Arc::new(Semaphore::new(DEFAULT_CONNECTION_CAP));
 
@@ -775,6 +749,94 @@ pub async fn run_server(
     }
 
     Ok(())
+}
+
+/// Start the HTTP proxy server.
+///
+/// Binds to `config.bind_addr`, accepts connections (bounded by
+/// [`DEFAULT_CONNECTION_CAP`]), and handles requests via [`handle_request`].
+///
+/// Blocks until SIGINT/SIGTERM is received. On signal:
+/// 1. Stops accepting new connections.
+/// 2. Waits for in-flight connections to drain (up to `config.graceful_drain`).
+/// 3. Returns `Ok(())`.
+///
+/// ## AC23 — Graceful shutdown
+///
+/// The drain window is `config.graceful_drain` (5s, evidence in config.rs).
+/// In-flight streams are given this window; new connections are refused after
+/// the signal is received.
+///
+/// ## AC22 — Connection cap
+///
+/// A `Semaphore` with [`DEFAULT_CONNECTION_CAP`] permits enforces the cap.
+/// When all permits are held, `accept()` blocks (TCP backpressure — AD-PXY-13).
+pub async fn run_server(
+    config: ProxyConfig,
+    pipeline: TransformPipeline,
+    analytics: Arc<dyn AnalyticsHook>,
+) -> Result<(), ProxyError> {
+    let bind_addr = config.bind_addr;
+    let config = Arc::new(config);
+    let pipeline = Arc::new(pipeline);
+    let readiness = ReadinessState::new();
+    let upstream_client =
+        Arc::new(UpstreamClient::new().map_err(|e| ProxyError::TlsConfig(e.to_string()))?);
+
+    // Bind the listener.
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .map_err(|e| ProxyError::BindFailed {
+            addr: bind_addr.to_string(),
+            source: e,
+        })?;
+
+    info!(addr = %bind_addr, "proxy listening");
+
+    serve_listener(listener, config, pipeline, analytics, upstream_client, readiness).await
+}
+
+/// Like [`run_server`] but accepts a pre-bound listener, bypassing the bind
+/// step and the port-range validation enforced by [`ProxyConfig`].
+///
+/// Intended for integration tests that obtain an OS-assigned port by binding
+/// to `127.0.0.1:0` — the OS guarantees each `bind(0)` call returns a unique
+/// port, eliminating the TOCTOU race that a probe-then-bind approach has under
+/// parallel nextest execution (each test runs in its own process, so a
+/// process-global `AtomicU16` counter resets independently and causes
+/// collisions). The caller reads the actual address via `listener.local_addr()`
+/// and passes the listener here; the config is used for all non-bind settings
+/// (upstream URL, timeouts, etc.) but its `bind_addr` is ignored.
+///
+/// Production code always uses [`run_server`]; this variant is only compiled
+/// when the `testing` feature is enabled.
+///
+/// # Errors
+///
+/// Returns [`ProxyError::TlsConfig`] if the upstream TLS client cannot be
+/// initialised. The listener's local address is read for logging only.
+#[cfg(any(test, feature = "testing"))]
+pub async fn run_server_with_listener(
+    listener: TcpListener,
+    config: ProxyConfig,
+    pipeline: TransformPipeline,
+    analytics: Arc<dyn AnalyticsHook>,
+) -> Result<(), ProxyError> {
+    let addr = listener
+        .local_addr()
+        .map_err(|e| ProxyError::BindFailed {
+            addr: "pre-bound".to_string(),
+            source: e,
+        })?;
+    let config = Arc::new(config);
+    let pipeline = Arc::new(pipeline);
+    let readiness = ReadinessState::new();
+    let upstream_client =
+        Arc::new(UpstreamClient::new().map_err(|e| ProxyError::TlsConfig(e.to_string()))?);
+
+    info!(addr = %addr, "proxy listening (pre-bound)");
+
+    serve_listener(listener, config, pipeline, analytics, upstream_client, readiness).await
 }
 
 // ============================================================================

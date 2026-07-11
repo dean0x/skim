@@ -97,6 +97,8 @@ pub mod forward;
 pub mod testing {
     use std::sync::Arc;
 
+    use tokio::net::TcpListener;
+
     use crate::analytics::AnalyticsHook;
     use crate::config::ProxyConfig;
     use crate::errors::ProxyError;
@@ -124,6 +126,32 @@ pub mod testing {
         analytics: Arc<dyn AnalyticsHook>,
     ) -> Result<(), ProxyError> {
         crate::server::run_server(config, pipeline, analytics).await
+    }
+
+    /// Like [`run_server_async`] but accepts a pre-bound listener.
+    ///
+    /// Binds to `127.0.0.1:0` in the test and hand the resulting
+    /// `TcpListener` here — the OS guarantees each `bind(0)` returns a unique
+    /// port, eliminating the TOCTOU race that a probe-then-bind pattern has
+    /// under parallel nextest (each test process has its own counter / seed that
+    /// independently restarts from the same base). The caller reads the actual
+    /// proxy address via `listener.local_addr()` before passing the listener in.
+    ///
+    /// `config.bind_addr` is **not** used for binding; the port stored in config
+    /// may be any placeholder value and is only used for non-bind settings
+    /// (upstream URL, timeouts, etc.).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProxyError`] for TLS init failures. Forwarding-path errors
+    /// are never surfaced — they resolve to fail-open.
+    pub async fn run_server_with_listener(
+        listener: TcpListener,
+        config: ProxyConfig,
+        pipeline: TransformPipeline,
+        analytics: Arc<dyn AnalyticsHook>,
+    ) -> Result<(), ProxyError> {
+        crate::server::run_server_with_listener(listener, config, pipeline, analytics).await
     }
 }
 
