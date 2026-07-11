@@ -376,12 +376,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.11.0] - 2026-07-11
 
-Consent-gated permissions seeding for `skim init`; Copilot hook re-homed to `~/.copilot`; `ls -a` fidelity fix. 4,327 tests passing (up from 3,558 in v2.10.0).
+Consent-gated permissions seeding for `skim init`; Copilot hook re-homed to `~/.copilot`; `ls -a` fidelity fix. 4,329 tests passing (up from 3,558 in v2.10.0).
 
 ### Added
 
 - **`skim init --permissions` / `--no-permissions` / `--permissions-tier=<tier>`** —
-  Consent-gated allowlist seeding for Claude, Gemini, and Codex. Three tiers:
+  Consent-gated allowlist seeding for Claude, Gemini, Codex, and Copilot. Three tiers:
   - **seed** (default): seeds 8 arg-safe read-only wrapped tools (`df`, `diff`, `du`,
     `grep`, `ls`, `rg`, `tree`, `wc`) as allowlist entries. Excluded-for-cause:
     `find`, `env`, `printenv`, `dig`, `nslookup`, `ps` (network or process-enumeration

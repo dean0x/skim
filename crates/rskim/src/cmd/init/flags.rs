@@ -5,8 +5,8 @@ use crate::cmd::session::AgentKind;
 /// Which scope of tool permissions to seed during `skim init --permissions`.
 ///
 /// The tier controls which (and how many) allowlist entries are written to the
-/// agent's permission config file. Subtask 7 implements the full tier-dispatch
-/// logic; this enum is defined here because it appears in `InitFlags` which must
+/// agent's permission config file. Tier dispatch is performed by `install.rs`;
+/// this enum is defined here because it appears in `InitFlags` which must
 /// stay `Copy`.
 ///
 /// Default is `Seed` — the narrowest, safest tier.
@@ -17,9 +17,9 @@ pub(crate) enum PermissionsTier {
     /// tool arguments, so only genuinely read-only tools are included.
     #[default]
     Seed,
-    /// Mirror the agent's existing allow-list entries (not yet wired; Subtask 7).
+    /// Mirror the agent's existing allow-list entries (Claude-scoped; see propose_mirrors).
     Mirror,
-    /// Blanket grant (requires double-confirmation; not yet wired; Subtask 7).
+    /// Blanket grant (requires a second hazard confirmation; refused for Codex).
     Blanket,
 }
 
@@ -169,7 +169,7 @@ impl DetectionEnv {
     /// or `~/.config/Cursor` (Linux). The `is_dir()` branch in
     /// `AgentKind::config_dir` handles the macOS vs. Linux detection at runtime.
     ///
-    /// **Cursor is IDE-only** (WS2B decision): skim integrates with Cursor via
+    /// **Cursor is IDE-only**: skim integrates with Cursor via
     /// the IDE hook + `.mdc` guidance rules only. The Cursor CLI has no
     /// rewrite-capable hook event, so no permissions file is seeded for Cursor.
     /// Config-dir resolution still runs (for hook/guidance install), but the

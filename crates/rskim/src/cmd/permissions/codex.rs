@@ -131,6 +131,8 @@ impl PermissionsProtocol for CodexPermissions {
         })?;
         let sidecar = PermissionSidecar {
             version: 1,
+            // tier is hardcoded to "seed": Blanket is refused above; Mirror falls back to
+            // the same seed-set.
             tier: "seed".to_string(),
             entries: entries.to_vec(),
             source_mirrors: std::collections::HashMap::new(),

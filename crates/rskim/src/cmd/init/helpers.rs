@@ -319,7 +319,7 @@ fn confirm_proceed_raw() -> anyhow::Result<bool> {
 /// # Bypass prohibition
 ///
 /// The `--yes` flag is for hook uninstall confirmation only. It does NOT bypass
-/// this function — callers (Subtask 7) invoke `confirm_grant` unconditionally
+/// this function — callers invoke `confirm_grant` unconditionally
 /// whenever permissions are requested. Do NOT add a flag parameter that skips
 /// the TTY check.
 ///

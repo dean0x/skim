@@ -128,10 +128,22 @@ pub(crate) trait PermissionsProtocol {
     /// on a missing or corrupt sidecar — callers must never silently proceed
     /// without a sidecar (risk: removing entries skim did not write).
     ///
-    /// For user-owned files: removes only sidecar-manifest entries that are
-    /// still byte-equal present in the allow array; leaves everything else.
-    /// For skim-owned files: deletes the file only after hash-verifying against
-    /// the sidecar.
+    /// For user-owned files (Claude `settings.json`, Copilot `permissions-config.json`):
+    /// removes only sidecar-manifest entries that are still byte-equal present in the
+    /// allow array; leaves everything else.
+    /// For skim-owned files (Gemini `policies/skim.toml`, Codex `rules/skim.rules`):
+    /// deletes the file only after hash-verifying against the sidecar.
+    ///
+    /// ## Sidecar behavior when the config file is absent
+    ///
+    /// This diverges by config ownership:
+    /// - **Skim-owned writers** (Gemini, Codex): both the config file and the sidecar are
+    ///   skim artifacts. If the config file is already gone, the sidecar is also deleted
+    ///   and `NothingToRemove` is returned — there is nothing left to clean up.
+    /// - **User-owned writers** (Claude, Copilot): skim does not own the config file's
+    ///   lifecycle. If the config file is absent the sidecar is left in place and
+    ///   `NothingToRemove` is returned — the sidecar still correctly records what was
+    ///   seeded and may inform future operations.
     fn remove_seeded(&self, config_dir: &Path) -> anyhow::Result<RemoveOutcome>;
 
     /// Check whether all `entries` are already present in the agent config.
@@ -151,15 +163,14 @@ pub(crate) trait PermissionsProtocol {
 /// Return the `PermissionsProtocol` implementation for `agent`, or `None` if
 /// skim does not write permissions for this agent.
 ///
-/// | Agent      | Result   | Reason                                                      |
-/// |------------|----------|-------------------------------------------------------------|
-/// | ClaudeCode | `Some`   | Writes to `settings.json` `permissions.allow` array.        |
-/// | GeminiCli  | `Some`   | Owns `policies/skim.toml` (wholesale replacement).          |
-/// | CodexCli   | `Some`   | Owns `rules/skim.rules` (Starlark prefix-rule lines).       |
-/// | Cursor     | `None`   | **Permanent**: IDE-only integration; no CLI permissions.    |
-/// | Crush      | `None`   | **Permanent**: no permissions writer (WS2B decision).       |
-/// | CopilotCli | `None`   | **Transitional**: Subtask 7 adds the Copilot writer after   |
-/// |            |          | the hook re-home; do not flip this `None` before that task. |
+/// | Agent      | Result   | Reason                                                          |
+/// |------------|---------|-----------------------------------------------------------------|
+/// | ClaudeCode | `Some`   | Writes to `settings.json` `permissions.allow` array.            |
+/// | GeminiCli  | `Some`   | Owns `policies/skim.toml` (wholesale replacement).              |
+/// | CodexCli   | `Some`   | Owns `rules/skim.rules` (Starlark prefix-rule lines).           |
+/// | CopilotCli | `Some`   | Writes per-project permissions-config.json keyed by git root.   |
+/// | Cursor     | `None`   | **Permanent**: IDE-only — its CLI has no rewrite-capable hook.  |
+/// | Crush      | `None`   | **Permanent**: no permissions surface — no config file to write.|
 pub(crate) fn permissions_protocol_for_agent(
     agent: AgentKind,
 ) -> Option<Box<dyn PermissionsProtocol>> {
@@ -167,11 +178,11 @@ pub(crate) fn permissions_protocol_for_agent(
         AgentKind::ClaudeCode => Some(Box::new(claude::ClaudePermissions)),
         AgentKind::GeminiCli => Some(Box::new(gemini::GeminiPermissions)),
         AgentKind::CodexCli => Some(Box::new(codex::CodexPermissions)),
-        // Permanent None: Cursor is IDE-only (WS2B). skim integrates via the
-        // IDE hook + .mdc guidance only. The Cursor CLI has no rewrite-capable
-        // hook event, so no permissions file is ever seeded.
+        // Permanent None: Cursor is IDE-only — its CLI has no rewrite-capable
+        // hook event; skim integrates via the IDE hook + .mdc guidance only.
+        // No permissions file is ever seeded.
         AgentKind::Cursor => None,
-        // Permanent None: Crush has no permissions writer (ratified in WS2B).
+        // Permanent None: Crush has no permissions surface — no config file to write.
         AgentKind::Crush => None,
         // Copilot writer: per-project permissions-config.json keyed by git root.
         // Schema validated in principle, pending deferred Copilot CLI e2e.
@@ -256,20 +267,19 @@ mod tests {
 
     #[test]
     fn test_factory_crush_returns_none_permanently() {
-        // Crush has no permissions writer (WS2B decision). Permanent None.
+        // Crush has no permissions surface — no config file to write. Permanent None.
         assert!(
             permissions_protocol_for_agent(AgentKind::Crush).is_none(),
-            "Crush must permanently return None from permissions factory (WS2B)"
+            "Crush must permanently return None from permissions factory (no permissions surface)"
         );
     }
 
     #[test]
     fn test_factory_copilot_returns_some() {
-        // Copilot writer was added in Subtask 7 (per-project permissions-config.json).
-        // This Some is PERMANENT — Copilot CLI now has a writer.
+        // Copilot CLI has a permanent permissions writer (per-project permissions-config.json).
         assert!(
             permissions_protocol_for_agent(AgentKind::CopilotCli).is_some(),
-            "Copilot must return Some from permissions factory (writer added in Subtask 7)"
+            "Copilot must return Some from permissions factory (per-project writer)"
         );
     }
 

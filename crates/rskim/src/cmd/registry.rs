@@ -187,8 +187,9 @@ pub(crate) fn is_known_subcommand(name: &str) -> bool {
 ///
 /// Used at install time to annotate wrappers with their permission tier.
 /// INVARIANT: this registry is install-time-only — it must NOT be referenced
-/// from any rewrite/dispatch code path. (A later subtask adds a contract test
-/// for this.) A deliberate future addition must be accompanied by a test edit
+/// from any rewrite/dispatch code path. (Enforced by
+/// `contract_read_only_subcommands_absent_from_rewrite_dispatch`.) A deliberate
+/// future addition must be accompanied by a test edit
 /// so drift is never silent.
 ///
 /// INVARIANT: must remain in ascending lexicographic order so that

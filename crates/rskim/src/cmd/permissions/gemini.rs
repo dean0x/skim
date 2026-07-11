@@ -138,6 +138,8 @@ impl PermissionsProtocol for GeminiPermissions {
         })?;
         let sidecar = PermissionSidecar {
             version: 1,
+            // tier is hardcoded to "seed": Mirror requests produce the same seed-set for
+            // this agent.
             tier: "seed".to_string(),
             entries: entries.to_vec(),
             source_mirrors: std::collections::HashMap::new(),
