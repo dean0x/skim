@@ -82,10 +82,12 @@ fn openai_body(content: &str) -> Vec<u8> {
         .into_bytes()
 }
 
-/// A long code block (> MIN_SIZE_FLOOR, eligible for code compression).
-/// Contains a complete Rust module with multiple functions for structure mode.
+/// A long Rust code block (> MIN_SIZE_FLOOR).
+///
+/// Post-P0.1: code blocks pass through byte-identical regardless of size.
+/// This fixture is kept for tests that verify never-inflate (passthrough ≤ input).
 fn long_rust_code() -> String {
-    // ~500 bytes of valid Rust — well above the 64-byte floor, below 32 KiB max.
+    // ~500 bytes of valid Rust — well above the 64-byte floor.
     let mut s = String::new();
     for i in 0..10 {
         s.push_str(&format!(
@@ -100,10 +102,25 @@ fn tiny_block() -> &'static str {
     "tiny" // 4 bytes — well below the 64-byte floor
 }
 
-/// A giant block — above MAX_CODE_BYTES (32 KiB).
-fn giant_code_block() -> String {
-    // ~33 KiB of code text, above MAX_CODE_BYTES (32 KiB).
+/// A large code block (>32 KiB). Routes to Passthrough unconditionally (ADR-007).
+fn large_code_block() -> String {
+    // ~33 KiB of code text.
     "fn placeholder() {}\n".repeat(33 * 1024 / 20)
+}
+
+/// A pretty-printed JSON object that shrinks under the JSON engine (minification).
+///
+/// Used for ac19 and proxy e2e tests. Must classify as Class::Json (Rule 2:
+/// raw text starting with `{` that parses as JSON). Must be >64B <64KiB.
+fn pretty_json_fixture() -> String {
+    let mut s = String::from("{\n");
+    for i in 0..15 {
+        s.push_str(&format!(
+            "  \"key_{i}\": \"value_{i}_some_longer_string_for_testing\",\n"
+        ));
+    }
+    s.push_str("  \"nested\": {\"a\": 1, \"b\": 2, \"c\": [1, 2, 3]}\n}");
+    s
 }
 
 /// Already-compressed / random-ish content that is hard to compress further.
@@ -192,7 +209,10 @@ fn ac11_already_compressed_content_no_inflate() {
     );
 }
 
-/// AC11 — Rust code: compression never inflates.
+/// AC11 / P0.1 — Rust code block: byte-identical passthrough (never inflates).
+///
+/// Post-P0.1: code blocks pass through byte-identical. The discriminating
+/// observable is that output == input (byte-identical), not just output <= input.
 #[test]
 fn ac11_rust_code_never_inflates() {
     let code = long_rust_code();
@@ -201,11 +221,43 @@ fn ac11_rust_code_never_inflates() {
     let router = BlockRouter::passthrough_default();
 
     let outcome = router.route(&body, Policy::Default, "req-ac11-rust", &sink);
-    assert!(
-        outcome.bytes.len() <= body.len(),
-        "Rust code output {} > input {}",
+    // P0.1: code passes through — output is byte-identical to input.
+    assert_eq!(
+        outcome.bytes.as_slice(),
+        body.as_slice(),
+        "P0.1: Rust code block must be byte-identical passthrough (output {} != input {})",
         outcome.bytes.len(),
         body.len()
+    );
+}
+
+/// P0.1 AC — >32KiB code block routes to byte-identical passthrough.
+///
+/// Discriminating observable: byte-identical output (not just byte-count ≤ input),
+/// confirmed on a large block to exercise the full passthrough path.
+#[test]
+fn p01_large_code_block_byte_identical_passthrough() {
+    let code = large_code_block();
+    let body = anthropic_body(&code);
+    let sink = Arc::new(MockSink::new());
+    let router = BlockRouter::new(sink.clone());
+
+    let outcome = router.route(&body, Policy::Default, "req-p01-large", sink.as_ref());
+    let records = sink.drain();
+
+    // Output must be byte-identical (Passthrough — P0.1).
+    assert_eq!(
+        outcome.bytes.as_slice(),
+        body.as_slice(),
+        "P0.1: >32KiB code block must be byte-identical passthrough"
+    );
+
+    // One Passthrough record emitted (prefilter skip or routing passthrough).
+    assert_eq!(records.len(), 1, "P0.1: exactly 1 record for 1 candidate");
+    assert_eq!(
+        records[0].decision,
+        rskim_contract::log::Decision::Passthrough,
+        "P0.1: large code block record must be Passthrough, not Modified"
     );
 }
 
@@ -490,41 +542,53 @@ fn ac19_reason_prefilter_passthrough() {
     );
 }
 
-/// AC19 — Reason mapping: compressed clean code → Modified/Full.
+/// AC19 / P0.1 — Reason mapping: pretty-printed JSON → Modified/Full (bytes_out < bytes_in).
 ///
-/// Discriminating: if reason is Degraded instead of Full, the assertion fails.
+/// Post-P0.1: code is always Passthrough. JSON minification is the discriminating
+/// compression path. This test uses a pretty-printed JSON fixture that shrinks
+/// under JSON minification (whitespace removal).
+///
+/// Discriminating:
+/// - If the JSON engine is removed, the block routes to Passthrough → test fails.
+/// - If reason is Degraded instead of Full, the assertion fails.
+/// - If bytes_out >= bytes_in, the assertion fails (must actually shrink).
 #[test]
 fn ac19_reason_compressed_clean_modified_full() {
-    let code = long_rust_code();
-    let body = anthropic_body(&code);
+    let json = pretty_json_fixture();
+    let body = anthropic_body(&json);
     let sink = Arc::new(MockSink::new());
     let router = BlockRouter::new(sink.clone());
 
     let outcome = router.route(&body, Policy::Default, "req-ac19-full", sink.as_ref());
     let records = sink.drain();
 
+    assert_eq!(
+        records.len(),
+        1,
+        "Must have exactly 1 record for 1 candidate"
+    );
+
     if outcome.is_passthrough() {
-        assert_eq!(records.len(), 1, "Must have exactly 1 record");
-        assert_eq!(records[0].decision, Decision::Passthrough);
-    } else {
+        // Acceptable if JSON minification did not shrink (byte-gate rejected).
         assert_eq!(
-            records.len(),
-            1,
-            "Must have exactly 1 record for 1 candidate"
+            records[0].decision,
+            Decision::Passthrough,
+            "Passthrough outcome must have Passthrough record"
         );
+    } else {
         assert_eq!(
             records[0].decision,
             Decision::Modified,
-            "Compressed block must be Modified"
+            "JSON-compressed block must be Modified"
         );
         assert_eq!(
             records[0].reason,
             OutcomeReason::Full,
-            "Clean compression must have reason=Full"
+            "JSON minification must have reason=Full (not Degraded)"
         );
         assert!(
             records[0].bytes_out < records[0].bytes_in,
-            "Modified record must show bytes_out < bytes_in"
+            "Modified record must show bytes_out < bytes_in (JSON minification shrinks)"
         );
     }
 }
@@ -761,14 +825,18 @@ fn ac22_below_floor_passthrough_record() {
     );
 }
 
-/// AC22 — Block above MAX_CODE_BYTES: byte-identical + Passthrough record.
+/// AC22 / P0.1 — Large code block: byte-identical passthrough, Passthrough record.
 ///
-/// Discriminating: if the max-size threshold is removed, the engine would run.
-/// The record reason would be FailedOpen or Modified. The reason assertion fails.
+/// Post-P0.1: large code blocks pass through unconditionally (no prefilter needed).
+/// The prefilter is never reached for code blocks — `engine_for_class` returns
+/// `Passthrough` before any prefilter check.
+///
+/// Discriminating: if the Code engine arm were restored, the block would route to
+/// the prefilter and might be compressed. The byte-identity assertion would fail.
 #[test]
-fn ac22_above_max_code_bytes_passthrough_record() {
-    let giant = giant_code_block();
-    let body = anthropic_body(&giant);
+fn ac22_large_code_block_passthrough_record() {
+    let code = large_code_block();
+    let body = anthropic_body(&code);
     let sink = Arc::new(MockSink::new());
     let router = BlockRouter::new(sink.clone());
 
@@ -778,30 +846,26 @@ fn ac22_above_max_code_bytes_passthrough_record() {
     assert_eq!(
         outcome.bytes.as_slice(),
         body.as_slice(),
-        "Above-max block must produce byte-identical output"
+        "P0.1: large code block must produce byte-identical output"
     );
 
-    assert_eq!(records.len(), 1, "Above-max block must emit 1 record");
+    assert_eq!(records.len(), 1, "Large code block must emit 1 record");
     assert_eq!(records[0].decision, Decision::Passthrough);
     assert_eq!(
         records[0].reason,
         OutcomeReason::Passthrough,
-        "Above-max block prefilter must emit reason=Passthrough"
+        "P0.1: large code block must emit reason=Passthrough"
     );
 }
 
 /// AC22 — Prefilter constants are meaningful (not 0 or usize::MAX).
 #[test]
 fn ac22_prefilter_constants_are_meaningful() {
-    use rskim_compress::prefilter::{MAX_CODE_BYTES, MIN_SIZE_FLOOR};
+    use rskim_compress::prefilter::MIN_SIZE_FLOOR;
 
     assert!(
         MIN_SIZE_FLOOR >= 16,
         "MIN_SIZE_FLOOR ({MIN_SIZE_FLOOR}) must be at least 16 bytes"
-    );
-    assert!(
-        MAX_CODE_BYTES >= 1024,
-        "MAX_CODE_BYTES ({MAX_CODE_BYTES}) must be at least 1 KiB"
     );
 }
 
@@ -842,17 +906,17 @@ fn determinism_100_repeats() {
 // ============================================================================
 
 mod prefilter_public_api {
-    use rskim_compress::prefilter::{
-        MAX_CODE_BYTES, MAX_JSON_BYTES, MAX_LOG_BYTES, MAX_MIXED_BYTES, MIN_SIZE_FLOOR,
-    };
+    use rskim_compress::prefilter::{MAX_JSON_BYTES, MAX_LOG_BYTES, MAX_MIXED_BYTES, MIN_SIZE_FLOOR};
 
-    /// AC22 — Prefilter constants are accessible for documentation and testing.
+    /// AC22 / P0.1 — Prefilter constants are accessible for documentation and testing.
+    ///
+    /// Note: code blocks always route to Passthrough before the prefilter (ADR-007);
+    /// no per-class size threshold is needed for `Class::Code`.
     #[test]
     fn all_constants_accessible() {
         // Compile test: this compiles iff all constants are `pub`.
         // Runtime bounds: each constant must be a sensible positive value.
         assert!(MIN_SIZE_FLOOR > 0, "MIN_SIZE_FLOOR must be positive");
-        assert!(MAX_CODE_BYTES > 0, "MAX_CODE_BYTES must be positive");
         assert!(MAX_JSON_BYTES > 0, "MAX_JSON_BYTES must be positive");
         assert!(MAX_LOG_BYTES > 0, "MAX_LOG_BYTES must be positive");
         assert!(MAX_MIXED_BYTES > 0, "MAX_MIXED_BYTES must be positive");
@@ -1643,6 +1707,14 @@ fn ac26_rskim_compress_no_direct_hyper_tokio_axum() {
     assert!(
         !deps_section.contains("axum"),
         "AC26: rskim-compress [dependencies] must NOT contain 'axum' (AC9/AC26)\n\
+         Found: {deps_section}"
+    );
+    // P0.1 / ADR-007: rskim-core (AST transform) must NOT be a direct dependency
+    // of rskim-compress. Code blocks pass through losslessly; no tree-sitter on egress.
+    assert!(
+        !deps_section.contains("rskim-core"),
+        "P0.1/ADR-007: rskim-compress [dependencies] must NOT contain 'rskim-core' \
+         (code blocks are always Passthrough; no AST transforms on the egress path)\n\
          Found: {deps_section}"
     );
 }

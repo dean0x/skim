@@ -1,4 +1,4 @@
-//! # rskim-compress — per-content-type block compression router (#304)
+//! # rskim-compress — per-content-type block compression router (#304, P0.1 #427)
 //!
 //! This crate is the L3 block-compression engine for skim's Layer-3 LLM request
 //! proxy. It hosts the [`BlockRouter`] and the promoted `compress_log` function.
@@ -33,7 +33,7 @@
 //!   deviates from D1's letter but honors its intent (per-call policy, stateless
 //!   shared router).
 //!
-//! ## Crate layout (Phase 3)
+//! ## Crate layout (Phase 3 / P0.1)
 //!
 //! ```text
 //! rskim-compress
@@ -45,7 +45,6 @@
 //! │   ├── route.rs      — class→engine dispatch + language-hint mapping (Phase 2)
 //! │   └── engines/      — per-content-type compressors (Phase 2)
 //! │       ├── mod.rs
-//! │       ├── code.rs   — rskim-core AST transform adapter
 //! │       ├── log.rs    — thin adapter over crate::log::compress_log
 //! │       ├── json.rs   — new valid-JSON structural compressor (D5)
 //! │       └── mixed.rs  — CRLF-aware fence scanner + per-fence routing
@@ -54,27 +53,15 @@
 //!     └── integration.rs — behavioral/safety integration tests (Phase 3)
 //! ```
 //!
+//! Note: `engines/code.rs` (rskim-core AST transform adapter) was deleted in P0.1
+//! (#427). Under ADR-007 (lossless-only egress), code blocks always pass through
+//! byte-identical on the proxy path.
+//!
 //! ## Dependency constraints (AC9 / AC26)
 //!
-//! rskim-compress MUST NOT depend on: hyper, tokio, axum, rskim-proxy.
-//! rskim-core MUST NOT gain regex (AC26): regex lives here.
-//!
-//! ## AD-011 — CRLF ground truth (Phase 3 correction)
-//!
-//! **Ground truth (verified by reading structure.rs:615 and transform/mod.rs):**
-//! rskim-core DOES normalize CRLF→LF in its output. The transform pipeline collects
-//! output text via `.lines()` (which strips `\r`) and reassembles with `"\n"` via
-//! `texts.join("\n")` (verified at `crates/rskim-core/src/transform/structure.rs:615`).
-//!
-//! Consequence for engines/code.rs: the CRLF normalization in the adapter
-//! (`text.replace("\r\n", "\n")` before calling `transform_with_quality`) is a
-//! belt-and-suspenders measure — it is NOT the only normalization path. Even without
-//! it, rskim-core's `join("\n")` would produce LF output. The adapter normalization
-//! is preserved for explicitness and to ensure LF input and CRLF input produce
-//! *identical* compressed output (determinism), not merely LF output.
-//!
-//! The Phase 2 handoff note ("rskim-core does NOT normalize CRLF") was incorrect.
-//! This correction supersedes it.
+//! rskim-compress MUST NOT depend on: hyper, tokio, axum, rskim-proxy, rskim-core.
+//! rskim-core was removed in P0.1 (#427) — no AST transforms on the egress path.
+//! regex lives here (AC26: rskim-core MUST NOT gain regex).
 
 #![deny(missing_docs)]
 
@@ -91,7 +78,6 @@ use rskim_contract::guardrail::{ByteGateVerdict, byte_gate, whole_request_check}
 use rskim_contract::log::{DecisionRecord, DecisionSink, OutcomeReason, SinkFull};
 use rskim_llm::{ParsedBody, mutate_block, serialize};
 
-use engines::code::CompressResult as CodeResult;
 use engines::json::CompressResult as JsonResult;
 use engines::log::CompressResult as LogResult;
 use engines::mixed::CompressResult as MixedResult;
@@ -229,13 +215,6 @@ impl BlockRouter {
     /// per-class maximum are forwarded byte-identical with a `Passthrough` record.
     /// Size-based only — never time-based.
     ///
-    /// ## AD-011 (CRLF) — corrected in Phase 3
-    ///
-    /// rskim-core DOES normalize CRLF→LF in its transform output (verified:
-    /// `structure.rs:615` uses `texts.join("\n")` which strips `\r`). The
-    /// engines/code.rs adapter also normalizes CRLF→LF before calling rskim-core,
-    /// for determinism (LF and CRLF input → identical compressed output).
-    /// For non-code engines (json/log/mixed), passthrough is byte-exact (CRLF preserved).
     pub fn route(
         &self,
         body: &[u8],
@@ -571,23 +550,20 @@ enum EngineOutcome {
 /// - engine returns `Passthrough` variant → `EngineOutcome::Passthrough { FailedOpen }`
 ///   (engine internally chose passthrough, treated as fail-open for logging)
 /// - engine returns `Compressed` → `EngineOutcome::Compressed { content, degraded }`
+///
+/// # P0.1 / ADR-007
+///
+/// `Class::Code` routes to `Passthrough` unconditionally in `engine_for_class`
+/// (ADR-007 / #427) — no engine dispatch occurs for code blocks.
 fn apply_engine(engine: EngineTarget, text: &str) -> EngineOutcome {
     match engine {
         EngineTarget::Passthrough => {
-            // Routing-level skip (unsupported hint, data-format language, etc.).
+            // Routing-level skip: code blocks (P0.1), unsupported hints, data-format
+            // languages, and all other passthrough cases.
             EngineOutcome::Passthrough {
                 reason: OutcomeReason::Passthrough,
             }
         }
-        EngineTarget::Code(lang) => match engines::code::compress_code(text, lang) {
-            CodeResult::Compressed { content, degraded } => {
-                EngineOutcome::Compressed { content, degraded }
-            }
-            CodeResult::Passthrough => EngineOutcome::Passthrough {
-                // Code engine returned Passthrough (language error or unsupported).
-                reason: OutcomeReason::FailedOpen,
-            },
-        },
         EngineTarget::Json => match engines::json::compress_json(text) {
             JsonResult::Compressed { content } => EngineOutcome::Compressed {
                 content,

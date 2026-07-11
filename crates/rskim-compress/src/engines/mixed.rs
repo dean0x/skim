@@ -1,4 +1,4 @@
-//! Mixed-content fence scanner and per-fence compression engine (#304 Phase 2).
+//! Mixed-content fence scanner and per-fence compression engine (#304 Phase 2, P0.1 #427).
 //!
 //! # AD-005 — Fence spans are re-derived by the router
 //!
@@ -12,15 +12,14 @@
 //! 1. Every byte OUTSIDE fence bodies (prose, ``` delimiters, info strings) MUST
 //!    be byte-identical to the input.
 //! 2. The count of ``` fences MUST be unchanged.
-//! 3. Each fence BODY is independently routed per the precedence table (AD-006):
+//! 3. Each fence BODY is independently routed per the precedence table (AD-006 / P0.1):
 //!    - `json` hint → JSON engine
 //!    - `yaml`, `toml`, `markdown` → passthrough (byte-identical body)
-//!    - supported code languages → code engine
+//!    - code language hints → passthrough (P0.1 / ADR-007: code never compressed on egress)
 //!    - no hint / unknown hint → passthrough
 //! 4. Unclosed fences (no closing ```) are left byte-identical (fail-safe).
 //! 5. CRLF line endings in prose and delimiters are preserved byte-identical.
-//!    CRLF inside fence bodies passed to the code engine will be normalized to
-//!    LF by rskim-core (AD-011) — this is documented behavior.
+//!    CRLF inside fence bodies is also preserved (no code engine, no LF normalization).
 //!
 //! # Single-pass fence scanner
 //!
@@ -225,18 +224,20 @@ fn split_first_line(text: &str) -> (&str, &str) {
 /// Returns the compressed body string (or the original if passthrough).
 /// The trailing newline convention is preserved by the caller (it splits on
 /// the closing ``` line separately).
+///
+/// # P0.1 / ADR-007
+///
+/// Code fences now always pass through byte-identical. `engine_for_class` returns
+/// `Passthrough` for all `Class::Code` inputs, so the `Code` arm is removed.
 fn apply_fence_engine(body: &str, engine: EngineTarget) -> String {
     match engine {
-        EngineTarget::Code(lang) => match super::code::compress_code(body, lang) {
-            super::code::CompressResult::Compressed { content, .. } => content,
-            super::code::CompressResult::Passthrough => body.to_string(),
-        },
         EngineTarget::Json => match compress_json(body) {
             super::json::CompressResult::Compressed { content } => content,
             super::json::CompressResult::Passthrough => body.to_string(),
         },
         EngineTarget::Log | EngineTarget::Mixed | EngineTarget::Passthrough => {
-            // Data-format hints, unknown hints, and nested mixed → byte-identical (AD-006).
+            // Data-format hints, code fences (P0.1), unknown hints, nested mixed →
+            // byte-identical (AD-006 / ADR-007).
             body.to_string()
         }
     }

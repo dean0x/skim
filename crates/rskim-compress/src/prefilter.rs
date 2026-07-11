@@ -1,4 +1,4 @@
-//! Per-class byte-size prefilter for the block compression router (#304 Phase 3).
+//! Per-class byte-size prefilter for the block compression router (#304 Phase 3, P0.1 #427).
 //!
 //! # AD-010 — Determinism
 //!
@@ -8,37 +8,29 @@
 //!
 //! # AD-010 (Step 7 / AC22) — Per-class thresholds + min-size floor
 //!
+//! ## P0.1 / ADR-007 — Code class is always Passthrough
+//!
+//! `Class::Code` routes to `EngineTarget::Passthrough` in `engine_for_class` (P0.1).
+//! The prefilter is never reached for code blocks — they skip engine dispatch entirely.
+//! `class_max` for `Class::Code` returns 0; the prefilter is never reached for code
+//! blocks because `engine_for_class` routes them to `EngineTarget::Passthrough` first.
+//!
 //! ## Basis for threshold values (ADR-003 / PF-005)
 //!
 //! **Provisional basis — profile not yet measured.** These constants are *conservative*
-//! provisions selected from first-principles and rskim-core benchmark data, not from a
-//! measured payload profile. The profile deliverable (Phase 4 benches / AC24) will
-//! produce empirical p50/p95 figures for each class; when that profile lands, these
-//! constants should be updated to match the measured thresholds.
-//!
-//! Until then every constant's basis is documented below so the profile team knows
-//! what they are replacing and why the provisional value is safe:
+//! provisions selected from first-principles, not from a measured payload profile.
+//! The profile deliverable (Phase 4 benches / AC24) will produce empirical p50/p95
+//! figures; when that profile lands, update these constants and the basis documentation.
 //!
 //! - **Safety is unconditional**: the never-inflate byte gate (AD-008) ensures that any
 //!   block above a threshold that somehow slips through still cannot produce output
 //!   larger than input. The prefilter is a *latency guard*, not a correctness guard.
-//!   Any threshold value — including 0 (always skip) or `usize::MAX` (never skip) —
-//!   is correct from a safety standpoint.
 //!
 //! - **Why a min floor?** Very small blocks (< `MIN_SIZE_FLOOR` bytes) cannot yield
-//!   meaningful compression. Code blocks < ~64 bytes are typically single-line
-//!   declarations that rskim-core would render as a single signature line anyway —
-//!   the structure transform adds no net reduction and may even inflate due to
-//!   the comment-replacement overhead (`{...}` additions). The floor avoids wasting
-//!   engine CPU on blocks guaranteed to be too small to benefit.
+//!   meaningful compression. The floor avoids wasting engine CPU on blocks guaranteed
+//!   to be too small to benefit.
 //!
-//! - **rskim-core latency measured at ~14.6ms for a 3000-line file** (from R4 / AC16
-//!   benchmark notes in 304-plan.md). A 3000-line Rust file is approximately 90 KB.
-//!   The per-class `Code` threshold is set well below that at 32 KB to keep p99 well
-//!   under the 10ms combined-proxy+engine target. This is conservative: adjust down
-//!   when the profile shows p95 blocks are smaller.
-//!
-//! - **JSON / Log / Mixed thresholds** follow the same first-principles rationale:
+//! - **JSON / Log / Mixed thresholds** follow first-principles rationale:
 //!   engines are structurally cheaper than tree-sitter, but large blocks (> 64 KB)
 //!   are unusual in real chat payloads and should skip to bound worst-case latency.
 //!
@@ -46,10 +38,9 @@
 //!
 //! When Phase 4 produces the payload profile (`skim bench` / AC24):
 //! 1. Record p50/p95/p99 block sizes per class from a representative corpus.
-//! 2. Set `MAX_CODE_BYTES` = 2× p95 code block size (safety margin above typical).
-//! 3. Set `MAX_JSON_BYTES`, `MAX_LOG_BYTES`, `MAX_MIXED_BYTES` similarly.
-//! 4. Update the basis documentation in this file to cite the profile date + corpus.
-//! 5. Re-run AC22 and AC24 to confirm the new thresholds hold.
+//! 2. Set `MAX_JSON_BYTES`, `MAX_LOG_BYTES`, `MAX_MIXED_BYTES` to 2× p95 block sizes.
+//! 3. Update the basis documentation to cite the profile date + corpus.
+//! 4. Re-run AC22 and AC24 to confirm the new thresholds hold.
 
 use rskim_llm::Class;
 
@@ -68,18 +59,6 @@ use rskim_llm::Class;
 /// render as an identical single-signature line gains no tokens from structure
 /// mode. The floor eliminates these no-op engine runs.
 pub const MIN_SIZE_FLOOR: usize = 64;
-
-/// Maximum code block size eligible for compression.
-///
-/// ## Basis (provisional — see module-level note)
-///
-/// Conservative cap set at 32 KiB, well below the ~90 KiB file where rskim-core
-/// measured ~14.6ms/file (per R4/AC16 benchmark notes). The cap keeps p99 engine
-/// latency below the 10ms proxy budget target.
-///
-/// Blocks above this threshold are forwarded byte-identical. The never-inflate
-/// byte gate (AD-008) guarantees safety for any threshold value.
-pub const MAX_CODE_BYTES: usize = 32 * 1024; // 32 KiB
 
 /// Maximum JSON block size eligible for compression.
 ///
@@ -146,15 +125,18 @@ pub fn prefilter_check(class: Class, block_len: usize) -> PrefilterVerdict {
 }
 
 /// Return the per-class maximum byte size threshold.
+///
+/// `Class::Code` returns 0 (always-skip) — code blocks route to Passthrough
+/// before reaching the prefilter (P0.1 / ADR-007). The 0 here is a safety
+/// backstop; in practice `engine_for_class` returns Passthrough for Code blocks
+/// and `apply_engine` never calls the prefilter for them.
 fn class_max(class: Class) -> usize {
     match class {
-        Class::Code => MAX_CODE_BYTES,
         Class::Json => MAX_JSON_BYTES,
         Class::Log => MAX_LOG_BYTES,
         Class::Mixed => MAX_MIXED_BYTES,
-        // Text/Unknown/Unknown-extension: pass-through classes that the router
-        // never routes to an engine — prefilter is moot, but return a floor of
-        // 0 so these classes are always "skip" if they ever reach this path.
+        // Code: always passthrough (P0.1 / ADR-007); prefilter never reached.
+        // Text/Unknown: passthrough classes; prefilter moot; 0 = always-skip backstop.
         _ => 0,
     }
 }
@@ -173,30 +155,32 @@ mod tests {
         );
     }
 
+    /// P0.1 / ADR-007 — Code blocks always Skip in the prefilter (class_max = 0).
+    ///
+    /// In practice `engine_for_class` returns Passthrough before the prefilter is
+    /// called for Code blocks; this test documents the defensive backstop.
     #[test]
-    fn at_floor_eligible() {
+    fn code_class_always_skips_prefilter() {
+        // Even at exactly MIN_SIZE_FLOOR, a Code block must Skip (class_max = 0 → block_len > 0).
         assert_eq!(
             prefilter_check(Class::Code, MIN_SIZE_FLOOR),
-            PrefilterVerdict::Eligible,
-            "block at exactly MIN_SIZE_FLOOR must be eligible"
-        );
-    }
-
-    #[test]
-    fn above_code_max_skip() {
-        assert_eq!(
-            prefilter_check(Class::Code, MAX_CODE_BYTES + 1),
             PrefilterVerdict::Skip,
-            "block above MAX_CODE_BYTES must be skipped"
+            "P0.1: Code class must always Skip in prefilter (class_max = 0)"
+        );
+        // And well above floor.
+        assert_eq!(
+            prefilter_check(Class::Code, 128 * 1024),
+            PrefilterVerdict::Skip,
+            "P0.1: large Code block must also Skip via prefilter backstop"
         );
     }
 
     #[test]
-    fn at_code_max_eligible() {
+    fn at_floor_eligible_json() {
         assert_eq!(
-            prefilter_check(Class::Code, MAX_CODE_BYTES),
+            prefilter_check(Class::Json, MIN_SIZE_FLOOR),
             PrefilterVerdict::Eligible,
-            "block at exactly MAX_CODE_BYTES must be eligible"
+            "JSON block at exactly MIN_SIZE_FLOOR must be eligible"
         );
     }
 

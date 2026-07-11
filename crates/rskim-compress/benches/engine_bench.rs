@@ -35,11 +35,16 @@
 //!
 //! | Bench                    | Recorded median | Regression gate |
 //! |--------------------------|-----------------|-----------------|
-//! | p50_code_block           | ~0.2-2ms        | < 10ms (D7)     |
-//! | p95_code_block           | ~1-5ms          | < 10ms (D7)     |
+//! | p50_code_block           | ~0.01-0.1ms     | < 1ms (P0.1)    |
+//! | p95_code_block           | ~0.01-0.1ms     | < 1ms (P0.1)    |
 //! | p50_json_block           | ~0.1-1ms        | < 10ms (D7)     |
 //! | p50_openai_passthrough   | ~0.01-0.1ms     | < 1ms           |
 //! | full_router_no_candidate | ~0.01-0.1ms     | < 1ms           |
+//!
+//! NOTE: p50/p95 code block baselines updated for P0.1 (ADR-007 lossless-only egress):
+//! code blocks now pass through byte-identical without any AST transform. The old
+//! ~0.2-5ms baselines were for the rskim-core tree-sitter engine; passthrough is an
+//! order of magnitude faster. Baselines above are estimates; re-measure after P0.1 lands.
 //!
 //! NOTE: These baselines are recorded from the first run on this branch.
 //! They are NOT hard-coded assertions. Criterion compares against its own
@@ -98,7 +103,8 @@ fn make_openai_body(content: &str) -> Vec<u8> {
 /// p50 code block: ~2 KiB of Rust code (typical chat message code snippet).
 ///
 /// Represents the 50th-percentile code block size in a typical chat payload.
-/// Chosen to be well within the MIN_SIZE_FLOOR..MAX_CODE_BYTES window.
+/// Post-P0.1: code blocks route to Passthrough — this fixture measures the
+/// parse+dispatch overhead of the passthrough path, not tree-sitter compression.
 fn p50_rust_code() -> String {
     // ~2 KiB: about 50-70 lines of idiomatic Rust
     let mut s = String::with_capacity(2048);
@@ -120,10 +126,11 @@ fn p50_rust_code() -> String {
     s
 }
 
-/// p95 code block: ~20 KiB of Rust code (large but within MAX_CODE_BYTES threshold).
+/// p95 code block: ~20 KiB of Rust code (large payload passthrough stub).
 ///
-/// Represents the 95th-percentile code block size. Chosen to stay within the
-/// 32 KiB MAX_CODE_BYTES cap to exercise the actual compression path.
+/// Represents the 95th-percentile code block size. Post-P0.1: code blocks route
+/// to Passthrough regardless of size — this bench measures parse+dispatch cost
+/// for a large passthrough payload (no AST transform, no rskim-core dependency).
 fn p95_rust_code() -> String {
     // ~20 KiB: about 500-700 lines
     let base = p50_rust_code();
@@ -148,10 +155,11 @@ fn p50_json_block() -> String {
 // Bench functions
 // ============================================================================
 
-/// Bench: p50 code block through the full router (N=1 edit path).
+/// Bench: p50 code block through the full router (N=1 passthrough path).
 ///
-/// Exercises: parse → compute_candidates (1) → prefilter → code engine →
-/// byte_gate → mutate_block → serialize → whole_request_check.
+/// Post-P0.1 (ADR-007): code blocks are always Passthrough. Exercises:
+/// parse → compute_candidates (1) → engine_for_class → Passthrough →
+/// whole_request_check (no byte_gate, no mutate_block needed).
 fn bench_p50_code_block(c: &mut Criterion) {
     let code = p50_rust_code();
     let body = make_anthropic_body(&code);
@@ -169,10 +177,11 @@ fn bench_p50_code_block(c: &mut Criterion) {
     );
 }
 
-/// Bench: p95 code block through the full router.
+/// Bench: p95 code block through the full router (large passthrough stub).
 ///
-/// Exercises the large-block path up to MAX_CODE_BYTES. Measures the actual
-/// N=1 mutate_block + serialize cost for a ~20 KiB code block.
+/// Post-P0.1: measures parse+dispatch cost for a ~20 KiB code block routed to
+/// Passthrough. No mutate_block (body unchanged), no serialize overhead beyond
+/// the input body itself.
 fn bench_p95_code_block(c: &mut Criterion) {
     let code = p95_rust_code();
     let body = make_anthropic_body(&code);
