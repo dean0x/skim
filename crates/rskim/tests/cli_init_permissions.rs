@@ -116,8 +116,8 @@ fn test_permissions_non_tty_writes_nothing_copilot() {
 
 /// `skim init --agent claude --permissions --dry-run` must:
 /// - Exit 0.
-/// - Print exactly 8 `Bash(skim <tool>:*)` entries.
-/// - Write NO sidecar.
+/// - Print all 8 `Bash(skim <tool>:*)` entries (F1: dry-run bypasses consent).
+/// - Write NO sidecar or any other file.
 #[test]
 fn test_permissions_dry_run_enumerates_8_claude_entries() {
     let tmp = TempDir::new().unwrap();
@@ -135,23 +135,32 @@ fn test_permissions_dry_run_enumerates_8_claude_entries() {
         !tmp.path().join("skim-permissions.json").exists(),
         "dry-run must not write a sidecar"
     );
+    // No settings.json written on dry-run (only the hook dry-run output appears).
+    // (settings.json may be absent — the dry-run never writes it.)
 
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    // Dry-run output must mention all 8 tools.
-    // (grant_permissions=false because non-TTY → confirm_grant returns false,
-    //  so dry-run may show the hook/settings actions but not permissions entries.
-    //  This is the correct behavior: non-TTY → no consent → no permissions output.
-    //  The "[dry-run] Would add … entries" line only appears when grant_permissions=true.)
-    //
-    // We still assert that the command succeeded and the hook dry-run output appeared.
+    // Dry-run must mention all 8 Bash(skim <tool>:*) entries regardless of TTY.
+    // Consent is not required to DISPLAY what would happen; the line annotates
+    // that real-install consent would still be required.
+    for tool in &["df", "diff", "du", "grep", "ls", "rg", "tree", "wc"] {
+        let entry = format!("Bash(skim {tool}:*)");
+        assert!(
+            stdout.contains(&entry),
+            "dry-run must enumerate '{entry}' in stdout, got:\n{stdout}"
+        );
+    }
+
+    // Sanity: the consent-annotation line must be present.
+    assert!(
+        stdout.contains("consent required at install"),
+        "dry-run must annotate that consent is required at install, got:\n{stdout}"
+    );
+
+    // Sanity: [dry-run] prefix present and no files written beyond temp dir.
     assert!(
         stdout.contains("[dry-run]"),
         "dry-run must produce [dry-run] output, got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("settings.json") || stdout.contains("Would patch"),
-        "dry-run must mention settings.json, got:\n{stdout}"
     );
 }
 
@@ -173,6 +182,97 @@ fn test_permissions_dry_run_succeeds() {
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .assert()
         .success();
+}
+
+// ============================================================================
+// F2/F3 — explicit --permissions refused on non-TTY must print a loud notice
+// ============================================================================
+
+/// `echo "" | skim init --permissions --agent claude` (non-interactive stdin):
+/// - Must exit 0 (no error).
+/// - Must write NO sidecar.
+/// - Must print a loud notice that --permissions was requested but not granted.
+///
+/// The notice must state (a) requested-but-not-granted, (b) non-interactive
+/// cause, and (c) interactive re-run remedy.
+#[test]
+fn test_permissions_non_tty_explicit_request_prints_notice() {
+    let tmp = TempDir::new().unwrap();
+
+    let out = common::skim()
+        .args(["init", "--agent", "claude", "--permissions"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .output()
+        .expect("skim must run");
+
+    // Must succeed.
+    assert!(
+        out.status.success(),
+        "must exit 0 even when consent is refused"
+    );
+
+    // Must not write sidecar.
+    assert!(
+        !tmp.path().join("skim-permissions.json").exists(),
+        "skim-permissions.json must NOT be written when non-TTY refuses consent"
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // The notice must be on stdout so it appears in agent context.
+    assert!(
+        stdout.contains("--permissions was requested but not granted"),
+        "stdout must mention '--permissions was requested but not granted', got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("non-interactive"),
+        "notice must mention non-interactive cause, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("interactively"),
+        "notice must mention interactive re-run remedy, got:\n{stdout}"
+    );
+}
+
+/// `echo "" | skim init --permissions --agent claude --yes` (non-interactive + --yes):
+/// Same as above — --yes cannot bypass consent.
+#[test]
+fn test_permissions_non_tty_yes_flag_prints_notice() {
+    let tmp = TempDir::new().unwrap();
+
+    let out = common::skim()
+        .args(["init", "--agent", "claude", "--permissions", "--yes"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .output()
+        .expect("skim must run");
+
+    // Must succeed.
+    assert!(
+        out.status.success(),
+        "must exit 0 even when consent is refused"
+    );
+
+    // Must not write sidecar.
+    assert!(
+        !tmp.path().join("skim-permissions.json").exists(),
+        "skim-permissions.json must NOT be written when --yes refuses consent non-interactively"
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Same notice must appear — --yes is never sufficient to grant permissions.
+    assert!(
+        stdout.contains("--permissions was requested but not granted"),
+        "stdout must mention '--permissions was requested but not granted', got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("non-interactive"),
+        "notice must mention non-interactive cause, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("interactively"),
+        "notice must mention interactive re-run remedy, got:\n{stdout}"
+    );
 }
 
 // ============================================================================

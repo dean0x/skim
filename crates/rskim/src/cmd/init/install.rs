@@ -451,27 +451,50 @@ fn run_install_single(
         print_dual_scope_warning(warning);
     }
 
-    // Resolve consent ONCE before any install action.
-    // Returns Ok(false) on non-TTY (the test harness never has a TTY).
-    let grant_permissions = resolve_permissions_consent(flags, agent, perm_dir)?;
-
     let global = !flags.project;
     print_install_summary(&state);
 
     if flags.dry_run {
+        // Dry-run writes nothing, so consent is not required to DISPLAY what
+        // would happen.  We enumerate the permission entries unconditionally
+        // (based on flags and writer availability) and annotate them with
+        // "(consent required at install)" so the user understands a real run
+        // would still prompt for approval.  We deliberately do NOT call
+        // resolve_permissions_consent here — that function may prompt on a
+        // real TTY and must never fire on a pure-display path.
         print_dry_run_actions(
             &state,
             flags.no_guidance,
             global,
             &env,
-            grant_permissions,
+            flags.permissions,
             flags.permissions_tier,
+            perm_dir,
         )?;
         // Also show dry-run for wrappers if they would be installed.
         if !flags.project {
             maybe_install_wrappers(flags.wrappers, flags.dry_run)?;
         }
         return Ok(std::process::ExitCode::SUCCESS);
+    }
+
+    // Resolve consent ONCE before any install action.
+    // Returns Ok(false) on non-TTY (the test harness never has a TTY).
+    let grant_permissions = resolve_permissions_consent(flags, agent, perm_dir)?;
+
+    // F2/F3: Print a loud notice when --permissions was explicitly requested
+    // but refused because stdin is not a terminal.  A TTY user who types 'n'
+    // gets no extra notice (they saw the prompt).  Default (None) non-TTY
+    // installs stay silent.
+    if flags.permissions == Some(true) && !grant_permissions {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            println!(
+                "  Note: --permissions was requested but not granted: non-interactive \
+                 session (a human must approve at a TTY; --yes cannot grant). \
+                 Re-run skim init --permissions interactively."
+            );
+        }
     }
 
     execute_install(
@@ -1221,8 +1244,9 @@ pub(super) fn print_dry_run_actions(
     no_guidance: bool,
     global: bool,
     env: &InstructionEnv,
-    grant_permissions: bool,
+    permissions: Option<bool>,
     tier: PermissionsTier,
+    perm_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
     let hook_script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
 
@@ -1245,40 +1269,61 @@ pub(super) fn print_dry_run_actions(
         }
     }
 
-    // Enumerate permissions entries when consent would be granted.
-    if grant_permissions {
+    // Enumerate permissions entries without consulting consent.
+    // Dry-run writes nothing, so no consent is required to DISPLAY what would
+    // happen.  We show entries whenever permissions are "active" for this run
+    // and annotate them with "(consent required at install)" to make clear that
+    // a real install would still require an interactive approval.
+    if permissions != Some(false) {
         let agent = agent_from_state(state)?;
-        let perm_dir: &std::path::Path = if agent == AgentKind::CopilotCli {
-            &state.hook_config_dir
-        } else {
-            &state.config_dir
-        };
         if let Some(protocol) = crate::cmd::permissions::permissions_protocol_for_agent(agent) {
-            let entries = match tier {
-                PermissionsTier::Mirror if agent == AgentKind::ClaudeCode => {
-                    crate::cmd::permissions::claude::propose_mirrors(perm_dir)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|p| {
-                            if p.is_mutating {
-                                format!("{} [mutating tool]", p.mirror)
-                            } else {
-                                p.mirror
-                            }
-                        })
-                        .collect::<Vec<_>>()
+            // Determine whether permissions are active for this dry-run.
+            let permissions_active = match permissions {
+                Some(false) => false, // explicit opt-out (already guarded above)
+                Some(true) => true,   // explicitly requested
+                None => {
+                    // Auto-mode: active only when the sidecar already exists and
+                    // is stale (same condition as permissions_blocks_fast_path).
+                    let sidecar_path = perm_dir.join("skim-permissions.json");
+                    if sidecar_path.exists() {
+                        let entries = crate::cmd::permissions::seeded_entries(protocol.as_ref());
+                        !protocol.is_current(perm_dir, &entries)
+                    } else {
+                        false
+                    }
                 }
-                _ => crate::cmd::permissions::seeded_entries(protocol.as_ref()),
             };
-            let config_file = perm_dir.join(protocol.config_filename());
-            println!(
-                "  [dry-run] Would add {} permission entr{} to {}:",
-                entries.len(),
-                if entries.len() == 1 { "y" } else { "ies" },
-                config_file.display()
-            );
-            for entry in &entries {
-                println!("    {entry}");
+            if permissions_active {
+                let entries = match tier {
+                    PermissionsTier::Mirror if agent == AgentKind::ClaudeCode => {
+                        let proposals = crate::cmd::permissions::claude::propose_mirrors(perm_dir)
+                            .unwrap_or_default();
+                        if proposals.is_empty() {
+                            // No mirroring candidates: fall back to seed entries.
+                            crate::cmd::permissions::seeded_entries(protocol.as_ref())
+                        } else {
+                            proposals
+                                .into_iter()
+                                .map(|p| {
+                                    if p.is_mutating {
+                                        format!("{} [mutating tool]", p.mirror)
+                                    } else {
+                                        p.mirror
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        }
+                    }
+                    _ => crate::cmd::permissions::seeded_entries(protocol.as_ref()),
+                };
+                let config_file = perm_dir.join(protocol.config_filename());
+                println!(
+                    "  [dry-run] Would seed permissions (consent required at install): {}",
+                    config_file.display()
+                );
+                for entry in &entries {
+                    println!("    {entry}");
+                }
             }
         }
     }
