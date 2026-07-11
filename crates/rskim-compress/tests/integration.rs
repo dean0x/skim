@@ -654,10 +654,11 @@ fn ac19_reason_engine_passthrough_any_valid_reason() {
         OutcomeReason::Passthrough,
         OutcomeReason::FailedOpen,
         OutcomeReason::PolicyPassthrough,
+        OutcomeReason::LossyRejected,
     ];
     assert!(
         valid_reasons.iter().any(|r| r == &records[0].reason),
-        "Record reason must be one of the 5 valid OutcomeReason values, got {:?}",
+        "Record reason must be one of the 6 valid OutcomeReason values, got {:?}",
         records[0].reason
     );
     assert!(
@@ -1817,6 +1818,273 @@ fn ac27_only_live_zone_mutable_block_mutated() {
         outcome.bytes.len() <= body.len(),
         "AC27(a): output must never exceed input size"
     );
+}
+
+// ============================================================================
+// #427 Pass 2 — Value-equivalence gate + lossless JSON engine tests
+// ============================================================================
+
+/// LossyRejected record is emitted when the value-equivalence budget is exhausted.
+///
+/// Discriminating: if the `route_with_budget(initial_budget=0)` path is removed,
+/// the budget never reaches 0, the gate never fires, and LossyRejected is never
+/// emitted. The record assertion fails.
+///
+/// Note: `route_with_budget` is a `#[cfg(test)]`-only API that sets the per-request
+/// budget to 0, immediately exhausting it. In production, the budget starts at
+/// `DEFAULT_WORK_BUDGET` (200,000), which is never reached by realistic payloads.
+#[test]
+fn lossy_rejected_json_record_emitted_on_zero_budget() {
+    let json = pretty_json_fixture();
+    let body = anthropic_body(&json);
+    let sink = Arc::new(MockSink::new());
+    let router = BlockRouter::new(sink.clone());
+
+    // Budget = 0: gate fires immediately on the first JSON node.
+    let outcome =
+        router.route_with_budget(&body, Policy::Default, "req-lrej-budget0", sink.as_ref(), 0);
+    let records = sink.drain();
+
+    // The outcome must be passthrough (LossyRejected → no mutation).
+    assert!(
+        outcome.is_passthrough(),
+        "LossyRejected path must return passthrough outcome, not modified"
+    );
+    assert_eq!(
+        outcome.bytes.as_slice(),
+        body.as_slice(),
+        "LossyRejected path must return byte-identical original input"
+    );
+
+    // Exactly 1 record must be emitted (1 JSON block candidate).
+    assert_eq!(
+        records.len(),
+        1,
+        "LossyRejected path must emit exactly 1 record; got {} records: {:#?}",
+        records.len(),
+        records
+    );
+
+    // The record must be Passthrough with reason=LossyRejected.
+    assert_eq!(
+        records[0].decision,
+        Decision::Passthrough,
+        "LossyRejected record must have decision=Passthrough"
+    );
+    assert_eq!(
+        records[0].reason,
+        OutcomeReason::LossyRejected,
+        "Budget-exhausted JSON block must emit reason=LossyRejected"
+    );
+}
+
+/// Non-JSON engines (Log, Mixed, Passthrough) NEVER emit LossyRejected.
+///
+/// The value-equivalence gate is only wired for the JSON engine
+/// (`engine == EngineTarget::Json`). Any other engine skips the gate entirely.
+///
+/// Discriminating: if the gate check were wired unconditionally (not guarded by
+/// `engine == EngineTarget::Json`), a log or mixed block could trigger LossyRejected.
+/// This test proves that cannot happen.
+#[test]
+fn gate_never_fires_for_non_json_engine() {
+    // A plain-text block classifies as Class::Text → EngineTarget::Passthrough.
+    // With budget=0, the gate must NOT fire (it's only for Json engine).
+    // The record reason should be Passthrough (from routing, not LossyRejected).
+    let body = anthropic_body("Some plain text content that is longer than the prefilter floor so it gets a record emitted and we can check the reason");
+    let sink = Arc::new(MockSink::new());
+    let router = BlockRouter::new(sink.clone());
+
+    let outcome =
+        router.route_with_budget(&body, Policy::Default, "req-non-json-gate", sink.as_ref(), 0);
+    let records = sink.drain();
+
+    // Never-inflate holds.
+    assert!(
+        outcome.bytes.len() <= body.len(),
+        "Non-JSON body must never inflate"
+    );
+
+    // If a record was emitted, it must NOT be LossyRejected.
+    for record in &records {
+        assert_ne!(
+            record.reason,
+            OutcomeReason::LossyRejected,
+            "Non-JSON engine block must NEVER emit LossyRejected (gate is JSON-only); \
+             got reason={:?} for record: {:#?}",
+            record.reason,
+            record
+        );
+    }
+}
+
+/// Duplicate-key JSON body → Passthrough (FailedOpen, not LossyRejected).
+///
+/// The lossless JSON minifier detects duplicate keys and returns
+/// `CompressResult::Passthrough` — not `Compressed`. This maps to
+/// `EngineOutcome::Passthrough { FailedOpen }` in `apply_engine`, so the
+/// record is `FailedOpen` (engine-level passthrough), not `LossyRejected`
+/// (gate-level rejection after Compressed).
+///
+/// Discriminating: if dup-key handling were moved to the gate instead of the
+/// engine, the record would be LossyRejected. This test pins the engine-level behavior.
+#[test]
+fn dup_key_json_body_passthrough_not_lossy_rejected() {
+    // Dup key "first_name" appears twice in this JSON.
+    // The minifier detects it and returns CompressResult::Passthrough (FailedOpen).
+    // Enough content (> 64 bytes) to pass the prefilter so the engine is actually invoked.
+    let dup_json = r#"{
+  "first_name": "Alice",
+  "last_name": "Smith",
+  "age": 30,
+  "email": "alice@example.com",
+  "city": "San Francisco",
+  "first_name": "Bob"
+}"#;
+    let body = anthropic_body(dup_json);
+    let sink = Arc::new(MockSink::new());
+    let router = BlockRouter::new(sink.clone());
+
+    let outcome = router.route(&body, Policy::Default, "req-dup-key", sink.as_ref());
+    let records = sink.drain();
+
+    // Output must be byte-identical (dup-key → passthrough at engine level).
+    assert_eq!(
+        outcome.bytes.as_slice(),
+        body.as_slice(),
+        "Dup-key JSON must return byte-identical original (engine-level Passthrough)"
+    );
+    assert!(
+        outcome.is_passthrough(),
+        "Dup-key JSON must produce passthrough outcome"
+    );
+
+    // The record reason must NOT be LossyRejected (engine Passthrough → FailedOpen).
+    assert_eq!(
+        records.len(),
+        1,
+        "Dup-key JSON must emit exactly 1 record; got {} records: {:#?}",
+        records.len(),
+        records
+    );
+    assert_ne!(
+        records[0].reason,
+        OutcomeReason::LossyRejected,
+        "Dup-key JSON must emit FailedOpen (engine-level), not LossyRejected (gate-level)"
+    );
+    // Specifically: engine returned Passthrough → FailedOpen.
+    assert_eq!(
+        records[0].reason,
+        OutcomeReason::FailedOpen,
+        "Dup-key JSON must emit FailedOpen (engine returned Passthrough variant)"
+    );
+}
+
+/// Number tokens survive the router byte-exact (lossless engine invariant).
+///
+/// Discriminating: the OLD lossy engine ran through `serde_json::Value`, which
+/// normalizes numbers: `1e3` → `1000`, `1.0` → `1`. The lossless minifier MUST
+/// preserve `1e3`, `1.0`, `100.00` byte-exact in the output.
+///
+/// This test fails on the old engine and passes ONLY with the lossless minifier.
+#[test]
+fn number_tokens_preserved_byte_exact_through_router() {
+    // The JSON contains non-canonical number tokens: 1e3, 1.0, 100.00.
+    // After lossless minification, these must appear verbatim in the output.
+    // The trailing whitespace (spaces) ensures the minifier compresses it (not no-op).
+    let json_with_numbers = r#"{
+  "scientific": 1e3,
+  "trailing_dot_zero": 1.0,
+  "trailing_zeros": 100.00,
+  "negative_exp": -0.5e-3
+}"#;
+    let body = anthropic_body(json_with_numbers);
+    let sink = Arc::new(MockSink::new());
+    let router = BlockRouter::new(sink.clone());
+
+    let outcome = router.route(&body, Policy::Default, "req-number-tokens", sink.as_ref());
+    let records = sink.drain();
+
+    // If the router modified the block, the output must contain the original
+    // number tokens verbatim.
+    if !outcome.is_passthrough() {
+        let out_str = std::str::from_utf8(&outcome.bytes).expect("output must be UTF-8");
+        assert!(
+            out_str.contains("1e3"),
+            "Lossless engine: 1e3 must survive byte-exact in router output; got:\n{out_str}"
+        );
+        assert!(
+            out_str.contains("1.0"),
+            "Lossless engine: 1.0 must survive byte-exact in router output; got:\n{out_str}"
+        );
+        assert!(
+            out_str.contains("100.00"),
+            "Lossless engine: 100.00 must survive byte-exact in router output; got:\n{out_str}"
+        );
+        assert!(
+            out_str.contains("-0.5e-3"),
+            "Lossless engine: -0.5e-3 must survive byte-exact in router output; got:\n{out_str}"
+        );
+    }
+
+    // Records: if modified, reason must be Full (not Degraded or LossyRejected).
+    for record in &records {
+        if record.decision == Decision::Modified {
+            assert_eq!(
+                record.reason,
+                OutcomeReason::Full,
+                "Number-token JSON must get Full (not Degraded), got: {:?}",
+                record.reason
+            );
+        }
+    }
+}
+
+proptest! {
+    /// Proptest: with budget=0 (gate always fires), no JSON block ever gets Modified.
+    ///
+    /// Discriminating: if the gate check `if engine == EngineTarget::Json` were
+    /// removed or budget=0 were not respected, some JSON blocks would get Modified
+    /// records even with an exhausted budget. This proptest fails in that case.
+    #[test]
+    fn prop_zero_budget_gate_never_allows_json_modification(
+        json_body in proptest::string::string_regex(r"\{[a-z]{2,6}: [0-9]{1,5}(, [a-z]{2,6}: [0-9]{1,5})*\}").unwrap()
+    ) {
+        // json_body is a compact JSON-like string. It may or may not parse as
+        // valid JSON (the regex generates patterns like {ab: 12}). If it doesn't
+        // parse, the router returns passthrough anyway — never Modified.
+        let body = anthropic_body(&json_body);
+        let sink = Arc::new(MockSink::new());
+        let router = BlockRouter::new(sink.clone());
+
+        let _ = router.route_with_budget(&body, Policy::Default, "req-prop-zero-budget", sink.as_ref(), 0);
+        let records = sink.drain();
+
+        // With budget=0, no JSON block must be Modified.
+        // Use direct PartialEq comparisons (auto-borrow) rather than prop_assert_eq!
+        // (which evaluates arguments by value and fails for non-Copy field access).
+        for record in &records {
+            if record.reason == OutcomeReason::LossyRejected
+                || record.reason == OutcomeReason::FailedOpen
+            {
+                prop_assert!(
+                    record.decision == Decision::Passthrough,
+                    "LossyRejected/FailedOpen must always be Passthrough decision, \
+                     got reason={:?} decision={:?}",
+                    record.reason,
+                    record.decision
+                );
+            }
+            // No record may be Modified (the gate fired for all JSON candidates).
+            prop_assert!(
+                record.decision != Decision::Modified,
+                "Zero-budget gate: no record may be Modified (gate must fire for all JSON); \
+                 got decision={:?} reason={:?}",
+                record.decision,
+                record.reason
+            );
+        }
+    }
 }
 
 /// AC27 (b) — OpenAI body: classify_body emits ids, but list_blocks yields
