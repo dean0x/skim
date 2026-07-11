@@ -207,19 +207,20 @@ pub enum Decision {
 ///
 /// Added in **#342** as a schema coordination step between #301 (this crate,
 /// schema owner) and #305 (persistence) per ADR-004. This field extends the
-/// two-variant [`Decision`] wire vocabulary with a five-value refining reason
-/// so that #304's `BlockRouter` can record the full 5→3 outcome mapping without
+/// two-variant [`Decision`] wire vocabulary with a six-value refining reason
+/// so that #304's `BlockRouter` can record the full 6→3 outcome mapping without
 /// carrying a local wrapper that risks drifting from the #305 schema.
 ///
-/// # Mapping to [`Decision`] (binding 5→3 rule, #304 §3)
+/// # Mapping to [`Decision`] (binding 6→3 rule, #304/#427 §Pass2)
 ///
-/// | `OutcomeReason` | Wire [`Decision`] | #304 semantic |
+/// | `OutcomeReason` | Wire [`Decision`] | Semantic |
 /// |---|---|---|
 /// | `Full` | `Modified` | Compressed, clean parse; no tree-sitter ERROR nodes added |
 /// | `Degraded` | `Modified` | Compressed, but parse had syntax errors (degraded tier) |
 /// | `Passthrough` | `Passthrough` | Skipped/forwarded: pre-filter, tie, misclassification |
 /// | `FailedOpen` | `Passthrough` | Compressor returned `Err`; block stays original |
 /// | `PolicyPassthrough` | `Passthrough` | Lossless-only policy active (`LosslessOnly` auth) |
+/// | `LossyRejected` | `Passthrough` | Candidate not proven value-equivalent; gate rejected or budget exhausted |
 ///
 /// # Persistence dependency (#305)
 ///
@@ -227,6 +228,15 @@ pub enum Decision {
 /// table once this schema lands. Do not add `OutcomeReason` variants without
 /// coordinating with #305. The enum is `#[non_exhaustive]` to allow additive
 /// extension without breaking downstream matchers.
+///
+/// # #305 coordination — `LossyRejected` (#427 Pass 2)
+///
+/// `LossyRejected` is a passthrough-family reason added in #427 Pass 2 for the
+/// runtime value-equivalence gate. Two sub-cases map to existing reasons rather
+/// than requiring new content-derived fields (security-H4 / no content in records):
+/// - Budget-exhausted gate checks record as `LossyRejected` ("not proven safe").
+/// - Dup-key inputs and no-op minification reuse `FailedOpen` (engine-level
+///   passthrough, not a gate failure — no new variant required).
 ///
 /// # Usage
 ///
@@ -276,6 +286,22 @@ pub enum OutcomeReason {
     /// Every block is forwarded byte-identical; no compressor runs.
     /// Maps to wire [`Decision::Passthrough`].
     PolicyPassthrough,
+    /// Candidate output was not proven value-equivalent to the original input.
+    ///
+    /// Emitted by the runtime value-equivalence gate when the comparator returns
+    /// `Some(false)` (proven mutating) or `None` (not provable — over-depth,
+    /// budget exhausted, or parse error in the comparator). The original bytes
+    /// are forwarded unchanged.
+    ///
+    /// Maps to wire [`Decision::Passthrough`].
+    ///
+    /// # Security note (H4 / no content-derived fields)
+    ///
+    /// Records with this reason carry only `bytes_in`/`bytes_out` (equal for
+    /// passthrough) and the reason enum tag — never any content from the block
+    /// itself. This matches the constraint that `DecisionRecord` must not act
+    /// as a covert side-channel for block content.
+    LossyRejected,
 }
 
 impl Default for OutcomeReason {
@@ -463,6 +489,7 @@ impl DecisionRecord {
                 OutcomeReason::Passthrough
                     | OutcomeReason::FailedOpen
                     | OutcomeReason::PolicyPassthrough
+                    | OutcomeReason::LossyRejected
             ),
             "passthrough_with_reason called with a modification-family reason ({reason:?}); \
              use modified_with_reason instead"
@@ -913,7 +940,7 @@ mod tests {
     // OutcomeReason and new constructors (#342)
     // ========================================================================
 
-    /// Compile-time guard: all 5 OutcomeReason variants must exist.
+    /// Compile-time guard: all 6 OutcomeReason variants must exist.
     /// Deleting a variant causes this array construction to fail to compile.
     #[test]
     fn outcome_reason_variants_are_distinct() {
@@ -923,6 +950,7 @@ mod tests {
             OutcomeReason::Passthrough,
             OutcomeReason::FailedOpen,
             OutcomeReason::PolicyPassthrough,
+            OutcomeReason::LossyRejected,
         ];
     }
 
@@ -1015,6 +1043,7 @@ mod tests {
             (OutcomeReason::Passthrough, "\"passthrough\""),
             (OutcomeReason::FailedOpen, "\"failed_open\""),
             (OutcomeReason::PolicyPassthrough, "\"policy_passthrough\""),
+            (OutcomeReason::LossyRejected, "\"lossy_rejected\""),
         ];
         for (reason, expected_json) in cases {
             let serialized = serde_json::to_string(&reason).expect("serialization must succeed");
@@ -1353,5 +1382,123 @@ mod tests {
         // Non-sensitive request IDs pass through unchanged.
         let r = DecisionRecord::passthrough("req-00001", "identity", 42);
         assert_eq!(r.request_id(), "req-00001");
+    }
+
+    // ========================================================================
+    // LossyRejected — new passthrough-family variant (#427 Pass 2)
+    // ========================================================================
+
+    /// Positive constructor test: a passthrough record with `LossyRejected` passes
+    /// the family assert in `passthrough_with_reason`.
+    ///
+    /// Discriminating: if `LossyRejected` is accidentally left out of the passthrough
+    /// allowlist in `passthrough_with_reason`, this test panics.
+    #[test]
+    fn passthrough_with_reason_lossy_rejected() {
+        let r = DecisionRecord::passthrough_with_reason(
+            "req-lr",
+            "block-router",
+            1024,
+            OutcomeReason::LossyRejected,
+        );
+        assert!(r.is_passthrough(), "LossyRejected must produce a Passthrough decision");
+        assert_eq!(r.reason, OutcomeReason::LossyRejected);
+        assert_eq!(r.bytes_in, 1024);
+        assert_eq!(r.bytes_out, 1024);
+        assert_eq!(r.decision, Decision::Passthrough);
+    }
+
+    /// `#[should_panic]` guard: `modified_with_reason(LossyRejected)` is a caller
+    /// bug and must trip the release-active `assert!`.
+    ///
+    /// Discriminating: if the family guard in `modified_with_reason` is removed,
+    /// this test passes vacuously — failing to detect that a Passthrough-family reason
+    /// silently ended up on a Modified record (PF-006 silent-wrong-path class).
+    #[test]
+    #[should_panic(expected = "modified_with_reason called with a passthrough-family reason")]
+    fn modified_with_reason_rejects_lossy_rejected() {
+        let _ = DecisionRecord::modified_with_reason(
+            "req-bad-lr",
+            "block-router",
+            100,
+            80,
+            OutcomeReason::LossyRejected,
+        );
+    }
+
+    /// Serde round-trip for `LossyRejected`: wire name must be exactly `"lossy_rejected"`.
+    ///
+    /// Discriminating: if the serde `rename_all = "snake_case"` is removed or the
+    /// variant is renamed, the wire name changes and #305 schema consumers break.
+    #[test]
+    fn lossy_rejected_serde_wire_name_is_lossy_rejected() {
+        let serialized = serde_json::to_string(&OutcomeReason::LossyRejected)
+            .expect("serialisation must succeed");
+        assert_eq!(
+            serialized, "\"lossy_rejected\"",
+            "LossyRejected wire name must be exactly \"lossy_rejected\""
+        );
+        let back: OutcomeReason = serde_json::from_str(&serialized)
+            .expect("must deserialize from \"lossy_rejected\"");
+        assert_eq!(back, OutcomeReason::LossyRejected, "round-trip must restore LossyRejected");
+    }
+
+    /// Schema guard: `DecisionRecord` carries only size/count/enum fields — no
+    /// content-derived strings.
+    ///
+    /// This test asserts that a record with `LossyRejected` reason serializes to
+    /// a JSON object whose fields are exactly the documented schema fields
+    /// (request_id, component, decision, reason, bytes_in, bytes_out, and optionally
+    /// tokens_in/tokens_out). No `content` field may ever appear — enforcing the
+    /// security-H4 constraint that decision records must not act as covert
+    /// side-channels for block content.
+    ///
+    /// Discriminating: if a `content` field is accidentally added to `DecisionRecord`,
+    /// this test fails.
+    #[test]
+    fn decision_record_no_content_derived_fields() {
+        let r = DecisionRecord::passthrough_with_reason(
+            "req-schema-lr",
+            "block-router",
+            8192,
+            OutcomeReason::LossyRejected,
+        );
+        let json = r.to_json().expect("serialisation must succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let obj = parsed.as_object().expect("must be a JSON object");
+
+        // Only these fields are allowed in a DecisionRecord (sizes/counts/enum tags).
+        let allowed_fields = [
+            "request_id",
+            "component",
+            "decision",
+            "reason",
+            "bytes_in",
+            "bytes_out",
+            "tokens_in",
+            "tokens_out",
+        ];
+        for key in obj.keys() {
+            assert!(
+                allowed_fields.contains(&key.as_str()),
+                "unexpected field in DecisionRecord JSON: {key} (only size/count/enum fields allowed)"
+            );
+        }
+
+        // bytes_in and bytes_out must be numeric (not content-derived strings).
+        assert!(obj["bytes_in"].is_number(), "bytes_in must be a number, not a string");
+        assert!(obj["bytes_out"].is_number(), "bytes_out must be a number, not a string");
+
+        // No 'content' field may ever appear (security-H4: no block content in records).
+        assert!(
+            !obj.contains_key("content"),
+            "DecisionRecord must NEVER carry a 'content' field (security-H4 covert-channel guard)"
+        );
+
+        // Reason must be the correct wire name.
+        assert_eq!(
+            obj["reason"], "lossy_rejected",
+            "LossyRejected must serialize as 'lossy_rejected' in the JSON record"
+        );
     }
 }
