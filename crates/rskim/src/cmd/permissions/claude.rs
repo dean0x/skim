@@ -26,10 +26,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use super::hash_if_bounded;
 use crate::cmd::init::{
     MAX_SETTINGS_SIZE, atomic_write_settings, backup_settings_file, load_or_create_settings,
 };
-use crate::cmd::integrity::compute_file_hash;
 use crate::cmd::permissions::sidecar::{
     PermissionSidecar, SIDECAR_FILENAME, load_sidecar, write_sidecar,
 };
@@ -115,7 +115,13 @@ impl PermissionsProtocol for ClaudePermissions {
         atomic_write_settings(&settings, &config_path)?;
 
         // Compute hash and write sidecar.
-        let config_hash = compute_file_hash(&config_path)?;
+        // The file was just written by skim after a size-guarded load; oversized here is unexpected.
+        let config_hash = hash_if_bounded(&config_path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "settings.json unexpectedly exceeds size limit after write — \
+                 this is an internal error; please file a bug report"
+            )
+        })?;
         let sidecar = PermissionSidecar {
             version: 1,
             tier: "seed".to_string(),
@@ -482,7 +488,13 @@ pub(crate) fn seed_mirrors(
     atomic_write_settings(&settings, &config_path)?;
 
     // Compute hash and write sidecar with source_mirrors provenance.
-    let config_hash = compute_file_hash(&config_path)?;
+    // The file was just written by skim after a size-guarded load; oversized here is unexpected.
+    let config_hash = hash_if_bounded(&config_path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "settings.json unexpectedly exceeds size limit after write — \
+             this is an internal error; please file a bug report"
+        )
+    })?;
     let source_mirrors: HashMap<String, String> = proposals
         .iter()
         .map(|p| (p.source.clone(), p.mirror.clone()))
@@ -569,6 +581,7 @@ fn get_allow_array_mut(settings: &mut serde_json::Value) -> Option<&mut Vec<serd
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::integrity::compute_file_hash;
     use crate::cmd::permissions::permissions_protocol_for_agent;
     use crate::cmd::permissions::seeded_entries;
     use crate::cmd::session::AgentKind;

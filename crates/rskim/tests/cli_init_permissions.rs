@@ -233,6 +233,8 @@ fn contract_read_only_subcommands_absent_from_rewrite_dispatch() {
         include_str!("../src/cmd/rewrite/rules.rs"),
         include_str!("../src/cmd/rewrite/hook.rs"),
         include_str!("../src/cmd/rewrite/handlers.rs"),
+        include_str!("../src/cmd/rewrite/engine.rs"),
+        include_str!("../src/cmd/rewrite/compound.rs"),
         include_str!("../src/cmd/rewrite/types.rs"),
         include_str!("../src/cmd/dispatch.rs"),
     ];
@@ -241,6 +243,11 @@ fn contract_read_only_subcommands_absent_from_rewrite_dispatch() {
         "cmd/rewrite/rules.rs",
         "cmd/rewrite/hook.rs",
         "cmd/rewrite/handlers.rs",
+        // engine.rs holds `try_rewrite` (the PF-004 rewrite-engine surface) and
+        // compound.rs holds `try_rewrite_compound` — the two central text-transform
+        // entry points the install-time-only registry must never leak into.
+        "cmd/rewrite/engine.rs",
+        "cmd/rewrite/compound.rs",
         "cmd/rewrite/types.rs",
         "cmd/dispatch.rs",
     ];

@@ -180,6 +180,33 @@ pub(crate) fn permissions_protocol_for_agent(
 }
 
 // ============================================================================
+// Shared file-hashing helper (size-bounded)
+// ============================================================================
+
+/// Hash `path`'s contents after confirming it falls within the permitted size bound.
+///
+/// Returns:
+/// - `Ok(Some(hash))` — file is within [`crate::cmd::init::MAX_SETTINGS_SIZE`] and
+///   hashed successfully.
+/// - `Ok(None)` — file exceeds the size bound; callers apply context-specific semantics:
+///   - `is_current` paths → return `false` (treat as not current).
+///   - `remove_seeded` paths → return `Err` with an actionable message.
+///   - seed-idempotency paths → treat as not-idempotent (fall through to seed logic).
+///   - after-atomic-write paths → return `Err` (unexpected; skim controls the write).
+/// - `Err(_)` — I/O or hash error; propagate to caller.
+///
+/// This is the single point through which all `compute_file_hash` calls in the
+/// permissions module are routed so that MAX_SETTINGS_SIZE parity is enforced
+/// consistently without duplicating the metadata guard at every call site.
+pub(super) fn hash_if_bounded(path: &std::path::Path) -> anyhow::Result<Option<String>> {
+    let size = std::fs::metadata(path)?.len();
+    if size > crate::cmd::init::MAX_SETTINGS_SIZE {
+        return Ok(None);
+    }
+    crate::cmd::integrity::compute_file_hash(path).map(Some)
+}
+
+// ============================================================================
 // Seed derivation helper
 // ============================================================================
 

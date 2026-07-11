@@ -125,7 +125,6 @@ pub(crate) trait HookProtocol {
     ///   the path within the project tree.
     /// - `has_override = true` → a `<AGENT>_CONFIG_DIR` env var is in effect;
     ///   the caller-supplied path was explicitly chosen and must be honored.
-    #[allow(dead_code)]
     fn hook_config_dir(
         &self,
         resolved_config_dir: &std::path::Path,
@@ -142,7 +141,6 @@ pub(crate) trait HookProtocol {
     /// Default: `false` (Claude Code, Gemini CLI, Cursor, Crush — all use
     /// settings.json / hooks.json / crush.json entries).
     /// Copilot CLI override: `true` (uses `hook_config_dir/hooks/skim.json`).
-    #[allow(dead_code)]
     fn uses_dedicated_hook_file(&self) -> bool {
         false
     }
@@ -153,7 +151,6 @@ pub(crate) trait HookProtocol {
     /// Called only when `uses_dedicated_hook_file()` is `true`.
     /// Default: always `false` (settings.json agents use `detect_hook` instead).
     /// Copilot CLI override: `true` when `hooks/skim.json` contains a skim entry.
-    #[allow(dead_code)]
     fn detect_hook_registration(&self, _hook_config_dir: &std::path::Path) -> bool {
         false
     }
@@ -164,7 +161,6 @@ pub(crate) trait HookProtocol {
     /// handles the write (returns `Ok(false)`).
     /// Copilot CLI: writes `hooks/skim.json` with the versioned envelope and
     /// returns `Ok(true)`.
-    #[allow(dead_code)]
     fn install_hook_registration(
         &self,
         _hook_config_dir: &std::path::Path,
@@ -177,7 +173,6 @@ pub(crate) trait HookProtocol {
     ///
     /// For settings.json-based agents: no-op, returns `Ok(false)`.
     /// Copilot CLI: deletes `hooks/skim.json`, returns `Ok(true)` on success.
-    #[allow(dead_code)]
     fn remove_hook_registration(&self, _hook_config_dir: &std::path::Path) -> anyhow::Result<bool> {
         Ok(false)
     }
@@ -189,7 +184,6 @@ pub(crate) trait HookProtocol {
     /// Copilot CLI override: enumerates `*.json` files in
     /// `hook_config_dir/hooks/`, returning command strings from any file that
     /// is not `skim.json`.
-    #[allow(dead_code)]
     fn scan_foreign_hooks(&self, hook_config_dir: &std::path::Path) -> Vec<String> {
         self.scan_other_hooks(hook_config_dir)
     }
@@ -206,7 +200,6 @@ pub(crate) trait HookProtocol {
     ///
     /// Default: `"settings.json"` (Claude Code, Gemini CLI, Copilot CLI).
     /// Override: Cursor → `"hooks.json"`, Crush → `"crush.json"`.
-    #[allow(dead_code)]
     fn config_filename(&self) -> &'static str {
         "settings.json"
     }
@@ -215,7 +208,6 @@ pub(crate) trait HookProtocol {
     ///
     /// Default: `"PreToolUse"` (Claude Code, Crush).
     /// Override: Gemini CLI → `"BeforeTool"`, Cursor → `"preToolUse"`, Copilot CLI → `"preToolUse"`.
-    #[allow(dead_code)]
     fn hook_event_key(&self) -> &'static str {
         "PreToolUse"
     }
@@ -223,7 +215,6 @@ pub(crate) trait HookProtocol {
     /// The tool matcher value used when inserting a hook entry.
     ///
     /// Default: `"Bash"`. Cursor overrides to `"Shell"`, Copilot CLI overrides to `"bash"`.
-    #[allow(dead_code)]
     fn tool_matcher(&self) -> &'static str {
         "Bash"
     }
@@ -231,7 +222,6 @@ pub(crate) trait HookProtocol {
     /// Timeout in seconds for the hook command.
     ///
     /// Default: 5 seconds (matches Claude Code defaults).
-    #[allow(dead_code)]
     fn hook_timeout(&self) -> u64 {
         5
     }
@@ -247,7 +237,6 @@ pub(crate) trait HookProtocol {
     /// ```
     ///
     /// Agents with different formats (Cursor, Copilot CLI) override this method.
-    #[allow(dead_code)]
     fn build_config_entry(&self, hook_script_path: &str) -> serde_json::Value {
         serde_json::json!({
             "matcher": self.tool_matcher(),
@@ -263,7 +252,6 @@ pub(crate) trait HookProtocol {
     ///
     /// Default checks for `"skim-rewrite"` substring in any nested `command` value
     /// (Claude Code / Gemini / Copilot / Crush). Cursor overrides this.
-    #[allow(dead_code)]
     fn is_skim_entry(&self, entry: &serde_json::Value) -> bool {
         entry
             .get("hooks")
@@ -284,7 +272,6 @@ pub(crate) trait HookProtocol {
     ///
     /// Default implementation handles the Claude Code / Gemini / Copilot /
     /// Crush array-of-objects format. Cursor overrides this.
-    #[allow(dead_code)]
     fn upsert_hook(
         &self,
         config: &mut serde_json::Value,
@@ -320,7 +307,7 @@ pub(crate) trait HookProtocol {
     /// Remove all skim hook entries from a parsed config JSON value in place.
     ///
     /// Returns `true` if any entries were removed, `false` if none found.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Default impl used by Codex (AwarenessOnly); called from test targets only
     fn remove_skim_entries(&self, config: &mut serde_json::Value) -> bool {
         let Some(hooks) = config.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
             return false;
@@ -345,7 +332,7 @@ pub(crate) trait HookProtocol {
     ///
     /// Returns `true` when the config file exists and contains a skim entry.
     /// Returns `false` on any I/O or parse error (non-fatal).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Called from per-agent test targets only; not reachable from production binary
     fn detect_hook(&self, config_dir: &std::path::Path) -> bool {
         use crate::cmd::init::MAX_SETTINGS_SIZE;
 
@@ -376,7 +363,6 @@ pub(crate) trait HookProtocol {
     /// same event bucket. Returns the command strings of any such entries.
     ///
     /// Used for collision-detection warnings during install.
-    #[allow(dead_code)]
     fn scan_other_hooks(&self, config_dir: &std::path::Path) -> Vec<String> {
         use crate::cmd::init::MAX_SETTINGS_SIZE;
 
@@ -430,7 +416,7 @@ pub(crate) trait HookProtocol {
     }
 
     /// Default no-op install. Override for agents with real hook installation.
-    #[allow(dead_code)] // Used in tests only
+    #[allow(dead_code)] // Default impl used by Codex (AwarenessOnly); called from test targets only
     fn install(&self, _opts: &InstallOpts) -> anyhow::Result<InstallResult> {
         Ok(InstallResult {
             script_path: None,
@@ -439,7 +425,7 @@ pub(crate) trait HookProtocol {
     }
 
     /// Default no-op uninstall. Override for agents with real hook removal.
-    #[allow(dead_code)] // Used in tests only
+    #[allow(dead_code)] // Default impl used by Codex (AwarenessOnly); called from test targets only
     fn uninstall(&self, _opts: &UninstallOpts) -> anyhow::Result<()> {
         Ok(())
     }

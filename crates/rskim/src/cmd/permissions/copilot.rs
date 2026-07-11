@@ -37,8 +37,8 @@
 
 use std::path::Path;
 
+use super::hash_if_bounded;
 use crate::cmd::init::{MAX_SETTINGS_SIZE, atomic_write_settings, load_or_create_settings};
-use crate::cmd::integrity::compute_file_hash;
 use crate::cmd::permissions::sidecar::{
     PermissionSidecar, SIDECAR_FILENAME, load_sidecar, write_sidecar,
 };
@@ -137,7 +137,13 @@ impl PermissionsProtocol for CopilotPermissions {
         atomic_write_settings(&full_json, &config_path)?;
 
         // Write sidecar.
-        let config_hash = compute_file_hash(&config_path)?;
+        // The file was just written by skim after a size-guarded load; oversized here is unexpected.
+        let config_hash = hash_if_bounded(&config_path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "permissions-config.json unexpectedly exceeds size limit after write — \
+                 this is an internal error; please file a bug report"
+            )
+        })?;
         let sidecar = PermissionSidecar {
             version: 1,
             tier: "seed".to_string(),

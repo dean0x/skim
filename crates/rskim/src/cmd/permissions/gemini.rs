@@ -42,7 +42,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::cmd::integrity::compute_file_hash;
+use super::hash_if_bounded;
 use crate::cmd::permissions::sidecar::{
     PermissionSidecar, SIDECAR_FILENAME, load_sidecar, write_sidecar,
 };
@@ -105,10 +105,11 @@ impl PermissionsProtocol for GeminiPermissions {
         let config_path = config_dir.join(CONFIG_FILENAME);
 
         // Check if the file is already current (sidecar hash match).
+        // hash_if_bounded returns Ok(None) for oversized files → pattern fails → not idempotent.
         if let Ok(sidecar) = load_sidecar(&config_dir.join(SIDECAR_FILENAME))
             && sidecar.entries == entries
             && config_path.exists()
-            && let Ok(current_hash) = compute_file_hash(&config_path)
+            && let Ok(Some(current_hash)) = hash_if_bounded(&config_path)
             && current_hash == sidecar.config_hash
         {
             return Ok(SeedOutcome::AlreadyCurrent);
@@ -128,7 +129,13 @@ impl PermissionsProtocol for GeminiPermissions {
         std::fs::rename(&tmp_path, &config_path)?;
 
         // Compute hash and write sidecar.
-        let config_hash = compute_file_hash(&config_path)?;
+        // The file was just written by skim; exceeding the size bound here is unexpected.
+        let config_hash = hash_if_bounded(&config_path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "generated Gemini policy file unexpectedly exceeds size limit — \
+                 this is an internal error; please file a bug report"
+            )
+        })?;
         let sidecar = PermissionSidecar {
             version: 1,
             tier: "seed".to_string(),
@@ -165,7 +172,14 @@ impl PermissionsProtocol for GeminiPermissions {
         }
 
         // Verify hash before deleting (don't remove a tampered file).
-        let current_hash = compute_file_hash(&config_path)?;
+        let current_hash = hash_if_bounded(&config_path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Gemini policy file is too large to hash safely and will not be removed: {}\n\
+                 hint: the file may have grown due to external edits; inspect it manually \
+                 and remove it (and the sidecar) by hand if no longer needed",
+                config_path.display()
+            )
+        })?;
         if current_hash != sidecar.config_hash {
             anyhow::bail!(
                 "Gemini policy file hash mismatch — file may have been modified manually: {}\n\
@@ -199,8 +213,9 @@ impl PermissionsProtocol for GeminiPermissions {
             return false;
         }
 
-        compute_file_hash(&config_path)
-            .map(|h| h == sidecar.config_hash)
+        // Ok(None) means oversized → treat as not current (return false).
+        hash_if_bounded(&config_path)
+            .map(|opt| opt.map(|h| h == sidecar.config_hash).unwrap_or(false))
             .unwrap_or(false)
     }
 }
@@ -499,6 +514,68 @@ mod tests {
             result.is_ok(),
             "Gemini seed must replace oversized owned file: {:?}",
             result
+        );
+    }
+
+    // ---- is_current: oversized config file ----
+
+    #[test]
+    fn test_is_current_oversized_file_returns_false() {
+        // is_current must return false (not panic) when the config file is oversized.
+        // This covers the hash_if_bounded(Ok(None)) → false path.
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let entries = vec!["skim df".to_string()];
+
+        // Seed normally to create a valid sidecar.
+        p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+
+        // Replace the config file with a sparse oversized file (no actual 10MiB disk use).
+        let config_path = dir.path().join(CONFIG_FILENAME);
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::File::create(&config_path).unwrap();
+            file.seek(SeekFrom::Start(MAX_SETTINGS_SIZE + 1)).unwrap();
+            file.write_all(b"x").unwrap();
+        }
+
+        assert!(
+            !p.is_current(dir.path(), &entries),
+            "is_current must return false when config file exceeds MAX_SETTINGS_SIZE"
+        );
+    }
+
+    // ---- remove_seeded: oversized config file ----
+
+    #[test]
+    fn test_remove_seeded_oversized_file_returns_err() {
+        // remove_seeded must return Err (fail-loud) when the config file is oversized
+        // so that skim never silently removes or skips a file it cannot safely verify.
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let entries = vec!["skim df".to_string()];
+
+        // Seed normally to create a valid sidecar.
+        p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+
+        // Replace the config file with a sparse oversized file.
+        let config_path = dir.path().join(CONFIG_FILENAME);
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::File::create(&config_path).unwrap();
+            file.seek(SeekFrom::Start(MAX_SETTINGS_SIZE + 1)).unwrap();
+            file.write_all(b"x").unwrap();
+        }
+
+        let result = p.remove_seeded(dir.path());
+        assert!(
+            result.is_err(),
+            "remove_seeded must return Err when config file exceeds MAX_SETTINGS_SIZE"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("too large") || err.contains("size"),
+            "error must mention the size limit: {err}"
         );
     }
 }
