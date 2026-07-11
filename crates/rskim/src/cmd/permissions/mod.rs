@@ -1,9 +1,5 @@
 //! Agent-permission writers for `skim init --permissions`.
 //!
-// The public API in this module (trait, factory, seeded_entries) is consumed by
-// Subtask 7 (init wiring). Suppress dead_code until callers land.
-#![allow(dead_code)]
-//!
 //! This module provides the `PermissionsProtocol` trait and per-agent writers
 //! that seed read-only tool allow-list entries into each agent's config file.
 //!
@@ -31,8 +27,9 @@
 
 pub(crate) mod sidecar;
 
-mod claude;
+pub(crate) mod claude;
 mod codex;
+mod copilot;
 mod gemini;
 
 use std::path::Path;
@@ -176,9 +173,9 @@ pub(crate) fn permissions_protocol_for_agent(
         AgentKind::Cursor => None,
         // Permanent None: Crush has no permissions writer (ratified in WS2B).
         AgentKind::Crush => None,
-        // Transitional None: Copilot writer is added in Subtask 7 after the
-        // Copilot hook re-home. Do not add a Copilot arm here before that task.
-        AgentKind::CopilotCli => None,
+        // Copilot writer: per-project permissions-config.json keyed by git root.
+        // Schema validated in principle, pending deferred Copilot CLI e2e.
+        AgentKind::CopilotCli => Some(Box::new(copilot::CopilotPermissions)),
     }
 }
 
@@ -240,12 +237,12 @@ mod tests {
     }
 
     #[test]
-    fn test_factory_copilot_returns_none_transitionally() {
-        // Copilot writer is added in Subtask 7 after the hook re-home.
-        // This None is TRANSITIONAL — Subtask 7 will flip it to Some.
+    fn test_factory_copilot_returns_some() {
+        // Copilot writer was added in Subtask 7 (per-project permissions-config.json).
+        // This Some is PERMANENT — Copilot CLI now has a writer.
         assert!(
-            permissions_protocol_for_agent(AgentKind::CopilotCli).is_none(),
-            "Copilot must return None from permissions factory until Subtask 7 adds the writer"
+            permissions_protocol_for_agent(AgentKind::CopilotCli).is_some(),
+            "Copilot must return Some from permissions factory (writer added in Subtask 7)"
         );
     }
 
@@ -345,6 +342,7 @@ mod tests {
             AgentKind::ClaudeCode,
             AgentKind::GeminiCli,
             AgentKind::CodexCli,
+            AgentKind::CopilotCli,
         ] {
             let p = permissions_protocol_for_agent(agent).unwrap();
             let entries = seeded_entries(p.as_ref());

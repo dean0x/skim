@@ -74,15 +74,11 @@ pub(super) struct InitFlags {
     /// CONSTRAINT: mutually exclusive with `--project` — permissions seeding is
     /// user-scope only. Project settings are repository-controlled and must not
     /// receive auto-generated allowlist entries.
-    // Consumed by the init execution path (Subtask 7); suppress until callers land.
-    #[allow(dead_code)]
     pub(super) permissions: Option<bool>,
     /// Which tier of permissions to seed when `permissions == Some(true)`.
     ///
     /// Default: `PermissionsTier::Seed` (narrowest — only the 8 read-only tools).
     /// Set via `--permissions-tier seed|mirror|blanket`.
-    // Consumed by the init execution path (Subtask 7); suppress until callers land.
-    #[allow(dead_code)]
     pub(super) permissions_tier: PermissionsTier,
 }
 

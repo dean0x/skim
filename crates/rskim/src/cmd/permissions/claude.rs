@@ -1,9 +1,5 @@
 //! Claude Code permissions writer.
 //!
-// Implementation-complete API consumed by Subtask 7 (init wiring + uninstall).
-// Suppress dead_code until the callers land.
-#![allow(dead_code)]
-//!
 //! Targets `{config_dir}/settings.json` → `permissions.allow` array.
 //!
 //! ## File ownership
@@ -27,6 +23,7 @@
 //! are in the sidecar manifest **and** still byte-equal present in the allow
 //! array. Leave everything else. Delete the sidecar on success.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::cmd::init::{
@@ -210,6 +207,302 @@ impl PermissionsProtocol for ClaudePermissions {
             allow.iter().filter_map(|v| v.as_str()).collect();
 
         entries.iter().all(|e| existing.contains(e.as_str()))
+    }
+}
+
+// ============================================================================
+// Mirror tier (Claude-scoped by design)
+// ============================================================================
+//
+// The Mirror tier is Claude-scoped: it reads the EXISTING Claude settings.json
+// `permissions.allow` list and proposes skim-prefixed mirrors for any entry
+// that names a wrapped tool. Non-Claude agents have no parseable Bash() source
+// rules; callers must fall back to Seed entries with a printed notice.
+
+/// A proposed mirror entry.
+///
+/// Each `MirrorProposal` is derived from one `source` allow entry in the
+/// current settings.json and paired with the mirrored form that skim would
+/// add. `is_mutating` is true when the tool is NOT in `READ_ONLY_SUBCOMMANDS`
+/// (consent must highlight mutating tools).
+#[derive(Debug, Clone)]
+pub(crate) struct MirrorProposal {
+    /// The source allow entry (e.g. `"Bash(git:*)"`)
+    pub(crate) source: String,
+    /// The mirror allow entry with `"skim "` prefix (e.g. `"Bash(skim git:*)"`)
+    pub(crate) mirror: String,
+    /// True when the mirrored tool is NOT in `READ_ONLY_SUBCOMMANDS` (i.e., mutating).
+    /// Consent display must mark these with a `(mutating)` suffix.
+    pub(crate) is_mutating: bool,
+}
+
+/// Validate that `entry` is an acceptable source for mirror derivation.
+///
+/// Accepted shapes (exact only):
+/// - `Bash(<tool>:*)` — single token
+/// - `Bash(<tool> <sub>:*)` — tool + subcommand
+///
+/// Requirements for acceptance:
+/// - Starts with `Bash(` and ends with `:*)`
+/// - Inner content is `<tool>` or `<tool> <sub>`; each part matches `^[A-Za-z0-9._-]+$`
+/// - `<tool>` must be in `wrapper_targets()`
+/// - No `*` or regex-ish chars inside the inner content (outside the trailing `:*`)
+///
+/// Rejected: `Bash(*)`, any wildcard/regex shape, non-Bash rules, malformed parens.
+fn is_valid_mirror_source(entry: &str) -> bool {
+    // Must start with `Bash(` and end with `:*)`
+    let inner = match entry
+        .strip_prefix("Bash(")
+        .and_then(|s| s.strip_suffix(":*)"))
+    {
+        Some(i) => i,
+        None => return false,
+    };
+
+    // Inner must not be empty (rejects `Bash(:*)`)
+    if inner.is_empty() {
+        return false;
+    }
+
+    // Inner must not contain `*`, `?`, `[`, `]` or parentheses (wildcard/regex guards)
+    if inner
+        .chars()
+        .any(|c| matches!(c, '*' | '?' | '[' | ']' | '(' | ')'))
+    {
+        return false;
+    }
+
+    // Split into tool (required) and optional sub, separated by a single space.
+    // More than one space means something unusual — reject.
+    let parts: Vec<&str> = inner.splitn(2, ' ').collect();
+    let tool = parts[0];
+    let sub = parts.get(1).copied();
+
+    // Tool must be in wrapper_targets().
+    if !crate::cmd::registry::wrapper_targets().contains(&tool) {
+        return false;
+    }
+
+    // Each part must match `^[A-Za-z0-9._-]+$` (strict; no spaces, no special chars).
+    let valid_chars = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+
+    if !valid_chars(tool) {
+        return false;
+    }
+
+    if sub.is_some_and(|s| !valid_chars(s)) {
+        return false;
+    }
+
+    true
+}
+
+/// Compute the mirror entry string for a validated source entry.
+///
+/// `Bash(tool:*)` → `Bash(skim tool:*)`
+/// `Bash(tool sub:*)` → `Bash(skim tool sub:*)`
+///
+/// Returns `None` when `source` is not in the expected shape (defensive; callers
+/// should call `is_valid_mirror_source` first).
+fn compute_mirror(source: &str) -> Option<String> {
+    let inner = source.strip_prefix("Bash(")?.strip_suffix(":*)")?;
+    Some(format!("Bash(skim {inner}:*)"))
+}
+
+/// Check whether a proposed mirror is already covered by any deny or ask rule.
+///
+/// Conservative coverage: exact string match OR the deny/ask entry is
+/// `Bash(skim:*)` (blanket skim deny/ask that covers all skim-prefixed mirrors).
+fn is_mirror_covered(mirror: &str, deny_rules: &[&str], ask_rules: &[&str]) -> bool {
+    for &rules in &[deny_rules, ask_rules] {
+        for &rule in rules {
+            // Exact match.
+            if rule == mirror {
+                return true;
+            }
+            // Blanket skim deny/ask covers all `Bash(skim …:*)` mirrors.
+            if rule == "Bash(skim:*)" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Helper: extract string values from a JSON array at `settings[key1][key2]`.
+fn extract_string_list<'a>(
+    settings: &'a serde_json::Value,
+    key1: &str,
+    key2: &str,
+) -> Vec<&'a str> {
+    settings
+        .get(key1)
+        .and_then(|p| p.get(key2))
+        .and_then(|a| a.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default()
+}
+
+/// Compute mirror proposals from the current `settings.json` allow list.
+///
+/// Reads `settings.json` **once**: the same document is used for source
+/// extraction, deny/ask consultation, dedup against existing mirrors, and
+/// (downstream) the actual write via [`seed_mirrors`].
+///
+/// Returns proposals whose mirrors are not already in the allow list and
+/// are not covered by any deny/ask rule.
+pub(crate) fn propose_mirrors(config_dir: &Path) -> anyhow::Result<Vec<MirrorProposal>> {
+    let config_path = config_dir.join(CONFIG_FILENAME);
+    let settings = load_or_create_settings(&config_path)?;
+
+    let allow: Vec<&str> = extract_string_list(&settings, "permissions", "allow");
+    let deny: Vec<&str> = extract_string_list(&settings, "permissions", "deny");
+    let ask: Vec<&str> = extract_string_list(&settings, "permissions", "ask");
+
+    let allow_set: HashSet<&str> = allow.iter().copied().collect();
+
+    let mut proposals = Vec::new();
+    for &source in &allow {
+        if !is_valid_mirror_source(source) {
+            continue;
+        }
+
+        let mirror = match compute_mirror(source) {
+            Some(m) => m,
+            None => continue,
+        };
+
+        // Skip if the mirror is covered by a deny or ask rule.
+        if is_mirror_covered(&mirror, &deny, &ask) {
+            continue;
+        }
+
+        // Skip if the mirror already exists in the allow list (dedup).
+        if allow_set.contains(mirror.as_str()) {
+            continue;
+        }
+
+        // Determine if the tool is mutating (not in READ_ONLY_SUBCOMMANDS).
+        let tool = source
+            .strip_prefix("Bash(")
+            .and_then(|s| s.strip_suffix(":*)"))
+            .and_then(|inner| inner.split(' ').next())
+            .unwrap_or("");
+        let is_mutating = !crate::cmd::registry::is_read_only(tool);
+
+        proposals.push(MirrorProposal {
+            source: source.to_string(),
+            mirror,
+            is_mutating,
+        });
+    }
+
+    Ok(proposals)
+}
+
+/// Seed mirror entries into `settings.json`.
+///
+/// Implements re-run semantics: previously recorded mirrors (from the sidecar)
+/// are removed first, then the new set is added. This ensures stale mirrors
+/// (from sources that no longer exist or were removed) are cleaned up.
+///
+/// Writes the sidecar with tier `"mirror"` and the `source_mirrors` provenance map.
+/// Returns `AlreadyCurrent` when no changes are needed.
+pub(crate) fn seed_mirrors(
+    config_dir: &Path,
+    proposals: &[MirrorProposal],
+) -> anyhow::Result<SeedOutcome> {
+    if proposals.is_empty() {
+        return Ok(SeedOutcome::AlreadyCurrent);
+    }
+
+    let config_path = config_dir.join(CONFIG_FILENAME);
+
+    // Byte-cap check.
+    if config_path.exists() {
+        let size = std::fs::metadata(&config_path)?.len();
+        if size > MAX_SETTINGS_SIZE {
+            anyhow::bail!(
+                "settings.json is too large ({size} bytes, max {max} bytes): {path}\n\
+                 hint: This does not look like a valid Claude Code settings file",
+                max = MAX_SETTINGS_SIZE,
+                path = config_path.display()
+            );
+        }
+    }
+
+    // Load previously recorded mirror entries from the sidecar (for re-run cleanup).
+    let sidecar_path = config_dir.join(SIDECAR_FILENAME);
+    let prev_mirrors: Vec<String> = match load_sidecar(&sidecar_path) {
+        Ok(s) if s.tier == "mirror" => s.entries,
+        _ => vec![],
+    };
+
+    let mut settings = load_or_create_settings(&config_path)?;
+    let allow_array = get_or_create_allow_array(&mut settings, &config_path)?;
+
+    // Re-run semantics: remove previously recorded mirrors first.
+    if !prev_mirrors.is_empty() {
+        let prev_set: HashSet<&String> = prev_mirrors.iter().collect();
+        allow_array.retain(|v| {
+            let s = v.as_str().unwrap_or("");
+            !prev_set.contains(&s.to_string())
+        });
+    }
+
+    // Collect current allow values (post-removal) for dedup.
+    let existing: HashSet<String> = allow_array
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+
+    // Add fresh mirrors.
+    let all_mirrors: Vec<String> = proposals.iter().map(|p| p.mirror.clone()).collect();
+    let mut entries_added: Vec<String> = Vec::new();
+    for mirror in &all_mirrors {
+        if !existing.contains(mirror) {
+            allow_array.push(serde_json::Value::String(mirror.clone()));
+            entries_added.push(mirror.clone());
+        }
+    }
+
+    if entries_added.is_empty() && prev_mirrors.is_empty() {
+        return Ok(SeedOutcome::AlreadyCurrent);
+    }
+
+    // Write settings.json.
+    if !config_dir.exists() {
+        std::fs::create_dir_all(config_dir)?;
+    }
+    if config_path.exists() {
+        backup_settings_file(config_dir, &config_path)?;
+    }
+    atomic_write_settings(&settings, &config_path)?;
+
+    // Compute hash and write sidecar with source_mirrors provenance.
+    let config_hash = compute_file_hash(&config_path)?;
+    let source_mirrors: HashMap<String, String> = proposals
+        .iter()
+        .map(|p| (p.source.clone(), p.mirror.clone()))
+        .collect();
+
+    let sidecar = PermissionSidecar {
+        version: 1,
+        tier: "mirror".to_string(),
+        entries: all_mirrors,
+        source_mirrors,
+        config_hash,
+    };
+    write_sidecar(&sidecar_path, &sidecar)?;
+
+    if entries_added.is_empty() {
+        Ok(SeedOutcome::AlreadyCurrent)
+    } else {
+        Ok(SeedOutcome::Added { entries_added })
     }
 }
 
@@ -564,6 +857,356 @@ mod tests {
             result.is_err(),
             "missing sidecar must return Err (not silent NothingToRemove)"
         );
+    }
+
+    // ---- mirror tier: is_valid_mirror_source ----
+
+    #[test]
+    fn test_valid_mirror_source_single_tool() {
+        // git is in wrapper_targets()
+        assert!(is_valid_mirror_source("Bash(git:*)"));
+        assert!(is_valid_mirror_source("Bash(ls:*)"));
+        assert!(is_valid_mirror_source("Bash(grep:*)"));
+    }
+
+    #[test]
+    fn test_valid_mirror_source_tool_with_sub() {
+        // cargo build, git diff — tool in wrapper_targets()
+        assert!(is_valid_mirror_source("Bash(cargo:*)"));
+    }
+
+    #[test]
+    fn test_invalid_mirror_source_wildcard() {
+        // Bare `Bash(*)` must be rejected
+        assert!(!is_valid_mirror_source("Bash(*)"));
+    }
+
+    #[test]
+    fn test_invalid_mirror_source_wildcard_in_tool() {
+        // `*` inside the tool name must be rejected
+        assert!(!is_valid_mirror_source("Bash(git*:*)"));
+    }
+
+    #[test]
+    fn test_invalid_mirror_source_non_wrapper_tool() {
+        // `rm` is not in wrapper_targets()
+        assert!(!is_valid_mirror_source("Bash(rm:*)"));
+    }
+
+    #[test]
+    fn test_invalid_mirror_source_not_bash_prefix() {
+        // Non-Bash rules must be rejected
+        assert!(!is_valid_mirror_source("Edit(ls:*)"));
+        assert!(!is_valid_mirror_source("Read(*:*)"));
+    }
+
+    #[test]
+    fn test_invalid_mirror_source_space_with_invalid_sub() {
+        // Subcommand with space — only valid charset [A-Za-z0-9._-] allowed
+        assert!(!is_valid_mirror_source("Bash(rm -rf:*)"));
+    }
+
+    #[test]
+    fn test_invalid_mirror_source_missing_trailing_star() {
+        // Trailing `:*)` must be present
+        assert!(!is_valid_mirror_source("Bash(git:)"));
+        assert!(!is_valid_mirror_source("Bash(git)"));
+    }
+
+    // ---- mirror tier: compute_mirror ----
+
+    #[test]
+    fn test_compute_mirror_single_tool() {
+        assert_eq!(
+            compute_mirror("Bash(git:*)"),
+            Some("Bash(skim git:*)".to_string())
+        );
+        assert_eq!(
+            compute_mirror("Bash(ls:*)"),
+            Some("Bash(skim ls:*)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compute_mirror_tool_with_sub() {
+        assert_eq!(
+            compute_mirror("Bash(cargo build:*)"),
+            Some("Bash(skim cargo build:*)".to_string())
+        );
+    }
+
+    // ---- mirror tier: is_mirror_covered ----
+
+    #[test]
+    fn test_mirror_covered_exact_deny() {
+        assert!(is_mirror_covered(
+            "Bash(skim git:*)",
+            &["Bash(skim git:*)"],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_mirror_covered_blanket_deny() {
+        assert!(is_mirror_covered("Bash(skim ls:*)", &["Bash(skim:*)"], &[]));
+    }
+
+    #[test]
+    fn test_mirror_covered_exact_ask() {
+        assert!(is_mirror_covered(
+            "Bash(skim grep:*)",
+            &[],
+            &["Bash(skim grep:*)"]
+        ));
+    }
+
+    #[test]
+    fn test_mirror_not_covered() {
+        assert!(!is_mirror_covered(
+            "Bash(skim ls:*)",
+            &["Bash(skim git:*)"],
+            &[]
+        ));
+        assert!(!is_mirror_covered("Bash(skim ls:*)", &[], &[]));
+    }
+
+    // ---- mirror tier: propose_mirrors ----
+
+    #[test]
+    fn test_propose_mirrors_empty_settings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let proposals = propose_mirrors(dir.path()).unwrap();
+        assert!(proposals.is_empty(), "no source rules → no proposals");
+    }
+
+    #[test]
+    fn test_propose_mirrors_with_valid_source() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = serde_json::json!({
+            "permissions": {
+                "allow": ["Bash(git:*)", "Bash(ls:*)"]
+            }
+        });
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let proposals = propose_mirrors(dir.path()).unwrap();
+        let mirrors: Vec<&str> = proposals.iter().map(|p| p.mirror.as_str()).collect();
+        assert!(mirrors.contains(&"Bash(skim git:*)"), "git → skim git");
+        assert!(mirrors.contains(&"Bash(skim ls:*)"), "ls → skim ls");
+    }
+
+    #[test]
+    fn test_propose_mirrors_skips_bash_wildcard() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = serde_json::json!({
+            "permissions": {
+                "allow": ["Bash(*)", "Bash(git:*)"]
+            }
+        });
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let proposals = propose_mirrors(dir.path()).unwrap();
+        // `Bash(*)` must be rejected; `Bash(git:*)` is valid
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].mirror, "Bash(skim git:*)");
+    }
+
+    #[test]
+    fn test_propose_mirrors_skips_denied_mirror() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = serde_json::json!({
+            "permissions": {
+                "allow": ["Bash(git:*)"],
+                "deny":  ["Bash(skim git:*)"]
+            }
+        });
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let proposals = propose_mirrors(dir.path()).unwrap();
+        assert!(
+            proposals.is_empty(),
+            "mirror covered by deny rule must be skipped"
+        );
+    }
+
+    #[test]
+    fn test_propose_mirrors_skips_blanket_denied() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = serde_json::json!({
+            "permissions": {
+                "allow": ["Bash(git:*)", "Bash(ls:*)"],
+                "deny":  ["Bash(skim:*)"]
+            }
+        });
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let proposals = propose_mirrors(dir.path()).unwrap();
+        assert!(
+            proposals.is_empty(),
+            "blanket skim deny must suppress all mirrors"
+        );
+    }
+
+    #[test]
+    fn test_propose_mirrors_skips_existing_mirror() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // `Bash(skim git:*)` already in the allow list — must not be proposed again.
+        let settings = serde_json::json!({
+            "permissions": {
+                "allow": ["Bash(git:*)", "Bash(skim git:*)"]
+            }
+        });
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let proposals = propose_mirrors(dir.path()).unwrap();
+        assert!(
+            proposals.is_empty(),
+            "already-mirrored source must not be proposed again"
+        );
+    }
+
+    #[test]
+    fn test_propose_mirrors_marks_mutating_tools() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // git is mutating (not in READ_ONLY_SUBCOMMANDS); ls is read-only.
+        let settings = serde_json::json!({
+            "permissions": {
+                "allow": ["Bash(git:*)", "Bash(ls:*)"]
+            }
+        });
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let proposals = propose_mirrors(dir.path()).unwrap();
+        let git_proposal = proposals.iter().find(|p| p.mirror == "Bash(skim git:*)");
+        let ls_proposal = proposals.iter().find(|p| p.mirror == "Bash(skim ls:*)");
+
+        assert!(git_proposal.is_some(), "git proposal must exist");
+        assert!(ls_proposal.is_some(), "ls proposal must exist");
+        assert!(git_proposal.unwrap().is_mutating, "git is mutating");
+        assert!(!ls_proposal.unwrap().is_mutating, "ls is read-only");
+    }
+
+    // ---- mirror tier: seed_mirrors ----
+
+    #[test]
+    fn test_seed_mirrors_adds_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = serde_json::json!({
+            "permissions": {
+                "allow": ["Bash(git:*)"]
+            }
+        });
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let proposals = propose_mirrors(dir.path()).unwrap();
+        assert!(!proposals.is_empty());
+
+        let outcome = seed_mirrors(dir.path(), &proposals).unwrap();
+        assert!(matches!(outcome, SeedOutcome::Added { .. }));
+
+        // Verify mirror is in settings.json
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let allow = updated["permissions"]["allow"].as_array().unwrap();
+        let allow_strs: Vec<&str> = allow.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            allow_strs.contains(&"Bash(skim git:*)"),
+            "mirror must be added"
+        );
+        assert!(
+            allow_strs.contains(&"Bash(git:*)"),
+            "source must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_seed_mirrors_writes_sidecar_with_provenance() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = serde_json::json!({
+            "permissions": { "allow": ["Bash(ls:*)"] }
+        });
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        let proposals = propose_mirrors(dir.path()).unwrap();
+        seed_mirrors(dir.path(), &proposals).unwrap();
+
+        let sidecar_path = dir.path().join("skim-permissions.json");
+        let sidecar = crate::cmd::permissions::sidecar::load_sidecar(&sidecar_path).unwrap();
+        assert_eq!(sidecar.tier, "mirror");
+        assert!(sidecar.entries.contains(&"Bash(skim ls:*)".to_string()));
+        assert_eq!(
+            sidecar.source_mirrors.get("Bash(ls:*)").map(String::as_str),
+            Some("Bash(skim ls:*)")
+        );
+    }
+
+    #[test]
+    fn test_seed_mirrors_rerun_removes_stale_mirrors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Initial settings: git is a source
+        let settings = serde_json::json!({
+            "permissions": { "allow": ["Bash(git:*)"] }
+        });
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        let proposals = propose_mirrors(dir.path()).unwrap();
+        seed_mirrors(dir.path(), &proposals).unwrap();
+
+        // Now remove git from source, add ls
+        let settings2 = serde_json::json!({
+            "permissions": { "allow": ["Bash(ls:*)"] }
+        });
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::to_string_pretty(&settings2).unwrap(),
+        )
+        .unwrap();
+
+        let proposals2 = propose_mirrors(dir.path()).unwrap();
+        seed_mirrors(dir.path(), &proposals2).unwrap();
+
+        let updated: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        let allow: Vec<&str> = updated["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        // Old git mirror must be removed; new ls mirror must be present
+        assert!(
+            !allow.contains(&"Bash(skim git:*)"),
+            "stale git mirror must be removed"
+        );
+        assert!(
+            allow.contains(&"Bash(skim ls:*)"),
+            "new ls mirror must be present"
+        );
+    }
+
+    #[test]
+    fn test_seed_mirrors_empty_proposals_returns_already_current() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let proposals = vec![];
+        let outcome = seed_mirrors(dir.path(), &proposals).unwrap();
+        assert!(matches!(outcome, SeedOutcome::AlreadyCurrent));
     }
 
     // ---- is_current ----

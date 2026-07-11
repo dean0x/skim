@@ -331,8 +331,6 @@ fn confirm_proceed_raw() -> anyhow::Result<bool> {
 /// - `agent_label` — human-readable agent name for the prompt (e.g. "Claude Code").
 /// - `config_file` — exact path of the file that will be modified.
 /// - `entries` — each entry that will be added, printed verbatim.
-// Consumers arrive in Subtask 7; allow dead_code until then.
-#[allow(dead_code)]
 pub(crate) fn confirm_grant(agent_label: &str, config_file: &Path, entries: &[String]) -> bool {
     use std::io::{BufRead, IsTerminal, Read, Write};
 

@@ -3,10 +3,12 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use super::flags::{DetectionEnv, InitFlags, detect_installed_agents, resolve_single_agent};
+use super::flags::{
+    DetectionEnv, InitFlags, PermissionsTier, detect_installed_agents, resolve_single_agent,
+};
 use super::helpers::{
-    HOOK_SCRIPT_NAME, SETTINGS_BACKUP, atomic_write_settings, check_mark, load_or_create_settings,
-    resolve_real_settings_path,
+    HOOK_SCRIPT_NAME, SETTINGS_BACKUP, atomic_write_settings, check_mark, confirm_grant,
+    confirm_proceed, load_or_create_settings, resolve_real_settings_path,
 };
 use super::state::{DetectedState, detect_state, has_skim_hook_entry, read_settings_json};
 use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
@@ -131,6 +133,203 @@ fn print_completion_message(agent_name: &str) {
     println!();
 }
 
+// ============================================================================
+// Permissions install helpers
+// ============================================================================
+
+/// Returns `true` when the "already up to date" fast path must be bypassed
+/// because permissions work may be needed.
+///
+/// Rule:
+/// - `Some(false)` → never block (explicit opt-out).
+/// - `Some(true)` → always block when a writer exists (explicit request).
+/// - `None` → block only when the sidecar exists but entries are stale (auto-update).
+fn permissions_blocks_fast_path(
+    flags: &InitFlags,
+    agent: AgentKind,
+    perm_dir: &std::path::Path,
+) -> bool {
+    match flags.permissions {
+        Some(false) => false,
+        Some(true) => crate::cmd::permissions::permissions_protocol_for_agent(agent).is_some(),
+        None => {
+            let Some(protocol) = crate::cmd::permissions::permissions_protocol_for_agent(agent)
+            else {
+                return false;
+            };
+            // Stale = sidecar exists AND entries are not all present in agent config.
+            let sidecar_path = perm_dir.join("skim-permissions.json");
+            if !sidecar_path.exists() {
+                return false; // Never seeded → don't auto-seed on upgrade.
+            }
+            let entries = crate::cmd::permissions::seeded_entries(protocol.as_ref());
+            !protocol.is_current(perm_dir, &entries)
+        }
+    }
+}
+
+/// Resolve whether consent has been obtained to seed permissions.
+///
+/// Calls `confirm_grant` at most once (the single consent resolution point).
+///
+/// Returns `Ok(true)` when the user consented (or when nothing new will be written).
+/// Returns `Ok(false)` when consent was not obtained: non-TTY, explicit opt-out,
+/// user declined, or no writer exists for this agent.
+fn resolve_permissions_consent(
+    flags: &InitFlags,
+    agent: AgentKind,
+    perm_dir: &std::path::Path,
+) -> anyhow::Result<bool> {
+    // Explicit opt-out.
+    if flags.permissions == Some(false) {
+        return Ok(false);
+    }
+
+    // No writer for this agent (Cursor, Crush).
+    let Some(protocol) = crate::cmd::permissions::permissions_protocol_for_agent(agent) else {
+        return Ok(false);
+    };
+
+    // Determine whether seeding is desired.
+    let requested = match flags.permissions {
+        Some(true) => true,
+        None => {
+            // Auto: only when sidecar exists and is stale.
+            let sidecar_path = perm_dir.join("skim-permissions.json");
+            if !sidecar_path.exists() {
+                return Ok(false);
+            }
+            let entries = crate::cmd::permissions::seeded_entries(protocol.as_ref());
+            !protocol.is_current(perm_dir, &entries)
+        }
+        Some(false) => return Ok(false), // already handled above; exhaustive match
+    };
+    if !requested {
+        return Ok(false);
+    }
+
+    // Blanket tier + Codex: hard error (Codex is unsandboxed; blanket is too broad).
+    if agent == AgentKind::CodexCli && flags.permissions_tier == PermissionsTier::Blanket {
+        anyhow::bail!(
+            "Blanket permission tier is not supported for Codex CLI: Codex runs without \
+             a sandbox — blanket grants are too broad.\n\
+             hint: use --permissions-tier seed instead"
+        );
+    }
+
+    // Compute entries and target file for the consent prompt.
+    let (entries_for_prompt, config_file) = match flags.permissions_tier {
+        PermissionsTier::Mirror if agent == AgentKind::ClaudeCode => {
+            let proposals = crate::cmd::permissions::claude::propose_mirrors(perm_dir)?;
+            if proposals.is_empty() {
+                // No eligible source entries to mirror — treat as already current.
+                return Ok(true);
+            }
+            // Display entries with a `[mutating tool]` annotation for user clarity.
+            // The annotation is display-only: actual writes use `p.mirror` verbatim.
+            let entries: Vec<String> = proposals
+                .iter()
+                .map(|p| {
+                    if p.is_mutating {
+                        format!("{} [mutating tool]", p.mirror)
+                    } else {
+                        p.mirror.clone()
+                    }
+                })
+                .collect();
+            (entries, perm_dir.join(protocol.config_filename()))
+        }
+        _ => {
+            let entries = crate::cmd::permissions::seeded_entries(protocol.as_ref());
+            (entries, perm_dir.join(protocol.config_filename()))
+        }
+    };
+
+    // Blanket tier: second confirmation before the main consent prompt.
+    if flags.permissions_tier == PermissionsTier::Blanket {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return Ok(false);
+        }
+        println!();
+        println!("  WARNING: Blanket permission tier grants skim broad access to all wrapped");
+        println!("  tools, including mutating operations. This is a broad grant.");
+        println!();
+        if !confirm_proceed()? {
+            return Ok(false);
+        }
+    }
+
+    // Codex CLI: additional "unsandboxed" confirmation (Codex lacks a sandbox).
+    if agent == AgentKind::CodexCli {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return Ok(false);
+        }
+        println!();
+        println!("  WARNING: Codex CLI does not sandbox tool calls. Seeding permissions for");
+        println!("  Codex may allow unintended tool access if the model is compromised.");
+        println!();
+        if !confirm_proceed()? {
+            return Ok(false);
+        }
+    }
+
+    // Non-negotiable TTY gate — confirm_grant returns false on non-TTY.
+    let granted = confirm_grant(protocol.agent_label(), &config_file, &entries_for_prompt);
+    Ok(granted)
+}
+
+/// Seed permissions into the agent config after consent has been obtained.
+///
+/// # Ordering invariant
+///
+/// Must be called AFTER `patch_settings` for all agents, and AFTER
+/// `migrate_copilot_legacy` for Copilot CLI, so that new hook artifacts are
+/// in place before permissions are written.
+fn write_permissions(state: &DetectedState, tier: PermissionsTier) -> anyhow::Result<()> {
+    let agent = agent_from_state(state)?;
+    let Some(protocol) = crate::cmd::permissions::permissions_protocol_for_agent(agent) else {
+        return Ok(());
+    };
+
+    // Copilot CLI: permissions-config.json lives in hook_config_dir (~/.copilot),
+    // not in config_dir (~/.github). For all other agents, use config_dir.
+    let perm_dir: &std::path::Path = if agent == AgentKind::CopilotCli {
+        &state.hook_config_dir
+    } else {
+        &state.config_dir
+    };
+
+    let outcome = match tier {
+        PermissionsTier::Mirror if agent == AgentKind::ClaudeCode => {
+            let proposals = crate::cmd::permissions::claude::propose_mirrors(perm_dir)?;
+            crate::cmd::permissions::claude::seed_mirrors(perm_dir, &proposals)?
+        }
+        _ => {
+            let entries = crate::cmd::permissions::seeded_entries(protocol.as_ref());
+            protocol.seed(perm_dir, tier, &entries)?
+        }
+    };
+
+    match outcome {
+        crate::cmd::permissions::SeedOutcome::Added { entries_added } => {
+            println!(
+                "  {} Permissions: added {} entr{} to {}",
+                check_mark(true),
+                entries_added.len(),
+                if entries_added.len() == 1 { "y" } else { "ies" },
+                protocol.config_filename()
+            );
+        }
+        crate::cmd::permissions::SeedOutcome::AlreadyCurrent => {
+            println!("  {} Permissions: already current", check_mark(true));
+        }
+    }
+
+    Ok(())
+}
+
 pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
     let det_env = DetectionEnv::from_process();
     if let Some(agent) = resolve_single_agent(flags) {
@@ -139,6 +338,27 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     } else {
         // No --agent: auto-detect all installed agents
         run_install_auto_detect(flags, &det_env)
+    }
+}
+
+/// Build the per-agent `InitFlags` for auto-detect mode.
+///
+/// Codex CLI is excluded from the permissions fan-out: it runs without a
+/// sandbox, so blanket or seed permissions require explicit `--agent codex`
+/// consent, not implicit fan-out. Any other agent inherits the caller's flags.
+fn agent_flags_for_auto_detect(agent: AgentKind, flags: &InitFlags) -> InitFlags {
+    InitFlags {
+        agent: Some(agent),
+        // Suppress permissions for Codex in auto-detect mode.
+        // Explicit `skim init --agent codex --permissions` bypasses this path.
+        permissions: if agent == AgentKind::CodexCli
+            && matches!(flags.permissions, Some(true) | None)
+        {
+            Some(false)
+        } else {
+            flags.permissions
+        },
+        ..*flags
     }
 }
 
@@ -160,19 +380,13 @@ fn run_install_auto_detect(
     // This also preserves the original error propagation behaviour (errors are returned
     // rather than caught-and-summarised), which is important for test assertions.
     if agents.len() == 1 {
-        let agent_flags = InitFlags {
-            agent: Some(agents[0]),
-            ..*flags
-        };
+        let agent_flags = agent_flags_for_auto_detect(agents[0], flags);
         return run_install_single(&agent_flags, agents[0], det_env);
     }
 
     let mut any_failed = false;
     for &agent in &agents {
-        let agent_flags = InitFlags {
-            agent: Some(agent),
-            ..*flags
-        };
+        let agent_flags = agent_flags_for_auto_detect(agent, flags);
         match run_install_single(&agent_flags, agent, det_env) {
             Ok(code) if code == std::process::ExitCode::SUCCESS => {}
             Ok(code) => {
@@ -206,6 +420,14 @@ fn run_install_single(
     let env = InstructionEnv::from_process();
     let state = detect_state(flags, agent, det_env)?;
 
+    // The directory where permissions sidecar and config live.
+    // Copilot CLI: hook_config_dir (~/.copilot). All others: config_dir.
+    let perm_dir: &std::path::Path = if agent == AgentKind::CopilotCli {
+        &state.hook_config_dir
+    } else {
+        &state.config_dir
+    };
+
     verify_agent_installed(&state, agent, flags)?;
     print_install_header(agent.display_name());
     print_detected_state(&state);
@@ -215,7 +437,9 @@ fn run_install_single(
     }
 
     let guidance_current = is_guidance_current(agent, flags, &state.skim_version, &env);
-    if state.hook_installed && state.hook_is_current() && guidance_current {
+    let permissions_blocked = permissions_blocks_fast_path(flags, agent, perm_dir);
+
+    if state.hook_installed && state.hook_is_current() && guidance_current && !permissions_blocked {
         print_already_up_to_date();
         return Ok(std::process::ExitCode::SUCCESS);
     }
@@ -224,11 +448,22 @@ fn run_install_single(
         print_dual_scope_warning(warning);
     }
 
+    // Resolve consent ONCE before any install action.
+    // Returns Ok(false) on non-TTY (the test harness never has a TTY).
+    let grant_permissions = resolve_permissions_consent(flags, agent, perm_dir)?;
+
     let global = !flags.project;
     print_install_summary(&state);
 
     if flags.dry_run {
-        print_dry_run_actions(&state, flags.no_guidance, global, &env)?;
+        print_dry_run_actions(
+            &state,
+            flags.no_guidance,
+            global,
+            &env,
+            grant_permissions,
+            flags.permissions_tier,
+        )?;
         // Also show dry-run for wrappers if they would be installed.
         if !flags.project {
             maybe_install_wrappers(flags.wrappers, flags.dry_run)?;
@@ -236,7 +471,14 @@ fn run_install_single(
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
-    execute_install(&state, flags.no_guidance, global, &env)?;
+    execute_install(
+        &state,
+        flags.no_guidance,
+        global,
+        &env,
+        grant_permissions,
+        flags.permissions_tier,
+    )?;
 
     // Install shell wrappers (global scope only — wrappers are per-user, not per-project).
     if !flags.project {
@@ -305,6 +547,8 @@ fn execute_install(
     no_guidance: bool,
     global: bool,
     env: &InstructionEnv,
+    grant_permissions: bool,
+    tier: PermissionsTier,
 ) -> anyhow::Result<()> {
     // B7: Create hook script
     create_hook_script(state)?;
@@ -324,8 +568,18 @@ fn execute_install(
     // ~/.github/ AFTER new artifacts have been written to ~/.copilot/.
     // state.config_dir  = ~/.github (rules dir; legacy hook location)
     // state.hook_config_dir = ~/.copilot (new hook artifact location)
+    //
+    // Ordering: migrate BEFORE write_permissions for Copilot, so that
+    // the new hook_config_dir is fully established before permissions are written.
     if let Some(AgentKind::CopilotCli) = AgentKind::from_str(state.agent_cli_name) {
         migrate_copilot_legacy(&state.config_dir, &state.hook_config_dir)?;
+    }
+
+    // Write permissions if consent was obtained.
+    // Ordering invariant: after patch_settings for all agents; after
+    // migrate_copilot_legacy for Copilot CLI (see comment above).
+    if grant_permissions {
+        write_permissions(state, tier)?;
     }
 
     // Inject guidance into agent instruction file
@@ -787,6 +1041,15 @@ fn migrate_copilot_legacy(
     legacy_config_dir: &std::path::Path,
     new_hook_config_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
+    // No-op when the legacy and new locations are the same directory.
+    // This occurs when COPILOT_CONFIG_DIR is set (both config_dir and
+    // hook_config_dir resolve to the override value), meaning the hook
+    // artifacts were already written to the correct location — there is
+    // nothing stale to clean up.
+    if legacy_config_dir == new_hook_config_dir {
+        return Ok(());
+    }
+
     // Ordering guard: new artifacts must already exist before we touch the legacy location.
     let new_script = new_hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
     let new_skim_json = new_hook_config_dir.join("hooks").join("skim.json");
@@ -955,6 +1218,8 @@ pub(super) fn print_dry_run_actions(
     no_guidance: bool,
     global: bool,
     env: &InstructionEnv,
+    grant_permissions: bool,
+    tier: PermissionsTier,
 ) -> anyhow::Result<()> {
     let hook_script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
 
@@ -976,6 +1241,45 @@ pub(super) fn print_dry_run_actions(
             println!("  [dry-run] Would inject guidance into {}", path.display());
         }
     }
+
+    // Enumerate permissions entries when consent would be granted.
+    if grant_permissions {
+        let agent = agent_from_state(state)?;
+        let perm_dir: &std::path::Path = if agent == AgentKind::CopilotCli {
+            &state.hook_config_dir
+        } else {
+            &state.config_dir
+        };
+        if let Some(protocol) = crate::cmd::permissions::permissions_protocol_for_agent(agent) {
+            let entries = match tier {
+                PermissionsTier::Mirror if agent == AgentKind::ClaudeCode => {
+                    crate::cmd::permissions::claude::propose_mirrors(perm_dir)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|p| {
+                            if p.is_mutating {
+                                format!("{} [mutating tool]", p.mirror)
+                            } else {
+                                p.mirror
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                }
+                _ => crate::cmd::permissions::seeded_entries(protocol.as_ref()),
+            };
+            let config_file = perm_dir.join(protocol.config_filename());
+            println!(
+                "  [dry-run] Would add {} permission entr{} to {}:",
+                entries.len(),
+                if entries.len() == 1 { "y" } else { "ies" },
+                config_file.display()
+            );
+            for entry in &entries {
+                println!("    {entry}");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1679,5 +1983,167 @@ mod tests {
             .expect("first call must not error");
         super::migrate_copilot_legacy(legacy_dir.path(), new_dir.path())
             .expect("second call (idempotent) must not error");
+    }
+
+    // ---- agent_flags_for_auto_detect: Codex permissions exclusion pin ----
+
+    /// INVARIANT: Codex must never receive permissions in auto-detect mode.
+    ///
+    /// This test pins the exclusion. If it fails, investigate before changing
+    /// `agent_flags_for_auto_detect` — Codex is unsandboxed and blanket/seed
+    /// grants require explicit `--agent codex --permissions` consent.
+    #[test]
+    fn test_codex_excluded_from_auto_detect_permissions_fan_out() {
+        let base_flags = super::super::flags::InitFlags {
+            project: false,
+            yes: false,
+            dry_run: false,
+            uninstall: false,
+            force: false,
+            no_guidance: false,
+            agent: None,
+            wrappers: None,
+            permissions: Some(true),
+            permissions_tier: super::super::flags::PermissionsTier::Seed,
+        };
+
+        // Codex must get permissions=Some(false) regardless of the caller flags.
+        let codex_flags = super::agent_flags_for_auto_detect(AgentKind::CodexCli, &base_flags);
+        assert_eq!(
+            codex_flags.permissions,
+            Some(false),
+            "Codex must be excluded from auto-detect permissions fan-out"
+        );
+
+        // Other agents must inherit the caller's permissions flag unchanged.
+        let claude_flags = super::agent_flags_for_auto_detect(AgentKind::ClaudeCode, &base_flags);
+        assert_eq!(
+            claude_flags.permissions,
+            Some(true),
+            "ClaudeCode must inherit permissions=Some(true) from caller flags"
+        );
+        let gemini_flags = super::agent_flags_for_auto_detect(AgentKind::GeminiCli, &base_flags);
+        assert_eq!(
+            gemini_flags.permissions,
+            Some(true),
+            "GeminiCli must inherit permissions=Some(true) from caller flags"
+        );
+    }
+
+    #[test]
+    fn test_codex_excluded_when_permissions_is_none() {
+        // When permissions=None (auto mode), Codex must also be excluded.
+        let base_flags = super::super::flags::InitFlags {
+            project: false,
+            yes: false,
+            dry_run: false,
+            uninstall: false,
+            force: false,
+            no_guidance: false,
+            agent: None,
+            wrappers: None,
+            permissions: None,
+            permissions_tier: super::super::flags::PermissionsTier::Seed,
+        };
+        let codex_flags = super::agent_flags_for_auto_detect(AgentKind::CodexCli, &base_flags);
+        assert_eq!(
+            codex_flags.permissions,
+            Some(false),
+            "Codex must be excluded from auto permissions fan-out even in None (auto) mode"
+        );
+    }
+
+    #[test]
+    fn test_codex_not_excluded_when_permissions_is_false() {
+        // When --no-permissions is set, Codex's permissions stays Some(false) — no change.
+        let base_flags = super::super::flags::InitFlags {
+            project: false,
+            yes: false,
+            dry_run: false,
+            uninstall: false,
+            force: false,
+            no_guidance: false,
+            agent: None,
+            wrappers: None,
+            permissions: Some(false),
+            permissions_tier: super::super::flags::PermissionsTier::Seed,
+        };
+        let codex_flags = super::agent_flags_for_auto_detect(AgentKind::CodexCli, &base_flags);
+        assert_eq!(
+            codex_flags.permissions,
+            Some(false),
+            "Codex permissions must remain Some(false) when caller says Some(false)"
+        );
+    }
+
+    // ---- permissions_blocks_fast_path ----
+
+    #[test]
+    fn test_permissions_blocks_fast_path_some_false_never_blocks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let flags = super::super::flags::InitFlags {
+            project: false,
+            yes: false,
+            dry_run: false,
+            uninstall: false,
+            force: false,
+            no_guidance: false,
+            agent: None,
+            wrappers: None,
+            permissions: Some(false),
+            permissions_tier: super::super::flags::PermissionsTier::Seed,
+        };
+        assert!(
+            !super::permissions_blocks_fast_path(&flags, AgentKind::ClaudeCode, tmp.path()),
+            "Some(false) must never block the fast path"
+        );
+    }
+
+    #[test]
+    fn test_permissions_blocks_fast_path_some_true_blocks_when_writer_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let flags = super::super::flags::InitFlags {
+            project: false,
+            yes: false,
+            dry_run: false,
+            uninstall: false,
+            force: false,
+            no_guidance: false,
+            agent: None,
+            wrappers: None,
+            permissions: Some(true),
+            permissions_tier: super::super::flags::PermissionsTier::Seed,
+        };
+        assert!(
+            super::permissions_blocks_fast_path(&flags, AgentKind::ClaudeCode, tmp.path()),
+            "Some(true) must block the fast path when a writer exists"
+        );
+        // Cursor has no writer → must not block even with Some(true).
+        assert!(
+            !super::permissions_blocks_fast_path(&flags, AgentKind::Cursor, tmp.path()),
+            "Some(true) must not block when agent has no writer (Cursor)"
+        );
+    }
+
+    #[test]
+    fn test_permissions_blocks_fast_path_none_no_sidecar_does_not_block() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let flags = super::super::flags::InitFlags {
+            project: false,
+            yes: false,
+            dry_run: false,
+            uninstall: false,
+            force: false,
+            no_guidance: false,
+            agent: None,
+            wrappers: None,
+            permissions: None,
+            permissions_tier: super::super::flags::PermissionsTier::Seed,
+        };
+        // No sidecar → no auto-seed → does not block.
+        assert!(
+            !super::permissions_blocks_fast_path(&flags, AgentKind::ClaudeCode, tmp.path()),
+            "None with no sidecar must not block the fast path"
+        );
     }
 }

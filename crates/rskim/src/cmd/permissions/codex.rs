@@ -1,9 +1,5 @@
 //! Codex CLI permissions writer.
 //!
-// Implementation-complete API consumed by Subtask 7 (init wiring + uninstall).
-// Suppress dead_code until the callers land.
-#![allow(dead_code)]
-//!
 //! Targets `{config_dir}/rules/skim.rules` — a skim-OWNED file containing
 //! Starlark-flavored prefix-rule lines. The entire file is **wholesale-replaced**
 //! on every seed. skim never merges into an existing Codex rules file.

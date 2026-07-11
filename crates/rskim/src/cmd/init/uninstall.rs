@@ -237,6 +237,43 @@ fn run_uninstall_for_agent(
         let _ = crate::cmd::integrity::remove_hash_manifest(&hook_config_dir, agent.cli_name());
     }
 
+    // Remove permissions sidecar and seeded entries (non-fatal).
+    // Copilot CLI permissions live in hook_config_dir; all others in config_dir.
+    let perm_dir: &std::path::Path = if agent == crate::cmd::session::AgentKind::CopilotCli {
+        &hook_config_dir
+    } else {
+        &config_dir
+    };
+    if let Some(permissions_protocol) =
+        crate::cmd::permissions::permissions_protocol_for_agent(agent)
+    {
+        let sidecar_path = perm_dir.join("skim-permissions.json");
+        if sidecar_path.exists() {
+            match permissions_protocol.remove_seeded(perm_dir) {
+                Ok(crate::cmd::permissions::RemoveOutcome::Removed { entries_removed }) => {
+                    println!(
+                        "  {} Permissions: removed {} seeded entr{}",
+                        check_mark(true),
+                        entries_removed.len(),
+                        if entries_removed.len() == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        }
+                    );
+                }
+                Ok(crate::cmd::permissions::RemoveOutcome::NothingToRemove) => {
+                    // No-op: sidecar existed but no matching entries found.
+                }
+                Err(e) => {
+                    // Non-fatal: loud notice but continue uninstall.
+                    eprintln!("  Notice: could not remove seeded permissions (sidecar issue): {e}");
+                    eprintln!("  hint: permissions entries may need to be removed manually");
+                }
+            }
+        }
+    }
+
     // Remove guidance from instruction file
     let global = !flags.project;
     let env = InstructionEnv::from_process();

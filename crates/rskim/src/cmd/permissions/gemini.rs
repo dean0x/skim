@@ -1,9 +1,5 @@
 //! Gemini CLI permissions writer.
 //!
-// Implementation-complete API consumed by Subtask 7 (init wiring + uninstall).
-// Suppress dead_code until the callers land.
-#![allow(dead_code)]
-//!
 //! Targets `{config_dir}/policies/skim.toml` — a skim-OWNED file that is
 //! **wholesale-replaced** on every seed. skim never merges into an existing
 //! Gemini policy file; it regenerates it from the current entry list.

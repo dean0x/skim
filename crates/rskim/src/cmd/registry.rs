@@ -197,17 +197,12 @@ pub(crate) fn is_known_subcommand(name: &str) -> bool {
 ///
 /// INVARIANT: every entry must also be in `KNOWN_SUBCOMMANDS` and in
 /// `wrapper_targets()`. Tests enforce both.
-// Consumed by cmd/permissions (install-time seed derivation). The permissions
-// module's seeded_entries() is suppressed until Subtask 7 wires callers;
-// suppress here too to keep dead_code clean across the wave.
-#[allow(dead_code)]
 pub(crate) static READ_ONLY_SUBCOMMANDS: &[&str] =
     &["df", "diff", "du", "grep", "ls", "rg", "tree", "wc"];
 
 /// Check whether `tool` is a read-only subcommand.
 ///
 /// Uses binary search because [`READ_ONLY_SUBCOMMANDS`] is sorted — O(log n).
-#[allow(dead_code)]
 pub(crate) fn is_read_only(tool: &str) -> bool {
     READ_ONLY_SUBCOMMANDS.binary_search(&tool).is_ok()
 }
