@@ -240,6 +240,9 @@ fn resolve_permissions_consent(
             (entries, perm_dir.join(protocol.config_filename()))
         }
         _ => {
+            if flags.permissions_tier == PermissionsTier::Mirror {
+                println!("  mirror tier is not supported for {agent}; falling back to seed tier");
+            }
             let entries = crate::cmd::permissions::seeded_entries(protocol.as_ref());
             (entries, perm_dir.join(protocol.config_filename()))
         }

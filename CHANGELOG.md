@@ -376,7 +376,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.11.0] - 2026-07-11
 
-Consent-gated permissions seeding for `skim init`; Copilot hook re-homed to `~/.copilot`; `ls -a` fidelity fix. 4,323 tests passing (up from 3,558 in v2.10.0).
+Consent-gated permissions seeding for `skim init`; Copilot hook re-homed to `~/.copilot`; `ls -a` fidelity fix. 4,327 tests passing (up from 3,558 in v2.10.0).
 
 ### Added
 
