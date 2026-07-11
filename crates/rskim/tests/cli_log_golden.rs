@@ -46,14 +46,14 @@ const STABLE_INPUT: &str = include_str!("fixtures/cmd/log/plaintext_mixed.txt");
 /// Captured from `./target/debug/skim log < plaintext_mixed.txt` on 2026-07-11.
 /// Pinned against: rskim-compress::log at wave/l3-wave2 HEAD c6585948.
 const GOLDEN_STABLE: &str = "12 lines \u{2192} 7 unique (3 duplicates removed)\n\
-2 debug lines hidden (skim log --debug-only)\n\
- INFO: server starting on port 8080\n\
- INFO: database connected to localhost:5432\n\
- INFO: request received GET /api/users (\u{00d7}2)\n\
- WARN: slow query detected (1200ms)\n\
- ERROR: connection refused: redis:6379 (\u{00d7}3)\n\
- INFO: request completed 200 OK\n\
- INFO: request completed 500 Internal Server Error";
+2 debug lines hidden (skim log --debug-only)\n \
+INFO: server starting on port 8080\n \
+INFO: database connected to localhost:5432\n \
+INFO: request received GET /api/users (\u{00d7}2)\n \
+WARN: slow query detected (1200ms)\n \
+ERROR: connection refused: redis:6379 (\u{00d7}3)\n \
+INFO: request completed 200 OK\n \
+INFO: request completed 500 Internal Server Error";
 
 /// STABLE golden: must be byte-identical through all #427 passes.
 ///
@@ -106,24 +106,24 @@ const COUNTERFIX_INPUT: &str = include_str!("fixtures/cmd/log/stack_trace_python
 ///
 /// NOTE: This output contains the P1.1 bug (total_lines < unique_messages → 0 duplicates).
 /// It WILL be re-captured in Pass 4 when the header-counting fix lands (#427 P1.1).
-const GOLDEN_COUNTERFIX: &str = "4 lines \u{2192} 5 unique (0 duplicates removed)\n\
- ERROR: Operation failed\n\
+const GOLDEN_COUNTERFIX: &str = "4 lines \u{2192} 5 unique (0 duplicates removed)\n \
+ERROR: Operation failed\n\
 Traceback (most recent call last):\n\
 File \"/app/db.py\", line 45, in query\n\
 cursor.execute(sql)\n\
 File \"/app/db.py\", line 102, in execute\n\
-return self._run(stmt)\n\
- DatabaseError: connection timeout\n\
- The above exception was the direct cause of the following exception:\n\
+return self._run(stmt)\n \
+DatabaseError: connection timeout\n \
+The above exception was the direct cause of the following exception:\n\
 Traceback (most recent call last):\n\
 File \"/app/api.py\", line 30, in handle\n\
 db.query(q)\n\
 File \"/app/api.py\", line 55, in respond\n\
 return handle(req)\n\
 File \"/app/main.py\", line 10, in run\n\
-respond(request)\n\
- ServiceError: failed to process request\n\
- INFO: recovered";
+respond(request)\n \
+ServiceError: failed to process request\n \
+INFO: recovered";
 
 /// COUNTERFIX golden: captures current (buggy) P1.1 output.
 ///
