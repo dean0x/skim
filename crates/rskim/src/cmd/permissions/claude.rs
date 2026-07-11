@@ -30,14 +30,13 @@ use crate::cmd::init::{
     MAX_SETTINGS_SIZE, atomic_write_settings, backup_settings_file, load_or_create_settings,
 };
 use crate::cmd::integrity::compute_file_hash;
-use crate::cmd::permissions::sidecar::{PermissionSidecar, load_sidecar, write_sidecar};
+use crate::cmd::permissions::sidecar::{
+    PermissionSidecar, SIDECAR_FILENAME, load_sidecar, write_sidecar,
+};
 use crate::cmd::permissions::{PermissionsProtocol, PermissionsTier, RemoveOutcome, SeedOutcome};
 
 /// Config file name for Claude Code.
 const CONFIG_FILENAME: &str = "settings.json";
-
-/// Sidecar manifest file name (relative to config_dir).
-const SIDECAR_FILENAME: &str = "skim-permissions.json";
 
 pub(super) struct ClaudePermissions;
 
@@ -157,7 +156,7 @@ impl PermissionsProtocol for ClaudePermissions {
 
         // Remove only entries that are BOTH in the sidecar AND byte-equal present.
         let mut entries_removed: Vec<String> = Vec::new();
-        let seeded: std::collections::HashSet<&String> = sidecar.entries.iter().collect();
+        let seeded: HashSet<&String> = sidecar.entries.iter().collect();
 
         allow_array.retain(|v| {
             let s = v.as_str().unwrap_or("");
@@ -203,8 +202,7 @@ impl PermissionsProtocol for ClaudePermissions {
             None => return false,
         };
 
-        let existing: std::collections::HashSet<&str> =
-            allow.iter().filter_map(|v| v.as_str()).collect();
+        let existing: HashSet<&str> = allow.iter().filter_map(|v| v.as_str()).collect();
 
         entries.iter().all(|e| existing.contains(e.as_str()))
     }

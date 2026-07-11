@@ -44,15 +44,12 @@ use std::path::Path;
 
 use crate::cmd::integrity::compute_file_hash;
 use crate::cmd::permissions::sidecar::{
-    PermissionSidecar, SidecarError, load_sidecar, write_sidecar,
+    PermissionSidecar, SIDECAR_FILENAME, load_sidecar, write_sidecar,
 };
 use crate::cmd::permissions::{PermissionsProtocol, PermissionsTier, RemoveOutcome, SeedOutcome};
 
 /// Config path (relative to config_dir) for the Codex rules file.
 const CONFIG_FILENAME: &str = "rules/skim.rules";
-
-/// Sidecar manifest file name (relative to config_dir).
-const SIDECAR_FILENAME: &str = "skim-permissions.json";
 
 pub(super) struct CodexPermissions;
 
@@ -183,7 +180,6 @@ impl PermissionsProtocol for CodexPermissions {
 
         let sidecar = match load_sidecar(&sidecar_path) {
             Ok(s) => s,
-            Err(SidecarError::NotFound(_)) => return false,
             Err(_) => return false,
         };
 

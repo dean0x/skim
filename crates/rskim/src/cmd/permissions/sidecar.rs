@@ -32,6 +32,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::cmd::init::MAX_SETTINGS_SIZE;
 
+/// Filename of the per-agent sidecar manifest, relative to `config_dir`.
+pub(super) const SIDECAR_FILENAME: &str = "skim-permissions.json";
+
 // ============================================================================
 // Schema
 // ============================================================================

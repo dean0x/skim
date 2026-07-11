@@ -44,15 +44,12 @@ use serde::Serialize;
 
 use crate::cmd::integrity::compute_file_hash;
 use crate::cmd::permissions::sidecar::{
-    PermissionSidecar, SidecarError, load_sidecar, write_sidecar,
+    PermissionSidecar, SIDECAR_FILENAME, load_sidecar, write_sidecar,
 };
 use crate::cmd::permissions::{PermissionsProtocol, PermissionsTier, RemoveOutcome, SeedOutcome};
 
 /// Config path (relative to config_dir) for the Gemini policy file.
 const CONFIG_FILENAME: &str = "policies/skim.toml";
-
-/// Sidecar manifest file name (relative to config_dir).
-const SIDECAR_FILENAME: &str = "skim-permissions.json";
 
 /// Gemini tool matcher used in policy rules.
 const GEMINI_TOOL: &str = "run_shell_command";
@@ -191,7 +188,6 @@ impl PermissionsProtocol for GeminiPermissions {
 
         let sidecar = match load_sidecar(&sidecar_path) {
             Ok(s) => s,
-            Err(SidecarError::NotFound(_)) => return false,
             Err(_) => return false,
         };
 

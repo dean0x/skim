@@ -39,14 +39,13 @@ use std::path::Path;
 
 use crate::cmd::init::{MAX_SETTINGS_SIZE, atomic_write_settings, load_or_create_settings};
 use crate::cmd::integrity::compute_file_hash;
-use crate::cmd::permissions::sidecar::{PermissionSidecar, load_sidecar, write_sidecar};
+use crate::cmd::permissions::sidecar::{
+    PermissionSidecar, SIDECAR_FILENAME, load_sidecar, write_sidecar,
+};
 use crate::cmd::permissions::{PermissionsProtocol, PermissionsTier, RemoveOutcome, SeedOutcome};
 
 /// Config filename (relative to copilot_home).
 const CONFIG_FILENAME: &str = "permissions-config.json";
-
-/// Sidecar filename (relative to copilot_home).
-const SIDECAR_FILENAME: &str = "skim-permissions.json";
 
 pub(super) struct CopilotPermissions;
 
