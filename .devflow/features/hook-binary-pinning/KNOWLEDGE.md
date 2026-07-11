@@ -5,7 +5,7 @@ description: "Use when modifying hook script generation, adding new agents, chan
 category: domain-knowledge
 directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/rewrite, crates/rskim/src/cmd/permissions]
 created: 2026-07-04
-updated: 2026-07-11
+updated: 2026-07-12
 ---
 
 # Agent Hook Install, Binary Pinning & Handshake (+ Permissions Seeding)
@@ -71,13 +71,21 @@ This function in `rewrite/hook.rs` fires only when versions match. It compares (
 
 `PermissionsProtocol` is a format-agnostic trait with four methods: `agent_label`, `render_entry`, `seed`, and `remove_seeded`. Each per-agent writer implements it. The factory `permissions_protocol_for_agent` returns `Some` for ClaudeCode, GeminiCli, CodexCli, and CopilotCli; returns `None` permanently for Cursor (IDE-only, no CLI hook) and Crush (WS2B decision). These two permanent `None` returns are pinned by contract tests.
 
-**Seed derivation**: the seeded tool list is always `READ_ONLY_SUBCOMMANDS ∩ wrapper_targets()` — exactly 8 tools: `df`, `diff`, `du`, `grep`, `ls`, `rg`, `tree`, `wc`. Per-agent render formats: Claude → `"Bash(skim <tool>:*)"`, Gemini → `"skim <tool>"`, Codex → raw tool name, Copilot → Copilot-native format. Entries are sorted before writing so the sidecar and config diff are stable.
+**Seed derivation**: the seeded tool list is always `READ_ONLY_SUBCOMMANDS ∩ wrapper_targets()` — exactly 8 tools: `df`, `diff`, `du`, `grep`, `ls`, `rg`, `tree`, `wc`. Per-agent render formats: Claude → `"Bash(skim <tool>:*)"`, Gemini → `"skim <tool>"`, Codex → raw tool name, Copilot → `"Bash(skim <tool>:*)"` (same as Claude). Entries are sorted before writing so the sidecar and config diff are stable.
 
 **`READ_ONLY_SUBCOMMANDS` invariant**: defined in `cmd/registry.rs`, referenced ONLY from install-time (`cmd/permissions/`). It must never be imported from rewrite/dispatch code paths. This is contract-tested: a `PF-004`-style test verifies the constant is not reachable from dispatch. The 8-tool exact set is pinned by `test_read_only_subcommands_exact_contents`.
 
 **Exclusions-for-cause**: `find` (recursive filesystem walk, path disclosure), `env`/`printenv` (env var enumeration), `dig`/`nslookup` (network DNS), `ps` (process enumeration). `Bash(skim <tool>:*)` entries do NOT bound the wrapped tool's arguments — only arg-safe read-only tools may be seeded.
 
+**Mirror tier does NOT enforce seed-tier exclusions**: `is_valid_mirror_source` in `claude.rs` documents this explicitly. The mirror tier only copies a `Bash(<tool>:*)` entry the user has already granted — it never expands the trust envelope beyond the pre-existing base-tool grant. Enforcing exclusions on the mirror path would silently drop valid user grants with no security benefit.
+
 **`confirm_grant` TTY-gating doctrine**: `confirm_grant()` in `init/helpers.rs` is the primary defense against prompt-injected agent self-grant. Non-TTY stdin → immediate `false` (no output). The `--yes` flag is for hook uninstall confirmation only; it does **not** bypass `confirm_grant`. No test bypass exists by design: consent-yes is unit-tested only (TTY behavior is verified in unit tests, not bypassed). The default-deny choice (empty input → false) is intentional.
+
+**Consent-path hardening in `resolve_permissions_consent`**: `resolve_permissions_consent` in `install.rs` no longer returns a fabricated `Ok(true)` for empty mirror proposals — when `propose_mirrors` returns an empty list it prints "No existing allow-list entries eligible to mirror; nothing to seed." and returns `Ok(false)`, so `confirm_grant` is only ever called when a seed is actually feasible. Additionally, Copilot permissions undergo a cwd git-root pre-check **before** prompting (line `I-25` guard): if `find_git_root_from_cwd()` returns `None`, install prints a notice and returns `Ok(false)` immediately, so `execute_install` never aborts mid-run after hook install with guidance skipped.
+
+**`remove_seeded` ownership contract (documented in trait doc)**: the trait doc in `mod.rs` codifies the ownership split:
+- **Skim-owned writers** (Gemini `policies/skim.toml`, Codex `rules/skim.rules`): if the config file is already gone, the sidecar is also deleted and `NothingToRemove` is returned.
+- **User-owned writers** (Claude `settings.json`, Copilot `permissions-config.json`): if the config file is absent the sidecar is left in place and `NothingToRemove` is returned — the sidecar still records what was seeded and may inform future operations.
 
 **Sidecar manifest semantics**: each agent that receives permissions gets a `skim-permissions.json` sidecar at `{config_dir}/`. The sidecar is **authoritative for claims** (which entries skim wrote, config hash at write time) and **advisory for removal** (removal uses the sidecar to identify entries to remove but verifies byte-equality in the live config). A missing sidecar is `SidecarError::NotFound` — distinguished from `Corrupt` so callers can treat "never written" differently. The sidecar is never silently ignored.
 
@@ -92,6 +100,12 @@ This function in `rewrite/hook.rs` fires only when versions match. It compares (
 **Why `dot_dir_name` stays `.github`**: Copilot settings (`settings.json`, project instructions) live in `~/.github/`, which is the value returned by `dot_dir_name()`. The hook file is a separate artifact that Copilot reads from `~/.copilot/hooks/`. Conflating the two would write hook artifacts into the settings directory, which Copilot does not check.
 
 **`detect_copilot_cli` keys off `~/.copilot`**: `detect_copilot_cli` in `cmd/agents/detection.rs` detects the agent by checking whether `~/.copilot/` exists. Earlier code checked `~/.github/hooks/` — this is a v2.11.0 behavioral change. The hook detection itself checks for `~/.copilot/hooks/skim.json`.
+
+**`write_copilot_skim_json` is atomic**: uses the same tmp-sibling + rename idiom as `atomic_write_settings` and `write_sidecar`: writes to `hooks/skim.json.tmp`, sets mode `0o600` on Unix, then renames. Any pre-existing file is replaced atomically and the tmp is never left behind on a permissions error.
+
+**Copilot hook scan bounds**: `scan_copilot_foreign_hooks` and `copilot_skim_json_has_entry` in `hooks/copilot.rs` both enforce `MAX_HOOK_FILES = 50` (via `.take(MAX_HOOK_FILES)`) and per-file `MAX_SETTINGS_SIZE` guards, matching the `scan_other_hooks` behavior on other agents. The v2.11.0 rewrite had initially dropped these guards; they were restored and regression tests pin both (oversized file tests use sparse-write to avoid allocating 10 MiB in CI).
+
+**Copilot permissions writer keys by git root**: `CopilotPermissions` in `permissions/copilot.rs` writes per-project entries into `permissions-config.json` keyed by the absolute project root (found via `find_git_root_from_cwd()`). Seeding project A cannot clobber project B entries. Full happy-path + per-project-key isolation tests exist in the unit test module.
 
 **Copilot response doctrine (ADR-006 matrix)**: `CopilotCliHook::format_response` returns `{"modifiedArgs": {"command": "<rewritten>"}}` with **no `permissionDecision` field**. Copilot joins Claude Code in the no-verb column: skim only emits a permission verb where the host protocol forces a decision field (Gemini, Crush use `decision:allow`; Cursor uses `permission:allow` — both are protocol-forced). No-rewrite = empty stdout; the `modifiedArgs` object is echoed only when a rewrite actually happened. Requires Copilot CLI >= 1.0.24 (2026-04-10); older CLIs silently ignore `modifiedArgs`.
 
@@ -117,7 +131,7 @@ detect_state()
         └─ false → create_hook_script() → is_hook_script_current() [redundant check, idempotent]
                   → atomic_write_executable() → write_hash_manifest()
                   → patch_settings() → inject_guidance()
-                  → [if --permissions] confirm_grant() → seed()
+                  → [if --permissions] resolve_permissions_consent() → confirm_grant() → seed()
 ```
 
 ## Technical Implementation Patterns
@@ -148,7 +162,7 @@ In `create_hook_script()`: (1) `atomic_write_executable()` then (2) `compute_fil
 
 **Adding `--yes` bypass to `confirm_grant`**: the `--yes` flag is uninstall-only. `confirm_grant` must be called unconditionally whenever permissions are requested. Adding a skip parameter violates the consent-gate design.
 
-**Adding `find`, `env`, `ps`, `dig`, or `nslookup` to `READ_ONLY_SUBCOMMANDS`**: these tools are excluded for cause (path disclosure, env enumeration, network DNS, process enumeration). `Bash(skim <tool>:*)` entries do NOT bound tool arguments — a "read-only" classification alone is insufficient; arg-safety must be reviewed explicitly before seeding.
+**Adding `find`, `env`, `ps`, `dig`, or `nslookup` to `READ_ONLY_SUBCOMMANDS`**: these tools are excluded for cause (path disclosure, env enumeration, network DNS, process enumeration). `Bash(skim <tool>:*)` entries do NOT bound tool arguments — a "read-only" classification alone is insufficient; arg-safety must be reviewed explicitly before seeding. The mirror tier is exempt from this check because it only mirrors pre-existing user grants.
 
 **Adding `SKIM_PASSTHROUGH` to the guidance template**: enforced by `!content.contains("SKIM_PASSTHROUGH")` negative test assert. Agents that learn about it use it as a default bypass, defeating compression.
 
@@ -161,6 +175,10 @@ In `create_hook_script()`: (1) `atomic_write_executable()` then (2) `compute_fil
 **`SKIM_HOOK_COMMIT` has no quotes**: `export SKIM_HOOK_COMMIT={git_commit}` — safe because hex SHAs and `"unknown"` contain no shell-special chars. `generate_hook_script` enforces ascii-alphanumeric only via `assert!`. Future `SKIM_GIT_COMMIT` format changes (e.g., prefix like `commit-`) must widen the predicate first.
 
 **`hook_config_dir` for Copilot env-override installs**: when `COPILOT_CONFIG_DIR` is set, the `hook_config_dir` override is suppressed and the env-supplied path is used verbatim. This means test sandboxing works correctly; production global install correctly redirects to `~/.copilot/`. The `dot_dir_name` stays `.github` for settings, but `detect_copilot_cli` now checks `~/.copilot/` not `~/.github/`.
+
+**Borrow conflict in seed() — use `HashSet<String>`, not `HashSet<&str>`**: in writers whose `seed()` mutates the live allow array (Claude and Copilot), the existing-entries membership set must be `HashSet<String>` — a `HashSet<&str>` borrowed from the allow array conflicts with the subsequent `.push()` (E0502). The `remove_seeded` and `retain` paths (no push during scan) correctly use `HashSet<&str>`. This split is intentional and visible in both `permissions/claude.rs` and `permissions/copilot.rs`.
+
+**`find_git_root_from_cwd` has a duplicate in `install.rs`**: `permissions/copilot.rs` exposes `find_git_root_from(start: &Path)` as a testable inner helper (0..64 bound) with `find_git_root_from_cwd()` as a thin wrapper. `install.rs` has its own inlined copy of `find_git_root_from_cwd` (pre-existing, different caller contract: returns `None` meaning "not a git repo" rather than falling back to cwd). Consolidation is deferred (tracked in backlog territory around issues #440/#443). Do not accidentally call the wrong version across modules.
 
 **`nextest --all-targets` does not build `target/debug/skim`**: the E2E test harness (integration tests in `tests/`) invokes the `skim` binary from `target/debug/skim`. `cargo nextest run -p rskim --all-targets` runs the tests but does NOT build the binary first. Always run `cargo build -p rskim` before running `--all-targets` integration tests.
 
@@ -175,12 +193,14 @@ In `create_hook_script()`: (1) `atomic_write_executable()` then (2) `compute_fil
 - `crates/rskim/src/cmd/init/mod.rs` — `run()` init dispatch, `command()` clap definition, `script_has_pinned_marker()` (single source of truth for the `SKIM_HOOK_BINARY` marker scan)
 - `crates/rskim/src/cmd/init/helpers.rs` — `guidance_content()`, `guidance_content_mdc()`, `atomic_write_settings()`, `load_or_create_settings()`, `confirm_proceed()`, `confirm_grant()` (TTY-gated consent gate), `backup_settings_file()`
 - `crates/rskim/src/cmd/init/flags.rs` — `PermissionsTier`, `InitFlags`, `DetectionEnv`, `detect_installed_agents()`, `resolve_agent()`
+- `crates/rskim/src/cmd/init/install.rs` — `resolve_permissions_consent()` (consent orchestration, Copilot pre-check, mirror empty-proposal guard), `is_hook_script_current()`, `create_hook_script()`, `atomic_write_executable()`, own copy of `find_git_root_from_cwd`
 - `crates/rskim/src/cmd/hooks/mod.rs` — `generate_hook_script()`, `shell_single_quote()`, `HookProtocol` trait (including `hook_config_dir` seam), `HookSupport` enum
-- `crates/rskim/src/cmd/hooks/copilot.rs` — `CopilotCliHook`: `hook_config_dir` redirect to `~/.copilot`, `uses_dedicated_hook_file`, `format_response` (modifiedArgs, no-verb doctrine), `write_copilot_skim_json`
+- `crates/rskim/src/cmd/hooks/copilot.rs` — `CopilotCliHook`: `hook_config_dir` redirect to `~/.copilot`, `uses_dedicated_hook_file`, `format_response` (modifiedArgs, no-verb doctrine), `write_copilot_skim_json` (atomic, 0o600), `scan_copilot_foreign_hooks` and `copilot_skim_json_has_entry` (both bounded by `MAX_HOOK_FILES=50` and `MAX_SETTINGS_SIZE`)
 - `crates/rskim/src/cmd/init/state.rs` — `detect_state()`, `uses_pinned_binary()`, `DetectedState`, `hook_is_current()`
-- `crates/rskim/src/cmd/init/install.rs` — `is_hook_script_current()`, `create_hook_script()`, `atomic_write_executable()`
 - `crates/rskim/src/cmd/rewrite/hook.rs` — `run_hook_mode()`, `check_hook_binary_mismatch()`, `check_hook_version_mismatch()`, `check_hook_integrity()`, `warn_once_daily()`
-- `crates/rskim/src/cmd/permissions/mod.rs` — `PermissionsProtocol` trait, `permissions_protocol_for_agent` factory, `hash_if_bounded`, `seeded_entries`
+- `crates/rskim/src/cmd/permissions/mod.rs` — `PermissionsProtocol` trait (with `remove_seeded` ownership contract in doc), `permissions_protocol_for_agent` factory, `hash_if_bounded`, `seeded_entries`
+- `crates/rskim/src/cmd/permissions/claude.rs` — Claude writer; `propose_mirrors()` and `is_valid_mirror_source()` (mirror tier logic)
+- `crates/rskim/src/cmd/permissions/copilot.rs` — Copilot writer; per-project-key JSON map, `find_git_root_from(start)` injectable helper, `find_git_root_from_cwd()` thin wrapper
 - `crates/rskim/src/cmd/permissions/sidecar.rs` — `PermissionSidecar`, `load_sidecar`, `write_sidecar`, `SidecarError`
 - `crates/rskim/src/cmd/registry.rs` — `READ_ONLY_SUBCOMMANDS` (8-tool seed set, install-time-only invariant), `KNOWN_SUBCOMMANDS`, `wrapper_targets()`
 - `crates/rskim/src/cmd/hooks/codex.rs` — `CodexCliHook` (AwarenessOnly reference implementation)
@@ -191,7 +211,7 @@ In `create_hook_script()`: (1) `atomic_write_executable()` then (2) `compute_fil
 
 - ADR-004 (hook install pins absolute binary path + handshake): mandated the pinned-binary format, daily-rate-limited warn-only signaling, and guidance rollout via version-bump re-pin
 - ADR-005 (guidance framed as calibrated trust): prohibits `SKIM_PASSTHROUGH` in the guidance template; enforced by `!content.contains("SKIM_PASSTHROUGH")` negative assert; `!content.contains("rskim")` is a corollary in the same test
-- ADR-006 (hook responses never self-approve — permissions seeding is consent-gated): defines the per-host response matrix (Claude/Copilot = no-verb; Gemini/Crush/Cursor = protocol-forced allow verb); permissions seeding is a separate, install-time, TTY-gated channel; `--yes` never grants
+- ADR-006 (hook responses never self-approve — permissions seeding is consent-gated): defines the per-host response matrix (Claude/Copilot = no-verb; Gemini/Crush/Cursor = protocol-forced allow verb); permissions seeding is a separate, install-time, TTY-gated channel; `--yes` never grants; `resolve_permissions_consent` enforces the pre-checks that keep the gate robust
 - PF-006 (strip_ansi destroys tabs — gh/diff skip_ansi_strip fix): covers wrapper configs that live outside this KB's directories; relevant because `guidance_content` explains command wrapping behavior those wrappers implement
 - PF-004 (rewrite-engine fidelity): connects to the two-surfaces distinction — rewrite-engine properties do not apply to the wrapper surface
 - Feature: `analytics` — session_id flows from hook JSON via sidecar, not via rewritten command flags
