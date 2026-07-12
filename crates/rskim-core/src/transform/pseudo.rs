@@ -498,7 +498,7 @@ fn collect_noise_ranges(
         strip_python_self_param(node, ctx.source_bytes, ctx.ranges);
     }
 
-    // Handle language-specific multi-node patterns (Rust return types, C++ siblings)
+    // Handle language-specific multi-node patterns (C++ siblings)
     if let Some(result) = handle_language_special_cases(node, ctx) {
         return result;
     }
@@ -546,13 +546,10 @@ fn adjust_type_start(language: Language, kind: &str, source: &[u8], start: usize
 /// Stopping recursion at this point means nested type arguments
 /// (`Promise<User>`, `tuple[int, str]`) survive intact inside the return annotation.
 fn is_return_type_annotation(node: Node, language: Language) -> bool {
-    // Only the two affected node kinds need this guard.
-    let kind = node.kind();
-    match (language, kind) {
-        (Language::Python, "type") | (Language::TypeScript, "type_annotation") => {}
-        _ => return false,
-    }
-    is_return_field_child(node)
+    matches!(
+        (language, node.kind()),
+        (Language::Python, "type") | (Language::TypeScript, "type_annotation")
+    ) && is_return_field_child(node)
 }
 
 /// Returns `true` when `node` is the `return_type` field child of its parent.

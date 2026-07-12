@@ -1272,8 +1272,7 @@ pub(super) use super::guidance::{
 // Dry-run output (B11)
 // ============================================================================
 
-#[allow(clippy::too_many_arguments)] // Inherited 7-arg signature; agent is the
-// structural replacement for agent_from_state.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn print_dry_run_actions(
     state: &DetectedState,
     no_guidance: bool,
@@ -1311,15 +1310,8 @@ pub(super) fn print_dry_run_actions(
             protocol.hook_event_key(),
         );
     }
-    // Show guidance path when applicable.
-    // Note: the `if let` is intentionally written as two nested `if` statements
-    // (rather than collapsed via `&&`) to keep the `no_guidance` guard's intent
-    // explicit and separate from the option unwrap.
-    #[allow(clippy::collapsible_if)]
-    if !no_guidance {
-        if let Some(path) = agent.instruction_file(global, env) {
-            println!("  [dry-run] Would inject guidance into {}", path.display());
-        }
+    if !no_guidance && let Some(path) = agent.instruction_file(global, env) {
+        println!("  [dry-run] Would inject guidance into {}", path.display());
     }
 
     // Enumerate permissions entries without consulting consent.
@@ -1327,57 +1319,55 @@ pub(super) fn print_dry_run_actions(
     // happen.  We show entries whenever permissions are "active" for this run
     // and annotate them with "(consent required at install)" to make clear that
     // a real install would still require an interactive approval.
-    let perm_protocol = crate::cmd::permissions::permissions_protocol_for_agent(agent);
-    #[allow(clippy::collapsible_if)]
-    if permissions != Some(false) {
-        if let Some(protocol) = perm_protocol {
-            // Determine whether permissions are active for this dry-run.
-            let permissions_active = match permissions {
-                Some(false) => false, // explicit opt-out (already guarded above)
-                Some(true) => true,   // explicitly requested
-                None => {
-                    // Auto-mode: active only when the sidecar already exists and
-                    // is stale (same condition as permissions_blocks_fast_path).
-                    let sidecar_path = perm_dir.join("skim-permissions.json");
-                    if sidecar_path.exists() {
-                        let entries = crate::cmd::permissions::seeded_entries(protocol.as_ref());
-                        !protocol.is_current(perm_dir, &entries)
+    if permissions != Some(false)
+        && let Some(protocol) = crate::cmd::permissions::permissions_protocol_for_agent(agent)
+    {
+        // Determine whether permissions are active for this dry-run.
+        let permissions_active = match permissions {
+            Some(false) => false, // explicit opt-out (already guarded above)
+            Some(true) => true,   // explicitly requested
+            None => {
+                // Auto-mode: active only when the sidecar already exists and
+                // is stale (same condition as permissions_blocks_fast_path).
+                let sidecar_path = perm_dir.join("skim-permissions.json");
+                if sidecar_path.exists() {
+                    let entries = crate::cmd::permissions::seeded_entries(protocol.as_ref());
+                    !protocol.is_current(perm_dir, &entries)
+                } else {
+                    false
+                }
+            }
+        };
+        if permissions_active {
+            let entries = match tier {
+                PermissionsTier::Mirror if agent == AgentKind::ClaudeCode => {
+                    let proposals = crate::cmd::permissions::claude::propose_mirrors(perm_dir)
+                        .unwrap_or_default();
+                    if proposals.is_empty() {
+                        // No mirroring candidates: fall back to seed entries.
+                        crate::cmd::permissions::seeded_entries(protocol.as_ref())
                     } else {
-                        false
+                        proposals
+                            .into_iter()
+                            .map(|p| {
+                                if p.is_mutating {
+                                    format!("{} [mutating tool]", p.mirror)
+                                } else {
+                                    p.mirror
+                                }
+                            })
+                            .collect::<Vec<_>>()
                     }
                 }
+                _ => crate::cmd::permissions::seeded_entries(protocol.as_ref()),
             };
-            if permissions_active {
-                let entries = match tier {
-                    PermissionsTier::Mirror if agent == AgentKind::ClaudeCode => {
-                        let proposals = crate::cmd::permissions::claude::propose_mirrors(perm_dir)
-                            .unwrap_or_default();
-                        if proposals.is_empty() {
-                            // No mirroring candidates: fall back to seed entries.
-                            crate::cmd::permissions::seeded_entries(protocol.as_ref())
-                        } else {
-                            proposals
-                                .into_iter()
-                                .map(|p| {
-                                    if p.is_mutating {
-                                        format!("{} [mutating tool]", p.mirror)
-                                    } else {
-                                        p.mirror
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                        }
-                    }
-                    _ => crate::cmd::permissions::seeded_entries(protocol.as_ref()),
-                };
-                let config_file = perm_dir.join(protocol.config_filename());
-                println!(
-                    "  [dry-run] Would seed permissions (consent required at install): {}",
-                    config_file.display()
-                );
-                for entry in &entries {
-                    println!("    {entry}");
-                }
+            let config_file = perm_dir.join(protocol.config_filename());
+            println!(
+                "  [dry-run] Would seed permissions (consent required at install): {}",
+                config_file.display()
+            );
+            for entry in &entries {
+                println!("    {entry}");
             }
         }
     }
