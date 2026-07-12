@@ -311,8 +311,8 @@ pub(crate) fn compress_json(text: &str) -> CompressResult {
             b',' => {
                 if let Some(Frame::Object { state, .. }) = stack.last_mut() {
                     // A comma ends the current value (scalar or container).
-                    // Both ExpectCommaOrEnd (normal path) and ExpectValue (scalar
-                    // ended without an explicit container close) → ExpectKey.
+                    // Both WantCommaOrEnd (normal path) and WantValue (scalar
+                    // ended without an explicit container close) → WantKey.
                     if matches!(*state, ObjState::WantCommaOrEnd | ObjState::WantValue) {
                         *state = ObjState::WantKey;
                     }

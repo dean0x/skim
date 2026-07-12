@@ -57,18 +57,8 @@ pub(crate) fn compress_log_block(text: &str) -> CompressResult {
         ..Default::default()
     };
     match compress_log(text, &flags) {
-        ParseResult::Full(result) => {
-            // Full parse: use the pre-rendered LogResult display string.
-            let content = result.to_string();
-            if content.is_empty() {
-                // AC4 invariant: never emit empty result for a log block.
-                CompressResult::Passthrough
-            } else {
-                CompressResult::Compressed { content }
-            }
-        }
-        ParseResult::Degraded(result, _warnings) => {
-            // Degraded parse: still use the rendered output.
+        // Both tiers emit from the pre-rendered LogResult display string (AC4).
+        ParseResult::Full(result) | ParseResult::Degraded(result, _) => {
             let content = result.to_string();
             if content.is_empty() {
                 CompressResult::Passthrough
@@ -76,10 +66,8 @@ pub(crate) fn compress_log_block(text: &str) -> CompressResult {
                 CompressResult::Compressed { content }
             }
         }
-        ParseResult::Passthrough(_) => {
-            // No structured/regex entries matched — forward byte-identical (AC4 negative).
-            CompressResult::Passthrough
-        }
+        // No structured/regex entries matched — forward byte-identical (AC4 negative).
+        ParseResult::Passthrough(_) => CompressResult::Passthrough,
     }
 }
 
