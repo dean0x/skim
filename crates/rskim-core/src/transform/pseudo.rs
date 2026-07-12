@@ -1,10 +1,15 @@
 //! Pseudo mode transformation — strips syntactic noise while preserving logic flow.
 //!
 //! ARCHITECTURE: Removes type annotations, decorators, semicolons, and other
-//! syntactic noise to produce pseudocode-like output.  Visibility modifiers
-//! (pub/export/access modifiers) are intentionally preserved — they convey API
-//! surface information.  Uses the same collect-ranges-then-remove pattern as
-//! minimal.rs.
+//! syntactic noise to produce pseudocode-like output.  The following are
+//! intentionally preserved as API surface (A4 contract):
+//! - Visibility modifiers (`pub`/`export`/access modifiers)
+//! - Function return type annotations (Python `-> T`, TypeScript `: T` at return
+//!   position, Rust `-> T` via normal recursion since Rust has no strip_kinds for
+//!   return types)
+//!
+//! Parameter, variable, and property type annotations are still stripped.
+//! Uses the same collect-ranges-then-remove pattern as minimal.rs.
 //!
 //! Token reduction target: 30-50%
 
@@ -98,7 +103,12 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
             strip_self_param: false,
         },
         Language::Python => PseudoRules {
-            strip_kinds: &["type", "return_type", "decorator"],
+            // "type" covers parameter/variable annotations (`a: int`).
+            // "return_type" is intentionally absent: it is a field name in the
+            // grammar, not a node kind — it never appeared in real trees.
+            // Return-type annotations are preserved (A4); the guard in
+            // collect_noise_ranges catches them before strip_kinds fires.
+            strip_kinds: &["type", "decorator"],
             strip_keywords: &[],
             strip_semicolons: false,
             strip_self_param: true,
@@ -374,10 +384,6 @@ fn collapse_whitespace(source: &str) -> String {
 fn handle_language_special_cases(node: Node, ctx: &mut NoiseWalkContext<'_>) -> Option<Result<()>> {
     let kind = node.kind();
     match ctx.language {
-        Language::Rust if matches!(kind, "function_item" | "function_signature_item") => {
-            strip_rust_return_type(node, ctx.ranges);
-            None // Continue recursion — function children (params, body) still need processing
-        }
         Language::Cpp if kind == "access_specifier" => {
             // Access specifiers (`public:`, `private:`, `protected:`) are visibility
             // markers that convey API surface.  They are preserved in pseudo mode (A4).
@@ -436,6 +442,14 @@ fn collect_noise_ranges(
 
     // Check if this node kind should be stripped
     if rules.strip_kinds.contains(&kind) {
+        // Return type annotations are API surface — preserved wholesale (A4 contract).
+        // Stopping recursion here means nested type args (Promise<User>, tuple[int, str])
+        // survive intact.  Param/variable/property annotations under other field names
+        // still fall through to be stripped.
+        if is_return_type_annotation(node, ctx.language) {
+            return Ok(());
+        }
+
         let start = node.start_byte();
         let end = node.end_byte();
         let adjusted_start = adjust_type_start(ctx.language, kind, ctx.source_bytes, start);
@@ -501,21 +515,15 @@ fn collect_noise_ranges(
 /// Adjust the start position for type annotations to include their separators.
 ///
 /// Python's "type" node in `typed_parameter` does NOT include the `: ` separator.
-/// Python's "return_type" node does NOT include the ` -> ` separator — the `->` is
-/// a separate anonymous sibling node BEFORE the `return_type` / `type` node. This
-/// extends the removal range backward to include these separators for clean output.
+/// This extends the removal range backward to include the `: ` separator for clean
+/// output.  Return-type annotations are preserved (A4) and never reach this function.
 fn adjust_type_start(language: Language, kind: &str, source: &[u8], start: usize) -> usize {
     match (language, kind) {
-        // NOTE: In Python's tree-sitter grammar, both parameter types (`a: int`)
-        // and return types (`-> int`) use node kind `"type"`. The `"return_type"`
-        // arm is kept for defensive compatibility but does not match in practice
-        // (tree-sitter uses `return_type` as a field name, not a node kind).
-        (Language::Python, "type" | "return_type") => {
-            // Python return type: ` -> int` — consume the ` -> ` separator.
-            // Python parameter type: `a: int` — consume the `: ` separator.
-            // Ordered longest-first for greedy match
-            const SEPARATORS: &[&[u8]] = &[b" -> ", b"-> ", b"->", b": ", b":"];
-            let prefix = source.get(start.saturating_sub(4)..start).unwrap_or(b"");
+        // Python parameter / variable type: `a: int` — consume the `: ` separator.
+        // Return-type annotations (`-> int`) are preserved (A4) and never reach here.
+        (Language::Python, "type") => {
+            const SEPARATORS: &[&[u8]] = &[b": ", b":"];
+            let prefix = source.get(start.saturating_sub(2)..start).unwrap_or(b"");
             for sep in SEPARATORS {
                 if prefix.ends_with(sep) {
                     return start.saturating_sub(sep.len());
@@ -525,6 +533,37 @@ fn adjust_type_start(language: Language, kind: &str, source: &[u8], start: usize
         }
         _ => start,
     }
+}
+
+/// Returns `true` when `node` is a type-annotation node whose parent treats it
+/// as the function's return type via the `return_type` field.
+///
+/// This guards the wholesale preservation of return-type annotations in pseudo mode
+/// (A4 contract).  Only Python `"type"` and TypeScript `"type_annotation"` nodes are
+/// candidates; all other languages either do not use these kinds or already preserve
+/// return types through normal recursion.
+///
+/// Stopping recursion at this point means nested type arguments
+/// (`Promise<User>`, `tuple[int, str]`) survive intact inside the return annotation.
+fn is_return_type_annotation(node: Node, language: Language) -> bool {
+    // Only the two affected node kinds need this guard.
+    let kind = node.kind();
+    match (language, kind) {
+        (Language::Python, "type") | (Language::TypeScript, "type_annotation") => {}
+        _ => return false,
+    }
+    is_return_field_child(node)
+}
+
+/// Returns `true` when `node` is the `return_type` field child of its parent.
+fn is_return_field_child(node: Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let Some(return_type_node) = parent.child_by_field_name("return_type") else {
+        return false;
+    };
+    return_type_node.id() == node.id()
 }
 
 /// Strip `self` or `cls` first parameter from Python method definitions
@@ -588,38 +627,6 @@ fn extend_past_trailing_comma(
     end
 }
 
-/// Strip Rust return type from function signatures.
-///
-/// In Rust's tree-sitter grammar, `-> Type` is NOT wrapped in a `return_type` node.
-/// Instead, `->` and the type are sibling children of `function_item`. This function
-/// finds the `->` child and removes from its start through the end of the next sibling
-/// (the type node), including the leading space.
-fn strip_rust_return_type(function_node: Node, ranges: &mut Vec<(usize, usize)>) {
-    let mut cursor = function_node.walk();
-    let children: Vec<_> = function_node.children(&mut cursor).collect();
-
-    for (i, child) in children.iter().enumerate() {
-        if child.kind() == "->" {
-            // Find the type node that follows (next named sibling)
-            let end = if let Some(type_node) = children.get(i + 1) {
-                // The type node immediately follows `->`
-                if type_node.kind() != "block" {
-                    type_node.end_byte()
-                } else {
-                    child.end_byte()
-                }
-            } else {
-                child.end_byte()
-            };
-
-            // Include the leading space before `->`
-            let start = child.start_byte().saturating_sub(1);
-
-            ranges.push((start, end));
-            return;
-        }
-    }
-}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in tests
@@ -640,16 +647,19 @@ mod tests {
 
     #[test]
     fn test_typescript_pseudo_strips_type_annotations() {
+        // Param type annotations are stripped; RETURN type annotation is preserved
+        // as API surface (A4 contract — pseudo mode preserves return types).
         let source = "function add(a: number, b: number): number {\n    return a + b;\n}\n";
         let result = transform(source, Language::TypeScript);
-        // Type annotations and semicolons should be stripped
-        assert!(
-            !result.contains(": number"),
-            "type annotations should be stripped"
-        );
+        // Parameter type annotations should be stripped
         assert!(
             result.contains("function add(a, b)"),
-            "function name and params preserved"
+            "function name and params preserved without param types, got: {result}"
+        );
+        // Return type annotation is preserved as API surface
+        assert!(
+            result.contains("): number"),
+            "return type annotation must be preserved as API surface, got: {result}"
         );
         assert!(result.contains("return a + b"), "logic preserved");
     }
@@ -722,17 +732,24 @@ mod tests {
 
     #[test]
     fn test_python_pseudo_strips_type_hints() {
+        // Param type annotations are stripped; RETURN type annotation is preserved
+        // as API surface (A4 contract — pseudo mode preserves return types).
         let source =
             "def calculate_sum(a: int, b: int) -> int:\n    result = a + b\n    return result\n";
         let result = transform(source, Language::Python);
+        // Parameter type annotations should be stripped
         assert!(
             !result.contains(": int"),
-            "type annotations should be stripped"
+            "param type annotations should be stripped, got: {result}"
         );
-        assert!(!result.contains("-> int"), "return type should be stripped");
+        // Return type annotation is preserved as API surface
+        assert!(
+            result.contains("-> int"),
+            "return type must be preserved as API surface, got: {result}"
+        );
         assert!(
             result.contains("def calculate_sum(a, b)"),
-            "function signature preserved"
+            "function signature preserved without param types, got: {result}"
         );
         assert!(result.contains("return result"), "logic preserved");
     }
@@ -812,12 +829,13 @@ mod tests {
     }
 
     #[test]
-    fn test_rust_pseudo_strips_return_type() {
+    fn test_rust_pseudo_preserves_return_type() {
+        // Return type is preserved as API surface (A4 contract).
         let source = "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
         let result = transform(source, Language::Rust);
         assert!(
-            !result.contains("-> i32"),
-            "return type should be stripped, got: {result}"
+            result.contains("-> i32"),
+            "return type must be preserved as API surface, got: {result}"
         );
         assert!(result.contains("fn add"), "function preserved");
     }
@@ -1037,16 +1055,24 @@ mod tests {
 
     #[test]
     fn test_python_pseudo_no_arrow_residue() {
-        // BUG 1: Python return type stripping left `-> ` residue
+        // Return type is now preserved as API surface (A4 contract); the full
+        // `-> int` annotation must survive intact without residue or duplication.
         let source = "def calculate_sum(a: int, b: int) -> int:\n    return a + b\n";
         let result = transform(source, Language::Python);
+        // Return type preserved: must contain `-> int:`
         assert!(
-            !result.contains("->"),
-            "return type arrow should be fully stripped, got: {result}"
+            result.contains("-> int:"),
+            "return type must be preserved intact, got: {result}"
         );
+        // Param types stripped: no `: int` in param list
         assert!(
-            result.contains("def calculate_sum(a, b):"),
-            "function signature should be clean, got: {result}"
+            result.contains("def calculate_sum(a, b)"),
+            "function signature clean (param types stripped), got: {result}"
+        );
+        // No double-arrow residue
+        assert!(
+            !result.contains("->  int") && !result.contains("-> -> "),
+            "no arrow residue or duplication, got: {result}"
         );
     }
 
@@ -1087,13 +1113,14 @@ mod tests {
     }
 
     #[test]
-    fn test_rust_pseudo_trait_return_type() {
-        // BUG 4: Rust trait method return types were not stripped
+    fn test_rust_pseudo_trait_preserves_return_type() {
+        // Return type is preserved as API surface (A4 contract); the trailing
+        // `;` on trait method signatures is still stripped.
         let source = "pub trait Compute {\n    fn compute(&self, value: i32) -> i32;\n    fn reset(&mut self);\n}\n";
         let result = transform(source, Language::Rust);
         assert!(
-            !result.contains("-> i32"),
-            "trait method return type should be stripped, got: {result}"
+            result.contains("-> i32"),
+            "trait method return type must be preserved as API surface, got: {result}"
         );
         assert!(
             result.contains("fn compute"),
@@ -1103,7 +1130,8 @@ mod tests {
 
     #[test]
     fn test_rust_pseudo_lifetime_no_space() {
-        // BUG 6: Stripping lifetime from `&'a str` left `& str` (extra space)
+        // BUG 6: Stripping lifetime from `&'a str` left `& str` (extra space).
+        // Return type is preserved (A4), with lifetime stripped inside it: `-> &str`.
         let source = "pub fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {\n    if x.len() > y.len() { x } else { y }\n}\n";
         let result = transform(source, Language::Rust);
         assert!(
@@ -1113,6 +1141,11 @@ mod tests {
         assert!(
             result.contains("&str"),
             "reference types should be clean, got: {result}"
+        );
+        // Return type preserved with lifetime stripped: -> &str (not -> &'a str)
+        assert!(
+            result.contains("-> &str"),
+            "return type must be preserved with lifetime stripped, got: {result}"
         );
     }
 
@@ -1175,20 +1208,26 @@ mod tests {
 
     #[test]
     fn test_python_pseudo_multiple_return_types() {
-        // Ensure multiple functions with return types all get clean output
+        // Return types preserved (A4); param types stripped.
         let source = "def foo(x: int) -> str:\n    return str(x)\n\ndef bar(y: str) -> int:\n    return int(y)\n";
         let result = transform(source, Language::Python);
+        // Return types must be preserved
         assert!(
-            !result.contains("->"),
-            "all return type arrows should be stripped, got: {result}"
+            result.contains("-> str"),
+            "first function return type must be preserved, got: {result}"
         );
         assert!(
-            result.contains("def foo(x):"),
-            "first function clean, got: {result}"
+            result.contains("-> int"),
+            "second function return type must be preserved, got: {result}"
+        );
+        // Param types stripped (the `x:` and `y:` annotations gone)
+        assert!(
+            result.contains("def foo(x)"),
+            "first function param type stripped, got: {result}"
         );
         assert!(
-            result.contains("def bar(y):"),
-            "second function clean, got: {result}"
+            result.contains("def bar(y)"),
+            "second function param type stripped, got: {result}"
         );
     }
 
@@ -1293,9 +1332,10 @@ mod tests {
 
     #[test]
     fn test_rust_special_case_continues_recursion_into_body() {
-        // Rust function_item returns None (continue recursion), so children like
+        // Rust function body children are still reachable via normal recursion.
         // mutable_specifier inside params should still be stripped.
-        // visibility_modifier (pub) is now PRESERVED as API surface (A4 contract).
+        // visibility_modifier (pub) is PRESERVED as API surface (A4 contract).
+        // Return type is PRESERVED as API surface (A4 contract).
         let source =
             "pub fn update(&mut self, value: i32) -> bool {\n    self.val = value;\n    true\n}\n";
         let result = transform(source, Language::Rust);
@@ -1308,8 +1348,8 @@ mod tests {
             "mut should be stripped via child recursion, got: {result}"
         );
         assert!(
-            !result.contains("-> bool"),
-            "return type should be stripped by special case, got: {result}"
+            result.contains("-> bool"),
+            "return type must be preserved as API surface (A4), got: {result}"
         );
         assert!(
             result.contains("self.val = value"),
@@ -1427,6 +1467,123 @@ mod tests {
         assert_eq!(
             result, "  function add()\n",
             "two leading spaces treated as indentation"
+        );
+    }
+
+    // ========================================================================
+    // Return-type preservation tests (A4 contract, Fix 2)
+    // ========================================================================
+
+    /// Rust: generic return types are preserved verbatim (including type args).
+    /// Note: Rust pseudo preserves parameter types too (no strip_kinds for them).
+    #[test]
+    fn test_rust_pseudo_preserves_generic_return() {
+        let source = "pub fn read_lines(path: &str) -> Result<Vec<String>, io::Error> {\n    todo!()\n}\n";
+        let result = transform(source, Language::Rust);
+        assert!(
+            result.contains("-> Result<Vec<String>, io::Error>"),
+            "generic return type must be preserved intact, got: {result}"
+        );
+        assert!(
+            result.contains("fn read_lines"),
+            "function name preserved, got: {result}"
+        );
+    }
+
+    /// Rust: impl-trait return type is preserved.
+    #[test]
+    fn test_rust_pseudo_preserves_impl_trait_return() {
+        let source = "pub fn make_iter() -> impl Iterator<Item = u32> {\n    [1, 2, 3].iter().copied()\n}\n";
+        let result = transform(source, Language::Rust);
+        assert!(
+            result.contains("-> impl Iterator<Item = u32>"),
+            "impl-trait return type must be preserved, got: {result}"
+        );
+    }
+
+    /// Python: async function with `-> None` return type is preserved.
+    #[test]
+    fn test_python_pseudo_preserves_async_return_none() {
+        let source = "async def shutdown(self) -> None:\n    await self.close()\n";
+        let result = transform(source, Language::Python);
+        assert!(
+            result.contains("-> None"),
+            "async function return type must be preserved, got: {result}"
+        );
+        // async keyword preserved (calling semantics)
+        assert!(
+            result.contains("async def"),
+            "async keyword preserved, got: {result}"
+        );
+    }
+
+    /// Python: nested return type (tuple) is preserved wholesale.
+    #[test]
+    fn test_python_pseudo_preserves_tuple_return() {
+        let source = "def split(s: str) -> tuple[int, str]:\n    return 0, s\n";
+        let result = transform(source, Language::Python);
+        assert!(
+            result.contains("-> tuple[int, str]"),
+            "nested tuple return type must be preserved wholesale, got: {result}"
+        );
+        // Param type stripped
+        assert!(
+            result.contains("def split(s)"),
+            "param type annotation stripped, got: {result}"
+        );
+    }
+
+    /// Python: default-param function with return type.
+    #[test]
+    fn test_python_pseudo_preserves_return_with_default_param() {
+        let source = "def add(x, y = 5) -> int:\n    return x + y\n";
+        let result = transform(source, Language::Python);
+        assert!(
+            result.contains("-> int"),
+            "return type must be preserved even when params have defaults, got: {result}"
+        );
+    }
+
+    /// TypeScript: arrow function with return type preserved.
+    #[test]
+    fn test_typescript_pseudo_preserves_arrow_return() {
+        let source = "const getUser = async (id: number): Promise<User> => {\n    return fetch(id);\n};\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            result.contains("): Promise<User>"),
+            "arrow function return type must be preserved, got: {result}"
+        );
+        // Param type stripped
+        assert!(
+            !result.contains("id: number"),
+            "param type annotation must be stripped, got: {result}"
+        );
+    }
+
+    /// TypeScript: interface method return type preserved; param type stripped.
+    #[test]
+    fn test_typescript_pseudo_interface_method_return_preserved() {
+        let source = "interface Repo {\n    find(id: number): User;\n}\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            result.contains("): User"),
+            "interface method return type must be preserved, got: {result}"
+        );
+        // Param type stripped
+        assert!(
+            !result.contains("id: number"),
+            "param type must be stripped in interface method, got: {result}"
+        );
+    }
+
+    /// TypeScript: optional param with return type — param type stripped, return preserved.
+    #[test]
+    fn test_typescript_pseudo_optional_param_return_preserved() {
+        let source = "function opt(a?: string): string {\n    return a ?? '';\n}\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            result.contains("): string"),
+            "return type must be preserved for optional-param function, got: {result}"
         );
     }
 }

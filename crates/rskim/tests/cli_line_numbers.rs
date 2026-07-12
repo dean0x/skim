@@ -955,13 +955,14 @@ fn test_line_numbers_pseudo_mode_gaps() {
 #[test]
 fn test_line_numbers_pseudo_python_def_signatures_get_prefix() {
     // Four-line file: def lines are on source lines 1 and 3.
-    // Pseudo mode strips type annotations so the output `def` lines differ from
-    // source. Before the fix, source_line=0 suppressed their prefix.
+    // Pseudo mode strips param type annotations but preserves return types (A4 contract),
+    // so `def foo(a: int) -> str:` → `def foo(a) -> str:` (param stripped, return kept).
+    // Before the original fix, source_line=0 suppressed their prefix.
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("test.py");
-    // Line 1: def foo(a: int) -> str:   (annotations stripped → `def foo(a):`)
+    // Line 1: def foo(a: int) -> str:   (param stripped → `def foo(a) -> str:`)
     // Line 2:     return str(a)
-    // Line 3: def bar(b: str) -> int:   (annotations stripped → `def bar(b):`)
+    // Line 3: def bar(b: str) -> int:   (param stripped → `def bar(b) -> int:`)
     // Line 4:     return len(b)
     std::fs::write(
         &file,
@@ -988,7 +989,8 @@ fn test_line_numbers_pseudo_python_def_signatures_get_prefix() {
 
     let lines: Vec<&str> = stdout.lines().collect();
 
-    // Find the def lines in the output (pseudo output strips type annotations).
+    // Find the def lines in the output (pseudo output strips param type annotations,
+    // preserves return types — so the line contains `def foo(a)` as a substring).
     let foo_line = lines
         .iter()
         .find(|&&l| l.contains("def foo(a)"))
@@ -1005,15 +1007,15 @@ fn test_line_numbers_pseudo_python_def_signatures_get_prefix() {
 
     assert_eq!(
         foo_annotated,
-        Some((1, "def foo(a):".to_owned())),
-        "`def foo(a):` must carry source line 1 prefix. \
+        Some((1, "def foo(a) -> str:".to_owned())),
+        "`def foo(a) -> str:` must carry source line 1 prefix. \
          Before fix it had no prefix (source_line=0). Got: {:?}",
         foo_line
     );
     assert_eq!(
         bar_annotated,
-        Some((3, "def bar(b):".to_owned())),
-        "`def bar(b):` must carry source line 3 prefix. \
+        Some((3, "def bar(b) -> int:".to_owned())),
+        "`def bar(b) -> int:` must carry source line 3 prefix. \
          Before fix it had no prefix (source_line=0). Got: {:?}",
         bar_line
     );
