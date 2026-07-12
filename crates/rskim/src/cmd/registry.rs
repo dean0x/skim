@@ -182,6 +182,32 @@ pub(crate) fn is_known_subcommand(name: &str) -> bool {
     KNOWN_SUBCOMMANDS.binary_search(&name).is_ok()
 }
 
+/// Read-only tool wrappers: subcommands that only inspect the filesystem or
+/// process state and never modify it.
+///
+/// Used at install time to annotate wrappers with their permission tier.
+/// INVARIANT: this registry is install-time-only — it must NOT be referenced
+/// from any rewrite/dispatch code path. (Enforced by
+/// `contract_read_only_subcommands_absent_from_rewrite_dispatch`.) A deliberate
+/// future addition must be accompanied by a test edit
+/// so drift is never silent.
+///
+/// INVARIANT: must remain in ascending lexicographic order so that
+/// `is_read_only` can use `binary_search`.
+/// The `test_read_only_subcommands_are_sorted` test enforces this.
+///
+/// INVARIANT: every entry must also be in `KNOWN_SUBCOMMANDS` and in
+/// `wrapper_targets()`. Tests enforce both.
+pub(crate) static READ_ONLY_SUBCOMMANDS: &[&str] =
+    &["df", "diff", "du", "grep", "ls", "rg", "tree", "wc"];
+
+/// Check whether `tool` is a read-only subcommand.
+///
+/// Uses binary search because [`READ_ONLY_SUBCOMMANDS`] is sorted — O(log n).
+pub(crate) fn is_read_only(tool: &str) -> bool {
+    READ_ONLY_SUBCOMMANDS.binary_search(&tool).is_ok()
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -284,5 +310,85 @@ mod tests {
             "KNOWN_SUBCOMMANDS is not sorted — binary_search in is_known_subcommand() requires \
              the array to be in ascending lexicographic order"
         );
+    }
+
+    // ========================================================================
+    // READ_ONLY_SUBCOMMANDS tests
+    // ========================================================================
+
+    /// READ_ONLY_SUBCOMMANDS must remain sorted so that `is_read_only` can use
+    /// binary search instead of a linear scan.
+    #[test]
+    fn test_read_only_subcommands_are_sorted() {
+        let mut sorted = READ_ONLY_SUBCOMMANDS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            READ_ONLY_SUBCOMMANDS,
+            sorted.as_slice(),
+            "READ_ONLY_SUBCOMMANDS is not sorted — binary_search in is_read_only() requires \
+             the array to be in ascending lexicographic order"
+        );
+    }
+
+    /// Every entry in READ_ONLY_SUBCOMMANDS must be in KNOWN_SUBCOMMANDS.
+    #[test]
+    fn test_read_only_subcommands_are_in_known_subcommands() {
+        for &name in READ_ONLY_SUBCOMMANDS {
+            assert!(
+                is_known_subcommand(name),
+                "READ_ONLY_SUBCOMMANDS entry '{name}' is not in KNOWN_SUBCOMMANDS — \
+                 every read-only entry must also be a known subcommand"
+            );
+        }
+    }
+
+    /// READ_ONLY_SUBCOMMANDS must be a subset of wrapper_targets(): read-only
+    /// tools must be real external-tool wrappers, not meta/management commands.
+    #[test]
+    fn test_read_only_subcommands_are_subset_of_wrapper_targets() {
+        let targets = wrapper_targets();
+        for &name in READ_ONLY_SUBCOMMANDS {
+            assert!(
+                targets.contains(&name),
+                "READ_ONLY_SUBCOMMANDS entry '{name}' is not in wrapper_targets() — \
+                 all read-only subcommands must be external-tool wrappers"
+            );
+        }
+    }
+
+    /// Pin test: READ_ONLY_SUBCOMMANDS must equal exactly these 8 tools.
+    ///
+    /// Any future addition must be accompanied by a deliberate test edit,
+    /// preventing silent formula drift.
+    #[test]
+    fn test_read_only_subcommands_exact_contents() {
+        assert_eq!(
+            READ_ONLY_SUBCOMMANDS,
+            &["df", "diff", "du", "grep", "ls", "rg", "tree", "wc"],
+            "READ_ONLY_SUBCOMMANDS must equal exactly the declared 8-tool set; \
+             update this test intentionally if adding a new read-only tool"
+        );
+    }
+
+    /// is_read_only returns true for each declared entry.
+    #[test]
+    fn test_is_read_only_true_for_declared_entries() {
+        for &name in READ_ONLY_SUBCOMMANDS {
+            assert!(
+                is_read_only(name),
+                "is_read_only('{name}') returned false — must return true for every declared entry"
+            );
+        }
+    }
+
+    /// is_read_only returns false for write-capable tools and meta subcommands.
+    #[test]
+    fn test_is_read_only_false_for_write_tools() {
+        for &name in &["git", "cargo", "npm", "init", "rewrite", "psql", "docker"] {
+            assert!(
+                !is_read_only(name),
+                "is_read_only('{name}') returned true — write-capable tools must return false"
+            );
+        }
     }
 }

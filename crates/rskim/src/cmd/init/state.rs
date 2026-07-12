@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use super::flags::InitFlags;
-use super::helpers::{HOOK_SCRIPT_NAME, resolve_config_dir_for_agent};
+use super::flags::{DetectionEnv, InitFlags};
+use super::helpers::HOOK_SCRIPT_NAME;
 use crate::cmd::hooks::{HookProtocol, protocol_for_agent};
 
 /// Maximum settings.json size we'll read (10 MB). Anything larger is almost
@@ -14,6 +14,11 @@ pub(super) struct DetectedState {
     pub(super) skim_binary: PathBuf,
     pub(super) skim_version: String,
     pub(super) config_dir: PathBuf,
+    /// Where hook artifacts (script, SHA sidecar, hook registration) live.
+    ///
+    /// Equals `config_dir` for all agents except Copilot CLI, which routes hook
+    /// artifacts to `~/.copilot/` via `HookProtocol::hook_config_dir`.
+    pub(super) hook_config_dir: PathBuf,
     pub(super) settings_path: PathBuf,
     pub(super) settings_exists: bool,
     pub(super) hook_installed: bool,
@@ -39,51 +44,74 @@ impl DetectedState {
 pub(super) fn detect_state(
     flags: &InitFlags,
     agent: crate::cmd::session::AgentKind,
+    env: &DetectionEnv,
 ) -> anyhow::Result<DetectedState> {
     let skim_binary = std::env::current_exe()?;
     let skim_version = env!("CARGO_PKG_VERSION").to_string();
-    let config_dir = resolve_config_dir_for_agent(flags.project, agent)?;
+    let config_dir = env.resolve(agent, flags.project)?;
     let protocol = protocol_for_agent(agent);
+
+    // Compute the hook artifact directory via the protocol seam.
+    // For all agents except Copilot CLI this equals config_dir (passthrough).
+    // For Copilot CLI it redirects to ~/.copilot (or $COPILOT_CONFIG_DIR).
+    let hook_config_dir = protocol.hook_config_dir(
+        &config_dir,
+        flags.project,
+        env.override_for(agent).is_some(),
+    );
+
     let settings_path = config_dir.join(protocol.config_filename());
     let settings_exists = settings_path.exists();
 
     // Read the hook script once so both version extraction and bare-command detection
     // can reuse the same contents rather than making two separate fs::read_to_string calls.
     let hook_script_contents =
-        std::fs::read_to_string(config_dir.join("hooks").join(HOOK_SCRIPT_NAME)).ok();
+        std::fs::read_to_string(hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME)).ok();
 
     let mut hook_installed = false;
     let mut hook_version = None;
+    let existing_hooks;
 
-    let parsed_settings = read_settings_json(&settings_path);
-    if let Some(ref json) = parsed_settings
-        && let Some(arr) = json
-            .get("hooks")
-            .and_then(|h| h.get(protocol.hook_event_key()))
-            .and_then(|v| v.as_array())
-    {
-        for entry in arr {
-            if protocol.is_skim_entry(entry) {
-                hook_installed = true;
-                hook_version = extract_hook_version_from_entry(
-                    entry,
-                    &config_dir,
-                    hook_script_contents.as_deref(),
-                );
+    if protocol.uses_dedicated_hook_file() {
+        // Copilot-style: detect from hooks/skim.json, not settings.json.
+        hook_installed = protocol.detect_hook_registration(&hook_config_dir);
+        if hook_installed {
+            // Version always comes from the script file (same for all agents).
+            hook_version = hook_script_contents
+                .as_deref()
+                .and_then(parse_version_from_script);
+        }
+        existing_hooks = protocol.scan_foreign_hooks(&hook_config_dir);
+    } else {
+        // settings.json-style: existing detection code (behaviorally unchanged).
+        let parsed_settings = read_settings_json(&settings_path);
+        if let Some(ref json) = parsed_settings
+            && let Some(arr) = json
+                .get("hooks")
+                .and_then(|h| h.get(protocol.hook_event_key()))
+                .and_then(|v| v.as_array())
+        {
+            for entry in arr {
+                if protocol.is_skim_entry(entry) {
+                    hook_installed = true;
+                    hook_version = extract_hook_version_from_entry(
+                        entry,
+                        &hook_config_dir,
+                        hook_script_contents.as_deref(),
+                    );
+                }
             }
         }
+        existing_hooks = scan_existing_hooks(
+            parsed_settings.as_ref(),
+            protocol.hook_event_key(),
+            protocol.tool_matcher(),
+            protocol.as_ref(),
+        );
     }
 
-    // Scan for existing non-skim hooks (plugin collision detection)
-    let existing_hooks = scan_existing_hooks(
-        parsed_settings.as_ref(),
-        protocol.hook_event_key(),
-        protocol.tool_matcher(),
-        protocol.as_ref(),
-    );
-
     // Dual-scope check (B5)
-    let dual_scope_warning = check_dual_scope(flags, agent)?;
+    let dual_scope_warning = check_dual_scope(flags, agent, env)?;
 
     // Reuse the already-read hook script contents for pinned-binary detection.
     let hook_uses_pinned_binary = hook_script_contents
@@ -95,6 +123,7 @@ pub(super) fn detect_state(
         skim_binary,
         skim_version,
         config_dir,
+        hook_config_dir,
         settings_path,
         settings_exists,
         hook_installed,
@@ -188,16 +217,31 @@ fn scan_existing_hooks(
     other_hooks
 }
 
+/// Check whether a skim hook is installed in the opposite scope (global vs project)
+/// and return a warning string if so.
+///
+/// # Copilot CLI
+///
+/// This function reads `<config_dir>/settings.json` for the hook event key, which is
+/// the Claude Code / Gemini / Cursor format. For Copilot CLI, `config_dir` resolves
+/// to `~/.github/` and the event key is `preToolUse`. Since skim v2.11.0, Copilot
+/// hook registration is written to `~/.copilot/hooks/skim.json` (not to
+/// `~/.github/settings.json`), so this function **never fires for Copilot CLI** —
+/// `has_hook` will always be `false` because the settings file skim no longer writes.
+/// This is intentionally conservative: the warning is suppressed rather than
+/// producing a false positive. A Copilot-aware dual-scope check can be added if
+/// needed in a future subtask.
 pub(super) fn check_dual_scope(
     flags: &InitFlags,
     agent: crate::cmd::session::AgentKind,
+    env: &DetectionEnv,
 ) -> anyhow::Result<Option<String>> {
     let other_dir = if flags.project {
         // Installing project-level, check global
-        resolve_config_dir_for_agent(false, agent)?
+        env.resolve(agent, false)?
     } else {
         // Installing global, check project
-        match resolve_config_dir_for_agent(true, agent) {
+        match env.resolve(agent, true) {
             Ok(dir) => dir,
             Err(_) => return Ok(None),
         }
@@ -513,7 +557,15 @@ mod tests {
 
     #[test]
     fn test_scan_existing_hooks_copilot_format() {
-        // Copilot CLI format: non-skim entry uses top-level "bash" field
+        // Copilot CLI format: non-skim entry uses top-level "bash" field.
+        //
+        // NOTE: the `/home/.github/hooks/skim-rewrite.sh` path is INTENTIONAL.
+        // `scan_existing_hooks` is called from the settings.json path in `detect_state`,
+        // which is only reached for agents that do NOT use a dedicated hook file. For
+        // Copilot CLI (which uses `hooks/skim.json`), this code path is bypassed.
+        // The `~/.github` literal here preserves the migration-window recognition behavior:
+        // `is_skim_entry` must continue to recognise legacy entries written to settings.json
+        // by older skim versions, so that `migrate_copilot_legacy` can surgically remove them.
         let settings = serde_json::json!({
             "hooks": {
                 "preToolUse": [
@@ -536,7 +588,10 @@ mod tests {
 
     #[test]
     fn test_scan_existing_hooks_copilot_skim_entry_excluded() {
-        // Copilot skim entry should be excluded from collision results
+        // Copilot skim entry should be excluded from collision results.
+        //
+        // NOTE: `~/.github/hooks/skim-rewrite.sh` path is INTENTIONAL — same
+        // migration-window rationale as `test_scan_existing_hooks_copilot_format` above.
         let settings = serde_json::json!({
             "hooks": {
                 "preToolUse": [{

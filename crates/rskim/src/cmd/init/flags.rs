@@ -2,6 +2,43 @@
 
 use crate::cmd::session::AgentKind;
 
+/// Which scope of tool permissions to seed during `skim init --permissions`.
+///
+/// The tier controls which (and how many) allowlist entries are written to the
+/// agent's permission config file. Tier dispatch is performed by `install.rs`;
+/// this enum is defined here because it appears in `InitFlags` which must
+/// stay `Copy`.
+///
+/// Default is `Seed` — the narrowest, safest tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PermissionsTier {
+    /// Narrowest set: only the 8 read-only tools that skim wraps.
+    /// These are arg-safe — `Bash(skim <tool>:*)` entries do NOT bound wrapped
+    /// tool arguments, so only genuinely read-only tools are included.
+    #[default]
+    Seed,
+    /// Mirror the agent's existing allow-list entries (Claude-scoped; see propose_mirrors).
+    Mirror,
+    /// Blanket grant (requires a second hazard confirmation; refused for Codex).
+    Blanket,
+}
+
+impl PermissionsTier {
+    /// Parse from the `--permissions-tier` CLI value.
+    pub(super) fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "seed" => Ok(PermissionsTier::Seed),
+            "mirror" => Ok(PermissionsTier::Mirror),
+            "blanket" => Ok(PermissionsTier::Blanket),
+            other => anyhow::bail!(
+                "invalid --permissions-tier value: '{}'\n\
+                 Valid values: seed, mirror, blanket",
+                other
+            ),
+        }
+    }
+}
+
 /// Parsed command-line flags for the init subcommand.
 ///
 /// All fields are `Copy`-friendly primitive types so that the multi-agent
@@ -28,6 +65,21 @@ pub(super) struct InitFlags {
     /// `Some(false)` — `--no-wrappers` flag: skip wrappers.
     /// `None` — neither flag: prompt interactively (or default to false in non-TTY).
     pub(super) wrappers: Option<bool>,
+    /// Whether to seed agent-native allow-list entries for skim's read-only tools.
+    ///
+    /// `Some(true)` — `--permissions` flag: seed entries.
+    /// `Some(false)` — `--no-permissions` flag: skip seeding.
+    /// `None` — neither flag: follow default (no seeding unless explicitly requested).
+    ///
+    /// CONSTRAINT: mutually exclusive with `--project` — permissions seeding is
+    /// user-scope only. Project settings are repository-controlled and must not
+    /// receive auto-generated allowlist entries.
+    pub(super) permissions: Option<bool>,
+    /// Which tier of permissions to seed when `permissions == Some(true)`.
+    ///
+    /// Default: `PermissionsTier::Seed` (narrowest — only the 8 read-only tools).
+    /// Set via `--permissions-tier seed|mirror|blanket`.
+    pub(super) permissions_tier: PermissionsTier,
 }
 
 /// Resolve a single explicit agent from flags, or `None` for auto-detect mode.
@@ -38,7 +90,8 @@ pub(super) fn resolve_single_agent(flags: &InitFlags) -> Option<AgentKind> {
     flags.agent
 }
 
-/// Injected environment values for [`detect_installed_agents`].
+/// Injected environment values for [`detect_installed_agents`] and config-dir
+/// resolution on both the detection path and the install/uninstall write path.
 ///
 /// Created once at the CLI boundary and threaded to callers, eliminating
 /// per-call env-var reads and enabling race-free unit testing. Mirrors the
@@ -46,21 +99,23 @@ pub(super) fn resolve_single_agent(flags: &InitFlags) -> Option<AgentKind> {
 ///
 /// ARCHITECTURE: `from_process()` reads env exactly once at the system
 /// boundary. Test code constructs this struct directly with controlled paths.
+/// `resolve()` is the single source of truth for config-dir resolution (applies
+/// PF-002: one resolver, not two independent paths).
 #[derive(Debug, Default)]
-pub(super) struct DetectionEnv {
-    pub(super) home_dir: Option<std::path::PathBuf>,
+pub(crate) struct DetectionEnv {
+    pub(crate) home_dir: Option<std::path::PathBuf>,
     /// `CLAUDE_CONFIG_DIR` override
-    pub(super) claude_config_dir: Option<std::path::PathBuf>,
+    pub(crate) claude_config_dir: Option<std::path::PathBuf>,
     /// `CURSOR_CONFIG_DIR` override
-    pub(super) cursor_config_dir: Option<std::path::PathBuf>,
+    pub(crate) cursor_config_dir: Option<std::path::PathBuf>,
     /// `GEMINI_CONFIG_DIR` override
-    pub(super) gemini_config_dir: Option<std::path::PathBuf>,
+    pub(crate) gemini_config_dir: Option<std::path::PathBuf>,
     /// `COPILOT_CONFIG_DIR` override
-    pub(super) copilot_config_dir: Option<std::path::PathBuf>,
+    pub(crate) copilot_config_dir: Option<std::path::PathBuf>,
     /// `CODEX_CONFIG_DIR` override
-    pub(super) codex_config_dir: Option<std::path::PathBuf>,
+    pub(crate) codex_config_dir: Option<std::path::PathBuf>,
     /// `CRUSH_CONFIG_DIR` override
-    pub(super) crush_config_dir: Option<std::path::PathBuf>,
+    pub(crate) crush_config_dir: Option<std::path::PathBuf>,
 }
 
 impl DetectionEnv {
@@ -68,7 +123,7 @@ impl DetectionEnv {
     ///
     /// Call this in `main`-adjacent code, then thread the struct down to
     /// callers — never call from within library functions.
-    pub(super) fn from_process() -> Self {
+    pub(crate) fn from_process() -> Self {
         let read = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);
         Self {
             home_dir: dirs::home_dir(),
@@ -86,7 +141,7 @@ impl DetectionEnv {
     /// Single enumeration point for the agent → override-field mapping.
     /// `any_override` and the filter match in [`detect_installed_agents`]
     /// both delegate here so that adding a new agent only requires one edit.
-    pub(super) fn override_for(&self, agent: AgentKind) -> Option<&std::path::Path> {
+    pub(crate) fn override_for(&self, agent: AgentKind) -> Option<&std::path::Path> {
         match agent {
             AgentKind::ClaudeCode => self.claude_config_dir.as_deref(),
             AgentKind::Cursor => self.cursor_config_dir.as_deref(),
@@ -95,6 +150,54 @@ impl DetectionEnv {
             AgentKind::CodexCli => self.codex_config_dir.as_deref(),
             AgentKind::Crush => self.crush_config_dir.as_deref(),
         }
+    }
+
+    /// Resolve the config directory for `agent` with the following precedence:
+    ///
+    /// 1. `--project` flag → CWD-relative `.<agent-dir>/` (e.g., `.claude/`).
+    /// 2. Per-agent env override (`CLAUDE_CONFIG_DIR`, `CURSOR_CONFIG_DIR`, …)
+    ///    → that path verbatim.
+    /// 3. Home-directory default via [`AgentKind::config_dir`], which handles
+    ///    platform-specific paths:
+    ///    - **Cursor (macOS)**: `~/Library/Application Support/Cursor` when
+    ///      that directory exists at runtime (global config, not project scope).
+    ///    - **Cursor (Linux/other)**: `~/.config/Cursor`.
+    ///    - **All others**: `~/<dot_dir_name>` (e.g., `~/.claude`).
+    ///
+    /// Note: `~/.cursor` is the *project-scope* dot-directory; Cursor's
+    /// *global* config lives under `Library/Application Support/Cursor` (macOS)
+    /// or `~/.config/Cursor` (Linux). The `is_dir()` branch in
+    /// `AgentKind::config_dir` handles the macOS vs. Linux detection at runtime.
+    ///
+    /// **Cursor is IDE-only**: skim integrates with Cursor via
+    /// the IDE hook + `.mdc` guidance rules only. The Cursor CLI has no
+    /// rewrite-capable hook event, so no permissions file is seeded for Cursor.
+    /// Config-dir resolution still runs (for hook/guidance install), but the
+    /// permissions factory returns `None` for [`AgentKind::Cursor`].
+    ///
+    /// This is the single authoritative config-dir resolver. All install,
+    /// uninstall, and detection code paths MUST call this — not read env vars
+    /// independently (avoids the PF-002 split-resolver hazard).
+    pub(crate) fn resolve(
+        &self,
+        agent: AgentKind,
+        project: bool,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        if project {
+            return Ok(std::env::current_dir()?.join(agent.dot_dir_name()));
+        }
+
+        // Per-agent env override: honored for ALL agents (not just ClaudeCode).
+        if let Some(override_path) = self.override_for(agent) {
+            return Ok(override_path.to_path_buf());
+        }
+
+        // Home-directory default (includes Cursor macOS/Linux is_dir() branch).
+        let home = self
+            .home_dir
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+        Ok(agent.config_dir(home))
     }
 }
 
@@ -179,10 +282,31 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
     let mut no_guidance = false;
     let mut agent: Option<AgentKind> = None;
     let mut wrappers: Option<bool> = None;
+    let mut permissions: Option<bool> = None;
+    let mut permissions_tier = PermissionsTier::default();
 
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
+        let arg = args[i].as_str();
+        // Handle --permissions-tier=<value> (inline =) and --permissions-tier <value> (space-separated).
+        if arg == "--permissions-tier" {
+            i += 1;
+            if i >= args.len() {
+                anyhow::bail!(
+                    "missing value for --permissions-tier\n\
+                     Valid values: seed, mirror, blanket"
+                );
+            }
+            permissions_tier = PermissionsTier::parse(args[i].as_str())?;
+            i += 1;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--permissions-tier=") {
+            permissions_tier = PermissionsTier::parse(val)?;
+            i += 1;
+            continue;
+        }
+        match arg {
             "--global" => { /* default, no-op */ }
             "--project" => project = true,
             "--yes" | "-y" => yes = true,
@@ -207,6 +331,24 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
                     );
                 }
                 wrappers = Some(false);
+            }
+            "--permissions" => {
+                if permissions == Some(false) {
+                    anyhow::bail!(
+                        "--permissions and --no-permissions are mutually exclusive\n\
+                         Use one or the other, not both."
+                    );
+                }
+                permissions = Some(true);
+            }
+            "--no-permissions" => {
+                if permissions == Some(true) {
+                    anyhow::bail!(
+                        "--permissions and --no-permissions are mutually exclusive\n\
+                         Use one or the other, not both."
+                    );
+                }
+                permissions = Some(false);
             }
             "--agent" => {
                 i += 1;
@@ -242,6 +384,16 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
         i += 1;
     }
 
+    // Cross-flag conflict: --permissions + --project is an error.
+    // Permissions seeding is user-scope only; project settings are repository-controlled.
+    if permissions == Some(true) && project {
+        anyhow::bail!(
+            "--permissions and --project are mutually exclusive: \
+             permissions seeding is user-scope only; \
+             --project settings are repository-controlled"
+        );
+    }
+
     Ok(InitFlags {
         project,
         yes,
@@ -251,6 +403,8 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
         no_guidance,
         agent,
         wrappers,
+        permissions,
+        permissions_tier,
     })
 }
 
@@ -357,6 +511,8 @@ mod tests {
             no_guidance: false,
             agent: Some(AgentKind::Cursor),
             wrappers: None,
+            permissions: None,
+            permissions_tier: PermissionsTier::Seed,
         };
         assert_eq!(resolve_single_agent(&flags), Some(AgentKind::Cursor));
     }
@@ -372,6 +528,8 @@ mod tests {
             no_guidance: false,
             agent: None,
             wrappers: None,
+            permissions: None,
+            permissions_tier: PermissionsTier::Seed,
         };
         assert_eq!(resolve_single_agent(&flags), None);
     }
@@ -461,6 +619,8 @@ mod tests {
             no_guidance: false,
             agent: Some(AgentKind::Cursor),
             wrappers: None,
+            permissions: None,
+            permissions_tier: PermissionsTier::Seed,
         };
         // env is unused when agent is explicit; default env is fine
         assert_eq!(
@@ -483,6 +643,8 @@ mod tests {
             no_guidance: false,
             agent: None,
             wrappers: None,
+            permissions: None,
+            permissions_tier: PermissionsTier::Seed,
         };
         let env = DetectionEnv {
             home_dir: Some(std::path::PathBuf::from(
@@ -552,6 +714,302 @@ mod tests {
         assert!(
             err.contains("mutually exclusive"),
             "error must mention mutual exclusion: {err}"
+        );
+    }
+
+    // ---- DetectionEnv::resolve ----
+
+    /// Per-agent env override must be honored for EVERY agent when project=false.
+    /// This covers the CRITICAL OUTCOME: env overrides honored on the WRITE path.
+    #[test]
+    fn test_resolve_override_honored_for_claude() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: Some(std::path::PathBuf::from("/home/user")),
+            claude_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::ClaudeCode, false).unwrap();
+        assert_eq!(result, tmp.path(), "CLAUDE_CONFIG_DIR override must win");
+    }
+
+    #[test]
+    fn test_resolve_override_honored_for_cursor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: Some(std::path::PathBuf::from("/home/user")),
+            cursor_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::Cursor, false).unwrap();
+        assert_eq!(result, tmp.path(), "CURSOR_CONFIG_DIR override must win");
+    }
+
+    #[test]
+    fn test_resolve_override_honored_for_gemini() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: Some(std::path::PathBuf::from("/home/user")),
+            gemini_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::GeminiCli, false).unwrap();
+        assert_eq!(result, tmp.path(), "GEMINI_CONFIG_DIR override must win");
+    }
+
+    #[test]
+    fn test_resolve_override_honored_for_copilot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: Some(std::path::PathBuf::from("/home/user")),
+            copilot_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::CopilotCli, false).unwrap();
+        assert_eq!(result, tmp.path(), "COPILOT_CONFIG_DIR override must win");
+    }
+
+    #[test]
+    fn test_resolve_override_honored_for_codex() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: Some(std::path::PathBuf::from("/home/user")),
+            codex_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::CodexCli, false).unwrap();
+        assert_eq!(result, tmp.path(), "CODEX_CONFIG_DIR override must win");
+    }
+
+    #[test]
+    fn test_resolve_override_honored_for_crush() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: Some(std::path::PathBuf::from("/home/user")),
+            crush_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::Crush, false).unwrap();
+        assert_eq!(result, tmp.path(), "CRUSH_CONFIG_DIR override must win");
+    }
+
+    /// project=true must resolve to CWD/<dot_dir_name>, ignoring env overrides.
+    #[test]
+    fn test_resolve_project_mode_ignores_env_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: Some(std::path::PathBuf::from("/home/user")),
+            claude_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::ClaudeCode, true).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            result,
+            cwd.join(".claude"),
+            "project mode must use CWD/.claude"
+        );
+    }
+
+    /// Home-dir fallback when no override: resolve returns agent.config_dir(home).
+    #[test]
+    fn test_resolve_home_dir_fallback_no_override() {
+        let home = std::path::PathBuf::from("/home/testuser");
+        let env = DetectionEnv {
+            home_dir: Some(home.clone()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::ClaudeCode, false).unwrap();
+        assert_eq!(
+            result,
+            home.join(".claude"),
+            "fallback must be home/.claude"
+        );
+    }
+
+    #[test]
+    fn test_resolve_no_home_dir_returns_error() {
+        let env = DetectionEnv {
+            home_dir: None,
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::ClaudeCode, false);
+        assert!(
+            result.is_err(),
+            "missing home dir without override must error"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("home directory"),
+            "error must mention home directory"
+        );
+    }
+
+    // ---- --permissions / --no-permissions ----
+
+    #[test]
+    fn test_parse_flags_permissions_true() {
+        let flags = parse_flags(&["--permissions".to_string()]).unwrap();
+        assert_eq!(
+            flags.permissions,
+            Some(true),
+            "--permissions must set Some(true)"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_no_permissions_false() {
+        let flags = parse_flags(&["--no-permissions".to_string()]).unwrap();
+        assert_eq!(
+            flags.permissions,
+            Some(false),
+            "--no-permissions must set Some(false)"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_absent_is_none() {
+        let flags = parse_flags(&["--yes".to_string()]).unwrap();
+        assert_eq!(
+            flags.permissions, None,
+            "absent --permissions flag must yield None"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_and_no_permissions_conflict() {
+        let result = parse_flags(&["--permissions".to_string(), "--no-permissions".to_string()]);
+        assert!(
+            result.is_err(),
+            "--permissions and --no-permissions must conflict"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "error must mention mutual exclusion: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_no_permissions_then_permissions_conflict() {
+        let result = parse_flags(&["--no-permissions".to_string(), "--permissions".to_string()]);
+        assert!(
+            result.is_err(),
+            "--no-permissions followed by --permissions must conflict"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "error must mention mutual exclusion: {err}"
+        );
+    }
+
+    // ---- --permissions-tier ----
+
+    #[test]
+    fn test_parse_flags_permissions_tier_default_is_seed() {
+        let flags = parse_flags(&["--yes".to_string()]).unwrap();
+        assert_eq!(
+            flags.permissions_tier,
+            PermissionsTier::Seed,
+            "default tier must be Seed"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_tier_seed() {
+        let flags = parse_flags(&["--permissions-tier".to_string(), "seed".to_string()]).unwrap();
+        assert_eq!(flags.permissions_tier, PermissionsTier::Seed);
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_tier_mirror() {
+        let flags = parse_flags(&["--permissions-tier".to_string(), "mirror".to_string()]).unwrap();
+        assert_eq!(flags.permissions_tier, PermissionsTier::Mirror);
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_tier_blanket() {
+        let flags =
+            parse_flags(&["--permissions-tier".to_string(), "blanket".to_string()]).unwrap();
+        assert_eq!(flags.permissions_tier, PermissionsTier::Blanket);
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_tier_inline_equals() {
+        let flags = parse_flags(&["--permissions-tier=mirror".to_string()]).unwrap();
+        assert_eq!(flags.permissions_tier, PermissionsTier::Mirror);
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_tier_invalid_value_errors() {
+        let result = parse_flags(&["--permissions-tier".to_string(), "unknown".to_string()]);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("invalid --permissions-tier value"),
+            "error must name the invalid value: {err}"
+        );
+        assert!(
+            err.contains("seed") && err.contains("mirror") && err.contains("blanket"),
+            "error must list valid values: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_permissions_tier_missing_value_errors() {
+        let result = parse_flags(&["--permissions-tier".to_string()]);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("missing value"),
+            "error must mention missing value: {err}"
+        );
+    }
+
+    // ---- --permissions + --project conflict ----
+
+    #[test]
+    fn test_parse_flags_permissions_and_project_conflict() {
+        let result = parse_flags(&["--permissions".to_string(), "--project".to_string()]);
+        assert!(result.is_err(), "--permissions and --project must conflict");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("--permissions") && err.contains("--project"),
+            "error must name both flags: {err}"
+        );
+        assert!(
+            err.contains("user-scope") || err.contains("repository-controlled"),
+            "error must explain the scope constraint: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_no_permissions_with_project_is_ok() {
+        // --no-permissions with --project is fine — the conflict only applies
+        // to --permissions (seeding), not to --no-permissions (explicit opt-out).
+        let result = parse_flags(&["--no-permissions".to_string(), "--project".to_string()]);
+        assert!(
+            result.is_ok(),
+            "--no-permissions + --project should not conflict: {:?}",
+            result
+        );
+    }
+
+    /// Env override takes precedence over home_dir for ALL agents — a None home
+    /// dir must not cause an error when an override is set.
+    #[test]
+    fn test_resolve_override_wins_over_missing_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            home_dir: None,
+            gemini_config_dir: Some(tmp.path().to_path_buf()),
+            ..DetectionEnv::default()
+        };
+        let result = env.resolve(AgentKind::GeminiCli, false).unwrap();
+        assert_eq!(
+            result,
+            tmp.path(),
+            "env override must win even when home_dir is None"
         );
     }
 }

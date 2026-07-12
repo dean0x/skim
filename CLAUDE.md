@@ -78,7 +78,7 @@ Most subcommands wrap a dev tool (cargo, git, npm, pytest, eslint, docker, psql,
 
 - `search` — n-gram code search over a project index. Build/update: `skim search index` (`--rebuild`, `--force`, `--root`, `--max-files`, `--index-dir`); routes to build only when trailing args match the build grammar — bare `skim search index` still builds (backward-compatible), but with query flags or extra positional terms it searches for the literal "index" (`skim search -- index` forces a search via POSIX `--`). Query: `skim search <text>` (`--limit`, `--json`, `--stats`). Temporal sort/filter: `--hot`/`--cold` (hotspot score), `--risky` (fix-risk), `--blast-radius FILE` (co-change peers). Structural: `--ast <pattern>` — a named pattern (`try-catch`, `nested-loop`, `god-function`, …) or containment query (`for_statement > block`); composable with text query and `--blast-radius`. `--ast` with temporal flags, or single-node queries, errors out (#202 / #283).
 - `heatmap` — git-history risk/coupling analysis: churn, co-change, stability, fix-after-touch (`--json`, `--since`, `--window`, `--path`, `--insights`).
-- `init` — install skim as an agent hook (Claude/Cursor/Codex/Gemini/Copilot/Crush); `--wrappers` adds PATH wrappers for sub-agent interception.
+- `init` — install skim as an agent hook (Claude/Cursor/Codex/Gemini/Copilot/Crush); `--wrappers` adds PATH wrappers for sub-agent interception; `--permissions` seeds consent-gated allowlist entries (tiers: seed|mirror|blanket).
 - `stats` — token analytics dashboard (`--since`, `--format json`, `--verbose`, `--clear`).
 - `discover` / `learn` / `rewrite` — scan agent sessions for missed optimizations, learn error-retry correction rules, and rewrite commands into skim equivalents.
 

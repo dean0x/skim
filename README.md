@@ -579,7 +579,7 @@ cargo bench
 
 ## Project Status
 
-**Current**: v2.10.0 — Stable
+**Current**: v2.11.0 — Stable
 
 ✅ **Core — Code Reading (18 languages):**
 - TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Kotlin/Swift/Bash/Markdown/JSON/YAML/TOML
@@ -598,7 +598,7 @@ cargo bench
 - Three-tier degradation: Structured → Regex → Passthrough
 
 ✅ **Agent Integration:**
-- `skim init` — hook installation for Claude Code, Cursor, Codex, Gemini, Copilot, Crush
+- `skim init` — hook installation for Claude Code, Cursor, Codex, Gemini, Copilot, Crush; optional consent-gated permission seeding (`--permissions`)
 - `skim rewrite` — command rewriting engine with `--hook` mode
 - MCP server mode for agent-native workflows
 

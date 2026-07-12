@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "rskim"
-version = "2.10.0"
+version = "2.11.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2434,6 +2434,7 @@ dependencies = [
  "strip-ansi-escapes",
  "tempfile",
  "thiserror",
+ "toml 0.8.23",
  "tree-sitter",
 ]
 
@@ -2473,7 +2474,7 @@ dependencies = [
 
 [[package]]
 name = "rskim-core"
-version = "2.10.0"
+version = "2.11.0"
 dependencies = [
  "criterion",
  "insta",

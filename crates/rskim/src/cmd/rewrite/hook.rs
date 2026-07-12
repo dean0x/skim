@@ -246,10 +246,20 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
 
 /// Resolve the hook config directory for the given agent.
 ///
-/// Delegates to the canonical `resolve_config_dir_for_agent` in `init/helpers.rs`
-/// which handles agent-specific env overrides and home-directory fallback.
+/// Delegates to `DetectionEnv::resolve()` — the single authoritative
+/// config-dir resolver — so per-agent env overrides (`CURSOR_CONFIG_DIR`,
+/// `GEMINI_CONFIG_DIR`, `COPILOT_CONFIG_DIR`, …) are honored in hook mode
+/// just as they are during install/uninstall.
+///
+/// Routes the resolved dir through `HookProtocol::hook_config_dir` so agents
+/// like Copilot CLI that store hook artifacts under a different root
+/// (e.g. `~/.copilot/`) are handled correctly.
 fn resolve_hook_config_dir(agent: AgentKind) -> Option<std::path::PathBuf> {
-    crate::cmd::init::resolve_config_dir_for_agent(false, agent).ok()
+    let env = crate::cmd::init::DetectionEnv::from_process();
+    let config_dir = env.resolve(agent, false).ok()?;
+    let protocol = crate::cmd::hooks::protocol_for_agent(agent);
+    let has_override = env.override_for(agent).is_some();
+    Some(protocol.hook_config_dir(&config_dir, false, has_override))
 }
 
 /// Check if a daily rate-limit stamp allows warning today.

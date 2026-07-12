@@ -374,6 +374,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`skim dig` / `skim nslookup` subcommands** — DNS query output compression via two independent parsers: `dig` uses section-based parsing (QUESTION/ANSWER sections), `nslookup` uses key-value line parsing. Both support three-tier degradation, `--json` structured output, error state compression, and macOS + Linux format variants. `nslookup` includes no-args guard. 2 new rewrite rules (total: 148) (#168)
 - **`skim make` / `skim gmake` subcommands** — GNU Make build output compression via three-tier parser: Tier 1 (GCC/Clang diagnostics regex + make failure lines), Tier 2 (noise-stripped invocation/directory-change lines), Tier 3 (passthrough). Includes `gmake` rewrite rule for hook integration. 17 unit tests, 2 E2E tests (#167)
 
+## [2.11.0] - 2026-07-11
+
+Consent-gated permissions seeding for `skim init`; Copilot hook re-homed to `~/.copilot`; `ls -a` fidelity fix. 4,329 tests passing (up from 3,558 in v2.10.0).
+
+### Added
+
+- **`skim init --permissions` / `--no-permissions` / `--permissions-tier=<tier>`** —
+  Consent-gated allowlist seeding for Claude, Gemini, Codex, and Copilot. Three tiers:
+  - **seed** (default): seeds 8 arg-safe read-only wrapped tools (`df`, `diff`, `du`,
+    `grep`, `ls`, `rg`, `tree`, `wc`) as allowlist entries. Excluded-for-cause:
+    `find`, `env`, `printenv`, `dig`, `nslookup`, `ps` (network or process-enumeration
+    risk). `Bash(skim <tool>:*)` prefix entries do NOT bound tool arguments — the seed
+    set is individually arg-safety-vetted.
+  - **mirror**: proposes exact-shape mirrors of the agent's existing allow rules, with
+    mutating tools highlighted; sourced from the live settings file; deny/ask-aware (skips
+    already-restricted rules). Claude-scoped only.
+  - **blanket**: seeds all wrapped subcommands; requires a second hazard confirmation at
+    the TTY prompt; refused for Codex (Codex is explicit-opt-in only for `--permissions`).
+  - Interactive TTY consent is required before any entries are written — `--yes` never
+    bypasses the grant prompt.
+  - A sidecar manifest (`skim-permissions.json`) is written alongside the agent config on
+    every seed; `skim init --uninstall` reads the sidecar for targeted removal so only
+    skim-seeded entries are touched.
+  - `--dry-run` enumerates the entries that would be written (with `[mutating tool]`
+    annotations on mirror tier) without modifying any files.
+  - Cursor and Crush have no permissions seeding (IDE-hook / no-hook channel only).
+
+### Fixed
+
+- **`skim ls -a` / `--all` now retains `.` and `..` entries** — `parse_ls` previously
+  stripped `.` and `..` unconditionally, silently truncating listings requested with
+  `-a`/`--all`. Fix threads an `include_dotdirs` flag through both long-format and
+  plain-format accumulation paths; retained dotdirs are included in the entry count.
+  Honors compress-never-truncate (#317).
+
+- **Copilot CLI hook re-homed to `~/.copilot/hooks/skim.json`** — Skim previously
+  installed Copilot hook config under `~/.github/` (a location the Copilot CLI never
+  reads). The hook is now written to `~/.copilot/hooks/skim.json` (or
+  `$COPILOT_HOME/hooks/skim.json`) using the documented hook-file envelope
+  (`{"version":1,"hooks":{"preToolUse":[…]}}`). On re-init, guarded migration
+  removes legacy `~/.github` artifacts (settings entry, hook script, SHA sidecar)
+  only when the new-location artifacts already exist; each removal is non-fatal and
+  idempotent.
+
+- **Copilot hook response now uses `modifiedArgs`** — Skim's Copilot PreToolUse response
+  previously included a `permissionDecision` field the protocol does not require. The
+  response is now `{"modifiedArgs":{"command":"<rewritten>"}}` with no `permissionDecision`
+  or `reason`. No-rewrite invocations emit no output (empty stdout, existing convention).
+  Requires Copilot CLI >= 1.0.24 (released 2026-04-10); older CLIs silently ignore
+  `modifiedArgs` — inert passthrough, not breakage. Schema verified 2026-07-11 against
+  GitHub Copilot CLI hooks-reference and hooks-configuration documentation.
+
+### Changed
+
+- **Cursor is IDE-only** — Cursor CLI has no rewrite-capable hook event; only the IDE
+  (`.cursor/rules/*.mdc` guidance injection) is supported by `skim init`. No permissions
+  seeding is offered for Cursor. Documented in `session/types.rs` operational contract.
+
+- **Per-agent `<AGENT>_CONFIG_DIR` overrides honored on the write path** —
+  `DetectionEnv::resolve()` now applies agent-specific env overrides on the install and
+  uninstall write path in addition to the pre-existing detection path. `CLAUDE_CONFIG_DIR`,
+  `GEMINI_CONFIG_DIR`, `CODEX_CONFIG_DIR`, `COPILOT_CONFIG_DIR`, and equivalents redirect
+  `skim init` to the specified directory, enabling fully sandboxed integration tests without
+  touching real agent config locations.
+
+### Two-Speed Rollout
+
+Binary-side changes (`ls -a` fidelity, Copilot hook response strategy) take effect
+immediately after upgrading the binary. Config/guidance changes (permissions seeding, Copilot
+hook re-home and legacy migration, updated agent guidance) activate at the next `skim init`
+re-run; the version bump advances the binary past the "already up to date" fast path, so
+`skim init` re-runs on the first post-upgrade invocation. Because Copilot never loaded the
+legacy `~/.github` hook config, all Copilot-facing changes (re-home, `modifiedArgs` response,
+migration) activate only at re-init.
+
 ## [2.10.0] - 2026-05-13
 
 Container, cloud, database compression; search crate foundation; heatmap insights. 3,558 tests passing (up from 3,310 in v2.9.0).
