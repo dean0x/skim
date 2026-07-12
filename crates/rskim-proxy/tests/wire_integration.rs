@@ -1765,7 +1765,9 @@ async fn test_ac14_regression_guard_can_fail() {
 
     // --- Slowed arm: noop hook, slowed-identity pipeline (50ms sleep per stage) ---
     let slowed_listener = bind_test_listener().await;
-    let slowed_addr = slowed_listener.local_addr().expect("slowed listener local_addr");
+    let slowed_addr = slowed_listener
+        .local_addr()
+        .expect("slowed listener local_addr");
     let slowed_config = ProxyConfig::builder()
         .port(41001) // placeholder — run_server_with_listener ignores config.bind_addr
         .upstream_default(&upstream_url)

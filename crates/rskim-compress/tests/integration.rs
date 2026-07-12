@@ -907,7 +907,9 @@ fn determinism_100_repeats() {
 // ============================================================================
 
 mod prefilter_public_api {
-    use rskim_compress::prefilter::{MAX_JSON_BYTES, MAX_LOG_BYTES, MAX_MIXED_BYTES, MIN_SIZE_FLOOR};
+    use rskim_compress::prefilter::{
+        MAX_JSON_BYTES, MAX_LOG_BYTES, MAX_MIXED_BYTES, MIN_SIZE_FLOOR,
+    };
 
     /// AC22 / P0.1 — Prefilter constants are accessible for documentation and testing.
     ///
@@ -1628,11 +1630,8 @@ fn ac25_full_router_passes_lossless_content_extension() {
     registry.register("lossless-content", lossless_content_check());
 
     let router = BlockRouter::new(Arc::new(MockSink::new()));
-    let report = run_conformance_suite_with_extensions(
-        &router,
-        "req-ac25-ext-lossless",
-        Some(&registry),
-    );
+    let report =
+        run_conformance_suite_with_extensions(&router, "req-ac25-ext-lossless", Some(&registry));
     assert!(
         report.all_passed(),
         "BlockRouter must pass ext:lossless-content invariant across ALL_CORPUS: {:#?}",
@@ -1928,12 +1927,19 @@ fn gate_never_fires_for_non_json_engine() {
     // A plain-text block classifies as Class::Text → EngineTarget::Passthrough.
     // With budget=0, the gate must NOT fire (it's only for Json engine).
     // The record reason should be Passthrough (from routing, not LossyRejected).
-    let body = anthropic_body("Some plain text content that is longer than the prefilter floor so it gets a record emitted and we can check the reason");
+    let body = anthropic_body(
+        "Some plain text content that is longer than the prefilter floor so it gets a record emitted and we can check the reason",
+    );
     let sink = Arc::new(MockSink::new());
     let router = BlockRouter::new(sink.clone());
 
-    let outcome =
-        router.route_with_budget(&body, Policy::Default, "req-non-json-gate", sink.as_ref(), 0);
+    let outcome = router.route_with_budget(
+        &body,
+        Policy::Default,
+        "req-non-json-gate",
+        sink.as_ref(),
+        0,
+    );
     let records = sink.drain();
 
     // Never-inflate holds.

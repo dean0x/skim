@@ -762,8 +762,10 @@ fn try_stub_json_number(input: &[u8]) -> Option<Vec<u8>> {
                         continue;
                     }
                     // Clone the text to release the immutable borrow before mutating.
-                    let text_clone =
-                        block.get("text").and_then(|t| t.as_str()).map(|s| s.to_owned());
+                    let text_clone = block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_owned());
                     let Some(text_str) = text_clone else {
                         continue;
                     };

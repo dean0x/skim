@@ -1401,7 +1401,10 @@ mod tests {
             1024,
             OutcomeReason::LossyRejected,
         );
-        assert!(r.is_passthrough(), "LossyRejected must produce a Passthrough decision");
+        assert!(
+            r.is_passthrough(),
+            "LossyRejected must produce a Passthrough decision"
+        );
         assert_eq!(r.reason, OutcomeReason::LossyRejected);
         assert_eq!(r.bytes_in, 1024);
         assert_eq!(r.bytes_out, 1024);
@@ -1438,9 +1441,13 @@ mod tests {
             serialized, "\"lossy_rejected\"",
             "LossyRejected wire name must be exactly \"lossy_rejected\""
         );
-        let back: OutcomeReason = serde_json::from_str(&serialized)
-            .expect("must deserialize from \"lossy_rejected\"");
-        assert_eq!(back, OutcomeReason::LossyRejected, "round-trip must restore LossyRejected");
+        let back: OutcomeReason =
+            serde_json::from_str(&serialized).expect("must deserialize from \"lossy_rejected\"");
+        assert_eq!(
+            back,
+            OutcomeReason::LossyRejected,
+            "round-trip must restore LossyRejected"
+        );
     }
 
     /// Schema guard: `DecisionRecord` carries only size/count/enum fields — no
@@ -1486,8 +1493,14 @@ mod tests {
         }
 
         // bytes_in and bytes_out must be numeric (not content-derived strings).
-        assert!(obj["bytes_in"].is_number(), "bytes_in must be a number, not a string");
-        assert!(obj["bytes_out"].is_number(), "bytes_out must be a number, not a string");
+        assert!(
+            obj["bytes_in"].is_number(),
+            "bytes_in must be a number, not a string"
+        );
+        assert!(
+            obj["bytes_out"].is_number(),
+            "bytes_out must be a number, not a string"
+        );
 
         // No 'content' field may ever appear (security-H4: no block content in records).
         assert!(

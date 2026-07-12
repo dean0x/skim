@@ -78,8 +78,7 @@ fn cli_log_golden_stable() {
     let stdout_trimmed = stdout.trim_end_matches('\n');
 
     assert_eq!(
-        stdout_trimmed,
-        GOLDEN_STABLE,
+        stdout_trimmed, GOLDEN_STABLE,
         "STABLE golden mismatch — byte-identical output required through all #427 passes.\n\
          Expected:\n{GOLDEN_STABLE:?}\n\
          Got:\n{stdout_trimmed:?}",
@@ -149,8 +148,7 @@ fn cli_log_golden_counterfix() {
     let stdout_trimmed = stdout.trim_end_matches('\n');
 
     assert_eq!(
-        stdout_trimmed,
-        GOLDEN_COUNTERFIX,
+        stdout_trimmed, GOLDEN_COUNTERFIX,
         "COUNTERFIX golden mismatch.\n\
          If this is Pass 4 (P1.1 fix landed): re-capture this golden with the fixed output.\n\
          If this is an unplanned change: investigate the log engine regression.\n\

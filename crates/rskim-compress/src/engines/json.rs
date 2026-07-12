@@ -361,8 +361,7 @@ mod tests {
 
     #[test]
     fn output_is_valid_json_for_object_input() {
-        let json =
-            r#"{"name": "Alice", "age": 30, "active": true, "score": 9.5, "meta": null}"#;
+        let json = r#"{"name": "Alice", "age": 30, "active": true, "score": 9.5, "meta": null}"#;
         let result = compress_json(json);
         match result {
             CompressResult::Compressed { ref content } => {
@@ -428,7 +427,11 @@ mod tests {
                     serde_json::from_str(&content).expect("valid JSON");
                 let arr = reparsed.as_array().expect("array");
                 // All 3 elements preserved (unlike the lossy engine which kept only first).
-                assert_eq!(arr.len(), 3, "all array elements must be preserved (lossless)");
+                assert_eq!(
+                    arr.len(),
+                    3,
+                    "all array elements must be preserved (lossless)"
+                );
             }
             CompressResult::Passthrough => panic!("Expected Compressed for array input"),
         }
@@ -548,8 +551,7 @@ mod tests {
         match compress_json(json) {
             CompressResult::Compressed { content } => {
                 // Both "a" values must be present.
-                let v: serde_json::Value =
-                    serde_json::from_str(&content).expect("valid JSON");
+                let v: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
                 assert_eq!(v["a"], 1, "outer 'a' must be 1");
                 assert_eq!(v["inner"]["a"], 2, "inner 'a' must be 2");
             }
@@ -626,7 +628,10 @@ mod tests {
     #[test]
     fn truncated_json_returns_passthrough() {
         assert!(
-            matches!(compress_json(r#"{"key": "val"#), CompressResult::Passthrough),
+            matches!(
+                compress_json(r#"{"key": "val"#),
+                CompressResult::Passthrough
+            ),
             "truncated JSON must return Passthrough"
         );
     }

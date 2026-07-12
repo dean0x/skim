@@ -793,7 +793,15 @@ pub async fn run_server(
 
     info!(addr = %bind_addr, "proxy listening");
 
-    serve_listener(listener, config, pipeline, analytics, upstream_client, readiness).await
+    serve_listener(
+        listener,
+        config,
+        pipeline,
+        analytics,
+        upstream_client,
+        readiness,
+    )
+    .await
 }
 
 /// Like [`run_server`] but accepts a pre-bound listener, bypassing the bind
@@ -822,12 +830,10 @@ pub async fn run_server_with_listener(
     pipeline: TransformPipeline,
     analytics: Arc<dyn AnalyticsHook>,
 ) -> Result<(), ProxyError> {
-    let addr = listener
-        .local_addr()
-        .map_err(|e| ProxyError::BindFailed {
-            addr: "pre-bound".to_string(),
-            source: e,
-        })?;
+    let addr = listener.local_addr().map_err(|e| ProxyError::BindFailed {
+        addr: "pre-bound".to_string(),
+        source: e,
+    })?;
     let config = Arc::new(config);
     let pipeline = Arc::new(pipeline);
     let readiness = ReadinessState::new();
@@ -836,7 +842,15 @@ pub async fn run_server_with_listener(
 
     info!(addr = %addr, "proxy listening (pre-bound)");
 
-    serve_listener(listener, config, pipeline, analytics, upstream_client, readiness).await
+    serve_listener(
+        listener,
+        config,
+        pipeline,
+        analytics,
+        upstream_client,
+        readiness,
+    )
+    .await
 }
 
 // ============================================================================

@@ -373,9 +373,7 @@ const VALUE_EQUIV_MAX_DEPTH: usize = 500;
 ///
 /// **O(n) duplicate detection:** a `HashSet<String>` is maintained during the
 /// streaming walk — insertion is O(1) amortised, so total complexity is O(n).
-fn parse_object_entries(
-    raw: &str,
-) -> Option<Vec<(String, Box<serde_json::value::RawValue>)>> {
+fn parse_object_entries(raw: &str) -> Option<Vec<(String, Box<serde_json::value::RawValue>)>> {
     use serde::de::{MapAccess, Visitor};
     use std::fmt;
 
@@ -388,10 +386,7 @@ fn parse_object_entries(
             write!(f, "a JSON object")
         }
 
-        fn visit_map<A: MapAccess<'de>>(
-            self,
-            mut map: A,
-        ) -> Result<Self::Value, A::Error> {
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
             let mut pairs: Vec<(String, Box<serde_json::value::RawValue>)> = Vec::new();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -572,22 +567,18 @@ fn value_equiv_inner(raw_a: &str, raw_b: &str, depth: usize, budget: &mut usize)
 
             // Build a HashMap from a's entries: key str → raw value str.
             // Borrows from a_pairs which is live for this scope.
-            let a_map: std::collections::HashMap<&str, &str> = a_pairs
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.get()))
-                .collect();
+            let a_map: std::collections::HashMap<&str, &str> =
+                a_pairs.iter().map(|(k, v)| (k.as_str(), v.get())).collect();
 
             // For each entry in b, look up in a and recurse.
             for (bk, bv) in &b_pairs {
                 match a_map.get(bk.as_str()) {
                     None => return Some(false), // key in b not in a
-                    Some(&av_str) => {
-                        match value_equiv_inner(av_str, bv.get(), depth + 1, budget) {
-                            None => return None,
-                            Some(false) => return Some(false),
-                            Some(true) => {}
-                        }
-                    }
+                    Some(&av_str) => match value_equiv_inner(av_str, bv.get(), depth + 1, budget) {
+                        None => return None,
+                        Some(false) => return Some(false),
+                        Some(true) => {}
+                    },
                 }
             }
             Some(true)
@@ -1019,7 +1010,10 @@ mod tests {
             Some(true),
             "budget=1 is enough for a single scalar"
         );
-        assert_eq!(budget1, 0, "budget must be fully consumed after one scalar call");
+        assert_eq!(
+            budget1, 0,
+            "budget must be fully consumed after one scalar call"
+        );
     }
 
     /// 10k-key linear-work test: asserts the budget consumed scales ~linearly
@@ -1055,14 +1049,22 @@ mod tests {
         let start_1k: usize = 100_000;
         let mut b1 = start_1k;
         let result_1k = value_equivalent_raw(&obj_1k, &obj_1k, &mut b1);
-        assert_eq!(result_1k, Some(true), "1k-key identical objects must be equal");
+        assert_eq!(
+            result_1k,
+            Some(true),
+            "1k-key identical objects must be equal"
+        );
         let consumed_1k = start_1k - b1;
 
         // Budget for 5k keys.
         let start_5k: usize = 1_000_000;
         let mut b5 = start_5k;
         let result_5k = value_equivalent_raw(&obj_5k, &obj_5k, &mut b5);
-        assert_eq!(result_5k, Some(true), "5k-key identical objects must be equal");
+        assert_eq!(
+            result_5k,
+            Some(true),
+            "5k-key identical objects must be equal"
+        );
         let consumed_5k = start_5k - b5;
 
         // Linear growth: ratio should be ~5 (5k/1k). Allow 10× for generous slack.
@@ -1095,9 +1097,18 @@ mod tests {
         assert_eq!(value_equivalent_raw("100.00", "100", &mut b), Some(false));
 
         // arrays order-sensitive
-        assert_eq!(value_equivalent_raw("[1,2,3]", "[1,2,3]", &mut b), Some(true));
-        assert_eq!(value_equivalent_raw("[1,2,3]", "[3,2,1]", &mut b), Some(false));
-        assert_eq!(value_equivalent_raw("[1,2]", "[1,2,3]", &mut b), Some(false));
+        assert_eq!(
+            value_equivalent_raw("[1,2,3]", "[1,2,3]", &mut b),
+            Some(true)
+        );
+        assert_eq!(
+            value_equivalent_raw("[1,2,3]", "[3,2,1]", &mut b),
+            Some(false)
+        );
+        assert_eq!(
+            value_equivalent_raw("[1,2]", "[1,2,3]", &mut b),
+            Some(false)
+        );
 
         // type mismatch
         assert_eq!(value_equivalent_raw("1", r#""1""#, &mut b), Some(false));
