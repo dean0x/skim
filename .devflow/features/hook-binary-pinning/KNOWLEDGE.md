@@ -1,7 +1,7 @@
 ---
 feature: hook-binary-pinning
 name: Agent Hook Install, Binary Pinning & Handshake (+ Permissions Seeding)
-description: "Use when modifying hook script generation, adding new agents, changing the hook script format, debugging version-skew or wrong-clone warnings, working on install/reinstall logic, touching wrapper symlink management, editing guidance_content() / the Command wrapping section, or working on skim init --permissions / the PermissionsProtocol subsystem. Keywords: hook install, binary pinning, SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, generate_hook_script, is_hook_script_current, uses_pinned_binary, script_has_pinned_marker, AwarenessOnly, codex, wrapper symlinks, guidance_content, guidance_content_mdc, Command wrapping, PermissionsProtocol, confirm_grant, READ_ONLY_SUBCOMMANDS, hook_config_dir, modifiedArgs, seed tier, sidecar manifest, ADR-004, ADR-005, ADR-006."
+description: "Use when modifying hook script generation, adding new agents, changing the hook script format, debugging version-skew or wrong-clone warnings, working on install/reinstall logic, touching wrapper symlink management, editing guidance_content() / the Command wrapping section, or working on skim init --permissions / the PermissionsProtocol subsystem. Keywords: hook install, binary pinning, SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, generate_hook_script, is_hook_script_current, uses_pinned_binary, script_has_pinned_marker, AwarenessOnly, codex, wrapper symlinks, guidance_content, guidance_content_mdc, Command wrapping, PermissionsProtocol, confirm_grant, READ_ONLY_SUBCOMMANDS, hook_config_dir, modifiedArgs, seed tier, sidecar manifest, uses_dedicated_hook_file, hook_event_key, print_install_summary, print_dry_run_actions, SKIM_JSON_NAME, ADR-004, ADR-005, ADR-006."
 category: domain-knowledge
 directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/rewrite, crates/rskim/src/cmd/permissions]
 created: 2026-07-04
@@ -103,6 +103,12 @@ This function in `rewrite/hook.rs` fires only when versions match. It compares (
 
 **`write_copilot_skim_json` is atomic**: uses the same tmp-sibling + rename idiom as `atomic_write_settings` and `write_sidecar`: writes to `hooks/skim.json.tmp`, sets mode `0o600` on Unix, then renames. Any pre-existing file is replaced atomically and the tmp is never left behind on a permissions error.
 
+**`SKIM_JSON_NAME` is `pub(crate)`**: the constant `SKIM_JSON_NAME = "skim.json"` in `hooks/copilot.rs` is `pub(crate)` so `install.rs` can import it for summary/dry-run path construction. There is one canonical string for the dedicated hook filename — do not add a second literal in `install.rs` or elsewhere.
+
+**Protocol-driven install summary and dry-run output**: `print_install_summary` and `print_dry_run_actions` in `install.rs` both take an explicit `agent: AgentKind` parameter and call `protocol_for_agent(agent).uses_dedicated_hook_file()` to branch output:
+- Copilot (`uses_dedicated_hook_file() == true`): prints "Register hook: `<hook_config_dir>/hooks/skim.json` (`<hook_event_key()>` entry)" / dry-run "Would write: … (register `<hook_event_key()>` hook)". No backup/patch lines.
+- Settings-based agents (`uses_dedicated_hook_file() == false`): prints "Patch settings: `<settings_path>` (add `<hook_event_key()>` hook)" using the protocol's event key (Gemini → `BeforeTool`, Cursor → `preToolUse`, Claude → `PreToolUse`). This means new agents get correct wording for free without code changes.
+
 **Copilot hook scan bounds**: `scan_copilot_foreign_hooks` and `copilot_skim_json_has_entry` in `hooks/copilot.rs` both enforce `MAX_HOOK_FILES = 50` (via `.take(MAX_HOOK_FILES)`) and per-file `MAX_SETTINGS_SIZE` guards, matching the `scan_other_hooks` behavior on other agents. The v2.11.0 rewrite had initially dropped these guards; they were restored and regression tests pin both (oversized file tests use sparse-write to avoid allocating 10 MiB in CI).
 
 **Copilot permissions writer keys by git root**: `CopilotPermissions` in `permissions/copilot.rs` writes per-project entries into `permissions-config.json` keyed by the absolute project root (found via `find_git_root_from_cwd()`). Seeding project A cannot clobber project B entries. Full happy-path + per-project-key isolation tests exist in the unit test module.
@@ -130,7 +136,8 @@ detect_state()
         ├─ true → print "Already up to date", exit
         └─ false → create_hook_script() → is_hook_script_current() [redundant check, idempotent]
                   → atomic_write_executable() → write_hash_manifest()
-                  → patch_settings() → inject_guidance()
+                  → patch_settings() [or install_hook_registration() for Copilot]
+                  → inject_guidance()
                   → [if --permissions] resolve_permissions_consent() → confirm_grant() → seed()
 ```
 
@@ -166,6 +173,8 @@ In `create_hook_script()`: (1) `atomic_write_executable()` then (2) `compute_fil
 
 **Adding `SKIM_PASSTHROUGH` to the guidance template**: enforced by `!content.contains("SKIM_PASSTHROUGH")` negative test assert. Agents that learn about it use it as a default bypass, defeating compression.
 
+**Hardcoding agent event names or dedicated hook filenames in user-facing init output**: `print_install_summary` and `print_dry_run_actions` must call `protocol_for_agent(agent).hook_event_key()` and `uses_dedicated_hook_file()` for all output labels. Hardcoding strings like `"PreToolUse"` or `"skim.json"` in those functions means new agents silently show incorrect wording. The pattern to follow: branch on `uses_dedicated_hook_file()`, use `hook_event_key()` for the event name label, import `SKIM_JSON_NAME` from `hooks/copilot.rs` for the filename.
+
 ## Gotchas
 
 **`check_hook_binary_mismatch` fires only on same-version**: when versions differ, `check_hook_version_mismatch` logs the version mismatch and returns without calling the binary/commit check. A binary path change coinciding with a version bump is silently skipped until versions re-synchronize.
@@ -175,6 +184,8 @@ In `create_hook_script()`: (1) `atomic_write_executable()` then (2) `compute_fil
 **`SKIM_HOOK_COMMIT` has no quotes**: `export SKIM_HOOK_COMMIT={git_commit}` — safe because hex SHAs and `"unknown"` contain no shell-special chars. `generate_hook_script` enforces ascii-alphanumeric only via `assert!`. Future `SKIM_GIT_COMMIT` format changes (e.g., prefix like `commit-`) must widen the predicate first.
 
 **`hook_config_dir` for Copilot env-override installs**: when `COPILOT_CONFIG_DIR` is set, the `hook_config_dir` override is suppressed and the env-supplied path is used verbatim. This means test sandboxing works correctly; production global install correctly redirects to `~/.copilot/`. The `dot_dir_name` stays `.github` for settings, but `detect_copilot_cli` now checks `~/.copilot/` not `~/.github/`.
+
+**`print_detected_state` still shows "Config: …/settings.json (will be created)" for Copilot**: this is a known residual cosmetic gap (out of scope, unfixed as of PR #446). `print_detected_state` uses `state.settings_path` and `state.settings_exists` directly — it does not branch on `uses_dedicated_hook_file()`. For Copilot, `settings_path` resolves to `~/.github/settings.json`, which may not exist. The misleading "(will be created)" label appears but no settings.json is actually written (Copilot uses `skim.json` instead). The actual install path is correct; only the detection-phase printout is cosmetically wrong.
 
 **Borrow conflict in seed() — use `HashSet<String>`, not `HashSet<&str>`**: in writers whose `seed()` mutates the live allow array (Claude and Copilot), the existing-entries membership set must be `HashSet<String>` — a `HashSet<&str>` borrowed from the allow array conflicts with the subsequent `.push()` (E0502). The `remove_seeded` and `retain` paths (no push during scan) correctly use `HashSet<&str>`. This split is intentional and visible in both `permissions/claude.rs` and `permissions/copilot.rs`.
 
@@ -188,16 +199,22 @@ In `create_hook_script()`: (1) `atomic_write_executable()` then (2) `compute_fil
 
 **`--permissions` and `--project` are mutually exclusive**: permissions seeding writes to user-scope config files. Project-scoped settings are repository-controlled and must not receive auto-generated allowlist entries. The parser enforces this conflict explicitly.
 
+**Fileops dispatcher intercepts `--help` only, not `-h`**: `cmd/file/mod.rs` checks `args.iter().any(|a| a == "--help")` and deliberately skips `-h`. This mirrors `db/mod.rs` hostname-precedent and reflects real tool-level semantics: `grep -h` means "suppress filename prefix", `ls -h`/`du -h`/`df -h`/`tree -h` mean "human-readable". If the dispatcher also intercepted `-h`, those tool-level flags would be swallowed. Use `skim <tool> --help` explicitly to see skim's fileops usage text.
+
+**rg skips `-h` and `--help` in its rewrite rule; grep does not**: the `rg` rewrite rule in `cmd/rewrite/rules.rs` has `skip_if_flag_prefix: &["-h", "--help", ...]` because for `rg` both are help flags. The `grep` catch-all rule has `skip_if_flag_prefix: &["--help", "--version", "-V"]` — `grep -h` is intentionally NOT skipped because it is a tool-level flag (suppress filenames). Do not add `-h` to the grep or ls skip lists.
+
 ## Key Files
 
 - `crates/rskim/src/cmd/init/mod.rs` — `run()` init dispatch, `command()` clap definition, `script_has_pinned_marker()` (single source of truth for the `SKIM_HOOK_BINARY` marker scan)
 - `crates/rskim/src/cmd/init/helpers.rs` — `guidance_content()`, `guidance_content_mdc()`, `atomic_write_settings()`, `load_or_create_settings()`, `confirm_proceed()`, `confirm_grant()` (TTY-gated consent gate), `backup_settings_file()`
 - `crates/rskim/src/cmd/init/flags.rs` — `PermissionsTier`, `InitFlags`, `DetectionEnv`, `detect_installed_agents()`, `resolve_agent()`
-- `crates/rskim/src/cmd/init/install.rs` — `resolve_permissions_consent()` (consent orchestration, Copilot pre-check, mirror empty-proposal guard), `is_hook_script_current()`, `create_hook_script()`, `atomic_write_executable()`, own copy of `find_git_root_from_cwd`
-- `crates/rskim/src/cmd/hooks/mod.rs` — `generate_hook_script()`, `shell_single_quote()`, `HookProtocol` trait (including `hook_config_dir` seam), `HookSupport` enum
-- `crates/rskim/src/cmd/hooks/copilot.rs` — `CopilotCliHook`: `hook_config_dir` redirect to `~/.copilot`, `uses_dedicated_hook_file`, `format_response` (modifiedArgs, no-verb doctrine), `write_copilot_skim_json` (atomic, 0o600), `scan_copilot_foreign_hooks` and `copilot_skim_json_has_entry` (both bounded by `MAX_HOOK_FILES=50` and `MAX_SETTINGS_SIZE`)
+- `crates/rskim/src/cmd/init/install.rs` — `print_install_summary(state, agent)` and `print_dry_run_actions(..., agent)` (protocol-driven, branch on `uses_dedicated_hook_file()`); `resolve_permissions_consent()` (consent orchestration, Copilot pre-check, mirror empty-proposal guard); `is_hook_script_current()`, `create_hook_script()`, `atomic_write_executable()`; own copy of `find_git_root_from_cwd`
+- `crates/rskim/src/cmd/hooks/mod.rs` — `generate_hook_script()`, `shell_single_quote()`, `HookProtocol` trait (including `hook_config_dir` seam, `uses_dedicated_hook_file()`, `hook_event_key()`), `HookSupport` enum
+- `crates/rskim/src/cmd/hooks/copilot.rs` — `CopilotCliHook`: `hook_config_dir` redirect to `~/.copilot`, `uses_dedicated_hook_file`, `hook_event_key`, `format_response` (modifiedArgs, no-verb doctrine), `write_copilot_skim_json` (atomic, 0o600), `scan_copilot_foreign_hooks` and `copilot_skim_json_has_entry` (both bounded by `MAX_HOOK_FILES=50` and `MAX_SETTINGS_SIZE`); `SKIM_JSON_NAME` constant (`pub(crate)`, single source for "skim.json")
 - `crates/rskim/src/cmd/init/state.rs` — `detect_state()`, `uses_pinned_binary()`, `DetectedState`, `hook_is_current()`
 - `crates/rskim/src/cmd/rewrite/hook.rs` — `run_hook_mode()`, `check_hook_binary_mismatch()`, `check_hook_version_mismatch()`, `check_hook_integrity()`, `warn_once_daily()`
+- `crates/rskim/src/cmd/rewrite/rules.rs` — rewrite rule table; rg rule skips `-h`/`--help`; grep catch-all does NOT skip `-h`
+- `crates/rskim/src/cmd/file/mod.rs` — fileops dispatcher; intercepts `--help` only (not `-h`) to preserve tool-level `-h` semantics
 - `crates/rskim/src/cmd/permissions/mod.rs` — `PermissionsProtocol` trait (with `remove_seeded` ownership contract in doc), `permissions_protocol_for_agent` factory, `hash_if_bounded`, `seeded_entries`
 - `crates/rskim/src/cmd/permissions/claude.rs` — Claude writer; `propose_mirrors()` and `is_valid_mirror_source()` (mirror tier logic)
 - `crates/rskim/src/cmd/permissions/copilot.rs` — Copilot writer; per-project-key JSON map, `find_git_root_from(start)` injectable helper, `find_git_root_from_cwd()` thin wrapper
@@ -217,3 +234,6 @@ In `create_hook_script()`: (1) `atomic_write_executable()` then (2) `compute_fil
 - Feature: `analytics` — session_id flows from hook JSON via sidecar, not via rewritten command flags
 - Source: `crates/rskim/src/cmd/integrity/` — `compute_file_hash()` and `write_hash_manifest()` used in SHA-256 sidecar generation
 - Source: `crates/rskim/src/cmd/hook_log.rs` — `log_hook_warning()` (the only permitted diagnostic channel in hook mode)
+- Tests: `crates/rskim/tests/cli_init.rs` — `test_gemini_dry_run_shows_before_tool_hook_key` (verifies protocol-driven event key in dry-run output)
+- Tests: `crates/rskim/tests/cli_init_copilot_migrate.rs` — `test_copilot_dry_run_shows_register_hook_not_patch_settings` (verifies Copilot dry-run shows "Would write skim.json", not "Would patch"/"Would back up")
+- Tests: `crates/rskim/tests/cli_e2e_file_h_flag.rs` — fileops `-h` passthrough behavior
