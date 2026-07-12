@@ -153,45 +153,49 @@ struct ProxyHandle {
     proxy_addr: SocketAddr,
 }
 
-/// Find a free port within the 41000-49000 range (D8/AD-PXY-03) for tests.
+/// Bind to an OS-assigned ephemeral port and return the listener.
 ///
-/// The proxy config validation rejects ports outside this range (per D8).
-/// We scan from a randomized offset within the range to reduce collision
-/// probability under parallel test runs.
-async fn find_proxy_test_port() -> u16 {
-    // Try ports starting from a semi-random offset to avoid races.
-    // Use the lower half of the range so we don't exhaust the range.
-    let base: u16 = 41100;
-    for offset in 0..800_u16 {
-        let port = base + offset;
-        if TcpListener::bind(format!("127.0.0.1:{port}")).await.is_ok() {
-            return port;
-        }
-    }
-    panic!("no free port found in 41100-41900 test subrange");
+/// Uses `TcpListener::bind("127.0.0.1:0")`: the OS assigns a free port and
+/// guarantees uniqueness across concurrent callers — even across separate
+/// nextest processes (each test runs in its own process under nextest, so a
+/// process-global counter resets to the same starting value in every process
+/// and causes TOCTOU collisions at `-j 4`). With bind-to-0 each call gets a
+/// distinct OS-assigned port; inter-test collisions are impossible.
+///
+/// The caller passes the returned listener directly to
+/// `rskim_proxy::testing::run_server_with_listener` — no second bind occurs,
+/// so the race window is zero.
+async fn bind_test_listener() -> TcpListener {
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to OS-assigned ephemeral port")
 }
 
 impl ProxyHandle {
-    /// Start a proxy on a free port within 41000-49000 (D8/AD-PXY-03).
+    /// Start a proxy on an OS-assigned port.
+    ///
+    /// Binds via [`bind_test_listener`] (port 0) so each concurrent test gets
+    /// a guaranteed-unique port. The listener is handed directly to
+    /// `run_server_with_listener` — no second bind, zero TOCTOU race.
     async fn start(upstream_url: &str) -> Self {
-        let port = find_proxy_test_port().await;
+        let listener = bind_test_listener().await;
+        let proxy_addr = listener.local_addr().expect("listener local_addr");
 
         let config = ProxyConfig::builder()
-            .port(port)
+            .port(41001) // placeholder — run_server_with_listener ignores config.bind_addr
             .upstream_default(upstream_url)
             .build()
             .expect("proxy config");
-        let proxy_addr = config.bind_addr();
 
         let pipeline = TransformPipeline::identity();
         let analytics = Arc::new(NoopAnalyticsHook);
 
-        let task = tokio::spawn(rskim_proxy::testing::run_server_async(
-            config, pipeline, analytics,
+        let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+            listener, config, pipeline, analytics,
         ));
         let abort_handle = task.abort_handle();
 
-        // Give the proxy a moment to bind and start accepting.
+        // Give the proxy a moment to start accepting.
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
         Self {

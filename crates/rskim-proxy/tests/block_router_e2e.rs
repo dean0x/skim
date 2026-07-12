@@ -198,63 +198,49 @@ struct ProxyHandle {
     proxy_addr: SocketAddr,
 }
 
-/// Scan for a free port within the block_router_e2e subrange (41600-41700).
+/// Bind to an OS-assigned ephemeral port and return the listener.
 ///
-/// Uses a unique per-test hash of the thread ID to reduce collision probability
-/// when nextest runs tests as separate processes — each process starts scanning
-/// from a different offset.
+/// Uses `TcpListener::bind("127.0.0.1:0")`: the OS assigns a free port and
+/// guarantees uniqueness across concurrent callers — even across separate
+/// nextest processes. With bind-to-0 each call gets a distinct OS-assigned
+/// port; inter-test collisions are impossible.
 ///
-/// D8/AD-PXY-03: all ports are within the 41000-49000 allowed range.
-/// The 41600-41700 subrange is distinct from conformance_and_determinism.rs
-/// (41100-41900 starting scan) and leaves room for other test files.
-async fn find_proxy_test_port() -> u16 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Mix process ID + current time nanos for a unique per-invocation starting offset.
-    // This avoids the TOCTOU race more reliably than a sequential scan when tests
-    // start simultaneously in separate nextest processes.
-    let pid = std::process::id() as u64;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(pid);
-    let seed = (pid ^ nanos ^ (pid << 16)) as u16;
-
-    // Scan within 41600-41700 (100-port window for block_router_e2e tests).
-    let base: u16 = 41600;
-    let range: u16 = 100;
-    let start_offset = seed % range;
-    for i in 0..range {
-        let port = base + (start_offset + i) % range;
-        if TcpListener::bind(format!("127.0.0.1:{port}")).await.is_ok() {
-            return port;
-        }
-    }
-    panic!("no free port found in 41600-41700 block_router_e2e subrange");
+/// The caller passes the returned listener directly to
+/// `rskim_proxy::testing::run_server_with_listener` — no second bind occurs,
+/// so the race window is zero.
+async fn bind_test_listener() -> TcpListener {
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to OS-assigned ephemeral port")
 }
 
 impl ProxyHandle {
     /// Start a proxy with the BlockRouter pipeline (Phase 4a wiring).
+    ///
+    /// Binds via [`bind_test_listener`] (port 0) so each concurrent test gets
+    /// a guaranteed-unique port. The listener is handed directly to
+    /// `run_server_with_listener` — no second bind, zero TOCTOU race.
     async fn start_with_router(upstream_url: &str) -> Self {
-        let port = find_proxy_test_port().await;
+        let listener = bind_test_listener().await;
+        let proxy_addr = listener.local_addr().expect("listener local_addr");
+
         let config = ProxyConfig::builder()
-            .port(port)
+            .port(41001) // placeholder — run_server_with_listener ignores config.bind_addr
             .upstream_default(upstream_url)
             .build()
             .expect("proxy config");
-        let proxy_addr = config.bind_addr();
 
         let router = BlockRouter::new(Arc::new(NullSink));
         let stage = BlockRouterStage::new(router);
         let pipeline = TransformPipeline::from_stages(vec![Box::new(stage)]);
         let analytics = Arc::new(NoopAnalyticsHook);
 
-        let task = tokio::spawn(rskim_proxy::testing::run_server_async(
-            config, pipeline, analytics,
+        let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+            listener, config, pipeline, analytics,
         ));
         let abort_handle = task.abort_handle();
 
-        // Allow the proxy to bind and start accepting.
+        // Allow the proxy to start accepting.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         Self {
