@@ -624,13 +624,20 @@ fn try_parse_regex_logs_lossless(input: &str, flags: &LogFlags) -> Option<LogRes
                 !pending_stack.is_empty(),
                 "FrameContext::PythonFrame requires a frame in pending_stack"
             );
-            if *continuation_count < MAX_CONTINUATIONS_PER_FRAME {
-                if let Some(last_frame) = pending_stack.back_mut() {
-                    last_frame.push('\n');
-                    last_frame.push_str(trimmed);
-                }
-                *continuation_count += 1;
+            // ADR-007 (content-discarding guard, same family as axes 5/6): appending
+            // beyond the per-frame continuation cap would SILENTLY DROP this line's
+            // content. In Lossless mode content is never discarded → signal
+            // whole-block Passthrough (None), mirroring the PENDING_STACK_CAP eviction
+            // guard above and `try_flush_stack_lossless`. The Lossy path caps
+            // continuations for memory bounds; the Lossless path must not.
+            if *continuation_count >= MAX_CONTINUATIONS_PER_FRAME {
+                return None;
             }
+            if let Some(last_frame) = pending_stack.back_mut() {
+                last_frame.push('\n');
+                last_frame.push_str(trimmed);
+            }
+            *continuation_count += 1;
             total_lines += 1;
             continue;
         }
@@ -2709,6 +2716,74 @@ mod tests {
                 "5 stack frames trigger PENDING_STACK_CAP → Lossless must passthrough; got tier={}",
                 result.tier_name()
             );
+        }
+
+        // ---- Axis 6b: per-frame continuation cap → passthrough (#427 scrutinizer) ----
+
+        /// Axis 6b (P0 regression, #427): a Python `File "..."` frame followed by
+        /// MORE indented continuation lines than `MAX_CONTINUATIONS_PER_FRAME` must
+        /// NOT silently drop the overflow line in Lossless mode. Dropping a
+        /// continuation line discards content on the egress path (ADR-007 violation);
+        /// the whole block must fall through to Passthrough instead.
+        ///
+        /// Discriminating: before the fix, the 5th continuation line was appended-or-
+        /// dropped by an `if count < CAP { append }` with no `else`, so its bytes
+        /// vanished from the (Compressed/Degraded) output while the block still
+        /// compressed. This test asserts Passthrough AND byte-identity, so the pre-fix
+        /// behaviour (Degraded, missing the overflow line) fails both assertions.
+        #[test]
+        fn lossless_axis6b_over_cap_python_continuation_passthrough() {
+            let mut input = String::from("Traceback (most recent call last):\n");
+            input.push_str("  File \"x.py\", line 1, in <module>\n");
+            // MAX_CONTINUATIONS_PER_FRAME + 1 indented continuation lines → the last
+            // one exceeds the per-frame cap and cannot be appended without loss.
+            for i in 1..=(MAX_CONTINUATIONS_PER_FRAME + 1) {
+                input.push_str(&format!("    frame_source_line_{i}\n"));
+            }
+            let result = compress_log(&input, &lossless_flags());
+            assert!(
+                result.is_passthrough(),
+                "over-cap Python continuation must Passthrough (no content drop); got tier={}",
+                result.tier_name()
+            );
+            // Byte-identical passthrough: the overflow line's content must survive.
+            assert_eq!(
+                result.content(),
+                input,
+                "Passthrough must preserve raw input byte-identical"
+            );
+            let overflow = format!("frame_source_line_{}", MAX_CONTINUATIONS_PER_FRAME + 1);
+            assert!(
+                result.content().contains(&overflow),
+                "over-cap continuation line '{overflow}' must not be discarded"
+            );
+        }
+
+        /// Companion positive: EXACTLY `MAX_CONTINUATIONS_PER_FRAME` continuation
+        /// lines must still compress (guards against over-correcting the axis-6b fix
+        /// into an eager Passthrough that rejects at-cap input).
+        #[test]
+        fn lossless_at_cap_python_continuation_compresses() {
+            let mut input = String::from("Traceback (most recent call last):\n");
+            input.push_str("  File \"y.py\", line 2, in handler\n");
+            for i in 1..=MAX_CONTINUATIONS_PER_FRAME {
+                input.push_str(&format!("    src_{i}\n"));
+            }
+            let result = compress_log(&input, &lossless_flags());
+            assert!(
+                !result.is_passthrough(),
+                "at-cap continuations (== MAX) must still compress, not passthrough; tier={}",
+                result.tier_name()
+            );
+            // All at-cap continuation lines are preserved in the compressed output.
+            for i in 1..=MAX_CONTINUATIONS_PER_FRAME {
+                let line = format!("src_{i}");
+                assert!(
+                    result.content().contains(&line),
+                    "at-cap continuation '{line}' must be preserved: {}",
+                    result.content()
+                );
+            }
         }
 
         // ---- Axis 7: Message truncation → passthrough (JSON tier) ----
