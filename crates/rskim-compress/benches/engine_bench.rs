@@ -40,6 +40,11 @@
 //! | p50_json_block           | ~0.1-1ms        | < 10ms (D7)     |
 //! | p50_openai_passthrough   | ~0.01-0.1ms     | < 1ms           |
 //! | full_router_no_candidate | ~0.01-0.1ms     | < 1ms           |
+//! | json_minify_p50          | TBD             | < 10ms (D7)     |
+//! | json_minify_p95          | TBD             | < 10ms (D7)     |
+//! | json_gate_worst_case     | ~2.38ms         | < 10ms (D7)     |
+//! | dup_key_scan             | TBD             | < 10ms (D7)     |
+//! | code_block_passthrough   | ~0.59ms         | < 1ms (P0.1)    |
 //!
 //! NOTE: p50/p95 code block baselines updated for P0.1 (ADR-007 lossless-only egress):
 //! code blocks now pass through byte-identical without any AST transform. The old
@@ -149,6 +154,95 @@ fn p50_json_block() -> String {
     }
     s.push_str("  \"nested\": {\"a\": 1, \"b\": 2, \"c\": [1,2,3,4,5]}\n}");
     s
+}
+
+/// p95 JSON block: ~10 KiB pretty-printed JSON object (200 string-value entries).
+///
+/// Represents the 95th-percentile JSON block size. Used in `bench_json_minify_p95`
+/// to measure the minify + value-equivalence gate cost for a larger payload.
+fn p95_json_block() -> String {
+    let mut s = String::from("{\n");
+    for i in 0..199 {
+        s.push_str(&format!(
+            "  \"key_{i:03}\": \"value_{i}_a_somewhat_longer_realistic_string_here\",\n"
+        ));
+    }
+    s.push_str("  \"key_199\": \"value_199_final_entry_no_trailing_comma\"\n}");
+    s
+}
+
+/// Adversarial many-key JSON object: 3 500 integer-valued keys (~57 KiB).
+///
+/// The maximum adversarial fixture within the `MAX_JSON_BYTES = 64 KiB` prefilter
+/// limit. Stresses:
+/// - The JSON engine dup-key scan (`HashSet<Vec<u8>>` per object, 3 500 insertions).
+/// - `value_equivalent_raw` after minification (3 500 key-by-key recursive
+///   comparisons, stays well within `DEFAULT_WORK_BUDGET = 200_000`).
+///
+/// # Why 3 500, not `MAX_JSON_KEYS = 10_000`
+///
+/// 10k keys × ~15 bytes/entry (pretty-printed) ≈ 150 KiB — exceeds `MAX_JSON_BYTES`
+/// (64 KiB), so the prefilter short-circuits and neither the engine nor
+/// `value_equivalent_raw` runs. 3 500 keys ≈ 57 KiB is the largest adversarial
+/// fixture that exercises the full minify + gate path under production prefilter
+/// constraints (per ADR-003 / PF-005: no hard assertions, documented goal only).
+fn adversarial_many_key_json() -> String {
+    let mut s = String::with_capacity(60_000);
+    s.push_str("{\n");
+    for i in 0..3_500usize {
+        if i + 1 < 3_500 {
+            s.push_str(&format!("  \"k{i}\": {i},\n"));
+        } else {
+            s.push_str(&format!("  \"k{i}\": {i}\n"));
+        }
+    }
+    s.push('}');
+    s
+}
+
+/// Adversarial dup-key scan fixture: 200 entries whose string VALUES contain
+/// colon-separated text that looks like JSON key names.
+///
+/// A naive scanner that doesn't track string boundaries would falsely flag
+/// substrings like `"key_N:"` inside a string value as duplicate keys.
+/// This fixture stresses the scanner's in-string handling (must correctly
+/// ignore key-like patterns inside quoted string values).
+///
+/// ~14 KiB: 200 entries × ~70 bytes each.
+fn dup_key_scan_json() -> String {
+    let mut s = String::with_capacity(15_000);
+    s.push_str("{\n");
+    for i in 0..200usize {
+        let j = (i + 1) % 200;
+        if i < 199 {
+            s.push_str(&format!(
+                "  \"entry_{i:03}\": \"config key_{j}: some value and key_{i}: nested here\",\n"
+            ));
+        } else {
+            s.push_str(&format!(
+                "  \"entry_{i:03}\": \"config key_{j}: some value and key_{i}: nested here\"\n"
+            ));
+        }
+    }
+    s.push('}');
+    s
+}
+
+/// 90 KiB fenced Rust code block (45 × `p50_rust_code()`).
+///
+/// Used in `bench_code_block_passthrough` to record the O(1) passthrough baseline
+/// for a 90 KiB fenced code block. Represents the largest-size code block expected
+/// in real chat payloads (p99.9 class).
+///
+/// # P0.1 / ADR-007 baseline
+///
+/// Pre-P0.1 (rskim-core tree-sitter path): ~14.6 ms/90 KiB (measured at commit
+/// `9cb3020c`, 2026-07-11). Post-P0.1 (passthrough, O(1) in content size):
+/// expected < 0.2 ms (no AST transform, no rskim-core dependency).
+fn p99_fenced_code_90kb() -> String {
+    let base = p50_rust_code();
+    let code = base.repeat(45);
+    format!("```rust\n{code}\n```")
 }
 
 // ============================================================================
@@ -267,6 +361,150 @@ fn bench_full_router_no_modification(c: &mut Criterion) {
     );
 }
 
+/// Bench: p50 JSON block through the JSON engine (minify + value-equivalence gate).
+///
+/// Exercised path: parse body → classify (`Class::Json`) → prefilter (eligible) →
+/// JSON engine (minify, ~1 KiB) → `value_equivalent_raw` (20 key comparisons) →
+/// byte_gate → `mutate_block`.
+///
+/// # D7 / ADR-003
+///
+/// Combined proxy + engine target: < 10 ms (D7 documented goal; per ADR-003/PF-005,
+/// this is a RECORDED figure, NOT a hard assertion). A median ≫ 10 ms signals a
+/// prefilter-threshold or engine-choice investigation.
+fn bench_json_minify_p50(c: &mut Criterion) {
+    let json = p50_json_block();
+    let body = make_anthropic_body(&json);
+    let router = BlockRouter::new(Arc::new(MockSink::new()));
+
+    c.bench_with_input(
+        BenchmarkId::new("router/json-minify", "p50_1kib"),
+        &body,
+        |b, body| {
+            b.iter(|| {
+                let sink = MockSink::new();
+                router.route(body, Policy::Default, "bench-req", &sink)
+            })
+        },
+    );
+}
+
+/// Bench: p95 JSON block through the JSON engine (minify + value-equivalence gate).
+///
+/// Same path as `bench_json_minify_p50` but with a ~10 KiB payload (200 entries).
+/// Useful for detecting super-linear growth in the engine or gate.
+fn bench_json_minify_p95(c: &mut Criterion) {
+    let json = p95_json_block();
+    let body = make_anthropic_body(&json);
+    let router = BlockRouter::new(Arc::new(MockSink::new()));
+
+    c.bench_with_input(
+        BenchmarkId::new("router/json-minify", "p95_10kib"),
+        &body,
+        |b, body| {
+            b.iter(|| {
+                let sink = MockSink::new();
+                router.route(body, Policy::Default, "bench-req", &sink)
+            })
+        },
+    );
+}
+
+/// Bench: many-key adversarial JSON object through minify + `value_equivalent_raw`.
+///
+/// 3 500-key object (~57 KiB pretty-printed) — the largest adversarial fixture within
+/// the `MAX_JSON_BYTES = 64 KiB` prefilter limit. Exercises:
+/// - JSON engine dup-key scan: 3 500 `HashSet` insertions.
+/// - `value_equivalent_raw` gate: 3 500 key-by-key recursive comparisons.
+///
+/// See `adversarial_many_key_json()` for why 3 500 keys (not 10 000).
+///
+/// # D7 latency goal (ADR-003 / PF-005)
+///
+/// Combined proxy + engine target: < 10 ms. This bench records the empirical worst-case
+/// cost — NOT a hard assertion. If median > 10 ms consistently, investigate per-object
+/// `HashSet` allocation or `value_equivalent_raw` budget exhaustion.
+fn bench_json_gate_worst_case(c: &mut Criterion) {
+    let json = adversarial_many_key_json();
+    let body = make_anthropic_body(&json);
+    let router = BlockRouter::new(Arc::new(MockSink::new()));
+
+    c.bench_with_input(
+        BenchmarkId::new("router/json-gate", "adversarial_3500keys_57kib"),
+        &body,
+        |b, body| {
+            b.iter(|| {
+                let sink = MockSink::new();
+                router.route(body, Policy::Default, "bench-req", &sink)
+            })
+        },
+    );
+}
+
+/// Bench: in-string key-like patterns through the JSON dup-key scanner.
+///
+/// 200-entry object (~14 KiB) where every string VALUE contains substrings of the
+/// form `"key_N: value"` — a pattern that would trip a naive scanner operating on
+/// raw bytes without proper string-boundary tracking.
+///
+/// Proves that the scanner's O(n) in-string skip is correct AND fast: the per-entry
+/// scan must not regress to O(m) on the value strings (where m is value length).
+fn bench_dup_key_scan(c: &mut Criterion) {
+    let json = dup_key_scan_json();
+    let body = make_anthropic_body(&json);
+    let router = BlockRouter::new(Arc::new(MockSink::new()));
+
+    c.bench_with_input(
+        BenchmarkId::new("router/json-gate", "dup_key_scan_in_strings_14kib"),
+        &body,
+        |b, body| {
+            b.iter(|| {
+                let sink = MockSink::new();
+                router.route(body, Policy::Default, "bench-req", &sink)
+            })
+        },
+    );
+}
+
+/// Bench: 90 KiB fenced code block → O(1) passthrough (ADR-007 baseline).
+///
+/// Records the **new** passthrough cost after P0.1 (ADR-007 lossless-only egress):
+/// parse body → classify (`Class::Code`) → `EngineTarget::Passthrough` → return.
+/// No prefilter check, no AST transform, no `rskim-core` dependency.
+///
+/// # Baseline comparison (P0.1 commit `9cb3020c`, 2026-07-11)
+///
+/// | Path             | Cost / 90 KiB  | Notes                              |
+/// |------------------|----------------|------------------------------------|
+/// | Pre-P0.1 (tst)  | ~14.6 ms       | rskim-core tree-sitter transform   |
+/// | Post-P0.1 (this) | < 0.2 ms est. | O(1) passthrough, no AST parse     |
+///
+/// Per ADR-003 / PF-005: the "> 70× speedup" is a DOCUMENTED finding, not a hard
+/// assertion. Criterion regression warnings fire if a future change degrades the
+/// passthrough path significantly.
+///
+/// # DEFERRED: `bench_log_lossless_proxy_block`
+///
+/// A bench measuring the log lossless-proxy path end-to-end is deferred to Pass 5
+/// (Log Lossless regime), when the log oracle corpus has timestamps and the
+/// annotated-form log engine is implemented.
+fn bench_code_block_passthrough(c: &mut Criterion) {
+    let fenced = p99_fenced_code_90kb();
+    let body = make_anthropic_body(&fenced);
+    let router = BlockRouter::new(Arc::new(MockSink::new()));
+
+    c.bench_with_input(
+        BenchmarkId::new("router/passthrough", "code_90kib_fenced"),
+        &body,
+        |b, body| {
+            b.iter(|| {
+                let sink = MockSink::new();
+                router.route(body, Policy::Default, "bench-req", &sink)
+            })
+        },
+    );
+}
+
 // ============================================================================
 // Criterion group + main
 // ============================================================================
@@ -276,7 +514,17 @@ criterion_group! {
     // AC24: small sample size for smoke-test (CI-safe); increase to 50-100 for
     // precise baseline measurement. The recorded baselines above were taken at 10.
     config = Criterion::default().sample_size(10).warm_up_time(std::time::Duration::from_secs(1));
-    targets = bench_p50_code_block, bench_p95_code_block, bench_p50_json_block, bench_openai_passthrough, bench_full_router_no_modification
+    targets =
+        bench_p50_code_block,
+        bench_p95_code_block,
+        bench_p50_json_block,
+        bench_openai_passthrough,
+        bench_full_router_no_modification,
+        bench_json_minify_p50,
+        bench_json_minify_p95,
+        bench_json_gate_worst_case,
+        bench_dup_key_scan,
+        bench_code_block_passthrough
 }
 
 criterion_main!(engine_benches);
