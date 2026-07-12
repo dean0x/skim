@@ -579,7 +579,19 @@ fn try_flush_stack_lossless(
 ///
 /// Per ADR-007: annotations may summarize METADATA (timestamps→ranges,
 /// duplicates→counts) but CONTENT bytes are never discarded.
+///
+/// # Line-count guard (P2-3 / Scrutinizer)
+///
+/// If the input has more than [`MAX_INPUT_LINES`] lines, returns `None` immediately
+/// (whole-block passthrough). The `.take(MAX_INPUT_LINES)` loop below would silently
+/// discard all lines beyond the cap, violating ADR-007. Fence bodies are bounded by
+/// the 64 KiB block prefilter, keeping this check nearly always O(0) in practice.
 fn try_parse_regex_logs_lossless(input: &str, flags: &LogFlags) -> Option<LogResult> {
+    // Guard: more lines than the cap → passthrough (no silent truncation on egress).
+    if input.lines().count() > MAX_INPUT_LINES {
+        return None;
+    }
+
     // (level, message, captured_timestamp)
     let mut all_entries: Vec<(Option<String>, String, Option<String>)> = Vec::with_capacity(256);
     let mut total_lines = 0usize;
@@ -2958,6 +2970,56 @@ mod tests {
                     }
                 }
             }
+        }
+
+        // ---- Axis: over-input-cap guard → passthrough (P2-3 / Scrutinizer) ----
+
+        /// P2-3 (Scrutinizer): Lossless path with >MAX_INPUT_LINES lines must return
+        /// Passthrough rather than silently truncating. Truncation is content-discarding
+        /// (ADR-007 violation); the whole block must fall through byte-identical instead.
+        ///
+        /// Discriminating: before the fix, `.take(MAX_INPUT_LINES)` silently dropped
+        /// lines beyond the cap. This test asserts `is_passthrough()` and byte-identity,
+        /// which the pre-fix code fails on both counts (it returns Degraded, truncated).
+        #[test]
+        fn lossless_over_input_cap_passthrough() {
+            // Construct MAX_INPUT_LINES + 1 lines cheaply.
+            // Each line: "ERROR: x\n" (9 bytes) → ~900 KB total; fast to allocate.
+            let short_line = "ERROR: x\n";
+            let input = short_line.repeat(MAX_INPUT_LINES + 1);
+
+            let result = compress_log(&input, &lossless_flags());
+            assert!(
+                result.is_passthrough(),
+                "Lossless path with >{MAX_INPUT_LINES} lines must passthrough (no silent truncation); \
+                 got tier={}",
+                result.tier_name()
+            );
+            // Passthrough must be byte-identical: every line preserved.
+            assert_eq!(
+                result.content(),
+                input.as_str(),
+                "Passthrough must preserve all {} lines byte-identical",
+                MAX_INPUT_LINES + 1
+            );
+        }
+
+        /// Companion positive: exactly MAX_INPUT_LINES lines must still compress
+        /// (guards against over-correcting into a too-eager passthrough).
+        #[test]
+        fn lossless_at_input_cap_compresses() {
+            // Exactly MAX_INPUT_LINES lines of "ERROR: x\n" → no truncation needed.
+            let short_line = "ERROR: x\n";
+            let input = short_line.repeat(MAX_INPUT_LINES);
+
+            let result = compress_log(&input, &lossless_flags());
+            // Must NOT passthrough; the cap check is strictly >, not >=.
+            assert!(
+                !result.is_passthrough(),
+                "Lossless path with exactly {MAX_INPUT_LINES} lines must still compress; \
+                 got tier={}",
+                result.tier_name()
+            );
         }
 
         // ---- CLI stays Lossy proof ----

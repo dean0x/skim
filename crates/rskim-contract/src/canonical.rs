@@ -358,6 +358,16 @@ pub fn tools_arrays_equal(raw_original: &str, raw_reordered: &str) -> bool {
 /// for valid minified content near depth 64. Setting both bounds to 500 ensures the
 /// gate never rejects valid output that the minifier accepted.
 ///
+/// **Effective limit in practice:**
+/// `serde_json` enforces its own internal recursion limit of approximately 128
+/// levels during JSON parsing. For any input nested deeper than ~128 levels,
+/// `serde_json::from_str` returns an error, causing `value_equiv_inner` to return
+/// `None` (parse failure) before the `VALUE_EQUIV_MAX_DEPTH` guard fires. In
+/// practice this means inputs nested between ~128 and 500 levels deep yield `None`
+/// (passthrough, fail-safe), not the `Some(false)` that a correct depth check would
+/// produce. This is acceptable: the gate's contract is to pass `Some(true)` for
+/// value-equivalent inputs and to pass through (`None`) when uncertain.
+///
 /// `MAX_CANONICAL_DEPTH` (64) is intentionally different: it is for tools-array
 /// waiver verification, which operates on shallow (4–10 level) tool schemas.
 const VALUE_EQUIV_MAX_DEPTH: usize = 500;

@@ -12,11 +12,13 @@
 //! 1. Every byte OUTSIDE fence bodies (prose, ``` delimiters, info strings) MUST
 //!    be byte-identical to the input.
 //! 2. The count of ``` fences MUST be unchanged.
-//! 3. Each fence BODY is independently routed per the precedence table (AD-006 / P0.1):
-//!    - `json` hint → JSON engine
-//!    - `yaml`, `toml`, `markdown` → passthrough (byte-identical body)
-//!    - code language hints → passthrough (P0.1 / ADR-007: code never compressed on egress)
-//!    - no hint / unknown hint → passthrough
+//! 3. Each fence BODY is independently routed per the precedence table (AD-006 /
+//!    Gate-1 / P0.1). Routing uses [`crate::route::engine_for_fence`] — the single
+//!    routing table — rather than any local dispatch:
+//!    - `json` hint (case-insensitive) → JSON minifier, then `value_equivalent_raw`
+//!      gate; only `Some(true)` splices the minified body. Everything else: byte-identical.
+//!    - all other hints / no hint → passthrough (byte-identical body).
+//!    - Code language hints → passthrough (P0.1 / ADR-007: code never compressed on egress).
 //! 4. Unclosed fences (no closing ```) are left byte-identical (fail-safe).
 //! 5. CRLF line endings in prose and delimiters are preserved byte-identical.
 //!    CRLF inside fence bodies is also preserved (no code engine, no LF normalization).
@@ -35,8 +37,8 @@
 //! fences). The scanner processes each byte at most once — O(n) pass.
 
 use super::json::compress_json;
-use crate::route::{EngineTarget, engine_for_class};
-use rskim_llm::Class;
+use crate::DEFAULT_WORK_BUDGET;
+use crate::route::{EngineTarget, engine_for_fence};
 
 /// Result of a mixed-content compression attempt.
 #[derive(Debug, Clone)]
@@ -110,8 +112,10 @@ fn reconstruct_with_compressed_fences(text: &str) -> String {
             break;
         };
 
-        // Determine the engine for this fence's language hint.
-        let engine = engine_for_class(Class::Code, info_lang.as_deref());
+        // Determine the engine for this fence's language hint via the single
+        // routing table (AD-006 / Gate-1). engine_for_fence routes json → Json,
+        // everything else → Passthrough (code stays byte-identical per ADR-007).
+        let engine = engine_for_fence(info_lang.as_deref());
         let closing_line = &after_opener[closing_fence_offset..];
         let (closer_line, after_closer) = split_first_line(closing_line);
 
@@ -219,22 +223,71 @@ fn split_first_line(text: &str) -> (&str, &str) {
     }
 }
 
+/// Strip the trailing line ending (`\r\n` or `\n`) from a string.
+///
+/// `find_fence_close` includes the `\n` before the closing ``` in the body span
+/// (the body ends at the byte offset of the closing fence's line start, which
+/// follows the `\n`). The JSON minifier strips ALL whitespace including `\n`,
+/// which would glue the minified JSON directly onto the closing ``` without the
+/// separating newline. This helper peels the trailing line ending off before
+/// minification so it can be re-appended afterwards.
+fn strip_trailing_newline(s: &str) -> (&str, &str) {
+    if let Some(stripped) = s.strip_suffix("\r\n") {
+        (stripped, "\r\n")
+    } else if let Some(stripped) = s.strip_suffix('\n') {
+        (stripped, "\n")
+    } else {
+        (s, "")
+    }
+}
+
 /// Apply the appropriate engine to a fence body.
 ///
 /// Returns the compressed body string (or the original if passthrough).
-/// The trailing newline convention is preserved by the caller (it splits on
-/// the closing ``` line separately).
+///
+/// # JSON fence handling (P2-1 / P2-2 / Gate-1)
+///
+/// For `EngineTarget::Json`:
+/// 1. The trailing newline is stripped before minification (P2-2) — `find_fence_close`
+///    includes the `\n` before the closing ``` in the body span; the minifier would
+///    drop it, glueing the output JSON to the closing fence line.
+/// 2. The minified body is verified via `value_equivalent_raw` (P2-1, defense-in-depth).
+///    Only `Some(true)` → splice. `Some(false)` or `None` → byte-identical fallback.
+///    Per-fence budget: [`DEFAULT_WORK_BUDGET`] (200 000 nodes). Fence bodies are
+///    bounded by the 64 KiB block prefilter, so the budget is never exhausted in practice.
+/// 3. The stripped newline is re-appended after minification so the closing fence
+///    remains on its own line.
 ///
 /// # P0.1 / ADR-007
 ///
-/// Code fences now always pass through byte-identical. `engine_for_class` returns
-/// `Passthrough` for all `Class::Code` inputs, so the `Code` arm is removed.
+/// All non-json fences pass through byte-identical. `engine_for_fence` returns
+/// `Passthrough` for every hint except `"json"`.
 fn apply_fence_engine(body: &str, engine: EngineTarget) -> String {
     match engine {
-        EngineTarget::Json => match compress_json(body) {
-            super::json::CompressResult::Compressed { content } => content,
-            super::json::CompressResult::Passthrough => body.to_string(),
-        },
+        EngineTarget::Json => {
+            // (P2-2) Strip the trailing newline before handing to the minifier.
+            let (content, trailing_nl) = strip_trailing_newline(body);
+
+            match compress_json(content) {
+                super::json::CompressResult::Compressed { content: minified } => {
+                    // (P2-1) Gate: verify value-equivalence before splicing.
+                    let mut budget = DEFAULT_WORK_BUDGET;
+                    match rskim_contract::canonical::value_equivalent_raw(
+                        content.trim(),
+                        minified.trim(),
+                        &mut budget,
+                    ) {
+                        Some(true) => format!("{minified}{trailing_nl}"),
+                        // Gate rejected (Some(false)) or budget/depth/dup-key (None):
+                        // forward the original fence body byte-identical (fail-safe).
+                        _ => body.to_string(),
+                    }
+                }
+                // Minifier returned Passthrough (already compact, invalid JSON,
+                // duplicate key, depth/key bound exceeded) — byte-identical.
+                super::json::CompressResult::Passthrough => body.to_string(),
+            }
+        }
         EngineTarget::Log | EngineTarget::Mixed | EngineTarget::Passthrough => {
             // Data-format hints, code fences (P0.1), unknown hints, nested mixed →
             // byte-identical (AD-006 / ADR-007).
@@ -244,7 +297,7 @@ fn apply_fence_engine(body: &str, engine: EngineTarget) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -426,33 +479,115 @@ mod tests {
     }
 
     // =========================================================================
-    // AC6 — json fence routed to JSON engine
+    // AC6 — json fence routed to JSON engine (P2-1 / Gate-1 restore)
     // =========================================================================
 
+    /// Discriminating: json-hinted fence bodies must be minified (Compressed), not
+    /// forwarded byte-identical (Passthrough). Fails on any revision where the
+    /// Mixed engine routes json fences through `engine_for_class(Class::Code, _)`.
+    ///
+    /// PF-007: this test is explicit — Passthrough is a test failure, not an
+    /// acceptable alternative outcome.
     #[test]
-    fn json_fence_body_produces_valid_json() {
-        // AD-006: json hint → JSON engine; never the code arm.
+    fn json_fence_body_is_minified() {
+        // Pretty-printed JSON (has whitespace to strip → compress_json WILL compress).
         let text = "Result:\n```json\n{\"name\": \"Alice\", \"age\": 30, \"active\": true}\n```\n";
         let output = match compress_mixed(text) {
             CompressResult::Compressed { content } => content,
-            CompressResult::Passthrough => return, // acceptable if no compression occurred
-        };
-        // Extract the fence body from the output to verify it's valid JSON.
-        if let Some(start) = output.find("```json\n") {
-            let after_opener = &output[start + 8..]; // skip "```json\n"
-            if let Some(end) = after_opener.find("```") {
-                let body = &after_opener[..end];
-                let trimmed = body.trim();
-                if !trimmed.is_empty() {
-                    let parsed: Result<serde_json::Value, _> = serde_json::from_str(trimmed);
-                    assert!(
-                        parsed.is_ok(),
-                        "JSON fence body in mixed output must be valid JSON; got: {:?}",
-                        trimmed
-                    );
-                }
+            // P2-1: Passthrough is a failure — json fence must be compressed.
+            CompressResult::Passthrough => {
+                panic!(
+                    "P2-1: json-hinted fence must produce Compressed output, not Passthrough.\n\
+                     Input: {text:?}"
+                );
             }
-        }
+        };
+        // Verify the fence body was minified: no insignificant whitespace.
+        let after_opener = output
+            .strip_prefix("Result:\n```json\n")
+            .expect("prose prefix must be byte-identical");
+        let body_end = after_opener
+            .find("```")
+            .expect("closing fence must be present");
+        let body = after_opener[..body_end].trim();
+        // Minified JSON has no space after `:` or `,`.
+        assert!(
+            !body.contains(": ") && !body.contains(", "),
+            "json fence body must be minified (no insignificant whitespace); got: {body:?}"
+        );
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(body);
+        assert!(
+            parsed.is_ok(),
+            "minified json fence body must still be valid JSON; got: {body:?}"
+        );
+        // Closing fence must be on its own line (P2-2: trailing newline preserved).
+        assert!(
+            after_opener[body_end..].starts_with("```\n"),
+            "closing fence must be on its own line after minification; got: {:?}",
+            &after_opener[body_end..]
+        );
+    }
+
+    /// Discriminating: rust-hinted fence bodies stay byte-identical (ADR-007).
+    ///
+    /// Fails if any restoration of code-engine routing is attempted for rust fences.
+    #[test]
+    fn rust_fence_body_is_byte_identical() {
+        let body = "fn main() {\n    println!(\"hello\");\n    let x = 42;\n}\n";
+        let text = format!("Intro.\n```rust\n{body}```\nOutro.\n");
+        let output = match compress_mixed(&text) {
+            CompressResult::Compressed { content } => content,
+            CompressResult::Passthrough => text.clone(),
+        };
+        // The rust fence body must be byte-identical (no code compression, P0.1).
+        assert!(
+            output.contains(body),
+            "rust fence body must be byte-identical (ADR-007/P0.1); got: {output:?}"
+        );
+    }
+
+    /// Discriminating (gate): a json fence whose body has duplicate keys must stay
+    /// byte-identical. `compress_json` returns Passthrough for dup-key objects;
+    /// the gate (`value_equivalent_raw`) would return None for invalid JSON anyway.
+    /// Either path: byte-identical.
+    #[test]
+    fn json_fence_dup_key_is_byte_identical() {
+        // JSON with a duplicate key: `compress_json` returns Passthrough → body unchanged.
+        let text = "Before.\n```json\n{\"a\": 1, \"a\": 2}\n```\nAfter.\n";
+        let output = match compress_mixed(text) {
+            CompressResult::Compressed { content } => content,
+            CompressResult::Passthrough => text.to_string(),
+        };
+        // The dup-key body must be byte-identical.
+        assert!(
+            output.contains("{\"a\": 1, \"a\": 2}"),
+            "dup-key json fence body must be byte-identical (gate/passthrough); got: {output:?}"
+        );
+    }
+
+    /// Discriminating (gate / number-token preservation): `1e10` and `1.0` must
+    /// survive minification with byte-exact token representation. `value_equivalent_raw`
+    /// uses raw-byte comparison for numbers, so `1e10` → `10000000000` would fail
+    /// the gate and produce byte-identical output instead.
+    ///
+    /// The JSON minifier strips whitespace only — number tokens are never rewritten —
+    /// so this test verifies the end-to-end path: minify → gate → splice.
+    #[test]
+    fn json_fence_number_tokens_byte_exact() {
+        let text = "Numbers:\n```json\n{\n  \"count\": 1e10,\n  \"ratio\": 1.0\n}\n```\nEnd.\n";
+        let output = match compress_mixed(text) {
+            CompressResult::Compressed { content } => content,
+            CompressResult::Passthrough => text.to_string(),
+        };
+        // Number tokens must appear byte-identical in the output.
+        assert!(
+            output.contains("1e10"),
+            "number token '1e10' must be byte-exact after minification; got: {output:?}"
+        );
+        assert!(
+            output.contains("1.0"),
+            "number token '1.0' must be byte-exact after minification; got: {output:?}"
+        );
     }
 
     // =========================================================================

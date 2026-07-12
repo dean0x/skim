@@ -140,7 +140,10 @@ impl DecisionSink for NullSink {
 ///
 /// 200,000 is well above any realistic LLM tool-result payload (typical: 50–500
 /// nodes). It is below adversarial JSON bomb payloads (millions of nodes).
-const DEFAULT_WORK_BUDGET: usize = 200_000;
+///
+/// Used by `engines/mixed.rs` as the per-fence budget. Fence bodies are bounded
+/// by the 64 KiB block prefilter, so in practice the budget is never exhausted.
+pub(crate) const DEFAULT_WORK_BUDGET: usize = 200_000;
 
 /// Per-content-type block compression router (#304).
 ///

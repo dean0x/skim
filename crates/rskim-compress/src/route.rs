@@ -8,16 +8,25 @@
 //! (`engines/code.rs`) is deleted; no rskim-core AST transform is applied on
 //! the egress path.
 //!
-//! This makes language-hint lookup irrelevant for code blocks. The
-//! `Class::Mixed` path (fence scanner in `engines/mixed.rs`) calls
-//! `engine_for_class(Class::Code, hint)` directly — all language hints on
-//! code fences now return `Passthrough`; only `json` fences still compress.
-//!
 //! # AD-006 — Data-format routing precedence (retained for Mixed/Json)
 //!
 //! `language_hint == "json"` → JSON engine, NEVER a code arm.
 //! `language_hint` in {`yaml`, `toml`, `markdown`} → byte-identical passthrough.
 //! Code language hints → `Passthrough` (P0.1 — code is never compressed on egress).
+//!
+//! # Fence-body routing (Gate 1 — maximise lossless compression)
+//!
+//! Within `Class::Mixed` blocks, fence bodies are routed via [`engine_for_fence`]
+//! (not `engine_for_class`). This keeps the routing table in one place while
+//! allowing json-hinted fences to route to the JSON engine:
+//!
+//! - hint `"json"` (case-insensitive, exact match; `jsonc` excluded — it allows
+//!   comments, which are not RFC-8259 JSON) → [`EngineTarget::Json`].
+//! - All other hints (code languages, unknown, none) → [`EngineTarget::Passthrough`].
+//!
+//! After minification the caller applies a `value_equivalent_raw` gate before
+//! splicing; any fence the gate cannot confirm as value-equivalent is forwarded
+//! byte-identical (fail-safe).
 //!
 //! # AD-012 — `unknown` is the extension point
 //!
@@ -72,6 +81,34 @@ pub(crate) fn engine_for_class(
         Class::Mixed => EngineTarget::Mixed,
         // AD-012: Text and Unknown are passthrough; the Unknown arm is the extension point.
         Class::Text | Class::Unknown => EngineTarget::Passthrough,
+    }
+}
+
+/// Map a fence language hint to an engine target for use within `Class::Mixed` blocks.
+///
+/// This is the SINGLE fence routing table (AD-006 / Gate-1). Fence bodies inside
+/// mixed content MUST use this function — never `engine_for_class` — so that
+/// json-hinted fences get the JSON minifier while all code fences stay lossless.
+///
+/// # Routing
+///
+/// | Hint | Engine |
+/// |------|--------|
+/// | `"json"` (case-insensitive, exact) | [`EngineTarget::Json`] |
+/// | All other hints / `None` | [`EngineTarget::Passthrough`] |
+///
+/// `jsonc` is deliberately excluded: it allows `//` and `/* */` comments, making it
+/// non-RFC-8259 JSON. The JSON minifier would reject those as parse errors and return
+/// `CompressResult::Passthrough` anyway, but routing them explicitly here avoids the
+/// unnecessary parse attempt.
+///
+/// After the caller receives `EngineTarget::Json` it MUST apply a
+/// `value_equivalent_raw` gate before splicing the minified body; any fence the gate
+/// cannot confirm as value-equivalent is forwarded byte-identical (fail-safe).
+pub(crate) fn engine_for_fence(hint: Option<&str>) -> EngineTarget {
+    match hint {
+        Some(h) if h.eq_ignore_ascii_case("json") => EngineTarget::Json,
+        _ => EngineTarget::Passthrough,
     }
 }
 
@@ -284,5 +321,76 @@ mod tests {
             EngineTarget::Passthrough,
             "P0.1: large code block must route to Passthrough (not Code engine)"
         );
+    }
+
+    // =========================================================================
+    // engine_for_fence tests — fence-body routing (AD-006 / Gate-1 / P2-1)
+    // =========================================================================
+
+    /// Discriminating: json hint on a fence body → Json engine (Gate-1 restore).
+    ///
+    /// This test fails on any revision where json fences incorrectly route through
+    /// `engine_for_class(Class::Code, hint)` (which always returns Passthrough).
+    #[test]
+    fn fence_json_hint_routes_to_json_engine() {
+        let target = engine_for_fence(Some("json"));
+        assert_eq!(
+            target,
+            EngineTarget::Json,
+            "AD-006/Gate-1: 'json' fence hint must route to Json engine"
+        );
+    }
+
+    #[test]
+    fn fence_json_hint_case_insensitive() {
+        // engine_for_fence normalises case; "JSON", "Json", "JSON" all → Json.
+        for hint in ["JSON", "Json", "jSoN"] {
+            let target = engine_for_fence(Some(hint));
+            assert_eq!(
+                target,
+                EngineTarget::Json,
+                "engine_for_fence must be case-insensitive for json; got {:?} → {:?}",
+                hint,
+                target
+            );
+        }
+    }
+
+    #[test]
+    fn fence_rust_hint_routes_to_passthrough() {
+        // Code-language hints on fences → Passthrough (P0.1 / ADR-007).
+        let target = engine_for_fence(Some("rust"));
+        assert_eq!(
+            target,
+            EngineTarget::Passthrough,
+            "fence 'rust' hint must route to Passthrough (ADR-007)"
+        );
+    }
+
+    #[test]
+    fn fence_no_hint_routes_to_passthrough() {
+        let target = engine_for_fence(None);
+        assert_eq!(
+            target,
+            EngineTarget::Passthrough,
+            "fence with no hint must route to Passthrough"
+        );
+    }
+
+    #[test]
+    fn fence_jsonc_routes_to_passthrough() {
+        // jsonc allows comments → not RFC-8259 JSON → excluded from Json engine.
+        let target = engine_for_fence(Some("jsonc"));
+        assert_eq!(
+            target,
+            EngineTarget::Passthrough,
+            "jsonc fence must route to Passthrough (comments not RFC-8259)"
+        );
+    }
+
+    #[test]
+    fn fence_unknown_hint_routes_to_passthrough() {
+        let target = engine_for_fence(Some("cobol"));
+        assert_eq!(target, EngineTarget::Passthrough);
     }
 }

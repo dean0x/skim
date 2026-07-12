@@ -405,6 +405,53 @@ pub fn generate_large_openai(target_bytes: usize) -> Vec<u8> {
     body.into_bytes()
 }
 
+/// Anthropic request with a mixed-content text block (prose + compact json fence).
+///
+/// # Purpose: ext:lossless-content invariant coverage for the Mixed engine
+///
+/// This fixture exercises the `Class::Mixed` path through BlockRouter:
+/// the text block contains prose with an embedded fenced JSON block.
+/// The JSON fence body is already compact (no insignificant whitespace),
+/// so `compress_json` returns `Passthrough` → the whole text block is byte-identical
+/// → the lossless-content oracle passes via the byte-identical fast-path.
+///
+/// # Oracle interaction
+///
+/// The `ext:lossless-content` oracle's `check_text_block_lossless` function classifies
+/// text blocks by their first non-whitespace byte. A mixed block starts with prose
+/// (`H` in "Here is"), not `{` or `[`, so it does NOT match the JSON arm. After the
+/// fence body minifier returns Passthrough (already compact), the whole block is
+/// byte-identical → `check_lossless_content` sees `i_text == o_text` → passes.
+///
+/// # What is NOT exercised here (and where it IS exercised)
+///
+/// The actual json-fence minification path (pretty-printed → compact, with
+/// value_equivalent_raw gate) is exercised by the discriminating unit tests in
+/// `crates/rskim-compress/src/engines/mixed.rs`:
+/// - `json_fence_body_is_minified` — Gate-1 restore; requires Compressed output.
+/// - `json_fence_number_tokens_byte_exact` — number token byte-exact after gate.
+/// - `json_fence_dup_key_is_byte_identical` — gate/passthrough for dup-key objects.
+///
+/// # One-class convention (relaxed)
+///
+/// This fixture's text block is `Class::Mixed` (prose + fence). The lossless-content
+/// oracle exercises the byte-identical arm, not the JSON or log oracle arms.
+pub const ANTHROPIC_MIXED_JSON_FENCE: &[u8] = br#"{
+  "model": "claude-3-5-sonnet-20241022",
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Here is some data:\n```json\n{\"key\":\"value\",\"count\":42}\n```\nEnd."
+        }
+      ]
+    }
+  ]
+}"#;
+
 /// All valid corpus inputs (static, both schemas).
 pub const VALID_CORPUS: &[&[u8]] = &[
     ANTHROPIC_MINIMAL,
@@ -417,6 +464,7 @@ pub const VALID_CORPUS: &[&[u8]] = &[
     ANTHROPIC_JSON_NUMBER_TOKENS,
     ANTHROPIC_LOG_DEDUP,
     ANTHROPIC_LOG_TIMESTAMPED,
+    ANTHROPIC_MIXED_JSON_FENCE,
     OPENAI_MINIMAL,
     OPENAI_MULTI_TURN,
     OPENAI_TOOL_CALLS,
@@ -447,6 +495,7 @@ pub const ALL_CORPUS: &[&[u8]] = &[
     ANTHROPIC_JSON_NUMBER_TOKENS,
     ANTHROPIC_LOG_DEDUP,
     ANTHROPIC_LOG_TIMESTAMPED,
+    ANTHROPIC_MIXED_JSON_FENCE,
     // Valid — OpenAI
     OPENAI_MINIMAL,
     OPENAI_MULTI_TURN,
