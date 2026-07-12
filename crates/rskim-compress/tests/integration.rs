@@ -1603,6 +1603,43 @@ fn ac25_full_router_passes_conformance_suite() {
     );
 }
 
+/// AC25-ext — Full router passes the `ext:lossless-content` extension invariant.
+///
+/// Registers `lossless_content_check` and runs `run_conformance_suite_with_extensions`
+/// over `ALL_CORPUS`. BlockRouter must not normalize JSON number tokens or silently
+/// drop log lines — proven end-to-end through the full router stack.
+///
+/// # What this proves (ADR-007 / #427 Pass 3)
+///
+/// - JSON minifier + value-equivalence gate preserve raw number tokens (`1e10` stays
+///   `1e10`; `value_equivalent_raw` returns `Some(true)`).
+/// - Log dedup-only compression satisfies the log oracle (distinct lines verbatim
+///   in output; header total == non-blank input count).
+/// - Code blocks always passthrough (oracle trivially satisfied by identity).
+///
+/// Complement: `assert_lossy_engine_fails_lossless_content_only` in `rskim-contract`
+/// proves the invariant is non-vacuous (PF-007).
+#[test]
+fn ac25_full_router_passes_lossless_content_extension() {
+    use rskim_contract::extension::{ExtensionRegistry, lossless_content_check};
+    use rskim_contract::harness::run_conformance_suite_with_extensions;
+
+    let mut registry = ExtensionRegistry::new();
+    registry.register("lossless-content", lossless_content_check());
+
+    let router = BlockRouter::new(Arc::new(MockSink::new()));
+    let report = run_conformance_suite_with_extensions(
+        &router,
+        "req-ac25-ext-lossless",
+        Some(&registry),
+    );
+    assert!(
+        report.all_passed(),
+        "BlockRouter must pass ext:lossless-content invariant across ALL_CORPUS: {:#?}",
+        report.failures()
+    );
+}
+
 // ============================================================================
 // AC26 — Dependency/layering checks.
 //

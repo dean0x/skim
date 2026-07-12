@@ -147,6 +147,250 @@ pub fn marker_immutability_check() -> Box<InvariantCheck> {
     })
 }
 
+// ============================================================================
+// ext:lossless-content — per-engine oracle (#427 Pass 3)
+// ============================================================================
+
+/// Budget for [`crate::canonical::value_equivalent_raw`] in the
+/// `lossless-content` extension check.
+///
+/// 10× the production `DEFAULT_WORK_BUDGET` (200 000 nodes). The harness runs
+/// offline against a small static corpus, so a generous budget is safe and
+/// ensures even large adversarial JSON fixtures are fully compared.
+const LOSSLESS_CONTENT_BUDGET: usize = 2_000_000;
+
+/// Create the `lossless-content` extension invariant check.
+///
+/// # Semantics
+///
+/// The check passes iff:
+/// - `output == input` (byte-identical), **or**
+/// - For each CHANGED `"text"` content block in the Anthropic request body:
+///   - **JSON block** (trimmed text starts with `{` or `[` and parses as valid
+///     JSON): the change is value-equivalent with raw number token preservation,
+///     verified via [`crate::canonical::value_equivalent_raw`] with a generous
+///     budget.
+///   - **LOG block** (≥50% of non-blank lines match log-level patterns): the
+///     change satisfies the log oracle — every distinct input line appears
+///     verbatim as a substring in the output, **and** the output header's total
+///     line count equals the non-blank input line count.
+///   - **All other block classes**: byte-identical required (no oracle ⇒ no
+///     exemption).
+///
+/// # Implementation: whole-body granularity + per-block class detection
+///
+/// The harness passes raw request bytes. Block segmentation navigates the
+/// Anthropic schema: `messages[].content[].text` for `"type": "text"` blocks.
+/// Each corpus fixture follows the one-class convention (JSON or LOG per
+/// fixture; see `corpus::ANTHROPIC_JSON_NUMBER_TOKENS` and
+/// `corpus::ANTHROPIC_LOG_DEDUP`) so per-block class detection is reliable.
+///
+/// # Falsifiability (PF-007)
+///
+/// `LossyEngineContract` in `harness::self_test` stubs a JSON number to `0`,
+/// which is NOT value-equivalent to `1e10` by raw bytes. It must fail ONLY
+/// this invariant. Isolation is asserted by
+/// `assert_lossy_engine_fails_lossless_content_only`.
+///
+/// # ADR-007 / #427
+///
+/// Registered as `"lossless-content"` → reported as `"ext:lossless-content"` in
+/// `ConformanceReport`.
+pub fn lossless_content_check() -> Box<InvariantCheck> {
+    Box::new(|input: &[u8], output: &[u8]| check_lossless_content(input, output))
+}
+
+fn check_lossless_content(input: &[u8], output: &[u8]) -> bool {
+    // Byte-identical: trivially passes.
+    if input == output {
+        return true;
+    }
+    // Non-UTF-8 changed body: no oracle available.
+    let Ok(input_str) = std::str::from_utf8(input) else {
+        return false;
+    };
+    let Ok(output_str) = std::str::from_utf8(output) else {
+        return false;
+    };
+    // Parse both as JSON to navigate the Anthropic message schema.
+    let Ok(input_val) = serde_json::from_str::<serde_json::Value>(input_str) else {
+        return false;
+    };
+    let Ok(output_val) = serde_json::from_str::<serde_json::Value>(output_str) else {
+        return false;
+    };
+
+    let input_texts = extract_content_texts(&input_val);
+    let output_texts = extract_content_texts(&output_val);
+
+    // Block count must be identical (no messages/blocks added or removed).
+    if input_texts.len() != output_texts.len() {
+        return false;
+    }
+
+    for (i_text, o_text) in input_texts.iter().zip(output_texts.iter()) {
+        if i_text == o_text {
+            continue; // Block unchanged.
+        }
+        if !check_text_block_lossless(i_text, o_text) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Extract decoded text from all `"type": "text"` content blocks in an Anthropic
+/// request body.
+///
+/// Navigates `messages[].content` in both string-form and array-of-blocks-form.
+/// Non-text block types (thinking, image, tool_use, tool_result) are skipped.
+fn extract_content_texts(val: &serde_json::Value) -> Vec<String> {
+    let mut texts = Vec::new();
+    let Some(messages) = val.get("messages").and_then(|m| m.as_array()) else {
+        return texts;
+    };
+    for msg in messages {
+        extract_message_texts(msg, &mut texts);
+    }
+    texts
+}
+
+fn extract_message_texts(msg: &serde_json::Value, texts: &mut Vec<String>) {
+    match msg.get("content") {
+        Some(serde_json::Value::String(s)) => texts.push(s.clone()),
+        Some(serde_json::Value::Array(blocks)) => {
+            for block in blocks {
+                if block.get("type").and_then(|t| t.as_str()).is_some_and(|t| t == "text")
+                    && let Some(text) = block.get("text").and_then(|t| t.as_str())
+                {
+                    texts.push(text.to_owned());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Check a single changed text block for losslessness.
+///
+/// - **JSON class**: verified via `value_equivalent_raw`.
+/// - **LOG class**: verified via the log oracle.
+/// - **Other class**: requires byte-identical; change already detected by caller.
+fn check_text_block_lossless(input_text: &str, output_text: &str) -> bool {
+    let trimmed = input_text.trim();
+
+    // JSON class: starts with `{` or `[` and parses as valid JSON.
+    if (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_ok()
+    {
+        let mut budget = LOSSLESS_CONTENT_BUDGET;
+        return matches!(
+            crate::canonical::value_equivalent_raw(trimmed, output_text.trim(), &mut budget),
+            Some(true)
+        );
+    }
+
+    // LOG class: ≥50% of non-blank lines match log-level patterns.
+    if is_log_text(input_text) {
+        return check_log_oracle(input_text, output_text);
+    }
+
+    // Other class: change detected by caller → fail (no oracle).
+    false
+}
+
+/// Returns `true` if ≥50% of non-blank lines in `text` carry a log-level prefix.
+///
+/// Mirrors the heuristic in `rskim_llm::classify::try_classify_log` to detect
+/// the same block class without introducing an rskim-llm dependency.
+fn is_log_text(text: &str) -> bool {
+    let (total, matching) = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .fold((0usize, 0usize), |(total, matching), line| {
+            (
+                total + 1,
+                matching + usize::from(line_has_log_level_prefix(line)),
+            )
+        });
+    total > 0 && matching * 2 >= total
+}
+
+/// Returns `true` if `line` starts with a known log-level prefix.
+///
+/// Recognizes bare and colon/space/tab-separated prefixes (e.g. `ERROR:`,
+/// `WARN `, `INFO\t`). Uses ASCII uppercase comparison to avoid allocation.
+fn line_has_log_level_prefix(line: &str) -> bool {
+    const LEVELS: &[&str] = &[
+        "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "TRACE", "FATAL", "CRITICAL",
+    ];
+    let lb = line.as_bytes();
+    LEVELS.iter().any(|&level| {
+        let lev = level.as_bytes();
+        if lb.len() < lev.len() {
+            return false;
+        }
+        if !lb[..lev.len()].eq_ignore_ascii_case(lev) {
+            return false;
+        }
+        let rest = &lb[lev.len()..];
+        rest.is_empty() || rest[0] == b':' || rest[0] == b' ' || rest[0] == b'\t'
+    })
+}
+
+/// Log oracle for the `lossless-content` invariant.
+///
+/// Verifies:
+/// 1. Every distinct non-blank input line appears verbatim (as a substring) in
+///    the output, proving no log message was silently dropped.
+/// 2. The output header reports a total equal to the non-blank input line count,
+///    proving no line was silently excluded from the count.
+///
+/// Header format from `LogResult::render`:
+/// `"N lines → M unique (K duplicates removed)"` where `N` is the first token.
+///
+/// # Why substring containment for check 1
+///
+/// The log engine reformats entries as ` LEVEL: message (×N)`. The verbatim
+/// line `"ERROR: connection refused"` IS a substring of
+/// `" ERROR: connection refused (×3)"`, so no content was lost.
+///
+/// # Timestamp condition (check 3)
+///
+/// Not applied here: the `ANTHROPIC_LOG_DEDUP` corpus fixture has no timestamps,
+/// so the condition is vacuously satisfied. Pass 5 will add a timestamped LOG
+/// fixture and extend this oracle with the min/max range check.
+fn check_log_oracle(input_text: &str, output_text: &str) -> bool {
+    let mut non_blank_count = 0usize;
+    let mut seen = std::collections::HashSet::<String>::new();
+
+    // Check 1: every distinct non-blank input line appears as a substring in output.
+    for line in input_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        non_blank_count += 1;
+        if seen.insert(trimmed.to_owned()) && !output_text.contains(trimmed) {
+            return false;
+        }
+    }
+
+    // Check 2: parse the header's total and compare to non_blank_count.
+    // Header: "N lines → M unique (K duplicates removed)"
+    if let Some(reported_total) = output_text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .and_then(|n| n.parse::<usize>().ok())
+    {
+        return reported_total == non_blank_count;
+    }
+
+    // No parseable header: the output is not a log compression result.
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

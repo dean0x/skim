@@ -64,6 +64,83 @@ pub fn generate_deep_nesting(depth: usize) -> Vec<u8> {
     buf
 }
 
+/// Anthropic request with a JSON content block containing number tokens
+/// `1e10`, `1.0`, and `100.00` (pretty-printed so the JSON minifier compresses it).
+///
+/// # Purpose: `ext:lossless-content` invariant testing (#427 Pass 3)
+///
+/// After JSON minification, number tokens must be preserved byte-identical (AC11).
+/// `value_equivalent_raw` catches normalization violations (`1e10` → `10000000000`)
+/// while passing lossless minification (`1e10` → `1e10`).
+///
+/// # One-class convention
+///
+/// Each corpus fixture is dominated by one content class so the `ext:lossless-content`
+/// check can apply the correct oracle. This fixture's text content block is a
+/// pretty-printed JSON object → `Class::Json`.
+pub const ANTHROPIC_JSON_NUMBER_TOKENS: &[u8] = br#"{
+  "model": "claude-3-5-sonnet-20241022",
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "{\n  \"count\": 1e10,\n  \"ratio\": 1.0,\n  \"total\": 100.00\n}"
+        }
+      ]
+    }
+  ]
+}"#;
+
+/// Anthropic request with a duplicate-heavy log block — tests dedup-only compression
+/// via the `ext:lossless-content` log oracle.
+///
+/// # Design constraints (critical sequencing — log engine is still LOSSY until Pass 5)
+///
+/// The ONLY compression triggered is line deduplication with `×N` count rendering.
+/// To satisfy the oracle under the current engine:
+/// - **No timestamps** — timestamp stripping changes the line text, violating the
+///   verbatim-substring oracle check.
+/// - **No DEBUG/TRACE lines** — they are hidden (`debug_hidden > 0`), which changes
+///   the Σ-count oracle. `LogFlags::default()` has `keep_debug = false`.
+/// - **No case-variant duplicates** — the dedup key uses lowercased message text;
+///   case variants create separate entries, complicating the oracle.
+/// - **No stack traces** — frame elision (last-3 rule) is non-lossless until Pass 5.
+/// - **Below truncation limits** — `MAX_INPUT_LINES = 100_000`; 5 lines is safe.
+///
+/// # Oracle verification (Pass 3 empirical check)
+///
+/// After BlockRouter processes this fixture via the log engine:
+/// - Oracle check 1 (distinct input lines verbatim in output):
+///   "ERROR: connection refused" ⊆ " ERROR: connection refused (×3)" ✓
+///   "INFO: request processed"  ⊆ " INFO: request processed (×2)"   ✓
+/// - Oracle check 2 (Σ of ×N counts == non-blank input lines):
+///   Output header: "5 lines → 2 unique (3 duplicates removed)"; parsed total = 5 == 5 ✓
+///
+/// Pass 5 will add a fixture with timestamps to exercise oracle condition 3
+/// (min/max timestamp range extremes).
+///
+/// # One-class convention
+///
+/// This fixture's text content block is log output → `Class::Log`.
+pub const ANTHROPIC_LOG_DEDUP: &[u8] = br#"{
+  "model": "claude-3-5-sonnet-20241022",
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "ERROR: connection refused\nERROR: connection refused\nERROR: connection refused\nINFO: request processed\nINFO: request processed"
+        }
+      ]
+    }
+  ]
+}"#;
+
 /// Anthropic schema with thinking blocks (sacrosanct content class).
 pub const ANTHROPIC_WITH_THINKING: &[u8] = br#"{
   "model": "claude-3-5-sonnet-20241022",
@@ -299,6 +376,8 @@ pub const VALID_CORPUS: &[&[u8]] = &[
     ANTHROPIC_TOOL_RESULT,
     ANTHROPIC_SACROSANCT,
     ANTHROPIC_WITH_THINKING,
+    ANTHROPIC_JSON_NUMBER_TOKENS,
+    ANTHROPIC_LOG_DEDUP,
     OPENAI_MINIMAL,
     OPENAI_MULTI_TURN,
     OPENAI_TOOL_CALLS,
@@ -326,6 +405,8 @@ pub const ALL_CORPUS: &[&[u8]] = &[
     ANTHROPIC_TOOL_RESULT,
     ANTHROPIC_SACROSANCT,
     ANTHROPIC_WITH_THINKING,
+    ANTHROPIC_JSON_NUMBER_TOKENS,
+    ANTHROPIC_LOG_DEDUP,
     // Valid — OpenAI
     OPENAI_MINIMAL,
     OPENAI_MULTI_TURN,
