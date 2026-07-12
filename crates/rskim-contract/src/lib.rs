@@ -12,9 +12,11 @@
 //!    variant, never `Err`. This makes fail-open the *only* shape the output type
 //!    can express.
 //!
-//! 2. **Never-inflate** — Per-transform-unit and whole-request output bytes ≤
-//!    input bytes. The gate is a byte-length comparison only — no tokenizer in the
-//!    accept/reject path. No tiny-payload exemption (unlike the L2 guardrail).
+//! 2. **Never-inflate AND never-lose-information** — Per-transform-unit and
+//!    whole-request output bytes ≤ input bytes, and all active egress engines are
+//!    information-preserving (lossless-only per ADR-007/#427). The gate is a
+//!    byte-length comparison only — no tokenizer in the accept/reject path. No
+//!    tiny-payload exemption (unlike the L2 guardrail).
 //!
 //! 3. **Hot-zone byte-identity** — System prompt, tools array, and every message
 //!    up to and including the last assistant message are re-emitted from the

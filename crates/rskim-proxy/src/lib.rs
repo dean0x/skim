@@ -19,10 +19,12 @@
 //!    The connection cap uses bounded-accept TCP backpressure (AD-PXY-13) — the
 //!    proxy does NOT emit 503+Retry-After.
 //!
-//! 2. **Never-inflate** — the transform seam composes #301's `guarded_transform`
-//!    gate; output bytes ≤ input bytes per stage (invariant 2). The identity stage
-//!    ships with this ticket; #304/#306/#307 plug into the [`seam::TransformStage`]
-//!    trait.
+//! 2. **Never-inflate AND never-lose-information** — the transform seam composes
+//!    #301's `guarded_transform` gate; output bytes ≤ input bytes per stage
+//!    (invariant 2), and all egress engines are lossless-only (ADR-007/#427):
+//!    information-preserving re-encoding only, no content discarding. The identity
+//!    stage ships with this ticket; #304/#306/#307 plug into the
+//!    [`seam::TransformStage`] trait.
 //!
 //! 3. **Byte-identical header forward** — allowed-list only: RFC 9110 hop-by-hop
 //!    headers, Host/SNI rewrite, and framing. No `Via`. See `forward.rs`.
