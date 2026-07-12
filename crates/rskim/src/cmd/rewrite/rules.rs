@@ -1721,11 +1721,14 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         global_value_flags: &[],
         require_flag: &[],
     },
-    // rg — pipe-source excluded so `rg pat | head` is not rewritten (AD-RW-2)
+    // rg — pipe-source excluded so `rg pat | head` is not rewritten (AD-RW-2).
+    // `-h`/`--help` skipped: for rg (unlike grep) these are help flags, not
+    // tool-level flags; without the skip, `rg --help` / `rg -h` would be
+    // rewritten to `skim rg …` and show skim's fileops help instead of rg's.
     RewriteRule {
         prefix: &["rg"],
         rewrite_to: &["skim", "rg"],
-        skip_if_flag_prefix: &["--json", "-c", "--count", "-l", "--files"],
+        skip_if_flag_prefix: &["-h", "--help", "--json", "-c", "--count", "-l", "--files"],
         category: RewriteCategory::FileOps,
         skip_if_middle_contains_eq: false,
         global_value_flags: &[],
@@ -2373,6 +2376,23 @@ mod tests {
         assert!(
             try_rewrite(&["grep", "--help"]).is_none(),
             "grep --help should pass through"
+        );
+    }
+
+    /// rg --help and rg -h must both skip the rg rewrite rule.
+    /// For rg, unlike grep, -h and --help are both help flags and must never
+    /// be rewritten to `skim rg` (which would swallow them and show skim's
+    /// fileops help instead of rg's own help output).
+    #[test]
+    fn test_rg_help_skip() {
+        use crate::cmd::rewrite::engine::try_rewrite;
+        assert!(
+            try_rewrite(&["rg", "--help"]).is_none(),
+            "rg --help should pass through (not rewritten to skim rg)"
+        );
+        assert!(
+            try_rewrite(&["rg", "-h"]).is_none(),
+            "rg -h should pass through (not rewritten to skim rg)"
         );
     }
 }
