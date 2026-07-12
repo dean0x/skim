@@ -9,9 +9,9 @@
 //!
 //! **COUNTERFIX golden** (`cli_log_golden_counterfix`): exercises continuation +
 //! traceback + chained-exception separators (the P1.1 bug surface). This golden
-//! captures the CURRENT (buggy) output and WILL be intentionally re-captured in
-//! Pass 4 when the P1.1 header counting is fixed. Do not treat a change to this
-//! golden as a regression until Pass 4.
+//! captures the FIXED output after Pass 4 (P1.1 header-counting fix). Header now
+//! correctly reports "12 lines → 5 unique (7 duplicates removed)" — the X−Z=Y
+//! invariant holds. Treat any change to this golden as a regression.
 //!
 //! ## Capture procedure (for re-capture in Pass 4)
 //!
@@ -91,22 +91,23 @@ fn cli_log_golden_stable() {
 //
 // Input: log with chained-exception separator ("The above exception was the
 // direct cause..."), two Traceback blocks, and continuation stack-frame lines.
-// This golden captures the CURRENT BUGGY OUTPUT (P1.1 counting bug):
-//   "4 lines → 5 unique (0 duplicates removed)"
-//   (total_lines=4 < unique_messages=5 — saturating_sub yields 0 duplicates)
+// This golden captures the FIXED P1.1 output (Pass 4 complete):
+//   "12 lines → 5 unique (7 duplicates removed)"
+//   total_lines=12 (step 8 ×4, Traceback ×2, continuation ×5, separator ×1).
+//   X−Z=Y invariant: 12−7=5 ✓
 //
-// This golden WILL change in Pass 4 when P1.1 is fixed. Re-capture then.
-// Until Pass 4, a change to this golden IS expected and planned.
+// This golden is now stable. Any change is a regression.
 // ============================================================================
 
 const COUNTERFIX_INPUT: &str = include_str!("fixtures/cmd/log/stack_trace_python_chained.txt");
 
-/// Captured from `./target/debug/skim log < stack_trace_python_chained.txt` on 2026-07-11.
-/// Pinned against: rskim-compress::log at wave/l3-wave2 HEAD c6585948.
+/// Captured from `./target/debug/skim log < stack_trace_python_chained.txt` on 2026-07-12.
+/// Pinned against: rskim-compress::log after P1.1 fix (Pass 4, #427).
 ///
-/// NOTE: This output contains the P1.1 bug (total_lines < unique_messages → 0 duplicates).
-/// It WILL be re-captured in Pass 4 when the header-counting fix lands (#427 P1.1).
-const GOLDEN_COUNTERFIX: &str = "4 lines \u{2192} 5 unique (0 duplicates removed)\n \
+/// P1.1 fix: total_lines now counts all 3 previously-uncounted entry-push sites
+/// (Step 3 continuations, Step 5 Traceback headers, Step 6 separator). Header
+/// satisfies X−Z=Y: 12 − 7 = 5. This is the permanent stable value.
+const GOLDEN_COUNTERFIX: &str = "12 lines \u{2192} 5 unique (7 duplicates removed)\n \
 ERROR: Operation failed\n\
 Traceback (most recent call last):\n\
 File \"/app/db.py\", line 45, in query\n\
@@ -125,13 +126,11 @@ respond(request)\n \
 ServiceError: failed to process request\n \
 INFO: recovered";
 
-/// COUNTERFIX golden: captures current (buggy) P1.1 output.
+/// COUNTERFIX golden: captures fixed P1.1 output (Pass 4 complete).
 ///
-/// This test will INTENTIONALLY FAIL after Pass 4 fixes P1.1. Re-capture then.
-///
-/// Discriminating NOW: if the header counting regresses in an unplanned way
-/// before Pass 4, this test catches the drift. After Pass 4, re-capture the
-/// fixed output and this becomes the new permanent stable golden.
+/// Discriminating: any change to this golden is a regression. The header must
+/// report "12 lines → 5 unique (7 duplicates removed)" — X−Z=Y holds after the
+/// P1.1 fix that counts all three previously-uncounted entry-push sites.
 #[test]
 fn cli_log_golden_counterfix() {
     let output = skim_cmd()

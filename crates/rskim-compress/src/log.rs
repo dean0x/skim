@@ -568,6 +568,9 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
                 }
                 *continuation_count += 1;
             }
+            // P1.1: count every non-blank input line that is handled here so
+            // total_lines >= unique_messages + debug_hidden always holds.
+            total_lines += 1;
             continue;
         }
 
@@ -584,6 +587,8 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
             }
             frame_ctx = FrameContext::Idle;
             found_structured = true;
+            // P1.1: count Traceback header lines so total_lines is accurate.
+            total_lines += 1;
             continue;
         }
 
@@ -598,6 +603,8 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
             );
             frame_ctx = FrameContext::Idle;
             all_entries.push((None, trimmed.to_string()));
+            // P1.1: count separator lines so total_lines is accurate.
+            total_lines += 1;
             continue;
         }
 
@@ -775,9 +782,17 @@ fn build_log_result(
     stack_frames_elided: usize,
 ) -> LogResult {
     let unique_messages = output_entries.len();
+    // P1.1: all three non-step-8 entry-push sites (continuation, Traceback header,
+    // chained-exception separator) now increment total_lines, so this invariant
+    // must hold.  debug_assert fires in debug/test builds; saturating_sub is the
+    // release safety belt (DoS prevention — no release panic from user input).
+    debug_assert!(
+        total_lines >= unique_messages.saturating_add(debug_hidden),
+        "P1.1 bug: total_lines({total_lines}) < unique({unique_messages}) + debug({debug_hidden}); \
+         an entry-push site is not counting"
+    );
     let deduplicated_count = total_lines
-        .saturating_sub(unique_messages)
-        .saturating_sub(debug_hidden);
+        .saturating_sub(unique_messages.saturating_add(debug_hidden));
 
     LogResult::new_with_stack(
         total_lines,
@@ -2062,6 +2077,114 @@ mod tests {
                 "Frame after the ERROR entry should be attached; got: {:?}",
                 error_entry.message
             );
+        }
+    }
+
+    // ============================================================================
+    // P1.1 — entry-push site counting fix (#427 Step 7)
+    // ============================================================================
+
+    mod p1_1_counting_fix_tests {
+        use super::*;
+
+        /// Combined three-site fixture: continuation lines (Step 3), Traceback header
+        /// (Step 5), and chained-exception separator (Step 6) are all now counted in
+        /// `total_lines` so the header arithmetic holds.
+        ///
+        /// Non-blank lines counted after the fix:
+        /// - ERROR: outer failure         → step 8           (+1)
+        /// - Traceback (most recent…)     → step 5 (site 2)  (+1)
+        /// - File "/app/foo.py"…          → step 2 (NOT counted — stack frame)
+        /// - bad()                        → step 3 (site 1)  (+1)
+        /// - ValueError: bad value        → step 8           (+1)
+        /// - The above exception…         → step 6 (site 3)  (+1)
+        /// - RuntimeError: wrapped        → step 8           (+1)
+        /// - INFO: recovered              → step 8           (+1)
+        ///
+        /// total_lines = 7, unique_messages = 5, debug_hidden = 0,
+        /// deduplicated_count = 7 − 5 − 0 = 2.
+        /// X − Z = Y ⟹ 7 − 2 = 5 ✓
+        #[test]
+        fn test_three_uncounted_sites_total_lines_fix() {
+            let input = concat!(
+                "ERROR: outer failure\n",
+                "Traceback (most recent call last):\n",
+                "  File \"/app/foo.py\", line 5, in f\n",
+                "    bad()\n",
+                "ValueError: bad value\n",
+                "\n",
+                "The above exception was the direct cause of the following exception:\n",
+                "\n",
+                "RuntimeError: wrapped\n",
+                "INFO: recovered\n",
+            );
+            let flags = make_flags();
+            let result = try_parse_regex_logs(input, &flags).expect("Should produce a LogResult");
+
+            assert_eq!(
+                result.total_lines, 7,
+                "P1.1: total_lines must count all three uncounted sites \
+                 (continuation, Traceback header, separator); got {}",
+                result.total_lines
+            );
+            assert_eq!(result.unique_messages, 5, "5 distinct entries expected");
+            assert_eq!(result.debug_hidden, 0, "no debug lines in this input");
+            assert_eq!(
+                result.deduplicated_count, 2,
+                "deduplicated_count = total_lines({}) - unique({}) - debug({}) = 2",
+                result.total_lines, result.unique_messages, result.debug_hidden
+            );
+
+            // X − Z = Y must hold (debug_hidden = 0 ⟹ no remainder).
+            assert_eq!(
+                result.total_lines.saturating_sub(result.deduplicated_count),
+                result.unique_messages,
+                "Header invariant X − Z = Y violated: {total} − {dedup} ≠ {unique}",
+                total = result.total_lines,
+                dedup = result.deduplicated_count,
+                unique = result.unique_messages
+            );
+        }
+
+        /// General invariant X = Y + Z + W across ALL regex-parseable fixtures.
+        ///
+        /// `total_lines = unique_messages + deduplicated_count + debug_hidden`
+        /// must hold for every fixture regardless of debug content.
+        #[test]
+        fn test_all_regex_fixtures_header_arithmetic_invariant() {
+            let fixture_names: &[&str] = &[
+                "plaintext_mixed.txt",
+                "stack_trace_java.txt",
+                "stack_trace_python.txt",
+                "stack_trace_python_chained.txt",
+                "stack_trace_python_pep657.txt",
+                "duplicate_heavy.txt",
+                "debug_heavy.txt",
+                "dedup_error_warn.txt",
+            ];
+
+            let flags = make_flags();
+            for name in fixture_names {
+                let input = load_fixture(name);
+                let result = match try_parse_regex_logs(&input, &flags) {
+                    Some(r) => r,
+                    None => continue, // Passthrough — no LogResult to check.
+                };
+                let computed = result
+                    .unique_messages
+                    .saturating_add(result.deduplicated_count)
+                    .saturating_add(result.debug_hidden);
+                assert_eq!(
+                    result.total_lines,
+                    computed,
+                    "Fixture {name}: X = Y + Z + W violated: \
+                     total={} ≠ unique={} + dedup={} + debug={}",
+                    result.total_lines,
+                    result.unique_messages,
+                    result.deduplicated_count,
+                    result.debug_hidden
+                );
+            }
         }
     }
 }
