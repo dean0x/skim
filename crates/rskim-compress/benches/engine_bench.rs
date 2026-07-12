@@ -482,12 +482,6 @@ fn bench_dup_key_scan(c: &mut Criterion) {
 /// Per ADR-003 / PF-005: the "> 70× speedup" is a DOCUMENTED finding, not a hard
 /// assertion. Criterion regression warnings fire if a future change degrades the
 /// passthrough path significantly.
-///
-/// # DEFERRED: `bench_log_lossless_proxy_block`
-///
-/// A bench measuring the log lossless-proxy path end-to-end is deferred to Pass 5
-/// (Log Lossless regime), when the log oracle corpus has timestamps and the
-/// annotated-form log engine is implemented.
 fn bench_code_block_passthrough(c: &mut Criterion) {
     let fenced = p99_fenced_code_90kb();
     let body = make_anthropic_body(&fenced);
@@ -495,6 +489,42 @@ fn bench_code_block_passthrough(c: &mut Criterion) {
 
     c.bench_with_input(
         BenchmarkId::new("router/passthrough", "code_90kib_fenced"),
+        &body,
+        |b, body| {
+            b.iter(|| {
+                let sink = MockSink::new();
+                router.route(body, Policy::Default, "bench-req", &sink)
+            })
+        },
+    );
+}
+
+/// Benchmark the Lossless log engine end-to-end via BlockRouter.
+///
+/// # Fixture
+///
+/// A timestamped log block with duplicates — the case that exercises the full
+/// Lossless path: timestamp capture, case-sensitive dedup, range annotation.
+/// Three ERROR lines with different ISO-8601 timestamps → one deduplicated entry
+/// with `×3, [ts_min..ts_max]` annotation.
+///
+/// # Baseline (Pass 5, ADR-003 / PF-005)
+///
+/// Recorded baseline: TBD (first run after Pass 5 lands).
+/// Regression gate: < 10ms combined proxy+engine (D7 latency goal).
+///
+/// Per ADR-003 / PF-005: the baseline is a DOCUMENTED finding, not a blind numeric
+/// assertion. Criterion regression warnings fire if the path degrades significantly.
+fn bench_log_lossless_proxy_block(c: &mut Criterion) {
+    let log_content = "2024-01-01T10:00:00Z ERROR: connection refused\n\
+                       2024-01-01T10:05:00Z ERROR: connection refused\n\
+                       2024-01-01T10:10:00Z ERROR: connection refused\n\
+                       INFO: retrying connection\n";
+    let body = make_anthropic_body(log_content);
+    let router = BlockRouter::new(Arc::new(MockSink::new()));
+
+    c.bench_with_input(
+        BenchmarkId::new("router/log_lossless", "timestamped_3x_dedup"),
         &body,
         |b, body| {
             b.iter(|| {
@@ -524,7 +554,8 @@ criterion_group! {
         bench_json_minify_p95,
         bench_json_gate_worst_case,
         bench_dup_key_scan,
-        bench_code_block_passthrough
+        bench_code_block_passthrough,
+        bench_log_lossless_proxy_block
 }
 
 criterion_main!(engine_benches);

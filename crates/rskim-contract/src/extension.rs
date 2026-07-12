@@ -260,7 +260,10 @@ fn extract_message_texts(msg: &serde_json::Value, texts: &mut Vec<String>) {
         Some(serde_json::Value::String(s)) => texts.push(s.clone()),
         Some(serde_json::Value::Array(blocks)) => {
             for block in blocks {
-                if block.get("type").and_then(|t| t.as_str()).is_some_and(|t| t == "text")
+                if block
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t == "text")
                     && let Some(text) = block.get("text").and_then(|t| t.as_str())
                 {
                     texts.push(text.to_owned());
@@ -304,15 +307,15 @@ fn check_text_block_lossless(input_text: &str, output_text: &str) -> bool {
 /// Mirrors the heuristic in `rskim_llm::classify::try_classify_log` to detect
 /// the same block class without introducing an rskim-llm dependency.
 fn is_log_text(text: &str) -> bool {
-    let (total, matching) = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .fold((0usize, 0usize), |(total, matching), line| {
+    let (total, matching) = text.lines().filter(|l| !l.trim().is_empty()).fold(
+        (0usize, 0usize),
+        |(total, matching), line| {
             (
                 total + 1,
                 matching + usize::from(line_has_log_level_prefix(line)),
             )
-        });
+        },
+    );
     total > 0 && matching * 2 >= total
 }
 
@@ -320,11 +323,34 @@ fn is_log_text(text: &str) -> bool {
 ///
 /// Recognizes bare and colon/space/tab-separated prefixes (e.g. `ERROR:`,
 /// `WARN `, `INFO\t`). Uses ASCII uppercase comparison to avoid allocation.
+///
+/// Also handles lines where a log-level prefix is preceded by an ISO-8601 'T'-
+/// style timestamp (e.g. `"2024-01-01T10:00:00Z ERROR: msg"`): the timestamp
+/// portion (up to the first space, provided it starts with 4 digits + '-') is
+/// stripped before the level check.
 fn line_has_log_level_prefix(line: &str) -> bool {
     const LEVELS: &[&str] = &[
         "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "TRACE", "FATAL", "CRITICAL",
     ];
-    let lb = line.as_bytes();
+
+    // Strip a leading ISO-8601-ish timestamp prefix (YYYY-MM-... up to first space)
+    // so that timestamped log lines such as "2024-01-01T10:00:00Z ERROR: msg"
+    // are detected as log lines by `is_log_text`.
+    let effective_line = if let Some(space_pos) = line.find(' ') {
+        let prefix = &line[..space_pos];
+        let pb = prefix.as_bytes();
+        // Heuristic: starts with 4 digits + '-' = date-like prefix.
+        if pb.len() >= 10 && pb[..4].iter().all(|b| b.is_ascii_digit()) && pb.get(4) == Some(&b'-')
+        {
+            &line[space_pos + 1..]
+        } else {
+            line
+        }
+    } else {
+        line
+    };
+
+    let lb = effective_line.as_bytes();
     LEVELS.iter().any(|&level| {
         let lev = level.as_bytes();
         if lb.len() < lev.len() {
@@ -341,28 +367,40 @@ fn line_has_log_level_prefix(line: &str) -> bool {
 /// Log oracle for the `lossless-content` invariant.
 ///
 /// Verifies:
-/// 1. Every distinct non-blank input line appears verbatim (as a substring) in
-///    the output, proving no log message was silently dropped.
+/// 1. Every distinct non-blank input line (after stripping an ISO-8601 timestamp
+///    prefix) appears verbatim (as a substring) in the output, proving no log
+///    message was silently dropped.
 /// 2. The output header reports a total equal to the non-blank input line count,
 ///    proving no line was silently excluded from the count.
+/// 3. (Conditional) If the input has ISO-8601 timestamp prefixes AND the output
+///    contains a `..` range annotation, both the min and max timestamps extracted
+///    from the input must appear as substrings in the output.
 ///
 /// Header format from `LogResult::render`:
 /// `"N lines → M unique (K duplicates removed)"` where `N` is the first token.
 ///
 /// # Why substring containment for check 1
 ///
-/// The log engine reformats entries as ` LEVEL: message (×N)`. The verbatim
-/// line `"ERROR: connection refused"` IS a substring of
-/// `" ERROR: connection refused (×3)"`, so no content was lost.
+/// The Lossless log engine reformats entries as ` LEVEL: message (×N, [ts..ts])`.
+/// After stripping the timestamp prefix, the verbatim message text
+/// `"ERROR: connection refused"` IS a substring of
+/// `" ERROR: connection refused (×3, [2024-01-01T10:00:00Z..2024-01-01T10:10:00Z])"`,
+/// so no content was lost.
 ///
-/// # Timestamp condition (check 3)
+/// # Timestamp extremes (check 3 — ADR-007 Pass 5)
 ///
-/// Not applied here: the `ANTHROPIC_LOG_DEDUP` corpus fixture has no timestamps,
-/// so the condition is vacuously satisfied. Pass 5 will add a timestamped LOG
-/// fixture and extend this oracle with the min/max range check.
+/// The Lossless engine annotates duplicate groups with `[ts_min..ts_max]`. The
+/// oracle verifies that both extremes appear verbatim in the output, proving the
+/// metadata was captured and not silently dropped. The check is conditional: it
+/// only applies when the input has ≥2 distinct ISO-8601 timestamp prefixes AND
+/// the output contains the `..` separator (i.e., a range annotation is present).
 fn check_log_oracle(input_text: &str, output_text: &str) -> bool {
     let mut non_blank_count = 0usize;
     let mut seen = std::collections::HashSet::<String>::new();
+
+    // Collect ISO-8601 timestamp prefixes for check 3.
+    // Heuristic: a line starting with 4 ASCII digits followed by '-' carries a timestamp.
+    let mut timestamps: Vec<String> = Vec::new();
 
     // Check 1: every distinct non-blank input line appears as a substring in output.
     for line in input_text.lines() {
@@ -371,24 +409,71 @@ fn check_log_oracle(input_text: &str, output_text: &str) -> bool {
             continue;
         }
         non_blank_count += 1;
-        if seen.insert(trimmed.to_owned()) && !output_text.contains(trimmed) {
+
+        // Collect timestamp prefix for check 3 (before stripping it for check 1).
+        let bytes = trimmed.as_bytes();
+        if bytes.len() >= 10
+            && bytes[..4].iter().all(|&b| b.is_ascii_digit())
+            && bytes.get(4) == Some(&b'-')
+            && bytes.get(7) == Some(&b'-')
+        {
+            let ts_end = trimmed.find(' ').unwrap_or(trimmed.len().min(30));
+            timestamps.push(trimmed[..ts_end].to_owned());
+        }
+
+        // Strip leading timestamp prefix (if present) to get the message text.
+        let message = if let Some(space_pos) = trimmed.find(' ') {
+            let prefix = &trimmed[..space_pos];
+            let prefix_bytes = prefix.as_bytes();
+            if prefix_bytes.len() >= 10
+                && prefix_bytes[..4].iter().all(|&b| b.is_ascii_digit())
+                && prefix_bytes.get(4) == Some(&b'-')
+            {
+                trimmed[space_pos + 1..].trim()
+            } else {
+                trimmed
+            }
+        } else {
+            trimmed
+        };
+
+        if seen.insert(message.to_owned()) && !output_text.contains(message) {
             return false;
         }
     }
 
     // Check 2: parse the header's total and compare to non_blank_count.
     // Header: "N lines → M unique (K duplicates removed)"
-    if let Some(reported_total) = output_text
+    let header_ok = if let Some(reported_total) = output_text
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().next())
         .and_then(|n| n.parse::<usize>().ok())
     {
-        return reported_total == non_blank_count;
+        reported_total == non_blank_count
+    } else {
+        // No parseable header: the output is not a log compression result.
+        return false;
+    };
+
+    if !header_ok {
+        return false;
     }
 
-    // No parseable header: the output is not a log compression result.
-    false
+    // Check 3 (conditional): when input has ≥2 timestamps AND output has a range
+    // annotation (`..`), verify that both the min and max timestamps appear in output.
+    if timestamps.len() >= 2 && output_text.contains("..") {
+        let (Some(min_ts), Some(max_ts)) = (timestamps.iter().min(), timestamps.iter().max())
+        else {
+            // Non-empty iterator always yields Some; unreachable in practice.
+            return true;
+        };
+        if !output_text.contains(min_ts.as_str()) || !output_text.contains(max_ts.as_str()) {
+            return false;
+        }
+    }
+
+    true
 }
 
 #[cfg(test)]

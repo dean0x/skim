@@ -12,7 +12,7 @@
 //! The caller (BlockRouter, Phase 3) applies the never-inflate byte gate AFTER
 //! receiving the compressed content.
 
-use crate::log::{LogFlags, ParseResult, compress_log};
+use crate::log::{LogFlags, Losslessness, ParseResult, compress_log};
 
 /// Result of a log compression attempt.
 #[derive(Debug, Clone)]
@@ -37,14 +37,25 @@ pub(crate) enum CompressResult {
 ///
 /// `CompressResult::Compressed` when `compress_log` produces a `Full` or
 /// `Degraded` result. `CompressResult::Passthrough` when `compress_log`
-/// returns `Passthrough` (no entries found, block misclassified, empty input).
+/// returns `Passthrough` (no entries found, block misclassified, empty input,
+/// or a content-discarding operation would be required in Lossless mode).
 ///
 /// # Invariant: never empty result (AC4)
 ///
 /// If `compress_log` would produce zero output lines, this function returns
 /// `CompressResult::Passthrough` instead. An empty result is never returned.
+///
+/// # ADR-007 — Lossless proxy egress
+///
+/// The proxy adapter uses `Losslessness::Lossless`: timestamps are captured as
+/// min–max range metadata, dedup is case-sensitive, DEBUG/TRACE lines are never
+/// hidden, and any input requiring content-discarding (over-cap stacks, etc.)
+/// returns `CompressResult::Passthrough` rather than partially-lossy output.
 pub(crate) fn compress_log_block(text: &str) -> CompressResult {
-    let flags = LogFlags::default();
+    let flags = LogFlags {
+        losslessness: Losslessness::Lossless,
+        ..Default::default()
+    };
     match compress_log(text, &flags) {
         ParseResult::Full(result) => {
             // Full parse: use the pre-rendered LogResult display string.
@@ -73,57 +84,62 @@ pub(crate) fn compress_log_block(text: &str) -> CompressResult {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
     // =========================================================================
-    // AC4 — Successful log compression
+    // AC4 — Successful log compression (Lossless proxy path — ADR-007)
     // =========================================================================
 
+    /// Lossless dedup produces `×N` count annotations and preserves message text.
+    ///
+    /// Discriminating: if dedup is silently disabled or the `×N` annotation is
+    /// stripped (Lossless becoming Lossy-without-annotation), neither assertion holds.
     #[test]
-    fn compress_log_with_duplicates_produces_shorter_output() {
+    fn annotated_dedup_visible() {
         let log = "ERROR: database connection failed\nERROR: database connection failed\nERROR: database connection failed\nWARN: retrying...\n";
         let result = compress_log_block(log);
-        match result {
-            CompressResult::Compressed { content } => {
-                let out_lines = content.lines().count();
-                let in_lines = log.lines().count();
-                assert!(
-                    out_lines < in_lines,
-                    "Deduplication must reduce line count: {} in, {} out",
-                    in_lines,
-                    out_lines
-                );
-            }
-            CompressResult::Passthrough => {
-                // Also acceptable if compress_log classifies this as passthrough.
-            }
-        }
+        let CompressResult::Compressed { ref content } = result else {
+            panic!("Expected Compressed result; got Passthrough for structured log");
+        };
+        // Count annotation must appear (×3 for the triplicated ERROR).
+        assert!(
+            content.contains('\u{d7}'),
+            "Lossless dedup must emit ×N annotation; got: {content}"
+        );
+        // Original message text must be present verbatim.
+        assert!(
+            content.contains("database connection failed"),
+            "Message text must appear verbatim in Lossless output; got: {content}"
+        );
     }
 
+    /// Case-variant messages are distinct content in Lossless mode.
+    ///
+    /// Discriminating: if case-folding is applied (Lossy leak), both variants
+    /// collapse to one entry and the assert fails.
     #[test]
-    fn error_lines_preserved_in_output() {
-        // AC4: every ERROR-equivalent line must appear in the output.
-        let log = "ERROR: critical failure\nDEBUG: something happened\nERROR: another failure\n";
+    fn case_variant_messages_both_present() {
+        // "critical failure" and "CRITICAL FAILURE" must both appear.
+        let log = "ERROR: critical failure\nDEBUG: something happened\nERROR: CRITICAL FAILURE\n";
         let result = compress_log_block(log);
-        match result {
-            CompressResult::Compressed { content } => {
-                // Both ERROR lines must be present somewhere in the output.
-                // (They may be deduplicated if identical, but these are distinct.)
-                assert!(
-                    content.contains("critical failure"),
-                    "First ERROR line must appear in output"
-                );
-                assert!(
-                    content.contains("another failure"),
-                    "Second ERROR line must appear in output"
-                );
-            }
-            CompressResult::Passthrough => {
-                // compress_log may passthrough if it can't structure this — acceptable.
-            }
-        }
+        let CompressResult::Compressed { ref content } = result else {
+            panic!("Expected Compressed result; got Passthrough for structured log");
+        };
+        assert!(
+            content.contains("critical failure"),
+            "Lowercase variant must appear in Lossless output; got: {content}"
+        );
+        assert!(
+            content.contains("CRITICAL FAILURE"),
+            "Uppercase variant must appear in Lossless output; got: {content}"
+        );
+        // DEBUG line must also reach output (no debug-hiding in Lossless mode, axis 4).
+        assert!(
+            content.contains("something happened"),
+            "DEBUG line must reach Lossless output (axis 4); got: {content}"
+        );
     }
 
     // =========================================================================
@@ -161,26 +177,29 @@ mod tests {
         }
     }
 
+    /// DEBUG and TRACE lines are never hidden in Lossless mode (axis 4).
+    ///
+    /// Discriminating: if debug-hiding is applied (Lossy leak), these lines
+    /// disappear from the output and both asserts fail.
     #[test]
-    fn structured_log_with_stack_trace_compresses() {
-        // AC4: a Log block with stack trace must compress (or passthrough safely).
+    fn debug_lines_reach_output() {
         let log = "\
 ERROR: NullPointerException at line 42\n\
-    at com.example.MyClass.doThing(MyClass.java:42)\n\
-    at com.example.Main.run(Main.java:10)\n\
-WARN: Retrying after backoff\n\
-INFO: Connected to database\n\
-INFO: Connected to database\n\
+DEBUG: internal state: x=42\n\
+TRACE: entering method doThing\n\
 INFO: Connected to database\n\
 ";
         let result = compress_log_block(log);
-        // AC4: any result must not be empty if Compressed.
-        if let CompressResult::Compressed { ref content } = result {
-            assert!(
-                !content.is_empty(),
-                "AC4: log compression result must not be empty"
-            );
-        }
-        // No panic — function must complete.
+        let CompressResult::Compressed { ref content } = result else {
+            panic!("Expected Compressed result; got Passthrough for structured log");
+        };
+        assert!(
+            content.contains("internal state"),
+            "DEBUG line must reach Lossless output (no debug-hiding in Lossless mode); got: {content}"
+        );
+        assert!(
+            content.contains("entering method doThing"),
+            "TRACE line must reach Lossless output (no debug-hiding in Lossless mode); got: {content}"
+        );
     }
 }

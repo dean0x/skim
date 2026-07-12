@@ -141,6 +141,44 @@ pub const ANTHROPIC_LOG_DEDUP: &[u8] = br#"{
   ]
 }"#;
 
+/// Anthropic request with a timestamped log block — exercises the oracle's
+/// min/max timestamp-extremes check (Pass 5 / ADR-007 check 3).
+///
+/// # Design constraints
+///
+/// - Three duplicate ERROR lines with different ISO-8601 timestamps so the Lossless
+///   engine emits a `×3, [ts_min..ts_max]` range annotation.
+/// - One INFO line without a timestamp so the fixture also exercises mixed input.
+/// - All timestamps are strictly ordered (lexicographic min = first, max = last).
+///
+/// # Oracle verification (check 3)
+///
+/// After BlockRouter processes this fixture via the Lossless log engine:
+/// - Check 1 (verbatim substring): "ERROR: connection refused" ⊆ rendered output ✓
+/// - Check 2 (count conservation): header total == 4 non-blank lines ✓
+/// - Check 3 (timestamp extremes):
+///   min "2024-01-01T10:00:00Z" appears in `[2024-01-01T10:00:00Z..2024-01-01T10:10:00Z]` ✓
+///   max "2024-01-01T10:10:00Z" appears in the same range annotation ✓
+///
+/// # One-class convention
+///
+/// This fixture's text content block is timestamped log output → `Class::Log`.
+pub const ANTHROPIC_LOG_TIMESTAMPED: &[u8] = br#"{
+  "model": "claude-3-5-sonnet-20241022",
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "2024-01-01T10:00:00Z ERROR: connection refused\n2024-01-01T10:05:00Z ERROR: connection refused\n2024-01-01T10:10:00Z ERROR: connection refused\nINFO: retrying"
+        }
+      ]
+    }
+  ]
+}"#;
+
 /// Anthropic schema with thinking blocks (sacrosanct content class).
 pub const ANTHROPIC_WITH_THINKING: &[u8] = br#"{
   "model": "claude-3-5-sonnet-20241022",
@@ -378,6 +416,7 @@ pub const VALID_CORPUS: &[&[u8]] = &[
     ANTHROPIC_WITH_THINKING,
     ANTHROPIC_JSON_NUMBER_TOKENS,
     ANTHROPIC_LOG_DEDUP,
+    ANTHROPIC_LOG_TIMESTAMPED,
     OPENAI_MINIMAL,
     OPENAI_MULTI_TURN,
     OPENAI_TOOL_CALLS,
@@ -407,6 +446,7 @@ pub const ALL_CORPUS: &[&[u8]] = &[
     ANTHROPIC_WITH_THINKING,
     ANTHROPIC_JSON_NUMBER_TOKENS,
     ANTHROPIC_LOG_DEDUP,
+    ANTHROPIC_LOG_TIMESTAMPED,
     // Valid — OpenAI
     OPENAI_MINIMAL,
     OPENAI_MULTI_TURN,
