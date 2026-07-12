@@ -786,6 +786,60 @@ fn ac21_lossless_only_record_per_candidate() {
     assert_eq!(records[0].reason, OutcomeReason::PolicyPassthrough);
 }
 
+/// AC21 — LosslessOnly tier: pretty-printed JSON is NOT minified (tier-semantics pin).
+///
+/// Pins the distinction between the two policy tiers:
+/// - `Policy::Default` = lossless re-encoding permitted (JSON minification, log dedup).
+/// - `Policy::LosslessOnly` = byte-exact passthrough: no re-encoding, not even lossless.
+///
+/// A pretty-printed JSON body that WOULD be minified under `Default` must pass
+/// through byte-identical under `LosslessOnly`.
+///
+/// Discriminating:
+/// 1. Under `Default` the body IS compressed (assertion 1 proves this fixture shrinks).
+/// 2. Under `LosslessOnly` the body must equal the original byte-for-byte; if an engine
+///    ran, the output would be shorter (minified JSON) and the equality assertion fails.
+#[test]
+fn ac21_lossless_only_json_not_even_minified() {
+    let json = pretty_json_fixture();
+    let body = anthropic_body(&json);
+    let sink = Arc::new(MockSink::new());
+    let router = BlockRouter::new(sink.clone());
+
+    // Assertion 1: Default DOES compress this body (makes the test discriminating).
+    let default_outcome = router.route(
+        &body,
+        Policy::Default,
+        "req-ac21-json-default",
+        sink.as_ref(),
+    );
+    assert!(
+        default_outcome.bytes.len() < body.len(),
+        "Policy::Default must compress the pretty-JSON fixture (body must shrink for the \
+         test to be discriminating); got {} bytes out of {} bytes in",
+        default_outcome.bytes.len(),
+        body.len(),
+    );
+    let _ = sink.drain(); // clear default-run records before lossless run
+
+    // Assertion 2: LosslessOnly produces byte-identical output (no re-encoding).
+    let outcome = router.route(
+        &body,
+        Policy::LosslessOnly,
+        "req-ac21-json-lossless",
+        sink.as_ref(),
+    );
+    assert_eq!(
+        outcome.bytes.as_slice(),
+        body.as_slice(),
+        "Policy::LosslessOnly must produce byte-identical output — no re-encoding, not even JSON minification"
+    );
+    assert!(
+        outcome.is_passthrough(),
+        "Policy::LosslessOnly must produce a passthrough outcome"
+    );
+}
+
 // ============================================================================
 // AC22 — Pre-filter by size: above threshold and below floor → Passthrough;
 // spy engines ZERO invocations.

@@ -30,12 +30,14 @@
 pub enum AuthMode {
     /// `x-api-key` header present. Typical for Anthropic direct API keys.
     ///
-    /// #304 maps this to `Policy::Default` (lossless + lossy compression allowed).
+    /// #304 maps this to `Policy::Default` (lossless re-encoding allowed; all
+    /// active engines are information-preserving).
     ApiKey,
 
     /// `Authorization: Bearer …` header present. Typical for subscription / OAuth flows.
     ///
-    /// #304 maps this to `Policy::LosslessOnly` (conservative: never compress lossy).
+    /// #304 maps this to `Policy::LosslessOnly` (byte-exact passthrough: no
+    /// re-encoding, even lossless).
     Subscription,
 
     /// Neither `x-api-key` nor `Authorization: Bearer` header present, OR both are

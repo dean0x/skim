@@ -103,12 +103,18 @@ use zone::compute_candidates;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Policy {
-    /// Default compression: apply all registered engines.
-    Default,
-    /// Lossless-only mode: forward every block byte-identical.
+    /// Lossless re-encoding permitted: all registered engines may run.
     ///
-    /// Applied when `ctx.auth_mode` indicates a subscription/OAuth flow.
-    /// Conservative map: `Ambiguous → Default` (per D1 / DECISIONS-NEEDED.md).
+    /// Applied when `ctx.auth_mode` is `ApiKey` or `Ambiguous`. All active
+    /// engines (JSON minification, annotated log deduplication) are certified
+    /// information-preserving — semantically equivalent output in fewer bytes.
+    Default,
+    /// Byte-exact passthrough: no re-encoding of any kind.
+    ///
+    /// Applied when `ctx.auth_mode` is `Subscription` (Bearer auth). Every
+    /// block is forwarded bit-for-bit unchanged — not even a semantically
+    /// equivalent re-encoding such as JSON minification is permitted.
+    /// Conservative map: `Ambiguous → Default` (per D1 / AD-PXY-08).
     LosslessOnly,
 }
 

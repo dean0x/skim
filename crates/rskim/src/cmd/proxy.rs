@@ -8,8 +8,8 @@
 //!
 //! This handler builds a [`BlockRouterStage`] adapter that implements [`rskim_proxy::seam::TransformStage`]
 //! by holding a [`rskim_compress::BlockRouter`] and mapping `ctx.auth_mode → Policy` per call (D1):
-//! - `AuthMode::Subscription → Policy::LosslessOnly` (conservative: no lossy compression)
-//! - `AuthMode::ApiKey      → Policy::Default`        (full compression allowed)
+//! - `AuthMode::Subscription → Policy::LosslessOnly` (byte-exact passthrough: no re-encoding)
+//! - `AuthMode::ApiKey      → Policy::Default`        (lossless re-encoding allowed)
 //! - `AuthMode::Ambiguous   → Policy::Default`        (conservative toward ApiKey, D1)
 //!
 //! The adapter lives HERE (in the rskim binary), not in rskim-compress, because
@@ -65,8 +65,8 @@ use rskim_proxy::seam::{TransformContext, TransformPipeline, TransformStage};
 ///
 /// | `AuthMode`        | `Policy`          | Rationale                                      |
 /// |-------------------|-------------------|------------------------------------------------|
-/// | `Subscription`    | `LosslessOnly`    | Conservative: subscription flows may expect byte-exact replay |
-/// | `ApiKey`          | `Default`         | Direct API key use — full compression allowed  |
+/// | `Subscription`    | `LosslessOnly`    | Byte-exact passthrough: no re-encoding (not even lossless) |
+/// | `ApiKey`          | `Default`         | Lossless re-encoding allowed (JSON minification, log dedup) |
 /// | `Ambiguous`       | `Default`         | Map to ApiKey (D1 conservative toward Default) |
 ///
 /// ## Fail-open contract
@@ -102,9 +102,9 @@ impl TransformStage for BlockRouterStage {
     fn apply(&self, body: &[u8], ctx: &TransformContext<'_>, sink: &dyn DecisionSink) -> Outcome {
         // D1: map auth_mode to policy per call (not stored — router stateless).
         let policy = match ctx.auth_mode {
-            // Subscription: LosslessOnly — conservative, no lossy compression.
+            // Subscription: LosslessOnly — byte-exact passthrough, no re-encoding.
             AuthMode::Subscription => Policy::LosslessOnly,
-            // ApiKey: Default — full compression allowed.
+            // ApiKey: Default — lossless re-encoding allowed (JSON minify, log dedup).
             AuthMode::ApiKey => Policy::Default,
             // Ambiguous: Default — conservative map toward ApiKey (D1).
             // Both-present AND neither-present cases are Ambiguous (AD-PXY-08).
