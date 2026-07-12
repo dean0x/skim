@@ -679,50 +679,47 @@ mod tests {
     use proptest::prelude::*;
 
     proptest! {
-        /// For any pretty-printed JSON object, the minified output is:
-        /// (a) `Compressed` (there is whitespace to strip), and
-        /// (b) value-equivalent to the input (serde_json::Value comparison).
+        /// For any pretty-printed JSON array with at least one element, the
+        /// minified output is ALWAYS `Compressed` and value-equivalent.
         ///
-        /// Discriminating: deleting the scanner logic or making it lossy causes
-        /// either the variant to become Passthrough (a) or the value comparison
-        /// to fail (b).
+        /// ## Why arrays and not objects
+        ///
+        /// Arrays eliminate the duplicate-key concern: every element is kept
+        /// regardless of value, so `serde_json::to_string_pretty` on an array
+        /// with >= 1 element ALWAYS produces removable whitespace (`[\n  …\n]`).
+        /// This makes the Passthrough arm unreachable and therefore a hard
+        /// failure — not a vacuous pass.
+        ///
+        /// ## Discriminating
+        ///
+        /// Deleting the scanner or making it lossy causes either:
+        /// (a) the variant to become Passthrough (arm below panics), or
+        /// (b) the value comparison to fail.
         #[test]
         fn prop_minify_round_trip_value_equivalent(
-            // Unique-ish keys and values (proptest may generate duplicate keys, which is
-            // fine — they exercise the dup-key Passthrough path, so we use prop_assume
-            // to filter those cases from the "must be Compressed" assertion).
-            pairs in proptest::collection::vec(
-                (
-                    proptest::string::string_regex("[a-z]{2,8}").unwrap(),
-                    prop_oneof![
-                        proptest::string::string_regex("[a-zA-Z0-9 ]{1,20}").unwrap()
-                            .prop_map(serde_json::Value::String),
-                        (0i64..100_000i64).prop_map(|n| serde_json::Value::Number(n.into())),
-                        any::<bool>().prop_map(serde_json::Value::Bool),
-                    ]
-                ),
+            // Arbitrary scalar values wrapped in an array — guarantees composite
+            // with >= 1 element so pretty-printing always produces whitespace.
+            values in proptest::collection::vec(
+                prop_oneof![
+                    proptest::string::string_regex("[a-zA-Z0-9 ]{1,20}").unwrap()
+                        .prop_map(serde_json::Value::String),
+                    (0i64..100_000i64).prop_map(|n| serde_json::Value::Number(n.into())),
+                    any::<bool>().prop_map(serde_json::Value::Bool),
+                ],
                 1..=6usize
             )
         ) {
-            // Build an object from the pairs (serde_json::Map preserves insertion order).
-            // If there are duplicate keys, the map deduplicates (last-wins), which may
-            // cause compress_json to see duplicates in the pretty-print.
-            let mut map = serde_json::Map::new();
-            for (k, v) in &pairs {
-                map.insert(k.clone(), v.clone());
-            }
-            let value = serde_json::Value::Object(map);
+            // Wrap in an array: always a composite with >= 1 element.
+            // `serde_json::to_string_pretty` on such an array always emits
+            // `[\n  <element>,\n  …\n]` — whitespace is structurally guaranteed.
+            let value = serde_json::Value::Array(values);
             let pretty = serde_json::to_string_pretty(&value).expect("must serialize");
-
-            // Skip inputs that are already minimal (edge case: single-key objects
-            // pretty-printed with no newlines on some serde_json versions).
-            prop_assume!(pretty.contains(|c: char| c.is_whitespace()));
 
             let result = compress_json(&pretty);
 
             match result {
                 CompressResult::Compressed { ref content } => {
-                    // (a) Value-equivalent via serde_json::Value comparison.
+                    // Value-equivalent via serde_json::Value round-trip.
                     let orig_val: serde_json::Value =
                         serde_json::from_str(&pretty).expect("original must parse");
                     let min_val: serde_json::Value =
@@ -731,18 +728,21 @@ mod tests {
                         &orig_val, &min_val,
                         "minified output must be value-equivalent to original"
                     );
-                    // (b) Output is shorter (whitespace was stripped).
+                    // Output is strictly shorter (whitespace was stripped).
                     prop_assert!(
                         content.len() < pretty.len(),
                         "Compressed output must be shorter than pretty input"
                     );
                 }
                 CompressResult::Passthrough => {
-                    // Passthrough is only valid if the input had duplicate keys
-                    // (which can happen when proptest generates the same key twice).
-                    // In that case, compress_json correctly returns Passthrough.
-                    // We accept both outcomes here — the key invariant is that
-                    // Compressed is NEVER returned with wrong values.
+                    // Unreachable: the input is always a non-empty array rendered
+                    // with `to_string_pretty`, which always contains whitespace.
+                    // A Passthrough here means the engine is broken.
+                    prop_assert!(
+                        false,
+                        "compress_json returned Passthrough for a pretty-printed array \
+                         with >= 1 element; expected Compressed. Input was: {pretty}"
+                    );
                 }
             }
         }
