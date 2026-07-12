@@ -45,10 +45,7 @@ fn test_grep_h_flag_not_intercepted_as_help() {
 /// `skim ls -lh /tmp` — `-h` is the human-readable flag, not help.
 #[test]
 fn test_ls_lh_not_intercepted_as_help() {
-    let output = skim_cmd()
-        .args(["ls", "-lh", "/tmp"])
-        .output()
-        .unwrap();
+    let output = skim_cmd().args(["ls", "-lh", "/tmp"]).output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         !stdout.contains("Available tools:"),
@@ -91,7 +88,13 @@ fn test_grep_h_multifile_produces_no_filename_label() {
     std::fs::write(&f2, "hello again\n").unwrap();
 
     let output = skim_cmd()
-        .args(["grep", "-hn", "hello", f1.to_str().unwrap(), f2.to_str().unwrap()])
+        .args([
+            "grep",
+            "-hn",
+            "hello",
+            f1.to_str().unwrap(),
+            f2.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);

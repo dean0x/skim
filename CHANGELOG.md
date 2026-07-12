@@ -43,6 +43,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SKIM_DEBUG=1` notice; all 6 modes have explicit Bash arms.
 
 ### Fixed
+- **Fileops dispatcher no longer intercepts tool-level `-h` as help** — `file/mod.rs`
+  narrowed its help guard to `--help` only, mirroring the `db/mod.rs` hostname-flag
+  precedent. `grep -h` (no-filename), `ls -h`/`du -h`/`df -h` (human-readable sizes)
+  now reach their handlers instead of printing skim's fileops help. `rg -h`/`rg --help`
+  added to rg's rewrite skip-list (for rg, unlike grep, `-h` is a genuine help flag;
+  without the skip, `rg --help` would be rewritten and show skim's help instead of rg's).
+
+- **Pseudo mode preserves function return types as API surface (A4 contract)** —
+  Return type annotations are API contracts callers depend on; they are now preserved
+  in pseudo mode alongside visibility modifiers, mirroring the commit c244a12
+  visibility fix. Param, variable, and property type annotations are still stripped.
+  Affected languages: Python (`-> T`), TypeScript (`: T` at return position), Rust
+  (`-> T` via normal recursion — the former strip_rust_return_type special-case is
+  removed). A position-aware guard (`is_return_type_annotation`) stops recursion at
+  the `return_type` field child, preserving nested generics (`Promise<User>`,
+  `tuple[int, str]`) wholesale.
+
+- **`skim init` summary and dry-run output protocol-driven for Copilot and Gemini** —
+  `print_install_summary` and `print_dry_run_actions` now accept an explicit
+  `AgentKind` parameter and branch on `protocol.uses_dedicated_hook_file()`:
+  Copilot CLI (the only dedicated-file agent) prints a "Register hook: …/skim.json"
+  / "Would write: …/skim.json" line instead of the incorrect "Patch settings" /
+  "Would patch settings.json" wording. Settings-based agents use `hook_event_key()`
+  instead of a hardcoded `"PreToolUse"`, so Gemini shows `BeforeTool` and Cursor
+  shows `preToolUse` in their respective output lines.
+
 - **`skim gh pr checks` tabs destroyed by ANSI-strip + exit-8 raw-forwarded before
   parse** — `gh pr checks` emits TAB-separated output but gh's `ToolRunConfig` had
   `skip_ansi_strip: false`, so `strip_ansi_escapes` dropped `\t` before

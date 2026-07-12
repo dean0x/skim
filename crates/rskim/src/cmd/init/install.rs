@@ -11,6 +11,7 @@ use super::helpers::{
     confirm_proceed, load_or_create_settings, resolve_real_settings_path,
 };
 use super::state::{DetectedState, detect_state, has_skim_hook_entry, read_settings_json};
+use crate::cmd::hooks::copilot::SKIM_JSON_NAME;
 use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
 use crate::cmd::session::{AgentKind, InstructionEnv};
 
@@ -114,15 +115,28 @@ fn print_dual_scope_warning(warning: &str) {
     println!();
 }
 
-fn print_install_summary(state: &DetectedState) {
+fn print_install_summary(state: &DetectedState, agent: AgentKind) {
     println!("  Summary:");
     if !state.hook_installed || !state.hook_is_current() {
         let hook_script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
         println!("    * Create hook script: {}", hook_script_path.display());
-        println!(
-            "    * Patch settings: {} (add PreToolUse hook)",
-            state.settings_path.display()
-        );
+        let protocol = protocol_for_agent(agent);
+        if protocol.uses_dedicated_hook_file() {
+            // Copilot CLI: registration via hooks/skim.json, not settings.json.
+            let skim_json = state.hook_config_dir.join("hooks").join(SKIM_JSON_NAME);
+            println!(
+                "    * Register hook: {} ({} entry)",
+                skim_json.display(),
+                protocol.hook_event_key(),
+            );
+        } else {
+            // Settings-based agents: patch settings.json with the correct event key.
+            println!(
+                "    * Patch settings: {} (add {} hook)",
+                state.settings_path.display(),
+                protocol.hook_event_key(),
+            );
+        }
     }
     println!();
 }
@@ -465,7 +479,7 @@ fn run_install_single(
     }
 
     let global = !flags.project;
-    print_install_summary(&state);
+    print_install_summary(&state, agent);
 
     if flags.dry_run {
         // Dry-run writes nothing, so consent is not required to DISPLAY what
@@ -483,6 +497,7 @@ fn run_install_single(
             flags.permissions,
             flags.permissions_tier,
             perm_dir,
+            agent,
         )?;
         // Also show dry-run for wrappers if they would be installed.
         if !flags.project {
@@ -1257,6 +1272,8 @@ pub(super) use super::guidance::{
 // Dry-run output (B11)
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)] // Inherited 7-arg signature; agent is the
+// structural replacement for agent_from_state.
 pub(super) fn print_dry_run_actions(
     state: &DetectedState,
     no_guidance: bool,
@@ -1265,23 +1282,41 @@ pub(super) fn print_dry_run_actions(
     permissions: Option<bool>,
     tier: PermissionsTier,
     perm_dir: &std::path::Path,
+    agent: AgentKind,
 ) -> anyhow::Result<()> {
     let hook_script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+    let protocol = protocol_for_agent(agent);
 
     println!("  [dry-run] Would create: {}", hook_script_path.display());
-    if state.settings_exists {
+    if protocol.uses_dedicated_hook_file() {
+        // Copilot CLI: write hooks/skim.json; no settings.json backup or patch.
+        let skim_json = state.hook_config_dir.join("hooks").join(SKIM_JSON_NAME);
         println!(
-            "  [dry-run] Would back up: {} -> {}",
+            "  [dry-run] Would write: {} (register {} hook)",
+            skim_json.display(),
+            protocol.hook_event_key(),
+        );
+    } else {
+        // Settings-based agents: back up + patch settings.json.
+        if state.settings_exists {
+            println!(
+                "  [dry-run] Would back up: {} -> {}",
+                state.settings_path.display(),
+                SETTINGS_BACKUP
+            );
+        }
+        println!(
+            "  [dry-run] Would patch: {} (add {} hook)",
             state.settings_path.display(),
-            SETTINGS_BACKUP
+            protocol.hook_event_key(),
         );
     }
-    println!(
-        "  [dry-run] Would patch: {} (add PreToolUse hook)",
-        state.settings_path.display()
-    );
+    // Show guidance path when applicable.
+    // Note: the `if let` is intentionally written as two nested `if` statements
+    // (rather than collapsed via `&&`) to keep the `no_guidance` guard's intent
+    // explicit and separate from the option unwrap.
+    #[allow(clippy::collapsible_if)]
     if !no_guidance {
-        let agent = agent_from_state(state)?;
         if let Some(path) = agent.instruction_file(global, env) {
             println!("  [dry-run] Would inject guidance into {}", path.display());
         }
@@ -1292,9 +1327,10 @@ pub(super) fn print_dry_run_actions(
     // happen.  We show entries whenever permissions are "active" for this run
     // and annotate them with "(consent required at install)" to make clear that
     // a real install would still require an interactive approval.
+    let perm_protocol = crate::cmd::permissions::permissions_protocol_for_agent(agent);
+    #[allow(clippy::collapsible_if)]
     if permissions != Some(false) {
-        let agent = agent_from_state(state)?;
-        if let Some(protocol) = crate::cmd::permissions::permissions_protocol_for_agent(agent) {
+        if let Some(protocol) = perm_protocol {
             // Determine whether permissions are active for this dry-run.
             let permissions_active = match permissions {
                 Some(false) => false, // explicit opt-out (already guarded above)

@@ -50,7 +50,9 @@ use super::{HookInput, HookProtocol, HookSupport};
 use crate::cmd::session::AgentKind;
 
 /// Filename of the skim-owned hook registration for Copilot CLI.
-const SKIM_JSON_NAME: &str = "skim.json";
+/// Exported so install.rs can build the dry-run / summary path without a
+/// second string literal.
+pub(crate) const SKIM_JSON_NAME: &str = "skim.json";
 
 /// Maximum number of hook-registration files enumerated per directory scan.
 /// Bounds the directory walk against adversarial or corrupt hook directories;

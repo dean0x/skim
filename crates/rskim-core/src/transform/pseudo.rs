@@ -627,7 +627,6 @@ fn extend_past_trailing_comma(
     end
 }
 
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in tests
 mod tests {
@@ -1478,7 +1477,8 @@ mod tests {
     /// Note: Rust pseudo preserves parameter types too (no strip_kinds for them).
     #[test]
     fn test_rust_pseudo_preserves_generic_return() {
-        let source = "pub fn read_lines(path: &str) -> Result<Vec<String>, io::Error> {\n    todo!()\n}\n";
+        let source =
+            "pub fn read_lines(path: &str) -> Result<Vec<String>, io::Error> {\n    todo!()\n}\n";
         let result = transform(source, Language::Rust);
         assert!(
             result.contains("-> Result<Vec<String>, io::Error>"),
@@ -1493,7 +1493,8 @@ mod tests {
     /// Rust: impl-trait return type is preserved.
     #[test]
     fn test_rust_pseudo_preserves_impl_trait_return() {
-        let source = "pub fn make_iter() -> impl Iterator<Item = u32> {\n    [1, 2, 3].iter().copied()\n}\n";
+        let source =
+            "pub fn make_iter() -> impl Iterator<Item = u32> {\n    [1, 2, 3].iter().copied()\n}\n";
         let result = transform(source, Language::Rust);
         assert!(
             result.contains("-> impl Iterator<Item = u32>"),
@@ -1547,7 +1548,8 @@ mod tests {
     /// TypeScript: arrow function with return type preserved.
     #[test]
     fn test_typescript_pseudo_preserves_arrow_return() {
-        let source = "const getUser = async (id: number): Promise<User> => {\n    return fetch(id);\n};\n";
+        let source =
+            "const getUser = async (id: number): Promise<User> => {\n    return fetch(id);\n};\n";
         let result = transform(source, Language::TypeScript);
         assert!(
             result.contains("): Promise<User>"),

@@ -1454,3 +1454,49 @@ fn test_init_multi_agent_auto_detect_uninstalls_claude_and_gemini() {
     drop(claude_dir);
     drop(gemini_dir);
 }
+
+// ============================================================================
+// Fix 3: Gemini dry-run uses BeforeTool hook key (not hardcoded PreToolUse)
+// ============================================================================
+
+/// `skim init --agent gemini --no-guidance --dry-run` must show "BeforeTool"
+/// in the patch-settings description line, not the hardcoded "PreToolUse".
+#[test]
+fn test_gemini_dry_run_shows_before_tool_hook_key() {
+    let (gemini_dir, gemini_path) = create_agent_config_dir();
+
+    let output = common::skim()
+        .args(["init", "--agent", "gemini", "--no-guidance", "--dry-run"])
+        .env("GEMINI_CONFIG_DIR", &gemini_path)
+        .output()
+        .expect("skim init must run");
+
+    assert!(
+        output.status.success(),
+        "skim init --agent gemini --dry-run must exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Gemini uses BeforeTool — must appear in the hook-key description
+    assert!(
+        stdout.contains("BeforeTool"),
+        "Gemini dry-run output must mention 'BeforeTool'; got:\n{stdout}"
+    );
+
+    // The patch-description line must use BeforeTool, not PreToolUse.
+    // Scope assertion to the Would-patch / Patch-settings line to avoid false
+    // positives from other output sections that could mention PreToolUse.
+    let patch_line = stdout
+        .lines()
+        .find(|l| l.contains("Would patch") || l.contains("Patch settings"));
+    if let Some(line) = patch_line {
+        assert!(
+            !line.contains("PreToolUse"),
+            "Gemini dry-run patch line must use 'BeforeTool', not 'PreToolUse'; line: {line}"
+        );
+    }
+
+    drop(gemini_dir);
+}
