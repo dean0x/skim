@@ -32,6 +32,10 @@ pub(crate) struct LogFlags {
     pub(crate) debug_only: bool,
     pub(crate) show_stats: bool,
     pub(crate) json_output: bool,
+    /// Whether compression must be lossless (proxy egress) or may be lossy (CLI).
+    ///
+    /// Default: `Lossy` — CLI never sets this to `Lossless`.
+    pub(crate) losslessness: rskim_compress::log::Losslessness,
 }
 
 fn parse_flags(args: &[String]) -> LogFlags {
@@ -214,6 +218,7 @@ pub(crate) fn compress_log(input: &str, flags: &LogFlags) -> ParseResult<LogResu
         debug_only: flags.debug_only,
         show_stats: flags.show_stats,
         json_output: flags.json_output,
+        losslessness: flags.losslessness,
     };
 
     // Call the canonical implementation in rskim-compress (#327 / R1).
@@ -240,6 +245,8 @@ fn convert_log_result(r: rskim_compress::log::LogResult) -> LogResult {
             level: e.level,
             message: e.message,
             count: e.count,
+            min_timestamp: e.min_timestamp,
+            max_timestamp: e.max_timestamp,
         })
         .collect();
     LogResult::new_with_stack(

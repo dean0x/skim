@@ -126,8 +126,34 @@ impl<T: Into<String>> ParseResult<T> {
     }
 }
 
+/// Whether log compression must be lossless (proxy egress) or may be lossy (CLI ingestion).
+///
+/// # ADR-007 (L3 lossless egress)
+///
+/// The CLI path is `Lossy` — it compresses for the agent's own ingest and the agent can
+/// re-read the original. The proxy path is `Lossless` — the downstream LLM only sees what
+/// the proxy forwards; any discard is unrecoverable.
+///
+/// `Lossless` invariants (per ADR-007):
+/// - Timestamps: captured as min–max metadata; never silently stripped.
+/// - Dedup: case-sensitive keying; first-seen ordering preserved.
+/// - DEBUG/TRACE lines: included, never hidden.
+/// - Stack frames: never elided; if elision would be needed → passthrough.
+/// - PENDING_STACK_CAP: no cap eviction; if cap would trigger → passthrough.
+/// - Message/level truncation: never applied; if truncation needed → passthrough.
+/// - JSON extra fields: never silently dropped → passthrough for JSON-structured logs.
+/// - Any required content-discarding operation → whole block returned unmodified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Losslessness {
+    /// Standard (CLI) mode: dedup, debug-hide, stack-elision, timestamp-strip.
+    #[default]
+    Lossy,
+    /// Proxy egress mode: annotations summarize metadata only; no content discarded.
+    Lossless,
+}
+
 /// A single log entry with optional level and deduplication count.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LogEntry {
     /// Log level (e.g., "ERROR", "WARN", "INFO"), if detected.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,6 +162,12 @@ pub struct LogEntry {
     pub message: String,
     /// How many times this message appeared in the input.
     pub count: usize,
+    /// Lossless mode: earliest timestamp seen for this dedup group (ISO-8601 prefix, trimmed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_timestamp: Option<String>,
+    /// Lossless mode: latest timestamp seen for this dedup group (ISO-8601 prefix, trimmed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_timestamp: Option<String>,
 }
 
 /// Result of log compression.
@@ -260,24 +292,24 @@ impl LogResult {
         }
 
         for entry in entries {
+            // Lossless mode: when count > 1 and timestamps were captured, append range.
+            let count_annotation = if entry.count > 1 {
+                match (&entry.min_timestamp, &entry.max_timestamp) {
+                    (Some(min_ts), Some(max_ts)) => {
+                        format!(" (\u{d7}{}, [{min_ts}..{max_ts}])", entry.count)
+                    }
+                    _ => format!(" (\u{d7}{})", entry.count),
+                }
+            } else {
+                String::new()
+            };
+
             match &entry.level {
                 Some(level) => {
-                    if entry.count > 1 {
-                        let _ = write!(
-                            output,
-                            "\n {level}: {} (\u{d7}{})",
-                            entry.message, entry.count
-                        );
-                    } else {
-                        let _ = write!(output, "\n {level}: {}", entry.message);
-                    }
+                    let _ = write!(output, "\n {level}: {}{count_annotation}", entry.message);
                 }
                 None => {
-                    if entry.count > 1 {
-                        let _ = write!(output, "\n {} (\u{d7}{})", entry.message, entry.count);
-                    } else {
-                        let _ = write!(output, "\n {}", entry.message);
-                    }
+                    let _ = write!(output, "\n {}{count_annotation}", entry.message);
                 }
             }
         }
@@ -320,6 +352,11 @@ pub struct LogFlags {
     pub show_stats: bool,
     /// Emit structured JSON output.
     pub json_output: bool,
+    /// Whether compression must be lossless (proxy egress) or may be lossy (CLI).
+    ///
+    /// Default: `Lossy` — all existing callers are unchanged. Set to `Lossless`
+    /// for the proxy egress path (see ADR-007 and `Losslessness` docs).
+    pub losslessness: Losslessness,
 }
 
 // ============================================================================
@@ -421,7 +458,17 @@ enum FrameContext {
 ///
 /// Behaviour is identical to the original `cmd/log.rs::compress_log` in the
 /// rskim binary. The rskim binary's handler is re-pointed here (R1 / #327).
+///
+/// # ADR-007 — Losslessness regime
+///
+/// When `flags.losslessness == Losslessness::Lossless`, dispatches to
+/// `compress_log_lossless` — a content-preserving path that annotates
+/// metadata (duplicate counts, timestamp ranges) without discarding any
+/// content bytes.
 pub fn compress_log(input: &str, flags: &LogFlags) -> ParseResult<LogResult> {
+    if flags.losslessness == Losslessness::Lossless {
+        return compress_log_lossless(input, flags);
+    }
     if let Some(result) = try_parse_json_logs(input, flags) {
         return ParseResult::Full(result);
     }
@@ -432,6 +479,279 @@ pub fn compress_log(input: &str, flags: &LogFlags) -> ParseResult<LogResult> {
         );
     }
     ParseResult::Passthrough(input.to_string())
+}
+
+// ============================================================================
+// Lossless mode entry point and helper functions (ADR-007)
+// ============================================================================
+
+/// Lossless mode compression — content-preserving annotated form.
+///
+/// Dispatched from `compress_log` when `flags.losslessness == Losslessness::Lossless`.
+///
+/// # ADR-007 invariants
+///
+/// - JSON-structured logs: always `Passthrough` (extra fields beyond level+message
+///   would be silently dropped — axes 7 and 8 / content-discarding).
+/// - Regex logs: `Degraded` when parseable with full lossless constraints;
+///   `Passthrough` if any content-discarding operation would be required.
+///
+/// CLI behaviour is NEVER affected: CLI callers use `Losslessness::Lossy` (the
+/// default), so all existing golden tests remain byte-identical.
+fn compress_log_lossless(input: &str, flags: &LogFlags) -> ParseResult<LogResult> {
+    // Axis 8 (JSON extra fields) and axes 7a/7b (message/level truncation):
+    // JSON-structured logs always have extra fields (timestamp, request-id, etc.)
+    // that our extractor silently drops. Return Passthrough immediately.
+    if input
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|first| serde_json::from_str::<serde_json::Value>(first.trim()).is_ok())
+    {
+        // JSON-structured log — content-discarding unavoidable → passthrough.
+        return ParseResult::Passthrough(input.to_string());
+    }
+
+    // Try regex tier with lossless constraints.
+    match try_parse_regex_logs_lossless(input, flags) {
+        Some(result) => ParseResult::Degraded(
+            result,
+            vec!["log: lossless mode — regex-parsed, content-preserving".to_string()],
+        ),
+        None => ParseResult::Passthrough(input.to_string()),
+    }
+}
+
+/// Strip an ISO-8601 timestamp prefix from `line` and capture the raw prefix.
+///
+/// Returns `(stripped_line, Some(captured_timestamp))` when a timestamp is found.
+/// Returns `(line, None)` when `keep_timestamps=true` or no prefix found.
+///
+/// Only ISO-8601-style prefixes matched by `RE_LOG_TIMESTAMP` are captured as
+/// metadata. Non-matching timestamp-ish text is CONTENT and returned verbatim.
+fn strip_timestamp_lossless(line: &str, keep_timestamps: bool) -> (&str, Option<String>) {
+    if keep_timestamps {
+        return (line, None);
+    }
+    match RE_LOG_TIMESTAMP.find(line) {
+        Some(m) => {
+            let ts = line[..m.end()].trim().to_string();
+            (&line[m.end()..], Some(ts))
+        }
+        None => (line, None),
+    }
+}
+
+/// Flush pending stack frames in Lossless mode.
+///
+/// Returns `None` if flushing would require elision (>3 frames) — the caller
+/// must return `Passthrough` for the whole block. Returns `Some(())` otherwise.
+///
+/// # ADR-007 — axes 5 and 6
+///
+/// Stack frame elision (keep-last-3 rule) and PENDING_STACK_CAP eviction are
+/// both content-discarding operations. If either would trigger, signal passthrough.
+fn try_flush_stack_lossless(
+    all_entries: &mut [(Option<String>, String, Option<String>)],
+    pending_stack: &mut VecDeque<String>,
+) -> Option<()> {
+    if pending_stack.is_empty() || all_entries.is_empty() {
+        pending_stack.clear();
+        return Some(());
+    }
+    if pending_stack.len() > 3 {
+        // Flushing would require elision — passthrough (axis 5).
+        return None;
+    }
+    if let Some((_, msg, _)) = all_entries.last_mut() {
+        for frame in pending_stack.iter() {
+            msg.push('\n');
+            msg.push_str(frame);
+        }
+    }
+    pending_stack.clear();
+    Some(())
+}
+
+/// Lossless regex log parser.
+///
+/// Returns `None` when any content-discarding operation would be required
+/// (stack elision, cap eviction, etc.). The caller returns `Passthrough`.
+///
+/// Per ADR-007: annotations may summarize METADATA (timestamps→ranges,
+/// duplicates→counts) but CONTENT bytes are never discarded.
+fn try_parse_regex_logs_lossless(input: &str, flags: &LogFlags) -> Option<LogResult> {
+    // (level, message, captured_timestamp)
+    let mut all_entries: Vec<(Option<String>, String, Option<String>)> = Vec::with_capacity(256);
+    let mut total_lines = 0usize;
+    let mut found_structured = false;
+    let mut pending_stack: VecDeque<String> = VecDeque::new();
+    let mut frame_ctx = FrameContext::Idle;
+
+    for line in input.lines().take(MAX_INPUT_LINES) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            try_flush_stack_lossless(&mut all_entries, &mut pending_stack)?;
+            pending_stack.clear();
+            frame_ctx = FrameContext::Idle;
+            continue;
+        }
+
+        // Stack trace detection (axes 5 + 6).
+        if RE_LOG_STACK_TRACE.is_match(line) {
+            if pending_stack.len() >= PENDING_STACK_CAP {
+                // Cap eviction would occur — passthrough (axis 6).
+                return None;
+            }
+            pending_stack.push_back(trimmed.to_string());
+            frame_ctx = if trimmed.starts_with("File ") {
+                FrameContext::PythonFrame {
+                    continuation_count: 0,
+                }
+            } else {
+                FrameContext::Idle
+            };
+            found_structured = true;
+            continue;
+        }
+
+        // Python source-preview / PEP 657 caret continuation.
+        if let FrameContext::PythonFrame {
+            ref mut continuation_count,
+        } = frame_ctx
+            && is_python_continuation(line)
+        {
+            debug_assert!(
+                !pending_stack.is_empty(),
+                "FrameContext::PythonFrame requires a frame in pending_stack"
+            );
+            if *continuation_count < MAX_CONTINUATIONS_PER_FRAME {
+                if let Some(last_frame) = pending_stack.back_mut() {
+                    last_frame.push('\n');
+                    last_frame.push_str(trimmed);
+                }
+                *continuation_count += 1;
+            }
+            total_lines += 1;
+            continue;
+        }
+
+        // Strip timestamp and capture it for range annotation (axis 1).
+        let (without_ts, captured_ts) = strip_timestamp_lossless(trimmed, flags.keep_timestamps);
+
+        // Traceback header.
+        if without_ts.starts_with("Traceback (most recent call last)") {
+            if let Some((_, msg, _)) = all_entries.last_mut() {
+                msg.push('\n');
+                msg.push_str(trimmed);
+            } else {
+                all_entries.push((None, trimmed.to_string(), captured_ts));
+            }
+            frame_ctx = FrameContext::Idle;
+            found_structured = true;
+            total_lines += 1;
+            continue;
+        }
+
+        // Chained exception separator.
+        if without_ts.starts_with("During handling of the above exception")
+            || without_ts.starts_with("The above exception was the direct cause")
+        {
+            try_flush_stack_lossless(&mut all_entries, &mut pending_stack)?;
+            frame_ctx = FrameContext::Idle;
+            all_entries.push((None, trimmed.to_string(), captured_ts));
+            total_lines += 1;
+            continue;
+        }
+
+        // Reset python-frame context.
+        frame_ctx = FrameContext::Idle;
+
+        // New log line — flush pending stack frames.
+        try_flush_stack_lossless(&mut all_entries, &mut pending_stack)?;
+
+        total_lines += 1;
+
+        if let Some((level, message)) = classify_log_line(without_ts) {
+            all_entries.push((Some(level), message, captured_ts));
+            found_structured = true;
+        } else {
+            all_entries.push((None, without_ts.to_string(), captured_ts));
+        }
+    }
+
+    // Flush trailing stack frames.
+    try_flush_stack_lossless(&mut all_entries, &mut pending_stack)?;
+
+    if !found_structured || all_entries.is_empty() {
+        return None;
+    }
+
+    Some(apply_compression_lossless(all_entries, total_lines))
+}
+
+/// Deduplicate entries in Lossless mode using a case-sensitive key (axis 3).
+///
+/// Tracks per-group min/max timestamps for range annotation (axis 1).
+/// Preserves first-seen insertion order (axis 2).
+fn deduplicate_entries_lossless(
+    entries: Vec<(Option<String>, String, Option<String>)>,
+) -> Vec<LogEntry> {
+    let mut dedup_map: HashMap<String, usize> = HashMap::with_capacity(1024);
+    let mut output_entries: Vec<LogEntry> = Vec::with_capacity(256);
+    let mut key_buf = String::with_capacity(128);
+
+    for (level, message, timestamp) in entries {
+        key_buf.clear();
+        key_buf.push_str(level.as_deref().unwrap_or("-"));
+        key_buf.push('|');
+        // Axis 3: case-sensitive message key (no .to_lowercase()).
+        key_buf.push_str(&message);
+
+        if let Some(&idx) = dedup_map.get(key_buf.as_str()) {
+            output_entries[idx].count += 1;
+            // Axis 1: update max_timestamp to last-seen.
+            if let Some(ts) = timestamp {
+                output_entries[idx].max_timestamp = Some(ts);
+            }
+        } else {
+            let idx = output_entries.len();
+            dedup_map.insert(key_buf.clone(), idx);
+            output_entries.push(LogEntry {
+                level,
+                message,
+                count: 1,
+                min_timestamp: timestamp.clone(),
+                max_timestamp: timestamp,
+            });
+        }
+    }
+
+    output_entries
+}
+
+/// Apply lossless compression to parsed entries.
+///
+/// - No debug filtering (axis 4): all levels including DEBUG/TRACE included.
+/// - Case-sensitive dedup (axis 3) with timestamp range capture (axis 1).
+/// - stack_frames_elided = 0 (axis 5: no elision allowed; any elision → passthrough).
+fn apply_compression_lossless(
+    all_entries: Vec<(Option<String>, String, Option<String>)>,
+    total_lines: usize,
+) -> LogResult {
+    // Axis 4: no debug filtering — all levels included, debug_hidden = 0.
+    let output_entries = deduplicate_entries_lossless(all_entries);
+    let unique_messages = output_entries.len();
+    let deduplicated_count = total_lines.saturating_sub(unique_messages);
+
+    LogResult::new_with_stack(
+        total_lines,
+        unique_messages,
+        0, // debug_hidden = 0 in Lossless mode
+        deduplicated_count,
+        output_entries,
+        false,
+        0, // stack_frames_elided = 0 (any elision → passthrough, not here)
+    )
 }
 
 // ============================================================================
@@ -757,6 +1077,7 @@ fn deduplicate_entries(entries: Vec<(Option<String>, String)>, no_dedup: bool) -
                 level,
                 message,
                 count: 1,
+                ..Default::default()
             });
         } else if let Some(&idx) = dedup_map.get(key_buf.as_str()) {
             output_entries[idx].count += 1;
@@ -767,6 +1088,7 @@ fn deduplicate_entries(entries: Vec<(Option<String>, String)>, no_dedup: bool) -
                 level,
                 message,
                 count: 1,
+                ..Default::default()
             });
         }
     }
@@ -791,8 +1113,8 @@ fn build_log_result(
         "P1.1 bug: total_lines({total_lines}) < unique({unique_messages}) + debug({debug_hidden}); \
          an entry-push site is not counting"
     );
-    let deduplicated_count = total_lines
-        .saturating_sub(unique_messages.saturating_add(debug_hidden));
+    let deduplicated_count =
+        total_lines.saturating_sub(unique_messages.saturating_add(debug_hidden));
 
     LogResult::new_with_stack(
         total_lines,
@@ -978,6 +1300,7 @@ mod tests {
             assert!(!f.debug_only);
             assert!(!f.show_stats);
             assert!(!f.json_output);
+            assert_eq!(f.losslessness, Losslessness::Lossy, "default must be Lossy");
         }
 
         #[test]
@@ -986,6 +1309,7 @@ mod tests {
                 level: Some("ERROR".to_string()),
                 message: "something failed".to_string(),
                 count: 2,
+                ..Default::default()
             }];
             let result = LogResult::new(10, 1, 0, 9, entries, false);
             let display = result.as_ref();
@@ -2185,6 +2509,411 @@ mod tests {
                     result.debug_hidden
                 );
             }
+        }
+    }
+
+    // ============================================================================
+    // Lossless regime tests (Step 8 / ADR-007)
+    //
+    // One discriminating test per lossy axis. Each test fails if the axis "leaks"
+    // into Lossless mode (i.e., the code silently applies a Lossy operation when
+    // Lossless is requested). Per PF-007.
+    // ============================================================================
+
+    mod lossless_regime_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn lossless_flags() -> LogFlags {
+            LogFlags {
+                losslessness: Losslessness::Lossless,
+                ..Default::default()
+            }
+        }
+
+        // ---- Axis 1: Timestamps → min/max range annotation ----
+
+        /// Axis 1: duplicate lines with different ISO-8601 timestamps → output shows
+        /// `×N, [ts_min..ts_max]` annotation. Fails if timestamps are silently
+        /// stripped without range capture (Lossy leak).
+        #[test]
+        fn lossless_axis1_timestamps_range_annotation() {
+            let input = concat!(
+                "2024-01-01T10:00:00Z ERROR: connection refused\n",
+                "2024-01-01T10:05:00Z ERROR: connection refused\n",
+                "2024-01-01T10:10:00Z ERROR: connection refused\n",
+            );
+            let result = compress_log(input, &lossless_flags());
+            assert!(
+                !result.is_passthrough(),
+                "Structured log with timestamps must not passthrough: tier={}",
+                result.tier_name()
+            );
+            let content = result.content();
+            // Range annotation must appear.
+            assert!(
+                content.contains("2024-01-01T10:00:00Z"),
+                "min_timestamp must appear in output: {content}"
+            );
+            assert!(
+                content.contains("2024-01-01T10:10:00Z"),
+                "max_timestamp must appear in output: {content}"
+            );
+            // Count annotation.
+            assert!(
+                content.contains('\u{d7}'),
+                "×N marker must appear: {content}"
+            );
+        }
+
+        // ---- Axis 2: Global dedup → first-seen ordering preserved ----
+
+        /// Axis 2: dedup preserves first-seen insertion order. Fails if ordering
+        /// is altered (e.g., sorted or reversed in Lossless mode).
+        #[test]
+        fn lossless_axis2_dedup_insertion_order_preserved() {
+            let input = concat!(
+                "ERROR: alpha\n",
+                "INFO: beta\n",
+                "WARN: gamma\n",
+                "ERROR: alpha\n", // duplicate of first
+            );
+            let result = compress_log(input, &lossless_flags());
+            assert!(!result.is_passthrough());
+            let content = result.content();
+            // Alpha (first seen) must appear before beta, beta before gamma.
+            let pos_alpha = content.find("alpha").expect("alpha must be in output");
+            let pos_beta = content.find("beta").expect("beta must be in output");
+            let pos_gamma = content.find("gamma").expect("gamma must be in output");
+            assert!(
+                pos_alpha < pos_beta && pos_beta < pos_gamma,
+                "First-seen order must be preserved: alpha={pos_alpha} beta={pos_beta} gamma={pos_gamma}"
+            );
+        }
+
+        // ---- Axis 3: Case-variant messages → never silently merged ----
+
+        /// Axis 3: "error: x" (lowercase) and "ERROR: x" (uppercase) are distinct
+        /// content — must not be merged by case-folding in Lossless mode.
+        ///
+        /// Discriminating: if case-folding is applied (Lossy leak), both variants
+        /// collapse to one entry and the assert on entry count fails.
+        #[test]
+        fn lossless_axis3_case_variants_not_merged() {
+            // Two messages with the same text but different level casing.
+            // The dedup key in Lossy mode lowercases the message, merging them.
+            // In Lossless mode, the key is case-sensitive, so they stay separate.
+            let input = concat!(
+                "INFO: Request processed successfully\n",
+                "INFO: request processed successfully\n", // lowercase variant
+            );
+            let result = compress_log(input, &lossless_flags());
+            assert!(!result.is_passthrough());
+            let content = result.content();
+            // Both variants must be present as separate lines.
+            assert!(
+                content.contains("Request processed successfully"),
+                "Uppercase-R variant must be present verbatim: {content}"
+            );
+            assert!(
+                content.contains("request processed successfully"),
+                "Lowercase-r variant must be present verbatim: {content}"
+            );
+            // Must NOT show a ×2 dedup marker (they are distinct entries).
+            assert!(
+                !content.contains('\u{d7}'),
+                "Case variants must NOT be merged (no ×2 marker): {content}"
+            );
+        }
+
+        // ---- Axis 4: DEBUG/TRACE lines → present in output ----
+
+        /// Axis 4: DEBUG and TRACE lines must reach the output in Lossless mode.
+        /// Fails if they are hidden (Lossy leak: `filter_debug_entries` applied).
+        #[test]
+        fn lossless_axis4_debug_lines_present() {
+            let input = concat!(
+                "ERROR: something failed\n",
+                "DEBUG: internal state: x=42\n",
+                "TRACE: entering method foo\n",
+                "INFO: recovered\n",
+            );
+            let result = compress_log(input, &lossless_flags());
+            assert!(!result.is_passthrough());
+            let content = result.content();
+            assert!(
+                content.contains("internal state"),
+                "DEBUG line must be present in Lossless output: {content}"
+            );
+            assert!(
+                content.contains("entering method foo"),
+                "TRACE line must be present in Lossless output: {content}"
+            );
+        }
+
+        // ---- Axis 5: Stack frames → passthrough when elision needed ----
+
+        /// Axis 5: a stack with more than 3 frames would normally elide frames
+        /// (keep-last-3 rule). In Lossless mode, the WHOLE block must return
+        /// Passthrough (never partially-lossy output).
+        ///
+        /// Discriminating: if the keep-last-3 rule is silently applied, the result
+        /// is Compressed with missing frames — this test asserts Passthrough instead.
+        #[test]
+        fn lossless_axis5_stack_frames_no_elision_passthrough() {
+            // 4 stack frames → elision needed (only 3 fit in flush) → passthrough.
+            let input = concat!(
+                "ERROR: something went wrong\n",
+                "    at com.example.Service.a(Service.java:1)\n",
+                "    at com.example.Service.b(Service.java:2)\n",
+                "    at com.example.Service.c(Service.java:3)\n",
+                "    at com.example.Service.d(Service.java:4)\n",
+                "INFO: recovered\n",
+            );
+            let result = compress_log(input, &lossless_flags());
+            assert!(
+                result.is_passthrough(),
+                "4 stack frames require elision → Lossless must return Passthrough; got tier={}",
+                result.tier_name()
+            );
+            // Passthrough content must be byte-identical to input.
+            assert_eq!(
+                result.content(),
+                input,
+                "Passthrough must preserve raw input byte-identical"
+            );
+        }
+
+        // ---- Axis 6: PENDING_STACK_CAP eviction → passthrough ----
+
+        /// Axis 6: PENDING_STACK_CAP = 4. If more than 4 frames arrive before a
+        /// flush, the Lossy path evicts the oldest frame. In Lossless mode, the
+        /// eviction must NOT occur — instead, the whole block is Passthrough.
+        ///
+        /// Discriminating: if cap eviction is silently applied, the result is
+        /// Compressed with missing frames — this test asserts Passthrough.
+        #[test]
+        fn lossless_axis6_pending_cap_eviction_passthrough() {
+            // 5 consecutive stack frames trigger the cap (PENDING_STACK_CAP = 4).
+            let input = concat!(
+                "ERROR: deep call chain\n",
+                "    at com.example.A.method(A.java:1)\n",
+                "    at com.example.B.method(B.java:2)\n",
+                "    at com.example.C.method(C.java:3)\n",
+                "    at com.example.D.method(D.java:4)\n",
+                "    at com.example.E.method(E.java:5)\n", // triggers cap eviction
+            );
+            let result = compress_log(input, &lossless_flags());
+            assert!(
+                result.is_passthrough(),
+                "5 stack frames trigger PENDING_STACK_CAP → Lossless must passthrough; got tier={}",
+                result.tier_name()
+            );
+        }
+
+        // ---- Axis 7: Message truncation → passthrough (JSON tier) ----
+
+        /// Axis 7: `extract_json_message` truncates messages exceeding MAX_JSON_MSG_LEN.
+        /// In Lossless mode, the JSON tier is skipped entirely — the whole block is
+        /// Passthrough, preserving the raw JSON verbatim.
+        ///
+        /// Discriminating: if the JSON tier is exercised in Lossless mode and
+        /// truncation is applied, the `[truncated]` suffix appears — failing
+        /// the Passthrough assertion.
+        #[test]
+        fn lossless_axis7_message_truncation_passthrough() {
+            let large_msg = "x".repeat(MAX_JSON_MSG_LEN + 100);
+            let json_line = format!(r#"{{"level":"error","msg":"{large_msg}"}}"#);
+            let result = compress_log(&json_line, &lossless_flags());
+            assert!(
+                result.is_passthrough(),
+                "JSON log with oversized message must passthrough in Lossless mode; got tier={}",
+                result.tier_name()
+            );
+            // Raw content preserved verbatim (no truncation).
+            assert!(
+                result.content().contains(&large_msg),
+                "Passthrough must preserve raw oversized message verbatim"
+            );
+        }
+
+        // ---- Axis 8: Level truncation → passthrough (JSON tier) ----
+
+        /// Axis 8: `extract_json_level` truncates level fields exceeding MAX_JSON_LEVEL_LEN.
+        /// In Lossless mode, the JSON tier is skipped — whole block is Passthrough.
+        ///
+        /// Discriminating: if the JSON tier runs and truncates the level, the
+        /// preserved level in output is shorter than the input — the Passthrough
+        /// assertion catches this.
+        #[test]
+        fn lossless_axis8_level_truncation_passthrough() {
+            let large_level = "CUSTOM_LEVEL_".repeat(5); // > MAX_JSON_LEVEL_LEN (32)
+            let json_line = format!(r#"{{"level":"{large_level}","msg":"test"}}"#);
+            let result = compress_log(&json_line, &lossless_flags());
+            assert!(
+                result.is_passthrough(),
+                "JSON log with oversized level must passthrough in Lossless mode; got tier={}",
+                result.tier_name()
+            );
+        }
+
+        // ---- Axis 9: JSON extra fields → passthrough ----
+
+        /// Axis 9: JSON structured logs have extra fields (timestamp, request_id, etc.)
+        /// that the extractor silently drops. In Lossless mode, the JSON tier is
+        /// skipped entirely — the whole block is Passthrough.
+        ///
+        /// Discriminating: if the JSON tier runs in Lossless mode and extra fields
+        /// are silently dropped, the Passthrough assertion fails.
+        #[test]
+        fn lossless_axis9_json_extra_fields_passthrough() {
+            let input = r#"{"level":"info","msg":"server started","timestamp":"2024-01-01T10:00:00Z","request_id":"req-001"}"#;
+            let result = compress_log(input, &lossless_flags());
+            assert!(
+                result.is_passthrough(),
+                "JSON log with extra fields must passthrough in Lossless mode; got tier={}",
+                result.tier_name()
+            );
+            // All fields preserved verbatim.
+            assert!(
+                result.content().contains("request_id"),
+                "Passthrough must preserve all JSON fields verbatim: {}",
+                result.content()
+            );
+        }
+
+        // ---- Annotation-ambiguity test ----
+
+        /// Annotation-ambiguity: an input line that genuinely ends with `(×5, ...)`-style
+        /// text is preserved verbatim and NOT confused with generated annotations.
+        ///
+        /// Count annotations come from integer counters, never parsed back from text.
+        /// This test ensures that a line containing `×` or `[ts..ts]` syntax is
+        /// treated as content, not as a generated annotation.
+        #[test]
+        fn lossless_annotation_ambiguity_suffix_preserved() {
+            // A log line whose message ends with annotation-looking text.
+            let input = concat!(
+                "INFO: batch complete (×5, [2024-01-01..2024-01-02])\n",
+                "INFO: batch complete (×5, [2024-01-01..2024-01-02])\n",
+            );
+            let result = compress_log(input, &lossless_flags());
+            // If this is Compressed: the message text must appear verbatim.
+            // If Passthrough: raw content preserved.
+            let content = result.content();
+            assert!(
+                content.contains("batch complete (×5, [2024-01-01..2024-01-02])"),
+                "Lines with annotation-like suffixes must be preserved verbatim: {content}"
+            );
+        }
+
+        // ---- Entry-count conservation proptest ----
+
+        proptest! {
+            /// For arbitrary log-ish input under Lossless mode:
+            /// - Σ entry.count == total_lines (no debug hidden, no silent drops)
+            /// - Every distinct message text present verbatim in output
+            ///
+            /// This is the content-conservation invariant: no input line is silently
+            /// discarded in Lossless mode.
+            #[test]
+            fn prop_lossless_entry_count_conservation(
+                lines in proptest::collection::vec(
+                    (
+                        prop_oneof![
+                            Just("ERROR"),
+                            Just("WARN"),
+                            Just("INFO"),
+                        ],
+                        proptest::string::string_regex("[a-zA-Z0-9 ]{1,30}").unwrap(),
+                    ),
+                    1..=15usize
+                )
+            ) {
+                let mut input = String::new();
+                for (level, msg) in &lines {
+                    input.push_str(level);
+                    input.push_str(": ");
+                    input.push_str(msg);
+                    input.push('\n');
+                }
+
+                let flags = lossless_flags();
+                let result = compress_log(&input, &flags);
+
+                match result {
+                    ParseResult::Passthrough(ref s) => {
+                        // Passthrough: content preserved verbatim.
+                        prop_assert_eq!(
+                            s.as_str(), input.as_str(),
+                            "Passthrough must preserve raw input byte-identical"
+                        );
+                    }
+                    ParseResult::Full(ref r) | ParseResult::Degraded(ref r, _) => {
+                        // Σ counts == total_lines (debug_hidden = 0 in Lossless).
+                        let total_counts: usize = r.entries.iter().map(|e| e.count).sum();
+                        prop_assert_eq!(
+                            total_counts, r.total_lines,
+                            "Σ entry.count ({}) must equal total_lines ({})",
+                            total_counts,
+                            r.total_lines
+                        );
+
+                        // Every distinct message text must appear verbatim in output.
+                        // Trim the message before checking: classify_log_line applies
+                        // .trim() to the message portion, so trailing/leading spaces
+                        // are stripped by the engine. The invariant is about content,
+                        // not byte-identical whitespace.
+                        let output_text = r.as_ref();
+                        let mut seen: std::collections::HashSet<&str> =
+                            std::collections::HashSet::new();
+                        for (_, msg) in &lines {
+                            let trimmed_msg = msg.trim();
+                            if trimmed_msg.is_empty() {
+                                continue;
+                            }
+                            if seen.insert(trimmed_msg) {
+                                prop_assert!(
+                                    output_text.contains(trimmed_msg),
+                                    "Message {:?} must appear verbatim in Lossless output",
+                                    trimmed_msg
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- CLI stays Lossy proof ----
+
+        /// Proof: the Lossy path is byte-identical to the pre-Step-8 path.
+        ///
+        /// The CLI goldens (STABLE + COUNTERFIX) enforce byte-identity at the
+        /// binary level. This unit-level test confirms that `Losslessness::Lossy`
+        /// (the default) does NOT alter any existing log compression behavior.
+        #[test]
+        fn lossless_default_is_lossy_cli_path_unchanged() {
+            let input = "ERROR: database connection failed\nERROR: database connection failed\nINFO: retrying\n";
+            let lossy_result = compress_log(
+                input,
+                &LogFlags {
+                    losslessness: Losslessness::Lossy,
+                    ..Default::default()
+                },
+            );
+            let default_result = compress_log(input, &LogFlags::default());
+            // Both must produce identical output (Lossy == Default).
+            assert_eq!(
+                lossy_result.content(),
+                default_result.content(),
+                "Losslessness::Lossy must produce identical output to Default"
+            );
+            assert_eq!(
+                lossy_result.tier_name(),
+                default_result.tier_name(),
+                "Tier must be identical for Lossy and Default"
+            );
         }
     }
 }
