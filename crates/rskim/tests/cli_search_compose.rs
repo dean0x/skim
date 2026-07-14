@@ -432,23 +432,31 @@ mod root_validation_400 {
     use predicates::prelude::*;
     use std::fs;
 
+    /// Count the number of hash subdirectories under `<cache>/search/`.
+    /// Returns 0 when `search/` is absent or empty. Used by
+    /// `assert_no_cache_subdirs` (emptiness check) and the AC6/AC7 exact-count
+    /// assertions so the `read_dir + filter_map(ok) + filter(is_dir)` idiom lives
+    /// in exactly one place.
+    fn count_hash_subdirs(cache: &std::path::Path) -> usize {
+        let search_dir = cache.join("search");
+        if !search_dir.exists() {
+            return 0;
+        }
+        fs::read_dir(&search_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .count()
+    }
+
     /// Assert that the `search/` subtree of `cache` contains no hash subdirs.
     /// AC2 and AC3 share this check (PF-007 discriminating for the funnel bail).
     fn assert_no_cache_subdirs(cache: &std::path::Path, label: &str) {
-        let search_dir = cache.join("search");
-        if search_dir.exists() {
-            let subdirs: Vec<_> = fs::read_dir(&search_dir)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                .collect();
-            assert!(
-                subdirs.is_empty(),
-                "{label}: no search/<hash>/ dirs must be created for a bad root; \
-                 found: {:?}",
-                subdirs.iter().map(|e| e.path()).collect::<Vec<_>>()
-            );
-        }
+        let n = count_hash_subdirs(cache);
+        assert!(
+            n == 0,
+            "{label}: no search/<hash>/ dirs must be created for a bad root; found {n} dirs"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -643,19 +651,11 @@ mod root_validation_400 {
             .unwrap();
 
         // Exactly one search/<hash>/ dir must exist — both spellings map to the same hash
-        let search_dir = cache.path().join("search");
-        let subdirs: Vec<_> = fs::read_dir(&search_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .collect();
+        let n = count_hash_subdirs(cache.path());
         assert_eq!(
-            subdirs.len(),
-            1,
+            n, 1,
             "AC6: both trailing-slash and plain spellings must map to ONE cache hash dir; \
-             found {} dirs: {:?}",
-            subdirs.len(),
-            subdirs.iter().map(|e| e.path()).collect::<Vec<_>>()
+             found {n} dirs"
         );
     }
 
@@ -710,18 +710,10 @@ mod root_validation_400 {
             .success();
 
         // Both routes must map to exactly ONE cache hash dir
-        let search_dir = cache.path().join("search");
-        let subdirs: Vec<_> = fs::read_dir(&search_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .collect();
+        let n = count_hash_subdirs(cache.path());
         assert_eq!(
-            subdirs.len(),
-            1,
-            "AC7: symlink-dir and real-dir must map to ONE cache hash; \
-             found: {:?}",
-            subdirs.iter().map(|e| e.path()).collect::<Vec<_>>()
+            n, 1,
+            "AC7: symlink-dir and real-dir must map to ONE cache hash; found {n} dirs"
         );
 
         // symlink-to-file must fail with is_dir message
@@ -769,6 +761,14 @@ mod root_validation_400 {
             .unwrap()
             .args(["search", "foo", "--root"])
             .arg(tmp_file.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .code(1);
+
+        // Empty-string root → canonicalize("") fails → exit 1 (AC10 third case)
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "foo", "--root", ""])
             .env("SKIM_CACHE_DIR", cache.path())
             .assert()
             .code(1);
