@@ -1238,6 +1238,165 @@ mod tracked_union_402 {
     }
 
     // -------------------------------------------------------------------------
+    // AC1 (#402) — Real-repo dog-food: CLAUDE.md surfaces in search results
+    // -------------------------------------------------------------------------
+    /// `CLAUDE.md` is tracked in git but listed in `.gitignore` (line 26), so it
+    /// was silently excluded from `skim search` before #402.  After the union fix
+    /// it must appear when searching for a token that exists only in `CLAUDE.md`.
+    ///
+    /// Oracle: `git grep -l "byte-faithful contract"` → `CLAUDE.md`.
+    /// Discriminating (PF-007): reverting the union removes CLAUDE.md from the
+    /// ignore-walk results so it vanishes from the search output, failing this test.
+    #[test]
+    fn ac1_real_repo_byte_faithful_contract() {
+        // Resolve the workspace root from this crate's CARGO_MANIFEST_DIR.
+        // Integration tests live in `crates/rskim/tests/`, so CARGO_MANIFEST_DIR
+        // points to `.../crates/rskim`; two parent steps reach the workspace root.
+        let repo_root = {
+            let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            manifest
+                .parent() // .../crates
+                .expect("crates dir")
+                .parent() // workspace root
+                .expect("workspace root")
+                .to_path_buf()
+        };
+
+        // Guard: CLAUDE.md must exist and contain the oracle token, so the
+        // assertion below is non-vacuous.
+        let claude_path = repo_root.join("CLAUDE.md");
+        assert!(
+            claude_path.exists(),
+            "AC1 guard: CLAUDE.md must exist at {}",
+            claude_path.display()
+        );
+        let claude_content = fs::read_to_string(&claude_path).expect("read CLAUDE.md");
+        assert!(
+            claude_content.contains("byte-faithful contract"),
+            "AC1 guard: CLAUDE.md must contain the token 'byte-faithful contract' \
+             (oracle: git grep -l \"byte-faithful contract\" → CLAUDE.md)"
+        );
+
+        let cache = tempfile::tempdir().unwrap();
+
+        // Build the index from the real repo (union must surface CLAUDE.md).
+        build_index_402(&repo_root, cache.path());
+
+        // Query for the token — union must have indexed CLAUDE.md.
+        let json = query_json(&repo_root, cache.path(), "byte-faithful contract");
+        let paths = result_paths(&json);
+
+        assert!(
+            paths.iter().any(|p| p.ends_with("CLAUDE.md")),
+            "AC1: CLAUDE.md must appear in results for 'byte-faithful contract'; \
+             paths: {paths:?}\n\
+             (CLAUDE.md is tracked-but-.gitignored; the union must surface it — AD-402-1)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC8 (#402) — Existing index self-heals exactly once
+    // -------------------------------------------------------------------------
+    /// Simulates a "pre-union" manifest by building the index when `secretdoc.md`
+    /// is NOT yet tracked in git, then staging it with `git add -f`.
+    ///
+    /// On the FIRST subsequent query, `check_staleness` calls `walk_metadata`
+    /// (with union active), finds `secretdoc.md` as newly-added, returns
+    /// `WorkingTreeChanged { added: 1 }`, and triggers exactly one rebuild.
+    /// On the SECOND query the manifest already has `secretdoc.md` → `Current`
+    /// → no rebuild.
+    ///
+    /// Discriminating (PF-007): query #1 must emit the "working tree changed"
+    /// stderr line; query #2 must not — neither direction is a vacuous exit-0 check.
+    #[test]
+    fn ac8_pre_union_index_self_heals_once() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        // Set up a git repo with ONLY src/a.rs committed initially.
+        // `secretdoc.md` exists on disk but is NOT yet tracked.
+        StdCommand::new("git")
+            .args(["init"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git init");
+        StdCommand::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git config email");
+        StdCommand::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git config name");
+
+        fs::create_dir_all(proj.path().join("src")).unwrap();
+        fs::write(proj.path().join(".gitignore"), "secretdoc.md\n").unwrap();
+        fs::write(proj.path().join("secretdoc.md"), "ZZUNIQUETOKEN\n").unwrap();
+        fs::write(proj.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+
+        // Stage only src/a.rs and .gitignore — secretdoc.md NOT yet tracked.
+        StdCommand::new("git")
+            .args(["add", "src/a.rs", ".gitignore"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git add src/a.rs .gitignore");
+        StdCommand::new("git")
+            .args(["commit", "-m", "init without secretdoc"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git commit");
+
+        // Build the index (pre-union state: secretdoc.md is NOT tracked → not indexed).
+        build_index_402(proj.path(), cache.path());
+
+        // Now add secretdoc.md to the git index (rewrites .git/index → union sees it).
+        StdCommand::new("git")
+            .args(["add", "-f", "secretdoc.md"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git add secretdoc.md");
+
+        // Query #1: staleness scan (via walk_metadata + union) finds secretdoc.md
+        // as "added" → WorkingTreeChanged → rebuild.  Discriminating: the
+        // "working tree changed" message must appear in stderr.
+        let out1 = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "ZZUNIQUETOKEN", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stderr1 = String::from_utf8_lossy(&out1.stderr);
+        assert!(
+            stderr1.contains("working tree changed"),
+            "AC8: query #1 must trigger a self-heal rebuild \
+             (staleness: working tree changed, 1 added); stderr:\n{stderr1}"
+        );
+
+        // Query #2: secretdoc.md is now in the manifest → Current → no rebuild.
+        // Discriminating: the staleness message must be absent (proves exactly one heal).
+        let out2 = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "ZZUNIQUETOKEN", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stderr2 = String::from_utf8_lossy(&out2.stderr);
+        assert!(
+            !stderr2.contains("working tree changed") && !stderr2.contains("building index"),
+            "AC8: query #2 must NOT trigger another rebuild (one-shot self-heal only); \
+             stderr:\n{stderr2}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // Cross-plan composed dog-food: #400 + #402 compose (ADR-007)
     // -------------------------------------------------------------------------
     /// One fresh isolated SKIM_CACHE_DIR: (a) bad-root fails loud (#400 behavior)

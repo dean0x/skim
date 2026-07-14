@@ -1156,6 +1156,196 @@ fn test_adr006_self_heal_after_abort() {
 }
 
 // ============================================================================
+// AC10 (#402) — ADR-006 desync-abort for a unioned WalkEntry
+// ============================================================================
+
+/// Create a real git repo with a tracked-but-.gitignored file, so the union
+/// path (`merge_tracked_union`) includes `secretdoc.md` in the walk output.
+/// Used by `test_ac10_402_*` below.
+fn make_tracked_ignored_project() -> TempDir {
+    use std::process::Command as StdCmd;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    StdCmd::new("git")
+        .args(["init"])
+        .current_dir(root)
+        .output()
+        .expect("git init");
+    StdCmd::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(root)
+        .output()
+        .expect("git config email");
+    StdCmd::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(root)
+        .output()
+        .expect("git config name");
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join(".gitignore"), "secretdoc.md\n").unwrap();
+    fs::write(root.join("secretdoc.md"), "ZZUNIQUETOKEN\n").unwrap();
+    fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+
+    StdCmd::new("git")
+        .args(["add", "-f", "secretdoc.md", "src/a.rs", ".gitignore"])
+        .current_dir(root)
+        .output()
+        .expect("git add");
+    StdCmd::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(root)
+        .output()
+        .expect("git commit");
+
+    dir
+}
+
+/// AC10 (#402) — Desync-abort on a unioned WalkEntry leaves the old manifest intact.
+///
+/// `secretdoc.md` is tracked-but-.gitignored, so it enters the build via
+/// `merge_tracked_union` (the union path, AD-402-4). When `add_file_ngrams` is
+/// forced to fail for that unioned file (by pre-advancing the AST builder), the
+/// existing `Pipeline::consume` abort path (ADR-006) must fire BEFORE
+/// `new_manifest.save()`, leaving the on-disk manifest byte-identical.
+///
+/// This proves that the ADR-006 desync-abort invariant inherited by unioned entries
+/// (stated in AD-402-4: "unioned files are downstream-indistinguishable") actually
+/// holds — unioned files are NOT silently skipped past the abort gate.
+///
+/// Discriminating observable (PF-007): old manifest mtime unchanged AND same
+/// entry count after the failed consume. (applies ADR-006 / AD-402-4)
+#[test]
+fn test_ac10_402_unioned_file_desync_abort_preserves_manifest() {
+    use rskim_search::{
+        AstIndexBuilder, AstNgramSet, FileId, NgramIndexBuilder, StructuralMetrics,
+    };
+
+    use super::super::manifest::FileManifest;
+    use super::super::types::ProcessedFile;
+    use super::Pipeline;
+
+    let project = make_tracked_ignored_project(); // secretdoc.md is union-contributed
+    let cache = tempfile::tempdir().unwrap();
+
+    // Stage 1: first build includes secretdoc.md via the union — establishes
+    // the "old manifest" on disk (has both src/a.rs AND secretdoc.md).
+    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS)
+        .expect("first build must succeed");
+
+    let skfiles_path = cache
+        .path()
+        .read_dir()
+        .unwrap()
+        .flatten()
+        .find(|e| e.path().extension().is_some_and(|x| x == "skfiles"))
+        .expect("manifest (.skfiles) must exist after first build")
+        .path();
+
+    let old_mtime = fs::metadata(&skfiles_path)
+        .expect("skfiles must be stat-able")
+        .modified()
+        .expect("mtime must be available on this platform");
+
+    let old_manifest = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+        .expect("old manifest must be loadable");
+    let old_entry_count = old_manifest.entry_count();
+
+    // Verify secretdoc.md (the unioned file) is in the manifest — otherwise the
+    // test only exercises regular-file abort behavior (same as ADR-006 test above).
+    assert!(
+        old_entry_count >= 2,
+        "AC10: old manifest must include both src/a.rs and secretdoc.md (unioned); \
+         got {old_entry_count} entries — union may not have fired"
+    );
+
+    // Stage 2: pre-break the AST builder by inserting FileId(0) so it expects
+    // FileId(1) next.  When consume processes secretdoc.md at FileId(0), the
+    // builder rejects it with the sequential-FileId error → ADR-006 abort.
+    let mut lexical_builder = NgramIndexBuilder::new(cache.path().to_path_buf())
+        .expect("lexical builder must initialise");
+    let mut ast_builder =
+        AstIndexBuilder::new(cache.path().to_path_buf()).expect("AST builder must initialise");
+
+    ast_builder
+        .add_file_ngrams(
+            FileId(0),
+            rskim_core::Language::Rust,
+            &AstNgramSet::default(),
+            0,
+            StructuralMetrics::default(),
+        )
+        .expect("pre-advance must succeed");
+
+    let mut new_manifest =
+        FileManifest::new(project.path().to_path_buf(), cache.path().to_path_buf());
+
+    // Stage 3: send secretdoc.md (the unioned file) through consume.
+    // This simulates the union-contributed file being the first item in the
+    // pipeline — exactly the scenario where FileId(0) triggers the abort.
+    let (tx, rx) = crossbeam_channel::bounded::<ProcessedFile>(1);
+    let pf = ProcessedFile {
+        rel_path: std::path::PathBuf::from("secretdoc.md"),
+        lang: rskim_core::Language::Markdown,
+        content: "ZZUNIQUETOKEN\n".to_string(),
+        sha256: "a".repeat(64),
+        mtime: None,
+        size: None,
+        field_map: vec![],
+        cache_hit: false,
+        ast_cached: None,
+    };
+    tx.send(pf).unwrap();
+    drop(tx); // close channel so consume loop terminates after one item
+
+    let mut throwaway_ast_cache = rskim_search::AstNgramCache::empty();
+    let result = Pipeline::consume(
+        &mut lexical_builder,
+        &mut ast_builder,
+        &mut new_manifest,
+        &mut throwaway_ast_cache,
+        rx,
+        false,
+    );
+
+    // Stage 4: consume MUST return Err — the ADR-006 abort fires for the unioned file.
+    assert!(
+        result.is_err(),
+        "AC10: consume must return Err when add_file_ngrams fails for a unioned file \
+         (ADR-006 / AD-402-4 invariant); got Ok"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("AST index desync") || err_msg.contains("sequential"),
+        "AC10: error must identify the desync; got: {err_msg}"
+    );
+
+    // Stage 5: verify the on-disk manifest was NOT saved — old manifest survives.
+    // `consume` returned Err before the caller's `new_manifest.save()` could run,
+    // so the file on disk is byte-identical to before.
+    let new_mtime = fs::metadata(&skfiles_path)
+        .expect("skfiles must still exist")
+        .modified()
+        .expect("mtime must be available on this platform");
+
+    assert_eq!(
+        old_mtime, new_mtime,
+        "AC10: manifest mtime must not change — the unioned-file desync abort must \
+         not overwrite the old manifest (ADR-006 / AD-402-4)"
+    );
+
+    let reloaded = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+        .expect("manifest must still be loadable after abort");
+    assert_eq!(
+        reloaded.entry_count(),
+        old_entry_count,
+        "AC10: manifest entry count must be unchanged — old manifest survived the abort \
+         (ADR-006 / AD-402-4)"
+    );
+}
+
+// ============================================================================
 // AC2 — Query-equivalence: fully-cached rebuild == --force full rebuild
 // ============================================================================
 
