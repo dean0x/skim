@@ -39,7 +39,7 @@
 use std::collections::{BinaryHeap, HashSet};
 use std::fs;
 use std::io::Read as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -665,17 +665,15 @@ fn tracked_files_memoized(root: &Path, cache_dir: Option<&Path>) -> Option<Vec<P
     // IO error reading the .git pointer file, or unexpected format), fall through
     // to a live list_tracked_files call rather than propagating None out of this
     // function and silently dropping the entire tracked-union (AD-402-3).
-    let git_index_path = match resolve_git_index_path(root) {
-        Some(p) => p,
-        None => return list_tracked_files(root),
+    let Some(git_index_path) = resolve_git_index_path(root) else {
+        return list_tracked_files(root);
     };
 
     // Stat the resolved index path for the fingerprint. If missing (newly-init
     // repo with no commits), fall through to a live call (which will also return
     // None from gix if the index truly does not exist).
-    let git_meta = match fs::metadata(&git_index_path) {
-        Ok(m) => m,
-        Err(_) => return list_tracked_files(root),
+    let Ok(git_meta) = fs::metadata(&git_index_path) else {
+        return list_tracked_files(root);
     };
     // Use nanosecond-precision mtime for the fingerprint to close the 1-second
     // window where two same-second .git/index rewrites of equal byte length
@@ -692,14 +690,13 @@ fn tracked_files_memoized(root: &Path, cache_dir: Option<&Path>) -> Option<Vec<P
     // appear identical → stale cache HIT. Skip the cache entirely on such
     // platforms and re-enumerate every call (correct; no optimization on this
     // platform). (finding: mtime-fingerprint-degenerate-zero)
-    let mtime_nanos: u64 = match git_meta
+    let Some(mtime_nanos) = git_meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as u64)
-    {
-        Some(n) => n,
-        None => return list_tracked_files(root),
+    else {
+        return list_tracked_files(root);
     };
     let len_bytes = git_meta.len();
 
@@ -707,18 +704,13 @@ fn tracked_files_memoized(root: &Path, cache_dir: Option<&Path>) -> Option<Vec<P
     // to avoid a redundant canonicalize+SHA-256 per query); otherwise resolve it
     // here as a soft fallback.  AD-402-6: the sidecar is an optimization cache —
     // failure to locate the dir simply forces a live gix re-enumeration.
-    let owned_dir;
-    let effective_cache_dir: &Path = match cache_dir {
-        Some(d) => d,
-        None => {
-            owned_dir = match resolve_search_cache_dir(root) {
-                Ok(d) => d,
-                Err(_) => return list_tracked_files(root),
-            };
-            &owned_dir
-        }
+    let sidecar_path = match cache_dir {
+        Some(d) => d.join("tracked_union.cache"),
+        None => match resolve_search_cache_dir(root) {
+            Ok(d) => d.join("tracked_union.cache"),
+            Err(_) => return list_tracked_files(root),
+        },
     };
-    let sidecar_path = effective_cache_dir.join("tracked_union.cache");
 
     // Cache HIT path: read sidecar as raw bytes (byte-lossless for non-UTF-8
     // paths — see format_tracked_union_cache for rationale) and validate.
@@ -789,7 +781,6 @@ fn list_tracked_files(root: &Path) -> Option<Vec<PathBuf>> {
         // `.git/index` could otherwise cause skim to read files outside the
         // repository (path traversal / local information disclosure).
         // `classify_metadata_core`'s strip_prefix guard is defense in depth.
-        use std::path::Component;
         if path.components().any(|c| {
             matches!(
                 c,
