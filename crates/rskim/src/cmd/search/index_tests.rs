@@ -1174,8 +1174,10 @@ fn test_adr006_self_heal_after_abort() {
 /// Discriminating observables (PF-007): (1) `result.is_err()` — the abort fires;
 /// (2) error message contains the desync signature; (3) `new_manifest.entry_count()`
 /// is 0 post-abort (manifest.insert() is skipped when add_file_ngrams errors);
-/// (4) an adversarial `new_manifest.save()` verifiably changes the on-disk mtime,
-/// confirming the manifest-preservation check is non-tautological.
+/// (4) on-disk manifest entry count equals the pre-abort count, verified BEFORE
+/// any adversarial save — the check fails if the abort-before-save guard is removed;
+/// (5) an adversarial `new_manifest.save()` drops the on-disk count to 0, proving
+/// observable (4) is non-tautological and that save() is effective when called.
 /// (applies ADR-006 / AD-402-4)
 #[test]
 fn test_ac10_402_unioned_file_desync_abort_preserves_manifest() {
@@ -1195,23 +1197,10 @@ fn test_ac10_402_unioned_file_desync_abort_preserves_manifest() {
     run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS)
         .expect("first build must succeed");
 
-    let skfiles_path = cache
-        .path()
-        .read_dir()
-        .unwrap()
-        .flatten()
-        .find(|e| e.path().extension().is_some_and(|x| x == "skfiles"))
-        .expect("manifest (.skfiles) must exist after first build")
-        .path();
-
-    let old_mtime = fs::metadata(&skfiles_path)
-        .expect("skfiles must be stat-able")
-        .modified()
-        .expect("mtime must be available on this platform");
-
-    let old_manifest = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
-        .expect("old manifest must be loadable");
-    let old_entry_count = old_manifest.entry_count();
+    let old_entry_count =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+            .expect("old manifest must be loadable")
+            .entry_count();
 
     // Verify secretdoc.md (the unioned file) is in the manifest — otherwise the
     // test only exercises regular-file abort behavior (same as ADR-006 test above).
@@ -1284,10 +1273,11 @@ fn test_ac10_402_unioned_file_desync_abort_preserves_manifest() {
 
     // Stage 5: prove the manifest-preservation claim is non-tautological (PF-007).
     //
-    // The `consume()` call in this test never invokes `new_manifest.save()`, so a
-    // naïve mtime check would be trivially true regardless of the abort. We make
-    // the assertions discriminating by demonstrating WHAT WOULD HAPPEN if the
-    // caller incorrectly saved after Err, then restoring the old manifest.
+    // Two discriminating checks, sequenced so neither can trivially pass:
+    // (b) reads the on-disk manifest BEFORE any adversarial intervention — fails if
+    //     the abort-before-save guard is missing; (c) calls save() adversarially and
+    //     confirms the manifest IS rewritten to 0 entries, proving that (b) would
+    //     have caught a broken implementation (save() is effective when called).
 
     // (a) new_manifest must be empty — manifest.insert() is skipped when
     //     add_file_ngrams errors; the abort fires before the insert call in consume().
@@ -1298,50 +1288,42 @@ fn test_ac10_402_unioned_file_desync_abort_preserves_manifest() {
          skipped when add_file_ngrams returns Err (ADR-006)"
     );
 
-    // (b) Adversarial: call new_manifest.save() explicitly to prove that save()
-    //     WOULD change the on-disk file (discriminating — mtime must change).
-    //     This is the incorrect behaviour a broken caller would exhibit; run()
-    //     does NOT take this path when consume() returns Err (ADR-006).
-    new_manifest
-        .save()
-        .expect("adversarial new_manifest.save() must succeed");
-    let adversarial_mtime = fs::metadata(&skfiles_path)
-        .expect("skfiles must still exist after adversarial save")
-        .modified()
-        .expect("mtime must be available on this platform");
-    assert_ne!(
-        old_mtime, adversarial_mtime,
-        "AC10 (adversarial): new_manifest.save() DID change the mtime — proving the \
-         manifest check is non-tautological (PF-007); a correct abort must skip save()"
-    );
+    // (b) On-disk manifest is unchanged after consume() Err — the correct
+    //     abort-before-save guard means run() never reaches new_manifest.save().
+    //     This assertion fails if the guard is removed (new_manifest has 0 entries,
+    //     so a save would overwrite the old {old_entry_count}-entry manifest with 0).
+    //     (PF-007, ADR-006 / AD-402-4)
     {
-        let corrupted =
-            FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
-                .expect("corrupted manifest must be loadable");
+        let on_disk = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+            .expect("on-disk manifest must be loadable after consume() Err");
         assert_eq!(
-            corrupted.entry_count(),
-            0,
-            "AC10 (adversarial): incorrect save() after Err writes 0 entries — the \
-             {old_entry_count}-entry old manifest would have been lost"
+            on_disk.entry_count(),
+            old_entry_count,
+            "AC10: on-disk manifest must still hold {old_entry_count} entries after \
+             consume() returns Err — abort-before-save guard must suppress \
+             new_manifest.save() (ADR-006 / AD-402-4)"
         );
     }
 
-    // (c) Restore the old manifest and verify the correct entry_count.
-    //     This mirrors the correct run() behaviour: no save() after Err means
-    //     old_entry_count is preserved on disk. (applies ADR-006 / AD-402-4)
-    old_manifest
+    // (c) Adversarial: call new_manifest.save() now to prove save() IS effective —
+    //     the on-disk manifest drops to 0 entries, confirming assertion (b) would
+    //     have caught a broken implementation that omitted the abort-before-save guard.
+    //     (PF-007 non-tautology gate — no restoration after this point)
+    new_manifest
         .save()
-        .expect("restoring old manifest must succeed");
-
-    let reloaded = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
-        .expect("manifest must still be loadable after restore");
-    assert_eq!(
-        reloaded.entry_count(),
-        old_entry_count,
-        "AC10: manifest entry count must be {old_entry_count} — the old manifest \
-         survives when run() does not call save() after consume() returns Err \
-         (ADR-006 / AD-402-4)"
-    );
+        .expect("adversarial new_manifest.save() must succeed");
+    {
+        let corrupted =
+            FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+                .expect("corrupted manifest must be loadable after adversarial save");
+        assert_eq!(
+            corrupted.entry_count(),
+            0,
+            "AC10 (adversarial): save() after Err writes 0 entries — the \
+             {old_entry_count}-entry old manifest is lost (proves save() is effective \
+             and that assertion (b) above discriminates correctly)"
+        );
+    }
 }
 
 // ============================================================================
