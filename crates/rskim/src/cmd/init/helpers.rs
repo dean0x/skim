@@ -142,10 +142,16 @@ The rewrite hook may also wrap supported shell commands (`ls`, `grep`,
 `git diff`, `gh`, test runners, ...) as `skim <tool>`: the same command
 runs with the same arguments and exit code, and skim compresses its
 output. Seeing `skim ls` run in place of `ls` is expected behavior, not
-an error.
+an error. File reads (`cat`, `head`, `tail` on code files) are rewritten
+into direct skim reads (example: `cat file.ts` becomes
+`skim file.ts --mode=pseudo`), so the output is a structured view, not
+raw file contents; seeing `skim` run in place of the original command
+is expected.
 
-Compression condenses how results are presented — it does not change
-what the command did. If compressed output ever looks incomplete,
+Compression changes how results are presented, and rewritten file reads
+show a structured view rather than exact file contents; skim prints a
+one-line stderr notice whenever the view it served differs from the raw
+file. If compressed output ever looks incomplete,
 garbled, or inconsistent with what you expected, flag it to the user
 rather than silently working around it.
 
@@ -483,6 +489,26 @@ mod tests {
         );
         // No rskim mention in guidance body
         assert!(!content.contains("rskim"));
+        // cat/head/tail file reads are described as rewritten into direct skim reads
+        assert!(
+            content.contains("`cat`, `head`, `tail`"),
+            "Guidance must mention cat/head/tail file reads"
+        );
+        // Wording must convey that output is not raw file contents
+        assert!(
+            content.contains("not") && content.contains("raw"),
+            "Guidance must explain that rewritten file reads are not raw file contents"
+        );
+        // stderr notice described
+        assert!(
+            content.contains("stderr notice"),
+            "Guidance must mention the stderr notice emitted when view differs"
+        );
+        // Old incorrect wording must be gone
+        assert!(
+            !content.contains("does not change what the command did"),
+            "Old incorrect claim must be replaced with corrected wording"
+        );
         // Heatmap section present with key content
         assert!(content.contains("Heatmap"));
         assert!(content.contains("skim heatmap"));
