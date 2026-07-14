@@ -559,6 +559,19 @@ fn merge_tracked_union(
     // yielded uses cloned keys (cheap String::clone, not another replace()).
     let mut yielded: HashSet<String> = entry_keys.iter().cloned().collect();
 
+    // Also seed yielded from already-skipped paths so a tracked file that the
+    // ignore-walk already classified as Skip (e.g. TooLarge) is not re-classified
+    // by the union, which would append a duplicate SkipReason and fire an extra
+    // symlink_metadata syscall.  SkipReason carries absolute paths; strip root and
+    // normalize to match the dedup key (finding: merge-tracked-union-skip-dedup).
+    for reason in skips.iter() {
+        if let Some(abs_path) = reason.sort_key()
+            && let Ok(rel) = abs_path.strip_prefix(root)
+        {
+            yielded.insert(normalize_rel_path(rel));
+        }
+    }
+
     let mut added = 0;
     for rel in tracked {
         let key = normalize_rel_path(&rel);
@@ -629,7 +642,21 @@ fn tracked_files_memoized(root: &Path, cache_dir: Option<&Path>) -> Option<Vec<P
         Ok(m) => m,
         Err(_) => return list_tracked_files(root),
     };
-    let mtime_secs = mtime_from_meta(&git_meta).unwrap_or(0);
+    // Use nanosecond-precision mtime for the fingerprint to close the 1-second
+    // window where two same-second .git/index rewrites of equal byte length
+    // would appear identical and serve a stale tracked list until the next
+    // index change.  Sub-second precision makes same-nanosecond collisions
+    // practically impossible.  Cast to u64: nanos since 1970 fit until 2554.
+    // `mtime_from_meta` (which returns seconds) is NOT used here — it is only
+    // for WalkEntry.mtime, compared against persisted manifest values in the
+    // staleness scan.  Changing those to nanos would break the manifest format.
+    // (finding: mtime-fingerprint-1s-granularity)
+    let mtime_nanos: u64 = git_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     let len_bytes = git_meta.len();
 
     // Use the caller-supplied cache dir if available (threaded from walk_metadata
@@ -651,7 +678,7 @@ fn tracked_files_memoized(root: &Path, cache_dir: Option<&Path>) -> Option<Vec<P
 
     // Cache HIT path: read and validate the sidecar.
     if let Ok(content) = fs::read_to_string(&sidecar_path)
-        && let Some(paths) = parse_tracked_union_cache(&content, mtime_secs, len_bytes)
+        && let Some(paths) = parse_tracked_union_cache(&content, mtime_nanos, len_bytes)
     {
         return Some(paths);
     }
@@ -662,7 +689,7 @@ fn tracked_files_memoized(root: &Path, cache_dir: Option<&Path>) -> Option<Vec<P
     // fails (e.g., cache dir not yet created), the next call re-enumerates.
     let _ = fs::write(
         &sidecar_path,
-        format_tracked_union_cache(mtime_secs, len_bytes, &paths),
+        format_tracked_union_cache(mtime_nanos, len_bytes, &paths),
     );
     Some(paths)
 }
@@ -733,21 +760,22 @@ fn list_tracked_files(root: &Path) -> Option<Vec<PathBuf>> {
 
 /// Serialize a tracked-file list to the sidecar cache format.
 ///
-/// Format: `{mtime_secs} {len_bytes}\0` header, then one repo-relative path
-/// per subsequent NUL-terminated record (UTF-8 lossy).
+/// Format: `{mtime_nanos} {len_bytes}\0` header (nanoseconds since UNIX epoch
+/// for sub-second fingerprint precision), then one repo-relative path per
+/// subsequent NUL-terminated record (UTF-8 lossy).
 ///
 /// NUL framing (git's own convention) is used instead of newline framing so
 /// that paths containing embedded `\n` characters round-trip correctly.
 /// Newline framing would produce a different tracked set on a cache HIT for
 /// such paths vs the authoritative live gix enumeration, violating the
-/// AD-379-1 build↔scan set-identity guarantee.  Existing sidecar files in the
-/// old newline format parse as a fingerprint mismatch (no NUL in header) →
-/// cache miss → harmless re-enumeration.
+/// AD-379-1 build↔scan set-identity guarantee.  Existing sidecar files in
+/// prior formats (old newline separator, or second-resolution mtime) parse as
+/// a fingerprint mismatch → cache miss → harmless re-enumeration.
 ///
 /// The file is an optimization cache with no format version; absent or corrupt
 /// → re-enumerate (fail-soft).
-fn format_tracked_union_cache(mtime_secs: u64, len_bytes: u64, paths: &[PathBuf]) -> String {
-    let mut out = format!("{mtime_secs} {len_bytes}\0");
+fn format_tracked_union_cache(mtime_nanos: u64, len_bytes: u64, paths: &[PathBuf]) -> String {
+    let mut out = format!("{mtime_nanos} {len_bytes}\0");
     for p in paths {
         out.push_str(&p.to_string_lossy());
         out.push('\0');
@@ -1050,17 +1078,12 @@ fn read_file_key(e: &ReadFile) -> String {
 /// Only called from the test-only [`classify_entry`]. Production code
 /// ([`classify_entry_metadata`]) captures a single [`std::fs::Metadata`] for
 /// both size pre-screening and mtime extraction to avoid double syscalls.
+/// Delegates to [`mtime_from_meta`] (the shared helper) to keep the two paths
+/// byte-identical and avoid a second diverging copy of the same chain
+/// (finding: mtime-secs-test-divergence).
 #[cfg(test)]
 fn mtime_secs(entry: &ignore::DirEntry) -> Option<u64> {
-    entry
-        .metadata()
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| {
-            t.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .ok()
-                .map(|d| d.as_secs())
-        })
+    entry.metadata().ok().as_ref().and_then(mtime_from_meta)
 }
 
 /// Configure a [`WalkBuilder`] with the project-standard ignore rules.

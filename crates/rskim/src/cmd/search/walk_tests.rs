@@ -1168,3 +1168,280 @@ fn test_ac14_402_ad_series_comments_present() {
         );
     }
 }
+
+// ============================================================================
+// #402 — fail-soft branch coverage (review findings)
+// ============================================================================
+
+/// parse_tracked_union_cache: corrupt/truncated sidecar returns None and
+/// triggers live re-enumeration (fail-soft).
+///
+/// The sidecar is an optimization cache with no format version; any parse
+/// failure must return None (cache miss → re-enumerate), never panic or
+/// return a partial list.  AC13 covers fingerprint-mismatch invalidation;
+/// this test covers the content-corruption paths that AC13 does not exercise.
+#[test]
+fn test_parse_tracked_union_cache_corrupt_and_truncated() {
+    let parse = |s: &str, mt: u64, ln: u64| super::parse_tracked_union_cache(s, mt, ln);
+
+    // Empty string: no header at all → None (re-enumerate).
+    assert!(
+        parse("", 100, 512).is_none(),
+        "empty sidecar must return None"
+    );
+
+    // Garbled header (no space separator between mtime and len) → None.
+    assert!(
+        parse("not_a_valid_header\0path.rs\0", 100, 512).is_none(),
+        "garbled header must return None"
+    );
+
+    // Second token in header is not a number → None.
+    assert!(
+        parse("100 notanumber\0path.rs\0", 100, 512).is_none(),
+        "non-numeric len field must return None"
+    );
+
+    // Correct numeric header but fingerprint mismatch → None (cache miss).
+    // This covers the mtime-differs direction.
+    assert!(
+        parse("999 512\0path.rs\0", 100, 512).is_none(),
+        "mtime mismatch must return None"
+    );
+    // And the len-differs direction.
+    assert!(
+        parse("100 999\0path.rs\0", 100, 512).is_none(),
+        "len mismatch must return None"
+    );
+
+    // Truncated: correct header only (no path records) → Some([]).
+    // Verifies that a truncated-after-header write is handled as an empty
+    // but valid cache hit (not treated as corrupt).
+    assert_eq!(
+        parse("100 512\0", 100, 512),
+        Some(vec![]),
+        "truncated-to-header sidecar with matching fingerprint must return Some([])"
+    );
+
+    // Valid single path: basic round-trip.
+    assert_eq!(
+        parse("100 512\0src/main.rs\0", 100, 512),
+        Some(vec![std::path::PathBuf::from("src/main.rs")]),
+        "valid single-entry sidecar must parse correctly"
+    );
+
+    // Valid multi-path (confirms NUL framing, not newline).
+    assert_eq!(
+        parse("100 512\0foo.rs\0bar.rs\0", 100, 512),
+        Some(vec![
+            std::path::PathBuf::from("foo.rs"),
+            std::path::PathBuf::from("bar.rs"),
+        ]),
+        "valid two-entry sidecar must parse both paths (NUL framing)"
+    );
+}
+
+/// list_tracked_files: SKIP_WORKTREE entries are excluded from the result.
+///
+/// `git update-index --skip-worktree <file>` marks a committed file as
+/// intentionally absent from the work tree (sparse checkout etc.).
+/// `list_tracked_files` must not return it — there is nothing to read at
+/// that path on disk (AD-402-5: skip-worktree entries not materialized).
+#[test]
+fn test_list_tracked_files_skip_worktree_excluded() {
+    use std::path::Path;
+    use std::process::Command as StdCmd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root_path = dir.path();
+
+    let git = |args: &[&str]| {
+        StdCmd::new("git")
+            .args(args)
+            .current_dir(root_path)
+            .output()
+            .unwrap()
+    };
+
+    git(&["init"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "T"]);
+
+    fs::write(root_path.join("visible.rs"), "fn v() {}\n").unwrap();
+    fs::write(root_path.join("sparse.rs"), "fn s() {}\n").unwrap();
+    git(&["add", "visible.rs", "sparse.rs"]);
+    git(&["commit", "-m", "init"]);
+
+    // Mark sparse.rs as SKIP_WORKTREE (simulates sparse-checkout intent).
+    git(&["update-index", "--skip-worktree", "sparse.rs"]);
+
+    let root = root_path.canonicalize().unwrap();
+    let tracked = super::list_tracked_files(&root)
+        .expect("list_tracked_files must succeed on a valid git repo");
+
+    assert!(
+        tracked.iter().any(|p| p == Path::new("visible.rs")),
+        "visible.rs must appear in list_tracked_files; tracked: {tracked:?}"
+    );
+    assert!(
+        !tracked.iter().any(|p| p == Path::new("sparse.rs")),
+        "SKIP_WORKTREE entry 'sparse.rs' must be excluded (AD-402-5); tracked: {tracked:?}"
+    );
+}
+
+/// list_tracked_files: gitlink (submodule) entries are excluded from the result.
+///
+/// A git submodule appears in the parent's index as a Mode::COMMIT entry
+/// (mode 0o160000).  `list_tracked_files` must skip these — they are directory
+/// pointers in the work tree, not indexable source files (AD-402-5).
+///
+/// Two local git repos are used so `git submodule add` works without a remote.
+/// `protocol.file.allow=always` is set to permit file-URI submodules in
+/// git >= 2.38.1 where file-protocol is restricted by default.
+#[test]
+fn test_list_tracked_files_gitlink_excluded() {
+    use std::path::Path;
+    use std::process::Command as StdCmd;
+
+    // Helper closure: run git in a specific dir.
+    let git = |args: &[&str], cwd: &std::path::Path| {
+        let out = StdCmd::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        out
+    };
+
+    // Build a minimal "remote" repo that the submodule will point to.
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote = remote_dir.path();
+    git(&["init"], remote);
+    git(&["config", "user.email", "t@t"], remote);
+    git(&["config", "user.name", "T"], remote);
+    fs::write(remote.join("dummy.rs"), "fn x() {}\n").unwrap();
+    git(&["add", "dummy.rs"], remote);
+    git(&["commit", "-m", "init"], remote);
+
+    // Build the parent repo that will contain the submodule.
+    let parent_dir = tempfile::tempdir().unwrap();
+    let parent = parent_dir.path();
+    git(&["init"], parent);
+    git(&["config", "user.email", "t@t"], parent);
+    git(&["config", "user.name", "T"], parent);
+    fs::write(parent.join("real.rs"), "fn main() {}\n").unwrap();
+    git(&["add", "real.rs"], parent);
+    git(&["commit", "-m", "init"], parent);
+
+    // Add a submodule from the local remote (file-protocol, needs allow=always).
+    let remote_path = remote.to_str().unwrap();
+    let add_out = git(
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            remote_path,
+            "sub",
+        ],
+        parent,
+    );
+
+    // If `git submodule add` is unavailable or fails (restrictive CI env),
+    // skip rather than fail — this test covers defensive filtering, not the
+    // submodule feature itself.
+    if !add_out.status.success() {
+        eprintln!(
+            "skipping test_list_tracked_files_gitlink_excluded: \
+             git submodule add failed ({}); stderr: {}",
+            add_out.status,
+            String::from_utf8_lossy(&add_out.stderr)
+        );
+        return;
+    }
+
+    git(
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "commit",
+            "-m",
+            "add submodule",
+        ],
+        parent,
+    );
+
+    let root = parent.canonicalize().unwrap();
+    let tracked = super::list_tracked_files(&root)
+        .expect("list_tracked_files must succeed on a valid git repo");
+
+    // `sub` is a gitlink (COMMIT mode) — must NOT appear as a path entry.
+    assert!(
+        !tracked.iter().any(|p| p == Path::new("sub")),
+        "gitlink 'sub' must be excluded (Mode::COMMIT filter, AD-402-5); tracked: {tracked:?}"
+    );
+    // The real source file must still be present.
+    assert!(
+        tracked.iter().any(|p| p == Path::new("real.rs")),
+        "real.rs must appear in list_tracked_files; tracked: {tracked:?}"
+    );
+}
+
+/// merge_tracked_union must not append a duplicate SkipReason for a tracked
+/// file that the ignore-walk already classified as Skip (e.g. TooLarge).
+///
+/// Without the skip-dedup fix, the union re-classifies the file (one extra
+/// symlink_metadata syscall) and appends a second TooLarge entry.  With the
+/// fix, the `yielded` set is pre-seeded from the skip list so the union
+/// dedup short-circuits before calling classify_tracked_path.
+///
+/// The indexed entry set is unchanged either way (bounded by MAX_SKIP_REASONS,
+/// never an Accept); this test covers the cosmetic / syscall-waste aspect.
+#[test]
+fn test_merge_tracked_union_no_duplicate_skip_for_already_skipped() {
+    use super::super::types::SkipReason;
+    use std::process::Command as StdCmd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root_path = dir.path();
+
+    let git = |args: &[&str]| {
+        StdCmd::new("git")
+            .args(args)
+            .current_dir(root_path)
+            .output()
+            .unwrap()
+    };
+
+    git(&["init"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "T"]);
+
+    fs::write(root_path.join("real.rs"), "fn main() {}\n").unwrap();
+
+    // Write a file large enough to trigger TooLarge (> 5 MiB).
+    let big = vec![b'a'; 6 * 1024 * 1024];
+    fs::write(root_path.join("huge.rs"), &big).unwrap();
+
+    git(&["add", "real.rs", "huge.rs"]);
+    git(&["commit", "-m", "init"]);
+
+    let root = root_path.canonicalize().unwrap();
+
+    // walk_metadata runs the ignore-walk (classifies huge.rs as TooLarge →
+    // goes into skips) and then calls merge_tracked_union (which sees huge.rs
+    // in the tracked list but should dedup against the skip list and NOT
+    // re-classify it).
+    let (_entries, skips) = walk_metadata(&root, 50_000).unwrap();
+
+    let huge_skip_count = skips
+        .iter()
+        .filter(|r| matches!(r, SkipReason::TooLarge { path, .. } if path.ends_with("huge.rs")))
+        .count();
+
+    assert_eq!(
+        huge_skip_count, 1,
+        "huge.rs must appear in the skip list exactly once \
+         (no duplicate from union re-classification); all skips: {skips:?}"
+    );
+}
