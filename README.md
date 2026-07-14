@@ -234,14 +234,14 @@ Skim offers six modes with different levels of aggressiveness:
 |------------|-----------|------------------------------------------|----------------------------|
 | Full       | 0%        | Everything (original source)             | Testing/comparison         |
 | Minimal    | 15-30%    | All code, doc comments                   | Light cleanup              |
-| Pseudo     | 30-50%    | Logic flow, names, values                | LLM context with logic     |
+| Pseudo     | 30-50%    | Logic flow, names, values, return types  | LLM context with logic     |
 | Structure  | 70-80%    | Signatures, types, classes, imports      | Understanding architecture |
 | Signatures | 85-92%    | Only callable signatures                 | API documentation          |
 | Types      | 90-95%    | Only type definitions                    | Type system analysis       |
 
 ```bash
 skim file.ts --mode structure   # Default
-skim file.ts --mode pseudo      # Pseudocode (strips types & decorators; preserves visibility)
+skim file.ts --mode pseudo      # Pseudocode (preserves return types + visibility; strips decorators)
 skim file.ts --mode signatures  # More aggressive
 skim file.ts --mode types       # Most aggressive
 skim file.ts --mode full        # No transformation

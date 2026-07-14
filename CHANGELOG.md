@@ -23,13 +23,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   applies ADR-002). See **Fixed** below for full details.
 
 ### Added
+- **Transparency marker for hook-rewritten file reads** — When the PreToolUse hook
+  rewrites `cat`/`head`/`tail` on a code file into `skim <file> --mode=pseudo` (or
+  `--mode=structure` for declaration files), the rewritten command now carries a
+  `SKIM_REWRITTEN_FROM=<cat|head|tail>` env token. After transformation, if the served
+  view differs from raw file bytes, skim emits a one-line stderr notice:
+  `[skim] transformed view (cat → skim --mode=pseudo): not raw file bytes — SKIM_PASSTHROUGH=1 for raw output`.
+  Multi-file: one aggregate line (`2/3 files not raw bytes`). The marker is silent for
+  byte-identical outputs (guardrail passthrough, `--mode=full`), direct `skim` calls
+  (no tag), and unknown-value env vars (closed-vocabulary guard prevents injection).
+  Cache hits also emit the marker when the cached view differs from raw.
 - **Agent guidance documents command wrapping** — The guidance injected by `skim init`
   now includes a "Command wrapping" section explaining that the rewrite hook may run
   supported commands as `skim <tool>` (same arguments, same exit code, compressed
-  output). Agents are instructed to flag garbled or incomplete compressed output to the
-  user rather than silently working around it. Existing installs pick up the new section
-  on the next version bump + re-pin (per ADR-004; binary-side fixes below are effective
-  immediately after rebuild).
+  output). Guidance wording corrected: file reads (`cat`, `head`, `tail`) are rewritten
+  into direct skim reads showing a structured view (not raw contents), and skim prints
+  a one-line stderr notice whenever the served view differs from the raw file.
+  The previous claim "does not change what the command did" has been replaced with
+  accurate wording. Agents are instructed to flag garbled or incomplete compressed
+  output to the user rather than silently working around it. Existing installs pick up
+  the new section on the next version bump + re-pin (per ADR-004; binary-side fixes
+  below are effective immediately after rebuild).
 - **Bash / shell language support** — Full tree-sitter-bash grammar integration
   (`Language::Bash`). Structure mode strips `function_definition` bodies to `{...}`
   while preserving function names and all top-level commands/variable assignments.
