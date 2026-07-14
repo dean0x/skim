@@ -699,6 +699,44 @@ fn test_index_unreadable_root_returns_error_or_empty() {
     }
 }
 
+/// `IndexCli::into_config` fails loud when `--root` is a non-existent path.
+///
+/// Guards the `canonicalize().map_err(...)? ` branch at index.rs:151-153 (#400,
+/// AD-400-2 backstop on the test-only `IndexCli` entry point): `into_config` must
+/// propagate `Err` rather than silently hashing a ghost root, which would produce
+/// 0 results and exit 0.  All other builder tests supply valid tempdir roots so
+/// this branch was previously unreachable.
+///
+/// Discriminating (PF-007): asserts both `Err` *and* that the error message
+/// identifies the offending `--root` path, so reverting `canonicalize().map_err()?`
+/// back to the old `canonicalize().unwrap_or_else(|_| r.clone())` would produce
+/// `Ok` and fail the first assertion.
+#[test]
+fn test_index_run_nonexistent_root_returns_error() {
+    let cache = tempfile::tempdir().unwrap();
+    // Use a path that cannot plausibly exist so canonicalize() fails immediately.
+    let nonexistent = "/does/not/exist_400_into_config_test";
+
+    let result = run(
+        &[
+            format!("--root={nonexistent}"),
+            format!("--index-dir={}", cache.path().display()),
+        ],
+        &TEST_ANALYTICS,
+    );
+
+    assert!(
+        result.is_err(),
+        "IndexCli::into_config must propagate Err for a non-existent --root \
+         (canonicalize().map_err()?  at index.rs:151-153); got Ok"
+    );
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("--root") || msg.contains(nonexistent),
+        "error message must identify the offending --root path; got: {msg}"
+    );
+}
+
 // ============================================================================
 // Help flag
 // ============================================================================
