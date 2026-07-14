@@ -125,18 +125,18 @@ const MAX_ANCESTORS: usize = 256;
 /// producer skip sample (AD-395-2).
 pub(super) const MAX_SKIP_REASONS: usize = 10_000;
 
-/// Test-only per-thread counter: incremented once per live `gix` call in
-/// [`list_tracked_files`].  Used by the AC13 unit test to discriminate cache
-/// hits (counter unchanged) from cache misses (counter increments).
-///
-/// A THREAD-LOCAL (not a shared global `AtomicUsize`) so the count is isolated
-/// per test. libtest runs each test on its own thread, and `list_tracked_files`
-/// always runs on the caller's thread (the union merge in [`merge_tracked_union`]
-/// happens AFTER the parallel walk joins). A shared global counter would be
-/// racily incremented by every other test that calls [`walk_metadata`] on a git
-/// root (`test_walk_metadata_*`, the AC6/AC9 union tests) running concurrently
-/// under `RUST_TEST_THREADS`, which `#[serial]` does not guard against, making
-/// AC13's cache-hit/miss assertions flaky. Per-thread isolation removes the race.
+// Test-only per-thread counter: incremented once per live `gix` call in
+// `list_tracked_files`.  Used by the AC13 unit test to discriminate cache
+// hits (counter unchanged) from cache misses (counter increments).
+//
+// A THREAD-LOCAL (not a shared global `AtomicUsize`) so the count is isolated
+// per test. libtest runs each test on its own thread, and `list_tracked_files`
+// always runs on the caller's thread (the union merge in `merge_tracked_union`
+// happens AFTER the parallel walk joins). A shared global counter would be
+// racily incremented by every other test that calls `walk_metadata` on a git
+// root (`test_walk_metadata_*`, the AC6/AC9 union tests) running concurrently
+// under `RUST_TEST_THREADS`, which `#[serial]` does not guard against, making
+// AC13's cache-hit/miss assertions flaky. Per-thread isolation removes the race.
 #[cfg(test)]
 thread_local! {
     pub(super) static ENUM_CALL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
