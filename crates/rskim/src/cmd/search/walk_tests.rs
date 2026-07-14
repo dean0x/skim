@@ -905,3 +905,264 @@ fn test_small_long_line_file_is_indexed() {
         "small long-line file must NOT be in the minified skip list"
     );
 }
+
+// ============================================================================
+// #402 — git-tracked union (AC6, AC9, AC11, AC13 unit)
+// ============================================================================
+
+/// Shared helper: create a real git repo with a tracked-but-.gitignored file.
+///
+/// Layout after init + commit:
+/// ```
+/// root/
+///   .gitignore       <- contains "secretdoc.md"
+///   secretdoc.md     <- tracked via `git add -f`; content = "ZZUNIQUETOKEN"
+///   src/a.rs         <- regular tracked file
+/// ```
+fn make_tracked_ignored_repo() -> tempfile::TempDir {
+    use std::process::Command as StdCommand;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    StdCommand::new("git")
+        .args(["init"])
+        .current_dir(root)
+        .output()
+        .expect("git init");
+    StdCommand::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(root)
+        .output()
+        .expect("git config email");
+    StdCommand::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(root)
+        .output()
+        .expect("git config name");
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join(".gitignore"), "secretdoc.md\n").unwrap();
+    fs::write(root.join("secretdoc.md"), "ZZUNIQUETOKEN\n").unwrap();
+    fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+
+    StdCommand::new("git")
+        .args(["add", "-f", "secretdoc.md", "src/a.rs", ".gitignore"])
+        .current_dir(root)
+        .output()
+        .expect("git add");
+    StdCommand::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(root)
+        .output()
+        .expect("git commit");
+
+    dir
+}
+
+/// AC6 (#402) — Determinism: two consecutive `walk_metadata` calls on a repo
+/// with a tracked-but-.gitignored file return byte-identical `rel_path` sequences.
+///
+/// PF-012: selection is an order-invariant SET function of the complete
+/// candidate set (walked ∪ tracked). Two consecutive calls MUST return the
+/// same membership AND the same order (sort by normalize_rel_path, ascending).
+#[test]
+fn test_ac6_402_walk_metadata_determinism_with_union() {
+    let dir = make_tracked_ignored_repo();
+    let root = dir.path().canonicalize().unwrap();
+
+    let (entries1, _) = walk_metadata(&root, 50_000).unwrap();
+    let (entries2, _) = walk_metadata(&root, 50_000).unwrap();
+
+    let keys1: Vec<String> = entries1
+        .iter()
+        .map(|e| normalize_rel_path(&e.rel_path))
+        .collect();
+    let keys2: Vec<String> = entries2
+        .iter()
+        .map(|e| normalize_rel_path(&e.rel_path))
+        .collect();
+
+    assert_eq!(
+        keys1, keys2,
+        "AC6: two consecutive walk_metadata calls must return byte-identical rel_path sequences \
+         (PF-012 / AD-402-2)"
+    );
+
+    // The tracked-but-gitignored file must appear in both results.
+    assert!(
+        keys1.iter().any(|k| k == "secretdoc.md"),
+        "AC6: secretdoc.md (tracked-but-gitignored) must appear in walk_metadata output; \
+         keys: {keys1:?}"
+    );
+}
+
+/// AC9 (#402) — `.git/**` is never unioned: the gix index never enumerates
+/// `.git/` internal files, so the union cannot introduce .git/ paths.
+///
+/// Extends the pre-existing `test_walk_skips_git_directory` invariant: the
+/// union must not break that guarantee.
+#[test]
+fn test_ac9_402_walk_metadata_never_unions_dot_git() {
+    let dir = make_tracked_ignored_repo();
+    let root = dir.path().canonicalize().unwrap();
+
+    let (entries, _) = walk_metadata(&root, 50_000).unwrap();
+
+    for e in &entries {
+        let key = normalize_rel_path(&e.rel_path);
+        assert!(
+            !key.starts_with(".git/"),
+            "AC9: no .git/ entry must appear in walk_metadata output after union; \
+             found: {key}"
+        );
+    }
+}
+
+/// AC11 (#402) — Symlink/gitlink tracked entries are Transparent (skipped).
+///
+/// `classify_tracked_path` uses `symlink_metadata` (not `metadata`), so a
+/// tracked symlink returns `Transparent` via the `!is_file()` guard.
+/// Gitlink entries (submodule COMMIT mode) are pre-filtered in
+/// `list_tracked_files`, so they never reach `classify_tracked_path`.
+#[cfg(unix)]
+#[test]
+fn test_ac11_402_classify_tracked_path_symlink_transparent() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+
+    // A real file (should be Accept).
+    let real_rs = root.join("a.rs");
+    fs::write(&real_rs, "fn a() {}\n").unwrap();
+
+    // A symlink to the real file (should be Transparent — not a regular file).
+    let link_rs = root.join("link.rs");
+    symlink(&real_rs, &link_rs).unwrap();
+
+    // Classify the real file via classify_tracked_path → must be Accept.
+    let outcome_real = super::classify_tracked_path(&real_rs, &root);
+    assert!(
+        matches!(outcome_real, super::ClassifyOutcome::Accept(_)),
+        "AC11: regular file must be Accept via classify_tracked_path"
+    );
+
+    // Classify the symlink → must be Transparent (not a regular file).
+    let outcome_link = super::classify_tracked_path(&link_rs, &root);
+    assert!(
+        matches!(outcome_link, super::ClassifyOutcome::Transparent),
+        "AC11: symlink must be Transparent via classify_tracked_path (not followed)"
+    );
+}
+
+/// AC13 unit (i) (#402) — Memo cache HIT on unchanged `.git/index`: a second
+/// call to `tracked_files_memoized` does NOT re-invoke the live gix read.
+///
+/// Discriminating: reverting the memoization (always re-parsing) makes
+/// `ENUM_CALL_COUNT` reach 2 after the second call, failing this assertion.
+///
+/// AC13 unit (ii) — After `git add -f newsecret.md` (which rewrites
+/// `.git/index`), the NEXT call is a cache MISS and enumerates the new file.
+#[serial_test::serial]
+#[test]
+fn test_ac13_402_memo_cache_hit_and_miss() {
+    use std::sync::atomic::Ordering;
+
+    let dir = make_tracked_ignored_repo();
+    let root = dir.path().canonicalize().unwrap();
+
+    // We need the search cache dir to exist so the sidecar write succeeds.
+    // Use a dedicated isolated SKIM_CACHE_DIR.
+    let cache_tmp = tempfile::tempdir().unwrap();
+    // SAFETY: test-only, serialized by #[serial_test::serial]; no other thread
+    // reads SKIM_CACHE_DIR concurrently during this critical section.
+    unsafe { std::env::set_var("SKIM_CACHE_DIR", cache_tmp.path()) };
+
+    // Create the cache dir so the sidecar write doesn't fail silently.
+    let cache_dir = super::super::index::resolve_search_cache_dir(&root).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Reset the test counter.
+    super::ENUM_CALL_COUNT.store(0, Ordering::Relaxed);
+
+    // --- AC13(i): cache HIT on unchanged .git/index ---
+
+    // First call: cold sidecar → cache MISS → gix is called once.
+    let result1 = super::tracked_files_memoized(&root);
+    assert!(result1.is_some(), "AC13(i): first call must return Some");
+    let count1 = super::ENUM_CALL_COUNT.load(Ordering::Relaxed);
+    assert_eq!(
+        count1, 1,
+        "AC13(i): first call must be a cache miss (gix called exactly once)"
+    );
+
+    // Second call: .git/index unchanged → sidecar hit → gix NOT called again.
+    let result2 = super::tracked_files_memoized(&root);
+    assert!(result2.is_some(), "AC13(i): second call must return Some");
+    let count2 = super::ENUM_CALL_COUNT.load(Ordering::Relaxed);
+    assert_eq!(
+        count2, 1,
+        "AC13(i): second call must be a cache HIT (ENUM_CALL_COUNT stays at 1)"
+    );
+
+    // Both calls must return the same set of paths.
+    assert_eq!(
+        result1.unwrap(),
+        result2.unwrap(),
+        "AC13(i): cache hit must return same path list as first enumeration"
+    );
+
+    // --- AC13(ii): cache MISS after git add (rewrites .git/index) ---
+
+    // Add a new tracked-but-.gitignored file — this rewrites .git/index.
+    fs::write(dir.path().join("newsecret.md"), "NEWSECRETTOKEN\n").unwrap();
+    std::process::Command::new("git")
+        .args(["add", "-f", "newsecret.md"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git add newsecret.md");
+
+    // Third call: .git/index has changed → cache MISS → gix is called again.
+    let result3 = super::tracked_files_memoized(&root);
+    assert!(
+        result3.is_some(),
+        "AC13(ii): post-git-add call must return Some"
+    );
+    let count3 = super::ENUM_CALL_COUNT.load(Ordering::Relaxed);
+    assert_eq!(
+        count3, 2,
+        "AC13(ii): post-git-add call must be a cache MISS (ENUM_CALL_COUNT increments to 2)"
+    );
+
+    // The newly-staged file must appear in the result.
+    let paths3 = result3.unwrap();
+    assert!(
+        paths3.iter().any(|p| p.ends_with("newsecret.md")),
+        "AC13(ii): newsecret.md must appear after cache miss + re-enumeration; \
+         paths: {paths3:?}"
+    );
+
+    // Restore environment (serial guard ensures no parallel interference).
+    // SAFETY: test-only, serialized by #[serial_test::serial].
+    unsafe { std::env::remove_var("SKIM_CACHE_DIR") };
+}
+
+/// AC14 (#402) — Design decisions are traceable in source code.
+///
+/// Grep walk.rs for `AD-402-1` through `AD-402-6` each at their documented
+/// call site. A missing marker means a design decision is no longer anchored
+/// to the code that implements it.
+#[test]
+fn test_ac14_402_ad_series_comments_present() {
+    let walk_src = include_str!("walk.rs");
+
+    for marker in [
+        "AD-402-1", "AD-402-2", "AD-402-3", "AD-402-4", "AD-402-5", "AD-402-6",
+    ] {
+        assert!(
+            walk_src.contains(marker),
+            "AC14: walk.rs must contain the design-decision anchor `{marker}` at its call site"
+        );
+    }
+}

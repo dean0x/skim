@@ -13,6 +13,19 @@
 //! MEMBERSHIP (not just order) depend on thread scheduling. Skipped files
 //! (unsupported language, too large, non-UTF8) do not count toward the cap.
 //!
+//! # Git-tracked union (#402)
+//!
+//! On a git root (`root/.git` exists), [`walk_metadata`] unions the
+//! ignore-walk output with git-tracked files that the `.gitignore`/hidden-file
+//! rules would otherwise exclude. This ensures `skim search` finds every file
+//! that `git grep` finds (ADR-007 dog-food ground truth). The union is
+//! **default-on** and runs inside [`walk_metadata`] — the single discovery
+//! funnel — so the index builder and the staleness scan always see the same
+//! file set (AD-379-1). Union entries re-enter the same [`normalize_rel_path`]
+//! top-K selection so the `max_files` cap applies to `walked ∪ tracked`.
+//! Non-git roots (no `.git`), enumeration failures, and fail-soft gix errors
+//! all degrade gracefully: the ignore-walk set is used alone (AD-402-3).
+//!
 //! # Skip conditions (in order checked)
 //!
 //! | Condition | Threshold |
@@ -23,7 +36,7 @@
 //! | Minified | avg line > 500 bytes in first 8 KB (tree-sitter langs only) |
 //! | Cap reached | total accepted entries exceed `max_files` (reporting only — computed AFTER the complete walk; never terminates it) |
 
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -111,6 +124,12 @@ const MAX_ANCESTORS: usize = 256;
 /// Exported `pub(super)` so `index.rs` can reuse the same cap for the merged
 /// producer skip sample (AD-395-2).
 pub(super) const MAX_SKIP_REASONS: usize = 10_000;
+
+/// Test-only counter: incremented once per live `gix` call in
+/// [`list_tracked_files`].  Used by the AC13 unit test to discriminate cache
+/// hits (counter unchanged) from cache misses (counter increments).
+#[cfg(test)]
+pub(super) static ENUM_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // ============================================================================
 // Typed read outcome
@@ -294,21 +313,22 @@ pub(super) fn walk_and_read(
 // Metadata-only walk (streaming pipeline)
 // ============================================================================
 
-/// Classify a single directory entry without reading its content.
+/// Classify an already-confirmed regular file from its path and optional metadata.
 ///
-/// Checks: file type, language detection, fast size pre-screen (DirEntry
-/// metadata).  No I/O beyond the metadata already cached by the walker.
-fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> ClassifyOutcome<WalkEntry> {
-    let file_type = match entry.file_type() {
-        Some(ft) => ft,
-        None => return ClassifyOutcome::Transparent,
-    };
-    if !file_type.is_file() {
-        return ClassifyOutcome::Transparent;
-    }
-
-    let abs_path = entry.path();
-
+/// Shared by the ignore-walk path ([`classify_entry_metadata`]) and the
+/// git-tracked union path ([`classify_tracked_path`]) so both apply byte-identical
+/// language detection, the 5 MiB size gate, and mtime/size capture — and emit
+/// identical [`SkipReason`]s.
+///
+/// AD-402-4: Unioned files reuse this core so a classify failure on a unioned
+/// [`WalkEntry`] is caught by the existing `Pipeline::consume` desync-abort
+/// (index.rs:711-725) and the `manifest_count != file_count` commit guard
+/// (index.rs:417-424) — no new ADR-006 code needed.
+fn classify_metadata_core(
+    abs_path: &Path,
+    meta_opt: Option<std::fs::Metadata>,
+    root: &Path,
+) -> ClassifyOutcome<WalkEntry> {
     // Language detection.
     let lang = match Language::from_path(abs_path) {
         Some(l) => l,
@@ -317,10 +337,6 @@ fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> ClassifyOut
         }
     };
 
-    // Capture metadata once; use it for the size pre-screen, the recorded
-    // size (AD-379-2), and mtime extraction so the walker never calls
-    // entry.metadata() twice per file.
-    let meta_opt = entry.metadata().ok();
     // Recorded size in bytes (AD-379-2): persisted in the manifest so the
     // working-tree staleness scan can compare size as a second freshness hint
     // alongside mtime. `None` when the platform/syscall does not expose it.
@@ -352,6 +368,54 @@ fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> ClassifyOut
         mtime,
         size,
     })
+}
+
+/// Classify a single directory entry without reading its content.
+///
+/// Checks: file type, language detection, fast size pre-screen (DirEntry
+/// metadata).  No I/O beyond the metadata already cached by the walker.
+///
+/// AD-402-4: Thin wrapper around [`classify_metadata_core`]; unchanged external
+/// behavior. Capture metadata once to avoid double syscalls (size pre-screen
+/// + mtime extraction both use the same [`std::fs::Metadata`]).
+fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> ClassifyOutcome<WalkEntry> {
+    let file_type = match entry.file_type() {
+        Some(ft) => ft,
+        None => return ClassifyOutcome::Transparent,
+    };
+    if !file_type.is_file() {
+        return ClassifyOutcome::Transparent;
+    }
+    // Capture metadata once; use it for the size pre-screen (AD-379-2) and
+    // mtime extraction so the walker never calls entry.metadata() twice per file.
+    classify_metadata_core(entry.path(), entry.metadata().ok(), root)
+}
+
+/// Classify a git-tracked path that the ignore-walker did NOT yield.
+///
+/// Uses [`std::fs::symlink_metadata`] to mirror `follow_links(false)`: a
+/// symlink, directory (gitlink/submodule in the work tree), or other
+/// non-regular-file entry is [`ClassifyOutcome::Transparent`] — skipped
+/// silently, exactly as the walker skips non-file entries. A vanished or
+/// unreadable path becomes a bounded [`SkipReason::ReadError`].
+///
+/// AD-402-4: Delegates to [`classify_metadata_core`] for identical language
+/// detection, size gate, and mtime/size capture as the ignore-walk path.
+fn classify_tracked_path(abs_path: &Path, root: &Path) -> ClassifyOutcome<WalkEntry> {
+    let meta = match fs::symlink_metadata(abs_path) {
+        Ok(m) => m,
+        Err(e) => {
+            return ClassifyOutcome::Skip(SkipReason::ReadError {
+                path: abs_path.to_path_buf(),
+                error: e.to_string(),
+            });
+        }
+    };
+    // Not a regular file (symlink, directory/gitlink, etc.) → Transparent.
+    if !meta.is_file() {
+        return ClassifyOutcome::Transparent;
+    }
+    classify_metadata_core(abs_path, Some(meta), root)
 }
 
 /// Walk `root` recursively, collecting file metadata without reading content.
@@ -394,13 +458,244 @@ pub(super) fn walk_metadata(
     let mut builder = WalkBuilder::new(root);
     configure_builder(&mut builder);
 
-    collect_bounded_topk(
+    let (mut entries, mut skips) = collect_bounded_topk(
         builder,
         max_files,
         root,
         classify_entry_metadata,
         walk_entry_key,
-    )
+    )?;
+
+    // AD-402-1: Union git-tracked files the ignore-walker missed, through this
+    // SAME funnel, so the index builder (index.rs `Pipeline::walk`) and the
+    // staleness scan (staleness.rs `scan_working_tree`) always see the same file
+    // set (AD-379-1). Consequence: an existing v5 index self-heals after an
+    // upgrade — the staleness scan finds `added > 0` → `WorkingTreeChanged` →
+    // one rebuild → stable thereafter. No index-format bump required.
+    if root.join(".git").exists() {
+        let added = merge_tracked_union(root, max_files, &mut entries, &mut skips);
+        if added > 0 && crate::debug::is_debug_enabled() {
+            eprintln!(
+                "skim search [debug]: unioned {added} git-tracked file(s) the .gitignore walk skipped"
+            );
+        }
+    }
+    Ok((entries, skips))
+}
+
+// ============================================================================
+// Git-tracked union (#402)
+// ============================================================================
+
+/// Merge git-tracked files absent from `entries` into the SAME
+/// [`normalize_rel_path`] top-K selection the walk uses, in place.
+///
+/// Returns the count of files successfully unioned in. Skips (symlinks, vanished
+/// paths, unsupported language, too large) are appended to `skips` up to
+/// [`MAX_SKIP_REASONS`].
+///
+/// AD-402-2: Union entries re-enter the same `normalize_rel_path` top-K rather
+/// than being appended after truncation. `sort_by_cached_key` + `truncate` after
+/// the merge preserves FileId↔`sorted_paths` determinism (AD-373-1 / PF-012).
+///
+/// AD-402-3: Enumeration failure (non-git root, gix parse error, etc.) is
+/// fail-soft: returns 0 and leaves `entries` unchanged.
+fn merge_tracked_union(
+    root: &Path,
+    max_files: usize,
+    entries: &mut Vec<WalkEntry>,
+    skips: &mut Vec<SkipReason>,
+) -> usize {
+    // AD-402-6: use memoized enumeration — only re-parses gix index when
+    // .git/index has changed since the last call.
+    let Some(tracked) = tracked_files_memoized(root) else {
+        // AD-402-3: enumeration failure → fail-soft, keep ignore-walk set alone.
+        return 0;
+    };
+
+    // Build a set of normalize_rel_path keys for already-walked entries so we
+    // can short-circuit paths the ignore-walk already yielded.
+    let mut yielded: HashSet<String> = entries
+        .iter()
+        .map(|e| normalize_rel_path(&e.rel_path))
+        .collect();
+
+    let mut added = 0usize;
+    for rel in tracked {
+        let key = normalize_rel_path(&rel);
+        if !yielded.insert(key) {
+            continue; // already walked → skip (dedup by normalize_rel_path key)
+        }
+        match classify_tracked_path(&root.join(&rel), root) {
+            ClassifyOutcome::Accept(entry) => {
+                entries.push(entry);
+                added += 1;
+            }
+            ClassifyOutcome::Skip(reason) => {
+                if skips.len() < MAX_SKIP_REASONS {
+                    skips.push(reason);
+                }
+            }
+            ClassifyOutcome::Transparent => {}
+        }
+    }
+
+    if added > 0 {
+        // AD-402-2: Re-run the SAME top-K (smallest max_files keys, ascending)
+        // so FileId↔sorted_paths and cross-run determinism hold (PF-012).
+        // sort_by_cached_key computes each key once (O(n log n));
+        // truncate enforces max_files without early-terminating the candidate
+        // set construction (avoids PF-012 violation).
+        entries.sort_by_cached_key(|e| normalize_rel_path(&e.rel_path));
+        entries.truncate(max_files);
+    }
+    added
+}
+
+/// Memoized tracked-file enumeration.
+///
+/// Reads a per-root sidecar cache (`{cache_dir}/tracked_union.cache`) keyed
+/// on the `.git/index` fingerprint `(mtime_secs, len_bytes)`. On call:
+/// - Stat `root/.git/index` for the current fingerprint.
+/// - If the sidecar fingerprint matches → return the cached list (cache HIT,
+///   zero gix calls).
+/// - Otherwise → call [`list_tracked_files`], rewrite the sidecar, return.
+///
+/// Fail-soft at every step: unresolvable cache dir, unreadable/corrupt sidecar,
+/// missing `.git/index` → fall through to a live [`list_tracked_files`] call
+/// (never a build gate). The sidecar is an OPTIMIZATION cache: absent/corrupt
+/// simply forces one re-enumeration.
+///
+/// AD-402-6: Keying on the `.git/index` fingerprint means `git add` / `rm` /
+/// `commit` / `checkout` — all of which rewrite `.git/index` — invalidate the
+/// cache and force a fresh gix read. The memo skips only the re-parse, not the
+/// top-K merge, so AD-379-1 build↔scan set-identity and PF-012 determinism
+/// are unaffected.
+fn tracked_files_memoized(root: &Path) -> Option<Vec<PathBuf>> {
+    let git_index_path = root.join(".git").join("index");
+
+    // Stat .git/index for the fingerprint. If missing (newly-init repo with no
+    // commits), fall through to a live call (which will also return None from
+    // gix if the index truly does not exist).
+    let git_meta = match fs::metadata(&git_index_path) {
+        Ok(m) => m,
+        Err(_) => return list_tracked_files(root),
+    };
+    let mtime_secs = git_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let len_bytes = git_meta.len();
+
+    // Resolve the per-root cache dir (fail-soft: fall through to live call).
+    let cache_dir = match super::index::resolve_search_cache_dir(root) {
+        Ok(d) => d,
+        Err(_) => return list_tracked_files(root),
+    };
+    let sidecar_path = cache_dir.join("tracked_union.cache");
+
+    // Cache HIT path: read and validate the sidecar.
+    if let Ok(content) = fs::read_to_string(&sidecar_path)
+        && let Some(paths) = parse_tracked_union_cache(&content, mtime_secs, len_bytes)
+    {
+        return Some(paths);
+    }
+
+    // Cache MISS: enumerate via gix, then rewrite the sidecar.
+    let paths = list_tracked_files(root)?;
+    // Fail-soft write — the sidecar is an optimization cache; if the write
+    // fails (e.g., cache dir not yet created), the next call re-enumerates.
+    let _ = fs::write(
+        &sidecar_path,
+        format_tracked_union_cache(mtime_secs, len_bytes, &paths),
+    );
+    Some(paths)
+}
+
+/// Enumerate git-tracked repo-relative paths under `root`.
+///
+/// Returns `None` when `root` is not a git repo or when enumeration fails
+/// (fail-soft — AD-402-3). The returned `Vec<PathBuf>` contains only
+/// repo-toplevel-relative paths; all gix types are confined here.
+///
+/// AD-402-5: Reads the git index in-process with `gix` (Fork B —
+/// user-resolved 2026-07-11). No subprocess, no git-binary dependency.
+/// `gix 0.72` is already a workspace dep; only the `"index"` feature is
+/// added. All gix types stay inside this function (gix-free `Vec<PathBuf>`
+/// boundary, mirroring `rskim-search`'s type discipline). Manual
+/// gitlink/skip-worktree filtering: no subprocess does this for you.
+fn list_tracked_files(root: &Path) -> Option<Vec<PathBuf>> {
+    #[cfg(test)]
+    ENUM_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    use gix::bstr::ByteSlice as _;
+
+    let repo = gix::open(root).ok()?;
+    let index = repo.open_index().ok()?;
+    // gix_index::File derefs to gix_index::State, which provides entries() and path().
+    let state = &*index;
+
+    let mut paths = Vec::new();
+    for entry in state.entries() {
+        // Skip gitlinks (submodules): mode COMMIT == 0o160000. A submodule
+        // appears as a directory in the work tree, not an indexable file.
+        if entry.mode == gix::index::entry::Mode::COMMIT {
+            continue;
+        }
+        // Skip skip-worktree entries: the file is intentionally not
+        // materialized in the work tree, so there is nothing to read.
+        if entry
+            .flags
+            .contains(gix::index::entry::Flags::SKIP_WORKTREE)
+        {
+            continue;
+        }
+        // Convert repo-toplevel-relative BStr to PathBuf (lossy on non-UTF-8).
+        // `.into_owned()` materialises `Cow<OsStr>` into `OsString`, giving
+        // `PathBuf::from` a single unambiguous impl to call.
+        let raw = entry.path(state);
+        let path = PathBuf::from(raw.to_os_str_lossy().into_owned());
+        paths.push(path);
+    }
+    Some(paths)
+}
+
+/// Serialize a tracked-file list to the sidecar cache format.
+///
+/// Format: line 1 = `{mtime_secs} {len_bytes}` (space-separated decimal),
+/// then one repo-relative path per subsequent line (UTF-8 lossy).
+/// The file is an optimization cache with no format version; absent or corrupt
+/// → re-enumerate (fail-soft).
+fn format_tracked_union_cache(mtime_secs: u64, len_bytes: u64, paths: &[PathBuf]) -> String {
+    let mut out = format!("{mtime_secs} {len_bytes}\n");
+    for p in paths {
+        out.push_str(&p.to_string_lossy());
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse a sidecar cache string produced by [`format_tracked_union_cache`].
+///
+/// Returns `Some(paths)` only when the header fingerprint matches
+/// `(expected_mtime, expected_len)` exactly. Returns `None` on any mismatch
+/// or parse error (corrupt/truncated sidecar → re-enumerate, fail-soft).
+fn parse_tracked_union_cache(
+    content: &str,
+    expected_mtime: u64,
+    expected_len: u64,
+) -> Option<Vec<PathBuf>> {
+    let mut lines = content.lines();
+    let header = lines.next()?;
+    let mut parts = header.splitn(2, ' ');
+    let mtime: u64 = parts.next()?.parse().ok()?;
+    let len: u64 = parts.next()?.parse().ok()?;
+    if mtime != expected_mtime || len != expected_len {
+        return None; // fingerprint mismatch → cache miss
+    }
+    Some(lines.map(PathBuf::from).collect())
 }
 
 // ============================================================================
@@ -688,6 +983,11 @@ fn mtime_secs(entry: &ignore::DirEntry) -> Option<u64> {
 }
 
 /// Configure a [`WalkBuilder`] with the project-standard ignore rules.
+///
+/// On a git root (`root/.git` exists`) the ignore-walk output produced by this
+/// builder is subsequently **unioned** with git-tracked files in
+/// [`walk_metadata`] (see [`merge_tracked_union`]). The builder alone is not
+/// the authoritative source of indexable files on git roots.
 fn configure_builder(builder: &mut WalkBuilder) {
     builder
         .hidden(true)
