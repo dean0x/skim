@@ -949,7 +949,7 @@ fn process_single_arg(
 
     if file == "-" {
         let result = process::process_stdin(process_options, args.filename.as_deref())?;
-        process::write_result_and_stats(&result, args.show_stats)?;
+        process::write_result_and_stats(&result, args.show_stats, &mode_str)?;
         record_file_analytics(
             analytics.enabled,
             result,
@@ -973,7 +973,7 @@ fn process_single_arg(
     }
 
     let result = process::process_file(&path, process_options)?;
-    process::write_result_and_stats(&result, args.show_stats)?;
+    process::write_result_and_stats(&result, args.show_stats, &mode_str)?;
     let cmd = format!("skim {file}");
     record_file_analytics(
         analytics.enabled,

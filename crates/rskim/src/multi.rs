@@ -187,6 +187,7 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
         !paths.is_empty(),
         "BUG: process_files called with empty paths"
     );
+    let total_paths = paths.len();
     let process_options = options.process;
 
     let results: Vec<_> = if let Some(num_jobs) = options.jobs {
@@ -212,6 +213,7 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
     let mut success_count = 0;
     let mut error_count = 0;
     let mut guardrail_count = 0usize;
+    let mut view_differs_count = 0usize;
     let mut total_original_tokens = 0usize;
     let mut total_transformed_tokens = 0usize;
 
@@ -232,6 +234,10 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
 
                 if process_result.guardrail_triggered {
                     guardrail_count += 1;
+                }
+
+                if process_result.view_differs {
+                    view_differs_count += 1;
                 }
 
                 if let (Some(orig), Some(trans)) = (
@@ -268,6 +274,20 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
             "[skim:guardrail] triggered on {}/{} files",
             guardrail_count, total
         );
+    }
+
+    if view_differs_count > 0
+        && let Some(origin) = crate::output::rewrite_origin()
+    {
+        let mode_str = format!("{:?}", options.process.mode).to_lowercase();
+        if let Some(marker) = crate::output::rewrite_transparency_marker(
+            &origin,
+            &mode_str,
+            view_differs_count,
+            total_paths,
+        ) {
+            eprintln!("{marker}");
+        }
     }
 
     if options.process.show_stats && total_original_tokens > 0 {

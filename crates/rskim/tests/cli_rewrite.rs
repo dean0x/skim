@@ -534,6 +534,17 @@ fn test_rewrite_cat_code_file() {
         .stdout(predicate::str::contains("skim src/main.rs --mode=pseudo"));
 }
 
+/// Phase 1 (transparency): cat rewrite must include the SKIM_REWRITTEN_FROM origin tag
+/// so the execution path can emit a transparency marker when the view differs from raw bytes.
+#[test]
+fn test_rewrite_cat_includes_origin_tag() {
+    common::skim()
+        .args(["rewrite", "cat", "src/main.rs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SKIM_REWRITTEN_FROM=cat"));
+}
+
 #[test]
 fn test_rewrite_cat_squeeze_blanks() {
     common::skim()

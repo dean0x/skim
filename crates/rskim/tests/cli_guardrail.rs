@@ -13,6 +13,7 @@ fn skim_cmd() -> Command {
     let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd.env_remove("SKIM_DEBUG");
+    cmd.env_remove("SKIM_REWRITTEN_FROM");
     cmd
 }
 

@@ -23,6 +23,7 @@ mod common;
 fn skim_cmd() -> Command {
     let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
+    cmd.env_remove("SKIM_REWRITTEN_FROM");
     cmd
 }
 
@@ -2736,8 +2737,14 @@ fn fix_e_git_show_pipe_passes_through() {
 #[test]
 fn test_hook_rewritten_cat_with_session_id_executes() {
     let dir = TempDir::new().unwrap();
-    let file = dir.path().join("roundtrip.rs");
-    fs::write(&file, "pub fn answer() -> u32 {\n    42\n}\n").unwrap();
+    // Use TypeScript so pseudo mode strips parameter type annotations (`: number`),
+    // guaranteeing view_differs = true and the transparency marker fires.
+    let file = dir.path().join("roundtrip.ts");
+    fs::write(
+        &file,
+        "export function answer(x: number, y: number): number {\n  return x + y;\n}\n",
+    )
+    .unwrap();
 
     let input = serde_json::json!({
         "session_id": "e2e-roundtrip-session",
@@ -2767,17 +2774,54 @@ fn test_hook_rewritten_cat_with_session_id_executes() {
         "rewritten command must NOT contain --session-id (attribution is out-of-band via sidecar): {rewritten}"
     );
 
-    // The rewritten command must start with "skim" and execute successfully.
-    // NOTE: split_whitespace is used for simplicity and relies on TempDir
-    // producing a space-free path (standard on Linux/macOS /tmp). If the
-    // temp dir ever introduces spaces, switch to a proper shell-word splitter.
+    // Phase 1 (transparency): the rewritten command must carry the origin tag
+    // as a leading KEY=val token so the execution path can emit a transparency marker.
+    assert!(
+        rewritten.contains("SKIM_REWRITTEN_FROM=cat"),
+        "rewritten command must contain SKIM_REWRITTEN_FROM=cat origin tag: {rewritten}"
+    );
+
+    // Execute the rewritten command, stripping leading KEY=val tokens and applying
+    // them as env vars — the standard shell semantics for inline env assignments.
+    // NOTE: split_whitespace relies on TempDir producing a space-free path.
     let tokens: Vec<&str> = rewritten.split_whitespace().collect();
-    assert_eq!(tokens[0], "skim");
-    skim_cmd()
-        .args(&tokens[1..])
+
+    // Separate leading KEY=val env tokens from the skim binary + args.
+    let mut env_pairs: Vec<(&str, &str)> = Vec::new();
+    let mut skim_start = 0;
+    for (i, tok) in tokens.iter().enumerate() {
+        if let Some(eq_pos) = tok.find('=') {
+            let key = &tok[..eq_pos];
+            let val = &tok[eq_pos + 1..];
+            env_pairs.push((key, val));
+            skim_start = i + 1;
+        } else {
+            break;
+        }
+    }
+    assert_eq!(tokens[skim_start], "skim");
+
+    let exec_result = skim_cmd()
+        .envs(env_pairs.iter().cloned())
+        .args(&tokens[skim_start + 1..])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("answer"));
+        .stdout(predicate::str::contains("answer"))
+        .get_output()
+        .stderr
+        .clone();
+
+    // End-to-end proof: the transparency marker must appear on stderr when the
+    // view differs from raw bytes (SKIM_REWRITTEN_FROM is set via env_pairs).
+    let stderr_str = String::from_utf8_lossy(&exec_result);
+    assert!(
+        stderr_str.contains("[skim] transformed view"),
+        "executing the rewritten cat command must emit the transparency marker on stderr; got: {stderr_str}"
+    );
+    assert!(
+        stderr_str.contains("SKIM_PASSTHROUGH=1"),
+        "transparency marker must include SKIM_PASSTHROUGH=1 hint; got: {stderr_str}"
+    );
 }
 
 // ============================================================================
