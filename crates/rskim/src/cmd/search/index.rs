@@ -5,7 +5,9 @@
 //! **Streaming build**:
 //! 1. `discover_project_root(cwd)` → walk up to `.git`, fall back to cwd
 //! 2. Resolve cache dir: `~/.cache/skim/search/{sha256(canonical_root)[..16]}/`
-//! 3. `walk_metadata(root, max_files)` → metadata-only WalkEntry list (sorted)
+//! 3. `walk_metadata(root, max_files, Some(cache_dir))` → metadata-only WalkEntry
+//!    list (sorted); on a git root it unions git-tracked files the ignore-walk
+//!    skipped, re-entering the same top-K selection (#402)
 //! 4. Producer thread: for each entry, reads content, computes SHA-256, applies
 //!    2-tier SHA cache, classifies; sends ProcessedFile on bounded channel
 //! 5. Consumer thread: receives ProcessedFile, calls add_file_classified, inserts
