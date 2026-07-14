@@ -480,7 +480,11 @@ impl<'cfg> Pipeline<'cfg> {
     /// Returns the FULL walk skip `Vec` (not reduced to `.len()`) so `run()`
     /// can merge it into the producer sample (AD-395-2).
     fn walk(&self) -> anyhow::Result<(Vec<WalkEntry>, Vec<SkipReason>)> {
-        let (entries, skips) = walk_metadata(&self.config.root, self.config.effective_max_files())?;
+        let (entries, skips) = walk_metadata(
+            &self.config.root,
+            self.config.effective_max_files(),
+            Some(&self.cache_dir),
+        )?;
         Ok((entries, skips))
     }
 

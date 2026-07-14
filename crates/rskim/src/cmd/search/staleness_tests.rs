@@ -1953,8 +1953,8 @@ fn test_walk_metadata_at_cap_is_deterministic() {
     }
 
     let cap = 5usize;
-    let (a, _) = walk_metadata(dir.path(), cap).unwrap();
-    let (b, _) = walk_metadata(dir.path(), cap).unwrap();
+    let (a, _) = walk_metadata(dir.path(), cap, None).unwrap();
+    let (b, _) = walk_metadata(dir.path(), cap, None).unwrap();
 
     let a_paths: Vec<String> = a.iter().map(|e| normalize_rel_path(&e.rel_path)).collect();
     let b_paths: Vec<String> = b.iter().map(|e| normalize_rel_path(&e.rel_path)).collect();

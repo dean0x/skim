@@ -250,7 +250,7 @@ fn scan_working_tree(
     use super::walk::{normalize_rel_path, walk_metadata};
 
     // Metadata-only walk under the builder's ignore config (AD-379-1).
-    let (entries, _skipped) = walk_metadata(root, max_files)?;
+    let (entries, _skipped) = walk_metadata(root, max_files, None)?;
 
     // Index the manifest by normalized rel-path → (mtime, size). The key is
     // already normalized (it is the stored manifest key), so no re-normalization.

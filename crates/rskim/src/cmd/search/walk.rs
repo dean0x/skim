@@ -275,10 +275,12 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> ClassifyOutcome<Read
     }
 
     let mtime = mtime_secs(entry);
-    let rel_path = abs_path
-        .strip_prefix(root)
-        .unwrap_or(abs_path)
-        .to_path_buf();
+    // Consistent with classify_metadata_core: return Transparent on root-escape
+    // rather than falling back to the absolute path as a relative path.
+    let rel_path = match abs_path.strip_prefix(root) {
+        Ok(r) => r.to_path_buf(),
+        Err(_) => return ClassifyOutcome::Transparent,
+    };
 
     ClassifyOutcome::Accept(ReadFile {
         rel_path,
@@ -327,7 +329,7 @@ pub(super) fn walk_and_read(
 /// Extract mtime as seconds since UNIX_EPOCH from a [`std::fs::Metadata`] value.
 ///
 /// Returns `None` when the platform does not expose modification time or the
-/// syscall fails. Shared by [`classify_metadata_core`] and [`tracked_files_memoized`].
+/// syscall fails. Used by [`classify_metadata_core`].
 fn mtime_from_meta(meta: &std::fs::Metadata) -> Option<u64> {
     meta.modified()
         .ok()
@@ -476,6 +478,7 @@ fn classify_tracked_path(abs_path: &Path, root: &Path) -> ClassifyOutcome<WalkEn
 pub(super) fn walk_metadata(
     root: &Path,
     max_files: usize,
+    cache_dir: Option<&Path>,
 ) -> anyhow::Result<(Vec<WalkEntry>, Vec<SkipReason>)> {
     let mut builder = WalkBuilder::new(root);
     configure_builder(&mut builder);
@@ -495,17 +498,13 @@ pub(super) fn walk_metadata(
     // upgrade — the staleness scan finds `added > 0` → `WorkingTreeChanged` →
     // one rebuild → stable thereafter. No index-format bump required.
     if root.join(".git").exists() {
-        // Resolve cache dir once here and thread it to merge_tracked_union so
-        // tracked_files_memoized avoids a redundant canonicalize+SHA-256 per
-        // query (AD-402-6 / finding: tracked-memo-redundant-resolve).
-        let cache_dir = resolve_search_cache_dir(root).ok();
-        let added = merge_tracked_union(
-            root,
-            max_files,
-            &mut entries,
-            &mut skips,
-            cache_dir.as_deref(),
-        );
+        // Thread the caller-supplied cache_dir to merge_tracked_union so
+        // tracked_files_memoized uses the pre-computed path (which respects
+        // cache_dir_override) rather than re-resolving it via
+        // resolve_search_cache_dir(root) here. tracked_files_memoized falls back
+        // to its own resolution when cache_dir is None (staleness.rs, tests).
+        // (AD-402-6 / finding: tracked-memo-redundant-resolve)
+        let added = merge_tracked_union(root, max_files, &mut entries, &mut skips, cache_dir);
         if added > 0 && crate::debug::is_debug_enabled() {
             eprintln!(
                 "skim search [debug]: unioned {added} git-tracked file(s) the .gitignore walk skipped"
@@ -548,16 +547,11 @@ fn merge_tracked_union(
         return 0;
     };
 
-    // Compute normalize_rel_path once per pre-existing entry.  `entry_keys` is
-    // kept parallel to `entries` so the sort can reuse these strings rather than
-    // re-running normalize_rel_path for every element (halves String-allocating
-    // replace() calls when added > 0 — finding: merge-double-normalize-perf).
-    let mut entry_keys: Vec<String> = entries
+    // Seed the dedup set from already-walked entries.
+    let mut yielded: HashSet<String> = entries
         .iter()
         .map(|e| normalize_rel_path(&e.rel_path))
         .collect();
-    // yielded uses cloned keys (cheap String::clone, not another replace()).
-    let mut yielded: HashSet<String> = entry_keys.iter().cloned().collect();
 
     // Also seed yielded from already-skipped paths so a tracked file that the
     // ignore-walk already classified as Skip (e.g. TooLarge) is not re-classified
@@ -579,10 +573,9 @@ fn merge_tracked_union(
             continue; // already walked → skip (dedup by normalize_rel_path key)
         }
         // Mark seen before classify so duplicate index entries don't re-classify.
-        yielded.insert(key.clone());
+        yielded.insert(key);
         match classify_tracked_path(&root.join(&rel), root) {
             ClassifyOutcome::Accept(entry) => {
-                entry_keys.push(key); // keep parallel to entries
                 entries.push(entry);
                 added += 1;
             }
@@ -598,17 +591,8 @@ fn merge_tracked_union(
     if added > 0 {
         // AD-402-2: Re-run the SAME top-K (smallest max_files keys, ascending)
         // so FileId↔sorted_paths and cross-run determinism hold (PF-012).
-        // Reuse pre-computed entry_keys — no second normalize_rel_path pass.
-        // entry_keys and entries are parallel (same length, same order).
-        debug_assert_eq!(
-            entry_keys.len(),
-            entries.len(),
-            "entry_keys/entries out of sync in merge_tracked_union"
-        );
-        let mut pairs: Vec<_> = entry_keys.into_iter().zip(entries.drain(..)).collect();
-        pairs.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-        pairs.truncate(max_files);
-        *entries = pairs.into_iter().map(|(_, e)| e).collect();
+        entries.sort_by_cached_key(|e| normalize_rel_path(&e.rel_path));
+        entries.truncate(max_files);
     }
     added
 }
@@ -676,7 +660,15 @@ fn tracked_files_memoized(root: &Path, cache_dir: Option<&Path>) -> Option<Vec<P
     // linked worktrees (.git file pointing to the worktree-specific git dir).
     // Without this, a linked worktree would always fail the stat below and fall
     // through to a live list_tracked_files call on every query.
-    let git_index_path = resolve_git_index_path(root)?;
+    //
+    // Fail-soft: if resolve_git_index_path returns None (non-UTF-8 gitdir path,
+    // IO error reading the .git pointer file, or unexpected format), fall through
+    // to a live list_tracked_files call rather than propagating None out of this
+    // function and silently dropping the entire tracked-union (AD-402-3).
+    let git_index_path = match resolve_git_index_path(root) {
+        Some(p) => p,
+        None => return list_tracked_files(root),
+    };
 
     // Stat the resolved index path for the fingerprint. If missing (newly-init
     // repo with no commits), fall through to a live call (which will also return

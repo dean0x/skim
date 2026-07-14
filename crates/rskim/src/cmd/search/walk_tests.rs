@@ -511,7 +511,7 @@ fn test_walk_metadata_returns_sorted_entries() {
     fs::write(root.join("m_middle.rs"), "fn m() {}\n").unwrap();
 
     let root = root.canonicalize().unwrap();
-    let (entries, _) = walk_metadata(&root, 50_000).unwrap();
+    let (entries, _) = walk_metadata(&root, 50_000, None).unwrap();
     let paths: Vec<PathBuf> = entries.iter().map(|e| e.rel_path.clone()).collect();
 
     // Must be sorted lexicographically.
@@ -538,7 +538,7 @@ fn test_walk_metadata_respects_max_files_cap() {
     }
 
     let root = root.canonicalize().unwrap();
-    let (entries, _) = walk_metadata(&root, 3).unwrap();
+    let (entries, _) = walk_metadata(&root, 3, None).unwrap();
     assert_eq!(
         entries.len(),
         3,
@@ -553,7 +553,7 @@ fn test_walk_metadata_includes_mtime() {
     let dir = make_sample_tree();
     let root = dir.path().canonicalize().unwrap();
 
-    let (entries, _) = walk_metadata(&root, 50_000).unwrap();
+    let (entries, _) = walk_metadata(&root, 50_000, None).unwrap();
     assert!(
         !entries.is_empty(),
         "make_sample_tree() must produce at least one entry"
@@ -598,7 +598,7 @@ fn test_walk_metadata_fileid_order_matches_btreemap_key_order() {
     fs::write(root.join("a/b/c.rs"), "fn deep() {}\n").unwrap();
 
     let root = root.canonicalize().unwrap();
-    let (entries, _) = walk_metadata(&root, 50_000).unwrap();
+    let (entries, _) = walk_metadata(&root, 50_000, None).unwrap();
 
     assert_eq!(entries.len(), 4, "all 4 source files must be collected");
 
@@ -660,7 +660,7 @@ fn test_walk_metadata_flat_corpus_order_unchanged() {
     fs::write(root.join("src/c.rs"), "fn c() {}\n").unwrap();
 
     let root = root.canonicalize().unwrap();
-    let (entries, _) = walk_metadata(&root, 50_000).unwrap();
+    let (entries, _) = walk_metadata(&root, 50_000, None).unwrap();
 
     assert_eq!(
         entries.len(),
@@ -921,8 +921,8 @@ fn test_ac6_402_walk_metadata_determinism_with_union() {
     let dir = super::super::tests::make_tracked_ignored_repo();
     let root = dir.path().canonicalize().unwrap();
 
-    let (entries1, _) = walk_metadata(&root, 50_000).unwrap();
-    let (entries2, _) = walk_metadata(&root, 50_000).unwrap();
+    let (entries1, _) = walk_metadata(&root, 50_000, None).unwrap();
+    let (entries2, _) = walk_metadata(&root, 50_000, None).unwrap();
 
     let keys1: Vec<String> = entries1
         .iter()
@@ -957,7 +957,7 @@ fn test_ac9_402_walk_metadata_never_unions_dot_git() {
     let dir = super::super::tests::make_tracked_ignored_repo();
     let root = dir.path().canonicalize().unwrap();
 
-    let (entries, _) = walk_metadata(&root, 50_000).unwrap();
+    let (entries, _) = walk_metadata(&root, 50_000, None).unwrap();
 
     for e in &entries {
         let key = normalize_rel_path(&e.rel_path);
@@ -1437,7 +1437,7 @@ fn test_merge_tracked_union_no_duplicate_skip_for_already_skipped() {
     // goes into skips) and then calls merge_tracked_union (which sees huge.rs
     // in the tracked list but should dedup against the skip list and NOT
     // re-classify it).
-    let (_entries, skips) = walk_metadata(&root, 50_000).unwrap();
+    let (_entries, skips) = walk_metadata(&root, 50_000, None).unwrap();
 
     let huge_skip_count = skips
         .iter()
