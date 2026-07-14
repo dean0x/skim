@@ -417,3 +417,393 @@ fn search_bareword_build_is_a_query_not_a_build_action() {
          stdout:\n{stdout}"
     );
 }
+
+// ============================================================================
+// #400 — invalid/nonexistent --root validation (fail-loud gate)
+// ============================================================================
+//
+// All tests run with an isolated SKIM_CACHE_DIR so they never touch ~/.cache/skim.
+// Tests drive the real binary (assert_cmd) to exercise the full
+//   main → dispatch → search::run → resolve_root_and_cache
+// entry-point path, not internal helpers.
+
+mod root_validation_400 {
+    use assert_cmd::Command;
+    use predicates::prelude::*;
+    use std::fs;
+
+    /// Collect the paths of all hash subdirectories under `<cache>/search/`.
+    /// Returns an empty vec when `search/` is absent or empty. Used by
+    /// `assert_no_cache_subdirs` (emptiness check) and the AC6/AC7 exact-count
+    /// assertions so the `read_dir + filter_map(ok) + filter(is_dir)` idiom lives
+    /// in exactly one place and failure messages show the offending paths.
+    fn collect_hash_subdirs(cache: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let search_dir = cache.join("search");
+        if !search_dir.exists() {
+            return Vec::new();
+        }
+        fs::read_dir(&search_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path())
+            .collect()
+    }
+
+    /// Assert that the `search/` subtree of `cache` contains no hash subdirs.
+    /// AC2 and AC3 share this check (PF-007 discriminating for the funnel bail).
+    /// On failure the message includes the offending paths for easier diagnosis.
+    fn assert_no_cache_subdirs(cache: &std::path::Path, label: &str) {
+        let dirs = collect_hash_subdirs(cache);
+        assert!(
+            dirs.is_empty(),
+            "{label}: no search/<hash>/ dirs must be created for a bad root; \
+             found: {dirs:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC1 (#400) — non-existent --root fails loud with the full message triple
+    // -------------------------------------------------------------------------
+    /// Before #400 this exited 0 with "no results"; after #400 it must exit
+    /// nonzero and emit all three expected message parts (PF-007 discriminating).
+    #[test]
+    fn ac1_nonexistent_root_fails_loud() {
+        let cache = tempfile::tempdir().unwrap();
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "foo", "--root", "/does/not/exist_400"])
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--root"))
+            .stderr(predicate::str::contains("/does/not/exist_400"))
+            .stderr(predicate::str::contains("Pass the directory to index"));
+    }
+
+    // -------------------------------------------------------------------------
+    // AC2 (#400) — no cache directory is created for a non-existent root
+    // -------------------------------------------------------------------------
+    /// Before #400, search/<ae6b160b...>/ was created; after the funnel fix no
+    /// cache dir is created (the bail fires before create_dir_all; PF-007).
+    #[test]
+    fn ac2_no_cache_dir_on_bad_root() {
+        let cache = tempfile::tempdir().unwrap();
+
+        let output = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "foo", "--root", "/does/not/exist_400"])
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+
+        // search/ subdir must not exist or must have zero sub-dirs
+        assert_no_cache_subdirs(cache.path(), "AC2");
+
+        // Stderr must NOT contain "building index" (funnel bailed before create_dir_all)
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("building index"),
+            "AC2: rejection must not trigger an index build; stderr:\n{stderr}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC3 (#400) — file-as-root is rejected by the is_dir guard
+    // -------------------------------------------------------------------------
+    /// canonicalize() succeeds for a regular file; the explicit is_dir() guard
+    /// is what catches it. Before #400 this indexed 1 file and exited 0 (PF-007).
+    #[test]
+    fn ac3_file_root_rejected() {
+        let cache = tempfile::tempdir().unwrap();
+        let tmp_file = tempfile::NamedTempFile::new().unwrap();
+
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "foo", "--root"])
+            .arg(tmp_file.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("is not a directory"))
+            .stderr(predicate::str::contains("Pass the directory to index"));
+
+        // No cache hash dir created for a file root
+        assert_no_cache_subdirs(cache.path(), "AC3");
+    }
+
+    // -------------------------------------------------------------------------
+    // AC4 (#400) — valid root returns ground-truth results, exit 0
+    // -------------------------------------------------------------------------
+    /// Uses `alpha_token` as a unique sentinel — exactly one file contains it.
+    /// The exact-set assertion (PF-007): src/a.rs appears, src/b.rs does not.
+    #[test]
+    fn ac4_valid_root_returns_ground_truth() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        // Ground truth: src/a.rs has alpha_token; src/b.rs does not
+        fs::create_dir_all(proj.path().join("src")).unwrap();
+        fs::write(
+            proj.path().join("src/a.rs"),
+            "fn find_alpha() { let alpha_token = 42; let _ = alpha_token; }\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.path().join("src/b.rs"),
+            "fn find_beta() { let beta_value = 99; let _ = beta_value; }\n",
+        )
+        .unwrap();
+
+        // Build the index
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "--build", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success();
+
+        let output = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "alpha_token", "--json", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("AC4: stdout must be valid JSON ({e}); got:\n{stdout}"));
+        let results = json["results"]
+            .as_array()
+            .expect("AC4: must have 'results' array");
+
+        let paths: Vec<&str> = results.iter().filter_map(|r| r["path"].as_str()).collect();
+
+        // Ground truth: alpha_token appears only in src/a.rs
+        assert!(
+            paths.iter().any(|p| p.contains("src/a.rs")),
+            "AC4: result set must contain src/a.rs (only file with alpha_token); \
+             got paths: {:?}",
+            paths
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("src/b.rs")),
+            "AC4: src/b.rs must NOT appear in results (lacks alpha_token); \
+             got paths: {:?}",
+            paths
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC5 (#400) — empty but valid directory is NOT rejected
+    // -------------------------------------------------------------------------
+    /// The gate keys on existence + is_dir, never on emptiness. An empty dir is
+    /// a legitimately valid root that just has no indexed files. Exit 0 + "no results".
+    #[test]
+    fn ac5_empty_valid_dir_not_rejected() {
+        let proj = tempfile::tempdir().unwrap(); // empty
+        let cache = tempfile::tempdir().unwrap();
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "foo", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("no results"));
+    }
+
+    // -------------------------------------------------------------------------
+    // AC6 (#400) — trailing-slash hash stability: dir and dir/ map to one cache hash
+    // -------------------------------------------------------------------------
+    /// Before the fix, the AD-381-2 lexical fallback was only used for
+    /// non-existent roots. Valid roots go through canonicalize() which already
+    /// collapses trailing slashes — so both spellings produce the same sha256 prefix
+    /// and only one search/<hash>/ dir must exist after both runs.
+    #[test]
+    fn ac6_trailing_slash_hash_stability() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        // Put one file in the project so the index is non-trivial
+        fs::create_dir_all(proj.path().join("src")).unwrap();
+        fs::write(proj.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
+
+        let dir_str = proj.path().to_string_lossy().into_owned();
+        let dir_trailing = format!("{dir_str}/");
+
+        // Run once with plain path, once with trailing slash (separate invocations)
+        let _ = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "main", "--root", &dir_str])
+            .env("SKIM_CACHE_DIR", cache.path())
+            .output()
+            .unwrap();
+
+        let _ = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "main", "--root", &dir_trailing])
+            .env("SKIM_CACHE_DIR", cache.path())
+            .output()
+            .unwrap();
+
+        // Exactly one search/<hash>/ dir must exist — both spellings map to the same hash
+        let subdirs = collect_hash_subdirs(cache.path());
+        assert_eq!(
+            subdirs.len(),
+            1,
+            "AC6: both trailing-slash and plain spellings must map to ONE cache hash dir; \
+             found {} dirs: {:?}",
+            subdirs.len(),
+            subdirs
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC7 (#400) — symlink-to-dir is accepted; symlink-to-file / dangling rejected
+    // -------------------------------------------------------------------------
+    #[cfg(unix)]
+    #[test]
+    fn ac7_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        // real/ dir with one Rust file
+        let real_dir = tmp.path().join("real");
+        fs::create_dir_all(&real_dir).unwrap();
+        fs::write(
+            real_dir.join("tok.rs"),
+            "fn symlink_unique_tok() { let x = 1; let _ = x; }\n",
+        )
+        .unwrap();
+
+        // A regular file
+        let real_file = tmp.path().join("f.rs");
+        fs::write(&real_file, "fn f() {}\n").unwrap();
+
+        // Symlinks
+        let link_dir = tmp.path().join("link_dir");
+        let link_file = tmp.path().join("link_file");
+        let link_dead = tmp.path().join("link_dead");
+        symlink(&real_dir, &link_dir).unwrap();
+        symlink(&real_file, &link_file).unwrap();
+        symlink(tmp.path().join("no_such_target_400"), &link_dead).unwrap();
+
+        // symlink-to-dir must succeed
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "symlink_unique_tok", "--root"])
+            .arg(&link_dir)
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success();
+
+        // run again via the real dir path to verify same hash
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "symlink_unique_tok", "--root"])
+            .arg(&real_dir)
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success();
+
+        // Both routes must map to exactly ONE cache hash dir
+        let subdirs = collect_hash_subdirs(cache.path());
+        assert_eq!(
+            subdirs.len(),
+            1,
+            "AC7: symlink-dir and real-dir must map to ONE cache hash; \
+             found {} dirs: {:?}",
+            subdirs.len(),
+            subdirs
+        );
+
+        // symlink-to-file must fail with is_dir message
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "foo", "--root"])
+            .arg(&link_file)
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("is not a directory"));
+
+        // dangling symlink must fail (canonicalize error → Pass the directory hint)
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "foo", "--root"])
+            .arg(&link_dead)
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("Pass the directory to index"));
+    }
+
+    // -------------------------------------------------------------------------
+    // AC10 (#400) — exit code is exactly 1 for all rejection cases
+    // -------------------------------------------------------------------------
+    /// Distinguishes exit 1 (general/user-input error) from skim's exit 2
+    /// (parse error) and exit 3 (unsupported language). Both reuse the existing
+    /// anyhow::Err → ExitCode::FAILURE mapping (main.rs; no new plumbing).
+    #[test]
+    fn ac10_exit_code_is_exactly_1() {
+        let cache = tempfile::tempdir().unwrap();
+        let tmp_file = tempfile::NamedTempFile::new().unwrap();
+
+        // Non-existent root → exit 1
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "foo", "--root", "/does/not/exist_400"])
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .code(1);
+
+        // File root → exit 1
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "foo", "--root"])
+            .arg(tmp_file.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .code(1);
+
+        // Note: `--root ""` is not included here because it is rejected by
+        // take_flag_value's empty-value guard (mod.rs:506-508 — "value must not be
+        // empty or whitespace-only") before reaching resolve_root_and_cache.
+        // That guard predates #400, so `--root ""` is not discriminating for the
+        // #400 funnel fix (PF-007) — the assertion would still pass with the entire
+        // root-validation funnel deleted.
+    }
+
+    // -------------------------------------------------------------------------
+    // AC11 (#400) — rejection is bounded; no index build on a bad root
+    // -------------------------------------------------------------------------
+    /// Pre-fix, the bad-root path performed a full walk + index write. Post-fix,
+    /// the funnel bail fires before create_dir_all and before any walk — no
+    /// "building index" message appears on stderr (PF-007 discriminating proxy).
+    #[test]
+    fn ac11_no_build_on_rejection() {
+        let cache = tempfile::tempdir().unwrap();
+        let output = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "foo", "--root", "/does/not/exist_400"])
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("building index"),
+            "AC11: bad-root rejection must not trigger an index build; stderr:\n{stderr}"
+        );
+    }
+}
