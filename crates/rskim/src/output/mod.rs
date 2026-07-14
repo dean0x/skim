@@ -525,9 +525,8 @@ mod rewrite_transparency_tests {
 
     #[test]
     fn test_rewrite_transparency_marker_head_structure() {
-        let result = rewrite_transparency_marker("head", "structure", 1, 1);
-        assert!(result.is_some());
-        let m = result.unwrap();
+        let m = rewrite_transparency_marker("head", "structure", 1, 1)
+            .expect("head + differing=1 must produce a marker");
         assert!(m.contains("head"), "marker must name the origin command");
         assert!(m.contains("structure"), "marker must name the mode");
         assert!(

@@ -2787,21 +2787,16 @@ fn test_hook_rewritten_cat_with_session_id_executes() {
     let tokens: Vec<&str> = rewritten.split_whitespace().collect();
 
     // Separate leading KEY=val env tokens from the skim binary + args.
-    let mut env_pairs: Vec<(&str, &str)> = Vec::new();
-    let mut skim_start = 0;
-    for (i, tok) in tokens.iter().enumerate() {
-        if let Some(eq_pos) = tok.find('=') {
-            let key = &tok[..eq_pos];
-            let val = &tok[eq_pos + 1..];
-            env_pairs.push((key, val));
-            skim_start = i + 1;
-        } else {
-            break;
-        }
-    }
+    let env_pairs: Vec<(&str, &str)> = tokens
+        .iter()
+        .copied()
+        .take_while(|tok| tok.contains('='))
+        .map(|tok| tok.split_once('=').unwrap())
+        .collect();
+    let skim_start = env_pairs.len();
     assert_eq!(tokens[skim_start], "skim");
 
-    let exec_result = skim_cmd()
+    let stderr_bytes = skim_cmd()
         .envs(env_pairs.iter().cloned())
         .args(&tokens[skim_start + 1..])
         .assert()
@@ -2813,7 +2808,7 @@ fn test_hook_rewritten_cat_with_session_id_executes() {
 
     // End-to-end proof: the transparency marker must appear on stderr when the
     // view differs from raw bytes (SKIM_REWRITTEN_FROM is set via env_pairs).
-    let stderr_str = String::from_utf8_lossy(&exec_result);
+    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
     assert!(
         stderr_str.contains("[skim] transformed view"),
         "executing the rewritten cat command must emit the transparency marker on stderr; got: {stderr_str}"
