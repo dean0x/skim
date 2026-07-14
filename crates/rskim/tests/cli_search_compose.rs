@@ -432,30 +432,33 @@ mod root_validation_400 {
     use predicates::prelude::*;
     use std::fs;
 
-    /// Count the number of hash subdirectories under `<cache>/search/`.
-    /// Returns 0 when `search/` is absent or empty. Used by
+    /// Collect the paths of all hash subdirectories under `<cache>/search/`.
+    /// Returns an empty vec when `search/` is absent or empty. Used by
     /// `assert_no_cache_subdirs` (emptiness check) and the AC6/AC7 exact-count
     /// assertions so the `read_dir + filter_map(ok) + filter(is_dir)` idiom lives
-    /// in exactly one place.
-    fn count_hash_subdirs(cache: &std::path::Path) -> usize {
+    /// in exactly one place and failure messages show the offending paths.
+    fn collect_hash_subdirs(cache: &std::path::Path) -> Vec<std::path::PathBuf> {
         let search_dir = cache.join("search");
         if !search_dir.exists() {
-            return 0;
+            return Vec::new();
         }
         fs::read_dir(&search_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .count()
+            .map(|e| e.path())
+            .collect()
     }
 
     /// Assert that the `search/` subtree of `cache` contains no hash subdirs.
     /// AC2 and AC3 share this check (PF-007 discriminating for the funnel bail).
+    /// On failure the message includes the offending paths for easier diagnosis.
     fn assert_no_cache_subdirs(cache: &std::path::Path, label: &str) {
-        let n = count_hash_subdirs(cache);
+        let dirs = collect_hash_subdirs(cache);
         assert!(
-            n == 0,
-            "{label}: no search/<hash>/ dirs must be created for a bad root; found {n} dirs"
+            dirs.is_empty(),
+            "{label}: no search/<hash>/ dirs must be created for a bad root; \
+             found: {dirs:?}"
         );
     }
 
@@ -651,11 +654,14 @@ mod root_validation_400 {
             .unwrap();
 
         // Exactly one search/<hash>/ dir must exist — both spellings map to the same hash
-        let n = count_hash_subdirs(cache.path());
+        let subdirs = collect_hash_subdirs(cache.path());
         assert_eq!(
-            n, 1,
+            subdirs.len(),
+            1,
             "AC6: both trailing-slash and plain spellings must map to ONE cache hash dir; \
-             found {n} dirs"
+             found {} dirs: {:?}",
+            subdirs.len(),
+            subdirs
         );
     }
 
@@ -710,10 +716,14 @@ mod root_validation_400 {
             .success();
 
         // Both routes must map to exactly ONE cache hash dir
-        let n = count_hash_subdirs(cache.path());
+        let subdirs = collect_hash_subdirs(cache.path());
         assert_eq!(
-            n, 1,
-            "AC7: symlink-dir and real-dir must map to ONE cache hash; found {n} dirs"
+            subdirs.len(),
+            1,
+            "AC7: symlink-dir and real-dir must map to ONE cache hash; \
+             found {} dirs: {:?}",
+            subdirs.len(),
+            subdirs
         );
 
         // symlink-to-file must fail with is_dir message
@@ -765,13 +775,12 @@ mod root_validation_400 {
             .assert()
             .code(1);
 
-        // Empty-string root → canonicalize("") fails → exit 1 (AC10 third case)
-        Command::cargo_bin("skim")
-            .unwrap()
-            .args(["search", "foo", "--root", ""])
-            .env("SKIM_CACHE_DIR", cache.path())
-            .assert()
-            .code(1);
+        // Note: `--root ""` is not included here because it is rejected by
+        // take_flag_value's empty-value guard (mod.rs:506-508 — "value must not be
+        // empty or whitespace-only") before reaching resolve_root_and_cache.
+        // That guard predates #400, so `--root ""` is not discriminating for the
+        // #400 funnel fix (PF-007) — the assertion would still pass with the entire
+        // root-validation funnel deleted.
     }
 
     // -------------------------------------------------------------------------
