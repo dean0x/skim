@@ -807,3 +807,627 @@ mod root_validation_400 {
         );
     }
 }
+
+// ============================================================================
+// #402 — tracked-but-.gitignored union (recall correctness fix)
+// ============================================================================
+//
+// All tests use isolated SKIM_CACHE_DIR so they never touch ~/.cache/skim.
+// Tests drive the real binary (assert_cmd) to exercise the full
+//   main → dispatch → search::run → walk_metadata → merge_tracked_union
+// entry-point path.
+//
+// Oracle for positive recall assertions: `git grep -l <token>` — respects the
+// git index and includes tracked-but-.gitignored files (ADR-003 / ADR-007).
+
+mod tracked_union_402 {
+    use assert_cmd::Command;
+    use predicates::prelude::*;
+    use serde_json::Value;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command as StdCommand;
+
+    // ---- Helpers ----------------------------------------------------------------
+
+    /// Initialize a real git repo at `root` with the standard test layout:
+    /// ```
+    /// root/
+    ///   .gitignore       <- "secretdoc.md\n"
+    ///   secretdoc.md     <- tracked via `git add -f`; content contains `token`
+    ///   src/a.rs         <- ordinary tracked file
+    /// ```
+    fn init_tracked_ignored_repo(root: &Path, token: &str) {
+        StdCommand::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .expect("git init");
+        StdCommand::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(root)
+            .output()
+            .expect("git config email");
+        StdCommand::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(root)
+            .output()
+            .expect("git config name");
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".gitignore"), "secretdoc.md\n").unwrap();
+        fs::write(root.join("secretdoc.md"), format!("{token}\n")).unwrap();
+        fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+
+        StdCommand::new("git")
+            .args(["add", "-f", "secretdoc.md", "src/a.rs", ".gitignore"])
+            .current_dir(root)
+            .output()
+            .expect("git add");
+        StdCommand::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(root)
+            .output()
+            .expect("git commit");
+    }
+
+    /// Build the search index for `proj`, routing all cache I/O to `cache`.
+    fn build_index_402(proj: &Path, cache: &Path) {
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "--build", "--root"])
+            .arg(proj)
+            .env("SKIM_CACHE_DIR", cache)
+            .assert()
+            .success();
+    }
+
+    /// Run `skim search <query> --root <proj> --json`, return stdout.
+    fn query_json(proj: &Path, cache: &Path, query: &str) -> String {
+        let out = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", query, "--root"])
+            .arg(proj)
+            .arg("--json")
+            .env("SKIM_CACHE_DIR", cache)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Extract the `path` fields from a `skim search --json` result.
+    fn result_paths(json_str: &str) -> Vec<String> {
+        let v: Value = serde_json::from_str(json_str.trim())
+            .unwrap_or_else(|e| panic!("JSON parse error: {e}; got:\n{json_str}"));
+        v["results"]
+            .as_array()
+            .expect("must have 'results' array")
+            .iter()
+            .filter_map(|r| r["path"].as_str().map(ToString::to_string))
+            .collect()
+    }
+
+    // -------------------------------------------------------------------------
+    // AC2 (#402) — hermetic exact-set repro: tracked-but-.gitignored file found
+    // -------------------------------------------------------------------------
+    /// Core correctness test: a file that is in `.gitignore` but also tracked
+    /// (`git add -f`) MUST appear in `skim search` results.
+    ///
+    /// Discriminating (PF-007): before #402, `secretdoc.md` is MISSING because
+    /// the ignore-walk honours `.gitignore`. The moment the union is reverted,
+    /// this test fails.
+    #[test]
+    fn ac2_tracked_gitignored_file_found() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        init_tracked_ignored_repo(proj.path(), "ZZUNIQUETOKEN");
+        build_index_402(proj.path(), cache.path());
+
+        let json = query_json(proj.path(), cache.path(), "ZZUNIQUETOKEN");
+        let paths = result_paths(&json);
+
+        assert!(
+            paths.iter().any(|p| p.contains("secretdoc.md")),
+            "AC2: secretdoc.md (tracked-but-.gitignored) must appear in search results; \
+             paths: {paths:?}"
+        );
+        // src/a.rs must NOT appear (lacks the token).
+        assert!(
+            !paths.iter().any(|p| p.contains("src/a.rs")),
+            "AC2: src/a.rs must not appear (does not contain ZZUNIQUETOKEN); paths: {paths:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC3 (#402) — tracked hidden-dir file is found
+    // -------------------------------------------------------------------------
+    /// A file in a hidden directory (e.g., `.config/app.rs`) is normally
+    /// dropped by `hidden(true)`. When tracked in git, it must appear.
+    #[test]
+    fn ac3_tracked_hidden_dir_file_found() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        StdCommand::new("git")
+            .args(["init"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git init");
+        StdCommand::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git config email");
+        StdCommand::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git config name");
+
+        fs::create_dir_all(proj.path().join(".config")).unwrap();
+        fs::write(proj.path().join(".config/app.rs"), "// HIDDENTOKEN\n").unwrap();
+        fs::create_dir_all(proj.path().join("src")).unwrap();
+        fs::write(proj.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+
+        StdCommand::new("git")
+            .args(["add", ".config/app.rs", "src/a.rs"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git add");
+        StdCommand::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git commit");
+
+        build_index_402(proj.path(), cache.path());
+
+        let json = query_json(proj.path(), cache.path(), "HIDDENTOKEN");
+        let paths = result_paths(&json);
+
+        assert!(
+            paths.iter().any(|p| p.contains(".config/app.rs")),
+            "AC3: .config/app.rs (tracked hidden-dir file) must appear in search results; \
+             paths: {paths:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC4 (#402) — Precision: untracked-ignored junk stays excluded
+    // -------------------------------------------------------------------------
+    /// The union only adds TRACKED files. An untracked `.gitignore`d file must
+    /// remain excluded so skim does not become `--no-ignore`.
+    #[test]
+    fn ac4_untracked_ignored_file_excluded() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        StdCommand::new("git")
+            .args(["init"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git init");
+        StdCommand::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git config email");
+        StdCommand::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git config name");
+
+        fs::create_dir_all(proj.path().join("build")).unwrap();
+        fs::create_dir_all(proj.path().join("src")).unwrap();
+        // Untracked junk — never git-added
+        fs::write(proj.path().join("build/junk.rs"), "// JUNKTOKEN\n").unwrap();
+        // Tracked ordinary file
+        fs::write(proj.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+        fs::write(proj.path().join(".gitignore"), "build/\n").unwrap();
+
+        StdCommand::new("git")
+            .args(["add", "src/a.rs", ".gitignore"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git add");
+        StdCommand::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git commit");
+
+        build_index_402(proj.path(), cache.path());
+
+        let json = query_json(proj.path(), cache.path(), "JUNKTOKEN");
+        let paths = result_paths(&json);
+
+        assert!(
+            !paths.iter().any(|p| p.contains("build/junk.rs")),
+            "AC4: untracked-ignored build/junk.rs must NOT appear in search results \
+             (union only adds tracked files); paths: {paths:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC5 (#402) — Non-git root: ignore-walk stays authoritative
+    // -------------------------------------------------------------------------
+    /// A temp dir with NO `.git` directory: the `.git` gate prevents the union
+    /// from running at all. A `.gitignore`d file that is NOT tracked stays out.
+    #[test]
+    fn ac5_non_git_root_union_skipped() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        // No git init — no .git directory
+        fs::write(proj.path().join(".gitignore"), "notes.rs\n").unwrap();
+        fs::write(proj.path().join("notes.rs"), "// NGTOKEN\n").unwrap();
+
+        build_index_402(proj.path(), cache.path());
+
+        let json = query_json(proj.path(), cache.path(), "NGTOKEN");
+        let paths = result_paths(&json);
+
+        assert!(
+            !paths.iter().any(|p| p.contains("notes.rs")),
+            "AC5: notes.rs must NOT appear on a non-git root \
+             (union gate requires .git to exist); paths: {paths:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC7 (#402) — Zero-delta steady state (no perpetual rebuild loop)
+    // -------------------------------------------------------------------------
+    /// After building the index once (which unions secretdoc.md), a subsequent
+    /// query must complete WITHOUT triggering a rebuild. If the union set
+    /// diverged between the build path and the staleness-scan path (AD-379-1
+    /// violation), the second query would trigger `WorkingTreeChanged` every
+    /// time → perpetual rebuild loop.
+    ///
+    /// Discriminating: a "working tree changed" or "building index" line on
+    /// stderr on the SECOND query proves the loop would occur.
+    #[test]
+    fn ac7_zero_delta_steady_state() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        init_tracked_ignored_repo(proj.path(), "ZZUNIQUETOKEN");
+
+        // First query: cold cache → builds the index (union adds secretdoc.md).
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "ZZUNIQUETOKEN", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success();
+
+        // Second query: index is warm; must NOT rebuild.
+        let out = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "ZZUNIQUETOKEN", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // AD-379-1: the perpetual-rebuild-loop bug manifests as WorkingTreeChanged on
+        // every query, which emits "working tree changed" (staleness.rs:730).  The
+        // NoIndex arm emits "building index" (staleness.rs:688).  Either message on
+        // the SECOND query proves the loop.  Only asserting "building index" misses
+        // the WorkingTreeChanged path (PF-007 violation) — assert both.
+        assert!(
+            !stderr.contains("working tree changed") && !stderr.contains("building index"),
+            "AC7: second query must NOT trigger a rebuild (would be a perpetual loop); \
+             stderr:\n{stderr}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC12 (#402) — Exit codes and SKIM_DEBUG diagnostic
+    // -------------------------------------------------------------------------
+    #[test]
+    fn ac12_exit_codes_and_debug_line() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        init_tracked_ignored_repo(proj.path(), "ZZUNIQUETOKEN");
+
+        // Build with SKIM_DEBUG=1: must emit the "unioned N git-tracked file(s)" line.
+        let build_out = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "--build", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .env("SKIM_DEBUG", "1")
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let build_stderr = String::from_utf8_lossy(&build_out.stderr);
+        assert!(
+            build_stderr.contains("unioned") && build_stderr.contains("git-tracked file"),
+            "AC12(c): SKIM_DEBUG=1 build must emit the union diagnostic line; \
+             stderr:\n{build_stderr}"
+        );
+
+        // Hit query → exit 0.
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "ZZUNIQUETOKEN", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .code(0);
+
+        // Miss query → exit 0 (skim always exits 0 on no results).
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "NOTPRESENTTOKEN402", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .code(0);
+
+        // Rebuild without SKIM_DEBUG → union diagnostic line must NOT appear.
+        let cache2 = tempfile::tempdir().unwrap();
+        let rebuild_out = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "--build", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache2.path())
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let rebuild_stderr = String::from_utf8_lossy(&rebuild_out.stderr);
+        assert!(
+            !rebuild_stderr.contains("unioned") || !rebuild_stderr.contains("git-tracked file"),
+            "AC12(c) negative: without SKIM_DEBUG the union line must be absent; \
+             stderr:\n{rebuild_stderr}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC13 integration (ii) (#402) — cache MISS on mutated .git/index
+    // -------------------------------------------------------------------------
+    /// After `git add -f newsecret.md` (which rewrites `.git/index`), the next
+    /// query must find `newsecret.md` in results.
+    ///
+    /// Discriminating: if the memoization never invalidates (always returns the
+    /// cached list), the newly-added file stays missing → assertion fails.
+    #[test]
+    fn ac13_integration_recall_after_git_add() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        init_tracked_ignored_repo(proj.path(), "ZZUNIQUETOKEN");
+
+        // Build the initial index.
+        build_index_402(proj.path(), cache.path());
+
+        // Verify initial state: ZZUNIQUETOKEN found, NEWSECRETTOKEN not found.
+        let paths_before = result_paths(&query_json(proj.path(), cache.path(), "NEWSECRETTOKEN"));
+        assert!(
+            !paths_before.iter().any(|p| p.contains("newsecret.md")),
+            "AC13: newsecret.md must not appear before git add"
+        );
+
+        // Add a new tracked-but-.gitignored file (rewrites .git/index).
+        fs::write(proj.path().join("newsecret.md"), "NEWSECRETTOKEN\n").unwrap();
+        StdCommand::new("git")
+            .args(["add", "-f", "newsecret.md"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git add newsecret.md");
+
+        // Trigger a rebuild (the new file should force WorkingTreeChanged).
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "NEWSECRETTOKEN", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success();
+
+        // After rebuild, NEWSECRETTOKEN must be found.
+        let paths_after = result_paths(&query_json(proj.path(), cache.path(), "NEWSECRETTOKEN"));
+        assert!(
+            paths_after.iter().any(|p| p.contains("newsecret.md")),
+            "AC13: newsecret.md must appear after git add + rebuild \
+             (cache miss must re-enumerate); paths: {paths_after:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC1 (#402) — Real-repo dog-food: CLAUDE.md surfaces in search results
+    // -------------------------------------------------------------------------
+    /// `CLAUDE.md` is tracked in git but listed in `.gitignore` (line 26), so it
+    /// was silently excluded from `skim search` before #402.  After the union fix
+    /// it must appear when searching for a token that exists only in `CLAUDE.md`.
+    ///
+    /// Oracle: `git grep -l "byte-faithful contract"` → `CLAUDE.md`.
+    /// Discriminating (PF-007): reverting the union removes CLAUDE.md from the
+    /// ignore-walk results so it vanishes from the search output, failing this test.
+    #[test]
+    fn ac1_real_repo_byte_faithful_contract() {
+        // Resolve the workspace root from this crate's CARGO_MANIFEST_DIR.
+        // Integration tests live in `crates/rskim/tests/`, so CARGO_MANIFEST_DIR
+        // points to `.../crates/rskim`; two parent steps reach the workspace root.
+        let repo_root = {
+            let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            manifest
+                .parent() // .../crates
+                .expect("crates dir")
+                .parent() // workspace root
+                .expect("workspace root")
+                .to_path_buf()
+        };
+
+        // Guard: CLAUDE.md must exist and contain the oracle token, so the
+        // assertion below is non-vacuous.
+        let claude_path = repo_root.join("CLAUDE.md");
+        assert!(
+            claude_path.exists(),
+            "AC1 guard: CLAUDE.md must exist at {}",
+            claude_path.display()
+        );
+        let claude_content = fs::read_to_string(&claude_path).expect("read CLAUDE.md");
+        assert!(
+            claude_content.contains("byte-faithful contract"),
+            "AC1 guard: CLAUDE.md must contain the token 'byte-faithful contract' \
+             (oracle: git grep -l \"byte-faithful contract\" → CLAUDE.md)"
+        );
+
+        let cache = tempfile::tempdir().unwrap();
+
+        // Build the index from the real repo (union must surface CLAUDE.md).
+        build_index_402(&repo_root, cache.path());
+
+        // Query for the token — union must have indexed CLAUDE.md.
+        let json = query_json(&repo_root, cache.path(), "byte-faithful contract");
+        let paths = result_paths(&json);
+
+        assert!(
+            paths.iter().any(|p| p.ends_with("CLAUDE.md")),
+            "AC1: CLAUDE.md must appear in results for 'byte-faithful contract'; \
+             paths: {paths:?}\n\
+             (CLAUDE.md is tracked-but-.gitignored; the union must surface it — AD-402-1)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC8 (#402) — Existing index self-heals exactly once
+    // -------------------------------------------------------------------------
+    /// Simulates a "pre-union" manifest by building the index when `secretdoc.md`
+    /// is NOT yet tracked in git, then staging it with `git add -f`.
+    ///
+    /// On the FIRST subsequent query, `check_staleness` calls `walk_metadata`
+    /// (with union active), finds `secretdoc.md` as newly-added, returns
+    /// `WorkingTreeChanged { added: 1 }`, and triggers exactly one rebuild.
+    /// On the SECOND query the manifest already has `secretdoc.md` → `Current`
+    /// → no rebuild.
+    ///
+    /// Discriminating (PF-007): query #1 must emit the "working tree changed"
+    /// stderr line; query #2 must not — neither direction is a vacuous exit-0 check.
+    #[test]
+    fn ac8_pre_union_index_self_heals_once() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        // Set up a git repo with ONLY src/a.rs committed initially.
+        // `secretdoc.md` exists on disk but is NOT yet tracked.
+        StdCommand::new("git")
+            .args(["init"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git init");
+        StdCommand::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git config email");
+        StdCommand::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git config name");
+
+        fs::create_dir_all(proj.path().join("src")).unwrap();
+        fs::write(proj.path().join(".gitignore"), "secretdoc.md\n").unwrap();
+        fs::write(proj.path().join("secretdoc.md"), "ZZUNIQUETOKEN\n").unwrap();
+        fs::write(proj.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+
+        // Stage only src/a.rs and .gitignore — secretdoc.md NOT yet tracked.
+        StdCommand::new("git")
+            .args(["add", "src/a.rs", ".gitignore"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git add src/a.rs .gitignore");
+        StdCommand::new("git")
+            .args(["commit", "-m", "init without secretdoc"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git commit");
+
+        // Build the index (pre-union state: secretdoc.md is NOT tracked → not indexed).
+        build_index_402(proj.path(), cache.path());
+
+        // Now add secretdoc.md to the git index (rewrites .git/index → union sees it).
+        StdCommand::new("git")
+            .args(["add", "-f", "secretdoc.md"])
+            .current_dir(proj.path())
+            .output()
+            .expect("git add secretdoc.md");
+
+        // Query #1: staleness scan (via walk_metadata + union) finds secretdoc.md
+        // as "added" → WorkingTreeChanged → rebuild.  Discriminating: the
+        // "working tree changed" message must appear in stderr.
+        let out1 = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "ZZUNIQUETOKEN", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stderr1 = String::from_utf8_lossy(&out1.stderr);
+        assert!(
+            stderr1.contains("working tree changed"),
+            "AC8: query #1 must trigger a self-heal rebuild \
+             (staleness: working tree changed, 1 added); stderr:\n{stderr1}"
+        );
+
+        // Query #2: secretdoc.md is now in the manifest → Current → no rebuild.
+        // Discriminating: the staleness message must be absent (proves exactly one heal).
+        let out2 = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "ZZUNIQUETOKEN", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stderr2 = String::from_utf8_lossy(&out2.stderr);
+        assert!(
+            !stderr2.contains("working tree changed") && !stderr2.contains("building index"),
+            "AC8: query #2 must NOT trigger another rebuild (one-shot self-heal only); \
+             stderr:\n{stderr2}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Cross-plan composed dog-food: #400 + #402 compose (ADR-007)
+    // -------------------------------------------------------------------------
+    /// One fresh isolated SKIM_CACHE_DIR: (a) bad-root fails loud (#400 behavior)
+    /// AND (b) a tracked-but-.gitignored file surfaces in search (#402 behavior).
+    /// Proves the two fixes compose in the wave (applies ADR-007).
+    #[test]
+    fn cross_plan_400_402_compose() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        init_tracked_ignored_repo(proj.path(), "ZZUNIQUETOKEN");
+
+        // (a) #400: bad root fails with exit 1 + message.
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "foo", "--root", "/does/not/exist_402_compose"])
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("Pass the directory to index"));
+
+        // (b) #402: tracked-but-.gitignored file found.
+        build_index_402(proj.path(), cache.path());
+        let paths = result_paths(&query_json(proj.path(), cache.path(), "ZZUNIQUETOKEN"));
+        assert!(
+            paths.iter().any(|p| p.contains("secretdoc.md")),
+            "cross-plan: secretdoc.md must appear (tracked-union #402); paths: {paths:?}"
+        );
+    }
+}

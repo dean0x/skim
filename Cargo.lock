@@ -2412,6 +2412,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "filetime",
+ "gix",
  "globset",
  "ignore",
  "indicatif",

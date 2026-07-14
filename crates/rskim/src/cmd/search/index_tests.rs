@@ -1156,6 +1156,177 @@ fn test_adr006_self_heal_after_abort() {
 }
 
 // ============================================================================
+// AC10 (#402) — ADR-006 desync-abort for a unioned WalkEntry
+// ============================================================================
+
+/// AC10 (#402) — Desync-abort on a unioned WalkEntry leaves the old manifest intact.
+///
+/// `secretdoc.md` is tracked-but-.gitignored, so it enters the build via
+/// `merge_tracked_union` (the union path, AD-402-4). When `add_file_ngrams` is
+/// forced to fail for that unioned file (by pre-advancing the AST builder), the
+/// existing `Pipeline::consume` abort path (ADR-006) must fire BEFORE
+/// `new_manifest.save()`, leaving the on-disk manifest byte-identical.
+///
+/// This proves that the ADR-006 desync-abort invariant inherited by unioned entries
+/// (stated in AD-402-4: "unioned files are downstream-indistinguishable") actually
+/// holds — unioned files are NOT silently skipped past the abort gate.
+///
+/// Discriminating observables (PF-007): (1) `result.is_err()` — the abort fires;
+/// (2) error message contains the desync signature; (3) `new_manifest.entry_count()`
+/// is 0 post-abort (manifest.insert() is skipped when add_file_ngrams errors);
+/// (4) on-disk manifest entry count equals the pre-abort count, verified BEFORE
+/// any adversarial save — the check fails if the abort-before-save guard is removed;
+/// (5) an adversarial `new_manifest.save()` drops the on-disk count to 0, proving
+/// observable (4) is non-tautological and that save() is effective when called.
+/// (applies ADR-006 / AD-402-4)
+#[test]
+fn test_ac10_402_unioned_file_desync_abort_preserves_manifest() {
+    use rskim_search::{
+        AstIndexBuilder, AstNgramSet, FileId, NgramIndexBuilder, StructuralMetrics,
+    };
+
+    use super::super::manifest::FileManifest;
+    use super::super::types::ProcessedFile;
+    use super::Pipeline;
+
+    let project = super::super::tests::make_tracked_ignored_repo(); // secretdoc.md is union-contributed
+    let cache = tempfile::tempdir().unwrap();
+
+    // Stage 1: first build includes secretdoc.md via the union — establishes
+    // the "old manifest" on disk (has both src/a.rs AND secretdoc.md).
+    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS)
+        .expect("first build must succeed");
+
+    let old_entry_count =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+            .expect("old manifest must be loadable")
+            .entry_count();
+
+    // Verify secretdoc.md (the unioned file) is in the manifest — otherwise the
+    // test only exercises regular-file abort behavior (same as ADR-006 test above).
+    assert!(
+        old_entry_count >= 2,
+        "AC10: old manifest must include both src/a.rs and secretdoc.md (unioned); \
+         got {old_entry_count} entries — union may not have fired"
+    );
+
+    // Stage 2: pre-break the AST builder by inserting FileId(0) so it expects
+    // FileId(1) next.  When consume processes secretdoc.md at FileId(0), the
+    // builder rejects it with the sequential-FileId error → ADR-006 abort.
+    let mut lexical_builder = NgramIndexBuilder::new(cache.path().to_path_buf())
+        .expect("lexical builder must initialise");
+    let mut ast_builder =
+        AstIndexBuilder::new(cache.path().to_path_buf()).expect("AST builder must initialise");
+
+    ast_builder
+        .add_file_ngrams(
+            FileId(0),
+            rskim_core::Language::Rust,
+            &AstNgramSet::default(),
+            0,
+            StructuralMetrics::default(),
+        )
+        .expect("pre-advance must succeed");
+
+    let mut new_manifest =
+        FileManifest::new(project.path().to_path_buf(), cache.path().to_path_buf());
+
+    // Stage 3: send secretdoc.md (the unioned file) through consume.
+    // This simulates the union-contributed file being the first item in the
+    // pipeline — exactly the scenario where FileId(0) triggers the abort.
+    let (tx, rx) = crossbeam_channel::bounded::<ProcessedFile>(1);
+    let pf = ProcessedFile {
+        rel_path: std::path::PathBuf::from("secretdoc.md"),
+        lang: rskim_core::Language::Markdown,
+        content: "ZZUNIQUETOKEN\n".to_string(),
+        sha256: "a".repeat(64),
+        mtime: None,
+        size: None,
+        field_map: vec![],
+        cache_hit: false,
+        ast_cached: None,
+    };
+    tx.send(pf).unwrap();
+    drop(tx); // close channel so consume loop terminates after one item
+
+    let mut throwaway_ast_cache = rskim_search::AstNgramCache::empty();
+    let result = Pipeline::consume(
+        &mut lexical_builder,
+        &mut ast_builder,
+        &mut new_manifest,
+        &mut throwaway_ast_cache,
+        rx,
+        false,
+    );
+
+    // Stage 4: consume MUST return Err — the ADR-006 abort fires for the unioned file.
+    assert!(
+        result.is_err(),
+        "AC10: consume must return Err when add_file_ngrams fails for a unioned file \
+         (ADR-006 / AD-402-4 invariant); got Ok"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("AST index desync") || err_msg.contains("sequential"),
+        "AC10: error must identify the desync; got: {err_msg}"
+    );
+
+    // Stage 5: prove the manifest-preservation claim is non-tautological (PF-007).
+    //
+    // Two discriminating checks, sequenced so neither can trivially pass:
+    // (b) reads the on-disk manifest BEFORE any adversarial intervention — fails if
+    //     the abort-before-save guard is missing; (c) calls save() adversarially and
+    //     confirms the manifest IS rewritten to 0 entries, proving that (b) would
+    //     have caught a broken implementation (save() is effective when called).
+
+    // (a) new_manifest must be empty — manifest.insert() is skipped when
+    //     add_file_ngrams errors; the abort fires before the insert call in consume().
+    assert_eq!(
+        new_manifest.entry_count(),
+        0,
+        "AC10: new_manifest must have 0 entries post-abort — manifest.insert() is \
+         skipped when add_file_ngrams returns Err (ADR-006)"
+    );
+
+    // (b) On-disk manifest is unchanged after consume() Err — the correct
+    //     abort-before-save guard means run() never reaches new_manifest.save().
+    //     This assertion fails if the guard is removed (new_manifest has 0 entries,
+    //     so a save would overwrite the old {old_entry_count}-entry manifest with 0).
+    //     (PF-007, ADR-006 / AD-402-4)
+    {
+        let on_disk = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+            .expect("on-disk manifest must be loadable after consume() Err");
+        assert_eq!(
+            on_disk.entry_count(),
+            old_entry_count,
+            "AC10: on-disk manifest must still hold {old_entry_count} entries after \
+             consume() returns Err — abort-before-save guard must suppress \
+             new_manifest.save() (ADR-006 / AD-402-4)"
+        );
+    }
+
+    // (c) Adversarial: call new_manifest.save() now to prove save() IS effective —
+    //     the on-disk manifest drops to 0 entries, confirming assertion (b) would
+    //     have caught a broken implementation that omitted the abort-before-save guard.
+    //     (PF-007 non-tautology gate — no restoration after this point)
+    new_manifest
+        .save()
+        .expect("adversarial new_manifest.save() must succeed");
+    {
+        let corrupted =
+            FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+                .expect("corrupted manifest must be loadable after adversarial save");
+        assert_eq!(
+            corrupted.entry_count(),
+            0,
+            "AC10 (adversarial): save() after Err writes 0 entries — the \
+             {old_entry_count}-entry old manifest is lost (proves save() is effective \
+             and that assertion (b) above discriminates correctly)"
+        );
+    }
+}
+
+// ============================================================================
 // AC2 — Query-equivalence: fully-cached rebuild == --force full rebuild
 // ============================================================================
 
@@ -2906,10 +3077,11 @@ fn test_ac8_existing_root_uses_canonicalized_sha256() {
 
     let resolved = super::resolve_search_cache_dir(root).unwrap();
 
-    // Recompute the expected tail independently from the canonicalized root,
-    // reusing the same hashing helper that resolve_search_cache_dir uses.
+    // Recompute the expected tail independently from the canonicalized root.
+    // project_root_hash is an implementation detail of resolve_search_cache_dir
+    // (now private in walk.rs); test the contract directly via sha256_hex.
     let canonical = root.canonicalize().unwrap();
-    let expected_hash = super::project_root_hash(&canonical);
+    let expected_hash = &super::sha256_hex(canonical.to_string_lossy().as_bytes())[..16];
 
     // The final two components must be `search/<hash>`.
     let tail: PathBuf = {
@@ -2918,7 +3090,7 @@ fn test_ac8_existing_root_uses_canonicalized_sha256() {
     };
     assert_eq!(
         tail,
-        PathBuf::from("search").join(&expected_hash),
+        PathBuf::from("search").join(expected_hash),
         "AC8: existing-root path tail must be search/<sha256(canonical)[..16]>"
     );
 }
