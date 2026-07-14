@@ -1159,49 +1159,6 @@ fn test_adr006_self_heal_after_abort() {
 // AC10 (#402) — ADR-006 desync-abort for a unioned WalkEntry
 // ============================================================================
 
-/// Create a real git repo with a tracked-but-.gitignored file, so the union
-/// path (`merge_tracked_union`) includes `secretdoc.md` in the walk output.
-/// Used by `test_ac10_402_*` below.
-fn make_tracked_ignored_project() -> TempDir {
-    use std::process::Command as StdCmd;
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-
-    StdCmd::new("git")
-        .args(["init"])
-        .current_dir(root)
-        .output()
-        .expect("git init");
-    StdCmd::new("git")
-        .args(["config", "user.email", "test@example.com"])
-        .current_dir(root)
-        .output()
-        .expect("git config email");
-    StdCmd::new("git")
-        .args(["config", "user.name", "Test"])
-        .current_dir(root)
-        .output()
-        .expect("git config name");
-
-    fs::create_dir_all(root.join("src")).unwrap();
-    fs::write(root.join(".gitignore"), "secretdoc.md\n").unwrap();
-    fs::write(root.join("secretdoc.md"), "ZZUNIQUETOKEN\n").unwrap();
-    fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
-
-    StdCmd::new("git")
-        .args(["add", "-f", "secretdoc.md", "src/a.rs", ".gitignore"])
-        .current_dir(root)
-        .output()
-        .expect("git add");
-    StdCmd::new("git")
-        .args(["commit", "-m", "init"])
-        .current_dir(root)
-        .output()
-        .expect("git commit");
-
-    dir
-}
-
 /// AC10 (#402) — Desync-abort on a unioned WalkEntry leaves the old manifest intact.
 ///
 /// `secretdoc.md` is tracked-but-.gitignored, so it enters the build via
@@ -1226,7 +1183,7 @@ fn test_ac10_402_unioned_file_desync_abort_preserves_manifest() {
     use super::super::types::ProcessedFile;
     use super::Pipeline;
 
-    let project = make_tracked_ignored_project(); // secretdoc.md is union-contributed
+    let project = super::super::tests::make_tracked_ignored_repo(); // secretdoc.md is union-contributed
     let cache = tempfile::tempdir().unwrap();
 
     // Stage 1: first build includes secretdoc.md via the union — establishes

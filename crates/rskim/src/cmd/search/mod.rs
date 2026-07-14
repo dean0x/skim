@@ -2177,6 +2177,54 @@ mod tests {
         staleness::create_real_git_repo(dir, commit_specs)
     }
 
+    /// Shared helper for #402 unit tests: create a real git repo with a
+    /// tracked-but-.gitignored file, used by both `walk_tests` and `index_tests`
+    /// (eliminates the two near-byte-identical per-module copies that matched the
+    /// per-module helper convention but lived in the SAME rskim crate).
+    ///
+    /// Layout after init + commit:
+    /// ```text
+    /// root/
+    ///   .gitignore       <- contains "secretdoc.md"
+    ///   secretdoc.md     <- tracked via `git add -f`; content = "ZZUNIQUETOKEN"
+    ///   src/a.rs         <- regular tracked file
+    /// ```
+    pub(crate) fn make_tracked_ignored_repo() -> tempfile::TempDir {
+        use std::process::Command as StdCmd;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        StdCmd::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .expect("git init");
+        StdCmd::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(root)
+            .output()
+            .expect("git config email");
+        StdCmd::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(root)
+            .output()
+            .expect("git config name");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".gitignore"), "secretdoc.md\n").unwrap();
+        std::fs::write(root.join("secretdoc.md"), "ZZUNIQUETOKEN\n").unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+        StdCmd::new("git")
+            .args(["add", "-f", "secretdoc.md", "src/a.rs", ".gitignore"])
+            .current_dir(root)
+            .output()
+            .expect("git add");
+        StdCmd::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(root)
+            .output()
+            .expect("git commit");
+        dir
+    }
+
     /// BUG A discriminating test: after `skim search --rebuild` on a git repo with
     /// ≥2 commits, temporal.db MUST exist, contain non-empty hotspots, and
     /// META_GIT_HEAD MUST equal the repo HEAD.

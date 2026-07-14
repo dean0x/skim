@@ -910,55 +910,6 @@ fn test_small_long_line_file_is_indexed() {
 // #402 — git-tracked union (AC6, AC9, AC11, AC13 unit)
 // ============================================================================
 
-/// Shared helper: create a real git repo with a tracked-but-.gitignored file.
-///
-/// Layout after init + commit:
-/// ```
-/// root/
-///   .gitignore       <- contains "secretdoc.md"
-///   secretdoc.md     <- tracked via `git add -f`; content = "ZZUNIQUETOKEN"
-///   src/a.rs         <- regular tracked file
-/// ```
-fn make_tracked_ignored_repo() -> tempfile::TempDir {
-    use std::process::Command as StdCommand;
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-
-    StdCommand::new("git")
-        .args(["init"])
-        .current_dir(root)
-        .output()
-        .expect("git init");
-    StdCommand::new("git")
-        .args(["config", "user.email", "test@example.com"])
-        .current_dir(root)
-        .output()
-        .expect("git config email");
-    StdCommand::new("git")
-        .args(["config", "user.name", "Test"])
-        .current_dir(root)
-        .output()
-        .expect("git config name");
-
-    fs::create_dir_all(root.join("src")).unwrap();
-    fs::write(root.join(".gitignore"), "secretdoc.md\n").unwrap();
-    fs::write(root.join("secretdoc.md"), "ZZUNIQUETOKEN\n").unwrap();
-    fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
-
-    StdCommand::new("git")
-        .args(["add", "-f", "secretdoc.md", "src/a.rs", ".gitignore"])
-        .current_dir(root)
-        .output()
-        .expect("git add");
-    StdCommand::new("git")
-        .args(["commit", "-m", "init"])
-        .current_dir(root)
-        .output()
-        .expect("git commit");
-
-    dir
-}
-
 /// AC6 (#402) — Determinism: two consecutive `walk_metadata` calls on a repo
 /// with a tracked-but-.gitignored file return byte-identical `rel_path` sequences.
 ///
@@ -967,7 +918,7 @@ fn make_tracked_ignored_repo() -> tempfile::TempDir {
 /// same membership AND the same order (sort by normalize_rel_path, ascending).
 #[test]
 fn test_ac6_402_walk_metadata_determinism_with_union() {
-    let dir = make_tracked_ignored_repo();
+    let dir = super::super::tests::make_tracked_ignored_repo();
     let root = dir.path().canonicalize().unwrap();
 
     let (entries1, _) = walk_metadata(&root, 50_000).unwrap();
@@ -1003,7 +954,7 @@ fn test_ac6_402_walk_metadata_determinism_with_union() {
 /// union must not break that guarantee.
 #[test]
 fn test_ac9_402_walk_metadata_never_unions_dot_git() {
-    let dir = make_tracked_ignored_repo();
+    let dir = super::super::tests::make_tracked_ignored_repo();
     let root = dir.path().canonicalize().unwrap();
 
     let (entries, _) = walk_metadata(&root, 50_000).unwrap();
@@ -1064,24 +1015,18 @@ fn test_ac11_402_classify_tracked_path_symlink_transparent() {
 ///
 /// AC13 unit (ii) — After `git add -f newsecret.md` (which rewrites
 /// `.git/index`), the NEXT call is a cache MISS and enumerates the new file.
-#[serial_test::serial]
 #[test]
 fn test_ac13_402_memo_cache_hit_and_miss() {
-    let dir = make_tracked_ignored_repo();
+    let dir = super::super::tests::make_tracked_ignored_repo();
     let root = dir.path().canonicalize().unwrap();
 
-    // We need the search cache dir to exist so the sidecar write succeeds.
-    // Use a dedicated isolated SKIM_CACHE_DIR.
+    // Use an isolated temp dir as the sidecar cache and pass it directly to
+    // tracked_files_memoized — no SKIM_CACHE_DIR mutation needed, eliminating
+    // the concurrent-setenv/getenv data-race window (#[serial] only serialises
+    // against other #[serial] tests, not against parallel non-serial ones).
+    // The tempdir already exists, so no create_dir_all is required.
     let cache_tmp = tempfile::tempdir().unwrap();
-    // SAFETY: test-only, serialized by #[serial_test::serial]; no other thread
-    // reads SKIM_CACHE_DIR concurrently during this critical section.
-    unsafe { std::env::set_var("SKIM_CACHE_DIR", cache_tmp.path()) };
-
-    // Create the cache dir so the sidecar write doesn't fail silently.
-    // resolve_search_cache_dir is now in walk.rs (breaking the former walk→index
-    // import cycle — finding: walk-index-cyclic-coupling).
-    let cache_dir = super::resolve_search_cache_dir(&root).unwrap();
-    fs::create_dir_all(&cache_dir).unwrap();
+    let cache_dir = cache_tmp.path().to_path_buf();
 
     // Reset the per-thread test counter.
     super::ENUM_CALL_COUNT.with(|c| c.set(0));
@@ -1144,10 +1089,6 @@ fn test_ac13_402_memo_cache_hit_and_miss() {
         "AC13(ii): newsecret.md must appear after cache miss + re-enumeration; \
          paths: {paths3:?}"
     );
-
-    // Restore environment (serial guard ensures no parallel interference).
-    // SAFETY: test-only, serialized by #[serial_test::serial].
-    unsafe { std::env::remove_var("SKIM_CACHE_DIR") };
 }
 
 /// resolve_git_index_path: regular repo returns .git/index, linked worktree
