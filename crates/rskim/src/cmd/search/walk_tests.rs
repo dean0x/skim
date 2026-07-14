@@ -1246,6 +1246,53 @@ fn test_parse_tracked_union_cache_corrupt_and_truncated() {
     );
 }
 
+/// Regression guard for the sidecar-lossy-round-trip fix (AD-379-1).
+///
+/// `format_tracked_union_cache` encodes paths via `OsStrExt::as_bytes` on Unix
+/// so that non-UTF-8 filenames survive the sidecar write → read cycle
+/// byte-losslessly.  If the implementation regressed to `to_string_lossy`, each
+/// `\xFF` or `\xFE` byte would become the three-byte UTF-8 sequence `\xEF\xBF\xBD`
+/// (U+FFFD replacement character), making the round-trip assertion below fail.
+///
+/// PF-007: all paths in `test_parse_tracked_union_cache_corrupt_and_truncated`
+/// are ASCII, so that test would pass even after such a regression.  This test
+/// feeds a non-UTF-8 `PathBuf` through the full format→parse pipeline and
+/// asserts that the raw `OsStr` bytes are preserved.
+#[cfg(unix)]
+#[test]
+fn test_format_parse_tracked_union_cache_non_utf8_round_trip() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    // Raw bytes that are NOT valid UTF-8 (0xFF, 0xFE are illegal UTF-8 lead bytes).
+    // On Linux/macOS, filenames with such bytes are legal at the OS level.
+    let raw_bytes: &[u8] = b"\xFF\xFEnon_utf8_file.rs";
+    let non_utf8_path = PathBuf::from(OsStr::from_bytes(raw_bytes));
+
+    // Serialize via format_tracked_union_cache — must use OsStrExt::as_bytes.
+    let formatted = super::format_tracked_union_cache(1_000_000, 4096, &[non_utf8_path]);
+
+    // Deserialize via parse_tracked_union_cache — must use OsStr::from_bytes.
+    let parsed = super::parse_tracked_union_cache(&formatted, 1_000_000, 4096)
+        .expect("format→parse round-trip must succeed for a non-UTF-8 path");
+
+    assert_eq!(parsed.len(), 1, "round-trip must produce exactly one path");
+
+    // The critical assertion: raw OsStr bytes must be bit-identical after the
+    // sidecar round-trip.  A regression to to_string_lossy would encode \xFF as
+    // \xEF\xBF\xBD (U+FFFD in UTF-8), making this assertion fail and proving that
+    // AD-379-1 build↔scan set-identity would be broken for non-UTF-8 filenames
+    // (they would be silently dropped from the union on any subsequent query that
+    // hit the sidecar cache).
+    assert_eq!(
+        parsed[0].as_os_str().as_bytes(),
+        raw_bytes,
+        "non-UTF-8 path bytes must survive format→parse byte-losslessly \
+         (AD-379-1 / sidecar-lossy-round-trip fix); a regression to \
+         to_string_lossy replaces \\xFF/\\xFE with U+FFFD here"
+    );
+}
+
 /// list_tracked_files: SKIP_WORKTREE entries are excluded from the result.
 ///
 /// `git update-index --skip-worktree <file>` marks a committed file as
@@ -1448,5 +1495,124 @@ fn test_merge_tracked_union_no_duplicate_skip_for_already_skipped() {
         huge_skip_count, 1,
         "huge.rs must appear in the skip list exactly once \
          (no duplicate from union re-classification); all skips: {skips:?}"
+    );
+}
+
+/// merge_tracked_union sort+truncate branch fires when walked ∪ tracked > max_files.
+///
+/// AC6 (#402) only verifies determinism at max_files=50_000, so the `entries.sort`
+/// + `entries.truncate(max_files)` branch in `merge_tracked_union` is never
+/// exercised with union entries actually present AND the cap actually binding.
+///
+/// PF-012: selection is "the max_files smallest keys over the complete candidate
+/// set" (an order-invariant SET function), not "the first max_files visited".
+/// This test verifies the post-union truncation keeps the SMALLEST-keyed entries
+/// and drops the LARGEST-keyed ones, even when those larger entries were produced
+/// by the ignore-walk and the smaller ones came via the tracked union.
+///
+/// Setup:
+///   - `.gitignore` hides `a_secret.rs` and `b_secret.rs`; both are force-added
+///     so they appear in the git index → tracked union adds them.
+///   - Walk finds: `c_visible.rs`, `d_visible.rs`, `e_visible.rs` (3 entries).
+///   - max_files = 3: walk fills the cap; union adds 2 more → 5 total.
+///   - sort+truncate(3) → [a_secret.rs, b_secret.rs, c_visible.rs].
+///   - `d_visible.rs` and `e_visible.rs` (the two largest keys) are dropped.
+#[test]
+fn test_merge_tracked_union_truncates_to_smallest_k() {
+    use std::process::Command as StdCmd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root_path = dir.path();
+
+    let git = |args: &[&str]| {
+        StdCmd::new("git")
+            .args(args)
+            .current_dir(root_path)
+            .output()
+            .unwrap()
+    };
+
+    git(&["init"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "T"]);
+
+    // .gitignore hides a_secret.rs and b_secret.rs from the ignore-walk, so
+    // those files can only enter via the tracked union path.
+    fs::write(root_path.join(".gitignore"), "a_secret.rs\nb_secret.rs\n").unwrap();
+    fs::write(root_path.join("a_secret.rs"), "fn a() {}\n").unwrap();
+    fs::write(root_path.join("b_secret.rs"), "fn b() {}\n").unwrap();
+    // These three files are NOT gitignored; the ignore-walk finds all of them.
+    fs::write(root_path.join("c_visible.rs"), "fn c() {}\n").unwrap();
+    fs::write(root_path.join("d_visible.rs"), "fn d() {}\n").unwrap();
+    fs::write(root_path.join("e_visible.rs"), "fn e() {}\n").unwrap();
+
+    // Force-add the gitignored files so they appear in the git index.
+    git(&[
+        "add",
+        "-f",
+        ".gitignore",
+        "a_secret.rs",
+        "b_secret.rs",
+        "c_visible.rs",
+        "d_visible.rs",
+        "e_visible.rs",
+    ]);
+    git(&["commit", "-m", "init"]);
+
+    let root = root_path.canonicalize().unwrap();
+
+    // max_files = 3.  Walk produces [c_visible.rs, d_visible.rs, e_visible.rs]
+    // (the only non-gitignored source files, 3 total — exactly filling the cap).
+    // Tracked union adds a_secret.rs and b_secret.rs → 5 total.
+    // merge_tracked_union: sort_by_cached_key → truncate(3)
+    //   → [a_secret.rs, b_secret.rs, c_visible.rs].
+    // d_visible.rs and e_visible.rs (the two largest normalize_rel_path keys)
+    // must be dropped.
+    let (entries, _) = walk_metadata(&root, 3, None).unwrap();
+
+    let keys: Vec<String> = entries
+        .iter()
+        .map(|e| normalize_rel_path(&e.rel_path))
+        .collect();
+
+    assert_eq!(
+        keys.len(),
+        3,
+        "after union+truncation to max_files=3 the result must contain exactly 3 entries; \
+         got: {keys:?}"
+    );
+
+    // The three smallest normalize_rel_path keys must be retained.
+    assert!(
+        keys.iter().any(|k| k == "a_secret.rs"),
+        "a_secret.rs (union entry, smallest key 'a') must be retained; keys: {keys:?}"
+    );
+    assert!(
+        keys.iter().any(|k| k == "b_secret.rs"),
+        "b_secret.rs (union entry, second-smallest key 'b') must be retained; keys: {keys:?}"
+    );
+    assert!(
+        keys.iter().any(|k| k == "c_visible.rs"),
+        "c_visible.rs (third-smallest key 'c') must be retained; keys: {keys:?}"
+    );
+
+    // The two largest-keyed entries must be absent — dropped by truncation.
+    // These were produced by the ignore-walk; the union entries displaced them.
+    assert!(
+        !keys.iter().any(|k| k == "d_visible.rs"),
+        "d_visible.rs must be dropped by truncation (4th-smallest key); keys: {keys:?}"
+    );
+    assert!(
+        !keys.iter().any(|k| k == "e_visible.rs"),
+        "e_visible.rs must be dropped by truncation (largest key); keys: {keys:?}"
+    );
+
+    // Entries must be sorted ascending by normalize_rel_path (AD-402-2 / PF-012).
+    let mut sorted_keys = keys.clone();
+    sorted_keys.sort();
+    assert_eq!(
+        keys, sorted_keys,
+        "walk_metadata must return entries sorted ascending by normalize_rel_path \
+         after union+truncation (AD-402-2 / PF-012)"
     );
 }
