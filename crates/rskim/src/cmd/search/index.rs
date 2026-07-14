@@ -1088,8 +1088,7 @@ pub(super) fn resolve_search_cache_dir(root: &Path) -> anyhow::Result<PathBuf> {
     let canonical = root.canonicalize().map_err(|e| {
         anyhow::anyhow!("failed to canonicalize search root {}: {e}", root.display())
     })?;
-    let hash = project_root_hash(&canonical);
-    Ok(base.join("search").join(hash))
+    Ok(base.join("search").join(project_root_hash(&canonical)))
 }
 
 /// Compute a 16-char hex prefix of the SHA-256 of the canonical project root path.

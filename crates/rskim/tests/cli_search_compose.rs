@@ -432,6 +432,25 @@ mod root_validation_400 {
     use predicates::prelude::*;
     use std::fs;
 
+    /// Assert that the `search/` subtree of `cache` contains no hash subdirs.
+    /// AC2 and AC3 share this check (PF-007 discriminating for the funnel bail).
+    fn assert_no_cache_subdirs(cache: &std::path::Path, label: &str) {
+        let search_dir = cache.join("search");
+        if search_dir.exists() {
+            let subdirs: Vec<_> = fs::read_dir(&search_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .collect();
+            assert!(
+                subdirs.is_empty(),
+                "{label}: no search/<hash>/ dirs must be created for a bad root; \
+                 found: {:?}",
+                subdirs.iter().map(|e| e.path()).collect::<Vec<_>>()
+            );
+        }
+    }
+
     // -------------------------------------------------------------------------
     // AC1 (#400) — non-existent --root fails loud with the full message triple
     // -------------------------------------------------------------------------
@@ -464,30 +483,13 @@ mod root_validation_400 {
             .unwrap()
             .args(["search", "foo", "--root", "/does/not/exist_400"])
             .env("SKIM_CACHE_DIR", cache.path())
-            .output()
-            .unwrap();
-
-        // Must fail
-        assert!(
-            !output.status.success(),
-            "AC2 precondition: bad root must exit nonzero"
-        );
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
 
         // search/ subdir must not exist or must have zero sub-dirs
-        let search_dir = cache.path().join("search");
-        if search_dir.exists() {
-            let subdirs: Vec<_> = fs::read_dir(&search_dir)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                .collect();
-            assert!(
-                subdirs.is_empty(),
-                "AC2: no search/<hash>/ dirs must be created for a bad root; \
-                 found: {:?}",
-                subdirs.iter().map(|e| e.path()).collect::<Vec<_>>()
-            );
-        }
+        assert_no_cache_subdirs(cache.path(), "AC2");
 
         // Stderr must NOT contain "building index" (funnel bailed before create_dir_all)
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -507,41 +509,18 @@ mod root_validation_400 {
         let cache = tempfile::tempdir().unwrap();
         let tmp_file = tempfile::NamedTempFile::new().unwrap();
 
-        let output = Command::cargo_bin("skim")
+        Command::cargo_bin("skim")
             .unwrap()
             .args(["search", "foo", "--root"])
             .arg(tmp_file.path())
             .env("SKIM_CACHE_DIR", cache.path())
             .assert()
             .failure()
-            .get_output()
-            .clone();
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("is not a directory"),
-            "AC3: stderr must contain 'is not a directory'; got:\n{stderr}"
-        );
-        assert!(
-            stderr.contains("Pass the directory to index"),
-            "AC3: stderr must contain 'Pass the directory to index'; got:\n{stderr}"
-        );
+            .stderr(predicate::str::contains("is not a directory"))
+            .stderr(predicate::str::contains("Pass the directory to index"));
 
         // No cache hash dir created for a file root
-        let search_dir = cache.path().join("search");
-        if search_dir.exists() {
-            let subdirs: Vec<_> = fs::read_dir(&search_dir)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                .collect();
-            assert!(
-                subdirs.is_empty(),
-                "AC3: no search/<hash>/ dirs must be created for a file root; \
-                 found: {:?}",
-                subdirs.iter().map(|e| e.path()).collect::<Vec<_>>()
-            );
-        }
+        assert_no_cache_subdirs(cache.path(), "AC3");
     }
 
     // -------------------------------------------------------------------------
@@ -808,13 +787,10 @@ mod root_validation_400 {
             .unwrap()
             .args(["search", "foo", "--root", "/does/not/exist_400"])
             .env("SKIM_CACHE_DIR", cache.path())
-            .output()
-            .unwrap();
-
-        assert!(
-            !output.status.success(),
-            "AC11 precondition: bad root must exit nonzero"
-        );
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !stderr.contains("building index"),
