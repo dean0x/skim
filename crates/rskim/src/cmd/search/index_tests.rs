@@ -3096,10 +3096,11 @@ fn test_ac8_existing_root_uses_canonicalized_sha256() {
 
     let resolved = super::resolve_search_cache_dir(root).unwrap();
 
-    // Recompute the expected tail independently from the canonicalized root,
-    // reusing the same hashing helper that resolve_search_cache_dir uses.
+    // Recompute the expected tail independently from the canonicalized root.
+    // project_root_hash is an implementation detail of resolve_search_cache_dir
+    // (now private in walk.rs); test the contract directly via sha256_hex.
     let canonical = root.canonicalize().unwrap();
-    let expected_hash = super::project_root_hash(&canonical);
+    let expected_hash = &super::sha256_hex(canonical.to_string_lossy().as_bytes())[..16];
 
     // The final two components must be `search/<hash>`.
     let tail: PathBuf = {

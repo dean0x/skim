@@ -373,10 +373,15 @@ fn classify_metadata_core(
     }
 
     let mtime = meta_opt.as_ref().and_then(mtime_from_meta);
-    let rel_path = abs_path
-        .strip_prefix(root)
-        .unwrap_or(abs_path)
-        .to_path_buf();
+    // Security: if abs_path escapes root (e.g. via a crafted git index `..`
+    // entry that slipped past the list_tracked_files filter), return Transparent
+    // rather than using the absolute path as rel_path.  Defense in depth —
+    // list_tracked_files filters ParentDir/RootDir before this point, so this
+    // arm fires only for unexpected escapes (AD-402-4 / path-containment).
+    let rel_path = match abs_path.strip_prefix(root) {
+        Ok(r) => r.to_path_buf(),
+        Err(_) => return ClassifyOutcome::Transparent,
+    };
 
     ClassifyOutcome::Accept(WalkEntry {
         abs_path: abs_path.to_path_buf(),
@@ -490,7 +495,17 @@ pub(super) fn walk_metadata(
     // upgrade — the staleness scan finds `added > 0` → `WorkingTreeChanged` →
     // one rebuild → stable thereafter. No index-format bump required.
     if root.join(".git").exists() {
-        let added = merge_tracked_union(root, max_files, &mut entries, &mut skips);
+        // Resolve cache dir once here and thread it to merge_tracked_union so
+        // tracked_files_memoized avoids a redundant canonicalize+SHA-256 per
+        // query (AD-402-6 / finding: tracked-memo-redundant-resolve).
+        let cache_dir = resolve_search_cache_dir(root).ok();
+        let added = merge_tracked_union(
+            root,
+            max_files,
+            &mut entries,
+            &mut skips,
+            cache_dir.as_deref(),
+        );
         if added > 0 && crate::debug::is_debug_enabled() {
             eprintln!(
                 "skim search [debug]: unioned {added} git-tracked file(s) the .gitignore walk skipped"
@@ -522,29 +537,39 @@ fn merge_tracked_union(
     max_files: usize,
     entries: &mut Vec<WalkEntry>,
     skips: &mut Vec<SkipReason>,
+    cache_dir: Option<&Path>,
 ) -> usize {
     // AD-402-6: use memoized enumeration — only re-parses gix index when
-    // .git/index has changed since the last call.
-    let Some(tracked) = tracked_files_memoized(root) else {
+    // .git/index has changed since the last call.  cache_dir is threaded from
+    // walk_metadata (computed once there) to avoid a redundant
+    // canonicalize+SHA-256 per query (finding: tracked-memo-redundant-resolve).
+    let Some(tracked) = tracked_files_memoized(root, cache_dir) else {
         // AD-402-3: enumeration failure → fail-soft, keep ignore-walk set alone.
         return 0;
     };
 
-    // Build a set of normalize_rel_path keys for already-walked entries so we
-    // can short-circuit paths the ignore-walk already yielded.
-    let mut yielded: HashSet<String> = entries
+    // Compute normalize_rel_path once per pre-existing entry.  `entry_keys` is
+    // kept parallel to `entries` so the sort can reuse these strings rather than
+    // re-running normalize_rel_path for every element (halves String-allocating
+    // replace() calls when added > 0 — finding: merge-double-normalize-perf).
+    let mut entry_keys: Vec<String> = entries
         .iter()
         .map(|e| normalize_rel_path(&e.rel_path))
         .collect();
+    // yielded uses cloned keys (cheap String::clone, not another replace()).
+    let mut yielded: HashSet<String> = entry_keys.iter().cloned().collect();
 
     let mut added = 0;
     for rel in tracked {
         let key = normalize_rel_path(&rel);
-        if !yielded.insert(key) {
+        if yielded.contains(&key) {
             continue; // already walked → skip (dedup by normalize_rel_path key)
         }
+        // Mark seen before classify so duplicate index entries don't re-classify.
+        yielded.insert(key.clone());
         match classify_tracked_path(&root.join(&rel), root) {
             ClassifyOutcome::Accept(entry) => {
+                entry_keys.push(key); // keep parallel to entries
                 entries.push(entry);
                 added += 1;
             }
@@ -560,11 +585,17 @@ fn merge_tracked_union(
     if added > 0 {
         // AD-402-2: Re-run the SAME top-K (smallest max_files keys, ascending)
         // so FileId↔sorted_paths and cross-run determinism hold (PF-012).
-        // sort_by_cached_key computes each key once (O(n log n));
-        // truncate enforces max_files without early-terminating the candidate
-        // set construction (avoids PF-012 violation).
-        entries.sort_by_cached_key(|e| normalize_rel_path(&e.rel_path));
-        entries.truncate(max_files);
+        // Reuse pre-computed entry_keys — no second normalize_rel_path pass.
+        // entry_keys and entries are parallel (same length, same order).
+        debug_assert_eq!(
+            entry_keys.len(),
+            entries.len(),
+            "entry_keys/entries out of sync in merge_tracked_union"
+        );
+        let mut pairs: Vec<_> = entry_keys.into_iter().zip(entries.drain(..)).collect();
+        pairs.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        pairs.truncate(max_files);
+        *entries = pairs.into_iter().map(|(_, e)| e).collect();
     }
     added
 }
@@ -588,7 +619,7 @@ fn merge_tracked_union(
 /// cache and force a fresh gix read. The memo skips only the re-parse, not the
 /// top-K merge, so AD-379-1 build↔scan set-identity and PF-012 determinism
 /// are unaffected.
-fn tracked_files_memoized(root: &Path) -> Option<Vec<PathBuf>> {
+fn tracked_files_memoized(root: &Path, cache_dir: Option<&Path>) -> Option<Vec<PathBuf>> {
     let git_index_path = root.join(".git").join("index");
 
     // Stat .git/index for the fingerprint. If missing (newly-init repo with no
@@ -601,12 +632,22 @@ fn tracked_files_memoized(root: &Path) -> Option<Vec<PathBuf>> {
     let mtime_secs = mtime_from_meta(&git_meta).unwrap_or(0);
     let len_bytes = git_meta.len();
 
-    // Resolve the per-root cache dir (fail-soft: fall through to live call).
-    let cache_dir = match super::index::resolve_search_cache_dir(root) {
-        Ok(d) => d,
-        Err(_) => return list_tracked_files(root),
+    // Use the caller-supplied cache dir if available (threaded from walk_metadata
+    // to avoid a redundant canonicalize+SHA-256 per query); otherwise resolve it
+    // here as a soft fallback.  AD-402-6: the sidecar is an optimization cache —
+    // failure to locate the dir simply forces a live gix re-enumeration.
+    let owned_dir;
+    let effective_cache_dir: &Path = match cache_dir {
+        Some(d) => d,
+        None => {
+            owned_dir = match resolve_search_cache_dir(root) {
+                Ok(d) => d,
+                Err(_) => return list_tracked_files(root),
+            };
+            &owned_dir
+        }
     };
-    let sidecar_path = cache_dir.join("tracked_union.cache");
+    let sidecar_path = effective_cache_dir.join("tracked_union.cache");
 
     // Cache HIT path: read and validate the sidecar.
     if let Ok(content) = fs::read_to_string(&sidecar_path)
@@ -669,6 +710,22 @@ fn list_tracked_files(root: &Path) -> Option<Vec<PathBuf>> {
         // `PathBuf::from` a single unambiguous impl to call.
         let raw = entry.path(state);
         let path = PathBuf::from(raw.to_os_str_lossy().into_owned());
+        // Security: skip entries with `..` (ParentDir) or a leading `/`
+        // (RootDir/Prefix) components that would escape `root` after
+        // `root.join(&path)`.  Legitimate git index paths are always
+        // repo-toplevel-relative with no `..` or absolute prefix; a crafted
+        // `.git/index` could otherwise cause skim to read files outside the
+        // repository (path traversal / local information disclosure).
+        // `classify_metadata_core`'s strip_prefix guard is defense in depth.
+        use std::path::Component;
+        if path.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            continue;
+        }
         paths.push(path);
     }
     Some(paths)
@@ -676,15 +733,24 @@ fn list_tracked_files(root: &Path) -> Option<Vec<PathBuf>> {
 
 /// Serialize a tracked-file list to the sidecar cache format.
 ///
-/// Format: line 1 = `{mtime_secs} {len_bytes}` (space-separated decimal),
-/// then one repo-relative path per subsequent line (UTF-8 lossy).
+/// Format: `{mtime_secs} {len_bytes}\0` header, then one repo-relative path
+/// per subsequent NUL-terminated record (UTF-8 lossy).
+///
+/// NUL framing (git's own convention) is used instead of newline framing so
+/// that paths containing embedded `\n` characters round-trip correctly.
+/// Newline framing would produce a different tracked set on a cache HIT for
+/// such paths vs the authoritative live gix enumeration, violating the
+/// AD-379-1 build↔scan set-identity guarantee.  Existing sidecar files in the
+/// old newline format parse as a fingerprint mismatch (no NUL in header) →
+/// cache miss → harmless re-enumeration.
+///
 /// The file is an optimization cache with no format version; absent or corrupt
 /// → re-enumerate (fail-soft).
 fn format_tracked_union_cache(mtime_secs: u64, len_bytes: u64, paths: &[PathBuf]) -> String {
-    let mut out = format!("{mtime_secs} {len_bytes}\n");
+    let mut out = format!("{mtime_secs} {len_bytes}\0");
     for p in paths {
         out.push_str(&p.to_string_lossy());
-        out.push('\n');
+        out.push('\0');
     }
     out
 }
@@ -694,20 +760,23 @@ fn format_tracked_union_cache(mtime_secs: u64, len_bytes: u64, paths: &[PathBuf]
 /// Returns `Some(paths)` only when the header fingerprint matches
 /// `(expected_mtime, expected_len)` exactly. Returns `None` on any mismatch
 /// or parse error (corrupt/truncated sidecar → re-enumerate, fail-soft).
+///
+/// Paths are NUL-separated (see [`format_tracked_union_cache`] for rationale).
 fn parse_tracked_union_cache(
     content: &str,
     expected_mtime: u64,
     expected_len: u64,
 ) -> Option<Vec<PathBuf>> {
-    let mut lines = content.lines();
-    let header = lines.next()?;
-    let mut parts = header.splitn(2, ' ');
-    let mtime: u64 = parts.next()?.parse().ok()?;
-    let len: u64 = parts.next()?.parse().ok()?;
+    let mut parts = content.split('\0');
+    let header = parts.next()?;
+    let mut hparts = header.splitn(2, ' ');
+    let mtime: u64 = hparts.next()?.parse().ok()?;
+    let len: u64 = hparts.next()?.parse().ok()?;
     if mtime != expected_mtime || len != expected_len {
         return None; // fingerprint mismatch → cache miss
     }
-    Some(lines.map(PathBuf::from).collect())
+    // Trailing NUL produces an empty final part; filter it out.
+    Some(parts.filter(|s| !s.is_empty()).map(PathBuf::from).collect())
 }
 
 // ============================================================================
@@ -1111,6 +1180,41 @@ pub(super) fn minified_metric(content: &str) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// Resolve the per-project search cache directory.
+///
+/// Path: `{base_cache}/search/{sha256(canonical_root)[..16]}/`.
+/// The base is `SKIM_CACHE_DIR` (if set) or the platform cache dir.
+///
+/// AD-400-2 (supersedes AD-381-2): callers reach here only AFTER
+/// `resolve_root_and_cache` has validated that the root exists and is a
+/// directory (#400), so a `canonicalize()` failure now signals a real error
+/// and is propagated — the former pure-lexical fallback for non-existent roots
+/// (`canonical_or_normalized` / `lexically_normalize`) is removed. This
+/// remains a defensive backstop: any *internal* caller (e.g. the test-only
+/// `IndexCli` path, or `build_index_rechecked` with `cache_dir_override: None`)
+/// that supplies a non-existent root now fails loud here instead of silently
+/// hashing a ghost path.
+///
+/// Moved from `index.rs` to `walk.rs` so that both the discovery module (walk)
+/// and the build module (index) depend on this shared path helper without
+/// introducing a bidirectional import cycle (finding: walk-index-cyclic-coupling).
+pub(super) fn resolve_search_cache_dir(root: &Path) -> anyhow::Result<PathBuf> {
+    let base = crate::cmd::resolve_cache_dir()
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve skim cache directory"))?;
+    let canonical = root.canonicalize().map_err(|e| {
+        anyhow::anyhow!("failed to canonicalize search root {}: {e}", root.display())
+    })?;
+    Ok(base.join("search").join(project_root_hash(&canonical)))
+}
+
+/// Compute a 16-char hex prefix of the SHA-256 of the canonical project root path.
+///
+/// Used as a stable directory name in the search cache.
+fn project_root_hash(canonical_root: &Path) -> String {
+    let input = canonical_root.to_string_lossy();
+    sha256_hex(input.as_bytes())[..16].to_string()
 }
 
 /// Compute the SHA-256 of `data` and return it as a 64-character lowercase hex string.

@@ -40,6 +40,10 @@ use super::walk::{
     MAX_SKIP_REASONS, ReadOutcome, discover_project_root, minified_metric, normalize_rel_path,
     open_and_read, sha256_hex, walk_metadata,
 };
+// Re-export so `mod.rs` (and index_tests.rs via super::) continue to reach the
+// function as `index::resolve_search_cache_dir`.  The definition moved to walk.rs
+// to break the former bidirectional import cycle (finding: walk-index-cyclic-coupling).
+pub(super) use super::walk::resolve_search_cache_dir;
 
 // ============================================================================
 // Public entry point
@@ -1067,36 +1071,6 @@ fn derive_ast_entry(
         metrics,
         node_count,
     }
-}
-
-/// Resolve the per-project search cache directory.
-///
-/// Path: `{base_cache}/search/{sha256(canonical_root)[..16]}/`.
-/// The base is `SKIM_CACHE_DIR` (if set) or the platform cache dir.
-///
-/// AD-400-2 (supersedes AD-381-2): callers reach here only AFTER
-/// `resolve_root_and_cache` has validated that the root exists and is a directory
-/// (#400), so a `canonicalize()` failure now signals a real error and is
-/// propagated — the former pure-lexical fallback for non-existent roots
-/// (`canonical_or_normalized` / `lexically_normalize`) is removed. This remains a
-/// defensive backstop: any *internal* caller (e.g. the test-only `IndexCli` path,
-/// or `build_index_rechecked` with `cache_dir_override: None`) that supplies a
-/// non-existent root now fails loud here instead of silently hashing a ghost path.
-pub(super) fn resolve_search_cache_dir(root: &Path) -> anyhow::Result<PathBuf> {
-    let base = crate::cmd::resolve_cache_dir()
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve skim cache directory"))?;
-    let canonical = root.canonicalize().map_err(|e| {
-        anyhow::anyhow!("failed to canonicalize search root {}: {e}", root.display())
-    })?;
-    Ok(base.join("search").join(project_root_hash(&canonical)))
-}
-
-/// Compute a 16-char hex prefix of the SHA-256 of the canonical project root path.
-///
-/// Used as a stable directory name in the search cache.
-fn project_root_hash(canonical_root: &Path) -> String {
-    let input = canonical_root.to_string_lossy();
-    sha256_hex(input.as_bytes())[..16].to_string()
 }
 
 // ============================================================================

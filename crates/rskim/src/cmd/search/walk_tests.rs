@@ -1078,7 +1078,9 @@ fn test_ac13_402_memo_cache_hit_and_miss() {
     unsafe { std::env::set_var("SKIM_CACHE_DIR", cache_tmp.path()) };
 
     // Create the cache dir so the sidecar write doesn't fail silently.
-    let cache_dir = super::super::index::resolve_search_cache_dir(&root).unwrap();
+    // resolve_search_cache_dir is now in walk.rs (breaking the former walk→index
+    // import cycle — finding: walk-index-cyclic-coupling).
+    let cache_dir = super::resolve_search_cache_dir(&root).unwrap();
     fs::create_dir_all(&cache_dir).unwrap();
 
     // Reset the per-thread test counter.
@@ -1087,7 +1089,9 @@ fn test_ac13_402_memo_cache_hit_and_miss() {
     // --- AC13(i): cache HIT on unchanged .git/index ---
 
     // First call: cold sidecar → cache MISS → gix is called once.
-    let result1 = super::tracked_files_memoized(&root);
+    // Pass Some(&cache_dir) so tracked_files_memoized reuses the already-
+    // resolved cache dir (finding: tracked-memo-redundant-resolve).
+    let result1 = super::tracked_files_memoized(&root, Some(&cache_dir));
     assert!(result1.is_some(), "AC13(i): first call must return Some");
     let count1 = super::ENUM_CALL_COUNT.with(std::cell::Cell::get);
     assert_eq!(
@@ -1096,7 +1100,7 @@ fn test_ac13_402_memo_cache_hit_and_miss() {
     );
 
     // Second call: .git/index unchanged → sidecar hit → gix NOT called again.
-    let result2 = super::tracked_files_memoized(&root);
+    let result2 = super::tracked_files_memoized(&root, Some(&cache_dir));
     assert!(result2.is_some(), "AC13(i): second call must return Some");
     let count2 = super::ENUM_CALL_COUNT.with(std::cell::Cell::get);
     assert_eq!(
@@ -1122,7 +1126,7 @@ fn test_ac13_402_memo_cache_hit_and_miss() {
         .expect("git add newsecret.md");
 
     // Third call: .git/index has changed → cache MISS → gix is called again.
-    let result3 = super::tracked_files_memoized(&root);
+    let result3 = super::tracked_files_memoized(&root, Some(&cache_dir));
     assert!(
         result3.is_some(),
         "AC13(ii): post-git-add call must return Some"
