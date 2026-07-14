@@ -2838,19 +2838,20 @@ fn test_manifest_old_version_triggers_auto_rebuild_on_next_query() {
 }
 
 // ============================================================================
-// #381 — index-location resolver: canonicalize-fallback normalization
-// (AC8 determinism, AC9 non-existent-root equivalence, AC13 pure-lexical algo)
+// #381 / #400 — index-location resolver: determinism + fail-loud backstop
+// (AC8 determinism on a real root, AC9 fail-loud on missing root)
 // ============================================================================
 
 use std::path::PathBuf;
 
-/// AC8: `resolve_search_cache_dir` is deterministic — the same input yields the
-/// same path across repeated calls.
+/// AC8: `resolve_search_cache_dir` is deterministic — the same existing input
+/// yields the same path across repeated calls. Uses a real tempdir (the only
+/// kind that reaches this function after the #400 funnel gate).
 #[test]
 fn test_ac8_resolve_search_cache_dir_is_deterministic() {
-    let root = Path::new("/no/such/deterministic/root");
-    let a = super::resolve_search_cache_dir(root).unwrap();
-    let b = super::resolve_search_cache_dir(root).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let a = super::resolve_search_cache_dir(dir.path()).unwrap();
+    let b = super::resolve_search_cache_dir(dir.path()).unwrap();
     assert_eq!(
         a, b,
         "AC8: resolve_search_cache_dir must be deterministic for a fixed input"
@@ -2884,56 +2885,15 @@ fn test_ac8_existing_root_uses_canonicalized_sha256() {
     );
 }
 
-/// AC9: for a NON-existent root, trailing-slash and `.`-segment spellings map to
-/// the SAME cache dir (pure-lexical fallback; no filesystem I/O for a missing
-/// root since canonicalize fails and we normalize lexically).
+/// AC9 (#400): `resolve_search_cache_dir` propagates Err on a non-existent root —
+/// the AD-381-2 pure-lexical fallback is removed. Calling with a missing path must
+/// return Err, not an Ok ghost-hash path (fail-loud backstop, AD-400-2).
 #[test]
-fn test_ac9_nonexistent_root_spellings_collapse() {
-    let plain = super::resolve_search_cache_dir(Path::new("/no/such/root")).unwrap();
-    let trailing = super::resolve_search_cache_dir(Path::new("/no/such/root/")).unwrap();
-    let dotseg = super::resolve_search_cache_dir(Path::new("/no/such/./root")).unwrap();
-
-    assert_eq!(
-        plain, trailing,
-        "AC9: trailing-slash spelling of a non-existent root must collapse to the same dir"
-    );
-    assert_eq!(
-        plain, dotseg,
-        "AC9: dot-segment spelling of a non-existent root must collapse to the same dir"
-    );
-}
-
-/// AC13: the pure-lexical helper collapses `.` segments and trailing separators
-/// for relative non-existent inputs (collides on ANY OS).
-#[test]
-fn test_ac13_canonical_or_normalized_collapses_dot_and_trailing() {
-    // These relative paths do not exist on disk, so canonicalize() fails and the
-    // pure-lexical fallback runs.
-    assert_eq!(
-        super::canonical_or_normalized(Path::new("./skim_381_foo")),
-        super::canonical_or_normalized(Path::new("skim_381_foo")),
-        "AC13: leading ./ must normalize away"
-    );
-    assert_eq!(
-        super::canonical_or_normalized(Path::new("skim_381_foo/")),
-        super::canonical_or_normalized(Path::new("skim_381_foo")),
-        "AC13: trailing separator must normalize away"
-    );
-    assert_eq!(
-        super::canonical_or_normalized(Path::new("skim_381_foo/./skim_381_bar")),
-        super::canonical_or_normalized(Path::new("skim_381_foo/skim_381_bar")),
-        "AC13: interior /./ must normalize away"
-    );
-}
-
-/// AC13 (NEGATIVE bound): `..` MUST NOT be resolved — divergent `..` spellings of
-/// a non-existent root stay distinct.
-#[test]
-fn test_ac13_parentdir_is_not_resolved() {
-    assert_ne!(
-        super::canonical_or_normalized(Path::new("skim_381_foo/../skim_381_bar")),
-        super::canonical_or_normalized(Path::new("skim_381_bar")),
-        "AC13 NEGATIVE: `..` must be preserved verbatim, not resolved"
+fn test_ac9_nonexistent_root_propagates_error() {
+    let result = super::resolve_search_cache_dir(Path::new("/no/such/root_400_ac9"));
+    assert!(
+        result.is_err(),
+        "AC9: resolve_search_cache_dir must propagate Err for a non-existent root (AD-400-2); got Ok"
     );
 }
 

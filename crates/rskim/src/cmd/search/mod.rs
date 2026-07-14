@@ -665,7 +665,28 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
 
 fn resolve_root_and_cache(root_override: &Option<PathBuf>) -> anyhow::Result<(PathBuf, PathBuf)> {
     let root = match root_override {
-        Some(r) => r.canonicalize().unwrap_or_else(|_| r.clone()),
+        // AD-400-1: `--root` is validated up-front at this single funnel so a
+        // non-existent or non-directory value FAILS LOUD (skim's "fail loud with
+        // actionable messages" invariant; #400) BEFORE resolve_search_cache_dir or
+        // any create_dir_all runs — hence NO cache directory is created for a garbage
+        // root. The former silent `.unwrap_or_else(|_| r.clone())` let a bogus root
+        // reach resolve_search_cache_dir's AD-381-2 lexical fallback, index 0 files,
+        // and return "no results" with exit 0. `canonicalize()` rejects a missing
+        // path (its io::Error carries no path, so we prepend --root + the spelling);
+        // the explicit `is_dir()` guard additionally rejects an existing *file* root,
+        // since canonicalize() succeeds for files. Both bail → exit 1 (dispatch maps
+        // anyhow::Err → ExitCode::FAILURE; exit 2 is reserved for the parse path).
+        Some(r) => {
+            let canonical = r.canonicalize().map_err(|e| {
+                anyhow::anyhow!("--root {}: {e}. Pass the directory to index.", r.display())
+            })?;
+            anyhow::ensure!(
+                canonical.is_dir(),
+                "--root {} is not a directory. Pass the directory to index.",
+                canonical.display()
+            );
+            canonical
+        }
         None => {
             let cwd = std::env::current_dir()?;
             walk::discover_project_root(&cwd)?
