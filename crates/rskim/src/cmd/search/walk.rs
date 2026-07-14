@@ -613,17 +613,56 @@ fn merge_tracked_union(
     added
 }
 
+/// Resolve the filesystem path to the git index file for `root`.
+///
+/// In a regular repository `root/.git` is a directory and the index lives at
+/// `root/.git/index`. In a **linked git worktree** `root/.git` is a plain
+/// file containing `gitdir: /abs/path/to/.git/worktrees/<name>` — the
+/// worktree-specific index lives at `<gitdir>/index`, NOT at
+/// `root/.git/index` (which does not exist as a path because `.git` is a
+/// file). Without this helper, [`tracked_files_memoized`] would always fail
+/// the `fs::metadata` call in a worktree and fall through to a live
+/// [`list_tracked_files`] on every query, silently losing the memoization
+/// bound AD-402-6 was designed to provide.
+///
+/// Returns `None` if `root/.git` is neither a directory nor a readable file
+/// (non-git root). The caller should not invoke this for non-git roots
+/// (gated by the `root.join(".git").exists()` check in [`walk_metadata`]).
+fn resolve_git_index_path(root: &Path) -> Option<PathBuf> {
+    let git_entry = root.join(".git");
+    if git_entry.is_dir() {
+        // Regular repository: index is at .git/index.
+        Some(git_entry.join("index"))
+    } else if git_entry.is_file() {
+        // Linked worktree: .git is a file containing "gitdir: <path>\n".
+        // git always writes an absolute path on modern versions; support a
+        // relative path (relative to root) as a defensive fallback.
+        let content = fs::read_to_string(&git_entry).ok()?;
+        let gitdir_str = content.strip_prefix("gitdir: ")?.trim_end();
+        let gitdir = if Path::new(gitdir_str).is_absolute() {
+            PathBuf::from(gitdir_str)
+        } else {
+            root.join(gitdir_str)
+        };
+        Some(gitdir.join("index"))
+    } else {
+        None
+    }
+}
+
 /// Memoized tracked-file enumeration.
 ///
 /// Reads a per-root sidecar cache (`{cache_dir}/tracked_union.cache`) keyed
-/// on the `.git/index` fingerprint `(mtime_secs, len_bytes)`. On call:
-/// - Stat `root/.git/index` for the current fingerprint.
+/// on the `.git/index` fingerprint `(mtime_nanos, len_bytes)`. On call:
+/// - Resolve the true git index path via [`resolve_git_index_path`] (handles
+///   both regular repos and linked worktrees — see that function's doc).
+/// - Stat the resolved index for the current fingerprint.
 /// - If the sidecar fingerprint matches → return the cached list (cache HIT,
 ///   zero gix calls).
 /// - Otherwise → call [`list_tracked_files`], rewrite the sidecar, return.
 ///
 /// Fail-soft at every step: unresolvable cache dir, unreadable/corrupt sidecar,
-/// missing `.git/index` → fall through to a live [`list_tracked_files`] call
+/// missing git index → fall through to a live [`list_tracked_files`] call
 /// (never a build gate). The sidecar is an OPTIMIZATION cache: absent/corrupt
 /// simply forces one re-enumeration.
 ///
@@ -633,11 +672,15 @@ fn merge_tracked_union(
 /// top-K merge, so AD-379-1 build↔scan set-identity and PF-012 determinism
 /// are unaffected.
 fn tracked_files_memoized(root: &Path, cache_dir: Option<&Path>) -> Option<Vec<PathBuf>> {
-    let git_index_path = root.join(".git").join("index");
+    // Resolve the git index path, handling both regular repos (.git/ dir) and
+    // linked worktrees (.git file pointing to the worktree-specific git dir).
+    // Without this, a linked worktree would always fail the stat below and fall
+    // through to a live list_tracked_files call on every query.
+    let git_index_path = resolve_git_index_path(root)?;
 
-    // Stat .git/index for the fingerprint. If missing (newly-init repo with no
-    // commits), fall through to a live call (which will also return None from
-    // gix if the index truly does not exist).
+    // Stat the resolved index path for the fingerprint. If missing (newly-init
+    // repo with no commits), fall through to a live call (which will also return
+    // None from gix if the index truly does not exist).
     let git_meta = match fs::metadata(&git_index_path) {
         Ok(m) => m,
         Err(_) => return list_tracked_files(root),
@@ -651,12 +694,21 @@ fn tracked_files_memoized(root: &Path, cache_dir: Option<&Path>) -> Option<Vec<P
     // for WalkEntry.mtime, compared against persisted manifest values in the
     // staleness scan.  Changing those to nanos would break the manifest format.
     // (finding: mtime-fingerprint-1s-granularity)
-    let mtime_nanos: u64 = git_meta
+    //
+    // Platform mtime unavailable: if mtime cannot be read the fingerprint would
+    // degenerate to (0, len_bytes), making same-length rewrites of .git/index
+    // appear identical → stale cache HIT. Skip the cache entirely on such
+    // platforms and re-enumerate every call (correct; no optimization on this
+    // platform). (finding: mtime-fingerprint-degenerate-zero)
+    let mtime_nanos: u64 = match git_meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+    {
+        Some(n) => n,
+        None => return list_tracked_files(root),
+    };
     let len_bytes = git_meta.len();
 
     // Use the caller-supplied cache dir if available (threaded from walk_metadata
@@ -676,8 +728,9 @@ fn tracked_files_memoized(root: &Path, cache_dir: Option<&Path>) -> Option<Vec<P
     };
     let sidecar_path = effective_cache_dir.join("tracked_union.cache");
 
-    // Cache HIT path: read and validate the sidecar.
-    if let Ok(content) = fs::read_to_string(&sidecar_path)
+    // Cache HIT path: read sidecar as raw bytes (byte-lossless for non-UTF-8
+    // paths — see format_tracked_union_cache for rationale) and validate.
+    if let Ok(content) = fs::read(&sidecar_path)
         && let Some(paths) = parse_tracked_union_cache(&content, mtime_nanos, len_bytes)
     {
         return Some(paths);
@@ -760,51 +813,98 @@ fn list_tracked_files(root: &Path) -> Option<Vec<PathBuf>> {
 
 /// Serialize a tracked-file list to the sidecar cache format.
 ///
+/// Returns a `Vec<u8>` (raw bytes, not a UTF-8 string) so that paths
+/// containing invalid UTF-8 bytes round-trip without data loss.  On Unix,
+/// [`OsStrExt::as_bytes`] encodes each path as its raw bytes (byte-lossless);
+/// on non-Unix platforms, which lack a byte-exact OsStr API, `to_string_lossy`
+/// is used as before (a latent limitation of those platforms' path model).
+///
 /// Format: `{mtime_nanos} {len_bytes}\0` header (nanoseconds since UNIX epoch
 /// for sub-second fingerprint precision), then one repo-relative path per
-/// subsequent NUL-terminated record (UTF-8 lossy).
+/// subsequent NUL-terminated record.
 ///
 /// NUL framing (git's own convention) is used instead of newline framing so
 /// that paths containing embedded `\n` characters round-trip correctly.
-/// Newline framing would produce a different tracked set on a cache HIT for
-/// such paths vs the authoritative live gix enumeration, violating the
-/// AD-379-1 build↔scan set-identity guarantee.  Existing sidecar files in
-/// prior formats (old newline separator, or second-resolution mtime) parse as
-/// a fingerprint mismatch → cache miss → harmless re-enumeration.
+///
+/// Byte-exact encoding is REQUIRED for AD-379-1 build↔scan set-identity: a
+/// file with a non-UTF-8 name is indexed on a cache MISS (live gix read
+/// returns the real bytes) but would fail `symlink_metadata` on a cache HIT if
+/// its path bytes were corrupted by `to_string_lossy`'s U+FFFD substitution,
+/// silently dropping it from the union (finding: sidecar-lossy-round-trip).
 ///
 /// The file is an optimization cache with no format version; absent or corrupt
-/// → re-enumerate (fail-soft).
-fn format_tracked_union_cache(mtime_nanos: u64, len_bytes: u64, paths: &[PathBuf]) -> String {
-    let mut out = format!("{mtime_nanos} {len_bytes}\0");
+/// → re-enumerate (fail-soft). Existing sidecars written by prior code (which
+/// used `to_string_lossy`) remain parse-compatible for UTF-8 paths (byte-
+/// identical) and trigger a re-enumeration for any non-UTF-8 path (the
+/// U+FFFD-encoded form produces a different path that fails `symlink_metadata`
+/// on the next classify call, so the sidecar is effectively invalid for that
+/// path and will be overwritten on the next git-index mutation).
+fn format_tracked_union_cache(mtime_nanos: u64, len_bytes: u64, paths: &[PathBuf]) -> Vec<u8> {
+    let mut out = format!("{mtime_nanos} {len_bytes}\0").into_bytes();
     for p in paths {
-        out.push_str(&p.to_string_lossy());
-        out.push('\0');
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            out.extend_from_slice(p.as_os_str().as_bytes());
+        }
+        #[cfg(not(unix))]
+        {
+            // Non-Unix: OsStr has no byte-exact API; fall back to lossy UTF-8.
+            out.extend_from_slice(p.to_string_lossy().as_bytes());
+        }
+        out.push(0); // NUL record terminator
     }
     out
 }
 
-/// Parse a sidecar cache string produced by [`format_tracked_union_cache`].
+/// Parse a sidecar cache produced by [`format_tracked_union_cache`].
+///
+/// Accepts raw bytes so that non-UTF-8 path bytes (written by
+/// `format_tracked_union_cache` on Unix via `OsStrExt::as_bytes`) are
+/// reconstructed byte-losslessly into `PathBuf`s via `OsStr::from_bytes`.
+/// A `&str` input would require the caller to decode the file as UTF-8 first,
+/// which reintroduces the lossy substitution we are trying to avoid
+/// (finding: sidecar-lossy-round-trip).
 ///
 /// Returns `Some(paths)` only when the header fingerprint matches
 /// `(expected_mtime, expected_len)` exactly. Returns `None` on any mismatch
 /// or parse error (corrupt/truncated sidecar → re-enumerate, fail-soft).
 ///
-/// Paths are NUL-separated (see [`format_tracked_union_cache`] for rationale).
+/// Paths are NUL-terminated records (see [`format_tracked_union_cache`]).
 fn parse_tracked_union_cache(
-    content: &str,
+    content: &[u8],
     expected_mtime: u64,
     expected_len: u64,
 ) -> Option<Vec<PathBuf>> {
-    let mut parts = content.split('\0');
-    let header = parts.next()?;
+    let mut parts = content.split(|&b| b == 0);
+    // Header is always ASCII digits + space; parse as UTF-8.
+    let header = std::str::from_utf8(parts.next()?).ok()?;
     let mut hparts = header.splitn(2, ' ');
     let mtime: u64 = hparts.next()?.parse().ok()?;
     let len: u64 = hparts.next()?.parse().ok()?;
     if mtime != expected_mtime || len != expected_len {
         return None; // fingerprint mismatch → cache miss
     }
-    // Trailing NUL produces an empty final part; filter it out.
-    Some(parts.filter(|s| !s.is_empty()).map(PathBuf::from).collect())
+    // Trailing NUL produces an empty final slice; filter it out.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        Some(
+            parts
+                .filter(|s| !s.is_empty())
+                .map(|b| PathBuf::from(std::ffi::OsStr::from_bytes(b)))
+                .collect(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        Some(
+            parts
+                .filter(|s| !s.is_empty())
+                .map(|b| PathBuf::from(String::from_utf8_lossy(b).into_owned()))
+                .collect(),
+        )
+    }
 }
 
 // ============================================================================

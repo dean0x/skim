@@ -1150,6 +1150,68 @@ fn test_ac13_402_memo_cache_hit_and_miss() {
     unsafe { std::env::remove_var("SKIM_CACHE_DIR") };
 }
 
+/// resolve_git_index_path: regular repo returns .git/index, linked worktree
+/// reads the gitdir from the .git file and returns <gitdir>/index.
+///
+/// Regression for finding: worktree-memo-bypass — in a linked worktree .git is
+/// a plain file so root/.git/index never exists, causing tracked_files_memoized
+/// to always fall through to a live list_tracked_files call on every query and
+/// silently losing the AD-402-6 memoization bound.
+#[test]
+fn test_resolve_git_index_path_regular_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let git_dir = root.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    // Create the index file so the path is valid.
+    fs::write(git_dir.join("index"), b"").unwrap();
+
+    let idx = super::resolve_git_index_path(root)
+        .expect("resolve_git_index_path must return Some for a regular repo");
+    assert_eq!(
+        idx,
+        root.join(".git").join("index"),
+        "regular repo: git index must be at .git/index"
+    );
+}
+
+#[test]
+fn test_resolve_git_index_path_linked_worktree() {
+    // Simulate a linked worktree where .git is a plain file containing a gitdir
+    // reference. The gitdir path may be absolute (normal) or relative (defensive
+    // fallback). We test the absolute case here (by far the most common).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // The "real" git dir (normally somewhere like /path/to/main/.git/worktrees/wt).
+    let fake_gitdir = tempfile::tempdir().unwrap();
+    let fake_index = fake_gitdir.path().join("index");
+    fs::write(&fake_index, b"").unwrap();
+
+    // Write a .git file (not a directory) pointing at fake_gitdir.
+    let gitdir_str = fake_gitdir.path().to_str().unwrap();
+    fs::write(root.join(".git"), format!("gitdir: {gitdir_str}\n")).unwrap();
+
+    let idx = super::resolve_git_index_path(root)
+        .expect("resolve_git_index_path must return Some for a linked worktree");
+    assert_eq!(
+        idx,
+        fake_gitdir.path().join("index"),
+        "linked worktree: git index must be at <gitdir>/index, not root/.git/index"
+    );
+}
+
+#[test]
+fn test_resolve_git_index_path_no_git() {
+    // A directory with no .git entry (not a git repo) must return None.
+    let dir = tempfile::tempdir().unwrap();
+    let result = super::resolve_git_index_path(dir.path());
+    assert!(
+        result.is_none(),
+        "resolve_git_index_path must return None when .git does not exist"
+    );
+}
+
 /// AC14 (#402) — Design decisions are traceable in source code.
 ///
 /// Grep walk.rs for `AD-402-1` through `AD-402-6` each at their documented
@@ -1182,35 +1244,37 @@ fn test_ac14_402_ad_series_comments_present() {
 /// this test covers the content-corruption paths that AC13 does not exercise.
 #[test]
 fn test_parse_tracked_union_cache_corrupt_and_truncated() {
-    let parse = |s: &str, mt: u64, ln: u64| super::parse_tracked_union_cache(s, mt, ln);
+    // parse_tracked_union_cache now accepts &[u8] (byte-lossless for non-UTF-8
+    // paths — finding: sidecar-lossy-round-trip). Use byte literals throughout.
+    let parse = |s: &[u8], mt: u64, ln: u64| super::parse_tracked_union_cache(s, mt, ln);
 
-    // Empty string: no header at all → None (re-enumerate).
+    // Empty byte slice: no header at all → None (re-enumerate).
     assert!(
-        parse("", 100, 512).is_none(),
+        parse(b"", 100, 512).is_none(),
         "empty sidecar must return None"
     );
 
     // Garbled header (no space separator between mtime and len) → None.
     assert!(
-        parse("not_a_valid_header\0path.rs\0", 100, 512).is_none(),
+        parse(b"not_a_valid_header\0path.rs\0", 100, 512).is_none(),
         "garbled header must return None"
     );
 
     // Second token in header is not a number → None.
     assert!(
-        parse("100 notanumber\0path.rs\0", 100, 512).is_none(),
+        parse(b"100 notanumber\0path.rs\0", 100, 512).is_none(),
         "non-numeric len field must return None"
     );
 
     // Correct numeric header but fingerprint mismatch → None (cache miss).
     // This covers the mtime-differs direction.
     assert!(
-        parse("999 512\0path.rs\0", 100, 512).is_none(),
+        parse(b"999 512\0path.rs\0", 100, 512).is_none(),
         "mtime mismatch must return None"
     );
     // And the len-differs direction.
     assert!(
-        parse("100 999\0path.rs\0", 100, 512).is_none(),
+        parse(b"100 999\0path.rs\0", 100, 512).is_none(),
         "len mismatch must return None"
     );
 
@@ -1218,21 +1282,21 @@ fn test_parse_tracked_union_cache_corrupt_and_truncated() {
     // Verifies that a truncated-after-header write is handled as an empty
     // but valid cache hit (not treated as corrupt).
     assert_eq!(
-        parse("100 512\0", 100, 512),
+        parse(b"100 512\0", 100, 512),
         Some(vec![]),
         "truncated-to-header sidecar with matching fingerprint must return Some([])"
     );
 
     // Valid single path: basic round-trip.
     assert_eq!(
-        parse("100 512\0src/main.rs\0", 100, 512),
+        parse(b"100 512\0src/main.rs\0", 100, 512),
         Some(vec![std::path::PathBuf::from("src/main.rs")]),
         "valid single-entry sidecar must parse correctly"
     );
 
     // Valid multi-path (confirms NUL framing, not newline).
     assert_eq!(
-        parse("100 512\0foo.rs\0bar.rs\0", 100, 512),
+        parse(b"100 512\0foo.rs\0bar.rs\0", 100, 512),
         Some(vec![
             std::path::PathBuf::from("foo.rs"),
             std::path::PathBuf::from("bar.rs"),
