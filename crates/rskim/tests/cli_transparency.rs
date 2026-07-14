@@ -95,6 +95,59 @@ fn test_no_marker_when_output_equals_raw_full_mode() {
 }
 
 // ============================================================================
+// Marker is silent when guardrail fires (raw bytes served, view_differs=false)
+// ============================================================================
+
+/// When the fidelity guardrail fires (transformed output > raw bytes), skim serves
+/// raw bytes, making `final_output == contents` and therefore `view_differs = false`.
+/// The transparency marker must stay silent even though `SKIM_REWRITTEN_FROM` is set.
+///
+/// Fixture shape mirrors `cli_guardrail.rs::test_guardrail_triggers_when_output_inflates`:
+/// 20 empty-body JS functions where structure mode replaces each `{ }` (3 bytes)
+/// with ` {...}` (6 bytes), inflating the output past the raw budget.
+#[test]
+fn test_no_marker_when_guardrail_fires() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("inflating.ts");
+
+    // 20 functions × ~18 bytes = ~360 bytes raw (above MIN_RAW_SIZE_FOR_GUARDRAIL of 256).
+    // Each empty body `{ }` (3 bytes) → ` {...}` (6 bytes) = +3 bytes per function,
+    // so the compressed output exceeds the raw size and the guardrail fires.
+    let mut source = String::new();
+    for i in 0..20 {
+        source.push_str(&format!("function f{i}() {{ }}\n"));
+    }
+    assert!(
+        source.len() >= 256,
+        "fixture must be >= 256 bytes for guardrail, got {}",
+        source.len()
+    );
+    fs::write(&file, &source).unwrap();
+
+    let output = skim_cmd()
+        .env("SKIM_REWRITTEN_FROM", "cat")
+        .arg(&file)
+        .arg("--mode=structure")
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Guardrail must have fired.
+    assert!(
+        stderr.contains("[skim:guardrail]"),
+        "expected guardrail notice on stderr, got: {stderr}"
+    );
+
+    // Transparency marker must be absent — guardrail served raw bytes so view_differs=false.
+    assert!(
+        !stderr.contains("[skim] transformed view"),
+        "transparency marker must be silent when guardrail serves raw bytes, got: {stderr}"
+    );
+}
+
+// ============================================================================
 // Marker names the mode (structure vs pseudo)
 // ============================================================================
 
@@ -138,8 +191,10 @@ fn test_transparency_marker_names_structure_mode() {
 // head tag with --max-lines
 // ============================================================================
 
-/// head tag with `--max-lines`: structure mode strips the function body, which
-/// combined with the max-lines truncation guarantees view differs from raw.
+/// head tag with `--max-lines`: structure mode strips the function body (mirroring
+/// what the head rewrite actually emits: `SKIM_REWRITTEN_FROM=head skim <file>
+/// --mode=structure --max-lines N`).  Structure mode guarantees view differs from
+/// raw, so the marker must appear and must name `head`.
 #[test]
 fn test_transparency_marker_with_head_tag() {
     let dir = TempDir::new().unwrap();
@@ -155,6 +210,7 @@ fn test_transparency_marker_with_head_tag() {
         .env("SKIM_REWRITTEN_FROM", "head")
         .arg(&file)
         .arg("--mode=structure")
+        .arg("--max-lines=10")
         .assert()
         .success()
         .stderr(predicate::str::contains("[skim] transformed view"))
