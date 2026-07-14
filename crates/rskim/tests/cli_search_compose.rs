@@ -1116,8 +1116,13 @@ mod tracked_union_402 {
             .clone();
 
         let stderr = String::from_utf8_lossy(&out.stderr);
+        // AD-379-1: the perpetual-rebuild-loop bug manifests as WorkingTreeChanged on
+        // every query, which emits "working tree changed" (staleness.rs:730).  The
+        // NoIndex arm emits "building index" (staleness.rs:688).  Either message on
+        // the SECOND query proves the loop.  Only asserting "building index" misses
+        // the WorkingTreeChanged path (PF-007 violation) — assert both.
         assert!(
-            !stderr.contains("building index"),
+            !stderr.contains("working tree changed") && !stderr.contains("building index"),
             "AC7: second query must NOT trigger a rebuild (would be a perpetual loop); \
              stderr:\n{stderr}"
         );
