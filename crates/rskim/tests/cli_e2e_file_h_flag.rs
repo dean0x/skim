@@ -76,9 +76,11 @@ fn test_file_long_help_still_triggers_help() {
 // ============================================================================
 
 /// `skim grep -hn hello <f1> <f2>` — `-h` suppresses filename prefix, `-n` adds
-/// line numbers.  The rewrite rule rewrites this to `skim grep -hn …` and the
-/// dispatcher must NOT intercept `-h` as help.  The output should contain the
-/// matched content and the `(no filename)` fallback label.
+/// line numbers.  This test exercises the HANDLER surface (direct `skim grep -hn`
+/// dispatch), not the rewrite engine (PF-004 two-surfaces distinction).  The
+/// fileops dispatcher must NOT intercept `-h` as help; `-h` must reach the grep
+/// handler unchanged.  The output should contain the matched content and the
+/// `(no filename)` fallback label.
 #[test]
 fn test_grep_h_multifile_produces_no_filename_label() {
     let dir = TempDir::new().unwrap();

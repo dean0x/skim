@@ -1491,12 +1491,13 @@ fn test_gemini_dry_run_shows_before_tool_hook_key() {
     let patch_line = stdout
         .lines()
         .find(|l| l.contains("Would patch") || l.contains("Patch settings"));
-    if let Some(line) = patch_line {
-        assert!(
-            !line.contains("PreToolUse"),
-            "Gemini dry-run patch line must use 'BeforeTool', not 'PreToolUse'; line: {line}"
-        );
-    }
+    let line = patch_line.expect(
+        "dry-run must emit a 'Would patch' or 'Patch settings' summary line; got nothing in stdout",
+    );
+    assert!(
+        !line.contains("PreToolUse"),
+        "Gemini dry-run patch line must use 'BeforeTool', not 'PreToolUse'; line: {line}"
+    );
 
     drop(gemini_dir);
 }

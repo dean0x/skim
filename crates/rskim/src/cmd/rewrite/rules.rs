@@ -2369,6 +2369,28 @@ mod tests {
         );
     }
 
+    /// grep -h must rewrite and `-h` must survive in tokens (PF-007).
+    ///
+    /// Guards the grep-vs-rg asymmetry: rg's rewrite rule skips `-h`/`--help`
+    /// because for rg both are help flags; grep's catch-all must NOT skip `-h`
+    /// because `grep -h` means "suppress filename prefix", not "show help".
+    #[test]
+    fn test_grep_h_still_rewrites_and_preserves_flag() {
+        use crate::cmd::rewrite::engine::try_rewrite;
+        let result = try_rewrite(&["grep", "-h", "pattern", "f1", "f2"])
+            .expect("grep -h must rewrite (not skipped by catch-all)");
+        assert!(
+            result.tokens.contains(&"-h".to_string()),
+            "grep -h must survive in the rewrite tokens; got: {:?}",
+            result.tokens
+        );
+        // Confirm rg -h is still skipped (guards the asymmetry)
+        assert!(
+            try_rewrite(&["rg", "-h"]).is_none(),
+            "rg -h must pass through (rg -h is a help flag, not filename-suppress)"
+        );
+    }
+
     /// grep --help skips the catch-all rule.
     #[test]
     fn test_grep_help_skip() {
