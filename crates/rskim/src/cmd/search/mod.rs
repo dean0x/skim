@@ -2771,6 +2771,14 @@ mod tests {
         let root = dir.path();
         let root_str = root.to_string_lossy().to_string();
 
+        // Dedicated isolated cache dir so this subprocess test is immune to
+        // concurrent SKIM_CACHE_DIR mutations from serial tests (e.g.
+        // test_ac13_402_memo_cache_hit_and_miss in walk_tests.rs sets and
+        // then drops SKIM_CACHE_DIR in the parent process; if the subprocess
+        // inherits that value the cache dir is deleted under it mid-build).
+        let cache_tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir_str = cache_tmp.path().to_string_lossy().to_string();
+
         // A git repo with commits so temporal data exists (the arm runs, not an error path).
         create_real_git_repo(
             root,
@@ -2795,6 +2803,7 @@ mod tests {
                 &root_str,
             ])
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", &cache_dir_str)
             .output()
             .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"));
         assert!(
@@ -2821,6 +2830,7 @@ mod tests {
                 &root_str,
             ])
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", &cache_dir_str)
             .output()
             .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"));
         assert!(
