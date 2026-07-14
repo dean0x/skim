@@ -313,6 +313,17 @@ pub(super) fn walk_and_read(
 // Metadata-only walk (streaming pipeline)
 // ============================================================================
 
+/// Extract mtime as seconds since UNIX_EPOCH from a [`std::fs::Metadata`] value.
+///
+/// Returns `None` when the platform does not expose modification time or the
+/// syscall fails. Shared by [`classify_metadata_core`] and [`tracked_files_memoized`].
+fn mtime_from_meta(meta: &std::fs::Metadata) -> Option<u64> {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+}
+
 /// Classify an already-confirmed regular file from its path and optional metadata.
 ///
 /// Shared by the ignore-walk path ([`classify_entry_metadata`]) and the
@@ -350,12 +361,7 @@ fn classify_metadata_core(
         });
     }
 
-    let mtime = meta_opt.and_then(|m| {
-        m.modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-    });
+    let mtime = meta_opt.as_ref().and_then(mtime_from_meta);
     let rel_path = abs_path
         .strip_prefix(root)
         .unwrap_or(abs_path)
@@ -520,7 +526,7 @@ fn merge_tracked_union(
         .map(|e| normalize_rel_path(&e.rel_path))
         .collect();
 
-    let mut added = 0usize;
+    let mut added = 0;
     for rel in tracked {
         let key = normalize_rel_path(&rel);
         if !yielded.insert(key) {
@@ -581,12 +587,7 @@ fn tracked_files_memoized(root: &Path) -> Option<Vec<PathBuf>> {
         Ok(m) => m,
         Err(_) => return list_tracked_files(root),
     };
-    let mtime_secs = git_meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let mtime_secs = mtime_from_meta(&git_meta).unwrap_or(0);
     let len_bytes = git_meta.len();
 
     // Resolve the per-root cache dir (fail-soft: fall through to live call).
