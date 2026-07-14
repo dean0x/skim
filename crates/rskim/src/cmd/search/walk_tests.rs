@@ -1067,8 +1067,6 @@ fn test_ac11_402_classify_tracked_path_symlink_transparent() {
 #[serial_test::serial]
 #[test]
 fn test_ac13_402_memo_cache_hit_and_miss() {
-    use std::sync::atomic::Ordering;
-
     let dir = make_tracked_ignored_repo();
     let root = dir.path().canonicalize().unwrap();
 
@@ -1083,15 +1081,15 @@ fn test_ac13_402_memo_cache_hit_and_miss() {
     let cache_dir = super::super::index::resolve_search_cache_dir(&root).unwrap();
     fs::create_dir_all(&cache_dir).unwrap();
 
-    // Reset the test counter.
-    super::ENUM_CALL_COUNT.store(0, Ordering::Relaxed);
+    // Reset the per-thread test counter.
+    super::ENUM_CALL_COUNT.with(|c| c.set(0));
 
     // --- AC13(i): cache HIT on unchanged .git/index ---
 
     // First call: cold sidecar → cache MISS → gix is called once.
     let result1 = super::tracked_files_memoized(&root);
     assert!(result1.is_some(), "AC13(i): first call must return Some");
-    let count1 = super::ENUM_CALL_COUNT.load(Ordering::Relaxed);
+    let count1 = super::ENUM_CALL_COUNT.with(std::cell::Cell::get);
     assert_eq!(
         count1, 1,
         "AC13(i): first call must be a cache miss (gix called exactly once)"
@@ -1100,7 +1098,7 @@ fn test_ac13_402_memo_cache_hit_and_miss() {
     // Second call: .git/index unchanged → sidecar hit → gix NOT called again.
     let result2 = super::tracked_files_memoized(&root);
     assert!(result2.is_some(), "AC13(i): second call must return Some");
-    let count2 = super::ENUM_CALL_COUNT.load(Ordering::Relaxed);
+    let count2 = super::ENUM_CALL_COUNT.with(std::cell::Cell::get);
     assert_eq!(
         count2, 1,
         "AC13(i): second call must be a cache HIT (ENUM_CALL_COUNT stays at 1)"
@@ -1129,7 +1127,7 @@ fn test_ac13_402_memo_cache_hit_and_miss() {
         result3.is_some(),
         "AC13(ii): post-git-add call must return Some"
     );
-    let count3 = super::ENUM_CALL_COUNT.load(Ordering::Relaxed);
+    let count3 = super::ENUM_CALL_COUNT.with(std::cell::Cell::get);
     assert_eq!(
         count3, 2,
         "AC13(ii): post-git-add call must be a cache MISS (ENUM_CALL_COUNT increments to 2)"

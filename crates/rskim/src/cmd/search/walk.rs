@@ -125,11 +125,22 @@ const MAX_ANCESTORS: usize = 256;
 /// producer skip sample (AD-395-2).
 pub(super) const MAX_SKIP_REASONS: usize = 10_000;
 
-/// Test-only counter: incremented once per live `gix` call in
+/// Test-only per-thread counter: incremented once per live `gix` call in
 /// [`list_tracked_files`].  Used by the AC13 unit test to discriminate cache
 /// hits (counter unchanged) from cache misses (counter increments).
+///
+/// A THREAD-LOCAL (not a shared global `AtomicUsize`) so the count is isolated
+/// per test. libtest runs each test on its own thread, and `list_tracked_files`
+/// always runs on the caller's thread (the union merge in [`merge_tracked_union`]
+/// happens AFTER the parallel walk joins). A shared global counter would be
+/// racily incremented by every other test that calls [`walk_metadata`] on a git
+/// root (`test_walk_metadata_*`, the AC6/AC9 union tests) running concurrently
+/// under `RUST_TEST_THREADS`, which `#[serial]` does not guard against, making
+/// AC13's cache-hit/miss assertions flaky. Per-thread isolation removes the race.
 #[cfg(test)]
-pub(super) static ENUM_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    pub(super) static ENUM_CALL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 // ============================================================================
 // Typed read outcome
@@ -629,7 +640,7 @@ fn tracked_files_memoized(root: &Path) -> Option<Vec<PathBuf>> {
 /// gitlink/skip-worktree filtering: no subprocess does this for you.
 fn list_tracked_files(root: &Path) -> Option<Vec<PathBuf>> {
     #[cfg(test)]
-    ENUM_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    ENUM_CALL_COUNT.with(|c| c.set(c.get() + 1));
 
     use gix::bstr::ByteSlice as _;
 
