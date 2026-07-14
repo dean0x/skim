@@ -1357,12 +1357,11 @@ fn test_list_tracked_files_gitlink_excluded() {
 
     // Helper closure: run git in a specific dir.
     let git = |args: &[&str], cwd: &std::path::Path| {
-        let out = StdCmd::new("git")
+        StdCmd::new("git")
             .args(args)
             .current_dir(cwd)
             .output()
-            .unwrap();
-        out
+            .unwrap()
     };
 
     // Build a minimal "remote" repo that the submodule will point to.
@@ -1502,7 +1501,7 @@ fn test_merge_tracked_union_no_duplicate_skip_for_already_skipped() {
 ///
 /// AC6 (#402) only verifies determinism at max_files=50_000, so the `entries.sort`
 /// + `entries.truncate(max_files)` branch in `merge_tracked_union` is never
-/// exercised with union entries actually present AND the cap actually binding.
+///   exercised with union entries actually present AND the cap actually binding.
 ///
 /// PF-012: selection is "the max_files smallest keys over the complete candidate
 /// set" (an order-invariant SET function), not "the first max_files visited".

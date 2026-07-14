@@ -3090,7 +3090,7 @@ fn test_ac8_existing_root_uses_canonicalized_sha256() {
     };
     assert_eq!(
         tail,
-        PathBuf::from("search").join(&expected_hash),
+        PathBuf::from("search").join(expected_hash),
         "AC8: existing-root path tail must be search/<sha256(canonical)[..16]>"
     );
 }
