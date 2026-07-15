@@ -6,10 +6,11 @@
 
 use assert_cmd::Command;
 use tempfile::TempDir;
+mod common;
 
 /// Get a command for the skim binary with clean env
 fn skim_cmd() -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd.env_remove("SKIM_DEBUG");
     cmd

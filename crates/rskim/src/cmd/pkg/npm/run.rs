@@ -101,6 +101,9 @@ pub(super) fn run_script(
             // which the tool-specific parsers exist to compress.
             expected_exit_codes: &[1],
             forward_stderr: false,
+            skip_net_savings_guard: false,
+            // npm run output is the script's own stdout; success output is not empty.
+            synthesize_success_line: None,
         },
         move |output: &CommandOutput| parse_npm_output(output, tool),
     )

@@ -15,9 +15,10 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+mod common;
 
 fn skim_cmd() -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd.env_remove("SKIM_DEBUG");
     cmd
@@ -57,10 +58,10 @@ fn test_cargo_tier1_json_fail_structured_output() {
 // Cargo: Tier 1 (nextest) via stdin
 // ============================================================================
 // NOTE: When piping nextest output via stdin (no args), `is_nextest` is false
-// because the cargo parser checks args for "nextest". Without the nextest flag,
-// the nextest text format falls through to passthrough (no JSON suite events,
-// no `test result:` regex match). This is a known limitation of stdin-piped
-// nextest output.
+// because the dispatch checks whether the first runner arg is "nextest" (A2).
+// Without the nextest flag, the nextest text format falls through to passthrough
+// (no JSON suite events, no `test result:` regex match). This is a known
+// limitation of stdin-piped nextest output.
 
 #[test]
 fn test_cargo_nextest_pass_passthrough_via_stdin() {
@@ -358,13 +359,18 @@ fn test_no_stderr_hint_on_success() {
 #[test]
 fn test_no_stderr_hint_on_passthrough() {
     // Unparseable input triggers tier 3 passthrough in vitest's own run().
-    // Vitest passthrough returns ExitCode::FAILURE but does not emit the hint
-    // because it bypasses run_parsed_command_with_mode entirely.
+    //
+    // Fix #3.1: passthrough with ExitSource::Stdin now returns exit 0 (no
+    // spawned process to report failure; resolve_exit_code defers to process
+    // exit, which is absent/0 for pure stdin paths).
+    //
+    // The hint-suppression invariant is UNCHANGED: vitest passthrough bypasses
+    // run_parsed_command_with_mode entirely, so the hint is never emitted here.
     skim_cmd()
         .args(["vitest", "run"])
         .write_stdin("completely unparseable garbage output that matches nothing\n")
         .assert()
-        .code(predicate::ne(0))
+        .code(0)
         .stderr(predicate::str::contains("[skim] compressed output").not());
 }
 

@@ -58,7 +58,19 @@ pub(crate) fn run(
     };
 
     match runner {
-        "cargo" => cargo::run(runner_args, show_stats, rec),
+        "cargo" => {
+            // UNREACHABLE via production dispatch: since the A1 fix,
+            // `dispatch_cargo` routes the "test" and "nextest" arms directly to
+            // `cargo::run` with is_nextest threaded from the dispatch arm — never
+            // re-derived from args position.  This unreachable guard surfaces any
+            // accidental regression where a new call-site bypasses dispatch_cargo.
+            // (A2 contract: is_nextest is threaded from the dispatcher, never
+            // sniffed from args.)
+            unreachable!(
+                "cargo runner is dispatched directly via dispatch_cargo → cargo::run \
+                 (A1 fix); reaching this arm means a new call-site bypassed dispatch_cargo"
+            )
+        }
         "cypress" => cypress::run(runner_args, show_stats, rec),
         "dotnet" => dotnet::run(runner_args, show_stats, rec),
         "go" => go::run(runner_args, show_stats, rec),

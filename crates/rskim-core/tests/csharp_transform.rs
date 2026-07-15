@@ -188,15 +188,37 @@ fn test_csharp_minimal_strips_regular_comments() {
 // ============================================================================
 
 #[test]
-fn test_csharp_pseudo_strips_visibility() {
+fn test_csharp_pseudo_preserves_visibility() {
+    // Access modifiers (public/private/protected/internal) convey API surface —
+    // preserved in pseudo mode (A4 contract).
     let result = transform(SIMPLE_CS, Language::CSharp, Mode::Pseudo).unwrap();
     assert!(
-        !result.contains("public "),
-        "public modifier should be stripped, got:\n{result}"
+        result.contains("public "),
+        "public modifier must be preserved as API surface, got:\n{result}"
     );
     assert!(
-        !result.contains("private "),
-        "private modifier should be stripped, got:\n{result}"
+        result.contains("private "),
+        "private modifier must be preserved as API surface, got:\n{result}"
+    );
+}
+
+#[test]
+fn test_csharp_pseudo_still_strips_static() {
+    // Non-visibility modifiers (static/virtual/override/sealed/abstract) still stripped (A4).
+    let source = "public class Service {\n    public static readonly int MAX = 100;\n    public virtual void Process() {}\n}\n";
+    let result = transform(source, Language::CSharp, Mode::Pseudo).unwrap();
+    assert!(
+        !result.contains("static "),
+        "static must still be stripped as non-visibility, got:\n{result}"
+    );
+    assert!(
+        !result.contains("virtual "),
+        "virtual must still be stripped as non-visibility, got:\n{result}"
+    );
+    // visibility preserved
+    assert!(
+        result.contains("public "),
+        "public must still be present, got:\n{result}"
     );
 }
 

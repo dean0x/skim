@@ -3,9 +3,10 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
+mod common;
 
 fn skim_cmd() -> Command {
-    Command::cargo_bin("skim").unwrap()
+    common::skim()
 }
 
 #[test]

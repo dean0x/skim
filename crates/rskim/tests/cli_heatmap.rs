@@ -3,10 +3,10 @@
 //! Tests end-to-end CLI behavior for git history risk/coupling analysis.
 //! For tests that need a git repo, we create a TempDir and set up deterministic commits.
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::Path;
 use std::process::Command as StdCommand;
+mod common;
 
 // ============================================================================
 // Test helpers
@@ -192,8 +192,7 @@ fn create_repo_with_lock_file(dir: &Path) {
 
 #[test]
 fn test_heatmap_help_exits_0() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["heatmap", "--help"])
         .assert()
         .success();
@@ -201,8 +200,7 @@ fn test_heatmap_help_exits_0() {
 
 #[test]
 fn test_heatmap_help_contains_flag_names() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["heatmap", "--help"])
         .assert()
         .success()
@@ -225,8 +223,7 @@ fn test_heatmap_help_contains_flag_names() {
 #[test]
 fn test_heatmap_not_git_repo_exits_failure() {
     let dir = tempfile::tempdir().expect("tempdir");
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["heatmap"])
         .current_dir(dir.path())
         .assert()
@@ -242,8 +239,7 @@ fn test_heatmap_not_git_repo_exits_failure() {
 fn test_heatmap_empty_repo_exits_failure() {
     let dir = tempfile::tempdir().expect("tempdir");
     git_init(dir.path());
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["heatmap"])
         .current_dir(dir.path())
         .assert()
@@ -263,8 +259,7 @@ fn test_heatmap_json_output_valid_json() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["heatmap", "--json"])
         .current_dir(dir.path())
         .output()
@@ -300,8 +295,7 @@ fn test_heatmap_json_has_all_metric_keys() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["heatmap", "--json"])
         .current_dir(dir.path())
         .output()
@@ -333,8 +327,7 @@ fn test_heatmap_text_output_contains_sections() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["heatmap"])
         .current_dir(dir.path())
         .assert()
@@ -380,8 +373,7 @@ fn test_heatmap_since_filters_commits() {
     );
 
     // --since=2023-01-01 (epoch 1672531200) should include only the two recent commits
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["heatmap", "--json", "--since=1672531200"])
         .current_dir(dir.path())
         .assert()
@@ -400,8 +392,7 @@ fn test_heatmap_window_sprint_preset() {
     // create_test_repo uses recent_ts() (7 days ago), well within sprint (14 days)
     create_test_repo(dir.path());
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["heatmap", "--window=sprint"])
         .current_dir(dir.path())
         .assert()
@@ -417,8 +408,7 @@ fn test_heatmap_path_scope() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["heatmap", "--json", "--path=src/", "--no-exclude"])
         .current_dir(dir.path())
         .output()
@@ -450,15 +440,13 @@ fn test_heatmap_no_exclude_includes_lock_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_repo_with_lock_file(dir.path());
 
-    let output_with_exclude = Command::cargo_bin("skim")
-        .unwrap()
+    let output_with_exclude = common::skim()
         .args(["heatmap", "--json"])
         .current_dir(dir.path())
         .output()
         .expect("spawn skim heatmap (default excludes)");
 
-    let output_no_exclude = Command::cargo_bin("skim")
-        .unwrap()
+    let output_no_exclude = common::skim()
         .args(["heatmap", "--json", "--no-exclude"])
         .current_dir(dir.path())
         .output()
@@ -506,8 +494,7 @@ fn test_heatmap_coupling_threshold_flag_accepted() {
     create_test_repo(dir.path());
 
     // A very low threshold should not crash
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["heatmap", "--coupling-threshold=0.1"])
         .current_dir(dir.path())
         .assert()
@@ -530,8 +517,7 @@ fn test_heatmap_single_commit_repo() {
         recent_ts(),
     );
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["heatmap", "--json"])
         .current_dir(dir.path())
         .output()
@@ -579,8 +565,7 @@ fn test_heatmap_top_flag_limits_output() {
         }
     }
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["heatmap", "--json", "--top=3"])
         .current_dir(dir.path())
         .output()
@@ -603,8 +588,7 @@ fn test_heatmap_top_flag_limits_output() {
     );
 
     // Text output with --top=3 should succeed and show Top Churn section
-    let text_output = Command::cargo_bin("skim")
-        .unwrap()
+    let text_output = common::skim()
         .args(["heatmap", "--top=3"])
         .current_dir(dir.path())
         .output()
@@ -633,8 +617,7 @@ fn test_heatmap_last_flag() {
     git_commit(dir.path(), "c.rs", "c", "third", base_ts + 200);
 
     // --last 3 should succeed and analyze commits
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["heatmap", "--last=3", "--json"])
         .current_dir(dir.path())
         .assert()
@@ -647,8 +630,7 @@ fn test_heatmap_last_flag() {
 
 #[test]
 fn test_heatmap_registered_in_help() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["--help"])
         .assert()
         .success()
@@ -664,8 +646,7 @@ fn test_heatmap_explicit_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg("heatmap")
         .arg("--json")
         .arg("src/main.rs")
@@ -696,8 +677,7 @@ fn test_heatmap_explicit_files_text_header() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg("heatmap")
         .arg("src/main.rs")
         .current_dir(dir.path())
@@ -717,8 +697,7 @@ fn test_heatmap_diff_and_files_mutual_exclusion() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("heatmap")
         .arg("--diff")
         .arg("main")
@@ -734,8 +713,7 @@ fn test_heatmap_diff_bad_ref() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("heatmap")
         .arg("--diff")
         .arg("nonexistent-branch")
@@ -752,8 +730,7 @@ fn test_heatmap_file_not_in_history() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg("heatmap")
         .arg("--json")
         .arg("nonexistent.rs")
@@ -778,8 +755,7 @@ fn test_heatmap_files_no_top_truncation() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg("heatmap")
         .arg("--json")
         .arg("src/main.rs")
@@ -800,8 +776,7 @@ fn test_heatmap_no_targets_unchanged() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg("heatmap")
         .arg("--json")
         .current_dir(dir.path())
@@ -837,8 +812,7 @@ fn test_heatmap_diff_flag() {
         recent_ts(),
     );
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg("heatmap")
         .arg("--diff")
         .arg("main")
@@ -864,8 +838,7 @@ fn test_heatmap_diff_no_changes() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("heatmap")
         .arg("--diff")
         .arg("HEAD")
@@ -902,8 +875,7 @@ fn test_heatmap_coupling_preserved_with_targets() {
         ts + 7 * 86400,
     );
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg("heatmap")
         .arg("--json")
         .arg("src/main.rs")
@@ -936,8 +908,7 @@ fn test_insights_text_output() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["heatmap", "--insights"])
         .env("NO_COLOR", "1")
         .current_dir(dir.path())
@@ -952,8 +923,7 @@ fn test_insights_text_no_metric_sections() {
     create_test_repo(dir.path());
 
     // --insights should produce only the Insights section, not the full heatmap sections
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["heatmap", "--insights"])
         .env("NO_COLOR", "1")
         .current_dir(dir.path())
@@ -970,8 +940,7 @@ fn test_insights_json_output() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["heatmap", "--insights", "--json"])
         .current_dir(dir.path())
         .output()
@@ -996,8 +965,7 @@ fn test_insights_json_has_top_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["heatmap", "--insights", "--json"])
         .current_dir(dir.path())
         .output()
@@ -1021,8 +989,7 @@ fn test_json_without_insights_unchanged() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["heatmap", "--json"])
         .current_dir(dir.path())
         .output()
@@ -1062,8 +1029,7 @@ fn test_insights_empty_repo() {
     // With only 1 commit, the tool might succeed or fail depending on min threshold.
     // Both outcomes are valid; assert specific behavior on each path so a panic or
     // unexpected output is caught rather than silently passing.
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .args(["heatmap", "--insights"])
         .env("NO_COLOR", "1")
         .current_dir(dir.path())
@@ -1093,8 +1059,7 @@ fn test_insights_with_file_targeting() {
     create_test_repo(dir.path());
 
     // --insights with a positional file arg should succeed and show insights output
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["heatmap", "--insights", "src/main.rs"])
         .env("NO_COLOR", "1")
         .current_dir(dir.path())
@@ -1105,8 +1070,7 @@ fn test_insights_with_file_targeting() {
 
 #[test]
 fn test_insights_help_text() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["heatmap", "--help"])
         .assert()
         .success()

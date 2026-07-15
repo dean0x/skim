@@ -32,6 +32,20 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::FileOps,
     expected_exit_codes: &[1],
     forward_stderr: true,
+    // Group-by-file ALWAYS, regardless of result size. The net-savings guard
+    // would flip small result sets back to the raw `file:line:content` format,
+    // so the SAME `grep -n` produced two different shapes depending on match
+    // volume — the cross-invocation inconsistency agents flagged. Skipping the
+    // guard makes the grouped format the single, predictable output. The cost is
+    // that tiny greps may render a few bytes larger than raw; that trade-off is
+    // an accepted, deliberate relaxation of the never-larger-than-raw guard for
+    // grep/rg (not the byte-faithful #317 *content* guarantee — every matching
+    // line is still emitted exactly once). Passthrough cases (-c/-l/-L,
+    // unparseable output, over the line-bound) are unaffected: parse returns the
+    // passthrough tier and the guard branch is skipped regardless of this flag.
+    skip_net_savings_guard: true,
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 /// Run `skim grep [args...]`.
@@ -292,7 +306,7 @@ fn try_parse_single_target(text: &str, label: &str, line_numbers: bool) -> Optio
         }
         let formatted = if line_numbers {
             match RE_LINENO_CONTENT.captures(line) {
-                Some(caps) => format!("  :{}: {}", &caps[1], caps[2].trim()),
+                Some(caps) => format!("  :{}: {}", &caps[1], caps[2].trim_end()),
                 None => format!("  {line}"),
             }
         } else {
@@ -416,16 +430,45 @@ mod tests {
         assert!(!rendered.contains("more files"), "no elision footer");
     }
 
+    /// D1 (#370): single file → header `grep 1`, footer `1 file`.
+    /// No `GREP:` prefix, no `matches in` double-header.
     #[test]
-    fn test_summary_line_present() {
+    fn test_file_count_footer_singular() {
         let input = "src/a.rs:1:hello world\n";
         let result = parse_multi(input).unwrap();
         let rendered = format!("{result}");
         assert!(
             rendered.contains("grep "),
-            "Should contain grep summary, got: {rendered}"
+            "canonical header must contain tool name: {rendered}"
         );
-        assert!(rendered.contains("matches in"));
+        assert!(
+            !rendered.contains("matches in"),
+            "must not contain double-header 'matches in': {rendered}"
+        );
+        assert!(
+            !rendered.contains("GREP:"),
+            "must not contain 'GREP:' prefix: {rendered}"
+        );
+        assert!(
+            rendered.trim_end().ends_with("1 file"),
+            "footer must be '1 file' (singular): {rendered}"
+        );
+    }
+
+    /// D1 (#370): two files → header `grep N`, footer `2 files`.
+    #[test]
+    fn test_file_count_footer_plural() {
+        let input = "src/a.rs:1:hello\nsrc/b.rs:2:world\n";
+        let result = parse_multi(input).unwrap();
+        let rendered = format!("{result}");
+        assert!(
+            !rendered.contains("matches in"),
+            "must not contain double-header: {rendered}"
+        );
+        assert!(
+            rendered.trim_end().ends_with("2 files"),
+            "footer must be '2 files' (plural): {rendered}"
+        );
     }
 
     #[test]
@@ -597,7 +640,24 @@ mod tests {
             rendered.contains("<stdin>"),
             "zero operands => stdin is the honest label: {rendered}"
         );
-        assert!(rendered.contains("3 matches"), "{rendered}");
+        // D1 (#370): count lives in the canonical `grep N` header now; old
+        // `"N matches in M files"` summary was removed.
+        assert!(
+            rendered.contains("grep 3"),
+            "count in canonical header: {rendered}"
+        );
+        assert!(
+            !rendered.contains("matches in"),
+            "must not contain old summary: {rendered}"
+        );
+        assert!(
+            !rendered.contains("GREP:"),
+            "must not contain old GREP: prefix: {rendered}"
+        );
+        assert!(
+            rendered.trim_end().ends_with("1 file"),
+            "footer must show '1 file' (not contains — avoid false match on 'N files'): {rendered}"
+        );
     }
 
     #[test]
@@ -611,6 +671,26 @@ mod tests {
             result.is_passthrough(),
             "unattributable lines must passthrough, got {}",
             result.tier_name()
+        );
+    }
+
+    /// R7: single-target path must preserve leading whitespace.
+    /// Leading spaces are semantically significant in Python, YAML, etc.
+    /// `.trim()` was stripping them, breaking indented definitions.
+    #[test]
+    fn test_r7_single_target_preserves_leading_indent() {
+        let grep_args = GrepArgs::scan(&args(&["-n", "def", "test.py"]));
+        let output = make_output("5:    def __init__(self):\n8:        pass\n");
+        let result = parse_impl(&output, &grep_args);
+        assert!(result.is_full());
+        let rendered = result.content().to_string();
+        assert!(
+            rendered.contains("    def __init__"),
+            "leading 4-space indent must be preserved (R7): {rendered}"
+        );
+        assert!(
+            rendered.contains("        pass"),
+            "8-space indent must be preserved (R7): {rendered}"
         );
     }
 

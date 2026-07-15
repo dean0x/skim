@@ -5,6 +5,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::PathBuf;
+mod common;
 
 fn fixture_path(name: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -22,7 +23,7 @@ fn read_fixture(name: &str) -> String {
 }
 
 fn skim_cmd() -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd
 }
@@ -116,13 +117,18 @@ fn test_skim_test_vitest_stdin_regex_fallback() {
 
 #[test]
 fn test_skim_test_vitest_stdin_passthrough() {
+    // Fix #3.1: passthrough with ExitSource::Stdin now returns exit 0.
+    // Unparseable stdin has no spawned process to report failure; resolve_exit_code
+    // defers to the process exit which is absent (0) for pure stdin paths.
+    // The verbatim raw content is still forwarded to stdout, and the [skim:notice]
+    // marker is still emitted to stderr via emit_markers.
     let input = "completely unparseable output";
 
     skim_cmd()
         .args(["--debug", "vitest", "run"])
         .write_stdin(input)
         .assert()
-        .failure()
+        .success()
         .stdout(predicate::str::contains("completely unparseable output"))
         .stderr(predicate::str::contains("[skim:notice]"));
 }
@@ -165,8 +171,7 @@ fn test_vitest_with_args_does_not_read_stdin() {
     //
     // The key assertion: stdout must NOT be empty. Skim spawns vitest run (which
     // is not installed), producing an error message on stdout.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env_remove("SKIM_DEBUG")
         .arg("vitest")
@@ -178,8 +183,7 @@ fn test_vitest_with_args_does_not_read_stdin() {
 
 #[test]
 fn test_jest_with_args_does_not_read_stdin() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env_remove("SKIM_DEBUG")
         .arg("jest")

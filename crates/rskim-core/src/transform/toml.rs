@@ -83,13 +83,16 @@ fn extract_table_structure(
         return Ok("{}".to_string());
     }
 
-    // SECURITY: Track total keys across all tables to prevent memory exhaustion
+    // Key count over the cap: a legitimate but very large TOML file (e.g. a
+    // lockfile or a generated config). Signal a complexity limit so the dispatcher
+    // degrades to lossless raw passthrough instead of failing. (#317)
     *key_count += table.len();
     if *key_count > MAX_TOML_KEYS {
-        return Err(SkimError::ParseError(format!(
-            "TOML key count exceeded: {} (max: {}). Possible malicious input.",
-            key_count, MAX_TOML_KEYS
-        )));
+        return Err(SkimError::ComplexityLimit {
+            what: "TOML keys",
+            count: *key_count,
+            max: MAX_TOML_KEYS,
+        });
     }
 
     let indent = "  ".repeat(depth);
@@ -280,7 +283,8 @@ point = { x = 1, y = 2 }
 
     #[test]
     fn test_key_count_limit() {
-        // SECURITY TEST: Ensure TOML with >10,000 keys is rejected
+        // LIMIT TEST: Ensure TOML with >10,000 keys produces a ComplexityLimit error
+        // (which the dispatcher catches and degrades to passthrough; transform_toml itself still Errs).
         let mut toml_str = String::new();
         for i in 0..10_001 {
             toml_str.push_str(&format!("key_{} = {}\n", i, i));
@@ -293,8 +297,8 @@ point = { x = 1, y = 2 }
             .expect_err("Expected error for key count limit")
             .to_string();
         assert!(
-            err.contains("key count exceeded"),
-            "Error message should mention key count limit, got: {}",
+            err.contains("exceeded safety cap"),
+            "Error message should mention safety cap, got: {}",
             err
         );
     }

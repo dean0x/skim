@@ -20,9 +20,10 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serial_test::serial;
+mod common;
 
 fn skim_cmd() -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     // Remove SKIM_PASSTHROUGH so the daemon guard is active.
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd

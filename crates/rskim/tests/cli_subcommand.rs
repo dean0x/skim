@@ -7,6 +7,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
+mod common;
 
 const FIND_FIXTURE: &str = include_str!("fixtures/cmd/file/find_small.txt");
 const GH_FIXTURE: &str = include_str!("fixtures/cmd/infra/gh_pr_list.json");
@@ -21,7 +22,7 @@ const GH_RUN_VIEW_FIXTURE: &str = include_str!("fixtures/cmd/infra/gh_run_view.j
 const LOG_FIXTURE: &str = include_str!("fixtures/cmd/log/plaintext_mixed.txt");
 
 fn skim_cmd() -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd.env_remove("SKIM_DEBUG");
     cmd
@@ -37,8 +38,7 @@ fn test_file_with_extension_routes_to_file_operation() {
     let file = dir.path().join("test.ts");
     fs::write(&file, "function add(a: number): number { return a; }").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file)
         .assert()
         .success()
@@ -52,8 +52,7 @@ fn test_file_named_init_py_routes_to_file_operation() {
     fs::write(&file, "def hello(): pass").unwrap();
 
     // "init" is a known subcommand, but "init.py" contains a dot
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file)
         .assert()
         .success()
@@ -68,8 +67,7 @@ fn test_path_with_separator_routes_to_file_operation() {
     let file = subdir.join("test.rs");
     fs::write(&file, "fn main() {}").unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file)
         .arg("--mode=signatures")
         .assert()
@@ -78,8 +76,7 @@ fn test_path_with_separator_routes_to_file_operation() {
 
 #[test]
 fn test_stdin_dash_routes_to_file_operation() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("-l")
         .arg("rust")
@@ -96,8 +93,7 @@ fn test_glob_pattern_routes_to_file_operation() {
     fs::write(&file, "const x = 1;").unwrap();
 
     // Glob chars → FileOperation (use relative pattern with current_dir)
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .current_dir(dir.path())
         .arg("*.ts")
         .assert()
@@ -107,21 +103,13 @@ fn test_glob_pattern_routes_to_file_operation() {
 #[test]
 fn test_dot_routes_to_file_operation() {
     // "." is a directory — contains a dot → FileOperation
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg(".")
-        .assert()
-        .success();
+    common::skim().arg(".").assert().success();
 }
 
 #[test]
 fn test_no_positional_routes_to_file_operation() {
     // Flags only, no positional → FileOperation → clap handles --clear-cache
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg("--clear-cache")
-        .assert()
-        .success();
+    common::skim().arg("--clear-cache").assert().success();
 }
 
 #[test]
@@ -130,12 +118,7 @@ fn test_double_dash_before_subcommand_name_routes_to_file_operation() {
     // `--` means everything after is positional, so "test" is a file arg.
     // This will fail because no file named "test" exists, but the important
     // thing is it does NOT route to the subcommand stub.
-    let output = Command::cargo_bin("skim")
-        .unwrap()
-        .arg("--")
-        .arg("test")
-        .assert()
-        .failure();
+    let output = common::skim().arg("--").arg("test").assert().failure();
 
     // Should get a file error, not "not yet implemented"
     output.stderr(predicate::str::contains("not yet implemented").not());
@@ -148,8 +131,7 @@ fn test_double_dash_before_subcommand_name_routes_to_file_operation() {
 #[test]
 fn test_known_subcommand_init_is_implemented() {
     // "init" is a known, implemented subcommand — help should work
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("init")
         .arg("--help")
         .assert()
@@ -160,8 +142,7 @@ fn test_known_subcommand_init_is_implemented() {
 #[test]
 fn test_subcommand_init_with_unknown_flag_fails() {
     // "init" with an unknown flag should fail gracefully
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("init")
         .arg("--nonexistent-flag")
         .assert()
@@ -171,8 +152,7 @@ fn test_subcommand_init_with_unknown_flag_fails() {
 
 #[test]
 fn test_subcommand_help_exits_zero() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("init")
         .arg("--help")
         .assert()
@@ -184,8 +164,7 @@ fn test_subcommand_help_exits_zero() {
 #[test]
 fn test_subcommand_short_help_exits_zero() {
     // v2.8.0: "build" is no longer a top-level subcommand; use "cargo" instead.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("cargo")
         .arg("-h")
         .assert()
@@ -208,8 +187,7 @@ fn test_full_path_to_file_named_as_subcommand_uses_separator_heuristic() {
     fs::write(&file, "fn setup() {}").unwrap();
 
     // Full path contains "/" → routes via path-separator heuristic (never reaches path.exists())
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file)
         .arg("-l")
         .arg("rust")
@@ -228,8 +206,7 @@ fn test_bare_file_named_as_subcommand_routes_to_subcommand() {
     // After the router fix, bare "init" ALWAYS routes to the subcommand
     // regardless of whether a file with that name exists on disk.
     // To read such a file, users must use ./init or the full path.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .current_dir(dir.path())
         .arg("init")
         .arg("--help")
@@ -250,11 +227,7 @@ fn test_full_path_to_dir_named_as_subcommand_uses_separator_heuristic() {
     fs::write(&file, "fn main() {}").unwrap();
 
     // Full path contains "/" → routes via path-separator heuristic (never reaches path.exists())
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg(&build_dir)
-        .assert()
-        .success();
+    common::skim().arg(&build_dir).assert().success();
 }
 
 #[test]
@@ -270,8 +243,7 @@ fn test_bare_dir_named_as_subcommand_routes_to_subcommand() {
     // regardless of whether a directory with that name exists on disk.
     // To process such a directory, users must use ./cargo or the full path.
     // v2.8.0: "cargo" is a top-level subcommand (was "build" previously).
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .current_dir(dir.path())
         .arg("cargo")
         .arg("--help")
@@ -293,8 +265,7 @@ fn test_mode_flag_consumes_next_token() {
 
     // `--mode signatures` — "signatures" is consumed by --mode, not treated
     // as a positional.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("--mode")
         .arg("signatures")
         .arg(&file)
@@ -310,8 +281,7 @@ fn test_mode_equals_syntax_is_single_token() {
 
     // `--mode=signatures` is one token — the router sees no positional
     // before the file path.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("--mode=signatures")
         .arg(&file)
         .assert()
@@ -326,8 +296,7 @@ fn test_mode_equals_syntax_is_single_token() {
 fn test_help_lists_subcommands() {
     // v2.8.0: Flat dispatch — tool names are top-level subcommands.
     // "test" and "build" are no longer category subcommands.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("--help")
         .assert()
         .success()
@@ -346,8 +315,7 @@ fn test_help_lists_subcommands() {
 fn test_unknown_word_routes_to_file_operation() {
     // "foobar" is not a known subcommand — routes to FileOperation.
     // Clap/file-processing will produce an error since the file doesn't exist.
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("foobar")
         .assert()
         .failure()

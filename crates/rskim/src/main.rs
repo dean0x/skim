@@ -180,9 +180,17 @@ const MAX_TOKEN_BUDGET: usize = 10_000_000;
 ///
 /// Transform source code by stripping implementation details while
 /// preserving structure, signatures, and types.
+/// Version string: "X.Y.Z (shortsha)" — or "X.Y.Z (unknown)" for tarball builds.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("SKIM_GIT_COMMIT"),
+    ")"
+);
+
 #[derive(Parser, Debug)]
 #[command(name = "skim")]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = VERSION, about, long_about = None)]
 #[command(after_help = "EXAMPLES:\n  \
     skim file.ts                             Read TypeScript with structure mode (cached)\n  \
     skim file.py --mode signatures           Extract Python signatures\n  \
@@ -227,10 +235,10 @@ struct Args {
     #[arg(help = "Transformation mode: structure, signatures, types, full, minimal, or pseudo")]
     mode: ModeArg,
 
-    /// Override language detection (required for stdin unless --filename is given)
+    /// Override language detection; stdin without this flag, --filename, or a shebang degrades to lossless passthrough (exit 0)
     #[arg(short, long, alias = "lang", value_enum)]
     #[arg(
-        help = "Programming language: typescript, javascript, python, rust, go, java, c, cpp, csharp, ruby, sql, kotlin, swift, markdown, json, yaml, toml (or use --filename for auto-detection from stdin)"
+        help = "Programming language: typescript, javascript, python, rust, go, java, c, cpp, csharp, ruby, sql, kotlin, swift, bash, markdown, json, yaml, toml (or use --filename for auto-detection from stdin)"
     )]
     language: Option<LanguageArg>,
 
@@ -364,7 +372,7 @@ enum ModeArg {
     Types,
     Full,
     Minimal,
-    /// Pseudo mode — strips syntactic noise (types, visibility, decorators) while preserving logic
+    /// Pseudo mode — strips syntactic noise (types, decorators) while preserving logic and visibility
     Pseudo,
 }
 
@@ -411,6 +419,8 @@ enum LanguageArg {
     #[value(alias = "kt")]
     Kotlin,
     Swift,
+    #[value(alias = "sh")]
+    Bash,
 }
 
 impl From<LanguageArg> for Language {
@@ -433,6 +443,7 @@ impl From<LanguageArg> for Language {
             LanguageArg::Sql => Language::Sql,
             LanguageArg::Kotlin => Language::Kotlin,
             LanguageArg::Swift => Language::Swift,
+            LanguageArg::Bash => Language::Bash,
         }
     }
 }
@@ -590,9 +601,13 @@ fn detect_argv0_dispatch() -> Option<(String, Vec<String>)> {
 /// 128 characters.
 ///
 /// Only the equals form (`--session-id=VALUE`) is recognised. The space-separated
-/// form (`--session-id VALUE`) is not supported — the hook always injects the flag
-/// in equals form, and accepting the space form would complicate the pre-parse
-/// routing logic.
+/// form (`--session-id VALUE`) is not supported — accepting the space form would
+/// complicate the pre-parse routing logic.
+///
+/// **Priority**: this function is the forward-compat *fallback* only (#1.1).
+/// The hook no longer injects `--session-id` into the rewritten command; the flag
+/// is honoured here only so an OLD hook talking to a NEW binary (skew scenario)
+/// is not silently dropped. New code should attribute via sidecar or env var.
 ///
 /// This is a pure function over an iterator so it can be unit-tested without
 /// mutating `std::env::args()`.
@@ -687,6 +702,59 @@ fn strip_skim_wrappers_from_path() {
     }
 }
 
+// ============================================================================
+// D2b (#370): stdout-is-regular-file predicate for wrapper passthrough
+// ============================================================================
+
+/// Testable seam: return `true` when the `io::Result<Metadata>` describes a
+/// regular file. Used by [`stdout_is_regular_file`] so the check can be unit-
+/// tested with synthetic metadata without touching real file descriptors.
+#[cfg(unix)]
+fn is_regular_file_stdout(meta: std::io::Result<std::fs::Metadata>) -> bool {
+    meta.map(|m| m.is_file()).unwrap_or(false)
+}
+
+/// Return `true` when the process's stdout (fd 1) is a regular file.
+///
+/// When a PATH-wrapper invocation is `~/.skim/bin/gh api … > out.json`, the
+/// shell sets fd 1 → the file BEFORE exec-ing the wrapper. No `>` appears in
+/// argv, so the rewrite-engine guard (D2-A) cannot catch it. Detecting the fd
+/// directly and running the real tool with inherited stdio ensures raw bytes
+/// reach the file unmodified (#370, #317). Pipes/ttys are not regular files
+/// and fall through to normal compression (skim's core use case).
+///
+/// **Shared invariant (cross-surface):** "stdout redirected to a regular file
+/// must receive the tool's raw bytes, never a skim summary." This invariant is
+/// enforced by two independent mechanisms — one per interception surface —
+/// because each surface observes the redirect at a different stage:
+/// - **Wrapper surface (here, runtime):** `fstat(fd 1)` after the shell has
+///   already consumed `>` and opened the file; no `>` token remains in argv.
+/// - **Rewrite surface (static):** `stdout_redirected_to_file` in
+///   `cmd/rewrite/compound.rs` — syntactic `>` scan before the command runs.
+///
+/// Keep the two detectors in lockstep. If you widen or narrow the detection
+/// semantics here, audit `stdout_redirected_to_file` for the same forms
+/// (`>f`, `>>f`, `1>f`, `&>f`, `&>>f`).
+///
+/// Non-Unix: always returns `false` (compression proceeds normally).
+#[cfg(unix)]
+fn stdout_is_regular_file() -> bool {
+    use std::mem::ManuallyDrop;
+    use std::os::unix::io::FromRawFd;
+    // Borrow fd 1 via a ManuallyDrop wrapper so the destructor never closes it.
+    // SAFETY: ManuallyDrop suppresses File's Drop, so fd 1 is never closed
+    // (no double-close). If fd 1 is invalid (e.g. the process was started with
+    // stdout closed), f.metadata() returns Err; is_regular_file_stdout falls
+    // back to false and normal compression proceeds.
+    let f = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+    is_regular_file_stdout(f.metadata())
+}
+
+#[cfg(not(unix))]
+fn stdout_is_regular_file() -> bool {
+    false
+}
+
 fn main() -> ExitCode {
     // Strip ~/.skim/bin from PATH FIRST — before any thread is spawned.
     // This prevents infinite recursion when invoked as a symlink (PF-003).
@@ -704,22 +772,26 @@ fn main() -> ExitCode {
     // Read analytics config from env + CLI flag once at the system boundary.
     // Thread the struct down to all callers — no per-call env reads.
     let cli_disable_analytics = std::env::args().any(|a| a == "--disable-analytics");
-    // Parse --session-id=VALUE before subcommand routing so every subcommand
-    // inherits session context without per-subcommand parsing.
-    // AD-SC-1: Fall back to PID-keyed sidecar when --session-id is absent so
-    // direct skim invocations (bypassing the hook) still get attribution.
-    // Third fallback: SKIM_SESSION_ID env var, set in shell profile alongside
-    // the PATH export so sub-agents (which bypass hooks) still get attribution.
-    let session_id = parse_session_id(std::env::args())
-        .or_else(|| {
-            let dir = cmd::resolve_cache_dir()?;
-            cmd::session_sidecar::read_session_id(&dir)
-        })
-        .or_else(|| {
-            std::env::var("SKIM_SESSION_ID")
-                .ok()
-                .filter(|s| analytics::is_safe_session_id(s))
-        });
+    // Resolution priority (skew-proof, #1.1):
+    //   1. Sidecar (out-of-band, written by the hook) — preferred path.
+    //      Resolves via ancestry walk so even a child two levels deep finds it.
+    //   2. SKIM_SESSION_ID env var — wrapper surface attribution (profile export).
+    //   3. --session-id=VALUE flag — forward-compat fallback only.
+    //      Honoured so an OLD hook that still injects the flag is not lost, but
+    //      it is never the primary path. Flag injection was removed from the
+    //      hook (#1.1 / fix/rewrite-compression-batch) to prevent version-skew
+    //      hard-failures ("unexpected argument --session-id" on older binaries).
+    let session_id = {
+        let dir = cmd::resolve_cache_dir();
+        dir.as_deref()
+            .and_then(cmd::session_sidecar::read_session_id)
+    }
+    .or_else(|| {
+        std::env::var("SKIM_SESSION_ID")
+            .ok()
+            .filter(|s| analytics::is_safe_session_id(s))
+    })
+    .or_else(|| parse_session_id(std::env::args()));
     let analytics = analytics::AnalyticsConfig::from_process(cli_disable_analytics, session_id);
 
     // Mark the thread-spawn boundary.  Any code below this line may spawn
@@ -731,7 +803,20 @@ fn main() -> ExitCode {
     // parsing and route directly to the appropriate handler. PATH stripping
     // above ensures the handler won't find the symlink again (no recursion).
     let result: anyhow::Result<ExitCode> = if let Some((name, args)) = detect_argv0_dispatch() {
-        cmd::dispatch(&name, &args, &analytics)
+        // D2b (#370): when stdout is a regular file the shell has already
+        // redirected fd 1 to the file before exec-ing us. Run the real tool
+        // with inherited stdio so its raw bytes reach the file unmodified (#317).
+        // Pipes/ttys are not regular files → still compress (normal path).
+        // Guard is scoped to this wrapper-dispatch branch only. The Subcommand
+        // and FileOperation branches below are intentionally NOT guarded:
+        // `skim file.ts > out.txt` and `skim grep … > out.txt` are explicit skim
+        // invocations where the user wants skim's output saved — hoisting this
+        // guard above detect_argv0_dispatch() would break that workflow.
+        if stdout_is_regular_file() {
+            Ok(cmd::run_inherited_passthrough(&name, &args))
+        } else {
+            cmd::dispatch(&name, &args, &analytics)
+        }
     } else {
         match resolve_invocation() {
             Invocation::FileOperation => run_file_operation(&analytics).map(|()| ExitCode::SUCCESS),
@@ -743,7 +828,19 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {e:#}");
-            ExitCode::FAILURE
+            // Map known SkimError variants to documented exit codes:
+            //   exit 2 — parse error (grammar/syntax failure)
+            //   exit 3 — unsupported language / detection failure
+            //   exit 1 — all other errors (I/O, config, etc.)
+            if let Some(skim_err) = e.downcast_ref::<rskim_core::SkimError>() {
+                match skim_err {
+                    rskim_core::SkimError::ParseError(_) => ExitCode::from(2),
+                    rskim_core::SkimError::UnsupportedLanguage(_) => ExitCode::from(3),
+                    _ => ExitCode::FAILURE,
+                }
+            } else {
+                ExitCode::FAILURE
+            }
         }
     };
 
@@ -774,7 +871,7 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
     if args.files.is_empty() {
         anyhow::bail!(
             "FILE argument is required\n\
-             Usage: skim <FILE|DIR|GLOB> [--mode structure|signatures|types|full]\n\
+             Usage: skim <FILE|DIR|GLOB> [--mode structure|signatures|types|full|minimal|pseudo]\n\
              Use 'skim --help' for more information."
         );
     }
@@ -842,15 +939,25 @@ fn process_single_arg(
     process_options: process::ProcessOptions,
     multi_options: multi::MultiFileOptions,
 ) -> anyhow::Result<()> {
+    // Capture cwd on the main thread before any background threads are spawned.
+    // (std::env::current_dir is not safe to call from background threads in general.)
+    let cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .display()
+        .to_string();
+    let mode_str = format!("{:?}", Mode::from(args.mode)).to_lowercase();
+
     if file == "-" {
         let result = process::process_stdin(process_options, args.filename.as_deref())?;
         process::write_result_and_stats(&result, args.show_stats)?;
         record_file_analytics(
             analytics.enabled,
-            &result,
+            result,
             "skim -",
-            args,
+            mode_str,
             analytics.session_id.as_deref(),
+            cwd,
+            None, // stdin: no path to re-read
         );
         return Ok(());
     }
@@ -867,59 +974,123 @@ fn process_single_arg(
 
     let result = process::process_file(&path, process_options)?;
     process::write_result_and_stats(&result, args.show_stats)?;
+    let cmd = format!("skim {file}");
     record_file_analytics(
         analytics.enabled,
-        &result,
-        &format!("skim {file}"),
-        args,
+        result,
+        &cmd,
+        mode_str,
         analytics.session_id.as_deref(),
+        cwd,
+        Some(path), // file: re-read from disk in background
     );
     Ok(())
 }
 
 /// Record token analytics for file operations (single file or stdin).
+///
+/// Takes `result` by value so `output` and `stdin_raw` can be moved into the
+/// background thread without cloning.
+///
+/// `file_path` is `Some` for single-file ops (re-read on background thread) and
+/// `None` for stdin (buffer already captured in `result.stdin_raw`).
 fn record_file_analytics(
     enabled: bool,
-    result: &process::ProcessResult,
+    result: process::ProcessResult,
     cmd: &str,
-    args: &Args,
+    mode_str: String,
     session_id: Option<&str>,
+    cwd: String,
+    file_path: Option<PathBuf>,
 ) {
-    if !enabled {
-        return;
-    }
-    if let (Some(raw), Some(comp)) = (result.original_tokens, result.transformed_tokens) {
-        let cwd = std::env::current_dir()
-            .unwrap_or_default()
-            .display()
-            .to_string();
-        let lang = args
-            .language
-            .map(|l| format!("{:?}", Language::from(l)).to_lowercase());
-        let mode = format!("{:?}", Mode::from(args.mode)).to_lowercase();
-        analytics::record_with_counts(
-            true,
-            analytics::TokenSavingsRecord {
-                timestamp: analytics::now_unix_secs(),
-                command_type: analytics::CommandType::File,
-                original_cmd: cmd.to_string(),
-                raw_tokens: raw,
-                compressed_tokens: comp,
-                savings_pct: analytics::savings_percentage(raw, comp),
-                duration_ms: 0,
-                project_path: cwd,
-                mode: Some(mode),
-                language: lang,
-                parse_tier: result.parse_tier.map(str::to_string),
-                session_id: session_id.map(str::to_string),
+    // Determine counts variant: Known when both token counts are already computed
+    // (i.e. --show-stats ran, or a count-carrying cache hit); Tokenize otherwise.
+    let counts = match (result.original_tokens, result.transformed_tokens) {
+        (Some(raw), Some(comp)) => {
+            // AC F5: counts in hand — no re-read, no double work.
+            analytics::FileCounts::Known {
+                raw,
+                compressed: comp,
+            }
+        }
+        _ => match file_path {
+            Some(p) => analytics::FileCounts::Tokenize {
+                raw: analytics::RawSource::Reread(p),
+                compressed: result.output,
             },
-        );
-    }
+            None => {
+                // Stdin: inline buffer retained by process_stdin when !show_stats.
+                // If stdin_raw is None here it means show_stats was on and counts
+                // should have been Some — this branch is unreachable in practice,
+                // but we degrade gracefully: no row recorded.
+                let Some(buf) = result.stdin_raw else { return };
+                analytics::FileCounts::Tokenize {
+                    raw: analytics::RawSource::Inline(buf),
+                    compressed: result.output,
+                }
+            }
+        },
+    };
+
+    let language = result.language.map(|l| l.as_str().to_string());
+    let parse_tier = result.parse_tier.map(str::to_string);
+
+    analytics::record_file_ops(
+        enabled,
+        vec![analytics::FileOpRow {
+            counts,
+            original_cmd: cmd.to_string(),
+            language,
+            parse_tier,
+        }],
+        analytics::FileOpCommon {
+            mode: Some(mode_str),
+            project_path: cwd,
+            session_id: session_id.map(str::to_string),
+        },
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // D2b (#370): is_regular_file_stdout unit tests
+    // ========================================================================
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_regular_file_stdout_true_for_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let meta = tmp.as_file().metadata();
+        assert!(
+            is_regular_file_stdout(meta),
+            "metadata from a regular file must return true"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_regular_file_stdout_false_for_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = std::fs::metadata(tmp.path());
+        assert!(
+            !is_regular_file_stdout(meta),
+            "metadata from a directory must return false"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_regular_file_stdout_false_for_err() {
+        let meta: std::io::Result<std::fs::Metadata> =
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(
+            !is_regular_file_stdout(meta),
+            "Err metadata must return false (defensive)"
+        );
+    }
 
     // ========================================================================
     // validate_bounded_arg unit tests (B3)
@@ -1142,24 +1313,29 @@ mod tests {
     }
 
     // ========================================================================
-    // Fallback chain: parse_session_id().or_else(|| read_session_id()) (AD-SC-1)
+    // Resolution priority: sidecar > env > flag (skew-proof, #1.1)
+    //
+    // New priority (fix/rewrite-compression-batch):
+    //   1. Sidecar  — written by hook; skim child finds it via ancestry walk
+    //   2. Env var  — SKIM_SESSION_ID (wrapper surface / profile export)
+    //   3. Flag     — --session-id=VALUE forward-compat fallback (old hook)
+    //
+    // This is the inverse of the OLD priority (flag > sidecar > env).
+    // The flag is no longer injected by the hook, so it must never win over
+    // a fresh sidecar (which is more authoritative).
     // ========================================================================
 
-    /// AD-SC-1: When --session-id is absent, the sidecar fallback is used.
+    /// Priority 1: sidecar is used when present (with or without a flag).
     ///
-    /// This test exercises the actual .or_else() composition wired in main():
-    ///   parse_session_id(args).or_else(|| read_session_id(&dir))
+    /// Exercises the composition in main():
+    ///   sidecar.or_else(env).or_else(flag)
     ///
-    /// It writes a sidecar keyed to the current PID, passes args that contain
-    /// no --session-id flag, and asserts the composed result equals the sidecar
-    /// value. This validates that the two halves of the fallback chain connect
-    /// correctly at the entry point.
+    /// Writes a sidecar for the current PID, then asserts it is found first.
     #[test]
-    fn test_fallback_chain_uses_sidecar_when_no_flag() {
+    fn test_resolution_sidecar_wins() {
         use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
-        // "sessions" mirrors the private SESSIONS_DIR constant in session_sidecar.
         let sessions_dir = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
         std::fs::write(
@@ -1168,91 +1344,71 @@ mod tests {
         )
         .unwrap();
 
-        // No --session-id flag in args → parse_session_id returns None.
-        let from_parse = parse_session_id(["skim", "test", "cargo"]);
-        assert!(from_parse.is_none(), "precondition: no flag yields None");
+        // Compose sidecar > env > flag (as main() now does).
+        let resolved = cmd::session_sidecar::read_session_id(dir.path())
+            .or_else(|| {
+                // env (not set in this test)
+                std::env::var("SKIM_SESSION_ID")
+                    .ok()
+                    .filter(|s| analytics::is_safe_session_id(s))
+            })
+            .or_else(|| parse_session_id(["skim", "git", "status"]));
 
-        // Compose exactly as main() does.
-        let resolved = from_parse.or_else(|| cmd::session_sidecar::read_session_id(dir.path()));
         assert_eq!(
             resolved.as_deref(),
             Some("sidecar-session-42"),
-            "sidecar must be used when --session-id flag is absent"
+            "sidecar must be first in the priority chain"
         );
     }
 
-    /// AD-SC-1: When --session-id is present, parse_session_id wins and the
-    /// sidecar is never consulted.
+    /// Priority 1b: sidecar wins over a stray --session-id flag (old hook compat).
     ///
-    /// Mirrors the composition in main() but with an explicit flag. Even though
-    /// a valid sidecar exists for the current PID, the .or_else() closure must
-    /// not execute when the left-hand side is Some.
+    /// If the sidecar says "session-A" and an old hook injected "--session-id=session-B",
+    /// the sidecar must still win so we don't regress to flag-first behaviour.
     #[test]
-    fn test_fallback_chain_explicit_flag_wins_over_sidecar() {
+    fn test_resolution_sidecar_wins_over_flag() {
         use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
         let sessions_dir = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
-        // Plant a sidecar that would be found if the fallback were consulted.
         std::fs::write(
             sessions_dir.join(format!("{}.id", std::process::id())),
-            "sidecar-should-not-win",
+            "sidecar-wins-session",
         )
         .unwrap();
 
-        // --session-id flag present → parse_session_id returns Some.
-        let from_parse = parse_session_id(["skim", "--session-id=explicit-session-99"]);
-        assert_eq!(
-            from_parse.as_deref(),
-            Some("explicit-session-99"),
-            "precondition: flag value must be extracted"
-        );
+        // Simulate: sidecar present, flag also present (old hook scenario).
+        let resolved = cmd::session_sidecar::read_session_id(dir.path())
+            .or_else(|| parse_session_id(["skim", "--session-id=flag-session"]));
 
-        // Compose exactly as main() does.
-        let resolved = from_parse.or_else(|| cmd::session_sidecar::read_session_id(dir.path()));
         assert_eq!(
             resolved.as_deref(),
-            Some("explicit-session-99"),
-            "explicit --session-id must take priority over sidecar"
+            Some("sidecar-wins-session"),
+            "sidecar must win over stray --session-id flag (old-hook compat)"
         );
     }
 
-    /// AD-SC-1: When neither --session-id flag nor a sidecar is present,
-    /// SKIM_SESSION_ID env var is used as the final fallback.
+    /// Priority 2: env var is used when sidecar is absent.
     ///
-    /// `set_var` is not thread-safe in multi-threaded programs. `#[serial_test::serial]`
-    /// ensures no other test runs concurrently while the env var is mutated.
-    /// The env var is removed unconditionally via `catch_unwind` so a test
-    /// failure cannot poison the environment for subsequent tests.
+    /// `#[serial_test::serial]` prevents concurrent env-var mutation.
     #[serial_test::serial]
     #[test]
-    fn test_fallback_chain_env_var_used_when_no_flag_and_no_sidecar() {
+    fn test_resolution_env_wins_when_no_sidecar() {
         use tempfile::TempDir;
 
-        // Use a directory with no sidecar file so the middle leg returns None.
-        let dir = TempDir::new().unwrap();
-
+        let dir = TempDir::new().unwrap(); // empty — no sidecar
         let env_session = "env-session-007";
 
-        // Safety: single-threaded by #[serial_test::serial].
         unsafe { std::env::set_var("SKIM_SESSION_ID", env_session) };
 
         let outcome = std::panic::catch_unwind(|| {
-            // No --session-id flag → first leg returns None.
-            let from_parse = parse_session_id(["skim", "git", "status"]);
-            assert!(from_parse.is_none(), "precondition: no flag yields None");
+            // No sidecar → first leg is None.
+            let from_sidecar = cmd::session_sidecar::read_session_id(dir.path());
+            assert!(from_sidecar.is_none(), "precondition: no sidecar");
 
-            // No sidecar in this temp dir → second leg returns None.
-            let after_sidecar =
-                from_parse.or_else(|| cmd::session_sidecar::read_session_id(dir.path()));
-            assert!(
-                after_sidecar.is_none(),
-                "precondition: absent sidecar yields None"
-            );
-
-            // Third leg: SKIM_SESSION_ID env var.
-            let resolved = after_sidecar.or_else(|| {
+            // Env var supplies the session.
+            let resolved = from_sidecar.or_else(|| {
                 std::env::var("SKIM_SESSION_ID")
                     .ok()
                     .filter(|s| analytics::is_safe_session_id(s))
@@ -1260,14 +1416,80 @@ mod tests {
             assert_eq!(
                 resolved.as_deref(),
                 Some(env_session),
-                "SKIM_SESSION_ID env var must be used as the final fallback"
+                "SKIM_SESSION_ID env var must be the second priority when no sidecar"
             );
         });
 
-        // Always remove the env var — even if the assertions above panicked.
+        unsafe { std::env::remove_var("SKIM_SESSION_ID") };
+        outcome.expect("test panicked while SKIM_SESSION_ID was set");
+    }
+
+    /// Priority 3: flag is the final fallback when sidecar and env are both absent.
+    ///
+    /// This is the forward-compat path: an OLD hook still injects the flag, and
+    /// a new binary honours it — but only as a last resort.
+    #[serial_test::serial]
+    #[test]
+    fn test_resolution_flag_is_last_resort() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap(); // empty — no sidecar
+
+        // Ensure SKIM_SESSION_ID is not set.
         unsafe { std::env::remove_var("SKIM_SESSION_ID") };
 
-        outcome.expect("test panicked while SKIM_SESSION_ID was set");
+        let outcome = std::panic::catch_unwind(|| {
+            // No sidecar.
+            let from_sidecar = cmd::session_sidecar::read_session_id(dir.path());
+            assert!(from_sidecar.is_none(), "precondition: no sidecar");
+
+            // No env var (not set).
+            let after_env = from_sidecar.or_else(|| {
+                std::env::var("SKIM_SESSION_ID")
+                    .ok()
+                    .filter(|s| analytics::is_safe_session_id(s))
+            });
+            assert!(after_env.is_none(), "precondition: no env var");
+
+            // Flag (old hook forward-compat fallback).
+            let resolved =
+                after_env.or_else(|| parse_session_id(["skim", "--session-id=old-hook-flag"]));
+            assert_eq!(
+                resolved.as_deref(),
+                Some("old-hook-flag"),
+                "--session-id flag must be the last-resort fallback"
+            );
+        });
+
+        outcome.expect("test panicked");
+    }
+
+    /// AD-SC-1: When neither sidecar, env, nor flag is present, result is None.
+    ///
+    /// Graceful degradation: no attribution — no hard failure.
+    #[serial_test::serial]
+    #[test]
+    fn test_resolution_none_when_all_absent() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        unsafe { std::env::remove_var("SKIM_SESSION_ID") };
+
+        let outcome = std::panic::catch_unwind(|| {
+            let resolved = cmd::session_sidecar::read_session_id(dir.path())
+                .or_else(|| {
+                    std::env::var("SKIM_SESSION_ID")
+                        .ok()
+                        .filter(|s| analytics::is_safe_session_id(s))
+                })
+                .or_else(|| parse_session_id(["skim", "git", "status"]));
+            assert!(
+                resolved.is_none(),
+                "all sources absent must yield None (no panic, graceful degradation)"
+            );
+        });
+
+        outcome.expect("test panicked");
     }
 
     // ========================================================================

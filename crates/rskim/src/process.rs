@@ -54,17 +54,29 @@ pub(crate) struct ProcessResult {
     ///
     /// `None` for cache hits (tier was not recorded at write time).
     pub(crate) parse_tier: Option<&'static str>,
+    /// Effective language used for transformation.
+    ///
+    /// Set in all three constructors (file, stdin, cache-hit) so the analytics
+    /// layer can record the correct language without re-detecting from path.
+    /// Priority mirrors the transform path: explicit_lang wins, else auto-detect.
+    pub(crate) language: Option<Language>,
+    /// Raw stdin buffer retained for background tokenization.
+    ///
+    /// `Some(buffer)` only from `process_stdin` when `!show_stats` (stdin
+    /// cannot be re-read; the buffer must be kept).  All other constructors
+    /// set this to `None` (files can be re-read from disk).
+    pub(crate) stdin_raw: Option<String>,
 }
 
-/// Determine the parse quality tier from the mode and whether the parser reported errors.
+/// Determine the parse quality tier from the mode, parse-error flag, and degraded flag.
 ///
 /// - "passthrough" — Mode::Full; no transformation was applied
-/// - "degraded"    — tree-sitter reported syntax errors
-/// - "full"        — clean parse, no syntax errors
-pub(crate) fn parse_tier_from(mode: Mode, has_errors: bool) -> &'static str {
+/// - "degraded" — tree-sitter reported syntax errors, OR a structural safety cap was exceeded and the output was degraded to raw passthrough
+/// - "full" — clean parse, no syntax errors, and no cap-triggered degradation
+pub(crate) fn parse_tier_from(mode: Mode, has_errors: bool, degraded: bool) -> &'static str {
     if mode == Mode::Full {
         "passthrough"
-    } else if has_errors {
+    } else if has_errors || degraded {
         "degraded"
     } else {
         "full"
@@ -182,17 +194,43 @@ fn try_cached_result(
         (hit.original_tokens, hit.transformed_tokens)
     };
 
+    // Effective language for a cache hit: explicit override wins, else detect from path.
+    let cache_lang = options
+        .explicit_lang
+        .or_else(|| detect_language_from_path(path));
+
     Ok(Some(ProcessResult {
         output: hit.content,
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered: false,
         parse_tier: None, // tier was not recorded at cache-write time
+        language: cache_lang,
+        stdin_raw: None,
     }))
 }
 
 /// Read a file and validate it doesn't exceed the maximum input size.
+///
+/// Performs a pre-read metadata check to bail early before allocating memory,
+/// which prevents a transient peak of `num_cpus × file_size` when this function
+/// is called in parallel (e.g., via `into_par_iter` in the analytics recorder).
+/// The post-read length check is retained for TOCTOU safety (the file may grow
+/// between the stat and the read).
 fn read_and_validate(path: &Path) -> anyhow::Result<String> {
+    // Pre-read size guard: bail before allocating if the file is already over the limit.
+    // This is a best-effort check; a file that is exactly at the limit may pass here
+    // but fail the post-read check below if it grows between the stat and the read.
+    if let Ok(meta) = fs::metadata(path)
+        && meta.len() as usize > MAX_INPUT_SIZE
+    {
+        anyhow::bail!(
+            "File too large: {} bytes exceeds maximum of {} bytes ({}MB)",
+            meta.len(),
+            MAX_INPUT_SIZE,
+            MAX_INPUT_SIZE / 1024 / 1024
+        );
+    }
     let contents = fs::read_to_string(path)?;
     if contents.len() > MAX_INPUT_SIZE {
         anyhow::bail!(
@@ -208,10 +246,16 @@ fn read_and_validate(path: &Path) -> anyhow::Result<String> {
 /// Transform file contents, trying auto-detection first and falling back to
 /// `explicit_lang` when provided.
 ///
-/// Returns `(transformed_output, mode_used, has_errors, source_line_map)` where:
+/// Output tuple of [`run_transform`]:
+/// `(transformed_output, mode_used, has_errors, source_line_map, degraded)`.
+type RunTransformOutput = (String, Mode, bool, Option<Vec<usize>>, bool);
+
+/// Returns `(transformed_output, mode_used, has_errors, source_line_map, degraded)` where:
 /// - `has_errors` reflects whether the parser encountered syntax errors
 /// - `source_line_map` is `Some(map)` when `options.line_numbers` is true and the
 ///   transform produced a meaningful source line map; `None` otherwise
+/// - `degraded` is `true` when a structural safety cap was exceeded and the output
+///   was degraded to raw passthrough
 ///
 /// For cascade paths (token_budget is set) `has_errors` is always `false` and
 /// line numbers are applied after mode selection.
@@ -219,16 +263,21 @@ fn run_transform(
     contents: &str,
     path: &Path,
     options: &ProcessOptions,
-) -> anyhow::Result<(String, Mode, bool, Option<Vec<usize>>)> {
+) -> anyhow::Result<RunTransformOutput> {
     let explicit_lang = options.explicit_lang;
     // Non-line-number transform closure (used for cascade mode selection)
     let transform_file = |config: &TransformConfig| -> anyhow::Result<Option<String>> {
-        // Try auto-detection first; fall back to explicit language if provided.
+        // Try auto-detection first; fall back to an explicit language, then to a
+        // shebang-sniffed language. The shebang fallback keeps this closure in
+        // step with the language resolution used for the cascade budget below,
+        // so an extensionless script with a `#!` line transforms here instead of
+        // failing with UnsupportedLanguage (ADR-002).
         let auto_result = transform_auto_with_config(contents, path, config);
         if let Ok(output) = auto_result {
             return Ok(Some(output));
         }
-        let Some(language) = explicit_lang else {
+        let fallback_lang = explicit_lang.or_else(|| detect_language_from_shebang(contents));
+        let Some(language) = fallback_lang else {
             return Err(auto_result.unwrap_err().into());
         };
         Ok(Some(transform_with_config(contents, language, config)?))
@@ -236,15 +285,27 @@ fn run_transform(
 
     match options.trunc.token_budget {
         Some(budget) => {
+            // Resolve the language for cascade budget math: explicit override,
+            // then extension, then a shebang sniff of the first line. Mirrors the
+            // None branch so extensionless shebang scripts (e.g. `#!/bin/bash`)
+            // behave consistently with and without a token budget (ADR-002).
             let language = explicit_lang
                 .or_else(|| detect_language_from_path(path))
-                .unwrap_or_else(|| {
-                    eprintln!(
-                        "[skim] warning: language detection failed for '{}', defaulting to TypeScript",
-                        path.display(),
-                    );
-                    Language::TypeScript
-                });
+                .or_else(|| detect_language_from_shebang(contents));
+
+            let Some(language) = language else {
+                // No language detectable (unknown extension, no shebang match) —
+                // degrade to a lossless raw passthrough (ADR-002) instead of
+                // erroring with UnsupportedLanguage. Matches the None-branch
+                // degrade; the SKIM_DEBUG notice is emitted by process_file once
+                // this returns.
+                let output = passthrough_with_truncation(
+                    contents,
+                    options.trunc.max_lines,
+                    options.trunc.last_lines,
+                );
+                return Ok((output, options.mode, false, None, true)); // degraded=true
+            };
 
             // AC-10: Token counting for mode selection does NOT include line number annotations.
             // Run cascade WITHOUT line_numbers to select the best mode.
@@ -260,14 +321,14 @@ fn run_transform(
             // Use the re-run output directly as the final output (avoids double transform).
             let (final_output, line_map) = if options.line_numbers {
                 let config = cascade::build_config_with_opts(mode, &options.trunc, true);
-                let (rerun_output, _has_errors, map) =
+                let (rerun_output, _has_errors, map, _degraded) =
                     transform_with_line_map(contents, language, &config)?;
                 (rerun_output, map)
             } else {
                 (output, None)
             };
 
-            Ok((final_output, mode, false, line_map))
+            Ok((final_output, mode, false, line_map, false)) // cascade path: degraded signal N/A
         }
         None => {
             let language = explicit_lang.or_else(|| detect_language_from_path(path));
@@ -279,19 +340,137 @@ fn run_transform(
                     &options.trunc,
                     options.line_numbers,
                 );
-                let (output, has_errors, line_map) =
+                let (output, has_errors, line_map, degraded) =
                     transform_with_line_map(contents, lang, &config)?;
-                Ok((output, options.mode, has_errors, line_map))
+                Ok((output, options.mode, has_errors, line_map, degraded))
             } else {
-                // Language detection failed — try auto-detect via path extension.
-                // Can't get line map without a known language.
-                let config = cascade::build_config(options.mode, &options.trunc);
-                let output = transform_file(&config)?.ok_or_else(|| {
-                    anyhow::anyhow!("Language detection failed and no --language specified")
-                })?;
-                Ok((output, options.mode, false, None))
+                // Language detection failed from extension — try shebang.
+                let shebang_lang = detect_language_from_shebang(contents);
+
+                if let Some(lang) = shebang_lang {
+                    let config = cascade::build_config_with_opts(
+                        options.mode,
+                        &options.trunc,
+                        options.line_numbers,
+                    );
+                    let (output, has_errors, line_map, degraded) =
+                        transform_with_line_map(contents, lang, &config)?;
+                    return Ok((output, options.mode, has_errors, line_map, degraded));
+                }
+
+                // No language detectable — degrade to lossless passthrough (ADR-002).
+                // The SKIM_DEBUG notice is emitted by process_file after run_transform
+                // returns, not here, to avoid duplicate notices when called from
+                // process_file (which also checks degraded and emits one notice).
+                let output = passthrough_with_truncation(
+                    contents,
+                    options.trunc.max_lines,
+                    options.trunc.last_lines,
+                );
+                Ok((output, options.mode, false, None, true)) // degraded=true
             }
         }
+    }
+}
+
+/// Try to detect a language from a shebang (`#!`) on the first line of `text`.
+///
+/// Returns `None` when the first line is absent or not a recognised shebang.
+/// Centralises the repeated `text.lines().next().and_then(Language::from_shebang)`
+/// pattern used across the processing pipeline.
+fn detect_language_from_shebang(text: &str) -> Option<Language> {
+    text.lines().next().and_then(Language::from_shebang)
+}
+
+/// Apply optional line-count truncation for unknown-language passthrough.
+///
+/// Used when language detection fails and we fall back to a lossless raw
+/// passthrough (ADR-002). Uses `#` as the elision-marker prefix — the most
+/// neutral choice for shell/config files (the primary use case for
+/// extension-less files). Both the head-truncation marker
+/// (`# ... N lines truncated…`) and the tail marker (`# ... N lines above…`)
+/// state exact omission counts and carry a `SKIM_PASSTHROUGH=1` hint, matching
+/// ADR-001 elision-marker semantics.
+fn passthrough_with_truncation(
+    text: &str,
+    max_lines: Option<usize>,
+    last_lines: Option<usize>,
+) -> String {
+    if let Some(n) = max_lines {
+        // split_inclusive('\n') keeps each segment's original \r\n or \n
+        // terminator, so the retained portion is byte-faithful (#317 / ADR-002).
+        // str::lines() normalises \r\n → nothing and join("\n") adds only \n,
+        // making the old approach lossy for CRLF input.
+        let segs: Vec<&str> = text.split_inclusive('\n').collect();
+        if segs.len() <= n {
+            return text.to_string();
+        }
+        let keep = n.saturating_sub(1);
+        let omitted = segs.len() - keep;
+        let marker =
+            format!("# ... ({omitted} lines truncated; use SKIM_PASSTHROUGH=1 to see all)");
+        // Retained segments already carry their terminators; segs[keep-1] is
+        // not the last segment (total > n), so it is guaranteed to end with \n.
+        let mut out: String = segs[..keep].concat();
+        out.push_str(&marker);
+        out.push('\n');
+        out
+    } else if let Some(n) = last_lines {
+        let segs: Vec<&str> = text.split_inclusive('\n').collect();
+        if segs.len() <= n {
+            return text.to_string();
+        }
+        let keep = n.saturating_sub(1);
+        let omitted = segs.len() - keep;
+        let marker = format!("# ... ({omitted} lines above; use SKIM_PASSTHROUGH=1 to see all)");
+        // Tail segments carry their original terminators (including \r\n).
+        let tail_start = segs.len().saturating_sub(keep);
+        let mut out = marker;
+        if keep > 0 {
+            out.push('\n');
+            out.push_str(&segs[tail_start..].concat());
+        }
+        out
+    } else {
+        text.to_string()
+    }
+}
+
+/// Build the [`ProcessResult`] for the unknown-language stdin passthrough (ADR-002).
+///
+/// Extracted from [`process_stdin`] to collapse the duplicated passthrough
+/// `ProcessResult` construction and `stdin_raw` retention. Emits the single
+/// SKIM_DEBUG degrade notice, then returns a lossless windowed passthrough.
+///
+/// The caller must first rule out the `--filename` hard-error case (an explicit
+/// but unrecognised extension); this path is only reached when no language is
+/// detectable *and* no `--filename` hint was given.
+///
+/// `stdin_raw` follows the main-path invariant: `Some(buffer)` iff `!show_stats`
+/// (stdin cannot be re-read, so the buffer must travel with the result for
+/// background tokenization).
+fn stdin_passthrough_result(buffer: String, options: &ProcessOptions) -> ProcessResult {
+    if std::env::var("SKIM_DEBUG").as_deref() == Ok("1") {
+        eprintln!(
+            "[skim] notice: unknown language for stdin — degraded to lossless passthrough. \
+             Use --language to specify, or SKIM_PASSTHROUGH=1 to bypass."
+        );
+    }
+    let output =
+        passthrough_with_truncation(&buffer, options.trunc.max_lines, options.trunc.last_lines);
+    let stdin_raw = if !options.show_stats {
+        Some(buffer)
+    } else {
+        None
+    };
+    ProcessResult {
+        output,
+        original_tokens: None,
+        transformed_tokens: None,
+        guardrail_triggered: false,
+        parse_tier: Some("passthrough"),
+        language: None,
+        stdin_raw,
     }
 }
 
@@ -320,25 +499,42 @@ pub(crate) fn process_stdin(
 
     let filename_lang = filename_hint.and_then(|f| Language::from_path(Path::new(f)));
 
-    let language = options.explicit_lang.or(filename_lang).ok_or_else(|| {
-        if let Some(fname) = filename_hint {
-            anyhow::anyhow!(
-                "Language detection failed: unrecognized filename '{}'\n\
-                 Supported extensions: .ts, .tsx, .js, .jsx, .cjs, .mjs, .py, .rs, .go, .java, .c, .h, .cpp, .hpp, .cxx, .cc, .md, .json, .yaml, .yml, .toml\n\
-                 Hint: use --language to specify the language explicitly\n\
-                 Example: cat file | skim - --language=typescript",
-                fname
-            )
-        } else {
-            anyhow::anyhow!(
-                "Language detection failed: reading from stdin requires --language or --filename\n\
-                 Example: cat file.ts | skim - --language=typescript\n\
-                 Example: git show HEAD:main.rs | skim - --filename=main.rs"
-            )
-        }
-    })?;
+    // Shebang detection: if no language from explicit flag or filename extension,
+    // sniff the first line of the stdin buffer.
+    let shebang_lang = if options.explicit_lang.is_none() && filename_lang.is_none() {
+        detect_language_from_shebang(&buffer)
+    } else {
+        None
+    };
 
-    let (transformed, stdin_has_errors, stdin_line_map) = match options.trunc.token_budget {
+    let language_or_none = options.explicit_lang.or(filename_lang).or(shebang_lang);
+
+    // ADR-002: when no language is detectable for plain stdin (no --language,
+    // no --filename, no shebang), degrade to a lossless passthrough rather than
+    // erroring — consistent with the file path behaviour in run_transform.
+    // --filename with an unrecognised extension is still an error unless a shebang
+    // in the stdin content provides a recognised language override: the user gave
+    // an explicit hint that skim cannot honour without a shebang fallback.
+    let Some(language) = language_or_none else {
+        if let Some(fname) = filename_hint {
+            // Explicit --filename with unknown extension → hard error (exit 3).
+            // Returning SkimError::UnsupportedLanguage lets the exit-code map in
+            // main.rs produce exit 3, consistent with the file-path code path
+            // (transform_auto_with_config also returns UnsupportedLanguage for
+            // unknown extensions). Avoids a hand-maintained extension list that
+            // drifts from Language::from_extension (the source of truth).
+            return Err(
+                rskim_core::SkimError::UnsupportedLanguage(Path::new(fname).to_path_buf()).into(),
+            );
+        }
+        // No --filename, no --language, no shebang — degrade to lossless passthrough.
+        return Ok(stdin_passthrough_result(buffer, &options));
+    };
+
+    let (transformed, stdin_has_errors, stdin_line_map, stdin_degraded) = match options
+        .trunc
+        .token_budget
+    {
         Some(budget) => {
             // AC-10: Cascade mode selection without line numbers, then re-run with line numbers
             let (output, mode) = cascade::cascade_for_token_budget(
@@ -351,24 +547,39 @@ pub(crate) fn process_stdin(
             // Use the re-run output directly as the final output (avoids double transform).
             let (cascade_output, line_map) = if options.line_numbers {
                 let config = cascade::build_config_with_opts(mode, &options.trunc, true);
-                let (rerun, _errs, map) = transform_with_line_map(&buffer, language, &config)?;
+                let (rerun, _errs, map, _degraded) =
+                    transform_with_line_map(&buffer, language, &config)?;
                 (rerun, map)
             } else {
                 (output, None)
             };
-            (cascade_output, false, line_map)
+            (cascade_output, false, line_map, false) // cascade path: degraded signal N/A
         }
         None => {
             let config =
                 cascade::build_config_with_opts(options.mode, &options.trunc, options.line_numbers);
-            let (output, has_errors, line_map) =
+            let (output, has_errors, line_map, degraded) =
                 transform_with_line_map(&buffer, language, &config)?;
-            (output, has_errors, line_map)
+            (output, has_errors, line_map, degraded)
         }
     };
 
+    // Emit notice when SKIM_DEBUG=1 and the transform degraded to passthrough due to a
+    // structural safety cap. The notice goes to stderr to avoid polluting stdout output.
+    if stdin_degraded && std::env::var("SKIM_DEBUG").as_deref() == Ok("1") {
+        eprintln!(
+            "[skim] notice: file too large to compress in {:?} mode \
+             (structural cap exceeded) — degraded to passthrough",
+            options.mode
+        );
+    }
+
     // Determine parse quality tier before guardrail.
-    let parse_tier = Some(parse_tier_from(options.mode, stdin_has_errors));
+    let parse_tier = Some(parse_tier_from(
+        options.mode,
+        stdin_has_errors,
+        stdin_degraded,
+    ));
 
     // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
     // Same protection as process_file; token counting happens after so stats reflect
@@ -398,12 +609,38 @@ pub(crate) fn process_stdin(
         (None, None)
     };
 
+    // Retain the raw buffer for analytics background tokenization only when
+    // counts are not already known (i.e. !show_stats). Stdin cannot be re-read,
+    // so the buffer must travel with the result.
+    //
+    // Invariant: stdin_raw is Some iff !show_stats; orig_tokens/trans_tokens are
+    // Some iff show_stats (when the tokenizer is available). These two conditions
+    // are mutually exclusive by construction: show_stats drives count_token_pair
+    // above, and its negation drives stdin_raw here.
+    //
+    // The assert pins the always-guaranteed half: if we are NOT running show_stats,
+    // counts must be None (we never computed them). The reverse (show_stats → Some)
+    // is best-effort and depends on the tokenizer succeeding, so is not asserted.
+    debug_assert!(
+        options.show_stats || orig_tokens.is_none(),
+        "BUG(process_stdin): show_stats=false but orig_tokens is Some — \
+         token counts must not be present when show_stats is false \
+         (stdin_raw invariant violated)"
+    );
+    let stdin_raw = if !options.show_stats {
+        Some(buffer)
+    } else {
+        None
+    };
+
     Ok(ProcessResult {
         output: final_output,
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered,
         parse_tier,
+        language: Some(language),
+        stdin_raw,
     })
 }
 
@@ -414,11 +651,34 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     }
 
     let contents = read_and_validate(path)?;
-    let (result, mode_used, has_errors, line_map) = run_transform(&contents, path, &options)?;
+    let (result, mode_used, has_errors, line_map, degraded) =
+        run_transform(&contents, path, &options)?;
+
+    // Emit notice when SKIM_DEBUG=1 and the transform degraded to passthrough.
+    // Two distinct degrade reasons: unknown language (no extension/shebang match)
+    // or file too large to compress (structural safety cap exceeded).
+    if degraded && std::env::var("SKIM_DEBUG").as_deref() == Ok("1") {
+        let lang_detected = options.explicit_lang.is_some()
+            || detect_language_from_path(path).is_some()
+            || detect_language_from_shebang(&contents).is_some();
+        if lang_detected {
+            eprintln!(
+                "[skim] notice: file too large to compress in {:?} mode \
+                 (structural cap exceeded) — degraded to passthrough",
+                options.mode
+            );
+        } else {
+            eprintln!(
+                "[skim] notice: unknown language for '{}' — degraded to lossless passthrough. \
+                 Use --language to specify, or SKIM_PASSTHROUGH=1 to bypass.",
+                path.display()
+            );
+        }
+    }
 
     // Determine parse quality tier before guardrail (guardrail may swap output,
     // but the parse tier reflects the transformation, not the final selection).
-    let parse_tier = Some(parse_tier_from(options.mode, has_errors));
+    let parse_tier = Some(parse_tier_from(options.mode, has_errors, degraded));
 
     // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
     // Token counting happens AFTER this decision so stats reflect the final output.
@@ -466,13 +726,31 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         });
     }
 
+    // Effective language for analytics: explicit override wins, else detect from path,
+    // then shebang. For unknown-language passthrough the language is None (zero-savings row).
+    let effective_lang = options
+        .explicit_lang
+        .or_else(|| detect_language_from_path(path))
+        .or_else(|| detect_language_from_shebang(&contents));
+
     Ok(ProcessResult {
         output: final_output,
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered,
         parse_tier,
+        language: effective_lang,
+        stdin_raw: None,
     })
+}
+
+/// Read a file and validate it doesn't exceed the maximum input size.
+///
+/// Public thin wrapper over `read_and_validate` for use by the background
+/// analytics re-read path (`analytics::RawSource::Reread`).  Reuses the
+/// 50 MB guard and naturally rejects TOCTOU-grown files.
+pub(crate) fn read_source(path: &std::path::Path) -> anyhow::Result<String> {
+    read_and_validate(path)
 }
 
 #[cfg(test)]
@@ -542,22 +820,33 @@ mod tests {
 
     #[test]
     fn test_parse_tier_passthrough() {
-        assert_eq!(parse_tier_from(Mode::Full, false), "passthrough");
-        assert_eq!(parse_tier_from(Mode::Full, true), "passthrough");
+        assert_eq!(parse_tier_from(Mode::Full, false, false), "passthrough");
+        assert_eq!(parse_tier_from(Mode::Full, true, false), "passthrough");
+        // degraded is irrelevant for Full mode (always "passthrough")
+        assert_eq!(parse_tier_from(Mode::Full, false, true), "passthrough");
     }
 
     #[test]
     fn test_parse_tier_degraded() {
-        assert_eq!(parse_tier_from(Mode::Structure, true), "degraded");
-        assert_eq!(parse_tier_from(Mode::Signatures, true), "degraded");
-        assert_eq!(parse_tier_from(Mode::Minimal, true), "degraded");
+        assert_eq!(parse_tier_from(Mode::Structure, true, false), "degraded");
+        assert_eq!(parse_tier_from(Mode::Signatures, true, false), "degraded");
+        assert_eq!(parse_tier_from(Mode::Minimal, true, false), "degraded");
     }
 
     #[test]
     fn test_parse_tier_full() {
-        assert_eq!(parse_tier_from(Mode::Structure, false), "full");
-        assert_eq!(parse_tier_from(Mode::Signatures, false), "full");
-        assert_eq!(parse_tier_from(Mode::Types, false), "full");
+        assert_eq!(parse_tier_from(Mode::Structure, false, false), "full");
+        assert_eq!(parse_tier_from(Mode::Signatures, false, false), "full");
+        assert_eq!(parse_tier_from(Mode::Types, false, false), "full");
+    }
+
+    #[test]
+    fn test_parse_tier_complexity_limited() {
+        // A file degraded via ComplexityLimit (oversized) must report "degraded",
+        // not "full", so analytics and callers are not misled. (#A7 tier-mislabel fix)
+        assert_eq!(parse_tier_from(Mode::Structure, false, true), "degraded");
+        assert_eq!(parse_tier_from(Mode::Pseudo, false, true), "degraded");
+        assert_eq!(parse_tier_from(Mode::Minimal, false, true), "degraded");
     }
 
     // ========================================================================
@@ -631,5 +920,129 @@ mod tests {
             result.contains("fn foo()"),
             "content must survive annotation"
         );
+    }
+
+    // ========================================================================
+    // stdin_passthrough_result tests (Issue C refactor: characterization)
+    // ========================================================================
+
+    /// Build ProcessOptions for the stdin-passthrough helper tests.
+    fn passthrough_opts(show_stats: bool) -> ProcessOptions {
+        ProcessOptions {
+            mode: Mode::Structure,
+            explicit_lang: None,
+            use_cache: false,
+            show_stats,
+            trunc: TruncationOptions::default(),
+            line_numbers: false,
+        }
+    }
+
+    /// !show_stats → the raw buffer is retained for background tokenization and
+    /// the ProcessResult carries the passthrough tier with no language/tokens.
+    #[test]
+    fn stdin_passthrough_result_retains_buffer_when_no_stats() {
+        let src = "line one\nline two\n";
+        let result = stdin_passthrough_result(src.to_string(), &passthrough_opts(false));
+
+        assert_eq!(result.parse_tier, Some("passthrough"));
+        assert_eq!(result.language, None);
+        assert!(!result.guardrail_triggered);
+        assert_eq!(result.original_tokens, None);
+        assert_eq!(result.transformed_tokens, None);
+        // No truncation options → lossless passthrough.
+        assert_eq!(result.output, src);
+        // Buffer retained (stdin cannot be re-read).
+        assert_eq!(result.stdin_raw.as_deref(), Some(src));
+    }
+
+    /// show_stats → the buffer is NOT retained (counts are computed on the main
+    /// thread), preserving the stdin_raw invariant.
+    #[test]
+    fn stdin_passthrough_result_drops_buffer_when_stats() {
+        let src = "alpha\nbeta\n";
+        let result = stdin_passthrough_result(src.to_string(), &passthrough_opts(true));
+
+        assert_eq!(result.stdin_raw, None);
+        assert_eq!(result.output, src);
+        assert_eq!(result.parse_tier, Some("passthrough"));
+    }
+
+    /// max_lines is honoured on the passthrough with the hinted elision marker.
+    #[test]
+    fn stdin_passthrough_result_honours_max_lines() {
+        let src = "one\ntwo\nthree\nfour\n";
+        let mut opts = passthrough_opts(false);
+        opts.trunc.max_lines = Some(2);
+
+        let result = stdin_passthrough_result(src.to_string(), &opts);
+
+        assert!(
+            result.output.contains("use SKIM_PASSTHROUGH=1 to see all"),
+            "truncated passthrough must carry the hint: {:?}",
+            result.output
+        );
+        // Buffer retention is unaffected by truncation.
+        assert_eq!(result.stdin_raw.as_deref(), Some(src));
+    }
+
+    // ========================================================================
+    // passthrough_with_truncation: CRLF byte-fidelity tests (Issue 1 fold-in)
+    // ========================================================================
+
+    /// The lossless passthrough must be byte-faithful: CRLF retained lines must
+    /// keep their \r\n, not be silently converted to \n.  The old lines()+join("\n")
+    /// approach stripped \r, violating #317 and ADR-002.
+    #[test]
+    fn passthrough_with_truncation_preserves_crlf() {
+        let crlf = "line1\r\nline2\r\nline3\r\nline4\r\n";
+
+        // max_lines: first retained line must keep \r\n.
+        // n=2 → keep=1 → retain "line1\r\n", omit 3 lines.
+        let out = passthrough_with_truncation(crlf, Some(2), None);
+        assert!(
+            out.starts_with("line1\r\n"),
+            "max_lines: \\r\\n must be preserved in retained line; got: {out:?}"
+        );
+        assert!(
+            out.contains("lines truncated"),
+            "max_lines: elision marker must be present: {out:?}"
+        );
+
+        // last_lines: last retained tail line must keep \r\n.
+        // n=2 → keep=1 → retain "line4\r\n", omit 3 lines above.
+        let out2 = passthrough_with_truncation(crlf, None, Some(2));
+        assert!(
+            out2.ends_with("line4\r\n"),
+            "last_lines: \\r\\n must be preserved in tail line; got: {out2:?}"
+        );
+        assert!(
+            out2.contains("lines above"),
+            "last_lines: elision marker must be present: {out2:?}"
+        );
+
+        // No truncation: entire content returned byte-for-byte.
+        let out3 = passthrough_with_truncation(crlf, None, None);
+        assert_eq!(out3, crlf, "no truncation must be byte-faithful");
+    }
+
+    /// LF-only input is unaffected by the split_inclusive change.
+    #[test]
+    fn passthrough_with_truncation_lf_unaffected() {
+        let lf = "alpha\nbeta\ngamma\ndelta\n";
+
+        let out = passthrough_with_truncation(lf, Some(2), None);
+        assert!(
+            out.starts_with("alpha\n"),
+            "LF: first line must end with \\n: {out:?}"
+        );
+        assert!(out.contains("lines truncated"), "{out:?}");
+
+        let out2 = passthrough_with_truncation(lf, None, Some(2));
+        assert!(
+            out2.ends_with("delta\n"),
+            "LF: last line must end with \\n: {out2:?}"
+        );
+        assert!(out2.contains("lines above"), "{out2:?}");
     }
 }

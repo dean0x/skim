@@ -39,6 +39,7 @@ mod integrity;
 mod learn;
 pub(crate) mod lint;
 mod log;
+mod permissions;
 mod pkg;
 mod proxy;
 mod rewrite;
@@ -54,9 +55,9 @@ pub(crate) mod ux;
 // ============================================================================
 
 mod dispatch;
-pub(crate) use dispatch::{dispatch, run_raw_passthrough};
+pub(crate) use dispatch::{dispatch, run_inherited_passthrough, run_raw_passthrough};
 
-mod execution;
+pub(crate) mod execution;
 pub(crate) use execution::{
     OutputFormat, ParsedCommandConfig, RunContext, ToolRunConfig, combine_output,
     format_analytics_label, run_parsed_command_with_exit, run_parsed_command_with_mode, run_tool,

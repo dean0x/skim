@@ -54,8 +54,8 @@ impl HookProtocol for CursorHook {
         })
     }
 
-    fn generate_script(&self, version: &str) -> String {
-        super::generate_hook_script(version, "cursor")
+    fn generate_script(&self, version: &str, binary_path: &str) -> String {
+        super::generate_hook_script(version, "cursor", binary_path)
     }
 
     // -------------------------------------------------------------------------
@@ -196,17 +196,21 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_generate_script_bare_command() {
-        let script = hook().generate_script("1.2.0");
+    fn test_cursor_generate_script_pinned_binary() {
+        let script = hook().generate_script("1.2.0", "/usr/local/bin/skim");
         assert!(script.contains("#!/usr/bin/env bash"));
         assert!(script.contains("# skim-hook v1.2.0"));
         assert!(script.contains("SKIM_HOOK_VERSION=\"1.2.0\""));
+        assert!(script.contains("export SKIM_HOOK_BINARY="));
+        assert!(script.contains("export SKIM_HOOK_COMMIT="));
+        assert!(script.contains("exec \"$_SKIM_BIN\" rewrite --hook --agent cursor"));
+        // PATH fallback must still be present.
         assert!(script.contains("exec skim rewrite --hook --agent cursor"));
     }
 
     #[test]
     fn test_cursor_generate_script_zero_stderr() {
-        let script = hook().generate_script("1.0.0");
+        let script = hook().generate_script("1.0.0", "/usr/local/bin/skim");
         // No eprintln or echo to stderr in generated script
         assert!(!script.contains(">&2"));
         assert!(!script.contains("echo"));
@@ -215,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_cursor_generate_script_init_comment() {
-        let script = hook().generate_script("1.0.0");
+        let script = hook().generate_script("1.0.0", "/usr/local/bin/skim");
         assert!(script.contains("skim init --agent cursor"));
     }
 

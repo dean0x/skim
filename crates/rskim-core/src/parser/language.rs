@@ -95,6 +95,12 @@ pub(crate) fn get_node_types(language: Language) -> Option<LanguageNodeTypes> {
             interface: "protocol_declaration",
             type_alias: "typealias_declaration",
         }),
+        Language::Bash => Some(LanguageNodeTypes {
+            function: "function_definition",
+            class: "",      // Bash has no class concept
+            interface: "",  // Bash has no interface concept
+            type_alias: "", // Bash has no type aliases
+        }),
         // ARCHITECTURE: Serde-based languages use their own parsers, not tree-sitter.
         // This is enforced by the Strategy Pattern in Language::transform_source().
         Language::Json | Language::Yaml | Language::Toml => None,

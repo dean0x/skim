@@ -36,6 +36,9 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::Lint,
     expected_exit_codes: &[1],
     forward_stderr: false,
+    skip_net_savings_guard: false,
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 /// AD-LINT-21 (2026-04-15) — Path-aware regex patterns: `.+\S` captures full path including

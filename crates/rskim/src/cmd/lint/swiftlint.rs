@@ -29,6 +29,11 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::Lint,
     expected_exit_codes: &[2],
     forward_stderr: false,
+    skip_net_savings_guard: false,
+    // swiftlint exits 0 silently when no violations; raw output is empty and
+    // passthrough is consistent with swiftlint's native no-output-on-clean behaviour.
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 /// `file.swift:line:col: warning: message (rule_id)`

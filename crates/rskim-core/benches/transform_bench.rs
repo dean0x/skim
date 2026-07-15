@@ -24,6 +24,7 @@ const SMALL_RB: &str = include_str!("../../../tests/fixtures/ruby/simple.rb");
 const SMALL_SQL: &str = include_str!("../../../tests/fixtures/sql/simple.sql");
 const SMALL_KT: &str = include_str!("../../../tests/fixtures/kotlin/Simple.kt");
 const SMALL_SWIFT: &str = include_str!("../../../tests/fixtures/swift/Simple.swift");
+const LARGE_BASH: &str = include_str!("../../../tests/fixtures/bash/large_script.sh");
 
 // Medium complexity TypeScript
 const MEDIUM_TS: &str = include_str!("../../../tests/fixtures/typescript/types.ts");
@@ -229,6 +230,7 @@ fn bench_language_comparison(c: &mut Criterion) {
         (Language::Sql, SMALL_SQL),
         (Language::Kotlin, SMALL_KT),
         (Language::Swift, SMALL_SWIFT),
+        (Language::Bash, LARGE_BASH),
     ];
 
     for (lang, source) in languages {
@@ -238,6 +240,26 @@ fn bench_language_comparison(c: &mut Criterion) {
             |b, &input| b.iter(|| transform(black_box(input), lang, Mode::Structure).unwrap()),
         );
     }
+
+    group.finish();
+}
+
+// ============================================================================
+// Bash Large File Benchmarks
+// ============================================================================
+
+fn bench_bash_large(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bash");
+
+    // ~917-line real-world bash script (deploy orchestration with functions,
+    // case statements, here-docs, arrays) — must stay <50ms on the 1000-line budget
+    group.bench_function("large_structure", |b| {
+        b.iter(|| transform(black_box(LARGE_BASH), Language::Bash, Mode::Structure).unwrap())
+    });
+
+    group.bench_function("large_signatures", |b| {
+        b.iter(|| transform(black_box(LARGE_BASH), Language::Bash, Mode::Signatures).unwrap())
+    });
 
     group.finish();
 }
@@ -305,6 +327,7 @@ criterion_group!(
     bench_scaling,
     bench_mode_comparison,
     bench_language_comparison,
+    bench_bash_large,
     bench_token_budget_truncation
 );
 criterion_main!(benches);

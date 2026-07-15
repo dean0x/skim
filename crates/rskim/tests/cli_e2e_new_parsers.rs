@@ -16,9 +16,10 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::process::Command as StdCommand;
+mod common;
 
 fn skim_cmd() -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd.env_remove("SKIM_DEBUG");
     cmd
@@ -318,12 +319,14 @@ fn test_swiftlint_tier1_json_fail() {
 #[test]
 fn test_swiftlint_tier1_json_pass() {
     let fixture = include_str!("fixtures/cmd/lint/swiftlint_pass.json");
+    // Net-savings guard may passthrough small inputs (swiftlint_pass.json is "[]").
+    // skim-format emits " OK"; raw passthrough emits "[]". Both indicate no issues.
     skim_cmd()
         .args(["swiftlint"])
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" OK"));
+        .stdout(predicate::str::contains(" OK").or(predicate::str::contains("[]")));
 }
 
 // ============================================================================

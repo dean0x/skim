@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use super::flags::InitFlags;
-use super::helpers::{HOOK_SCRIPT_NAME, resolve_config_dir_for_agent};
+use super::flags::{DetectionEnv, InitFlags};
+use super::helpers::HOOK_SCRIPT_NAME;
 use crate::cmd::hooks::{HookProtocol, protocol_for_agent};
 
 /// Maximum settings.json size we'll read (10 MB). Anything larger is almost
@@ -14,12 +14,17 @@ pub(super) struct DetectedState {
     pub(super) skim_binary: PathBuf,
     pub(super) skim_version: String,
     pub(super) config_dir: PathBuf,
+    /// Where hook artifacts (script, SHA sidecar, hook registration) live.
+    ///
+    /// Equals `config_dir` for all agents except Copilot CLI, which routes hook
+    /// artifacts to `~/.copilot/` via `HookProtocol::hook_config_dir`.
+    pub(super) hook_config_dir: PathBuf,
     pub(super) settings_path: PathBuf,
     pub(super) settings_exists: bool,
     pub(super) hook_installed: bool,
     pub(super) hook_version: Option<String>,
-    /// Whether the hook script uses bare `skim` (PATH-resolved) vs hardcoded binary path.
-    pub(super) hook_uses_bare_command: bool,
+    /// Whether the hook script uses the pinned binary format (exports `SKIM_HOOK_BINARY`).
+    pub(super) hook_uses_pinned_binary: bool,
     /// If installing to one scope and the other scope also has a hook
     pub(super) dual_scope_warning: Option<String>,
     /// Existing non-skim hooks for the agent's tool matcher (plugin collision detection)
@@ -30,100 +35,122 @@ pub(super) struct DetectedState {
 
 impl DetectedState {
     /// Returns `true` when the installed hook is at the current version and
-    /// already uses the bare `skim` command format (no reinstall needed).
+    /// already uses the pinned binary format (no reinstall needed).
     pub(super) fn hook_is_current(&self) -> bool {
-        self.hook_version.as_deref() == Some(&self.skim_version) && self.hook_uses_bare_command
+        self.hook_version.as_deref() == Some(&self.skim_version) && self.hook_uses_pinned_binary
     }
 }
 
 pub(super) fn detect_state(
     flags: &InitFlags,
     agent: crate::cmd::session::AgentKind,
+    env: &DetectionEnv,
 ) -> anyhow::Result<DetectedState> {
     let skim_binary = std::env::current_exe()?;
     let skim_version = env!("CARGO_PKG_VERSION").to_string();
-    let config_dir = resolve_config_dir_for_agent(flags.project, agent)?;
+    let config_dir = env.resolve(agent, flags.project)?;
     let protocol = protocol_for_agent(agent);
+
+    // Compute the hook artifact directory via the protocol seam.
+    // For all agents except Copilot CLI this equals config_dir (passthrough).
+    // For Copilot CLI it redirects to ~/.copilot (or $COPILOT_CONFIG_DIR).
+    let hook_config_dir = protocol.hook_config_dir(
+        &config_dir,
+        flags.project,
+        env.override_for(agent).is_some(),
+    );
+
     let settings_path = config_dir.join(protocol.config_filename());
     let settings_exists = settings_path.exists();
 
     // Read the hook script once so both version extraction and bare-command detection
     // can reuse the same contents rather than making two separate fs::read_to_string calls.
     let hook_script_contents =
-        std::fs::read_to_string(config_dir.join("hooks").join(HOOK_SCRIPT_NAME)).ok();
+        std::fs::read_to_string(hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME)).ok();
 
     let mut hook_installed = false;
     let mut hook_version = None;
+    let existing_hooks;
 
-    let parsed_settings = read_settings_json(&settings_path);
-    if let Some(ref json) = parsed_settings
-        && let Some(arr) = json
-            .get("hooks")
-            .and_then(|h| h.get(protocol.hook_event_key()))
-            .and_then(|v| v.as_array())
-    {
-        for entry in arr {
-            if protocol.is_skim_entry(entry) {
-                hook_installed = true;
-                hook_version = extract_hook_version_from_entry(
-                    entry,
-                    &config_dir,
-                    hook_script_contents.as_deref(),
-                );
+    if protocol.uses_dedicated_hook_file() {
+        // Copilot-style: detect from hooks/skim.json, not settings.json.
+        hook_installed = protocol.detect_hook_registration(&hook_config_dir);
+        if hook_installed {
+            // Version always comes from the script file (same for all agents).
+            hook_version = hook_script_contents
+                .as_deref()
+                .and_then(parse_version_from_script);
+        }
+        existing_hooks = protocol.scan_foreign_hooks(&hook_config_dir);
+    } else {
+        // settings.json-style: existing detection code (behaviorally unchanged).
+        let parsed_settings = read_settings_json(&settings_path);
+        if let Some(ref json) = parsed_settings
+            && let Some(arr) = json
+                .get("hooks")
+                .and_then(|h| h.get(protocol.hook_event_key()))
+                .and_then(|v| v.as_array())
+        {
+            for entry in arr {
+                if protocol.is_skim_entry(entry) {
+                    hook_installed = true;
+                    hook_version = extract_hook_version_from_entry(
+                        entry,
+                        &hook_config_dir,
+                        hook_script_contents.as_deref(),
+                    );
+                }
             }
         }
+        existing_hooks = scan_existing_hooks(
+            parsed_settings.as_ref(),
+            protocol.hook_event_key(),
+            protocol.tool_matcher(),
+            protocol.as_ref(),
+        );
     }
 
-    // Scan for existing non-skim hooks (plugin collision detection)
-    let existing_hooks = scan_existing_hooks(
-        parsed_settings.as_ref(),
-        protocol.hook_event_key(),
-        protocol.tool_matcher(),
-        protocol.as_ref(),
-    );
-
     // Dual-scope check (B5)
-    let dual_scope_warning = check_dual_scope(flags, agent)?;
+    let dual_scope_warning = check_dual_scope(flags, agent, env)?;
 
-    // Reuse the already-read hook script contents for bare-command detection.
-    let hook_uses_bare_command = hook_script_contents
+    // Reuse the already-read hook script contents for pinned-binary detection.
+    let hook_uses_pinned_binary = hook_script_contents
         .as_deref()
-        .map(uses_bare_command)
+        .map(uses_pinned_binary)
         .unwrap_or(false);
 
     Ok(DetectedState {
         skim_binary,
         skim_version,
         config_dir,
+        hook_config_dir,
         settings_path,
         settings_exists,
         hook_installed,
         hook_version,
-        hook_uses_bare_command,
+        hook_uses_pinned_binary,
         dual_scope_warning,
         existing_hooks,
         agent_cli_name: agent.cli_name(),
     })
 }
 
-/// Returns `true` when `contents` of a hook script use the bare `skim` command
-/// (PATH-resolved) rather than a hardcoded binary path.
+/// Returns `true` when `contents` of a hook script use the pinned binary format:
+/// exports `SKIM_HOOK_BINARY` which is the install-time canonical path.
 ///
-/// Anchors to line-start (after optional leading whitespace) to avoid
-/// false-positives from comment lines that mention `exec skim `.
-fn uses_bare_command(contents: &str) -> bool {
-    contents
-        .lines()
-        .any(|l| l.trim_start().starts_with("exec skim "))
+/// Old hook scripts that only have bare `exec skim` (no `SKIM_HOOK_BINARY`) are
+/// considered stale and cause a reinstall so they gain the pinned-binary format.
+fn uses_pinned_binary(contents: &str) -> bool {
+    super::script_has_pinned_marker(contents)
 }
 
 /// Check if the hook script at `config_dir/hooks/HOOK_SCRIPT_NAME` uses the
-/// bare `skim` command.  Used by tests that drive detection with a temp dir.
+/// pinned binary format.  Used by tests that drive detection with a temp dir.
 #[cfg(test)]
-fn hook_script_uses_bare_command(config_dir: &Path) -> bool {
+fn hook_script_uses_pinned_binary(config_dir: &Path) -> bool {
     let script_path = config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
     std::fs::read_to_string(&script_path)
-        .map(|c| uses_bare_command(&c))
+        .map(|c| uses_pinned_binary(&c))
         .unwrap_or(false)
 }
 
@@ -190,16 +217,31 @@ fn scan_existing_hooks(
     other_hooks
 }
 
+/// Check whether a skim hook is installed in the opposite scope (global vs project)
+/// and return a warning string if so.
+///
+/// # Copilot CLI
+///
+/// This function reads `<config_dir>/settings.json` for the hook event key, which is
+/// the Claude Code / Gemini / Cursor format. For Copilot CLI, `config_dir` resolves
+/// to `~/.github/` and the event key is `preToolUse`. Since skim v2.11.0, Copilot
+/// hook registration is written to `~/.copilot/hooks/skim.json` (not to
+/// `~/.github/settings.json`), so this function **never fires for Copilot CLI** —
+/// `has_hook` will always be `false` because the settings file skim no longer writes.
+/// This is intentionally conservative: the warning is suppressed rather than
+/// producing a false positive. A Copilot-aware dual-scope check can be added if
+/// needed in a future subtask.
 pub(super) fn check_dual_scope(
     flags: &InitFlags,
     agent: crate::cmd::session::AgentKind,
+    env: &DetectionEnv,
 ) -> anyhow::Result<Option<String>> {
     let other_dir = if flags.project {
         // Installing project-level, check global
-        resolve_config_dir_for_agent(false, agent)?
+        env.resolve(agent, false)?
     } else {
         // Installing global, check project
-        match resolve_config_dir_for_agent(true, agent) {
+        match env.resolve(agent, true) {
             Ok(dir) => dir,
             Err(_) => return Ok(None),
         }
@@ -354,7 +396,30 @@ mod tests {
     use crate::cmd::hooks::cursor::CursorHook;
 
     #[test]
-    fn test_hook_script_uses_bare_command_new_format() {
+    fn test_hook_script_uses_pinned_binary_true_for_new_format() {
+        // New F6 format: exports SKIM_HOOK_BINARY → pinned.
+        let dir = tempfile::TempDir::new().unwrap();
+        let hooks_dir = dir.path().join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            hooks_dir.join(HOOK_SCRIPT_NAME),
+            "#!/usr/bin/env bash\n\
+             export SKIM_HOOK_VERSION=\"2.5.1\"\n\
+             export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
+             export SKIM_HOOK_COMMIT=abc1234\n\
+             _SKIM_BIN='/usr/local/bin/skim'\n\
+             if [ -x \"$_SKIM_BIN\" ]; then\n\
+               exec \"$_SKIM_BIN\" rewrite --hook --agent claude-code\n\
+             fi\n\
+             exec skim rewrite --hook --agent claude-code\n",
+        )
+        .unwrap();
+        assert!(hook_script_uses_pinned_binary(dir.path()));
+    }
+
+    #[test]
+    fn test_hook_script_uses_pinned_binary_false_for_bare_command() {
+        // Old "bare skim" format (pre-F6) is stale → not pinned.
         let dir = tempfile::TempDir::new().unwrap();
         let hooks_dir = dir.path().join("hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
@@ -363,11 +428,12 @@ mod tests {
             "#!/usr/bin/env bash\nexport SKIM_HOOK_VERSION=\"2.5.1\"\nexec skim rewrite --hook\n",
         )
         .unwrap();
-        assert!(hook_script_uses_bare_command(dir.path()));
+        assert!(!hook_script_uses_pinned_binary(dir.path()));
     }
 
     #[test]
-    fn test_hook_script_uses_bare_command_old_format() {
+    fn test_hook_script_uses_pinned_binary_false_for_old_absolute_path() {
+        // Oldest format (hardcoded absolute path, no SKIM_HOOK_BINARY export) → not pinned.
         let dir = tempfile::TempDir::new().unwrap();
         let hooks_dir = dir.path().join("hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
@@ -376,13 +442,13 @@ mod tests {
             "#!/usr/bin/env bash\nexec \"/usr/local/bin/skim\" rewrite --hook\n",
         )
         .unwrap();
-        assert!(!hook_script_uses_bare_command(dir.path()));
+        assert!(!hook_script_uses_pinned_binary(dir.path()));
     }
 
     #[test]
-    fn test_hook_script_uses_bare_command_missing() {
+    fn test_hook_script_uses_pinned_binary_false_when_missing() {
         let dir = tempfile::TempDir::new().unwrap();
-        assert!(!hook_script_uses_bare_command(dir.path()));
+        assert!(!hook_script_uses_pinned_binary(dir.path()));
     }
 
     #[test]
@@ -491,7 +557,15 @@ mod tests {
 
     #[test]
     fn test_scan_existing_hooks_copilot_format() {
-        // Copilot CLI format: non-skim entry uses top-level "bash" field
+        // Copilot CLI format: non-skim entry uses top-level "bash" field.
+        //
+        // NOTE: the `/home/.github/hooks/skim-rewrite.sh` path is INTENTIONAL.
+        // `scan_existing_hooks` is called from the settings.json path in `detect_state`,
+        // which is only reached for agents that do NOT use a dedicated hook file. For
+        // Copilot CLI (which uses `hooks/skim.json`), this code path is bypassed.
+        // The `~/.github` literal here preserves the migration-window recognition behavior:
+        // `is_skim_entry` must continue to recognise legacy entries written to settings.json
+        // by older skim versions, so that `migrate_copilot_legacy` can surgically remove them.
         let settings = serde_json::json!({
             "hooks": {
                 "preToolUse": [
@@ -514,7 +588,10 @@ mod tests {
 
     #[test]
     fn test_scan_existing_hooks_copilot_skim_entry_excluded() {
-        // Copilot skim entry should be excluded from collision results
+        // Copilot skim entry should be excluded from collision results.
+        //
+        // NOTE: `~/.github/hooks/skim-rewrite.sh` path is INTENTIONAL — same
+        // migration-window rationale as `test_scan_existing_hooks_copilot_format` above.
         let settings = serde_json::json!({
             "hooks": {
                 "preToolUse": [{

@@ -94,6 +94,12 @@ pub(super) struct ParentContext {
     /// The first line of the parent (declaration header), 1-indexed.
     pub header_line: usize,
     /// The last line of the parent (closing brace), 1-indexed.
+    ///
+    /// Used by `render_changed_only` (test-only full-body path) to emit the
+    /// container's closing brace after its last changed child.  Not used by
+    /// the production `render_default_scoped` (hunk-scoped path), which emits
+    /// only the breadcrumb header — not the close brace.
+    #[allow(dead_code)]
     pub close_line: usize,
 }
 

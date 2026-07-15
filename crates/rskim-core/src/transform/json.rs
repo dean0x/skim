@@ -91,13 +91,16 @@ fn extract_object_structure(
         return Ok("{}".to_string());
     }
 
-    // SECURITY: Track total keys across all objects to prevent memory exhaustion
+    // Key count over the cap: a legitimate but very large file (e.g. package-lock.json
+    // or an OpenAPI spec). Signal a complexity limit so the dispatcher degrades to
+    // lossless raw passthrough instead of failing. (#317)
     *key_count += map.len();
     if *key_count > MAX_JSON_KEYS {
-        return Err(SkimError::ParseError(format!(
-            "JSON key count exceeded: {} (max: {}). Possible malicious input.",
-            key_count, MAX_JSON_KEYS
-        )));
+        return Err(SkimError::ComplexityLimit {
+            what: "JSON keys",
+            count: *key_count,
+            max: MAX_JSON_KEYS,
+        });
     }
 
     let indent = "  ".repeat(depth);

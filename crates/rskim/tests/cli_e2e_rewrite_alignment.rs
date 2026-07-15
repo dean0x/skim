@@ -45,9 +45,10 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+mod common;
 
 fn skim_cmd() -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd
 }

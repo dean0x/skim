@@ -244,20 +244,39 @@ fn test_swift_minimal_preserves_triple_slash() {
 // ============================================================================
 
 #[test]
-fn test_swift_pseudo_strips_visibility() {
+fn test_swift_pseudo_preserves_visibility() {
+    // All Swift visibility modifiers (public/private/internal/fileprivate/open)
+    // convey API surface — preserved in pseudo mode (A4 contract).
+    // Non-visibility modifiers (static/override/final) are still stripped.
     let source = "public class Foo {\n    private var x: Int = 0\n    internal func bar() {\n        print(x)\n    }\n}\n";
     let result = transform(source, Language::Swift, Mode::Pseudo).unwrap();
     assert!(
-        !result.contains("public "),
-        "public modifier should be stripped, got:\n{result}"
+        result.contains("public "),
+        "public modifier must be preserved as API surface, got:\n{result}"
     );
     assert!(
-        !result.contains("private "),
-        "private modifier should be stripped, got:\n{result}"
+        result.contains("private "),
+        "private modifier must be preserved as API surface, got:\n{result}"
     );
     assert!(
-        !result.contains("internal "),
-        "internal modifier should be stripped, got:\n{result}"
+        result.contains("internal "),
+        "internal modifier must be preserved as API surface, got:\n{result}"
+    );
+}
+
+#[test]
+fn test_swift_pseudo_still_strips_static() {
+    // Non-visibility modifier `static` must still be stripped (A4 contract).
+    let source =
+        "class Counter {\n    static var count: Int = 0\n    final func increment() {}\n}\n";
+    let result = transform(source, Language::Swift, Mode::Pseudo).unwrap();
+    assert!(
+        !result.contains("static "),
+        "static must still be stripped as non-visibility modifier, got:\n{result}"
+    );
+    assert!(
+        !result.contains("final "),
+        "final must still be stripped as non-visibility modifier, got:\n{result}"
     );
 }
 

@@ -29,6 +29,9 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::Infra,
     expected_exit_codes: &[],
     forward_stderr: false,
+    skip_net_savings_guard: false,
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 /// Keys stripped from AWS JSON responses (metadata, not useful data).

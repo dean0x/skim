@@ -31,6 +31,227 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Tabular re-encoding is explicitly excluded from v1 (tracked in #430 with evidence gate).
   - Per-block agent-consent code compression deferred to #429.
 
+### Breaking Changes
+
+- **Exit-code remap: parse errors → 2, unsupported language → 3** — Scripts that
+  branched on a specific non-zero exit code (not just `!= 0`) may need updating.
+  See **Changed** below for full details.
+- **Unknown-extension files now degrade to lossless passthrough (exit 0)** —
+  Files with an unrecognised extension or unrecognised shebang previously produced
+  a non-zero exit; they now fall back to byte-faithful passthrough (exit 0,
+  applies ADR-002). Scripts that relied on a non-zero exit to detect unrecognised
+  input must instead inspect the output. See **Fixed** below for full details.
+- **`skim -` (stdin) without a language hint now exits 0** — Bare stdin with no
+  `--language` flag, no `--filename` hint, and no recognisable shebang previously
+  errored (non-zero). It now degrades to lossless passthrough (exit 0,
+  applies ADR-002). See **Fixed** below for full details.
+
+### Added
+- **Agent guidance documents command wrapping** — The guidance injected by `skim init`
+  now includes a "Command wrapping" section explaining that the rewrite hook may run
+  supported commands as `skim <tool>` (same arguments, same exit code, compressed
+  output). Agents are instructed to flag garbled or incomplete compressed output to the
+  user rather than silently working around it. Existing installs pick up the new section
+  on the next version bump + re-pin (per ADR-004; binary-side fixes below are effective
+  immediately after rebuild).
+- **Bash / shell language support** — Full tree-sitter-bash grammar integration
+  (`Language::Bash`). Structure mode strips `function_definition` bodies to `{...}`
+  while preserving function names and all top-level commands/variable assignments.
+  Zero-function scripts (pure top-level commands like deploy.sh) render meaningfully:
+  all commands and variable assignments are visible. Shebang auto-detection recognises
+  `#!/bin/bash`, `#!/bin/sh`, `#!/usr/bin/env bash`, and the `env -S` form; supports
+  `dash`, `zsh`, `ksh`, `mksh`, `fish` dialects. CRLF-tolerant (`\r\n` shebangs work).
+  Also detects shebangs for `python`, `node`, and `ruby` on extensionless files.
+  `--language bash` (alias `sh`) available for explicit override. Unknown-extension
+  files with an unrecognised shebang degrade to lossless passthrough (ADR-002) with a
+  `SKIM_DEBUG=1` notice; all 6 modes have explicit Bash arms.
+
+### Fixed
+- **`skim gh pr checks` tabs destroyed by ANSI-strip + exit-8 raw-forwarded before
+  parse** — `gh pr checks` emits TAB-separated output but gh's `ToolRunConfig` had
+  `skip_ansi_strip: false`, so `strip_ansi_escapes` dropped `\t` before
+  `RE_GH_CHECK_TAB` could match, causing fall-through to Passthrough. Independently,
+  `expected_exit_codes: &[]` classified gh's exit 8 (pending/failing checks) as
+  `UnexpectedFailure`, raw-forwarding the output before parsing. Fixed: set
+  `skip_ansi_strip: true` (gh emits no ANSI when piped) and `expected_exit_codes:
+  &[8]`. Exit 8 is still propagated so callers see the true check state. Blast
+  radius: CONFIG is shared by all `run_tool` gh routes; `gh run watch` is unaffected
+  (streaming path). A hypothetical gh exit-8 from a non-checks route falls to
+  Tier-3 passthrough with exit code preserved.
+
+- **`skim diff` tab-split header fused path to mtime** — `diff -u` emits
+  `--- path\t<mtime>` headers and `try_parse_standalone_unified` splits on `\t` to
+  extract the path. With `skip_ansi_strip: false`, the tab was dropped by
+  `strip_ansi_escapes`, fusing path and timestamp into a single token. Fixed:
+  set `skip_ansi_strip: true` (diff emits no ANSI). The ADR-001 net-savings guard
+  is undisturbed.
+
+- **`git diff` output could exceed raw size** — The default diff renderer walked the
+  full AST node body for each hunk, emitting 2–5× the raw patch size for large files.
+  Replaced with a hunk-scoped path (`render_default_scoped`) that emits only the
+  container breadcrumb header plus the hunk's own changed lines, so output is ≤ raw in
+  all cases. Orphan hunks (changed lines outside all AST node ranges, e.g. EOF
+  deletions or between-function additions) render as raw patch lines so no content is
+  silently dropped. An ADR-001 guardrail is wired into `run_diff` (text output) so a
+  net-expansion is never forwarded.
+
+- **`mypy` produced blank output on a clean run when injecting `--output json`** —
+  mypy writes nothing to stdout in JSON mode when there are zero issues. Agents
+  received empty output instead of "Success: …". A new `synthesize_success_line`
+  knob on `ToolRunConfig` emits a configured line when exit code is 0 and compressed
+  output is empty. mypy is configured with `synthesize_success_line = "mypy OK 0
+  issues"` and `injected_format_flag = "--output"`. Synthesis is suppressed when the
+  user already supplied `--output` themselves. A companion `injected_format_flag`
+  field prevents prepare_args from injecting the format flag twice.
+
+- **`ls -R` and multi-path `ls` lost per-directory section structure** — `try_parse_ls_long`
+  was a flat single-pass parser that ignored `"dir:"` section headers from `ls -R` and
+  multi-path invocations. Empty directories silently vanished (only `total`/`.`/`..`
+  lines were present). Fix dispatches to a sectioned parser when the output contains
+  section headers, rendering each section with its label header. Empty directories now
+  produce a labelled section with 0 entries rather than disappearing.
+
+- **grep/rg stripped semantically significant leading whitespace from matched content** —
+  `.trim()` was applied to match content in three extraction sites
+  (`try_parse_single_target` for grep, `try_parse_file_line_content` for the shared
+  file:line:content parser, and `extract_match_fields` in the rg JSON tier). This was
+  destructive for Python (indented function defs), YAML, and any language where leading
+  spaces carry meaning. Fixed by switching to `trim_end()` — trailing whitespace is
+  still removed, leading whitespace is preserved. Both the rewrite-hook and PATH-wrapper
+  surfaces share these handlers and benefit from the fix.
+
+- **Hook scripts used a bare `skim` exec that silently ran the wrong binary after
+  `skim` was updated or reinstalled** — Generated hook scripts now embed `SKIM_HOOK_BINARY`
+  (the canonicalized absolute install-time path) and `SKIM_HOOK_COMMIT` (short git SHA)
+  at generation time via a `build.rs` compile-time constant. At runtime the hook
+  executes via the pinned binary with a PATH fallback. `hook_is_current()` now checks
+  for the `SKIM_HOOK_BINARY` export — hooks generated before this fix are treated as
+  stale and `skim init` will prompt to reinstall. A version-mismatch helper warns when
+  the running binary differs from the pinned binary SHA.
+
+- **Manually repointing a pinned hook script's binary path triggers an integrity warning**
+  — This is expected behaviour. Editing the script bytes by hand changes its SHA-256
+  checksum, so the run-time integrity check (`check_hook_integrity`) reports the script
+  as "tampered"; a repointed `SKIM_HOOK_BINARY` path also trips the binary-path check
+  (`check_hook_binary_mismatch`). Both checks fire at hook run time — the install-time
+  currency predicate (`hook_is_current`) is not involved and never yields "tampered".
+  Run `skim init --uninstall --force` to remove the modified script (the `--force`
+  flag bypasses the tamper guard on uninstall), then `skim init` to regenerate a
+  clean script pointed at the current install location (applies ADR-004).
+
+- **`--version` now prints `x.y.z (<shortsha>)`** — The version output includes the short
+  git SHA of the build commit (compiled in via `build.rs`). This makes it straightforward
+  to identify which exact commit a running binary was built from, which is useful when
+  debugging hook-version mismatches reported by `hook_is_current()`.
+
+- **Markdown headings appear in reverse order in structure/signatures output** — The
+  `extract_markdown_headers_with_spans` function collected headings via a depth-first
+  visit stack (LIFO) which emitted sibling headings in reverse source order; a document
+  with `# A`, `## B`, `## C` produced `C → B → A` output. The fix adds a single
+  ascending sort on `source_start_line` before the texts/spans/line-map pipeline, so
+  headings are always emitted top-to-bottom regardless of tree traversal order.
+
+- **`cargo nextest run` dropped the `run` subcommand token in rewrites** — The rewrite
+  rule for `cargo nextest run` was `rewrite_to: &["skim", "cargo", "nextest"]`,
+  silently dropping `run`. This caused the dispatch layer to receive `nextest` without
+  `run`, fell through to the wrong handler, and also triggered a fragile
+  `args.iter().any(|a| a == "nextest")` sniff in the cargo test driver that
+  occasionally mis-identified standard `cargo test` runs. Three-layer fix: (a) preserve
+  `run` in the rewrite rule; (b) replace the sniff with an explicit
+  `runner_args.first() == Some("nextest")` check threaded from the dispatcher (A2
+  contract); (c) correct the test-failure output path — nextest writes its entire report
+  (including the summary) to *stderr*, leaving stdout empty, so its failures must be
+  forwarded raw rather than routed into skim's stdout-keyed compress path (which would
+  emit nothing — the net-savings guard baselines against the empty stdout — or
+  mis-count, since the embedded per-process libtest line reports a single binary, not
+  the whole run). nextest's test-failure exit `100` (distinct from libtest's `101`) is
+  therefore deliberately *not* added to the compressible-exit set; every non-zero
+  nextest exit forwards the full, accurate report verbatim. (#317 compress-never-truncate)
+
+- **Pseudo mode stripped visibility/export modifiers, losing API surface** — Pseudo mode
+  is intended to remove syntactic noise while preserving code semantics. Visibility
+  modifiers (`pub`, `export`, `public`, `private`, `protected`, `internal`,
+  `fileprivate`, `open` in Swift) are API surface — they affect what callers can see —
+  not noise. Removing them silently changed the semantics an LLM reads. The fix removes
+  visibility keywords and node kinds from all per-language `PseudoRules` strip lists.
+  Non-visibility structural modifiers (`static`, `final`, `abstract`, `virtual`,
+  `override`, `sealed`, Kotlin `open`/`data`) remain stripped as before. C++ access
+  specifiers (`public:`, `private:`) are similarly preserved. (A4 contract)
+
+- **`ls -la` output double-counted `.`/`..` entries and emitted a redundant header** —
+  `try_parse_ls_long` matched the permission-line regex against `.` and `..` dotdir
+  entries, inflating the dir count by 2. It also prepended a `"LS: N entries …"`
+  summary line before the file list; `FileResult::render` then emitted a second `ls N`
+  header, producing two headers in the rendered output. Fixes: skip `.` and `..` before
+  counting (trimming the trailing `/` added by `-F`/`-p` before the name comparison);
+  remove the prepended summary entry; fold the dir/file breakdown into the footer so it
+  reads `"… — D dirs, F files"` when entries are elided or `"D dirs, F files"` when all
+  fit. Empty directories (only `total`/`.`/`..` lines) return a well-formed `Full`
+  result with 0 entries rather than `None`, preventing Tier-2 from mis-tokenising those
+  lines.
+
+- **Unified `SKIM_CACHE_DIR` resolution — honored by all cache subsystems (#359 Phase B)** —
+  Previously `SKIM_CACHE_DIR` was silently ignored by the parser cache and the default
+  `analytics.db` path (`cache::get_cache_dir` read only `dirs::cache_dir()`) while the
+  search index and hook log respected it. This caused partial relocation: some skim state
+  moved, some stayed under `~/.cache/skim` (PF-002).
+
+  The fix introduces a single source of truth:
+  - `cache::cache_root_from(override_dir)` — pure resolver (no I/O); filters empty paths.
+  - `cache::cache_root()` — reads `SKIM_CACHE_DIR` and delegates to `cache_root_from`.
+  - `cache::get_cache_dir()` now calls `cache_root()` before the mkdir/chmod block.
+  - `cmd::hook_log::CacheEnv::resolve_cache_dir()` now delegates to `cache::cache_root_from`
+    instead of its own inline resolver.
+
+  **Behavior change:** `SKIM_CACHE_DIR` now also relocates the default `analytics.db`
+  (previously it did not). `SKIM_ANALYTICS_DB` still takes precedence over the relocated
+  default when explicitly set. Empty `SKIM_CACHE_DIR` is treated as unset (falls back to
+  the platform default `~/.cache/skim`). **Caveat:** pre-existing history at the old
+  `~/.cache/skim/analytics.db` is **not migrated** — setting `SKIM_CACHE_DIR` for the
+  first time causes `skim stats` to start from an empty DB at the new location; the old
+  file remains at `~/.cache/skim/analytics.db` and must be moved manually if you want to
+  preserve history.
+
+- **Plain `skim <file>` now always records token-savings analytics (#359 Phase A)** —
+  Previously a plain `skim <file>` (and stdin, glob, and directory invocations) only
+  recorded analytics when token counts were already present in the parser cache from a
+  prior `--show-stats` run; cold-cache and plain-warmed-cache runs silently dropped all
+  data. The fix introduces a unified `record_file_ops` path that records token counts
+  independent of cache state, with the detected language attached to each row. Multi-file
+  invocations (glob, directory) now emit one analytics row per file instead of a single
+  aggregate. **Dashboard metric note:** `skim stats` computes `invocations` as a row count,
+  so a 3-file run now contributes +3 to the invocations counter instead of +1; historical
+  data recorded before this release used the old single-row-per-invocation convention, so
+  `invocations` comparisons across the upgrade point will reflect this change in counting
+  semantics.
+
+- **Oversized files now degrade to a lossless raw passthrough instead of erroring** — Files
+  exceeding the AST node cap or line cap previously aborted with "Too many AST nodes / Possible
+  malicious input". They now fall back to a full byte-faithful raw pass-through (signalled via a
+  typed `ComplexityLimit`), so agents always see content rather than an error. `--max-lines` and
+  `--last-lines` are honored, so a head-style request still yields the requested window. AST depth
+  caps (guarding against unbounded recursion) remain hard errors.
+
+- **`skim -` (stdin) without a language hint now degrades to lossless passthrough (exit 0)
+  instead of erroring** — Previously, piping content to skim with no `--language` flag,
+  no `--filename` hint, and no recognisable shebang produced an error and exited non-zero.
+  stdin now falls back to a full byte-faithful passthrough consistent with the file-path
+  degrade policy. Shebang auto-detection (`#!/usr/bin/env python3`, `#!/bin/bash`, etc.)
+  still applies before the passthrough decision — only plain content with no detectable
+  language degrades. Use `--language` for reliable transformation when the language cannot
+  be inferred (applies ADR-002).
+
+- **`skim search index` no longer shadows the search term "index"** — Previously `skim search index`
+  always triggered an index build, making the literal term "index" unsearchable. The dispatch now
+  routes to the build path only when trailing args fit the build grammar (`--force`, `--root`,
+  `--max-files`, `--index-dir`); with any query flag or extra positional terms it searches for the
+  literal string "index". `skim search -- index` forces a search via the POSIX `--` escape. Bare
+  `skim search index` (no extra args) still triggers a build (backward-compatible).
+
+- **`skim grep`/`rg` now group matches by file at any match volume** — Small result sets
+  previously fell back to raw `file:line:content` output instead of the grouped-by-file layout.
+  Grouping is now applied consistently regardless of match count.
+
 ### Added
 - **`rskim-tokens` crate (L3 Wave-1)** — Multi-provider token counting library (cl100k /
   o200k / Anthropic-offline / heuristic). Default build is HTTP-free; `net-anthropic` feature
@@ -66,8 +287,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gh api` and `gh run watch` are exempt from the `--json` steering check at the
   handler gate (matching the rewrite skip-list); only `--jq`/`-q`/`--template`/`-t`
   trigger passthrough for those subcommands.
+- **Test-runner exit-code fidelity** (#350) — A passing suite whose output skim cannot
+  parse now exits 0 instead of 1. Previously `resolve_exit_code` treated an unparseable
+  exit-0 result as a failure (exit 1); it now propagates the child's zero exit code
+  verbatim. Genuine non-zero exits from failing suites are preserved unchanged on all paths.
+- **Git diff changed-line de-duplication** (#350) — Lines appearing in a hunk covered by
+  adjacent diff ranges are now emitted exactly once. A per-`FileDiff` `EmittedCursor` tracks
+  the last-written position; overlapping ranges advance the cursor rather than re-emitting
+  the shared lines. No change to diff output for non-overlapping hunks.
 
 ### Changed
+- **Exit codes refined: parse errors → 2, unsupported language → 3** — Previously all
+  `skim` errors that prevented transformation exited 1. The CLI now maps known failure
+  classes to distinct codes: exit 2 for grammar/syntax parse failures
+  (`SkimError::ParseError`), exit 3 for unrecognised language when a `--filename`
+  hint carries an extension skim does not recognise (`SkimError::UnsupportedLanguage`).
+  Exit 1 is preserved for all other errors (I/O, config, etc.). Shebang-only or
+  extension-based detection failures degrade to lossless passthrough (exit 0) rather
+  than exiting 3; exit 3 fires only when a `--filename` hint carries an extension skim
+  does not recognise. Scripts that tested for `exit != 0` are unaffected; scripts that branched on
+  the exact exit code may need updating.
+- **Session-id attribution priority inverted: sidecar > env > flag** (#350) — The hook no longer
+  injects `--session-id` into rewritten commands; flag injection caused hard failures
+  (`"unexpected argument --session-id"`) on older binaries. Attribution now resolves in order:
+  sidecar (written out-of-band by the hook; found via ancestry walk) → `SKIM_SESSION_ID` env var
+  (wrapper-surface attribution; export alongside `PATH`) → `--session-id=VALUE` flag
+  (forward-compat fallback; honoured so old hooks that still inject the flag are not lost).
+- **Net-savings guard token-decision cap raised 64 KiB → 256 KiB; new 4 KiB longest-run guard
+  for degenerate inputs** (#317 / #350) — The cap controlling when `savings_decision` falls
+  back from exact token counts to fast byte comparison is raised from 64 KiB to 256 KiB,
+  improving token-accurate decisions for moderately large outputs.  A complementary
+  longest-run guard is added: when either string contains a non-whitespace run exceeding
+  4 KiB (and both strings are below the size cap), the function falls back to byte comparison
+  to avoid O(n²) BPE merge cost on minified JS / base64 / binary-as-text single-line inputs.
+  Real line-oriented shell output never triggers the run guard; the "never expand" safety
+  invariant is unchanged on all paths.
+- **Analytics stores true (gross) compressed-token counts on expansion rows** (#317 / #350) —
+  Previously `compressed_tokens` was clamped to `raw_tokens` when the output expanded.  It is
+  now stored as the true value.  The `tokens_saved` aggregate (in `query_summary`, `query_daily`,
+  and all other aggregate queries) is floored per-row to 0 via `CASE WHEN`, consistent with
+  existing `query_by_command` / `query_by_language` / `query_by_mode` / `query_by_session`
+  behavior.  Row-level `raw_tokens` / `compressed_tokens` now carry true gross counts, allowing
+  accurate expansion-rate analysis.  **Note:** rows written before this change remain clamped
+  (mixed historical data); this is acceptable for cumulative analytics — no migration is needed.
+- **`--show-stats` token counts reused for analytics recording** (#317 / #350) — When
+  `--show-stats` is active, the token counts already computed for the stats display are reused
+  to record the analytics row via `try_record_command_with_counts`, avoiding redundant
+  background re-tokenization.  The common path (no `--show-stats`) is unchanged.
 - **`serde_json` `preserve_order` feature enabled workspace-wide — key ordering changes** — (#302)
   Enabling `preserve_order` switches `serde_json::Map` from `BTreeMap` (alphabetical) to
   `IndexMap` (declaration/insertion order) for every crate in the workspace. Visible effects:
@@ -131,6 +397,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`skim search index` subcommand** — Build or update the n-gram search index for the current project. Walk/classify/build pipeline with parallel tree-sitter classification (rayon), JSONL manifest sidecar for incremental builds (SHA-256 cache hits skip re-classification), atomic write ordering, minified file detection, and 50K file cap. `--force` flag for full rebuild, `--root` for explicit project root, `--max-files` override. (#182)
 - **`skim dig` / `skim nslookup` subcommands** — DNS query output compression via two independent parsers: `dig` uses section-based parsing (QUESTION/ANSWER sections), `nslookup` uses key-value line parsing. Both support three-tier degradation, `--json` structured output, error state compression, and macOS + Linux format variants. `nslookup` includes no-args guard. 2 new rewrite rules (total: 148) (#168)
 - **`skim make` / `skim gmake` subcommands** — GNU Make build output compression via three-tier parser: Tier 1 (GCC/Clang diagnostics regex + make failure lines), Tier 2 (noise-stripped invocation/directory-change lines), Tier 3 (passthrough). Includes `gmake` rewrite rule for hook integration. 17 unit tests, 2 E2E tests (#167)
+
+## [2.11.0] - 2026-07-11
+
+Consent-gated permissions seeding for `skim init`; Copilot hook re-homed to `~/.copilot`; `ls -a` fidelity fix. 4,329 tests passing (up from 3,558 in v2.10.0).
+
+### Added
+
+- **`skim init --permissions` / `--no-permissions` / `--permissions-tier=<tier>`** —
+  Consent-gated allowlist seeding for Claude, Gemini, Codex, and Copilot. Three tiers:
+  - **seed** (default): seeds 8 arg-safe read-only wrapped tools (`df`, `diff`, `du`,
+    `grep`, `ls`, `rg`, `tree`, `wc`) as allowlist entries. Excluded-for-cause:
+    `find`, `env`, `printenv`, `dig`, `nslookup`, `ps` (network or process-enumeration
+    risk). `Bash(skim <tool>:*)` prefix entries do NOT bound tool arguments — the seed
+    set is individually arg-safety-vetted.
+  - **mirror**: proposes exact-shape mirrors of the agent's existing allow rules, with
+    mutating tools highlighted; sourced from the live settings file; deny/ask-aware (skips
+    already-restricted rules). Claude-scoped only.
+  - **blanket**: seeds all wrapped subcommands; requires a second hazard confirmation at
+    the TTY prompt; refused for Codex (Codex is explicit-opt-in only for `--permissions`).
+  - Interactive TTY consent is required before any entries are written — `--yes` never
+    bypasses the grant prompt.
+  - A sidecar manifest (`skim-permissions.json`) is written alongside the agent config on
+    every seed; `skim init --uninstall` reads the sidecar for targeted removal so only
+    skim-seeded entries are touched.
+  - `--dry-run` enumerates the entries that would be written (with `[mutating tool]`
+    annotations on mirror tier) without modifying any files.
+  - Cursor and Crush have no permissions seeding (IDE-hook / no-hook channel only).
+
+### Fixed
+
+- **`skim ls -a` / `--all` now retains `.` and `..` entries** — `parse_ls` previously
+  stripped `.` and `..` unconditionally, silently truncating listings requested with
+  `-a`/`--all`. Fix threads an `include_dotdirs` flag through both long-format and
+  plain-format accumulation paths; retained dotdirs are included in the entry count.
+  Honors compress-never-truncate (#317).
+
+- **Copilot CLI hook re-homed to `~/.copilot/hooks/skim.json`** — Skim previously
+  installed Copilot hook config under `~/.github/` (a location the Copilot CLI never
+  reads). The hook is now written to `~/.copilot/hooks/skim.json` (or
+  `$COPILOT_HOME/hooks/skim.json`) using the documented hook-file envelope
+  (`{"version":1,"hooks":{"preToolUse":[…]}}`). On re-init, guarded migration
+  removes legacy `~/.github` artifacts (settings entry, hook script, SHA sidecar)
+  only when the new-location artifacts already exist; each removal is non-fatal and
+  idempotent.
+
+- **Copilot hook response now uses `modifiedArgs`** — Skim's Copilot PreToolUse response
+  previously included a `permissionDecision` field the protocol does not require. The
+  response is now `{"modifiedArgs":{"command":"<rewritten>"}}` with no `permissionDecision`
+  or `reason`. No-rewrite invocations emit no output (empty stdout, existing convention).
+  Requires Copilot CLI >= 1.0.24 (released 2026-04-10); older CLIs silently ignore
+  `modifiedArgs` — inert passthrough, not breakage. Schema verified 2026-07-11 against
+  GitHub Copilot CLI hooks-reference and hooks-configuration documentation.
+
+### Changed
+
+- **Cursor is IDE-only** — Cursor CLI has no rewrite-capable hook event; only the IDE
+  (`.cursor/rules/*.mdc` guidance injection) is supported by `skim init`. No permissions
+  seeding is offered for Cursor. Documented in `session/types.rs` operational contract.
+
+- **Per-agent `<AGENT>_CONFIG_DIR` overrides honored on the write path** —
+  `DetectionEnv::resolve()` now applies agent-specific env overrides on the install and
+  uninstall write path in addition to the pre-existing detection path. `CLAUDE_CONFIG_DIR`,
+  `GEMINI_CONFIG_DIR`, `CODEX_CONFIG_DIR`, `COPILOT_CONFIG_DIR`, and equivalents redirect
+  `skim init` to the specified directory, enabling fully sandboxed integration tests without
+  touching real agent config locations.
+
+### Two-Speed Rollout
+
+Binary-side changes (`ls -a` fidelity, Copilot hook response strategy) take effect
+immediately after upgrading the binary. Config/guidance changes (permissions seeding, Copilot
+hook re-home and legacy migration, updated agent guidance) activate at the next `skim init`
+re-run; the version bump advances the binary past the "already up to date" fast path, so
+`skim init` re-runs on the first post-upgrade invocation. Because Copilot never loaded the
+legacy `~/.github` hook config, all Copilot-facing changes (re-home, `modifiedArgs` response,
+migration) activate only at re-init.
 
 ## [2.10.0] - 2026-05-13
 

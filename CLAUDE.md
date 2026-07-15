@@ -30,7 +30,7 @@ Cargo workspace, 8 crates:
 Parser Manager (language detection)
   ↓
 Language::transform_source()          ← Strategy Pattern dispatcher
-  ├─ tree-sitter  (14 code langs: TS/JS/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Kotlin/Swift/Markdown)
+  ├─ tree-sitter  (15 code langs: TS/JS/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Kotlin/Swift/Bash/Markdown)
   └─ serde-based  (JSON/YAML/TOML — data formats, not code)
   ↓
 Transformation Layer (modes: structure / signatures / types / minimal / pseudo / full)
@@ -41,7 +41,7 @@ Streaming output (stdout, zero-copy via &str slices where possible)
 `transform_source()` routes each language to its parser via the Strategy Pattern, avoiding special-case conditionals — each language encapsulates its own strategy.
 
 **Non-obvious behavior (gotchas):**
-- **Analytics:** token savings persist to `~/.cache/skim/analytics.db` (SQLite/WAL), recorded fire-and-forget on background threads. `--clear-cache` clears only the parser cache, NOT `analytics.db` — use `skim stats --clear` for that. The `AnalyticsStore` trait + `MockStore` make the stats dashboard testable without a real DB.
+- **Analytics:** token savings persist to `~/.cache/skim/analytics.db` (SQLite/WAL; default location — relocates with `SKIM_CACHE_DIR`, see Environment Variables), recorded fire-and-forget on background threads. `--clear-cache` clears only the parser cache, NOT `analytics.db` — use `skim stats --clear` for that. The `AnalyticsStore` trait + `MockStore` make the stats dashboard testable without a real DB.
 - **Search DB:** `rskim-search` stores hotspot/risk/co-change data in `<root>/.skim/search.db`. Migrations are forward-only via `PRAGMA user_version`; a DB written by a newer version errors rather than corrupting data.
 - **AST index:** the n-gram index (`ast_index.skidx` / `.skpost`) is format v2 — v1 files are rejected with "please rebuild" (`skim search index --rebuild`). Synthetic n-gram markers (IDs ≥ 64900) resolve to `None` in `vocab_resolve()`, keeping them isolated from real vocabulary.
 
@@ -76,9 +76,9 @@ Modes are set via `--mode` only (no config file): `structure` (default), `signat
 
 Most subcommands wrap a dev tool (cargo, git, npm, pytest, eslint, docker, psql, grep, …) and compress its output — run `skim --help` for the full catalog. The ones with non-obvious behavior:
 
-- `search` — n-gram code search over a project index. Build/update: `skim search index` (`--rebuild`, `--force`, `--root`, `--max-files`). Query: `skim search <text>` (`--limit`, `--json`, `--stats`). Temporal sort/filter: `--hot`/`--cold` (hotspot score), `--risky` (fix-risk), `--blast-radius FILE` (co-change peers). Structural: `--ast <pattern>` — a named pattern (`try-catch`, `nested-loop`, `god-function`, …) or containment query (`for_statement > block`); composable with text query and `--blast-radius`. `--ast` with temporal flags, or single-node queries, errors out (#202 / #283).
+- `search` — n-gram code search over a project index. Build/update: `skim search index` (`--rebuild`, `--force`, `--root`, `--max-files`, `--index-dir`); routes to build only when trailing args match the build grammar — bare `skim search index` still builds (backward-compatible), but with query flags or extra positional terms it searches for the literal "index" (`skim search -- index` forces a search via POSIX `--`). Query: `skim search <text>` (`--limit`, `--json`, `--stats`). Temporal sort/filter: `--hot`/`--cold` (hotspot score), `--risky` (fix-risk), `--blast-radius FILE` (co-change peers). Structural: `--ast <pattern>` — a named pattern (`try-catch`, `nested-loop`, `god-function`, …) or containment query (`for_statement > block`); composable with text query and `--blast-radius`. `--ast` with temporal flags, or single-node queries, errors out (#202 / #283).
 - `heatmap` — git-history risk/coupling analysis: churn, co-change, stability, fix-after-touch (`--json`, `--since`, `--window`, `--path`, `--insights`).
-- `init` — install skim as an agent hook (Claude/Cursor/Codex/Gemini/Copilot/Crush); `--wrappers` adds PATH wrappers for sub-agent interception.
+- `init` — install skim as an agent hook (Claude/Cursor/Codex/Gemini/Copilot/Crush); `--wrappers` adds PATH wrappers for sub-agent interception; `--permissions` seeds consent-gated allowlist entries (tiers: seed|mirror|blanket).
 - `stats` — token analytics dashboard (`--since`, `--format json`, `--verbose`, `--clear`).
 - `discover` / `learn` / `rewrite` — scan agent sessions for missed optimizations, learn error-retry correction rules, and rewrite commands into skim equivalents.
 
@@ -88,22 +88,33 @@ skim intercepts a sub-agent's shell command through **two independent mechanisms
 
 1. **Rewrite engine** — the PreToolUse hook and the `skim rewrite` CLI. Operates on the command *as text, before it runs*: `cmd/rewrite/` `try_rewrite()` transforms the string `grep -rn x` → `skim grep -rn x`. This is the **only** surface where flag preservation (Fix A — don't drop `-rn` during the rewrite), corruption-bail (Fix C), and pipe-source passthrough (Fix E) exist — they are properties of the *text transformation*.
 
-2. **PATH wrappers** — `skim init --wrappers` symlinks `~/.skim/bin/<tool>` → the skim binary (with `~/.skim/bin` first on `PATH`) so sub-agent shells route through skim even when they bypass PreToolUse hooks. Here skim *is* the tool: the OS runs the binary with `argv[0]=<tool>`, `main()` calls `strip_skim_wrappers_from_path()` as its very first statement (before any thread spawns, so the real tool is found and recursion is impossible), then `detect_argv0_dispatch()` routes straight to `cmd::dispatch(tool, args)` — **`try_rewrite` is never called**. Flags arrive as ordinary argv and pass to the handler unchanged; there is no rewrite step to "preserve" them through. `SKIM_PASSTHROUGH=1` is the escape hatch. Wrapper install/uninstall only ever touches symlinks whose target stem is `skim`/`rskim` — never regular files.
+2. **PATH wrappers** — `skim init --wrappers` symlinks `~/.skim/bin/<tool>` → the skim binary (with `~/.skim/bin` first on `PATH`) so sub-agent shells route through skim even when they bypass PreToolUse hooks. Here skim *is* the tool: the OS runs the binary with `argv[0]=<tool>`, `main()` calls `strip_skim_wrappers_from_path()` as its very first statement (before any thread spawns, so the real tool is found and recursion is impossible), then `detect_argv0_dispatch()` returns the tool name and args; `main()` interposes a fidelity gate (#370): `stdout_is_regular_file()` (`fstat` on fd 1) checks whether the shell already redirected stdout to a regular file before exec-ing the wrapper, and if so bails to `cmd::run_inherited_passthrough` so raw bytes reach the file unmodified (#317); otherwise it calls `cmd::dispatch(tool, args)`. **`try_rewrite` is never called**. Flags arrive as ordinary argv and pass to the handler unchanged; there is no rewrite step to "preserve" them through. `SKIM_PASSTHROUGH=1` is the escape hatch. Wrapper install/uninstall only ever touches symlinks whose target stem is `skim`/`rskim` — never regular files.
 
-**Testing / verification implication:** the two surfaces share the per-tool *handlers* (output compression) but NOT the dispatch front-end. A test that drives the `--hook`/`rewrite` path does **not** exercise the wrapper path, and vice-versa. When verifying behavior — and when confirming Snyk/CI actually cover a change — identify *which* surface a test hits and cover both where the behavior could diverge. Rewrite-engine guarantees (flag preservation, corruption-bail, pipe passthrough) simply do not apply to the wrapper surface.
+**Testing / verification implication:** the two surfaces share the per-tool *handlers* (output compression) but NOT the dispatch front-end. A test that drives the `--hook`/`rewrite` path does **not** exercise the wrapper path, and vice-versa. When verifying behavior — and when confirming Snyk/CI actually cover a change — identify *which* surface a test hits and cover both where the behavior could diverge. The rewrite *text-transformation* guarantees (flag preservation, text-scan corruption-bail, pipe-source passthrough) are rewrite-engine-only and do not apply to the wrapper surface. The stdout-to-file output-fidelity guarantee, however, now exists on *both* surfaces via distinct mechanisms: the rewrite engine uses `stdout_redirected_to_file` (a text scan before exec); the wrapper uses `stdout_is_regular_file` (an `fstat` on fd 1 after the shell has already redirected). Do not conclude that wrappers have no output-fidelity protection (#370).
 
 ## Environment Variables
 
 - `SKIM_PASSTHROUGH=1` — bypass all compression (use when compressed output hides an error). Indefinite commands (`vite dev`, `jest --watch`, bare `skim vitest`) auto-pass-through live; use `skim vitest run` for a compressed one-shot.
 - `SKIM_DEBUG=1` (or `--debug`) — warnings/notices on stderr.
-- `SKIM_SESSION_ID` — analytics session attribution; priority `--session-id` > sidecar > env > none. Set it alongside the PATH export so sub-agents inherit it.
-- `SKIM_CACHE_DIR` / `SKIM_ANALYTICS_DB` — override the cache dir / analytics DB path.
+- `SKIM_SESSION_ID` — analytics session attribution; priority sidecar > env > `--session-id` flag (flag is a forward-compat fallback only — the hook no longer injects it). Set it alongside the PATH export so sub-agents inherit it.
+- `SKIM_CACHE_DIR` — relocates **all** skim cache state: parser cache (`.json` files),
+  tee output (`tee/`), and the **default** `analytics.db` location. An empty value is
+  treated as unset (falls back to `~/.cache/skim`). The path is used as-is (no `skim`
+  suffix is appended by the resolver). **Caveat:** pre-existing analytics history at the
+  old `~/.cache/skim/analytics.db` is **not migrated** — setting this variable for the
+  first time causes `skim stats` to start from an empty DB at the new location; move
+  the old file manually if you want to preserve history.
+- `SKIM_ANALYTICS_DB` — overrides the analytics DB path directly; **takes precedence over
+  `SKIM_CACHE_DIR`** for the DB location. When `SKIM_ANALYTICS_DB` is set, the DB is
+  opened at that exact path regardless of `SKIM_CACHE_DIR`. To isolate all skim state
+  in a sandbox it is sufficient to set `SKIM_CACHE_DIR` alone (the default analytics.db
+  moves with it).
 - `SKIM_DISABLE_ANALYTICS=1` — disable recording. `SKIM_INPUT_COST_PER_MTOK` — $/MTok for cost estimates (default 3.0).
 - Session-provider overrides for `discover`/`learn`/`agents`: `SKIM_PROJECTS_DIR`, `SKIM_CODEX_SESSIONS_DIR`, `SKIM_COPILOT_DIR`, `SKIM_CURSOR_DB_PATH`, `SKIM_GEMINI_DIR`, `SKIM_CRUSH_DIR`.
 
 ## Design Constraints
 
-**MUST:** stream to stdout (never write intermediate files) · prefer `&str` slices over allocation in the hot path · tolerate incomplete code (rely on tree-sitter error nodes) · stay under 50ms for 1000-line files (benchmark regressions block) · fail loud with actionable messages, never silently · modes via CLI flags only, no `.skimrc` · **compress, never truncate** (#317): wrappers may re-encode output but never show less than the raw tool; an unavoidable safety bound must use `output::elision_marker` (exact counts + `SKIM_PASSTHROUGH=1` hint); unexpected non-zero exits forward raw output instead of compressing; rewrites must reconstruct the command byte-faithfully or bail (never emit a command that errors or changes semantics).
+**MUST:** stream to stdout (never write intermediate files) · prefer `&str` slices over allocation in the hot path · tolerate incomplete code (rely on tree-sitter error nodes) · stay under 50ms for 1000-line files (benchmark regressions block) · fail loud with actionable messages, never silently · modes via CLI flags only, no `.skimrc` · **compress, never truncate** (#317): wrappers may re-encode output but never show less than the raw tool; an unavoidable safety bound must use `output::elision_marker` (exact counts + `SKIM_PASSTHROUGH=1` hint); unexpected non-zero exits forward raw output instead of compressing; rewrites must reconstruct the command byte-faithfully or bail (never emit a command that errors or changes semantics). **git diff enhancement view must fit within the raw budget** — any enriched render (e.g. hunk-scoped AST breadcrumbs) is guarded by an ADR-001 net-savings check; if enrichment expands the output beyond the raw diff size, raw is emitted instead (git-diff raw-budget decision reversal: the unguarded enhancement view was replaced by a guardrail-protected one).
 
 **MUST NOT:** add syntax highlighting (use `bat`), linting (use linters), type checking (use `tsc`/`mypy`), or LSP features — all out of scope.
 

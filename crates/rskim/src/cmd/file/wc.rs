@@ -28,6 +28,9 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::FileOps,
     expected_exit_codes: &[],
     forward_stderr: true,
+    skip_net_savings_guard: false,
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 /// Matches full wc output: lines words bytes filename

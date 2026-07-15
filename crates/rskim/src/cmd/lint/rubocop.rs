@@ -29,6 +29,10 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::Lint,
     expected_exit_codes: &[1],
     forward_stderr: false,
+    skip_net_savings_guard: false,
+    // rubocop JSON mode outputs `{"summary": {...}}` even on 0 offenses — Full tier is never empty.
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 /// `file:line:col: S: CopName: message`

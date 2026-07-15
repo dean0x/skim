@@ -18,9 +18,10 @@ use predicates::prelude::*;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use tempfile::TempDir;
+mod common;
 
 fn skim_cmd() -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd
 }
@@ -145,6 +146,43 @@ fn test_rewrite_tsc_bare_with_args() {
         .assert()
         .success()
         .stdout(predicate::str::contains("skim tsc --noEmit --watch"));
+}
+
+/// `cargo nextest run` must be rewritten with `run` preserved (F2a / #317 byte-faithful).
+///
+/// The old rule dropped `run`, producing `skim cargo nextest`, which then executed
+/// `cargo test nextest …` — a bogus command that matched ~5 tests by name.
+#[test]
+fn test_rewrite_cargo_nextest_run_preserves_run() {
+    skim_cmd()
+        .args([
+            "rewrite", "cargo", "nextest", "run", "-p", "rskim", "--bins",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "skim cargo nextest run -p rskim --bins",
+        ));
+}
+
+/// Verify that the rule is still triggered when only the `cargo nextest run` prefix
+/// matches — flags after `run` must be forwarded verbatim (byte-faithful).
+#[test]
+fn test_rewrite_cargo_nextest_run_flags_forwarded() {
+    skim_cmd()
+        .args([
+            "rewrite",
+            "cargo",
+            "nextest",
+            "run",
+            "--no-fail-fast",
+            "--test-threads=4",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "skim cargo nextest run --no-fail-fast --test-threads=4",
+        ));
 }
 
 #[test]
@@ -429,7 +467,8 @@ fn test_rewrite_hook_agent_gemini_no_match_passthrough() {
 
 #[test]
 fn test_rewrite_hook_agent_copilot_match() {
-    // Copilot uses deny-with-suggestion response format
+    // Copilot uses modifiedArgs response format (no-verb column: no permissionDecision).
+    // Respected by Copilot CLI >= v1.0.24; older CLIs silently ignore it (inert passthrough).
     let input = serde_json::json!({
         "tool_input": {
             "command": "cargo test"
@@ -444,13 +483,22 @@ fn test_rewrite_hook_agent_copilot_match() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(
-        json["permissionDecision"], "deny",
-        "Copilot response should have permissionDecision=deny"
-    );
+    // modifiedArgs.command must contain the rewritten command
     assert!(
-        json["reason"].as_str().unwrap().contains("skim cargo test"),
-        "Copilot deny reason should contain rewritten command"
+        json["modifiedArgs"]["command"]
+            .as_str()
+            .is_some_and(|c| c.contains("skim cargo test")),
+        "Copilot response must have modifiedArgs.command with the rewritten command; got: {json}"
+    );
+    // No permissionDecision — skim never self-approves for Copilot
+    assert!(
+        json.get("permissionDecision").is_none(),
+        "Copilot response must NOT include permissionDecision (no-verb column)"
+    );
+    // No reason field — modifiedArgs response is terse
+    assert!(
+        json.get("reason").is_none(),
+        "Copilot response must NOT include a reason field"
     );
 }
 
@@ -1606,8 +1654,7 @@ fn fake_gh_on_path() -> (TempDir, String) {
 fn test_gh_handler_gate_fires_on_q_flag_passes_through_verbatim() {
     let (_bin_dir, new_path) = fake_gh_on_path();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env("PATH", &new_path)
         .args(["gh", "issue", "view", "93", "-q", ".body"])
@@ -1639,8 +1686,7 @@ fn test_gh_handler_gate_fires_on_q_flag_passes_through_verbatim() {
 fn test_gh_handler_gate_does_not_fire_without_steering_flag() {
     let (_bin_dir, new_path) = fake_gh_on_path();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env("PATH", &new_path)
         .args(["gh", "issue", "view", "93"])
@@ -1668,8 +1714,7 @@ fn test_gh_handler_gate_does_not_fire_without_steering_flag() {
 fn test_gh_handler_gate_fires_on_json_flag() {
     let (_bin_dir, new_path) = fake_gh_on_path();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env("PATH", &new_path)
         .args(["gh", "issue", "view", "93", "--json", "number,body"])
@@ -1696,8 +1741,7 @@ fn test_gh_handler_gate_fires_on_json_flag() {
 fn test_gh_handler_gate_api_json_does_not_passthrough() {
     let (_bin_dir, new_path) = fake_gh_on_path();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env("PATH", &new_path)
         .args(["gh", "api", "repos/o/r", "--json", "name"])
@@ -2685,8 +2729,10 @@ fn fix_e_git_show_pipe_passes_through() {
 // "unexpected argument '--session-id'".
 // ============================================================================
 
-/// Hook-rewrite `cat <tmp.rs>` with a session_id, then EXECUTE the emitted
-/// command. It must exit 0 and produce output.
+/// Hook-rewrite `cat <tmp.rs>` with a session_id: the rewritten command must
+/// contain NO `--session-id` token (Fix #1.1 — session attribution is
+/// out-of-band via sidecar/env, never injected into the command text).
+/// The rewritten command must still execute successfully and produce output.
 #[test]
 fn test_hook_rewritten_cat_with_session_id_executes() {
     let dir = TempDir::new().unwrap();
@@ -2712,12 +2758,16 @@ fn test_hook_rewritten_cat_with_session_id_executes() {
     let rewritten = response["hookSpecificOutput"]["updatedInput"]["command"]
         .as_str()
         .expect("rewritten command present");
+
+    // Fix #1.1: session attribution flows via sidecar ancestry walk, never
+    // via --session-id flag injection.  The rewritten command text must be
+    // free of the flag so it can execute without "unrecognised option" errors.
     assert!(
-        rewritten.contains("--session-id=e2e-roundtrip-session"),
-        "session id must be injected: {rewritten}"
+        !rewritten.contains("--session-id"),
+        "rewritten command must NOT contain --session-id (attribution is out-of-band via sidecar): {rewritten}"
     );
 
-    // Execute the emitted tokens through the actual skim binary.
+    // The rewritten command must start with "skim" and execute successfully.
     // NOTE: split_whitespace is used for simplicity and relies on TempDir
     // producing a space-free path (standard on Linux/macOS /tmp). If the
     // temp dir ever introduces spaces, switch to a proper shell-word splitter.
@@ -2790,9 +2840,12 @@ fn test_hook_redirect_reorder_hazard_is_never_rewritten() {
         .stdout(predicate::str::is_empty());
 }
 
-/// Safe redirect order (`>log 2>&1`) still rewrites — append preserves it.
+/// D2 (#370): `cargo test >log.txt 2>&1` redirects stdout to a file — the
+/// hook must bail (success + empty stdout) so skim does not interpose.
+/// Mirrors `test_hook_redirect_reorder_hazard_is_never_rewritten` above.
+/// Hook bail contract: `.success()` + `stdout(is_empty())`.
 #[test]
-fn test_hook_safe_redirect_order_still_rewrites() {
+fn test_hook_stdout_redirect_bails() {
     let input = serde_json::json!({
         "tool_input": {
             "command": "cargo test >log.txt 2>&1"
@@ -2803,7 +2856,52 @@ fn test_hook_safe_redirect_order_still_rewrites() {
         .write_stdin(serde_json::to_string(&input).unwrap())
         .assert()
         .success()
-        .stdout(predicate::str::contains(">log.txt 2>&1"));
+        .stdout(predicate::str::is_empty());
+}
+
+// ============================================================================
+// D2 (#370) — hook-surface bail: newly-fixed false-negative cases
+//
+// Hook bail contract: .success() + empty stdout (avoids PF-004).
+// CLI bail equivalents in cli_rewrite.rs.
+// Wrapper surface coverage in cli_wrapper_argv0.rs.
+// ============================================================================
+
+/// D2 (#370) false-negative fix 1b hook path: `>&2x` is a redirect to file
+/// `2x` (not an fd-dup — only `>&<all-digits>` and `>&-` qualify).
+/// Hook bail contract: `.success()` + empty stdout (avoids PF-004).
+#[test]
+fn test_hook_redirect_fd2x_bails() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "cmd >&2x"
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// D2 (#370) false-negative fix 1a hook path: a backslash-escaped single
+/// quote (`\'`) outside quotes must not open a quoting context; the `>`
+/// between two `\'` markers is a real stdout redirect that must bail.
+/// Hook bail contract: `.success()` + empty stdout (avoids PF-004).
+#[test]
+fn test_hook_redirect_backslash_desync_bails() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "grep x\\' file > out z\\'z"
+        }
+    });
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
 }
 
 // ============================================================================
@@ -2885,4 +2983,124 @@ fn cli_rewrite_no_newline_still_rewrites() {
         .assert()
         .success()
         .stdout(predicate::str::contains("skim grep -rn x dir"));
+}
+
+// ============================================================================
+// F7: cat guard hook-mode regression tests (PF-004)
+//
+// The cat handler has two guards in handlers.rs:
+//   1. Flag bail (lines 73-87): flags -A, -v, -e, -t, -n, -b all indicate
+//      non-pure-content display modes — the rewrite is suppressed because
+//      skim cat would produce different output from raw `cat`.
+//   2. Non-code-extension bail (line ~90): files with unsupported extensions
+//      (e.g., .mds, .txt) are not skim-readable — the rewrite is suppressed.
+//
+// In hook mode, a suppressed rewrite produces empty stdout (exit 0).  These
+// tests pin the guards against accidental removal so any regression is caught
+// immediately at the E2E layer.
+// ============================================================================
+
+/// Helper: build a JSON hook payload for a cat command in hook mode.
+fn cat_hook_payload(cmd: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "tool_input": { "command": cmd }
+    }))
+    .unwrap()
+}
+
+/// Guard 1a: `cat -A file.ts` — `-A` flag bails out (show-all, not content).
+#[test]
+fn test_cat_guard_flag_show_all_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat -A file.ts"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Guard 1b: `cat -v file.ts` — `-v` flag bails out (show-nonprinting).
+#[test]
+fn test_cat_guard_flag_v_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat -v file.ts"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Guard 1c: `cat -e file.ts` — `-e` flag bails out (show-ends + nonprinting).
+#[test]
+fn test_cat_guard_flag_e_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat -e file.ts"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Guard 1d: `cat -t file.ts` — `-t` flag bails out (show-tabs + nonprinting).
+#[test]
+fn test_cat_guard_flag_t_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat -t file.ts"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Guard 1e: `cat -n file.ts` — `-n` flag bails out (number all lines).
+///
+/// Skim does not reproduce line-number formatting; rewriting would change
+/// semantics.  This guard ensures the command is passed through unchanged.
+#[test]
+fn test_cat_guard_flag_n_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat -n file.ts"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Guard 1f: `cat -b file.ts` — `-b` flag bails out (number non-blank lines).
+#[test]
+fn test_cat_guard_flag_b_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat -b file.ts"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Guard 2a: `cat file.mds` — `.mds` is not a supported skim extension.
+///
+/// The non-code-extension bail prevents skim from being called on unrecognized
+/// file types where it would either error or produce meaningless output.
+#[test]
+fn test_cat_guard_unsupported_extension_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat file.mds"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Guard 2b: `cat -A *.mds` — flag bail takes precedence over glob / extension.
+///
+/// The flag guard fires first, so even a glob pattern with an unsupported
+/// extension produces no rewrite.
+#[test]
+fn test_cat_guard_flag_show_all_with_glob_no_rewrite_in_hook_mode() {
+    skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(cat_hook_payload("cat -A *.mds"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
 }

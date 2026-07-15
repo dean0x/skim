@@ -8,9 +8,10 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::process;
+mod common;
 
 fn skim_cmd() -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd
 }
@@ -25,11 +26,7 @@ fn test_skim_pytest_help() {
     // `skim pytest` with --help and no stdin should attempt to run pytest --help.
     // Since we can't guarantee pytest is installed, we just check that
     // the subcommand routing works (doesn't say "not yet implemented").
-    let output = Command::cargo_bin("skim")
-        .unwrap()
-        .args(["pytest", "--help"])
-        .output()
-        .unwrap();
+    let output = common::skim().args(["pytest", "--help"]).output().unwrap();
 
     // If pytest is installed, it shows pytest help.
     // If not, we get an error about pytest not being found.
@@ -101,8 +98,7 @@ fn test_piped_all_failures() {
 
 #[test]
 fn test_piped_passthrough_for_garbage() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["pytest"])
         .write_stdin("this is not pytest output\n")
         .assert()
@@ -119,8 +115,7 @@ fn test_piped_passthrough_for_garbage() {
 #[test]
 fn test_piped_passthrough_mode_skips_compression() {
     let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .args(["pytest"])
         .env("SKIM_PASSTHROUGH", "1")
         .write_stdin(fixture)
@@ -221,8 +216,7 @@ fn test_pytest_with_args_does_not_read_stdin() {
     // (unlike vitest which has an npx fallback producing stdout). Assert
     // on stderr to prove the spawn path was taken — the "pytest" name in
     // the error message confirms skim attempted to exec it.
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .env_remove("SKIM_PASSTHROUGH")
         .env_remove("SKIM_DEBUG")
         .arg("pytest")

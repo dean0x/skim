@@ -9,20 +9,21 @@ use predicates::prelude::*;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
+mod common;
 
 // ============================================================================
 // Helper: build an isolated `skim init` command with CLAUDE_CONFIG_DIR override
 // ============================================================================
 
 fn skim_init_cmd(config_dir: &std::path::Path) -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.arg("init")
         .env("CLAUDE_CONFIG_DIR", config_dir.as_os_str());
     cmd
 }
 
 fn skim_rewrite_hook_cmd(config_dir: &std::path::Path) -> Command {
-    let mut cmd = Command::cargo_bin("skim").unwrap();
+    let mut cmd = common::skim();
     cmd.args(["rewrite", "--hook"])
         .env("CLAUDE_CONFIG_DIR", config_dir.as_os_str())
         .env_remove("SKIM_PASSTHROUGH");

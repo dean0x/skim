@@ -2,10 +2,10 @@
 //!
 //! Tests token reduction statistics output
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
+mod common;
 
 #[test]
 fn test_show_stats_single_file() {
@@ -17,8 +17,7 @@ fn test_show_stats_single_file() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--show-stats")
         .assert()
@@ -50,8 +49,7 @@ fn test_show_stats_multiple_files() {
     .unwrap();
 
     // Stats should show aggregated counts for multiple files
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("*.ts")
         .arg("--show-stats")
         .current_dir(temp_dir.path())
@@ -71,8 +69,7 @@ fn test_show_stats_with_structure_mode() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--mode=structure")
         .arg("--show-stats")
@@ -92,8 +89,7 @@ fn test_show_stats_with_signatures_mode() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--mode=signatures")
         .arg("--show-stats")
@@ -110,8 +106,7 @@ fn test_show_stats_with_full_mode() {
     fs::write(&file_path, "function test() { return 42; }").unwrap();
 
     // Full mode should show 0% reduction (or 100% of original)
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--mode=full")
         .arg("--show-stats")
@@ -122,8 +117,7 @@ fn test_show_stats_with_full_mode() {
 
 #[test]
 fn test_show_stats_with_stdin() {
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("-")
         .arg("--language=typescript")
         .arg("--show-stats")
@@ -141,8 +135,7 @@ fn test_no_stats_by_default() {
     fs::write(&file_path, "function test() { return 42; }").unwrap();
 
     // Without --show-stats, stderr should be empty (no stats output)
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg(&file_path)
         .assert()
         .success()
@@ -171,8 +164,7 @@ fn test_show_stats_format_contains_reduction_percentage() {
     )
     .unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = common::skim()
         .arg(&file_path)
         .arg("--mode=structure")
         .arg("--show-stats")
@@ -200,8 +192,7 @@ fn test_show_stats_with_python() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--show-stats")
         .assert()
@@ -220,8 +211,7 @@ fn test_show_stats_with_rust() {
     )
     .unwrap();
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--show-stats")
         .assert()
@@ -238,8 +228,7 @@ fn test_show_stats_with_glob_and_no_header() {
     fs::write(temp_dir.path().join("b.ts"), "function b() {}").unwrap();
 
     // Stats should still work with --no-header flag
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg("*.ts")
         .arg("--no-header")
         .arg("--show-stats")
@@ -257,8 +246,7 @@ fn test_show_stats_empty_file() {
     fs::write(&file_path, "").unwrap();
 
     // Empty file should still work with --show-stats (likely 0 → 0 tokens)
-    Command::cargo_bin("skim")
-        .unwrap()
+    common::skim()
         .arg(&file_path)
         .arg("--show-stats")
         .assert()

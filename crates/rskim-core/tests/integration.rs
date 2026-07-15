@@ -660,8 +660,12 @@ fn test_json_token_reduction() {
 }
 
 #[test]
-fn test_json_large_keys_security() {
-    // SECURITY TEST: Ensure JSON with >10,000 keys is rejected
+fn test_json_large_keys_degrades_to_passthrough() {
+    // A legitimate but very large JSON (package-lock.json, an OpenAPI or i18n
+    // bundle) can exceed MAX_JSON_KEYS. Rather than failing the command, skim
+    // degrades to a lossless raw passthrough — the same policy applied to oversized
+    // tree-sitter files (#385). Safe because input size is already bounded by
+    // MAX_INPUT_SIZE before parsing, and the passthrough is a bounded copy.
     let mut json = String::from("{");
     for i in 0..10_001 {
         if i > 0 {
@@ -671,14 +675,11 @@ fn test_json_large_keys_security() {
     }
     json.push('}');
 
-    let result = transform(&json, Language::Json, Mode::Structure);
-
-    assert!(result.is_err(), "Expected error for excessive keys");
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("key count exceeded"),
-        "Error message should mention key count limit, got: {}",
-        err_msg
+    let output = transform(&json, Language::Json, Mode::Structure)
+        .expect("large-key JSON should degrade to passthrough, not error");
+    assert_eq!(
+        output, json,
+        "degraded output must be the lossless raw source verbatim"
     );
 }
 
@@ -1000,21 +1001,21 @@ fn test_detect_language_yaml() {
 }
 
 #[test]
-fn test_yaml_large_keys_security() {
-    // SECURITY TEST: Ensure YAML with >10,000 keys is rejected
+fn test_yaml_large_keys_degrades_to_passthrough() {
+    // A legitimate but very large YAML can exceed MAX_YAML_KEYS. Rather than failing
+    // the command, skim degrades to a lossless raw passthrough — the same policy
+    // applied to oversized tree-sitter files (#385). Safe because input size is
+    // already bounded by MAX_INPUT_SIZE before parsing.
     let mut yaml = String::new();
     for i in 0..10_001 {
         yaml.push_str(&format!("key_{}: {}\n", i, i));
     }
 
-    let result = transform(&yaml, Language::Yaml, Mode::Structure);
-
-    assert!(result.is_err(), "Expected error for excessive keys");
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("key count exceeded"),
-        "Error message should mention key count limit, got: {}",
-        err_msg
+    let output = transform(&yaml, Language::Yaml, Mode::Structure)
+        .expect("large-key YAML should degrade to passthrough, not error");
+    assert_eq!(
+        output, yaml,
+        "degraded output must be the lossless raw source verbatim"
     );
 }
 
@@ -2757,10 +2758,10 @@ fn test_typescript_pseudo() {
         "type annotations should be stripped"
     );
 
-    // Should strip export keyword
+    // `export` is now preserved as API surface (A4 contract)
     assert!(
-        !result.contains("export "),
-        "export keyword should be stripped"
+        result.contains("export "),
+        "export must be preserved as API surface"
     );
 
     // Should preserve function names and logic
@@ -2824,10 +2825,10 @@ fn test_rust_pseudo() {
     let source = include_str!("../../../tests/fixtures/rust/simple.rs");
     let result = transform(source, Language::Rust, Mode::Pseudo).unwrap();
 
-    // Should strip visibility modifiers
+    // `pub` is now preserved as API surface in pseudo mode (A4 contract)
     assert!(
-        !result.contains("pub fn"),
-        "pub modifier should be stripped from functions"
+        result.contains("pub fn"),
+        "pub must be preserved as API surface"
     );
 
     // Should preserve function names and logic
@@ -2842,14 +2843,14 @@ fn test_java_pseudo() {
     let source = include_str!("../../../tests/fixtures/java/Simple.java");
     let result = transform(source, Language::Java, Mode::Pseudo).unwrap();
 
-    // Should strip visibility modifiers
+    // Access modifiers (public/private) are preserved as API surface (A4 contract)
     assert!(
-        !result.contains("public class"),
-        "public modifier should be stripped"
+        result.contains("public class"),
+        "public must be preserved as API surface"
     );
     assert!(
-        !result.contains("private int"),
-        "private modifier should be stripped"
+        result.contains("private "),
+        "private must be preserved as API surface"
     );
 
     // Should preserve class name and methods
@@ -2875,14 +2876,10 @@ fn test_cpp_pseudo() {
     let source = include_str!("../../../tests/fixtures/cpp/simple.cpp");
     let result = transform(source, Language::Cpp, Mode::Pseudo).unwrap();
 
-    // Should strip access specifiers
+    // C++ access specifiers (public:/private:) are preserved as API surface (A4 contract)
     assert!(
-        !result.contains("public:"),
-        "access specifier should be stripped"
-    );
-    assert!(
-        !result.contains("private:"),
-        "access specifier should be stripped"
+        result.contains("public:"),
+        "access specifier must be preserved as API surface"
     );
 
     // Should preserve class structure
@@ -2940,7 +2937,11 @@ fn test_pseudo_with_config() {
     let config = TransformConfig::with_mode(Mode::Pseudo);
     let source = "export function add(a: number, b: number): number { return a + b; }";
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
-    assert!(!result.contains("export"), "export stripped via config API");
+    // `export` is now preserved as API surface (A4 contract)
+    assert!(
+        result.contains("export"),
+        "export preserved as API surface via config API"
+    );
     assert!(
         !result.contains(": number"),
         "type annotations stripped via config API"
@@ -2949,11 +2950,12 @@ fn test_pseudo_with_config() {
 
 #[test]
 fn test_pseudo_auto_detection() {
+    // `pub` is now preserved as API surface in pseudo mode (A4 contract)
     let source = "pub fn hello() -> String { \"world\".to_string() }\n";
     let result = transform_auto(source, Path::new("test.rs"), Mode::Pseudo).unwrap();
     assert!(
-        !result.contains("pub "),
-        "visibility stripped via auto-detection"
+        result.contains("pub "),
+        "visibility preserved as API surface via auto-detection"
     );
     assert!(result.contains("fn hello"), "function preserved");
 }

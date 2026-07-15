@@ -32,6 +32,9 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::Infra,
     expected_exit_codes: &[2],
     forward_stderr: false,
+    skip_net_savings_guard: false,
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 /// Matches the plan summary line in text output.

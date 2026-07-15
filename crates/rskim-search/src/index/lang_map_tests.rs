@@ -24,6 +24,7 @@ fn test_lang_mapping_roundtrip() {
         rskim_core::Language::Toml,
         rskim_core::Language::TypeScript,
         rskim_core::Language::Yaml,
+        rskim_core::Language::Bash,
     ];
     for lang in langs {
         let id = lang_to_id(lang);
@@ -38,8 +39,10 @@ fn test_lang_mapping_roundtrip() {
 
 #[test]
 fn test_lang_from_id_unknown() {
+    // 17 is now Bash (a known ID); 18 is the next unassigned ID and must
+    // still degrade to None so newer-index forward-compatibility holds.
+    assert_eq!(lang_from_id(18), None);
     assert_eq!(lang_from_id(200), None);
-    assert_eq!(lang_from_id(17), None);
     assert_eq!(lang_from_id(255), None);
 }
 
@@ -63,6 +66,7 @@ fn test_lang_ids_unique() {
         rskim_core::Language::Toml,
         rskim_core::Language::TypeScript,
         rskim_core::Language::Yaml,
+        rskim_core::Language::Bash,
     ];
     let mut ids: Vec<u8> = langs.iter().map(|&l| lang_to_id(l)).collect();
     let before = ids.len();
