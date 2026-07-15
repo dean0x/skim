@@ -500,27 +500,30 @@ pub(super) fn query_standalone(
 
     match sort {
         Some(TemporalSort::Hot) | None => {
-            let mut rows = db.top_hotspots(fetch_limit)?;
-            let has_more = rows.len() > page.depth();
-            rows.truncate(page.depth()); // drop the sentinel if present
-            page.apply(&mut rows);
+            let (rows, has_more) = paginate_sentinel(page, db.top_hotspots(fetch_limit)?);
             Ok((TemporalQueryOutput::Hotspots(rows), has_more))
         }
         Some(TemporalSort::Cold) => {
-            let mut rows = db.top_coldspots(fetch_limit)?;
-            let has_more = rows.len() > page.depth();
-            rows.truncate(page.depth());
-            page.apply(&mut rows);
+            let (rows, has_more) = paginate_sentinel(page, db.top_coldspots(fetch_limit)?);
             Ok((TemporalQueryOutput::Coldspots(rows), has_more))
         }
         Some(TemporalSort::Risky) => {
-            let mut rows = db.top_risks(fetch_limit)?;
-            let has_more = rows.len() > page.depth();
-            rows.truncate(page.depth());
-            page.apply(&mut rows);
+            let (rows, has_more) = paginate_sentinel(page, db.top_risks(fetch_limit)?);
             Ok((TemporalQueryOutput::Risks(rows), has_more))
         }
     }
+}
+
+/// Detect pagination end and apply skip+take on a sentinel-over-fetched row vec.
+///
+/// The caller must have fetched `page.depth().saturating_add(1)` rows; the
+/// extra element acts as a sentinel: `has_more` is true iff the DB returned it.
+/// `page.apply` drops the sentinel by draining `offset` rows then truncating to
+/// `limit`, so a separate `truncate(depth)` call is not needed.
+fn paginate_sentinel<T>(page: Page, mut rows: Vec<T>) -> (Vec<T>, bool) {
+    let has_more = rows.len() > page.depth();
+    page.apply(&mut rows);
+    (rows, has_more)
 }
 
 /// Re-sort blast-radius partners by temporal score using per-file lookups.
