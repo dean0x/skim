@@ -18,16 +18,45 @@ fn skim_cmd() -> assert_cmd::Command {
 // grep -h must NOT trigger help text
 // ============================================================================
 
-/// `skim grep -h pattern /dev/null` — `-h` means no-filename, not help.
+/// `skim grep -h pattern <file>` — `-h` means no-filename, not help.
 /// The dispatcher must NOT print help; it must pass through to grep.
+///
+/// This exercises the HANDLER surface (direct `skim grep` dispatch, per PF-004),
+/// not the rewrite engine.  The two surfaces share per-tool handlers but have
+/// different dispatch front-ends; `-h` flag preservation is tested here on the
+/// handler surface only.
+///
+/// The original test used `/dev/null` (no matches → empty stdout), which cannot
+/// distinguish "reached grep" from "errored before grep."  This version uses a
+/// real temp file with known content so we can make a positive assertion that
+/// grep actually ran and returned a match.
 #[test]
 fn test_grep_h_flag_not_intercepted_as_help() {
+    let dir = TempDir::new().unwrap();
+    let f = dir.path().join("needle.txt");
+    std::fs::write(&f, "findme line\n").unwrap();
+
     let output = skim_cmd()
-        .args(["grep", "-h", "pattern", "/dev/null"])
+        .args(["grep", "-h", "findme", f.to_str().unwrap()])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Positive: exit 0 confirms skim reached the grep handler and grep matched.
+    assert!(
+        output.status.success(),
+        "skim grep -h must exit 0 (grep ran and found a match); stderr: {stderr}"
+    );
+
+    // Positive: matched content in stdout proves grep actually ran against the file
+    // and `-h` was passed through unchanged (not swallowed as help).
+    assert!(
+        stdout.contains("findme"),
+        "grep -h output must include the matched line, proving grep ran; stdout: {stdout}"
+    );
+
+    // Negative: must not show skim's fileops help text.
     assert!(
         !stdout.contains("Available tools:"),
         "grep -h must not trigger fileops help text; stdout: {stdout}, stderr: {stderr}"

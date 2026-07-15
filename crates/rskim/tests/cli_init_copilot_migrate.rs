@@ -148,6 +148,17 @@ fn test_copilot_dry_run_shows_register_hook_not_patch_settings() {
         "dry-run output must reference skim.json hook registration; got:\n{stdout}"
     );
 
+    // Must show register-hook wording with Copilot's event key.
+    // Literal from print_dry_run_actions (uses_dedicated_hook_file() == true branch):
+    //   "  [dry-run] Would write: … (register preToolUse hook)"
+    // Copilot's hook_event_key() is "preToolUse" (lowercase, per copilot.rs:161).
+    // A regression that drops this line while leaving skim.json elsewhere would
+    // still pass the skim.json assert above — this assertion catches that gap.
+    assert!(
+        stdout.contains("register preToolUse hook"),
+        "Copilot dry-run must show register-hook wording with Copilot's event key (preToolUse); got:\n{stdout}"
+    );
+
     // Must NOT show "Would patch" (that is settings.json-based agent wording)
     assert!(
         !stdout.contains("Would patch"),
