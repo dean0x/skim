@@ -38,13 +38,16 @@ pub(crate) const MAX_INPUT_LINES: usize = 100_000;
 
 /// Entry point for `skim <tool> [args...]` (file handler).
 ///
-/// If no tool is specified or `--help` / `-h` is passed, prints usage
-/// and exits. Otherwise dispatches to the tool-specific handler.
+/// If no tool is specified or `--help` is passed, prints usage and exits.
+/// `-h` is intentionally NOT intercepted here: file tools use `-h` with
+/// tool-level semantics (`grep -h` = no-filename, `ls -h`/`du -h`/`df -h` =
+/// human-readable sizes), mirroring the `db/mod.rs` hostname-flag precedent.
+/// Use `skim <tool> --help` to see this usage text.
 pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+    if args.is_empty() || args.iter().any(|a| a == "--help") {
         print_help();
         return Ok(ExitCode::SUCCESS);
     }

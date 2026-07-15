@@ -3,6 +3,7 @@
 use super::handlers::{try_rewrite_cat, try_rewrite_head, try_rewrite_tail};
 use super::rules;
 use super::types::RewriteResult;
+use crate::output::REWRITE_ORIGIN_ENV;
 
 /// Return true if any token in `middle` matches a skip-flag prefix.
 ///
@@ -328,7 +329,14 @@ pub(super) fn try_custom_handlers(
     };
 
     result.map(|mut r| {
-        // Prepend env vars if present
+        // Inject origin tag so the execution path can emit a transparency marker.
+        // Placed before the skim binary token but after caller env vars, following
+        // the session-id out-of-band precedent (ADR-004): order after prepend will
+        // be [caller_envs..., SKIM_REWRITTEN_FROM=cat, skim, file, --mode=...].
+        let origin_tag = format!("{}={}", REWRITE_ORIGIN_ENV, command_tokens[0]);
+        r.tokens.insert(0, origin_tag);
+
+        // Prepend caller env vars (they must stay first in the command string)
         if !env_vars.is_empty() {
             let mut with_env: Vec<String> = env_vars.iter().map(|s| s.to_string()).collect();
             with_env.extend(r.tokens);
@@ -514,7 +522,53 @@ mod tests {
     #[test]
     fn test_cat_code_file() {
         let result = try_rewrite(&["cat", "file.rs"]).unwrap();
-        assert_eq!(result.tokens, vec!["skim", "file.rs", "--mode=pseudo"]);
+        // Origin tag is injected before the skim binary token (ADR-004 out-of-band channel).
+        assert_eq!(
+            result.tokens,
+            vec![
+                "SKIM_REWRITTEN_FROM=cat",
+                "skim",
+                "file.rs",
+                "--mode=pseudo"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_head_code_file_includes_origin_tag() {
+        let result = try_rewrite(&["head", "-n", "20", "file.py"]).unwrap();
+        assert!(
+            result
+                .tokens
+                .contains(&"SKIM_REWRITTEN_FROM=head".to_string()),
+            "head rewrite must include origin tag; got: {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_tail_code_file_includes_origin_tag() {
+        let result = try_rewrite(&["tail", "file.go"]).unwrap();
+        assert!(
+            result
+                .tokens
+                .contains(&"SKIM_REWRITTEN_FROM=tail".to_string()),
+            "tail rewrite must include origin tag; got: {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_cat_origin_tag_env_ordering_with_caller_env() {
+        // FOO=1 cat f.ts → ["FOO=1", "SKIM_REWRITTEN_FROM=cat", "skim", ...]
+        let result = try_rewrite(&["FOO=1", "cat", "file.ts"]).unwrap();
+        let tokens = &result.tokens;
+        assert_eq!(tokens[0], "FOO=1", "caller env must stay first");
+        assert_eq!(
+            tokens[1], "SKIM_REWRITTEN_FROM=cat",
+            "origin tag must be second (after caller env)"
+        );
+        assert_eq!(tokens[2], "skim", "skim binary must follow origin tag");
     }
 
     #[test]

@@ -439,6 +439,109 @@ pub(crate) fn compressed_output_hint(code: i32) -> String {
 }
 
 // ============================================================================
+// Rewrite transparency (hook-rewritten file reads)
+// ============================================================================
+
+/// Env-var name injected by the rewrite engine to signal a cat/head/tail rewrite.
+///
+/// The engine sets this as a leading `KEY=val` prefix token so the executing
+/// `skim <file>` process can detect it was launched via a hook rewrite.
+/// Validated on read: only `"cat"`, `"head"`, and `"tail"` are accepted.
+pub(crate) const REWRITE_ORIGIN_ENV: &str = "SKIM_REWRITTEN_FROM";
+
+/// Return `Some(origin)` when `SKIM_REWRITTEN_FROM` is set to a recognised
+/// file-read command name (`cat`, `head`, or `tail`).
+///
+/// Returns `None` for any other value to prevent stderr-text injection via
+/// arbitrary env vars (closed vocabulary guard).
+pub(crate) fn rewrite_origin() -> Option<String> {
+    let val = std::env::var(REWRITE_ORIGIN_ENV).ok()?;
+    match val.as_str() {
+        "cat" | "head" | "tail" => Some(val),
+        _ => None,
+    }
+}
+
+/// Build a transparency marker for hook-rewritten file reads.
+///
+/// Returns `None` when `differing == 0` (view is byte-identical to raw bytes).
+///
+/// Single file: `[skim] transformed view (cat → skim --mode=pseudo): not raw file bytes — SKIM_PASSTHROUGH=1 for raw output`
+/// Multi-file:  `[skim] transformed view (cat → skim --mode=pseudo): 2/3 files not raw bytes — SKIM_PASSTHROUGH=1 for raw output`
+pub(crate) fn rewrite_transparency_marker(
+    origin: &str,
+    mode_str: &str,
+    differing: usize,
+    total: usize,
+) -> Option<String> {
+    if differing == 0 {
+        return None;
+    }
+    let inner = if total <= 1 {
+        "not raw file bytes".to_string()
+    } else {
+        format!("{differing}/{total} files not raw bytes")
+    };
+    Some(format!(
+        "[skim] transformed view ({origin} \u{2192} skim --mode={mode_str}): {inner} — SKIM_PASSTHROUGH=1 for raw output"
+    ))
+}
+
+#[cfg(test)]
+mod rewrite_transparency_tests {
+    use super::*;
+
+    #[test]
+    fn test_rewrite_transparency_marker_single_differing() {
+        let result = rewrite_transparency_marker("cat", "pseudo", 1, 1);
+        assert_eq!(
+            result,
+            Some(
+                "[skim] transformed view (cat \u{2192} skim --mode=pseudo): not raw file bytes \
+                 — SKIM_PASSTHROUGH=1 for raw output"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_rewrite_transparency_marker_multi_file() {
+        let result = rewrite_transparency_marker("cat", "pseudo", 2, 3);
+        assert_eq!(
+            result,
+            Some(
+                "[skim] transformed view (cat \u{2192} skim --mode=pseudo): 2/3 files not raw bytes \
+                 — SKIM_PASSTHROUGH=1 for raw output"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_rewrite_transparency_marker_zero_differing_returns_none() {
+        assert_eq!(rewrite_transparency_marker("cat", "pseudo", 0, 1), None);
+        assert_eq!(rewrite_transparency_marker("tail", "structure", 0, 5), None);
+    }
+
+    #[test]
+    fn test_rewrite_transparency_marker_head_structure() {
+        let m = rewrite_transparency_marker("head", "structure", 1, 1)
+            .expect("head + differing=1 must produce a marker");
+        assert!(m.contains("head"), "marker must name the origin command");
+        assert!(m.contains("structure"), "marker must name the mode");
+        assert!(
+            m.contains("SKIM_PASSTHROUGH=1"),
+            "marker must include passthrough hint"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_origin_env_constant() {
+        assert_eq!(REWRITE_ORIGIN_ENV, "SKIM_REWRITTEN_FROM");
+    }
+}
+
+// ============================================================================
 // FilterTransparencyHeader
 // ============================================================================
 

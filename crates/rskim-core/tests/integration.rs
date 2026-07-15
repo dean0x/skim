@@ -2748,14 +2748,23 @@ fn test_typescript_pseudo() {
     let source = include_str!("../../../tests/fixtures/typescript/simple.ts");
     let result = transform(source, Language::TypeScript, Mode::Pseudo).unwrap();
 
-    // Should strip type annotations
+    // Param type annotations should be stripped; return type preserved (A4 contract).
+    // Fixture: `add(a: number, b: number): number` — params stripped, return kept.
     assert!(
-        !result.contains(": number"),
-        "type annotations should be stripped"
+        result.contains("function add(a, b)"),
+        "param type annotations should be stripped, got: {result}"
     );
     assert!(
-        !result.contains(": string"),
-        "type annotations should be stripped"
+        result.contains("): number"),
+        "return type annotation must be preserved as API surface (A4), got: {result}"
+    );
+    assert!(
+        result.contains("function greet(name)"),
+        "param type annotation stripped in greet, got: {result}"
+    );
+    assert!(
+        result.contains("): string"),
+        "return type annotation preserved in greet (A4), got: {result}"
     );
 
     // `export` is now preserved as API surface (A4 contract)
@@ -2784,22 +2793,23 @@ fn test_python_pseudo() {
     let source = include_str!("../../../tests/fixtures/python/simple.py");
     let result = transform(source, Language::Python, Mode::Pseudo).unwrap();
 
-    // Should strip type annotations
+    // Param type annotations stripped; return types preserved (A4 contract).
     assert!(
         !result.contains(": int"),
-        "type annotations should be stripped"
+        "param type annotations should be stripped, got: {result}"
     );
     assert!(
         !result.contains(": str"),
-        "type annotations should be stripped"
+        "param type annotations should be stripped, got: {result}"
+    );
+    // Return types are now preserved as API surface (A4 contract).
+    assert!(
+        result.contains("-> int"),
+        "return type must be preserved as API surface (A4), got: {result}"
     );
     assert!(
-        !result.contains("-> int"),
-        "return types should be stripped"
-    );
-    assert!(
-        !result.contains("-> str"),
-        "return types should be stripped"
+        result.contains("-> str"),
+        "return type must be preserved as API surface (A4), got: {result}"
     );
 
     // Should strip self parameter
@@ -2942,9 +2952,14 @@ fn test_pseudo_with_config() {
         result.contains("export"),
         "export preserved as API surface via config API"
     );
+    // Param type annotations stripped; return type preserved (A4 contract).
     assert!(
-        !result.contains(": number"),
-        "type annotations stripped via config API"
+        result.contains("function add(a, b)"),
+        "param type annotations stripped via config API, got: {result}"
+    );
+    assert!(
+        result.contains("): number"),
+        "return type preserved as API surface via config API (A4), got: {result}"
     );
 }
 

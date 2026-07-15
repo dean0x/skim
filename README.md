@@ -58,6 +58,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 
 ### Command Rewriting (`skim init`)
 - PreToolUse hook rewrites `ls`, `grep`, `gh`, `cargo test`, `vitest`, `git diff` into skim equivalents
+- File reads (`cat`, `head`, `tail` on code files) are rewritten into direct skim reads (e.g. `cat file.ts` → `skim file.ts --mode=pseudo`); output is a structured view, not raw bytes — skim emits a one-line stderr notice whenever the served view differs from raw file contents
 - Two-layer rule system with declarative prefix-swap and custom argument handlers
 - One command installs the hook for automatic, invisible context savings
 - Round-trip safe: commands with pipes, newlines, heredocs, or command substitution are never rewritten
@@ -233,14 +234,14 @@ Skim offers six modes with different levels of aggressiveness:
 |------------|-----------|------------------------------------------|----------------------------|
 | Full       | 0%        | Everything (original source)             | Testing/comparison         |
 | Minimal    | 15-30%    | All code, doc comments                   | Light cleanup              |
-| Pseudo     | 30-50%    | Logic flow, names, values                | LLM context with logic     |
+| Pseudo     | 30-50%    | Logic flow, names, values, return types  | LLM context with logic     |
 | Structure  | 70-80%    | Signatures, types, classes, imports      | Understanding architecture |
 | Signatures | 85-92%    | Only callable signatures                 | API documentation          |
 | Types      | 90-95%    | Only type definitions                    | Type system analysis       |
 
 ```bash
 skim file.ts --mode structure   # Default
-skim file.ts --mode pseudo      # Pseudocode (strips types & decorators; preserves visibility)
+skim file.ts --mode pseudo      # Pseudocode (preserves return types + visibility; strips decorators)
 skim file.ts --mode signatures  # More aggressive
 skim file.ts --mode types       # Most aggressive
 skim file.ts --mode full        # No transformation

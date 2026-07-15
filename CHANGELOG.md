@@ -23,13 +23,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   applies ADR-002). See **Fixed** below for full details.
 
 ### Added
+- **Transparency marker for hook-rewritten file reads** — When the PreToolUse hook
+  rewrites `cat`/`head`/`tail` on a code file into `skim <file> --mode=pseudo` (or
+  `--mode=structure` for declaration files), the rewritten command now carries a
+  `SKIM_REWRITTEN_FROM=<cat|head|tail>` env token. After transformation, if the served
+  view differs from raw file bytes, skim emits a one-line stderr notice:
+  `[skim] transformed view (cat → skim --mode=pseudo): not raw file bytes — SKIM_PASSTHROUGH=1 for raw output`.
+  Multi-file: one aggregate line (`2/3 files not raw bytes`). The marker is silent for
+  byte-identical outputs (guardrail passthrough, `--mode=full`), direct `skim` calls
+  (no tag), and unknown-value env vars (closed-vocabulary guard prevents injection).
+  Cache hits also emit the marker when the cached view differs from raw.
 - **Agent guidance documents command wrapping** — The guidance injected by `skim init`
   now includes a "Command wrapping" section explaining that the rewrite hook may run
   supported commands as `skim <tool>` (same arguments, same exit code, compressed
-  output). Agents are instructed to flag garbled or incomplete compressed output to the
-  user rather than silently working around it. Existing installs pick up the new section
-  on the next version bump + re-pin (per ADR-004; binary-side fixes below are effective
-  immediately after rebuild).
+  output). Guidance wording corrected: file reads (`cat`, `head`, `tail`) are rewritten
+  into direct skim reads showing a structured view (not raw contents), and skim prints
+  a one-line stderr notice whenever the served view differs from the raw file.
+  The previous claim "does not change what the command did" has been replaced with
+  accurate wording. Agents are instructed to flag garbled or incomplete compressed
+  output to the user rather than silently working around it. Existing installs pick up
+  the new section on the next version bump + re-pin (per ADR-004; binary-side fixes
+  below are effective immediately after rebuild).
 - **Bash / shell language support** — Full tree-sitter-bash grammar integration
   (`Language::Bash`). Structure mode strips `function_definition` bodies to `{...}`
   while preserving function names and all top-level commands/variable assignments.
@@ -43,6 +57,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SKIM_DEBUG=1` notice; all 6 modes have explicit Bash arms.
 
 ### Fixed
+- **Fileops dispatcher no longer intercepts tool-level `-h` as help** — `file/mod.rs`
+  narrowed its help guard to `--help` only, mirroring the `db/mod.rs` hostname-flag
+  precedent. `grep -h` (no-filename), `ls -h`/`du -h`/`df -h` (human-readable sizes)
+  now reach their handlers instead of printing skim's fileops help. `rg -h`/`rg --help`
+  added to rg's rewrite skip-list (for rg, unlike grep, `-h` is a genuine help flag;
+  without the skip, `rg --help` would be rewritten and show skim's help instead of rg's).
+
+- **Pseudo mode preserves function return types as API surface (A4 contract)** —
+  Return type annotations are API contracts callers depend on; they are now preserved
+  in pseudo mode alongside visibility modifiers, mirroring the commit c244a12
+  visibility fix. For Python and TypeScript, param, variable, and property type
+  annotations are still stripped. Rust preserves parameter types (pseudo mode strips
+  only lifetimes, type parameters, where clauses, and attributes for Rust).
+  Affected languages: Python (`-> T`), TypeScript (`: T` at return position), Rust
+  (`-> T` via normal recursion — the former strip_rust_return_type special-case is
+  removed). A position-aware guard (`is_return_type_annotation`) stops recursion at
+  the `return_type` field child, preserving nested generics (`Promise<User>`,
+  `tuple[int, str]`) wholesale.
+
+- **`skim init` summary and dry-run output protocol-driven for Copilot and Gemini** —
+  `print_install_summary` and `print_dry_run_actions` now accept an explicit
+  `AgentKind` parameter and branch on `protocol.uses_dedicated_hook_file()`:
+  Copilot CLI (the only dedicated-file agent) prints a "Register hook: …/skim.json"
+  / "Would write: …/skim.json" line instead of the incorrect "Patch settings" /
+  "Would patch settings.json" wording. Settings-based agents use `hook_event_key()`
+  instead of a hardcoded `"PreToolUse"`, so Gemini shows `BeforeTool` and Cursor
+  shows `preToolUse` in their respective output lines.
+
 - **`skim gh pr checks` tabs destroyed by ANSI-strip + exit-8 raw-forwarded before
   parse** — `gh pr checks` emits TAB-separated output but gh's `ToolRunConfig` had
   `skip_ansi_strip: false`, so `strip_ansi_escapes` dropped `\t` before

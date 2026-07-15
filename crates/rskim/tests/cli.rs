@@ -791,8 +791,9 @@ fn test_cli_pseudo_mode() {
         .success()
         .stdout(predicate::str::contains("function add"))
         .stdout(predicate::str::contains("return a + b"))
-        // Type annotations should be stripped
-        .stdout(predicate::str::contains(": number").not())
+        // Param type annotations should be stripped; return type preserved (A4 contract)
+        .stdout(predicate::str::contains("function add(a, b)"))
+        .stdout(predicate::str::contains("): number"))
         // `export` is preserved as API surface (A4 contract)
         .stdout(predicate::str::contains("export"));
 }
@@ -813,9 +814,10 @@ fn test_cli_pseudo_mode_python() {
         .arg("pseudo")
         .assert()
         .success()
+        // Param type annotation stripped; return type preserved (A4 contract)
         .stdout(predicate::str::contains("def greet(name)"))
         .stdout(predicate::str::contains(": str").not())
-        .stdout(predicate::str::contains("-> str").not());
+        .stdout(predicate::str::contains("-> str"));
 }
 
 #[test]
