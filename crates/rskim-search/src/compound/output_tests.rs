@@ -46,7 +46,7 @@ fn format_text_empty_slice_writes_no_match_line() {
 #[test]
 fn format_json_empty_slice_writes_valid_json_total_zero() {
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_json(&[], "try-catch", "Try/catch blocks", &mut buf).unwrap();
+    format_ast_json(&[], "try-catch", "Try/catch blocks", false, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).expect("must be valid JSON");
     assert_eq!(v["mode"], "ast", "mode must be 'ast'");
@@ -87,13 +87,13 @@ fn format_text_returns_ok_for_empty_and_populated_slices() {
 #[test]
 fn format_json_returns_ok_for_empty_and_populated_slices() {
     let mut buf: Vec<u8> = Vec::new();
-    assert!(format_ast_json(&[], "x", "", &mut buf).is_ok());
+    assert!(format_ast_json(&[], "x", "", false, &mut buf).is_ok());
 
     // Populated (degraded, no-line) row must serialize the envelope + the row's
     // path/score, and OMIT line/snippet (the additive-key contract, AC-F4).
     let results = vec![make_result_no_line("src/bar.rs", 1.2)];
     let mut buf2: Vec<u8> = Vec::new();
-    format_ast_json(&results, "x", "", &mut buf2).expect("populated slice must return Ok");
+    format_ast_json(&results, "x", "", false, &mut buf2).expect("populated slice must return Ok");
     let out = String::from_utf8(buf2).unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).expect("must be valid JSON");
     assert_eq!(v["mode"], "ast", "mode must be 'ast'");
@@ -197,7 +197,7 @@ fn format_json_with_line_has_line_and_snippet_keys() {
         "  fn foo() {",
     )];
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_json(&results, "try-catch", "desc", &mut buf).unwrap();
+    format_ast_json(&results, "try-catch", "desc", false, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).expect("must be valid JSON");
 
@@ -219,7 +219,7 @@ fn format_json_degraded_row_line_and_snippet_keys_absent() {
     // AC-F4 NEGATIVE: degraded row → line and snippet keys ABSENT (not null, not 0).
     let results = vec![make_result_no_line("src/models/user.rs", 0.72)];
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_json(&results, "try-catch", "desc", &mut buf).unwrap();
+    format_ast_json(&results, "try-catch", "desc", false, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).expect("must be valid JSON");
 
@@ -280,7 +280,7 @@ fn format_json_layers_matched_is_present_on_every_row() {
         make_result_no_line("src/b.rs", 0.5),
     ];
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_json(&results, "try-catch", "", &mut buf).unwrap();
+    format_ast_json(&results, "try-catch", "", false, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
 
@@ -327,7 +327,7 @@ fn format_json_path_and_score_always_present() {
         make_result_no_line("src/b.rs", 1.2),
     ];
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_json(&results, "try-catch", "", &mut buf).unwrap();
+    format_ast_json(&results, "try-catch", "", false, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
 
@@ -373,7 +373,7 @@ fn format_text_header_without_description_has_no_em_dash() {
 #[test]
 fn format_json_mode_is_always_ast() {
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_json(&[], "whatever", "", &mut buf).unwrap();
+    format_ast_json(&[], "whatever", "", false, &mut buf).unwrap();
     let v: serde_json::Value = serde_json::from_str(&String::from_utf8(buf).unwrap()).unwrap();
     assert_eq!(v["mode"], "ast");
 }
@@ -386,7 +386,7 @@ fn format_json_mode_is_always_ast() {
 fn format_json_temporal_absent_when_none() {
     let results = vec![make_result_no_line("src/foo.rs", 1.0)];
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_json(&results, "x", "", &mut buf).unwrap();
+    format_ast_json(&results, "x", "", false, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     let first = &v["results"][0];

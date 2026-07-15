@@ -227,7 +227,7 @@ impl TemporalDb {
             .conn
             .prepare_cached(
                 "SELECT file_path, score, changes_30d, changes_90d FROM hotspot \
-                 ORDER BY score DESC LIMIT ?1",
+                 ORDER BY score DESC, file_path ASC LIMIT ?1",
             )
             .map_err(db_err)?;
         let rows = stmt
@@ -307,7 +307,7 @@ impl TemporalDb {
             .conn
             .prepare_cached(
                 "SELECT file_path, score, changes_30d, changes_90d FROM hotspot \
-                 ORDER BY score ASC LIMIT ?1",
+                 ORDER BY score ASC, file_path ASC LIMIT ?1",
             )
             .map_err(db_err)?;
         let rows = stmt

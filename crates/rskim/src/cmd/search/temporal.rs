@@ -15,7 +15,7 @@ use std::path::Path;
 use rskim_search::{FileId, HotspotRow, RiskRow, TemporalDb};
 use serde::Serialize;
 
-use super::types::{ResolvedResult, TemporalAnnotation, TemporalSort};
+use super::types::{Page, ResolvedResult, TemporalAnnotation, TemporalSort};
 
 // ============================================================================
 // Path normalization
@@ -434,9 +434,12 @@ pub(super) enum TemporalQueryOutput {
 ///
 /// - `sort`: optional sort mode (Hot, Cold, Risky).
 /// - `blast_radius`: optional file path for co-change partner lookup.
-/// - `limit`: maximum number of results.
+/// - `page`: pagination cursor (limit + offset); AD-404 standalone paths fix.
 /// - `db`: open temporal database.
 /// - `project_root`: needed for path normalization of `blast_radius`.
+///
+/// Returns `(output, has_more)` where `has_more` is the sound pagination
+/// terminator (AD-404-11 / D-5): true when more results exist beyond this page.
 ///
 /// # Errors
 ///
@@ -444,37 +447,79 @@ pub(super) enum TemporalQueryOutput {
 pub(super) fn query_standalone(
     sort: Option<TemporalSort>,
     blast_radius: Option<&str>,
-    limit: usize,
+    page: Page,
     db: &TemporalDb,
     project_root: &Path,
-) -> anyhow::Result<TemporalQueryOutput> {
+) -> anyhow::Result<(TemporalQueryOutput, bool)> {
     if let Some(raw_path) = blast_radius {
         let normalized = normalize_blast_radius_path(raw_path, project_root)?;
         let mut partners = db.cochanges_for_file(&normalized)?;
 
         if let Some(sort_mode) = sort {
-            // Pre-truncate before the re-sort to bound per-file DB lookups.
-            // The cochange query already returns results sorted by Jaccard DESC,
-            // so the highest co-change partners are at the front. Window is
-            // limit*5 clamped to at least 100 so small limits don't over-prune.
-            partners.truncate(resort_window(limit));
+            // AD-404-7: temporal re-sort window is fixed at resort_window(page.limit()),
+            // NOT resort_window(page.depth()). Offset-independent so pages are provably
+            // disjoint with no duplicate/miss defect; see D-2 user sign-off 2026-07-15.
+            let window = resort_window(page.limit());
+            let window_capped = partners.len() > window;
+            partners.truncate(window);
             resort_partners_by_temporal(&mut partners, sort_mode, &normalized, db)?;
+            let pre_page_len = partners.len();
+            page.apply(&mut partners);
+            // has_more: either the temporal window was capped (AD-404-8 bounded-page
+            // notice seam) or there are more verified rows within the window than
+            // the current page consumes (AD-404-11).
+            let has_more = window_capped || pre_page_len > page.depth();
+            return Ok((
+                TemporalQueryOutput::Cochanges {
+                    target: normalized,
+                    partners,
+                },
+                has_more,
+            ));
         }
 
-        partners.truncate(limit);
-        return Ok(TemporalQueryOutput::Cochanges {
-            target: normalized,
-            partners,
-        });
+        // No sort: cochanges returned in Jaccard DESC order from DB (all partners,
+        // no internal truncation). Apply page directly.
+        let total_before = partners.len();
+        page.apply(&mut partners);
+        let has_more = total_before > page.depth();
+        return Ok((
+            TemporalQueryOutput::Cochanges {
+                target: normalized,
+                partners,
+            },
+            has_more,
+        ));
     }
 
     // No blast-radius — pure temporal sort.
+    // Over-fetch page.depth() + 1 rows so we can detect whether more results
+    // exist beyond the current page (the "+1 sentinel" trick: if we get back
+    // exactly depth+1 rows, has_more is true; fewer rows means this is the last page).
+    let fetch_limit = page.depth().saturating_add(1);
+
     match sort {
         Some(TemporalSort::Hot) | None => {
-            Ok(TemporalQueryOutput::Hotspots(db.top_hotspots(limit)?))
+            let mut rows = db.top_hotspots(fetch_limit)?;
+            let has_more = rows.len() > page.depth();
+            rows.truncate(page.depth()); // drop the sentinel if present
+            page.apply(&mut rows);
+            Ok((TemporalQueryOutput::Hotspots(rows), has_more))
         }
-        Some(TemporalSort::Cold) => Ok(TemporalQueryOutput::Coldspots(db.top_coldspots(limit)?)),
-        Some(TemporalSort::Risky) => Ok(TemporalQueryOutput::Risks(db.top_risks(limit)?)),
+        Some(TemporalSort::Cold) => {
+            let mut rows = db.top_coldspots(fetch_limit)?;
+            let has_more = rows.len() > page.depth();
+            rows.truncate(page.depth());
+            page.apply(&mut rows);
+            Ok((TemporalQueryOutput::Coldspots(rows), has_more))
+        }
+        Some(TemporalSort::Risky) => {
+            let mut rows = db.top_risks(fetch_limit)?;
+            let has_more = rows.len() > page.depth();
+            rows.truncate(page.depth());
+            page.apply(&mut rows);
+            Ok((TemporalQueryOutput::Risks(rows), has_more))
+        }
     }
 }
 
@@ -657,35 +702,56 @@ struct CochangeJsonRow<'a> {
 }
 
 /// Top-level envelope for hotspot/coldspot standalone JSON.
+///
+/// `has_more` is absent when false (additive, back-compat; AD-404-11).
 #[derive(Serialize)]
 struct HotColdJson<'a> {
     mode: &'a str,
     total: usize,
+    /// Sound pagination terminator; absent when false (AD-404-11 / D-5).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    has_more: bool,
     results: Vec<HotspotJsonRow<'a>>,
 }
 
 /// Top-level envelope for risk standalone JSON.
+///
+/// `has_more` is absent when false (additive, back-compat; AD-404-11).
 #[derive(Serialize)]
 struct RiskyJson<'a> {
     mode: &'a str,
     total: usize,
+    /// Sound pagination terminator; absent when false (AD-404-11 / D-5).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    has_more: bool,
     results: Vec<RiskJsonRow<'a>>,
 }
 
 /// Top-level envelope for blast-radius standalone JSON.
+///
+/// `has_more` is absent when false (additive, back-compat; AD-404-11).
 #[derive(Serialize)]
 struct BlastRadiusJson<'a> {
     mode: &'a str,
     target: &'a str,
     total: usize,
+    /// Sound pagination terminator; absent when false (AD-404-11 / D-5).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    has_more: bool,
     results: Vec<CochangeJsonRow<'a>>,
 }
 
 /// Serialize a hotspot/coldspot row slice to JSON and write it.
-fn write_hotcold_json(mode: &str, rows: &[HotspotRow], w: &mut impl Write) -> anyhow::Result<()> {
+fn write_hotcold_json(
+    mode: &str,
+    rows: &[HotspotRow],
+    has_more: bool,
+    w: &mut impl Write,
+) -> anyhow::Result<()> {
     let envelope = HotColdJson {
         mode,
         total: rows.len(),
+        has_more,
         results: rows
             .iter()
             .map(|r| HotspotJsonRow {
@@ -700,22 +766,27 @@ fn write_hotcold_json(mode: &str, rows: &[HotspotRow], w: &mut impl Write) -> an
     Ok(())
 }
 
-/// Format a standalone temporal query result as JSON.
+/// Format a standalone temporal query result as JSON (AD-404-11).
+///
+/// `has_more`: sound pagination terminator — true when more results exist
+/// beyond the current page. Absent from JSON when false (additive, back-compat).
 ///
 /// Uses `#[derive(Serialize)]` typed structs so field names are defined in one
 /// place, preventing the hand-built `serde_json::json!()` approach from drifting
 /// independently.
 pub(super) fn format_temporal_json(
     output: &TemporalQueryOutput,
+    has_more: bool,
     w: &mut impl Write,
 ) -> anyhow::Result<()> {
     match output {
-        TemporalQueryOutput::Hotspots(rows) => write_hotcold_json("hot", rows, w)?,
-        TemporalQueryOutput::Coldspots(rows) => write_hotcold_json("cold", rows, w)?,
+        TemporalQueryOutput::Hotspots(rows) => write_hotcold_json("hot", rows, has_more, w)?,
+        TemporalQueryOutput::Coldspots(rows) => write_hotcold_json("cold", rows, has_more, w)?,
         TemporalQueryOutput::Risks(rows) => {
             let envelope = RiskyJson {
                 mode: "risky",
                 total: rows.len(),
+                has_more,
                 results: rows
                     .iter()
                     .map(|r| RiskJsonRow {
@@ -734,6 +805,7 @@ pub(super) fn format_temporal_json(
                 mode: "blast-radius",
                 target,
                 total: partners.len(),
+                has_more,
                 results: partners
                     .iter()
                     .map(|p| CochangeJsonRow {
@@ -781,16 +853,19 @@ pub(super) fn apply_temporal_enrichment(
                     .and_then(|t| t.hotspot_score)
                     .unwrap_or(-1.0)
             };
+            // Tiebreak: score DESC (Hot) or ASC (Cold), then file_path ASC
+            // unconditionally — unified total order matching SQL (resolution 8).
             results.sort_by(|a, b| {
-                let cmp = hotspot_score(a)
-                    .partial_cmp(&hotspot_score(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.path.cmp(&b.path));
-                if sort == TemporalSort::Hot {
-                    cmp.reverse()
+                let score_cmp = if sort == TemporalSort::Hot {
+                    hotspot_score(b)
+                        .partial_cmp(&hotspot_score(a))
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 } else {
-                    cmp
-                }
+                    hotspot_score(a)
+                        .partial_cmp(&hotspot_score(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                };
+                score_cmp.then_with(|| a.path.cmp(&b.path))
             });
         }
         TemporalSort::Risky => {
@@ -894,16 +969,20 @@ pub(super) fn enrich_ast_results(
                     .and_then(|t| t.hotspot_score)
                     .unwrap_or(-1.0)
             };
+            // Tiebreak: score DESC (reverse for Hot, ASC for Cold), then
+            // file_path ASC unconditionally — unified total order matching
+            // SQL ORDER BY score DESC, file_path ASC (resolution 8, AD-7).
             results.sort_by(|a, b| {
-                let cmp = hotspot_score(a)
-                    .partial_cmp(&hotspot_score(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.path.cmp(&b.path));
-                if sort == TemporalSort::Hot {
-                    cmp.reverse()
+                let score_cmp = if sort == TemporalSort::Hot {
+                    hotspot_score(b)
+                        .partial_cmp(&hotspot_score(a))
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 } else {
-                    cmp
-                }
+                    hotspot_score(a)
+                        .partial_cmp(&hotspot_score(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                };
+                score_cmp.then_with(|| a.path.cmp(&b.path))
             });
         }
         TemporalSort::Risky => {

@@ -232,6 +232,7 @@ pub(super) fn execute_query_with_manifest(
             results: vec![],
             duration_ms: start.elapsed().as_millis() as u64,
             index_stats: None,
+            has_more: false,
         });
     }
 
@@ -419,7 +420,12 @@ pub(super) fn execute_query_with_manifest(
         // Multi-word / default: widen pool via LEXICAL_CANDIDATE_POOL_K (AD-355-2).
         // phrase/near are false/None here by construction (positional is false);
         // forwarded for clarity/symmetry with the branch above.
-        let pool_limit = candidate_pool(config.limit, LEXICAL_CANDIDATE_POOL_K);
+        //
+        // AD-404-4 additive widening: pool = candidate_pool(limit, K) + offset.
+        // At offset 0: pool == candidate_pool(limit, K) — zero regression.
+        // NEVER the multiplicative candidate_pool(depth(), K) form (D-2).
+        let pool_limit = candidate_pool(config.page().limit(), LEXICAL_CANDIDATE_POOL_K)
+            + config.page().offset();
         let mut sq = SearchQuery::new(config.text.clone());
         sq.limit = Some(pool_limit);
         sq.phrase = config.phrase;
@@ -462,6 +468,7 @@ pub(super) fn execute_query_with_manifest(
         results,
         duration_ms,
         index_stats: Some(stats),
+        has_more: false,
     })
 }
 
@@ -521,6 +528,7 @@ fn run_compound_query(
             results: vec![],
             duration_ms: ctx.start.elapsed().as_millis() as u64,
             index_stats: Some(ctx.stats),
+            has_more: false,
         });
     }
 
@@ -556,6 +564,7 @@ fn run_compound_query(
             results: vec![],
             duration_ms: ctx.start.elapsed().as_millis() as u64,
             index_stats: Some(ctx.stats),
+            has_more: false,
         });
     }
     // AD-356-2: size sq.limit to the candidate set.  filter_set.len() >= 1 is
@@ -660,6 +669,7 @@ fn run_compound_query(
         results,
         duration_ms,
         index_stats: Some(ctx.stats),
+        has_more: false,
     })
 }
 
@@ -728,7 +738,10 @@ fn run_blast_radius_composite_query(
     sq.limit = if positional {
         None // full intersection for phrase/near — verify-then-truncate-LAST (AD-393-12)
     } else {
-        Some(candidate_pool(config.limit, BLAST_CANDIDATE_POOL_K))
+        // AD-404-13 / AC-404-13: BLAST_CANDIDATE_POOL_K=10 is load-bearing (pinned by
+        // AC-404-13) — do NOT replace with bare config.page().depth() (pool-shrink
+        // regression). Additive form: candidate_pool(limit, K) + offset (D-2).
+        Some(candidate_pool(config.page().limit(), BLAST_CANDIDATE_POOL_K) + config.page().offset())
     };
     // AD-393-12: thread phrase/near through the blast-radius SearchQuery so the
     // reader's search_positional path is exercised (not just BM25F recall).
@@ -892,6 +905,7 @@ fn run_blast_radius_composite_query(
         results,
         duration_ms,
         index_stats: Some(ctx.stats),
+        has_more: false,
     })
 }
 

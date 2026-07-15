@@ -388,7 +388,7 @@ fn run_ast_standalone_hot_sorts_by_hotspot_and_annotates() {
     let mut out: Vec<u8> = Vec::new();
     let result = super::run_ast_standalone(
         "rust-nested-loop",
-        20,
+        super::super::types::Page::first(20),
         true, // JSON
         cache.path(),
         &manifest,
@@ -675,7 +675,7 @@ fn format_ast_json_mode_is_ast_degraded_row_no_line_snippet_keys() {
         None,
     )];
     let mut buf = BufWriter::new(Vec::new());
-    super::format_ast_json(&results, "try-catch", "Try/catch blocks", &mut buf).unwrap();
+    super::format_ast_json(&results, "try-catch", "Try/catch blocks", false, &mut buf).unwrap();
     let out = String::from_utf8(buf.into_inner().unwrap()).unwrap();
 
     let v: serde_json::Value =
@@ -708,7 +708,7 @@ fn format_ast_json_mode_is_ast_degraded_row_no_line_snippet_keys() {
 fn format_ast_json_empty_results_is_valid_json() {
     // Empty result set → valid JSON with mode=="ast", total==0.
     let mut buf = BufWriter::new(Vec::new());
-    super::format_ast_json(&[], "try-catch", "Try/catch blocks", &mut buf).unwrap();
+    super::format_ast_json(&[], "try-catch", "Try/catch blocks", false, &mut buf).unwrap();
     let out = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     let v: serde_json::Value =
         serde_json::from_str(&out).expect("empty format_ast_json must produce valid JSON");
@@ -962,7 +962,7 @@ fn run_ast_standalone_with_real_index_maps_paths() {
     let mut out: Vec<u8> = Vec::new();
     let result = super::run_ast_standalone(
         "try-catch",
-        20,
+        super::super::types::Page::first(20),
         false, // text output
         cache.path(),
         &manifest,
@@ -1558,7 +1558,7 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
     let mut output_buf: Vec<u8> = Vec::new();
     let filtered_result = super::run_ast_standalone(
         "rust-nested-loop",
-        20,
+        super::super::types::Page::first(20),
         false,
         cache.path(),
         &manifest,
@@ -1635,7 +1635,7 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
     let mut degrade_buf: Vec<u8> = Vec::new();
     let degrade_result = super::run_ast_standalone(
         "rust-nested-loop",
-        20,
+        super::super::types::Page::first(20),
         false,
         cache.path(),
         &manifest,
@@ -2586,7 +2586,7 @@ fn run_ast_standalone_resolves_nested_dir_corpus_correctly() {
     let mut out: Vec<u8> = Vec::new();
     let result = super::run_ast_standalone(
         "function_item > block",
-        40,
+        super::super::types::Page::first(40),
         false, // text output
         cache.path(),
         &manifest,
@@ -2732,7 +2732,7 @@ fn run_ast_standalone_excludes_non_tree_sitter_files_ac1_374() {
     let mut out: Vec<u8> = Vec::new();
     let result = super::run_ast_standalone(
         "rust-nested-loop",
-        20,
+        super::super::types::Page::first(20),
         false,
         cache.path(),
         &manifest,
@@ -2847,7 +2847,7 @@ fn run_ast_standalone_true_positives_survive_gate_ac4_374() {
     let mut nested_out: Vec<u8> = Vec::new();
     super::run_ast_standalone(
         "rust-nested-loop",
-        20,
+        super::super::types::Page::first(20),
         false,
         cache.path(),
         &manifest,
@@ -2874,7 +2874,7 @@ fn run_ast_standalone_true_positives_survive_gate_ac4_374() {
     let mut unsafe_out: Vec<u8> = Vec::new();
     super::run_ast_standalone(
         "rust-unsafe-block",
-        20,
+        super::super::types::Page::first(20),
         false,
         cache.path(),
         &manifest,
@@ -2927,7 +2927,7 @@ fn run_ast_standalone_truncate_after_gate_ac5_374() {
     let mut out: Vec<u8> = Vec::new();
     let result = super::run_ast_standalone(
         "rust-nested-loop",
-        1, // limit = 1
+        super::super::types::Page::first(1), // limit = 1
         true,
         cache.path(),
         &manifest,
@@ -2985,7 +2985,7 @@ fn run_ast_standalone_real_node_result_always_carries_line_ac3_ac8_397() {
     let mut out: Vec<u8> = Vec::new();
     super::run_ast_standalone(
         "rust-nested-loop",
-        20,
+        super::super::types::Page::first(20),
         false,
         cache.path(),
         &manifest,
@@ -3035,7 +3035,7 @@ fn run_ast_standalone_json_results_all_carry_integer_line_ac4_397() {
     let mut out: Vec<u8> = Vec::new();
     let exit = super::run_ast_standalone(
         "rust-nested-loop",
-        20,
+        super::super::types::Page::first(20),
         true, // JSON
         cache.path(),
         &manifest,
@@ -3098,7 +3098,7 @@ fn run_ast_standalone_single_ngram_identity_ac9_374() {
     let mut out: Vec<u8> = Vec::new();
     super::run_ast_standalone(
         "rust-unsafe-block",
-        20,
+        super::super::types::Page::first(20),
         false,
         cache.path(),
         &manifest,
@@ -3158,7 +3158,7 @@ fn run_ast_standalone_no_format_change_ac10_374() {
     let mut out: Vec<u8> = Vec::new();
     super::run_ast_standalone(
         "rust-nested-loop",
-        20,
+        super::super::types::Page::first(20),
         false,
         cache.path(),
         &manifest,
@@ -3219,7 +3219,7 @@ fn run_ast_standalone_empty_gate_no_elision_marker_ac11_374() {
     let mut out: Vec<u8> = Vec::new();
     let result = super::run_ast_standalone(
         "rust-nested-loop",
-        20,
+        super::super::types::Page::first(20),
         false,
         cache.path(),
         &manifest,
@@ -3388,7 +3388,7 @@ fn uses_closure() {
     let mut out: Vec<u8> = Vec::new();
     let result = super::run_ast_standalone(
         "rust-nested-loop",
-        20,
+        super::super::types::Page::first(20),
         false,
         cache.path(),
         &manifest,
@@ -4023,7 +4023,7 @@ fn run_ast_standalone_all_five_synthetic_patterns_positive_ac1_394() {
         let mut out: Vec<u8> = Vec::new();
         let result = super::run_ast_standalone(
             pattern,
-            20,
+            super::super::types::Page::first(20),
             false,
             cache.path(),
             &manifest,
@@ -4095,7 +4095,7 @@ fn run_ast_standalone_matches_compound_for_all_five_synthetic_patterns_ac2_394()
         let mut standalone_out: Vec<u8> = Vec::new();
         super::run_ast_standalone(
             pattern,
-            20,
+            super::super::types::Page::first(20),
             false,
             cache.path(),
             &manifest,
@@ -4388,7 +4388,7 @@ fn run_ast_standalone_json_line_matches_ground_truth_for_all_five_ac10_394() {
         let mut out: Vec<u8> = Vec::new();
         super::run_ast_standalone(
             pattern,
-            20,
+            super::super::types::Page::first(20),
             true, // json
             cache.path(),
             &manifest,
@@ -4581,7 +4581,7 @@ fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
         let mut out: Vec<u8> = Vec::new();
         super::run_ast_standalone(
             "god-function",
-            20,
+            super::super::types::Page::first(20),
             false,
             cache.path(),
             &manifest,

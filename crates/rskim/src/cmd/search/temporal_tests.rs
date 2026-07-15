@@ -256,7 +256,15 @@ fn standalone_hot_returns_top_by_score() {
     ])
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Hot), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match output {
         TemporalQueryOutput::Hotspots(rows) => {
             assert_eq!(rows.len(), 2);
@@ -288,7 +296,15 @@ fn standalone_cold_returns_bottom_by_score() {
     ])
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Cold), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Cold),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match output {
         TemporalQueryOutput::Coldspots(rows) => {
             assert_eq!(rows.len(), 2);
@@ -322,7 +338,15 @@ fn standalone_risky_returns_top_by_density() {
     ])
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Risky), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Risky),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match output {
         TemporalQueryOutput::Risks(rows) => {
             assert_eq!(rows.len(), 2);
@@ -349,7 +373,15 @@ fn standalone_blast_radius_returns_partners() {
     }])
     .unwrap();
 
-    let output = query_standalone(None, Some("src/auth.rs"), 10, &db, &root).unwrap();
+    let output = query_standalone(
+        None,
+        Some("src/auth.rs"),
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match output {
         TemporalQueryOutput::Cochanges { target, partners } => {
             assert_eq!(target, "src/auth.rs");
@@ -403,11 +435,12 @@ fn standalone_blast_radius_with_risky_sorts_by_risk() {
     let output = query_standalone(
         Some(TemporalSort::Risky),
         Some("src/auth.rs"),
-        10,
+        super::super::types::Page::first(10),
         &db,
         &root,
     )
-    .unwrap();
+    .unwrap()
+    .0;
     match output {
         TemporalQueryOutput::Cochanges { partners, .. } => {
             assert_eq!(partners.len(), 2);
@@ -504,11 +537,12 @@ fn standalone_blast_radius_risky_real_wilson_small_sample_below_large() {
     let output = query_standalone(
         Some(TemporalSort::Risky),
         Some("src/auth.rs"),
-        10,
+        super::super::types::Page::first(10),
         &db,
         &root,
     )
-    .unwrap();
+    .unwrap()
+    .0;
     match output {
         TemporalQueryOutput::Cochanges { partners, .. } => {
             assert_eq!(partners.len(), 2);
@@ -550,7 +584,15 @@ fn standalone_limit_caps_results() {
     )
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Hot), None, 3, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::first(3),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match output {
         TemporalQueryOutput::Hotspots(rows) => {
             assert_eq!(rows.len(), 3, "limit should cap at 3");
@@ -573,7 +615,15 @@ fn standalone_hot_json_valid() {
     }])
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Hot), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     let mut buf = BufWriter::new(Vec::new());
     format_temporal_json(&output, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
@@ -601,7 +651,15 @@ fn standalone_hot_text_has_table_columns() {
     }])
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Hot), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     let mut buf = BufWriter::new(Vec::new());
     format_temporal_text(&output, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
@@ -1155,7 +1213,15 @@ fn standalone_cold_empty_db_text_format() {
     let (_db_dir, db) = temp_db();
 
     // Empty hotspots table — no store_hotspots call.
-    let output = query_standalone(Some(TemporalSort::Cold), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Cold),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match &output {
         TemporalQueryOutput::Coldspots(rows) => assert!(rows.is_empty()),
         other => panic!("expected Coldspots, got {other:?}"),
@@ -1182,7 +1248,15 @@ fn standalone_risky_empty_db_text_format() {
     let (_db_dir, db) = temp_db();
 
     // Empty risks table — no store_risks call.
-    let output = query_standalone(Some(TemporalSort::Risky), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Risky),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match &output {
         TemporalQueryOutput::Risks(rows) => assert!(rows.is_empty()),
         other => panic!("expected Risks, got {other:?}"),
@@ -1366,7 +1440,15 @@ fn standalone_risky_json_valid() {
     }])
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Risky), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Risky),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     let mut buf = BufWriter::new(Vec::new());
     format_temporal_json(&output, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
@@ -1414,7 +1496,15 @@ fn standalone_blast_radius_json_valid() {
     }])
     .unwrap();
 
-    let output = query_standalone(None, Some("src/auth.rs"), 10, &db, &root).unwrap();
+    let output = query_standalone(
+        None,
+        Some("src/auth.rs"),
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     let mut buf = BufWriter::new(Vec::new());
     format_temporal_json(&output, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
@@ -1455,7 +1545,15 @@ fn standalone_cold_json_valid() {
     }])
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Cold), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Cold),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     let mut buf = BufWriter::new(Vec::new());
     format_temporal_json(&output, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
@@ -1481,7 +1579,15 @@ fn standalone_hot_empty_db_text_format() {
     let (_db_dir, db) = temp_db();
 
     // Empty hotspots table — no store_hotspots call.
-    let output = query_standalone(Some(TemporalSort::Hot), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match &output {
         TemporalQueryOutput::Hotspots(rows) => assert!(rows.is_empty()),
         other => panic!("expected Hotspots, got {other:?}"),
@@ -1517,7 +1623,15 @@ fn standalone_blast_radius_empty_db_text_format() {
     let (_db_dir, db) = temp_db();
     // No store_cochanges call — empty co-change table.
 
-    let output = query_standalone(None, Some("src/auth.rs"), 10, &db, &root).unwrap();
+    let output = query_standalone(
+        None,
+        Some("src/auth.rs"),
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match &output {
         TemporalQueryOutput::Cochanges { partners, .. } => assert!(partners.is_empty()),
         other => panic!("expected Cochanges, got {other:?}"),
