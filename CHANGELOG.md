@@ -67,7 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Pseudo mode preserves function return types as API surface (A4 contract)** —
   Return type annotations are API contracts callers depend on; they are now preserved
   in pseudo mode alongside visibility modifiers, mirroring the commit c244a12
-  visibility fix. Param, variable, and property type annotations are still stripped.
+  visibility fix. For Python and TypeScript, param, variable, and property type
+  annotations are still stripped. Rust preserves parameter types (pseudo mode strips
+  only lifetimes, type parameters, where clauses, and attributes for Rust).
   Affected languages: Python (`-> T`), TypeScript (`: T` at return position), Rust
   (`-> T` via normal recursion — the former strip_rust_return_type special-case is
   removed). A position-aware guard (`is_return_type_annotation`) stops recursion at

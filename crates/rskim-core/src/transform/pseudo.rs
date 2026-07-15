@@ -8,7 +8,9 @@
 //!   position, Rust `-> T` via normal recursion since Rust has no strip_kinds for
 //!   return types)
 //!
-//! Parameter, variable, and property type annotations are still stripped.
+//! For Python and TypeScript, parameter, variable, and property type annotations are
+//! still stripped. Rust preserves parameter types (pseudo mode strips only lifetimes,
+//! type parameters, where clauses, and attributes for Rust).
 //! Uses the same collect-ranges-then-remove pattern as minimal.rs.
 //!
 //! Token reduction target: 30-50%
@@ -446,7 +448,7 @@ fn collect_noise_ranges(
         // Stopping recursion here means nested type args (Promise<User>, tuple[int, str])
         // survive intact.  Param/variable/property annotations under other field names
         // still fall through to be stripped.
-        if is_return_type_annotation(node, ctx.language) {
+        if is_return_type_annotation(node, kind, ctx.language) {
             return Ok(());
         }
 
@@ -523,7 +525,12 @@ fn adjust_type_start(language: Language, kind: &str, source: &[u8], start: usize
         // Return-type annotations (`-> int`) are preserved (A4) and never reach here.
         (Language::Python, "type") => {
             const SEPARATORS: &[&[u8]] = &[b": ", b":"];
-            let prefix = source.get(start.saturating_sub(2)..start).unwrap_or(b"");
+            // Derive the look-back window from the longest separator so this stays
+            // in sync automatically if SEPARATORS ever gains a longer entry.
+            let max_sep_len = SEPARATORS.iter().map(|s| s.len()).max().unwrap_or(0);
+            let prefix = source
+                .get(start.saturating_sub(max_sep_len)..start)
+                .unwrap_or(b"");
             for sep in SEPARATORS {
                 if prefix.ends_with(sep) {
                     return start.saturating_sub(sep.len());
@@ -545,9 +552,9 @@ fn adjust_type_start(language: Language, kind: &str, source: &[u8], start: usize
 ///
 /// Stopping recursion at this point means nested type arguments
 /// (`Promise<User>`, `tuple[int, str]`) survive intact inside the return annotation.
-fn is_return_type_annotation(node: Node, language: Language) -> bool {
+fn is_return_type_annotation(node: Node, kind: &str, language: Language) -> bool {
     matches!(
-        (language, node.kind()),
+        (language, kind),
         (Language::Python, "type") | (Language::TypeScript, "type_annotation")
     ) && is_return_field_child(node)
 }
@@ -698,6 +705,25 @@ mod tests {
         assert!(result.contains("i < 10"), "for-loop condition preserved");
     }
 
+    #[test]
+    fn test_typescript_pseudo_strips_class_property_annotation() {
+        // Class property type annotations (e.g. `count: number = 0`) are stripped in
+        // pseudo mode — the `: number` annotation is removed; the property name and
+        // value survive.  `is_return_field_child` does NOT fire here because the
+        // parent field name is `type`, not `return_type`, so the annotation is
+        // correctly stripped rather than accidentally preserved.
+        let source = "class Counter {\n    count: number = 0\n}\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            !result.contains("count: number"),
+            "class property type annotation should be stripped, got: {result}"
+        );
+        assert!(
+            result.contains("count") && result.contains("= 0"),
+            "property name and value must be preserved, got: {result}"
+        );
+    }
+
     // ========================================================================
     // JavaScript pseudo tests
     // ========================================================================
@@ -771,6 +797,25 @@ mod tests {
             "decorator should be stripped"
         );
         assert!(result.contains("def helper()"), "function preserved");
+    }
+
+    #[test]
+    fn test_python_pseudo_strips_variable_annotation() {
+        // Standalone variable annotations (e.g. `x: int = 5`) are stripped in
+        // pseudo mode — the `: int` annotation is removed; name and value survive.
+        // `is_return_field_child` does NOT fire here (parent is an assignment, not a
+        // function_definition with a `return_type` field), so the annotation is
+        // correctly stripped rather than accidentally preserved.
+        let source = "x: int = 5\n";
+        let result = transform(source, Language::Python);
+        assert!(
+            !result.contains(": int"),
+            "variable type annotation should be stripped, got: {result}"
+        );
+        assert!(
+            result.contains("x") && result.contains("= 5"),
+            "variable name and value must be preserved, got: {result}"
+        );
     }
 
     // ========================================================================
