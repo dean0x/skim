@@ -356,6 +356,136 @@ fn standalone_risky_returns_top_by_density() {
     }
 }
 
+/// AC-404-2 (hermetic deep pagination): `query_standalone` on the standalone
+/// `--hot` arm must honor a non-zero `offset`, returning disjoint pages and a
+/// sound `has_more` terminator.
+///
+/// This is the hermetic sibling of `cli_search_offset.rs::offset_accepted_on_hot_standalone`
+/// — that CLI test only proves the flag is WIRED (degraded exit 0 with no
+/// temporal.db); the deep disjointness+has_more contract that seeded data
+/// requires is asserted here. Exercises the `paginate_sentinel` over-fetch +
+/// skip/take path with `offset > 0` (AD-404-11 / D-5).
+#[test]
+fn standalone_hot_offset_paginates_disjoint_with_has_more() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let (_db_dir, db) = temp_db();
+
+    // Five distinct scores → deterministic Hot order (score DESC, file_path ASC):
+    // e(0.9) d(0.7) c(0.5) b(0.3) a(0.1).
+    db.store_hotspots(&[
+        HotspotRow {
+            file_path: "a.rs".to_string(),
+            score: 0.1,
+            changes_30d: 1,
+            changes_90d: 2,
+        },
+        HotspotRow {
+            file_path: "b.rs".to_string(),
+            score: 0.3,
+            changes_30d: 2,
+            changes_90d: 4,
+        },
+        HotspotRow {
+            file_path: "c.rs".to_string(),
+            score: 0.5,
+            changes_30d: 3,
+            changes_90d: 6,
+        },
+        HotspotRow {
+            file_path: "d.rs".to_string(),
+            score: 0.7,
+            changes_30d: 4,
+            changes_90d: 8,
+        },
+        HotspotRow {
+            file_path: "e.rs".to_string(),
+            score: 0.9,
+            changes_30d: 5,
+            changes_90d: 10,
+        },
+    ])
+    .unwrap();
+
+    let paths = |out: TemporalQueryOutput| -> Vec<String> {
+        match out {
+            TemporalQueryOutput::Hotspots(rows) => rows.into_iter().map(|r| r.file_path).collect(),
+            other => panic!("expected Hotspots, got {other:?}"),
+        }
+    };
+
+    // Page 0: limit 2, offset 0 → top two hottest, more remain.
+    let (out0, more0) = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::new(2, Some(0)),
+        &db,
+        &root,
+    )
+    .unwrap();
+    let page0 = paths(out0);
+    assert_eq!(
+        page0,
+        vec!["e.rs", "d.rs"],
+        "page 0 = top two by score DESC"
+    );
+    assert!(more0, "5 rows, page of 2 at offset 0 → has_more");
+
+    // Page 1: limit 2, offset 2 → next two, disjoint from page 0, more remain.
+    let (out1, more1) = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::new(2, Some(2)),
+        &db,
+        &root,
+    )
+    .unwrap();
+    let page1 = paths(out1);
+    assert_eq!(
+        page1,
+        vec!["c.rs", "b.rs"],
+        "page 1 = rows 3-4 by score DESC"
+    );
+    assert!(more1, "5 rows, page of 2 at offset 2 → has_more");
+    let overlap: Vec<_> = page0.iter().filter(|p| page1.contains(p)).collect();
+    assert!(
+        overlap.is_empty(),
+        "pages must be disjoint, overlap={overlap:?}"
+    );
+
+    // Page 2: limit 2, offset 4 → the single remaining row, no more pages.
+    let (out2, more2) = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::new(2, Some(4)),
+        &db,
+        &root,
+    )
+    .unwrap();
+    let page2 = paths(out2);
+    assert_eq!(
+        page2,
+        vec!["a.rs"],
+        "page 2 = last (coldest of the hot list)"
+    );
+    assert!(
+        !more2,
+        "offset 4 of 5 rows exhausts the set → has_more=false"
+    );
+
+    // Page past end: empty, no more.
+    let (out3, more3) = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::new(2, Some(99)),
+        &db,
+        &root,
+    )
+    .unwrap();
+    assert!(paths(out3).is_empty(), "offset past end → empty page");
+    assert!(!more3, "offset past end → has_more=false");
+}
+
 #[test]
 fn standalone_blast_radius_returns_partners() {
     let dir = TempDir::new().unwrap();

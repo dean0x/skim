@@ -301,8 +301,11 @@ pub(super) fn run_ast_standalone(
         // Additive widening: candidate_pool(page.limit(), K) + page.offset().
         // At offset 0: pool = candidate_pool(limit, K), byte-identical to pre-change.
         // With offset: pool grows by exactly offset, not by K*offset (D-3).
+        // saturating_add (not `+`) guards a hostile `--offset` near usize::MAX
+        // from overflowing (applies PF-004, matches Page::depth()); byte-identical
+        // for every realistic offset since it only clamps at the usize::MAX ceiling.
         super::query::candidate_pool(page.limit(), super::query::LEXICAL_CANDIDATE_POOL_K)
-            + page.offset()
+            .saturating_add(page.offset())
     };
     let window = temporal_window.max(ast_pool);
 

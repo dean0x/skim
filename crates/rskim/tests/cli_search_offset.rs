@@ -488,3 +488,54 @@ fn offset_paginates_containment_query() {
          overlap={overlap:?}, page0={paths0:?}, page1={paths1:?}"
     );
 }
+
+// ============================================================================
+// PF-004: hostile --offset near usize::MAX must not overflow the candidate pool
+// ============================================================================
+
+/// A `--offset` at `usize::MAX` must NOT overflow the additive candidate-pool
+/// widening (`candidate_pool(limit, K) + offset`). Before the `saturating_add`
+/// guard this panicked in debug/test builds ("attempt to add with overflow")
+/// and wrapped to a garbage pool size in release. Post-fix: exit 0, empty page
+/// (paged far past the end), never a panic.
+///
+/// Exercises the non-synthetic AST pool path (`--ast try-catch`) that computes
+/// `candidate_pool(...) + offset`.
+#[test]
+fn hostile_max_offset_does_not_overflow() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    make_try_catch_project(proj.path(), 3);
+    build_index(proj.path(), cache.path());
+
+    let out = Command::cargo_bin("skim")
+        .unwrap()
+        .args([
+            "search",
+            "--ast",
+            "try-catch",
+            "--limit",
+            "5",
+            // usize::MAX on a 64-bit target.
+            "--offset",
+            "18446744073709551615",
+            "--json",
+            "--root",
+        ])
+        .arg(proj.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .assert()
+        .success() // must NOT panic/overflow
+        .get_output()
+        .stdout
+        .clone();
+
+    let v: serde_json::Value =
+        serde_json::from_slice(&out).expect("hostile-offset page must be valid JSON");
+    assert_eq!(
+        v["total"].as_u64(),
+        Some(0),
+        "paging past usize::MAX must yield an empty page, got: {v}"
+    );
+}
