@@ -1,0 +1,14 @@
+AST pattern: try-catch — A try/catch block (TypeScript/JavaScript). Exact: try_statement always contains a catch_clause.
+
+  file1.ts:8  [2.288]  try-catch
+      } catch (error) {
+  file2.ts:8  [2.305]  try-catch
+      } catch (error) {
+  file6.ts:8  [2.314]  try-catch
+      } catch (error) {
+  file5.ts:8  [2.322]  try-catch
+      } catch (error) {
+  file4.ts:8  [2.322]  try-catch
+      } catch (error) {
+
+5 file(s) matched pattern "try-catch"

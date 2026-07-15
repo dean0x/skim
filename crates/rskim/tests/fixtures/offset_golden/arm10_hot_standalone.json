@@ -1,0 +1,36 @@
+{
+  "mode": "hot",
+  "total": 5,
+  "results": [
+    {
+      "path": "file1.ts",
+      "hotspot_score": 1.0,
+      "changes_30d": 5,
+      "changes_90d": 5
+    },
+    {
+      "path": "file2.ts",
+      "hotspot_score": 0.6,
+      "changes_30d": 3,
+      "changes_90d": 3
+    },
+    {
+      "path": "file6.ts",
+      "hotspot_score": 0.39999999999999997,
+      "changes_30d": 2,
+      "changes_90d": 2
+    },
+    {
+      "path": "file3.ts",
+      "hotspot_score": 0.19999999999999998,
+      "changes_30d": 1,
+      "changes_90d": 1
+    },
+    {
+      "path": "file5.ts",
+      "hotspot_score": 0.19999999999999998,
+      "changes_30d": 1,
+      "changes_90d": 1
+    }
+  ]
+}
