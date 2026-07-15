@@ -7,9 +7,9 @@ use rskim_search::{CochangeRow, HotspotRow, RiskRow, TemporalDb};
 use tempfile::TempDir;
 
 use super::{
-    TemporalQueryOutput, apply_temporal_enrichment, check_temporal_staleness, enrich_ast_results,
-    format_temporal_json, format_temporal_text, normalize_blast_radius_path, open_temporal_db,
-    query_standalone, resort_window,
+    TemporalQueryOutput, apply_temporal_enrichment, bounded_page_notice, check_temporal_staleness,
+    enrich_ast_results, format_temporal_json, format_temporal_text, normalize_blast_radius_path,
+    open_temporal_db, query_standalone, resort_window,
 };
 use crate::cmd::search::types::{ResolvedResult, TemporalSort};
 
@@ -791,7 +791,7 @@ fn standalone_hot_text_has_table_columns() {
     .unwrap()
     .0;
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_text(&output, &mut buf).unwrap();
+    format_temporal_text(&output, super::super::types::Page::first(10), &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         s.contains("Score"),
@@ -800,6 +800,198 @@ fn standalone_hot_text_has_table_columns() {
     assert!(
         s.contains("Path"),
         "text output should have Path column header"
+    );
+}
+
+// ============================================================================
+// AC-404-12: golden fixture comparison tests
+// ============================================================================
+//
+// These tests verify that `format_temporal_text` and `format_temporal_json`
+// at offset 0 produce output byte-identical to the golden fixtures committed
+// in tests/fixtures/offset_golden/ (captured from the pre-change binary in
+// Step 0 of #404). They confirm that the page-aware changes in format_temporal_text
+// are a zero-regression at offset=0 (PF-007 / AC-404-12).
+
+/// AC-404-12 / PF-007: `format_temporal_text` at offset 0 must produce output
+/// matching the arm10 golden fixture (standalone --hot, 5 files).
+///
+/// This pins the exact tiebreak ordering (file3.ts before file5.ts at score 0.2)
+/// that Decision 8 documents; a permutation would fail here.
+#[test]
+fn golden_arm10_hot_standalone_text_matches_fixture() {
+    // Data extracted directly from arm10_hot_standalone.json golden fixture.
+    let output = TemporalQueryOutput::Hotspots(vec![
+        HotspotRow {
+            file_path: "file1.ts".to_string(),
+            score: 1.0,
+            changes_30d: 5,
+            changes_90d: 5,
+        },
+        HotspotRow {
+            file_path: "file2.ts".to_string(),
+            score: 0.6,
+            changes_30d: 3,
+            changes_90d: 3,
+        },
+        HotspotRow {
+            file_path: "file6.ts".to_string(),
+            // Use the exact float from the JSON fixture to match {:.3} rounding.
+            score: 0.39999999999999997,
+            changes_30d: 2,
+            changes_90d: 2,
+        },
+        HotspotRow {
+            file_path: "file3.ts".to_string(),
+            score: 0.19999999999999998,
+            changes_30d: 1,
+            changes_90d: 1,
+        },
+        HotspotRow {
+            file_path: "file5.ts".to_string(),
+            score: 0.19999999999999998,
+            changes_30d: 1,
+            changes_90d: 1,
+        },
+    ]);
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_text(&output, super::super::types::Page::first(5), &mut buf).unwrap();
+    let actual = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    let expected = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/offset_golden/arm10_hot_standalone.txt"),
+    )
+    .expect("arm10 golden fixture must be readable");
+
+    assert_eq!(
+        actual, expected,
+        "AC-404-12 / PF-007: format_temporal_text at offset 0 must match golden fixture.\n\
+         If this fails due to a deliberate behavioral change (e.g. tiebreak Decision 8),\n\
+         update arm10_hot_standalone.txt to reflect the new correct output."
+    );
+}
+
+/// AC-404-12: offset > 0 header is page-range aware, NOT "top N".
+///
+/// At offset 2 the header should say "Hotspots (items 3–N, 90-day decay):"
+/// not "Hotspots (top N, 90-day decay):" — the "top" claim is false when
+/// the first N items have been skipped.
+#[test]
+fn format_temporal_text_offset_nonzero_header_not_top() {
+    let (_db_dir, db) = temp_db();
+    db.store_hotspots(
+        &(0..5u32)
+            .map(|i| HotspotRow {
+                file_path: format!("f{i}.rs"),
+                score: 1.0 - i as f64 * 0.1,
+                changes_30d: i,
+                changes_90d: i * 2,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let (output, _) = super::query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::new(2, Some(2)),
+        &db,
+        &root,
+    )
+    .unwrap();
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_text(
+        &output,
+        super::super::types::Page::new(2, Some(2)),
+        &mut buf,
+    )
+    .unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    assert!(
+        !s.contains("top"),
+        "AC-404-10: offset>0 header must NOT say 'top', got: {s:?}"
+    );
+    assert!(
+        s.contains("items 3"),
+        "AC-404-10: offset>0 header must show 1-indexed start position, got: {s:?}"
+    );
+}
+
+/// AC-404-10: empty page at offset > 0 emits "no results at offset N" message,
+/// NOT the misleading "No hotspot data available." message.
+#[test]
+fn format_temporal_text_empty_offset_page_message() {
+    let output = TemporalQueryOutput::Hotspots(vec![]);
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_text(
+        &output,
+        super::super::types::Page::new(5, Some(100)),
+        &mut buf,
+    )
+    .unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    assert!(
+        !s.contains("No hotspot data available."),
+        "AC-404-10: empty-offset-page must NOT say 'No hotspot data available.', got: {s:?}"
+    );
+    assert!(
+        s.contains("offset 100"),
+        "AC-404-10: empty-offset-page message must mention the offset, got: {s:?}"
+    );
+}
+
+/// AC-404-10: empty co-change page at offset > 0 says "no results at offset N",
+/// NOT "No co-change data for {target}.".
+#[test]
+fn format_temporal_text_empty_cochange_offset_page_message() {
+    let output = TemporalQueryOutput::Cochanges {
+        target: "src/auth.rs".to_string(),
+        partners: vec![],
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_text(
+        &output,
+        super::super::types::Page::new(5, Some(50)),
+        &mut buf,
+    )
+    .unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    assert!(
+        !s.contains("No co-change data for"),
+        "AC-404-10: empty-offset-page must NOT say 'No co-change data for …', got: {s:?}"
+    );
+    assert!(
+        s.contains("offset 50"),
+        "AC-404-10: empty-offset-page co-change message must mention the offset, got: {s:?}"
+    );
+}
+
+/// AC-404-11: `bounded_page_notice` contains the required "exceeds the temporal
+/// ranking window" phrasing and includes counts + next-offset remedy.
+#[test]
+fn bounded_page_notice_contains_required_phrasing() {
+    let notice = bounded_page_notice(5, 0, 5);
+    assert!(
+        notice.contains("exceed"),
+        "AC-404-11: notice must contain 'exceed' (ranking window phrase), got: {notice:?}"
+    );
+    assert!(
+        notice.contains("showing 5"),
+        "AC-404-11: notice must include count, got: {notice:?}"
+    );
+    assert!(
+        notice.contains("--offset 5"),
+        "AC-404-11: notice must include next-offset remedy, got: {notice:?}"
     );
 }
 
@@ -1358,7 +1550,7 @@ fn standalone_cold_empty_db_text_format() {
     }
 
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_text(&output, &mut buf).unwrap();
+    format_temporal_text(&output, super::super::types::Page::first(10), &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         s.contains("No coldspot data available"),
@@ -1393,7 +1585,7 @@ fn standalone_risky_empty_db_text_format() {
     }
 
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_text(&output, &mut buf).unwrap();
+    format_temporal_text(&output, super::super::types::Page::first(10), &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         s.contains("No risk data available"),
@@ -1725,7 +1917,7 @@ fn standalone_hot_empty_db_text_format() {
     }
 
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_text(&output, &mut buf).unwrap();
+    format_temporal_text(&output, super::super::types::Page::first(10), &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         s.contains("No hotspot data available"),
@@ -1769,7 +1961,7 @@ fn standalone_blast_radius_empty_db_text_format() {
     }
 
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_text(&output, &mut buf).unwrap();
+    format_temporal_text(&output, super::super::types::Page::first(10), &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         s.contains("No co-change data"),

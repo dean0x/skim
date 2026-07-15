@@ -117,14 +117,20 @@ impl Page {
 impl QueryConfig {
     /// Return the pagination cursor implied by this config's `limit` and `offset`.
     ///
-    /// ## AD-404-4: base_search_query constructor (consumed by #403, #405)
-    ///
-    /// This method is the canonical source of the `Page` that `base_search_query`
-    /// (AD-404-4) and every other call site should derive from the config, rather
-    /// than repeating `Page::new(config.limit, config.offset)` at each site.
+    /// This is the canonical way to derive a `Page` from a `QueryConfig` rather
+    /// than repeating `Page::new(config.limit, config.offset)` at each call site.
     /// Upstream tickets (#403, #405) MUST call `config.page()` rather than
     /// constructing their own `Page` so that any change to `QueryConfig`'s offset
     /// handling propagates automatically.
+    ///
+    /// ## AD-404-4: additive pool widening
+    ///
+    /// The candidate pool passed to the lexical engine MUST be computed as
+    /// `candidate_pool(page.limit(), K).saturating_add(page.offset())` — the
+    /// additive form (not the multiplicative `candidate_pool(page.depth(), K)`
+    /// form, which is D-2 / Decision 2 violation).  The call sites in `query.rs`
+    /// cite this decision; this accessor ensures callers consistently derive the
+    /// same `limit` and `offset` values that drive the pool calculation.
     #[must_use]
     pub(super) fn page(&self) -> Page {
         Page::new(self.limit, self.offset)

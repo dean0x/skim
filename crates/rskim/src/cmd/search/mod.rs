@@ -1203,11 +1203,24 @@ fn run_temporal_standalone(
     let (output, has_more) =
         temporal::query_standalone(temporal_sort, blast_radius, page, &db, &root)?;
 
+    // AD-404-8: bounded-page-notice — emitted on stderr when has_more is true
+    // (more results exist beyond this page, or the temporal ranking window was
+    // exceeded).  Goes to stderr (#377 seam, PF-006) so --json stdout stays
+    // byte-identical.  The notice surfaces the pagination seam for agents that
+    // detect the last page via has_more rather than the unsound `len < limit`
+    // heuristic (D-5).
+    if has_more {
+        eprintln!(
+            "{}",
+            temporal::bounded_page_notice(output.result_count(), page.offset(), page.limit())
+        );
+    }
+
     let mut stdout = BufWriter::new(std::io::stdout());
     if json {
         temporal::format_temporal_json(&output, has_more, &mut stdout)?;
     } else {
-        temporal::format_temporal_text(&output, &mut stdout)?;
+        temporal::format_temporal_text(&output, page, &mut stdout)?;
     }
     stdout.flush()?;
 
@@ -1315,8 +1328,10 @@ General examples:
   skim search --stats                       Show index statistics
   skim search --install-hooks               Auto-refresh on git commit/merge
   skim search --hot                         Top hotspot files (standalone)
+  skim search --hot --limit 5 --offset 5   Hotspot page 2 (items 6-10)
   skim search --risky                       Top risky files (standalone)
   skim search --blast-radius src/auth.rs    Co-change partners of auth.rs
+  skim search --blast-radius src/auth.rs --offset 10  Co-change page 2
   skim search \"auth\" --hot                  Text results sorted by hotspot
   skim search \"auth\" --blast-radius src/auth.rs  Text within co-change partners";
 
@@ -2105,7 +2120,12 @@ mod tests {
 
         let mut buf = Vec::new();
         let mut writer = BufWriter::new(&mut buf);
-        format_temporal_text(&output, &mut writer).unwrap();
+        format_temporal_text(
+            &output,
+            crate::cmd::search::types::Page::first(10),
+            &mut writer,
+        )
+        .unwrap();
         drop(writer);
 
         let text = String::from_utf8(buf).unwrap();
@@ -2150,7 +2170,12 @@ mod tests {
 
         let mut buf = Vec::new();
         let mut writer = BufWriter::new(&mut buf);
-        format_temporal_text(&output, &mut writer).unwrap();
+        format_temporal_text(
+            &output,
+            crate::cmd::search::types::Page::first(10),
+            &mut writer,
+        )
+        .unwrap();
         drop(writer);
 
         let text = String::from_utf8(buf).unwrap();

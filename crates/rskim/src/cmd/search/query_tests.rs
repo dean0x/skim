@@ -2401,6 +2401,11 @@ fn ac10_help_text_reflects_both_composite_paths_and_temporal_inert() {
         "AC10: --weights help must explicitly state the temporal weight is inert whenever --ast \
          is present"
     );
+    // AC-404-16: --offset must appear in the help text (pagination on all arms).
+    assert!(
+        help.contains("--offset"),
+        "AC-404-16: --offset must appear in the skim search help text (pagination flag)"
+    );
 }
 
 // ============================================================================

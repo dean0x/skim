@@ -430,6 +430,22 @@ pub(super) enum TemporalQueryOutput {
     },
 }
 
+impl TemporalQueryOutput {
+    /// Number of results in the current page.
+    ///
+    /// Used by the bounded-page-notice in `run_temporal_standalone` (AD-404-8)
+    /// to report how many results were shown before emitting the "more exist"
+    /// hint on stderr.
+    pub(super) fn result_count(&self) -> usize {
+        match self {
+            Self::Hotspots(rows) => rows.len(),
+            Self::Coldspots(rows) => rows.len(),
+            Self::Risks(rows) => rows.len(),
+            Self::Cochanges { partners, .. } => partners.len(),
+        }
+    }
+}
+
 /// Execute a standalone temporal query (no text query).
 ///
 /// - `sort`: optional sort mode (Hot, Cold, Risky).
@@ -588,20 +604,70 @@ fn resort_partners_by_temporal(
 // Output formatters
 // ============================================================================
 
+/// Format the bounded-page stderr notice for standalone temporal queries.
+///
+/// ## AD-404-8: bounded-page-notice emission site
+///
+/// Emitted when `has_more=true` from `query_standalone` — the result set was
+/// either capped at the temporal ranking window (`resort_window(page.limit())`)
+/// or more rows exist beyond the current page.  Goes to stderr (#377 seam,
+/// PF-006) so `--json` stdout stays byte-identical.
+///
+/// `n` is the count of results in the current page, used so agents see exactly
+/// how many they received before the "more exist" hint.
+pub(super) fn bounded_page_notice(n: usize, offset: usize, limit: usize) -> String {
+    format!(
+        "skim search: showing {n} result(s) (offset {offset}, limit {limit}); \
+         more exist — results exceed the temporal ranking window. \
+         Use --offset {} to page forward or increase --limit.",
+        offset.saturating_add(limit)
+    )
+}
+
 /// Format a standalone temporal query result as human-readable text.
+///
+/// ## AC-404-10: page-aware headers and empty messages
+///
+/// `page` is required so that:
+/// - Headers say "top N" only at offset 0 (backward-compatible with golden
+///   fixtures); at offset > 0 they show `offset+1 .. offset+count` instead.
+/// - An empty result page at offset > 0 says "no more results at this offset"
+///   rather than the misleading "No hotspot data available." message (which
+///   implies the data source is empty, not that the page is exhausted).
 pub(super) fn format_temporal_text(
     output: &TemporalQueryOutput,
+    page: Page,
     w: &mut impl Write,
 ) -> anyhow::Result<()> {
     match output {
         TemporalQueryOutput::Hotspots(rows) => {
             if rows.is_empty() {
-                writeln!(w, "No hotspot data available.")?;
+                if page.offset() > 0 {
+                    writeln!(
+                        w,
+                        "No hotspot results at offset {} (try a smaller --offset).",
+                        page.offset()
+                    )?;
+                } else {
+                    writeln!(w, "No hotspot data available.")?;
+                }
                 return Ok(());
             }
             // Single newline after header (writeln! already appends \n; no
             // extra \n in the format string — that would insert a blank line).
-            writeln!(w, "Hotspots (top {}, 90-day decay):", rows.len())?;
+            //
+            // At offset 0: "top N" (backward-compatible with golden fixtures).
+            // At offset > 0: show the 1-indexed range so agents know position.
+            if page.offset() == 0 {
+                writeln!(w, "Hotspots (top {}, 90-day decay):", rows.len())?;
+            } else {
+                writeln!(
+                    w,
+                    "Hotspots (items {}–{}, 90-day decay):",
+                    page.offset() + 1,
+                    page.offset() + rows.len()
+                )?;
+            }
             writeln!(w, "  Score  30d  90d  Path")?;
             writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
             for r in rows {
@@ -614,10 +680,27 @@ pub(super) fn format_temporal_text(
         }
         TemporalQueryOutput::Coldspots(rows) => {
             if rows.is_empty() {
-                writeln!(w, "No coldspot data available.")?;
+                if page.offset() > 0 {
+                    writeln!(
+                        w,
+                        "No coldspot results at offset {} (try a smaller --offset).",
+                        page.offset()
+                    )?;
+                } else {
+                    writeln!(w, "No coldspot data available.")?;
+                }
                 return Ok(());
             }
-            writeln!(w, "Coldspots (top {}, least active):", rows.len())?;
+            if page.offset() == 0 {
+                writeln!(w, "Coldspots (top {}, least active):", rows.len())?;
+            } else {
+                writeln!(
+                    w,
+                    "Coldspots (items {}–{}, least active):",
+                    page.offset() + 1,
+                    page.offset() + rows.len()
+                )?;
+            }
             writeln!(w, "  Score  30d  90d  Path")?;
             writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
             for r in rows {
@@ -630,10 +713,27 @@ pub(super) fn format_temporal_text(
         }
         TemporalQueryOutput::Risks(rows) => {
             if rows.is_empty() {
-                writeln!(w, "No risk data available.")?;
+                if page.offset() > 0 {
+                    writeln!(
+                        w,
+                        "No risk results at offset {} (try a smaller --offset).",
+                        page.offset()
+                    )?;
+                } else {
+                    writeln!(w, "No risk data available.")?;
+                }
                 return Ok(());
             }
-            writeln!(w, "Risk hotspots (top {}):\n", rows.len())?;
+            if page.offset() == 0 {
+                writeln!(w, "Risk hotspots (top {}):\n", rows.len())?;
+            } else {
+                writeln!(
+                    w,
+                    "Risk hotspots (items {}–{}):\n",
+                    page.offset() + 1,
+                    page.offset() + rows.len()
+                )?;
+            }
             writeln!(w, "  Risk   Fix%   Fixes  Total  Path")?;
             writeln!(
                 w,
@@ -653,15 +753,33 @@ pub(super) fn format_temporal_text(
         }
         TemporalQueryOutput::Cochanges { target, partners } => {
             if partners.is_empty() {
-                writeln!(w, "No co-change data for {target:?}.")?;
+                if page.offset() > 0 {
+                    writeln!(
+                        w,
+                        "No co-change results for {target:?} at offset {} (try a smaller --offset).",
+                        page.offset()
+                    )?;
+                } else {
+                    writeln!(w, "No co-change data for {target:?}.")?;
+                }
                 return Ok(());
             }
-            writeln!(
-                w,
-                "Co-change partners of {} ({} files):\n",
-                target,
-                partners.len()
-            )?;
+            if page.offset() == 0 {
+                writeln!(
+                    w,
+                    "Co-change partners of {} ({} files):\n",
+                    target,
+                    partners.len()
+                )?;
+            } else {
+                writeln!(
+                    w,
+                    "Co-change partners of {} (items {}–{}):\n",
+                    target,
+                    page.offset() + 1,
+                    page.offset() + partners.len()
+                )?;
+            }
             writeln!(w, "  Jaccard  Count  Path")?;
             writeln!(w, "  ───────  ─────  ────────────────────────────────")?;
             for p in partners {

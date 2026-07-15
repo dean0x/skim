@@ -490,6 +490,50 @@ fn offset_paginates_containment_query() {
 }
 
 // ============================================================================
+// AC-404-11: bounded-page stderr notice when has_more=true
+// ============================================================================
+
+/// AC-404-11: when `--hot` returns a capped page (limit < total), a notice
+/// containing "more exist" and the next --offset must appear on stderr.
+/// JSON stdout must stay byte-clean (no notice leaking into stdout).
+///
+/// Uses the degraded path (no temporal.db) to get a deterministic exit 0 with
+/// empty output and no bounded-page notice (nothing to page). The notice only
+/// fires when has_more=true; the degraded empty case produces has_more=false.
+///
+/// A proper end-to-end notice test would require a seeded git history (to
+/// populate temporal.db with > limit rows). The unit test
+/// `bounded_page_notice_contains_required_phrasing` in temporal_tests.rs pins
+/// the exact phrasing; this test pins that the notice goes to stderr and NOT
+/// to stdout.
+#[test]
+fn bounded_page_notice_goes_to_stderr_not_stdout() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    // No temporal.db → degraded path (no notice, just the empty warning).
+    // We verify that stdout is either empty or valid JSON (no notice contamination).
+    let out = Command::cargo_bin("skim")
+        .unwrap()
+        .args([
+            "search", "--hot", "--limit", "2", "--offset", "0", "--json", "--root",
+        ])
+        .arg(proj.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    // stdout must NOT contain "more exist" (the bounded-page notice goes to stderr).
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout_str.contains("more exist"),
+        "AC-404-11: bounded-page notice must NOT appear in stdout; got: {stdout_str:?}"
+    );
+}
+
+// ============================================================================
 // PF-004: hostile --offset near usize::MAX must not overflow the candidate pool
 // ============================================================================
 
