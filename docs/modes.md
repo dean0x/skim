@@ -8,7 +8,7 @@ Skim offers six transformation modes, each with different levels of aggressivene
 |------------|-----------------|------------------------------------------|-----------------------------|
 | Full       | 0%              | Everything (original source)             | Nothing                     |
 | Minimal    | 15-30%          | All code, doc comments                   | Non-doc comments            |
-| Pseudo     | 30-50%          | Logic flow, names, values, visibility, return types | Parameter type annotations, generics, decorators, semicolons |
+| Pseudo     | 30-50%          | Logic flow, names, values, visibility, return types | Parameter type annotations (Python, TypeScript), generics (except inside preserved return types), decorators, semicolons |
 | Structure  | 70-80%          | Signatures, types, classes, imports      | Function bodies             |
 | Signatures | 85-92%          | Only callable signatures                 | Everything else             |
 | Types      | 90-95%          | Only type definitions                    | All code                    |
@@ -271,8 +271,8 @@ Pseudo mode strips syntactic noise (type annotations, decorators, semicolons) wh
 
 ### What's Removed
 
-- Parameter type annotations (`: number`, `: int`, `: str`) — return types are preserved (see above)
-- Type parameters and generics (`<T>`, `<'a>`)
+- Parameter type annotations (`: number`, `: int`, `: str`) — Python and TypeScript only; Rust preserves parameter types (see per-language table below). Return types are preserved in all languages (see above)
+- Type parameters and generics (`<T>`, `<'a>`) — except inside preserved return types (e.g., `-> Result<T, E>`, `): Promise<User>`)
 - Non-visibility keyword modifiers (`static`, `final`, `abstract`, Kotlin `open`)
 - Decorators and attributes (`@Override`, `#[derive(Debug)]`)
 - Statement-terminating semicolons (preserves for-loop semicolons)
