@@ -625,7 +625,7 @@ fn standalone_hot_json_valid() {
     .unwrap()
     .0;
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_json(&output, &mut buf).unwrap();
+    format_temporal_json(&output, false, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     let v: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
     assert_eq!(v["mode"], "hot");
@@ -1396,6 +1396,7 @@ fn format_text_output_includes_both_hotspot_and_risk_tags() {
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
+        has_more: false,
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -1450,7 +1451,7 @@ fn standalone_risky_json_valid() {
     .unwrap()
     .0;
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_json(&output, &mut buf).unwrap();
+    format_temporal_json(&output, false, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     let v: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
 
@@ -1506,7 +1507,7 @@ fn standalone_blast_radius_json_valid() {
     .unwrap()
     .0;
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_json(&output, &mut buf).unwrap();
+    format_temporal_json(&output, false, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     let v: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
 
@@ -1555,7 +1556,7 @@ fn standalone_cold_json_valid() {
     .unwrap()
     .0;
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_json(&output, &mut buf).unwrap();
+    format_temporal_json(&output, false, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     let v: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
 
