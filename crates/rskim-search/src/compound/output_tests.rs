@@ -425,6 +425,74 @@ fn format_json_mode_is_always_ast() {
 }
 
 // ============================================================================
+// AC-405-10: excluded_count appended to empty-result messages when non-zero
+// ============================================================================
+
+#[test]
+fn format_text_excluded_count_appended_to_no_match_when_offset_zero() {
+    // AC-405-10: offset=0, excluded_count=3 → "no files match" message must
+    // include the "(N file(s) excluded from AST indexing by size cap ...)" suffix.
+    let mut buf: Vec<u8> = Vec::new();
+    format_ast_text(&[], "try-catch", "Try/catch blocks", 0, 3, &mut buf).unwrap();
+    let out = String::from_utf8(buf).unwrap();
+
+    assert!(
+        out.contains("no files match"),
+        "AC-405-10: must still say 'no files match'; got: {out}"
+    );
+    assert!(
+        out.contains("3 file(s) excluded from AST indexing by size cap"),
+        "AC-405-10: must append excluded-count clause; got: {out}"
+    );
+    assert!(
+        out.contains("skim search --stats --json"),
+        "AC-405-10: must include the stats hint; got: {out}"
+    );
+    // When excluded_count is zero the suffix must be absent (regression guard).
+    let mut buf2: Vec<u8> = Vec::new();
+    format_ast_text(&[], "try-catch", "Try/catch blocks", 0, 0, &mut buf2).unwrap();
+    let out2 = String::from_utf8(buf2).unwrap();
+    assert!(
+        !out2.contains("excluded from AST indexing"),
+        "excluded-count clause must be absent when excluded_count=0; got: {out2}"
+    );
+}
+
+#[test]
+fn format_text_excluded_count_appended_to_no_more_when_offset_nonzero() {
+    // AC-405-10: offset>0, excluded_count=7 → "No more files match … beyond offset N"
+    // message must include the "(M file(s) excluded …)" suffix.
+    let mut buf: Vec<u8> = Vec::new();
+    format_ast_text(&[], "nested-loop", "Nested loops", 10, 7, &mut buf).unwrap();
+    let out = String::from_utf8(buf).unwrap();
+
+    assert!(
+        out.contains("No more files match"),
+        "AC-405-10: must say 'No more files match'; got: {out}"
+    );
+    assert!(
+        out.contains("beyond offset 10"),
+        "AC-405-10: must include the offset value; got: {out}"
+    );
+    assert!(
+        out.contains("7 file(s) excluded from AST indexing by size cap"),
+        "AC-405-10: must append excluded-count clause; got: {out}"
+    );
+    assert!(
+        out.contains("skim search --stats --json"),
+        "AC-405-10: must include the stats hint; got: {out}"
+    );
+    // When excluded_count is zero the suffix must be absent (regression guard).
+    let mut buf2: Vec<u8> = Vec::new();
+    format_ast_text(&[], "nested-loop", "Nested loops", 10, 0, &mut buf2).unwrap();
+    let out2 = String::from_utf8(buf2).unwrap();
+    assert!(
+        !out2.contains("excluded from AST indexing"),
+        "excluded-count clause must be absent when excluded_count=0; got: {out2}"
+    );
+}
+
+// ============================================================================
 // temporal field is absent when None (AC-API4 additive)
 // ============================================================================
 
