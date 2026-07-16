@@ -709,7 +709,8 @@ const AST_VERIFY_BYTES_PER_SLOT: u64 = 100 * 1024;
 ///
 /// Extracted as a testable helper so unit tests exercise the production formula
 /// instead of reimplementing the arithmetic inline (AD-405-11).
-pub(super) fn compute_verify_budget(window: usize) -> u64 {
+#[must_use]
+fn compute_verify_budget(window: usize) -> u64 {
     (window as u64).saturating_mul(AST_VERIFY_BYTES_PER_SLOT)
 }
 
@@ -718,7 +719,8 @@ pub(super) fn compute_verify_budget(window: usize) -> u64 {
 ///
 /// Mirrors the gate check in the verify loop verbatim so tests call the
 /// production predicate, not a hand-rolled copy (AD-405-11).
-pub(super) fn is_over_budget(bytes_verified: u64, file_size: u64, budget: u64) -> bool {
+#[must_use]
+fn is_over_budget(bytes_verified: u64, file_size: u64, budget: u64) -> bool {
     bytes_verified.saturating_add(file_size) > budget
 }
 
