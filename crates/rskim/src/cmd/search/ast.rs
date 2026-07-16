@@ -435,6 +435,30 @@ pub(super) fn run_ast_standalone(
     // Replaces the unsound `results.len() < limit` heuristic.
     let has_more = pre_page_len > page.depth() || pool_was_capped;
 
+    // AD-404-11: bounded-page notice on the compound --ast+temporal path.
+    //
+    // Fires when: (a) the current page is non-empty (silences the exhausted-page
+    // case where resolved is empty after offset drain), (b) temporal enrichment
+    // is active, and (c) the pre-page verified set exceeds the temporal ranking
+    // window — meaning the re-sort operated on more candidates than the bounded
+    // window can confidently rank, so results near the boundary may not be in
+    // the most accurate temporal order.
+    //
+    // predicate: `pre_page_len > temporal_window` (not `pool_was_capped`) because
+    // the temporal window is the relevant ceiling here: the AST candidate pool
+    // (ast_pool) can be wider than temporal_window when offset is large, so
+    // pool_was_capped misses the temporal-boundary case.  The exhausted check
+    // (`!resolved.is_empty()`) ensures no false notice on the page-past-end path.
+    //
+    // Mirrors run_temporal_standalone (mod.rs:1212-1217).  Goes to stderr
+    // (PF-006 / AD-404-8) so --json stdout stays byte-identical.
+    if !resolved.is_empty() && temporal_active && pre_page_len > temporal_window {
+        eprintln!(
+            "{}",
+            super::temporal::bounded_page_notice(resolved.len(), page.offset(), page.limit())
+        );
+    }
+
     // AD-397-4: Real-node patterns: line/snippet already set from the
     // find_first_strict_match anchor (gate + anchor in one pass, cached in the
     // pool entry through temporal sort/truncation). No post-truncation re-parse

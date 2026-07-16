@@ -1125,6 +1125,13 @@ fn run_query(
     if let Some(sort) = flags.temporal_sort {
         if let Some(ref db) = temporal_db {
             temporal::apply_temporal_enrichment(&mut output.results, sort, db)?;
+        } else {
+            // AD-404-6 degraded path: no temporal.db present (non-git repo or
+            // heatmap not yet built).  Emit the advisory message that mirrors
+            // run_temporal_standalone (mod.rs:1198) — single source of truth via
+            // NO_TEMPORAL_DATA_MSG.  Goes to stderr so --json stdout stays
+            // byte-identical (PF-006 / AD-404-8).
+            eprintln!("skim search: {NO_TEMPORAL_DATA_MSG}");
         }
         // Pagination applied regardless of DB presence (AD-404-10 guard drift fix).
         let page = types::Page::new(flags.limit, flags.offset);
