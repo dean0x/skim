@@ -2794,3 +2794,113 @@ fn test_match_positions_absent_from_json_output_ac4() {
         "AC6: line_range.end must be 3 (single-anchor-line)"
     );
 }
+
+// ============================================================================
+// D-5 / AD-404-11: has_more on pure-lexical text path
+// ============================================================================
+
+/// Create a project where N files each contain a unique function that also
+/// uses the shared token "qxz_shared_probe" so that a query for that token
+/// matches all N files.
+fn create_multi_match_project(root: &std::path::Path, n: usize) {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    for i in 1..=n {
+        fs::write(
+            src.join(format!("f{i:02}.rs")),
+            format!("/// File {i}.\npub fn qxz_shared_probe_{i}() -> u32 {{ {i} }}\n"),
+        )
+        .unwrap();
+    }
+}
+
+/// D-5 / AD-404-11: `has_more` must be `true` on the pure-lexical text path
+/// when verified results exceed the page (limit < total matches).
+///
+/// Pre-fix: `has_more` was hardcoded `false` at all `QueryOutput` construction
+/// sites in `query.rs`, so callers could not distinguish "last page" from "more
+/// pages exist" on the text-query surface (D-5 contract unfulfilled).
+///
+/// Post-fix: `resolve_paths_and_snippets_verified` uses "probe one more" to
+/// set `has_more = true` when verified results > limit + offset.
+#[test]
+fn test_has_more_true_on_pure_lexical_text_path_when_limit_less_than_total() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // 3 files each containing "qxz_shared_probe"; limit=1 → has_more must be true.
+    create_multi_match_project(&root, 3);
+
+    let config = QueryConfig {
+        text: "qxz_shared_probe".to_string(),
+        limit: 1,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // Exactly 1 result returned (limit honored).
+    assert_eq!(
+        output.results.len(),
+        1,
+        "D-5: limit=1 must return exactly 1 result; got {}",
+        output.results.len()
+    );
+
+    // D-5: has_more must be true because 3 files match but only 1 is on this page.
+    assert!(
+        output.has_more,
+        "D-5 (pure-lexical text path): has_more must be true when limit=1 \
+         and multiple files match; got has_more=false. Pre-fix regression — \
+         has_more was hardcoded false at the QueryOutput construction site."
+    );
+}
+
+/// D-5 / AD-404-11: `has_more` must be `false` when all verified results fit
+/// on one page (last-page / single-page invariant).
+///
+/// Paired with `test_has_more_true_on_pure_lexical_text_path_when_limit_less_than_total`
+/// to guard both directions of the D-5 contract.
+#[test]
+fn test_has_more_false_when_all_results_fit_on_page() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // 2 files; limit=100 → all results fit on one page → has_more must be false.
+    create_multi_match_project(&root, 2);
+
+    let config = QueryConfig {
+        text: "qxz_shared_probe".to_string(),
+        limit: 100,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !output.has_more,
+        "D-5: has_more must be false when all results fit on one page; \
+         got has_more=true with {} results and limit=100",
+        output.results.len()
+    );
+}

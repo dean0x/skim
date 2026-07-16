@@ -1156,6 +1156,18 @@ fn run_query(
         }
     }
 
+    // AD-404-11 / D-5: emit bounded-page notice on the pure-text path (no temporal
+    // sort) when has_more=true — mirrors the temporal arm above so the stderr
+    // contract is consistent across all text-query dispatch shapes.
+    // Goes to stderr so --json stdout stays byte-identical (PF-006 / AD-404-8).
+    if output.has_more && flags.temporal_sort.is_none() {
+        let page = types::Page::new(flags.limit, flags.offset);
+        eprintln!(
+            "{}",
+            temporal::bounded_page_notice(output.total, page.offset(), page.limit())
+        );
+    }
+
     let mut stdout = BufWriter::new(std::io::stdout());
     if flags.json {
         query::format_json_output(&output, &mut stdout)?;

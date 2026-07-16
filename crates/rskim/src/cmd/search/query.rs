@@ -448,7 +448,7 @@ pub(super) fn execute_query_with_manifest(
     // trigram-containment false positives at the CLI gate (the reader is recall-
     // oriented, not the correctness authority — AD-393-1).
     let effective_offset = config.offset.unwrap_or(0);
-    let results = resolve_paths_and_snippets_verified(
+    let (results, has_more) = resolve_paths_and_snippets_verified(
         &raw_results,
         &sorted,
         root,
@@ -471,7 +471,7 @@ pub(super) fn execute_query_with_manifest(
         results,
         duration_ms,
         index_stats: Some(stats),
-        has_more: false,
+        has_more,
     })
 }
 
@@ -651,7 +651,7 @@ fn run_compound_query(
     // AD-393-7: same VerifyMode as the pure-lexical path so that phrase/near
     // correctness carries through the compound text+--ast dispatch.
     let effective_offset = config.offset.unwrap_or(0);
-    let results = resolve_paths_and_snippets_verified(
+    let (results, has_more) = resolve_paths_and_snippets_verified(
         &recomposed,
         ctx.sorted,
         ctx.root,
@@ -672,7 +672,7 @@ fn run_compound_query(
         results,
         duration_ms,
         index_stats: Some(ctx.stats),
-        has_more: false,
+        has_more,
     })
 }
 
@@ -815,7 +815,9 @@ fn run_blast_radius_composite_query(
     // Applied post-verify (`.skip` before `.take`), consistent with the pure-lexical
     // and compound paths.
     let effective_offset = config.offset.unwrap_or(0);
-    let results: Vec<super::types::ResolvedResult> = ranked
+    // AD-404-11 / D-5: collect limit+1 results to detect has_more without a second
+    // pass; truncated to config.limit below after the has_more check.
+    let mut results: Vec<super::types::ResolvedResult> = ranked
         .iter()
         .filter_map(|&(fid, composite_score)| {
             let path = ctx.sorted.get(fid.0 as usize)?;
@@ -902,9 +904,13 @@ fn run_blast_radius_composite_query(
         })
         // AD-355-2 / AD-372-3: apply offset then truncate LAST — after verification
         // removes non-matching candidates (consistent with pure-lexical path).
+        // Probe one extra (config.limit + 1) to detect has_more without a second
+        // pass; truncated to config.limit below (AD-404-11).
         .skip(effective_offset)
-        .take(config.limit)
+        .take(config.limit.saturating_add(1))
         .collect();
+    let has_more = results.len() > config.limit;
+    results.truncate(config.limit);
 
     let total = results.len();
     let duration_ms = ctx.start.elapsed().as_millis() as u64;
@@ -914,7 +920,7 @@ fn run_blast_radius_composite_query(
         results,
         duration_ms,
         index_stats: Some(ctx.stats),
-        has_more: false,
+        has_more,
     })
 }
 
@@ -999,7 +1005,7 @@ fn resolve_paths_and_snippets_verified(
     root: &Path,
     manifest: &FileManifest,
     params: SnippetVerifyParams<'_>,
-) -> Vec<ResolvedResult> {
+) -> (Vec<ResolvedResult>, bool) {
     let SnippetVerifyParams {
         query,
         layers_matched,
@@ -1007,7 +1013,11 @@ fn resolve_paths_and_snippets_verified(
         offset,
         verify_mode,
     } = params;
-    raw_results
+    // AD-404-11 / D-5: probe one extra result beyond the page boundary so we can
+    // report `has_more` without a full second pass over the verified set.
+    // `.take(limit + 1)` reads at most one file past the page; if the probe item
+    // exists, `has_more = true` and we truncate back to `limit`.
+    let mut probe: Vec<ResolvedResult> = raw_results
         .iter()
         .filter_map(|r| {
             let path = sorted_paths.get(r.file_id.0 as usize)?;
@@ -1049,9 +1059,14 @@ fn resolve_paths_and_snippets_verified(
         })
         // AD-355-2 / AD-372-3: apply offset then truncate LAST — after verification
         // removes non-matching candidates.
+        // Probe one extra (limit.saturating_add(1)) to detect has_more without a
+        // second pass; truncated to `limit` below (AD-404-11).
         .skip(offset)
-        .take(limit)
-        .collect()
+        .take(limit.saturating_add(1))
+        .collect();
+    let has_more = probe.len() > limit;
+    probe.truncate(limit);
+    (probe, has_more)
 }
 
 // ============================================================================

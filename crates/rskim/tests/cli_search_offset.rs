@@ -583,3 +583,111 @@ fn hostile_max_offset_does_not_overflow() {
         "paging past usize::MAX must yield an empty page, got: {v}"
     );
 }
+
+// ============================================================================
+// D-5 / AD-404-11: has_more on the pure-text query path
+// ============================================================================
+
+/// Create N Rust files that each contain the sentinel token "qxz_shared_probe"
+/// so a text query for it returns all N files.
+fn make_multi_match_project(root: &std::path::Path, n: usize) {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    for i in 1..=n {
+        fs::write(
+            src.join(format!("m{i:02}.rs")),
+            format!("pub fn qxz_shared_probe_{i}() -> u32 {{ {i} }}\n"),
+        )
+        .unwrap();
+    }
+}
+
+/// D-5 / AD-404-11: `has_more` must be `true` on a plain text query when the
+/// result set is larger than the page.
+///
+/// Pre-fix: `QueryOutput.has_more` was hardcoded `false` at all construction
+/// sites in `query.rs`, so the D-5 pagination-terminator contract was never
+/// fulfilled on the "skim search <text> --json" surface (while `--ast`,
+/// `--hot`, `--cold`, `--risky`, and `--blast-radius` standalone paths
+/// already emitted it correctly).
+///
+/// Post-fix: `resolve_paths_and_snippets_verified` uses a "probe one more"
+/// strategy — collect `limit + 1` results after skip, set `has_more = true`
+/// when the probe item exists, then truncate to `limit`.
+#[test]
+fn has_more_true_on_text_query_when_results_exceed_limit() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    // 6 files each containing "qxz_shared_probe"; limit=2 → 4 remain → has_more=true.
+    make_multi_match_project(proj.path(), 6);
+    build_index(proj.path(), cache.path());
+
+    let out = Command::cargo_bin("skim")
+        .unwrap()
+        .args([
+            "search",
+            "qxz_shared_probe",
+            "--limit",
+            "2",
+            "--json",
+            "--root",
+        ])
+        .arg(proj.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let v: serde_json::Value = serde_json::from_slice(&out).expect("text-query JSON must be valid");
+    assert_eq!(
+        v["has_more"].as_bool(),
+        Some(true),
+        "D-5: has_more must be true on text path when limit=2 < total results (6 files); \
+         pre-fix regression — has_more was hardcoded false. Got: {:?}",
+        v
+    );
+}
+
+/// D-5: `has_more` must be absent (false) on the last page of a text query.
+///
+/// Guards the "single-page / last-page" direction of the D-5 contract:
+/// when all matches fit on one page, `has_more` must NOT be present
+/// (serialized as absent because `#[serde(skip_serializing_if = "Not::not")]`).
+#[test]
+fn has_more_absent_on_text_query_when_all_results_fit_on_page() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    // 3 files; limit=100 → all fit on one page → has_more must be absent.
+    make_multi_match_project(proj.path(), 3);
+    build_index(proj.path(), cache.path());
+
+    let out = Command::cargo_bin("skim")
+        .unwrap()
+        .args([
+            "search",
+            "qxz_shared_probe",
+            "--limit",
+            "100",
+            "--json",
+            "--root",
+        ])
+        .arg(proj.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let v: serde_json::Value =
+        serde_json::from_slice(&out).expect("single-page JSON must be valid");
+    assert!(
+        v.get("has_more").is_none(),
+        "D-5: has_more must be ABSENT when all results fit on one page; got: {:?}",
+        v.get("has_more")
+    );
+}
