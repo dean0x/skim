@@ -1331,11 +1331,12 @@ Positional query options:
                    Example: \"alpha beta gamma\" --phrase --near 4 matches if alpha,
                    beta, and gamma appear in that order within 4 word-token positions.
 
-  --lang LANG      Filter results to files of a given language (e.g. --lang rust,
-                   --lang python). Accepted as language name or extension.
-
   --phrase and --near are honored on any text query including text + --ast and
   text + --blast-radius. They are inert on all other arms (no text query).
+
+Language filter option:
+  --lang LANG      Filter results to files of a given language (e.g. --lang rust,
+                   --lang python). Accepted as language name or extension.
 
 AST structural query options (#199):
   --ast PATTERN    Filter/list by AST structural pattern.
