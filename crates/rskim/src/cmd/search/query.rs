@@ -433,7 +433,16 @@ pub(super) fn execute_query_with_manifest(
     let manifest = match pre_loaded_manifest {
         Some(m) => m,
         None => {
-            let (_refreshed, m) = auto_refresh_if_stale(root, cache_dir, analytics)?;
+            let (refreshed, m) = auto_refresh_if_stale(root, cache_dir, analytics)?;
+            // AC-405-7: emit AST coverage notice when a first-time (NoIndex) or
+            // stale-index build fires on the pure-lexical query path (D-4 cadence).
+            // All build surfaces emit this notice; the pure-lexical path is the only
+            // one that calls auto_refresh_if_stale via this inner branch, so we gate
+            // on `refreshed` here rather than adding a second eprintln! inside
+            // auto_refresh_if_stale (which would double-emit on --update).
+            if refreshed && let Some(notice) = ast_coverage_notice(&m.ast_coverage()) {
+                eprintln!("{notice}");
+            }
             m
         }
     };

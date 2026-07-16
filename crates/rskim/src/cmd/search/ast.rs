@@ -420,8 +420,8 @@ pub(super) fn run_ast_standalone(
     if budget_omitted > 0 {
         eprintln!(
             "skim search: AST verify: byte budget exhausted ({budget_omitted} of \
-             {total_candidates} candidates unverified; budget = {window} slots × {} KiB); \
-             use SKIM_PASSTHROUGH=1 or rebuild with `skim search --rebuild`.",
+             {total_candidates} candidates unverified; budget = {window} slots x {} KiB); \
+             Narrow the query or lower --limit.",
             AST_VERIFY_BYTES_PER_SLOT / 1024,
         );
     }
@@ -602,13 +602,19 @@ fn write_ast_page_output(
     if json {
         // AD-404-11 / D-5: has_more lets agents detect the last page without
         // relying on the unsound `len < limit` heuristic.
-        // AD-405-3: ast_coverage key carries one shape on all three surfaces.
+        // AD-405-3 / AC-405-9: ast_coverage key omitted when clean (is_clean()),
+        // present only when excluded or undetermined files exist — identical guard
+        // on all three surfaces (standalone --ast, compound --ast, --stats --json).
         format_ast_json(
             resolved,
             display_name,
             description,
             has_more,
-            Some(coverage),
+            if coverage.is_clean() {
+                None
+            } else {
+                Some(coverage)
+            },
             w,
         )?;
     } else {

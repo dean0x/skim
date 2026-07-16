@@ -926,24 +926,28 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
             }
         }
 
-        // AD-405-7 / AC-405-17: AST size-coverage section (D-4 cadence).
+        // AD-405-7 / AC-405-9 / AC-405-15: AST size-coverage section (D-4 cadence).
+        // Omit when clean (is_clean() == true) — byte-identical to the pre-fix binary
+        // on a corpus with zero excluded / zero undetermined files (AC-405-15).
         // Loaded manifest is already in memory from check_staleness — zero extra I/O.
         if let Some(ref m) = loaded_manifest {
             let coverage = m.ast_coverage();
-            writeln!(out, "  ast eligible  : {}", coverage.size_eligible_files)?;
-            if coverage.size_excluded_files > 0 {
-                writeln!(
-                    out,
-                    "  ast excluded  : {} (exceed 1 MiB cap)",
-                    coverage.size_excluded_files
-                )?;
-                // PF-012: excluded_by_lang is a BTreeMap — already sorted.
-                for (lang, count) in &coverage.excluded_by_lang {
-                    writeln!(out, "    {lang}: {count}")?;
+            if !coverage.is_clean() {
+                writeln!(out, "  ast eligible  : {}", coverage.size_eligible_files)?;
+                if coverage.size_excluded_files > 0 {
+                    writeln!(
+                        out,
+                        "  ast excluded  : {} (exceed 1 MiB cap)",
+                        coverage.size_excluded_files
+                    )?;
+                    // PF-012: excluded_by_lang is a BTreeMap — already sorted.
+                    for (lang, count) in &coverage.excluded_by_lang {
+                        writeln!(out, "    {lang}: {count}")?;
+                    }
                 }
-            }
-            if coverage.undetermined_files > 0 {
-                writeln!(out, "  ast undetermined: {}", coverage.undetermined_files)?;
+                if coverage.undetermined_files > 0 {
+                    writeln!(out, "  ast undetermined: {}", coverage.undetermined_files)?;
+                }
             }
         }
     }
@@ -1546,18 +1550,21 @@ pub(super) fn build_stats_json(
     // A repo with 50 unsupported files + 1 minified bundle therefore shows
     // `"skipped": [<minified entry>]` here vs. "51 skipped" at build time.
     //
-    // AD-405-9 / AC-405-11 / D-5: `ast_coverage` is an additive key (never
-    // replaces existing keys).  Absent when no manifest is loaded (None → JSON
-    // null); always present and typed when the manifest is available, regardless
-    // of is_clean().  Unlike QueryOutput which omits the key when clean, --stats
-    // always shows the full coverage so operators can audit coverage on healthy
-    // repos.  No-index early-return at line 1444 keeps the error object as-is.
-    let ast_coverage_val = loaded_manifest
+    // AD-405-9 / AC-405-9 / AC-405-15: `ast_coverage` is additive (never replaces
+    // existing keys) and OMITTED when clean (is_clean() == true), matching the
+    // same guard used on the standalone --ast and compound --ast surfaces.
+    // Absent when no manifest is loaded OR when all files are within cap.
+    // No-index early-return above keeps the error object as-is.
+    let ast_coverage_val: Option<serde_json::Value> = loaded_manifest
         .as_ref()
-        .map(|m| serde_json::to_value(m.ast_coverage()))
+        .and_then(|m| {
+            let cov = m.ast_coverage();
+            if cov.is_clean() { None } else { Some(cov) }
+        })
+        .map(serde_json::to_value)
         .transpose()
         .map_err(|e| anyhow::anyhow!("ast_coverage serialization error: {e}"))?;
-    Ok(serde_json::json!({
+    let mut result = serde_json::json!({
         "file_count": stats.file_count,
         "total_ngrams": stats.total_ngrams,
         "index_size_bytes": stats.index_size_bytes,
@@ -1569,8 +1576,12 @@ pub(super) fn build_stats_json(
         "cache_dir": cache_dir.display().to_string(),
         "skipped": skipped_arr,
         "skipped_by_reason": skipped_by_reason,
-        "ast_coverage": ast_coverage_val,
-    }))
+    });
+    // Insert ast_coverage only when non-clean (omit-when-clean AC-405-9/15).
+    if let Some(val) = ast_coverage_val {
+        result["ast_coverage"] = val;
+    }
+    Ok(result)
 }
 
 // ============================================================================
