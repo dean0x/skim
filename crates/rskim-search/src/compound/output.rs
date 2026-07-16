@@ -37,6 +37,8 @@ use std::io::{self, Write};
 
 use serde::Serialize;
 
+use crate::AstCoverage;
+
 // ============================================================================
 // TemporalAnnotation (defined here so #202 populates, never re-declares it)
 // ============================================================================
@@ -169,7 +171,7 @@ impl AstResult {
 
 /// JSON envelope for a compound AST query result (AC-F4, AC-API1).
 ///
-/// Shape:
+/// Shape (clean corpus — `ast_coverage` absent when all counts are zero):
 /// ```json
 /// {
 ///   "mode": "ast",
@@ -180,12 +182,24 @@ impl AstResult {
 ///   "results": [
 ///     { "path": "src/foo.rs", "score": 2.45, "line": 42,
 ///       "snippet": "  fn foo() {", "layers_matched": ["ast"] }
-///   ]
+///   ],
+///   "ast_coverage": {
+///     "size_eligible_files": 676,
+///     "size_excluded_files": 1,
+///     "undetermined_files": 0,
+///     "excluded_by_lang": { "rust": 1 },
+///     "excluded": [
+///       { "path": "crates/rskim-search/src/weights.rs", "lang": "rust",
+///         "size_bytes": 2700349, "limit_bytes": 1048576,
+///         "reason": "ast_size_cap" }
+///     ]
+///   }
 /// }
 /// ```
 ///
 /// Degraded rows omit `line` and `snippet` keys entirely (never `null`/`0`).
 /// `has_more` is absent when `false` (additive, back-compat; AD-404-11).
+/// `ast_coverage` is absent when all counts are zero (D-5 / AD-405-9).
 #[derive(Serialize)]
 struct AstJsonEnvelope<'a> {
     mode: &'static str,
@@ -200,6 +214,14 @@ struct AstJsonEnvelope<'a> {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     has_more: bool,
     results: &'a [AstResult],
+    /// AST size-coverage summary (D-5 / AD-405-9).
+    ///
+    /// Absent when all counts are zero (`is_clean()` == true) — never `null`,
+    /// never present-with-empty-arrays.  Same shape as `--stats --json` and
+    /// pure-text `--ast` [`crate::QueryOutput`] (one Serialize struct, three
+    /// surfaces — AD-405-3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ast_coverage: Option<AstCoverage>,
 }
 
 // ============================================================================
@@ -223,6 +245,14 @@ struct AstJsonEnvelope<'a> {
 /// Empty result at `offset > 0` → page-exhausted message (AC-404-10): the
 /// caller has paged past all results, so the message distinguishes "no data"
 /// from "paged too far".
+/// When `excluded_count > 0`, the empty-result message appends the count
+/// so agents know the pattern matched zero INDEXED files but N files were
+/// excluded from AST indexing by the size cap (AC-405-10).
+///
+/// **Do NOT add an `Option<AstCoverage>` param here**: the JSON coverage key
+/// is in `format_ast_json`'s envelope only; the text notice goes to stderr
+/// at the call site (C3 / AD-405-4).  Only the scalar `excluded_count` is
+/// needed to compose the empty-result message.
 ///
 /// Mirrors `format_temporal_text` (in `rskim`) which takes a `Page` for the
 /// same page-aware empty-message split; here `offset: usize` carries the one
@@ -237,6 +267,7 @@ pub fn format_ast_text(
     pattern_name: &str,
     description: &str,
     offset: usize,
+    excluded_count: u64,
     w: &mut impl Write,
 ) -> io::Result<()> {
     if description.is_empty() {
@@ -249,13 +280,33 @@ pub fn format_ast_text(
     if results.is_empty() {
         if offset > 0 {
             // AC-404-8 / AC-404-10: page-aware empty — "paged past all matches".
-            writeln!(
-                w,
-                "No more files match pattern {pattern_name:?} beyond offset {offset} \
-                 (try a smaller --offset)."
-            )?;
+            // AC-405-10: append excluded count when non-zero.
+            if excluded_count > 0 {
+                writeln!(
+                    w,
+                    "No more files match pattern {pattern_name:?} beyond offset {offset} \
+                     (try a smaller --offset). ({excluded_count} file(s) excluded from \
+                     AST indexing by size cap — run `skim search --stats --json`.)"
+                )?;
+            } else {
+                writeln!(
+                    w,
+                    "No more files match pattern {pattern_name:?} beyond offset {offset} \
+                     (try a smaller --offset)."
+                )?;
+            }
         } else {
-            writeln!(w, "no files match pattern {:?}", pattern_name)?;
+            // AC-405-10: append excluded count when non-zero.
+            if excluded_count > 0 {
+                writeln!(
+                    w,
+                    "no files match pattern {:?} ({excluded_count} file(s) excluded from \
+                     AST indexing by size cap — run `skim search --stats --json`.)",
+                    pattern_name
+                )?;
+            } else {
+                writeln!(w, "no files match pattern {:?}", pattern_name)?;
+            }
         }
         return Ok(());
     }
@@ -299,6 +350,11 @@ pub fn format_ast_text(
 /// The field is ABSENT from the JSON when false (additive, back-compat).
 /// Replaces the unsound `results.len() < limit` heuristic (D-5 / AD-404-11).
 ///
+/// `ast_coverage`: when `Some`, the JSON envelope includes the `ast_coverage`
+/// key with counts and a bounded excluded-file sample (AD-405-9 / D-5).
+/// Pass `None` on a clean corpus (no excluded or undetermined files) to omit
+/// the key entirely — never serialize an empty struct as `null` (AC-405-9).
+///
 /// # Errors
 ///
 /// Returns `Err` on I/O write failures or JSON serialisation errors.
@@ -307,6 +363,7 @@ pub fn format_ast_json(
     pattern_name: &str,
     description: &str,
     has_more: bool,
+    ast_coverage: Option<AstCoverage>,
     w: &mut impl Write,
 ) -> io::Result<()> {
     let envelope = AstJsonEnvelope {
@@ -316,6 +373,7 @@ pub fn format_ast_json(
         total: results.len(),
         has_more,
         results,
+        ast_coverage,
     };
     let json = serde_json::to_string_pretty(&envelope)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;

@@ -31,7 +31,7 @@ fn make_result_no_line(path: &str, score: f64) -> AstResult {
 #[test]
 fn format_text_empty_slice_writes_no_match_line() {
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_text(&[], "try-catch", "Try/catch blocks", 0, &mut buf).unwrap();
+    format_ast_text(&[], "try-catch", "Try/catch blocks", 0, 0, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     assert!(
         out.contains("no files match"),
@@ -46,7 +46,7 @@ fn format_text_empty_slice_writes_no_match_line() {
 #[test]
 fn format_json_empty_slice_writes_valid_json_total_zero() {
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_json(&[], "try-catch", "Try/catch blocks", false, &mut buf).unwrap();
+    format_ast_json(&[], "try-catch", "Try/catch blocks", false, None, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).expect("must be valid JSON");
     assert_eq!(v["mode"], "ast", "mode must be 'ast'");
@@ -61,14 +61,14 @@ fn format_json_empty_slice_writes_valid_json_total_zero() {
 fn format_text_returns_ok_for_empty_and_populated_slices() {
     // AC-API1: formatter returns Ok(()) for any well-formed input.
     let mut buf: Vec<u8> = Vec::new();
-    let r = format_ast_text(&[], "x", "", 0, &mut buf);
+    let r = format_ast_text(&[], "x", "", 0, 0, &mut buf);
     assert!(r.is_ok(), "empty slice must return Ok");
 
     // Populated (line-recovered) row must actually render its content, not just
     // return Ok: path:line suffix, the 3-decimal score, and the snippet line.
     let results = vec![make_result_with_line("src/foo.rs", 2.5, 10, "  fn foo() {")];
     let mut buf2: Vec<u8> = Vec::new();
-    format_ast_text(&results, "x", "", 0, &mut buf2).expect("populated slice must return Ok");
+    format_ast_text(&results, "x", "", 0, 0, &mut buf2).expect("populated slice must return Ok");
     let out = String::from_utf8(buf2).unwrap();
     assert!(
         out.contains("src/foo.rs:10"),
@@ -87,13 +87,14 @@ fn format_text_returns_ok_for_empty_and_populated_slices() {
 #[test]
 fn format_json_returns_ok_for_empty_and_populated_slices() {
     let mut buf: Vec<u8> = Vec::new();
-    assert!(format_ast_json(&[], "x", "", false, &mut buf).is_ok());
+    assert!(format_ast_json(&[], "x", "", false, None, &mut buf).is_ok());
 
     // Populated (degraded, no-line) row must serialize the envelope + the row's
     // path/score, and OMIT line/snippet (the additive-key contract, AC-F4).
     let results = vec![make_result_no_line("src/bar.rs", 1.2)];
     let mut buf2: Vec<u8> = Vec::new();
-    format_ast_json(&results, "x", "", false, &mut buf2).expect("populated slice must return Ok");
+    format_ast_json(&results, "x", "", false, None, &mut buf2)
+        .expect("populated slice must return Ok");
     let out = String::from_utf8(buf2).unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).expect("must be valid JSON");
     assert_eq!(v["mode"], "ast", "mode must be 'ast'");
@@ -127,7 +128,7 @@ fn format_text_with_line_has_colon_suffix_and_snippet() {
         "  fn handle_auth() {",
     )];
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_text(&results, "try-catch", "Try/catch blocks", 0, &mut buf).unwrap();
+    format_ast_text(&results, "try-catch", "Try/catch blocks", 0, 0, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
 
     // Must contain path:line suffix (AC-F1 POSITIVE).
@@ -155,7 +156,7 @@ fn format_text_with_line_has_colon_suffix_and_snippet() {
 fn format_text_degraded_row_no_colon_line_suffix() {
     let results = vec![make_result_no_line("src/models/user.rs", 0.72)];
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_text(&results, "try-catch", "desc", 0, &mut buf).unwrap();
+    format_ast_text(&results, "try-catch", "desc", 0, 0, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
 
     // Must contain the path.
@@ -197,7 +198,7 @@ fn format_json_with_line_has_line_and_snippet_keys() {
         "  fn foo() {",
     )];
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_json(&results, "try-catch", "desc", false, &mut buf).unwrap();
+    format_ast_json(&results, "try-catch", "desc", false, None, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).expect("must be valid JSON");
 
@@ -219,7 +220,7 @@ fn format_json_degraded_row_line_and_snippet_keys_absent() {
     // AC-F4 NEGATIVE: degraded row → line and snippet keys ABSENT (not null, not 0).
     let results = vec![make_result_no_line("src/models/user.rs", 0.72)];
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_json(&results, "try-catch", "desc", false, &mut buf).unwrap();
+    format_ast_json(&results, "try-catch", "desc", false, None, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).expect("must be valid JSON");
 
@@ -280,7 +281,7 @@ fn format_json_layers_matched_is_present_on_every_row() {
         make_result_no_line("src/b.rs", 0.5),
     ];
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_json(&results, "try-catch", "", false, &mut buf).unwrap();
+    format_ast_json(&results, "try-catch", "", false, None, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
 
@@ -327,7 +328,7 @@ fn format_json_path_and_score_always_present() {
         make_result_no_line("src/b.rs", 1.2),
     ];
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_json(&results, "try-catch", "", false, &mut buf).unwrap();
+    format_ast_json(&results, "try-catch", "", false, None, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
 
@@ -351,7 +352,7 @@ fn format_json_path_and_score_always_present() {
 fn format_text_empty_offset_zero_says_no_match() {
     // offset=0: first page, pattern never matched anything.
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_text(&[], "try-catch", "Try/catch blocks", 0, &mut buf).unwrap();
+    format_ast_text(&[], "try-catch", "Try/catch blocks", 0, 0, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     assert!(
         out.contains("no files match"),
@@ -367,7 +368,7 @@ fn format_text_empty_offset_zero_says_no_match() {
 fn format_text_empty_offset_nonzero_says_no_more_results() {
     // offset>0: paged past all results — distinct from "pattern never matched".
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_text(&[], "try-catch", "Try/catch blocks", 5, &mut buf).unwrap();
+    format_ast_text(&[], "try-catch", "Try/catch blocks", 5, 0, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     assert!(
         out.contains("No more files match"),
@@ -395,7 +396,7 @@ fn format_text_empty_offset_nonzero_says_no_more_results() {
 #[test]
 fn format_text_header_contains_pattern_name() {
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_text(&[], "nested-loop", "Nested loop", 0, &mut buf).unwrap();
+    format_ast_text(&[], "nested-loop", "Nested loop", 0, 0, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     assert!(
         out.contains("AST pattern: nested-loop"),
@@ -406,7 +407,7 @@ fn format_text_header_contains_pattern_name() {
 #[test]
 fn format_text_header_without_description_has_no_em_dash() {
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_text(&[], "containment-query", "", 0, &mut buf).unwrap();
+    format_ast_text(&[], "containment-query", "", 0, 0, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     // When description is empty, no em dash should appear.
     assert!(
@@ -418,7 +419,7 @@ fn format_text_header_without_description_has_no_em_dash() {
 #[test]
 fn format_json_mode_is_always_ast() {
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_json(&[], "whatever", "", false, &mut buf).unwrap();
+    format_ast_json(&[], "whatever", "", false, None, &mut buf).unwrap();
     let v: serde_json::Value = serde_json::from_str(&String::from_utf8(buf).unwrap()).unwrap();
     assert_eq!(v["mode"], "ast");
 }
@@ -431,7 +432,7 @@ fn format_json_mode_is_always_ast() {
 fn format_json_temporal_absent_when_none() {
     let results = vec![make_result_no_line("src/foo.rs", 1.0)];
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_json(&results, "x", "", false, &mut buf).unwrap();
+    format_ast_json(&results, "x", "", false, None, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     let first = &v["results"][0];

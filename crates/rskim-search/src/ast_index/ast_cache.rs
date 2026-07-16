@@ -13,10 +13,11 @@
 //!   Header: 4-byte magic + 1-byte version + 4-byte entry count.
 //!   Each entry: 64-byte SHA key, 4-byte payload length, then payload bytes.
 //!   Payload: little-endian packed `(AstNgramSet, StructuralMetrics, u32)`.
-//! - **Version:** `CACHE_FORMAT_VERSION = 1`.  A version mismatch discards the
-//!   entire cache and cold-starts extraction.  Any change to the extraction
-//!   algorithm or AST weight tables MUST bump this constant so stale weights
-//!   are never reused from cache.  (applies ADR-003)
+//! - **Version:** `CACHE_FORMAT_VERSION = 2` (#405 bump from 1 — AD-405-14).
+//!   A version mismatch discards the entire cache and cold-starts extraction.
+//!   Any change to the extraction algorithm, AST weight tables, OR the AST size
+//!   cap MUST bump this constant so stale entries are never reused from cache.
+//!   (applies ADR-003)
 //! - **Self-pruning:** the cache is rebuilt from scratch each build — only the
 //!   current build's files are inserted, then written atomically.  Deleted or
 //!   renamed files naturally age out.
@@ -61,16 +62,31 @@ const CACHE_MAGIC: &[u8; 4] = b"SKAC";
 
 /// Current on-disk format version.
 ///
+/// ## AD-405-14: v1 -> v2 bump rationale
+///
+/// Without this bump the SHA-keyed skcache would SILENTLY re-serve stale empty
+/// AST entries for files that were over the old 100 KiB cap but are now eligible
+/// under the raised 1 MiB cap (rskim_core::ast_size_limit, #405).  Because the
+/// SHA of an unchanged file is identical across rebuilds, `decode_file` would
+/// accept the v1 entry and return the old empty `CachedAstEntry`, making the
+/// `AST_INDEX_FORMAT_VERSION` 2 -> 3 bump a silent no-op for those files.
+/// Bumping `CACHE_FORMAT_VERSION` to 2 causes `decode_file` to reject the v1
+/// magic and discard the entire skcache, so every file is re-extracted cold
+/// under the new cap on the first post-upgrade build.
+///
 /// **Bump this constant** whenever ANY of the following change:
 /// - `crates/rskim-search/src/ast_index/ast_weights.rs` (auto-generated IDF
 ///   weight tables) — stale IDF weights produce wrong n-gram scores in the index.
 /// - `extract_ast_ngrams_with_metrics` in `extract.rs` — changes to the
 ///   extraction algorithm would make cached n-grams diverge from fresh results.
 /// - The binary layout of `CachedAstEntry` itself.
+/// - The AST size cap (`rskim_core::ast_size_limit`) — a cap change makes
+///   previously-rejected files eligible; a stale skcache would serve their
+///   empty entries and the cap raise would be a silent no-op.
 ///
 /// A version mismatch at load time discards the entire cache cleanly so the
 /// first incremental build after any such change re-extracts everything. (applies ADR-003)
-pub const CACHE_FORMAT_VERSION: u8 = 1;
+pub const CACHE_FORMAT_VERSION: u8 = 2;
 
 /// Sidecar filename inside the cache directory.
 pub const CACHE_FILENAME: &str = "ast_index.skcache";

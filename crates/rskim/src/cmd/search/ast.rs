@@ -360,39 +360,71 @@ pub(super) fn run_ast_standalone(
     // AD-374-5: Non-tree-sitter files (JSON/TOML/YAML) return None/false and
     // are dropped here. AD-374-4: dropping is a relevance filter, not a #317
     // output cap; no `output::elision_marker` is required.
-    let verified_pool: Vec<VerifiedEntry> = pooled
-        .into_iter()
-        .filter_map(|(fid, score)| {
-            let idx = fid.0 as usize;
-            let rel_path = match sorted.get(idx) {
-                Some(p) => p,
-                None => {
-                    // Out-of-range FileId — warn and drop (ADR-006 counterpart).
-                    eprintln!(
-                        "skim search: AST verify gate warning: FileId({idx}) is out of \
-                         manifest range (manifest has {} files) — index may be out of sync; \
-                         run `skim search --rebuild`",
-                        sorted.len()
-                    );
-                    return None;
-                }
-            };
-            let abs_path = root.join(rel_path);
-            let stored_mtime = manifest.lookup(rel_path).and_then(|e| e.mtime);
+    //
+    // AD-405-11: byte-budget gate — bounds query-time I/O to the pre-raise total
+    // (window * AST_VERIFY_BYTES_PER_SLOT), so adding 1 MiB-eligible files does not
+    // inflate verify-gate latency past the AC11 <500ms target.
+    let verify_budget = (window as u64).saturating_mul(AST_VERIFY_BYTES_PER_SLOT);
+    let mut bytes_verified: u64 = 0;
+    let total_candidates = pooled.len();
+    let mut budget_omitted: usize = 0;
+    let mut verified_pool: Vec<VerifiedEntry> = Vec::with_capacity(window.min(total_candidates));
 
-            if is_synthetic {
-                // Synthetic: two-function flow (AND-semantics gate, AC-10/#419 preserved).
-                // `then_some` (eager) not `then` (lazy): the tuple is a trivial
-                // value, so a closure is unnecessary (clippy::unnecessary_lazy_evaluations).
-                pattern_occurs_in_file(&abs_path, &query, stored_mtime)
-                    .then_some((fid, score, None))
-            } else {
-                // Real-node: find_first_strict_match (gate + anchor in one pass).
-                find_first_strict_match(&abs_path, &query, stored_mtime)
-                    .map(|anchor| (fid, score, Some(anchor)))
+    for (fid, score) in pooled {
+        let idx = fid.0 as usize;
+        let rel_path = match sorted.get(idx) {
+            Some(p) => p,
+            None => {
+                // Out-of-range FileId — warn and drop (ADR-006 counterpart).
+                eprintln!(
+                    "skim search: AST verify gate warning: FileId({idx}) is out of \
+                     manifest range (manifest has {} files) — index may be out of sync; \
+                     run `skim search --rebuild`",
+                    sorted.len()
+                );
+                continue;
             }
-        })
-        .collect();
+        };
+
+        // AD-405-11: accrue file size against the query I/O budget before opening
+        // the file. Fall back to one slot's worth when the manifest size is absent
+        // (conservative: assumes a full-slot file rather than silently granting
+        // unlimited budget).
+        let entry = manifest.lookup(rel_path);
+        let file_size = entry
+            .and_then(|e| e.size)
+            .unwrap_or(AST_VERIFY_BYTES_PER_SLOT);
+        if bytes_verified.saturating_add(file_size) > verify_budget {
+            budget_omitted += 1;
+            continue;
+        }
+        bytes_verified = bytes_verified.saturating_add(file_size);
+
+        let abs_path = root.join(rel_path);
+        let stored_mtime = entry.and_then(|e| e.mtime);
+
+        if is_synthetic {
+            // Synthetic: two-function flow (AND-semantics gate, AC-10/#419 preserved).
+            if pattern_occurs_in_file(&abs_path, &query, stored_mtime) {
+                verified_pool.push((fid, score, None));
+            }
+        } else {
+            // Real-node: find_first_strict_match (gate + anchor in one pass).
+            if let Some(anchor) = find_first_strict_match(&abs_path, &query, stored_mtime) {
+                verified_pool.push((fid, score, Some(anchor)));
+            }
+        }
+    }
+
+    // AD-405-11: emit budget-exhausted notice to stderr when candidates were skipped.
+    if budget_omitted > 0 {
+        eprintln!(
+            "skim search: AST verify: byte budget exhausted ({budget_omitted} of \
+             {total_candidates} candidates unverified; budget = {window} slots × {} KiB); \
+             use SKIM_PASSTHROUGH=1 or rebuild with `skim search --rebuild`.",
+            AST_VERIFY_BYTES_PER_SLOT / 1024,
+        );
+    }
 
     // Resolve FileIds → repo-relative paths. For real-node patterns, populate
     // line/snippet from the cached anchor (no post-truncation re-parse needed).
@@ -455,6 +487,13 @@ pub(super) fn run_ast_standalone(
         super::temporal::enrich_ast_results(&mut resolved, sort, db);
     }
 
+    // AD-405-7 / AC-405-17: compute coverage from the already-loaded manifest
+    // (zero extra I/O). Emit notice on the standalone --ast surface (D-4 cadence).
+    let coverage = manifest.ast_coverage();
+    if let Some(notice) = super::query::ast_coverage_notice(&coverage) {
+        eprintln!("{notice}");
+    }
+
     write_ast_page_output(
         &mut resolved,
         page,
@@ -466,6 +505,7 @@ pub(super) fn run_ast_standalone(
         root,
         manifest,
         json,
+        coverage,
         w,
     )
 }
@@ -499,6 +539,7 @@ fn write_ast_page_output(
     root: &Path,
     manifest: &super::manifest::FileManifest,
     json: bool,
+    coverage: rskim_search::AstCoverage,
     w: &mut impl std::io::Write,
 ) -> anyhow::Result<ExitCode> {
     // AD-404-5 / AD-404-11: page.apply() — skip + take. Position is load-bearing
@@ -539,8 +580,13 @@ fn write_ast_page_output(
             let abs_path = root.join(&r.path);
             let stored_mtime = manifest.lookup(&r.path).and_then(|e| e.mtime);
             if let Some((ln, byte_range)) = recover_line(&abs_path, query, stored_mtime) {
+                // AD-405-2 / AD-405-14: language-aware size limit keeps read_line_at
+                // in sync with linearize_source and read_guarded; no drift possible.
+                let max_bytes = rskim_core::Language::from_path(Path::new(&r.path))
+                    .and_then(rskim_core::ast_size_limit)
+                    .unwrap_or(rskim_core::AST_SIZE_LIMIT_DEFAULT);
                 // Suppress snippet when byte_range is empty (synthetic recovery artifact).
-                let snip = read_line_at(&abs_path, ln, rskim_search::MAX_REPARSE_FILE_BYTES);
+                let snip = read_line_at(&abs_path, ln, max_bytes);
                 r.line = Some(ln);
                 r.snippet = if byte_range.is_empty() { None } else { snip };
             }
@@ -551,15 +597,33 @@ fn write_ast_page_output(
     let pattern_name = raw_pattern.trim();
     let (display_name, description) = pattern_description(pattern_name);
 
+    // AD-405-10: extract scalar before consuming coverage to avoid a partial move.
+    let excluded_count = coverage.size_excluded_files;
     if json {
         // AD-404-11 / D-5: has_more lets agents detect the last page without
         // relying on the unsound `len < limit` heuristic.
-        format_ast_json(resolved, display_name, description, has_more, w)?;
+        // AD-405-3: ast_coverage key carries one shape on all three surfaces.
+        format_ast_json(
+            resolved,
+            display_name,
+            description,
+            has_more,
+            Some(coverage),
+            w,
+        )?;
     } else {
         // AC-404-8 / AC-404-10: page-aware empty messages are now handled
         // inside format_ast_text via the `offset` parameter, mirroring how
         // format_temporal_text (temporal.rs) threads Page for the same split.
-        format_ast_text(resolved, display_name, description, page.offset(), w)?;
+        // AC-405-10: excluded_count appended when non-zero.
+        format_ast_text(
+            resolved,
+            display_name,
+            description,
+            page.offset(),
+            excluded_count,
+            w,
+        )?;
     }
 
     Ok(ExitCode::SUCCESS)
@@ -569,22 +633,45 @@ fn write_ast_page_output(
 // Snippet extraction helpers
 // ============================================================================
 
+/// AD-405-11: byte-budget constant for the structural verify gate.
+///
+/// The gate loop may read at most `window * AST_VERIFY_BYTES_PER_SLOT` bytes
+/// across all candidates in one query.  This is the pre-raise per-slot volume
+/// (100 KiB = the old cap), deliberately DECOUPLED from `AST_SIZE_LIMIT_DEFAULT`
+/// (1 MiB) so raising the cap adds files to the index without inflating query-time
+/// I/O.  Pre-raise workloads cannot exceed `window * 100 KiB` anyway, so the
+/// <500ms AC11 gate holds by construction.
+const AST_VERIFY_BYTES_PER_SLOT: u64 = 100 * 1024;
+
 /// Read the text of a specific 1-indexed line from a file.
 ///
 /// Returns `None` when the file cannot be read, is non-UTF8, exceeds
 /// `max_bytes`, or the line number is out of range.
 ///
+/// ## AD-405-2 / AD-405-14: Language-aware size limit
+///
+/// The caller passes the LANGUAGE-AWARE limit from `rskim_core::ast_size_limit`
+/// so `read_line_at` admits exactly the same files that `linearize_source` and
+/// `read_guarded` admit — no silent second cap can drift to a stale value.
+///
+/// ## Streaming BufRead (AD-405-14)
+///
+/// Uses `BufRead::lines().nth(target)` instead of `fs::read` + whole-file
+/// UTF-8 so fetching a single line from a 1 MiB file costs only the bytes
+/// up to that line, not a full 1 MiB read.
+///
 /// This is the "file-reading" half of the crate split (#201): pure formatting
 /// lives in `rskim_search::compound::output`; disk I/O lives here.
 fn read_line_at(abs_path: &Path, line_1indexed: u32, max_bytes: u64) -> Option<String> {
+    use std::io::BufRead;
     let meta = std::fs::metadata(abs_path).ok()?;
     if meta.len() > max_bytes {
         return None;
     }
-    let content = std::fs::read(abs_path).ok()?;
-    let text = std::str::from_utf8(&content).ok()?;
-    let target = line_1indexed.saturating_sub(1) as usize; // → 0-indexed
-    text.lines().nth(target).map(|l| l.to_string())
+    let file = std::fs::File::open(abs_path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let target = line_1indexed.saturating_sub(1) as usize; // 0-indexed
+    reader.lines().nth(target).and_then(|r| r.ok())
 }
 
 // ============================================================================

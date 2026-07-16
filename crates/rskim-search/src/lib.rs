@@ -38,14 +38,16 @@ pub(crate) mod validity;
 pub mod weights;
 
 pub use ast_index::{
-    AST_BM25_B, AST_BM25_K1, AST_CACHE_FILENAME, AST_CACHE_FORMAT_VERSION, AstBigram,
-    AstBigramEntry, AstFileMetaEntry, AstIndexBuilder, AstIndexReader, AstNgramCache, AstNgramSet,
-    AstPosting, AstPostingSource, AstQuery, AstQueryEngine, AstTrigram, AstTrigramEntry,
-    CachedAstEntry, DEFAULT_AST_WEIGHT, LinearNode, LinearizeResult, NodeKindId, Pattern,
-    PatternCategory, StructuralMetrics, all_patterns, ast_bigram_idf, ast_trigram_idf,
-    extract_ast_ngrams, extract_ast_ngrams_with_lines, extract_ast_ngrams_with_metrics,
-    extract_ast_ngrams_with_weights, is_synthetic_id, linearize_source, lookup_pattern,
-    parse_ast_query, synthetic_key_present, vocab_len, vocab_lookup, vocab_resolve,
+    AST_BM25_B, AST_BM25_K1, AST_CACHE_FILENAME, AST_CACHE_FORMAT_VERSION,
+    AST_COVERAGE_EXCLUDED_SAMPLE_CAP, AstBigram, AstBigramEntry, AstCoverage, AstExcludedFile,
+    AstFileMetaEntry, AstIndexBuilder, AstIndexReader, AstNgramCache, AstNgramSet, AstPosting,
+    AstPostingSource, AstQuery, AstQueryEngine, AstTrigram, AstTrigramEntry, CachedAstEntry,
+    CoverageEntry, DEFAULT_AST_WEIGHT, LinearNode, LinearizeResult, NodeKindId, Pattern,
+    PatternCategory, StructuralMetrics, all_patterns, ast_bigram_idf, ast_coverage,
+    ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_lines,
+    extract_ast_ngrams_with_metrics, extract_ast_ngrams_with_weights, is_synthetic_id,
+    linearize_source, lookup_pattern, parse_ast_query, synthetic_key_present, vocab_len,
+    vocab_lookup, vocab_resolve,
 };
 
 /// Current on-disk format version for the AST index (`ast_index.skidx`).
@@ -107,9 +109,10 @@ pub use compound::{
 };
 // #201: enriched result row type, formatters, and line-span re-parse.
 // #397: find_first_strict_match — single strict-ancestor predicate for both gate and anchor.
+// #405: MAX_REPARSE_FILE_BYTES removed (AD-405-2); use rskim_core::ast_size_limit.
 pub use compound::{
-    AstResult, MAX_REPARSE_FILE_BYTES, TemporalAnnotation, find_first_strict_match,
-    format_ast_json, format_ast_text, pattern_occurs_in_file, recover_line,
+    AstResult, TemporalAnnotation, find_first_strict_match, format_ast_json, format_ast_text,
+    pattern_occurs_in_file, recover_line,
 };
 pub use index::{NgramIndexBuilder, NgramIndexReader};
 pub use lexical::{

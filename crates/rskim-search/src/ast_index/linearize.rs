@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use rskim_core::{AstWalkConfig, AstWalkIter, Language, Parser};
+use rskim_core::{AstWalkConfig, AstWalkIter, Language, Parser, ast_size_limit};
 
 use crate::ast_weights::NODE_KIND_VOCABULARY;
 use crate::types::SearchError;
@@ -45,19 +45,10 @@ pub(crate) const MAX_AST_DEPTH: u32 = AstWalkConfig::DEFAULT_MAX_DEPTH;
 #[cfg(test)]
 pub(crate) const MAX_AST_NODES: u32 = AstWalkConfig::DEFAULT_MAX_NODES;
 
-/// Maximum source file size accepted for linearization (100 KiB).
-///
-/// Files exceeding this limit return `Ok(LinearizeResult::default())` rather
-/// than an error.
-const MAX_FILE_SIZE: usize = 100 * 1024;
-
-/// Maximum source file size for SQL files (1 MiB).
-///
-/// SQL migrations and schema dumps are routinely larger than 100 KiB, so SQL
-/// uses a higher limit to match `rskim-research/src/ast_extract.rs`. Files
-/// between 100 KiB and 1 MiB that are SQL will be linearized; all other
-/// languages still use `MAX_FILE_SIZE`.
-const MAX_FILE_SIZE_LARGE: usize = 1024 * 1024;
+// MAX_FILE_SIZE and MAX_FILE_SIZE_LARGE were deleted in #405.
+// The single cap is now rskim_core::ast_size_limit(language) -> Option<u64>.
+// Both build-time (here) and query-time (reparse.rs) use that one function
+// so they cannot drift (AC-405-21 / AD-405-1).
 
 // ============================================================================
 // Public types
@@ -204,9 +195,8 @@ static LANG_MAPS: LazyLock<HashMap<Language, Vec<Option<u16>>>> = LazyLock::new(
 /// Linearize a source file into a pre-order depth-encoded node sequence.
 ///
 /// Returns `Ok(LinearizeResult::default())` (empty result) for:
-/// - Files exceeding `MAX_FILE_SIZE` (100 KiB) for most languages, or
-///   `MAX_FILE_SIZE_LARGE` (1 MiB) for SQL
-/// - Non-tree-sitter languages (JSON, YAML, TOML)
+/// - Files exceeding the AST size cap (1 MiB, from `rskim_core::ast_size_limit`)
+/// - Non-tree-sitter languages (JSON, YAML, TOML — `ast_size_limit` returns `None`)
 /// - Parse failures (tree-sitter is error-tolerant, so this is rare)
 ///
 /// Returns `Err(SearchError::Ast)` only when the grammar itself fails to
@@ -218,18 +208,20 @@ static LANG_MAPS: LazyLock<HashMap<Language, Vec<Option<u16>>>> = LazyLock::new(
 /// `language` fails to load (grammar crate not compiled in, ABI mismatch,
 /// etc.). This is distinct from a parse error, which produces an empty result.
 pub fn linearize_source(source: &str, language: Language) -> crate::types::Result<LinearizeResult> {
-    // Guard 1: oversized files return empty result (not an error).
-    // SQL migrations/schema dumps can exceed 100 KiB, so SQL uses a larger
-    // limit (1 MiB) consistent with rskim-research/src/ast_extract.rs.
-    let size_limit = match language {
-        Language::Sql => MAX_FILE_SIZE_LARGE,
-        _ => MAX_FILE_SIZE,
-    };
-    if source.len() > size_limit {
-        return Ok(LinearizeResult::default());
+    // Guard 1: oversized files and non-tree-sitter languages return empty result.
+    // ast_size_limit returns None for JSON/YAML/TOML (no grammar) and Some(cap)
+    // for the 14 tree-sitter languages.  A unified 1 MiB cap replaces the old
+    // 100 KiB / 1 MiB-for-SQL two-tier (AD-405-1 / AC-405-21).
+    match ast_size_limit(language) {
+        None => return Ok(LinearizeResult::default()),
+        Some(cap) if source.len() as u64 > cap => return Ok(LinearizeResult::default()),
+        Some(_) => {}
     }
 
-    // Guard 2: non-tree-sitter languages have no CST → return empty result.
+    // Guard 2: look up the per-language node-kind vocab map.  Languages without
+    // a tree-sitter grammar were already rejected by ast_size_limit returning None
+    // in Guard 1, but LANG_MAPS is the compile-time source of truth for which
+    // grammars are compiled in — a missing entry here is a config mismatch.
     let lang_map = match LANG_MAPS.get(&language) {
         Some(m) => m,
         None => return Ok(LinearizeResult::default()),

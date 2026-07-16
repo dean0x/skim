@@ -407,7 +407,13 @@ pub(super) fn check_staleness(
     // AST self-heal: if the lexical index exists but the AST index is absent
     // or has an old format version, report stale so both rebuild atomically.
     // This handles: post-upgrade (v1→v2), crash between lexical.build() and
-    // ast.build(), and first run after adding --ast to an existing install.
+    // ast.build(), first run after adding --ast to an existing install, and
+    // coverage-policy changes that change which files are AST-indexed.
+    // #405 (AD-405-15): AST_INDEX_FORMAT_VERSION bumped 2→3 for the 100 KiB→1 MiB
+    // size-cap raise; a v2 index is stale and triggers a full cold rebuild
+    // (skcache CACHE_FORMAT_VERSION also bumped 1→2 in ast_cache.rs so the
+    // rebuild re-extracts every file from source rather than serving stale empty
+    // entries from the SHA-keyed skcache — see AD-405-14).
     let ast_index_path = cache_dir.join("ast_index.skidx");
     let ast_stale = if !ast_index_path.exists() {
         true

@@ -49,7 +49,10 @@ pub(crate) const SKAX_MAGIC: &[u8; 4] = b"SKAX";
 ///
 /// Version-bump policy: any change to field order, field width, or interpretation
 /// of any byte in any struct increments this number.  Old versions are rejected
-/// with an error message containing "format version".
+/// with an error message containing "format version".  A coverage-policy change
+/// (AST size cap change) also increments the version to force a full dual-index
+/// rebuild — the on-disk layout is byte-identical but the content is wrong
+/// (empty postings for now-eligible files) without a rebuild.
 ///
 /// v2 changes (Wave 3e):
 /// - `AstFileMetaEntry` extended from 5 to 15 bytes (added max_depth:u16,
@@ -57,7 +60,20 @@ pub(crate) const SKAX_MAGIC: &[u8; 4] = b"SKAX";
 /// - Header reserved bytes [38..42] now store `avg_max_depth` as f32 LE.
 /// - Synthetic n-grams from the AST Pattern Library stored alongside real n-grams.
 /// - All v1 indexes are invalid; reader rejects them with "please rebuild the AST index".
-pub(crate) const FORMAT_VERSION: u16 = 2;
+///
+/// v3 changes (#405 / AD-405-15):
+/// - AST size cap raised from 100 KiB (or 1 MiB for SQL) to a unified 1 MiB
+///   for ALL 14 tree-sitter languages (`rskim_core::ast_size_limit`).
+/// - The on-disk layout is BYTE-IDENTICAL to v2; this bump exists solely to
+///   invalidate every pre-#405 AST index.  A v2 index may contain empty
+///   postings for files in the 100 KiB..1 MiB band that are now AST-eligible.
+///   `check_staleness` detects `on_disk_version < FORMAT_VERSION` and triggers
+///   a full dual-index rebuild on the next AST-relevant invocation (ADR-006).
+/// - Together with the `CACHE_FORMAT_VERSION` 1 -> 2 bump in `ast_cache.rs`,
+///   this forces a COLD rebuild: the skcache is discarded so every file is
+///   re-extracted from source under the new cap (without the cache bump the
+///   SHA-keyed skcache would serve stale empty entries).
+pub(crate) const FORMAT_VERSION: u16 = 3;
 
 /// Size in bytes of [`AstSkidxHeader`] on disk.
 pub(crate) const HEADER_SIZE: usize = 48;

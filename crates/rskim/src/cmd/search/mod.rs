@@ -406,7 +406,7 @@ fn parse_near_value(raw: &str) -> anyhow::Result<u32> {
 /// Accepts both file extensions (`rs`, `py`, `ts`) and language display names
 /// (`rust`, `python`, `typescript`); case-insensitive.  Returns an actionable
 /// error listing accepted values when the input is unrecognised.
-fn parse_lang_value(raw: &str) -> anyhow::Result<rskim_core::Language> {
+pub(super) fn parse_lang_value(raw: &str) -> anyhow::Result<rskim_core::Language> {
     use rskim_core::Language;
     // Normalize to lowercase once so both the extension lookup and the name
     // match arm are case-insensitive.  Without this `--lang RS` (uppercase
@@ -758,6 +758,13 @@ fn run_build(
         eprintln!("{sample_display}");
     }
 
+    // AD-405-7 / AC-405-17: emit AST coverage notice after an explicit build or
+    // rebuild (D-4 cadence).  `result.ast_coverage` was computed in index.rs
+    // before `new_manifest.save()` — zero extra I/O (AC-405-12).
+    if let Some(notice) = query::ast_coverage_notice(&result.ast_coverage) {
+        eprintln!("{notice}");
+    }
+
     // AD-TMP-1: --rebuild/--build must produce a COMPLETE index (lexical + AST +
     // temporal), matching user expectation that "rebuild" rebuilds everything (#357 BUG A).
     // run_build goes through build_index directly, bypassing auto_refresh_if_stale where
@@ -789,9 +796,15 @@ fn run_update(
 ) -> anyhow::Result<ExitCode> {
     let (root, cache_dir) = resolve_root_and_cache(root_override)?;
     std::fs::create_dir_all(&cache_dir)?;
-    let (refreshed, _manifest) = staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+    let (refreshed, manifest) = staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
     if !refreshed {
         eprintln!("skim search: index is current");
+    } else {
+        // AD-405-7 / AC-405-17: emit AST coverage notice after --update refreshes
+        // the index (D-4 cadence).  Manifest is the post-refresh state.
+        if let Some(notice) = query::ast_coverage_notice(&manifest.ast_coverage()) {
+            eprintln!("{notice}");
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -910,6 +923,27 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
             )?;
             for (reason, count) in &by_reason {
                 writeln!(out, "    {reason}: {count}")?;
+            }
+        }
+
+        // AD-405-7 / AC-405-17: AST size-coverage section (D-4 cadence).
+        // Loaded manifest is already in memory from check_staleness — zero extra I/O.
+        if let Some(ref m) = loaded_manifest {
+            let coverage = m.ast_coverage();
+            writeln!(out, "  ast eligible  : {}", coverage.size_eligible_files)?;
+            if coverage.size_excluded_files > 0 {
+                writeln!(
+                    out,
+                    "  ast excluded  : {} (exceed 1 MiB cap)",
+                    coverage.size_excluded_files
+                )?;
+                // PF-012: excluded_by_lang is a BTreeMap — already sorted.
+                for (lang, count) in &coverage.excluded_by_lang {
+                    writeln!(out, "    {lang}: {count}")?;
+                }
+            }
+            if coverage.undetermined_files > 0 {
+                writeln!(out, "  ast undetermined: {}", coverage.undetermined_files)?;
             }
         }
     }
@@ -1132,6 +1166,22 @@ fn run_query(
         lang: flags.lang,
     };
 
+    // AD-405-7 / AC-405-17: compute AST coverage BEFORE moving the manifest into
+    // execute_query_with_manifest.  Only meaningful on --ast paths (D-4 cadence).
+    // Pure-lexical paths keep None → ast_coverage key absent from JSON (D-5).
+    let compound_ast_coverage: Option<rskim_search::AstCoverage> = if flags.ast.is_some() {
+        Some(
+            pre_loaded_manifest
+                .as_ref()
+                .map(|m| m.ast_coverage())
+                // Defensive fallback: manifest invariant holds (expect() above), but
+                // avoid a panic if the invariant ever breaks in tests.
+                .unwrap_or_else(|| rskim_search::ast_coverage(std::iter::empty())),
+        )
+    } else {
+        None
+    };
+
     // Pass the already-refreshed manifest to execute_query_with_manifest.  When
     // pre_loaded_manifest is Some (temporal or AST flag active — refresh happened
     // above), execute_query skips its own auto_refresh_if_stale.  When None
@@ -1183,6 +1233,18 @@ fn run_query(
             temporal::bounded_page_notice(output.total, page.offset(), page.limit())
         );
     }
+
+    // AD-405-7 / AC-405-17: emit AST coverage notice on compound --ast paths (D-4
+    // cadence).  Notice goes to stderr so --json stdout stays byte-identical.
+    // Wire coverage into output for the JSON key (D-5): omit when clean so the
+    // key is absent on healthy repos (avoids noise for well-maintained codebases).
+    if let Some(ref cov) = compound_ast_coverage
+        && let Some(notice) = query::ast_coverage_notice(cov)
+    {
+        eprintln!("{notice}");
+    }
+    output.ast_coverage =
+        compound_ast_coverage.and_then(|c| if c.is_clean() { None } else { Some(c) });
 
     let mut stdout = BufWriter::new(std::io::stdout());
     if flags.json {
@@ -1349,6 +1411,12 @@ AST structural query options (#199):
   Limitations:
     #283 -- Single-node queries (e.g. --ast try_statement) are not yet supported;
            use a named pattern or a containment query instead.
+    Size cap -- Files larger than 1 MiB are excluded from AST indexing and will
+           not appear in --ast results (they remain fully text-searchable).
+           Run `skim search --stats` or `skim search --stats --json` to see
+           which files are excluded (`ast_coverage` / ast eligible/excluded lines).
+           The `--ast` JSON envelope includes an `ast_coverage` key when any
+           files are excluded, listing per-language counts and a bounded sample.
 
   --ast composes with: text query, --phrase, --near, --lang, --hot/--cold/--risky,
   --blast-radius, --limit, --offset, and --json.  When heatmap data is absent,
@@ -1477,6 +1545,18 @@ pub(super) fn build_stats_json(
     // counted in the `run_build` headline ("N skipped") but not persisted.
     // A repo with 50 unsupported files + 1 minified bundle therefore shows
     // `"skipped": [<minified entry>]` here vs. "51 skipped" at build time.
+    //
+    // AD-405-9 / AC-405-11 / D-5: `ast_coverage` is an additive key (never
+    // replaces existing keys).  Absent when no manifest is loaded (None → JSON
+    // null); always present and typed when the manifest is available, regardless
+    // of is_clean().  Unlike QueryOutput which omits the key when clean, --stats
+    // always shows the full coverage so operators can audit coverage on healthy
+    // repos.  No-index early-return at line 1444 keeps the error object as-is.
+    let ast_coverage_val = loaded_manifest
+        .as_ref()
+        .map(|m| serde_json::to_value(m.ast_coverage()))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("ast_coverage serialization error: {e}"))?;
     Ok(serde_json::json!({
         "file_count": stats.file_count,
         "total_ngrams": stats.total_ngrams,
@@ -1489,6 +1569,7 @@ pub(super) fn build_stats_json(
         "cache_dir": cache_dir.display().to_string(),
         "skipped": skipped_arr,
         "skipped_by_reason": skipped_by_reason,
+        "ast_coverage": ast_coverage_val,
     }))
 }
 
