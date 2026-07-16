@@ -62,6 +62,96 @@ fn build_index(proj: &Path, cache: &Path) {
         .success();
 }
 
+/// Run a git command in `root`, asserting exit 0.
+///
+/// Local user identity is supplied via git-config so CI machines and machines
+/// without a global `~/.gitconfig` work identically.  `commit.gpgsign=false`
+/// prevents GPG signing prompts in environments where a signing key is
+/// configured globally.
+fn git_in(root: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .status()
+        .unwrap_or_else(|e| panic!("git {:?} failed to spawn: {e}", args));
+    assert!(status.success(), "git {:?} exited with {status}", args);
+}
+
+/// Initialize a git repo at `root` with hermetic local identity and no signing.
+fn git_init(root: &Path) {
+    git_in(root, &["init"]);
+    git_in(root, &["config", "user.email", "test@t.com"]);
+    git_in(root, &["config", "user.name", "Test"]);
+    git_in(root, &["config", "commit.gpgsign", "false"]);
+}
+
+/// Create a project with N TypeScript files **plus a two-commit git history**.
+///
+/// The second commit (which modifies all files) guarantees that `temporal.db`
+/// is populated with hotspot and risk rows when `skim search --build` runs.
+/// Without git history `run_temporal_standalone` returns early at the
+/// `open_temporal_db` guard, never reaching the pagination code — the PF-007
+/// vacuity this helper is designed to prevent.
+///
+/// Files are named `src/f01.ts` … `src/fNN.ts` (lexicographic order so
+/// pagination has a deterministic sort key: all AST scores tie → FileId ASC).
+fn make_git_project(root: &Path, n: usize) {
+    make_try_catch_project(root, n);
+    git_init(root);
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-m", "seed"]);
+    // Second commit: touch every file so each appears in at least one non-initial
+    // commit.  gix diffs the initial commit against the empty tree, but ensuring
+    // a second commit makes the test independent of that edge-case behaviour.
+    for i in 1..=n {
+        fs::write(
+            root.join(format!("src/f{i:02}.ts")),
+            format!("// v2\nexport const v{i}: number = {i};\n"),
+        )
+        .unwrap();
+    }
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-m", "update"]);
+}
+
+/// Create a project with co-change history for `--blast-radius` pagination tests.
+///
+/// Layout:
+/// - `src/anchor.ts` — the blast-radius target
+/// - `src/p01.ts` … `src/p05.ts` — five partner files
+///
+/// All six files are committed together in two commits, giving every pair a
+/// Jaccard co-change score of 1.0 (≥ `MIN_COCHANGE_JACCARD` = 0.10).  With
+/// five partners, `--blast-radius src/anchor.ts --limit 2` can paginate:
+/// page 0 → partners ordered by (jaccard DESC, file_b ASC) → p01, p02;
+/// page 1 (offset 2) → p03, p04.
+fn make_cochange_project(root: &Path) {
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/anchor.ts"), "export const anchor = 0;\n").unwrap();
+    for i in 1..=5u32 {
+        fs::write(
+            root.join(format!("src/p{i:02}.ts")),
+            format!("export const p{i}: number = {i};\n"),
+        )
+        .unwrap();
+    }
+    git_init(root);
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-m", "seed"]);
+    // Second commit: modify all files together again to cement every pair's
+    // co-change count to 2 (Jaccard stays 1.0).
+    fs::write(root.join("src/anchor.ts"), "export const anchor = 1;\n").unwrap();
+    for i in 1..=5u32 {
+        fs::write(
+            root.join(format!("src/p{i:02}.ts")),
+            format!("export const p{i}: number = {i} + 1;\n"),
+        )
+        .unwrap();
+    }
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-m", "update"]);
+}
+
 // ============================================================================
 // AC-404-1: standalone --ast honors --offset
 // ============================================================================
@@ -160,6 +250,59 @@ fn offset_paginates_standalone_ast() {
         v0["has_more"].as_bool(),
         Some(true),
         "AC-404-18: page 0 of 6-file result with limit 2 must have has_more=true"
+    );
+
+    // Contiguity: page 0 and page 1 must be exactly adjacent slices of the
+    // full result list.  Disjoint-only is insufficient: an off-by-one in the
+    // offset skip (e.g. skipping 1 or 3 instead of 2) produces disjoint pages
+    // that still miss or duplicate a result.
+    let all_out = Command::cargo_bin("skim")
+        .unwrap()
+        .args([
+            "search",
+            "--ast",
+            "try-catch",
+            "--limit",
+            "100",
+            "--offset",
+            "0",
+            "--json",
+            "--root",
+        ])
+        .arg(proj.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let v_all: serde_json::Value =
+        serde_json::from_slice(&all_out).expect("all-results must be valid JSON");
+    let all_paths: Vec<&str> = v_all["results"]
+        .as_array()
+        .expect("all-results must have a results array")
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+
+    assert!(
+        all_paths.len() >= 4,
+        "AC-404-1: need at least 4 results for a 2-page pagination check; got {}",
+        all_paths.len()
+    );
+    assert_eq!(
+        paths0,
+        &all_paths[..2],
+        "AC-404-1 (contiguity): page 0 must be exactly the first 2 of all results. \
+         Off-by-one in --offset would produce disjoint-but-non-contiguous pages."
+    );
+    assert_eq!(
+        paths1,
+        &all_paths[2..4],
+        "AC-404-1 (contiguity): page 1 must be exactly results [2..4] of all results. \
+         Off-by-one in --offset would skip or duplicate a result."
     );
 }
 
@@ -273,88 +416,329 @@ fn offset_past_end_yields_empty_page() {
 // AC-404-2: standalone temporal arms accept --offset without error
 // ============================================================================
 
-/// AC-404-2: `--hot --offset N` must be accepted (not rejected) by the CLI.
+/// AC-404-2: `--hot --offset N` actually paginates (offset is wired through to
+/// the temporal query engine, not silently ignored).
 ///
-/// Deep pagination disjointness requires seeded git data (verified hermetically
-/// in `temporal_tests.rs`). This test asserts that the flag is WIRED and does
-/// not cause an unexpected non-zero exit or panic.
+/// Pre-fix: `run_temporal_standalone` never passed the `page` cursor to
+/// `query_standalone`; offset was ignored and both pages returned the same
+/// files.  Testing against a no-git-history project masked this because the
+/// function returned early (no temporal.db), never reaching pagination code —
+/// the PF-007 vacuity.  This test uses a seeded git project so temporal.db is
+/// built and the real pagination path executes.
 #[test]
 fn offset_accepted_on_hot_standalone() {
     let proj = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    // No git history → no temporal.db → graceful degradation (exit 0).
-    Command::cargo_bin("skim")
+    // Seed 6 files with git history so --build populates temporal.db.
+    make_git_project(proj.path(), 6);
+    build_index(proj.path(), cache.path());
+
+    let page0_out = Command::cargo_bin("skim")
         .unwrap()
-        .args(["search", "--hot", "--offset", "2", "--limit", "5", "--root"])
+        .args([
+            "search", "--hot", "--limit", "2", "--offset", "0", "--json", "--root",
+        ])
         .arg(proj.path())
         .env("SKIM_CACHE_DIR", cache.path())
         .env("SKIM_DISABLE_ANALYTICS", "1")
         .assert()
-        .success(); // degraded exit 0 (no temporal.db)
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let page1_out = Command::cargo_bin("skim")
+        .unwrap()
+        .args([
+            "search", "--hot", "--limit", "2", "--offset", "2", "--json", "--root",
+        ])
+        .arg(proj.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let v0: serde_json::Value =
+        serde_json::from_slice(&page0_out).expect("--hot page 0 must be valid JSON");
+    let v1: serde_json::Value =
+        serde_json::from_slice(&page1_out).expect("--hot page 1 must be valid JSON");
+
+    let paths0: Vec<&str> = v0["results"]
+        .as_array()
+        .expect("--hot page 0 must have a results array")
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+    let paths1: Vec<&str> = v1["results"]
+        .as_array()
+        .expect("--hot page 1 must have a results array")
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+
+    assert_eq!(paths0.len(), 2, "--hot page 0 must have exactly 2 results");
+    assert_eq!(paths1.len(), 2, "--hot page 1 must have exactly 2 results");
+
+    // Key check: pages must be disjoint — pre-fix both returned the same files.
+    let overlap: Vec<_> = paths0.iter().filter(|p| paths1.contains(p)).collect();
+    assert!(
+        overlap.is_empty(),
+        "AC-404-2: --hot --offset paginates disjoint pages. \
+         overlap={overlap:?} page0={paths0:?} page1={paths1:?}"
+    );
 }
 
-/// AC-404-2: `--cold --offset N` must be accepted.
+/// AC-404-2: `--cold --offset N` actually paginates (offset is wired through
+/// to the temporal query engine, not silently ignored).
+///
+/// Same vacuity fix as `offset_accepted_on_hot_standalone`: uses a seeded git
+/// project so temporal.db is populated and the real pagination path executes.
 #[test]
 fn offset_accepted_on_cold_standalone() {
     let proj = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    Command::cargo_bin("skim")
+    make_git_project(proj.path(), 6);
+    build_index(proj.path(), cache.path());
+
+    let page0_out = Command::cargo_bin("skim")
         .unwrap()
         .args([
-            "search", "--cold", "--offset", "3", "--limit", "5", "--root",
+            "search", "--cold", "--limit", "2", "--offset", "0", "--json", "--root",
         ])
         .arg(proj.path())
         .env("SKIM_CACHE_DIR", cache.path())
         .env("SKIM_DISABLE_ANALYTICS", "1")
         .assert()
-        .success();
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let page1_out = Command::cargo_bin("skim")
+        .unwrap()
+        .args([
+            "search", "--cold", "--limit", "2", "--offset", "2", "--json", "--root",
+        ])
+        .arg(proj.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let v0: serde_json::Value =
+        serde_json::from_slice(&page0_out).expect("--cold page 0 must be valid JSON");
+    let v1: serde_json::Value =
+        serde_json::from_slice(&page1_out).expect("--cold page 1 must be valid JSON");
+
+    let paths0: Vec<&str> = v0["results"]
+        .as_array()
+        .expect("--cold page 0 must have a results array")
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+    let paths1: Vec<&str> = v1["results"]
+        .as_array()
+        .expect("--cold page 1 must have a results array")
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+
+    assert_eq!(paths0.len(), 2, "--cold page 0 must have exactly 2 results");
+    assert_eq!(paths1.len(), 2, "--cold page 1 must have exactly 2 results");
+
+    let overlap: Vec<_> = paths0.iter().filter(|p| paths1.contains(p)).collect();
+    assert!(
+        overlap.is_empty(),
+        "AC-404-2: --cold --offset paginates disjoint pages. \
+         overlap={overlap:?} page0={paths0:?} page1={paths1:?}"
+    );
 }
 
-/// AC-404-2: `--risky --offset N` must be accepted.
+/// AC-404-2: `--risky --offset N` actually paginates (offset is wired through
+/// to the temporal query engine, not silently ignored).
+///
+/// Risk score is 0 for all files (no "fix" commits in the seed history), so
+/// `top_risks` orders by `risk_score DESC, total_commits DESC, file_path ASC`.
+/// With all scores tied, pagination falls back to file_path ASC — deterministic
+/// and sufficient to prove disjointness.
 #[test]
 fn offset_accepted_on_risky_standalone() {
     let proj = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    Command::cargo_bin("skim")
+    make_git_project(proj.path(), 6);
+    build_index(proj.path(), cache.path());
+
+    let page0_out = Command::cargo_bin("skim")
         .unwrap()
         .args([
-            "search", "--risky", "--offset", "1", "--limit", "5", "--root",
+            "search", "--risky", "--limit", "2", "--offset", "0", "--json", "--root",
         ])
         .arg(proj.path())
         .env("SKIM_CACHE_DIR", cache.path())
         .env("SKIM_DISABLE_ANALYTICS", "1")
         .assert()
-        .success();
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let page1_out = Command::cargo_bin("skim")
+        .unwrap()
+        .args([
+            "search", "--risky", "--limit", "2", "--offset", "2", "--json", "--root",
+        ])
+        .arg(proj.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let v0: serde_json::Value =
+        serde_json::from_slice(&page0_out).expect("--risky page 0 must be valid JSON");
+    let v1: serde_json::Value =
+        serde_json::from_slice(&page1_out).expect("--risky page 1 must be valid JSON");
+
+    let paths0: Vec<&str> = v0["results"]
+        .as_array()
+        .expect("--risky page 0 must have a results array")
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+    let paths1: Vec<&str> = v1["results"]
+        .as_array()
+        .expect("--risky page 1 must have a results array")
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+
+    assert_eq!(
+        paths0.len(),
+        2,
+        "--risky page 0 must have exactly 2 results"
+    );
+    assert_eq!(
+        paths1.len(),
+        2,
+        "--risky page 1 must have exactly 2 results"
+    );
+
+    let overlap: Vec<_> = paths0.iter().filter(|p| paths1.contains(p)).collect();
+    assert!(
+        overlap.is_empty(),
+        "AC-404-2: --risky --offset paginates disjoint pages. \
+         overlap={overlap:?} page0={paths0:?} page1={paths1:?}"
+    );
 }
 
 // ============================================================================
 // AC-404-3: standalone --blast-radius accepts --offset without error
 // ============================================================================
 
-/// AC-404-3: `--blast-radius FILE --offset N` must be accepted.
+/// AC-404-3: `--blast-radius FILE --offset N` actually paginates co-change
+/// partners (offset is wired through, not silently ignored).
+///
+/// `make_cochange_project` seeds `src/anchor.ts` with 5 co-change partners
+/// (`src/p01.ts` … `src/p05.ts`) via a two-commit git history.  Each pair
+/// reaches Jaccard 1.0 (≥ MIN_COCHANGE_JACCARD 0.10), so `cochanges_for_file`
+/// returns all 5 partners and the pagination code executes — unlike the prior
+/// vacuous test that used a no-git-history project where `open_temporal_db`
+/// returned `None` and `run_temporal_standalone` exited early.
 #[test]
 fn offset_accepted_on_blast_radius_standalone() {
     let proj = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    make_try_catch_project(proj.path(), 2);
-    // No temporal.db → graceful degradation (exit 0).
-    Command::cargo_bin("skim")
+    make_cochange_project(proj.path());
+    build_index(proj.path(), cache.path());
+
+    let page0_out = Command::cargo_bin("skim")
         .unwrap()
         .args([
             "search",
             "--blast-radius",
-            "src/f01.ts",
-            "--offset",
-            "1",
+            "src/anchor.ts",
             "--limit",
-            "3",
+            "2",
+            "--offset",
+            "0",
+            "--json",
             "--root",
         ])
         .arg(proj.path())
         .env("SKIM_CACHE_DIR", cache.path())
         .env("SKIM_DISABLE_ANALYTICS", "1")
         .assert()
-        .success();
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let page1_out = Command::cargo_bin("skim")
+        .unwrap()
+        .args([
+            "search",
+            "--blast-radius",
+            "src/anchor.ts",
+            "--limit",
+            "2",
+            "--offset",
+            "2",
+            "--json",
+            "--root",
+        ])
+        .arg(proj.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let v0: serde_json::Value =
+        serde_json::from_slice(&page0_out).expect("--blast-radius page 0 must be valid JSON");
+    let v1: serde_json::Value =
+        serde_json::from_slice(&page1_out).expect("--blast-radius page 1 must be valid JSON");
+
+    let paths0: Vec<&str> = v0["results"]
+        .as_array()
+        .expect("--blast-radius page 0 must have a results array")
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+    let paths1: Vec<&str> = v1["results"]
+        .as_array()
+        .expect("--blast-radius page 1 must have a results array")
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+
+    assert_eq!(
+        paths0.len(),
+        2,
+        "--blast-radius page 0 must have exactly 2 co-change partners"
+    );
+    assert_eq!(
+        paths1.len(),
+        2,
+        "--blast-radius page 1 must have exactly 2 co-change partners"
+    );
+
+    // Key check: pages must be disjoint — pre-fix both returned the same partners.
+    let overlap: Vec<_> = paths0.iter().filter(|p| paths1.contains(p)).collect();
+    assert!(
+        overlap.is_empty(),
+        "AC-404-3: --blast-radius --offset paginates disjoint pages. \
+         overlap={overlap:?} page0={paths0:?} page1={paths1:?}"
+    );
 }
 
 // ============================================================================
@@ -486,6 +870,58 @@ fn offset_paginates_containment_query() {
         overlap.is_empty(),
         "AC-404-1 (containment): pages must be disjoint. \
          overlap={overlap:?}, page0={paths0:?}, page1={paths1:?}"
+    );
+
+    // Contiguity: verify page 0 and page 1 are exactly adjacent slices of the
+    // full result list.  Disjoint-only is insufficient: an off-by-one in the
+    // offset skip produces disjoint-but-non-contiguous pages that silently miss
+    // or duplicate one result.
+    let all_out = Command::cargo_bin("skim")
+        .unwrap()
+        .args([
+            "search",
+            "--ast",
+            "function_item > block",
+            "--limit",
+            "100",
+            "--offset",
+            "0",
+            "--json",
+            "--root",
+        ])
+        .arg(proj.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let v_all: serde_json::Value =
+        serde_json::from_slice(&all_out).expect("all-results must be valid JSON");
+    let all_paths: Vec<&str> = v_all["results"]
+        .as_array()
+        .expect("all-results must have a results array")
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+
+    assert!(
+        all_paths.len() >= 4,
+        "AC-404-1 (containment): need at least 4 results for 2-page check; got {}",
+        all_paths.len()
+    );
+    assert_eq!(
+        paths0,
+        &all_paths[..2],
+        "AC-404-1 (containment, contiguity): page 0 must be exactly the first 2 of all results."
+    );
+    assert_eq!(
+        paths1,
+        &all_paths[2..4],
+        "AC-404-1 (containment, contiguity): page 1 must be exactly results [2..4] of all results. \
+         Off-by-one in --offset would skip or duplicate a result."
     );
 }
 
