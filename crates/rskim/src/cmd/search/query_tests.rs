@@ -3088,6 +3088,74 @@ fn ac403_near_diagnostic_notice_truth_table() {
     );
 }
 
+/// Verify that `near_diagnostic_notice` uses the punctuation-aware word tokenizer
+/// (count_query_word_tokens / collect_word_spans) rather than whitespace splitting,
+/// so punctuated code-search queries produce the correct word count.
+///
+/// The two divergence cases are:
+/// - Undercount: `"foo.bar baz"` → whitespace=2, real=3 tokens.
+///   --near 1 is unsatisfiable for 3 real tokens (need span >= 2), so the notice
+///   MUST fire.  With a broken whitespace count (2 tokens, need span >= 1) it
+///   would silently be skipped.
+/// - Overcount / misfire: `"foo::bar"` → whitespace=1, real=2 tokens.
+///   --near 5 is satisfiable for 2 real tokens, so the notice MUST NOT fire.
+///   With a broken whitespace count (1 token) the "single-word" notice would
+///   erroneously fire even though --near is meaningful.
+#[test]
+fn ac403_near_diagnostic_punctuation_tokenizer() {
+    // Undercount divergence: "foo.bar baz" is 3 real tokens (foo, bar, baz).
+    // --near 1 requires span >= 2, so it is unsatisfiable → notice must fire.
+    let undercnt = near_diagnostic_notice(Some(1), "foo.bar baz");
+    assert!(
+        undercnt.is_some(),
+        "--near 1 on 3-real-token query 'foo.bar baz' must produce notice (unsatisfiable)"
+    );
+
+    // Verify the notice says it cannot match (not "single-word").
+    assert!(
+        undercnt.as_deref().unwrap_or("").contains("cannot match"),
+        "notice for 3-token unsatisfiable near must say 'cannot match'; got {:?}",
+        undercnt
+    );
+
+    // Satisfiable threshold: --near 2 == word_count - 1 for 3 tokens → no notice.
+    assert_eq!(
+        near_diagnostic_notice(Some(2), "foo.bar baz"),
+        None,
+        "--near 2 on 3-token 'foo.bar baz' is satisfiable: must be None"
+    );
+
+    // Overcount / misfire divergence: "foo::bar" is 2 real tokens (foo, bar).
+    // --near 5 is satisfiable (5 >= 2-1 = 1) → no notice must fire.
+    assert_eq!(
+        near_diagnostic_notice(Some(5), "foo::bar"),
+        None,
+        "--near 5 on 2-token 'foo::bar' is satisfiable: must not emit single-word notice"
+    );
+
+    // "foo::bar" with --near 0 is blocked by parse, so test --near 1 (satisfiable).
+    assert_eq!(
+        near_diagnostic_notice(Some(1), "foo::bar"),
+        None,
+        "--near 1 on 2-token 'foo::bar' is satisfiable: must be None"
+    );
+
+    // Single punctuation-joined token still fires: "foo_bar" is one token.
+    let single_token = near_diagnostic_notice(Some(3), "foo_bar");
+    assert!(
+        single_token.is_some(),
+        "--near 3 on single-token 'foo_bar' must produce single-word notice"
+    );
+    assert!(
+        single_token
+            .as_deref()
+            .unwrap_or("")
+            .contains("single-word"),
+        "notice for single-token near must say 'single-word'; got {:?}",
+        single_token
+    );
+}
+
 // ── AC-403-T4: SEARCH_HELP_TEXT positional documentation ─────────────────────
 
 /// AC-403-13: SEARCH_HELP_TEXT must contain documentation for --phrase, --near,

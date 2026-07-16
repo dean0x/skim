@@ -626,8 +626,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                     i += 1;
                 }
             }
-            // AD-403-6: the stale "ordering-only" comment was false and removed.
-            // When BOTH --phrase and --near are given, the composed semantic is
+            // AD-403-6: When BOTH --phrase and --near are given, the composed semantic is
             // PhraseNear(n) — ordered, total span <= n — NOT just phrase.  See
             // verify_mode_for in query.rs (AD-403-1) for the exhaustive mapping.
             // v5 positional search (#392 / #380 Phase 2). Shell strips quotes, so

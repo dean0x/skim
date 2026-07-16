@@ -19,8 +19,8 @@ use std::time::Instant;
 
 use rskim_search::{
     CompositeWeights, FileId, IndexStats, NgramIndexReader, QueryEngine, SearchLayer, SearchQuery,
-    SearchResult, StructuralMetrics, intersect_and_rank, is_single_token, merge_layer_scores,
-    recompose_with_lexical,
+    SearchResult, StructuralMetrics, count_query_word_tokens, intersect_and_rank, is_single_token,
+    merge_layer_scores, recompose_with_lexical,
 };
 
 use super::manifest::FileManifest;
@@ -240,10 +240,10 @@ pub(super) fn positional_inert_notice(
 #[must_use]
 pub(super) fn near_diagnostic_notice(near: Option<u32>, text: &str) -> Option<String> {
     let n = near?;
-    // Count whitespace-delimited tokens as a user-facing approximation of word count.
-    // The precise tokenizer (collect_word_spans) uses the same split points for
-    // ASCII-alphanumeric runs, so the counts agree for typical queries.
-    let word_count = text.split_whitespace().count();
+    // Use the authoritative tokenizer (count_query_word_tokens / collect_word_spans /
+    // D10 / is_word_byte) so the word count matches what the positional predicates
+    // see.  Punctuation acts as a separator: "foo::bar" is 2 tokens, not 1.
+    let word_count = count_query_word_tokens(text);
     if word_count == 0 {
         return None; // no text to diagnose (covered by positional_inert_notice)
     }

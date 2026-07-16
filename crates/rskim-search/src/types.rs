@@ -856,6 +856,19 @@ fn collect_word_spans(s: &str) -> Vec<(usize, usize)> {
     spans
 }
 
+/// Count the number of word tokens in a query string using the same tokenizer
+/// (`collect_word_spans` / D10 / `is_word_byte`) as the positional predicates.
+///
+/// Punctuation characters (`.`, `:`, `-`, etc.) act as separators, so
+/// `"foo::bar"` has two tokens and `"foo.bar baz"` has three — matching what
+/// `phrase_tokens_present` and `near_tokens_present` see when they evaluate
+/// the query.  This is the authoritative word-count for CLI diagnostics such as
+/// `near_diagnostic_notice`.
+#[must_use]
+pub fn count_query_word_tokens(s: &str) -> usize {
+    collect_word_spans(s).len()
+}
+
 /// AD-393-3: Token-exact phrase predicate. Tokenizes doc content with the SAME
 /// `word_token_indices` semantics as the indexer (see `collect_word_spans`) and
 /// requires each doc token to EQUAL the query word at consecutive ordinals —

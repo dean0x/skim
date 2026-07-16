@@ -1015,9 +1015,8 @@ impl NgramIndexReader {
             }
 
             // AD-393-2 / AD-403-3: exhaustive tuple match on (phrase, near) selects
-            // the correct candidate alignment counter.  Both phrase-first if/else
-            // layers that silently dropped --near when --phrase was set are collapsed
-            // here; adding a new (phrase, near) combination is now compiler-caught.
+            // the correct candidate alignment counter; adding a new (phrase, near)
+            // combination is compiler-caught.
             let alignments = match (want_phrase, near_n) {
                 // Ordered + total span (new for #403): greedy scan within [p0, p0+n].
                 (true, Some(n)) => count_phrase_near_alignments(&d, n),
