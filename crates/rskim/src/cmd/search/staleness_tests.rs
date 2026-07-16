@@ -799,6 +799,10 @@ fn test_auto_refresh_rebuilds_on_head_changed() {
         outcome.refreshed(),
         "HEAD changed — index should be rebuilt"
     );
+    assert!(
+        !outcome.is_first_build(),
+        "HEAD changed is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
+    );
     assert_eq!(
         manifest.stored_git_head(),
         Some(new_sha),
@@ -825,6 +829,10 @@ fn test_auto_refresh_rebuilds_on_no_stored_head() {
     assert!(
         outcome.refreshed(),
         "no stored HEAD + git present — index should be rebuilt"
+    );
+    assert!(
+        !outcome.is_first_build(),
+        "NoStoredHead is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
     );
     assert_eq!(
         manifest.stored_git_head(),
@@ -1574,6 +1582,10 @@ fn test_auto_refresh_rebuilds_on_working_tree_edit() {
         refreshed.refreshed(),
         "in-place edit must trigger a rebuild (AC1/AC5)"
     );
+    assert!(
+        !refreshed.is_first_build(),
+        "working-tree edit is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
+    );
     // Manifest was rewritten exactly once (mtime advanced).
     let mtime_after = fs::metadata(&manifest_path).unwrap().modified().unwrap();
     assert_ne!(
@@ -1607,6 +1619,10 @@ fn test_auto_refresh_indexes_new_working_tree_file() {
     assert!(
         refreshed.refreshed(),
         "a new working-tree file must trigger a rebuild (AC2)"
+    );
+    assert!(
+        !refreshed.is_first_build(),
+        "new working-tree file is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
     );
 
     let paths = manifest_paths(dir.path(), &cache_dir);
@@ -1646,6 +1662,10 @@ fn test_auto_refresh_reflects_delete_and_rename() {
     assert!(
         refreshed.refreshed(),
         "delete+add must trigger a rebuild (AC3)"
+    );
+    assert!(
+        !refreshed.is_first_build(),
+        "delete+add is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
     );
 
     let paths = manifest_paths(dir.path(), &cache_dir);
@@ -1790,6 +1810,10 @@ fn test_auto_refresh_size_change_with_preserved_mtime_reindexes() {
         refreshed.refreshed(),
         "size change with preserved mtime MUST reindex (size comparison, AC9a)"
     );
+    assert!(
+        !refreshed.is_first_build(),
+        "size-change reindex is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
+    );
 
     // Post-edit manifest carries a populated size for the file.
     use crate::cmd::search::manifest::FileManifest;
@@ -1825,6 +1849,10 @@ fn test_auto_refresh_non_git_working_tree_change_reindexes() {
     assert!(
         refreshed.refreshed(),
         "non-git working-tree change MUST reindex (AD-379-3, AC12)"
+    );
+    assert!(
+        !refreshed.is_first_build(),
+        "non-git working-tree change is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
     );
 }
 
@@ -1865,6 +1893,10 @@ fn test_auto_refresh_corrupt_head_with_working_tree_change_reindexes() {
         refreshed.refreshed(),
         "corrupt-HEAD + working-tree edit MUST reindex (AD-379-6, AC13)"
     );
+    assert!(
+        !refreshed.is_first_build(),
+        "corrupt-HEAD reindex is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
+    );
 }
 
 /// AC14 (stampede collapse): two sequential `auto_refresh_if_stale` calls after a
@@ -1892,6 +1924,10 @@ fn test_auto_refresh_working_tree_change_single_rebuild_across_pair() {
     // First call rebuilds.
     let (r1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
     assert!(r1.refreshed(), "first call must rebuild on the edit (AC14)");
+    assert!(
+        !r1.is_first_build(),
+        "working-tree change rebuild is incremental — must be Incremental, not FirstBuild (AC-405-8)"
+    );
     let mtime_after_first = fs::metadata(&manifest_path).unwrap().modified().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
 
@@ -1954,6 +1990,10 @@ fn test_auto_refresh_pre_379_manifest_self_heals_populates_mtime_size() {
     assert!(
         refreshed.refreshed(),
         "pre-#379 manifest (mtime/size None) must self-heal via one rebuild (AC10)"
+    );
+    assert!(
+        !refreshed.is_first_build(),
+        "pre-#379 self-heal is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
     );
 
     // The rewritten manifest now carries populated mtime AND size.
