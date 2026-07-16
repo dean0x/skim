@@ -8,6 +8,7 @@
 //! - Error types use thiserror for ergonomic, typed handling
 //! - CLI/binary code in `crates/rskim/src/cmd/search.rs` handles all I/O
 
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -973,8 +974,6 @@ pub fn near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<u
 
     let n = n as usize;
 
-    use std::collections::HashMap;
-
     // Build q_counts: for each unique query word, how many times it must appear
     // in a valid window (handles D11 distinct-position rule for duplicates).
     let mut q_counts: HashMap<&str, usize> = HashMap::new();
@@ -1205,17 +1204,17 @@ pub fn phrase_near_tokens_present(content: &str, query: &str, n: u32) -> Option<
 
     let k = q_words.len();
 
-    use std::collections::{HashMap, HashSet};
-
-    // Single O(C) pass: build per-word ordinal lists for all query words at once.
-    // Restores O(C) parity with near_tokens_present (types.rs:983-995); the prior
-    // k-pass loop ran one filter_map().collect() per query word — O(k*C).
-    let q_set: HashSet<&str> = q_words.iter().map(|&(qs, qe)| &query[qs..qe]).collect();
-    let mut word_positions: HashMap<&str, Vec<usize>> = HashMap::new();
+    // Single O(C) pass: pre-populate word_positions with all query words then
+    // scan content once, using get_mut as a combined membership-check and append.
+    // This is O(k + C) vs the prior k-pass loop which was O(k*C).
+    let mut word_positions: HashMap<&str, Vec<usize>> = q_words
+        .iter()
+        .map(|&(qs, qe)| (&query[qs..qe], Vec::new()))
+        .collect();
     for (ci, &(cs, ce)) in c_words.iter().enumerate() {
         let cw = &content[cs..ce];
-        if q_set.contains(cw) {
-            word_positions.entry(cw).or_default().push(ci);
+        if let Some(positions) = word_positions.get_mut(cw) {
+            positions.push(ci);
         }
     }
 
