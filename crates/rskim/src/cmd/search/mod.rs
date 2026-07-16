@@ -1122,6 +1122,7 @@ fn run_query(
     // The old guard `if let (Some(sort), Some(db))` silently dropped --limit and --offset
     // on the degraded path (no temporal.db). Fix: bind the condition once and hoist
     // pagination out of the DB-presence branch so it runs unconditionally on temporal arms.
+    let page = types::Page::new(flags.limit, flags.offset);
     if let Some(sort) = flags.temporal_sort {
         if let Some(ref db) = temporal_db {
             temporal::apply_temporal_enrichment(&mut output.results, sort, db)?;
@@ -1139,29 +1140,16 @@ fn run_query(
         // the sound `has_more` terminator — replaces the unsound `len < limit`
         // heuristic on this path.  `pre_page_len > page.depth()` is true when the
         // re-sorted resort window contains more results than the current page consumes.
-        let page = types::Page::new(flags.limit, flags.offset);
         let pre_page_len = output.results.len();
         page.apply(&mut output.results);
         output.total = output.results.len();
         output.has_more = pre_page_len > page.depth();
-        // Mirror run_temporal_standalone: emit the bounded-page-notice to stderr
-        // when has_more is true so agents see the pagination seam without relying on
-        // the unsound len<limit check.  Goes to stderr (PF-006 / AD-404-8) so
-        // --json stdout stays byte-identical.
-        if output.has_more {
-            eprintln!(
-                "{}",
-                temporal::bounded_page_notice(output.total, page.offset(), page.limit())
-            );
-        }
     }
 
-    // AD-404-11 / D-5: emit bounded-page notice on the pure-text path (no temporal
-    // sort) when has_more=true — mirrors the temporal arm above so the stderr
-    // contract is consistent across all text-query dispatch shapes.
+    // AD-404-11 / D-5: emit bounded-page notice on all text-query paths when
+    // has_more is true (pure-text and text+temporal both reach here).
     // Goes to stderr so --json stdout stays byte-identical (PF-006 / AD-404-8).
-    if output.has_more && flags.temporal_sort.is_none() {
-        let page = types::Page::new(flags.limit, flags.offset);
+    if output.has_more {
         eprintln!(
             "{}",
             temporal::bounded_page_notice(output.total, page.offset(), page.limit())

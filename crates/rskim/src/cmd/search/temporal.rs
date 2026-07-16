@@ -581,19 +581,14 @@ fn resort_partners_by_temporal(
 
     // Sort an index Vec by score, then apply the permutation to `partners`.
     let mut indices: Vec<usize> = (0..partners.len()).collect();
-    if sort_mode == TemporalSort::Cold {
-        indices.sort_by(|&a, &b| {
-            scores[a]
-                .partial_cmp(&scores[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    } else {
-        indices.sort_by(|&a, &b| {
-            scores[b]
-                .partial_cmp(&scores[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    }
+    indices.sort_by(|&a, &b| {
+        if sort_mode == TemporalSort::Cold {
+            scores[a].partial_cmp(&scores[b])
+        } else {
+            scores[b].partial_cmp(&scores[a])
+        }
+        .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Apply permutation: collect in sorted order, then replace `partners`.
     *partners = indices.into_iter().map(|i| partners[i].clone()).collect();
