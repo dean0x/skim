@@ -168,7 +168,9 @@ impl TemporalDb {
     ///
     /// Searches both `file_a` and `file_b` columns so the canonical ordering
     /// (lexically smaller path in `file_a`) is transparent to callers.
-    /// Results are sorted by Jaccard similarity descending.
+    /// Results are sorted by Jaccard similarity descending; ties are broken by
+    /// `file_a ASC, file_b ASC` for deterministic page boundaries under
+    /// `--blast-radius --offset` pagination (PF-012 spirit).
     ///
     /// Uses `UNION ALL` of two indexed queries instead of `OR` to allow SQLite
     /// to use both the primary key index on `file_a` and the secondary index on
@@ -189,7 +191,7 @@ impl TemporalDb {
                  UNION ALL \
                  SELECT file_a, file_b, count, jaccard FROM cochange \
                  WHERE file_b = ?1 AND jaccard >= ?2 \
-                 ORDER BY jaccard DESC LIMIT 10000",
+                 ORDER BY jaccard DESC, file_a ASC, file_b ASC LIMIT 10000",
             )
             .map_err(db_err)?;
         let rows = stmt
