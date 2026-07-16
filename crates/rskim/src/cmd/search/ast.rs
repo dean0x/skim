@@ -364,7 +364,7 @@ pub(super) fn run_ast_standalone(
     // AD-405-11: byte-budget gate — bounds query-time I/O to the pre-raise total
     // (window * AST_VERIFY_BYTES_PER_SLOT), so adding 1 MiB-eligible files does not
     // inflate verify-gate latency past the AC11 <500ms target.
-    let verify_budget = (window as u64).saturating_mul(AST_VERIFY_BYTES_PER_SLOT);
+    let verify_budget = compute_verify_budget(window);
     let mut bytes_verified: u64 = 0;
     let total_candidates = pooled.len();
     let mut budget_omitted: usize = 0;
@@ -396,7 +396,7 @@ pub(super) fn run_ast_standalone(
         let file_size = entry
             .and_then(|e| e.size)
             .unwrap_or(rskim_core::AST_SIZE_LIMIT_DEFAULT);
-        if bytes_verified.saturating_add(file_size) > verify_budget {
+        if is_over_budget(bytes_verified, file_size, verify_budget) {
             budget_omitted += 1;
             continue;
         }
@@ -701,6 +701,26 @@ fn write_ast_page_output(
 ///   each candidate file sequentially.  Parallelising across candidates with
 ///   rayon is tracked in #406.
 const AST_VERIFY_BYTES_PER_SLOT: u64 = 100 * 1024;
+
+/// Compute the total byte budget for the structural verify gate.
+///
+/// Returns `window * AST_VERIFY_BYTES_PER_SLOT` using saturating multiplication
+/// so a very large `window` clamps at `u64::MAX` rather than wrapping.
+///
+/// Extracted as a testable helper so unit tests exercise the production formula
+/// instead of reimplementing the arithmetic inline (AD-405-11).
+pub(super) fn compute_verify_budget(window: usize) -> u64 {
+    (window as u64).saturating_mul(AST_VERIFY_BYTES_PER_SLOT)
+}
+
+/// Returns `true` when accruing `file_size` bytes would push `bytes_verified`
+/// past `budget`.
+///
+/// Mirrors the gate check in the verify loop verbatim so tests call the
+/// production predicate, not a hand-rolled copy (AD-405-11).
+pub(super) fn is_over_budget(bytes_verified: u64, file_size: u64, budget: u64) -> bool {
+    bytes_verified.saturating_add(file_size) > budget
+}
 
 /// Read the text of a specific 1-indexed line from a file.
 ///

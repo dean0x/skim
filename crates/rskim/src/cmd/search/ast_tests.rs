@@ -4669,38 +4669,43 @@ fn make_inflated_manifest(
 /// AD-405-11 (unit): budget arithmetic constants are internally coherent.
 ///
 /// - `AST_VERIFY_BYTES_PER_SLOT` equals 100 KiB (pre-raise per-slot constant).
-/// - `verify_budget = window * slot` saturates rather than wraps at usize::MAX.
-/// - A file sized exactly one slot fits in a one-slot budget (boundary: NOT >).
-/// - A file sized one byte over one slot exceeds a one-slot budget.
+/// - `compute_verify_budget` saturates rather than wraps at u64::MAX.
+/// - `is_over_budget` returns `false` for a file sized exactly one slot within a
+///   one-slot budget (boundary: NOT strictly greater).
+/// - `is_over_budget` returns `true` for a file one byte over the slot.
 /// - A size-unknown entry is charged `AST_SIZE_LIMIT_DEFAULT` (1 MiB) — not
-///   `AST_VERIFY_BYTES_PER_SLOT` — so budget can be exhausted on the very first
+///   `AST_VERIFY_BYTES_PER_SLOT` — so `is_over_budget` fires on the very first
 ///   unknown-size candidate when limit is small (AD-405-11 conservative fallback).
+///
+/// The boundary and saturation assertions call the production `compute_verify_budget`
+/// and `is_over_budget` helpers rather than reimplementing the arithmetic inline,
+/// so any change to those helpers is caught immediately here.
 #[test]
 fn ast_verify_budget_constants_and_arithmetic_ad405_11() {
     let slot = super::AST_VERIFY_BYTES_PER_SLOT;
     assert_eq!(slot, 100 * 1024, "slot must be 100 KiB");
 
-    // verify_budget = window * slot: must saturate at u64::MAX, not wrap.
-    let big_window: u64 = u64::MAX / slot + 2; // would overflow u64 if using `*`
-    let saturated = big_window.saturating_mul(slot);
+    // Saturation: compute_verify_budget must clamp at u64::MAX, not wrap.
+    // window chosen so window * slot would overflow u64 with plain multiplication.
+    let big_window = (u64::MAX / slot + 2) as usize;
     assert_eq!(
-        saturated,
+        super::compute_verify_budget(big_window),
         u64::MAX,
-        "budget saturation must clamp at u64::MAX"
+        "compute_verify_budget must clamp at u64::MAX (saturating_mul, not wrapping)"
     );
 
     // Boundary: a file sized exactly one slot FITS in a 1-slot budget (NOT strictly greater).
-    let budget_1slot = slot;
-    let bytes_verified: u64 = 0;
+    let budget_1slot = super::compute_verify_budget(1);
+    assert_eq!(budget_1slot, slot, "1-slot budget must equal one slot");
     assert!(
-        bytes_verified.saturating_add(slot) <= budget_1slot,
-        "a file sized exactly one slot must NOT exceed a 1-slot budget (boundary: NOT >)"
+        !super::is_over_budget(0, slot, budget_1slot),
+        "is_over_budget must return false when accrued == budget (boundary: NOT strictly >)"
     );
 
     // A file one byte over a slot EXCEEDS the 1-slot budget.
     assert!(
-        bytes_verified.saturating_add(slot + 1) > budget_1slot,
-        "a file one byte over one slot must exceed a 1-slot budget"
+        super::is_over_budget(0, slot + 1, budget_1slot),
+        "is_over_budget must return true when accrued > budget"
     );
 
     // Size-unknown fallback is AST_SIZE_LIMIT_DEFAULT (1 MiB), not the slot constant.
@@ -4717,8 +4722,9 @@ fn ast_verify_budget_constants_and_arithmetic_ad405_11() {
          so a single unknown-size candidate exhausts a 1-slot budget"
     );
     assert!(
-        bytes_verified.saturating_add(unknown_size) > budget_1slot,
-        "a size-unknown file (fallback = 1 MiB) must exceed a 1-slot budget (100 KiB)"
+        super::is_over_budget(0, unknown_size, budget_1slot),
+        "is_over_budget must return true for a size-unknown file (fallback = 1 MiB) \
+         against a 1-slot budget (100 KiB)"
     );
 }
 
