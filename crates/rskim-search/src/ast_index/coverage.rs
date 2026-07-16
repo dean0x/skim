@@ -247,20 +247,19 @@ fn insert_into_bounded_sample(
     cap: usize,
 ) {
     // Phase 1: fast-reject when the map is full and path would be evicted.
-    if map.len() >= cap {
-        if let Some(last) = map.keys().next_back() {
-            if path >= *last {
-                return;
-            }
-        }
+    if map.len() >= cap
+        && let Some(last) = map.keys().next_back()
+        && path >= *last
+    {
+        return;
     }
     // Phase 2: insert.
     map.insert(path, file);
     // Phase 3: evict the largest entry if we just exceeded the cap.
-    if map.len() > cap {
-        if let Some(last_key) = map.keys().next_back().cloned() {
-            map.remove(&last_key);
-        }
+    if map.len() > cap
+        && let Some(last_key) = map.keys().next_back().cloned()
+    {
+        map.remove(&last_key);
     }
 }
 

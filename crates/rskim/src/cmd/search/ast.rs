@@ -387,13 +387,15 @@ pub(super) fn run_ast_standalone(
         };
 
         // AD-405-11: accrue file size against the query I/O budget before opening
-        // the file. Fall back to one slot's worth when the manifest size is absent
-        // (conservative: assumes a full-slot file rather than silently granting
-        // unlimited budget).
+        // the file. Fall back to AST_SIZE_LIMIT_DEFAULT (1 MiB — the maximum bytes
+        // read_guarded will ever read) when the manifest size is absent. This is the
+        // truly conservative bound: a size-unknown file can cost up to 1 MiB, so we
+        // charge the worst case rather than the per-slot estimate (100 KiB), which
+        // could under-charge by up to ~10x and allow the I/O bound to be exceeded.
         let entry = manifest.lookup(rel_path);
         let file_size = entry
             .and_then(|e| e.size)
-            .unwrap_or(AST_VERIFY_BYTES_PER_SLOT);
+            .unwrap_or(rskim_core::AST_SIZE_LIMIT_DEFAULT);
         if bytes_verified.saturating_add(file_size) > verify_budget {
             budget_omitted += 1;
             continue;
@@ -494,16 +496,19 @@ pub(super) fn run_ast_standalone(
 
     write_ast_page_output(
         &mut resolved,
-        page,
-        pool_was_capped,
-        temporal_active,
-        is_synthetic,
-        raw_pattern,
-        &query,
+        PageCtx {
+            page,
+            pool_was_capped,
+            temporal_active,
+        },
+        PatternCtx {
+            raw: raw_pattern,
+            query: &query,
+            is_synthetic,
+        },
         root,
         manifest,
-        json,
-        coverage,
+        OutputFmt { json, coverage },
         w,
     )
 }
@@ -512,34 +517,65 @@ pub(super) fn run_ast_standalone(
 // Output phase: pagination + notice + synthetic recovery + format
 // ============================================================================
 
+/// Pagination state for `write_ast_page_output`.
+///
+/// Groups three tightly coupled booleans that jointly govern the page-level
+/// output behaviour: the cursor, the pool-cap flag (drives `has_more`), and
+/// the temporal-active flag (gates the bounded-page notice and the
+/// `resolved.truncate` the caller applied before entry).
+struct PageCtx {
+    page: Page,
+    pool_was_capped: bool,
+    /// Consistent with the `resolved.truncate(temporal_window)` the caller
+    /// applied before `enrich_ast_results` (AD-404-6/7).
+    temporal_active: bool,
+}
+
+/// Pattern identity and routing for `write_ast_page_output`.
+///
+/// Carries the three per-query knobs that route synthetic vs. real-node
+/// post-truncation handling and supply display metadata.
+struct PatternCtx<'a> {
+    raw: &'a str,
+    query: &'a AstQuery,
+    is_synthetic: bool,
+}
+
+/// Output format options for `write_ast_page_output`.
+///
+/// Bundles the two format knobs that are read together at the single
+/// JSON/text dispatch point.
+struct OutputFmt {
+    json: bool,
+    coverage: rskim_search::AstCoverage,
+}
+
 /// Apply pagination, emit the bounded-page notice, run synthetic line recovery,
 /// and write the final output for a standalone `--ast` query.
 ///
 /// Extracted from `run_ast_standalone` to keep that function below the 200-line
 /// threshold. All pagination and output logic lives here; the caller owns the
 /// verify gate, the temporal pre-truncation, and the temporal enrichment steps.
-///
-/// `temporal_active` is consistent with the `resolved.truncate(temporal_window)`
-/// the caller already applied before `enrich_ast_results` (AD-404-6/7).
-// Arguments are all independent caller-supplied knobs (pagination cursor,
-// pool cap flag, temporal flag, synthetic-vs-real routing, pattern string,
-// query handle for recover_line, paths for file I/O, format flag, writer).
-// No natural grouping exists — mirrors run_ast_standalone's own allow.
-#[allow(clippy::too_many_arguments)]
 fn write_ast_page_output(
     resolved: &mut Vec<AstResult>,
-    page: Page,
-    pool_was_capped: bool,
-    temporal_active: bool,
-    is_synthetic: bool,
-    raw_pattern: &str,
-    query: &AstQuery,
+    page_ctx: PageCtx,
+    pattern: PatternCtx<'_>,
     root: &Path,
     manifest: &super::manifest::FileManifest,
-    json: bool,
-    coverage: rskim_search::AstCoverage,
+    fmt: OutputFmt,
     w: &mut impl std::io::Write,
 ) -> anyhow::Result<ExitCode> {
+    let PageCtx {
+        page,
+        pool_was_capped,
+        temporal_active,
+    } = page_ctx;
+    let PatternCtx {
+        raw: raw_pattern,
+        query,
+        is_synthetic,
+    } = pattern;
+    let OutputFmt { json, coverage } = fmt;
     // AD-404-5 / AD-404-11: page.apply() — skip + take. Position is load-bearing
     // (AD-404-3): AFTER verify gate and AFTER temporal re-sort.
     // At offset 0: page.apply() == truncate(limit) — zero regression.
@@ -637,14 +673,22 @@ fn write_ast_page_output(
 // Snippet extraction helpers
 // ============================================================================
 
-/// AD-405-11: byte-budget constant for the structural verify gate.
+/// AD-405-11: per-slot byte allowance for the structural verify gate.
 ///
-/// The gate loop may read at most `window * AST_VERIFY_BYTES_PER_SLOT` bytes
-/// across all candidates in one query.  This is the pre-raise per-slot volume
-/// (100 KiB = the old cap), deliberately DECOUPLED from `AST_SIZE_LIMIT_DEFAULT`
-/// (1 MiB) so raising the cap adds files to the index without inflating query-time
-/// I/O.  Pre-raise workloads cannot exceed `window * 100 KiB` anyway, so the
-/// <500ms AC11 gate holds by construction.
+/// Each file in the candidate pool is charged its manifest-reported size
+/// (or `AST_SIZE_LIMIT_DEFAULT` when the size is unknown) against a total
+/// query-time I/O budget of `window * AST_VERIFY_BYTES_PER_SLOT`.
+///
+/// This constant equals the pre-raise per-file cap (100 KiB = the old
+/// `AST_SIZE_LIMIT_DEFAULT` before the 1 MiB raise), deliberately DECOUPLED
+/// from `AST_SIZE_LIMIT_DEFAULT` (1 MiB) so raising the cap adds files to the
+/// index without proportionally inflating the per-slot query budget.
+/// Pre-raise workloads cannot exceed `window * 100 KiB` anyway (all pre-raise
+/// files are ≤ 100 KiB), so the <500ms AC11 gate holds by construction.
+///
+/// Size-unknown entries (manifest `size = None`) are charged
+/// `AST_SIZE_LIMIT_DEFAULT` (the worst-case `read_guarded` I/O volume) rather
+/// than this per-slot constant — see the budget loop in `run_ast_standalone`.
 ///
 /// ## Follow-ups
 ///
