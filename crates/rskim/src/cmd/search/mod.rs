@@ -1134,9 +1134,26 @@ fn run_query(
             eprintln!("skim search: {NO_TEMPORAL_DATA_MSG}");
         }
         // Pagination applied regardless of DB presence (AD-404-10 guard drift fix).
+        //
+        // AD-404-11 / D-5: capture pre-page count BEFORE page.apply so we can emit
+        // the sound `has_more` terminator — replaces the unsound `len < limit`
+        // heuristic on this path.  `pre_page_len > page.depth()` is true when the
+        // re-sorted resort window contains more results than the current page consumes.
         let page = types::Page::new(flags.limit, flags.offset);
+        let pre_page_len = output.results.len();
         page.apply(&mut output.results);
         output.total = output.results.len();
+        output.has_more = pre_page_len > page.depth();
+        // Mirror run_temporal_standalone: emit the bounded-page-notice to stderr
+        // when has_more is true so agents see the pagination seam without relying on
+        // the unsound len<limit check.  Goes to stderr (PF-006 / AD-404-8) so
+        // --json stdout stays byte-identical.
+        if output.has_more {
+            eprintln!(
+                "{}",
+                temporal::bounded_page_notice(output.total, page.offset(), page.limit())
+            );
+        }
     }
 
     let mut stdout = BufWriter::new(std::io::stdout());
