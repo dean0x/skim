@@ -375,6 +375,58 @@ fn oversized_file_returns_default() {
     );
 }
 
+/// Old 100 KiB cap (bytes) — the lower bound of the newly-included band.
+///
+/// AD-405-1 raised the per-language AST size cap from 100 KiB (all non-SQL
+/// languages) to 1 MiB (unified for all 14 tree-sitter languages). Files in
+/// [100 KiB, 1 MiB) were previously excluded; they must now be indexed.
+#[cfg(test)]
+const OLD_AST_CAP_BYTES: usize = 100 * 1024;
+
+#[test]
+fn midband_file_100kib_to_1mib_is_ast_indexed() {
+    // D-3 regression guard: a file in the newly-included 100 KiB–1 MiB band
+    // must produce non-empty AST nodes. The old threshold was 100 KiB; the new
+    // unified cap (AD-405-1) is 1 MiB. Returning LinearizeResult::default()
+    // silently for midband files would pass every exclusion-direction size test
+    // but fail here — that is the exact D-3 hazard this test exists to catch.
+    let line = "fn func(x: i32) -> i32 { x + 1 }\n";
+    // 4096 repetitions × 33 bytes ≈ 132 KiB — well within [100 KiB, 1 MiB).
+    let source: String = line.repeat(4096);
+
+    let limit = ast_size_limit(Language::Rust).expect("Rust must have a size limit");
+
+    // Self-check: the source must sit in the newly-included band.
+    assert!(
+        source.len() > OLD_AST_CAP_BYTES,
+        "test source ({} bytes) must exceed old 100 KiB cap ({} bytes) to cover \
+         the newly-included band",
+        source.len(),
+        OLD_AST_CAP_BYTES,
+    );
+    assert!(
+        (source.len() as u64) < limit,
+        "test source ({} bytes) must be under the 1 MiB cap ({} bytes) to be indexed",
+        source.len(),
+        limit,
+    );
+
+    let result = parse_and_linearize(&source, Language::Rust);
+    assert!(
+        !result.nodes.is_empty(),
+        "midband file ({} bytes, 100 KiB–1 MiB band) must produce non-empty AST \
+         nodes; got 0 — possible silent-empty-postings regression (D-3)",
+        source.len(),
+    );
+    assert!(
+        result.node_count > 0,
+        "node_count must be > 0 for a midband file ({} bytes); got {}",
+        source.len(),
+        result.node_count,
+    );
+    assert_node_count_invariant(&result);
+}
+
 // ── Cycle 6: Multi-language ───────────────────────────────────────────────────
 
 #[test]
