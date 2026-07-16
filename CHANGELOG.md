@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **`skim search --phrase --near N` composition**: `--phrase` and `--near N` may now be
   combined: the composed semantic is ordered (strictly ascending word positions) AND total span
-  <= N word tokens - a `PhraseNear(N)` verify mode.  Previously `--near` was silently discarded
+  ≤ N word tokens - a `PhraseNear(N)` verify mode.  Previously `--near` was silently discarded
   whenever `--phrase` was also set.  Fix applies at both the index-reader layer (posting
   intersection) and the verify/CLI-gate layer.  `--phrase --near (k-1)` is semantically
   equivalent to `--phrase` for a k-word query; `--phrase --near N` ⊆ `--near N` (never wider
