@@ -33,18 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`auto_refresh_if_stale`).  To force an immediate rebuild: `skim search --rebuild`.
 
 ### Added
-- **`skim search --phrase --near N` composition** — `--phrase` and `--near N` may now be
+- **`skim search --phrase --near N` composition**: `--phrase` and `--near N` may now be
   combined: the composed semantic is ordered (strictly ascending word positions) AND total span
-  ≤ N word tokens — a `PhraseNear(N)` verify mode.  Previously `--near` was silently discarded
+  <= N word tokens - a `PhraseNear(N)` verify mode.  Previously `--near` was silently discarded
   whenever `--phrase` was also set.  Fix applies at both the index-reader layer (posting
   intersection) and the verify/CLI-gate layer.  `--phrase --near (k-1)` is semantically
   equivalent to `--phrase` for a k-word query; `--phrase --near N` ⊆ `--near N` (never wider
   than the bare near result set). (#403)
-- **`verify_mode` in `skim search --json` output** — the `QueryOutput` envelope now includes a
+- **`verify_mode` in `skim search --json` output**: the `QueryOutput` envelope now includes a
   `verify_mode` key (`"phrase"`, `"near"`, or `"phrase_near"`) when a non-default positional
   mode is active.  The key is absent (not null) for plain substring queries to maintain
   byte-identity for existing callers. (#403)
-- **Inert-flag notice for `--phrase` / `--near` on non-text arms** — using `--phrase` or
+- **Inert-flag notice for `--phrase` / `--near` on non-text arms**: using `--phrase` or
   `--near` with `--build`, `--rebuild`, `--update`, `--stats`, `--ast` (standalone), or
   temporal-only queries now prints a notice to stderr instead of silently discarding the flags.
   Exit code remains 0. (#403)
@@ -71,7 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full AST re-parse on every rebuild. (#290)
 
 ### Fixed
-- **`skim search --near` silently dropped when `--phrase` was also set** (#403) —
+- **`skim search --near` silently dropped when `--phrase` was also set** (#403):
   Two independent layers each had the same bug: reader.rs used `if want_phrase { phrase_alignments } else { near_match }`,
   and query.rs used `if phrase { Phrase } else if near { Near }`.  In both cases `--near N`
   was completely ignored when `--phrase` was present.  Fix: both layers now use an exhaustive

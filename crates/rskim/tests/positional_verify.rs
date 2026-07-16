@@ -25,6 +25,7 @@ use assert_cmd::Command;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
+use std::ops::Range;
 use std::path::Path;
 
 // ─── phrase_tokens_present ────────────────────────────────────────────────────
@@ -1883,4 +1884,519 @@ fn ac403_2_predicate_differential_identity() {
              phrase={phrase_result:?} phrase_near(k-1)={pn_result:?}"
         );
     }
+}
+
+// ── AC-403-2 (strengthened): exact Option<Range> identity on all 11 golden fixtures ──
+
+/// AC-403-2 (strengthened): phrase_near_tokens_present(c, q, k-1) must return
+/// the IDENTICAL `Option<Range<usize>>` as phrase_tokens_present(c, q) for each of
+/// the 11 existing golden phrase fixtures at positional_verify.rs:33-172.
+///
+/// Replaces the weaker `is_some()`-only check with `assert_eq!` on the full
+/// Option<Range<usize>> (byte-exact range identity, not just presence/absence).
+///
+/// Single-word fixtures (word_count < 2) are skipped -- the identity k-1=0 is
+/// degenerate for single-word queries.
+///
+/// Byte ranges for the "Some" fixtures were computed from the content strings and
+/// are cross-checked against the existing phrase_returns_correct_byte_range_ac3
+/// and phrase_case_sensitive_ac14 unit tests.
+#[test]
+fn ac403_2_predicate_identity_all_golden_fixtures() {
+    // Each entry: (content, query, expected_Option_Range).
+    // NOTE: is_word_byte includes '_' so "encode_varint" is ONE token.
+    // Fixtures are listed in declaration order (lines 33-172 of this file).
+    let cases: &[(&str, &str, Option<Range<usize>>)] = &[
+        // Fixture 1 -- phrase_exact_match_returns_some
+        // query "encode_varint" is 1 word (underscore is a word byte) -> SKIP
+        (
+            "fn encode_varint(x: u32)",
+            "encode_varint",
+            None, /* SKIP: single word */
+        ),
+        // Fixture 2 -- phrase_trigram_false_positive_is_rejected_ac2
+        // "encode_length" is ONE token; query word "encode" is absent -> None.
+        ("encode_length varint_writer", "encode varint", None),
+        // Fixture 3 -- phrase_multi_word_ordered_match
+        // "encode" = bytes 3..9, "varint" = bytes 10..16.
+        ("fn encode varint bytes end", "encode varint", Some(3..16)),
+        // Fixture 4 -- phrase_reversed_order_not_matched
+        // "encode" at ord 2, "varint" at ord 1 -- reversed, no forward placement.
+        ("fn varint encode bytes", "encode varint", None),
+        // Fixture 5 -- phrase_gap_not_matched
+        // "encode" ord 1, "some" ord 2, "varint" ord 3 -- gap of 1 for k-1=1 ceiling -> None.
+        ("fn encode some varint bytes", "encode varint", None),
+        // Fixture 6 -- phrase_returns_correct_byte_range_ac3
+        // "foo" = bytes 12..15, "bar" = bytes 16..19.
+        // (Verified by the existing byte-range unit test.)
+        ("hello world foo bar baz", "foo bar", Some(12..19)),
+        // Fixture 7 -- phrase_empty_query_returns_none (word_count=0) -> SKIP
+        (
+            "fn encode(x: u32) {}",
+            "",
+            None, /* SKIP: empty query */
+        ),
+        // Fixture 8 -- phrase_separator_only_query_returns_none (word_count=0) -> SKIP
+        (
+            "fn encode(x: u32) {}",
+            "   ",
+            None, /* SKIP: whitespace-only query */
+        ),
+        // Fixture 9 -- phrase_empty_content_returns_none
+        // Empty content -> c_words is empty -> None.
+        ("", "encode varint", None),
+        // Fixture 10a -- phrase_single_word_exact_token_boundary (no-match sub-case)
+        // query "fn" is 1 word -> SKIP
+        ("fn_helper foo bar", "fn", None /* SKIP: single word */),
+        // Fixture 10b -- phrase_single_word_exact_token_boundary (match sub-case)
+        // query "fn" is 1 word -> SKIP
+        ("fn foo bar", "fn", None /* SKIP: single word */),
+        // Fixture 11a -- phrase_case_sensitive_ac14 (wrong-case sub-case)
+        // "Encode" != "encode" (case-sensitive); d[0] for "encode" is empty -> None.
+        ("fn Encode varint foo", "encode varint", None),
+        // Fixture 11b -- phrase_case_sensitive_ac14 (exact-case sub-case)
+        // "encode" = bytes 3..9, "varint" = bytes 10..16.
+        ("fn encode varint foo", "encode varint", Some(3..16)),
+    ];
+
+    for &(content, query, ref expected) in cases {
+        let word_count = query.split_whitespace().count();
+        if word_count < 2 {
+            // Degenerate: single-word or empty query; k-1=0 or k-1<0.  Skip.
+            continue;
+        }
+        let k_minus_1 = (word_count - 1) as u32;
+
+        let phrase_result = phrase_tokens_present(content, query);
+
+        // Sanity: phrase_tokens_present must agree with the documented expected range.
+        assert_eq!(
+            phrase_result, *expected,
+            "AC-403-2 GOLDEN FIXTURE MISMATCH: phrase_tokens_present({content:?}, {query:?}) \
+             expected {expected:?}, got {phrase_result:?}. \
+             The expected range table in this test may need to be updated if the \
+             implementation changed."
+        );
+
+        let pn_result = phrase_near_tokens_present(content, query, k_minus_1);
+
+        // Full Option<Range> identity -- not just is_some() parity.
+        assert_eq!(
+            pn_result, *expected,
+            "AC-403-2 IDENTITY VIOLATION: phrase_near_tokens_present({content:?}, {query:?}, \
+             k-1={k_minus_1}) must return the IDENTICAL Option<Range> as \
+             phrase_tokens_present (both should be {expected:?}); got {pn_result:?}. \
+             This means the greedy fixed-ceiling scan diverges from the adjacent-scan \
+             at k-1 boundary -- a regression in the identity invariant."
+        );
+    }
+}
+
+// ── AC-403-10: text + --near N composition with --ast and --blast-radius ──────
+
+/// AC-403-10a: `text + --near N + --ast <pattern>` must return a non-empty
+/// result set that is a STRICT SUBSET of `text + --near N` alone.
+///
+/// Corpus:
+///   a.rs  "encode xx varint" (span 2 <= N=3) + match expression  -> in composed
+///   b.rs  "encode xx varint" (span 2 <= N=3), no match            -> in near alone, NOT composed
+///   c.rs  "encode aa bb cc varint" (span 4 > N=3) + match        -> excluded by near
+///
+/// Subset property: composed ⊆ near_alone.
+/// Strict: b.rs is in near_alone but NOT in composed (explicit exclusion assertion).
+#[test]
+fn ac403_10_near_ast_composition_strict_subset() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    // a.rs: "encode xx varint" tokens (span 2) inside a match block.
+    fs::write(
+        proj.path().join("a.rs"),
+        "fn process(r: u32) -> u32 {\n\
+         \x20   // encode xx varint\n\
+         \x20   match r {\n\
+         \x20       0 => 0,\n\
+         \x20       _ => 1,\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+
+    // b.rs: same encode/varint span but NO match expression.
+    // query_substring_present: "encode" present, "varint" present -> passes Substring.
+    // Near(3): span=2 <=3 -> passes Near verify.
+    // --ast match-with-arms: no match block -> EXCLUDED from composed.
+    fs::write(
+        proj.path().join("b.rs"),
+        "// encode xx varint\nfn plain() { let x = 1; }\n",
+    )
+    .unwrap();
+
+    // c.rs: match block present but encode..varint span=4 > N=3 -> excluded by --near.
+    fs::write(
+        proj.path().join("c.rs"),
+        "fn check(r: u32) -> u32 {\n\
+         \x20   // encode aa bb cc varint\n\
+         \x20   match r {\n\
+         \x20       0 => 0,\n\
+         \x20       _ => 1,\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+
+    build_index(proj.path(), cache.path());
+
+    // Baseline: text + --near 3 alone.
+    let j_near = search_json(proj.path(), cache.path(), &["--near", "3", "encode varint"]);
+    let near_set = paths(&j_near);
+
+    // Composed: text + --near 3 + --ast match-with-arms.
+    let j_composed = search_json(
+        proj.path(),
+        cache.path(),
+        &["--near", "3", "--ast", "match-with-arms", "encode varint"],
+    );
+    let composed_set = paths(&j_composed);
+
+    // Composed must be non-empty.
+    assert!(
+        !composed_set.is_empty(),
+        "AC-403-10a: composed (--near 3 + --ast match-with-arms) must return >= 1 result; got empty"
+    );
+
+    // Positive: a.rs satisfies BOTH near and ast.
+    assert!(
+        composed_set.contains("a.rs"),
+        "AC-403-10a: a.rs (encode/varint span=2 AND match-with-arms) must be in composed; \
+         got {composed_set:?}"
+    );
+
+    // Strict subset: every file in composed must also be in near_alone.
+    for file in &composed_set {
+        assert!(
+            near_set.contains(file.as_str()),
+            "AC-403-10a: {file} is in (--near 3 + --ast) but NOT in (--near 3 alone) -- \
+             MONOTONICITY VIOLATED; near_set={near_set:?}"
+        );
+    }
+
+    // Exclusion: b.rs has near=true but no match -> absent from composed.
+    assert!(
+        !composed_set.contains("b.rs"),
+        "AC-403-10a: b.rs (span<=3 but no match-with-arms) must be EXCLUDED from composed; \
+         got {composed_set:?}"
+    );
+
+    // Exclusion: c.rs has match but span>3 -> excluded by near.
+    assert!(
+        !composed_set.contains("c.rs"),
+        "AC-403-10a: c.rs (match-with-arms but span>3) must be EXCLUDED from composed; \
+         got {composed_set:?}"
+    );
+}
+
+/// AC-403-10b: `text + --near N + --blast-radius FILE` must return a non-empty
+/// result set that is a STRICT SUBSET of `text + --blast-radius FILE` alone.
+///
+/// Corpus:
+///   target.rs  the blast-radius reference file
+///   a.rs       "encode xx varint" (span 2 <= N=3)           -> in both
+///   b.rs       "encode aa bb cc varint" (span 4 > N=3)      -> in blast alone, NOT composed
+///
+/// Without temporal data the blast-radius path falls back to lexical union using
+/// Substring verify (query_substring_present: EACH token must appear anywhere in
+/// content).  b.rs contains both "encode" and "varint" as substrings so it passes
+/// Substring verify but fails Near(3) verify (span 4 > 3).
+///
+/// Subset property: composed ⊆ blast_alone.
+/// Strict: b.rs is in blast_alone but NOT in composed (explicit exclusion assertion).
+#[test]
+fn ac403_10_near_blast_radius_composition_strict_subset() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    fs::write(proj.path().join("target.rs"), "fn target() {}\n").unwrap();
+
+    // a.rs: encode(0) xx(1) varint(2) -- span=2 <=3. Both in blast_alone and composed.
+    fs::write(proj.path().join("a.rs"), "// encode xx varint\n").unwrap();
+
+    // b.rs: encode(0) aa(1) bb(2) cc(3) varint(4) -- span=4 >3.
+    // Substring verify passes (each token present); Near(3) verify fails.
+    // -> in blast_alone (non-positional), EXCLUDED from composed.
+    fs::write(proj.path().join("b.rs"), "// encode aa bb cc varint\n").unwrap();
+
+    build_index(proj.path(), cache.path());
+
+    // Baseline: text + --blast-radius alone (Substring verify).
+    let j_blast = search_json(
+        proj.path(),
+        cache.path(),
+        &["encode varint", "--blast-radius", "target.rs"],
+    );
+    let blast_set = paths(&j_blast);
+
+    // Composed: text + --near 3 + --blast-radius (Near(3) verify).
+    let j_composed = search_json(
+        proj.path(),
+        cache.path(),
+        &[
+            "--near",
+            "3",
+            "encode varint",
+            "--blast-radius",
+            "target.rs",
+        ],
+    );
+    let composed_set = paths(&j_composed);
+
+    // Composed must be non-empty.
+    assert!(
+        !composed_set.is_empty(),
+        "AC-403-10b: composed (--near 3 + --blast-radius) must return >= 1 result; got empty. \
+         Check that a.rs was indexed and span=2 <=3 passes Near(3) verify."
+    );
+
+    // Positive: a.rs (span=2 <=3) must appear in composed.
+    assert!(
+        composed_set.contains("a.rs"),
+        "AC-403-10b: a.rs (encode/varint span=2) must be in composed; got {composed_set:?}"
+    );
+
+    // Strict subset: every file in composed must also be in blast_alone.
+    for file in &composed_set {
+        assert!(
+            blast_set.contains(file.as_str()),
+            "AC-403-10b: {file} is in (--near 3 + --blast-radius) but NOT in (--blast-radius alone) -- \
+             MONOTONICITY VIOLATED; blast_set={blast_set:?}"
+        );
+    }
+
+    // Exclusion: b.rs passes Substring verify but Near(3) span=4>3 -> excluded.
+    assert!(
+        !composed_set.contains("b.rs"),
+        "AC-403-10b: b.rs (encode/varint span=4 > near N=3) must be EXCLUDED from composed; \
+         got {composed_set:?}"
+    );
+}
+
+// ── AC-403-16 (E2E): line_number anchors at FIRST matched word; line_range clamp ──
+
+/// AC-403-16 (E2E extension): in `--json` output for `--phrase --near N`, the
+/// `line_number` field MUST point to the line of the FIRST matched word (the
+/// leftmost greedy base), not the last matched word.
+///
+/// Also verifies the existing `line_range` clamp invariant:
+///   `end - start <= 2 * DEFAULT_CONTEXT + 1` (= 7).
+///
+/// Corpus: one file where "alpha" is on line 5 and "beta" is on line 7.
+/// With `--phrase --near 6 "alpha beta"` the greedy scan places "alpha" as base.
+/// `line_number` must be 5 (alpha's line), not 7 (beta's line).
+#[test]
+fn ac403_16_e2e_line_number_anchors_at_first_word_multi_line() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    // Lines 1-8; "alpha" on line 5, "beta" on line 7.
+    //
+    // Token ordinals (0-based):
+    //   header(0) comment(1) fn(2) setup(3) fn(4) helper(5) fn(6) configure(7)
+    //   alpha(8) config(9) start(10) bridge(11) comment(12) here(13) beta(14) ...
+    //
+    // span(alpha, beta) = 14 - 8 = 6 <= N=6 -> match with --phrase --near 6.
+    let content = "// header comment\n\
+                   fn setup() {}\n\
+                   fn helper() {}\n\
+                   fn configure() {}\n\
+                   alpha config start;\n\
+                   // bridge comment here\n\
+                   beta result end;\n\
+                   // footer line\n";
+
+    fs::write(proj.path().join("multi.rs"), content).unwrap();
+    build_index(proj.path(), cache.path());
+
+    let json = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "6", "alpha beta"],
+    );
+    let results = json["results"]
+        .as_array()
+        .expect("AC-403-16 E2E: results must be an array");
+
+    assert_eq!(
+        results.len(),
+        1,
+        "AC-403-16 E2E: exactly one result expected; got {results:?}"
+    );
+    let result = &results[0];
+
+    // line_number must be 5 (the line where "alpha" -- the FIRST matched word -- appears).
+    let line_number = result["line_number"]
+        .as_u64()
+        .expect("AC-403-16 E2E: line_number must be present as a number");
+    assert_eq!(
+        line_number, 5,
+        "AC-403-16 E2E: line_number must be 5 (line of 'alpha', the FIRST matched word), \
+         not 7 (line of 'beta', the LAST matched word); got {line_number}. \
+         A re-anchor implementation that uses the last-word position would fail here."
+    );
+
+    // line_range must satisfy the clamp invariant: end - start <= 7.
+    let line_range = &result["line_range"];
+    assert!(
+        !line_range.is_null(),
+        "AC-403-16 E2E: line_range must be present (not null)"
+    );
+    let lr_start = line_range["start"]
+        .as_u64()
+        .expect("AC-403-16 E2E: line_range.start must be a number");
+    let lr_end = line_range["end"]
+        .as_u64()
+        .expect("AC-403-16 E2E: line_range.end must be a number");
+
+    assert!(
+        lr_end - lr_start <= 7,
+        "AC-403-16 E2E: line_range span ({}) must be <= 7 (2*DEFAULT_CONTEXT+1); \
+         start={lr_start} end={lr_end}",
+        lr_end - lr_start
+    );
+    assert!(
+        lr_start <= line_number,
+        "AC-403-16 E2E: line_range.start ({lr_start}) must be <= line_number ({line_number})"
+    );
+    assert!(
+        lr_end > line_number,
+        "AC-403-16 E2E: line_range.end ({lr_end}, exclusive) must be > line_number ({line_number})"
+    );
+}
+
+// ── AC-403-12: --phrase --near 20 latency within 2.0x of --phrase alone ───────
+
+/// AC-403-12: measured release-binary latency on the real repo corpus.
+///
+/// Builds a search index over the workspace root (the ~676-file skim-search
+/// corpus) and times `--phrase <query>` vs `--phrase --near 20 <query>` over
+/// three runs.  The median composed-query time must be within 2.0x the median
+/// baseline time.
+///
+/// Skipped when the release binary does not exist (requires `cargo build
+/// --release` first).  Relative latency is what matters; the 2.0x bound is
+/// generous enough that debug-build timing differences do not affect pass/fail.
+#[test]
+fn ac403_12_phrase_near_latency_within_2x_baseline() {
+    use std::time::Instant;
+
+    // Workspace root -- two parents above CARGO_MANIFEST_DIR (crates/rskim).
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/ parent")
+        .parent()
+        .expect("workspace root");
+
+    // Prefer the release binary for meaningful latency numbers.
+    let release_bin = workspace_root.join("target/release/skim");
+    if !release_bin.exists() {
+        // Skip gracefully -- the test is invalid without the release binary.
+        eprintln!(
+            "ac403_12: SKIP -- release binary not found at {release_bin:?}; \
+             run 'cargo build --release --bin skim' first"
+        );
+        return;
+    }
+
+    let cache = tempfile::tempdir().unwrap();
+
+    // Build the index over the workspace corpus.
+    let build_status = std::process::Command::new(&release_bin)
+        .args(["search", "--build", "--root"])
+        .arg(workspace_root)
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env("NO_COLOR", "1")
+        .status()
+        .expect("ac403_12: failed to invoke skim search --build");
+    assert!(
+        build_status.success(),
+        "ac403_12: skim search --build must succeed on the workspace corpus"
+    );
+
+    // Query that returns results in the real codebase (tokens present in types.rs).
+    const QUERY: &str = "phrase tokens";
+    const RUNS: usize = 3;
+
+    // Warm-up: two runs to amortize filesystem cache effects.
+    for _ in 0..2 {
+        let _ = std::process::Command::new(&release_bin)
+            .args(["search", "--phrase", QUERY, "--root"])
+            .arg(workspace_root)
+            .env("SKIM_CACHE_DIR", cache.path())
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+    }
+
+    // Measure --phrase baseline.
+    let mut baseline_ns: Vec<u128> = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let t0 = Instant::now();
+        let status = std::process::Command::new(&release_bin)
+            .args(["search", "--phrase", QUERY, "--root"])
+            .arg(workspace_root)
+            .env("SKIM_CACHE_DIR", cache.path())
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("NO_COLOR", "1")
+            .status()
+            .unwrap();
+        baseline_ns.push(t0.elapsed().as_nanos());
+        assert!(
+            status.success(),
+            "ac403_12: --phrase baseline query must exit 0"
+        );
+    }
+
+    // Measure --phrase --near 20 composed.
+    let mut composed_ns: Vec<u128> = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let t0 = Instant::now();
+        let status = std::process::Command::new(&release_bin)
+            .args(["search", "--phrase", "--near", "20", QUERY, "--root"])
+            .arg(workspace_root)
+            .env("SKIM_CACHE_DIR", cache.path())
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("NO_COLOR", "1")
+            .status()
+            .unwrap();
+        composed_ns.push(t0.elapsed().as_nanos());
+        assert!(
+            status.success(),
+            "ac403_12: --phrase --near 20 query must exit 0"
+        );
+    }
+
+    // Take median of three runs.
+    baseline_ns.sort_unstable();
+    composed_ns.sort_unstable();
+    let baseline_median = baseline_ns[RUNS / 2];
+    let composed_median = composed_ns[RUNS / 2];
+
+    // If both queries complete in under 1ms (trivially fast corpus), the ratio is
+    // uninteresting -- skip the numeric bound and just verify both exit 0.
+    let ratio = if baseline_median < 1_000_000 {
+        0.0_f64
+    } else {
+        composed_median as f64 / baseline_median as f64
+    };
+
+    assert!(
+        ratio <= 2.0,
+        "AC-403-12: --phrase --near 20 latency ({} ms median) must be within 2.0x the \
+         --phrase-alone baseline ({} ms median); ratio={:.2}x. \
+         A >2x ratio suggests O(candidates * window) behavior instead of O(candidates).",
+        composed_median / 1_000_000,
+        baseline_median / 1_000_000,
+        ratio
+    );
 }
