@@ -57,10 +57,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **`skim search --hot/--cold/--risky/--blast-radius` now honors `--offset`** (#404) —
-  Standalone temporal paths silently ignored `--offset` because `run_temporal_standalone`
-  received a `Page` but the offset was never applied on the pure-temporal branch.  The root
-  cause was threading `limit` as a bare `usize` at the dispatch site and never passing `offset`
-  through.  Fix: `Page{limit, offset}` is now propagated into `query_standalone` (all four
+  Standalone temporal paths silently ignored `--offset` because `limit` was threaded as a
+  bare `usize` at the dispatch site and `offset` was never passed into `run_temporal_standalone`
+  at all.  Fix: `Page{limit, offset}` is now propagated into `query_standalone` (all four
   temporal arms), `format_temporal_text` (page-aware headers and empty-page messages), and a
   bounded-page stderr notice is emitted when `has_more=true` so agents can detect the last
   page without the unsound `len < limit` heuristic.  `has_more` is also present in the JSON
