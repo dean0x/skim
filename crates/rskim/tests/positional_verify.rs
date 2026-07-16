@@ -288,6 +288,66 @@ fn near_case_sensitive_ac14() {
     );
 }
 
+// ─── phrase_near_tokens_present k==1 branch ───────────────────────────────────
+
+/// k==1 branch of phrase_near_tokens_present: single-word query, word present.
+///
+/// The k==1 branch returns the leftmost occurrence directly (span is trivially 0).
+/// A broken k==1 path (e.g., falling into the greedy multi-word scan with k<2)
+/// would either panic (debug_assert fires) or return wrong results.
+///
+/// Guards finding: ac403_18(a) only asserts the verify_mode label, never that
+/// a file is returned or that the range covers the word.
+#[test]
+fn phrase_near_k1_single_word_present_returns_correct_range() {
+    // Single word "encode" present as a standalone token.
+    let content = "fn encode varint bytes";
+    // word ordinals: fn(0), encode(1), varint(2), bytes(3)
+    // k==1 branch: base = d[0][0] = 1, c_words[1] = (3, 9) → "encode"
+    let result = phrase_near_tokens_present(content, "encode", 5);
+    let range = result.expect("k==1: single-word 'encode' must match");
+    assert_eq!(
+        &content[range], "encode",
+        "k==1: range must cover exactly 'encode' (not more, not less)"
+    );
+}
+
+/// k==1 branch of phrase_near_tokens_present: single-word query, word absent → None.
+#[test]
+fn phrase_near_k1_single_word_absent_returns_none() {
+    let result = phrase_near_tokens_present("fn bar baz", "encode", 5);
+    assert!(
+        result.is_none(),
+        "k==1: 'encode' absent from content must return None"
+    );
+}
+
+/// k==1 branch of phrase_near_tokens_present: multiple occurrences → returns LEFTMOST.
+///
+/// The k==1 branch unconditionally takes d[0][0] (first in ascending ordinal order),
+/// which is the leftmost occurrence. A broken implementation taking any other
+/// occurrence would produce a range.start that does not match byte 4 below.
+#[test]
+fn phrase_near_k1_returns_leftmost_occurrence() {
+    // "zzz encode yyy encode"
+    // word ordinals: zzz(0), encode(1), yyy(2), encode(3)
+    // d[0](encode) = [1, 3]; k==1 branch: base = d[0][0] = 1
+    // c_words[1] = "encode" at bytes 4..10 (after "zzz ")
+    let content = "zzz encode yyy encode";
+    let result = phrase_near_tokens_present(content, "encode", 5);
+    let range = result.expect("k==1: 'encode' must match");
+    assert_eq!(
+        range.start, 4,
+        "k==1: must return LEFTMOST 'encode' at byte 4, not the second at byte 15; \
+         got range.start={}",
+        range.start
+    );
+    assert_eq!(
+        &content[range], "encode",
+        "k==1: range must cover exactly 'encode'"
+    );
+}
+
 // ─── word-boundary parity ─────────────────────────────────────────────────────
 
 /// D10: collect_word_spans boundary rule must match word_token_indices.
@@ -1868,6 +1928,89 @@ fn ac403_16_deterministic_anchor_range() {
     );
 }
 
+// ── D-1 multi-base fallback (predicate) ──────────────────────────────────────
+
+/// D-1 greedy multi-base fallback (predicate): the FIRST base in d[0] fails its
+/// fixed ceiling, and a LATER base rescues the match.
+///
+/// Content: `"alpha zzz zzz zzz alpha zzz beta"`
+///   word ordinals: alpha(0) zzz(1) zzz(2) zzz(3) alpha(4) zzz(5) beta(6)
+///   d[0](alpha) = [0, 4],  d[1](beta) = [6]
+///
+/// With n=3:
+///   base=alpha@0 → ceiling = 0+3 = 3; beta@6 > 3 → **FAIL** (first base fails).
+///   base=alpha@4 → ceiling = 4+3 = 7; beta@6 ≤ 7 → **MATCH** (second base rescues).
+///
+/// A regression that only tries d[0][0] and returns None on failure (no loop
+/// continuation) would cause a false-negative here.  Every existing predicate
+/// test had the first base succeed, so such a regression would be undetected.
+#[test]
+fn phrase_near_multi_base_first_fails_second_rescues() {
+    let content = "alpha zzz zzz zzz alpha zzz beta";
+    //  bytes:      0-4   6-8  10-12 14-16 18-22 24-26 28-31
+    //  ordinals:    0     1     2     3     4     5     6
+
+    // n=3: base@0 ceiling=3, beta@6>3 → FAIL; base@4 ceiling=7, beta@6≤7 → MATCH.
+    let result = phrase_near_tokens_present(content, "alpha beta", 3);
+    let range = result.expect(
+        "D-1 multi-base: base alpha@0 fails ceiling 3 (beta@6 > 3); \
+         base alpha@4 must rescue (beta@6 ≤ 7); got None — \
+         likely the greedy loop does not continue past the first failing base",
+    );
+
+    // Range must start at the SECOND alpha (byte 18), not the first (byte 0).
+    // If loop breaks on first failure we'd get None (caught above).
+    // If range.start==0 the first alpha was used but should have been rejected.
+    assert_eq!(
+        range.start, 18,
+        "D-1 multi-base: range.start must be 18 (second alpha, the rescuing base), \
+         not 0 (first alpha, which exceeds its ceiling); got start={}",
+        range.start
+    );
+    assert_eq!(
+        range.end, 32,
+        "D-1 multi-base: range.end must be 32 (end of 'beta'); got end={}",
+        range.end
+    );
+
+    // Control: n=1 — both bases fail (beta@6 > 0+1=1 and beta@6 > 4+1=5).
+    let control = phrase_near_tokens_present(content, "alpha beta", 1);
+    assert!(
+        control.is_none(),
+        "D-1 multi-base control: n=1, both alpha@0 (ceiling 1) and alpha@4 (ceiling 5) \
+         fail (beta@6 > both); got Some"
+    );
+}
+
+// ── D-1 overflow-widening regression (low risk, but contractual) ─────────────
+
+/// D-1 overflow-widening: `phrase_near_tokens_present` with n == u32::MAX must
+/// not panic and must correctly match any ordered pair.
+///
+/// The implementation widens n to usize before `saturating_add`.  On 64-bit
+/// platforms usize is 64-bit so `base.saturating_add(u32::MAX as usize)` is
+/// always representable — no saturation occurs.  This test documents and
+/// exercises the widening contract; it also guards against a hypothetical
+/// cast-before-add regression (e.g. `(base + n) as usize` which could
+/// silently wrap on a 32-bit target).
+#[test]
+fn phrase_near_saturating_add_large_n_no_panic_d1() {
+    // Minimal case: adjacent pair, n = u32::MAX.
+    let result = phrase_near_tokens_present("alpha beta", "alpha beta", u32::MAX);
+    assert!(
+        result.is_some(),
+        "D-1 overflow-widening: n=u32::MAX must not panic and must match adjacent pair"
+    );
+
+    // Non-zero base: ordinal 1 as base, n = u32::MAX - 1.
+    // Ceiling = 1.saturating_add((u32::MAX - 1) as usize) — valid on 64-bit.
+    let result2 = phrase_near_tokens_present("zzz alpha beta", "alpha beta", u32::MAX - 1);
+    assert!(
+        result2.is_some(),
+        "D-1 overflow-widening: n=u32::MAX-1 with nonzero base must not panic and must match"
+    );
+}
+
 // ── AC-403-17: total-span vs per-pair discriminator ───────────────────────────
 
 /// AC-403-17: The TOTAL-SPAN N discriminator.
@@ -1975,6 +2118,74 @@ fn ac403_18_verify_mode_json_field() {
         Some("near"),
         "AC-403-18(d): verify_mode must be 'near' with --near; got {:?}",
         j_n["verify_mode"]
+    );
+}
+
+// ── AC-403-18 k==1 E2E: single-word --phrase --near must return the file ──────
+
+/// AC-403-18 (k==1 E2E): a single-word `--phrase --near N` query must return
+/// the file containing the word AND produce a non-null `line_number`.
+///
+/// `ac403_18(a)` only asserts the `verify_mode` label ("phrase_near") — it does
+/// not verify that `a.rs` actually appears in `results`.  A k==1 branch returning
+/// an empty result set or the wrong anchor would pass the label check but fail here.
+///
+/// This test also exercises the k==1 branch of `count_phrase_near_alignments`
+/// (reader.rs), which returns `d[0].len()` for single positioned-word queries.
+#[test]
+fn ac403_18_k1_single_word_phrase_near_returns_file() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    // a.rs contains "encode_varint" as a standalone word token (underscore is a word byte).
+    fs::write(
+        proj.path().join("a.rs"),
+        "fn encode_varint(x: u64) -> Vec<u8> { vec![] }\n",
+    )
+    .unwrap();
+    // b.rs contains neither "encode_varint" nor any standalone "encode" token.
+    fs::write(
+        proj.path().join("b.rs"),
+        "fn other_function() { let x = 1; }\n",
+    )
+    .unwrap();
+    build_index(proj.path(), cache.path());
+
+    // Single-word query with --phrase --near N exercises the k==1 branch of both
+    // phrase_near_tokens_present (verify gate) and count_phrase_near_alignments (scorer).
+    let json = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "5", "encode_varint"],
+    );
+
+    let got = paths(&json);
+    assert!(
+        got.contains("a.rs"),
+        "AC-403-18 k==1: a.rs (contains 'encode_varint') must be in results; got {got:?}. \
+         A broken k==1 branch returning empty or wrong anchor would fail here."
+    );
+    assert!(
+        !got.contains("b.rs"),
+        "AC-403-18 k==1: b.rs (no 'encode_varint' token) must be absent; got {got:?}"
+    );
+
+    // verify_mode must still be "phrase_near" for --phrase --near (unchanged).
+    assert_eq!(
+        json["verify_mode"].as_str(),
+        Some("phrase_near"),
+        "AC-403-18 k==1: verify_mode must be 'phrase_near'; got {:?}",
+        json["verify_mode"]
+    );
+
+    // line_number must be present (non-null) — the k==1 anchor returns the
+    // leftmost occurrence's byte range, which must resolve to a valid line.
+    let result = &json["results"].as_array().expect("results array")[0];
+    assert!(
+        result["line_number"].as_u64().is_some(),
+        "AC-403-18 k==1: line_number must be present (non-null) for a single-word match; \
+         got {:?}",
+        result["line_number"]
     );
 }
 
@@ -2404,6 +2615,87 @@ fn ac403_16_e2e_line_number_anchors_at_first_word_multi_line() {
     );
 }
 
+// ── D-1 multi-base fallback (E2E) ────────────────────────────────────────────
+
+/// D-1 multi-base fallback (E2E): when the first occurrence of the base word
+/// exceeds the --near ceiling, a later occurrence must rescue the match.
+///
+/// Corpus:
+///   a.rs — "alpha" on line 1 (too far from beta) AND line 2 with adjacent "beta"
+///   b.rs — "alpha" only on line 1, far from beta — never rescued
+///
+/// File a.rs token ordinals (words in comment sections):
+///   Line 1 "// alpha alone here":  alpha(0) alone(1) here(2)
+///   Line 2 "// alpha beta":         alpha(3) beta(4)
+///
+///   d[0](alpha) = [0, 3],  d[1](beta) = [4]
+///
+/// With `--phrase --near 2`:
+///   base=alpha@0 → ceiling 2; beta@4 > 2 → FAIL (first base fails).
+///   base=alpha@3 → ceiling 5; beta@4 ≤ 5 → MATCH (second base rescues).
+///
+/// A regression to first-base-only would return an empty result set for a.rs,
+/// causing it to appear absent.  This test catches that regression.
+#[test]
+fn ac403_d1_multi_base_e2e_second_base_rescues() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    // a.rs: "alpha" on line 1 (ordinal 0, far from beta) and line 2 (ordinal 3,
+    // adjacent to beta at ordinal 4).  With --phrase --near 2:
+    //   base@0 → ceiling=2; beta@4 > 2 → FAIL.
+    //   base@3 → ceiling=5; beta@4 ≤ 5 → MATCH.
+    fs::write(
+        proj.path().join("a.rs"),
+        "// alpha alone here\n// alpha beta\n",
+    )
+    .unwrap();
+    // b.rs: "alpha" at ordinal 0 only; beta at ordinal 7 (far).
+    // base@0 → ceiling=2; beta@7 > 2 → FAIL; no further bases.
+    fs::write(
+        proj.path().join("b.rs"),
+        "// alpha alone here nothing here nothing here beta\n",
+    )
+    .unwrap();
+    build_index(proj.path(), cache.path());
+
+    let json = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "2", "alpha beta"],
+    );
+    let got = paths(&json);
+
+    assert!(
+        got.contains("a.rs"),
+        "D-1 multi-base E2E: a.rs must be returned — second alpha (ordinal 3) rescues the \
+         match (beta at ordinal 4, span=1 ≤ 2); got {got:?}. \
+         A first-base-only implementation would miss this file."
+    );
+    assert!(
+        !got.contains("b.rs"),
+        "D-1 multi-base E2E: b.rs must be absent (only alpha at ordinal 0, \
+         beta at ordinal 7, span=7 > 2); got {got:?}"
+    );
+
+    // line_number must anchor at line 2 (the RESCUING alpha on line 2 + beta on line 2),
+    // NOT line 1 (the FAILING first alpha on line 1).
+    let result = json["results"]
+        .as_array()
+        .expect("results must be an array")
+        .iter()
+        .find(|r| r["path"].as_str().unwrap_or("") == "a.rs")
+        .expect("a.rs must be present in results");
+    let ln = result["line_number"]
+        .as_u64()
+        .expect("D-1 multi-base E2E: line_number must be present");
+    assert_eq!(
+        ln, 2,
+        "D-1 multi-base E2E: line_number must be 2 (rescuing alpha on line 2), \
+         not 1 (failing alpha on line 1); got {ln}"
+    );
+}
+
 // ── AC-403-12: --phrase --near 20 latency within 2.0x of --phrase alone ───────
 
 /// AC-403-12: measured release-binary latency on the real repo corpus.
@@ -2514,14 +2806,23 @@ fn ac403_12_phrase_near_latency_within_2x_baseline() {
     let baseline_median = baseline_ns[RUNS / 2];
     let composed_median = composed_ns[RUNS / 2];
 
-    // If both queries complete in under 1ms (trivially fast corpus), the ratio is
-    // uninteresting -- skip the numeric bound and just verify both exit 0.
-    let ratio = if baseline_median < 1_000_000 {
-        0.0_f64
-    } else {
-        composed_median as f64 / baseline_median as f64
-    };
+    // If both queries complete in under 1ms the corpus is too small to produce a
+    // stable latency ratio.  Silently setting ratio=0.0 would make the assert
+    // trivially pass and hide that the performance bound was never checked.
+    // Instead, skip the numeric bound explicitly so the skip is visible in output,
+    // and rely on the exit-status assertions already run in the loops above.
+    if baseline_median < 1_000_000 {
+        eprintln!(
+            "ac403_12: baseline under 1ms ({} ns median) — skipping numeric ratio assertion; \
+             the 2.0x latency bound requires a corpus large enough to show measurable query \
+             latency (run this test against the real skim-search workspace, ~676 files, for a \
+             binding measurement)",
+            baseline_median
+        );
+        return;
+    }
 
+    let ratio = composed_median as f64 / baseline_median as f64;
     assert!(
         ratio <= 2.0,
         "AC-403-12: --phrase --near 20 latency ({} ms median) must be within 2.0x the \
