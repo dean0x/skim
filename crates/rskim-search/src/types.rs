@@ -1077,6 +1077,51 @@ pub fn near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<u
     None
 }
 
+/// Greedy fixed-ceiling scan for ordered proximity matching.
+///
+/// For each base ordinal in `d[0]` (ascending), attempts to assign a strictly-ascending
+/// ordinal from `d[j]` for `j = 1..k-1`, all within the fixed ceiling
+/// `base.saturating_add(n_span)`. Returns `(base_ord, last_ord)` for the leftmost
+/// valid assignment, or `None` when no valid assignment exists.
+///
+/// **Sync note**: the analogous counting variant `count_phrase_near_alignments`
+/// (reader.rs) operates over `u32` token positions widened to `u64` and counts all
+/// valid assignments rather than returning a range. The two must be kept in sync;
+/// the AC-403-2 identity test suite (positional_verify.rs) is the oracle guard.
+/// Widening difference: `u32`→`u64` in reader.rs, `u32`→`usize` here (usize is the
+/// natural domain for in-memory word-ordinal indices).
+fn greedy_phrase_near_scan(d: &[Vec<usize>], n_span: usize) -> Option<(usize, usize)> {
+    debug_assert!(d.len() >= 2, "caller ensures k >= 2 before delegating here");
+    for &base in &d[0] {
+        // Fixed ceiling: once the base is chosen, ceiling = base + n_span is
+        // immutable for this attempt. Saturating add prevents usize overflow for
+        // very large n (e.g. u32::MAX cast to usize on 32-bit platforms).
+        let ceiling = base.saturating_add(n_span);
+        let mut prev = base;
+        let mut last_ord = base;
+        let mut ok = true;
+        for d_j in &d[1..] {
+            // partition_point(|&p| p <= prev) → index of first p strictly greater
+            // than prev. d_j is sorted ascending, so this is O(log |d_j|).
+            let pos = d_j.partition_point(|&p| p <= prev);
+            match d_j.get(pos) {
+                Some(&p) if p <= ceiling => {
+                    prev = p;
+                    last_ord = p;
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            return Some((base, last_ord));
+        }
+    }
+    None
+}
+
 /// AD-403-2: Ordered proximity predicate. Requires an assignment of one exact
 /// (byte-equal, case-sensitive) doc token per query word at STRICTLY ASCENDING
 /// ordinals (query order enforced), with total ordinal span
@@ -1130,6 +1175,12 @@ pub fn near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<u
 ///   most-used positional hot path (CLAUDE.md: prefer &str slices over allocation in
 ///   hot paths). The two coexist; the identity property above is the oracle guard.
 ///   `phrase_tokens_present` stays BYTE-UNCHANGED.
+/// - **Intentional duplication of the greedy scan**: `greedy_phrase_near_scan` above
+///   (ordinal/usize domain, returns a byte range) is deliberately separate from
+///   `count_phrase_near_alignments` in reader.rs (token-position/u32→u64 domain,
+///   counts all valid assignments). The two must be kept in sync; the AC-403-2
+///   identity test suite (positional_verify.rs) is the oracle guard. See the mirror
+///   note in `count_phrase_near_alignments`.
 ///
 /// Coexists with AD-393-4's total-span rule for bare `--near` — N has one meaning
 /// CLI-wide. Extends AD-393-3 / AD-393-4.
@@ -1154,26 +1205,32 @@ pub fn phrase_near_tokens_present(content: &str, query: &str, n: u32) -> Option<
 
     let k = q_words.len();
 
-    // Build d[j] = sorted list of ordinals (indices into c_words) where the
-    // content token equals query word j (byte-exact).
+    use std::collections::HashMap;
+
+    // Single O(C) pass: build per-word ordinal lists for all query words at once.
+    // Restores O(C) parity with near_tokens_present (types.rs:983-995); the prior
+    // k-pass loop ran one filter_map().collect() per query word — O(k*C).
+    let q_set: HashMap<&str, ()> = q_words
+        .iter()
+        .map(|&(qs, qe)| (&query[qs..qe], ()))
+        .collect();
+    let mut word_positions: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (ci, &(cs, ce)) in c_words.iter().enumerate() {
+        let cw = &content[cs..ce];
+        if q_set.contains_key(cw) {
+            word_positions.entry(cw).or_default().push(ci);
+        }
+    }
+
+    // Build d[j] = sorted ordinals for query word j; early-out if any absent.
+    // Ordinals are already in ascending order (enumerated sequentially above).
     let mut d: Vec<Vec<usize>> = Vec::with_capacity(k);
     for &(qs, qe) in &q_words {
         let qw = &query[qs..qe];
-        let positions: Vec<usize> = c_words
-            .iter()
-            .enumerate()
-            .filter_map(|(ci, &(cs, ce))| {
-                if &content[cs..ce] == qw {
-                    Some(ci)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if positions.is_empty() {
-            return None; // this query word is absent from content
+        match word_positions.get(qw) {
+            Some(positions) => d.push(positions.clone()),
+            None => return None, // this query word absent from content
         }
-        d.push(positions);
     }
 
     // k == 1: any occurrence of the single word is a valid match with span 0.
@@ -1184,49 +1241,17 @@ pub fn phrase_near_tokens_present(content: &str, query: &str, n: u32) -> Option<
         return Some(cs..ce);
     }
 
-    // Greedy scan (section 3.4 of plan):
-    //   for each base p0 in d[0] (ascending):
-    //     ceiling = p0 + n  (fixed, saturating to avoid overflow — PF-004/AD-403-2)
-    //     prev = p0
-    //     for j = 1..k-1:
-    //       p = first element of d[j] strictly greater than prev
-    //       if absent or p > ceiling: fail this base
-    //       prev = p
-    //     if all k placed: MATCH (leftmost base by construction)
-    //
-    // Widening: ordinals are usize, n is u32. Use usize arithmetic with
-    // saturating_add so a very large n (e.g. u32::MAX) never wraps.
+    // Greedy fixed-ceiling scan (section 3.4 of plan; see greedy_phrase_near_scan).
+    // Widening: n is u32; cast to usize (the ordinal domain). saturating_add guards
+    // against overflow when n is very large (e.g. u32::MAX on 64-bit is safe; on a
+    // hypothetical 32-bit target it would saturate to usize::MAX, which is correct).
     let n_span = n as usize;
-
-    for &base in &d[0] {
-        let ceiling = base.saturating_add(n_span);
-        let mut prev = base;
-        let mut last_ord = base;
-        let mut ok = true;
-        for d_j in &d[1..] {
-            // partition_point(|&p| p <= prev) → index of first p strictly greater
-            // than prev.  d_j is sorted, so this is an O(log |d_j|) binary search.
-            let pos = d_j.partition_point(|&p| p <= prev);
-            match d_j.get(pos) {
-                Some(&p) if p <= ceiling => {
-                    prev = p;
-                    last_ord = p;
-                }
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok {
-            // Leftmost base, leftmost continuation at each step → deterministic anchor.
-            let (cs, _) = c_words[base];
-            let (_, ce) = c_words[last_ord];
-            return Some(cs..ce);
-        }
-    }
-
-    None
+    greedy_phrase_near_scan(&d, n_span).map(|(base, last_ord)| {
+        // Leftmost base, leftmost continuation at each step → deterministic anchor.
+        let (cs, _) = c_words[base];
+        let (_, ce) = c_words[last_ord];
+        cs..ce
+    })
 }
 
 // ============================================================================
