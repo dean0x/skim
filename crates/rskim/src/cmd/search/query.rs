@@ -187,7 +187,7 @@ pub(super) fn weights_inert_notice(
 /// self-heals (`HeadChanged` / `WorkingTreeChanged`) — these are the common
 /// case and emitting would contradict the "pure-lexical carries no AST caveat"
 /// promise (AC-405-8).
-pub(super) const AST_COVERAGE_NOTICE: &str = "skim search: note: ";
+pub(super) const AST_COVERAGE_PREFIX: &str = "skim search: note: ";
 
 /// Produce the AST size-coverage notice string, or `None` on a clean corpus.
 ///
@@ -196,7 +196,7 @@ pub(super) const AST_COVERAGE_NOTICE: &str = "skim search: note: ";
 /// guarded `eprintln!` — they never write the notice themselves, keeping the
 /// wording in one place (PF-008 / AD-405-4).
 ///
-/// The returned string ALWAYS starts with [`AST_COVERAGE_NOTICE`]; unit tests
+/// The returned string ALWAYS starts with [`AST_COVERAGE_PREFIX`]; unit tests
 /// assert the prefix from the constant to avoid re-deriving the literal.
 #[must_use]
 pub(super) fn ast_coverage_notice(coverage: &rskim_search::AstCoverage) -> Option<String> {
@@ -237,7 +237,7 @@ pub(super) fn ast_coverage_notice(coverage: &rskim_search::AstCoverage) -> Optio
 
     let body = parts.join(" ");
     Some(format!(
-        "{AST_COVERAGE_NOTICE}{body} They remain fully text-searchable. \
+        "{AST_COVERAGE_PREFIX}{body} They remain fully text-searchable. \
          Run `skim search --stats --json` and read `ast_coverage.excluded` for the sample."
     ))
 }
@@ -447,14 +447,14 @@ pub(super) fn execute_query_with_manifest(
     let manifest = match pre_loaded_manifest {
         Some(m) => m,
         None => {
-            let (refreshed, m) = auto_refresh_if_stale(root, cache_dir, analytics)?;
-            // AC-405-7: emit AST coverage notice when a first-time (NoIndex) or
-            // stale-index build fires on the pure-lexical query path (D-4 cadence).
-            // All build surfaces emit this notice; the pure-lexical path is the only
-            // one that calls auto_refresh_if_stale via this inner branch, so we gate
-            // on `refreshed` here rather than adding a second eprintln! inside
-            // auto_refresh_if_stale (which would double-emit on --update).
-            if refreshed {
+            let (outcome, m) = auto_refresh_if_stale(root, cache_dir, analytics)?;
+            // AC-405-7 / AC-405-8: emit AST coverage notice ONLY when a first-time
+            // (NoIndex) build fires on the pure-lexical query path (D-4 cadence).
+            // Incremental self-heals (HeadChanged / WorkingTreeChanged) must be
+            // silent — they are the common case and emitting would contradict the
+            // "pure-lexical carries no AST caveat" promise (AC-405-8).
+            // `outcome.is_first_build()` distinguishes the two via RefreshOutcome.
+            if outcome.is_first_build() {
                 emit_ast_coverage_notice(&m.ast_coverage());
             }
             m

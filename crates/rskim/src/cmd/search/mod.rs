@@ -183,7 +183,7 @@ pub(crate) fn run(
             let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
             std::fs::create_dir_all(&cache_dir)?;
             // ADR-006: refresh BOTH indexes before opening either engine.
-            let (_refreshed, manifest) =
+            let (_outcome, manifest) =
                 staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
             let temporal_db_path = cache_dir.join("temporal.db");
             // Resolve blast-radius → FileIds BEFORE calling run_ast_standalone.
@@ -794,8 +794,8 @@ fn run_update(
 ) -> anyhow::Result<ExitCode> {
     let (root, cache_dir) = resolve_root_and_cache(root_override)?;
     std::fs::create_dir_all(&cache_dir)?;
-    let (refreshed, manifest) = staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
-    if !refreshed {
+    let (outcome, manifest) = staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+    if !outcome.refreshed() {
         eprintln!("skim search: index is current");
     } else {
         // AD-405-7 / AC-405-17: emit AST coverage notice after --update refreshes
@@ -1043,7 +1043,7 @@ fn run_query(
     // swallows temporal errors internally — callers only see lexical failures.
     let pre_loaded_manifest_from_refresh =
         if flags.temporal_sort.is_some() || flags.blast_radius.is_some() || flags.ast.is_some() {
-            let (_refreshed, manifest) =
+            let (_outcome, manifest) =
                 staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
             Some(manifest)
         } else {

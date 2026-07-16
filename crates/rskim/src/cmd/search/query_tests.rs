@@ -3209,7 +3209,7 @@ fn ac403_search_help_text_positional_documentation() {
 // `ast_coverage_notice` is the single source of truth for the AST size-coverage
 // notice wording, shared by run_build / run_update / run_ast_standalone /
 // run_query / run_stats. AD-405-4 requires every emitting site to print a string
-// starting with the shared `AST_COVERAGE_NOTICE` prefix, and requires the seam to
+// starting with the shared `AST_COVERAGE_PREFIX` prefix, and requires the seam to
 // return `None` on a clean corpus so callers never gate on `is_clean()` themselves.
 // These assertions are falsifiable (PF-007): each fails if the #405 notice contract
 // regresses.
@@ -3239,11 +3239,11 @@ fn ast_coverage_notice_none_on_clean_corpus() {
 }
 
 /// POSITIVE (AD-405-4 / PF-008): an excluded file (over the 1 MiB cap) fires the
-/// notice, which MUST start with the shared `AST_COVERAGE_NOTICE` prefix, report
+/// notice, which MUST start with the shared `AST_COVERAGE_PREFIX` prefix, report
 /// the excluded count, and carry the per-language breakdown.
 #[test]
 fn ast_coverage_notice_fires_with_shared_prefix_when_excluded() {
-    use super::{AST_COVERAGE_NOTICE, ast_coverage_notice};
+    use super::{AST_COVERAGE_PREFIX, ast_coverage_notice};
     use rskim_search::{CoverageEntry, ast_coverage};
 
     let over_cap = rskim_core::AST_SIZE_LIMIT_DEFAULT + 1;
@@ -3260,7 +3260,7 @@ fn ast_coverage_notice_fires_with_shared_prefix_when_excluded() {
     let notice =
         ast_coverage_notice(&dirty).expect("an excluded file must produce a coverage notice");
     assert!(
-        notice.starts_with(AST_COVERAGE_NOTICE),
+        notice.starts_with(AST_COVERAGE_PREFIX),
         "notice must start with the shared prefix (AD-405-4/PF-008): got {notice:?}"
     );
     assert!(
