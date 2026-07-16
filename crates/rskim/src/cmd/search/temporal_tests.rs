@@ -942,8 +942,11 @@ fn golden_arm10_hot_standalone_json_matches_fixture() {
 /// AC-404-12: `format_temporal_text` for arm11 (--blast-radius standalone, 5 partners)
 /// must produce output byte-identical to arm11_blast_standalone.txt.
 ///
-/// The exact tiebreak ordering for the three jaccard=0.2 partners (file3 < file4
-/// < file5, by file_b ASC in the DB query) is pinned here.
+/// The input `partners` vec is pre-ordered in the tiebreak sequence the DB query
+/// produces (file3 < file4 < file5 by `file_b ASC` within the jaccard=0.2 tie
+/// group); `format_temporal_text` renders in input order without re-sorting.
+/// The DB-level tiebreak itself is covered by
+/// `rskim_search::temporal::tests::cochanges_for_file_tiebreak_crosses_union_arms`.
 #[test]
 fn golden_arm11_blast_standalone_text_matches_fixture() {
     // Data extracted from arm11_blast_standalone.json golden fixture.

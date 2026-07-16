@@ -874,6 +874,88 @@ fn top_coldspots_usize_max_does_not_overflow() {
 // ============================================================================
 // Group 11: Schema v2 migration (Step 3)
 // ============================================================================
+//
+// ============================================================================
+// Group 12: Regression — cochange tiebreak ORDER BY file_a ASC, file_b ASC
+// ============================================================================
+
+/// Regression: `cochanges_for_file` must apply `file_a ASC, file_b ASC` as a
+/// secondary tiebreak and NOT rely on UNION arm-1-first incidental order.
+///
+/// The query is a `UNION ALL` of two index scans:
+///   arm 1: `file_a = ?` — returns hub-as-file_a rows via the PK index
+///   arm 2: `file_b = ?` — returns hub-as-file_b rows via the secondary index
+///
+/// Without `file_a ASC, file_b ASC` the SQLite sort is undefined for equal-
+/// jaccard rows; in practice it preserves materialization order (arm 1 before
+/// arm 2).  So the arm-2 row `aaa.rs/hub.rs` (file_a="aaa.rs") would appear
+/// AFTER the arm-1 rows `hub.rs/mmm.rs` and `hub.rs/zzz.rs` (file_a="hub.rs"),
+/// even though "aaa.rs" < "hub.rs" lexically.
+///
+/// **Falsifiability**: removing `file_a ASC, file_b ASC` from the ORDER BY in
+/// `storage_ops::cochanges_for_file` would cause `results[0].file_a` to equal
+/// "hub.rs" (arm-1-first order), breaking the assertion below.
+#[test]
+fn cochanges_for_file_tiebreak_crosses_union_arms() {
+    let (_dir, db) = temp_db();
+
+    // All rows have jaccard=0.5 — fully tied on the primary sort key.
+    // Lexical order: "aaa.rs" < "hub.rs" < "mmm.rs" < "zzz.rs".
+    //
+    // Insert the arm-1 rows FIRST so they get lower rowids and SQLite
+    // materialises them before the arm-2 row during the UNION ALL.  Without the
+    // `file_a ASC, file_b ASC` tiebreak, that incidental materialization order
+    // would survive into the final result, placing hub.rs/* before aaa.rs/hub.rs.
+    db.store_cochanges(&[
+        CochangeRow {
+            // arm-1 hit (hub is file_a)
+            file_a: "hub.rs".to_string(),
+            file_b: "mmm.rs".to_string(),
+            count: 1,
+            jaccard: 0.5,
+        },
+        CochangeRow {
+            // arm-1 hit (hub is file_a)
+            file_a: "hub.rs".to_string(),
+            file_b: "zzz.rs".to_string(),
+            count: 1,
+            jaccard: 0.5,
+        },
+        CochangeRow {
+            // arm-2 hit (hub is file_b); file_a="aaa.rs" < "hub.rs" so the
+            // tiebreak ORDER BY must promote this row before the arm-1 rows.
+            file_a: "aaa.rs".to_string(),
+            file_b: "hub.rs".to_string(),
+            count: 1,
+            jaccard: 0.5,
+        },
+    ])
+    .unwrap();
+
+    let results = db.cochanges_for_file("hub.rs").unwrap();
+    assert_eq!(results.len(), 3, "all three rows must be returned");
+
+    // Expected ORDER BY jaccard DESC, file_a ASC, file_b ASC:
+    //   [0] aaa.rs/hub.rs  — file_a="aaa.rs" < "hub.rs"
+    //   [1] hub.rs/mmm.rs  — file_b="mmm.rs" < "zzz.rs" within equal file_a
+    //   [2] hub.rs/zzz.rs
+    assert_eq!(
+        results[0].file_a, "aaa.rs",
+        "file_a ASC tiebreak must promote the arm-2 row (aaa.rs/hub.rs) before \
+         arm-1 rows (hub.rs/*); without the tiebreak, UNION arm-1-first incidental \
+         order would return hub.rs first"
+    );
+    assert_eq!(results[0].file_b, "hub.rs");
+    assert_eq!(results[1].file_a, "hub.rs");
+    assert_eq!(
+        results[1].file_b, "mmm.rs",
+        "file_b ASC must order mmm.rs before zzz.rs within the same file_a"
+    );
+    assert_eq!(results[2].file_a, "hub.rs");
+    assert_eq!(results[2].file_b, "zzz.rs");
+}
+
+//
 
 #[test]
 fn v1_database_migrates_to_v2_on_reopen() {
