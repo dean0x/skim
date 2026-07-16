@@ -1,11 +1,11 @@
 ---
 feature: hook-binary-pinning
 name: Agent Hook Install, Binary Pinning & Handshake (+ Permissions Seeding)
-description: "Use when modifying hook script generation, adding new agents, changing the hook script format, debugging version-skew or wrong-clone warnings, working on install/reinstall logic, touching wrapper symlink management, editing guidance_content() / the Command wrapping section, or working on skim init --permissions / the PermissionsProtocol subsystem. Keywords: hook install, binary pinning, SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, generate_hook_script, is_hook_script_current, uses_pinned_binary, script_has_pinned_marker, AwarenessOnly, codex, wrapper symlinks, guidance_content, guidance_content_mdc, Command wrapping, PermissionsProtocol, confirm_grant, READ_ONLY_SUBCOMMANDS, hook_config_dir, modifiedArgs, seed tier, sidecar manifest, ADR-004, ADR-005, ADR-006."
+description: "Use when modifying hook script generation, adding new agents, changing the hook script format, debugging version-skew or wrong-clone warnings, working on install/reinstall logic, touching wrapper symlink management, editing guidance_content() / the Command wrapping section, or working on skim init --permissions / the PermissionsProtocol subsystem, or modifying the proxy feature gate / cfg-gated registry entries. Keywords: hook install, binary pinning, SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, generate_hook_script, is_hook_script_current, uses_pinned_binary, script_has_pinned_marker, AwarenessOnly, codex, wrapper symlinks, guidance_content, guidance_content_mdc, Command wrapping, PermissionsProtocol, confirm_grant, READ_ONLY_SUBCOMMANDS, hook_config_dir, modifiedArgs, seed tier, sidecar manifest, proxy feature gate, cfg-gated registry, routing guard, cli_proxy_gating, KNOWN_SUBCOMMANDS, META_SUBCOMMANDS, wrapper_targets, ADR-004, ADR-005, ADR-006, ADR-008."
 category: domain-knowledge
 directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/rewrite, crates/rskim/src/cmd/permissions]
 created: 2026-07-04
-updated: 2026-07-12
+updated: 2026-07-16
 ---
 
 # Agent Hook Install, Binary Pinning & Handshake (+ Permissions Seeding)
@@ -66,6 +66,22 @@ This function in `rewrite/hook.rs` fires only when versions match. It compares (
 ### Codex Is HookSupport::AwarenessOnly
 
 `CodexCliHook` returns `HookSupport::AwarenessOnly`: `generate_script()` returns `""`, `parse_input()` returns `None`, `format_response()` returns `Null`. In `run_hook_mode`, the awareness check fires before any stdin read. Tests for Codex assert NO script and NO handshake.
+
+### Proxy Feature Gate (#352)
+
+The `proxy` subcommand is compiled out of default builds (ADR-008). This is enforced in three coordinated places:
+
+**Registry pair-gate (`registry.rs`)**: `"proxy"` appears in BOTH `KNOWN_SUBCOMMANDS` (line ~72) AND `META_SUBCOMMANDS` (line ~127), each under `#[cfg(feature = "proxy")]`. Because `wrapper_targets() = KNOWN − META`, the cfg-gate must always be applied as a **pair**: if proxy is in KNOWN it must also be in META (and vice versa). A META-only mis-gate would add proxy to `wrapper_targets()` and cause `skim init --wrappers` to create a bogus `~/.skim/bin/proxy` → skim symlink at runtime.
+
+The invariant test `test_proxy_registry_entries_gated_as_a_pair` in `registry.rs` asserts `is_known_subcommand("proxy") == is_meta_subcommand("proxy")` and `!wrapper_targets().contains(&"proxy")`. This assertion is meaningful in **both** feature configs: with proxy ON both return true (equal); with proxy OFF both return false (equal). A mis-gate makes one true and one false, which fails immediately.
+
+**Routing guard (`main.rs`)**: After the known-subcommand check fails (proxy not in KNOWN in default builds), the pre-parse router hits an explicit `#[cfg(not(feature = "proxy"))]` guard that intercepts the bare positional `"proxy"` before falling through to the file-op path. It calls `anyhow::bail!("'proxy' requires a build with --features proxy")`, producing exit 1 with an actionable error on stderr. Without this guard, a file named `proxy` in cwd would be silently skimmed — or the user would get a confusing "No such file or directory" error.
+
+**Cargo optional deps (`Cargo.toml`)**: `rskim-proxy` and `rskim-contract` are `optional = true` in `[dependencies]` and are gated behind the non-default `proxy` feature (`proxy = ["dep:rskim-proxy", "dep:rskim-contract"]`). The rskim-contract **dev-dependency** stays unconditional (needed by contract tests in default builds). rskim-contract also reaches default builds transitively through rskim-compress — this is accepted because rskim-contract carries no HTTP/TLS/async code.
+
+**E2E coverage**: `tests/cli_proxy_gating.rs` is file-gated `#![cfg(not(feature = "proxy"))]` and pins three behaviors: bare `skim proxy` exits 1 with the actionable error, a file named `proxy` in cwd does not defeat the routing guard, and `skim completions bash` does not list `proxy` when the feature is off.
+
+**CI**: the Build Check step builds `--release -p rskim --features proxy` plus a proxy smoke test; separate default-features clippy and gating-test steps run without the feature; `release.yml` passes `--features proxy` on all native and cross builds.
 
 ### Permissions Seeding Subsystem (`cmd/permissions/`)
 
@@ -166,6 +182,8 @@ In `create_hook_script()`: (1) `atomic_write_executable()` then (2) `compute_fil
 
 **Adding `SKIM_PASSTHROUGH` to the guidance template**: enforced by `!content.contains("SKIM_PASSTHROUGH")` negative test assert. Agents that learn about it use it as a default bypass, defeating compression.
 
+**Mis-gating the proxy registry entries**: `"proxy"` must appear in `KNOWN_SUBCOMMANDS` and `META_SUBCOMMANDS` under the **same** `#[cfg(feature = "proxy")]` attribute. Gating only META (not KNOWN) would make `wrapper_targets()` include `"proxy"` in default builds, causing `skim init --wrappers` to create a bogus `~/.skim/bin/proxy` symlink. Gating only KNOWN (not META) is impossible in practice but would break `is_known_subcommand` consistency. The `test_proxy_registry_entries_gated_as_a_pair` test pins this invariant in both feature configs.
+
 ## Gotchas
 
 **`check_hook_binary_mismatch` fires only on same-version**: when versions differ, `check_hook_version_mismatch` logs the version mismatch and returns without calling the binary/commit check. A binary path change coinciding with a version bump is silently skipped until versions re-synchronize.
@@ -188,6 +206,10 @@ In `create_hook_script()`: (1) `atomic_write_executable()` then (2) `compute_fil
 
 **`--permissions` and `--project` are mutually exclusive**: permissions seeding writes to user-scope config files. Project-scoped settings are repository-controlled and must not receive auto-generated allowlist entries. The parser enforces this conflict explicitly.
 
+**Proxy routing guard fires before file-op fallthrough**: in default builds, `skim proxy` with a file named `proxy` in cwd does NOT silently skim that file. The `#[cfg(not(feature = "proxy"))]` guard in `resolve_invocation()` fires after the known-subcommand check fails but before the FileOperation fallthrough. This is intentional — "proxy" as a positional arg always means the subcommand, not a file. Use `skim ./proxy` to skim a file with that name.
+
+**`cli_proxy_gating.rs` is invisible to `--all-features` runs**: the `#![cfg(not(feature = "proxy"))]` file-level gate means the entire test file is excluded when building with `--features proxy`. A CI step that only runs `cargo test --all-features` will not exercise the gating tests. The default-features CI step is the one that provides coverage for the routing guard and completions exclusion.
+
 ## Key Files
 
 - `crates/rskim/src/cmd/init/mod.rs` — `run()` init dispatch, `command()` clap definition, `script_has_pinned_marker()` (single source of truth for the `SKIM_HOOK_BINARY` marker scan)
@@ -202,7 +224,10 @@ In `create_hook_script()`: (1) `atomic_write_executable()` then (2) `compute_fil
 - `crates/rskim/src/cmd/permissions/claude.rs` — Claude writer; `propose_mirrors()` and `is_valid_mirror_source()` (mirror tier logic)
 - `crates/rskim/src/cmd/permissions/copilot.rs` — Copilot writer; per-project-key JSON map, `find_git_root_from(start)` injectable helper, `find_git_root_from_cwd()` thin wrapper
 - `crates/rskim/src/cmd/permissions/sidecar.rs` — `PermissionSidecar`, `load_sidecar`, `write_sidecar`, `SidecarError`
-- `crates/rskim/src/cmd/registry.rs` — `READ_ONLY_SUBCOMMANDS` (8-tool seed set, install-time-only invariant), `KNOWN_SUBCOMMANDS`, `wrapper_targets()`
+- `crates/rskim/src/cmd/registry.rs` — `READ_ONLY_SUBCOMMANDS` (8-tool seed set, install-time-only invariant), `KNOWN_SUBCOMMANDS`, `META_SUBCOMMANDS`, `wrapper_targets()`; `"proxy"` cfg-gated as a pair; `test_proxy_registry_entries_gated_as_a_pair` invariant test
+- `crates/rskim/src/main.rs` — pre-parse routing (`resolve_invocation()`), `#[cfg(not(feature = "proxy"))]` proxy routing guard (actionable exit 1 before file-op fallthrough)
+- `crates/rskim/Cargo.toml` — `proxy = ["dep:rskim-proxy", "dep:rskim-contract"]` feature definition; rskim-contract unconditional dev-dep
+- `crates/rskim/tests/cli_proxy_gating.rs` — E2E integration tests for default-build proxy gating; file-gated `#![cfg(not(feature = "proxy"))]`
 - `crates/rskim/src/cmd/hooks/codex.rs` — `CodexCliHook` (AwarenessOnly reference implementation)
 - `crates/rskim/build.rs` — `SKIM_GIT_COMMIT` build-time injection
 - `crates/rskim/src/cmd/agents/detection.rs` — `detect_copilot_cli` (keys off `~/.copilot`)
@@ -212,6 +237,7 @@ In `create_hook_script()`: (1) `atomic_write_executable()` then (2) `compute_fil
 - ADR-004 (hook install pins absolute binary path + handshake): mandated the pinned-binary format, daily-rate-limited warn-only signaling, and guidance rollout via version-bump re-pin
 - ADR-005 (guidance framed as calibrated trust): prohibits `SKIM_PASSTHROUGH` in the guidance template; enforced by `!content.contains("SKIM_PASSTHROUGH")` negative assert; `!content.contains("rskim")` is a corollary in the same test
 - ADR-006 (hook responses never self-approve — permissions seeding is consent-gated): defines the per-host response matrix (Claude/Copilot = no-verb; Gemini/Crush/Cursor = protocol-forced allow verb); permissions seeding is a separate, install-time, TTY-gated channel; `--yes` never grants; `resolve_permissions_consent` enforces the pre-checks that keep the gate robust
+- ADR-008 (default builds never link async/TLS/HTTP; `proxy` cargo feature is the opt-in, enforced by AC9 CI dep-gate; release builds pass `--features proxy`): the cfg-pair registry gating and main.rs routing guard are the runtime enforcement; the `proxy = ["dep:rskim-proxy", "dep:rskim-contract"]` optional-dep definition is the compile-time enforcement
 - PF-006 (strip_ansi destroys tabs — gh/diff skip_ansi_strip fix): covers wrapper configs that live outside this KB's directories; relevant because `guidance_content` explains command wrapping behavior those wrappers implement
 - PF-004 (rewrite-engine fidelity): connects to the two-surfaces distinction — rewrite-engine properties do not apply to the wrapper surface
 - Feature: `analytics` — session_id flows from hook JSON via sidecar, not via rewritten command flags
