@@ -761,9 +761,7 @@ fn run_build(
     // AD-405-7 / AC-405-17: emit AST coverage notice after an explicit build or
     // rebuild (D-4 cadence).  `result.ast_coverage` was computed in index.rs
     // before `new_manifest.save()` — zero extra I/O (AC-405-12).
-    if let Some(notice) = query::ast_coverage_notice(&result.ast_coverage) {
-        eprintln!("{notice}");
-    }
+    query::emit_ast_coverage_notice(&result.ast_coverage);
 
     // AD-TMP-1: --rebuild/--build must produce a COMPLETE index (lexical + AST +
     // temporal), matching user expectation that "rebuild" rebuilds everything (#357 BUG A).
@@ -802,9 +800,7 @@ fn run_update(
     } else {
         // AD-405-7 / AC-405-17: emit AST coverage notice after --update refreshes
         // the index (D-4 cadence).  Manifest is the post-refresh state.
-        if let Some(notice) = query::ast_coverage_notice(&manifest.ast_coverage()) {
-            eprintln!("{notice}");
-        }
+        query::emit_ast_coverage_notice(&manifest.ast_coverage());
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -946,7 +942,9 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
                     }
                 }
                 if coverage.undetermined_files > 0 {
-                    writeln!(out, "  ast undetermined: {}", coverage.undetermined_files)?;
+                    // "ast no-size" (11 chars) + 3 spaces = 14-char label field;
+                    // colon at column 16 — aligned with all other stats lines.
+                    writeln!(out, "  ast no-size   : {}", coverage.undetermined_files)?;
                 }
             }
         }
@@ -1085,53 +1083,62 @@ fn run_query(
     //
     // Missing index (after refresh) → fail loud (return Err, #199).
     // Query execution failure → degrade gracefully (warn, no AST filter).
-    let (ast_scored, pre_loaded_manifest) = if let Some(ref raw_ast) = flags.ast {
-        // The refresh already ran above: `pre_loaded_manifest_from_refresh` is always
-        // `Some` when `flags.ast.is_some()` (the early-refresh condition includes
-        // `|| flags.ast.is_some()`). Reuse that manifest directly rather than calling
-        // auto_refresh_if_stale a second time (the second call was idempotent but
-        // wasteful — it returned `(false, manifest)` immediately on Current).
-        let manifest = pre_loaded_manifest_from_refresh
-            .expect("manifest must be present when flags.ast is Some (invariant)");
-        let engine = ast::open_ast_engine(&cache_dir)?;
-        // Changed from #199 (lossy HashSet) to #198 (scored vec for RRF).
-        // resolve_ast_scored returns Vec<(FileId, f64)> sorted FileId-ASC,
-        // preserving AST scores so intersect_and_rank can build the rank map.
-        let ast_scored = match ast::resolve_ast_scored(&engine, raw_ast) {
-            Ok(hits) => {
-                if hits.is_empty() {
-                    // AC-405-10: append excluded-file count when non-zero so the
-                    // compound path mirrors the standalone path in output.rs.
-                    let excluded = manifest.ast_coverage().size_excluded_files;
-                    if excluded > 0 {
-                        eprintln!(
-                            "skim search: --ast {:?} matched no indexed files \
+    // AC-405-10 / AD-405-7: compute ast_coverage once here, before the match, so
+    // the empty-hits branch and compound_ast_coverage share a single O(N) pass.
+    // Carried forward in the tuple as `cached_ast_coverage` to avoid a second call
+    // at the compound_ast_coverage site below (eliminating the redundant double pass
+    // on the compound --ast empty-hits path).
+    let (ast_scored, pre_loaded_manifest, cached_ast_coverage) =
+        if let Some(ref raw_ast) = flags.ast {
+            // The refresh already ran above: `pre_loaded_manifest_from_refresh` is always
+            // `Some` when `flags.ast.is_some()` (the early-refresh condition includes
+            // `|| flags.ast.is_some()`). Reuse that manifest directly rather than calling
+            // auto_refresh_if_stale a second time (the second call was idempotent but
+            // wasteful — it returned `(false, manifest)` immediately on Current).
+            let manifest = pre_loaded_manifest_from_refresh
+                .expect("manifest must be present when flags.ast is Some (invariant)");
+            let engine = ast::open_ast_engine(&cache_dir)?;
+            // Compute coverage once: reused by both the empty-hits message below and
+            // the compound_ast_coverage binding after this block (no second pass).
+            let coverage = manifest.ast_coverage();
+            // Changed from #199 (lossy HashSet) to #198 (scored vec for RRF).
+            // resolve_ast_scored returns Vec<(FileId, f64)> sorted FileId-ASC,
+            // preserving AST scores so intersect_and_rank can build the rank map.
+            let ast_scored = match ast::resolve_ast_scored(&engine, raw_ast) {
+                Ok(hits) => {
+                    if hits.is_empty() {
+                        // AC-405-10: append excluded-file count when non-zero so the
+                        // compound path mirrors the standalone path in output.rs.
+                        let excluded = coverage.size_excluded_files;
+                        if excluded > 0 {
+                            eprintln!(
+                                "skim search: --ast {:?} matched no indexed files \
                              ({excluded} file(s) excluded from AST indexing by size cap \
                              — run `skim search --stats --json`.)",
-                            raw_ast
-                        );
-                    } else {
-                        eprintln!("skim search: --ast {:?} matched no indexed files", raw_ast);
+                                raw_ast
+                            );
+                        } else {
+                            eprintln!("skim search: --ast {:?} matched no indexed files", raw_ast);
+                        }
                     }
+                    Some(hits)
                 }
-                Some(hits)
-            }
-            Err(e) => {
-                // Query execution failure: degrade gracefully (warn, no AST filter).
-                // Warning always goes to stderr — even in --json mode — so it does
-                // not pollute the JSON stream (sibling warnings also go to stderr).
-                eprintln!("skim search: AST query warning: {e}");
-                None
-            }
+                Err(e) => {
+                    // Query execution failure: degrade gracefully (warn, no AST filter).
+                    // Warning always goes to stderr — even in --json mode — so it does
+                    // not pollute the JSON stream (sibling warnings also go to stderr).
+                    eprintln!("skim search: AST query warning: {e}");
+                    None
+                }
+            };
+            (ast_scored, Some(manifest), Some(coverage))
+        } else {
+            // Pure-lexical path: no --ast flag. Pass the manifest from the early
+            // refresh (if we did one) so execute_query_with_manifest skips its own
+            // auto_refresh_if_stale call. When no refresh was needed (no temporal or
+            // AST flag), pass None so execute_query_with_manifest does its own refresh.
+            (None, pre_loaded_manifest_from_refresh, None)
         };
-        (ast_scored, Some(manifest))
-    } else {
-        // Pure-lexical path: no --ast flag. Pass the manifest from the early
-        // refresh (if we did one) so execute_query_with_manifest skips its own
-        // auto_refresh_if_stale call. When no refresh was needed (no temporal or
-        // AST flag), pass None so execute_query_with_manifest does its own refresh.
-        (None, pre_loaded_manifest_from_refresh)
-    };
 
     // AD-403-6: degenerate --near diagnostic (fail loud, never silently — ADR-001).
     // Emitted here on the text-query path ONLY (has_text is true by construction).
@@ -1182,21 +1189,10 @@ fn run_query(
         lang: flags.lang,
     };
 
-    // AD-405-7 / AC-405-17: compute AST coverage BEFORE moving the manifest into
-    // execute_query_with_manifest.  Only meaningful on --ast paths (D-4 cadence).
-    // Pure-lexical paths keep None → ast_coverage key absent from JSON (D-5).
-    let compound_ast_coverage: Option<rskim_search::AstCoverage> = if flags.ast.is_some() {
-        Some(
-            pre_loaded_manifest
-                .as_ref()
-                .map(|m| m.ast_coverage())
-                // Defensive fallback: manifest invariant holds (expect() above), but
-                // avoid a panic if the invariant ever breaks in tests.
-                .unwrap_or_else(|| rskim_search::ast_coverage(std::iter::empty())),
-        )
-    } else {
-        None
-    };
+    // AD-405-7 / AC-405-17: AST coverage was already computed once in the block
+    // above (carried in `cached_ast_coverage`) — no second manifest pass needed.
+    // Pure-lexical paths carry None → ast_coverage key absent from JSON (D-5).
+    let compound_ast_coverage = cached_ast_coverage;
 
     // Pass the already-refreshed manifest to execute_query_with_manifest.  When
     // pre_loaded_manifest is Some (temporal or AST flag active — refresh happened
@@ -1254,10 +1250,8 @@ fn run_query(
     // cadence).  Notice goes to stderr so --json stdout stays byte-identical.
     // Wire coverage into output for the JSON key (D-5): omit when clean so the
     // key is absent on healthy repos (avoids noise for well-maintained codebases).
-    if let Some(ref cov) = compound_ast_coverage
-        && let Some(notice) = query::ast_coverage_notice(cov)
-    {
-        eprintln!("{notice}");
+    if let Some(ref cov) = compound_ast_coverage {
+        query::emit_ast_coverage_notice(cov);
     }
     output.ast_coverage =
         compound_ast_coverage.and_then(|c| if c.is_clean() { None } else { Some(c) });

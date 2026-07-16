@@ -242,6 +242,20 @@ pub(super) fn ast_coverage_notice(coverage: &rskim_search::AstCoverage) -> Optio
     ))
 }
 
+/// Emit the AST coverage advisory notice to stderr when coverage is non-clean.
+///
+/// Encapsulates the recurring `if let Some(notice) = ast_coverage_notice(cov) { eprintln!(...) }`
+/// pattern shared across all five notice-cadence sites (run_build, run_update,
+/// run_query compound path, run_ast_standalone, and the auto_refresh inner
+/// branch of execute_query_with_manifest) so a future wording or routing change
+/// touches exactly one function.  No-op on a clean corpus (delegates to
+/// [`ast_coverage_notice`] which returns `None` when `is_clean()` is true).
+pub(super) fn emit_ast_coverage_notice(coverage: &rskim_search::AstCoverage) {
+    if let Some(notice) = ast_coverage_notice(coverage) {
+        eprintln!("{notice}");
+    }
+}
+
 // ============================================================================
 // Verify-mode selection (AD-393-5, AD-403-1)
 // ============================================================================
@@ -440,8 +454,8 @@ pub(super) fn execute_query_with_manifest(
             // one that calls auto_refresh_if_stale via this inner branch, so we gate
             // on `refreshed` here rather than adding a second eprintln! inside
             // auto_refresh_if_stale (which would double-emit on --update).
-            if refreshed && let Some(notice) = ast_coverage_notice(&m.ast_coverage()) {
-                eprintln!("{notice}");
+            if refreshed {
+                emit_ast_coverage_notice(&m.ast_coverage());
             }
             m
         }

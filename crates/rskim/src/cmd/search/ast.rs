@@ -490,9 +490,7 @@ pub(super) fn run_ast_standalone(
     // AD-405-7 / AC-405-17: compute coverage from the already-loaded manifest
     // (zero extra I/O). Emit notice on the standalone --ast surface (D-4 cadence).
     let coverage = manifest.ast_coverage();
-    if let Some(notice) = super::query::ast_coverage_notice(&coverage) {
-        eprintln!("{notice}");
-    }
+    super::query::emit_ast_coverage_notice(&coverage);
 
     write_ast_page_output(
         &mut resolved,

@@ -3946,3 +3946,199 @@ fn test_ac4_run_build_stderr_names_skipped_bundle() {
         "AC4 stderr: run_build must name 'bundle.js' in the skip sample; got: {stderr:?}"
     );
 }
+
+// ============================================================================
+// AC-405-9 / AC-405-15 — --stats AST coverage: omit-when-clean + present-when-dirty
+// ============================================================================
+
+/// AC-405-9 — `--stats --json` omits `ast_coverage` when the corpus is clean
+/// (all files within the 1 MiB AST size cap, no files with unknown size).
+///
+/// The `ast_coverage` key must be ABSENT from the JSON object (omit-when-clean
+/// contract from AD-405-7 / D-5 / AC-405-9).
+///
+/// PF-007 discriminating: if `build_stats_json` forgets the `is_clean()` guard
+/// and unconditionally serialises `ast_coverage`, this test fails immediately.
+#[test]
+fn test_ac_405_9_stats_json_ast_coverage_absent_when_clean() {
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    // Small file — well within the 1 MiB AST size cap.
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    build_index(&config).expect("build must succeed");
+
+    let stats_json = super::super::stats_json_for_test(cache.path(), root)
+        .expect("stats_json_for_test must succeed");
+
+    assert!(
+        stats_json.get("ast_coverage").is_none(),
+        "AC-405-9: 'ast_coverage' key must be absent when all files are within the \
+         AST size cap (omit-when-clean guard); got key: {:?}",
+        stats_json.get("ast_coverage")
+    );
+}
+
+/// AC-405-15 — `--stats --json` includes `ast_coverage` when the corpus has
+/// files exceeding the AST size cap (`is_clean() == false`).
+///
+/// PF-007 discriminating: if `build_stats_json` omits `ast_coverage` regardless
+/// of corpus state (missing the dirty code path), or the `is_clean()` guard is
+/// inverted, this test fails.
+#[test]
+fn test_ac_405_15_stats_json_ast_coverage_present_when_dirty() {
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+
+    // Write a multi-line Rust file that exceeds the 1 MiB AST size cap so it is
+    // classified SIZE-EXCLUDED and `coverage.is_clean() == false`.
+    //
+    // Multi-line (one short function per line) so the minified gate does NOT fire:
+    // the gate requires ≤1 newline in the first 8 KiB probe; this file has ~819
+    // newlines in the first 8 KiB → well above the gate threshold → not minified.
+    //
+    // "fn x() {}\n" = 10 bytes.  We need total_size > AST_SIZE_LIMIT_DEFAULT.
+    // (AST_SIZE_LIMIT_DEFAULT / 10 + 1) lines × 10 bytes = cap + 10 bytes > cap.
+    let line = "fn x() {}\n";
+    let n_lines = rskim_core::AST_SIZE_LIMIT_DEFAULT as usize / line.len() + 1;
+    fs::write(root.join("huge.rs"), line.repeat(n_lines)).unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    build_index(&config).expect("build must succeed");
+
+    let stats_json = super::super::stats_json_for_test(cache.path(), root)
+        .expect("stats_json_for_test must succeed");
+
+    // AC-405-15: ast_coverage key must be PRESENT and non-trivial when dirty.
+    let ast_cov = stats_json.get("ast_coverage").unwrap_or_else(|| {
+        panic!(
+            "AC-405-15: 'ast_coverage' key must be present when corpus has files \
+             exceeding the AST size cap; stats_json: {stats_json}"
+        )
+    });
+
+    let excluded = ast_cov["size_excluded_files"].as_u64().unwrap_or(0);
+    assert!(
+        excluded >= 1,
+        "AC-405-15: ast_coverage.size_excluded_files must be >= 1; \
+         got ast_coverage: {ast_cov}"
+    );
+
+    let by_lang_rust = ast_cov["excluded_by_lang"]["rust"].as_u64().unwrap_or(0);
+    assert!(
+        by_lang_rust >= 1,
+        "AC-405-15: ast_coverage.excluded_by_lang.rust must be >= 1; \
+         got ast_coverage: {ast_cov}"
+    );
+}
+
+/// AC-405-9/15 text + finding 4 — `--stats` text mode shows the AST coverage
+/// section with correctly aligned column labels when the corpus is dirty, and
+/// every `  ast …` line has its colon at column 16 (0-indexed).
+///
+/// Guards the fix for finding 4 (ticket/405-ast-size-cap): the old label
+/// "  ast undetermined: N" had no space before ':' and placed the colon at
+/// column 18, breaking the shared column used by all other stats lines.
+/// The fixed label is "  ast no-size   : N" — colon at column 16.
+///
+/// Driven via the binary (subprocess) to capture real stdout from `run_stats`.
+#[test]
+fn test_ac_405_text_stats_ast_section_column_alignment() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache_base = tempfile::tempdir().unwrap();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+
+    // Same multi-line 1+ MiB Rust file technique as the JSON dirty test above.
+    let line = "fn x() {}\n";
+    let n_lines = rskim_core::AST_SIZE_LIMIT_DEFAULT as usize / line.len() + 1;
+    fs::write(root.join("huge.rs"), line.repeat(n_lines)).unwrap();
+
+    let bin = std::env::var("CARGO_BIN_EXE_skim").unwrap_or_else(|_| {
+        let mut p = std::env::current_exe().unwrap();
+        p.pop(); // deps/
+        p.pop(); // debug/ or release/
+        p.push("skim");
+        p.to_string_lossy().to_string()
+    });
+
+    // Step 1: build the index (using the binary so build and stats share the
+    // same SKIM_CACHE_DIR-based cache resolution).
+    let build_out = std::process::Command::new(&bin)
+        .args(["search", "--build", "--root"])
+        .arg(root)
+        .env("SKIM_CACHE_DIR", cache_base.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim search --build must launch");
+    assert!(
+        build_out.status.success(),
+        "build must succeed; stderr={}",
+        String::from_utf8_lossy(&build_out.stderr)
+    );
+
+    // Step 2: run --stats in text mode.
+    let stats_out = std::process::Command::new(&bin)
+        .args(["search", "--stats", "--root"])
+        .arg(root)
+        .env("SKIM_CACHE_DIR", cache_base.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim search --stats must launch");
+    assert!(
+        stats_out.status.success(),
+        "--stats must succeed; stderr={}",
+        String::from_utf8_lossy(&stats_out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&stats_out.stdout);
+
+    // AC-405-15 text: the AST coverage section must appear (corpus is dirty).
+    assert!(
+        stdout.contains("  ast eligible  :"),
+        "AC-405-15 text: must contain aligned 'ast eligible  :' label; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  ast excluded  :"),
+        "AC-405-15 text: must contain aligned 'ast excluded  :' label; got:\n{stdout}"
+    );
+
+    // Finding 4 guard: every `  ast …` line must have ':' at column 16 (0-indexed).
+    // Regression: "  ast undetermined: N" placed the colon at column 18 — this
+    // assertion catches any reintroduction of that misalignment.
+    for text_line in stdout.lines() {
+        if text_line.starts_with("  ast ") {
+            let colon_pos = text_line
+                .find(':')
+                .unwrap_or_else(|| panic!("AST stats line must contain ':': {text_line:?}"));
+            assert_eq!(
+                colon_pos, 16,
+                "finding 4: colon must be at column 16 in AST stats line; \
+                 got col={colon_pos} in {:?}\nFull stats:\n{stdout}",
+                text_line
+            );
+        }
+    }
+}
