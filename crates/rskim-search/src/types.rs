@@ -1205,19 +1205,16 @@ pub fn phrase_near_tokens_present(content: &str, query: &str, n: u32) -> Option<
 
     let k = q_words.len();
 
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     // Single O(C) pass: build per-word ordinal lists for all query words at once.
     // Restores O(C) parity with near_tokens_present (types.rs:983-995); the prior
     // k-pass loop ran one filter_map().collect() per query word — O(k*C).
-    let q_set: HashMap<&str, ()> = q_words
-        .iter()
-        .map(|&(qs, qe)| (&query[qs..qe], ()))
-        .collect();
+    let q_set: HashSet<&str> = q_words.iter().map(|&(qs, qe)| &query[qs..qe]).collect();
     let mut word_positions: HashMap<&str, Vec<usize>> = HashMap::new();
     for (ci, &(cs, ce)) in c_words.iter().enumerate() {
         let cw = &content[cs..ce];
-        if q_set.contains_key(cw) {
+        if q_set.contains(cw) {
             word_positions.entry(cw).or_default().push(ci);
         }
     }
