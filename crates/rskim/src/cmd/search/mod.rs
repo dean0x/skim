@@ -1324,7 +1324,7 @@ Positional query options:
                    Inert without a text query.
 
   --phrase --near N  Require query words in order (strictly ascending positions) AND
-                   total span <= N word tokens (same N as bare --near). Narrows
+                   total span ≤ N word tokens (same N as bare --near). Narrows
                    --near N by additionally enforcing query word order; never grows
                    the result set versus bare --near N.
                    Identity: --phrase --near (k-1) == --phrase for a k-word query.
