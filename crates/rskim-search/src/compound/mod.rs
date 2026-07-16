@@ -39,7 +39,6 @@ pub use intersection::{
 pub use merge::{merge_composite, merge_layer_scores};
 pub use output::{AstResult, TemporalAnnotation, format_ast_json, format_ast_text};
 pub use proximity::dir_proximity_score;
-// MAX_REPARSE_FILE_BYTES was deleted in #405 (AD-405-2); re-export removed.
 pub use reparse::{find_first_strict_match, pattern_occurs_in_file, recover_line};
 pub use weights::{
     CompositeWeights6, WEIGHT6_AST, WEIGHT6_DIR_PROXIMITY, WEIGHT6_IMPORT_GRAPH, WEIGHT6_LEXICAL,

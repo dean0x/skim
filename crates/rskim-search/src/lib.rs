@@ -109,7 +109,6 @@ pub use compound::{
 };
 // #201: enriched result row type, formatters, and line-span re-parse.
 // #397: find_first_strict_match — single strict-ancestor predicate for both gate and anchor.
-// #405: MAX_REPARSE_FILE_BYTES removed (AD-405-2); use rskim_core::ast_size_limit.
 pub use compound::{
     AstResult, TemporalAnnotation, find_first_strict_match, format_ast_json, format_ast_text,
     pattern_occurs_in_file, recover_line,

@@ -273,9 +273,7 @@ impl<'a> std::iter::FusedIterator for AstWalkIter<'a> {}
 /// the 2.57 MB auto-generated `weights.rs` table.
 ///
 /// The old two-tier (100 KiB for all except SQL, 1 MiB for SQL) collapses
-/// into this single value.  `ast_size_limit` is the ONLY definition; the
-/// private `MAX_FILE_SIZE` / `MAX_FILE_SIZE_LARGE` duplicates in
-/// `rskim-search/linearize.rs` and `rskim-research/ast_extract.rs` are deleted.
+/// into this single value.  `ast_size_limit` is the ONLY definition.
 pub const AST_SIZE_LIMIT_DEFAULT: u64 = 1024 * 1024;
 
 /// Return the maximum file size accepted for AST indexing and re-parsing for
@@ -628,11 +626,6 @@ mod tests {
             Language::Kotlin,
             Language::Swift,
         ];
-        assert_eq!(
-            tree_sitter_langs.len(),
-            14,
-            "expected exactly 14 tree-sitter languages"
-        );
 
         for lang in tree_sitter_langs {
             assert_eq!(
@@ -649,11 +642,6 @@ mod tests {
         use crate::Language;
 
         let data_format_langs = [Language::Json, Language::Yaml, Language::Toml];
-        assert_eq!(
-            data_format_langs.len(),
-            3,
-            "expected exactly 3 data-format languages"
-        );
 
         for lang in data_format_langs {
             assert_eq!(
