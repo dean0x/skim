@@ -398,7 +398,7 @@ pub(super) fn execute_query_with_manifest(
     // as the exact-symbol path (AD-372-3), so they share its branch below.
     let positional = config.phrase || config.near.is_some();
 
-    let raw_results = if exact_symbol || positional {
+    let (raw_results, pool_was_capped) = if exact_symbol || positional {
         // AD-372-3 / RESOLVED Decision 3 (extended to the positional path, #392):
         // sq.limit = None: reader returns the FULL ranked intersection so that the
         // post-verify skip (below) operates on the verified set, not the pre-verify
@@ -407,6 +407,10 @@ pub(super) fn execute_query_with_manifest(
         // verify step — page-2 could silently omit a file that was at rank-1 after
         // verification.  Setting sq.offset = None (reader default) keeps the full
         // ranked intersection intact for the post-verify pagination below.
+        //
+        // pool_was_capped = false: sq.limit = None means the reader returns the
+        // complete intersection — no external pool cap exists on this path, so
+        // has_more is never conservatively inflated by a pool-cap signal.
         let mut sq = SearchQuery::new(config.text.clone());
         sq.limit = None;
         // sq.offset is intentionally left as None (== reader default 0): offset is
@@ -415,7 +419,7 @@ pub(super) fn execute_query_with_manifest(
         sq.phrase = config.phrase;
         sq.near = config.near;
         sq.lang = config.lang; // D17 / AC16: --lang honored on positional + exact paths
-        engine.search(&sq)?
+        (engine.search(&sq)?, false)
     } else {
         // Multi-word / default: widen pool via LEXICAL_CANDIDATE_POOL_K (AD-355-2).
         // phrase/near are false/None here by construction (positional is false);
@@ -434,7 +438,17 @@ pub(super) fn execute_query_with_manifest(
         sq.phrase = config.phrase;
         sq.near = config.near;
         sq.lang = config.lang; // D17 / AC16: --lang honored on BM25F UNION path
-        engine.search(&sq)?
+        let results = engine.search(&sq)?;
+        // AD-404-11 / D-5 pool-cap signal (cross-path consistency with AST path):
+        // if the reader returned exactly pool_limit candidates it filled the pool to
+        // the ceiling — there may be additional qualifying files beyond it that the
+        // verify gate never sees.  Set pool_was_capped conservatively so
+        // resolve_paths_and_snippets_verified can report has_more = true even when
+        // the probe-then-truncate check finds exactly `limit` verified rows.
+        // Direction is safe: a false positive (says "more" when there are none)
+        // prompts one redundant paginate; a false negative silently drops results.
+        let capped = results.len() == pool_limit;
+        (results, capped)
     };
 
     // Resolve snippets, verify with the correct predicate, then truncate to --limit LAST.
@@ -459,6 +473,7 @@ pub(super) fn execute_query_with_manifest(
             limit: config.limit,
             offset: effective_offset,
             verify_mode: verify_mode_for(config.phrase, config.near),
+            pool_was_capped,
         },
     );
 
@@ -662,6 +677,10 @@ fn run_compound_query(
             limit: config.limit,
             offset: effective_offset,
             verify_mode: verify_mode_for(config.phrase, config.near),
+            // Pool = exact AST∩lexical set (AD-356-1): the reader's file_filter
+            // restricts candidates to exactly the AST-matched FileId set, so the
+            // pool is tight and cannot be capped by an external K-multiplier.
+            pool_was_capped: false,
         },
     );
     let total = results.len();
@@ -967,6 +986,21 @@ struct SnippetVerifyParams<'a> {
     ///   trigram-containment false positives, e.g. `encode_length varint_writer`
     ///   must NOT match when the query is `encode varint`.
     verify_mode: VerifyMode,
+    /// Conservative pool-cap fallback for has_more (AD-404-11 / D-5).
+    ///
+    /// When `true`, has_more is set to `true` even if the probe-then-truncate
+    /// check finds exactly `limit` verified results — because the pre-verify pool
+    /// was filled to its ceiling and there may be additional qualifying candidates
+    /// beyond it that the verify gate never saw.  Mirrors the AST path's
+    /// `pool_was_capped` logic (ast.rs line `pool_was_capped = pooled.len() == window
+    /// && raw_count > window`), closing the cross-path consistency gap.
+    ///
+    /// Always `false` on the exact-symbol / positional path (sq.limit = None →
+    /// full intersection, no ceiling) and on the compound text+AST path (pool is
+    /// the exact AST-intersection set, no K-multiplier cap).  Only non-trivially
+    /// `true` on the multi-word BM25F path when the reader fills its pool to
+    /// `candidate_pool(limit, K) + offset`.
+    pool_was_capped: bool,
 }
 
 /// Map `FileId`s to paths, extract snippets, **verify substring membership**,
@@ -1012,6 +1046,7 @@ fn resolve_paths_and_snippets_verified(
         limit,
         offset,
         verify_mode,
+        pool_was_capped,
     } = params;
     // AD-404-11 / D-5: probe one extra result beyond the page boundary so we can
     // report `has_more` without a full second pass over the verified set.
@@ -1064,7 +1099,14 @@ fn resolve_paths_and_snippets_verified(
         .skip(offset)
         .take(limit.saturating_add(1))
         .collect();
-    let has_more = probe.len() > limit;
+    // AD-404-11 / D-5: probe-then-truncate has_more check.
+    // `probe.len() > limit` fires when the probe item (rank offset+limit+1) exists
+    // in the verified set.  `pool_was_capped` is the conservative pool-cap fallback:
+    // when the pre-verify pool was filled to its ceiling there may be additional
+    // qualifying candidates beyond it that verification never read — so has_more is
+    // set true even when the probe check alone would produce false.  Mirrors the
+    // AST path (`has_more = pre_page_len > page.depth() || pool_was_capped`).
+    let has_more = probe.len() > limit || pool_was_capped;
     probe.truncate(limit);
     (probe, has_more)
 }

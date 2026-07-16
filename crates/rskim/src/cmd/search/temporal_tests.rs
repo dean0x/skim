@@ -2407,3 +2407,133 @@ fn blast_radius_sort_offset_nonzero_has_more_via_depth() {
         other => panic!("expected Cochanges, got {other:?}"),
     }
 }
+
+// ============================================================================
+// D-5 / AD-404-11: has_more terminator — text+temporal path (mod.rs run_query)
+//
+// run_query overwrites output.has_more after apply_temporal_enrichment:
+//
+//   let page = types::Page::new(flags.limit, flags.offset);
+//   let pre_page_len = output.results.len();
+//   page.apply(&mut output.results);
+//   output.total = output.results.len();
+//   output.has_more = pre_page_len > page.depth();
+//
+// These tests exercise that formula in isolation to guard the D-5 terminator
+// on this path (the blast-radius composite path is guarded by
+// test_ac13_limit_applied_after_fusion_rank_then_limit; this set covers the
+// text+temporal overwrite arm which has no equivalent integration test).
+// ============================================================================
+
+/// D-5: has_more is true when the resort window produces more results than the
+/// page depth (limit+offset).  Simulates resort_window(1)=5 results fetched
+/// for limit=1 — any of the 5 enriched results beyond the page triggers has_more.
+#[test]
+fn test_text_temporal_has_more_true_when_resort_window_overflows_page() {
+    use crate::cmd::search::types::Page;
+
+    // resort_window(limit=1) fetches 5 results (the candidate window).
+    // After enrichment all 5 survive; page = limit:1, offset:0 → depth=1.
+    let mut results = vec![
+        make_result("a.rs", 5.0),
+        make_result("b.rs", 4.0),
+        make_result("c.rs", 3.0),
+        make_result("d.rs", 2.0),
+        make_result("e.rs", 1.0),
+    ];
+    let page = Page::new(1, None); // limit=1, offset=0 → depth=1
+    let pre_page_len = results.len();
+    page.apply(&mut results);
+    let has_more = pre_page_len > page.depth();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "page.apply truncates resort window to limit=1"
+    );
+    assert!(
+        has_more,
+        "D-5 text+temporal: has_more must be true when 5 resort candidates > depth(1)"
+    );
+}
+
+/// D-5: has_more is false when the result count exactly equals the page limit
+/// with no offset (resort window exhausted without overflow).
+#[test]
+fn test_text_temporal_has_more_false_when_results_equal_limit() {
+    use crate::cmd::search::types::Page;
+
+    // Exactly 2 results, page = limit:2, offset:0 → depth=2.
+    // pre_page_len(2) > depth(2) is false → has_more = false.
+    let mut results = vec![make_result("a.rs", 2.0), make_result("b.rs", 1.0)];
+    let page = Page::new(2, None); // limit=2, offset=0
+    let pre_page_len = results.len();
+    page.apply(&mut results);
+    let has_more = pre_page_len > page.depth();
+
+    assert_eq!(
+        results.len(),
+        2,
+        "page.apply preserves all results when count == limit"
+    );
+    assert!(
+        !has_more,
+        "D-5 text+temporal: has_more must be false when result count ({}) == depth({})",
+        pre_page_len,
+        page.depth()
+    );
+}
+
+/// D-5: has_more with a non-zero offset.  depth = limit + offset; has_more is
+/// true iff pre_page_len > depth.  Exercises both sides of the boundary.
+#[test]
+fn test_text_temporal_has_more_with_nonzero_offset() {
+    use crate::cmd::search::types::Page;
+
+    // Exactly 3 results, page = limit:2, offset:1 → depth=3.
+    // pre_page_len(3) > depth(3) is false → has_more = false.
+    let mut results_exact = vec![
+        make_result("a.rs", 3.0),
+        make_result("b.rs", 2.0),
+        make_result("c.rs", 1.0),
+    ];
+    let page = Page::new(2, Some(1)); // limit=2, offset=1 → depth=3
+    let pre_exact = results_exact.len();
+    page.apply(&mut results_exact);
+    let has_more_exact = pre_exact > page.depth();
+
+    assert_eq!(
+        results_exact.len(),
+        2,
+        "page.apply skips 1 then truncates to limit=2"
+    );
+    assert!(
+        !has_more_exact,
+        "D-5 text+temporal offset: has_more must be false when count ({}) == depth({})",
+        pre_exact,
+        page.depth()
+    );
+
+    // 4 results, same page → pre_page_len(4) > depth(3) → has_more = true.
+    let mut results_overflow = vec![
+        make_result("a.rs", 4.0),
+        make_result("b.rs", 3.0),
+        make_result("c.rs", 2.0),
+        make_result("d.rs", 1.0),
+    ];
+    let pre_overflow = results_overflow.len();
+    page.apply(&mut results_overflow);
+    let has_more_overflow = pre_overflow > page.depth();
+
+    assert_eq!(
+        results_overflow.len(),
+        2,
+        "page.apply skips 1 then truncates to 2"
+    );
+    assert!(
+        has_more_overflow,
+        "D-5 text+temporal offset: has_more must be true when count ({}) > depth({})",
+        pre_overflow,
+        page.depth()
+    );
+}

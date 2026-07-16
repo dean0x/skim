@@ -697,6 +697,16 @@ fn test_ac13_limit_applied_after_fusion_rank_then_limit() {
         output.results.len(),
         output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
     );
+    // D-5 / AD-404-11: blast-radius composite path must set has_more=true when
+    // candidate count (2) exceeds limit (1).  The probe-then-truncate logic in
+    // run_blast_radius_composite_query collects limit+1=2 items, finds len > limit,
+    // sets has_more=true, then truncates to limit=1.
+    assert!(
+        output.has_more,
+        "D-5: blast-radius composite must set has_more=true when \
+        UNION candidate count (2) > limit (1); got has_more={}",
+        output.has_more
+    );
 }
 
 // ============================================================================
