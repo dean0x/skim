@@ -127,7 +127,7 @@ pub struct CoverageEntry {
 ///   Entries from the manifest's `skipped_entries` map (files > 5 MiB walk cap)
 ///   are disjoint by construction and must NOT be passed here (AC-405-14).
 /// - **Language resolve (AD-405-6):** stored `lang` string is parsed first via
-///   `parse_lang_name`; if that fails, `Language::from_path` is tried on the
+///   `Language::from_name`; if that fails, `Language::from_path` is tried on the
 ///   `path`.  Only if BOTH fail is the file counted as UNDETERMINED.
 ///
 /// ## AD-405-5: Bounded sample algorithm
@@ -137,7 +137,8 @@ pub struct CoverageEntry {
 /// last entry (lexicographically largest path) to keep the MAP bounded at
 /// exactly `cap` entries throughout.  At the end the map contains the
 /// lexicographically smallest `cap` paths.  This is O(N log cap) — correct and
-/// cheap.
+/// cheap.  The two-phase insert-then-evict logic is encapsulated in
+/// [`insert_into_bounded_sample`] to keep this function readable.
 #[must_use]
 pub fn ast_coverage(entries: impl IntoIterator<Item = CoverageEntry>) -> AstCoverage {
     let mut size_eligible_files: u64 = 0;
@@ -149,7 +150,7 @@ pub fn ast_coverage(entries: impl IntoIterator<Item = CoverageEntry>) -> AstCove
 
     for entry in entries {
         // Two-tier language resolve (AD-405-6).
-        let lang_opt = parse_lang_name(&entry.lang)
+        let lang_opt = Language::from_name(&entry.lang)
             .or_else(|| Language::from_path(std::path::Path::new(&entry.path)));
 
         let Some(lang) = lang_opt else {
@@ -182,30 +183,18 @@ pub fn ast_coverage(entries: impl IntoIterator<Item = CoverageEntry>) -> AstCove
 
                 // Bounded sample: keep the `AST_COVERAGE_EXCLUDED_SAMPLE_CAP`
                 // lexicographically smallest paths (AD-405-5 / PF-012).
-                if sample_map.len() < AST_COVERAGE_EXCLUDED_SAMPLE_CAP
-                    || sample_map
-                        .keys()
-                        .next_back()
-                        .map(|last| entry.path < *last)
-                        .unwrap_or(true)
-                {
-                    sample_map.insert(
-                        entry.path.clone(),
-                        AstExcludedFile {
-                            path: entry.path,
-                            lang: lang_name.to_string(),
-                            size_bytes: sz,
-                            limit_bytes: cap,
-                            reason: "ast_size_cap".to_string(),
-                        },
-                    );
-                    // Evict the last entry if we exceeded the cap.
-                    if sample_map.len() > AST_COVERAGE_EXCLUDED_SAMPLE_CAP
-                        && let Some(last_key) = sample_map.keys().next_back().cloned()
-                    {
-                        sample_map.remove(&last_key);
-                    }
-                }
+                insert_into_bounded_sample(
+                    &mut sample_map,
+                    entry.path.clone(),
+                    AstExcludedFile {
+                        path: entry.path,
+                        lang: lang_name.to_string(),
+                        size_bytes: sz,
+                        limit_bytes: cap,
+                        reason: "ast_size_cap".to_string(),
+                    },
+                    AST_COVERAGE_EXCLUDED_SAMPLE_CAP,
+                );
             }
         }
     }
@@ -229,31 +218,39 @@ pub fn ast_coverage(entries: impl IntoIterator<Item = CoverageEntry>) -> AstCove
 // Internal helpers
 // ============================================================================
 
-/// Try to parse a lowercase language name string into a `Language`.
+/// Insert `path`→`file` into `map`, keeping at most `cap` lexicographically
+/// smallest entries (AD-405-5).
 ///
-/// Checks the canonical lowercase representations used by the manifest
-/// (`"rust"`, `"typescript"`, etc.).  Returns `None` if the string is unknown.
-fn parse_lang_name(s: &str) -> Option<Language> {
-    // Match against the lowercase display forms used by Language serialisation.
-    match s {
-        "typescript" => Some(Language::TypeScript),
-        "javascript" => Some(Language::JavaScript),
-        "python" => Some(Language::Python),
-        "rust" => Some(Language::Rust),
-        "go" => Some(Language::Go),
-        "java" => Some(Language::Java),
-        "markdown" => Some(Language::Markdown),
-        "json" => Some(Language::Json),
-        "yaml" => Some(Language::Yaml),
-        "c" => Some(Language::C),
-        "cpp" | "c++" => Some(Language::Cpp),
-        "toml" => Some(Language::Toml),
-        "csharp" | "c#" => Some(Language::CSharp),
-        "ruby" => Some(Language::Ruby),
-        "sql" => Some(Language::Sql),
-        "kotlin" => Some(Language::Kotlin),
-        "swift" => Some(Language::Swift),
-        _ => None,
+/// Two-phase algorithm:
+/// 1. **Fast-reject** — if the map is already full and `path` is ≥ the current
+///    maximum, it would be evicted immediately after insertion, so skip it.
+/// 2. **Insert** — add the entry unconditionally.
+/// 3. **Evict** — if the map now exceeds `cap`, remove the lexicographically
+///    largest entry.
+///
+/// The result is that `map` always holds the `cap` smallest paths seen so far,
+/// with O(log cap) cost per call and O(cap) total allocation.
+fn insert_into_bounded_sample(
+    map: &mut BTreeMap<String, AstExcludedFile>,
+    path: String,
+    file: AstExcludedFile,
+    cap: usize,
+) {
+    // Phase 1: fast-reject when the map is full and path would be evicted.
+    if map.len() >= cap {
+        if let Some(last) = map.keys().next_back() {
+            if path >= *last {
+                return;
+            }
+        }
+    }
+    // Phase 2: insert.
+    map.insert(path, file);
+    // Phase 3: evict the largest entry if we just exceeded the cap.
+    if map.len() > cap {
+        if let Some(last_key) = map.keys().next_back().cloned() {
+            map.remove(&last_key);
+        }
     }
 }
 
