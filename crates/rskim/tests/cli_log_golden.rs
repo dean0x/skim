@@ -186,9 +186,18 @@ fn cli_log_golden_counterfix() {
     let (z_str, _) = after_unique
         .split_once(" duplicates removed)")
         .expect("header must contain ' duplicates removed)'");
-    let x: i64 = x_str.trim().parse().expect("x (total lines) must be an integer");
-    let y: i64 = y_str.trim().parse().expect("y (unique lines) must be an integer");
-    let z: i64 = z_str.trim().parse().expect("z (duplicates removed) must be an integer");
+    let x: i64 = x_str
+        .trim()
+        .parse()
+        .expect("x (total lines) must be an integer");
+    let y: i64 = y_str
+        .trim()
+        .parse()
+        .expect("y (unique lines) must be an integer");
+    let z: i64 = z_str
+        .trim()
+        .parse()
+        .expect("z (duplicates removed) must be an integer");
 
     // Annotation line: "2 debug lines hidden (skim log --debug-only)"
     let debug_line = lines
@@ -199,7 +208,10 @@ fn cli_log_golden_counterfix() {
         .trim()
         .split_once(" debug lines hidden")
         .expect("debug annotation must begin with an integer");
-    let d: i64 = d_str.trim().parse().expect("d (debug lines hidden) must be an integer");
+    let d: i64 = d_str
+        .trim()
+        .parse()
+        .expect("d (debug lines hidden) must be an integer");
 
     // Guard against i64 underflow before the subtraction.
     assert!(
@@ -227,8 +239,7 @@ fn cli_log_golden_counterfix() {
 // is incorrectly compressing this fixture.
 // ============================================================================
 
-const PASSTHROUGH_INPUT: &[u8] =
-    include_bytes!("fixtures/cmd/log/stack_trace_python_chained.txt");
+const PASSTHROUGH_INPUT: &[u8] = include_bytes!("fixtures/cmd/log/stack_trace_python_chained.txt");
 
 /// PASSTHROUGH golden: skim log must emit the original fixture byte-identical.
 ///

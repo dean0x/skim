@@ -70,7 +70,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "prettier",    // linter
     "printenv",    // file operations
     #[cfg(feature = "proxy")]
-    "proxy",       // meta: skim Layer-3 HTTP reverse proxy (#303)
+    "proxy", // meta: skim Layer-3 HTTP reverse proxy (#303)
     "ps",          // file operations
     "psql",        // database
     "pytest",      // test runner

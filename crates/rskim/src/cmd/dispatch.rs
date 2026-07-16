@@ -7,12 +7,12 @@
 use std::io::{self, Write};
 use std::process::{Command, ExitCode};
 
+#[cfg(feature = "proxy")]
+use super::proxy;
 use super::{
     KNOWN_SUBCOMMANDS, agents, build, completions, db, discover, file, git, heatmap, infra, init,
     learn, lint, log, pkg, rewrite, sanitize_for_display, search, stats, test,
 };
-#[cfg(feature = "proxy")]
-use super::proxy;
 
 // ============================================================================
 // Defense-in-depth: strip stray --session-id from subcommand args
