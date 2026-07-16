@@ -61,13 +61,13 @@
 //! (`read_guarded`) now call the same function so the two gates are guaranteed
 //! to admit the identical set of files (AC-405-21).
 //!
-//! The old `MAX_REPARSE_FILE_BYTES = 100 * 1024` constant was deleted in #405
-//! because it was a flat 100 KiB applied BEFORE `Language::from_path`, so SQL
-//! files in the 100 KiB..1 MiB band were linearised (build-time gate passed via
-//! the old `MAX_FILE_SIZE_LARGE` exception) but then dropped at query time (the
-//! flat 100 KiB gate fired first, before language resolution).  `read_guarded`
-//! now resolves the language FIRST, then calls `ast_size_limit(lang)?`, so the
-//! two gates are coupled to the same language-aware cap.
+//! The #405 fix replaced a flat pre-language-resolution byte cap with the
+//! language-aware `ast_size_limit(lang)` call.  The old design applied a hard
+//! byte limit BEFORE language detection, so language-specific files in the
+//! 100 KiB–1 MiB band were indexed at build time (the language-specific cap
+//! applied there) but dropped at query time (the flat cap fired first).
+//! `read_guarded` now resolves the language FIRST, then calls `ast_size_limit(lang)?`,
+//! so the two gates are coupled to the same language-aware cap.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -312,9 +312,9 @@ pub fn recover_line(
 ///
 /// `Language::from_path` is called BEFORE the size gate so that
 /// `ast_size_limit(lang)` returns the language-aware cap.  The old ordering
-/// (flat `MAX_REPARSE_FILE_BYTES` before language resolution) silently dropped
-/// SQL files in the 100 KiB..1 MiB band that the build-time gate had already
-/// admitted via the old SQL-specific exception.  With this PR, the same
+/// applied a flat byte cap before language detection, silently dropping
+/// language-specific files in the 100 KiB–1 MiB band that the build-time gate
+/// had already admitted.  With this PR, the same
 /// `ast_size_limit` function is used at both build-time and query-time, so the
 /// two gates are guaranteed to admit the identical set (AC-405-21).
 ///

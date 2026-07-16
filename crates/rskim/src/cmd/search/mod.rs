@@ -1100,7 +1100,19 @@ fn run_query(
         let ast_scored = match ast::resolve_ast_scored(&engine, raw_ast) {
             Ok(hits) => {
                 if hits.is_empty() {
-                    eprintln!("skim search: --ast {:?} matched no indexed files", raw_ast);
+                    // AC-405-10: append excluded-file count when non-zero so the
+                    // compound path mirrors the standalone path in output.rs.
+                    let excluded = manifest.ast_coverage().size_excluded_files;
+                    if excluded > 0 {
+                        eprintln!(
+                            "skim search: --ast {:?} matched no indexed files \
+                             ({excluded} file(s) excluded from AST indexing by size cap \
+                             — run `skim search --stats --json`.)",
+                            raw_ast
+                        );
+                    } else {
+                        eprintln!("skim search: --ast {:?} matched no indexed files", raw_ast);
+                    }
                 }
                 Some(hits)
             }

@@ -22,10 +22,9 @@ use crate::types::SourceFile;
 // wherever a local override is needed, or use `AstWalkConfig::default()` to
 // pick up both at once.
 
-// MAX_FILE_SIZE and MAX_FILE_SIZE_LARGE were deleted in #405.
-// The single cap is now rskim_core::ast_size_limit(language) -> Option<u64>
+// Per-file size gate: rskim_core::ast_size_limit(language) -> Option<u64>
 // (AD-405-1 / AC-405-21).  Both rskim-search and rskim-research share the
-// same function so drift is impossible by construction.
+// same function so drift between the two crates is impossible by construction.
 
 /// Maximum number of trigrams collected per file (memory guard).
 const MAX_TRIGRAMS_PER_FILE: usize = 50_000;

@@ -647,6 +647,17 @@ fn write_ast_page_output(
 /// (1 MiB) so raising the cap adds files to the index without inflating query-time
 /// I/O.  Pre-raise workloads cannot exceed `window * 100 KiB` anyway, so the
 /// <500ms AC11 gate holds by construction.
+///
+/// ## Follow-ups
+///
+/// - **FU-1 (node/depth-cap accounting):** Node and depth counters in
+///   `AstWalkConfig` (`DEFAULT_MAX_NODES`, `DEFAULT_MAX_DEPTH`) are not
+///   accounted for in the byte budget — a tree-sitter walk that terminates
+///   early due to node/depth limits may still consume fewer bytes than this
+///   slot allows.  Proper accounting is a tracked follow-up.
+/// - **FU-2 (rayon parallelize verify gate, #406):** The gate currently runs
+///   each candidate file sequentially.  Parallelising across candidates with
+///   rayon is tracked in #406.
 const AST_VERIFY_BYTES_PER_SLOT: u64 = 100 * 1024;
 
 /// Read the text of a specific 1-indexed line from a file.
