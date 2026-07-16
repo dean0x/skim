@@ -595,6 +595,75 @@ mod tests {
         );
     }
 
+    // ── ast_size_limit contract (AD-405-1 / AD-405-13) ───────────────────────
+
+    /// All 14 tree-sitter languages must return `Some(AST_SIZE_LIMIT_DEFAULT)`.
+    ///
+    /// The list is kept explicit (no wildcard) so that adding a 15th tree-sitter
+    /// language without updating this test produces a compile-time error in
+    /// `ast_size_limit`'s exhaustive match — not a silent miss here.
+    #[test]
+    fn ast_size_limit_tree_sitter_langs_return_some_one_mib() {
+        use crate::Language;
+
+        const ONE_MIB: u64 = 1024 * 1024;
+        assert_eq!(
+            AST_SIZE_LIMIT_DEFAULT, ONE_MIB,
+            "AST_SIZE_LIMIT_DEFAULT must be exactly 1 MiB (1 048 576 bytes)"
+        );
+
+        let tree_sitter_langs = [
+            Language::TypeScript,
+            Language::JavaScript,
+            Language::Python,
+            Language::Rust,
+            Language::Go,
+            Language::Java,
+            Language::Markdown,
+            Language::C,
+            Language::Cpp,
+            Language::CSharp,
+            Language::Ruby,
+            Language::Sql,
+            Language::Kotlin,
+            Language::Swift,
+        ];
+        assert_eq!(
+            tree_sitter_langs.len(),
+            14,
+            "expected exactly 14 tree-sitter languages"
+        );
+
+        for lang in tree_sitter_langs {
+            assert_eq!(
+                ast_size_limit(lang),
+                Some(ONE_MIB),
+                "ast_size_limit({lang:?}) should be Some(1 MiB)"
+            );
+        }
+    }
+
+    /// JSON, YAML, and TOML have no tree-sitter grammar and must return `None`.
+    #[test]
+    fn ast_size_limit_data_format_langs_return_none() {
+        use crate::Language;
+
+        let data_format_langs = [Language::Json, Language::Yaml, Language::Toml];
+        assert_eq!(
+            data_format_langs.len(),
+            3,
+            "expected exactly 3 data-format languages"
+        );
+
+        for lang in data_format_langs {
+            assert_eq!(
+                ast_size_limit(lang),
+                None,
+                "ast_size_limit({lang:?}) should be None (no tree-sitter grammar)"
+            );
+        }
+    }
+
     // ── Zero limits yield nothing ─────────────────────────────────────────────
 
     #[test]
