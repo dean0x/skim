@@ -133,6 +133,7 @@ pub use types::{
     FileTemporalStats, HistoryResult, IndexStats, LayerBuilder, NodeInfo, Result, SearchError,
     SearchField, SearchLayer, SearchQuery, SearchResult, TemporalFlags, TemporalMetadata,
     TemporalSource, byte_offset_to_line, compute_line_range, near_tokens_present,
-    phrase_tokens_present, query_substring_present, substring_first_anchor,
+    phrase_near_tokens_present, phrase_tokens_present, query_substring_present,
+    substring_first_anchor,
 };
 pub use weights::{DEFAULT_WEIGHT, TRIGRAM_WEIGHTS, lookup_weight, trigram_weight};

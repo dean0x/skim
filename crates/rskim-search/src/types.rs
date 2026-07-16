@@ -1064,6 +1064,149 @@ pub fn near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<u
     None
 }
 
+/// AD-403-2: Ordered proximity predicate. Requires an assignment of one exact
+/// (byte-equal, case-sensitive) doc token per query word at STRICTLY ASCENDING
+/// ordinals (query order enforced), with total ordinal span
+/// `(last_ordinal − first_ordinal) ≤ n`.
+///
+/// Returns the byte range of the LEFTMOST valid base position with the leftmost
+/// valid continuation at each step (`first_matched_token.start ..
+/// last_matched_token.end`), or `None` when no valid assignment exists.
+///
+/// This is the single correctness authority for `--phrase --near N` at the CLI gate.
+///
+/// # Contract (D-1 sign-off 2026-07-15)
+///
+/// - **Ordered + total span ≤ N**: unlike bare `--near N` (unordered, total span),
+///   this predicate additionally requires STRICTLY ASCENDING ordinals — query word
+///   order is enforced. Same N budget as `near_tokens_present` (AD-393-4).
+/// - **MONOTONE**: results of `--phrase --near N` are a strict subset of bare
+///   `--near N` results (ordering is an added constraint only). Adding `--phrase`
+///   may only narrow the result set, never grow it.
+/// - **IDENTITY**: for a k-word query, `phrase_near_tokens_present(c, q, k-1)`
+///   returns the same `Option<Range>` as `phrase_tokens_present(c, q)`. K distinct
+///   strictly-ascending positions with total span ≤ k−1 forces them consecutive.
+/// - **ALGORITHM (greedy, no DP)**: Under total span, the ceiling `p0 + N` is
+///   FIXED once the base is chosen. Greedy smallest-valid-next is therefore complete
+///   (no DP needed). Proof: greedy's `p_j` is pointwise minimal over all valid
+///   assignments sharing base `p0`; if any valid assignment satisfies
+///   `p_{k-1} ≤ p0 + N`, greedy's does. Cross-check on the discriminating example:
+///   `alpha xx beta xx gamma`, query "alpha beta gamma", ordinals 0,2,4, span=4.
+///   Greedy at N=4: takes alpha@0 → beta@2 → gamma@4, and 4 ≤ 0+4, MATCH.
+///   At N=2: gamma@4 > 0+2, NO MATCH. Agrees with ground truth at both ends.
+/// - **ANCHOR RULE (user-visible)**: returns the LEFTMOST base (smallest d[0]
+///   position that admits a valid assignment), with the leftmost valid continuation
+///   at each step. This drives the AD-393-6 snippet re-anchor (line_number /
+///   line_range / snippet.lines[].is_match in `--json` output). Nondeterminism
+///   here would be user-visible across binary versions.
+/// - **5 MiB limit**: inherits the MAX_VERIFY_SCAN_BYTES boundary; a match
+///   straddling that offset is a false negative. A wide `--near N` window makes
+///   this more reachable than for `--phrase` alone.
+/// - **Why not delegate from `phrase_tokens_present`**: that function is an
+///   allocation-free early-exit sliding scan. This predicate materializes per-word
+///   position state and cannot early-exit as cheaply. Delegating would regress the
+///   most-used positional hot path (CLAUDE.md: prefer &str slices over allocation in
+///   hot paths). The two coexist; the identity property above is the oracle guard.
+///   `phrase_tokens_present` stays BYTE-UNCHANGED.
+///
+/// Coexists with AD-393-4's total-span rule for bare `--near` — N has one meaning
+/// CLI-wide. Extends AD-393-3 / AD-393-4.
+///
+/// # Semantics
+///
+/// - **Case-sensitive byte-exact** (AD-355-3): consistent with sibling predicates.
+/// - **Query tokenization via `collect_word_spans`** (D10): same as reader and
+///   indexer — punctuation and non-ASCII are separators.
+/// - **Empty / whitespace-only query**: returns `None`.
+/// - **Empty content**: returns `None`.
+#[must_use]
+pub fn phrase_near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<usize>> {
+    let q_words = collect_word_spans(query);
+    if q_words.is_empty() {
+        return None; // empty/whitespace-only query
+    }
+    let c_words = collect_word_spans(content);
+    if c_words.is_empty() {
+        return None;
+    }
+
+    let k = q_words.len();
+
+    // Build d[j] = sorted list of ordinals (indices into c_words) where the
+    // content token equals query word j (byte-exact).
+    let mut d: Vec<Vec<usize>> = Vec::with_capacity(k);
+    for j in 0..k {
+        let qw = &query[q_words[j].0..q_words[j].1];
+        let positions: Vec<usize> = c_words
+            .iter()
+            .enumerate()
+            .filter_map(|(ci, &(cs, ce))| {
+                if &content[cs..ce] == qw {
+                    Some(ci)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if positions.is_empty() {
+            return None; // this query word is absent from content
+        }
+        d.push(positions);
+    }
+
+    // k == 1: any occurrence of the single word is a valid match with span 0.
+    // Return the leftmost (first in d[0], which is the first occurrence).
+    if k == 1 {
+        let base = d[0][0];
+        let (cs, ce) = c_words[base];
+        return Some(cs..ce);
+    }
+
+    // Greedy scan (section 3.4 of plan):
+    //   for each base p0 in d[0] (ascending):
+    //     ceiling = p0 + n  (fixed, saturating to avoid overflow — PF-004/AD-403-2)
+    //     prev = p0
+    //     for j = 1..k-1:
+    //       p = first element of d[j] strictly greater than prev
+    //       if absent or p > ceiling: fail this base
+    //       prev = p
+    //     if all k placed: MATCH (leftmost base by construction)
+    //
+    // Widening: ordinals are usize, n is u32. Use usize arithmetic with
+    // saturating_add so a very large n (e.g. u32::MAX) never wraps.
+    let n_span = n as usize;
+
+    for &base in &d[0] {
+        let ceiling = base.saturating_add(n_span);
+        let mut prev = base;
+        let mut last_ord = base;
+        let mut ok = true;
+        for d_j in &d[1..] {
+            // partition_point(|&p| p <= prev) → index of first p strictly greater
+            // than prev.  d_j is sorted, so this is an O(log |d_j|) binary search.
+            let pos = d_j.partition_point(|&p| p <= prev);
+            match d_j.get(pos) {
+                Some(&p) if p <= ceiling => {
+                    prev = p;
+                    last_ord = p;
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            // Leftmost base, leftmost continuation at each step → deterministic anchor.
+            let (cs, _) = c_words[base];
+            let (_, ce) = c_words[last_ord];
+            return Some(cs..ce);
+        }
+    }
+
+    None
+}
+
 // ============================================================================
 // Error Types
 // ============================================================================

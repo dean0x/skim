@@ -166,6 +166,65 @@ fn count_phrase_alignments(d: &[Vec<u32>], offsets: &[u32]) -> usize {
     count
 }
 
+/// AD-403-3: Ordered proximity alignment count. Counts base positions in `d[0]`
+/// that admit a greedy ordered assignment within the fixed ceiling `[p0, p0 + span]`.
+///
+/// `d[k]` = sorted-unique doc token positions for positionable word k. This mirrors
+/// the `count_phrase_alignments` contract but enforces ASCENDING ordinals and a
+/// TOTAL-SPAN bound instead of exact consecutive offsets.
+///
+/// # Contract (AD-403-3)
+///
+/// - **SUPERSET invariant (preserving AD-393-1)**: the reader's job is recall-
+///   oriented candidate generation. The positioned (≥3-byte) words are a *subset*
+///   of the gate's matched set, so ascending ordinals + span ≤ N over the positioned
+///   subset is a superset of the gate condition. Tightening (enforcing minimum gaps
+///   from `offsets`) would be safe but buys nothing while risking silent recall loss
+///   if done incorrectly. `offsets` is therefore deliberately NOT used.
+/// - **`saturating_add` on widened u64** guards `p0 + span` from wrapping (PF-004 /
+///   AD-403-2). Token positions are u32; widening to u64 before arithmetic keeps
+///   the ceiling exact even when `base` is near u32::MAX.
+/// - **Alignment count is a loose proxy**: the reader's lower bound is `prev+1`,
+///   while the gate additionally requires dropped short words to fit. A future
+///   "tightening" of this count is recognizable as such, not a bug fix.
+/// - **`(false, None)` arm** is handled by `debug_assert` + fallback in the tuple
+///   match below — never a panic (engineering rule: never throw in business logic).
+fn count_phrase_near_alignments(d: &[Vec<u32>], span: u32) -> usize {
+    if d.is_empty() || d.iter().any(Vec::is_empty) {
+        return 0;
+    }
+    let k = d.len();
+    if k == 1 {
+        // Single positioned word: every base qualifies (span is trivially 0 ≤ span).
+        return d[0].len();
+    }
+    let span_u64 = span as u64;
+    let mut count = 0usize;
+    for &base in &d[0] {
+        // Widen to u64 before adding span to prevent u32 overflow (PF-004 / AD-403-3).
+        let ceiling = (base as u64).saturating_add(span_u64);
+        let mut prev = base as u64;
+        let mut ok = true;
+        for dk in d.iter().skip(1) {
+            // First position in dk strictly greater than prev (binary search on sorted dk).
+            let pos = dk.partition_point(|&p| (p as u64) <= prev);
+            match dk.get(pos) {
+                Some(&p) if (p as u64) <= ceiling => {
+                    prev = p as u64;
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// True iff there is an assignment of one doc token per query word whose span
 /// (max − min) ≤ `n` (unordered proximity). `d[k]` = sorted-unique doc token
 /// positions for word k. Sliding window over the merged sorted positions.
@@ -955,13 +1014,31 @@ impl NgramIndexReader {
                 continue;
             }
 
-            // AD-393-2: use gap-aware count_phrase_alignments with offsets so that
-            // dropped short words leave their ordinal gap intact in the alignment check.
-            let alignments = if want_phrase {
-                count_phrase_alignments(&d, &offsets)
-            } else {
-                let n = near_n.unwrap_or(0);
-                usize::from(near_match(&d, n))
+            // AD-393-2 / AD-403-3: exhaustive tuple match on (phrase, near) selects
+            // the correct candidate alignment counter.  Both phrase-first if/else
+            // layers that silently dropped --near when --phrase was set are collapsed
+            // here; adding a new (phrase, near) combination is now compiler-caught.
+            let alignments = match (want_phrase, near_n) {
+                // Ordered + total span (new for #403): greedy scan within [p0, p0+n].
+                (true, Some(n)) => count_phrase_near_alignments(&d, n),
+                // Exact phrase (consecutive offsets, byte-unchanged): gap-aware
+                // count_phrase_alignments with ordinal offsets so dropped short words
+                // leave their gap intact (AD-393-2).
+                (true, None) => count_phrase_alignments(&d, &offsets),
+                // Unordered proximity (byte-unchanged): sliding-window near_match.
+                (false, Some(n)) => usize::from(near_match(&d, n)),
+                // Structurally unreachable via the only caller (reader.rs guards
+                // `query.phrase || query.near.is_some()` at :1134), but
+                // `SearchQuery.phrase`/`.near` are public fields so external callers
+                // can reach this arm.  Never panic (engineering rule). (AD-403-3)
+                (false, None) => {
+                    debug_assert!(
+                        false,
+                        "AD-403-3: search_positional called with phrase=false near=None; \
+                         caller should route to the BM25F path"
+                    );
+                    usize::from(near_match(&d, 0))
+                }
             };
             if alignments == 0 {
                 continue;

@@ -357,6 +357,17 @@ pub(super) struct QueryOutput {
     /// false (additive, back-compat; `#[serde(skip_serializing_if)]`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub has_more: bool,
+    /// AD-403-7: Verification mode applied to candidate files on this query.
+    ///
+    /// Absent (via `skip_serializing_if`) when the mode is the default Substring
+    /// — preserves byte-identical JSON for all callers that do not use positional
+    /// flags.  When `--phrase`, `--near N`, or `--phrase --near N` is active,
+    /// carries `"phrase"`, `"near"`, or `"phrase_near"` respectively.
+    ///
+    /// Derived from `verify_mode_for` on the query path.  Informational /
+    /// diagnostic — not a search parameter.  D-5 sign-off 2026-07-15.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_mode: Option<&'static str>,
     /// Resolved and enriched results.
     pub results: Vec<ResolvedResult>,
     /// Wall-clock duration of the query in milliseconds.

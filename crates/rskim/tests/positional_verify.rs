@@ -18,7 +18,7 @@
 // Predicate unit tests
 // ============================================================================
 
-use rskim_search::{near_tokens_present, phrase_tokens_present};
+use rskim_search::{near_tokens_present, phrase_near_tokens_present, phrase_tokens_present};
 
 // Imports used by CLI integration tests below.
 use assert_cmd::Command;
@@ -1157,4 +1157,730 @@ fn cli_ac17_blast_radius_control_exits_zero() {
         !got_pos.contains("superstring.rs"),
         "AC17 control: superstring.rs must be excluded from --phrase + --blast-radius; got {got_pos:?}"
     );
+}
+
+// ============================================================================
+// AC-403: --phrase --near N composition (#403)
+// ============================================================================
+//
+// All E2E tests use isolated SKIM_CACHE_DIR via tempdir() — no writes to
+// ~/.cache/skim/.  PF-013 (lib test binary hangs) is avoided by using the
+// binary path, not `cargo test -p rskim-search --lib`.
+// PF-010 (shared target/ lock) is avoided by running tests one at a time.
+//
+// Spanlab corpus (used by AC-403-1 through AC-403-4):
+//   adj.rs  "// alpha beta gamma"          adjacent, ordered, span=2
+//   span.rs "// alpha xx beta xx gamma"    ordered, span=4 (not adjacent)
+//   rev.rs  "// gamma xx beta xx alpha"    reversed order, span=4
+//   sup.rs  "// alphabet betamax gammaray" superstrings (no whole-word match)
+//
+// Shortlab corpus (used by AC-403-5):
+//   hit.rs  "// in xx of"                  ordered, span=2 (all-short words)
+//   far.rs  "// in xx xx xx of"            ordered, span=4 (all-short words)
+//   rev.rs  "// of xx in"                  reversed order, span=2 (all-short)
+
+/// Build the spanlab corpus and index.
+fn build_spanlab(proj: &Path, cache: &Path) {
+    fs::write(proj.join("adj.rs"), "// alpha beta gamma\n").unwrap();
+    fs::write(proj.join("span.rs"), "// alpha xx beta xx gamma\n").unwrap();
+    fs::write(proj.join("rev.rs"), "// gamma xx beta xx alpha\n").unwrap();
+    fs::write(proj.join("sup.rs"), "// alphabet betamax gammaray\n").unwrap();
+    build_index(proj, cache);
+}
+
+/// Run `skim search <extra_args> --root <proj>` and return the raw process output.
+/// Does NOT require --json or successful exit, so it works for notice-only tests.
+fn raw_search_output(proj: &Path, cache: &Path, extra_args: &[&str]) -> std::process::Output {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("search")
+        .args(extra_args)
+        .args(["--root"])
+        .arg(proj)
+        .env("SKIM_CACHE_DIR", cache)
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap()
+}
+
+// ── AC-403-1: composed ordered + total-span semantic ─────────────────────────
+
+/// AC-403-1: --phrase --near N applies ORDERED + TOTAL-SPAN semantics.
+///
+/// - adj.rs  (span 2): present at --phrase --near 2, --near 3, --near 4
+/// - span.rs (span 4): absent at N=2 and N=3, present at N=4
+///
+/// The N=2 discriminator is the KEY: a per-adjacent-pair implementation
+/// (each gap 2) would incorrectly include span.rs at N=2.  Total-span
+/// correctly excludes it (total span 4 > 2).
+#[test]
+fn ac403_1_composed_ordered_total_span_semantic() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    build_spanlab(proj.path(), cache.path());
+
+    // --phrase --near 2: adj.rs only (span 2 <= 2; span.rs has span 4 > 2).
+    let j2 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "2", "alpha beta gamma"],
+    );
+    let got2 = paths(&j2);
+    assert!(
+        got2.contains("adj.rs"),
+        "AC-403-1 N=2: adj.rs (span 2) must be present; got {got2:?}"
+    );
+    assert!(
+        !got2.contains("span.rs"),
+        "AC-403-1 N=2: span.rs (span 4) must be ABSENT (total span > N); got {got2:?}. \
+         NOTE: if span.rs is present, this is the per-adjacent-pair bug — total-span is required."
+    );
+
+    // --phrase --near 3: adj.rs only (span 2 <= 3; span.rs span 4 > 3).
+    let j3 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "3", "alpha beta gamma"],
+    );
+    let got3 = paths(&j3);
+    assert!(
+        got3.contains("adj.rs"),
+        "AC-403-1 N=3: adj.rs (span 2) must be present; got {got3:?}"
+    );
+    assert!(
+        !got3.contains("span.rs"),
+        "AC-403-1 N=3: span.rs (span 4) must be ABSENT; got {got3:?}"
+    );
+
+    // --phrase --near 4: adj.rs + span.rs (both span <= 4, ordered).
+    let j4 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "4", "alpha beta gamma"],
+    );
+    let got4 = paths(&j4);
+    assert!(
+        got4.contains("adj.rs"),
+        "AC-403-1 N=4: adj.rs must be present; got {got4:?}"
+    );
+    assert!(
+        got4.contains("span.rs"),
+        "AC-403-1 N=4: span.rs (span 4) must be present at N=4; got {got4:?}"
+    );
+    assert!(
+        !got4.contains("sup.rs"),
+        "AC-403-1 N=4: sup.rs (superstrings) must be ABSENT; got {got4:?}"
+    );
+    assert!(
+        !got4.contains("rev.rs"),
+        "AC-403-1 N=4: rev.rs (reversed order) must be ABSENT from --phrase --near 4; got {got4:?}"
+    );
+}
+
+// ── AC-403-2: identity (--phrase --near (k-1) == --phrase) ───────────────────
+
+/// AC-403-2: For a k-word query, --phrase --near (k-1) MUST produce the same
+/// result set as --phrase alone.  k=3, so k-1=2.
+///
+/// Also verifies the predicate-level identity:
+/// phrase_near_tokens_present(content, query, k-1) matches phrase_tokens_present(content, query).
+#[test]
+fn ac403_2_identity_phrase_near_k_minus_1_equals_phrase() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    build_spanlab(proj.path(), cache.path());
+
+    // CLI identity.
+    let j_phrase = search_json(proj.path(), cache.path(), &["--phrase", "alpha beta gamma"]);
+    let j_phrase_near_2 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "2", "alpha beta gamma"],
+    );
+    let got_phrase = paths(&j_phrase);
+    let got_pn2 = paths(&j_phrase_near_2);
+
+    assert!(
+        !got_phrase.is_empty(),
+        "AC-403-2: --phrase must return at least one result (adj.rs); got empty"
+    );
+    assert_eq!(
+        got_phrase, got_pn2,
+        "AC-403-2: --phrase and --phrase --near 2 must return the same set for 3-word query; \
+         phrase={got_phrase:?} phrase_near_2={got_pn2:?}"
+    );
+
+    // Predicate-level identity on adj.rs and span.rs content.
+    let adj_content = "// alpha beta gamma\n";
+    let span_content = "// alpha xx beta xx gamma\n";
+    let query = "alpha beta gamma";
+
+    // adj.rs: adjacent — both phrase and phrase_near(k-1=2) match.
+    assert_eq!(
+        phrase_tokens_present(adj_content, query).is_some(),
+        phrase_near_tokens_present(adj_content, query, 2).is_some(),
+        "AC-403-2 predicate identity on adj.rs: phrase and phrase_near(2) must agree"
+    );
+    // span.rs: gapped — neither phrase nor phrase_near(k-1=2) matches.
+    assert_eq!(
+        phrase_tokens_present(span_content, query).is_some(),
+        phrase_near_tokens_present(span_content, query, 2).is_some(),
+        "AC-403-2 predicate identity on span.rs: phrase and phrase_near(2) must agree (both false)"
+    );
+}
+
+// ── AC-403-3: monotonicity ────────────────────────────────────────────────────
+
+/// AC-403-3: --phrase --near N MUST NOT return any file that --near N does not
+/// return.  Adding --phrase (ordering constraint) may only narrow, never grow.
+///
+/// At N=4 on the spanlab corpus:
+///   --near 4        returns {adj.rs, span.rs, rev.rs}  (unordered, any span<=4)
+///   --phrase --near 4  returns {adj.rs, span.rs}       (ordered, span<=4)
+///   --phrase        returns {adj.rs}                   (adjacent, ordered)
+///
+/// Monotonicity chain: phrase_near_4 ⊆ near_4 and phrase ⊆ phrase_near_4.
+#[test]
+fn ac403_3_monotonicity() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    build_spanlab(proj.path(), cache.path());
+
+    let j_near4 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--near", "4", "alpha beta gamma"],
+    );
+    let j_pn4 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "4", "alpha beta gamma"],
+    );
+    let j_phrase = search_json(proj.path(), cache.path(), &["--phrase", "alpha beta gamma"]);
+
+    let near4 = paths(&j_near4);
+    let pn4 = paths(&j_pn4);
+    let phrase = paths(&j_phrase);
+
+    // All sets must be non-empty (AC-403-3 requires a discriminating corpus).
+    assert!(
+        !near4.is_empty(),
+        "AC-403-3: --near 4 must return >= 1 file"
+    );
+    assert!(
+        !pn4.is_empty(),
+        "AC-403-3: --phrase --near 4 must return >= 1 file"
+    );
+    assert!(
+        !phrase.is_empty(),
+        "AC-403-3: --phrase must return >= 1 file"
+    );
+
+    // Monotonicity: pn4 ⊆ near4.
+    for file in &pn4 {
+        assert!(
+            near4.contains(file.as_str()),
+            "AC-403-3: {file} is in --phrase --near 4 but NOT in --near 4 — MONOTONICITY VIOLATED"
+        );
+    }
+
+    // Monotonicity: phrase ⊆ pn4.
+    for file in &phrase {
+        assert!(
+            pn4.contains(file.as_str()),
+            "AC-403-3: {file} is in --phrase but NOT in --phrase --near 4 — MONOTONICITY VIOLATED"
+        );
+    }
+
+    // Strict-subset check: rev.rs (reversed order) must be in near4 but NOT pn4.
+    assert!(
+        near4.contains("rev.rs"),
+        "AC-403-3: rev.rs (reversed order) must be in --near 4; got {near4:?}"
+    );
+    assert!(
+        !pn4.contains("rev.rs"),
+        "AC-403-3: rev.rs (reversed order) must be ABSENT from --phrase --near 4; got {pn4:?}"
+    );
+}
+
+// ── AC-403-4: order enforcement + superstring rejection ──────────────────────
+
+/// AC-403-4: --phrase --near N must exclude files whose query words appear only
+/// out of query order (rev.rs) and superstring files (sup.rs), at any N.
+#[test]
+fn ac403_4_order_enforcement_and_superstring_rejection() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    build_spanlab(proj.path(), cache.path());
+
+    // rev.rs must be absent from --phrase --near 4 (reversed order).
+    let j4 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "4", "alpha beta gamma"],
+    );
+    let got4 = paths(&j4);
+    assert!(
+        !got4.contains("rev.rs"),
+        "AC-403-4: rev.rs (gamma xx beta xx alpha — reversed) must be ABSENT at --phrase --near 4; got {got4:?}"
+    );
+
+    // rev.rs must be absent at any large N (order cannot flip).
+    let j100 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "100", "alpha beta gamma"],
+    );
+    let got100 = paths(&j100);
+    assert!(
+        !got100.contains("rev.rs"),
+        "AC-403-4: rev.rs must be ABSENT at --phrase --near 100; got {got100:?}"
+    );
+
+    // sup.rs must be absent (superstrings: 'alphabet' != token 'alpha').
+    assert!(
+        !got4.contains("sup.rs"),
+        "AC-403-4: sup.rs (alphabet/betamax/gammaray superstrings) must be ABSENT; got {got4:?}"
+    );
+
+    // sup.rs absent from pure --phrase too.
+    let j_phrase = search_json(proj.path(), cache.path(), &["--phrase", "alpha beta gamma"]);
+    assert!(
+        !paths(&j_phrase).contains("sup.rs"),
+        "AC-403-4: sup.rs must be ABSENT from --phrase; got {:?}",
+        paths(&j_phrase)
+    );
+
+    // rev.rs absent from pure --phrase too (reversed order, not adjacent).
+    assert!(
+        !paths(&j_phrase).contains("rev.rs"),
+        "AC-403-4: rev.rs must be ABSENT from --phrase; got {:?}",
+        paths(&j_phrase)
+    );
+}
+
+// ── AC-403-5: all-short-word path (words < 3 bytes) ──────────────────────────
+
+/// AC-403-5: --phrase --near N on a query where all words are < 3 bytes.
+///
+/// "in" and "of" are each 2 bytes — they cannot form a trigram.  The reader
+/// falls back to the all-files candidate set with score 0.0 (AD-355-7).
+/// The per-file verify predicate phrase_near_tokens_present still enforces the
+/// ordered + total-span contract.
+///
+/// Shortlab corpus:
+///   hit.rs  "// in xx of"       span=2  (in=0, xx=1, of=2)
+///   far.rs  "// in xx xx xx of" span=4  (in=0, of=4)
+///   rev.rs  "// of xx in"       reversed
+#[test]
+fn ac403_5_all_short_word_path() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    fs::write(proj.path().join("hit.rs"), "// in xx of\n").unwrap();
+    fs::write(proj.path().join("far.rs"), "// in xx xx xx of\n").unwrap();
+    fs::write(proj.path().join("rev.rs"), "// of xx in\n").unwrap();
+    build_index(proj.path(), cache.path());
+
+    // --phrase --near 2: hit.rs (span=2 <= 2, ordered). far.rs (span=4 > 2) out.
+    let j2 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "2", "in of"],
+    );
+    let got2 = paths(&j2);
+    assert!(
+        got2.contains("hit.rs"),
+        "AC-403-5: hit.rs (span 2) must be present at --phrase --near 2; got {got2:?}"
+    );
+    assert!(
+        !got2.contains("far.rs"),
+        "AC-403-5: far.rs (span 4 > 2) must be ABSENT at --phrase --near 2; got {got2:?}"
+    );
+    assert!(
+        !got2.contains("rev.rs"),
+        "AC-403-5: rev.rs (reversed) must be ABSENT at --phrase --near 2; got {got2:?}"
+    );
+
+    // --phrase --near 1: empty (hit.rs span=2 > 1).
+    let j1 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "1", "in of"],
+    );
+    let got1 = paths(&j1);
+    assert!(
+        got1.is_empty(),
+        "AC-403-5: --phrase --near 1 must return empty (minimum span is 2); got {got1:?}"
+    );
+
+    // --near 4: hit.rs + far.rs (span <= 4, any order). rev.rs has span=2 <= 4, also included.
+    let j_near4 = search_json(proj.path(), cache.path(), &["--near", "4", "in of"]);
+    let got_near4 = paths(&j_near4);
+    assert!(
+        got_near4.contains("far.rs"),
+        "AC-403-5: far.rs must be present in --near 4; got {got_near4:?}"
+    );
+
+    // AD-355-7: all-short fallback score should be 0.0 for hit.rs.
+    let hit_result = j2["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["path"].as_str().unwrap_or("") == "hit.rs");
+    if let Some(hit) = hit_result {
+        let score = hit["score"].as_f64().unwrap_or(1.0);
+        assert!(
+            score == 0.0,
+            "AC-403-5 AD-355-7: all-short-word fallback score must be 0.0; got {score}"
+        );
+    }
+}
+
+// ── AC-403-6: inert-flag notice on non-text arms ──────────────────────────────
+
+/// AC-403-6: --phrase or --near on any non-text arm (--build, standalone temporal,
+/// etc.) must emit a notice to stderr.  Exit code is 0.  stdout is unchanged.
+///
+/// Tested arms: --build and standalone --hot (no text query).
+#[test]
+fn ac403_6_inert_flag_notice_on_nontex_arms() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    // --phrase --build: notice fires, build runs, exit 0.
+    let out_build = raw_search_output(proj.path(), cache.path(), &["--phrase", "--build"]);
+    let stderr_build = String::from_utf8(out_build.stderr).unwrap();
+    assert!(
+        out_build.status.success(),
+        "AC-403-6: --phrase --build must exit 0; stderr: {stderr_build}"
+    );
+    assert!(
+        stderr_build.contains("skim search: note:"),
+        "AC-403-6: --phrase --build must emit an inert-flag notice to stderr; got: {stderr_build:?}"
+    );
+    assert!(
+        stderr_build.contains("--phrase"),
+        "AC-403-6: notice must name the --phrase flag; got: {stderr_build:?}"
+    );
+
+    // --near 5 --build: notice fires for --near too.
+    let out_near_build = raw_search_output(proj.path(), cache.path(), &["--near", "5", "--build"]);
+    let stderr_near = String::from_utf8(out_near_build.stderr).unwrap();
+    assert!(
+        out_near_build.status.success(),
+        "AC-403-6: --near 5 --build must exit 0; stderr: {stderr_near}"
+    );
+    assert!(
+        stderr_near.contains("skim search: note:"),
+        "AC-403-6: --near 5 --build must emit an inert-flag notice; got: {stderr_near:?}"
+    );
+
+    // --phrase --near 5 --build: combined notice.
+    let out_both = raw_search_output(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "5", "--build"],
+    );
+    let stderr_both = String::from_utf8(out_both.stderr).unwrap();
+    assert!(
+        out_both.status.success(),
+        "AC-403-6: --phrase --near 5 --build must exit 0; stderr: {stderr_both}"
+    );
+    assert!(
+        stderr_both.contains("skim search: note:"),
+        "AC-403-6: --phrase --near 5 --build must emit notice; got: {stderr_both:?}"
+    );
+}
+
+// ── AC-403-7: notice does not over-fire ──────────────────────────────────────
+
+/// AC-403-7: --phrase or --near MUST NOT emit the inert-flag notice when a
+/// text query IS present (the flags are active, not inert).
+#[test]
+fn ac403_7_notice_does_not_overfire() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    // Build a minimal corpus.
+    fs::write(proj.path().join("a.rs"), "fn alpha_beta() {}\n").unwrap();
+    build_index(proj.path(), cache.path());
+
+    // --phrase + text: no inert-flag notice.
+    let out_phrase = raw_search_output(proj.path(), cache.path(), &["--phrase", "--json", "alpha"]);
+    let stderr_phrase = String::from_utf8(out_phrase.stderr).unwrap();
+    assert!(
+        !stderr_phrase.contains("has no effect"),
+        "AC-403-7: --phrase + text must NOT emit inert notice; stderr: {stderr_phrase:?}"
+    );
+
+    // --near 3 + text: no inert-flag notice.
+    let out_near = raw_search_output(
+        proj.path(),
+        cache.path(),
+        &["--near", "3", "--json", "alpha"],
+    );
+    let stderr_near = String::from_utf8(out_near.stderr).unwrap();
+    assert!(
+        !stderr_near.contains("has no effect"),
+        "AC-403-7: --near 3 + text must NOT emit inert notice; stderr: {stderr_near:?}"
+    );
+}
+
+// ── AC-403-8: degenerate --near diagnostic ────────────────────────────────────
+
+/// AC-403-8: structurally-degenerate --near queries (single-word, or
+/// N < word_count - 1) emit a stderr notice.  Exit code is 0.
+#[test]
+fn ac403_8_degenerate_near_diagnostic() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    fs::write(proj.path().join("a.rs"), "fn alpha beta gamma() {}\n").unwrap();
+    build_index(proj.path(), cache.path());
+
+    // Single-word query + --near N: degenerate (no other words to be near).
+    let out_single = raw_search_output(
+        proj.path(),
+        cache.path(),
+        &["--near", "5", "--json", "alpha"],
+    );
+    let stderr_single = String::from_utf8(out_single.stderr).unwrap();
+    assert!(
+        out_single.status.success(),
+        "AC-403-8: single-word --near must exit 0; stderr: {stderr_single}"
+    );
+    assert!(
+        stderr_single.contains("skim search: note:"),
+        "AC-403-8: single-word --near must emit a diagnostic notice; got: {stderr_single:?}"
+    );
+
+    // N < word_count - 1: 3-word query, N=1 < 2 = word_count - 1.
+    let out_impossible = raw_search_output(
+        proj.path(),
+        cache.path(),
+        &["--near", "1", "--json", "alpha beta gamma"],
+    );
+    let stderr_impossible = String::from_utf8(out_impossible.stderr).unwrap();
+    assert!(
+        out_impossible.status.success(),
+        "AC-403-8: impossible --near must exit 0; stderr: {stderr_impossible}"
+    );
+    assert!(
+        stderr_impossible.contains("skim search: note:"),
+        "AC-403-8: N < word_count-1 must emit diagnostic notice; got: {stderr_impossible:?}"
+    );
+
+    // Control: N == word_count - 1 (satisfiable minimum) — no notice.
+    let out_min = raw_search_output(
+        proj.path(),
+        cache.path(),
+        &["--near", "2", "--json", "alpha beta gamma"],
+    );
+    let stderr_min = String::from_utf8(out_min.stderr).unwrap();
+    // Note: the notice check only applies to "cannot match" cases.
+    // N=2 is the smallest satisfiable span for a 3-word query.
+    assert!(
+        !stderr_min.contains("cannot match"),
+        "AC-403-8 control: --near 2 on 3-word query is satisfiable; must NOT emit 'cannot match'; \
+         got: {stderr_min:?}"
+    );
+}
+
+// ── AC-403-16: deterministic anchor range (predicate unit) ───────────────────
+
+/// AC-403-16: phrase_near_tokens_present must return the range anchored at
+/// the FIRST (leftmost-base) occurrence of the first query word.
+///
+/// Content: "alpha zzz alpha xx beta"
+/// Query:   "alpha beta"
+/// n=4:     first alpha at ord 0, beta at ord 4, span=4 <= 4.
+///          The range MUST start at byte 0 (first alpha), NOT byte 10 (second alpha).
+#[test]
+fn ac403_16_deterministic_anchor_range() {
+    let content = "alpha zzz alpha xx beta";
+    let query = "alpha beta";
+
+    let result = phrase_near_tokens_present(content, query, 4);
+    let range = result.expect(
+        "AC-403-16: 'alpha ... beta' with n=4 must match (span 4 from first alpha to beta)",
+    );
+
+    // Range must start at byte 0 (first alpha), not byte 10 (second alpha).
+    assert_eq!(
+        range.start, 0,
+        "AC-403-16: range must start at byte 0 (first 'alpha'), got start={}; \
+         content={content:?}",
+        range.start
+    );
+    // Range must cover all the way to the end of 'beta'.
+    // "alpha zzz alpha xx beta" → 'beta' ends at byte 23.
+    assert_eq!(
+        range.end,
+        content.len(),
+        "AC-403-16: range.end must cover 'beta' at end of content; \
+         got end={}, content_len={}",
+        range.end,
+        content.len()
+    );
+    let span_text = &content[range];
+    assert!(
+        span_text.starts_with("alpha"),
+        "AC-403-16: range must start with 'alpha'; got {span_text:?}"
+    );
+    assert!(
+        span_text.ends_with("beta"),
+        "AC-403-16: range must end with 'beta'; got {span_text:?}"
+    );
+}
+
+// ── AC-403-17: total-span vs per-pair discriminator ───────────────────────────
+
+/// AC-403-17: The TOTAL-SPAN N discriminator.
+///
+/// Corpus: one file with content "alpha xx beta xx gamma"
+///   word tokens: alpha(0), xx(1), beta(2), xx(3), gamma(4)
+///   total span = 4 (gamma ordinal - alpha ordinal)
+///
+/// --phrase --near 2: MUST return 0 results.
+///   Total span 4 > 2.  A per-adjacent-pair implementation (each gap=2)
+///   would incorrectly return 1 result here — this test catches that bug.
+///
+/// --phrase --near 4: MUST return 1 result (total span 4 <= 4, ordered).
+#[test]
+fn ac403_17_total_span_discriminator() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    fs::write(proj.path().join("file.rs"), "// alpha xx beta xx gamma\n").unwrap();
+    build_index(proj.path(), cache.path());
+
+    // --phrase --near 2: empty (total span 4 > 2).
+    let j2 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "2", "alpha beta gamma"],
+    );
+    let got2 = paths(&j2);
+    assert!(
+        got2.is_empty(),
+        "AC-403-17: --phrase --near 2 MUST return empty on content with total span 4; got {got2:?}. \
+         A per-adjacent-pair implementation would incorrectly match (2+2=2 per gap). \
+         This is the total-span discriminating test."
+    );
+
+    // --phrase --near 4: exactly 1 result (total span 4 <= 4, alpha before gamma in order).
+    let j4 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "4", "alpha beta gamma"],
+    );
+    let count4 = j4["total"].as_u64().unwrap_or(0);
+    assert_eq!(
+        count4, 1,
+        "AC-403-17: --phrase --near 4 must return exactly 1 result; got {count4}"
+    );
+}
+
+// ── AC-403-18: verify_mode JSON field ────────────────────────────────────────
+
+/// AC-403-18: the `verify_mode` field in --json output.
+///
+/// (a) --phrase --near N: field == "phrase_near"
+/// (b) no positional flags: field absent (not null) — byte-identity for existing callers
+/// (c) --phrase: field == "phrase"
+/// (d) --near N: field == "near"
+#[test]
+fn ac403_18_verify_mode_json_field() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    // Build a tiny corpus so queries return a valid JSON envelope.
+    fs::write(
+        proj.path().join("a.rs"),
+        "fn alpha() { beta(); gamma(); }\n",
+    )
+    .unwrap();
+    build_index(proj.path(), cache.path());
+
+    // (a) --phrase --near 5 → verify_mode == "phrase_near"
+    let j_pn = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "5", "alpha"],
+    );
+    assert_eq!(
+        j_pn["verify_mode"].as_str(),
+        Some("phrase_near"),
+        "AC-403-18(a): verify_mode must be 'phrase_near' with --phrase --near; got {:?}",
+        j_pn["verify_mode"]
+    );
+
+    // (b) no flags → verify_mode absent (not present, not null).
+    let j_none = search_json(proj.path(), cache.path(), &["alpha"]);
+    assert!(
+        j_none.get("verify_mode").is_none(),
+        "AC-403-18(b): verify_mode must be ABSENT (not null) without positional flags; \
+         got {:?}",
+        j_none.get("verify_mode")
+    );
+
+    // (c) --phrase → verify_mode == "phrase"
+    let j_p = search_json(proj.path(), cache.path(), &["--phrase", "alpha"]);
+    assert_eq!(
+        j_p["verify_mode"].as_str(),
+        Some("phrase"),
+        "AC-403-18(c): verify_mode must be 'phrase' with --phrase; got {:?}",
+        j_p["verify_mode"]
+    );
+
+    // (d) --near 5 → verify_mode == "near"
+    let j_n = search_json(proj.path(), cache.path(), &["--near", "5", "alpha"]);
+    assert_eq!(
+        j_n["verify_mode"].as_str(),
+        Some("near"),
+        "AC-403-18(d): verify_mode must be 'near' with --near; got {:?}",
+        j_n["verify_mode"]
+    );
+}
+
+// ── AC-403-2 (predicate): phrase_near golden-fixture differential identity ───
+
+/// AC-403-2 (predicate extension): phrase_near_tokens_present(c, q, k-1)
+/// must match phrase_tokens_present(c, q) on the existing golden phrase fixtures.
+///
+/// Tests the identity on representative cases from the existing suite.
+#[test]
+fn ac403_2_predicate_differential_identity() {
+    // Cases from existing phrase_tokens_present tests.
+    let cases: &[(&str, &str)] = &[
+        ("fn encode_varint(x: u32)", "encode_varint"), // single-word
+        ("fn encode varint bytes end", "encode varint"), // two-word, adjacent
+        ("fn varint encode bytes", "encode varint"),   // reversed — both None
+        ("fn encode some varint bytes", "encode varint"), // gapped — both None
+        ("hello world foo bar baz", "foo bar"),        // two-word, mid-string
+        ("in the loop here", "in the loop"),           // three short words
+        ("fn main() { }", "fn main"),                  // short leading word
+    ];
+
+    for (content, query) in cases {
+        let word_count = query.split_whitespace().count();
+        // k-1 is the identity span.  For single-word, k-1=0 would always match
+        // (span of one word is always 0), so skip k=1 for this test.
+        if word_count < 2 {
+            continue;
+        }
+        let k_minus_1 = (word_count - 1) as u32;
+
+        let phrase_result = phrase_tokens_present(content, query);
+        let pn_result = phrase_near_tokens_present(content, query, k_minus_1);
+
+        assert_eq!(
+            phrase_result.is_some(),
+            pn_result.is_some(),
+            "AC-403-2 identity: content={content:?} query={query:?} k-1={k_minus_1}: \
+             phrase={phrase_result:?} phrase_near(k-1)={pn_result:?}"
+        );
+    }
 }

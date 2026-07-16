@@ -7,7 +7,11 @@ use std::io::BufWriter;
 
 use tempfile::tempdir;
 
-use super::{execute_query, format_json_output, format_text_output};
+use super::{
+    execute_query, format_json_output, format_text_output, near_diagnostic_notice,
+    positional_inert_notice, verify_mode_for,
+};
+use crate::cmd::search::snippet::VerifyMode;
 use crate::cmd::search::types::{QueryConfig, QueryOutput};
 
 // ============================================================================
@@ -177,10 +181,11 @@ fn test_format_text_output_empty_results() {
     let output = QueryOutput {
         query: "nothing".to_string(),
         total: 0,
+        has_more: false,
+        verify_mode: None,
         results: vec![],
         duration_ms: 5,
         index_stats: None,
-        has_more: false,
     };
     let mut buf = BufWriter::new(Vec::new());
     format_text_output(&output, &mut buf).unwrap();
@@ -225,10 +230,11 @@ fn test_format_text_output_includes_path_and_score() {
     let output = QueryOutput {
         query: "authenticate".to_string(),
         total: 1,
+        has_more: false,
+        verify_mode: None,
         results: vec![result],
         duration_ms: 3,
         index_stats: None,
-        has_more: false,
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -267,10 +273,11 @@ fn test_format_text_output_includes_stale_marker() {
     let output = QueryOutput {
         query: "old_fn".to_string(),
         total: 1,
+        has_more: false,
+        verify_mode: None,
         results: vec![result],
         duration_ms: 2,
         index_stats: None,
-        has_more: false,
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -858,10 +865,11 @@ fn test_format_json_output_is_valid_json() {
     let output = QueryOutput {
         query: "test".to_string(),
         total: 0,
+        has_more: false,
+        verify_mode: None,
         results: vec![],
         duration_ms: 1,
         index_stats: None,
-        has_more: false,
     };
     let mut buf = BufWriter::new(Vec::new());
     format_json_output(&output, &mut buf).unwrap();
@@ -901,10 +909,11 @@ fn test_format_text_output_includes_temporal_hotspot() {
     let output = QueryOutput {
         query: "hot".to_string(),
         total: 1,
+        has_more: false,
+        verify_mode: None,
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
-        has_more: false,
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -944,10 +953,11 @@ fn test_format_text_output_includes_temporal_risk() {
     let output = QueryOutput {
         query: "risky".to_string(),
         total: 1,
+        has_more: false,
+        verify_mode: None,
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
-        has_more: false,
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -984,10 +994,11 @@ fn test_format_text_output_omits_temporal_when_none() {
     let output = QueryOutput {
         query: "plain".to_string(),
         total: 1,
+        has_more: false,
+        verify_mode: None,
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
-        has_more: false,
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -1028,10 +1039,11 @@ fn test_format_json_output_includes_temporal_annotations() {
     let output = QueryOutput {
         query: "hot".to_string(),
         total: 1,
+        has_more: false,
+        verify_mode: None,
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
-        has_more: false,
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -2912,5 +2924,204 @@ fn test_has_more_false_when_all_results_fit_on_page() {
         "D-5: has_more must be false when all results fit on one page; \
          got has_more=true with {} results and limit=100",
         output.results.len()
+    );
+}
+
+// ============================================================================
+// AC-403: positional composition unit tests (#403)
+// ============================================================================
+
+// ── AC-403-T1: verify_mode_for truth table ───────────────────────────────────
+
+/// AC-403 / AD-403-1: verify_mode_for must map all four (phrase, near) cells
+/// to the correct VerifyMode variant (exhaustive tuple match — no combination
+/// should fall through to a default).
+#[test]
+fn ac403_verify_mode_for_truth_table() {
+    // (false, None) → Substring
+    assert!(
+        matches!(verify_mode_for(false, None), VerifyMode::Substring),
+        "AD-403-1: (false, None) must map to Substring"
+    );
+    // (false, Some(5)) → Near(5)
+    assert!(
+        matches!(verify_mode_for(false, Some(5)), VerifyMode::Near(5)),
+        "AD-403-1: (false, Some(5)) must map to Near(5)"
+    );
+    // (true, None) → Phrase
+    assert!(
+        matches!(verify_mode_for(true, None), VerifyMode::Phrase),
+        "AD-403-1: (true, None) must map to Phrase"
+    );
+    // (true, Some(4)) → PhraseNear(4)
+    assert!(
+        matches!(verify_mode_for(true, Some(4)), VerifyMode::PhraseNear(4)),
+        "AD-403-1: (true, Some(4)) must map to PhraseNear(4)"
+    );
+}
+
+// ── AC-403-T2: positional_inert_notice truth table ───────────────────────────
+
+/// AC-403 / AD-403-5: positional_inert_notice truth table.
+///
+/// The notice fires iff at least one positional flag is set AND has_text=false.
+/// When has_text=true the flags are active — no notice. When no positional flag
+/// is set — no notice regardless of has_text.
+#[test]
+fn ac403_positional_inert_notice_truth_table() {
+    // No positional flag → always None.
+    assert_eq!(
+        positional_inert_notice(false, None, false),
+        None,
+        "no flags + no text: must be None"
+    );
+    assert_eq!(
+        positional_inert_notice(false, None, true),
+        None,
+        "no flags + text: must be None"
+    );
+
+    // Flags present + text → None (flags are active).
+    assert_eq!(
+        positional_inert_notice(true, None, true),
+        None,
+        "--phrase + text: must be None (flag is honored)"
+    );
+    assert_eq!(
+        positional_inert_notice(false, Some(5), true),
+        None,
+        "--near 5 + text: must be None (flag is honored)"
+    );
+    assert_eq!(
+        positional_inert_notice(true, Some(3), true),
+        None,
+        "--phrase --near 3 + text: must be None (flags are honored)"
+    );
+
+    // Flags present + no text → Some(notice).
+    let n1 = positional_inert_notice(true, None, false);
+    assert!(n1.is_some(), "--phrase + no text: must be Some(notice)");
+    assert!(
+        n1.as_deref().unwrap_or("").contains("--phrase"),
+        "--phrase notice must name the flag; got {:?}",
+        n1
+    );
+
+    let n2 = positional_inert_notice(false, Some(7), false);
+    assert!(n2.is_some(), "--near 7 + no text: must be Some(notice)");
+    assert!(
+        n2.as_deref().unwrap_or("").contains("--near 7"),
+        "--near 7 notice must name the flag and value; got {:?}",
+        n2
+    );
+
+    let n3 = positional_inert_notice(true, Some(3), false);
+    assert!(
+        n3.is_some(),
+        "--phrase --near 3 + no text: must be Some(notice)"
+    );
+    let n3_text = n3.as_deref().unwrap_or("");
+    assert!(
+        n3_text.contains("--phrase") && n3_text.contains("--near 3"),
+        "--phrase --near 3 notice must name both flags; got {:?}",
+        n3
+    );
+}
+
+// ── AC-403-T3: near_diagnostic_notice truth table ────────────────────────────
+
+/// AC-403 / AD-403-6: near_diagnostic_notice truth table (4 cells × has_text).
+///
+/// Fires on single-word query and N < word_count - 1. Does NOT fire when near
+/// is None, when query is empty, or when N is large enough.
+#[test]
+fn ac403_near_diagnostic_notice_truth_table() {
+    // near=None → always None.
+    assert_eq!(near_diagnostic_notice(None, "alpha beta"), None);
+    assert_eq!(near_diagnostic_notice(None, "alpha"), None);
+
+    // Empty query → None (covered by positional_inert_notice upstream).
+    assert_eq!(near_diagnostic_notice(Some(3), ""), None);
+    assert_eq!(near_diagnostic_notice(Some(3), "   "), None);
+
+    // Single-word query + any N → Some(notice).
+    let single = near_diagnostic_notice(Some(5), "alpha");
+    assert!(
+        single.is_some(),
+        "single-word query + --near 5 must produce notice"
+    );
+    assert!(
+        single.as_deref().unwrap_or("").contains("single-word"),
+        "notice must explain 'single-word'; got {:?}",
+        single
+    );
+
+    // N < word_count - 1 → Some(notice).
+    // 3-word query: word_count=3, N must be >= 2 to be satisfiable.
+    // N=1 < 2 → notice.
+    let n1 = near_diagnostic_notice(Some(1), "alpha beta gamma");
+    assert!(
+        n1.is_some(),
+        "--near 1 on 3-word query must produce notice (unsatisfiable: span >= 2)"
+    );
+
+    // N=2 == word_count-1 → no notice (smallest satisfiable span for 3-word query).
+    assert_eq!(
+        near_diagnostic_notice(Some(2), "alpha beta gamma"),
+        None,
+        "--near 2 on 3-word query is satisfiable (span == word_count - 1): must be None"
+    );
+
+    // N=10 >> word_count-1 → no notice.
+    assert_eq!(
+        near_diagnostic_notice(Some(10), "alpha beta gamma"),
+        None,
+        "--near 10 on 3-word query is satisfiable: must be None"
+    );
+
+    // 2-word query: word_count=2, N must be >= 1; N=0 is rejected by parse,
+    // so any N >= 1 is satisfiable for a 2-word query.
+    assert_eq!(
+        near_diagnostic_notice(Some(1), "alpha beta"),
+        None,
+        "--near 1 on 2-word query is satisfiable: must be None"
+    );
+}
+
+// ── AC-403-T4: SEARCH_HELP_TEXT positional documentation ─────────────────────
+
+/// AC-403-13: SEARCH_HELP_TEXT must contain documentation for --phrase, --near,
+/// --lang, composition rule, and "word token" (the unit of N).
+/// Must also NOT contain em-dashes or en-dashes in new copy (plain ASCII hyphens).
+#[test]
+fn ac403_search_help_text_positional_documentation() {
+    let help = crate::cmd::search::SEARCH_HELP_TEXT;
+
+    // Required vocabulary.
+    assert!(
+        help.contains("--phrase"),
+        "AC-403-13: SEARCH_HELP_TEXT must document --phrase"
+    );
+    assert!(
+        help.contains("--near"),
+        "AC-403-13: SEARCH_HELP_TEXT must document --near"
+    );
+    assert!(
+        help.contains("--lang"),
+        "AC-403-13: SEARCH_HELP_TEXT must document --lang"
+    );
+    assert!(
+        help.contains("word token") || help.contains("word tokens"),
+        "AC-403-13: SEARCH_HELP_TEXT must explain the 'word token' unit for --near N"
+    );
+    assert!(
+        help.contains("case-sensitive") || help.contains("case sensitive"),
+        "AC-403-13: SEARCH_HELP_TEXT must state --phrase matching is case-sensitive"
+    );
+
+    // Composition rule documented.
+    assert!(
+        help.contains("--phrase --near") || help.contains("--phrase and --near"),
+        "AC-403-13: SEARCH_HELP_TEXT must document the --phrase --near N composition"
     );
 }
