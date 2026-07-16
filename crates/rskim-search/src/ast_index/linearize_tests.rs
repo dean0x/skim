@@ -14,9 +14,10 @@
 
 use rskim_core::Language;
 
-use super::{LinearNode, LinearizeResult, MAX_AST_DEPTH, MAX_AST_NODES, MAX_FILE_SIZE};
+use super::{LinearNode, LinearizeResult, MAX_AST_DEPTH, MAX_AST_NODES};
 use crate::ast_index::linearize::LANG_MAPS;
 use crate::ast_weights::NODE_KIND_VOCABULARY;
+use rskim_core::ast_size_limit;
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -335,7 +336,7 @@ fn no_node_has_depth_at_or_above_max_ast_depth() {
 #[test]
 fn node_count_never_exceeds_max_ast_nodes() {
     // NOTE: The MAX_AST_NODES (100K) guard cannot be triggered by real source
-    // without also exceeding MAX_FILE_SIZE (100 KiB): reaching 100K nodes would
+    // without also exceeding the file-size limit (1 MiB): reaching 100K nodes would
     // require ~12,500+ simple statements (~140 KiB), which the file-size guard
     // catches first. The guard for MAX_AST_NODES is therefore exercised by the
     // tree-sitter walk (nested/wide ASTs), not by statement count.
@@ -356,8 +357,9 @@ fn node_count_never_exceeds_max_ast_nodes() {
 
 #[test]
 fn oversized_file_returns_default() {
-    // File larger than MAX_FILE_SIZE should return empty default result.
-    let big = "fn x() {}\n".repeat(MAX_FILE_SIZE / 10 + 1);
+    // File larger than the AST size limit should return empty default result.
+    let limit = ast_size_limit(Language::Rust).unwrap() as usize;
+    let big = "fn x() {}\n".repeat(limit / 10 + 1);
     let result = parse_and_linearize(&big, Language::Rust);
     assert!(
         result.nodes.is_empty(),
@@ -544,8 +546,8 @@ fn binary_like_input_returns_ok_default() {
 fn linearize_1000_line_file_under_10ms() {
     use std::time::Instant;
 
-    // Generate a ~1000-line Rust file (well under MAX_FILE_SIZE).
-    // Each line is one function ~40 bytes; 1000 lines ≈ 40 KiB < 100 KiB limit.
+    // Generate a ~1000-line Rust file (well under the 1 MiB AST size limit).
+    // Each line is one function ~40 bytes; 1000 lines ≈ 40 KiB < 1 MiB limit.
     let source: String = (0..1000)
         .map(|i| format!("fn func_{i}(x: i32) -> i32 {{ x + {i} }}\n"))
         .collect();

@@ -45,11 +45,6 @@ pub(crate) const MAX_AST_DEPTH: u32 = AstWalkConfig::DEFAULT_MAX_DEPTH;
 #[cfg(test)]
 pub(crate) const MAX_AST_NODES: u32 = AstWalkConfig::DEFAULT_MAX_NODES;
 
-// MAX_FILE_SIZE and MAX_FILE_SIZE_LARGE were deleted in #405.
-// The single cap is now rskim_core::ast_size_limit(language) -> Option<u64>.
-// Both build-time (here) and query-time (reparse.rs) use that one function
-// so they cannot drift (AC-405-21 / AD-405-1).
-
 // ============================================================================
 // Public types
 // ============================================================================

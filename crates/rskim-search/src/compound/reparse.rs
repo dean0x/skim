@@ -81,9 +81,6 @@ use crate::ast_index::{
     synthetic_key_present, vocab_lookup,
 };
 
-// MAX_REPARSE_FILE_BYTES was deleted in #405 (AD-405-2).
-// Use rskim_core::ast_size_limit(lang) at every re-parse gate; see read_guarded.
-
 /// Find the first CST node matching the query's strict ancestor relationship.
 ///
 /// Returns `Some((line, byte_range, snippet))` where:

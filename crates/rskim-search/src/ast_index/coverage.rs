@@ -127,9 +127,8 @@ pub struct CoverageEntry {
 ///   Entries from the manifest's `skipped_entries` map (files > 5 MiB walk cap)
 ///   are disjoint by construction and must NOT be passed here (AC-405-14).
 /// - **Language resolve (AD-405-6):** stored `lang` string is parsed first via
-///   `Language::from_str_case_insensitive`; if that fails,
-///   `Language::from_path` is tried on the `path`.  Only if BOTH fail is the
-///   file counted as UNDETERMINED.
+///   `parse_lang_name`; if that fails, `Language::from_path` is tried on the
+///   `path`.  Only if BOTH fail is the file counted as UNDETERMINED.
 ///
 /// ## AD-405-5: Bounded sample algorithm
 ///
@@ -178,7 +177,7 @@ pub fn ast_coverage(entries: impl IntoIterator<Item = CoverageEntry>) -> AstCove
             Some(sz) => {
                 // SIZE-EXCLUDED: sz > cap.
                 size_excluded_files += 1;
-                let lang_name = lang_name_str(lang);
+                let lang_name = lang.as_str();
                 *excluded_by_lang.entry(lang_name.to_string()).or_insert(0) += 1;
 
                 // Bounded sample: keep the `AST_COVERAGE_EXCLUDED_SAMPLE_CAP`
@@ -255,29 +254,6 @@ fn parse_lang_name(s: &str) -> Option<Language> {
         "kotlin" => Some(Language::Kotlin),
         "swift" => Some(Language::Swift),
         _ => None,
-    }
-}
-
-/// Return the canonical lowercase name for a `Language` as used in the manifest.
-fn lang_name_str(lang: Language) -> &'static str {
-    match lang {
-        Language::TypeScript => "typescript",
-        Language::JavaScript => "javascript",
-        Language::Python => "python",
-        Language::Rust => "rust",
-        Language::Go => "go",
-        Language::Java => "java",
-        Language::Markdown => "markdown",
-        Language::Json => "json",
-        Language::Yaml => "yaml",
-        Language::C => "c",
-        Language::Cpp => "cpp",
-        Language::Toml => "toml",
-        Language::CSharp => "csharp",
-        Language::Ruby => "ruby",
-        Language::Sql => "sql",
-        Language::Kotlin => "kotlin",
-        Language::Swift => "swift",
     }
 }
 
