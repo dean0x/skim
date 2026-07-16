@@ -308,7 +308,16 @@ pub(super) fn run_ast_standalone(
         super::query::candidate_pool(page.limit(), super::query::LEXICAL_CANDIDATE_POOL_K)
             .saturating_add(page.offset())
     };
-    let window = temporal_window.max(ast_pool);
+    // When temporal is active the verify gate outputs at most `temporal_window`
+    // rows (see the truncate below), so sizing the pool to ast_pool's wider
+    // offset-inflated value would only waste up to `offset` extra file opens.
+    // Use temporal_window directly on that path; keep ast_pool for the pure-AST
+    // path where no truncation follows.
+    let window = if temporal_active {
+        temporal_window
+    } else {
+        ast_pool
+    };
 
     // Intersect AST results with blast-radius FileIds (when set), then take the
     // working window (pool). The filter runs BEFORE truncation so the window reflects
@@ -425,12 +434,18 @@ pub(super) fn run_ast_standalone(
     // `enrich_ast_results` caller contract: MUST receive ≤ resort_window entries
     // so per-file DB lookups stay bounded at O(resort_window) — AC-P1.
     //
-    // D-2 / AD-404-7: the temporal re-sort window is offset-INDEPENDENT.  The
-    // ast_pool above widens with offset so the verify gate can fill offset pages,
-    // but that widening MUST NOT carry into the temporal sort — doing so promotes
-    // late-rank hot files into earlier pages' slots, producing cross-page
-    // duplicate/miss results (the exact defect AD-404-6/7 forbid).  Truncating to
-    // resort_window(limit) here keeps pages provably disjoint.
+    // D-2 / AD-404-7: the temporal re-sort window is offset-INDEPENDENT.
+    // With temporal active, window is set to exactly temporal_window above
+    // (not ast_pool), so both the pool step and the verify gate produce at
+    // most temporal_window entries.  This truncate is therefore a no-op on
+    // the temporal path and is kept as defence-in-depth against future
+    // window-computation changes.
+    //
+    // Pages are disjoint for both pattern kinds:
+    //   - Synthetic: AND-semantics verify is exact; verified ≤ temporal_window.
+    //   - Real-node: find_first_strict_match is lossy (verified_count can be
+    //     < temporal_window) but never exceeds the pool ceiling, so no
+    //     offset-dependent set growth occurs and the disjoint bound holds.
     if temporal_active {
         resolved.truncate(temporal_window);
     }
@@ -445,7 +460,6 @@ pub(super) fn run_ast_standalone(
         page,
         pool_was_capped,
         temporal_active,
-        temporal_window,
         is_synthetic,
         raw_pattern,
         &query,
@@ -467,11 +481,10 @@ pub(super) fn run_ast_standalone(
 /// threshold. All pagination and output logic lives here; the caller owns the
 /// verify gate, the temporal pre-truncation, and the temporal enrichment steps.
 ///
-/// `temporal_active` / `temporal_window` must be consistent with the
-/// `resolved.truncate(temporal_window)` the caller already applied before
-/// `enrich_ast_results` (AD-404-6/7).
+/// `temporal_active` is consistent with the `resolved.truncate(temporal_window)`
+/// the caller already applied before `enrich_ast_results` (AD-404-6/7).
 // Arguments are all independent caller-supplied knobs (pagination cursor,
-// pool cap flag, temporal flags, synthetic-vs-real routing, pattern string,
+// pool cap flag, temporal flag, synthetic-vs-real routing, pattern string,
 // query handle for recover_line, paths for file I/O, format flag, writer).
 // No natural grouping exists — mirrors run_ast_standalone's own allow.
 #[allow(clippy::too_many_arguments)]
@@ -480,7 +493,6 @@ fn write_ast_page_output(
     page: Page,
     pool_was_capped: bool,
     temporal_active: bool,
-    temporal_window: usize,
     is_synthetic: bool,
     raw_pattern: &str,
     query: &AstQuery,
@@ -499,13 +511,19 @@ fn write_ast_page_output(
     // Replaces the unsound `results.len() < limit` heuristic.
     let has_more = pre_page_len > page.depth() || pool_was_capped;
 
-    // Bounded-page notice on the --ast+temporal path (AD-404-11).
+    // Bounded-page notice on the --ast+temporal path (AD-404-11 / D-5).
     // Fires when temporal is active, the page is non-empty (no false notice on
-    // the exhausted-page path), and pre_page_len exceeds the fixed temporal
-    // window — meaning candidates near the boundary may not be in the most
-    // accurate temporal order. Goes to stderr (PF-006 / AD-404-8) so --json
-    // stdout stays byte-identical. Mirrors run_temporal_standalone (mod.rs).
-    if !resolved.is_empty() && temporal_active && pre_page_len > temporal_window {
+    // the exhausted-page path), and has_more is true — meaning there are
+    // verified results beyond the current page (or the candidate pool was
+    // capped), so the user should paginate. Goes to stderr (PF-006 / AD-404-8)
+    // so --json stdout stays byte-identical. Mirrors run_temporal_standalone
+    // (mod.rs:1151) which also gates solely on has_more.
+    //
+    // NOTE: the old guard `pre_page_len > temporal_window` was dead code after
+    // resolved.truncate(temporal_window) (called by the caller before entry)
+    // ensured pre_page_len ≤ temporal_window when temporal_active — replaced
+    // here by has_more to restore parity with the text+temporal path.
+    if !resolved.is_empty() && temporal_active && has_more {
         eprintln!(
             "{}",
             super::temporal::bounded_page_notice(resolved.len(), page.offset(), page.limit())
