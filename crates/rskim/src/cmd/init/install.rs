@@ -11,6 +11,7 @@ use super::helpers::{
     confirm_proceed, load_or_create_settings, resolve_real_settings_path,
 };
 use super::state::{DetectedState, detect_state, has_skim_hook_entry, read_settings_json};
+use crate::cmd::hooks::copilot::SKIM_JSON_NAME;
 use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
 use crate::cmd::session::{AgentKind, InstructionEnv};
 
@@ -114,15 +115,28 @@ fn print_dual_scope_warning(warning: &str) {
     println!();
 }
 
-fn print_install_summary(state: &DetectedState) {
+fn print_install_summary(state: &DetectedState, agent: AgentKind) {
     println!("  Summary:");
     if !state.hook_installed || !state.hook_is_current() {
         let hook_script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
         println!("    * Create hook script: {}", hook_script_path.display());
-        println!(
-            "    * Patch settings: {} (add PreToolUse hook)",
-            state.settings_path.display()
-        );
+        let protocol = protocol_for_agent(agent);
+        if protocol.uses_dedicated_hook_file() {
+            // Copilot CLI: registration via hooks/skim.json, not settings.json.
+            let skim_json = state.hook_config_dir.join("hooks").join(SKIM_JSON_NAME);
+            println!(
+                "    * Register hook: {} ({} entry)",
+                skim_json.display(),
+                protocol.hook_event_key(),
+            );
+        } else {
+            // Settings-based agents: patch settings.json with the correct event key.
+            println!(
+                "    * Patch settings: {} (add {} hook)",
+                state.settings_path.display(),
+                protocol.hook_event_key(),
+            );
+        }
     }
     println!();
 }
@@ -465,25 +479,16 @@ fn run_install_single(
     }
 
     let global = !flags.project;
-    print_install_summary(&state);
+    print_install_summary(&state, agent);
 
     if flags.dry_run {
         // Dry-run writes nothing, so consent is not required to DISPLAY what
-        // would happen.  We enumerate the permission entries unconditionally
-        // (based on flags and writer availability) and annotate them with
-        // "(consent required at install)" so the user understands a real run
-        // would still prompt for approval.  We deliberately do NOT call
-        // resolve_permissions_consent here — that function may prompt on a
-        // real TTY and must never fire on a pure-display path.
-        print_dry_run_actions(
-            &state,
-            flags.no_guidance,
-            global,
-            &env,
-            flags.permissions,
-            flags.permissions_tier,
-            perm_dir,
-        )?;
+        // would happen.  We deliberately do NOT call resolve_permissions_consent
+        // here — that function may prompt on a real TTY and must never fire on
+        // a pure-display path.  Permission entries are enumerated (with a
+        // "(consent required at install)" annotation) by print_dry_run_permissions.
+        print_dry_run_actions(&state, flags.no_guidance, global, &env, agent)?;
+        print_dry_run_permissions(agent, flags.permissions, flags.permissions_tier, perm_dir)?;
         // Also show dry-run for wrappers if they would be installed.
         if !flags.project {
             maybe_install_wrappers(flags.wrappers, flags.dry_run)?;
@@ -1257,93 +1262,130 @@ pub(super) use super::guidance::{
 // Dry-run output (B11)
 // ============================================================================
 
+/// Enumerate permissions entries in dry-run output without performing any
+/// consent check or write.
+///
+/// Prints what permissions would be seeded, annotated with
+/// "(consent required at install)", so the user understands that a real
+/// install would still require interactive approval.  Called immediately
+/// after `print_dry_run_actions` from `run_install_single`.
+///
+/// On the Mirror tier, if `propose_mirrors` returns an error the fallback
+/// is the seed-tier entry list; a `SKIM_DEBUG=1` notice is emitted to stderr
+/// so the error is visible without changing control flow.
+fn print_dry_run_permissions(
+    agent: AgentKind,
+    permissions: Option<bool>,
+    tier: PermissionsTier,
+    perm_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    // Skip if permissions are explicitly disabled or no writer exists.
+    if permissions == Some(false) {
+        return Ok(());
+    }
+    let Some(protocol) = crate::cmd::permissions::permissions_protocol_for_agent(agent) else {
+        return Ok(());
+    };
+
+    // Determine whether permissions are active for this dry-run.
+    let permissions_active = match permissions {
+        Some(false) => false, // explicit opt-out (already guarded above)
+        Some(true) => true,   // explicitly requested
+        None => {
+            // Auto-mode: active only when the sidecar already exists and
+            // is stale (same condition as permissions_blocks_fast_path).
+            let sidecar_path = perm_dir.join("skim-permissions.json");
+            if sidecar_path.exists() {
+                let entries = crate::cmd::permissions::seeded_entries(protocol.as_ref());
+                !protocol.is_current(perm_dir, &entries)
+            } else {
+                false
+            }
+        }
+    };
+    if !permissions_active {
+        return Ok(());
+    }
+
+    let entries = match tier {
+        PermissionsTier::Mirror if agent == AgentKind::ClaudeCode => {
+            let proposals = match crate::cmd::permissions::claude::propose_mirrors(perm_dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    if std::env::var("SKIM_DEBUG").as_deref() == Ok("1") {
+                        eprintln!(
+                            "[skim:debug] dry-run mirror preview: could not read allow-list: {e}"
+                        );
+                    }
+                    Vec::new()
+                }
+            };
+            if proposals.is_empty() {
+                // No mirroring candidates: fall back to seed entries.
+                crate::cmd::permissions::seeded_entries(protocol.as_ref())
+            } else {
+                proposals
+                    .into_iter()
+                    .map(|p| {
+                        if p.is_mutating {
+                            format!("{} [mutating tool]", p.mirror)
+                        } else {
+                            p.mirror
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            }
+        }
+        _ => crate::cmd::permissions::seeded_entries(protocol.as_ref()),
+    };
+    let config_file = perm_dir.join(protocol.config_filename());
+    println!(
+        "  [dry-run] Would seed permissions (consent required at install): {}",
+        config_file.display()
+    );
+    for entry in &entries {
+        println!("    {entry}");
+    }
+
+    Ok(())
+}
+
 pub(super) fn print_dry_run_actions(
     state: &DetectedState,
     no_guidance: bool,
     global: bool,
     env: &InstructionEnv,
-    permissions: Option<bool>,
-    tier: PermissionsTier,
-    perm_dir: &std::path::Path,
+    agent: AgentKind,
 ) -> anyhow::Result<()> {
     let hook_script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+    let protocol = protocol_for_agent(agent);
 
     println!("  [dry-run] Would create: {}", hook_script_path.display());
-    if state.settings_exists {
+    if protocol.uses_dedicated_hook_file() {
+        // Copilot CLI: write hooks/skim.json; no settings.json backup or patch.
+        let skim_json = state.hook_config_dir.join("hooks").join(SKIM_JSON_NAME);
         println!(
-            "  [dry-run] Would back up: {} -> {}",
+            "  [dry-run] Would write: {} (register {} hook)",
+            skim_json.display(),
+            protocol.hook_event_key(),
+        );
+    } else {
+        // Settings-based agents: back up + patch settings.json.
+        if state.settings_exists {
+            println!(
+                "  [dry-run] Would back up: {} -> {}",
+                state.settings_path.display(),
+                SETTINGS_BACKUP
+            );
+        }
+        println!(
+            "  [dry-run] Would patch: {} (add {} hook)",
             state.settings_path.display(),
-            SETTINGS_BACKUP
+            protocol.hook_event_key(),
         );
     }
-    println!(
-        "  [dry-run] Would patch: {} (add PreToolUse hook)",
-        state.settings_path.display()
-    );
-    if !no_guidance {
-        let agent = agent_from_state(state)?;
-        if let Some(path) = agent.instruction_file(global, env) {
-            println!("  [dry-run] Would inject guidance into {}", path.display());
-        }
-    }
-
-    // Enumerate permissions entries without consulting consent.
-    // Dry-run writes nothing, so no consent is required to DISPLAY what would
-    // happen.  We show entries whenever permissions are "active" for this run
-    // and annotate them with "(consent required at install)" to make clear that
-    // a real install would still require an interactive approval.
-    if permissions != Some(false) {
-        let agent = agent_from_state(state)?;
-        if let Some(protocol) = crate::cmd::permissions::permissions_protocol_for_agent(agent) {
-            // Determine whether permissions are active for this dry-run.
-            let permissions_active = match permissions {
-                Some(false) => false, // explicit opt-out (already guarded above)
-                Some(true) => true,   // explicitly requested
-                None => {
-                    // Auto-mode: active only when the sidecar already exists and
-                    // is stale (same condition as permissions_blocks_fast_path).
-                    let sidecar_path = perm_dir.join("skim-permissions.json");
-                    if sidecar_path.exists() {
-                        let entries = crate::cmd::permissions::seeded_entries(protocol.as_ref());
-                        !protocol.is_current(perm_dir, &entries)
-                    } else {
-                        false
-                    }
-                }
-            };
-            if permissions_active {
-                let entries = match tier {
-                    PermissionsTier::Mirror if agent == AgentKind::ClaudeCode => {
-                        let proposals = crate::cmd::permissions::claude::propose_mirrors(perm_dir)
-                            .unwrap_or_default();
-                        if proposals.is_empty() {
-                            // No mirroring candidates: fall back to seed entries.
-                            crate::cmd::permissions::seeded_entries(protocol.as_ref())
-                        } else {
-                            proposals
-                                .into_iter()
-                                .map(|p| {
-                                    if p.is_mutating {
-                                        format!("{} [mutating tool]", p.mirror)
-                                    } else {
-                                        p.mirror
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                        }
-                    }
-                    _ => crate::cmd::permissions::seeded_entries(protocol.as_ref()),
-                };
-                let config_file = perm_dir.join(protocol.config_filename());
-                println!(
-                    "  [dry-run] Would seed permissions (consent required at install): {}",
-                    config_file.display()
-                );
-                for entry in &entries {
-                    println!("    {entry}");
-                }
-            }
-        }
+    if !no_guidance && let Some(path) = agent.instruction_file(global, env) {
+        println!("  [dry-run] Would inject guidance into {}", path.display());
     }
 
     Ok(())

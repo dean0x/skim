@@ -66,6 +66,13 @@ pub(crate) struct ProcessResult {
     /// cannot be re-read; the buffer must be kept).  All other constructors
     /// set this to `None` (files can be re-read from disk).
     pub(crate) stdin_raw: Option<String>,
+    /// Whether the served view differs from raw file bytes.
+    ///
+    /// `true` when `SKIM_REWRITTEN_FROM` is set AND the transformed output
+    /// is not byte-identical to the raw input.  Used by the transparency
+    /// marker layer to emit a stderr notice on hook-rewritten file reads.
+    /// Always `false` when the origin env var is absent (non-hook invocations).
+    pub(crate) view_differs: bool,
 }
 
 /// Determine the parse quality tier from the mode, parse-error flag, and degraded flag.
@@ -148,9 +155,15 @@ pub(crate) fn report_token_stats(
 ///
 /// Used by both `process_stdin` and the single-file path in `main()`.
 /// Multi-file paths use their own output logic in `process_files()`.
+///
+/// When the invocation was a hook-rewritten file read (`SKIM_REWRITTEN_FROM` is set)
+/// and the served view differs from raw bytes, emits a one-line stderr transparency
+/// marker so agents can distinguish structured views from byte-identical passthroughs
+/// (per ADR-005: agents learn about passthrough via stderr hints, not guidance prose).
 pub(crate) fn write_result_and_stats(
     result: &ProcessResult,
     show_stats: bool,
+    mode_str: &str,
 ) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
@@ -159,6 +172,13 @@ pub(crate) fn write_result_and_stats(
 
     if show_stats {
         report_token_stats(result.original_tokens, result.transformed_tokens, "");
+    }
+
+    if result.view_differs
+        && let Some(origin) = crate::output::rewrite_origin()
+        && let Some(marker) = crate::output::rewrite_transparency_marker(&origin, mode_str, 1, 1)
+    {
+        eprintln!("{marker}");
     }
 
     Ok(())
@@ -186,12 +206,37 @@ fn try_cached_result(
     // file and count tokens for both source and output -- but only when
     // --show-stats is active. Analytics background threads handle their own
     // token counting, so we don't erode cache speedup for analytics alone.
+    //
+    // Also read the raw file when a hook-rewrite origin tag is present so the
+    // transparency marker can compare cached content against raw bytes.
     let needs_recount = hit.original_tokens.is_none() && options.show_stats;
-    let (orig_tokens, trans_tokens) = if needs_recount {
-        let contents = read_and_validate(path)?;
-        count_token_pair(&contents, &hit.content)
+    let origin_active = crate::output::rewrite_origin().is_some();
+    let needs_raw_read = needs_recount || origin_active;
+
+    let (orig_tokens, trans_tokens, view_differs) = if needs_raw_read {
+        match read_and_validate(path) {
+            Ok(contents) => {
+                let (orig, trans) = if needs_recount {
+                    count_token_pair(&contents, &hit.content)
+                } else {
+                    (hit.original_tokens, hit.transformed_tokens)
+                };
+                let differs = origin_active && hit.content != contents;
+                (orig, trans, differs)
+            }
+            Err(e) => {
+                if needs_recount {
+                    // Token recount failure is a hard error.
+                    return Err(e);
+                }
+                // Read needed only for the transparency marker; default to
+                // view_differs=true (conservative — a false positive is safe,
+                // a false negative would be the incident class).
+                (hit.original_tokens, hit.transformed_tokens, true)
+            }
+        }
     } else {
-        (hit.original_tokens, hit.transformed_tokens)
+        (hit.original_tokens, hit.transformed_tokens, false)
     };
 
     // Effective language for a cache hit: explicit override wins, else detect from path.
@@ -207,6 +252,7 @@ fn try_cached_result(
         parse_tier: None, // tier was not recorded at cache-write time
         language: cache_lang,
         stdin_raw: None,
+        view_differs,
     }))
 }
 
@@ -471,6 +517,7 @@ fn stdin_passthrough_result(buffer: String, options: &ProcessOptions) -> Process
         parse_tier: Some("passthrough"),
         language: None,
         stdin_raw,
+        view_differs: false, // passthrough output is byte-identical to input
     }
 }
 
@@ -593,6 +640,11 @@ pub(crate) fn process_stdin(
             (transformed, false)
         };
 
+    // Transparency marker: did the transformation produce a different view?
+    // Compare pre-line-numbers output against raw buffer. When guardrail fired,
+    // final_output == buffer so view_differs will be false (correct — raw served).
+    let view_differs = crate::output::rewrite_origin().is_some() && final_output != buffer;
+
     // Apply line number formatting AFTER guardrail, BEFORE token stats.
     let final_output = apply_line_numbers(
         final_output,
@@ -641,6 +693,7 @@ pub(crate) fn process_stdin(
         parse_tier,
         language: Some(language),
         stdin_raw,
+        view_differs,
     })
 }
 
@@ -692,6 +745,11 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
             (result, false)
         };
 
+    // Transparency marker: did transformation produce a different view than raw bytes?
+    // Compare pre-line-numbers output to raw contents. When guardrail fired,
+    // final_output == contents so view_differs will be false (correct — raw was served).
+    let view_differs = crate::output::rewrite_origin().is_some() && final_output != contents;
+
     // Apply line number formatting AFTER guardrail, BEFORE cache write and token stats.
     // AC-12: Cache key includes line_numbers (handled in cache::read_cache/write_cache).
     let final_output = apply_line_numbers(
@@ -741,6 +799,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         parse_tier,
         language: effective_lang,
         stdin_raw: None,
+        view_differs,
     })
 }
 

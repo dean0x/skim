@@ -30,7 +30,9 @@
 /// calls. Per-test env overrides applied after this call take precedence.
 pub fn skim() -> assert_cmd::Command {
     let mut c = assert_cmd::Command::cargo_bin("skim").unwrap();
-    c.env("SKIM_DISABLE_ANALYTICS", "1").env("NO_COLOR", "1");
+    c.env("SKIM_DISABLE_ANALYTICS", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("SKIM_REWRITTEN_FROM"); // prevent host env from leaking into tests
     c
 }
 
