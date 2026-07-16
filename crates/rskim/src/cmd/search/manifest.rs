@@ -727,9 +727,9 @@ impl FileManifest {
     ///
     /// ## AD-405-6: two-tier language resolve
     ///
-    /// `parse_lang_name` (inside `rskim_search::ast_coverage`) tries the stored
-    /// `lang` string first, then falls back to `Language::from_path` on the
-    /// stored `path`.  Only if BOTH fail is the entry counted as UNDETERMINED.
+    /// `Language::from_name` tries the stored `lang` string first, then falls
+    /// back to `Language::from_path` on the stored `path`.  Only if BOTH fail
+    /// is the entry counted as UNDETERMINED.
     ///
     /// ## AC-405-14: walk-skipped files are disjoint
     ///
