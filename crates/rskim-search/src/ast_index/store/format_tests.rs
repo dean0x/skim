@@ -469,12 +469,13 @@ fn file_meta_rejects_truncation() {
 }
 
 // ============================================================================
-// A1: FORMAT_VERSION == 2, magic unchanged
+// A1: FORMAT_VERSION == 3, magic unchanged
 // ============================================================================
 
 #[test]
-fn a1_format_version_is_2() {
-    assert_eq!(FORMAT_VERSION, 2, "A1: FORMAT_VERSION must be 2");
+fn a1_format_version_is_3() {
+    // #405 (AD-405-15): bumped 2 -> 3 for the 100 KiB -> 1 MiB AST size-cap raise.
+    assert_eq!(FORMAT_VERSION, 3, "A1: FORMAT_VERSION must be 3");
 }
 
 #[test]

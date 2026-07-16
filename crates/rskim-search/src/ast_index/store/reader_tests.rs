@@ -654,20 +654,20 @@ fn ast_index_size_ratio() {
 // probe is a cheap staleness check; the caller decides what to do with the value.
 // ============================================================================
 
-/// F9 positive: index_version returns Ok(FORMAT_VERSION) == Ok(2) for a real
-/// v2 index built by AstIndexBuilder.
+/// F9 positive: index_version returns Ok(FORMAT_VERSION) == Ok(3) for a real
+/// v3 index built by AstIndexBuilder (#405 bumped 2 -> 3).
 #[test]
-fn f9_index_version_returns_2_for_v2_index() {
+fn f9_index_version_returns_3_for_v3_index() {
     let (dir, _reader) = build_3_file_index();
     let version = AstIndexReader::index_version(dir.path()).unwrap();
     assert_eq!(
         version,
         super::super::format::FORMAT_VERSION,
-        "index_version must return FORMAT_VERSION (2) for a freshly built index"
+        "index_version must return FORMAT_VERSION (3) for a freshly built index"
     );
     assert_eq!(
-        version, 2u16,
-        "FORMAT_VERSION is expected to be 2 in this wave"
+        version, 3u16,
+        "FORMAT_VERSION is expected to be 3 in this wave (#405 size-cap bump)"
     );
 }
 

@@ -3201,3 +3201,74 @@ fn ac403_search_help_text_positional_documentation() {
         "AC-403-13: SEARCH_HELP_TEXT must document the --phrase --near N composition"
     );
 }
+
+// ============================================================================
+// #405 — ast_coverage_notice pure decision seam (AD-405-4 / PF-008 / D-4)
+// ============================================================================
+//
+// `ast_coverage_notice` is the single source of truth for the AST size-coverage
+// notice wording, shared by run_build / run_update / run_ast_standalone /
+// run_query / run_stats. AD-405-4 requires every emitting site to print a string
+// starting with the shared `AST_COVERAGE_NOTICE` prefix, and requires the seam to
+// return `None` on a clean corpus so callers never gate on `is_clean()` themselves.
+// These assertions are falsifiable (PF-007): each fails if the #405 notice contract
+// regresses.
+
+/// NEGATIVE (AC-405-8): a clean corpus (every file within the AST size cap) is
+/// silent — the seam returns `None`, so no site emits a spurious notice and the
+/// "pure-lexical carries no AST caveat" promise holds.
+#[test]
+fn ast_coverage_notice_none_on_clean_corpus() {
+    use super::ast_coverage_notice;
+    use rskim_search::{CoverageEntry, ast_coverage};
+
+    let clean = ast_coverage(std::iter::once(CoverageEntry {
+        path: "src/small.rs".to_string(),
+        lang: "rust".to_string(),
+        size: Some(100),
+    }));
+    assert!(
+        clean.is_clean(),
+        "an in-cap file must yield a clean coverage"
+    );
+    assert_eq!(
+        ast_coverage_notice(&clean),
+        None,
+        "clean corpus must produce no coverage notice (AC-405-8)"
+    );
+}
+
+/// POSITIVE (AD-405-4 / PF-008): an excluded file (over the 1 MiB cap) fires the
+/// notice, which MUST start with the shared `AST_COVERAGE_NOTICE` prefix, report
+/// the excluded count, and carry the per-language breakdown.
+#[test]
+fn ast_coverage_notice_fires_with_shared_prefix_when_excluded() {
+    use super::{AST_COVERAGE_NOTICE, ast_coverage_notice};
+    use rskim_search::{CoverageEntry, ast_coverage};
+
+    let over_cap = rskim_core::AST_SIZE_LIMIT_DEFAULT + 1;
+    let dirty = ast_coverage(std::iter::once(CoverageEntry {
+        path: "src/huge.rs".to_string(),
+        lang: "rust".to_string(),
+        size: Some(over_cap),
+    }));
+    assert!(
+        !dirty.is_clean(),
+        "an over-cap file must yield a non-clean coverage"
+    );
+
+    let notice =
+        ast_coverage_notice(&dirty).expect("an excluded file must produce a coverage notice");
+    assert!(
+        notice.starts_with(AST_COVERAGE_NOTICE),
+        "notice must start with the shared prefix (AD-405-4/PF-008): got {notice:?}"
+    );
+    assert!(
+        notice.contains("1 file(s) exceed"),
+        "notice must report the excluded count: got {notice:?}"
+    );
+    assert!(
+        notice.contains("By language: rust 1"),
+        "notice must carry the per-language breakdown: got {notice:?}"
+    );
+}

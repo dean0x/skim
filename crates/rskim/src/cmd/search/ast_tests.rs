@@ -4541,11 +4541,11 @@ fn recover_line_matches_ground_truth_for_all_five_synthetic_patterns_ac13_394() 
 
 /// AC12 (#394): synthetic-pattern queries are query-time only — the AST index
 /// file is not rewritten across consecutive queries, and the on-disk
-/// FORMAT_VERSION remains at its initial value (2).
+/// FORMAT_VERSION remains at its initial value (3).
 ///
 /// The no-rebuild assertion uses `ast_index.skidx` mtime, NOT version equality:
 /// a staleness-triggered rebuild re-writes the index at the SAME FORMAT_VERSION
-/// (2), so `version_before == version_after` would be true whether or not a
+/// (3), so `version_before == version_after` would be true whether or not a
 /// rebuild fired — the mtime is the discriminating observable (reviewer finding).
 #[test]
 fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
@@ -4555,18 +4555,19 @@ fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
     let cache = tempfile::tempdir().unwrap();
     build_project_index(project.path(), cache.path());
 
-    // Pin the format version: the fix must NOT change FORMAT_VERSION.
+    // Pin the format version: the AC12 fix must NOT change FORMAT_VERSION.
     //
-    // Pinned to the literal 2 (not `AST_INDEX_FORMAT_VERSION`) so that a future
+    // Pinned to the literal 3 (not `AST_INDEX_FORMAT_VERSION`) so that a future
     // version bump fails this locally-runnable test, not only the CI-only lib
-    // test `format_tests.rs::a1_format_version_is_2`. Reading version_before
+    // test `format_tests.rs::a1_format_version_is_3`. Reading version_before
     // from the just-written index and comparing to the constant would produce a
     // tautological `X == X` that cannot detect a bump (reviewer finding).
+    // #405 (AD-405-15): the pin was updated 2 -> 3 alongside the size-cap bump.
     let version_before = rskim_search::AstIndexReader::index_version(cache.path())
         .expect("index_version must succeed after build");
     assert_eq!(
-        version_before, 2u16,
-        "AC12 (#394): AST index format version must be exactly 2 (literal pin). \
+        version_before, 3u16,
+        "AC12 (#394): AST index format version must be exactly 3 (literal pin). \
          If this fails, FORMAT_VERSION was bumped — check \
          rskim_search::AST_INDEX_FORMAT_VERSION and update this pin deliberately"
     );
@@ -4574,7 +4575,7 @@ fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
     // Capture the index file mtime BEFORE the queries — this is the
     // discriminating observable for "no rebuild fired" (version equality alone
     // cannot distinguish a rebuild from a no-op because rebuilds write the same
-    // FORMAT_VERSION=2).
+    // FORMAT_VERSION=3).
     let idx_path = cache.path().join("ast_index.skidx");
     let mtime_before = std::fs::metadata(&idx_path)
         .expect("ast_index.skidx must exist after build")
