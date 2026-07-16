@@ -176,6 +176,7 @@ impl AstResult {
 ///   "pattern": "try-catch",
 ///   "description": "...",
 ///   "total": 3,
+///   "has_more": true,
 ///   "results": [
 ///     { "path": "src/foo.rs", "score": 2.45, "line": 42,
 ///       "snippet": "  fn foo() {", "layers_matched": ["ast"] }
@@ -184,12 +185,20 @@ impl AstResult {
 /// ```
 ///
 /// Degraded rows omit `line` and `snippet` keys entirely (never `null`/`0`).
+/// `has_more` is absent when `false` (additive, back-compat; AD-404-11).
 #[derive(Serialize)]
 struct AstJsonEnvelope<'a> {
     mode: &'static str,
     pattern: &'a str,
     description: &'a str,
     total: usize,
+    /// Sound pagination terminator: true when more results exist beyond the
+    /// current page. Replaces the unsound `results.len() < limit` heuristic.
+    /// See AD-404-11 and D-5 user sign-off 2026-07-15.
+    ///
+    /// Absent when false (additive, back-compat).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    has_more: bool,
     results: &'a [AstResult],
 }
 
@@ -210,7 +219,15 @@ struct AstJsonEnvelope<'a> {
 /// src/models/user.rs  [0.72]  try-catch
 /// ```
 ///
-/// Empty result → "no files match pattern" (exit 0, AC-F8).
+/// Empty result at `offset == 0` → "no files match pattern" (exit 0, AC-F8).
+/// Empty result at `offset > 0` → page-exhausted message (AC-404-10): the
+/// caller has paged past all results, so the message distinguishes "no data"
+/// from "paged too far".
+///
+/// Mirrors `format_temporal_text` (in `rskim`) which takes a `Page` for the
+/// same page-aware empty-message split; here `offset: usize` carries the one
+/// field that drives formatting without pulling the `Page` type across the
+/// crate boundary.
 ///
 /// # Errors
 ///
@@ -219,6 +236,7 @@ pub fn format_ast_text(
     results: &[AstResult],
     pattern_name: &str,
     description: &str,
+    offset: usize,
     w: &mut impl Write,
 ) -> io::Result<()> {
     if description.is_empty() {
@@ -229,7 +247,16 @@ pub fn format_ast_text(
     writeln!(w)?;
 
     if results.is_empty() {
-        writeln!(w, "no files match pattern {:?}", pattern_name)?;
+        if offset > 0 {
+            // AC-404-8 / AC-404-10: page-aware empty — "paged past all matches".
+            writeln!(
+                w,
+                "No more files match pattern {pattern_name:?} beyond offset {offset} \
+                 (try a smaller --offset)."
+            )?;
+        } else {
+            writeln!(w, "no files match pattern {:?}", pattern_name)?;
+        }
         return Ok(());
     }
 
@@ -262,10 +289,15 @@ pub fn format_ast_text(
 // JSON formatter
 // ============================================================================
 
-/// Format compound AST results as a JSON object (AC-F4, AC-API1).
+/// Format compound AST results as a JSON object (AC-F4, AC-API1, AD-404-11).
 ///
 /// Empty results → `{"mode":"ast","total":0,"results":[]}` (AC-F8).
 /// Degraded rows omit `line` and `snippet` keys (AC-F4 NEGATIVE).
+///
+/// `has_more`: sound pagination terminator — true when more results exist beyond
+/// the current page or the candidate pool was capped; false on the last page.
+/// The field is ABSENT from the JSON when false (additive, back-compat).
+/// Replaces the unsound `results.len() < limit` heuristic (D-5 / AD-404-11).
 ///
 /// # Errors
 ///
@@ -274,6 +306,7 @@ pub fn format_ast_json(
     results: &[AstResult],
     pattern_name: &str,
     description: &str,
+    has_more: bool,
     w: &mut impl Write,
 ) -> io::Result<()> {
     let envelope = AstJsonEnvelope {
@@ -281,6 +314,7 @@ pub fn format_ast_json(
         pattern: pattern_name,
         description,
         total: results.len(),
+        has_more,
         results,
     };
     let json = serde_json::to_string_pretty(&envelope)

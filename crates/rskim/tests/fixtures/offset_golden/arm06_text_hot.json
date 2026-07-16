@@ -1,0 +1,288 @@
+{
+  "query": "error",
+  "total": 5,
+  "results": [
+    {
+      "path": "file1.ts",
+      "score": 9.0,
+      "field": "symbol_name",
+      "line_number": 8,
+      "line_range": {
+        "start": 8,
+        "end": 9
+      },
+      "snippet": {
+        "lines": [
+          {
+            "line_number": 5,
+            "content": "      console.log(item);",
+            "is_match": false
+          },
+          {
+            "line_number": 6,
+            "content": "    }",
+            "is_match": false
+          },
+          {
+            "line_number": 7,
+            "content": "    return data.result;",
+            "is_match": false
+          },
+          {
+            "line_number": 8,
+            "content": "  } catch (error) {",
+            "is_match": true
+          },
+          {
+            "line_number": 9,
+            "content": "    console.error(\"Failed:\", error);",
+            "is_match": false
+          },
+          {
+            "line_number": 10,
+            "content": "    return \"\";",
+            "is_match": false
+          },
+          {
+            "line_number": 11,
+            "content": "  }",
+            "is_match": false
+          }
+        ]
+      },
+      "stale": false,
+      "temporal": {
+        "hotspot_score": 1.0,
+        "changes_30d": 5,
+        "changes_90d": 5
+      }
+    },
+    {
+      "path": "file2.ts",
+      "score": 9.0,
+      "field": "symbol_name",
+      "line_number": 8,
+      "line_range": {
+        "start": 8,
+        "end": 9
+      },
+      "snippet": {
+        "lines": [
+          {
+            "line_number": 5,
+            "content": "      console.log(item);",
+            "is_match": false
+          },
+          {
+            "line_number": 6,
+            "content": "    }",
+            "is_match": false
+          },
+          {
+            "line_number": 7,
+            "content": "    return data.result;",
+            "is_match": false
+          },
+          {
+            "line_number": 8,
+            "content": "  } catch (error) {",
+            "is_match": true
+          },
+          {
+            "line_number": 9,
+            "content": "    console.error(\"Failed:\", error);",
+            "is_match": false
+          },
+          {
+            "line_number": 10,
+            "content": "    return \"\";",
+            "is_match": false
+          },
+          {
+            "line_number": 11,
+            "content": "  }",
+            "is_match": false
+          }
+        ]
+      },
+      "stale": false,
+      "temporal": {
+        "hotspot_score": 0.6,
+        "changes_30d": 3,
+        "changes_90d": 3
+      }
+    },
+    {
+      "path": "file6.ts",
+      "score": 9.0,
+      "field": "symbol_name",
+      "line_number": 8,
+      "line_range": {
+        "start": 8,
+        "end": 9
+      },
+      "snippet": {
+        "lines": [
+          {
+            "line_number": 5,
+            "content": "      console.log(item);",
+            "is_match": false
+          },
+          {
+            "line_number": 6,
+            "content": "    }",
+            "is_match": false
+          },
+          {
+            "line_number": 7,
+            "content": "    return data.result;",
+            "is_match": false
+          },
+          {
+            "line_number": 8,
+            "content": "  } catch (error) {",
+            "is_match": true
+          },
+          {
+            "line_number": 9,
+            "content": "    console.error(\"Failed:\", error);",
+            "is_match": false
+          },
+          {
+            "line_number": 10,
+            "content": "    return \"\";",
+            "is_match": false
+          },
+          {
+            "line_number": 11,
+            "content": "  }",
+            "is_match": false
+          }
+        ]
+      },
+      "stale": false,
+      "temporal": {
+        "hotspot_score": 0.39999999999999997,
+        "changes_30d": 2,
+        "changes_90d": 2
+      }
+    },
+    {
+      "path": "file5.ts",
+      "score": 9.0,
+      "field": "symbol_name",
+      "line_number": 8,
+      "line_range": {
+        "start": 8,
+        "end": 9
+      },
+      "snippet": {
+        "lines": [
+          {
+            "line_number": 5,
+            "content": "      console.log(item);",
+            "is_match": false
+          },
+          {
+            "line_number": 6,
+            "content": "    }",
+            "is_match": false
+          },
+          {
+            "line_number": 7,
+            "content": "    return data.result;",
+            "is_match": false
+          },
+          {
+            "line_number": 8,
+            "content": "  } catch (error) {",
+            "is_match": true
+          },
+          {
+            "line_number": 9,
+            "content": "    console.error(\"Failed:\", error);",
+            "is_match": false
+          },
+          {
+            "line_number": 10,
+            "content": "    return \"\";",
+            "is_match": false
+          },
+          {
+            "line_number": 11,
+            "content": "  }",
+            "is_match": false
+          }
+        ]
+      },
+      "stale": false,
+      "temporal": {
+        "hotspot_score": 0.19999999999999998,
+        "changes_30d": 1,
+        "changes_90d": 1
+      }
+    },
+    {
+      "path": "file4.ts",
+      "score": 9.0,
+      "field": "symbol_name",
+      "line_number": 8,
+      "line_range": {
+        "start": 8,
+        "end": 9
+      },
+      "snippet": {
+        "lines": [
+          {
+            "line_number": 5,
+            "content": "      console.log(item);",
+            "is_match": false
+          },
+          {
+            "line_number": 6,
+            "content": "    }",
+            "is_match": false
+          },
+          {
+            "line_number": 7,
+            "content": "    return data.result;",
+            "is_match": false
+          },
+          {
+            "line_number": 8,
+            "content": "  } catch (error) {",
+            "is_match": true
+          },
+          {
+            "line_number": 9,
+            "content": "    console.error(\"Failed:\", error);",
+            "is_match": false
+          },
+          {
+            "line_number": 10,
+            "content": "    return \"\";",
+            "is_match": false
+          },
+          {
+            "line_number": 11,
+            "content": "  }",
+            "is_match": false
+          }
+        ]
+      },
+      "stale": false,
+      "temporal": {
+        "hotspot_score": 0.19999999999999998,
+        "changes_30d": 1,
+        "changes_90d": 1
+      }
+    }
+  ],
+  "duration_ms": 0,
+  "index_stats": {
+    "file_count": 6,
+    "total_ngrams": 233,
+    "index_size_bytes": 11672,
+    "last_updated": null
+  }
+}

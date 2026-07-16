@@ -1,0 +1,188 @@
+{
+  "query": "processRequest",
+  "total": 5,
+  "results": [
+    {
+      "path": "file1.ts",
+      "score": 0.011475409836065573,
+      "field": "symbol_name",
+      "line_number": 1,
+      "line_range": {
+        "start": 1,
+        "end": 2
+      },
+      "snippet": {
+        "lines": [
+          {
+            "line_number": 1,
+            "content": "export function processRequest1(input: unknown): string {",
+            "is_match": true
+          },
+          {
+            "line_number": 2,
+            "content": "  try {",
+            "is_match": false
+          },
+          {
+            "line_number": 3,
+            "content": "    const data = JSON.parse(input as string);",
+            "is_match": false
+          },
+          {
+            "line_number": 4,
+            "content": "    for (const item of data.items) {",
+            "is_match": false
+          }
+        ]
+      },
+      "stale": false
+    },
+    {
+      "path": "file2.ts",
+      "score": 0.01129032258064516,
+      "field": "symbol_name",
+      "line_number": 1,
+      "line_range": {
+        "start": 1,
+        "end": 2
+      },
+      "snippet": {
+        "lines": [
+          {
+            "line_number": 1,
+            "content": "export function processRequest2(input: unknown): string {",
+            "is_match": true
+          },
+          {
+            "line_number": 2,
+            "content": "  try {",
+            "is_match": false
+          },
+          {
+            "line_number": 3,
+            "content": "    const data = JSON.parse(input as string);",
+            "is_match": false
+          },
+          {
+            "line_number": 4,
+            "content": "    for (const item of data.items) {",
+            "is_match": false
+          }
+        ]
+      },
+      "stale": false
+    },
+    {
+      "path": "file3.ts",
+      "score": 0.01111111111111111,
+      "field": "symbol_name",
+      "line_number": 1,
+      "line_range": {
+        "start": 1,
+        "end": 2
+      },
+      "snippet": {
+        "lines": [
+          {
+            "line_number": 1,
+            "content": "export function processRequest3(input: unknown): string {",
+            "is_match": true
+          },
+          {
+            "line_number": 2,
+            "content": "  try {",
+            "is_match": false
+          },
+          {
+            "line_number": 3,
+            "content": "    const data = JSON.parse(input as string);",
+            "is_match": false
+          },
+          {
+            "line_number": 4,
+            "content": "    for (const item of data.items) {",
+            "is_match": false
+          }
+        ]
+      },
+      "stale": false
+    },
+    {
+      "path": "file4.ts",
+      "score": 0.0109375,
+      "field": "symbol_name",
+      "line_number": 1,
+      "line_range": {
+        "start": 1,
+        "end": 2
+      },
+      "snippet": {
+        "lines": [
+          {
+            "line_number": 1,
+            "content": "export function processRequest4(input: unknown): string {",
+            "is_match": true
+          },
+          {
+            "line_number": 2,
+            "content": "  try {",
+            "is_match": false
+          },
+          {
+            "line_number": 3,
+            "content": "    const data = JSON.parse(input as string);",
+            "is_match": false
+          },
+          {
+            "line_number": 4,
+            "content": "    for (const item of data.items) {",
+            "is_match": false
+          }
+        ]
+      },
+      "stale": false
+    },
+    {
+      "path": "file5.ts",
+      "score": 0.01076923076923077,
+      "field": "symbol_name",
+      "line_number": 1,
+      "line_range": {
+        "start": 1,
+        "end": 2
+      },
+      "snippet": {
+        "lines": [
+          {
+            "line_number": 1,
+            "content": "export function processRequest5(input: unknown): string {",
+            "is_match": true
+          },
+          {
+            "line_number": 2,
+            "content": "  try {",
+            "is_match": false
+          },
+          {
+            "line_number": 3,
+            "content": "    const data = JSON.parse(input as string);",
+            "is_match": false
+          },
+          {
+            "line_number": 4,
+            "content": "    for (const item of data.items) {",
+            "is_match": false
+          }
+        ]
+      },
+      "stale": false
+    }
+  ],
+  "duration_ms": 0,
+  "index_stats": {
+    "file_count": 6,
+    "total_ngrams": 233,
+    "index_size_bytes": 11672,
+    "last_updated": null
+  }
+}

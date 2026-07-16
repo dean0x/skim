@@ -1,0 +1,53 @@
+{
+  "mode": "ast",
+  "pattern": "try-catch",
+  "description": "A try/catch block (TypeScript/JavaScript). Exact: try_statement always contains a catch_clause.",
+  "total": 5,
+  "results": [
+    {
+      "path": "file1.ts",
+      "score": 2.2878358342986647,
+      "line": 8,
+      "snippet": "  } catch (error) {",
+      "layers_matched": [
+        "ast"
+      ]
+    },
+    {
+      "path": "file2.ts",
+      "score": 2.304929315688841,
+      "line": 8,
+      "snippet": "  } catch (error) {",
+      "layers_matched": [
+        "ast"
+      ]
+    },
+    {
+      "path": "file3.ts",
+      "score": 2.3222801464922265,
+      "line": 8,
+      "snippet": "  } catch (error) {",
+      "layers_matched": [
+        "ast"
+      ]
+    },
+    {
+      "path": "file4.ts",
+      "score": 2.3222801464922265,
+      "line": 8,
+      "snippet": "  } catch (error) {",
+      "layers_matched": [
+        "ast"
+      ]
+    },
+    {
+      "path": "file5.ts",
+      "score": 2.3222801464922265,
+      "line": 8,
+      "snippet": "  } catch (error) {",
+      "layers_matched": [
+        "ast"
+      ]
+    }
+  ]
+}

@@ -232,6 +232,7 @@ pub(super) fn execute_query_with_manifest(
             results: vec![],
             duration_ms: start.elapsed().as_millis() as u64,
             index_stats: None,
+            has_more: false,
         });
     }
 
@@ -397,7 +398,7 @@ pub(super) fn execute_query_with_manifest(
     // as the exact-symbol path (AD-372-3), so they share its branch below.
     let positional = config.phrase || config.near.is_some();
 
-    let raw_results = if exact_symbol || positional {
+    let (raw_results, pool_was_capped) = if exact_symbol || positional {
         // AD-372-3 / RESOLVED Decision 3 (extended to the positional path, #392):
         // sq.limit = None: reader returns the FULL ranked intersection so that the
         // post-verify skip (below) operates on the verified set, not the pre-verify
@@ -406,6 +407,10 @@ pub(super) fn execute_query_with_manifest(
         // verify step — page-2 could silently omit a file that was at rank-1 after
         // verification.  Setting sq.offset = None (reader default) keeps the full
         // ranked intersection intact for the post-verify pagination below.
+        //
+        // pool_was_capped = false: sq.limit = None means the reader returns the
+        // complete intersection — no external pool cap exists on this path, so
+        // has_more is never conservatively inflated by a pool-cap signal.
         let mut sq = SearchQuery::new(config.text.clone());
         sq.limit = None;
         // sq.offset is intentionally left as None (== reader default 0): offset is
@@ -414,18 +419,36 @@ pub(super) fn execute_query_with_manifest(
         sq.phrase = config.phrase;
         sq.near = config.near;
         sq.lang = config.lang; // D17 / AC16: --lang honored on positional + exact paths
-        engine.search(&sq)?
+        (engine.search(&sq)?, false)
     } else {
         // Multi-word / default: widen pool via LEXICAL_CANDIDATE_POOL_K (AD-355-2).
         // phrase/near are false/None here by construction (positional is false);
         // forwarded for clarity/symmetry with the branch above.
-        let pool_limit = candidate_pool(config.limit, LEXICAL_CANDIDATE_POOL_K);
+        //
+        // AD-404-4 additive widening: pool = candidate_pool(limit, K) + offset.
+        // At offset 0: pool == candidate_pool(limit, K) — zero regression.
+        // NEVER the multiplicative candidate_pool(depth(), K) form (D-2).
+        // saturating_add (not `+`) guards a hostile `--offset` near usize::MAX from
+        // overflowing (applies PF-004, matches Page::depth()); byte-identical for
+        // realistic offsets, clamps only at the usize::MAX ceiling.
+        let pool_limit = candidate_pool(config.page().limit(), LEXICAL_CANDIDATE_POOL_K)
+            .saturating_add(config.page().offset());
         let mut sq = SearchQuery::new(config.text.clone());
         sq.limit = Some(pool_limit);
         sq.phrase = config.phrase;
         sq.near = config.near;
         sq.lang = config.lang; // D17 / AC16: --lang honored on BM25F UNION path
-        engine.search(&sq)?
+        let results = engine.search(&sq)?;
+        // AD-404-11 / D-5 pool-cap signal (cross-path consistency with AST path):
+        // if the reader returned exactly pool_limit candidates it filled the pool to
+        // the ceiling — there may be additional qualifying files beyond it that the
+        // verify gate never sees.  Set pool_was_capped conservatively so
+        // resolve_paths_and_snippets_verified can report has_more = true even when
+        // the probe-then-truncate check finds exactly `limit` verified rows.
+        // Direction is safe: a false positive (says "more" when there are none)
+        // prompts one redundant paginate; a false negative silently drops results.
+        let capped = results.len() == pool_limit;
+        (results, capped)
     };
 
     // Resolve snippets, verify with the correct predicate, then truncate to --limit LAST.
@@ -439,7 +462,7 @@ pub(super) fn execute_query_with_manifest(
     // trigram-containment false positives at the CLI gate (the reader is recall-
     // oriented, not the correctness authority — AD-393-1).
     let effective_offset = config.offset.unwrap_or(0);
-    let results = resolve_paths_and_snippets_verified(
+    let (results, has_more) = resolve_paths_and_snippets_verified(
         &raw_results,
         &sorted,
         root,
@@ -450,6 +473,7 @@ pub(super) fn execute_query_with_manifest(
             limit: config.limit,
             offset: effective_offset,
             verify_mode: verify_mode_for(config.phrase, config.near),
+            pool_was_capped,
         },
     );
 
@@ -462,6 +486,7 @@ pub(super) fn execute_query_with_manifest(
         results,
         duration_ms,
         index_stats: Some(stats),
+        has_more,
     })
 }
 
@@ -521,6 +546,7 @@ fn run_compound_query(
             results: vec![],
             duration_ms: ctx.start.elapsed().as_millis() as u64,
             index_stats: Some(ctx.stats),
+            has_more: false,
         });
     }
 
@@ -556,6 +582,7 @@ fn run_compound_query(
             results: vec![],
             duration_ms: ctx.start.elapsed().as_millis() as u64,
             index_stats: Some(ctx.stats),
+            has_more: false,
         });
     }
     // AD-356-2: size sq.limit to the candidate set.  filter_set.len() >= 1 is
@@ -639,7 +666,7 @@ fn run_compound_query(
     // AD-393-7: same VerifyMode as the pure-lexical path so that phrase/near
     // correctness carries through the compound text+--ast dispatch.
     let effective_offset = config.offset.unwrap_or(0);
-    let results = resolve_paths_and_snippets_verified(
+    let (results, has_more) = resolve_paths_and_snippets_verified(
         &recomposed,
         ctx.sorted,
         ctx.root,
@@ -650,6 +677,10 @@ fn run_compound_query(
             limit: config.limit,
             offset: effective_offset,
             verify_mode: verify_mode_for(config.phrase, config.near),
+            // Pool = exact AST∩lexical set (AD-356-1): the reader's file_filter
+            // restricts candidates to exactly the AST-matched FileId set, so the
+            // pool is tight and cannot be capped by an external K-multiplier.
+            pool_was_capped: false,
         },
     );
     let total = results.len();
@@ -660,6 +691,7 @@ fn run_compound_query(
         results,
         duration_ms,
         index_stats: Some(ctx.stats),
+        has_more,
     })
 }
 
@@ -728,7 +760,16 @@ fn run_blast_radius_composite_query(
     sq.limit = if positional {
         None // full intersection for phrase/near — verify-then-truncate-LAST (AD-393-12)
     } else {
-        Some(candidate_pool(config.limit, BLAST_CANDIDATE_POOL_K))
+        // AD-404-13 / AC-404-13: BLAST_CANDIDATE_POOL_K=10 is load-bearing (pinned by
+        // AC-404-13) — do NOT replace with bare config.page().depth() (pool-shrink
+        // regression). Additive form: candidate_pool(limit, K) + offset (D-2).
+        // saturating_add (not `+`) guards a hostile `--offset` near usize::MAX from
+        // overflowing (applies PF-004, matches Page::depth()); byte-identical for
+        // realistic offsets, clamps only at the usize::MAX ceiling.
+        Some(
+            candidate_pool(config.page().limit(), BLAST_CANDIDATE_POOL_K)
+                .saturating_add(config.page().offset()),
+        )
     };
     // AD-393-12: thread phrase/near through the blast-radius SearchQuery so the
     // reader's search_positional path is exercised (not just BM25F recall).
@@ -793,7 +834,9 @@ fn run_blast_radius_composite_query(
     // Applied post-verify (`.skip` before `.take`), consistent with the pure-lexical
     // and compound paths.
     let effective_offset = config.offset.unwrap_or(0);
-    let results: Vec<super::types::ResolvedResult> = ranked
+    // AD-404-11 / D-5: collect limit+1 results to detect has_more without a second
+    // pass; truncated to config.limit below after the has_more check.
+    let mut results: Vec<super::types::ResolvedResult> = ranked
         .iter()
         .filter_map(|&(fid, composite_score)| {
             let path = ctx.sorted.get(fid.0 as usize)?;
@@ -880,9 +923,13 @@ fn run_blast_radius_composite_query(
         })
         // AD-355-2 / AD-372-3: apply offset then truncate LAST — after verification
         // removes non-matching candidates (consistent with pure-lexical path).
+        // Probe one extra (config.limit + 1) to detect has_more without a second
+        // pass; truncated to config.limit below (AD-404-11).
         .skip(effective_offset)
-        .take(config.limit)
+        .take(config.limit.saturating_add(1))
         .collect();
+    let has_more = results.len() > config.limit;
+    results.truncate(config.limit);
 
     let total = results.len();
     let duration_ms = ctx.start.elapsed().as_millis() as u64;
@@ -892,6 +939,7 @@ fn run_blast_radius_composite_query(
         results,
         duration_ms,
         index_stats: Some(ctx.stats),
+        has_more,
     })
 }
 
@@ -938,6 +986,21 @@ struct SnippetVerifyParams<'a> {
     ///   trigram-containment false positives, e.g. `encode_length varint_writer`
     ///   must NOT match when the query is `encode varint`.
     verify_mode: VerifyMode,
+    /// Conservative pool-cap fallback for has_more (AD-404-11 / D-5).
+    ///
+    /// When `true`, has_more is set to `true` even if the probe-then-truncate
+    /// check finds exactly `limit` verified results — because the pre-verify pool
+    /// was filled to its ceiling and there may be additional qualifying candidates
+    /// beyond it that the verify gate never saw.  Mirrors the AST path's
+    /// `pool_was_capped` logic (ast.rs line `pool_was_capped = pooled.len() == window
+    /// && raw_count > window`), closing the cross-path consistency gap.
+    ///
+    /// Always `false` on the exact-symbol / positional path (sq.limit = None →
+    /// full intersection, no ceiling) and on the compound text+AST path (pool is
+    /// the exact AST-intersection set, no K-multiplier cap).  Only non-trivially
+    /// `true` on the multi-word BM25F path when the reader fills its pool to
+    /// `candidate_pool(limit, K) + offset`.
+    pool_was_capped: bool,
 }
 
 /// Map `FileId`s to paths, extract snippets, **verify substring membership**,
@@ -976,15 +1039,20 @@ fn resolve_paths_and_snippets_verified(
     root: &Path,
     manifest: &FileManifest,
     params: SnippetVerifyParams<'_>,
-) -> Vec<ResolvedResult> {
+) -> (Vec<ResolvedResult>, bool) {
     let SnippetVerifyParams {
         query,
         layers_matched,
         limit,
         offset,
         verify_mode,
+        pool_was_capped,
     } = params;
-    raw_results
+    // AD-404-11 / D-5: probe one extra result beyond the page boundary so we can
+    // report `has_more` without a full second pass over the verified set.
+    // `.take(limit + 1)` reads at most one file past the page; if the probe item
+    // exists, `has_more = true` and we truncate back to `limit`.
+    let mut probe: Vec<ResolvedResult> = raw_results
         .iter()
         .filter_map(|r| {
             let path = sorted_paths.get(r.file_id.0 as usize)?;
@@ -1026,9 +1094,21 @@ fn resolve_paths_and_snippets_verified(
         })
         // AD-355-2 / AD-372-3: apply offset then truncate LAST — after verification
         // removes non-matching candidates.
+        // Probe one extra (limit.saturating_add(1)) to detect has_more without a
+        // second pass; truncated to `limit` below (AD-404-11).
         .skip(offset)
-        .take(limit)
-        .collect()
+        .take(limit.saturating_add(1))
+        .collect();
+    // AD-404-11 / D-5: probe-then-truncate has_more check.
+    // `probe.len() > limit` fires when the probe item (rank offset+limit+1) exists
+    // in the verified set.  `pool_was_capped` is the conservative pool-cap fallback:
+    // when the pre-verify pool was filled to its ceiling there may be additional
+    // qualifying candidates beyond it that verification never read — so has_more is
+    // set true even when the probe check alone would produce false.  Mirrors the
+    // AST path (`has_more = pre_page_len > page.depth() || pool_was_capped`).
+    let has_more = probe.len() > limit || pool_was_capped;
+    probe.truncate(limit);
+    (probe, has_more)
 }
 
 // ============================================================================

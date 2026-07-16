@@ -49,7 +49,7 @@ type AnchorHit = (u32, std::ops::Range<usize>, String);
 /// position (AD-397-4).
 type VerifiedEntry = (FileId, f64, Option<AnchorHit>);
 
-use super::types::TemporalSort;
+use super::types::{Page, TemporalSort};
 
 // ============================================================================
 // Engine helpers
@@ -215,14 +215,14 @@ pub(super) fn resolve_ast_scored(
 /// Returns `Err` when the index is absent, the query is invalid, or I/O fails.
 /// Returns `Ok(ExitCode::SUCCESS)` for empty result sets (AC-F8).
 // Ten cohesive runtime inputs for the `search --ast` CLI entrypoint (pattern,
-// limit, json, cache dir, manifest, blast-radius filter, temporal sort, temporal
+// page, json, cache dir, manifest, blast-radius filter, temporal sort, temporal
 // DB, root, writer). Bundling them into a struct would be artificial — they are
 // all independent caller-supplied knobs — so the argument count is allowed here
 // intentionally.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_ast_standalone(
     raw_pattern: &str,
-    limit: usize,
+    page: Page,
     json: bool,
     cache_dir: &Path,
     manifest: &super::manifest::FileManifest,
@@ -253,22 +253,30 @@ pub(super) fn run_ast_standalone(
     //
     // Because the Part B gate (pattern_occurs_in_file) can DROP candidates,
     // taking exactly `limit` before the gate would under-fill results. We fetch
-    // `LEXICAL_CANDIDATE_POOL_K × limit` candidates (the AST candidate pool),
-    // gate them, then truncate to `limit` LAST — mirroring the lexical
-    // verify-then-truncate-LAST architecture (AD-355-2).
+    // `candidate_pool(page.limit(), K).saturating_add(page.offset())` candidates
+    // (the additive AST candidate pool — NEVER the multiplicative `K × depth`
+    // form that D-2 / AD-404-6 forbid), gate them, then truncate to `limit` LAST
+    // — mirroring the lexical verify-then-truncate-LAST architecture (AD-355-2).
     //
     // With AND-intersect upstream (AD-374-1) the pool is already small, so K=5
     // is adequate. The K value has no measured corpus basis and is tracked under
     // #361 per ADR-003.
     //
-    // Temporal path: the temporal resort also needs a wider window so hot files
-    // beyond raw rank `limit` can be promoted (AC-F4 temporal contract). We take
-    // the MAX of the temporal window and the verify pool so both constraints are met.
+    // Temporal path: the temporal resort needs a wider window so hot files
+    // beyond raw rank `limit` can be promoted (AC-F4 temporal contract).
+    //
+    // AD-404-5: pool uses page.depth() (= limit + offset) for raw-order widening
+    // so offset pages are fillable. Depth at offset 0 == limit — zero regression.
+    //
+    // AD-404-6: temporal window stays resort_window(page.limit()), offset-independent,
+    // so pages are provably disjoint (no duplicate/miss defect, D-2 / AD-404-7).
+    // Only the raw-order (verify) pool widens with offset — never the temporal window.
     let temporal_active = temporal_sort.is_some() && temporal_db.is_some();
     let temporal_window = if temporal_active {
-        super::temporal::resort_window(limit)
+        // AD-404-7: fixed at resort_window(page.limit()); never resort_window(page.depth()).
+        super::temporal::resort_window(page.limit())
     } else {
-        limit
+        page.depth()
     };
     // AD-374-3 / AC11 (#419): AST candidate pool.
     //
@@ -281,22 +289,44 @@ pub(super) fn run_ast_standalone(
     // empty-catch, excessive-params): the extraction-reuse verify gate
     // (`synthetic_key_present`) has near-zero drop rate — the AST index correctly
     // identifies which files contain the marker, so a K=5 pool and a 100-file
-    // floor are pure overhead. For these, size the pool to exactly `limit` (with
-    // a floor of 1 to avoid an empty pool when limit=0).
+    // floor are pure overhead. For these, size the pool to exactly `page.depth()`
+    // (with a floor of 1 to avoid an empty pool when limit=0). At offset 0,
+    // depth() == limit — zero regression (AD-404-2).
     //
     // This is the companion to the `synthetic_key_present` early-exit fix in
     // `compound/reparse.rs` — together they reduce measured `--ast deep-nesting`
     // latency from ~6.9s to within AC11's <500ms target.
     let ast_pool = if is_synthetic {
-        limit.max(1)
+        page.depth().max(1)
     } else {
-        super::query::candidate_pool(limit, super::query::LEXICAL_CANDIDATE_POOL_K)
+        // Additive widening: candidate_pool(page.limit(), K) + page.offset().
+        // At offset 0: pool = candidate_pool(limit, K), byte-identical to pre-change.
+        // With offset: pool grows by exactly offset, not by K*offset (D-3).
+        // saturating_add (not `+`) guards a hostile `--offset` near usize::MAX
+        // from overflowing (applies PF-004, matches Page::depth()); byte-identical
+        // for every realistic offset since it only clamps at the usize::MAX ceiling.
+        super::query::candidate_pool(page.limit(), super::query::LEXICAL_CANDIDATE_POOL_K)
+            .saturating_add(page.offset())
     };
-    let window = temporal_window.max(ast_pool);
+    // When temporal is active the verify gate outputs at most `temporal_window`
+    // rows (see the truncate below), so sizing the pool to ast_pool's wider
+    // offset-inflated value would only waste up to `offset` extra file opens.
+    // Use temporal_window directly on that path; keep ast_pool for the pure-AST
+    // path where no truncation follows.
+    let window = if temporal_active {
+        temporal_window
+    } else {
+        ast_pool
+    };
 
     // Intersect AST results with blast-radius FileIds (when set), then take the
     // working window (pool). The filter runs BEFORE truncation so the window reflects
     // the filtered set size (avoids PF-006 silent feature-drop).
+    //
+    // Track pool_was_capped: if we filled the entire window from raw_results,
+    // there may be more candidates beyond the pool ceiling — conservatively sets
+    // has_more = true (AD-404-11 / D-5 pool-cap edge case for AC-404-18).
+    let raw_count = raw_results.len();
     let pooled: Vec<_> = raw_results
         .into_iter()
         .filter(|(fid, _)| {
@@ -306,6 +336,7 @@ pub(super) fn run_ast_standalone(
         })
         .take(window)
         .collect();
+    let pool_was_capped = pooled.len() == window && raw_count > window;
 
     // AD-374-2 / AD-397-4: Structural verify gate + anchor — combined for real-node,
     // separate for synthetic.
@@ -398,30 +429,117 @@ pub(super) fn run_ast_standalone(
         }
     }
 
-    // Temporal enrichment + re-sort before the truncate-LAST step (AC-F4).
+    // AD-404-6/7: pre-truncate to resort_window(limit) BEFORE enrich_ast_results.
+    //
+    // `enrich_ast_results` caller contract: MUST receive ≤ resort_window entries
+    // so per-file DB lookups stay bounded at O(resort_window) — AC-P1.
+    //
+    // D-2 / AD-404-7: the temporal re-sort window is offset-INDEPENDENT.
+    // With temporal active, window is set to exactly temporal_window above
+    // (not ast_pool), so both the pool step and the verify gate produce at
+    // most temporal_window entries.  This truncate is therefore a no-op on
+    // the temporal path and is kept as defence-in-depth against future
+    // window-computation changes.
+    //
+    // Pages are disjoint for both pattern kinds:
+    //   - Synthetic: AND-semantics verify is exact; verified ≤ temporal_window.
+    //   - Real-node: find_first_strict_match is lossy (verified_count can be
+    //     < temporal_window) but never exceeds the pool ceiling, so no
+    //     offset-dependent set growth occurs and the disjoint bound holds.
+    if temporal_active {
+        resolved.truncate(temporal_window);
+    }
+    // Temporal enrichment + re-sort before the paginate step (AC-F4).
     // When absent, results stay in raw AST order (graceful degradation — AC-A3).
     if let (Some(sort), Some(db)) = (temporal_sort, temporal_db) {
         super::temporal::enrich_ast_results(&mut resolved, sort, db);
     }
-    // AD-374-3 / AD-355-2: truncate-LAST — after any temporal re-sort so the
-    // top-`limit` by temporal score survive; in the non-temporal path this is
-    // the only truncation (min(limit, verified_count) results).
-    resolved.truncate(limit);
 
-    // AD-397-4: Real-node patterns: line/snippet already set from the
-    // find_first_strict_match anchor (gate + anchor in one pass, cached in the
-    // pool entry through temporal sort/truncation). No post-truncation re-parse
-    // is needed.
+    write_ast_page_output(
+        &mut resolved,
+        page,
+        pool_was_capped,
+        temporal_active,
+        is_synthetic,
+        raw_pattern,
+        &query,
+        root,
+        manifest,
+        json,
+        w,
+    )
+}
+
+// ============================================================================
+// Output phase: pagination + notice + synthetic recovery + format
+// ============================================================================
+
+/// Apply pagination, emit the bounded-page notice, run synthetic line recovery,
+/// and write the final output for a standalone `--ast` query.
+///
+/// Extracted from `run_ast_standalone` to keep that function below the 200-line
+/// threshold. All pagination and output logic lives here; the caller owns the
+/// verify gate, the temporal pre-truncation, and the temporal enrichment steps.
+///
+/// `temporal_active` is consistent with the `resolved.truncate(temporal_window)`
+/// the caller already applied before `enrich_ast_results` (AD-404-6/7).
+// Arguments are all independent caller-supplied knobs (pagination cursor,
+// pool cap flag, temporal flag, synthetic-vs-real routing, pattern string,
+// query handle for recover_line, paths for file I/O, format flag, writer).
+// No natural grouping exists — mirrors run_ast_standalone's own allow.
+#[allow(clippy::too_many_arguments)]
+fn write_ast_page_output(
+    resolved: &mut Vec<AstResult>,
+    page: Page,
+    pool_was_capped: bool,
+    temporal_active: bool,
+    is_synthetic: bool,
+    raw_pattern: &str,
+    query: &AstQuery,
+    root: &Path,
+    manifest: &super::manifest::FileManifest,
+    json: bool,
+    w: &mut impl std::io::Write,
+) -> anyhow::Result<ExitCode> {
+    // AD-404-5 / AD-404-11: page.apply() — skip + take. Position is load-bearing
+    // (AD-404-3): AFTER verify gate and AFTER temporal re-sort.
+    // At offset 0: page.apply() == truncate(limit) — zero regression.
+    let pre_page_len = resolved.len();
+    page.apply(resolved);
+    // has_more (AD-404-11 / D-5): true when more verified results exist beyond the
+    // current page, or when the candidate pool was capped (conservatively true).
+    // Replaces the unsound `results.len() < limit` heuristic.
+    let has_more = pre_page_len > page.depth() || pool_was_capped;
+
+    // Bounded-page notice on the --ast+temporal path (AD-404-11 / D-5).
+    // Fires when temporal is active, the page is non-empty (no false notice on
+    // the exhausted-page path), and has_more is true — meaning there are
+    // verified results beyond the current page (or the candidate pool was
+    // capped), so the user should paginate. Goes to stderr (PF-006 / AD-404-8)
+    // so --json stdout stays byte-identical. Mirrors run_temporal_standalone
+    // (mod.rs:1151) which also gates solely on has_more.
     //
-    // Synthetic patterns (#394, AD-394-5): recover_line runs post-truncation
+    // NOTE: the old guard `pre_page_len > temporal_window` was dead code after
+    // resolved.truncate(temporal_window) (called by the caller before entry)
+    // ensured pre_page_len ≤ temporal_window when temporal_active — replaced
+    // here by has_more to restore parity with the text+temporal path.
+    if !resolved.is_empty() && temporal_active && has_more {
+        eprintln!(
+            "{}",
+            super::temporal::bounded_page_notice(resolved.len(), page.offset(), page.limit())
+        );
+    }
+
+    // AD-397-4: Real-node patterns — line/snippet cached in the verify pool entry
+    // from `find_first_strict_match`; no post-truncation re-parse needed.
+    // Synthetic patterns (#394, AD-394-5) — recover_line runs post-truncation
     // (≤ limit files, AC-API3), unchanged from #394.
     if is_synthetic {
-        for r in &mut resolved {
+        for r in resolved.iter_mut() {
             let abs_path = root.join(&r.path);
             let stored_mtime = manifest.lookup(&r.path).and_then(|e| e.mtime);
-            if let Some((ln, byte_range)) = recover_line(&abs_path, &query, stored_mtime) {
-                // Extract the single representative line as snippet text; suppress
-                // when the byte range is empty (synthetic recovery artifact).
+            if let Some((ln, byte_range)) = recover_line(&abs_path, query, stored_mtime) {
+                // Suppress snippet when byte_range is empty (synthetic recovery artifact).
                 let snip = read_line_at(&abs_path, ln, rskim_search::MAX_REPARSE_FILE_BYTES);
                 r.line = Some(ln);
                 r.snippet = if byte_range.is_empty() { None } else { snip };
@@ -434,9 +552,14 @@ pub(super) fn run_ast_standalone(
     let (display_name, description) = pattern_description(pattern_name);
 
     if json {
-        format_ast_json(&resolved, display_name, description, w)?;
+        // AD-404-11 / D-5: has_more lets agents detect the last page without
+        // relying on the unsound `len < limit` heuristic.
+        format_ast_json(resolved, display_name, description, has_more, w)?;
     } else {
-        format_ast_text(&resolved, display_name, description, w)?;
+        // AC-404-8 / AC-404-10: page-aware empty messages are now handled
+        // inside format_ast_text via the `offset` parameter, mirroring how
+        // format_temporal_text (temporal.rs) threads Page for the same split.
+        format_ast_text(resolved, display_name, description, page.offset(), w)?;
     }
 
     Ok(ExitCode::SUCCESS)

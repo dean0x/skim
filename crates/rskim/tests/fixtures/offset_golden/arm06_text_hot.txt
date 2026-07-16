@@ -1,0 +1,46 @@
+file1.ts:8  [symbol_name]  score: 9.00  hotspot: 1.000
+        5│       console.log(item);
+        6│     }
+        7│     return data.result;
+  >     8│   } catch (error) {
+        9│     console.error("Failed:", error);
+       10│     return "";
+       11│   }
+
+file2.ts:8  [symbol_name]  score: 9.00  hotspot: 0.600
+        5│       console.log(item);
+        6│     }
+        7│     return data.result;
+  >     8│   } catch (error) {
+        9│     console.error("Failed:", error);
+       10│     return "";
+       11│   }
+
+file6.ts:8  [symbol_name]  score: 9.00  hotspot: 0.400
+        5│       console.log(item);
+        6│     }
+        7│     return data.result;
+  >     8│   } catch (error) {
+        9│     console.error("Failed:", error);
+       10│     return "";
+       11│   }
+
+file5.ts:8  [symbol_name]  score: 9.00  hotspot: 0.200
+        5│       console.log(item);
+        6│     }
+        7│     return data.result;
+  >     8│   } catch (error) {
+        9│     console.error("Failed:", error);
+       10│     return "";
+       11│   }
+
+file4.ts:8  [symbol_name]  score: 9.00  hotspot: 0.200
+        5│       console.log(item);
+        6│     }
+        7│     return data.result;
+  >     8│   } catch (error) {
+        9│     console.error("Failed:", error);
+       10│     return "";
+       11│   }
+
+5 result(s) in 0ms

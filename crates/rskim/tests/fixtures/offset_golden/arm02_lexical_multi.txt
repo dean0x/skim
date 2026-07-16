@@ -1,0 +1,36 @@
+file1.ts:2  [function_body]  score: 2.52
+        1│ export function processRequest1(input: unknown): string {
+  >     2│   try {
+        3│     const data = JSON.parse(input as string);
+        4│     for (const item of data.items) {
+        5│       console.log(item);
+
+file2.ts:2  [function_body]  score: 2.52
+        1│ export function processRequest2(input: unknown): string {
+  >     2│   try {
+        3│     const data = JSON.parse(input as string);
+        4│     for (const item of data.items) {
+        5│       console.log(item);
+
+file3.ts:2  [function_body]  score: 2.52
+        1│ export function processRequest3(input: unknown): string {
+  >     2│   try {
+        3│     const data = JSON.parse(input as string);
+        4│     for (const item of data.items) {
+        5│       console.log(item);
+
+file4.ts:2  [function_body]  score: 2.52
+        1│ export function processRequest4(input: unknown): string {
+  >     2│   try {
+        3│     const data = JSON.parse(input as string);
+        4│     for (const item of data.items) {
+        5│       console.log(item);
+
+file5.ts:2  [function_body]  score: 2.52
+        1│ export function processRequest5(input: unknown): string {
+  >     2│   try {
+        3│     const data = JSON.parse(input as string);
+        4│     for (const item of data.items) {
+        5│       console.log(item);
+
+5 result(s) in 5ms

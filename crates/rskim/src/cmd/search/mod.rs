@@ -198,9 +198,12 @@ pub(crate) fn run(
                 None
             };
             let mut stdout = BufWriter::new(std::io::stdout());
+            // AD-404 (mod.rs): pass Page so run_ast_standalone honors --offset.
+            // This is the call site the whole ticket is about (the P1 defect was
+            // passing `flags.limit` here and silently losing `flags.offset`).
             let result = ast::run_ast_standalone(
                 raw,
-                flags.limit,
+                types::Page::new(flags.limit, flags.offset),
                 flags.json,
                 &cache_dir,
                 &manifest,
@@ -244,8 +247,10 @@ pub(crate) fn run(
                      `skim search TERM --hot --lang LANG`."
                 );
             }
+            // AD-404 (mod.rs): pass Page so run_temporal_standalone honors --offset
+            // on the --hot/--cold/--risky/--blast-radius-only paths.
             run_temporal_standalone(
-                flags.limit,
+                types::Page::new(flags.limit, flags.offset),
                 flags.json,
                 &flags.root_override,
                 flags.temporal_sort,
@@ -1106,23 +1111,49 @@ fn run_query(
     // preserving the invariant: exactly one auto_refresh_if_stale call per query.
     let mut output = query::execute_query_with_manifest(&config, pre_loaded_manifest, analytics)?;
 
-    // Apply temporal sort/annotation to the results, then apply offset + truncate to --limit.
-    // Applying offset+limit AFTER the re-sort (not via the engine's LIMIT) is the GAP-1
-    // invariant: the top-`limit` BY TEMPORAL SCORE survive, not the top-`limit`
-    // by lexical relevance re-ordered.
-    // AD-372-3 / PF-006: thread config.offset so `--offset` works on the temporal path too.
-    // The offset passed to QueryConfig above is None when temporal_sort is active, so
-    // execute_query_with_manifest does NOT apply offset; this drain is the SINGLE application.
-    if let (Some(sort), Some(db)) = (flags.temporal_sort, &temporal_db) {
-        temporal::apply_temporal_enrichment(&mut output.results, sort, db)?;
-        let effective_offset = flags.offset.unwrap_or(0);
-        if effective_offset > 0 {
-            output
-                .results
-                .drain(..effective_offset.min(output.results.len()));
+    // AD-404-9 / AD-404-10: apply temporal enrichment + paginate on the text+temporal arm.
+    //
+    // Double-offset guard (AD-404-9): config.offset is None when temporal_sort is active
+    // (mod.rs:1086-1090), so execute_query_with_manifest does NOT apply offset on this
+    // path; the drain below is the SINGLE application (no double-offset bug).
+    //
+    // Guard drift fix (AD-404-10): the pagination (offset drain + limit truncate) MUST
+    // run whenever temporal_sort is active, even when temporal_db is absent (degraded).
+    // The old guard `if let (Some(sort), Some(db))` silently dropped --limit and --offset
+    // on the degraded path (no temporal.db). Fix: bind the condition once and hoist
+    // pagination out of the DB-presence branch so it runs unconditionally on temporal arms.
+    let page = types::Page::new(flags.limit, flags.offset);
+    if let Some(sort) = flags.temporal_sort {
+        if let Some(ref db) = temporal_db {
+            temporal::apply_temporal_enrichment(&mut output.results, sort, db)?;
+        } else {
+            // AD-404-6 degraded path: no temporal.db present (non-git repo or
+            // heatmap not yet built).  Emit the advisory message that mirrors
+            // run_temporal_standalone (mod.rs:1198) — single source of truth via
+            // NO_TEMPORAL_DATA_MSG.  Goes to stderr so --json stdout stays
+            // byte-identical (PF-006 / AD-404-8).
+            eprintln!("skim search: {NO_TEMPORAL_DATA_MSG}");
         }
-        output.results.truncate(flags.limit);
+        // Pagination applied regardless of DB presence (AD-404-10 guard drift fix).
+        //
+        // AD-404-11 / D-5: capture pre-page count BEFORE page.apply so we can emit
+        // the sound `has_more` terminator — replaces the unsound `len < limit`
+        // heuristic on this path.  `pre_page_len > page.depth()` is true when the
+        // re-sorted resort window contains more results than the current page consumes.
+        let pre_page_len = output.results.len();
+        page.apply(&mut output.results);
         output.total = output.results.len();
+        output.has_more = pre_page_len > page.depth();
+    }
+
+    // AD-404-11 / D-5: emit bounded-page notice on all text-query paths when
+    // has_more is true (pure-text and text+temporal both reach here).
+    // Goes to stderr so --json stdout stays byte-identical (PF-006 / AD-404-8).
+    if output.has_more {
+        eprintln!(
+            "{}",
+            temporal::bounded_page_notice(output.total, page.offset(), page.limit())
+        );
     }
 
     let mut stdout = BufWriter::new(std::io::stdout());
@@ -1159,7 +1190,7 @@ struct WarningJson<'a> {
 /// never self-healed on the standalone --hot/--cold/--risky path.
 /// The call below fixes that gap (#357 BLOCKER).
 fn run_temporal_standalone(
-    limit: usize,
+    page: types::Page,
     json: bool,
     root_override: &Option<PathBuf>,
     temporal_sort: Option<types::TemporalSort>,
@@ -1193,13 +1224,27 @@ fn run_temporal_standalone(
         return Ok(ExitCode::SUCCESS);
     };
 
-    let output = temporal::query_standalone(temporal_sort, blast_radius, limit, &db, &root)?;
+    let (output, has_more) =
+        temporal::query_standalone(temporal_sort, blast_radius, page, &db, &root)?;
+
+    // AD-404-8: bounded-page-notice — emitted on stderr when has_more is true
+    // (more results exist beyond this page, or the temporal ranking window was
+    // exceeded).  Goes to stderr (#377 seam, PF-006) so --json stdout stays
+    // byte-identical.  The notice surfaces the pagination seam for agents that
+    // detect the last page via has_more rather than the unsound `len < limit`
+    // heuristic (D-5).
+    if has_more {
+        eprintln!(
+            "{}",
+            temporal::bounded_page_notice(output.result_count(), page.offset(), page.limit())
+        );
+    }
 
     let mut stdout = BufWriter::new(std::io::stdout());
     if json {
-        temporal::format_temporal_json(&output, &mut stdout)?;
+        temporal::format_temporal_json(&output, has_more, &mut stdout)?;
     } else {
-        temporal::format_temporal_text(&output, &mut stdout)?;
+        temporal::format_temporal_text(&output, page, &mut stdout)?;
     }
     stdout.flush()?;
 
@@ -1307,8 +1352,10 @@ General examples:
   skim search --stats                       Show index statistics
   skim search --install-hooks               Auto-refresh on git commit/merge
   skim search --hot                         Top hotspot files (standalone)
+  skim search --hot --limit 5 --offset 5   Hotspot page 2 (items 6-10)
   skim search --risky                       Top risky files (standalone)
   skim search --blast-radius src/auth.rs    Co-change partners of auth.rs
+  skim search --blast-radius src/auth.rs --offset 10  Co-change page 2
   skim search \"auth\" --hot                  Text results sorted by hotspot
   skim search \"auth\" --blast-radius src/auth.rs  Text within co-change partners";
 
@@ -2097,7 +2144,12 @@ mod tests {
 
         let mut buf = Vec::new();
         let mut writer = BufWriter::new(&mut buf);
-        format_temporal_text(&output, &mut writer).unwrap();
+        format_temporal_text(
+            &output,
+            crate::cmd::search::types::Page::first(10),
+            &mut writer,
+        )
+        .unwrap();
         drop(writer);
 
         let text = String::from_utf8(buf).unwrap();
@@ -2142,7 +2194,12 @@ mod tests {
 
         let mut buf = Vec::new();
         let mut writer = BufWriter::new(&mut buf);
-        format_temporal_text(&output, &mut writer).unwrap();
+        format_temporal_text(
+            &output,
+            crate::cmd::search::types::Page::first(10),
+            &mut writer,
+        )
+        .unwrap();
         drop(writer);
 
         let text = String::from_utf8(buf).unwrap();

@@ -7,9 +7,9 @@ use rskim_search::{CochangeRow, HotspotRow, RiskRow, TemporalDb};
 use tempfile::TempDir;
 
 use super::{
-    TemporalQueryOutput, apply_temporal_enrichment, check_temporal_staleness, enrich_ast_results,
-    format_temporal_json, format_temporal_text, normalize_blast_radius_path, open_temporal_db,
-    query_standalone, resort_window,
+    TemporalQueryOutput, apply_temporal_enrichment, bounded_page_notice, check_temporal_staleness,
+    enrich_ast_results, format_temporal_json, format_temporal_text, normalize_blast_radius_path,
+    open_temporal_db, query_standalone, resort_window,
 };
 use crate::cmd::search::types::{ResolvedResult, TemporalSort};
 
@@ -256,7 +256,15 @@ fn standalone_hot_returns_top_by_score() {
     ])
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Hot), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match output {
         TemporalQueryOutput::Hotspots(rows) => {
             assert_eq!(rows.len(), 2);
@@ -288,7 +296,15 @@ fn standalone_cold_returns_bottom_by_score() {
     ])
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Cold), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Cold),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match output {
         TemporalQueryOutput::Coldspots(rows) => {
             assert_eq!(rows.len(), 2);
@@ -322,7 +338,15 @@ fn standalone_risky_returns_top_by_density() {
     ])
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Risky), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Risky),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match output {
         TemporalQueryOutput::Risks(rows) => {
             assert_eq!(rows.len(), 2);
@@ -330,6 +354,136 @@ fn standalone_risky_returns_top_by_density() {
         }
         other => panic!("expected Risks, got {other:?}"),
     }
+}
+
+/// AC-404-2 (hermetic deep pagination): `query_standalone` on the standalone
+/// `--hot` arm must honor a non-zero `offset`, returning disjoint pages and a
+/// sound `has_more` terminator.
+///
+/// This is the hermetic sibling of `cli_search_offset.rs::offset_accepted_on_hot_standalone`
+/// — that CLI test only proves the flag is WIRED (degraded exit 0 with no
+/// temporal.db); the deep disjointness+has_more contract that seeded data
+/// requires is asserted here. Exercises the `paginate_sentinel` over-fetch +
+/// skip/take path with `offset > 0` (AD-404-11 / D-5).
+#[test]
+fn standalone_hot_offset_paginates_disjoint_with_has_more() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let (_db_dir, db) = temp_db();
+
+    // Five distinct scores → deterministic Hot order (score DESC, file_path ASC):
+    // e(0.9) d(0.7) c(0.5) b(0.3) a(0.1).
+    db.store_hotspots(&[
+        HotspotRow {
+            file_path: "a.rs".to_string(),
+            score: 0.1,
+            changes_30d: 1,
+            changes_90d: 2,
+        },
+        HotspotRow {
+            file_path: "b.rs".to_string(),
+            score: 0.3,
+            changes_30d: 2,
+            changes_90d: 4,
+        },
+        HotspotRow {
+            file_path: "c.rs".to_string(),
+            score: 0.5,
+            changes_30d: 3,
+            changes_90d: 6,
+        },
+        HotspotRow {
+            file_path: "d.rs".to_string(),
+            score: 0.7,
+            changes_30d: 4,
+            changes_90d: 8,
+        },
+        HotspotRow {
+            file_path: "e.rs".to_string(),
+            score: 0.9,
+            changes_30d: 5,
+            changes_90d: 10,
+        },
+    ])
+    .unwrap();
+
+    let paths = |out: TemporalQueryOutput| -> Vec<String> {
+        match out {
+            TemporalQueryOutput::Hotspots(rows) => rows.into_iter().map(|r| r.file_path).collect(),
+            other => panic!("expected Hotspots, got {other:?}"),
+        }
+    };
+
+    // Page 0: limit 2, offset 0 → top two hottest, more remain.
+    let (out0, more0) = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::new(2, Some(0)),
+        &db,
+        &root,
+    )
+    .unwrap();
+    let page0 = paths(out0);
+    assert_eq!(
+        page0,
+        vec!["e.rs", "d.rs"],
+        "page 0 = top two by score DESC"
+    );
+    assert!(more0, "5 rows, page of 2 at offset 0 → has_more");
+
+    // Page 1: limit 2, offset 2 → next two, disjoint from page 0, more remain.
+    let (out1, more1) = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::new(2, Some(2)),
+        &db,
+        &root,
+    )
+    .unwrap();
+    let page1 = paths(out1);
+    assert_eq!(
+        page1,
+        vec!["c.rs", "b.rs"],
+        "page 1 = rows 3-4 by score DESC"
+    );
+    assert!(more1, "5 rows, page of 2 at offset 2 → has_more");
+    let overlap: Vec<_> = page0.iter().filter(|p| page1.contains(p)).collect();
+    assert!(
+        overlap.is_empty(),
+        "pages must be disjoint, overlap={overlap:?}"
+    );
+
+    // Page 2: limit 2, offset 4 → the single remaining row, no more pages.
+    let (out2, more2) = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::new(2, Some(4)),
+        &db,
+        &root,
+    )
+    .unwrap();
+    let page2 = paths(out2);
+    assert_eq!(
+        page2,
+        vec!["a.rs"],
+        "page 2 = last (coldest of the hot list)"
+    );
+    assert!(
+        !more2,
+        "offset 4 of 5 rows exhausts the set → has_more=false"
+    );
+
+    // Page past end: empty, no more.
+    let (out3, more3) = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::new(2, Some(99)),
+        &db,
+        &root,
+    )
+    .unwrap();
+    assert!(paths(out3).is_empty(), "offset past end → empty page");
+    assert!(!more3, "offset past end → has_more=false");
 }
 
 #[test]
@@ -349,7 +503,15 @@ fn standalone_blast_radius_returns_partners() {
     }])
     .unwrap();
 
-    let output = query_standalone(None, Some("src/auth.rs"), 10, &db, &root).unwrap();
+    let output = query_standalone(
+        None,
+        Some("src/auth.rs"),
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match output {
         TemporalQueryOutput::Cochanges { target, partners } => {
             assert_eq!(target, "src/auth.rs");
@@ -403,11 +565,12 @@ fn standalone_blast_radius_with_risky_sorts_by_risk() {
     let output = query_standalone(
         Some(TemporalSort::Risky),
         Some("src/auth.rs"),
-        10,
+        super::super::types::Page::first(10),
         &db,
         &root,
     )
-    .unwrap();
+    .unwrap()
+    .0;
     match output {
         TemporalQueryOutput::Cochanges { partners, .. } => {
             assert_eq!(partners.len(), 2);
@@ -504,11 +667,12 @@ fn standalone_blast_radius_risky_real_wilson_small_sample_below_large() {
     let output = query_standalone(
         Some(TemporalSort::Risky),
         Some("src/auth.rs"),
-        10,
+        super::super::types::Page::first(10),
         &db,
         &root,
     )
-    .unwrap();
+    .unwrap()
+    .0;
     match output {
         TemporalQueryOutput::Cochanges { partners, .. } => {
             assert_eq!(partners.len(), 2);
@@ -550,7 +714,15 @@ fn standalone_limit_caps_results() {
     )
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Hot), None, 3, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::first(3),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match output {
         TemporalQueryOutput::Hotspots(rows) => {
             assert_eq!(rows.len(), 3, "limit should cap at 3");
@@ -573,9 +745,17 @@ fn standalone_hot_json_valid() {
     }])
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Hot), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_json(&output, &mut buf).unwrap();
+    format_temporal_json(&output, false, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     let v: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
     assert_eq!(v["mode"], "hot");
@@ -601,9 +781,17 @@ fn standalone_hot_text_has_table_columns() {
     }])
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Hot), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_text(&output, &mut buf).unwrap();
+    format_temporal_text(&output, super::super::types::Page::first(10), &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         s.contains("Score"),
@@ -612,6 +800,394 @@ fn standalone_hot_text_has_table_columns() {
     assert!(
         s.contains("Path"),
         "text output should have Path column header"
+    );
+}
+
+// ============================================================================
+// AC-404-12: golden fixture comparison tests
+// ============================================================================
+//
+// These tests verify that `format_temporal_text` and `format_temporal_json`
+// at offset 0 produce output byte-identical to the golden fixtures committed
+// in tests/fixtures/offset_golden/ (captured from the pre-change binary in
+// Step 0 of #404). They confirm that the page-aware changes in format_temporal_text
+// are a zero-regression at offset=0 (PF-007 / AC-404-12).
+//
+// Coverage: arm10 (hot standalone) and arm11 (blast-radius standalone) — both
+// text and JSON output formats (4 fixtures total).  Arms 01–09 cover lexical
+// and AST query output produced by `format_text_output` / `format_json_output`
+// / `format_ast_text`; those formatters are exercised in query_tests.rs and
+// ast_tests.rs, not here.
+
+/// AC-404-12 / PF-007: `format_temporal_text` at offset 0 must produce output
+/// matching the arm10 golden fixture (standalone --hot, 5 files).
+///
+/// This pins the exact tiebreak ordering (file3.ts before file5.ts at score 0.2)
+/// that Decision 8 documents; a permutation would fail here.
+#[test]
+fn golden_arm10_hot_standalone_text_matches_fixture() {
+    // Data extracted directly from arm10_hot_standalone.json golden fixture.
+    let output = TemporalQueryOutput::Hotspots(vec![
+        HotspotRow {
+            file_path: "file1.ts".to_string(),
+            score: 1.0,
+            changes_30d: 5,
+            changes_90d: 5,
+        },
+        HotspotRow {
+            file_path: "file2.ts".to_string(),
+            score: 0.6,
+            changes_30d: 3,
+            changes_90d: 3,
+        },
+        HotspotRow {
+            file_path: "file6.ts".to_string(),
+            // Use the exact float from the JSON fixture to match {:.3} rounding.
+            score: 0.39999999999999997,
+            changes_30d: 2,
+            changes_90d: 2,
+        },
+        HotspotRow {
+            file_path: "file3.ts".to_string(),
+            score: 0.19999999999999998,
+            changes_30d: 1,
+            changes_90d: 1,
+        },
+        HotspotRow {
+            file_path: "file5.ts".to_string(),
+            score: 0.19999999999999998,
+            changes_30d: 1,
+            changes_90d: 1,
+        },
+    ]);
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_text(&output, super::super::types::Page::first(5), &mut buf).unwrap();
+    let actual = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    let expected = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/offset_golden/arm10_hot_standalone.txt"),
+    )
+    .expect("arm10 golden fixture must be readable");
+
+    assert_eq!(
+        actual, expected,
+        "AC-404-12 / PF-007: format_temporal_text at offset 0 must match golden fixture.\n\
+         If this fails due to a deliberate behavioral change (e.g. tiebreak Decision 8),\n\
+         update arm10_hot_standalone.txt to reflect the new correct output."
+    );
+}
+
+/// AC-404-12: `format_temporal_json` for arm10 (--hot standalone, 5 files) must
+/// produce output byte-identical to the committed arm10_hot_standalone.json fixture.
+///
+/// Same data as `golden_arm10_hot_standalone_text_matches_fixture`; exercises
+/// the JSON path that was previously uncovered by golden tests.
+#[test]
+fn golden_arm10_hot_standalone_json_matches_fixture() {
+    // Data extracted directly from arm10_hot_standalone.json golden fixture.
+    let output = TemporalQueryOutput::Hotspots(vec![
+        HotspotRow {
+            file_path: "file1.ts".to_string(),
+            score: 1.0,
+            changes_30d: 5,
+            changes_90d: 5,
+        },
+        HotspotRow {
+            file_path: "file2.ts".to_string(),
+            score: 0.6,
+            changes_30d: 3,
+            changes_90d: 3,
+        },
+        HotspotRow {
+            file_path: "file6.ts".to_string(),
+            score: 0.39999999999999997,
+            changes_30d: 2,
+            changes_90d: 2,
+        },
+        HotspotRow {
+            file_path: "file3.ts".to_string(),
+            score: 0.19999999999999998,
+            changes_30d: 1,
+            changes_90d: 1,
+        },
+        HotspotRow {
+            file_path: "file5.ts".to_string(),
+            score: 0.19999999999999998,
+            changes_30d: 1,
+            changes_90d: 1,
+        },
+    ]);
+
+    let mut buf = BufWriter::new(Vec::new());
+    // has_more=false: first page contains all results, so `has_more` is absent
+    // from JSON output (skip_serializing_if).
+    format_temporal_json(&output, false, &mut buf).unwrap();
+    let actual = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    let expected = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/offset_golden/arm10_hot_standalone.json"),
+    )
+    .expect("arm10 JSON golden fixture must be readable");
+
+    assert_eq!(
+        actual, expected,
+        "AC-404-12: format_temporal_json at offset 0 must match arm10 golden fixture.\n\
+         Update arm10_hot_standalone.json if the JSON schema changes deliberately."
+    );
+}
+
+/// AC-404-12: `format_temporal_text` for arm11 (--blast-radius standalone, 5 partners)
+/// must produce output byte-identical to arm11_blast_standalone.txt.
+///
+/// The input `partners` vec is pre-ordered in the tiebreak sequence the DB query
+/// produces (file3 < file4 < file5 by `file_b ASC` within the jaccard=0.2 tie
+/// group); `format_temporal_text` renders in input order without re-sorting.
+/// The DB-level tiebreak itself is covered by
+/// `rskim_search::temporal::tests::cochanges_for_file_tiebreak_crosses_union_arms`.
+#[test]
+fn golden_arm11_blast_standalone_text_matches_fixture() {
+    // Data extracted from arm11_blast_standalone.json golden fixture.
+    // file_a="file1.ts" for all rows so cochange_partner() returns file_b.
+    let output = TemporalQueryOutput::Cochanges {
+        target: "file1.ts".to_string(),
+        partners: vec![
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file3.ts".to_string(),
+                count: 1,
+                jaccard: 0.2,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file4.ts".to_string(),
+                count: 1,
+                jaccard: 0.2,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file5.ts".to_string(),
+                count: 1,
+                jaccard: 0.2,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file6.ts".to_string(),
+                count: 1,
+                // Exact f64 for 1/6 as stored in the golden fixture.
+                jaccard: 0.16666666666666666,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file2.ts".to_string(),
+                count: 1,
+                // Exact f64 for 1/7 as stored in the golden fixture.
+                jaccard: 0.14285714285714285,
+            },
+        ],
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_text(&output, super::super::types::Page::first(5), &mut buf).unwrap();
+    let actual = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    let expected = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/offset_golden/arm11_blast_standalone.txt"),
+    )
+    .expect("arm11 text golden fixture must be readable");
+
+    assert_eq!(
+        actual, expected,
+        "AC-404-12: format_temporal_text at offset 0 must match arm11 golden fixture.\n\
+         Update arm11_blast_standalone.txt if blast-radius text output format changes."
+    );
+}
+
+/// AC-404-12: `format_temporal_json` for arm11 (--blast-radius standalone, 5 partners)
+/// must produce output byte-identical to arm11_blast_standalone.json.
+#[test]
+fn golden_arm11_blast_standalone_json_matches_fixture() {
+    // Same data as the arm11 text golden test above.
+    let output = TemporalQueryOutput::Cochanges {
+        target: "file1.ts".to_string(),
+        partners: vec![
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file3.ts".to_string(),
+                count: 1,
+                jaccard: 0.2,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file4.ts".to_string(),
+                count: 1,
+                jaccard: 0.2,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file5.ts".to_string(),
+                count: 1,
+                jaccard: 0.2,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file6.ts".to_string(),
+                count: 1,
+                jaccard: 0.16666666666666666,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file2.ts".to_string(),
+                count: 1,
+                jaccard: 0.14285714285714285,
+            },
+        ],
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_json(&output, false, &mut buf).unwrap();
+    let actual = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    let expected = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/offset_golden/arm11_blast_standalone.json"),
+    )
+    .expect("arm11 JSON golden fixture must be readable");
+
+    assert_eq!(
+        actual, expected,
+        "AC-404-12: format_temporal_json at offset 0 must match arm11 golden fixture.\n\
+         Update arm11_blast_standalone.json if blast-radius JSON output format changes."
+    );
+}
+
+/// AC-404-12: offset > 0 header is page-range aware, NOT "top N".
+///
+/// At offset 2 the header should say "Hotspots (items 3–N, 90-day decay):"
+/// not "Hotspots (top N, 90-day decay):" — the "top" claim is false when
+/// the first N items have been skipped.
+#[test]
+fn format_temporal_text_offset_nonzero_header_not_top() {
+    let (_db_dir, db) = temp_db();
+    db.store_hotspots(
+        &(0..5u32)
+            .map(|i| HotspotRow {
+                file_path: format!("f{i}.rs"),
+                score: 1.0 - i as f64 * 0.1,
+                changes_30d: i,
+                changes_90d: i * 2,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let (output, _) = super::query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::new(2, Some(2)),
+        &db,
+        &root,
+    )
+    .unwrap();
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_text(
+        &output,
+        super::super::types::Page::new(2, Some(2)),
+        &mut buf,
+    )
+    .unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    assert!(
+        !s.contains("top"),
+        "AC-404-10: offset>0 header must NOT say 'top', got: {s:?}"
+    );
+    assert!(
+        s.contains("items 3"),
+        "AC-404-10: offset>0 header must show 1-indexed start position, got: {s:?}"
+    );
+}
+
+/// AC-404-10: empty page at offset > 0 emits "no results at offset N" message,
+/// NOT the misleading "No hotspot data available." message.
+#[test]
+fn format_temporal_text_empty_offset_page_message() {
+    let output = TemporalQueryOutput::Hotspots(vec![]);
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_text(
+        &output,
+        super::super::types::Page::new(5, Some(100)),
+        &mut buf,
+    )
+    .unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    assert!(
+        !s.contains("No hotspot data available."),
+        "AC-404-10: empty-offset-page must NOT say 'No hotspot data available.', got: {s:?}"
+    );
+    assert!(
+        s.contains("offset 100"),
+        "AC-404-10: empty-offset-page message must mention the offset, got: {s:?}"
+    );
+}
+
+/// AC-404-10: empty co-change page at offset > 0 says "no results at offset N",
+/// NOT "No co-change data for {target}.".
+#[test]
+fn format_temporal_text_empty_cochange_offset_page_message() {
+    let output = TemporalQueryOutput::Cochanges {
+        target: "src/auth.rs".to_string(),
+        partners: vec![],
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_text(
+        &output,
+        super::super::types::Page::new(5, Some(50)),
+        &mut buf,
+    )
+    .unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    assert!(
+        !s.contains("No co-change data for"),
+        "AC-404-10: empty-offset-page must NOT say 'No co-change data for …', got: {s:?}"
+    );
+    assert!(
+        s.contains("offset 50"),
+        "AC-404-10: empty-offset-page co-change message must mention the offset, got: {s:?}"
+    );
+}
+
+/// AC-404-11: `bounded_page_notice` includes count, a "more results exist" hint,
+/// and the next --offset remedy.
+///
+/// The notice is emitted on ALL has_more paths — both the blast-radius ranking
+/// window cap and the pure `--hot`/`--cold`/`--risky` sentinel case (no ranking
+/// window involved), so it uses generic "more results exist" language rather than
+/// the earlier "results exceed the temporal ranking window" phrasing.
+#[test]
+fn bounded_page_notice_contains_required_phrasing() {
+    let notice = bounded_page_notice(5, 0, 5);
+    assert!(
+        notice.contains("more results exist"),
+        "AC-404-11: notice must say 'more results exist', got: {notice:?}"
+    );
+    assert!(
+        notice.contains("showing 5"),
+        "AC-404-11: notice must include count, got: {notice:?}"
+    );
+    assert!(
+        notice.contains("--offset 5"),
+        "AC-404-11: notice must include next-offset remedy, got: {notice:?}"
     );
 }
 
@@ -1155,14 +1731,22 @@ fn standalone_cold_empty_db_text_format() {
     let (_db_dir, db) = temp_db();
 
     // Empty hotspots table — no store_hotspots call.
-    let output = query_standalone(Some(TemporalSort::Cold), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Cold),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match &output {
         TemporalQueryOutput::Coldspots(rows) => assert!(rows.is_empty()),
         other => panic!("expected Coldspots, got {other:?}"),
     }
 
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_text(&output, &mut buf).unwrap();
+    format_temporal_text(&output, super::super::types::Page::first(10), &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         s.contains("No coldspot data available"),
@@ -1182,14 +1766,22 @@ fn standalone_risky_empty_db_text_format() {
     let (_db_dir, db) = temp_db();
 
     // Empty risks table — no store_risks call.
-    let output = query_standalone(Some(TemporalSort::Risky), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Risky),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match &output {
         TemporalQueryOutput::Risks(rows) => assert!(rows.is_empty()),
         other => panic!("expected Risks, got {other:?}"),
     }
 
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_text(&output, &mut buf).unwrap();
+    format_temporal_text(&output, super::super::types::Page::first(10), &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         s.contains("No risk data available"),
@@ -1322,6 +1914,7 @@ fn format_text_output_includes_both_hotspot_and_risk_tags() {
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
+        has_more: false,
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -1366,9 +1959,17 @@ fn standalone_risky_json_valid() {
     }])
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Risky), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Risky),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_json(&output, &mut buf).unwrap();
+    format_temporal_json(&output, false, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     let v: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
 
@@ -1414,9 +2015,17 @@ fn standalone_blast_radius_json_valid() {
     }])
     .unwrap();
 
-    let output = query_standalone(None, Some("src/auth.rs"), 10, &db, &root).unwrap();
+    let output = query_standalone(
+        None,
+        Some("src/auth.rs"),
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_json(&output, &mut buf).unwrap();
+    format_temporal_json(&output, false, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     let v: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
 
@@ -1455,9 +2064,17 @@ fn standalone_cold_json_valid() {
     }])
     .unwrap();
 
-    let output = query_standalone(Some(TemporalSort::Cold), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Cold),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_json(&output, &mut buf).unwrap();
+    format_temporal_json(&output, false, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     let v: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
 
@@ -1481,14 +2098,22 @@ fn standalone_hot_empty_db_text_format() {
     let (_db_dir, db) = temp_db();
 
     // Empty hotspots table — no store_hotspots call.
-    let output = query_standalone(Some(TemporalSort::Hot), None, 10, &db, &root).unwrap();
+    let output = query_standalone(
+        Some(TemporalSort::Hot),
+        None,
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match &output {
         TemporalQueryOutput::Hotspots(rows) => assert!(rows.is_empty()),
         other => panic!("expected Hotspots, got {other:?}"),
     }
 
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_text(&output, &mut buf).unwrap();
+    format_temporal_text(&output, super::super::types::Page::first(10), &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         s.contains("No hotspot data available"),
@@ -1517,14 +2142,22 @@ fn standalone_blast_radius_empty_db_text_format() {
     let (_db_dir, db) = temp_db();
     // No store_cochanges call — empty co-change table.
 
-    let output = query_standalone(None, Some("src/auth.rs"), 10, &db, &root).unwrap();
+    let output = query_standalone(
+        None,
+        Some("src/auth.rs"),
+        super::super::types::Page::first(10),
+        &db,
+        &root,
+    )
+    .unwrap()
+    .0;
     match &output {
         TemporalQueryOutput::Cochanges { partners, .. } => assert!(partners.is_empty()),
         other => panic!("expected Cochanges, got {other:?}"),
     }
 
     let mut buf = BufWriter::new(Vec::new());
-    format_temporal_text(&output, &mut buf).unwrap();
+    format_temporal_text(&output, super::super::types::Page::first(10), &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         s.contains("No co-change data"),
@@ -1534,5 +2167,376 @@ fn standalone_blast_radius_empty_db_text_format() {
     assert!(
         !s.contains("Jaccard"),
         "column headers must not appear for empty co-change output, got: {s:?}"
+    );
+}
+
+// ============================================================================
+// D-2 / AC-404-12: blast-radius offset > 0 pagination coverage
+//
+// Finding: every query_standalone blast-radius test previously used
+// Page::first(10) (offset 0), leaving both branches of the blast-radius arm
+// in query_standalone — the no-sort path and the temporal re-sort path — with
+// zero offset coverage.  These tests exercise the disjointness-critical
+// `has_more` computation on both paths with offset > 0 so that the D-2 proof
+// is backed by a failing-then-passing regression test.
+// ============================================================================
+
+/// D-2 / AC-404-12 (no-sort branch): blast-radius without a temporal sort flag
+/// with offset > 0 must skip the first `offset` partners and set has_more=true
+/// when more partners exist beyond the current page.
+///
+/// Setup: 5 partners (jaccard 0.9 → 0.5), Page(limit=2, offset=2).
+/// depth = limit + offset = 4.  total_before = 5 > 4 → has_more = true.
+/// Returned partners are positions [2..4] in Jaccard-DESC order: jaccard 0.7
+/// and 0.6.
+#[test]
+fn blast_radius_no_sort_offset_nonzero_has_more() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/hub.rs"), "").unwrap();
+
+    let (_db_dir, db) = temp_db();
+    db.store_cochanges(&[
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/p1.rs".to_string(),
+            count: 5,
+            jaccard: 0.9,
+        },
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/p2.rs".to_string(),
+            count: 4,
+            jaccard: 0.8,
+        },
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/p3.rs".to_string(),
+            count: 3,
+            jaccard: 0.7,
+        },
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/p4.rs".to_string(),
+            count: 2,
+            jaccard: 0.6,
+        },
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/p5.rs".to_string(),
+            count: 1,
+            jaccard: 0.5,
+        },
+    ])
+    .unwrap();
+
+    let page = super::super::types::Page::new(2, Some(2));
+    let (output, has_more) = query_standalone(None, Some("src/hub.rs"), page, &db, &root).unwrap();
+
+    // has_more: total_before(5) > depth(4) → true (D-2 no-sort branch).
+    assert!(
+        has_more,
+        "D-2 no-sort: has_more must be true when total partners(5) > depth(4)"
+    );
+
+    match output {
+        TemporalQueryOutput::Cochanges { partners, .. } => {
+            assert_eq!(
+                partners.len(),
+                2,
+                "D-2 no-sort: page must contain exactly limit(2) partners, got {}",
+                partners.len()
+            );
+            // Jaccard DESC ordering: skip p1(0.9), p2(0.8); take p3(0.7), p4(0.6).
+            let jaccards: Vec<f64> = partners.iter().map(|p| p.jaccard).collect();
+            assert!(
+                (jaccards[0] - 0.7).abs() < 1e-9,
+                "D-2 no-sort: first partner after offset=2 must have jaccard≈0.7, got {}",
+                jaccards[0]
+            );
+            assert!(
+                (jaccards[1] - 0.6).abs() < 1e-9,
+                "D-2 no-sort: second partner after offset=2 must have jaccard≈0.6, got {}",
+                jaccards[1]
+            );
+        }
+        other => panic!("expected Cochanges, got {other:?}"),
+    }
+}
+
+/// D-2 / AC-404-12 (sort branch): blast-radius with a temporal sort flag and
+/// offset > 0 must apply the page AFTER re-sorting and set has_more=true via
+/// `pre_page_len > page.depth()` when the window was not capped.
+///
+/// Setup: 5 partners, each with a distinct risk score.  Sort: --risky (DESC).
+/// Page(limit=2, offset=2): depth = 4.  After resort the full 5 are within
+/// the resort_window floor (100), so window_capped=false.  pre_page_len=5 > 4
+/// → has_more=true via the second disjunct.  Partners returned are the 3rd and
+/// 4th by risk score (risk 0.5 and 0.3).
+#[test]
+fn blast_radius_sort_offset_nonzero_has_more_via_depth() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/hub.rs"), "").unwrap();
+
+    let (_db_dir, db) = temp_db();
+
+    // All Jaccard values above MIN_JACCARD_THRESHOLD (0.10).
+    // Deliberately invert Jaccard order vs risk order so re-sort is observable.
+    db.store_cochanges(&[
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/low_jac.rs".to_string(),
+            count: 1,
+            jaccard: 0.15,
+        }, // Jaccard rank 5 — risk rank 1
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/mid_low.rs".to_string(),
+            count: 1,
+            jaccard: 0.20,
+        }, // Jaccard rank 4 — risk rank 2
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/mid.rs".to_string(),
+            count: 1,
+            jaccard: 0.30,
+        }, // Jaccard rank 3 — risk rank 3
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/mid_high.rs".to_string(),
+            count: 1,
+            jaccard: 0.40,
+        }, // Jaccard rank 2 — risk rank 4
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/high_jac.rs".to_string(),
+            count: 1,
+            jaccard: 0.50,
+        }, // Jaccard rank 1 — risk rank 5
+    ])
+    .unwrap();
+
+    // Risk scores: deliberately inverted from Jaccard order (low_jac is most risky).
+    db.store_risks(&[
+        RiskRow {
+            file_path: "src/low_jac.rs".to_string(),
+            risk_score: 0.9,
+            total_commits: 10,
+            fix_commits: 9,
+            fix_density: 0.9,
+        },
+        RiskRow {
+            file_path: "src/mid_low.rs".to_string(),
+            risk_score: 0.7,
+            total_commits: 10,
+            fix_commits: 7,
+            fix_density: 0.7,
+        },
+        RiskRow {
+            file_path: "src/mid.rs".to_string(),
+            risk_score: 0.5,
+            total_commits: 10,
+            fix_commits: 5,
+            fix_density: 0.5,
+        },
+        RiskRow {
+            file_path: "src/mid_high.rs".to_string(),
+            risk_score: 0.3,
+            total_commits: 10,
+            fix_commits: 3,
+            fix_density: 0.3,
+        },
+        RiskRow {
+            file_path: "src/high_jac.rs".to_string(),
+            risk_score: 0.1,
+            total_commits: 10,
+            fix_commits: 1,
+            fix_density: 0.1,
+        },
+    ])
+    .unwrap();
+
+    let page = super::super::types::Page::new(2, Some(2));
+    let (output, has_more) = query_standalone(
+        Some(TemporalSort::Risky),
+        Some("src/hub.rs"),
+        page,
+        &db,
+        &root,
+    )
+    .unwrap();
+
+    // has_more: window_capped(5<=100→false) || pre_page_len(5) > depth(4) → true.
+    assert!(
+        has_more,
+        "D-2 sort: has_more must be true when pre_page_len(5) > depth(4)"
+    );
+
+    match output {
+        TemporalQueryOutput::Cochanges { partners, .. } => {
+            assert_eq!(
+                partners.len(),
+                2,
+                "D-2 sort: page must contain exactly limit(2) partners after re-sort+skip"
+            );
+            // After --risky re-sort: [low_jac(0.9), mid_low(0.7), mid(0.5), mid_high(0.3), high_jac(0.1)]
+            // Skip offset=2 → take [mid(0.5), mid_high(0.3)]
+            let names: Vec<&str> = partners
+                .iter()
+                .map(|p| {
+                    if p.file_a == "src/hub.rs" {
+                        p.file_b.as_str()
+                    } else {
+                        p.file_a.as_str()
+                    }
+                })
+                .collect();
+            assert_eq!(
+                names[0], "src/mid.rs",
+                "D-2 sort: first partner at offset=2 after --risky re-sort must be src/mid.rs \
+                 (risk=0.5), got {:?}",
+                names[0]
+            );
+            assert_eq!(
+                names[1], "src/mid_high.rs",
+                "D-2 sort: second partner at offset=2 after --risky re-sort must be \
+                 src/mid_high.rs (risk=0.3), got {:?}",
+                names[1]
+            );
+        }
+        other => panic!("expected Cochanges, got {other:?}"),
+    }
+}
+
+// ============================================================================
+// D-5 / AD-404-11: has_more terminator — text+temporal path (mod.rs run_query)
+//
+// run_query overwrites output.has_more after apply_temporal_enrichment:
+//
+//   let page = types::Page::new(flags.limit, flags.offset);
+//   let pre_page_len = output.results.len();
+//   page.apply(&mut output.results);
+//   output.total = output.results.len();
+//   output.has_more = pre_page_len > page.depth();
+//
+// These tests exercise that formula in isolation to guard the D-5 terminator
+// on this path (the blast-radius composite path is guarded by
+// test_ac13_limit_applied_after_fusion_rank_then_limit; this set covers the
+// text+temporal overwrite arm which has no equivalent integration test).
+// ============================================================================
+
+/// D-5: has_more is true when the resort window produces more results than the
+/// page depth (limit+offset).  Simulates resort_window(1)=5 results fetched
+/// for limit=1 — any of the 5 enriched results beyond the page triggers has_more.
+#[test]
+fn test_text_temporal_has_more_true_when_resort_window_overflows_page() {
+    use crate::cmd::search::types::Page;
+
+    // resort_window(limit=1) fetches 5 results (the candidate window).
+    // After enrichment all 5 survive; page = limit:1, offset:0 → depth=1.
+    let mut results = vec![
+        make_result("a.rs", 5.0),
+        make_result("b.rs", 4.0),
+        make_result("c.rs", 3.0),
+        make_result("d.rs", 2.0),
+        make_result("e.rs", 1.0),
+    ];
+    let page = Page::new(1, None); // limit=1, offset=0 → depth=1
+    let pre_page_len = results.len();
+    page.apply(&mut results);
+    let has_more = pre_page_len > page.depth();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "page.apply truncates resort window to limit=1"
+    );
+    assert!(
+        has_more,
+        "D-5 text+temporal: has_more must be true when 5 resort candidates > depth(1)"
+    );
+}
+
+/// D-5: has_more is false when the result count exactly equals the page limit
+/// with no offset (resort window exhausted without overflow).
+#[test]
+fn test_text_temporal_has_more_false_when_results_equal_limit() {
+    use crate::cmd::search::types::Page;
+
+    // Exactly 2 results, page = limit:2, offset:0 → depth=2.
+    // pre_page_len(2) > depth(2) is false → has_more = false.
+    let mut results = vec![make_result("a.rs", 2.0), make_result("b.rs", 1.0)];
+    let page = Page::new(2, None); // limit=2, offset=0
+    let pre_page_len = results.len();
+    page.apply(&mut results);
+    let has_more = pre_page_len > page.depth();
+
+    assert_eq!(
+        results.len(),
+        2,
+        "page.apply preserves all results when count == limit"
+    );
+    assert!(
+        !has_more,
+        "D-5 text+temporal: has_more must be false when result count ({}) == depth({})",
+        pre_page_len,
+        page.depth()
+    );
+}
+
+/// D-5: has_more with a non-zero offset.  depth = limit + offset; has_more is
+/// true iff pre_page_len > depth.  Exercises both sides of the boundary.
+#[test]
+fn test_text_temporal_has_more_with_nonzero_offset() {
+    use crate::cmd::search::types::Page;
+
+    // Exactly 3 results, page = limit:2, offset:1 → depth=3.
+    // pre_page_len(3) > depth(3) is false → has_more = false.
+    let mut results_exact = vec![
+        make_result("a.rs", 3.0),
+        make_result("b.rs", 2.0),
+        make_result("c.rs", 1.0),
+    ];
+    let page = Page::new(2, Some(1)); // limit=2, offset=1 → depth=3
+    let pre_exact = results_exact.len();
+    page.apply(&mut results_exact);
+    let has_more_exact = pre_exact > page.depth();
+
+    assert_eq!(
+        results_exact.len(),
+        2,
+        "page.apply skips 1 then truncates to limit=2"
+    );
+    assert!(
+        !has_more_exact,
+        "D-5 text+temporal offset: has_more must be false when count ({}) == depth({})",
+        pre_exact,
+        page.depth()
+    );
+
+    // 4 results, same page → pre_page_len(4) > depth(3) → has_more = true.
+    let mut results_overflow = vec![
+        make_result("a.rs", 4.0),
+        make_result("b.rs", 3.0),
+        make_result("c.rs", 2.0),
+        make_result("d.rs", 1.0),
+    ];
+    let pre_overflow = results_overflow.len();
+    page.apply(&mut results_overflow);
+    let has_more_overflow = pre_overflow > page.depth();
+
+    assert_eq!(
+        results_overflow.len(),
+        2,
+        "page.apply skips 1 then truncates to 2"
+    );
+    assert!(
+        has_more_overflow,
+        "D-5 text+temporal offset: has_more must be true when count ({}) > depth({})",
+        pre_overflow,
+        page.depth()
     );
 }

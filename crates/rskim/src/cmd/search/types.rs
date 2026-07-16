@@ -10,6 +10,134 @@ use rskim_search::SearchField;
 use serde::Serialize;
 
 // ============================================================================
+// Pagination value type (AD-404-1/2/3)
+// ============================================================================
+
+/// A pagination cursor that bundles `limit` and `offset` into one value.
+///
+/// ## AD-404-1: why a struct, not two loose `usize` arguments
+///
+/// The P1 root cause (mod.rs:201-212 passing `limit` but silently never
+/// threading `offset`) happened because `run_ast_standalone` accepted
+/// `limit: usize` as a positional argument — a positional argument can be
+/// forgotten in a function call whereas a struct field cannot be omitted when
+/// the struct literal is constructed.  `Page` does NOT make omission a compile
+/// error — `Page::new(flags.limit, None)` compiles fine — but it expresses
+/// pagination as an indivisible concept so every call site must visibly choose
+/// `Page::first(limit)` (offset=0) or `Page::new(limit, flags.offset)`, making
+/// the intent clear at every dispatch site.  The real guard is the dispatch-level
+/// argv test (`cli_search_offset.rs`).
+///
+/// ## AD-404-2: depth() arithmetic
+///
+/// `depth() = limit.saturating_add(offset)` is the minimum candidates the
+/// pre-verify pool must hold.  `saturating_add` guards a hostile
+/// `--offset near usize::MAX` from overflowing (applies PF-004: widen before
+/// adding an offset).  Zero-regression property: when offset==0, depth()==limit,
+/// so every raw-order widening is a provable no-op for existing behavior.
+///
+/// ## AD-404-3: apply() ownership and position
+///
+/// `apply` is a consuming drain-then-truncate that implements the canonical
+/// `skip(offset) -> take(limit)` sequence.  It must run AFTER any temporal
+/// re-sort and AFTER the verify gate, never before — the comment at each call
+/// site cites this rule.  It takes `&mut Vec<T>` (not `Vec<T>`) so callers keep
+/// their named binding and can inspect the result immediately after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Page {
+    limit: usize,
+    offset: usize,
+}
+
+impl Page {
+    /// Construct from a `limit` and an optional `offset`.
+    ///
+    /// `None` offset is treated as 0 (the default when the flag is absent).
+    pub(super) fn new(limit: usize, offset: Option<usize>) -> Self {
+        Self {
+            limit,
+            offset: offset.unwrap_or(0),
+        }
+    }
+
+    /// Construct a first-page cursor (`offset = 0`).
+    ///
+    /// Use at call sites where `--offset` is intentionally absent or ignored
+    /// (e.g. unit tests that predate pagination).  Avoids the
+    /// `Page::new(limit, None)` form so grep can distinguish
+    /// "intentionally no offset" from "accidentally forgot offset".
+    ///
+    /// `#[allow(dead_code)]`: this function is a test helper called only from
+    /// `#[cfg(test)]` modules (`ast_tests.rs`, `temporal_tests.rs`).  The bin
+    /// crate's dead_code lint fires because no non-test code calls it; the
+    /// attribute silences the false positive while keeping the function available
+    /// to all test modules that need it.
+    #[allow(dead_code)]
+    pub(super) fn first(limit: usize) -> Self {
+        Self { limit, offset: 0 }
+    }
+
+    /// The maximum number of results to return.
+    #[must_use]
+    #[inline]
+    pub(super) fn limit(self) -> usize {
+        self.limit
+    }
+
+    /// The number of verified results to skip before collecting.
+    #[must_use]
+    #[inline]
+    pub(super) fn offset(self) -> usize {
+        self.offset
+    }
+
+    /// Minimum pre-verify pool size to guarantee this page is fully fillable.
+    ///
+    /// `limit.saturating_add(offset)` — safe against `offset` near `usize::MAX`
+    /// (PF-004 / AD-404-2).  When offset==0, depth()==limit (zero-regression at
+    /// all existing call sites).
+    #[must_use]
+    #[inline]
+    pub(super) fn depth(self) -> usize {
+        self.limit.saturating_add(self.offset)
+    }
+
+    /// Apply skip-then-take to `rows`: drain the first `offset` elements, then
+    /// truncate to `limit`.  Position is load-bearing: call AFTER verify gate
+    /// and AFTER any temporal re-sort.  See AD-404-3.
+    pub(super) fn apply<T>(self, rows: &mut Vec<T>) {
+        if self.offset > 0 {
+            let skip = self.offset.min(rows.len());
+            rows.drain(..skip);
+        }
+        rows.truncate(self.limit);
+    }
+}
+
+impl QueryConfig {
+    /// Return the pagination cursor implied by this config's `limit` and `offset`.
+    ///
+    /// This is the canonical way to derive a `Page` from a `QueryConfig` rather
+    /// than repeating `Page::new(config.limit, config.offset)` at each call site.
+    /// Upstream tickets (#403, #405) MUST call `config.page()` rather than
+    /// constructing their own `Page` so that any change to `QueryConfig`'s offset
+    /// handling propagates automatically.
+    ///
+    /// ## AD-404-4: additive pool widening
+    ///
+    /// The candidate pool passed to the lexical engine MUST be computed as
+    /// `candidate_pool(page.limit(), K).saturating_add(page.offset())` — the
+    /// additive form (not the multiplicative `candidate_pool(page.depth(), K)`
+    /// form, which is D-2 / Decision 2 violation).  The call sites in `query.rs`
+    /// cite this decision; this accessor ensures callers consistently derive the
+    /// same `limit` and `offset` values that drive the pool calculation.
+    #[must_use]
+    pub(super) fn page(&self) -> Page {
+        Page::new(self.limit, self.offset)
+    }
+}
+
+// ============================================================================
 // Temporal query types (Issue #189)
 // ============================================================================
 
@@ -222,6 +350,13 @@ pub(super) struct QueryOutput {
     pub query: String,
     /// Total number of results returned (≤ limit).
     pub total: usize,
+    /// Sound pagination terminator — true when more results exist beyond the
+    /// current page or the candidate pool was capped (AD-404-11 / D-5).
+    ///
+    /// Replaces the unsound `results.len() < limit` heuristic. Absent when
+    /// false (additive, back-compat; `#[serde(skip_serializing_if)]`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub has_more: bool,
     /// Resolved and enriched results.
     pub results: Vec<ResolvedResult>,
     /// Wall-clock duration of the query in milliseconds.
@@ -580,3 +715,11 @@ pub(super) struct ReadFile {
     /// guarantee for cache invalidation.
     pub mtime: Option<u64>,
 }
+
+// ============================================================================
+// Tests (co-located in types_tests.rs)
+// ============================================================================
+
+#[cfg(test)]
+#[path = "types_tests.rs"]
+mod tests;

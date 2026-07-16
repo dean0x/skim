@@ -15,7 +15,7 @@ use std::path::Path;
 use rskim_search::{FileId, HotspotRow, RiskRow, TemporalDb};
 use serde::Serialize;
 
-use super::types::{ResolvedResult, TemporalAnnotation, TemporalSort};
+use super::types::{Page, ResolvedResult, TemporalAnnotation, TemporalSort};
 
 // ============================================================================
 // Path normalization
@@ -430,13 +430,32 @@ pub(super) enum TemporalQueryOutput {
     },
 }
 
+impl TemporalQueryOutput {
+    /// Number of results in the current page.
+    ///
+    /// Used by the bounded-page-notice in `run_temporal_standalone` (AD-404-8)
+    /// to report how many results were shown before emitting the "more exist"
+    /// hint on stderr.
+    pub(super) fn result_count(&self) -> usize {
+        match self {
+            Self::Hotspots(rows) => rows.len(),
+            Self::Coldspots(rows) => rows.len(),
+            Self::Risks(rows) => rows.len(),
+            Self::Cochanges { partners, .. } => partners.len(),
+        }
+    }
+}
+
 /// Execute a standalone temporal query (no text query).
 ///
 /// - `sort`: optional sort mode (Hot, Cold, Risky).
 /// - `blast_radius`: optional file path for co-change partner lookup.
-/// - `limit`: maximum number of results.
+/// - `page`: pagination cursor (limit + offset); AD-404 standalone paths fix.
 /// - `db`: open temporal database.
 /// - `project_root`: needed for path normalization of `blast_radius`.
+///
+/// Returns `(output, has_more)` where `has_more` is the sound pagination
+/// terminator (AD-404-11 / D-5): true when more results exist beyond this page.
 ///
 /// # Errors
 ///
@@ -444,38 +463,83 @@ pub(super) enum TemporalQueryOutput {
 pub(super) fn query_standalone(
     sort: Option<TemporalSort>,
     blast_radius: Option<&str>,
-    limit: usize,
+    page: Page,
     db: &TemporalDb,
     project_root: &Path,
-) -> anyhow::Result<TemporalQueryOutput> {
+) -> anyhow::Result<(TemporalQueryOutput, bool)> {
     if let Some(raw_path) = blast_radius {
         let normalized = normalize_blast_radius_path(raw_path, project_root)?;
         let mut partners = db.cochanges_for_file(&normalized)?;
 
         if let Some(sort_mode) = sort {
-            // Pre-truncate before the re-sort to bound per-file DB lookups.
-            // The cochange query already returns results sorted by Jaccard DESC,
-            // so the highest co-change partners are at the front. Window is
-            // limit*5 clamped to at least 100 so small limits don't over-prune.
-            partners.truncate(resort_window(limit));
+            // AD-404-7: temporal re-sort window is fixed at resort_window(page.limit()),
+            // NOT resort_window(page.depth()). Offset-independent so pages are provably
+            // disjoint with no duplicate/miss defect; see D-2 user sign-off 2026-07-15.
+            let window = resort_window(page.limit());
+            let window_capped = partners.len() > window;
+            partners.truncate(window);
             resort_partners_by_temporal(&mut partners, sort_mode, &normalized, db)?;
+            let pre_page_len = partners.len();
+            page.apply(&mut partners);
+            // has_more: either the temporal window was capped (AD-404-8 bounded-page
+            // notice seam) or there are more verified rows within the window than
+            // the current page consumes (AD-404-11).
+            let has_more = window_capped || pre_page_len > page.depth();
+            return Ok((
+                TemporalQueryOutput::Cochanges {
+                    target: normalized,
+                    partners,
+                },
+                has_more,
+            ));
         }
 
-        partners.truncate(limit);
-        return Ok(TemporalQueryOutput::Cochanges {
-            target: normalized,
-            partners,
-        });
+        // No sort: cochanges returned in Jaccard DESC order from DB (all partners,
+        // no internal truncation). Apply page directly.
+        let total_before = partners.len();
+        page.apply(&mut partners);
+        let has_more = total_before > page.depth();
+        return Ok((
+            TemporalQueryOutput::Cochanges {
+                target: normalized,
+                partners,
+            },
+            has_more,
+        ));
     }
 
     // No blast-radius — pure temporal sort.
+    // Over-fetch page.depth() + 1 rows so we can detect whether more results
+    // exist beyond the current page (the "+1 sentinel" trick: if we get back
+    // exactly depth+1 rows, has_more is true; fewer rows means this is the last page).
+    let fetch_limit = page.depth().saturating_add(1);
+
     match sort {
         Some(TemporalSort::Hot) | None => {
-            Ok(TemporalQueryOutput::Hotspots(db.top_hotspots(limit)?))
+            let (rows, has_more) = paginate_sentinel(page, db.top_hotspots(fetch_limit)?);
+            Ok((TemporalQueryOutput::Hotspots(rows), has_more))
         }
-        Some(TemporalSort::Cold) => Ok(TemporalQueryOutput::Coldspots(db.top_coldspots(limit)?)),
-        Some(TemporalSort::Risky) => Ok(TemporalQueryOutput::Risks(db.top_risks(limit)?)),
+        Some(TemporalSort::Cold) => {
+            let (rows, has_more) = paginate_sentinel(page, db.top_coldspots(fetch_limit)?);
+            Ok((TemporalQueryOutput::Coldspots(rows), has_more))
+        }
+        Some(TemporalSort::Risky) => {
+            let (rows, has_more) = paginate_sentinel(page, db.top_risks(fetch_limit)?);
+            Ok((TemporalQueryOutput::Risks(rows), has_more))
+        }
     }
+}
+
+/// Detect pagination end and apply skip+take on a sentinel-over-fetched row vec.
+///
+/// The caller must have fetched `page.depth().saturating_add(1)` rows; the
+/// extra element acts as a sentinel: `has_more` is true iff the DB returned it.
+/// `page.apply` drops the sentinel by draining `offset` rows then truncating to
+/// `limit`, so a separate `truncate(depth)` call is not needed.
+fn paginate_sentinel<T>(page: Page, mut rows: Vec<T>) -> (Vec<T>, bool) {
+    let has_more = rows.len() > page.depth();
+    page.apply(&mut rows);
+    (rows, has_more)
 }
 
 /// Re-sort blast-radius partners by temporal score using per-file lookups.
@@ -517,19 +581,14 @@ fn resort_partners_by_temporal(
 
     // Sort an index Vec by score, then apply the permutation to `partners`.
     let mut indices: Vec<usize> = (0..partners.len()).collect();
-    if sort_mode == TemporalSort::Cold {
-        indices.sort_by(|&a, &b| {
-            scores[a]
-                .partial_cmp(&scores[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    } else {
-        indices.sort_by(|&a, &b| {
-            scores[b]
-                .partial_cmp(&scores[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    }
+    indices.sort_by(|&a, &b| {
+        if sort_mode == TemporalSort::Cold {
+            scores[a].partial_cmp(&scores[b])
+        } else {
+            scores[b].partial_cmp(&scores[a])
+        }
+        .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Apply permutation: collect in sorted order, then replace `partners`.
     *partners = indices.into_iter().map(|i| partners[i].clone()).collect();
@@ -540,20 +599,103 @@ fn resort_partners_by_temporal(
 // Output formatters
 // ============================================================================
 
+/// Format the bounded-page stderr notice emitted whenever `has_more=true`.
+///
+/// ## AD-404-8: bounded-page-notice emission site
+///
+/// Shared across all search dispatch paths — not limited to standalone temporal
+/// queries.  Current callers:
+///
+/// * `run_temporal_standalone` (temporal-only: `--hot`/`--cold`/`--risky`) —
+///   capped at the temporal ranking window or more rows exist in the DB.
+/// * `mod.rs` text+temporal arm — mirrors standalone, fires after the combined
+///   lexical+temporal result set is paged.
+/// * `mod.rs` pure-text arm — no temporal window; fires when the verified
+///   candidate pool exceeds the requested page (AD-404-11 / D-5).
+/// * `ast.rs` `--ast`+temporal arm — fires after `page.apply()` when the
+///   pre-page pool exceeded the current page depth.
+///
+/// Goes to stderr (#377 seam, PF-006) so `--json` stdout stays byte-identical.
+///
+/// `n` is the count of results in the current page, used so agents see exactly
+/// how many they received before the "more results exist" hint.
+pub(super) fn bounded_page_notice(n: usize, offset: usize, limit: usize) -> String {
+    format!(
+        "skim search: showing {n} result(s) (offset {offset}, limit {limit}); \
+         more results exist. \
+         Use --offset {} to page forward or increase --limit.",
+        offset.saturating_add(limit)
+    )
+}
+
+/// Return the empty-result message for a standalone temporal query page.
+///
+/// - At `offset 0`: "No {kind} data available." — the data source appears empty.
+/// - At `offset > 0`: "No {kind} results at offset N (try a smaller --offset)."
+///   — the page is exhausted, not the data source.
+///
+/// Used by `format_temporal_text` for the three typed arms (hotspot / coldspot /
+/// risk).  The co-change arm handles its own empty message because it includes a
+/// `target` path in both forms.
+fn page_empty_msg(kind: &str, page: Page) -> String {
+    if page.offset() > 0 {
+        format!(
+            "No {kind} results at offset {} (try a smaller --offset).",
+            page.offset()
+        )
+    } else {
+        format!("No {kind} data available.")
+    }
+}
+
+/// Return the 1-indexed range label for a temporal result page header.
+///
+/// - At `offset 0`: `first_page` (backward-compatible with golden fixtures,
+///   e.g. "top 5" or "5 files").
+/// - At `offset > 0`: "items {first}–{last}" using saturating arithmetic (PF-004).
+///
+/// `n` is the number of rows in the current page; it must equal `first_page`'s
+/// embedded count when `offset == 0` (no check — callers are responsible).
+fn page_range_label(first_page: &str, n: usize, page: Page) -> String {
+    if page.offset() == 0 {
+        first_page.to_string()
+    } else {
+        format!(
+            "items {}–{}",
+            page.offset().saturating_add(1),
+            page.offset().saturating_add(n)
+        )
+    }
+}
+
 /// Format a standalone temporal query result as human-readable text.
+///
+/// ## AC-404-10: page-aware headers and empty messages
+///
+/// `page` is required so that:
+/// - Headers say "top N" only at offset 0 (backward-compatible with golden
+///   fixtures); at offset > 0 they show `offset+1 .. offset+count` instead.
+/// - An empty result page at offset > 0 says "no more results at this offset"
+///   rather than the misleading "No hotspot data available." message (which
+///   implies the data source is empty, not that the page is exhausted).
 pub(super) fn format_temporal_text(
     output: &TemporalQueryOutput,
+    page: Page,
     w: &mut impl Write,
 ) -> anyhow::Result<()> {
     match output {
         TemporalQueryOutput::Hotspots(rows) => {
             if rows.is_empty() {
-                writeln!(w, "No hotspot data available.")?;
+                writeln!(w, "{}", page_empty_msg("hotspot", page))?;
                 return Ok(());
             }
             // Single newline after header (writeln! already appends \n; no
             // extra \n in the format string — that would insert a blank line).
-            writeln!(w, "Hotspots (top {}, 90-day decay):", rows.len())?;
+            //
+            // At offset 0: "top N" (backward-compatible with golden fixtures).
+            // At offset > 0: 1-indexed range via page_range_label (PF-004 saturating).
+            let range = page_range_label(&format!("top {}", rows.len()), rows.len(), page);
+            writeln!(w, "Hotspots ({range}, 90-day decay):")?;
             writeln!(w, "  Score  30d  90d  Path")?;
             writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
             for r in rows {
@@ -566,10 +708,11 @@ pub(super) fn format_temporal_text(
         }
         TemporalQueryOutput::Coldspots(rows) => {
             if rows.is_empty() {
-                writeln!(w, "No coldspot data available.")?;
+                writeln!(w, "{}", page_empty_msg("coldspot", page))?;
                 return Ok(());
             }
-            writeln!(w, "Coldspots (top {}, least active):", rows.len())?;
+            let range = page_range_label(&format!("top {}", rows.len()), rows.len(), page);
+            writeln!(w, "Coldspots ({range}, least active):")?;
             writeln!(w, "  Score  30d  90d  Path")?;
             writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
             for r in rows {
@@ -582,10 +725,11 @@ pub(super) fn format_temporal_text(
         }
         TemporalQueryOutput::Risks(rows) => {
             if rows.is_empty() {
-                writeln!(w, "No risk data available.")?;
+                writeln!(w, "{}", page_empty_msg("risk", page))?;
                 return Ok(());
             }
-            writeln!(w, "Risk hotspots (top {}):\n", rows.len())?;
+            let range = page_range_label(&format!("top {}", rows.len()), rows.len(), page);
+            writeln!(w, "Risk hotspots ({range}):\n")?;
             writeln!(w, "  Risk   Fix%   Fixes  Total  Path")?;
             writeln!(
                 w,
@@ -605,15 +749,22 @@ pub(super) fn format_temporal_text(
         }
         TemporalQueryOutput::Cochanges { target, partners } => {
             if partners.is_empty() {
-                writeln!(w, "No co-change data for {target:?}.")?;
+                // Co-change empty message includes the target path in both forms;
+                // inlined here because the target variable is only in scope here.
+                if page.offset() > 0 {
+                    writeln!(
+                        w,
+                        "No co-change results for {target:?} at offset {} (try a smaller --offset).",
+                        page.offset()
+                    )?;
+                } else {
+                    writeln!(w, "No co-change data for {target:?}.")?;
+                }
                 return Ok(());
             }
-            writeln!(
-                w,
-                "Co-change partners of {} ({} files):\n",
-                target,
-                partners.len()
-            )?;
+            let range =
+                page_range_label(&format!("{} files", partners.len()), partners.len(), page);
+            writeln!(w, "Co-change partners of {} ({range}):\n", target)?;
             writeln!(w, "  Jaccard  Count  Path")?;
             writeln!(w, "  ───────  ─────  ────────────────────────────────")?;
             for p in partners {
@@ -657,35 +808,56 @@ struct CochangeJsonRow<'a> {
 }
 
 /// Top-level envelope for hotspot/coldspot standalone JSON.
+///
+/// `has_more` is absent when false (additive, back-compat; AD-404-11).
 #[derive(Serialize)]
 struct HotColdJson<'a> {
     mode: &'a str,
     total: usize,
+    /// Sound pagination terminator; absent when false (AD-404-11 / D-5).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    has_more: bool,
     results: Vec<HotspotJsonRow<'a>>,
 }
 
 /// Top-level envelope for risk standalone JSON.
+///
+/// `has_more` is absent when false (additive, back-compat; AD-404-11).
 #[derive(Serialize)]
 struct RiskyJson<'a> {
     mode: &'a str,
     total: usize,
+    /// Sound pagination terminator; absent when false (AD-404-11 / D-5).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    has_more: bool,
     results: Vec<RiskJsonRow<'a>>,
 }
 
 /// Top-level envelope for blast-radius standalone JSON.
+///
+/// `has_more` is absent when false (additive, back-compat; AD-404-11).
 #[derive(Serialize)]
 struct BlastRadiusJson<'a> {
     mode: &'a str,
     target: &'a str,
     total: usize,
+    /// Sound pagination terminator; absent when false (AD-404-11 / D-5).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    has_more: bool,
     results: Vec<CochangeJsonRow<'a>>,
 }
 
 /// Serialize a hotspot/coldspot row slice to JSON and write it.
-fn write_hotcold_json(mode: &str, rows: &[HotspotRow], w: &mut impl Write) -> anyhow::Result<()> {
+fn write_hotcold_json(
+    mode: &str,
+    rows: &[HotspotRow],
+    has_more: bool,
+    w: &mut impl Write,
+) -> anyhow::Result<()> {
     let envelope = HotColdJson {
         mode,
         total: rows.len(),
+        has_more,
         results: rows
             .iter()
             .map(|r| HotspotJsonRow {
@@ -700,22 +872,27 @@ fn write_hotcold_json(mode: &str, rows: &[HotspotRow], w: &mut impl Write) -> an
     Ok(())
 }
 
-/// Format a standalone temporal query result as JSON.
+/// Format a standalone temporal query result as JSON (AD-404-11).
+///
+/// `has_more`: sound pagination terminator — true when more results exist
+/// beyond the current page. Absent from JSON when false (additive, back-compat).
 ///
 /// Uses `#[derive(Serialize)]` typed structs so field names are defined in one
 /// place, preventing the hand-built `serde_json::json!()` approach from drifting
 /// independently.
 pub(super) fn format_temporal_json(
     output: &TemporalQueryOutput,
+    has_more: bool,
     w: &mut impl Write,
 ) -> anyhow::Result<()> {
     match output {
-        TemporalQueryOutput::Hotspots(rows) => write_hotcold_json("hot", rows, w)?,
-        TemporalQueryOutput::Coldspots(rows) => write_hotcold_json("cold", rows, w)?,
+        TemporalQueryOutput::Hotspots(rows) => write_hotcold_json("hot", rows, has_more, w)?,
+        TemporalQueryOutput::Coldspots(rows) => write_hotcold_json("cold", rows, has_more, w)?,
         TemporalQueryOutput::Risks(rows) => {
             let envelope = RiskyJson {
                 mode: "risky",
                 total: rows.len(),
+                has_more,
                 results: rows
                     .iter()
                     .map(|r| RiskJsonRow {
@@ -734,6 +911,7 @@ pub(super) fn format_temporal_json(
                 mode: "blast-radius",
                 target,
                 total: partners.len(),
+                has_more,
                 results: partners
                     .iter()
                     .map(|p| CochangeJsonRow {
@@ -752,6 +930,28 @@ pub(super) fn format_temporal_json(
 // ============================================================================
 // Combined text+temporal enrichment (Step 10)
 // ============================================================================
+
+/// Compare two hotspot/coldspot scores for a Hot-or-Cold sort.
+///
+/// - `Hot` → descending (higher score first).
+/// - `Cold` → ascending (lower score first).
+///
+/// Extracted to eliminate the byte-identical comparator body that previously
+/// appeared in both `apply_temporal_enrichment` (text+temporal path) and
+/// `enrich_ast_results` (standalone AST path).  Path-ASC tiebreak is applied
+/// by the caller via `.then_with(|| a.path.cmp(&b.path))`.
+#[inline]
+fn hotcold_score_cmp(score_a: f64, score_b: f64, sort: TemporalSort) -> std::cmp::Ordering {
+    if sort == TemporalSort::Hot {
+        score_b
+            .partial_cmp(&score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    } else {
+        score_a
+            .partial_cmp(&score_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
 
 /// Annotate and re-sort text search results with temporal data.
 ///
@@ -781,16 +981,11 @@ pub(super) fn apply_temporal_enrichment(
                     .and_then(|t| t.hotspot_score)
                     .unwrap_or(-1.0)
             };
+            // Tiebreak: score DESC (Hot) or ASC (Cold), then file_path ASC
+            // unconditionally — unified total order matching SQL (resolution 8).
             results.sort_by(|a, b| {
-                let cmp = hotspot_score(a)
-                    .partial_cmp(&hotspot_score(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.path.cmp(&b.path));
-                if sort == TemporalSort::Hot {
-                    cmp.reverse()
-                } else {
-                    cmp
-                }
+                hotcold_score_cmp(hotspot_score(a), hotspot_score(b), sort)
+                    .then_with(|| a.path.cmp(&b.path))
             });
         }
         TemporalSort::Risky => {
@@ -894,16 +1089,11 @@ pub(super) fn enrich_ast_results(
                     .and_then(|t| t.hotspot_score)
                     .unwrap_or(-1.0)
             };
+            // Tiebreak: score DESC (Hot) or ASC (Cold), then file_path ASC
+            // unconditionally — unified total order matching SQL (resolution 8, AD-7).
             results.sort_by(|a, b| {
-                let cmp = hotspot_score(a)
-                    .partial_cmp(&hotspot_score(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.path.cmp(&b.path));
-                if sort == TemporalSort::Hot {
-                    cmp.reverse()
-                } else {
-                    cmp
-                }
+                hotcold_score_cmp(hotspot_score(a), hotspot_score(b), sort)
+                    .then_with(|| a.path.cmp(&b.path))
             });
         }
         TemporalSort::Risky => {
