@@ -1099,6 +1099,15 @@ pub fn near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<u
 /// - **IDENTITY**: for a k-word query, `phrase_near_tokens_present(c, q, k-1)`
 ///   returns the same `Option<Range>` as `phrase_tokens_present(c, q)`. K distinct
 ///   strictly-ascending positions with total span ≤ k−1 forces them consecutive.
+///   This identity is **predicate-level** (gate / file-membership): the verify gate
+///   guarantees that the untruncated result set is identical for `--phrase` and
+///   `--phrase --near(k-1)`. It does NOT extend to reader-level rank order: when the
+///   query contains sub-3-byte words, `count_phrase_near_alignments` (reader.rs) uses
+///   a looser span bound than `count_phrase_alignments` (the exact ordinal offsets),
+///   so files may rank differently under the two paths. With a tight `--limit`, the
+///   surviving set post-verify can differ. See the D-1 rank-identity scope note in
+///   `count_phrase_near_alignments` (reader.rs) and the regression fixture
+///   `ac403_2_d1_rank_identity_gap_short_word` in positional_verify.rs.
 /// - **ALGORITHM (greedy, no DP)**: Under total span, the ceiling `p0 + N` is
 ///   FIXED once the base is chosen. Greedy smallest-valid-next is therefore complete
 ///   (no DP needed). Proof: greedy's `p_j` is pointwise minimal over all valid

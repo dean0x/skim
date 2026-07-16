@@ -187,6 +187,28 @@ fn count_phrase_alignments(d: &[Vec<u32>], offsets: &[u32]) -> usize {
 /// - **Alignment count is a loose proxy**: the reader's lower bound is `prev+1`,
 ///   while the gate additionally requires dropped short words to fit. A future
 ///   "tightening" of this count is recognizable as such, not a bug fix.
+/// - **D-1 rank-identity scope**: when the query contains sub-3-byte words, these
+///   are dropped from the positioned set `d`, making the span constraint here
+///   LOOSER than the ordinal-offset constraint used by `count_phrase_alignments`.
+///   For example, query "alpha fn beta" (where "fn" is 2 bytes) has offsets `[0, 2]`
+///   (a gap of 2 because "fn" holds ordinal 1), but this function only sees the
+///   positioned words `{alpha, beta}` with `span = k-1 = 2`. It therefore also
+///   counts "alpha beta" pairs at gap 1 (within span), which `count_phrase_alignments`
+///   would reject (gap ≠ 2). Files accumulating many such looser-gap pairings
+///   receive inflated near-scores even though the verify gate (`phrase_near_tokens_present`)
+///   correctly requires the dropped word to be present. Verified files may therefore
+///   rank differently under `--phrase --near(k-1)` vs `--phrase`: tight `--limit`
+///   values can yield **different surviving sets post-verify** between the two paths.
+///   The D-1 IDENTITY guarantee is **predicate-level** (set membership via the verify
+///   gate), not reader-level rank order. See `phrase_near_tokens_present` in types.rs
+///   for the authoritative identity proof and `ac403_2_d1_rank_identity_gap_short_word`
+///   in positional_verify.rs for a regression fixture.
+/// - **Intentional duplication of the greedy scan**: the ordered-proximity logic here
+///   (count/u64 over token positions) and in `phrase_near_tokens_present` in types.rs
+///   (range/usize over word ordinals) are deliberately separate implementations.
+///   Delegating would regress the exact-phrase hot path (see the delegation note in
+///   types.rs). The two must be kept in sync; the predicate-level identity test suite
+///   (AC-403-2 golden fixtures in positional_verify.rs) is the oracle guard.
 /// - **`(false, None)` arm** is handled by `debug_assert` + fallback in the tuple
 ///   match below — never a panic (engineering rule: never throw in business logic).
 fn count_phrase_near_alignments(d: &[Vec<u32>], span: u32) -> usize {

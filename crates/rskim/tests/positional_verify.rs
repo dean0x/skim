@@ -1331,6 +1331,138 @@ fn ac403_2_identity_phrase_near_k_minus_1_equals_phrase() {
     );
 }
 
+// ── AC-403-2 (D-1 rank-identity gap): short-word query set-identity + rank-divergence ──
+
+/// AC-403-2 (D-1 rank-identity gap): documents and validates the known rank-identity
+/// limitation for the D-1 IDENTITY (`--phrase --near(k-1)` == `--phrase`).
+///
+/// The D-1 identity is **predicate-level** (set membership): after verification both
+/// paths produce the same file set.  Reader-level rank order may differ when the query
+/// contains sub-3-byte words: `count_phrase_near_alignments` operates on positioned
+/// (≥3-byte) words only, using a span bound that is LOOSER than the exact ordinal gaps
+/// encoded in `count_phrase_alignments`.
+///
+/// # Corpus (query: "alpha fn beta", k=3, k-1=2, "fn" is 2 bytes → short/dropped)
+///
+/// Positioned words: {alpha, beta}.  offsets = [0, 2] (beta must be 2 ordinals after
+/// alpha, leaving room for the dropped "fn").
+///
+/// - a.rs: "alpha fn beta\nalpha fn beta\nalpha fn beta\n"
+///   * count_phrase_alignments  = 3  (each pair matches exact gap 2)
+///   * count_phrase_near_alignments(span=2) = 3  (same: gap 1<p<2+1, all ≤ ceiling)
+///   * verify passes (contains "alpha fn beta")
+///
+/// - b.rs: "alpha beta\nalpha beta\nalpha beta\nalpha fn beta\n"
+///   * count_phrase_alignments  = 1  (only the final "alpha fn beta" pair, gap=2)
+///   * count_phrase_near_alignments(span=2) = 4  (three "alpha beta" gap-1 pairs + one gap-2)
+///   * verify passes (contains "alpha fn beta")
+///
+/// # Set-identity (no limit)
+///
+/// Both paths return {a.rs, b.rs} — the verify gate guarantees set-identity.
+///
+/// # Rank-divergence with --limit 1
+///
+/// * `--phrase` ranks by count_phrase_alignments: a.rs(3) > b.rs(1) → **a.rs wins**.
+/// * `--phrase --near 2` ranks by count_phrase_near_alignments: b.rs(4) > a.rs(3) → **b.rs wins**.
+///
+/// With --limit 1 the surviving sets differ: {a.rs} vs {b.rs}.  This is **expected,
+/// documented behavior** — the D-1 guarantee is set-identity, not rank-identity.
+/// See `count_phrase_near_alignments` (reader.rs) and `phrase_near_tokens_present`
+/// (types.rs) for the full design rationale.
+#[test]
+fn ac403_2_d1_rank_identity_gap_short_word() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    // a.rs: three exact "alpha fn beta" phrases.
+    // count_phrase_alignments = 3; count_phrase_near_alignments(span=2) = 3.
+    fs::write(
+        proj.path().join("a.rs"),
+        "alpha fn beta\nalpha fn beta\nalpha fn beta\n",
+    )
+    .unwrap();
+
+    // b.rs: three "alpha beta" pairs (gap 1) + one "alpha fn beta" (gap 2).
+    // count_phrase_alignments = 1 (only the exact gap-2 pair).
+    // count_phrase_near_alignments(span=2) = 4 (three gap-1 pairs count too).
+    fs::write(
+        proj.path().join("b.rs"),
+        "alpha beta\nalpha beta\nalpha beta\nalpha fn beta\n",
+    )
+    .unwrap();
+
+    build_index(proj.path(), cache.path());
+
+    // ── Part 1: set-identity (no limit) ──────────────────────────────────────
+    //
+    // Verify that the D-1 set-identity holds: both --phrase and --phrase --near 2
+    // return the same set {a.rs, b.rs} when no limit is applied.
+    let j_phrase = search_json(proj.path(), cache.path(), &["--phrase", "alpha fn beta"]);
+    let j_near2 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "2", "alpha fn beta"],
+    );
+    let phrase_set = paths(&j_phrase);
+    let near2_set = paths(&j_near2);
+
+    assert!(
+        phrase_set.contains("a.rs") && phrase_set.contains("b.rs"),
+        "AC-403-2 D-1 set-identity: --phrase must return both a.rs and b.rs; got {phrase_set:?}"
+    );
+    assert_eq!(
+        phrase_set, near2_set,
+        "AC-403-2 D-1 set-identity: --phrase and --phrase --near 2 must return the same set \
+         (set-identity guaranteed by the verify gate); phrase={phrase_set:?} near2={near2_set:?}"
+    );
+
+    // ── Part 2: rank-divergence with tight --limit (documented known gap) ────
+    //
+    // With --limit 1, the rank order from the reader determines which file survives.
+    // --phrase ranks by count_phrase_alignments: a.rs(3) > b.rs(1) → a.rs.
+    // --phrase --near 2 ranks by count_phrase_near_alignments: b.rs(4) > a.rs(3) → b.rs.
+    // This is the D-1 rank-identity gap: set-identity holds without limit, but tight
+    // limits expose reader-score divergence for short-word queries.
+    let j_phrase_limit1 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--limit", "1", "alpha fn beta"],
+    );
+    let j_near2_limit1 = search_json(
+        proj.path(),
+        cache.path(),
+        &["--phrase", "--near", "2", "--limit", "1", "alpha fn beta"],
+    );
+
+    let phrase_limit1_path = j_phrase_limit1["results"][0]["path"]
+        .as_str()
+        .expect("AC-403-2 D-1 rank gap: --phrase --limit 1 must return a result")
+        .to_string();
+    let near2_limit1_path = j_near2_limit1["results"][0]["path"]
+        .as_str()
+        .expect("AC-403-2 D-1 rank gap: --phrase --near 2 --limit 1 must return a result")
+        .to_string();
+
+    // --phrase ranks by exact phrase count (gap=2 only): a.rs wins (score 3 vs 1).
+    assert_eq!(
+        phrase_limit1_path, "a.rs",
+        "AC-403-2 D-1 rank gap: --phrase --limit 1 must return a.rs (score 3 > 1 from \
+         count_phrase_alignments with offsets [0,2]); got {phrase_limit1_path:?}"
+    );
+    // --phrase --near 2 ranks by loose near count (gap 1 or 2): b.rs wins (score 4 vs 3).
+    // This divergence from --phrase is the known rank-identity gap — NOT a correctness bug
+    // (both returned files genuinely contain 'alpha fn beta', verify passes for both).
+    assert_eq!(
+        near2_limit1_path, "b.rs",
+        "AC-403-2 D-1 rank gap: --phrase --near 2 --limit 1 must return b.rs (score 4 > 3 \
+         from count_phrase_near_alignments counting 'alpha beta' gap-1 pairs); \
+         got {near2_limit1_path:?}. \
+         If both return the same file, the rank-identity gap was closed — update this test \
+         to document the new behavior."
+    );
+}
+
 // ── AC-403-3: monotonicity ────────────────────────────────────────────────────
 
 /// AC-403-3: --phrase --near N MUST NOT return any file that --near N does not
