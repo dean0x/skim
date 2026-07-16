@@ -604,15 +604,23 @@ fn resort_partners_by_temporal(
 // Output formatters
 // ============================================================================
 
-/// Format the bounded-page stderr notice for standalone temporal queries.
+/// Format the bounded-page stderr notice emitted whenever `has_more=true`.
 ///
 /// ## AD-404-8: bounded-page-notice emission site
 ///
-/// Emitted when `has_more=true` from `query_standalone` — the result set was
-/// either capped at the temporal ranking window (`resort_window(page.limit())`)
-/// or more rows exist beyond the current page (DB sentinel on pure
-/// `--hot`/`--cold`/`--risky` paths).  Goes to stderr (#377 seam, PF-006) so
-/// `--json` stdout stays byte-identical.
+/// Shared across all search dispatch paths — not limited to standalone temporal
+/// queries.  Current callers:
+///
+/// * `run_temporal_standalone` (temporal-only: `--hot`/`--cold`/`--risky`) —
+///   capped at the temporal ranking window or more rows exist in the DB.
+/// * `mod.rs` text+temporal arm — mirrors standalone, fires after the combined
+///   lexical+temporal result set is paged.
+/// * `mod.rs` pure-text arm — no temporal window; fires when the verified
+///   candidate pool exceeds the requested page (AD-404-11 / D-5).
+/// * `ast.rs` `--ast`+temporal arm — fires after `page.apply()` when the
+///   pre-page pool exceeded the current page depth.
+///
+/// Goes to stderr (#377 seam, PF-006) so `--json` stdout stays byte-identical.
 ///
 /// `n` is the count of results in the current page, used so agents see exactly
 /// how many they received before the "more results exist" hint.
