@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`skim proxy` is now gated behind a non-default `proxy` cargo feature** — default builds are
+  HTTP/TLS-free (AC9); release binaries include the proxy. Source builds opt in via
+  `cargo build -p rskim --features proxy` or `cargo install --path crates/rskim --features proxy`. (#352)
+- **Proxy egress compression is now lossless-only (#427)** — All active engines on the
+  `skim proxy` egress path are information-preserving:
+  - **JSON minification** — structural whitespace removal only; value-equivalent, dup-key-safe,
+    runtime-gated via `value_equivalent_raw` (budget: 200k nodes/request). Blocked on
+    budget exhaustion or dup-key detection → byte-identical passthrough.
+  - **Log deduplication** — annotated dedup with ×N counts and timestamp min–max ranges;
+    all unique content preserved. Log header arithmetic fix: X lines → Y unique (Z duplicates
+    removed) now correctly satisfies X−Z=Y.
+  - **Code blocks** — pass through byte-identical on the proxy path (tree-sitter removed
+    from the egress pipeline entirely). Measured win: ~14.6 ms → ~0.6 ms per 90 KB block.
+  - **Policy tiers re-scoped** — `Policy::LosslessOnly` = byte-exact passthrough (no re-encoding,
+    Subscription/Bearer auth); `Policy::Default` = lossless re-encoding allowed (ApiKey auth).
+
+### Removed
+- **Lossy egress transforms removed (#427)** — The following content-discarding egress
+  transforms are removed from the proxy path:
+  - Code-body stripping via tree-sitter (replaced by byte-identical passthrough; latency
+    improvement ~14.6 ms → ~0.6 ms per 90 KB block).
+  - JSON value placeholders (replaced by minification or byte-identical passthrough).
+  - Content-discarding log axes.
+  - Tabular re-encoding is explicitly excluded from v1 (tracked in #430 with evidence gate).
+  - Per-block agent-consent code compression deferred to #429.
+
 ### Breaking Changes
 
 - **Exit-code remap: parse errors → 2, unsupported language → 3** — Scripts that

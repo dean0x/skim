@@ -1,0 +1,12 @@
+2024-01-15T10:00:00Z [INFO] server started
+2024-01-15T10:00:01Z [DEBUG] cache miss for key=session:abc
+2024-01-15T10:00:01Z [DEBUG] cache miss for key=session:def
+2024-01-15T10:00:02Z [DEBUG] db query plan: seq scan on users
+2024-01-15T10:00:02Z [DEBUG] db query plan: seq scan on orders
+2024-01-15T10:00:03Z [DEBUG] cache miss for key=session:abc
+2024-01-15T10:00:03Z [DEBUG] loading config from /etc/app/config.yaml
+2024-01-15T10:00:04Z [DEBUG] cache miss for key=session:ghi
+2024-01-15T10:00:04Z [TRACE] entering handler fn=process_request
+2024-01-15T10:00:05Z [INFO] request processed successfully
+2024-01-15T10:00:05Z [DEBUG] cache miss for key=session:jkl
+2024-01-15T10:00:06Z [TRACE] exiting handler fn=process_request
