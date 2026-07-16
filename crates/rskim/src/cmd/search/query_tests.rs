@@ -186,6 +186,7 @@ fn test_format_text_output_empty_results() {
         results: vec![],
         duration_ms: 5,
         index_stats: None,
+        ast_coverage: None,
     };
     let mut buf = BufWriter::new(Vec::new());
     format_text_output(&output, &mut buf).unwrap();
@@ -235,6 +236,7 @@ fn test_format_text_output_includes_path_and_score() {
         results: vec![result],
         duration_ms: 3,
         index_stats: None,
+        ast_coverage: None,
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -278,6 +280,7 @@ fn test_format_text_output_includes_stale_marker() {
         results: vec![result],
         duration_ms: 2,
         index_stats: None,
+        ast_coverage: None,
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -870,6 +873,7 @@ fn test_format_json_output_is_valid_json() {
         results: vec![],
         duration_ms: 1,
         index_stats: None,
+        ast_coverage: None,
     };
     let mut buf = BufWriter::new(Vec::new());
     format_json_output(&output, &mut buf).unwrap();
@@ -914,6 +918,7 @@ fn test_format_text_output_includes_temporal_hotspot() {
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
+        ast_coverage: None,
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -958,6 +963,7 @@ fn test_format_text_output_includes_temporal_risk() {
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
+        ast_coverage: None,
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -999,6 +1005,7 @@ fn test_format_text_output_omits_temporal_when_none() {
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
+        ast_coverage: None,
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -1044,6 +1051,7 @@ fn test_format_json_output_includes_temporal_annotations() {
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
+        ast_coverage: None,
     };
 
     let mut buf = BufWriter::new(Vec::new());
