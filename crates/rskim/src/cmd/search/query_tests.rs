@@ -3223,8 +3223,8 @@ fn ast_coverage_notice_none_on_clean_corpus() {
     use rskim_search::{CoverageEntry, ast_coverage};
 
     let clean = ast_coverage(std::iter::once(CoverageEntry {
-        path: "src/small.rs".to_string(),
-        lang: "rust".to_string(),
+        path: "src/small.rs",
+        lang: "rust",
         size: Some(100),
     }));
     assert!(
@@ -3248,8 +3248,8 @@ fn ast_coverage_notice_fires_with_shared_prefix_when_excluded() {
 
     let over_cap = rskim_core::AST_SIZE_LIMIT_DEFAULT + 1;
     let dirty = ast_coverage(std::iter::once(CoverageEntry {
-        path: "src/huge.rs".to_string(),
-        lang: "rust".to_string(),
+        path: "src/huge.rs",
+        lang: "rust",
         size: Some(over_cap),
     }));
     assert!(

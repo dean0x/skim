@@ -743,9 +743,13 @@ impl FileManifest {
     /// The manifest is already loaded; this is a pure in-memory pass.  No disk
     /// reads are performed.
     pub(super) fn ast_coverage(&self) -> rskim_search::AstCoverage {
+        // Borrow `path` and `lang` as `&str` — no allocation per entry.
+        // Heap allocation occurs only for the ≤ AST_COVERAGE_EXCLUDED_SAMPLE_CAP
+        // (10) entries that are actually inserted into the bounded sample
+        // (AD-405-5 zero-clone iteration).
         rskim_search::ast_coverage(self.entries.values().map(|e| rskim_search::CoverageEntry {
-            path: e.path.clone(),
-            lang: e.lang.clone(),
+            path: &e.path,
+            lang: &e.lang,
             size: e.size,
         }))
     }

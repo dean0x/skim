@@ -105,13 +105,20 @@ impl AstCoverage {
 /// Callers convert their concrete manifest entry type to this flat form.
 /// Keeping this type generic avoids a direct dependency between `rskim-search`
 /// and the concrete `ManifestEntry` in `rskim/src/cmd/search/manifest.rs`.
-#[derive(Debug, Clone)]
-pub struct CoverageEntry {
+///
+/// ## AD-405-5: zero-clone iteration
+///
+/// `path` and `lang` are borrowed `&str` so the O(N) iterator in
+/// `FileManifest::ast_coverage` pays no allocation cost.  String heap
+/// allocations happen only for the ≤ `AST_COVERAGE_EXCLUDED_SAMPLE_CAP` (10)
+/// entries that are actually inserted into the bounded excluded sample.
+#[derive(Debug, Clone, Copy)]
+pub struct CoverageEntry<'a> {
     /// Repo-relative path of the file.
-    pub path: String,
+    pub path: &'a str,
     /// Language name as stored in the manifest (e.g. `"rust"`).  May be
     /// unparseable if the manifest was written by an old version.
-    pub lang: String,
+    pub lang: &'a str,
     /// File size in bytes at the time the manifest was written (`None` if absent).
     pub size: Option<u64>,
 }
@@ -140,7 +147,7 @@ pub struct CoverageEntry {
 /// cheap.  The two-phase insert-then-evict logic is encapsulated in
 /// [`insert_into_bounded_sample`] to keep this function readable.
 #[must_use]
-pub fn ast_coverage(entries: impl IntoIterator<Item = CoverageEntry>) -> AstCoverage {
+pub fn ast_coverage<'a>(entries: impl IntoIterator<Item = CoverageEntry<'a>>) -> AstCoverage {
     let mut size_eligible_files: u64 = 0;
     let mut size_excluded_files: u64 = 0;
     let mut undetermined_files: u64 = 0;
@@ -150,8 +157,9 @@ pub fn ast_coverage(entries: impl IntoIterator<Item = CoverageEntry>) -> AstCove
 
     for entry in entries {
         // Two-tier language resolve (AD-405-6).
-        let lang_opt = Language::from_name(&entry.lang)
-            .or_else(|| Language::from_path(std::path::Path::new(&entry.path)));
+        // `entry.path` / `entry.lang` are `&str` (Copy): no allocation here.
+        let lang_opt = Language::from_name(entry.lang)
+            .or_else(|| Language::from_path(std::path::Path::new(entry.path)));
 
         let Some(lang) = lang_opt else {
             // Language unknown — UNDETERMINED (not a non-participant, the path
@@ -183,11 +191,13 @@ pub fn ast_coverage(entries: impl IntoIterator<Item = CoverageEntry>) -> AstCove
 
                 // Bounded sample: keep the `AST_COVERAGE_EXCLUDED_SAMPLE_CAP`
                 // lexicographically smallest paths (AD-405-5 / PF-012).
+                // Allocate String only here (≤ cap = 10 times), not for every
+                // entry (AD-405-5 zero-clone iteration).
                 insert_into_bounded_sample(
                     &mut sample_map,
-                    entry.path.clone(),
+                    entry.path.to_owned(),
                     AstExcludedFile {
-                        path: entry.path,
+                        path: entry.path.to_owned(),
                         lang: lang_name.to_string(),
                         size_bytes: sz,
                         limit_bytes: cap,
@@ -262,12 +272,8 @@ fn insert_into_bounded_sample(
 mod tests {
     use super::*;
 
-    fn entry(path: &str, lang: &str, size: Option<u64>) -> CoverageEntry {
-        CoverageEntry {
-            path: path.to_string(),
-            lang: lang.to_string(),
-            size,
-        }
+    fn entry<'a>(path: &'a str, lang: &'a str, size: Option<u64>) -> CoverageEntry<'a> {
+        CoverageEntry { path, lang, size }
     }
 
     /// AC-405-3: Coverage predicate matrix.
@@ -323,10 +329,16 @@ mod tests {
     fn bounded_sample_is_path_sorted_and_capped() {
         let cap = rskim_core::AST_SIZE_LIMIT_DEFAULT;
         // Create 15 excluded files; paths are out-of-alpha order.
-        let entries: Vec<CoverageEntry> = (0..15u64)
-            .map(|i| entry(&format!("file{:02}.rs", 14 - i), "rust", Some(cap + 1 + i)))
+        // Collect owned path strings first so their lifetimes outlive the
+        // `CoverageEntry<'_>` borrows produced by the iterator below.
+        let paths: Vec<String> = (0..15u64)
+            .map(|i| format!("file{:02}.rs", 14 - i))
             .collect();
-        let cov = ast_coverage(entries);
+        let cov = ast_coverage(paths.iter().enumerate().map(|(i, p)| CoverageEntry {
+            path: p.as_str(),
+            lang: "rust",
+            size: Some(cap + 1 + i as u64),
+        }));
 
         assert_eq!(cov.size_excluded_files, 15, "authoritative total");
         assert_eq!(
