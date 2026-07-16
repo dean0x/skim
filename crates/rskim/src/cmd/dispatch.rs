@@ -9,8 +9,10 @@ use std::process::{Command, ExitCode};
 
 use super::{
     KNOWN_SUBCOMMANDS, agents, build, completions, db, discover, file, git, heatmap, infra, init,
-    learn, lint, log, pkg, proxy, rewrite, sanitize_for_display, search, stats, test,
+    learn, lint, log, pkg, rewrite, sanitize_for_display, search, stats, test,
 };
+#[cfg(feature = "proxy")]
+use super::proxy;
 
 // ============================================================================
 // Defense-in-depth: strip stray --session-id from subcommand args
@@ -598,6 +600,9 @@ pub(crate) fn dispatch(
         // run_inherited_passthrough — `proxy` is not an indefinite streaming command
         // (AC25 / AD-PXY-03). It is excluded from PATH-wrapper targets via
         // META_SUBCOMMANDS in registry.rs.
+        // Routing guard in main.rs owns the default-build UX (#352): bare `skim proxy`
+        // on a non-proxy build emits a clear error before ever reaching dispatch.
+        #[cfg(feature = "proxy")]
         "proxy" => proxy::run(args, analytics),
         "rewrite" => rewrite::run(args, analytics),
         "search" => search::run(args, analytics),

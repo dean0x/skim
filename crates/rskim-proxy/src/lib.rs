@@ -48,12 +48,12 @@
 //!
 //! hyper, tokio, and rustls are heavy dependencies and introduce the first async
 //! runtime in the workspace. A separate crate isolates incremental-rebuild churn:
-//! changes to proxy internals do not re-link all other crates. NOTE: `rskim`
-//! currently depends on `rskim-proxy` unconditionally (not feature-gated), so
-//! hyper/tokio/rustls ARE compiled into every `skim` build and flow through release
-//! LTO. A `proxy` feature gate is tracked in #352 (ADR-004: real ticket, not a
-//! placeholder). This follows the `rskim-search` precedent: depends on
-//! `rskim-core`/`rskim-contract` without changing their APIs.
+//! changes to proxy internals do not re-link all other crates. `rskim` gates this
+//! dep behind a non-default `proxy` cargo feature (#352): default builds contain no
+//! proxy subcommand and no tokio/hyper/rustls in the dependency tree (AC9:
+//! HTTP/TLS-free default tree); release binaries are built with `--features proxy`.
+//! This follows the `rskim-search` precedent: depends on `rskim-core`/`rskim-contract`
+//! without changing their APIs.
 //!
 //! ## Public API surface
 //!
@@ -174,10 +174,10 @@ use std::sync::Arc;
 /// # AD-PXY-01
 ///
 /// The `rskim_proxy` crate is a separate workspace member to isolate
-/// incremental-rebuild churn from proxy-internal changes. NOTE: the
-/// `rskim` dependency is currently unconditional (not feature-gated), so
-/// hyper/tokio/rustls ARE compiled into every `skim` build. Feature-gating
-/// is tracked in #352.
+/// incremental-rebuild churn from proxy-internal changes. `rskim` gates this
+/// dep behind a non-default `proxy` cargo feature (#352): default builds
+/// contain no proxy subcommand and no tokio/hyper/rustls in the dependency
+/// tree; release binaries are built with `--features proxy`.
 pub fn serve(config: config::ProxyConfig) -> Result<(), errors::ProxyError> {
     // Initialise structured JSON logging (AC13). Safe to call multiple times.
     logging::init_logging();

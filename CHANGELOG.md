@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`skim proxy` is now gated behind a non-default `proxy` cargo feature** — default builds are
+  HTTP/TLS-free (AC9); release binaries include the proxy. Source builds opt in via
+  `cargo build -p rskim --features proxy` or `cargo install --path crates/rskim --features proxy`. (#352)
 - **Proxy egress compression is now lossless-only (#427)** — All active engines on the
   `skim proxy` egress path are information-preserving:
   - **JSON minification** — structural whitespace removal only; value-equivalent, dup-key-safe,

@@ -41,6 +41,7 @@ pub(crate) mod lint;
 mod log;
 mod permissions;
 mod pkg;
+#[cfg(feature = "proxy")]
 mod proxy;
 mod rewrite;
 mod search;

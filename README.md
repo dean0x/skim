@@ -114,6 +114,9 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 
 ### LLM Proxy (`skim proxy`)
 - Resident loopback HTTP/1.1 reverse proxy that sits between your agent and the LLM API
+- **Availability**: prebuilt release binaries (GitHub Releases, npm, Homebrew) include `skim proxy`.
+  Source builds opt in: `cargo build -p rskim --features proxy` or
+  `cargo install --path crates/rskim --features proxy`. Default source builds are HTTP/TLS-free.
 - **Lossless-only egress guarantee** — all compression on the proxy path is information-preserving:
   - JSON minification (structural whitespace removal; value-equivalent, dup-key-safe)
   - Log deduplication with ×N counts and timestamp min–max ranges (all unique content preserved)

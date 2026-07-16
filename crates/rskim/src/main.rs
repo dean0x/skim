@@ -104,7 +104,7 @@ fn looks_like_file_or_glob(token: &str) -> bool {
 /// | Contains `*`, `?`, `[`, or `{`                  | FileOperation |
 /// | Is known subcommand                           | Subcommand    |
 /// | Everything else                               | FileOperation |
-fn resolve_invocation() -> Invocation {
+fn resolve_invocation() -> anyhow::Result<Invocation> {
     let raw_args: Vec<String> = std::env::args().collect();
     // Skip argv[0] (the binary name)
     let args = &raw_args[1..];
@@ -119,7 +119,7 @@ fn resolve_invocation() -> Invocation {
         // Without this, `skim -- test` would skip `--`, find `test`,
         // and incorrectly route to Subcommand.
         if arg == "--" {
-            return Invocation::FileOperation;
+            return Ok(Invocation::FileOperation);
         }
 
         if arg.starts_with('-') {
@@ -144,12 +144,12 @@ fn resolve_invocation() -> Invocation {
     }
 
     let Some((pos_idx, positional)) = first_positional else {
-        return Invocation::FileOperation;
+        return Ok(Invocation::FileOperation);
     };
 
     // File-like heuristics: if it looks like a file/path/glob, treat as file
     if looks_like_file_or_glob(positional) {
-        return Invocation::FileOperation;
+        return Ok(Invocation::FileOperation);
     }
 
     // Known subcommand check — subcommands always take priority.
@@ -157,14 +157,23 @@ fn resolve_invocation() -> Invocation {
     if cmd::is_known_subcommand(positional) {
         let name = positional.to_string();
         let remaining_args: Vec<String> = args[pos_idx + 1..].to_vec();
-        return Invocation::Subcommand {
+        return Ok(Invocation::Subcommand {
             name,
             args: remaining_args,
-        };
+        });
+    }
+
+    // #352: `proxy` is compiled out of default builds. Bare `skim proxy` must fail
+    // actionably instead of falling into the file-op path (which would error with
+    // "No such file or directory" — or silently skim a file named `proxy`). This
+    // also keeps subcommand-over-file shadowing identical across feature configs.
+    #[cfg(not(feature = "proxy"))]
+    if positional == "proxy" {
+        anyhow::bail!("'proxy' requires a build with --features proxy");
     }
 
     // Unknown word — fall through to FileOperation (clap handles errors)
-    Invocation::FileOperation
+    Ok(Invocation::FileOperation)
 }
 
 /// Maximum number of parallel jobs (threads) to prevent resource exhaustion
@@ -819,8 +828,11 @@ fn main() -> ExitCode {
         }
     } else {
         match resolve_invocation() {
-            Invocation::FileOperation => run_file_operation(&analytics).map(|()| ExitCode::SUCCESS),
-            Invocation::Subcommand { name, args } => cmd::dispatch(&name, &args, &analytics),
+            Ok(Invocation::FileOperation) => {
+                run_file_operation(&analytics).map(|()| ExitCode::SUCCESS)
+            }
+            Ok(Invocation::Subcommand { name, args }) => cmd::dispatch(&name, &args, &analytics),
+            Err(e) => Err(e),
         }
     };
 

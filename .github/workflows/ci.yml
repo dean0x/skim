@@ -249,12 +249,21 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release binary
-        run: cargo build --release -p rskim
+        run: cargo build --release -p rskim --features proxy
 
       - name: Smoke test
         run: |
           ./target/release/skim --version
           echo "fn main() {}" | ./target/release/skim - --language=rust
+          ./target/release/skim proxy --help 2>&1 | grep -q "HTTP reverse proxy"
+
+      - name: Default-features lint (proxy gated off — #352)
+        run: cargo clippy -p rskim --all-targets -- -D warnings
+
+      - name: Default-features gating tests (#352)
+        run: |
+          cargo test -p rskim --bins registry::
+          cargo test -p rskim --test cli_proxy_gating
 
   # Scoped Windows proxy integration job (#303 AC17).
   #
