@@ -50,7 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now eligible for AST structural indexing (named patterns and containment queries via
   `--ast`).  Files that exceed 1 MiB remain excluded and are fully text-searchable.
   The cap is language-aware (`ast_size_limit(Language)`): data formats (JSON/YAML/TOML)
-  have no cap (they use a serde-based path, not tree-sitter).  Expect a proportionally
+  are never AST-indexed (`ast_size_limit` returns `None` for them — they are
+  non-participants, not uncapped participants).  Expect a proportionally
   larger `ast_index.skpost` on repos with large source files.
 
 - **`ast_coverage` in `--ast` JSON output and `--stats --json`** (#405): The
