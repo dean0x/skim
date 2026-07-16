@@ -812,6 +812,12 @@ fn standalone_hot_text_has_table_columns() {
 // in tests/fixtures/offset_golden/ (captured from the pre-change binary in
 // Step 0 of #404). They confirm that the page-aware changes in format_temporal_text
 // are a zero-regression at offset=0 (PF-007 / AC-404-12).
+//
+// Coverage: arm10 (hot standalone) and arm11 (blast-radius standalone) — both
+// text and JSON output formats (4 fixtures total).  Arms 01–09 cover lexical
+// and AST query output produced by `format_text_output` / `format_json_output`
+// / `format_ast_text`; those formatters are exercised in query_tests.rs and
+// ast_tests.rs, not here.
 
 /// AC-404-12 / PF-007: `format_temporal_text` at offset 0 must produce output
 /// matching the arm10 golden fixture (standalone --hot, 5 files).
@@ -870,6 +876,188 @@ fn golden_arm10_hot_standalone_text_matches_fixture() {
         "AC-404-12 / PF-007: format_temporal_text at offset 0 must match golden fixture.\n\
          If this fails due to a deliberate behavioral change (e.g. tiebreak Decision 8),\n\
          update arm10_hot_standalone.txt to reflect the new correct output."
+    );
+}
+
+/// AC-404-12: `format_temporal_json` for arm10 (--hot standalone, 5 files) must
+/// produce output byte-identical to the committed arm10_hot_standalone.json fixture.
+///
+/// Same data as `golden_arm10_hot_standalone_text_matches_fixture`; exercises
+/// the JSON path that was previously uncovered by golden tests.
+#[test]
+fn golden_arm10_hot_standalone_json_matches_fixture() {
+    // Data extracted directly from arm10_hot_standalone.json golden fixture.
+    let output = TemporalQueryOutput::Hotspots(vec![
+        HotspotRow {
+            file_path: "file1.ts".to_string(),
+            score: 1.0,
+            changes_30d: 5,
+            changes_90d: 5,
+        },
+        HotspotRow {
+            file_path: "file2.ts".to_string(),
+            score: 0.6,
+            changes_30d: 3,
+            changes_90d: 3,
+        },
+        HotspotRow {
+            file_path: "file6.ts".to_string(),
+            score: 0.39999999999999997,
+            changes_30d: 2,
+            changes_90d: 2,
+        },
+        HotspotRow {
+            file_path: "file3.ts".to_string(),
+            score: 0.19999999999999998,
+            changes_30d: 1,
+            changes_90d: 1,
+        },
+        HotspotRow {
+            file_path: "file5.ts".to_string(),
+            score: 0.19999999999999998,
+            changes_30d: 1,
+            changes_90d: 1,
+        },
+    ]);
+
+    let mut buf = BufWriter::new(Vec::new());
+    // has_more=false: first page contains all results, so `has_more` is absent
+    // from JSON output (skip_serializing_if).
+    format_temporal_json(&output, false, &mut buf).unwrap();
+    let actual = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    let expected = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/offset_golden/arm10_hot_standalone.json"),
+    )
+    .expect("arm10 JSON golden fixture must be readable");
+
+    assert_eq!(
+        actual, expected,
+        "AC-404-12: format_temporal_json at offset 0 must match arm10 golden fixture.\n\
+         Update arm10_hot_standalone.json if the JSON schema changes deliberately."
+    );
+}
+
+/// AC-404-12: `format_temporal_text` for arm11 (--blast-radius standalone, 5 partners)
+/// must produce output byte-identical to arm11_blast_standalone.txt.
+///
+/// The exact tiebreak ordering for the three jaccard=0.2 partners (file3 < file4
+/// < file5, by file_b ASC in the DB query) is pinned here.
+#[test]
+fn golden_arm11_blast_standalone_text_matches_fixture() {
+    // Data extracted from arm11_blast_standalone.json golden fixture.
+    // file_a="file1.ts" for all rows so cochange_partner() returns file_b.
+    let output = TemporalQueryOutput::Cochanges {
+        target: "file1.ts".to_string(),
+        partners: vec![
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file3.ts".to_string(),
+                count: 1,
+                jaccard: 0.2,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file4.ts".to_string(),
+                count: 1,
+                jaccard: 0.2,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file5.ts".to_string(),
+                count: 1,
+                jaccard: 0.2,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file6.ts".to_string(),
+                count: 1,
+                // Exact f64 for 1/6 as stored in the golden fixture.
+                jaccard: 0.16666666666666666,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file2.ts".to_string(),
+                count: 1,
+                // Exact f64 for 1/7 as stored in the golden fixture.
+                jaccard: 0.14285714285714285,
+            },
+        ],
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_text(&output, super::super::types::Page::first(5), &mut buf).unwrap();
+    let actual = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    let expected = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/offset_golden/arm11_blast_standalone.txt"),
+    )
+    .expect("arm11 text golden fixture must be readable");
+
+    assert_eq!(
+        actual, expected,
+        "AC-404-12: format_temporal_text at offset 0 must match arm11 golden fixture.\n\
+         Update arm11_blast_standalone.txt if blast-radius text output format changes."
+    );
+}
+
+/// AC-404-12: `format_temporal_json` for arm11 (--blast-radius standalone, 5 partners)
+/// must produce output byte-identical to arm11_blast_standalone.json.
+#[test]
+fn golden_arm11_blast_standalone_json_matches_fixture() {
+    // Same data as the arm11 text golden test above.
+    let output = TemporalQueryOutput::Cochanges {
+        target: "file1.ts".to_string(),
+        partners: vec![
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file3.ts".to_string(),
+                count: 1,
+                jaccard: 0.2,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file4.ts".to_string(),
+                count: 1,
+                jaccard: 0.2,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file5.ts".to_string(),
+                count: 1,
+                jaccard: 0.2,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file6.ts".to_string(),
+                count: 1,
+                jaccard: 0.16666666666666666,
+            },
+            CochangeRow {
+                file_a: "file1.ts".to_string(),
+                file_b: "file2.ts".to_string(),
+                count: 1,
+                jaccard: 0.14285714285714285,
+            },
+        ],
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_temporal_json(&output, false, &mut buf).unwrap();
+    let actual = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    let expected = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/offset_golden/arm11_blast_standalone.json"),
+    )
+    .expect("arm11 JSON golden fixture must be readable");
+
+    assert_eq!(
+        actual, expected,
+        "AC-404-12: format_temporal_json at offset 0 must match arm11 golden fixture.\n\
+         Update arm11_blast_standalone.json if blast-radius JSON output format changes."
     );
 }
 
@@ -1977,4 +2165,245 @@ fn standalone_blast_radius_empty_db_text_format() {
         !s.contains("Jaccard"),
         "column headers must not appear for empty co-change output, got: {s:?}"
     );
+}
+
+// ============================================================================
+// D-2 / AC-404-12: blast-radius offset > 0 pagination coverage
+//
+// Finding: every query_standalone blast-radius test previously used
+// Page::first(10) (offset 0), leaving both branches of the blast-radius arm
+// in query_standalone — the no-sort path and the temporal re-sort path — with
+// zero offset coverage.  These tests exercise the disjointness-critical
+// `has_more` computation on both paths with offset > 0 so that the D-2 proof
+// is backed by a failing-then-passing regression test.
+// ============================================================================
+
+/// D-2 / AC-404-12 (no-sort branch): blast-radius without a temporal sort flag
+/// with offset > 0 must skip the first `offset` partners and set has_more=true
+/// when more partners exist beyond the current page.
+///
+/// Setup: 5 partners (jaccard 0.9 → 0.5), Page(limit=2, offset=2).
+/// depth = limit + offset = 4.  total_before = 5 > 4 → has_more = true.
+/// Returned partners are positions [2..4] in Jaccard-DESC order: jaccard 0.7
+/// and 0.6.
+#[test]
+fn blast_radius_no_sort_offset_nonzero_has_more() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/hub.rs"), "").unwrap();
+
+    let (_db_dir, db) = temp_db();
+    db.store_cochanges(&[
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/p1.rs".to_string(),
+            count: 5,
+            jaccard: 0.9,
+        },
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/p2.rs".to_string(),
+            count: 4,
+            jaccard: 0.8,
+        },
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/p3.rs".to_string(),
+            count: 3,
+            jaccard: 0.7,
+        },
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/p4.rs".to_string(),
+            count: 2,
+            jaccard: 0.6,
+        },
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/p5.rs".to_string(),
+            count: 1,
+            jaccard: 0.5,
+        },
+    ])
+    .unwrap();
+
+    let page = super::super::types::Page::new(2, Some(2));
+    let (output, has_more) = query_standalone(None, Some("src/hub.rs"), page, &db, &root).unwrap();
+
+    // has_more: total_before(5) > depth(4) → true (D-2 no-sort branch).
+    assert!(
+        has_more,
+        "D-2 no-sort: has_more must be true when total partners(5) > depth(4)"
+    );
+
+    match output {
+        TemporalQueryOutput::Cochanges { partners, .. } => {
+            assert_eq!(
+                partners.len(),
+                2,
+                "D-2 no-sort: page must contain exactly limit(2) partners, got {}",
+                partners.len()
+            );
+            // Jaccard DESC ordering: skip p1(0.9), p2(0.8); take p3(0.7), p4(0.6).
+            let jaccards: Vec<f64> = partners.iter().map(|p| p.jaccard).collect();
+            assert!(
+                (jaccards[0] - 0.7).abs() < 1e-9,
+                "D-2 no-sort: first partner after offset=2 must have jaccard≈0.7, got {}",
+                jaccards[0]
+            );
+            assert!(
+                (jaccards[1] - 0.6).abs() < 1e-9,
+                "D-2 no-sort: second partner after offset=2 must have jaccard≈0.6, got {}",
+                jaccards[1]
+            );
+        }
+        other => panic!("expected Cochanges, got {other:?}"),
+    }
+}
+
+/// D-2 / AC-404-12 (sort branch): blast-radius with a temporal sort flag and
+/// offset > 0 must apply the page AFTER re-sorting and set has_more=true via
+/// `pre_page_len > page.depth()` when the window was not capped.
+///
+/// Setup: 5 partners, each with a distinct risk score.  Sort: --risky (DESC).
+/// Page(limit=2, offset=2): depth = 4.  After resort the full 5 are within
+/// the resort_window floor (100), so window_capped=false.  pre_page_len=5 > 4
+/// → has_more=true via the second disjunct.  Partners returned are the 3rd and
+/// 4th by risk score (risk 0.5 and 0.3).
+#[test]
+fn blast_radius_sort_offset_nonzero_has_more_via_depth() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/hub.rs"), "").unwrap();
+
+    let (_db_dir, db) = temp_db();
+
+    // All Jaccard values above MIN_JACCARD_THRESHOLD (0.10).
+    // Deliberately invert Jaccard order vs risk order so re-sort is observable.
+    db.store_cochanges(&[
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/low_jac.rs".to_string(),
+            count: 1,
+            jaccard: 0.15,
+        }, // Jaccard rank 5 — risk rank 1
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/mid_low.rs".to_string(),
+            count: 1,
+            jaccard: 0.20,
+        }, // Jaccard rank 4 — risk rank 2
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/mid.rs".to_string(),
+            count: 1,
+            jaccard: 0.30,
+        }, // Jaccard rank 3 — risk rank 3
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/mid_high.rs".to_string(),
+            count: 1,
+            jaccard: 0.40,
+        }, // Jaccard rank 2 — risk rank 4
+        CochangeRow {
+            file_a: "src/hub.rs".to_string(),
+            file_b: "src/high_jac.rs".to_string(),
+            count: 1,
+            jaccard: 0.50,
+        }, // Jaccard rank 1 — risk rank 5
+    ])
+    .unwrap();
+
+    // Risk scores: deliberately inverted from Jaccard order (low_jac is most risky).
+    db.store_risks(&[
+        RiskRow {
+            file_path: "src/low_jac.rs".to_string(),
+            risk_score: 0.9,
+            total_commits: 10,
+            fix_commits: 9,
+            fix_density: 0.9,
+        },
+        RiskRow {
+            file_path: "src/mid_low.rs".to_string(),
+            risk_score: 0.7,
+            total_commits: 10,
+            fix_commits: 7,
+            fix_density: 0.7,
+        },
+        RiskRow {
+            file_path: "src/mid.rs".to_string(),
+            risk_score: 0.5,
+            total_commits: 10,
+            fix_commits: 5,
+            fix_density: 0.5,
+        },
+        RiskRow {
+            file_path: "src/mid_high.rs".to_string(),
+            risk_score: 0.3,
+            total_commits: 10,
+            fix_commits: 3,
+            fix_density: 0.3,
+        },
+        RiskRow {
+            file_path: "src/high_jac.rs".to_string(),
+            risk_score: 0.1,
+            total_commits: 10,
+            fix_commits: 1,
+            fix_density: 0.1,
+        },
+    ])
+    .unwrap();
+
+    let page = super::super::types::Page::new(2, Some(2));
+    let (output, has_more) = query_standalone(
+        Some(TemporalSort::Risky),
+        Some("src/hub.rs"),
+        page,
+        &db,
+        &root,
+    )
+    .unwrap();
+
+    // has_more: window_capped(5<=100→false) || pre_page_len(5) > depth(4) → true.
+    assert!(
+        has_more,
+        "D-2 sort: has_more must be true when pre_page_len(5) > depth(4)"
+    );
+
+    match output {
+        TemporalQueryOutput::Cochanges { partners, .. } => {
+            assert_eq!(
+                partners.len(),
+                2,
+                "D-2 sort: page must contain exactly limit(2) partners after re-sort+skip"
+            );
+            // After --risky re-sort: [low_jac(0.9), mid_low(0.7), mid(0.5), mid_high(0.3), high_jac(0.1)]
+            // Skip offset=2 → take [mid(0.5), mid_high(0.3)]
+            let names: Vec<&str> = partners
+                .iter()
+                .map(|p| {
+                    if p.file_a == "src/hub.rs" {
+                        p.file_b.as_str()
+                    } else {
+                        p.file_a.as_str()
+                    }
+                })
+                .collect();
+            assert_eq!(
+                names[0], "src/mid.rs",
+                "D-2 sort: first partner at offset=2 after --risky re-sort must be src/mid.rs \
+                 (risk=0.5), got {:?}",
+                names[0]
+            );
+            assert_eq!(
+                names[1], "src/mid_high.rs",
+                "D-2 sort: second partner at offset=2 after --risky re-sort must be \
+                 src/mid_high.rs (risk=0.3), got {:?}",
+                names[1]
+            );
+        }
+        other => panic!("expected Cochanges, got {other:?}"),
+    }
 }
