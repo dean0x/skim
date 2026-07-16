@@ -19,8 +19,8 @@ use std::time::Instant;
 
 use rskim_search::{
     CompositeWeights, FileId, IndexStats, NgramIndexReader, QueryEngine, SearchLayer, SearchQuery,
-    SearchResult, StructuralMetrics, intersect_and_rank, is_single_token, merge_layer_scores,
-    recompose_with_lexical,
+    SearchResult, StructuralMetrics, count_query_word_tokens, intersect_and_rank, is_single_token,
+    merge_layer_scores, recompose_with_lexical,
 };
 
 use super::manifest::FileManifest;
@@ -163,22 +163,105 @@ pub(super) fn weights_inert_notice(
 }
 
 // ============================================================================
-// Verify-mode selection (AD-393-5)
+// Verify-mode selection (AD-393-5, AD-403-1)
 // ============================================================================
 
-/// Select the [`VerifyMode`] for a query from `--phrase` / `--near` flags.
+/// AD-403-1: Select the [`VerifyMode`] for a query from `--phrase` / `--near` flags.
 ///
-/// Called on every query path (pure-lexical, compound text+AST, blast-radius).
-/// Single definition prevents the three call sites from drifting apart if a new
-/// `VerifyMode` variant is added.
-fn verify_mode_for(phrase: bool, near: Option<u32>) -> VerifyMode {
-    if phrase {
-        VerifyMode::Phrase
-    } else if let Some(n) = near {
-        VerifyMode::Near(n)
-    } else {
-        VerifyMode::Substring
+/// Exhaustive tuple match on `(phrase, near)` — no combination falls through to
+/// a winner branch.  Called on every query path (pure-lexical, compound text+AST,
+/// blast-radius).  Single definition prevents the three call sites from drifting
+/// apart when a new `VerifyMode` variant is added.
+///
+/// | phrase | near    | VerifyMode      | Semantic                              |
+/// |--------|---------|-----------------|---------------------------------------|
+/// | false  | None    | Substring       | trigram containment (default)         |
+/// | false  | Some(n) | Near(n)         | unordered total span ≤ n             |
+/// | true   | None    | Phrase          | ordered, consecutive positions        |
+/// | true   | Some(n) | PhraseNear(n)   | ordered, total span ≤ n (AD-403-2)   |
+pub(super) fn verify_mode_for(phrase: bool, near: Option<u32>) -> VerifyMode {
+    match (phrase, near) {
+        (false, None) => VerifyMode::Substring,
+        (false, Some(n)) => VerifyMode::Near(n),
+        (true, None) => VerifyMode::Phrase,
+        (true, Some(n)) => VerifyMode::PhraseNear(n),
     }
+}
+
+// ============================================================================
+// Positional-flag notices (AD-403-5, AD-403-6)
+// ============================================================================
+
+/// AD-403-5: Returns `Some(notice)` iff at least one positional flag was
+/// supplied AND there is no text query (has_text = `!text.trim().is_empty()`).
+///
+/// A SINGLE pre-dispatch guard in `mod.rs` (above `match flags.action`) emits
+/// this notice so EVERY arm — action arms (`--build`, `--rebuild`, `--stats`,
+/// etc.), standalone `--ast`, standalone temporal/blast, and the bare help arm
+/// — is covered.  Avoids per-arm silent drops (PF-006 class elimination).
+///
+/// Names only the flags actually supplied.  Notice is plain text on stderr on
+/// every path including `--json` — stdout stays byte-identical; exit 0.
+#[must_use]
+pub(super) fn positional_inert_notice(
+    phrase: bool,
+    near: Option<u32>,
+    has_text: bool,
+) -> Option<String> {
+    // Nothing to warn about when text is present — flags are honored on that path.
+    if has_text {
+        return None;
+    }
+    match (phrase, near) {
+        (true, Some(n)) => Some(format!(
+            "skim search: note: --phrase and --near {n} have no effect without a text query."
+        )),
+        (true, None) => {
+            Some("skim search: note: --phrase has no effect without a text query.".to_string())
+        }
+        (false, Some(n)) => Some(format!(
+            "skim search: note: --near {n} has no effect without a text query."
+        )),
+        (false, None) => None,
+    }
+}
+
+/// AD-403-6: Returns `Some(notice)` when a text query is present and `--near N`
+/// is structurally degenerate (extends the AD-393-9 precedent):
+///
+/// - Single-word query: `--near` cannot constrain anything — there is only one
+///   word token so proximity to "other words" is vacuous.
+/// - `N < word_count - 1`: k distinct strictly-ascending positions span at least
+///   k−1 word tokens, so no assignment can satisfy the window.  Silent zero
+///   results would be confusing; a stderr notice follows ADR-001 ("fail loud,
+///   never silently").
+///
+/// Not a hard error — exit code stays 0.  `text` is the trimmed query string.
+#[must_use]
+pub(super) fn near_diagnostic_notice(near: Option<u32>, text: &str) -> Option<String> {
+    let n = near?;
+    // Use the authoritative tokenizer (count_query_word_tokens / collect_word_spans /
+    // D10 / is_word_byte) so the word count matches what the positional predicates
+    // see.  Punctuation acts as a separator: "foo::bar" is 2 tokens, not 1.
+    let word_count = count_query_word_tokens(text);
+    if word_count == 0 {
+        return None; // no text to diagnose (covered by positional_inert_notice)
+    }
+    if word_count == 1 {
+        return Some(format!(
+            "skim search: note: --near {n} has no effect on a single-word query \
+             (there are no other words to be near)."
+        ));
+    }
+    // k distinct strictly-ascending word-token positions span at least k-1 ordinals.
+    if (n as usize) < word_count - 1 {
+        return Some(format!(
+            "skim search: note: --near {n} cannot match a {word_count}-word query: \
+             {word_count} distinct word tokens span at least {} positions.",
+            word_count - 1,
+        ));
+    }
+    None
 }
 
 // ============================================================================
@@ -229,12 +312,17 @@ pub(super) fn execute_query_with_manifest(
         return Ok(QueryOutput {
             query: config.text.clone(),
             total: 0,
+            has_more: false,
+            verify_mode: None,
             results: vec![],
             duration_ms: start.elapsed().as_millis() as u64,
             index_stats: None,
-            has_more: false,
         });
     }
+    // Compute the verify-mode label once for all QueryOutput sites in this function.
+    // AD-403-7: absent (None) for Substring so the JSON field is skipped for default
+    // callers, preserving byte-identity.
+    let vm_label = verify_mode_for(config.phrase, config.near).json_label();
 
     // AD-377-2 / PF-006: warn (once, on stderr) when `--weights` was supplied to a
     // path that ignores some or all of it.  This entry point handles the
@@ -483,10 +571,11 @@ pub(super) fn execute_query_with_manifest(
     Ok(QueryOutput {
         query: config.text.clone(),
         total,
+        has_more,
+        verify_mode: vm_label,
         results,
         duration_ms,
         index_stats: Some(stats),
-        has_more,
     })
 }
 
@@ -532,6 +621,8 @@ fn run_compound_query(
         config.limit >= 1,
         "config.limit must be >= 1 (CLI guarantee via parse_limit_value; see mod.rs)"
     );
+    // AD-403-7: compute once for all QueryOutput sites in this function.
+    let vm_label = verify_mode_for(config.phrase, config.near).json_label();
 
     // Build the AST FileId set once for O(1) membership tests below.
     let ast_fid_set: HashSet<FileId> = ast_scored_vec.iter().map(|&(fid, _)| fid).collect();
@@ -543,10 +634,11 @@ fn run_compound_query(
         return Ok(QueryOutput {
             query: config.text.clone(),
             total: 0,
+            has_more: false,
+            verify_mode: vm_label,
             results: vec![],
             duration_ms: ctx.start.elapsed().as_millis() as u64,
             index_stats: Some(ctx.stats),
-            has_more: false,
         });
     }
 
@@ -579,10 +671,11 @@ fn run_compound_query(
         return Ok(QueryOutput {
             query: config.text.clone(),
             total: 0,
+            has_more: false,
+            verify_mode: vm_label,
             results: vec![],
             duration_ms: ctx.start.elapsed().as_millis() as u64,
             index_stats: Some(ctx.stats),
-            has_more: false,
         });
     }
     // AD-356-2: size sq.limit to the candidate set.  filter_set.len() >= 1 is
@@ -688,10 +781,11 @@ fn run_compound_query(
     Ok(QueryOutput {
         query: config.text.clone(),
         total,
+        has_more,
+        verify_mode: vm_label,
         results,
         duration_ms,
         index_stats: Some(ctx.stats),
-        has_more,
     })
 }
 
@@ -727,6 +821,9 @@ fn run_blast_radius_composite_query(
     blast_file_ids: &Option<HashSet<FileId>>,
     ctx: QueryContext<'_>,
 ) -> anyhow::Result<QueryOutput> {
+    // AD-403-7: compute once for all QueryOutput sites in this function.
+    let vm_label = verify_mode_for(config.phrase, config.near).json_label();
+
     // Effective weights: use caller-supplied override or the six-signal #200 profile.
     let weights = config
         .composite_weights
@@ -936,10 +1033,11 @@ fn run_blast_radius_composite_query(
     Ok(QueryOutput {
         query: config.text.clone(),
         total,
+        has_more,
+        verify_mode: vm_label,
         results,
         duration_ms,
         index_stats: Some(ctx.stats),
-        has_more,
     })
 }
 

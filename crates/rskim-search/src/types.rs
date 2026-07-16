@@ -8,6 +8,7 @@
 //! - Error types use thiserror for ergonomic, typed handling
 //! - CLI/binary code in `crates/rskim/src/cmd/search.rs` handles all I/O
 
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -856,6 +857,19 @@ fn collect_word_spans(s: &str) -> Vec<(usize, usize)> {
     spans
 }
 
+/// Count the number of word tokens in a query string using the same tokenizer
+/// (`collect_word_spans` / D10 / `is_word_byte`) as the positional predicates.
+///
+/// Punctuation characters (`.`, `:`, `-`, etc.) act as separators, so
+/// `"foo::bar"` has two tokens and `"foo.bar baz"` has three — matching what
+/// `phrase_tokens_present` and `near_tokens_present` see when they evaluate
+/// the query.  This is the authoritative word-count for CLI diagnostics such as
+/// `near_diagnostic_notice`.
+#[must_use]
+pub fn count_query_word_tokens(s: &str) -> usize {
+    collect_word_spans(s).len()
+}
+
 /// AD-393-3: Token-exact phrase predicate. Tokenizes doc content with the SAME
 /// `word_token_indices` semantics as the indexer (see `collect_word_spans`) and
 /// requires each doc token to EQUAL the query word at consecutive ordinals —
@@ -960,8 +974,6 @@ pub fn near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<u
 
     let n = n as usize;
 
-    use std::collections::HashMap;
-
     // Build q_counts: for each unique query word, how many times it must appear
     // in a valid window (handles D11 distinct-position rule for duplicates).
     let mut q_counts: HashMap<&str, usize> = HashMap::new();
@@ -1062,6 +1074,180 @@ pub fn near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<u
         }
     }
     None
+}
+
+/// Greedy fixed-ceiling scan for ordered proximity matching.
+///
+/// For each base ordinal in `d[0]` (ascending), attempts to assign a strictly-ascending
+/// ordinal from `d[j]` for `j = 1..k-1`, all within the fixed ceiling
+/// `base.saturating_add(n_span)`. Returns `(base_ord, last_ord)` for the leftmost
+/// valid assignment, or `None` when no valid assignment exists.
+///
+/// **Sync note**: the analogous counting variant `count_phrase_near_alignments`
+/// (reader.rs) operates over `u32` token positions widened to `u64` and counts all
+/// valid assignments rather than returning a range. The two must be kept in sync;
+/// the AC-403-2 identity test suite (positional_verify.rs) is the oracle guard.
+/// Widening difference: `u32`→`u64` in reader.rs, `u32`→`usize` here (usize is the
+/// natural domain for in-memory word-ordinal indices).
+fn greedy_phrase_near_scan(d: &[Vec<usize>], n_span: usize) -> Option<(usize, usize)> {
+    debug_assert!(d.len() >= 2, "caller ensures k >= 2 before delegating here");
+    for &base in &d[0] {
+        // Fixed ceiling: once the base is chosen, ceiling = base + n_span is
+        // immutable for this attempt. Saturating add prevents usize overflow for
+        // very large n (e.g. u32::MAX cast to usize on 32-bit platforms).
+        let ceiling = base.saturating_add(n_span);
+        let mut prev = base;
+        let mut last_ord = base;
+        let mut ok = true;
+        for d_j in &d[1..] {
+            // partition_point(|&p| p <= prev) → index of first p strictly greater
+            // than prev. d_j is sorted ascending, so this is O(log |d_j|).
+            let pos = d_j.partition_point(|&p| p <= prev);
+            match d_j.get(pos) {
+                Some(&p) if p <= ceiling => {
+                    prev = p;
+                    last_ord = p;
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            return Some((base, last_ord));
+        }
+    }
+    None
+}
+
+/// AD-403-2: Ordered proximity predicate. Requires an assignment of one exact
+/// (byte-equal, case-sensitive) doc token per query word at STRICTLY ASCENDING
+/// ordinals (query order enforced), with total ordinal span
+/// `(last_ordinal − first_ordinal) ≤ n`.
+///
+/// Returns the byte range of the LEFTMOST valid base position with the leftmost
+/// valid continuation at each step (`first_matched_token.start ..
+/// last_matched_token.end`), or `None` when no valid assignment exists.
+///
+/// This is the single correctness authority for `--phrase --near N` at the CLI gate.
+///
+/// # Contract (D-1 sign-off 2026-07-15)
+///
+/// - **Ordered + total span ≤ N**: unlike bare `--near N` (unordered, total span),
+///   this predicate additionally requires STRICTLY ASCENDING ordinals — query word
+///   order is enforced. Same N budget as `near_tokens_present` (AD-393-4).
+/// - **MONOTONE**: results of `--phrase --near N` are a strict subset of bare
+///   `--near N` results (ordering is an added constraint only). Adding `--phrase`
+///   may only narrow the result set, never grow it.
+/// - **IDENTITY**: for a k-word query, `phrase_near_tokens_present(c, q, k-1)`
+///   returns the same `Option<Range>` as `phrase_tokens_present(c, q)`. K distinct
+///   strictly-ascending positions with total span ≤ k−1 forces them consecutive.
+///   This identity is **predicate-level** (gate / file-membership): the verify gate
+///   guarantees that the untruncated result set is identical for `--phrase` and
+///   `--phrase --near(k-1)`. It does NOT extend to reader-level rank order: when the
+///   query contains sub-3-byte words, `count_phrase_near_alignments` (reader.rs) uses
+///   a looser span bound than `count_phrase_alignments` (the exact ordinal offsets),
+///   so files may rank differently under the two paths. With a tight `--limit`, the
+///   surviving set post-verify can differ. See the D-1 rank-identity scope note in
+///   `count_phrase_near_alignments` (reader.rs) and the regression fixture
+///   `ac403_2_d1_rank_identity_gap_short_word` in positional_verify.rs.
+/// - **ALGORITHM (greedy, no DP)**: Under total span, the ceiling `p0 + N` is
+///   FIXED once the base is chosen. Greedy smallest-valid-next is therefore complete
+///   (no DP needed). Proof: greedy's `p_j` is pointwise minimal over all valid
+///   assignments sharing base `p0`; if any valid assignment satisfies
+///   `p_{k-1} ≤ p0 + N`, greedy's does. Cross-check on the discriminating example:
+///   `alpha xx beta xx gamma`, query "alpha beta gamma", ordinals 0,2,4, span=4.
+///   Greedy at N=4: takes alpha@0 → beta@2 → gamma@4, and 4 ≤ 0+4, MATCH.
+///   At N=2: gamma@4 > 0+2, NO MATCH. Agrees with ground truth at both ends.
+/// - **ANCHOR RULE (user-visible)**: returns the LEFTMOST base (smallest d[0]
+///   position that admits a valid assignment), with the leftmost valid continuation
+///   at each step. This drives the AD-393-6 snippet re-anchor (line_number /
+///   line_range / snippet.lines[].is_match in `--json` output). Nondeterminism
+///   here would be user-visible across binary versions.
+/// - **5 MiB limit**: inherits the MAX_VERIFY_SCAN_BYTES boundary; a match
+///   straddling that offset is a false negative. A wide `--near N` window makes
+///   this more reachable than for `--phrase` alone.
+/// - **Why not delegate from `phrase_tokens_present`**: that function is an
+///   allocation-free early-exit sliding scan. This predicate materializes per-word
+///   position state and cannot early-exit as cheaply. Delegating would regress the
+///   most-used positional hot path (CLAUDE.md: prefer &str slices over allocation in
+///   hot paths). The two coexist; the identity property above is the oracle guard.
+///   `phrase_tokens_present` stays BYTE-UNCHANGED.
+/// - **Intentional duplication of the greedy scan**: `greedy_phrase_near_scan` above
+///   (ordinal/usize domain, returns a byte range) is deliberately separate from
+///   `count_phrase_near_alignments` in reader.rs (token-position/u32→u64 domain,
+///   counts all valid assignments). The two must be kept in sync; the AC-403-2
+///   identity test suite (positional_verify.rs) is the oracle guard. See the mirror
+///   note in `count_phrase_near_alignments`.
+///
+/// Coexists with AD-393-4's total-span rule for bare `--near` — N has one meaning
+/// CLI-wide. Extends AD-393-3 / AD-393-4.
+///
+/// # Semantics
+///
+/// - **Case-sensitive byte-exact** (AD-355-3): consistent with sibling predicates.
+/// - **Query tokenization via `collect_word_spans`** (D10): same as reader and
+///   indexer — punctuation and non-ASCII are separators.
+/// - **Empty / whitespace-only query**: returns `None`.
+/// - **Empty content**: returns `None`.
+#[must_use]
+pub fn phrase_near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<usize>> {
+    let q_words = collect_word_spans(query);
+    if q_words.is_empty() {
+        return None; // empty/whitespace-only query
+    }
+    let c_words = collect_word_spans(content);
+    if c_words.is_empty() {
+        return None;
+    }
+
+    let k = q_words.len();
+
+    // Single O(C) pass: pre-populate word_positions with all query words then
+    // scan content once, using get_mut as a combined membership-check and append.
+    // This is O(k + C) vs the prior k-pass loop which was O(k*C).
+    let mut word_positions: HashMap<&str, Vec<usize>> = q_words
+        .iter()
+        .map(|&(qs, qe)| (&query[qs..qe], Vec::new()))
+        .collect();
+    for (ci, &(cs, ce)) in c_words.iter().enumerate() {
+        let cw = &content[cs..ce];
+        if let Some(positions) = word_positions.get_mut(cw) {
+            positions.push(ci);
+        }
+    }
+
+    // Build d[j] = sorted ordinals for query word j; early-out if any absent.
+    // Ordinals are already in ascending order (enumerated sequentially above).
+    let mut d: Vec<Vec<usize>> = Vec::with_capacity(k);
+    for &(qs, qe) in &q_words {
+        let qw = &query[qs..qe];
+        match word_positions.get(qw) {
+            Some(positions) => d.push(positions.clone()),
+            None => return None, // this query word absent from content
+        }
+    }
+
+    // k == 1: any occurrence of the single word is a valid match with span 0.
+    // Return the leftmost (first in d[0], which is the first occurrence).
+    if k == 1 {
+        let base = d[0][0];
+        let (cs, ce) = c_words[base];
+        return Some(cs..ce);
+    }
+
+    // Greedy fixed-ceiling scan (section 3.4 of plan; see greedy_phrase_near_scan).
+    // Widening: n is u32; cast to usize (the ordinal domain). saturating_add guards
+    // against overflow when n is very large (e.g. u32::MAX on 64-bit is safe; on a
+    // hypothetical 32-bit target it would saturate to usize::MAX, which is correct).
+    let n_span = n as usize;
+    greedy_phrase_near_scan(&d, n_span).map(|(base, last_ord)| {
+        // Leftmost base, leftmost continuation at each step → deterministic anchor.
+        let (cs, _) = c_words[base];
+        let (_, ce) = c_words[last_ord];
+        cs..ce
+    })
 }
 
 // ============================================================================

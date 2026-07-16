@@ -1911,10 +1911,11 @@ fn format_text_output_includes_both_hotspot_and_risk_tags() {
     let output = QueryOutput {
         query: "both".to_string(),
         total: 1,
+        has_more: false,
+        verify_mode: None,
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
-        has_more: false,
     };
 
     let mut buf = BufWriter::new(Vec::new());

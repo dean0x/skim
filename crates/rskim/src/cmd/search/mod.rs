@@ -107,6 +107,24 @@ pub(crate) fn run(
     }
     // ────────────────────────────────────────────────────────────────────────
 
+    // AD-403-5 / PF-006: single pre-dispatch guard for positional-flag inert notice.
+    //
+    // Placed here — BEFORE `match flags.action` — so it fires on every arm:
+    // Build/Rebuild/Update/Stats/InstallHooks/RemoveHooks (action arms), standalone
+    // --ast (empty query), standalone temporal/blast (empty query), and the bare help
+    // arm.  A whitespace-only query ("   " is not a text query per the mod.rs:123
+    // guard) is treated as no-text.
+    //
+    // `has_text` mirrors the dispatch condition at :123 exactly so the notice fires
+    // on the identical set of paths where the flags are structurally inert.  stderr
+    // only; stdout byte-identical; exit 0.
+    {
+        let has_text = matches!(&flags.action, SearchAction::Query(t) if !t.trim().is_empty());
+        if let Some(notice) = query::positional_inert_notice(flags.phrase, flags.near, has_text) {
+            eprintln!("{notice}");
+        }
+    }
+
     match flags.action {
         SearchAction::Build => run_build(false, &flags.root_override, analytics),
         SearchAction::Rebuild => run_build(true, &flags.root_override, analytics),
@@ -608,11 +626,12 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                     i += 1;
                 }
             }
+            // AD-403-6: When BOTH --phrase and --near are given, the composed semantic is
+            // PhraseNear(n) — ordered, total span <= n — NOT just phrase.  See
+            // verify_mode_for in query.rs (AD-403-1) for the exhaustive mapping.
             // v5 positional search (#392 / #380 Phase 2). Shell strips quotes, so
             // `skim search "alpha beta"` and `skim search alpha beta` both arrive as
             // text "alpha beta"; `--phrase` is the explicit contiguous-match signal.
-            // If BOTH `--phrase` and `--near` are given, phrase wins (stricter) —
-            // `search_positional` checks `query.phrase` first.
             "--phrase" => phrase = true,
             s if s == "--near" || s.starts_with("--near=") => {
                 let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--near")?;
@@ -1064,6 +1083,15 @@ fn run_query(
         (None, pre_loaded_manifest_from_refresh)
     };
 
+    // AD-403-6: degenerate --near diagnostic (fail loud, never silently — ADR-001).
+    // Emitted here on the text-query path ONLY (has_text is true by construction).
+    // Case (a): single-word query + --near N (N cannot constrain anything).
+    // Case (b): N < word_count - 1 (structurally unsatisfiable; returns empty results
+    // silently without this notice).  stderr only; exit 0.
+    if let Some(notice) = query::near_diagnostic_notice(flags.near, text) {
+        eprintln!("{notice}");
+    }
+
     // GAP-1: when a temporal sort is active, fetch a bounded candidate
     // window (limit*5 ≥ 100) so the re-sort can promote a temporally-hot file that
     // ranks beyond `--limit` in raw lexical/composite order; truncate to --limit
@@ -1283,6 +1311,33 @@ Options:
   --root PATH      Override project root (default: walk up to .git)
   -h, --help       Print this help message
 
+Positional query options:
+  --phrase         Require query words in order, adjacent (no gaps between tokens).
+                   Matching is case-sensitive and byte-exact. Punctuation is a word
+                   separator, so --phrase \"foo bar\" matches foo::bar() and foo bar.
+                   A single-word --phrase is a whole-word-exact search: --phrase alpha
+                   does NOT match 'alphabet'. Inert without a text query.
+
+  --near N         Require all query words within a window of N word tokens, in any
+                   order. N counts word tokens (not characters or lines). N >= 1.
+                   Example: --near 5 means the matched words span at most 5 positions.
+                   Inert without a text query.
+
+  --phrase --near N  Require query words in order (strictly ascending positions) AND
+                   total span ≤ N word tokens (same N as bare --near). Narrows
+                   --near N by additionally enforcing query word order; never grows
+                   the result set versus bare --near N.
+                   Identity: --phrase --near (k-1) == --phrase for a k-word query.
+                   Example: \"alpha beta gamma\" --phrase --near 4 matches if alpha,
+                   beta, and gamma appear in that order within 4 word-token positions.
+
+  --phrase and --near are honored on any text query including text + --ast and
+  text + --blast-radius. They are inert on all other arms (no text query).
+
+Language filter option:
+  --lang LANG      Filter results to files of a given language (e.g. --lang rust,
+                   --lang python). Accepted as language name or extension.
+
 AST structural query options (#199):
   --ast PATTERN    Filter/list by AST structural pattern.
                    PATTERN is a named catalog pattern or a containment query:
@@ -1292,13 +1347,13 @@ AST structural query options (#199):
                    or combine with a text query for intersection results.
 
   Limitations:
-    #283 — Single-node queries (e.g. --ast try_statement) are not yet supported;
+    #283 -- Single-node queries (e.g. --ast try_statement) are not yet supported;
            use a named pattern or a containment query instead.
 
-  --ast composes with every temporal flag (--hot / --cold / --risky /
-  --blast-radius), a text query, --limit, and --json.  When heatmap data is
-  absent, temporal sorts degrade gracefully: a warning is printed to stderr and
-  results are returned unsorted (exit 0).
+  --ast composes with: text query, --phrase, --near, --lang, --hot/--cold/--risky,
+  --blast-radius, --limit, --offset, and --json.  When heatmap data is absent,
+  temporal sorts degrade gracefully: a warning is printed to stderr and results are
+  returned unsorted (exit 0).
 
 AST standalone examples:
   skim search --ast try-catch                   Files with try/catch blocks

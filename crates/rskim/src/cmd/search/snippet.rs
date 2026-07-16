@@ -45,14 +45,35 @@ const MAX_VERIFY_SCAN_BYTES: usize = 5 * 1024 * 1024;
 ///   (uses `rskim_search::phrase_tokens_present`).
 /// - `Near(n)`: all query words must appear within `n` word-token positions of each
 ///   other, in any order (uses `rskim_search::near_tokens_present`).
+/// - `PhraseNear(n)`: all query words must appear in QUERY ORDER (strictly ascending
+///   ordinals) with total ordinal span ≤ `n` (uses
+///   `rskim_search::phrase_near_tokens_present`). AD-403-1 / AD-403-2.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum VerifyMode {
     /// Substring (trigram-intersection) verification — default pre-#393 mode.
     Substring,
     /// Exact phrase: words in contiguous order, no gaps (AD-393-3).
     Phrase,
-    /// Proximity: all words within `n` word-token positions (AD-393-4).
+    /// Proximity: all words within `n` word-token positions, unordered (AD-393-4).
     Near(u32),
+    /// Ordered proximity: words in query order, total span ≤ `n` positions (AD-403-1).
+    PhraseNear(u32),
+}
+
+impl VerifyMode {
+    /// JSON label for this mode in the `--json` search envelope (AD-403-7).
+    ///
+    /// Returns `None` for `Substring` (the default) so the field is omitted via
+    /// `#[serde(skip_serializing_if = "Option::is_none")]`, preserving byte-identical
+    /// JSON for all callers that do not use positional flags.
+    pub(super) fn json_label(self) -> Option<&'static str> {
+        match self {
+            VerifyMode::Substring => None,
+            VerifyMode::Phrase => Some("phrase"),
+            VerifyMode::Near(_) => Some("near"),
+            VerifyMode::PhraseNear(_) => Some("phrase_near"),
+        }
+    }
 }
 
 /// Outcome of attempting to extract a snippet.
@@ -404,12 +425,18 @@ pub(super) fn extract_snippet_and_verify(
 /// For `Substring`, calls `rskim_search::query_substring_present` directly
 /// (single-pass boolean) rather than the full `substring_first_anchor` which
 /// computes a tiered anchor only to have it discarded by the large-file caller.
-/// For `Phrase`/`Near`, delegates to `run_verify_predicate_with_range` (they are
-/// already single-pass and share the same code path as the snippet branch).
+/// For `Phrase`/`Near`/`PhraseNear`, delegates to `run_verify_predicate_with_range`
+/// (they are already single-pass and share the same code path as the snippet branch).
+///
+/// Explicit arms (no wildcard) so that adding a `VerifyMode` variant is
+/// compiler-caught here — prevents the silent totality-gap that existed before #403
+/// (AD-403-1).
 fn run_verify_predicate(text: &str, query: &str, mode: &VerifyMode) -> bool {
     match mode {
         VerifyMode::Substring => rskim_search::query_substring_present(text, query),
-        _ => run_verify_predicate_with_range(text, query, mode).0,
+        VerifyMode::Phrase | VerifyMode::Near(_) | VerifyMode::PhraseNear(_) => {
+            run_verify_predicate_with_range(text, query, mode).0
+        }
     }
 }
 
@@ -417,11 +444,12 @@ fn run_verify_predicate(text: &str, query: &str, mode: &VerifyMode) -> bool {
 ///
 /// For all modes, the anchor range is the content-derived byte span of the first
 /// match — used to re-anchor the snippet (AD-393-6 / AD-396-1):
-/// - `Substring` → `rskim_search::substring_first_anchor` (AD-396-1): returns
+/// - `Substring`   → `rskim_search::substring_first_anchor` (AD-396-1): returns
 ///   the content-derived anchor for the tiered policy (AD-396-2); `is_some()`
 ///   is logically equivalent to `query_substring_present` (AD-396-3).
-/// - `Phrase`    → `rskim_search::phrase_tokens_present` (exact ordered tokens).
-/// - `Near(n)`   → `rskim_search::near_tokens_present` (within n positions).
+/// - `Phrase`      → `rskim_search::phrase_tokens_present` (exact ordered tokens).
+/// - `Near(n)`     → `rskim_search::near_tokens_present` (within n positions, unordered).
+/// - `PhraseNear(n)` → `rskim_search::phrase_near_tokens_present` (ordered, total span ≤ n).
 fn run_verify_predicate_with_range(
     text: &str,
     query: &str,
@@ -431,6 +459,7 @@ fn run_verify_predicate_with_range(
         VerifyMode::Substring => rskim_search::substring_first_anchor(text, query),
         VerifyMode::Phrase => rskim_search::phrase_tokens_present(text, query),
         VerifyMode::Near(n) => rskim_search::near_tokens_present(text, query, *n),
+        VerifyMode::PhraseNear(n) => rskim_search::phrase_near_tokens_present(text, query, *n),
     };
     (opt.is_some(), opt)
 }
