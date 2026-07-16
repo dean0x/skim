@@ -65,7 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded-page stderr notice is emitted when `has_more=true` so agents can detect the last
   page without the unsound `len < limit` heuristic.  `has_more` is also present in the JSON
   envelope on standalone temporal queries.  At `--offset 0` output is byte-identical to
-  pre-#404 behavior (zero regression).
+  pre-#404 behavior for inputs with distinct temporal scores.  Equal-score results follow
+  an updated path-ASC tiebreak (resolution 8) that differs from the implicit path-DESC
+  ordering the old `.reverse()` produced — a negligible edge case in practice.
 
 ### Removed
 - **`skim search index` legacy positional subcommand** (#375) — the bareword `index`

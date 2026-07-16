@@ -976,14 +976,19 @@ fn format_temporal_text_empty_cochange_offset_page_message() {
     );
 }
 
-/// AC-404-11: `bounded_page_notice` contains the required "exceeds the temporal
-/// ranking window" phrasing and includes counts + next-offset remedy.
+/// AC-404-11: `bounded_page_notice` includes count, a "more results exist" hint,
+/// and the next --offset remedy.
+///
+/// The notice is emitted on ALL has_more paths — both the blast-radius ranking
+/// window cap and the pure `--hot`/`--cold`/`--risky` sentinel case (no ranking
+/// window involved), so it uses generic "more results exist" language rather than
+/// the earlier "results exceed the temporal ranking window" phrasing.
 #[test]
 fn bounded_page_notice_contains_required_phrasing() {
     let notice = bounded_page_notice(5, 0, 5);
     assert!(
-        notice.contains("exceed"),
-        "AC-404-11: notice must contain 'exceed' (ranking window phrase), got: {notice:?}"
+        notice.contains("more results exist"),
+        "AC-404-11: notice must say 'more results exist', got: {notice:?}"
     );
     assert!(
         notice.contains("showing 5"),

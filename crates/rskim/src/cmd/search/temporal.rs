@@ -610,18 +610,59 @@ fn resort_partners_by_temporal(
 ///
 /// Emitted when `has_more=true` from `query_standalone` — the result set was
 /// either capped at the temporal ranking window (`resort_window(page.limit())`)
-/// or more rows exist beyond the current page.  Goes to stderr (#377 seam,
-/// PF-006) so `--json` stdout stays byte-identical.
+/// or more rows exist beyond the current page (DB sentinel on pure
+/// `--hot`/`--cold`/`--risky` paths).  Goes to stderr (#377 seam, PF-006) so
+/// `--json` stdout stays byte-identical.
 ///
 /// `n` is the count of results in the current page, used so agents see exactly
-/// how many they received before the "more exist" hint.
+/// how many they received before the "more results exist" hint.
 pub(super) fn bounded_page_notice(n: usize, offset: usize, limit: usize) -> String {
     format!(
         "skim search: showing {n} result(s) (offset {offset}, limit {limit}); \
-         more exist — results exceed the temporal ranking window. \
+         more results exist. \
          Use --offset {} to page forward or increase --limit.",
         offset.saturating_add(limit)
     )
+}
+
+/// Return the empty-result message for a standalone temporal query page.
+///
+/// - At `offset 0`: "No {kind} data available." — the data source appears empty.
+/// - At `offset > 0`: "No {kind} results at offset N (try a smaller --offset)."
+///   — the page is exhausted, not the data source.
+///
+/// Used by `format_temporal_text` for the three typed arms (hotspot / coldspot /
+/// risk).  The co-change arm handles its own empty message because it includes a
+/// `target` path in both forms.
+fn page_empty_msg(kind: &str, page: Page) -> String {
+    if page.offset() > 0 {
+        format!(
+            "No {kind} results at offset {} (try a smaller --offset).",
+            page.offset()
+        )
+    } else {
+        format!("No {kind} data available.")
+    }
+}
+
+/// Return the 1-indexed range label for a temporal result page header.
+///
+/// - At `offset 0`: `first_page` (backward-compatible with golden fixtures,
+///   e.g. "top 5" or "5 files").
+/// - At `offset > 0`: "items {first}–{last}" using saturating arithmetic (PF-004).
+///
+/// `n` is the number of rows in the current page; it must equal `first_page`'s
+/// embedded count when `offset == 0` (no check — callers are responsible).
+fn page_range_label(first_page: &str, n: usize, page: Page) -> String {
+    if page.offset() == 0 {
+        first_page.to_string()
+    } else {
+        format!(
+            "items {}–{}",
+            page.offset().saturating_add(1),
+            page.offset().saturating_add(n)
+        )
+    }
 }
 
 /// Format a standalone temporal query result as human-readable text.
@@ -642,32 +683,16 @@ pub(super) fn format_temporal_text(
     match output {
         TemporalQueryOutput::Hotspots(rows) => {
             if rows.is_empty() {
-                if page.offset() > 0 {
-                    writeln!(
-                        w,
-                        "No hotspot results at offset {} (try a smaller --offset).",
-                        page.offset()
-                    )?;
-                } else {
-                    writeln!(w, "No hotspot data available.")?;
-                }
+                writeln!(w, "{}", page_empty_msg("hotspot", page))?;
                 return Ok(());
             }
             // Single newline after header (writeln! already appends \n; no
             // extra \n in the format string — that would insert a blank line).
             //
             // At offset 0: "top N" (backward-compatible with golden fixtures).
-            // At offset > 0: show the 1-indexed range so agents know position.
-            if page.offset() == 0 {
-                writeln!(w, "Hotspots (top {}, 90-day decay):", rows.len())?;
-            } else {
-                writeln!(
-                    w,
-                    "Hotspots (items {}–{}, 90-day decay):",
-                    page.offset() + 1,
-                    page.offset() + rows.len()
-                )?;
-            }
+            // At offset > 0: 1-indexed range via page_range_label (PF-004 saturating).
+            let range = page_range_label(&format!("top {}", rows.len()), rows.len(), page);
+            writeln!(w, "Hotspots ({range}, 90-day decay):")?;
             writeln!(w, "  Score  30d  90d  Path")?;
             writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
             for r in rows {
@@ -680,27 +705,11 @@ pub(super) fn format_temporal_text(
         }
         TemporalQueryOutput::Coldspots(rows) => {
             if rows.is_empty() {
-                if page.offset() > 0 {
-                    writeln!(
-                        w,
-                        "No coldspot results at offset {} (try a smaller --offset).",
-                        page.offset()
-                    )?;
-                } else {
-                    writeln!(w, "No coldspot data available.")?;
-                }
+                writeln!(w, "{}", page_empty_msg("coldspot", page))?;
                 return Ok(());
             }
-            if page.offset() == 0 {
-                writeln!(w, "Coldspots (top {}, least active):", rows.len())?;
-            } else {
-                writeln!(
-                    w,
-                    "Coldspots (items {}–{}, least active):",
-                    page.offset() + 1,
-                    page.offset() + rows.len()
-                )?;
-            }
+            let range = page_range_label(&format!("top {}", rows.len()), rows.len(), page);
+            writeln!(w, "Coldspots ({range}, least active):")?;
             writeln!(w, "  Score  30d  90d  Path")?;
             writeln!(w, "  ─────  ───  ───  ────────────────────────────────")?;
             for r in rows {
@@ -713,27 +722,11 @@ pub(super) fn format_temporal_text(
         }
         TemporalQueryOutput::Risks(rows) => {
             if rows.is_empty() {
-                if page.offset() > 0 {
-                    writeln!(
-                        w,
-                        "No risk results at offset {} (try a smaller --offset).",
-                        page.offset()
-                    )?;
-                } else {
-                    writeln!(w, "No risk data available.")?;
-                }
+                writeln!(w, "{}", page_empty_msg("risk", page))?;
                 return Ok(());
             }
-            if page.offset() == 0 {
-                writeln!(w, "Risk hotspots (top {}):\n", rows.len())?;
-            } else {
-                writeln!(
-                    w,
-                    "Risk hotspots (items {}–{}):\n",
-                    page.offset() + 1,
-                    page.offset() + rows.len()
-                )?;
-            }
+            let range = page_range_label(&format!("top {}", rows.len()), rows.len(), page);
+            writeln!(w, "Risk hotspots ({range}):\n")?;
             writeln!(w, "  Risk   Fix%   Fixes  Total  Path")?;
             writeln!(
                 w,
@@ -753,6 +746,8 @@ pub(super) fn format_temporal_text(
         }
         TemporalQueryOutput::Cochanges { target, partners } => {
             if partners.is_empty() {
+                // Co-change empty message includes the target path in both forms;
+                // inlined here because the target variable is only in scope here.
                 if page.offset() > 0 {
                     writeln!(
                         w,
@@ -764,22 +759,9 @@ pub(super) fn format_temporal_text(
                 }
                 return Ok(());
             }
-            if page.offset() == 0 {
-                writeln!(
-                    w,
-                    "Co-change partners of {} ({} files):\n",
-                    target,
-                    partners.len()
-                )?;
-            } else {
-                writeln!(
-                    w,
-                    "Co-change partners of {} (items {}–{}):\n",
-                    target,
-                    page.offset() + 1,
-                    page.offset() + partners.len()
-                )?;
-            }
+            let range =
+                page_range_label(&format!("{} files", partners.len()), partners.len(), page);
+            writeln!(w, "Co-change partners of {} ({range}):\n", target)?;
             writeln!(w, "  Jaccard  Count  Path")?;
             writeln!(w, "  ───────  ─────  ────────────────────────────────")?;
             for p in partners {
@@ -946,6 +928,28 @@ pub(super) fn format_temporal_json(
 // Combined text+temporal enrichment (Step 10)
 // ============================================================================
 
+/// Compare two hotspot/coldspot scores for a Hot-or-Cold sort.
+///
+/// - `Hot` → descending (higher score first).
+/// - `Cold` → ascending (lower score first).
+///
+/// Extracted to eliminate the byte-identical comparator body that previously
+/// appeared in both `apply_temporal_enrichment` (text+temporal path) and
+/// `enrich_ast_results` (standalone AST path).  Path-ASC tiebreak is applied
+/// by the caller via `.then_with(|| a.path.cmp(&b.path))`.
+#[inline]
+fn hotcold_score_cmp(score_a: f64, score_b: f64, sort: TemporalSort) -> std::cmp::Ordering {
+    if sort == TemporalSort::Hot {
+        score_b
+            .partial_cmp(&score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    } else {
+        score_a
+            .partial_cmp(&score_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
 /// Annotate and re-sort text search results with temporal data.
 ///
 /// - For `Hot`: annotate with hotspot scores, sort descending. Files absent
@@ -977,16 +981,8 @@ pub(super) fn apply_temporal_enrichment(
             // Tiebreak: score DESC (Hot) or ASC (Cold), then file_path ASC
             // unconditionally — unified total order matching SQL (resolution 8).
             results.sort_by(|a, b| {
-                let score_cmp = if sort == TemporalSort::Hot {
-                    hotspot_score(b)
-                        .partial_cmp(&hotspot_score(a))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                } else {
-                    hotspot_score(a)
-                        .partial_cmp(&hotspot_score(b))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                };
-                score_cmp.then_with(|| a.path.cmp(&b.path))
+                hotcold_score_cmp(hotspot_score(a), hotspot_score(b), sort)
+                    .then_with(|| a.path.cmp(&b.path))
             });
         }
         TemporalSort::Risky => {
@@ -1090,20 +1086,11 @@ pub(super) fn enrich_ast_results(
                     .and_then(|t| t.hotspot_score)
                     .unwrap_or(-1.0)
             };
-            // Tiebreak: score DESC (reverse for Hot, ASC for Cold), then
-            // file_path ASC unconditionally — unified total order matching
-            // SQL ORDER BY score DESC, file_path ASC (resolution 8, AD-7).
+            // Tiebreak: score DESC (Hot) or ASC (Cold), then file_path ASC
+            // unconditionally — unified total order matching SQL (resolution 8, AD-7).
             results.sort_by(|a, b| {
-                let score_cmp = if sort == TemporalSort::Hot {
-                    hotspot_score(b)
-                        .partial_cmp(&hotspot_score(a))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                } else {
-                    hotspot_score(a)
-                        .partial_cmp(&hotspot_score(b))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                };
-                score_cmp.then_with(|| a.path.cmp(&b.path))
+                hotcold_score_cmp(hotspot_score(a), hotspot_score(b), sort)
+                    .then_with(|| a.path.cmp(&b.path))
             });
         }
         TemporalSort::Risky => {
