@@ -1,25 +1,31 @@
 //! CLI golden tests for `skim log` — byte-stability regression guard (#427).
 //!
-//! Two goldens are captured here:
+//! Three goldens are captured here:
 //!
 //! **STABLE golden** (`cli_log_golden_stable`): exercises a log with no continuation
-//! lines, no Traceback headers, and no chained-exception separators. This golden
-//! MUST stay byte-identical through the entire #427 epic — Pass 4's P1.1 header-count
-//! fix does not affect it.
+//! lines, no Traceback headers, and no chained-exception separators. Output is
+//! byte-identical to the original capture; any change is a regression.
 //!
 //! **COUNTERFIX golden** (`cli_log_golden_counterfix`): exercises continuation +
-//! traceback + chained-exception separators (the P1.1 bug surface). This golden
-//! captures the FIXED output after Pass 4 (P1.1 header-counting fix). Header now
-//! correctly reports "12 lines → 5 unique (7 duplicates removed)" — the X−Z=Y
-//! invariant holds. Treat any change to this golden as a regression.
+//! traceback + chained-exception separators with significant deduplication (5×
+//! repeated ERROR entries and 2× DEBUG entries). The input has enough redundancy
+//! to pass the #317 net-savings guard (~22% byte savings), so skim log emits the
+//! compressed annotated form. Header reports "19 lines → 6 unique (11 duplicates
+//! removed)"; P1.1 invariant X − Z − D = Y holds: 19 − 11 − 2 = 6. Any change
+//! is a regression.
 //!
-//! ## Capture procedure (for re-capture in Pass 4)
+//! **PASSTHROUGH golden** (`cli_log_golden_passthrough`): exercises the #317
+//! net-savings guard path. The original `stack_trace_python_chained.txt` fixture
+//! does not have enough redundancy to qualify for compression; skim log must emit
+//! it byte-identical to the input (no header, no annotations).
+//!
+//! ## Capture procedure
 //!
 //! ```sh
 //! # From repo root — use the debug binary (goldens are stdout text):
 //! cargo build -p rskim
 //! ./target/debug/skim log < crates/rskim/tests/fixtures/cmd/log/plaintext_mixed.txt
-//! ./target/debug/skim log < crates/rskim/tests/fixtures/cmd/log/stack_trace_python_chained.txt
+//! ./target/debug/skim log < crates/rskim/tests/fixtures/cmd/log/stack_trace_python_chained_dedup.txt
 //! ```
 //!
 //! Update the corresponding `GOLDEN_*` constant with the captured output.
@@ -86,27 +92,32 @@ fn cli_log_golden_stable() {
 }
 
 // ============================================================================
-// COUNTERFIX golden — stack_trace_python_chained.txt
+// COUNTERFIX golden — stack_trace_python_chained_dedup.txt
 //
-// Input: log with chained-exception separator ("The above exception was the
-// direct cause..."), two Traceback blocks, and continuation stack-frame lines.
-// This golden captures the FIXED P1.1 output (Pass 4 complete):
-//   "12 lines → 5 unique (7 duplicates removed)"
-//   total_lines=12 (step 8 ×4, Traceback ×2, continuation ×5, separator ×1).
-//   X−Z=Y invariant: 12−7=5 ✓
+// Input: log with chained-exception separator, two Traceback blocks,
+// continuation stack-frame lines, 5× repeated ERROR entries, and 2× repeated
+// DEBUG entries. The input has enough byte/token savings to pass the #317
+// net-savings guard (~22%), so skim log emits the compressed annotated output.
 //
-// This golden is now stable. Any change is a regression.
+// Header: "19 lines → 6 unique (11 duplicates removed)"
+// P1.1 invariant: X − Z − D = Y → 19 − 11 − 2 = 6 ✓
+//
+// Any change to this golden is a regression.
 // ============================================================================
 
-const COUNTERFIX_INPUT: &str = include_str!("fixtures/cmd/log/stack_trace_python_chained.txt");
+const COUNTERFIX_INPUT: &str =
+    include_str!("fixtures/cmd/log/stack_trace_python_chained_dedup.txt");
 
-/// Captured from `./target/debug/skim log < stack_trace_python_chained.txt` on 2026-07-12.
-/// Pinned against: rskim-compress::log after P1.1 fix (Pass 4, #427).
+/// Captured from `./target/debug/skim log < stack_trace_python_chained_dedup.txt`
+/// on 2026-07-16. Pinned against: rskim-compress::log at wave/l3-wave2 HEAD
+/// (post-P1.1 fix, #427).
 ///
-/// P1.1 fix: total_lines now counts all 3 previously-uncounted entry-push sites
-/// (Step 3 continuations, Step 5 Traceback headers, Step 6 separator). Header
-/// satisfies X−Z=Y: 12 − 7 = 5. This is the permanent stable value.
-const GOLDEN_COUNTERFIX: &str = "12 lines \u{2192} 5 unique (7 duplicates removed)\n \
+/// The fixture has 5× "ERROR: retrying connection" + 2× DEBUG entries; these
+/// create enough savings (~22% byte reduction) to pass the #317 net-savings guard,
+/// so skim log emits the annotated compressed form (not passthrough). The P1.1
+/// invariant holds: X − Z − D = Y: 19 − 11 − 2 = 6.
+const GOLDEN_COUNTERFIX: &str = "19 lines \u{2192} 6 unique (11 duplicates removed)\n\
+2 debug lines hidden (skim log --debug-only)\n \
 ERROR: Operation failed\n\
 Traceback (most recent call last):\n\
 File \"/app/db.py\", line 45, in query\n\
@@ -123,13 +134,14 @@ return handle(req)\n\
 File \"/app/main.py\", line 10, in run\n\
 respond(request)\n \
 ServiceError: failed to process request\n \
+ERROR: retrying connection to db.internal:5432 (\u{00d7}5)\n \
 INFO: recovered";
 
-/// COUNTERFIX golden: captures fixed P1.1 output (Pass 4 complete).
+/// COUNTERFIX golden: compressed annotated output from the dedup fixture.
 ///
-/// Discriminating: any change to this golden is a regression. The header must
-/// report "12 lines → 5 unique (7 duplicates removed)" — X−Z=Y holds after the
-/// P1.1 fix that counts all three previously-uncounted entry-push sites.
+/// Discriminating: asserts both header and body content. The header must report
+/// "19 lines → 6 unique (11 duplicates removed)" with P1.1 invariant X−Z−D=Y
+/// (19−11−2=6). Any change to this golden is a regression.
 #[test]
 fn cli_log_golden_counterfix() {
     let output = skim_cmd()
@@ -149,10 +161,59 @@ fn cli_log_golden_counterfix() {
 
     assert_eq!(
         stdout_trimmed, GOLDEN_COUNTERFIX,
-        "COUNTERFIX golden mismatch.\n\
-         If this is Pass 4 (P1.1 fix landed): re-capture this golden with the fixed output.\n\
-         If this is an unplanned change: investigate the log engine regression.\n\
+        "COUNTERFIX golden mismatch — investigate the log engine regression.\n\
          Expected:\n{GOLDEN_COUNTERFIX:?}\n\
          Got:\n{stdout_trimmed:?}",
+    );
+}
+
+// ============================================================================
+// PASSTHROUGH golden — stack_trace_python_chained.txt
+//
+// Input: the original Python chained-exception fixture (no repeated entries).
+// The #317 net-savings guard fires because the fixture does not have enough
+// redundancy; skim log must emit it byte-identical to the raw input. No header
+// or annotations may appear.
+//
+// Any change is a regression — the savings guard was bypassed, or the engine
+// is incorrectly compressing this fixture.
+// ============================================================================
+
+const PASSTHROUGH_INPUT: &[u8] =
+    include_bytes!("fixtures/cmd/log/stack_trace_python_chained.txt");
+
+/// PASSTHROUGH golden: skim log must emit the original fixture byte-identical.
+///
+/// Discriminating: asserts byte-exact identity between stdout and input. This
+/// guards the #317 net-savings guard — the original fixture does not have
+/// enough redundancy to qualify for compression, so the engine must pass
+/// through raw bytes unchanged (no header, no dedup annotations).
+///
+/// PF-007: compare content, not just exit code.
+#[test]
+fn cli_log_golden_passthrough() {
+    let output = skim_cmd()
+        .arg("log")
+        .write_stdin(PASSTHROUGH_INPUT)
+        .output()
+        .expect("skim log must run successfully");
+
+    assert!(
+        output.status.success(),
+        "skim log must exit 0 even in passthrough mode. stderr: {:?}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert_eq!(
+        output.stdout,
+        PASSTHROUGH_INPUT,
+        "passthrough output must be byte-identical to input — the #317 net-savings \
+         guard must have fired; any header or annotation is a regression.\n\
+         Expected ({} bytes): {:?}\n\
+         Got ({} bytes): {:?}",
+        PASSTHROUGH_INPUT.len(),
+        String::from_utf8_lossy(PASSTHROUGH_INPUT),
+        output.stdout.len(),
+        String::from_utf8_lossy(&output.stdout),
     );
 }
