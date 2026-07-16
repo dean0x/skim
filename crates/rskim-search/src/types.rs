@@ -1135,8 +1135,8 @@ pub fn phrase_near_tokens_present(content: &str, query: &str, n: u32) -> Option<
     // Build d[j] = sorted list of ordinals (indices into c_words) where the
     // content token equals query word j (byte-exact).
     let mut d: Vec<Vec<usize>> = Vec::with_capacity(k);
-    for j in 0..k {
-        let qw = &query[q_words[j].0..q_words[j].1];
+    for &(qs, qe) in &q_words {
+        let qw = &query[qs..qe];
         let positions: Vec<usize> = c_words
             .iter()
             .enumerate()

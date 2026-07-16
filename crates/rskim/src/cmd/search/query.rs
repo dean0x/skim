@@ -208,24 +208,22 @@ pub(super) fn positional_inert_notice(
     near: Option<u32>,
     has_text: bool,
 ) -> Option<String> {
-    // Nothing to warn about when text is present (flags are honored)
-    // or when no positional flag was supplied.
-    if has_text || (!phrase && near.is_none()) {
+    // Nothing to warn about when text is present — flags are honored on that path.
+    if has_text {
         return None;
     }
-    let msg = match (phrase, near) {
-        (true, Some(n)) => format!(
+    match (phrase, near) {
+        (true, Some(n)) => Some(format!(
             "skim search: note: --phrase and --near {n} have no effect without a text query."
-        ),
+        )),
         (true, None) => {
-            "skim search: note: --phrase has no effect without a text query.".to_string()
+            Some("skim search: note: --phrase has no effect without a text query.".to_string())
         }
-        (false, Some(n)) => {
-            format!("skim search: note: --near {n} has no effect without a text query.")
-        }
-        (false, None) => return None, // guarded above; unreachable
-    };
-    Some(msg)
+        (false, Some(n)) => Some(format!(
+            "skim search: note: --near {n} has no effect without a text query."
+        )),
+        (false, None) => None,
+    }
 }
 
 /// AD-403-6: Returns `Some(notice)` when a text query is present and `--near N`
