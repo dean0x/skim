@@ -1985,28 +1985,62 @@ fn phrase_near_multi_base_first_fails_second_rescues() {
 // ── D-1 overflow-widening regression (low risk, but contractual) ─────────────
 
 /// D-1 overflow-widening: `phrase_near_tokens_present` with n == u32::MAX must
-/// not panic and must correctly match any ordered pair.
+/// not panic and must correctly accept ordered pairs at any word-ordinal gap.
 ///
-/// The implementation widens n to usize before `saturating_add`.  On 64-bit
-/// platforms usize is 64-bit so `base.saturating_add(u32::MAX as usize)` is
-/// always representable — no saturation occurs.  This test documents and
-/// exercises the widening contract; it also guards against a hypothetical
-/// cast-before-add regression (e.g. `(base + n) as usize` which could
-/// silently wrap on a 32-bit target).
+/// **What this test proves on 64-bit CI (the common CI target):**
+/// On a 64-bit host `usize` is 64-bit, so `n as usize` = 4_294_967_295 — well
+/// below `usize::MAX`.  `base.saturating_add(n_span)` never actually saturates
+/// here, and the 32-bit wrap regression the function name references cannot
+/// manifest.  The discriminating value of this test on 64-bit CI is therefore:
+///
+///   (a) **Span check is active**: n = 2 correctly rejects span-3 (ceiling 2 <
+///       ordinal 3), while n = u32::MAX accepts it — proving the ceiling
+///       comparison (`p ≤ ceiling`) is actually applied for large-n values and
+///       not silently bypassed.  Adjacent-only pairs (span 1) would pass even
+///       with n = 1, so they give no evidence the large-n value matters.
+///
+///   (b) **No panic**: base contract for any u32 input including boundary values.
+///
+/// **On 32-bit targets (hypothetical):**
+/// A cast-before-add regression (e.g. `(base + n as u32) as usize`) would
+/// overflow when `base > 0`, producing a tiny ceiling that incorrectly rejects
+/// matches.  `saturating_add` clamps to `usize::MAX` and avoids this.  That
+/// specific regression cannot be exercised on a 64-bit host; checks (a) and (b)
+/// above are the strongest test available on a 64-bit target.
 #[test]
 fn phrase_near_saturating_add_large_n_no_panic_d1() {
-    // Minimal case: adjacent pair, n = u32::MAX.
-    let result = phrase_near_tokens_present("alpha beta", "alpha beta", u32::MAX);
+    // Discriminating check (64-bit guard): span-3 pair with n = 2 (reject) vs
+    // n = u32::MAX (accept).
+    //
+    // Content:  "alpha x y beta"  → ordinals alpha(0), x(1), y(2), beta(3)
+    // Span:     beta(3) − alpha(0) = 3.
+    // n = 2: ceiling = 0.saturating_add(2) = 2; beta@3 > 2 → None.
+    // n = u32::MAX: ceiling = 0.saturating_add(u32::MAX as usize) >> 3 → Some.
+    let span3 = "alpha x y beta";
+    let reject = phrase_near_tokens_present(span3, "alpha beta", 2);
     assert!(
-        result.is_some(),
+        reject.is_none(),
+        "D-1 overflow-widening: n=2 must reject span-3 pair (span check is active)"
+    );
+    let accept = phrase_near_tokens_present(span3, "alpha beta", u32::MAX);
+    assert!(
+        accept.is_some(),
+        "D-1 overflow-widening: n=u32::MAX must accept span-3 pair without panic"
+    );
+
+    // Adjacent pair: original no-panic smoke check (span 1 ≤ u32::MAX, trivially passes).
+    let adj = phrase_near_tokens_present("alpha beta", "alpha beta", u32::MAX);
+    assert!(
+        adj.is_some(),
         "D-1 overflow-widening: n=u32::MAX must not panic and must match adjacent pair"
     );
 
     // Non-zero base: ordinal 1 as base, n = u32::MAX - 1.
-    // Ceiling = 1.saturating_add((u32::MAX - 1) as usize) — valid on 64-bit.
-    let result2 = phrase_near_tokens_present("zzz alpha beta", "alpha beta", u32::MAX - 1);
+    // Ceiling = 1.saturating_add((u32::MAX - 1) as usize) — valid on 64-bit
+    // (= 1 + 4_294_967_294 = 4_294_967_295, no overflow).
+    let nonzero = phrase_near_tokens_present("zzz alpha beta", "alpha beta", u32::MAX - 1);
     assert!(
-        result2.is_some(),
+        nonzero.is_some(),
         "D-1 overflow-widening: n=u32::MAX-1 with nonzero base must not panic and must match"
     );
 }
