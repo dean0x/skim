@@ -110,8 +110,10 @@ impl AstCoverage {
 ///
 /// `path` and `lang` are borrowed `&str` so the O(N) iterator in
 /// `FileManifest::ast_coverage` pays no allocation cost.  String heap
-/// allocations happen only for the ≤ `AST_COVERAGE_EXCLUDED_SAMPLE_CAP` (10)
-/// entries that are actually inserted into the bounded excluded sample.
+/// allocations for the bounded excluded sample happen only after the
+/// fast-reject guard inside [`insert_into_bounded_sample`], so at most
+/// `AST_COVERAGE_EXCLUDED_SAMPLE_CAP` (10) allocations occur across all
+/// size-excluded entries.
 #[derive(Debug, Clone, Copy)]
 pub struct CoverageEntry<'a> {
     /// Repo-relative path of the file.
@@ -191,18 +193,16 @@ pub fn ast_coverage<'a>(entries: impl IntoIterator<Item = CoverageEntry<'a>>) ->
 
                 // Bounded sample: keep the `AST_COVERAGE_EXCLUDED_SAMPLE_CAP`
                 // lexicographically smallest paths (AD-405-5 / PF-012).
-                // Allocate String only here (≤ cap = 10 times), not for every
-                // entry (AD-405-5 zero-clone iteration).
+                // Pass `&str` fields — String/AstExcludedFile are allocated
+                // INSIDE insert_into_bounded_sample, AFTER the fast-reject
+                // guard, so at most `cap` allocations occur across all
+                // size-excluded entries (AD-405-5 zero-clone iteration).
                 insert_into_bounded_sample(
                     &mut sample_map,
-                    entry.path.to_owned(),
-                    AstExcludedFile {
-                        path: entry.path.to_owned(),
-                        lang: lang_name.to_string(),
-                        size_bytes: sz,
-                        limit_bytes: cap,
-                        reason: "ast_size_cap".to_string(),
-                    },
+                    entry.path,
+                    lang_name,
+                    sz,
+                    cap,
                     AST_COVERAGE_EXCLUDED_SAMPLE_CAP,
                 );
             }
@@ -228,33 +228,50 @@ pub fn ast_coverage<'a>(entries: impl IntoIterator<Item = CoverageEntry<'a>>) ->
 // Internal helpers
 // ============================================================================
 
-/// Insert `path`→`file` into `map`, keeping at most `cap` lexicographically
-/// smallest entries (AD-405-5).
+/// Insert a new excluded-file entry into `map`, keeping at most `cap`
+/// lexicographically smallest paths (AD-405-5).
 ///
-/// Two-phase algorithm:
-/// 1. **Fast-reject** — if the map is already full and `path` is ≥ the current
-///    maximum, it would be evicted immediately after insertion, so skip it.
-/// 2. **Insert** — add the entry unconditionally.
+/// Accepts borrowed `path` and `lang` (`&str`) so that `String` heap
+/// allocation is deferred until AFTER the fast-reject guard.  For a repo with
+/// many size-excluded files only ≤ `cap` allocations ever occur (AD-405-5).
+///
+/// Three-phase algorithm:
+/// 1. **Fast-reject** — if the map is already full and `path` is ≥ the
+///    current maximum, it would be evicted immediately after insertion, so
+///    return early with zero allocation.
+/// 2. **Allocate + insert** — only now construct the owned `String` key and
+///    `AstExcludedFile` value and insert them.
 /// 3. **Evict** — if the map now exceeds `cap`, remove the lexicographically
 ///    largest entry.
 ///
 /// The result is that `map` always holds the `cap` smallest paths seen so far,
-/// with O(log cap) cost per call and O(cap) total allocation.
+/// with O(log cap) cost per call and O(cap) total allocation across all calls.
 fn insert_into_bounded_sample(
     map: &mut BTreeMap<String, AstExcludedFile>,
-    path: String,
-    file: AstExcludedFile,
+    path: &str,
+    lang: &str,
+    size_bytes: u64,
+    limit_bytes: u64,
     cap: usize,
 ) {
     // Phase 1: fast-reject when the map is full and path would be evicted.
+    // Comparison uses `&str` — no allocation at all for rejected entries.
     if map.len() >= cap
         && let Some(last) = map.keys().next_back()
-        && path >= *last
+        && path >= last.as_str()
     {
         return;
     }
-    // Phase 2: insert.
-    map.insert(path, file);
+    // Phase 2: allocate only after the fast-reject guard.
+    let owned_path = path.to_owned();
+    let file = AstExcludedFile {
+        path: owned_path.clone(),
+        lang: lang.to_owned(),
+        size_bytes,
+        limit_bytes,
+        reason: "ast_size_cap".to_owned(),
+    };
+    map.insert(owned_path, file);
     // Phase 3: evict the largest entry if we just exceeded the cap.
     if map.len() > cap
         && let Some(last_key) = map.keys().next_back().cloned()
