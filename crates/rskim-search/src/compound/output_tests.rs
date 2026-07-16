@@ -31,7 +31,7 @@ fn make_result_no_line(path: &str, score: f64) -> AstResult {
 #[test]
 fn format_text_empty_slice_writes_no_match_line() {
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_text(&[], "try-catch", "Try/catch blocks", &mut buf).unwrap();
+    format_ast_text(&[], "try-catch", "Try/catch blocks", 0, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     assert!(
         out.contains("no files match"),
@@ -61,14 +61,14 @@ fn format_json_empty_slice_writes_valid_json_total_zero() {
 fn format_text_returns_ok_for_empty_and_populated_slices() {
     // AC-API1: formatter returns Ok(()) for any well-formed input.
     let mut buf: Vec<u8> = Vec::new();
-    let r = format_ast_text(&[], "x", "", &mut buf);
+    let r = format_ast_text(&[], "x", "", 0, &mut buf);
     assert!(r.is_ok(), "empty slice must return Ok");
 
     // Populated (line-recovered) row must actually render its content, not just
     // return Ok: path:line suffix, the 3-decimal score, and the snippet line.
     let results = vec![make_result_with_line("src/foo.rs", 2.5, 10, "  fn foo() {")];
     let mut buf2: Vec<u8> = Vec::new();
-    format_ast_text(&results, "x", "", &mut buf2).expect("populated slice must return Ok");
+    format_ast_text(&results, "x", "", 0, &mut buf2).expect("populated slice must return Ok");
     let out = String::from_utf8(buf2).unwrap();
     assert!(
         out.contains("src/foo.rs:10"),
@@ -127,7 +127,7 @@ fn format_text_with_line_has_colon_suffix_and_snippet() {
         "  fn handle_auth() {",
     )];
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_text(&results, "try-catch", "Try/catch blocks", &mut buf).unwrap();
+    format_ast_text(&results, "try-catch", "Try/catch blocks", 0, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
 
     // Must contain path:line suffix (AC-F1 POSITIVE).
@@ -155,7 +155,7 @@ fn format_text_with_line_has_colon_suffix_and_snippet() {
 fn format_text_degraded_row_no_colon_line_suffix() {
     let results = vec![make_result_no_line("src/models/user.rs", 0.72)];
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_text(&results, "try-catch", "desc", &mut buf).unwrap();
+    format_ast_text(&results, "try-catch", "desc", 0, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
 
     // Must contain the path.
@@ -344,13 +344,58 @@ fn format_json_path_and_score_always_present() {
 }
 
 // ============================================================================
+// AC-404-10: page-aware empty messages (offset-aware formatting)
+// ============================================================================
+
+#[test]
+fn format_text_empty_offset_zero_says_no_match() {
+    // offset=0: first page, pattern never matched anything.
+    let mut buf: Vec<u8> = Vec::new();
+    format_ast_text(&[], "try-catch", "Try/catch blocks", 0, &mut buf).unwrap();
+    let out = String::from_utf8(buf).unwrap();
+    assert!(
+        out.contains("no files match"),
+        "offset=0 empty must say 'no files match'; got: {out}"
+    );
+    assert!(
+        !out.contains("beyond offset"),
+        "offset=0 empty must NOT say 'beyond offset'; got: {out}"
+    );
+}
+
+#[test]
+fn format_text_empty_offset_nonzero_says_no_more_results() {
+    // offset>0: paged past all results — distinct from "pattern never matched".
+    let mut buf: Vec<u8> = Vec::new();
+    format_ast_text(&[], "try-catch", "Try/catch blocks", 5, &mut buf).unwrap();
+    let out = String::from_utf8(buf).unwrap();
+    assert!(
+        out.contains("No more files match"),
+        "offset>0 empty must say 'No more files match'; got: {out}"
+    );
+    assert!(
+        out.contains("beyond offset 5"),
+        "offset>0 empty must include the offset value; got: {out}"
+    );
+    assert!(
+        out.contains("try a smaller --offset"),
+        "offset>0 empty must include remediation hint; got: {out}"
+    );
+    // Header must still be rendered (mirrors format_temporal_text).
+    assert!(
+        out.contains("AST pattern: try-catch"),
+        "header must be present even on empty offset>0 page; got: {out}"
+    );
+}
+
+// ============================================================================
 // Header formatting
 // ============================================================================
 
 #[test]
 fn format_text_header_contains_pattern_name() {
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_text(&[], "nested-loop", "Nested loop", &mut buf).unwrap();
+    format_ast_text(&[], "nested-loop", "Nested loop", 0, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     assert!(
         out.contains("AST pattern: nested-loop"),
@@ -361,7 +406,7 @@ fn format_text_header_contains_pattern_name() {
 #[test]
 fn format_text_header_without_description_has_no_em_dash() {
     let mut buf: Vec<u8> = Vec::new();
-    format_ast_text(&[], "containment-query", "", &mut buf).unwrap();
+    format_ast_text(&[], "containment-query", "", 0, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     // When description is empty, no em dash should appear.
     assert!(

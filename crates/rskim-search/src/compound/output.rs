@@ -219,7 +219,15 @@ struct AstJsonEnvelope<'a> {
 /// src/models/user.rs  [0.72]  try-catch
 /// ```
 ///
-/// Empty result → "no files match pattern" (exit 0, AC-F8).
+/// Empty result at `offset == 0` → "no files match pattern" (exit 0, AC-F8).
+/// Empty result at `offset > 0` → page-exhausted message (AC-404-10): the
+/// caller has paged past all results, so the message distinguishes "no data"
+/// from "paged too far".
+///
+/// Mirrors `format_temporal_text` (in `rskim`) which takes a `Page` for the
+/// same page-aware empty-message split; here `offset: usize` carries the one
+/// field that drives formatting without pulling the `Page` type across the
+/// crate boundary.
 ///
 /// # Errors
 ///
@@ -228,6 +236,7 @@ pub fn format_ast_text(
     results: &[AstResult],
     pattern_name: &str,
     description: &str,
+    offset: usize,
     w: &mut impl Write,
 ) -> io::Result<()> {
     if description.is_empty() {
@@ -238,7 +247,16 @@ pub fn format_ast_text(
     writeln!(w)?;
 
     if results.is_empty() {
-        writeln!(w, "no files match pattern {:?}", pattern_name)?;
+        if offset > 0 {
+            // AC-404-8 / AC-404-10: page-aware empty — "paged past all matches".
+            writeln!(
+                w,
+                "No more files match pattern {pattern_name:?} beyond offset {offset} \
+                 (try a smaller --offset)."
+            )?;
+        } else {
+            writeln!(w, "no files match pattern {:?}", pattern_name)?;
+        }
         return Ok(());
     }
 

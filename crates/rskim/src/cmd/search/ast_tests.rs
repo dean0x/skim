@@ -626,7 +626,7 @@ fn rebuild_yields_identical_fileid_ordering() {
 #[test]
 fn format_ast_text_empty_results_says_no_match() {
     let mut buf = BufWriter::new(Vec::new());
-    super::format_ast_text(&[], "try-catch", "Try/catch blocks", &mut buf).unwrap();
+    super::format_ast_text(&[], "try-catch", "Try/catch blocks", 0, &mut buf).unwrap();
     let out = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         out.contains("no files match"),
@@ -643,7 +643,7 @@ fn format_ast_text_degraded_rows_have_no_colon_line_suffix() {
         super::AstResult::ast_only("src/bar.rs".to_string(), 1.2, None, None),
     ];
     let mut buf = BufWriter::new(Vec::new());
-    super::format_ast_text(&results, "try-catch", "Try/catch blocks", &mut buf).unwrap();
+    super::format_ast_text(&results, "try-catch", "Try/catch blocks", 0, &mut buf).unwrap();
     let out = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         out.contains("src/foo.rs"),

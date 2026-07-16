@@ -537,23 +537,11 @@ fn write_ast_page_output(
         // AD-404-11 / D-5: has_more lets agents detect the last page without
         // relying on the unsound `len < limit` heuristic.
         format_ast_json(resolved, display_name, description, has_more, w)?;
-    } else if resolved.is_empty() && page.offset() > 0 {
-        // AC-404-8 / AC-404-10: page-aware empty — distinguish "paged past all
-        // matches" from "pattern never matched anything".
-        if description.is_empty() {
-            writeln!(w, "AST pattern: {display_name}")?;
-        } else {
-            writeln!(w, "AST pattern: {display_name} — {description}")?;
-        }
-        writeln!(w)?;
-        writeln!(
-            w,
-            "No more files match pattern {display_name:?} beyond offset {} \
-             (try a smaller --offset).",
-            page.offset()
-        )?;
     } else {
-        format_ast_text(resolved, display_name, description, w)?;
+        // AC-404-8 / AC-404-10: page-aware empty messages are now handled
+        // inside format_ast_text via the `offset` parameter, mirroring how
+        // format_temporal_text (temporal.rs) threads Page for the same split.
+        format_ast_text(resolved, display_name, description, page.offset(), w)?;
     }
 
     Ok(ExitCode::SUCCESS)
