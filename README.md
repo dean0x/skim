@@ -117,6 +117,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - **Availability**: prebuilt release binaries (GitHub Releases, npm, Homebrew) include `skim proxy`.
   Source builds opt in: `cargo build -p rskim --features proxy` or
   `cargo install --path crates/rskim --features proxy`. Default source builds are HTTP/TLS-free.
+  Note: `cargo install rskim` (crates.io) does not currently include the proxy subcommand (tracked in #453).
 - **Lossless-only egress guarantee** — all compression on the proxy path is information-preserving:
   - JSON minification (structural whitespace removal; value-equivalent, dup-key-safe)
   - Log deduplication with ×N counts and timestamp min–max ranges (all unique content preserved)
