@@ -35,6 +35,14 @@ use rskim_core::{Language, ast_size_limit};
 /// Maximum number of excluded files in the bounded sample (AD-405-5).
 pub const AST_COVERAGE_EXCLUDED_SAMPLE_CAP: usize = 10;
 
+/// Bundles the two `u64` measurements for a size-excluded file so that the
+/// positional parameters of [`insert_into_bounded_sample`] cannot be silently
+/// transposed.
+struct ExcludedSizes {
+    size_bytes: u64,
+    limit_bytes: u64,
+}
+
 /// A single file that is present in the index but exceeds the AST size cap.
 ///
 /// Fields are intentionally kept flat (no nesting) so the three JSON envelopes
@@ -111,9 +119,12 @@ impl AstCoverage {
 /// `path` and `lang` are borrowed `&str` so the O(N) iterator in
 /// `FileManifest::ast_coverage` pays no allocation cost.  String heap
 /// allocations for the bounded excluded sample happen only after the
-/// fast-reject guard inside [`insert_into_bounded_sample`], so at most
-/// `AST_COVERAGE_EXCLUDED_SAMPLE_CAP` (10) allocations occur across all
-/// size-excluded entries.
+/// fast-reject guard inside [`insert_into_bounded_sample`].  Because the
+/// caller iterates a `BTreeMap` in ascending (non-decreasing) path order,
+/// once the sample is full every subsequent entry is fast-rejected without
+/// allocating, so at most `AST_COVERAGE_EXCLUDED_SAMPLE_CAP` (10) allocations
+/// occur across all size-excluded entries.  For arbitrary insertion order the
+/// allocation count may be higher.
 #[derive(Debug, Clone, Copy)]
 pub struct CoverageEntry<'a> {
     /// Repo-relative path of the file.
@@ -195,14 +206,18 @@ pub fn ast_coverage<'a>(entries: impl IntoIterator<Item = CoverageEntry<'a>>) ->
                 // lexicographically smallest paths (AD-405-5 / PF-012).
                 // Pass `&str` fields — String/AstExcludedFile are allocated
                 // INSIDE insert_into_bounded_sample, AFTER the fast-reject
-                // guard, so at most `cap` allocations occur across all
-                // size-excluded entries (AD-405-5 zero-clone iteration).
+                // guard.  Because the BTreeMap-ascending iterator feeds paths
+                // in non-decreasing order, at most `cap` allocations occur
+                // across all size-excluded entries (AD-405-5 zero-clone
+                // iteration).
                 insert_into_bounded_sample(
                     &mut sample_map,
                     entry.path,
                     lang_name,
-                    sz,
-                    cap,
+                    ExcludedSizes {
+                        size_bytes: sz,
+                        limit_bytes: cap,
+                    },
                     AST_COVERAGE_EXCLUDED_SAMPLE_CAP,
                 );
             }
@@ -232,8 +247,16 @@ pub fn ast_coverage<'a>(entries: impl IntoIterator<Item = CoverageEntry<'a>>) ->
 /// lexicographically smallest paths (AD-405-5).
 ///
 /// Accepts borrowed `path` and `lang` (`&str`) so that `String` heap
-/// allocation is deferred until AFTER the fast-reject guard.  For a repo with
-/// many size-excluded files only ≤ `cap` allocations ever occur (AD-405-5).
+/// allocation is deferred until AFTER the fast-reject guard.  The two `u64`
+/// measurements are bundled in [`ExcludedSizes`] to prevent silent
+/// transposition at the call site.
+///
+/// **Allocation bound:** for non-decreasing (ascending) path input, once the
+/// sample is full every subsequent entry hits Phase 1 and returns without
+/// allocating, so at most `cap` allocations occur across all calls (AD-405-5).
+/// For arbitrary insertion order the allocation count may be higher — up to
+/// O(N) in the worst (strictly-descending) case.  The current caller feeds a
+/// `BTreeMap`-ascending iterator so the O(cap) bound holds in practice.
 ///
 /// Three-phase algorithm:
 /// 1. **Fast-reject** — if the map is already full and `path` is ≥ the
@@ -245,13 +268,12 @@ pub fn ast_coverage<'a>(entries: impl IntoIterator<Item = CoverageEntry<'a>>) ->
 ///    largest entry.
 ///
 /// The result is that `map` always holds the `cap` smallest paths seen so far,
-/// with O(log cap) cost per call and O(cap) total allocation across all calls.
+/// with O(log cap) cost per call.
 fn insert_into_bounded_sample(
     map: &mut BTreeMap<String, AstExcludedFile>,
     path: &str,
     lang: &str,
-    size_bytes: u64,
-    limit_bytes: u64,
+    sizes: ExcludedSizes,
     cap: usize,
 ) {
     // Phase 1: fast-reject when the map is full and path would be evicted.
@@ -267,8 +289,8 @@ fn insert_into_bounded_sample(
     let file = AstExcludedFile {
         path: owned_path.clone(),
         lang: lang.to_owned(),
-        size_bytes,
-        limit_bytes,
+        size_bytes: sizes.size_bytes,
+        limit_bytes: sizes.limit_bytes,
         reason: "ast_size_cap".to_owned(),
     };
     map.insert(owned_path, file);
@@ -370,6 +392,48 @@ mod tests {
         // Verify the 10 SMALLEST paths are kept.
         assert_eq!(paths[0], "file00.rs");
         assert_eq!(paths[9], "file09.rs");
+    }
+
+    /// AC-405-5: `insert_into_bounded_sample` fast-rejects paths that arrive in
+    /// ascending order once the sample cap is reached.
+    ///
+    /// The existing `bounded_sample_is_path_sorted_and_capped` test feeds paths
+    /// in descending order, so every over-cap entry evicts an existing one
+    /// (Phase 3) rather than triggering the Phase 1 early-return.  This test
+    /// uses strictly ascending paths to exercise the fast-reject branch:
+    /// once the sample is full, any new path >= current max must be rejected
+    /// without allocating an `AstExcludedFile`.
+    #[test]
+    fn bounded_sample_fast_rejects_ascending_order() {
+        use std::collections::BTreeMap;
+        let size_bytes = rskim_core::AST_SIZE_LIMIT_DEFAULT + 1;
+        let limit_bytes = rskim_core::AST_SIZE_LIMIT_DEFAULT;
+        const CAP: usize = 2;
+        let mut map: BTreeMap<String, AstExcludedFile> = BTreeMap::new();
+        // Insert 5 paths in strictly ascending (lexicographic) order.
+        // After the first CAP insertions the map is full; every subsequent
+        // path is lexicographically greater than the current maximum and must
+        // be fast-rejected (Phase 1 returns immediately).
+        for i in 0u64..5 {
+            insert_into_bounded_sample(
+                &mut map,
+                &format!("file{:02}.rs", i),
+                "rust",
+                ExcludedSizes {
+                    size_bytes,
+                    limit_bytes,
+                },
+                CAP,
+            );
+        }
+        // Only the CAP smallest paths should be retained.
+        assert_eq!(map.len(), CAP, "sample must be capped at {CAP}");
+        let keys: Vec<&str> = map.keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["file00.rs", "file01.rs"]);
+        // The fast-rejected entries (file02..file04) must be absent.
+        assert!(!map.contains_key("file02.rs"));
+        assert!(!map.contains_key("file03.rs"));
+        assert!(!map.contains_key("file04.rs"));
     }
 
     /// AC-405-14: Data-format files are NON-PARTICIPANTS (never counted).
