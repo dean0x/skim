@@ -257,7 +257,7 @@ jobs:
           echo "fn main() {}" | ./target/release/skim - --language=rust
           grep -q "HTTP reverse proxy" <<< "$(./target/release/skim proxy --help 2>&1)"
 
-      - name: Default-features lint (proxy gated off — #352)
+      - name: "Default-features lint (proxy gated off — #352)"
         run: cargo clippy -p rskim --all-targets -- -D warnings
 
       - name: Default-features gating tests (#352)
@@ -286,7 +286,7 @@ jobs:
   # ranges).  Verified via netsh interface ipv4 show excludedportrange protocol=tcp
   # on a standard Windows Server 2022 image.
   proxy-windows:
-    name: Proxy Windows Integration (AC17, #303)
+    name: "Proxy Windows Integration (AC17, #303)"
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
