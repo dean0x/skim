@@ -139,9 +139,10 @@ INFO: recovered";
 
 /// COUNTERFIX golden: compressed annotated output from the dedup fixture.
 ///
-/// Discriminating: asserts both header and body content. The header must report
-/// "19 lines → 6 unique (11 duplicates removed)" with P1.1 invariant X−Z−D=Y
-/// (19−11−2=6). Any change to this golden is a regression.
+/// Discriminating: asserts byte-equality to the golden constant AND verifies the
+/// P1.1 arithmetic invariant X − Z − D = Y at runtime by parsing actual stdout
+/// values (independent of the constant). Expected: 19 − 11 − 2 = 6.
+/// Any change to this golden is a regression.
 #[test]
 fn cli_log_golden_counterfix() {
     let output = skim_cmd()
@@ -164,6 +165,53 @@ fn cli_log_golden_counterfix() {
         "COUNTERFIX golden mismatch — investigate the log engine regression.\n\
          Expected:\n{GOLDEN_COUNTERFIX:?}\n\
          Got:\n{stdout_trimmed:?}",
+    );
+
+    // ── Runtime P1.1 arithmetic invariant: X − Z − D = Y ──────────────────
+    // Parse live stdout (not the constant) to independently verify the header
+    // arithmetic. Catches engine regressions that produce a "passing" golden
+    // by emitting a self-consistent but wrong header.
+    let lines: Vec<&str> = stdout_trimmed.lines().collect();
+
+    // Header line: "19 lines → 6 unique (11 duplicates removed)"
+    // '\u{2192}' is → (U+2192 RIGHTWARDS ARROW); split_once operates on char
+    // boundaries so the multi-byte sequence is handled correctly by Rust's str.
+    let header = lines.first().expect("stdout must have at least one line");
+    let (x_str, after_arrow) = header
+        .split_once(" lines \u{2192} ")
+        .expect("header must contain ' lines → '");
+    let (y_str, after_unique) = after_arrow
+        .split_once(" unique (")
+        .expect("header must contain ' unique ('");
+    let (z_str, _) = after_unique
+        .split_once(" duplicates removed)")
+        .expect("header must contain ' duplicates removed)'");
+    let x: i64 = x_str.trim().parse().expect("x (total lines) must be an integer");
+    let y: i64 = y_str.trim().parse().expect("y (unique lines) must be an integer");
+    let z: i64 = z_str.trim().parse().expect("z (duplicates removed) must be an integer");
+
+    // Annotation line: "2 debug lines hidden (skim log --debug-only)"
+    let debug_line = lines
+        .iter()
+        .find(|l| l.contains("debug lines hidden"))
+        .expect("output must contain a 'debug lines hidden' annotation line");
+    let (d_str, _) = debug_line
+        .trim()
+        .split_once(" debug lines hidden")
+        .expect("debug annotation must begin with an integer");
+    let d: i64 = d_str.trim().parse().expect("d (debug lines hidden) must be an integer");
+
+    // Guard against i64 underflow before the subtraction.
+    assert!(
+        x >= z + d,
+        "P1.1 precondition: x ({x}) must be >= z ({z}) + d ({d})"
+    );
+    assert_eq!(
+        x - z - d,
+        y,
+        "P1.1 arithmetic invariant X − Z − D = Y failed: \
+         {x} − {z} − {d} = {} ≠ {y}",
+        x - z - d,
     );
 }
 
