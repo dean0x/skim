@@ -412,6 +412,50 @@ fn identical_content_shares_one_cache_entry() {
 }
 
 // ============================================================================
+// A1: CACHE_FORMAT_VERSION == 2, magic unchanged (literal-pin guards)
+//
+// These tests pin the on-disk constants to their exact expected values so that
+// any silent revert (e.g. CACHE_FORMAT_VERSION back to 1) is immediately caught
+// by CI.  Without a literal-pin, the generic `version_mismatch_discards_cache`
+// test only verifies behaviour when the byte is corrupted at runtime; it cannot
+// detect a code-level revert of the constant itself.
+//
+// AD-405-14: CACHE_FORMAT_VERSION was bumped 1 -> 2 because a stale skcache
+// would silently re-serve empty AST entries for files that were over the old
+// 100 KiB cap but are now eligible under the 1 MiB cap.  Reverting to 1 is
+// the precise D-3 silent-empty-postings failure the ticket guards against.
+// ============================================================================
+
+/// Pin CACHE_FORMAT_VERSION to exactly 2.
+///
+/// If anyone reverts the constant to 1 (or bumps it prematurely to 3+), this
+/// test fails immediately, surfacing the regression before CI merges it.
+/// The `version_mismatch_discards_cache` test validates runtime behaviour but
+/// cannot catch a compile-time revert of this constant. (AD-405-14)
+#[test]
+fn a1_cache_format_version_is_2() {
+    assert_eq!(
+        CACHE_FORMAT_VERSION, 2,
+        "A1: CACHE_FORMAT_VERSION must be 2 (AD-405-14 bump from 1); \
+         bump this test when the format version is intentionally changed"
+    );
+}
+
+/// Pin CACHE_MAGIC to exactly b\"SKAC\".
+///
+/// A magic change would silently invalidate all existing skcache files for
+/// every user without a meaningful error.  Pin it so any unintentional change
+/// is caught immediately.
+#[test]
+fn a1_cache_magic_is_skac() {
+    assert_eq!(
+        CACHE_MAGIC, b"SKAC",
+        "A1: CACHE_MAGIC must remain b\"SKAC\"; \
+         bump this test if the magic is intentionally changed"
+    );
+}
+
+// ============================================================================
 // Empty cache helpers
 // ============================================================================
 

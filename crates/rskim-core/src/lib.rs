@@ -42,7 +42,9 @@
 // Public API — stable as of v1.0.0
 pub use types::{Language, Mode, Parser, Result, SkimError, TransformConfig, TransformResult};
 
-pub use ast_walk::{AstWalkConfig, AstWalkIter, AstWalkNode};
+pub use ast_walk::{
+    AST_SIZE_LIMIT_DEFAULT, AstWalkConfig, AstWalkIter, AstWalkNode, ast_size_limit,
+};
 
 /// Return the structural priority of a tree-sitter node kind (1–5).
 ///

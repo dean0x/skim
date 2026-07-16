@@ -375,6 +375,15 @@ pub(super) struct QueryOutput {
     /// Index statistics (included when available).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_stats: Option<rskim_search::IndexStats>,
+    /// AST size-coverage for the query invocation (D-5 / AD-405-9).
+    ///
+    /// Present ONLY on `--ast` paths (standalone and compound).  Absent on
+    /// pure-lexical queries (`None` → key omitted from JSON via
+    /// `skip_serializing_if`).  When present and not clean, the coverage
+    /// object carries the counts and bounded excluded-file sample; when
+    /// `is_clean()` the field is set to `None` (omit from JSON entirely).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_coverage: Option<rskim_search::AstCoverage>,
 }
 
 // ============================================================================
@@ -433,6 +442,13 @@ pub(super) struct IndexResult {
     pub ast_reextracted: u32,
     /// Wall-clock duration of the build.
     pub duration: Duration,
+    /// AST size-coverage computed from the manifest after the build (#405).
+    ///
+    /// Derived from the manifest before `save()` — zero extra I/O (AC-405-12).
+    /// Not `Serialize` (in-memory only; the struct is never written as JSON
+    /// directly — emission sites use it to compute a notice or pass it to
+    /// `build_stats_json` / `format_ast_json`).
+    pub ast_coverage: rskim_search::AstCoverage,
 }
 
 // ============================================================================

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### BREAKING
 
+- **`skim search` AST index format: v2 → v3 (1 MiB size cap + coverage policy)** (#405):
+  The AST structural index format version is bumped from 2 to 3 to reflect the raised
+  per-file size cap (100 KiB → 1 MiB) and the new coverage taxonomy.  Any existing
+  `ast_index.skidx` written by a prior version is automatically detected as stale and
+  triggers a cold rebuild on the next query (`check_staleness`).  No manual `--rebuild`
+  needed, but expect the rebuild to index more files (and produce a proportionally larger
+  `ast_index.skpost`) if your repo contains files between 100 KiB and 1 MiB.
+
+- **`skim search` AST extraction cache format: v1 → v2 (size-cap policy change)** (#405):
+  The per-file AST extraction cache (`ast_index.skcache`) format version is bumped from 1
+  to 2.  Cached entries computed under the old 100 KiB cap are silently discarded on the
+  next build; affected files are re-extracted at up to 1 MiB.  No user action required.
+
 - **`skim search` manifest format: v2 → v3 (FileId↔path ordering skew fix)** (#373) —
   Standalone `--ast` queries and all other FileId consumers (lexical, blast-radius, temporal)
   could return the wrong files whenever the project contained nested directories (e.g.
@@ -33,6 +46,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`auto_refresh_if_stale`).  To force an immediate rebuild: `skim search --rebuild`.
 
 ### Added
+- **`skim search` AST size cap raised 100 KiB → 1 MiB** (#405): Files up to 1 MiB are
+  now eligible for AST structural indexing (named patterns and containment queries via
+  `--ast`).  Files that exceed 1 MiB remain excluded and are fully text-searchable.
+  The cap is language-aware (`ast_size_limit(Language)`): data formats (JSON/YAML/TOML)
+  are never AST-indexed (`ast_size_limit` returns `None` for them — they are
+  non-participants, not uncapped participants).  Expect a proportionally
+  larger `ast_index.skpost` on repos with large source files.
+
+- **`ast_coverage` in `--ast` JSON output and `--stats --json`** (#405): The
+  `--ast` JSON envelopes (`AstJsonEnvelope`, `QueryOutput`) now include an `ast_coverage`
+  key when any files are excluded from AST indexing by the size cap.  The key is absent
+  when all files are within cap (`is_clean()`).  Fields: `size_eligible_files`,
+  `size_excluded_files`, `undetermined_files`, `excluded_by_lang` (per-language breakdown),
+  and `excluded` (bounded path-sorted sample of up to 10 excluded files).
+  `skim search --stats --json` applies the same omit-when-clean guard as the `--ast` surfaces.
+
+- **`skim search` coverage notice on `--build` / `--rebuild` / `--update` / `--ast` / `--stats` / first-ever build**
+  (#405): When files are excluded from AST indexing by the 1 MiB cap, a notice is printed
+  to stderr on every explicit build, refresh, standalone `--ast` query, `--stats` invocation,
+  and the first-ever build triggered by a pure-lexical query (NoIndex case).
+  The notice lists the file count and per-language breakdown, and is suppressed when all
+  files are within cap.  It does NOT fire on incremental self-heals (D-4 cadence).
+
+- **`skim search --stats` AST coverage section (text mode)** (#405): `skim search --stats`
+  now prints `ast eligible`, `ast excluded`, and (when non-zero) `ast undetermined` lines
+  after the existing stats when any files are excluded by the cap.  The section is omitted
+  on clean repos (no excluded or undetermined files), keeping `--stats` output byte-identical
+  to the pre-cap binary on clean codebases.
+
 - **`skim search --phrase --near N` composition**: `--phrase` and `--near N` may now be
   combined: the composed semantic is ordered (strictly ascending word positions) AND total span
   ≤ N word tokens - a `PhraseNear(N)` verify mode.  Previously `--near` was silently discarded

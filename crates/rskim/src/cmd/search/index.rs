@@ -456,6 +456,10 @@ impl<'cfg> Pipeline<'cfg> {
         // Record the current git HEAD in the manifest so staleness detection
         // can compare it on the next query without spawning a git subprocess.
         new_manifest.set_git_head(read_git_head(&self.config.root));
+        // AD-405-7: compute coverage BEFORE save() — new_manifest is fully
+        // populated here (all insert() calls are done) so the count is exact.
+        // Zero extra I/O: the manifest is already in memory (AC-405-12).
+        let ast_coverage = new_manifest.ast_coverage();
         new_manifest.save()?;
 
         // Merge walk-phase skips + producer sample, sort by stable key, truncate
@@ -474,6 +478,7 @@ impl<'cfg> Pipeline<'cfg> {
             ast_cache_hits,
             ast_reextracted,
             duration: self.start.elapsed(),
+            ast_coverage,
         })
     }
 
@@ -529,6 +534,8 @@ impl<'cfg> Pipeline<'cfg> {
             .map_err(|e| anyhow::anyhow!("AST cache save failed: {e}"))?;
         let mut manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
         manifest.set_git_head(read_git_head(&self.config.root));
+        // AD-405-7: empty manifest → all counts zero, coverage is clean.
+        let ast_coverage = manifest.ast_coverage();
         manifest.save()?;
         Ok(IndexResult {
             file_count: 0,
@@ -538,6 +545,7 @@ impl<'cfg> Pipeline<'cfg> {
             ast_cache_hits: 0,
             ast_reextracted: 0,
             duration: self.start.elapsed(),
+            ast_coverage,
         })
     }
 

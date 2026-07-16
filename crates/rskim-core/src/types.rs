@@ -148,6 +148,60 @@ impl Language {
         }
     }
 
+    /// Parse the canonical lowercase serialisation string produced by
+    /// [`Language::as_str`] back into a [`Language`].
+    ///
+    /// This is the **exact inverse** of `as_str()` — only the canonical
+    /// forms (e.g. `"cpp"`, not `"c++"`) are recognised.  Callers that need
+    /// broader matching (path extension, legacy aliases) should fall back to
+    /// [`Language::from_path`].
+    ///
+    /// # Maintenance pairing with `as_str`
+    ///
+    /// `as_str()` uses a wildcard-free exhaustive `match` (one arm per
+    /// variant).  The compiler therefore forces every new `Language` variant
+    /// to receive a canonical string there.  **This function must be updated
+    /// in the same commit** — the two functions are intentionally co-located
+    /// in this file so the pairing is obvious to anyone adding a variant.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rskim_core::Language;
+    ///
+    /// assert_eq!(Language::from_name("rust"), Some(Language::Rust));
+    /// assert_eq!(Language::from_name("cpp"),  Some(Language::Cpp));
+    /// assert_eq!(Language::from_name("c++"),  None); // alias, not canonical
+    /// assert_eq!(Language::from_name("unknown"), None);
+    /// ```
+    #[must_use]
+    pub fn from_name(s: &str) -> Option<Self> {
+        // Mirror as_str() 1-to-1: one arm per variant, no aliases.
+        // The `_ => None` arm is unavoidable for string matching (strings are
+        // not enums), but the listing above it is exhaustive by construction —
+        // it must match as_str() exactly.
+        match s {
+            "typescript" => Some(Self::TypeScript),
+            "javascript" => Some(Self::JavaScript),
+            "python" => Some(Self::Python),
+            "rust" => Some(Self::Rust),
+            "go" => Some(Self::Go),
+            "java" => Some(Self::Java),
+            "markdown" => Some(Self::Markdown),
+            "json" => Some(Self::Json),
+            "yaml" => Some(Self::Yaml),
+            "c" => Some(Self::C),
+            "cpp" => Some(Self::Cpp),
+            "toml" => Some(Self::Toml),
+            "csharp" => Some(Self::CSharp),
+            "ruby" => Some(Self::Ruby),
+            "sql" => Some(Self::Sql),
+            "kotlin" => Some(Self::Kotlin),
+            "swift" => Some(Self::Swift),
+            _ => None,
+        }
+    }
+
     /// Convert to tree-sitter Language
     ///
     /// ARCHITECTURE: This is the ONLY place where tree-sitter grammars are loaded.

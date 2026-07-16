@@ -723,6 +723,38 @@ impl FileManifest {
         self.entries.len()
     }
 
+    /// Compute [`rskim_search::AstCoverage`] from the **indexed** entries only.
+    ///
+    /// ## AD-405-6: two-tier language resolve
+    ///
+    /// `Language::from_name` tries the stored `lang` string first, then falls
+    /// back to `Language::from_path` on the stored `path`.  Only if BOTH fail
+    /// is the entry counted as UNDETERMINED.
+    ///
+    /// ## AC-405-14: walk-skipped files are disjoint
+    ///
+    /// Iterates **only `self.entries`** (indexed files).  `self.skipped_entries`
+    /// (files over the 5 MiB walk cap) is a SEPARATE `BTreeMap` and MUST NOT be
+    /// passed to the builder — those files are absent from every index and
+    /// therefore from `ast_coverage.excluded`.
+    ///
+    /// ## AC-405-12: zero extra I/O
+    ///
+    /// The manifest is already loaded; this is a pure in-memory pass.  No disk
+    /// reads are performed.
+    pub(super) fn ast_coverage(&self) -> rskim_search::AstCoverage {
+        // Borrow `path` and `lang` as `&str` — no allocation per entry.
+        // Heap allocation for the bounded sample occurs inside
+        // `insert_into_bounded_sample`, after its fast-reject guard, so at
+        // most AST_COVERAGE_EXCLUDED_SAMPLE_CAP (10) allocations occur across
+        // all size-excluded entries (AD-405-5 zero-clone iteration).
+        rskim_search::ast_coverage(self.entries.values().map(|e| rskim_search::CoverageEntry {
+            path: &e.path,
+            lang: &e.lang,
+            size: e.size,
+        }))
+    }
+
     /// Return the git HEAD that was recorded when the index was last built.
     ///
     /// `None` when the manifest was written by an older skim version that did

@@ -30,6 +30,7 @@
 //! ```
 
 pub mod ast_cache;
+pub mod coverage;
 mod extract;
 mod linearize;
 mod ngram;
@@ -55,6 +56,9 @@ pub type NodeKindId = u16;
 pub use ast_cache::{
     AstNgramCache, CACHE_FILENAME as AST_CACHE_FILENAME,
     CACHE_FORMAT_VERSION as AST_CACHE_FORMAT_VERSION, CachedAstEntry,
+};
+pub use coverage::{
+    AST_COVERAGE_EXCLUDED_SAMPLE_CAP, AstCoverage, AstExcludedFile, CoverageEntry, ast_coverage,
 };
 pub use extract::{
     AstBigramEntry, AstNgramSet, AstTrigramEntry, extract_ast_ngrams,

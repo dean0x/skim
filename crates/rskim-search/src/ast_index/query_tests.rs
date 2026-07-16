@@ -1733,7 +1733,12 @@ fn ac3_unknown_lang_id_still_scores_positively() {
 #[test]
 fn ac4_format_constants_unchanged() {
     use crate::ast_index::store::format::{FILE_META_SIZE, FORMAT_VERSION};
-    assert_eq!(FORMAT_VERSION, 2, "FORMAT_VERSION must remain 2 (AC4)");
+    // #405 (AD-405-15): FORMAT_VERSION bumped 2 -> 3 for the AST size-cap raise;
+    // FILE_META_SIZE is unchanged (v3 on-disk layout is byte-identical to v2).
+    assert_eq!(
+        FORMAT_VERSION, 3,
+        "FORMAT_VERSION must be 3 (AC4; #405 size-cap bump)"
+    );
     assert_eq!(FILE_META_SIZE, 15, "FILE_META_SIZE must remain 15 (AC4)");
 }
 

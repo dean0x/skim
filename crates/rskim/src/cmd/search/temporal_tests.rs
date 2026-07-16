@@ -1916,6 +1916,7 @@ fn format_text_output_includes_both_hotspot_and_risk_tags() {
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
+        ast_coverage: None,
     };
 
     let mut buf = BufWriter::new(Vec::new());

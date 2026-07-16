@@ -747,10 +747,10 @@ fn test_auto_refresh_returns_false_when_current() {
     build_index_in(dir.path(), &cache_dir);
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, _manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (outcome, _manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
 
     assert!(
-        !refreshed,
+        !outcome.refreshed(),
         "index is current — should not trigger a rebuild"
     );
 }
@@ -766,7 +766,7 @@ fn test_auto_refresh_returns_manifest_when_current() {
     build_index_in(dir.path(), &cache_dir);
 
     let analytics = TEST_ANALYTICS;
-    let (_refreshed, manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (_outcome, manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
 
     // The returned manifest should reflect the stored HEAD.
     assert_eq!(
@@ -793,9 +793,16 @@ fn test_auto_refresh_rebuilds_on_head_changed() {
     fs::write(git_dir.join("HEAD"), format!("{new_sha}\n")).unwrap();
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (outcome, manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
 
-    assert!(refreshed, "HEAD changed — index should be rebuilt");
+    assert!(
+        outcome.refreshed(),
+        "HEAD changed — index should be rebuilt"
+    );
+    assert!(
+        !outcome.is_first_build(),
+        "HEAD changed is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
+    );
     assert_eq!(
         manifest.stored_git_head(),
         Some(new_sha),
@@ -817,11 +824,15 @@ fn test_auto_refresh_rebuilds_on_no_stored_head() {
     create_fake_git_repo(dir.path(), &format!("{sha}\n"));
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (outcome, manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
 
     assert!(
-        refreshed,
+        outcome.refreshed(),
         "no stored HEAD + git present — index should be rebuilt"
+    );
+    assert!(
+        !outcome.is_first_build(),
+        "NoStoredHead is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
     );
     assert_eq!(
         manifest.stored_git_head(),
@@ -839,15 +850,15 @@ fn test_auto_refresh_non_git_project_no_rebuild_loop() {
     build_index_in(dir.path(), &cache_dir);
 
     let analytics = TEST_ANALYTICS;
-    let (first_refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
-    let (second_refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (first_outcome, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (second_outcome, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
 
     assert!(
-        !first_refreshed,
+        !first_outcome.refreshed(),
         "non-git project should not rebuild on first query"
     );
     assert!(
-        !second_refreshed,
+        !second_outcome.refreshed(),
         "non-git project should not rebuild on second query (no infinite loop)"
     );
 }
@@ -888,7 +899,7 @@ fn test_auto_refresh_hook_temporal_failure_does_not_fail_lexical() {
     );
 
     // The returned manifest must be valid (lexical index was built).
-    let (_refreshed, manifest) = result.unwrap();
+    let (_outcome, manifest) = result.unwrap();
     // Non-git project: stored_git_head is None (no git repo).
     assert_eq!(
         manifest.stored_git_head(),
@@ -963,10 +974,10 @@ fn test_auto_refresh_hook_populates_temporal_db_on_real_git_repo() {
         "auto_refresh_if_stale must succeed on a real git repo"
     );
 
-    let (refreshed, manifest) = result.unwrap();
+    let (outcome, manifest) = result.unwrap();
     assert!(
-        refreshed,
-        "index must have been built (NoIndex → refreshed=true)"
+        outcome.is_first_build(),
+        "index must have been built (NoIndex → FirstBuild)"
     );
     assert_eq!(
         manifest.stored_git_head(),
@@ -1031,13 +1042,13 @@ fn test_auto_refresh_temporal_success_does_not_affect_lexical_manifest() {
     // First refresh: builds index + populates temporal.db.
     let (refreshed1, manifest1) =
         auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
-    assert!(refreshed1, "first refresh must build the index");
+    assert!(refreshed1.refreshed(), "first refresh must build the index");
 
     // Second refresh: index is current — must not rebuild, manifest unchanged.
     let (refreshed2, manifest2) =
         auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
     assert!(
-        !refreshed2,
+        !refreshed2.refreshed(),
         "second refresh must not rebuild (index is current)"
     );
 
@@ -1149,7 +1160,7 @@ fn test_bug_b_auto_refresh_self_heals_deleted_temporal_db() {
 
     // First call: builds lexical+AST+temporal.
     let (refreshed1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
-    assert!(refreshed1, "first call must build the index");
+    assert!(refreshed1.refreshed(), "first call must build the index");
 
     let temporal_db_path = cache_dir.join("temporal.db");
     assert!(
@@ -1168,7 +1179,7 @@ fn test_bug_b_auto_refresh_self_heals_deleted_temporal_db() {
     // BUG B fix: must self-heal temporal.db before the Current early-return.
     let (refreshed2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
     assert!(
-        !refreshed2,
+        !refreshed2.refreshed(),
         "lexical must NOT be rebuilt (index is Current) even during temporal self-heal"
     );
 
@@ -1252,7 +1263,10 @@ fn test_bug_b_auto_refresh_self_heals_head_divergent_temporal_db() {
     // Second call: lexical is Current; temporal.db exists but HEAD-divergent.
     // BUG B fix: must detect and self-heal the divergent temporal.db.
     let (refreshed2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
-    assert!(!refreshed2, "lexical must NOT be rebuilt on Current branch");
+    assert!(
+        !refreshed2.refreshed(),
+        "lexical must NOT be rebuilt on Current branch"
+    );
 
     // Discriminating: META_GIT_HEAD must transition from planted_head to real head.
     let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
@@ -1310,7 +1324,7 @@ fn test_bug_b_no_rebuild_loop_when_temporal_is_current() {
     // Must NOT rebuild temporal.db (mtime must stay unchanged).
     let (refreshed2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
     assert!(
-        !refreshed2,
+        !refreshed2.refreshed(),
         "second call must not rebuild lexical (Current)"
     );
 
@@ -1384,7 +1398,10 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
         let result1 = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics);
         assert!(result1.is_ok(), "Case A: first call must return Ok");
         let (refreshed1, _) = result1.unwrap();
-        assert!(!refreshed1, "Case A: lexical must not be rebuilt (Current)");
+        assert!(
+            !refreshed1.refreshed(),
+            "Case A: lexical must not be rebuilt (Current)"
+        );
 
         let temporal_db_path = cache_dir.join("temporal.db");
         let exists_after_first = temporal_db_path.exists();
@@ -1392,7 +1409,10 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
         let result2 = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics);
         assert!(result2.is_ok(), "Case A: second call must return Ok");
         let (refreshed2, _) = result2.unwrap();
-        assert!(!refreshed2, "Case A: second call must not rebuild lexical");
+        assert!(
+            !refreshed2.refreshed(),
+            "Case A: second call must not rebuild lexical"
+        );
 
         let exists_after_second = temporal_db_path.exists();
         // Stability assertion: both-absent is the expected stable state.
@@ -1417,8 +1437,11 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
         let analytics = TEST_ANALYTICS;
 
         // First call: NoIndex → build lexical + write empty temporal.db.
-        let (refreshed1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
-        assert!(refreshed1, "Case B: first call must build index (NoIndex)");
+        let (outcome1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+        assert!(
+            outcome1.is_first_build(),
+            "Case B: first call must build index (NoIndex → FirstBuild)"
+        );
 
         let temporal_db_path = cache_dir.join("temporal.db");
         assert!(
@@ -1441,9 +1464,9 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
 
         // Second call: both lexical and temporal are Current.
         // MUST NOT rewrite temporal.db — mtime must be unchanged.
-        let (refreshed2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+        let (outcome2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
         assert!(
-            !refreshed2,
+            !outcome2.refreshed(),
             "Case B: second call must not rebuild lexical (Current)"
         );
 
@@ -1555,7 +1578,14 @@ fn test_auto_refresh_rebuilds_on_working_tree_edit() {
     let analytics = TEST_ANALYTICS;
     let (refreshed, manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
 
-    assert!(refreshed, "in-place edit must trigger a rebuild (AC1/AC5)");
+    assert!(
+        refreshed.refreshed(),
+        "in-place edit must trigger a rebuild (AC1/AC5)"
+    );
+    assert!(
+        !refreshed.is_first_build(),
+        "working-tree edit is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
+    );
     // Manifest was rewritten exactly once (mtime advanced).
     let mtime_after = fs::metadata(&manifest_path).unwrap().modified().unwrap();
     assert_ne!(
@@ -1587,8 +1617,12 @@ fn test_auto_refresh_indexes_new_working_tree_file() {
     let analytics = TEST_ANALYTICS;
     let (refreshed, _manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
     assert!(
-        refreshed,
+        refreshed.refreshed(),
         "a new working-tree file must trigger a rebuild (AC2)"
+    );
+    assert!(
+        !refreshed.is_first_build(),
+        "new working-tree file is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
     );
 
     let paths = manifest_paths(dir.path(), &cache_dir);
@@ -1625,7 +1659,14 @@ fn test_auto_refresh_reflects_delete_and_rename() {
 
     let analytics = TEST_ANALYTICS;
     let (refreshed, _manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
-    assert!(refreshed, "delete+add must trigger a rebuild (AC3)");
+    assert!(
+        refreshed.refreshed(),
+        "delete+add must trigger a rebuild (AC3)"
+    );
+    assert!(
+        !refreshed.is_first_build(),
+        "delete+add is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
+    );
 
     let paths = manifest_paths(dir.path(), &cache_dir);
     assert!(
@@ -1661,8 +1702,14 @@ fn test_auto_refresh_clean_tree_no_rebuild_idempotent() {
     let (r1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
     let (r2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
 
-    assert!(!r1, "clean tree: first call must not rebuild (AC7)");
-    assert!(!r2, "clean tree: second call must not rebuild (AC7)");
+    assert!(
+        !r1.refreshed(),
+        "clean tree: first call must not rebuild (AC7)"
+    );
+    assert!(
+        !r2.refreshed(),
+        "clean tree: second call must not rebuild (AC7)"
+    );
 
     let mtime_final = fs::metadata(&manifest_path).unwrap().modified().unwrap();
     assert_eq!(
@@ -1728,7 +1775,7 @@ fn test_auto_refresh_same_mtime_and_size_does_not_reindex() {
     let analytics = TEST_ANALYTICS;
     let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
     assert!(
-        !refreshed,
+        !refreshed.refreshed(),
         "same-size + same-second swap must NOT reindex (AD-379-2 pinned boundary, AC9)"
     );
 }
@@ -1760,8 +1807,12 @@ fn test_auto_refresh_size_change_with_preserved_mtime_reindexes() {
     let analytics = TEST_ANALYTICS;
     let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
     assert!(
-        refreshed,
+        refreshed.refreshed(),
         "size change with preserved mtime MUST reindex (size comparison, AC9a)"
+    );
+    assert!(
+        !refreshed.is_first_build(),
+        "size-change reindex is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
     );
 
     // Post-edit manifest carries a populated size for the file.
@@ -1796,8 +1847,12 @@ fn test_auto_refresh_non_git_working_tree_change_reindexes() {
     let analytics = TEST_ANALYTICS;
     let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
     assert!(
-        refreshed,
+        refreshed.refreshed(),
         "non-git working-tree change MUST reindex (AD-379-3, AC12)"
+    );
+    assert!(
+        !refreshed.is_first_build(),
+        "non-git working-tree change is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
     );
 }
 
@@ -1835,8 +1890,12 @@ fn test_auto_refresh_corrupt_head_with_working_tree_change_reindexes() {
     let analytics = TEST_ANALYTICS;
     let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
     assert!(
-        refreshed,
+        refreshed.refreshed(),
         "corrupt-HEAD + working-tree edit MUST reindex (AD-379-6, AC13)"
+    );
+    assert!(
+        !refreshed.is_first_build(),
+        "corrupt-HEAD reindex is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
     );
 }
 
@@ -1864,14 +1923,18 @@ fn test_auto_refresh_working_tree_change_single_rebuild_across_pair() {
 
     // First call rebuilds.
     let (r1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
-    assert!(r1, "first call must rebuild on the edit (AC14)");
+    assert!(r1.refreshed(), "first call must rebuild on the edit (AC14)");
+    assert!(
+        !r1.is_first_build(),
+        "working-tree change rebuild is incremental — must be Incremental, not FirstBuild (AC-405-8)"
+    );
     let mtime_after_first = fs::metadata(&manifest_path).unwrap().modified().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Second call: index is now Current (manifest carries fresh mtime+size).
     let (r2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
     assert!(
-        !r2,
+        !r2.refreshed(),
         "second call must NOT rebuild — index already refreshed (AC14 / AD-379-8)"
     );
     let mtime_after_second = fs::metadata(&manifest_path).unwrap().modified().unwrap();
@@ -1925,8 +1988,12 @@ fn test_auto_refresh_pre_379_manifest_self_heals_populates_mtime_size() {
     let analytics = TEST_ANALYTICS;
     let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
     assert!(
-        refreshed,
+        refreshed.refreshed(),
         "pre-#379 manifest (mtime/size None) must self-heal via one rebuild (AC10)"
+    );
+    assert!(
+        !refreshed.is_first_build(),
+        "pre-#379 self-heal is an incremental rebuild — outcome must be Incremental, not FirstBuild (AC-405-8)"
     );
 
     // The rewritten manifest now carries populated mtime AND size.

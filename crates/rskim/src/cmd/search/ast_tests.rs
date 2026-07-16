@@ -626,7 +626,7 @@ fn rebuild_yields_identical_fileid_ordering() {
 #[test]
 fn format_ast_text_empty_results_says_no_match() {
     let mut buf = BufWriter::new(Vec::new());
-    super::format_ast_text(&[], "try-catch", "Try/catch blocks", 0, &mut buf).unwrap();
+    super::format_ast_text(&[], "try-catch", "Try/catch blocks", 0, 0, &mut buf).unwrap();
     let out = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         out.contains("no files match"),
@@ -643,7 +643,7 @@ fn format_ast_text_degraded_rows_have_no_colon_line_suffix() {
         super::AstResult::ast_only("src/bar.rs".to_string(), 1.2, None, None),
     ];
     let mut buf = BufWriter::new(Vec::new());
-    super::format_ast_text(&results, "try-catch", "Try/catch blocks", 0, &mut buf).unwrap();
+    super::format_ast_text(&results, "try-catch", "Try/catch blocks", 0, 0, &mut buf).unwrap();
     let out = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         out.contains("src/foo.rs"),
@@ -675,7 +675,15 @@ fn format_ast_json_mode_is_ast_degraded_row_no_line_snippet_keys() {
         None,
     )];
     let mut buf = BufWriter::new(Vec::new());
-    super::format_ast_json(&results, "try-catch", "Try/catch blocks", false, &mut buf).unwrap();
+    super::format_ast_json(
+        &results,
+        "try-catch",
+        "Try/catch blocks",
+        false,
+        None,
+        &mut buf,
+    )
+    .unwrap();
     let out = String::from_utf8(buf.into_inner().unwrap()).unwrap();
 
     let v: serde_json::Value =
@@ -708,7 +716,7 @@ fn format_ast_json_mode_is_ast_degraded_row_no_line_snippet_keys() {
 fn format_ast_json_empty_results_is_valid_json() {
     // Empty result set → valid JSON with mode=="ast", total==0.
     let mut buf = BufWriter::new(Vec::new());
-    super::format_ast_json(&[], "try-catch", "Try/catch blocks", false, &mut buf).unwrap();
+    super::format_ast_json(&[], "try-catch", "Try/catch blocks", false, None, &mut buf).unwrap();
     let out = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     let v: serde_json::Value =
         serde_json::from_str(&out).expect("empty format_ast_json must produce valid JSON");
@@ -4533,11 +4541,11 @@ fn recover_line_matches_ground_truth_for_all_five_synthetic_patterns_ac13_394() 
 
 /// AC12 (#394): synthetic-pattern queries are query-time only — the AST index
 /// file is not rewritten across consecutive queries, and the on-disk
-/// FORMAT_VERSION remains at its initial value (2).
+/// FORMAT_VERSION remains at its initial value (3).
 ///
 /// The no-rebuild assertion uses `ast_index.skidx` mtime, NOT version equality:
 /// a staleness-triggered rebuild re-writes the index at the SAME FORMAT_VERSION
-/// (2), so `version_before == version_after` would be true whether or not a
+/// (3), so `version_before == version_after` would be true whether or not a
 /// rebuild fired — the mtime is the discriminating observable (reviewer finding).
 #[test]
 fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
@@ -4547,18 +4555,19 @@ fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
     let cache = tempfile::tempdir().unwrap();
     build_project_index(project.path(), cache.path());
 
-    // Pin the format version: the fix must NOT change FORMAT_VERSION.
+    // Pin the format version: the AC12 fix must NOT change FORMAT_VERSION.
     //
-    // Pinned to the literal 2 (not `AST_INDEX_FORMAT_VERSION`) so that a future
+    // Pinned to the literal 3 (not `AST_INDEX_FORMAT_VERSION`) so that a future
     // version bump fails this locally-runnable test, not only the CI-only lib
-    // test `format_tests.rs::a1_format_version_is_2`. Reading version_before
+    // test `format_tests.rs::a1_format_version_is_3`. Reading version_before
     // from the just-written index and comparing to the constant would produce a
     // tautological `X == X` that cannot detect a bump (reviewer finding).
+    // #405 (AD-405-15): the pin was updated 2 -> 3 alongside the size-cap bump.
     let version_before = rskim_search::AstIndexReader::index_version(cache.path())
         .expect("index_version must succeed after build");
     assert_eq!(
-        version_before, 2u16,
-        "AC12 (#394): AST index format version must be exactly 2 (literal pin). \
+        version_before, 3u16,
+        "AC12 (#394): AST index format version must be exactly 3 (literal pin). \
          If this fails, FORMAT_VERSION was bumped — check \
          rskim_search::AST_INDEX_FORMAT_VERSION and update this pin deliberately"
     );
@@ -4566,7 +4575,7 @@ fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
     // Capture the index file mtime BEFORE the queries — this is the
     // discriminating observable for "no rebuild fired" (version equality alone
     // cannot distinguish a rebuild from a no-op because rebuilds write the same
-    // FORMAT_VERSION=2).
+    // FORMAT_VERSION=3).
     let idx_path = cache.path().join("ast_index.skidx");
     let mtime_before = std::fs::metadata(&idx_path)
         .expect("ast_index.skidx must exist after build")
@@ -4604,6 +4613,325 @@ fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
         "AC12 (#394): ast_index.skidx mtime must not change across synthetic-pattern \
          queries — a changed mtime means a staleness rebuild fired, which must not \
          happen for a read-side / query-time-only fix"
+    );
+}
+
+// ============================================================================
+// Group 12: Byte-budget verify gate (AD-405-11)
+// ============================================================================
+
+/// Create a minimal project where every Rust file has only an empty function
+/// body.  These files match the "empty-function" synthetic AST pattern
+/// (bigram `__empty_body__ → function_item`), making them ideal for testing
+/// budget exhaustion without requiring large on-disk files.
+fn make_project_with_empty_functions() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Three files, each with a single empty Rust function body.
+    // tree-sitter Rust emits EMPTY_BODY for `fn foo() {}` (zero statements in the block).
+    fs::write(root.join("src/a.rs"), "fn empty_a() {}\n").unwrap();
+    fs::write(root.join("src/b.rs"), "fn empty_b() {}\n").unwrap();
+    fs::write(root.join("src/c.rs"), "fn empty_c() {}\n").unwrap();
+
+    dir
+}
+
+/// AD-405-11: Build a `FileManifest` with the same paths as `real_manifest`
+/// but with every entry's `size` field overridden to `size_bytes`.
+///
+/// Used to inject artificially large sizes into the manifest so that the
+/// byte-budget verify gate can be triggered with tiny on-disk files.
+/// The paths and all other fields are cloned from `real_manifest` so the
+/// FileId → path mapping in the AST index remains valid.
+fn make_inflated_manifest(
+    real_manifest: &super::super::manifest::FileManifest,
+    project: &Path,
+    cache: &Path,
+    size_bytes: u64,
+) -> super::super::manifest::FileManifest {
+    let mut m =
+        super::super::manifest::FileManifest::new(project.to_path_buf(), cache.to_path_buf());
+    for path in real_manifest.sorted_paths() {
+        if let Some(e) = real_manifest.lookup(path) {
+            m.insert(super::super::manifest::ManifestEntry {
+                size: Some(size_bytes),
+                ..e.clone()
+            });
+        }
+    }
+    m
+}
+
+/// AD-405-11 (unit): budget arithmetic constants are internally coherent.
+///
+/// - `AST_VERIFY_BYTES_PER_SLOT` equals 100 KiB (pre-raise per-slot constant).
+/// - `compute_verify_budget` saturates rather than wraps at u64::MAX.
+/// - `is_over_budget` returns `false` for a file sized exactly one slot within a
+///   one-slot budget (boundary: NOT strictly greater).
+/// - `is_over_budget` returns `true` for a file one byte over the slot.
+/// - A size-unknown entry is charged `AST_SIZE_LIMIT_DEFAULT` (1 MiB) — not
+///   `AST_VERIFY_BYTES_PER_SLOT` — so `is_over_budget` fires on the very first
+///   unknown-size candidate when limit is small (AD-405-11 conservative fallback).
+///
+/// The boundary and saturation assertions call the production `compute_verify_budget`
+/// and `is_over_budget` helpers rather than reimplementing the arithmetic inline,
+/// so any change to those helpers is caught immediately here.
+#[test]
+fn ast_verify_budget_constants_and_arithmetic_ad405_11() {
+    let slot = super::AST_VERIFY_BYTES_PER_SLOT;
+    assert_eq!(slot, 100 * 1024, "slot must be 100 KiB");
+
+    // Saturation: compute_verify_budget must clamp at u64::MAX, not wrap.
+    // window chosen so window * slot would overflow u64 with plain multiplication.
+    let big_window = (u64::MAX / slot + 2) as usize;
+    assert_eq!(
+        super::compute_verify_budget(big_window),
+        u64::MAX,
+        "compute_verify_budget must clamp at u64::MAX (saturating_mul, not wrapping)"
+    );
+
+    // Boundary: a file sized exactly one slot FITS in a 1-slot budget (NOT strictly greater).
+    let budget_1slot = super::compute_verify_budget(1);
+    assert_eq!(budget_1slot, slot, "1-slot budget must equal one slot");
+    assert!(
+        !super::is_over_budget(0, slot, budget_1slot),
+        "is_over_budget must return false when accrued == budget (boundary: NOT strictly >)"
+    );
+
+    // A file one byte over a slot EXCEEDS the 1-slot budget.
+    assert!(
+        super::is_over_budget(0, slot + 1, budget_1slot),
+        "is_over_budget must return true when accrued > budget"
+    );
+
+    // Size-unknown fallback is AST_SIZE_LIMIT_DEFAULT (1 MiB), not the slot constant.
+    // With window=1 (budget=100 KiB), a size-unknown file charges 1 MiB → exceeds budget.
+    let unknown_size = rskim_core::AST_SIZE_LIMIT_DEFAULT;
+    assert_eq!(
+        unknown_size,
+        1024 * 1024,
+        "AST_SIZE_LIMIT_DEFAULT must be 1 MiB"
+    );
+    assert!(
+        unknown_size > slot,
+        "size-unknown fallback ({unknown_size}) must be larger than one slot ({slot}) \
+         so a single unknown-size candidate exhausts a 1-slot budget"
+    );
+    assert!(
+        super::is_over_budget(0, unknown_size, budget_1slot),
+        "is_over_budget must return true for a size-unknown file (fallback = 1 MiB) \
+         against a 1-slot budget (100 KiB)"
+    );
+}
+
+/// AD-405-11 (integration): the byte-budget gate drops candidates when
+/// manifest-reported sizes push cumulative I/O over `window * slot`.
+///
+/// Strategy:
+/// - Build a project with 3 empty-function Rust files (all match "empty-function").
+/// - Build the real AST index.
+/// - Create a FAKE manifest where every file reports `2 * AST_VERIFY_BYTES_PER_SLOT`
+///   (200 KiB) — inflated well above the actual file size (< 20 bytes each).
+/// - Run `run_ast_standalone("empty-function", limit=1, ...)` with the fake manifest.
+///   For synthetic patterns: `ast_pool = limit.max(1) = 1`, `window = 1`,
+///   `verify_budget = 1 * 100 KiB = 100 KiB`.
+///   The pool has 1 candidate; its reported size (200 KiB) > budget (100 KiB) → DROPPED.
+///   budget_omitted = 1 → stderr notice emitted; result count = 0.
+/// - Run the SAME query with the REAL manifest (actual file sizes < 20 bytes).
+///   Same pool; file 0 (< 20 bytes) fits in budget → verify gate runs → 1 result.
+///
+/// The result-count difference (inflated: 0, real: 1) proves the budget gate
+/// actually drops candidates and reduces recall when sizes exceed the budget —
+/// the untested path before this test existed.
+#[test]
+fn ast_verify_budget_exhaustion_drops_candidates_ad405_11() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_empty_functions();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let real_manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Baseline: real manifest (tiny files) — limit=1 should yield 1 result.
+    // This confirms the pattern actually matches at least one file.
+    let mut baseline_out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "empty-function",
+        super::super::types::Page::first(1),
+        true, // JSON so result count is parseable
+        cache.path(),
+        &real_manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut baseline_out,
+    )
+    .expect("baseline run must succeed");
+    let baseline: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(baseline_out).unwrap()).unwrap();
+    let baseline_count = baseline["results"].as_array().unwrap().len();
+    assert!(
+        baseline_count >= 1,
+        "AD-405-11 setup: 'empty-function' must match at least one file in the fixture \
+         (got 0 — test environment may not be indexing empty Rust functions); \
+         cannot prove budget drop if no candidates exist"
+    );
+
+    // Budget-exhaustion run: inflated manifest (200 KiB per file > 100 KiB budget).
+    // With limit=1 → window=1 → budget = 100 KiB.
+    // The first (and only) pool candidate reports 200 KiB → budget exceeded → dropped.
+    let inflated = make_inflated_manifest(
+        &real_manifest,
+        project.path(),
+        cache.path(),
+        2 * super::AST_VERIFY_BYTES_PER_SLOT, // 200 KiB
+    );
+
+    let mut budget_out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "empty-function",
+        super::super::types::Page::first(1),
+        true, // JSON
+        cache.path(),
+        &inflated,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut budget_out,
+    )
+    .expect("budget-exhaustion run must return Ok (budget drop is not an error — AC-F8)");
+
+    let budget_result: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(budget_out).unwrap()).unwrap();
+    let budget_count = budget_result["results"].as_array().unwrap().len();
+
+    // DISCRIMINATING: with inflated sizes all candidates are budget-dropped.
+    // A broken gate (no budget enforcement) would let the candidate through
+    // and return the same count as the baseline, failing this assertion.
+    assert_eq!(
+        budget_count, 0,
+        "AD-405-11: all candidates must be budget-dropped when reported size (200 KiB) \
+         exceeds the 1-slot budget (100 KiB); got {budget_count} results \
+         (expected 0 — a non-zero count proves the budget gate is not enforced)"
+    );
+}
+
+/// AD-405-11 (integration): size-unknown manifest entries charge
+/// `AST_SIZE_LIMIT_DEFAULT` (1 MiB), not `AST_VERIFY_BYTES_PER_SLOT` (100 KiB).
+///
+/// Proves Finding 3 of the #405 review: the old fallback (`AST_VERIFY_BYTES_PER_SLOT`)
+/// was a 10x under-charge for size-unknown entries — `read_guarded` could read up
+/// to 1 MiB but the budget only reserved 100 KiB, allowing the stated I/O bound
+/// to be exceeded by up to ~10x.
+///
+/// Strategy:
+/// - Build a project with empty-function files.
+/// - Create a manifest where every entry has `size = None` (unknown).
+/// - Run with limit=1 → window=1 → budget = 1 * 100 KiB = 100 KiB.
+///   - With the FIXED fallback (1 MiB): 1 MiB > 100 KiB → candidate DROPPED → 0 results.
+///   - With the OLD fallback (100 KiB): 100 KiB NOT > 100 KiB (equal) → passes →
+///     1 result. (A regression here proves the old behaviour was restored.)
+/// - The 0-result outcome confirms the 1 MiB fallback is active.
+///
+/// Contrast with baseline (real manifest, real sizes) that yields 1 result at
+/// limit=1 — proving the pattern matches and the 0-result is budget-driven, not
+/// a false "no match."
+#[test]
+fn ast_verify_missing_size_charges_1mib_fallback_ad405_11() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_empty_functions();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let real_manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Helper: build a manifest with all sizes set to None (unknown).
+    let make_none_manifest = |real: &FileManifest| {
+        let mut m = FileManifest::new(project.path().to_path_buf(), cache.path().to_path_buf());
+        for path in real.sorted_paths() {
+            if let Some(e) = real.lookup(path) {
+                m.insert(super::super::manifest::ManifestEntry {
+                    size: None,
+                    ..e.clone()
+                });
+            }
+        }
+        m
+    };
+
+    // Setup guard: pattern must match at least one file at limit=11 (wide budget).
+    //
+    // Budget arithmetic:
+    //   AST_VERIFY_BYTES_PER_SLOT = 100 * 1024 = 102,400 bytes
+    //   AST_SIZE_LIMIT_DEFAULT    = 1024 * 1024 = 1,048,576 bytes
+    //   limit=11 → budget = 11 * 102,400 = 1,126,400 bytes
+    //   first size-unknown candidate: 0 + 1,048,576 = 1,048,576 NOT > 1,126,400 → PASSES
+    //
+    // Note: limit=10 is insufficient (10 * 102,400 = 1,024,000 < 1,048,576 → still dropped).
+    // limit=11 is the minimum that allows one size-unknown candidate through.
+    let mut wide_out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "empty-function",
+        super::super::types::Page::first(11), // wide: budget = 11 * 102,400 > 1 MiB
+        true,
+        cache.path(),
+        &make_none_manifest(&real_manifest),
+        None,
+        None,
+        None,
+        project.path(),
+        &mut wide_out,
+    )
+    .expect("wide-budget run must succeed");
+    let wide: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(wide_out).unwrap()).unwrap();
+    let wide_count = wide["results"].as_array().unwrap().len();
+    assert!(
+        wide_count >= 1,
+        "AD-405-11 setup: 'empty-function' with wide budget (1 MiB) must match \
+         at least one size-unknown file; got 0 — cannot prove narrow-budget drop"
+    );
+
+    // Narrow-budget run: limit=1 → window=1 → budget = 100 KiB.
+    // size-unknown fallback = 1 MiB (after the fix) → 1 MiB > 100 KiB → DROPPED.
+    let mut narrow_out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "empty-function",
+        super::super::types::Page::first(1), // narrow: budget = 100 KiB
+        true,
+        cache.path(),
+        &make_none_manifest(&real_manifest),
+        None,
+        None,
+        None,
+        project.path(),
+        &mut narrow_out,
+    )
+    .expect("narrow-budget run must return Ok (budget drop is not an error)");
+
+    let narrow: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(narrow_out).unwrap()).unwrap();
+    let narrow_count = narrow["results"].as_array().unwrap().len();
+
+    // DISCRIMINATING: 1 MiB fallback is active, so 1 MiB > 100 KiB → 0 results.
+    // If the OLD fallback (100 KiB) were active, 100 KiB NOT > 100 KiB → passes →
+    // the candidate reaches verify and would return 1 result (regression failure).
+    assert_eq!(
+        narrow_count, 0,
+        "AD-405-11: a size-unknown candidate (fallback = 1 MiB) must be budget-dropped \
+         at limit=1 (budget = 100 KiB); got {narrow_count} result(s) — \
+         a non-zero count means the old 100 KiB fallback is active (regression: \
+         the 1 MiB fallback fix is not in effect)"
     );
 }
 

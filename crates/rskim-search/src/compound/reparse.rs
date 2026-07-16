@@ -54,32 +54,32 @@
 //! Where a `line_range` is present it is the single anchor line `{n, n+1}`.
 //! Cross-mode field-name uniformity is tracked in #423.
 //!
-//! ## Re-parse size guard
+//! ## Re-parse size guard (AD-405-2)
 //!
-//! 100 KiB — the same cap used by `linearize.rs::MAX_FILE_SIZE`. Files larger
-//! than 100 KiB are not in the AST index (they were never linearised), so
-//! attempting to re-parse them would be dead range. If a file grew beyond 100 KiB
-//! since indexing, the mtime will differ and the caller's stale guard will degrade
-//! to file-level output before this function is called.
+//! 1 MiB — the same cap returned by `rskim_core::ast_size_limit` for every
+//! tree-sitter language.  Build-time (`linearize_source`) and query-time
+//! (`read_guarded`) now call the same function so the two gates are guaranteed
+//! to admit the identical set of files (AC-405-21).
+//!
+//! The #405 fix replaced a flat pre-language-resolution byte cap with the
+//! language-aware `ast_size_limit(lang)` call.  The old design applied a hard
+//! byte limit BEFORE language detection, so language-specific files in the
+//! 100 KiB–1 MiB band were indexed at build time (the language-specific cap
+//! applied there) but dropped at query time (the flat cap fired first).
+//! `read_guarded` now resolves the language FIRST, then calls `ast_size_limit(lang)?`,
+//! so the two gates are coupled to the same language-aware cap.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 
-use rskim_core::{AstWalkConfig, AstWalkIter, Language, Parser};
+use rskim_core::{AstWalkConfig, AstWalkIter, Language, Parser, ast_size_limit};
 
 use crate::ast_index::structural::is_synthetic_id;
 use crate::ast_index::{
     AstBigram, AstQuery, NodeKindId, extract_ast_ngrams_with_lines, linearize_source,
     synthetic_key_present, vocab_lookup,
 };
-
-/// Maximum file size for re-parse operations.
-///
-/// Matches `linearize.rs::MAX_FILE_SIZE` (100 KiB) so that only files that
-/// were eligible for AST indexing are re-parsed. Files above this cap degrade
-/// to file-level output (`None`).
-pub const MAX_REPARSE_FILE_BYTES: u64 = 100 * 1024;
 
 /// Find the first CST node matching the query's strict ancestor relationship.
 ///
@@ -131,7 +131,7 @@ pub const MAX_REPARSE_FILE_BYTES: u64 = 100 * 1024;
 /// ## Returns `None` for
 ///
 /// - Synthetic patterns (see AD-397-3).
-/// - File larger than [`MAX_REPARSE_FILE_BYTES`] (100 KiB).
+/// - File larger than the AST size cap (`rskim_core::ast_size_limit`, 1 MiB).
 /// - File unreadable, deleted, or non-UTF8.
 /// - Language has no tree-sitter grammar (JSON/YAML/TOML etc.).
 /// - Pattern's resolved n-grams do not match any real ancestor edge.
@@ -308,10 +308,20 @@ pub fn recover_line(
 
 /// Shared I/O guard prologue for all re-parse entry points.
 ///
+/// ## AD-405-2: Language resolved BEFORE size gate
+///
+/// `Language::from_path` is called BEFORE the size gate so that
+/// `ast_size_limit(lang)` returns the language-aware cap.  The old ordering
+/// applied a flat byte cap before language detection, silently dropping
+/// language-specific files in the 100 KiB–1 MiB band that the build-time gate
+/// had already admitted.  With this PR, the same
+/// `ast_size_limit` function is used at both build-time and query-time, so the
+/// two gates are guaranteed to admit the identical set (AC-405-21).
+///
 /// Consolidates the five-step precondition that every re-parse call site must
 /// satisfy before touching tree-sitter — `fs::metadata` existence, mtime
-/// staleness guard, `MAX_REPARSE_FILE_BYTES` size cap, `Language::from_path`
-/// detection, and `fs::read` — into a single owner so the precondition cannot
+/// staleness guard, `Language::from_path` detection, `ast_size_limit(lang)`
+/// size cap, and `fs::read` — into a single owner so the precondition cannot
 /// drift across call sites (DRY / single-source-of-truth).
 ///
 /// Returns `None` on any guard failure. Option-returning callers short-circuit
@@ -323,8 +333,8 @@ pub fn recover_line(
 ///
 /// 1. `fs::metadata` — fails fast for missing / unreadable paths.
 /// 2. Mtime guard — no read needed for stale files.
-/// 3. Size guard — no read needed for oversized files.
-/// 4. `Language::from_path` — rejects non-tree-sitter languages before reading.
+/// 3. `Language::from_path` — language is needed by the size gate.
+/// 4. Size gate (`ast_size_limit(lang)`) — no read needed for oversized files.
 /// 5. `fs::read` — only after all guards pass.
 fn read_guarded(path: &Path, manifest_mtime: Option<u64>) -> Option<(Language, Vec<u8>)> {
     let meta = std::fs::metadata(path).ok()?;
@@ -340,11 +350,18 @@ fn read_guarded(path: &Path, manifest_mtime: Option<u64>) -> Option<(Language, V
         }
     }
 
-    if meta.len() > MAX_REPARSE_FILE_BYTES {
+    // AD-405-2: resolve language FIRST so the size gate can be language-aware.
+    let lang = Language::from_path(path)?;
+
+    // Apply the single language-aware AST size cap.  ast_size_limit returns None
+    // for non-tree-sitter languages (JSON/YAML/TOML) — those are already excluded
+    // by the Language::from_path call above (which would also return None), but
+    // the `?` on ast_size_limit serves as a double-gate for defence-in-depth.
+    let cap = ast_size_limit(lang)?;
+    if meta.len() > cap {
         return None;
     }
 
-    let lang = Language::from_path(path)?;
     let content = std::fs::read(path).ok()?;
     Some((lang, content))
 }
@@ -426,9 +443,9 @@ fn recover_synthetic_line(
 ///
 /// - `true`  — at least one node in the CST matches the declared ancestor relationship.
 /// - `false` — returned (never panics) for: non-tree-sitter language, empty resolved
-///   match table, file > [`MAX_REPARSE_FILE_BYTES`], mtime mismatch vs
-///   `manifest_mtime`, unreadable/non-UTF8 file, parse failure, no matching ancestor
-///   edge.
+///   match table, file > the AST size cap (`rskim_core::ast_size_limit`, 1 MiB),
+///   mtime mismatch vs `manifest_mtime`, unreadable/non-UTF8 file, parse failure, no
+///   matching ancestor edge.
 ///
 /// ## AD-374-4: Relevance gate, not a #317 output cap
 ///

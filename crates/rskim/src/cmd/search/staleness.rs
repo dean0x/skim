@@ -407,7 +407,13 @@ pub(super) fn check_staleness(
     // AST self-heal: if the lexical index exists but the AST index is absent
     // or has an old format version, report stale so both rebuild atomically.
     // This handles: post-upgrade (v1→v2), crash between lexical.build() and
-    // ast.build(), and first run after adding --ast to an existing install.
+    // ast.build(), first run after adding --ast to an existing install, and
+    // coverage-policy changes that change which files are AST-indexed.
+    // #405 (AD-405-15): AST_INDEX_FORMAT_VERSION bumped 2→3 for the 100 KiB→1 MiB
+    // size-cap raise; a v2 index is stale and triggers a full cold rebuild
+    // (skcache CACHE_FORMAT_VERSION also bumped 1→2 in ast_cache.rs so the
+    // rebuild re-extracts every file from source rather than serving stale empty
+    // entries from the SHA-keyed skcache — see AD-405-14).
     let ast_index_path = cache_dir.join("ast_index.skidx");
     let ast_stale = if !ast_index_path.exists() {
         true
@@ -605,12 +611,53 @@ pub(super) fn try_rebuild_temporal_nonfatal(
 // Auto-refresh
 // ============================================================================
 
+/// What kind of build (if any) [`auto_refresh_if_stale`] performed.
+///
+/// Callers that only need to know *whether* a build ran should call
+/// [`RefreshOutcome::refreshed`].  Callers that need to distinguish a first
+/// build (no prior index) from an incremental refresh should use
+/// [`RefreshOutcome::is_first_build`].
+///
+/// The AST coverage notice cadence (D-4 / AC-405-8) is the primary consumer
+/// of this distinction: it fires on `FirstBuild` and is silent on `Incremental`.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RefreshOutcome {
+    /// Index was current; no rebuild was needed.
+    UpToDate,
+    /// First build: no prior index existed (`NoIndex` staleness variant).
+    /// The AST coverage notice **must** fire on this outcome (D-4 cadence).
+    FirstBuild,
+    /// Incremental refresh: the index existed but was stale (`HeadChanged`,
+    /// `NoStoredHead`, or `WorkingTreeChanged`).  The AST coverage notice
+    /// **must be silent** on this outcome (AC-405-8).
+    Incremental,
+}
+
+impl RefreshOutcome {
+    /// Returns `true` when any build ran — either first or incremental.
+    pub fn refreshed(&self) -> bool {
+        !matches!(self, RefreshOutcome::UpToDate)
+    }
+
+    /// Returns `true` **only** for the very first index build (`NoIndex`).
+    ///
+    /// Use this instead of [`refreshed`](Self::refreshed) when the caller
+    /// must distinguish a first build from an incremental refresh — e.g.
+    /// to decide whether to emit the AST coverage notice.
+    pub fn is_first_build(&self) -> bool {
+        matches!(self, RefreshOutcome::FirstBuild)
+    }
+}
+
 /// Check for staleness and rebuild the index if needed.
 ///
-/// Returns `(refreshed, manifest)` where:
-/// - `refreshed` is `true` when the index was rebuilt, `false` when already current.
-/// - `manifest` is the [`FileManifest`] loaded from disk after any rebuild, ready
-///   for callers (e.g. query execution) to use without a second load.
+/// Returns `(outcome, manifest)` where:
+/// - `outcome` is [`RefreshOutcome::UpToDate`] when the index was already
+///   current, [`RefreshOutcome::FirstBuild`] after a first-time (NoIndex)
+///   build, and [`RefreshOutcome::Incremental`] after any incremental refresh
+///   (HeadChanged / NoStoredHead / WorkingTreeChanged).
+/// - `manifest` is the [`FileManifest`] loaded from disk after any rebuild,
+///   ready for callers (e.g. query execution) to use without a second load.
 ///
 /// This is a convenience wrapper for the query path: call it before opening
 /// the reader so callers always get a fresh index.
@@ -629,7 +676,7 @@ pub(super) fn auto_refresh_if_stale(
     root: &Path,
     cache_dir: &Path,
     _analytics: &crate::analytics::AnalyticsConfig,
-) -> anyhow::Result<(bool, FileManifest)> {
+) -> anyhow::Result<(RefreshOutcome, FileManifest)> {
     use super::index::{build_index, build_index_rechecked};
     use super::types::IndexConfig;
 
@@ -665,7 +712,7 @@ pub(super) fn auto_refresh_if_stale(
             try_rebuild_temporal_nonfatal(root, cache_dir, Some(head), "self-heal");
         }
 
-        return Ok((false, manifest));
+        return Ok((RefreshOutcome::UpToDate, manifest));
     }
 
     // All rebuild paths share the same config.
@@ -676,12 +723,15 @@ pub(super) fn auto_refresh_if_stale(
         cache_dir_override: Some(cache_dir.to_path_buf()),
     };
 
+    // Determine whether this is a first build (NoIndex) before moving `staleness`
+    // into the match below, so the outcome can be tagged correctly afterward.
+    let is_no_index = matches!(staleness, StalenessCheck::NoIndex);
+
     // Tracks whether a pipeline build actually ran. Every arm below rebuilds
     // unconditionally EXCEPT WorkingTreeChanged, which may skip the rebuild when
     // a concurrent peer already refreshed the index (AD-379-8). When the build is
-    // skipped we must report `refreshed == false` and skip the post-rebuild
-    // temporal hook (nothing was rebuilt), so the steady-state no-op contract
-    // (AC7/AC14) holds.
+    // skipped we must report `UpToDate` and skip the post-rebuild temporal hook
+    // (nothing was rebuilt), so the steady-state no-op contract (AC7/AC14) holds.
     let did_build: bool = match staleness {
         StalenessCheck::Current => unreachable!(),
         StalenessCheck::NoIndex => {
@@ -746,7 +796,7 @@ pub(super) fn auto_refresh_if_stale(
     // the index is now Current: return without re-running the temporal hook.
     if !did_build {
         let manifest = FileManifest::load(root.to_path_buf(), cache_dir.to_path_buf())?;
-        return Ok((false, manifest));
+        return Ok((RefreshOutcome::UpToDate, manifest));
     }
 
     // After a rebuild, load the freshly written manifest for the caller.
@@ -767,7 +817,12 @@ pub(super) fn auto_refresh_if_stale(
     try_rebuild_temporal_nonfatal(root, cache_dir, current_head.as_deref(), "post-rebuild");
     // ─────────────────────────────────────────────────────────────────────────
 
-    Ok((true, manifest))
+    let outcome = if is_no_index {
+        RefreshOutcome::FirstBuild
+    } else {
+        RefreshOutcome::Incremental
+    };
+    Ok((outcome, manifest))
 }
 
 // ============================================================================

@@ -360,39 +360,73 @@ pub(super) fn run_ast_standalone(
     // AD-374-5: Non-tree-sitter files (JSON/TOML/YAML) return None/false and
     // are dropped here. AD-374-4: dropping is a relevance filter, not a #317
     // output cap; no `output::elision_marker` is required.
-    let verified_pool: Vec<VerifiedEntry> = pooled
-        .into_iter()
-        .filter_map(|(fid, score)| {
-            let idx = fid.0 as usize;
-            let rel_path = match sorted.get(idx) {
-                Some(p) => p,
-                None => {
-                    // Out-of-range FileId — warn and drop (ADR-006 counterpart).
-                    eprintln!(
-                        "skim search: AST verify gate warning: FileId({idx}) is out of \
-                         manifest range (manifest has {} files) — index may be out of sync; \
-                         run `skim search --rebuild`",
-                        sorted.len()
-                    );
-                    return None;
-                }
-            };
-            let abs_path = root.join(rel_path);
-            let stored_mtime = manifest.lookup(rel_path).and_then(|e| e.mtime);
+    //
+    // AD-405-11: byte-budget gate — bounds query-time I/O to the pre-raise total
+    // (window * AST_VERIFY_BYTES_PER_SLOT), so adding 1 MiB-eligible files does not
+    // inflate verify-gate latency past the AC11 <500ms target.
+    let verify_budget = compute_verify_budget(window);
+    let mut bytes_verified: u64 = 0;
+    let total_candidates = pooled.len();
+    let mut budget_omitted: usize = 0;
+    let mut verified_pool: Vec<VerifiedEntry> = Vec::with_capacity(window.min(total_candidates));
 
-            if is_synthetic {
-                // Synthetic: two-function flow (AND-semantics gate, AC-10/#419 preserved).
-                // `then_some` (eager) not `then` (lazy): the tuple is a trivial
-                // value, so a closure is unnecessary (clippy::unnecessary_lazy_evaluations).
-                pattern_occurs_in_file(&abs_path, &query, stored_mtime)
-                    .then_some((fid, score, None))
-            } else {
-                // Real-node: find_first_strict_match (gate + anchor in one pass).
-                find_first_strict_match(&abs_path, &query, stored_mtime)
-                    .map(|anchor| (fid, score, Some(anchor)))
+    for (fid, score) in pooled {
+        let idx = fid.0 as usize;
+        let rel_path = match sorted.get(idx) {
+            Some(p) => p,
+            None => {
+                // Out-of-range FileId — warn and drop (ADR-006 counterpart).
+                eprintln!(
+                    "skim search: AST verify gate warning: FileId({idx}) is out of \
+                     manifest range (manifest has {} files) — index may be out of sync; \
+                     run `skim search --rebuild`",
+                    sorted.len()
+                );
+                continue;
             }
-        })
-        .collect();
+        };
+
+        // AD-405-11: accrue file size against the query I/O budget before opening
+        // the file. Fall back to AST_SIZE_LIMIT_DEFAULT (1 MiB — the maximum bytes
+        // read_guarded will ever read) when the manifest size is absent. This is the
+        // truly conservative bound: a size-unknown file can cost up to 1 MiB, so we
+        // charge the worst case rather than the per-slot estimate (100 KiB), which
+        // could under-charge by up to ~10x and allow the I/O bound to be exceeded.
+        let entry = manifest.lookup(rel_path);
+        let file_size = entry
+            .and_then(|e| e.size)
+            .unwrap_or(rskim_core::AST_SIZE_LIMIT_DEFAULT);
+        if is_over_budget(bytes_verified, file_size, verify_budget) {
+            budget_omitted += 1;
+            continue;
+        }
+        bytes_verified = bytes_verified.saturating_add(file_size);
+
+        let abs_path = root.join(rel_path);
+        let stored_mtime = entry.and_then(|e| e.mtime);
+
+        if is_synthetic {
+            // Synthetic: two-function flow (AND-semantics gate, AC-10/#419 preserved).
+            if pattern_occurs_in_file(&abs_path, &query, stored_mtime) {
+                verified_pool.push((fid, score, None));
+            }
+        } else {
+            // Real-node: find_first_strict_match (gate + anchor in one pass).
+            if let Some(anchor) = find_first_strict_match(&abs_path, &query, stored_mtime) {
+                verified_pool.push((fid, score, Some(anchor)));
+            }
+        }
+    }
+
+    // AD-405-11: emit budget-exhausted notice to stderr when candidates were skipped.
+    if budget_omitted > 0 {
+        eprintln!(
+            "skim search: AST verify: byte budget exhausted ({budget_omitted} of \
+             {total_candidates} candidates unverified; budget = {window} slots x {} KiB); \
+             Narrow the query or lower --limit.",
+            AST_VERIFY_BYTES_PER_SLOT / 1024,
+        );
+    }
 
     // Resolve FileIds → repo-relative paths. For real-node patterns, populate
     // line/snippet from the cached anchor (no post-truncation re-parse needed).
@@ -455,17 +489,26 @@ pub(super) fn run_ast_standalone(
         super::temporal::enrich_ast_results(&mut resolved, sort, db);
     }
 
+    // AD-405-7 / AC-405-17: compute coverage from the already-loaded manifest
+    // (zero extra I/O). Emit notice on the standalone --ast surface (D-4 cadence).
+    let coverage = manifest.ast_coverage();
+    super::query::emit_ast_coverage_notice(&coverage);
+
     write_ast_page_output(
         &mut resolved,
-        page,
-        pool_was_capped,
-        temporal_active,
-        is_synthetic,
-        raw_pattern,
-        &query,
+        PageCtx {
+            page,
+            pool_was_capped,
+            temporal_active,
+        },
+        PatternCtx {
+            raw: raw_pattern,
+            query: &query,
+            is_synthetic,
+        },
         root,
         manifest,
-        json,
+        OutputFmt { json, coverage },
         w,
     )
 }
@@ -474,33 +517,65 @@ pub(super) fn run_ast_standalone(
 // Output phase: pagination + notice + synthetic recovery + format
 // ============================================================================
 
+/// Pagination state for `write_ast_page_output`.
+///
+/// Groups three tightly coupled booleans that jointly govern the page-level
+/// output behaviour: the cursor, the pool-cap flag (drives `has_more`), and
+/// the temporal-active flag (gates the bounded-page notice and the
+/// `resolved.truncate` the caller applied before entry).
+struct PageCtx {
+    page: Page,
+    pool_was_capped: bool,
+    /// Consistent with the `resolved.truncate(temporal_window)` the caller
+    /// applied before `enrich_ast_results` (AD-404-6/7).
+    temporal_active: bool,
+}
+
+/// Pattern identity and routing for `write_ast_page_output`.
+///
+/// Carries the three per-query knobs that route synthetic vs. real-node
+/// post-truncation handling and supply display metadata.
+struct PatternCtx<'a> {
+    raw: &'a str,
+    query: &'a AstQuery,
+    is_synthetic: bool,
+}
+
+/// Output format options for `write_ast_page_output`.
+///
+/// Bundles the two format knobs that are read together at the single
+/// JSON/text dispatch point.
+struct OutputFmt {
+    json: bool,
+    coverage: rskim_search::AstCoverage,
+}
+
 /// Apply pagination, emit the bounded-page notice, run synthetic line recovery,
 /// and write the final output for a standalone `--ast` query.
 ///
 /// Extracted from `run_ast_standalone` to keep that function below the 200-line
 /// threshold. All pagination and output logic lives here; the caller owns the
 /// verify gate, the temporal pre-truncation, and the temporal enrichment steps.
-///
-/// `temporal_active` is consistent with the `resolved.truncate(temporal_window)`
-/// the caller already applied before `enrich_ast_results` (AD-404-6/7).
-// Arguments are all independent caller-supplied knobs (pagination cursor,
-// pool cap flag, temporal flag, synthetic-vs-real routing, pattern string,
-// query handle for recover_line, paths for file I/O, format flag, writer).
-// No natural grouping exists — mirrors run_ast_standalone's own allow.
-#[allow(clippy::too_many_arguments)]
 fn write_ast_page_output(
     resolved: &mut Vec<AstResult>,
-    page: Page,
-    pool_was_capped: bool,
-    temporal_active: bool,
-    is_synthetic: bool,
-    raw_pattern: &str,
-    query: &AstQuery,
+    page_ctx: PageCtx,
+    pattern: PatternCtx<'_>,
     root: &Path,
     manifest: &super::manifest::FileManifest,
-    json: bool,
+    fmt: OutputFmt,
     w: &mut impl std::io::Write,
 ) -> anyhow::Result<ExitCode> {
+    let PageCtx {
+        page,
+        pool_was_capped,
+        temporal_active,
+    } = page_ctx;
+    let PatternCtx {
+        raw: raw_pattern,
+        query,
+        is_synthetic,
+    } = pattern;
+    let OutputFmt { json, coverage } = fmt;
     // AD-404-5 / AD-404-11: page.apply() — skip + take. Position is load-bearing
     // (AD-404-3): AFTER verify gate and AFTER temporal re-sort.
     // At offset 0: page.apply() == truncate(limit) — zero regression.
@@ -539,8 +614,13 @@ fn write_ast_page_output(
             let abs_path = root.join(&r.path);
             let stored_mtime = manifest.lookup(&r.path).and_then(|e| e.mtime);
             if let Some((ln, byte_range)) = recover_line(&abs_path, query, stored_mtime) {
+                // AD-405-2 / AD-405-14: language-aware size limit keeps read_line_at
+                // in sync with linearize_source and read_guarded; no drift possible.
+                let max_bytes = rskim_core::Language::from_path(Path::new(&r.path))
+                    .and_then(rskim_core::ast_size_limit)
+                    .unwrap_or(rskim_core::AST_SIZE_LIMIT_DEFAULT);
                 // Suppress snippet when byte_range is empty (synthetic recovery artifact).
-                let snip = read_line_at(&abs_path, ln, rskim_search::MAX_REPARSE_FILE_BYTES);
+                let snip = read_line_at(&abs_path, ln, max_bytes);
                 r.line = Some(ln);
                 r.snippet = if byte_range.is_empty() { None } else { snip };
             }
@@ -551,15 +631,39 @@ fn write_ast_page_output(
     let pattern_name = raw_pattern.trim();
     let (display_name, description) = pattern_description(pattern_name);
 
+    // AD-405-10: extract scalar before consuming coverage to avoid a partial move.
+    let excluded_count = coverage.size_excluded_files;
     if json {
         // AD-404-11 / D-5: has_more lets agents detect the last page without
         // relying on the unsound `len < limit` heuristic.
-        format_ast_json(resolved, display_name, description, has_more, w)?;
+        // AD-405-3 / AC-405-9: ast_coverage key omitted when clean (is_clean()),
+        // present only when excluded or undetermined files exist — identical guard
+        // on all three surfaces (standalone --ast, compound --ast, --stats --json).
+        format_ast_json(
+            resolved,
+            display_name,
+            description,
+            has_more,
+            if coverage.is_clean() {
+                None
+            } else {
+                Some(coverage)
+            },
+            w,
+        )?;
     } else {
         // AC-404-8 / AC-404-10: page-aware empty messages are now handled
         // inside format_ast_text via the `offset` parameter, mirroring how
         // format_temporal_text (temporal.rs) threads Page for the same split.
-        format_ast_text(resolved, display_name, description, page.offset(), w)?;
+        // AC-405-10: excluded_count appended when non-zero.
+        format_ast_text(
+            resolved,
+            display_name,
+            description,
+            page.offset(),
+            excluded_count,
+            w,
+        )?;
     }
 
     Ok(ExitCode::SUCCESS)
@@ -569,22 +673,86 @@ fn write_ast_page_output(
 // Snippet extraction helpers
 // ============================================================================
 
+/// AD-405-11: per-slot byte allowance for the structural verify gate.
+///
+/// Each file in the candidate pool is charged its manifest-reported size
+/// (or `AST_SIZE_LIMIT_DEFAULT` when the size is unknown) against a total
+/// query-time I/O budget of `window * AST_VERIFY_BYTES_PER_SLOT`.
+///
+/// This constant equals the pre-raise per-file cap (100 KiB = the old
+/// `AST_SIZE_LIMIT_DEFAULT` before the 1 MiB raise), deliberately DECOUPLED
+/// from `AST_SIZE_LIMIT_DEFAULT` (1 MiB) so raising the cap adds files to the
+/// index without proportionally inflating the per-slot query budget.
+/// Pre-raise workloads cannot exceed `window * 100 KiB` anyway (all pre-raise
+/// files are ≤ 100 KiB), so the <500ms AC11 gate holds by construction.
+///
+/// Size-unknown entries (manifest `size = None`) are charged
+/// `AST_SIZE_LIMIT_DEFAULT` (the worst-case `read_guarded` I/O volume) rather
+/// than this per-slot constant — see the budget loop in `run_ast_standalone`.
+///
+/// ## Follow-ups
+///
+/// - **FU-1 (node/depth-cap accounting):** Node and depth counters in
+///   `AstWalkConfig` (`DEFAULT_MAX_NODES`, `DEFAULT_MAX_DEPTH`) are not
+///   accounted for in the byte budget — a tree-sitter walk that terminates
+///   early due to node/depth limits may still consume fewer bytes than this
+///   slot allows.  Proper accounting is a tracked follow-up.
+/// - **FU-2 (rayon parallelize verify gate, #406):** The gate currently runs
+///   each candidate file sequentially.  Parallelising across candidates with
+///   rayon is tracked in #406.
+const AST_VERIFY_BYTES_PER_SLOT: u64 = 100 * 1024;
+
+/// Compute the total byte budget for the structural verify gate.
+///
+/// Returns `window * AST_VERIFY_BYTES_PER_SLOT` using saturating multiplication
+/// so a very large `window` clamps at `u64::MAX` rather than wrapping.
+///
+/// Extracted as a testable helper so unit tests exercise the production formula
+/// instead of reimplementing the arithmetic inline (AD-405-11).
+#[must_use]
+fn compute_verify_budget(window: usize) -> u64 {
+    (window as u64).saturating_mul(AST_VERIFY_BYTES_PER_SLOT)
+}
+
+/// Returns `true` when accruing `file_size` bytes would push `bytes_verified`
+/// past `budget`.
+///
+/// Mirrors the gate check in the verify loop verbatim so tests call the
+/// production predicate, not a hand-rolled copy (AD-405-11).
+#[must_use]
+fn is_over_budget(bytes_verified: u64, file_size: u64, budget: u64) -> bool {
+    bytes_verified.saturating_add(file_size) > budget
+}
+
 /// Read the text of a specific 1-indexed line from a file.
 ///
 /// Returns `None` when the file cannot be read, is non-UTF8, exceeds
 /// `max_bytes`, or the line number is out of range.
 ///
+/// ## AD-405-2 / AD-405-14: Language-aware size limit
+///
+/// The caller passes the LANGUAGE-AWARE limit from `rskim_core::ast_size_limit`
+/// so `read_line_at` admits exactly the same files that `linearize_source` and
+/// `read_guarded` admit — no silent second cap can drift to a stale value.
+///
+/// ## Streaming BufRead (AD-405-14)
+///
+/// Uses `BufRead::lines().nth(target)` instead of `fs::read` + whole-file
+/// UTF-8 so fetching a single line from a 1 MiB file costs only the bytes
+/// up to that line, not a full 1 MiB read.
+///
 /// This is the "file-reading" half of the crate split (#201): pure formatting
 /// lives in `rskim_search::compound::output`; disk I/O lives here.
 fn read_line_at(abs_path: &Path, line_1indexed: u32, max_bytes: u64) -> Option<String> {
+    use std::io::BufRead;
     let meta = std::fs::metadata(abs_path).ok()?;
     if meta.len() > max_bytes {
         return None;
     }
-    let content = std::fs::read(abs_path).ok()?;
-    let text = std::str::from_utf8(&content).ok()?;
-    let target = line_1indexed.saturating_sub(1) as usize; // → 0-indexed
-    text.lines().nth(target).map(|l| l.to_string())
+    let file = std::fs::File::open(abs_path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let target = line_1indexed.saturating_sub(1) as usize; // 0-indexed
+    reader.lines().nth(target).and_then(|r| r.ok())
 }
 
 // ============================================================================

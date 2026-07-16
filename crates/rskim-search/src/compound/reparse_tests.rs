@@ -44,6 +44,11 @@ use super::{find_first_strict_match, pattern_occurs_in_file, recover_line};
 // Helpers
 // ============================================================================
 
+/// Single source of truth for the AST size cap in tests — derived from the
+/// production constant so a future raise in `AST_SIZE_LIMIT_DEFAULT` (AD-405-2)
+/// automatically propagates here without manual updates.
+const MAX_REPARSE_FILE_BYTES: usize = rskim_core::AST_SIZE_LIMIT_DEFAULT as usize;
+
 /// Write a named source file in a tempdir and return the absolute path.
 fn write_fixture(dir: &TempDir, name: &str, content: &str) -> std::path::PathBuf {
     let path = dir.path().join(name);
@@ -500,8 +505,6 @@ fn find_first_strict_match_clean_match_found_despite_error_region_ac6b() {
 /// always returns `None` would vacuously pass but would fail AC1.
 #[test]
 fn find_first_strict_match_returns_none_for_degraded_inputs_ac8() {
-    use super::MAX_REPARSE_FILE_BYTES;
-
     let dir = tempfile::tempdir().unwrap();
     let query = parse_ast_query("rust-nested-loop").unwrap();
 
@@ -521,11 +524,11 @@ fn find_first_strict_match_returns_none_for_degraded_inputs_ac8() {
         "AC8: non-UTF8 content must return None, not panic"
     );
 
-    // File exceeding the 100 KiB size guard.
+    // File exceeding the 1 MiB size guard.
     let huge_path = dir.path().join("huge.rs");
     std::fs::write(
         &huge_path,
-        "x".repeat((MAX_REPARSE_FILE_BYTES + 1) as usize).as_bytes(),
+        "x".repeat(MAX_REPARSE_FILE_BYTES + 1).as_bytes(),
     )
     .unwrap();
     let result = find_first_strict_match(&huge_path, &query, None);
@@ -723,11 +726,9 @@ fn nested() { for i in 0..3 { for j in 0..3 {} } }
 /// Falsifiable: an implementation without a size guard would return true (or OOM).
 #[test]
 fn pattern_occurs_false_for_file_exceeding_size_guard() {
-    use super::MAX_REPARSE_FILE_BYTES;
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("huge.rs");
-    let content = "x".repeat((MAX_REPARSE_FILE_BYTES + 1) as usize);
+    let content = "x".repeat(MAX_REPARSE_FILE_BYTES + 1);
     std::fs::write(&path, content.as_bytes()).unwrap();
 
     let query = parse_ast_query("rust-nested-loop").unwrap();
@@ -1055,8 +1056,6 @@ fn pattern_occurs_false_for_all_five_synthetic_negative_twins_ac3_394() {
 /// over the size guard, and mtime mismatch.
 #[test]
 fn pattern_occurs_false_for_synthetic_pattern_on_degraded_inputs_ac6_394() {
-    use super::MAX_REPARSE_FILE_BYTES;
-
     let dir = tempfile::tempdir().unwrap();
     let query = parse_ast_query("god-function").unwrap();
 
@@ -1072,7 +1071,7 @@ fn pattern_occurs_false_for_synthetic_pattern_on_degraded_inputs_ac6_394() {
     let huge_path = dir.path().join("huge.rs");
     std::fs::write(
         &huge_path,
-        "x".repeat((MAX_REPARSE_FILE_BYTES + 1) as usize).as_bytes(),
+        "x".repeat(MAX_REPARSE_FILE_BYTES + 1).as_bytes(),
     )
     .unwrap();
     assert!(
@@ -1227,8 +1226,6 @@ fn recover_line_matches_ground_truth_for_all_five_synthetic_patterns_ac13_394() 
 /// on the same inputs the real branch already guards against.
 #[test]
 fn recover_line_none_for_synthetic_pattern_on_degraded_inputs_ac13_394() {
-    use super::MAX_REPARSE_FILE_BYTES;
-
     let dir = tempfile::tempdir().unwrap();
     let query = parse_ast_query("god-function").unwrap();
 
@@ -1242,7 +1239,7 @@ fn recover_line_none_for_synthetic_pattern_on_degraded_inputs_ac13_394() {
     let huge_path = dir.path().join("huge.rs");
     std::fs::write(
         &huge_path,
-        "x".repeat((MAX_REPARSE_FILE_BYTES + 1) as usize).as_bytes(),
+        "x".repeat(MAX_REPARSE_FILE_BYTES + 1).as_bytes(),
     )
     .unwrap();
     assert!(
