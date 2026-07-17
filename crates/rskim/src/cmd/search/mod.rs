@@ -548,7 +548,12 @@ fn take_flag_value(
 /// - `--root` without a following value.
 /// - `--ast` without a value or with a whitespace-only value.
 /// - `--weights` without a value or with an invalid weight string.
-/// - Unrecognised flags (tokens beginning with `--`).
+/// - Unrecognised dash-leading flags — any `--foo` or `-x` (length >= 2) that is
+///   not a known flag. Bare `-` is a positional query token; a literal dash-leading
+///   term is searchable after the `--` end-of-flags separator.
+/// - Combining a text query with an action flag (`--build` / `--rebuild` /
+///   `--update` / `--stats` / `--install-hooks` / `--remove-hooks`) — an
+///   ambiguous mixed form.
 fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut action_flag: Option<SearchAction> = None;
     let mut json = false;

@@ -1516,8 +1516,12 @@ mod argv_parser_412 {
 
     // ---- AC3/AC2 (E2E): `--` separator prevents action-flag hijack -----------
 
-    /// AC3: `skim search --json -- --rebuild --root <proj>` searches for the literal
+    /// AC3: `skim search --json --root <proj> -- --rebuild` searches for the literal
     /// text "--rebuild" and does NOT rebuild the index.
+    ///
+    /// Output flags (`--json`, `--root <proj>`) MUST precede `--`; every token
+    /// after `--` is drained verbatim into the query, so `--root` placed after it
+    /// would become literal query text (and silently un-scope the search).
     #[test]
     fn ac3_dashdash_separator_prevents_action_flag_hijack() {
         let proj = tempfile::tempdir().unwrap();
@@ -1527,8 +1531,9 @@ mod argv_parser_412 {
 
         let out = Command::cargo_bin("skim")
             .unwrap()
-            .args(["search", "--json", "--", "--rebuild", "--root"])
+            .args(["search", "--json", "--root"])
             .arg(proj.path())
+            .args(["--", "--rebuild"])
             .env("SKIM_CACHE_DIR", cache.path())
             .assert()
             .success()
@@ -1553,8 +1558,10 @@ mod argv_parser_412 {
 
     // ---- AC5: Help scan bounded at first `--` --------------------------------
 
-    /// AC5(a): `skim search -- -h --root <proj>` exits 0 and stdout does NOT
+    /// AC5(a): `skim search --root <proj> -- -h` exits 0 and stdout does NOT
     /// contain the help marker "layered n-gram BM25F" (it searched, not helped).
+    /// `--root <proj>` precedes `--` so the search stays scoped to the fixture
+    /// (tokens after `--` are drained verbatim into the query).
     ///
     /// AC5(b): `skim search -h` exits 0 and stdout DOES contain "layered n-gram BM25F"
     /// (bare -h before `--` still triggers help).
@@ -1568,8 +1575,9 @@ mod argv_parser_412 {
         // AC5(a): `search -- -h` must search, not print help.
         let out_search = Command::cargo_bin("skim")
             .unwrap()
-            .args(["search", "--", "-h", "--root"])
+            .args(["search", "--root"])
             .arg(proj.path())
+            .args(["--", "-h"])
             .env("SKIM_CACHE_DIR", cache.path())
             .assert()
             .success()
@@ -1689,11 +1697,14 @@ mod argv_parser_412 {
             "AC10 fixture guard: 'error' must match at least one file in make_project corpus"
         );
 
-        // Via `--`: semantically identical query.
+        // Via `--`: semantically identical query. `--root <proj>` precedes `--`
+        // so both invocations resolve the same fixture root; only the literal
+        // query token ("error") follows `--`.
         let out_escaped = Command::cargo_bin("skim")
             .unwrap()
-            .args(["search", "--json", "--", "error", "--root"])
+            .args(["search", "--json", "--root"])
             .arg(proj.path())
+            .args(["--", "error"])
             .env("SKIM_CACHE_DIR", cache.path())
             .assert()
             .success()

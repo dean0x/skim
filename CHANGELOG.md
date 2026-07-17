@@ -111,6 +111,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Incremental AST n-gram cache** — the index reuses per-file AST structural entries
   (`ast_index.skcache`) across builds for files whose content is unchanged, avoiding a
   full AST re-parse on every rebuild. (#290)
+- **`skim search --` end-of-flags separator** (#412) — every token after a bare `--`
+  is treated as literal query text, so dash-leading terms (`-Werror`, `->`, `-5`) and
+  even flag-looking words (`--rebuild`, `-h`) can be searched: `skim search -- -Werror`.
+  Output flags (`--json`, `--limit`, `--root`, …) must appear BEFORE `--`, and the
+  `--help`/`-h` scan is likewise bounded at the first `--`.
+- **`skim search` text-mode summary now echoes the effective query** (#412) — the
+  non-empty human summary reads `N result(s) for "query" in Tms` (previously
+  `N result(s) in Tms`) so a mangled query can never masquerade as a successful search.
+  JSON output is unchanged.
 
 ### Fixed
 - **`skim search --near` silently dropped when `--phrase` was also set** (#403):
@@ -168,6 +177,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matched pattern node is line-recovered; degraded (non-recovered) rows omit both. JSON
   output gains optional `line` and `snippet` fields — additive, so existing consumers of
   `path`/`score` are unaffected. (#201)
+- **`skim search` argv parsing is now strict and symmetric** (#412) — unknown
+  single-dash flags (`-i`, `-w`, `-C`) are rejected with an `unrecognised flag` error
+  and a pointer to the `--` escape hatch, matching the pre-existing long-flag behavior
+  (previously they were silently folded into the query text). Combining a text query
+  with an action flag (e.g. `skim search foo --rebuild`) now hard-errors as an ambiguous
+  mixed form instead of silently running the action and discarding the query. Bare `-`
+  remains a valid positional query token.
 
 ### Fixed
 - **`skim search --rebuild`/`--build` now populate `temporal.db`** (#357) — explicit
