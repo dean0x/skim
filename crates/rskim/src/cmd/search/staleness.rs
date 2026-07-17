@@ -545,24 +545,55 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool
         return true;
     }
     // Lightweight read-only open: no WAL pragma, no permission reset, no migrations.
-    // We only need to read one meta row; the full TemporalDb::open setup is
-    // deferred to the dispatch arm that actually queries the DB.
-    let stored_head: Option<String> = rusqlite::Connection::open_with_flags(
+    // We read at most two meta rows (git_head + data_version); the full
+    // TemporalDb::open setup is deferred to the dispatch arm that actually queries.
+    let conn = match rusqlite::Connection::open_with_flags(
         &db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()
-    .and_then(|conn| {
-        conn.query_row(
+    ) {
+        Ok(c) => c,
+        Err(_) => return true,
+    };
+
+    // Check 1: HEAD match.
+    let stored_head: Option<String> = conn
+        .query_row(
             "SELECT value FROM meta WHERE key = ?1",
             rusqlite::params![rskim_search::META_GIT_HEAD],
             |row| row.get(0),
         )
-        .ok()
-    });
+        .ok();
     match stored_head.as_deref() {
-        Some(stored) => stored != current_head,
+        // HEAD mismatch → stale.
+        Some(stored) if stored != current_head => return true,
         // No stored HEAD row (e.g. empty-repo DB or migration gap): stale.
+        None => return true,
+        _ => {}
+    }
+
+    // AD-408-4: Check 2: data-version gate.
+    // The DB is stale when the stored data_version is absent or numerically less
+    // than TEMPORAL_DATA_VERSION, forcing a self-heal rebuild on the next query
+    // (applies ADR-006; mirrors the lexical/AST/manifest self-heal in
+    // check_staleness). Meta values are TEXT — version comparison is numeric to
+    // correctly order multi-digit values (string compare mis-orders "10" vs "2").
+    // An absent or non-integer stored value is treated as stale (pre-fix DB).
+    // Uses `stored < current` (NOT `!=`) so a DB written by a newer binary is
+    // NOT needlessly rebuilt by an older post-fix binary (no downgrade loop).
+    let stored_version: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            rusqlite::params![rskim_search::META_DATA_VERSION],
+            |row| row.get(0),
+        )
+        .ok();
+    match stored_version.as_deref() {
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) => n < u64::from(rskim_search::TEMPORAL_DATA_VERSION),
+            // Non-integer stored value → treat as stale.
+            Err(_) => true,
+        },
+        // Absent data_version row → stale (pre-fix DB that lacks the ghost filter).
         None => true,
     }
 }

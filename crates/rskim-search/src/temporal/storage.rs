@@ -66,6 +66,30 @@ pub const META_LAST_UPDATED: &str = "last_updated";
 /// Key storing the git HEAD SHA at the time of the last [`TemporalDb::sync`].
 pub const META_GIT_HEAD: &str = "git_head";
 
+/// Version number attesting that the temporal data was written by a binary
+/// whose `rebuild_temporal` applies the ghost filter.
+///
+/// AD-408-3: This const is the single source of truth for the self-heal
+/// contract: the data-version attests "written by a binary whose
+/// `rebuild_temporal` applies the ghost filter." Written **unconditionally**
+/// in [`TemporalDb::sync`] — the only version-attesting write path (same
+/// choke point as `META_GIT_HEAD`), so the empty-history DB also carries it
+/// and the no-rebuild-loop invariant is preserved. Bump this const to force a
+/// future global rebuild of all `temporal.db` files on the next query.
+///
+/// Note: a future caller using `store_*` / `set_meta(git_head)` directly
+/// would produce a DB with a HEAD but no `data_version` row — perpetually
+/// flagged stale. [`TemporalDb::sync`] is the only version-attesting write
+/// path; do not bypass it.
+pub const TEMPORAL_DATA_VERSION: u16 = 1;
+
+/// Meta table key storing the [`TEMPORAL_DATA_VERSION`] value.
+///
+/// AD-408-3: Written unconditionally inside [`TemporalDb::sync`] alongside
+/// [`META_GIT_HEAD`] and [`META_LAST_UPDATED`]. The same `INSERT OR REPLACE`
+/// prepared statement is reused for all three meta rows.
+pub const META_DATA_VERSION: &str = "data_version";
+
 // ============================================================================
 // Error helper
 // ============================================================================

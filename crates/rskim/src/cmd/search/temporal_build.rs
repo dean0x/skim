@@ -363,6 +363,38 @@ pub(super) fn rebuild_temporal(
     rebuild_temporal_with_source(&GixSource, root, cache_dir, head, now_epoch)
 }
 
+/// Return `true` if `rel` names a regular file under `root`.
+///
+/// AD-408-2: The chosen existence semantic is on-disk `root.join(rel).is_file()`
+/// (Option A, user-resolved 2026-07-17; follow-up #454 covers manifest-union
+/// consistency if later needed). Defense-in-depth: rejects any `rel` that is
+/// absolute OR contains a `..` component so a malicious git-history path cannot
+/// `stat` outside `root` (applies ADR-008: "tracked paths are untrusted input and
+/// must be containment-checked"). `Path::join` silently replaces the base when
+/// `rel` is absolute, so the absolute-path check is required in addition to the
+/// `..`-component check. Git never emits absolute paths or `..` components in
+/// tree paths, so no legitimate row is ever dropped by these guards.
+///
+/// `is_file()` (not `.exists()`) is the correct predicate for "a path an agent
+/// can Read" — a former-file path that is now a directory passes `.exists()` but
+/// fails `.is_file()` and must be excluded from both the temporal and heatmap
+/// surfaces (OD2, 2026-07-17).
+fn tracked_path_exists(root: &Path, rel: &str) -> bool {
+    let rel_path = std::path::Path::new(rel);
+    // Reject absolute paths — Path::join replaces the base for absolute arguments.
+    if rel_path.is_absolute() {
+        return false;
+    }
+    // Reject any path containing a .. (ParentDir) component.
+    if rel_path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return false;
+    }
+    root.join(rel_path).is_file()
+}
+
 /// Inner implementation of `rebuild_temporal` with an injectable `TemporalSource`.
 ///
 /// Separated from `rebuild_temporal` so tests can supply a counting or fake
@@ -403,7 +435,7 @@ pub(super) fn rebuild_temporal_with_source(
     // The single sync path addresses this: if sync fails we warn+skip and the
     // file may still exist headless, but this is the same risk that already
     // exists on the non-empty path (pre-existing, not introduced here).
-    let (hotspot_rows, risk_rows, cochange_rows);
+    let (mut hotspot_rows, mut risk_rows, mut cochange_rows);
     if risk_history.commits.is_empty() {
         hotspot_rows = vec![];
         risk_rows = vec![];
@@ -426,6 +458,49 @@ pub(super) fn rebuild_temporal_with_source(
         cochange_rows = build_cochange_rows(&risk_history);
         hotspot_rows = build_hotspot_rows(&risk_scores, &temporal_stats);
         risk_rows = build_risk_rows(&risk_scores, &temporal_stats);
+    }
+
+    // ── Build-time ghost filter (AD-408-1) ───────────────────────────────────
+    // AD-408-1: The build-time ghost filter is the single choke point for
+    // existence-checking. It is applied on freshly-computed rows *before*
+    // `db.sync` persists them (applies ADR-006: the prior DB survives on
+    // failure and self-heals). Hotspot/risk rows are retained only when the
+    // file exists on disk; cochange rows survive only when BOTH `file_a` AND
+    // `file_b` exist. Scores are NOT renormalized after the drop — dropping
+    // rows post-computation is sound because a file's own hotspot/risk score
+    // does not depend on deleted files, and each cochange row carries its
+    // baked-in Jaccard. This filter fixes all consumers (`--hot`/`--cold`/
+    // `--risky` text+JSON, `--blast-radius` partners) at one choke point.
+    //
+    // Existence is resolved once per unique path (deduplication across all
+    // three row types) to avoid redundant stat syscalls — worst case 1×
+    // per unique path rather than up to 3×.
+    //
+    // For the empty-history case the three row slices are already empty so
+    // the retain calls are no-ops. The ghost filter is intentionally applied
+    // unconditionally (avoids a dead code branch and handles future call paths).
+    if !hotspot_rows.is_empty() || !risk_rows.is_empty() || !cochange_rows.is_empty() {
+        // Collect all unique paths across all three row types.
+        let unique_paths: std::collections::HashSet<&str> = hotspot_rows
+            .iter()
+            .map(|r| r.file_path.as_str())
+            .chain(risk_rows.iter().map(|r| r.file_path.as_str()))
+            .chain(
+                cochange_rows
+                    .iter()
+                    .flat_map(|r| [r.file_a.as_str(), r.file_b.as_str()]),
+            )
+            .collect();
+        // Resolve each unique path exactly once.
+        let existing: std::collections::HashSet<String> = unique_paths
+            .into_iter()
+            .filter(|p| tracked_path_exists(root, p))
+            .map(String::from)
+            .collect();
+        hotspot_rows.retain(|r| existing.contains(&r.file_path));
+        risk_rows.retain(|r| existing.contains(&r.file_path));
+        // Cochange: both sides must exist on disk.
+        cochange_rows.retain(|r| existing.contains(&r.file_a) && existing.contains(&r.file_b));
     }
 
     // ── Acquire lock (D4), then sync ─────────────────────────────────────────

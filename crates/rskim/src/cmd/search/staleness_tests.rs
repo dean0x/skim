@@ -1131,6 +1131,134 @@ fn test_temporal_db_is_stale_when_head_diverges() {
 }
 
 // ============================================================================
+// AC5 / AC6 / AC7 — temporal data-version gate (AD-408-4)
+// ============================================================================
+
+/// AC5: A temporal.db whose git_head MATCHES current_head but has NO
+/// data_version row is reported stale (pre-fix DB that lacks the ghost filter).
+///
+/// AD-408-4 discriminating: the gate must catch pre-fix DBs even when the
+/// HEAD matches.  Without the data-version gate, temporal_db_is_stale would
+/// return false for such a DB and ghost rows would never be evicted.
+#[test]
+fn test_temporal_db_data_version_absent_is_stale() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("temporal.db");
+    let head = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222";
+
+    // Create a DB and set META_GIT_HEAD but NOT data_version (pre-fix state).
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.set_meta(rskim_search::META_GIT_HEAD, head).unwrap();
+    drop(db);
+
+    assert!(
+        temporal_db_is_stale(dir.path(), head),
+        "AC5: temporal.db with matching HEAD but no data_version must be stale \
+         (pre-fix DB contains ghost rows)"
+    );
+}
+
+/// AC5: A temporal.db written by `sync()` carries the data_version row and is
+/// NOT reported stale (post-fix DB).
+///
+/// Also verifies that `sync()` is the version-attesting write path (AD-408-3):
+/// an empty-history DB written via sync still gets the data_version row.
+#[test]
+fn test_temporal_db_after_sync_data_version_is_not_stale() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("temporal.db");
+    let head = "cccc3333cccc3333cccc3333cccc3333cccc3333";
+
+    // Write via sync() — the only version-attesting path.
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head).unwrap();
+    drop(db);
+
+    assert!(
+        !temporal_db_is_stale(dir.path(), head),
+        "AC5: temporal.db written by sync() (with data_version) must NOT be stale"
+    );
+}
+
+/// AC5: A non-integer data_version value is treated as stale.
+///
+/// AD-408-4: the gate must parse the stored value as an integer; an
+/// unparseable value is treated as stale so corrupt rows trigger a self-heal.
+#[test]
+fn test_temporal_db_data_version_non_integer_is_stale() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("temporal.db");
+    let head = "dddd4444dddd4444dddd4444dddd4444dddd4444";
+
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head).unwrap();
+    // Overwrite data_version with a non-integer.
+    db.set_meta(rskim_search::META_DATA_VERSION, "not-a-number")
+        .unwrap();
+    drop(db);
+
+    assert!(
+        temporal_db_is_stale(dir.path(), head),
+        "AC5: non-integer data_version must be treated as stale (numeric parse required)"
+    );
+}
+
+/// AC6: No rebuild loop — after a single sync, two consecutive
+/// temporal_db_is_stale calls both return false.
+///
+/// Also verifies that an empty-history DB (sync with empty slices) carries
+/// the data_version row and is NOT perpetually flagged stale (AD-408-3).
+#[test]
+fn test_temporal_db_data_version_no_rebuild_loop() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("temporal.db");
+    let head = "eeee5555eeee5555eeee5555eeee5555eeee5555";
+
+    // Write an empty-history DB via sync().
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head).unwrap();
+    drop(db);
+
+    // First post-sync check.
+    assert!(
+        !temporal_db_is_stale(dir.path(), head),
+        "AC6: first post-sync check must be Current (no rebuild loop)"
+    );
+    // Second post-sync check — must still be Current.
+    assert!(
+        !temporal_db_is_stale(dir.path(), head),
+        "AC6: second post-sync check must be Current (no oscillation)"
+    );
+}
+
+/// AC7: Forward compatibility — a temporal.db whose stored data_version is
+/// GREATER than TEMPORAL_DATA_VERSION is NOT flagged stale.
+///
+/// AD-408-4: the gate uses `stored < current` (not `!=`) so a DB written by a
+/// newer binary is not needlessly rebuilt by an older post-fix binary.
+#[test]
+fn test_temporal_db_data_version_forward_compat() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("temporal.db");
+    let head = "ffff6666ffff6666ffff6666ffff6666ffff6666";
+
+    // Write via sync() then overwrite data_version with a future version.
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head).unwrap();
+    // Store a version much higher than the current one.
+    let future_version = u64::from(rskim_search::TEMPORAL_DATA_VERSION) + 999;
+    db.set_meta(rskim_search::META_DATA_VERSION, &future_version.to_string())
+        .unwrap();
+    drop(db);
+
+    assert!(
+        !temporal_db_is_stale(dir.path(), head),
+        "AC7: data_version > TEMPORAL_DATA_VERSION must NOT be stale (forward compat: \
+         gate uses stored < current, not stored != current)"
+    );
+}
+
+// ============================================================================
 // #357 BUG B — auto_refresh_if_stale self-heals stale temporal.db when
 // lexical index is Current (AD-TMP-2)
 // ============================================================================

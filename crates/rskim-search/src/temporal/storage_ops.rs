@@ -11,7 +11,9 @@ use rusqlite::params;
 use crate::types::{Result, SearchError};
 
 use super::storage_types::{CochangeRow, HotspotRow, RiskRow};
-use super::{META_GIT_HEAD, META_LAST_UPDATED, TemporalDb, db_err};
+use super::{
+    META_DATA_VERSION, META_GIT_HEAD, META_LAST_UPDATED, TEMPORAL_DATA_VERSION, TemporalDb, db_err,
+};
 
 /// Maximum rows accepted per table in a single store or sync call.
 ///
@@ -614,6 +616,15 @@ impl TemporalDb {
             .map_err(db_err)?;
         meta_stmt
             .execute(params![META_LAST_UPDATED, now_secs])
+            .map_err(db_err)?;
+        // AD-408-3: Write the data-version unconditionally so the empty-history
+        // DB also carries it and the no-rebuild-loop invariant is preserved.
+        // `sync()` is the sole version-attesting write path — see TEMPORAL_DATA_VERSION docs.
+        meta_stmt
+            .execute(params![
+                META_DATA_VERSION,
+                TEMPORAL_DATA_VERSION.to_string()
+            ])
             .map_err(db_err)?;
         drop(meta_stmt);
 

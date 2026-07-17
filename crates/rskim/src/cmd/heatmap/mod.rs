@@ -99,7 +99,11 @@ fn resolve_diff_files(
             let root = git_source.get_repo_root().unwrap_or_default();
             for f in &files {
                 let abs = std::path::Path::new(&root).join(f);
-                if !abs.exists() {
+                // AD-408-2 (OD2, 2026-07-17): use is_file() not exists() so that
+                // a former-file path that is now a directory is excluded from heatmap
+                // output — same existence semantic as the temporal ghost filter.
+                // is_file() is the correct predicate for "a path an agent can Read".
+                if !abs.is_file() {
                     eprintln!(
                         "skim heatmap: warning: file '{}' deleted on current branch",
                         f
