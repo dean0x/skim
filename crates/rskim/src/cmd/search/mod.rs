@@ -513,6 +513,15 @@ fn parse_temporal_flag(
         "--blast-radius" => {
             let val =
                 next_arg.ok_or_else(|| anyhow::anyhow!("--blast-radius requires a file path"))?;
+            // AD-412-3: bail so --help/-h is never consumed as the file-path value
+            // (parity with take_flag_value; e.g. `skim search --blast-radius --help`).
+            // AD-412-4: {val:?} (Debug, quoted) neutralises ANSI-escape injection.
+            if matches!(val.as_str(), "--help" | "-h") {
+                anyhow::bail!(
+                    "--blast-radius requires a file path (got {val:?}); \
+                     to print help, run: `skim search --help`"
+                );
+            }
             *blast_radius = Some(val.clone());
             Ok(true)
         }
@@ -2236,6 +2245,42 @@ mod tests {
         assert!(
             msg.contains("--ast requires a value"),
             "AD-412-3: -h must not be silently consumed as the --ast value; got: {msg}"
+        );
+    }
+
+    /// `--blast-radius --help`: `--help` must not be swallowed as the file path.
+    ///
+    /// `--blast-radius` consumes its value via `parse_temporal_flag` rather than
+    /// `take_flag_value`, so it needs the same AD-412-3 guard.  Without it,
+    /// `blast_radius = Some("--help")` ran a degraded co-change search for a file
+    /// literally named "--help" (exit 0) instead of honoring the help request —
+    /// the same silent-wrong-behavior class AD-412-3 fixed for `--root`.
+    ///
+    /// PF-007 (discriminating): asserts the specific "--blast-radius requires a
+    /// file path" message and the help-surface pointer, so reverting the guard
+    /// (which yields Ok with a bogus blast_radius) makes `unwrap_err()` panic.
+    #[test]
+    fn test_parse_flags_help_after_blast_radius_is_not_consumed_as_value() {
+        let err = parse_flags(&["--blast-radius".to_string(), "--help".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--blast-radius requires a file path"),
+            "AD-412-3: --help must not be silently consumed as the --blast-radius value; got: {msg}"
+        );
+        assert!(
+            msg.contains("skim search --help"),
+            "error must point at the help surface; got: {msg}"
+        );
+    }
+
+    /// Same as above but with the `-h` short form.
+    #[test]
+    fn test_parse_flags_short_h_after_blast_radius_is_not_consumed_as_value() {
+        let err = parse_flags(&["--blast-radius".to_string(), "-h".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--blast-radius requires a file path"),
+            "AD-412-3: -h must not be silently consumed as the --blast-radius value; got: {msg}"
         );
     }
 
