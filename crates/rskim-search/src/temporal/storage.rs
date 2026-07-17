@@ -85,9 +85,8 @@ pub const TEMPORAL_DATA_VERSION: u16 = 1;
 
 /// Meta table key storing the [`TEMPORAL_DATA_VERSION`] value.
 ///
-/// AD-408-3: Written unconditionally inside [`TemporalDb::sync`] alongside
-/// [`META_GIT_HEAD`] and [`META_LAST_UPDATED`]. The same `INSERT OR REPLACE`
-/// prepared statement is reused for all three meta rows.
+/// Written unconditionally inside [`TemporalDb::sync`] alongside
+/// [`META_GIT_HEAD`] and [`META_LAST_UPDATED`] (AD-408-3).
 pub const META_DATA_VERSION: &str = "data_version";
 
 // ============================================================================

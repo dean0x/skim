@@ -419,89 +419,64 @@ pub(super) fn rebuild_temporal_with_source(
     };
 
     // ── Score computation (pure, no I/O) ─────────────────────────────────────
-    // For empty-history repos (zero commits): all row slices are empty but we
-    // still fall through to the single lock+open+sync block below, which writes
-    // a present-but-empty temporal.db with META_GIT_HEAD set.
-    //
-    // LOCKED DECISION (2026-06-24, plan lines 14/146/349): a present-but-empty
-    // temporal.db prevents the per-query no-op rebuild loop — on the next query,
-    // temporal_db_is_stale reads META_GIT_HEAD and sees Current, so no rebuild.
-    //
-    // Falling through (rather than an early-return empty branch) also avoids
+    // Empty-history path falls through to the single lock+open+sync block below
+    // (LOCKED DECISION 2026-06-24): a present-but-empty temporal.db with
+    // META_GIT_HEAD set prevents the per-query rebuild loop — temporal_db_is_stale
+    // reads META_GIT_HEAD and sees Current, so no rebuild. Falling through avoids
     // duplicating the lock+open+sync block and eliminates the partial-file risk
-    // that the prior early-return had: if sync fails after TemporalDb::open
-    // creates the file, the file exists with no META_GIT_HEAD row, making
-    // temporal_db_is_stale return true on the next query → rebuild loop.
-    // The single sync path addresses this: if sync fails we warn+skip and the
-    // file may still exist headless, but this is the same risk that already
-    // exists on the non-empty path (pre-existing, not introduced here).
-    let (mut hotspot_rows, mut risk_rows, mut cochange_rows);
-    if risk_history.commits.is_empty() {
-        hotspot_rows = vec![];
-        risk_rows = vec![];
-        cochange_rows = vec![];
+    // of an early-return (if sync fails after TemporalDb::open creates the file,
+    // the file exists with no META_GIT_HEAD row → rebuild loop).
+    let (mut hotspot_rows, mut risk_rows, mut cochange_rows) = if risk_history.commits.is_empty() {
+        (vec![], vec![], vec![])
     } else {
-        // risk_scores: decay-weighted hotspot/fix_density from the full-history walk
-        // (O-C / ADR-003). Full history ensures decay weights span the commit
-        // lifetime rather than being capped at 90 days.
+        // Full-history walk feeds all score computation (O-C / ADR-003).
+        // risk_scores: decay-weighted hotspot/fix_density.
         let risk_scores = rskim_search::compute_file_risk_scores(
             &risk_history.commits,
             now_epoch,
             DEFAULT_HALF_LIFE_DAYS,
         );
-        // temporal_stats: windowed counts (changes_30d/90d) PLUS lifetime totals
-        // (total_commits/fix_commits). The 30d/90d fields reflect commits inside
-        // the window relative to now_epoch (timestamp arithmetic, no walk cap).
+        // temporal_stats: windowed counts (changes_30d/90d) PLUS lifetime totals.
         let temporal_stats =
             rskim_search::compute_file_temporal_stats(&risk_history.commits, now_epoch);
-        // cochange uses full history (lifetime co-change coupling).
-        cochange_rows = build_cochange_rows(&risk_history);
-        hotspot_rows = build_hotspot_rows(&risk_scores, &temporal_stats);
-        risk_rows = build_risk_rows(&risk_scores, &temporal_stats);
-    }
+        (
+            build_hotspot_rows(&risk_scores, &temporal_stats),
+            build_risk_rows(&risk_scores, &temporal_stats),
+            build_cochange_rows(&risk_history),
+        )
+    };
 
     // ── Build-time ghost filter (AD-408-1) ───────────────────────────────────
-    // AD-408-1: The build-time ghost filter is the single choke point for
-    // existence-checking. It is applied on freshly-computed rows *before*
-    // `db.sync` persists them (applies ADR-006: the prior DB survives on
-    // failure and self-heals). Hotspot/risk rows are retained only when the
-    // file exists on disk; cochange rows survive only when BOTH `file_a` AND
-    // `file_b` exist. Scores are NOT renormalized after the drop — dropping
-    // rows post-computation is sound because a file's own hotspot/risk score
-    // does not depend on deleted files, and each cochange row carries its
-    // baked-in Jaccard. This filter fixes all consumers (`--hot`/`--cold`/
-    // `--risky` text+JSON, `--blast-radius` partners) at one choke point.
+    // Applied on freshly-computed rows *before* `db.sync` persists them (applies
+    // ADR-006: the prior DB survives on failure and self-heals). Hotspot/risk rows
+    // are retained only when the file exists on disk; cochange rows survive only
+    // when BOTH `file_a` AND `file_b` exist. Scores are NOT renormalized after the
+    // drop — each row's score depends only on that file's own history, and cochange
+    // rows carry their baked-in Jaccard. This single choke point fixes all consumers
+    // (`--hot`/`--cold`/`--risky` text+JSON, `--blast-radius` partners).
     //
-    // Existence is resolved once per unique path (deduplication across all
-    // three row types) to avoid redundant stat syscalls — worst case 1×
-    // per unique path rather than up to 3×.
-    //
-    // For the empty-history case the three row slices are already empty so
-    // the retain calls are no-ops. The ghost filter is intentionally applied
-    // unconditionally (avoids a dead code branch and handles future call paths).
-    if !hotspot_rows.is_empty() || !risk_rows.is_empty() || !cochange_rows.is_empty() {
-        // Collect all unique paths across all three row types.
-        let unique_paths: std::collections::HashSet<&str> = hotspot_rows
-            .iter()
-            .map(|r| r.file_path.as_str())
-            .chain(risk_rows.iter().map(|r| r.file_path.as_str()))
-            .chain(
-                cochange_rows
-                    .iter()
-                    .flat_map(|r| [r.file_a.as_str(), r.file_b.as_str()]),
-            )
-            .collect();
-        // Resolve each unique path exactly once.
-        let existing: std::collections::HashSet<String> = unique_paths
-            .into_iter()
-            .filter(|p| tracked_path_exists(root, p))
-            .map(String::from)
-            .collect();
-        hotspot_rows.retain(|r| existing.contains(&r.file_path));
-        risk_rows.retain(|r| existing.contains(&r.file_path));
-        // Cochange: both sides must exist on disk.
-        cochange_rows.retain(|r| existing.contains(&r.file_a) && existing.contains(&r.file_b));
-    }
+    // Existence is resolved once per unique path across all three row types to avoid
+    // redundant stat syscalls (worst case 1× per path rather than up to 3×).
+    // For the empty-history case the slices are already empty, so retain is a no-op.
+    let unique_paths: std::collections::HashSet<&str> = hotspot_rows
+        .iter()
+        .map(|r| r.file_path.as_str())
+        .chain(risk_rows.iter().map(|r| r.file_path.as_str()))
+        .chain(
+            cochange_rows
+                .iter()
+                .flat_map(|r| [r.file_a.as_str(), r.file_b.as_str()]),
+        )
+        .collect();
+    let existing: std::collections::HashSet<String> = unique_paths
+        .into_iter()
+        .filter(|p| tracked_path_exists(root, p))
+        .map(String::from)
+        .collect();
+    hotspot_rows.retain(|r| existing.contains(&r.file_path));
+    risk_rows.retain(|r| existing.contains(&r.file_path));
+    // Cochange: both sides must exist on disk.
+    cochange_rows.retain(|r| existing.contains(&r.file_a) && existing.contains(&r.file_b));
 
     // ── Acquire lock (D4), then sync ─────────────────────────────────────────
     // Single sync path for both the empty-history and non-empty cases:

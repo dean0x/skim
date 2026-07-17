@@ -555,7 +555,7 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool
         Err(_) => return true,
     };
 
-    // Check 1: HEAD match.
+    // Check 1: HEAD match — absent row or mismatch both report stale.
     let stored_head: Option<String> = conn
         .query_row(
             "SELECT value FROM meta WHERE key = ?1",
@@ -563,12 +563,8 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool
             |row| row.get(0),
         )
         .ok();
-    match stored_head.as_deref() {
-        // HEAD mismatch → stale.
-        Some(stored) if stored != current_head => return true,
-        // No stored HEAD row (e.g. empty-repo DB or migration gap): stale.
-        None => return true,
-        _ => {}
+    if stored_head.as_deref() != Some(current_head) {
+        return true;
     }
 
     // AD-408-4: Check 2: data-version gate.
