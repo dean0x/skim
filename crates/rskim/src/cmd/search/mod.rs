@@ -57,7 +57,7 @@ pub(super) const NO_TEMPORAL_DATA_MSG: &str =
 /// separate (different format and prose descriptions).
 const KNOWN_FLAGS: &str = "--build, --rebuild, --update, --stats, --install-hooks, \
     --remove-hooks, --json, -j, --limit, -n, --offset, --root, --ast, --hot, --cold, \
-    --risky, --blast-radius, --weights, --phrase, --near, --lang";
+    --risky, --blast-radius, --weights, --phrase, --near, --lang, --help, -h";
 
 // ============================================================================
 // Public entry point
@@ -2191,9 +2191,24 @@ mod tests {
     #[test]
     fn test_parse_flags_unrecognised_flag_is_error() {
         let err = parse_flags(&["--unknown-flag".to_string()]).unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("unrecognised flag"),
-            "unexpected error message: {err}"
+            msg.contains("unrecognised flag"),
+            "unexpected error message: {msg}"
+        );
+        // KNOWN_FLAGS completeness (finding 3 from review): the error message embeds
+        // KNOWN_FLAGS verbatim, so `-n` (the --limit short alias added in #412) must
+        // appear in the "Valid flags" listing.  A regression removing `-n` from
+        // KNOWN_FLAGS would make this test fail while all other assertions still pass.
+        assert!(
+            msg.contains("-n"),
+            "unrecognised-flag error must list -n in the valid-flags help text; got: {msg}"
+        );
+        // --help/-h completeness (finding 5 from review): help flags must appear in
+        // the valid-flags listing so users see a complete picture.
+        assert!(
+            msg.contains("--help"),
+            "unrecognised-flag error must list --help in the valid-flags help text; got: {msg}"
         );
     }
 
@@ -2304,9 +2319,12 @@ mod tests {
     /// `--help` is reached (another sequential-error-wins case).
     #[test]
     fn test_parse_flags_bad_limit_value_before_help_errors_not_help() {
-        let err =
-            parse_flags(&["--limit".to_string(), "xyz".to_string(), "--help".to_string()])
-                .unwrap_err();
+        let err = parse_flags(&[
+            "--limit".to_string(),
+            "xyz".to_string(),
+            "--help".to_string(),
+        ])
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("positive integer"),
@@ -2492,6 +2510,30 @@ mod tests {
         assert!(
             err.to_string().contains("cannot combine"),
             "AC14: query + --build must be rejected as mixed form"
+        );
+    }
+
+    /// AD-412-5 (finding 2 from review): a whitespace-only positional combined with
+    /// an action flag MUST succeed (not error as mixed form).
+    ///
+    /// `validate_no_mixed_form` uses `.any(|p| !p.trim().is_empty())` so a
+    /// positional whose only content is whitespace is not counted as a real text
+    /// query.  `skim search "  " --rebuild` therefore dispatches to `Rebuild` and
+    /// silently discards the whitespace token — consistent with every downstream
+    /// dispatch site that trims before use.
+    ///
+    /// Discriminating coverage (avoids PF-007): a regression reverting the predicate
+    /// to `!query_parts.is_empty()` would restore the old `Err("cannot combine")`
+    /// and make this test fail, while the two non-whitespace tests above (`foo`,
+    /// `myterm`) continue to pass — so the stale guard cannot hide behind them.
+    #[test]
+    fn test_parse_flags_whitespace_only_positional_with_action_flag_succeeds() {
+        let flags = parse_flags(&["  ".to_string(), "--rebuild".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Rebuild,
+            "AD-412-5: whitespace-only positional + --rebuild must yield Rebuild, \
+             not a mixed-form error"
         );
     }
 
