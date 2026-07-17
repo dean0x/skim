@@ -2294,12 +2294,7 @@ mod tests {
     /// verbatim as a query token, not re-interpreted as a separator.
     #[test]
     fn test_parse_flags_second_dashdash_is_literal_query_text() {
-        let flags = parse_flags(&[
-            "--".to_string(),
-            "--".to_string(),
-            "x".to_string(),
-        ])
-        .unwrap();
+        let flags = parse_flags(&["--".to_string(), "--".to_string(), "x".to_string()]).unwrap();
         assert_eq!(
             flags.action,
             SearchAction::Query("-- x".to_string()),
