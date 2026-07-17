@@ -374,12 +374,15 @@ struct Flags {
     lang: Option<rskim_core::Language>,
 }
 
-impl Flags {
-    /// Construct a `Flags` value that signals "print help and exit."
-    ///
-    /// All fields other than `action` are at their defaults; they are never
-    /// read on the `SearchAction::Help` dispatch path in `run()`.
-    fn help() -> Self {
+/// Single source of truth for all `Flags` field defaults.
+///
+/// `parse_flags` initialises its local variables to these same values; if a
+/// default changes, update both this impl and the corresponding `let mut …`
+/// in `parse_flags` to keep them in sync.  `Flags::help()` delegates here so
+/// adding a new field only requires one edit instead of two (the compiler
+/// enforces exhaustiveness on struct literals in `Default::default`).
+impl Default for Flags {
+    fn default() -> Self {
         Flags {
             action: SearchAction::Help,
             json: false,
@@ -394,6 +397,18 @@ impl Flags {
             near: None,
             lang: None,
         }
+    }
+}
+
+impl Flags {
+    /// Construct a `Flags` value that signals "print help and exit."
+    ///
+    /// All fields other than `action` are at their defaults; they are never
+    /// read on the `SearchAction::Help` dispatch path in `run()`.  Uses
+    /// `Default::default()` so that adding a field only requires one edit
+    /// (the `Default` impl above) rather than duplicating all defaults here.
+    fn help() -> Self {
+        Default::default()
     }
 }
 
@@ -555,6 +570,8 @@ fn parse_temporal_flag(
 /// take_flag_value("--ast", Some("try-catch"), "--ast")         → Ok(("try-catch", true))
 /// take_flag_value("--ast", None, "--ast")                      → Err(…missing…)
 /// take_flag_value("--ast=  ", None, "--ast")                   → Err(…empty…)
+/// take_flag_value("--ast", Some("--help"), "--ast")            → Err(…requires a value; to print help…)
+/// take_flag_value("--ast", Some("-h"), "--ast")                → Err(…requires a value; to print help…)
 /// ```
 fn take_flag_value(
     arg: &str,
@@ -572,6 +589,17 @@ fn take_flag_value(
     // Space-separated form: the value is in the next token.
     let val =
         next_arg.ok_or_else(|| anyhow::anyhow!("{flag} requires a value (e.g. {flag} <value>)"))?;
+    // AD-412-3: --help/-h must not be silently consumed as a flag value.
+    // A user who types `--ast --help` or `--limit --help` almost certainly
+    // wants help output, not to search for a value named "--help".  Bail early
+    // with an actionable message so the intent is never silently misread.
+    if matches!(val.as_str(), "--help" | "-h") {
+        anyhow::bail!(
+            "{flag} requires a value (got {:?}); \
+             to print help, run: `skim search --help`",
+            val
+        );
+    }
     let trimmed = val.trim();
     if trimmed.is_empty() {
         anyhow::bail!("{flag} value must not be empty or whitespace-only");
@@ -825,12 +853,18 @@ fn resolve_root_and_cache(root_override: &Option<PathBuf>) -> anyhow::Result<(Pa
         // anyhow::Err → ExitCode::FAILURE; exit 2 is reserved for the parse path).
         Some(r) => {
             let canonical = r.canonicalize().map_err(|e| {
-                anyhow::anyhow!("--root {}: {e}. Pass the directory to index.", r.display())
+                // AD-412-4: use {:?} (Debug, quoted) on the raw user-supplied path so
+                // ANSI-escape or newline bytes in a crafted `--root` value cannot clear
+                // the terminal or forge log lines in AI-agent output (same pattern as
+                // the unrecognised-flag and mixed-form error paths).
+                anyhow::anyhow!("--root {:?}: {e}. Pass the directory to index.", r)
             })?;
             anyhow::ensure!(
                 canonical.is_dir(),
-                "--root {} is not a directory. Pass the directory to index.",
-                canonical.display()
+                // Canonical path is filesystem-derived (post-canonicalize), but apply
+                // the same {:?} guard for consistency with the AD-412-4 hardening.
+                "--root {:?} is not a directory. Pass the directory to index.",
+                canonical
             );
             canonical
         }
@@ -2160,6 +2194,123 @@ mod tests {
         assert!(
             err.to_string().contains("unrecognised flag"),
             "unexpected error message: {err}"
+        );
+    }
+
+    // ============================================================================
+    // AD-412-3: --help/-h must not be silently consumed as a value (finding 2)
+    // ============================================================================
+
+    /// `--ast --help`: `--help` must not be swallowed as the AST pattern value.
+    ///
+    /// Before the AD-412-3 fix, `take_flag_value("--ast", Some("--help"), "--ast")`
+    /// returned Ok(("--help", true)), so `ast = Some("--help")` propagated into
+    /// `validate_ast_pattern` which produced a confusing "unknown pattern" error
+    /// instead of pointing the user at the help surface.  The fix bails early with
+    /// a clear "requires a value; to print help, run: skim search --help" message.
+    #[test]
+    fn test_parse_flags_help_after_ast_is_not_consumed_as_value() {
+        let err = parse_flags(&["--ast".to_string(), "--help".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--ast requires a value"),
+            "AD-412-3: --help must not be silently consumed as the --ast value; got: {msg}"
+        );
+        assert!(
+            msg.contains("skim search --help"),
+            "error must point at the help surface; got: {msg}"
+        );
+    }
+
+    /// `--limit --help`: `--help` must not be swallowed as the limit value.
+    #[test]
+    fn test_parse_flags_help_after_limit_is_not_consumed_as_value() {
+        let err = parse_flags(&["--limit".to_string(), "--help".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--limit requires a value"),
+            "AD-412-3: --help must not be silently consumed as the --limit value; got: {msg}"
+        );
+        assert!(
+            msg.contains("skim search --help"),
+            "error must point at the help surface; got: {msg}"
+        );
+    }
+
+    /// `--root --help`: `--help` must not be silently accepted as a directory path.
+    ///
+    /// Before the fix `--root --help` ran a real search rooted at the bogus
+    /// path "--help" with exit 0, which was the worst outcome (silent wrong
+    /// behavior).  After the fix it is a clear error.
+    #[test]
+    fn test_parse_flags_help_after_root_is_not_consumed_as_value() {
+        let err = parse_flags(&["--root".to_string(), "--help".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--root requires a value"),
+            "AD-412-3: --help must not be silently consumed as the --root path; got: {msg}"
+        );
+        assert!(
+            msg.contains("skim search --help"),
+            "error must point at the help surface; got: {msg}"
+        );
+    }
+
+    /// Same as above but with the `-h` short form.
+    #[test]
+    fn test_parse_flags_short_h_after_ast_is_not_consumed_as_value() {
+        let err = parse_flags(&["--ast".to_string(), "-h".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--ast requires a value"),
+            "AD-412-3: -h must not be silently consumed as the --ast value; got: {msg}"
+        );
+    }
+
+    // ============================================================================
+    // AD-412-3: help-vs-error precedence (finding 5) — pin sequential behavior
+    // ============================================================================
+
+    /// `--badflag --help` → error, NOT help.
+    ///
+    /// Pre-delta (ad7b590), `run()` pre-scanned argv for `--help`/`-h` BEFORE
+    /// calling `parse_flags`, so a help request anywhere in argv — even after an
+    /// invalid flag — printed help and exited 0.
+    ///
+    /// Post-AD-412-3, `parse_flags` processes tokens sequentially: `--badflag`
+    /// hits the unrecognised-flag arm and errors before `--help` is reached.
+    /// This is consistent with #412's strict left-to-right direction and with
+    /// getopt semantics.  The test pins the new behaviour so any future regression
+    /// (restoring a pre-scan) is immediately detected (PF-007: discriminating).
+    #[test]
+    fn test_parse_flags_bad_flag_before_help_errors_not_help() {
+        let err = parse_flags(&["--badflag".to_string(), "--help".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        // Must error on the bad flag — NOT silently print help.
+        assert!(
+            msg.contains("unrecognised flag"),
+            "AD-412-3: --badflag before --help must produce an error (not help); got: {msg}"
+        );
+        // The error must name the offending token (PF-007: discriminating observable).
+        assert!(
+            msg.contains("--badflag"),
+            "error must name the unrecognised flag '--badflag'; got: {msg}"
+        );
+    }
+
+    /// `--limit xyz --help` → error (bad value wins, not help).
+    ///
+    /// The invalid value `xyz` triggers `parse_limit_value` to error before
+    /// `--help` is reached (another sequential-error-wins case).
+    #[test]
+    fn test_parse_flags_bad_limit_value_before_help_errors_not_help() {
+        let err =
+            parse_flags(&["--limit".to_string(), "xyz".to_string(), "--help".to_string()])
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("positive integer"),
+            "AD-412-3: bad --limit value before --help must produce a parse error; got: {msg}"
         );
     }
 
