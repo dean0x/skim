@@ -84,10 +84,8 @@ pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    // AD-412-3: Restrict the help scan to tokens BEFORE the first `--` so that
-    // `search -- -h` performs a search (`-h` becomes literal query text per
-    // AD-412-2) while `search -h` still prints help. Tokens after `--` are literal
-    // query text and must not trigger the help scan.
+    // Restrict the help scan to tokens before the first `--` so that
+    // `search -- -h` searches for "-h" rather than printing help.
     if args.is_empty()
         || args
             .iter()
@@ -658,35 +656,14 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                     i += 1;
                 }
             }
-            // AD-412-2: End-of-flags separator. The first `--` stops flag parsing and
-            // drains all remaining tokens verbatim into the query. Only the first `--` is
-            // special; a second `--` in the remaining tokens becomes literal query text.
-            // This is the escape hatch that makes dash-leading literals (`-Werror`, `->`,
-            // `--rebuild`) searchable now that AD-412-1 rejects unknown single-dash flags.
-            // The slice drain is bounded by `args.len()`, satisfying reliability.md.
-            // Note: flags placed AFTER `--` (e.g. `--json`) become literal query text;
-            // output flags must be placed BEFORE `--` (e.g. `skim search --json -- <term>`).
+            // End-of-flags separator: drain remaining tokens verbatim into the query.
+            // Output flags (--json, --limit, …) must appear BEFORE `--`.
             "--" => {
                 query_parts.extend(args[i + 1..].iter().cloned());
                 break;
             }
-            s if s.starts_with("--") => {
-                anyhow::bail!(
-                    "unrecognised flag {s:?}. \
-                     To search a literal dash-leading term, use `--` (e.g. `skim search -- {s}`). \
-                     Valid flags: --build, --rebuild, --update, \
-                     --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --offset, \
-                     --root, --ast, --hot, --cold, --risky, --blast-radius, --weights, \
-                     --phrase, --near, --lang"
-                );
-            }
-            // AD-412-1: Reject unknown single-dash flags symmetrically with long flags. Any
-            // token starting with `-` and at least 2 chars long that reached this arm is
-            // unrecognised and is rejected with the same error as the long-flag arm above.
-            // Bare `-` (len == 1) intentionally falls through to the positional catch-all
-            // (a lone dash is a valid query term, not a flag). This arm uses no
-            // sibling-flag-absent guard (avoids PF-006 — it matches unconditionally on
-            // token shape, not on the absence of another flag).
+            // Reject any unrecognised dash-prefixed token (both `--foo` and `-x`).
+            // Bare `-` (len == 1) falls through to the positional catch-all below.
             s if s.starts_with('-') && s.len() >= 2 => {
                 anyhow::bail!(
                     "unrecognised flag {s:?}. \
@@ -703,13 +680,9 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
         i += 1;
     }
 
-    // AD-412-5: Hard error when an action flag (Some) and a non-empty text query
-    // appear together. Before this guard, `search foo --rebuild` silently dropped
-    // `foo` and ran the rebuild (action_flag won via `unwrap_or_else`). Now it
-    // exits non-zero with an actionable error describing the conflict and naming
-    // the `--` escape hatch as the correct way to search for a flag-shaped string.
-    // Validation runs AFTER all arg parsing so action_flag and query_parts are
-    // fully collected before the check. (OD6, user-confirmed 2026-07-17)
+    // Hard error when an action flag and a text query appear together — e.g.
+    // `search foo --rebuild` is ambiguous. Validated after full arg parsing so
+    // both sides are collected before the check.
     if action_flag.is_some() && !query_parts.is_empty() {
         let query = query_parts.join(" ");
         anyhow::bail!(
@@ -2095,7 +2068,7 @@ mod tests {
     }
 
     // ============================================================================
-    // AD-412-1: unknown single-dash flags rejected symmetrically (AC1, AC11)
+    // Unknown single-dash flags rejected symmetrically (AC1, AC11)
     // ============================================================================
 
     /// AC1: -i is rejected with "unrecognised flag" (not folded into the query).
@@ -2135,7 +2108,7 @@ mod tests {
     }
 
     // ============================================================================
-    // AD-412-2: `--` end-of-flags separator (AC2, AC3, AC10)
+    // `--` end-of-flags separator (AC2, AC3, AC10)
     // ============================================================================
 
     /// AC2: `['--', '-i']` yields Query("-i") — separator drains following tokens verbatim.
@@ -2221,31 +2194,7 @@ mod tests {
     }
 
     // ============================================================================
-    // AC7 (NEGATIVE regression): recognized short flags not shadowed by AD-412-1
-    // ============================================================================
-
-    /// AC7: -j still sets json=true after AD-412-1 is placed after the -j arm.
-    #[test]
-    fn test_parse_flags_short_j_still_sets_json_after_412() {
-        let flags = parse_flags(&["-j".to_string()]).unwrap();
-        assert!(
-            flags.json,
-            "AC7: -j must still set json=true; the AD-412-1 arm must not shadow it"
-        );
-    }
-
-    /// AC7: -n 3 still sets limit=3 after AD-412-1.
-    #[test]
-    fn test_parse_flags_short_n_with_value_still_sets_limit_after_412() {
-        let flags = parse_flags(&["-n".to_string(), "3".to_string()]).unwrap();
-        assert_eq!(
-            flags.limit, 3,
-            "AC7: -n 3 must still set limit=3; AD-412-1 must not shadow -n"
-        );
-    }
-
-    // ============================================================================
-    // AD-412-5: mixed-form hard error (action flag + query text) (AC14)
+    // Mixed-form hard error: action flag + query text (AC14)
     // ============================================================================
 
     /// AC14: `['foo', '--rebuild']` is rejected — cannot combine query and action flag.

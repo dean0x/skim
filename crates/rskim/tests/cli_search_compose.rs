@@ -1446,16 +1446,6 @@ mod argv_parser_412 {
     use predicates::prelude::*;
     use serde_json::Value;
 
-    // ---- Helpers ----------------------------------------------------------------
-
-    fn make_project_412(root: &std::path::Path) {
-        super::make_project(root);
-    }
-
-    fn build_index_412(proj: &std::path::Path, cache: &std::path::Path) {
-        super::build_index(proj, cache);
-    }
-
     /// Collect `path` fields from a `skim search --json` result.
     fn result_paths_from_json(json_str: &str) -> Vec<String> {
         let v: Value = serde_json::from_str(json_str.trim())
@@ -1472,15 +1462,12 @@ mod argv_parser_412 {
 
     /// AC1: `skim search error -i --root <proj>` exits 1 with "unrecognised flag"
     /// in stderr — the flag must NOT be folded into the query.
-    ///
-    /// Discriminating (PF-007): before AD-412-1, the binary exited 0 and returned
-    /// results for query `"error -i"`; now it must exit 1.
     #[test]
     fn ac1_unknown_short_flag_exits_one_with_message() {
         let proj = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
-        make_project_412(proj.path());
-        build_index_412(proj.path(), cache.path());
+        super::make_project(proj.path());
+        super::build_index(proj.path(), cache.path());
 
         Command::cargo_bin("skim")
             .unwrap()
@@ -1497,15 +1484,12 @@ mod argv_parser_412 {
 
     /// AC4: `skim search error -i --json` exits 1 with "unrecognised flag" in stderr
     /// and NO JSON envelope on stdout (rejection fires before any query rendering).
-    ///
-    /// Discriminating (PF-007): before AD-412-1, the binary emitted a JSON body
-    /// with `"query": "error -i"`. Now stdout must be empty / contain no `{`.
     #[test]
     fn ac4_rejection_is_parse_time_no_json_on_error() {
         let proj = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
-        make_project_412(proj.path());
-        build_index_412(proj.path(), cache.path());
+        super::make_project(proj.path());
+        super::build_index(proj.path(), cache.path());
 
         let out = Command::cargo_bin("skim")
             .unwrap()
@@ -1534,16 +1518,12 @@ mod argv_parser_412 {
 
     /// AC3: `skim search --json -- --rebuild --root <proj>` searches for the literal
     /// text "--rebuild" and does NOT rebuild the index.
-    ///
-    /// Discriminating (PF-007): before AD-412-2, the `--rebuild` arm fired and ran
-    /// a full rebuild (stdout empty, stderr had "indexed"). Now stdout is a JSON
-    /// envelope with `query == "--rebuild"` and stderr must NOT contain "indexed".
     #[test]
     fn ac3_dashdash_separator_prevents_action_flag_hijack() {
         let proj = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
-        make_project_412(proj.path());
-        build_index_412(proj.path(), cache.path());
+        super::make_project(proj.path());
+        super::build_index(proj.path(), cache.path());
 
         let out = Command::cargo_bin("skim")
             .unwrap()
@@ -1578,14 +1558,12 @@ mod argv_parser_412 {
     ///
     /// AC5(b): `skim search -h` exits 0 and stdout DOES contain "layered n-gram BM25F"
     /// (bare -h before `--` still triggers help).
-    ///
-    /// Discriminating (PF-007): a broken take_while would flip at least one assertion.
     #[test]
     fn ac5_help_scan_bounded_at_dashdash() {
         let proj = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
-        make_project_412(proj.path());
-        build_index_412(proj.path(), cache.path());
+        super::make_project(proj.path());
+        super::build_index(proj.path(), cache.path());
 
         // AC5(a): `search -- -h` must search, not print help.
         let out_search = Command::cargo_bin("skim")
@@ -1621,19 +1599,16 @@ mod argv_parser_412 {
         );
     }
 
-    // ---- AC9: JSON stdout key set unchanged by AD-412-4 ----------------------
+    // ---- AC9: JSON stdout key set unchanged by query echo --------------------
 
     /// AC9: A normal `skim search <term> --json` query's top-level key set is
-    /// unchanged after AD-412-4. The echo must NOT leak into the JSON envelope.
-    ///
-    /// Discriminating (PF-007): if a new key were added by the echo, `extra_keys`
-    /// would be non-empty and the assertion fails.
+    /// unchanged; the query echo must NOT leak new keys into the JSON envelope.
     #[test]
     fn ac9_json_stdout_key_set_unchanged() {
         let proj = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
-        make_project_412(proj.path());
-        build_index_412(proj.path(), cache.path());
+        super::make_project(proj.path());
+        super::build_index(proj.path(), cache.path());
 
         let out = Command::cargo_bin("skim")
             .unwrap()
@@ -1675,7 +1650,7 @@ mod argv_parser_412 {
 
         assert!(
             extra_keys.is_empty(),
-            "AC9: JSON output must not have unexpected keys after AD-412-4; \
+            "AC9: JSON output must not have unexpected keys; \
              unexpected: {extra_keys:?}\nstdout:\n{stdout}"
         );
 
@@ -1689,17 +1664,14 @@ mod argv_parser_412 {
 
     // ---- AC10: `--` rescues dash-leading literals; bare `-` stays positional --
 
-    /// AC10: `skim search -- error` returns the SAME result paths as
-    /// `skim search error` (equality, not just success — per PF-007).
-    ///
-    /// Discriminating: if `--` were mishandled (e.g. empty query, mangled term),
-    /// the path sets would differ.
+    /// AC10: `skim search -- error` returns the same result paths as
+    /// `skim search error`.
     #[test]
     fn ac10_dashdash_returns_same_results_as_bare_query() {
         let proj = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
-        make_project_412(proj.path());
-        build_index_412(proj.path(), cache.path());
+        super::make_project(proj.path());
+        super::build_index(proj.path(), cache.path());
 
         // Baseline: direct query.
         let out_direct = Command::cargo_bin("skim")
@@ -1746,15 +1718,12 @@ mod argv_parser_412 {
 
     /// AC14: `skim search foo --rebuild --root <proj>` exits 1 with a conflict
     /// description in stderr and does NOT rebuild the index.
-    ///
-    /// Discriminating (PF-007): before AD-412-5, the binary silently dropped "foo"
-    /// and ran the rebuild (exit 0, "indexed" on stderr). Now it must exit 1.
     #[test]
     fn ac14_mixed_form_action_and_query_is_error() {
         let proj = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
-        make_project_412(proj.path());
-        build_index_412(proj.path(), cache.path());
+        super::make_project(proj.path());
+        super::build_index(proj.path(), cache.path());
 
         let out = Command::cargo_bin("skim")
             .unwrap()
@@ -1792,9 +1761,6 @@ mod argv_parser_412 {
 
     /// AC12: `skim search --help` stdout must contain a `--` end-of-flags
     /// description, and existing help assertions must still pass.
-    ///
-    /// Discriminating (PF-007): if the `--` documentation line is removed from
-    /// SEARCH_HELP_TEXT, this assertion fails.
     #[test]
     fn ac12_help_documents_dashdash_end_of_flags() {
         Command::cargo_bin("skim")
