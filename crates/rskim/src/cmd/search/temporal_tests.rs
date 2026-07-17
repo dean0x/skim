@@ -814,10 +814,7 @@ fn standalone_hot_text_has_table_columns() {
 // are a zero-regression at offset=0 (PF-007 / AC-404-12).
 //
 // Coverage: arm10 (hot standalone) and arm11 (blast-radius standalone) — both
-// text and JSON output formats (4 fixtures total).  Arms 01–09 cover lexical
-// and AST query output produced by `format_text_output` / `format_json_output`
-// / `format_ast_text`; those formatters are exercised in query_tests.rs and
-// ast_tests.rs, not here.
+// text and JSON output formats (4 fixtures total).
 
 /// AC-404-12 / PF-007: `format_temporal_text` at offset 0 must produce output
 /// matching the arm10 golden fixture (standalone --hot, 5 files).
