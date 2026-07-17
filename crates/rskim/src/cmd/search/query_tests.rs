@@ -293,6 +293,64 @@ fn test_format_text_output_includes_stale_marker() {
 }
 
 // ============================================================================
+// AD-412-4: format_text_output echoes effective query in non-empty summary (AC6)
+// ============================================================================
+
+/// AC6 (AD-412-4): The non-empty human-text summary line includes the effective
+/// query so a silently-mangled query can never masquerade as a successful search.
+///
+/// Discriminating (PF-007): if the echo is removed (summary reverts to the old
+/// `"N result(s) in Xms"` form), the `contains("widget")` assertion fails.
+#[test]
+fn test_format_text_output_non_empty_echoes_query() {
+    use crate::cmd::search::types::{ResolvedResult, SnippetContext, SnippetLine};
+
+    let result = ResolvedResult {
+        path: "src/widget.rs".to_string(),
+        score: 7.5,
+        field: "function_signature".to_string(),
+        line_number: Some(1),
+        line_range: Some(1..2),
+        snippet: Some(SnippetContext {
+            lines: vec![SnippetLine {
+                line_number: 1,
+                content: "pub fn widget() {}".to_string(),
+                is_match: true,
+            }],
+        }),
+        stale: false,
+        match_positions: vec![],
+        temporal: None,
+        layers_matched: vec![],
+    };
+
+    let output = QueryOutput {
+        query: "widget".to_string(),
+        total: 1,
+        has_more: false,
+        verify_mode: None,
+        results: vec![result],
+        duration_ms: 2,
+        index_stats: None,
+        ast_coverage: None,
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_text_output(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    // AC6: summary line must contain the query text ("widget") and "result(s)".
+    assert!(
+        s.contains("widget"),
+        "AC6 (AD-412-4): summary line must echo effective query 'widget'; got: {s:?}"
+    );
+    assert!(
+        s.contains("result(s)"),
+        "AC6: summary line must contain 'result(s)'; got: {s:?}"
+    );
+}
+
+// ============================================================================
 // Edge cases: no .git, corrupt index
 // ============================================================================
 

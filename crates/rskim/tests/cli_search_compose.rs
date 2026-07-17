@@ -1431,3 +1431,379 @@ mod tracked_union_402 {
         );
     }
 }
+
+// ============================================================================
+// #412 — argv parser: short-flag rejection, `--` separator, mixed-form error,
+//         effective-query echo, help-scan bounded at `--`
+// ============================================================================
+//
+// All E2E tests here drive the real `skim` binary (assert_cmd) to exercise
+// the full dispatch chain: main → search::run → parse_flags → output.
+// Unit-level parse_flags coverage lives in cmd/search/mod.rs #[cfg(test)].
+
+mod argv_parser_412 {
+    use assert_cmd::Command;
+    use predicates::prelude::*;
+    use serde_json::Value;
+
+    // ---- Helpers ----------------------------------------------------------------
+
+    fn make_project_412(root: &std::path::Path) {
+        super::make_project(root);
+    }
+
+    fn build_index_412(proj: &std::path::Path, cache: &std::path::Path) {
+        super::build_index(proj, cache);
+    }
+
+    /// Collect `path` fields from a `skim search --json` result.
+    fn result_paths_from_json(json_str: &str) -> Vec<String> {
+        let v: Value = serde_json::from_str(json_str.trim())
+            .unwrap_or_else(|e| panic!("JSON parse error ({e}); got:\n{json_str}"));
+        v["results"]
+            .as_array()
+            .expect("must have 'results' array")
+            .iter()
+            .filter_map(|r| r["path"].as_str().map(ToString::to_string))
+            .collect()
+    }
+
+    // ---- AC1: Unknown single-dash flags exit 1 at the CLI level ---------------
+
+    /// AC1: `skim search error -i --root <proj>` exits 1 with "unrecognised flag"
+    /// in stderr — the flag must NOT be folded into the query.
+    ///
+    /// Discriminating (PF-007): before AD-412-1, the binary exited 0 and returned
+    /// results for query `"error -i"`; now it must exit 1.
+    #[test]
+    fn ac1_unknown_short_flag_exits_one_with_message() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        make_project_412(proj.path());
+        build_index_412(proj.path(), cache.path());
+
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "error", "-i", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .failure()
+            .code(1)
+            .stderr(predicate::str::contains("unrecognised flag"));
+    }
+
+    // ---- AC4: Rejection is parse-time; no JSON emitted on error ---------------
+
+    /// AC4: `skim search error -i --json` exits 1 with "unrecognised flag" in stderr
+    /// and NO JSON envelope on stdout (rejection fires before any query rendering).
+    ///
+    /// Discriminating (PF-007): before AD-412-1, the binary emitted a JSON body
+    /// with `"query": "error -i"`. Now stdout must be empty / contain no `{`.
+    #[test]
+    fn ac4_rejection_is_parse_time_no_json_on_error() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        make_project_412(proj.path());
+        build_index_412(proj.path(), cache.path());
+
+        let out = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "error", "-i", "--json", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .failure()
+            .code(1)
+            .stderr(predicate::str::contains("unrecognised flag"))
+            .get_output()
+            .clone();
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains('{'),
+            "AC4: stdout must contain no JSON envelope on rejection; got:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"query\""),
+            "AC4: stdout must not contain 'query' key on rejection; got:\n{stdout}"
+        );
+    }
+
+    // ---- AC3/AC2 (E2E): `--` separator prevents action-flag hijack -----------
+
+    /// AC3: `skim search --json -- --rebuild --root <proj>` searches for the literal
+    /// text "--rebuild" and does NOT rebuild the index.
+    ///
+    /// Discriminating (PF-007): before AD-412-2, the `--rebuild` arm fired and ran
+    /// a full rebuild (stdout empty, stderr had "indexed"). Now stdout is a JSON
+    /// envelope with `query == "--rebuild"` and stderr must NOT contain "indexed".
+    #[test]
+    fn ac3_dashdash_separator_prevents_action_flag_hijack() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        make_project_412(proj.path());
+        build_index_412(proj.path(), cache.path());
+
+        let out = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "--json", "--", "--rebuild", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        let json: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("AC3: stdout must be valid JSON ({e}); got:\n{stdout}"));
+        assert_eq!(
+            json["query"].as_str(),
+            Some("--rebuild"),
+            "AC3: JSON query field must be '--rebuild'; got:\n{stdout}"
+        );
+        assert!(
+            !stderr.contains("indexed"),
+            "AC3: the index must NOT be rebuilt (no 'indexed' marker); stderr:\n{stderr}"
+        );
+    }
+
+    // ---- AC5: Help scan bounded at first `--` --------------------------------
+
+    /// AC5(a): `skim search -- -h --root <proj>` exits 0 and stdout does NOT
+    /// contain the help marker "layered n-gram BM25F" (it searched, not helped).
+    ///
+    /// AC5(b): `skim search -h` exits 0 and stdout DOES contain "layered n-gram BM25F"
+    /// (bare -h before `--` still triggers help).
+    ///
+    /// Discriminating (PF-007): a broken take_while would flip at least one assertion.
+    #[test]
+    fn ac5_help_scan_bounded_at_dashdash() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        make_project_412(proj.path());
+        build_index_412(proj.path(), cache.path());
+
+        // AC5(a): `search -- -h` must search, not print help.
+        let out_search = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "--", "-h", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+
+        let stdout_search = String::from_utf8_lossy(&out_search.stdout);
+        assert!(
+            !stdout_search.contains("layered n-gram BM25F"),
+            "AC5(a): `search -- -h` must not print help; stdout:\n{stdout_search}"
+        );
+
+        // AC5(b): `search -h` must still print help.
+        let out_help = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "-h"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+
+        let stdout_help = String::from_utf8_lossy(&out_help.stdout);
+        assert!(
+            stdout_help.contains("layered n-gram BM25F"),
+            "AC5(b): `search -h` must still print help with 'layered n-gram BM25F'; \
+             stdout:\n{stdout_help}"
+        );
+    }
+
+    // ---- AC9: JSON stdout key set unchanged by AD-412-4 ----------------------
+
+    /// AC9: A normal `skim search <term> --json` query's top-level key set is
+    /// unchanged after AD-412-4. The echo must NOT leak into the JSON envelope.
+    ///
+    /// Discriminating (PF-007): if a new key were added by the echo, `extra_keys`
+    /// would be non-empty and the assertion fails.
+    #[test]
+    fn ac9_json_stdout_key_set_unchanged() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        make_project_412(proj.path());
+        build_index_412(proj.path(), cache.path());
+
+        let out = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "error", "--json", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let json: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("AC9: stdout must be valid JSON ({e}); got:\n{stdout}"));
+
+        let allowed_keys: std::collections::HashSet<&str> = [
+            "query",
+            "total",
+            "results",
+            "duration_ms",
+            "has_more",
+            "verify_mode",
+            "ast_coverage",
+            "index_stats",
+            "mode",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        let obj = json
+            .as_object()
+            .expect("AC9: top-level JSON must be an object");
+        let extra_keys: Vec<&str> = obj
+            .keys()
+            .filter(|k| !allowed_keys.contains(k.as_str()))
+            .map(String::as_str)
+            .collect();
+
+        assert!(
+            extra_keys.is_empty(),
+            "AC9: JSON output must not have unexpected keys after AD-412-4; \
+             unexpected: {extra_keys:?}\nstdout:\n{stdout}"
+        );
+
+        // Confirm `query` key is present and correct.
+        assert_eq!(
+            json["query"].as_str(),
+            Some("error"),
+            "AC9: 'query' field must be the search term; stdout:\n{stdout}"
+        );
+    }
+
+    // ---- AC10: `--` rescues dash-leading literals; bare `-` stays positional --
+
+    /// AC10: `skim search -- error` returns the SAME result paths as
+    /// `skim search error` (equality, not just success — per PF-007).
+    ///
+    /// Discriminating: if `--` were mishandled (e.g. empty query, mangled term),
+    /// the path sets would differ.
+    #[test]
+    fn ac10_dashdash_returns_same_results_as_bare_query() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        make_project_412(proj.path());
+        build_index_412(proj.path(), cache.path());
+
+        // Baseline: direct query.
+        let out_direct = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "error", "--json", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let direct_paths = result_paths_from_json(&String::from_utf8_lossy(&out_direct.stdout));
+        assert!(
+            !direct_paths.is_empty(),
+            "AC10 fixture guard: 'error' must match at least one file in make_project corpus"
+        );
+
+        // Via `--`: semantically identical query.
+        let out_escaped = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "--json", "--", "error", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let escaped_paths = result_paths_from_json(&String::from_utf8_lossy(&out_escaped.stdout));
+
+        // Sort both for deterministic comparison.
+        let mut direct_sorted = direct_paths.clone();
+        let mut escaped_sorted = escaped_paths.clone();
+        direct_sorted.sort();
+        escaped_sorted.sort();
+
+        assert_eq!(
+            direct_sorted, escaped_sorted,
+            "AC10: `search -- error` and `search error` must return the same result paths; \
+             direct={direct_paths:?}, escaped={escaped_paths:?}"
+        );
+    }
+
+    // ---- AC14: Mixed-form hard error (action flag + query text) --------------
+
+    /// AC14: `skim search foo --rebuild --root <proj>` exits 1 with a conflict
+    /// description in stderr and does NOT rebuild the index.
+    ///
+    /// Discriminating (PF-007): before AD-412-5, the binary silently dropped "foo"
+    /// and ran the rebuild (exit 0, "indexed" on stderr). Now it must exit 1.
+    #[test]
+    fn ac14_mixed_form_action_and_query_is_error() {
+        let proj = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        make_project_412(proj.path());
+        build_index_412(proj.path(), cache.path());
+
+        let out = Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "foo", "--rebuild", "--root"])
+            .arg(proj.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .assert()
+            .failure()
+            .code(1)
+            .get_output()
+            .clone();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        assert!(
+            stderr.contains("cannot combine"),
+            "AC14: stderr must describe the conflict ('cannot combine'); got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("--"),
+            "AC14: stderr must mention the '--' escape hatch; got:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("indexed"),
+            "AC14: the index must NOT be rebuilt; got stderr:\n{stderr}"
+        );
+        assert!(
+            stdout.is_empty() || !stdout.contains('{'),
+            "AC14: stdout must not contain a JSON/results envelope; got:\n{stdout}"
+        );
+    }
+
+    // ---- AC12: SEARCH_HELP_TEXT documents `--` end-of-flags -----------------
+
+    /// AC12: `skim search --help` stdout must contain a `--` end-of-flags
+    /// description, and existing help assertions must still pass.
+    ///
+    /// Discriminating (PF-007): if the `--` documentation line is removed from
+    /// SEARCH_HELP_TEXT, this assertion fails.
+    #[test]
+    fn ac12_help_documents_dashdash_end_of_flags() {
+        Command::cargo_bin("skim")
+            .unwrap()
+            .args(["search", "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("End of flags"))
+            // The established help marker must still be present (AC7 regression guard).
+            .stdout(predicate::str::contains("layered n-gram BM25F"));
+    }
+}

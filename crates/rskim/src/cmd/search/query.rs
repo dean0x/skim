@@ -1393,7 +1393,16 @@ pub(super) fn format_text_output(
         writeln!(w)?;
     }
 
-    writeln!(w, "{} result(s) in {}ms", output.total, output.duration_ms)?;
+    // AD-412-4: Echo the effective query in the non-empty human summary so a
+    // silently-mangled query can never masquerade as a successful search.
+    // Using {:?} matches the empty-branch quoting convention (`no results for {:?}`)
+    // for uniform escaping. JSON already carries `query`; this echo is text-only
+    // and does NOT alter JSON output.
+    writeln!(
+        w,
+        "{} result(s) for {:?} in {}ms",
+        output.total, output.query, output.duration_ms
+    )?;
 
     Ok(())
 }

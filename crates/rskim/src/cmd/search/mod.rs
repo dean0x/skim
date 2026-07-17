@@ -84,8 +84,16 @@ pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    // No args or --help/-h → print help
-    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+    // AD-412-3: Restrict the help scan to tokens BEFORE the first `--` so that
+    // `search -- -h` performs a search (`-h` becomes literal query text per
+    // AD-412-2) while `search -h` still prints help. Tokens after `--` are literal
+    // query text and must not trigger the help scan.
+    if args.is_empty()
+        || args
+            .iter()
+            .take_while(|a| a.as_str() != "--")
+            .any(|a| matches!(a.as_str(), "--help" | "-h"))
+    {
         print_help();
         return Ok(ExitCode::SUCCESS);
     }
@@ -650,19 +658,65 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                     i += 1;
                 }
             }
+            // AD-412-2: End-of-flags separator. The first `--` stops flag parsing and
+            // drains all remaining tokens verbatim into the query. Only the first `--` is
+            // special; a second `--` in the remaining tokens becomes literal query text.
+            // This is the escape hatch that makes dash-leading literals (`-Werror`, `->`,
+            // `--rebuild`) searchable now that AD-412-1 rejects unknown single-dash flags.
+            // The slice drain is bounded by `args.len()`, satisfying reliability.md.
+            // Note: flags placed AFTER `--` (e.g. `--json`) become literal query text;
+            // output flags must be placed BEFORE `--` (e.g. `skim search --json -- <term>`).
+            "--" => {
+                query_parts.extend(args[i + 1..].iter().cloned());
+                break;
+            }
             s if s.starts_with("--") => {
                 anyhow::bail!(
-                    "unrecognised flag {:?}. Valid flags: --build, --rebuild, --update, \
+                    "unrecognised flag {s:?}. \
+                     To search a literal dash-leading term, use `--` (e.g. `skim search -- {s}`). \
+                     Valid flags: --build, --rebuild, --update, \
                      --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --offset, \
                      --root, --ast, --hot, --cold, --risky, --blast-radius, --weights, \
-                     --phrase, --near, --lang",
-                    s
+                     --phrase, --near, --lang"
+                );
+            }
+            // AD-412-1: Reject unknown single-dash flags symmetrically with long flags. Any
+            // token starting with `-` and at least 2 chars long that reached this arm is
+            // unrecognised and is rejected with the same error as the long-flag arm above.
+            // Bare `-` (len == 1) intentionally falls through to the positional catch-all
+            // (a lone dash is a valid query term, not a flag). This arm uses no
+            // sibling-flag-absent guard (avoids PF-006 — it matches unconditionally on
+            // token shape, not on the absence of another flag).
+            s if s.starts_with('-') && s.len() >= 2 => {
+                anyhow::bail!(
+                    "unrecognised flag {s:?}. \
+                     To search a literal dash-leading term, use `--` (e.g. `skim search -- {s}`). \
+                     Valid flags: --build, --rebuild, --update, \
+                     --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --offset, \
+                     --root, --ast, --hot, --cold, --risky, --blast-radius, --weights, \
+                     --phrase, --near, --lang"
                 );
             }
             // Positional arg — part of the query text.
             s => query_parts.push(s.to_string()),
         }
         i += 1;
+    }
+
+    // AD-412-5: Hard error when an action flag (Some) and a non-empty text query
+    // appear together. Before this guard, `search foo --rebuild` silently dropped
+    // `foo` and ran the rebuild (action_flag won via `unwrap_or_else`). Now it
+    // exits non-zero with an actionable error describing the conflict and naming
+    // the `--` escape hatch as the correct way to search for a flag-shaped string.
+    // Validation runs AFTER all arg parsing so action_flag and query_parts are
+    // fully collected before the check. (OD6, user-confirmed 2026-07-17)
+    if action_flag.is_some() && !query_parts.is_empty() {
+        let query = query_parts.join(" ");
+        anyhow::bail!(
+            "cannot combine a text query ({query:?}) with an action flag \
+             (--build / --rebuild / --update / --stats / --install-hooks / --remove-hooks). \
+             To search for the literal text, use: `skim search -- {query}`"
+        );
     }
 
     let action = action_flag.unwrap_or_else(|| SearchAction::Query(query_parts.join(" ")));
@@ -1381,6 +1435,10 @@ Options:
   --limit N        Maximum results to return (default: 20)
   --offset N       Skip N verified results (pagination; default: 0)
   --root PATH      Override project root (default: walk up to .git)
+  --               End of flags. All tokens after `--` are literal query text,
+                   even if they look like flags. Use this to search for
+                   dash-leading terms (e.g. `skim search -- -Werror`).
+                   Output flags (--json, --limit) must be placed BEFORE `--`.
   -h, --help       Print this help message
 
 Positional query options:
@@ -2033,6 +2091,185 @@ mod tests {
         assert!(
             err.to_string().contains("unrecognised flag"),
             "unexpected error message: {err}"
+        );
+    }
+
+    // ============================================================================
+    // AD-412-1: unknown single-dash flags rejected symmetrically (AC1, AC11)
+    // ============================================================================
+
+    /// AC1: -i is rejected with "unrecognised flag" (not folded into the query).
+    /// AC11: error message mentions the `--` escape hatch.
+    #[test]
+    fn test_parse_flags_unknown_short_flag_i_is_error() {
+        let err = parse_flags(&["-i".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unrecognised flag"),
+            "AC1: -i must produce 'unrecognised flag'; got: {msg}"
+        );
+        assert!(
+            msg.contains("--"),
+            "AC11: error message must mention the '--' escape hatch; got: {msg}"
+        );
+    }
+
+    /// AC1: -w is rejected symmetrically with long flags.
+    #[test]
+    fn test_parse_flags_unknown_short_flag_w_is_error() {
+        let err = parse_flags(&["-w".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("unrecognised flag"),
+            "AC1: -w must produce 'unrecognised flag'"
+        );
+    }
+
+    /// AC1: -C is rejected symmetrically with long flags.
+    #[test]
+    fn test_parse_flags_unknown_short_flag_c_is_error() {
+        let err = parse_flags(&["-C".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("unrecognised flag"),
+            "AC1: -C must produce 'unrecognised flag'"
+        );
+    }
+
+    // ============================================================================
+    // AD-412-2: `--` end-of-flags separator (AC2, AC3, AC10)
+    // ============================================================================
+
+    /// AC2: `['--', '-i']` yields Query("-i") — separator drains following tokens verbatim.
+    #[test]
+    fn test_parse_flags_dashdash_before_short_flag_becomes_query() {
+        let flags = parse_flags(&["--".to_string(), "-i".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("-i".to_string()),
+            "AC2: ['--', '-i'] must yield Query(\"-i\")"
+        );
+    }
+
+    /// AC2: `['foo', '--', '--limit']` yields Query("foo --limit").
+    #[test]
+    fn test_parse_flags_query_then_dashdash_drains_flag_as_literal() {
+        let flags =
+            parse_flags(&["foo".to_string(), "--".to_string(), "--limit".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("foo --limit".to_string()),
+            "AC2: ['foo', '--', '--limit'] must yield Query(\"foo --limit\")"
+        );
+    }
+
+    /// AC2/AC3: `['--', '--rebuild']` yields Query("--rebuild") — no rebuild action fired.
+    #[test]
+    fn test_parse_flags_dashdash_before_action_flag_yields_query() {
+        let flags = parse_flags(&["--".to_string(), "--rebuild".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("--rebuild".to_string()),
+            "AC2/AC3: ['--', '--rebuild'] must yield Query(\"--rebuild\"); no rebuild action"
+        );
+    }
+
+    // ============================================================================
+    // AC10: bare `-` stays positional; dash-leading literals searchable via `--`
+    // ============================================================================
+
+    /// AC10: bare `-` (len == 1) is a valid query token, not a flag.
+    #[test]
+    fn test_parse_flags_bare_dash_is_positional() {
+        let flags = parse_flags(&["-".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("-".to_string()),
+            "AC10: bare '-' must be treated as a positional query token"
+        );
+    }
+
+    /// AC10: `['--', '->']` yields Query("->").
+    #[test]
+    fn test_parse_flags_dashdash_before_arrow_becomes_query() {
+        let flags = parse_flags(&["--".to_string(), "->".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("->".to_string()),
+            "AC10: ['--', '->'] must yield Query(\"->\")"
+        );
+    }
+
+    /// AC10: `['--', '-Werror']` yields Query("-Werror").
+    #[test]
+    fn test_parse_flags_dashdash_before_werror_becomes_query() {
+        let flags = parse_flags(&["--".to_string(), "-Werror".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("-Werror".to_string()),
+            "AC10: ['--', '-Werror'] must yield Query(\"-Werror\")"
+        );
+    }
+
+    /// AC10: `['--', '-5']` yields Query("-5").
+    #[test]
+    fn test_parse_flags_dashdash_before_negative_number_becomes_query() {
+        let flags = parse_flags(&["--".to_string(), "-5".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("-5".to_string()),
+            "AC10: ['--', '-5'] must yield Query(\"-5\")"
+        );
+    }
+
+    // ============================================================================
+    // AC7 (NEGATIVE regression): recognized short flags not shadowed by AD-412-1
+    // ============================================================================
+
+    /// AC7: -j still sets json=true after AD-412-1 is placed after the -j arm.
+    #[test]
+    fn test_parse_flags_short_j_still_sets_json_after_412() {
+        let flags = parse_flags(&["-j".to_string()]).unwrap();
+        assert!(
+            flags.json,
+            "AC7: -j must still set json=true; the AD-412-1 arm must not shadow it"
+        );
+    }
+
+    /// AC7: -n 3 still sets limit=3 after AD-412-1.
+    #[test]
+    fn test_parse_flags_short_n_with_value_still_sets_limit_after_412() {
+        let flags = parse_flags(&["-n".to_string(), "3".to_string()]).unwrap();
+        assert_eq!(
+            flags.limit, 3,
+            "AC7: -n 3 must still set limit=3; AD-412-1 must not shadow -n"
+        );
+    }
+
+    // ============================================================================
+    // AD-412-5: mixed-form hard error (action flag + query text) (AC14)
+    // ============================================================================
+
+    /// AC14: `['foo', '--rebuild']` is rejected — cannot combine query and action flag.
+    #[test]
+    fn test_parse_flags_mixed_form_query_and_rebuild_is_error() {
+        let err = parse_flags(&["foo".to_string(), "--rebuild".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot combine"),
+            "AC14: mixed query+action must produce 'cannot combine'; got: {msg}"
+        );
+        assert!(
+            msg.contains("--"),
+            "AC14: error message must mention the '--' escape hatch; got: {msg}"
+        );
+    }
+
+    /// AC14: `['myterm', '--build']` is also rejected as mixed form.
+    #[test]
+    fn test_parse_flags_mixed_form_query_and_build_is_error() {
+        let err = parse_flags(&["myterm".to_string(), "--build".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot combine"),
+            "AC14: query + --build must be rejected as mixed form"
         );
     }
 
