@@ -293,6 +293,73 @@ fn test_format_text_output_includes_stale_marker() {
 }
 
 // ============================================================================
+// format_text_output echoes effective query in non-empty summary (AC6)
+// ============================================================================
+
+/// AC6: The non-empty human-text summary includes the effective query so a
+/// mangled query can never masquerade as a successful search.
+///
+/// PF-007 (discriminating): Uses a query token "xqzuniq_query" that does NOT
+/// appear in the path or snippet, so `s.contains("xqzuniq_query")` can only
+/// be satisfied by the summary line.  The composite assertion
+/// `s.contains(r#"result(s) for "xqzuniq_query""#)` fails when the echo is
+/// reverted to the old `"{} result(s) in {}ms"` format — it would produce
+/// `1 result(s) in 2ms`, which does not contain `for "xqzuniq_query"`.
+#[test]
+fn test_format_text_output_non_empty_echoes_query() {
+    use crate::cmd::search::types::{ResolvedResult, SnippetContext, SnippetLine};
+
+    // Path and snippet intentionally contain no part of the query token
+    // "xqzuniq_query" — that string can only appear in the summary line echo.
+    let result = ResolvedResult {
+        path: "src/module.rs".to_string(),
+        score: 7.5,
+        field: "function_signature".to_string(),
+        line_number: Some(1),
+        line_range: Some(1..2),
+        snippet: Some(SnippetContext {
+            lines: vec![SnippetLine {
+                line_number: 1,
+                content: "pub fn module_func() {}".to_string(),
+                is_match: true,
+            }],
+        }),
+        stale: false,
+        match_positions: vec![],
+        temporal: None,
+        layers_matched: vec![],
+    };
+
+    let output = QueryOutput {
+        query: "xqzuniq_query".to_string(),
+        total: 1,
+        has_more: false,
+        verify_mode: None,
+        results: vec![result],
+        duration_ms: 2,
+        index_stats: None,
+        ast_coverage: None,
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_text_output(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    // AC6 / PF-007 (discriminating): the summary line must be in the new
+    // `N result(s) for "Q" in Xms` format.  This assertion fails when the echo
+    // is reverted to `"{} result(s) in {}ms"` (old format produces
+    // `1 result(s) in 2ms`, which contains neither `for` nor the quoted query).
+    // Neither the path (`src/module.rs`) nor the snippet (`pub fn module_func()`)
+    // contain "xqzuniq_query", so the only source of this substring is the
+    // summary line — making the assertion a true discriminating guard for AD-412-4.
+    assert!(
+        s.contains(r#"result(s) for "xqzuniq_query""#),
+        "AC6: summary line must echo effective query in the form \
+         'N result(s) for \"xqzuniq_query\" in Xms' (AD-412-4); got: {s:?}"
+    );
+}
+
+// ============================================================================
 // Edge cases: no .git, corrupt index
 // ============================================================================
 

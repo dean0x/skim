@@ -48,6 +48,17 @@ use serde::Serialize;
 pub(super) const NO_TEMPORAL_DATA_MSG: &str =
     "no temporal data — run 'skim search' on a git repo to auto-populate";
 
+/// Canonical enumeration of all recognised flags for `skim search`.
+///
+/// Single source of truth: used in the unknown-flag error message so that
+/// adding or renaming a flag requires only one edit here rather than separate
+/// edits to the error string and the doc comment.  The help text at
+/// `print_help` is intentionally separate (different format and prose
+/// descriptions).
+const KNOWN_FLAGS: &str = "--build, --rebuild, --update, --stats, --install-hooks, \
+    --remove-hooks, --json, -j, --limit, -n, --offset, --root, --ast, --hot, --cold, \
+    --risky, --blast-radius, --weights, --phrase, --near, --lang, --help, -h";
+
 // ============================================================================
 // Public entry point
 // ============================================================================
@@ -84,55 +95,39 @@ pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    // No args or --help/-h → print help
-    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
-        print_help();
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // Parse flags — propagate errors (invalid --limit, unrecognised flags, etc.).
+    // AD-412-3: help detection (empty args, --help, -h before --) lives entirely in
+    // parse_flags so the `--` end-of-flags boundary has a single owner.
     let flags = parse_flags(args)?;
 
     // ── Validation order (deterministic — tests rely on this ordering) ──────
-    // --ast patterns are validated BEFORE dispatch so the error fires regardless
-    // of which downstream path the flags resolve to:
+    // --ast pattern validated before dispatch; composes freely with temporal flags
+    // (mutual exclusion of sort modes is enforced earlier, in parse_flags).
     //   1. single-node pattern → #283 error.
     //   2. unknown pattern → lists available names.
-    // --ast now composes freely with temporal flags (--hot/--cold/--risky/
-    // --blast-radius), a text query, --limit, and --json — there is NO flag
-    // combination that errors here (mutual exclusion of sort modes is still
-    // enforced earlier, in parse_flags).
     if let Some(ref raw_ast) = flags.ast {
         ast::validate_ast_pattern(raw_ast)?;
     }
-    // ────────────────────────────────────────────────────────────────────────
 
     // AD-403-5 / PF-006: single pre-dispatch guard for positional-flag inert notice.
-    //
-    // Placed here — BEFORE `match flags.action` — so it fires on every arm:
-    // Build/Rebuild/Update/Stats/InstallHooks/RemoveHooks (action arms), standalone
-    // --ast (empty query), standalone temporal/blast (empty query), and the bare help
-    // arm.  A whitespace-only query ("   " is not a text query per the mod.rs:123
-    // guard) is treated as no-text.
-    //
-    // `has_text` mirrors the dispatch condition at :123 exactly so the notice fires
-    // on the identical set of paths where the flags are structurally inert.  stderr
-    // only; stdout byte-identical; exit 0.
-    {
-        let has_text = matches!(&flags.action, SearchAction::Query(t) if !t.trim().is_empty());
-        if let Some(notice) = query::positional_inert_notice(flags.phrase, flags.near, has_text) {
-            eprintln!("{notice}");
-        }
+    // Fires before `match flags.action` so it covers every arm. A whitespace-only
+    // query is treated as no-text (mirrors the `!text.trim().is_empty()` guard below).
+    let has_text = matches!(&flags.action, SearchAction::Query(t) if !t.trim().is_empty());
+    if let Some(notice) = query::positional_inert_notice(flags.phrase, flags.near, has_text) {
+        eprintln!("{notice}");
     }
 
     match flags.action {
+        SearchAction::Help => {
+            print_help();
+            Ok(ExitCode::SUCCESS)
+        }
         SearchAction::Build => run_build(false, &flags.root_override, analytics),
         SearchAction::Rebuild => run_build(true, &flags.root_override, analytics),
         SearchAction::Update => run_update(&flags.root_override, analytics),
         SearchAction::Stats => run_stats(flags.json, &flags.root_override),
         SearchAction::InstallHooks => run_install_hooks(&flags.root_override),
         SearchAction::RemoveHooks => run_remove_hooks(&flags.root_override),
-        // Reject whitespace-only queries at dispatch (defense-in-depth for Finding 1 / AC2):
+        // Reject whitespace-only queries at dispatch (defense-in-depth / AC2):
         // query_substring_present uses split_whitespace which yields no tokens for "  ",
         // making the predicate vacuously true and letting the AD-355-7 all-files fallback
         // emit up to 100 arbitrary indexed files for a content-free query. Trimming here
@@ -302,6 +297,13 @@ enum SearchAction {
     RemoveHooks,
     /// Run a search query with the given text.
     Query(String),
+    /// Print the help text and exit.
+    ///
+    /// AD-412-3: folded into `parse_flags` so the end-of-flags sentinel
+    /// (`"--"`) lives in a single owner — the `"--"` match arm in
+    /// `parse_flags`. Help detection (empty args, `--help`, `-h`) is
+    /// handled entirely by `parse_flags`.
+    Help,
 }
 
 /// Parsed flags from the CLI args passed to `skim search`.
@@ -348,6 +350,44 @@ struct Flags {
     /// Accepts both language names (`rust`, `python`, `typescript`) and file
     /// extensions (`rs`, `py`, `ts`).  `None` means no language restriction.
     lang: Option<rskim_core::Language>,
+}
+
+/// Single source of truth for all `Flags` field defaults.
+///
+/// `parse_flags` initialises its local variables to these same values; if a
+/// default changes, update both this impl and the corresponding `let mut …`
+/// in `parse_flags` to keep them in sync.  `Flags::help()` delegates here so
+/// adding a new field only requires one edit instead of two (the compiler
+/// enforces exhaustiveness on struct literals in `Default::default`).
+impl Default for Flags {
+    fn default() -> Self {
+        Flags {
+            action: SearchAction::Help,
+            json: false,
+            limit: 20,
+            offset: None,
+            root_override: None,
+            temporal_sort: None,
+            blast_radius: None,
+            ast: None,
+            weights: None,
+            phrase: false,
+            near: None,
+            lang: None,
+        }
+    }
+}
+
+impl Flags {
+    /// Construct a `Flags` value that signals "print help and exit."
+    ///
+    /// All fields other than `action` are at their defaults; they are never
+    /// read on the `SearchAction::Help` dispatch path in `run()`.  Uses
+    /// `Default::default()` so that adding a field only requires one edit
+    /// (the `Default` impl above) rather than duplicating all defaults here.
+    fn help() -> Self {
+        Default::default()
+    }
 }
 
 /// Parse and validate a `--limit` value string.
@@ -473,6 +513,15 @@ fn parse_temporal_flag(
         "--blast-radius" => {
             let val =
                 next_arg.ok_or_else(|| anyhow::anyhow!("--blast-radius requires a file path"))?;
+            // AD-412-3: bail so --help/-h is never consumed as the file-path value
+            // (parity with take_flag_value; e.g. `skim search --blast-radius --help`).
+            // AD-412-4: {val:?} (Debug, quoted) neutralises ANSI-escape injection.
+            if matches!(val.as_str(), "--help" | "-h") {
+                anyhow::bail!(
+                    "--blast-radius requires a file path (got {val:?}); \
+                     to print help, run: `skim search --help`"
+                );
+            }
             *blast_radius = Some(val.clone());
             Ok(true)
         }
@@ -508,6 +557,8 @@ fn parse_temporal_flag(
 /// take_flag_value("--ast", Some("try-catch"), "--ast")         → Ok(("try-catch", true))
 /// take_flag_value("--ast", None, "--ast")                      → Err(…missing…)
 /// take_flag_value("--ast=  ", None, "--ast")                   → Err(…empty…)
+/// take_flag_value("--ast", Some("--help"), "--ast")            → Err(…requires a value; to print help…)
+/// take_flag_value("--ast", Some("-h"), "--ast")                → Err(…requires a value; to print help…)
 /// ```
 fn take_flag_value(
     arg: &str,
@@ -525,6 +576,14 @@ fn take_flag_value(
     // Space-separated form: the value is in the next token.
     let val =
         next_arg.ok_or_else(|| anyhow::anyhow!("{flag} requires a value (e.g. {flag} <value>)"))?;
+    // AD-412-3: bail so --help/-h is never consumed as a flag value (e.g. `--ast --help`).
+    if matches!(val.as_str(), "--help" | "-h") {
+        anyhow::bail!(
+            "{flag} requires a value (got {:?}); \
+             to print help, run: `skim search --help`",
+            val
+        );
+    }
     let trimmed = val.trim();
     if trimmed.is_empty() {
         anyhow::bail!("{flag} value must not be empty or whitespace-only");
@@ -542,8 +601,19 @@ fn take_flag_value(
 /// - `--root` without a following value.
 /// - `--ast` without a value or with a whitespace-only value.
 /// - `--weights` without a value or with an invalid weight string.
-/// - Unrecognised flags (tokens beginning with `--`).
+/// - Unrecognised dash-leading flags — any `--foo` or `-x` (length >= 2) that is
+///   not a known flag (see `KNOWN_FLAGS`). Bare `-` is a positional query token;
+///   a literal dash-leading term is searchable after the `--` end-of-flags separator.
+/// - Combining a text query with an action flag (`--build` / `--rebuild` /
+///   `--update` / `--stats` / `--install-hooks` / `--remove-hooks`) — an
+///   ambiguous mixed form.
 fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
+    // AD-412-3: empty args → help immediately. --help/-h before `--` → help via the
+    // match arm below. Post-`--` tokens are drained as literal query text (AD-412-2).
+    if args.is_empty() {
+        return Ok(Flags::help());
+    }
+
     let mut action_flag: Option<SearchAction> = None;
     let mut json = false;
     let mut limit: usize = 20;
@@ -650,13 +720,27 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                     i += 1;
                 }
             }
-            s if s.starts_with("--") => {
+            // AD-412-3: --help/-h before `--` triggers help; after `--` these tokens
+            // are already drained as literal query text and never reach this arm.
+            "--help" | "-h" => return Ok(Flags::help()),
+            // AD-412-2: end-of-flags separator. Drains all remaining tokens verbatim into
+            // the query and stops flag parsing. Escape hatch for dash-leading literals
+            // (`-Werror`, `->`, `--rebuild`). Only the first `--` is special; a second
+            // `--` becomes literal query text. Output flags must appear BEFORE `--`.
+            "--" => {
+                query_parts.extend(args[i + 1..].iter().cloned());
+                break;
+            }
+            // AD-412-1: reject any unrecognised dash-prefixed token (both `--foo` and
+            // `-x`), symmetric for short and long flags. Bare `-` (len == 1) falls
+            // through to the positional catch-all. Matches on token shape only (no
+            // sibling-flag-absent guard — avoids PF-006).
+            // AD-412-4: {s:?} (Debug, quoted) prevents ANSI-escape injection in output.
+            s if s.starts_with('-') && s.len() >= 2 => {
                 anyhow::bail!(
-                    "unrecognised flag {:?}. Valid flags: --build, --rebuild, --update, \
-                     --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --offset, \
-                     --root, --ast, --hot, --cold, --risky, --blast-radius, --weights, \
-                     --phrase, --near, --lang",
-                    s
+                    "unrecognised flag {s:?}. \
+                     To search a literal dash-leading term, use `--` (e.g. `skim search -- {s:?}`). \
+                     Valid flags: {KNOWN_FLAGS}"
                 );
             }
             // Positional arg — part of the query text.
@@ -664,6 +748,9 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
         }
         i += 1;
     }
+
+    // AD-412-5: error when an action flag and a text query appear together (mixed form).
+    validate_no_mixed_form(action_flag.as_ref(), &query_parts)?;
 
     let action = action_flag.unwrap_or_else(|| SearchAction::Query(query_parts.join(" ")));
 
@@ -681,6 +768,36 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
         near,
         lang,
     })
+}
+
+/// AD-412-5: Validate that an action flag and a text query are not combined.
+///
+/// Extracted from `parse_flags` to reduce that function's cyclomatic complexity.
+/// Returns an error with an actionable message if both are present.
+///
+/// # AD-412-4 (security)
+///
+/// `{query:?}` uses Debug formatting (quoted, escaped) so ANSI-escape, newline,
+/// or other control bytes in a crafted positional token cannot clear the terminal
+/// or forge log lines in AI agent output.  The Debug-quoted form is still a
+/// valid, copy-pasteable `skim search -- "..."` argument.
+fn validate_no_mixed_form(
+    action_flag: Option<&SearchAction>,
+    query_parts: &[String],
+) -> anyhow::Result<()> {
+    // AD-412-5: use the same "is there a real query?" predicate as the `has_text`
+    // binding in `run()` and the `SearchAction::Query` dispatch guard so
+    // whitespace-only positional tokens (e.g. `skim search "  " --rebuild`) are
+    // not treated as a genuine text query here while being silently ignored downstream.
+    if action_flag.is_some() && query_parts.iter().any(|p| !p.trim().is_empty()) {
+        let query = query_parts.join(" ");
+        anyhow::bail!(
+            "cannot combine a text query ({query:?}) with an action flag \
+             (--build / --rebuild / --update / --stats / --install-hooks / --remove-hooks). \
+             To search for the literal text, use: `skim search -- {query:?}`"
+        );
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -702,12 +819,18 @@ fn resolve_root_and_cache(root_override: &Option<PathBuf>) -> anyhow::Result<(Pa
         // anyhow::Err → ExitCode::FAILURE; exit 2 is reserved for the parse path).
         Some(r) => {
             let canonical = r.canonicalize().map_err(|e| {
-                anyhow::anyhow!("--root {}: {e}. Pass the directory to index.", r.display())
+                // AD-412-4: use {:?} (Debug, quoted) on the raw user-supplied path so
+                // ANSI-escape or newline bytes in a crafted `--root` value cannot clear
+                // the terminal or forge log lines in AI-agent output (same pattern as
+                // the unrecognised-flag and mixed-form error paths).
+                anyhow::anyhow!("--root {:?}: {e}. Pass the directory to index.", r)
             })?;
             anyhow::ensure!(
                 canonical.is_dir(),
-                "--root {} is not a directory. Pass the directory to index.",
-                canonical.display()
+                // Canonical path is filesystem-derived (post-canonicalize), but apply
+                // the same {:?} guard for consistency with the AD-412-4 hardening.
+                "--root {:?} is not a directory. Pass the directory to index.",
+                canonical
             );
             canonical
         }
@@ -1377,10 +1500,14 @@ Options:
   --stats          Show index statistics
   --install-hooks  Install git post-commit/merge hooks for auto-refresh
   --remove-hooks   Remove skim git hooks
-  --json           Output results as JSON
-  --limit N        Maximum results to return (default: 20)
+  --json, -j       Output results as JSON
+  --limit N, -n N  Maximum results to return (default: 20)
   --offset N       Skip N verified results (pagination; default: 0)
   --root PATH      Override project root (default: walk up to .git)
+  --               End of flags. All tokens after `--` are literal query text,
+                   even if they look like flags. Use this to search for
+                   dash-leading terms (e.g. `skim search -- -Werror`).
+                   Output flags (--json, --limit) must be placed BEFORE `--`.
   -h, --help       Print this help message
 
 Positional query options:
@@ -2030,9 +2157,385 @@ mod tests {
     #[test]
     fn test_parse_flags_unrecognised_flag_is_error() {
         let err = parse_flags(&["--unknown-flag".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unrecognised flag"),
+            "unexpected error message: {msg}"
+        );
+        // KNOWN_FLAGS completeness: the error message embeds KNOWN_FLAGS verbatim,
+        // so `-n` (the --limit short alias added in #412) must appear in the
+        // "Valid flags" listing.  A regression removing `-n` from KNOWN_FLAGS would
+        // make this test fail while all other assertions still pass.
+        assert!(
+            msg.contains("-n"),
+            "unrecognised-flag error must list -n in the valid-flags help text; got: {msg}"
+        );
+        // --help/-h must appear in the valid-flags listing so users see a complete
+        // picture of recognised tokens when they mistype a flag.
+        assert!(
+            msg.contains("--help"),
+            "unrecognised-flag error must list --help in the valid-flags help text; got: {msg}"
+        );
+    }
+
+    // ============================================================================
+    // AD-412-3: --help/-h must not be silently consumed as a flag value
+    // ============================================================================
+
+    /// `--ast --help`: `--help` must not be swallowed as the AST pattern value.
+    ///
+    /// Before the AD-412-3 fix, `take_flag_value("--ast", Some("--help"), "--ast")`
+    /// returned Ok(("--help", true)), so `ast = Some("--help")` propagated into
+    /// `validate_ast_pattern` which produced a confusing "unknown pattern" error
+    /// instead of pointing the user at the help surface.  The fix bails early with
+    /// a clear "requires a value; to print help, run: skim search --help" message.
+    #[test]
+    fn test_parse_flags_help_after_ast_is_not_consumed_as_value() {
+        let err = parse_flags(&["--ast".to_string(), "--help".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--ast requires a value"),
+            "AD-412-3: --help must not be silently consumed as the --ast value; got: {msg}"
+        );
+        assert!(
+            msg.contains("skim search --help"),
+            "error must point at the help surface; got: {msg}"
+        );
+    }
+
+    /// `--limit --help`: `--help` must not be swallowed as the limit value.
+    #[test]
+    fn test_parse_flags_help_after_limit_is_not_consumed_as_value() {
+        let err = parse_flags(&["--limit".to_string(), "--help".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--limit requires a value"),
+            "AD-412-3: --help must not be silently consumed as the --limit value; got: {msg}"
+        );
+        assert!(
+            msg.contains("skim search --help"),
+            "error must point at the help surface; got: {msg}"
+        );
+    }
+
+    /// `--root --help`: `--help` must not be silently accepted as a directory path.
+    ///
+    /// Before the fix `--root --help` ran a real search rooted at the bogus
+    /// path "--help" with exit 0, which was the worst outcome (silent wrong
+    /// behavior).  After the fix it is a clear error.
+    #[test]
+    fn test_parse_flags_help_after_root_is_not_consumed_as_value() {
+        let err = parse_flags(&["--root".to_string(), "--help".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--root requires a value"),
+            "AD-412-3: --help must not be silently consumed as the --root path; got: {msg}"
+        );
+        assert!(
+            msg.contains("skim search --help"),
+            "error must point at the help surface; got: {msg}"
+        );
+    }
+
+    /// Same as above but with the `-h` short form.
+    #[test]
+    fn test_parse_flags_short_h_after_ast_is_not_consumed_as_value() {
+        let err = parse_flags(&["--ast".to_string(), "-h".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--ast requires a value"),
+            "AD-412-3: -h must not be silently consumed as the --ast value; got: {msg}"
+        );
+    }
+
+    /// `--blast-radius --help`: `--help` must not be swallowed as the file path.
+    ///
+    /// `--blast-radius` consumes its value via `parse_temporal_flag` rather than
+    /// `take_flag_value`, so it needs the same AD-412-3 guard.  Without it,
+    /// `blast_radius = Some("--help")` ran a degraded co-change search for a file
+    /// literally named "--help" (exit 0) instead of honoring the help request —
+    /// the same silent-wrong-behavior class AD-412-3 fixed for `--root`.
+    ///
+    /// PF-007 (discriminating): asserts the specific "--blast-radius requires a
+    /// file path" message and the help-surface pointer, so reverting the guard
+    /// (which yields Ok with a bogus blast_radius) makes `unwrap_err()` panic.
+    #[test]
+    fn test_parse_flags_help_after_blast_radius_is_not_consumed_as_value() {
+        let err = parse_flags(&["--blast-radius".to_string(), "--help".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--blast-radius requires a file path"),
+            "AD-412-3: --help must not be silently consumed as the --blast-radius value; got: {msg}"
+        );
+        assert!(
+            msg.contains("skim search --help"),
+            "error must point at the help surface; got: {msg}"
+        );
+    }
+
+    /// Same as above but with the `-h` short form.
+    #[test]
+    fn test_parse_flags_short_h_after_blast_radius_is_not_consumed_as_value() {
+        let err = parse_flags(&["--blast-radius".to_string(), "-h".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--blast-radius requires a file path"),
+            "AD-412-3: -h must not be silently consumed as the --blast-radius value; got: {msg}"
+        );
+    }
+
+    // ============================================================================
+    // AD-412-3: help-vs-error precedence (finding 5) — pin sequential behavior
+    // ============================================================================
+
+    /// `--badflag --help` → error, NOT help.
+    ///
+    /// Pre-delta (ad7b590), `run()` pre-scanned argv for `--help`/`-h` BEFORE
+    /// calling `parse_flags`, so a help request anywhere in argv — even after an
+    /// invalid flag — printed help and exited 0.
+    ///
+    /// Post-AD-412-3, `parse_flags` processes tokens sequentially: `--badflag`
+    /// hits the unrecognised-flag arm and errors before `--help` is reached.
+    /// This is consistent with #412's strict left-to-right direction and with
+    /// getopt semantics.  The test pins the new behaviour so any future regression
+    /// (restoring a pre-scan) is immediately detected (PF-007: discriminating).
+    #[test]
+    fn test_parse_flags_bad_flag_before_help_errors_not_help() {
+        let err = parse_flags(&["--badflag".to_string(), "--help".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        // Must error on the bad flag — NOT silently print help.
+        assert!(
+            msg.contains("unrecognised flag"),
+            "AD-412-3: --badflag before --help must produce an error (not help); got: {msg}"
+        );
+        // The error must name the offending token (PF-007: discriminating observable).
+        assert!(
+            msg.contains("--badflag"),
+            "error must name the unrecognised flag '--badflag'; got: {msg}"
+        );
+    }
+
+    /// `--limit xyz --help` → error (bad value wins, not help).
+    ///
+    /// The invalid value `xyz` triggers `parse_limit_value` to error before
+    /// `--help` is reached (another sequential-error-wins case).
+    #[test]
+    fn test_parse_flags_bad_limit_value_before_help_errors_not_help() {
+        let err = parse_flags(&[
+            "--limit".to_string(),
+            "xyz".to_string(),
+            "--help".to_string(),
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("positive integer"),
+            "AD-412-3: bad --limit value before --help must produce a parse error; got: {msg}"
+        );
+    }
+
+    // ============================================================================
+    // Unknown single-dash flags rejected symmetrically (AC1, AC11)
+    // ============================================================================
+
+    /// AC1: -i is rejected with "unrecognised flag" (not folded into the query).
+    /// AC11: error message mentions the `--` escape hatch.
+    #[test]
+    fn test_parse_flags_unknown_short_flag_i_is_error() {
+        let err = parse_flags(&["-i".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unrecognised flag"),
+            "AC1: -i must produce 'unrecognised flag'; got: {msg}"
+        );
+        assert!(
+            msg.contains("--"),
+            "AC11: error message must mention the '--' escape hatch; got: {msg}"
+        );
+    }
+
+    /// AC1: -w is rejected symmetrically with long flags.
+    #[test]
+    fn test_parse_flags_unknown_short_flag_w_is_error() {
+        let err = parse_flags(&["-w".to_string()]).unwrap_err();
         assert!(
             err.to_string().contains("unrecognised flag"),
-            "unexpected error message: {err}"
+            "AC1: -w must produce 'unrecognised flag'"
+        );
+    }
+
+    /// AC1: -C is rejected symmetrically with long flags.
+    #[test]
+    fn test_parse_flags_unknown_short_flag_c_is_error() {
+        let err = parse_flags(&["-C".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("unrecognised flag"),
+            "AC1: -C must produce 'unrecognised flag'"
+        );
+    }
+
+    // ============================================================================
+    // `--` end-of-flags separator (AC2, AC3, AC10)
+    // ============================================================================
+
+    /// AC2: `['--', '-i']` yields Query("-i") — separator drains following tokens verbatim.
+    #[test]
+    fn test_parse_flags_dashdash_before_short_flag_becomes_query() {
+        let flags = parse_flags(&["--".to_string(), "-i".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("-i".to_string()),
+            "AC2: ['--', '-i'] must yield Query(\"-i\")"
+        );
+    }
+
+    /// AC2: `['foo', '--', '--limit']` yields Query("foo --limit").
+    #[test]
+    fn test_parse_flags_query_then_dashdash_drains_flag_as_literal() {
+        let flags =
+            parse_flags(&["foo".to_string(), "--".to_string(), "--limit".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("foo --limit".to_string()),
+            "AC2: ['foo', '--', '--limit'] must yield Query(\"foo --limit\")"
+        );
+    }
+
+    /// AC2/AC3: `['--', '--rebuild']` yields Query("--rebuild") — no rebuild action fired.
+    #[test]
+    fn test_parse_flags_dashdash_before_action_flag_yields_query() {
+        let flags = parse_flags(&["--".to_string(), "--rebuild".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("--rebuild".to_string()),
+            "AC2/AC3: ['--', '--rebuild'] must yield Query(\"--rebuild\"); no rebuild action"
+        );
+    }
+
+    // ============================================================================
+    // AC10: bare `-` stays positional; dash-leading literals searchable via `--`
+    // ============================================================================
+
+    /// AC10: bare `-` (len == 1) is a valid query token, not a flag.
+    #[test]
+    fn test_parse_flags_bare_dash_is_positional() {
+        let flags = parse_flags(&["-".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("-".to_string()),
+            "AC10: bare '-' must be treated as a positional query token"
+        );
+    }
+
+    /// AC10: `['--', '->']` yields Query("->").
+    #[test]
+    fn test_parse_flags_dashdash_before_arrow_becomes_query() {
+        let flags = parse_flags(&["--".to_string(), "->".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("->".to_string()),
+            "AC10: ['--', '->'] must yield Query(\"->\")"
+        );
+    }
+
+    /// AC10: `['--', '-Werror']` yields Query("-Werror").
+    #[test]
+    fn test_parse_flags_dashdash_before_werror_becomes_query() {
+        let flags = parse_flags(&["--".to_string(), "-Werror".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("-Werror".to_string()),
+            "AC10: ['--', '-Werror'] must yield Query(\"-Werror\")"
+        );
+    }
+
+    /// AC10: `['--', '-5']` yields Query("-5").
+    #[test]
+    fn test_parse_flags_dashdash_before_negative_number_becomes_query() {
+        let flags = parse_flags(&["--".to_string(), "-5".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("-5".to_string()),
+            "AC10: ['--', '-5'] must yield Query(\"-5\")"
+        );
+    }
+
+    /// Only the first `--` is special; a second `--` becomes literal query text.
+    /// `['--', '--', 'x']` must yield Query("-- x") — the second `--` is drained
+    /// verbatim as a query token, not re-interpreted as a separator.
+    #[test]
+    fn test_parse_flags_second_dashdash_is_literal_query_text() {
+        let flags = parse_flags(&["--".to_string(), "--".to_string(), "x".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("-- x".to_string()),
+            "second '--' must be literal query text, not a separator; expected Query(\"-- x\")"
+        );
+    }
+
+    /// Trailing `--` with nothing after it drains an empty slice — must not panic
+    /// and must preserve any query tokens accumulated before the separator.
+    /// `['foo', '--']` must yield Query("foo").
+    #[test]
+    fn test_parse_flags_trailing_dashdash_yields_preceding_query() {
+        let flags = parse_flags(&["foo".to_string(), "--".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("foo".to_string()),
+            "trailing '--' with nothing after must yield Query(\"foo\"), not panic"
+        );
+    }
+
+    // ============================================================================
+    // Mixed-form hard error: action flag + query text (AC14)
+    // ============================================================================
+
+    /// AC14: `['foo', '--rebuild']` is rejected — cannot combine query and action flag.
+    #[test]
+    fn test_parse_flags_mixed_form_query_and_rebuild_is_error() {
+        let err = parse_flags(&["foo".to_string(), "--rebuild".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot combine"),
+            "AC14: mixed query+action must produce 'cannot combine'; got: {msg}"
+        );
+        assert!(
+            msg.contains("--"),
+            "AC14: error message must mention the '--' escape hatch; got: {msg}"
+        );
+    }
+
+    /// AC14: `['myterm', '--build']` is also rejected as mixed form.
+    #[test]
+    fn test_parse_flags_mixed_form_query_and_build_is_error() {
+        let err = parse_flags(&["myterm".to_string(), "--build".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot combine"),
+            "AC14: query + --build must be rejected as mixed form"
+        );
+    }
+
+    /// AD-412-5: a whitespace-only positional combined with an action flag MUST
+    /// succeed (not error as mixed form).
+    ///
+    /// `validate_no_mixed_form` uses `.any(|p| !p.trim().is_empty())` so a
+    /// positional whose only content is whitespace is not counted as a real text
+    /// query.  `skim search "  " --rebuild` therefore dispatches to `Rebuild` and
+    /// silently discards the whitespace token — consistent with every downstream
+    /// dispatch site that trims before use.
+    ///
+    /// Discriminating coverage (avoids PF-007): a regression reverting the predicate
+    /// to `!query_parts.is_empty()` would restore the old `Err("cannot combine")`
+    /// and make this test fail, while the two non-whitespace tests above (`foo`,
+    /// `myterm`) continue to pass — so the stale guard cannot hide behind them.
+    #[test]
+    fn test_parse_flags_whitespace_only_positional_with_action_flag_succeeds() {
+        let flags = parse_flags(&["  ".to_string(), "--rebuild".to_string()]).unwrap();
+        assert_eq!(
+            flags.action,
+            SearchAction::Rebuild,
+            "AD-412-5: whitespace-only positional + --rebuild must yield Rebuild, \
+             not a mixed-form error"
         );
     }
 

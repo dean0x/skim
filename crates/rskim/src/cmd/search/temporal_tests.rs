@@ -814,10 +814,7 @@ fn standalone_hot_text_has_table_columns() {
 // are a zero-regression at offset=0 (PF-007 / AC-404-12).
 //
 // Coverage: arm10 (hot standalone) and arm11 (blast-radius standalone) — both
-// text and JSON output formats (4 fixtures total).  Arms 01–09 cover lexical
-// and AST query output produced by `format_text_output` / `format_json_output`
-// / `format_ast_text`; those formatters are exercised in query_tests.rs and
-// ast_tests.rs, not here.
+// text and JSON output formats (4 fixtures total).
 
 /// AC-404-12 / PF-007: `format_temporal_text` at offset 0 must produce output
 /// matching the arm10 golden fixture (standalone --hot, 5 files).
@@ -2313,8 +2310,10 @@ fn blast_radius_sort_offset_nonzero_has_more_via_depth() {
             jaccard: 0.40,
         }, // Jaccard rank 2 — risk rank 4
         CochangeRow {
-            file_a: "src/hub.rs".to_string(),
-            file_b: "src/high_jac.rs".to_string(),
+            // "src/high_jac.rs" < "src/hub.rs" lexically ('i' < 'u'), so
+            // high_jac must be file_a to satisfy the file_a < file_b invariant.
+            file_a: "src/high_jac.rs".to_string(),
+            file_b: "src/hub.rs".to_string(),
             count: 1,
             jaccard: 0.50,
         }, // Jaccard rank 1 — risk rank 5

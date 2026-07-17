@@ -1393,7 +1393,15 @@ pub(super) fn format_text_output(
         writeln!(w)?;
     }
 
-    writeln!(w, "{} result(s) in {}ms", output.total, output.duration_ms)?;
+    // AD-412-4: Echo the effective query in the human summary so a mangled query
+    // can never masquerade as a successful search.  {:?} matches the empty-branch
+    // quoting convention (`no results for {:?}`) for uniform escaping.
+    // JSON output already carries `query` and is unaffected by this change.
+    writeln!(
+        w,
+        "{} result(s) for {:?} in {}ms",
+        output.total, output.query, output.duration_ms
+    )?;
 
     Ok(())
 }
