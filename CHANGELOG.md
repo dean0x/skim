@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### BREAKING
 
+- **`skim search` argv parsing is now strict and symmetric** (#412) — unknown
+  single-dash flags (`-i`, `-w`, `-C`) are rejected with an `unrecognised flag` error
+  and a pointer to the `--` escape hatch, matching the pre-existing long-flag behavior
+  (previously they were silently folded into the query text). Combining a text query
+  with an action flag (e.g. `skim search foo --rebuild`) now hard-errors as an ambiguous
+  mixed form instead of silently running the action and discarding the query. Bare `-`
+  remains a valid positional query token.
+
 - **`skim search` AST index format: v2 → v3 (1 MiB size cap + coverage policy)** (#405):
   The AST structural index format version is bumped from 2 to 3 to reflect the raised
   per-file size cap (100 KiB → 1 MiB) and the new coverage taxonomy.  Any existing
@@ -177,13 +185,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matched pattern node is line-recovered; degraded (non-recovered) rows omit both. JSON
   output gains optional `line` and `snippet` fields — additive, so existing consumers of
   `path`/`score` are unaffected. (#201)
-- **`skim search` argv parsing is now strict and symmetric** (#412) — unknown
-  single-dash flags (`-i`, `-w`, `-C`) are rejected with an `unrecognised flag` error
-  and a pointer to the `--` escape hatch, matching the pre-existing long-flag behavior
-  (previously they were silently folded into the query text). Combining a text query
-  with an action flag (e.g. `skim search foo --rebuild`) now hard-errors as an ambiguous
-  mixed form instead of silently running the action and discarding the query. Bare `-`
-  remains a valid positional query token.
 
 ### Fixed
 - **`skim search --rebuild`/`--build` now populate `temporal.db`** (#357) — explicit
