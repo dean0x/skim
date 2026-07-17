@@ -95,49 +95,28 @@ pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    // AD-412-3: help detection is folded into parse_flags (via
-    // `SearchAction::Help`) so the end-of-flags boundary (`"--"`) has a single
-    // owner. Empty args, `--help`, and `-h` all return `SearchAction::Help`
-    // from parse_flags, and the `SearchAction::Help` arm below dispatches to
-    // print_help().
+    // AD-412-3: help detection (empty args, --help, -h before --) lives entirely in
+    // parse_flags so the `--` end-of-flags boundary has a single owner.
     let flags = parse_flags(args)?;
 
     // ── Validation order (deterministic — tests rely on this ordering) ──────
-    // --ast patterns are validated BEFORE dispatch so the error fires regardless
-    // of which downstream path the flags resolve to:
+    // --ast pattern validated before dispatch; composes freely with temporal flags
+    // (mutual exclusion of sort modes is enforced earlier, in parse_flags).
     //   1. single-node pattern → #283 error.
     //   2. unknown pattern → lists available names.
-    // --ast now composes freely with temporal flags (--hot/--cold/--risky/
-    // --blast-radius), a text query, --limit, and --json — there is NO flag
-    // combination that errors here (mutual exclusion of sort modes is still
-    // enforced earlier, in parse_flags).
     if let Some(ref raw_ast) = flags.ast {
         ast::validate_ast_pattern(raw_ast)?;
     }
-    // ────────────────────────────────────────────────────────────────────────
 
     // AD-403-5 / PF-006: single pre-dispatch guard for positional-flag inert notice.
-    //
-    // Placed here — BEFORE `match flags.action` — so it fires on every arm:
-    // Build/Rebuild/Update/Stats/InstallHooks/RemoveHooks (action arms), standalone
-    // --ast (empty query), standalone temporal/blast (empty query), and the bare help
-    // arm.  A whitespace-only query ("   " is not a text query per the mod.rs:123
-    // guard) is treated as no-text.
-    //
-    // `has_text` mirrors the dispatch condition at :123 exactly so the notice fires
-    // on the identical set of paths where the flags are structurally inert.  stderr
-    // only; stdout byte-identical; exit 0.
-    {
-        let has_text = matches!(&flags.action, SearchAction::Query(t) if !t.trim().is_empty());
-        if let Some(notice) = query::positional_inert_notice(flags.phrase, flags.near, has_text) {
-            eprintln!("{notice}");
-        }
+    // Fires before `match flags.action` so it covers every arm. A whitespace-only
+    // query is treated as no-text (mirrors the `!text.trim().is_empty()` guard below).
+    let has_text = matches!(&flags.action, SearchAction::Query(t) if !t.trim().is_empty());
+    if let Some(notice) = query::positional_inert_notice(flags.phrase, flags.near, has_text) {
+        eprintln!("{notice}");
     }
 
     match flags.action {
-        // AD-412-3: help is a first-class SearchAction variant; the `"--"`
-        // end-of-flags sentinel lives in exactly one place (the parse_flags
-        // match arm).
         SearchAction::Help => {
             print_help();
             Ok(ExitCode::SUCCESS)
@@ -588,10 +567,7 @@ fn take_flag_value(
     // Space-separated form: the value is in the next token.
     let val =
         next_arg.ok_or_else(|| anyhow::anyhow!("{flag} requires a value (e.g. {flag} <value>)"))?;
-    // AD-412-3: --help/-h must not be silently consumed as a flag value.
-    // A user who types `--ast --help` or `--limit --help` almost certainly
-    // wants help output, not to search for a value named "--help".  Bail early
-    // with an actionable message so the intent is never silently misread.
+    // AD-412-3: bail so --help/-h is never consumed as a flag value (e.g. `--ast --help`).
     if matches!(val.as_str(), "--help" | "-h") {
         anyhow::bail!(
             "{flag} requires a value (got {:?}); \
@@ -623,12 +599,8 @@ fn take_flag_value(
 ///   `--update` / `--stats` / `--install-hooks` / `--remove-hooks`) — an
 ///   ambiguous mixed form.
 fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
-    // AD-412-3: help detection is folded here. Empty args → help immediately.
-    // `--help`/`-h` before `--` → help via the match arm below. Post-`--`
-    // tokens are literal query text (AD-412-2) and never trigger help — the
-    // sequential match arms guarantee `"--"` is consumed first, draining the
-    // rest as query tokens. The `"--"` sentinel lives in a single place: the
-    // match arm below.
+    // AD-412-3: empty args → help immediately. --help/-h before `--` → help via the
+    // match arm below. Post-`--` tokens are drained as literal query text (AD-412-2).
     if args.is_empty() {
         return Ok(Flags::help());
     }
@@ -739,33 +711,23 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                     i += 1;
                 }
             }
-            // AD-412-3: `--help` / `-h` before `--` triggers help. This arm
-            // comes before the `"--"` arm so that the sequential match consumes
-            // help flags first.  Any `-h` or `--help` appearing AFTER `--` is
-            // already drained as a literal query token by the `"--"` arm and
-            // never reaches this arm — preserving `skim search -- -h` → Query("-h").
+            // AD-412-3: --help/-h before `--` triggers help; after `--` these tokens
+            // are already drained as literal query text and never reach this arm.
             "--help" | "-h" => return Ok(Flags::help()),
-            // AD-412-2: End-of-flags separator — the single source of truth for
-            // the `"--"` boundary. Drains all remaining tokens
-            // verbatim into the query and stops flag parsing (bounded by `args.len()`).
-            // This is the escape hatch that keeps dash-leading literals (`-Werror`,
-            // `->`, `--rebuild`) searchable now that AD-412-1 rejects unknown dashes.
-            // Only the first `--` is special; a second `--` becomes literal query text.
-            // Output flags (--json, --limit, …) must appear BEFORE `--`.
+            // AD-412-2: end-of-flags separator. Drains all remaining tokens verbatim into
+            // the query and stops flag parsing. Escape hatch for dash-leading literals
+            // (`-Werror`, `->`, `--rebuild`). Only the first `--` is special; a second
+            // `--` becomes literal query text. Output flags must appear BEFORE `--`.
             "--" => {
                 query_parts.extend(args[i + 1..].iter().cloned());
                 break;
             }
-            // AD-412-1: Reject any unrecognised dash-prefixed token (both `--foo`
-            // and `-x`), making short- and long-flag rejection symmetric.
-            // Bare `-` (len == 1) intentionally falls through to the positional
-            // catch-all below.  This arm uses no sibling-flag-absent guard
-            // (avoids PF-006) — it matches on the token shape unconditionally.
+            // AD-412-1: reject any unrecognised dash-prefixed token (both `--foo` and
+            // `-x`), symmetric for short and long flags. Bare `-` (len == 1) falls
+            // through to the positional catch-all. Matches on token shape only (no
+            // sibling-flag-absent guard — avoids PF-006).
+            // AD-412-4: {s:?} (Debug, quoted) prevents ANSI-escape injection in output.
             s if s.starts_with('-') && s.len() >= 2 => {
-                // AD-412-4 (security): both `s` appearances use {:?} (Debug, quoted)
-                // so ANSI-escape or newline bytes in a crafted token cannot clear
-                // the terminal or forge log lines in AI agent output.  The quoted
-                // form is still a valid, copy-pasteable shell argument.
                 anyhow::bail!(
                     "unrecognised flag {s:?}. \
                      To search a literal dash-leading term, use `--` (e.g. `skim search -- {s:?}`). \
@@ -778,9 +740,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
         i += 1;
     }
 
-    // AD-412-5: Hard error when an action flag and a text query appear together.
-    // Extracted to `validate_no_mixed_form` to reduce parse_flags cyclomatic
-    // complexity.
+    // AD-412-5: error when an action flag and a text query appear together (mixed form).
     validate_no_mixed_form(action_flag.as_ref(), &query_parts)?;
 
     let action = action_flag.unwrap_or_else(|| SearchAction::Query(query_parts.join(" ")));
