@@ -46,11 +46,18 @@ fn create_ref_file(dir: &std::path::Path, ref_path: &str, sha: &str) {
 /// Write a minimal valid AST index stub file in `cache_dir`.
 ///
 /// `index_version` reads the first 6 bytes: magic `SKAX` + version u16 LE.
-/// Writing version 2 (the current format) prevents the AST self-heal from
-/// reporting `NoStoredHead` in unit tests that only stub the lexical index.
+/// Writing the current `AST_INDEX_FORMAT_VERSION` prevents the AST self-heal
+/// from reporting `NoStoredHead` in unit tests that only stub the lexical index.
+///
+/// The version bytes are derived from `rskim_search::AST_INDEX_FORMAT_VERSION`
+/// so this stub automatically tracks future FORMAT_VERSION bumps without requiring
+/// a manual edit — the same maintenance-safety pattern used by `write_lexical_index_stub`.
 fn write_ast_index_stub(cache_dir: &std::path::Path) {
-    // b"SKAX" = magic (4 bytes), 0x02 0x00 = version 2 in little-endian.
-    fs::write(cache_dir.join("ast_index.skidx"), b"SKAX\x02\x00").unwrap();
+    let version_bytes = rskim_search::AST_INDEX_FORMAT_VERSION.to_le_bytes();
+    let mut stub = Vec::with_capacity(6);
+    stub.extend_from_slice(b"SKAX");
+    stub.extend_from_slice(&version_bytes);
+    fs::write(cache_dir.join("ast_index.skidx"), &stub).unwrap();
 }
 
 /// Write a minimal valid lexical index stub file in `cache_dir`.

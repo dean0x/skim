@@ -2310,8 +2310,10 @@ fn blast_radius_sort_offset_nonzero_has_more_via_depth() {
             jaccard: 0.40,
         }, // Jaccard rank 2 — risk rank 4
         CochangeRow {
-            file_a: "src/hub.rs".to_string(),
-            file_b: "src/high_jac.rs".to_string(),
+            // "src/high_jac.rs" < "src/hub.rs" lexically ('i' < 'u'), so
+            // high_jac must be file_a to satisfy the file_a < file_b invariant.
+            file_a: "src/high_jac.rs".to_string(),
+            file_b: "src/hub.rs".to_string(),
             count: 1,
             jaccard: 0.50,
         }, // Jaccard rank 1 — risk rank 5
