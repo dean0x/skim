@@ -38,4 +38,4 @@ file5.ts:3  [symbol_name]  score: 1.00
         5│       console.log(item);
         6│     }
 
-5 result(s) in 3ms
+5 result(s) for "JSON parse" in 3ms

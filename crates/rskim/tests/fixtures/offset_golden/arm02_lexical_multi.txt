@@ -33,4 +33,4 @@ file5.ts:2  [function_body]  score: 2.52
         4│     for (const item of data.items) {
         5│       console.log(item);
 
-5 result(s) in 5ms
+5 result(s) for "try catch" in 5ms

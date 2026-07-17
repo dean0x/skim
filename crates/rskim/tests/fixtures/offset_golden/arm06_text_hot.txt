@@ -43,4 +43,4 @@ file4.ts:8  [symbol_name]  score: 9.00  hotspot: 0.200
        10│     return "";
        11│   }
 
-5 result(s) in 0ms
+5 result(s) for "error" in 0ms

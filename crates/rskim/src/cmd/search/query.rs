@@ -1393,9 +1393,10 @@ pub(super) fn format_text_output(
         writeln!(w)?;
     }
 
-    // Echo the effective query in the human summary so a mangled query can never
-    // masquerade as a successful search. {:?} matches the empty-branch quoting
-    // convention for uniform escaping; JSON output is unaffected.
+    // AD-412-4: Echo the effective query in the human summary so a mangled query
+    // can never masquerade as a successful search.  {:?} matches the empty-branch
+    // quoting convention (`no results for {:?}`) for uniform escaping.
+    // JSON output already carries `query` and is unaffected by this change.
     writeln!(
         w,
         "{} result(s) for {:?} in {}ms",

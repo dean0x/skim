@@ -84,8 +84,10 @@ pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    // Restrict the help scan to tokens before the first `--` so that
+    // AD-412-3: Restrict the help scan to tokens before the first `--` so that
     // `search -- -h` searches for "-h" rather than printing help.
+    // Post-`--` tokens are literal query text (AD-412-2); they must never
+    // trigger the help path.
     if args.is_empty()
         || args
             .iter()
@@ -661,14 +663,21 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                     i += 1;
                 }
             }
-            // End-of-flags separator: drain remaining tokens verbatim into the query.
+            // AD-412-2: End-of-flags separator. Drains all remaining tokens verbatim
+            // into the query and stops flag parsing (bounded by `args.len()`).
+            // This is the escape hatch that keeps dash-leading literals (`-Werror`,
+            // `->`, `--rebuild`) searchable now that AD-412-1 rejects unknown dashes.
+            // Only the first `--` is special; a second `--` becomes literal query text.
             // Output flags (--json, --limit, …) must appear BEFORE `--`.
             "--" => {
                 query_parts.extend(args[i + 1..].iter().cloned());
                 break;
             }
-            // Reject any unrecognised dash-prefixed token (both `--foo` and `-x`).
-            // Bare `-` (len == 1) falls through to the positional catch-all below.
+            // AD-412-1: Reject any unrecognised dash-prefixed token (both `--foo`
+            // and `-x`), making short- and long-flag rejection symmetric.
+            // Bare `-` (len == 1) intentionally falls through to the positional
+            // catch-all below.  This arm uses no sibling-flag-absent guard
+            // (avoids PF-006) — it matches on the token shape unconditionally.
             s if s.starts_with('-') && s.len() >= 2 => {
                 anyhow::bail!(
                     "unrecognised flag {s:?}. \
@@ -685,9 +694,11 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
         i += 1;
     }
 
-    // Hard error when an action flag and a text query appear together — e.g.
-    // `search foo --rebuild` is ambiguous. Validated after full arg parsing so
-    // both sides are collected before the check.
+    // AD-412-5: Hard error when an action flag and a text query appear together —
+    // e.g. `search foo --rebuild` is ambiguous and previously silently dropped
+    // the query.  Validated after full arg parsing so both sides are fully
+    // collected before the check.  The `--` escape (AD-412-2) is the correct
+    // way to search for a flag-shaped string.
     if action_flag.is_some() && !query_parts.is_empty() {
         let query = query_parts.join(" ");
         anyhow::bail!(
