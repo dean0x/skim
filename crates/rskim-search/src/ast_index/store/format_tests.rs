@@ -123,10 +123,10 @@ fn header_rejects_wrong_version_one() {
 }
 
 #[test]
-fn header_rejects_wrong_version_three() {
-    // A future version (3) must also be rejected by this binary.
+fn header_rejects_wrong_version_four() {
+    // A future version (4) must also be rejected by this binary.
     let mut encoded = encode_header(&make_valid_header());
-    encoded[4..6].copy_from_slice(&3u16.to_le_bytes());
+    encoded[4..6].copy_from_slice(&4u16.to_le_bytes());
     let err = decode_header(&encoded).unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -141,7 +141,7 @@ fn header_future_version_suggests_upgrade_not_rebuild() {
     // user needs a NEWER binary, not a rebuild.  The error message must say "upgrade"
     // rather than "please rebuild the AST index" so the user gets actionable guidance.
     let mut encoded = encode_header(&make_valid_header());
-    encoded[4..6].copy_from_slice(&3u16.to_le_bytes()); // v3 is a future version
+    encoded[4..6].copy_from_slice(&4u16.to_le_bytes()); // v4 is a future version
     let err = decode_header(&encoded).unwrap_err();
     let msg = format!("{err}");
     assert!(
