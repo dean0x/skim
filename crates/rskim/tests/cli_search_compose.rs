@@ -1558,10 +1558,15 @@ mod argv_parser_412 {
 
     // ---- AC5: Help scan bounded at first `--` --------------------------------
 
-    /// AC5(a): `skim search --root <proj> -- -h` exits 0 and stdout does NOT
-    /// contain the help marker "layered n-gram BM25F" (it searched, not helped).
-    /// `--root <proj>` precedes `--` so the search stays scoped to the fixture
-    /// (tokens after `--` are drained verbatim into the query).
+    /// AC5(a): `skim search --json --root <proj> -- -h` exits 0, emits valid JSON
+    /// with `query == "-h"` (it searched, not helped), and stdout does NOT contain
+    /// the help marker "layered n-gram BM25F".
+    /// `--json` and `--root <proj>` precede `--` so the search stays scoped to the
+    /// fixture; tokens after `--` are drained verbatim into the query.
+    ///
+    /// The `json["query"]` assertion is the primary discriminating observable (PF-007):
+    /// an early no-op success with empty stdout would fail to parse as JSON, and a
+    /// help-hijack regression would set `query` to `None` or an unrelated value.
     ///
     /// AC5(b): `skim search -h` exits 0 and stdout DOES contain "layered n-gram BM25F"
     /// (bare -h before `--` still triggers help).
@@ -1572,10 +1577,11 @@ mod argv_parser_412 {
         super::make_project(proj.path());
         super::build_index(proj.path(), cache.path());
 
-        // AC5(a): `search -- -h` must search, not print help.
+        // AC5(a): `search --json -- -h` must search, not print help.
+        // Primary discriminating observable: json["query"] == "-h" (PF-007).
         let out_search = Command::cargo_bin("skim")
             .unwrap()
-            .args(["search", "--root"])
+            .args(["search", "--json", "--root"])
             .arg(proj.path())
             .args(["--", "-h"])
             .env("SKIM_CACHE_DIR", cache.path())
@@ -1585,6 +1591,14 @@ mod argv_parser_412 {
             .clone();
 
         let stdout_search = String::from_utf8_lossy(&out_search.stdout);
+        let json: Value = serde_json::from_str(stdout_search.trim()).unwrap_or_else(|e| {
+            panic!("AC5(a): stdout must be valid JSON ({e}); got:\n{stdout_search}")
+        });
+        assert_eq!(
+            json["query"].as_str(),
+            Some("-h"),
+            "AC5(a): JSON query field must be '-h' (-- drains into query); got:\n{stdout_search}"
+        );
         assert!(
             !stdout_search.contains("layered n-gram BM25F"),
             "AC5(a): `search -- -h` must not print help; stdout:\n{stdout_search}"
