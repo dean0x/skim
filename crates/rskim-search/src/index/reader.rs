@@ -47,8 +47,8 @@ use crate::{
 /// Sort `scored` by descending score (ascending `doc_id` tie-break), then
 /// assemble [`SearchResult`] values after applying `offset` + `limit`.
 ///
-/// Used by both `search_exact_intersection` (raw occurrence-count ranking,
-/// AD-372-6) and `collect_scored_results` (BM25F UNION path) so the two
+/// Used by both `search_exact_intersection` (per-field-saturated BM25F ranking,
+/// AD-411-3) and `collect_scored_results` (BM25F UNION path) so the two
 /// ranking tails stay in sync when the `SearchResult` shape or tie-break
 /// rule changes.
 ///
@@ -1397,8 +1397,8 @@ impl SearchLayer for NgramIndexReader {
     /// 3. **`is_single_token` branch** — a single contiguous token (≥ 3 bytes,
     ///    no interior whitespace) routes to `search_exact_intersection`, which
     ///    generates candidates via AND-intersection (grep-exact, limit/size-
-    ///    independent) and ranks by raw occurrence-count
-    ///    (AD-372-6, length-norm-free).
+    ///    independent) and ranks by per-field-saturated BM25F
+    ///    (AD-411-3, length-norm-free).
     /// 4. **Multi-word / default** — the existing BM25F UNION loop; untouched.
     ///
     /// The `is_single_token` check is placed AFTER the `ngrams.is_empty()` guard
@@ -1413,7 +1413,7 @@ impl SearchLayer for NgramIndexReader {
     /// internal `.take`); the caller's verify-then-truncate-LAST step is the only
     /// gate (ADR-001).
     ///
-    /// # Exact-symbol semantics (AD-372-1 / AD-372-6)
+    /// # Exact-symbol semantics (AD-372-1 / AD-411-3)
     ///
     /// `search_exact_intersection` applies offset + limit after ranking —
     /// callers on the pure-lexical path must set `sq.limit = None` so the
@@ -1470,7 +1470,7 @@ impl SearchLayer for NgramIndexReader {
         // the AND-intersection path.  The intersection is grep-exact and
         // limit/size-independent: every verified file is guaranteed to be in
         // the candidate set (superset invariant, AD-372-2).  Ranked by
-        // raw occurrence-count (length-norm-free, AD-372-6) so
+        // per-field-saturated BM25F (AD-411-3, length-norm-free) so
         // large-file definers are not buried by BM25F field-length normalization.
         //
         // This check is placed AFTER `ngrams.is_empty()` (above) so that a

@@ -2984,3 +2984,91 @@ fn test_ac_p2_no_regression_plain_query_unaffected() {
         "AC-P2-3: plain query 'alpha' must return BOTH files (positional branch must not fire); got {ids:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// AD-411-2 field-attribution tie rule
+// ---------------------------------------------------------------------------
+
+/// Verify the field-attribution tie rule in `align_whole_token`:
+/// when a token spans a field boundary (different trigrams of the same
+/// `token_position` carry different `field_id` values), the minimum
+/// (highest-priority) `field_id` wins.
+///
+/// Hand-builds a two-trigram word and a `postings_by_key` where:
+/// - Trigram 0 at `(doc_id=0, token_position=7)` has `field_id = 4` (FunctionBody)
+/// - Trigram 1 at `(doc_id=0, token_position=7)` has `field_id = 1` (FunctionSignature)
+///
+/// The tie rule must attribute the occurrence to field 1 (FunctionSignature),
+/// not field 4 (FunctionBody), because 1 < 4.
+#[test]
+fn test_align_whole_token_field_attribution_tie_rule() {
+    use crate::index::format::PostingEntry;
+    use crate::ngram::{Ngram, QueryToken};
+
+    // Build a 5-byte token "abcde" with two consecutive trigrams.
+    let trig0 = Ngram::from_bytes(b'a', b'b', b'c');
+    let trig1 = Ngram::from_bytes(b'b', b'c', b'd');
+    let word = QueryToken {
+        token_off: 0,
+        byte_len: 5, // length gate: postings must also have token_length = 5
+        trigrams: vec![trig0, trig1],
+    };
+
+    let doc_id: u32 = 0;
+    let token_pos: u32 = 7;
+    let token_len: u32 = 5;
+
+    // Trigram 0 at token_position 7 → field 4 (FunctionBody, lower priority).
+    let posts0 = vec![PostingEntry {
+        doc_id,
+        field_id: 4, // FunctionBody discriminant
+        position: 10,
+        token_position: token_pos,
+        token_length: token_len,
+    }];
+    // Trigram 1 at token_position 7 → field 1 (FunctionSignature, higher priority).
+    let posts1 = vec![PostingEntry {
+        doc_id,
+        field_id: 1, // FunctionSignature discriminant
+        position: 11,
+        token_position: token_pos,
+        token_length: token_len,
+    }];
+
+    let mut postings_by_key: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
+    postings_by_key.insert(trig0.key(), posts0);
+    postings_by_key.insert(trig1.key(), posts1);
+
+    let mut scratch_cands: HashMap<u32, CandidateEntry> = HashMap::new();
+    let mut scratch_trig: HashMap<u32, u8> = HashMap::new();
+
+    let (field_tf, byte_positions) = align_whole_token(
+        doc_id,
+        &word,
+        &postings_by_key,
+        &mut scratch_cands,
+        &mut scratch_trig,
+    );
+
+    // The tie rule must attribute the one aligned occurrence to field 1
+    // (FunctionSignature, min of {4,1}=1), not field 4 (FunctionBody).
+    assert_eq!(
+        field_tf[1], 1.0,
+        "AD-411-2 tie rule: FunctionSignature (field_id=1) must receive credit; got field_tf={field_tf:?}"
+    );
+    assert_eq!(
+        field_tf[4], 0.0,
+        "AD-411-2 tie rule: FunctionBody (field_id=4) must NOT receive credit; got field_tf={field_tf:?}"
+    );
+    // Exactly one aligned position.
+    assert_eq!(
+        byte_positions.len(),
+        1,
+        "AD-411-2 tie rule: exactly one aligned occurrence expected; got {byte_positions:?}"
+    );
+    // Byte position from the seed trigram (trig0, position=10).
+    assert_eq!(
+        byte_positions[0].start, 10,
+        "Byte position must come from the seed trigram (position=10); got {byte_positions:?}"
+    );
+}

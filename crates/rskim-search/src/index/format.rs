@@ -89,7 +89,7 @@ pub(crate) const SKIDX_MAGIC: &[u8; 4] = b"SKIX";
 /// - v2 → v3: owned by #355 Part B (trigram key widen, `SkidxEntry` change)
 /// - v3 → v4: owned by #358 Item 2 (posting codec / `PostingEntry` change)
 ///
-/// Old v3 indexes self-heal: `decode_header` rejects version ≠ 5 with
+/// Old v3 indexes self-heal: `decode_header` rejects version ≠ 7 with
 /// "unsupported format version … please rebuild" so the staleness check
 /// triggers a full rebuild on first query after upgrade.
 ///
@@ -102,7 +102,7 @@ pub(crate) const SKIDX_MAGIC: &[u8; 4] = b"SKIX";
 /// search. On disk it is appended as a 4th tail varint per entry:
 /// `[varint delta_doc_id][u8 field_id][varint delta_position][varint delta_token_position]`.
 /// The 3-field v4 prefix is byte-identical, so snippet/field_id logic is
-/// unchanged. Old v4 indexes self-heal: `decode_header` rejects version ≠ 5.
+/// unchanged. Old v4 indexes self-heal: `decode_header` rejects version ≠ 7.
 ///
 /// v5 → v6 (#411):
 ///
