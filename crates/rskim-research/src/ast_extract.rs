@@ -604,9 +604,11 @@ mod tests {
     fn oversized_file_returns_empty() {
         let mut vocab = NodeKindVocabulary::new();
         // Source must exceed the 1 MiB cap (rskim_core::AST_SIZE_LIMIT_DEFAULT = 1_048_576).
-        // "fn x() {}\n" is 11 bytes; 100_000 repetitions = 1_100_000 bytes > 1 MiB.
+        // "fn x() {}\n" is 10 bytes; (CAP / 10 + 1) repetitions = CAP + 10 bytes > 1 MiB.
         // (#405: cap raised from 100 KiB to 1 MiB; test updated to stay over the new cap.)
-        let large_source = "fn x() {}\n".repeat(100_000);
+        let line = "fn x() {}\n";
+        let n_lines = rskim_core::AST_SIZE_LIMIT_DEFAULT as usize / line.len() + 1;
+        let large_source = line.repeat(n_lines);
         let result =
             extract_ast_ngrams_from_file(&large_source, Language::Rust, &mut vocab, false).unwrap();
         assert!(
