@@ -1376,8 +1376,7 @@ fn run_query(
     if let Some(ref cov) = compound_ast_coverage {
         query::emit_ast_coverage_notice(cov);
     }
-    output.ast_coverage =
-        compound_ast_coverage.and_then(|c| if c.is_clean() { None } else { Some(c) });
+    output.ast_coverage = compound_ast_coverage.filter(|c| !c.is_clean());
 
     let mut stdout = BufWriter::new(std::io::stdout());
     if flags.json {

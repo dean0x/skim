@@ -106,18 +106,15 @@ fn try_parse_list(text: &str) -> Option<LintResult> {
         if trimmed.starts_with("//") {
             continue;
         }
-        if let Some(caps) = RE_GOFMT_FILE.captures(trimmed) {
-            issues.push(LintIssue {
-                file: caps[1].to_string(),
-                line: 0,
-                rule: "formatting".to_string(),
-                message: "file is not gofmt-formatted".to_string(),
-                severity: LintSeverity::Warning,
-            });
-        } else {
-            // Line doesn't look like a .go path — this isn't -l output
-            return None;
-        }
+        // Line doesn't look like a .go path — this isn't -l output
+        let caps = RE_GOFMT_FILE.captures(trimmed)?;
+        issues.push(LintIssue {
+            file: caps[1].to_string(),
+            line: 0,
+            rule: "formatting".to_string(),
+            message: "file is not gofmt-formatted".to_string(),
+            severity: LintSeverity::Warning,
+        });
     }
 
     if issues.is_empty() {

@@ -165,14 +165,13 @@ pub(super) fn try_parse_file_line_content(
                 .entry(file)
                 .or_default()
                 .push(format!("  :{lineno}: {content}"));
-        } else if let Some(label) = fallback_label {
+        } else {
+            let label = fallback_label?;
             total_matches += 1;
             file_matches
                 .entry(label.to_string())
                 .or_default()
                 .push(format!("  {line}"));
-        } else {
-            return None;
         }
     }
 

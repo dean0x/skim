@@ -121,11 +121,8 @@ fn try_parse_tabular(text: &str) -> Option<DbResult> {
 
     // Find the row-count footer (last non-empty line matching `(N rows)`).
     let row_count_line = lines.iter().rev().find(|l| !l.trim().is_empty())?;
-    let row_count = if let Some(caps) = RE_ROW_COUNT.captures(row_count_line.trim()) {
-        caps[1].parse::<usize>().unwrap_or(0)
-    } else {
-        return None; // Require footer for Tier 1
-    };
+    let caps = RE_ROW_COUNT.captures(row_count_line.trim())?; // Require footer for Tier 1
+    let row_count = caps[1].parse::<usize>().unwrap_or(0);
 
     // Rows are between separator and the footer line (exclusive).
     let footer_idx = lines
