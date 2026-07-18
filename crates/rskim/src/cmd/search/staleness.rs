@@ -854,19 +854,21 @@ pub(super) fn auto_refresh_if_stale(
 // Shared test helpers (visible within cmd::search via pub(super))
 // ============================================================================
 
-/// Create a real git repository with commits.
+/// Extended form of [`create_real_git_repo`] that accepts an optional per-commit
+/// date string (e.g. `"2025-10-01 00:00:00 +0000"`) injected via
+/// `GIT_AUTHOR_DATE` / `GIT_COMMITTER_DATE`.  When `date` is `None` the commit
+/// is made with the current wall-clock time (same behaviour as
+/// `create_real_git_repo`).
 ///
-/// Canonical shared helper used by `staleness_tests.rs`, `temporal_build_tests.rs`,
-/// and `mod.rs` test modules — eliminates the three near-verbatim copies that would
-/// otherwise drift independently (see #357 cycle-2 findings 9/14, and the plan's
-/// step 6 recommendation). `pub(super)` makes it accessible to all `#[cfg(test)]`
-/// users within `crate::cmd::search` via `super::staleness::create_real_git_repo`.
+/// Prefer this over hand-rolling `Command::new("git")` add/commit blocks with
+/// env-var date overrides in individual tests — it keeps all dated and undated
+/// tests on the same shared setup path.
 ///
 /// Returns the full 40-hex SHA of HEAD.
 #[cfg(test)]
-pub(super) fn create_real_git_repo(
+pub(super) fn create_real_git_repo_with_dates(
     dir: &std::path::Path,
-    commit_files: &[(&str, &[(&str, &str)])],
+    commit_files: &[(&str, Option<&str>, &[(&str, &str)])],
 ) -> String {
     use std::fs;
     use std::process::Command;
@@ -887,7 +889,7 @@ pub(super) fn create_real_git_repo(
         .output()
         .expect("git config name");
 
-    for (msg, files) in commit_files {
+    for (msg, date, files) in commit_files {
         for (name, content) in *files {
             let path = dir.join(name);
             if let Some(parent) = path.parent() {
@@ -900,11 +902,13 @@ pub(super) fn create_real_git_repo(
                 .output()
                 .expect("git add");
         }
-        Command::new("git")
-            .args(["commit", "-m", msg])
-            .current_dir(dir)
-            .output()
-            .expect("git commit");
+        let mut cmd = Command::new("git");
+        cmd.args(["commit", "-m", msg]).current_dir(dir);
+        if let Some(d) = date {
+            cmd.env("GIT_AUTHOR_DATE", d)
+                .env("GIT_COMMITTER_DATE", d);
+        }
+        cmd.output().expect("git commit");
     }
 
     let out = Command::new("git")
@@ -913,6 +917,29 @@ pub(super) fn create_real_git_repo(
         .output()
         .expect("git rev-parse HEAD");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Create a real git repository with commits.
+///
+/// Canonical shared helper used by `staleness_tests.rs`, `temporal_build_tests.rs`,
+/// and `mod.rs` test modules — eliminates the three near-verbatim copies that would
+/// otherwise drift independently (see #357 cycle-2 findings 9/14, and the plan's
+/// step 6 recommendation). `pub(super)` makes it accessible to all `#[cfg(test)]`
+/// users within `crate::cmd::search` via `super::staleness::create_real_git_repo`.
+///
+/// For tests that need per-commit date control, use [`create_real_git_repo_with_dates`].
+///
+/// Returns the full 40-hex SHA of HEAD.
+#[cfg(test)]
+pub(super) fn create_real_git_repo(
+    dir: &std::path::Path,
+    commit_files: &[(&str, &[(&str, &str)])],
+) -> String {
+    let with_dates: Vec<(&str, Option<&str>, &[(&str, &str)])> = commit_files
+        .iter()
+        .map(|(msg, files)| (*msg, None, *files))
+        .collect();
+    create_real_git_repo_with_dates(dir, &with_dates)
 }
 
 /// Test-only re-export of `scan_working_tree` for AC9 / AC7 integration tests

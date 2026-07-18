@@ -386,6 +386,17 @@ fn create_real_git_repo(dir: &std::path::Path, commit_files: &[(&str, &[(&str, &
     super::super::staleness::create_real_git_repo(dir, commit_files)
 }
 
+/// Extended form of [`create_real_git_repo`] that accepts an optional per-commit
+/// date string (e.g. `"2020-01-01 00:00:00 +0000"`) so tests that need
+/// `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` control can share the same helper path
+/// as undated tests rather than hand-rolling repeated `Command::new("git")` blocks.
+fn create_real_git_repo_with_dates(
+    dir: &std::path::Path,
+    commit_files: &[(&str, Option<&str>, &[(&str, &str)])],
+) -> String {
+    super::super::staleness::create_real_git_repo_with_dates(dir, commit_files)
+}
+
 /// AC5 / AC6 — HEAD stored in temporal.db equals full 40-hex SHA and matches
 /// `git rev-parse HEAD` (no false-stale warning).
 ///
@@ -1309,8 +1320,14 @@ fn test_rebuild_temporal_parse_history_called_once() {
 /// absent from top_hotspots, top_risks, and top_coldspots.  A present file is
 /// still there.  Exact-set assertion — fails if the retain passes are removed.
 ///
-/// AC2 (cochange both-sides rule): A cochange row is dropped when either side
-/// is a ghost; a row with two present files is retained.
+/// AC2 (cochange both-sides rule): Both directions of the filter are tested —
+/// - DROP: the (keep.rs, gone.rs) row is dropped because gone.rs is a ghost.
+/// - RETAIN: the (keep.rs, peer.rs) row is retained because both files are
+///   present on disk.  The retain assertion is the positive anchor that would
+///   catch an over-zealous filter that drops all cochange rows.
+///
+/// Fixture: `peer.rs` co-changes with `keep.rs` in both joint commits.
+/// Jaccard(keep, peer) = 2/(3+2-2) = 2/3 ≈ 0.67 — well above threshold.
 ///
 /// The ghost is created via `fs::remove_file` after committing (leaving the
 /// file in git history but off disk) — the `create_real_git_repo` helper does
@@ -1324,22 +1341,31 @@ fn test_ghost_filter_deleted_file_absent_from_all_tables() {
     let cache_dir = dir.path().join("cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
 
-    // Commit keep.rs and gone.rs together so they co-change, then delete gone.rs
-    // from disk (not from git) to create a ghost.
+    // Commit keep.rs, gone.rs, and peer.rs together in the first two commits so
+    // all three co-change.  delete gone.rs from disk to create a ghost; peer.rs
+    // remains present and anchors the AC2 retain assertion.
     let head = create_real_git_repo(
         dir.path(),
         &[
-            // Joint commit: both files co-change → creates a cochange row.
+            // Joint commit: all three files co-change.
             (
-                "feat: add both",
-                &[("keep.rs", "fn keep() {}"), ("gone.rs", "fn gone() {}")],
+                "feat: add all",
+                &[
+                    ("keep.rs", "fn keep() {}"),
+                    ("gone.rs", "fn gone() {}"),
+                    ("peer.rs", "fn peer() {}"),
+                ],
             ),
-            // Second commit touching both: raises Jaccard above MIN_COCHANGE_JACCARD.
+            // Second joint commit: raises Jaccard for all pairs above MIN_COCHANGE_JACCARD.
             (
-                "feat: update both",
-                &[("keep.rs", "fn keep2() {}"), ("gone.rs", "fn gone2() {}")],
+                "feat: update all",
+                &[
+                    ("keep.rs", "fn keep2() {}"),
+                    ("gone.rs", "fn gone2() {}"),
+                    ("peer.rs", "fn peer2() {}"),
+                ],
             ),
-            // Extra commit to keep.rs only.
+            // Extra commit to keep.rs only (does not affect the peer/gone Jaccard).
             ("feat: keep only", &[("keep.rs", "fn keep3() {}")]),
         ],
     );
@@ -1383,14 +1409,28 @@ fn test_ghost_filter_deleted_file_absent_from_all_tables() {
         "AC1: keep.rs (present) must be in top_hotspots (should not be filtered)"
     );
 
-    // AC2: cochange row (keep.rs, gone.rs) must be absent.
     let partners = db.cochanges_for_file("keep.rs").unwrap();
+
+    // AC2 DROP: cochange row (keep.rs, gone.rs) must be absent — gone.rs is a ghost.
     let ghost_partner = partners
         .iter()
         .any(|r| r.file_a == "gone.rs" || r.file_b == "gone.rs");
     assert!(
         !ghost_partner,
         "AC2: cochange row (keep.rs, gone.rs) must be ABSENT — ghost partner not filtered"
+    );
+
+    // AC2 RETAIN (positive anchor): cochange row (keep.rs, peer.rs) must be present.
+    // Both files are on disk; the filter must retain this row.  Without this assertion
+    // an over-zealous filter that drops all cochange rows — including legitimate
+    // both-present pairs — would go undetected.
+    let peer_partner_retained = partners
+        .iter()
+        .any(|r| r.file_a == "peer.rs" || r.file_b == "peer.rs");
+    assert!(
+        peer_partner_retained,
+        "AC2: cochange row (keep.rs, peer.rs) must be RETAINED — \
+         both files are present on disk; filter must not over-drop"
     );
 }
 
@@ -1519,13 +1559,15 @@ fn test_ghost_filter_subdir_root_rows_survive() {
 /// Discriminating: a query-time ghost filter would under-fill to 1 row; the
 /// build-time filter returns exactly 4.  This test fails if the filter is moved
 /// to query time.
+///
+/// Uses `create_real_git_repo_with_dates` to share the same setup helper as
+/// undated tests (`test_ghost_filter_deleted_file_absent_from_all_tables`) and
+/// avoid hand-rolling repeated `Command::new("git")` blocks.
 #[test]
 fn test_ghost_filter_coldspot_limit_no_underfill() {
     let dir = tempdir().unwrap();
     let cache_dir = dir.path().join("cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
-
-    init_git_repo(dir.path());
 
     // now_epoch pinned to 2026-06-13 08:00:00 UTC (matches other tests).
     let now_epoch: u64 = 1_781_337_600;
@@ -1535,52 +1577,45 @@ fn test_ghost_filter_coldspot_limit_no_underfill() {
     // Recent date → commits have high decay weight → warmer scores.
     let present_date = "2026-06-10 00:00:00 +0000";
 
-    // Create 3 ghost files with old commits.
-    for i in 0..3u32 {
-        let name = format!("ghost{i}.rs");
-        std::fs::write(dir.path().join(&name), format!("// ghost {i}")).unwrap();
-        Command::new("git")
-            .args(["add", &name])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", &format!("feat: ghost {i}")])
-            .current_dir(dir.path())
-            .env("GIT_AUTHOR_DATE", ghost_date)
-            .env("GIT_COMMITTER_DATE", ghost_date)
-            .output()
-            .unwrap();
+    // Pre-compute owned names, messages, and contents so slices can be taken.
+    let ghost_names: Vec<String> = (0..3u32).map(|i| format!("ghost{i}.rs")).collect();
+    let ghost_contents: Vec<String> = (0..3u32).map(|i| format!("// ghost {i}")).collect();
+    let ghost_msgs: Vec<String> = (0..3u32).map(|i| format!("feat: ghost {i}")).collect();
+
+    let present_names: Vec<String> = (0..5u32).map(|i| format!("present{i}.rs")).collect();
+    let present_contents: Vec<String> = (0..5u32).map(|i| format!("// present {i}")).collect();
+    let present_msgs: Vec<String> = (0..5u32).map(|i| format!("feat: present {i}")).collect();
+
+    // Per-commit file lists — each commit touches exactly one file.
+    let ghost_file_lists: Vec<Vec<(&str, &str)>> = ghost_names
+        .iter()
+        .zip(ghost_contents.iter())
+        .map(|(n, c)| vec![(n.as_str(), c.as_str())])
+        .collect();
+    let present_file_lists: Vec<Vec<(&str, &str)>> = present_names
+        .iter()
+        .zip(present_contents.iter())
+        .map(|(n, c)| vec![(n.as_str(), c.as_str())])
+        .collect();
+
+    // Build commit specs: (message, date, files).
+    let mut commit_specs: Vec<(&str, Option<&str>, &[(&str, &str)])> = Vec::new();
+    for (i, msg) in ghost_msgs.iter().enumerate() {
+        commit_specs.push((msg.as_str(), Some(ghost_date), ghost_file_lists[i].as_slice()));
+    }
+    for (i, msg) in present_msgs.iter().enumerate() {
+        commit_specs.push((
+            msg.as_str(),
+            Some(present_date),
+            present_file_lists[i].as_slice(),
+        ));
     }
 
-    // Create 5 present files with recent commits.
-    for i in 0..5u32 {
-        let name = format!("present{i}.rs");
-        std::fs::write(dir.path().join(&name), format!("// present {i}")).unwrap();
-        Command::new("git")
-            .args(["add", &name])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", &format!("feat: present {i}")])
-            .current_dir(dir.path())
-            .env("GIT_AUTHOR_DATE", present_date)
-            .env("GIT_COMMITTER_DATE", present_date)
-            .output()
-            .unwrap();
-    }
-
-    let head_out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
-    let head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+    let head = create_real_git_repo_with_dates(dir.path(), &commit_specs);
 
     // Delete ghost files from disk (they remain in git history).
-    for i in 0..3u32 {
-        std::fs::remove_file(dir.path().join(format!("ghost{i}.rs"))).unwrap();
+    for name in &ghost_names {
+        std::fs::remove_file(dir.path().join(name)).unwrap();
     }
 
     rebuild_temporal(dir.path(), &cache_dir, &head, now_epoch).unwrap();
@@ -1611,12 +1646,11 @@ fn test_ghost_filter_coldspot_limit_no_underfill() {
     }
 
     // Ghost files must not appear in any coldspot row.
-    for i in 0..3u32 {
-        let ghost_name = format!("ghost{i}.rs");
-        let ghost_present = coldspots.iter().any(|r| r.file_path == ghost_name);
+    for name in &ghost_names {
+        let ghost_present = coldspots.iter().any(|r| r.file_path == *name);
         assert!(
             !ghost_present,
-            "AC4: ghost file '{ghost_name}' must not appear in top_coldspots"
+            "AC4: ghost file '{name}' must not appear in top_coldspots"
         );
     }
 }
