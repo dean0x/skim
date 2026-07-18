@@ -55,26 +55,33 @@ fn git_init(dir: &Path) {
 }
 
 /// Create a fixture git repo where `gone.rs` has several commits alongside
-/// `keep.rs` (high co-change Jaccard) and is then deleted from disk.
+/// `keep.rs` (high co-change Jaccard) and is then deleted from disk, while
+/// `peer.rs` co-changes with `keep.rs` at the same Jaccard and remains on disk.
 ///
 /// Returns the owned `TempDir` (keep alive for test duration) and the HEAD SHA.
 ///
 /// Git history layout:
-/// - 3 joint commits (keep.rs + gone.rs) → joint=3, keep=4, gone=3
-///   Jaccard = 3 / (4 + 3 - 3) = 3/4 = 0.75 ≥ MIN_COCHANGE_JACCARD (0.10)
+/// - 3 joint commits (keep.rs + gone.rs + peer.rs) → joint=3, keep=4, gone=3, peer=3
+///   Jaccard(keep, gone) = 3 / (4 + 3 - 3) = 3/4 = 0.75 ≥ MIN_COCHANGE_JACCARD (0.10)
+///   Jaccard(keep, peer) = 3 / (4 + 3 - 3) = 3/4 = 0.75 ≥ MIN_COCHANGE_JACCARD (0.10)
 /// - 1 extra keep.rs-only commit
 ///
-/// After setup: `gone.rs` is deleted from disk via `fs::remove_file`, leaving
-/// it in git history but absent on disk (the ghost scenario).
+/// After setup:
+/// - `gone.rs` is deleted from disk via `fs::remove_file` (ghost scenario)
+/// - `peer.rs` remains present on disk (the surviving co-change partner)
+///
+/// This two-partner structure lets `--blast-radius keep.rs` exercise both sides:
+/// the ghost filter drops `gone.rs` while `peer.rs` survives in the result set.
 fn make_ghost_repo() -> (TempDir, String) {
     let dir = TempDir::new().expect("tempdir");
     git_init(dir.path());
 
-    // Joint commit 1.
+    // Joint commit 1 — all three files.
     fs::write(dir.path().join("keep.rs"), "fn keep1() {}").unwrap();
     fs::write(dir.path().join("gone.rs"), "fn gone1() {}").unwrap();
+    fs::write(dir.path().join("peer.rs"), "fn peer1() {}").unwrap();
     StdCommand::new("git")
-        .args(["add", "keep.rs", "gone.rs"])
+        .args(["add", "keep.rs", "gone.rs", "peer.rs"])
         .current_dir(dir.path())
         .output()
         .unwrap();
@@ -84,11 +91,12 @@ fn make_ghost_repo() -> (TempDir, String) {
         .output()
         .unwrap();
 
-    // Joint commit 2.
+    // Joint commit 2 — all three files.
     fs::write(dir.path().join("keep.rs"), "fn keep2() {}").unwrap();
     fs::write(dir.path().join("gone.rs"), "fn gone2() {}").unwrap();
+    fs::write(dir.path().join("peer.rs"), "fn peer2() {}").unwrap();
     StdCommand::new("git")
-        .args(["add", "keep.rs", "gone.rs"])
+        .args(["add", "keep.rs", "gone.rs", "peer.rs"])
         .current_dir(dir.path())
         .output()
         .unwrap();
@@ -98,11 +106,12 @@ fn make_ghost_repo() -> (TempDir, String) {
         .output()
         .unwrap();
 
-    // Joint commit 3.
+    // Joint commit 3 — all three files.
     fs::write(dir.path().join("keep.rs"), "fn keep3() {}").unwrap();
     fs::write(dir.path().join("gone.rs"), "fn gone3() {}").unwrap();
+    fs::write(dir.path().join("peer.rs"), "fn peer3() {}").unwrap();
     StdCommand::new("git")
-        .args(["add", "keep.rs", "gone.rs"])
+        .args(["add", "keep.rs", "gone.rs", "peer.rs"])
         .current_dir(dir.path())
         .output()
         .unwrap();
@@ -112,7 +121,7 @@ fn make_ghost_repo() -> (TempDir, String) {
         .output()
         .unwrap();
 
-    // Extra keep.rs-only commit (keep: 4 total, gone: 3 total, joint: 3).
+    // Extra keep.rs-only commit (keep: 4 total, gone: 3 total, peer: 3 total, joint: 3).
     fs::write(dir.path().join("keep.rs"), "fn keep4() {}").unwrap();
     StdCommand::new("git")
         .args(["add", "keep.rs"])
@@ -143,6 +152,10 @@ fn make_ghost_repo() -> (TempDir, String) {
     assert!(
         dir.path().join("keep.rs").is_file(),
         "keep.rs must be present on disk"
+    );
+    assert!(
+        dir.path().join("peer.rs").is_file(),
+        "peer.rs must be present on disk"
     );
 
     (dir, head)
@@ -336,10 +349,17 @@ fn test_ghost_filter_hot_text_and_json() {
 }
 
 /// AC3 / AC10: `--blast-radius keep.rs` (text + JSON) exits 0, emits no ghost,
-/// all JSON paths present.
+/// all JSON paths present, and the present co-change partner (peer.rs) survives.
 ///
-/// The (keep.rs, gone.rs) co-change pair was dropped by the ghost filter.
-/// gone.rs must NOT appear as a blast-radius partner of keep.rs.
+/// The fixture has TWO co-change partners for keep.rs:
+/// - `gone.rs` — deleted from disk; the ghost filter MUST drop it.
+/// - `peer.rs` — present on disk; the ghost filter MUST retain it.
+///
+/// This both-sides structure (PF-007) catches an over-zealous ghost filter that
+/// would also drop present partners, which the old all-ghost fixture could not
+/// detect (no surviving partner to check).  The unit test
+/// `test_ghost_filter_deleted_file_absent_from_all_tables` covers the same
+/// invariant at the storage layer; this test covers it at the CLI layer.
 #[test]
 fn test_ghost_filter_blast_radius_text_and_json() {
     let (dir, _head) = make_ghost_repo();
@@ -357,15 +377,14 @@ fn test_ghost_filter_blast_radius_text_and_json() {
         .stdout
         .clone();
     assert_ghost_absent(&text_out, "--blast-radius text");
-    // After ghost-filtering, gone.rs (the only partner) is removed and the
-    // output says `No co-change data for "keep.rs".`  That message still
-    // contains "keep.rs", so this assertion is non-vacuous: if the binary
-    // crashed silently and emitted nothing it would fail here (PF-007).
+    // peer.rs is a present co-change partner — it must survive the ghost filter
+    // and appear in blast-radius results (PF-007: discriminating assertion).
     let text = String::from_utf8_lossy(&text_out);
     assert!(
-        text.contains("keep.rs"),
-        "AC3: '--blast-radius text' must reference 'keep.rs' \
-         (target appears in the no-data message when all partners are filtered)"
+        text.contains("peer.rs"),
+        "AC3: '--blast-radius text' must emit 'peer.rs' (present co-change partner \
+         that survives the ghost filter); an absent peer.rs indicates the ghost \
+         filter is over-zealous or the co-change edge was not recorded"
     );
 
     let json_out = Command::cargo_bin("skim")
@@ -379,10 +398,9 @@ fn test_ghost_filter_blast_radius_text_and_json() {
         .stdout
         .clone();
     assert_ghost_absent(&json_out, "--blast-radius --json");
-    // require_nonempty=false: all co-change partners (only gone.rs) are ghosts
-    // and are correctly filtered, yielding an empty results array.  An empty
-    // result is the correct post-filter state here, not a regression.
-    assert_json_paths_present(&json_out, dir.path(), "--blast-radius --json", false);
+    // require_nonempty=true: peer.rs is a present partner that survives the
+    // ghost filter, so the results array must be non-empty (PF-007).
+    assert_json_paths_present(&json_out, dir.path(), "--blast-radius --json", true);
 }
 
 // ============================================================================
