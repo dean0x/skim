@@ -545,24 +545,49 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool
         return true;
     }
     // Lightweight read-only open: no WAL pragma, no permission reset, no migrations.
-    // We only need to read one meta row; the full TemporalDb::open setup is
-    // deferred to the dispatch arm that actually queries the DB.
-    let stored_head: Option<String> = rusqlite::Connection::open_with_flags(
+    // We read at most two meta rows (git_head + data_version); the full
+    // TemporalDb::open setup is deferred to the dispatch arm that actually queries.
+    let conn = match rusqlite::Connection::open_with_flags(
         &db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()
-    .and_then(|conn| {
+    ) {
+        Ok(c) => c,
+        Err(_) => return true,
+    };
+
+    // Shared helper: read a single TEXT value from the meta table by key.
+    let read_meta = |key: &str| -> Option<String> {
         conn.query_row(
             "SELECT value FROM meta WHERE key = ?1",
-            rusqlite::params![rskim_search::META_GIT_HEAD],
+            rusqlite::params![key],
             |row| row.get(0),
         )
         .ok()
-    });
-    match stored_head.as_deref() {
-        Some(stored) => stored != current_head,
-        // No stored HEAD row (e.g. empty-repo DB or migration gap): stale.
+    };
+
+    // Check 1: HEAD match — absent row or mismatch both report stale.
+    let stored_head: Option<String> = read_meta(rskim_search::META_GIT_HEAD);
+    if stored_head.as_deref() != Some(current_head) {
+        return true;
+    }
+
+    // AD-408-4: Check 2: data-version gate.
+    // The DB is stale when the stored data_version is absent or numerically less
+    // than TEMPORAL_DATA_VERSION, forcing a self-heal rebuild on the next query
+    // (applies ADR-006; mirrors the lexical/AST/manifest self-heal in
+    // check_staleness). Meta values are TEXT — version comparison is numeric to
+    // correctly order multi-digit values (string compare mis-orders "10" vs "2").
+    // An absent or non-integer stored value is treated as stale (pre-fix DB).
+    // Uses `stored < current` (NOT `!=`) so a DB written by a newer binary is
+    // NOT needlessly rebuilt by an older post-fix binary (no downgrade loop).
+    let stored_version: Option<String> = read_meta(rskim_search::META_DATA_VERSION);
+    match stored_version.as_deref() {
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) => n < u64::from(rskim_search::TEMPORAL_DATA_VERSION),
+            // Non-integer stored value → treat as stale.
+            Err(_) => true,
+        },
+        // Absent data_version row → stale (pre-fix DB that lacks the ghost filter).
         None => true,
     }
 }
@@ -837,11 +862,38 @@ pub(super) fn auto_refresh_if_stale(
 /// step 6 recommendation). `pub(super)` makes it accessible to all `#[cfg(test)]`
 /// users within `crate::cmd::search` via `super::staleness::create_real_git_repo`.
 ///
+/// For tests that need per-commit date control, use [`create_real_git_repo_with_dates`].
+///
 /// Returns the full 40-hex SHA of HEAD.
 #[cfg(test)]
+#[allow(clippy::type_complexity)]
 pub(super) fn create_real_git_repo(
     dir: &std::path::Path,
     commit_files: &[(&str, &[(&str, &str)])],
+) -> String {
+    let with_dates: Vec<(&str, Option<&str>, &[(&str, &str)])> = commit_files
+        .iter()
+        .map(|(msg, files)| (*msg, None, *files))
+        .collect();
+    create_real_git_repo_with_dates(dir, &with_dates)
+}
+
+/// Extended form of [`create_real_git_repo`] that accepts an optional per-commit
+/// date string (e.g. `"2025-10-01 00:00:00 +0000"`) injected via
+/// `GIT_AUTHOR_DATE` / `GIT_COMMITTER_DATE`.  When `date` is `None` the commit
+/// is made with the current wall-clock time (same behaviour as
+/// `create_real_git_repo`).
+///
+/// Prefer this over hand-rolling `Command::new("git")` add/commit blocks with
+/// env-var date overrides in individual tests — it keeps all dated and undated
+/// tests on the same shared setup path.
+///
+/// Returns the full 40-hex SHA of HEAD.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(super) fn create_real_git_repo_with_dates(
+    dir: &std::path::Path,
+    commit_files: &[(&str, Option<&str>, &[(&str, &str)])],
 ) -> String {
     use std::fs;
     use std::process::Command;
@@ -862,7 +914,7 @@ pub(super) fn create_real_git_repo(
         .output()
         .expect("git config name");
 
-    for (msg, files) in commit_files {
+    for (msg, date, files) in commit_files {
         for (name, content) in *files {
             let path = dir.join(name);
             if let Some(parent) = path.parent() {
@@ -875,11 +927,12 @@ pub(super) fn create_real_git_repo(
                 .output()
                 .expect("git add");
         }
-        Command::new("git")
-            .args(["commit", "-m", msg])
-            .current_dir(dir)
-            .output()
-            .expect("git commit");
+        let mut cmd = Command::new("git");
+        cmd.args(["commit", "-m", msg]).current_dir(dir);
+        if let Some(d) = date {
+            cmd.env("GIT_AUTHOR_DATE", d).env("GIT_COMMITTER_DATE", d);
+        }
+        cmd.output().expect("git commit");
     }
 
     let out = Command::new("git")
@@ -888,6 +941,31 @@ pub(super) fn create_real_git_repo(
         .output()
         .expect("git rev-parse HEAD");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Test-only helper: write a single `meta` key/value pair directly via raw SQL,
+/// bypassing the `TemporalDb::set_meta` version-attestation guard (AD-408-3).
+///
+/// Tests need to construct adversarial persisted states — a half-attested DB
+/// (`git_head` present, `data_version` absent), a corrupt/non-integer
+/// `data_version`, or a future/legacy version — that the production `set_meta`
+/// guard deliberately rejects with a `debug_assert!`. Those raw-bytes scenarios
+/// (simulating a DB written by another / older / corrupt binary) belong at the
+/// storage layer, not the guarded domain API.
+///
+/// Requires the `meta` table to already exist (created by `TemporalDb::open`)
+/// and opens its own short-lived connection, so any live `TemporalDb` handle on
+/// the same file must be dropped first to avoid write contention. `pub(super)`
+/// makes it reachable from all `#[cfg(test)]` modules within
+/// `crate::cmd::search` (`staleness_tests.rs`, `temporal_tests.rs`).
+#[cfg(test)]
+pub(super) fn plant_meta_raw(db_path: &std::path::Path, key: &str, value: &str) {
+    let conn = rusqlite::Connection::open(db_path).expect("open temporal.db for meta plant");
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        rusqlite::params![key, value],
+    )
+    .expect("plant meta row");
 }
 
 /// Test-only re-export of `scan_working_tree` for AC9 / AC7 integration tests

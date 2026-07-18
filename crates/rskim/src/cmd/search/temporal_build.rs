@@ -22,7 +22,7 @@
 //! returns `Ok(())` with a debug-gated warning on recoverable errors; only
 //! unexpected internal errors propagate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -363,6 +363,113 @@ pub(super) fn rebuild_temporal(
     rebuild_temporal_with_source(&GixSource, root, cache_dir, head, now_epoch)
 }
 
+/// Return `true` when `rel` names a regular file that exists under `root`.
+///
+/// Performs two checks in order:
+/// 1. **Containment guard** via [`crate::cmd::is_repo_relative_safe`] — rejects
+///    any `rel` with absolute, `..` (ParentDir), or drive-relative (Prefix)
+///    components to mitigate path-traversal risk (applies ADR-008; single
+///    canonical helper shared with `walk::list_tracked_files` and `heatmap::resolve_diff_files`).
+///    Git never emits such components in tree-diff output, so no legitimate row
+///    is dropped by this guard.
+/// 2. **`is_file()` existence check** — the correct predicate for "a path an
+///    agent can Read" (AD-408-2): a former-file path that is now a directory
+///    passes `.exists()` but fails `.is_file()` and must be excluded from the
+///    temporal surface (OD2, 2026-07-17).
+///
+/// # Symlink note (AD-408-2)
+///
+/// `is_file()` follows symlinks. A committed in-tree symlink that is relative
+/// and `..`-free (e.g. `link.rs -> /etc/passwd`) passes the containment guard
+/// and `is_file()` traverses the target, stat'ing outside `root`. The security
+/// impact is nil — only the boolean result is used to retain or drop a ranking
+/// row; no file content is read and no resolved path is emitted. An unreadable
+/// but present file (EACCES) is also silently treated as a ghost and dropped.
+/// Both are consciously accepted; use `symlink_metadata()` if strict containment
+/// is ever required.
+fn rel_is_regular_file(root: &Path, rel: &str) -> bool {
+    let rel_path = std::path::Path::new(rel);
+    if !crate::cmd::is_repo_relative_safe(rel_path) {
+        return false;
+    }
+    root.join(rel_path).is_file()
+}
+
+/// Discover the git worktree working directory by walking upward from `root`.
+///
+/// Returns the path of the worktree root (the directory containing `.git`) when
+/// `root` is inside a git repository, or `None` when gix cannot find a repo or
+/// the repo is bare. This is a pure path-discovery call — no object lookup or
+/// history walk occurs.
+///
+/// # Why this is needed
+///
+/// History paths in [`rskim_search::HistoryResult`] are REPO-ROOT-relative
+/// because [`GixSource::parse_history`] calls `gix::discover(root)` which walks
+/// **upward** to find `.git`. When `root` is a subdirectory of the worktree
+/// (e.g. `--root crates/rskim-search`), naive `root.join(rel)` double-nests the
+/// prefix — `<root>/crates/rskim-search/src/lib.rs` instead of the correct
+/// `<workdir>/crates/rskim-search/src/lib.rs` — causing every row to fail the
+/// `is_file()` check and be silently dropped. Using the discovered workdir as
+/// the anchor mirrors the approach in `heatmap/mod.rs` which joins against
+/// `git_source.get_repo_root()` (AD-408-5).
+///
+/// Failure is silently absorbed per D5 (temporal failure must not fail the
+/// lexical query path); callers fall back to `root` when `None` is returned.
+fn discover_git_workdir(root: &Path) -> Option<std::path::PathBuf> {
+    gix::discover(root)
+        .ok()
+        .and_then(|repo| repo.workdir().map(|p| p.to_path_buf()))
+}
+
+/// Remove temporal rows whose backing files no longer exist on disk.
+///
+/// This is the build-time ghost filter (AD-408-1). It runs on freshly-computed
+/// rows *before* [`TemporalDb::sync`] persists them, so the prior DB survives
+/// intact when sync fails and the self-heal invariant holds (applies ADR-006).
+///
+/// Hotspot and risk rows are retained only when the file exists on disk as a
+/// regular file; cochange rows survive only when **both** `file_a` and `file_b`
+/// exist. Scores are NOT renormalized after the drop — each file's score derives
+/// solely from its own git history, and cochange rows carry a baked-in Jaccard.
+///
+/// Existence is resolved once per unique path across all three row types to
+/// bound stat syscall count at 1× per path (worst case) rather than up to 3×.
+/// For the empty-history case the slices are already empty, so `retain` is a
+/// no-op.
+///
+/// Per PF-012: uses sequential `HashSet + retain` (bounded full-completion),
+/// NOT an early-terminated parallel walk. Parallelism would introduce PF-012
+/// racy-truncation risk for no measurable gain on this non-query path.
+fn apply_ghost_filter(
+    root: &Path,
+    hotspot_rows: &mut Vec<rskim_search::HotspotRow>,
+    risk_rows: &mut Vec<rskim_search::RiskRow>,
+    cochange_rows: &mut Vec<rskim_search::CochangeRow>,
+) {
+    // Collect each unique path referenced by any row type (1× stat per path).
+    let unique_paths: HashSet<&str> = hotspot_rows
+        .iter()
+        .map(|r| r.file_path.as_str())
+        .chain(risk_rows.iter().map(|r| r.file_path.as_str()))
+        .chain(
+            cochange_rows
+                .iter()
+                .flat_map(|r| [r.file_a.as_str(), r.file_b.as_str()]),
+        )
+        .collect();
+    // Resolve existence once per unique path.
+    let existing: HashSet<String> = unique_paths
+        .into_iter()
+        .filter(|p| rel_is_regular_file(root, p))
+        .map(String::from)
+        .collect();
+    hotspot_rows.retain(|r| existing.contains(&r.file_path));
+    risk_rows.retain(|r| existing.contains(&r.file_path));
+    // Cochange: both sides must exist on disk (AD-408-1 both-sides rule).
+    cochange_rows.retain(|r| existing.contains(&r.file_a) && existing.contains(&r.file_b));
+}
+
 /// Inner implementation of `rebuild_temporal` with an injectable `TemporalSource`.
 ///
 /// Separated from `rebuild_temporal` so tests can supply a counting or fake
@@ -387,46 +494,54 @@ pub(super) fn rebuild_temporal_with_source(
     };
 
     // ── Score computation (pure, no I/O) ─────────────────────────────────────
-    // For empty-history repos (zero commits): all row slices are empty but we
-    // still fall through to the single lock+open+sync block below, which writes
-    // a present-but-empty temporal.db with META_GIT_HEAD set.
-    //
-    // LOCKED DECISION (2026-06-24, plan lines 14/146/349): a present-but-empty
-    // temporal.db prevents the per-query no-op rebuild loop — on the next query,
-    // temporal_db_is_stale reads META_GIT_HEAD and sees Current, so no rebuild.
-    //
-    // Falling through (rather than an early-return empty branch) also avoids
+    // Empty-history path falls through to the single lock+open+sync block below
+    // (LOCKED DECISION 2026-06-24): a present-but-empty temporal.db with
+    // META_GIT_HEAD set prevents the per-query rebuild loop — temporal_db_is_stale
+    // reads META_GIT_HEAD and sees Current, so no rebuild. Falling through avoids
     // duplicating the lock+open+sync block and eliminates the partial-file risk
-    // that the prior early-return had: if sync fails after TemporalDb::open
-    // creates the file, the file exists with no META_GIT_HEAD row, making
-    // temporal_db_is_stale return true on the next query → rebuild loop.
-    // The single sync path addresses this: if sync fails we warn+skip and the
-    // file may still exist headless, but this is the same risk that already
-    // exists on the non-empty path (pre-existing, not introduced here).
-    let (hotspot_rows, risk_rows, cochange_rows);
-    if risk_history.commits.is_empty() {
-        hotspot_rows = vec![];
-        risk_rows = vec![];
-        cochange_rows = vec![];
+    // of an early-return (if sync fails after TemporalDb::open creates the file,
+    // the file exists with no META_GIT_HEAD row → rebuild loop).
+    let (mut hotspot_rows, mut risk_rows, mut cochange_rows) = if risk_history.commits.is_empty() {
+        (vec![], vec![], vec![])
     } else {
-        // risk_scores: decay-weighted hotspot/fix_density from the full-history walk
-        // (O-C / ADR-003). Full history ensures decay weights span the commit
-        // lifetime rather than being capped at 90 days.
+        // Full-history walk feeds all score computation (O-C / ADR-003).
+        // risk_scores: decay-weighted hotspot/fix_density.
         let risk_scores = rskim_search::compute_file_risk_scores(
             &risk_history.commits,
             now_epoch,
             DEFAULT_HALF_LIFE_DAYS,
         );
-        // temporal_stats: windowed counts (changes_30d/90d) PLUS lifetime totals
-        // (total_commits/fix_commits). The 30d/90d fields reflect commits inside
-        // the window relative to now_epoch (timestamp arithmetic, no walk cap).
+        // temporal_stats: windowed counts (changes_30d/90d) PLUS lifetime totals.
         let temporal_stats =
             rskim_search::compute_file_temporal_stats(&risk_history.commits, now_epoch);
-        // cochange uses full history (lifetime co-change coupling).
-        cochange_rows = build_cochange_rows(&risk_history);
-        hotspot_rows = build_hotspot_rows(&risk_scores, &temporal_stats);
-        risk_rows = build_risk_rows(&risk_scores, &temporal_stats);
-    }
+        (
+            build_hotspot_rows(&risk_scores, &temporal_stats),
+            build_risk_rows(&risk_scores, &temporal_stats),
+            build_cochange_rows(&risk_history),
+        )
+    };
+
+    // ── Build-time ghost filter (AD-408-1 / AD-408-5) ────────────────────────
+    // Applied on freshly-computed rows *before* `db.sync` persists them so the
+    // prior DB survives on failure and the self-heal invariant holds (ADR-006).
+    // See `apply_ghost_filter` for the full invariant documentation.
+    //
+    // AD-408-5: history paths from `parse_history` are REPO-ROOT-relative
+    // because `gix::discover` walks upward to find `.git` from `root`. When
+    // `root` is a subdirectory of the worktree (e.g. `--root crates/rskim-search`),
+    // naive `root.join(rel)` double-nests the path prefix and causes every row
+    // to be false-ghosted — all temporal output silently becomes empty (exit 0).
+    // We discover the actual git workdir and use it as the anchor for
+    // `rel_is_regular_file`, mirroring `heatmap/mod.rs` which joins against
+    // `git_source.get_repo_root()`. Falls back to `root` if discovery fails
+    // (D5: temporal failure must not fail the lexical query path).
+    let ghost_root = discover_git_workdir(root).unwrap_or_else(|| root.to_path_buf());
+    apply_ghost_filter(
+        &ghost_root,
+        &mut hotspot_rows,
+        &mut risk_rows,
+        &mut cochange_rows,
+    );
 
     // ── Acquire lock (D4), then sync ─────────────────────────────────────────
     // Single sync path for both the empty-history and non-empty cases:

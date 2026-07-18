@@ -15,7 +15,7 @@ use tempfile::tempdir;
 
 use super::{
     build_cochange_rows, build_hotspot_rows, build_risk_rows, rebuild_temporal,
-    rebuild_temporal_with_source,
+    rebuild_temporal_with_source, rel_is_regular_file,
 };
 
 // ============================================================================
@@ -384,6 +384,18 @@ fn init_git_repo(dir: &std::path::Path) {
 /// an unborn repo (no commits).
 fn create_real_git_repo(dir: &std::path::Path, commit_files: &[(&str, &[(&str, &str)])]) -> String {
     super::super::staleness::create_real_git_repo(dir, commit_files)
+}
+
+/// Extended form of [`create_real_git_repo`] that accepts an optional per-commit
+/// date string (e.g. `"2020-01-01 00:00:00 +0000"`) so tests that need
+/// `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` control can share the same helper path
+/// as undated tests rather than hand-rolling repeated `Command::new("git")` blocks.
+#[allow(clippy::type_complexity)]
+fn create_real_git_repo_with_dates(
+    dir: &std::path::Path,
+    commit_files: &[(&str, Option<&str>, &[(&str, &str)])],
+) -> String {
+    super::super::staleness::create_real_git_repo_with_dates(dir, commit_files)
 }
 
 /// AC5 / AC6 — HEAD stored in temporal.db equals full 40-hex SHA and matches
@@ -1299,4 +1311,358 @@ fn test_rebuild_temporal_parse_history_called_once() {
         !hotspots.is_empty(),
         "temporal.db must contain hotspot data (parse_history returned real commits)"
     );
+}
+
+// ============================================================================
+// AC1 / AC2 — Build-time ghost filter: committed-deleted files absent from DB
+// ============================================================================
+
+/// AC1: After rebuild, a file present in git history but deleted from disk is
+/// absent from top_hotspots, top_risks, and top_coldspots.  A present file is
+/// still there.  Subset assertion — fails if the retain passes are removed.
+///
+/// AC2 (cochange both-sides rule): Both directions of the filter are tested —
+/// - DROP: the (keep.rs, gone.rs) row is dropped because gone.rs is a ghost.
+/// - RETAIN: the (keep.rs, peer.rs) row is retained because both files are
+///   present on disk.  The retain assertion is the positive anchor that would
+///   catch an over-zealous filter that drops all cochange rows.
+///
+/// Fixture: `peer.rs` co-changes with `keep.rs` in both joint commits.
+/// Jaccard(keep, peer) = 2/(3+2-2) = 2/3 ≈ 0.67 — well above threshold.
+///
+/// The ghost is created via `fs::remove_file` after committing (leaving the
+/// file in git history but off disk) — the `create_real_git_repo` helper does
+/// not support git-rm, so we delete the file directly.
+///
+/// PF-007 discriminating: the subset assertion fails if the ghost filter is
+/// removed (gone.rs would reappear in the output).
+#[test]
+fn test_ghost_filter_deleted_file_absent_from_all_tables() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Commit keep.rs, gone.rs, and peer.rs together in the first two commits so
+    // all three co-change.  delete gone.rs from disk to create a ghost; peer.rs
+    // remains present and anchors the AC2 retain assertion.
+    let head = create_real_git_repo(
+        dir.path(),
+        &[
+            // Joint commit: all three files co-change.
+            (
+                "feat: add all",
+                &[
+                    ("keep.rs", "fn keep() {}"),
+                    ("gone.rs", "fn gone() {}"),
+                    ("peer.rs", "fn peer() {}"),
+                ],
+            ),
+            // Second joint commit: raises Jaccard for all pairs above MIN_COCHANGE_JACCARD.
+            (
+                "feat: update all",
+                &[
+                    ("keep.rs", "fn keep2() {}"),
+                    ("gone.rs", "fn gone2() {}"),
+                    ("peer.rs", "fn peer2() {}"),
+                ],
+            ),
+            // Extra commit to keep.rs only (does not affect the peer/gone Jaccard).
+            ("feat: keep only", &[("keep.rs", "fn keep3() {}")]),
+        ],
+    );
+
+    // Delete gone.rs from disk — it remains in git history (ghost).
+    std::fs::remove_file(dir.path().join("gone.rs"))
+        .expect("gone.rs must exist on disk before deletion");
+
+    let now = super::current_epoch_secs();
+    rebuild_temporal(dir.path(), &cache_dir, &head, now).unwrap();
+
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+
+    // AC1: gone.rs must be absent from all three score tables.
+    let hotspots = db.top_hotspots(50).unwrap();
+    let risks = db.top_risks(50).unwrap();
+    let coldspots = db.top_coldspots(50).unwrap();
+
+    let gone_in_hotspot = hotspots.iter().any(|r| r.file_path == "gone.rs");
+    let gone_in_risk = risks.iter().any(|r| r.file_path == "gone.rs");
+    let gone_in_cold = coldspots.iter().any(|r| r.file_path == "gone.rs");
+
+    assert!(
+        !gone_in_hotspot,
+        "AC1: gone.rs (ghost) must be ABSENT from top_hotspots — ghost filter not applied"
+    );
+    assert!(
+        !gone_in_risk,
+        "AC1: gone.rs (ghost) must be ABSENT from top_risks — ghost filter not applied"
+    );
+    assert!(
+        !gone_in_cold,
+        "AC1: gone.rs (ghost) must be ABSENT from top_coldspots — ghost filter not applied"
+    );
+
+    // keep.rs must still be present.
+    let keep_in_hotspot = hotspots.iter().any(|r| r.file_path == "keep.rs");
+    assert!(
+        keep_in_hotspot,
+        "AC1: keep.rs (present) must be in top_hotspots (should not be filtered)"
+    );
+
+    let partners = db.cochanges_for_file("keep.rs").unwrap();
+
+    // AC2 DROP: cochange row (keep.rs, gone.rs) must be absent — gone.rs is a ghost.
+    let ghost_partner = partners
+        .iter()
+        .any(|r| r.file_a == "gone.rs" || r.file_b == "gone.rs");
+    assert!(
+        !ghost_partner,
+        "AC2: cochange row (keep.rs, gone.rs) must be ABSENT — ghost partner not filtered"
+    );
+
+    // AC2 RETAIN (positive anchor): cochange row (keep.rs, peer.rs) must be present.
+    // Both files are on disk; the filter must retain this row.  Without this assertion
+    // an over-zealous filter that drops all cochange rows — including legitimate
+    // both-present pairs — would go undetected.
+    let peer_partner_retained = partners
+        .iter()
+        .any(|r| r.file_a == "peer.rs" || r.file_b == "peer.rs");
+    assert!(
+        peer_partner_retained,
+        "AC2: cochange row (keep.rs, peer.rs) must be RETAINED — \
+         both files are present on disk; filter must not over-drop"
+    );
+}
+
+/// AC9: Containment guard — a history path that is absolute or contains `..`
+/// is treated as non-existent (dropped) and never stats outside root.
+///
+/// We test `rel_is_regular_file` directly: absolute paths and `..`-containing
+/// paths are rejected without ever calling `is_file()` outside `root`.
+#[test]
+fn test_ghost_filter_containment_guard() {
+    let dir = tempdir().unwrap();
+
+    // A normal present file.
+    std::fs::write(dir.path().join("present.rs"), "fn main() {}").unwrap();
+
+    // Absolute path — rejected even if the target file exists.
+    let abs_path = dir.path().join("present.rs").to_string_lossy().to_string();
+    assert!(
+        !rel_is_regular_file(dir.path(), &abs_path),
+        "AC9: absolute path must be rejected by containment guard (is_absolute check)"
+    );
+
+    // Path with .. component — rejected regardless of whether target exists.
+    assert!(
+        !rel_is_regular_file(dir.path(), "../escape.rs"),
+        "AC9: path with .. component must be rejected (ParentDir check)"
+    );
+    assert!(
+        !rel_is_regular_file(dir.path(), "subdir/../../escape.rs"),
+        "AC9: nested .. path must be rejected (ParentDir check)"
+    );
+
+    // A normal relative path to an existing file — accepted.
+    assert!(
+        rel_is_regular_file(dir.path(), "present.rs"),
+        "AC9: present file with normal relative path must be accepted"
+    );
+
+    // A normal relative path to a missing file — correctly absent (not an error).
+    assert!(
+        !rel_is_regular_file(dir.path(), "missing.rs"),
+        "AC9: missing file must return false (not error)"
+    );
+
+    // A path to a directory — rejected by is_file().
+    let subdir = dir.path().join("subdir");
+    std::fs::create_dir_all(&subdir).unwrap();
+    assert!(
+        !rel_is_regular_file(dir.path(), "subdir"),
+        "AC9: directory path must be rejected by is_file() predicate (OD2)"
+    );
+}
+
+/// Regression: ghost filter must NOT false-drop rows when `root` is a
+/// subdirectory of the git worktree (AD-408-5).
+///
+/// Before the fix, `apply_ghost_filter` joined REPO-ROOT-relative paths against
+/// the search `root` subdir, double-nesting the prefix and causing every row to
+/// fail `is_file()`. With the fix, paths are joined against the discovered git
+/// workdir (the true repo root), so present files are correctly retained.
+///
+/// Failure scenario (pre-fix):
+///   `skim search --hot --root <repo>/subdir`
+///   → gix discovers `<repo>` from `subdir`, emits `src/lib.rs`
+///   → ghost filter: `subdir.join("src/lib.rs")` = `<repo>/subdir/src/lib.rs`
+///     (double-nested; file does not exist there)
+///   → all rows dropped; `--hot` returns empty output with exit 0 (silent loss).
+///
+/// Discriminating: without the fix every hotspot row is false-ghosted; with the
+/// fix `src/lib.rs` is retained because `<workdir>.join("src/lib.rs")` exists.
+#[test]
+fn test_ghost_filter_subdir_root_rows_survive() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Create a real git repo at dir.path() and commit `src/lib.rs` there.
+    // These paths are REPO-ROOT-relative from gix's perspective.
+    let head = create_real_git_repo(
+        dir.path(),
+        &[
+            ("feat: add lib", &[("src/lib.rs", "pub fn a() {}")]),
+            ("feat: update lib", &[("src/lib.rs", "pub fn b() {}")]),
+        ],
+    );
+
+    // Create a subdirectory and use it as the search root — simulating
+    // `skim search --hot --root <repo>/subdir`.
+    // `src/lib.rs` does NOT exist under `subdir`; it exists under `dir.path()`.
+    let subdir = dir.path().join("subdir");
+    std::fs::create_dir_all(&subdir).unwrap();
+
+    let now = super::current_epoch_secs();
+    rebuild_temporal(&subdir, &cache_dir, &head, now).unwrap();
+
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+
+    let hotspots = db.top_hotspots(50).unwrap();
+    assert!(
+        !hotspots.is_empty(),
+        "ghost filter must NOT drop rows when root is a subdirectory of the git worktree \
+         (AD-408-5 regression: subdir double-path causes false ghost detection); \
+         got {} hotspot rows — pre-fix behaviour returned 0",
+        hotspots.len()
+    );
+
+    let lib_present = hotspots.iter().any(|r| r.file_path == "src/lib.rs");
+    assert!(
+        lib_present,
+        "src/lib.rs must survive the ghost filter when rebuild root is a subdirectory \
+         of the worktree (paths are repo-root-relative from gix)"
+    );
+}
+
+/// AC4: --cold --limit N returns exactly N present rows even when ghost files
+/// would have ranked at the top of the coldspot ordering.
+///
+/// Setup: 3 ghost files with very old commits (cold, score ~0 due to decay) and
+/// 5 present files with recent commits (warmer but with only 1 commit each).
+/// Without the ghost filter, the 3 coldest rows would be ghosts; with limit=4
+/// a query-time filter would return only 1 present row (under-fill).  With the
+/// build-time filter, the DB only contains the 5 present rows and top_coldspots(4)
+/// returns exactly 4.
+///
+/// Discriminating: a query-time ghost filter would under-fill to 1 row; the
+/// build-time filter returns exactly 4.  This test fails if the filter is moved
+/// to query time.
+///
+/// Uses `create_real_git_repo_with_dates` to share the same setup helper as
+/// undated tests (`test_ghost_filter_deleted_file_absent_from_all_tables`) and
+/// avoid hand-rolling repeated `Command::new("git")` blocks.
+#[test]
+#[allow(clippy::type_complexity)]
+fn test_ghost_filter_coldspot_limit_no_underfill() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // now_epoch pinned to 2026-06-13 08:00:00 UTC (matches other tests).
+    let now_epoch: u64 = 1_781_337_600;
+
+    // Old date → commits decay to ~0 → very cold scores.
+    let ghost_date = "2020-01-01 00:00:00 +0000";
+    // Recent date → commits have high decay weight → warmer scores.
+    let present_date = "2026-06-10 00:00:00 +0000";
+
+    // Co-locate each commit's (name, content, message) to avoid parallel-Vec
+    // index alignment.  Owned strings live here; slices are taken below.
+    let ghost_data: Vec<(String, String, String)> = (0..3u32)
+        .map(|i| {
+            (
+                format!("ghost{i}.rs"),
+                format!("// ghost {i}"),
+                format!("feat: ghost {i}"),
+            )
+        })
+        .collect();
+    let present_data: Vec<(String, String, String)> = (0..5u32)
+        .map(|i| {
+            (
+                format!("present{i}.rs"),
+                format!("// present {i}"),
+                format!("feat: present {i}"),
+            )
+        })
+        .collect();
+
+    // Per-commit file lists — each commit touches exactly one file.
+    let ghost_files: Vec<Vec<(&str, &str)>> = ghost_data
+        .iter()
+        .map(|(n, c, _)| vec![(n.as_str(), c.as_str())])
+        .collect();
+    let present_files: Vec<Vec<(&str, &str)>> = present_data
+        .iter()
+        .map(|(n, c, _)| vec![(n.as_str(), c.as_str())])
+        .collect();
+
+    // Build commit specs: (message, date, files).
+    let mut commit_specs: Vec<(&str, Option<&str>, &[(&str, &str)])> = Vec::new();
+    for (i, (_, _, msg)) in ghost_data.iter().enumerate() {
+        commit_specs.push((msg.as_str(), Some(ghost_date), ghost_files[i].as_slice()));
+    }
+    for (i, (_, _, msg)) in present_data.iter().enumerate() {
+        commit_specs.push((
+            msg.as_str(),
+            Some(present_date),
+            present_files[i].as_slice(),
+        ));
+    }
+
+    let head = create_real_git_repo_with_dates(dir.path(), &commit_specs);
+
+    // Delete ghost files from disk (they remain in git history).
+    for (name, _, _) in &ghost_data {
+        std::fs::remove_file(dir.path().join(name)).unwrap();
+    }
+
+    rebuild_temporal(dir.path(), &cache_dir, &head, now_epoch).unwrap();
+
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+
+    // With ghost filter: DB has only 5 present rows → top_coldspots(4) returns 4.
+    let limit: usize = 4;
+    let coldspots = db.top_coldspots(limit).unwrap();
+
+    assert_eq!(
+        coldspots.len(),
+        limit,
+        "AC4: top_coldspots({limit}) must return exactly {limit} rows (build-time ghost filter \
+         ensures no ghosts in DB); got {} — query-time filter would under-fill when ghosts cluster \
+         at the top of the coldspot ordering",
+        coldspots.len()
+    );
+
+    // All returned rows must be present on disk.
+    for row in &coldspots {
+        assert!(
+            dir.path().join(&row.file_path).is_file(),
+            "AC4: coldspot row '{}' must be present on disk (ghost filter must have removed ghosts)",
+            row.file_path
+        );
+    }
+
+    // Ghost files must not appear in any coldspot row.
+    for (name, _, _) in &ghost_data {
+        let ghost_present = coldspots.iter().any(|r| r.file_path == *name);
+        assert!(
+            !ghost_present,
+            "AC4: ghost file '{name}' must not appear in top_coldspots"
+        );
+    }
 }
