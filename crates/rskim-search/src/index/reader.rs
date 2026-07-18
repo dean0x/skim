@@ -293,6 +293,32 @@ fn near_match(d: &[Vec<u32>], n: u32) -> bool {
     false
 }
 
+/// Update `slot` to hold the minimum of its current value and `v`.
+///
+/// A single named helper for the field-attribution tie rule (AD-411-2):
+/// when a token spans a field boundary the highest-priority (lowest-numbered)
+/// field wins.  The rule appears in three phases of `align_whole_token`
+/// (seed, narrow, and accumulate); consolidating into one function ensures all
+/// three diverge in lock-step if the rule ever changes.
+#[inline]
+fn keep_min(slot: &mut u8, v: u8) {
+    if v < *slot {
+        *slot = v;
+    }
+}
+
+/// Named entry for the `candidates` map in `align_whole_token`.
+///
+/// Replaces the anonymous `(u8, u32)` tuple so each field is self-documenting
+/// across the three phases that touch it (seed, narrow `retain`, accumulate).
+struct CandidateEntry {
+    /// Minimum `field_id` seen for this `token_position` across all processed trigrams
+    /// (AD-411-2 field-attribution rule: highest-priority field wins).
+    min_field: u8,
+    /// Byte offset of the first trigram of this occurrence (for snippet highlighting).
+    byte_pos: u32,
+}
+
 /// Compute per-field TF increments and byte-range positions for one whole-token
 /// alignment: query word `word` occurring as a complete token in document `doc_id`.
 ///
@@ -300,12 +326,13 @@ fn near_match(d: &[Vec<u32>], n: u32) -> bool {
 ///
 /// The aligned positions are the **set**-intersection of `token_position` across
 /// ALL of `word`'s trigrams.  The seed phase collects
-/// `token_position → (min_field_id, byte_pos)` into a `HashMap` — not a `Vec` —
-/// so a trigram that recurs at the same `token_position` inside a single document
-/// token (e.g. `"data_database"` or `"test_test"` where the seed trigram appears
-/// twice at the same position) produces exactly **one** candidate, not two.  Each
-/// unique aligned `token_position` counts exactly once toward `field_tf`, matching
-/// the set semantics documented in `search_exact_intersection` (AD-411-2):
+/// `token_position → CandidateEntry { min_field, byte_pos }` into a `HashMap` —
+/// not a `Vec` — so a trigram that recurs at the same `token_position` inside a
+/// single document token (e.g. `"data_database"` or `"test_test"` where the seed
+/// trigram appears twice at the same position) produces exactly **one** candidate,
+/// not two.  Each unique aligned `token_position` counts exactly once toward
+/// `field_tf`, matching the set semantics documented in `search_exact_intersection`
+/// (AD-411-2):
 ///
 /// ```text
 /// aligned = ∩_g  { p.token_position | p ∈ postings(g, doc) }
@@ -320,21 +347,34 @@ fn near_match(d: &[Vec<u32>], n: u32) -> bool {
 /// - `byte_positions` holds one byte-range per aligned occurrence for snippet
 ///   highlighting, pointing to the first trigram's byte offset.
 ///
+/// # Scratch-buffer contract
+///
+/// `candidates` and `trig_scratch` are caller-owned reusable allocations.
+/// This function clears both at the appropriate phase boundaries and returns
+/// with them empty, so the caller may re-use the capacity across the doc loop
+/// without re-allocating (reliability guideline: prefer pools/pre-sized
+/// collections over per-iteration allocations).
+///
 /// Pure, free function (no I/O) — unit-testable without building an index.
 /// Matches the convention at lines 91–96 (`intersect_sorted_u32`, etc.).
 fn align_whole_token(
     doc_id: u32,
     word: &QueryToken,
     postings_by_key: &HashMap<u32, Vec<super::format::PostingEntry>>,
+    candidates: &mut HashMap<u32, CandidateEntry>,
+    trig_scratch: &mut HashMap<u32, u8>,
 ) -> ([f32; FIELD_COUNT], Vec<std::ops::Range<usize>>) {
     let mut field_tf = [0.0f32; FIELD_COUNT];
     let mut byte_pos_vec: Vec<std::ops::Range<usize>> = Vec::new();
+
+    // Reuse the caller-provided allocation; clear at call boundary.
+    candidates.clear();
 
     if word.trigrams.is_empty() {
         return (field_tf, byte_pos_vec);
     }
 
-    // --- Seed phase: first trigram → HashMap keyed by token_position ---
+    // --- Seed phase: first trigram → candidates keyed by token_position ---
     // Using a HashMap (not a Vec) is what produces set semantics: if the seed
     // trigram appears at the same token_position more than once (e.g. the
     // trigram "dat" occurs twice within the single token "data_database"),
@@ -347,8 +387,6 @@ fn align_whole_token(
         None => return (field_tf, byte_pos_vec),
     };
     let lo = first_posts.partition_point(|p| p.doc_id < doc_id);
-    // token_position → (min_field_id, byte_pos)
-    let mut candidates: HashMap<u32, (u8, u32)> = HashMap::new();
     let mut idx = lo;
     while idx < first_posts.len() && first_posts[idx].doc_id == doc_id {
         let p = &first_posts[idx];
@@ -356,10 +394,11 @@ fn align_whole_token(
         if p.token_length == word.byte_len {
             let e = candidates
                 .entry(p.token_position)
-                .or_insert((p.field_id, p.position));
-            if p.field_id < e.0 {
-                e.0 = p.field_id;
-            }
+                .or_insert(CandidateEntry {
+                    min_field: p.field_id,
+                    byte_pos: p.position,
+                });
+            keep_min(&mut e.min_field, p.field_id);
         }
         idx += 1;
     }
@@ -385,23 +424,23 @@ fn align_whole_token(
         };
         let lo2 = posts.partition_point(|p| p.doc_id < doc_id);
         // min field_id per token_position for this trigram at this doc.
-        let mut trig_field: HashMap<u32, u8> = HashMap::new();
+        // trig_scratch is a caller-provided reusable allocation; cleared here
+        // at the start of each trigram iteration (not per-doc-loop iteration).
+        trig_scratch.clear();
         let mut idx2 = lo2;
         while idx2 < posts.len() && posts[idx2].doc_id == doc_id {
             let p = &posts[idx2];
-            let e = trig_field.entry(p.token_position).or_insert(p.field_id);
-            if p.field_id < *e {
-                *e = p.field_id;
-            }
+            trig_scratch
+                .entry(p.token_position)
+                .and_modify(|e| keep_min(e, p.field_id))
+                .or_insert(p.field_id);
             idx2 += 1;
         }
         // Field attribution tie rule: min field_id across all trigrams; drop
         // positions not confirmed by this trigram.
-        candidates.retain(|tok_pos, (min_field, _bp)| match trig_field.get(tok_pos) {
+        candidates.retain(|tok_pos, entry| match trig_scratch.get(tok_pos) {
             Some(&fid) => {
-                if fid < *min_field {
-                    *min_field = fid;
-                }
+                keep_min(&mut entry.min_field, fid);
                 true
             }
             None => false,
@@ -409,12 +448,13 @@ fn align_whole_token(
     }
 
     // --- Accumulate: one whole-token occurrence per aligned position ---
-    for (_tok_pos, (min_field, byte_pos)) in candidates {
-        let fidx = min_field as usize;
+    // drain() leaves the map empty but retains its capacity for the next call.
+    for (_tok_pos, entry) in candidates.drain() {
+        let fidx = entry.min_field as usize;
         if fidx < FIELD_COUNT {
             field_tf[fidx] += 1.0;
         }
-        byte_pos_vec.push(byte_pos as usize..byte_pos as usize + 3);
+        byte_pos_vec.push(entry.byte_pos as usize..entry.byte_pos as usize + 3);
     }
 
     (field_tf, byte_pos_vec)
@@ -978,6 +1018,13 @@ impl NgramIndexReader {
         let mut doc_field: HashMap<u32, [f32; FIELD_COUNT]> = HashMap::new();
         let mut scored: Vec<(u32, f64)> = Vec::with_capacity(intersection.len());
 
+        // Scratch allocations for align_whole_token — hoisted above the doc loop so
+        // each per-doc call reuses the same heap-allocated maps instead of allocating
+        // a fresh HashMap per (doc × trigram) iteration (reliability guideline:
+        // minimize allocation after initialization — prefer pools/pre-sized collections).
+        let mut scratch_cands: HashMap<u32, CandidateEntry> = HashMap::new();
+        let mut scratch_trig: HashMap<u32, u8> = HashMap::new();
+
         // Step 3 (AD-411-3): Per-field-saturated BM25F config is loop-invariant;
         // hoisted above the intersection loop to avoid reconstructing a stack-only
         // struct on every scored document.
@@ -1011,7 +1058,13 @@ impl NgramIndexReader {
             // token_position counts exactly once, even if the seed trigram recurs
             // at the same position within the document token.
             for word in &positional_words {
-                let (word_tf, word_positions) = align_whole_token(doc_id, word, &postings_by_key);
+                let (word_tf, word_positions) = align_whole_token(
+                    doc_id,
+                    word,
+                    &postings_by_key,
+                    &mut scratch_cands,
+                    &mut scratch_trig,
+                );
                 for i in 0..FIELD_COUNT {
                     field_tf[i] += word_tf[i];
                 }
