@@ -362,8 +362,8 @@ struct CandidateEntry {
 ///   slice by `start` before returning to restore deterministic order
 ///   (HashMap drain order is non-deterministic per RandomState seed).
 ///
-/// Pure, free function (no I/O) — unit-testable without building an index.
-/// Matches the convention at lines 91–96 (`intersect_sorted_u32`, etc.).
+/// Pure, free function (no I/O) — unit-testable without building an index,
+/// following the same pattern as `intersect_sorted_u32`.
 fn align_whole_token(
     doc_id: u32,
     word: &QueryToken,
