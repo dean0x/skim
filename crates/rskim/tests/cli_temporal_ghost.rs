@@ -13,10 +13,16 @@
 //!
 //! # Test plan coverage
 //!
-//! - AC3:  All four standalone arms (text + `--json`) exit 0 and emit no ghost.
-//! - AC10: Ground-truth smoke — every path in JSON output satisfies `is_file()`.
-//! - AC12: Heatmap arm does not emit a former-file path absent from disk.
-//! - AC13: Heatmap and temporal arms agree: "gone.rs" absent from both.
+//! - AC3:  All four standalone arms (text + `--json`) exit 0, emit no ghost,
+//!         and emit at least one present file (non-vacuous PF-007 anchor).
+//! - AC10: Ground-truth smoke — every path in JSON output satisfies `is_file()`;
+//!         results non-empty where expected.
+//! - AC12: `skim heatmap --diff` warns when a diffed path is replaced by a
+//!         directory (`is_file()==false`, `exists()==true`) — tested in
+//!         `test_heatmap_diff_path_replaced_by_directory_warns`.
+//! - AC13: `skim search --hot` excludes "gone.rs" (ghost filter applied at build
+//!         time); `skim heatmap` (no `--diff`) shows it from git history, which
+//!         is correct and expected.
 
 use std::fs;
 use std::path::Path;
@@ -169,13 +175,33 @@ fn assert_ghost_absent(stdout: &[u8], label: &str) {
 ///
 /// AC10: every path emitted in `--json` output must be present on disk.
 /// The JSON structure has `results: [{path: "..."}, ...]` for all temporal arms.
-fn assert_json_paths_present(json_bytes: &[u8], root: &Path, label: &str) {
+///
+/// `require_nonempty`: when `true`, asserts the results array is non-empty so
+/// that the ghost-absence check cannot pass vacuously on an empty result set
+/// (PF-007: a test asserting only exit-0 is worthless — assert a DISCRIMINATING
+/// observable).  Pass `false` for the `--blast-radius` arm where all co-change
+/// partners are ghosts and an empty result set is the correct post-filter state.
+fn assert_json_paths_present(
+    json_bytes: &[u8],
+    root: &Path,
+    label: &str,
+    require_nonempty: bool,
+) {
     let v: serde_json::Value = serde_json::from_slice(json_bytes)
         .unwrap_or_else(|e| panic!("'{label}' --json output is not valid JSON: {e}"));
     let results = v
         .get("results")
         .and_then(|r| r.as_array())
         .unwrap_or_else(|| panic!("'{label}' JSON missing 'results' array"));
+
+    if require_nonempty {
+        assert!(
+            !results.is_empty(),
+            "AC10: '{label}' JSON 'results' array is empty — temporal query \
+             returned nothing; ghost-absence assertion cannot be verified \
+             (possible index-wiring regression)"
+        );
+    }
 
     for result in results {
         let path = result
@@ -202,7 +228,7 @@ fn test_ghost_filter_risky_text_and_json() {
     let cache = TempDir::new().unwrap();
     build_index(dir.path(), cache.path());
 
-    // Text mode: exit 0 + no "gone.rs".
+    // Text mode: exit 0 + no "gone.rs" + keep.rs present (non-vacuous anchor).
     let text_out = Command::cargo_bin("skim")
         .unwrap()
         .args(["search", "--risky", "--root"])
@@ -214,8 +240,14 @@ fn test_ghost_filter_risky_text_and_json() {
         .stdout
         .clone();
     assert_ghost_absent(&text_out, "--risky text");
+    let text = String::from_utf8_lossy(&text_out);
+    assert!(
+        text.contains("keep.rs"),
+        "AC3: '--risky text' must emit 'keep.rs' (present file); \
+         if empty the ghost-absence check is vacuous (PF-007)"
+    );
 
-    // JSON mode: exit 0, no "gone.rs", every path is_file().
+    // JSON mode: exit 0, no "gone.rs", every path is_file(), results non-empty.
     let json_out = Command::cargo_bin("skim")
         .unwrap()
         .args(["search", "--risky", "--json", "--root"])
@@ -227,7 +259,7 @@ fn test_ghost_filter_risky_text_and_json() {
         .stdout
         .clone();
     assert_ghost_absent(&json_out, "--risky --json");
-    assert_json_paths_present(&json_out, dir.path(), "--risky --json");
+    assert_json_paths_present(&json_out, dir.path(), "--risky --json", true);
 }
 
 /// AC3 / AC10: `--cold` (text + JSON) exits 0, emits no ghost, all JSON paths present.
@@ -248,6 +280,12 @@ fn test_ghost_filter_cold_text_and_json() {
         .stdout
         .clone();
     assert_ghost_absent(&text_out, "--cold text");
+    let text = String::from_utf8_lossy(&text_out);
+    assert!(
+        text.contains("keep.rs"),
+        "AC3: '--cold text' must emit 'keep.rs' (present file); \
+         if empty the ghost-absence check is vacuous (PF-007)"
+    );
 
     let json_out = Command::cargo_bin("skim")
         .unwrap()
@@ -260,7 +298,7 @@ fn test_ghost_filter_cold_text_and_json() {
         .stdout
         .clone();
     assert_ghost_absent(&json_out, "--cold --json");
-    assert_json_paths_present(&json_out, dir.path(), "--cold --json");
+    assert_json_paths_present(&json_out, dir.path(), "--cold --json", true);
 }
 
 /// AC3 / AC10: `--hot` (text + JSON) exits 0, emits no ghost, all JSON paths present.
@@ -281,6 +319,12 @@ fn test_ghost_filter_hot_text_and_json() {
         .stdout
         .clone();
     assert_ghost_absent(&text_out, "--hot text");
+    let text = String::from_utf8_lossy(&text_out);
+    assert!(
+        text.contains("keep.rs"),
+        "AC3: '--hot text' must emit 'keep.rs' (present file); \
+         if empty the ghost-absence check is vacuous (PF-007)"
+    );
 
     let json_out = Command::cargo_bin("skim")
         .unwrap()
@@ -293,7 +337,7 @@ fn test_ghost_filter_hot_text_and_json() {
         .stdout
         .clone();
     assert_ghost_absent(&json_out, "--hot --json");
-    assert_json_paths_present(&json_out, dir.path(), "--hot --json");
+    assert_json_paths_present(&json_out, dir.path(), "--hot --json", true);
 }
 
 /// AC3 / AC10: `--blast-radius keep.rs` (text + JSON) exits 0, emits no ghost,
@@ -318,6 +362,16 @@ fn test_ghost_filter_blast_radius_text_and_json() {
         .stdout
         .clone();
     assert_ghost_absent(&text_out, "--blast-radius text");
+    // After ghost-filtering, gone.rs (the only partner) is removed and the
+    // output says `No co-change data for "keep.rs".`  That message still
+    // contains "keep.rs", so this assertion is non-vacuous: if the binary
+    // crashed silently and emitted nothing it would fail here (PF-007).
+    let text = String::from_utf8_lossy(&text_out);
+    assert!(
+        text.contains("keep.rs"),
+        "AC3: '--blast-radius text' must reference 'keep.rs' \
+         (target appears in the no-data message when all partners are filtered)"
+    );
 
     let json_out = Command::cargo_bin("skim")
         .unwrap()
@@ -330,42 +384,52 @@ fn test_ghost_filter_blast_radius_text_and_json() {
         .stdout
         .clone();
     assert_ghost_absent(&json_out, "--blast-radius --json");
-    assert_json_paths_present(&json_out, dir.path(), "--blast-radius --json");
+    // require_nonempty=false: all co-change partners (only gone.rs) are ghosts
+    // and are correctly filtered, yielding an empty results array.  An empty
+    // result is the correct post-filter state here, not a regression.
+    assert_json_paths_present(&json_out, dir.path(), "--blast-radius --json", false);
 }
 
 // ============================================================================
 // AC12 / AC13 — Heatmap alignment (OD2)
 // ============================================================================
 
-/// AC12 / AC13: `skim heatmap` and `skim search --hot` both exclude "gone.rs".
+/// AC13: `skim search --hot` excludes "gone.rs" (ghost filter applied at build time).
 ///
-/// AC12: heatmap does not emit a path that `is_file()` rejects.
-/// AC13: the two surfaces agree — "gone.rs" is absent from both.
+/// AC13: the temporal `--hot` arm does not surface a deleted-from-disk path.
 ///
-/// Note: `skim heatmap` warns about files deleted on the *current branch*
-/// (git diff output), not files deleted in previous commits.  Since "gone.rs"
-/// was deleted in a past commit, it does not appear in `git diff` and will not
-/// be present in heatmap output at all.  This test verifies that neither arm
-/// exposes it.
+/// Note: `skim heatmap` without `--diff` shows ALL files from git history and
+/// intentionally includes gone.rs (it has 3 commits).  The heatmap ghost-filter
+/// (`is_file()` in `resolve_diff_files`) is only triggered with `--diff`; that
+/// path is covered by `test_heatmap_diff_path_replaced_by_directory_warns`.
+/// This test uses `current_dir` as the idiom from cli_heatmap.rs:226-228 — the
+/// heatmap has no `--root` flag (its parser rejects unknown flags via `bail!`).
 #[test]
 fn test_ghost_filter_heatmap_and_hot_agree() {
     let (dir, _head) = make_ghost_repo();
     let cache = TempDir::new().unwrap();
     build_index(dir.path(), cache.path());
 
-    // Heatmap: exit 0, "gone.rs" not in output.
+    // Heatmap: exit 0, keep.rs appears (positive non-vacuous anchor).
+    // gone.rs also appears (3 commits in history) — that is expected because the
+    // heatmap without --diff reads raw git log and has no ghost filter.
     let heatmap_out = Command::cargo_bin("skim")
         .unwrap()
-        .args(["heatmap", "--root"])
-        .arg(dir.path())
+        .args(["heatmap"])
+        .current_dir(dir.path())
         .env("SKIM_CACHE_DIR", cache.path())
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
+    let heatmap_text = String::from_utf8_lossy(&heatmap_out);
+    assert!(
+        heatmap_text.contains("keep.rs"),
+        "AC13: heatmap must emit 'keep.rs' (present file with 4 commits)"
+    );
 
-    // --hot: exit 0, "gone.rs" not in output.
+    // --hot: exit 0, "gone.rs" not in output, keep.rs present.
     let hot_out = Command::cargo_bin("skim")
         .unwrap()
         .args(["search", "--hot", "--root"])
@@ -376,12 +440,107 @@ fn test_ghost_filter_heatmap_and_hot_agree() {
         .get_output()
         .stdout
         .clone();
-
-    // AC13: neither surface emits "gone.rs".
-    let heatmap_text = String::from_utf8_lossy(&heatmap_out);
-    assert!(
-        !heatmap_text.contains("gone.rs"),
-        "AC12/AC13: heatmap must not emit 'gone.rs' (ghost)"
-    );
     assert_ghost_absent(&hot_out, "AC13 --hot");
+    let hot_text = String::from_utf8_lossy(&hot_out);
+    assert!(
+        hot_text.contains("keep.rs"),
+        "AC13: '--hot' must emit 'keep.rs'; \
+         if empty the ghost-absence check is vacuous (PF-007)"
+    );
+}
+
+// ============================================================================
+// AD-408-2 (OD2) — heatmap --diff is_file() vs exists() discrimination
+// ============================================================================
+
+/// AD-408-2: `skim heatmap --diff` warns when a diffed path is replaced by a
+/// directory on disk (`is_file() == false` while `exists() == true`).
+///
+/// This is the only test that exercises the `is_file()` guard introduced in
+/// `resolve_diff_files` (heatmap/mod.rs).  The discriminating case is a
+/// former-file path now occupied by a directory: `exists()` would return `true`
+/// and silently skip the warning; `is_file()` returns `false` and emits it.
+///
+/// Setup:
+/// - commit A: `changed.rs` is a regular file
+/// - commit B: `changed.rs` is modified (HEAD)
+/// - disk: `changed.rs` is replaced by a same-named directory (not committed)
+///
+/// `git diff A...HEAD --name-only` lists `changed.rs` as modified.
+/// `is_file()` on the absolute path returns false (it is a directory).
+/// Warning must appear in stderr.
+#[test]
+fn test_heatmap_diff_path_replaced_by_directory_warns() {
+    let dir = TempDir::new().expect("tempdir");
+    git_init(dir.path());
+
+    // Commit A: create changed.rs as a regular file.
+    fs::write(dir.path().join("changed.rs"), "fn a() {}").unwrap();
+    StdCommand::new("git")
+        .args(["add", "changed.rs"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["commit", "-m", "base: add changed.rs"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    // Capture base SHA (the diff base for --diff).
+    let base_out = StdCommand::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git rev-parse HEAD");
+    let base_sha = String::from_utf8_lossy(&base_out.stdout)
+        .trim()
+        .to_string();
+    assert_eq!(base_sha.len(), 40, "base SHA must be 40 chars");
+
+    // Commit B: modify changed.rs so it appears in `git diff <base>...HEAD`.
+    fs::write(dir.path().join("changed.rs"), "fn a_v2() {}").unwrap();
+    StdCommand::new("git")
+        .args(["add", "changed.rs"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["commit", "-m", "modify changed.rs"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    // Replace changed.rs with a same-named directory (not committed).
+    // After this: exists() == true, is_file() == false — the case that
+    // exists() would have missed (AD-408-2).
+    fs::remove_file(dir.path().join("changed.rs")).expect("remove changed.rs");
+    fs::create_dir(dir.path().join("changed.rs")).expect("create changed.rs dir");
+    assert!(
+        dir.path().join("changed.rs").exists(),
+        "directory must exist at changed.rs path"
+    );
+    assert!(
+        !dir.path().join("changed.rs").is_file(),
+        "changed.rs must NOT be a regular file (it is a directory)"
+    );
+
+    // Run `skim heatmap --diff <base_sha>`.
+    // git diff base...HEAD lists changed.rs as modified.
+    // is_file() on the absolute path returns false → warning emitted to stderr.
+    let out = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["heatmap", "--diff"])
+        .arg(&base_sha)
+        .current_dir(dir.path())
+        .output()
+        .expect("skim heatmap --diff");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("deleted on current branch"),
+        "AD-408-2: expected 'deleted on current branch' warning when a diffed \
+         path is occupied by a directory (is_file()==false, exists()==true); \
+         stderr was: {stderr:?}"
+    );
 }
