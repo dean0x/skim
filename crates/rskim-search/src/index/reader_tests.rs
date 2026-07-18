@@ -3111,13 +3111,15 @@ fn test_align_whole_token_field_attribution_tie_rule() {
 
     let mut scratch_cands: HashMap<u32, CandidateEntry> = HashMap::new();
     let mut scratch_trig: HashMap<u32, u8> = HashMap::new();
+    let mut byte_pos_vec: Vec<std::ops::Range<usize>> = Vec::new();
 
-    let (field_tf, byte_positions) = align_whole_token(
+    let field_tf = align_whole_token(
         doc_id,
         &word,
         &postings_by_key,
         &mut scratch_cands,
         &mut scratch_trig,
+        &mut byte_pos_vec,
     );
 
     // The tie rule must attribute the one aligned occurrence to field 1
@@ -3132,13 +3134,124 @@ fn test_align_whole_token_field_attribution_tie_rule() {
     );
     // Exactly one aligned position.
     assert_eq!(
-        byte_positions.len(),
+        byte_pos_vec.len(),
         1,
-        "AD-411-2 tie rule: exactly one aligned occurrence expected; got {byte_positions:?}"
+        "AD-411-2 tie rule: exactly one aligned occurrence expected; got {byte_pos_vec:?}"
     );
     // Byte position from the seed trigram (trig0, position=10).
     assert_eq!(
-        byte_positions[0].start, 10,
-        "Byte position must come from the seed trigram (position=10); got {byte_positions:?}"
+        byte_pos_vec[0].start, 10,
+        "Byte position must come from the seed trigram (position=10); got {byte_pos_vec:?}"
+    );
+}
+
+/// Regression test for AD-411-2 set-semantics ("set-dedup") in the seed phase
+/// of `align_whole_token`.
+///
+/// A seed trigram that recurs at the **same `token_position`** within a single
+/// word token (e.g. `"abcabc"` where the trigram `"abc"` maps to byte offsets 0
+/// and 3 but both share the same word ordinal) must produce `field_tf += 1.0`,
+/// not `2.0`.
+///
+/// Motivation: the seed phase uses a `HashMap<token_position, CandidateEntry>`
+/// (AD-411-2).  Because `HashMap::entry().or_insert()` is a no-op on the second
+/// occurrence, each unique `token_position` contributes exactly ONE candidate and
+/// thus exactly ONE increment to `field_tf`.  An inadvertent revert to a `Vec`
+/// (multiset) seed container would push two candidates and yield `field_tf=2.0`,
+/// which this test would catch (per PF-007: assert a DISCRIMINATING observable).
+#[test]
+fn test_align_whole_token_set_dedup_recurring_seed_at_same_position() {
+    use crate::index::format::PostingEntry;
+    use crate::ngram::{Ngram, QueryToken};
+
+    // Single-trigram word "abc" (byte_len = 3). With only one trigram the
+    // narrow phase is skipped; only the seed phase and accumulate phase run,
+    // which isolates the set-dedup behaviour being tested.
+    let trig = Ngram::from_bytes(b'a', b'b', b'c');
+    let word = QueryToken {
+        token_off: 0,
+        byte_len: 3,
+        trigrams: vec![trig],
+    };
+
+    let doc_id: u32 = 0;
+    let tok_pos: u32 = 5; // arbitrary word ordinal
+    let tok_len: u32 = 3; // must equal word.byte_len to pass the length gate
+
+    // Two postings for the same trigram at the SAME token_position (tok_pos=5)
+    // but at different byte offsets and with different field_ids. This models
+    // a recurring seed trigram inside a single word token.
+    //
+    // Expected HashMap behaviour: the first posting creates the entry
+    // { min_field=2, byte_pos=0 }; the second posting's `or_insert` is a
+    // no-op (one entry per token_position), then `keep_min(2, 4)` is also a
+    // no-op (2 < 4). Result: ONE candidate, field_tf[2] += 1.0.
+    //
+    // Old Vec behaviour (what the fix replaces): two candidates pushed,
+    // field_tf total == 2.0 — the discriminating failure this test catches.
+    let posts = vec![
+        PostingEntry {
+            doc_id,
+            field_id: 2, // SymbolName (higher-priority, min wins)
+            position: 0,
+            token_position: tok_pos,
+            token_length: tok_len,
+        },
+        PostingEntry {
+            doc_id,
+            field_id: 4, // FunctionBody (lower-priority)
+            position: 100,
+            token_position: tok_pos,
+            token_length: tok_len,
+        },
+    ];
+
+    let mut postings_by_key: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
+    postings_by_key.insert(trig.key(), posts);
+
+    let mut scratch_cands: HashMap<u32, CandidateEntry> = HashMap::new();
+    let mut scratch_trig: HashMap<u32, u8> = HashMap::new();
+    let mut byte_pos_vec: Vec<std::ops::Range<usize>> = Vec::new();
+
+    let field_tf = align_whole_token(
+        doc_id,
+        &word,
+        &postings_by_key,
+        &mut scratch_cands,
+        &mut scratch_trig,
+        &mut byte_pos_vec,
+    );
+
+    // AD-411-2 set-dedup: total field_tf must be 1.0, not 2.0.
+    let total: f32 = field_tf.iter().sum();
+    assert_eq!(
+        total, 1.0,
+        "AD-411-2 set-dedup: two postings at the same token_position must yield \
+         field_tf sum=1.0 (set), not 2.0 (multiset); got field_tf={field_tf:?}"
+    );
+    // The min field_id (2 = SymbolName) must own the occurrence credit.
+    assert_eq!(
+        field_tf[2], 1.0,
+        "AD-411-2 set-dedup: min field_id (2=SymbolName) must receive credit; \
+         got field_tf={field_tf:?}"
+    );
+    assert_eq!(
+        field_tf[4], 0.0,
+        "AD-411-2 set-dedup: higher field_id (4=FunctionBody) must not receive credit; \
+         got field_tf={field_tf:?}"
+    );
+    // Exactly one aligned byte position.
+    assert_eq!(
+        byte_pos_vec.len(),
+        1,
+        "AD-411-2 set-dedup: exactly one aligned byte position expected; \
+         got {byte_pos_vec:?}"
+    );
+    // The byte position must come from the FIRST posting (position=0), since
+    // `or_insert` preserves the first-seen byte_pos.
+    assert_eq!(
+        byte_pos_vec[0].start, 0,
+        "AD-411-2 set-dedup: byte position must come from the first seed posting \
+         (position=0); got {byte_pos_vec:?}"
     );
 }
