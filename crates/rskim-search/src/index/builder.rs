@@ -166,30 +166,20 @@ impl NgramIndexBuilder {
         // AD-355-5 / PF-004: widen each byte to u32 before shift arithmetic to
         // prevent u8 overflow: `u32::from(b) << k`, never `b << k`.
         let bytes = content.as_bytes();
-        let token_of_byte = crate::lexical::word_token_indices(content);
-        debug_assert_eq!(token_of_byte.len(), content.len());
 
-        // AD-411-7: precompute the byte length of the word token containing
-        // each byte position.  For a word byte (ASCII [A-Za-z0-9_]) this is the
-        // total byte span of its maximal word run; for non-word bytes it is 0
-        // (they are never the first byte of a query trigram so the value is never
-        // checked in search_exact_intersection).
-        let mut token_length_of_byte = vec![0u32; bytes.len()];
-        {
-            let mut i = 0usize;
-            while i < bytes.len() {
-                if crate::lexical::is_word_byte(bytes[i]) {
-                    let start = i;
-                    while i < bytes.len() && crate::lexical::is_word_byte(bytes[i]) {
-                        i += 1;
-                    }
-                    let len = (i - start) as u32;
-                    token_length_of_byte[start..i].fill(len);
-                } else {
-                    i += 1;
-                }
-            }
-        }
+        // AD-411-7: obtain per-byte token ordinal AND per-byte token length in a
+        // single O(n) pass so that both arrays are always derived from the same
+        // traversal of is_word_byte.  This is the SSOT fix: word-run boundaries
+        // are defined once inside word_token_indices_and_lengths (tokenize.rs),
+        // not in a separate inline loop here.
+        //
+        // token_of_byte[i]     — word-token ordinal for posting.token_position
+        // token_length_of_byte[i] — run length for posting.token_length (0 for
+        //   non-word bytes, which are never the start byte of a query trigram)
+        let (token_of_byte, token_length_of_byte) =
+            crate::lexical::word_token_indices_and_lengths(content);
+        debug_assert_eq!(token_of_byte.len(), content.len());
+        debug_assert_eq!(token_length_of_byte.len(), content.len());
 
         let mut range_idx = 0usize;
         for (pos, window) in bytes.windows(3).enumerate() {
