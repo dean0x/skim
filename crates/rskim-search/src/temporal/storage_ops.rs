@@ -45,18 +45,17 @@ pub(super) const MIN_JACCARD_THRESHOLD: f64 = 0.10;
 /// ADR-006): any `temporal.db` that carries `git_head` must also carry
 /// `data_version`, or `temporal_db_is_stale` flags it stale indefinitely.
 /// Co-locating both writes in this single primitive makes the invariant
-/// structurally un-bypassable — callers that need to record a new HEAD must
-/// go through here rather than calling [`TemporalDb::set_meta`] for each key
-/// independently.
+/// un-bypassable in the production write path — callers that need to record a
+/// new HEAD must go through here rather than calling [`TemporalDb::set_meta`]
+/// for each key independently. (`set_meta` has a `debug_assert!` guard that
+/// fires in debug builds if those keys are written through it directly.)
 fn write_version_meta_in_tx(tx: &rusqlite::Transaction<'_>, git_head: &str) -> Result<()> {
     let sql = "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)";
-    tx.execute(sql, params![META_GIT_HEAD, git_head])
+    let mut stmt = tx.prepare_cached(sql).map_err(db_err)?;
+    stmt.execute(params![META_GIT_HEAD, git_head])
         .map_err(db_err)?;
-    tx.execute(
-        sql,
-        params![META_DATA_VERSION, TEMPORAL_DATA_VERSION.to_string()],
-    )
-    .map_err(db_err)?;
+    stmt.execute(params![META_DATA_VERSION, TEMPORAL_DATA_VERSION.to_string()])
+        .map_err(db_err)?;
     Ok(())
 }
 
@@ -429,12 +428,19 @@ impl TemporalDb {
     /// writing one without the other yields a database that
     /// `temporal_db_is_stale` flags stale forever (absent `data_version` is
     /// treated as stale). Use [`TemporalDb::sync`] instead — it writes both
-    /// atomically via the `write_version_meta_in_tx` primitive.
+    /// atomically via the `write_version_meta_in_tx` primitive. A
+    /// `debug_assert!` below fires in debug builds if this contract is
+    /// violated.
     ///
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        debug_assert!(
+            key != META_GIT_HEAD && key != META_DATA_VERSION,
+            "set_meta must not write version-attestation keys directly; \
+             use TemporalDb::sync (AD-408-3)"
+        );
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
@@ -643,11 +649,10 @@ impl TemporalDb {
         // Write git_head + data_version as a co-required pair through the
         // dedicated primitive so the invariant cannot be bypassed (AD-408-3).
         write_version_meta_in_tx(&tx, git_head)?;
-        tx.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-            params![META_LAST_UPDATED, now_secs],
-        )
-        .map_err(db_err)?;
+        tx.prepare_cached("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)")
+            .map_err(db_err)?
+            .execute(params![META_LAST_UPDATED, now_secs])
+            .map_err(db_err)?;
 
         tx.commit().map_err(db_err)
     }
