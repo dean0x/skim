@@ -555,14 +555,18 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool
         Err(_) => return true,
     };
 
-    // Check 1: HEAD match — absent row or mismatch both report stale.
-    let stored_head: Option<String> = conn
-        .query_row(
+    // Shared helper: read a single TEXT value from the meta table by key.
+    let read_meta = |key: &str| -> Option<String> {
+        conn.query_row(
             "SELECT value FROM meta WHERE key = ?1",
-            rusqlite::params![rskim_search::META_GIT_HEAD],
+            rusqlite::params![key],
             |row| row.get(0),
         )
-        .ok();
+        .ok()
+    };
+
+    // Check 1: HEAD match — absent row or mismatch both report stale.
+    let stored_head: Option<String> = read_meta(rskim_search::META_GIT_HEAD);
     if stored_head.as_deref() != Some(current_head) {
         return true;
     }
@@ -576,13 +580,7 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool
     // An absent or non-integer stored value is treated as stale (pre-fix DB).
     // Uses `stored < current` (NOT `!=`) so a DB written by a newer binary is
     // NOT needlessly rebuilt by an older post-fix binary (no downgrade loop).
-    let stored_version: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = ?1",
-            rusqlite::params![rskim_search::META_DATA_VERSION],
-            |row| row.get(0),
-        )
-        .ok();
+    let stored_version: Option<String> = read_meta(rskim_search::META_DATA_VERSION);
     match stored_version.as_deref() {
         Some(v) => match v.parse::<u64>() {
             Ok(n) => n < u64::from(rskim_search::TEMPORAL_DATA_VERSION),
