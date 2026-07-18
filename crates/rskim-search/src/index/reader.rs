@@ -800,17 +800,24 @@ impl NgramIndexReader {
 
         // Step 0 (AD-411-2): Build postings_by_key for per-word aligned counting.
         //
-        // Re-use the already-decoded `per_ngram_postings` from Step 1 — no second
-        // `lookup_postings` call needed (halves decode+alloc work).  Deduplicate by
-        // ngram key: when the query produces the same key from different ngram objects
-        // (rare for distinct trigrams, but possible for short queries), the first
-        // decoded posting list wins.
-        let mut postings_by_key: HashMap<u32, &Vec<PostingEntry>> =
+        // Start from the already-decoded covering-set postings (halves decode work
+        // for trigrams that were already fetched in Step 1), then fetch any
+        // additional trigrams needed by positional_words.
+        //
+        // Root fix: extract_query_ngrams returns a greedy *covering set* (not all
+        // trigrams).  extract_query_positional_tokens returns ALL trigrams of each
+        // word.  When the positional alignment loop encounters a trigram that is not
+        // in postings_by_key it would previously clear candidates and produce zero
+        // field_tf — excluding every doc even when they genuinely contain the query
+        // token.  Populating the map with ALL word trigrams before the loop prevents
+        // this (an absent posting list for a genuinely absent trigram is an empty
+        // Vec, which correctly narrows candidates to zero).
+        let mut postings_by_key: HashMap<u32, Vec<PostingEntry>> =
             HashMap::with_capacity(per_ngram_postings.len());
         for (i, (ngram, _)) in ngrams.iter().enumerate() {
             postings_by_key
                 .entry(ngram.key())
-                .or_insert(&per_ngram_postings[i]);
+                .or_insert_with(|| per_ngram_postings[i].clone());
         }
 
         // Positionable words for whole-token per-field aligned counting (AD-411-2).
@@ -819,6 +826,19 @@ impl NgramIndexReader {
         // by the is_single_token guard above), positional_words would have multiple
         // entries — the loop handles that correctly by summing per-word field TFs.
         let positional_words = extract_query_positional_tokens(&query.text);
+
+        // Fetch postings for any trigrams in positional_words that weren't in the
+        // covering set (extra trigrams not selected by extract_query_ngrams).
+        // These are needed so whole-token positional alignment can intersect ALL
+        // of the word's trigram positions — not just the covering subset.
+        for word in &positional_words {
+            for trig in &word.trigrams {
+                let k = trig.key();
+                if let std::collections::hash_map::Entry::Vacant(e) = postings_by_key.entry(k) {
+                    e.insert(self.lookup_postings(k)?);
+                }
+            }
+        }
 
         // Step 2 (AD-411-2): Whole-token per-field aligned TF counting.
         //
@@ -867,7 +887,7 @@ impl NgramIndexReader {
                 // — the byte_position is from the first trigram for snippet highlighting.
                 let first = &word.trigrams[0];
                 let first_posts = match postings_by_key.get(&first.key()) {
-                    Some(p) => *p,
+                    Some(p) => p,
                     None => continue,
                 };
                 let lo = first_posts.partition_point(|p| p.doc_id < doc_id);
@@ -889,7 +909,7 @@ impl NgramIndexReader {
                         break;
                     }
                     let posts = match postings_by_key.get(&trig.key()) {
-                        Some(p) => *p,
+                        Some(p) => p,
                         None => {
                             candidates.clear();
                             break;

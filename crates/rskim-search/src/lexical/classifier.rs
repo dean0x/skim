@@ -94,8 +94,14 @@ fn is_value_decl_kind(kind: &str) -> bool {
             | "enum_entry"
             // SQL: create_query holds the table/view/index name via name: identifier;
             // column_definition holds the column name similarly.
+            // object_reference wraps the table name in CREATE TABLE via name: identifier
+            // (tree-sitter-sequel: create_table → object_reference → name: identifier).
+            // Adding it here ensures table names are never mis-classified as FunctionBody;
+            // they degrade to FunctionSignature (definition tier) even in reference
+            // contexts where the grandparent is not a CREATE statement.
             | "create_query"
             | "column_definition"
+            | "object_reference"
     )
 }
 
