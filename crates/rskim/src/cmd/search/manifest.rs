@@ -474,8 +474,8 @@ impl FileManifest {
     /// therefore carries the OLD classification for every SHA-matching file, making
     /// definition ranking silently inert on any in-place upgrade (the self-heal
     /// rebuilds v6 postings but stamps them with v5 SymbolName attribution).
-    /// Bumping to v6 makes `decode_header` return `None` on version mismatch
-    /// (manifest.rs:361-363), cold-starting the manifest so the self-heal
+    /// Bumping to v6 makes `decode_header` return `None` on any version mismatch,
+    /// cold-starting the manifest so the self-heal
     /// re-classifies ALL files on the first query after upgrade — no manual
     /// `--rebuild` required.  Same pattern as the AD-405-14 AST skcache bump on
     /// the AST side (#405).  #411 owns 5→6.
@@ -608,7 +608,7 @@ impl FileManifest {
                 }
             }
         }
-        // Truncation note: a genuine v4–v6 manifest NEVER reaches this code — decode_header
+        // Truncation note: a genuine v6 manifest NEVER reaches this code — decode_header
         // rejects any version != FORMAT_VERSION (7) before the entry loop runs (the
         // ADR-006 version gate triggers a cold-start rebuild, not this fallback).
         // The only way `read_u32()` returns `None` here is a TRUNCATED v7 file where
