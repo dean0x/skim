@@ -35,7 +35,9 @@ use crate::{
     lexical::{
         BM25FConfig, FIELD_COUNT, bm25f_per_field_saturated_score, bm25f_score, dominant_field,
     },
-    ngram::{Ngram, extract_query_ngrams, extract_query_positional_tokens, is_single_token},
+    ngram::{
+        Ngram, QueryToken, extract_query_ngrams, extract_query_positional_tokens, is_single_token,
+    },
 };
 
 // ============================================================================
@@ -291,6 +293,133 @@ fn near_match(d: &[Vec<u32>], n: u32) -> bool {
     false
 }
 
+/// Compute per-field TF increments and byte-range positions for one whole-token
+/// alignment: query word `word` occurring as a complete token in document `doc_id`.
+///
+/// # AD-411-2: Set semantics (not multiset)
+///
+/// The aligned positions are the **set**-intersection of `token_position` across
+/// ALL of `word`'s trigrams.  The seed phase collects
+/// `token_position → (min_field_id, byte_pos)` into a `HashMap` — not a `Vec` —
+/// so a trigram that recurs at the same `token_position` inside a single document
+/// token (e.g. `"data_database"` or `"test_test"` where the seed trigram appears
+/// twice at the same position) produces exactly **one** candidate, not two.  Each
+/// unique aligned `token_position` counts exactly once toward `field_tf`, matching
+/// the set semantics documented in `search_exact_intersection` (AD-411-2):
+///
+/// ```text
+/// aligned = ∩_g  { p.token_position | p ∈ postings(g, doc) }
+/// for each tok_pos in aligned:
+///   field = min{ p.field_id | p.token_position = tok_pos }
+///   field_tf[field] += 1
+/// ```
+///
+/// Returns `(field_tf, byte_positions)` where:
+/// - `field_tf[f]` is the whole-token occurrence count for field `f`
+///   (0 or 1 per token position, summed across aligned positions).
+/// - `byte_positions` holds one byte-range per aligned occurrence for snippet
+///   highlighting, pointing to the first trigram's byte offset.
+///
+/// Pure, free function (no I/O) — unit-testable without building an index.
+/// Matches the convention at lines 91–96 (`intersect_sorted_u32`, etc.).
+fn align_whole_token(
+    doc_id: u32,
+    word: &QueryToken,
+    postings_by_key: &HashMap<u32, Vec<super::format::PostingEntry>>,
+) -> ([f32; FIELD_COUNT], Vec<std::ops::Range<usize>>) {
+    let mut field_tf = [0.0f32; FIELD_COUNT];
+    let mut byte_pos_vec: Vec<std::ops::Range<usize>> = Vec::new();
+
+    if word.trigrams.is_empty() {
+        return (field_tf, byte_pos_vec);
+    }
+
+    // --- Seed phase: first trigram → HashMap keyed by token_position ---
+    // Using a HashMap (not a Vec) is what produces set semantics: if the seed
+    // trigram appears at the same token_position more than once (e.g. the
+    // trigram "dat" occurs twice within the single token "data_database"),
+    // the HashMap entry is a no-op on the second occurrence — one entry per
+    // position.  The min field_id across all seed postings at each position is
+    // tracked as the initial tiebreaker (AD-411-2 field-attribution rule).
+    let first = &word.trigrams[0];
+    let first_posts = match postings_by_key.get(&first.key()) {
+        Some(p) => p,
+        None => return (field_tf, byte_pos_vec),
+    };
+    let lo = first_posts.partition_point(|p| p.doc_id < doc_id);
+    // token_position → (min_field_id, byte_pos)
+    let mut candidates: HashMap<u32, (u8, u32)> = HashMap::new();
+    let mut idx = lo;
+    while idx < first_posts.len() && first_posts[idx].doc_id == doc_id {
+        let p = &first_posts[idx];
+        // Exact-token length gate: reject postings in longer tokens (AD-411-7).
+        if p.token_length == word.byte_len {
+            let e = candidates
+                .entry(p.token_position)
+                .or_insert((p.field_id, p.position));
+            if p.field_id < e.0 {
+                e.0 = p.field_id;
+            }
+        }
+        idx += 1;
+    }
+    if candidates.is_empty() {
+        return (field_tf, byte_pos_vec);
+    }
+
+    // --- Narrow phase: subsequent trigrams narrow the candidate set ---
+    // For each remaining trigram, keep only positions confirmed at this doc.
+    // The minimum field_id is updated across all trigrams (field-attribution
+    // tie rule: when a token spans a field boundary, the highest-priority
+    // field wins — AD-411-2).
+    for trig in &word.trigrams[1..] {
+        if candidates.is_empty() {
+            break;
+        }
+        let posts = match postings_by_key.get(&trig.key()) {
+            Some(p) => p,
+            None => {
+                candidates.clear();
+                break;
+            }
+        };
+        let lo2 = posts.partition_point(|p| p.doc_id < doc_id);
+        // min field_id per token_position for this trigram at this doc.
+        let mut trig_field: HashMap<u32, u8> = HashMap::new();
+        let mut idx2 = lo2;
+        while idx2 < posts.len() && posts[idx2].doc_id == doc_id {
+            let p = &posts[idx2];
+            let e = trig_field.entry(p.token_position).or_insert(p.field_id);
+            if p.field_id < *e {
+                *e = p.field_id;
+            }
+            idx2 += 1;
+        }
+        // Field attribution tie rule: min field_id across all trigrams; drop
+        // positions not confirmed by this trigram.
+        candidates.retain(|tok_pos, (min_field, _bp)| match trig_field.get(tok_pos) {
+            Some(&fid) => {
+                if fid < *min_field {
+                    *min_field = fid;
+                }
+                true
+            }
+            None => false,
+        });
+    }
+
+    // --- Accumulate: one whole-token occurrence per aligned position ---
+    for (_tok_pos, (min_field, byte_pos)) in candidates {
+        let fidx = min_field as usize;
+        if fidx < FIELD_COUNT {
+            field_tf[fidx] += 1.0;
+        }
+        byte_pos_vec.push(byte_pos as usize..byte_pos as usize + 3);
+    }
+
+    (field_tf, byte_pos_vec)
+}
+
 // ============================================================================
 // Reader struct
 // ============================================================================
@@ -319,7 +448,7 @@ pub struct NgramIndexReader {
 impl NgramIndexReader {
     /// Open an existing index from `dir`.
     ///
-    /// Validates magic bytes, format version (must equal v6), file sizes, and
+    /// Validates magic bytes, format version (must equal v7), file sizes, and
     /// the CRC32 checksum before returning.
     ///
     /// # Errors
@@ -799,10 +928,13 @@ impl NgramIndexReader {
         // Vec, which correctly narrows candidates to zero).
         let mut postings_by_key: HashMap<u32, Vec<PostingEntry>> =
             HashMap::with_capacity(per_ngram_postings.len());
-        for (i, (ngram, _)) in ngrams.iter().enumerate() {
-            postings_by_key
-                .entry(ngram.key())
-                .or_insert_with(|| per_ngram_postings[i].clone());
+        // Move each decoded posting Vec into the map — no clone needed.
+        // Duplicate covering keys (same trigram appearing more than once in the
+        // covering set) move-and-drop via or_insert's ownership semantics.
+        // per_ngram_postings is consumed here; its only earlier uses were
+        // .len() (above) and this population loop.
+        for ((ngram, _), postings) in ngrams.iter().zip(per_ngram_postings) {
+            postings_by_key.entry(ngram.key()).or_insert(postings);
         }
 
         // Positionable words for whole-token per-field aligned counting (AD-411-2).
@@ -837,10 +969,22 @@ impl NgramIndexReader {
         // Partial-trigram noise is eliminated because a trigram from an unrelated
         // word (e.g. "Use" in "User") will not appear at the token_position of the
         // query token "UserService", so the intersection discards it.
+        //
+        // The per-word alignment is a cohesive pure computation extracted into
+        // `align_whole_token` (SRP: this method owns intersection + scoring;
+        // `align_whole_token` owns the positional set logic).
         let mut doc_positions: HashMap<u32, Vec<std::ops::Range<usize>>> = HashMap::new();
         let mut doc_meta_cache: HashMap<u32, FileMetaEntry> = HashMap::new();
         let mut doc_field: HashMap<u32, [f32; FIELD_COUNT]> = HashMap::new();
         let mut scored: Vec<(u32, f64)> = Vec::with_capacity(intersection.len());
+
+        // Step 3 (AD-411-3): Per-field-saturated BM25F config is loop-invariant;
+        // hoisted above the intersection loop to avoid reconstructing a stack-only
+        // struct on every scored document.
+        // BM25FConfig::for_exact_symbol() has field_b=[0;8], so large-file
+        // definers are NOT penalised by length normalisation (ADR-001 /
+        // AD-372-6 property preserved).
+        let exact_symbol_config = BM25FConfig::for_exact_symbol();
 
         for &doc_id in &intersection {
             // Apply file_filter (blast-radius allowlist) first.
@@ -862,89 +1006,16 @@ impl NgramIndexReader {
             let mut field_tf = [0.0f32; FIELD_COUNT];
             let mut byte_pos_vec: Vec<std::ops::Range<usize>> = Vec::new();
 
+            // Accumulate per-word aligned TF and byte positions.
+            // `align_whole_token` enforces set semantics (AD-411-2): each unique
+            // token_position counts exactly once, even if the seed trigram recurs
+            // at the same position within the document token.
             for word in &positional_words {
-                if word.trigrams.is_empty() {
-                    continue;
+                let (word_tf, word_positions) = align_whole_token(doc_id, word, &postings_by_key);
+                for i in 0..FIELD_COUNT {
+                    field_tf[i] += word_tf[i];
                 }
-
-                // Seed candidates from the first trigram of this word.
-                // candidates: (token_position, min_field_id, byte_position)
-                // — the byte_position is from the first trigram for snippet highlighting.
-                //
-                // AD-411-7: only accept postings whose token_length equals the
-                // query word's byte length.  This rejects postings where the
-                // query word is a substring of a longer document token (e.g.
-                // the query "check_staleness" must NOT match the token
-                // "test_check_staleness_present" even though all query trigrams
-                // appear at the same token_position in both cases).
-                let first = &word.trigrams[0];
-                let first_posts = match postings_by_key.get(&first.key()) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                let lo = first_posts.partition_point(|p| p.doc_id < doc_id);
-                let mut candidates: Vec<(u32, u8, u32)> = Vec::new();
-                let mut idx = lo;
-                while idx < first_posts.len() && first_posts[idx].doc_id == doc_id {
-                    let p = &first_posts[idx];
-                    // Exact-token length gate: reject postings in longer tokens.
-                    if p.token_length == word.byte_len {
-                        candidates.push((p.token_position, p.field_id, p.position));
-                    }
-                    idx += 1;
-                }
-                if candidates.is_empty() {
-                    continue;
-                }
-
-                // Narrow to whole-token aligned positions by intersecting with each
-                // subsequent trigram's token_position set at this doc.
-                for trig in &word.trigrams[1..] {
-                    if candidates.is_empty() {
-                        break;
-                    }
-                    let posts = match postings_by_key.get(&trig.key()) {
-                        Some(p) => p,
-                        None => {
-                            candidates.clear();
-                            break;
-                        }
-                    };
-                    let lo2 = posts.partition_point(|p| p.doc_id < doc_id);
-                    // Collect min field_id per token_position for this trigram at this doc.
-                    let mut trig_field: HashMap<u32, u8> = HashMap::new();
-                    let mut idx2 = lo2;
-                    while idx2 < posts.len() && posts[idx2].doc_id == doc_id {
-                        let p = &posts[idx2];
-                        let e = trig_field.entry(p.token_position).or_insert(p.field_id);
-                        if p.field_id < *e {
-                            *e = p.field_id;
-                        }
-                        idx2 += 1;
-                    }
-                    // Field attribution tie rule: when a token spans a field boundary,
-                    // the minimum (highest-priority) field_id across all trigrams wins.
-                    candidates.retain_mut(|(tok_pos, min_field, _bp)| {
-                        match trig_field.get(tok_pos) {
-                            Some(&fid) => {
-                                if fid < *min_field {
-                                    *min_field = fid;
-                                }
-                                true
-                            }
-                            None => false,
-                        }
-                    });
-                }
-
-                // Record one whole-token occurrence per aligned token_position.
-                for (_, min_field, byte_pos) in candidates {
-                    let fidx = min_field as usize;
-                    if fidx < FIELD_COUNT {
-                        field_tf[fidx] += 1.0;
-                    }
-                    byte_pos_vec.push(byte_pos as usize..byte_pos as usize + 3);
-                }
+                byte_pos_vec.extend(word_positions);
             }
 
             // Only rank docs that had at least one aligned whole-token occurrence.
@@ -952,13 +1023,8 @@ impl NgramIndexReader {
                 continue;
             }
 
-            // Step 3 (AD-411-3): Per-field-saturated BM25F scoring.
             // idf = 1.0 (single-term, uniform scale across docs).
-            // BM25FConfig::for_exact_symbol() has field_b=[0;8], so large-file
-            // definers are NOT penalised by length normalisation (ADR-001 /
-            // AD-372-6 property preserved).
-            let score =
-                bm25f_per_field_saturated_score(1.0, &field_tf, &BM25FConfig::for_exact_symbol());
+            let score = bm25f_per_field_saturated_score(1.0, &field_tf, &exact_symbol_config);
 
             scored.push((doc_id, score));
             doc_positions.insert(doc_id, byte_pos_vec);

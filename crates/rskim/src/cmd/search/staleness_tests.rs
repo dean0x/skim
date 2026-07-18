@@ -486,7 +486,7 @@ fn test_check_staleness_lexical_below_version_triggers_rebuild_returns_manifest(
     create_fake_git_repo(dir.path(), &format!("{sha}\n"));
 
     write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
-    // Write a v2 lexical stub (bigram-era format, below current v6).
+    // Write a v2 lexical stub (bigram-era format, below current v7).
     // magic = b"SKIX", version = 2 (LE u16).
     fs::write(cache_dir.join("index.skidx"), b"SKIX\x02\x00").unwrap();
     // Valid AST stub so AST self-heal does not co-trigger.
@@ -494,7 +494,7 @@ fn test_check_staleness_lexical_below_version_triggers_rebuild_returns_manifest(
 
     let (result, manifest) = check_staleness(&cache_dir, dir.path());
 
-    // Must report stale (lexical v2 < v6 → self-heal required).
+    // Must report stale (lexical v2 < v7 → self-heal required).
     assert!(
         matches!(result, StalenessCheck::NoStoredHead),
         "v2 lexical index must trigger NoStoredHead rebuild; got {result:?}"
@@ -533,7 +533,7 @@ fn test_check_staleness_lexical_v3_below_version_triggers_rebuild_returns_manife
     create_fake_git_repo(dir.path(), &format!("{sha}\n"));
 
     write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
-    // Write a v3 lexical stub (pre-varint-compression format, below current v6).
+    // Write a v3 lexical stub (pre-varint-compression format, below current v7).
     // magic = b"SKIX", version = 3 (LE u16).
     fs::write(cache_dir.join("index.skidx"), b"SKIX\x03\x00").unwrap();
     // Valid AST stub so AST self-heal does not co-trigger.
@@ -541,7 +541,7 @@ fn test_check_staleness_lexical_v3_below_version_triggers_rebuild_returns_manife
 
     let (result, manifest) = check_staleness(&cache_dir, dir.path());
 
-    // Must report stale (lexical v3 < v6 → self-heal required, same guard as v2).
+    // Must report stale (lexical v3 < v7 → self-heal required, same guard as v2).
     assert!(
         matches!(result, StalenessCheck::NoStoredHead),
         "v3 lexical index must trigger NoStoredHead rebuild; got {result:?}"
@@ -573,7 +573,7 @@ fn test_check_staleness_lexical_v4_below_version_triggers_rebuild_returns_manife
     create_fake_git_repo(dir.path(), &format!("{sha}\n"));
 
     write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
-    // Write a v4 lexical stub (pre-token_position format, below current v6).
+    // Write a v4 lexical stub (pre-token_position format, below current v7).
     // magic = b"SKIX", version = 4 (LE u16).
     fs::write(cache_dir.join("index.skidx"), b"SKIX\x04\x00").unwrap();
     write_ast_index_stub(&cache_dir);
@@ -582,7 +582,7 @@ fn test_check_staleness_lexical_v4_below_version_triggers_rebuild_returns_manife
 
     assert!(
         matches!(result, StalenessCheck::NoStoredHead),
-        "v4 lexical index must trigger NoStoredHead rebuild under v6 binary; got {result:?}"
+        "v4 lexical index must trigger NoStoredHead rebuild under v7 binary; got {result:?}"
     );
     assert!(
         manifest.is_some(),
@@ -597,7 +597,7 @@ fn test_check_staleness_lexical_v4_below_version_triggers_rebuild_returns_manife
 
 /// AD-411-5 / ADR-006: a v5 lexical stub (pre-AD-411-1 field_id semantic change)
 /// must trigger `NoStoredHead` so the staleness check self-heals via full rebuild
-/// under the v6 binary.  The stored field_ids are semantically incorrect in v5:
+/// under the v7 binary.  The stored field_ids are semantically incorrect in v5:
 /// identifier bytes all carry SymbolName (unconditional) rather than the new
 /// declaration-name-aware tier (FunctionSignature / TypeDefinition / ImportExport
 /// / SymbolName / FunctionBody per context).  A v5 on-disk index is therefore
@@ -614,17 +614,17 @@ fn test_check_staleness_lexical_v5_below_version_triggers_rebuild_returns_manife
     create_fake_git_repo(dir.path(), &format!("{sha}\n"));
 
     write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
-    // Write a v5 lexical stub (pre-AD-411-1 field_id semantic, below current v6).
+    // Write a v5 lexical stub (pre-AD-411-1 field_id semantic, below current v7).
     // magic = b"SKIX", version = 5 (LE u16).
     fs::write(cache_dir.join("index.skidx"), b"SKIX\x05\x00").unwrap();
     write_ast_index_stub(&cache_dir);
 
     let (result, manifest) = check_staleness(&cache_dir, dir.path());
 
-    // Must report stale (lexical v5 < v6 → self-heal required).
+    // Must report stale (lexical v5 < v7 → self-heal required).
     assert!(
         matches!(result, StalenessCheck::NoStoredHead),
-        "v5 lexical index must trigger NoStoredHead rebuild under v6 binary; got {result:?}"
+        "v5 lexical index must trigger NoStoredHead rebuild under v7 binary; got {result:?}"
     );
     assert!(
         manifest.is_some(),
@@ -633,7 +633,55 @@ fn test_check_staleness_lexical_v5_below_version_triggers_rebuild_returns_manife
     assert_eq!(
         manifest.unwrap().stored_git_head(),
         Some(sha),
-        "--stats must show real HEAD when only the lexical format version is outdated (v5→v6)"
+        "--stats must show real HEAD when only the lexical format version is outdated (v5→v7)"
+    );
+}
+
+/// AD-411-7 / ADR-006: a v6 lexical stub (pre-token_length posting field, the
+/// format version the v6→v7 bump in #411 alignment-fix upgrades FROM) must trigger
+/// `NoStoredHead` so the staleness check self-heals via full rebuild under the v7
+/// binary.  A v6 on-disk index lacks the `delta_token_length` 5th varint per
+/// posting entry; `decode_postings_varint` would desync or read across entry
+/// boundaries if the v7 binary tried to use it — clean rejection + self-heal is
+/// the only safe response (ADR-006, same `v < LEXICAL_INDEX_FORMAT_VERSION` guard
+/// in staleness.rs that covers v2/v3/v4/v5).
+///
+/// This test complements `test_v6_header_rejected_with_please_rebuild_message` in
+/// `format_tests.rs` (which exercises the low-level `decode_header` rejection in
+/// isolation) by covering the end-to-end `check_staleness` integration path,
+/// confirming that `StalenessCheck::NoStoredHead` is returned AND the manifest is
+/// preserved for `--stats` display.
+///
+/// PF-007 compliance: asserts the exact `NoStoredHead` observable + manifest
+/// returned (mirrors the sibling v2/v3/v4/v5 test structure exactly).
+#[test]
+fn test_check_staleness_lexical_v6_below_version_triggers_rebuild_returns_manifest() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().to_path_buf();
+    let sha = "aabb6677aabb6677aabb6677aabb6677aabb6677";
+    create_fake_git_repo(dir.path(), &format!("{sha}\n"));
+
+    write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
+    // Write a v6 lexical stub (pre-AD-411-7 token_length posting field, below
+    // current v7). magic = b"SKIX", version = 6 (LE u16).
+    fs::write(cache_dir.join("index.skidx"), b"SKIX\x06\x00").unwrap();
+    write_ast_index_stub(&cache_dir);
+
+    let (result, manifest) = check_staleness(&cache_dir, dir.path());
+
+    // Must report stale (lexical v6 < v7 → self-heal required).
+    assert!(
+        matches!(result, StalenessCheck::NoStoredHead),
+        "v6 lexical index must trigger NoStoredHead rebuild under v7 binary; got {result:?}"
+    );
+    assert!(
+        manifest.is_some(),
+        "check_staleness must return manifest even when lexical index is below version (v6)"
+    );
+    assert_eq!(
+        manifest.unwrap().stored_git_head(),
+        Some(sha),
+        "--stats must show real HEAD when only the lexical format version is outdated (v6→v7)"
     );
 }
 
