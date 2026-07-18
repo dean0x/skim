@@ -1318,7 +1318,7 @@ fn test_rebuild_temporal_parse_history_called_once() {
 
 /// AC1: After rebuild, a file present in git history but deleted from disk is
 /// absent from top_hotspots, top_risks, and top_coldspots.  A present file is
-/// still there.  Exact-set assertion — fails if the retain passes are removed.
+/// still there.  Subset assertion — fails if the retain passes are removed.
 ///
 /// AC2 (cochange both-sides rule): Both directions of the filter are tested —
 /// - DROP: the (keep.rs, gone.rs) row is dropped because gone.rs is a ghost.
@@ -1333,7 +1333,7 @@ fn test_rebuild_temporal_parse_history_called_once() {
 /// file in git history but off disk) — the `create_real_git_repo` helper does
 /// not support git-rm, so we delete the file directly.
 ///
-/// PF-007 discriminating: the exact-set assertion fails if the ghost filter is
+/// PF-007 discriminating: the subset assertion fails if the ghost filter is
 /// removed (gone.rs would reappear in the output).
 #[test]
 fn test_ghost_filter_deleted_file_absent_from_all_tables() {
@@ -1577,48 +1577,46 @@ fn test_ghost_filter_coldspot_limit_no_underfill() {
     // Recent date → commits have high decay weight → warmer scores.
     let present_date = "2026-06-10 00:00:00 +0000";
 
-    // Pre-compute owned names, messages, and contents so slices can be taken.
-    let ghost_names: Vec<String> = (0..3u32).map(|i| format!("ghost{i}.rs")).collect();
-    let ghost_contents: Vec<String> = (0..3u32).map(|i| format!("// ghost {i}")).collect();
-    let ghost_msgs: Vec<String> = (0..3u32).map(|i| format!("feat: ghost {i}")).collect();
-
-    let present_names: Vec<String> = (0..5u32).map(|i| format!("present{i}.rs")).collect();
-    let present_contents: Vec<String> = (0..5u32).map(|i| format!("// present {i}")).collect();
-    let present_msgs: Vec<String> = (0..5u32).map(|i| format!("feat: present {i}")).collect();
+    // Co-locate each commit's (name, content, message) to avoid parallel-Vec
+    // index alignment.  Owned strings live here; slices are taken below.
+    let ghost_data: Vec<(String, String, String)> = (0..3u32)
+        .map(|i| (
+            format!("ghost{i}.rs"),
+            format!("// ghost {i}"),
+            format!("feat: ghost {i}"),
+        ))
+        .collect();
+    let present_data: Vec<(String, String, String)> = (0..5u32)
+        .map(|i| (
+            format!("present{i}.rs"),
+            format!("// present {i}"),
+            format!("feat: present {i}"),
+        ))
+        .collect();
 
     // Per-commit file lists — each commit touches exactly one file.
-    let ghost_file_lists: Vec<Vec<(&str, &str)>> = ghost_names
+    let ghost_files: Vec<Vec<(&str, &str)>> = ghost_data
         .iter()
-        .zip(ghost_contents.iter())
-        .map(|(n, c)| vec![(n.as_str(), c.as_str())])
+        .map(|(n, c, _)| vec![(n.as_str(), c.as_str())])
         .collect();
-    let present_file_lists: Vec<Vec<(&str, &str)>> = present_names
+    let present_files: Vec<Vec<(&str, &str)>> = present_data
         .iter()
-        .zip(present_contents.iter())
-        .map(|(n, c)| vec![(n.as_str(), c.as_str())])
+        .map(|(n, c, _)| vec![(n.as_str(), c.as_str())])
         .collect();
 
     // Build commit specs: (message, date, files).
     let mut commit_specs: Vec<(&str, Option<&str>, &[(&str, &str)])> = Vec::new();
-    for (i, msg) in ghost_msgs.iter().enumerate() {
-        commit_specs.push((
-            msg.as_str(),
-            Some(ghost_date),
-            ghost_file_lists[i].as_slice(),
-        ));
+    for (i, (_, _, msg)) in ghost_data.iter().enumerate() {
+        commit_specs.push((msg.as_str(), Some(ghost_date), ghost_files[i].as_slice()));
     }
-    for (i, msg) in present_msgs.iter().enumerate() {
-        commit_specs.push((
-            msg.as_str(),
-            Some(present_date),
-            present_file_lists[i].as_slice(),
-        ));
+    for (i, (_, _, msg)) in present_data.iter().enumerate() {
+        commit_specs.push((msg.as_str(), Some(present_date), present_files[i].as_slice()));
     }
 
     let head = create_real_git_repo_with_dates(dir.path(), &commit_specs);
 
     // Delete ghost files from disk (they remain in git history).
-    for name in &ghost_names {
+    for (name, _, _) in &ghost_data {
         std::fs::remove_file(dir.path().join(name)).unwrap();
     }
 
@@ -1650,7 +1648,7 @@ fn test_ghost_filter_coldspot_limit_no_underfill() {
     }
 
     // Ghost files must not appear in any coldspot row.
-    for name in &ghost_names {
+    for (name, _, _) in &ghost_data {
         let ghost_present = coldspots.iter().any(|r| r.file_path == *name);
         assert!(
             !ghost_present,
