@@ -1444,6 +1444,68 @@ fn test_ghost_filter_containment_guard() {
     );
 }
 
+/// Regression: ghost filter must NOT false-drop rows when `root` is a
+/// subdirectory of the git worktree (AD-408-4).
+///
+/// Before the fix, `apply_ghost_filter` joined REPO-ROOT-relative paths against
+/// the search `root` subdir, double-nesting the prefix and causing every row to
+/// fail `is_file()`. With the fix, paths are joined against the discovered git
+/// workdir (the true repo root), so present files are correctly retained.
+///
+/// Failure scenario (pre-fix):
+///   `skim search --hot --root <repo>/subdir`
+///   → gix discovers `<repo>` from `subdir`, emits `src/lib.rs`
+///   → ghost filter: `subdir.join("src/lib.rs")` = `<repo>/subdir/src/lib.rs`
+///     (double-nested; file does not exist there)
+///   → all rows dropped; `--hot` returns empty output with exit 0 (silent loss).
+///
+/// Discriminating: without the fix every hotspot row is false-ghosted; with the
+/// fix `src/lib.rs` is retained because `<workdir>.join("src/lib.rs")` exists.
+#[test]
+fn test_ghost_filter_subdir_root_rows_survive() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Create a real git repo at dir.path() and commit `src/lib.rs` there.
+    // These paths are REPO-ROOT-relative from gix's perspective.
+    let head = create_real_git_repo(
+        dir.path(),
+        &[
+            ("feat: add lib", &[("src/lib.rs", "pub fn a() {}")]),
+            ("feat: update lib", &[("src/lib.rs", "pub fn b() {}")]),
+        ],
+    );
+
+    // Create a subdirectory and use it as the search root — simulating
+    // `skim search --hot --root <repo>/subdir`.
+    // `src/lib.rs` does NOT exist under `subdir`; it exists under `dir.path()`.
+    let subdir = dir.path().join("subdir");
+    std::fs::create_dir_all(&subdir).unwrap();
+
+    let now = super::current_epoch_secs();
+    rebuild_temporal(&subdir, &cache_dir, &head, now).unwrap();
+
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+
+    let hotspots = db.top_hotspots(50).unwrap();
+    assert!(
+        !hotspots.is_empty(),
+        "ghost filter must NOT drop rows when root is a subdirectory of the git worktree \
+         (AD-408-4 regression: subdir double-path causes false ghost detection); \
+         got {} hotspot rows — pre-fix behaviour returned 0",
+        hotspots.len()
+    );
+
+    let lib_present = hotspots.iter().any(|r| r.file_path == "src/lib.rs");
+    assert!(
+        lib_present,
+        "src/lib.rs must survive the ghost filter when rebuild root is a subdirectory \
+         of the worktree (paths are repo-root-relative from gix)"
+    );
+}
+
 /// AC4: --cold --limit N returns exactly N present rows even when ghost files
 /// would have ranked at the top of the coldspot ordering.
 ///

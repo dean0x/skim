@@ -368,29 +368,58 @@ pub(super) fn rebuild_temporal(
 /// Performs two checks in order:
 /// 1. **Containment guard** via [`crate::cmd::is_repo_relative_safe`] — rejects
 ///    any `rel` with absolute, `..` (ParentDir), or drive-relative (Prefix)
-///    components so a malicious git-history path cannot stat outside `root`
-///    (applies ADR-008; single canonical helper shared with
-///    `walk::list_tracked_files` and `heatmap::run`).
+///    components to mitigate path-traversal risk (applies ADR-008; single
+///    canonical helper shared with `walk::list_tracked_files` and `heatmap::run`).
+///    Git never emits such components in tree-diff output, so no legitimate row
+///    is dropped by this guard.
 /// 2. **`is_file()` existence check** — the correct predicate for "a path an
 ///    agent can Read" (AD-408-2): a former-file path that is now a directory
 ///    passes `.exists()` but fails `.is_file()` and must be excluded from the
 ///    temporal surface (OD2, 2026-07-17).
 ///
-/// Git never emits absolute, `..`, or prefix-relative tree paths, so no
-/// legitimate temporal row is dropped by the containment guard.
+/// # Symlink note (AD-408-3)
 ///
-/// Note: `is_file()` follows symlinks. A git-tracked in-tree symlink whose
-/// target resolves outside `root` would return `true` if the target file
-/// exists, but the security impact is nil — only the boolean result is consumed
-/// to retain or drop a ranking row; no file content is read and no resolved
-/// path is emitted. Retaining such a symlink is arguably correct per OD2 intent
-/// ("a path an agent can Read"). Noted for conscious acceptance per AD-408-3.
+/// `is_file()` follows symlinks. A committed in-tree symlink that is relative
+/// and `..`-free (e.g. `link.rs -> /etc/passwd`) passes the containment guard
+/// and `is_file()` traverses the target, stat'ing outside `root`. The security
+/// impact is nil — only the boolean result is used to retain or drop a ranking
+/// row; no file content is read and no resolved path is emitted. An unreadable
+/// but present file (EACCES) is also silently treated as a ghost and dropped.
+/// Both are consciously accepted; use `symlink_metadata()` if strict containment
+/// is ever required.
 fn rel_is_regular_file(root: &Path, rel: &str) -> bool {
     let rel_path = std::path::Path::new(rel);
     if !crate::cmd::is_repo_relative_safe(rel_path) {
         return false;
     }
     root.join(rel_path).is_file()
+}
+
+/// Discover the git worktree working directory by walking upward from `root`.
+///
+/// Returns the path of the worktree root (the directory containing `.git`) when
+/// `root` is inside a git repository, or `None` when gix cannot find a repo or
+/// the repo is bare. This is a pure path-discovery call — no object lookup or
+/// history walk occurs.
+///
+/// # Why this is needed
+///
+/// History paths in [`rskim_search::HistoryResult`] are REPO-ROOT-relative
+/// because [`GixSource::parse_history`] calls `gix::discover(root)` which walks
+/// **upward** to find `.git`. When `root` is a subdirectory of the worktree
+/// (e.g. `--root crates/rskim-search`), naive `root.join(rel)` double-nests the
+/// prefix — `<root>/crates/rskim-search/src/lib.rs` instead of the correct
+/// `<workdir>/crates/rskim-search/src/lib.rs` — causing every row to fail the
+/// `is_file()` check and be silently dropped. Using the discovered workdir as
+/// the anchor mirrors the approach in `heatmap/mod.rs` which joins against
+/// `git_source.get_repo_root()` (AD-408-4).
+///
+/// Failure is silently absorbed per D5 (temporal failure must not fail the
+/// lexical query path); callers fall back to `root` when `None` is returned.
+fn discover_git_workdir(root: &Path) -> Option<std::path::PathBuf> {
+    gix::discover(root)
+        .ok()
+        .and_then(|repo| repo.workdir().map(|p| p.to_path_buf()))
 }
 
 /// Remove temporal rows whose backing files no longer exist on disk.
@@ -492,11 +521,27 @@ pub(super) fn rebuild_temporal_with_source(
         )
     };
 
-    // ── Build-time ghost filter (AD-408-1) ───────────────────────────────────
+    // ── Build-time ghost filter (AD-408-1 / AD-408-4) ────────────────────────
     // Applied on freshly-computed rows *before* `db.sync` persists them so the
     // prior DB survives on failure and the self-heal invariant holds (ADR-006).
     // See `apply_ghost_filter` for the full invariant documentation.
-    apply_ghost_filter(root, &mut hotspot_rows, &mut risk_rows, &mut cochange_rows);
+    //
+    // AD-408-4: history paths from `parse_history` are REPO-ROOT-relative
+    // because `gix::discover` walks upward to find `.git` from `root`. When
+    // `root` is a subdirectory of the worktree (e.g. `--root crates/rskim-search`),
+    // naive `root.join(rel)` double-nests the path prefix and causes every row
+    // to be false-ghosted — all temporal output silently becomes empty (exit 0).
+    // We discover the actual git workdir and use it as the anchor for
+    // `rel_is_regular_file`, mirroring `heatmap/mod.rs` which joins against
+    // `git_source.get_repo_root()`. Falls back to `root` if discovery fails
+    // (D5: temporal failure must not fail the lexical query path).
+    let ghost_root = discover_git_workdir(root).unwrap_or_else(|| root.to_path_buf());
+    apply_ghost_filter(
+        &ghost_root,
+        &mut hotspot_rows,
+        &mut risk_rows,
+        &mut cochange_rows,
+    );
 
     // ── Acquire lock (D4), then sync ─────────────────────────────────────────
     // Single sync path for both the empty-history and non-empty cases:
