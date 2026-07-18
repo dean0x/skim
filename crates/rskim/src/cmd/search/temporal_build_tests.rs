@@ -1485,7 +1485,7 @@ fn test_ghost_filter_containment_guard() {
 }
 
 /// Regression: ghost filter must NOT false-drop rows when `root` is a
-/// subdirectory of the git worktree (AD-408-4).
+/// subdirectory of the git worktree (AD-408-5).
 ///
 /// Before the fix, `apply_ghost_filter` joined REPO-ROOT-relative paths against
 /// the search `root` subdir, double-nesting the prefix and causing every row to
@@ -1533,7 +1533,7 @@ fn test_ghost_filter_subdir_root_rows_survive() {
     assert!(
         !hotspots.is_empty(),
         "ghost filter must NOT drop rows when root is a subdirectory of the git worktree \
-         (AD-408-4 regression: subdir double-path causes false ghost detection); \
+         (AD-408-5 regression: subdir double-path causes false ghost detection); \
          got {} hotspot rows — pre-fix behaviour returned 0",
         hotspots.len()
     );

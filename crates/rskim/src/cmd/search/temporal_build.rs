@@ -377,7 +377,7 @@ pub(super) fn rebuild_temporal(
 ///    passes `.exists()` but fails `.is_file()` and must be excluded from the
 ///    temporal surface (OD2, 2026-07-17).
 ///
-/// # Symlink note (AD-408-3)
+/// # Symlink note (AD-408-2)
 ///
 /// `is_file()` follows symlinks. A committed in-tree symlink that is relative
 /// and `..`-free (e.g. `link.rs -> /etc/passwd`) passes the containment guard
@@ -412,7 +412,7 @@ fn rel_is_regular_file(root: &Path, rel: &str) -> bool {
 /// `<workdir>/crates/rskim-search/src/lib.rs` — causing every row to fail the
 /// `is_file()` check and be silently dropped. Using the discovered workdir as
 /// the anchor mirrors the approach in `heatmap/mod.rs` which joins against
-/// `git_source.get_repo_root()` (AD-408-4).
+/// `git_source.get_repo_root()` (AD-408-5).
 ///
 /// Failure is silently absorbed per D5 (temporal failure must not fail the
 /// lexical query path); callers fall back to `root` when `None` is returned.
@@ -521,12 +521,12 @@ pub(super) fn rebuild_temporal_with_source(
         )
     };
 
-    // ── Build-time ghost filter (AD-408-1 / AD-408-4) ────────────────────────
+    // ── Build-time ghost filter (AD-408-1 / AD-408-5) ────────────────────────
     // Applied on freshly-computed rows *before* `db.sync` persists them so the
     // prior DB survives on failure and the self-heal invariant holds (ADR-006).
     // See `apply_ghost_filter` for the full invariant documentation.
     //
-    // AD-408-4: history paths from `parse_history` are REPO-ROOT-relative
+    // AD-408-5: history paths from `parse_history` are REPO-ROOT-relative
     // because `gix::discover` walks upward to find `.git` from `root`. When
     // `root` is a subdirectory of the worktree (e.g. `--root crates/rskim-search`),
     // naive `root.join(rel)` double-nests the path prefix and causes every row

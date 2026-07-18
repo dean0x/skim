@@ -298,7 +298,7 @@ pub(crate) fn inject_flag_before_separator(args: &mut Vec<String>, flag: &str) {
 ///
 /// Note: the guard does NOT defend against in-tree symlinks whose targets resolve
 /// outside `root` — that is a low-severity, defense-in-depth concern noted for
-/// conscious acceptance (AD-408-3).
+/// conscious acceptance (AD-408-2).
 #[must_use]
 pub(crate) fn is_repo_relative_safe(rel: &std::path::Path) -> bool {
     use std::path::Component;
