@@ -777,22 +777,7 @@ impl NgramIndexReader {
         // Compute intersection using the sorted order.
         let mut intersection: Vec<u32> = per_ngram_doc_ids[order[0]].clone();
         for &idx in &order[1..] {
-            let other = &per_ngram_doc_ids[idx];
-            let mut result: Vec<u32> = Vec::new();
-            let mut i = 0usize;
-            let mut j = 0usize;
-            while i < intersection.len() && j < other.len() {
-                match intersection[i].cmp(&other[j]) {
-                    std::cmp::Ordering::Equal => {
-                        result.push(intersection[i]);
-                        i += 1;
-                        j += 1;
-                    }
-                    std::cmp::Ordering::Less => i += 1,
-                    std::cmp::Ordering::Greater => j += 1,
-                }
-            }
-            intersection = result;
+            intersection = intersect_sorted_u32(&intersection, &per_ngram_doc_ids[idx]);
             if intersection.is_empty() {
                 return Ok(Vec::new());
             }

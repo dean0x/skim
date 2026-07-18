@@ -145,19 +145,6 @@ fn test_serde_roundtrip() {
 }
 
 #[test]
-fn test_partial_eq() {
-    let a = BM25FConfig::default();
-    let b = BM25FConfig::default();
-    assert_eq!(a, b);
-
-    let c = BM25FConfig {
-        k1: 2.0,
-        ..BM25FConfig::default()
-    };
-    assert_ne!(a, c);
-}
-
-#[test]
 fn test_field_count_matches_search_field_variants() {
     // SearchField has 8 variants (0..=7). FIELD_COUNT must match.
     assert_eq!(

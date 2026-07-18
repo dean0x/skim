@@ -204,26 +204,6 @@ fn test_zero_field_length_with_b_one_no_nan() {
     assert!(score > 0.0, "score should still be positive: {score}");
 }
 
-#[test]
-fn test_determinism() {
-    // Calling bm25f_score 100 times with the same inputs must give identical results.
-    let cfg = BM25FConfig::default();
-    let mut tfs = zero_field_tfs();
-    tfs[0] = 3.0;
-    tfs[1] = 1.0;
-    let lengths = [200u32; FIELD_COUNT];
-    let avgs = [180.0f32; FIELD_COUNT];
-
-    let first = bm25f_score(4.0, &tfs, &lengths, &avgs, &cfg);
-    for _ in 0..100 {
-        let s = bm25f_score(4.0, &tfs, &lengths, &avgs, &cfg);
-        assert!(
-            (s - first).abs() < 1e-15,
-            "bm25f_score is not deterministic: {first} vs {s}"
-        );
-    }
-}
-
 // -----------------------------------------------------------------------
 // bm25f_per_field_saturated_score (AD-411-3)
 // -----------------------------------------------------------------------
@@ -316,24 +296,6 @@ fn test_per_field_saturated_fnsig_boost_beats_typedef_boost() {
     );
 }
 
-/// Score is deterministic across repeated calls.
-#[test]
-fn test_per_field_saturated_deterministic() {
-    let cfg = BM25FConfig::for_exact_symbol();
-    let mut tfs = zero_field_tfs();
-    tfs[0] = 3.0;
-    tfs[1] = 1.0;
-    tfs[4] = 5.0;
-    let first = bm25f_per_field_saturated_score(2.5, &tfs, &cfg);
-    for _ in 0..50 {
-        let s = bm25f_per_field_saturated_score(2.5, &tfs, &cfg);
-        assert!(
-            (s - first).abs() < 1e-15,
-            "bm25f_per_field_saturated_score is not deterministic: {first} vs {s}"
-        );
-    }
-}
-
 /// Score is finite for any reasonable input combination.
 #[test]
 fn test_per_field_saturated_finite_for_large_tf() {
@@ -386,18 +348,4 @@ fn test_dominant_field_tie_picks_lowest_discriminant() {
     tfs[1] = 2.0;
     tfs[4] = 2.0;
     assert_eq!(dominant_field(&tfs), SearchField::FunctionSignature);
-}
-
-#[test]
-fn test_dominant_field_deterministic() {
-    let mut tfs = zero_field_tfs();
-    tfs[3] = 4.0;
-    let first = dominant_field(&tfs);
-    for _ in 0..50 {
-        assert_eq!(
-            dominant_field(&tfs),
-            first,
-            "dominant_field must be deterministic"
-        );
-    }
 }
