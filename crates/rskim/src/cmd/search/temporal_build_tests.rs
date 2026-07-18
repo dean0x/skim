@@ -15,7 +15,7 @@ use tempfile::tempdir;
 
 use super::{
     build_cochange_rows, build_hotspot_rows, build_risk_rows, rebuild_temporal,
-    rebuild_temporal_with_source, tracked_path_exists,
+    rebuild_temporal_with_source, rel_is_regular_file,
 };
 
 // ============================================================================
@@ -1397,7 +1397,7 @@ fn test_ghost_filter_deleted_file_absent_from_all_tables() {
 /// AC9: Containment guard — a history path that is absolute or contains `..`
 /// is treated as non-existent (dropped) and never stats outside root.
 ///
-/// We test `tracked_path_exists` directly: absolute paths and `..`-containing
+/// We test `rel_is_regular_file` directly: absolute paths and `..`-containing
 /// paths are rejected without ever calling `is_file()` outside `root`.
 #[test]
 fn test_ghost_filter_containment_guard() {
@@ -1409,29 +1409,29 @@ fn test_ghost_filter_containment_guard() {
     // Absolute path — rejected even if the target file exists.
     let abs_path = dir.path().join("present.rs").to_string_lossy().to_string();
     assert!(
-        !tracked_path_exists(dir.path(), &abs_path),
+        !rel_is_regular_file(dir.path(), &abs_path),
         "AC9: absolute path must be rejected by containment guard (is_absolute check)"
     );
 
     // Path with .. component — rejected regardless of whether target exists.
     assert!(
-        !tracked_path_exists(dir.path(), "../escape.rs"),
+        !rel_is_regular_file(dir.path(), "../escape.rs"),
         "AC9: path with .. component must be rejected (ParentDir check)"
     );
     assert!(
-        !tracked_path_exists(dir.path(), "subdir/../../escape.rs"),
+        !rel_is_regular_file(dir.path(), "subdir/../../escape.rs"),
         "AC9: nested .. path must be rejected (ParentDir check)"
     );
 
     // A normal relative path to an existing file — accepted.
     assert!(
-        tracked_path_exists(dir.path(), "present.rs"),
+        rel_is_regular_file(dir.path(), "present.rs"),
         "AC9: present file with normal relative path must be accepted"
     );
 
     // A normal relative path to a missing file — correctly absent (not an error).
     assert!(
-        !tracked_path_exists(dir.path(), "missing.rs"),
+        !rel_is_regular_file(dir.path(), "missing.rs"),
         "AC9: missing file must return false (not error)"
     );
 
@@ -1439,7 +1439,7 @@ fn test_ghost_filter_containment_guard() {
     let subdir = dir.path().join("subdir");
     std::fs::create_dir_all(&subdir).unwrap();
     assert!(
-        !tracked_path_exists(dir.path(), "subdir"),
+        !rel_is_regular_file(dir.path(), "subdir"),
         "AC9: directory path must be rejected by is_file() predicate (OD2)"
     );
 }

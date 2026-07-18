@@ -39,7 +39,7 @@
 use std::collections::{BinaryHeap, HashSet};
 use std::fs;
 use std::io::Read as _;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -774,19 +774,15 @@ fn list_tracked_files(root: &Path) -> Option<Vec<PathBuf>> {
         // `PathBuf::from` a single unambiguous impl to call.
         let raw = entry.path(state);
         let path = PathBuf::from(raw.to_os_str_lossy().into_owned());
-        // Security: skip entries with `..` (ParentDir) or a leading `/`
-        // (RootDir/Prefix) components that would escape `root` after
-        // `root.join(&path)`.  Legitimate git index paths are always
-        // repo-toplevel-relative with no `..` or absolute prefix; a crafted
-        // `.git/index` could otherwise cause skim to read files outside the
-        // repository (path traversal / local information disclosure).
-        // `classify_metadata_core`'s strip_prefix guard is defense in depth.
-        if path.components().any(|c| {
-            matches!(
-                c,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        }) {
+        // Security: skip entries that would escape `root` after `root.join(&path)`.
+        // Legitimate git index paths are always repo-toplevel-relative with no
+        // `..` or absolute prefix; a crafted `.git/index` could otherwise cause
+        // skim to read files outside the repository (path traversal / local
+        // information disclosure). `classify_metadata_core`'s strip_prefix guard
+        // is defense in depth. Delegates to the canonical shared guard
+        // `crate::cmd::is_repo_relative_safe` (applies ADR-008) so all git-path
+        // containment checks stay in one place and cannot drift.
+        if !crate::cmd::is_repo_relative_safe(&path) {
             continue;
         }
         paths.push(path);

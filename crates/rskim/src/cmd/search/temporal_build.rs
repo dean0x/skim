@@ -363,36 +363,82 @@ pub(super) fn rebuild_temporal(
     rebuild_temporal_with_source(&GixSource, root, cache_dir, head, now_epoch)
 }
 
-/// Return `true` if `rel` names a regular file under `root`.
+/// Return `true` when `rel` names a regular file that exists under `root`.
 ///
-/// AD-408-2: The chosen existence semantic is on-disk `root.join(rel).is_file()`
-/// (Option A, user-resolved 2026-07-17; follow-up #454 covers manifest-union
-/// consistency if later needed). Defense-in-depth: rejects any `rel` that is
-/// absolute OR contains a `..` component so a malicious git-history path cannot
-/// `stat` outside `root` (applies ADR-008: "tracked paths are untrusted input and
-/// must be containment-checked"). `Path::join` silently replaces the base when
-/// `rel` is absolute, so the absolute-path check is required in addition to the
-/// `..`-component check. Git never emits absolute paths or `..` components in
-/// tree paths, so no legitimate row is ever dropped by these guards.
+/// Performs two checks in order:
+/// 1. **Containment guard** via [`crate::cmd::is_repo_relative_safe`] — rejects
+///    any `rel` with absolute, `..` (ParentDir), or drive-relative (Prefix)
+///    components so a malicious git-history path cannot stat outside `root`
+///    (applies ADR-008; single canonical helper shared with
+///    `walk::list_tracked_files` and `heatmap::run`).
+/// 2. **`is_file()` existence check** — the correct predicate for "a path an
+///    agent can Read" (AD-408-2): a former-file path that is now a directory
+///    passes `.exists()` but fails `.is_file()` and must be excluded from the
+///    temporal surface (OD2, 2026-07-17).
 ///
-/// `is_file()` (not `.exists()`) is the correct predicate for "a path an agent
-/// can Read" — a former-file path that is now a directory passes `.exists()` but
-/// fails `.is_file()` and must be excluded from both the temporal and heatmap
-/// surfaces (OD2, 2026-07-17).
-fn tracked_path_exists(root: &Path, rel: &str) -> bool {
+/// Git never emits absolute, `..`, or prefix-relative tree paths, so no
+/// legitimate temporal row is dropped by the containment guard.
+///
+/// Note: `is_file()` follows symlinks. A git-tracked in-tree symlink whose
+/// target resolves outside `root` would return `true` if the target file
+/// exists, but the security impact is nil — only the boolean result is consumed
+/// to retain or drop a ranking row; no file content is read and no resolved
+/// path is emitted. Retaining such a symlink is arguably correct per OD2 intent
+/// ("a path an agent can Read"). Noted for conscious acceptance per AD-408-3.
+fn rel_is_regular_file(root: &Path, rel: &str) -> bool {
     let rel_path = std::path::Path::new(rel);
-    // Reject absolute paths — Path::join replaces the base for absolute arguments.
-    if rel_path.is_absolute() {
-        return false;
-    }
-    // Reject any path containing a .. (ParentDir) component.
-    if rel_path
-        .components()
-        .any(|c| c == std::path::Component::ParentDir)
-    {
+    if !crate::cmd::is_repo_relative_safe(rel_path) {
         return false;
     }
     root.join(rel_path).is_file()
+}
+
+/// Remove temporal rows whose backing files no longer exist on disk.
+///
+/// This is the build-time ghost filter (AD-408-1). It runs on freshly-computed
+/// rows *before* [`TemporalDb::sync`] persists them, so the prior DB survives
+/// intact when sync fails and the self-heal invariant holds (applies ADR-006).
+///
+/// Hotspot and risk rows are retained only when the file exists on disk as a
+/// regular file; cochange rows survive only when **both** `file_a` and `file_b`
+/// exist. Scores are NOT renormalized after the drop — each file's score derives
+/// solely from its own git history, and cochange rows carry a baked-in Jaccard.
+///
+/// Existence is resolved once per unique path across all three row types to
+/// bound stat syscall count at 1× per path (worst case) rather than up to 3×.
+/// For the empty-history case the slices are already empty, so `retain` is a
+/// no-op.
+///
+/// Per PF-012: uses sequential `HashSet + retain` (bounded full-completion),
+/// NOT an early-terminated parallel walk. Parallelism would introduce PF-012
+/// racy-truncation risk for no measurable gain on this non-query path.
+fn apply_ghost_filter(
+    root: &Path,
+    hotspot_rows: &mut Vec<rskim_search::HotspotRow>,
+    risk_rows: &mut Vec<rskim_search::RiskRow>,
+    cochange_rows: &mut Vec<rskim_search::CochangeRow>,
+) {
+    // Collect each unique path referenced by any row type (1× stat per path).
+    let unique_paths: std::collections::HashSet<&str> = hotspot_rows
+        .iter()
+        .map(|r| r.file_path.as_str())
+        .chain(risk_rows.iter().map(|r| r.file_path.as_str()))
+        .chain(
+            cochange_rows
+                .iter()
+                .flat_map(|r| [r.file_a.as_str(), r.file_b.as_str()]),
+        )
+        .collect();
+    // Resolve existence once per unique path.
+    let existing: std::collections::HashSet<String> = unique_paths
+        .into_iter()
+        .filter(|p| rel_is_regular_file(root, p))
+        .map(String::from)
+        .collect();
+    hotspot_rows.retain(|r| existing.contains(&r.file_path));
+    risk_rows.retain(|r| existing.contains(&r.file_path));
+    // Cochange: both sides must exist on disk (AD-408-1 both-sides rule).
+    cochange_rows.retain(|r| existing.contains(&r.file_a) && existing.contains(&r.file_b));
 }
 
 /// Inner implementation of `rebuild_temporal` with an injectable `TemporalSource`.
@@ -447,36 +493,10 @@ pub(super) fn rebuild_temporal_with_source(
     };
 
     // ── Build-time ghost filter (AD-408-1) ───────────────────────────────────
-    // Applied on freshly-computed rows *before* `db.sync` persists them (applies
-    // ADR-006: the prior DB survives on failure and self-heals). Hotspot/risk rows
-    // are retained only when the file exists on disk; cochange rows survive only
-    // when BOTH `file_a` AND `file_b` exist. Scores are NOT renormalized after the
-    // drop — each row's score depends only on that file's own history, and cochange
-    // rows carry their baked-in Jaccard. This single choke point fixes all consumers
-    // (`--hot`/`--cold`/`--risky` text+JSON, `--blast-radius` partners).
-    //
-    // Existence is resolved once per unique path across all three row types to avoid
-    // redundant stat syscalls (worst case 1× per path rather than up to 3×).
-    // For the empty-history case the slices are already empty, so retain is a no-op.
-    let unique_paths: std::collections::HashSet<&str> = hotspot_rows
-        .iter()
-        .map(|r| r.file_path.as_str())
-        .chain(risk_rows.iter().map(|r| r.file_path.as_str()))
-        .chain(
-            cochange_rows
-                .iter()
-                .flat_map(|r| [r.file_a.as_str(), r.file_b.as_str()]),
-        )
-        .collect();
-    let existing: std::collections::HashSet<String> = unique_paths
-        .into_iter()
-        .filter(|p| tracked_path_exists(root, p))
-        .map(String::from)
-        .collect();
-    hotspot_rows.retain(|r| existing.contains(&r.file_path));
-    risk_rows.retain(|r| existing.contains(&r.file_path));
-    // Cochange: both sides must exist on disk.
-    cochange_rows.retain(|r| existing.contains(&r.file_a) && existing.contains(&r.file_b));
+    // Applied on freshly-computed rows *before* `db.sync` persists them so the
+    // prior DB survives on failure and the self-heal invariant holds (ADR-006).
+    // See `apply_ghost_filter` for the full invariant documentation.
+    apply_ghost_filter(root, &mut hotspot_rows, &mut risk_rows, &mut cochange_rows);
 
     // ── Acquire lock (D4), then sync ─────────────────────────────────────────
     // Single sync path for both the empty-history and non-empty cases:

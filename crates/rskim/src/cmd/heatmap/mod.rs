@@ -98,6 +98,14 @@ fn resolve_diff_files(
             // so resolve paths against the repo root to avoid cwd-dependent failures.
             let root = git_source.get_repo_root().unwrap_or_default();
             for f in &files {
+                // ADR-008: containment guard — skip any git-diff path that is
+                // absolute or escapes root via `..` or a drive-relative prefix.
+                // Delegates to the canonical shared guard (`super::is_repo_relative_safe`)
+                // so this site stays consistent with `walk::list_tracked_files` and
+                // `temporal_build::rel_is_regular_file`.
+                if !super::is_repo_relative_safe(std::path::Path::new(f.as_str())) {
+                    continue;
+                }
                 let abs = std::path::Path::new(&root).join(f);
                 // AD-408-2 (OD2, 2026-07-17): use is_file() not exists() so that
                 // a former-file path that is now a directory is excluded from heatmap
