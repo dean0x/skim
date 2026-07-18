@@ -418,7 +418,10 @@ fn test_411_typescript_fn_def_name_is_fnsig() {
     );
 }
 
-/// TS call site inside a function body → FunctionBody.
+/// TS call site inside a function body → FunctionBody (AD-411-1 non-declaration parent path).
+/// The call expression is not a declaration context, so the identifier falls to FunctionBody.
+/// Accepting Other here would let a regression that stops indexing call sites pass silently
+/// (avoids PF-007).
 #[test]
 fn test_411_typescript_call_site_is_fnbody() {
     // "function main(): void { " = 24 bytes → "greet" starts at byte 24
@@ -426,15 +429,11 @@ fn test_411_typescript_call_site_is_fnbody() {
     let ranges = classify_source(source, rskim_core::Language::TypeScript).unwrap();
     assert_contiguous(&ranges, source.len());
     let field = field_at_byte(&ranges, 24);
-    assert_ne!(
+    assert_eq!(
         field,
-        SearchField::FunctionSignature,
-        "TS call site should not be FunctionSignature; got {field:?}"
-    );
-    // FunctionBody OR Other (either is acceptable — the key is it's NOT a def tier)
-    assert!(
-        matches!(field, SearchField::FunctionBody | SearchField::Other),
-        "TS call site should be FunctionBody or Other; got {field:?}"
+        SearchField::FunctionBody,
+        "TS call site should be FunctionBody (non-declaration parent → call-site tier); \
+         got {field:?}\nranges: {ranges:?}"
     );
 }
 
@@ -491,37 +490,45 @@ fn test_411_go_fn_def_name_is_fnsig() {
 
 // --- Java ---------------------------------------------------------------
 
-/// Java method declaration name → FunctionSignature (OD5).
+/// Java method declaration name → FunctionSignature (OD5, AD-411-1).
+/// `method_declaration` has priority 4 and its name child uses field "name" (confirmed via
+/// tree-sitter-java node-types.json), so `map_identifier_to_field` returns FunctionSignature.
+/// Asserting only assert_ne!(FunctionBody) would accept Other or SymbolName regressions
+/// (avoids PF-007).
 #[test]
-fn test_411_java_method_def_name_is_not_fnbody() {
+fn test_411_java_method_def_name_is_fnsig() {
     let source = "class Foo { void bar() {} }";
     let ranges = classify_source(source, rskim_core::Language::Java).unwrap();
     assert_contiguous(&ranges, source.len());
     // "void " = 5 bytes inside "class Foo { " (12) → "bar" at byte 12+5=17
     let field = field_at_byte(&ranges, 17);
-    assert_ne!(
+    assert_eq!(
         field,
-        SearchField::FunctionBody,
-        "Java method name should not be FunctionBody; got {field:?}"
+        SearchField::FunctionSignature,
+        "Java method name should be FunctionSignature \
+         (method_declaration priority 4 + name: field → FnSig); got {field:?}\nranges: {ranges:?}"
     );
 }
 
 // --- C ------------------------------------------------------------------
 
-/// C function declarator name — falls to SymbolName (degradation, OD4).
-/// The C grammar uses `declarator:` field (not `name:`), so the name-child
-/// receives SymbolName, not FunctionBody.
+/// C function declarator name → SymbolName (degradation, OD4).
+/// The C grammar uses `declarator:` field (not `name:`), so field_name != Some("name")
+/// → `map_identifier_to_field` returns SymbolName (the degradation tier).
+/// assert_ne!(FunctionBody) would accept Other or FunctionSignature regressions
+/// (avoids PF-007).
 #[test]
-fn test_411_c_fn_def_name_is_not_fnbody() {
+fn test_411_c_fn_def_name_is_symbolname() {
     let source = "int add(int a) { return a; }";
     let ranges = classify_source(source, rskim_core::Language::C).unwrap();
     assert_contiguous(&ranges, source.len());
     // "int " = 4 bytes → "add" starts at byte 4
     let field = field_at_byte(&ranges, 4);
-    assert_ne!(
+    assert_eq!(
         field,
-        SearchField::FunctionBody,
-        "C function name should not be FunctionBody (should be SymbolName); got {field:?}"
+        SearchField::SymbolName,
+        "C function name should be SymbolName (declarator: field, not name:, \
+         → degradation tier); got {field:?}\nranges: {ranges:?}"
     );
 }
 
@@ -542,35 +549,44 @@ fn test_411_c_call_site_is_fnbody() {
 
 // --- C++ ----------------------------------------------------------------
 
-/// C++ function name uses `declarator:` field → SymbolName (degradation, OD4).
+/// C++ function name → SymbolName via `declarator:` field (degradation, OD4).
+/// Like C, the C++ grammar routes the function name through function_declarator with
+/// `declarator:` (not `name:`) → field_name != Some("name") → SymbolName.
+/// assert_ne!(FunctionBody) would accept Other or FunctionSignature regressions
+/// (avoids PF-007).
 #[test]
-fn test_411_cpp_fn_def_name_is_not_fnbody() {
+fn test_411_cpp_fn_def_name_is_symbolname() {
     let source = "int add(int a) { return a; }";
     let ranges = classify_source(source, rskim_core::Language::Cpp).unwrap();
     assert_contiguous(&ranges, source.len());
     // "int " = 4 bytes → "add" starts at byte 4
     let field = field_at_byte(&ranges, 4);
-    assert_ne!(
+    assert_eq!(
         field,
-        SearchField::FunctionBody,
-        "C++ function name should not be FunctionBody; got {field:?}"
+        SearchField::SymbolName,
+        "C++ function name should be SymbolName (declarator: field, not name:, \
+         → degradation tier); got {field:?}\nranges: {ranges:?}"
     );
 }
 
 // --- C# -----------------------------------------------------------------
 
-/// C# method declaration name → not FunctionBody (OD5).
+/// C# method declaration name → FunctionSignature (OD5, AD-411-1).
+/// C# `method_declaration` has priority 4 and its name child uses field "name"
+/// (confirmed via tree-sitter-c-sharp node-types.json), so `map_identifier_to_field`
+/// returns FunctionSignature — symmetric with Java (avoids PF-007).
 #[test]
-fn test_411_csharp_method_def_name_is_not_fnbody() {
+fn test_411_csharp_method_def_name_is_fnsig() {
     let source = "class Foo { void Bar() {} }";
     let ranges = classify_source(source, rskim_core::Language::CSharp).unwrap();
     assert_contiguous(&ranges, source.len());
     // "void " = 5 bytes inside "class Foo { " (12) → "Bar" at byte 17
     let field = field_at_byte(&ranges, 17);
-    assert_ne!(
+    assert_eq!(
         field,
-        SearchField::FunctionBody,
-        "C# method name should not be FunctionBody; got {field:?}"
+        SearchField::FunctionSignature,
+        "C# method name should be FunctionSignature \
+         (method_declaration priority 4 + name: field → FnSig); got {field:?}\nranges: {ranges:?}"
     );
 }
 
@@ -593,20 +609,29 @@ fn test_411_ruby_method_def_name_is_fnsig() {
 
 // --- SQL ----------------------------------------------------------------
 
-/// SQL `CREATE TABLE users` — the table name must not be FunctionBody (OD5).
-/// The exact field depends on whether the grammar uses `name:` or another
-/// field for the table identifier; at minimum it should not be a call-site tier.
+/// SQL `CREATE TABLE users` — the table name must be FunctionSignature (definition tier, OD5).
+/// The tree-sitter-sequel grammar routes `users` as:
+///   `create_table → object_reference → name: identifier`
+/// `object_reference` is in `is_value_decl_kind`; its `name:` child has
+/// `field_name == Some("name")`, so `map_identifier_to_field` hits the `_ =>` arm
+/// (AD-411-6 option a) and returns FunctionSignature.
+/// The `object_reference` + `create_query` + `column_definition` additions to
+/// `is_value_decl_kind` exist precisely to give SQL definition names a definition tier;
+/// assert_ne!(FunctionBody) would never confirm that tier was actually assigned
+/// (avoids PF-007).
 #[test]
-fn test_411_sql_table_def_name_is_not_fnbody() {
+fn test_411_sql_table_def_name_is_fnsig() {
     let source = "CREATE TABLE users (id INT)";
     let ranges = classify_source(source, rskim_core::Language::Sql).unwrap();
     assert_contiguous(&ranges, source.len());
     // "CREATE TABLE " = 13 bytes → "users" starts at byte 13
     let field = field_at_byte(&ranges, 13);
-    assert_ne!(
+    assert_eq!(
         field,
-        SearchField::FunctionBody,
-        "SQL table name should not be FunctionBody; got {field:?}"
+        SearchField::FunctionSignature,
+        "SQL table name should be FunctionSignature \
+         (object_reference is_value_decl_kind + name: field → AD-411-6 FnSig tier); \
+         got {field:?}\nranges: {ranges:?}"
     );
 }
 
