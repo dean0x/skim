@@ -2246,39 +2246,49 @@ fn test_punctuation_joined_symbol_exact_intersection() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AD-372-6: Bench-surface ranking — large-file definer within TOP_K
+// AD-411-3: Bench-surface ranking — definition ranks #1, large file not buried
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// AD-372-6 / PF-007: the raw occurrence-count ranking key (length-norm-free, NOT BM25F)
-/// must rank a large-file definer with 3 occurrences ABOVE small files with 1 occurrence.
+/// AD-411-3 / PF-007: on the exact-symbol path the per-field-saturated BM25F key
+/// (AD-411-2/3, superseding the AD-372-6 raw occurrence-count key) must rank the
+/// file that *defines* the symbol above files that only mention it — and, because
+/// `field_b = 0` (AD-411-4), a large file must NOT be buried below a smaller one
+/// purely for its size (the length-norm-free property AD-372-6 established and
+/// AD-411 preserves).
 ///
 /// This emulates the rskim-bench harness (`harness.rs:148-155`) which calls
 /// `reader.search(limit=Some(TOP_K))` WITHOUT a verify step — rank order alone
 /// determines which results are returned.
 ///
-/// AD-372-6 ranking key = raw occurrence count (NOT BM25F, NOT occurrence/total_tokens).
-/// - BM25F: divides by field_len → large files are penalized → large-file definer buried.
-/// - occurrence/total_tokens: reintroduces length normalization (small files win on density).
-/// - Raw occurrence count (AD-372-6): a file with 3 occurrences ranks above 1 occurrence,
-///   regardless of file size.
+/// Corpus (all contain the literal token, so the AND-intersection keeps all four):
+/// - File 0: LARGE file, token appears 3× as bare identifiers (→ FunctionBody,
+///   boost 1.0) amid ~960 bytes of filler. This is NOT a definition.
+/// - File 1: the DEFINITION — `fn large_definer_fn()` (token → FunctionSignature,
+///   boost 8.0 in `for_exact_symbol`).
+/// - File 2: an import mention — `pub use crate::large_definer_fn;`.
+/// - File 3: a comment mention — `// large_definer_fn ...` (token → Comment).
 ///
-/// The test MUST FAIL if the ranking reverts to BM25F or a density-divided key.
-///
-/// Discriminating (PF-007): we assert the large-file definer ranks #1 (3 occurrences)
-/// over small junk files (1 occurrence each).
+/// Discriminating (PF-007):
+/// - rank-1 MUST be File 1 (the definition). A single high-boost definition
+///   occurrence dominates many low-boost body occurrences (per-field saturation).
+///   FAILS if AD-411 field-boosting is absent, or if the key reverts to raw
+///   occurrence count — which would rank the 3-mention File 0 first (pre-#411).
+/// - File 0 (large, 3 body occurrences) MUST out-rank File 3 (tiny, 1 comment
+///   occurrence): length-norm-free (field_b=0) — a large file is not buried by
+///   its size below a smaller one.
 #[test]
-fn test_ac_bench_surface_ranking_large_definer_within_top_k() {
+fn test_ac_bench_surface_ranking_definition_ranks_first() {
     let token = "large_definer_fn";
     const TOP_K: usize = 5;
 
-    // File 0 (LARGE definer): the unique token appears 3 times amid ~960 bytes of filler.
-    // Under BM25F this file would rank low because field_len is large.
-    // Under raw occurrence-count ranking (AD-372-6) it ranks #1 (3 > 1 for small files).
+    // File 0 (LARGE, non-definition): the token appears 3× as bare identifiers amid
+    // ~960 bytes of filler → FunctionBody (boost 1.0), a call-site/body tier.
     let filler = "filler_word ".repeat(80); // ~960 bytes
     let large_definer = format!("{filler} {token} middle {token} end {token}");
 
-    // Files 1..=3 (small dense): each contains the token once in a tiny snippet.
+    // File 1 (the DEFINITION): `fn <token>()` → token in FunctionSignature (boost 8.0).
     let small1 = format!("fn {token}() {{ 42 }}");
+    // File 2 (import mention) and File 3 (comment mention): non-definition tiers.
     let small2 = format!("pub use crate::{token};");
     let small3 = format!("// {token} defined elsewhere");
 
@@ -2296,27 +2306,26 @@ fn test_ac_bench_surface_ranking_large_definer_within_top_k() {
 
     let ids: Vec<u32> = results.iter().map(|r| r.file_id.0).collect();
 
-    // The large definer (3 occurrences) must rank #1.
-    // AD-372-6: raw occurrence count → 3 > 1 → FileId(0) ranks above FileIds(1,2,3).
-    // Under BM25F, FileId(0) would score lower than small files due to field_len division.
-    assert!(
-        ids.contains(&0),
-        "AD-372-6: large-file definer (FileId 0, 3 occurrences) must appear in TOP_K={TOP_K} \
-         results under the length-norm-free ranking key; got {ids:?}. \
-         If this fails, the ranking key reverted to BM25F (divides by field_len) — AD-372-6 violated."
+    // AD-411-3: rank-1 must be the DEFINITION (File 1, FunctionSignature boost 8.0),
+    // NOT the 3-mention bare-text file. Under the superseded raw occurrence-count
+    // key File 0 (3 mentions) would be #1 — this assertion fires if that regresses.
+    assert_eq!(
+        ids.first().copied(),
+        Some(1),
+        "AD-411-3: the definition file (FileId 1, `fn {token}()` → FunctionSignature) \
+         must rank #1 over bare mentions; got ranked ids {ids:?}"
     );
 
-    // PF-007 negative: if a BM25F key (divides by field_len) were used, FileId(0)
-    // might be buried below the small files.  The assert above catches that.
-    // Additionally verify rank-1 is FileId(0) (highest raw occurrence count, AD-372-6).
-    if !ids.is_empty() {
-        assert_eq!(
-            ids[0], 0,
-            "AD-372-6: FileId(0) with 3 occurrences must rank #1 under raw occurrence-count key; \
-             got rank-1 = FileId({}). BM25F would bury the large file — AD-372-6 prevents that.",
-            ids[0]
-        );
-    }
+    // AD-411-4 (field_b=0, length-norm-free): the LARGE file (File 0, 3 FunctionBody
+    // occurrences) must NOT be buried by its size — it must out-rank the tiny
+    // single-occurrence COMMENT file (File 3). Positions in `ids` are rank order.
+    let pos0 = ids.iter().position(|&x| x == 0);
+    let pos3 = ids.iter().position(|&x| x == 3);
+    assert!(
+        matches!((pos0, pos3), (Some(a), Some(b)) if a < b),
+        "AD-411-4: large file (FileId 0, 3 body occurrences) must out-rank the tiny \
+         comment file (FileId 3) — length-norm-free; got ranked ids {ids:?}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

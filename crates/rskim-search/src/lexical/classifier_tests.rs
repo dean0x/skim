@@ -675,7 +675,6 @@ fn test_411_markdown_heading_is_type_definition() {
 #[test]
 fn test_411_rust_const_def_field_outranks_markdown_heading_field() {
     use crate::lexical::BM25FConfig;
-    use crate::lexical::config::FIELD_COUNT;
 
     // Rust const def → FunctionSignature (index 1)
     let source_rust = "const TOKEN: u32 = 1;";
@@ -706,5 +705,4 @@ fn test_411_rust_const_def_field_outranks_markdown_heading_field() {
         "FunctionSignature boost ({fnsig_boost}) must exceed TypeDefinition boost ({typedef_boost}) \
          so code def scores above Markdown heading (OD3 / AC14)"
     );
-    let _ = FIELD_COUNT; // silence unused-import warning
 }
