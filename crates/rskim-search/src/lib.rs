@@ -97,6 +97,40 @@ const _: () = assert!(
 /// Finding 9 / #355 and #358).
 pub const LEXICAL_INDEX_FORMAT_VERSION: u16 = index::LEXICAL_FORMAT_VERSION;
 
+/// Generation of the classifier field-attribution schema.
+///
+/// Bump this constant whenever `classify_source` changes which [`crate::SearchField`]
+/// variant it assigns to any byte range (a "classifier schema change").  After
+/// bumping, the compile-time assertions guarding `index::format::FORMAT_VERSION`
+/// (in `rskim-search`) and `FileManifest::FORMAT_VERSION` (in `rskim`) will fail
+/// the build until BOTH constants are advanced to at least this value, enforcing
+/// the AD-411-5 dual-bump invariant:
+///
+/// - Bumping the **lexical index** format version ensures old on-disk indexes are
+///   detected as stale and rebuilt with the new field_id assignments.
+/// - Bumping the **manifest** format version ensures the per-file `field_map` cache
+///   written by older classifier code is discarded rather than reused during the
+///   rebuild, preventing the silent-inertness bug fixed in b21d08f (#411).
+///
+/// History:
+/// - v1: original SymbolName-only classification (all identifiers → SymbolName)
+/// - v2 (#411, AD-411-1): context-aware classification — declaration names inherit
+///   their declaration's field (FunctionSignature / TypeDefinition / ImportExport);
+///   non-declaration identifiers → FunctionBody.
+///   `LEXICAL_INDEX_FORMAT_VERSION` (6→7) and `FileManifest::FORMAT_VERSION` (6→7)
+///   bumped together with this constant to activate the compile-time guard.
+pub const CLASSIFIER_SCHEMA_VERSION: u32 = 7;
+
+// Compile-time guard (AD-411-5): LEXICAL_INDEX_FORMAT_VERSION must be at least
+// CLASSIFIER_SCHEMA_VERSION. When the classifier schema advances, bump
+// CLASSIFIER_SCHEMA_VERSION first — this assertion then fails until FORMAT_VERSION
+// is also advanced, making it impossible to forget the lexical-index bump.
+const _: () = assert!(
+    LEXICAL_INDEX_FORMAT_VERSION as u32 >= CLASSIFIER_SCHEMA_VERSION,
+    "LEXICAL_INDEX_FORMAT_VERSION must be >= CLASSIFIER_SCHEMA_VERSION; \
+     bump both when classify_source field-attribution rules change (AD-411-5)"
+);
+
 pub use cochange::{COUPLING_MAX_FILES, CochangeMatrixBuilder, CochangeMatrixReader};
 pub use compound::{
     CompositeWeights, RRF_K, WEIGHT_AST, WEIGHT_LEXICAL, intersect_and_rank, recompose_with_lexical,

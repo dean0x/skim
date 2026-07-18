@@ -997,12 +997,15 @@ fn test_1000_file_benchmark() {
 /// modeled on ast_index_size_ratio (~1.23-1.3x measured, <2.2x guard,
 /// ast_index/store/reader_tests.rs:574-666) and issue #273.
 ///
-/// Measured lexical baseline (trigram, v4 delta+varint, 1000 diverse Rust
-/// modules, 4 fns each ~1055 bytes (~1.05 MB total source), multi-field
-/// classified path): 3.53x.
+/// Measured lexical baseline (trigram, v7 delta+varint+token_length, 1000
+/// diverse Rust modules, 4 fns each ~1055 bytes (~1.05 MB total source),
+/// multi-field classified path): 5.57x (index=5878841, source=1055560).
+/// v4 delta+varint baseline was 3.53x; v5 (+token_position) was ~4.4x;
+/// v7 (+token_length, this branch) adds a 5th varint per posting (~+1
+/// byte/entry), raising the measured ratio to ~5.57x.
 /// v3 uncompressed baseline was 9.04x; delta+varint compression (#358 Item 2)
 /// reduced postings ~61%.
-/// Guard ceiling: measured_baseline + 1.5x headroom = 5.0x (round number).
+/// Guard ceiling: measured_v7_baseline + ~1.5x absolute headroom = 7.0x.
 /// The test fails on a genuine bloat regression (discriminating per PF-007
 /// -- a vacuous assert(>0) would pass even with 100x bloat).
 ///
@@ -1077,8 +1080,7 @@ fn test_lexical_index_size_ratio() {
          n_files={n_files}, fns_per_file={fns_per_file})"
     );
 
-    // Guard ceiling: v4 delta+varint baseline + estimated v5 token_position
-    // overhead + headroom.
+    // Guard ceiling: v7 delta+varint+token_length baseline + headroom.
     //
     // Rationale for the ceiling value:
     //   - Measured v4 trigram baseline on this corpus (1000 diverse Rust modules,
@@ -1093,27 +1095,29 @@ fn test_lexical_index_size_ratio() {
     //     (delta_token_position), almost always 0 or 1 → ~1 extra byte/entry over
     //     the v4 ~3.5 B/entry average, i.e. an estimated v5 ratio ~4.4x
     //     (v4 3.53x baseline × ~4.5/3.5). CI on a009a2c empirically CONFIRMS the v5
-    //     index stays < 5.0x on this fixed corpus. Headroom is now ~1.13x (tighter
-    //     than v4's 1.42x) but the corpus is deterministic, so the guard is stable;
-    //     a full-revert 9x posting explosion still fires it decisively.
-    //     (To re-ground to the exact v5 ratio: set this ceiling low, push, and read
-    //     the printed ratio from the CI failure message — not done here to avoid a
-    //     throwaway red CI run.)
-    //   - True sensitivity threshold: ~1.13x bloat (5.0 / ~4.4 estimated v5
-    //     baseline).  The FIRST regression that actually fires the assertion is
-    //     ~1.13x above the estimated v5 baseline (tighter than v4's ~1.42x
-    //     margin, since token_position adds bytes without raising the ceiling).
-    //     A genuine posting-list explosion (full revert to v3 fixed-9-byte
-    //     encoding gives 9.04x >> 5.0x) still definitively fires the gate (ADR-003).
+    //     index stays < 5.0x on this fixed corpus.
+    //   - v7 (#411, token_length added): each posting gains a 5th varint
+    //     (delta_token_length, encoding the byte span of the word run at the
+    //     trigram's first byte). Within a word run the delta is always 0 (+1
+    //     byte/entry); at word boundaries or (doc_id, field_id) resets the
+    //     absolute token_length encodes to 1-2 bytes. Net effect: ~+1 byte/entry
+    //     over v5's ~4.5 B/entry average. Empirically measured on this
+    //     deterministic corpus: 5.57x (index=5878841, source=1055560 bytes).
+    //     The ceiling is raised to 7.0x: 5.57 + ~1.47 absolute headroom
+    //     (matching the original v4→ceiling design margin).
+    //   - True sensitivity threshold: ~1.26x bloat (7.0 / 5.57 measured v7
+    //     baseline). A genuine posting-list explosion (full revert to v3
+    //     fixed-9-byte encoding gives 9.04x >> 7.0x) still definitively fires
+    //     the gate (ADR-003).
     //
     // ADR-003: regression guard must be empirically grounded, not the
     // baseless 0.30x inherited from the original ticket text.
-    const LEXICAL_SIZE_RATIO_CEILING: f64 = 5.0;
+    const LEXICAL_SIZE_RATIO_CEILING: f64 = 7.0;
     assert!(
         ratio < LEXICAL_SIZE_RATIO_CEILING,
         "AD-LXSZ-1: lexical index size ratio {ratio:.4} exceeds the \
-         <{LEXICAL_SIZE_RATIO_CEILING}x bloat guard (v5 token_position baseline ~4.4x, \
-         CI-confirmed < 5.0x). \
+         <{LEXICAL_SIZE_RATIO_CEILING}x bloat guard (v7 token_length baseline ~5.57x, \
+         empirically measured on this corpus). \
          If ratio exceeded: check for O(files^2) posting growth, \
          missing dedup, unbounded trigram emission, or codec regression. \
          index={total_index_bytes} bytes, source={total_source_bytes} bytes."
@@ -1489,13 +1493,26 @@ fn test_ac6_result_set_non_regression_v4_codec() {
 
 /// Helper: build a real `NgramIndexReader` (not the boxed `SearchLayer` trait)
 /// so we can call inherent methods like `search_exact_intersection`.
+///
+/// Uses `classify_source` for tree-sitter field classification so that
+/// FunctionSignature / FunctionBody / TypeDefinition boosts reflect the actual
+/// AST structure of the content — matching the production indexing path used by
+/// `index.rs::run()`.  Without classification all bytes fall into `SearchField::Other`
+/// (boost 0.5) and per-field BM25F is unable to distinguish a definition name
+/// (FunctionSignature, boost 8.0) from a call-site reference (FunctionBody, boost 1.0),
+/// causing the token_length seeding filter tests (AD-411-7) and the definition-rank
+/// tests (AD-411-3) to fail because raw TF in `Other` overrides the field boost.
 fn build_reader_with(
     files: &[(FileId, &str, rskim_core::Language)],
 ) -> (tempfile::TempDir, NgramIndexReader) {
+    use crate::classify_source;
     let dir = tmp_dir();
     let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
     for (id, content, lang) in files {
-        builder.add_file(*id, content, *lang).unwrap();
+        let field_map = classify_source(content, *lang).unwrap_or_default();
+        builder
+            .add_file_classified(*id, content, *lang, &field_map)
+            .unwrap();
     }
     builder.build().unwrap();
     let reader = NgramIndexReader::open(dir.path()).unwrap();
@@ -1995,8 +2012,8 @@ fn test_ac9_multi_word_union_path_preserved() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// AC #8: an index built by the current builder must be queryable with the
-/// new single-token exact path WITHOUT `--rebuild`.  FORMAT_VERSION must be 5
-/// (v4→v5, #392 / #380 Phase 2).  The existing
+/// new single-token exact path WITHOUT `--rebuild`.  FORMAT_VERSION must be 7
+/// (v6→v7, #411 alignment fix).  The existing
 /// `test_ac6_result_set_non_regression_v4_codec` test is the companion guard;
 /// this test focuses on the #372 exact-symbol path.
 #[test]
@@ -2006,7 +2023,7 @@ fn test_ac8_v4_format_compat_exact_symbol_no_rebuild() {
     let token = "exact_symbol_token";
     let dir = tmp_dir();
 
-    // Build a v5 index.
+    // Build a v7 index.
     {
         let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
         builder
@@ -2026,8 +2043,7 @@ fn test_ac8_v4_format_compat_exact_symbol_no_rebuild() {
         builder.build().unwrap();
     }
 
-    // Verify the on-disk format version is unchanged by #372 (still equals
-    // FORMAT_VERSION, currently v5).
+    // Verify the on-disk format version matches current FORMAT_VERSION (currently v7).
     let version = NgramIndexReader::lexical_index_version(dir.path()).unwrap();
     assert_eq!(
         version, FORMAT_VERSION,
@@ -2246,39 +2262,49 @@ fn test_punctuation_joined_symbol_exact_intersection() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AD-372-6: Bench-surface ranking — large-file definer within TOP_K
+// AD-411-3: Bench-surface ranking — definition ranks #1, large file not buried
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// AD-372-6 / PF-007: the raw occurrence-count ranking key (length-norm-free, NOT BM25F)
-/// must rank a large-file definer with 3 occurrences ABOVE small files with 1 occurrence.
+/// AD-411-3 / PF-007: on the exact-symbol path the per-field-saturated BM25F key
+/// (AD-411-2/3, superseding the AD-372-6 raw occurrence-count key) must rank the
+/// file that *defines* the symbol above files that only mention it — and, because
+/// `field_b = 0` (AD-411-4), a large file must NOT be buried below a smaller one
+/// purely for its size (the length-norm-free property AD-372-6 established and
+/// AD-411 preserves).
 ///
 /// This emulates the rskim-bench harness (`harness.rs:148-155`) which calls
 /// `reader.search(limit=Some(TOP_K))` WITHOUT a verify step — rank order alone
 /// determines which results are returned.
 ///
-/// AD-372-6 ranking key = raw occurrence count (NOT BM25F, NOT occurrence/total_tokens).
-/// - BM25F: divides by field_len → large files are penalized → large-file definer buried.
-/// - occurrence/total_tokens: reintroduces length normalization (small files win on density).
-/// - Raw occurrence count (AD-372-6): a file with 3 occurrences ranks above 1 occurrence,
-///   regardless of file size.
+/// Corpus (all contain the literal token, so the AND-intersection keeps all four):
+/// - File 0: LARGE file, token appears 3× as bare identifiers (→ FunctionBody,
+///   boost 1.0) amid ~960 bytes of filler. This is NOT a definition.
+/// - File 1: the DEFINITION — `fn large_definer_fn()` (token → FunctionSignature,
+///   boost 8.0 in `for_exact_symbol`).
+/// - File 2: an import mention — `pub use crate::large_definer_fn;`.
+/// - File 3: a comment mention — `// large_definer_fn ...` (token → Comment).
 ///
-/// The test MUST FAIL if the ranking reverts to BM25F or a density-divided key.
-///
-/// Discriminating (PF-007): we assert the large-file definer ranks #1 (3 occurrences)
-/// over small junk files (1 occurrence each).
+/// Discriminating (PF-007):
+/// - rank-1 MUST be File 1 (the definition). A single high-boost definition
+///   occurrence dominates many low-boost body occurrences (per-field saturation).
+///   FAILS if AD-411 field-boosting is absent, or if the key reverts to raw
+///   occurrence count — which would rank the 3-mention File 0 first (pre-#411).
+/// - File 0 (large, 3 body occurrences) MUST out-rank File 3 (tiny, 1 comment
+///   occurrence): length-norm-free (field_b=0) — a large file is not buried by
+///   its size below a smaller one.
 #[test]
-fn test_ac_bench_surface_ranking_large_definer_within_top_k() {
+fn test_ac_bench_surface_ranking_definition_ranks_first() {
     let token = "large_definer_fn";
     const TOP_K: usize = 5;
 
-    // File 0 (LARGE definer): the unique token appears 3 times amid ~960 bytes of filler.
-    // Under BM25F this file would rank low because field_len is large.
-    // Under raw occurrence-count ranking (AD-372-6) it ranks #1 (3 > 1 for small files).
+    // File 0 (LARGE, non-definition): the token appears 3× as bare identifiers amid
+    // ~960 bytes of filler → FunctionBody (boost 1.0), a call-site/body tier.
     let filler = "filler_word ".repeat(80); // ~960 bytes
     let large_definer = format!("{filler} {token} middle {token} end {token}");
 
-    // Files 1..=3 (small dense): each contains the token once in a tiny snippet.
+    // File 1 (the DEFINITION): `fn <token>()` → token in FunctionSignature (boost 8.0).
     let small1 = format!("fn {token}() {{ 42 }}");
+    // File 2 (import mention) and File 3 (comment mention): non-definition tiers.
     let small2 = format!("pub use crate::{token};");
     let small3 = format!("// {token} defined elsewhere");
 
@@ -2296,27 +2322,183 @@ fn test_ac_bench_surface_ranking_large_definer_within_top_k() {
 
     let ids: Vec<u32> = results.iter().map(|r| r.file_id.0).collect();
 
-    // The large definer (3 occurrences) must rank #1.
-    // AD-372-6: raw occurrence count → 3 > 1 → FileId(0) ranks above FileIds(1,2,3).
-    // Under BM25F, FileId(0) would score lower than small files due to field_len division.
-    assert!(
-        ids.contains(&0),
-        "AD-372-6: large-file definer (FileId 0, 3 occurrences) must appear in TOP_K={TOP_K} \
-         results under the length-norm-free ranking key; got {ids:?}. \
-         If this fails, the ranking key reverted to BM25F (divides by field_len) — AD-372-6 violated."
+    // AD-411-3: rank-1 must be the DEFINITION (File 1, FunctionSignature boost 8.0),
+    // NOT the 3-mention bare-text file. Under the superseded raw occurrence-count
+    // key File 0 (3 mentions) would be #1 — this assertion fires if that regresses.
+    assert_eq!(
+        ids.first().copied(),
+        Some(1),
+        "AD-411-3: the definition file (FileId 1, `fn {token}()` → FunctionSignature) \
+         must rank #1 over bare mentions; got ranked ids {ids:?}"
     );
 
-    // PF-007 negative: if a BM25F key (divides by field_len) were used, FileId(0)
-    // might be buried below the small files.  The assert above catches that.
-    // Additionally verify rank-1 is FileId(0) (highest raw occurrence count, AD-372-6).
-    if !ids.is_empty() {
-        assert_eq!(
-            ids[0], 0,
-            "AD-372-6: FileId(0) with 3 occurrences must rank #1 under raw occurrence-count key; \
-             got rank-1 = FileId({}). BM25F would bury the large file — AD-372-6 prevents that.",
-            ids[0]
-        );
-    }
+    // AD-411-4 (field_b=0, length-norm-free): the LARGE file (File 0, 3 FunctionBody
+    // occurrences) must NOT be buried by its size — it must out-rank the tiny
+    // single-occurrence COMMENT file (File 3). Positions in `ids` are rank order.
+    let pos0 = ids.iter().position(|&x| x == 0);
+    let pos3 = ids.iter().position(|&x| x == 3);
+    assert!(
+        matches!((pos0, pos3), (Some(a), Some(b)) if a < b),
+        "AD-411-4: large file (FileId 0, 3 body occurrences) must out-rank the tiny \
+         comment file (FileId 3) — length-norm-free; got ranked ids {ids:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AD-411-7: Exact-token filter — definer ranks above test helpers whose names
+// merely CONTAIN the query as a substring of a longer identifier
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AD-411-7 / AC2 regression guard: `search_exact_intersection` must rank the
+/// file that *defines* the symbol as a standalone token (FunctionSignature)
+/// ABOVE files that only contain the symbol as a SUBSTRING of longer test-helper
+/// function names.
+///
+/// Root cause that this test guards against (PF-014: verified against HEAD):
+/// the whole-token aligned counting (AD-411-2) intersects `token_position` sets
+/// across all query trigrams to confirm alignment.  For a query "check_staleness"
+/// (length 15) and a document token "test_check_staleness_present" (length 28),
+/// ALL 13 query trigrams appear at the same `token_position` (the big token's
+/// ordinal).  Without the `token_length` check added in v7 (AD-411-7), the
+/// alignment passes and the test-helper receives FunctionSignature credit (boost
+/// 8.0) for every helper function — easily outscoring the one real definition.
+///
+/// With the v7 fix: postings whose `token_length ≠ word.byte_len` are filtered
+/// out during seeding, so test-helper names contribute only FunctionBody credit
+/// (for call-site occurrences), which BM25F can no longer elevate above the
+/// actual definition.
+///
+/// Setup:
+/// - File 0 (definer): `fn check_staleness(db: &str) -> bool { false }` →
+///   token "check_staleness" in FunctionSignature (exact match, boost 8.0).
+/// - File 1 (test file): five test functions whose names CONTAIN "check_staleness"
+///   as a substring: `fn test_check_staleness_present() {}` × 5 →
+///   tokens "test_check_staleness_present", etc. each in FunctionSignature but
+///   length ≠ 15 → filtered by AD-411-7 → only FunctionBody call-site credit.
+///
+/// PF-007: the definer-rank assertion fires the moment the token_length seeding
+/// filter is removed or the FORMAT_VERSION bump is rolled back.
+#[test]
+fn test_ac2_exact_token_filter_definer_ranks_above_test_helpers() {
+    let symbol = "check_staleness";
+
+    // File 0: the definition — symbol as a standalone function name.
+    let definer = format!("fn {symbol}(db: &str) -> bool {{ false }}");
+
+    // File 1: a test file with 5 helper functions whose names CONTAIN the symbol
+    // as a substring but are longer tokens.  Without the token_length guard each
+    // helper's FunctionSignature occurrence would credit the full boost=8.0,
+    // accumulating far more score than the single definition.
+    let test_file = [
+        format!("fn test_{symbol}_present() {{ assert!(crate::{symbol}(\"a\")); }}"),
+        format!("fn test_{symbol}_absent() {{ assert!(!crate::{symbol}(\"b\")); }}"),
+        format!("fn test_{symbol}_empty() {{ assert!(!crate::{symbol}(\"\")); }}"),
+        format!("fn test_{symbol}_cache() {{ let _ = crate::{symbol}(\"c\"); }}"),
+        format!("fn test_{symbol}_bench() {{ let _ = crate::{symbol}(\"d\"); }}"),
+    ]
+    .join("\n");
+
+    let (_dir, reader) = build_reader_with(&[
+        (FileId(0), &definer, rskim_core::Language::Rust),
+        (FileId(1), &test_file, rskim_core::Language::Rust),
+    ]);
+
+    let mut q = SearchQuery::new(symbol);
+    q.limit = Some(10);
+    let results = reader.search(&q).unwrap();
+    let ids: Vec<u32> = results.iter().map(|r| r.file_id.0).collect();
+
+    // Both files must be returned (both contain the literal token as a substring
+    // — the definer exactly, the test file via call-site occurrences like
+    // `crate::check_staleness("a")`).
+    assert!(
+        ids.contains(&0) && ids.contains(&1),
+        "AD-411-7: both definer (FileId 0) and test file (FileId 1) must appear \
+         in results; got {ids:?}"
+    );
+
+    // The DEFINER must rank strictly ABOVE the test file.
+    let pos_definer = ids.iter().position(|&x| x == 0).unwrap();
+    let pos_test = ids.iter().position(|&x| x == 1).unwrap();
+    assert!(
+        pos_definer < pos_test,
+        "AD-411-7 / AC2: definer (FileId 0, `fn {symbol}`) must rank above the test file \
+         (FileId 1, five test helpers whose names contain '{symbol}' as a substring); \
+         got ranked ids {ids:?}; definer at rank {} test at rank {} — \
+         this means the token_length seeding filter (v7 AD-411-7) is absent or broken",
+        pos_definer + 1,
+        pos_test + 1
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADR-007: substring-only candidates must not be dropped before verify gate
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// ADR-007 recall regression: `search_exact_intersection` must return a file
+/// that contains the query **only** as a substring of longer identifiers, with
+/// no exact-token occurrences anywhere in the file.
+///
+/// Previously the method applied `if !field_tf.iter().any(|&f| f > 0.0) {
+/// continue; }` which dropped such files before the caller's substring-verify
+/// gate (`resolve_paths_and_snippets_verified`) could confirm the match.  This
+/// violated ADR-007: `git grep check_staleness` returns a file containing
+/// `fn test_check_staleness_present() {}` even though `check_staleness` is a
+/// substring of `test_check_staleness_present` — not a standalone token.
+///
+/// Fix: zero-aligned docs receive score 0.0 (instead of being skipped) so
+/// they appear after BM25F-ranked exact matches but are not suppressed.
+///
+/// PF-007: the test asserts file 1 IS present (discriminating observable).
+/// Without the fix, `ids` would contain only `{0}`.
+#[test]
+fn test_adr007_pure_substring_only_match_returned() {
+    let symbol = "check_staleness";
+
+    // File 0: exact-token definition.
+    let definer = format!("fn {symbol}(db: &str) -> bool {{ false }}");
+
+    // File 1: ONLY a test stub whose function NAME contains the symbol as a
+    // substring — NO call-site occurrences like `crate::check_staleness(...)`.
+    // Every trigram of `check_staleness` is present in `test_check_staleness_present`
+    // so File 1 passes the AND-intersection; but `token_length` (28) ≠ `byte_len`
+    // (15), so `align_whole_token` (AD-411-7) produces zero `field_tf` for File 1.
+    let pure_substring = format!("fn test_{symbol}_present() {{ }}");
+
+    let (_dir, reader) = build_reader_with(&[
+        (FileId(0), &definer, rskim_core::Language::Rust),
+        (FileId(1), &pure_substring, rskim_core::Language::Rust),
+    ]);
+
+    let mut q = SearchQuery::new(symbol);
+    q.limit = Some(10);
+    let results = reader.search(&q).unwrap();
+    let ids: Vec<u32> = results.iter().map(|r| r.file_id.0).collect();
+
+    // ADR-007: file 1 must appear because `git grep check_staleness` returns it.
+    assert!(
+        ids.contains(&1),
+        "ADR-007: file containing '{symbol}' only as a substring of \
+         'test_{symbol}_present' must appear in results; got {ids:?} — \
+         the zero-field_tf early-continue was not removed from \
+         search_exact_intersection"
+    );
+
+    // Exact-token match (FileId 0) must rank strictly above the pure-substring
+    // match (FileId 1) — BM25F score > 0.0 > 0.0 (substring score).
+    assert!(
+        ids.contains(&0),
+        "ADR-007: definer (FileId 0) must also be present; got {ids:?}"
+    );
+    let pos_definer = ids.iter().position(|&x| x == 0).unwrap();
+    let pos_sub = ids.iter().position(|&x| x == 1).unwrap();
+    assert!(
+        pos_definer < pos_sub,
+        "ADR-007: definer (FileId 0) must rank above pure-substring file (FileId 1); \
+         got {ids:?} — definer at rank {} substring at rank {}",
+        pos_definer + 1,
+        pos_sub + 1
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2874,5 +3056,206 @@ fn test_ac_p2_no_regression_plain_query_unaffected() {
     assert!(
         ids.contains(&0) && ids.contains(&1),
         "AC-P2-3: plain query 'alpha' must return BOTH files (positional branch must not fire); got {ids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AD-411-2 field-attribution tie rule
+// ---------------------------------------------------------------------------
+
+/// Verify the field-attribution tie rule in `align_whole_token`:
+/// when a token spans a field boundary (different trigrams of the same
+/// `token_position` carry different `field_id` values), the minimum
+/// (highest-priority) `field_id` wins.
+///
+/// Hand-builds a two-trigram word and a `postings_by_key` where:
+/// - Trigram 0 at `(doc_id=0, token_position=7)` has `field_id = 4` (FunctionBody)
+/// - Trigram 1 at `(doc_id=0, token_position=7)` has `field_id = 1` (FunctionSignature)
+///
+/// The tie rule must attribute the occurrence to field 1 (FunctionSignature),
+/// not field 4 (FunctionBody), because 1 < 4.
+#[test]
+fn test_align_whole_token_field_attribution_tie_rule() {
+    use crate::index::format::PostingEntry;
+    use crate::ngram::{Ngram, QueryToken};
+
+    // Build a 5-byte token "abcde" with two consecutive trigrams.
+    let trig0 = Ngram::from_bytes(b'a', b'b', b'c');
+    let trig1 = Ngram::from_bytes(b'b', b'c', b'd');
+    let word = QueryToken {
+        token_off: 0,
+        byte_len: 5, // length gate: postings must also have token_length = 5
+        trigrams: vec![trig0, trig1],
+    };
+
+    let doc_id: u32 = 0;
+    let token_pos: u32 = 7;
+    let token_len: u32 = 5;
+
+    // Trigram 0 at token_position 7 → field 4 (FunctionBody, lower priority).
+    let posts0 = vec![PostingEntry {
+        doc_id,
+        field_id: 4, // FunctionBody discriminant
+        position: 10,
+        token_position: token_pos,
+        token_length: token_len,
+    }];
+    // Trigram 1 at token_position 7 → field 1 (FunctionSignature, higher priority).
+    let posts1 = vec![PostingEntry {
+        doc_id,
+        field_id: 1, // FunctionSignature discriminant
+        position: 11,
+        token_position: token_pos,
+        token_length: token_len,
+    }];
+
+    let mut postings_by_key: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
+    postings_by_key.insert(trig0.key(), posts0);
+    postings_by_key.insert(trig1.key(), posts1);
+
+    let mut scratch_cands: HashMap<u32, CandidateEntry> = HashMap::new();
+    let mut scratch_trig: HashMap<u32, u8> = HashMap::new();
+    let mut byte_pos_vec: Vec<std::ops::Range<usize>> = Vec::new();
+
+    let field_tf = align_whole_token(
+        doc_id,
+        &word,
+        &postings_by_key,
+        &mut scratch_cands,
+        &mut scratch_trig,
+        &mut byte_pos_vec,
+    );
+
+    // The tie rule must attribute the one aligned occurrence to field 1
+    // (FunctionSignature, min of {4,1}=1), not field 4 (FunctionBody).
+    assert_eq!(
+        field_tf[1], 1.0,
+        "AD-411-2 tie rule: FunctionSignature (field_id=1) must receive credit; got field_tf={field_tf:?}"
+    );
+    assert_eq!(
+        field_tf[4], 0.0,
+        "AD-411-2 tie rule: FunctionBody (field_id=4) must NOT receive credit; got field_tf={field_tf:?}"
+    );
+    // Exactly one aligned position.
+    assert_eq!(
+        byte_pos_vec.len(),
+        1,
+        "AD-411-2 tie rule: exactly one aligned occurrence expected; got {byte_pos_vec:?}"
+    );
+    // Byte position from the seed trigram (trig0, position=10).
+    assert_eq!(
+        byte_pos_vec[0].start, 10,
+        "Byte position must come from the seed trigram (position=10); got {byte_pos_vec:?}"
+    );
+}
+
+/// Regression test for AD-411-2 set-semantics ("set-dedup") in the seed phase
+/// of `align_whole_token`.
+///
+/// A seed trigram that recurs at the **same `token_position`** within a single
+/// word token (e.g. `"abcabc"` where the trigram `"abc"` maps to byte offsets 0
+/// and 3 but both share the same word ordinal) must produce `field_tf += 1.0`,
+/// not `2.0`.
+///
+/// Motivation: the seed phase uses a `HashMap<token_position, CandidateEntry>`
+/// (AD-411-2).  Because `HashMap::entry().or_insert()` is a no-op on the second
+/// occurrence, each unique `token_position` contributes exactly ONE candidate and
+/// thus exactly ONE increment to `field_tf`.  An inadvertent revert to a `Vec`
+/// (multiset) seed container would push two candidates and yield `field_tf=2.0`,
+/// which this test would catch (per PF-007: assert a DISCRIMINATING observable).
+#[test]
+fn test_align_whole_token_set_dedup_recurring_seed_at_same_position() {
+    use crate::index::format::PostingEntry;
+    use crate::ngram::{Ngram, QueryToken};
+
+    // Single-trigram word "abc" (byte_len = 3). With only one trigram the
+    // narrow phase is skipped; only the seed phase and accumulate phase run,
+    // which isolates the set-dedup behaviour being tested.
+    let trig = Ngram::from_bytes(b'a', b'b', b'c');
+    let word = QueryToken {
+        token_off: 0,
+        byte_len: 3,
+        trigrams: vec![trig],
+    };
+
+    let doc_id: u32 = 0;
+    let tok_pos: u32 = 5; // arbitrary word ordinal
+    let tok_len: u32 = 3; // must equal word.byte_len to pass the length gate
+
+    // Two postings for the same trigram at the SAME token_position (tok_pos=5)
+    // but at different byte offsets and with different field_ids. This models
+    // a recurring seed trigram inside a single word token.
+    //
+    // Expected HashMap behaviour: the first posting creates the entry
+    // { min_field=2, byte_pos=0 }; the second posting's `or_insert` is a
+    // no-op (one entry per token_position), then `keep_min(2, 4)` is also a
+    // no-op (2 < 4). Result: ONE candidate, field_tf[2] += 1.0.
+    //
+    // Old Vec behaviour (what the fix replaces): two candidates pushed,
+    // field_tf total == 2.0 — the discriminating failure this test catches.
+    let posts = vec![
+        PostingEntry {
+            doc_id,
+            field_id: 2, // SymbolName (higher-priority, min wins)
+            position: 0,
+            token_position: tok_pos,
+            token_length: tok_len,
+        },
+        PostingEntry {
+            doc_id,
+            field_id: 4, // FunctionBody (lower-priority)
+            position: 100,
+            token_position: tok_pos,
+            token_length: tok_len,
+        },
+    ];
+
+    let mut postings_by_key: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
+    postings_by_key.insert(trig.key(), posts);
+
+    let mut scratch_cands: HashMap<u32, CandidateEntry> = HashMap::new();
+    let mut scratch_trig: HashMap<u32, u8> = HashMap::new();
+    let mut byte_pos_vec: Vec<std::ops::Range<usize>> = Vec::new();
+
+    let field_tf = align_whole_token(
+        doc_id,
+        &word,
+        &postings_by_key,
+        &mut scratch_cands,
+        &mut scratch_trig,
+        &mut byte_pos_vec,
+    );
+
+    // AD-411-2 set-dedup: total field_tf must be 1.0, not 2.0.
+    let total: f32 = field_tf.iter().sum();
+    assert_eq!(
+        total, 1.0,
+        "AD-411-2 set-dedup: two postings at the same token_position must yield \
+         field_tf sum=1.0 (set), not 2.0 (multiset); got field_tf={field_tf:?}"
+    );
+    // The min field_id (2 = SymbolName) must own the occurrence credit.
+    assert_eq!(
+        field_tf[2], 1.0,
+        "AD-411-2 set-dedup: min field_id (2=SymbolName) must receive credit; \
+         got field_tf={field_tf:?}"
+    );
+    assert_eq!(
+        field_tf[4], 0.0,
+        "AD-411-2 set-dedup: higher field_id (4=FunctionBody) must not receive credit; \
+         got field_tf={field_tf:?}"
+    );
+    // Exactly one aligned byte position.
+    assert_eq!(
+        byte_pos_vec.len(),
+        1,
+        "AD-411-2 set-dedup: exactly one aligned byte position expected; \
+         got {byte_pos_vec:?}"
+    );
+    // The byte position must come from the FIRST posting (position=0), since
+    // `or_insert` preserves the first-seen byte_pos.
+    assert_eq!(
+        byte_pos_vec[0].start, 0,
+        "AD-411-2 set-dedup: byte position must come from the first seed posting \
+         (position=0); got {byte_pos_vec:?}"
     );
 }

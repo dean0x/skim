@@ -23,5 +23,5 @@ pub mod tokenize;
 pub use classifier::classify_source;
 pub use config::{BM25FConfig, FIELD_COUNT};
 pub use query::{MAX_QUERY_BYTES, QueryEngine};
-pub use scoring::{bm25f_score, dominant_field};
-pub(crate) use tokenize::{is_word_byte, word_token_indices};
+pub use scoring::{bm25f_per_field_saturated_score, bm25f_score, dominant_field};
+pub(crate) use tokenize::{is_word_byte, word_token_indices, word_token_indices_and_lengths};
