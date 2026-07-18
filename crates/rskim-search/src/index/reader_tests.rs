@@ -1489,13 +1489,26 @@ fn test_ac6_result_set_non_regression_v4_codec() {
 
 /// Helper: build a real `NgramIndexReader` (not the boxed `SearchLayer` trait)
 /// so we can call inherent methods like `search_exact_intersection`.
+///
+/// Uses `classify_source` for tree-sitter field classification so that
+/// FunctionSignature / FunctionBody / TypeDefinition boosts reflect the actual
+/// AST structure of the content — matching the production indexing path used by
+/// `index.rs::run()`.  Without classification all bytes fall into `SearchField::Other`
+/// (boost 0.5) and per-field BM25F is unable to distinguish a definition name
+/// (FunctionSignature, boost 8.0) from a call-site reference (FunctionBody, boost 1.0),
+/// causing the token_length seeding filter tests (AD-411-7) and the definition-rank
+/// tests (AD-411-3) to fail because raw TF in `Other` overrides the field boost.
 fn build_reader_with(
     files: &[(FileId, &str, rskim_core::Language)],
 ) -> (tempfile::TempDir, NgramIndexReader) {
+    use crate::classify_source;
     let dir = tmp_dir();
     let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
     for (id, content, lang) in files {
-        builder.add_file(*id, content, *lang).unwrap();
+        let field_map = classify_source(content, *lang).unwrap_or_default();
+        builder
+            .add_file_classified(*id, content, *lang, &field_map)
+            .unwrap();
     }
     builder.build().unwrap();
     let reader = NgramIndexReader::open(dir.path()).unwrap();
