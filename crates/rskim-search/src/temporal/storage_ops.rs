@@ -39,6 +39,27 @@ pub(super) const MIN_JACCARD_THRESHOLD: f64 = 0.10;
 // Private insert helpers — accept an open Transaction
 // ============================================================================
 
+/// Write the version-attestation pair atomically within `tx`.
+///
+/// `META_GIT_HEAD` and `META_DATA_VERSION` form a co-required pair (AD-408-3,
+/// ADR-006): any `temporal.db` that carries `git_head` must also carry
+/// `data_version`, or `temporal_db_is_stale` flags it stale indefinitely.
+/// Co-locating both writes in this single primitive makes the invariant
+/// structurally un-bypassable — callers that need to record a new HEAD must
+/// go through here rather than calling [`TemporalDb::set_meta`] for each key
+/// independently.
+fn write_version_meta_in_tx(tx: &rusqlite::Transaction<'_>, git_head: &str) -> Result<()> {
+    let sql = "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)";
+    tx.execute(sql, params![META_GIT_HEAD, git_head])
+        .map_err(db_err)?;
+    tx.execute(
+        sql,
+        params![META_DATA_VERSION, TEMPORAL_DATA_VERSION.to_string()],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
 fn insert_hotspots_in_tx(tx: &rusqlite::Transaction<'_>, rows: &[HotspotRow]) -> Result<()> {
     tx.execute("DELETE FROM hotspot", []).map_err(db_err)?;
     let mut stmt = tx
@@ -401,6 +422,15 @@ impl TemporalDb {
 
     /// Insert or replace a single key-value pair in the `meta` table.
     ///
+    /// # Warning: version-attestation keys
+    ///
+    /// Do **not** write [`META_GIT_HEAD`] or [`META_DATA_VERSION`] through
+    /// this method directly. Those two keys form a co-required pair (AD-408-3):
+    /// writing one without the other yields a database that
+    /// `temporal_db_is_stale` flags stale forever (absent `data_version` is
+    /// treated as stale). Use [`TemporalDb::sync`] instead — it writes both
+    /// atomically via the `write_version_meta_in_tx` primitive.
+    ///
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
@@ -557,9 +587,11 @@ impl TemporalDb {
     /// Atomically replace all temporal data in a single transaction.
     ///
     /// Writes `hotspots`, `risks`, and `cochanges` via DELETE + INSERT and
-    /// updates the `meta` table with `git_head` and the current UTC timestamp
-    /// under [`META_LAST_UPDATED`]. All four operations are wrapped in one
-    /// transaction: either all succeed or none are committed.
+    /// updates the `meta` table with three keys: `git_head` under
+    /// [`META_GIT_HEAD`], the current UTC timestamp under [`META_LAST_UPDATED`],
+    /// and the current [`TEMPORAL_DATA_VERSION`] under [`META_DATA_VERSION`]
+    /// (AD-408-3). All operations are wrapped in one transaction: either all
+    /// succeed or none are committed.
     ///
     /// # Parameters
     ///
@@ -608,25 +640,14 @@ impl TemporalDb {
             .unwrap_or(Duration::ZERO)
             .as_secs()
             .to_string();
-        let mut meta_stmt = tx
-            .prepare_cached("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)")
-            .map_err(db_err)?;
-        meta_stmt
-            .execute(params![META_GIT_HEAD, git_head])
-            .map_err(db_err)?;
-        meta_stmt
-            .execute(params![META_LAST_UPDATED, now_secs])
-            .map_err(db_err)?;
-        // AD-408-3: Write the data-version unconditionally so the empty-history
-        // DB also carries it and the no-rebuild-loop invariant is preserved.
-        // `sync()` is the sole version-attesting write path — see TEMPORAL_DATA_VERSION docs.
-        meta_stmt
-            .execute(params![
-                META_DATA_VERSION,
-                TEMPORAL_DATA_VERSION.to_string()
-            ])
-            .map_err(db_err)?;
-        drop(meta_stmt);
+        // Write git_head + data_version as a co-required pair through the
+        // dedicated primitive so the invariant cannot be bypassed (AD-408-3).
+        write_version_meta_in_tx(&tx, git_head)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            params![META_LAST_UPDATED, now_secs],
+        )
+        .map_err(db_err)?;
 
         tx.commit().map_err(db_err)
     }
