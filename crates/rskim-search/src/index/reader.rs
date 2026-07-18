@@ -854,12 +854,23 @@ impl NgramIndexReader {
     /// gate (AD-355-2).  When `query.limit` is `Some(n)`, offset+limit are
     /// applied AFTER ranking.
     ///
-    /// # Correctness invariant (AD-372-2)
+    /// # Correctness invariant (AD-372-2) + ADR-007 recall
     ///
-    /// A file that contains the literal query token contains every contiguous
-    /// trigram of that token.  Therefore the AND-intersection of the query's
-    /// trigram posting lists is a **superset** of the verified result set: every
-    /// verified file is in the intersection; no true match can be dropped.
+    /// A file that contains the literal query token — either as an exact
+    /// whole-token or as a **substring** of a longer token — contains every
+    /// contiguous trigram of the query.  Therefore the AND-intersection of the
+    /// query's trigram posting lists is a **superset** of the verified result
+    /// set: every true match is in the intersection; no true match can be
+    /// dropped.
+    ///
+    /// Recall contract (ADR-007): `git grep <query>` is the ground-truth for
+    /// search quality.  A file containing the query only as a substring of
+    /// longer identifiers (e.g. `test_check_staleness_present`) must still
+    /// appear in results, ranked with score 0.0 after BM25F-ranked exact
+    /// matches.  The AD-411-7 token_length gate in `align_whole_token` assigns
+    /// these candidates zero `field_tf` (preventing false BM25F inflation) but
+    /// this method does **not** drop them; the caller's substring-verify gate
+    /// (`resolve_paths_and_snippets_verified`) confirms the match.
     ///
     /// # AD-411-2: Whole-token per-field counting (partial-trigram noise fix)
     ///
@@ -1071,13 +1082,29 @@ impl NgramIndexReader {
                 byte_pos_vec.extend(word_positions);
             }
 
-            // Only rank docs that had at least one aligned whole-token occurrence.
-            if !field_tf.iter().any(|&f| f > 0.0) {
-                continue;
-            }
-
-            // idf = 1.0 (single-term, uniform scale across docs).
-            let score = bm25f_per_field_saturated_score(1.0, &field_tf, &exact_symbol_config);
+            // Score: exact-token matches → BM25F; substring-only (passes the AND-
+            // intersection because the query's trigrams appear in the file, but no
+            // token_position aligns to the exact query byte-length) → 0.0.
+            //
+            // ADR-007: recall must match git-grep, which returns every file whose
+            // content contains the query as a literal substring — including cases like
+            // `check_staleness` appearing inside `test_check_staleness_present`.
+            // The token_length gate in `align_whole_token` (AD-411-7) correctly keeps
+            // test-helper FunctionSignature postings out of the BM25F count so they
+            // cannot outscore the real definition, but must NOT drop those files from
+            // the result set.  Score-0 candidates appear after all BM25F-ranked exact
+            // matches and still pass through the caller's substring-verify gate
+            // (`resolve_paths_and_snippets_verified`), which is the correctness
+            // authority (AD-355-2 / AD-372-2).
+            let score = if field_tf.iter().any(|&f| f > 0.0) {
+                // idf = 1.0 (single-term, uniform scale across docs).
+                bm25f_per_field_saturated_score(1.0, &field_tf, &exact_symbol_config)
+            } else {
+                // Substring-only candidate: no aligned whole-token occurrence, but
+                // the file genuinely contains the query text.  Score 0.0 keeps it
+                // below every BM25F-ranked result while still surfacing it.
+                0.0
+            };
 
             scored.push((doc_id, score));
             doc_positions.insert(doc_id, byte_pos_vec);

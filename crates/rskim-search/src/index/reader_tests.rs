@@ -2428,6 +2428,76 @@ fn test_ac2_exact_token_filter_definer_ranks_above_test_helpers() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ADR-007: substring-only candidates must not be dropped before verify gate
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// ADR-007 recall regression: `search_exact_intersection` must return a file
+/// that contains the query **only** as a substring of longer identifiers, with
+/// no exact-token occurrences anywhere in the file.
+///
+/// Previously the method applied `if !field_tf.iter().any(|&f| f > 0.0) {
+/// continue; }` which dropped such files before the caller's substring-verify
+/// gate (`resolve_paths_and_snippets_verified`) could confirm the match.  This
+/// violated ADR-007: `git grep check_staleness` returns a file containing
+/// `fn test_check_staleness_present() {}` even though `check_staleness` is a
+/// substring of `test_check_staleness_present` — not a standalone token.
+///
+/// Fix: zero-aligned docs receive score 0.0 (instead of being skipped) so
+/// they appear after BM25F-ranked exact matches but are not suppressed.
+///
+/// PF-007: the test asserts file 1 IS present (discriminating observable).
+/// Without the fix, `ids` would contain only `{0}`.
+#[test]
+fn test_adr007_pure_substring_only_match_returned() {
+    let symbol = "check_staleness";
+
+    // File 0: exact-token definition.
+    let definer = format!("fn {symbol}(db: &str) -> bool {{ false }}");
+
+    // File 1: ONLY a test stub whose function NAME contains the symbol as a
+    // substring — NO call-site occurrences like `crate::check_staleness(...)`.
+    // Every trigram of `check_staleness` is present in `test_check_staleness_present`
+    // so File 1 passes the AND-intersection; but `token_length` (28) ≠ `byte_len`
+    // (15), so `align_whole_token` (AD-411-7) produces zero `field_tf` for File 1.
+    let pure_substring = format!("fn test_{symbol}_present() {{ }}");
+
+    let (_dir, reader) = build_reader_with(&[
+        (FileId(0), &definer, rskim_core::Language::Rust),
+        (FileId(1), &pure_substring, rskim_core::Language::Rust),
+    ]);
+
+    let mut q = SearchQuery::new(symbol);
+    q.limit = Some(10);
+    let results = reader.search(&q).unwrap();
+    let ids: Vec<u32> = results.iter().map(|r| r.file_id.0).collect();
+
+    // ADR-007: file 1 must appear because `git grep check_staleness` returns it.
+    assert!(
+        ids.contains(&1),
+        "ADR-007: file containing '{symbol}' only as a substring of \
+         'test_{symbol}_present' must appear in results; got {ids:?} — \
+         the zero-field_tf early-continue was not removed from \
+         search_exact_intersection"
+    );
+
+    // Exact-token match (FileId 0) must rank strictly above the pure-substring
+    // match (FileId 1) — BM25F score > 0.0 > 0.0 (substring score).
+    assert!(
+        ids.contains(&0),
+        "ADR-007: definer (FileId 0) must also be present; got {ids:?}"
+    );
+    let pos_definer = ids.iter().position(|&x| x == 0).unwrap();
+    let pos_sub = ids.iter().position(|&x| x == 1).unwrap();
+    assert!(
+        pos_definer < pos_sub,
+        "ADR-007: definer (FileId 0) must rank above pure-substring file (FileId 1); \
+         got {ids:?} — definer at rank {} substring at rank {}",
+        pos_definer + 1,
+        pos_sub + 1
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // AD-372-4: short_query_fallback no longer pre-truncates (AC #14)
 // ─────────────────────────────────────────────────────────────────────────────
 
