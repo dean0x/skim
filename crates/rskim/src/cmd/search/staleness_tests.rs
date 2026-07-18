@@ -102,7 +102,7 @@ fn write_manifest_with_head(
 ///     (the unconditional SymbolName classification from before AD-411-1)
 ///
 /// The manifest header uses `version = 5` (LE u32), which `decode_header`
-/// rejects (`version 5 ≠ FORMAT_VERSION 6`) → `FileManifest::load` returns an
+/// rejects (`version 5 ≠ FORMAT_VERSION 7`) → `FileManifest::load` returns an
 /// empty manifest → no cache hit → fresh `classify_source` → AD-411-1 semantics.
 ///
 /// If the version gate in `decode_header` were removed (regression), the struct
@@ -810,7 +810,7 @@ fn test_v5_manifest_stale_reclassifies_with_new_ad411_field_semantics() {
     let source = "fn authenticate() {}\nfn main() { authenticate(); }\n";
     fs::write(dir.path().join("auth.rs"), source).unwrap();
 
-    // ── Step 1: build a current-version (v6 manifest + v7 lexical) index ──
+    // ── Step 1: build a current-version (v7 manifest + v7 lexical) index ──
     // This establishes the real SHA for auth.rs so the planted v5 manifest can
     // contain a matching SHA — triggering a cache HIT under the regression.
     build_index_in(dir.path(), &cache_dir);
@@ -825,7 +825,7 @@ fn test_v5_manifest_stale_reclassifies_with_new_ad411_field_semantics() {
         .clone();
 
     // ── Step 2: overwrite manifest with v5-format + SymbolName + real SHA ──
-    // decode_header rejects version = 5 (≠ 6) → empty manifest → no cache hit.
+    // decode_header rejects version = 5 (≠ 7) → empty manifest → no cache hit.
     // Under regression (missing version check): parse succeeds → SHA matches →
     // stale SymbolName (disc = 2) served as a cache hit from the v5 manifest,
     // bypassing classify_source entirely.
@@ -846,7 +846,7 @@ fn test_v5_manifest_stale_reclassifies_with_new_ad411_field_semantics() {
     write_ast_index_stub(&cache_dir);
 
     // ── Step 4: self-heal via auto_refresh_if_stale ────────────────────────
-    // check_staleness: lexical v5 < v7 → stale; manifest v5 ≠ v6 → stale →
+    // check_staleness: lexical v5 < v7 → stale; manifest v5 ≠ v7 → stale →
     // NoStoredHead → build_index with empty manifest → classify_source fresh.
     let analytics = TEST_ANALYTICS;
     let result = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics);
@@ -876,7 +876,7 @@ fn test_v5_manifest_stale_reclassifies_with_new_ad411_field_semantics() {
     assert!(
         has_fn_sig,
         "rebuilt manifest must contain FunctionSignature (disc = 1) for the function \
-         declaration name after stale-v5 self-heal (manifest v5 → v6, lexical v5 → v7); \
+         declaration name after stale-v5 self-heal (manifest v5 → v7, lexical v5 → v7); \
          SymbolName (disc = 2) only would mean \
          the stale v5 field_map cache was incorrectly reused instead of fresh \
          classify_source (AD-411-1 regression, per PF-007). field_map={:?}",
@@ -892,7 +892,7 @@ fn test_v5_manifest_stale_reclassifies_with_new_ad411_field_semantics() {
     assert!(
         has_fn_body,
         "rebuilt manifest must contain FunctionBody (disc = 4) for body blocks and \
-         call sites after stale-v5 self-heal (manifest v5 → v6, lexical v5 → v7; proves AD-411-1 context-aware classify_source \
+         call sites after stale-v5 self-heal (manifest v5 → v7, lexical v5 → v7; proves AD-411-1 context-aware classify_source \
          ran, not stale SymbolName-only cache). field_map={:?}",
         entry.field_map
     );
