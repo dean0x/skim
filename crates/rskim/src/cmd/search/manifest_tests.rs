@@ -641,7 +641,7 @@ fn test_binary_header_layout() {
     assert_eq!(&bytes[0..4], b"SKFM");
     let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
     assert_eq!(version, FileManifest::FORMAT_VERSION);
-    assert_eq!(version, 5, "FORMAT_VERSION must be 5 (AD-395-3 / AC6)");
+    assert_eq!(version, 6, "FORMAT_VERSION must be 6 (AD-411-5 / #411)");
     let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     assert_eq!(
         count, 2,
@@ -666,8 +666,8 @@ fn test_load_absent_magic_returns_empty() {
     assert_eq!(manifest.entry_count(), 0, "absent magic → Ok(empty) (AC-2)");
 }
 
-/// AC-2 (#380): load() returns Ok(empty) when the version != 4 (e.g. a future v5
-/// binary, or a forged version int).
+/// AC-2 (#380): load() returns Ok(empty) when the version does not match FORMAT_VERSION
+/// (e.g. a stale v5 binary, or a forged version int).
 #[test]
 fn test_load_wrong_version_returns_empty() {
     let dir = tempfile::tempdir().unwrap();
@@ -685,7 +685,7 @@ fn test_load_wrong_version_returns_empty() {
     fs::write(cache_dir.join("index.skfiles"), &buf).unwrap();
 
     let manifest = FileManifest::load(root, cache_dir).unwrap();
-    assert_eq!(manifest.entry_count(), 0, "version != 5 → Ok(empty) (AC-2)");
+    assert_eq!(manifest.entry_count(), 0, "version != 6 → Ok(empty) (AC-2)");
 }
 
 /// AC-2 / AC-5 (#380): load() returns Ok(empty) when the body is truncated below
@@ -820,18 +820,23 @@ fn test_full_entry_set_roundtrip_byte_identical() {
 }
 
 // ============================================================================
-// #395 — FORMAT_VERSION 5 + skip section tests
+// #395 / #411 — FORMAT_VERSION 6 + skip section tests
 // ============================================================================
 
-/// AC6 (partial): FORMAT_VERSION must equal 5. version_matches returns false
-/// for a v4 header and true for a v5 header (the self-heal trigger, AD-395-3).
+/// AC6 (partial): FORMAT_VERSION must equal 6. version_matches returns false
+/// for v4/v5 headers and true for a v6 header (the self-heal trigger, AD-411-5).
+///
+/// v5→v6 bump (#411, AD-411-5): field attribution changed (identifiers now
+/// classify context-aware instead of unconditional SymbolName); manifests written
+/// by v5 hold stale field_maps and must be cold-started so the self-heal
+/// re-classifies all files on the first query after upgrade.
 #[test]
-fn test_ac6_format_version_5_and_version_matches() {
-    // Compile-time check: constant must be 5.
+fn test_ac6_format_version_6_and_version_matches() {
+    // Compile-time check: constant must be 6.
     assert_eq!(
         FileManifest::FORMAT_VERSION,
-        5,
-        "FORMAT_VERSION must be 5 (AD-395-3 / AC6)"
+        6,
+        "FORMAT_VERSION must be 6 (AD-411-5 / #411)"
     );
 
     let dir = tempfile::tempdir().unwrap();
@@ -841,7 +846,7 @@ fn test_ac6_format_version_5_and_version_matches() {
     let root_str = dir.path().to_string_lossy();
     let root_bytes = root_str.as_bytes();
 
-    // Forge a v4 SKFM header.
+    // Forge a v4 SKFM header — must be rejected (stale, triggers rebuild).
     let mut v4_buf: Vec<u8> = Vec::new();
     v4_buf.extend_from_slice(b"SKFM");
     v4_buf.extend_from_slice(&4u32.to_le_bytes()); // version 4
@@ -849,14 +854,14 @@ fn test_ac6_format_version_5_and_version_matches() {
     v4_buf.extend_from_slice(&u32::try_from(root_bytes.len()).unwrap().to_le_bytes());
     v4_buf.extend_from_slice(root_bytes);
     v4_buf.push(0u8); // git_head absent
-    v4_buf.extend_from_slice(&0u32.to_le_bytes()); // skip_count = 0 (v5 appended)
+    v4_buf.extend_from_slice(&0u32.to_le_bytes()); // skip_count = 0
     fs::write(cache_dir.join("index.skfiles"), &v4_buf).unwrap();
     assert!(
         !FileManifest::version_matches(cache_dir).unwrap(),
         "v4 header must return false (triggers self-heal rebuild, AD-395-3)"
     );
 
-    // Forge a v5 SKFM header.
+    // Forge a v5 SKFM header — must also be rejected (stale after AD-411-5 bump).
     let mut v5_buf: Vec<u8> = Vec::new();
     v5_buf.extend_from_slice(b"SKFM");
     v5_buf.extend_from_slice(&5u32.to_le_bytes()); // version 5
@@ -867,8 +872,23 @@ fn test_ac6_format_version_5_and_version_matches() {
     v5_buf.extend_from_slice(&0u32.to_le_bytes()); // skip_count = 0
     fs::write(cache_dir.join("index.skfiles"), &v5_buf).unwrap();
     assert!(
+        !FileManifest::version_matches(cache_dir).unwrap(),
+        "v5 header must return false (stale after AD-411-5 bump, triggers self-heal re-classify)"
+    );
+
+    // Forge a v6 SKFM header — must be accepted (current version).
+    let mut v6_buf: Vec<u8> = Vec::new();
+    v6_buf.extend_from_slice(b"SKFM");
+    v6_buf.extend_from_slice(&6u32.to_le_bytes()); // version 6
+    v6_buf.extend_from_slice(&0u32.to_le_bytes()); // entry_count
+    v6_buf.extend_from_slice(&u32::try_from(root_bytes.len()).unwrap().to_le_bytes());
+    v6_buf.extend_from_slice(root_bytes);
+    v6_buf.push(0u8); // git_head absent
+    v6_buf.extend_from_slice(&0u32.to_le_bytes()); // skip_count = 0
+    fs::write(cache_dir.join("index.skfiles"), &v6_buf).unwrap();
+    assert!(
         FileManifest::version_matches(cache_dir).unwrap(),
-        "v5 header must return true (current version)"
+        "v6 header must return true (current version, AD-411-5)"
     );
 }
 
@@ -892,14 +912,14 @@ fn test_ac6_version_matches_rejects_v4() {
     );
 }
 
-/// Truncated-v5 manifest (skip_count missing) rejects whole — codec consistency (AD-380-3).
+/// Truncated-v6 manifest (skip_count missing) rejects whole — codec consistency (AD-380-3).
 ///
 /// The `else` branch in `FileManifest::load` now cold-starts when `read_u32()` for
 /// the skip_count returns `None` (buffer ended exactly at the skip section boundary).
-/// This is a v5-only scenario: v4 manifests are rejected by `decode_header` before
+/// This is a v6-only scenario: v4/v5 manifests are rejected by `decode_header` before
 /// reaching this code.
 #[test]
-fn test_v5_manifest_truncated_at_skip_count_rejects_whole() {
+fn test_v6_manifest_truncated_at_skip_count_rejects_whole() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let cache_dir = root.clone();
@@ -922,16 +942,16 @@ fn test_v5_manifest_truncated_at_skip_count_rejects_whole() {
     assert_eq!(
         loaded.entry_count(),
         0,
-        "v5 manifest truncated exactly at the skip_count boundary must reject-whole \
+        "v6 manifest truncated exactly at the skip_count boundary must reject-whole \
          (entry_count == 0), not silently accept the indexed entries (AD-380-3)"
     );
 }
 
-/// AC10 — v5 manifest round-trip: skip entries survive encode/load, are
+/// AC10 — v6 manifest round-trip: skip entries survive encode/load, are
 /// excluded from sorted_paths() and entry_count(), and a forged skip_count
 /// over MAX_MANIFEST_ENTRIES causes load() to reject-whole (AD-395-4).
 #[test]
-fn test_ac10_v5_manifest_round_trip_and_skip_isolation() {
+fn test_ac10_v6_manifest_round_trip_and_skip_isolation() {
     use super::super::types::{PersistedSkipReason, SkippedEntry};
 
     let dir = tempfile::tempdir().unwrap();

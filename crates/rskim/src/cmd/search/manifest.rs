@@ -9,7 +9,7 @@
 //!
 //! # Format (AD-380-1, #380)
 //!
-//! As of FORMAT_VERSION 5 the manifest is a compact **binary** file with a
+//! As of FORMAT_VERSION 6 the manifest is a compact **binary** file with a
 //! self-describing header, mirroring `ast_index.skcache`
 //! (`crates/rskim-search/src/ast_index/ast_cache.rs`). The previous v2/v3 format
 //! was a JSONL stream; binarizing removes the dominant on-disk cost of the index
@@ -453,7 +453,20 @@ impl FileManifest {
     /// that ends the infinite refresh loop for files that remain legitimately
     /// content-skipped (AD-395-4/5). A v4 manifest triggers NoStoredHead →
     /// exactly one full rebuild with no manual `--rebuild`. #395 owns 4→5.
-    pub const FORMAT_VERSION: u32 = 5;
+    ///
+    /// v5 → v6: AD-411-5 (#411): The lexical classifier field attribution changed
+    /// — identifiers are now classified context-aware as FunctionSignature /
+    /// TypeDefinition / ImportExport / FunctionBody instead of the previous
+    /// unconditional SymbolName.  The per-file `field_map` cached in v5 manifests
+    /// therefore carries the OLD classification for every SHA-matching file, making
+    /// definition ranking silently inert on any in-place upgrade (the self-heal
+    /// rebuilds v6 postings but stamps them with v5 SymbolName attribution).
+    /// Bumping to v6 makes `decode_header` return `None` on version mismatch
+    /// (manifest.rs:361-363), cold-starting the manifest so the self-heal
+    /// re-classifies ALL files on the first query after upgrade — no manual
+    /// `--rebuild` required.  Same pattern as the AD-405-14 AST skcache bump on
+    /// the AST side (#405).  #411 owns 5→6.
+    pub const FORMAT_VERSION: u32 = 6;
 
     // -----------------------------------------------------------------------
     // Constructors
@@ -476,7 +489,7 @@ impl FileManifest {
     /// reject WHOLE, never partial):
     /// - The file does not exist.
     /// - The file exceeds `MAX_MANIFEST_FILE_BYTES`.
-    /// - The magic is absent (e.g. an old JSONL manifest), version != 5, or the
+    /// - The magic is absent (e.g. an old JSONL manifest), version != 6, or the
     ///   declared entry count exceeds `MAX_MANIFEST_ENTRIES`.
     /// - The header's `root` does not match the canonical `project_root`.
     /// - The body is truncated or any entry is structurally corrupt.
@@ -574,7 +587,7 @@ impl FileManifest {
             }
         }
         // Truncation note: a genuine v4 manifest NEVER reaches this code — decode_header
-        // rejects any version != FORMAT_VERSION (5) before the entry loop runs (the
+        // rejects any version != FORMAT_VERSION (6) before the entry loop runs (the
         // ADR-006 version gate triggers a cold-start rebuild, not this fallback).
         // The only way `read_u32()` returns `None` here is a TRUNCATED v5 file where
         // all indexed entries are intact but the 4-byte skip_count is missing or partial.
@@ -597,7 +610,7 @@ impl FileManifest {
     /// Check if an on-disk manifest file exists and has the current FORMAT_VERSION.
     ///
     /// Returns:
-    /// - `Ok(true)` if the manifest exists and version matches (current binary v5).
+    /// - `Ok(true)` if the manifest exists and version matches (current binary v6).
     /// - `Ok(false)` if the manifest exists but is stale (v4 binary, old JSONL
     ///   v2/v3 — no binary magic, or a different version int).
     /// - `Ok(true)` if no manifest file exists (cold start; the `NoIndex` path
