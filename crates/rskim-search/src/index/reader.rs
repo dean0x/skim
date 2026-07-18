@@ -32,7 +32,9 @@ use super::format::{
 };
 use crate::{
     FileId, IndexStats, Result, SearchError, SearchField, SearchLayer, SearchQuery, SearchResult,
-    lexical::{BM25FConfig, FIELD_COUNT, bm25f_score, dominant_field},
+    lexical::{
+        BM25FConfig, FIELD_COUNT, bm25f_per_field_saturated_score, bm25f_score, dominant_field,
+    },
     ngram::{Ngram, extract_query_ngrams, extract_query_positional_tokens, is_single_token},
 };
 
@@ -317,8 +319,8 @@ pub struct NgramIndexReader {
 impl NgramIndexReader {
     /// Open an existing index from `dir`.
     ///
-    /// Validates magic bytes, format version, file sizes, and the CRC32
-    /// checksum before returning.
+    /// Validates magic bytes, format version (must equal v6), file sizes, and
+    /// the CRC32 checksum before returning.
     ///
     /// # Errors
     ///
@@ -429,10 +431,10 @@ impl NgramIndexReader {
     ///
     /// Opens only 6 bytes (magic + version) — no mmap, no CRC, no full validation.
     /// Used by `check_staleness` to detect a stale/below-current lexical
-    /// FORMAT_VERSION (currently v5) and trigger a rebuild before
+    /// FORMAT_VERSION (currently v6) and trigger a rebuild before
     /// `NgramIndexReader::open` hard-errors on the version mismatch.
-    /// For example, a v3 index on disk (pre-#358 delta+varint posting codec)
-    /// reads version=3 here, which is less than FORMAT_VERSION=5, so the
+    /// For example, a v5 index on disk (pre-AD-411-1 field_id semantic change)
+    /// reads version=5 here, which is less than FORMAT_VERSION=6, so the
     /// staleness check fires and a full rebuild is triggered.
     ///
     /// # Errors
@@ -667,15 +669,16 @@ impl NgramIndexReader {
     }
 
     /// Exact-symbol search: AND-intersection of query trigram posting lists,
-    /// followed by raw occurrence-count ranking (length-norm-free, AD-372-6).
+    /// followed by whole-token per-field-saturated BM25F ranking (AD-411-2/3).
     ///
     /// # AD-372-1: Query-shape dispatch — exact-symbol mode
     ///
     /// This method is called when `is_single_token(query.text)` is `true` and
     /// `extract_query_ngrams` produced a non-empty set.  It generates candidates
     /// via AND-intersection (grep-exact, limit/size-independent), then ranks by
-    /// raw occurrence-count (AD-372-6, length-norm-free) so large-file definers
-    /// are not buried by BM25F length-normalization.
+    /// per-field-saturated BM25F (AD-411-3) with the def-oriented config
+    /// ([`BM25FConfig::for_exact_symbol`]) so definition files rank above
+    /// call-site files, test files, and documentation.
     ///
     /// The intersection is returned in its entirety (no `take` before verify):
     /// the caller (`resolve_paths_and_snippets_verified`) is the only truncation
@@ -689,11 +692,37 @@ impl NgramIndexReader {
     /// trigram posting lists is a **superset** of the verified result set: every
     /// verified file is in the intersection; no true match can be dropped.
     ///
-    /// # match_positions (RESOLVED Decision 2: ALL intersected trigrams)
+    /// # AD-411-2: Whole-token per-field counting (partial-trigram noise fix)
     ///
-    /// Positions are collected from **all** intersected trigrams for each
-    /// surviving document (not just the highest-weight trigram).  This preserves
-    /// byte-identical snippet behavior relative to the UNION path.
+    /// The old approach counted ALL posting entries for all query trigrams, which
+    /// inflated scores for files containing other words that share a trigram with
+    /// the query token (e.g. "User" shares "Use" with "UserService").  The new
+    /// approach intersects `token_position` sets across ALL of a word's trigrams:
+    ///
+    /// ```text
+    /// aligned = ∩_g  { p.token_position | p ∈ postings(g, doc) }
+    /// for each tok_pos in aligned:
+    ///   field = min{ p.field_id | p.token_position = tok_pos, g ∈ word.trigrams }
+    ///   field_tf[field] += 1
+    /// ```
+    ///
+    /// `field_b = 0` (set by [`BM25FConfig::for_exact_symbol`]) means large-file
+    /// definers are not penalised by BM25F length normalisation (ADR-001 length-
+    /// norm-free property from AD-372-6 is preserved).
+    ///
+    /// # AD-411-3: Per-field-saturated BM25F scoring
+    ///
+    /// Score = `idf × Σ_f boost_f × (tf_f / (tf_f + k1))`, where `idf = 1.0`
+    /// (uniform scale) and boosts come from [`BM25FConfig::for_exact_symbol`].
+    /// Each field's contribution is saturated independently so a single
+    /// high-boost definition occurrence dominates many low-boost call-site
+    /// occurrences — see [`bm25f_per_field_saturated_score`] for the formula.
+    ///
+    /// # match_positions
+    ///
+    /// Byte positions are collected from the first trigram of each aligned
+    /// occurrence — one range per whole-token occurrence, pointing to the token
+    /// start.  This is byte-compatible with the UNION path's snippet highlighting.
     ///
     /// # Errors
     ///
@@ -769,89 +798,157 @@ impl NgramIndexReader {
             }
         }
 
-        // `intersection` is a sorted Vec<u32> — use binary_search for O(log n)
-        // membership tests below, avoiding the O(n) HashSet construction + rehash.
-
-        // Step 2: For each surviving doc_id, gather occurrence count (for
-        // ranking) and match positions (for snippets) from ALL intersected
-        // trigrams.  Also apply lang_filter and file_filter.
+        // Step 0 (AD-411-2): Build postings_by_key for per-word aligned counting.
         //
-        // Reuse the already-decoded `per_ngram_postings` from Step 1 — no
-        // second `lookup_postings` call needed (halves decode+alloc work).
+        // Re-use the already-decoded `per_ngram_postings` from Step 1 — no second
+        // `lookup_postings` call needed (halves decode+alloc work).  Deduplicate by
+        // ngram key: when the query produces the same key from different ngram objects
+        // (rare for distinct trigrams, but possible for short queries), the first
+        // decoded posting list wins.
+        let mut postings_by_key: HashMap<u32, &Vec<PostingEntry>> =
+            HashMap::with_capacity(per_ngram_postings.len());
+        for (i, (ngram, _)) in ngrams.iter().enumerate() {
+            postings_by_key
+                .entry(ngram.key())
+                .or_insert(&per_ngram_postings[i]);
+        }
 
-        // Per-doc occurrence count (sum of TFs across all query trigrams).
-        let mut doc_occurrence_count: HashMap<u32, usize> = HashMap::new();
+        // Positionable words for whole-token per-field aligned counting (AD-411-2).
+        // For a single-token query "UserService", this is exactly one word with all
+        // of UserService's trigrams. For multi-word queries routed here (impossible
+        // by the is_single_token guard above), positional_words would have multiple
+        // entries — the loop handles that correctly by summing per-word field TFs.
+        let positional_words = extract_query_positional_tokens(&query.text);
+
+        // Step 2 (AD-411-2): Whole-token per-field aligned TF counting.
+        //
+        // For each doc_id in the AND-intersection:
+        //   For each positionable query word w:
+        //     aligned_positions = ∩_g { p.token_position | p ∈ postings(g, doc) }
+        //     for each tok_pos in aligned_positions:
+        //       field = min{ p.field_id | p.token_position = tok_pos, g ∈ w.trigrams }
+        //       field_tf[field] += 1.0
+        //
+        // Partial-trigram noise is eliminated because a trigram from an unrelated
+        // word (e.g. "Use" in "User") will not appear at the token_position of the
+        // query token "UserService", so the intersection discards it.
         let mut doc_positions: HashMap<u32, Vec<std::ops::Range<usize>>> = HashMap::new();
         let mut doc_meta_cache: HashMap<u32, FileMetaEntry> = HashMap::new();
         let mut doc_field: HashMap<u32, [f32; FIELD_COUNT]> = HashMap::new();
+        let mut scored: Vec<(u32, f64)> = Vec::with_capacity(intersection.len());
 
-        for postings in &per_ngram_postings {
-            for p in postings {
-                // Binary search on the sorted intersection vec — no HashSet needed.
-                if intersection.binary_search(&p.doc_id).is_err() {
-                    continue; // not in intersection
-                }
-                // Apply file_filter (blast-radius allowlist) if set.
-                if let Some(ref f) = query.file_filter
-                    && !f.contains(&FileId(p.doc_id))
-                {
+        for &doc_id in &intersection {
+            // Apply file_filter (blast-radius allowlist) first.
+            if let Some(ref f) = query.file_filter
+                && !f.contains(&FileId(doc_id))
+            {
+                continue;
+            }
+            // Resolve and cache file metadata; apply lang_filter.
+            if let std::collections::hash_map::Entry::Vacant(e) = doc_meta_cache.entry(doc_id) {
+                let meta = self.file_meta_at(doc_id)?;
+                e.insert(meta);
+            }
+            let meta = &doc_meta_cache[&doc_id];
+            if lang_filter.is_some_and(|required| meta.lang_id != required) {
+                continue;
+            }
+
+            let mut field_tf = [0.0f32; FIELD_COUNT];
+            let mut byte_pos_vec: Vec<std::ops::Range<usize>> = Vec::new();
+
+            for word in &positional_words {
+                if word.trigrams.is_empty() {
                     continue;
                 }
-                // Resolve and cache file metadata; apply lang_filter.
-                if let std::collections::hash_map::Entry::Vacant(e) = doc_meta_cache.entry(p.doc_id)
-                {
-                    let meta = self.file_meta_at(p.doc_id)?;
-                    e.insert(meta);
+
+                // Seed candidates from the first trigram of this word.
+                // candidates: (token_position, min_field_id, byte_position)
+                // — the byte_position is from the first trigram for snippet highlighting.
+                let first = &word.trigrams[0];
+                let first_posts = match postings_by_key.get(&first.key()) {
+                    Some(p) => *p,
+                    None => continue,
+                };
+                let lo = first_posts.partition_point(|p| p.doc_id < doc_id);
+                let mut candidates: Vec<(u32, u8, u32)> = Vec::new();
+                let mut idx = lo;
+                while idx < first_posts.len() && first_posts[idx].doc_id == doc_id {
+                    let p = &first_posts[idx];
+                    candidates.push((p.token_position, p.field_id, p.position));
+                    idx += 1;
                 }
-                let meta = &doc_meta_cache[&p.doc_id];
-                if lang_filter.is_some_and(|required| meta.lang_id != required) {
+                if candidates.is_empty() {
                     continue;
                 }
 
-                // Accumulate occurrence count (TF) across all query trigrams.
-                *doc_occurrence_count.entry(p.doc_id).or_default() += 1;
+                // Narrow to whole-token aligned positions by intersecting with each
+                // subsequent trigram's token_position set at this doc.
+                for trig in &word.trigrams[1..] {
+                    if candidates.is_empty() {
+                        break;
+                    }
+                    let posts = match postings_by_key.get(&trig.key()) {
+                        Some(p) => *p,
+                        None => {
+                            candidates.clear();
+                            break;
+                        }
+                    };
+                    let lo2 = posts.partition_point(|p| p.doc_id < doc_id);
+                    // Collect min field_id per token_position for this trigram at this doc.
+                    let mut trig_field: HashMap<u32, u8> = HashMap::new();
+                    let mut idx2 = lo2;
+                    while idx2 < posts.len() && posts[idx2].doc_id == doc_id {
+                        let p = &posts[idx2];
+                        let e = trig_field.entry(p.token_position).or_insert(p.field_id);
+                        if p.field_id < *e {
+                            *e = p.field_id;
+                        }
+                        idx2 += 1;
+                    }
+                    // Field attribution tie rule: when a token spans a field boundary,
+                    // the minimum (highest-priority) field_id across all trigrams wins.
+                    candidates.retain_mut(|(tok_pos, min_field, _bp)| {
+                        match trig_field.get(tok_pos) {
+                            Some(&fid) => {
+                                if fid < *min_field {
+                                    *min_field = fid;
+                                }
+                                true
+                            }
+                            None => false,
+                        }
+                    });
+                }
 
-                // Collect positions from ALL intersected trigrams (RESOLVED
-                // Decision 2) so snippets are byte-identical to the UNION path.
-                let pos = p.position as usize;
-                doc_positions
-                    .entry(p.doc_id)
-                    .or_default()
-                    .push(pos..pos + 3);
-
-                // Accumulate field TF for dominant-field determination.
-                let field_idx = p.field_id as usize;
-                if field_idx < FIELD_COUNT {
-                    doc_field.entry(p.doc_id).or_insert([0.0; FIELD_COUNT])[field_idx] += 1.0;
+                // Record one whole-token occurrence per aligned token_position.
+                for (_, min_field, byte_pos) in candidates {
+                    let fidx = min_field as usize;
+                    if fidx < FIELD_COUNT {
+                        field_tf[fidx] += 1.0;
+                    }
+                    byte_pos_vec.push(byte_pos as usize..byte_pos as usize + 3);
                 }
             }
-        }
 
-        // Step 3: Build ranked result list.
-        //
-        // AD-372-6: Ranking key = raw occurrence_count (length-norm-free, NOT BM25F).
-        //
-        // BM25F divides TF by field_length, which buried large-file definers
-        // (the root bug: a file with 3 occurrences of "UserService" in a 500-line
-        // module scored LOWER than a tiny stub with 1 occurrence because BM25F's
-        // field-length normalization term divided by the large module's byte count).
-        //
-        // The fix: use the raw occurrence count directly.  A file with 10 occurrences
-        // of the token ranks higher than a file with 1 occurrence regardless of file
-        // size.  This is "length-norm-free" in the sense that large files are not
-        // penalized for being large — only raw occurrence frequency matters.
-        //
-        // Why NOT occurrence/total_tokens?  That would reintroduce a density bias
-        // that penalizes long files (a file with 3/83 = 0.036 density ranks BELOW
-        // a tiny file with 1/5 = 0.20 density), recreating the length-normalization
-        // problem we are eliminating.  Raw count is the correct signal.
-        //
-        // Note: docs that were excluded by file_filter or lang_filter above will
-        // have no entry in doc_occurrence_count and are omitted here.
-        let mut scored: Vec<(u32, f64)> = doc_occurrence_count
-            .into_iter()
-            .map(|(doc_id, occ)| (doc_id, occ as f64))
-            .collect();
+            // Only rank docs that had at least one aligned whole-token occurrence.
+            if !field_tf.iter().any(|&f| f > 0.0) {
+                continue;
+            }
+
+            // Step 3 (AD-411-3): Per-field-saturated BM25F scoring.
+            // idf = 1.0 (single-term, uniform scale across docs).
+            // BM25FConfig::for_exact_symbol() has field_b=[0;8], so large-file
+            // definers are NOT penalised by length normalisation (ADR-001 /
+            // AD-372-6 property preserved).
+            let score =
+                bm25f_per_field_saturated_score(1.0, &field_tf, &BM25FConfig::for_exact_symbol());
+
+            scored.push((doc_id, score));
+            doc_positions.insert(doc_id, byte_pos_vec);
+            doc_field.insert(doc_id, field_tf);
+        }
 
         // Step 4: Sort + assemble via shared helper (mirrors collect_scored_results).
         Ok(sort_and_assemble_results(

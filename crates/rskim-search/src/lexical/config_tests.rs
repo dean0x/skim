@@ -167,6 +167,78 @@ fn test_field_count_matches_search_field_variants() {
 }
 
 // -----------------------------------------------------------------------
+// BM25FConfig::for_exact_symbol (AD-411-4)
+// -----------------------------------------------------------------------
+
+/// `for_exact_symbol()` must pass validate() (all parameters in legal ranges).
+#[test]
+fn test_for_exact_symbol_validates() {
+    let cfg = BM25FConfig::for_exact_symbol();
+    assert!(
+        cfg.validate().is_ok(),
+        "for_exact_symbol() must satisfy validate(); errors: {:?}",
+        cfg.validate()
+    );
+}
+
+/// field_b must be all 0.0 — no length normalisation on the exact-symbol path
+/// (preserves AD-372-6 length-norm-free property, OD-3/4 guarantee).
+#[test]
+fn test_for_exact_symbol_field_b_all_zero() {
+    let cfg = BM25FConfig::for_exact_symbol();
+    for (i, &b) in cfg.field_b.iter().enumerate() {
+        assert_eq!(
+            b, 0.0,
+            "for_exact_symbol: field_b[{i}] must be 0.0 (length-norm-free), got {b}"
+        );
+    }
+}
+
+/// FunctionSignature boost (index 1) > TypeDefinition boost (index 0).
+/// Required so code definitions outrank Markdown headings (OD3, AC14).
+#[test]
+fn test_for_exact_symbol_fnsig_boost_greater_than_typedef_boost() {
+    let cfg = BM25FConfig::for_exact_symbol();
+    let fnsig = cfg.field_boosts[1]; // FunctionSignature
+    let typedef = cfg.field_boosts[0]; // TypeDefinition
+    assert!(
+        fnsig > typedef,
+        "FunctionSignature boost ({fnsig}) must exceed TypeDefinition boost ({typedef}) (OD3)"
+    );
+}
+
+/// FunctionSignature boost > SymbolName boost > FunctionBody boost.
+/// Ensures definition tier > degradation tier > call-site tier.
+#[test]
+fn test_for_exact_symbol_boost_ordering_invariants() {
+    let cfg = BM25FConfig::for_exact_symbol();
+    let fnsig = cfg.field_boosts[1]; // FunctionSignature
+    let symbol = cfg.field_boosts[2]; // SymbolName
+    let body = cfg.field_boosts[4]; // FunctionBody
+    assert!(
+        fnsig > symbol,
+        "FnSig boost ({fnsig}) must exceed SymbolName boost ({symbol})"
+    );
+    assert!(
+        symbol > body,
+        "SymbolName boost ({symbol}) must exceed FunctionBody boost ({body})"
+    );
+}
+
+/// `for_exact_symbol()` must return a DIFFERENT config from `Default`.
+/// (If they were identical the method would be dead code.)
+#[test]
+fn test_for_exact_symbol_differs_from_default() {
+    let exact = BM25FConfig::for_exact_symbol();
+    let def = BM25FConfig::default();
+    // At minimum, field_b differs (exact=0, default=0.75).
+    assert_ne!(
+        exact.field_b, def.field_b,
+        "for_exact_symbol field_b must differ from default"
+    );
+}
+
+// -----------------------------------------------------------------------
 // NaN / Infinity rejection
 // -----------------------------------------------------------------------
 

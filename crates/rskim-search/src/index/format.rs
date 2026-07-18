@@ -103,7 +103,26 @@ pub(crate) const SKIDX_MAGIC: &[u8; 4] = b"SKIX";
 /// `[varint delta_doc_id][u8 field_id][varint delta_position][varint delta_token_position]`.
 /// The 3-field v4 prefix is byte-identical, so snippet/field_id logic is
 /// unchanged. Old v4 indexes self-heal: `decode_header` rejects version ≠ 5.
-pub(crate) const FORMAT_VERSION: u16 = 5;
+///
+/// v5 → v6 (#411):
+///
+/// # AD-411-5
+///
+/// The `field_id` semantics for identifier-family byte ranges changed: in v6
+/// the classifier (`classify_source`) applies context-aware field attribution
+/// so that declaration-name identifiers inherit their declaration's field
+/// (FunctionSignature, TypeDefinition, or ImportExport) and non-declaration
+/// identifiers map to FunctionBody, rather than all identifiers mapping to
+/// SymbolName unconditionally. Any index built by a v5 (or older) binary will
+/// have `field_id` values for identifier bytes that differ from v6 semantics,
+/// causing the `search_exact_intersection` per-field-saturated scorer to
+/// mis-rank definitions. The self-heal is driven by the existing
+/// `v < LEXICAL_INDEX_FORMAT_VERSION` guard in `staleness.rs`
+/// (same mechanism as v2/v3/v4 self-heals) — a full rebuild is triggered on
+/// the next query with no `--rebuild` required. ADR-006 invariant preserved:
+/// the rebuild aborts before persisting the new manifest on any per-file
+/// desync so the old v5 index survives until a clean rebuild completes.
+pub(crate) const FORMAT_VERSION: u16 = 6;
 /// Size in bytes of [`SkidxHeader`] on disk.
 ///
 /// v1 was 30 bytes; v2 adds 32 bytes for `avg_field_lengths: [f32; 8]`.

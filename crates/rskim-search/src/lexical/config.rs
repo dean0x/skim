@@ -100,6 +100,53 @@ impl Default for BM25FConfig {
     }
 }
 
+impl BM25FConfig {
+    /// Definition-oriented BM25F config for the exact-symbol query path.
+    ///
+    /// # AD-411-4
+    ///
+    /// Used by `search_exact_intersection` (AD-411-3) to rank the single-token
+    /// exact-symbol query.  Key invariants:
+    ///
+    /// 1. **FunctionSignature boost > TypeDefinition boost** (OD3): a code
+    ///    function definition — or any const/value definition name mapped to
+    ///    FunctionSignature by the classifier (AD-411-6 option a) — must
+    ///    outrank a Markdown heading, which `classify_markdown` stamps as
+    ///    TypeDefinition.  With FnSig=8.0 and TypeDef=4.0 this holds for any
+    ///    tf ≥ 1.
+    ///
+    /// 2. **field_b = 0 everywhere** (AD-372-6 property preserved): no
+    ///    length-normalisation so large-file definers are not buried by their
+    ///    size relative to the corpus average.
+    ///
+    /// 3. **SymbolName boost above FunctionBody**: the degradation tier for
+    ///    grammars whose declaration name-field is not literally `"name"` must
+    ///    rank strictly above call-site occurrences.
+    ///
+    /// Boost ordering (option a, AD-411-6):
+    ///
+    /// | Field            | Index | Boost |
+    /// |-----------------|-------|-------|
+    /// | FunctionSignature | 1   | 8.0   |  ← fn defs + const/value defs (AD-411-6)
+    /// | TypeDefinition  | 0     | 4.0   |  ← struct/type defs; below FnSig (OD3)
+    /// | SymbolName      | 2     | 2.0   |  ← degradation tier (above FunctionBody)
+    /// | ImportExport    | 3     | 1.5   |
+    /// | FunctionBody    | 4     | 1.0   |  ← call sites
+    /// | Comment         | 5     | 0.5   |
+    /// | Other           | 7     | 0.5   |
+    /// | StringLiteral   | 6     | 0.3   |
+    #[must_use]
+    pub fn for_exact_symbol() -> Self {
+        Self {
+            k1: 1.2,
+            // Index order matches SearchField discriminants 0..7:
+            // [TypeDef, FnSig, SymbolName, ImportExport, FnBody, Comment, StringLit, Other]
+            field_boosts: [4.0, 8.0, 2.0, 1.5, 1.0, 0.5, 0.3, 0.5],
+            field_b: [0.0; FIELD_COUNT],
+        }
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

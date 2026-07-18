@@ -121,9 +121,9 @@ fn test_v2_header_rejected_with_please_rebuild_message() {
         checksum: 0,
     };
     let encoded = encode_header(&h);
-    // decode_header must NOT accept version 2 — FORMAT_VERSION is now 5.
+    // decode_header must NOT accept version 2 — FORMAT_VERSION is now 6.
     let result = decode_header(&encoded);
-    assert!(result.is_err(), "v2 header must be rejected by v5 reader");
+    assert!(result.is_err(), "v2 header must be rejected by v6 reader");
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("please rebuild"),
@@ -158,9 +158,9 @@ fn test_v3_header_rejected_with_please_rebuild_message() {
         checksum: 0,
     };
     let encoded = encode_header(&h);
-    // decode_header must NOT accept version 3 — FORMAT_VERSION is now 5.
+    // decode_header must NOT accept version 3 — FORMAT_VERSION is now 6.
     let result = decode_header(&encoded);
-    assert!(result.is_err(), "v3 header must be rejected by v5 reader");
+    assert!(result.is_err(), "v3 header must be rejected by v6 reader");
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("please rebuild"),
@@ -196,9 +196,9 @@ fn test_v4_header_rejected_with_please_rebuild_message() {
         checksum: 0,
     };
     let encoded = encode_header(&h);
-    // decode_header must NOT accept version 4 — FORMAT_VERSION is now 5.
+    // decode_header must NOT accept version 4 — FORMAT_VERSION is now 6.
     let result = decode_header(&encoded);
-    assert!(result.is_err(), "v4 header must be rejected by v5 reader");
+    assert!(result.is_err(), "v4 header must be rejected by v6 reader");
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("please rebuild"),
@@ -207,6 +207,48 @@ fn test_v4_header_rejected_with_please_rebuild_message() {
     assert!(
         err.contains("format version") || err.contains("unsupported"),
         "v4 rejection must mention 'format version' or 'unsupported': {err}"
+    );
+}
+
+/// Format v5 indexes must be rejected with an actionable 'please rebuild' message.
+///
+/// AD-411-5: After the v5→v6 format bump (#411), the v6 reader must reject v5
+/// indexes cleanly so the staleness check triggers a full rebuild — the old
+/// index is NOT corrupted, only the stored field_id semantics for identifier byte
+/// ranges changed (declaration names now carry definition-tier field_ids instead
+/// of the old unconditional SymbolName).  A v5 on-disk index would therefore
+/// produce mis-ranked results rather than garbage, making clean rejection + self-
+/// heal (via `check_staleness` guard `v < LEXICAL_INDEX_FORMAT_VERSION`) the
+/// correct response (ADR-006, self-heal via existing `v < FORMAT_VERSION` guard).
+///
+/// PF-007 compliance: asserts BOTH discriminating substrings
+/// ("unsupported format version" AND "please rebuild") so the test fails if
+/// either message is missing, not just if decode_header() returns Ok(()).
+#[test]
+fn test_v5_header_rejected_with_please_rebuild_message() {
+    // Construct a well-formed 62-byte header but with version = 5 (pre-v6 format).
+    let h = SkidxHeader {
+        magic: *SKIDX_MAGIC,
+        version: 5, // old v5 format (pre-AD-411-1 field_id semantic change)
+        ngram_count: 0,
+        file_count: 0,
+        postings_file_size: 0,
+        avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
+        checksum: 0,
+    };
+    let encoded = encode_header(&h);
+    // decode_header must NOT accept version 5 — FORMAT_VERSION is now 6.
+    let result = decode_header(&encoded);
+    assert!(result.is_err(), "v5 header must be rejected by v6 reader");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("please rebuild"),
+        "v5 rejection must include 'please rebuild' (actionable per ADR-006 / AD-411-5): {err}"
+    );
+    assert!(
+        err.contains("format version") || err.contains("unsupported"),
+        "v5 rejection must mention 'format version' or 'unsupported': {err}"
     );
 }
 

@@ -319,3 +319,392 @@ fn test_field_lengths_sum_multi_language() {
         assert_field_lengths_sum(&ranges, source.len());
     }
 }
+
+// -----------------------------------------------------------------------
+// AD-411-1: context-aware identifier classification
+// OD5: all 14 tree-sitter grammars have declaration-name fixtures
+// -----------------------------------------------------------------------
+
+/// Return the field assigned to the byte at `pos` in `ranges`.
+fn field_at_byte(ranges: &[(std::ops::Range<usize>, SearchField)], pos: usize) -> SearchField {
+    for (range, field) in ranges {
+        if range.contains(&pos) {
+            return *field;
+        }
+    }
+    SearchField::Other
+}
+
+// --- Rust ---------------------------------------------------------------
+
+/// Rust `fn compute()` — the declaration name "compute" must be in
+/// FunctionSignature (AD-411-1 priority-4 path).
+#[test]
+fn test_411_rust_fn_def_name_is_fnsig() {
+    // "fn " = 3 bytes → "compute" starts at byte 3
+    let source = "fn compute() {}";
+    let ranges = classify_source(source, rskim_core::Language::Rust).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 3); // first byte of "compute"
+    assert_eq!(
+        field,
+        SearchField::FunctionSignature,
+        "Rust fn name should be FunctionSignature; got {field:?}"
+    );
+}
+
+/// Rust call-site identifier (inside a function body) must be FunctionBody
+/// (AD-411-1 non-declaration parent path).
+#[test]
+fn test_411_rust_call_site_is_fnbody() {
+    // "fn main() { " = 12 bytes → "compute" in body starts at byte 12
+    let source = "fn main() { compute() }";
+    let ranges = classify_source(source, rskim_core::Language::Rust).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 12); // first byte of call-site "compute"
+    assert_eq!(
+        field,
+        SearchField::FunctionBody,
+        "Rust call site should be FunctionBody; got {field:?}"
+    );
+}
+
+/// Rust `const MAX: u32 = 100;` — the declaration name "MAX" must be in
+/// FunctionSignature (AD-411-1 + AD-411-6 option a: const names → FnSig).
+#[test]
+fn test_411_rust_const_def_name_is_fnsig() {
+    // "const " = 6 bytes → "MAX" starts at byte 6
+    let source = "const MAX: u32 = 100;";
+    let ranges = classify_source(source, rskim_core::Language::Rust).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 6); // first byte of "MAX"
+    assert_eq!(
+        field,
+        SearchField::FunctionSignature,
+        "Rust const name should be FunctionSignature (AD-411-6 option a); got {field:?}"
+    );
+}
+
+/// Non-regression: the Rust struct name should still be TypeDefinition
+/// (existing behaviour, not broken by AD-411-1).
+#[test]
+fn test_411_rust_struct_name_still_typedefinition() {
+    // "struct " = 7 bytes → "Foo" starts at byte 7
+    let source = "struct Foo { x: u32 }";
+    let ranges = classify_source(source, rskim_core::Language::Rust).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 7); // first byte of "Foo"
+    assert_eq!(
+        field,
+        SearchField::TypeDefinition,
+        "Rust struct name should be TypeDefinition; got {field:?}"
+    );
+}
+
+// --- TypeScript ---------------------------------------------------------
+
+/// TS function declaration name → FunctionSignature.
+#[test]
+fn test_411_typescript_fn_def_name_is_fnsig() {
+    // "function " = 9 bytes → "greet" starts at byte 9
+    let source = "function greet(): void {}";
+    let ranges = classify_source(source, rskim_core::Language::TypeScript).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 9);
+    assert_eq!(
+        field,
+        SearchField::FunctionSignature,
+        "TS function name should be FunctionSignature; got {field:?}"
+    );
+}
+
+/// TS call site inside a function body → FunctionBody.
+#[test]
+fn test_411_typescript_call_site_is_fnbody() {
+    // "function main(): void { " = 24 bytes → "greet" starts at byte 24
+    let source = "function main(): void { greet() }";
+    let ranges = classify_source(source, rskim_core::Language::TypeScript).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 24);
+    assert_ne!(
+        field,
+        SearchField::FunctionSignature,
+        "TS call site should not be FunctionSignature; got {field:?}"
+    );
+    // FunctionBody OR Other (either is acceptable — the key is it's NOT a def tier)
+    assert!(
+        matches!(field, SearchField::FunctionBody | SearchField::Other),
+        "TS call site should be FunctionBody or Other; got {field:?}"
+    );
+}
+
+// --- JavaScript ---------------------------------------------------------
+
+/// JS function declaration name → FunctionSignature.
+#[test]
+fn test_411_javascript_fn_def_name_is_fnsig() {
+    // "function " = 9 bytes → "greet" starts at byte 9
+    let source = "function greet() {}";
+    let ranges = classify_source(source, rskim_core::Language::JavaScript).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 9);
+    assert_eq!(
+        field,
+        SearchField::FunctionSignature,
+        "JS function name should be FunctionSignature; got {field:?}"
+    );
+}
+
+// --- Python -------------------------------------------------------------
+
+/// Python `def greet():` — name identifier → FunctionSignature.
+#[test]
+fn test_411_python_fn_def_name_is_fnsig() {
+    // "def " = 4 bytes → "greet" starts at byte 4
+    let source = "def greet(): pass";
+    let ranges = classify_source(source, rskim_core::Language::Python).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 4);
+    assert_eq!(
+        field,
+        SearchField::FunctionSignature,
+        "Python def name should be FunctionSignature; got {field:?}"
+    );
+}
+
+// --- Go -----------------------------------------------------------------
+
+/// Go `func greet() {}` — name identifier → FunctionSignature.
+#[test]
+fn test_411_go_fn_def_name_is_fnsig() {
+    // "func " = 5 bytes → "greet" starts at byte 5
+    let source = "func greet() {}";
+    let ranges = classify_source(source, rskim_core::Language::Go).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 5);
+    assert_eq!(
+        field,
+        SearchField::FunctionSignature,
+        "Go func name should be FunctionSignature; got {field:?}"
+    );
+}
+
+// --- Java ---------------------------------------------------------------
+
+/// Java method declaration name → FunctionSignature (OD5).
+#[test]
+fn test_411_java_method_def_name_is_not_fnbody() {
+    let source = "class Foo { void bar() {} }";
+    let ranges = classify_source(source, rskim_core::Language::Java).unwrap();
+    assert_contiguous(&ranges, source.len());
+    // "void " = 5 bytes inside "class Foo { " (12) → "bar" at byte 12+5=17
+    let field = field_at_byte(&ranges, 17);
+    assert_ne!(
+        field,
+        SearchField::FunctionBody,
+        "Java method name should not be FunctionBody; got {field:?}"
+    );
+}
+
+// --- C ------------------------------------------------------------------
+
+/// C function declarator name — falls to SymbolName (degradation, OD4).
+/// The C grammar uses `declarator:` field (not `name:`), so the name-child
+/// receives SymbolName, not FunctionBody.
+#[test]
+fn test_411_c_fn_def_name_is_not_fnbody() {
+    let source = "int add(int a) { return a; }";
+    let ranges = classify_source(source, rskim_core::Language::C).unwrap();
+    assert_contiguous(&ranges, source.len());
+    // "int " = 4 bytes → "add" starts at byte 4
+    let field = field_at_byte(&ranges, 4);
+    assert_ne!(
+        field,
+        SearchField::FunctionBody,
+        "C function name should not be FunctionBody (should be SymbolName); got {field:?}"
+    );
+}
+
+/// C call site inside a function body → FunctionBody.
+#[test]
+fn test_411_c_call_site_is_fnbody() {
+    // "int main() { " = 13 bytes → "add" at byte 13
+    let source = "int main() { add(1); return 0; }";
+    let ranges = classify_source(source, rskim_core::Language::C).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 13);
+    assert_eq!(
+        field,
+        SearchField::FunctionBody,
+        "C call site should be FunctionBody; got {field:?}"
+    );
+}
+
+// --- C++ ----------------------------------------------------------------
+
+/// C++ function name uses `declarator:` field → SymbolName (degradation, OD4).
+#[test]
+fn test_411_cpp_fn_def_name_is_not_fnbody() {
+    let source = "int add(int a) { return a; }";
+    let ranges = classify_source(source, rskim_core::Language::Cpp).unwrap();
+    assert_contiguous(&ranges, source.len());
+    // "int " = 4 bytes → "add" starts at byte 4
+    let field = field_at_byte(&ranges, 4);
+    assert_ne!(
+        field,
+        SearchField::FunctionBody,
+        "C++ function name should not be FunctionBody; got {field:?}"
+    );
+}
+
+// --- C# -----------------------------------------------------------------
+
+/// C# method declaration name → not FunctionBody (OD5).
+#[test]
+fn test_411_csharp_method_def_name_is_not_fnbody() {
+    let source = "class Foo { void Bar() {} }";
+    let ranges = classify_source(source, rskim_core::Language::CSharp).unwrap();
+    assert_contiguous(&ranges, source.len());
+    // "void " = 5 bytes inside "class Foo { " (12) → "Bar" at byte 17
+    let field = field_at_byte(&ranges, 17);
+    assert_ne!(
+        field,
+        SearchField::FunctionBody,
+        "C# method name should not be FunctionBody; got {field:?}"
+    );
+}
+
+// --- Ruby ---------------------------------------------------------------
+
+/// Ruby `def greet` — name identifier → FunctionSignature (OD5).
+#[test]
+fn test_411_ruby_method_def_name_is_fnsig() {
+    // "def " = 4 bytes → "greet" starts at byte 4
+    let source = "def greet\nend\n";
+    let ranges = classify_source(source, rskim_core::Language::Ruby).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 4);
+    assert_eq!(
+        field,
+        SearchField::FunctionSignature,
+        "Ruby def name should be FunctionSignature; got {field:?}"
+    );
+}
+
+// --- SQL ----------------------------------------------------------------
+
+/// SQL `CREATE TABLE users` — the table name must not be FunctionBody (OD5).
+/// The exact field depends on whether the grammar uses `name:` or another
+/// field for the table identifier; at minimum it should not be a call-site tier.
+#[test]
+fn test_411_sql_table_def_name_is_not_fnbody() {
+    let source = "CREATE TABLE users (id INT)";
+    let ranges = classify_source(source, rskim_core::Language::Sql).unwrap();
+    assert_contiguous(&ranges, source.len());
+    // "CREATE TABLE " = 13 bytes → "users" starts at byte 13
+    let field = field_at_byte(&ranges, 13);
+    assert_ne!(
+        field,
+        SearchField::FunctionBody,
+        "SQL table name should not be FunctionBody; got {field:?}"
+    );
+}
+
+// --- Kotlin -------------------------------------------------------------
+
+/// Kotlin `fun greet()` — name identifier → FunctionSignature (OD5).
+#[test]
+fn test_411_kotlin_fn_def_name_is_fnsig() {
+    // "fun " = 4 bytes → "greet" starts at byte 4
+    let source = "fun greet(): Unit {}";
+    let ranges = classify_source(source, rskim_core::Language::Kotlin).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 4);
+    assert_eq!(
+        field,
+        SearchField::FunctionSignature,
+        "Kotlin fun name should be FunctionSignature; got {field:?}"
+    );
+}
+
+// --- Swift --------------------------------------------------------------
+
+/// Swift `func greet()` — name identifier → FunctionSignature (OD5).
+#[test]
+fn test_411_swift_fn_def_name_is_fnsig() {
+    // "func " = 5 bytes → "greet" starts at byte 5
+    let source = "func greet() {}";
+    let ranges = classify_source(source, rskim_core::Language::Swift).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 5);
+    assert_eq!(
+        field,
+        SearchField::FunctionSignature,
+        "Swift func name should be FunctionSignature; got {field:?}"
+    );
+}
+
+// --- Markdown -----------------------------------------------------------
+
+/// Markdown heading → TypeDefinition (non-regression for classify_markdown).
+/// Markdown is handled by a format-specific classifier, not the tree-sitter
+/// identifier path, so this tests the Markdown path remains unaffected (OD5).
+#[test]
+fn test_411_markdown_heading_is_type_definition() {
+    let source = "# Heading\n";
+    let ranges = classify_source(source, rskim_core::Language::Markdown).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let has_typedef = ranges
+        .iter()
+        .any(|(_, f)| *f == SearchField::TypeDefinition);
+    assert!(
+        has_typedef,
+        "Markdown heading should produce TypeDefinition; got: {ranges:?}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// AC14: code definition outranks Markdown heading (OD3)
+// Verified at field level here; the scoring-tier proof is in config_tests.
+// -----------------------------------------------------------------------
+
+/// A Rust const definition name is stamped FunctionSignature (boost 8.0 in
+/// for_exact_symbol), while a Markdown heading is TypeDefinition (boost 4.0).
+/// This field-level fixture proves AC14: code def > doc heading on the
+/// exact-symbol path — the score arithmetic follows from the boosts.
+#[test]
+fn test_411_rust_const_def_field_outranks_markdown_heading_field() {
+    use crate::lexical::BM25FConfig;
+    use crate::lexical::config::FIELD_COUNT;
+
+    // Rust const def → FunctionSignature (index 1)
+    let source_rust = "const TOKEN: u32 = 1;";
+    let ranges = classify_source(source_rust, rskim_core::Language::Rust).unwrap();
+    // "const " = 6 bytes → "TOKEN" starts at byte 6
+    let rust_field = field_at_byte(&ranges, 6);
+    assert_eq!(
+        rust_field,
+        SearchField::FunctionSignature,
+        "Rust const name should be FunctionSignature"
+    );
+
+    // Markdown heading → TypeDefinition (index 0)
+    let source_md = "# TOKEN\n";
+    let md_ranges = classify_source(source_md, rskim_core::Language::Markdown).unwrap();
+    // "# " = 2 bytes → "TOKEN" heading content; any TypeDefinition byte is enough
+    let md_has_typedef = md_ranges
+        .iter()
+        .any(|(_, f)| *f == SearchField::TypeDefinition);
+    assert!(md_has_typedef, "Markdown heading should be TypeDefinition");
+
+    // Verify the BM25FConfig::for_exact_symbol() boost ordering ensures code > doc.
+    let cfg = BM25FConfig::for_exact_symbol();
+    let fnsig_boost = cfg.field_boosts[SearchField::FunctionSignature.discriminant() as usize];
+    let typedef_boost = cfg.field_boosts[SearchField::TypeDefinition.discriminant() as usize];
+    assert!(
+        fnsig_boost > typedef_boost,
+        "FunctionSignature boost ({fnsig_boost}) must exceed TypeDefinition boost ({typedef_boost}) \
+         so code def scores above Markdown heading (OD3 / AC14)"
+    );
+    let _ = FIELD_COUNT; // silence unused-import warning
+}

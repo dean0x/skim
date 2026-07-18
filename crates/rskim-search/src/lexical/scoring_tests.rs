@@ -225,6 +225,132 @@ fn test_determinism() {
 }
 
 // -----------------------------------------------------------------------
+// bm25f_per_field_saturated_score (AD-411-3)
+// -----------------------------------------------------------------------
+
+/// Zero TF in all fields → score must be exactly 0.0.
+#[test]
+fn test_per_field_saturated_zero_tf_returns_zero() {
+    let cfg = BM25FConfig::for_exact_symbol();
+    let score = bm25f_per_field_saturated_score(1.0, &zero_field_tfs(), &cfg);
+    assert_eq!(score, 0.0, "all-zero TF should give 0.0 score");
+}
+
+/// idf = 0.0 → score must be 0.0 regardless of TFs.
+#[test]
+fn test_per_field_saturated_zero_idf_returns_zero() {
+    let cfg = BM25FConfig::for_exact_symbol();
+    let mut tfs = zero_field_tfs();
+    tfs[1] = 10.0; // FunctionSignature
+    let score = bm25f_per_field_saturated_score(0.0, &tfs, &cfg);
+    assert_eq!(score, 0.0, "zero idf should give 0.0 score");
+}
+
+/// AC4 (N=16): 1 occurrence in FunctionSignature (boost 8.0) must score
+/// higher than 16 occurrences in FunctionBody (boost 1.0).
+///
+/// Math: 1 FnSig → 8 × (1/2.2) ≈ 3.636
+///       16 FnBody → 1 × (16/17.2) ≈ 0.930   → def wins
+#[test]
+fn test_per_field_saturated_one_fnsig_beats_sixteen_fnbody() {
+    let cfg = BM25FConfig::for_exact_symbol();
+    let idf = 1.0_f64;
+
+    let mut def_tfs = zero_field_tfs();
+    def_tfs[SearchField::FunctionSignature.discriminant() as usize] = 1.0;
+
+    let mut body_tfs = zero_field_tfs();
+    body_tfs[SearchField::FunctionBody.discriminant() as usize] = 16.0;
+
+    let def_score = bm25f_per_field_saturated_score(idf, &def_tfs, &cfg);
+    let body_score = bm25f_per_field_saturated_score(idf, &body_tfs, &cfg);
+
+    assert!(
+        def_score > body_score,
+        "AC4: 1 FnSig occurrence ({def_score:.4}) must beat 16 FnBody occurrences ({body_score:.4})"
+    );
+}
+
+/// AC4 (N=52): 1 occurrence in FunctionSignature must beat 52 in FunctionBody.
+/// This is the extreme case from the plan's example.
+#[test]
+fn test_per_field_saturated_one_fnsig_beats_fifty_two_fnbody() {
+    let cfg = BM25FConfig::for_exact_symbol();
+    let idf = 1.0_f64;
+
+    let mut def_tfs = zero_field_tfs();
+    def_tfs[SearchField::FunctionSignature.discriminant() as usize] = 1.0;
+
+    let mut body_tfs = zero_field_tfs();
+    body_tfs[SearchField::FunctionBody.discriminant() as usize] = 52.0;
+
+    let def_score = bm25f_per_field_saturated_score(idf, &def_tfs, &cfg);
+    let body_score = bm25f_per_field_saturated_score(idf, &body_tfs, &cfg);
+
+    assert!(
+        def_score > body_score,
+        "AC4: 1 FnSig ({def_score:.4}) must beat 52 FnBody ({body_score:.4})"
+    );
+}
+
+/// FunctionSignature boost (8.0) > TypeDefinition boost (4.0) ensures code
+/// definitions outrank doc headings (OD3). Verify the per-field saturated scorer
+/// respects this ordering.
+#[test]
+fn test_per_field_saturated_fnsig_boost_beats_typedef_boost() {
+    let cfg = BM25FConfig::for_exact_symbol();
+    let idf = 1.0_f64;
+
+    let mut code_tfs = zero_field_tfs();
+    code_tfs[SearchField::FunctionSignature.discriminant() as usize] = 1.0;
+
+    let mut doc_tfs = zero_field_tfs();
+    doc_tfs[SearchField::TypeDefinition.discriminant() as usize] = 1.0;
+
+    let code_score = bm25f_per_field_saturated_score(idf, &code_tfs, &cfg);
+    let doc_score = bm25f_per_field_saturated_score(idf, &doc_tfs, &cfg);
+
+    assert!(
+        code_score > doc_score,
+        "OD3: FnSig ({code_score:.4}) must beat TypeDef ({doc_score:.4})"
+    );
+}
+
+/// Score is deterministic across repeated calls.
+#[test]
+fn test_per_field_saturated_deterministic() {
+    let cfg = BM25FConfig::for_exact_symbol();
+    let mut tfs = zero_field_tfs();
+    tfs[0] = 3.0;
+    tfs[1] = 1.0;
+    tfs[4] = 5.0;
+    let first = bm25f_per_field_saturated_score(2.5, &tfs, &cfg);
+    for _ in 0..50 {
+        let s = bm25f_per_field_saturated_score(2.5, &tfs, &cfg);
+        assert!(
+            (s - first).abs() < 1e-15,
+            "bm25f_per_field_saturated_score is not deterministic: {first} vs {s}"
+        );
+    }
+}
+
+/// Score is finite for any reasonable input combination.
+#[test]
+fn test_per_field_saturated_finite_for_large_tf() {
+    let cfg = BM25FConfig::for_exact_symbol();
+    let mut tfs = zero_field_tfs();
+    tfs[4] = 100_000.0; // very high TF in FunctionBody
+    let score = bm25f_per_field_saturated_score(1.0, &tfs, &cfg);
+    assert!(score.is_finite(), "score must be finite for large TF");
+    // Should be close to asymptote: boost × (tf → ∞) → boost × 1.0
+    let boost_fnbody = cfg.field_boosts[4] as f64;
+    assert!(
+        score <= boost_fnbody * 1.0001,
+        "score must not exceed the asymptote {boost_fnbody}"
+    );
+}
+
+// -----------------------------------------------------------------------
 // dominant_field
 // -----------------------------------------------------------------------
 
