@@ -93,6 +93,74 @@ fn write_manifest_with_head(
     manifest.save().unwrap();
 }
 
+/// Write a v5-format binary manifest (`index.skfiles`) into `cache_dir`,
+/// containing exactly one entry for `rel_path` with:
+///   - `sha256` = the caller-supplied SHA (use the REAL file SHA so a SHA-check
+///     cache HIT fires under a regression that skips the version gate)
+///   - `lang` = "rust"
+///   - `field_map` = one all-SymbolName (discriminant = 2) span `[0, source_len)`
+///     (the unconditional SymbolName classification from before AD-411-1)
+///
+/// The manifest header uses `version = 5` (LE u32), which `decode_header`
+/// rejects (`version 5 ≠ FORMAT_VERSION 6`) → `FileManifest::load` returns an
+/// empty manifest → no cache hit → fresh `classify_source` → AD-411-1 semantics.
+///
+/// If the version gate in `decode_header` were removed (regression), the struct
+/// would parse successfully, `manifest.lookup(rel_path)` would find the entry,
+/// the SHA would match the real file content, and `read_and_classify` would reuse
+/// the stale SymbolName field_map via a SHA-check cache hit — bypassing
+/// `classify_source` entirely. The end-to-end test asserts FunctionSignature
+/// (disc = 1) in the rebuilt field_map, which is impossible under that regression.
+fn write_v5_manifest_with_symbolname_and_sha(
+    root: &std::path::Path,
+    cache_dir: &std::path::Path,
+    rel_path: &str,
+    sha256: &str,
+    source_len: usize,
+) {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let root_str = canonical_root.to_string_lossy();
+    let root_bytes = root_str.as_bytes();
+
+    let mut buf = Vec::<u8>::new();
+
+    // Fixed header: magic "SKFM" + version = 5 (stale) + entry_count = 1
+    buf.extend_from_slice(b"SKFM");
+    buf.extend_from_slice(&5u32.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes());
+
+    // Variable header: root (length-prefixed) + git_head absent
+    buf.extend_from_slice(&(root_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(root_bytes);
+    buf.push(0u8); // git_head_present = false (None)
+
+    // Entry: path
+    let path_bytes = rel_path.as_bytes();
+    buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(path_bytes);
+    // Entry: sha256 — the REAL file SHA so SHA-check cache HIT fires under regression
+    let sha_bytes = sha256.as_bytes();
+    buf.extend_from_slice(&(sha_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(sha_bytes);
+    // Entry: lang = "rust"
+    buf.extend_from_slice(&4u32.to_le_bytes());
+    buf.extend_from_slice(b"rust");
+    // Entry: field_map — one SymbolName (disc = 2) span [0, source_len)
+    // This is the stale pre-AD-411-1 classification that must NOT be reused.
+    buf.extend_from_slice(&1u32.to_le_bytes()); // field_map_count = 1
+    buf.extend_from_slice(&0u32.to_le_bytes()); // start = 0
+    buf.extend_from_slice(&(source_len as u32).to_le_bytes()); // end = source_len
+    buf.push(2u8); // discriminant = 2 (SymbolName — old unconditional pre-AD-411-1 field)
+    // Entry: mtime absent, size absent
+    buf.push(0u8); // mtime_present = 0 (None)
+    buf.push(0u8); // size_present  = 0 (None)
+
+    // v5 skip section (empty)
+    buf.extend_from_slice(&0u32.to_le_bytes()); // skip_count = 0
+
+    fs::write(cache_dir.join("index.skfiles"), &buf).unwrap();
+}
+
 // ============================================================================
 // resolve_git_dir
 // ============================================================================
@@ -682,6 +750,150 @@ fn test_check_staleness_lexical_v6_below_version_triggers_rebuild_returns_manife
         manifest.unwrap().stored_git_head(),
         Some(sha),
         "--stats must show real HEAD when only the lexical format version is outdated (v6→v7)"
+    );
+}
+
+// ============================================================================
+// AD-411-1 end-to-end reclassification: v5 manifest self-heal (PF-007)
+// ============================================================================
+
+/// AD-411-1 / PF-007 discriminating end-to-end regression test.
+///
+/// ## What is being tested
+///
+/// A v5-format manifest (pre-AD-411-1, all identifier bytes unconditionally
+/// SymbolName, discriminant = 2) is planted with the **real file SHA** so that
+/// a SHA-check cache HIT would fire under a regression (missing `decode_header`
+/// version gate).
+///
+/// After `auto_refresh_if_stale` detects both the stale v5 manifest AND the
+/// stale v5 lexical index (both below current FORMAT_VERSION / LEXICAL_FORMAT_VERSION),
+/// `build_index` is called with the v5 manifest rejected to empty →
+/// `read_and_classify` gets a cache MISS → `classify_source` runs fresh →
+/// `authenticate` in `fn authenticate()` maps to FunctionSignature (disc = 1),
+/// NOT the old unconditional SymbolName (disc = 2).
+///
+/// ## Why the regression payload matters
+///
+/// Without the REAL SHA in the planted entry, a regression (no version check)
+/// would still cause a cache miss (SHA mismatch), `classify_source` would still
+/// run, and the test would pass despite the bug — making it a false green.
+/// Planting the real SHA turns a cache HIT into the regression trigger: the
+/// stale SymbolName field_map is served from the v5 manifest under the bug, and
+/// FunctionSignature can never appear in the rebuilt index.
+///
+/// ## v6→v7 lexical gate coverage
+///
+/// Replacing the v5 lexical stub with `b"SKIX\x05\x00"` (v5, below current v7)
+/// also exercises the v6→v7 boundary of the lexical staleness ladder, which was
+/// flagged as missing a classification assertion.  The compound
+/// `lexical_stale || manifest_stale` guard in `check_staleness` fires for BOTH
+/// independently, so this single test covers both format-version gates.
+///
+/// ## PF-007 compliance
+///
+/// Asserts the discriminating observables:
+/// - `outcome.refreshed()` (rebuild fired)
+/// - `FunctionSignature` (disc = 1) present in rebuilt field_map
+/// - `FunctionBody` (disc = 4) present for body blocks / call sites
+///
+/// Both would be absent if the stale v5 SymbolName cache were incorrectly reused.
+#[test]
+fn test_v5_manifest_stale_reclassifies_with_new_ad411_field_semantics() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Source: one function declaration (name → FunctionSignature under new semantics)
+    // + one body block and call site (→ FunctionBody). Pre-AD-411-1 all identifiers
+    // were unconditionally SymbolName (disc = 2).
+    let source = "fn authenticate() {}\nfn main() { authenticate(); }\n";
+    fs::write(dir.path().join("auth.rs"), source).unwrap();
+
+    // ── Step 1: build a current-version (v6 manifest + v7 lexical) index ──
+    // This establishes the real SHA for auth.rs so the planted v5 manifest can
+    // contain a matching SHA — triggering a cache HIT under the regression.
+    build_index_in(dir.path(), &cache_dir);
+
+    use crate::cmd::search::manifest::FileManifest;
+    let initial_manifest = FileManifest::load(dir.path().to_path_buf(), cache_dir.clone())
+        .expect("freshly built manifest must load without error");
+    let real_sha = initial_manifest
+        .lookup("auth.rs")
+        .expect("auth.rs must be indexed after initial build")
+        .sha256
+        .clone();
+
+    // ── Step 2: overwrite manifest with v5-format + SymbolName + real SHA ──
+    // decode_header rejects version = 5 (≠ 6) → empty manifest → no cache hit.
+    // Under regression (missing version check): parse succeeds → SHA matches →
+    // stale SymbolName (disc = 2) served as a cache hit from the v5 manifest,
+    // bypassing classify_source entirely.
+    write_v5_manifest_with_symbolname_and_sha(
+        dir.path(),
+        &cache_dir,
+        "auth.rs",
+        &real_sha,
+        source.len(),
+    );
+
+    // ── Step 3: downgrade lexical index to v5 (pre-AD-411-7 format, below v7) ──
+    // Guards the v6→v7 lexical gate: the compound `lexical_stale || manifest_stale`
+    // in check_staleness fires for BOTH independently (covers the flagged missing
+    // v6→v7 self-heal classification assertion).
+    fs::write(cache_dir.join("index.skidx"), b"SKIX\x05\x00").unwrap();
+    // Keep AST stub current so only lexical + manifest gates fire.
+    write_ast_index_stub(&cache_dir);
+
+    // ── Step 4: self-heal via auto_refresh_if_stale ────────────────────────
+    // check_staleness: lexical v5 < v7 → stale; manifest v5 ≠ v6 → stale →
+    // NoStoredHead → build_index with empty manifest → classify_source fresh.
+    let analytics = TEST_ANALYTICS;
+    let result = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics);
+    assert!(
+        result.is_ok(),
+        "auto_refresh_if_stale must succeed on v5 self-heal: {:?}",
+        result.err()
+    );
+    let (outcome, rebuilt_manifest) = result.unwrap();
+    assert!(
+        outcome.refreshed(),
+        "v5 manifest + v5 lexical must trigger a rebuild \
+         (PF-007: test must assert a discriminating observable, not just check exit 0)"
+    );
+
+    // ── Step 5: verify AD-411-1 field semantics in the rebuilt manifest ────
+    let entry = rebuilt_manifest
+        .lookup("auth.rs")
+        .expect("auth.rs must be present in rebuilt manifest after self-heal");
+
+    // FunctionSignature (disc = 1): `authenticate` in `fn authenticate()` is
+    // the `name:` child of `function_item` (priority 4) → FunctionSignature
+    // via map_identifier_to_field (AD-411-1).
+    // Pre-AD-411-1 (v5) semantics: unconditionally SymbolName (disc = 2).
+    // Under regression: stale SymbolName served from cache → disc = 1 absent.
+    let has_fn_sig = entry.field_map.iter().any(|(_, _, d)| *d == 1);
+    assert!(
+        has_fn_sig,
+        "rebuilt manifest must contain FunctionSignature (disc = 1) for the function \
+         declaration name after v5→v6 self-heal; SymbolName (disc = 2) only would mean \
+         the stale v5 field_map cache was incorrectly reused instead of fresh \
+         classify_source (AD-411-1 regression, per PF-007). field_map={:?}",
+        entry.field_map
+    );
+
+    // FunctionBody (disc = 4): body blocks (`{}`, `{ authenticate(); }`) and the
+    // call site `authenticate()` in main map to FunctionBody under AD-411-1.
+    // Combined with FunctionSignature above, this proves context-aware
+    // classify_source ran — the stale v5 entry had only a single SymbolName span
+    // covering all bytes; no SymbolName-only rebuild can produce FunctionBody here.
+    let has_fn_body = entry.field_map.iter().any(|(_, _, d)| *d == 4);
+    assert!(
+        has_fn_body,
+        "rebuilt manifest must contain FunctionBody (disc = 4) for body blocks and \
+         call sites after v5→v6 self-heal (proves AD-411-1 context-aware classify_source \
+         ran, not stale SymbolName-only cache). field_map={:?}",
+        entry.field_map
     );
 }
 
