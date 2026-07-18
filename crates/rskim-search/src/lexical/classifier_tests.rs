@@ -664,6 +664,155 @@ fn test_411_markdown_heading_is_type_definition() {
 }
 
 // -----------------------------------------------------------------------
+// AD-411-1 container rule: class/module names must be TypeDefinition
+// (cross-language consistency fix for priority-2 container kinds)
+//
+// Before the fix, class_declaration (TS/JS/Java/C#) and class_specifier (C++)
+// had priority 2 in node_kind_info — below the `>= 3` guard in
+// map_identifier_to_field — so their name-child identifiers fell through to
+// FunctionBody (call-site tier), making `class Foo {}` rank at the same level
+// as a call site.  That contradicts Rust `struct Foo` (struct_item = priority 5
+// → TypeDefinition) and Python `class Foo` (class_definition = priority 5 →
+// TypeDefinition) for semantically-equivalent constructs.
+// (applies ADR-001: fix immediately; applies ADR-007: dog-food quality gate)
+// -----------------------------------------------------------------------
+
+/// TS `class Foo {}` — the class name "Foo" must be TypeDefinition, NOT FunctionBody.
+/// Before the fix, class_declaration's priority-2 rating caused "Foo" to fall
+/// through the `>= 3` guard in map_identifier_to_field and land at FunctionBody.
+#[test]
+fn test_411_typescript_class_def_name_is_typedefinition() {
+    // "class " = 6 bytes → "Foo" starts at byte 6
+    let source = "class Foo {}";
+    let ranges = classify_source(source, rskim_core::Language::TypeScript).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 6);
+    assert_eq!(
+        field,
+        SearchField::TypeDefinition,
+        "TS class name must be TypeDefinition (was FunctionBody before container-rule fix); \
+         got {field:?}\nranges: {ranges:?}"
+    );
+}
+
+/// JS `class Foo {}` — the class name "Foo" must be TypeDefinition.
+#[test]
+fn test_411_javascript_class_def_name_is_typedefinition() {
+    // "class " = 6 bytes → "Foo" starts at byte 6
+    let source = "class Foo {}";
+    let ranges = classify_source(source, rskim_core::Language::JavaScript).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 6);
+    assert_eq!(
+        field,
+        SearchField::TypeDefinition,
+        "JS class name must be TypeDefinition; got {field:?}\nranges: {ranges:?}"
+    );
+}
+
+/// Java `class Foo {}` — the class name "Foo" must be TypeDefinition.
+/// Before the fix: class_declaration (priority 2) → name identifier → FunctionBody.
+#[test]
+fn test_411_java_class_def_name_is_typedefinition() {
+    // "class " = 6 bytes → "Foo" starts at byte 6
+    let source = "class Foo {}";
+    let ranges = classify_source(source, rskim_core::Language::Java).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 6);
+    assert_eq!(
+        field,
+        SearchField::TypeDefinition,
+        "Java class name must be TypeDefinition; got {field:?}\nranges: {ranges:?}"
+    );
+}
+
+/// C++ `class Foo {};` — the class name "Foo" must be TypeDefinition.
+/// C++ uses class_specifier (not class_declaration) for class definitions.
+/// Before the fix: class_specifier (priority 2) → name type_identifier → FunctionBody.
+#[test]
+fn test_411_cpp_class_def_name_is_typedefinition() {
+    // "class " = 6 bytes → "Foo" starts at byte 6
+    let source = "class Foo {};";
+    let ranges = classify_source(source, rskim_core::Language::Cpp).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 6);
+    assert_eq!(
+        field,
+        SearchField::TypeDefinition,
+        "C++ class name must be TypeDefinition (via class_specifier); \
+         got {field:?}\nranges: {ranges:?}"
+    );
+}
+
+/// C# `class Foo {}` — the class name "Foo" must be TypeDefinition.
+/// Before the fix: class_declaration (priority 2) → name identifier → FunctionBody.
+#[test]
+fn test_411_csharp_class_def_name_is_typedefinition() {
+    // "class " = 6 bytes → "Foo" starts at byte 6
+    let source = "class Foo {}";
+    let ranges = classify_source(source, rskim_core::Language::CSharp).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 6);
+    assert_eq!(
+        field,
+        SearchField::TypeDefinition,
+        "C# class name must be TypeDefinition; got {field:?}\nranges: {ranges:?}"
+    );
+}
+
+/// Non-regression: within a Java file both `class Foo` and `interface Bar` must be
+/// at TypeDefinition or above.  interface_declaration already has priority 5
+/// (TypeDefinition), so this verifies that adding the container rule for
+/// class_declaration does not accidentally lower the interface name rank.
+#[test]
+fn test_411_java_class_and_interface_both_typedefinition() {
+    // class at byte 0: "class " = 6 → "Foo" at 6
+    let source_class = "class Foo {}";
+    let ranges_class = classify_source(source_class, rskim_core::Language::Java).unwrap();
+    let class_field = field_at_byte(&ranges_class, 6);
+
+    // interface at byte 0: "interface " = 10 → "Bar" at 10
+    let source_iface = "interface Bar {}";
+    let ranges_iface = classify_source(source_iface, rskim_core::Language::Java).unwrap();
+    let iface_field = field_at_byte(&ranges_iface, 10);
+
+    assert_eq!(
+        class_field,
+        SearchField::TypeDefinition,
+        "Java class name must be TypeDefinition; got {class_field:?}"
+    );
+    assert_eq!(
+        iface_field,
+        SearchField::TypeDefinition,
+        "Java interface name must be TypeDefinition; got {iface_field:?}"
+    );
+    // Both should be equal — cross-language consistency mandated by ADR-007.
+    assert_eq!(
+        class_field, iface_field,
+        "Java `class` and `interface` names must rank at the same tier \
+         (both TypeDefinition); got class={class_field:?}, interface={iface_field:?}"
+    );
+}
+
+/// Non-regression: TS `interface Foo {}` uses interface_declaration (priority 5 →
+/// TypeDefinition) which was already correct.  Verify the container-rule addition
+/// does not disturb the existing priority-5 path.
+#[test]
+fn test_411_typescript_interface_def_name_still_typedefinition() {
+    // "interface " = 10 bytes → "Foo" at byte 10
+    let source = "interface Foo {}";
+    let ranges = classify_source(source, rskim_core::Language::TypeScript).unwrap();
+    assert_contiguous(&ranges, source.len());
+    let field = field_at_byte(&ranges, 10);
+    assert_eq!(
+        field,
+        SearchField::TypeDefinition,
+        "TS interface name must remain TypeDefinition (priority-5 path unaffected); \
+         got {field:?}\nranges: {ranges:?}"
+    );
+}
+
+// -----------------------------------------------------------------------
 // AC14: code definition outranks Markdown heading (OD3)
 // Verified at field level here; the scoring-tier proof is in config_tests.
 // -----------------------------------------------------------------------
