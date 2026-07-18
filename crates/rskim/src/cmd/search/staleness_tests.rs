@@ -876,7 +876,8 @@ fn test_v5_manifest_stale_reclassifies_with_new_ad411_field_semantics() {
     assert!(
         has_fn_sig,
         "rebuilt manifest must contain FunctionSignature (disc = 1) for the function \
-         declaration name after v5→v6 self-heal; SymbolName (disc = 2) only would mean \
+         declaration name after stale-v5 self-heal (manifest v5 → v6, lexical v5 → v7); \
+         SymbolName (disc = 2) only would mean \
          the stale v5 field_map cache was incorrectly reused instead of fresh \
          classify_source (AD-411-1 regression, per PF-007). field_map={:?}",
         entry.field_map
@@ -891,7 +892,7 @@ fn test_v5_manifest_stale_reclassifies_with_new_ad411_field_semantics() {
     assert!(
         has_fn_body,
         "rebuilt manifest must contain FunctionBody (disc = 4) for body blocks and \
-         call sites after v5→v6 self-heal (proves AD-411-1 context-aware classify_source \
+         call sites after stale-v5 self-heal (manifest v5 → v6, lexical v5 → v7; proves AD-411-1 context-aware classify_source \
          ran, not stale SymbolName-only cache). field_map={:?}",
         entry.field_map
     );

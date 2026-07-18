@@ -118,8 +118,14 @@ pub(crate) const SKIDX_MAGIC: &[u8; 4] = b"SKIX";
 /// causing the `search_exact_intersection` per-field-saturated scorer to
 /// mis-rank definitions. The self-heal is driven by the existing
 /// `v < LEXICAL_INDEX_FORMAT_VERSION` guard in `staleness.rs`
-/// (same mechanism as v2/v3/v4 self-heals) — a full rebuild is triggered on
-/// the next query with no `--rebuild` required. ADR-006 invariant preserved:
+/// (same mechanism as v2/v3/v4 self-heals), and correct field_id
+/// reclassification is guaranteed because a v5 lexical is always paired with
+/// a v5 manifest (`FileManifest::FORMAT_VERSION` was bumped together with the
+/// lexical version for this semantic change): the v5 manifest is rejected by
+/// its own `decode_header` (version 5 ≠ `FileManifest::FORMAT_VERSION` 6),
+/// yielding an empty manifest so `build_index` has no stale cached field_maps
+/// to reuse even under `force=false`. A full rebuild is triggered on the
+/// next query with no `--rebuild` required. ADR-006 invariant preserved:
 /// the rebuild aborts before persisting the new manifest on any per-file
 /// desync so the old v5 index survives until a clean rebuild completes.
 ///
