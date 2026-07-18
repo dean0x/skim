@@ -1808,16 +1808,19 @@ fn ac403_7_notice_does_not_overfire() {
         "AC-403-7: --phrase + text must NOT emit inert notice; stderr: {stderr_phrase:?}"
     );
 
-    // --near 3 + text: no inert-flag notice.
+    // --near 3 + 2-word text: no inert-flag notice (>1 word → --near is active).
+    // "fn alpha_beta" has two word tokens (fn, alpha_beta) so near_diagnostic_notice
+    // returns None (n=3 ≥ word_count-1=1).  Contrast with ac403_8 which asserts the
+    // single-word case DOES emit a notice.
     let out_near = raw_search_output(
         proj.path(),
         cache.path(),
-        &["--near", "3", "--json", "alpha"],
+        &["--near", "3", "--json", "fn alpha_beta"],
     );
     let stderr_near = String::from_utf8(out_near.stderr).unwrap();
     assert!(
         !stderr_near.contains("has no effect"),
-        "AC-403-7: --near 3 + text must NOT emit inert notice; stderr: {stderr_near:?}"
+        "AC-403-7: --near 3 + 2-word text must NOT emit inert notice; stderr: {stderr_near:?}"
     );
 }
 
