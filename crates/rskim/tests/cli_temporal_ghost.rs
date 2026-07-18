@@ -14,15 +14,15 @@
 //! # Test plan coverage
 //!
 //! - AC3:  All four standalone arms (text + `--json`) exit 0, emit no ghost,
-//!         and emit at least one present file (non-vacuous PF-007 anchor).
+//!   and emit at least one present file (non-vacuous PF-007 anchor).
 //! - AC10: Ground-truth smoke — every path in JSON output satisfies `is_file()`;
-//!         results non-empty where expected.
+//!   results non-empty where expected.
 //! - AC12: `skim heatmap --diff` warns when a diffed path is replaced by a
-//!         directory (`is_file()==false`, `exists()==true`) — tested in
-//!         `test_heatmap_diff_path_replaced_by_directory_warns`.
+//!   directory (`is_file()==false`, `exists()==true`) — tested in
+//!   `test_heatmap_diff_path_replaced_by_directory_warns`.
 //! - AC13: `skim search --hot` excludes "gone.rs" (ghost filter applied at build
-//!         time); `skim heatmap` (no `--diff`) shows it from git history, which
-//!         is correct and expected.
+//!   time); `skim heatmap` (no `--diff`) shows it from git history, which
+//!   is correct and expected.
 
 use std::fs;
 use std::path::Path;

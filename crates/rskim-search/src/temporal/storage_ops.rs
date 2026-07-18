@@ -54,8 +54,11 @@ fn write_version_meta_in_tx(tx: &rusqlite::Transaction<'_>, git_head: &str) -> R
     let mut stmt = tx.prepare_cached(sql).map_err(db_err)?;
     stmt.execute(params![META_GIT_HEAD, git_head])
         .map_err(db_err)?;
-    stmt.execute(params![META_DATA_VERSION, TEMPORAL_DATA_VERSION.to_string()])
-        .map_err(db_err)?;
+    stmt.execute(params![
+        META_DATA_VERSION,
+        TEMPORAL_DATA_VERSION.to_string()
+    ])
+    .map_err(db_err)?;
     Ok(())
 }
 

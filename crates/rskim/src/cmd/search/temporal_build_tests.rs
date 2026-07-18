@@ -390,6 +390,7 @@ fn create_real_git_repo(dir: &std::path::Path, commit_files: &[(&str, &[(&str, &
 /// date string (e.g. `"2020-01-01 00:00:00 +0000"`) so tests that need
 /// `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` control can share the same helper path
 /// as undated tests rather than hand-rolling repeated `Command::new("git")` blocks.
+#[allow(clippy::type_complexity)]
 fn create_real_git_repo_with_dates(
     dir: &std::path::Path,
     commit_files: &[(&str, Option<&str>, &[(&str, &str)])],
@@ -1564,6 +1565,7 @@ fn test_ghost_filter_subdir_root_rows_survive() {
 /// undated tests (`test_ghost_filter_deleted_file_absent_from_all_tables`) and
 /// avoid hand-rolling repeated `Command::new("git")` blocks.
 #[test]
+#[allow(clippy::type_complexity)]
 fn test_ghost_filter_coldspot_limit_no_underfill() {
     let dir = tempdir().unwrap();
     let cache_dir = dir.path().join("cache");
@@ -1580,18 +1582,22 @@ fn test_ghost_filter_coldspot_limit_no_underfill() {
     // Co-locate each commit's (name, content, message) to avoid parallel-Vec
     // index alignment.  Owned strings live here; slices are taken below.
     let ghost_data: Vec<(String, String, String)> = (0..3u32)
-        .map(|i| (
-            format!("ghost{i}.rs"),
-            format!("// ghost {i}"),
-            format!("feat: ghost {i}"),
-        ))
+        .map(|i| {
+            (
+                format!("ghost{i}.rs"),
+                format!("// ghost {i}"),
+                format!("feat: ghost {i}"),
+            )
+        })
         .collect();
     let present_data: Vec<(String, String, String)> = (0..5u32)
-        .map(|i| (
-            format!("present{i}.rs"),
-            format!("// present {i}"),
-            format!("feat: present {i}"),
-        ))
+        .map(|i| {
+            (
+                format!("present{i}.rs"),
+                format!("// present {i}"),
+                format!("feat: present {i}"),
+            )
+        })
         .collect();
 
     // Per-commit file lists — each commit touches exactly one file.
@@ -1610,7 +1616,11 @@ fn test_ghost_filter_coldspot_limit_no_underfill() {
         commit_specs.push((msg.as_str(), Some(ghost_date), ghost_files[i].as_slice()));
     }
     for (i, (_, _, msg)) in present_data.iter().enumerate() {
-        commit_specs.push((msg.as_str(), Some(present_date), present_files[i].as_slice()));
+        commit_specs.push((
+            msg.as_str(),
+            Some(present_date),
+            present_files[i].as_slice(),
+        ));
     }
 
     let head = create_real_git_repo_with_dates(dir.path(), &commit_specs);

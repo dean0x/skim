@@ -866,6 +866,7 @@ pub(super) fn auto_refresh_if_stale(
 ///
 /// Returns the full 40-hex SHA of HEAD.
 #[cfg(test)]
+#[allow(clippy::type_complexity)]
 pub(super) fn create_real_git_repo_with_dates(
     dir: &std::path::Path,
     commit_files: &[(&str, Option<&str>, &[(&str, &str)])],
@@ -930,6 +931,7 @@ pub(super) fn create_real_git_repo_with_dates(
 ///
 /// Returns the full 40-hex SHA of HEAD.
 #[cfg(test)]
+#[allow(clippy::type_complexity)]
 pub(super) fn create_real_git_repo(
     dir: &std::path::Path,
     commit_files: &[(&str, &[(&str, &str)])],
