@@ -1852,14 +1852,17 @@ fn staleness_warns_when_stored_head_differs_from_current() {
         return;
     }
 
-    // Open a fresh temporal DB and store a deliberately wrong HEAD.
+    // Open a fresh temporal DB to create the schema, then plant a deliberately
+    // wrong HEAD via raw SQL — set_meta guards version-attestation keys
+    // (AD-408-3). Re-open to read it back through the domain API.
     let db_path = root.join("temporal.db");
-    let db = TemporalDb::open(&db_path).unwrap();
-    db.set_meta(
+    drop(TemporalDb::open(&db_path).unwrap());
+    crate::cmd::search::staleness::plant_meta_raw(
+        &db_path,
         rskim_search::META_GIT_HEAD,
         "0000000000000000000000000000000000000000",
-    )
-    .unwrap();
+    );
+    let db = TemporalDb::open(&db_path).unwrap();
 
     // The staleness check must detect the mismatch and return a warning.
     let warning = check_temporal_staleness(&db, &root);

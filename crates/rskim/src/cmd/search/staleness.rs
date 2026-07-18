@@ -943,6 +943,31 @@ pub(super) fn create_real_git_repo_with_dates(
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// Test-only helper: write a single `meta` key/value pair directly via raw SQL,
+/// bypassing the `TemporalDb::set_meta` version-attestation guard (AD-408-3).
+///
+/// Tests need to construct adversarial persisted states — a half-attested DB
+/// (`git_head` present, `data_version` absent), a corrupt/non-integer
+/// `data_version`, or a future/legacy version — that the production `set_meta`
+/// guard deliberately rejects with a `debug_assert!`. Those raw-bytes scenarios
+/// (simulating a DB written by another / older / corrupt binary) belong at the
+/// storage layer, not the guarded domain API.
+///
+/// Requires the `meta` table to already exist (created by `TemporalDb::open`)
+/// and opens its own short-lived connection, so any live `TemporalDb` handle on
+/// the same file must be dropped first to avoid write contention. `pub(super)`
+/// makes it reachable from all `#[cfg(test)]` modules within
+/// `crate::cmd::search` (`staleness_tests.rs`, `temporal_tests.rs`).
+#[cfg(test)]
+pub(super) fn plant_meta_raw(db_path: &std::path::Path, key: &str, value: &str) {
+    let conn = rusqlite::Connection::open(db_path).expect("open temporal.db for meta plant");
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        rusqlite::params![key, value],
+    )
+    .expect("plant meta row");
+}
+
 /// Test-only re-export of `scan_working_tree` for AC9 / AC7 integration tests
 /// that construct manifest state directly rather than going through `build_index`.
 ///

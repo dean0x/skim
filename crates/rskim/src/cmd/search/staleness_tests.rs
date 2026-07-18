@@ -1147,9 +1147,10 @@ fn test_temporal_db_data_version_absent_is_stale() {
     let head = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222";
 
     // Create a DB and set META_GIT_HEAD but NOT data_version (pre-fix state).
+    // Plant git_head via raw SQL — set_meta guards version-attestation keys (AD-408-3).
     let db = rskim_search::TemporalDb::open(&db_path).unwrap();
-    db.set_meta(rskim_search::META_GIT_HEAD, head).unwrap();
     drop(db);
+    super::plant_meta_raw(&db_path, rskim_search::META_GIT_HEAD, head);
 
     assert!(
         temporal_db_is_stale(dir.path(), head),
@@ -1192,10 +1193,9 @@ fn test_temporal_db_data_version_non_integer_is_stale() {
 
     let db = rskim_search::TemporalDb::open(&db_path).unwrap();
     db.sync(&[], &[], &[], head).unwrap();
-    // Overwrite data_version with a non-integer.
-    db.set_meta(rskim_search::META_DATA_VERSION, "not-a-number")
-        .unwrap();
     drop(db);
+    // Overwrite data_version with a non-integer via raw SQL — set_meta guards it (AD-408-3).
+    super::plant_meta_raw(&db_path, rskim_search::META_DATA_VERSION, "not-a-number");
 
     assert!(
         temporal_db_is_stale(dir.path(), head),
@@ -1245,11 +1245,14 @@ fn test_temporal_db_data_version_forward_compat() {
     // Write via sync() then overwrite data_version with a future version.
     let db = rskim_search::TemporalDb::open(&db_path).unwrap();
     db.sync(&[], &[], &[], head).unwrap();
-    // Store a version much higher than the current one.
-    let future_version = u64::from(rskim_search::TEMPORAL_DATA_VERSION) + 999;
-    db.set_meta(rskim_search::META_DATA_VERSION, &future_version.to_string())
-        .unwrap();
     drop(db);
+    // Store a version much higher than the current one via raw SQL — set_meta guards it (AD-408-3).
+    let future_version = u64::from(rskim_search::TEMPORAL_DATA_VERSION) + 999;
+    super::plant_meta_raw(
+        &db_path,
+        rskim_search::META_DATA_VERSION,
+        &future_version.to_string(),
+    );
 
     assert!(
         !temporal_db_is_stale(dir.path(), head),
@@ -1285,8 +1288,9 @@ fn test_temporal_db_data_version_lower_integer_is_stale() {
     // TEMPORAL_DATA_VERSION, simulating a versioned-but-outdated pre-fix DB.
     let db = rskim_search::TemporalDb::open(&db_path).unwrap();
     db.sync(&[], &[], &[], head).unwrap();
-    db.set_meta(rskim_search::META_DATA_VERSION, "0").unwrap();
     drop(db);
+    // Overwrite data_version with "0" via raw SQL — set_meta guards it (AD-408-3).
+    super::plant_meta_raw(&db_path, rskim_search::META_DATA_VERSION, "0");
 
     assert!(
         temporal_db_is_stale(dir.path(), head),
@@ -1414,13 +1418,11 @@ fn test_bug_b_auto_refresh_self_heals_head_divergent_temporal_db() {
     );
 
     // Plant a stale META_GIT_HEAD to simulate the HEAD-divergent case.
+    // Raw SQL — set_meta guards version-attestation keys (AD-408-3). The DB
+    // already exists (built by the earlier auto_refresh call), so the `meta`
+    // table is present.
     let planted_head = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
-    {
-        let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
-        db.set_meta(rskim_search::META_GIT_HEAD, planted_head)
-            .unwrap();
-        drop(db);
-    }
+    super::plant_meta_raw(&temporal_db_path, rskim_search::META_GIT_HEAD, planted_head);
 
     // Verify the plant took effect.
     {
